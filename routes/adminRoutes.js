@@ -1,0 +1,314 @@
+// routes/adminRoutes.js
+// =============================================================================
+// AZAMAN V4 — ADMIN ROUTES (Consolidated Command Center)
+//
+// ALL routes require both `protect` (JWT) AND `adminOnly` (role check).
+// This is the single entry point for all admin functionality.
+//
+// Mounted at /api/admin in server.js
+// =============================================================================
+
+const express = require('express');
+const router = express.Router();
+const adminController = require('../controllers/adminController');
+const { protect, adminOnly } = require('../middleware/authMiddleware');
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SECURITY: ALL admin routes require BOTH protect + adminOnly
+// ═══════════════════════════════════════════════════════════════════════════════
+router.use(protect);
+router.use(adminOnly);
+
+// ─── PLATFORM OVERVIEW ───────────────────────────────────────────────────────
+router.get('/stats', adminController.getPlatformStats);
+router.get('/system-health', adminController.getSystemHealth);
+router.get('/profit-breakdown', adminController.getProfitBreakdown);
+
+// ─── TRADE OVERSIGHT ─────────────────────────────────────────────────────────
+router.get('/trades/live', adminController.getLiveTrades);
+router.get('/disputes', adminController.getAllDisputes);
+router.post('/disputes/force-release', adminController.forceRelease);
+router.post('/disputes/force-cancel', adminController.forceCancel);
+
+// ─── USER MANAGEMENT ─────────────────────────────────────────────────────────
+router.get('/users', adminController.getUsers);
+router.post('/users/:id/ban', adminController.banUser);
+router.post('/users/:id/role', adminController.changeUserRole);
+
+// ─── KYC MANAGEMENT ──────────────────────────────────────────────────────────
+router.get('/kyc/pending', adminController.getPendingKyc);
+router.post('/kyc/approve', adminController.approveKyc);
+router.post('/kyc/reject', adminController.rejectKyc);
+
+// ─── WITHDRAWAL MANAGEMENT ───────────────────────────────────────────────────
+router.get('/withdrawals/pending', adminController.getPendingWithdrawals);
+router.post('/withdrawals/:id/approve', adminController.approveWithdrawal);
+router.post('/withdrawals/:id/reject', adminController.rejectWithdrawal);
+
+// ─── CHAT INTERVENTION ───────────────────────────────────────────────────────
+router.post('/chat/inject', adminController.sendAdminMessage);
+
+// ─── PROFIT OPERATIONS ───────────────────────────────────────────────────────
+router.post('/profits/liquidate', adminController.liquidateProfits);
+
+// ─── FEE PROFILES (Phase Q1) ─────────────────────────────────────────────────
+const feeProfileController = require('../controllers/adminFeeProfileController');
+router.get('/fee-profiles',          feeProfileController.listFeeProfiles);
+router.get('/fee-profiles/resolve',  feeProfileController.resolveProfile);
+router.post('/fee-profiles',         feeProfileController.createFeeProfile);
+router.put('/fee-profiles/:id',      feeProfileController.updateFeeProfile);
+router.delete('/fee-profiles/:id',   feeProfileController.deactivateFeeProfile);
+
+// ─── GLOBAL SETTINGS & FINANCIAL PARAMETERS ──────────────────────────────────
+const adminSettingsController = require('../controllers/adminSettingsController');
+router.get('/settings',              adminSettingsController.getSettings);
+router.put('/settings',              adminSettingsController.updateSettings);
+router.post('/users/:id/risk-tier',  adminSettingsController.setUserRiskTier);
+router.get('/audit-log',             adminSettingsController.getAuditLog);
+
+// ─── TRADE ACCOUNT VERIFICATION ──────────────────────────────────────────────
+router.get('/trade-accounts/pending', async (req, res) => {
+    const prisma = req.app.get('prisma');
+    try {
+        const accounts = await prisma.tradeAccount.findMany({
+            where: { adminVerificationStatus: 'PENDING', archivedAt: null },
+            include: { user: { select: { id: true, username: true, email: true, role: true } } },
+            orderBy: { createdAt: 'desc' },
+        });
+        return res.status(200).json({ success: true, accounts });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: error.message });
+    }
+});
+
+router.post('/trade-accounts/:id/approve', async (req, res) => {
+    const prisma = req.app.get('prisma');
+    const notificationService = req.app.get('notificationService');
+    try {
+        const { id } = req.params;
+        const account = await prisma.tradeAccount.findUnique({
+            where: { id },
+            include: { user: { select: { id: true, username: true } } }
+        });
+        if (!account) return res.status(404).json({ success: false, message: 'Trade account not found.' });
+
+        await prisma.tradeAccount.update({
+            where: { id },
+            data: { adminVerificationStatus: 'APPROVED' },
+        });
+
+        // Notify the vendor
+        if (notificationService) {
+            await notificationService.sendNotification({
+                userId: account.userId,
+                title: '✅ Trade Account Approved',
+                body: `Your ${account.methodType} trade account has been verified and is ready to use.`,
+                category: 'VENDOR_PRIORITY',
+                actionPayload: { route: '/settings', action: 'OPEN_TRADE_ACCOUNTS' },
+            });
+        }
+
+        return res.status(200).json({ success: true, message: 'Trade account approved.' });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: error.message });
+    }
+});
+
+router.post('/trade-accounts/:id/reject', async (req, res) => {
+    const prisma = req.app.get('prisma');
+    const notificationService = req.app.get('notificationService');
+    try {
+        const { id } = req.params;
+        const { reason } = req.body;
+        const account = await prisma.tradeAccount.findUnique({
+            where: { id },
+            include: { user: { select: { id: true, username: true } } }
+        });
+        if (!account) return res.status(404).json({ success: false, message: 'Trade account not found.' });
+
+        await prisma.tradeAccount.update({
+            where: { id },
+            data: { adminVerificationStatus: 'REJECTED' },
+        });
+
+        if (notificationService) {
+            await notificationService.sendNotification({
+                userId: account.userId,
+                title: '❌ Trade Account Rejected',
+                body: `Your ${account.methodType} account was not approved. ${reason || 'Please resubmit with valid details.'}`,
+                category: 'VENDOR_PRIORITY',
+                actionPayload: { route: '/settings', action: 'OPEN_TRADE_ACCOUNTS' },
+            });
+        }
+
+        return res.status(200).json({ success: true, message: 'Trade account rejected.' });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: error.message });
+    }
+});
+
+// ─── ADMIN CREDIT (Demo: give users test USDC) ──────────────────────────────
+router.post('/users/:id/credit', async (req, res) => {
+    const prisma = req.app.get('prisma');
+    const emitBalanceUpdate = req.app.get('emitBalanceUpdate');
+    try {
+        const userId = parseInt(req.params.id, 10);
+        const { amount, reason } = req.body;
+
+        if (isNaN(userId)) return res.status(400).json({ success: false, message: 'Invalid user ID.' });
+        if (!amount || isNaN(parseFloat(amount)) || parseFloat(amount) <= 0) {
+            return res.status(400).json({ success: false, message: 'amount must be a positive number.' });
+        }
+
+        const amountFloat = parseFloat(amount);
+
+        const user = await prisma.user.findUnique({ where: { id: userId }, select: { id: true, username: true } });
+        if (!user) return res.status(404).json({ success: false, message: 'User not found.' });
+
+        await prisma.$transaction([
+            prisma.user.update({
+                where: { id: userId },
+                data: { availableBalance: { increment: amountFloat } },
+            }),
+            prisma.transactionHistory.create({
+                data: {
+                    userId,
+                    type: 'DEPOSIT_CRYPTO',
+                    amountUsdc: amountFloat,
+                    feeUsdc: 0,
+                    txHash: `ADMIN_CREDIT_${Date.now()}_${userId}`,
+                    status: 'COMPLETED',
+                }
+            }),
+            prisma.adminSettingsAuditLog.create({
+                data: {
+                    adminId: req.user.id,
+                    adminName: req.user.username,
+                    action: 'CREDIT_USER_BALANCE',
+                    targetType: 'USER_BALANCE',
+                    targetId: String(userId),
+                    changes: { amount: amountFloat, reason: reason || 'Admin credit' },
+                }
+            }),
+        ]);
+
+        if (emitBalanceUpdate) await emitBalanceUpdate(userId);
+
+        return res.status(200).json({
+            success: true,
+            message: `Credited ${amountFloat} USDC to ${user.username}.`,
+            data: { userId, username: user.username, credited: amountFloat }
+        });
+    } catch (error) {
+        console.error('[admin.creditUser] error:', error.message);
+        return res.status(500).json({ success: false, message: error.message });
+    }
+});
+
+// ─── AUTONOMOUS PAYOUTS (Phase Q8) ──────────────────────────────────────────
+router.post('/payouts/batch-process',   adminController.batchProcessPayouts);
+router.get('/payouts/settings',         adminController.getPayoutSettings);
+router.put('/payouts/settings',         adminController.updatePayoutSettings);
+router.get('/payouts/needs-review',     adminController.getNeedsManualReview);
+
+// ─── APP VERSION GATE (Phase Q15) ────────────────────────────────────────────
+router.get('/version-gate', async (req, res) => {
+    const prisma = req.app.get('prisma');
+    try {
+        const settings = await prisma.globalSettings.findUnique({
+            where: { id: 1 },
+            select: { minAppVersion: true, forceUpdateUrl: true, updateMessage: true },
+        });
+        return res.status(200).json({ success: true, data: settings });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: error.message });
+    }
+});
+
+router.put('/version-gate', async (req, res) => {
+    const prisma = req.app.get('prisma');
+    try {
+        const { minAppVersion, forceUpdateUrl, updateMessage } = req.body;
+
+        // Validate semver format (basic check)
+        if (minAppVersion && !/^\d+\.\d+\.\d+$/.test(minAppVersion)) {
+            return res.status(400).json({ success: false, message: 'minAppVersion must be semver (e.g., 1.2.3)' });
+        }
+
+        const updateData = {};
+        if (minAppVersion) updateData.minAppVersion = minAppVersion;
+        if (forceUpdateUrl) updateData.forceUpdateUrl = forceUpdateUrl;
+        if (updateMessage) updateData.updateMessage = updateMessage;
+
+        if (Object.keys(updateData).length === 0) {
+            return res.status(400).json({ success: false, message: 'No fields to update' });
+        }
+
+        const settings = await prisma.globalSettings.update({
+            where: { id: 1 },
+            data: updateData,
+            select: { minAppVersion: true, forceUpdateUrl: true, updateMessage: true },
+        });
+
+        console.log(`[Admin] Version gate updated: minAppVersion=${settings.minAppVersion}`);
+        return res.status(200).json({ success: true, data: settings });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: error.message });
+    }
+});
+
+// Phase Q14: Dispute Resolution
+router.post('/disputes/:tradeId/resolve', async (req, res) => {
+    const DisputeResolutionService = require('../services/disputeResolutionService');
+    const prisma = req.app.get('prisma');
+    const notificationService = req.app.get('notificationService');
+    const service = new DisputeResolutionService(prisma, notificationService);
+
+    try {
+        const tradeId = parseInt(req.params.tradeId, 10);
+        if (isNaN(tradeId)) {
+            return res.status(400).json({ success: false, message: 'Invalid trade ID' });
+        }
+
+        const { ruling, reason, buyerPercent } = req.body;
+        const adminId = req.user.id;
+
+        const resolution = await service.resolveDispute({
+            tradeId,
+            adminId,
+            ruling,
+            reason,
+            buyerPercent: buyerPercent != null ? parseFloat(buyerPercent) : undefined,
+        });
+
+        return res.status(200).json({ success: true, data: resolution });
+
+    } catch (error) {
+        console.error('[admin.resolveDispute] error:', error.message);
+        const status = error.message.includes('not found') ? 404 :
+                       error.message.includes('Invalid') || error.message.includes('required') ? 400 :
+                       error.message.includes('already') ? 409 : 500;
+        return res.status(status).json({ success: false, message: error.message });
+    }
+});
+
+router.get('/disputes/resolutions', async (req, res) => {
+    const DisputeResolutionService = require('../services/disputeResolutionService');
+    const prisma = req.app.get('prisma');
+    const notificationService = req.app.get('notificationService');
+    const service = new DisputeResolutionService(prisma, notificationService);
+
+    try {
+        const limit = Math.min(parseInt(req.query.limit || '20', 10), 50);
+        const cursor = req.query.cursor || undefined;
+
+        const resolutions = await service.getResolutionHistory({ limit, cursor });
+
+        return res.status(200).json({ success: true, data: resolutions });
+    } catch (error) {
+        console.error('[admin.disputeResolutions] error:', error.message);
+        return res.status(500).json({ success: false, message: error.message });
+    }
+});
+
+module.exports = router;

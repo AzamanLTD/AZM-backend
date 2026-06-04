@@ -1,0 +1,2496 @@
+// prisma/schema.prisma
+// =============================================================================
+// AZAMAN PLATFORM — V2 SCHEMA
+// "The Great Account Split" & "The Unified Ledger"
+// =============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// =============================================================================
+// ENUMS
+// =============================================================================
+
+enum TradeStatus {
+  PENDING
+  PENDING_PAYMENT
+  PAID
+  COMPLETED
+  CANCELLED
+  AUTO_CANCELLED
+  DISPUTED
+}
+
+enum KycStatus {
+  UNVERIFIED
+  PENDING
+  VERIFIED
+  REJECTED
+}
+
+enum NotificationCategory {
+  GENERAL
+  SECURITY_ACCOUNT
+  VENDOR_PRIORITY
+  ADMIN_SYSTEM
+  // Master Sprint (2026-05-27)
+  VAULT
+  SUSU
+  SMART_ROUTE
+  AUCTION
+}
+
+enum BanStatus {
+  ACTIVE
+  BANNED_24H
+  BANNED_1W
+  BANNED_INDEF
+}
+
+enum AdminVerificationStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+enum RiskLevel {
+  LOW
+  MEDIUM
+  HIGH
+}
+
+enum LoyaltyTier {
+  STANDARD
+  GOLD
+  PLATINUM
+}
+
+enum Role {
+  USER
+  VENDOR
+  ADMIN
+}
+
+enum TransactionType {
+  DEPOSIT_FIAT
+  DEPOSIT_CRYPTO
+  WITHDRAWAL_FIAT
+  WITHDRAWAL_CRYPTO
+  P2P_TRADE
+  INTERNAL_TRANSFER
+  AZM_REWARD
+  // Master Sprint (2026-05-27)
+  VAULT_DEPOSIT
+  VAULT_RELEASE
+  SUSU_CONTRIBUTION
+  SUSU_PAYOUT
+  SUSU_SEIZURE
+  // PHASE 5 / Workstream E (2026-06-01): War Room escrow refund
+  SUSU_REFUND
+  SMART_ROUTE_RUN
+  // PHASE 6 / Phase 5 (2026-06-01): Susu Profit Engine — platform fee on cycle payouts
+  SUSU_PROFIT
+}
+
+enum TransactionStatus {
+  PENDING
+  COMPLETED
+  FAILED
+  FROZEN_DISPUTE
+}
+
+enum ProfitSource {
+  EXIT_FEE
+  P2P_MARGIN
+  ARBITRAGE_SPREAD
+  GAS_FEE_REVENUE
+  WITHDRAWAL_FEE
+  SAVINGS_FEE
+  SWAP_FEE
+  // PHASE 6 / Phase 5 (2026-06-01): Susu cycle fee revenue
+  SUSU_FEE
+}
+
+enum ConversationType {
+  TRADE
+  PERSONAL
+}
+
+enum MessageType {
+  TEXT
+  SYSTEM_URGENCY
+  PAYMENT_TRANSFER
+  ADMIN_INTERVENTION
+  IMAGE_PROOF
+  // Phase UI-3 (2026-05-26): rich-media types for the upgraded chat.
+  IMAGE
+  VIDEO
+  DOCUMENT
+  AUDIO
+  LINK
+}
+
+enum ColdStorageDirection {
+  TO_COLD
+  TO_HOT
+}
+
+enum CorporatePurchaseMethod {
+  API
+  MANUAL
+}
+
+enum TradeQueueStatus {
+  WAITING
+  PROCESSED
+  CANCELLED
+}
+
+enum FriendshipStatus {
+  PENDING
+  ACCEPTED
+  REJECTED
+  BLOCKED
+}
+
+enum PeerTransferType {
+  SEND
+  REQUEST
+}
+
+enum PeerTransferStatus {
+  PENDING
+  COMPLETED
+  DECLINED
+  FAILED
+  INSUFFICIENT_FUNDS
+}
+
+enum DirectMessageType {
+  TEXT
+  TRANSFER_SENT
+  TRANSFER_REQUEST
+  TRANSFER_COMPLETED
+  TRANSFER_DECLINED
+  SYSTEM
+  // Phase UI-3 (2026-05-26): rich-media types for the upgraded chat.
+  IMAGE
+  VIDEO
+  DOCUMENT
+  AUDIO
+  LINK
+  // Phase UI-4 (2026-05-26): event card injected when a Ticket is
+  // created/closed/cancelled inside a friendship; clicking deep-links
+  // to the Ticket workspace.
+  TICKET_LINK
+}
+
+enum VendorLevel {
+  BRONZE
+  SILVER
+  GOLD
+  DIAMOND
+  LEGEND
+}
+
+enum AdInteractionType {
+  VIEWED
+  TRADE_INITIATED
+  CLOSED
+}
+
+// =============================================================================
+// MASTER SPRINT (2026-05-27): Vault, Susu, Smart Route, AZM Auction enums
+// =============================================================================
+
+// ── PHASE 1: VAULT ──────────────────────────────────────────────────
+enum VaultStatus {
+  ACTIVE
+  COMPLETED
+  BROKEN_EARLY
+  CANCELLED
+}
+
+enum VaultFrequency {
+  DAILY
+  WEEKLY
+  BIWEEKLY
+  MONTHLY
+}
+
+enum VaultDepositType {
+  MANUAL
+  AUTO_RULE
+  BONUS
+}
+
+enum VaultDepositStatus {
+  COMPLETED
+  FAILED_INSUFFICIENT
+  FAILED_OTHER
+  PENDING
+}
+
+// ── PHASE 2: SUSU + GROUP CHAT ──────────────────────────────────────
+enum GroupRole {
+  ADMIN
+  MEMBER
+}
+
+enum GroupChatStatus {
+  ACTIVE
+  ARCHIVED
+}
+
+// ── PHASE 6: SOCIAL & VOUCHING EVOLUTION ────────────────────────────
+// Status of a GroupJoinRequest (a member-proposed add awaiting admin
+// approval). A strict @@unique([groupId, targetUserId, status]) lets one
+// PENDING coexist with a later APPROVED/REJECTED audit row; the service
+// also guards "no two PENDING for the same (group,target)" before insert.
+enum GroupJoinRequestStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  CANCELLED
+}
+
+enum SusuStatus {
+  CONFIGURING
+  ACTIVE
+  COMPLETED
+  CANCELLED
+  FROZEN_DISPUTE
+}
+
+enum SusuFrequency {
+  DAILY
+  WEEKLY
+  BIWEEKLY
+  MONTHLY
+}
+
+enum SusuCycleStatus {
+  PENDING
+  COLLECTING
+  // ── PHASE 5 / Workstream C (2026-06-01): Penalty ladder grace window ──
+  // A cycle enters COLLECTING_GRACE when at least one ACTIVE member falls
+  // short at the scheduled run time. The cycle holds here for exactly 24h
+  // (SusuCycle.graceUntil) so the shorting member(s) can top up. On any
+  // tick where every member has funded, the cycle finalizes (payout). At
+  // grace expiry the still-short members are hard-defaulted (seizure +
+  // 25% Voucher_Slash + future-payout strip + escrow) and the cycle
+  // finalizes/defaults.
+  COLLECTING_GRACE
+  PAID_OUT
+  DEFAULTED
+}
+
+enum SusuMemberStatus {
+  PENDING_VOUCH
+  PENDING_CONTRACT
+  ACTIVE
+  DEFAULTED
+  REMOVED
+}
+
+enum SusuContributionStatus {
+  PAID
+  FAILED_INSUFFICIENT
+  SEIZED
+}
+
+enum VouchStatus {
+  PENDING
+  COMPLETED
+  REJECTED
+  VOIDED
+}
+
+// =============================================================================
+// PRIVATE SUSU ECOSYSTEM (2026-05-31)
+//
+// New enums introduced for the Susu ecosystem additive overlay. The existing
+// Susu* / Vouch* enums above remain unchanged. See
+// .kiro/specs/private-susu-ecosystem/design.md for the full data model and
+// API contracts.
+// =============================================================================
+
+enum ProofOfResidencyStatus {
+  NOT_SUBMITTED
+  PENDING_REVIEW
+  VERIFIED
+  REJECTED
+  EXPIRED
+}
+
+enum SusuInviteChannel {
+  FRIEND
+  PHONE
+  LINK
+}
+
+enum SusuInviteStatus {
+  PENDING
+  ACCEPTED
+  DECLINED
+  REVOKED
+  EXPIRED
+}
+
+enum AdminWarRoomAlertType {
+  ADMIN_DEFAULT
+  MASS_DEFAULT_THRESHOLD
+  ESCROW_DIVERSION
+  VOUCH_SLASH_TX_FAILURE
+}
+
+// ── PHASE 3: SMART ROUTE ────────────────────────────────────────────
+enum SmartRouteStatus {
+  ACTIVE
+  PAUSED
+  CANCELLED
+  COMPLETED
+}
+
+enum SmartRouteAction {
+  WITHDRAW_MOMO
+  INTERNAL_TRANSFER
+  SAVINGS_DEPOSIT
+  VAULT_DEPOSIT
+}
+
+enum SmartRouteFrequency {
+  DAILY
+  WEEKLY
+  MONTHLY
+  ON_DAY_OF_MONTH
+}
+
+enum SmartRouteRunStatus {
+  SUCCESS
+  FAILED_INSUFFICIENT
+  FAILED_GATEWAY
+  FAILED_OTHER
+  SKIPPED
+}
+
+// ── PHASE 4: AZM AUCTION ────────────────────────────────────────────
+enum AzmAuctionStatus {
+  OPEN
+  SETTLING
+  SETTLED
+  CANCELLED
+}
+
+enum AzmBidStatus {
+  ACTIVE
+  WON
+  LOST
+  REFUNDED
+}
+
+// =============================================================================
+// CORE USER MODEL
+// =============================================================================
+
+model User {
+  id       Int    @id @default(autoincrement())
+  username String @unique
+  email    String @unique
+  password String
+
+  // --- V2: THE GREAT ACCOUNT SPLIT — Unified Ledger Balances ---
+  // NOTE (Phase J2, 2026-05-25): every Decimal column on this model that
+  // represents a balance has a CHECK (col >= 0) constraint at the DB
+  // level (see prisma/migrations/20260525_phase_j2_balance_check_constraints).
+  // Prisma can't model CHECK constraints in the schema language, so they
+  // live in the SQL migration only. completionRate has CHECK (>= 0 AND
+  // <= 100). Phase J3 (2026-05-25): Float → Decimal migration complete.
+  availableBalance         Decimal @default(0.0) @db.Decimal(20, 8) // USDT available for trading / spending
+  vendorUnallocatedBalance Decimal @default(0.0) @db.Decimal(20, 8) // USDT returned to vendor post auto-cancel
+  escrowLockedBalance      Decimal @default(0.0) @db.Decimal(20, 8) // USDT locked in escrow for active trades
+  disputeEscrowBalance     Decimal @default(0.0) @db.Decimal(20, 8) // USDT frozen during an open dispute
+
+  // --- AZM LOYALTY POINTS (independent reward ledger) ---
+  // AZM is an internal platform loyalty-point currency (like BNB or airline
+  // miles). It is NOT derived from availableBalance. Users earn AZM through
+  // platform activities (trade completions, referrals, achievements) and can
+  // spend it on premium features (fee discounts, ad-tier unlocks, etc.).
+  // AZM is NOT a blockchain token — it is strictly a backend-controlled
+  // database ledger. Phase D-2 incorrectly dropped this column; Phase D-3
+  // restores it as an independent loyalty ledger.
+  azmBalance Decimal @default(0.0) @db.Decimal(20, 8) // AZM loyalty points (independent of USDC)
+
+  // --- TATUM INTEGRATION ---
+  tatumPolygonAddress String?
+
+  // --- V2: INFLUENCER & REFERRAL SYSTEM ---
+  influencerCode String? @unique
+  referredByCode String?
+
+  // --- AUTH & SECURITY ---
+  googleId           String? @unique
+  appleId            String? @unique
+  twoFactorSecret    String?
+  isTwoFactorEnabled Boolean @default(false)
+  pinHash            String?
+  profilePictureUrl  String?
+  isDeleted          Boolean @default(false)
+
+  // --- PHASE K: TOKEN INVALIDATION ---
+  // Bumped whenever the user's privileges change (today: USER -> VENDOR via
+  // KYC approval). Embedded in the access JWT; `protect` rejects access
+  // tokens whose claim < live row. Refresh tokens for the user are
+  // cascade-revoked at the same moment so the new privileges propagate
+  // exactly once per role change.
+  tokenVersion  Int            @default(0)
+  refreshTokens RefreshToken[]
+
+  // --- IDENTITY & ROLE ---
+  role     Role    @default(USER)
+  fcmToken String?
+
+  // --- KYC & LEGAL IDENTITY ---
+  kycStatus    KycStatus @default(UNVERIFIED)
+  legalName    String?
+  idType       String?
+  idNumber     String?
+  idImageFront String?
+  idImageBack  String?
+
+  // --- REPUTATION STATS ---
+  tradesCompleted Int     @default(0)
+  completionRate  Decimal @default(0.0) @db.Decimal(5, 2)
+  positiveReviews Int     @default(0)
+  negativeReviews Int     @default(0)
+
+  // --- V2: STRIKE & BAN SYSTEM ---
+  strikeCount            Int       @default(0) // V2 unified strike counter
+  cancellationAbuseCount Int       @default(0) // Legacy abuse counter (pre-V2)
+  banStatus              BanStatus @default(ACTIVE)
+  banUntil               DateTime?
+
+  // --- LOYALTY & DISCOUNT ENGINE ---
+  loyaltyTier          LoyaltyTier @default(STANDARD)
+  activeDiscountCredit Decimal     @default(0.0) @db.Decimal(20, 8)
+  discountExpiresAt    DateTime?
+
+  // --- WITHDRAWAL RISK TIER (admin-assignable) ---
+  // Controls which withdrawal fee percentage applies to this user.
+  // Resolved against GlobalSettings.withdrawalFeeByRiskTier JSON map.
+  withdrawalRiskTier String @default("STANDARD") // STANDARD | TRUSTED | HIGH_RISK
+
+  // --- V3: VENDOR GAMIFICATION SYSTEM ---
+  vendorXp        Int         @default(0) // Total XP earned
+  vendorLevel     VendorLevel @default(BRONZE) // Current vendor tier
+  currentStreak   Int         @default(0) // Consecutive active trade days
+  longestStreak   Int         @default(0) // All-time best streak
+  lastTradeDate   DateTime? // Last date a trade was completed (for streak calc)
+  totalVolumeUsdc Decimal     @default(0.0) @db.Decimal(20, 8) // Lifetime trade volume
+  totalProfitUsdc Decimal     @default(0.0) @db.Decimal(20, 8) // Lifetime vendor profit earned
+
+  // --- SECURE VENDOR PAYMENT VAULT ---
+  paymentDetails Json?
+
+  // --- V3: USER PREFERENCES (cross-device sync) ---
+  selectedTheme       String? @default("dark") // Theme ID: dark, mars, saturn, snow, neonTokyo, deepOcean, volcanic, aurora
+  customShortcuts     Json? // Array of shortcut IDs in user's preferred order
+  settingsPreferences Json? // General settings blob (haptics, sounds, etc.)
+
+  // --- V4: ONBOARDING & PROFILE ENHANCEMENTS ---
+  onboardingCompleted Boolean   @default(false) // Whether user finished the onboarding flow
+  onboardingStep      Int       @default(0) // Last completed onboarding step (0 = not started)
+  displayName         String? // Optional display name (different from username)
+  bio                 String? // Short bio for profile
+  phoneNumber         String? // Phone number for notifications/MoMo
+  phoneVerified       Boolean   @default(false) // True once OTP-verified via smsService (Phase L2)
+  country             String?   @default("GH") // Country code
+  lastLoginAt         DateTime? // Track last login time
+  loginStreak         Int       @default(0) // Consecutive login days
+
+  // ── PHASE 6 / Social & Vouching Evolution (2026-06-01) ──────────────────────
+  // Azaman_ID: unique, immutable, shareable public identifier of the form
+  // 'AZM-#########' (literal prefix + 9 digits). Distinct from the numeric
+  // primary key (never exposed) and from influencerCode. Nullable in the
+  // column only so the additive ADD COLUMN is safe on a populated table; the
+  // registration hook + idempotent backfill guarantee it is always populated.
+  azamanId            String?   @unique
+  // Opt-out of phone Contact_Discovery. While false, the user never appears
+  // in another user's /users/discover result.
+  discoverable        Boolean   @default(true)
+  // SHA-256(HMAC) of the verified E.164 phone with a server pepper. Contact
+  // discovery matches hash-to-hash so raw address-book numbers are never
+  // compared against (or stored as) plaintext. Set on phone verification +
+  // backfill; null until the user verifies a phone.
+  phoneHash           String?
+
+  // ==========================================================================
+  // RELATIONSHIPS
+  // ==========================================================================
+
+  // P2P Trading
+  ads            Ad[]
+  tradesAsBuyer  Trade[] @relation("BuyerRelation")
+  tradesAsVendor Trade[] @relation("VendorRelation")
+
+  // Account Split
+  tradeAccounts      TradeAccount[]
+  payoutDestinations PayoutDestination[]
+
+  // Finance
+  withdrawals  Withdrawal[]
+  transactions TransactionHistory[]
+
+  // V2: Trade Queue
+  queuedTrades TradeQueue[]
+
+  // Social & Communication
+  conversations Conversation[] @relation("ConversationParticipants")
+  sentMessages  Message[]      @relation("MessageSender")
+  contacts      Contact[]      @relation("ContactOwner")
+  savedByUsers  Contact[]      @relation("ContactSavedUser")
+
+  // Reviews
+  givenReviews    Review[] @relation("GivenReviews")
+  receivedReviews Review[] @relation("ReceivedReviews")
+
+  // Misc
+  savedWallets       SavedWallet[]
+  savedMomoAccounts  SavedMomoAccount[]
+  notifications      Notification[]
+  earnedBadges       Badge[]             @relation("UserBadges")
+  leaderboardRecords LeaderboardRecord[]
+  accountFeedbacks   AccountFeedback[]
+
+  // V3: Social Friend System
+  sentFriendRequests     Friendship[]    @relation("FriendshipRequester")
+  receivedFriendRequests Friendship[]    @relation("FriendshipAddressee")
+  sentDirectMessages     DirectMessage[] @relation("DirectMessageSender")
+  receivedDirectMessages DirectMessage[] @relation("DirectMessageReceiver")
+  sentPeerTransfers      PeerTransfer[]  @relation("PeerTransferSender")
+  receivedPeerTransfers  PeerTransfer[]  @relation("PeerTransferReceiver")
+
+  // Phase UI-4 (2026-05-26): Tickets Engine
+  createdTickets     Ticket[]        @relation("TicketCreator")
+  receivedTickets    Ticket[]        @relation("TicketCounterparty")
+  sentTicketMessages TicketMessage[] @relation("TicketMessageSender")
+
+  // V3: Vendor Gamification
+  adInteractions     AdInteraction[]
+  vendorAchievements VendorAchievement[]
+
+  // V3: Savings System
+  savingsGoals    SavingsGoal[]
+  savingsDeposits SavingsDeposit[]
+
+  // Phase Q12: Rate Alerts
+  rateAlerts RateAlert[]
+
+  // Phase Q14: Dispute Resolutions administered
+  disputeResolutions DisputeResolution[] @relation("DisputeResolutionAdmin")
+
+  // Phase E1: AZM Reward History
+  azmRewardLogs AzmRewardLog[]
+
+  // Phase E2: AZM Spend History
+  azmSpendLogs AzmSpendLog[]
+
+  // Phase V: Vendor Applications
+  vendorApplications         VendorApplication[]
+  reviewedVendorApplications VendorApplication[] @relation("VendorApplicationReviewer")
+
+  // ── MASTER SPRINT (2026-05-27): Vault, Susu, Smart Route, AZM Auction ──
+  vaults            Vault[]
+  vaultDeposits     VaultDeposit[]
+  groupsCreated     GroupChat[]        @relation("GroupChatCreator")
+  groupMemberships  GroupMember[]      @relation("GroupMembership")
+  sentGroupMessages GroupMessage[]     @relation("GroupMessageSender")
+  vouchesGiven      VouchRecord[]      @relation("VouchVoucher")
+  vouchesReceived   VouchRecord[]      @relation("VouchInvitee")
+  susuMemberships   SusuMember[]       @relation("SusuMembership")
+  susuPayoutsWon    SusuCycle[]        @relation("SusuCycleWinner")
+  susuContributions SusuContribution[] @relation("SusuContributor")
+  smartRoutes       SmartRoute[]
+  smartRouteRuns    SmartRouteRun[]    @relation("SmartRouteRunUser")
+  azmAuctionBids    AzmAuctionBid[]    @relation("AuctionBidder")
+
+  // ── PRIVATE SUSU ECOSYSTEM (2026-05-31) ────────────────────────────────────
+  // Proof of Residency (Req 3) — admin-reviewed residency document with
+  // 365-day expiry sweep. Gates Susu participation alongside kycStatus.
+  proofOfResidencyUrl             String?
+  proofOfResidencyStatus          ProofOfResidencyStatus @default(NOT_SUBMITTED)
+  proofOfResidencySubmittedAt     DateTime?
+  proofOfResidencyVerifiedAt      DateTime?
+  proofOfResidencyRejectionReason String?
+
+  // Trust Rating (Req 7.10) — global counter, initialised to 100, floored at
+  // 0. Decremented by 1 on every Voucher_Slash event. Distinct from
+  // SusuMember.trustScore which is a per-Susu rotation-ranking metric.
+  trustRating Int @default(100)
+
+  // Relations introduced for the new Susu ecosystem tables. The existing
+  // vouchesGiven / vouchesReceived / susuMemberships / susuPayoutsWon /
+  // susuContributions relations above remain unchanged.
+  susuInvitesSent      SusuInvite[]               @relation("SusuInviteInviter")
+  susuInvitesReceived  SusuInvite[]               @relation("SusuInviteInvitee")
+  liabilityAcceptances LiabilityAcceptance[]
+  publishedContracts   LiabilityContractVersion[] @relation("ContractPublisher")
+  vouchSlashesIssued   VoucherSlashLog[]          @relation("SlashVoucher")
+  vouchSlashesReceived VoucherSlashLog[]          @relation("SlashVouched")
+  acknowledgedAlerts   AdminWarRoomAlert[]        @relation("AlertAcknowledger")
+
+  // PHASE 6: Group join-request proposals (as proposer / as target).
+  groupJoinRequestsProposed GroupJoinRequest[] @relation("GJRProposer")
+  groupJoinRequestsReceived GroupJoinRequest[] @relation("GJRTarget")
+
+  // PHASE 6 / Phase 4: Liability acceptances where this user vouched for another.
+  vouchedLiabilityAcceptances LiabilityAcceptance[] @relation("LiabilityVoucher")
+
+  createdAt DateTime @default(now())
+}
+
+// =============================================================================
+// PHASE K — REFRESH TOKENS
+// =============================================================================
+//
+// Long-lived refresh tokens. Each row is a UUID, opaque on the wire. The
+// /api/auth/refresh endpoint exchanges a valid refresh token for a fresh
+// 15-minute access JWT and rotates the refresh token (creates a new row
+// with a new id, marks the old one revoked). Logout marks revokedAt.
+//
+// Privilege changes (e.g., USER -> VENDOR via KYC approval) bump
+// User.tokenVersion AND mark every refresh token for that user as revoked,
+// forcing the next /refresh to re-issue with the new claims.
+//
+// A periodic worker can sweep WHERE expiresAt < now AND revokedAt IS NULL
+// to keep the table compact.
+// =============================================================================
+model RefreshToken {
+  id        String    @id // UUID — also the on-wire token value
+  userId    Int
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expiresAt DateTime
+  revokedAt DateTime?
+  userAgent String?
+  ipAddress String?
+  createdAt DateTime  @default(now())
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+// =============================================================================
+// P2P TRADING CORE
+// =============================================================================
+
+model Ad {
+  id     Int    @id @default(autoincrement())
+  type   String // "BUY" or "SELL"
+  crypto String @default("USDT")
+
+  // Price Settings
+  pricePerUSD  Decimal  @db.Decimal(18, 8)
+  margin       Decimal? @db.Decimal(10, 4)
+  baseMargin   Decimal  @default(0.0) @db.Decimal(10, 4)
+  vendorMargin Decimal  @default(0.0) @db.Decimal(10, 4)
+  minLimit     Decimal  @db.Decimal(20, 8)
+  maxLimit     Decimal  @db.Decimal(20, 8)
+
+  // Payment Config
+  paymentMethod String
+  terms         String?
+  status        String  @default("ACTIVE")
+
+  // Time & Concurrency
+  maxPaymentWindow    Int    @default(15)
+  activeHoursStart    String @default("08:00")
+  activeHoursEnd      String @default("22:00")
+  maxConcurrentTrades Int    @default(5) // V2: overflow → TradeQueue
+
+  // Phase E2: Ad Boost (AZM spend feature)
+  isBoosted      Boolean   @default(false) // Currently boosted for featured placement
+  boostExpiresAt DateTime? // When the boost expires (null = not boosted)
+
+  // Phase F2: Link to vendor's specific payment account
+  tradeAccountId String?
+  tradeAccount   TradeAccount? @relation(fields: [tradeAccountId], references: [id], onDelete: SetNull)
+
+  // Relations
+  vendorId Int
+  vendor   User @relation(fields: [vendorId], references: [id])
+
+  // V2: Queue for overflow buyers
+  queue TradeQueue[]
+
+  // V3: Ad Interaction Analytics
+  interactions AdInteraction[]
+
+  // Master Sprint (2026-05-27): AZM Auction bids targeting this ad
+  auctionBids AzmAuctionBid[] @relation("AuctionAd")
+
+  // Phase Q4: Soft-delete archive timestamp (null = active, set = archived)
+  archivedAt DateTime?
+
+  createdAt DateTime @default(now())
+
+  // Phase I: powers cursor pagination on GET /api/ads (marketplace).
+  // Most queries filter by status='ACTIVE' and order by createdAt desc.
+  @@index([status, createdAt(sort: Desc)])
+  @@index([vendorId, createdAt(sort: Desc)])
+  // Phase E2: boost sorting — boosted ads appear first in marketplace
+  @@index([isBoosted(sort: Desc), status, createdAt(sort: Desc)])
+}
+
+model Trade {
+  id Int @id @default(autoincrement())
+
+  // Transaction Details
+  crypto        String
+  amountCrypto  Decimal @db.Decimal(20, 8)
+  amountFiat    Decimal @db.Decimal(20, 8)
+  currency      String  @default("GHS")
+  type          String
+  rate          Decimal @default(0.0) @db.Decimal(18, 8)
+  paymentMethod String  @default("Bank Transfer")
+
+  // Status & Proof
+  status      TradeStatus @default(PENDING_PAYMENT)
+  proofUrl    String?
+  paidAt      DateTime?
+  completedAt DateTime?
+
+  // Time Limit & Strike System
+  selectedTimeframe Int      @default(15)
+  tradeStartTime    DateTime @default(now())
+  expiresAt         DateTime
+  senderFiatName    String?
+
+  // Milestone Warning Tracking
+  milestone33Sent Boolean @default(false)
+  milestone66Sent Boolean @default(false)
+  milestone99Sent Boolean @default(false)
+
+  // Admin Bonus Tracking
+  adminBonusAmount  Decimal @default(0.0) @db.Decimal(20, 8)
+  adminBonusMessage String?
+  vendorProfitCut   Decimal @default(0.0) @db.Decimal(20, 8)
+
+  // Snapshot of Vendor payment details at trade time
+  vendorPaymentDetails Json?
+
+  // Phase F2: Buyer provides their recipient details (SELL ads only)
+  buyerPaymentDetails Json?
+
+  // Relationships
+  userId   Int
+  user     User @relation("BuyerRelation", fields: [userId], references: [id])
+  vendorId Int
+  vendor   User @relation("VendorRelation", fields: [vendorId], references: [id])
+
+  messages Message[] @relation("TradeMessages")
+  reviews  Review[]
+
+  // Phase Q14: Dispute resolution record (one-to-one)
+  disputeResolution DisputeResolution?
+
+  createdAt DateTime @default(now())
+
+  // Phase I: powers cursor pagination on GET /api/trades/history.
+  // The where clause is `OR: [{userId}, {vendorId}]`, so we need both
+  // composite shapes — Postgres can't satisfy an OR from a single index.
+  @@index([userId, createdAt(sort: Desc)])
+  @@index([vendorId, createdAt(sort: Desc)])
+}
+
+// =============================================================================
+// V2: TRADE QUEUE (Overflow Management)
+// =============================================================================
+
+model TradeQueue {
+  id       String           @id @default(uuid())
+  buyerId  Int // FK → User
+  adId     Int // FK → Ad
+  status   TradeQueueStatus @default(WAITING)
+  joinedAt DateTime         @default(now())
+
+  buyer User @relation(fields: [buyerId], references: [id], onDelete: Cascade)
+  ad    Ad   @relation(fields: [adId], references: [id], onDelete: Cascade)
+
+  @@index([buyerId])
+  @@index([adId])
+  @@index([status])
+}
+
+// =============================================================================
+// ACCOUNT SPLIT: TRADE ACCOUNTS & PAYOUT DESTINATIONS
+// =============================================================================
+
+model TradeAccount {
+  id                      String                  @id @default(uuid())
+  userId                  Int
+  methodType              String // e.g., "ZELLE", "CASHAPP", "VENMO", "PAYPAL", "APPLE_PAY", etc.
+  accountDetails          Json // Type-specific fields validated by tradeAccountValidation service
+  verificationScreenshot  String // URL to uploaded proof screenshot
+  adminVerificationStatus AdminVerificationStatus @default(PENDING)
+  riskLevel               RiskLevel               @default(MEDIUM)
+
+  // Phase Q2: Soft-delete archive (vendor wallet is NEVER hard-deleted)
+  archivedAt    DateTime? // null = active, set = archived (soft-deleted)
+  archiveReason String? // "USER_DELETED" | "ADMIN_SUSPENDED" | "COMPLIANCE_HOLD"
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  ads  Ad[] // Phase F2: ads linked to this account
+
+  @@index([userId])
+  @@index([userId, archivedAt])
+}
+
+model PayoutDestination {
+  id                 String   @id @default(uuid())
+  userId             Int
+  nickname           String
+  destinationType    String // "BINANCE_PAY", "TRC20", "ERC20", "MOMO", etc.
+  destinationAddress String
+  isExternalCrypto   Boolean  @default(false)
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+// =============================================================================
+// DUAL-ENVIRONMENT CHAT
+// =============================================================================
+
+model Conversation {
+  id        String           @id @default(uuid())
+  type      ConversationType
+  tradeId   String?          @unique
+  createdAt DateTime         @default(now())
+  updatedAt DateTime         @updatedAt
+
+  participants User[]    @relation("ConversationParticipants")
+  messages     Message[]
+
+  @@index([type])
+}
+
+model Message {
+  id             String      @id @default(uuid())
+  conversationId String
+  senderId       Int?
+  tradeId        Int?
+  messageType    MessageType @default(TEXT)
+  content        String
+  createdAt      DateTime    @default(now())
+
+  // Phase UI-3 (2026-05-26): media columns for rich-media chat.
+  // Used when messageType is IMAGE, VIDEO, DOCUMENT, AUDIO, or LINK.
+  mediaUrl           String?
+  mediaType          String? // image | video | document | audio
+  mediaMimeType      String?
+  mediaSize          Int? // bytes
+  mediaDuration      Int? // seconds, audio/video only
+  mediaWaveformPeaks Json? // 50-bucket integer array, audio only
+  linkPreview        Json? // { url, title, description, image, favicon, fetchedAt }
+
+  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  sender       User?        @relation("MessageSender", fields: [senderId], references: [id])
+  trade        Trade?       @relation("TradeMessages", fields: [tradeId], references: [id])
+
+  @@index([conversationId])
+  @@index([senderId])
+  @@index([tradeId])
+  // Phase I: powers cursor pagination on GET /api/chat/:tradeId
+  // (filter conversationId, order createdAt desc).
+  @@index([conversationId, createdAt(sort: Desc)])
+}
+
+model Contact {
+  id          String   @id @default(uuid())
+  userId      Int
+  savedUserId Int
+  nickname    String?
+  createdAt   DateTime @default(now())
+
+  user      User @relation("ContactOwner", fields: [userId], references: [id], onDelete: Cascade)
+  savedUser User @relation("ContactSavedUser", fields: [savedUserId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, savedUserId])
+  @@index([userId])
+}
+
+// =============================================================================
+// FINANCE: WITHDRAWALS, REVIEWS, SETTINGS
+// =============================================================================
+
+model Withdrawal {
+  id             Int      @id @default(autoincrement())
+  amount         Decimal  @db.Decimal(20, 8)
+  payoutMethod   String   @default("BINANCE_ID")
+  network        String?
+  destination    String   @default("OLD_RECORD")
+  totalGasFee    Decimal  @default(0.0) @db.Decimal(20, 8)
+  vendorGasShare Decimal  @default(0.0) @db.Decimal(20, 8)
+  adminGasShare  Decimal  @default(0.0) @db.Decimal(20, 8)
+  status         String   @default("PENDING")
+  userId         Int
+  user           User     @relation(fields: [userId], references: [id])
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+}
+
+model Review {
+  id         Int      @id @default(autoincrement())
+  isPositive Boolean
+  comment    String?
+  tradeId    Int
+  trade      Trade    @relation(fields: [tradeId], references: [id])
+  reviewerId Int
+  reviewer   User     @relation("GivenReviews", fields: [reviewerId], references: [id])
+  revieweeId Int
+  reviewee   User     @relation("ReceivedReviews", fields: [revieweeId], references: [id])
+  createdAt  DateTime @default(now())
+
+  @@unique([tradeId, reviewerId])
+}
+
+model GlobalSettings {
+  id Int @id @default(1)
+
+  // Admin Margins (as decimal percentages: 0.03 = 3%)
+  bankMargin       Decimal @default(0.03) @db.Decimal(10, 4)
+  thirdPartyMargin Decimal @default(0.02) @db.Decimal(10, 4)
+
+  // Vendor Profit Share
+  vendorShareUnder1k Decimal @default(0.40) @db.Decimal(10, 4)
+  vendorShareOver1k  Decimal @default(0.50) @db.Decimal(10, 4)
+
+  // Tier Threshold — trades at or above this USD amount use the "over" split
+  tierThreshold Decimal @default(1000.0) @db.Decimal(20, 8)
+
+  // Vendor minimum collateral — minimum trading pool balance required to post an ad
+  vendorMinCollateral Decimal @default(500.0) @db.Decimal(20, 8)
+
+  // Gas Fee Estimates (USD)
+  gasFeeTrc20 Decimal @default(1.00) @db.Decimal(20, 8)
+  gasFeeErc20 Decimal @default(5.00) @db.Decimal(20, 8)
+  gasFeeBep20 Decimal @default(0.30) @db.Decimal(20, 8)
+
+  // Live Oracle Rates  (legacy single rate — kept synced with liveRetailRate)
+  liveUsdToGhs  Decimal @default(12.50) @db.Decimal(18, 8)
+  liveUsdtToUsd Decimal @default(1.00) @db.Decimal(18, 8)
+  liveUsdcToUsd Decimal @default(1.00) @db.Decimal(18, 8)
+  liveDaiToUsd  Decimal @default(1.00) @db.Decimal(18, 8)
+
+  // Phase B: Kotani Pay V3 dual-rate model
+  //   liveRetailRate    → user UI Hologram (sell USDC → GHS)
+  //   liveCorporateRate → admin spread / OTC buy (USDC ← GHS at discount)
+  //   liveRateSource    → 'MOCK' | 'LIVE' | 'ORACLE'  (provenance flag)
+  //   lastRateSync      → wall-clock of the most recent gateway pull
+  liveRetailRate    Decimal   @default(12.50) @db.Decimal(18, 8)
+  liveCorporateRate Decimal   @default(12.30) @db.Decimal(18, 8)
+  liveRateSource    String    @default("MOCK")
+  lastRateSync      DateTime?
+
+  // Phase F2: P2P flat fee (replaces GHS margin math for P2P trades)
+  p2pFeePct Decimal @default(0.02) @db.Decimal(10, 4) // 2% default; range [0..1]
+
+  // Withdrawal & Exit Fees (dynamic — admin-configurable)
+  baseExitFeePct         Decimal @default(0.02) @db.Decimal(10, 4) // 2% exit fee on fiat withdrawals
+  fiatWithdrawalFeePct   Decimal @default(0.02) @db.Decimal(10, 4) // Fiat withdrawal fee (MTN MoMo)
+  cryptoWithdrawalFeePct Decimal @default(0.01) @db.Decimal(10, 4) // Crypto gas fee estimate as %
+  cryptoPlatformFeePct   Decimal @default(0.00) @db.Decimal(10, 4) // Additional platform fee on crypto withdrawals
+
+  // Risk-tier withdrawal fee overrides (JSON map: { "STANDARD": 0.02, "TRUSTED": 0.005, "HIGH_RISK": 0.05 })
+  withdrawalFeeByRiskTier Json @default("{\"STANDARD\":0.02,\"TRUSTED\":0.005,\"HIGH_RISK\":0.05}")
+
+  // Per-payment-method P2P fee rates (JSON map: method → fee decimal)
+  // Admin-configurable from the Fee Engine. p2pFeePct is the fallback for unlisted methods.
+  feeByPaymentMethod Json @default("{\"ZELLE\":0.02,\"CASHAPP\":0.02,\"APPLE_PAY\":0.025,\"GOOGLE_PAY\":0.025,\"VENMO\":0.025,\"PAYPAL\":0.04,\"WISE\":0.02,\"REVOLUT\":0.025,\"WESTERN_UNION\":0.015,\"WIRE_TRANSFER\":0.015}")
+
+  // Supported payment methods configuration (JSON array of method definitions)
+  // Each entry: { key, label, riskLevel, requiredFields: [{ name, label, type, placeholder }] }
+  supportedPaymentMethods Json @default("[{\"key\":\"ZELLE\",\"label\":\"Zelle\",\"riskLevel\":\"LOW\",\"requiredFields\":[{\"name\":\"email\",\"label\":\"Zelle Email\",\"type\":\"email\",\"placeholder\":\"you@email.com\"},{\"name\":\"phone\",\"label\":\"Phone (optional)\",\"type\":\"phone\",\"placeholder\":\"+1234567890\"}]},{\"key\":\"CASHAPP\",\"label\":\"CashApp\",\"riskLevel\":\"LOW\",\"requiredFields\":[{\"name\":\"cashtag\",\"label\":\"$Cashtag\",\"type\":\"text\",\"placeholder\":\"$YourTag\"}]},{\"key\":\"APPLE_PAY\",\"label\":\"Apple Pay\",\"riskLevel\":\"MEDIUM\",\"requiredFields\":[{\"name\":\"phone\",\"label\":\"Phone Number\",\"type\":\"phone\",\"placeholder\":\"+1234567890\"}]},{\"key\":\"GOOGLE_PAY\",\"label\":\"Google Pay\",\"riskLevel\":\"MEDIUM\",\"requiredFields\":[{\"name\":\"email\",\"label\":\"Google Pay Email\",\"type\":\"email\",\"placeholder\":\"you@gmail.com\"}]},{\"key\":\"VENMO\",\"label\":\"Venmo\",\"riskLevel\":\"MEDIUM\",\"requiredFields\":[{\"name\":\"username\",\"label\":\"Venmo Username\",\"type\":\"text\",\"placeholder\":\"@YourVenmo\"}]},{\"key\":\"PAYPAL\",\"label\":\"PayPal\",\"riskLevel\":\"HIGH\",\"requiredFields\":[{\"name\":\"email\",\"label\":\"PayPal Email\",\"type\":\"email\",\"placeholder\":\"you@email.com\"}]},{\"key\":\"WISE\",\"label\":\"Wise\",\"riskLevel\":\"LOW\",\"requiredFields\":[{\"name\":\"email\",\"label\":\"Wise Email\",\"type\":\"email\",\"placeholder\":\"you@email.com\"},{\"name\":\"accountTag\",\"label\":\"Account Tag\",\"type\":\"text\",\"placeholder\":\"@yourtag\"}]},{\"key\":\"REVOLUT\",\"label\":\"Revolut\",\"riskLevel\":\"MEDIUM\",\"requiredFields\":[{\"name\":\"username\",\"label\":\"Revolut Tag\",\"type\":\"text\",\"placeholder\":\"@yourtag\"},{\"name\":\"phone\",\"label\":\"Phone\",\"type\":\"phone\",\"placeholder\":\"+1234567890\"}]},{\"key\":\"WESTERN_UNION\",\"label\":\"Western Union\",\"riskLevel\":\"LOW\",\"requiredFields\":[{\"name\":\"fullName\",\"label\":\"Receiver Full Name\",\"type\":\"text\",\"placeholder\":\"John Doe\"},{\"name\":\"country\",\"label\":\"Country\",\"type\":\"text\",\"placeholder\":\"US\"}]},{\"key\":\"WIRE_TRANSFER\",\"label\":\"Wire Transfer\",\"riskLevel\":\"LOW\",\"requiredFields\":[{\"name\":\"bankName\",\"label\":\"Bank Name\",\"type\":\"text\",\"placeholder\":\"Chase Bank\"},{\"name\":\"accountNumber\",\"label\":\"Account Number\",\"type\":\"text\",\"placeholder\":\"1234567890\"},{\"name\":\"routingNumber\",\"label\":\"Routing Number\",\"type\":\"text\",\"placeholder\":\"021000021\"}]}]")
+
+  // Phase Q8: Autonomous Payout Configuration
+  autoPayoutEnabled       Boolean @default(false) // Master switch
+  autoPayoutThresholdUsdc Decimal @default(500.00) @db.Decimal(20, 8) // Pool must have >= this
+  autoPayoutMaxAmountUsdc Decimal @default(200.00) @db.Decimal(20, 8) // Max single withdrawal for auto
+  autoPayoutIntervalMs    Int     @default(120000) // Worker scan interval (ms)
+
+  // Phase Q15: App Version Gate
+  minAppVersion  String @default("1.0.0") // Minimum supported app version (semver)
+  forceUpdateUrl String @default("https://play.google.com/store/apps/details?id=com.azaman.app")
+  updateMessage  String @default("A new version of Azaman is available. Please update to continue.")
+
+  // PHASE 6 / Phase 5: Susu Profit Engine — platform fee on Susu cycle payouts
+  // Default 3% (0.03). Admin-configurable via /api/admin/settings. Fee is
+  // deducted from the pooled contribution before payout: takeHome = pooled - fee.
+  // Range [0, 1]. Persisted per cycle in SusuCycle.feeUsdc for audit.
+  susuProfitPct Decimal @default(0.03) @db.Decimal(10, 4)
+
+  updatedAt DateTime @updatedAt
+}
+
+// =============================================================================
+// ADMIN FEE PROFILES — Dynamic Fee Override System
+//
+// Allows the admin to create scoped fee rules that override GlobalSettings
+// defaults. Resolution priority: highest `priority` value wins. Scopes:
+//   ALL              — matches every trade (global override)
+//   VENDOR_TIER      — matches vendors at or above a tier (targetValue = tier name)
+//   USER_TIER        — matches buyers with >= N completed trades (targetValue = N)
+//   INFLUENCER_REFERRAL — matches buyers referred by a specific code (targetValue = code)
+//   HOLIDAY          — matches all trades within validFrom..validUntil window
+//   CUSTOM           — matches specific user IDs (targetValue = comma-separated IDs)
+// =============================================================================
+model AdminFeeProfile {
+  id          String  @id @default(uuid())
+  name        String
+  targetScope String // ALL | VENDOR_TIER | USER_TIER | INFLUENCER_REFERRAL | HOLIDAY | CUSTOM
+  targetValue String? // Scope-specific filter value
+
+  // Fee parameters (all as decimals 0..1)
+  platformFeePct Decimal @db.Decimal(10, 4) // Platform fee % on trade amount
+  adminSplitPct  Decimal @db.Decimal(10, 4) // Admin's share of the platform fee
+  vendorSplitPct Decimal @db.Decimal(10, 4) // Vendor's share of the platform fee
+  exitFeePct     Decimal @db.Decimal(10, 4) // Exit/withdrawal fee override
+
+  // Priority & scheduling
+  priority   Int       @default(0) // Higher = checked first
+  isActive   Boolean   @default(true)
+  validFrom  DateTime? // null = immediately active
+  validUntil DateTime? // null = never expires
+
+  // Audit
+  createdBy Int? // Admin user ID who created this
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([isActive, priority(sort: Desc)])
+}
+
+// =============================================================================
+// ADMIN SETTINGS AUDIT LOG — Tracks every financial parameter change
+// =============================================================================
+model AdminSettingsAuditLog {
+  id         String   @id @default(uuid())
+  adminId    Int // Who made the change
+  adminName  String? // Username snapshot for display
+  action     String // 'UPDATE_SETTINGS' | 'CREATE_FEE_PROFILE' | 'UPDATE_FEE_PROFILE' | etc.
+  targetType String // 'GLOBAL_SETTINGS' | 'FEE_PROFILE' | 'USER_RISK_TIER'
+  targetId   String? // ID of the affected record (if applicable)
+  changes    Json // { field: { old: X, new: Y }, ... }
+  createdAt  DateTime @default(now())
+
+  @@index([adminId])
+  @@index([createdAt(sort: Desc)])
+}
+
+model SavedWallet {
+  id              Int       @id @default(autoincrement())
+  label           String
+  address         String
+  network         String
+  provider        String    @default("PENDING")
+  riskLevel       RiskLevel @default(LOW)
+  accountName     String?
+  secondaryDetail String?
+  userId          Int
+  user            User      @relation(fields: [userId], references: [id])
+  createdAt       DateTime  @default(now())
+}
+
+model Notification {
+  id            String               @id @default(uuid())
+  userId        Int
+  title         String
+  body          String
+  category      NotificationCategory
+  isRead        Boolean              @default(false)
+  actionPayload Json
+  createdAt     DateTime             @default(now())
+  updatedAt     DateTime             @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  // Phase I: composite indexes powering cursor pagination on
+  //   GET /api/notifications            (filter userId, order createdAt desc)
+  //   GET /api/notifications/unread     (filter userId+isRead, order createdAt desc)
+  // Postgres uses the leftmost-prefix rule, so the bare [userId] index above
+  // could be dropped in a future cleanup — kept for now for backwards-compat
+  // with any ad-hoc admin queries.
+  @@index([userId, createdAt(sort: Desc)])
+  @@index([userId, isRead, createdAt(sort: Desc)])
+}
+
+// =============================================================================
+// V2: UNIFIED SYSTEM LEDGER — Four Distinct Corporate Liquidity Pools
+// =============================================================================
+
+/// Tracks total USDT/crypto held across all on-chain wallets
+model SystemMasterCrypto {
+  id        Int      @id @default(1)
+  balance   Decimal  @default(0.0) @db.Decimal(20, 8)
+  updatedAt DateTime @updatedAt
+}
+
+/// Tracks USDT immediately available for P2P escrow funding
+model SystemHotWallet {
+  id        Int      @id @default(1)
+  balance   Decimal  @default(0.0) @db.Decimal(20, 8)
+  updatedAt DateTime @updatedAt
+}
+
+/// Tracks net fiat received from all completed P2P trades
+model SystemFiatPool {
+  id        Int      @id @default(1)
+  balance   Decimal  @default(0.0) @db.Decimal(20, 8)
+  updatedAt DateTime @updatedAt
+}
+
+/// Tracks accumulated platform profit (fees, margins, spreads)
+model SystemProfitFees {
+  id        Int      @id @default(1)
+  balance   Decimal  @default(0.0) @db.Decimal(20, 8)
+  updatedAt DateTime @updatedAt
+}
+
+// =============================================================================
+// TREASURY ENGINE: TRANSACTION HISTORY & PROFIT LOGS
+// =============================================================================
+
+model TransactionHistory {
+  id         String            @id @default(uuid())
+  userId     Int
+  type       TransactionType
+  amountUsdc Decimal           @db.Decimal(20, 8)
+  feeUsdc    Decimal           @default(0) @db.Decimal(20, 8)
+  txHash     String?           @unique
+  status     TransactionStatus @default(PENDING)
+  createdAt  DateTime          @default(now())
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@index([userId])
+}
+
+model AdminProfitLog {
+  id           String       @id @default(uuid())
+  amountUsdc   Decimal      @db.Decimal(20, 8)
+  source       ProfitSource
+  relatedTxId  String?
+  isSubsidized Boolean      @default(false)
+  createdAt    DateTime     @default(now())
+}
+
+// =============================================================================
+// GAMIFICATION & ACCOUNT MANAGEMENT
+// =============================================================================
+
+model Badge {
+  id             String  @id @default(uuid())
+  name           String
+  iconUrl        String
+  description    String
+  requiredVolume Decimal @default(0.0) @db.Decimal(20, 8)
+
+  users User[] @relation("UserBadges")
+
+  @@index([name])
+}
+
+model LeaderboardRecord {
+  id            String   @id @default(uuid())
+  userId        Int
+  weekStartDate DateTime
+  totalVolume   Decimal  @db.Decimal(20, 8)
+  rank          Int
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([weekStartDate])
+}
+
+model AccountFeedback {
+  id           String   @id @default(uuid())
+  userId       Int
+  textReason   String
+  audioFileUrl String? // Reserved for future voice/audio feedback
+  createdAt    DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+// =============================================================================
+// ADMIN WAR ROOM & ANALYTICS
+// =============================================================================
+
+model DailySnapshot {
+  id              Int      @id @default(autoincrement())
+  date            DateTime @unique
+  totalProfitUsdc Decimal  @db.Decimal(20, 8)
+  activeUsers     Int
+  totalVolumeUsdc Decimal  @db.Decimal(20, 8)
+  profitBySource  Json
+  createdAt       DateTime @default(now())
+}
+
+model ColdStorageLog {
+  id         Int                  @id @default(autoincrement())
+  amountUsdc Decimal              @db.Decimal(20, 8)
+  direction  ColdStorageDirection
+  adminId    Int
+  notes      String?
+  createdAt  DateTime             @default(now())
+}
+
+model CorporatePurchaseLog {
+  id               Int                     @id @default(autoincrement())
+  usdcAmount       Decimal                 @db.Decimal(20, 8)
+  fiatSentTotal    Decimal                 @db.Decimal(20, 8)
+  discountRate     Decimal                 @db.Decimal(18, 8)
+  actualMarketRate Decimal                 @db.Decimal(18, 8)
+  screenshotUrl    String?
+  purchaseMethod   CorporatePurchaseMethod
+  adminId          Int
+
+  // Phase B: gateway provenance for API-initiated corporate purchases.
+  // gatewayReference is unique → second-write idempotency at the DB level.
+  gatewayProvider  String?
+  gatewayReference String? @unique
+
+  createdAt DateTime @default(now())
+}
+
+model ProfitWithdrawalLog {
+  id          Int      @id @default(autoincrement())
+  amountUsdc  Decimal  @db.Decimal(20, 8)
+  adminId     Int
+  destination String
+  createdAt   DateTime @default(now())
+}
+
+// =============================================================================
+// AI & SYSTEMS COMMAND
+// =============================================================================
+
+model OperationalExpense {
+  id          String   @id @default(uuid())
+  serviceName String
+  costUsdc    Decimal  @db.Decimal(20, 8)
+  timestamp   DateTime @default(now())
+
+  @@index([serviceName])
+  @@index([timestamp])
+}
+
+// =============================================================================
+// V3: SOCIAL FRIEND SYSTEM — Friendship, Direct Messaging & Peer Transfers
+// =============================================================================
+
+model Friendship {
+  id          String           @id @default(uuid())
+  requesterId Int
+  addresseeId Int
+  status      FriendshipStatus @default(PENDING)
+  message     String? // Intro message sent with friend request
+
+  // Phase UI-5 (2026-05-26): Per-friendship local nicknames. JSON map of
+  // `{ "<observerUserId>": "<nickname they set for the other person>" }`.
+  // Each side of the friendship can set their own nickname; both are
+  // stored in the same map keyed by the OBSERVER's userId.
+  localNicknames Json @default("{}")
+
+  requester User @relation("FriendshipRequester", fields: [requesterId], references: [id], onDelete: Cascade)
+  addressee User @relation("FriendshipAddressee", fields: [addresseeId], references: [id], onDelete: Cascade)
+
+  directMessages DirectMessage[]
+  peerTransfers  PeerTransfer[]
+  // Phase UI-4 (2026-05-26): Tickets Engine
+  tickets        Ticket[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([requesterId, addresseeId])
+  @@index([requesterId])
+  @@index([addresseeId])
+  @@index([status])
+  // Phase I: powers cursor pagination on GET /api/friends.
+  // Query: WHERE (requesterId=X OR addresseeId=X) AND status='ACCEPTED'
+  //        ORDER BY updatedAt DESC. The OR predicate needs both shapes —
+  //        Postgres BitmapOrs them and feeds the merged set into a top-K.
+  @@index([requesterId, status, updatedAt(sort: Desc)])
+  @@index([addresseeId, status, updatedAt(sort: Desc)])
+}
+
+model DirectMessage {
+  id           String            @id @default(uuid())
+  friendshipId String
+  senderId     Int
+  receiverId   Int
+  content      String
+  messageType  DirectMessageType @default(TEXT)
+  metadata     Json? // For transfer details (amount, reference, transferId)
+  isRead       Boolean           @default(false)
+
+  // Phase UI-3 (2026-05-26): media columns for rich-media chat.
+  // Used when messageType is IMAGE, VIDEO, DOCUMENT, AUDIO, or LINK.
+  mediaUrl           String?
+  mediaType          String?
+  mediaMimeType      String?
+  mediaSize          Int?
+  mediaDuration      Int?
+  mediaWaveformPeaks Json?
+  linkPreview        Json?
+
+  friendship Friendship @relation(fields: [friendshipId], references: [id], onDelete: Cascade)
+  sender     User       @relation("DirectMessageSender", fields: [senderId], references: [id], onDelete: Cascade)
+  receiver   User       @relation("DirectMessageReceiver", fields: [receiverId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
+  @@index([friendshipId])
+  @@index([senderId])
+  @@index([receiverId])
+  @@index([createdAt])
+  // Phase I: powers cursor pagination on GET /api/friends/chat/:friendshipId
+  // (filter friendshipId, order createdAt desc).
+  @@index([friendshipId, createdAt(sort: Desc)])
+}
+
+model PeerTransfer {
+  id           String             @id @default(uuid())
+  friendshipId String
+  senderId     Int // Person sending / person being requested from
+  receiverId   Int // Person receiving / person requesting
+  amount       Decimal            @db.Decimal(20, 8)
+  currency     String             @default("USDC")
+  reference    String? // Reason/note for the transfer
+  type         PeerTransferType // SEND or REQUEST
+  status       PeerTransferStatus @default(PENDING)
+
+  friendship Friendship @relation(fields: [friendshipId], references: [id], onDelete: Cascade)
+  sender     User       @relation("PeerTransferSender", fields: [senderId], references: [id], onDelete: Cascade)
+  receiver   User       @relation("PeerTransferReceiver", fields: [receiverId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([friendshipId])
+  @@index([senderId])
+  @@index([receiverId])
+  @@index([status])
+  @@index([type])
+}
+
+// =============================================================================
+// V3: AD INTERACTION ANALYTICS
+// Records every interaction a user has with a vendor ad for metrics tracking.
+// =============================================================================
+
+model AdInteraction {
+  id        String            @id @default(uuid())
+  adId      Int
+  userId    Int
+  type      AdInteractionType // VIEWED, TRADE_INITIATED, CLOSED
+  metadata  Json? // Optional: device info, session duration, etc.
+  createdAt DateTime          @default(now())
+
+  ad   Ad   @relation(fields: [adId], references: [id], onDelete: Cascade)
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([adId])
+  @@index([userId])
+  @@index([type])
+  @@index([createdAt])
+  @@index([adId, type])
+}
+
+// =============================================================================
+// V3: VENDOR ACHIEVEMENT SYSTEM
+// Tracks earned achievements/badges for vendor gamification.
+// =============================================================================
+
+model VendorAchievement {
+  id            String   @id @default(uuid())
+  userId        Int
+  achievementId String // Reference to achievement definition
+  name          String // Display name
+  description   String // What the vendor did to earn it
+  iconName      String // Frontend icon identifier
+  xpAwarded     Int      @default(0) // XP given when achievement was unlocked
+  tier          String   @default("COMMON") // COMMON, RARE, EPIC, LEGENDARY
+  unlockedAt    DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, achievementId])
+  @@index([userId])
+  @@index([achievementId])
+}
+
+// =============================================================================
+// PHASE E1: AZM REWARD LOG — Tracks every AZM credit event
+// Every time a user earns AZM (trade completion, login streak, referral,
+// achievement unlock, etc.), a row is written here. Provides a transparent
+// audit trail for the loyalty-point system and powers the "AZM History"
+// screen in the frontend.
+// =============================================================================
+
+model AzmRewardLog {
+  id           String   @id @default(uuid())
+  userId       Int
+  amount       Decimal  @db.Decimal(20, 8) // AZM credited (always positive — debits are a future Phase E2 concern)
+  reason       String // Human-readable description
+  source       String // Machine key: TRADE_COMPLETE, LOGIN_STREAK, REFERRAL_BONUS, ACHIEVEMENT_UNLOCK, MILESTONE
+  metadata     Json? // Optional context (tradeId, streak count, achievement name, etc.)
+  balanceAfter Decimal  @default(0.0) @db.Decimal(20, 8) // User's azmBalance after this credit
+  createdAt    DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt(sort: Desc)])
+  @@index([source])
+  @@index([userId, source])
+}
+
+// =============================================================================
+// PHASE E2: AZM SPEND LOG — Tracks every AZM debit event
+// Every time a user spends AZM (fee discounts, ad boosts, etc.), a row is
+// written here. Provides a transparent audit trail for the loyalty-point
+// spend side and powers the "AZM Spend History" in the frontend.
+// =============================================================================
+
+model AzmSpendLog {
+  id           String   @id @default(uuid())
+  userId       Int
+  amount       Decimal  @db.Decimal(20, 8) // AZM debited (always positive — the direction is implied by the table)
+  reason       String // Human-readable description
+  source       String // Machine key: FEE_DISCOUNT, AD_BOOST
+  metadata     Json? // Optional context (tierId, adId, discount percentage, etc.)
+  balanceAfter Decimal  @default(0.0) @db.Decimal(20, 8) // User's azmBalance after this debit
+  createdAt    DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt(sort: Desc)])
+  @@index([source])
+  @@index([userId, source])
+}
+
+// =============================================================================
+// V3: SAVINGS SYSTEM — Goal-Based Savings with Gamification
+// Users set savings targets with scheduled deposits. Funds are locked until
+// the goal end date. Early withdrawal incurs a penalty. Streaks reward
+// consistency.
+// =============================================================================
+
+model SavingsGoal {
+  id                     String    @id @default(uuid())
+  userId                 Int
+  name                   String    @default("My Savings")
+  targetAmountGhs        Decimal   @db.Decimal(20, 8) // Total target in GHS
+  currentAmountGhs       Decimal   @default(0.0) @db.Decimal(20, 8) // Progress so far (GHS equivalent)
+  frequencyAmount        Decimal   @db.Decimal(20, 8) // Amount per scheduled deposit (GHS)
+  frequency              String    @default("WEEKLY") // DAILY, WEEKLY, BIWEEKLY, MONTHLY
+  startDate              DateTime  @default(now())
+  endDate                DateTime? // When the goal matures (null = open-ended)
+  nextDueDate            DateTime? // Next scheduled deposit date
+  status                 String    @default("ACTIVE") // ACTIVE, COMPLETED, PAUSED, CANCELLED
+  streakCount            Int       @default(0) // Consecutive on-time deposits
+  longestStreak          Int       @default(0)
+  missedCount            Int       @default(0) // Times the user missed a deposit
+  totalDeposits          Int       @default(0) // Count of successful deposits
+  isLocked               Boolean   @default(true) // Whether early withdrawal is penalized
+  earlyWithdrawalPenalty Decimal   @default(0.02) @db.Decimal(10, 4) // 2% penalty for breaking lock
+
+  user     User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  deposits SavingsDeposit[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
+  @@index([status])
+  @@index([nextDueDate])
+}
+
+model SavingsDeposit {
+  id         String  @id @default(uuid())
+  goalId     String
+  userId     Int
+  amountGhs  Decimal @db.Decimal(20, 8) // Amount deposited in GHS
+  amountUsdc Decimal @db.Decimal(20, 8) // USDC equivalent at time of deposit
+  type       String  @default("SCHEDULED") // SCHEDULED, MANUAL, BONUS
+  status     String  @default("COMPLETED") // COMPLETED, FAILED, PENDING
+
+  goal SavingsGoal @relation(fields: [goalId], references: [id], onDelete: Cascade)
+  user User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
+  @@index([goalId])
+  @@index([userId])
+}
+
+// =============================================================================
+// PHASE Q1: ADMIN FEE PROFILES — Dynamic Margin/Split Control
+//
+// The admin can create fee profiles that override the default platform fee
+// percentages and admin/vendor split ratios. Profiles target specific scopes
+// (all users, vendor tiers, influencer referrals, holiday promos) and have
+// optional time windows. The highest-priority matching profile wins.
+//
+// Resolution logic (in services/feeProfileService.js):
+//   1. Find active profiles where validFrom <= now <= validUntil (or null)
+//   2. Filter to those matching the trade context (user referral, vendor tier, ALL)
+//   3. Pick highest priority
+// =============================================================================
+// PHASE Q12: RATE ALERT SYSTEM
+//
+// Users set price alerts ("Notify me when USD/GHS crosses X").
+// The oracle service checks all active, un-triggered alerts on each rate sync.
+// When a threshold is crossed, the alert is marked triggered and a notification
+// is sent via notificationService.
+// =============================================================================
+
+model RateAlert {
+  id            String    @id @default(uuid())
+  userId        Int
+  targetRate    Decimal   @db.Decimal(18, 8) // The rate threshold
+  direction     String    @default("ABOVE") // ABOVE | BELOW
+  ratePair      String    @default("USD_GHS") // Which rate pair to watch
+  isTriggered   Boolean   @default(false)
+  triggeredAt   DateTime?
+  triggeredRate Decimal?  @db.Decimal(18, 8) // The rate when alert fired
+  isActive      Boolean   @default(true)
+  note          String? // User's optional label
+
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt DateTime @default(now())
+
+  @@index([isActive, isTriggered, direction, targetRate])
+  @@index([userId, createdAt(sort: Desc)])
+}
+
+// =============================================================================
+// PHASE Q14: DISPUTE RESOLUTION — Structured Admin Workflow
+//
+// When a trade enters DISPUTED status, an admin can resolve it via:
+//   1. Assign (auto or manual)
+//   2. Review (chat history, proofs, user stats)
+//   3. Rule (BUYER_WINS, VENDOR_WINS, SPLIT)
+//   4. Auto-execute (escrow release, notifications, stats update)
+// =============================================================================
+
+model DisputeResolution {
+  id           String    @id @default(uuid())
+  tradeId      Int       @unique // One resolution per trade
+  adminId      Int // Admin who resolved
+  ruling       String // BUYER_WINS | VENDOR_WINS | SPLIT
+  reason       String // Admin's explanation (required)
+  buyerAmount  Decimal   @default(0) @db.Decimal(20, 8) // USDC credited to buyer
+  vendorAmount Decimal   @default(0) @db.Decimal(20, 8) // USDC credited to vendor
+  totalEscrow  Decimal   @db.Decimal(20, 8) // Total escrow at resolution time
+  status       String    @default("PENDING") // PENDING | EXECUTED | FAILED
+  executedAt   DateTime?
+
+  trade Trade @relation(fields: [tradeId], references: [id])
+  admin User  @relation("DisputeResolutionAdmin", fields: [adminId], references: [id])
+
+  createdAt DateTime @default(now())
+
+  @@index([status])
+  @@index([adminId])
+  @@index([createdAt(sort: Desc)])
+}
+
+// =============================================================================
+// PHASE V: VENDOR APPLICATION — Binance-Level Merchant Registration
+//
+// Users submit comprehensive KYC + financial information to become vendors.
+// Admin reviews in the War Room → APPROVED triggers role change USER → VENDOR.
+// =============================================================================
+
+enum VendorApplicationStatus {
+  PENDING
+  UNDER_REVIEW
+  APPROVED
+  REJECTED
+}
+
+enum SourceOfFunds {
+  EMPLOYMENT
+  BUSINESS
+  INVESTMENTS
+  SAVINGS
+  OTHER
+}
+
+enum MonthlyVolumeEstimate {
+  TIER_1 // $0 – $1,000
+  TIER_2 // $1,000 – $5,000
+  TIER_3 // $5,000 – $20,000
+  TIER_4 // $20,000+
+}
+
+model VendorApplication {
+  id     String                  @id @default(uuid())
+  userId Int
+  status VendorApplicationStatus @default(PENDING)
+
+  // Step 1: Personal Identity
+  legalName    String
+  dateOfBirth  String
+  country      String
+  idType       String // NATIONAL_ID | PASSPORT | DRIVERS_LICENSE
+  idImageFront String? // URL after upload
+  idImageBack  String? // URL (optional)
+  selfieWithId String? // URL after upload
+
+  // Step 2: Proof of Address
+  proofOfAddress String? // URL after upload
+  addressStreet  String
+  addressCity    String
+  addressRegion  String
+  addressPostal  String?
+
+  // Step 3: Financial Background
+  sourceOfFunds         SourceOfFunds         @default(EMPLOYMENT)
+  sourceOfFundsOther    String? // Free text if OTHER
+  monthlyVolumeEstimate MonthlyVolumeEstimate @default(TIER_1)
+  hasPreviousExperience Boolean               @default(false)
+  previousPlatforms     String? // Comma-separated platform names
+
+  // Step 4: Payment Methods (stored as JSON array)
+  paymentMethods Json @default("[]")
+
+  // Step 5: Terms & Collateral
+  acceptedTerms    Boolean @default(false)
+  collateralAmount Decimal @default(500) @db.Decimal(20, 8)
+
+  // Admin Review
+  reviewedBy      Int? // Admin user ID
+  reviewedAt      DateTime?
+  rejectionReason String?
+  adminNotes      String?
+
+  // Relations
+  user     User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  reviewer User? @relation("VendorApplicationReviewer", fields: [reviewedBy], references: [id])
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
+  @@index([status])
+  @@index([createdAt(sort: Desc)])
+}
+
+// =============================================================================
+// LINK PREVIEW CACHE (Phase UI-3, 2026-05-26)
+//
+// Caches Open Graph metadata fetched server-side so:
+//   • Clients never deal with CORS/network issues fetching arbitrary URLs.
+//   • Two users sharing the same link don't hit the origin twice.
+//   • The 24h TTL is enforced via the `expiresAt` column read in the
+//     linkPreviewService — entries past their expiry are re-fetched.
+// =============================================================================
+model LinkPreviewCache {
+  id          String   @id @default(uuid())
+  urlHash     String   @unique // sha256 of normalised URL — index target
+  url         String // original URL (for debugging / re-fetch)
+  title       String?
+  description String?  @db.Text
+  image       String? // primary OG image URL
+  favicon     String?
+  siteName    String?
+  status      String   @default("OK") // OK | FAILED | TIMEOUT | BLOCKED
+  fetchedAt   DateTime @default(now())
+  expiresAt   DateTime
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@index([urlHash])
+  @@index([expiresAt])
+}
+
+// =============================================================================
+// TICKETS ENGINE (Phase UI-4, 2026-05-26)
+//
+// Tickets are isolated, trackable chat workspaces generated INSIDE an
+// existing peer-to-peer friendship to record a specific business deal,
+// transaction, or agreement. They are NOT escrow-backed P2P trades —
+// those remain the formal `Trade` flow with `escrowLockedBalance`. Tickets
+// are lightweight social-transactional records that two friends create
+// to track an off-platform deal, service swap, or escrow arrangement
+// they're negotiating.
+//
+// Ticket lifecycle:
+//   OPEN      — newly created, both parties can post messages
+//   CLOSED    — parties marked the deal complete (immutable thereafter)
+//   CANCELLED — parties abandoned the negotiation (immutable thereafter)
+//
+// On creation, a TICKET_LINK DirectMessage is injected into the parent
+// friendship chat so both parties see the event card in their main feed
+// and can deep-link into the ticket workspace.
+// =============================================================================
+
+enum TicketType {
+  BUY
+  SELL
+  ESCROW
+  SERVICE_SWAP
+}
+
+enum TicketStatus {
+  OPEN
+  CLOSED
+  CANCELLED
+}
+
+model Ticket {
+  id             String       @id @default(uuid())
+  friendshipId   String
+  creatorId      Int
+  counterpartyId Int
+  name           String       @db.VarChar(80)
+  type           TicketType
+  targetAmount   Decimal      @db.Decimal(20, 8)
+  targetCurrency String       @db.VarChar(8)
+  memo           String?      @db.VarChar(500)
+  status         TicketStatus @default(OPEN)
+
+  // Lifecycle timestamps
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+  closedAt       DateTime?
+  cancelledAt    DateTime?
+  lastActivityAt DateTime  @default(now())
+
+  friendship   Friendship      @relation(fields: [friendshipId], references: [id], onDelete: Cascade)
+  creator      User            @relation("TicketCreator", fields: [creatorId], references: [id], onDelete: Cascade)
+  counterparty User            @relation("TicketCounterparty", fields: [counterpartyId], references: [id], onDelete: Cascade)
+  messages     TicketMessage[]
+
+  @@index([friendshipId])
+  @@index([creatorId])
+  @@index([counterpartyId])
+  @@index([status])
+  // Powers the dashboard query: WHERE friendshipId=X AND status=Y
+  // ORDER BY lastActivityAt DESC.
+  @@index([friendshipId, status, lastActivityAt(sort: Desc)])
+}
+
+model TicketMessage {
+  id       String  @id @default(uuid())
+  ticketId String
+  senderId Int
+  type     String // TEXT | IMAGE | VIDEO | DOCUMENT | AUDIO | LINK | TRANSFER | SYSTEM
+  content  String?
+  metadata Json? // For transfer details, system-event payloads, etc.
+
+  // Phase UI-3 media columns — same shape as DirectMessage so the
+  // chat_media_bubble.dart widget renders identically in either context.
+  mediaUrl           String?
+  mediaType          String?
+  mediaMimeType      String?
+  mediaSize          Int?
+  mediaDuration      Int?
+  mediaWaveformPeaks Json?
+  linkPreview        Json?
+
+  ticket Ticket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  sender User   @relation("TicketMessageSender", fields: [senderId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
+  @@index([ticketId])
+  @@index([senderId])
+  @@index([ticketId, createdAt(sort: Desc)])
+}
+
+// =============================================================================
+// MASTER SPRINT (2026-05-27): VAULTS, SUSU, SMART ROUTE, AZM AUCTION
+// =============================================================================
+
+// ── PHASE 1: SOLO VAULT ──────────────────────────────────────────────────────
+//
+// A locked escrow wallet with gamified deposit rules. Users accept a "Rules
+// of the Game" pop-up before creating, defining:
+//   • A target amount + maturity date (hard lockup)
+//   • Optional auto-deposit rule (cron-fired)
+//   • An early-break penalty (default 5%)
+//
+// Funds live OUTSIDE availableBalance — tracked on Vault.currentAmountUsdc.
+// The vaultWorker sweeps matured vaults nightly and routes funds back to
+// availableBalance + writes a receipt snapshot. AZM intensity rewards are
+// computed per-deposit (Amount × Frequency multiplier × streak bonus).
+// =============================================================================
+
+model Vault {
+  id                String      @id @default(uuid())
+  userId            Int
+  name              String      @db.VarChar(60)
+  targetAmountUsdc  Decimal     @db.Decimal(20, 8)
+  currentAmountUsdc Decimal     @default(0) @db.Decimal(20, 8)
+  status            VaultStatus @default(ACTIVE)
+
+  // Rules-of-the-game contract (mandatory acceptance before creation)
+  rulesAcceptedAt      DateTime
+  rulesAcceptedVersion Int      @default(1)
+  earlyBreakPenaltyPct Decimal  @default(0.05) @db.Decimal(5, 4)
+  isLocked             Boolean  @default(true)
+
+  // Timeline
+  startDate    DateTime  @default(now())
+  maturityDate DateTime
+  completedAt  DateTime?
+  brokenAt     DateTime?
+
+  // Auto-deposit rule (1:1 with vault — null means manual-only)
+  autoRuleEnabled    Boolean         @default(false)
+  autoRuleAmountUsdc Decimal?        @db.Decimal(20, 8)
+  autoRuleFrequency  VaultFrequency?
+  autoRuleNextRun    DateTime? // cron scans this column
+
+  // Gamification
+  streakCount      Int     @default(0)
+  longestStreak    Int     @default(0)
+  missedCount      Int     @default(0)
+  consistencyScore Decimal @default(0) @db.Decimal(5, 2)
+  totalAzmEarned   Decimal @default(0) @db.Decimal(20, 8)
+
+  // Receipt snapshot (denormalised on completion for fast UI render)
+  receiptSnapshot Json?
+
+  user     User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  deposits VaultDeposit[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
+  @@index([status])
+  @@index([autoRuleEnabled, autoRuleNextRun])
+  @@index([status, maturityDate])
+}
+
+model VaultDeposit {
+  id         String             @id @default(uuid())
+  vaultId    String
+  userId     Int
+  amountUsdc Decimal            @db.Decimal(20, 8)
+  type       VaultDepositType
+  status     VaultDepositStatus @default(COMPLETED)
+
+  // AZM intensity reward breakdown (rendered verbatim in the FE explainer)
+  azmAwarded   Decimal @default(0) @db.Decimal(20, 8)
+  azmBreakdown Json?
+
+  // For AUTO_RULE: did the cron find idle funds?
+  scheduledFor  DateTime?
+  attemptedAt   DateTime  @default(now())
+  failureReason String?
+
+  vault Vault @relation(fields: [vaultId], references: [id], onDelete: Cascade)
+  user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
+  @@index([vaultId, createdAt(sort: Desc)])
+  @@index([userId, createdAt(sort: Desc)])
+  @@index([status])
+}
+
+// ── PHASE 2: GROUP CHAT + SUSU ─────────────────────────────────────────────
+//
+// Group chat is a parallel surface to DirectMessage (which is friend-pair
+// scoped). Conversation is reserved for trade rooms — both stay untouched.
+// Groups can be Susu-enabled by binding a SusuGroup row.
+// =============================================================================
+
+model GroupChat {
+  id          String          @id @default(uuid())
+  name        String          @db.VarChar(80)
+  description String?         @db.VarChar(280)
+  avatarUrl   String?
+  createdById Int
+  status      GroupChatStatus @default(ACTIVE)
+
+  // 1:0..1 binding to SusuGroup. Set when admin starts a susu inside the group.
+  susuGroupId String? @unique
+
+  members      GroupMember[]
+  messages     GroupMessage[]
+  vouchRecords VouchRecord[]
+  joinRequests GroupJoinRequest[]
+  susuGroup    SusuGroup?     @relation("GroupSusu", fields: [susuGroupId], references: [id], onDelete: SetNull)
+  createdBy    User           @relation("GroupChatCreator", fields: [createdById], references: [id])
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status])
+  @@index([createdById])
+}
+
+model GroupMember {
+  id            String    @id @default(uuid())
+  groupId       String
+  userId        Int
+  role          GroupRole @default(MEMBER)
+  joinedAt      DateTime  @default(now())
+  removedAt     DateTime?
+  removedReason String?
+
+  // PHASE 6: vouch lineage. addedById = who added/vouched for this member
+  // (admin self-add → admin; member proposal → proposer). vouchedById = the
+  // resolved voucher for Susu purposes (defaults to addedById). These let the
+  // initiation split compute Vouched/Unvouched without a separate join, and
+  // VouchRecord creation pulls voucherId from vouchedById at activation.
+  addedById   Int?
+  vouchedById Int?
+
+  group GroupChat @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  user  User      @relation("GroupMembership", fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([groupId, userId])
+  @@index([userId])
+  @@index([groupId, role])
+}
+
+// ── PHASE 6: GROUP JOIN REQUEST (member-proposed add → admin approval) ──────
+// A persisted proposal by one group member (the proposer / voucher-to-be) to
+// add a target user to a group. Pending until the admin approves or rejects.
+// On approval the target becomes a GroupMember with vouchedById = proposerId.
+model GroupJoinRequest {
+  id           String                 @id @default(uuid())
+  groupId      String
+  proposerId   Int // the voucher-to-be
+  targetUserId Int
+  note         String? // free-text reason, surfaced in notifications
+  status       GroupJoinRequestStatus @default(PENDING)
+  decidedById  Int? // admin who approved/rejected
+  decidedAt    DateTime?
+  createdAt    DateTime               @default(now())
+
+  group    GroupChat @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  proposer User      @relation("GJRProposer", fields: [proposerId], references: [id], onDelete: Cascade)
+  target   User      @relation("GJRTarget", fields: [targetUserId], references: [id], onDelete: Cascade)
+
+  @@unique([groupId, targetUserId, status])
+  @@index([groupId, status])
+  @@index([targetUserId, status])
+}
+
+model GroupMessage {
+  id       String  @id @default(uuid())
+  groupId  String
+  senderId Int?
+  type     String // TEXT | IMAGE | VIDEO | DOCUMENT | AUDIO | LINK | SYSTEM | SUSU_EVENT | VOUCH_REQUEST
+  content  String?
+  metadata Json?
+
+  // Same media columns as DirectMessage / TicketMessage
+  mediaUrl           String?
+  mediaType          String?
+  mediaMimeType      String?
+  mediaSize          Int?
+  mediaDuration      Int?
+  mediaWaveformPeaks Json?
+  linkPreview        Json?
+
+  group  GroupChat @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  sender User?     @relation("GroupMessageSender", fields: [senderId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now())
+
+  @@index([groupId, createdAt(sort: Desc)])
+  @@index([senderId])
+}
+
+model VouchRecord {
+  id           String  @id @default(uuid())
+  groupId      String
+  inviteeId    Int? // nullable: pre-registration vouches link by phone
+  inviteePhone String? // phone-based vouch target (auto-linked on signup)
+  voucherId    Int
+  isInviter    Boolean @default(false)
+
+  // The Vouch Form payload
+  relationship        String  @db.VarChar(80)
+  durationKnown       String  @db.VarChar(40)
+  reasonForTrust      String  @db.VarChar(500)
+  acknowledgesPenalty Boolean @default(false)
+
+  status      VouchStatus @default(PENDING)
+  submittedAt DateTime?
+
+  group   GroupChat @relation(fields: [groupId], references: [id], onDelete: Cascade)
+  invitee User?     @relation("VouchInvitee", fields: [inviteeId], references: [id], onDelete: Cascade)
+  voucher User      @relation("VouchVoucher", fields: [voucherId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([groupId, inviteeId])
+  @@index([voucherId])
+  @@index([status])
+  @@index([inviteePhone]) // registration hook scans this
+}
+
+model SusuGroup {
+  id        String     @id @default(uuid())
+  groupChat GroupChat? @relation("GroupSusu")
+
+  status                SusuStatus    @default(CONFIGURING)
+  contributionUsdc      Decimal       @db.Decimal(20, 8)
+  frequency             SusuFrequency
+  totalCycles           Int
+  startDate             DateTime
+  contractAcceptedCount Int           @default(0)
+  contractRequiredCount Int
+
+  // Smart-rotation snapshot at start (immutable order for UI)
+  rotationSnapshot Json
+
+  // ── PRIVATE SUSU ECOSYSTEM (2026-05-31) ────────────────────────────────
+  // Liability_Contract version pinned at activation time (Req 4.10)
+  contractVersion String?
+  contractHash    String?
+  // Activation timestamp distinct from startDate so we can tell pre-activation
+  // Susus apart from active ones (Req 8.7)
+  activatedAt     DateTime?
+  // Circuit Breaker freeze record (Req 11.9)
+  frozenAt        DateTime?
+  frozenReason    String?
+
+  // ── PHASE 5 / Workstream D (2026-06-01): Group-chat-first initiation ──
+  // When an admin clicks "Initiate Susu" inside a group chat, the SusuGroup
+  // is created in CONFIGURING with an initiation countdown. Every member
+  // must reach KYC=VERIFIED + PoR=VERIFIED + contract acceptance before the
+  // deadline, or the initiation-sweep worker removes them from the group
+  // and either activates with the verified set or aborts.
+  initiationDeadline DateTime?
+  initiatedById      Int?
+
+  members              SusuMember[]
+  cycles               SusuCycle[]
+  invites              SusuInvite[]
+  liabilityAcceptances LiabilityAcceptance[]
+  voucherSlashLogs     VoucherSlashLog[]
+  reminderRows         SusuReminderSent[]
+  warRoomAlerts        AdminWarRoomAlert[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status])
+  @@index([startDate])
+}
+
+model SusuMember {
+  id                 String           @id @default(uuid())
+  susuGroupId        String
+  userId             Int
+  cycleSlot          Int
+  trustScore         Decimal          @db.Decimal(8, 4)
+  status             SusuMemberStatus @default(PENDING_CONTRACT)
+  contractAcceptedAt DateTime?
+
+  // Vouch chain that admitted this member
+  inviterId   Int?
+  vouchedById Int?
+
+  // Default tracking
+  defaultedAt     DateTime?
+  totalSeizedUsdc Decimal   @default(0) @db.Decimal(20, 8)
+
+  // ── PHASE 5 / Workstream B (2026-06-01): auto-retain opt-in ──
+  // When true, the member has asked the platform to keep the next
+  // contribution amount reserved from their availableBalance after a
+  // payout, so the upcoming cycle self-funds without a manual top-up.
+  // Honoured by the Reminder_Cron / cycle funding logic (Workstream C).
+  autoRetainNextCycle Boolean @default(false)
+
+  susu          SusuGroup          @relation(fields: [susuGroupId], references: [id], onDelete: Cascade)
+  user          User               @relation("SusuMembership", fields: [userId], references: [id], onDelete: Cascade)
+  contributions SusuContribution[]
+  reminderRows  SusuReminderSent[]
+
+  @@unique([susuGroupId, userId])
+  @@unique([susuGroupId, cycleSlot])
+  @@index([userId])
+  @@index([status])
+}
+
+model SusuCycle {
+  id             String          @id @default(uuid())
+  susuGroupId    String
+  cycleNumber    Int
+  collectionDate DateTime
+  payoutAmount   Decimal         @db.Decimal(20, 8)
+  payoutUserId   Int
+  status         SusuCycleStatus @default(PENDING)
+
+  paidOutAt     DateTime?
+  defaultsCount Int       @default(0)
+
+  // ── PRIVATE SUSU ECOSYSTEM (2026-05-31) ────────────────────────────────
+  // Set when Cycle_Scheduler transitions PENDING → COLLECTING (Req 10.1)
+  startedCollectingAt DateTime?
+  // Non-null when payout was diverted to azaman-treasury because the
+  // designated payoutUser had defaulted (Req 10.8)
+  escrowDivertedAt    DateTime?
+
+  // ── PHASE 5 / Workstream C (2026-06-01): Grace window deadline ──
+  // Set when the cycle enters COLLECTING_GRACE. The Cycle_Scheduler keeps
+  // re-evaluating the cycle while now() < graceUntil (members may top up
+  // and fund); once now() >= graceUntil any still-short member is
+  // hard-defaulted and the cycle is finalized.
+  graceUntil          DateTime?
+
+  // ── PHASE 6 / Phase 5 (2026-06-01): Susu Profit Engine ──
+  // Platform fee deducted from the pooled contribution before payout.
+  // Calculated as ROUND_DOWN(pooled × GlobalSettings.susuProfitPct).
+  // Persisted for audit and transparency. takeHome = pooled - feeUsdc.
+  feeUsdc             Decimal?                @db.Decimal(20, 8)
+
+  susu             SusuGroup           @relation(fields: [susuGroupId], references: [id], onDelete: Cascade)
+  payoutUser       User                @relation("SusuCycleWinner", fields: [payoutUserId], references: [id])
+  contributions    SusuContribution[]
+  voucherSlashLogs VoucherSlashLog[]
+  reminderRows     SusuReminderSent[]
+  warRoomAlerts    AdminWarRoomAlert[]
+
+  @@unique([susuGroupId, cycleNumber])
+  @@index([status, collectionDate])
+  @@index([payoutUserId])
+}
+
+model SusuContribution {
+  id                  String                 @id @default(uuid())
+  cycleId             String
+  memberId            String
+  userId              Int
+  amountUsdc          Decimal                @db.Decimal(20, 8)
+  status              SusuContributionStatus
+  collectedAt         DateTime               @default(now())
+  seizedFromAvailable Decimal                @default(0) @db.Decimal(20, 8)
+  shortfall           Decimal                @default(0) @db.Decimal(20, 8)
+
+  cycle  SusuCycle  @relation(fields: [cycleId], references: [id], onDelete: Cascade)
+  member SusuMember @relation(fields: [memberId], references: [id], onDelete: Cascade)
+  user   User       @relation("SusuContributor", fields: [userId], references: [id])
+
+  @@unique([cycleId, memberId])
+  @@index([userId])
+  @@index([status])
+}
+
+// =============================================================================
+// PRIVATE SUSU ECOSYSTEM — NEW TABLES (2026-05-31)
+// =============================================================================
+//
+// Strictly additive overlay on the deployed SusuGroup / SusuMember /
+// SusuCycle / SusuContribution / VouchRecord scaffolding. Each new table
+// powers a specific requirement from
+// .kiro/specs/private-susu-ecosystem/requirements.md:
+//
+//   SusuInvite               — Req 6 (three-channel invites)
+//   LiabilityContractVersion — Req 4 (versioned contract bodies + hashes)
+//   LiabilityAcceptance      — Req 4 (per-user / per-Susu acceptance audit)
+//   VoucherSlashLog          — Req 7 (immutable AZM/trust slash record)
+//   SusuReminderSent         — Req 13 (T-24h reminder idempotency)
+//   AdminWarRoomAlert        — Req 10.12 / Req 11.9 (Circuit Breaker + escrow alerts)
+//
+// All tables key off SusuGroup.id (the existing Susu identifier). VouchRecord
+// continues to power the rich Vouch-Form workflow; new SusuInvite rows
+// trigger VouchRecord creation through SusuVouch_Service in Phase 2.
+// =============================================================================
+
+model SusuInvite {
+  id            String            @id @default(uuid())
+  susuGroupId   String
+  inviterId     Int
+  inviteeUserId Int? // null until a PHONE invite is bound to a verified phone
+  inviteePhone  String? // E.164 normalised; populated only for PHONE channel
+  channel       SusuInviteChannel
+  token         String?           @unique // 32-byte URL-safe random for LINK channel only
+  status        SusuInviteStatus  @default(PENDING)
+  expiresAt     DateTime
+  redeemedAt    DateTime?
+  createdAt     DateTime          @default(now())
+
+  susu    SusuGroup @relation(fields: [susuGroupId], references: [id], onDelete: Cascade)
+  inviter User      @relation("SusuInviteInviter", fields: [inviterId], references: [id])
+  invitee User?     @relation("SusuInviteInvitee", fields: [inviteeUserId], references: [id])
+
+  @@index([susuGroupId, status])
+  @@index([inviteeUserId, status])
+  @@index([inviteePhone, status])
+}
+
+model LiabilityContractVersion {
+  id           String   @id @default(uuid())
+  version      String   @unique // e.g. "v1.0", "v1.1"
+  contractHash String   @unique // SHA-256 of body
+  body         String   @db.Text
+  publishedAt  DateTime @default(now())
+  publishedBy  Int
+
+  publisher User @relation("ContractPublisher", fields: [publishedBy], references: [id])
+
+  @@index([publishedAt(sort: Desc)])
+}
+
+model LiabilityAcceptance {
+  id              String   @id @default(uuid())
+  userId          Int
+  susuGroupId     String
+  contractVersion String
+  contractHash    String
+  acceptedAt      DateTime @default(now())
+  ipAddress       String
+  userAgent       String
+
+  // ── PHASE 6 / Phase 4 (2026-06-01): Consent & Voucher tracking ──────────
+  // acknowledgedClauses: JSON array of clause keys the user ticked in the
+  // Consent_Gate modal (e.g., ["seizure", "tracing", "named_voucher"]).
+  // Persisted for audit and future enforcement. Nullable for backward
+  // compatibility with existing acceptances.
+  acknowledgedClauses Json?
+  // voucherUserId: the User.id of the member who vouched for this user at
+  // acceptance time. Nullable: null means the user was already a group member
+  // (no vouch needed) or was auto-vouched by the initiator.
+  voucherUserId       Int?
+
+  user    User      @relation(fields: [userId], references: [id])
+  susu    SusuGroup @relation(fields: [susuGroupId], references: [id], onDelete: Cascade)
+  voucher User?     @relation("LiabilityVoucher", fields: [voucherUserId], references: [id])
+
+  @@unique([userId, susuGroupId, contractVersion])
+  @@index([susuGroupId])
+  @@index([voucherUserId])
+}
+
+model VoucherSlashLog {
+  id                String   @id @default(uuid())
+  voucherId         Int? // nullable for absent-vouch case (Req 7.4)
+  vouchedUserId     Int
+  susuGroupId       String
+  cycleId           String
+  azmDeducted       Decimal  @db.Decimal(20, 8)
+  trustRatingBefore Int
+  trustRatingAfter  Int
+  appliedAt         DateTime @default(now())
+
+  voucher User?     @relation("SlashVoucher", fields: [voucherId], references: [id])
+  vouched User      @relation("SlashVouched", fields: [vouchedUserId], references: [id])
+  susu    SusuGroup @relation(fields: [susuGroupId], references: [id], onDelete: Cascade)
+  cycle   SusuCycle @relation(fields: [cycleId], references: [id], onDelete: Cascade)
+
+  @@index([voucherId])
+  @@index([susuGroupId, cycleId])
+}
+
+model SusuReminderSent {
+  id           String   @id @default(uuid())
+  susuMemberId String
+  susuCycleId  String
+  susuGroupId  String // denormalised for cleanup convenience
+  reminderType String // 'T_24H_SHORTFALL' for now; expandable
+  sentAt       DateTime @default(now())
+
+  member SusuMember @relation(fields: [susuMemberId], references: [id], onDelete: Cascade)
+  cycle  SusuCycle  @relation(fields: [susuCycleId], references: [id], onDelete: Cascade)
+  susu   SusuGroup  @relation(fields: [susuGroupId], references: [id], onDelete: Cascade)
+
+  @@unique([susuMemberId, susuCycleId, reminderType])
+  @@index([susuCycleId])
+}
+
+model AdminWarRoomAlert {
+  id             String                @id @default(uuid())
+  alertType      AdminWarRoomAlertType
+  susuGroupId    String
+  cycleId        String?
+  payload        Json
+  createdAt      DateTime              @default(now())
+  acknowledgedAt DateTime?
+  acknowledgedBy Int?
+
+  // ── PHASE 5 / Workstream E (2026-06-01): incident resolution ──
+  // How the admin closed the incident from the War Room: RESUME (lift the
+  // FROZEN_DISPUTE freeze and let cycles continue) or REFUND_AND_CLOSE
+  // (return the frozen pool to members and cancel the Susu). Null until the
+  // incident is resolved.
+  resolution     String?
+  resolvedAt     DateTime?
+  resolvedBy     Int?
+
+  susu  SusuGroup  @relation(fields: [susuGroupId], references: [id], onDelete: Cascade)
+  cycle SusuCycle? @relation(fields: [cycleId], references: [id], onDelete: SetNull)
+  ackBy User?      @relation("AlertAcknowledger", fields: [acknowledgedBy], references: [id])
+
+  @@index([acknowledgedAt, createdAt(sort: Desc)])
+  @@index([susuGroupId])
+}
+
+// ── PHASE 3: SMART ROUTE ────────────────────────────────────────────────────
+
+model SmartRoute {
+  id         String              @id @default(uuid())
+  userId     Int
+  name       String              @db.VarChar(60)
+  action     SmartRouteAction
+  amountUsdc Decimal             @db.Decimal(20, 8)
+  frequency  SmartRouteFrequency
+  dayOfMonth Int?
+  status     SmartRouteStatus    @default(ACTIVE)
+
+  // Destination (one is set depending on `action`)
+  destMomoNumber    String?
+  destMomoProvider  String?
+  destFriendUserId  Int?
+  destSavingsGoalId String?
+  destVaultId       String?
+
+  startDate       DateTime
+  endDate         DateTime?
+  nextRunAt       DateTime
+  lastRunAt       DateTime?
+  totalRuns       Int       @default(0)
+  totalRoutedUsdc Decimal   @default(0) @db.Decimal(20, 8)
+
+  user User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+  runs SmartRouteRun[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
+  @@index([status, nextRunAt])
+}
+
+model SmartRouteRun {
+  id         String              @id @default(uuid())
+  routeId    String
+  userId     Int
+  status     SmartRouteRunStatus
+  amountUsdc Decimal             @db.Decimal(20, 8)
+  amountGhs  Decimal?            @db.Decimal(20, 8)
+  rateUsed   Decimal?            @db.Decimal(18, 8)
+
+  withdrawalId  Int? // loose FK — no @relation to keep Withdrawal untouched
+  failureReason String?
+
+  route SmartRoute @relation(fields: [routeId], references: [id], onDelete: Cascade)
+  user  User       @relation("SmartRouteRunUser", fields: [userId], references: [id])
+
+  createdAt DateTime @default(now())
+
+  @@index([routeId, createdAt(sort: Desc)])
+  @@index([userId, createdAt(sort: Desc)])
+}
+
+// ── PHASE 4: AZM AUCTION (AD BOOST SINK) ───────────────────────────────────
+
+model AzmAuction {
+  id          String           @id @default(uuid())
+  windowStart DateTime
+  windowEnd   DateTime
+  status      AzmAuctionStatus @default(OPEN)
+
+  leaderboard    Json?
+  winnerCount    Int       @default(3)
+  totalAzmBurned Decimal   @default(0) @db.Decimal(20, 8)
+  settledAt      DateTime?
+
+  bids AzmAuctionBid[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([windowStart, windowEnd])
+  @@index([status])
+  @@index([windowEnd])
+}
+
+model AzmAuctionBid {
+  id           String       @id @default(uuid())
+  auctionId    String
+  vendorId     Int
+  adId         Int
+  bidAmountAzm Decimal      @db.Decimal(20, 8)
+  status       AzmBidStatus @default(ACTIVE)
+
+  rank         Int?
+  azmBurned    Decimal   @default(0) @db.Decimal(20, 8)
+  boostedUntil DateTime?
+
+  auction AzmAuction @relation(fields: [auctionId], references: [id], onDelete: Cascade)
+  vendor  User       @relation("AuctionBidder", fields: [vendorId], references: [id], onDelete: Cascade)
+  ad      Ad         @relation("AuctionAd", fields: [adId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([auctionId, vendorId])
+  @@index([auctionId, bidAmountAzm(sort: Desc)])
+  @@index([vendorId])
+  @@index([adId])
+}
+
+// =============================================================================
+// SAVED MOMO ACCOUNTS  (Master Sprint v2, 2026-05-27)
+//
+// Local-fiat deposit destinations the user pre-saves so the deposit screen
+// can fire a STK-push prompt to a known/verified phone number with one tap.
+// We never collect "payment" inputs at deposit time — the gateway sends the
+// prompt to the saved phone, the user approves it on their phone, and the
+// webhook credits availableBalance once the gateway confirms settlement.
+//
+// Save-time security:
+//   • Backend re-verifies the user's password (or 2FA token) before persisting.
+//   • Provider name lookup (mocked until Kotani Pay V3 ships the endpoint —
+//     the field then just gets re-populated at first use).
+// =============================================================================
+
+model SavedMomoAccount {
+  id          String    @id @default(uuid())
+  userId      Int
+  nickname    String    @db.VarChar(40) // user-chosen label e.g. "Mum's MTN"
+  provider    String // MTN | VODAFONE | TELECEL
+  phoneNumber String // E.164 string, unique per user+number
+  accountName String? // resolved via provider lookup
+  isVerified  Boolean   @default(false) // true once provider returns a name
+  isPrimary   Boolean   @default(false) // user can mark one as default
+  lastUsedAt  DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, phoneNumber])
+  @@index([userId])
+}

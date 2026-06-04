@@ -1,0 +1,108 @@
+// middleware/banGuardMiddleware.js
+// =============================================================================
+// AZAMAN V2 — BAN GUARD
+//
+// Enforces the "Ghost Ban" model from AZAMAN_MASTER_SOUL.md:
+//   - Banned users retain READ-ONLY access (GET requests pass through).
+//   - Any write action (POST / PUT / PATCH / DELETE) is rejected with a
+//     structured 403 envelope so the frontend can render the appeal banner.
+//   - Time-bound bans (banUntil in the past) auto-restore to ACTIVE.
+//
+// Pairs with the existing `protect` middleware. The exported `protectActive`
+// chain runs `protect` first to populate req.user, then `checkBan` to verify
+// the user is permitted to perform write actions.
+// =============================================================================
+
+const { protect } = require('./authMiddleware');
+
+const APPEAL_EMAIL = process.env.APPEAL_EMAIL || 'support@azaman.me';
+
+/**
+ * checkBan
+ *
+ * Assumes `protect` has already populated req.user with the JWT payload.
+ * GET requests are permitted unconditionally so banned users can browse the
+ * marketplace, view their trades, and read chats. Any non-GET request is
+ * blocked unless banStatus === 'ACTIVE' or the time-bound ban has expired.
+ */
+const checkBan = async (req, res, next) => {
+    // No user context → let the route's own protect/auth handler reject it.
+    if (!req.user || !req.user.id) return next();
+
+    // Read-only access is always allowed (Ghost Ban semantics).
+    if (req.method === 'GET') return next();
+
+    const prisma = req.app.get('prisma');
+
+    try {
+        const user = await prisma.user.findUnique({
+            where:  { id: parseInt(req.user.id, 10) },
+            select: { banStatus: true, banUntil: true, isDeleted: true }
+        });
+
+        if (!user) {
+            return res.status(401).json({
+                success: false,
+                code:    'USER_NOT_FOUND',
+                message: 'Authenticated user no longer exists.'
+            });
+        }
+
+        if (user.isDeleted) {
+            return res.status(403).json({
+                success: false,
+                code:    'ACCOUNT_DELETED',
+                message: 'This account has been deactivated.'
+            });
+        }
+
+        // Active user — pass through.
+        if (user.banStatus === 'ACTIVE') return next();
+
+        // Auto-restore expired time-bound bans.
+        if (user.banUntil && new Date(user.banUntil) <= new Date()) {
+            await prisma.user.update({
+                where: { id: parseInt(req.user.id, 10) },
+                data:  { banStatus: 'ACTIVE', banUntil: null }
+            });
+            console.log(`[banGuard] Auto-restored expired ban for user ${req.user.id}`);
+            return next();
+        }
+
+        // Indefinite or still-active timed ban — reject the write.
+        return res.status(403).json({
+            success: false,
+            code:        'ACCOUNT_RESTRICTED',
+            banStatus:   user.banStatus,
+            banUntil:    user.banUntil,
+            appealEmail: APPEAL_EMAIL,
+            message:
+                'Your account is currently restricted. You retain read-only access. ' +
+                `If you believe this is in error, contact ${APPEAL_EMAIL} to appeal.`
+        });
+    } catch (err) {
+        console.error('[banGuard] error:', err.message);
+        // Fail-closed on the strict reading: if we cannot verify ban status,
+        // do not allow the write to proceed.
+        return res.status(500).json({
+            success: false,
+            code:    'BAN_GUARD_FAILURE',
+            message: 'Unable to verify account status. Please try again.'
+        });
+    }
+};
+
+/**
+ * protectActive
+ *
+ * Drop-in replacement for `protect` on routes that mutate state. Ensures the
+ * caller is both authenticated AND has an ACTIVE banStatus before the
+ * controller runs.
+ *
+ * Usage:
+ *   const { protectActive } = require('../middleware/banGuardMiddleware');
+ *   router.post('/initiate', protectActive, controller.initiateTrade);
+ */
+const protectActive = [protect, checkBan];
+
+module.exports = { checkBan, protectActive, APPEAL_EMAIL };

@@ -1,0 +1,42 @@
+-- =============================================================================
+-- Phase J — Schema cleanup: drop dead V1 columns
+-- =============================================================================
+--
+-- Drops two columns from "User" that have been write-dead since the V2
+-- "Great Account Split" landed:
+--
+--   * lockedBalance — V1 vendor escrow lock. Replaced by escrowLockedBalance
+--     (active trade) + vendorUnallocatedBalance (auto-cancel rebate) +
+--     disputeEscrowBalance (frozen during open dispute). No code path has
+--     written to lockedBalance since the V2 split; only initialized to 0.0
+--     on user creation. See AUDIT.md Phase B finding D.
+--
+--   * ghsBalance — V1 per-currency fiat bucket. Replaced by the hologram
+--     model (availableBalance × yellow-card rate, computed on read). No
+--     code path has ever written to ghsBalance; read only in display
+--     selects which always returned 0.0. See AUDIT.md Phase B finding C.
+--
+-- Phase B's audit grep confirmed both fields are write-dead:
+--   $ grep -rn "ghsBalance:" backend  | grep -v "true\|select" -> 0 hits
+--   $ grep -rn "lockedBalance:" backend | grep -v "0.0\|true"  -> 0 hits
+--
+-- Coordinated FE update: lib/models/user_model.dart, lib/providers/
+-- {auth,hologram,trade}_provider.dart, lib/services/socket_service.dart,
+-- lib/screens/{user,vendor}_dashboard.dart, lib/screens/vendor_deposit_screen.dart
+-- all stop reading the dropped JSON keys in the Phase J FE PR. The hologram
+-- ghsBalanceProvider is removed (was always 0.0); UI now reads
+-- escrowLockedBalance for "in escrow" labels (was previously labeled but
+-- bound to the dead lockedBalance column).
+--
+-- DEFERRED to Phase J2: Float -> Decimal column type rewrite + CHECK
+-- (availableBalance >= 0) constraint on every money column. Both require
+-- a maintenance window (column-type rewrite locks the table).
+--
+-- Safety: data loss is acceptable. Both columns hold 0.0 for every row in
+-- every environment (verified by the no-write-path analysis above). No
+-- backup needed. The drop is fast — no row scan required for a column
+-- removal in Postgres.
+-- =============================================================================
+
+ALTER TABLE "User" DROP COLUMN IF EXISTS "lockedBalance";
+ALTER TABLE "User" DROP COLUMN IF EXISTS "ghsBalance";

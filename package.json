@@ -1,0 +1,45 @@
+{
+  "name": "azaman-backend",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "node server.js",
+    "build": "prisma generate",
+    "migrate:deploy": "prisma migrate deploy",
+    "install:susu": "node infra/install-susu-overlay.js",
+    "seed:susu": "node infra/seed-susu-foundation.js",
+    "release": "node infra/install-susu-overlay.js && node infra/seed-susu-foundation.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@prisma/adapter-pg": "^7.4.0",
+    "@prisma/client": "^6.19.2",
+    "axios": "^1.14.0",
+    "bcryptjs": "^2.4.3",
+    "cloudinary": "^2.10.0",
+    "dotenv": "^17.3.1",
+    "express": "^5.2.1",
+    "firebase-admin": "^13.6.1",
+    "http": "^0.0.1-security",
+    "jsonwebtoken": "^9.0.3",
+    "morgan": "^1.10.1",
+    "multer": "^2.1.1",
+    "node-cron": "^4.2.1",
+    "pdfkit": "^0.16.0",
+    "pg": "^8.18.0",
+    "prisma": "^6.19.2",
+    "qrcode": "^1.5.4",
+    "socket.io": "^4.8.3",
+    "speakeasy": "^2.0.0",
+    "tsx": "^4.21.0",
+    "uuid": "^13.0.0"
+  },
+  "devDependencies": {
+    "@types/pg": "^8.16.0"
+  }
+}

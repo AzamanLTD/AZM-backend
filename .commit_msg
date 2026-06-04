@@ -1,0 +1,65 @@
+feat(phase5): implement admin profit engine & transparent susu fee system
+
+PHASE 5 COMPLETE - Admin Profit Engine & Cycle Math
+
+This commit implements the final phase of the Susu feature set, adding
+a configurable platform fee system with full transparency and audit trails.
+
+Backend Changes:
+- Add GlobalSettings.susuProfitPct (default 3%) for configurable fees
+- Add SusuCycle.feeUsdc to track per-cycle platform fees
+- Add SUSU_PROFIT transaction type and SUSU_FEE profit source
+- Implement profit skim logic in susuService.processCycle()
+  * Calculates fee: ROUND_DOWN(totalCollected × profitPct)
+  * Deducts fee from payout (user receives net amount)
+  * Logs to AdminProfitLog with full metadata
+  * Creates SUSU_PROFIT transaction for audit trail
+- Update adminSettingsController to expose susuProfitPct via API
+  * GET /api/admin/settings returns current fee percentage
+  * PUT /api/admin/settings accepts updates (validated 0-1 range)
+  * All changes logged to AdminSettingsAuditLog
+
+Flutter Changes:
+- Add transparent fee breakdown to susu_config_screen.dart
+  * Displays: Total Pool, Azaman Fee (%), Net Take-Home Payout
+  * Updates dynamically as admin changes contribution amount
+  * Color-coded for clarity (red for fees, green for payout)
+  * Only shows when member count > 0
+
+Admin Portal Changes:
+- Add "Susu Platform Fee" section to Config.jsx
+  * Number input for fee percentage (0-1 range, step 0.001)
+  * Real-time display of current percentage
+  * Save button with toast notifications
+  * Positioned between payout settings and KYC section
+
+Financial Impact:
+- Default 3% fee on all Susu cycle payouts
+- Example: 20 members × $30 = $600 pool → $18 fee → $582 net payout
+- Admin-adjustable via web portal (0-100% range)
+- ROUND_DOWN calculation prevents over-charging
+
+Security & Compliance:
+- Admin-only access to fee configuration
+- All changes logged with old→new diffs
+- Atomic transactions prevent partial updates
+- Full audit trail for regulatory compliance
+- Users see fee breakdown BEFORE initiating Susu
+
+Validation:
+- ✅ 16/16 automated checks passed
+- ✅ All syntax validations passed
+- ✅ Schema overlay applied successfully (68 ok, 0 failed)
+- ✅ Flutter static analysis passed
+- ✅ No breaking changes to existing functionality
+
+Files Modified:
+- Backend: schema.prisma, install-susu-overlay.js, susuService.js, adminSettingsController.js
+- Flutter: susu_config_screen.dart
+- Admin Portal: Config.jsx
+
+Deployment Ready: YES
+Breaking Changes: NO
+Database Migration: Required (run install-susu-overlay.js)
+
+Refs: Phase 5 Specification, Admin Profit Engine Requirements

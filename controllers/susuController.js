@@ -1,0 +1,107 @@
+// controllers/susuController.js
+// =============================================================================
+// AZAMAN — SUSU CONTROLLER  (Master Sprint, 2026-05-27)
+// =============================================================================
+
+const wrap = (fn) => async (req, res) => {
+    try { await fn(req, res); }
+    catch (err) {
+        console.error(`[susuController] ${fn.name || 'h'}:`, err.message);
+        res.status(400).json({ success: false, message: err.message });
+    }
+};
+
+exports.createSusu = wrap(async function createSusu(req, res) {
+    const svc = req.app.get('susuService');
+    const { groupChatId, contributionUsdc, frequency, startDate } = req.body;
+    const susu = await svc.createSusu({
+        adminId: req.user.id,
+        groupChatId,
+        contributionUsdc,
+        frequency,
+        startDate,
+    });
+    res.status(201).json({ success: true, susu });
+});
+
+exports.getDetail = wrap(async function getDetail(req, res) {
+    const prisma = req.app.get('prisma');
+    const susu = await prisma.susuGroup.findUnique({
+        where: { id: req.params.id },
+        include: {
+            members: {
+                include: {
+                    user: { select: { id: true, username: true, profilePictureUrl: true } },
+                },
+                orderBy: { cycleSlot: 'asc' },
+            },
+            cycles: { orderBy: { cycleNumber: 'asc' } },
+            groupChat: { select: { id: true, name: true } },
+        },
+    });
+    if (!susu) return res.status(404).json({ success: false, message: 'Susu not found' });
+
+    // Verify caller is a member
+    const isMember = susu.members.some((m) => m.userId === req.user.id);
+    if (!isMember) return res.status(403).json({ success: false, message: 'Not a member' });
+
+    res.json({ success: true, susu });
+});
+
+exports.acceptContract = wrap(async function acceptContract(req, res) {
+    const svc = req.app.get('susuService');
+    if (!req.body.acceptedSeverityWarning || !req.body.acceptedSeizureClause) {
+        return res.status(400).json({
+            success: false,
+            message: 'Both severity warning and seizure clause must be acknowledged.',
+        });
+    }
+    const result = await svc.acceptContract({
+        userId: req.user.id,
+        susuGroupId: req.params.id,
+    });
+    res.json({ success: true, ...result });
+});
+
+exports.cancel = wrap(async function cancel(req, res) {
+    const svc = req.app.get('susuService');
+    await svc.cancel({ adminId: req.user.id, susuGroupId: req.params.id });
+    res.json({ success: true });
+});
+
+exports.myPosition = wrap(async function myPosition(req, res) {
+    const prisma = req.app.get('prisma');
+    const member = await prisma.susuMember.findUnique({
+        where: { susuGroupId_userId: { susuGroupId: req.params.id, userId: req.user.id } },
+        include: {
+            susu: {
+                include: {
+                    cycles: {
+                        where: { status: 'PENDING' },
+                        orderBy: { collectionDate: 'asc' },
+                        take: 5,
+                    },
+                },
+            },
+        },
+    });
+    if (!member) return res.status(404).json({ success: false, message: 'Not a member' });
+    res.json({ success: true, member });
+});
+
+exports.submitVouch = wrap(async function submitVouch(req, res) {
+    const svc = req.app.get('susuService');
+    const { vouchRecordId, payload } = req.body;
+    const vouch = await svc.submitVouch({
+        voucherId: req.user.id,
+        vouchRecordId,
+        payload,
+    });
+    res.json({ success: true, vouch });
+});
+
+exports.pendingVouches = wrap(async function pendingVouches(req, res) {
+    const svc = req.app.get('susuService');
+    const vouches = await svc.pendingVouchesFor(req.user.id);
+    res.json({ success: true, vouches });
+});

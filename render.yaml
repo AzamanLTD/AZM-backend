@@ -1,0 +1,41 @@
+# =============================================================================
+# Render Blueprint — azaman-backend
+#
+# This file version-controls the deploy configuration so the migrate + seed
+# step is never lost to dashboard drift. If the service is currently
+# configured manually in the Render dashboard, mirror these commands there
+# (Settings → Build & Deploy):
+#
+#   Build Command:       npm install && npm run build
+#   Pre-Deploy Command:  npm run release      (Render "Pre-Deploy Command")
+#   Start Command:       npm start
+#
+# `npm run release` = `prisma migrate deploy && node infra/seed-susu-foundation.js`
+#   - prisma migrate deploy   → applies pending migrations (overlay + DAILY enum)
+#   - seed-susu-foundation.js → idempotently seeds the azaman-treasury wallet
+#                               and the v1.0 liability contract
+#
+# Both halves are idempotent, so re-running the release step is safe.
+#
+# IMPORTANT: the Pre-Deploy Command runs once, after build and BEFORE the new
+# version receives traffic. This guarantees the DB is migrated + seeded before
+# server.js boots. Even if it is omitted, server.js is resilient: it logs a
+# warning and disables only the Susu escrow/cycle features (the rest of the
+# backend stays up) until the seed is applied.
+# =============================================================================
+services:
+  - type: web
+    name: azaman-backend
+    runtime: node
+    plan: starter
+    branch: main
+    buildCommand: npm install && npm run build
+    preDeployCommand: npm run release
+    startCommand: npm start
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+      # DATABASE_URL and all secrets remain managed in the Render dashboard /
+      # environment group — they are intentionally NOT committed here.

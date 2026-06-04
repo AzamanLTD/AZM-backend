@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Azaman Vendor Simulator</title>
+</head>
+<body style="background-color: #121212; color: white; font-family: sans-serif; padding: 20px;">
+    <h1>Azaman Socket Tester</h1>
+    <p>Status: <span id="connection-status" style="color: red;">Disconnected</span></p>
+    
+    <div id="logs" style="background: #1e1e1e; border: 1px solid #333; padding: 20px; font-family: monospace; height: 400px; overflow-y: scroll; border-radius: 8px;">
+        <p style="color: #888;">Waiting for events...</p>
+    </div>
+
+    <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+    <script>
+        // Connect to your local server
+        const socket = io("http://localhost:3000");
+        const logs = document.getElementById('logs');
+        const statusText = document.getElementById('connection-status');
+
+        socket.on('connect', () => {
+            statusText.innerText = "Connected to Server";
+            statusText.style.color = "lightgreen";
+            console.log("Connected with ID:", socket.id);
+        });
+
+        // --- DEBUGGER: Listen for ANY event coming from the server ---
+        socket.onAny((eventName, data) => {
+            console.log(`Event: ${eventName}`, data);
+        });
+
+        // 1. Listen for new trade requests (Vendor side)
+        // If your Postman vendorId is "vendor_123", this matches perfectly
+        const myVendorId = "vendor_123"; 
+        
+        socket.on(`notify_vendor_${myVendorId}`, (data) => {
+            logs.innerHTML += `
+                <div style="border-left: 4px solid #F0B90B; background: #2b2b2b; padding: 10px; margin-bottom: 10px;">
+                    <b style="color: #F0B90B">[NEW TRADE REQUEST]</b><br>
+                    <span style="font-size: 12px; color: #aaa;">Trade ID: ${data.tradeId}</span><br>
+                    <b>Amount:</b> ${data.amount} ${data.asset}
+                </div>`;
+            
+            // AUTOMATICALLY JOIN THE TRADE ROOM
+            // This is crucial so the user and vendor can "talk" in private
+            socket.emit('join_trade', data.tradeId);
+            logs.innerHTML += `<p style="color: #888; font-size: 10px;">Joined Room: ${data.tradeId}</p>`;
+        });
+
+        // 2. Listen for status updates (e.g., when Vendor Authorizes or User Pays)
+        socket.on('trade_update', (data) => {
+            logs.innerHTML += `
+                <div style="border-left: 4px solid lightgreen; background: #2b2b2b; padding: 10px; margin-bottom: 10px;">
+                    <b style="color: lightgreen">[TRADE UPDATE]</b><br>
+                    Status changed to: <span style="color: white; font-weight: bold;">${data.status}</span>
+                </div>`;
+        });
+
+        socket.on('disconnect', () => {
+            statusText.innerText = "Disconnected";
+            statusText.style.color = "red";
+        });
+    </script>
+</body>
+</html>

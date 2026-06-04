@@ -1,0 +1,5 @@
+-- AlterEnum: Expand ProfitSource with additional revenue categories
+ALTER TYPE "ProfitSource" ADD VALUE IF NOT EXISTS 'GAS_FEE_REVENUE';
+ALTER TYPE "ProfitSource" ADD VALUE IF NOT EXISTS 'WITHDRAWAL_FEE';
+ALTER TYPE "ProfitSource" ADD VALUE IF NOT EXISTS 'SAVINGS_FEE';
+ALTER TYPE "ProfitSource" ADD VALUE IF NOT EXISTS 'SWAP_FEE';

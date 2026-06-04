@@ -1,0 +1,510 @@
+// services/receiptService.js
+// =============================================================================
+// AZAMAN — TRANSACTION RECEIPT SERVICE (Phase Q11)
+//
+// Generates downloadable PDF receipts for completed trades and withdrawals.
+//
+// Each receipt includes:
+//   - Azaman platform branding (header)
+//   - Transaction type, date, reference ID
+//   - Amount (crypto + fiat equivalent)
+//   - Counterparty (username masked to first 3 + ***)
+//   - Payment method used
+//   - Status (COMPLETED / PROCESSED)
+//   - QR code linking to the transaction (for verification)
+//   - Footer with platform disclaimer
+//
+// Dependencies: pdfkit, qrcode (both in package.json)
+//
+// Usage:
+//   const { generateTradeReceipt, generateWithdrawalReceipt } = require('./receiptService');
+//   const pdfBuffer = await generateTradeReceipt(trade, user);
+//   res.set('Content-Type', 'application/pdf');
+//   res.send(pdfBuffer);
+// =============================================================================
+
+const PDFDocument = require('pdfkit');
+const QRCode = require('qrcode');
+
+// ── Constants ────────────────────────────────────────────────────────────────
+
+const BRAND = {
+    name: 'AZAMAN',
+    tagline: 'Peer-to-Peer Crypto Exchange',
+    color: '#02C076',       // Accent green
+    darkColor: '#0B0E11',   // Background dark
+    textColor: '#333333',
+    lightGray: '#999999',
+    website: 'https://azaman.app',
+};
+
+const PAGE_MARGIN = 50;
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+/**
+ * Mask a username: show first 3 chars + ***
+ * e.g., "CryptoKing" → "Cry***"
+ */
+function maskUsername(username) {
+    if (!username) return '***';
+    if (username.length <= 3) return username + '***';
+    return username.substring(0, 3) + '***';
+}
+
+/**
+ * Format a date to a human-readable string.
+ */
+function formatDate(date) {
+    if (!date) return 'N/A';
+    const d = new Date(date);
+    return d.toLocaleDateString('en-US', {
+        year: 'numeric',
+        month: 'long',
+        day: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit',
+        timeZoneName: 'short',
+    });
+}
+
+/**
+ * Format a decimal amount to 2 decimal places with commas.
+ */
+function formatAmount(amount) {
+    const num = parseFloat(amount || 0);
+    return num.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
+
+/**
+ * Generate a QR code as a data URL (PNG base64).
+ */
+async function generateQRDataUrl(text) {
+    try {
+        return await QRCode.toDataURL(text, {
+            width: 100,
+            margin: 1,
+            color: { dark: '#000000', light: '#FFFFFF' },
+        });
+    } catch (err) {
+        console.error('[receiptService] QR generation failed:', err.message);
+        return null;
+    }
+}
+
+/**
+ * Convert a data URL to a Buffer for pdfkit.
+ */
+function dataUrlToBuffer(dataUrl) {
+    if (!dataUrl) return null;
+    const base64 = dataUrl.replace(/^data:image\/png;base64,/, '');
+    return Buffer.from(base64, 'base64');
+}
+
+// ── PDF Generation Helpers ───────────────────────────────────────────────────
+
+/**
+ * Draw the Azaman branded header on the PDF.
+ */
+function drawHeader(doc) {
+    // Brand name
+    doc.fontSize(22)
+       .fillColor(BRAND.color)
+       .font('Helvetica-Bold')
+       .text(BRAND.name, PAGE_MARGIN, PAGE_MARGIN, { align: 'left' });
+
+    // Tagline
+    doc.fontSize(9)
+       .fillColor(BRAND.lightGray)
+       .font('Helvetica')
+       .text(BRAND.tagline, PAGE_MARGIN, PAGE_MARGIN + 28, { align: 'left' });
+
+    // "TRANSACTION RECEIPT" right-aligned
+    doc.fontSize(11)
+       .fillColor(BRAND.textColor)
+       .font('Helvetica-Bold')
+       .text('TRANSACTION RECEIPT', PAGE_MARGIN, PAGE_MARGIN + 5, { align: 'right' });
+
+    // Divider line
+    const y = PAGE_MARGIN + 50;
+    doc.moveTo(PAGE_MARGIN, y)
+       .lineTo(doc.page.width - PAGE_MARGIN, y)
+       .strokeColor(BRAND.color)
+       .lineWidth(1.5)
+       .stroke();
+
+    return y + 20; // return the Y position after header
+}
+
+/**
+ * Draw a labeled row (key: value pair).
+ */
+function drawRow(doc, y, label, value, options = {}) {
+    const { bold = false, color = BRAND.textColor } = options;
+
+    doc.fontSize(10)
+       .fillColor(BRAND.lightGray)
+       .font('Helvetica')
+       .text(label, PAGE_MARGIN, y, { width: 160, align: 'left' });
+
+    doc.fontSize(10)
+       .fillColor(color)
+       .font(bold ? 'Helvetica-Bold' : 'Helvetica')
+       .text(value, PAGE_MARGIN + 170, y, { width: 300, align: 'left' });
+
+    return y + 22;
+}
+
+/**
+ * Draw the footer disclaimer.
+ */
+function drawFooter(doc) {
+    const footerY = doc.page.height - 80;
+
+    doc.moveTo(PAGE_MARGIN, footerY)
+       .lineTo(doc.page.width - PAGE_MARGIN, footerY)
+       .strokeColor('#DDDDDD')
+       .lineWidth(0.5)
+       .stroke();
+
+    doc.fontSize(7)
+       .fillColor(BRAND.lightGray)
+       .font('Helvetica')
+       .text(
+           'This receipt is generated by Azaman and serves as a record of the transaction. ' +
+           'It does not constitute a legal invoice. For disputes or inquiries, contact support@azaman.app.',
+           PAGE_MARGIN, footerY + 10,
+           { width: doc.page.width - PAGE_MARGIN * 2, align: 'center' }
+       );
+
+    doc.fontSize(7)
+       .text(
+           `Generated: ${formatDate(new Date())} | ${BRAND.website}`,
+           PAGE_MARGIN, footerY + 35,
+           { width: doc.page.width - PAGE_MARGIN * 2, align: 'center' }
+       );
+}
+
+// =============================================================================
+// PUBLIC: Generate Trade Receipt PDF
+// =============================================================================
+
+/**
+ * Generate a PDF receipt for a completed trade.
+ *
+ * @param {Object} trade - The trade record from Prisma (with user + vendor included)
+ * @param {Object} requestingUser - The user requesting the receipt (to determine perspective)
+ * @returns {Promise<Buffer>} - PDF file as a Buffer
+ */
+async function generateTradeReceipt(trade, requestingUser) {
+    const doc = new PDFDocument({ size: 'A4', margin: PAGE_MARGIN });
+    const buffers = [];
+
+    doc.on('data', (chunk) => buffers.push(chunk));
+
+    const isBuyer = requestingUser.id === trade.userId;
+    const counterparty = isBuyer ? trade.vendor : trade.user;
+    const role = isBuyer ? 'Buyer' : 'Vendor';
+    const tradeRef = `TRD-${String(trade.id).padStart(7, '0')}`;
+
+    // QR Code content: verification URL
+    const qrText = `${BRAND.website}/verify/trade/${trade.id}`;
+    const qrDataUrl = await generateQRDataUrl(qrText);
+    const qrBuffer = dataUrlToBuffer(qrDataUrl);
+
+    // Draw header
+    let y = drawHeader(doc);
+
+    // Transaction type section
+    doc.fontSize(13)
+       .fillColor(BRAND.textColor)
+       .font('Helvetica-Bold')
+       .text('P2P TRADE', PAGE_MARGIN, y);
+    y += 28;
+
+    // Details
+    y = drawRow(doc, y, 'Reference', tradeRef, { bold: true });
+    y = drawRow(doc, y, 'Date', formatDate(trade.completedAt || trade.createdAt));
+    y = drawRow(doc, y, 'Status', trade.status === 'COMPLETED' ? 'COMPLETED' : trade.status, {
+        bold: true,
+        color: trade.status === 'COMPLETED' ? BRAND.color : '#FF6B35',
+    });
+    y += 10;
+
+    // Amounts
+    y = drawRow(doc, y, 'Crypto Amount', `${formatAmount(trade.amountCrypto)} ${trade.crypto || 'USDC'}`);
+    y = drawRow(doc, y, 'Fiat Amount', `$${formatAmount(trade.amountFiat)} ${trade.currency || 'USD'}`);
+    y = drawRow(doc, y, 'Exchange Rate', `1 ${trade.crypto || 'USDC'} = $${formatAmount(trade.rate)} ${trade.currency || 'USD'}`);
+    y += 10;
+
+    // Parties
+    y = drawRow(doc, y, 'Your Role', role);
+    y = drawRow(doc, y, 'Counterparty', maskUsername(counterparty?.username));
+    y = drawRow(doc, y, 'Payment Method', trade.paymentMethod || 'N/A');
+    y += 10;
+
+    // Timing
+    y = drawRow(doc, y, 'Initiated', formatDate(trade.createdAt));
+    y = drawRow(doc, y, 'Completed', formatDate(trade.completedAt));
+    y = drawRow(doc, y, 'Time Taken', _calculateDuration(trade.createdAt, trade.completedAt));
+    y += 10;
+
+    // Vendor profit (only shown to vendor)
+    if (!isBuyer && trade.vendorProfitCut) {
+        y = drawRow(doc, y, 'Your Profit', `$${formatAmount(trade.vendorProfitCut)} USD`, { color: BRAND.color });
+        y += 10;
+    }
+
+    // QR Code
+    if (qrBuffer) {
+        doc.fontSize(8)
+           .fillColor(BRAND.lightGray)
+           .font('Helvetica')
+           .text('Scan to verify:', PAGE_MARGIN, y);
+        y += 14;
+        doc.image(qrBuffer, PAGE_MARGIN, y, { width: 80, height: 80 });
+        doc.fontSize(7)
+           .fillColor(BRAND.lightGray)
+           .text(qrText, PAGE_MARGIN + 90, y + 30, { width: 200 });
+    }
+
+    // Footer
+    drawFooter(doc);
+
+    doc.end();
+
+    return new Promise((resolve, reject) => {
+        doc.on('end', () => resolve(Buffer.concat(buffers)));
+        doc.on('error', reject);
+    });
+}
+
+// =============================================================================
+// PUBLIC: Generate Withdrawal Receipt PDF
+// =============================================================================
+
+/**
+ * Generate a PDF receipt for a completed withdrawal.
+ *
+ * @param {Object} withdrawal - The withdrawal record from Prisma (with user included)
+ * @param {Object} requestingUser - The user requesting the receipt
+ * @returns {Promise<Buffer>} - PDF file as a Buffer
+ */
+async function generateWithdrawalReceipt(withdrawal, requestingUser) {
+    const doc = new PDFDocument({ size: 'A4', margin: PAGE_MARGIN });
+    const buffers = [];
+
+    doc.on('data', (chunk) => buffers.push(chunk));
+
+    const withdrawalRef = `WDR-${String(withdrawal.id).padStart(7, '0')}`;
+
+    // QR Code
+    const qrText = `${BRAND.website}/verify/withdrawal/${withdrawal.id}`;
+    const qrDataUrl = await generateQRDataUrl(qrText);
+    const qrBuffer = dataUrlToBuffer(qrDataUrl);
+
+    // Draw header
+    let y = drawHeader(doc);
+
+    // Transaction type section
+    doc.fontSize(13)
+       .fillColor(BRAND.textColor)
+       .font('Helvetica-Bold')
+       .text('WITHDRAWAL', PAGE_MARGIN, y);
+    y += 28;
+
+    // Details
+    y = drawRow(doc, y, 'Reference', withdrawalRef, { bold: true });
+    y = drawRow(doc, y, 'Date', formatDate(withdrawal.createdAt));
+    y = drawRow(doc, y, 'Status', withdrawal.status, {
+        bold: true,
+        color: withdrawal.status === 'COMPLETED' ? BRAND.color :
+               withdrawal.status === 'FAILED' ? '#FF3B30' : '#FF9500',
+    });
+    y += 10;
+
+    // Amount details
+    y = drawRow(doc, y, 'Amount', `$${formatAmount(withdrawal.amount)} USDC`);
+    if (parseFloat(withdrawal.totalGasFee) > 0) {
+        y = drawRow(doc, y, 'Network Fee', `$${formatAmount(withdrawal.totalGasFee)} USDC`);
+        const netAmount = parseFloat(withdrawal.amount) - parseFloat(withdrawal.totalGasFee);
+        y = drawRow(doc, y, 'Net Received', `$${formatAmount(netAmount)} USDC`, { bold: true, color: BRAND.color });
+    }
+    y += 10;
+
+    // Payout details
+    y = drawRow(doc, y, 'Payout Method', _formatPayoutMethod(withdrawal.payoutMethod));
+    y = drawRow(doc, y, 'Network', withdrawal.network || 'N/A');
+    y = drawRow(doc, y, 'Destination', _maskDestination(withdrawal.destination));
+    y += 10;
+
+    // Timestamps
+    y = drawRow(doc, y, 'Initiated', formatDate(withdrawal.createdAt));
+    y = drawRow(doc, y, 'Last Updated', formatDate(withdrawal.updatedAt));
+    y += 10;
+
+    // QR Code
+    if (qrBuffer) {
+        doc.fontSize(8)
+           .fillColor(BRAND.lightGray)
+           .font('Helvetica')
+           .text('Scan to verify:', PAGE_MARGIN, y);
+        y += 14;
+        doc.image(qrBuffer, PAGE_MARGIN, y, { width: 80, height: 80 });
+        doc.fontSize(7)
+           .fillColor(BRAND.lightGray)
+           .text(qrText, PAGE_MARGIN + 90, y + 30, { width: 200 });
+    }
+
+    // Footer
+    drawFooter(doc);
+
+    doc.end();
+
+    return new Promise((resolve, reject) => {
+        doc.on('end', () => resolve(Buffer.concat(buffers)));
+        doc.on('error', reject);
+    });
+}
+
+// ── Private helpers ──────────────────────────────────────────────────────────
+
+function _calculateDuration(start, end) {
+    if (!start || !end) return 'N/A';
+    const ms = new Date(end) - new Date(start);
+    const minutes = Math.floor(ms / 60000);
+    if (minutes < 60) return `${minutes} min`;
+    const hours = Math.floor(minutes / 60);
+    const remainMinutes = minutes % 60;
+    if (hours < 24) return `${hours}h ${remainMinutes}m`;
+    const days = Math.floor(hours / 24);
+    return `${days}d ${hours % 24}h`;
+}
+
+function _formatPayoutMethod(method) {
+    if (!method) return 'N/A';
+    const map = {
+        'BINANCE_ID': 'Binance ID',
+        'MTN_MOMO': 'MTN Mobile Money',
+        'VODAFONE_CASH': 'Vodafone Cash',
+        'POLYGON_USDC': 'Polygon (USDC)',
+        'BANK_TRANSFER': 'Bank Transfer',
+    };
+    return map[method] || method.replace(/_/g, ' ');
+}
+
+function _maskDestination(dest) {
+    if (!dest || dest === 'OLD_RECORD') return '***';
+    if (dest.length <= 6) return dest;
+    return dest.substring(0, 4) + '****' + dest.substring(dest.length - 4);
+}
+
+// =============================================================================
+// PUBLIC: Generate Transfer Receipt PDF (Phase UI-5, 2026-05-26)
+//
+// Receipts are immutable records of direct P2P off-ticket money transfers
+// between two friends — the existing "send money with a tracking reason"
+// flow. Source: PeerTransfer rows in COMPLETED status. Cleanly differentiates
+// casual balance transfers from structured ticket deals or formal P2P
+// trade settlements.
+// =============================================================================
+
+/**
+ * Generate a PDF receipt for a completed peer transfer.
+ *
+ * @param {Object} transfer - The PeerTransfer record from Prisma (with sender + receiver included)
+ * @param {Object} observer - The user requesting the receipt (must be sender or receiver)
+ * @returns {Promise<Buffer>} PDF file as a Buffer
+ */
+async function generateTransferReceipt(transfer, observer) {
+    const doc = new PDFDocument({ size: 'A4', margin: PAGE_MARGIN });
+    const buffers = [];
+    doc.on('data', (chunk) => buffers.push(chunk));
+
+    const transferRef = `TRF-${String(transfer.id).slice(0, 12).toUpperCase()}`;
+
+    // QR code → verification URL
+    const qrText = `${BRAND.website}/verify/transfer/${transfer.id}`;
+    const qrDataUrl = await generateQRDataUrl(qrText);
+    const qrBuffer = dataUrlToBuffer(qrDataUrl);
+
+    // Determine direction from the observer's perspective
+    const isSender = transfer.senderId === observer.id;
+    const counterparty = isSender ? transfer.receiver : transfer.sender;
+    const direction = isSender ? 'SENT' : 'RECEIVED';
+    const directionColor = isSender ? '#FF9500' /* warning */ : BRAND.color;
+
+    let y = drawHeader(doc);
+
+    doc.fontSize(13)
+       .fillColor(BRAND.textColor)
+       .font('Helvetica-Bold')
+       .text(`PEER TRANSFER — ${direction}`, PAGE_MARGIN, y);
+    y += 28;
+
+    // Reference + status
+    y = drawRow(doc, y, 'Reference', transferRef, { bold: true });
+    y = drawRow(doc, y, 'Date', formatDate(transfer.createdAt));
+    y = drawRow(doc, y, 'Status', transfer.status, {
+        bold: true,
+        color: transfer.status === 'COMPLETED' ? BRAND.color :
+               transfer.status === 'DECLINED' || transfer.status === 'FAILED' ? '#FF3B30' : '#FF9500',
+    });
+    y += 10;
+
+    // Amount
+    y = drawRow(
+        doc, y,
+        direction === 'SENT' ? 'Amount Sent' : 'Amount Received',
+        `${formatAmount(transfer.amount)} ${transfer.currency || 'USDC'}`,
+        { bold: true, color: directionColor }
+    );
+    y += 10;
+
+    // Parties
+    y = drawRow(doc, y, 'Direction', isSender ? 'You → Counterparty' : 'Counterparty → You');
+    y = drawRow(doc, y, 'Counterparty', maskUsername(counterparty?.username));
+    y += 10;
+
+    // Reference / memo (free-form note from the sender)
+    if (transfer.reference && transfer.reference.trim().length > 0) {
+        y = drawRow(doc, y, 'Memo / Reason', transfer.reference);
+        y += 10;
+    }
+
+    // Type (SEND vs REQUEST fulfilled)
+    y = drawRow(doc, y, 'Type', transfer.type || 'SEND');
+    y = drawRow(doc, y, 'Last Updated', formatDate(transfer.updatedAt));
+    y += 10;
+
+    // QR code
+    if (qrBuffer) {
+        doc.fontSize(8)
+           .fillColor(BRAND.lightGray)
+           .font('Helvetica')
+           .text('Scan to verify:', PAGE_MARGIN, y);
+        y += 14;
+        doc.image(qrBuffer, PAGE_MARGIN, y, { width: 80, height: 80 });
+        doc.fontSize(7)
+           .fillColor(BRAND.lightGray)
+           .text(qrText, PAGE_MARGIN + 90, y + 30, { width: 200 });
+    }
+
+    drawFooter(doc);
+    doc.end();
+
+    return new Promise((resolve, reject) => {
+        doc.on('end', () => resolve(Buffer.concat(buffers)));
+        doc.on('error', reject);
+    });
+}
+
+// =============================================================================
+// EXPORTS
+// =============================================================================
+
+module.exports = {
+    generateTradeReceipt,
+    generateWithdrawalReceipt,
+    generateTransferReceipt,
+};
