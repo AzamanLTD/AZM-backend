@@ -22,9 +22,9 @@
 
 ## CHANGELOG & POST-AUDIT VERIFICATION
 
-### Phase ADMIN-CONTROL-2 — Backend Critical Fixes (2026-06-06, implemented, BE)
+### Phase ADMIN-CONTROL-2 — Backend Critical Fixes + Missing Indexes (2026-06-06, implemented, BE)
 
-Six targeted fixes closing the gaps identified in the full three-codebase audit:
+Seven targeted fixes closing the gaps identified in the full three-codebase audit:
 
 1. **GET /api/auth/platform/config** — new public (no-auth) endpoint exposing all user-facing fee rates from GlobalSettings. Flutter PlatformConfigProvider calls this on app start. Falls back to hardcoded defaults if DB is offline so the app is never broken by a missing row. Rate-limited to 60 req/min per IP via generalLimiter to prevent scraper abuse.
 
@@ -39,6 +39,8 @@ Six targeted fixes closing the gaps identified in the full three-codebase audit:
 6. **Trade initiation response enriched with earnings preview object** — expectedVendorEarningsUsdc, vendorSplitPct, platformFeePct, appliedProfileName. Calculated using resolveFeeProfile at initiation time. Informational only — does not affect the actual fee split at trade completion. Allows Flutter to show vendors their expected earnings without client-side estimation.
 
 7. **Dispute resolution buyerPercent safety guard** — values outside 5–95% range return HTTP 422 with code EXTREME_RULING_REQUIRES_OVERRIDE. Caller must resend with override: true to proceed. Prevents accidental 0% or 100% rulings in adminRoutes.js. Does not block valid edge cases — just requires explicit confirmation.
+
+8. **Database Index Migration (20260606120000_add_missing_indexes)** — Comprehensive index audit across all 40+ models. 16 models had zero or insufficient indexes. Added 55 new indexes using CREATE INDEX CONCURRENTLY (zero downtime). Critical fixes: Withdrawal (was zero indexes → 3 composites for admin queue, user history, reconciliation), TransactionHistory (userId only → 4 composites for pagination and filtering), AdminProfitLog (zero → 3 for revenue dashboard), SavedWallet (zero → 2 for withdrawal screen), Review (only unique → 3 for vendor profile), plus Susu, SmartRoute, Group, TradeQueue, ColdStorage, VendorApplication, and Savings models. Every index targets a traced query pattern from controllers/services/workers.
 
 ### Phase UI-5 — Chat Profile + Transaction Vault (2026-05-26, in review, BE)
 
