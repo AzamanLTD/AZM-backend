@@ -212,6 +212,15 @@ exports.fiatWithdrawal = async (req, res) => {
     } catch (error) {
         console.error('[finance.fiatWithdrawal] error:', error.message);
 
+        // Phase ADMIN-CONTROL-2 FIX 5: Fiat pool insufficient liquidity
+        if (error.code === 'FIAT_POOL_INSUFFICIENT') {
+            return res.status(503).json({
+                success: false,
+                code: 'FIAT_POOL_INSUFFICIENT',
+                message: error.message
+            });
+        }
+
         // Double-Check failure → freeze record + 403
         if (error.message.includes('[DoubleCheck]')) {
             try {

@@ -29,6 +29,64 @@ router.post('/logout',  refreshController.logout);
 // --- NEW PUBLIC DOOR: Fetch Live Oracle Rates (Used by Dashboards & Wallets) ---
 router.get('/settings/rates', authController.getPublicRates);
 
+// --- Phase ADMIN-CONTROL-2: Public Platform Configuration (FIX 1) ---
+// GET /api/auth/platform/config — returns all user-facing fee rates from
+// GlobalSettings. No authentication required. Falls back to hardcoded
+// defaults if DB is offline. Called by Flutter PlatformConfigProvider on
+// app start. Rate-limited to 60 req/min per IP (via generalLimiter).
+const { generalLimiter } = require('../middleware/rateLimitMiddleware');
+router.get('/platform/config', generalLimiter, async (req, res) => {
+    const prisma = req.app.get('prisma');
+    try {
+        let settings = await prisma.globalSettings.findUnique({ where: { id: 1 } });
+        if (!settings) {
+            settings = {
+                fiatWithdrawalFeePct: 0.02,
+                cryptoPlatformFeePct: 0.00,
+                cryptoWithdrawalFeePct: 0.01,
+                p2pFeePct: 0.02,
+                tierThreshold: 1000,
+                vendorShareUnder1k: 0.40,
+                vendorShareOver1k: 0.50,
+                bankMargin: 0.03,
+                thirdPartyMargin: 0.02,
+                susuProfitPct: 0.03
+            };
+        }
+        return res.status(200).json({
+            success: true,
+            config: {
+                fiatWithdrawalFeePct: Number(settings.fiatWithdrawalFeePct),
+                cryptoPlatformFeePct: Number(settings.cryptoPlatformFeePct),
+                cryptoWithdrawalFeePct: Number(settings.cryptoWithdrawalFeePct),
+                p2pFeePct: Number(settings.p2pFeePct),
+                tierThreshold: Number(settings.tierThreshold),
+                vendorShareUnder1k: Number(settings.vendorShareUnder1k),
+                vendorShareOver1k: Number(settings.vendorShareOver1k),
+                bankMargin: Number(settings.bankMargin),
+                thirdPartyMargin: Number(settings.thirdPartyMargin),
+                susuProfitPct: Number(settings.susuProfitPct)
+            }
+        });
+    } catch (e) {
+        return res.status(200).json({
+            success: true,
+            config: {
+                fiatWithdrawalFeePct: 0.02,
+                cryptoPlatformFeePct: 0.00,
+                cryptoWithdrawalFeePct: 0.01,
+                p2pFeePct: 0.02,
+                tierThreshold: 1000,
+                vendorShareUnder1k: 0.40,
+                vendorShareOver1k: 0.50,
+                bankMargin: 0.03,
+                thirdPartyMargin: 0.02,
+                susuProfitPct: 0.03
+            }
+        });
+    }
+});
+
 // --- THE NEW DOOR: Fetch User Balance & Details ---
 router.get('/me/:id', protect, authController.getUserDetails);
 

@@ -273,6 +273,26 @@ router.post('/disputes/:tradeId/resolve', async (req, res) => {
         const { ruling, reason, buyerPercent } = req.body;
         const adminId = req.user.id;
 
+        // --- Phase ADMIN-CONTROL-2 FIX 6A: Dispute buyerPercent validation ---
+        if (ruling === 'SPLIT') {
+            const buyerPct = parseInt(buyerPercent, 10);
+            if (isNaN(buyerPct) || buyerPct < 0 || buyerPct > 100) {
+                return res.status(400).json({
+                    success: false,
+                    message: 'buyerPercent must be an integer between 0 and 100.'
+                });
+            }
+            const isExtremeRuling = buyerPct < 5 || buyerPct > 95;
+            if (isExtremeRuling && req.body.override !== true) {
+                return res.status(422).json({
+                    success: false,
+                    code: 'EXTREME_RULING_REQUIRES_OVERRIDE',
+                    message: `buyerPercent of ${buyerPct}% is an extreme ruling. If you are certain, resend with override: true in the request body.`,
+                    requiresOverride: true
+                });
+            }
+        }
+
         const resolution = await service.resolveDispute({
             tradeId,
             adminId,

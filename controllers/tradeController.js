@@ -15,6 +15,7 @@
 const { sendPushNotification } = require('../utils/firebaseService');
 const gamification = require('../services/vendorGamificationService');
 const { parsePagination, buildPageEnvelope } = require('../utils/pagination');
+const { resolveFeeProfile } = require('../services/feeProfileService');
 
 /**
  * Phase N helper: retrieve the singleton NotificationService from app context.
@@ -75,6 +76,22 @@ exports.initiateTrade = async (req, res) => {
     try {
         const { adId, amountCrypto, amountFiat, paymentMethod, idempotencyKey, buyerPaymentDetails } = req.body;
         const userId = req.user.id;
+
+        // --- Phase ADMIN-CONTROL-2 FIX 3: Server-side KYC gate ---
+        const buyerKyc = await prisma.user.findUnique({
+            where: { id: userId },
+            select: { kycStatus: true, banStatus: true }
+        });
+        if (!buyerKyc) {
+            return res.status(404).json({ success: false, message: 'User not found.' });
+        }
+        if (buyerKyc.kycStatus !== 'VERIFIED') {
+            return res.status(403).json({
+                success: false,
+                code: 'KYC_REQUIRED',
+                message: 'KYC verification is required before trading. Please complete identity verification in your profile settings.'
+            });
+        }
 
         // HIGH-6: Input validation
         if (!adId) {
@@ -331,7 +348,32 @@ exports.initiateTrade = async (req, res) => {
             }
         });
 
-        res.status(201).json({ success: true, queued: false, trade: newTrade });
+        // --- Phase ADMIN-CONTROL-2: Add expected vendor earnings to response (PROMPT 5) ---
+        const feeProfile = await resolveFeeProfile(prisma, {
+            vendorId: newTrade.vendorId,
+            buyerId: userId,
+            amountCrypto: newTrade.amountCrypto
+        });
+        
+        const earningsSettings = await prisma.globalSettings.findUnique({ where: { id: 1 } });
+        const tierThreshold = Number(earningsSettings?.tierThreshold ?? 1000);
+        const platformFeePct = feeProfile.platformFeePct || Number(earningsSettings?.p2pFeePct ?? 0.02);
+        const vendorSplit = Number(newTrade.amountCrypto) >= tierThreshold
+            ? (feeProfile.vendorSplitPct || Number(earningsSettings?.vendorShareOver1k ?? 0.50))
+            : (feeProfile.vendorSplitPct || Number(earningsSettings?.vendorShareUnder1k ?? 0.40));
+        const expectedVendorEarningsUsdc = parseFloat((Number(newTrade.amountCrypto) * platformFeePct * vendorSplit).toFixed(6));
+
+        res.status(201).json({
+            success: true,
+            queued: false,
+            trade: newTrade,
+            earnings: {
+                expectedVendorEarningsUsdc,
+                vendorSplitPct: vendorSplit,
+                platformFeePct,
+                appliedProfileName: feeProfile.profileName
+            }
+        });
 
     } catch (error) {
         console.error('Initiate Trade Error:', error);

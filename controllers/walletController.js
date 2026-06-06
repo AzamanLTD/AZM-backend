@@ -25,6 +25,11 @@ exports.requestWithdrawal = async (req, res) => {
         const settings = await prisma.globalSettings.findUnique({ where: { id: 1 } });
         if (!settings) throw new Error("Global settings offline.");
 
+        // --- Phase ADMIN-CONTROL-2 FIX 2: Read crypto platform fee ---
+        const cryptoPlatformFeePct = Number(settings?.cryptoPlatformFeePct ?? 0);
+        const platformFeeUsdc = parseFloat((withdrawAmount * cryptoPlatformFeePct).toFixed(6));
+        const netAfterPlatformFee = withdrawAmount - platformFeeUsdc;
+
         // --- THE BACKEND DETECTIVE ---
         let payoutMethod = "UNKNOWN";
         let detectedNetwork = networkPref || "UNKNOWN";
@@ -78,6 +83,22 @@ exports.requestWithdrawal = async (req, res) => {
                 data: { availableBalance: { decrement: withdrawAmount } }
             });
 
+            // --- Phase ADMIN-CONTROL-2 FIX 2: Credit platform fee ---
+            if (platformFeeUsdc > 0) {
+                await tx.systemProfitFees.upsert({
+                    where: { id: 1 },
+                    update: { balance: { increment: platformFeeUsdc } },
+                    create: { id: 1, balance: platformFeeUsdc }
+                });
+                await tx.adminProfitLog.create({
+                    data: {
+                        amountUsdc: platformFeeUsdc,
+                        source: 'CRYPTO_WITHDRAWAL_FEE',
+                        relatedTxId: `crypto_pfee_${userId}_${Date.now()}`
+                    }
+                });
+            }
+
             // Create the heavily detailed withdrawal ticket
             const withdrawal = await tx.withdrawal.create({
                 data: {
@@ -89,6 +110,7 @@ exports.requestWithdrawal = async (req, res) => {
                     totalGasFee: totalGasFee,
                     vendorGasShare: vendorGasShare,
                     adminGasShare: adminGasShare,
+                    platformFeeUsdc: platformFeeUsdc,
                     status: "PENDING"
                 }
             });

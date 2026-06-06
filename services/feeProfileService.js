@@ -55,11 +55,26 @@ async function resolveFeeProfile(prisma, { vendorId, buyerId, amountCrypto } = {
         return true;
     });
 
+    // --- Phase ADMIN-CONTROL-2 FIX 4: PRE-FETCH vendor and buyer ONCE — eliminates N+1 ---
+    let vendor = null, buyer = null;
+    if (vendorId) {
+        vendor = await prisma.user.findUnique({
+            where: { id: vendorId },
+            select: { vendorLevel: true, tradesCompleted: true, referredByCode: true, withdrawalRiskTier: true }
+        });
+    }
+    if (buyerId) {
+        buyer = await prisma.user.findUnique({
+            where: { id: buyerId },
+            select: { tradesCompleted: true, referredByCode: true, withdrawalRiskTier: true }
+        });
+    }
+
     // 3. Try to match scoped profiles against the trade context
     let bestMatch = null;
 
     for (const profile of validProfiles) {
-        const matched = await _matchesContext(prisma, profile, { vendorId, buyerId, amountCrypto });
+        const matched = _matchesContextSync(profile, { vendorId, buyerId, amountCrypto, vendor, buyer });
         if (matched) {
             bestMatch = profile;
             break; // highest priority first, so first match wins
@@ -94,52 +109,34 @@ async function resolveFeeProfile(prisma, { vendorId, buyerId, amountCrypto } = {
 }
 
 /**
- * Check if a profile's targetScope/targetValue matches the given trade context.
+ * Phase ADMIN-CONTROL-2 FIX 4: Synchronous context matcher — no DB calls inside.
+ * Uses pre-fetched vendor and buyer objects passed from resolveFeeProfile.
  */
-async function _matchesContext(prisma, profile, { vendorId, buyerId, amountCrypto }) {
+function _matchesContextSync(profile, { vendorId, buyerId, vendor, buyer }) {
     switch (profile.targetScope) {
         case 'ALL':
             return true;
 
         case 'VENDOR_TIER': {
-            if (!vendorId || !profile.targetValue) return false;
-            // targetValue might be a vendorLevel threshold like "GOLD" or a numeric level
-            const vendor = await prisma.user.findUnique({
-                where: { id: vendorId },
-                select: { vendorLevel: true, tradesCompleted: true }
-            });
-            if (!vendor) return false;
-            // Match by level name or numeric threshold
+            if (!vendor || !profile.targetValue) return false;
             const tv = profile.targetValue.toUpperCase();
             if (tv === 'GOLD' && (vendor.vendorLevel >= 5 || vendor.tradesCompleted >= 100)) return true;
             if (tv === 'SILVER' && (vendor.vendorLevel >= 3 || vendor.tradesCompleted >= 50)) return true;
             if (tv === 'BRONZE' && (vendor.vendorLevel >= 1 || vendor.tradesCompleted >= 10)) return true;
-            // Numeric level match
             const numLevel = parseInt(tv, 10);
             if (!isNaN(numLevel) && vendor.vendorLevel >= numLevel) return true;
             return false;
         }
 
         case 'USER_TIER': {
-            if (!buyerId || !profile.targetValue) return false;
-            const buyer = await prisma.user.findUnique({
-                where: { id: buyerId },
-                select: { tradesCompleted: true }
-            });
-            if (!buyer) return false;
+            if (!buyer || !profile.targetValue) return false;
             const threshold = parseInt(profile.targetValue, 10);
             if (!isNaN(threshold) && buyer.tradesCompleted >= threshold) return true;
             return false;
         }
 
         case 'INFLUENCER_REFERRAL': {
-            if (!buyerId || !profile.targetValue) return false;
-            // Check if the buyer was referred by the influencer code
-            const buyer = await prisma.user.findUnique({
-                where: { id: buyerId },
-                select: { referredByCode: true }
-            });
-            if (!buyer) return false;
+            if (!buyer || !profile.targetValue) return false;
             return buyer.referredByCode === profile.targetValue;
         }
 

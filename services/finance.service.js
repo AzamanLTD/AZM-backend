@@ -147,6 +147,17 @@ const processFiatWithdrawal = async (prisma, userId, amountFloat, opts = {}) => 
     const retailRate = Number(opts.retailRate) > 0 ? Number(opts.retailRate) : null;
     const payoutGhs  = Number(opts.payoutGhs)  > 0 ? Number(opts.payoutGhs)  : null;
 
+    // ── Phase ADMIN-CONTROL-2 FIX 5: Fiat pool pre-flight balance check ──────
+    const fiatPool = await prisma.systemFiatPool.findUnique({ where: { id: 1 } });
+    if (!fiatPool || Number(fiatPool.balance) < amountFloat) {
+        const err = new Error(
+            'Platform fiat liquidity is temporarily insufficient. Your USDC has not been deducted. ' +
+            'Please try again shortly or contact support.'
+        );
+        err.code = 'FIAT_POOL_INSUFFICIENT';
+        throw err;
+    }
+
     // ── Step 5: ACID transaction ─────────────────────────────────────────────
     const result = await prisma.$transaction(async (tx) => {
 
