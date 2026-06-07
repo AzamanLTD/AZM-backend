@@ -121,8 +121,12 @@ exports.sendImageMessage = async (req, res) => {
             return res.status(403).json({ success: false, message: 'You are not a party to this trade.' });
         }
 
-        // Public URL for the upload
-        const imageUrl = `${req.protocol}://${req.get('host')}/uploads/${req.file.filename}`;
+        // Persist the screenshot to Cloudinary so its URL survives redeploys
+        // (Render's local disk is ephemeral). Multer now buffers the file in
+        // memory; the shared service streams the buffer up and returns a
+        // permanent secure_url.
+        const { uploadToCloudinary } = require('../services/cloudinaryService');
+        const { url: imageUrl } = await uploadToCloudinary(req.file, 'chat/images');
 
         const conversation = await _getOrCreateTradeConversation(prisma, trade);
 

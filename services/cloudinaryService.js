@@ -47,7 +47,14 @@ if (IS_CONFIGURED) {
  */
 async function uploadToCloudinary(file, folder = 'uploads', options = {}) {
     if (!IS_CONFIGURED) {
-        // Fallback: return local path (for local dev without Cloudinary)
+        // Fallback for local dev without Cloudinary: only possible when multer
+        // wrote the file to disk (file.path exists). Callers that use
+        // memoryStorage (chat media, avatars, proof-of-residency) have no local
+        // path to fall back to — surface a clear error instead of a cryptic
+        // TypeError on `undefined.replace`.
+        if (!file.path) {
+            throw new Error('Cloudinary not configured; in-memory upload cannot be persisted locally. Set CLOUDINARY_* env vars.');
+        }
         const localUrl = '/' + file.path.replace(/\\/g, '/');
         return { url: localUrl, publicId: null };
     }

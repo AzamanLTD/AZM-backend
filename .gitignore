@@ -3,6 +3,7 @@ node_modules
 .env
 .env.*
 !.env.example
+!.env.test.example
 
 /generated/prisma
 
@@ -42,3 +43,33 @@ secrets/
 
 # Local commit-message scratch file used by the agent's commit pipeline.
 .git_commit_msg
+.commit_msg
+
+# AI agent / IDE assistant config and session files (internal tooling, not source)
+.cursorrules
+AZAMAN_MASTER_SOUL.md
+AUDIT.md
+FRONTEND_AUDIT.md
+API_INTEGRATION_SUMMARY.md
+PHASE_5_SUMMARY.md
+PHASE_5_DEPLOYMENT_GUIDE.md
+
+# Build outputs
+dist/
+build/
+*.log
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp
+.cache/

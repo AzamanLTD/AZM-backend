@@ -585,8 +585,8 @@ exports.uploadAvatar = async (req, res) => {
     try {
         const userId = req.user.id;
 
-        // Upload to Cloudinary (falls back to local path if not configured)
-        const { url } = await uploadToCloudinary(req.file, 'avatars');
+        // Upload to Cloudinary (folder azaman/users/avatars)
+        const { url } = await uploadToCloudinary(req.file, 'users/avatars');
 
         const updated = await prisma.user.update({
             where: { id: userId },

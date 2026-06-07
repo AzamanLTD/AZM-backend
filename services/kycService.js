@@ -160,6 +160,24 @@ class KYCService {
 
         console.log(`✅ [KYC] User ${userId} → ${newStatus} (confidence: ${overallConfidence}, provider status: ${verificationStatus})`);
 
+        // B-11: when the provider succeeded but the confidence score landed
+        // BETWEEN the auto-reject and auto-approve thresholds, the result needs
+        // a human decision. Alert admins (fire-and-forget; never affects the
+        // webhook response, which must always 200 to Dojah).
+        if (
+            newStatus === 'PENDING' &&
+            verificationStatus === 'successful' &&
+            overallConfidence >= this.autoRejectThreshold &&
+            overallConfidence < this.autoApproveThreshold &&
+            this.adminAlertService
+        ) {
+            setImmediate(() => this.adminAlertService.emit('KYC_MANUAL_REVIEW_REQUIRED', {
+                userId,
+                score: overallConfidence,
+                message: `KYC for @${user.username || userId} needs manual review (score ${overallConfidence}).`,
+            }));
+        }
+
         // 6. Send notification to user
         await this._sendKycResultNotification(userId, newStatus);
 

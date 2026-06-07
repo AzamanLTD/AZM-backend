@@ -8,45 +8,27 @@
 // Sharing the directory means a future "list /uploads/proofs/" feature
 // (or a misconfigured static-file serve) leaks KYC data.
 //
-// Phase K: avatars get their own /uploads/avatars/ directory with a
-// stricter filename scheme (no user-controlled tradeId in the path) and
-// a tighter 2MB limit (avatars don't need 5MB; that ceiling was for
-// KYC document scans).
+// Phase K gave avatars their own directory; the Cloudinary migration takes
+// that further — avatars now upload to the dedicated `users/avatars`
+// Cloudinary folder, fully separated from KYC/proof storage. This middleware
+// only buffers the file in memory (2MB cap — avatars don't need the 5MB
+// ceiling that was for KYC document scans); profileController.uploadAvatar
+// streams it to Cloudinary and persists the secure_url.
 //
-// Existing avatar URLs in the DB pointing at /uploads/proofs/<filename>
-// continue to work — the static-file mount in server.js still serves
-// the entire /uploads tree. Only NEW uploads land in the avatars
-// directory.
+// Existing avatar URLs in the DB (older /uploads/... paths or prior Cloudinary
+// URLs) continue to resolve unchanged; only NEW uploads land in users/avatars.
 // =============================================================================
 
 const multer = require('multer');
 const path = require('path');
-const fs = require('fs');
-const crypto = require('crypto');
 
-const avatarDir = 'uploads/avatars';
-if (!fs.existsSync(avatarDir)) {
-    fs.mkdirSync(avatarDir, { recursive: true });
-}
-
-const storage = multer.diskStorage({
-    destination: (req, file, cb) => {
-        cb(null, avatarDir);
-    },
-    filename: (req, file, cb) => {
-        // Filename scheme: avatar-<userId>-<8 random hex>.<ext>
-        // Why not use the original filename? Two reasons:
-        //   1. originalname is user-controlled — could contain path traversal
-        //      attempts (..%2F..%2F) that some browsers normalise weirdly.
-        //   2. Re-uploading the same name overwrites silently. With a random
-        //      suffix, every upload has a distinct URL — handy if a CDN
-        //      caches by URL.
-        const userId = (req.user && req.user.id) || 'anon';
-        const suffix = crypto.randomBytes(4).toString('hex');
-        const ext = path.extname(file.originalname).toLowerCase() || '.jpg';
-        cb(null, `avatar-${userId}-${suffix}${ext}`);
-    }
-});
+// In-memory buffering only. The consumer (profileController.uploadAvatar)
+// streams the buffer to Cloudinary via uploadToCloudinary() and stores the
+// returned secure_url, so avatars never touch the (ephemeral) local disk.
+// The old disk filename scheme (avatar-<userId>-<hex>.<ext>) is no longer
+// needed — Cloudinary assigns its own public_id and the upload is scoped to
+// the users/avatars folder.
+const storage = multer.memoryStorage();
 
 const avatarUpload = multer({
     storage,
