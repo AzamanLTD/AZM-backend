@@ -11,8 +11,14 @@ class SMSService {
     constructor() {
         this.apiKey = process.env.SMS_API_KEY || 'mock_sms_api_key';
         this.provider = process.env.SMS_PROVIDER || 'mock';
-        this.isTestMode = process.env.NODE_ENV !== 'production';
-        
+        // isTestMode normally forces MOCK in any non-production env. That is the
+        // right default, but it also blocks testing a REAL provider (e.g. Moolre)
+        // against its sandbox from a dev/staging box. SMS_FORCE_LIVE=true lets a
+        // real, non-mock provider send for real even when NODE_ENV !== production.
+        // When the provider is already 'mock' this flag does nothing.
+        const forceLive = process.env.SMS_FORCE_LIVE === 'true';
+        this.isTestMode = process.env.NODE_ENV !== 'production' && !forceLive;
+
         // Store OTP codes in memory for testing (use Redis in production)
         this.otpStore = new Map();
     }
@@ -55,6 +61,8 @@ class SMSService {
                 return await this._sendViaHubtel(phoneNumber, message, sender);
             case 'arkesel':
                 return await this._sendViaArkesel(phoneNumber, message, sender);
+            case 'moolre':
+                return await this._sendViaMoolre(phoneNumber, message, sender);
             default:
                 throw new Error(`Unsupported SMS provider: ${this.provider}`);
         }
@@ -322,6 +330,74 @@ class SMSService {
         } catch (error) {
             console.error(`❌ [Arkesel] Network error: ${error.message}`);
             return { success: false, provider: 'arkesel', status: 'error', error: error.message };
+        }
+    }
+
+    async _sendViaMoolre(phoneNumber, message, sender) {
+        // Moolre SMS API (Value-Added Services).
+        //
+        // Auth: STATIC headers (no OAuth). Per Moolre's reference, SMS/USSD use
+        // the VAS key X-API-VASKEY in addition to the account user X-API-USER.
+        // Universal response envelope: { status: 1|0, code, message, data, go }
+        // where status is an INTEGER (1 = success, 0 = failure).
+        //
+        // ─── ⚠️ VERIFY-AGAINST-SANDBOX ───────────────────────────────────────
+        // The exact endpoint path + body field names below are intuitive
+        // guesses (the docs SPA could not be scraped). Adjust ONLY these three
+        // constants once you confirm them in the Moolre sandbox; the auth,
+        // envelope handling, and return shape are provider-correct.
+        const MOOLRE_SMS_ENDPOINT = '/open/sms/send';   // ⚠️ VERIFY path
+        const BODY = {                                  // ⚠️ VERIFY body keys
+            sender:    'sender',
+            recipient: 'recipient',
+            message:   'message',
+        };
+        // ─────────────────────────────────────────────────────────────────────
+
+        const useProd  = process.env.MOOLRE_ENV === 'production' || process.env.MOOLRE_ENV === 'prod';
+        const baseUrl  = process.env.MOOLRE_BASE_URL || (useProd ? 'https://api.moolre.com' : 'https://sandbox.moolre.com');
+        const apiUser  = process.env.MOOLRE_API_USER || '';
+        // SMS/USSD use the VAS key; fall back to the standard API key if a
+        // dedicated VAS key isn't provisioned on the account.
+        const vasKey   = process.env.MOOLRE_VAS_KEY || process.env.MOOLRE_API_KEY || this.apiKey;
+        const senderId = process.env.MOOLRE_SMS_SENDER_ID || sender || 'AZAMAN';
+
+        try {
+            const response = await fetch(`${baseUrl}${MOOLRE_SMS_ENDPOINT}`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'X-API-USER':   apiUser,
+                    'X-API-VASKEY': vasKey,
+                },
+                body: JSON.stringify({
+                    [BODY.sender]:    senderId,
+                    [BODY.recipient]: phoneNumber.replace(/^\+/, ''), // bare MSISDN
+                    [BODY.message]:   message,
+                })
+            });
+
+            const envelope = await response.json().catch(() => null);
+            const ok = response.ok && envelope && Number(envelope.status) === 1;
+
+            if (ok) {
+                const messageId = envelope.data?.messageid || envelope.data?.id || this._generateMessageId();
+                console.log(`✅ [Moolre] SMS sent to ${phoneNumber} (id: ${messageId})`);
+                return {
+                    success: true,
+                    messageId,
+                    provider: 'moolre',
+                    cost: envelope.data?.cost ?? 0,
+                    status: 'sent'
+                };
+            }
+
+            const errMsg = envelope?.message || envelope?.code || `HTTP ${response.status}`;
+            console.error(`❌ [Moolre] SMS failed: ${errMsg}`);
+            return { success: false, provider: 'moolre', status: 'failed', error: errMsg };
+        } catch (error) {
+            console.error(`❌ [Moolre] Network error: ${error.message}`);
+            return { success: false, provider: 'moolre', status: 'error', error: error.message };
         }
     }
 }
