@@ -34,6 +34,13 @@ if (!process.env.JWT_SECRET) {
     console.error('FATAL: JWT_SECRET is not set. Server cannot start.');
     process.exit(1);
 }
+// A short secret is brute-forceable and silently weakens every token. Enforce
+// at least 32 chars (256 bits) so a misconfigured deploy fails loudly at boot
+// instead of running with weak auth.
+if (process.env.JWT_SECRET.length < 32) {
+    console.error('FATAL: JWT_SECRET must be at least 32 characters (256 bits). Server cannot start.');
+    process.exit(1);
+}
 if (!process.env.DATABASE_URL) {
     console.error('FATAL: DATABASE_URL is not set. Server cannot start.');
     process.exit(1);
@@ -41,6 +48,17 @@ if (!process.env.DATABASE_URL) {
 
 const IS_PRODUCTION = process.env.NODE_ENV === 'production';
 const JWT_SECRET = process.env.JWT_SECRET;
+
+// ── Health/observability holders (D-05) ──────────────────────────────────────
+// Populated later as components come online; read by GET /health. Kept at
+// module scope so the health handler (defined before workers start) can close
+// over them and report live state per-request.
+const APP_VERSION = require('./package.json').version;
+// kind ('cron' workers etc.) -> 'running'. Filled in as each worker .start()s.
+const workerStatus = {};
+// 'not_configured' until B-07 wires the Socket.IO Redis adapter; then
+// 'connected' / 'disconnected' driven by the ioredis client events.
+let redisStatus = 'not_configured';
 
 // ── Phase J3: Prisma Decimal → Number JSON Serialization ─────────────────────
 // Prisma returns NUMERIC/DECIMAL columns as Decimal.js objects which serialize
@@ -227,14 +245,32 @@ app.use((req, res, next) => {
 
 // HIGH-2: CORS locked to configured origins
 const corsOrigins = process.env.CORS_ORIGINS
-    ? process.env.CORS_ORIGINS.split(',').map(s => s.trim())
+    ? process.env.CORS_ORIGINS.split(',').map(s => s.trim()).filter(Boolean)
     : ['*']; // Dev fallback — override in production!
 
+// In production, explicitly reject any browser origin not on the allow-list.
+// In development (or when CORS_ORIGINS is the '*' wildcard), CORS stays open.
+// Requests without an Origin header (curl, mobile apps, server-to-server) are
+// always permitted since the browser same-origin policy does not apply to them.
+const corsOriginValidator = (origin, callback) => {
+    if (!origin) return callback(null, true);
+    if (!IS_PRODUCTION || corsOrigins.includes('*')) return callback(null, true);
+    if (corsOrigins.includes(origin)) return callback(null, true);
+    return callback(new Error(`CORS: origin ${origin} is not allowed`));
+};
+
 app.use(cors({
-    origin: corsOrigins.includes('*') ? true : corsOrigins,
+    origin: corsOriginValidator,
     methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     credentials: true
 }));
+
+// Surface the CORS posture at boot so misconfigured deploys are obvious.
+if (IS_PRODUCTION) {
+    console.log(`CORS locked to: [${corsOrigins.join(', ')}]`);
+} else {
+    console.log('CORS open (development mode)');
+}
 
 // Body parser with size limit (M-1 fix) + raw body for HMAC verification
 app.use(express.json({
@@ -276,8 +312,11 @@ app.get('/health', async (req, res) => {
         res.status(200).json({
             status: 'healthy',
             timestamp: new Date().toISOString(),
+            version: APP_VERSION,
             uptime: process.uptime(),
             database: 'connected',
+            redis: redisStatus,
+            workers: workerStatus,
             versionGate,
             // Susu Sprint (2026-06-01): surface the boot-time auto-release
             // outcome + treasury cache state so deploy health can be checked
@@ -294,7 +333,9 @@ app.get('/health', async (req, res) => {
         res.status(503).json({
             status: 'unhealthy',
             timestamp: new Date().toISOString(),
+            version: APP_VERSION,
             database: 'disconnected',
+            redis: redisStatus,
             error: IS_PRODUCTION ? 'Service unavailable' : err.message
         });
     }
@@ -337,6 +378,37 @@ const io = new Server(server, {
         methods: ["GET", "POST"]
     }
 });
+
+// ── B-07: optional Socket.IO Redis adapter for horizontal scaling ────────────
+// The default in-memory adapter can't fan events out across processes, so
+// running >1 backend instance silently breaks real-time delivery (a socket on
+// instance A never hears an io.emit issued on instance B). When REDIS_URL is
+// set, swap in the Redis pub/sub adapter so all instances share one event bus
+// and PM2 cluster mode / multiple dynos work correctly. When it's unset (local
+// dev, single-instance deploys) the server runs exactly as before — Redis is
+// strictly opt-in. All io.emit / io.in(room).emit callsites are unchanged.
+if (process.env.REDIS_URL) {
+    try {
+        const { createAdapter } = require('@socket.io/redis-adapter');
+        const { Redis } = require('ioredis');
+        const pubClient = new Redis(process.env.REDIS_URL);
+        const subClient = pubClient.duplicate();
+        pubClient.on('connect', () => { redisStatus = 'connected'; });
+        pubClient.on('error', (e) => {
+            redisStatus = 'disconnected';
+            console.error('[Redis] adapter error:', e.message);
+        });
+        io.adapter(createAdapter(pubClient, subClient));
+        console.log('Socket.IO Redis adapter enabled (multi-instance mode).');
+    } catch (e) {
+        // Don't take the whole server down over a missing optional dep or a
+        // bad URL — fall back to the in-memory adapter (single-instance only).
+        redisStatus = 'disconnected';
+        console.error('[Redis] adapter init failed; using in-memory adapter:', e.message);
+    }
+} else {
+    console.log('REDIS_URL not set — Socket.IO using in-memory adapter (single instance).');
+}
 
 // CRITICAL-4: Socket.IO JWT Authentication Middleware
 io.use((socket, next) => {
@@ -716,6 +788,32 @@ const AzmAuctionWorker = require('./workers/azmAuctionWorker');
 const azmAuctionWorker = new AzmAuctionWorker(prisma, azmAuctionService);
 azmAuctionWorker.start();
 
+// ── D-05: record worker liveness for GET /health ─────────────────────────────
+// These all called .start() above. tradeWorker is special: it is instantiated
+// here but only .start()'d in the server.listen callback (so its expiry sweep
+// doesn't run before the server is accepting traffic). We seed it as
+// 'pending_listen' and flip it to 'running' from that callback, so /health
+// reflects its true state rather than omitting it. The Susu V2 cycle workers
+// start asynchronously after the treasury cache resolves and register
+// themselves via app.set(...); /health reflects them through the app registry.
+Object.assign(workerStatus, {
+    leaderboardWorker: 'running',
+    analyticsWorker: 'running',
+    cfoWorker: 'running',
+    savingsWorker: 'running',
+    withdrawalReconciliationWorker: 'running',
+    payoutBatchWorker: 'running',
+    vaultWorker: 'running',
+    susuWorker: 'running',
+    smartRouteWorker: 'running',
+    azmAuctionWorker: 'running',
+    tradeWorker: 'pending_listen',
+});
+if (process.env.NODE_ENV === 'test') {
+    // Workers are no-ops in test mode; don't claim they're running.
+    for (const k of Object.keys(workerStatus)) workerStatus[k] = 'disabled_in_test';
+}
+
 // --- OFFLINE PUSH HELPER ---
 const pushIfOffline = async (userId, title, body, extra = {}) => {
     try {
@@ -775,10 +873,24 @@ app.set('tatumService', tatumService);
 app.set('emailService', emailService);
 app.set('smsService', smsService);
 
+// B-11: admin alert service (socket broadcast + email to ADMIN_ALERT_EMAIL).
+// Registered for controllers to fetch via req.app.get('adminAlertService').
+// Inert until trigger points are wired (see services/adminAlertService.js
+// WIRING block) and harmless until ADMIN_ALERT_EMAIL / a real email provider
+// are set.
+const AdminAlertService = require('./services/adminAlertService');
+const adminAlertService = new AdminAlertService({ io, emailService });
+app.set('adminAlertService', adminAlertService);
+// The KYC service runs webhook processing outside the request lifecycle (no
+// req.app handle), so hand it the alert service directly. Optional chaining at
+// the callsite keeps it safe if this ever isn't set.
+kycService.adminAlertService = adminAlertService;
+
 // ══════════════════════════════════════════════════════════════════════════════
 // API ROUTES (with rate limiting — CRITICAL-3)
 // ══════════════════════════════════════════════════════════════════════════════
 
+app.use('/api/public', generalLimiter, require('./routes/publicRoutes'));
 app.use('/api/auth', authLimiter, authRoutes);
 app.use('/api/trades', financialLimiter, tradeRoutes);
 app.use('/api/ads', generalLimiter, adRoutes);
@@ -842,29 +954,22 @@ app.use('/api/admin/susu',                generalLimiter, adminSusuRoutes);
 // historically open and image-only; it stays open here to avoid breaking any
 // in-the-wild builds, but the new clients should target the typed routes.
 //
-// Storage: uploads/chat/<userId>/<filename>. The per-user subdirectory keeps
-// audit trails clean and lets us garbage-collect stale media per-account.
+// Storage: Cloudinary (folders azaman/chat/{images,audio,video,documents}).
+// Files are buffered in memory by multer, then streamed to Cloudinary via the
+// shared uploadToCloudinary() service so the persisted URL survives Render
+// redeploys (the local disk is ephemeral on free-tier hosting).
 //
 // Size limits:
 //   • image    — 10 MB
 //   • audio    —  5 MB
 //   • video    — 50 MB
 //   • document — 25 MB
-const chatMediaDir = 'uploads/chat/';
-if (!fs.existsSync(chatMediaDir)) fs.mkdirSync(chatMediaDir, { recursive: true });
+const { uploadToCloudinary: uploadChatMedia } = require('./services/cloudinaryService');
 
-const _chatStorageFor = (kind) => multer.diskStorage({
-    destination: (req, file, cb) => {
-        const userId = req.user?.id || 'anon';
-        const dir = path.join('uploads/chat', String(userId), kind);
-        try { fs.mkdirSync(dir, { recursive: true }); } catch (_) { /* swallow */ }
-        cb(null, dir);
-    },
-    filename: (req, file, cb) => {
-        const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-        cb(null, `${kind}-${uniqueSuffix}${path.extname(file.originalname)}`);
-    }
-});
+// Cloudinary folder per media kind (the service prefixes everything with azaman/).
+const _chatFolderFor = { image: 'chat/images', audio: 'chat/audio', video: 'chat/video', document: 'chat/documents' };
+
+const _chatStorageFor = () => multer.memoryStorage();
 
 const _chatMimeFilter = (allowed) => (req, file, cb) => {
     if (allowed.some((p) => file.mimetype === p || file.mimetype.startsWith(p))) {
@@ -909,19 +1014,31 @@ const chatDocumentUpload = multer({
 
 const { protect: protectChatUpload } = require('./middleware/authMiddleware');
 
-// Helper: build the canonical response envelope from a multer file.
-const _mediaUrlFromFile = (file) => '/' + file.path.replace(/\\/g, '/');
+// Helper: upload a buffered multer file to Cloudinary and return its secure_url.
+// `kind` selects the destination folder; documents are stored as `raw` so office
+// formats (docx/xlsx/csv/txt) are served back with their original bytes.
+const _uploadChatMediaUrl = async (file, kind) => {
+    const opts = kind === 'document' ? { resource_type: 'raw' } : {};
+    const { url } = await uploadChatMedia(file, _chatFolderFor[kind], opts);
+    return url;
+};
 
 // POST /api/chat/upload/image — { url, mimeType, size, filename }
-app.post('/api/chat/upload/image', protectChatUpload, chatImageUpload.single('file'), (req, res) => {
+app.post('/api/chat/upload/image', protectChatUpload, chatImageUpload.single('file'), async (req, res) => {
     if (!req.file) return res.status(400).json({ success: false, message: 'No file uploaded' });
-    res.status(200).json({
-        success: true,
-        url: _mediaUrlFromFile(req.file),
-        mimeType: req.file.mimetype,
-        size: req.file.size,
-        filename: req.file.originalname
-    });
+    try {
+        const url = await _uploadChatMediaUrl(req.file, 'image');
+        res.status(200).json({
+            success: true,
+            url,
+            mimeType: req.file.mimetype,
+            size: req.file.size,
+            filename: req.file.originalname
+        });
+    } catch (err) {
+        console.error('chat image upload error:', err.message);
+        res.status(500).json({ success: false, message: 'Upload failed' });
+    }
 });
 
 // POST /api/chat/upload/audio — { url, mimeType, size, duration, waveformPeaks }
@@ -929,7 +1046,7 @@ app.post('/api/chat/upload/image', protectChatUpload, chatImageUpload.single('fi
 // body fields the client precomputes and includes alongside the file. The
 // server trusts them for MVP; a future PR can resample server-side via
 // audiowaveform if the trust model needs to tighten.
-app.post('/api/chat/upload/audio', protectChatUpload, chatAudioUpload.single('file'), (req, res) => {
+app.post('/api/chat/upload/audio', protectChatUpload, chatAudioUpload.single('file'), async (req, res) => {
     if (!req.file) return res.status(400).json({ success: false, message: 'No file uploaded' });
     let waveformPeaks = null;
     if (req.body.waveformPeaks) {
@@ -939,39 +1056,57 @@ app.post('/api/chat/upload/audio', protectChatUpload, chatAudioUpload.single('fi
         } catch (_) { /* swallow */ }
     }
     const duration = parseInt(req.body.duration, 10);
-    res.status(200).json({
-        success: true,
-        url: _mediaUrlFromFile(req.file),
-        mimeType: req.file.mimetype,
-        size: req.file.size,
-        duration: Number.isFinite(duration) ? duration : null,
-        waveformPeaks
-    });
+    try {
+        const url = await _uploadChatMediaUrl(req.file, 'audio');
+        res.status(200).json({
+            success: true,
+            url,
+            mimeType: req.file.mimetype,
+            size: req.file.size,
+            duration: Number.isFinite(duration) ? duration : null,
+            waveformPeaks
+        });
+    } catch (err) {
+        console.error('chat audio upload error:', err.message);
+        res.status(500).json({ success: false, message: 'Upload failed' });
+    }
 });
 
 // POST /api/chat/upload/video — { url, mimeType, size, duration }
-app.post('/api/chat/upload/video', protectChatUpload, chatVideoUpload.single('file'), (req, res) => {
+app.post('/api/chat/upload/video', protectChatUpload, chatVideoUpload.single('file'), async (req, res) => {
     if (!req.file) return res.status(400).json({ success: false, message: 'No file uploaded' });
     const duration = parseInt(req.body.duration, 10);
-    res.status(200).json({
-        success: true,
-        url: _mediaUrlFromFile(req.file),
-        mimeType: req.file.mimetype,
-        size: req.file.size,
-        duration: Number.isFinite(duration) ? duration : null
-    });
+    try {
+        const url = await _uploadChatMediaUrl(req.file, 'video');
+        res.status(200).json({
+            success: true,
+            url,
+            mimeType: req.file.mimetype,
+            size: req.file.size,
+            duration: Number.isFinite(duration) ? duration : null
+        });
+    } catch (err) {
+        console.error('chat video upload error:', err.message);
+        res.status(500).json({ success: false, message: 'Upload failed' });
+    }
 });
 
 // POST /api/chat/upload/document — { url, mimeType, size, filename }
-app.post('/api/chat/upload/document', protectChatUpload, chatDocumentUpload.single('file'), (req, res) => {
+app.post('/api/chat/upload/document', protectChatUpload, chatDocumentUpload.single('file'), async (req, res) => {
     if (!req.file) return res.status(400).json({ success: false, message: 'No file uploaded' });
-    res.status(200).json({
-        success: true,
-        url: _mediaUrlFromFile(req.file),
-        mimeType: req.file.mimetype,
-        size: req.file.size,
-        filename: req.file.originalname
-    });
+    try {
+        const url = await _uploadChatMediaUrl(req.file, 'document');
+        res.status(200).json({
+            success: true,
+            url,
+            mimeType: req.file.mimetype,
+            size: req.file.size,
+            filename: req.file.originalname
+        });
+    } catch (err) {
+        console.error('chat document upload error:', err.message);
+        res.status(500).json({ success: false, message: 'Upload failed' });
+    }
 });
 
 // POST /api/chat/link-preview — { url } -> { url, title, description, image, favicon, siteName, status }
@@ -994,24 +1129,17 @@ app.post('/api/chat/link-preview', protectChatUpload, async (req, res) => {
 
 // LEGACY (Phase 0): kept alive for older builds. Image-only, 8MB, public.
 // Phase UI-3 superseded this with the four typed endpoints above.
-const chatMediaStorage = multer.diskStorage({
-    destination: (req, file, cb) => cb(null, chatMediaDir),
-    filename: (req, file, cb) => {
-        const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-        cb(null, 'chat-' + uniqueSuffix + path.extname(file.originalname));
-    }
-});
 const chatMediaUpload = multer({
-    storage: chatMediaStorage,
+    storage: multer.memoryStorage(),
     limits: { fileSize: 8 * 1024 * 1024 },
     fileFilter: imageFileFilter
 });
 
-app.post('/api/chat/upload-media', chatMediaUpload.any(), (req, res) => {
+app.post('/api/chat/upload-media', chatMediaUpload.any(), async (req, res) => {
     try {
         const file = Array.isArray(req.files) ? req.files[0] : req.file;
         if (!file) return res.status(400).json({ error: 'No file uploaded' });
-        const mediaUrl = '/' + file.path.replace(/\\/g, '/');
+        const mediaUrl = await _uploadChatMediaUrl(file, 'image');
         res.status(200).json({ mediaUrl, path: mediaUrl, url: mediaUrl });
     } catch (err) {
         console.error('Chat media upload error:', err.message);
@@ -1329,6 +1457,7 @@ const PORT = process.env.PORT || 3000;
 server.listen(PORT, '0.0.0.0', () => {
     console.log(`AZAMAN BACKEND LIVE ON PORT ${PORT} [${IS_PRODUCTION ? 'PRODUCTION' : 'DEVELOPMENT'}]`);
     tradeWorker.start();
+    workerStatus.tradeWorker = 'running';
 });
 
 // Graceful shutdown handler
@@ -1376,4 +1505,14 @@ process.on('SIGINT', () => shutdown('SIGINT'));
 // Prevent unhandled promise rejections from crashing the process silently
 process.on('unhandledRejection', (reason, promise) => {
     console.error('[UnhandledRejection]', reason);
+});
+
+// A synchronous throw outside any try/catch lands here. Node's default is to
+// print and exit; we log explicitly first (stack included) so the crash is
+// never silent, then exit non-zero so the process manager (PM2/Render) restarts
+// us into a known-good state rather than limping on in an undefined one.
+process.on('uncaughtException', (err) => {
+    console.error('[UncaughtException]', err && err.message);
+    if (err && err.stack) console.error(err.stack);
+    process.exit(1);
 });

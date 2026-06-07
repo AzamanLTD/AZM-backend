@@ -917,6 +917,19 @@ exports.disputeTrade = async (req, res) => {
 
         io.emit('admin_alert', { type: 'DISPUTE', tradeId: id, reason });
 
+        // B-11: structured alert to the admin spy room + email (fire-and-forget).
+        // This is the shape the admin portal's AlertBanner / Notification Center
+        // consume (severity/title); the raw io.emit above is kept for any legacy
+        // listener. Never blocks the dispute flow.
+        const alertService = req.app.get('adminAlertService');
+        if (alertService) {
+            setImmediate(() => alertService.emit('DISPUTE_FILED', {
+                tradeId: id,
+                userId,
+                message: `Trade #${id} disputed${reason ? `: ${reason}` : ''}`,
+            }));
+        }
+
         const targetToken = (userId === trade.vendorId) ? trade.user.fcmToken : trade.vendor.fcmToken;
         if (targetToken) {
             await sendPushNotification(

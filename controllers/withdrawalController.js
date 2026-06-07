@@ -144,6 +144,20 @@ exports.fiatWithdrawal = async (req, res) => {
             console.warn('[fiatWithdrawal] Withdrawal mirror row insert failed:', rowErr.message);
         }
 
+        // B-11: notify admins of a large pending withdrawal (fire-and-forget,
+        // never blocks the payout). Guarded by the service's own threshold.
+        if (withdrawalRow) {
+            const alertService = req.app.get('adminAlertService');
+            if (alertService && alertService.isLargeWithdrawal(parseFloat(amount))) {
+                setImmediate(() => alertService.emit('LARGE_WITHDRAWAL_PENDING', {
+                    withdrawalId: withdrawalRow.id,
+                    userId,
+                    amount: parseFloat(amount),
+                    destination: phone,
+                }));
+            }
+        }
+
         // Step 3 — Dispatch payout to MTN MoMo. On synchronous failure, fully
         // reverse the ledger so the user is not silently debited.
         if (!mtnDisbursementService) {

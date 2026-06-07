@@ -15,11 +15,9 @@ const { protect }              = require('../middleware/authMiddleware');
 const { protectActive }        = require('../middleware/banGuardMiddleware');
 
 // ── Multer configuration ─────────────────────────────────────────────────────
-const storage = multer.diskStorage({
-    destination: './uploads/',
-    filename:    (req, file, cb) =>
-        cb(null, 'receipt-' + Date.now() + path.extname(file.originalname))
-});
+// In-memory buffering; the controller streams the file to Cloudinary so the
+// stored URL survives Render redeploys (local disk is ephemeral).
+const storage = multer.memoryStorage();
 
 const fileFilter = (req, file, cb) => {
     const filetypes = /jpeg|jpg|png/;
