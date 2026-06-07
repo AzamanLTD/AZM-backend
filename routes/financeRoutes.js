@@ -23,7 +23,12 @@ router.post(
 
 // Webhook endpoints (no auth — external providers; idempotency via txHash)
 router.post('/webhook/deposit',          financeController.cryptoDepositWebhook);
+// MTN MoMo settlement webhook (fallback off-ramp — kept active alongside Moolre).
 router.post('/webhook/mtn-disbursement', financeController.mtnDisbursementWebhook);
+// Moolre settlement webhook (primary off-ramp). Shared-secret guarded via
+// X-Moolre-Webhook-Secret. Same idempotent PENDING/SUCCESSFUL/FAILED semantics
+// as the MTN webhook. Point your Moolre dashboard callback URL here.
+router.post('/webhook/moolre-disbursement', financeController.moolreDisbursementWebhook);
 
 // Phase C: Tatum Polygon deposit webhook (canonical V2 path)
 // Tatum POSTs here when USDC lands on a user's derived Polygon address.

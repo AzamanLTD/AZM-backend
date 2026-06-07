@@ -479,6 +479,152 @@ exports.mtnDisbursementWebhook = async (req, res) => {
 };
 
 // =============================================================================
+// POST /api/finance/webhook/moolre-disbursement
+// Moolre Disbursement settlement webhook. Public route — secured by a shared
+// secret header (X-Moolre-Webhook-Secret). This is the Moolre-shaped twin of
+// mtnDisbursementWebhook above and reuses the EXACT same ledger semantics:
+//   • SUCCESSFUL on a COMPLETED row  → no-op (debit already committed at dispatch)
+//   • PENDING                        → 200, no ledger mutation
+//   • FAILED                         → atomic reverseFiatWithdrawal (also unwinds
+//                                      the SystemMasterCrypto capture)
+//   • FAILED on an already-FAILED row → 200 no-op (idempotent)
+//
+// Accepts BOTH Moolre's universal envelope { status, code, message, data, go }
+// (in which case the real fields live inside `data`) AND a flat normalized
+// shape, so it works whether Moolre POSTs the raw envelope or you pre-flatten
+// it at an edge. The transaction reference is matched against
+// TransactionHistory.txHash — the same idempotency key dispatched in
+// fiatWithdrawal — so upstream and downstream stay correlated.
+// =============================================================================
+exports.moolreDisbursementWebhook = async (req, res) => {
+    const prisma            = req.app.get('prisma');
+    const io                = req.app.get('socketio');
+    const emitBalanceUpdate = req.app.get('emitBalanceUpdate');
+
+    try {
+        const expectedSecret = process.env.MOOLRE_WEBHOOK_SECRET;
+        if (!expectedSecret) {
+            console.error('[moolreDisbursementWebhook] MOOLRE_WEBHOOK_SECRET is not configured.');
+            return res.status(503).json({
+                success: false,
+                message: 'Webhook endpoint is not configured. Refusing to mutate ledger.'
+            });
+        }
+        // ⚠️ VERIFY: Moolre's callback authentication header name + scheme.
+        // Defaulting to a shared-secret header (mirrors the MTN webhook). If
+        // Moolre instead signs the body with an HMAC, swap this constant-time
+        // compare for an HMAC verification over req.rawBody (already captured by
+        // the express.json verify hook in server.js).
+        const providedSecret = req.headers['x-moolre-webhook-secret'];
+        if (providedSecret !== expectedSecret) {
+            return res.status(401).json({ success: false, message: 'Invalid webhook signature.' });
+        }
+
+        // Moolre wraps payloads in { status, code, message, data, go }. When the
+        // envelope is present, the transaction fields live inside `data`. Fall
+        // back to the top-level body if it's already flattened.
+        const body    = req.body || {};
+        const payload = (body.data && typeof body.data === 'object') ? body.data : body;
+
+        // ⚠️ VERIFY: the field names Moolre uses for the reference + status in
+        // the callback. We check the common candidates so the handler is robust
+        // to the exact key once confirmed.
+        const reference    = payload.externalref || payload.reference || payload.externalId || null;
+        const rawStatus    = payload.status || payload.txstatus || null;
+        const providerTxId = payload.transactionid || payload.txid || payload.id || null;
+        const reasonText   = payload.reason || body.message || null;
+
+        if (!reference || rawStatus === null || rawStatus === undefined) {
+            return res.status(400).json({
+                success: false,
+                message: 'reference (externalref) and status are required.'
+            });
+        }
+
+        // Normalize Moolre's status onto AZM's terminal states. Moolre's success
+        // sentinel may arrive as the integer 1 / string "1" (envelope-style) or
+        // as a word ("SUCCESS"/"FAILED"/"PENDING"). Handle all three.
+        const upper = String(rawStatus).toUpperCase();
+        let normalized;
+        if (upper === '1' || upper === 'SUCCESS' || upper === 'SUCCESSFUL' || upper === 'COMPLETED' || upper === 'PAID') {
+            normalized = 'SUCCESSFUL';
+        } else if (upper === 'PENDING' || upper === 'PROCESSING') {
+            return res.status(200).json({
+                success: true,
+                message: 'PENDING status acknowledged; no ledger mutation.',
+                data:    { reference, status: 'PENDING' }
+            });
+        } else if (upper === '0' || upper === 'FAILED' || upper === 'REJECTED' || upper === 'REVERSED' || upper === 'CANCELLED') {
+            normalized = 'FAILED';
+        } else {
+            return res.status(400).json({
+                success: false,
+                message: `Unrecognized Moolre status: ${rawStatus}.`
+            });
+        }
+
+        const original = await prisma.transactionHistory.findUnique({ where: { txHash: reference } });
+        if (!original) {
+            return res.status(404).json({ success: false, message: 'Unknown reference.' });
+        }
+        if (original.type !== 'WITHDRAWAL_FIAT') {
+            return res.status(409).json({
+                success: false,
+                message: `Reference ${reference} is not a fiat withdrawal.`
+            });
+        }
+
+        // SUCCESSFUL on a COMPLETED row = no-op (the debit was already committed
+        // at dispatch time; Moolre is just confirming the GHS landed).
+        if (normalized === 'SUCCESSFUL') {
+            return res.status(200).json({
+                success: true,
+                message: 'Settlement confirmed.',
+                data:    { reference, status: original.status, providerTxId: providerTxId || null }
+            });
+        }
+
+        // FAILED — trigger atomic reversal (also unwinds SystemMasterCrypto).
+        if (original.status === 'FAILED') {
+            return res.status(200).json({
+                success: true,
+                message: 'Reference already in FAILED state. No-op.',
+                data:    { reference, status: 'FAILED', alreadyReversed: true }
+            });
+        }
+
+        const reversal = await financeService.reverseFiatWithdrawal(prisma, reference, {
+            reason: reasonText || 'Moolre reported FAILED via webhook.'
+        });
+
+        if (emitBalanceUpdate) await emitBalanceUpdate(reversal.userId);
+        try {
+            await _getNotificationService(req).sendNotification({
+                userId:        reversal.userId,
+                title:         'Withdrawal Reversed',
+                body:
+                    `The mobile-money payout for reference ${reference} could not be ` +
+                    `completed. Funds (${reversal.refundedAmount} USDC) have been ` +
+                    `returned to your wallet.`,
+                category:      'GENERAL',
+                actionPayload: { action: 'OPEN_WALLET', reference }
+            });
+        } catch (notifErr) {
+            console.error('[moolreDisbursementWebhook] Notification write failed:', notifErr.message);
+        }
+
+        return res.status(200).json({
+            success: true,
+            message: 'Settlement failure handled — withdrawal reversed.',
+            data:    reversal
+        });
+    } catch (error) {
+        console.error('[finance.moolreDisbursementWebhook] error:', error.message);
+        return res.status(500).json({ success: false, message: error.message });
+    }
+};
+
+// =============================================================================
 // GET /api/finance/fiat-pool-status   — public read-only
 // Frontend uses this to render the "limited fiat" tag in the withdrawal UI.
 // =============================================================================

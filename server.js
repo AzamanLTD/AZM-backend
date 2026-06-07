@@ -121,9 +121,25 @@ const GatewayService = require('./services/gatewayService');
 const gatewayService = new GatewayService(prisma);
 gatewayService.startRateSync();
 
-// --- MTN MOMO DISBURSEMENT ---
-const MtnDisbursementService = require('./services/mtnDisbursementService');
-const mtnDisbursementService = new MtnDisbursementService();
+// --- FIAT OFF-RAMP DISBURSEMENT (Moolre — primary; MTN MoMo — fallback) ──────
+// The off-ramp provider is bound to ONE variable (`mtnDisbursementService`) that
+// every consumer reads (finance.controller, withdrawalReconciliationWorker,
+// payoutBatchWorker, smartRouteService). Because MoolreDisbursementService
+// mirrors the MTN adapter's public method shape EXACTLY
+// (initiateTransfer / getTransferStatus / newReferenceId / simulateInboundWebhook,
+// and deliberately NO `dispatch`), swapping which class backs that variable
+// changes the provider for the whole platform with zero consumer edits.
+//
+// The legacy MTN wiring is preserved (commented) directly below as a safe
+// fallback — to revert, comment the Moolre block and uncomment the MTN block.
+
+// ── PRIMARY: Moolre ───────────────────────────────────────────────────────────
+const MoolreDisbursementService = require('./services/moolreDisbursementService');
+const mtnDisbursementService = new MoolreDisbursementService();
+
+// ── FALLBACK: MTN MoMo (kept intact — uncomment to revert) ────────────────────
+// const MtnDisbursementService = require('./services/mtnDisbursementService');
+// const mtnDisbursementService = new MtnDisbursementService();
 
 // --- TATUM WEB3 SERVICE ---
 const TatumService = require('./services/tatumService');
