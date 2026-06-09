@@ -16,13 +16,20 @@ exports.initializeKyc = async (req, res) => {
     try {
         const kycService = req.app.get('kycService');
         const userId = req.user.id;
-        const { firstName, lastName } = req.body;
+        // idType/idNumber/dob are ADDITIVE (Phase Q6 LIVE): the Dojah Ghana
+        // adapter performs a synchronous ID lookup and needs them. The MOCK
+        // service ignores these extra fields, so the request shape stays
+        // backward-compatible and the mock remains a safe fallback.
+        const { firstName, lastName, idType, idNumber, dob } = req.body;
 
         const result = await kycService.initializeSession({
             userId,
             email: req.user.email,
             firstName: firstName || req.user.username,
-            lastName: lastName || undefined
+            lastName: lastName || undefined,
+            idType,
+            idNumber,
+            dob
         });
 
         if (!result.success) {
@@ -31,11 +38,16 @@ exports.initializeKyc = async (req, res) => {
 
         res.status(200).json({
             success: true,
-            message: 'KYC session initialized. Open the widget URL to begin verification.',
+            message: result.widgetUrl
+                ? 'KYC session initialized. Open the widget URL to begin verification.'
+                : 'KYC verification processed.',
             widgetUrl: result.widgetUrl,
             referenceId: result.referenceId,
             provider: result.provider,
             expiresAt: result.expiresAt,
+            // Synchronous providers (Dojah GH lookups) resolve immediately —
+            // pass the resolved status straight back to the FE.
+            ...(result.kycStatus ? { kycStatus: result.kycStatus } : {}),
             // Only include mock hint in non-production
             ...(process.env.NODE_ENV !== 'production' && result._mockHint ? { _mockHint: result._mockHint } : {})
         });

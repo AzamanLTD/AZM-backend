@@ -549,11 +549,30 @@ const { autoRelease } = require('./infra/autoRelease');
 })();
 
 // --- KYC SERVICE (Phase Q6) ---
-// Singleton: manages Dojah KYC verification lifecycle (initialize, webhook, admin override).
+// Singleton: manages KYC verification lifecycle (initialize, webhook, admin override).
 // Shared across controllers via req.app.get('kycService').
+//
+// SWAPPABLE ADAPTER (Phase Q6 LIVE):
+// kycService.js (MOCK) and dojahKycService.js (LIVE Ghana lookups) expose the
+// exact same public surface, so we bind ONE of them based on KYC_PROVIDER:
+//   - KYC_PROVIDER=LIVE | dojah → real Dojah sandbox/production calls
+//   - anything else (default)   → deterministic MOCK, safe for local dev + CI
+//
+// The MOCK wiring is preserved (commented out) right below the live wiring so we
+// always have a one-line fallback if the live provider misbehaves.
 const KYCService = require('./services/kycService');
-const kycService = new KYCService(prisma, notificationService);
+const DojahKYCService = require('./services/dojahKycService');
+
+const KYC_PROVIDER = (process.env.KYC_PROVIDER || 'mock').toLowerCase();
+const KYC_LIVE = KYC_PROVIDER === 'live' || KYC_PROVIDER === 'dojah';
+
+// ── LIVE Dojah wiring ────────────────────────────────────────────────────────
+// const kycService = new KYCService(prisma, notificationService); // ← MOCK fallback (uncomment to revert)
+const kycService = KYC_LIVE
+    ? new DojahKYCService(prisma, notificationService)
+    : new KYCService(prisma, notificationService);
 app.set('kycService', kycService);
+console.log(`🪪  [KYC] Provider = ${KYC_LIVE ? 'DOJAH (live)' : 'MOCK'}`);
 
 // --- RATE ALERT SERVICE (Phase Q12) ---
 // Singleton: manages user rate alerts (CRUD + threshold checking on oracle sync).
