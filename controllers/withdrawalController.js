@@ -263,8 +263,13 @@ exports.fiatWithdrawal = async (req, res) => {
             return res.status(200).json({
                 success: true,
                 message: `Withdrawal dispatched to MTN MoMo. Reference: ${reference}`,
+                // Top-level `reference` so the Flutter WithdrawalProgressSheet can
+                // open immediately and subscribe to withdrawal_progress / poll
+                // GET /api/withdraw/status/:reference without parsing the message.
+                reference,
                 data: {
                     ...data,
+                    reference,
                     withdrawalId: withdrawalRow ? withdrawalRow.id : null,
                     dispatch
                 }
@@ -688,5 +693,89 @@ exports.cryptoWithdrawal = async (req, res) => {
         }
 
         return res.status(400).json({ success: false, message: error.message });
+    }
+};
+
+// =============================================================================
+// GET /api/withdraw/status/:reference   (auth — owner only)
+// Backend half of the real-time withdrawal progress popup. The Flutter
+// WithdrawalProgressSheet polls this every 5s as a fallback for when the
+// Socket.IO `withdrawal_progress` event is missed (Moolre down / network blip).
+//
+// `reference` is the canonical idempotency UUID minted in fiatWithdrawal and
+// stored as TransactionHistory.txHash. We map the TransactionHistory.status
+// onto a user-facing {stage,label,pct} triple. We additionally try to locate
+// the mirror Withdrawal row (correlated by userId + amount + ±5s window, the
+// same correlation the reconciliation worker uses) for admin/provider context.
+// =============================================================================
+exports.getWithdrawalStatus = async (req, res) => {
+    const prisma = req.app.get('prisma');
+
+    try {
+        const { reference } = req.params;
+        if (!reference) {
+            return res.status(400).json({ success: false, code: 'BAD_REQUEST', message: 'reference is required.' });
+        }
+
+        // Only return status for a withdrawal that belongs to the requester.
+        const tx = await prisma.transactionHistory.findFirst({
+            where: {
+                txHash: reference,
+                userId: req.user.id,
+                type:   'WITHDRAWAL_FIAT'
+            }
+        });
+
+        if (!tx) {
+            return res.status(404).json({ success: false, code: 'NOT_FOUND', message: 'No withdrawal found for that reference.' });
+        }
+
+        // Try to locate the mirror Withdrawal row for the destination phone and
+        // any provider tracking the reconciliation worker may have stored. The
+        // Withdrawal model has no `reference`/`providerTxId` column, so we
+        // correlate on userId + amount within the same wall-clock window — the
+        // exact heuristic withdrawalReconciliationWorker uses. Non-fatal.
+        let withdrawalRow = null;
+        try {
+            withdrawalRow = await prisma.withdrawal.findFirst({
+                where: {
+                    userId: req.user.id,
+                    amount: tx.amountUsdc,
+                    createdAt: {
+                        gte: new Date(tx.createdAt.getTime() - 5_000),
+                        lte: new Date(tx.createdAt.getTime() + 5_000)
+                    }
+                },
+                orderBy: { createdAt: 'desc' }
+            });
+        } catch (_) { /* non-fatal — provider context simply omitted */ }
+
+        // Map TransactionHistory.status → user-facing progress triple.
+        const STAGE_MAP = {
+            PENDING:   { stage: 'PROCESSING', label: 'Sending to your MoMo wallet...', pct: 40 },
+            COMPLETED: { stage: 'COMPLETED',  label: 'Money sent successfully!',       pct: 100 },
+            FAILED:    { stage: 'FAILED',     label: 'Transfer failed. Refund issued.', pct: 0 },
+        };
+        const mapped = STAGE_MAP[tx.status] || { stage: 'PROCESSING', label: 'Processing...', pct: 20 };
+
+        // The Withdrawal model stores no providerTxId column today; expose it as
+        // null until reconciliation persists it, so the Flutter contract is stable.
+        const providerTxId = (withdrawalRow && withdrawalRow.providerTxId) || null;
+
+        return res.status(200).json({
+            success:      true,
+            reference,
+            status:       tx.status,
+            stage:        mapped.stage,
+            label:        mapped.label,
+            pct:          mapped.pct,
+            amountGhs:    tx.amountUsdc != null ? Number(tx.amountUsdc) : null,
+            recipient:    withdrawalRow ? withdrawalRow.destination : null,
+            providerTxId,
+            updatedAt:    tx.createdAt ? tx.createdAt.toISOString() : null
+        });
+    } catch (error) {
+        console.error('[getWithdrawalStatus] error:', error.message);
+        return res.status(500).json({ success: false, code: 'SERVER_ERROR', message: error.message });
     }
 };

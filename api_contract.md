@@ -308,6 +308,29 @@ via `finance.service.reverseFiatWithdrawal` which:
 
 Refuses to mutate if `MTN_WEBHOOK_SECRET` is unset (503).
 
+### `POST /finance/webhook/moolre-disbursement` (no auth, **secret OR HMAC guarded**) — *Moolre primary off-ramp*
+Settlement webhook for the **primary** off-ramp (Moolre), bound under the
+same app-key as MTN. Same idempotent `PENDING / SUCCESSFUL / FAILED`
+semantics and the same `reverseFiatWithdrawal` reversal as the MTN webhook
+above. Moolre wraps the payload in its universal envelope
+`{ status, code, message, data, go }`; the handler reads transaction fields
+from `data` (falling back to the top-level body if already flattened).
+
+**Authentication (accepts either):**
+1. Shared secret — `X-Moolre-Webhook-Secret: <MOOLRE_WEBHOOK_SECRET>`.
+2. HMAC-SHA256 — `hex(HMAC(MOOLRE_WEBHOOK_SECRET, rawBody))` in any of
+   `X-Moolre-Signature` / `X-Signature` / `X-Webhook-Signature`, compared
+   in constant time against the raw request body.
+
+Returns `401` if neither header is present or verification fails; `503` if
+`MOOLRE_WEBHOOK_SECRET` is unset (the server also logs a `[STARTUP]` warning
+at boot).
+
+**Real-time progress:** on each callback the handler emits a
+`withdrawal_progress` Socket.io event to `user_<id>` (PROCESSING on
+`PENDING`, COMPLETED on success, FAILED on the reversal path) so the Flutter
+`WithdrawalProgressSheet` updates instantly. See **Real-time events**.
+
 ### `GET /finance/fiat-pool-status` (public, read-only) — *Phase B*
 Returns the live `SystemFiatPool` balance with a tier classification
 (`HEALTHY` ≥ threshold, `LIMITED` ≥ ½ × threshold, `CRITICAL` below).
@@ -485,6 +508,44 @@ Returns `400` if `amount` is too low to cover gas.
   }
 }
 ```
+
+### `GET /withdraw/status/:reference` (auth) — *Moolre progress popup*
+Owner-only status lookup for the real-time withdrawal progress sheet.
+`reference` is the canonical idempotency UUID minted in `fiatWithdrawal`
+and stored as `TransactionHistory.txHash`. Acts as the **5s polling
+fallback** for the `withdrawal_progress` Socket.io event (see Real-time
+events). Returns `404 NOT_FOUND` if no `WITHDRAWAL_FIAT` row with that
+`txHash` belongs to the requester.
+
+Maps `TransactionHistory.status` → a user-facing `{stage,label,pct}`
+triple:
+
+| status      | stage        | label                            | pct |
+|-------------|--------------|----------------------------------|-----|
+| `PENDING`   | `PROCESSING` | Sending to your MoMo wallet...   | 40  |
+| `COMPLETED` | `COMPLETED`  | Money sent successfully!         | 100 |
+| `FAILED`    | `FAILED`     | Transfer failed. Refund issued.  | 0   |
+| (other)     | `PROCESSING` | Processing...                    | 20  |
+
+```json
+{
+  "success": true,
+  "reference": "<uuid-v4>",
+  "status": "PENDING",
+  "stage": "PROCESSING",
+  "label": "Sending to your MoMo wallet...",
+  "pct": 40,
+  "amountGhs": 100,
+  "recipient": "233XXXXXXXXX",
+  "providerTxId": null,
+  "updatedAt": "2026-06-12T10:00:00.000Z"
+}
+```
+
+> Note: `POST /finance/withdraw/fiat` (and the `/api/withdraw/fiat` alias)
+> now return `reference` at the **top level** of the success body (in
+> addition to `data.reference`) so the Flutter `WithdrawalProgressSheet`
+> can open immediately and subscribe without parsing the message string.
 
 ---
 
@@ -1149,6 +1210,8 @@ hardware wallet.
 - `queued`                 — Smart-Queue placement
 - `new_notification`       — generic banner ping
 - `deposit_success`        — `{ type, amount, txHash | reference, newBalance, timestamp }`
+- `withdrawal_progress`    — fiat off-ramp progress for the Flutter `WithdrawalProgressSheet`, emitted to `user_<id>` from the Moolre settlement webhook. `{ reference, status, stage, label, pct, amountGhs?, providerTxId?, timestamp }` where `stage ∈ {PROCESSING, COMPLETED, FAILED}` (PENDING→pct 60, SUCCESS→pct 100, FAILED→pct 0). Polling fallback: `GET /withdraw/status/:reference`.
+- `withdrawal_settled`     — terminal settlement from the reconciliation worker — `{ reference, status, amount, refunded? }`
 - `admin_alert`            — `{ type, ... }` (DISPUTE, OVERPAYMENT_DISPUTE, LIQUIDITY_LOW, PROFIT_LIQUIDATION, ...)
 - `account_restricted`     — fired when the strike threshold trips a ban
 

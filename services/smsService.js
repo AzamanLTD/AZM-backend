@@ -6,11 +6,23 @@
  */
 
 const crypto = require('crypto');
+const axios  = require('axios');
 
 class SMSService {
     constructor() {
         this.apiKey = process.env.SMS_API_KEY || 'mock_sms_api_key';
         this.provider = process.env.SMS_PROVIDER || 'mock';
+
+        // ── Moolre SMS (VAS) configuration ────────────────────────────────────
+        // Resolved once in the constructor so _sendViaMoolre stays stateless per
+        // call. Defaults to sandbox unless MOOLRE_ENV says production. SMS uses
+        // the VAS key (X-API-VASKEY); falls back to the standard API key if a
+        // dedicated VAS key isn't provisioned.
+        const moolreUseProd = process.env.MOOLRE_ENV === 'production' || process.env.MOOLRE_ENV === 'prod';
+        this.moolreBaseUrl  = process.env.MOOLRE_BASE_URL || (moolreUseProd ? 'https://api.moolre.com' : 'https://sandbox.moolre.com');
+        this.moolreApiUser  = process.env.MOOLRE_API_USER || null;
+        this.moolreVasKey   = process.env.MOOLRE_VAS_KEY  || process.env.MOOLRE_API_KEY || null;
+        this.moolreSenderId = process.env.MOOLRE_SMS_SENDER_ID || 'AZAMAN';
         // isTestMode normally forces MOCK in any non-production env. That is the
         // right default, but it also blocks testing a REAL provider (e.g. Moolre)
         // against its sandbox from a dev/staging box. SMS_FORCE_LIVE=true lets a
@@ -339,65 +351,81 @@ class SMSService {
         // Auth: STATIC headers (no OAuth). Per Moolre's reference, SMS/USSD use
         // the VAS key X-API-VASKEY in addition to the account user X-API-USER.
         // Universal response envelope: { status: 1|0, code, message, data, go }
-        // where status is an INTEGER (1 = success, 0 = failure).
+        // where status is an INTEGER (1 = success, 0 = failure) — unwrapped here
+        // exactly as moolreDisbursementService._unwrap() does.
+        //
+        // Fire-and-forget contract: this method THROWS on failure rather than
+        // swallowing the error. The production callers (sendSMS via
+        // sendWithdrawalConfirmation) do not await it on the hot path, so a
+        // throw only surfaces where the call is explicitly awaited.
         //
         // ─── ⚠️ VERIFY-AGAINST-SANDBOX ───────────────────────────────────────
-        // The exact endpoint path + body field names below are intuitive
-        // guesses (the docs SPA could not be scraped). Adjust ONLY these three
-        // constants once you confirm them in the Moolre sandbox; the auth,
-        // envelope handling, and return shape are provider-correct.
-        const MOOLRE_SMS_ENDPOINT = '/open/sms/send';   // ⚠️ VERIFY path
-        const BODY = {                                  // ⚠️ VERIFY body keys
-            sender:    'sender',
-            recipient: 'recipient',
-            message:   'message',
+        // Endpoint path + body field names below are best-guess values that
+        // follow Moolre's documented VAS/SMS product. They are isolated as
+        // constants so they are trivial to rename once confirmed in sandbox;
+        // the auth, envelope handling, and return shape are provider-correct.
+        const MOOLRE_SMS_ENDPOINT = '/sms/send';        // ⚠️ VERIFY path
+        const SMS_BODY_KEYS = {                          // ⚠️ VERIFY body keys
+            recipient: 'recipient',    // ⚠️ VERIFY: phone number field name
+            message:   'message',      // ⚠️ VERIFY: message content field name
+            sender:    'sender_id',    // ⚠️ VERIFY: sender ID field name
+            type:      'type',         // ⚠️ VERIFY: message type field (may not exist)
         };
+        const SMS_TYPE_VALUE = 'text'; // ⚠️ VERIFY: or set null to omit the field entirely
         // ─────────────────────────────────────────────────────────────────────
 
-        const useProd  = process.env.MOOLRE_ENV === 'production' || process.env.MOOLRE_ENV === 'prod';
-        const baseUrl  = process.env.MOOLRE_BASE_URL || (useProd ? 'https://api.moolre.com' : 'https://sandbox.moolre.com');
-        const apiUser  = process.env.MOOLRE_API_USER || '';
-        // SMS/USSD use the VAS key; fall back to the standard API key if a
-        // dedicated VAS key isn't provisioned on the account.
-        const vasKey   = process.env.MOOLRE_VAS_KEY || process.env.MOOLRE_API_KEY || this.apiKey;
-        const senderId = process.env.MOOLRE_SMS_SENDER_ID || sender || 'AZAMAN';
+        // Strip all non-digits before sending — Moolre expects a bare MSISDN.
+        const sanitized = String(phoneNumber).replace(/\D+/g, '');
+
+        // Build the body, sending only fields that have values (omit nulls).
+        const body = {
+            [SMS_BODY_KEYS.recipient]: sanitized,
+            [SMS_BODY_KEYS.message]:   message,
+            [SMS_BODY_KEYS.sender]:    sender || this.moolreSenderId,
+        };
+        if (SMS_TYPE_VALUE !== null && SMS_TYPE_VALUE !== undefined) {
+            body[SMS_BODY_KEYS.type] = SMS_TYPE_VALUE;
+        }
 
         try {
-            const response = await fetch(`${baseUrl}${MOOLRE_SMS_ENDPOINT}`, {
-                method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                    'X-API-USER':   apiUser,
-                    'X-API-VASKEY': vasKey,
-                },
-                body: JSON.stringify({
-                    [BODY.sender]:    senderId,
-                    [BODY.recipient]: phoneNumber.replace(/^\+/, ''), // bare MSISDN
-                    [BODY.message]:   message,
-                })
-            });
+            const { data: envelope } = await axios.post(
+                `${this.moolreBaseUrl}${MOOLRE_SMS_ENDPOINT}`,
+                body,
+                {
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'X-API-USER':   this.moolreApiUser,
+                        'X-API-VASKEY': this.moolreVasKey,
+                    },
+                    timeout: 10000,
+                }
+            );
 
-            const envelope = await response.json().catch(() => null);
-            const ok = response.ok && envelope && Number(envelope.status) === 1;
-
-            if (ok) {
-                const messageId = envelope.data?.messageid || envelope.data?.id || this._generateMessageId();
+            // Unwrap Moolre's universal envelope: status is an INTEGER (1 = success).
+            if (envelope && Number(envelope.status) === 1) {
+                const data = envelope.data || {};
+                const messageId = data?.id || data?.messageid || data?.transactionid || null;
                 console.log(`✅ [Moolre] SMS sent to ${phoneNumber} (id: ${messageId})`);
                 return {
-                    success: true,
+                    success:   true,
                     messageId,
-                    provider: 'moolre',
-                    cost: envelope.data?.cost ?? 0,
-                    status: 'sent'
+                    provider:  'moolre',
+                    cost:      data?.cost || 0,
+                    status:    'sent',
+                    timestamp: new Date().toISOString(),
                 };
             }
 
-            const errMsg = envelope?.message || envelope?.code || `HTTP ${response.status}`;
-            console.error(`❌ [Moolre] SMS failed: ${errMsg}`);
-            return { success: false, provider: 'moolre', status: 'failed', error: errMsg };
-        } catch (error) {
-            console.error(`❌ [Moolre] Network error: ${error.message}`);
-            return { success: false, provider: 'moolre', status: 'error', error: error.message };
+            // FAILURE PATH (envelope.status === 0 or malformed envelope).
+            throw new Error(`Moolre SMS rejected: ${envelope?.message || envelope?.code || 'unknown error'}`);
+        } catch (err) {
+            // Re-throw provider rejections (already prefixed) verbatim so the
+            // caller sees the Moolre reason; wrap network/timeout errors.
+            if (err.message && err.message.startsWith('Moolre SMS rejected:')) {
+                throw err;
+            }
+            const apiMsg = err.response?.data?.message || err.response?.data?.code || err.message;
+            throw new Error(`[SMSService/Moolre] Request failed: ${apiMsg}`);
         }
     }
 }
