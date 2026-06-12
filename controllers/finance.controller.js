@@ -37,6 +37,7 @@ function _getNotificationService(req) {
 
 const financeService               = require('../services/finance.service');
 const { FIAT_POOL_ALERT_THRESH }   = financeService;
+const crypto                       = require('crypto');
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -510,13 +511,44 @@ exports.moolreDisbursementWebhook = async (req, res) => {
                 message: 'Webhook endpoint is not configured. Refusing to mutate ledger.'
             });
         }
-        // ⚠️ VERIFY: Moolre's callback authentication header name + scheme.
-        // Defaulting to a shared-secret header (mirrors the MTN webhook). If
-        // Moolre instead signs the body with an HMAC, swap this constant-time
-        // compare for an HMAC verification over req.rawBody (already captured by
-        // the express.json verify hook in server.js).
+        // ── Authentication: support BOTH a shared-secret header AND an HMAC ────
+        // signature over the raw body. Moolre's exact scheme is unconfirmed, so
+        // we accept either:
+        //   1. Shared secret  → X-Moolre-Webhook-Secret === MOOLRE_WEBHOOK_SECRET
+        //   2. HMAC-SHA256     → hex(HMAC(MOOLRE_WEBHOOK_SECRET, rawBody)) matches
+        //      one of the common signature headers, compared in constant time.
+        // req.rawBody is captured by the express.json verify hook in server.js.
         const providedSecret = req.headers['x-moolre-webhook-secret'];
-        if (providedSecret !== expectedSecret) {
+        const signatureHeaderNames = ['x-moolre-signature', 'x-signature', 'x-webhook-signature'];
+        const providedSignature = signatureHeaderNames
+            .map((h) => req.headers[h])
+            .find((v) => typeof v === 'string' && v.length > 0) || null;
+
+        let authPassed = false;
+        if (typeof providedSecret === 'string' && providedSecret.length > 0) {
+            // (1) Shared-secret path (existing behaviour).
+            authPassed = providedSecret === expectedSecret;
+        } else if (providedSignature) {
+            // (2) HMAC-SHA256 path over the raw request body.
+            try {
+                const expectedSig = crypto
+                    .createHmac('sha256', expectedSecret)
+                    .update(req.rawBody || '')
+                    .digest('hex');
+                const a = Buffer.from(providedSignature, 'utf8');
+                const b = Buffer.from(expectedSig, 'utf8');
+                // timingSafeEqual throws on length mismatch — guard first.
+                authPassed = a.length === b.length && crypto.timingSafeEqual(a, b);
+            } catch (sigErr) {
+                console.error('[moolreDisbursementWebhook] HMAC verification error:', sigErr.message);
+                authPassed = false;
+            }
+        } else {
+            // Neither a shared-secret header nor a signature header is present.
+            return res.status(401).json({ success: false, message: 'Missing webhook authentication.' });
+        }
+
+        if (!authPassed) {
             return res.status(401).json({ success: false, message: 'Invalid webhook signature.' });
         }
 
@@ -549,6 +581,28 @@ exports.moolreDisbursementWebhook = async (req, res) => {
         if (upper === '1' || upper === 'SUCCESS' || upper === 'SUCCESSFUL' || upper === 'COMPLETED' || upper === 'PAID') {
             normalized = 'SUCCESSFUL';
         } else if (upper === 'PENDING' || upper === 'PROCESSING') {
+            // Emit a real-time PROCESSING tick to the user's progress popup, then
+            // acknowledge without mutating the ledger (debit already committed at
+            // dispatch). `original` is fetched below for SUCCESS/FAILED, but on
+            // the PENDING path we only have `reference`, so look up the userId for
+            // the room. Non-fatal if it can't be resolved.
+            setImmediate(async () => {
+                try {
+                    if (!io) return;
+                    const row = await prisma.transactionHistory.findUnique({ where: { txHash: reference } });
+                    if (!row) return;
+                    io.to(`user_${row.userId}`).emit('withdrawal_progress', {
+                        reference,
+                        status:    'PENDING',
+                        stage:     'PROCESSING',
+                        label:     'Transfer in progress...',
+                        pct:       60,
+                        timestamp: new Date().toISOString()
+                    });
+                } catch (emitErr) {
+                    console.error('[moolreDisbursementWebhook] Socket emit failed:', emitErr.message);
+                }
+            });
             return res.status(200).json({
                 success: true,
                 message: 'PENDING status acknowledged; no ledger mutation.',
@@ -577,6 +631,28 @@ exports.moolreDisbursementWebhook = async (req, res) => {
         // SUCCESSFUL on a COMPLETED row = no-op (the debit was already committed
         // at dispatch time; Moolre is just confirming the GHS landed).
         if (normalized === 'SUCCESSFUL') {
+            // Real-time push to the user's withdrawal progress popup so it flips
+            // to the success state instantly without waiting for the 5s poll.
+            setImmediate(() => {
+                try {
+                    const userId = original.userId;
+                    if (io) {
+                        io.to(`user_${userId}`).emit('withdrawal_progress', {
+                            reference,
+                            status:       'COMPLETED',
+                            stage:        'COMPLETED',
+                            label:        'Money sent to your MoMo wallet!',
+                            pct:          100,
+                            amountGhs:    original.amountUsdc != null ? Number(original.amountUsdc) : null,
+                            providerTxId: providerTxId || null,
+                            timestamp:    new Date().toISOString()
+                        });
+                    }
+                } catch (emitErr) {
+                    console.error('[moolreDisbursementWebhook] Socket emit failed:', emitErr.message);
+                }
+            });
+
             return res.status(200).json({
                 success: true,
                 message: 'Settlement confirmed.',
@@ -598,6 +674,26 @@ exports.moolreDisbursementWebhook = async (req, res) => {
         });
 
         if (emitBalanceUpdate) await emitBalanceUpdate(reversal.userId);
+
+        // Real-time push to the user's withdrawal progress popup so it flips to
+        // the failed/refunded state instantly without waiting for the 5s poll.
+        setImmediate(() => {
+            try {
+                if (io) {
+                    io.to(`user_${original.userId}`).emit('withdrawal_progress', {
+                        reference,
+                        status:    'FAILED',
+                        stage:     'FAILED',
+                        label:     'Transfer failed. Your balance has been refunded.',
+                        pct:       0,
+                        timestamp: new Date().toISOString()
+                    });
+                }
+            } catch (emitErr) {
+                console.error('[moolreDisbursementWebhook] Socket emit failed:', emitErr.message);
+            }
+        });
+
         try {
             await _getNotificationService(req).sendNotification({
                 userId:        reversal.userId,

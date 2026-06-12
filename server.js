@@ -137,6 +137,13 @@ gatewayService.startRateSync();
 const MoolreDisbursementService = require('./services/moolreDisbursementService');
 const mtnDisbursementService = new MoolreDisbursementService();
 
+// Startup guard: the Moolre settlement webhook hard-disables itself (503) if
+// MOOLRE_WEBHOOK_SECRET is unset, so warn loudly at boot to make the disabled
+// endpoint obvious instead of silently rejecting every callback in production.
+if (!process.env.MOOLRE_WEBHOOK_SECRET) {
+    console.warn('[STARTUP] MOOLRE_WEBHOOK_SECRET is not set — webhook endpoint is disabled.');
+}
+
 // ── FALLBACK: MTN MoMo (kept intact — uncomment to revert) ────────────────────
 // const MtnDisbursementService = require('./services/mtnDisbursementService');
 // const mtnDisbursementService = new MtnDisbursementService();
