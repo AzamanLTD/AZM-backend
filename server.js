@@ -236,6 +236,10 @@ const azmRoutes         = require('./routes/azmRoutes');
 const receiptRoutes     = require('./routes/receiptRoutes');
 const ticketRoutes      = require('./routes/ticketRoutes');
 
+// Smart Escrow & Business Accounts (2026-06-14)
+const escrowRoutes      = require('./routes/escrowRoutes');
+const businessRoutes    = require('./routes/businessRoutes');
+
 // Master Sprint (2026-05-27): Vault, Susu, Group Chat, Smart Route, AZM Auction
 const vaultRoutes       = require('./routes/vaultRoutes');
 const groupChatRoutes   = require('./routes/groupChatRoutes');
@@ -742,6 +746,14 @@ const payoutBatchWorker = new PayoutBatchWorker(prisma, io, mtnDisbursementServi
 payoutBatchWorker.start();
 app.set('payoutBatchWorker', payoutBatchWorker);
 
+// --- SMART ESCROW EXPIRY WORKER (2026-06-14) ---
+// Sweeps DRAFT escrows past 24h and FUNDED escrows past 30d of inactivity
+// (refunding the payer), every 30 minutes. No-op safe in test mode.
+const EscrowExpiryWorker = require('./workers/escrowExpiryWorker');
+const escrowExpiryWorker = new EscrowExpiryWorker(prisma, io, notificationService);
+escrowExpiryWorker.start();
+app.set('escrowExpiryWorker', escrowExpiryWorker);
+
 // --- MASTER SPRINT WORKERS (Vault / Susu / Smart Route / AZM Auction) ---
 const VaultWorker = require('./workers/vaultWorker');
 const vaultWorker = new VaultWorker(prisma, vaultService, notificationService);
@@ -908,6 +920,11 @@ app.set('socketio', io);
 app.set('prisma', prisma);
 app.set('vendorStatus', vendorStatus);
 app.set('emitBalanceUpdate', emitBalanceUpdate);
+
+// Smart Escrow & Business Accounts (2026-06-14): escrowService exports plain
+// functions, so bind the module itself rather than an instance.
+const EscrowService = require('./services/escrowService');
+app.set('escrowService', EscrowService);
 app.set('pushIfOffline', pushIfOffline);
 app.set('gatewayService', gatewayService);
 app.set('mtnDisbursementService', mtnDisbursementService);
@@ -959,6 +976,10 @@ app.use('/api/oracle', generalLimiter, oracleRoutes);
 app.use('/api/azm', generalLimiter, azmRoutes);
 app.use('/api/receipts', generalLimiter, receiptRoutes);
 app.use('/api/tickets', generalLimiter, ticketRoutes);
+
+// Smart Escrow & Business Accounts (2026-06-14)
+app.use('/api/escrow',   financialLimiter, escrowRoutes);
+app.use('/api/business', generalLimiter,   businessRoutes);
 
 // Master Sprint (2026-05-27)
 app.use('/api/vaults',        financialLimiter, vaultRoutes);
