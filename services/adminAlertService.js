@@ -29,6 +29,8 @@ const ALERT_DEFS = {
     SUSPICIOUS_TRADE_PATTERN: { severity: 'HIGH',     title: 'Suspicious trade pattern' },
     KYC_MANUAL_REVIEW_REQUIRED:{ severity: 'MEDIUM',  title: 'KYC needs manual review' },
     DISPUTE_FILED:            { severity: 'HIGH',     title: 'Trade dispute filed' },
+    // Smart Escrow & Business Accounts (2026-06-14): escrow dispute escalation.
+    ESCROW_DISPUTE:           { severity: 'HIGH',     title: 'Escrow dispute filed' },
 };
 
 const ADMIN_ROOM = 'admin_spy_room';

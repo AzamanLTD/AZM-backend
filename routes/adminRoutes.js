@@ -331,4 +331,10 @@ router.get('/disputes/resolutions', async (req, res) => {
     }
 });
 
+// ─── SMART ESCROW DISPUTES (2026-06-14) ──────────────────────────────────────
+// protect + adminOnly are already applied globally via router.use at the top.
+router.get('/escrow-disputes', adminController.getEscrowDisputes);
+router.post('/escrow-disputes/:id/assign', adminController.assignEscrowDispute);
+router.post('/escrow-disputes/:id/resolve', adminController.resolveEscrowDispute);
+
 module.exports = router;
