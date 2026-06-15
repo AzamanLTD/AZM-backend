@@ -1763,3 +1763,204 @@ exports.getNeedsManualReview = async (req, res) => {
         return res.status(500).json({ success: false, message: error.message });
     }
 };
+
+// =============================================================================
+// SMART ESCROW DISPUTES (2026-06-14)
+// Admin/worker management of escrow disputes. Financial rulings are executed by
+// services/escrowService.js (resolveDispute) inside prisma.$transaction.
+// =============================================================================
+
+const escrowService = require('../services/escrowService');
+
+/** Inject a SYSTEM TicketMessage into a ticket and fan it out (best-effort). */
+async function _injectEscrowSystemMessage(prisma, io, ticket, content, metadata = {}) {
+    try {
+        const message = await prisma.ticketMessage.create({
+            data: {
+                ticketId: ticket.id,
+                senderId: ticket.creatorId,
+                type: 'SYSTEM',
+                content,
+                metadata: { system: true, ...metadata }
+            }
+        });
+        await prisma.ticket.update({
+            where: { id: ticket.id },
+            data: { lastActivityAt: new Date() }
+        });
+        if (io) {
+            const payload = { ...message, ticketId: ticket.id };
+            io.to(`ticket_${ticket.id}`).emit('ticket_message', payload);
+            io.to(`user_${ticket.creatorId}`).emit('ticket_message', payload);
+            io.to(`user_${ticket.counterpartyId}`).emit('ticket_message', payload);
+        }
+    } catch (err) {
+        console.error('[admin._injectEscrowSystemMessage] error:', err.message);
+    }
+}
+
+// GET /api/admin/escrow-disputes?status=&page=&limit=
+exports.getEscrowDisputes = async (req, res) => {
+    const prisma = req.app.get('prisma');
+    try {
+        const { status } = req.query;
+        const VALID = ['PENDING', 'ASSIGNED', 'UNDER_REVIEW', 'RESOLVED'];
+        const where = {};
+        if (status) {
+            const upper = String(status).toUpperCase();
+            if (!VALID.includes(upper)) {
+                return res.status(400).json({ success: false, message: `status must be one of: ${VALID.join(', ')}` });
+            }
+            where.status = upper;
+        }
+
+        const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
+        const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 100);
+        const skip = (page - 1) * limit;
+
+        const [disputes, total] = await Promise.all([
+            prisma.escrowDispute.findMany({
+                where,
+                orderBy: { createdAt: 'desc' },
+                skip,
+                take: limit,
+                include: {
+                    escrow: {
+                        include: {
+                            ticket: { select: { id: true, name: true, status: true } },
+                            payer: { select: { id: true, username: true } },
+                            payee: { select: { id: true, username: true } }
+                        }
+                    },
+                    raisedBy: { select: { id: true, username: true } },
+                    assignedTo: { select: { id: true, username: true } }
+                }
+            }),
+            prisma.escrowDispute.count({ where })
+        ]);
+
+        return res.status(200).json({
+            success: true,
+            disputes,
+            pagination: { page, limit, total, totalPages: Math.ceil(total / limit) }
+        });
+    } catch (error) {
+        console.error('[getEscrowDisputes] error:', error.message);
+        return res.status(500).json({ success: false, message: error.message });
+    }
+};
+
+// POST /api/admin/escrow-disputes/:id/assign   body: { assignedToId }
+exports.assignEscrowDispute = async (req, res) => {
+    const prisma = req.app.get('prisma');
+    const io = req.app.get('socketio');
+    try {
+        const { id } = req.params; // dispute id
+        const { assignedToId } = req.body;
+        if (!assignedToId) {
+            return res.status(400).json({ success: false, message: 'assignedToId is required.' });
+        }
+
+        const dispute = await prisma.escrowDispute.findUnique({ where: { id } });
+        if (!dispute) {
+            return res.status(404).json({ success: false, message: 'Dispute not found.' });
+        }
+
+        const result = await escrowService.assignDisputeToAdmin(prisma, {
+            escrowId: dispute.escrowId,
+            assignedToId: Number(assignedToId),
+            requestingAdminId: req.user.id
+        });
+
+        if (io) {
+            io.to(`user_${Number(assignedToId)}`).emit('dispute_assigned', {
+                disputeId: result.dispute.id,
+                escrowId: result.escrow.id,
+                status: result.dispute.status
+            });
+        }
+
+        return res.status(200).json({ success: true, escrow: result.escrow, dispute: result.dispute });
+    } catch (error) {
+        console.error('[assignEscrowDispute] error:', error.message);
+        return res.status(500).json({ success: false, message: error.message });
+    }
+};
+
+// POST /api/admin/escrow-disputes/:id/resolve
+// body: { ruling: 'FULL_RELEASE'|'FULL_REFUND'|'SPLIT', rulingNotes, payerPct?, payeePct? }
+exports.resolveEscrowDispute = async (req, res) => {
+    const prisma = req.app.get('prisma');
+    const io = req.app.get('socketio');
+    try {
+        const { id } = req.params; // dispute id
+        const { ruling, rulingNotes, payerPct, payeePct } = req.body;
+
+        if (!['FULL_RELEASE', 'FULL_REFUND', 'SPLIT'].includes(ruling)) {
+            return res.status(400).json({ success: false, message: 'ruling must be FULL_RELEASE, FULL_REFUND, or SPLIT.' });
+        }
+
+        const dispute = await prisma.escrowDispute.findUnique({
+            where: { id },
+            include: {
+                escrow: { include: { ticket: true, payer: { select: { id: true, username: true } }, payee: { select: { id: true, username: true } } } }
+            }
+        });
+        if (!dispute) {
+            return res.status(404).json({ success: false, message: 'Dispute not found.' });
+        }
+        const escrowRow = dispute.escrow;
+
+        const result = await escrowService.resolveDispute(prisma, {
+            escrowId: dispute.escrowId,
+            adminId: req.user.id,
+            ruling,
+            rulingNotes,
+            payerPct,
+            payeePct
+        });
+
+        const payerName = escrowRow.payer ? escrowRow.payer.username : 'the payer';
+        const payeeName = escrowRow.payee ? escrowRow.payee.username : 'the payee';
+
+        // Emit escrow_resolved to both parties.
+        if (io) {
+            const payload = {
+                escrowId: result.escrow.id,
+                ticketId: result.escrow.ticketId,
+                status: result.escrow.status,
+                ruling,
+                payerPct: result.dispute.payerPct,
+                payeePct: result.dispute.payeePct
+            };
+            io.to(`user_${result.escrow.payerId}`).emit('escrow_resolved', payload);
+            io.to(`user_${result.escrow.payeeId}`).emit('escrow_resolved', payload);
+        }
+
+        // SYSTEM TicketMessage describing the ruling.
+        let msg;
+        if (ruling === 'FULL_RELEASE') {
+            msg = `🏆 Admin ruling: Funds released to ${payeeName}.`;
+        } else if (ruling === 'FULL_REFUND') {
+            msg = `↩️ Admin ruling: Funds refunded to ${payerName}.`;
+        } else {
+            msg = `⚖️ Admin ruling: ${payerPct}% refunded to ${payerName}, ${payeePct}% released to ${payeeName}.`;
+        }
+        await _injectEscrowSystemMessage(prisma, io, escrowRow.ticket, msg, {
+            event: 'ESCROW_RESOLVED', escrowId: result.escrow.id, ruling
+        });
+
+        // Close the parent ticket if still OPEN.
+        if (escrowRow.ticket && escrowRow.ticket.status === 'OPEN') {
+            await prisma.ticket.update({
+                where: { id: escrowRow.ticket.id },
+                data: { status: 'CLOSED', closedAt: new Date(), lastActivityAt: new Date() }
+            });
+        }
+
+        return res.status(200).json({ success: true, escrow: result.escrow, dispute: result.dispute });
+    } catch (error) {
+        console.error('[resolveEscrowDispute] error:', error.message);
+        return res.status(500).json({ success: false, message: error.message });
+    }
+};
