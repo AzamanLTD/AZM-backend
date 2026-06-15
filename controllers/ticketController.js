@@ -27,6 +27,10 @@ const VALID_MESSAGE_TYPES = new Set([
     'TEXT', 'IMAGE', 'VIDEO', 'DOCUMENT', 'AUDIO', 'LINK', 'TRANSFER', 'SYSTEM'
 ]);
 
+// Smart Escrow & Business Accounts (2026-06-14): ESCROW-type tickets auto-create
+// a SmartEscrow record; business-mode tickets bypass the friendship requirement.
+const escrowService = require('../services/escrowService');
+
 // ── helpers ─────────────────────────────────────────────────────────────────
 
 async function _verifyFriendshipParticipant(prisma, friendshipId, userId) {
@@ -85,13 +89,24 @@ exports.createTicket = async (req, res) => {
 
     try {
         const userId = req.user.id;
-        const { friendshipId, name, type, targetAmount, targetCurrency, memo } = req.body;
+        const {
+            friendshipId, businessProfileId, name, type, targetAmount,
+            targetCurrency, memo, escrowAmount, deliveryTerms, dueDate
+        } = req.body;
 
         // ── Validation ──────────────────────────────────────────────────────
-        if (!friendshipId || !name || !type || targetAmount == null || !targetCurrency) {
+        // Either friendshipId (friendship mode) or businessProfileId (business
+        // mode) must be present, but not neither.
+        if (!friendshipId && !businessProfileId) {
             return res.status(400).json({
                 success: false,
-                message: 'friendshipId, name, type, targetAmount, targetCurrency are required.'
+                message: 'Either friendshipId or businessProfileId is required.'
+            });
+        }
+        if (!name || !type || targetAmount == null || !targetCurrency) {
+            return res.status(400).json({
+                success: false,
+                message: 'name, type, targetAmount, targetCurrency are required.'
             });
         }
         const cleanName = String(name).trim();
@@ -111,16 +126,51 @@ exports.createTicket = async (req, res) => {
         }
         const cleanMemo = memo ? String(memo).trim().slice(0, 500) : null;
 
-        // ── Authorization ───────────────────────────────────────────────────
-        const auth = await _verifyFriendshipParticipant(prisma, friendshipId, userId);
-        if (!auth.ok) return res.status(auth.code).json({ success: false, message: auth.message });
+        // ── Authorization + mode resolution ──────────────────────────────────
+        // friendship mode: counterparty derived from the friendship.
+        // business  mode: counterparty = the business owner.
+        let counterpartyId;
+        let resolvedFriendshipId = null;
+        let resolvedBusinessProfileId = null;
+        let friendshipAuth = null;
+
+        if (friendshipId) {
+            const auth = await _verifyFriendshipParticipant(prisma, friendshipId, userId);
+            if (!auth.ok) return res.status(auth.code).json({ success: false, message: auth.message });
+            counterpartyId = auth.counterpartyId;
+            resolvedFriendshipId = friendshipId;
+            friendshipAuth = auth;
+        } else {
+            // Business-mode ticket (bypasses friendship requirement).
+            const bizProfile = await prisma.businessProfile.findUnique({
+                where: { id: businessProfileId },
+                select: { id: true, userId: true, businessName: true }
+            });
+            if (!bizProfile) {
+                return res.status(404).json({ success: false, message: 'Business not found.' });
+            }
+            if (bizProfile.userId === userId) {
+                return res.status(400).json({ success: false, message: 'Cannot open a ticket with your own business.' });
+            }
+            counterpartyId = bizProfile.userId;
+            resolvedBusinessProfileId = bizProfile.id;
+        }
+
+        // ── ESCROW pre-validation (before creating the ticket) ────────────────
+        if (type === 'ESCROW' && (!escrowAmount || Number(escrowAmount) <= 0)) {
+            return res.status(400).json({
+                success: false,
+                message: 'escrowAmount is required for ESCROW-type tickets.'
+            });
+        }
 
         // ── Create ──────────────────────────────────────────────────────────
         const ticket = await prisma.ticket.create({
             data: {
-                friendshipId,
+                friendshipId: resolvedFriendshipId,
+                businessProfileId: resolvedBusinessProfileId,
                 creatorId: userId,
-                counterpartyId: auth.counterpartyId,
+                counterpartyId,
                 name: cleanName,
                 type,
                 targetAmount: amt,
@@ -130,40 +180,80 @@ exports.createTicket = async (req, res) => {
         });
 
         // Inject TICKET_LINK event card into the parent friendship chat so
-        // both parties see the deep-link tile in their main feed.
-        const eventCard = await prisma.directMessage.create({
-            data: {
-                friendshipId,
-                senderId: userId,
-                receiverId: auth.counterpartyId,
-                content: _eventCardContent(ticket, 'CREATED'),
-                messageType: 'TICKET_LINK',
-                metadata: {
+        // both parties see the deep-link tile in their main feed. Friendship
+        // mode only — business-mode tickets have no friendship feed.
+        let eventCard = null;
+        if (resolvedFriendshipId) {
+            eventCard = await prisma.directMessage.create({
+                data: {
+                    friendshipId: resolvedFriendshipId,
+                    senderId: userId,
+                    receiverId: counterpartyId,
+                    content: _eventCardContent(ticket, 'CREATED'),
+                    messageType: 'TICKET_LINK',
+                    metadata: {
+                        ticketId: ticket.id,
+                        ticketName: ticket.name,
+                        ticketType: ticket.type,
+                        ticketStatus: ticket.status,
+                        eventType: 'CREATED',
+                        targetAmount: ticket.targetAmount.toString(),
+                        targetCurrency: ticket.targetCurrency
+                    }
+                }
+            });
+
+            // Bubble friendship to top of chat list
+            await prisma.friendship.update({
+                where: { id: resolvedFriendshipId },
+                data: { updatedAt: new Date() }
+            });
+        }
+
+        // ── Auto-create SmartEscrow for ESCROW-type tickets ───────────────────
+        // payer = ticket creator (pays); payee = counterparty (delivers).
+        if (type === 'ESCROW') {
+            let escrow;
+            try {
+                escrow = await escrowService.createEscrow(prisma, {
                     ticketId: ticket.id,
-                    ticketName: ticket.name,
-                    ticketType: ticket.type,
-                    ticketStatus: ticket.status,
-                    eventType: 'CREATED',
-                    targetAmount: ticket.targetAmount.toString(),
-                    targetCurrency: ticket.targetCurrency
+                    payerId: userId,
+                    payeeId: counterpartyId,
+                    amountUsdc: Number(escrowAmount),
+                    deliveryTerms: deliveryTerms || null,
+                    dueDate: dueDate ? new Date(dueDate) : null
+                });
+            } catch (escrowErr) {
+                // Roll back the just-created ticket so we don't orphan it.
+                await prisma.ticket.delete({ where: { id: ticket.id } }).catch(() => {});
+                return res.status(400).json({ success: false, message: escrowErr.message });
+            }
+
+            // ── Sockets ──────────────────────────────────────────────────────
+            if (io) {
+                io.to(`user_${userId}`).emit('ticket_created', { ticket });
+                io.to(`user_${counterpartyId}`).emit('ticket_created', { ticket });
+                if (resolvedFriendshipId && eventCard) {
+                    io.to(`friend_chat_${resolvedFriendshipId}`).emit('friend_message', {
+                        ...eventCard,
+                        eventCard: true
+                    });
                 }
             }
-        });
 
-        // Bubble friendship to top of chat list
-        await prisma.friendship.update({
-            where: { id: friendshipId },
-            data: { updatedAt: new Date() }
-        });
+            return res.status(201).json({ success: true, ticket, escrow });
+        }
 
-        // ── Sockets ────────────────────────────────────────────────────────
+        // ── Sockets (non-escrow) ─────────────────────────────────────────────
         if (io) {
             io.to(`user_${userId}`).emit('ticket_created', { ticket });
-            io.to(`user_${auth.counterpartyId}`).emit('ticket_created', { ticket });
-            io.to(`friend_chat_${friendshipId}`).emit('friend_message', {
-                ...eventCard,
-                eventCard: true
-            });
+            io.to(`user_${counterpartyId}`).emit('ticket_created', { ticket });
+            if (resolvedFriendshipId && eventCard) {
+                io.to(`friend_chat_${resolvedFriendshipId}`).emit('friend_message', {
+                    ...eventCard,
+                    eventCard: true
+                });
+            }
         }
 
         return res.status(201).json({ success: true, ticket });
@@ -174,25 +264,60 @@ exports.createTicket = async (req, res) => {
 };
 
 // =============================================================================
-// 2. LIST TICKETS — paginated by friendship + status
+// 2. LIST TICKETS — paginated, three modes
 //
-// GET /api/tickets?friendshipId=&status=&cursor=&limit=
+// GET /api/tickets?friendshipId=&businessProfileId=&status=&cursor=&limit=
+//
+//   MODE 1 — friendshipId provided : tickets in that friendship (legacy).
+//   MODE 2 — businessProfileId provided : tickets for that business (owner or
+//            a ticket participant may view).
+//   MODE 3 — neither provided : the caller's own tickets ("My Deals").
 // =============================================================================
 exports.listTickets = async (req, res) => {
     const prisma = req.app.get('prisma');
     try {
         const userId = req.user.id;
-        const { friendshipId, status } = req.query;
+        const { friendshipId, businessProfileId, status } = req.query;
         const limit = Math.min(parseInt(req.query.limit, 10) || 50, 100);
         const cursor = req.query.cursor || null;
 
-        if (!friendshipId) {
-            return res.status(400).json({ success: false, message: 'friendshipId required.' });
-        }
-        const auth = await _verifyFriendshipParticipant(prisma, friendshipId, userId);
-        if (!auth.ok) return res.status(auth.code).json({ success: false, message: auth.message });
+        let where;
 
-        const where = { friendshipId };
+        if (friendshipId) {
+            // ── MODE 1 — friendship tickets (unchanged behavior) ──────────────
+            const auth = await _verifyFriendshipParticipant(prisma, friendshipId, userId);
+            if (!auth.ok) return res.status(auth.code).json({ success: false, message: auth.message });
+            where = { friendshipId };
+        } else if (businessProfileId) {
+            // ── MODE 2 — business tickets ─────────────────────────────────────
+            // Caller must be the business owner OR a participant on one of its
+            // tickets (creatorId or counterpartyId).
+            const bizProfile = await prisma.businessProfile.findUnique({
+                where: { id: businessProfileId },
+                select: { id: true, userId: true }
+            });
+            if (!bizProfile) {
+                return res.status(404).json({ success: false, message: 'Business not found.' });
+            }
+            if (bizProfile.userId !== userId) {
+                const participantTicket = await prisma.ticket.findFirst({
+                    where: {
+                        businessProfileId,
+                        OR: [{ creatorId: userId }, { counterpartyId: userId }]
+                    },
+                    select: { id: true }
+                });
+                if (!participantTicket) {
+                    return res.status(403).json({ success: false, message: 'Not authorized to view this business\'s tickets.' });
+                }
+            }
+            where = { businessProfileId };
+        } else {
+            // ── MODE 3 — "My Deals": all tickets the caller participates in ───
+            where = { OR: [{ creatorId: userId }, { counterpartyId: userId }] };
+        }
+
+        // Shared status filter (all three modes).
         if (status) {
             const upper = String(status).toUpperCase();
             if (!VALID_STATUSES.has(upper)) {
@@ -205,6 +330,9 @@ exports.listTickets = async (req, res) => {
             where,
             orderBy: { lastActivityAt: 'desc' },
             take: limit + 1,
+            include: {
+                smartEscrow: { select: { id: true, status: true, amountUsdc: true, feeUsdc: true } }
+            },
             ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {})
         });
 
@@ -407,33 +535,39 @@ exports.changeTicketStatus = async (req, res) => {
         const ticket = await prisma.ticket.update({ where: { id }, data });
 
         // Inject status-change event card into parent friendship chat.
+        // Friendship mode only — business-mode tickets have no friendship feed.
         const eventType = targetStatus === 'OPEN' ? 'REOPENED' : targetStatus;
-        const eventCard = await prisma.directMessage.create({
-            data: {
-                friendshipId: ticket.friendshipId,
-                senderId: userId,
-                receiverId: ticket.creatorId === userId ? ticket.counterpartyId : ticket.creatorId,
-                content: _eventCardContent(ticket, eventType),
-                messageType: 'TICKET_LINK',
-                metadata: {
-                    ticketId: ticket.id,
-                    ticketName: ticket.name,
-                    ticketType: ticket.type,
-                    ticketStatus: ticket.status,
-                    eventType,
-                    targetAmount: ticket.targetAmount.toString(),
-                    targetCurrency: ticket.targetCurrency
+        let eventCard = null;
+        if (ticket.friendshipId) {
+            eventCard = await prisma.directMessage.create({
+                data: {
+                    friendshipId: ticket.friendshipId,
+                    senderId: userId,
+                    receiverId: ticket.creatorId === userId ? ticket.counterpartyId : ticket.creatorId,
+                    content: _eventCardContent(ticket, eventType),
+                    messageType: 'TICKET_LINK',
+                    metadata: {
+                        ticketId: ticket.id,
+                        ticketName: ticket.name,
+                        ticketType: ticket.type,
+                        ticketStatus: ticket.status,
+                        eventType,
+                        targetAmount: ticket.targetAmount.toString(),
+                        targetCurrency: ticket.targetCurrency
+                    }
                 }
-            }
-        });
+            });
+        }
 
         if (io) {
             io.to(`user_${ticket.creatorId}`).emit('ticket_status_changed', { ticket });
             io.to(`user_${ticket.counterpartyId}`).emit('ticket_status_changed', { ticket });
-            io.to(`friend_chat_${ticket.friendshipId}`).emit('friend_message', {
-                ...eventCard,
-                eventCard: true
-            });
+            if (ticket.friendshipId && eventCard) {
+                io.to(`friend_chat_${ticket.friendshipId}`).emit('friend_message', {
+                    ...eventCard,
+                    eventCard: true
+                });
+            }
         }
 
         return res.status(200).json({ success: true, ticket });
@@ -470,7 +604,11 @@ exports.pingPresence = async (req, res) => {
             };
             io.to(`user_${auth.ticket.creatorId}`).emit('ticket_presence_update', payload);
             io.to(`user_${auth.ticket.counterpartyId}`).emit('ticket_presence_update', payload);
-            io.to(`friend_chat_${auth.ticket.friendshipId}`).emit('ticket_presence_update', payload);
+            // Business-mode tickets have no friendship feed — guard against
+            // emitting to a `friend_chat_null` room.
+            if (auth.ticket.friendshipId) {
+                io.to(`friend_chat_${auth.ticket.friendshipId}`).emit('ticket_presence_update', payload);
+            }
         }
 
         return res.status(200).json({ success: true });
