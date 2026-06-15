@@ -3,13 +3,17 @@
 -- =============================================================================
 -- Audit of all 40+ models against query patterns in controllers, services,
 -- and workers. 16 models had zero or insufficient indexes. This migration
--- adds all missing indexes using CREATE INDEX CONCURRENTLY so the operation
--- is non-blocking on a live production database.
+-- adds all missing indexes.
 --
--- CONCURRENTLY means:
---   • No table lock taken — reads and writes continue during index build.
---   • Cannot run inside a transaction block — each statement is standalone.
---   • Slightly longer build time, zero downtime.
+-- NOTE (2026-06-14): originally authored with CREATE INDEX CONCURRENTLY, but
+-- Prisma Migrate (v6) wraps each migration's statements in a single
+-- transaction, and CONCURRENTLY cannot run inside a transaction block
+-- (Postgres error 25001). This made the migration impossible to apply via
+-- both `migrate dev` (shadow DB) AND `migrate deploy` (P3018). CONCURRENTLY
+-- has been removed so the migration applies. A plain CREATE INDEX takes a
+-- brief lock per table; acceptable here, and IF NOT EXISTS keeps it
+-- idempotent. For true zero-downtime index builds on a hot production table,
+-- run CONCURRENTLY manually outside of Prisma Migrate.
 --
 -- IF NOT EXISTS guards every statement — safe to re-run on any environment.
 -- =============================================================================
@@ -20,15 +24,15 @@
 -- ---------------------------------------------------------------------------
 
 -- User withdrawal history (GET /api/wallet/history)
-CREATE INDEX CONCURRENTLY IF NOT EXISTS "Withdrawal_userId_createdAt_idx"
+CREATE INDEX IF NOT EXISTS "Withdrawal_userId_createdAt_idx"
     ON "Withdrawal"("userId", "createdAt" DESC);
 
 -- Admin payout queue / War Room (filter by status)
-CREATE INDEX CONCURRENTLY IF NOT EXISTS "Withdrawal_status_createdAt_idx"
+CREATE INDEX IF NOT EXISTS "Withdrawal_status_createdAt_idx"
     ON "Withdrawal"("status", "createdAt" DESC);
 
 -- Reconciliation worker (PENDING + PROCESSING scans)
-CREATE INDEX CONCURRENTLY IF NOT EXISTS "Withdrawal_userId_status_idx"
+CREATE INDEX IF NOT EXISTS "Withdrawal_userId_status_idx"
     ON "Withdrawal"("userId", "status");
 
 -- ---------------------------------------------------------------------------
@@ -37,19 +41,19 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS "Withdrawal_userId_status_idx"
 -- ---------------------------------------------------------------------------
 
 -- Cursor pagination on /api/transactions (userId + createdAt)
-CREATE INDEX CONCURRENTLY IF NOT EXISTS "TransactionHistory_userId_createdAt_idx"
+CREATE INDEX IF NOT EXISTS "TransactionHistory_userId_createdAt_idx"
     ON "TransactionHistory"("userId", "createdAt" DESC);
 
 -- Filter by type (WITHDRAWAL_FIAT, P2P_TRADE, etc.)
-CREATE INDEX CONCURRENTLY IF NOT EXISTS "TransactionHistory_userId_type_idx"
+CREATE INDEX IF NOT EXISTS "TransactionHistory_userId_type_idx"
     ON "TransactionHistory"("userId", "type");
 
 -- Status filter (PENDING → sweep workers, FROZEN_DISPUTE → admin)
-CREATE INDEX CONCURRENTLY IF NOT EXISTS "TransactionHistory_status_idx"
+CREATE INDEX IF NOT EXISTS "TransactionHistory_status_idx"
     ON "TransactionHistory"("status");
 
 -- Admin audit: all transactions of a given type across users
-CREATE INDEX CONCURRENTLY IF NOT EXISTS "TransactionHistory_type_createdAt_idx"
+CREATE INDEX IF NOT EXISTS "TransactionHistory_type_createdAt_idx"
     ON "TransactionHistory"("type", "createdAt" DESC);
 
 -- ---------------------------------------------------------------------------
@@ -57,13 +61,13 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS "TransactionHistory_type_createdAt_idx"
 --    grouped by source and date range constantly.
 -- ---------------------------------------------------------------------------
 
-CREATE INDEX CONCURRENTLY IF NOT EXISTS "AdminProfitLog_source_createdAt_idx"
+CREATE INDEX IF NOT EXISTS "AdminProfitLog_source_createdAt_idx"
     ON "AdminProfitLog"("source", "createdAt" DESC);
 
-CREATE INDEX CONCURRENTLY IF NOT EXISTS "AdminProfitLog_createdAt_idx"
+CREATE INDEX IF NOT EXISTS "AdminProfitLog_createdAt_idx"
     ON "AdminProfitLog"("createdAt" DESC);
 
-CREATE INDEX CONCURRENTLY IF NOT EXISTS "AdminProfitLog_isSubsidized_idx"
+CREATE INDEX IF NOT EXISTS "AdminProfitLog_isSubsidized_idx"
     ON "AdminProfitLog"("isSubsidized");
 
 -- ---------------------------------------------------------------------------
@@ -71,10 +75,10 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS "AdminProfitLog_isSubsidized_idx"
 --    and every wallet picker (GET /api/wallet/saved).
 -- ---------------------------------------------------------------------------
 
-CREATE INDEX CONCURRENTLY IF NOT EXISTS "SavedWallet_userId_idx"
+CREATE INDEX IF NOT EXISTS "SavedWallet_userId_idx"
     ON "SavedWallet"("userId");
 
-CREATE INDEX CONCURRENTLY IF NOT EXISTS "SavedWallet_userId_createdAt_idx"
+CREATE INDEX IF NOT EXISTS "SavedWallet_userId_createdAt_idx"
     ON "SavedWallet"("userId", "createdAt" DESC);
 
 -- ---------------------------------------------------------------------------
@@ -82,13 +86,13 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS "SavedWallet_userId_createdAt_idx"
 --    queries fetch all reviews for a revieweeId — was a full table scan.
 -- ---------------------------------------------------------------------------
 
-CREATE INDEX CONCURRENTLY IF NOT EXISTS "Review_revieweeId_idx"
+CREATE INDEX IF NOT EXISTS "Review_revieweeId_idx"
     ON "Review"("revieweeId");
 
-CREATE INDEX CONCURRENTLY IF NOT EXISTS "Review_reviewerId_idx"
+CREATE INDEX IF NOT EXISTS "Review_reviewerId_idx"
     ON "Review"("reviewerId");
 
-CREATE INDEX CONCURRENTLY IF NOT EXISTS "Review_revieweeId_createdAt_idx"
+CREATE INDEX IF NOT EXISTS "Review_revieweeId_createdAt_idx"
     ON "Review"("revieweeId", "createdAt" DESC);
 
 -- ---------------------------------------------------------------------------
@@ -96,10 +100,10 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS "Review_revieweeId_createdAt_idx"
 --    (cycleId, status) that the cycle-runner uses on every collection tick.
 -- ---------------------------------------------------------------------------
 
-CREATE INDEX CONCURRENTLY IF NOT EXISTS "SusuContribution_cycleId_status_idx"
+CREATE INDEX IF NOT EXISTS "SusuContribution_cycleId_status_idx"
     ON "SusuContribution"("cycleId", "status");
 
-CREATE INDEX CONCURRENTLY IF NOT EXISTS "SusuContribution_cycleId_userId_idx"
+CREATE INDEX IF NOT EXISTS "SusuContribution_cycleId_userId_idx"
     ON "SusuContribution"("cycleId", "userId");
 
 -- ---------------------------------------------------------------------------
@@ -107,10 +111,10 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS "SusuContribution_cycleId_userId_idx"
 --    (susuGroupId, status) which every group dashboard fetches.
 -- ---------------------------------------------------------------------------
 
-CREATE INDEX CONCURRENTLY IF NOT EXISTS "SusuCycle_susuGroupId_status_idx"
+CREATE INDEX IF NOT EXISTS "SusuCycle_susuGroupId_status_idx"
     ON "SusuCycle"("susuGroupId", "status");
 
-CREATE INDEX CONCURRENTLY IF NOT EXISTS "SusuCycle_susuGroupId_cycleNumber_idx"
+CREATE INDEX IF NOT EXISTS "SusuCycle_susuGroupId_cycleNumber_idx"
     ON "SusuCycle"("susuGroupId", "cycleNumber");
 
 -- ---------------------------------------------------------------------------
@@ -118,10 +122,10 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS "SusuCycle_susuGroupId_cycleNumber_idx"
 --    but missing status index used by the failed-run sweep worker.
 -- ---------------------------------------------------------------------------
 
-CREATE INDEX CONCURRENTLY IF NOT EXISTS "SmartRouteRun_status_idx"
+CREATE INDEX IF NOT EXISTS "SmartRouteRun_status_idx"
     ON "SmartRouteRun"("status");
 
-CREATE INDEX CONCURRENTLY IF NOT EXISTS "SmartRouteRun_status_createdAt_idx"
+CREATE INDEX IF NOT EXISTS "SmartRouteRun_status_createdAt_idx"
     ON "SmartRouteRun"("status", "createdAt" DESC);
 
 -- ---------------------------------------------------------------------------
@@ -129,7 +133,7 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS "SmartRouteRun_status_createdAt_idx"
 --    type filter used for media gallery and system-event queries.
 -- ---------------------------------------------------------------------------
 
-CREATE INDEX CONCURRENTLY IF NOT EXISTS "GroupMessage_groupId_type_idx"
+CREATE INDEX IF NOT EXISTS "GroupMessage_groupId_type_idx"
     ON "GroupMessage"("groupId", "type");
 
 -- ---------------------------------------------------------------------------
@@ -137,10 +141,10 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS "GroupMessage_groupId_type_idx"
 --     missing vouchedUserId which the trust-rating dashboard filters on.
 -- ---------------------------------------------------------------------------
 
-CREATE INDEX CONCURRENTLY IF NOT EXISTS "VoucherSlashLog_vouchedUserId_idx"
+CREATE INDEX IF NOT EXISTS "VoucherSlashLog_vouchedUserId_idx"
     ON "VoucherSlashLog"("vouchedUserId");
 
-CREATE INDEX CONCURRENTLY IF NOT EXISTS "VoucherSlashLog_vouchedUserId_appliedAt_idx"
+CREATE INDEX IF NOT EXISTS "VoucherSlashLog_vouchedUserId_appliedAt_idx"
     ON "VoucherSlashLog"("vouchedUserId", "appliedAt" DESC);
 
 -- ---------------------------------------------------------------------------
@@ -148,10 +152,10 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS "VoucherSlashLog_vouchedUserId_appliedAt
 --     contractVersion for compliance audits and version-specific queries.
 -- ---------------------------------------------------------------------------
 
-CREATE INDEX CONCURRENTLY IF NOT EXISTS "LiabilityAcceptance_contractVersion_idx"
+CREATE INDEX IF NOT EXISTS "LiabilityAcceptance_contractVersion_idx"
     ON "LiabilityAcceptance"("contractVersion");
 
-CREATE INDEX CONCURRENTLY IF NOT EXISTS "LiabilityAcceptance_userId_susuGroupId_idx"
+CREATE INDEX IF NOT EXISTS "LiabilityAcceptance_userId_susuGroupId_idx"
     ON "LiabilityAcceptance"("userId", "susuGroupId");
 
 -- ---------------------------------------------------------------------------
@@ -159,10 +163,10 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS "LiabilityAcceptance_userId_susuGroupId_
 --     missing alertType index for the War Room type-filtered queue.
 -- ---------------------------------------------------------------------------
 
-CREATE INDEX CONCURRENTLY IF NOT EXISTS "AdminWarRoomAlert_alertType_idx"
+CREATE INDEX IF NOT EXISTS "AdminWarRoomAlert_alertType_idx"
     ON "AdminWarRoomAlert"("alertType");
 
-CREATE INDEX CONCURRENTLY IF NOT EXISTS "AdminWarRoomAlert_alertType_acknowledgedAt_idx"
+CREATE INDEX IF NOT EXISTS "AdminWarRoomAlert_alertType_acknowledgedAt_idx"
     ON "AdminWarRoomAlert"("alertType", "acknowledgedAt");
 
 -- ---------------------------------------------------------------------------
@@ -170,10 +174,10 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS "AdminWarRoomAlert_alertType_acknowledge
 --     (adId, status) that processNextInQueue hits on every trade completion.
 -- ---------------------------------------------------------------------------
 
-CREATE INDEX CONCURRENTLY IF NOT EXISTS "TradeQueue_adId_status_idx"
+CREATE INDEX IF NOT EXISTS "TradeQueue_adId_status_idx"
     ON "TradeQueue"("adId", "status");
 
-CREATE INDEX CONCURRENTLY IF NOT EXISTS "TradeQueue_buyerId_status_idx"
+CREATE INDEX IF NOT EXISTS "TradeQueue_buyerId_status_idx"
     ON "TradeQueue"("buyerId", "status");
 
 -- ---------------------------------------------------------------------------
@@ -181,10 +185,10 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS "TradeQueue_buyerId_status_idx"
 --     and date range for treasury audit trail.
 -- ---------------------------------------------------------------------------
 
-CREATE INDEX CONCURRENTLY IF NOT EXISTS "ColdStorageLog_adminId_createdAt_idx"
+CREATE INDEX IF NOT EXISTS "ColdStorageLog_adminId_createdAt_idx"
     ON "ColdStorageLog"("adminId", "createdAt" DESC);
 
-CREATE INDEX CONCURRENTLY IF NOT EXISTS "ColdStorageLog_createdAt_idx"
+CREATE INDEX IF NOT EXISTS "ColdStorageLog_createdAt_idx"
     ON "ColdStorageLog"("createdAt" DESC);
 
 -- ---------------------------------------------------------------------------
@@ -192,22 +196,22 @@ CREATE INDEX CONCURRENTLY IF NOT EXISTS "ColdStorageLog_createdAt_idx"
 --     filters by status; vendor fetches their own by userId.
 -- ---------------------------------------------------------------------------
 
-CREATE INDEX CONCURRENTLY IF NOT EXISTS "VendorApplication_userId_idx"
+CREATE INDEX IF NOT EXISTS "VendorApplication_userId_idx"
     ON "VendorApplication"("userId");
 
-CREATE INDEX CONCURRENTLY IF NOT EXISTS "VendorApplication_status_createdAt_idx"
+CREATE INDEX IF NOT EXISTS "VendorApplication_status_createdAt_idx"
     ON "VendorApplication"("status", "createdAt" DESC);
 
-CREATE INDEX CONCURRENTLY IF NOT EXISTS "VendorApplication_reviewerId_idx"
-    ON "VendorApplication"("reviewerId");
+CREATE INDEX IF NOT EXISTS "VendorApplication_reviewedBy_idx"
+    ON "VendorApplication"("reviewedBy");
 
 -- ---------------------------------------------------------------------------
 -- 16. SAVINGS DEPOSIT — had goalId and userId, but missing composite
 --     (userId, createdAt) for the transaction-style history feed.
 -- ---------------------------------------------------------------------------
 
-CREATE INDEX CONCURRENTLY IF NOT EXISTS "SavingsDeposit_userId_createdAt_idx"
+CREATE INDEX IF NOT EXISTS "SavingsDeposit_userId_createdAt_idx"
     ON "SavingsDeposit"("userId", "createdAt" DESC);
 
-CREATE INDEX CONCURRENTLY IF NOT EXISTS "SavingsDeposit_goalId_createdAt_idx"
+CREATE INDEX IF NOT EXISTS "SavingsDeposit_goalId_createdAt_idx"
     ON "SavingsDeposit"("goalId", "createdAt" DESC);

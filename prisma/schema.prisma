@@ -75,6 +75,9 @@ enum Role {
   USER
   VENDOR
   ADMIN
+  // NOTE: there is intentionally NO business role. Business ownership is
+  // determined solely by the existence of a BusinessProfile record, so a user
+  // can be both a regular app user and a business owner without role conflict.
 }
 
 enum TransactionType {
@@ -96,6 +99,11 @@ enum TransactionType {
   SMART_ROUTE_RUN
   // PHASE 6 / Phase 5 (2026-06-01): Susu Profit Engine — platform fee on cycle payouts
   SUSU_PROFIT
+  // Smart Escrow & Business Accounts (2026-06-14)
+  TICKET_ESCROW_FUND      // payer locks funds into escrow
+  TICKET_ESCROW_RELEASE   // funds released to payee on settlement
+  TICKET_ESCROW_REFUND    // funds returned to payer on refund/cancel
+  TICKET_ESCROW_FEE       // platform fee taken when escrow is funded
 }
 
 enum TransactionStatus {
@@ -115,6 +123,8 @@ enum ProfitSource {
   SWAP_FEE
   // PHASE 6 / Phase 5 (2026-06-01): Susu cycle fee revenue
   SUSU_FEE
+  // Smart Escrow & Business Accounts (2026-06-14): escrow service fee revenue
+  SMART_ESCROW_FEE
 }
 
 enum ConversationType {
@@ -203,6 +213,68 @@ enum AdInteractionType {
   VIEWED
   TRADE_INITIATED
   CLOSED
+}
+
+// =============================================================================
+// SMART ESCROW ENGINE & BUSINESS ACCOUNTS (2026-06-14)
+//
+// ESCROW-type Tickets become real USDC escrow via the SmartEscrow model.
+// Businesses register a BusinessProfile with a searchable BIZ-XXXXXXXXX id and
+// transact in "business-mode" tickets (no friendship required). Disputes
+// escalate through EscrowDispute with admin/worker assignment and rulings.
+//
+// Funds convention (shared with the P2P flow but entirely separate code):
+//   FUND    payer.availableBalance      -> payer.escrowLockedBalance (+ fee to SystemProfitFees)
+//   RELEASE payer.escrowLockedBalance   -> payee.availableBalance
+//   DISPUTE payer.escrowLockedBalance   -> payer.disputeEscrowBalance
+//   REFUND  payer.{escrowLocked|disputeEscrow}Balance -> payer.availableBalance
+// =============================================================================
+
+enum EscrowStatus {
+  DRAFT              // created, not yet funded by payer
+  FUNDED             // payer has locked funds — escrow is live
+  IN_PROGRESS        // both parties explicitly acknowledged readiness
+  PENDING_SETTLEMENT // one party marked satisfied, awaiting the other
+  SETTLED            // both marked satisfied — auto-released to payee
+  DISPUTED           // one party raised a formal dispute
+  ADMIN_REVIEW       // escalated and assigned to an admin/worker
+  RELEASED           // admin ruled for payee — funds transferred
+  REFUNDED           // admin ruled for payer — funds returned
+  EXPIRED            // unfunded (24h) or inactive (30d) — auto-cancelled
+}
+
+enum DisputeStatus {
+  PENDING          // raised, not yet assigned to any admin/worker
+  ASSIGNED         // assigned to a specific admin/worker
+  UNDER_REVIEW     // actively being reviewed
+  RESOLVED         // ruling has been issued
+}
+
+enum DisputeRuling {
+  FULL_RELEASE     // 100% to payee
+  FULL_REFUND      // 100% to payer
+  SPLIT            // custom split defined by payerPct + payeePct
+}
+
+enum KybStatus {
+  UNVERIFIED
+  PENDING
+  VERIFIED
+  REJECTED
+}
+
+enum BusinessCategory {
+  FREELANCE_SERVICES
+  RETAIL
+  FOOD_BEVERAGE
+  TECHNOLOGY
+  REAL_ESTATE
+  EDUCATION
+  HEALTH_WELLNESS
+  ENTERTAINMENT
+  LOGISTICS
+  FINANCIAL_SERVICES
+  OTHER
 }
 
 // =============================================================================
@@ -580,6 +652,13 @@ model User {
   createdTickets     Ticket[]        @relation("TicketCreator")
   receivedTickets    Ticket[]        @relation("TicketCounterparty")
   sentTicketMessages TicketMessage[] @relation("TicketMessageSender")
+
+  // Smart Escrow & Business Accounts (2026-06-14)
+  businessProfile  BusinessProfile?
+  escrowsAsPayer   SmartEscrow[]   @relation("EscrowPayer")
+  escrowsAsPayee   SmartEscrow[]   @relation("EscrowPayee")
+  disputesRaised   EscrowDispute[] @relation("DisputeRaisedBy")
+  disputesAssigned EscrowDispute[] @relation("DisputeAssignedTo")
 
   // V3: Vendor Gamification
   adInteractions     AdInteraction[]
@@ -1049,6 +1128,13 @@ model GlobalSettings {
   // deducted from the pooled contribution before payout: takeHome = pooled - fee.
   // Range [0, 1]. Persisted per cycle in SusuCycle.feeUsdc for audit.
   susuProfitPct Decimal @default(0.03) @db.Decimal(10, 4)
+
+  // Smart Escrow & Business Accounts (2026-06-14)
+  // Platform fee taken from the payer when an escrow is funded (upfront,
+  // non-refundable). 0.005 = 0.5%. Seeded from SMART_ESCROW_FEE_PCT env var.
+  smartEscrowFeePct      Decimal @default(0.005) @db.Decimal(6, 4)
+  escrowDraftExpiryHours Int     @default(24)
+  escrowFundedExpiryDays Int     @default(30)
 
   updatedAt DateTime @updatedAt
 }
@@ -1728,6 +1814,8 @@ model VendorApplication {
   @@index([userId])
   @@index([status])
   @@index([createdAt(sort: Desc)])
+  @@index([status, createdAt(sort: Desc)])
+  @@index([reviewedBy])
 }
 
 // =============================================================================
@@ -1794,7 +1882,7 @@ enum TicketStatus {
 
 model Ticket {
   id             String       @id @default(uuid())
-  friendshipId   String
+  friendshipId   String?      // null for business-mode tickets
   creatorId      Int
   counterpartyId Int
   name           String       @db.VarChar(80)
@@ -1804,6 +1892,9 @@ model Ticket {
   memo           String?      @db.VarChar(500)
   status         TicketStatus @default(OPEN)
 
+  // Smart Escrow & Business Accounts (2026-06-14)
+  businessProfileId String? // links to BusinessProfile for business-mode tickets
+
   // Lifecycle timestamps
   createdAt      DateTime  @default(now())
   updatedAt      DateTime  @updatedAt
@@ -1811,15 +1902,18 @@ model Ticket {
   cancelledAt    DateTime?
   lastActivityAt DateTime  @default(now())
 
-  friendship   Friendship      @relation(fields: [friendshipId], references: [id], onDelete: Cascade)
-  creator      User            @relation("TicketCreator", fields: [creatorId], references: [id], onDelete: Cascade)
-  counterparty User            @relation("TicketCounterparty", fields: [counterpartyId], references: [id], onDelete: Cascade)
-  messages     TicketMessage[]
+  friendship      Friendship?      @relation(fields: [friendshipId], references: [id], onDelete: Cascade)
+  creator         User             @relation("TicketCreator", fields: [creatorId], references: [id], onDelete: Cascade)
+  counterparty    User             @relation("TicketCounterparty", fields: [counterpartyId], references: [id], onDelete: Cascade)
+  messages        TicketMessage[]
+  businessProfile BusinessProfile? @relation(fields: [businessProfileId], references: [id])
+  smartEscrow     SmartEscrow? // optional 1:1 — only ESCROW-type tickets
 
   @@index([friendshipId])
   @@index([creatorId])
   @@index([counterpartyId])
   @@index([status])
+  @@index([businessProfileId])
   // Powers the dashboard query: WHERE friendshipId=X AND status=Y
   // ORDER BY lastActivityAt DESC.
   @@index([friendshipId, status, lastActivityAt(sort: Desc)])
@@ -1851,6 +1945,133 @@ model TicketMessage {
   @@index([ticketId])
   @@index([senderId])
   @@index([ticketId, createdAt(sort: Desc)])
+}
+
+// =============================================================================
+// SMART ESCROW (2026-06-14)
+// Real USDC escrow attached 1:1 to an ESCROW-type Ticket. See the funds
+// convention in the enum block header above. All balance mutations live in
+// services/escrowService.js and are wrapped in prisma.$transaction.
+// =============================================================================
+model SmartEscrow {
+  id         String       @id @default(uuid())
+  ticketId   String       @unique
+  payerId    Int
+  payeeId    Int
+  amountUsdc Decimal      @db.Decimal(20, 8)
+  feeUsdc    Decimal      @default(0.0) @db.Decimal(20, 8)
+  status     EscrowStatus @default(DRAFT)
+
+  // Satisfaction tracking — BOTH must be true for auto-settlement
+  payerSatisfied Boolean @default(false)
+  payeeSatisfied Boolean @default(false)
+
+  // Terms agreed between parties (filled in ticket workspace)
+  deliveryTerms String? @db.VarChar(1000)
+  // Optional delivery deadline
+  dueDate DateTime?
+
+  // Lifecycle timestamps
+  fundedAt      DateTime?
+  settledAt     DateTime?
+  refundedAt    DateTime?
+  expiresAt     DateTime? // set on creation: +24h for DRAFT, +30d on FUND
+  warningSentAt DateTime? // Work Item 9: inactive-funded expiry warning idempotency
+
+  // Correlation keys — link to TransactionHistory rows
+  fundTxHash    String? @unique
+  releaseTxHash String? @unique
+  refundTxHash  String? @unique
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  ticket  Ticket         @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  payer   User           @relation("EscrowPayer", fields: [payerId], references: [id])
+  payee   User           @relation("EscrowPayee", fields: [payeeId], references: [id])
+  dispute EscrowDispute?
+
+  @@index([payerId])
+  @@index([payeeId])
+  @@index([status])
+  @@index([expiresAt])
+}
+
+// =============================================================================
+// ESCROW DISPUTE (2026-06-14)
+// Escalation record for a SmartEscrow. Admin/worker is assigned, then rules.
+// =============================================================================
+model EscrowDispute {
+  id           String        @id @default(uuid())
+  escrowId     String        @unique
+  raisedById   Int
+  reason       String        @db.VarChar(1000)
+  evidenceUrls Json? // String[] of Cloudinary URLs
+  status       DisputeStatus @default(PENDING)
+  assignedToId Int? // null = unassigned; set = assigned admin/worker
+
+  // Resolution fields (populated when admin rules)
+  ruling      DisputeRuling?
+  rulingNotes String?        @db.VarChar(2000)
+  payerPct    Decimal?       @db.Decimal(5, 2) // for SPLIT rulings
+  payeePct    Decimal?       @db.Decimal(5, 2) // for SPLIT rulings (payerPct + payeePct = 100)
+  resolvedAt  DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  escrow     SmartEscrow @relation(fields: [escrowId], references: [id], onDelete: Cascade)
+  raisedBy   User        @relation("DisputeRaisedBy", fields: [raisedById], references: [id])
+  assignedTo User?       @relation("DisputeAssignedTo", fields: [assignedToId], references: [id])
+
+  @@index([status])
+  @@index([assignedToId])
+}
+
+// =============================================================================
+// BUSINESS PROFILE (2026-06-14)
+// A user-owned business identity with a searchable BIZ-XXXXXXXXX id. Flips the
+// owning User's role to BUSINESS on registration.
+// =============================================================================
+model BusinessProfile {
+  id           String           @id @default(uuid())
+  userId       Int              @unique
+  bizId        String           @unique // BIZ-XXXXXXXXX (9 digits after prefix)
+  businessName String           @db.VarChar(100)
+  category     BusinessCategory @default(OTHER)
+  description  String?          @db.VarChar(500)
+  website      String?          @db.VarChar(255)
+  logoUrl      String?
+
+  // Verification
+  isVerified Boolean   @default(false)
+  verifiedAt DateTime?
+  kybStatus  KybStatus @default(UNVERIFIED)
+
+  // Public contact info
+  phoneNumber  String? @db.VarChar(20)
+  contactEmail String? @db.VarChar(100)
+  address      String? @db.VarChar(255)
+  country      String? @db.VarChar(2)
+
+  // Denormalized stats (updated by triggers/workers for fast reads)
+  totalEscrows     Int     @default(0)
+  completedEscrows Int     @default(0)
+  totalVolume      Decimal @default(0.0) @db.Decimal(20, 8)
+  averageRating    Decimal @default(0.0) @db.Decimal(3, 2)
+
+  user    User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tickets Ticket[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([bizId])
+  @@index([category])
+  @@index([kybStatus])
+  @@index([isVerified])
+  // Full-text search support: business name search
+  @@index([businessName])
 }
 
 // =============================================================================
