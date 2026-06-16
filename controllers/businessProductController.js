@@ -1,0 +1,157 @@
+// controllers/businessProductController.js
+// =============================================================================
+// AZAMAN — BUSINESS PRODUCT CONTROLLER (2026-06-16)
+//
+// HTTP layer for the Business Portal product catalogue. Mirrors the conventions
+// in businessController.js / escrowController.js:
+//   prisma = req.app.get('prisma'); io = req.app.get('socketio');
+//   userId = req.user.id;
+//   success → { success: true, ... }; error → { success: false, message }.
+//
+// Ownership is determined purely by the existence of a BusinessProfile for the
+// calling user. GET /products/:productId is PUBLIC (no protect middleware).
+// =============================================================================
+
+const businessProductService = require('../services/businessProductService');
+
+// ── helpers ───────────────────────────────────────────────────────────────────
+
+/** Load the BusinessProfile owned by the calling user (null if none). */
+async function _ownedProfile(prisma, userId) {
+    return prisma.businessProfile.findUnique({
+        where: { userId },
+        select: { id: true, businessName: true, kybStatus: true }
+    });
+}
+
+// =============================================================================
+// 1. POST /api/business/products — create a product (owner only).
+// =============================================================================
+exports.createProduct = async (req, res) => {
+    const prisma = req.app.get('prisma');
+    try {
+        const userId = req.user.id;
+        const { name, description, priceUsdc, imageUrls, category } = req.body;
+
+        if (!name || priceUsdc === undefined || priceUsdc === null) {
+            return res.status(400).json({ success: false, message: 'name and priceUsdc are required.' });
+        }
+
+        const profile = await _ownedProfile(prisma, userId);
+        if (!profile) {
+            return res.status(403).json({ success: false, message: 'You do not own a business profile.' });
+        }
+
+        const product = await businessProductService.createProduct(prisma, {
+            businessProfileId: profile.id,
+            name,
+            description,
+            priceUsdc,
+            imageUrls,
+            category
+        });
+
+        return res.status(201).json({ success: true, product });
+    } catch (err) {
+        return res.status(400).json({ success: false, message: err.message });
+    }
+};
+
+// =============================================================================
+// 2. GET /api/business/products — list the caller's own products (owner only).
+// =============================================================================
+exports.listMyProducts = async (req, res) => {
+    const prisma = req.app.get('prisma');
+    try {
+        const userId = req.user.id;
+        const profile = await _ownedProfile(prisma, userId);
+        if (!profile) {
+            return res.status(403).json({ success: false, message: 'You do not own a business profile.' });
+        }
+
+        const { isActive, limit, cursor } = req.query;
+        let isActiveFilter;
+        if (isActive === 'true') isActiveFilter = true;
+        else if (isActive === 'false') isActiveFilter = false;
+
+        const result = await businessProductService.listProducts(prisma, {
+            businessProfileId: profile.id,
+            isActive: isActiveFilter,
+            limit,
+            cursor
+        });
+
+        return res.status(200).json({ success: true, ...result });
+    } catch (err) {
+        return res.status(400).json({ success: false, message: err.message });
+    }
+};
+
+// =============================================================================
+// 3. GET /api/business/products/:productId — PUBLIC product detail.
+// =============================================================================
+exports.getProduct = async (req, res) => {
+    const prisma = req.app.get('prisma');
+    try {
+        const { productId } = req.params;
+        const product = await businessProductService.getProduct(prisma, {
+            productId,
+            includeBusinessProfile: true
+        });
+        if (!product) {
+            return res.status(404).json({ success: false, message: 'Product not found.' });
+        }
+        return res.status(200).json({ success: true, product });
+    } catch (err) {
+        return res.status(400).json({ success: false, message: err.message });
+    }
+};
+
+// =============================================================================
+// 4. PATCH /api/business/products/:productId — update a product (owner only).
+// =============================================================================
+exports.updateProduct = async (req, res) => {
+    const prisma = req.app.get('prisma');
+    try {
+        const userId = req.user.id;
+        const { productId } = req.params;
+        const profile = await _ownedProfile(prisma, userId);
+        if (!profile) {
+            return res.status(403).json({ success: false, message: 'You do not own a business profile.' });
+        }
+
+        const product = await businessProductService.updateProduct(prisma, {
+            productId,
+            businessProfileId: profile.id,
+            updates: req.body
+        });
+
+        return res.status(200).json({ success: true, product });
+    } catch (err) {
+        return res.status(400).json({ success: false, message: err.message });
+    }
+};
+
+// =============================================================================
+// 5. DELETE /api/business/products/:productId — soft-delete (owner only).
+// =============================================================================
+exports.deleteProduct = async (req, res) => {
+    const prisma = req.app.get('prisma');
+    try {
+        const userId = req.user.id;
+        const { productId } = req.params;
+        const profile = await _ownedProfile(prisma, userId);
+        if (!profile) {
+            return res.status(403).json({ success: false, message: 'You do not own a business profile.' });
+        }
+
+        const product = await businessProductService.deleteProduct(prisma, {
+            productId,
+            businessProfileId: profile.id
+        });
+
+        return res.status(200).json({ success: true, product, message: 'Product deactivated.' });
+    } catch (err) {
+        return res.status(400).json({ success: false, message: err.message });
+    }
+};
