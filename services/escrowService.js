@@ -27,6 +27,14 @@
 const { randomUUID } = require('crypto');
 const { runDoubleCheck } = require('../utils/securityCheck');
 
+// Lazy-require to avoid circular dependency: escrowService <-> businessOrderService.
+// Do NOT change this to a top-level require().
+let _bizOrderService = null;
+const _getBizOrderService = () => {
+    if (!_bizOrderService) _bizOrderService = require('./businessOrderService');
+    return _bizOrderService;
+};
+
 // ── Module constants ─────────────────────────────────────────────────────────
 const SMART_ESCROW_FEE_PCT_DEFAULT = 0.005; // 0.5% — fallback if GlobalSettings missing
 const DRAFT_EXPIRY_HOURS = 24; // unfunded escrows expire after 24h
@@ -197,6 +205,12 @@ const fundEscrow = async (prisma, { escrowId, payerId }) => {
         return updated;
     });
 
+    setImmediate(() => {
+        _getBizOrderService()
+            .updateOrderStatusFromEscrow(prisma, escrowId, 'FUNDED')
+            .catch((err) => console.error('[escrowService.fundEscrow] order sync:', err.message));
+    });
+
     return { success: true, escrow: updatedEscrow, reference };
 };
 
@@ -277,6 +291,12 @@ const raiseDispute = async (prisma, { escrowId, raisedById, reason, evidenceUrls
         });
 
         return { escrow: updated, dispute };
+    });
+
+    setImmediate(() => {
+        _getBizOrderService()
+            .updateOrderStatusFromEscrow(prisma, escrowId, 'DISPUTED')
+            .catch((err) => console.error('[escrowService.raiseDispute] order sync:', err.message));
     });
 
     return result;
@@ -469,6 +489,42 @@ const _releaseEscrow = async (prisma, escrowId, finalStatus = 'SETTLED') => {
         return result;
     });
 
+    setImmediate(() => {
+        _getBizOrderService()
+            .updateOrderStatusFromEscrow(prisma, escrowId, finalStatus)
+            .catch((err) => console.error('[escrowService._releaseEscrow] order sync:', err.message));
+    });
+
+    if (finalStatus === 'SETTLED' || finalStatus === 'RELEASED') {
+        setImmediate(async () => {
+            try {
+                const order = await prisma.businessOrder.findFirst({
+                    where: { escrowId },
+                    select: { businessProfileId: true, amountUsdc: true, productId: true }
+                });
+                if (!order) return;
+                await prisma.businessProfile.update({
+                    where: { id: order.businessProfileId },
+                    data: {
+                        completedEscrows: { increment: 1 },
+                        totalVolume:      { increment: Number(escrow.amountUsdc) }
+                    }
+                });
+                if (order.productId) {
+                    await prisma.businessProduct.update({
+                        where: { id: order.productId },
+                        data: {
+                            totalOrders:  { increment: 1 },
+                            totalRevenue: { increment: Number(escrow.amountUsdc) }
+                        }
+                    });
+                }
+            } catch (err) {
+                console.error('[escrowService._releaseEscrow] profile stat sync:', err.message);
+            }
+        });
+    }
+
     return updated;
 };
 
@@ -516,6 +572,14 @@ const _refundEscrow = async (prisma, escrowId, finalStatus = 'REFUNDED') => {
         });
 
         return result;
+    });
+
+    // finalStatus is either 'REFUNDED' (admin/manual) or 'EXPIRED' (worker sweep).
+    // Both map to BusinessOrderStatus.REFUNDED in updateOrderStatusFromEscrow.
+    setImmediate(() => {
+        _getBizOrderService()
+            .updateOrderStatusFromEscrow(prisma, escrowId, finalStatus)
+            .catch((err) => console.error('[escrowService._refundEscrow] order sync:', err.message));
     });
 
     return updated;

@@ -337,4 +337,12 @@ router.get('/escrow-disputes', adminController.getEscrowDisputes);
 router.post('/escrow-disputes/:id/assign', adminController.assignEscrowDispute);
 router.post('/escrow-disputes/:id/resolve', adminController.resolveEscrowDispute);
 
+// BUSINESS KYB REVIEW (2026-06-16)
+// protect + adminOnly are already applied globally via router.use at the top.
+const businessKybCtrl = require('../controllers/businessKybController');
+router.get('/business-kyb',                            businessKybCtrl.getKybQueue);
+router.post('/business-kyb/:documentId/review',        businessKybCtrl.reviewKybDocument);
+router.post('/business-kyb/:bizId/approve',            businessKybCtrl.approveBusinessKyb);
+router.post('/business-kyb/:bizId/reject',             businessKybCtrl.rejectBusinessKyb);
+
 module.exports = router;

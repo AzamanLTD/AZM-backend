@@ -30,6 +30,7 @@ const VALID_MESSAGE_TYPES = new Set([
 // Smart Escrow & Business Accounts (2026-06-14): ESCROW-type tickets auto-create
 // a SmartEscrow record; business-mode tickets bypass the friendship requirement.
 const escrowService = require('../services/escrowService');
+const businessOrderService = require('../services/businessOrderService');
 
 // ── helpers ─────────────────────────────────────────────────────────────────
 
@@ -91,8 +92,10 @@ exports.createTicket = async (req, res) => {
         const userId = req.user.id;
         const {
             friendshipId, businessProfileId, name, type, targetAmount,
-            targetCurrency, memo, escrowAmount, deliveryTerms, dueDate
+            targetCurrency, memo, deliveryTerms, dueDate,
+            productId, customerNotes
         } = req.body;
+        let escrowAmount = req.body.escrowAmount;
 
         // ── Validation ──────────────────────────────────────────────────────
         // Either friendshipId (friendship mode) or businessProfileId (business
@@ -154,6 +157,22 @@ exports.createTicket = async (req, res) => {
             }
             counterpartyId = bizProfile.userId;
             resolvedBusinessProfileId = bizProfile.id;
+        }
+
+        if (resolvedBusinessProfileId && productId) {
+            const product = await prisma.businessProduct.findUnique({
+                where: { id: productId },
+                select: { id: true, businessProfileId: true, isActive: true, priceUsdc: true }
+            });
+            if (!product || product.businessProfileId !== resolvedBusinessProfileId) {
+                return res.status(404).json({ success: false, message: 'Product not found.' });
+            }
+            if (!product.isActive) {
+                return res.status(409).json({ success: false, message: 'This product is no longer available.' });
+            }
+            if (!escrowAmount) {
+                escrowAmount = Number(product.priceUsdc);
+            }
         }
 
         // ── ESCROW pre-validation (before creating the ticket) ────────────────
@@ -229,6 +248,48 @@ exports.createTicket = async (req, res) => {
                 return res.status(400).json({ success: false, message: escrowErr.message });
             }
 
+            let businessOrder = null;
+            if (resolvedBusinessProfileId) {
+                try {
+                    businessOrder = await businessOrderService.createOrder(prisma, {
+                        businessProfileId: resolvedBusinessProfileId,
+                        customerId:        userId,
+                        productId:         productId || null,
+                        escrowId:          escrow.id,
+                        ticketId:          ticket.id,
+                        amountUsdc:        Number(escrowAmount),
+                        title:             cleanName,
+                        description:       cleanMemo || null,
+                        customerNotes:     customerNotes || null
+                    });
+                } catch (orderErr) {
+                    console.error('[createTicket] BusinessOrder creation failed:', orderErr.message);
+                }
+            }
+
+            if (businessOrder && resolvedBusinessProfileId) {
+                const notificationService = req.app.get('notificationService');
+                const bizProfile = await prisma.businessProfile.findUnique({
+                    where: { id: resolvedBusinessProfileId },
+                    select: { userId: true, businessName: true }
+                });
+                if (bizProfile && notificationService) {
+                    setImmediate(() => {
+                        notificationService.sendNotification({
+                            userId:   bizProfile.userId,
+                            title:    'New Order',
+                            body:     `${cleanName} -- ${Number(escrowAmount).toFixed(2)} USDC. Awaiting payment.`,
+                            category: 'GENERAL',
+                            actionPayload: {
+                                route:   '/business/orders',
+                                action:  'VIEW_BUSINESS_ORDER',
+                                orderId: businessOrder.id
+                            }
+                        }).catch((e) => console.error('[createTicket] notification:', e.message));
+                    });
+                }
+            }
+
             // ── Sockets ──────────────────────────────────────────────────────
             if (io) {
                 io.to(`user_${userId}`).emit('ticket_created', { ticket });
@@ -241,7 +302,7 @@ exports.createTicket = async (req, res) => {
                 }
             }
 
-            return res.status(201).json({ success: true, ticket, escrow });
+            return res.status(201).json({ success: true, ticket, escrow, businessOrder: businessOrder || null });
         }
 
         // ── Sockets (non-escrow) ─────────────────────────────────────────────
