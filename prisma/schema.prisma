@@ -278,6 +278,36 @@ enum BusinessCategory {
 }
 
 // =============================================================================
+// BUSINESS PORTAL (2026-06-16): Products, Orders, KYB verification
+// =============================================================================
+
+enum BusinessOrderStatus {
+  AWAITING_PAYMENT  // SmartEscrow is DRAFT — customer has not funded yet
+  PAID              // SmartEscrow is FUNDED — proceed with the order
+  DELIVERED         // Business marked as delivered, awaiting customer confirm
+  COMPLETED         // Both parties confirmed; escrow auto-settled
+  DISPUTED          // Dispute raised on the linked SmartEscrow
+  REFUNDED          // Escrow was refunded to the customer
+  CANCELLED         // Order cancelled before it was funded
+}
+
+enum KybDocumentType {
+  BUSINESS_REGISTRATION_CERT
+  DIRECTOR_ID_FRONT
+  DIRECTOR_ID_BACK
+  TAX_IDENTIFICATION
+  PROOF_OF_ADDRESS
+  SELFIE_WITH_ID
+  OTHER
+}
+
+enum KybDocumentStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+// =============================================================================
 // MASTER SPRINT (2026-05-27): Vault, Susu, Smart Route, AZM Auction enums
 // =============================================================================
 
@@ -659,6 +689,8 @@ model User {
   escrowsAsPayee   SmartEscrow[]   @relation("EscrowPayee")
   disputesRaised   EscrowDispute[] @relation("DisputeRaisedBy")
   disputesAssigned EscrowDispute[] @relation("DisputeAssignedTo")
+  ordersAsCustomer     BusinessOrder[]                @relation("OrderCustomer")
+  kybDocumentsReviewed BusinessVerificationDocument[] @relation("KybDocReviewer")
 
   // V3: Vendor Gamification
   adInteractions     AdInteraction[]
@@ -1135,6 +1167,13 @@ model GlobalSettings {
   smartEscrowFeePct      Decimal @default(0.005) @db.Decimal(6, 4)
   escrowDraftExpiryHours Int     @default(24)
   escrowFundedExpiryDays Int     @default(30)
+
+  // Business Portal (2026-06-16)
+  // Additional platform fee on each COMPLETED business order, on top of escrow fee.
+  // 0.0 = disabled. Range [0..0.05] (max 5%).
+  businessOrderFeePct           Decimal @default(0.0) @db.Decimal(6, 4)
+  // Hours before an AWAITING_PAYMENT order auto-cancels if escrow is never funded.
+  businessOrderDraftExpiryHours Int     @default(24)
 
   updatedAt DateTime @updatedAt
 }
@@ -1908,6 +1947,7 @@ model Ticket {
   messages        TicketMessage[]
   businessProfile BusinessProfile? @relation(fields: [businessProfileId], references: [id])
   smartEscrow     SmartEscrow? // optional 1:1 — only ESCROW-type tickets
+  businessOrder   BusinessOrder? // back-relation, no @relation directive needed
 
   @@index([friendshipId])
   @@index([creatorId])
@@ -1990,6 +2030,7 @@ model SmartEscrow {
   payer   User           @relation("EscrowPayer", fields: [payerId], references: [id])
   payee   User           @relation("EscrowPayee", fields: [payeeId], references: [id])
   dispute EscrowDispute?
+  businessOrder BusinessOrder? // back-relation, no @relation directive needed
 
   @@index([payerId])
   @@index([payeeId])
@@ -2030,8 +2071,10 @@ model EscrowDispute {
 
 // =============================================================================
 // BUSINESS PROFILE (2026-06-14)
-// A user-owned business identity with a searchable BIZ-XXXXXXXXX id. Flips the
-// owning User's role to BUSINESS on registration.
+// A user-owned business identity with a searchable BIZ-XXXXXXXXX id.
+// Business ownership is determined by the existence of this record only —
+// no role flip occurs on registration. A user can simultaneously be a
+// regular user, a vendor, and a business owner.
 // =============================================================================
 model BusinessProfile {
   id           String           @id @default(uuid())
@@ -2062,6 +2105,9 @@ model BusinessProfile {
 
   user    User     @relation(fields: [userId], references: [id], onDelete: Cascade)
   tickets Ticket[]
+  products              BusinessProduct[]
+  orders                BusinessOrder[]
+  verificationDocuments BusinessVerificationDocument[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -2073,6 +2119,101 @@ model BusinessProfile {
   // Full-text search support: business name search
   @@index([businessName])
 }
+
+// =============================================================================
+// BUSINESS PRODUCT (2026-06-16)
+// A sellable item/service offered by a business. Soft-delete only (isActive).
+// =============================================================================
+model BusinessProduct {
+  id                String            @id @default(uuid())
+  businessProfileId String
+  name              String            @db.VarChar(200)
+  description       String?           @db.VarChar(1000)
+  priceUsdc         Decimal           @db.Decimal(20, 8)
+  imageUrls         Json?             // String[] of Cloudinary URLs
+  category          BusinessCategory? // null inherits from profile
+  isActive          Boolean           @default(true)
+  slug              String            @unique
+  totalOrders       Int               @default(0)
+  totalRevenue      Decimal           @default(0.0) @db.Decimal(20, 8)
+
+  businessProfile BusinessProfile @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+  orders          BusinessOrder[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([businessProfileId])
+  @@index([businessProfileId, isActive])
+  @@index([slug])
+}
+
+// =============================================================================
+// BUSINESS ORDER (2026-06-16)
+// Tracks the state of a business order. NEVER moves USDC — all financial
+// mutations live in escrowService.js. Linked 1:1 to a SmartEscrow and Ticket.
+// =============================================================================
+model BusinessOrder {
+  id                String              @id @default(uuid())
+  businessProfileId String
+  customerId        Int
+  productId         String?
+  escrowId          String?             @unique
+  ticketId          String?             @unique
+  status            BusinessOrderStatus @default(AWAITING_PAYMENT)
+  orderRef          String              @unique
+  title             String              @db.VarChar(200)
+  description       String?             @db.VarChar(500)
+  amountUsdc        Decimal             @db.Decimal(20, 8)
+  customerNotes     String?             @db.VarChar(500)
+  deliveryNotes     String?             @db.VarChar(500)
+  deliveredAt       DateTime?
+  completedAt       DateTime?
+  cancelledAt       DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  businessProfile BusinessProfile  @relation(fields: [businessProfileId], references: [id])
+  customer        User             @relation("OrderCustomer", fields: [customerId], references: [id])
+  product         BusinessProduct? @relation(fields: [productId], references: [id])
+  escrow          SmartEscrow?     @relation(fields: [escrowId], references: [id])
+  ticket          Ticket?          @relation(fields: [ticketId], references: [id])
+
+  @@index([businessProfileId])
+  @@index([businessProfileId, status])
+  @@index([customerId])
+  @@index([status])
+  @@index([productId])
+}
+
+// =============================================================================
+// BUSINESS VERIFICATION DOCUMENT (2026-06-16)
+// KYB document submitted by a business. Pre-uploaded Cloudinary URLs only.
+// The @@unique([businessProfileId, documentType]) is REQUIRED by the upsert.
+// =============================================================================
+model BusinessVerificationDocument {
+  id                String            @id @default(uuid())
+  businessProfileId String
+  documentType      KybDocumentType
+  documentUrl       String
+  status            KybDocumentStatus @default(PENDING)
+  reviewedById      Int?
+  reviewNotes       String?           @db.VarChar(500)
+  reviewedAt        DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  businessProfile BusinessProfile @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+  reviewedBy      User?           @relation("KybDocReviewer", fields: [reviewedById], references: [id])
+
+  @@unique([businessProfileId, documentType])
+  @@index([businessProfileId])
+  @@index([status])
+  @@index([documentType])
+}
+
 
 // =============================================================================
 // MASTER SPRINT (2026-05-27): VAULTS, SUSU, SMART ROUTE, AZM AUCTION
