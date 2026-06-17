@@ -15,6 +15,7 @@
 // =============================================================================
 
 const escrowService = require('../services/escrowService');
+const bizNotificationService = require('../services/bizNotificationService');
 
 // ── helpers ─────────────────────────────────────────────────────────────────
 
@@ -371,6 +372,15 @@ exports.cancelEscrow = async (req, res) => {
                 where: { id: loaded.escrow.ticketId },
                 data: { status: 'CANCELLED', cancelledAt: new Date(), lastActivityAt: new Date() }
             });
+            // Sync the linked business order, if any. A never-funded DRAFT cancellation
+            // is CANCELLED — NOT REFUNDED (no money ever moved). updateOrderStatusFromEscrow
+            // is deliberately bypassed here because it maps EXPIRED → REFUNDED, which is
+            // only correct for the worker's funded-escrow sweep. updateMany is a no-op for
+            // peer-to-peer escrows with no order.
+            await tx.businessOrder.updateMany({
+                where: { escrowId },
+                data: { status: 'CANCELLED' }
+            });
             return escrow;
         });
 
@@ -378,6 +388,16 @@ exports.cancelEscrow = async (req, res) => {
             escrowId: result.id,
             ticketId: result.ticketId,
             status: result.status
+        });
+
+        // Owner-facing feed: a DRAFT order was cancelled before funding.
+        setImmediate(() => {
+            bizNotificationService.notifyOrderEvent(prisma, {
+                escrowId,
+                type: 'ORDER_CANCELLED'
+            }).then((res) => {
+                if (res && io) io.to(`user_${res.order.businessProfile.userId}`).emit('biz_notification', { type: 'ORDER_CANCELLED' });
+            }).catch((err) => console.error('[cancelEscrow] biz notif:', err.message));
         });
 
         return res.status(200).json({ success: true, escrow: result });

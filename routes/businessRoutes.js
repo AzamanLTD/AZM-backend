@@ -19,6 +19,7 @@ const ctrl        = require('../controllers/businessController');
 const productCtrl = require('../controllers/businessProductController');
 const orderCtrl   = require('../controllers/businessOrderController');
 const kybCtrl     = require('../controllers/businessKybController');
+const notifCtrl   = require('../controllers/bizNotificationController');
 
 // Existing business account routes (unchanged)
 router.post('/register', protectActive, ctrl.registerBusiness);
@@ -45,6 +46,12 @@ router.patch('/orders/:orderId/delivered',  protect, orderCtrl.markDelivered);
 
 // Customer order history (any authenticated user)
 router.get('/my-orders', protect, orderCtrl.listMyOrders);
+
+// Notification feed (owner only) — static paths before /:bizId
+router.get('/notifications',              protect, notifCtrl.getNotifications);
+router.get('/notifications/unread-count', protect, notifCtrl.getUnreadCount);
+router.post('/notifications/read-all',    protect, notifCtrl.markAllAsRead);
+router.post('/notifications/read/:id',    protect, notifCtrl.markAsRead);
 
 // Public business profile lookup — MUST be last
 router.get('/:bizId', ctrl.getBusinessByBizId);
