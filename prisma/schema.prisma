@@ -291,6 +291,25 @@ enum BusinessOrderStatus {
   CANCELLED         // Order cancelled before it was funded
 }
 
+// =============================================================================
+// BUSINESS NOTIFICATION (2026-06-17)
+// Persistent, owner-facing notification feed surfaced in the Business Portal.
+// Distinct from the per-user Notification model: a BusinessNotification is keyed
+// to a BusinessProfile (not a userId) so it stays correct even if ownership of
+// the business is ever transferred. Written fire-and-forget alongside the order
+// lifecycle — never inside a financial $transaction.
+// =============================================================================
+enum BizNotifType {
+  NEW_ORDER          // a customer opened an escrow order against this business
+  ORDER_FUNDED       // the buyer funded the escrow
+  ORDER_SATISFIED    // the buyer marked the order satisfied
+  ORDER_DISPUTED     // a dispute was raised on the order
+  ORDER_SETTLED      // escrow released — funds delivered to the business
+  ORDER_CANCELLED    // a DRAFT order was cancelled before funding
+  ORDER_REFUNDED     // escrow refunded to the buyer
+  KYB_STATUS_CHANGED // verification status changed (approved/rejected)
+}
+
 enum KybDocumentType {
   BUSINESS_REGISTRATION_CERT
   DIRECTOR_ID_FRONT
@@ -2108,6 +2127,7 @@ model BusinessProfile {
   products              BusinessProduct[]
   orders                BusinessOrder[]
   verificationDocuments BusinessVerificationDocument[]
+  notifications         BusinessNotification[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -2212,6 +2232,29 @@ model BusinessVerificationDocument {
   @@index([businessProfileId])
   @@index([status])
   @@index([documentType])
+}
+
+// =============================================================================
+// BUSINESS NOTIFICATION (2026-06-17)
+// One row per owner-facing event (new order, funded, disputed, settled, …).
+// Persisted so the portal shows a feed on load, not just live socket events.
+// metadata carries deep-link ids ({ orderId, ticketId, escrowId, productId,
+// amount }). Cascades with the BusinessProfile.
+// =============================================================================
+model BusinessNotification {
+  id                String       @id @default(uuid())
+  businessProfileId String
+  type              BizNotifType
+  title             String       @db.VarChar(200)
+  body              String       @db.VarChar(500)
+  metadata          Json?
+  isRead            Boolean      @default(false)
+  createdAt         DateTime     @default(now())
+
+  businessProfile BusinessProfile @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+
+  @@index([businessProfileId, isRead])
+  @@index([businessProfileId, createdAt(sort: Desc)])
 }
 
 
