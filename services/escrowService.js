@@ -35,6 +35,15 @@ const _getBizOrderService = () => {
     return _bizOrderService;
 };
 
+// Owner-facing notification feed. Lazy-required for symmetry with the above and
+// to keep the financial core free of optional dependencies at load time.
+// notifyOrderEvent is a no-op for peer-to-peer (non-business) escrows.
+let _bizNotificationService = null;
+const _getBizNotificationService = () => {
+    if (!_bizNotificationService) _bizNotificationService = require('./bizNotificationService');
+    return _bizNotificationService;
+};
+
 // ── Module constants ─────────────────────────────────────────────────────────
 const SMART_ESCROW_FEE_PCT_DEFAULT = 0.005; // 0.5% — fallback if GlobalSettings missing
 const DRAFT_EXPIRY_HOURS = 24; // unfunded escrows expire after 24h
@@ -211,6 +220,14 @@ const fundEscrow = async (prisma, { escrowId, payerId }) => {
             .catch((err) => console.error('[escrowService.fundEscrow] order sync:', err.message));
     });
 
+    // Owner-facing feed: the buyer has funded the escrow.
+    setImmediate(() => {
+        _getBizNotificationService().notifyOrderEvent(prisma, {
+            escrowId,
+            type: 'ORDER_FUNDED'
+        }).catch((err) => console.error('[escrowService.fundEscrow] biz notif:', err.message));
+    });
+
     return { success: true, escrow: updatedEscrow, reference };
 };
 
@@ -235,10 +252,23 @@ const markSatisfied = async (prisma, { escrowId, userId }) => {
         data
     });
 
-    // Both satisfied → release to payee (SETTLED).
+    // Both satisfied → release to payee (SETTLED). _releaseEscrow fires
+    // ORDER_SETTLED itself, so we do NOT also fire ORDER_SATISFIED here.
     if (updated.payerSatisfied && updated.payeeSatisfied) {
         const settled = await _releaseEscrow(prisma, escrowId, 'SETTLED');
         return { settled: true, escrow: settled };
+    }
+
+    // Buyer (payer) signalled completion but the owner hasn't confirmed yet —
+    // surface it on the owner-facing feed. (Owner marking their own side needs
+    // no notification.)
+    if (escrow.payerId === userId) {
+        setImmediate(() => {
+            _getBizNotificationService().notifyOrderEvent(prisma, {
+                escrowId,
+                type: 'ORDER_SATISFIED'
+            }).catch((err) => console.error('[escrowService.markSatisfied] biz notif:', err.message));
+        });
     }
 
     // Otherwise mark we are awaiting the other side.
@@ -297,6 +327,15 @@ const raiseDispute = async (prisma, { escrowId, raisedById, reason, evidenceUrls
         _getBizOrderService()
             .updateOrderStatusFromEscrow(prisma, escrowId, 'DISPUTED')
             .catch((err) => console.error('[escrowService.raiseDispute] order sync:', err.message));
+    });
+
+    // Owner-facing feed: a dispute was opened on this order.
+    setImmediate(() => {
+        _getBizNotificationService().notifyOrderEvent(prisma, {
+            escrowId,
+            type: 'ORDER_DISPUTED',
+            extraMetadata: { disputeId: result.dispute?.id, raisedById }
+        }).catch((err) => console.error('[escrowService.raiseDispute] biz notif:', err.message));
     });
 
     return result;
@@ -523,6 +562,14 @@ const _releaseEscrow = async (prisma, escrowId, finalStatus = 'SETTLED') => {
                 console.error('[escrowService._releaseEscrow] profile stat sync:', err.message);
             }
         });
+
+        // Owner-facing feed: funds delivered to the business.
+        setImmediate(() => {
+            _getBizNotificationService().notifyOrderEvent(prisma, {
+                escrowId,
+                type: 'ORDER_SETTLED'
+            }).catch((err) => console.error('[escrowService._releaseEscrow] biz notif:', err.message));
+        });
     }
 
     return updated;
@@ -580,6 +627,14 @@ const _refundEscrow = async (prisma, escrowId, finalStatus = 'REFUNDED') => {
         _getBizOrderService()
             .updateOrderStatusFromEscrow(prisma, escrowId, finalStatus)
             .catch((err) => console.error('[escrowService._refundEscrow] order sync:', err.message));
+    });
+
+    // Owner-facing feed: principal returned to the buyer (manual or worker sweep).
+    setImmediate(() => {
+        _getBizNotificationService().notifyOrderEvent(prisma, {
+            escrowId,
+            type: 'ORDER_REFUNDED'
+        }).catch((err) => console.error('[escrowService._refundEscrow] biz notif:', err.message));
     });
 
     return updated;
