@@ -31,6 +31,7 @@ const VALID_MESSAGE_TYPES = new Set([
 // a SmartEscrow record; business-mode tickets bypass the friendship requirement.
 const escrowService = require('../services/escrowService');
 const businessOrderService = require('../services/businessOrderService');
+const bizNotificationService = require('../services/bizNotificationService');
 
 // ── helpers ─────────────────────────────────────────────────────────────────
 
@@ -287,6 +288,17 @@ exports.createTicket = async (req, res) => {
                             }
                         }).catch((e) => console.error('[createTicket] notification:', e.message));
                     });
+                }
+
+                // Persistent owner-facing feed (Business Portal) + best-effort socket nudge.
+                setImmediate(() => {
+                    bizNotificationService.notifyOrderEvent(prisma, {
+                        escrowId: escrow.id,
+                        type: 'NEW_ORDER'
+                    }).catch((e) => console.error('[createTicket] biz notif:', e.message));
+                });
+                if (io && bizProfile) {
+                    io.to(`user_${bizProfile.userId}`).emit('biz_notification', { type: 'NEW_ORDER' });
                 }
             }
 

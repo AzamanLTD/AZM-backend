@@ -11,6 +11,8 @@
 //   success → { success: true, ... }; error → { success: false, message }.
 // =============================================================================
 
+const bizNotificationService = require('../services/bizNotificationService');
+
 const VALID_KYB_DOC_TYPES = new Set([
     'BUSINESS_REGISTRATION_CERT',
     'DIRECTOR_ID_FRONT',
@@ -260,6 +262,19 @@ exports.approveBusinessKyb = async (req, res) => {
             });
         }
 
+        // Persistent owner-facing feed entry.
+        setImmediate(() => {
+            bizNotificationService.createNotification(prisma, {
+                businessProfileId: profile.id,
+                type: 'KYB_STATUS_CHANGED',
+                title: 'Business Verified',
+                body: 'Your KYB documents were approved — your business is now verified and publicly visible.',
+                metadata: { decision: 'APPROVED', kybStatus: 'VERIFIED' }
+            });
+        });
+        const io = req.app.get('socketio');
+        if (io) io.to(`user_${profile.userId}`).emit('biz_notification', { type: 'KYB_STATUS_CHANGED' });
+
         return res.status(200).json({ success: true, business: updated });
     } catch (err) {
         return res.status(400).json({ success: false, message: err.message });
@@ -310,6 +325,19 @@ exports.rejectBusinessKyb = async (req, res) => {
                 }).catch((e) => console.error('[rejectBusinessKyb] notification:', e.message));
             });
         }
+
+        // Persistent owner-facing feed entry.
+        setImmediate(() => {
+            bizNotificationService.createNotification(prisma, {
+                businessProfileId: profile.id,
+                type: 'KYB_STATUS_CHANGED',
+                title: 'KYB Documents Rejected',
+                body: String(reason).slice(0, 480),
+                metadata: { decision: 'REJECTED', kybStatus: 'REJECTED' }
+            });
+        });
+        const io = req.app.get('socketio');
+        if (io) io.to(`user_${profile.userId}`).emit('biz_notification', { type: 'KYB_STATUS_CHANGED' });
 
         return res.status(200).json({ success: true });
     } catch (err) {
