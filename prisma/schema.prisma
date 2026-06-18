@@ -2110,6 +2110,11 @@ model BusinessProfile {
   verifiedAt DateTime?
   kybStatus  KybStatus @default(UNVERIFIED)
 
+  // Admin moderation (WS4): a suspended business is hidden/blocked from new
+  // activity until an admin unsuspends it. suspendReason is operator-facing.
+  isSuspended   Boolean @default(false)
+  suspendReason String? @db.VarChar(500)
+
   // Public contact info
   phoneNumber  String? @db.VarChar(20)
   contactEmail String? @db.VarChar(100)

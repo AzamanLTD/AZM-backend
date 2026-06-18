@@ -1,5 +1,10 @@
 // server.js
 // =============================================================================
+// WS6: Sentry must be the very first require so its auto-instrumentation can
+// patch http/express/pg before they are loaded. No-op when SENTRY_DSN is unset.
+const Sentry = require('./instrument');
+
+// =============================================================================
 // AZAMAN V3 — PRODUCTION-HARDENED SERVER
 //
 // SECURITY FIXES APPLIED:
@@ -336,6 +341,32 @@ app.get('/health', async (req, res) => {
             }
         } catch (_) { /* non-fatal */ }
 
+        // WS7: Escrow + business system stats for the Admin Portal dashboard.
+        // Each block is independently guarded — a stats query failure must NEVER
+        // flip /health to 503 (the DB SELECT 1 above is the real liveness probe).
+        let escrowSystem = null;
+        try {
+            const startOfToday = new Date();
+            startOfToday.setHours(0, 0, 0, 0);
+            const [activeEscrows, disputedEscrows, expiredToday] = await Promise.all([
+                prisma.smartEscrow.count({ where: { status: { in: ['FUNDED', 'IN_PROGRESS', 'PENDING_SETTLEMENT'] } } }),
+                prisma.smartEscrow.count({ where: { status: { in: ['DISPUTED', 'ADMIN_REVIEW'] } } }),
+                prisma.smartEscrow.count({ where: { status: 'EXPIRED', updatedAt: { gte: startOfToday } } }),
+            ]);
+            escrowSystem = { activeEscrows, disputedEscrows, expiredToday };
+        } catch (_) { /* non-fatal */ }
+
+        let businessSystem = null;
+        try {
+            const [totalBusinesses, verifiedBusinesses, pendingKyb, activeOrders] = await Promise.all([
+                prisma.businessProfile.count(),
+                prisma.businessProfile.count({ where: { kybStatus: 'VERIFIED' } }),
+                prisma.businessProfile.count({ where: { kybStatus: 'PENDING' } }),
+                prisma.businessOrder.count({ where: { status: { in: ['PAID', 'DELIVERED'] } } }),
+            ]);
+            businessSystem = { totalBusinesses, verifiedBusinesses, pendingKyb, activeOrders };
+        } catch (_) { /* non-fatal */ }
+
         res.status(200).json({
             status: 'healthy',
             timestamp: new Date().toISOString(),
@@ -344,6 +375,8 @@ app.get('/health', async (req, res) => {
             database: 'connected',
             redis: redisStatus,
             workers: workerStatus,
+            escrowSystem,
+            businessSystem,
             versionGate,
             // Susu Sprint (2026-06-01): surface the boot-time auto-release
             // outcome + treasury cache state so deploy health can be checked
@@ -713,29 +746,38 @@ const momoNameLookupService = new MomoNameLookupService();
 app.set('momoNameLookupService', momoNameLookupService);
 
 // --- WORKERS ---
+// Background workers schedule cron jobs / setInterval timers inside their
+// .start(). Under test (NODE_ENV==='test' — e.g. __tests__/auth.test.js requires
+// this module via supertest) we must NOT start them: the open handles would hang
+// the jest process and the scheduled jobs would run against the disposable test
+// DB. We guard only .start() (not instantiation) so the references in the listen
+// callback and graceful-shutdown handler stay in module scope.
+const IS_TEST_ENV = process.env.NODE_ENV === 'test';
+const startWorker = (w) => { if (!IS_TEST_ENV) w.start(); };
+
 const TradeWorker = require('./workers/tradeWorker');
 const tradeWorker = new TradeWorker(prisma, io, tradeSocketService);
 
 const LeaderboardWorker = require('./workers/leaderboardWorker');
 const leaderboardWorker = new LeaderboardWorker(prisma, io);
-leaderboardWorker.start();
+startWorker(leaderboardWorker);
 
 const AnalyticsWorker = require('./workers/analyticsWorker');
 const analyticsWorker = new AnalyticsWorker(prisma);
-analyticsWorker.start();
+startWorker(analyticsWorker);
 
 const CfoWorker = require('./workers/cfoWorker');
 const cfoWorker = new CfoWorker(prisma, io);
-cfoWorker.start();
+startWorker(cfoWorker);
 
 const SavingsWorker = require('./workers/savingsWorker');
 const savingsWorker = new SavingsWorker(prisma, io);
-savingsWorker.start();
+startWorker(savingsWorker);
 
 const WithdrawalReconciliationWorker = require('./workers/withdrawalReconciliationWorker');
 const withdrawalReconciliationWorker =
     new WithdrawalReconciliationWorker(prisma, io, mtnDisbursementService, emailService, smsService);
-withdrawalReconciliationWorker.start();
+startWorker(withdrawalReconciliationWorker);
 
 // --- PAYOUT BATCH WORKER (Phase Q8) ---
 // Scans PENDING fiat withdrawals and auto-dispatches when pool has liquidity
@@ -743,7 +785,7 @@ withdrawalReconciliationWorker.start();
 // under-funded withdrawals as NEEDS_MANUAL_REVIEW for the War Room.
 const PayoutBatchWorker = require('./workers/payoutBatchWorker');
 const payoutBatchWorker = new PayoutBatchWorker(prisma, io, mtnDisbursementService, notificationService);
-payoutBatchWorker.start();
+startWorker(payoutBatchWorker);
 app.set('payoutBatchWorker', payoutBatchWorker);
 
 // --- SMART ESCROW EXPIRY WORKER (2026-06-14) ---
@@ -751,17 +793,17 @@ app.set('payoutBatchWorker', payoutBatchWorker);
 // (refunding the payer), every 30 minutes. No-op safe in test mode.
 const EscrowExpiryWorker = require('./workers/escrowExpiryWorker');
 const escrowExpiryWorker = new EscrowExpiryWorker(prisma, io, notificationService);
-escrowExpiryWorker.start();
+startWorker(escrowExpiryWorker);
 app.set('escrowExpiryWorker', escrowExpiryWorker);
 
 // --- MASTER SPRINT WORKERS (Vault / Susu / Smart Route / AZM Auction) ---
 const VaultWorker = require('./workers/vaultWorker');
 const vaultWorker = new VaultWorker(prisma, vaultService, notificationService);
-vaultWorker.start();
+startWorker(vaultWorker);
 
 const SusuWorker = require('./workers/susuWorker');
 const susuWorker = new SusuWorker(prisma, susuService);
-susuWorker.start();
+startWorker(susuWorker);
 
 // ── Phase 3 (private-susu-ecosystem) workers — 2026-05-31 ───────────────────
 // V2 cycle scheduler (60s cadence) handles SusuGroups with contractVersion
@@ -826,7 +868,7 @@ if (process.env.NODE_ENV !== 'test') {
 
 const SmartRouteWorker = require('./workers/smartRouteWorker');
 const smartRouteWorker = new SmartRouteWorker(prisma, smartRouteService);
-smartRouteWorker.start();
+startWorker(smartRouteWorker);
 
 // PHASE 5 / Workstream D — Susu initiation countdown sweep (every 60s).
 // Independent of the treasury cache (it only manages membership + activation),
@@ -840,7 +882,7 @@ if (process.env.NODE_ENV !== 'test') {
 
 const AzmAuctionWorker = require('./workers/azmAuctionWorker');
 const azmAuctionWorker = new AzmAuctionWorker(prisma, azmAuctionService);
-azmAuctionWorker.start();
+startWorker(azmAuctionWorker);
 
 // ── D-05: record worker liveness for GET /health ─────────────────────────────
 // These all called .start() above. tradeWorker is special: it is instantiated
@@ -1481,6 +1523,13 @@ app.use((req, res) => {
     res.status(404).json({ success: false, error: 'Endpoint not found', path: req.originalUrl });
 });
 
+// WS6: Sentry error handler — must come AFTER all controllers/routes and the
+// 404 catch-all, but BEFORE our own error responder so the exception is
+// captured first, then formatted for the client below. No-op without SENTRY_DSN.
+if (process.env.SENTRY_DSN) {
+    Sentry.setupExpressErrorHandler(app);
+}
+
 // HIGH-4: Global error handler — sanitize in production
 app.use((err, req, res, next) => {
     console.error('SERVER ERROR:', err.message);
@@ -1516,12 +1565,21 @@ app.use((err, req, res, next) => {
 // START SERVER + GRACEFUL SHUTDOWN
 // ══════════════════════════════════════════════════════════════════════════════
 
+// Export the fully-built Express app so integration tests (supertest) can mount
+// it without binding a port. Must come AFTER all routes + error handlers are
+// registered (above) so the exported app is complete. See __tests__/auth.test.js.
+module.exports = app;
+
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, '0.0.0.0', () => {
-    console.log(`AZAMAN BACKEND LIVE ON PORT ${PORT} [${IS_PRODUCTION ? 'PRODUCTION' : 'DEVELOPMENT'}]`);
-    tradeWorker.start();
-    workerStatus.tradeWorker = 'running';
-});
+// In test mode we never bind a port (supertest drives the app object directly),
+// which also avoids EADDRINUSE and leaving a live listener after the suite ends.
+if (!IS_TEST_ENV) {
+    server.listen(PORT, '0.0.0.0', () => {
+        console.log(`AZAMAN BACKEND LIVE ON PORT ${PORT} [${IS_PRODUCTION ? 'PRODUCTION' : 'DEVELOPMENT'}]`);
+        tradeWorker.start();
+        workerStatus.tradeWorker = 'running';
+    });
+}
 
 // Graceful shutdown handler
 const shutdown = async (signal) => {

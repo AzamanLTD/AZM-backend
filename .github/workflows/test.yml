@@ -1,0 +1,56 @@
+name: Azaman Test Suite
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: azaman_test
+          POSTGRES_PASSWORD: azaman_test_secret
+          POSTGRES_DB: azaman_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DATABASE_URL: postgresql://azaman_test:azaman_test_secret@localhost:5432/azaman_test
+      TEST_DATABASE_URL: postgresql://azaman_test:azaman_test_secret@localhost:5432/azaman_test
+      JWT_SECRET: test_secret_exactly_32_characters_long
+      NODE_ENV: test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - run: npm ci
+
+      - name: Apply database schema
+        run: npx prisma migrate deploy
+
+      - name: Generate Prisma client
+        run: npx prisma generate
+
+      - name: Run tests
+        # --runInBand: the DB-backed suites TRUNCATE the shared Postgres between
+        #   tests; parallel jest workers would truncate each other's rows and flake.
+        # --forceExit: __tests__/auth.test.js boots the Express app (supertest),
+        #   which holds its own Prisma client + pg pool open; force a clean exit so
+        #   CI doesn't hang waiting on those handles.
+        run: npm test -- --runInBand --forceExit

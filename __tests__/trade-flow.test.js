@@ -18,6 +18,8 @@
 // fake pass. Wire the seed to your factory/fixtures to fully activate it.
 // =============================================================================
 
+const { seedPaidTrade } = require('./helpers/factories');
+
 const hasDb = !!process.env.TEST_DATABASE_URL;
 const describeOrSkip = hasDb ? describe : describe.skip;
 
@@ -48,23 +50,14 @@ describeOrSkip('completeTrade — concurrent finalize is single-winner', () => {
         if (prisma) await prisma.$disconnect();
     });
 
-    test('two simultaneous completeTrade calls: exactly one succeeds', async () => {
-        // ---- SEED (wire to your fixtures) ----------------------------------
-        // Create a buyer, a vendor with funded escrow, and a Trade in PAID
-        // status whose escrowLockedBalance covers amountCrypto. Capture tradeId
-        // and the releasing user's id.
-        //
-        // const { tradeId, releasedByUserId } = await seedPaidTrade(prisma);
-        const seed = null; // TODO: replace with seedPaidTrade(prisma)
+    afterEach(async () => {
+        // Prevent cross-test pollution. Trade has FKs to User; Ad to User.
+        await prisma.$executeRawUnsafe('TRUNCATE TABLE "Trade", "Ad", "User" RESTART IDENTITY CASCADE');
+    });
 
-        if (!seed) {
-            // Be loud, not silently green: fail so this TODO is visible when the
-            // DB is present but the fixture isn't wired yet.
-            throw new Error(
-                'trade-flow seed not wired: implement seedPaidTrade(prisma) to create a ' +
-                'PAID trade with funded escrow, then remove this guard.'
-            );
-        }
+    test('two simultaneous completeTrade calls: exactly one succeeds', async () => {
+        // Real seed: a PAID SELL trade where the buyer has escrowed amountCrypto.
+        const seed = await seedPaidTrade(prisma);
 
         const complete = () =>
             p2pService
@@ -74,12 +67,19 @@ describeOrSkip('completeTrade — concurrent finalize is single-winner', () => {
 
         const [a, b] = await Promise.all([complete(), complete()]);
 
+        // The atomic PAID->COMPLETED flip means exactly one caller wins; the
+        // other must bail with TRADE_ALREADY_FINALIZED.
         const successes = [a, b].filter((x) => x.ok).length;
         expect(successes).toBe(1);
 
-        // The vendor balance must reflect exactly one payout. Re-read and assert
-        // against the expected net (amountCrypto - fee) — not double.
-        // const vendor = await prisma.user.findUnique({ where: { id: seed.vendorId } });
-        // expect(Number(vendor.availableBalance)).toBeCloseTo(seed.expectedVendorBalance, 6);
+        // Exactly one payout: the buyer's escrow is drained exactly once (a
+        // double-payout would push escrowLockedBalance negative), and the vendor
+        // is credited once with the net (0 < net <= amountCrypto after fees).
+        const buyer = await prisma.user.findUnique({ where: { id: seed.buyerId } });
+        expect(Number(buyer.escrowLockedBalance)).toBeCloseTo(0, 6);
+
+        const vendor = await prisma.user.findUnique({ where: { id: seed.vendorId } });
+        expect(Number(vendor.availableBalance)).toBeGreaterThan(0);
+        expect(Number(vendor.availableBalance)).toBeLessThanOrEqual(seed.amountCrypto);
     });
 });

@@ -247,10 +247,21 @@ const markSatisfied = async (prisma, { escrowId, userId }) => {
     const isPayer = escrow.payerId === userId;
     const data = isPayer ? { payerSatisfied: true } : { payeeSatisfied: true };
 
-    const updated = await prisma.smartEscrow.update({
-        where: { id: escrowId },
+    // TOCTOU guard: claim this party's satisfaction flag with a conditional
+    // update so two concurrent markSatisfied calls for the SAME party cannot
+    // both "win" (the loser sees count=0 and bails). Combined with the
+    // single-winner claim inside _releaseEscrow, this makes double-settlement
+    // (and therefore double-payout) impossible even under concurrent calls
+    // from both parties at once. Mirrors the completeTrade atomic-flip pattern.
+    const guard = isPayer ? { payerSatisfied: false } : { payeeSatisfied: false };
+    const claimed = await prisma.smartEscrow.updateMany({
+        where: { id: escrowId, ...guard },
         data
     });
+    if (claimed.count === 0) {
+        throw new Error('You have already marked this escrow as satisfied.');
+    }
+    const updated = await prisma.smartEscrow.findUnique({ where: { id: escrowId } });
 
     // Both satisfied → release to payee (SETTLED). _releaseEscrow fires
     // ORDER_SETTLED itself, so we do NOT also fire ORDER_SATISFIED here.
@@ -490,9 +501,32 @@ const _releaseEscrow = async (prisma, escrowId, finalStatus = 'SETTLED') => {
     // Funds sit in the dispute bucket only once a dispute moved them there.
     const fromDispute = escrow.status === 'DISPUTED' || escrow.status === 'ADMIN_REVIEW';
     const sourceColumn = fromDispute ? 'disputeEscrowBalance' : 'escrowLockedBalance';
+    // The set of statuses we are allowed to release FROM. Used as the atomic
+    // claim precondition below so the same escrow can never be released twice.
+    const claimableStatuses = fromDispute
+        ? ['DISPUTED', 'ADMIN_REVIEW']
+        : ['FUNDED', 'IN_PROGRESS', 'PENDING_SETTLEMENT'];
     const reference = randomUUID();
 
     const updated = await prisma.$transaction(async (tx) => {
+        // SINGLE-WINNER CLAIM (TOCTOU guard): flip the escrow to its final
+        // status if and only if it is still in a releasable state. A second
+        // concurrent release sees count=0 and aborts BEFORE any balance moves,
+        // exactly like the completeTrade PAID->COMPLETED atomic flip. Without
+        // this, two settlements racing (e.g. both parties marking satisfied at
+        // once) would each pay the payee — real money loss.
+        const claim = await tx.smartEscrow.updateMany({
+            where: { id: escrowId, status: { in: claimableStatuses } },
+            data: {
+                status: finalStatus,
+                settledAt: new Date(),
+                releaseTxHash: reference
+            }
+        });
+        if (claim.count === 0) {
+            throw new Error('ESCROW_ALREADY_FINALIZED');
+        }
+
         // Release the locked principal from the payer's holding bucket.
         await tx.user.update({
             where: { id: escrow.payerId },
@@ -505,14 +539,7 @@ const _releaseEscrow = async (prisma, escrowId, finalStatus = 'SETTLED') => {
             data: { availableBalance: { increment: amount } }
         });
 
-        const result = await tx.smartEscrow.update({
-            where: { id: escrowId },
-            data: {
-                status: finalStatus,
-                settledAt: new Date(),
-                releaseTxHash: reference
-            }
-        });
+        const result = await tx.smartEscrow.findUnique({ where: { id: escrowId } });
 
         await tx.transactionHistory.create({
             data: {
@@ -587,9 +614,28 @@ const _refundEscrow = async (prisma, escrowId, finalStatus = 'REFUNDED') => {
     const amount = Number(escrow.amountUsdc);
     const fromDispute = escrow.status === 'DISPUTED' || escrow.status === 'ADMIN_REVIEW';
     const sourceColumn = fromDispute ? 'disputeEscrowBalance' : 'escrowLockedBalance';
+    // Statuses we are allowed to refund FROM — the atomic claim precondition.
+    const claimableStatuses = fromDispute
+        ? ['DISPUTED', 'ADMIN_REVIEW']
+        : ['FUNDED', 'IN_PROGRESS', 'PENDING_SETTLEMENT'];
     const reference = randomUUID();
 
     const updated = await prisma.$transaction(async (tx) => {
+        // SINGLE-WINNER CLAIM (TOCTOU guard): mirror _releaseEscrow so a refund
+        // can never run twice (e.g. the expiry worker and an admin refund both
+        // firing on the same escrow). The loser aborts before any balance moves.
+        const claim = await tx.smartEscrow.updateMany({
+            where: { id: escrowId, status: { in: claimableStatuses } },
+            data: {
+                status: finalStatus,
+                refundedAt: new Date(),
+                refundTxHash: reference
+            }
+        });
+        if (claim.count === 0) {
+            throw new Error('ESCROW_ALREADY_FINALIZED');
+        }
+
         await tx.user.update({
             where: { id: escrow.payerId },
             data: {
@@ -598,14 +644,7 @@ const _refundEscrow = async (prisma, escrowId, finalStatus = 'REFUNDED') => {
             }
         });
 
-        const result = await tx.smartEscrow.update({
-            where: { id: escrowId },
-            data: {
-                status: finalStatus,
-                refundedAt: new Date(),
-                refundTxHash: reference
-            }
-        });
+        const result = await tx.smartEscrow.findUnique({ where: { id: escrowId } });
 
         await tx.transactionHistory.create({
             data: {
@@ -690,6 +729,42 @@ const getEscrowForTicket = async (prisma, ticketId) =>
         }
     });
 
+// =============================================================================
+// 8. CANCEL ESCROW — payer aborts the escrow.
+//   • DRAFT  → no money ever moved → mark EXPIRED.
+//   • FUNDED/IN_PROGRESS/PENDING_SETTLEMENT → refund the locked principal to
+//     the payer (via _refundEscrow) and mark REFUNDED.
+//   Only the payer may cancel. Mirrors controllers/escrowController.cancelEscrow
+//   (DRAFT-only) but adds the funded-refund path; the controller may adopt this
+//   service function later. The DRAFT flip is an atomic conditional update so a
+//   concurrent fund cannot race a cancel.
+// =============================================================================
+const cancelEscrow = async (prisma, { escrowId, userId }) => {
+    const escrow = await prisma.smartEscrow.findUnique({ where: { id: escrowId } });
+    if (!escrow) throw new Error('Escrow not found.');
+    if (escrow.payerId !== userId) {
+        throw new Error('Only the payer can cancel this escrow.');
+    }
+
+    if (escrow.status === 'DRAFT') {
+        const claim = await prisma.smartEscrow.updateMany({
+            where: { id: escrowId, status: 'DRAFT' },
+            data: { status: 'EXPIRED' }
+        });
+        if (claim.count === 0) {
+            throw new Error(`Escrow cannot be cancelled from status ${escrow.status}.`);
+        }
+        return prisma.smartEscrow.findUnique({ where: { id: escrowId } });
+    }
+
+    if (['FUNDED', 'IN_PROGRESS', 'PENDING_SETTLEMENT'].includes(escrow.status)) {
+        // _refundEscrow performs the atomic claim + balance move + history row.
+        return _refundEscrow(prisma, escrowId, 'REFUNDED');
+    }
+
+    throw new Error(`Escrow cannot be cancelled from status ${escrow.status}.`);
+};
+
 module.exports = {
     createEscrow,
     fundEscrow,
@@ -698,6 +773,7 @@ module.exports = {
     resolveDispute,
     assignDisputeToAdmin,
     getEscrowForTicket,
+    cancelEscrow,
     // Exposed for the expiry worker (Work Item 9).
     _refundEscrow,
     _releaseEscrow,
