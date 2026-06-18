@@ -748,7 +748,10 @@ exports.getPlatformStats = async (req, res) => {
             volume24h,
             volumeAllTime,
             profitFees,
-            pendingWithdrawals
+            pendingWithdrawals,
+            activeEscrows,
+            disputedEscrows,
+            pendingBusinessKyb
         ] = await Promise.all([
             // Total users
             prisma.user.count(),
@@ -785,7 +788,13 @@ exports.getPlatformStats = async (req, res) => {
             // System profit fees
             prisma.systemProfitFees.findUnique({ where: { id: 1 } }).catch(() => null),
             // Pending withdrawals
-            prisma.withdrawal.count({ where: { status: 'PENDING' } })
+            prisma.withdrawal.count({ where: { status: 'PENDING' } }),
+            // Active escrows — value currently locked (funded, not yet settled/disputed)
+            prisma.smartEscrow.count({ where: { status: { in: ['FUNDED', 'IN_PROGRESS', 'PENDING_SETTLEMENT'] } } }),
+            // Disputed escrows — escalated, awaiting/under admin ruling
+            prisma.smartEscrow.count({ where: { status: { in: ['DISPUTED', 'ADMIN_REVIEW'] } } }),
+            // Businesses awaiting KYB review
+            prisma.businessProfile.count({ where: { kybStatus: 'PENDING' } })
         ]);
 
         const totalFiatVolume = volumeAllTime._sum.amountFiat || 0;
@@ -824,6 +833,11 @@ exports.getPlatformStats = async (req, res) => {
                 // Operations
                 pendingKyc,
                 pendingWithdrawals,
+
+                // Escrow & Business (WS4)
+                activeEscrows,
+                disputedEscrows,
+                pendingBusinessKyb,
 
                 // Timestamps
                 generatedAt: now.toISOString()
