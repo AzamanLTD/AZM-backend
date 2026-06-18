@@ -345,4 +345,11 @@ router.post('/business-kyb/:documentId/review',        businessKybCtrl.reviewKyb
 router.post('/business-kyb/:bizId/approve',            businessKybCtrl.approveBusinessKyb);
 router.post('/business-kyb/:bizId/reject',             businessKybCtrl.rejectBusinessKyb);
 
+// ─── BUSINESS MANAGEMENT (WS4, 2026-06-18) ───────────────────────────────────
+// List all businesses + suspend/unsuspend. protect + adminOnly applied globally.
+const businessAdminCtrl = require('../controllers/businessAdminController');
+router.get('/businesses',                    businessAdminCtrl.getBusinesses);
+router.post('/businesses/:bizId/suspend',    businessAdminCtrl.suspendBusiness);
+router.post('/businesses/:bizId/unsuspend',  businessAdminCtrl.unsuspendBusiness);
+
 module.exports = router;

@@ -1911,6 +1911,17 @@ exports.resolveEscrowDispute = async (req, res) => {
         }
         const escrowRow = dispute.escrow;
 
+        // WS3.1 IDEMPOTENCY: an already-resolved dispute (or an escrow that is no
+        // longer in a resolvable state) must be rejected with 409 Conflict, never
+        // re-executed — re-running a ruling would move money twice.
+        const RESOLVABLE_ESCROW = ['DISPUTED', 'ADMIN_REVIEW'];
+        if (dispute.status === 'RESOLVED' || !escrowRow || !RESOLVABLE_ESCROW.includes(escrowRow.status)) {
+            return res.status(409).json({
+                success: false,
+                message: `Dispute already resolved or escrow not in a resolvable state (dispute=${dispute.status}, escrow=${escrowRow ? escrowRow.status : 'missing'}).`
+            });
+        }
+
         const result = await escrowService.resolveDispute(prisma, {
             escrowId: dispute.escrowId,
             adminId: req.user.id,
@@ -1946,8 +1957,16 @@ exports.resolveEscrowDispute = async (req, res) => {
         } else {
             msg = `⚖️ Admin ruling: ${payerPct}% refunded to ${payerName}, ${payeePct}% released to ${payeeName}.`;
         }
+        // WS3.1 AUDIT: the SYSTEM TicketMessage is the persistent, queryable audit
+        // record for the ruling (the dispute row also stamps ruling/rulingNotes/
+        // resolvedAt/assignedToId). Capture adminId + reason + ruling + timestamp.
         await _injectEscrowSystemMessage(prisma, io, escrowRow.ticket, msg, {
-            event: 'ESCROW_RESOLVED', escrowId: result.escrow.id, ruling
+            event: 'ESCROW_RESOLVED',
+            escrowId: result.escrow.id,
+            ruling,
+            adminId: req.user.id,
+            rulingNotes: rulingNotes || null,
+            resolvedAt: new Date().toISOString()
         });
 
         // Close the parent ticket if still OPEN.

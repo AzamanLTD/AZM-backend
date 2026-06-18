@@ -63,6 +63,15 @@ const validateRegisterInput = (username, email, password) => {
         errors.push('Password is required');
     } else if (password.length < 8) {
         errors.push('Password must be at least 8 characters long');
+    } else {
+        // Complexity: enforce the same rules the Flutter UI shows, so a direct
+        // API call (e.g. Postman) cannot bypass them with a weak password.
+        const hasUpper = /[A-Z]/.test(password);
+        const hasNumber = /[0-9]/.test(password);
+        const hasSpecial = /[!@#$%^&*(),.?":{}|<>]/.test(password);
+        if (!hasUpper || !hasNumber || !hasSpecial) {
+            errors.push('Password must contain at least one uppercase letter, one number, and one special character (!@#$%^&*)');
+        }
     }
     return errors;
 };
