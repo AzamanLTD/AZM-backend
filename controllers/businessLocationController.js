@@ -13,6 +13,12 @@ const locationSvc = require('../services/businessLocationService');
 const _ownedProfile = async (prisma, userId) => {
   const profile = await prisma.businessProfile.findUnique({ where: { userId } });
   if (!profile) throw Object.assign(new Error('No business profile found.'), { status: 404 });
+  if (profile.isSuspended) {
+    throw Object.assign(
+      new Error('Your business account is suspended. Contact support.'),
+      { status: 403 }
+    );
+  }
   return profile;
 };
 
@@ -77,7 +83,7 @@ exports.deleteLocation = async (req, res) => {
 // GET /api/business/search/nearby
 exports.searchNearby = async (req, res) => {
   const prisma = req.app.get("prisma");
-  const { lat, lng, radiusKm, category, q, verified, limit, cursor } = req.query;
+  const { lat, lng, radiusKm, category, q, verified, limit, page } = req.query;
   if (!lat || !lng) return res.status(400).json({ success: false, message: 'lat and lng are required.' });
   const latF = parseFloat(lat); const lngF = parseFloat(lng);
   if (isNaN(latF) || isNaN(lngF)) return res.status(400).json({ success: false, message: 'lat/lng must be valid numbers.' });
@@ -85,7 +91,7 @@ exports.searchNearby = async (req, res) => {
     const result = await locationSvc.searchNearby(prisma, {
       lat: latF, lng: lngF, radiusKm,
       category, q, verified: verified === "true",
-      limit, cursor,
+      limit, page,
     });
     return res.json({ success: true, ...result });
   } catch (err) { return _err(res, err); }

@@ -67,13 +67,7 @@ exports.getBusinessByBizId = async (req, res) => {
             return res.status(404).json({ success: false, message: 'Business not found.' });
         }
         if (business.isSuspended) {
-            // Suspended businesses are invisible to public visitors. The owner
-            // (business.userId === req.user?.id) can still see their own profile
-            // via /me — this route is public, so req.user may be undefined.
-            const requestingUserId = req.user?.id ?? null;
-            if (requestingUserId !== business.userId) {
-                return res.status(404).json({ success: false, message: 'Business not found.' });
-            }
+            return res.status(404).json({ success: false, message: 'Business not found.' });
         }
         return res.status(200).json({ success: true, business });
     } catch (err) {

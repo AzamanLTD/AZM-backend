@@ -158,13 +158,14 @@ const deleteTable = async (prisma, { businessProfileId, tableId }) => {
 // ── Nearby Search ─────────────────────────────────────────────────────────────
 // Bounding-box approximation: 1° lat ≈ 111km, 1° lng ≈ 111km × cos(lat).
 // Returns locations within radiusKm, ordered by haversine distance asc.
-const searchNearby = async (prisma, { lat, lng, radiusKm = 10, category, q, verified, limit, cursor }) => {
+const searchNearby = async (prisma, { lat, lng, radiusKm = 10, category, q, verified, limit, page }) => {
   const R = Math.min(parseFloat(radiusKm) || 10, 50);
   const latDelta = R / 111.0;
   const lngDelta = R / (111.0 * Math.cos((lat * Math.PI) / 180));
   const minLat = lat - latDelta; const maxLat = lat + latDelta;
   const minLng = lng - lngDelta; const maxLng = lng + lngDelta;
   const take = Math.min(parseInt(limit, 10) || 20, 50);
+  const pageNum = Math.max(parseInt(page, 10) || 0, 0);
 
   const locationWhere = {
     isActive: true,
@@ -181,35 +182,40 @@ const searchNearby = async (prisma, { lat, lng, radiusKm = 10, category, q, veri
     },
   };
 
+  // Phase 1 — fetch ALL locations in the bounding box (hard-capped at 500 to
+  // prevent runaway queries). Cursor pagination on an unsorted result set is
+  // meaningless, so we pull the full candidate pool here and sort by true
+  // distance below.
   const locations = await prisma.businessLocation.findMany({
     where: locationWhere,
-    take: take + 1,
+    take: 500,
     include: {
       businessProfile: {
         select: { id: true, bizId: true, businessName: true, category: true,
           logoUrl: true, isVerified: true, averageRating: true, totalEscrows: true },
       },
     },
-    ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
   });
 
-  const hasMore = locations.length > take;
-  const items = locations.slice(0, take);
-
-  // Compute actual haversine distance and sort ascending
-  const withDist = items.map(loc => {
+  // Phase 2 — compute actual haversine distance for every candidate, then sort
+  // ascending so pagination operates on a globally-ordered list.
+  const allSorted = locations.map(loc => {
     const dLat = (Number(loc.latitude) - lat) * (Math.PI/180);
     const dLng = (Number(loc.longitude) - lng) * (Math.PI/180);
     const a = Math.sin(dLat/2)**2 + Math.cos(lat*Math.PI/180)*Math.cos(Number(loc.latitude)*Math.PI/180)*Math.sin(dLng/2)**2;
     const dist = 6371 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
     return { ...loc, distanceKm: Math.round(dist * 10) / 10 };
   });
-  withDist.sort((a, b) => a.distanceKm - b.distanceKm);
+  allSorted.sort((a, b) => a.distanceKm - b.distanceKm);
+
+  // Offset-based pagination over the sorted pool.
+  const pageItems = allSorted.slice(pageNum * take, (pageNum + 1) * take);
+  const hasMore = allSorted.length > (pageNum + 1) * take;
 
   return {
-    locations: withDist,
+    locations: pageItems,
     hasMore,
-    nextCursor: hasMore ? items[items.length - 1].id : null,
+    nextPage: hasMore ? pageNum + 1 : null,
   };
 };
 
