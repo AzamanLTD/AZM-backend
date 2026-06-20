@@ -104,6 +104,9 @@ enum TransactionType {
   TICKET_ESCROW_RELEASE   // funds released to payee on settlement
   TICKET_ESCROW_REFUND    // funds returned to payer on refund/cancel
   TICKET_ESCROW_FEE       // platform fee taken when escrow is funded
+  // Discovery Sprint (2026-06-20): instant invoice settlement
+  BUSINESS_INVOICE_PAYMENT   // customer debit when paying an invoice
+  BUSINESS_INVOICE_RECEIPT   // business credit when invoice is paid
 }
 
 enum TransactionStatus {
@@ -125,6 +128,8 @@ enum ProfitSource {
   SUSU_FEE
   // Smart Escrow & Business Accounts (2026-06-14): escrow service fee revenue
   SMART_ESCROW_FEE
+  // Discovery Sprint (2026-06-20): platform fee from invoice payments
+  BUSINESS_INVOICE_FEE
 }
 
 enum ConversationType {
@@ -292,6 +297,26 @@ enum BusinessOrderStatus {
 }
 
 // =============================================================================
+// DISCOVERY SPRINT (2026-06-20): Locations, Invoices, Reviews
+// =============================================================================
+enum InvoiceStatus {
+  DRAFT     // business is building it, not yet visible to customer
+  SENT      // visible to customer, awaiting payment
+  PAID      // instant settlement completed
+  VOIDED    // business cancelled it before payment
+}
+
+enum TaxLineType {
+  PERCENTAGE   // value is a % applied to invoice subtotal
+  FLAT         // value is a fixed amount added directly
+}
+
+enum ReviewSourceType {
+  ORDER     // review tied to a completed BusinessOrder
+  INVOICE   // review tied to a paid BusinessInvoice
+}
+
+// =============================================================================
 // BUSINESS NOTIFICATION (2026-06-17)
 // Persistent, owner-facing notification feed surfaced in the Business Portal.
 // Distinct from the per-user Notification model: a BusinessNotification is keyed
@@ -308,6 +333,7 @@ enum BizNotifType {
   ORDER_CANCELLED    // a DRAFT order was cancelled before funding
   ORDER_REFUNDED     // escrow refunded to the buyer
   KYB_STATUS_CHANGED // verification status changed (approved/rejected)
+  INVOICE_PAID       // a sent invoice was paid by the customer
 }
 
 enum KybDocumentType {
@@ -710,6 +736,10 @@ model User {
   disputesAssigned EscrowDispute[] @relation("DisputeAssignedTo")
   ordersAsCustomer     BusinessOrder[]                @relation("OrderCustomer")
   kybDocumentsReviewed BusinessVerificationDocument[] @relation("KybDocReviewer")
+
+  // Discovery Sprint (2026-06-20): invoices billed to this user + reviews authored
+  receivedInvoices BusinessInvoice[] @relation("InvoiceCustomer")
+  businessReviews  BusinessReview[]  @relation("BusinessReviewer")
 
   // V3: Vendor Gamification
   adInteractions     AdInteraction[]
@@ -1185,6 +1215,10 @@ model GlobalSettings {
   // non-refundable). 0.005 = 0.5%. Seeded from SMART_ESCROW_FEE_PCT env var.
   smartEscrowFeePct      Decimal @default(0.005) @db.Decimal(6, 4)
   escrowDraftExpiryHours Int     @default(24)
+
+  // Discovery Sprint (2026-06-20): platform fee on instant invoice settlement.
+  // 0.015 = 1.5% default. Snapshotted onto BusinessInvoice.feeUsdc at payment.
+  businessInvoiceFeePct Decimal @default(0.015) @db.Decimal(6, 4)
   escrowFundedExpiryDays Int     @default(30)
 
   // Business Portal (2026-06-16)
@@ -2134,6 +2168,11 @@ model BusinessProfile {
   verificationDocuments BusinessVerificationDocument[]
   notifications         BusinessNotification[]
 
+  // Discovery Sprint (2026-06-20): branches, invoices, customer reviews
+  locations BusinessLocation[]
+  invoices  BusinessInvoice[]
+  reviews   BusinessReview[]
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -2143,6 +2182,146 @@ model BusinessProfile {
   @@index([isVerified])
   // Full-text search support: business name search
   @@index([businessName])
+}
+
+// =============================================================================
+// DISCOVERY SPRINT (2026-06-20): LOCATIONS, TABLES, INVOICES, REVIEWS
+// BusinessLocation is declared BEFORE BusinessProduct because
+// BusinessProduct.locationId references it.
+// =============================================================================
+model BusinessLocation {
+  id                String  @id @default(uuid())
+  businessProfileId String
+  label             String  @db.VarChar(100) // e.g. "Osu Branch", "Main Office"
+  address           String  @db.VarChar(255)
+  city              String? @db.VarChar(100)
+  region            String? @db.VarChar(100)
+  country           String? @db.VarChar(2)
+  latitude          Decimal @db.Decimal(10, 7) // GPS lat — required for nearby search
+  longitude         Decimal @db.Decimal(10, 7) // GPS lng — required for nearby search
+  phoneNumber       String? @db.VarChar(20)
+  operatingHours    Json? // { mon:"8:00-22:00", tue:"8:00-22:00", ... sun:"closed" }
+  galleryUrls       Json? // String[] of Cloudinary URLs — ambiance/storefront photos
+  isPrimary         Boolean @default(false) // only one per business should be primary
+  isActive          Boolean @default(true)
+
+  businessProfile BusinessProfile   @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+  products        BusinessProduct[] // products available at this specific location
+  tables          BusinessTable[]
+  invoices        BusinessInvoice[]
+  reviews         BusinessReview[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([businessProfileId])
+  @@index([businessProfileId, isActive])
+  @@index([latitude]) // used by bounding-box nearby search
+  @@index([longitude])
+}
+
+model BusinessTable {
+  id         String  @id @default(uuid())
+  locationId String
+  label      String  @db.VarChar(50) // e.g. "Table 4", "Counter 1", "VIP Room"
+  isActive   Boolean @default(true)
+
+  location BusinessLocation  @relation(fields: [locationId], references: [id], onDelete: Cascade)
+  invoices BusinessInvoice[]
+
+  createdAt DateTime @default(now())
+
+  @@unique([locationId, label]) // no duplicate table labels within a location
+  @@index([locationId])
+}
+
+model BusinessInvoice {
+  id                 String        @id @default(uuid())
+  businessProfileId  String
+  locationId         String? // null = invoice not tied to a specific branch
+  tableId            String? // null = not a table-based invoice
+  customerId         Int // the Azaman user being billed
+  invoiceRef         String        @unique // e.g. "INV-260620-A3F2"
+  status             InvoiceStatus @default(DRAFT)
+  subtotalUsdc       Decimal       @db.Decimal(20, 8) // sum of lineItem totals
+  taxTotalUsdc       Decimal       @default(0.0) @db.Decimal(20, 8) // sum of all tax lines
+  tipUsdc            Decimal       @default(0.0) @db.Decimal(20, 8) // set at payment time
+  billTotalUsdc      Decimal       @db.Decimal(20, 8) // subtotal + taxTotal (pre-tip)
+  feeUsdc            Decimal       @default(0.0) @db.Decimal(20, 8) // snapshotted at payment
+  customerCoveredFee Boolean       @default(false) // did customer absorb the fee?
+  customerPaidUsdc   Decimal?      @db.Decimal(20, 8) // snapshotted at PAID — billTotal + tip + fee if covered
+  customerNote       String?       @db.VarChar(500) // optional note from customer at payment
+  businessNote       String?       @db.VarChar(500) // note from business at creation
+  sentAt             DateTime?
+  paidAt             DateTime?
+  voidedAt           DateTime?
+  payTxHash          String?       @unique // idempotency anchor — set at PAID
+
+  businessProfile BusinessProfile           @relation(fields: [businessProfileId], references: [id])
+  location        BusinessLocation?         @relation(fields: [locationId], references: [id])
+  table           BusinessTable?            @relation(fields: [tableId], references: [id])
+  customer        User                      @relation("InvoiceCustomer", fields: [customerId], references: [id])
+  lineItems       BusinessInvoiceLineItem[]
+  taxLines        BusinessInvoiceTaxLine[]
+  review          BusinessReview?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([businessProfileId])
+  @@index([businessProfileId, status])
+  @@index([customerId])
+  @@index([customerId, status])
+  @@index([status])
+}
+
+model BusinessInvoiceLineItem {
+  id          String  @id @default(uuid())
+  invoiceId   String
+  description String  @db.VarChar(200) // e.g. "Jollof Special", "1hr Web Dev"
+  quantity    Int     @default(1)
+  unitPrice   Decimal @db.Decimal(20, 8)
+  lineTotal   Decimal @db.Decimal(20, 8) // quantity * unitPrice, snapshotted at creation
+
+  invoice BusinessInvoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+
+  @@index([invoiceId])
+}
+
+model BusinessInvoiceTaxLine {
+  id             String      @id @default(uuid())
+  invoiceId      String
+  name           String      @db.VarChar(100) // e.g. "VAT", "NHIL", "Service Charge"
+  type           TaxLineType
+  value          Decimal     @db.Decimal(10, 4) // percent (15.0) or flat amount (5.00)
+  computedAmount Decimal     @db.Decimal(20, 8) // snapshotted at creation — never re-calc later
+
+  invoice BusinessInvoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+
+  @@index([invoiceId])
+}
+
+model BusinessReview {
+  id                String           @id @default(uuid())
+  businessProfileId String
+  locationId        String?
+  reviewerId        Int
+  rating            Int // 1–5 integer — validated in service
+  comment           String?          @db.VarChar(1000)
+  sourceType        ReviewSourceType
+  orderId           String?          @unique // one review per order
+  invoiceId         String?          @unique // one review per invoice
+
+  businessProfile BusinessProfile   @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+  location        BusinessLocation? @relation(fields: [locationId], references: [id])
+  reviewer        User              @relation("BusinessReviewer", fields: [reviewerId], references: [id])
+  order           BusinessOrder?    @relation(fields: [orderId], references: [id])
+  invoice         BusinessInvoice?  @relation(fields: [invoiceId], references: [id])
+
+  createdAt DateTime @default(now())
+
+  @@index([businessProfileId])
+  @@index([businessProfileId, createdAt(sort: Desc)])
 }
 
 // =============================================================================
@@ -2162,7 +2341,13 @@ model BusinessProduct {
   totalOrders       Int               @default(0)
   totalRevenue      Decimal           @default(0.0) @db.Decimal(20, 8)
 
-  businessProfile BusinessProfile @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+  // Discovery Sprint (2026-06-20): per-branch availability + delivery hints
+  locationId        String? // null = available at all branches
+  deliveryTerms     String? @db.VarChar(500) // e.g. 'Same day delivery'
+  estimatedDelivery String? @db.VarChar(100) // e.g. '2-3 days'
+
+  businessProfile BusinessProfile   @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+  location        BusinessLocation? @relation(fields: [locationId], references: [id])
   orders          BusinessOrder[]
 
   createdAt DateTime @default(now())
@@ -2204,6 +2389,7 @@ model BusinessOrder {
   product         BusinessProduct? @relation(fields: [productId], references: [id])
   escrow          SmartEscrow?     @relation(fields: [escrowId], references: [id])
   ticket          Ticket?          @relation(fields: [ticketId], references: [id])
+  review          BusinessReview?  // Discovery Sprint: one optional review per order
 
   @@index([businessProfileId])
   @@index([businessProfileId, status])

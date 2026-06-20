@@ -12,6 +12,7 @@ const profileController = require('../controllers/profileController');
 const identityController = require('../controllers/identityController');
 const milestoneController = require('../controllers/milestoneController');
 const securityLogController = require('../controllers/securityLogController');
+const businessInvoiceController = require('../controllers/businessInvoiceController');
 const authMiddleware = require('../middleware/authMiddleware.js');
 const avatarUpload = require('../middleware/avatarUploadMiddleware.js');
 const { strictLimiter } = require('../middleware/rateLimitMiddleware');
@@ -59,6 +60,11 @@ router.put('/preferences', protect, userPreferencesController.updateAll);
 // ─── MILESTONES & SECURITY LOGS ──────────────────────────────────────────────
 router.get('/me/milestones', protect, milestoneController.getMilestones);
 router.get('/me/security-logs', protect, securityLogController.getSecurityLogs);
+
+// ─── INCOMING INVOICES (Discovery Sprint 2026-06-20) ─────────────────────────
+// Customer-facing list of bills sent to this user by businesses.
+// Reachable at GET /api/users/invoices.
+router.get('/invoices', protect, businessInvoiceController.listMyInvoices);
 
 // ─── ACCOUNT MANAGEMENT ──────────────────────────────────────────────────────
 router.post('/delete', protect, userController.deleteAccount);

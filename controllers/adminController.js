@@ -751,7 +751,10 @@ exports.getPlatformStats = async (req, res) => {
             pendingWithdrawals,
             activeEscrows,
             disputedEscrows,
-            pendingBusinessKyb
+            pendingBusinessKyb,
+            activeInvoices,
+            paidInvoicesToday,
+            activeLocations
         ] = await Promise.all([
             // Total users
             prisma.user.count(),
@@ -794,7 +797,13 @@ exports.getPlatformStats = async (req, res) => {
             // Disputed escrows — escalated, awaiting/under admin ruling
             prisma.smartEscrow.count({ where: { status: { in: ['DISPUTED', 'ADMIN_REVIEW'] } } }),
             // Businesses awaiting KYB review
-            prisma.businessProfile.count({ where: { kybStatus: 'PENDING' } })
+            prisma.businessProfile.count({ where: { kybStatus: 'PENDING' } }),
+            // Discovery Sprint (2026-06-20): live invoices (sent or paid)
+            prisma.businessInvoice.count({ where: { status: { in: ['SENT', 'PAID'] } } }),
+            // Invoices paid today
+            prisma.businessInvoice.count({ where: { status: 'PAID', paidAt: { gte: today } } }),
+            // Active branch locations
+            prisma.businessLocation.count({ where: { isActive: true } })
         ]);
 
         const totalFiatVolume = volumeAllTime._sum.amountFiat || 0;
@@ -838,6 +847,11 @@ exports.getPlatformStats = async (req, res) => {
                 activeEscrows,
                 disputedEscrows,
                 pendingBusinessKyb,
+
+                // Discovery Sprint (2026-06-20): Invoices & Locations
+                activeInvoices,
+                paidInvoicesToday,
+                totalActiveLocations: activeLocations,
 
                 // Timestamps
                 generatedAt: now.toISOString()

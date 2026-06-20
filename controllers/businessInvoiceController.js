@@ -1,0 +1,215 @@
+// controllers/businessInvoiceController.js
+// =============================================================================
+// AZAMAN — BUSINESS INVOICE CONTROLLER (Discovery Sprint, 2026-06-20)
+//
+// HTTP layer for the instant-settlement invoice feature + customer reviews.
+// Socket emits and notifications fire via setImmediate AFTER the service's
+// $transaction commits — never inside it. Mirrors the escrow / peer-transfer
+// conventions: prisma/io/emitBalanceUpdate/notificationService from req.app.
+// =============================================================================
+'use strict';
+const invoiceSvc = require('../services/businessInvoiceService');
+const reviewSvc  = require('../services/businessReviewService');
+
+const _ownedProfile = async (prisma, userId) => {
+  const p = await prisma.businessProfile.findUnique({ where: { userId } });
+  if (!p) throw Object.assign(new Error('No business profile found.'), { status: 404 });
+  return p;
+};
+const _err = (res, err) => res.status(err.status || 400).json({ success: false, message: err.message });
+
+// POST /api/business/invoices — create a DRAFT invoice
+exports.createInvoice = async (req, res) => {
+  const prisma = req.app.get("prisma");
+  try {
+    const profile = await _ownedProfile(prisma, req.user.id);
+    const { customerId, locationId, tableId, lineItems, taxLines, businessNote } = req.body;
+    if (!customerId) return res.status(400).json({ success: false, message: "customerId required." });
+    const invoice = await invoiceSvc.createInvoice(prisma, {
+      businessProfileId: profile.id, customerId, locationId, tableId,
+      lineItems, taxLines, businessNote,
+    });
+    return res.status(201).json({ success: true, invoice });
+  } catch (err) { return _err(res, err); }
+};
+
+// GET /api/business/customers/lookup?azamanId=AZM-XXXXXX
+exports.lookupCustomer = async (req, res) => {
+  const prisma = req.app.get("prisma");
+  try {
+    await _ownedProfile(prisma, req.user.id); // must own a business to use this
+    const customer = await invoiceSvc.lookupCustomerByAzamanId(prisma, { azamanId: req.query.azamanId });
+    if (!customer) return res.status(404).json({ success: false, message: 'Customer not found.' });
+    return res.json({ success: true, customer });
+  } catch (err) { return _err(res, err); }
+};
+
+// GET /api/business/invoices — list this business's invoices (owner only)
+exports.listInvoices = async (req, res) => {
+  const prisma = req.app.get("prisma");
+  try {
+    const profile = await _ownedProfile(prisma, req.user.id);
+    const result = await invoiceSvc.listInvoicesForBusiness(prisma, {
+      businessProfileId: profile.id,
+      status: req.query.status,
+      limit: req.query.limit,
+      cursor: req.query.cursor,
+    });
+    return res.json({ success: true, ...result });
+  } catch (err) { return _err(res, err); }
+};
+
+// GET /api/business/invoices/:invoiceId
+exports.getInvoice = async (req, res) => {
+  const prisma = req.app.get("prisma");
+  try {
+    const invoice = await invoiceSvc.getInvoice(prisma, { invoiceId: req.params.invoiceId });
+    if (!invoice) return res.status(404).json({ success: false, message: 'Invoice not found.' });
+    // Authorize: only business owner or the customer
+    const profile = await prisma.businessProfile.findUnique({ where: { id: invoice.businessProfileId } });
+    if (invoice.customerId !== req.user.id && profile?.userId !== req.user.id) {
+      return res.status(403).json({ success: false, message: 'Not authorized.' });
+    }
+    return res.json({ success: true, invoice });
+  } catch (err) { return _err(res, err); }
+};
+
+// POST /api/business/invoices/:invoiceId/send
+exports.sendInvoice = async (req, res) => {
+  const prisma = req.app.get("prisma");
+  const io = req.app.get("socketio");
+  try {
+    const profile = await _ownedProfile(prisma, req.user.id);
+    const invoice = await invoiceSvc.sendInvoice(prisma, {
+      invoiceId: req.params.invoiceId, businessProfileId: profile.id,
+    });
+    // Fire-and-forget notifications AFTER transaction commits
+    setImmediate(() => {
+      try {
+        const notificationService = req.app.get("notificationService");
+        if (notificationService) {
+          notificationService.sendNotification({
+            userId: invoice.customerId,
+            title: '🧾 New Bill',
+            body: `${profile.businessName} sent you a bill for ${Number(invoice.billTotalUsdc).toFixed(2)} USDC`,
+            category: 'GENERAL',
+            actionPayload: { action: 'OPEN_INVOICE', invoiceId: invoice.id, route: `/bills/${invoice.id}` },
+          });
+        }
+        if (io) io.to(`user_${invoice.customerId}`).emit('invoice_received', {
+          invoiceId: invoice.id,
+          invoiceRef: invoice.invoiceRef,
+          businessName: profile.businessName,
+          billTotalUsdc: Number(invoice.billTotalUsdc),
+        });
+      } catch (e) { console.error("[invoice/send] notification error:", e.message); }
+    });
+    return res.json({ success: true, invoice });
+  } catch (err) { return _err(res, err); }
+};
+
+// POST /api/business/invoices/:invoiceId/void
+exports.voidInvoice = async (req, res) => {
+  const prisma = req.app.get("prisma");
+  const io = req.app.get("socketio");
+  try {
+    const profile = await _ownedProfile(prisma, req.user.id);
+    const invoice = await invoiceSvc.voidInvoice(prisma, {
+      invoiceId: req.params.invoiceId, businessProfileId: profile.id,
+    });
+    setImmediate(() => {
+      if (io) io.to(`user_${invoice.customerId}`).emit('invoice_voided', { invoiceId: invoice.id });
+    });
+    return res.json({ success: true, invoice });
+  } catch (err) { return _err(res, err); }
+};
+
+// POST /api/business/invoices/:invoiceId/pay  (CUSTOMER pays — auth = customer)
+exports.payInvoice = async (req, res) => {
+  const prisma = req.app.get("prisma");
+  const io = req.app.get("socketio");
+  const emitBalanceUpdate = req.app.get("emitBalanceUpdate");
+  try {
+    const { tipUsdc, customerNote, customerCoveredFee } = req.body;
+    const { invoice, customerPays, businessReceives, fee, alreadyPaid } = await invoiceSvc.payInvoice(prisma, {
+      invoiceId: req.params.invoiceId, customerId: req.user.id,
+      tipUsdc, customerNote, customerCoveredFee,
+    });
+    // ── IDEMPOTENT REPLAY ───────────────────────────────────────────────────
+    // payTxHash was already set — no money moved this call. Skip all
+    // notifications, socket emits, and balance updates (businessReceives/fee
+    // are undefined here anyway) and return the existing paid invoice silently.
+    if (alreadyPaid) {
+      return res.json({ success: true, invoice, customerPays, alreadyPaid: true });
+    }
+    const bizOwnerId = invoice.businessProfile?.userId ?? null;
+    setImmediate(() => {
+      try {
+        // Real-time balance update to both parties
+        if (emitBalanceUpdate) {
+          emitBalanceUpdate(req.user.id);
+          if (bizOwnerId) emitBalanceUpdate(bizOwnerId);
+        }
+        // Notify business of payment
+        const notificationService = req.app.get("notificationService");
+        if (notificationService && bizOwnerId) {
+          notificationService.sendNotification({
+            userId: bizOwnerId,
+            title: '💰 Invoice Paid',
+            body: `${invoice.businessProfile.businessName}: Invoice ${invoice.invoiceRef} paid — you received ${Number(businessReceives).toFixed(2)} USDC`,
+            category: 'GENERAL',
+            actionPayload: { action: 'OPEN_INVOICE', invoiceId: invoice.id, route: `/business/invoices/${invoice.id}` },
+          });
+        }
+        if (io && bizOwnerId) io.to(`user_${bizOwnerId}`).emit('invoice_paid', {
+          invoiceId: invoice.id, invoiceRef: invoice.invoiceRef,
+          customerPaidUsdc: customerPays, businessReceives, fee,
+        });
+      } catch (e) { console.error("[invoice/pay] notification error:", e.message); }
+    });
+    return res.json({ success: true, invoice, customerPays, businessReceives, fee });
+  } catch (err) {
+    if (err.message === 'INSUFFICIENT_FUNDS') {
+      return res.status(402).json({ success: false, message: 'Insufficient balance to pay this invoice.' });
+    }
+    return _err(res, err);
+  }
+};
+
+// GET /api/users/invoices — customer's own incoming invoices
+exports.listMyInvoices = async (req, res) => {
+  const prisma = req.app.get("prisma");
+  try {
+    const result = await invoiceSvc.listInvoicesForCustomer(prisma, {
+      customerId: req.user.id, status: req.query.status,
+      limit: req.query.limit, cursor: req.query.cursor,
+    });
+    return res.json({ success: true, ...result });
+  } catch (err) { return _err(res, err); }
+};
+
+// POST /api/business/reviews — customer posts a review
+exports.createReview = async (req, res) => {
+  const prisma = req.app.get("prisma");
+  try {
+    const { businessProfileId, locationId, rating, comment, sourceType, orderId, invoiceId } = req.body;
+    const review = await reviewSvc.createReview(prisma, {
+      businessProfileId, locationId, reviewerId: req.user.id,
+      rating, comment, sourceType, orderId, invoiceId,
+    });
+    return res.status(201).json({ success: true, review });
+  } catch (err) { return _err(res, err); }
+};
+
+// GET /api/business/:bizId/reviews — public listing
+exports.listReviews = async (req, res) => {
+  const prisma = req.app.get("prisma");
+  try {
+    const biz = await prisma.businessProfile.findUnique({ where: { bizId: req.params.bizId } });
+    if (!biz || biz.isSuspended) return res.status(404).json({ success: false, message: 'Business not found.' });
+    const result = await reviewSvc.listReviews(prisma, {
+      businessProfileId: biz.id, limit: req.query.limit, cursor: req.query.cursor,
+    });
+    return res.json({ success: true, ...result });
+  } catch (err) { return _err(res, err); }
+};

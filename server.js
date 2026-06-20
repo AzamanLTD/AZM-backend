@@ -554,11 +554,15 @@ const { autoRelease } = require('./infra/autoRelease');
     };
 
     try {
-        // Always run the boot release (installer converges schema; seed is
+        // Run the boot release (installer converges schema; seed is
         // internally gated on treasury-missing). This lands additive
         // columns/tables on every deploy without prisma migrate (prod Neon
         // is db push-managed behind a pooler — see infra/autoRelease.js).
-        await autoRelease(prisma);
+        // Skipped under test: CI applies the schema via `prisma db push`, and
+        // booting auth.test.js must not trigger the installer/seed path.
+        if (process.env.NODE_ENV !== 'test') {
+            await autoRelease(prisma);
+        }
 
         // Resolve + cache the treasury id (seeded by autoRelease if it was
         // missing).
