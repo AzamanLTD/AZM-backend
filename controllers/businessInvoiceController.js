@@ -14,6 +14,12 @@ const reviewSvc  = require('../services/businessReviewService');
 const _ownedProfile = async (prisma, userId) => {
   const p = await prisma.businessProfile.findUnique({ where: { userId } });
   if (!p) throw Object.assign(new Error('No business profile found.'), { status: 404 });
+  if (p.isSuspended) {
+    throw Object.assign(
+      new Error('Your business account is suspended. Contact support.'),
+      { status: 403 }
+    );
+  }
   return p;
 };
 const _err = (res, err) => res.status(err.status || 400).json({ success: false, message: err.message });
