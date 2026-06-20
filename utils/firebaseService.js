@@ -35,10 +35,13 @@ try {
         console.log("🔥 Firebase Admin SDK Initialized Successfully");
     }
 } catch (error) {
-    console.error("⚠️ FIREBASE INIT WARNING: Could not load Firebase credentials.");
-    console.error("   Push notifications will be disabled until credentials are provided.");
-    console.error("   Options: set FIREBASE_SERVICE_ACCOUNT_BASE64 env var, or place service-account.json in project root.");
-    console.error("   Error details:", error.message);
+    // Under test, a missing service-account is expected — log at warn level so
+    // CI output isn't polluted with error-level noise. Elsewhere keep it loud.
+    const log = process.env.NODE_ENV === 'test' ? console.warn : console.error;
+    log("⚠️ FIREBASE INIT WARNING: Could not load Firebase credentials.");
+    log("   Push notifications will be disabled until credentials are provided.");
+    log("   Options: set FIREBASE_SERVICE_ACCOUNT_BASE64 env var, or place service-account.json in project root.");
+    log("   Error details:", error.message);
 }
 
 /**
