@@ -99,7 +99,7 @@ const getBusinessProfile = async (prisma, { bizId, userId }) => {
 const searchBusinesses = async (prisma, { query, category, verified, limit, cursor }) => {
     const take = Math.min(Math.max(parseInt(limit, 10) || 20, 1), 50);
 
-    const where = {};
+    const where = { isSuspended: false }; // CRITICAL: never show suspended businesses publicly
     if (query) {
         where.OR = [
             { businessName: { contains: query, mode: 'insensitive' } },

@@ -20,6 +20,8 @@ const productCtrl = require('../controllers/businessProductController');
 const orderCtrl   = require('../controllers/businessOrderController');
 const kybCtrl     = require('../controllers/businessKybController');
 const notifCtrl   = require('../controllers/bizNotificationController');
+const locationCtrl = require('../controllers/businessLocationController');
+const invoiceCtrl  = require('../controllers/businessInvoiceController');
 
 // Existing business account routes (unchanged)
 router.post('/register', protectActive, ctrl.registerBusiness);
@@ -52,6 +54,37 @@ router.get('/notifications',              protect, notifCtrl.getNotifications);
 router.get('/notifications/unread-count', protect, notifCtrl.getUnreadCount);
 router.post('/notifications/read-all',    protect, notifCtrl.markAllAsRead);
 router.post('/notifications/read/:id',    protect, notifCtrl.markAsRead);
+
+// =============================================================================
+// DISCOVERY SPRINT (2026-06-20) — Locations, Tables, Invoices, Reviews
+// All registered BEFORE the /:bizId catch-all below. Single-segment static
+// paths (/locations, /invoices, /reviews, /customers/lookup, /search/nearby)
+// MUST precede /:bizId or Express would match them as a bizId.
+// =============================================================================
+
+// ── LOCATION ROUTES ──────────────────────────────────────────────────────────
+router.get('/search/nearby',                          locationCtrl.searchNearby);   // public
+router.post('/locations',                  protect, protectActive, locationCtrl.createLocation);
+router.get('/locations',                   protect,                locationCtrl.listMyLocations);
+router.patch('/locations/:locationId',     protect, protectActive, locationCtrl.updateLocation);
+router.delete('/locations/:locationId',    protect, protectActive, locationCtrl.deleteLocation);
+router.post('/locations/:locationId/tables', protect, protectActive, locationCtrl.createTable);
+router.get('/locations/:locationId/tables',  protect,              locationCtrl.listTables);
+router.delete('/tables/:tableId',          protect, protectActive, locationCtrl.deleteTable);
+router.get('/:bizId/locations',                       locationCtrl.getPublicLocations); // public
+
+// ── INVOICE ROUTES ────────────────────────────────────────────────────────────
+router.get('/customers/lookup',            protect,                invoiceCtrl.lookupCustomer);
+router.post('/invoices',                   protect, protectActive, invoiceCtrl.createInvoice);
+router.get('/invoices',                    protect,                invoiceCtrl.listInvoices);
+router.get('/invoices/:invoiceId',         protect,                invoiceCtrl.getInvoice);
+router.post('/invoices/:invoiceId/send',   protect, protectActive, invoiceCtrl.sendInvoice);
+router.post('/invoices/:invoiceId/void',   protect, protectActive, invoiceCtrl.voidInvoice);
+router.post('/invoices/:invoiceId/pay',    protect, protectActive, invoiceCtrl.payInvoice);
+
+// ── REVIEW ROUTES ─────────────────────────────────────────────────────────────
+router.post('/reviews',                    protect, protectActive, invoiceCtrl.createReview);
+router.get('/:bizId/reviews',                         invoiceCtrl.listReviews);      // public
 
 // Public business profile lookup — MUST be last
 router.get('/:bizId', ctrl.getBusinessByBizId);
