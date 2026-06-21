@@ -72,6 +72,7 @@ router.post('/locations/:locationId/tables', protect, protectActive, locationCtr
 router.get('/locations/:locationId/tables',  protect,              locationCtrl.listTables);
 router.delete('/tables/:tableId',          protect, protectActive, locationCtrl.deleteTable);
 router.get('/:bizId/locations',                       locationCtrl.getPublicLocations); // public
+router.get('/:bizId/products',                        productCtrl.listProductsByBizId); // public
 
 // ── INVOICE ROUTES ────────────────────────────────────────────────────────────
 router.get('/customers/lookup',            protect,                invoiceCtrl.lookupCustomer);

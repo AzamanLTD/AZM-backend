@@ -1218,6 +1218,39 @@ app.post('/api/chat/upload/document', protectChatUpload, chatDocumentUpload.sing
     }
 });
 
+// ── BUSINESS IMAGE UPLOAD ─────────────────────────────────────────────────────
+// Business image upload — uses the same multer memoryStorage + Cloudinary
+// pipeline as chat media, but routes files to azaman/business/ folders.
+const { protect: protectBizUpload } = require('./middleware/authMiddleware');
+
+// POST /api/business/upload/image — uploads to azaman/business/products/
+// Used by the Add Product image picker and business logo upload.
+// The ?folder= query param selects the destination:
+//   ?folder=products  → azaman/business/products/  (default)
+//   ?folder=logos     → azaman/business/logos/
+//   ?folder=kyb       → azaman/business/kyb/
+// Returns: { success, url, mimeType, size, filename }
+app.post('/api/business/upload/image', protectBizUpload, chatImageUpload.single('file'), async (req, res) => {
+    if (!req.file) return res.status(400).json({ success: false, message: 'No file uploaded' });
+    try {
+        const folder = req.query.folder === 'logos' ? 'business/logos'
+                     : req.query.folder === 'kyb'   ? 'business/kyb'
+                     : 'business/products';
+
+        const { url } = await uploadChatMedia(req.file, folder);
+        res.status(200).json({
+            success: true,
+            url,
+            mimeType: req.file.mimetype,
+            size: req.file.size,
+            filename: req.file.originalname
+        });
+    } catch (err) {
+        console.error('business image upload error:', err.message);
+        res.status(500).json({ success: false, message: 'Upload failed' });
+    }
+});
+
 // POST /api/chat/link-preview — { url } -> { url, title, description, image, favicon, siteName, status }
 const LinkPreviewService = require('./services/linkPreviewService');
 const linkPreviewService = new LinkPreviewService(prisma);
