@@ -16,6 +16,7 @@
 // =============================================================================
 
 const gamification = require('./vendorGamificationService');
+const { calculateFeeSplit } = require('../utils/feeMath');
 
 // ── Constants ────────────────────────────────────────────────────────────────
 const STRIKE_BAN_THRESHOLD   = 3;          // strikes before auto-ban
@@ -612,7 +613,6 @@ const completeTrade = async (prisma, { tradeId, releasedByUserId }) => {
 
     // ── Phase F2: Flat USDC fee arithmetic (no GHS oracle math) ───────────
     // P2P trades are USDC↔USD (1:1 parity). Fee is a flat % of amountCrypto.
-    const totalFeeUsdc = parseFloat((trade.amountCrypto * effectiveFeePct).toFixed(6));
 
     // Phase ADMIN-CONTROL: Read tier threshold and splits from GlobalSettings
     const tierThreshold = Number(settings?.tierThreshold ?? FALLBACK_TIER_THRESHOLD);
@@ -623,11 +623,11 @@ const completeTrade = async (prisma, { tradeId, releasedByUserId }) => {
         : (1 - Number(settings?.vendorShareUnder1k ?? (1 - FALLBACK_UNDER_1K_ADMIN_PCT))));
     const vendorPct = feeProfile.vendorSplitPct || (1 - adminPct);
 
-    const adminCutUsdc  = parseFloat((totalFeeUsdc * adminPct).toFixed(6));
-    const vendorCutUsdc = parseFloat((totalFeeUsdc * vendorPct).toFixed(6));
-
-    // Net USDC the counterparty receives after fee deduction
-    const netUsdc = parseFloat((trade.amountCrypto - totalFeeUsdc).toFixed(6));
+    // Fee split via the shared util (utils/feeMath) — the single source of truth
+    // also used by __tests__/math.test.js. vendorPct is passed explicitly so a
+    // fee profile's vendorSplitPct is honoured exactly as the inline math did.
+    const { totalFeeUsdc, adminCutUsdc, vendorCutUsdc, netUsdc } =
+        calculateFeeSplit(trade.amountCrypto, effectiveFeePct, adminPct, vendorPct);
 
     const result = await prisma.$transaction(async (tx) => {
         // Phase H8 BUGFIX (2026-05-27): atomic conditional status flip.

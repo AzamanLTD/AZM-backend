@@ -14,15 +14,11 @@
 // the service and this test import. Until then, this guards the contract.
 // =============================================================================
 
-// Mirror of services/p2p.service.js fee arithmetic. Keep in sync with prod.
-function calculateFeeSplit(amountCrypto, feePct, adminPct) {
-    const vendorPct = 1 - adminPct;
-    const totalFeeUsdc = parseFloat((amountCrypto * feePct).toFixed(6));
-    const adminCutUsdc = parseFloat((totalFeeUsdc * adminPct).toFixed(6));
-    const vendorCutUsdc = parseFloat((totalFeeUsdc * vendorPct).toFixed(6));
-    const netUsdc = parseFloat((amountCrypto - totalFeeUsdc).toFixed(6));
-    return { totalFeeUsdc, adminCutUsdc, vendorCutUsdc, netUsdc };
-}
+// Fee arithmetic now lives in a shared util imported by BOTH this test and
+// services/p2p.service.js (completeTrade) — the single source of truth this
+// suite's header asked for. Called with three args, vendorPct defaults to
+// (1 - adminPct), exactly matching the original inline mirror.
+const { calculateFeeSplit } = require('../utils/feeMath');
 
 // Tolerance: USDC settles to 6 dp, so a half-unit of the last place is the most
 // rounding can ever move a single split. We assert drift stays under that.

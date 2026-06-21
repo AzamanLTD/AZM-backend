@@ -9,11 +9,13 @@ const router = require('express').Router();
 const ctrl = require('../controllers/escrowController');
 const { protect } = require('../middleware/authMiddleware');
 const { protectActive } = require('../middleware/banGuardMiddleware');
+const { validate } = require('../middleware/validate');
+const { fundEscrowSchema, raiseDisputeSchema } = require('../services/validation/financialSchemas');
 
 router.get('/ticket/:ticketId', protect, ctrl.getEscrowForTicket);
-router.post('/fund', protectActive, ctrl.fundEscrow);
+router.post('/fund', protectActive, validate(fundEscrowSchema), ctrl.fundEscrow);
 router.post('/satisfy', protectActive, ctrl.markSatisfied);
-router.post('/dispute', protectActive, ctrl.raiseDispute);
+router.post('/dispute', protectActive, validate(raiseDisputeSchema), ctrl.raiseDispute);
 router.post('/update-terms', protect, ctrl.updateTerms);
 router.post('/cancel', protectActive, ctrl.cancelEscrow);
 

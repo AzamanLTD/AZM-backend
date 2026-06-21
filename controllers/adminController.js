@@ -1,6 +1,7 @@
 // controllers/adminController.js
 const { sendPushNotification } = require('../utils/firebaseService');
 const { parsePagination, buildPageEnvelope } = require('../utils/pagination');
+const { audit } = require('../utils/audit');
 
 /**
  * Helper: retrieve the singleton NotificationService from app context.
@@ -233,6 +234,14 @@ exports.forceRelease = async (req, res) => {
         io.to(`user_${trade.vendorId}`).emit('new_notification', { title: 'Trade Resolved by Admin' });
 
         res.status(200).json({ success: true, message: 'Force Release Successful.', data: result });
+
+        // Append-only audit trail (fire-and-forget — never fails the request).
+        await audit(prisma, {
+            actorId: req.user.id, actorName: req.user.username,
+            action: 'FORCE_RELEASE_TRADE', targetType: 'TRADE', targetId: String(tradeId),
+            metadata: { adminNotes: adminNotes || null, previousStatus: 'DISPUTED' },
+            ipAddress: req.ip,
+        });
     } catch (error) {
         console.error("Force Release Error:", error);
         res.status(500).json({ success: false, message: error.message });
@@ -335,6 +344,14 @@ exports.forceCancel = async (req, res) => {
         io.to(`user_${trade.vendorId}`).emit('new_notification', { title: 'Trade Resolved — Assets Returned' });
 
         res.status(200).json({ success: true, message: 'Force Cancel Successful.' });
+
+        // Append-only audit trail (fire-and-forget — never fails the request).
+        await audit(prisma, {
+            actorId: req.user.id, actorName: req.user.username,
+            action: 'FORCE_CANCEL_TRADE', targetType: 'TRADE', targetId: String(tradeId),
+            metadata: { adminNotes: adminNotes || null, previousStatus: 'DISPUTED' },
+            ipAddress: req.ip,
+        });
     } catch (error) {
         // Phase H9: another concurrent admin already finalized this
         // trade. Surface a 409 so the FE can refresh and show the new
@@ -533,6 +550,14 @@ exports.approveKyc = async (req, res) => {
         });
 
         res.status(200).json({ success: true, message: "KYC approved. User promoted to Vendor." });
+
+        // Append-only audit trail (fire-and-forget — never fails the request).
+        await audit(prisma, {
+            actorId: req.user.id, actorName: req.user.username,
+            action: 'APPROVE_KYC', targetType: 'USER', targetId: String(targetId),
+            metadata: { previousStatus: 'PENDING', newStatus: 'VERIFIED', newRole: 'VENDOR' },
+            ipAddress: req.ip,
+        });
     } catch (error) {
         console.error("Approve KYC Error:", error);
         res.status(500).json({ success: false, message: error.message });
@@ -579,6 +604,14 @@ exports.rejectKyc = async (req, res) => {
         io.to(`user_${userId}`).emit('kyc_update', { status: 'REJECTED' });
 
         res.status(200).json({ success: true, message: "KYC rejected." });
+
+        // Append-only audit trail (fire-and-forget — never fails the request).
+        await audit(prisma, {
+            actorId: req.user.id, actorName: req.user.username,
+            action: 'REJECT_KYC', targetType: 'USER', targetId: String(userId),
+            metadata: { previousStatus: 'PENDING', newStatus: 'REJECTED', reason: reason || null },
+            ipAddress: req.ip,
+        });
     } catch (error) {
         console.error("Reject KYC Error:", error);
         res.status(500).json({ success: false, message: error.message });
@@ -699,6 +732,14 @@ exports.liquidateProfits = async (req, res) => {
         } catch (socketErr) {
             console.error('[liquidateProfits] Failed to emit socket alert:', socketErr.message);
         }
+
+        // Append-only audit trail (fire-and-forget — never fails the request).
+        await audit(prisma, {
+            actorId: req.user.id, actorName: req.user.username,
+            action: 'LIQUIDATE_PROFITS', targetType: 'SYSTEM', targetId: null,
+            metadata: { amountUsdc: amountUsdc || null, amountLiquidated: data.amountLiquidated },
+            ipAddress: req.ip,
+        });
 
         return res.status(200).json({
             success: true,
@@ -1151,6 +1192,15 @@ exports.banUser = async (req, res) => {
             }
         }
 
+        // Append-only audit trail (fire-and-forget — never fails the request).
+        await audit(prisma, {
+            actorId: req.user.id, actorName: req.user.username,
+            action: action === 'UNBAN' ? 'UNBAN_USER' : 'BAN_USER',
+            targetType: 'USER', targetId: String(userId),
+            metadata: { banAction: action, reason: reason || null, banStatus, banUntil },
+            ipAddress: req.ip,
+        });
+
         return res.status(200).json({
             success: true,
             message: action === 'UNBAN'
@@ -1413,6 +1463,14 @@ exports.approveWithdrawal = async (req, res) => {
             message: 'Your withdrawal has been approved.'
         });
 
+        // Append-only audit trail (fire-and-forget — never fails the request).
+        await audit(prisma, {
+            actorId: req.user.id, actorName: req.user.username,
+            action: 'APPROVE_WITHDRAWAL', targetType: 'WITHDRAWAL', targetId: String(withdrawalId),
+            metadata: { previousStatus: 'PENDING', userId: withdrawal.userId, amount: withdrawal.amount, adminNotes: adminNotes || null },
+            ipAddress: req.ip,
+        });
+
         return res.status(200).json({
             success: true,
             message: `Withdrawal #${withdrawalId} approved.`,
@@ -1492,6 +1550,14 @@ exports.rejectWithdrawal = async (req, res) => {
             status: 'REJECTED',
             reason,
             message: 'Your withdrawal was rejected. Funds returned.'
+        });
+
+        // Append-only audit trail (fire-and-forget — never fails the request).
+        await audit(prisma, {
+            actorId: req.user.id, actorName: req.user.username,
+            action: 'REJECT_WITHDRAWAL', targetType: 'WITHDRAWAL', targetId: String(withdrawalId),
+            metadata: { previousStatus: 'PENDING', userId: withdrawal.userId, amount: withdrawal.amount, reason: reason || null },
+            ipAddress: req.ip,
         });
 
         return res.status(200).json({
@@ -2005,9 +2071,51 @@ exports.resolveEscrowDispute = async (req, res) => {
             });
         }
 
+        // Append-only audit trail (fire-and-forget — never fails the request).
+        await audit(prisma, {
+            actorId: req.user.id, actorName: req.user.username,
+            action: 'RESOLVE_ESCROW_DISPUTE', targetType: 'ESCROW', targetId: String(dispute.escrowId),
+            metadata: { disputeId: id, ruling, rulingNotes: rulingNotes || null, payerPct: payerPct ?? null, payeePct: payeePct ?? null },
+            ipAddress: req.ip,
+        });
+
         return res.status(200).json({ success: true, escrow: result.escrow, dispute: result.dispute });
     } catch (error) {
         console.error('[resolveEscrowDispute] error:', error.message);
         return res.status(500).json({ success: false, message: error.message });
+    }
+};
+
+// =============================================================================
+// GENERAL AUDIT LOG — paginated read of the append-only AuditLog (utils/audit).
+// Exposed at GET /api/admin/audit-log/general (the bare /audit-log path is
+// already taken by the settings audit log → adminSettingsController.getAuditLog).
+// Filters: ?page=&limit=&action=&targetType=&actorId=
+// =============================================================================
+exports.getAuditLog = async (req, res) => {
+    const prisma = req.app.get('prisma');
+    try {
+        const page  = Math.max(1, parseInt(req.query.page)  || 1);
+        const limit = Math.min(100, parseInt(req.query.limit) || 50);
+        const skip  = (page - 1) * limit;
+
+        const where = {};
+        if (req.query.action)     where.action     = req.query.action;
+        if (req.query.targetType) where.targetType = req.query.targetType;
+        if (req.query.actorId)    where.actorId    = parseInt(req.query.actorId);
+
+        const [rows, total] = await Promise.all([
+            prisma.auditLog.findMany({ where, orderBy: { createdAt: 'desc' }, skip, take: limit }),
+            prisma.auditLog.count({ where }),
+        ]);
+
+        return res.status(200).json({
+            success: true,
+            auditLog: rows,
+            pagination: { page, limit, total, totalPages: Math.ceil(total / limit), hasNext: page * limit < total },
+        });
+    } catch (err) {
+        console.error('[getAuditLog]', err.message);
+        return res.status(500).json({ success: false, message: err.message });
     }
 };
