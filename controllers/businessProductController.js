@@ -155,3 +155,41 @@ exports.deleteProduct = async (req, res) => {
         return res.status(400).json({ success: false, message: err.message });
     }
 };
+
+// =============================================================================
+// PUBLIC — List products by business bizId (for marketplace profile page).
+// Returns only active products. No auth required.
+// =============================================================================
+exports.listProductsByBizId = async (req, res) => {
+    const prisma = req.app.get('prisma');
+    try {
+        const { bizId } = req.params;
+
+        // Look up the business profile by bizId
+        const biz = await prisma.businessProfile.findUnique({
+            where: { bizId },
+            select: { id: true, isSuspended: true }
+        });
+
+        if (!biz || biz.isSuspended) {
+            return res.status(404).json({ success: false, message: 'Business not found.' });
+        }
+
+        // Parse pagination params
+        const { limit, cursor } = req.query;
+
+        // Reuse the existing listProducts service — it already handles
+        // cursor pagination and the take+1 overflow pattern.
+        const result = await businessProductService.listProducts(prisma, {
+            businessProfileId: biz.id,
+            isActive: true,   // public visitors only see active products
+            limit,
+            cursor
+        });
+
+        return res.status(200).json({ success: true, ...result });
+    } catch (err) {
+        console.error('[listProductsByBizId] error:', err.message);
+        return res.status(400).json({ success: false, message: err.message });
+    }
+};
