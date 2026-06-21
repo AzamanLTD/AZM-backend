@@ -12,6 +12,13 @@ const express = require('express');
 const router = express.Router();
 const adminController = require('../controllers/adminController');
 const { protect, adminOnly } = require('../middleware/authMiddleware');
+const { validate } = require('../middleware/validate');
+const {
+    approveKycSchema,
+    rejectKycSchema,
+    banUserSchema,
+    forceReleaseSchema,
+} = require('../services/validation/financialSchemas');
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // SECURITY: ALL admin routes require BOTH protect + adminOnly
@@ -27,18 +34,18 @@ router.get('/profit-breakdown', adminController.getProfitBreakdown);
 // ─── TRADE OVERSIGHT ─────────────────────────────────────────────────────────
 router.get('/trades/live', adminController.getLiveTrades);
 router.get('/disputes', adminController.getAllDisputes);
-router.post('/disputes/force-release', adminController.forceRelease);
+router.post('/disputes/force-release', validate(forceReleaseSchema), adminController.forceRelease);
 router.post('/disputes/force-cancel', adminController.forceCancel);
 
 // ─── USER MANAGEMENT ─────────────────────────────────────────────────────────
 router.get('/users', adminController.getUsers);
-router.post('/users/:id/ban', adminController.banUser);
+router.post('/users/:id/ban', validate(banUserSchema), adminController.banUser);
 router.post('/users/:id/role', adminController.changeUserRole);
 
 // ─── KYC MANAGEMENT ──────────────────────────────────────────────────────────
 router.get('/kyc/pending', adminController.getPendingKyc);
-router.post('/kyc/approve', adminController.approveKyc);
-router.post('/kyc/reject', adminController.rejectKyc);
+router.post('/kyc/approve', validate(approveKycSchema), adminController.approveKyc);
+router.post('/kyc/reject', validate(rejectKycSchema), adminController.rejectKyc);
 
 // ─── WITHDRAWAL MANAGEMENT ───────────────────────────────────────────────────
 router.get('/withdrawals/pending', adminController.getPendingWithdrawals);
@@ -351,5 +358,12 @@ const businessAdminCtrl = require('../controllers/businessAdminController');
 router.get('/businesses',                    businessAdminCtrl.getBusinesses);
 router.post('/businesses/:bizId/suspend',    businessAdminCtrl.suspendBusiness);
 router.post('/businesses/:bizId/unsuspend',  businessAdminCtrl.unsuspendBusiness);
+
+// ─── GENERAL AUDIT LOG (append-only ledger of privileged actions) ────────────
+// NOTE: the bare GET /audit-log path above maps to the settings-change log
+// (adminSettingsController.getAuditLog). This distinct path serves the general
+// AuditLog model written by utils/audit.js. protect + adminOnly applied globally.
+// GET /api/admin/audit-log/general?page=1&limit=50&action=APPROVE_KYC&targetType=USER
+router.get('/audit-log/general', adminController.getAuditLog);
 
 module.exports = router;

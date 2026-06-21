@@ -19,9 +19,11 @@ const express              = require('express');
 const router               = express.Router();
 const depositController    = require('../controllers/depositController');
 const { protectActive }    = require('../middleware/banGuardMiddleware');
+const { validate }         = require('../middleware/validate');
+const { initiateFiatDepositSchema } = require('../services/validation/financialSchemas');
 
 // 1. Initiate Local Fiat Deposit (creates PENDING TransactionHistory)
-router.post('/fiat/initiate',  protectActive, depositController.initiateLocalFiatDeposit);
+router.post('/fiat/initiate',  protectActive, validate(initiateFiatDepositSchema), depositController.initiateLocalFiatDeposit);
 
 // 2. Local Fiat Deposit Webhook (no JWT — secured by X-Azaman-Webhook-Secret)
 router.post('/fiat/webhook',   depositController.localFiatDepositWebhook);

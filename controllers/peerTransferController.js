@@ -528,7 +528,10 @@ exports.fulfillTransferRequest = async (req, res) => {
             });
 
             if (!payer) throw new Error('User not found.');
-            if (payer.availableBalance < transferAmount) {
+            // NOTE: both operands are Prisma Decimal objects; a bare `<` would
+            // compare them lexicographically as strings (e.g. "300" < "75" is
+            // true), falsely rejecting valid requests. Compare numerically.
+            if (Number(payer.availableBalance) < Number(transferAmount)) {
                 throw new Error('INSUFFICIENT_FUNDS');
             }
 

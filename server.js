@@ -262,6 +262,14 @@ const server = http.createServer(app);
 // 3. MIDDLEWARES
 // ══════════════════════════════════════════════════════════════════════════════
 
+// HTTP access logging (morgan). "combined" = IP, method, path, status,
+// response-time — enough to debug most production issues from the Render log
+// stream. Skipped under NODE_ENV=test to keep test output clean.
+const morgan = require('morgan');
+if (process.env.NODE_ENV !== 'test') {
+    app.use(morgan('combined'));
+}
+
 // HIGH-1: Security headers (helmet-equivalent without dependency)
 app.use((req, res, next) => {
     res.setHeader('X-Content-Type-Options', 'nosniff');

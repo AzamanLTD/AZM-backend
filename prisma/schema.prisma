@@ -1270,6 +1270,31 @@ model AdminFeeProfile {
 }
 
 // =============================================================================
+// GENERAL AUDIT LOG — Append-only ledger for ALL privileged admin/financial
+// actions (KYC approve/reject, ban, force-release/cancel, withdrawal
+// approve/reject, escrow dispute resolve, profit liquidation, ...).
+//
+// NEVER add update or delete operations on this model. Rows are written once,
+// via utils/audit.js, and only ever read back. This is the compliance trail.
+// =============================================================================
+model AuditLog {
+  id         String   @id @default(uuid())
+  actorId    Int? // Admin userId (null = system/worker)
+  actorName  String? // Username snapshot
+  action     String // e.g. APPROVE_KYC, FORCE_RELEASE_TRADE
+  targetType String // e.g. USER, TRADE, ESCROW, WITHDRAWAL, SYSTEM
+  targetId   String? // ID of the affected record
+  metadata   Json     @default("{}") // Context snapshot
+  ipAddress  String?
+  createdAt  DateTime @default(now())
+
+  @@index([actorId])
+  @@index([action])
+  @@index([targetType, targetId])
+  @@index([createdAt(sort: Desc)])
+}
+
+// =============================================================================
 // ADMIN SETTINGS AUDIT LOG — Tracks every financial parameter change
 // =============================================================================
 model AdminSettingsAuditLog {
