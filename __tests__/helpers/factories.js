@@ -199,6 +199,77 @@ async function seedEscrowTicket(prisma, escrowStatus = 'FUNDED', overrides = {})
     return { payer, payee, friendship, ticket, escrow };
 }
 
+// ── Savings + AZM factories (Backend Completion Sprint, 2026-06-22) ───────────
+// Adapted to the ACTUAL prisma/schema.prisma, NOT the design-doc shapes:
+//   • SavingsGoal requires only targetAmountGhs + frequencyAmount; the lock
+//     semantics are isLocked (bool) + endDate (maturity), NOT the doc's
+//     `lockUntil`. The penalty field is earlyWithdrawalPenalty (default 0.02).
+//     status/streak/missed columns all default, so we set only what tests read.
+//   • There is NO AzmEarnLog model — the reward audit table is AzmRewardLog
+//     (fields amount/reason/source/balanceAfter). azmBalance lives on User and
+//     is independent of the USDC balances.
+
+/**
+ * seedSavingsGoal — create a user + an ACTIVE savings goal.
+ * @param {PrismaClient} prisma
+ * @param {object} overrides
+ *   user: overrides forwarded to seedUser (e.g. { availableBalance: 300 })
+ *   goal: overrides forwarded to savingsGoal.create. Lock/maturity is expressed
+ *         with isLocked (bool) + endDate (a past endDate → matured → no penalty;
+ *         a future/null endDate while isLocked → early withdrawal → penalty).
+ * @returns {{ user, goal }}
+ */
+async function seedSavingsGoal(prisma, overrides = {}) {
+    const user = await seedUser(prisma, overrides.user || { availableBalance: 500 });
+    const id = _uniq();
+    const g = overrides.goal || {};
+    const goal = await prisma.savingsGoal.create({
+        data: {
+            userId:                 user.id,
+            name:                   g.name ?? `Test Goal ${id}`,
+            targetAmountGhs:        g.targetAmountGhs ?? 1000,
+            currentAmountGhs:       g.currentAmountGhs ?? 0,
+            frequencyAmount:        g.frequencyAmount ?? 50,
+            frequency:              g.frequency ?? 'WEEKLY',
+            nextDueDate:            g.nextDueDate ?? new Date(Date.now() + 7 * 86400000),
+            endDate:                g.endDate ?? null,
+            isLocked:               g.isLocked ?? true,
+            earlyWithdrawalPenalty: g.earlyWithdrawalPenalty ?? 0.05, // 5%
+            status:                 g.status ?? 'ACTIVE',
+        },
+    });
+    return { user, goal };
+}
+
+/**
+ * seedAzmBalance — create a user with a known azmBalance (AZM loyalty points).
+ * Used by the AZM economy tests. Best-effort writes a backing AzmRewardLog row
+ * (the real reward-audit table) so history endpoints return sensible data;
+ * swallowed if the table is absent in an older schema snapshot.
+ * @returns the created user object with azmBalance overlaid as a plain number.
+ */
+async function seedAzmBalance(prisma, azmBalance = 100, overrides = {}) {
+    const user = await seedUser(prisma, overrides);
+    await prisma.user.update({
+        where: { id: user.id },
+        data:  { azmBalance },
+    });
+    try {
+        await prisma.azmRewardLog.create({
+            data: {
+                userId:       user.id,
+                amount:       azmBalance,
+                reason:       'Seeded test balance',
+                source:       'SEED',
+                balanceAfter: azmBalance,
+            },
+        });
+    } catch (_) {
+        // Table might not exist in older schema snapshots — swallow gracefully.
+    }
+    return { ...user, azmBalance };
+}
+
 module.exports = {
     TEST_PASSWORD,
     seedUser,
@@ -206,4 +277,6 @@ module.exports = {
     seedPaidTrade,
     seedBusiness,
     seedEscrowTicket,
+    seedSavingsGoal,   // NEW
+    seedAzmBalance,    // NEW
 };
