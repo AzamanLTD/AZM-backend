@@ -4,8 +4,8 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "jest --testEnvironment=node",
-    "test:coverage": "jest --testEnvironment=node --coverage",
+    "test": "jest --testEnvironment=node --runInBand --forceExit",
+    "test:coverage": "jest --testEnvironment=node --coverage --runInBand --forceExit",
     "start": "node server.js",
     "build": "prisma generate",
     "migrate:deploy": "prisma migrate deploy",
