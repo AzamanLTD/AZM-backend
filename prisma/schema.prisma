@@ -100,13 +100,13 @@ enum TransactionType {
   // PHASE 6 / Phase 5 (2026-06-01): Susu Profit Engine — platform fee on cycle payouts
   SUSU_PROFIT
   // Smart Escrow & Business Accounts (2026-06-14)
-  TICKET_ESCROW_FUND      // payer locks funds into escrow
-  TICKET_ESCROW_RELEASE   // funds released to payee on settlement
-  TICKET_ESCROW_REFUND    // funds returned to payer on refund/cancel
-  TICKET_ESCROW_FEE       // platform fee taken when escrow is funded
+  TICKET_ESCROW_FUND // payer locks funds into escrow
+  TICKET_ESCROW_RELEASE // funds released to payee on settlement
+  TICKET_ESCROW_REFUND // funds returned to payer on refund/cancel
+  TICKET_ESCROW_FEE // platform fee taken when escrow is funded
   // Discovery Sprint (2026-06-20): instant invoice settlement
-  BUSINESS_INVOICE_PAYMENT   // customer debit when paying an invoice
-  BUSINESS_INVOICE_RECEIPT   // business credit when invoice is paid
+  BUSINESS_INVOICE_PAYMENT // customer debit when paying an invoice
+  BUSINESS_INVOICE_RECEIPT // business credit when invoice is paid
 }
 
 enum TransactionStatus {
@@ -236,29 +236,29 @@ enum AdInteractionType {
 // =============================================================================
 
 enum EscrowStatus {
-  DRAFT              // created, not yet funded by payer
-  FUNDED             // payer has locked funds — escrow is live
-  IN_PROGRESS        // both parties explicitly acknowledged readiness
+  DRAFT // created, not yet funded by payer
+  FUNDED // payer has locked funds — escrow is live
+  IN_PROGRESS // both parties explicitly acknowledged readiness
   PENDING_SETTLEMENT // one party marked satisfied, awaiting the other
-  SETTLED            // both marked satisfied — auto-released to payee
-  DISPUTED           // one party raised a formal dispute
-  ADMIN_REVIEW       // escalated and assigned to an admin/worker
-  RELEASED           // admin ruled for payee — funds transferred
-  REFUNDED           // admin ruled for payer — funds returned
-  EXPIRED            // unfunded (24h) or inactive (30d) — auto-cancelled
+  SETTLED // both marked satisfied — auto-released to payee
+  DISPUTED // one party raised a formal dispute
+  ADMIN_REVIEW // escalated and assigned to an admin/worker
+  RELEASED // admin ruled for payee — funds transferred
+  REFUNDED // admin ruled for payer — funds returned
+  EXPIRED // unfunded (24h) or inactive (30d) — auto-cancelled
 }
 
 enum DisputeStatus {
-  PENDING          // raised, not yet assigned to any admin/worker
-  ASSIGNED         // assigned to a specific admin/worker
-  UNDER_REVIEW     // actively being reviewed
-  RESOLVED         // ruling has been issued
+  PENDING // raised, not yet assigned to any admin/worker
+  ASSIGNED // assigned to a specific admin/worker
+  UNDER_REVIEW // actively being reviewed
+  RESOLVED // ruling has been issued
 }
 
 enum DisputeRuling {
-  FULL_RELEASE     // 100% to payee
-  FULL_REFUND      // 100% to payer
-  SPLIT            // custom split defined by payerPct + payeePct
+  FULL_RELEASE // 100% to payee
+  FULL_REFUND // 100% to payer
+  SPLIT // custom split defined by payerPct + payeePct
 }
 
 enum KybStatus {
@@ -287,33 +287,33 @@ enum BusinessCategory {
 // =============================================================================
 
 enum BusinessOrderStatus {
-  AWAITING_PAYMENT  // SmartEscrow is DRAFT — customer has not funded yet
-  PAID              // SmartEscrow is FUNDED — proceed with the order
-  DELIVERED         // Business marked as delivered, awaiting customer confirm
-  COMPLETED         // Both parties confirmed; escrow auto-settled
-  DISPUTED          // Dispute raised on the linked SmartEscrow
-  REFUNDED          // Escrow was refunded to the customer
-  CANCELLED         // Order cancelled before it was funded
+  AWAITING_PAYMENT // SmartEscrow is DRAFT — customer has not funded yet
+  PAID // SmartEscrow is FUNDED — proceed with the order
+  DELIVERED // Business marked as delivered, awaiting customer confirm
+  COMPLETED // Both parties confirmed; escrow auto-settled
+  DISPUTED // Dispute raised on the linked SmartEscrow
+  REFUNDED // Escrow was refunded to the customer
+  CANCELLED // Order cancelled before it was funded
 }
 
 // =============================================================================
 // DISCOVERY SPRINT (2026-06-20): Locations, Invoices, Reviews
 // =============================================================================
 enum InvoiceStatus {
-  DRAFT     // business is building it, not yet visible to customer
-  SENT      // visible to customer, awaiting payment
-  PAID      // instant settlement completed
-  VOIDED    // business cancelled it before payment
+  DRAFT // business is building it, not yet visible to customer
+  SENT // visible to customer, awaiting payment
+  PAID // instant settlement completed
+  VOIDED // business cancelled it before payment
 }
 
 enum TaxLineType {
-  PERCENTAGE   // value is a % applied to invoice subtotal
-  FLAT         // value is a fixed amount added directly
+  PERCENTAGE // value is a % applied to invoice subtotal
+  FLAT // value is a fixed amount added directly
 }
 
 enum ReviewSourceType {
-  ORDER     // review tied to a completed BusinessOrder
-  INVOICE   // review tied to a paid BusinessInvoice
+  ORDER // review tied to a completed BusinessOrder
+  INVOICE // review tied to a paid BusinessInvoice
 }
 
 // =============================================================================
@@ -325,15 +325,15 @@ enum ReviewSourceType {
 // lifecycle — never inside a financial $transaction.
 // =============================================================================
 enum BizNotifType {
-  NEW_ORDER          // a customer opened an escrow order against this business
-  ORDER_FUNDED       // the buyer funded the escrow
-  ORDER_SATISFIED    // the buyer marked the order satisfied
-  ORDER_DISPUTED     // a dispute was raised on the order
-  ORDER_SETTLED      // escrow released — funds delivered to the business
-  ORDER_CANCELLED    // a DRAFT order was cancelled before funding
-  ORDER_REFUNDED     // escrow refunded to the buyer
+  NEW_ORDER // a customer opened an escrow order against this business
+  ORDER_FUNDED // the buyer funded the escrow
+  ORDER_SATISFIED // the buyer marked the order satisfied
+  ORDER_DISPUTED // a dispute was raised on the order
+  ORDER_SETTLED // escrow released — funds delivered to the business
+  ORDER_CANCELLED // a DRAFT order was cancelled before funding
+  ORDER_REFUNDED // escrow refunded to the buyer
   KYB_STATUS_CHANGED // verification status changed (approved/rejected)
-  INVOICE_PAID       // a sent invoice was paid by the customer
+  INVOICE_PAID // a sent invoice was paid by the customer
 }
 
 enum KybDocumentType {
@@ -667,15 +667,15 @@ model User {
   // primary key (never exposed) and from influencerCode. Nullable in the
   // column only so the additive ADD COLUMN is safe on a populated table; the
   // registration hook + idempotent backfill guarantee it is always populated.
-  azamanId            String?   @unique
+  azamanId     String? @unique
   // Opt-out of phone Contact_Discovery. While false, the user never appears
   // in another user's /users/discover result.
-  discoverable        Boolean   @default(true)
+  discoverable Boolean @default(true)
   // SHA-256(HMAC) of the verified E.164 phone with a server pepper. Contact
   // discovery matches hash-to-hash so raw address-book numbers are never
   // compared against (or stored as) plaintext. Set on phone verification +
   // backfill; null until the user verifies a phone.
-  phoneHash           String?
+  phoneHash    String?
 
   // ==========================================================================
   // RELATIONSHIPS
@@ -729,11 +729,11 @@ model User {
   sentTicketMessages TicketMessage[] @relation("TicketMessageSender")
 
   // Smart Escrow & Business Accounts (2026-06-14)
-  businessProfile  BusinessProfile?
-  escrowsAsPayer   SmartEscrow[]   @relation("EscrowPayer")
-  escrowsAsPayee   SmartEscrow[]   @relation("EscrowPayee")
-  disputesRaised   EscrowDispute[] @relation("DisputeRaisedBy")
-  disputesAssigned EscrowDispute[] @relation("DisputeAssignedTo")
+  businessProfile      BusinessProfile?
+  escrowsAsPayer       SmartEscrow[]                  @relation("EscrowPayer")
+  escrowsAsPayee       SmartEscrow[]                  @relation("EscrowPayee")
+  disputesRaised       EscrowDispute[]                @relation("DisputeRaisedBy")
+  disputesAssigned     EscrowDispute[]                @relation("DisputeAssignedTo")
   ordersAsCustomer     BusinessOrder[]                @relation("OrderCustomer")
   kybDocumentsReviewed BusinessVerificationDocument[] @relation("KybDocReviewer")
 
@@ -1218,7 +1218,7 @@ model GlobalSettings {
 
   // Discovery Sprint (2026-06-20): platform fee on instant invoice settlement.
   // 0.015 = 1.5% default. Snapshotted onto BusinessInvoice.feeUsdc at payment.
-  businessInvoiceFeePct Decimal @default(0.015) @db.Decimal(6, 4)
+  businessInvoiceFeePct  Decimal @default(0.015) @db.Decimal(6, 4)
   escrowFundedExpiryDays Int     @default(30)
 
   // Business Portal (2026-06-16)
@@ -1999,7 +1999,7 @@ enum TicketStatus {
 
 model Ticket {
   id             String       @id @default(uuid())
-  friendshipId   String?      // null for business-mode tickets
+  friendshipId   String? // null for business-mode tickets
   creatorId      Int
   counterpartyId Int
   name           String       @db.VarChar(80)
@@ -2085,9 +2085,9 @@ model SmartEscrow {
   payeeSatisfied Boolean @default(false)
 
   // Terms agreed between parties (filled in ticket workspace)
-  deliveryTerms String? @db.VarChar(1000)
+  deliveryTerms String?   @db.VarChar(1000)
   // Optional delivery deadline
-  dueDate DateTime?
+  dueDate       DateTime?
 
   // Lifecycle timestamps
   fundedAt      DateTime?
@@ -2104,10 +2104,10 @@ model SmartEscrow {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  ticket  Ticket         @relation(fields: [ticketId], references: [id], onDelete: Cascade)
-  payer   User           @relation("EscrowPayer", fields: [payerId], references: [id])
-  payee   User           @relation("EscrowPayee", fields: [payeeId], references: [id])
-  dispute EscrowDispute?
+  ticket        Ticket         @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  payer         User           @relation("EscrowPayer", fields: [payerId], references: [id])
+  payee         User           @relation("EscrowPayee", fields: [payeeId], references: [id])
+  dispute       EscrowDispute?
   businessOrder BusinessOrder? // back-relation, no @relation directive needed
 
   @@index([payerId])
@@ -2186,8 +2186,8 @@ model BusinessProfile {
   totalVolume      Decimal @default(0.0) @db.Decimal(20, 8)
   averageRating    Decimal @default(0.0) @db.Decimal(3, 2)
 
-  user    User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-  tickets Ticket[]
+  user                  User                           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tickets               Ticket[]
   products              BusinessProduct[]
   orders                BusinessOrder[]
   verificationDocuments BusinessVerificationDocument[]
@@ -2207,6 +2207,12 @@ model BusinessProfile {
   @@index([isVerified])
   // Full-text search support: business name search
   @@index([businessName])
+  // Public discovery (businessService.searchBusinesses): always filters
+  // isSuspended=false, optionally category, and ORDERs BY totalEscrows desc.
+  // These composites let Postgres satisfy the filter+sort from the index
+  // instead of a full scan + in-memory sort as the marketplace grows.
+  @@index([isSuspended, totalEscrows(sort: Desc)])
+  @@index([isSuspended, category, totalEscrows(sort: Desc)])
 }
 
 // =============================================================================
@@ -2359,7 +2365,7 @@ model BusinessProduct {
   name              String            @db.VarChar(200)
   description       String?           @db.VarChar(1000)
   priceUsdc         Decimal           @db.Decimal(20, 8)
-  imageUrls         Json?             // String[] of Cloudinary URLs
+  imageUrls         Json? // String[] of Cloudinary URLs
   category          BusinessCategory? // null inherits from profile
   isActive          Boolean           @default(true)
   slug              String            @unique
@@ -2414,13 +2420,20 @@ model BusinessOrder {
   product         BusinessProduct? @relation(fields: [productId], references: [id])
   escrow          SmartEscrow?     @relation(fields: [escrowId], references: [id])
   ticket          Ticket?          @relation(fields: [ticketId], references: [id])
-  review          BusinessReview?  // Discovery Sprint: one optional review per order
+  review          BusinessReview? // Discovery Sprint: one optional review per order
 
   @@index([businessProfileId])
   @@index([businessProfileId, status])
   @@index([customerId])
   @@index([status])
   @@index([productId])
+  // Order lists are always ORDERed BY createdAt desc, scoped to either the
+  // business (listOrdersForBusiness) or the customer (listOrdersForCustomer),
+  // each with an optional status filter. The createdAt-trailing composites let
+  // the paginated list read straight from the index.
+  @@index([businessProfileId, status, createdAt(sort: Desc)])
+  @@index([customerId, status, createdAt(sort: Desc)])
+  @@index([customerId, createdAt(sort: Desc)])
 }
 
 // =============================================================================
@@ -2472,7 +2485,6 @@ model BusinessNotification {
   @@index([businessProfileId, isRead])
   @@index([businessProfileId, createdAt(sort: Desc)])
 }
-
 
 // =============================================================================
 // MASTER SPRINT (2026-05-27): VAULTS, SUSU, SMART ROUTE, AZM AUCTION
@@ -2589,8 +2601,8 @@ model GroupChat {
   messages     GroupMessage[]
   vouchRecords VouchRecord[]
   joinRequests GroupJoinRequest[]
-  susuGroup    SusuGroup?     @relation("GroupSusu", fields: [susuGroupId], references: [id], onDelete: SetNull)
-  createdBy    User           @relation("GroupChatCreator", fields: [createdById], references: [id])
+  susuGroup    SusuGroup?         @relation("GroupSusu", fields: [susuGroupId], references: [id], onDelete: SetNull)
+  createdBy    User               @relation("GroupChatCreator", fields: [createdById], references: [id])
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -2814,13 +2826,13 @@ model SusuCycle {
   // re-evaluating the cycle while now() < graceUntil (members may top up
   // and fund); once now() >= graceUntil any still-short member is
   // hard-defaulted and the cycle is finalized.
-  graceUntil          DateTime?
+  graceUntil DateTime?
 
   // ── PHASE 6 / Phase 5 (2026-06-01): Susu Profit Engine ──
   // Platform fee deducted from the pooled contribution before payout.
   // Calculated as ROUND_DOWN(pooled × GlobalSettings.susuProfitPct).
   // Persisted for audit and transparency. takeHome = pooled - feeUsdc.
-  feeUsdc             Decimal?                @db.Decimal(20, 8)
+  feeUsdc Decimal? @db.Decimal(20, 8)
 
   susu             SusuGroup           @relation(fields: [susuGroupId], references: [id], onDelete: Cascade)
   payoutUser       User                @relation("SusuCycleWinner", fields: [payoutUserId], references: [id])
@@ -2999,9 +3011,9 @@ model AdminWarRoomAlert {
   // FROZEN_DISPUTE freeze and let cycles continue) or REFUND_AND_CLOSE
   // (return the frozen pool to members and cancel the Susu). Null until the
   // incident is resolved.
-  resolution     String?
-  resolvedAt     DateTime?
-  resolvedBy     Int?
+  resolution String?
+  resolvedAt DateTime?
+  resolvedBy Int?
 
   susu  SusuGroup  @relation(fields: [susuGroupId], references: [id], onDelete: Cascade)
   cycle SusuCycle? @relation(fields: [cycleId], references: [id], onDelete: SetNull)
