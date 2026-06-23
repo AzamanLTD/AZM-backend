@@ -32,6 +32,8 @@ function _getNotificationService(req) {
 //   GET    /api/savings/overview           — Dashboard summary (total saved, streaks, etc.)
 // =============================================================================
 
+const { audit } = require('../utils/audit');
+
 const VALID_FREQUENCIES = ['DAILY', 'WEEKLY', 'BIWEEKLY', 'MONTHLY'];
 
 // ── Helper: Calculate next due date based on frequency ───────────────────────
@@ -357,6 +359,12 @@ exports.deposit = async (req, res) => {
             });
         }
 
+        await audit(prisma, {
+            actorId: req.user.id, actorName: req.user.username,
+            action: 'SAVINGS_DEPOSIT', targetType: 'SAVINGSGOAL', targetId: String(goal.id),
+            metadata: { amountGhs: req.body.amountGhs }, ipAddress: req.ip,
+        });
+
         return res.status(200).json({
             success: true,
             message: `Deposited GHS ${amountGhs} into "${goal.name}".`,
@@ -488,6 +496,13 @@ exports.withdraw = async (req, res) => {
         });
 
         if (emitBalanceUpdate) await emitBalanceUpdate(userId);
+
+        await audit(prisma, {
+            actorId: req.user.id, actorName: req.user.username,
+            action: isEarlyWithdrawal ? 'SAVINGS_EARLY_WITHDRAWAL' : 'SAVINGS_WITHDRAWAL',
+            targetType: 'SAVINGSGOAL', targetId: String(goal.id),
+            metadata: { withdrawAmountGhs: withdrawAmount, penaltyGhs }, ipAddress: req.ip,
+        });
 
         return res.status(200).json({
             success: true,

@@ -75,7 +75,7 @@ const BODY_KEYS = {
     recipient:      'receiver',        // recipient MSISDN field name
     reference:      'externalref',     // OUR idempotency key field name
     accountName:    'accountname',
-    narration:      'reason',          // payer/payee note field name
+    narration:      'reference',        // confirmed from docs.moolre.com/ai/initiate-transfer.md
     accountNumber:  'accountnumber',   // YOUR Moolre payout account/wallet number
 };
 
@@ -88,11 +88,12 @@ const TRANSFER_TYPE_CODE     = 1;
 // AZM passes network ∈ {MTN, VODAFONE, AIRTELTIGO} (VODAFONE is now Telecel).
 // Map each to whatever channel code Moolre expects. Using passthrough strings
 // as a safe default; replace values with Moolre's real slugs/codes.
+// Confirmed numeric codes from docs.moolre.com/ai/initiate-transfer.md
 const NETWORK_TO_CHANNEL = {
-    MTN:         'MTN',
-    VODAFONE:    'VODAFONE',   // a.k.a. Telecel Ghana
-    TELECEL:     'VODAFONE',
-    AIRTELTIGO:  'AIRTELTIGO',
+    MTN:         1,
+    VODAFONE:    6,   // a.k.a. Telecel Ghana
+    TELECEL:     6,
+    AIRTELTIGO:  7,
 };
 
 // ── ⚠️ VERIFY: async status string mapping ────────────────────────────────────

@@ -552,6 +552,8 @@ model User {
   email    String @unique
   password String
 
+  moolrePaymentId String? @unique // *203*<id># USSD payment ID (Moolre on-ramp, 2026-06-23)
+
   // --- V2: THE GREAT ACCOUNT SPLIT — Unified Ledger Balances ---
   // NOTE (Phase J2, 2026-05-25): every Decimal column on this model that
   // represents a balance has a CHECK (col >= 0) constraint at the DB
@@ -1389,14 +1391,19 @@ model SystemProfitFees {
 // =============================================================================
 
 model TransactionHistory {
-  id         String            @id @default(uuid())
-  userId     Int
-  type       TransactionType
-  amountUsdc Decimal           @db.Decimal(20, 8)
-  feeUsdc    Decimal           @default(0) @db.Decimal(20, 8)
-  txHash     String?           @unique
-  status     TransactionStatus @default(PENDING)
-  createdAt  DateTime          @default(now())
+  id                String            @id @default(uuid())
+  userId            Int
+  type              TransactionType
+  amountUsdc        Decimal           @db.Decimal(20, 8)
+  feeUsdc           Decimal           @default(0) @db.Decimal(20, 8)
+  txHash            String?           @unique
+  // --- Moolre collection on-ramp (2026-06-23) — all nullable/additive ---
+  providerRef       String? // Moolre tracking UUID (TR099 data field)
+  payerMsisdn       String? // MSISDN that paid — stored raw, masked before display
+  initiatedByUserId Int? // User who triggered this deposit (null = USSD walk-up)
+  metadata          Json? // { provider, network, amountGhs, rateAtInitiation, ... }
+  status            TransactionStatus @default(PENDING)
+  createdAt         DateTime          @default(now())
 
   user User @relation(fields: [userId], references: [id])
 
@@ -2155,14 +2162,15 @@ model EscrowDispute {
 // regular user, a vendor, and a business owner.
 // =============================================================================
 model BusinessProfile {
-  id           String           @id @default(uuid())
-  userId       Int              @unique
-  bizId        String           @unique // BIZ-XXXXXXXXX (9 digits after prefix)
-  businessName String           @db.VarChar(100)
-  category     BusinessCategory @default(OTHER)
-  description  String?          @db.VarChar(500)
-  website      String?          @db.VarChar(255)
-  logoUrl      String?
+  id              String           @id @default(uuid())
+  userId          Int              @unique
+  bizId           String           @unique // BIZ-XXXXXXXXX (9 digits after prefix)
+  moolrePaymentId String?          @unique // *203*<id># USSD payment ID for businesses (Moolre on-ramp, 2026-06-23)
+  businessName    String           @db.VarChar(100)
+  category        BusinessCategory @default(OTHER)
+  description     String?          @db.VarChar(500)
+  website         String?          @db.VarChar(255)
+  logoUrl         String?
 
   // Verification
   isVerified Boolean   @default(false)
