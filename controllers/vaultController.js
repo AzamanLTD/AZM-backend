@@ -8,6 +8,8 @@
 // so a frozen account can still review their state.
 // =============================================================================
 
+const { audit } = require('../utils/audit');
+
 const wrap = (fn) => async (req, res) => {
     try {
         await fn(req, res);
@@ -60,6 +62,11 @@ exports.deposit = wrap(async function deposit(req, res) {
         userId: req.user.id,
         vaultId: req.params.id,
         amountUsdc: req.body.amountUsdc,
+    });
+    await audit(req.app.get('prisma'), {
+        actorId: req.user.id, actorName: req.user.username,
+        action: 'VAULT_DEPOSIT', targetType: 'VAULT', targetId: String(req.params.id),
+        metadata: { amountUsdc: req.body.amountUsdc }, ipAddress: req.ip,
     });
     res.json({ success: true, breakdown: result.breakdown });
 });
@@ -115,6 +122,11 @@ exports.breakEarly = wrap(async function breakEarly(req, res) {
         });
     }
     const vault = await svc.breakEarly({ userId: req.user.id, vaultId: req.params.id });
+    await audit(req.app.get('prisma'), {
+        actorId: req.user.id, actorName: req.user.username,
+        action: 'VAULT_BROKEN_EARLY', targetType: 'VAULT', targetId: String(req.params.id),
+        metadata: { penaltyUsdc: vault?.penaltyUsdc }, ipAddress: req.ip,
+    });
     res.json({ success: true, vault });
 });
 

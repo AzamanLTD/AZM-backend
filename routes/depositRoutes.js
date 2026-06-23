@@ -31,4 +31,10 @@ router.post('/fiat/webhook',   depositController.localFiatDepositWebhook);
 // 3. Tatum Crypto Webhook (legacy alias — delegates to finance.service)
 router.post('/webhook/tatum',  depositController.tatumCryptoWebhook);
 
+// ── Moolre MoMo PIN-push collection on-ramp (2026-06-23) ──────────────────────
+router.post('/fiat/initiate/moolre',     protectActive, depositController.initiateMoolreFiatDeposit);
+router.post('/fiat/initiate/moolre/otp', protectActive, depositController.confirmMoolreOtp);
+router.post('/fiat/webhook/moolre',      depositController.moolreCollectionWebhook); // no JWT — secret-guarded
+router.post('/validate-name',            protectActive, depositController.validateMomoName);
+
 module.exports = router;

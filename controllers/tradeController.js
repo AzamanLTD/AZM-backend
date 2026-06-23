@@ -16,6 +16,7 @@ const { sendPushNotification } = require('../utils/firebaseService');
 const gamification = require('../services/vendorGamificationService');
 const { parsePagination, buildPageEnvelope } = require('../utils/pagination');
 const { resolveFeeProfile } = require('../services/feeProfileService');
+const { audit } = require('../utils/audit');
 
 /**
  * Phase N helper: retrieve the singleton NotificationService from app context.
@@ -939,6 +940,12 @@ exports.disputeTrade = async (req, res) => {
                 { tradeId: id.toString() }
             );
         }
+
+        await audit(prisma, {
+            actorId: userId, actorName: req.user.username,
+            action: 'TRADE_DISPUTED', targetType: 'TRADE', targetId: String(id),
+            metadata: { reason }, ipAddress: req.ip,
+        });
 
         res.status(200).json({ success: true, message: 'Dispute raised successfully.' });
     } catch (error) {

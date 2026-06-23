@@ -34,6 +34,17 @@ function _getNotificationService(req) {
 // =============================================================================
 
 const crypto = require('crypto');
+const { audit } = require('../utils/audit');
+
+// Constant-time string comparison — avoids leaking secret length/content via
+// timing. Returns false on any type/length mismatch instead of throwing.
+function _safeEqual(a, b) {
+    if (typeof a !== 'string' || typeof b !== 'string') return false;
+    const ab = Buffer.from(a);
+    const bb = Buffer.from(b);
+    if (ab.length !== bb.length) return false;
+    return crypto.timingSafeEqual(ab, bb);
+}
 
 // ── Constants ────────────────────────────────────────────────────────────────
 const FIAT_REF_PREFIX = 'FIAT_DEPOSIT_';
@@ -256,6 +267,12 @@ exports.localFiatDepositWebhook = async (req, res) => {
         }
 
         console.log(`[localFiatDepositWebhook] Confirmed: ref=${reference} userId=${existing.userId} +${usdcEquivalent} USDC`);
+
+        await audit(prisma, {
+            actorId: existing.userId, actorName: '',
+            action: 'DEPOSIT_FIAT_COMPLETED', targetType: 'TRANSACTION', targetId: String(existing.id),
+            metadata: { amountUsdc: usdcEquivalent, provider: existing.metadata?.provider }, ipAddress: req.ip,
+        });
 
         return res.status(200).json({
             success: true,
@@ -489,6 +506,12 @@ exports.tatumCryptoWebhook = async (req, res) => {
 
         console.log(`[tatumCryptoWebhook] Confirmed: txHash=${txHash} userId=${targetUserId} +${amountUsdc} USDC (Polygon)`);
 
+        await audit(prisma, {
+            actorId: targetUserId, actorName: '',
+            action: 'DEPOSIT_CRYPTO_COMPLETED', targetType: 'TRANSACTION', targetId: String(result.txRecord?.id || ''),
+            metadata: { amountUsdc, txHash: txHash || '' }, ipAddress: req.ip,
+        });
+
         return res.status(200).json({
             success: true,
             message: `Crypto deposit of ${amountUsdc} USDC confirmed for user ${targetUserId}.`,
@@ -506,5 +529,264 @@ exports.tatumCryptoWebhook = async (req, res) => {
     } catch (error) {
         console.error('[tatumCryptoWebhook] error:', error.message);
         return res.status(500).json({ success: false, message: error.message });
+    }
+};
+
+// =============================================================================
+// MOOLRE COLLECTION ON-RAMP (2026-06-23) — in-bound GHS via PIN-push MoMo
+//
+// Flow mirrors the local-fiat flow: initiate creates a PENDING row keyed by a
+// unique reference (TransactionHistory.txHash), the provider prompts the payer
+// for their MoMo PIN, and a secret-guarded webhook credits the wallet once
+// settlement lands. OTP-gated networks round-trip through confirmMoolreOtp.
+//
+// The collection adapter is bound under app key 'moolreCollectionService'.
+// =============================================================================
+
+// ── Export 1: initiateMoolreFiatDeposit ──────────────────────────────────────
+// POST /api/deposit/fiat/initiate/moolre  (auth)
+// Body: { amountGhs, provider, phoneNumber }   provider ∈ MTN_MOMO|VODAFONE_CASH|AIRTELTIGO
+exports.initiateMoolreFiatDeposit = async (req, res) => {
+    const prisma = req.app.get('prisma');
+    const moolre = req.app.get('moolreCollectionService');
+    if (!moolre) return res.status(503).json({ success: false, message: 'Deposit service unavailable.' });
+
+    try {
+        const { amountGhs, provider, phoneNumber, memo } = req.body;
+        const userId = req.user.id;
+
+        const MOMO = new Set(['MTN_MOMO', 'VODAFONE_CASH', 'AIRTELTIGO']);
+        if (!amountGhs || Number(amountGhs) <= 0)
+            return res.status(400).json({ success: false, message: 'Invalid deposit amount.' });
+        if (!MOMO.has(provider))
+            return res.status(400).json({ success: false, message: 'Use this endpoint only for MoMo providers.' });
+        if (!phoneNumber || String(phoneNumber).replace(/\D/g, '').length < 9)
+            return res.status(400).json({ success: false, message: 'A valid phone number is required.' });
+
+        const networkMap = { MTN_MOMO: 'MTN', VODAFONE_CASH: 'VODAFONE', AIRTELTIGO: 'AIRTELTIGO' };
+        const network    = networkMap[provider] || 'MTN';
+
+        const settings = await prisma.globalSettings.findUnique({ where: { id: 1 } });
+        if (!settings) return res.status(503).json({ success: false, message: 'Exchange rate unavailable.' });
+
+        const ghsFloat     = parseFloat(amountGhs);
+        const usdcEstimate = parseFloat((ghsFloat / Number(settings.liveUsdToGhs)).toFixed(6));
+        const reference    = `MOOLRE_DEP_${userId}_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+
+        // Create the PENDING row BEFORE calling Moolre — the webhook needs it to exist.
+        const tx = await prisma.transactionHistory.create({
+            data: {
+                userId, type: 'DEPOSIT_FIAT', amountUsdc: usdcEstimate,
+                txHash: reference, status: 'PENDING',
+                initiatedByUserId: userId,
+                metadata: {
+                    provider, network, amountGhs: ghsFloat,
+                    rateAtInitiation: Number(settings.liveUsdToGhs),
+                    payerPhone: phoneNumber, channel: 'APP',
+                    // Susu deposit trace (Req 12.4) — opaque memo (e.g. susu:<id>)
+                    // forwarded by the app so operators can tie a deposit back to
+                    // the cycle reminder that prompted it. Optional.
+                    ...(memo ? { memo: String(memo) } : {}),
+                },
+            },
+        });
+
+        let moolreResult;
+        try {
+            moolreResult = await moolre.initiatePayment({
+                externalRef: reference, amountGhs: ghsFloat,
+                payerPhone: phoneNumber, network,
+            });
+        } catch (moolreErr) {
+            if (moolreErr.isDuplicate)
+                return res.status(409).json({ success: false, message: 'Duplicate deposit reference. Please retry.' });
+            await prisma.transactionHistory.update({ where: { id: tx.id }, data: { status: 'FAILED' } });
+            console.error('[initiateMoolreFiatDeposit] Moolre error:', moolreErr.message);
+            return res.status(502).json({ success: false, message: 'Payment provider error. Please retry.' });
+        }
+
+        if (moolreResult.providerRef) {
+            await prisma.transactionHistory.update({
+                where: { id: tx.id }, data: { providerRef: moolreResult.providerRef },
+            });
+        }
+
+        return res.status(201).json({
+            success: true, requiresOtp: moolreResult.requiresOtp,
+            data: { reference, amountGhs: ghsFloat, usdcEstimate, provider, phoneNumber },
+        });
+    } catch (err) {
+        console.error('[initiateMoolreFiatDeposit]', err.message);
+        return res.status(500).json({ success: false, message: 'An unexpected error occurred.' });
+    }
+};
+
+// ── Export 2: confirmMoolreOtp ────────────────────────────────────────────────
+// POST /api/deposit/fiat/initiate/moolre/otp  (auth)
+// Body: { reference, otpCode }
+exports.confirmMoolreOtp = async (req, res) => {
+    const prisma = req.app.get('prisma');
+    const moolre = req.app.get('moolreCollectionService');
+    if (!moolre) return res.status(503).json({ success: false, message: 'Deposit service unavailable.' });
+
+    try {
+        const { reference, otpCode } = req.body;
+        if (!reference || !otpCode)
+            return res.status(400).json({ success: false, message: 'reference and otpCode are required.' });
+
+        const tx = await prisma.transactionHistory.findUnique({ where: { txHash: reference } });
+        if (!tx || tx.userId !== req.user.id)
+            return res.status(404).json({ success: false, message: 'Deposit not found.' });
+        if (tx.status !== 'PENDING')
+            return res.status(409).json({ success: false, message: `Deposit is already ${tx.status}.` });
+
+        const meta = tx.metadata || {};
+        const moolreResult = await moolre.initiatePayment({
+            externalRef: reference, amountGhs: meta.amountGhs,
+            payerPhone: meta.payerPhone, network: meta.network, otpCode,
+        });
+
+        if (moolreResult.requiresOtp)
+            return res.status(400).json({ success: false, message: 'OTP verification failed. Check the code and retry.' });
+        if (moolreResult.providerRef)
+            await prisma.transactionHistory.update({
+                where: { id: tx.id }, data: { providerRef: moolreResult.providerRef },
+            });
+
+        return res.status(200).json({ success: true, requiresOtp: false, data: { reference } });
+    } catch (err) {
+        console.error('[confirmMoolreOtp]', err.message);
+        return res.status(500).json({ success: false, message: 'An unexpected error occurred.' });
+    }
+};
+
+// ── Export 3: moolreCollectionWebhook ─────────────────────────────────────────
+// POST /api/deposit/fiat/webhook/moolre  (no JWT — secret-guarded)
+// Auth is signature-first: HMAC-SHA256 of the raw body in `x-moolre-signature`,
+// with a constant-time plaintext `x-moolre-webhook-secret` fallback.
+// ⚠️ BEFORE GOING LIVE: run a real sandbox test and log req.body verbatim to
+//    confirm the field names inside `data` (externalref, payer, amount).
+exports.moolreCollectionWebhook = async (req, res) => {
+    const prisma = req.app.get('prisma');
+    try {
+        const expectedSecret = process.env.MOOLRE_WEBHOOK_SECRET;
+        if (!expectedSecret) {
+            console.error('[moolreCollectionWebhook] MOOLRE_WEBHOOK_SECRET is not configured.');
+            return res.status(503).json({ success: false, message: 'Webhook endpoint not configured. Refusing to credit funds.' });
+        }
+
+        // Prefer HMAC over the raw body; fall back to a constant-time plaintext
+        // secret header. Both comparisons are timing-safe.
+        let authed = false;
+        const rawBody = req.rawBody || JSON.stringify(req.body);
+        const hmac    = req.headers['x-moolre-signature'];
+        if (hmac && rawBody) {
+            const expected = crypto.createHmac('sha256', expectedSecret).update(rawBody).digest('hex');
+            authed = _safeEqual(hmac, expected);
+        }
+        if (!authed) {
+            const headerSecret = req.headers['x-moolre-webhook-secret'];
+            if (headerSecret) authed = _safeEqual(headerSecret, expectedSecret);
+        }
+        if (!authed) return res.status(401).json({ success: false, message: 'Unauthorized.' });
+
+        const { status, code, data } = req.body;
+        // Only a confirmed, successful collection (status 1 / P01) settles. Any
+        // other event is acknowledged so Moolre stops retrying.
+        if (Number(status) !== 1 || code !== 'P01')
+            return res.status(200).json({ success: true, message: 'Event acknowledged.' });
+
+        // ⚠️ CONFIRM these field names against a real sandbox payload:
+        const externalRef = data?.externalref;
+        const payerMsisdn = data?.payer;
+        const amountGhsRaw = data?.amount;
+        if (!externalRef) return res.status(400).json({ success: false, message: 'Missing externalref.' });
+
+        const existing = await prisma.transactionHistory.findUnique({ where: { txHash: externalRef } });
+        if (!existing) return res.status(404).json({ success: false, message: 'Unknown reference.' });
+        if (existing.status === 'COMPLETED')
+            return res.status(200).json({ success: true, message: 'Already processed.' });
+
+        const settings = await prisma.globalSettings.findUnique({ where: { id: 1 } });
+        if (!settings) return res.status(503).json({ success: false, message: 'Rate unavailable.' });
+
+        const ghsFloat   = parseFloat(amountGhsRaw || existing.metadata?.amountGhs || 0);
+        const usdcCredit = parseFloat((ghsFloat / Number(settings.liveUsdToGhs)).toFixed(6));
+
+        await prisma.$transaction([
+            prisma.user.update({
+                where: { id: existing.userId },
+                data:  { availableBalance: { increment: usdcCredit } },
+            }),
+            prisma.transactionHistory.update({
+                where: { id: existing.id },
+                data: {
+                    status: 'COMPLETED', amountUsdc: usdcCredit,
+                    payerMsisdn: payerMsisdn || null,
+                    metadata: {
+                        ...(existing.metadata || {}),
+                        settledAmountGhs: ghsFloat,
+                        settledRate: Number(settings.liveUsdToGhs),
+                        settledAt: new Date().toISOString(),
+                        moolreData: data,
+                    },
+                },
+            }),
+        ]);
+
+        try {
+            const io = req.app.get('socketio');
+            if (io) io.to(`user_${existing.userId}`).emit('deposit_success', {
+                type: 'DEPOSIT_FIAT', amountGhs: ghsFloat, amountUsdc: usdcCredit,
+                provider: existing.metadata?.provider || 'MOBILE_MONEY', reference: externalRef,
+            });
+            await _getNotificationService(req).sendNotification({
+                userId:        existing.userId,
+                title:         'Deposit Confirmed',
+                body:          `GH₵ ${ghsFloat.toFixed(2)} has been credited to your account.`,
+                category:      'GENERAL',
+                actionPayload: { action: 'OPEN_WALLET', reference: externalRef },
+            });
+        } catch (notifErr) {
+            console.error('[moolreCollectionWebhook] Notification failed:', notifErr.message);
+        }
+
+        // Append-only audit trail (fire-and-forget — never fails the request).
+        await audit(prisma, {
+            actorId: existing.userId, actorName: '',
+            action: 'DEPOSIT_MOOLRE_COMPLETED', targetType: 'TRANSACTION', targetId: String(existing.id),
+            metadata: { amountGhs: ghsFloat, amountUsdc: usdcCredit, externalRef }, ipAddress: req.ip,
+        });
+
+        return res.status(200).json({ success: true, message: 'Deposit credited.' });
+    } catch (err) {
+        console.error('[moolreCollectionWebhook]', err.message);
+        return res.status(500).json({ success: false, message: 'Internal error.' });
+    }
+};
+
+// ── Export 4: validateMomoName ────────────────────────────────────────────────
+// POST /api/deposit/validate-name  (auth)
+// Body: { phoneNumber, provider }
+exports.validateMomoName = async (req, res) => {
+    const moolre = req.app.get('moolreCollectionService');
+    if (!moolre) return res.status(503).json({ success: false, message: 'Validation service unavailable.' });
+
+    try {
+        const { phoneNumber, provider } = req.body;
+        if (!phoneNumber) return res.status(400).json({ success: false, message: 'phoneNumber required.' });
+
+        const nm = {
+            MTN: 'MTN', VODAFONE: 'VODAFONE', AIRTELTIGO: 'AIRTELTIGO',
+            MTN_MOMO: 'MTN', VODAFONE_CASH: 'VODAFONE',
+        };
+        const network = nm[(provider || '').toUpperCase()] || 'MTN';
+        const name = await moolre.validateName({ payerPhone: phoneNumber, network });
+        if (!name) return res.status(404).json({ success: false, message: 'Account not found.' });
+
+        return res.status(200).json({ success: true, data: name });
+    } catch (err) {
+        console.error('[validateMomoName]', err.message);
+        return res.status(500).json({ success: false, message: 'Validation failed.' });
     }
 };

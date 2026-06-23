@@ -19,6 +19,7 @@
 // =============================================================================
 
 const p2pService = require('../services/p2p.service');
+const { audit } = require('../utils/audit');
 
 /**
  * Phase N helper: fire any _notifications returned by p2p.service functions
@@ -607,6 +608,12 @@ exports.completeTrade = async (req, res) => {
                 }
             });
         }
+
+        await audit(prisma, {
+            actorId: releasedByUserId, actorName: req.user.username,
+            action: 'TRADE_COMPLETED', targetType: 'TRADE', targetId: String(data.tradeId || tradeId),
+            metadata: { netUsdc: data.netUsdc, vendorCutUsdc: data.vendorCutUsdc }, ipAddress: req.ip,
+        });
 
         return res.status(200).json({
             success: true,

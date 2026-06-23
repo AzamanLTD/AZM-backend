@@ -142,6 +142,13 @@ gatewayService.startRateSync();
 const MoolreDisbursementService = require('./services/moolreDisbursementService');
 const mtnDisbursementService = new MoolreDisbursementService();
 
+// --- FIAT ON-RAMP COLLECTION (Moolre — 2026-06-23) ───────────────────────────
+// Inbound sibling of the disbursement adapter above: PIN-push MoMo deposits.
+// Bound under 'moolreCollectionService' (depositController reads it via
+// req.app.get). Pure I/O adapter — no Prisma, MOCK unless MOOLRE_PROVIDER=LIVE.
+const MoolreCollectionService = require('./services/moolreCollectionService');
+const moolreCollectionService = new MoolreCollectionService();
+
 // Startup guard: the Moolre settlement webhook hard-disables itself (503) if
 // MOOLRE_WEBHOOK_SECRET is unset, so warn loudly at boot to make the disabled
 // endpoint obvious instead of silently rejecting every callback in production.
@@ -989,6 +996,7 @@ app.set('escrowService', EscrowService);
 app.set('pushIfOffline', pushIfOffline);
 app.set('gatewayService', gatewayService);
 app.set('mtnDisbursementService', mtnDisbursementService);
+app.set('moolreCollectionService', moolreCollectionService);
 app.set('tatumService', tatumService);
 app.set('emailService', emailService);
 app.set('smsService', smsService);

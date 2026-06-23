@@ -18,6 +18,7 @@ const financeService          = require('../services/finance.service');
 const { runDoubleCheck }      = require('../utils/securityCheck');
 const axios                   = require('axios');
 const { randomUUID }          = require('crypto');
+const { audit }               = require('../utils/audit');
 
 const POLYGON_GAS_FEE_MATIC   = 0.05;  // V2 Blueprint: 100% of network gas is borne by user
 const FIAT_POOL_ALERT_THRESH  = financeService.FIAT_POOL_ALERT_THRESH;
@@ -259,6 +260,13 @@ exports.fiatWithdrawal = async (req, res) => {
                     }).catch(() => {});
                 });
             }
+
+            await audit(prisma, {
+                actorId: userId, actorName: req.user.username,
+                action: 'WITHDRAWAL_FIAT_INITIATED', targetType: 'TRANSACTION',
+                targetId: String(withdrawalRow?.id || reference),
+                metadata: { amountGhs: amount, provider: payoutMethod, reference }, ipAddress: req.ip,
+            });
 
             return res.status(200).json({
                 success: true,
@@ -648,6 +656,14 @@ exports.cryptoWithdrawal = async (req, res) => {
                 }).catch(() => {});
             });
         }
+
+        await audit(prisma, {
+            actorId: req.user.id, actorName: req.user.username,
+            action: 'WITHDRAWAL_CRYPTO_INITIATED', targetType: 'TRANSACTION',
+            targetId: String(result.txRecord?.id || result.txHash || ''),
+            metadata: { amountUsdc: amount, destination: String(destination || '').slice(0, 8) + '...' },
+            ipAddress: req.ip,
+        });
 
         return res.status(200).json({
             success: true,

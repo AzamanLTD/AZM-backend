@@ -16,6 +16,7 @@
 
 const escrowService = require('../services/escrowService');
 const bizNotificationService = require('../services/bizNotificationService');
+const { audit } = require('../utils/audit');
 
 // ── helpers ─────────────────────────────────────────────────────────────────
 
@@ -135,6 +136,12 @@ exports.fundEscrow = async (req, res) => {
             { event: 'ESCROW_FUNDED', escrowId: escrow.id }
         );
 
+        await audit(prisma, {
+            actorId: req.user.id, actorName: req.user.username,
+            action: 'ESCROW_FUNDED', targetType: 'SMARTESCROW', targetId: String(escrow.id),
+            metadata: { amountUsdc: escrow.amountUsdc }, ipAddress: req.ip,
+        });
+
         return res.status(200).json({ success: true, escrow });
     } catch (err) {
         console.error('[fundEscrow] error:', err.message);
@@ -196,6 +203,12 @@ exports.markSatisfied = async (req, res) => {
                 { event: 'ESCROW_PENDING_SETTLEMENT', escrowId: escrow.id }
             );
         }
+
+        await audit(prisma, {
+            actorId: req.user.id, actorName: req.user.username,
+            action: 'ESCROW_SATISFIED', targetType: 'SMARTESCROW', targetId: String(escrow.id),
+            metadata: { settled: result?.settled }, ipAddress: req.ip,
+        });
 
         return res.status(200).json({ success: true, settled: result.settled, escrow });
     } catch (err) {
@@ -284,6 +297,12 @@ exports.raiseDispute = async (req, res) => {
             `⚠️ Dispute raised by ${raiserName}. An Azaman admin will review and rule within 48 hours.`,
             { event: 'ESCROW_DISPUTED', escrowId: escrow.id, disputeId: result.dispute.id }
         );
+
+        await audit(prisma, {
+            actorId: req.user.id, actorName: req.user.username,
+            action: 'ESCROW_DISPUTED', targetType: 'SMARTESCROW', targetId: String(escrow.id),
+            metadata: { reason: cleanReason }, ipAddress: req.ip,
+        });
 
         return res.status(200).json({ success: true, escrow, dispute: result.dispute });
     } catch (err) {
@@ -398,6 +417,12 @@ exports.cancelEscrow = async (req, res) => {
             }).then((res) => {
                 if (res && io) io.to(`user_${res.order.businessProfile.userId}`).emit('biz_notification', { type: 'ORDER_CANCELLED' });
             }).catch((err) => console.error('[cancelEscrow] biz notif:', err.message));
+        });
+
+        await audit(prisma, {
+            actorId: req.user.id, actorName: req.user.username,
+            action: 'ESCROW_CANCELLED', targetType: 'SMARTESCROW', targetId: String(result.id),
+            metadata: {}, ipAddress: req.ip,
         });
 
         return res.status(200).json({ success: true, escrow: result });
