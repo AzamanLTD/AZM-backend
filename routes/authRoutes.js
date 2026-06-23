@@ -4,11 +4,16 @@ const authController = require('../controllers/authController');
 const ssoController = require('../controllers/ssoController');
 const refreshController = require('../controllers/refreshController');
 const authMiddleware = require('../middleware/authMiddleware.js');
+const { validate } = require('../middleware/validate');
+const { registerSchema, loginSchema } = require('../services/validation/authSchemas');
 
 const protect = authMiddleware.protect;
 
-router.post('/register', authController.register);
-router.post('/login', authController.login);
+// Zod edge-guard (additive). The `authList` formatter reproduces the controller's
+// exact { message:"Validation failed", errors:[...] } envelope, so the Flutter
+// client sees no shape change. Controllers retain their inline validation.
+router.post('/register', validate(registerSchema, 'authList'), authController.register);
+router.post('/login', validate(loginSchema, 'authList'), authController.login);
 
 // --- SSO (Google & Apple Sign-In via Firebase) ---
 router.post('/sso', ssoController.ssoLogin);

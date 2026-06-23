@@ -14,6 +14,8 @@
 const router = require('express').Router();
 const { protect }       = require('../middleware/authMiddleware');
 const { protectActive } = require('../middleware/banGuardMiddleware');
+const { validate }      = require('../middleware/validate');
+const { businessRegisterSchema, businessUpdateSchema } = require('../services/validation/businessSchemas');
 
 const ctrl        = require('../controllers/businessController');
 const productCtrl = require('../controllers/businessProductController');
@@ -23,11 +25,12 @@ const notifCtrl   = require('../controllers/bizNotificationController');
 const locationCtrl = require('../controllers/businessLocationController');
 const invoiceCtrl  = require('../controllers/businessInvoiceController');
 
-// Existing business account routes (unchanged)
-router.post('/register', protectActive, ctrl.registerBusiness);
+// Business account routes. Zod validate() guards register/profile at the edge,
+// mirroring withdrawalRoutes; controllers keep their fallback checks intact.
+router.post('/register', protectActive, validate(businessRegisterSchema), ctrl.registerBusiness);
 router.get('/search', ctrl.searchBusinesses);                // public
 router.get('/me', protect, ctrl.getMyBusiness);
-router.patch('/profile', protect, ctrl.updateBusinessProfile);
+router.patch('/profile', protect, validate(businessUpdateSchema), ctrl.updateBusinessProfile);
 
 // KYB routes (before /:bizId)
 router.post('/kyb/submit',  protect, kybCtrl.submitKybDocuments);

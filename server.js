@@ -262,12 +262,19 @@ const server = http.createServer(app);
 // 3. MIDDLEWARES
 // ══════════════════════════════════════════════════════════════════════════════
 
+// Request tracing (must precede morgan so the access log carries the id).
+// Assigns req.id / res.locals.requestId and the X-Request-Id response header.
+app.use(require('./middleware/requestId'));
+
 // HTTP access logging (morgan). "combined" = IP, method, path, status,
 // response-time — enough to debug most production issues from the Render log
-// stream. Skipped under NODE_ENV=test to keep test output clean.
+// stream. We append the request id (":req-id" token) so a log line can be
+// correlated with an error report or a client bug submission. Skipped under
+// NODE_ENV=test to keep test output clean.
 const morgan = require('morgan');
+morgan.token('req-id', (req) => req.id || '-');
 if (process.env.NODE_ENV !== 'test') {
-    app.use(morgan('combined'));
+    app.use(morgan(':remote-addr :method :url :status :response-time ms - :req-id'));
 }
 
 // HIGH-1: Security headers (helmet-equivalent without dependency)
@@ -998,6 +1005,25 @@ app.set('adminAlertService', adminAlertService);
 // req.app handle), so hand it the alert service directly. Optional chaining at
 // the callsite keeps it safe if this ever isn't set.
 kycService.adminAlertService = adminAlertService;
+
+// ══════════════════════════════════════════════════════════════════════════════
+// API VERSIONING + RESPONSE ENVELOPE (additive, non-breaking)
+// ──────────────────────────────────────────────────────────────────────────────
+// 1. apiVersioning resolves req.apiVersion from the path/headers.
+// 2. The alias rewrite maps `/api/v1/<x>` → `/api/<x>` IN PLACE so every
+//    existing mount below serves BOTH the legacy `/api/<x>` path and the new
+//    versioned `/api/v1/<x>` path — no router duplication, no client breakage.
+//    (Version is captured in step 1 BEFORE the prefix is stripped here.)
+// 3. responseHelpers adds opt-in res.ok()/res.fail(); it does NOT touch existing
+//    res.json(...) bodies the live Flutter client depends on.
+// ══════════════════════════════════════════════════════════════════════════════
+app.use('/api', require('./middleware/apiVersioning'));
+app.use((req, res, next) => {
+    const m = req.url.match(/^\/api\/v(\d+)(?=\/|\?|$)/);
+    if (m) req.url = '/api' + req.url.slice(m[0].length);
+    next();
+});
+app.use('/api', require('./middleware/responseHelpers'));
 
 // ══════════════════════════════════════════════════════════════════════════════
 // API ROUTES (with rate limiting — CRITICAL-3)
