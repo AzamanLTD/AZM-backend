@@ -1,0 +1,21 @@
+{
+	"folders": [
+		{
+			"name": "AZM-backend",
+			"path": "."
+		},
+		{
+			"name": "AZM-frontend",
+			"path": "../AZM-frontend-main"
+		},
+		{
+			"name": "AZM-businessPortal",
+			"path": "../AZM-businessPortal"
+		},
+		{
+			"name": "AZM-adminPortal",
+			"path": "../AZM-adminPortal-main"
+		}
+	],
+	"settings": {}
+}
