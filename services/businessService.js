@@ -96,7 +96,7 @@ const getBusinessProfile = async (prisma, { bizId, userId }) => {
 // =============================================================================
 // 3. SEARCH BUSINESSES — name / bizId / description, optional filters.
 // =============================================================================
-const searchBusinesses = async (prisma, { query, category, verified, limit, cursor }) => {
+const searchBusinesses = async (prisma, { query, category, verified, limit, cursor, subcategory, priceRange, minRating }) => {
     const take = Math.min(Math.max(parseInt(limit, 10) || 20, 1), 50);
 
     const where = { isSuspended: false }; // CRITICAL: never show suspended businesses publicly
@@ -108,7 +108,17 @@ const searchBusinesses = async (prisma, { query, category, verified, limit, curs
         ];
     }
     if (category && VALID_CATEGORIES.has(category)) where.category = category;
+    // Marketplace hierarchy drill-down (2026-06-24) — additive filters.
+    if (subcategory) where.subcategory = subcategory;
+    if (priceRange) {
+        const pr = parseInt(priceRange, 10);
+        if (!isNaN(pr)) where.priceRange = pr;
+    }
     if (verified === true) where.isVerified = true;
+    // averageRating is a Decimal; Prisma handles gte comparison.
+    if (minRating && !isNaN(parseFloat(minRating))) {
+        where.averageRating = { gte: parseFloat(minRating) };
+    }
 
     return prisma.businessProfile.findMany({
         where,
@@ -118,6 +128,19 @@ const searchBusinesses = async (prisma, { query, category, verified, limit, curs
             user: { select: { id: true, username: true, profilePictureUrl: true } }
         },
         ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {})
+    });
+};
+
+// =============================================================================
+// GET SUBCATEGORIES — public lookup for the category drill-down UI.
+// Returns all active subcategories for a given parentWire, or all if omitted.
+// =============================================================================
+const getSubcategories = async (prisma, { parentWire } = {}) => {
+    const where = { isActive: true };
+    if (parentWire) where.parentWire = parentWire;
+    return prisma.businessSubcategory.findMany({
+        where,
+        orderBy: [{ parentWire: 'asc' }, { displayOrder: 'asc' }]
     });
 };
 
@@ -157,6 +180,7 @@ module.exports = {
     registerBusiness,
     getBusinessProfile,
     searchBusinesses,
+    getSubcategories,
     updateBusinessProfile,
     VALID_CATEGORIES
 };

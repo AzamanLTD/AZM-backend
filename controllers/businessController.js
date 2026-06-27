@@ -82,7 +82,7 @@ exports.getBusinessByBizId = async (req, res) => {
 exports.searchBusinesses = async (req, res) => {
     const prisma = req.app.get('prisma');
     try {
-        const { q, category, verified, limit, cursor } = req.query;
+        const { q, category, verified, limit, cursor, subcategory, priceRange, minRating } = req.query;
         const take = Math.min(Math.max(parseInt(limit, 10) || 20, 1), 50);
 
         const rows = await businessService.searchBusinesses(prisma, {
@@ -90,7 +90,10 @@ exports.searchBusinesses = async (req, res) => {
             category: category || null,
             verified: verified === 'true',
             limit: take,
-            cursor: cursor || null
+            cursor: cursor || null,
+            subcategory: subcategory || null,
+            priceRange: priceRange || null,
+            minRating: minRating || null
         });
 
         const hasMore = rows.length > take;
@@ -135,6 +138,24 @@ exports.getMyBusiness = async (req, res) => {
         return res.status(200).json({ success: true, business });
     } catch (err) {
         console.error('[getMyBusiness] error:', err.message);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+};
+
+// =============================================================================
+// 6. GET /api/business/subcategories?parentWire=FOOD_BEVERAGE
+// Public — returns the marketplace category hierarchy for drill-down UI.
+// =============================================================================
+exports.getSubcategories = async (req, res) => {
+    const prisma = req.app.get('prisma');
+    try {
+        const { parentWire } = req.query;
+        const subcategories = await businessService.getSubcategories(prisma, {
+            parentWire: parentWire || null
+        });
+        return res.status(200).json({ success: true, subcategories });
+    } catch (err) {
+        console.error('[getSubcategories] error:', err.message);
         return res.status(500).json({ success: false, message: err.message });
     }
 };
