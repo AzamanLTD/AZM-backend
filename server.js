@@ -252,6 +252,9 @@ const ticketRoutes      = require('./routes/ticketRoutes');
 const escrowRoutes      = require('./routes/escrowRoutes');
 const businessRoutes    = require('./routes/businessRoutes');
 
+// Marketplace Foundation (2026-06-24): Reservation system
+const reservationRoutes = require('./routes/reservationRoutes');
+
 // Master Sprint (2026-05-27): Vault, Susu, Group Chat, Smart Route, AZM Auction
 const vaultRoutes       = require('./routes/vaultRoutes');
 const groupChatRoutes   = require('./routes/groupChatRoutes');
@@ -1068,6 +1071,9 @@ app.use('/api/tickets', generalLimiter, ticketRoutes);
 // Smart Escrow & Business Accounts (2026-06-14)
 app.use('/api/escrow',   financialLimiter, escrowRoutes);
 app.use('/api/business', generalLimiter,   businessRoutes);
+
+// Marketplace Foundation (2026-06-24): Reservation system
+app.use('/api/reservations', generalLimiter, reservationRoutes);
 
 // Master Sprint (2026-05-27)
 app.use('/api/vaults',        financialLimiter, vaultRoutes);

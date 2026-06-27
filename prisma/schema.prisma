@@ -282,6 +282,18 @@ enum BusinessCategory {
   OTHER
 }
 
+// Reservation lifecycle (Marketplace Foundation, 2026-06-24)
+enum ReservationStatus {
+  PENDING
+  CONFIRMED
+  CHECKED_IN
+  CHECKED_OUT
+  COMPLETED
+  CANCELLED_CUSTOMER
+  CANCELLED_BUSINESS
+  NO_SHOW
+}
+
 // =============================================================================
 // BUSINESS PORTAL (2026-06-16): Products, Orders, KYB verification
 // =============================================================================
@@ -742,6 +754,9 @@ model User {
   // Discovery Sprint (2026-06-20): invoices billed to this user + reviews authored
   receivedInvoices BusinessInvoice[] @relation("InvoiceCustomer")
   businessReviews  BusinessReview[]  @relation("BusinessReviewer")
+
+  // Marketplace Foundation (2026-06-24): bookings this user holds
+  reservations  Reservation[]  @relation("CustomerReservations")
 
   // V3: Vendor Gamification
   adInteractions     AdInteraction[]
@@ -2116,6 +2131,7 @@ model SmartEscrow {
   payee         User           @relation("EscrowPayee", fields: [payeeId], references: [id])
   dispute       EscrowDispute?
   businessOrder BusinessOrder? // back-relation, no @relation directive needed
+  reservation   Reservation? // back-relation for deposit-protected bookings (2026-06-24)
 
   @@index([payerId])
   @@index([payeeId])
@@ -2161,11 +2177,35 @@ model EscrowDispute {
 // no role flip occurs on registration. A user can simultaneously be a
 // regular user, a vendor, and a business owner.
 // =============================================================================
+// =============================================================================
+// BUSINESS SUBCATEGORY — Marketplace hierarchy (2026-06-24)
+// Pre-seeded lookup table. Wire values are the source of truth for
+// BusinessProfile.subcategory. parentWire maps to the BusinessCategory enum.
+// =============================================================================
+model BusinessSubcategory {
+  id            String   @id @default(uuid())
+  parentWire    String   // maps to BusinessCategory enum, e.g. "FOOD_BEVERAGE"
+  wire          String   @unique // e.g. "RESTAURANT_FINE_DINING"
+  label         String   // "Fine Dining"
+  imageUrl      String?  // Cloudinary lifestyle photo for the category tile
+  displayOrder  Int      @default(0)
+  isActive      Boolean  @default(true)
+
+  @@index([parentWire, displayOrder])
+  @@index([isActive])
+}
+
 model BusinessProfile {
   id              String           @id @default(uuid())
   userId          Int              @unique
   bizId           String           @unique // BIZ-XXXXXXXXX (9 digits after prefix)
   moolrePaymentId String?          @unique // *203*<id># USSD payment ID for businesses (Moolre on-ramp, 2026-06-23)
+  // Marketplace hierarchy additions (2026-06-24)
+  subcategory     String?    // wire value from BusinessSubcategory (e.g. "RESTAURANT_FINE_DINING")
+  priceRange      Int?       // 1=₵  2=₵₵  3=₵₵₵  4=₵₵₵₵
+  amenities       String[]   // ["WIFI","PARKING","AC","POOL"] — profile-level amenities
+  cuisineTypes    String[]   // Food & Bev only: ["GHANAIAN","CHINESE","CONTINENTAL"]
+  businessMeta    Json?      // category-specific extended fields
   businessName    String           @db.VarChar(100)
   category        BusinessCategory @default(OTHER)
   description     String?          @db.VarChar(500)
@@ -2206,6 +2246,11 @@ model BusinessProfile {
   invoices  BusinessInvoice[]
   reviews   BusinessReview[]
 
+  // Marketplace Foundation (2026-06-24): catalog sections, bookable windows, reservations
+  catalogSections   CatalogSection[]
+  availabilityRules AvailabilityRule[]
+  reservations      Reservation[]
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -2221,6 +2266,10 @@ model BusinessProfile {
   // instead of a full scan + in-memory sort as the marketplace grows.
   @@index([isSuspended, totalEscrows(sort: Desc)])
   @@index([isSuspended, category, totalEscrows(sort: Desc)])
+  // Marketplace hierarchy filters (subcategory + priceRange drill-down)
+  @@index([subcategory])
+  @@index([priceRange])
+  @@index([isSuspended, subcategory, totalEscrows(sort: Desc)])
 }
 
 // =============================================================================
@@ -2249,6 +2298,7 @@ model BusinessLocation {
   tables          BusinessTable[]
   invoices        BusinessInvoice[]
   reviews         BusinessReview[]
+  sections        CatalogSection[] // catalog sections scoped to this branch (2026-06-24)
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -2364,6 +2414,33 @@ model BusinessReview {
 }
 
 // =============================================================================
+// CATALOG SECTION — Menu/product grouping (2026-06-24)
+// Restaurants use "Starters / Mains / Drinks". Hotels use "Rooms / Suites".
+// Linked to BusinessProduct via catalogSectionId.
+// =============================================================================
+model CatalogSection {
+  id                String   @id @default(uuid())
+  businessProfileId String
+  locationId        String?  // null = all branches
+  name              String   @db.VarChar(100) // "Starters", "Main Course", "Drinks"
+  description       String?  @db.VarChar(300)
+  displayOrder      Int      @default(0)
+  availableFrom     String?  // "06:00" — section only visible in this time window
+  availableTo       String?  // "11:00"
+  imageUrl          String?
+  isActive          Boolean  @default(true)
+
+  businessProfile   BusinessProfile   @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+  location          BusinessLocation? @relation(fields: [locationId], references: [id])
+  products          BusinessProduct[] @relation("SectionProducts")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([businessProfileId, displayOrder])
+}
+
+// =============================================================================
 // BUSINESS PRODUCT (2026-06-16)
 // A sellable item/service offered by a business. Soft-delete only (isActive).
 // =============================================================================
@@ -2385,8 +2462,18 @@ model BusinessProduct {
   deliveryTerms     String? @db.VarChar(500) // e.g. 'Same day delivery'
   estimatedDelivery String? @db.VarChar(100) // e.g. '2-3 days'
 
+  // Catalog section additions (2026-06-24)
+  catalogSectionId  String?    // which CatalogSection this item belongs to
+  isAvailable       Boolean    @default(true) // real-time sold-out toggle
+  preparationMins   Int?       // estimated prep time in minutes
+  tags              String[]   // ["SPICY","VEGAN","GLUTEN_FREE","POPULAR","NEW"]
+  calorieCount      Int?
+  variants          Json?      // [{ label:"Small", priceDelta:0 },{ label:"Large", priceDelta:2.5 }]
+  modifierGroups    Json?      // [{ name:"Add-ons", max:3, options:[{ name:"Extra Sauce", price:0.5 }] }]
+
   businessProfile BusinessProfile   @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
   location        BusinessLocation? @relation(fields: [locationId], references: [id])
+  catalogSection  CatalogSection?   @relation("SectionProducts", fields: [catalogSectionId], references: [id])
   orders          BusinessOrder[]
 
   createdAt DateTime @default(now())
@@ -2395,6 +2482,7 @@ model BusinessProduct {
   @@index([businessProfileId])
   @@index([businessProfileId, isActive])
   @@index([slug])
+  @@index([catalogSectionId]) // section → products lookup (2026-06-24)
 }
 
 // =============================================================================
@@ -2492,6 +2580,69 @@ model BusinessNotification {
 
   @@index([businessProfileId, isRead])
   @@index([businessProfileId, createdAt(sort: Desc)])
+}
+
+// =============================================================================
+// AVAILABILITY RULE — Defines bookable time windows for a business (2026-06-24)
+// =============================================================================
+model AvailabilityRule {
+  id                 String   @id @default(uuid())
+  businessProfileId  String
+  locationId         String?
+  serviceItemId      String?  // null = general booking; or a BusinessProduct.id
+  dayOfWeek          Int[]    // 0=Sun..6=Sat; empty = every day
+  startTime          String   // "08:00" 24h local
+  endTime            String   // "22:00"
+  slotDurationMins   Int?     // null = full-day (hotel rooms, whole-day services)
+  maxBookingsPerSlot Int      @default(1)
+  isActive           Boolean  @default(true)
+
+  businessProfile   BusinessProfile @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
+  @@index([businessProfileId, isActive])
+}
+
+// =============================================================================
+// RESERVATION — Customer-held booking with optional escrow (2026-06-24)
+// Integrates with existing SmartEscrow for deposit-protected bookings.
+// NEVER moves USDC directly — escrow mutations stay in escrowService.
+// =============================================================================
+model Reservation {
+  id                 String            @id @default(uuid())
+  reservationRef     String            @unique // RES-XXXXXXXX
+  businessProfileId  String
+  locationId         String?
+  customerId         Int
+  serviceItemId      String?           // BusinessProduct.id (room type, service slot)
+  status             ReservationStatus @default(PENDING)
+  startDatetime      DateTime
+  endDatetime        DateTime
+  partySize          Int?              @default(1)
+  amountUsdc         Decimal           @db.Decimal(20, 8)
+  depositUsdc        Decimal           @default(0) @db.Decimal(20, 8)
+  cancellationPolicy String?           @db.VarChar(500)
+  customerNotes      String?           @db.VarChar(500)
+  businessNotes      String?           @db.VarChar(500)
+  confirmedAt        DateTime?
+  cancelledAt        DateTime?
+  checkedInAt        DateTime?
+  checkedOutAt       DateTime?
+  escrowId           String?           @unique
+  metadata           Json?
+
+  businessProfile   BusinessProfile  @relation(fields: [businessProfileId], references: [id])
+  customer          User             @relation("CustomerReservations", fields: [customerId], references: [id])
+  escrow            SmartEscrow?     @relation(fields: [escrowId], references: [id])
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([businessProfileId, startDatetime])
+  @@index([customerId])
+  @@index([businessProfileId, status])
+  @@index([reservationRef])
 }
 
 // =============================================================================

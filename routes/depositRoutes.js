@@ -20,7 +20,7 @@ const router               = express.Router();
 const depositController    = require('../controllers/depositController');
 const { protectActive }    = require('../middleware/banGuardMiddleware');
 const { validate }         = require('../middleware/validate');
-const { initiateFiatDepositSchema } = require('../services/validation/financialSchemas');
+const { initiateFiatDepositSchema, initiateMoolreFiatDepositSchema } = require('../services/validation/financialSchemas');
 
 // 1. Initiate Local Fiat Deposit (creates PENDING TransactionHistory)
 router.post('/fiat/initiate',  protectActive, validate(initiateFiatDepositSchema), depositController.initiateLocalFiatDeposit);
@@ -32,7 +32,7 @@ router.post('/fiat/webhook',   depositController.localFiatDepositWebhook);
 router.post('/webhook/tatum',  depositController.tatumCryptoWebhook);
 
 // ── Moolre MoMo PIN-push collection on-ramp (2026-06-23) ──────────────────────
-router.post('/fiat/initiate/moolre',     protectActive, depositController.initiateMoolreFiatDeposit);
+router.post('/fiat/initiate/moolre',     protectActive, validate(initiateMoolreFiatDepositSchema), depositController.initiateMoolreFiatDeposit);
 router.post('/fiat/initiate/moolre/otp', protectActive, depositController.confirmMoolreOtp);
 router.post('/fiat/webhook/moolre',      depositController.moolreCollectionWebhook); // no JWT — secret-guarded
 router.post('/validate-name',            protectActive, depositController.validateMomoName);

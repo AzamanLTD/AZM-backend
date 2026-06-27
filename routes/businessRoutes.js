@@ -24,10 +24,12 @@ const kybCtrl     = require('../controllers/businessKybController');
 const notifCtrl   = require('../controllers/bizNotificationController');
 const locationCtrl = require('../controllers/businessLocationController');
 const invoiceCtrl  = require('../controllers/businessInvoiceController');
+const catalogCtrl  = require('../controllers/catalogSectionController');
 
 // Business account routes. Zod validate() guards register/profile at the edge,
 // mirroring withdrawalRoutes; controllers keep their fallback checks intact.
 router.post('/register', protectActive, validate(businessRegisterSchema), ctrl.registerBusiness);
+router.get('/subcategories', ctrl.getSubcategories);         // public — category hierarchy
 router.get('/search', ctrl.searchBusinesses);                // public
 router.get('/me', protect, ctrl.getMyBusiness);
 router.patch('/profile', protect, validate(businessUpdateSchema), ctrl.updateBusinessProfile);
@@ -89,6 +91,15 @@ router.post('/invoices/:invoiceId/pay',    protect, protectActive, invoiceCtrl.p
 // ── REVIEW ROUTES ─────────────────────────────────────────────────────────────
 router.post('/reviews',                    protect, protectActive, invoiceCtrl.createReview);
 router.get('/:bizId/reviews',                         invoiceCtrl.listReviews);      // public
+
+// ── CATALOG SECTION ROUTES (2026-06-24) ───────────────────────────────────────
+// Static /catalog/* paths and the two-segment /:bizId/menu lookup, all declared
+// before the /:bizId single-segment catch-all below.
+router.get('/:bizId/menu',                     catalogCtrl.getPublicMenu);          // public
+router.get('/catalog/sections',                protect, catalogCtrl.listMySections);
+router.post('/catalog/sections',               protect, catalogCtrl.createSection);
+router.patch('/catalog/sections/:sectionId',   protect, catalogCtrl.updateSection);
+router.delete('/catalog/sections/:sectionId',  protect, catalogCtrl.deleteSection);
 
 // Public business profile lookup — MUST be last
 router.get('/:bizId', ctrl.getBusinessByBizId);
