@@ -229,14 +229,18 @@ class NotificationService {
         };
     }
 
-    formatDepositSuccess(amountUsdc) {
+    formatDepositSuccess(amountUsdc, reference = null) {
         return {
             title:         '💰 Deposit Confirmed',
             body:          amountUsdc
-                ? `${amountUsdc} USDC has been credited to your account.`
+                ? `GH₵${amountUsdc} USDC added to your wallet.`
                 : 'Your deposit has been confirmed.',
             category:      'GENERAL',
-            actionPayload: { route: '/wallet', action: 'OPEN_WALLET' }
+            actionPayload: {
+                route:     '/wallet',
+                action:    'OPEN_WALLET',
+                reference: reference,
+            }
         };
     }
 

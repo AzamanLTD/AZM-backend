@@ -198,7 +198,7 @@ class MtnDisbursementService {
         }
 
         const finalExternalId   = externalId   || `AZAMAN_${Date.now()}`;
-        const finalPayerMessage = (payerMessage || 'Azaman fiat withdrawal').slice(0, 160);
+        const finalPayerMessage = (payerMessage || 'Azaman MoMo withdrawal').slice(0, 160);
         const finalPayeeNote    = (payeeNote    || 'Azaman MoMo payout').slice(0, 160);
 
         if (this.providerMode === 'MOCK') {

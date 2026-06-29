@@ -497,7 +497,7 @@ exports.tatumCryptoWebhook = async (req, res) => {
                     title:         'Crypto Deposit Confirmed',
                     body:          `${amountUsdc} USDC has been credited to your account via Polygon.`,
                     category:      'GENERAL',
-                    actionPayload: { action: 'OPEN_WALLET', txHash, network: 'Polygon' }
+                    actionPayload: { action: 'OPEN_WALLET', reference: txHash, network: 'Polygon' }
                 });
             } catch (err) {
                 console.error('[tatumCryptoWebhook] notification non-fatal:', err.message);

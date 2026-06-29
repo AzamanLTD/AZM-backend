@@ -151,8 +151,8 @@ const processFiatWithdrawal = async (prisma, userId, amountFloat, opts = {}) => 
     const fiatPool = await prisma.systemFiatPool.findUnique({ where: { id: 1 } });
     if (!fiatPool || Number(fiatPool.balance) < amountFloat) {
         const err = new Error(
-            'Platform fiat liquidity is temporarily insufficient. Your USDC has not been deducted. ' +
-            'Please try again shortly or contact support.'
+            'MoMo payouts are temporarily at capacity. Your USDC has not been deducted. ' +
+            'Please try again in a few minutes or contact support.'
         );
         err.code = 'FIAT_POOL_INSUFFICIENT';
         throw err;

@@ -210,7 +210,7 @@ exports.fiatWithdrawal = async (req, res) => {
                 amountGhs:      data.payoutGhs || data.withdrawalAmount,  // GHS amount derived by service if available
                 recipientPhone: phone,
                 externalId:     reference,
-                payerMessage:   'Azaman fiat withdrawal',
+                payerMessage:   `Azaman withdrawal ref ${reference}`,
                 payeeNote:      `Withdrawal ${reference}`
             });
 

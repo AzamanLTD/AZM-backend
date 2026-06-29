@@ -127,7 +127,7 @@ exports.fiatWithdrawal = async (req, res) => {
                 amountGhs:      payoutGhs,
                 recipientPhone,
                 externalId:     `AZAMAN_${userId}_${Date.now()}`,
-                payerMessage:   `Azaman fiat withdrawal #${data.transaction.id}`,
+                payerMessage:   `Azaman withdrawal ref ${reference}`,
                 payeeNote:      `Azaman MoMo payout (${networkChoice})`
             });
         } catch (gatewayErr) {
@@ -339,7 +339,7 @@ exports.cryptoDepositWebhook = async (req, res) => {
                 title:         '💰 Deposit Confirmed',
                 body:          `${amountUsdc} USDC has been credited to your account.`,
                 category:      'GENERAL',
-                actionPayload: { action: 'OPEN_WALLET', txHash }
+                actionPayload: { action: 'OPEN_WALLET', reference: txHash }
             });
         } catch (notifErr) {
             console.error('[cryptoDepositWebhook] Notification write failed:', notifErr.message);
