@@ -43,6 +43,11 @@ describeOrSkip('Deposit flow', () => {
   });
 
   afterEach(async () => {
+    // Drain the event loop so any setImmediate callbacks (e.g. notification
+    // side-effects fired by the deposit webhook) complete before we wipe the DB.
+    // Without this, the async notification INSERT races against TRUNCATE and
+    // causes a PostgreSQL deadlock (code 40P01).
+    await new Promise(r => setTimeout(r, 150));
     await prisma.$executeRawUnsafe(
       'TRUNCATE TABLE "User", "TransactionHistory" RESTART IDENTITY CASCADE'
     );

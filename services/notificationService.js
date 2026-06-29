@@ -125,9 +125,13 @@ class NotificationService {
     async _triggerPushNotification(userId, title, body, actionPayload) {
         try {
             // Only fire FCM when the user has no live socket connection
-            if (this.io) {
-                const sockets = await this.io.in(`user_${userId}`).allSockets();
-                if (sockets && sockets.size > 0) return; // user is online — skip FCM
+            if (this.io && typeof this.io.in === 'function') {
+                try {
+                    const sockets = await this.io.in(`user_${userId}`).allSockets();
+                    if (sockets && sockets.size > 0) return; // user is online — skip FCM
+                } catch (_) {
+                    // socket adapter not available (e.g. test environment) — proceed to FCM
+                }
             }
 
             const user = await this.prisma.user.findUnique({
