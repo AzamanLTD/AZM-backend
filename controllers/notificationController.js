@@ -16,13 +16,15 @@ exports.getNotifications = async (req, res) => {
     try {
         const userId = req.user.id;
         const unreadOnly = req.query.unreadOnly === 'true';
+        const category = req.query.category || null;
         const { take, cursor, page, mode } = parsePagination(req.query);
 
         const result = await getService(req).getNotifications(userId, {
             limit: take,
             page,
             cursor,
-            unreadOnly
+            unreadOnly,
+            category
         });
 
         // result.notifications is the array; envelope wraps it with cursor info.

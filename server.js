@@ -520,6 +520,9 @@ io.use((socket, next) => {
 
 const vendorStatus = new Map();
 
+// B-11: Transit booking routes
+const transitRoutes = require('./routes/transitRoutes');
+
 // --- TRADE SOCKET SERVICE ---
 const TradeSocketService = require('./services/tradeSocketService');
 const tradeSocketService = new TradeSocketService(io, prisma);
@@ -1085,6 +1088,9 @@ app.use('/api/azm-auction',   generalLimiter,   azmAuctionRoutes);
 // Master Sprint v2 (2026-05-27): Saved MoMo accounts (deposit address book)
 app.use('/api/saved-momo',    financialLimiter, savedMomoRoutes);
 
+// B-11: Transit booking system
+app.use('/api/transit',       generalLimiter,   transitRoutes);
+
 // ── PRIVATE SUSU ECOSYSTEM OVERLAY ROUTES (2026-05-31) ────────────────────────
 // PoR + Liability + Admin War Room. Susu overlay endpoints are added inside
 // the existing /api/susu router (routes/susuRoutes.js) so /api/susu remains
@@ -1400,6 +1406,26 @@ io.on('connection', (socket) => {
         console.error('[socket.connect] initial balance emit error:', err.message);
     });
 
+    // ── B-7: Online / Offline / Last-Seen tracking ────────────────────────────
+    // Mark user online on connect, offline on disconnect. Emit to friends so
+    // chat surfaces show presence dots. Track lastSeenAt for "seen X ago" UI.
+    prisma.user.update({
+        where: { id: userId },
+        data: { isOnline: true, lastSeenAt: new Date() },
+    }).catch(() => {});
+
+    // Broadcast to friend rooms that this user came online (each friend's
+    // user_${friendId} room). Any friend who has this user as a friend can
+    // pick up the event.
+    socket.broadcast.emit('user_online', { userId, lastSeenAt: new Date().toISOString() });
+
+    socket.on('user_heartbeat', () => {
+        prisma.user.update({
+            where: { id: userId },
+            data: { lastSeenAt: new Date() },
+        }).catch(() => {});
+    });
+
     // 1. Room Management — VALIDATED against socket.user
     socket.on('join_balance_room', (requestedUserId) => {
         // Only allow joining own balance room
@@ -1595,7 +1621,13 @@ io.on('connection', (socket) => {
     });
 
     socket.on('disconnect', () => {
-        // Clean disconnect — no logging in production to reduce noise
+        // B-7: mark user offline and broadcast to friends
+        const now = new Date();
+        prisma.user.update({
+            where: { id: userId },
+            data: { isOnline: false, lastSeenAt: now },
+        }).catch(() => {});
+        socket.broadcast.emit('user_offline', { userId, lastSeenAt: now.toISOString() });
     });
 });
 

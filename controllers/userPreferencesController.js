@@ -259,6 +259,54 @@ exports.updateAll = async (req, res) => {
 
 
 // =============================================================================
+// 5. UPDATE PREFERRED CURRENCY
+//    PATCH /api/users/preferences/currency
+//    Body: { currency: 'USD' | 'GHS' | 'NGN' | 'KES' | ... }
+// =============================================================================
+exports.updatePreferredCurrency = async (req, res) => {
+    const prisma = req.app.get('prisma');
+
+    try {
+        const userId = req.user.id;
+        const { currency } = req.body;
+
+        if (!currency || typeof currency !== 'string' || currency.trim().length === 0) {
+            return res.status(400).json({ success: false, message: 'currency is required.' });
+        }
+
+        const code = currency.trim().toUpperCase();
+        if (code.length > 8) {
+            return res.status(400).json({ success: false, message: 'Currency code too long (max 8 chars).' });
+        }
+
+        await prisma.user.update({
+            where: { id: userId },
+            data: { preferredCurrency: code }
+        });
+
+        // Broadcast preference change so other sessions pick it up
+        try {
+            const io = req.app.get('socketio');
+            if (io) {
+                io.to(`user_${userId}`).emit('preferences_updated', {
+                    type: 'CURRENCY',
+                    preferredCurrency: code
+                });
+            }
+        } catch (_) { /* non-fatal */ }
+
+        return res.status(200).json({
+            success: true,
+            message: `Preferred currency updated to "${code}".`,
+            data: { preferredCurrency: code }
+        });
+    } catch (error) {
+        console.error('[userPreferences.updatePreferredCurrency] error:', error.message);
+        return res.status(500).json({ success: false, message: error.message });
+    }
+};
+
+// =============================================================================
 // INTERNAL HELPERS
 // =============================================================================
 

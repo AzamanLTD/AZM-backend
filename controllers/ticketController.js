@@ -466,7 +466,9 @@ exports.getTicket = async (req, res) => {
 // Body: {
 //   content?, type?, metadata?,
 //   mediaUrl?, mediaType?, mediaMimeType?, mediaSize?,
-//   mediaDuration?, mediaWaveformPeaks?, linkPreview?
+//   mediaDuration?, mediaWaveformPeaks?, linkPreview?,
+//   // B-6 reply-to support
+//   replyToId?, replyToText?, replyToSenderName?
 // }
 // =============================================================================
 exports.sendTicketMessage = async (req, res) => {
@@ -480,7 +482,8 @@ exports.sendTicketMessage = async (req, res) => {
         const {
             content, type, metadata,
             mediaUrl, mediaType, mediaMimeType, mediaSize,
-            mediaDuration, mediaWaveformPeaks, linkPreview
+            mediaDuration, mediaWaveformPeaks, linkPreview,
+            replyToId, replyToText, replyToSenderName
         } = req.body;
 
         const auth = await _verifyTicketParticipant(prisma, id, userId);
@@ -523,7 +526,11 @@ exports.sendTicketMessage = async (req, res) => {
                 mediaSize: typeof mediaSize === 'number' ? mediaSize : null,
                 mediaDuration: typeof mediaDuration === 'number' ? mediaDuration : null,
                 mediaWaveformPeaks: Array.isArray(mediaWaveformPeaks) ? mediaWaveformPeaks : null,
-                linkPreview: resolvedLinkPreview
+                linkPreview: resolvedLinkPreview,
+                // B-6 reply-to support
+                replyToId: replyToId || null,
+                replyToText: replyToText || null,
+                replyToSenderName: replyToSenderName || null
             },
             include: {
                 sender: { select: { id: true, username: true, profilePictureUrl: true } }

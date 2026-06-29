@@ -744,3 +744,55 @@ exports.getFiatPoolStatus = async (req, res) => {
         return res.status(500).json({ success: false, message: error.message });
     }
 };
+
+// =============================================================================
+// B-9: GET /api/finance/transactions
+// Authenticated user's own transaction history with optional filters.
+// Query params: type?, status?, startDate?, endDate?, cursor?, limit?
+// =============================================================================
+exports.getTransactionHistory = async (req, res) => {
+    const prisma = req.app.get('prisma');
+    try {
+        const userId = req.user.id;
+        const { type, status, startDate, endDate } = req.query;
+        const limit = Math.min(parseInt(req.query.limit, 10) || 50, 100);
+        const cursor = req.query.cursor || null;
+
+        const where = { userId };
+
+        if (type) {
+            const upper = String(type).toUpperCase();
+            where.type = upper;
+        }
+        if (status) {
+            const upper = String(status).toUpperCase();
+            where.status = upper;
+        }
+        if (startDate || endDate) {
+            where.createdAt = {};
+            if (startDate) where.createdAt.gte = new Date(startDate);
+            if (endDate) where.createdAt.lte = new Date(endDate);
+        }
+
+        const transactions = await prisma.transactionHistory.findMany({
+            where,
+            orderBy: { createdAt: 'desc' },
+            take: limit + 1,
+            ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {})
+        });
+
+        const hasMore = transactions.length > limit;
+        const slice = hasMore ? transactions.slice(0, limit) : transactions;
+        const nextCursor = hasMore ? slice[slice.length - 1].id : null;
+
+        return res.status(200).json({
+            success: true,
+            transactions: slice,
+            hasMore,
+            nextCursor
+        });
+    } catch (error) {
+        console.error('[finance.getTransactionHistory] error:', error.message);
+        return res.status(500).json({ success: false, message: error.message });
+    }
+};

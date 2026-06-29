@@ -238,7 +238,7 @@ class GroupChatService {
     // MESSAGES
     // =========================================================================
 
-    async sendMessage({ groupId, senderId, type = 'TEXT', content, metadata, media }) {
+    async sendMessage({ groupId, senderId, type = 'TEXT', content, metadata, media, replyToId, replyToText, replyToSenderName, stickerAssetPath, stickerIsAnimated }) {
         // Validate sender is an active member
         const member = await this.prisma.groupMember.findUnique({
             where: { groupId_userId: { groupId, userId: senderId } },
@@ -260,6 +260,17 @@ class GroupChatService {
             data.mediaDuration = media.duration;
             data.mediaWaveformPeaks = media.waveformPeaks;
             data.linkPreview = media.linkPreview;
+        }
+        // B-5: reply-to support
+        if (replyToId) {
+            data.replyToId = replyToId;
+            data.replyToText = replyToText || null;
+            data.replyToSenderName = replyToSenderName || null;
+        }
+        // B-5: sticker support
+        if (stickerAssetPath) {
+            data.stickerAssetPath = stickerAssetPath;
+            data.stickerIsAnimated = stickerIsAnimated === true ? true : null;
         }
 
         const msg = await this.prisma.groupMessage.create({

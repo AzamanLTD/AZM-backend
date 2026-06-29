@@ -149,6 +149,10 @@ enum MessageType {
   DOCUMENT
   AUDIO
   LINK
+  // Phase UI-4 (2026-05-26): event card injected when a Ticket is created
+  TICKET_LINK
+  // B-1 (2026-06-28): sticker message support
+  STICKER
 }
 
 enum ColdStorageDirection {
@@ -204,6 +208,8 @@ enum DirectMessageType {
   // created/closed/cancelled inside a friendship; clicking deep-links
   // to the Ticket workspace.
   TICKET_LINK
+  // B-1 (2026-06-28): sticker message support
+  STICKER
 }
 
 enum VendorLevel {
@@ -280,6 +286,16 @@ enum BusinessCategory {
   LOGISTICS
   FINANCIAL_SERVICES
   OTHER
+}
+
+// B-14 (2026-06-28): category image lookup — one image URL per category
+model BusinessCategoryImage {
+  id       String          @id @default(uuid())
+  category BusinessCategory @unique
+  imageUrl String
+  createdAt DateTime @default(now())
+
+  @@index([category])
 }
 
 // Reservation lifecycle (Marketplace Foundation, 2026-06-24)
@@ -664,6 +680,11 @@ model User {
   customShortcuts     Json? // Array of shortcut IDs in user's preferred order
   settingsPreferences Json? // General settings blob (haptics, sounds, etc.)
 
+  // B-1 (2026-06-28): display currency preference + online presence
+  preferredCurrency   String?   @default("USD")
+  lastSeenAt          DateTime?
+  isOnline            Boolean   @default(false)
+
   // --- V4: ONBOARDING & PROFILE ENHANCEMENTS ---
   onboardingCompleted Boolean   @default(false) // Whether user finished the onboarding flow
   onboardingStep      Int       @default(0) // Last completed onboarding step (0 = not started)
@@ -757,6 +778,9 @@ model User {
 
   // Marketplace Foundation (2026-06-24): bookings this user holds
   reservations  Reservation[]  @relation("CustomerReservations")
+
+  // B-2 (2026-06-28): transit bookings as customer
+  transitBookings TransitBooking[] @relation("TransitBookingCustomer")
 
   // V3: Vendor Gamification
   adInteractions     AdInteraction[]
@@ -1609,6 +1633,15 @@ model DirectMessage {
   mediaWaveformPeaks Json?
   linkPreview        Json?
 
+  // B-1 (2026-06-28): reply-to support
+  replyToId          String?
+  replyToText        String?
+  replyToSenderName  String?
+
+  // B-1 (2026-06-28): sticker support
+  stickerAssetPath   String?
+  stickerIsAnimated  Boolean?
+
   friendship Friendship @relation(fields: [friendshipId], references: [id], onDelete: Cascade)
   sender     User       @relation("DirectMessageSender", fields: [senderId], references: [id], onDelete: Cascade)
   receiver   User       @relation("DirectMessageReceiver", fields: [receiverId], references: [id], onDelete: Cascade)
@@ -2077,6 +2110,11 @@ model TicketMessage {
   mediaWaveformPeaks Json?
   linkPreview        Json?
 
+  // B-1 (2026-06-28): reply-to support
+  replyToId          String?
+  replyToText        String?
+  replyToSenderName  String?
+
   ticket Ticket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
   sender User   @relation("TicketMessageSender", fields: [senderId], references: [id], onDelete: Cascade)
 
@@ -2250,6 +2288,10 @@ model BusinessProfile {
   catalogSections   CatalogSection[]
   availabilityRules AvailabilityRule[]
   reservations      Reservation[]
+
+  // B-2 (2026-06-28): transit fleet and bookings
+  transitVehicles   TransitVehicle[]
+  transitBookings   TransitBooking[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -2646,6 +2688,88 @@ model Reservation {
 }
 
 // =============================================================================
+// B-2 (2026-06-28): TRANSIT VEHICLE + BOOKING — Ride-hailing and delivery fleet
+// =============================================================================
+
+enum TransitBookingStatus {
+  PENDING
+  CONFIRMED
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+  NO_SHOW
+}
+
+model TransitVehicle {
+  id                String   @id @default(uuid())
+  businessProfileId String
+  type              String   // CAR, VAN, TRUCK, MOTORCYCLE, BICYCLE, SCOOTER
+  make              String?  @db.VarChar(100)
+  model             String?  @db.VarChar(100)
+  year              Int?
+  color             String?  @db.VarChar(50)
+  licensePlate      String?  @db.VarChar(20)
+  capacity          Int      @default(4) // passenger or cargo capacity
+  imageUrl          String?
+  isActive          Boolean  @default(true)
+  driverName        String?  @db.VarChar(100)
+  driverPhone       String?  @db.VarChar(20)
+  driverPhotoUrl    String?
+
+  // Additional metadata (insurance docs, permit, etc.)
+  metadata          Json?
+
+  businessProfile BusinessProfile     @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+  bookings        TransitBooking[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([businessProfileId])
+  @@index([businessProfileId, isActive])
+  @@index([type])
+}
+
+model TransitBooking {
+  id                String               @id @default(uuid())
+  businessProfileId String
+  vehicleId         String?
+  customerId        Int
+  status            TransitBookingStatus @default(PENDING)
+  pickupAddress     String               @db.VarChar(255)
+  dropoffAddress    String               @db.VarChar(255)
+  pickupLatitude    Decimal?             @db.Decimal(10, 7)
+  pickupLongitude   Decimal?             @db.Decimal(10, 7)
+  dropoffLatitude   Decimal?             @db.Decimal(10, 7)
+  dropoffLongitude  Decimal?             @db.Decimal(10, 7)
+  scheduledAt       DateTime?
+  pickupTime        DateTime?
+  dropoffTime       DateTime?
+  amountUsdc        Decimal              @db.Decimal(20, 8)
+  feeUsdc           Decimal              @default(0) @db.Decimal(20, 8)
+  customerNote      String?              @db.VarChar(500)
+  driverNote        String?              @db.VarChar(500)
+  rating            Int?                 // 1–5 customer rating after completion
+  reviewComment     String?              @db.VarChar(1000)
+  bookingRef        String               @unique // e.g. "TRN-2806-A1B2"
+  metadata          Json?
+
+  businessProfile BusinessProfile  @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+  vehicle         TransitVehicle?  @relation(fields: [vehicleId], references: [id], onDelete: SetNull)
+  customer        User             @relation("TransitBookingCustomer", fields: [customerId], references: [id])
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([businessProfileId])
+  @@index([businessProfileId, status])
+  @@index([customerId])
+  @@index([vehicleId])
+  @@index([status])
+  @@index([scheduledAt])
+}
+
+// =============================================================================
 // MASTER SPRINT (2026-05-27): VAULTS, SUSU, SMART ROUTE, AZM AUCTION
 // =============================================================================
 
@@ -2835,6 +2959,15 @@ model GroupMessage {
   mediaDuration      Int?
   mediaWaveformPeaks Json?
   linkPreview        Json?
+
+  // B-1 (2026-06-28): reply-to support
+  replyToId          String?
+  replyToText        String?
+  replyToSenderName  String?
+
+  // B-1 (2026-06-28): sticker support
+  stickerAssetPath   String?
+  stickerIsAnimated  Boolean?
 
   group  GroupChat @relation(fields: [groupId], references: [id], onDelete: Cascade)
   sender User?     @relation("GroupMessageSender", fields: [senderId], references: [id], onDelete: SetNull)

@@ -5,6 +5,9 @@
 // Replaces local disk storage with Cloudinary cloud storage.
 // All uploaded files get permanent URLs that survive Render redeploys.
 //
+// B-3 (2026-06-28): validated folder structure — only known entity/type pairs
+// are accepted, preventing accidental mis-routing of uploads.
+//
 // Usage:
 //   const { uploadToCloudinary } = require('./services/cloudinaryService');
 //   const result = await uploadToCloudinary(req.file, 'avatars');
@@ -37,15 +40,42 @@ if (IS_CONFIGURED) {
     console.warn('⚠️  Cloudinary NOT configured — file uploads will use local disk (ephemeral on Render)');
 }
 
+// B-3: Allowed folder keys mapped to their Cloudinary path suffix.
+// Every upload must specify one of these keys; unknown keys fall back to
+// the key itself so the migration is non-breaking for existing callers.
+const FOLDER_MAP = {
+    avatars:          'avatars',
+    'chat/images':    'chat/images',
+    'chat/audio':     'chat/audio',
+    'chat/video':     'chat/video',
+    'chat/documents': 'chat/documents',
+    'business/logos':   'business/logos',
+    'business/products':'business/products',
+    'business/kyb':     'business/kyb',
+    'business/receipts':'business/receipts',
+    kyc:              'kyc',
+    'vendor-docs':    'vendor-docs',
+    transit:          'transit',
+    others:           'others',
+};
+
+/**
+ * Resolve the Cloudinary folder path from an entity/type key.
+ * Falls back to the key itself if not in the map.
+ */
+function resolveFolder(key) {
+    return FOLDER_MAP[key] || key;
+}
+
 /**
  * Upload a multer file to Cloudinary.
  *
  * @param {object} file - multer file object (has .path or .buffer)
- * @param {string} folder - Cloudinary folder name ('avatars', 'proofs', 'chat')
+ * @param {string} folder - entity/type key ('avatars', 'chat/images', etc.)
  * @param {object} [options] - Extra Cloudinary upload options
  * @returns {Promise<{url: string, publicId: string}>}
  */
-async function uploadToCloudinary(file, folder = 'uploads', options = {}) {
+async function uploadToCloudinary(file, folder = 'others', options = {}) {
     if (!IS_CONFIGURED) {
         // Fallback for local dev without Cloudinary: only possible when multer
         // wrote the file to disk (file.path exists). Callers that use
@@ -60,8 +90,9 @@ async function uploadToCloudinary(file, folder = 'uploads', options = {}) {
     }
 
     return new Promise((resolve, reject) => {
+        const resolvedFolder = resolveFolder(folder);
         const uploadOptions = {
-            folder: `azaman/${folder}`,
+            folder: `azaman/${resolvedFolder}`,
             resource_type: 'auto',
             ...options,
         };

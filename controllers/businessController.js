@@ -159,3 +159,149 @@ exports.getSubcategories = async (req, res) => {
         return res.status(500).json({ success: false, message: err.message });
     }
 };
+
+// =============================================================================
+// B-13: TRANSIT VEHICLE MANAGEMENT
+// =============================================================================
+
+// GET /api/business/vehicles — list the business owner's fleet
+exports.listVehicles = async (req, res) => {
+    const prisma = req.app.get('prisma');
+    try {
+        const profile = await prisma.businessProfile.findUnique({
+            where: { userId: req.user.id },
+            select: { id: true }
+        });
+        if (!profile) return res.status(404).json({ success: false, message: 'No business profile.' });
+
+        const vehicles = await prisma.transitVehicle.findMany({
+            where: { businessProfileId: profile.id },
+            orderBy: { createdAt: 'desc' }
+        });
+
+        return res.status(200).json({ success: true, vehicles });
+    } catch (err) {
+        console.error('[listVehicles] error:', err.message);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+};
+
+// POST /api/business/vehicles — add a vehicle to the fleet
+exports.createVehicle = async (req, res) => {
+    const prisma = req.app.get('prisma');
+    try {
+        const profile = await prisma.businessProfile.findUnique({
+            where: { userId: req.user.id },
+            select: { id: true, isSuspended: true }
+        });
+        if (!profile) return res.status(404).json({ success: false, message: 'No business profile.' });
+        if (profile.isSuspended) return res.status(403).json({ success: false, message: 'Business is suspended.' });
+
+        const { type, make, model, year, color, licensePlate, capacity, imageUrl, driverName, driverPhone, driverPhotoUrl, metadata } = req.body;
+
+        if (!type) return res.status(400).json({ success: false, message: 'type is required (CAR, VAN, TRUCK, MOTORCYCLE, BICYCLE, SCOOTER).' });
+
+        const vehicle = await prisma.transitVehicle.create({
+            data: {
+                businessProfileId: profile.id,
+                type: String(type).toUpperCase(),
+                make: make || null,
+                model: model || null,
+                year: year ? parseInt(year, 10) : null,
+                color: color || null,
+                licensePlate: licensePlate || null,
+                capacity: typeof capacity === 'number' ? capacity : 4,
+                imageUrl: imageUrl || null,
+                isActive: true,
+                driverName: driverName || null,
+                driverPhone: driverPhone || null,
+                driverPhotoUrl: driverPhotoUrl || null,
+                metadata: metadata || null
+            }
+        });
+
+        return res.status(201).json({ success: true, vehicle });
+    } catch (err) {
+        console.error('[createVehicle] error:', err.message);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+};
+
+// PATCH /api/business/vehicles/:vehicleId — update vehicle details
+exports.updateVehicle = async (req, res) => {
+    const prisma = req.app.get('prisma');
+    try {
+        const profile = await prisma.businessProfile.findUnique({
+            where: { userId: req.user.id },
+            select: { id: true }
+        });
+        if (!profile) return res.status(404).json({ success: false, message: 'No business profile.' });
+
+        const { vehicleId } = req.params;
+        const existing = await prisma.transitVehicle.findUnique({
+            where: { id: vehicleId },
+            select: { id: true, businessProfileId: true }
+        });
+        if (!existing || existing.businessProfileId !== profile.id) {
+            return res.status(404).json({ success: false, message: 'Vehicle not found.' });
+        }
+
+        const { type, make, model, year, color, licensePlate, capacity, imageUrl, isActive, driverName, driverPhone, driverPhotoUrl, metadata } = req.body;
+
+        const data = {};
+        if (type !== undefined) data.type = String(type).toUpperCase();
+        if (make !== undefined) data.make = make;
+        if (model !== undefined) data.model = model;
+        if (year !== undefined) data.year = parseInt(year, 10);
+        if (color !== undefined) data.color = color;
+        if (licensePlate !== undefined) data.licensePlate = licensePlate;
+        if (capacity !== undefined) data.capacity = capacity;
+        if (imageUrl !== undefined) data.imageUrl = imageUrl;
+        if (isActive !== undefined) data.isActive = isActive;
+        if (driverName !== undefined) data.driverName = driverName;
+        if (driverPhone !== undefined) data.driverPhone = driverPhone;
+        if (driverPhotoUrl !== undefined) data.driverPhotoUrl = driverPhotoUrl;
+        if (metadata !== undefined) data.metadata = metadata;
+
+        const vehicle = await prisma.transitVehicle.update({
+            where: { id: vehicleId },
+            data
+        });
+
+        return res.status(200).json({ success: true, vehicle });
+    } catch (err) {
+        console.error('[updateVehicle] error:', err.message);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+};
+
+// DELETE /api/business/vehicles/:vehicleId — remove a vehicle from the fleet
+exports.deleteVehicle = async (req, res) => {
+    const prisma = req.app.get('prisma');
+    try {
+        const profile = await prisma.businessProfile.findUnique({
+            where: { userId: req.user.id },
+            select: { id: true }
+        });
+        if (!profile) return res.status(404).json({ success: false, message: 'No business profile.' });
+
+        const { vehicleId } = req.params;
+        const existing = await prisma.transitVehicle.findUnique({
+            where: { id: vehicleId },
+            select: { id: true, businessProfileId: true }
+        });
+        if (!existing || existing.businessProfileId !== profile.id) {
+            return res.status(404).json({ success: false, message: 'Vehicle not found.' });
+        }
+
+        await prisma.transitVehicle.update({
+            where: { id: vehicleId },
+            data: { isActive: false }
+        });
+
+        return res.status(200).json({ success: true, message: 'Vehicle deactivated.' });
+    } catch (err) {
+        console.error('[deleteVehicle] error:', err.message);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+};

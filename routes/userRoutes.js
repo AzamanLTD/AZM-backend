@@ -56,6 +56,8 @@ router.get('/preferences', protect, userPreferencesController.getPreferences);
 router.put('/preferences/theme', protect, userPreferencesController.updateTheme);
 router.put('/preferences/shortcuts', protect, userPreferencesController.updateShortcuts);
 router.put('/preferences', protect, userPreferencesController.updateAll);
+// B-10: preferred display currency (USD, GHS, NGN, KES, etc.)
+router.patch('/preferences/currency', protect, userPreferencesController.updatePreferredCurrency);
 
 // ─── MILESTONES & SECURITY LOGS ──────────────────────────────────────────────
 router.get('/me/milestones', protect, milestoneController.getMilestones);

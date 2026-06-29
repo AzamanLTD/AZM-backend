@@ -65,6 +65,27 @@ exports.listInvoices = async (req, res) => {
   } catch (err) { return _err(res, err); }
 };
 
+// GET /api/business/invoices/lookup/:azmId — resolve an AZM-ID to customer info
+exports.lookupByAzmId = async (req, res) => {
+  const prisma = req.app.get("prisma");
+  try {
+    await _ownedProfile(prisma, req.user.id);
+    const { azmId } = req.params;
+    if (!azmId || !azmId.startsWith("AZM-")) {
+      return res.status(400).json({ success: false, message: "Valid AZM-ID required (AZM-XXXXXXXXX)." });
+    }
+    const customer = await prisma.user.findUnique({
+      where: { azamanId: azmId },
+      select: {
+        id: true, username: true, displayName: true,
+        profilePictureUrl: true, azamanId: true
+      }
+    });
+    if (!customer) return res.status(404).json({ success: false, message: "Customer not found." });
+    return res.json({ success: true, customer });
+  } catch (err) { return _err(res, err); }
+};
+
 // GET /api/business/invoices/:invoiceId
 exports.getInvoice = async (req, res) => {
   const prisma = req.app.get("prisma");

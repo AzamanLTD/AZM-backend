@@ -81,6 +81,7 @@ router.get('/:bizId/products',                        productCtrl.listProductsBy
 
 // ── INVOICE ROUTES ────────────────────────────────────────────────────────────
 router.get('/customers/lookup',            protect,                invoiceCtrl.lookupCustomer);
+router.get('/invoices/lookup/:azmId',      protect,                invoiceCtrl.lookupByAzmId);
 router.post('/invoices',                   protect, protectActive, invoiceCtrl.createInvoice);
 router.get('/invoices',                    protect,                invoiceCtrl.listInvoices);
 router.get('/invoices/:invoiceId',         protect,                invoiceCtrl.getInvoice);
@@ -100,6 +101,13 @@ router.get('/catalog/sections',                protect, catalogCtrl.listMySectio
 router.post('/catalog/sections',               protect, catalogCtrl.createSection);
 router.patch('/catalog/sections/:sectionId',   protect, catalogCtrl.updateSection);
 router.delete('/catalog/sections/:sectionId',  protect, catalogCtrl.deleteSection);
+
+// ── TRANSIT VEHICLE ROUTES (B-13, 2026-06-28) ─────────────────────────────────
+// Business owners manage their fleet vehicles for ride-hailing/delivery.
+router.get('/vehicles',                        protect,                ctrl.listVehicles);
+router.post('/vehicles',                       protect, protectActive, ctrl.createVehicle);
+router.patch('/vehicles/:vehicleId',           protect, protectActive, ctrl.updateVehicle);
+router.delete('/vehicles/:vehicleId',          protect, protectActive, ctrl.deleteVehicle);
 
 // Public business profile lookup — MUST be last
 router.get('/:bizId', ctrl.getBusinessByBizId);

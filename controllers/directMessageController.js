@@ -95,11 +95,14 @@ exports.getMessages = async (req, res) => {
 // POST /api/friends/chat/:friendshipId/messages
 // Body: {
 //   content,                      // optional for media-only messages
-//   messageType?,                 // TEXT | IMAGE | VIDEO | DOCUMENT | AUDIO | LINK | TICKET_LINK | TRANSFER_*
+//   messageType?,                 // TEXT | IMAGE | VIDEO | DOCUMENT | AUDIO | LINK | STICKER | TICKET_LINK | TRANSFER_*
 //   metadata?,                    // transfer details, ticket id, etc.
 //   // Phase UI-3 (2026-05-26) media fields — required when messageType is media-typed
 //   mediaUrl?, mediaType?, mediaMimeType?, mediaSize?,
 //   mediaDuration?, mediaWaveformPeaks?, linkPreview?
+//   // B-4 (2026-06-28) reply-to + sticker fields
+//   replyToId?, replyToText?, replyToSenderName?
+//   stickerAssetPath?, stickerIsAnimated?
 // }
 // =============================================================================
 exports.sendMessage = async (req, res) => {
@@ -120,20 +123,30 @@ exports.sendMessage = async (req, res) => {
             mediaSize,
             mediaDuration,
             mediaWaveformPeaks,
-            linkPreview
+            linkPreview,
+            // B-4 reply-to + sticker
+            replyToId,
+            replyToText,
+            replyToSenderName,
+            stickerAssetPath,
+            stickerIsAnimated
         } = req.body;
 
         const finalType = (messageType || 'TEXT').toString().toUpperCase();
         const isMedia = ['IMAGE', 'VIDEO', 'DOCUMENT', 'AUDIO', 'LINK'].includes(finalType);
+        const isSticker = finalType === 'STICKER';
         const isTicketLink = finalType === 'TICKET_LINK';
 
         // Validation: text messages need content; media messages need a mediaUrl;
-        // ticket links need metadata.ticketId.
-        if (!isMedia && !isTicketLink && (!content || content.trim().length === 0)) {
+        // sticker needs stickerAssetPath; ticket links need metadata.ticketId.
+        if (!isMedia && !isSticker && !isTicketLink && (!content || content.trim().length === 0)) {
             return res.status(400).json({ success: false, message: 'Message content is required.' });
         }
         if (isMedia && !mediaUrl) {
             return res.status(400).json({ success: false, message: 'mediaUrl required for media messages.' });
+        }
+        if (isSticker && !stickerAssetPath) {
+            return res.status(400).json({ success: false, message: 'stickerAssetPath required for sticker messages.' });
         }
         if (isTicketLink && (!metadata || !metadata.ticketId)) {
             return res.status(400).json({ success: false, message: 'metadata.ticketId required for ticket-link messages.' });
@@ -186,7 +199,13 @@ exports.sendMessage = async (req, res) => {
                 mediaSize: typeof mediaSize === 'number' ? mediaSize : null,
                 mediaDuration: typeof mediaDuration === 'number' ? mediaDuration : null,
                 mediaWaveformPeaks: Array.isArray(mediaWaveformPeaks) ? mediaWaveformPeaks : null,
-                linkPreview: resolvedLinkPreview
+                linkPreview: resolvedLinkPreview,
+                // B-4 reply-to + sticker
+                replyToId: replyToId || null,
+                replyToText: replyToText || null,
+                replyToSenderName: replyToSenderName || null,
+                stickerAssetPath: stickerAssetPath || null,
+                stickerIsAnimated: stickerIsAnimated === true ? true : null
             },
             include: {
                 sender: { select: { id: true, username: true, profilePictureUrl: true } }
@@ -216,6 +235,12 @@ exports.sendMessage = async (req, res) => {
             mediaDuration: message.mediaDuration,
             mediaWaveformPeaks: message.mediaWaveformPeaks,
             linkPreview: message.linkPreview,
+            // B-4 reply-to + sticker
+            replyToId: message.replyToId,
+            replyToText: message.replyToText,
+            replyToSenderName: message.replyToSenderName,
+            stickerAssetPath: message.stickerAssetPath,
+            stickerIsAnimated: message.stickerIsAnimated,
             isRead: false,
             createdAt: message.createdAt
         };

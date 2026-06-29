@@ -343,10 +343,11 @@ class NotificationService {
 
     async getNotifications(userId, opts = {}) {
         const parsedUserId = parseInt(userId, 10);
-        const { page = 1, limit = 20, unreadOnly = false, cursor = null } = opts;
+        const { page = 1, limit = 20, unreadOnly = false, cursor = null, category = null } = opts;
 
         const where = { userId: parsedUserId };
         if (unreadOnly) where.isRead = false;
+        if (category) where.category = String(category).toUpperCase();
 
         // Cursor mode: O(limit) lookup against the composite index.
         // Skip 1 ensures the cursor row itself isn't repeated on the next page.
@@ -414,7 +415,7 @@ class NotificationService {
     // =========================================================================
 
     _normalizeCategory(category) {
-        const valid = ['GENERAL', 'SECURITY_ACCOUNT', 'VENDOR_PRIORITY', 'ADMIN_SYSTEM'];
+        const valid = ['GENERAL', 'SECURITY_ACCOUNT', 'VENDOR_PRIORITY', 'ADMIN_SYSTEM', 'VAULT', 'SUSU', 'SMART_ROUTE', 'AUCTION'];
         return valid.includes(category) ? category : 'GENERAL';
     }
 }

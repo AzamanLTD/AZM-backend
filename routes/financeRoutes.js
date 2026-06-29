@@ -8,6 +8,7 @@ const express                  = require('express');
 const router                   = express.Router();
 const financeController        = require('../controllers/finance.controller');
 const { adminOnly }            = require('../middleware/authMiddleware');
+const { protect }              = require('../middleware/authMiddleware');
 const { protectActive }        = require('../middleware/banGuardMiddleware');
 
 // User endpoints (protected + ban-guarded)
@@ -39,5 +40,8 @@ router.post('/webhook/tatum', depositController.tatumCryptoWebhook);
 // Public read-only — frontend uses this to render the "limited fiat" tag
 // before the user opens the withdraw flow. Returns HEALTHY|LIMITED|CRITICAL.
 router.get('/fiat-pool-status', financeController.getFiatPoolStatus);
+
+// B-9: Transaction history — authenticated user's own ledger with filters.
+router.get('/transactions', protect, financeController.getTransactionHistory);
 
 module.exports = router;
