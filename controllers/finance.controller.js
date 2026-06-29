@@ -730,12 +730,20 @@ exports.getFiatPoolStatus = async (req, res) => {
         const pool = await prisma.systemFiatPool.findUnique({ where: { id: 1 } });
         const balance = pool?.balance ?? 0;
         const status  = _classifyFiatPool(balance);
+
+        const bannerTexts = {
+            HEALTHY: 'Withdrawals are operating normally.',
+            LIMITED: 'Fiat withdrawal capacity is temporarily limited. Please try again later if you encounter issues.',
+            CRITICAL: 'Fiat withdrawals are temporarily unavailable due to low liquidity. We are replenishing the pool.',
+        };
+
         return res.status(200).json({
             success: true,
             data: {
                 balance:    parseFloat(balance.toFixed(6)),
                 threshold:  FIAT_POOL_ALERT_THRESH,
                 status,                                    // 'HEALTHY' | 'LIMITED' | 'CRITICAL'
+                bannerText: bannerTexts[status],
                 lastUpdate: pool?.updatedAt || null
             }
         });
@@ -754,7 +762,7 @@ exports.getTransactionHistory = async (req, res) => {
     const prisma = req.app.get('prisma');
     try {
         const userId = req.user.id;
-        const { type, status, startDate, endDate } = req.query;
+        const { type, status, startDate, endDate, q } = req.query;
         const limit = Math.min(parseInt(req.query.limit, 10) || 50, 100);
         const cursor = req.query.cursor || null;
 
@@ -772,6 +780,12 @@ exports.getTransactionHistory = async (req, res) => {
             where.createdAt = {};
             if (startDate) where.createdAt.gte = new Date(startDate);
             if (endDate) where.createdAt.lte = new Date(endDate);
+        }
+        if (q) {
+            where.OR = [
+                { txHash: { contains: q, mode: 'insensitive' } },
+                { providerRef: { contains: q, mode: 'insensitive' } },
+            ];
         }
 
         const transactions = await prisma.transactionHistory.findMany({

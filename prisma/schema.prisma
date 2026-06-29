@@ -681,7 +681,7 @@ model User {
   settingsPreferences Json? // General settings blob (haptics, sounds, etc.)
 
   // B-1 (2026-06-28): display currency preference + online presence
-  preferredCurrency   String?   @default("USD")
+  preferredCurrency   String   @default("usdc")
   lastSeenAt          DateTime?
   isOnline            Boolean   @default(false)
 

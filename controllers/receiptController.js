@@ -16,6 +16,70 @@
 const { generateTradeReceipt, generateWithdrawalReceipt, generateTransferReceipt } = require('../services/receiptService');
 
 // =============================================================================
+// 4. GET TRANSACTION RECEIPT (B-8)
+//    GET /api/receipts/transaction/:id
+//
+// Returns data for a PDF receipt from a TransactionHistory row. Auth: caller
+// must own the transaction. Only COMPLETED transactions get receipts.
+// =============================================================================
+exports.getTransactionReceipt = async (req, res) => {
+    const prisma = req.app.get('prisma');
+
+    try {
+        const userId = req.user.id;
+        const { id } = req.params;
+        if (!id) {
+            return res.status(400).json({ success: false, message: 'Invalid transaction ID' });
+        }
+
+        const tx = await prisma.transactionHistory.findUnique({
+            where: { id },
+            include: {
+                user: { select: { id: true, username: true, email: true } }
+            }
+        });
+
+        if (!tx) {
+            return res.status(404).json({ success: false, message: 'Transaction not found' });
+        }
+
+        if (tx.userId !== userId) {
+            return res.status(403).json({ success: false, message: 'You do not own this transaction' });
+        }
+
+        if (tx.status !== 'COMPLETED') {
+            return res.status(400).json({
+                success: false,
+                message: `Receipts are only available for completed transactions. Current status: ${tx.status}`,
+            });
+        }
+
+        const metadata = tx.metadata || {};
+
+        return res.status(200).json({
+            success: true,
+            data: {
+                id:              tx.id,
+                type:            tx.type,
+                amountUsdc:      parseFloat(tx.amountUsdc),
+                feeUsdc:         parseFloat(tx.feeUsdc || 0),
+                txHash:          tx.txHash,
+                providerRef:     tx.providerRef,
+                payerMsisdn:     tx.payerMsisdn,
+                status:          tx.status,
+                metadata:        metadata,
+                createdAt:       tx.createdAt,
+                user:            { username: tx.user.username, email: tx.user.email },
+            }
+        });
+
+    } catch (error) {
+        console.error('[receipt.getTransactionReceipt] error:', error.message);
+        return res.status(500).json({ success: false, message: 'Failed to fetch receipt data' });
+    }
+};
+
+// =============================================================================
 // 1. GET TRADE RECEIPT
 //    GET /api/receipts/trade/:tradeId
 // =============================================================================

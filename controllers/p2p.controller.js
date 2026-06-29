@@ -652,3 +652,65 @@ exports.completeTrade = async (req, res) => {
         return _handleError(res, 'completeTrade', error);
     }
 };
+
+// =============================================================================
+// B-9: GET /api/p2p/action-required
+// Returns a list of trades needing the user's attention.
+// =============================================================================
+exports.getActionRequired = async (req, res) => {
+    const prisma = req.app.get('prisma');
+
+    try {
+        const userId = req.user.id;
+
+        const activeStatuses = ['PENDING', 'PENDING_PAYMENT', 'PAID', 'DISPUTED'];
+
+        const trades = await prisma.trade.findMany({
+            where: {
+                OR: [
+                    { userId, status: { in: activeStatuses } },
+                    { vendorId: userId, status: { in: activeStatuses } }
+                ]
+            },
+            select: {
+                id: true,
+                type: true,
+                amountCrypto: true,
+                amountFiat: true,
+                currency: true,
+                status: true,
+                createdAt: true,
+                user:   { select: { id: true, username: true } },
+                vendor: { select: { id: true, username: true } },
+            },
+            orderBy: { createdAt: 'desc' }
+        });
+
+        const unreadCount = await prisma.directMessage.count({
+            where: {
+                receiverId: userId,
+                isRead: false
+            }
+        });
+
+        const unrespondedPings = await prisma.trade.count({
+            where: {
+                vendorId: userId,
+                status: 'PENDING',
+            }
+        });
+
+        return res.status(200).json({
+            success: true,
+            data: {
+                hasAction: trades.length > 0 || unreadCount > 0,
+                activeTradeCount: trades.length,
+                unreadMessageCount: unreadCount,
+                unrespondedPingCount: unrespondedPings,
+                trades
+            }
+        });
+    } catch (error) {
+        return _handleError(res, 'getActionRequired', error);
+    }
+};

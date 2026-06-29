@@ -120,7 +120,7 @@ const searchBusinesses = async (prisma, { query, category, verified, limit, curs
         where.averageRating = { gte: parseFloat(minRating) };
     }
 
-    return prisma.businessProfile.findMany({
+    const rows = await prisma.businessProfile.findMany({
         where,
         take: take + 1,
         orderBy: { totalEscrows: 'desc' },
@@ -129,6 +129,25 @@ const searchBusinesses = async (prisma, { query, category, verified, limit, curs
         },
         ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {})
     });
+
+    // B-12: attach min product price from BusinessProduct
+    if (rows.length > 0) {
+        const bizIds = rows.map((r) => r.id);
+        const products = await prisma.businessProduct.groupBy({
+            by: ['businessProfileId'],
+            where: { businessProfileId: { in: bizIds }, isActive: true },
+            _min: { priceUsdc: true },
+        });
+        const priceMap = {};
+        for (const p of products) {
+            priceMap[p.businessProfileId] = p._min.priceUsdc;
+        }
+        for (const row of rows) {
+            row.minProductPrice = priceMap[row.id] ?? null;
+        }
+    }
+
+    return rows;
 };
 
 // =============================================================================

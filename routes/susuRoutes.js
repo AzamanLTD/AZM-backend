@@ -40,4 +40,7 @@ router.post('/invites/:id/revoke',                    protectActive, overlay.rev
 router.get('/:id/contract',                           protectActive, overlay.getContractForSusu);
 router.post('/:id/contract/accept',                   protectActive, overlay.acceptContract);
 
+// B-11: Payout timeline — upcoming payout dates across all active susu groups
+router.get('/payout-timeline',                         protect,       ctrl.getPayoutTimeline);
+
 module.exports = router;

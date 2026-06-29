@@ -260,8 +260,8 @@ exports.updateAll = async (req, res) => {
 
 // =============================================================================
 // 5. UPDATE PREFERRED CURRENCY
-//    PATCH /api/users/preferences/currency
-//    Body: { currency: 'USD' | 'GHS' | 'NGN' | 'KES' | ... }
+//    PUT /api/users/preferences/currency
+//    Body: { currency: 'usdc' | 'ghs' }
 // =============================================================================
 exports.updatePreferredCurrency = async (req, res) => {
     const prisma = req.app.get('prisma');
@@ -270,13 +270,13 @@ exports.updatePreferredCurrency = async (req, res) => {
         const userId = req.user.id;
         const { currency } = req.body;
 
-        if (!currency || typeof currency !== 'string' || currency.trim().length === 0) {
+        if (!currency || typeof currency !== 'string') {
             return res.status(400).json({ success: false, message: 'currency is required.' });
         }
 
-        const code = currency.trim().toUpperCase();
-        if (code.length > 8) {
-            return res.status(400).json({ success: false, message: 'Currency code too long (max 8 chars).' });
+        const code = currency.trim().toLowerCase();
+        if (code !== 'usdc' && code !== 'ghs') {
+            return res.status(400).json({ success: false, message: 'currency must be "usdc" or "ghs".' });
         }
 
         await prisma.user.update({

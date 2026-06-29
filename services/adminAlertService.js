@@ -25,7 +25,7 @@
 
 const ALERT_DEFS = {
     LARGE_WITHDRAWAL_PENDING: { severity: 'HIGH',     title: 'Large withdrawal pending' },
-    FIAT_POOL_LOW:            { severity: 'CRITICAL', title: 'Fiat pool below threshold' },
+    FIAT_POOL_LOW:            { severity: 'CRITICAL', title: 'Liquidity pool below threshold' },
     SUSPICIOUS_TRADE_PATTERN: { severity: 'HIGH',     title: 'Suspicious trade pattern' },
     KYC_MANUAL_REVIEW_REQUIRED:{ severity: 'MEDIUM',  title: 'KYC needs manual review' },
     DISPUTE_FILED:            { severity: 'HIGH',     title: 'Trade dispute filed' },

@@ -105,3 +105,49 @@ exports.pendingVouches = wrap(async function pendingVouches(req, res) {
     const vouches = await svc.pendingVouchesFor(req.user.id);
     res.json({ success: true, vouches });
 });
+
+// =============================================================================
+// B-11: GET /api/susu/payout-timeline
+// Returns upcoming payout dates for the caller across all active susu groups.
+// =============================================================================
+exports.getPayoutTimeline = wrap(async function getPayoutTimeline(req, res) {
+    const prisma = req.app.get('prisma');
+    const userId = req.user.id;
+
+    const memberships = await prisma.susuMember.findMany({
+        where: { userId, status: 'ACTIVE' },
+        include: {
+            susu: {
+                where: { status: 'ACTIVE' },
+                include: {
+                    cycles: {
+                        where: { status: { in: ['PENDING', 'COLLECTING', 'COLLECTING_GRACE'] } },
+                        orderBy: { collectionDate: 'asc' },
+                    },
+                },
+            },
+        },
+    });
+
+    const timeline = [];
+    for (const membership of memberships) {
+        for (const cycle of membership.susu.cycles) {
+            timeline.push({
+                groupId:           membership.susu.id,
+                groupName:         membership.susu.id,
+                cycleNumber:       cycle.cycleNumber,
+                totalCycles:       membership.susu.totalCycles,
+                collectionDate:    cycle.collectionDate,
+                payoutAmount:      cycle.payoutAmount,
+                payoutUserId:      cycle.payoutUserId,
+                cycleStatus:       cycle.status,
+                contributionUsdc:  membership.susu.contributionUsdc,
+                frequency:         membership.susu.frequency,
+            });
+        }
+    }
+
+    timeline.sort((a, b) => new Date(a.collectionDate) - new Date(b.collectionDate));
+
+    res.json({ success: true, timeline, total: timeline.length });
+});

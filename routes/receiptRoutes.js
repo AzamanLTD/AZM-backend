@@ -26,4 +26,7 @@ router.get('/withdrawal/:id', protect, receiptController.getWithdrawalReceipt);
 // download chip on each row of the Chat Profile vault's Receipts tab.
 router.get('/transfer/:id', protect, receiptController.getTransferReceipt);
 
+// B-8: Transaction receipt data endpoint — returns JSON data for PDF receipt.
+router.get('/transaction/:id', protect, receiptController.getTransactionReceipt);
+
 module.exports = router;
