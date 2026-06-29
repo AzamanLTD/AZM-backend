@@ -329,6 +329,16 @@ if (IS_PRODUCTION) {
     console.log('CORS open (development mode)');
 }
 
+// C-10: Force HTTPS in production (Render provides HTTPS proxy)
+if (process.env.NODE_ENV === 'production') {
+    app.use((req, res, next) => {
+        if (req.headers['x-forwarded-proto'] !== 'https') {
+            return res.redirect(301, `https://${req.headers.host}${req.url}`);
+        }
+        next();
+    });
+}
+
 // Body parser with size limit (M-1 fix) + raw body for HMAC verification
 app.use(express.json({
     limit: '2mb',
@@ -1019,6 +1029,27 @@ app.set('adminAlertService', adminAlertService);
 // req.app handle), so hand it the alert service directly. Optional chaining at
 // the callsite keeps it safe if this ever isn't set.
 kycService.adminAlertService = adminAlertService;
+
+// C-8: Health check — no auth required
+app.get('/health', async (req, res) => {
+    const prisma = req.app.get('prisma');
+    let dbOk = false;
+    try {
+        await prisma.$queryRaw`SELECT 1`;
+        dbOk = true;
+    } catch (_) {}
+    const io = req.app.get('io');
+    let sockets = 0;
+    try { sockets = io ? (await io.allSockets()).size : 0; } catch (_) {}
+    return res.json({
+        status:    'ok',
+        uptime:    process.uptime(),
+        db:        dbOk ? 'connected' : 'error',
+        sockets,
+        env:       process.env.NODE_ENV,
+        timestamp: new Date().toISOString(),
+    });
+});
 
 // ══════════════════════════════════════════════════════════════════════════════
 // API VERSIONING + RESPONSE ENVELOPE (additive, non-breaking)

@@ -754,21 +754,70 @@ exports.getFiatPoolStatus = async (req, res) => {
 };
 
 // =============================================================================
+// C-4: GET /api/finance/transactions/:id/receipt — structured PDF data
+// =============================================================================
+exports.getTransactionReceipt = async (req, res) => {
+    const prisma = req.app.get('prisma');
+    try {
+        const txn = await prisma.transactionHistory.findFirst({
+            where: { id: req.params.id, userId: req.user.id },
+        });
+        if (!txn) {
+            return res.status(404).json({ success: false, message: 'Not found.' });
+        }
+        const user = await prisma.user.findUnique({
+            where:  { id: req.user.id },
+            select: { username: true, azamanId: true, email: true },
+        });
+        return res.json({
+            success: true,
+            receipt: {
+                id:           txn.id,
+                type:         txn.type,
+                amountUsdc:   txn.amountUsdc,
+                feeUsdc:      txn.feeUsdc,
+                status:       txn.status,
+                createdAt:    txn.createdAt,
+                providerRef:  txn.providerRef,
+                metadata:     txn.metadata,
+                user: {
+                    username: user.username,
+                    azamanId: user.azamanId,
+                    email:    user.email,
+                },
+                generatedAt:  new Date().toISOString(),
+                platform:     'Azaman',
+                footerNote:   'This is an official Azaman transaction receipt.',
+            }
+        });
+    } catch (error) {
+        console.error('[finance.getTransactionReceipt] error:', error.message);
+        return res.status(500).json({ success: false, message: error.message });
+    }
+};
+
+// =============================================================================
 // B-9: GET /api/finance/transactions
 // Authenticated user's own transaction history with optional filters.
-// Query params: type?, status?, startDate?, endDate?, cursor?, limit?
+// Query params: type?, status?, startDate?, endDate?, filter?, cursor?, limit?
 // =============================================================================
 exports.getTransactionHistory = async (req, res) => {
     const prisma = req.app.get('prisma');
     try {
         const userId = req.user.id;
-        const { type, status, startDate, endDate, q } = req.query;
+        const { type, status, startDate, endDate, q, filter } = req.query;
         const limit = Math.min(parseInt(req.query.limit, 10) || 50, 100);
         const cursor = req.query.cursor || null;
 
         const where = { userId };
 
-        if (type) {
+        if (filter) {
+            const f = String(filter).toUpperCase();
+            if (f === 'IN')       where.type = { in: ['DEPOSIT_FIAT','DEPOSIT_CRYPTO','SUSU_PAYOUT','VAULT_RELEASE','TRADE_PAYOUT'] };
+            else if (f === 'OUT') where.type = { in: ['WITHDRAWAL_FIAT','WITHDRAWAL_CRYPTO','SUSU_CONTRIBUTION','VAULT_DEPOSIT'] };
+            else if (f === 'INTERNAL') where.type = { in: ['INTERNAL_TRANSFER','SMART_ROUTE_RUN'] };
+        }
+        if (type && !filter) {
             const upper = String(type).toUpperCase();
             where.type = upper;
         }

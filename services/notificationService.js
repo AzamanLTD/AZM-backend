@@ -102,6 +102,9 @@ class NotificationService {
         if (actionPayload.action === 'OPEN_TRADE' && actionPayload.tradeId) {
             return { path: ['action'], value: 'OPEN_TRADE', tradeId: actionPayload.tradeId };
         }
+        if (actionPayload.action === 'OPEN_WALLET' && actionPayload.reference) {
+            return { path: ['reference'], value: actionPayload.reference };
+        }
         return null;
     }
 

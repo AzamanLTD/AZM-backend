@@ -74,6 +74,7 @@ exports.getProfile = async (req, res) => {
                 onboardingStep: true,
 
                 // Preferences
+                preferredCurrency: true,
                 selectedTheme: true,
                 customShortcuts: true,
                 settingsPreferences: true,
@@ -85,6 +86,8 @@ exports.getProfile = async (req, res) => {
                 lastLoginAt: true,
 
                 // Meta
+                isOnline: true,
+                lastSeenAt: true,
                 createdAt: true,
 
                 // Relations count

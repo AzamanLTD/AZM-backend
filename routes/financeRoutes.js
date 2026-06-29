@@ -44,4 +44,7 @@ router.get('/fiat-pool-status', financeController.getFiatPoolStatus);
 // B-9: Transaction history — authenticated user's own ledger with filters.
 router.get('/transactions', protect, financeController.getTransactionHistory);
 
+// C-4: Transaction receipt — structured JSON data for PDF rendering
+router.get('/transactions/:id/receipt', protect, financeController.getTransactionReceipt);
+
 module.exports = router;

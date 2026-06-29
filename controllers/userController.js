@@ -122,3 +122,20 @@ exports.deleteAccount = async (req, res) => {
         return res.status(500).json({ success: false, error: error.message });
     }
 };
+
+// =============================================================================
+// C-9: GET /api/users/:id/status — chat partner online status
+// =============================================================================
+exports.getUserStatus = async (req, res) => {
+    const prisma = req.app.get('prisma');
+    try {
+        const user = await prisma.user.findUnique({
+            where:  { id: parseInt(req.params.id, 10) },
+            select: { isOnline: true, lastSeenAt: true, username: true },
+        });
+        if (!user) return res.status(404).json({ success: false, message: 'User not found' });
+        return res.json({ success: true, ...user });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: error.message });
+    }
+};

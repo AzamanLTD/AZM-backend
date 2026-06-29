@@ -784,6 +784,13 @@ exports.markAsPaid = async (req, res) => {
         });
         io.to(room).emit('trade_update', { status: 'PAID', proofUrl });
 
+        // C-3: emit p2p_action_required to vendor (needs to release)
+        io.to(`user_${result.updatedTrade.vendorId}`).emit('p2p_action_required', {
+            tradeId: tradeIdInt,
+            status:  'PAID',
+            count:   1,
+        });
+
         // Phase N: deliver vendor notification via full pipeline (DB + socket + FCM).
         // Replaces the raw io.emit('new_notification') + pushIfOffline which only
         // delivered real-time but never persisted to the notification table.
@@ -914,6 +921,14 @@ exports.disputeTrade = async (req, res) => {
             status:        'DISPUTED',
             message:       'Trade has been paused by Support. An admin will join shortly.',
             disputeReason: reason
+        });
+
+        // C-3: emit p2p_action_required to the other party
+        const otherPartyId = trade.userId === userId ? trade.vendorId : trade.userId;
+        io.to(`user_${otherPartyId}`).emit('p2p_action_required', {
+            tradeId: id,
+            status:  'DISPUTED',
+            count:   1,
         });
 
         io.emit('admin_alert', { type: 'DISPUTE', tradeId: id, reason });
@@ -1060,5 +1075,36 @@ exports.submitReview = async (req, res) => {
             return res.status(400).json({ success: false, message: 'You have already reviewed this trade.' });
         console.error('submitReview error:', error.message);
         res.status(500).json({ success: false, error: error.message });
+    }
+};
+
+// =============================================================================
+// B-1: GET /api/trades/active — active trades count for nav badge
+// =============================================================================
+exports.getActiveTrades = async (req, res) => {
+    const prisma = req.app.get('prisma');
+    const userId = req.user.id;
+
+    try {
+        const ACTION_STATUSES = ['PENDING_PAYMENT', 'PAID', 'DISPUTED'];
+
+        const trades = await prisma.trade.findMany({
+            where: {
+                OR: [{ userId }, { vendorId: userId }],
+                status: { in: ACTION_STATUSES },
+            },
+            select: {
+                id: true, status: true, type: true,
+                amountCrypto: true, amountFiat: true,
+                rate: true, expiresAt: true, createdAt: true,
+                userId: true, vendorId: true,
+            },
+            orderBy: { createdAt: 'desc' },
+        });
+
+        return res.json({ success: true, trades, count: trades.length });
+    } catch (error) {
+        console.error('getActiveTrades error:', error.message);
+        return res.status(500).json({ success: false, message: error.message });
     }
 };

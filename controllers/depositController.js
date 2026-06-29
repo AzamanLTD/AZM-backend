@@ -245,7 +245,7 @@ exports.localFiatDepositWebhook = async (req, res) => {
                 await _getNotificationService(req).sendNotification({
                     userId:        existing.userId,
                     title:         'Deposit Confirmed',
-                    body:          `Your deposit of GHS ${amountGhsFloat.toFixed(2)} has been credited as ${usdcEquivalent.toFixed(2)} USDC.`,
+                    body:          `GH₵${amountGhsFloat.toFixed(2)} deposited via MoMo — ${usdcEquivalent.toFixed(2)} USDC added to your wallet.`,
                     category:      'GENERAL',
                     actionPayload: { action: 'OPEN_WALLET', reference }
                 });

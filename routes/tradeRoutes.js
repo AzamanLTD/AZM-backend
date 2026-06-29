@@ -25,6 +25,9 @@ const {
     submitReview
 } = tradeController;
 
+// B-1: Active trades count for nav badge
+router.get('/active', protect, tradeController.getActiveTrades);
+
 // ── Read endpoints (banned users retain read-only access) ────────────────────
 router.get('/history', protect, getTradeHistory);
 router.get('/:id',     protect, getTradeDetails);

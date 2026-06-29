@@ -212,7 +212,8 @@ exports.register = async (req, res) => {
                 onboardingCompleted: false,
                 selectedTheme: 'dark',
                 loginStreak: 1,
-                tradesCompleted: 0
+                tradesCompleted: 0,
+                preferredCurrency: 'usdc',
             }
         });
 
@@ -326,7 +327,8 @@ exports.login = async (req, res) => {
                     email: user.email,
                     role: user.role,
                     availableBalance: user.availableBalance || 0.0,
-                    azmBalance: user.azmBalance || 0.0
+                    azmBalance: user.azmBalance || 0.0,
+                    preferredCurrency: user.preferredCurrency || 'usdc',
                 }
             });
         }
@@ -424,7 +426,8 @@ exports.login = async (req, res) => {
                 onboardingCompleted: user.onboardingCompleted || false,
                 selectedTheme: user.selectedTheme || 'dark',
                 loginStreak: loginStreak,
-                tradesCompleted: user.tradesCompleted || 0
+                tradesCompleted: user.tradesCompleted || 0,
+                preferredCurrency: user.preferredCurrency || 'usdc',
             }
         });
 

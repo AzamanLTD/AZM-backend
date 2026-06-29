@@ -68,6 +68,9 @@ router.get('/me/security-logs', protect, securityLogController.getSecurityLogs);
 // Reachable at GET /api/users/invoices.
 router.get('/invoices', protect, businessInvoiceController.listMyInvoices);
 
+// ─── C-9: User online status for chat top nav ────────────────────────────────
+router.get('/:id/status', protect, userController.getUserStatus);
+
 // ─── ACCOUNT MANAGEMENT ──────────────────────────────────────────────────────
 router.post('/delete', protect, userController.deleteAccount);
 
