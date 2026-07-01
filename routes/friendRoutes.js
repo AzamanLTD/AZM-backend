@@ -46,6 +46,9 @@ router.get('/chat/:friendshipId/messages', protect, directMessageController.getM
 router.post('/chat/:friendshipId/messages', protect, directMessageController.sendMessage);
 router.put('/chat/:friendshipId/read', protect, directMessageController.markAsRead);
 router.get('/chat/:friendshipId/info', protect, directMessageController.getConversationInfo);
+router.put('/chat/messages/:id/edit', protect, directMessageController.editMessage);
+router.delete('/chat/messages/:id', protect, directMessageController.deleteMessage);
+router.post('/chat/messages/:id/react', protect, directMessageController.reactToMessage);
 
 // =============================================================================
 // CHAT PROFILE + VAULT (Phase UI-5) + TRUST METRICS (Phase UI-6)

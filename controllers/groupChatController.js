@@ -206,3 +206,53 @@ exports.getAddQuota = gjrWrap(async function getAddQuota(req, res) {
     const quota = await svc.getAddQuota(req.params.id, req.user.id);
     res.json({ success: true, data: quota });
 });
+
+// =============================================================================
+// PHASE 6 / Premium Group Chat Features
+// =============================================================================
+
+exports.getGroupMessagesPaginated = async (req, res) => {
+  const prisma = req.app.get('prisma');
+  try {
+    const { groupId } = req.params;
+    const { cursor, limit = 50 } = req.query;
+    const userId = req.user.id;
+
+    // Verify membership
+    const member = await prisma.groupMember.findFirst({
+      where: { groupId, userId, removedAt: null }
+    });
+    if (!member) return res.status(403).json({ error: 'Not a member' });
+
+    const query = {
+      where: { groupId },
+      take: parseInt(limit),
+      orderBy: { createdAt: 'desc' },
+      include: {
+        sender: { select: { id: true, username: true, profilePictureUrl: true } }
+      }
+    };
+
+    if (cursor) {
+      query.cursor = { id: cursor };
+      query.skip = 1;
+    }
+
+    const messages = await prisma.groupMessage.findMany(query);
+    const nextCursor = messages.length === parseInt(limit) ? messages[messages.length - 1].id : null;
+
+    res.json({ success: true, messages, nextCursor });
+  } catch (error) { res.status(500).json({ error: 'Server error' }); }
+};
+
+exports.getGroupReadStatus = async (req, res) => {
+  const prisma = req.app.get('prisma');
+  try {
+    const { groupId } = req.params;
+    const cursors = await prisma.groupReadCursor.findMany({
+      where: { groupId },
+      include: { user: { select: { id: true, username: true } } }
+    });
+    res.json({ success: true, cursors });
+  } catch (error) { res.status(500).json({ error: 'Server error' }); }
+};

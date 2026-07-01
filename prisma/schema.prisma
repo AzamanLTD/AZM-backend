@@ -1108,6 +1108,17 @@ model Message {
   mediaWaveformPeaks Json? // 50-bucket integer array, audio only
   linkPreview        Json? // { url, title, description, image, favicon, fetchedAt }
 
+  // Premium chat fields (Telegram-inspired)
+  localId            String?
+  status             String    @default("sent")
+  editedAt           DateTime?
+  editedContent      String?
+  deletedAt          DateTime?
+  reactions          Json      @default("{}")
+  replyToId          String?
+  replyToText        String?
+  replyToSenderName  String?
+
   conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
   sender       User?        @relation("MessageSender", fields: [senderId], references: [id])
   trade        Trade?       @relation("TradeMessages", fields: [tradeId], references: [id])
@@ -1118,6 +1129,7 @@ model Message {
   // Phase I: powers cursor pagination on GET /api/chat/:tradeId
   // (filter conversationId, order createdAt desc).
   @@index([conversationId, createdAt(sort: Desc)])
+  @@index([localId])
 }
 
 model Contact {
@@ -1633,6 +1645,16 @@ model DirectMessage {
   mediaWaveformPeaks Json?
   linkPreview        Json?
 
+  // Premium chat fields (Telegram-inspired)
+  localId            String?
+  status             String    @default("sent")
+  editedAt           DateTime?
+  editedContent      String?
+  deletedAt          DateTime?
+  reactions          Json      @default("{}")
+  forwardedFromId    String?
+  forwardedFromUser  String?
+
   // B-1 (2026-06-28): reply-to support
   replyToId          String?
   replyToText        String?
@@ -1655,6 +1677,7 @@ model DirectMessage {
   // Phase I: powers cursor pagination on GET /api/friends/chat/:friendshipId
   // (filter friendshipId, order createdAt desc).
   @@index([friendshipId, createdAt(sort: Desc)])
+  @@index([localId])
 }
 
 model PeerTransfer {
@@ -2110,6 +2133,14 @@ model TicketMessage {
   mediaWaveformPeaks Json?
   linkPreview        Json?
 
+  // Premium chat fields (Telegram-inspired)
+  localId            String?
+  status             String    @default("sent")
+  editedAt           DateTime?
+  editedContent      String?
+  deletedAt          DateTime?
+  reactions          Json      @default("{}")
+
   // B-1 (2026-06-28): reply-to support
   replyToId          String?
   replyToText        String?
@@ -2123,6 +2154,7 @@ model TicketMessage {
   @@index([ticketId])
   @@index([senderId])
   @@index([ticketId, createdAt(sort: Desc)])
+  @@index([localId])
 }
 
 // =============================================================================
@@ -2960,6 +2992,14 @@ model GroupMessage {
   mediaWaveformPeaks Json?
   linkPreview        Json?
 
+  // Premium chat fields (Telegram-inspired)
+  localId            String?
+  status             String    @default("sent")
+  editedAt           DateTime?
+  editedContent      String?
+  deletedAt          DateTime?
+  reactions          Json      @default("{}")
+
   // B-1 (2026-06-28): reply-to support
   replyToId          String?
   replyToText        String?
@@ -2977,6 +3017,7 @@ model GroupMessage {
   @@index([groupId, createdAt(sort: Desc)])
   @@index([senderId])
   @@index([groupId, type])
+  @@index([localId])
 }
 
 model VouchRecord {

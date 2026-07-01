@@ -470,3 +470,81 @@ exports.getConversationInfo = async (req, res) => {
         return res.status(500).json({ success: false, message: 'Failed to get conversation info.' });
     }
 };
+
+// =============================================================================
+// 6. EDIT MESSAGE (Premium)
+// PUT /api/friends/chat/messages/:id/edit
+// =============================================================================
+exports.editMessage = async (req, res) => {
+    const prisma = req.app.get('prisma');
+    try {
+        const { id } = req.params;
+        const { newContent } = req.body;
+        const userId = req.user.id;
+
+        const msg = await prisma.directMessage.findUnique({ where: { id } });
+        if (!msg || msg.senderId !== userId) return res.status(403).json({ error: 'Unauthorized' });
+
+        // 15 minute limit
+        const age = Date.now() - new Date(msg.createdAt).getTime();
+        if (age > 15 * 60 * 1000) return res.status(400).json({ error: 'Time limit exceeded' });
+
+        const updated = await prisma.directMessage.update({
+            where: { id },
+            data: { content: newContent.trim(), editedAt: new Date(), editedContent: msg.content }
+        });
+        res.json({ success: true, message: updated });
+    } catch (error) { res.status(500).json({ error: 'Server error' }); }
+};
+
+// =============================================================================
+// 7. DELETE MESSAGE (Premium - Soft Delete)
+// DELETE /api/friends/chat/messages/:id
+// =============================================================================
+exports.deleteMessage = async (req, res) => {
+    const prisma = req.app.get('prisma');
+    try {
+        const { id } = req.params;
+        const userId = req.user.id;
+
+        const msg = await prisma.directMessage.findUnique({ where: { id } });
+        if (!msg || msg.senderId !== userId) return res.status(403).json({ error: 'Unauthorized' });
+
+        const updated = await prisma.directMessage.update({
+            where: { id },
+            data: { deletedAt: new Date() }
+        });
+        res.json({ success: true, message: updated });
+    } catch (error) { res.status(500).json({ error: 'Server error' }); }
+};
+
+// =============================================================================
+// 8. REACT TO MESSAGE (Premium)
+// POST /api/friends/chat/messages/:id/react
+// =============================================================================
+exports.reactToMessage = async (req, res) => {
+    const prisma = req.app.get('prisma');
+    try {
+        const { id } = req.params;
+        const { emoji } = req.body;
+        const userId = req.user.id;
+
+        const msg = await prisma.directMessage.findUnique({ where: { id } });
+        if (!msg) return res.status(404).json({ error: 'Not found' });
+
+        const reactions = msg.reactions || {};
+        const list = reactions[emoji] || [];
+
+        if (list.includes(userId)) {
+            reactions[emoji] = list.filter(uid => uid !== userId);
+            if (reactions[emoji].length === 0) delete reactions[emoji];
+        } else {
+            reactions[emoji] = [...list, userId];
+        }
+
+        const updated = await prisma.directMessage.update({
+            where: { id }, data: { reactions }
+        });
+        res.json({ success: true, reactions: updated.reactions });
+    } catch (error) { res.status(500).json({ error: 'Server error' }); }
+};

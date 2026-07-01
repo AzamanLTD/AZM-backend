@@ -32,4 +32,8 @@ router.post('/:id/join-requests/:reqId/reject',   protectActive, ctrl.rejectJoin
 router.post('/:id/members/direct',                protectActive, ctrl.directAddMember);
 router.get('/:id/add-quota',                      protect,       ctrl.getAddQuota);
 
+// PHASE 6 / Premium Group Chat Features
+router.get('/:groupId/messages-v2',               protect,       ctrl.getGroupMessagesPaginated);
+router.get('/:groupId/read-status',               protect,       ctrl.getGroupReadStatus);
+
 module.exports = router;

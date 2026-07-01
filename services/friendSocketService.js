@@ -14,6 +14,7 @@
 // =============================================================================
 
 const { sendPushNotification } = require('../utils/firebaseService');
+const { v4: uuidv4 } = require('uuid');
 
 class FriendSocketService {
     constructor(io, prisma) {
@@ -212,6 +213,98 @@ class FriendSocketService {
                     detail: err.message,
                     tempId: data.tempId || null
                 });
+            }
+        });
+
+        // ── 3.5 SEND FRIEND MESSAGE V2 (Premium) ───────────────────────────
+        socket.on('send_friend_message_v2', async (data) => {
+            try {
+                const {
+                    friendshipId, senderId, content, type, localId,
+                    replyToId, replyToText, replyToSenderName,
+                    mediaUrl, mediaType, mediaMimeType, mediaSize,
+                    mediaDuration, mediaWaveformPeaks, linkPreview,
+                    metadata
+                } = data;
+                if (!friendshipId || !senderId || (!content && !mediaUrl && !metadata)) return;
+
+                const friendship = await this.prisma.friendship.findUnique({
+                    where: { id: friendshipId },
+                    include: { requester: true, addressee: true }
+                });
+                if (!friendship) return socket.emit('friend_error', { reason: 'not_found' });
+                if (friendship.status !== 'ACCEPTED') {
+                    return socket.emit('friend_error', { reason: 'not_friends' });
+                }
+
+                const receiverId = friendship.requesterId === parseInt(senderId)
+                    ? friendship.addresseeId : friendship.requesterId;
+
+                const message = await this.prisma.directMessage.create({
+                    data: {
+                        friendshipId,
+                        senderId: parseInt(senderId),
+                        receiverId,
+                        content: content || '',
+                        messageType: type || 'TEXT',
+                        localId: localId || uuidv4(),
+                        status: 'sent',
+                        replyToId: replyToId || null,
+                        replyToText: replyToText || null,
+                        replyToSenderName: replyToSenderName || null,
+                        mediaUrl: mediaUrl || null, mediaType: mediaType || null,
+                        mediaMimeType: mediaMimeType || null, mediaSize: mediaSize || null,
+                        mediaDuration: mediaDuration || null,
+                        mediaWaveformPeaks: mediaWaveformPeaks || null,
+                        linkPreview: linkPreview ? linkPreview : null,
+                        metadata: metadata || null,
+                    },
+                    include: { sender: { select: { id: true, username: true, profilePictureUrl: true } } }
+                });
+
+                socket.emit('message_ack', {
+                    localId, id: message.id, status: 'sent', createdAt: message.createdAt
+                });
+
+                const payload = {
+                    id: message.id, localId: message.localId,
+                    friendshipId, senderId: parseInt(senderId),
+                    senderUsername: message.sender?.username,
+                    senderAvatar: message.sender?.profilePictureUrl,
+                    messageType: message.messageType, content: message.content,
+                    createdAt: message.createdAt, status: 'sent',
+                    replyToId, replyToText, replyToSenderName,
+                    mediaUrl, mediaType, mediaMimeType, mediaSize,
+                    mediaDuration, mediaWaveformPeaks, linkPreview, metadata,
+                };
+
+                this.io.to(`friend_chat_${friendshipId}`).emit('new_friend_message', payload);
+
+                // Update Friendship.updatedAt for cursor pagination sorting
+                await this.prisma.friendship.update({
+                    where: { id: friendshipId }, data: { updatedAt: new Date() }
+                });
+
+                const recipientSockets = await this.io.in(`user_${receiverId}`).allSockets();
+                if (recipientSockets.size > 0) {
+                    this.io.to(`user_${senderId}`).emit('message_delivered', {
+                        id: message.id, context: 'friend', status: 'delivered',
+                    });
+                } else {
+                    const receiver = friendship.requesterId === receiverId
+                        ? friendship.requester : friendship.addressee;
+                    if (receiver?.fcmToken) {
+                        const { sendPushNotification } = require('../utils/firebaseService');
+                        await sendPushNotification(
+                            receiver.fcmToken,
+                            `New message from ${message.sender?.username}`,
+                            (content || '📎 Media').substring(0, 100),
+                            { type: 'FRIEND_CHAT', friendshipId, route: `/friends/${friendshipId}` }
+                        ).catch(() => {});
+                    }
+                }
+            } catch (e) {
+                socket.emit('message_error', { reason: 'server_error', localId: data.localId });
             }
         });
 

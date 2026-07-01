@@ -225,6 +225,7 @@ const authRoutes = require('./routes/authRoutes');
 const tradeRoutes = require('./routes/tradeRoutes');
 const adRoutes = require('./routes/adRoutes');
 const chatRoutes = require('./routes/chatRoutes');
+const chatUploadRoutes = require('./routes/chatUploadRoutes');
 const walletRoutes = require('./routes/walletRoutes');
 const adminRoutes = require('./routes/adminRoutes');
 const kycRoutes = require('./routes/kycRoutes');
@@ -540,6 +541,9 @@ const tradeSocketService = new TradeSocketService(io, prisma);
 // --- CHAT SOCKET SERVICE ---
 const ChatSocketService = require('./services/chatSocketService');
 const chatSocketService = new ChatSocketService(io, prisma);
+
+const GroupChatSocketService = require('./services/groupChatSocketService');
+const groupChatSocketService = new GroupChatSocketService(io, prisma);
 
 // --- FRIEND SOCKET SERVICE ---
 const FriendSocketService = require('./services/friendSocketService');
@@ -1079,6 +1083,7 @@ app.use('/api/auth', authLimiter, authRoutes);
 app.use('/api/trades', financialLimiter, tradeRoutes);
 app.use('/api/ads', generalLimiter, adRoutes);
 app.use('/api/chat', generalLimiter, chatRoutes);
+app.use('/api/chat-upload', generalLimiter, chatUploadRoutes);
 app.use('/api/wallet', financialLimiter, walletRoutes);
 app.use('/api/admin', generalLimiter, adminRoutes);
 app.use('/api/kyc', generalLimiter, kycRoutes);
@@ -1530,6 +1535,7 @@ io.on('connection', (socket) => {
 
     // --- CHAT SOCKET SERVICE HANDLERS ---
     chatSocketService.registerHandlers(socket);
+    groupChatSocketService.registerHandlers(socket);
 
     // --- FRIEND SOCKET SERVICE HANDLERS ---
     friendSocketService.registerHandlers(socket);
