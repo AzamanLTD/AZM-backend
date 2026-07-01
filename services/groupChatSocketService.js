@@ -1,7 +1,7 @@
 // services/groupChatSocketService.js
 // AZAMAN PREMIUM GROUP CHAT SOCKET SERVICE
 
-const { v4: uuidv4 } = require('uuid');
+const crypto = require('crypto');
 
 class GroupChatSocketService {
   constructor(io, prisma) {
@@ -60,7 +60,7 @@ class GroupChatSocketService {
             groupId, senderId: parseInt(senderId),
             type: type || 'TEXT',
             content: content || '',
-            localId: localId || uuidv4(),
+            localId: localId || crypto.randomUUID(),
             status: 'sent',
             replyToId: replyToId || null,
             replyToText: replyToText || null,
@@ -163,7 +163,7 @@ class GroupChatSocketService {
           data: {
             groupId, senderId: senderId ? parseInt(senderId) : null,
             type: 'SUSU_EVENT', content: '',
-            metadata, localId: uuidv4(), status: 'sent'
+            metadata, localId: crypto.randomUUID(), status: 'sent'
           }
         });
         this.io.to(`group_${groupId}`).emit('new_group_message', {

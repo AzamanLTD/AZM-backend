@@ -3,7 +3,7 @@
 // Preserves all existing event names. Adds new premium events.
 
 const crypto = require('crypto');
-const { v4: uuidv4 } = require('uuid');
+
 const ADMIN_SPY_ROOM = 'admin_spy_room';
 
 class ChatSocketService {
@@ -143,7 +143,7 @@ class ChatSocketService {
             senderId: parseInt(senderId),
             messageType: messageType || 'TEXT',
             content,
-            localId: localId || uuidv4(),
+            localId: localId || crypto.randomUUID(),
             status: 'sent',
             replyToId: replyToId || null,
             replyToText: replyToText || null,
@@ -205,7 +205,7 @@ class ChatSocketService {
             senderId: parseInt(senderId),
             messageType: messageType || 'TEXT',
             content,
-            localId: localId || uuidv4(),
+            localId: localId || crypto.randomUUID(),
             status: 'sent',
             replyToId: replyToId || null,
             replyToText: replyToText || null,

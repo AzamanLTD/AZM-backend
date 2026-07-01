@@ -14,7 +14,7 @@
 // =============================================================================
 
 const { sendPushNotification } = require('../utils/firebaseService');
-const { v4: uuidv4 } = require('uuid');
+const crypto = require('crypto');
 
 class FriendSocketService {
     constructor(io, prisma) {
@@ -247,7 +247,7 @@ class FriendSocketService {
                         receiverId,
                         content: content || '',
                         messageType: type || 'TEXT',
-                        localId: localId || uuidv4(),
+                        localId: localId || crypto.randomUUID(),
                         status: 'sent',
                         replyToId: replyToId || null,
                         replyToText: replyToText || null,
