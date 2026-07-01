@@ -126,6 +126,14 @@ exports.register = async (req, res) => {
         const azamanId = await identitySvc.generateUniqueAzamanId();
         const trimmedPhone = phoneNumber ? String(phoneNumber).trim() : null;
 
+        let phoneHash = null;
+        if (trimmedPhone) {
+            const normalizedPhone = trimmedPhone.replace(/\D/g, '');
+            if (normalizedPhone) {
+                phoneHash = crypto.createHash('sha256').update(normalizedPhone).digest('hex');
+            }
+        }
+
         const newUser = await prisma.user.create({
             data: {
                 username: trimmedUsername,
@@ -133,6 +141,7 @@ exports.register = async (req, res) => {
                 password: hashedPassword,
                 availableBalance: 0.0,
                 azamanId,
+                phoneHash,
                 // Optional phone — used by the pre-registration vouch hook
                 // below to auto-link any pending VouchRecord rows that
                 // someone vouched for using this phone number while the
@@ -149,6 +158,7 @@ exports.register = async (req, res) => {
         // block registration.
         if (newUser.phoneNumber) {
             setImmediate(() => {
+                const { adminAlertService } = require('../services/adminAlertService');
                 const { SusuService } = require('../services/susuService');
                 SusuService.linkPreRegistrationVouches(prisma, newUser.id, newUser.phoneNumber)
                     .then((linked) => {

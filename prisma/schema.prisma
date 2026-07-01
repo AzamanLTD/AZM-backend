@@ -290,10 +290,10 @@ enum BusinessCategory {
 
 // B-14 (2026-06-28): category image lookup — one image URL per category
 model BusinessCategoryImage {
-  id       String          @id @default(uuid())
-  category BusinessCategory @unique
-  imageUrl String
-  createdAt DateTime @default(now())
+  id        String           @id @default(uuid())
+  category  BusinessCategory @unique
+  imageUrl  String
+  createdAt DateTime         @default(now())
 
   @@index([category])
 }
@@ -681,9 +681,9 @@ model User {
   settingsPreferences Json? // General settings blob (haptics, sounds, etc.)
 
   // B-1 (2026-06-28): display currency preference + online presence
-  preferredCurrency   String   @default("usdc")
-  lastSeenAt          DateTime?
-  isOnline            Boolean   @default(false)
+  preferredCurrency String    @default("usdc")
+  lastSeenAt        DateTime?
+  isOnline          Boolean   @default(false)
 
   // --- V4: ONBOARDING & PROFILE ENHANCEMENTS ---
   onboardingCompleted Boolean   @default(false) // Whether user finished the onboarding flow
@@ -777,7 +777,7 @@ model User {
   businessReviews  BusinessReview[]  @relation("BusinessReviewer")
 
   // Marketplace Foundation (2026-06-24): bookings this user holds
-  reservations  Reservation[]  @relation("CustomerReservations")
+  reservations Reservation[] @relation("CustomerReservations")
 
   // B-2 (2026-06-28): transit bookings as customer
   transitBookings TransitBooking[] @relation("TransitBookingCustomer")
@@ -853,7 +853,12 @@ model User {
   // PHASE 6 / Phase 4: Liability acceptances where this user vouched for another.
   vouchedLiabilityAcceptances LiabilityAcceptance[] @relation("LiabilityVoucher")
 
-  createdAt DateTime @default(now())
+  createdAt      DateTime        @default(now())
+  stories        Story[]
+  storyViews     StoryView[]     @relation("StoryViewer")
+  storyReactions StoryReaction[] @relation("StoryReactor")
+
+  @@index([phoneHash])
 }
 
 // =============================================================================
@@ -1109,15 +1114,15 @@ model Message {
   linkPreview        Json? // { url, title, description, image, favicon, fetchedAt }
 
   // Premium chat fields (Telegram-inspired)
-  localId            String?
-  status             String    @default("sent")
-  editedAt           DateTime?
-  editedContent      String?
-  deletedAt          DateTime?
-  reactions          Json      @default("{}")
-  replyToId          String?
-  replyToText        String?
-  replyToSenderName  String?
+  localId           String?
+  status            String    @default("sent")
+  editedAt          DateTime?
+  editedContent     String?
+  deletedAt         DateTime?
+  reactions         Json      @default("{}")
+  replyToId         String?
+  replyToText       String?
+  replyToSenderName String?
 
   conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
   sender       User?        @relation("MessageSender", fields: [senderId], references: [id])
@@ -1646,23 +1651,23 @@ model DirectMessage {
   linkPreview        Json?
 
   // Premium chat fields (Telegram-inspired)
-  localId            String?
-  status             String    @default("sent")
-  editedAt           DateTime?
-  editedContent      String?
-  deletedAt          DateTime?
-  reactions          Json      @default("{}")
-  forwardedFromId    String?
-  forwardedFromUser  String?
+  localId           String?
+  status            String    @default("sent")
+  editedAt          DateTime?
+  editedContent     String?
+  deletedAt         DateTime?
+  reactions         Json      @default("{}")
+  forwardedFromId   String?
+  forwardedFromUser String?
 
   // B-1 (2026-06-28): reply-to support
-  replyToId          String?
-  replyToText        String?
-  replyToSenderName  String?
+  replyToId         String?
+  replyToText       String?
+  replyToSenderName String?
 
   // B-1 (2026-06-28): sticker support
-  stickerAssetPath   String?
-  stickerIsAnimated  Boolean?
+  stickerAssetPath  String?
+  stickerIsAnimated Boolean?
 
   friendship Friendship @relation(fields: [friendshipId], references: [id], onDelete: Cascade)
   sender     User       @relation("DirectMessageSender", fields: [senderId], references: [id], onDelete: Cascade)
@@ -2134,17 +2139,17 @@ model TicketMessage {
   linkPreview        Json?
 
   // Premium chat fields (Telegram-inspired)
-  localId            String?
-  status             String    @default("sent")
-  editedAt           DateTime?
-  editedContent      String?
-  deletedAt          DateTime?
-  reactions          Json      @default("{}")
+  localId       String?
+  status        String    @default("sent")
+  editedAt      DateTime?
+  editedContent String?
+  deletedAt     DateTime?
+  reactions     Json      @default("{}")
 
   // B-1 (2026-06-28): reply-to support
-  replyToId          String?
-  replyToText        String?
-  replyToSenderName  String?
+  replyToId         String?
+  replyToText       String?
+  replyToSenderName String?
 
   ticket Ticket @relation(fields: [ticketId], references: [id], onDelete: Cascade)
   sender User   @relation("TicketMessageSender", fields: [senderId], references: [id], onDelete: Cascade)
@@ -2253,13 +2258,13 @@ model EscrowDispute {
 // BusinessProfile.subcategory. parentWire maps to the BusinessCategory enum.
 // =============================================================================
 model BusinessSubcategory {
-  id            String   @id @default(uuid())
-  parentWire    String   // maps to BusinessCategory enum, e.g. "FOOD_BEVERAGE"
-  wire          String   @unique // e.g. "RESTAURANT_FINE_DINING"
-  label         String   // "Fine Dining"
-  imageUrl      String?  // Cloudinary lifestyle photo for the category tile
-  displayOrder  Int      @default(0)
-  isActive      Boolean  @default(true)
+  id           String  @id @default(uuid())
+  parentWire   String // maps to BusinessCategory enum, e.g. "FOOD_BEVERAGE"
+  wire         String  @unique // e.g. "RESTAURANT_FINE_DINING"
+  label        String // "Fine Dining"
+  imageUrl     String? // Cloudinary lifestyle photo for the category tile
+  displayOrder Int     @default(0)
+  isActive     Boolean @default(true)
 
   @@index([parentWire, displayOrder])
   @@index([isActive])
@@ -2271,11 +2276,11 @@ model BusinessProfile {
   bizId           String           @unique // BIZ-XXXXXXXXX (9 digits after prefix)
   moolrePaymentId String?          @unique // *203*<id># USSD payment ID for businesses (Moolre on-ramp, 2026-06-23)
   // Marketplace hierarchy additions (2026-06-24)
-  subcategory     String?    // wire value from BusinessSubcategory (e.g. "RESTAURANT_FINE_DINING")
-  priceRange      Int?       // 1=₵  2=₵₵  3=₵₵₵  4=₵₵₵₵
-  amenities       String[]   // ["WIFI","PARKING","AC","POOL"] — profile-level amenities
-  cuisineTypes    String[]   // Food & Bev only: ["GHANAIAN","CHINESE","CONTINENTAL"]
-  businessMeta    Json?      // category-specific extended fields
+  subcategory     String? // wire value from BusinessSubcategory (e.g. "RESTAURANT_FINE_DINING")
+  priceRange      Int? // 1=₵  2=₵₵  3=₵₵₵  4=₵₵₵₵
+  amenities       String[] // ["WIFI","PARKING","AC","POOL"] — profile-level amenities
+  cuisineTypes    String[] // Food & Bev only: ["GHANAIAN","CHINESE","CONTINENTAL"]
+  businessMeta    Json? // category-specific extended fields
   businessName    String           @db.VarChar(100)
   category        BusinessCategory @default(OTHER)
   description     String?          @db.VarChar(500)
@@ -2322,11 +2327,13 @@ model BusinessProfile {
   reservations      Reservation[]
 
   // B-2 (2026-06-28): transit fleet and bookings
-  transitVehicles   TransitVehicle[]
-  transitBookings   TransitBooking[]
+  transitVehicles TransitVehicle[]
+  transitBookings TransitBooking[]
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+
+  stories Story[]
 
   @@index([bizId])
   @@index([category])
@@ -2493,20 +2500,20 @@ model BusinessReview {
 // Linked to BusinessProduct via catalogSectionId.
 // =============================================================================
 model CatalogSection {
-  id                String   @id @default(uuid())
+  id                String  @id @default(uuid())
   businessProfileId String
-  locationId        String?  // null = all branches
-  name              String   @db.VarChar(100) // "Starters", "Main Course", "Drinks"
-  description       String?  @db.VarChar(300)
-  displayOrder      Int      @default(0)
-  availableFrom     String?  // "06:00" — section only visible in this time window
-  availableTo       String?  // "11:00"
+  locationId        String? // null = all branches
+  name              String  @db.VarChar(100) // "Starters", "Main Course", "Drinks"
+  description       String? @db.VarChar(300)
+  displayOrder      Int     @default(0)
+  availableFrom     String? // "06:00" — section only visible in this time window
+  availableTo       String? // "11:00"
   imageUrl          String?
-  isActive          Boolean  @default(true)
+  isActive          Boolean @default(true)
 
-  businessProfile   BusinessProfile   @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
-  location          BusinessLocation? @relation(fields: [locationId], references: [id])
-  products          BusinessProduct[] @relation("SectionProducts")
+  businessProfile BusinessProfile   @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+  location        BusinessLocation? @relation(fields: [locationId], references: [id])
+  products        BusinessProduct[] @relation("SectionProducts")
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -2537,13 +2544,13 @@ model BusinessProduct {
   estimatedDelivery String? @db.VarChar(100) // e.g. '2-3 days'
 
   // Catalog section additions (2026-06-24)
-  catalogSectionId  String?    // which CatalogSection this item belongs to
-  isAvailable       Boolean    @default(true) // real-time sold-out toggle
-  preparationMins   Int?       // estimated prep time in minutes
-  tags              String[]   // ["SPICY","VEGAN","GLUTEN_FREE","POPULAR","NEW"]
-  calorieCount      Int?
-  variants          Json?      // [{ label:"Small", priceDelta:0 },{ label:"Large", priceDelta:2.5 }]
-  modifierGroups    Json?      // [{ name:"Add-ons", max:3, options:[{ name:"Extra Sauce", price:0.5 }] }]
+  catalogSectionId String? // which CatalogSection this item belongs to
+  isAvailable      Boolean  @default(true) // real-time sold-out toggle
+  preparationMins  Int? // estimated prep time in minutes
+  tags             String[] // ["SPICY","VEGAN","GLUTEN_FREE","POPULAR","NEW"]
+  calorieCount     Int?
+  variants         Json? // [{ label:"Small", priceDelta:0 },{ label:"Large", priceDelta:2.5 }]
+  modifierGroups   Json? // [{ name:"Add-ons", max:3, options:[{ name:"Extra Sauce", price:0.5 }] }]
 
   businessProfile BusinessProfile   @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
   location        BusinessLocation? @relation(fields: [locationId], references: [id])
@@ -2660,18 +2667,18 @@ model BusinessNotification {
 // AVAILABILITY RULE — Defines bookable time windows for a business (2026-06-24)
 // =============================================================================
 model AvailabilityRule {
-  id                 String   @id @default(uuid())
+  id                 String  @id @default(uuid())
   businessProfileId  String
   locationId         String?
-  serviceItemId      String?  // null = general booking; or a BusinessProduct.id
-  dayOfWeek          Int[]    // 0=Sun..6=Sat; empty = every day
-  startTime          String   // "08:00" 24h local
-  endTime            String   // "22:00"
-  slotDurationMins   Int?     // null = full-day (hotel rooms, whole-day services)
-  maxBookingsPerSlot Int      @default(1)
-  isActive           Boolean  @default(true)
+  serviceItemId      String? // null = general booking; or a BusinessProduct.id
+  dayOfWeek          Int[] // 0=Sun..6=Sat; empty = every day
+  startTime          String // "08:00" 24h local
+  endTime            String // "22:00"
+  slotDurationMins   Int? // null = full-day (hotel rooms, whole-day services)
+  maxBookingsPerSlot Int     @default(1)
+  isActive           Boolean @default(true)
 
-  businessProfile   BusinessProfile @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+  businessProfile BusinessProfile @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
 
   createdAt DateTime @default(now())
 
@@ -2689,7 +2696,7 @@ model Reservation {
   businessProfileId  String
   locationId         String?
   customerId         Int
-  serviceItemId      String?           // BusinessProduct.id (room type, service slot)
+  serviceItemId      String? // BusinessProduct.id (room type, service slot)
   status             ReservationStatus @default(PENDING)
   startDatetime      DateTime
   endDatetime        DateTime
@@ -2706,9 +2713,9 @@ model Reservation {
   escrowId           String?           @unique
   metadata           Json?
 
-  businessProfile   BusinessProfile  @relation(fields: [businessProfileId], references: [id])
-  customer          User             @relation("CustomerReservations", fields: [customerId], references: [id])
-  escrow            SmartEscrow?     @relation(fields: [escrowId], references: [id])
+  businessProfile BusinessProfile @relation(fields: [businessProfileId], references: [id])
+  customer        User            @relation("CustomerReservations", fields: [customerId], references: [id])
+  escrow          SmartEscrow?    @relation(fields: [escrowId], references: [id])
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -2733,25 +2740,25 @@ enum TransitBookingStatus {
 }
 
 model TransitVehicle {
-  id                String   @id @default(uuid())
+  id                String  @id @default(uuid())
   businessProfileId String
-  type              String   // CAR, VAN, TRUCK, MOTORCYCLE, BICYCLE, SCOOTER
-  make              String?  @db.VarChar(100)
-  model             String?  @db.VarChar(100)
+  type              String // CAR, VAN, TRUCK, MOTORCYCLE, BICYCLE, SCOOTER
+  make              String? @db.VarChar(100)
+  model             String? @db.VarChar(100)
   year              Int?
-  color             String?  @db.VarChar(50)
-  licensePlate      String?  @db.VarChar(20)
-  capacity          Int      @default(4) // passenger or cargo capacity
+  color             String? @db.VarChar(50)
+  licensePlate      String? @db.VarChar(20)
+  capacity          Int     @default(4) // passenger or cargo capacity
   imageUrl          String?
-  isActive          Boolean  @default(true)
-  driverName        String?  @db.VarChar(100)
-  driverPhone       String?  @db.VarChar(20)
+  isActive          Boolean @default(true)
+  driverName        String? @db.VarChar(100)
+  driverPhone       String? @db.VarChar(20)
   driverPhotoUrl    String?
 
   // Additional metadata (insurance docs, permit, etc.)
-  metadata          Json?
+  metadata Json?
 
-  businessProfile BusinessProfile     @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+  businessProfile BusinessProfile  @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
   bookings        TransitBooking[]
 
   createdAt DateTime @default(now())
@@ -2781,14 +2788,14 @@ model TransitBooking {
   feeUsdc           Decimal              @default(0) @db.Decimal(20, 8)
   customerNote      String?              @db.VarChar(500)
   driverNote        String?              @db.VarChar(500)
-  rating            Int?                 // 1–5 customer rating after completion
+  rating            Int? // 1–5 customer rating after completion
   reviewComment     String?              @db.VarChar(1000)
   bookingRef        String               @unique // e.g. "TRN-2806-A1B2"
   metadata          Json?
 
-  businessProfile BusinessProfile  @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
-  vehicle         TransitVehicle?  @relation(fields: [vehicleId], references: [id], onDelete: SetNull)
-  customer        User             @relation("TransitBookingCustomer", fields: [customerId], references: [id])
+  businessProfile BusinessProfile @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+  vehicle         TransitVehicle? @relation(fields: [vehicleId], references: [id], onDelete: SetNull)
+  customer        User            @relation("TransitBookingCustomer", fields: [customerId], references: [id])
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -2993,21 +3000,21 @@ model GroupMessage {
   linkPreview        Json?
 
   // Premium chat fields (Telegram-inspired)
-  localId            String?
-  status             String    @default("sent")
-  editedAt           DateTime?
-  editedContent      String?
-  deletedAt          DateTime?
-  reactions          Json      @default("{}")
+  localId       String?
+  status        String    @default("sent")
+  editedAt      DateTime?
+  editedContent String?
+  deletedAt     DateTime?
+  reactions     Json      @default("{}")
 
   // B-1 (2026-06-28): reply-to support
-  replyToId          String?
-  replyToText        String?
-  replyToSenderName  String?
+  replyToId         String?
+  replyToText       String?
+  replyToSenderName String?
 
   // B-1 (2026-06-28): sticker support
-  stickerAssetPath   String?
-  stickerIsAnimated  Boolean?
+  stickerAssetPath  String?
+  stickerIsAnimated Boolean?
 
   group  GroupChat @relation(fields: [groupId], references: [id], onDelete: Cascade)
   sender User?     @relation("GroupMessageSender", fields: [senderId], references: [id], onDelete: SetNull)
@@ -3497,4 +3504,48 @@ model SavedMomoAccount {
 
   @@unique([userId, phoneNumber])
   @@index([userId])
+}
+
+// =============================================================================
+// STORIES (TELEGRAM INSPIRED)
+// =============================================================================
+
+model Story {
+  id                Int              @id @default(autoincrement())
+  userId            Int
+  user              User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  businessProfileId String?
+  businessProfile   BusinessProfile? @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+
+  mediaUrl      String
+  caption       String?
+  expiresAt     DateTime
+  boostAzmSpent Decimal  @default(0.0) @db.Decimal(20, 8)
+  createdAt     DateTime @default(now())
+
+  views     StoryView[]
+  reactions StoryReaction[]
+}
+
+model StoryView {
+  id       Int      @id @default(autoincrement())
+  storyId  Int
+  story    Story    @relation(fields: [storyId], references: [id], onDelete: Cascade)
+  viewerId Int
+  viewer   User     @relation("StoryViewer", fields: [viewerId], references: [id], onDelete: Cascade)
+  viewedAt DateTime @default(now())
+
+  @@unique([storyId, viewerId])
+}
+
+model StoryReaction {
+  id        Int      @id @default(autoincrement())
+  storyId   Int
+  story     Story    @relation(fields: [storyId], references: [id], onDelete: Cascade)
+  userId    Int
+  user      User     @relation("StoryReactor", fields: [userId], references: [id], onDelete: Cascade)
+  emoji     String
+  createdAt DateTime @default(now())
+
+  @@unique([storyId, userId])
 }

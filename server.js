@@ -21,6 +21,7 @@ const Sentry = require('./instrument');
 // =============================================================================
 
 const express = require('express');
+const cron = require('node-cron');
 const http = require('http');
 const { Server } = require('socket.io');
 const { PrismaClient, Prisma } = require('@prisma/client');
@@ -1030,6 +1031,16 @@ app.set('smsService', smsService);
 const AdminAlertService = require('./services/adminAlertService');
 const adminAlertService = new AdminAlertService({ io, emailService });
 app.set('adminAlertService', adminAlertService);
+
+const StoryService = require('./services/storyService');
+const storyService = new StoryService(io, prisma, azmSpendService, null);
+app.set('storyService', storyService);
+
+// Stories expiration cron
+cron.schedule('*/15 * * * *', () => {
+    app.get('storyService').expireOldStories().catch(err => console.error('[StoryCron]', err));
+});
+
 // The KYC service runs webhook processing outside the request lifecycle (no
 // req.app handle), so hand it the alert service directly. Optional chaining at
 // the callsite keeps it safe if this ever isn't set.
@@ -1096,6 +1107,8 @@ app.use('/api/payout-destinations', generalLimiter, payoutDestinationRoutes);
 app.use('/api/admin/chat', generalLimiter, adminChatRoutes);
 app.use('/api/security', generalLimiter, securityRoutes);
 app.use('/api/users', generalLimiter, userRoutes);
+app.use('/api/stories', generalLimiter, require('./routes/storyRoutes'));
+app.use('/api/contacts', generalLimiter, require('./routes/contactRoutes'));
 app.use('/api/war-room', generalLimiter, warRoomRoutes);
 app.use('/api/ai', generalLimiter, aiRoutes);
 app.use('/api/finance', financialLimiter, financeRoutes);
