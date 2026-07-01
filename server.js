@@ -267,6 +267,7 @@ const azmAuctionRoutes  = require('./routes/azmAuctionRoutes');
 const savedMomoRoutes   = require('./routes/savedMomoRoutes');
 
 const app = express();
+app.set('trust proxy', 1);
 const server = http.createServer(app);
 
 // ══════════════════════════════════════════════════════════════════════════════

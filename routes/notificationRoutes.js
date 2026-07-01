@@ -13,7 +13,7 @@ const notifLimiter = rateLimit({
     max: 60,
     standardHeaders: true,
     legacyHeaders: false,
-    keyGenerator: (req) => req.user?.id?.toString() ?? req.ip,
+    keyGenerator: (req) => req.user?.id?.toString() || 'anonymous',
     message: { success: false, message: 'Too many requests. Slow down.' },
 });
 
