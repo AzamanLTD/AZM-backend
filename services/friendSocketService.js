@@ -304,7 +304,7 @@ class FriendSocketService {
                     }
                 }
             } catch (e) {
-                socket.emit('message_error', { reason: 'server_error', localId: data.localId });
+                console.error("SOCKET ERROR:", e); socket.emit('message_error', { reason: 'server_error', localId: data.localId });
             }
         });
 

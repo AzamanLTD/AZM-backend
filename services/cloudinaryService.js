@@ -20,6 +20,8 @@
 // =============================================================================
 
 const cloudinary = require('cloudinary').v2;
+const fs = require('fs');
+const path = require('path');
 
 // Configure from env vars
 cloudinary.config({
@@ -76,16 +78,31 @@ function resolveFolder(key) {
  * @returns {Promise<{url: string, publicId: string}>}
  */
 async function uploadToCloudinary(file, folder = 'others', options = {}) {
-    if (!IS_CONFIGURED) {
-        // Fallback for local dev without Cloudinary: only possible when multer
-        // wrote the file to disk (file.path exists). Callers that use
-        // memoryStorage (chat media, avatars, proof-of-residency) have no local
-        // path to fall back to — surface a clear error instead of a cryptic
-        // TypeError on `undefined.replace`.
-        if (!file.path) {
-            throw new Error('Cloudinary not configured; in-memory upload cannot be persisted locally. Set CLOUDINARY_* env vars.');
+    const isMock = !IS_CONFIGURED ||
+                   (process.env.CLOUDINARY_CLOUD_NAME && process.env.CLOUDINARY_CLOUD_NAME.includes('mock')) ||
+                   (process.env.CLOUDINARY_API_KEY && process.env.CLOUDINARY_API_KEY.includes('mock'));
+
+    if (isMock) {
+        const resolvedFolder = resolveFolder(folder);
+        const uploadsDir = path.join(__dirname, '../uploads', resolvedFolder);
+        
+        fs.mkdirSync(uploadsDir, { recursive: true });
+        
+        const ext = file.originalname ? path.extname(file.originalname) : '.dat';
+        const filename = `${Date.now()}-${Math.round(Math.random() * 1e9)}${ext}`;
+        const destPath = path.join(uploadsDir, filename);
+        
+        if (file.buffer) {
+            fs.writeFileSync(destPath, file.buffer);
+        } else if (file.path) {
+            fs.copyFileSync(file.path, destPath);
+            fs.unlink(file.path, () => {});
+        } else {
+            throw new Error('File has neither buffer nor path');
         }
-        const localUrl = '/' + file.path.replace(/\\/g, '/');
+        
+        const localUrl = `/uploads/${resolvedFolder}/${filename}`;
+        console.log(`[CloudinaryMock] Saved local fallback file: ${destPath} -> ${localUrl}`);
         return { url: localUrl, publicId: null };
     }
 
