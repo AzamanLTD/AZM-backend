@@ -860,7 +860,7 @@ startWorker(susuWorker);
 // whose contractVersion is null. Reminder cron + PoR expiry sweep complete
 // the Phase 3 surface. All three workers are no-ops in test mode.
 if (process.env.NODE_ENV !== 'test') {
-    const logger = require('./utils/logger'); // Ensure your logger path is correct
+
     const { initScheduler } = require('./services/susu/susuScheduler');
     const SusuCycleService          = require('./services/susu/susuCycle.service');
     const SusuCycleSchedulerV2      = require('./workers/susuCycleSchedulerV2');
