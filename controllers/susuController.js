@@ -151,3 +151,45 @@ exports.getPayoutTimeline = wrap(async function getPayoutTimeline(req, res) {
 
     res.json({ success: true, timeline, total: timeline.length });
 });
+
+exports.getTransparencyReport = wrap(async function getTransparencyReport(req, res) {
+    const prisma = req.app.get('prisma');
+    const susu = await prisma.susuGroup.findUnique({
+        where: { id: req.params.id },
+        include: {
+            members: {
+                include: { user: { select: { id: true, username: true, profilePictureUrl: true } } },
+                orderBy: { cycleSlot: 'asc' },
+            },
+        },
+    });
+    if (!susu) return res.status(404).json({ success: false, message: 'Susu not found' });
+
+    const isMember = susu.members.some((m) => m.userId === req.user.id);
+    if (!isMember) return res.status(403).json({ success: false, message: 'Not a member' });
+
+    const contributions = await prisma.susuContribution.findMany({
+        where: { cycle: { susuGroupId: susu.id } },
+        select: { userId: true, status: true },
+    });
+
+    const report = susu.members.map((m) => {
+        const mine = contributions.filter((c) => c.userId === m.userId);
+        const onTime = mine.filter((c) => c.status === 'PAID').length;
+        const missed = mine.filter((c) => c.status === 'SEIZED' || c.status === 'FAILED_INSUFFICIENT').length;
+        const totalTracked = mine.length;
+        return {
+            userId: m.userId,
+            username: m.user.username,
+            profilePictureUrl: m.user.profilePictureUrl,
+            onTimeCount: onTime,
+            missedCount: missed,
+            totalTracked,
+            // 100% when no cycles have run yet, rather than dividing by zero --
+            // a brand-new member shouldn't show as "0% reliable".
+            reliabilityPct: totalTracked === 0 ? 100 : Math.round((onTime / totalTracked) * 100),
+        };
+    });
+
+    res.json({ success: true, groupId: susu.id, report });
+});

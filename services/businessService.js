@@ -96,7 +96,7 @@ const getBusinessProfile = async (prisma, { bizId, userId }) => {
 // =============================================================================
 // 3. SEARCH BUSINESSES — name / bizId / description, optional filters.
 // =============================================================================
-const searchBusinesses = async (prisma, { query, category, verified, limit, cursor, subcategory, priceRange, minRating }) => {
+const searchBusinesses = async (prisma, { query, category, verified, limit, cursor, subcategory, priceRange, minRating, sort }) => {
     const take = Math.min(Math.max(parseInt(limit, 10) || 20, 1), 50);
 
     const where = { isSuspended: false }; // CRITICAL: never show suspended businesses publicly
@@ -120,15 +120,21 @@ const searchBusinesses = async (prisma, { query, category, verified, limit, curs
         where.averageRating = { gte: parseFloat(minRating) };
     }
 
+    const useTrending = sort === 'trending';
     const rows = await prisma.businessProfile.findMany({
         where,
         take: take + 1,
-        orderBy: { totalEscrows: 'desc' },
+        orderBy: useTrending ? { averageRating: 'desc' } : { totalEscrows: 'desc' },
         include: {
             user: { select: { id: true, username: true, profilePictureUrl: true } }
         },
         ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {})
     });
+
+    if (useTrending) {
+        const { discoveryScore } = require('../utils/ranking');
+        rows.sort((a, b) => discoveryScore(b) - discoveryScore(a));
+    }
 
     // B-12: attach min product price from BusinessProduct
     if (rows.length > 0) {

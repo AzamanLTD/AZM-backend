@@ -280,6 +280,11 @@ class FriendSocketService {
 
                 this.io.to(`friend_chat_${friendshipId}`).emit('new_friend_message', payload);
 
+                // Compat: also emit the legacy `friend_message` event to the receiver's personal
+                // room. FriendProvider (app-wide) listens ONLY for this event name to drive the
+                // unread badge count and the friend-list "latest message" preview.
+                this.io.to(`user_${receiverId}`).emit('friend_message', payload);
+
                 // Update Friendship.updatedAt for cursor pagination sorting
                 await this.prisma.friendship.update({
                     where: { id: friendshipId }, data: { updatedAt: new Date() }

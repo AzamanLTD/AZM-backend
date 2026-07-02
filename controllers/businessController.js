@@ -82,7 +82,7 @@ exports.getBusinessByBizId = async (req, res) => {
 exports.searchBusinesses = async (req, res) => {
     const prisma = req.app.get('prisma');
     try {
-        const { q, category, verified, limit, cursor, subcategory, priceRange, minRating } = req.query;
+        const { q, category, verified, limit, cursor, subcategory, priceRange, minRating, sort } = req.query;
         const take = Math.min(Math.max(parseInt(limit, 10) || 20, 1), 50);
 
         const rows = await businessService.searchBusinesses(prisma, {
@@ -93,7 +93,8 @@ exports.searchBusinesses = async (req, res) => {
             cursor: cursor || null,
             subcategory: subcategory || null,
             priceRange: priceRange || null,
-            minRating: minRating || null
+            minRating: minRating || null,
+            sort: sort || null
         });
 
         const hasMore = rows.length > take;

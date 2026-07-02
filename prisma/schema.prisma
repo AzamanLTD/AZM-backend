@@ -2308,6 +2308,7 @@ model BusinessProfile {
   completedEscrows Int     @default(0)
   totalVolume      Decimal @default(0.0) @db.Decimal(20, 8)
   averageRating    Decimal @default(0.0) @db.Decimal(3, 2)
+  reviewCount      Int     @default(0)
 
   user                  User                           @relation(fields: [userId], references: [id], onDelete: Cascade)
   tickets               Ticket[]

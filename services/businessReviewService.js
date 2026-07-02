@@ -62,7 +62,10 @@ const createReview = async (prisma, {
     });
     await tx.businessProfile.update({
       where: { id: businessProfileId },
-      data: { averageRating: agg._avg.rating || 0 },
+      data: { 
+        averageRating: agg._avg.rating || 0,
+        reviewCount: agg._count,
+      },
     });
     return review;
   });
