@@ -258,6 +258,9 @@ const businessRoutes    = require('./routes/businessRoutes');
 // Marketplace Foundation (2026-06-24): Reservation system
 const reservationRoutes = require('./routes/reservationRoutes');
 
+// Marketplace Expansion (2026-07-02)
+const marketplaceRoutes = require('./routes/marketplaceRoutes');
+
 // Master Sprint (2026-05-27): Vault, Susu, Group Chat, Smart Route, AZM Auction
 const vaultRoutes       = require('./routes/vaultRoutes');
 const groupChatRoutes   = require('./routes/groupChatRoutes');
@@ -935,6 +938,21 @@ const AzmAuctionWorker = require('./workers/azmAuctionWorker');
 const azmAuctionWorker = new AzmAuctionWorker(prisma, azmAuctionService);
 startWorker(azmAuctionWorker);
 
+// MARKETPLACE EXPANSION — No-Show Penalty Sweep
+if (process.env.NODE_ENV !== 'test') {
+    const noShowWorker = require('./workers/reservationNoShowWorker');
+    // Run every hour
+    cron.schedule('0 * * * *', async () => {
+        try {
+            console.log('[NoShowWorker] Running scheduled sweep...');
+            const results = await noShowWorker.sweepAll(prisma);
+            console.log('[NoShowWorker] Sweep complete:', JSON.stringify(results));
+        } catch (err) {
+            console.error('[NoShowWorker] Sweep failed:', err.message);
+        }
+    });
+}
+
 // ── D-05: record worker liveness for GET /health ─────────────────────────────
 // These all called .start() above. tradeWorker is special: it is instantiated
 // here but only .start()'d in the server.listen callback (so its expiry sweep
@@ -1161,6 +1179,9 @@ app.use('/api/admin/war-room',            generalLimiter, adminWarRoomRoutes);
 // PHASE 5 / Workstream E — Admin Portal Susu monitor + operator actions.
 const adminSusuRoutes = require('./routes/adminSusuRoutes');
 app.use('/api/admin/susu',                generalLimiter, adminSusuRoutes);
+
+// MARKETPLACE EXPANSION — Phase B-2
+app.use('/api/marketplace',               generalLimiter, marketplaceRoutes);
 
 // --- CHAT MEDIA UPLOAD (Phase UI-3, 2026-05-26) ──────────────────────────────
 //

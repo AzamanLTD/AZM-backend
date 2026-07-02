@@ -342,6 +342,8 @@ enum TaxLineType {
 enum ReviewSourceType {
   ORDER // review tied to a completed BusinessOrder
   INVOICE // review tied to a paid BusinessInvoice
+  RESERVATION
+  TRANSIT
 }
 
 // =============================================================================
@@ -362,6 +364,13 @@ enum BizNotifType {
   ORDER_REFUNDED // escrow refunded to the buyer
   KYB_STATUS_CHANGED // verification status changed (approved/rejected)
   INVOICE_PAID // a sent invoice was paid by the customer
+  RESERVATION_NEW
+  RESERVATION_CONFIRMED
+  RESERVATION_CHECKED_IN
+  RESERVATION_NO_SHOW
+  TRANSIT_BOOKING_NEW
+  TRANSIT_NO_SHOW
+  INVOICE_SENT
 }
 
 enum KybDocumentType {
@@ -2118,6 +2127,8 @@ model Ticket {
   // Powers the dashboard query: WHERE friendshipId=X AND status=Y
   // ORDER BY lastActivityAt DESC.
   @@index([friendshipId, status, lastActivityAt(sort: Desc)])
+  reservation      Reservation?
+  transitBooking   TransitBooking?
 }
 
 model TicketMessage {
@@ -2212,6 +2223,7 @@ model SmartEscrow {
   @@index([payeeId])
   @@index([status])
   @@index([expiresAt])
+  transitBooking   TransitBooking?
 }
 
 // =============================================================================
@@ -2352,6 +2364,7 @@ model BusinessProfile {
   @@index([subcategory])
   @@index([priceRange])
   @@index([isSuspended, subcategory, totalEscrows(sort: Desc)])
+  transitTrips     TransitTrip[]
 }
 
 // =============================================================================
@@ -2493,6 +2506,11 @@ model BusinessReview {
 
   @@index([businessProfileId])
   @@index([businessProfileId, createdAt(sort: Desc)])
+  photoUrls        Json?
+  reservationId    String?      @unique
+  transitBookingId String?      @unique
+  reservation      Reservation? @relation(fields: [reservationId], references: [id])
+  transitBooking   TransitBooking? @relation(fields: [transitBookingId], references: [id])
 }
 
 // =============================================================================
@@ -2725,6 +2743,13 @@ model Reservation {
   @@index([customerId])
   @@index([businessProfileId, status])
   @@index([reservationRef])
+  noShowPenaltyPct Decimal? @db.Decimal(5,4)
+  noShowPenaltyUsdc Decimal? @db.Decimal(20,8)
+  penaltyAmountUsdc Decimal? @db.Decimal(20,8)
+  penaltyChargedAt DateTime?
+  ticketId         String?  @unique
+  ticket           Ticket?  @relation(fields: [ticketId], references: [id])
+  review           BusinessReview?
 }
 
 // =============================================================================
@@ -2768,6 +2793,8 @@ model TransitVehicle {
   @@index([businessProfileId])
   @@index([businessProfileId, isActive])
   @@index([type])
+  transitTrips     TransitTrip[]
+  seatMap          TransitSeatMap?
 }
 
 model TransitBooking {
@@ -2807,6 +2834,19 @@ model TransitBooking {
   @@index([vehicleId])
   @@index([status])
   @@index([scheduledAt])
+  checkedInAt      DateTime?
+  escrowId         String?       @unique
+  escrow           SmartEscrow?  @relation(fields: [escrowId], references: [id])
+  noShowPenaltyPct Decimal? @db.Decimal(5,4)
+  noShowPenaltyUsdc Decimal? @db.Decimal(20,8)
+  penaltyAmountUsdc Decimal? @db.Decimal(20,8)
+  penaltyChargedAt DateTime?
+  ticketId         String?       @unique
+  ticket           Ticket?       @relation(fields: [ticketId], references: [id])
+  tripId           String?
+  trip             TransitTrip?  @relation(fields: [tripId], references: [id])
+  seats            TransitBookingSeat[]
+  review           BusinessReview?
 }
 
 // =============================================================================
@@ -3549,4 +3589,58 @@ model StoryReaction {
   createdAt DateTime @default(now())
 
   @@unique([storyId, userId])
+}
+
+model TransitTrip {
+  id                String   @id @default(uuid())
+  businessProfileId String
+  vehicleId         String
+  routeName         String   @db.VarChar(200)
+  origin            String   @db.VarChar(255)
+  destination       String   @db.VarChar(255)
+  departureAt       DateTime
+  arrivalAt         DateTime?
+  fareUsdc          Decimal  @db.Decimal(20, 8)
+  availableSeats    Int      @default(0)
+  status            String   @default("SCHEDULED")
+  metadata          Json?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  businessProfile BusinessProfile @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+  vehicle         TransitVehicle  @relation(fields: [vehicleId], references: [id], onDelete: Cascade)
+  bookings        TransitBooking[]
+  seats           TransitBookingSeat[]
+
+  @@index([businessProfileId, departureAt])
+  @@index([vehicleId, departureAt])
+  @@index([status])
+}
+
+model TransitSeatMap {
+  id        String  @id @default(uuid())
+  vehicleId String  @unique
+  layout    Json    // [{ seatId:"1A", row:1, col:1, type:"WINDOW" }, ...]
+  rows      Int
+  cols      Int
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  vehicle TransitVehicle @relation(fields: [vehicleId], references: [id], onDelete: Cascade)
+}
+
+model TransitBookingSeat {
+  id            String  @id @default(uuid())
+  bookingId     String
+  tripId        String  // denormalized for the unique constraint
+  seatId        String  @db.VarChar(10)
+  passengerName String? @db.VarChar(100)
+  createdAt     DateTime @default(now())
+
+  booking TransitBooking @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  trip    TransitTrip    @relation(fields: [tripId], references: [id], onDelete: Cascade)
+
+  @@unique([tripId, seatId]) // STRUCTURAL double-booking prevention
+  @@index([bookingId])
+  @@index([tripId])
 }
