@@ -861,7 +861,7 @@ startWorker(susuWorker);
 // the Phase 3 surface. All three workers are no-ops in test mode.
 if (process.env.NODE_ENV !== 'test') {
 
-    const { initScheduler } = require('./services/susu/susuScheduler');
+
     const SusuCycleService          = require('./services/susu/susuCycle.service');
     const SusuCycleSchedulerV2      = require('./workers/susuCycleSchedulerV2');
     const SusuReminderCron          = require('./workers/susuReminderCron');
