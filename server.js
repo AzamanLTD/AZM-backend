@@ -263,6 +263,9 @@ const followRoutes = require('./routes/followRoutes');
 const adPostRoutes = require('./routes/adPostRoutes');
 const dineInRoutes = require('./routes/dineInRoutes');
 const showcaseRoutes = require('./routes/showcaseRoutes');
+const marketplaceFinanceRoutes = require('./routes/marketplaceFinanceRoutes');
+const marketplaceSeatMapRoutes = require('./routes/marketplaceSeatMapRoutes');
+const marketplacePenaltyRoutes = require('./routes/marketplacePenaltyRoutes');
 
 const marketplaceRoutes = require('./routes/marketplaceRoutes');
 
@@ -1117,6 +1120,9 @@ app.use('/api', require('./middleware/responseHelpers'));
 // ══════════════════════════════════════════════════════════════════════════════
 
 app.use('/api/public', generalLimiter, require('./routes/publicRoutes'));
+const { adminBusinessScope } = require('./middleware/adminBusinessScope');
+app.use(adminBusinessScope);
+
 app.use('/api/auth', authLimiter, authRoutes);
 app.use('/api/trades', financialLimiter, tradeRoutes);
 app.use('/api/ads', generalLimiter, adRoutes);
@@ -1159,6 +1165,9 @@ app.use('/api/follows',      generalLimiter, followRoutes);
 app.use('/api/ad-posts',     generalLimiter, adPostRoutes);
 app.use('/api/dine-in',      financialLimiter, dineInRoutes);
 app.use('/api/showcases',    generalLimiter, showcaseRoutes);
+app.use('/api/marketplace-finance',  financialLimiter, marketplaceFinanceRoutes);
+app.use('/api/marketplace-seat-map', generalLimiter, marketplaceSeatMapRoutes);
+app.use('/api/marketplace-penalty',  generalLimiter, marketplacePenaltyRoutes);
 
 // Master Sprint (2026-05-27)
 app.use('/api/vaults',        financialLimiter, vaultRoutes);

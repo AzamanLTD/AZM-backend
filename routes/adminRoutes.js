@@ -366,4 +366,76 @@ router.post('/businesses/:bizId/unsuspend',  businessAdminCtrl.unsuspendBusiness
 // GET /api/admin/audit-log/general?page=1&limit=50&action=APPROVE_KYC&targetType=USER
 router.get('/audit-log/general', adminController.getAuditLog);
 
+// ─── MARKETPLACE OVERSIGHT (Admin View-All Mode) ─────────────────────────────
+router.get('/marketplace-businesses', async (req, res) => {
+    const prisma = req.app.get('prisma');
+    try {
+        const { category, kybStatus, search } = req.query;
+        const where = {};
+        if (category) where.category = category;
+        if (kybStatus) where.kybStatus = kybStatus;
+        if (search) {
+            where.OR = [
+                { businessName: { contains: search, mode: 'insensitive' } },
+                { azamanId: { contains: search, mode: 'insensitive' } },
+            ];
+        }
+
+        const businesses = await prisma.businessProfile.findMany({
+            where,
+            include: {
+                user: { select: { id: true, username: true, email: true, role: true } },
+                locations: { select: { id: true, label: true, city: true } },
+                _count: {
+                    select: {
+                        followers: true,
+                        adPosts: true,
+                        dineInTabs: true,
+                        reservations: true,
+                        transitTrips: true,
+                        showcaseMedia: true,
+                    },
+                },
+            },
+            orderBy: { createdAt: 'desc' },
+        });
+
+        return res.status(200).json({ success: true, businesses });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: error.message });
+    }
+});
+
+router.get('/marketplace-businesses/:bizId', async (req, res) => {
+    const prisma = req.app.get('prisma');
+    try {
+        const business = await prisma.businessProfile.findUnique({
+            where: { id: req.params.bizId },
+            include: {
+                user: { select: { id: true, username: true, email: true, role: true } },
+                locations: true,
+                products: { take: 10, orderBy: { createdAt: 'desc' } },
+                penaltyPolicy: true,
+                _count: {
+                    select: {
+                        followers: true,
+                        adPosts: true,
+                        dineInTabs: true,
+                        reservations: true,
+                        transitTrips: true,
+                        showcaseMedia: true,
+                        reviews: true,
+                    },
+                },
+            },
+        });
+
+        if (!business) return res.status(404).json({ success: false, message: 'Business not found.' });
+
+        return res.status(200).json({ success: true, business });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: error.message });
+    }
+});
+
 module.exports = router;

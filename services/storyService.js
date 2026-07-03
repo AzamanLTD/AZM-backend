@@ -63,6 +63,7 @@ class StoryService {
             include: {
                 user: { select: { id: true, username: true, profilePictureUrl: true } },
                 views: { where: { viewerId }, select: { id: true } },
+                businessProfile: { select: { id: true, businessName: true, profileImageUrl: true } },
             },
         });
  
@@ -72,18 +73,22 @@ class StoryService {
             byAuthor.get(s.userId).push(s);
         }
  
-        const groups = [...byAuthor.entries()].map(([authorId, items]) => ({
-            authorId,
-            author: items[0].user,
-            hasUnseen: items.some(i => i.views.length === 0),
-            isBoosted: items.some(i => i.boostAzmSpent > 0),
+        const groups = [...byAuthor.entries()].map(([authorId, items]) => {
+            const isBusiness = !!items[0].businessProfileId;
+            return {
+                authorId,
+                author: items[0].user,
+                isBusiness,
+                business: items[0].businessProfile,
+                hasUnseen: items.some(i => i.views.length === 0),
+                isBoosted: items.some(i => i.boostAzmSpent > 0),
             latestAt: items[0].createdAt,
             stories: items.map(i => ({
                 id: i.id, mediaUrl: i.mediaUrl, caption: i.caption,
                 linkedBizId: i.businessProfileId,
                 boosted: i.boostAzmSpent > 0, seen: i.views.length > 0, createdAt: i.createdAt,
             })),
-        }));
+        };});
  
         // Tiered comparator -- same shape as Telegram's peerStoriesComparator.
         groups.sort((a, b) => {

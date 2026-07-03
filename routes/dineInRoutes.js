@@ -2,13 +2,18 @@ const express = require('express');
 const router = express.Router();
 const { protect } = require('../middleware/authMiddleware');
 const ctrl = require('../controllers/dineInController');
+const { kybGate } = require('../middleware/kybGateMiddleware');
 
 // Business-side
-router.post('/tabs',                  protect, ctrl.openTab);
-router.post('/tabs/:tabId/items',     protect, ctrl.addItem);
-router.post('/tabs/:tabId/finalize',  protect, ctrl.finalizeTab);
-router.get('/tabs',                   protect, ctrl.getOpenTabs);
-router.post('/tabs/:tabId/default',   protect, ctrl.reportDefault);
+router.post('/tabs',                  protect, kybGate, ctrl.openTab);
+router.post('/tabs/:tabId/items',     protect, kybGate, ctrl.addItem);
+router.post('/tabs/:tabId/finalize',  protect, kybGate, ctrl.finalizeTab);
+router.get('/tabs',                   protect, kybGate, ctrl.getOpenTabs);
+router.post('/tabs/:tabId/default',   protect, kybGate, ctrl.reportDefault);
+
+// Guests
+router.get('/guests',                 protect, kybGate, ctrl.getGuests);
+router.get('/guests/search',          protect, kybGate, ctrl.searchGuests);
 
 // Customer-side
 router.get('/tabs/:tabId',            protect, ctrl.getTab);

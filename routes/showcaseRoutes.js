@@ -2,11 +2,12 @@ const express = require('express');
 const router = express.Router();
 const { protect } = require('../middleware/authMiddleware');
 const ctrl = require('../controllers/showcaseController');
+const { kybGate } = require('../middleware/kybGateMiddleware');
 
-router.post('/',                      protect, ctrl.add);
+router.post('/',                      protect, kybGate, ctrl.add);
 router.get('/:businessProfileId',     ctrl.list); // public
-router.patch('/:id',                  protect, ctrl.update);
-router.delete('/:id',                 protect, ctrl.delete);
-router.post('/reorder',               protect, ctrl.reorder);
+router.patch('/:id',                  protect, kybGate, ctrl.update);
+router.delete('/:id',                 protect, kybGate, ctrl.delete);
+router.post('/reorder',               protect, kybGate, ctrl.reorder);
 
 module.exports = router;
