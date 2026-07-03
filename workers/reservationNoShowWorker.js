@@ -12,7 +12,17 @@
 //   (default 30 minutes after departure, no check-in).
 // =============================================================================
 
-const GRACE_PERIOD_MINS = 30; // grace after departure before marking transit no-show
+const GRACE_PERIOD_MINS = 30;
+
+            // MARKETPLACE v2: Update customer trust score
+            try {
+                const TrustScoreService = require('../services/marketplace/trustScoreService');
+                const trustSvc = new TrustScoreService(prisma);
+                await trustSvc.recordNoShow(reservation.customerId);
+            } catch (e) {
+                console.error(`[noShowWorker] Trust score update failed:`, e.message);
+            }
+ // grace after departure before marking transit no-show
 
 // =============================================================================
 // sweepNoShowReservations — finds past-due reservations without check-in.

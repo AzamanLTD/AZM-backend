@@ -67,6 +67,30 @@ const createReview = async (prisma, {
         reviewCount: agg._count,
       },
     });
+    // MARKETPLACE v2: After a positive review (4-5 stars), prompt customer to follow
+    try {
+      if (r >= 4) {
+        const FollowService = require('./marketplace/followService');
+        const followSvc = new FollowService(tx, global._io);
+        const isFollowing = await followSvc.isFollowing(reviewerId, businessProfileId);
+        if (!isFollowing) {
+          await tx.notification.create({
+            data: {
+              userId: reviewerId,
+              type: 'FOLLOW_PROMPT',
+              category: 'MARKETPLACE',
+              title: 'Follow this business?',
+              body: 'You gave a great review! Follow to get updates and promotions.',
+              metadata: { businessProfileId, reviewId: review.id },
+              isRead: false,
+            }
+          });
+        }
+      }
+    } catch (e) {
+      console.error('[businessReviewService] Follow prompt failed:', e.message);
+    }
+
     return review;
   });
 };

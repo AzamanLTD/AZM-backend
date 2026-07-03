@@ -286,6 +286,7 @@ enum BusinessCategory {
   LOGISTICS
   FINANCIAL_SERVICES
   OTHER
+  HOSPITALITY
 }
 
 // B-14 (2026-06-28): category image lookup — one image URL per category
@@ -371,6 +372,16 @@ enum BizNotifType {
   TRANSIT_BOOKING_NEW
   TRANSIT_NO_SHOW
   INVOICE_SENT
+  FOLLOWED_BUSINESS
+  AD_POST_CREATED
+  DINE_IN_TAB_OPENED
+  DINE_IN_TAB_FINALIZED
+  DINE_IN_TAB_PAID
+  PENALTY_CHARGED
+  PENALTY_REFUNDED
+  TRUST_LEVEL_CHANGED
+  TRANSIT_REMINDER
+  COUNTER_PROPOSAL
 }
 
 enum KybDocumentType {
@@ -862,10 +873,14 @@ model User {
   // PHASE 6 / Phase 4: Liability acceptances where this user vouched for another.
   vouchedLiabilityAcceptances LiabilityAcceptance[] @relation("LiabilityVoucher")
 
-  createdAt      DateTime        @default(now())
-  stories        Story[]
-  storyViews     StoryView[]     @relation("StoryViewer")
-  storyReactions StoryReaction[] @relation("StoryReactor")
+  createdAt           DateTime            @default(now())
+  stories             Story[]
+  storyViews          StoryView[]         @relation("StoryViewer")
+  storyReactions      StoryReaction[]     @relation("StoryReactor")
+  followingBusinesses BusinessFollower[]  @relation("BusinessFollower")
+  dineInTabs          DineInTab[]         @relation("DineInTabCustomer")
+  dineInTabItems      DineInTabItem[]     @relation("DineInTabStaff")
+  trustScore          CustomerTrustScore?
 
   @@index([phoneHash])
 }
@@ -2118,6 +2133,8 @@ model Ticket {
   businessProfile BusinessProfile? @relation(fields: [businessProfileId], references: [id])
   smartEscrow     SmartEscrow? // optional 1:1 — only ESCROW-type tickets
   businessOrder   BusinessOrder? // back-relation, no @relation directive needed
+  reservation     Reservation?
+  transitBooking  TransitBooking?
 
   @@index([friendshipId])
   @@index([creatorId])
@@ -2127,8 +2144,6 @@ model Ticket {
   // Powers the dashboard query: WHERE friendshipId=X AND status=Y
   // ORDER BY lastActivityAt DESC.
   @@index([friendshipId, status, lastActivityAt(sort: Desc)])
-  reservation      Reservation?
-  transitBooking   TransitBooking?
 }
 
 model TicketMessage {
@@ -2212,18 +2227,19 @@ model SmartEscrow {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  ticket        Ticket         @relation(fields: [ticketId], references: [id], onDelete: Cascade)
-  payer         User           @relation("EscrowPayer", fields: [payerId], references: [id])
-  payee         User           @relation("EscrowPayee", fields: [payeeId], references: [id])
-  dispute       EscrowDispute?
-  businessOrder BusinessOrder? // back-relation, no @relation directive needed
-  reservation   Reservation? // back-relation for deposit-protected bookings (2026-06-24)
+  ticket         Ticket          @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  payer          User            @relation("EscrowPayer", fields: [payerId], references: [id])
+  payee          User            @relation("EscrowPayee", fields: [payeeId], references: [id])
+  dispute        EscrowDispute?
+  businessOrder  BusinessOrder? // back-relation, no @relation directive needed
+  reservation    Reservation? // back-relation for deposit-protected bookings (2026-06-24)
+  transitBooking TransitBooking?
+  dineInTab      DineInTab?
 
   @@index([payerId])
   @@index([payeeId])
   @@index([status])
   @@index([expiresAt])
-  transitBooking   TransitBooking?
 }
 
 // =============================================================================
@@ -2346,7 +2362,13 @@ model BusinessProfile {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  stories Story[]
+  stories       Story[]
+  transitTrips  TransitTrip[]
+  followers     BusinessFollower[]
+  adPosts       BusinessAdPost[]
+  dineInTabs    DineInTab[]
+  penaltyPolicy PenaltyPolicy?
+  showcase      BusinessShowcase[]
 
   @@index([bizId])
   @@index([category])
@@ -2364,7 +2386,6 @@ model BusinessProfile {
   @@index([subcategory])
   @@index([priceRange])
   @@index([isSuspended, subcategory, totalEscrows(sort: Desc)])
-  transitTrips     TransitTrip[]
 }
 
 // =============================================================================
@@ -2395,8 +2416,9 @@ model BusinessLocation {
   reviews         BusinessReview[]
   sections        CatalogSection[] // catalog sections scoped to this branch (2026-06-24)
 
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  createdAt  DateTime    @default(now())
+  updatedAt  DateTime    @updatedAt
+  dineInTabs DineInTab[]
 
   @@index([businessProfileId])
   @@index([businessProfileId, isActive])
@@ -2413,7 +2435,8 @@ model BusinessTable {
   location BusinessLocation  @relation(fields: [locationId], references: [id], onDelete: Cascade)
   invoices BusinessInvoice[]
 
-  createdAt DateTime @default(now())
+  createdAt  DateTime    @default(now())
+  dineInTabs DineInTab[]
 
   @@unique([locationId, label]) // no duplicate table labels within a location
   @@index([locationId])
@@ -2449,8 +2472,9 @@ model BusinessInvoice {
   taxLines        BusinessInvoiceTaxLine[]
   review          BusinessReview?
 
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  createdAt DateTime   @default(now())
+  updatedAt DateTime   @updatedAt
+  dineInTab DineInTab?
 
   @@index([businessProfileId])
   @@index([businessProfileId, status])
@@ -2502,15 +2526,15 @@ model BusinessReview {
   order           BusinessOrder?    @relation(fields: [orderId], references: [id])
   invoice         BusinessInvoice?  @relation(fields: [invoiceId], references: [id])
 
-  createdAt DateTime @default(now())
+  createdAt        DateTime        @default(now())
+  photoUrls        Json?
+  reservationId    String?         @unique
+  transitBookingId String?         @unique
+  reservation      Reservation?    @relation(fields: [reservationId], references: [id])
+  transitBooking   TransitBooking? @relation(fields: [transitBookingId], references: [id])
 
   @@index([businessProfileId])
   @@index([businessProfileId, createdAt(sort: Desc)])
-  photoUrls        Json?
-  reservationId    String?      @unique
-  transitBookingId String?      @unique
-  reservation      Reservation? @relation(fields: [reservationId], references: [id])
-  transitBooking   TransitBooking? @relation(fields: [transitBookingId], references: [id])
 }
 
 // =============================================================================
@@ -2576,8 +2600,9 @@ model BusinessProduct {
   catalogSection  CatalogSection?   @relation("SectionProducts", fields: [catalogSectionId], references: [id])
   orders          BusinessOrder[]
 
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+  dineInTabItems DineInTabItem[]
 
   @@index([businessProfileId])
   @@index([businessProfileId, isActive])
@@ -2736,20 +2761,20 @@ model Reservation {
   customer        User            @relation("CustomerReservations", fields: [customerId], references: [id])
   escrow          SmartEscrow?    @relation(fields: [escrowId], references: [id])
 
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  createdAt         DateTime        @default(now())
+  updatedAt         DateTime        @updatedAt
+  noShowPenaltyPct  Decimal?        @db.Decimal(5, 4)
+  noShowPenaltyUsdc Decimal?        @db.Decimal(20, 8)
+  penaltyAmountUsdc Decimal?        @db.Decimal(20, 8)
+  penaltyChargedAt  DateTime?
+  ticketId          String?         @unique
+  ticket            Ticket?         @relation(fields: [ticketId], references: [id])
+  review            BusinessReview?
 
   @@index([businessProfileId, startDatetime])
   @@index([customerId])
   @@index([businessProfileId, status])
   @@index([reservationRef])
-  noShowPenaltyPct Decimal? @db.Decimal(5,4)
-  noShowPenaltyUsdc Decimal? @db.Decimal(20,8)
-  penaltyAmountUsdc Decimal? @db.Decimal(20,8)
-  penaltyChargedAt DateTime?
-  ticketId         String?  @unique
-  ticket           Ticket?  @relation(fields: [ticketId], references: [id])
-  review           BusinessReview?
 }
 
 // =============================================================================
@@ -2787,14 +2812,14 @@ model TransitVehicle {
   businessProfile BusinessProfile  @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
   bookings        TransitBooking[]
 
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  createdAt    DateTime        @default(now())
+  updatedAt    DateTime        @updatedAt
+  transitTrips TransitTrip[]
+  seatMap      TransitSeatMap?
 
   @@index([businessProfileId])
   @@index([businessProfileId, isActive])
   @@index([type])
-  transitTrips     TransitTrip[]
-  seatMap          TransitSeatMap?
 }
 
 model TransitBooking {
@@ -2825,8 +2850,21 @@ model TransitBooking {
   vehicle         TransitVehicle? @relation(fields: [vehicleId], references: [id], onDelete: SetNull)
   customer        User            @relation("TransitBookingCustomer", fields: [customerId], references: [id])
 
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
+  createdAt         DateTime             @default(now())
+  updatedAt         DateTime             @updatedAt
+  checkedInAt       DateTime?
+  escrowId          String?              @unique
+  escrow            SmartEscrow?         @relation(fields: [escrowId], references: [id])
+  noShowPenaltyPct  Decimal?             @db.Decimal(5, 4)
+  noShowPenaltyUsdc Decimal?             @db.Decimal(20, 8)
+  penaltyAmountUsdc Decimal?             @db.Decimal(20, 8)
+  penaltyChargedAt  DateTime?
+  ticketId          String?              @unique
+  ticket            Ticket?              @relation(fields: [ticketId], references: [id])
+  tripId            String?
+  trip              TransitTrip?         @relation(fields: [tripId], references: [id])
+  seats             TransitBookingSeat[]
+  review            BusinessReview?
 
   @@index([businessProfileId])
   @@index([businessProfileId, status])
@@ -2834,19 +2872,6 @@ model TransitBooking {
   @@index([vehicleId])
   @@index([status])
   @@index([scheduledAt])
-  checkedInAt      DateTime?
-  escrowId         String?       @unique
-  escrow           SmartEscrow?  @relation(fields: [escrowId], references: [id])
-  noShowPenaltyPct Decimal? @db.Decimal(5,4)
-  noShowPenaltyUsdc Decimal? @db.Decimal(20,8)
-  penaltyAmountUsdc Decimal? @db.Decimal(20,8)
-  penaltyChargedAt DateTime?
-  ticketId         String?       @unique
-  ticket           Ticket?       @relation(fields: [ticketId], references: [id])
-  tripId           String?
-  trip             TransitTrip?  @relation(fields: [tripId], references: [id])
-  seats            TransitBookingSeat[]
-  review           BusinessReview?
 }
 
 // =============================================================================
@@ -3566,6 +3591,7 @@ model Story {
 
   views     StoryView[]
   reactions StoryReaction[]
+  adPost    BusinessAdPost?
 }
 
 model StoryView {
@@ -3592,23 +3618,23 @@ model StoryReaction {
 }
 
 model TransitTrip {
-  id                String   @id @default(uuid())
+  id                String    @id @default(uuid())
   businessProfileId String
   vehicleId         String
-  routeName         String   @db.VarChar(200)
-  origin            String   @db.VarChar(255)
-  destination       String   @db.VarChar(255)
+  routeName         String    @db.VarChar(200)
+  origin            String    @db.VarChar(255)
+  destination       String    @db.VarChar(255)
   departureAt       DateTime
   arrivalAt         DateTime?
-  fareUsdc          Decimal  @db.Decimal(20, 8)
-  availableSeats    Int      @default(0)
-  status            String   @default("SCHEDULED")
+  fareUsdc          Decimal   @db.Decimal(20, 8)
+  availableSeats    Int       @default(0)
+  status            String    @default("SCHEDULED")
   metadata          Json?
-  createdAt         DateTime @default(now())
-  updatedAt         DateTime @updatedAt
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
 
-  businessProfile BusinessProfile @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
-  vehicle         TransitVehicle  @relation(fields: [vehicleId], references: [id], onDelete: Cascade)
+  businessProfile BusinessProfile      @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+  vehicle         TransitVehicle       @relation(fields: [vehicleId], references: [id], onDelete: Cascade)
   bookings        TransitBooking[]
   seats           TransitBookingSeat[]
 
@@ -3618,9 +3644,9 @@ model TransitTrip {
 }
 
 model TransitSeatMap {
-  id        String  @id @default(uuid())
-  vehicleId String  @unique
-  layout    Json    // [{ seatId:"1A", row:1, col:1, type:"WINDOW" }, ...]
+  id        String   @id @default(uuid())
+  vehicleId String   @unique
+  layout    Json // [{ seatId:"1A", row:1, col:1, type:"WINDOW" }, ...]
   rows      Int
   cols      Int
   createdAt DateTime @default(now())
@@ -3630,11 +3656,11 @@ model TransitSeatMap {
 }
 
 model TransitBookingSeat {
-  id            String  @id @default(uuid())
+  id            String   @id @default(uuid())
   bookingId     String
-  tripId        String  // denormalized for the unique constraint
-  seatId        String  @db.VarChar(10)
-  passengerName String? @db.VarChar(100)
+  tripId        String // denormalized for the unique constraint
+  seatId        String   @db.VarChar(10)
+  passengerName String?  @db.VarChar(100)
   createdAt     DateTime @default(now())
 
   booking TransitBooking @relation(fields: [bookingId], references: [id], onDelete: Cascade)
@@ -3643,4 +3669,132 @@ model TransitBookingSeat {
   @@unique([tripId, seatId]) // STRUCTURAL double-booking prevention
   @@index([bookingId])
   @@index([tripId])
+}
+
+// =============================================================================
+// MARKETPLACE EXPANSION v4.0 MODELS
+// =============================================================================
+
+model BusinessFollower {
+  id                String   @id @default(uuid())
+  businessProfileId String
+  customerId        Int
+  createdAt         DateTime @default(now())
+
+  businessProfile BusinessProfile @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+  customer        User            @relation("BusinessFollower", fields: [customerId], references: [id], onDelete: Cascade)
+
+  @@unique([businessProfileId, customerId])
+  @@index([customerId])
+  @@index([businessProfileId])
+}
+
+model BusinessAdPost {
+  id                String   @id @default(uuid())
+  businessProfileId String
+  templateType      String
+  title             String   @db.VarChar(200)
+  bodyText          String?  @db.VarChar(2000)
+  mediaUrl          String?
+  ctaLabel          String?  @db.VarChar(50)
+  ctaTarget         String?  @db.VarChar(500)
+  storyId           Int?     @unique
+  status            String   @default("ACTIVE")
+  expiresAt         DateTime
+  createdAt         DateTime @default(now())
+
+  businessProfile BusinessProfile @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+  story           Story?          @relation(fields: [storyId], references: [id], onDelete: SetNull)
+
+  @@index([businessProfileId, status])
+  @@index([status, expiresAt])
+}
+
+model DineInTab {
+  id                String    @id @default(uuid())
+  businessProfileId String
+  locationId        String?
+  tableId           String?
+  customerId        Int
+  status            String    @default("OPEN")
+  openedAt          DateTime  @default(now())
+  closedAt          DateTime?
+  subtotalUsdc      Decimal   @default(0.0) @db.Decimal(20, 8)
+  taxTotalUsdc      Decimal   @default(0.0) @db.Decimal(20, 8)
+  tipUsdc           Decimal   @default(0.0) @db.Decimal(20, 8)
+  grandTotalUsdc    Decimal   @default(0.0) @db.Decimal(20, 8)
+  invoiceId         String?   @unique
+  escrowId          String?   @unique
+
+  businessProfile BusinessProfile   @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+  location        BusinessLocation? @relation(fields: [locationId], references: [id])
+  table           BusinessTable?    @relation(fields: [tableId], references: [id])
+  customer        User              @relation("DineInTabCustomer", fields: [customerId], references: [id])
+  invoice         BusinessInvoice?  @relation(fields: [invoiceId], references: [id])
+  escrow          SmartEscrow?      @relation(fields: [escrowId], references: [id])
+  items           DineInTabItem[]
+
+  @@index([businessProfileId, status])
+  @@index([customerId, status])
+}
+
+model DineInTabItem {
+  id            String   @id @default(uuid())
+  dineInTabId   String
+  productId     String?
+  name          String   @db.VarChar(200)
+  unitPriceUsdc Decimal  @db.Decimal(20, 8)
+  quantity      Int      @default(1)
+  lineTotalUsdc Decimal  @db.Decimal(20, 8)
+  addedAt       DateTime @default(now())
+  addedBy       Int
+
+  dineInTab   DineInTab        @relation(fields: [dineInTabId], references: [id], onDelete: Cascade)
+  product     BusinessProduct? @relation(fields: [productId], references: [id])
+  addedByUser User             @relation("DineInTabStaff", fields: [addedBy], references: [id])
+
+  @@index([dineInTabId])
+}
+
+model PenaltyPolicy {
+  id                 String   @id @default(uuid())
+  businessProfileId  String   @unique
+  customerNoShowPct  Decimal? @db.Decimal(5, 4)
+  customerNoShowFlat Decimal? @db.Decimal(20, 8)
+  businessNoShowPct  Decimal? @db.Decimal(5, 4)
+  businessNoShowFlat Decimal? @db.Decimal(20, 8)
+  gracePeriodMins    Int      @default(30)
+  autoPenaltyEnabled Boolean  @default(true)
+  updatedAt          DateTime @updatedAt
+
+  businessProfile BusinessProfile @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+}
+
+model CustomerTrustScore {
+  id                String   @id @default(uuid())
+  customerId        Int      @unique
+  totalBookings     Int      @default(0)
+  completedBookings Int      @default(0)
+  noShowCount       Int      @default(0)
+  noShowRate        Decimal  @default(0.0) @db.Decimal(5, 4)
+  trustLevel        String   @default("GOOD")
+  lastUpdated       DateTime @updatedAt
+
+  customer User @relation(fields: [customerId], references: [id], onDelete: Cascade)
+}
+
+model BusinessShowcase {
+  id                String   @id @default(uuid())
+  businessProfileId String
+  mediaUrl          String
+  mediaType         String   @default("IMAGE")
+  thumbnailUrl      String?
+  caption           String?  @db.VarChar(500)
+  displayOrder      Int      @default(0)
+  isActive          Boolean  @default(true)
+  createdAt         DateTime @default(now())
+
+  businessProfile BusinessProfile @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+
+  @@index([businessProfileId, isActive, displayOrder])
 }

@@ -47,7 +47,18 @@ class StoryService {
         friendIds.push(viewerId); // include own stories at index 0 downstream
  
         const stories = await this.prisma.story.findMany({
-            where: { userId: { in: friendIds }, expiresAt: { gt: new Date() } },
+            where: {
+                OR: [
+                    { userId: { in: friendIds }, expiresAt: { gt: new Date() } },
+                    {
+                        businessProfileId: { not: null },
+                        expiresAt: { gt: new Date() },
+                        businessProfile: {
+                            followers: { some: { userId: viewerId } }
+                        }
+                    }
+                ],
+            },
             orderBy: { createdAt: 'desc' },
             include: {
                 user: { select: { id: true, username: true, profilePictureUrl: true } },

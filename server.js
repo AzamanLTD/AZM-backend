@@ -1154,6 +1154,12 @@ app.use('/api/business', generalLimiter,   businessRoutes);
 // Marketplace Foundation (2026-06-24): Reservation system
 app.use('/api/reservations', generalLimiter, reservationRoutes);
 
+// Marketplace Expansion (2026-07-02)
+app.use('/api/follows',      generalLimiter, followRoutes);
+app.use('/api/ad-posts',     generalLimiter, adPostRoutes);
+app.use('/api/dine-in',      financialLimiter, dineInRoutes);
+app.use('/api/showcases',    generalLimiter, showcaseRoutes);
+
 // Master Sprint (2026-05-27)
 app.use('/api/vaults',        financialLimiter, vaultRoutes);
 app.use('/api/group-chats',   generalLimiter,   groupChatRoutes);
