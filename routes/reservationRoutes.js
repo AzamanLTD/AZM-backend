@@ -21,3 +21,7 @@ router.patch('/:reservationId/checkin', protect,       ctrl.checkInReservation);
 router.patch('/:reservationId/checkout',protect,       ctrl.checkOutReservation);
 
 module.exports = router;
+
+// ── Counter-Propose (NEW) ────────────────────────────────────────────────────
+router.post('/:id/counter-propose', protect, ctrl.counterProposeReservation);
+router.post('/:id/accept-counter', protect, ctrl.acceptCounterProposal);

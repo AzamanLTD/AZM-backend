@@ -33,3 +33,10 @@ router.post('/business/trips', protect, ctrl.createTransitTrip);
 router.post('/business/seat-map', protect, ctrl.setSeatMap);
 
 module.exports = router;
+
+// ── Transit QR Check-in (NEW) ──────────────────────────────────────────────────
+router.get('/transit/bookings/:id/checkin-qr', protect, ctrl.generateTransitCheckInQR);
+router.post('/transit/boarding', protect, ctrl.transitBoarding);
+
+// ── Customer Trust Score (NEW) ───────────────────────────────────────────────
+router.get('/trust-score/:azamanId', protect, ctrl.getCustomerTrustScore);

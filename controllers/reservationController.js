@@ -297,3 +297,78 @@ exports.getAvailability = async (req, res) => {
         return res.status(code).json({ success: false, message: err.message });
     }
 };
+
+// ── counterProposeReservation ───────────────────────────────────────────
+// Business proposes an alternative time for a reservation.
+exports.counterProposeReservation = async (req, res) => {
+    try {
+        const { reservationId } = req.params;
+        const { proposedStartDatetime, proposedEndDatetime, message } = req.body;
+
+        if (!proposedStartDatetime) {
+            return res.status(400).json({ success: false, message: 'proposedStartDatetime is required.' });
+        }
+
+        const reservation = await req.prisma.reservation.findUnique({
+            where: { id: reservationId },
+            include: { businessProfile: { select: { userId: true, businessName: true } } }
+        });
+        if (!reservation) return res.status(404).json({ success: false, message: 'Reservation not found.' });
+        if (reservation.businessProfile.userId !== req.user.id) {
+            return res.status(403).json({ success: false, message: 'Not authorized.' });
+        }
+        if (reservation.status !== 'PENDING') {
+            return res.status(400).json({ success: false, message: `Cannot counter-propose on a ${reservation.status} reservation.` });
+        }
+
+        const updated = await req.prisma.reservation.update({
+            where: { id: reservationId },
+            data: {
+                proposedStartDatetime: new Date(proposedStartDatetime),
+                proposedEndDatetime: proposedEndDatetime ? new Date(proposedEndDatetime) : null,
+                counterProposeMessage: message || null,
+                counterProposedAt: new Date(),
+            }
+        });
+
+        res.json({ success: true, reservation: updated });
+    } catch (err) {
+        console.error('[counterProposeReservation]', err.message);
+        res.status(500).json({ success: false, message: err.message });
+    }
+};
+
+// ── acceptCounterProposal ────────────────────────────────────────────────
+// Customer accepts the business's proposed alternative time.
+exports.acceptCounterProposal = async (req, res) => {
+    try {
+        const { reservationId } = req.params;
+
+        const reservation = await req.prisma.reservation.findUnique({
+            where: { id: reservationId }
+        });
+        if (!reservation) return res.status(404).json({ success: false, message: 'Reservation not found.' });
+        if (reservation.customerId !== req.user.id) {
+            return res.status(403).json({ success: false, message: 'Not authorized.' });
+        }
+        if (!reservation.proposedStartDatetime) {
+            return res.status(400).json({ success: false, message: 'No counter-proposal to accept.' });
+        }
+
+        const updated = await req.prisma.reservation.update({
+            where: { id: reservationId },
+            data: {
+                startDatetime: reservation.proposedStartDatetime,
+                endDatetime: reservation.proposedEndDatetime || reservation.endDatetime,
+                proposedStartDatetime: null,
+                proposedEndDatetime: null,
+                counterProposeMessage: null,
+            }
+        });
+
+        res.json({ success: true, reservation: updated });
+    } catch (err) {
+        console.error('[acceptCounterProposal]', err.message);
+        res.status(500).json({ success: false, message: err.message });
+    }
+};

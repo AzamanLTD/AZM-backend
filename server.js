@@ -259,6 +259,11 @@ const businessRoutes    = require('./routes/businessRoutes');
 const reservationRoutes = require('./routes/reservationRoutes');
 
 // Marketplace Expansion (2026-07-02)
+const followRoutes = require('./routes/followRoutes');
+const adPostRoutes = require('./routes/adPostRoutes');
+const dineInRoutes = require('./routes/dineInRoutes');
+const showcaseRoutes = require('./routes/showcaseRoutes');
+
 const marketplaceRoutes = require('./routes/marketplaceRoutes');
 
 // Master Sprint (2026-05-27): Vault, Susu, Group Chat, Smart Route, AZM Auction

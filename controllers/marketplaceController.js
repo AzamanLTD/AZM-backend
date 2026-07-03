@@ -325,3 +325,52 @@ exports.setSeatMap = async (req, res) => {
     }
 };
 
+
+// ── generateTransitCheckInQR ──────────────────────────────────────────────
+exports.generateTransitCheckInQR = async (req, res) => {
+    try {
+        const { bookingId } = req.params;
+        const { generateTransitCheckInToken } = require('../services/qrCheckInService');
+        const result = await generateTransitCheckInToken(req.prisma, {
+            bookingId, customerId: req.user.id
+        });
+        res.json({ success: true, ...result });
+    } catch (err) {
+        console.error('[generateTransitCheckInQR]', err.message);
+        res.status(400).json({ success: false, message: err.message });
+    }
+};
+
+// ── transitBoarding ────────────────────────────────────────────────────────
+exports.transitBoarding = async (req, res) => {
+    try {
+        const { token } = req.body;
+        const { verifyTransitTokenAndBoard } = require('../services/qrCheckInService');
+        const result = await verifyTransitTokenAndBoard(req.prisma, {
+            token, businessUserId: req.user.id
+        });
+        res.json(result);
+    } catch (err) {
+        console.error('[transitBoarding]', err.message);
+        res.status(400).json({ success: false, message: err.message });
+    }
+};
+
+// ── getCustomerTrustScore ──────────────────────────────────────────────────
+exports.getCustomerTrustScore = async (req, res) => {
+    try {
+        const { azamanId } = req.params;
+        const customer = await req.prisma.user.findFirst({
+            where: { azamanId },
+            select: { id: true }
+        });
+        if (!customer) return res.status(404).json({ success: false, message: 'Customer not found.' });
+
+        const { getTrustScore } = require('../services/customerTrustScoreService');
+        const score = await getTrustScore(req.prisma, customer.id);
+        res.json({ success: true, ...score });
+    } catch (err) {
+        console.error('[getCustomerTrustScore]', err.message);
+        res.status(500).json({ success: false, message: err.message });
+    }
+};
