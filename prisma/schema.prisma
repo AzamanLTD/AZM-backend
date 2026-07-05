@@ -107,6 +107,8 @@ enum TransactionType {
   // Discovery Sprint (2026-06-20): instant invoice settlement
   BUSINESS_INVOICE_PAYMENT // customer debit when paying an invoice
   BUSINESS_INVOICE_RECEIPT // business credit when invoice is paid
+  EWA_WITHDRAWAL
+  PAYROLL_DISBURSEMENT
 }
 
 enum TransactionStatus {
@@ -875,6 +877,16 @@ model User {
 
   createdAt           DateTime            @default(now())
   stories             Story[]
+  // Business OS relations
+  employeeProfiles      BusinessEmployee[]  @relation("EmployeeUser")
+  shifts               Shift[]             @relation("ShiftUser")
+  shiftSwapsRequested   ShiftSwap[]        @relation("SwapRequester")
+  shiftSwapsClaimed     ShiftSwap[]        @relation("SwapClaimer")
+  timeOffRequests       TimeOffRequest[]
+  payrollRecords        PayrollRecord[]
+  employeeFeedbacks     EmployeeFeedback[] @relation("FeedbackGiven")
+  housekeepingTasks     HotelHousekeepingTask[] @relation("Housekeeper")
+  driverAssignments    DriverAssignment[]
   storyViews          StoryView[]         @relation("StoryViewer")
   storyReactions      StoryReaction[]     @relation("StoryReactor")
   followingBusinesses BusinessFollower[]  @relation("BusinessFollower")
@@ -2369,6 +2381,19 @@ model BusinessProfile {
   dineInTabs    DineInTab[]
   penaltyPolicy PenaltyPolicy?
   showcase      BusinessShowcase[]
+  // Business OS relations
+  employees          BusinessEmployee[]
+  shifts             Shift[]
+  shiftSwaps         ShiftSwap[]
+  timeOffRequests    TimeOffRequest[]
+  payrollRecords     PayrollRecord[]
+  ledgerEntries      BusinessLedgerEntry[]
+  employeeFeedbacks  EmployeeFeedback[]
+  hotelRooms         HotelRoom[]
+  housekeepingTasks  HotelHousekeepingTask[]
+  kitchenOrders      KitchenOrder[]
+  driverAssignments  DriverAssignment[]
+  vehicleMaintenances VehicleMaintenance[]
 
   @@index([bizId])
   @@index([category])
@@ -2410,6 +2435,8 @@ model BusinessLocation {
   isActive          Boolean @default(true)
 
   businessProfile BusinessProfile   @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+  hotelRooms       HotelRoom[]
+  kitchenOrders    KitchenOrder[]
   products        BusinessProduct[] // products available at this specific location
   tables          BusinessTable[]
   invoices        BusinessInvoice[]
@@ -2598,6 +2625,7 @@ model BusinessProduct {
   businessProfile BusinessProfile   @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
   location        BusinessLocation? @relation(fields: [locationId], references: [id])
   catalogSection  CatalogSection?   @relation("SectionProducts", fields: [catalogSectionId], references: [id])
+  kitchenOrderItems KitchenOrderItem[]
   orders          BusinessOrder[]
 
   createdAt      DateTime        @default(now())
@@ -2642,6 +2670,7 @@ model BusinessOrder {
   escrow          SmartEscrow?     @relation(fields: [escrowId], references: [id])
   ticket          Ticket?          @relation(fields: [ticketId], references: [id])
   review          BusinessReview? // Discovery Sprint: one optional review per order
+  kitchenOrder  KitchenOrder?
 
   @@index([businessProfileId])
   @@index([businessProfileId, status])
@@ -2822,6 +2851,8 @@ model TransitVehicle {
   transitTrips TransitTrip[]
   seatMap      TransitSeatMap?
 
+  driverAssignments  DriverAssignment[]
+  maintenances        VehicleMaintenance[]
   @@index([businessProfileId])
   @@index([businessProfileId, isActive])
   @@index([type])
@@ -3642,6 +3673,7 @@ model TransitTrip {
   vehicle         TransitVehicle       @relation(fields: [vehicleId], references: [id], onDelete: Cascade)
   bookings        TransitBooking[]
   seats           TransitBookingSeat[]
+  driverAssignments DriverAssignment[]
 
   @@index([businessProfileId, departureAt])
   @@index([vehicleId, departureAt])
@@ -3802,4 +3834,673 @@ model BusinessShowcase {
   businessProfile BusinessProfile @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
 
   @@index([businessProfileId, isActive, displayOrder])
+}
+
+
+// BUSINESS OS — EMPLOYEE MANAGEMENT & CATEGORY OPERATIONS (July 2026)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ── Employee Enums ─────────────────────────────────────────────────────────────
+enum EmployeeRole {
+  OWNER
+  MANAGER
+  SUPERVISOR
+  STAFF
+  DRIVER
+  HOUSEKEEPER
+  WAITER
+  CHEF
+  RECEPTIONIST
+  CONCIERGE
+  SECURITY
+}
+
+enum EmployeeStatus {
+  ACTIVE
+  SUSPENDED
+  TERMINATED
+  ON_LEAVE
+}
+
+enum EmployeePaymentPreference {
+  AZAMAN_BALANCE
+  MOMO
+  WALLET
+  SPLIT
+}
+
+enum ShiftStatus {
+  SCHEDULED
+  CLOCKED_IN
+  CLOCKED_OUT
+  NO_SHOW
+  LATE
+}
+
+enum ShiftSwapStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  CANCELLED
+  EXPIRED
+}
+
+enum TimeOffType {
+  SICK
+  VACATION
+  PERSONAL
+  EMERGENCY
+  UNPAID
+}
+
+enum TimeOffStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  CANCELLED
+}
+
+enum PayrollStatus {
+  PENDING
+  PROCESSED
+  FAILED
+  PARTIAL
+}
+
+enum PayrollType {
+  SALARY
+  HOURLY
+  PIECE_RATE
+}
+
+enum LedgerEntryType {
+  INCOME
+  EXPENSE
+  PAYROLL
+  TAX
+  REFUND
+  PENALTY
+  AD_SPEND
+  MAINTENANCE
+  SUPPLIES
+  UTILITIES
+  RENT
+  OTHER
+}
+
+enum FeedbackTag {
+  PUNCTUAL
+  TEAM_PLAYER
+  HARD_WORKING
+  RELIABLE
+  LEADERSHIP
+  NEEDS_IMPROVEMENT
+  LATE
+  UNRELIABLE
+}
+
+enum HousekeepingStatus {
+  PENDING
+  IN_PROGRESS
+  COMPLETED
+  INSPECTED
+  FAILED
+}
+
+enum RoomStatus {
+  AVAILABLE
+  OCCUPIED
+  DIRTY
+  CLEANING
+  MAINTENANCE
+  RESERVED
+}
+
+enum KitchenOrderStatus {
+  NEW
+  PREPARING
+  READY
+  SERVED
+  CANCELLED
+}
+
+enum MaintenanceStatus {
+  SCHEDULED
+  IN_PROGRESS
+  COMPLETED
+  OVERDUE
+}
+
+enum MaintenanceType {
+  SCHEDULED
+  UNSCHEDULED
+  EMERGENCY
+}
+
+// ── Extend Existing TransactionType Enum ──────────────────────────────────────
+// The existing TransactionType enum in schema.prisma must be extended with two
+// new values to support Business OS financial movements. Find the existing
+// `enum TransactionType { ... }` block and add these two values at the end
+// (before the closing brace):
+//
+//   EWA_WITHDRAWAL
+//   PAYROLL_DISBURSEMENT
+//
+// These are required by ewaService.js and payrollService.js to create
+// TransactionHistory records for atomic ledger reconciliation.
+
+// ── Employee Management Models ────────────────────────────────────────────────
+
+model BusinessEmployee {
+  id                String                  @id @default(uuid())
+  businessProfileId String
+  userId            Int
+  role              EmployeeRole            @default(STAFF)
+  status            EmployeeStatus          @default(ACTIVE)
+  title             String?                 @db.VarChar(100)
+  department        String?                 @db.VarChar(100) // e.g. "Front Desk", "Kitchen", "Housekeeping", "Driving"
+  
+  // Compensation
+  payrollType       PayrollType             @default(SALARY)
+  salaryAmount      Decimal?                @db.Decimal(20, 8) // monthly salary in USDC
+  hourlyRate        Decimal?                @db.Decimal(20, 8) // hourly rate in USDC
+  paymentPreference EmployeePaymentPreference @default(AZAMAN_BALANCE)
+  
+  // Smart Route for payroll — employee sets their own routing
+  smartRouteId      String? // FK to SmartRoute.id — employee-configured split routing
+  
+  // Permissions (JSON array of permission strings like ["manage_employees", "view_finance", "process_payroll"])
+  permissions       String[]
+  
+  // Stats (denormalized for quick portal display)
+  totalShifts       Int      @default(0)
+  totalHours        Decimal  @default(0.0) @db.Decimal(10, 2)
+  lateCount         Int      @default(0)
+  noShowCount       Int      @default(0)
+  rating            Decimal  @default(5.0) @db.Decimal(3, 2) // average from EmployeeFeedback
+  ratingCount       Int      @default(0)
+  
+  // EWA (Earned Wage Access) tracking
+  accruedWages      Decimal  @default(0.0) @db.Decimal(20, 8) // running accrued wages
+  withdrawnEarly    Decimal  @default(0.0) @db.Decimal(20, 8) // total withdrawn via EWA
+  ewaEligible       Boolean  @default(true)
+  
+  // Employment dates
+  hireDate          DateTime @default(now())
+  terminationDate   DateTime?
+  
+  // Metadata
+  emergencyContact  Json? // { name, phone, relationship }
+  notes             String? @db.VarChar(1000)
+  
+  businessProfile BusinessProfile @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+  user            User            @relation("EmployeeUser", fields: [userId], references: [id], onDelete: Cascade)
+  shifts          Shift[]
+  swapRequests    ShiftSwap[]      @relation("SwapRequesterEmployee")
+  swapClaims      ShiftSwap[]      @relation("SwapClaimerEmployee")
+  timeOffRequests TimeOffRequest[]
+  payrollRecords  PayrollRecord[]
+  feedbacksGiven   EmployeeFeedback[] @relation("FeedbackGiverEmployee")
+  feedbacksReceived EmployeeFeedback[] @relation("FeedbackReceiverEmployee")
+  housekeepingTasks HotelHousekeepingTask[]
+  kitchenOrders    KitchenOrder[]      @relation("KitchenChefEmployee")
+  driverAssignments DriverAssignment[]
+  
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  
+  @@unique([businessProfileId, userId])
+  @@index([businessProfileId, status])
+  @@index([userId])
+  @@index([businessProfileId, role])
+}
+
+model Shift {
+  id                String      @id @default(uuid())
+  businessProfileId String
+  employeeId        String
+  userId            Int // denormalized from employee for quick lookups
+  locationId        String? // which branch/location
+  
+  // Scheduling
+  shiftDate         DateTime // the date of the shift (date only, time component is start)
+  startTime         DateTime
+  endTime           DateTime
+  breakMinutes      Int         @default(30)
+  
+  // Clock in/out tracking
+  status            ShiftStatus @default(SCHEDULED)
+  clockInTime       DateTime?
+  clockOutTime      DateTime?
+  actualMinutes     Int? // calculated from clock in/out
+  
+  // Late tracking
+  isLate            Boolean     @default(false)
+  lateMinutes       Int         @default(0)
+  
+  // Rotation info
+  rotationId        String? // links to a rotation group
+  shiftLabel        String?     @db.VarChar(50) // e.g. "Morning A", "Evening B"
+  
+  // Notes
+  notes             String?     @db.VarChar(500)
+  
+  businessProfile BusinessProfile   @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+  employee        BusinessEmployee  @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  user            User              @relation("ShiftUser", fields: [userId], references: [id], onDelete: Cascade)
+  swapRequests    ShiftSwap[]       @relation("ShiftSwapOrigin")
+  swapClaims      ShiftSwap[]       @relation("ShiftSwapTarget")
+  
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  
+  @@index([businessProfileId, shiftDate])
+  @@index([employeeId, shiftDate])
+  @@index([userId, shiftDate])
+  @@index([status])
+  @@index([businessProfileId, status, shiftDate])
+}
+
+model ShiftSwap {
+  id                String          @id @default(uuid())
+  businessProfileId String
+  requestingShiftId String
+  claimingShiftId   String? // the shift the claimer offers in return (null = one-way takeover)
+  requestingEmployeeId String
+  claimingEmployeeId  String?
+  requestingUserId    Int
+  claimingUserId      Int?
+  
+  status            ShiftSwapStatus @default(PENDING)
+  reason            String?         @db.VarChar(500)
+  managerNote       String?         @db.VarChar(500)
+  
+  requestedAt       DateTime        @default(now())
+  respondedAt       DateTime?
+  
+  requestingShift   Shift             @relation("ShiftSwapOrigin", fields: [requestingShiftId], references: [id], onDelete: Cascade)
+  claimingShift     Shift?            @relation("ShiftSwapTarget", fields: [claimingShiftId], references: [id])
+  requestingEmployee BusinessEmployee @relation("SwapRequesterEmployee", fields: [requestingEmployeeId], references: [id], onDelete: Cascade)
+  claimingEmployee   BusinessEmployee? @relation("SwapClaimerEmployee", fields: [claimingEmployeeId], references: [id])
+  businessProfile    BusinessProfile  @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+  requestingUser     User             @relation("SwapRequester", fields: [requestingUserId], references: [id], onDelete: Cascade)
+  claimingUser       User?            @relation("SwapClaimer", fields: [claimingUserId], references: [id])
+  
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  
+  @@index([businessProfileId, status])
+  @@index([requestingEmployeeId])
+  @@index([claimingEmployeeId])
+}
+
+model TimeOffRequest {
+  id                String         @id @default(uuid())
+  businessProfileId String
+  employeeId        String
+  userId            Int
+  
+  type              TimeOffType
+  status            TimeOffStatus  @default(PENDING)
+  
+  startDate         DateTime
+  endDate           DateTime
+  reason            String?        @db.VarChar(500)
+  managerNote       String?        @db.VarChar(500)
+  
+  // For sick/emergency — can be same-day request
+  isEmergency       Boolean        @default(false)
+  
+  employee        BusinessEmployee @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  businessProfile BusinessProfile  @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+  user            User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  
+  @@index([businessProfileId, status])
+  @@index([employeeId])
+  @@index([userId, status])
+}
+
+model PayrollRecord {
+  id                String         @id @default(uuid())
+  businessProfileId String
+  employeeId        String
+  userId            Int
+  
+  period            String         @db.VarChar(20) // e.g. "2026-07" for July 2026
+  payrollType       PayrollType
+  
+  // Earnings
+  grossAmount       Decimal        @db.Decimal(20, 8) // total gross in USDC
+  netAmount         Decimal        @db.Decimal(20, 8) // after deductions
+  baseAmount        Decimal        @db.Decimal(20, 8) // base salary or hours*rate
+  overtimeAmount    Decimal        @default(0.0) @db.Decimal(20, 8)
+  bonusAmount       Decimal        @default(0.0) @db.Decimal(20, 8)
+  tipsAmount        Decimal        @default(0.0) @db.Decimal(20, 8)
+  
+  // Deductions
+  deductionAmount   Decimal        @default(0.0) @db.Decimal(20, 8)
+  ewaDeduction      Decimal        @default(0.0) @db.Decimal(20, 8) // EWA withdrawals to deduct
+  taxAmount         Decimal        @default(0.0) @db.Decimal(20, 8)
+  
+  // Hours breakdown
+  totalHours        Decimal        @default(0.0) @db.Decimal(10, 2)
+  overtimeHours     Decimal        @default(0.0) @db.Decimal(10, 2)
+  
+  // Payment execution
+  status            PayrollStatus  @default(PENDING)
+  smartRouteId      String? // if Smart Route was used for disbursement
+  transactionHash   String? // blockchain tx hash if applicable
+  paidAt            DateTime?
+  failureReason     String?        @db.VarChar(500)
+  
+  // Breakdown details (JSON for audit)
+  breakdown         Json? // detailed breakdown of hours, rates, etc.
+  
+  employee        BusinessEmployee @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  businessProfile BusinessProfile  @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+  user            User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  
+  @@unique([employeeId, period])
+  @@index([businessProfileId, period])
+  @@index([employeeId, period])
+  @@index([status])
+}
+
+model BusinessLedgerEntry {
+  id                String          @id @default(uuid())
+  businessProfileId String
+  
+  type              LedgerEntryType
+  category          String          @db.VarChar(100) // sub-category e.g. "Room Revenue", "Food Sales", "Fuel", "Salaries"
+  description       String          @db.VarChar(500)
+  amount            Decimal         @db.Decimal(20, 8) // positive for income, negative for expense
+  amountGhs         Decimal?        @db.Decimal(20, 8) // GHS equivalent at time of entry
+  
+  // Source tracking
+  sourceType        String?         @db.VarChar(50) // "ORDER", "PAYROLL", "MANUAL", "ESCROW", "AD"
+  sourceId          String? // FK to the source entity (order id, payroll id, etc.)
+  
+  // Metadata
+  metadata          Json?
+  
+  businessProfile BusinessProfile @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+  
+  createdAt DateTime @default(now())
+  
+  @@index([businessProfileId, type])
+  @@index([businessProfileId, createdAt(sort: Desc)])
+  @@index([businessProfileId, type, createdAt(sort: Desc)])
+  @@index([sourceType, sourceId])
+}
+
+model EmployeeFeedback {
+  id                String          @id @default(uuid())
+  businessProfileId String
+  giverEmployeeId   String
+  receiverEmployeeId String
+  givenByUserId     Int
+  receivedByUserId  Int
+  
+  rating            Int // 1-5
+  tags              FeedbackTag[]
+  comment           String?         @db.VarChar(500)
+  
+  // Period this feedback covers
+  periodStart       DateTime
+  periodEnd         DateTime
+  
+  giverEmployee    BusinessEmployee @relation("FeedbackGiverEmployee", fields: [giverEmployeeId], references: [id], onDelete: Cascade)
+  receiverEmployee  BusinessEmployee @relation("FeedbackReceiverEmployee", fields: [receiverEmployeeId], references: [id], onDelete: Cascade)
+  businessProfile   BusinessProfile  @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+  givenByUser       User             @relation("FeedbackGiven", fields: [givenByUserId], references: [id], onDelete: Cascade)
+  
+  createdAt DateTime @default(now())
+  
+  @@index([receiverEmployeeId])
+  @@index([businessProfileId, createdAt(sort: Desc)])
+}
+
+// ── Hotel Operations Models ────────────────────────────────────────────────────
+
+model HotelRoom {
+  id                String      @id @default(uuid())
+  businessProfileId String
+  locationId        String?
+  
+  roomNumber        String      @db.VarChar(20)
+  roomType          String      @db.VarChar(50) // "STANDARD", "DELUXE", "SUITE", "EXECUTIVE"
+  floor             Int?
+  capacity          Int         @default(2)
+  bedConfig         String?     @db.VarChar(50) // "1 KING", "2 QUEEN", "1 QUEEN + 1 SINGLE"
+  
+  status            RoomStatus  @default(AVAILABLE)
+  
+  // Pricing (per night in USDC)
+  basePriceUsdc     Decimal     @db.Decimal(20, 8)
+  weekendPriceUsdc  Decimal?    @db.Decimal(20, 8)
+  
+  // Amenities
+  amenities         String[] // ["AC", "WIFI", "TV", "MINIBAR", "BALCONY", "OCEAN_VIEW"]
+  
+  // Media
+  imageUrls         String[]
+  
+  // Current occupancy
+  currentReservationId String? // FK to Reservation.id
+  checkedInAt         DateTime?
+  checkoutDueAt       DateTime?
+  
+  // Maintenance
+  lastInspectedAt   DateTime?
+  notes             String?     @db.VarChar(500)
+  
+  businessProfile BusinessProfile  @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+  location        BusinessLocation? @relation(fields: [locationId], references: [id])
+  housekeepingTasks HotelHousekeepingTask[]
+  
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  
+  @@unique([businessProfileId, roomNumber])
+  @@index([businessProfileId, status])
+  @@index([businessProfileId, roomType])
+  @@index([locationId, status])
+}
+
+model HotelHousekeepingTask {
+  id                String            @id @default(uuid())
+  businessProfileId String
+  roomId            String
+  employeeId        String?
+  userId            Int? // denormalized from employee
+  
+  status            HousekeepingStatus @default(PENDING)
+  
+  // Task details
+  taskType          String            @db.VarChar(50) // "CHECKOUT_CLEAN", "DAILY_REFRESH", "DEEP_CLEAN", "INSPECTION"
+  priority          Int               @default(5) // 1=urgent, 5=normal
+  description       String?           @db.VarChar(500)
+  
+  // Photo proof
+  beforePhotoUrl    String?
+  afterPhotoUrl     String?
+  
+  // Timing
+  assignedAt        DateTime?
+  startedAt         DateTime?
+  completedAt       DateTime?
+  inspectedAt       DateTime?
+  
+  // Inspection result
+  inspectionPassed  Boolean?
+  inspectionNote    String?           @db.VarChar(500)
+  
+  room             HotelRoom         @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  businessProfile  BusinessProfile   @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+  employee         BusinessEmployee? @relation(fields: [employeeId], references: [id])
+  housekeeper      User?             @relation("Housekeeper", fields: [userId], references: [id])
+  
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  
+  @@index([businessProfileId, status])
+  @@index([roomId, status])
+  @@index([employeeId, status])
+}
+
+// ── Restaurant Operations Models ──────────────────────────────────────────────
+
+model KitchenOrder {
+  id                String             @id @default(uuid())
+  businessProfileId String
+  locationId        String?
+  businessOrderId   String?  @unique // FK to BusinessOrder
+  
+  // Kitchen ticket number (sequential per location per day)
+  ticketNumber      Int
+  tableNumber       String?  @db.VarChar(20) // "Table 4", "Table 12"
+  serverName        String?  @db.VarChar(100) // waiter who sent the order
+  
+  status            KitchenOrderStatus @default(NEW)
+  
+  // Timing
+  sentAt            DateTime           @default(now())
+  startedAt         DateTime?
+  readyAt           DateTime?
+  servedAt          DateTime?
+  
+  // Routing
+  station           String?            @db.VarChar(50) // "GRILL", "FRY", "SALAD", "BAR", "DESSERT"
+  prepTimeMinutes   Int? // estimated prep time
+  
+  // Allergy/special alerts
+  allergyAlerts     String[] // ["PEANUT", "GLUTEN", "SHELLFISH"]
+  specialInstructions String?           @db.VarChar(500)
+  
+  // Priority
+  isRush            Boolean            @default(false)
+  
+  // Chef assignment
+  employeeId        String?
+  
+  businessProfile BusinessProfile   @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+  location        BusinessLocation? @relation(fields: [locationId], references: [id])
+  businessOrder   BusinessOrder?    @relation(fields: [businessOrderId], references: [id])
+  chef            BusinessEmployee? @relation("KitchenChefEmployee", fields: [employeeId], references: [id])
+  items           KitchenOrderItem[]
+  
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  
+  @@index([businessProfileId, status])
+  @@index([locationId, status])
+  @@index([station, status])
+}
+
+model KitchenOrderItem {
+  id                String   @id @default(uuid())
+  kitchenOrderId    String
+  productId         String?
+  
+  name              String   @db.VarChar(200)
+  quantity          Int      @default(1)
+  modifiers         String[] // ["NO ONION", "EXTRA CHEESE", "WELL DONE"]
+  station           String?  @db.VarChar(50) // override at item level
+  
+  status            KitchenOrderStatus @default(NEW)
+  bumpedAt          DateTime? // when chef taps "bump" (dismiss)
+  
+  kitchenOrder  KitchenOrder     @relation(fields: [kitchenOrderId], references: [id], onDelete: Cascade)
+  product       BusinessProduct? @relation(fields: [productId], references: [id])
+  
+  createdAt DateTime @default(now())
+  
+  @@index([kitchenOrderId])
+  @@index([station, status])
+}
+
+// ── Transit Operations Models ─────────────────────────────────────────────────
+
+model DriverAssignment {
+  id                String   @id @default(uuid())
+  businessProfileId String
+  tripId            String?
+  vehicleId         String?
+  employeeId        String
+  userId            Int // denormalized
+  
+  // Assignment details
+  assignmentDate    DateTime
+  role              String   @db.VarChar(50) // "DRIVER", "CONDUCTOR", "ASSISTANT"
+  shiftLabel        String?  @db.VarChar(50)
+  
+  // Status
+  status            String   @default("ASSIGNED") // ASSIGNED, CHECKED_IN, ON_DUTY, COMPLETED, CANCELLED
+  checkedInAt       DateTime?
+  startedAt         DateTime?
+  completedAt       DateTime?
+  
+  // Route/trip info (denormalized for quick display)
+  routeName         String?  @db.VarChar(200)
+  departureTime     DateTime?
+  
+  businessProfile BusinessProfile  @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+  trip            TransitTrip?     @relation(fields: [tripId], references: [id])
+  vehicle         TransitVehicle?  @relation(fields: [vehicleId], references: [id])
+  employee        BusinessEmployee @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  user            User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  
+  @@index([businessProfileId, assignmentDate])
+  @@index([employeeId, assignmentDate])
+  @@index([userId, assignmentDate])
+  @@index([vehicleId])
+}
+
+model VehicleMaintenance {
+  id                String           @id @default(uuid())
+  businessProfileId String
+  vehicleId         String
+  
+  type              MaintenanceType  @default(SCHEDULED)
+  status            MaintenanceStatus @default(SCHEDULED)
+  
+  // Scheduling
+  scheduledDate     DateTime
+  completedDate     DateTime?
+  
+  // Details
+  description       String           @db.VarChar(500)
+  cost              Decimal          @default(0.0) @db.Decimal(20, 8)
+  costGhs           Decimal?         @db.Decimal(20, 8)
+  serviceProvider   String?          @db.VarChar(200)
+  
+  // Odometer-based scheduling
+  odometerAtService Int?
+  nextServiceDue    Int? // odometer reading for next service
+  
+  // Parts & labor breakdown
+  partsCost         Decimal          @default(0.0) @db.Decimal(20, 8)
+  laborCost         Decimal          @default(0.0) @db.Decimal(20, 8)
+  
+  // Notes
+  notes             String?          @db.VarChar(1000)
+  
+  businessProfile BusinessProfile  @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+  vehicle         TransitVehicle   @relation(fields: [vehicleId], references: [id], onDelete: Cascade)
+  
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  
+  @@index([businessProfileId, status])
+  @@index([vehicleId, status])
+  @@index([vehicleId, scheduledDate])
 }

@@ -1198,10 +1198,12 @@ app.use('/api/admin/war-room',            generalLimiter, adminWarRoomRoutes);
 
 // PHASE 5 / Workstream E — Admin Portal Susu monitor + operator actions.
 const adminSusuRoutes = require('./routes/adminSusuRoutes');
+const businessOSRoutes  = require('./routes/businessOSRoutes');
 app.use('/api/admin/susu',                generalLimiter, adminSusuRoutes);
 
 // MARKETPLACE EXPANSION — Phase B-2
 app.use('/api/marketplace',               generalLimiter, marketplaceRoutes);
+app.use('/api/business-os',   generalLimiter,   businessOSRoutes);
 
 // --- CHAT MEDIA UPLOAD (Phase UI-3, 2026-05-26) ──────────────────────────────
 //
