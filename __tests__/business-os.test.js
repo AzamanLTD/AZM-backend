@@ -183,6 +183,20 @@ async function teardownFixtures() {
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
+
+if (hasDb) {
+    beforeAll(async () => {
+        prisma = new PrismaClient({ datasources: { db: { url: process.env.TEST_DATABASE_URL } } });
+        process.env.DATABASE_URL = process.env.TEST_DATABASE_URL;
+        await setupFixtures();
+    });
+
+    afterAll(async () => {
+        await teardownFixtures();
+        await prisma.$disconnect();
+    });
+}
+
 describeIf('Business OS — Employee Management', () => {
     beforeAll(async () => {
         prisma = new PrismaClient({ datasources: { db: { url: process.env.TEST_DATABASE_URL } } });
@@ -268,14 +282,6 @@ describeIf('Business OS — Employee Management', () => {
 // ── Shift Service ─────────────────────────────────────────────────────────────
 describeIf('Business OS — Shift Management', () => {
     let testShift;
-
-    beforeAll(async () => {
-        if (!prisma) {
-            prisma = new PrismaClient({ datasources: { db: { url: process.env.TEST_DATABASE_URL } } });
-            process.env.DATABASE_URL = process.env.TEST_DATABASE_URL;
-            await setupFixtures();
-        }
-    });
 
     afterAll(async () => {
         if (testShift) await prisma.shift.deleteMany({ where: { id: testShift.id } });
@@ -373,14 +379,6 @@ describeIf('Business OS — Shift Management', () => {
 
 // ── EWA Service ───────────────────────────────────────────────────────────────
 describeIf('Business OS — Earned Wage Access (EWA)', () => {
-    beforeAll(async () => {
-        if (!prisma) {
-            prisma = new PrismaClient({ datasources: { db: { url: process.env.TEST_DATABASE_URL } } });
-            process.env.DATABASE_URL = process.env.TEST_DATABASE_URL;
-            await setupFixtures();
-        }
-    });
-
     test('should check EWA eligibility (0 accrued = not eligible)', async () => {
         const { EwaService } = require('../services/businessOS/ewaService');
         const svc = new EwaService(prisma);
@@ -449,14 +447,6 @@ describeIf('Business OS — Earned Wage Access (EWA)', () => {
 
 // ── Business Ledger Service ───────────────────────────────────────────────────
 describeIf('Business OS — Business Ledger', () => {
-    beforeAll(async () => {
-        if (!prisma) {
-            prisma = new PrismaClient({ datasources: { db: { url: process.env.TEST_DATABASE_URL } } });
-            process.env.DATABASE_URL = process.env.TEST_DATABASE_URL;
-            await setupFixtures();
-        }
-    });
-
     test('should create a ledger entry', async () => {
         const { BusinessLedgerService } = require('../services/businessOS/businessLedgerService');
         const svc = new BusinessLedgerService(prisma);
@@ -505,14 +495,6 @@ describeIf('Business OS — Business Ledger', () => {
 
 // ── Hotel Ops Service ─────────────────────────────────────────────────────────
 describeIf('Business OS — Hotel Operations', () => {
-    beforeAll(async () => {
-        if (!prisma) {
-            prisma = new PrismaClient({ datasources: { db: { url: process.env.TEST_DATABASE_URL } } });
-            process.env.DATABASE_URL = process.env.TEST_DATABASE_URL;
-            await setupFixtures();
-        }
-    });
-
     test('should get rooms list', async () => {
         const { HotelOpsService } = require('../services/businessOS/hotelOpsService');
         const svc = new HotelOpsService(prisma);
@@ -589,14 +571,6 @@ describeIf('Business OS — Hotel Operations', () => {
 
 // ── Restaurant Ops Service ────────────────────────────────────────────────────
 describeIf('Business OS — Restaurant Operations (KDS)', () => {
-    beforeAll(async () => {
-        if (!prisma) {
-            prisma = new PrismaClient({ datasources: { db: { url: process.env.TEST_DATABASE_URL } } });
-            process.env.DATABASE_URL = process.env.TEST_DATABASE_URL;
-            await setupFixtures();
-        }
-    });
-
     test('should create a kitchen order', async () => {
         const { RestaurantOpsService } = require('../services/businessOS/restaurantOpsService');
         const svc = new RestaurantOpsService(prisma);
@@ -679,14 +653,6 @@ describeIf('Business OS — Restaurant Operations (KDS)', () => {
 
 // ── Transit Ops Service ───────────────────────────────────────────────────────
 describeIf('Business OS — Transit Operations', () => {
-    beforeAll(async () => {
-        if (!prisma) {
-            prisma = new PrismaClient({ datasources: { db: { url: process.env.TEST_DATABASE_URL } } });
-            process.env.DATABASE_URL = process.env.TEST_DATABASE_URL;
-            await setupFixtures();
-        }
-    });
-
     test('should create a maintenance record', async () => {
         const { TransitOpsService } = require('../services/businessOS/transitOpsService');
         const svc = new TransitOpsService(prisma);
@@ -739,14 +705,6 @@ describeIf('Business OS — Transit Operations', () => {
 
 // ── Payroll Service ───────────────────────────────────────────────────────────
 describeIf('Business OS — Payroll', () => {
-    beforeAll(async () => {
-        if (!prisma) {
-            prisma = new PrismaClient({ datasources: { db: { url: process.env.TEST_DATABASE_URL } } });
-            process.env.DATABASE_URL = process.env.TEST_DATABASE_URL;
-            await setupFixtures();
-        }
-    });
-
     test('should process payroll for a single employee', async () => {
         const { PayrollService } = require('../services/businessOS/payrollService');
         const svc = new PayrollService(prisma);
@@ -781,14 +739,6 @@ describeIf('Business OS — Payroll', () => {
 
 // ── Time Off Service ──────────────────────────────────────────────────────────
 describeIf('Business OS — Time Off', () => {
-    beforeAll(async () => {
-        if (!prisma) {
-            prisma = new PrismaClient({ datasources: { db: { url: process.env.TEST_DATABASE_URL } } });
-            process.env.DATABASE_URL = process.env.TEST_DATABASE_URL;
-            await setupFixtures();
-        }
-    });
-
     test('should request time off', async () => {
         const { TimeOffService } = require('../services/businessOS/timeOffService');
         const svc = new TimeOffService(prisma);
@@ -822,14 +772,6 @@ describeIf('Business OS — Time Off', () => {
 
 // ── Employee Feedback Service ─────────────────────────────────────────────────
 describeIf('Business OS — Employee Feedback', () => {
-    beforeAll(async () => {
-        if (!prisma) {
-            prisma = new PrismaClient({ datasources: { db: { url: process.env.TEST_DATABASE_URL } } });
-            process.env.DATABASE_URL = process.env.TEST_DATABASE_URL;
-            await setupFixtures();
-        }
-    });
-
     test('should create feedback and update employee rating', async () => {
         const { EmployeeFeedbackService } = require('../services/businessOS/employeeFeedbackService');
         const svc = new EmployeeFeedbackService(prisma);
