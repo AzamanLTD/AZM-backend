@@ -149,9 +149,10 @@ async function setupFixtures() {
         data: {
             businessProfileId: businessProfile.id,
             name: 'Jollof Rice Special',
-            price: 25.00,
-            category: 'Main Course',
-            metadata: { station: 'HOT', allergens: [] },
+            priceUsdc: 25.00,
+            slug: `jollof-rice-special-${Date.now()}`,
+            category: 'FOOD_BEVERAGE',
+            metadata: { category: 'Main Course', station: 'HOT', allergens: [] },
         },
     });
 }
