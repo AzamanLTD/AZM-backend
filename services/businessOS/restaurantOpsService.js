@@ -265,23 +265,21 @@ class RestaurantOpsService {
             throw new Error('Product does not belong to this business.');
         }
 
-        // Store 86 status in metadata
-        const metadata = product.metadata || {};
-        metadata.is86ed = is86ed;
-        metadata.eightySixReason = is86ed ? (reason || 'Out of stock') : null;
-        metadata.eightySixAt = is86ed ? new Date().toISOString() : null;
-
+        // BusinessProduct schema uses `isAvailable` (not metadata)
+        // is86ed = true means sold out → isAvailable = false
         return this.prisma.businessProduct.update({
             where: { id: productId },
-            data: { metadata },
+            data: {
+                isAvailable: !is86ed,
+            },
         });
     }
 
     async get86edItems(businessProfileId) {
-        const products = await this.prisma.businessProduct.findMany({
-            where: { businessProfileId },
+        // 86'd items = products that are not available
+        return this.prisma.businessProduct.findMany({
+            where: { businessProfileId, isAvailable: false },
         });
-        return products.filter(p => p.metadata?.is86ed);
     }
 }
 
