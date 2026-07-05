@@ -53,7 +53,6 @@ class RestaurantOpsService {
                     quantity: item.quantity,
                     station: itemStation,
                     modifiers: item.modifiers || [],
-                    notes: item.notes || '',
                     status: 'NEW',
                 });
             }
@@ -74,10 +73,11 @@ class RestaurantOpsService {
                 allergyAlerts: uniqueAllergies,
                 specialInstructions,
                 isRush: isRush || false,
-                orderItems: orderItems,
+                items: { create: orderItems },
             },
             include: {
                 businessOrder: true,
+                items: true,
             },
         });
 
@@ -286,3 +286,4 @@ class RestaurantOpsService {
 }
 
 module.exports = { RestaurantOpsService };
+
