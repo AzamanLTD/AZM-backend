@@ -133,8 +133,8 @@ class TransitOpsService {
                 type,
                 scheduledDate: new Date(scheduledDate),
                 description,
-                cost: cost ? parseFloat(cost) : null,
-                odometer: odometer ? parseInt(odometer) : null,
+                cost: parseFloat(cost) || 0,
+                odometerAtService: odometer ? parseInt(odometer) : null,
                 serviceProvider,
                 notes,
                 status: 'SCHEDULED',
@@ -157,13 +157,13 @@ class TransitOpsService {
 
     async updateMaintenanceStatus(maintenanceId, { status, completedDate, actualCost, notes, performedBy }) {
         const updates = { status };
-        if (status === 'IN_PROGRESS') updates.startedAt = new Date();
+        // if (status === 'IN_PROGRESS') — no startedAt field in schema, skip
         if (status === 'COMPLETED') {
             updates.completedAt = completedDate ? new Date(completedDate) : new Date();
             if (actualCost) updates.cost = parseFloat(actualCost);
         }
         if (notes) updates.notes = notes;
-        if (performedBy) updates.performedBy = performedBy;
+        // if (performedBy) — no performedBy field in schema, skip
 
         return this.prisma.vehicleMaintenance.update({
             where: { id: maintenanceId },
@@ -289,3 +289,4 @@ class TransitOpsService {
 }
 
 module.exports = { TransitOpsService };
+
