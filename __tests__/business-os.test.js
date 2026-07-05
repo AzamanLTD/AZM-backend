@@ -54,6 +54,7 @@ async function setupFixtures() {
             businessName: 'Test Hotel & Transit Co',
             category: 'REAL_ESTATE',
             isVerified: true,
+            bizId: `BIZ-${Date.now()}`,
         },
     });
 
@@ -153,6 +154,7 @@ async function setupFixtures() {
 }
 
 async function teardownFixtures() {
+    if (!businessProfile) return;
     // Clean up in reverse dependency order
     await prisma.employeeFeedback.deleteMany({ where: { businessProfileId: businessProfile.id } });
     await prisma.vehicleMaintenance.deleteMany({ where: { businessProfileId: businessProfile.id } });
