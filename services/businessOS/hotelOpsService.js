@@ -121,6 +121,8 @@ class HotelOpsService {
                 businessProfileId: reservation.businessProfileId,
                 roomId: reservation.serviceItemId,
                 reservationId,
+                taskType: 'CHECKOUT_CLEAN',
+                priority: 5,
                 checklistItems: defaultItems,
             },
         });
