@@ -198,16 +198,9 @@ if (hasDb) {
 }
 
 describeIf('Business OS — Employee Management', () => {
-    beforeAll(async () => {
-        prisma = new PrismaClient({ datasources: { db: { url: process.env.TEST_DATABASE_URL } } });
-        process.env.DATABASE_URL = process.env.TEST_DATABASE_URL;
-        await setupFixtures();
-    });
 
-    afterAll(async () => {
-        await teardownFixtures();
-        await prisma.$disconnect();
-    });
+
+
 
     // ── Employee Service ──────────────────────────────────────────────────
     test('should list employees for the business', async () => {
@@ -262,7 +255,7 @@ describeIf('Business OS — Employee Management', () => {
             },
         });
         const otherBp = await prisma.businessProfile.create({
-            data: { userId: otherOwner.id, businessName: 'Other Biz', category: 'RETAIL' },
+            data: { userId: otherOwner.id, businessName: 'Other Biz', category: 'RETAIL', bizId: `BIZ-OTHER-${Date.now()}` },
         });
 
         await expect(
