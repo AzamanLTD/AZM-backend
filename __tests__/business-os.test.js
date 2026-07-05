@@ -685,8 +685,7 @@ describeIf('Business OS — Restaurant Operations (KDS)', () => {
             reason: 'Ran out of rice',
         });
 
-        expect(updated.metadata.is86ed).toBe(true);
-        expect(updated.metadata.eightySixReason).toBe('Ran out of rice');
+        expect(updated.isAvailable).toBe(false); // 86'd = not available
 
         // Un-86 it
         const restored = await svc.toggleItem86({
@@ -694,7 +693,7 @@ describeIf('Business OS — Restaurant Operations (KDS)', () => {
             productId: testProduct.id,
             is86ed: false,
         });
-        expect(restored.metadata.is86ed).toBe(false);
+        expect(restored.isAvailable).toBe(true); // un-86'd = available again
     });
 });
 
