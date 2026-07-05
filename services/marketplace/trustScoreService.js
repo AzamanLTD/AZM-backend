@@ -21,9 +21,9 @@ class TrustScoreService {
      */
     async getOrCreateScore(userId) {
         return this.prisma.customerTrustScore.upsert({
-            where: { userId },
+            where: { customerId: userId },
             update: {},
-            create: { userId, trustLevel: 'GOOD' },
+            create: { customerId: userId, trustLevel: 'GOOD' },
         });
     }
 
@@ -33,7 +33,7 @@ class TrustScoreService {
     async recordCompletedBooking(userId) {
         const score = await this.getOrCreateScore(userId);
         const updated = await this.prisma.customerTrustScore.update({
-            where: { userId },
+            where: { customerId: userId },
             data: { totalBookings: score.totalBookings + 1 },
         });
         return this._recalculateLevel(updated);
@@ -45,20 +45,8 @@ class TrustScoreService {
     async recordNoShow(userId) {
         const score = await this.getOrCreateScore(userId);
         const updated = await this.prisma.customerTrustScore.update({
-            where: { userId },
+            where: { customerId: userId },
             data: { noShowCount: score.noShowCount + 1 },
-        });
-        return this._recalculateLevel(updated);
-    }
-
-    /**
-     * Record a late cancellation.
-     */
-    async recordLateCancellation(userId) {
-        const score = await this.getOrCreateScore(userId);
-        const updated = await this.prisma.customerTrustScore.update({
-            where: { userId },
-            data: { lateCancelCount: score.lateCancelCount + 1 },
         });
         return this._recalculateLevel(updated);
     }
@@ -88,8 +76,15 @@ class TrustScoreService {
 
         if (level !== score.trustLevel) {
             return this.prisma.customerTrustScore.update({
-                where: { userId: score.userId },
-                data: { trustLevel: level },
+                where: { customerId: score.customerId },
+                data: { trustLevel: level, noShowRate: rate },
+            });
+        }
+        
+        if (rate !== parseFloat(score.noShowRate)) {
+             return this.prisma.customerTrustScore.update({
+                where: { customerId: score.customerId },
+                data: { noShowRate: rate },
             });
         }
         return score;

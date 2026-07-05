@@ -71,6 +71,17 @@ const sweepNoShowReservations = async (prisma) => {
                 penaltyAmount: result.penaltyAmount,
                 refundAmount: result.refundAmount,
             });
+
+            // MARKETPLACE v2: Update customer trust score
+            try {
+                const { recordBookingOutcome } = require('../services/customerTrustScoreService');
+                await recordBookingOutcome(prisma, {
+                    customerId: reservation.customerId || (await prisma.reservation.findUnique({ where: { id: reservation.id }, select: { customerId: true } })).customerId,
+                    outcome: 'NO_SHOW'
+                });
+            } catch (e) {
+                console.error(`[noShowWorker] Trust score update failed for reservation ${reservation.id}:`, e.message);
+            }
         } catch (err) {
             results.errors++;
             results.details.push({ id: reservation.id, error: err.message });
@@ -134,6 +145,17 @@ const sweepNoShowTransitBookings = async (prisma) => {
                 penaltyAmount: result.penaltyAmount,
                 refundAmount: result.refundAmount,
             });
+
+            // MARKETPLACE v2: Update customer trust score
+            try {
+                const { recordBookingOutcome } = require('../services/customerTrustScoreService');
+                await recordBookingOutcome(prisma, {
+                    customerId: booking.customerId || (await prisma.transitBooking.findUnique({ where: { id: booking.id }, select: { customerId: true } })).customerId,
+                    outcome: 'NO_SHOW'
+                });
+            } catch (e) {
+                console.error(`[noShowWorker] Trust score update failed for transit booking ${booking.id}:`, e.message);
+            }
         } catch (err) {
             results.errors++;
             results.details.push({ id: booking.id, error: err.message });

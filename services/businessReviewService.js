@@ -35,7 +35,7 @@ const createReview = async (prisma, {
     throw new Error('Invalid sourceType. Must be ORDER or INVOICE.');
   }
 
-  return prisma.$transaction(async (tx) => {
+  const transactionResult = await prisma.$transaction(async (tx) => {
     let review;
     try {
       review = await tx.businessReview.create({ data: {
@@ -67,32 +67,59 @@ const createReview = async (prisma, {
         reviewCount: agg._count,
       },
     });
-    // MARKETPLACE v2: After a positive review (4-5 stars), prompt customer to follow
-    try {
-      if (r >= 4) {
-        const FollowService = require('./marketplace/followService');
-        const followSvc = new FollowService(tx, global._io);
-        const isFollowing = await followSvc.isFollowing(reviewerId, businessProfileId);
-        if (!isFollowing) {
-          await tx.notification.create({
-            data: {
-              userId: reviewerId,
-              type: 'FOLLOW_PROMPT',
-              category: 'MARKETPLACE',
-              title: 'Follow this business?',
-              body: 'You gave a great review! Follow to get updates and promotions.',
-              metadata: { businessProfileId, reviewId: review.id },
-              isRead: false,
-            }
-          });
+    // MARKETPLACE v2: After a positive review, auto-follow the business
+    // (if the customer hasn't already) — this seeds the story feed.
+    if (r >= 4) {
+        try {
+            await tx.businessFollower.upsert({
+                where: {
+                    businessProfileId_customerId: { businessProfileId, customerId: reviewerId }
+                },
+                update: {},
+                create: { businessProfileId, customerId: reviewerId }
+            });
+            await tx.businessProfile.update({
+                where: { id: businessProfileId },
+                data: { followerCount: { increment: 1 } }
+            });
+        } catch (e) {
+            // Non-blocking — don't fail the review if the follow fails
         }
-      }
-    } catch (e) {
-      console.error('[businessReviewService] Follow prompt failed:', e.message);
     }
 
     return review;
   });
+
+  // Record trust score outcome after successful review
+  try {
+      const { recordBookingOutcome } = require('./marketplace/trustScoreService');
+      await recordBookingOutcome(prisma, { customerId: reviewerId, outcome: 'COMPLETED' });
+  } catch (e) {
+      // Non-blocking
+  }
+
+  // Notify the business of the new review
+  try {
+      const business = await prisma.businessProfile.findUnique({
+          where: { id: businessProfileId },
+          select: { userId: true, businessName: true }
+      });
+      if (business) {
+          await prisma.notification.create({
+              data: {
+                  userId: business.userId,
+                  type: 'REVIEW_RECEIVED',
+                  category: 'MARKETPLACE',
+                  title: 'New review',
+                  body: `${r}★ review from a customer.`,
+                  metadata: { reviewId: transactionResult.id, businessProfileId, rating: r },
+                  isRead: false,
+              }
+          });
+      }
+  } catch (e) {}
+
+  return transactionResult;
 };
 
 // ── listReviews ────────────────────────────────────────────────────────────

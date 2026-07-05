@@ -20,35 +20,35 @@ class FollowService {
         if (business.isSuspended) throw new Error('This business is suspended.');
 
         await this.prisma.businessFollower.upsert({
-            where: { userId_businessProfileId: { userId, businessProfileId } },
+            where: { businessProfileId_customerId: { customerId: userId, businessProfileId } },
             update: {},
-            create: { userId, businessProfileId },
+            create: { customerId: userId, businessProfileId },
         });
 
         this.io?.to(`user_${business.userId}`).emit('new_follower', {
-            businessProfileId, followerId: userId,
+            businessProfileId,
+            customerId: userId,
         });
-
         return { success: true };
     }
 
     async unfollow(userId, businessProfileId) {
         await this.prisma.businessFollower.deleteMany({
-            where: { userId, businessProfileId },
+            where: { customerId: userId, businessProfileId },
         });
         return { success: true };
     }
 
     async isFollowing(userId, businessProfileId) {
         const record = await this.prisma.businessFollower.findUnique({
-            where: { userId_businessProfileId: { userId, businessProfileId } },
+            where: { businessProfileId_customerId: { customerId: userId, businessProfileId } },
         });
         return !!record;
     }
 
     async getFollowing(userId) {
         const follows = await this.prisma.businessFollower.findMany({
-            where: { userId },
+            where: { customerId: userId },
             include: {
                 businessProfile: {
                     select: {
@@ -66,18 +66,18 @@ class FollowService {
         const follows = await this.prisma.businessFollower.findMany({
             where: { businessProfileId },
             include: {
-                user: {
+                customer: {
                     select: { id: true, username: true, profilePictureUrl: true, azamanId: true },
                 },
             },
             orderBy: { createdAt: 'desc' },
         });
-        return follows.map(f => ({ ...f.user, followedAt: f.createdAt }));
+        return follows.map(f => ({ ...f.customer, followedAt: f.createdAt }));
     }
 
-    async getFollowedBusinessIds(userId) {
+    async getFollowedBusinessIds(customerId) {
         const follows = await this.prisma.businessFollower.findMany({
-            where: { userId },
+            where: { customerId },
             select: { businessProfileId: true },
         });
         return follows.map(f => f.businessProfileId);

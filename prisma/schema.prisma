@@ -2771,6 +2771,11 @@ model Reservation {
   ticket            Ticket?         @relation(fields: [ticketId], references: [id])
   review            BusinessReview?
 
+  proposedStartDatetime DateTime?
+  proposedEndDatetime   DateTime?
+  counterProposeMessage String?  @db.VarChar(500)
+  counterProposedAt     DateTime?
+
   @@index([businessProfileId, startDatetime])
   @@index([customerId])
   @@index([businessProfileId, status])

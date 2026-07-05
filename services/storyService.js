@@ -44,26 +44,30 @@ class StoryService {
     //   3. most recent story first
     async getFeed(viewerId) {
         const friendIds = await this._getFriendIds(viewerId);
-        friendIds.push(viewerId); // include own stories at index 0 downstream
- 
+        friendIds.push(viewerId);
+
+        // MARKETPLACE V2 FIX: Also include stories from businesses the viewer follows
+        const followedBusinessIds = await this.prisma.businessFollower.findMany({
+            where: { customerId: viewerId },
+            select: { businessProfileId: true },
+        });
+        const bizIds = followedBusinessIds.map(f => f.businessProfileId);
+
+        const whereClause = {
+            expiresAt: { gt: new Date() },
+            OR: [
+                { userId: { in: friendIds } },
+                ...(bizIds.length > 0 ? [{ businessProfileId: { in: bizIds } }] : []),
+            ],
+        };
+
         const stories = await this.prisma.story.findMany({
-            where: {
-                OR: [
-                    { userId: { in: friendIds }, expiresAt: { gt: new Date() } },
-                    {
-                        businessProfileId: { not: null },
-                        expiresAt: { gt: new Date() },
-                        businessProfile: {
-                            followers: { some: { userId: viewerId } }
-                        }
-                    }
-                ],
-            },
+            where: whereClause,
             orderBy: { createdAt: 'desc' },
             include: {
                 user: { select: { id: true, username: true, profilePictureUrl: true } },
+                businessProfile: { select: { id: true, businessName: true, logoUrl: true } },
                 views: { where: { viewerId }, select: { id: true } },
-                businessProfile: { select: { id: true, businessName: true, profileImageUrl: true } },
             },
         });
  

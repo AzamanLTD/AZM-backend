@@ -15,4 +15,8 @@ router.get('/bookings', protect, transitController.listBookings);
 router.get('/bookings/:id', protect, transitController.getBooking);
 router.patch('/bookings/:id/status', protect, transitController.updateBookingStatus);
 
+// ── Transit QR Check-in (NEW) ──────────────────────────────────────────────────
+router.get('/bookings/:id/checkin-qr', protect, transitController.generateTransitCheckInQR);
+router.post('/boarding', protect, transitController.transitBoarding);
+
 module.exports = router;

@@ -24,7 +24,7 @@ class DineInService {
      * @param {string} tableLabel - e.g. "Table 5"
      * @returns {Promise<object>} The new DineInTab
      */
-    async openTab({ businessProfileId, azamanId, tableLabel }) {
+    async openTab({ businessProfileId, azamanId, tableId }) {
         if (!businessProfileId) throw new Error('businessProfileId is required.');
         if (!azamanId) throw new Error('azamanId is required.');
 
@@ -45,7 +45,7 @@ class DineInService {
             data: {
                 businessProfileId,
                 customerId: customer.id,
-                tableLabel: tableLabel || null,
+                tableId: tableId || null,
                 status: 'OPEN',
             },
             include: { items: true },
@@ -64,7 +64,7 @@ class DineInService {
     /**
      * Add an item to an open tab.
      */
-    async addItem({ tabId, name, price, quantity, notes }) {
+    async addItem({ tabId, name, price, quantity, notes, addedBy }) {
         if (!tabId) throw new Error('tabId is required.');
         if (!name) throw new Error('name is required.');
         const priceNum = Number(price);
@@ -79,7 +79,14 @@ class DineInService {
         if (tab.status !== 'OPEN') throw new Error('Cannot add items to a tab that is not OPEN.');
 
         const item = await this.prisma.dineInTabItem.create({
-            data: { dineInTabId: tabId, name, price: priceNum, quantity: qty, notes: notes || null },
+            data: { 
+                dineInTabId: tabId, 
+                name, 
+                unitPriceUsdc: priceNum, 
+                quantity: qty, 
+                lineTotalUsdc: priceNum * qty,
+                addedBy: addedBy || tab.customerId,
+            },
         });
 
         // Notify customer
@@ -117,14 +124,15 @@ class DineInService {
         if (!tab) throw new Error('Tab not found.');
         if (tab.status !== 'OPEN') throw new Error('Tab is not OPEN.');
 
-        const total = tab.items.reduce((sum, item) => sum + Number(item.price) * item.quantity, 0);
+        const total = tab.items.reduce((sum, item) => sum + Number(item.unitPriceUsdc) * item.quantity, 0);
 
         const finalized = await this.prisma.dineInTab.update({
             where: { id: tabId },
             data: {
                 status: 'FINALIZED',
-                finalizedAt: new Date(),
-                totalAmount: parseFloat(total.toFixed(6)),
+                closedAt: new Date(),
+                grandTotalUsdc: total,
+                subtotalUsdc: total,
             },
             include: { items: true },
         });

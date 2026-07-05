@@ -42,9 +42,9 @@ class AdPostService {
         const adPost = await this.prisma.businessAdPost.create({
             data: {
                 businessProfileId,
-                type: type || 'GENERAL',
+                templateType: type || 'GENERAL',
                 title,
-                body,
+                bodyText: body,
                 mediaUrl: mediaUrl || business.logoUrl || null,
                 ctaLabel: ctaLabel || null,
                 ctaTarget: ctaTarget || null,
@@ -70,10 +70,10 @@ class AdPostService {
         // Notify all followers in real-time
         const followers = await this.prisma.businessFollower.findMany({
             where: { businessProfileId },
-            select: { userId: true },
+            select: { customerId: true },
         });
         for (const f of followers) {
-            this.io?.to(`user_${f.userId}`).emit('new_business_ad', {
+            this.io?.to(`user_${f.customerId}`).emit('new_business_ad', {
                 adPostId: adPost.id,
                 businessProfileId,
                 title,

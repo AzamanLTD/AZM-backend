@@ -321,15 +321,42 @@ exports.counterProposeReservation = async (req, res) => {
             return res.status(400).json({ success: false, message: `Cannot counter-propose on a ${reservation.status} reservation.` });
         }
 
+        // Update the reservation with the proposed alternative
         const updated = await req.prisma.reservation.update({
             where: { id: reservationId },
             data: {
+                // Keep status as PENDING but store the counter-proposal
+                // The customer will see the proposed alternative and can accept or decline
                 proposedStartDatetime: new Date(proposedStartDatetime),
                 proposedEndDatetime: proposedEndDatetime ? new Date(proposedEndDatetime) : null,
                 counterProposeMessage: message || null,
                 counterProposedAt: new Date(),
             }
         });
+
+        // Notify the customer
+        await req.prisma.notification.create({
+            data: {
+                userId: reservation.customerId,
+                type: 'COUNTER_PROPOSAL',
+                category: 'MARKETPLACE',
+                title: `${reservation.businessProfile.businessName} proposed an alternative time`,
+                body: message || `The business has proposed ${new Date(proposedStartDatetime).toLocaleString()}. Tap to review.`,
+                metadata: { reservationId, proposedStartDatetime, proposedEndDatetime },
+                isRead: false,
+            }
+        });
+
+        // Real-time push
+        if (req.app.get('io')) {
+            req.app.get('io').to(`user_${reservation.customerId}`).emit('counter_proposal', {
+                reservationId,
+                businessName: reservation.businessProfile.businessName,
+                proposedStartDatetime,
+                proposedEndDatetime,
+                message,
+            });
+        }
 
         res.json({ success: true, reservation: updated });
     } catch (err) {
@@ -355,6 +382,7 @@ exports.acceptCounterProposal = async (req, res) => {
             return res.status(400).json({ success: false, message: 'No counter-proposal to accept.' });
         }
 
+        // Apply the proposed times
         const updated = await req.prisma.reservation.update({
             where: { id: reservationId },
             data: {
@@ -363,6 +391,19 @@ exports.acceptCounterProposal = async (req, res) => {
                 proposedStartDatetime: null,
                 proposedEndDatetime: null,
                 counterProposeMessage: null,
+            }
+        });
+
+        // Notify the business
+        await req.prisma.notification.create({
+            data: {
+                userId: (await req.prisma.businessProfile.findUnique({ where: { id: reservation.businessProfileId }, select: { userId: true } })).userId,
+                type: 'COUNTER_PROPOSAL',
+                category: 'MARKETPLACE',
+                title: 'Counter-proposal accepted',
+                body: 'The customer accepted your proposed alternative time.',
+                metadata: { reservationId },
+                isRead: false,
             }
         });
 

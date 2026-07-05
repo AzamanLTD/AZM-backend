@@ -23,8 +23,8 @@ class PenaltyPolicyService {
             update: {},
             create: {
                 businessProfileId,
-                customerPenaltyPct: 0.10,
-                businessPenaltyPct: 0.10,
+                customerNoShowPct: 0.1,
+                businessNoShowPct: 0.1,
                 gracePeriodMins: 30,
             },
         });
@@ -39,13 +39,13 @@ class PenaltyPolicyService {
             const val = Number(customerPenaltyPct);
             if (!Number.isFinite(val) || val < 0) throw new Error('customerPenaltyPct must be non-negative.');
             if (val > MAX_PENALTY_PCT) throw new Error(`customerPenaltyPct cannot exceed ${MAX_PENALTY_PCT} (50%).`);
-            data.customerPenaltyPct = parseFloat(val.toFixed(4));
+            data.customerNoShowPct = parseFloat(val.toFixed(4));
         }
         if (businessPenaltyPct !== undefined) {
             const val = Number(businessPenaltyPct);
             if (!Number.isFinite(val) || val < 0) throw new Error('businessPenaltyPct must be non-negative.');
             if (val > MAX_PENALTY_PCT) throw new Error(`businessPenaltyPct cannot exceed ${MAX_PENALTY_PCT} (50%).`);
-            data.businessPenaltyPct = parseFloat(val.toFixed(4));
+            data.businessNoShowPct = parseFloat(val.toFixed(4));
         }
         if (gracePeriodMins !== undefined) {
             const val = Number(gracePeriodMins);
@@ -72,8 +72,8 @@ class PenaltyPolicyService {
     async computePenalty(businessProfileId, escrowAmount, direction = 'customer') {
         const policy = await this.getOrCreatePolicy(businessProfileId);
         const pct = direction === 'customer' 
-            ? Number(policy.customerPenaltyPct) 
-            : Number(policy.businessPenaltyPct);
+            ? Number(policy.customerNoShowPct) 
+            : Number(policy.businessNoShowPct);
         
         const penaltyAmount = parseFloat((escrowAmount * pct).toFixed(6));
         const releaseAmount = parseFloat((escrowAmount - penaltyAmount).toFixed(6));
