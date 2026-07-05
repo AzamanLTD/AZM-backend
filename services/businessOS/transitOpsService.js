@@ -56,7 +56,6 @@ class TransitOpsService {
                 vehicleId,
                 assignmentDate: new Date(assignmentDate),
                 role,
-                notes,
             },
             include: {
                 employee: { include: { user: { select: { username: true } } } },
@@ -126,17 +125,18 @@ class TransitOpsService {
     // ═══ FLEET MANAGEMENT ═════════════════════════════════════════════════════
 
     async createMaintenanceRecord({ businessProfileId, vehicleId, type, scheduledDate, description, cost, odometer, serviceProvider, notes }) {
+        // VehicleMaintenance uses `description` not `notes`; merge if both provided
+        const finalDescription = description || notes;
         return this.prisma.vehicleMaintenance.create({
             data: {
                 businessProfileId,
                 vehicleId,
                 type,
                 scheduledDate: new Date(scheduledDate),
-                description,
+                description: finalDescription,
                 cost: parseFloat(cost) || 0,
                 odometerAtService: odometer ? parseInt(odometer) : null,
                 serviceProvider,
-                notes,
                 status: 'SCHEDULED',
             },
         });
@@ -159,10 +159,10 @@ class TransitOpsService {
         const updates = { status };
         // if (status === 'IN_PROGRESS') — no startedAt field in schema, skip
         if (status === 'COMPLETED') {
-            updates.completedAt = completedDate ? new Date(completedDate) : new Date();
+            updates.completedDate = completedDate ? new Date(completedDate) : new Date();
             if (actualCost) updates.cost = parseFloat(actualCost);
         }
-        if (notes) updates.notes = notes;
+        if (notes) updates.description = notes;
         // if (performedBy) — no performedBy field in schema, skip
 
         return this.prisma.vehicleMaintenance.update({
