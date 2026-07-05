@@ -42,6 +42,14 @@ class EmployeeService {
             throw new Error('User is already an employee of this business.');
         }
 
+        // Check if user is already an employee of ANOTHER business (cross-business guard)
+        const existingElsewhere = await this.prisma.businessEmployee.findFirst({
+            where: { userId, NOT: { businessProfileId } },
+        });
+        if (existingElsewhere) {
+            throw new Error('User is already employed at another business.');
+        }
+
         // Verify the user exists
         const user = await this.prisma.user.findUnique({ where: { id: userId } });
         if (!user) throw new Error('User not found.');
@@ -449,3 +457,4 @@ class EmployeeService {
 }
 
 module.exports = { EmployeeService, ROLE_PERMISSIONS };
+
