@@ -250,3 +250,60 @@ exports.updateBookingStatus = async (req, res) => {
         return res.status(500).json({ success: false, message: err.message });
     }
 };
+
+// GET /api/transit/bookings/:id/checkin-qr
+exports.generateTransitCheckInQR = async (req, res) => {
+    const prisma = req.app.get('prisma');
+    const { qrCheckInService } = require('../services/qrCheckInService') || { qrCheckInService: require('../services/qrCheckInService') };
+    try {
+        const userId = req.user.id;
+        const bookingId = req.params.id;
+
+        const booking = await prisma.transitBooking.findUnique({
+            where: { id: bookingId }
+        });
+
+        if (!booking) {
+            return res.status(404).json({ success: false, message: 'Booking not found.' });
+        }
+        if (booking.customerId !== userId) {
+            return res.status(403).json({ success: false, message: 'Not authorized.' });
+        }
+        if (booking.status !== 'CONFIRMED' && booking.status !== 'IN_PROGRESS') {
+            return res.status(409).json({ success: false, message: 'Booking must be CONFIRMED or IN_PROGRESS to generate QR.' });
+        }
+
+        const svc = qrCheckInService || require('../services/qrCheckInService');
+        const tokenData = await svc.generateTransitCheckInToken(bookingId, userId);
+        return res.status(200).json({ success: true, qrData: tokenData });
+    } catch (err) {
+        console.error('[transit.generateTransitCheckInQR] error:', err.message);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+};
+
+// POST /api/transit/boarding
+exports.transitBoarding = async (req, res) => {
+    const prisma = req.app.get('prisma');
+    const { qrCheckInService } = require('../services/qrCheckInService') || { qrCheckInService: require('../services/qrCheckInService') };
+    try {
+        const userId = req.user.id;
+        const { code } = req.body;
+        
+        if (!code) {
+            return res.status(400).json({ success: false, message: 'QR code is required.' });
+        }
+
+        const svc = qrCheckInService || require('../services/qrCheckInService');
+        const result = await svc.transitCheckIn(code, userId, prisma);
+        
+        if (!result.success) {
+            return res.status(400).json(result);
+        }
+
+        return res.status(200).json(result);
+    } catch (err) {
+        console.error('[transit.transitBoarding] error:', err.message);
+        return res.status(500).json({ success: false, message: err.message });
+    }
+};
