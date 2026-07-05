@@ -152,7 +152,6 @@ async function setupFixtures() {
             priceUsdc: 25.00,
             slug: `jollof-rice-special-${Date.now()}`,
             category: 'FOOD_BEVERAGE',
-            metadata: { category: 'Main Course', station: 'HOT', allergens: [] },
         },
     });
 }
@@ -551,11 +550,11 @@ describeIf('Business OS — Hotel Operations', () => {
             data: {
                 businessProfileId: businessProfile.id,
                 customerId: customer.id,
-                roomId: testRoom.id,
-                checkInDate: new Date(Date.now() - 86400000),
-                checkOutDate: new Date(),
+                serviceItemId: testRoom.id,
+                startDatetime: new Date(Date.now() - 86400000),
+                endDatetime: new Date(),
                 status: 'CHECKED_OUT',
-                totalAmount: 150.00,
+                amountUsdc: 150.00,
                 reservationRef: `RES-${Date.now()}`,
             },
         });
@@ -695,7 +694,7 @@ describeIf('Business OS — Transit Operations', () => {
         const record = await svc.createMaintenanceRecord({
             businessProfileId: businessProfile.id,
             vehicleId: testVehicle.id,
-            type: 'OIL_CHANGE',
+            type: 'SCHEDULED',
             scheduledDate: new Date(Date.now() + 7 * 86400000),
             description: 'Routine oil change',
             cost: 150.00,
