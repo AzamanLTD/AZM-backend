@@ -342,8 +342,8 @@ describeIf('Business OS — Shift Management', () => {
         const { ShiftService } = require('../services/businessOS/shiftService');
         const svc = new ShiftService(prisma);
 
-        const tomorrow = new Date();
-        tomorrow.setDate(tomorrow.getDate() + 1);
+        // MUST use the SAME date as the first shift test for conflict detection
+        const tomorrow = new Date('2026-12-15T00:00:00.000Z');
         const startTime = new Date(tomorrow);
         startTime.setHours(10, 0, 0, 0); // overlaps with 8-16 shift
         const endTime = new Date(tomorrow);
@@ -506,7 +506,9 @@ describeIf('Business OS — Business Ledger', () => {
         const pl = await svc.getProfitLoss(businessProfile.id);
         expect(pl.totalIncome).toBeGreaterThan(0);
         expect(pl.totalExpenses).toBeGreaterThan(0);
-        expect(pl.netProfit).toBe(300 - 50);
+        // EWA test creates a PAYROLL entry (-100) that's also in the ledger
+        // totalIncome=300, totalExpenses=50(MAINTENANCE)+100(EWA PAYROLL)=150
+        expect(pl.netProfit).toBe(300 - 150);
     });
 
     test('should get expense breakdown', async () => {
