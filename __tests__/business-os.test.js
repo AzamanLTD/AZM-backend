@@ -200,7 +200,7 @@ describeIf('Business OS — Employee Management', () => {
         const { EmployeeService } = require('../services/businessOS/employeeService');
         const svc = new EmployeeService(prisma);
 
-        const employees = await svc.getEmployees(businessProfile.id);
+        const employees = await svc.listEmployees(businessProfile.id);
         expect(employees.length).toBeGreaterThanOrEqual(2);
         expect(employees.find(e => e.id === testEmployee.id)).toBeTruthy();
     });
@@ -212,27 +212,27 @@ describeIf('Business OS — Employee Management', () => {
         const emp = await svc.getEmployee(testEmployee.id, businessProfile.id);
         expect(emp.role).toBe('HOUSEKEEPER');
         expect(emp.user).toBeTruthy();
-        expect(emp.businessProfile).toBeTruthy();
+        expect(emp.businessProfileId).toBeTruthy();
     });
 
     test('should update employee status', async () => {
         const { EmployeeService } = require('../services/businessOS/employeeService');
         const svc = new EmployeeService(prisma);
 
-        const updated = await svc.updateEmployee(testEmployee.id, businessProfile.id, { status: 'SUSPENDED' });
+        const updated = await svc.updateEmployee(testEmployee.id, { status: 'SUSPENDED' });
         expect(updated.status).toBe('SUSPENDED');
 
         // Restore
-        await svc.updateEmployee(testEmployee.id, businessProfile.id, { status: 'ACTIVE' });
+        await svc.updateEmployee(testEmployee.id, { status: 'ACTIVE' });
     });
 
     test('should update employee permissions', async () => {
         const { EmployeeService } = require('../services/businessOS/employeeService');
         const svc = new EmployeeService(prisma);
 
-        const newPerms = { canManageProducts: true, canViewFinance: true };
-        const updated = await svc.updatePermissions(testEmployee.id, businessProfile.id, newPerms);
-        expect(updated.permissions).toMatchObject(newPerms);
+        const newPerms = ['manage_products', 'view_finance'];
+        const updated = await svc.updateEmployee(testEmployee.id, { permissions: newPerms });
+        expect(updated.permissions).toEqual(expect.arrayContaining(newPerms));
     });
 
     test('should not add employee from another business', async () => {
@@ -849,8 +849,8 @@ describeIf('Business OS — Employee Feedback', () => {
 
         // Verify employee's rating was updated
         const employee = await prisma.businessEmployee.findUnique({ where: { id: testEmployee.id } });
-        expect(parseFloat(employee.performanceRating)).toBe(5.0);
-        expect(employee.feedbackCount).toBeGreaterThanOrEqual(1);
+        expect(parseFloat(employee.rating)).toBe(5.0);
+        expect(employee.ratingCount).toBeGreaterThanOrEqual(1);
     });
 
     test('should not allow self-feedback', async () => {

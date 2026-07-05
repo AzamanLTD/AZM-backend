@@ -28,20 +28,21 @@ class EmployeeFeedbackService {
         const feedback = await this.prisma.employeeFeedback.create({
             data: {
                 businessProfileId,
-                fromEmployeeId,
-                toEmployeeId,
-                fromUserId: fromEmployee.userId,
+                giverEmployeeId: fromEmployeeId,
+                receiverEmployeeId: toEmployeeId,
+                givenByUserId: fromEmployee.userId,
+                receivedByUserId: toEmployee.userId,
                 rating,
                 tags,
                 comment,
-                isAnonymous,
-                shiftId,
+                periodStart: new Date(Date.now() - 30 * 86400000), // Default 30 days
+                periodEnd: new Date(),
             },
         });
 
         // Recalculate employee's average rating
         const allFeedback = await this.prisma.employeeFeedback.findMany({
-            where: { toEmployeeId, isAnonymous: false },
+            where: { receiverEmployeeId: toEmployeeId },
             select: { rating: true },
         });
         const avgRating = allFeedback.length > 0
@@ -51,8 +52,8 @@ class EmployeeFeedbackService {
         await this.prisma.businessEmployee.update({
             where: { id: toEmployeeId },
             data: {
-                performanceRating: Math.round(avgRating * 100) / 100,
-                feedbackCount: allFeedback.length,
+                rating: Math.round(avgRating * 100) / 100,
+                ratingCount: allFeedback.length,
             },
         });
 
@@ -61,9 +62,9 @@ class EmployeeFeedbackService {
 
     async getFeedbackForEmployee(employeeId) {
         return this.prisma.employeeFeedback.findMany({
-            where: { toEmployeeId: employeeId },
+            where: { receiverEmployeeId: employeeId },
             include: {
-                fromEmployee: {
+                giverEmployee: {
                     include: { user: { select: { username: true } } },
                 },
             },
@@ -73,9 +74,9 @@ class EmployeeFeedbackService {
 
     async getFeedbackByEmployee(employeeId) {
         return this.prisma.employeeFeedback.findMany({
-            where: { fromEmployeeId: employeeId },
+            where: { giverEmployeeId: employeeId },
             include: {
-                toEmployee: {
+                receiverEmployee: {
                     include: { user: { select: { username: true } } },
                 },
             },
@@ -100,8 +101,8 @@ class EmployeeFeedbackService {
         });
 
         const avgRating = employees.length > 0
-            ? employees.filter(e => e.performanceRating > 0).reduce((s, e) => s + e.performanceRating, 0) /
-              (employees.filter(e => e.performanceRating > 0).length || 1)
+            ? employees.filter(e => e.rating > 0).reduce((s, e) => s + Number(e.rating), 0) /
+              (employees.filter(e => e.rating > 0).length || 1)
             : 0;
 
         return {
@@ -109,8 +110,8 @@ class EmployeeFeedbackService {
             totalFeedback,
             avgRating: Math.round(avgRating * 100) / 100,
             employees: employees
-                .filter(e => e.feedbackCount > 0)
-                .sort((a, b) => b.performanceRating - a.performanceRating),
+                .filter(e => e.ratingCount > 0)
+                .sort((a, b) => Number(b.rating) - Number(a.rating)),
         };
     }
 }
