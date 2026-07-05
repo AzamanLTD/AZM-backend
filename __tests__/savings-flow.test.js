@@ -54,7 +54,7 @@ describeOrSkip('Savings flow', () => {
             'TRUNCATE TABLE "User","SavingsGoal","SavingsDeposit",' +
             '"TransactionHistory","SystemProfitFees","GlobalSettings" RESTART IDENTITY CASCADE'
         );
-    });
+    }, 10000);
 
     function res() {
         const r = { _status: 200, _body: null };

@@ -125,6 +125,7 @@ async function setupFixtures() {
             floor: 1,
             roomType: 'DELUXE',
             basePrice: 150.00,
+            basePriceUsdc: 150.00,
             capacity: 2,
             amenities: ['WiFi', 'AC', 'Mini Bar'],
             status: 'AVAILABLE',
