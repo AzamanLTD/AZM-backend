@@ -4327,6 +4327,10 @@ model HotelHousekeepingTask {
   priority          Int               @default(5) // 1=urgent, 5=normal
   description       String?           @db.VarChar(500)
   
+  // Checklist + reservation link (added for housekeeping workflow)
+  checklistItems    Json?             // [{ task: 'Strip beds', done: false }, ...]
+  reservationId     String?           // FK to Reservation.id (soft ref, no FK constraint)
+  
   // Photo proof
   beforePhotoUrl    String?
   afterPhotoUrl     String?
@@ -4504,3 +4508,4 @@ model VehicleMaintenance {
   @@index([vehicleId, status])
   @@index([vehicleId, scheduledDate])
 }
+
