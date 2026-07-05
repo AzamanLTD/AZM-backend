@@ -34,13 +34,13 @@ class BusinessLedgerService {
         if (type) where.type = type;
         if (category) where.category = category;
         if (startDate && endDate) {
-            where.entryDate = { gte: new Date(startDate), lte: new Date(endDate) };
+            where.createdAt = { gte: new Date(startDate), lte: new Date(endDate) };
         }
 
         const [entries, total] = await Promise.all([
             this.prisma.businessLedgerEntry.findMany({
                 where,
-                orderBy: { entryDate: 'desc' },
+                orderBy: { createdAt: 'desc' },
                 take: limit,
                 skip: offset,
             }),
@@ -54,7 +54,7 @@ class BusinessLedgerService {
     async getProfitLoss(businessProfileId, { startDate, endDate } = {}) {
         const where = { businessProfileId };
         if (startDate && endDate) {
-            where.entryDate = { gte: new Date(startDate), lte: new Date(endDate) };
+            where.createdAt = { gte: new Date(startDate), lte: new Date(endDate) };
         }
 
         const entries = await this.prisma.businessLedgerEntry.findMany({ where });
@@ -97,12 +97,12 @@ class BusinessLedgerService {
     async getCashFlow(businessProfileId, { startDate, endDate } = {}) {
         const where = { businessProfileId };
         if (startDate && endDate) {
-            where.entryDate = { gte: new Date(startDate), lte: new Date(endDate) };
+            where.createdAt = { gte: new Date(startDate), lte: new Date(endDate) };
         }
 
         const entries = await this.prisma.businessLedgerEntry.findMany({
             where,
-            orderBy: { entryDate: 'asc' },
+            orderBy: { createdAt: 'asc' },
         });
 
         let runningBalance = 0;
@@ -110,7 +110,7 @@ class BusinessLedgerService {
         const flow = entries.map(e => {
             const amount = parseFloat(e.amount);
             runningBalance += amount;
-            const dateKey = new Date(e.entryDate).toISOString().split('T')[0];
+            const dateKey = new Date(e.createdAt).toISOString().split('T')[0];
             if (!dailyFlow[dateKey]) {
                 dailyFlow[dateKey] = { date: dateKey, inflow: 0, outflow: 0, net: 0 };
             }
@@ -120,7 +120,7 @@ class BusinessLedgerService {
 
             return {
                 id: e.id,
-                date: e.entryDate,
+                date: e.createdAt,
                 type: e.type,
                 category: e.category,
                 description: e.description,
@@ -144,7 +144,7 @@ class BusinessLedgerService {
     async getExpenseBreakdown(businessProfileId, { startDate, endDate } = {}) {
         const where = { businessProfileId, type: { not: 'INCOME' } };
         if (startDate && endDate) {
-            where.entryDate = { gte: new Date(startDate), lte: new Date(endDate) };
+            where.createdAt = { gte: new Date(startDate), lte: new Date(endDate) };
         }
 
         const entries = await this.prisma.businessLedgerEntry.findMany({ where });
@@ -177,10 +177,10 @@ class BusinessLedgerService {
 
         const [currentEntries, previousEntries, allEntries] = await Promise.all([
             this.prisma.businessLedgerEntry.findMany({
-                where: { businessProfileId, entryDate: { gte: thirtyDaysAgo } },
+                where: { businessProfileId, createdAt: { gte: thirtyDaysAgo } },
             }),
             this.prisma.businessLedgerEntry.findMany({
-                where: { businessProfileId, entryDate: { gte: sixtyDaysAgo, lt: thirtyDaysAgo } },
+                where: { businessProfileId, createdAt: { gte: sixtyDaysAgo, lt: thirtyDaysAgo } },
             }),
             this.prisma.businessLedgerEntry.findMany({
                 where: { businessProfileId },
@@ -228,3 +228,4 @@ class BusinessLedgerService {
 }
 
 module.exports = { BusinessLedgerService };
+
