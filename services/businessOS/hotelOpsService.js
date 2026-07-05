@@ -20,7 +20,7 @@ class HotelOpsService {
                 roomNumber,
                 floor,
                 roomType,
-                basePrice: parseFloat(basePrice),
+                basePriceUsdc: parseFloat(basePrice),
                 capacity,
                 amenities,
                 description,
@@ -68,14 +68,14 @@ class HotelOpsService {
             where: {
                 businessProfileId,
                 status: { in: ['CONFIRMED', 'CHECKED_IN', 'PENDING'] },
-                checkInDate: { lte: nextDay },
-                checkOutDate: { gt: targetDate },
+                startDatetime: { lte: nextDay },
+                endDatetime: { gt: targetDate },
             },
         });
 
         // Map rooms to their reservation status
         return rooms.map(room => {
-            const reservation = reservations.find(r => r.roomId === room.id);
+            const reservation = reservations.find(r => r.serviceItemId === room.id);
             return {
                 ...room,
                 reservation: reservation || null,
@@ -94,12 +94,12 @@ class HotelOpsService {
             include: { businessProfile: true },
         });
         if (!reservation) throw new Error('Reservation not found.');
-        if (!reservation.roomId) throw new Error('Reservation has no room assigned.');
+        if (!reservation.serviceItemId) throw new Error('Reservation has no room assigned.');
 
         // Check if there's already a pending task for this room
         const existing = await this.prisma.hotelHousekeepingTask.findFirst({
             where: {
-                roomId: reservation.roomId,
+                roomId: reservation.serviceItemId,
                 status: { in: ['PENDING', 'IN_PROGRESS'] },
             },
         });
@@ -119,7 +119,7 @@ class HotelOpsService {
         const task = await this.prisma.hotelHousekeepingTask.create({
             data: {
                 businessProfileId: reservation.businessProfileId,
-                roomId: reservation.roomId,
+                roomId: reservation.serviceItemId,
                 reservationId,
                 checklistItems: defaultItems,
             },
@@ -127,7 +127,7 @@ class HotelOpsService {
 
         // Set room to CLEANING
         await this.prisma.hotelRoom.update({
-            where: { id: reservation.roomId },
+            where: { id: reservation.serviceItemId },
             data: { status: 'CLEANING' },
         });
 
@@ -146,8 +146,8 @@ class HotelOpsService {
         return this.prisma.hotelHousekeepingTask.update({
             where: { id: taskId },
             data: {
-                assignedEmployeeId: employeeId,
-                assignedTo: employee.userId,
+                employeeId: employeeId,
+                userId: employee.userId,
                 status: 'IN_PROGRESS',
                 startedAt: new Date(),
             },
@@ -187,8 +187,8 @@ class HotelOpsService {
             data: {
                 status: 'COMPLETED',
                 completedAt: new Date(),
-                photoProofUrl,
-                notes,
+                afterPhotoUrl: photoProofUrl,
+                description: notes,
             },
         });
 
@@ -213,9 +213,10 @@ class HotelOpsService {
             where: { id: taskId },
             data: {
                 status: newStatus,
-                inspectedById: inspectorId,
+                userId: inspectorId,
                 inspectedAt: new Date(),
-                inspectionNotes: notes,
+                inspectionNote: notes,
+                inspectionPassed: passed,
             },
         });
 
@@ -330,3 +331,4 @@ class HotelOpsService {
 }
 
 module.exports = { HotelOpsService };
+
