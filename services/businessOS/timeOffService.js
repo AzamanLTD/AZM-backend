@@ -18,20 +18,15 @@ class TimeOffService {
             throw new Error('Employee does not belong to this business.');
         }
 
-        const days = Math.ceil(
-            (new Date(endDate) - new Date(startDate)) / (1000 * 60 * 60 * 24)
-        ) + 1;
-
         return this.prisma.timeOffRequest.create({
             data: {
                 businessProfileId,
                 employeeId,
+                userId: employee.userId,
                 type,
                 startDate: new Date(startDate),
                 endDate: new Date(endDate),
-                days,
                 reason,
-                supportingDocUrl,
             },
         });
     }
@@ -47,7 +42,6 @@ class TimeOffService {
             where: { id: requestId },
             data: {
                 status: 'APPROVED',
-                approverId,
                 managerNote,
                 respondedAt: new Date(),
             },
@@ -59,7 +53,6 @@ class TimeOffService {
             where: { id: requestId },
             data: {
                 status: 'REJECTED',
-                approverId,
                 managerNote,
                 respondedAt: new Date(),
             },
@@ -105,3 +98,4 @@ class TimeOffService {
 }
 
 module.exports = { TimeOffService };
+
