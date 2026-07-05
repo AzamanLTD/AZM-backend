@@ -135,10 +135,11 @@ async function setupFixtures() {
     testVehicle = await prisma.transitVehicle.create({
         data: {
             businessProfileId: businessProfile.id,
-            plateNumber: `TEST-${Date.now().toString().slice(-4)}`,
+            licensePlate: `TEST-${Date.now().toString().slice(-4)}`,
+            type: 'VAN',
             model: 'Toyota HiAce',
             capacity: 14,
-            status: 'ACTIVE',
+            isActive: true,
             year: 2024,
         },
     });
@@ -554,6 +555,7 @@ describeIf('Business OS — Hotel Operations', () => {
                 checkOutDate: new Date(),
                 status: 'CHECKED_OUT',
                 totalAmount: 150.00,
+                reservationRef: `RES-${Date.now()}`,
             },
         });
 
