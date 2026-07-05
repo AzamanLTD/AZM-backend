@@ -43,7 +43,6 @@ class TimeOffService {
             data: {
                 status: 'APPROVED',
                 managerNote,
-                respondedAt: new Date(),
             },
         });
     }
@@ -54,7 +53,6 @@ class TimeOffService {
             data: {
                 status: 'REJECTED',
                 managerNote,
-                respondedAt: new Date(),
             },
         });
     }
