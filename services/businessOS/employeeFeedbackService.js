@@ -89,8 +89,8 @@ class EmployeeFeedbackService {
             select: {
                 id: true,
                 role: true,
-                performanceRating: true,
-                feedbackCount: true,
+                rating: true,
+                ratingCount: true,
                 user: { select: { username: true } },
             },
         });

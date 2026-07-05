@@ -85,8 +85,10 @@ async function setupFixtures() {
             label: 'Main Branch',
             address: '123 Test Street',
             city: 'Accra',
-            phone: '+233500000000',
+            phoneNumber: '+233500000000',
             isPrimary: true,
+            latitude: 5.6037,
+            longitude: -0.1870,
         },
     });
 

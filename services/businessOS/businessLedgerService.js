@@ -23,7 +23,7 @@ class BusinessLedgerService {
                 sourceType: sourceType || null,
                 sourceId: sourceId || null,
                 metadata: metadata || {},
-                entryDate: entryDate ? new Date(entryDate) : new Date(),
+                createdAt: entryDate ? new Date(entryDate) : undefined,
             },
         });
     }
