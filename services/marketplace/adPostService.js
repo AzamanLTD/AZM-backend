@@ -117,6 +117,19 @@ class AdPostService {
     }
 
     /**
+     * Sweep expired (non-deleted) ad posts. Reads already filter by
+     * expiresAt at query time so this has no correctness impact -- it just
+     * prevents unbounded table growth. Returns the count removed so the
+     * caller/worker can log it.
+     */
+    async expireOldAds() {
+        const result = await this.prisma.businessAdPost.deleteMany({
+            where: { expiresAt: { lte: new Date() } },
+        });
+        return { expired: result.count };
+    }
+
+    /**
      * Delete an ad post (business owner only).
      */
     async deleteAdPost(adPostId, businessProfileId) {

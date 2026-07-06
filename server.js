@@ -961,6 +961,21 @@ if (process.env.NODE_ENV !== 'test') {
     });
 }
 
+// FIX (2026-07-06): both workers below were fully written (and each has its
+// own internal try/catch) but were never actually registered with cron --
+// their own file headers literally said "ADD to server.js" as a to-do that
+// was never done. sweepExpiredAds in particular is what keeps the
+// marketplace "status"/ad-feed table from growing unbounded (reads already
+// filter expired rows out, so this was silent DB bloat, not a user-facing
+// bug -- but it's exactly the kind of thing that quietly gets worse over
+// time if never registered).
+if (process.env.NODE_ENV !== 'test') {
+    const { sweepTransitReminders } = require('./workers/transitReminderWorker');
+    const { sweepExpiredAds } = require('./workers/businessAdExpiryWorker');
+    cron.schedule('*/15 * * * *', () => sweepTransitReminders(prisma));
+    cron.schedule('*/30 * * * *', () => sweepExpiredAds(prisma));
+}
+
 // ── D-05: record worker liveness for GET /health ─────────────────────────────
 // These all called .start() above. tradeWorker is special: it is instantiated
 // here but only .start()'d in the server.listen callback (so its expiry sweep
