@@ -46,7 +46,12 @@ exports.myFollowing = async (req, res) => {
             limit: req.query.limit,
             offset: req.query.offset
         });
-        res.json({ success: true, ...result });
+        // FIX (2026-07-06): getFollowing resolves to a bare array. Spreading
+        // an array into a JSON object (`{ success: true, ...result }`)
+        // produces numeric-string-keyed junk ({"0": {...}, "1": {...}}),
+        // NOT a JSON array -- any real client reading `.following` (or
+        // expecting an array at all) got nothing. Wrap it properly.
+        res.json({ success: true, following: result });
     } catch (err) { res.status(500).json({ success: false, message: err.message }); }
 };
 
@@ -62,6 +67,7 @@ exports.myFollowers = async (req, res) => {
             limit: req.query.limit,
             offset: req.query.offset
         });
-        res.json({ success: true, ...result });
+        // Same array-spread bug as myFollowing above -- fixed the same way.
+        res.json({ success: true, followers: result });
     } catch (err) { res.status(500).json({ success: false, message: err.message }); }
 };
