@@ -14,7 +14,7 @@ exports.adminBusinessScope = async (req, res, next) => {
         }
     }
 
-    if (user?.role === 'admin' && req.headers['x-admin-business-id']) {
+    if (user?.role?.toUpperCase() === 'ADMIN' && req.headers['x-admin-business-id']) {
         const prisma = req.app.get('prisma');
         const bizId = req.headers['x-admin-business-id'];
 
