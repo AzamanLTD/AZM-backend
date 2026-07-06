@@ -2628,6 +2628,7 @@ model BusinessProduct {
   location        BusinessLocation? @relation(fields: [locationId], references: [id])
   catalogSection  CatalogSection?   @relation("SectionProducts", fields: [catalogSectionId], references: [id])
   kitchenOrderItems KitchenOrderItem[]
+  recipeIngredients RecipeIngredient[]
   orders          BusinessOrder[]
 
   createdAt      DateTime        @default(now())
@@ -2902,7 +2903,6 @@ model TransitBooking {
   tripId            String?
   trip              TransitTrip?         @relation(fields: [tripId], references: [id])
   seats             TransitBookingSeat[]
-  cargoParcels      CargoParcel[]
   review            BusinessReview?
 
   @@index([businessProfileId])
@@ -3676,6 +3676,7 @@ model TransitTrip {
   vehicle         TransitVehicle       @relation(fields: [vehicleId], references: [id], onDelete: Cascade)
   bookings        TransitBooking[]
   seats           TransitBookingSeat[]
+  cargoParcels      CargoParcel[]
   driverAssignments DriverAssignment[]
 
   @@index([businessProfileId, departureAt])
@@ -4528,7 +4529,7 @@ enum CargoStatus {
 }
 
 model CargoParcel {
-  id                String      @id @default(cuid())
+  id                String      @id @default(uuid())
   transitTripId     String
   businessProfileId String
   senderName        String
@@ -4538,7 +4539,7 @@ model CargoParcel {
   receiverAddress   String?
   description       String
   weightKg          Float
-  priceUsdc         Float
+  priceUsdc         Decimal   @db.Decimal(20, 8)
   fragile           Boolean     @default(false)
   notes             String?
   status            CargoStatus @default(PENDING)
@@ -4556,7 +4557,7 @@ model CargoParcel {
 
 // ── Restaurant: Inventory Management ──────────────────────────────────────────
 model InventoryItem {
-  id                String  @id @default(cuid())
+  id                String  @id @default(uuid())
   businessProfileId String
   name              String
   unit              String  // "kg", "liters", "pieces", "grams"
@@ -4577,7 +4578,7 @@ model InventoryItem {
 }
 
 model RecipeIngredient {
-  id              String @id @default(cuid())
+  id              String @id @default(uuid())
   productId       String
   inventoryItemId String
   quantityRequired Float // quantity per one serving of the product

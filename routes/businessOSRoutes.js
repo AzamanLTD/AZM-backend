@@ -776,7 +776,7 @@ router.post('/transit/irops/reassign', protect, protectActive, wrap(async (req, 
     const sourceTrip = await prisma.transitTrip.findFirst({
         where: { id: sourceTripId, businessProfileId: bpId },
         include: {
-            bookings: { where: { status: { in: ['CONFIRMED', 'BOARDED'] } } },
+            bookings: { where: { status: { in: ['CONFIRMED'] } } },
             cargoParcels: { where: { status: { in: ['PENDING', 'LOADED'] } } },
         },
     });
@@ -793,7 +793,7 @@ router.post('/transit/irops/reassign', protect, protectActive, wrap(async (req, 
                 routeName: `${sourceTrip.routeName} [REPLACEMENT]`,
                 origin: sourceTrip.origin, destination: sourceTrip.destination,
                 departureAt: new Date(), fareUsdc: sourceTrip.fareUsdc,
-                availableSeats: targetVehicle.totalSeats ?? sourceTrip.availableSeats,
+                availableSeats: targetVehicle.capacity ?? sourceTrip.availableSeats,
                 status: 'ACTIVE',
             },
         });
@@ -804,8 +804,8 @@ router.post('/transit/irops/reassign', protect, protectActive, wrap(async (req, 
         let passengerCount = 0;
         if (sourceTrip.bookings.length > 0) {
             const moved = await tx.transitBooking.updateMany({
-                where: { transitTripId: sourceTripId, status: { in: ['CONFIRMED', 'BOARDED'] } },
-                data: { transitTripId: newTrip.id },
+                where: { tripId: sourceTripId, status: { in: ['CONFIRMED'] } },
+                data: { tripId: newTrip.id },
             });
             passengerCount = moved.count;
         }
