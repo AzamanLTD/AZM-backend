@@ -41,7 +41,7 @@ describeOrSkip('Vault flow', () => {
     await prisma.$executeRawUnsafe(
       'TRUNCATE TABLE "User", "Vault", "VaultDeposit", "TransactionHistory" RESTART IDENTITY CASCADE'
     );
-  });
+  }, 15000);
 
   const futureDate = () => new Date(Date.now() + 30 * 86400000).toISOString();
 

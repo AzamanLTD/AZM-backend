@@ -52,7 +52,7 @@ describeOrSkip('AZM token economy', () => {
             'TRUNCATE TABLE "User","Ad","AzmRewardLog","AzmSpendLog","AzmAuction",' +
             '"AzmAuctionBid","TransactionHistory" RESTART IDENTITY CASCADE'
         );
-    });
+    }, 15000);
 
     async function seedAd(vendorId) {
         return prisma.ad.create({

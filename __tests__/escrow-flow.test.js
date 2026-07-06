@@ -47,7 +47,7 @@ describeOrSkip('SmartEscrow flows', () => {
         await prisma.$executeRawUnsafe(
             'TRUNCATE TABLE "User", "SystemProfitFees", "AdminProfitLog" RESTART IDENTITY CASCADE'
         );
-    });
+    }, 15000);
 
     // ── fund ──────────────────────────────────────────────────────────────────
     describe('fund', () => {

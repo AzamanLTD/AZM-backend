@@ -57,7 +57,7 @@ describeOrSkip('Vault auto-rule deposits', () => {
         await prisma.$executeRawUnsafe(
             'TRUNCATE TABLE "User","Vault","VaultDeposit","TransactionHistory" RESTART IDENTITY CASCADE'
         );
-    });
+    }, 15000);
 
     async function makeVault(userId, overrides = {}) {
         return prisma.vault.create({

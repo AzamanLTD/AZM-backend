@@ -53,7 +53,7 @@ describeOrSkip('completeTrade — concurrent finalize is single-winner', () => {
     afterEach(async () => {
         // Prevent cross-test pollution. Trade has FKs to User; Ad to User.
         await prisma.$executeRawUnsafe('TRUNCATE TABLE "Trade", "Ad", "User" RESTART IDENTITY CASCADE');
-    });
+    }, 15000);
 
     test('two simultaneous completeTrade calls: exactly one succeeds', async () => {
         // Real seed: a PAID SELL trade where the buyer has escrowed amountCrypto.

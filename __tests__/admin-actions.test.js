@@ -31,7 +31,7 @@ describeOrSkip('Admin privileged actions', () => {
     await prisma.$executeRawUnsafe(
       'TRUNCATE TABLE "User", "RefreshToken", "AuditLog", "TransactionHistory" RESTART IDENTITY CASCADE'
     );
-  });
+  }, 15000);
 
   function mockRes() {
     const r = { _status: 200, _body: null };

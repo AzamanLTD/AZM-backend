@@ -34,7 +34,7 @@ describeOrSkip('Withdrawal flow', () => {
     await prisma.$executeRawUnsafe(
       'TRUNCATE TABLE "User", "Withdrawal", "TransactionHistory", "AuditLog" RESTART IDENTITY CASCADE'
     );
-  });
+  }, 15000);
 
   function mockRes() {
     const r = { _status: 200, _body: null };

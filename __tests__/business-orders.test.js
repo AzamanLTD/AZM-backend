@@ -39,7 +39,7 @@ describeOrSkip('BusinessOrder — lifecycle', () => {
         await prisma.$executeRawUnsafe(
             'TRUNCATE TABLE "User", "BusinessProfile", "BusinessProduct", "BusinessOrder" RESTART IDENTITY CASCADE'
         );
-    });
+    }, 15000);
 
     test('markDelivered transitions a PAID order to DELIVERED', async () => {
         const { biz, product } = await seedBusiness(prisma);
