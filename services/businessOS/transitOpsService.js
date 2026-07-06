@@ -203,13 +203,21 @@ class TransitOpsService {
 
         return vehicles.map(v => ({
             id: v.id,
-            plateNumber: v.plateNumber,
+            type: v.type,
+            make: v.make,
             model: v.model,
+            year: v.year,
+            color: v.color,
+            licensePlate: v.licensePlate,
             capacity: v.capacity,
-            currentStatus: v.status,
-            activeAssignment: v.driverAssignments[0] || null,
-            pendingMaintenance: v.maintenances,
-            needsMaintenance: v.maintenances.length > 0,
+            isActive: v.isActive,
+            driverName: v.driverName,
+            driverPhone: v.driverPhone,
+            imageUrl: v.imageUrl,
+            currentStatus: v.isActive ? 'ACTIVE' : 'INACTIVE',
+            activeAssignment: v.driverAssignments?.[0] || null,
+            pendingMaintenance: v.maintenances || [],
+            needsMaintenance: (v.maintenances || []).length > 0,
         }));
     }
 
