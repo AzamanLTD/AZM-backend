@@ -12,6 +12,16 @@
 const bcrypt = require('bcryptjs');
 const { issueTokenPair } = require('../services/authTokenService');
 
+// Calendar-day difference (UTC midnight-to-midnight), NOT a rolling 24h
+// window. See the BUGFIX note at the login-streak call site for why this
+// matters — comparing raw elapsed ms silently breaks streaks for anyone
+// whose login time drifts earlier day over day.
+function _daysBetweenCalendarDates(a, b) {
+    const utcA = Date.UTC(a.getFullYear(), a.getMonth(), a.getDate());
+    const utcB = Date.UTC(b.getFullYear(), b.getMonth(), b.getDate());
+    return Math.round((utcB - utcA) / (1000 * 60 * 60 * 24));
+}
+
 // ── Startup validation ───────────────────────────────────────────────────────
 // CRITICAL-2: Crash immediately if JWT_SECRET is not configured.
 // This prevents accidental deployment with a guessable default secret.
@@ -367,17 +377,29 @@ exports.login = async (req, res) => {
         }
 
         // ── Track login streak ────────────────────────────────────────────
+        // BUGFIX (2026-07-06): this used to diff `now - lastLogin` as a rolling
+        // 24h window (`Math.floor(ms / 86400000)`). That silently broke the
+        // streak for anyone who logs in even a little earlier each day than the
+        // day before — e.g. 8:00am Monday then 7:30am Tuesday is only 23.5h
+        // apart, floors to 0, and the code reads that as "same day, keep streak
+        // as is" even though it's a brand new calendar day. Over time that
+        // makes daily streak credit understated or stuck, since it's real-world
+        // easy to nudge your login time earlier and never trip the >=24h mark.
+        // Fixed to compare CALENDAR dates (midnight-to-midnight, UTC) instead
+        // of raw elapsed milliseconds — this also matches the calendar-day
+        // convention _todayKey() already uses for the daily-credit dedup key
+        // in azmRewardService, so "streak day" and "dedup day" now agree.
         const now = new Date();
         let loginStreak = user.loginStreak || 0;
         if (user.lastLoginAt) {
             const lastLogin = new Date(user.lastLoginAt);
-            const daysSinceLastLogin = Math.floor((now - lastLogin) / (1000 * 60 * 60 * 24));
+            const daysSinceLastLogin = _daysBetweenCalendarDates(lastLogin, now);
             if (daysSinceLastLogin === 1) {
-                loginStreak += 1; // Consecutive day
+                loginStreak += 1; // Consecutive calendar day
             } else if (daysSinceLastLogin > 1) {
                 loginStreak = 1; // Streak broken, restart
             }
-            // If daysSinceLastLogin === 0, same day login — keep streak as is
+            // If daysSinceLastLogin === 0, same calendar day login — keep streak as is
         } else {
             loginStreak = 1; // First login
         }
@@ -540,3 +562,7 @@ exports.getPublicRates = async (req, res) => {
         res.status(500).json({ success: false, message: "Failed to fetch rates." });
     }
 };
+
+// Exported for unit testing only (pure calendar-day-diff helper — see the
+// login-streak BUGFIX note above for why this needed to change).
+exports._daysBetweenCalendarDates = _daysBetweenCalendarDates;
