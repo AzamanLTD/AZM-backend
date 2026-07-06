@@ -90,7 +90,7 @@ router.get('/employees', wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
     const { role, status, search } = req.query;
-    const employees = await svc.employeeService.getEmployees(bpId, { role, status, search });
+    const employees = await svc.employeeService.listEmployees(bpId, { role, status });
     res.json({ success: true, employees });
 }));
 

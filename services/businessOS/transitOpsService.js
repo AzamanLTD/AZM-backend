@@ -40,7 +40,7 @@ class TransitOpsService {
                 });
                 if (existing && existing.trip) {
                     // Check time overlap
-                    if (existing.trip.departureTime < trip.arrivalTime && existing.trip.arrivalTime > trip.departureTime) {
+                    if (existing.trip.departureAt < trip.arrivalTime && existing.trip.arrivalTime > trip.departureAt) {
                         throw new Error('Driver has a conflicting trip at this time.');
                     }
                 }
@@ -273,9 +273,9 @@ class TransitOpsService {
         const trips = await this.prisma.transitTrip.findMany({
             where: {
                 businessProfileId,
-                departureTime: { gte: targetDate, lt: nextDay },
+                departureAt: { gte: targetDate, lt: nextDay },
             },
-            orderBy: { departureTime: 'asc' },
+            orderBy: { departureAt: 'asc' },
         });
 
         const manifests = [];
