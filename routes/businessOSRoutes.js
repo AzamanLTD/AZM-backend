@@ -685,4 +685,295 @@ router.get('/feedback/by/:employeeId', wrap(async (req, res) => {
     res.json({ success: true, feedback });
 }));
 
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MOOLRE COMPETITION — Transit Cargo & Restaurant Inventory
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ── TRANSIT: CARGO MANAGEMENT ─────────────────────────────────────────────────
+
+// GET /api/business-os/transit/cargo — list cargo for a trip
+router.get('/transit/cargo', protect, protectActive, wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+    const { tripId, status } = req.query;
+    const where = { businessProfileId: bpId };
+    if (tripId) where.transitTripId = tripId;
+    if (status) where.status = status;
+    const parcels = await prisma.cargoParcel.findMany({
+        where,
+        include: {
+            transitTrip: { select: { origin: true, destination: true, departureAt: true, routeName: true } },
+        },
+        orderBy: { createdAt: 'desc' },
+    });
+    res.json({ success: true, parcels });
+}));
+
+// POST /api/business-os/transit/cargo — create cargo parcel
+router.post('/transit/cargo', protect, protectActive, wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+    const {
+        transitTripId, senderName, senderPhone, receiverName, receiverPhone,
+        receiverAddress, description, weightKg, priceUsdc, fragile, notes,
+    } = req.body;
+    const trip = await prisma.transitTrip.findFirst({
+        where: { id: transitTripId, businessProfileId: bpId },
+    });
+    if (!trip) return res.status(404).json({ success: false, message: 'Trip not found' });
+    const parcel = await prisma.cargoParcel.create({
+        data: {
+            transitTripId, businessProfileId: bpId,
+            senderName, senderPhone, receiverName, receiverPhone,
+            receiverAddress, description,
+            weightKg: parseFloat(weightKg), priceUsdc: parseFloat(priceUsdc),
+            fragile: fragile === true || fragile === 'true', notes,
+        },
+    });
+    res.json({ success: true, parcel });
+}));
+
+// PATCH /api/business-os/transit/cargo/:id/status — update cargo status
+router.patch('/transit/cargo/:id/status', protect, protectActive, wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+    const { status } = req.body;
+    const validStatuses = ['PENDING', 'LOADED', 'IN_TRANSIT', 'DELIVERED', 'RETURNED', 'LOST'];
+    if (!validStatuses.includes(status)) {
+        return res.status(400).json({ success: false, message: 'Invalid status' });
+    }
+    const updateData = { status };
+    if (status === 'LOADED') updateData.loadedAt = new Date();
+    if (status === 'DELIVERED') updateData.deliveredAt = new Date();
+    const result = await prisma.cargoParcel.updateMany({
+        where: { id: req.params.id, businessProfileId: bpId },
+        data: updateData,
+    });
+    if (!result.count) return res.status(404).json({ success: false, message: 'Parcel not found' });
+    res.json({ success: true });
+}));
+
+// DELETE /api/business-os/transit/cargo/:id — remove cargo parcel
+router.delete('/transit/cargo/:id', protect, protectActive, wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+    const result = await prisma.cargoParcel.deleteMany({
+        where: { id: req.params.id, businessProfileId: bpId, status: 'PENDING' },
+    });
+    if (!result.count) return res.status(404).json({ success: false, message: 'Parcel not found or already loaded' });
+    res.json({ success: true });
+}));
+
+// POST /api/business-os/transit/irops/reassign — vehicle breakdown reassignment
+router.post('/transit/irops/reassign', protect, protectActive, wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+    const { sourceTripId, targetVehicleId, reason } = req.body;
+    if (!sourceTripId || !targetVehicleId) {
+        return res.status(400).json({ success: false, message: 'sourceTripId and targetVehicleId are required' });
+    }
+    const sourceTrip = await prisma.transitTrip.findFirst({
+        where: { id: sourceTripId, businessProfileId: bpId },
+        include: {
+            bookings: { where: { status: { in: ['CONFIRMED', 'BOARDED'] } } },
+            cargoParcels: { where: { status: { in: ['PENDING', 'LOADED'] } } },
+        },
+    });
+    if (!sourceTrip) return res.status(404).json({ success: false, message: 'Source trip not found' });
+    const targetVehicle = await prisma.transitVehicle.findFirst({
+        where: { id: targetVehicleId, businessProfileId: bpId, isActive: true },
+    });
+    if (!targetVehicle) return res.status(404).json({ success: false, message: 'Target vehicle not found or not active' });
+
+    const result = await prisma.$transaction(async (tx) => {
+        const newTrip = await tx.transitTrip.create({
+            data: {
+                businessProfileId: bpId, vehicleId: targetVehicleId,
+                routeName: `${sourceTrip.routeName} [REPLACEMENT]`,
+                origin: sourceTrip.origin, destination: sourceTrip.destination,
+                departureAt: new Date(), fareUsdc: sourceTrip.fareUsdc,
+                availableSeats: targetVehicle.totalSeats ?? sourceTrip.availableSeats,
+                status: 'ACTIVE',
+            },
+        });
+        await tx.transitTrip.update({
+            where: { id: sourceTripId },
+            data: { status: 'CANCELLED' },
+        });
+        let passengerCount = 0;
+        if (sourceTrip.bookings.length > 0) {
+            const moved = await tx.transitBooking.updateMany({
+                where: { transitTripId: sourceTripId, status: { in: ['CONFIRMED', 'BOARDED'] } },
+                data: { transitTripId: newTrip.id },
+            });
+            passengerCount = moved.count;
+        }
+        let cargoCount = 0;
+        if (sourceTrip.cargoParcels.length > 0) {
+            const movedCargo = await tx.cargoParcel.updateMany({
+                where: { transitTripId: sourceTripId, status: { in: ['PENDING', 'LOADED'] } },
+                data: { transitTripId: newTrip.id },
+            });
+            cargoCount = movedCargo.count;
+        }
+        return { newTrip, passengerCount, cargoCount };
+    });
+
+    res.json({
+        success: true,
+        message: `Reassigned ${result.passengerCount} passengers and ${result.cargoCount} cargo items to replacement vehicle`,
+        newTripId: result.newTrip.id,
+        passengerCount: result.passengerCount, cargoCount: result.cargoCount,
+    });
+}));
+
+// ── RESTAURANT: INVENTORY MANAGEMENT ──────────────────────────────────────────
+
+// GET /api/business-os/restaurant/inventory — list inventory items
+router.get('/restaurant/inventory', protect, protectActive, wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+    const items = await prisma.inventoryItem.findMany({
+        where: { businessProfileId: bpId, isActive: true },
+        include: {
+            recipeIngredients: { include: { product: { select: { name: true, id: true } } } },
+        },
+        orderBy: [{ category: 'asc' }, { name: 'asc' }],
+    });
+    const annotated = items.map(item => ({
+        ...item,
+        isLowStock: item.currentStock <= item.minimumStock,
+        isOutOfStock: item.currentStock <= 0,
+        totalCostGhs: item.currentStock * item.costPerUnit,
+    }));
+    res.json({ success: true, items: annotated });
+}));
+
+// POST /api/business-os/restaurant/inventory — create inventory item
+router.post('/restaurant/inventory', protect, protectActive, wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+    const { name, unit, currentStock, minimumStock, costPerUnit, category, supplier } = req.body;
+    try {
+        const item = await prisma.inventoryItem.create({
+            data: {
+                businessProfileId: bpId, name, unit,
+                currentStock: parseFloat(currentStock),
+                minimumStock: parseFloat(minimumStock || 0),
+                costPerUnit: parseFloat(costPerUnit),
+                category, supplier,
+            },
+        });
+        res.json({ success: true, item });
+    } catch (e) {
+        if (e.code === 'P2002') return res.status(400).json({ success: false, message: 'An ingredient with this name already exists' });
+        throw e;
+    }
+}));
+
+// PATCH /api/business-os/restaurant/inventory/:id — update stock or details
+router.patch('/restaurant/inventory/:id', protect, protectActive, wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+    const { currentStock, minimumStock, costPerUnit, category, supplier, adjustment } = req.body;
+    const existing = await prisma.inventoryItem.findFirst({
+        where: { id: req.params.id, businessProfileId: bpId },
+    });
+    if (!existing) return res.status(404).json({ success: false, message: 'Item not found' });
+    const updateData = {};
+    if (currentStock !== undefined) updateData.currentStock = parseFloat(currentStock);
+    if (adjustment !== undefined) updateData.currentStock = Math.max(0, existing.currentStock + parseFloat(adjustment));
+    if (minimumStock !== undefined) updateData.minimumStock = parseFloat(minimumStock);
+    if (costPerUnit !== undefined) updateData.costPerUnit = parseFloat(costPerUnit);
+    if (category !== undefined) updateData.category = category;
+    if (supplier !== undefined) updateData.supplier = supplier;
+    const item = await prisma.inventoryItem.update({
+        where: { id: req.params.id }, data: updateData,
+    });
+    res.json({ success: true, item });
+}));
+
+// POST /api/business-os/restaurant/inventory/:id/restock — quick restock
+router.post('/restaurant/inventory/:id/restock', protect, protectActive, wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+    const { quantity } = req.body;
+    const result = await prisma.inventoryItem.updateMany({
+        where: { id: req.params.id, businessProfileId: bpId },
+        data: { currentStock: { increment: parseFloat(quantity) } },
+    });
+    if (!result.count) return res.status(404).json({ success: false, message: 'Item not found' });
+    res.json({ success: true });
+}));
+
+// GET /api/business-os/restaurant/recipes — get recipe costs per product
+router.get('/restaurant/recipes', protect, protectActive, wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+    const products = await prisma.businessProduct.findMany({
+        where: { businessProfileId: bpId },
+        include: { recipeIngredients: { include: { inventoryItem: true } } },
+    });
+    const withCost = products.map(p => ({
+        id: p.id, name: p.name, priceUsdc: p.priceUsdc,
+        ingredients: p.recipeIngredients.map(ri => ({
+            id: ri.id, inventoryItemId: ri.inventoryItemId,
+            inventoryItemName: ri.inventoryItem.name, unit: ri.inventoryItem.unit,
+            quantityRequired: ri.quantityRequired,
+            costGhs: ri.quantityRequired * ri.inventoryItem.costPerUnit,
+        })),
+        totalCostGhs: p.recipeIngredients.reduce((sum, ri) => sum + ri.quantityRequired * ri.inventoryItem.costPerUnit, 0),
+    }));
+    res.json({ success: true, products: withCost });
+}));
+
+// POST /api/business-os/restaurant/recipes/:productId/link — link ingredient to product
+router.post('/restaurant/recipes/:productId/link', protect, protectActive, wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const { inventoryItemId, quantityRequired } = req.body;
+    const link = await prisma.recipeIngredient.upsert({
+        where: { productId_inventoryItemId: { productId: req.params.productId, inventoryItemId } },
+        create: { productId: req.params.productId, inventoryItemId, quantityRequired: parseFloat(quantityRequired) },
+        update: { quantityRequired: parseFloat(quantityRequired) },
+    });
+    res.json({ success: true, link });
+}));
+
+// DELETE /api/business-os/restaurant/recipes/:productId/link/:itemId — remove link
+router.delete('/restaurant/recipes/:productId/link/:itemId', protect, protectActive, wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    await prisma.recipeIngredient.deleteMany({
+        where: { productId: req.params.productId, inventoryItemId: req.params.itemId },
+    });
+    res.json({ success: true });
+}));
+
+// POST /api/business-os/restaurant/inventory/deduct/:orderId — deduct inventory when order completes
+router.post('/restaurant/inventory/deduct/:orderId', protect, protectActive, wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+    const order = await prisma.businessOrder.findFirst({
+        where: { id: req.params.orderId, businessProfileId: bpId },
+        include: { product: { include: { recipeIngredients: { include: { inventoryItem: true } } } } },
+    });
+    if (!order) return res.status(404).json({ success: false, message: 'Order not found' });
+    if (!order.product?.recipeIngredients?.length) {
+        return res.json({ success: true, message: 'No recipe configured — nothing deducted', deductions: [] });
+    }
+    const qty = order.quantity || 1;
+    const deductions = [];
+    await prisma.$transaction(async (tx) => {
+        for (const ri of order.product.recipeIngredients) {
+            const deductQty = ri.quantityRequired * qty;
+            await tx.inventoryItem.update({
+                where: { id: ri.inventoryItemId },
+                data: { currentStock: { decrement: deductQty } },
+            });
+            deductions.push({ ingredient: ri.inventoryItem.name, deducted: deductQty, unit: ri.inventoryItem.unit });
+        }
+    });
+    res.json({ success: true, message: 'Inventory deducted', deductions });
+}));
+
 module.exports = router;

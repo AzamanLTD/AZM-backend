@@ -2394,6 +2394,8 @@ model BusinessProfile {
   kitchenOrders      KitchenOrder[]
   driverAssignments  DriverAssignment[]
   vehicleMaintenances VehicleMaintenance[]
+  cargoParcelsSent     CargoParcel[]
+  inventoryItems       InventoryItem[]
 
   @@index([bizId])
   @@index([category])
@@ -2900,6 +2902,7 @@ model TransitBooking {
   tripId            String?
   trip              TransitTrip?         @relation(fields: [tripId], references: [id])
   seats             TransitBookingSeat[]
+  cargoParcels      CargoParcel[]
   review            BusinessReview?
 
   @@index([businessProfileId])
@@ -4509,3 +4512,80 @@ model VehicleMaintenance {
   @@index([vehicleId, scheduledDate])
 }
 
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MOOLRE COMPETITION — Transit Cargo & Restaurant Inventory
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ── Transit: Cargo Logistics ───────────────────────────────────────────────────
+enum CargoStatus {
+  PENDING
+  LOADED
+  IN_TRANSIT
+  DELIVERED
+  RETURNED
+  LOST
+}
+
+model CargoParcel {
+  id                String      @id @default(cuid())
+  transitTripId     String
+  businessProfileId String
+  senderName        String
+  senderPhone       String?
+  receiverName      String
+  receiverPhone     String
+  receiverAddress   String?
+  description       String
+  weightKg          Float
+  priceUsdc         Float
+  fragile           Boolean     @default(false)
+  notes             String?
+  status            CargoStatus @default(PENDING)
+  loadedAt          DateTime?
+  deliveredAt       DateTime?
+  createdAt         DateTime    @default(now())
+  updatedAt         DateTime    @updatedAt
+
+  transitTrip     TransitTrip     @relation(fields: [transitTripId], references: [id], onDelete: Cascade)
+  businessProfile BusinessProfile @relation(fields: [businessProfileId], references: [id])
+
+  @@index([transitTripId])
+  @@index([businessProfileId])
+}
+
+// ── Restaurant: Inventory Management ──────────────────────────────────────────
+model InventoryItem {
+  id                String  @id @default(cuid())
+  businessProfileId String
+  name              String
+  unit              String  // "kg", "liters", "pieces", "grams"
+  currentStock      Float
+  minimumStock      Float   @default(0)
+  costPerUnit       Float   // cost in GHS
+  category          String? // "Proteins", "Vegetables", "Beverages", "Dry Goods"
+  supplier          String?
+  isActive          Boolean @default(true)
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  businessProfile  BusinessProfile   @relation(fields: [businessProfileId], references: [id])
+  recipeIngredients RecipeIngredient[]
+
+  @@index([businessProfileId])
+  @@unique([businessProfileId, name])
+}
+
+model RecipeIngredient {
+  id              String @id @default(cuid())
+  productId       String
+  inventoryItemId String
+  quantityRequired Float // quantity per one serving of the product
+
+  product       BusinessProduct @relation(fields: [productId], references: [id], onDelete: Cascade)
+  inventoryItem InventoryItem   @relation(fields: [inventoryItemId], references: [id], onDelete: Cascade)
+
+  @@unique([productId, inventoryItemId])
+  @@index([productId])
+  @@index([inventoryItemId])
+}
