@@ -81,6 +81,213 @@ function wrap(handler) {
 // Apply auth + ban guard middleware to all routes
 router.use(protect, protectActive);
 
+
+// ═══════════════════════════════════════════════════════════════════════════
+// WORKER SELF-SERVICE (Employee-facing — uses req.user.id, no business profile needed)
+// These endpoints power the Worker Sub-Portal in the Flutter app.
+// A user tagged as an active employee can access these without owning a business.
+// ═══════════════════════════════════════════════════════════════════════════
+
+// GET /api/business-os/employees/me — get current user's employee record
+router.get('/employees/me', wrap(async (req, res) => {
+    if (!req.user?.id) return res.status(401).json({ success: false, message: 'Authentication required.' });
+    const prisma = getPrisma(req);
+    const employee = await prisma.businessEmployee.findFirst({
+        where: { userId: req.user.id, status: 'ACTIVE' },
+        include: {
+            businessProfile: {
+                select: { id: true, businessName: true, category: true, logoUrl: true },
+            },
+            user: { select: { username: true } },
+        },
+    });
+    if (!employee) return res.json({ success: true, employee: null });
+    res.json({ success: true, employee });
+}));
+
+// GET /api/business-os/employees/my-dashboard — full worker dashboard (aggregated)
+router.get('/employees/my-dashboard', wrap(async (req, res) => {
+    if (!req.user?.id) return res.status(401).json({ success: false, message: 'Authentication required.' });
+    const svc = getServices(req);
+    const dashboard = await svc.employeeService.getWorkerDashboard(req.user.id);
+    if (!dashboard) return res.json({ success: true, dashboard: null });
+    res.json({ success: true, dashboard });
+}));
+
+// GET /api/business-os/employees/my-shifts — get current user's shift schedule
+router.get('/employees/my-shifts', wrap(async (req, res) => {
+    if (!req.user?.id) return res.status(401).json({ success: false, message: 'Authentication required.' });
+    const svc = getServices(req);
+    const shifts = await svc.shiftService.getUserSchedule(req.user.id, {
+        startDate: req.query.startDate,
+        endDate: req.query.endDate,
+    });
+    res.json({ success: true, shifts });
+}));
+
+// GET /api/business-os/employees/my-team — get team on duty at the user's business
+router.get('/employees/my-team', wrap(async (req, res) => {
+    if (!req.user?.id) return res.status(401).json({ success: false, message: 'Authentication required.' });
+    const prisma = getPrisma(req);
+    // Find the user's active employment
+    const employee = await prisma.businessEmployee.findFirst({
+        where: { userId: req.user.id, status: 'ACTIVE' },
+    });
+    if (!employee) return res.json({ success: true, teamOnDuty: [], upcomingTeam: null });
+    const svc = getServices(req);
+    const teamOnDuty = await svc.shiftService.getTeamOnDuty(employee.businessProfileId);
+    const upcomingTeam = await svc.shiftService.getUpcomingTeam(employee.businessProfileId);
+    res.json({ success: true, teamOnDuty, upcomingTeam });
+}));
+
+// GET /api/business-os/employees/my-payroll — get current user's payroll records
+router.get('/employees/my-payroll', wrap(async (req, res) => {
+    if (!req.user?.id) return res.status(401).json({ success: false, message: 'Authentication required.' });
+    const prisma = getPrisma(req);
+    const employee = await prisma.businessEmployee.findFirst({
+        where: { userId: req.user.id, status: 'ACTIVE' },
+    });
+    if (!employee) return res.json({ success: true, records: [] });
+    const svc = getServices(req);
+    const records = await svc.payrollService.getPayrollRecords(employee.businessProfileId, {
+        employeeId: employee.id,
+        period: req.query.period,
+    });
+    res.json({ success: true, records });
+}));
+
+// GET /api/business-os/employees/my-earnings — get EWA summary and history
+router.get('/employees/my-earnings', wrap(async (req, res) => {
+    if (!req.user?.id) return res.status(401).json({ success: false, message: 'Authentication required.' });
+    const prisma = getPrisma(req);
+    const employee = await prisma.businessEmployee.findFirst({
+        where: { userId: req.user.id, status: 'ACTIVE' },
+    });
+    if (!employee) return res.json({ success: true, ewaHistory: [], ewaSummary: null });
+    const svc = getServices(req);
+    const ewaHistory = await svc.ewaService.getEwaHistory(employee.id);
+    const ewaEligible = await svc.ewaService.checkEligibility(employee.id);
+    const accrued = parseFloat(employee.accruedWages);
+    const withdrawn = parseFloat(employee.withdrawnEarly);
+    res.json({
+        success: true,
+        ewaHistory,
+        ewaEligible,
+        ewaAvailable: Math.max(0, accrued * 0.30 - withdrawn),
+        accruedWages: accrued,
+        withdrawnEarly: withdrawn,
+    });
+}));
+
+// POST /api/business-os/employees/my-ewa-request — request EWA withdrawal
+router.post('/employees/my-ewa-request', wrap(async (req, res) => {
+    if (!req.user?.id) return res.status(401).json({ success: false, message: 'Authentication required.' });
+    const prisma = getPrisma(req);
+    const employee = await prisma.businessEmployee.findFirst({
+        where: { userId: req.user.id, status: 'ACTIVE' },
+    });
+    if (!employee) throw new Error('You are not an active employee.');
+    const svc = getServices(req);
+    const result = await svc.employeeService.requestEWA(employee.id, req.body.amount);
+    res.json({ success: true, ...result });
+}));
+
+// GET /api/business-os/employees/my-feedback — get feedback received by the current user
+router.get('/employees/my-feedback', wrap(async (req, res) => {
+    if (!req.user?.id) return res.status(401).json({ success: false, message: 'Authentication required.' });
+    const prisma = getPrisma(req);
+    const employee = await prisma.businessEmployee.findFirst({
+        where: { userId: req.user.id, status: 'ACTIVE' },
+    });
+    if (!employee) return res.json({ success: true, feedback: [] });
+    const svc = getServices(req);
+    const feedback = await svc.feedbackService.getFeedbackForEmployee(employee.id);
+    res.json({ success: true, feedback });
+}));
+
+// GET /api/business-os/employees/shifts/open — get open shift swaps the user can claim
+router.get('/employees/shifts/open', wrap(async (req, res) => {
+    if (!req.user?.id) return res.status(401).json({ success: false, message: 'Authentication required.' });
+    const prisma = getPrisma(req);
+    const employee = await prisma.businessEmployee.findFirst({
+        where: { userId: req.user.id, status: 'ACTIVE' },
+    });
+    if (!employee) return res.json({ success: true, swaps: [] });
+    const svc = getServices(req);
+    const swaps = await svc.shiftService.getShiftSwaps(employee.businessProfileId, { status: 'OPEN' });
+    res.json({ success: true, swaps });
+}));
+
+// POST /api/business-os/employees/shifts/:shiftId/clock-in — worker clocks themselves in
+router.post('/employees/shifts/:shiftId/clock-in', wrap(async (req, res) => {
+    if (!req.user?.id) return res.status(401).json({ success: false, message: 'Authentication required.' });
+    const prisma = getPrisma(req);
+    // Verify the shift belongs to this user
+    const shift = await prisma.shift.findFirst({
+        where: { id: req.params.shiftId },
+        include: { employee: true },
+    });
+    if (!shift) throw new Error('Shift not found.');
+    if (shift.employee.userId !== req.user.id) throw new Error('This shift does not belong to you.');
+    const svc = getServices(req);
+    const updated = await svc.shiftService.clockIn(req.params.shiftId);
+    res.json({ success: true, shift: updated });
+}));
+
+// POST /api/business-os/employees/shifts/:shiftId/clock-out — worker clocks themselves out
+router.post('/employees/shifts/:shiftId/clock-out', wrap(async (req, res) => {
+    if (!req.user?.id) return res.status(401).json({ success: false, message: 'Authentication required.' });
+    const prisma = getPrisma(req);
+    const shift = await prisma.shift.findFirst({
+        where: { id: req.params.shiftId },
+        include: { employee: true },
+    });
+    if (!shift) throw new Error('Shift not found.');
+    if (shift.employee.userId !== req.user.id) throw new Error('This shift does not belong to you.');
+    const svc = getServices(req);
+    const updated = await svc.shiftService.clockOut(req.params.shiftId);
+    res.json({ success: true, shift: updated });
+}));
+
+// POST /api/business-os/employees/shifts/:shiftId/request-swap — worker requests shift swap
+router.post('/employees/shifts/:shiftId/request-swap', wrap(async (req, res) => {
+    if (!req.user?.id) return res.status(401).json({ success: false, message: 'Authentication required.' });
+    const prisma = getPrisma(req);
+    const employee = await prisma.businessEmployee.findFirst({
+        where: { userId: req.user.id, status: 'ACTIVE' },
+    });
+    if (!employee) throw new Error('You are not an active employee.');
+    const svc = getServices(req);
+    const swap = await svc.shiftService.requestShiftSwap({
+        businessProfileId: employee.businessProfileId,
+        shiftId: req.params.shiftId,
+        requestingEmployeeId: employee.id,
+        reason: req.body.reason,
+    });
+    res.status(201).json({ success: true, swap });
+}));
+
+// POST /api/business-os/employees/time-off — worker requests time off
+router.post('/employees/time-off', wrap(async (req, res) => {
+    if (!req.user?.id) return res.status(401).json({ success: false, message: 'Authentication required.' });
+    const prisma = getPrisma(req);
+    const employee = await prisma.businessEmployee.findFirst({
+        where: { userId: req.user.id, status: 'ACTIVE' },
+    });
+    if (!employee) throw new Error('You are not an active employee.');
+    const svc = getServices(req);
+    const request = await svc.timeOffService.requestTimeOff({
+        businessProfileId: employee.businessProfileId,
+        employeeId: employee.id,
+        type: req.body.type,
+        startDate: req.body.startDate,
+        endDate: req.body.endDate,
+        reason: req.body.reason,
+    });
+    res.status(201).json({ success: true, request });
+}));
+
+
 // ═══════════════════════════════════════════════════════════════════════════
 // EMPLOYEE MANAGEMENT
 // ═══════════════════════════════════════════════════════════════════════════

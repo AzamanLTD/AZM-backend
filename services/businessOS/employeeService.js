@@ -409,7 +409,7 @@ class EmployeeService {
             })),
             upcomingTeam: upcomingTeam ? {
                 name: upcomingTeam.employee.user.username,
-                role: upcomingShift?.employee?.role,
+                role: upcomingTeam?.employee?.role,
                 startTime: upcomingTeam.startTime,
             } : null,
             salaryInfo,
