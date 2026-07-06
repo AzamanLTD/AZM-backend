@@ -444,7 +444,8 @@ router.patch('/hotel/rooms/:id/status', wrap(async (req, res) => {
 router.get('/hotel/room-rack', wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
-    const rack = await svc.hotelOpsService.getRoomRack(bpId, req.query.date);
+    const date = req.query.date || new Date().toISOString().split('T')[0];
+    const rack = await svc.hotelOpsService.getRoomRack(bpId, date);
     res.json({ success: true, rack });
 }));
 
@@ -636,7 +637,8 @@ router.get('/transit/manifests/:tripId', wrap(async (req, res) => {
 router.get('/transit/manifests', wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
-    const manifests = await svc.transitOpsService.getDailyManifests(bpId, req.query.date);
+    const date = req.query.date || new Date().toISOString().split('T')[0];
+    const manifests = await svc.transitOpsService.getDailyManifests(bpId, date);
     res.json({ success: true, manifests });
 }));
 
