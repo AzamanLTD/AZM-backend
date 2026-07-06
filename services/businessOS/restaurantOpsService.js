@@ -287,5 +287,17 @@ class RestaurantOpsService {
     }
 }
 
-module.exports = { RestaurantOpsService };
+module.exports = { RestaurantOpsService 
+    async updateTableStatus(tableId, businessProfileId, status) {
+        const valid = ['AVAILABLE', 'OCCUPIED', 'RESERVED', 'DIRTY', 'CLEANING'];
+        if (!valid.includes(status)) {
+            throw new Error(`Invalid table status: ${status}`);
+        }
+        return this.prisma.restaurantTable.update({
+            where: { id: tableId, businessProfileId },
+            data: { status },
+        });
+    }
+
+};
 

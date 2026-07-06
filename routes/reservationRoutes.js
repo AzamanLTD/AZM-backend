@@ -19,6 +19,7 @@ router.get('/business/:bizId',          protect,       ctrl.listBusinessReservat
 router.patch('/:reservationId/confirm', protect,       ctrl.confirmReservation);
 router.patch('/:reservationId/checkin', protect,       ctrl.checkInReservation);
 router.patch('/:reservationId/checkout',protect,       ctrl.checkOutReservation);
+router.patch('/:reservationId/no-show', protect,    ctrl.markNoShowReservation);
 
 module.exports = router;
 

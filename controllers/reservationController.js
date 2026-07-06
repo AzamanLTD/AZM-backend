@@ -212,6 +212,32 @@ exports.checkInReservation = async (req, res) => {
 };
 
 // ── PATCH /api/reservations/:reservationId/checkout ──────────────────────────
+
+// ── PATCH /api/reservations/:reservationId/no-show ─────────────────────────
+exports.markNoShowReservation = async (req, res) => {
+    const prisma = req.app.get('prisma');
+    try {
+        const userId  = req.user.id;
+        const profile = await prisma.businessProfile.findUnique({ where: { userId } });
+        if (!profile) return res.status(403).json({ success: false, message: 'Business profile required.' });
+
+        const { reservationId } = req.params;
+        const existing = await prisma.reservation.findUnique({ where: { id: reservationId } });
+        if (!existing || existing.businessProfileId !== profile.id)
+            return res.status(404).json({ success: false, message: 'Reservation not found.' });
+        if (!['CONFIRMED', 'CHECKED_IN'].includes(existing.status))
+            return res.status(409).json({ success: false, message: 'Can only no-show a CONFIRMED or CHECKED_IN reservation.' });
+
+        const updated = await prisma.reservation.update({
+            where: { id: reservationId },
+            data:  { status: 'NO_SHOW' },
+        });
+        return res.status(200).json({ success: true, reservation: updated });
+    } catch (err) {
+        return res.status(500).json({ success: false, message: err.message });
+    }
+};
+
 exports.checkOutReservation = async (req, res) => {
     const prisma = req.app.get('prisma');
     try {
