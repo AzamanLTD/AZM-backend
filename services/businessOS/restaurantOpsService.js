@@ -235,18 +235,22 @@ class RestaurantOpsService {
             include: {
                 items: true,
                 customer: { select: { username: true } },
+                table: { select: { label: true } },
             },
-            orderBy: { tableNumber: 'asc' },
+            orderBy: { openedAt: 'asc' },
         });
+
+        // Sort by table label if available
+        tabs.sort((a, b) => (a.table?.label || 'ZZZ').localeCompare(b.table?.label || 'ZZZ'));
 
         return tabs.map(tab => ({
             id: tab.id,
-            tableNumber: tab.tableNumber,
+            tableNumber: tab.table?.label || '—',
             status: tab.status,
             customerName: tab.customer?.username || 'Walk-in',
-            serverName: tab.serverName,
+            serverName: null, // DineInTab has no serverName field
             itemCount: tab.items.length,
-            totalAmount: tab.items.reduce((s, i) => s + parseFloat(i.price) * i.quantity, 0),
+            totalAmount: tab.items.reduce((s, i) => s + parseFloat(i.unitPriceUsdc) * i.quantity, 0),
             openedAt: tab.openedAt,
             durationMinutes: Math.round((new Date() - new Date(tab.openedAt)) / (1000 * 60)),
         }));

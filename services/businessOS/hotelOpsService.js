@@ -275,31 +275,31 @@ class HotelOpsService {
         nextDay.setDate(nextDay.getDate() + 1);
 
         const [arrivals, departures, inHouse, available] = await Promise.all([
-            // Arrivals: reservations checking in today
+            // Arrivals: reservations starting today (status CONFIRMED or PENDING)
             this.prisma.reservation.findMany({
                 where: {
                     businessProfileId,
                     status: { in: ['CONFIRMED', 'PENDING'] },
-                    checkInDate: { gte: targetDate, lt: nextDay },
+                    startDatetime: { gte: targetDate, lt: nextDay },
                 },
                 include: {
-                    room: { select: { roomNumber: true, roomType: true } },
+                    serviceItem: { select: { name: true } },
                     customer: { select: { username: true, email: true } },
                 },
-                orderBy: { checkInDate: 'asc' },
+                orderBy: { startDatetime: 'asc' },
             }),
-            // Departures: reservations checking out today
+            // Departures: reservations ending today (status CHECKED_IN)
             this.prisma.reservation.findMany({
                 where: {
                     businessProfileId,
                     status: 'CHECKED_IN',
-                    checkOutDate: { gte: targetDate, lt: nextDay },
+                    endDatetime: { gte: targetDate, lt: nextDay },
                 },
                 include: {
-                    room: { select: { roomNumber: true, roomType: true } },
+                    serviceItem: { select: { name: true } },
                     customer: { select: { username: true, email: true } },
                 },
-                orderBy: { checkOutDate: 'asc' },
+                orderBy: { endDatetime: 'asc' },
             }),
             // In-house: currently checked-in guests
             this.prisma.reservation.findMany({
@@ -308,10 +308,10 @@ class HotelOpsService {
                     status: 'CHECKED_IN',
                 },
                 include: {
-                    room: { select: { roomNumber: true, roomType: true } },
+                    serviceItem: { select: { name: true } },
                     customer: { select: { username: true, email: true } },
                 },
-                orderBy: { checkInDate: 'asc' },
+                orderBy: { startDatetime: 'asc' },
             }),
             // Available rooms
             this.prisma.hotelRoom.count({
