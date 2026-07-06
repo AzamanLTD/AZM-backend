@@ -26,6 +26,7 @@ const {
     rotateRefreshToken,
     revokeRefreshToken,
 } = require('../services/authTokenService');
+const { recordDailyLogin } = require('../services/loginStreakService');
 
 exports.refresh = async (req, res) => {
     const prisma = req.app.get('prisma');
@@ -50,6 +51,24 @@ exports.refresh = async (req, res) => {
                 message: 'Refresh token is invalid, expired, or revoked. Please log in again.',
                 code: 'REFRESH_INVALID',
             });
+        }
+
+        // BUGFIX (2026-07-06): /refresh is what silently fires on almost
+        // every app re-open once a user has a valid session -- it never
+        // recorded the daily login streak at all before this, so the streak
+        // was effectively frozen at day 1 for anyone who doesn't explicitly
+        // log out and back in. See services/loginStreakService.js header.
+        // Best-effort: a streak-recording hiccup must never fail the token
+        // refresh itself, which is on the hot path for every authenticated
+        // request cycle. Awaited (unlike the AZM reward push inside, which
+        // stays fire-and-forget) so the streak write is guaranteed to have
+        // committed by the time this response returns -- it's a single fast
+        // UPDATE on the common "same calendar day" path it usually no-ops
+        // entirely, so this doesn't add meaningful latency to /refresh.
+        try {
+            await recordDailyLogin(prisma, result.user, req.app.get('azmRewardService'));
+        } catch (err) {
+            console.error('[refresh] login streak record error:', err.message);
         }
 
         return res.status(200).json({

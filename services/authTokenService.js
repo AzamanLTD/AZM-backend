@@ -160,6 +160,11 @@ async function rotateRefreshToken(prisma, inboundRefreshToken, meta = {}) {
                     tokenVersion: true,
                     isDeleted: true,
                     banStatus: true,
+                    // Added 2026-07-06 so refreshController.refresh() can
+                    // feed loginStreakService.recordDailyLogin() -- see
+                    // that file's header for why /refresh needs this too.
+                    loginStreak: true,
+                    lastLoginAt: true,
                 },
             },
         },

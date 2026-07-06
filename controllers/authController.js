@@ -377,50 +377,18 @@ exports.login = async (req, res) => {
         }
 
         // ── Track login streak ────────────────────────────────────────────
-        // BUGFIX (2026-07-06): this used to diff `now - lastLogin` as a rolling
-        // 24h window (`Math.floor(ms / 86400000)`). That silently broke the
-        // streak for anyone who logs in even a little earlier each day than the
-        // day before — e.g. 8:00am Monday then 7:30am Tuesday is only 23.5h
-        // apart, floors to 0, and the code reads that as "same day, keep streak
-        // as is" even though it's a brand new calendar day. Over time that
-        // makes daily streak credit understated or stuck, since it's real-world
-        // easy to nudge your login time earlier and never trip the >=24h mark.
-        // Fixed to compare CALENDAR dates (midnight-to-midnight, UTC) instead
-        // of raw elapsed milliseconds — this also matches the calendar-day
-        // convention _todayKey() already uses for the daily-credit dedup key
-        // in azmRewardService, so "streak day" and "dedup day" now agree.
-        const now = new Date();
-        let loginStreak = user.loginStreak || 0;
-        if (user.lastLoginAt) {
-            const lastLogin = new Date(user.lastLoginAt);
-            const daysSinceLastLogin = _daysBetweenCalendarDates(lastLogin, now);
-            if (daysSinceLastLogin === 1) {
-                loginStreak += 1; // Consecutive calendar day
-            } else if (daysSinceLastLogin > 1) {
-                loginStreak = 1; // Streak broken, restart
-            }
-            // If daysSinceLastLogin === 0, same calendar day login — keep streak as is
-        } else {
-            loginStreak = 1; // First login
-        }
-
-        await prisma.user.update({
-            where: { id: user.id },
-            data: { lastLoginAt: now, loginStreak }
-        });
-
-        // ── Phase E1: Award AZM for login streak (fire-and-forget) ────────
-        const previousStreak = user.loginStreak || 0;
-        if (loginStreak > previousStreak) {
-            // Streak increased — award AZM asynchronously
-            const azmRewardService = req.app.get('azmRewardService');
-            if (azmRewardService) {
-                setImmediate(() => {
-                    azmRewardService.rewardLoginStreak(user.id, loginStreak)
-                        .catch(err => console.error('[auth.login] AZM login streak reward error:', err.message));
-                });
-            }
-        }
+        // Calendar-day streak logic (BUGFIX 2026-07-06: compares CALENDAR
+        // dates, not a rolling 24h window — see login-streak-daycalc.test.js)
+        // now lives in services/loginStreakService.js, SHARED with
+        // refreshController.refresh(). That second wiring is the fix for the
+        // "daily logins aren't recording" report: refresh-token rotation
+        // silently keeps most users logged in without ever hitting this
+        // /login endpoint again, so the streak was frozen at day 1 for any
+        // normal "just reopen the app" flow until that call site also
+        // recorded the day. See loginStreakService.js header for full detail.
+        const { recordDailyLogin } = require('../services/loginStreakService');
+        const azmRewardService = req.app.get('azmRewardService');
+        const loginStreak = await recordDailyLogin(prisma, user, azmRewardService);
 
         // Re-fetch with the freshly bumped tokenVersion (it can stay stable here
         // — login does not bump it — but the read-back also picks up any pending
