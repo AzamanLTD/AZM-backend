@@ -56,4 +56,22 @@ jobs:
         # --forceExit: __tests__/auth.test.js boots the Express app (supertest),
         #   which holds its own Prisma client + pg pool open; force a clean exit so
         #   CI doesn't hang waiting on those handles.
-        run: npm test -- --runInBand --forceExit
+        #
+        # Retry-once: a shared CI Postgres container can occasionally be slow
+        # enough to blow a DB-hook's timeout even with generous limits (seen on
+        # cc5cc7c — 1/255 tests timed out on a TRUNCATE hook, root cause was a
+        # loaded runner, not a code regression; every subsequent local run of the
+        # same commit was 255/255 green). Rather than requiring a human to notice
+        # a flake and manually re-run the workflow, retry the whole suite once
+        # automatically. A REAL failure reproduces on the retry and still fails
+        # the job — this only absorbs one-off infra flakiness.
+        run: |
+          set +e
+          npm test -- --runInBand --forceExit
+          code=$?
+          if [ $code -ne 0 ]; then
+            echo "::warning::Test suite failed on first attempt — retrying once in case of CI-environment flakiness (e.g. a slow shared DB container)."
+            npm test -- --runInBand --forceExit
+            code=$?
+          fi
+          exit $code
