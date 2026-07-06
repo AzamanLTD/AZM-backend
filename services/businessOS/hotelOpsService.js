@@ -283,7 +283,6 @@ class HotelOpsService {
                     startDatetime: { gte: targetDate, lt: nextDay },
                 },
                 include: {
-                    serviceItem: { select: { name: true } },
                     customer: { select: { username: true, email: true } },
                 },
                 orderBy: { startDatetime: 'asc' },
@@ -296,7 +295,6 @@ class HotelOpsService {
                     endDatetime: { gte: targetDate, lt: nextDay },
                 },
                 include: {
-                    serviceItem: { select: { name: true } },
                     customer: { select: { username: true, email: true } },
                 },
                 orderBy: { endDatetime: 'asc' },
@@ -308,7 +306,6 @@ class HotelOpsService {
                     status: 'CHECKED_IN',
                 },
                 include: {
-                    serviceItem: { select: { name: true } },
                     customer: { select: { username: true, email: true } },
                 },
                 orderBy: { startDatetime: 'asc' },
@@ -319,15 +316,27 @@ class HotelOpsService {
             }),
         ]);
 
+        // Enrich with product names (serviceItemId → BusinessProduct.name)
+        const allReservations = [...arrivals, ...departures, ...inHouse];
+        const productIds = [...new Set(allReservations.map(r => r.serviceItemId).filter(Boolean))];
+        const products = productIds.length > 0
+            ? await this.prisma.businessProduct.findMany({ where: { id: { in: productIds } }, select: { id: true, name: true } })
+            : [];
+        const productMap = Object.fromEntries(products.map(p => [p.id, p.name]));
+        const enrich = (list) => list.map(r => ({
+            ...r,
+            room: r.serviceItemId ? { roomNumber: productMap[r.serviceItemId] || '—', roomType: '—' } : null,
+        }));
+
         return {
             date: targetDate,
             arrivals: arrivals.length,
             departures: departures.length,
             inHouse: inHouse.length,
             availableRooms: available,
-            arrivalList: arrivals,
-            departureList: departures,
-            inHouseList: inHouse,
+            arrivalList: enrich(arrivals),
+            departureList: enrich(departures),
+            inHouseList: enrich(inHouse),
         };
     }
 }
