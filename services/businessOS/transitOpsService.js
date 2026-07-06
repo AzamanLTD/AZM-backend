@@ -10,6 +10,21 @@ class TransitOpsService {
         this.prisma = prisma;
     }
 
+    // ═══ FLEET MANAGEMENT ═════════════════════════════════════════════════════
+
+    async createVehicle({ businessProfileId, type, make, model, year, color, licensePlate, capacity, imageUrl, driverName, driverPhone, driverPhotoUrl }) {
+        return this.prisma.transitVehicle.create({
+            data: {
+                businessProfileId,
+                type: type || 'CAR',
+                make, model, year, color, licensePlate,
+                capacity: capacity || 4,
+                imageUrl, driverName, driverPhone, driverPhotoUrl,
+                isActive: true,
+            },
+        });
+    }
+
     // ═══ DRIVER ROSTERING ═════════════════════════════════════════════════════
 
     async assignDriver({ businessProfileId, employeeId, tripId, vehicleId, assignmentDate, role = 'DRIVER', notes }) {

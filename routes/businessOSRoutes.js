@@ -607,6 +607,13 @@ router.get('/transit/fleet', wrap(async (req, res) => {
     res.json({ success: true, fleet });
 }));
 
+router.post('/transit/fleet', wrap(async (req, res) => {
+    const svc = getServices(req);
+    const bpId = await getBusinessProfileId(req);
+    const vehicle = await svc.transitOpsService.createVehicle({ ...req.body, businessProfileId: bpId });
+    res.status(201).json({ success: true, vehicle });
+}));
+
 router.get('/transit/fleet/maintenance', wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
