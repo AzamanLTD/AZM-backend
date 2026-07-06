@@ -285,9 +285,7 @@ class RestaurantOpsService {
             where: { businessProfileId, isAvailable: false },
         });
     }
-}
 
-module.exports = { RestaurantOpsService 
     async updateTableStatus(tableId, businessProfileId, status) {
         const valid = ['AVAILABLE', 'OCCUPIED', 'RESERVED', 'DIRTY', 'CLEANING'];
         if (!valid.includes(status)) {
@@ -298,6 +296,7 @@ module.exports = { RestaurantOpsService
             data: { status },
         });
     }
+}
 
-};
+module.exports = { RestaurantOpsService };
 
