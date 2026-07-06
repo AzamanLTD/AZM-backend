@@ -378,7 +378,11 @@ class AzmRewardService {
         const [user, bySource] = await Promise.all([
             this.prisma.user.findUnique({
                 where: { id: userId },
-                select: { azmBalance: true }
+                // loginStreak/lastLoginAt added 2026-07-06 so the AZM Rewards
+                // page can finally surface the streak the backend has been
+                // tracking correctly since the /refresh streak-recording fix
+                // -- previously nothing on this response exposed it at all.
+                select: { azmBalance: true, loginStreak: true, lastLoginAt: true }
             }),
             this.prisma.azmRewardLog.groupBy({
                 by: ['source'],
@@ -400,7 +404,70 @@ class AzmRewardService {
         return {
             totalEarned,
             currentBalance: user?.azmBalance || 0,
-            bySource: sourceBreakdown
+            bySource: sourceBreakdown,
+            loginStreak: user?.loginStreak || 0,
+            lastLoginAt: user?.lastLoginAt || null
+        };
+    }
+
+    // =========================================================================
+    // FRIENDS LEADERBOARD (2026-07-06)
+    //
+    // Ranks the caller + their ACCEPTED friends by total AZM ever earned
+    // (AzmRewardLog sum, not live azmBalance -- balance would under-count
+    // anyone who's spent AZM on fee discounts / ad boosts / card skins, which
+    // would make "leaderboard rank" and "spend" perversely work against each
+    // other). Reuses the exact aggregation already proven in
+    // getRewardSummary() rather than introducing a second AZM total concept.
+    // =========================================================================
+    async getFriendsLeaderboard(userId, limit = 20) {
+        const friendships = await this.prisma.friendship.findMany({
+            where: {
+                status: 'ACCEPTED',
+                OR: [{ requesterId: userId }, { addresseeId: userId }]
+            },
+            select: { requesterId: true, addresseeId: true }
+        });
+
+        const friendIds = friendships.map((f) =>
+            f.requesterId === userId ? f.addresseeId : f.requesterId
+        );
+        const memberIds = [...new Set([userId, ...friendIds])];
+
+        const [members, totals] = await Promise.all([
+            this.prisma.user.findMany({
+                where: { id: { in: memberIds } },
+                select: { id: true, username: true, profilePictureUrl: true }
+            }),
+            this.prisma.azmRewardLog.groupBy({
+                by: ['userId'],
+                where: { userId: { in: memberIds } },
+                _sum: { amount: true }
+            })
+        ]);
+
+        // Prisma Decimal fields don't come back as plain JS numbers -- coerce
+        // now so callers (and JSON responses) get real numbers, not Decimal.js
+        // wrapper objects that serialize/compare unpredictably.
+        const totalByUserId = new Map(totals.map((t) => [t.userId, Number(t._sum.amount) || 0]));
+
+        const ranked = members
+            .map((m) => ({
+                userId: m.id,
+                username: m.username,
+                profilePictureUrl: m.profilePictureUrl,
+                totalEarned: totalByUserId.get(m.id) || 0,
+                isMe: m.id === userId
+            }))
+            .sort((a, b) => b.totalEarned - a.totalEarned)
+            .map((entry, idx) => ({ ...entry, rank: idx + 1 }));
+
+        const me = ranked.find((r) => r.isMe) || null;
+
+        return {
+            leaderboard: ranked.slice(0, limit),
+            myRank: me ? me.rank : null,
+            totalMembers: ranked.length
         };
     }
 

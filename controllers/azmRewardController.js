@@ -84,6 +84,30 @@ exports.getSummary = async (req, res) => {
 };
 
 // =============================================================================
+// GET /api/azm/friends-leaderboard
+// Ranks the caller + their ACCEPTED friends by total AZM earned.
+// Query params: ?limit=20 (max 50)
+// =============================================================================
+exports.getFriendsLeaderboard = async (req, res) => {
+    try {
+        const azmRewardService = req.app.get('azmRewardService');
+        if (!azmRewardService) {
+            return res.status(503).json({ success: false, message: 'AZM service unavailable.' });
+        }
+
+        const userId = req.user.id;
+        const limit = req.query.limit ? Math.min(parseInt(req.query.limit, 10) || 20, 50) : 20;
+
+        const result = await azmRewardService.getFriendsLeaderboard(userId, limit);
+
+        return res.status(200).json({ success: true, data: result });
+    } catch (error) {
+        console.error('[azmReward.getFriendsLeaderboard] Error:', error.message);
+        return res.status(500).json({ success: false, message: 'Failed to fetch friends leaderboard.' });
+    }
+};
+
+// =============================================================================
 // GET /api/azm/rates
 // Public: returns current AZM earn rates (no auth required for discovery)
 // =============================================================================

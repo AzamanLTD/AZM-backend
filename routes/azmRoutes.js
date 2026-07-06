@@ -28,6 +28,7 @@ router.get('/rates', azmRewardController.getRates);
 // Authenticated endpoints
 router.get('/history', protect, azmRewardController.getHistory);
 router.get('/summary', protect, azmRewardController.getSummary);
+router.get('/friends-leaderboard', protect, azmRewardController.getFriendsLeaderboard);
 
 // ── SPEND (Phase E2) ─────────────────────────────────────────────────────────
 
