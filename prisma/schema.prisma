@@ -2910,6 +2910,7 @@ model TransitBooking {
   noShowPenaltyUsdc Decimal?             @db.Decimal(20, 8)
   penaltyAmountUsdc Decimal?             @db.Decimal(20, 8)
   penaltyChargedAt  DateTime?
+  reminderSentAt    DateTime? // set by workers/transitReminderWorker.js once the pre-departure push is sent
   ticketId          String?              @unique
   ticket            Ticket?              @relation(fields: [ticketId], references: [id])
   tripId            String?

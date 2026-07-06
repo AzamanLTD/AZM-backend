@@ -100,7 +100,3 @@ const sweepTransitReminders = async (prisma) => {
 };
 
 module.exports = { sweepTransitReminders, REMINDER_WINDOW_MINS };
-
-NOTE: Add reminderSentAt field to TransitBooking model in schema.prisma:
-// Add to TransitBooking model:
-  reminderSentAt DateTime?
