@@ -19,7 +19,7 @@ exports.registerBusiness = async (req, res) => {
         const userId = req.user.id;
         const {
             businessName, category, description, website,
-            phoneNumber, contactEmail, address, country, logoUrl
+            phoneNumber, contactEmail, address, country, logoUrl, coverPhotoUrl
         } = req.body;
 
         const cleanName = String(businessName || '').trim();
@@ -40,7 +40,7 @@ exports.registerBusiness = async (req, res) => {
             userId,
             businessName: cleanName,
             category: category || 'OTHER',
-            description, website, logoUrl,
+            description, website, logoUrl, coverPhotoUrl,
             phoneNumber, contactEmail, address, country
         });
 

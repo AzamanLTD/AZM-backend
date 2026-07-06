@@ -2326,6 +2326,7 @@ model BusinessProfile {
   description     String?          @db.VarChar(500)
   website         String?          @db.VarChar(255)
   logoUrl         String?
+  coverPhotoUrl    String?  @db.VarChar(500) // Marketplace UI: business cover photo
 
   // Verification
   isVerified Boolean   @default(false)

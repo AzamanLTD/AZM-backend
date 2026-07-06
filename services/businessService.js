@@ -17,7 +17,7 @@ const VALID_CATEGORIES = new Set([
 // Fields a business owner may self-edit after registration.
 const UPDATABLE_FIELDS = new Set([
     'businessName', 'description', 'website', 'logoUrl', 'phoneNumber',
-    'contactEmail', 'address', 'country', 'category'
+    'contactEmail', 'address', 'country', 'category', 'coverPhotoUrl'
 ]);
 
 /** Generate a BIZ-XXXXXXXXX id (literal prefix + 9 digits). */
@@ -28,7 +28,7 @@ const _generateBizId = () =>
 // 1. REGISTER BUSINESS — create the BusinessProfile (no role change).
 // =============================================================================
 const registerBusiness = async (prisma, {
-    userId, businessName, category, description, website, logoUrl,
+    userId, businessName, category, description, website, logoUrl, coverPhotoUrl,
     phoneNumber, contactEmail, address, country
 }) => {
     if (!userId) throw new Error('userId is required.');
@@ -65,6 +65,7 @@ const registerBusiness = async (prisma, {
             description: description ? String(description).slice(0, 500) : null,
             website: website ? String(website).slice(0, 255) : null,
             logoUrl: logoUrl || null,
+            coverPhotoUrl: coverPhotoUrl || null,
             phoneNumber: phoneNumber ? String(phoneNumber).slice(0, 20) : null,
             contactEmail: contactEmail ? String(contactEmail).slice(0, 100) : null,
             address: address ? String(address).slice(0, 255) : null,
