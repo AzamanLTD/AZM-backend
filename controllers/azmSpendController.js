@@ -10,7 +10,7 @@
 // GET  /api/azm/spend/history       — Paginated spend history
 // =============================================================================
 
-const { AZM_SPEND_SOURCES, FEE_DISCOUNT_TIERS, AD_BOOST_OPTIONS } = require('../services/azmSpendService');
+const { AZM_SPEND_SOURCES, FEE_DISCOUNT_TIERS, AD_BOOST_OPTIONS, CARD_SKIN_OPTIONS } = require('../services/azmSpendService');
 
 // =============================================================================
 // GET /api/azm/spend/options
@@ -204,5 +204,91 @@ exports.getSpendHistory = async (req, res) => {
     } catch (error) {
         console.error('[azmSpend.getSpendHistory] Error:', error.message);
         return res.status(500).json({ success: false, message: 'Failed to fetch AZM spend history.' });
+    }
+};
+
+
+// =============================================================================
+// GET /api/azm/spend/card-skins
+// Returns the card skin catalog with per-user ownership/equipped/affordability.
+// =============================================================================
+exports.getCardSkinCatalog = async (req, res) => {
+    try {
+        const azmSpendService = req.app.get('azmSpendService');
+        if (!azmSpendService) {
+            return res.status(503).json({ success: false, message: 'AZM spend service unavailable.' });
+        }
+
+        const data = await azmSpendService.getCardSkinCatalog(req.user.id);
+        return res.status(200).json({ success: true, data });
+    } catch (error) {
+        console.error('[azmSpend.getCardSkinCatalog] Error:', error.message);
+        return res.status(500).json({ success: false, message: 'Failed to fetch card skin catalog.' });
+    }
+};
+
+// =============================================================================
+// POST /api/azm/spend/card-skin/purchase
+// Body: { skinId: 'gold' | 'midnight' | 'emerald' | 'sunset' }
+// =============================================================================
+exports.purchaseCardSkin = async (req, res) => {
+    try {
+        const azmSpendService = req.app.get('azmSpendService');
+        if (!azmSpendService) {
+            return res.status(503).json({ success: false, message: 'AZM spend service unavailable.' });
+        }
+
+        const { skinId } = req.body;
+        if (!skinId || typeof skinId !== 'string') {
+            return res.status(400).json({
+                success: false,
+                message: 'skinId is required. Valid options: ' + CARD_SKIN_OPTIONS.map(s => s.id).join(', ')
+            });
+        }
+
+        const result = await azmSpendService.purchaseCardSkin(req.user.id, skinId);
+
+        return res.status(200).json({
+            success: true,
+            message: result.purchased ? 'Card skin purchased!' : 'You already own this skin.',
+            data: result
+        });
+    } catch (error) {
+        console.error('[azmSpend.purchaseCardSkin] Error:', error.message);
+
+        if (error.message.includes('Insufficient AZM')) {
+            return res.status(400).json({ success: false, code: 'INSUFFICIENT_AZM', message: error.message });
+        }
+        return res.status(400).json({ success: false, message: error.message });
+    }
+};
+
+// =============================================================================
+// POST /api/azm/spend/card-skin/equip
+// Body: { skinId: 'classic' | 'gold' | 'midnight' | 'emerald' | 'sunset' }
+// Free — just switches which owned skin is active on future transfers.
+// =============================================================================
+exports.equipCardSkin = async (req, res) => {
+    try {
+        const azmSpendService = req.app.get('azmSpendService');
+        if (!azmSpendService) {
+            return res.status(503).json({ success: false, message: 'AZM spend service unavailable.' });
+        }
+
+        const { skinId } = req.body;
+        if (!skinId || typeof skinId !== 'string') {
+            return res.status(400).json({ success: false, message: 'skinId is required.' });
+        }
+
+        const result = await azmSpendService.equipCardSkin(req.user.id, skinId);
+
+        return res.status(200).json({
+            success: true,
+            message: `Equipped "${skinId}" card skin.`,
+            data: result
+        });
+    } catch (error) {
+        console.error('[azmSpend.equipCardSkin] Error:', error.message);
+        return res.status(400).json({ success: false, message: error.message });
     }
 };

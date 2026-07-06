@@ -36,4 +36,9 @@ router.post('/spend/fee-discount', protect, azmSpendController.applyFeeDiscount)
 router.post('/spend/ad-boost', protect, azmSpendController.boostAd);
 router.get('/spend/history', protect, azmSpendController.getSpendHistory);
 
+// ── CARD SKINS (2026-07-06) ──────────────────────────────────────────────────
+router.get('/spend/card-skins', protect, azmSpendController.getCardSkinCatalog);
+router.post('/spend/card-skin/purchase', protect, azmSpendController.purchaseCardSkin);
+router.post('/spend/card-skin/equip', protect, azmSpendController.equipCardSkin);
+
 module.exports = router;

@@ -625,6 +625,12 @@ model User {
   // database ledger. Phase D-2 incorrectly dropped this column; Phase D-3
   // restores it as an independent loyalty ledger.
   azmBalance Decimal @default(0.0) @db.Decimal(20, 8) // AZM loyalty points (independent of USDC)
+  // Card skins (2026-07-06): purchasable cosmetic skins for the peer-transfer
+  // chat card. 'classic' is always available (free, not in ownedCardSkins).
+  // equippedCardSkin must be 'classic' or present in ownedCardSkins — enforced
+  // in azmSpendService.equipCardSkin, not at the DB level.
+  equippedCardSkin String   @default("classic") @db.VarChar(20)
+  ownedCardSkins   String[] @default([])
 
   // --- TATUM INTEGRATION ---
   tatumPolygonAddress String?
@@ -2327,6 +2333,11 @@ model BusinessProfile {
   website         String?          @db.VarChar(255)
   logoUrl         String?
   coverPhotoUrl    String?  @db.VarChar(500) // Marketplace UI: business cover photo
+  // Ad appearance customization (2026-07-06): lets a business pick its own
+  // marketplace card tint from the business portal instead of always
+  // inheriting the category-default tint. Hex string e.g. "#FFAA00", null
+  // falls back to category tint (existing behavior in collapsible_business_bar.dart).
+  adAccentColor    String?  @db.VarChar(7)
 
   // Verification
   isVerified Boolean   @default(false)

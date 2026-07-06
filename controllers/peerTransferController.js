@@ -114,7 +114,7 @@ exports.sendFunds = async (req, res) => {
         const result = await prisma.$transaction(async (tx) => {
             const sender = await tx.user.findUnique({
                 where: { id: senderId },
-                select: { availableBalance: true, username: true }
+                select: { availableBalance: true, username: true, equippedCardSkin: true }
             });
 
             if (!sender) throw new Error('Sender not found.');
@@ -189,7 +189,8 @@ exports.sendFunds = async (req, res) => {
                         amount: transferAmount,
                         currency: 'USDC',
                         reference: reference || null,
-                        status: 'COMPLETED'
+                        status: 'COMPLETED',
+                        cardSkin: sender.equippedCardSkin
                     }
                 },
                 include: {
@@ -336,7 +337,7 @@ exports.requestFunds = async (req, res) => {
 
         const requesterUser = await prisma.user.findUnique({
             where: { id: requesterId },
-            select: { username: true }
+            select: { username: true, equippedCardSkin: true }
         });
 
         // Create the pending transfer request
@@ -368,7 +369,8 @@ exports.requestFunds = async (req, res) => {
                     currency: 'USDC',
                     reference: reference || null,
                     status: 'PENDING',
-                    requestedBy: requesterId
+                    requestedBy: requesterId,
+                    cardSkin: requesterUser.equippedCardSkin
                 }
             },
             include: {
@@ -524,7 +526,7 @@ exports.fulfillTransferRequest = async (req, res) => {
 
             const payer = await tx.user.findUnique({
                 where: { id: payerId },
-                select: { availableBalance: true, username: true }
+                select: { availableBalance: true, username: true, equippedCardSkin: true }
             });
 
             if (!payer) throw new Error('User not found.');
@@ -590,7 +592,8 @@ exports.fulfillTransferRequest = async (req, res) => {
                         currency: 'USDC',
                         reference: transfer.reference || null,
                         status: 'COMPLETED',
-                        fulfilledBy: payerId
+                        fulfilledBy: payerId,
+                        cardSkin: payer.equippedCardSkin
                     }
                 },
                 include: {
@@ -760,7 +763,7 @@ exports.declineTransferRequest = async (req, res) => {
         // Create decline message in chat
         const declineUser = await prisma.user.findUnique({
             where: { id: userId },
-            select: { username: true }
+            select: { username: true, equippedCardSkin: true }
         });
 
         const chatMessage = await prisma.directMessage.create({
@@ -775,7 +778,8 @@ exports.declineTransferRequest = async (req, res) => {
                     amount: transfer.amount,
                     currency: 'USDC',
                     reference: transfer.reference || null,
-                    status: 'DECLINED'
+                    status: 'DECLINED',
+                    cardSkin: declineUser.equippedCardSkin
                 }
             },
             include: {

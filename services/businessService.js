@@ -17,8 +17,14 @@ const VALID_CATEGORIES = new Set([
 // Fields a business owner may self-edit after registration.
 const UPDATABLE_FIELDS = new Set([
     'businessName', 'description', 'website', 'logoUrl', 'phoneNumber',
-    'contactEmail', 'address', 'country', 'category', 'coverPhotoUrl'
+    'contactEmail', 'address', 'country', 'category', 'coverPhotoUrl',
+    'adAccentColor'
 ]);
+
+// Ad appearance customization (2026-07-06): must be a 6-digit hex color
+// with leading '#', or null/empty string to clear the override and fall
+// back to the category-default tint.
+const HEX_COLOR_RE = /^#[0-9A-Fa-f]{6}$/;
 
 /** Generate a BIZ-XXXXXXXXX id (literal prefix + 9 digits). */
 const _generateBizId = () =>
@@ -190,6 +196,17 @@ const updateBusinessProfile = async (prisma, { userId, updates }) => {
                 throw new Error('businessName must be 2–100 chars.');
             }
             data.businessName = clean;
+            continue;
+        }
+        if (key === 'adAccentColor') {
+            if (value === null || value === '') {
+                data.adAccentColor = null; // explicit clear -> revert to category tint
+                continue;
+            }
+            if (!HEX_COLOR_RE.test(value)) {
+                throw new Error('adAccentColor must be a 6-digit hex color like "#FFAA00".');
+            }
+            data.adAccentColor = value;
             continue;
         }
         data[key] = value;

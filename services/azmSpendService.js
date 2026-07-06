@@ -31,6 +31,13 @@ const AZM_COSTS = {
     AD_BOOST_24H:      15.0,   // 24-hour featured placement
     AD_BOOST_72H:      35.0,   // 72-hour featured placement
     AD_BOOST_7D:       80.0,   // 7-day featured placement
+
+    // Card skins (2026-07-06): cosmetic skins for the peer-transfer chat card.
+    // 'classic' is free/default and NOT in this map (never purchasable, always owned).
+    CARD_SKIN_GOLD:     20.0,
+    CARD_SKIN_MIDNIGHT: 20.0,
+    CARD_SKIN_EMERALD:  30.0,
+    CARD_SKIN_SUNSET:   30.0,
 };
 
 // ── Spend source keys ────────────────────────────────────────────────────────
@@ -42,6 +49,8 @@ const AZM_SPEND_SOURCES = {
     // get debited at settlement. This avoids stuck refund logic and
     // keeps the auction blind without an escrow column.
     AD_AUCTION_BID: 'AD_AUCTION_BID',
+    // Card skins (2026-07-06)
+    CARD_SKIN: 'CARD_SKIN',
 };
 
 // ── Fee discount tiers ───────────────────────────────────────────────────────
@@ -57,6 +66,19 @@ const AD_BOOST_OPTIONS = [
     { id: 'boost_72h', label: '3 Days',   durationMs: 72 * 60 * 60 * 1000, cost: AZM_COSTS.AD_BOOST_72H },
     { id: 'boost_7d',  label: '7 Days',   durationMs: 7 * 24 * 60 * 60 * 1000, cost: AZM_COSTS.AD_BOOST_7D },
 ];
+
+// ── Card skin catalog ────────────────────────────────────────────────────────
+// Matches the Flutter kCardSkins map (widgets/peer_transfer_card.dart).
+// 'classic' is always owned/equippable for free and is deliberately excluded
+// from this list — it is never purchased, only the default fallback.
+const CARD_SKIN_OPTIONS = [
+    { id: 'gold',     label: 'Gold',     cost: AZM_COSTS.CARD_SKIN_GOLD },
+    { id: 'midnight', label: 'Midnight', cost: AZM_COSTS.CARD_SKIN_MIDNIGHT },
+    { id: 'emerald',  label: 'Emerald',  cost: AZM_COSTS.CARD_SKIN_EMERALD },
+    { id: 'sunset',   label: 'Sunset',   cost: AZM_COSTS.CARD_SKIN_SUNSET },
+];
+const FREE_CARD_SKIN = 'classic';
+const VALID_CARD_SKIN_IDS = new Set([FREE_CARD_SKIN, ...CARD_SKIN_OPTIONS.map(s => s.id)]);
 
 class AzmSpendService {
     /**
@@ -307,6 +329,142 @@ class AzmSpendService {
     }
 
     // =========================================================================
+    // CARD SKINS — purchase & equip cosmetic peer-transfer card skins
+    // =========================================================================
+
+    /**
+     * Purchase a card skin with AZM. Idempotent — re-purchasing an already-
+     * owned skin is a no-op (no double charge) and returns immediately.
+     *
+     * @param {number} userId
+     * @param {string} skinId - one of CARD_SKIN_OPTIONS ids (not 'classic')
+     * @returns {Promise<{purchased: boolean, ownedCardSkins: string[], newBalance: number}>}
+     */
+    async purchaseCardSkin(userId, skinId) {
+        const option = CARD_SKIN_OPTIONS.find(s => s.id === skinId);
+        if (!option) throw new Error(`Invalid card skin: ${skinId}`);
+
+        const user = await this.prisma.user.findUnique({
+            where: { id: userId },
+            select: { ownedCardSkins: true, azmBalance: true }
+        });
+        if (!user) throw new Error('User not found.');
+
+        // Already owned — idempotent no-op, no double charge.
+        if (user.ownedCardSkins.includes(skinId)) {
+            return {
+                purchased: false,
+                ownedCardSkins: user.ownedCardSkins,
+                newBalance: Number(user.azmBalance)
+            };
+        }
+
+        // Atomic: debit AZM + append to ownedCardSkins in one transaction.
+        const result = await this.prisma.$transaction(async (tx) => {
+            const fresh = await tx.user.findUnique({
+                where: { id: userId },
+                select: { azmBalance: true, ownedCardSkins: true }
+            });
+            if (!fresh) throw new Error('User not found.');
+            if (fresh.ownedCardSkins.includes(skinId)) {
+                return { alreadyOwned: true, ownedCardSkins: fresh.ownedCardSkins, newBalance: fresh.azmBalance };
+            }
+            if (Number(fresh.azmBalance) < option.cost) {
+                throw new Error(
+                    `Insufficient AZM balance. Required: ${option.cost}, available: ${Number(fresh.azmBalance).toFixed(1)}`
+                );
+            }
+
+            const ownedCardSkins = [...fresh.ownedCardSkins, skinId];
+            const updatedUser = await tx.user.update({
+                where: { id: userId },
+                data: {
+                    azmBalance: { decrement: option.cost },
+                    ownedCardSkins
+                },
+                select: { azmBalance: true, ownedCardSkins: true }
+            });
+
+            await tx.azmSpendLog.create({
+                data: {
+                    userId,
+                    amount: option.cost,
+                    source: AZM_SPEND_SOURCES.CARD_SKIN,
+                    reason: `Purchased "${option.label}" card skin (-${option.cost} AZM)`,
+                    metadata: { skinId },
+                    balanceAfter: updatedUser.azmBalance
+                }
+            });
+
+            return { alreadyOwned: false, ownedCardSkins: updatedUser.ownedCardSkins, newBalance: updatedUser.azmBalance };
+        });
+
+        if (result.alreadyOwned) {
+            return { purchased: false, ownedCardSkins: result.ownedCardSkins, newBalance: Number(result.newBalance) };
+        }
+
+        this._emitSpendUpdate(userId, result.newBalance, option.cost, AZM_SPEND_SOURCES.CARD_SKIN, `Purchased "${option.label}" card skin`);
+
+        return { purchased: true, ownedCardSkins: result.ownedCardSkins, newBalance: Number(result.newBalance) };
+    }
+
+    /**
+     * Equip an owned card skin (or 'classic', always allowed). Free — no AZM cost.
+     * Throws if the user doesn't own the requested skin.
+     *
+     * @param {number} userId
+     * @param {string} skinId
+     * @returns {Promise<{equippedCardSkin: string}>}
+     */
+    async equipCardSkin(userId, skinId) {
+        if (!VALID_CARD_SKIN_IDS.has(skinId)) {
+            throw new Error(`Invalid card skin: ${skinId}`);
+        }
+
+        if (skinId !== FREE_CARD_SKIN) {
+            const user = await this.prisma.user.findUnique({
+                where: { id: userId },
+                select: { ownedCardSkins: true }
+            });
+            if (!user) throw new Error('User not found.');
+            if (!user.ownedCardSkins.includes(skinId)) {
+                throw new Error('You do not own this card skin yet.');
+            }
+        }
+
+        const updated = await this.prisma.user.update({
+            where: { id: userId },
+            data: { equippedCardSkin: skinId },
+            select: { equippedCardSkin: true }
+        });
+
+        return { equippedCardSkin: updated.equippedCardSkin };
+    }
+
+    /**
+     * Get the card skin catalog with per-user ownership/equipped state.
+     * @param {number} userId
+     */
+    async getCardSkinCatalog(userId) {
+        const user = await this.prisma.user.findUnique({
+            where: { id: userId },
+            select: { ownedCardSkins: true, equippedCardSkin: true, azmBalance: true }
+        });
+        if (!user) throw new Error('User not found.');
+
+        const skins = [
+            { id: FREE_CARD_SKIN, label: 'Classic', cost: 0, owned: true },
+            ...CARD_SKIN_OPTIONS.map(s => ({
+                ...s,
+                owned: user.ownedCardSkins.includes(s.id),
+                affordable: Number(user.azmBalance) >= s.cost
+            }))
+        ];
+
+        return { skins, equippedCardSkin: user.equippedCardSkin, azmBalance: Number(user.azmBalance) };
+    }
+
+    // =========================================================================
     // INTERNAL: Socket emission
     // =========================================================================
 
@@ -326,4 +484,4 @@ class AzmSpendService {
     }
 }
 
-module.exports = { AzmSpendService, AZM_COSTS, AZM_SPEND_SOURCES, FEE_DISCOUNT_TIERS, AD_BOOST_OPTIONS };
+module.exports = { AzmSpendService, AZM_COSTS, AZM_SPEND_SOURCES, FEE_DISCOUNT_TIERS, AD_BOOST_OPTIONS, CARD_SKIN_OPTIONS, VALID_CARD_SKIN_IDS, FREE_CARD_SKIN };
