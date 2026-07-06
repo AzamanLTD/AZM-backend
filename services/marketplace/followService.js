@@ -46,7 +46,18 @@ class FollowService {
         return !!record;
     }
 
-    async getFollowing(userId) {
+    // FIX (2026-07-06): the caller (businessFollowerService.getFollowing) has
+    // always passed a single `{ userId, limit, offset }` object here, but this
+    // method's signature only ever accepted a bare `userId` -- meaning the
+    // whole options object was being used AS the userId, so
+    // `where: { customerId: userId }` filtered on a stringified object and
+    // matched nothing. GET /api/follows/following was silently broken for
+    // every caller since this was written. Also added real pagination
+    // (take/skip), which never existed despite limit/offset being accepted
+    // and threaded through from the controller the whole time.
+    async getFollowing(userId, { limit, offset } = {}) {
+        const take = Math.min(Number(limit) || 50, 100);
+        const skip = Number(offset) || 0;
         const follows = await this.prisma.businessFollower.findMany({
             where: { customerId: userId },
             include: {
@@ -58,11 +69,15 @@ class FollowService {
                 },
             },
             orderBy: { createdAt: 'desc' },
+            take,
+            skip,
         });
         return follows.map(f => ({ ...f.businessProfile, followedAt: f.createdAt }));
     }
 
-    async getFollowers(businessProfileId) {
+    async getFollowers(businessProfileId, { limit, offset } = {}) {
+        const take = Math.min(Number(limit) || 50, 100);
+        const skip = Number(offset) || 0;
         const follows = await this.prisma.businessFollower.findMany({
             where: { businessProfileId },
             include: {
@@ -71,6 +86,8 @@ class FollowService {
                 },
             },
             orderBy: { createdAt: 'desc' },
+            take,
+            skip,
         });
         return follows.map(f => ({ ...f.customer, followedAt: f.createdAt }));
     }

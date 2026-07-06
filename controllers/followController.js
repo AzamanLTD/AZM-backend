@@ -1,4 +1,5 @@
 const { followBusiness, unfollowBusiness, isFollowing, getFollowers, getFollowing } = require('../services/businessFollowerService');
+const FollowService = require('../services/marketplace/followService');
 
 exports.follow = async (req, res) => {
     try {
@@ -26,7 +27,15 @@ exports.checkFollowing = async (req, res) => {
             customerId: req.user.id,
             businessProfileId: req.params.businessProfileId
         });
-        res.json({ success: true, isFollowing: following });
+        // FIX (2026-07-06): the Flutter business profile screen reads both
+        // `isFollowing` and `followerCount` from this response to render the
+        // initial follow-button state, but followerCount was never returned
+        // -- it silently defaulted to 0 on every page load until the user
+        // toggled follow/unfollow themselves (which updates it optimistically
+        // client-side only).
+        const svc = new FollowService(req.prisma);
+        const followerCount = await svc.getFollowerCount(req.params.businessProfileId);
+        res.json({ success: true, isFollowing: following, followerCount });
     } catch (err) { res.status(400).json({ success: false, message: err.message }); }
 };
 
