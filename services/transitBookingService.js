@@ -71,8 +71,18 @@ const bookSeats = async (prisma, {
         throw new Error(`Only ${trip.availableSeats} seats available, requested ${seatIds.length}.`);
     }
 
-    // 5. Calculate total fare
-    const totalFare = _round6(Number(trip.fareUsdc) * seatIds.length);
+    // 5. Calculate total fare — tier-aware. Each seat's tier (VIP/STANDARD/ECONOMY),
+    //    tagged on the seat map layout, is priced from trip.metadata.tierFares if present,
+    //    falling back to the flat trip.fareUsdc for untagged seats or trips with no tier pricing.
+    const tierFares = (trip.metadata && trip.metadata.tierFares) || {};
+    const seatByIdMap = new Map(layout.map(s => [s.seatId, s]));
+    const perSeatFare = seatIds.map(seatId => {
+        const seat = seatByIdMap.get(seatId);
+        const tier = seat && seat.tier;
+        const tierFare = tier && tierFares[tier] != null ? Number(tierFares[tier]) : null;
+        return tierFare != null ? tierFare : Number(trip.fareUsdc);
+    });
+    const totalFare = _round6(perSeatFare.reduce((sum, f) => sum + f, 0));
 
     // 6. Create the booking + seats atomically
     const bookingRef = _genRef();
@@ -146,10 +156,12 @@ const getTripSeatAvailability = async (prisma, { tripId }) => {
         select: { seatId: true }
     });
     const bookedSet = new Set(bookedSeats.map(s => s.seatId));
+    const tierFares = (trip.metadata && trip.metadata.tierFares) || {};
 
     const seats = layout.map(seat => ({
         ...seat,
-        status: bookedSet.has(seat.seatId) ? 'OCCUPIED' : 'AVAILABLE'
+        status: bookedSet.has(seat.seatId) ? 'OCCUPIED' : 'AVAILABLE',
+        fare: seat.tier && tierFares[seat.tier] != null ? Number(tierFares[seat.tier]) : Number(trip.fareUsdc),
     }));
 
     return {
@@ -159,6 +171,7 @@ const getTripSeatAvailability = async (prisma, { tripId }) => {
         totalSeats: layout.length,
         tripStatus: trip.status,
         fareUsdc: trip.fareUsdc,
+        tierFares,
     };
 };
 
