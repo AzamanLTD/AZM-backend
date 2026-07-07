@@ -4,11 +4,24 @@
 // Public-facing: GET sections + products for a business profile.
 
 // ── Owner: create section ─────────────────────────────────────────────────────
+/**
+ * Resolve which BusinessProfile a write should target.
+ * - Normal users: always their own profile (unchanged behavior/security).
+ * - ADMIN role only: may pass an explicit `businessProfileId` in the body to
+ *   manage/seed another business's catalogue (oversight/support use, same
+ *   trust tier as the existing admin suspend/KYB routes).
+ */
+async function _resolveTargetProfile(prisma, req) {
+    if (req.user.role === 'ADMIN' && req.body.businessProfileId) {
+        return prisma.businessProfile.findUnique({ where: { id: req.body.businessProfileId } });
+    }
+    return prisma.businessProfile.findUnique({ where: { userId: req.user.id } });
+}
+
 exports.createSection = async (req, res) => {
     const prisma = req.app.get('prisma');
     try {
-        const userId  = req.user.id;
-        const profile = await prisma.businessProfile.findUnique({ where: { userId } });
+        const profile = await _resolveTargetProfile(prisma, req);
         if (!profile) return res.status(404).json({ success: false, message: 'Business profile not found.' });
 
         const { name, description, displayOrder, availableFrom, availableTo, imageUrl, locationId } = req.body;

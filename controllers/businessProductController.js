@@ -24,20 +24,39 @@ async function _ownedProfile(prisma, userId) {
     });
 }
 
+/**
+ * Resolve which BusinessProfile a write should target.
+ * - Normal users: always their own profile (unchanged behavior/security).
+ * - ADMIN role only: may pass an explicit `businessProfileId` in the body to
+ *   manage/seed another business's catalogue (oversight/support use, same
+ *   trust tier as the existing admin suspend/KYB routes). Falls back to the
+ *   admin's own profile if no override is given.
+ */
+async function _resolveTargetProfile(prisma, req) {
+    if (req.user.role === 'ADMIN' && req.body.businessProfileId) {
+        const profile = await prisma.businessProfile.findUnique({
+            where: { id: req.body.businessProfileId },
+            select: { id: true, businessName: true, kybStatus: true }
+        });
+        if (!profile) throw Object.assign(new Error('businessProfileId not found.'), { status: 404 });
+        return profile;
+    }
+    return _ownedProfile(prisma, req.user.id);
+}
+
 // =============================================================================
 // 1. POST /api/business/products — create a product (owner only).
 // =============================================================================
 exports.createProduct = async (req, res) => {
     const prisma = req.app.get('prisma');
     try {
-        const userId = req.user.id;
-        const { name, description, priceUsdc, imageUrls, category } = req.body;
+        const { name, description, priceUsdc, imageUrls, category, catalogSectionId, tags, calorieCount, preparationMins } = req.body;
 
         if (!name || priceUsdc === undefined || priceUsdc === null) {
             return res.status(400).json({ success: false, message: 'name and priceUsdc are required.' });
         }
 
-        const profile = await _ownedProfile(prisma, userId);
+        const profile = await _resolveTargetProfile(prisma, req);
         if (!profile) {
             return res.status(403).json({ success: false, message: 'You do not own a business profile.' });
         }
@@ -48,12 +67,16 @@ exports.createProduct = async (req, res) => {
             description,
             priceUsdc,
             imageUrls,
-            category
+            category,
+            catalogSectionId,
+            tags,
+            calorieCount,
+            preparationMins,
         });
 
         return res.status(201).json({ success: true, product });
     } catch (err) {
-        return res.status(400).json({ success: false, message: err.message });
+        return res.status(err.status || 400).json({ success: false, message: err.message });
     }
 };
 

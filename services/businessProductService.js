@@ -91,7 +91,7 @@ const _validateFields = ({ name, description, priceUsdc, imageUrls, category }, 
 // =============================================================================
 // 1. CREATE PRODUCT
 // =============================================================================
-const createProduct = async (prisma, { businessProfileId, name, description, priceUsdc, imageUrls, category }) => {
+const createProduct = async (prisma, { businessProfileId, name, description, priceUsdc, imageUrls, category, catalogSectionId, tags, calorieCount, preparationMins }) => {
     if (!businessProfileId) throw new Error('businessProfileId is required.');
 
     const profile = await prisma.businessProfile.findUnique({
@@ -103,6 +103,13 @@ const createProduct = async (prisma, { businessProfileId, name, description, pri
     const data = _validateFields({ name, description, priceUsdc, imageUrls, category }, { partial: false });
     const slug = await _generateSlug(prisma, profile.businessName, data.name);
 
+    // Optional catalogue-section link — only wired to this business's own sections.
+    let resolvedSectionId = null;
+    if (catalogSectionId) {
+        const section = await prisma.catalogSection.findUnique({ where: { id: catalogSectionId }, select: { id: true, businessProfileId: true } });
+        if (section && section.businessProfileId === businessProfileId) resolvedSectionId = section.id;
+    }
+
     return prisma.businessProduct.create({
         data: {
             businessProfileId,
@@ -111,7 +118,11 @@ const createProduct = async (prisma, { businessProfileId, name, description, pri
             priceUsdc: data.priceUsdc,
             imageUrls: data.imageUrls ?? (Array.isArray(imageUrls) ? imageUrls : null),
             category: data.category ?? (category && VALID_CATEGORIES.has(category) ? category : null),
-            slug
+            slug,
+            catalogSectionId: resolvedSectionId,
+            tags: Array.isArray(tags) ? tags : [],
+            calorieCount: (calorieCount !== undefined && calorieCount !== null) ? parseInt(calorieCount, 10) : null,
+            preparationMins: (preparationMins !== undefined && preparationMins !== null) ? parseInt(preparationMins, 10) : null,
         }
     });
 };
