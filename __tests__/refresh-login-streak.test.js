@@ -12,6 +12,15 @@
 //
 // Hits a real Express app + database via Supertest, same pattern as
 // __tests__/auth.test.js. Skips (not fails) without TEST_DATABASE_URL.
+//
+// TIME-ANCHORING (fixed 2026-07-07): backdate lastLoginAt using UTC
+// calendar-day arithmetic (Date.UTC(...) at noon), NOT a raw millisecond
+// offset like "Date.now() - 25h". A raw offset is flaky right around UTC
+// midnight -- e.g. if the suite happens to run at 00:39 UTC, "25h ago"
+// lands on the day BEFORE yesterday (a 2-day gap), not yesterday (a 1-day
+// gap), because it crosses two midnight boundaries instead of one. Anchoring
+// to noon UTC on the actual target calendar day is immune to what wall-clock
+// time the test happens to execute at.
 // =============================================================================
 
 const hasDb = !!process.env.TEST_DATABASE_URL;
@@ -69,12 +78,16 @@ describeOrSkip('Login streak is recorded on token refresh, not just /login', () 
     });
 
     test('refreshing after the calendar day has rolled over DOES advance the streak (the actual bug)', async () => {
-        // Simulate "yesterday's last login" the same way the login-streak
-        // day-calc tests do — backdate lastLoginAt, don't fast-forward the
-        // whole DB/clock.
+        // Simulate "yesterday's last login" anchored to an actual calendar
+        // day (noon UTC yesterday), not a raw hour offset — see the
+        // TIME-ANCHORING note in the file header for why that's flaky.
+        const now = new Date();
+        const yesterdayNoonUtc = new Date(Date.UTC(
+            now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - 1, 12, 0, 0
+        ));
         await prisma.user.update({
             where: { id: userId },
-            data: { lastLoginAt: new Date(Date.now() - 25 * 60 * 60 * 1000) }, // 25h ago, safely the previous calendar day
+            data: { lastLoginAt: yesterdayNoonUtc },
         });
 
         const res = await request(app).post('/api/auth/refresh').send({ refreshToken });
@@ -87,9 +100,15 @@ describeOrSkip('Login streak is recorded on token refresh, not just /login', () 
     });
 
     test('a broken streak (2+ day gap) resets to 1 on refresh, not just on /login', async () => {
+        // Same anchoring approach — 4 calendar days back at noon UTC, immune
+        // to what wall-clock time the suite happens to run at.
+        const now = new Date();
+        const fourDaysAgoNoonUtc = new Date(Date.UTC(
+            now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() - 4, 12, 0, 0
+        ));
         await prisma.user.update({
             where: { id: userId },
-            data: { lastLoginAt: new Date(Date.now() - 4 * 24 * 60 * 60 * 1000) }, // 4 days ago
+            data: { lastLoginAt: fourDaysAgoNoonUtc },
         });
 
         const res = await request(app).post('/api/auth/refresh').send({ refreshToken });
