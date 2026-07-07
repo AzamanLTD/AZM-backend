@@ -26,10 +26,3 @@ const sweepExpiredAds = async (prisma) => {
 };
 
 module.exports = { sweepExpiredAds };
-
-ADD to server.js (after existing cron registrations):
-// Marketplace v2 workers
-const { sweepTransitReminders } = require('./workers/transitReminderWorker');
-const { sweepExpiredAds } = require('./workers/businessAdExpiryWorker');
-cron.schedule('*/15 * * * *', () => sweepTransitReminders(prisma));
-cron.schedule('*/30 * * * *', () => sweepExpiredAds(prisma));
