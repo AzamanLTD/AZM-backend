@@ -296,6 +296,98 @@ exports.createTransitTrip = async (req, res) => {
     }
 };
 
+// GET /api/marketplace/business/trips — list the CALLING business's own trips
+// (distinct from listTransitTrips above, which is the customer-facing browse
+// endpoint and requires an explicit businessProfileId query param — this one
+// scopes automatically to the authenticated business owner).
+exports.listMyTransitTrips = async (req, res) => {
+    const prisma = req.app.get('prisma');
+    try {
+        const userId = req.user.id;
+        const profile = await prisma.businessProfile.findUnique({ where: { userId } });
+        if (!profile) return res.status(404).json({ success: false, message: 'Business profile not found.' });
+
+        const { status } = req.query;
+        const where = { businessProfileId: profile.id };
+        if (status) where.status = status;
+
+        const trips = await prisma.transitTrip.findMany({
+            where,
+            orderBy: { departureAt: 'asc' },
+            take: 100,
+            include: {
+                vehicle: { select: { id: true, type: true, make: true, model: true, imageUrl: true, licensePlate: true, capacity: true, driverName: true, driverPhotoUrl: true } },
+                _count: { select: { bookings: true, seats: true } }
+            }
+        });
+        return res.status(200).json({ success: true, trips });
+    } catch (err) {
+        return res.status(500).json({ success: false, message: err.message });
+    }
+};
+
+// PATCH /api/marketplace/business/trips/:id — update a trip's schedule/fare/status.
+// vehicleId is intentionally immutable after creation (the seat map + any
+// existing bookings are keyed off the original vehicle's layout).
+exports.updateTransitTrip = async (req, res) => {
+    const prisma = req.app.get('prisma');
+    try {
+        const userId = req.user.id;
+        const { id } = req.params;
+        const profile = await prisma.businessProfile.findUnique({ where: { userId } });
+        if (!profile) return res.status(404).json({ success: false, message: 'Business profile not found.' });
+
+        const trip = await prisma.transitTrip.findUnique({ where: { id } });
+        if (!trip) return res.status(404).json({ success: false, message: 'Trip not found.' });
+        if (trip.businessProfileId !== profile.id)
+            return res.status(403).json({ success: false, message: 'This trip does not belong to your business.' });
+
+        const { routeName, origin, destination, departureAt, arrivalAt, fareUsdc, status } = req.body;
+        const data = {};
+        if (routeName !== undefined) data.routeName = routeName;
+        if (origin !== undefined) data.origin = origin;
+        if (destination !== undefined) data.destination = destination;
+        if (departureAt !== undefined) data.departureAt = new Date(departureAt);
+        if (arrivalAt !== undefined) data.arrivalAt = arrivalAt ? new Date(arrivalAt) : null;
+        if (fareUsdc !== undefined) data.fareUsdc = parseFloat(fareUsdc);
+        if (status !== undefined) data.status = status;
+
+        const updated = await prisma.transitTrip.update({ where: { id }, data });
+        return res.status(200).json({ success: true, trip: updated });
+    } catch (err) {
+        return res.status(500).json({ success: false, message: err.message });
+    }
+};
+
+// DELETE /api/marketplace/business/trips/:id — remove a trip that has no bookings.
+// Trips with existing bookings must be cancelled (status=CANCELLED) instead of
+// deleted, so paying customers' bookings/escrow are never silently destroyed.
+exports.deleteTransitTrip = async (req, res) => {
+    const prisma = req.app.get('prisma');
+    try {
+        const userId = req.user.id;
+        const { id } = req.params;
+        const profile = await prisma.businessProfile.findUnique({ where: { userId } });
+        if (!profile) return res.status(404).json({ success: false, message: 'Business profile not found.' });
+
+        const trip = await prisma.transitTrip.findUnique({
+            where: { id },
+            include: { _count: { select: { seats: true } } }
+        });
+        if (!trip) return res.status(404).json({ success: false, message: 'Trip not found.' });
+        if (trip.businessProfileId !== profile.id)
+            return res.status(403).json({ success: false, message: 'This trip does not belong to your business.' });
+        if (trip._count.seats > 0) {
+            return res.status(400).json({ success: false, message: 'This trip has existing bookings — cancel it instead of deleting.' });
+        }
+
+        await prisma.transitTrip.delete({ where: { id } });
+        return res.status(200).json({ success: true });
+    } catch (err) {
+        return res.status(500).json({ success: false, message: err.message });
+    }
+};
+
 // POST /api/marketplace/business/seat-map — create or update a vehicle's seat map
 exports.setSeatMap = async (req, res) => {
     const prisma = req.app.get('prisma');

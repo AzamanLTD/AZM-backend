@@ -29,7 +29,10 @@ router.get('/business/:id/stories', protect, ctrl.getBusinessStories);
 router.patch('/business/penalty-policy', protect, ctrl.setPenaltyPolicy);
 
 // ── Transit Trip + Seat Map Management (business portal) ─────────────────────
+router.get('/business/trips', protect, ctrl.listMyTransitTrips);
 router.post('/business/trips', protect, ctrl.createTransitTrip);
+router.patch('/business/trips/:id', protect, ctrl.updateTransitTrip);
+router.delete('/business/trips/:id', protect, ctrl.deleteTransitTrip);
 router.post('/business/seat-map', protect, ctrl.setSeatMap);
 
 module.exports = router;
