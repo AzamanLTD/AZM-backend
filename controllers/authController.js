@@ -465,6 +465,7 @@ exports.getUserDetails = async (req, res) => {
                 profilePictureUrl: true,
                 role: true,
                 kycStatus: true,
+                azamanId: true, // 2026-07-08 fix: was missing — settings drawer showed 'AZM-—' forever
                 availableBalance: true,
                 vendorUnallocatedBalance: true,
                 escrowLockedBalance: true,
