@@ -77,11 +77,16 @@ class MomoNameLookupService {
 
     /** Normalise to E.164 (+233XXXXXXXXX) or return null. */
     _normalize(input) {
+        // Return 0-prefixed local format (0XXXXXXXXX) — this matches what
+        // moolreCollectionService._sanitizeMsisdn expects, since that helper
+        // strips non-digits and then checks for '0' or '233' prefix.
+        // Previously returned E.164 (+233...) which caused _sanitizeMsisdn to
+        // strip the '+' and produce a 12-digit '2330XXXXXXXX' string that matched
+        // no branch, falling through as-is and confusing the Moolre API.
         if (!input) return null;
-        const digits = String(input).replace(/[^0-9+]/g, '');
-        if (/^\+233[0-9]{9}$/.test(digits)) return digits;
-        if (/^0[0-9]{9}$/.test(digits))      return '+233' + digits.substring(1);
-        if (/^233[0-9]{9}$/.test(digits))     return '+' + digits;
+        const digits = String(input).replace(/\D/g, '');
+        if (digits.startsWith('233') && digits.length === 12) return '0' + digits.slice(3);
+        if (digits.startsWith('0')   && digits.length === 10) return digits;
         return null;
     }
 
