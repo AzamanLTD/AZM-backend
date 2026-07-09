@@ -216,7 +216,7 @@ class MoolreDisbursementService {
         // ── LIVE path ─────────────────────────────────────────────────────────
         const body = {
             [BODY_KEYS.currency]:      SUPPORTED_CURRENCY,
-            [BODY_KEYS.amount]:        Number(amountGhs),
+            [BODY_KEYS.amount]:        String(Number(amountGhs)),   // Moolre requires amount as string
             [BODY_KEYS.recipient]:     this._sanitizeMsisdn(recipientPhone),
             [BODY_KEYS.reference]:     referenceId,         // strict idempotency key
             [BODY_KEYS.channel]:       channel,
@@ -396,8 +396,12 @@ class MoolreDisbursementService {
     }
 
     _sanitizeMsisdn(phone) {
-        // Strip "+" and any non-digits — MoMo APIs expect a bare MSISDN.
-        return String(phone).replace(/\D+/g, '');
+        // Strip non-digits then normalize to 0-prefixed local format (0XXXXXXXXX).
+        // Moolre docs example shows "0246798993" — same as collection service.
+        const digits = String(phone).replace(/\D+/g, '');
+        if (digits.startsWith('233') && digits.length === 12) return '0' + digits.slice(3);
+        if (digits.startsWith('0') && digits.length === 10) return digits;
+        return digits; // fallback — pass as-is if unrecognised format
     }
 
     _mockInitiateTransfer({ referenceId, amountGhs, recipientPhone, externalId, note, channel }) {
