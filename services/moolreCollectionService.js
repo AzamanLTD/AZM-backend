@@ -161,7 +161,7 @@ class MoolreCollectionService {
         const data = await this._post('/open/transact/validate', {
             type: 1, receiver: this._sanitizeMsisdn(payerPhone),
             channel, currency: SUPPORTED_CURRENCY, accountnumber: this.accountNumber,
-        }, this._privateHeaders());
+        }, this._publicHeaders());
 
         if (Number(data.status) === 0) {
             const error = new Error("Moolre status 0");
