@@ -1065,6 +1065,10 @@ app.set('escrowService', EscrowService);
 app.set('pushIfOffline', pushIfOffline);
 app.set('gatewayService', gatewayService);
 app.set('mtnDisbursementService', mtnDisbursementService);
+// finance.controller.js reads 'moolreDisbursementService'; withdrawalController.js reads
+// 'mtnDisbursementService'. Both variables point at the same MoolreDisbursementService
+// instance — registering under both keys costs nothing and avoids silent 503 errors.
+app.set('moolreDisbursementService', mtnDisbursementService);
 app.set('moolreCollectionService', moolreCollectionService);
 app.set('tatumService', tatumService);
 app.set('emailService', emailService);
