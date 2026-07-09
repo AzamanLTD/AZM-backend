@@ -1,68 +1,106 @@
 // services/momoNameLookupService.js
 // =============================================================================
-// AZAMAN — MOMO NAME LOOKUP  (Master Sprint v2, 2026-05-27)
+// AZAMAN — MOMO NAME LOOKUP  (rewritten 2026-07-09)
 //
-// Resolves the registered name on a mobile-money number BEFORE the user
-// saves it as a deposit/withdrawal target. Today this is mocked because
-// the Kotani Pay V3 name-lookup endpoint hasn't been wired yet — but the
-// service surface is stable so the caller (savedMomo controller) doesn't
-// have to change when LIVE goes online.
+// Resolves the registered name on a mobile-money number before the user
+// saves it as a deposit/withdrawal target (POST /api/saved-momo/lookup).
 //
-// Provider must be one of: MTN | VODAFONE | TELECEL.
+// Originally wired to a Kotani Pay V3 stub that was never implemented and
+// returned "Live name lookup not yet enabled." even in LIVE mode. Rewired
+// to delegate directly to MoolreCollectionService.validateName(), which is
+// already confirmed correct against docs.moolre.com/ai/validate-name.md and
+// shares the same MOOLRE_PROVIDER / MOOLRE_API_* env vars.
+//
+// Provider must be one of: MTN | VODAFONE | TELECEL | AIRTELTIGO.
 // Phone format: GH local (0XXXXXXXXX) or E.164 (+233XXXXXXXXX).
 // =============================================================================
 
+const MoolreCollectionService = require('./moolreCollectionService');
+
+// Singleton — shares the same underlying instance as the deposit on-ramp
+// so we don't create a second authenticated client with its own token state.
+let _instance = null;
+
 class MomoNameLookupService {
-    constructor() {
-        this.mode = process.env.KOTANI_PROVIDER === 'LIVE' ? 'LIVE' : 'MOCK';
+    /**
+     * @param {MoolreCollectionService} [sharedInstance]
+     *   If provided, reuses the already-initialised Moolre client instead of
+     *   creating a second one. server.js passes moolreCollectionService here.
+     *   Tests that call new MomoNameLookupService() with no argument get their
+     *   own MOCK-mode instance, which is fine.
+     */
+    constructor(sharedInstance) {
+        if (sharedInstance) {
+            _instance = sharedInstance;
+        } else if (!_instance) {
+            _instance = new MoolreCollectionService();
+        }
+        this._moolre = _instance;
+        this.mode = this._moolre.providerMode; // 'LIVE' or 'MOCK'
     }
 
     /**
-     * Returns: { ok: true, name } | { ok: false, message }
+     * Returns:
+     *   { ok: true,  name: string, msisdn: string, provider: string }
+     *   { ok: false, message: string }
      */
     async resolveName({ provider, phoneNumber }) {
         const normalisedPhone = this._normalize(phoneNumber);
         if (!normalisedPhone) {
             return { ok: false, message: 'Invalid phone number format.' };
         }
-        const supportedProviders = ['MTN', 'VODAFONE', 'TELECEL'];
-        if (!supportedProviders.includes(provider)) {
-            return { ok: false, message: 'Unsupported provider.' };
+
+        // Canonical provider key (VALIDATE_CHANNEL_MAP uses these as keys).
+        const network = this._canonicalNetwork(provider);
+        if (!network) {
+            return { ok: false, message: `Unsupported provider "${provider}". Use MTN, VODAFONE, TELECEL, or AIRTELTIGO.` };
         }
 
-        if (this.mode === 'MOCK') {
-            return this._mockLookup(provider, normalisedPhone);
-        }
+        try {
+            const name = await this._moolre.validateName({
+                payerPhone: normalisedPhone,
+                network,
+            });
 
-        // TODO: wire Kotani Pay V3 name-lookup endpoint when ready.
-        // The contract returns { msisdn, registeredName, status }.
-        return { ok: false, message: 'Live name lookup not yet enabled.' };
+            if (!name) {
+                return { ok: false, message: 'Account not found on this network. Check the number and provider.' };
+            }
+
+            return { ok: true, name, msisdn: normalisedPhone, provider: network };
+        } catch (err) {
+            console.error('[MomoNameLookupService] validateName error:', err.message);
+            return { ok: false, message: 'Name lookup failed. Please retry.' };
+        }
     }
 
+    // ── Helpers ──────────────────────────────────────────────────────────────
+
+    /** Normalise to E.164 (+233XXXXXXXXX) or return null. */
     _normalize(input) {
         if (!input) return null;
         const digits = String(input).replace(/[^0-9+]/g, '');
         if (/^\+233[0-9]{9}$/.test(digits)) return digits;
-        if (/^0[0-9]{9}$/.test(digits)) return '+233' + digits.substring(1);
-        if (/^233[0-9]{9}$/.test(digits)) return '+' + digits;
+        if (/^0[0-9]{9}$/.test(digits))      return '+233' + digits.substring(1);
+        if (/^233[0-9]{9}$/.test(digits))     return '+' + digits;
         return null;
     }
 
-    _mockLookup(provider, msisdn) {
-        // Deterministic mock — same number always returns the same name so
-        // the FE save-flow renders a stable preview during testing.
-        const seed = msisdn.split('').reduce((acc, c) => acc + c.charCodeAt(0), 0);
-        const firsts = ['Kwame', 'Akosua', 'Yaw', 'Adwoa', 'Kojo', 'Esi', 'Kofi', 'Ama'];
-        const lasts = ['Mensah', 'Boateng', 'Owusu', 'Asante', 'Adjei', 'Kumi', 'Sarpong'];
-        const first = firsts[seed % firsts.length];
-        const last = lasts[(seed >> 1) % lasts.length];
-        return {
-            ok: true,
-            name: `${first} ${last}`,
-            provider,
-            msisdn,
-            mocked: true,
+    /** Map any accepted provider variant to MoolreCollectionService's canonical key. */
+    _canonicalNetwork(provider) {
+        if (!provider) return null;
+        const map = {
+            MTN:       'MTN',
+            VODAFONE:  'VODAFONE',
+            TELECEL:   'TELECEL',     // Vodafone rebranded → channel 6
+            AIRTELTIGO:'AIRTELTIGO',  // channel 7
+            AT:        'AIRTELTIGO',
+            // Legacy form strings coming from the saved-momo add sheet
+            MTN_MOMO:       'MTN',
+            VODAFONE_CASH:  'VODAFONE',
+            TELECEL_CASH:   'TELECEL',
+            AIRTELTIGO_CASH:'AIRTELTIGO',
         };
+        return map[provider.toUpperCase().replace(/[^A-Z_]/g, '')] ?? null;
     }
 }
 

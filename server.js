@@ -800,9 +800,12 @@ const azmAuctionService = new AzmAuctionService({
 });
 app.set('azmAuctionService', azmAuctionService);
 
-// Master Sprint v2 (2026-05-27): MoMo name lookup (mock until Kotani V3 wires)
+// Master Sprint v2 (2026-05-27): MoMo name lookup — delegates to the already-
+// instantiated moolreCollectionService so there is exactly one authenticated
+// Moolre client in the process. We pass the shared instance in to avoid a
+// second independent constructor call with its own token/credential state.
 const { MomoNameLookupService } = require('./services/momoNameLookupService');
-const momoNameLookupService = new MomoNameLookupService();
+const momoNameLookupService = new MomoNameLookupService(moolreCollectionService);
 app.set('momoNameLookupService', momoNameLookupService);
 
 // --- WORKERS ---
