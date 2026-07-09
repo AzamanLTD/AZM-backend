@@ -163,8 +163,12 @@ class MoolreCollectionService {
             channel, currency: SUPPORTED_CURRENCY, accountnumber: this.accountNumber,
         }, this._privateHeaders());
 
-        if (Number(data.status) === 0) return null;
-        return typeof data.data === 'string' ? data.data : null;
+        if (Number(data.status) === 0) {
+            const error = new Error("Moolre status 0");
+            error.raw = data;
+            throw error;
+        }
+        return typeof data.data === 'string' ? data.data : JSON.stringify(data.data);
     }
 
     /**

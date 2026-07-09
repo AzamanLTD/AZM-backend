@@ -69,7 +69,8 @@ class MomoNameLookupService {
             return { ok: true, name, msisdn: normalisedPhone, provider: network };
         } catch (err) {
             console.error('[MomoNameLookupService] validateName error:', err.message);
-            return { ok: false, message: 'Name lookup failed. Please retry.' };
+            const rawInfo = err.raw ? JSON.stringify(err.raw) : err.message;
+            return { ok: false, message: `Moolre Error: ${rawInfo}` };
         }
     }
 
