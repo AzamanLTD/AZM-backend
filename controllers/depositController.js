@@ -566,8 +566,17 @@ exports.initiateMoolreFiatDeposit = async (req, res) => {
         const networkMap = { MTN_MOMO: 'MTN', VODAFONE_CASH: 'VODAFONE', AIRTELTIGO: 'AIRTELTIGO' };
         const network    = networkMap[provider] || 'MTN';
 
-        const settings = await prisma.globalSettings.findUnique({ where: { id: 1 } });
-        if (!settings) return res.status(503).json({ success: false, message: 'Exchange rate unavailable.' });
+        let settings = await prisma.globalSettings.findUnique({ where: { id: 1 } });
+        // Auto-bootstrap the settings row if it doesn't exist yet (first deploy, no admin visit yet).
+        if (!settings) {
+            try {
+                settings = await prisma.globalSettings.create({ data: { id: 1 } });
+            } catch (_) {
+                // Race condition — another request created it between our find and create.
+                settings = await prisma.globalSettings.findUnique({ where: { id: 1 } });
+            }
+        }
+        if (!settings) return res.status(503).json({ success: false, message: 'Exchange rate unavailable. Please contact support.' });
 
         const ghsFloat     = parseFloat(amountGhs);
         const usdcEstimate = parseFloat((ghsFloat / Number(settings.liveUsdToGhs)).toFixed(6));
