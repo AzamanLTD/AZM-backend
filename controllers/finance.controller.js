@@ -8,12 +8,13 @@
 // Phase B v2 change: the off-ramp is now decoupled from Kotani Pay V3.
 // Kotani is still mounted on the server (used for on-ramp / corporate
 // purchases and as the live retail-rate oracle), but the actual fiat
-// PAYOUT to the user is now dispatched through MTN MoMo's Disbursement
-// API via services/mtnDisbursementService.js. This is the architectural
-// half of the fix in services/finance.service.js — Azaman now permanently
-// retains the user's USDC in SYSTEM_MASTER_CRYPTO and pays them out from
-// the local SYSTEM_FIAT_POOL, which lets the platform arbitrage the
-// captured USDC at the OTC premium (see §1 / §4 of AZAMAN_MASTER_SOUL.md).
+// PAYOUT to the user is now dispatched through Moolre's Disbursement
+// API via services/moolreDisbursementService.js (all networks: MTN ch1,
+// Telecel ch6, AirtelTigo ch7). This is the architectural half of the
+// fix in services/finance.service.js — Azaman now permanently retains
+// the user's USDC in SYSTEM_MASTER_CRYPTO and pays them out from the
+// local SYSTEM_FIAT_POOL, which lets the platform arbitrage the captured
+// USDC at the OTC premium (see §1 / §4 of AZAMAN_MASTER_SOUL.md).
 //
 // Routes wired in routes/financeRoutes.js:
 //   POST /api/finance/withdraw/fiat                   → fiatWithdrawal          (auth + ban guard)
@@ -55,11 +56,11 @@ const _classifyFiatPool = (balance) => {
 // equivalent GHS is debited from SYSTEM_FIAT_POOL and disbursed via MTN.
 // =============================================================================
 exports.fiatWithdrawal = async (req, res) => {
-    const prisma                  = req.app.get('prisma');
-    const io                      = req.app.get('socketio');
-    const emitBalanceUpdate       = req.app.get('emitBalanceUpdate');
-    const gatewayService          = req.app.get('gatewayService');           // rate oracle only
-    const mtnDisbursementService  = req.app.get('mtnDisbursementService');   // off-ramp dispatch
+    const prisma                    = req.app.get('prisma');
+    const io                        = req.app.get('socketio');
+    const emitBalanceUpdate         = req.app.get('emitBalanceUpdate');
+    const gatewayService            = req.app.get('gatewayService');             // rate oracle only
+    const moolreDisbursementService = req.app.get('moolreDisbursementService'); // off-ramp dispatch
 
     let reference = null;        // populated after the service debit so the
                                  // catch block can call reverseFiatWithdrawal.
@@ -91,10 +92,10 @@ exports.fiatWithdrawal = async (req, res) => {
                 message: 'Rate oracle (Kotani gateway) is not configured on this server.'
             });
         }
-        if (!mtnDisbursementService) {
+        if (!moolreDisbursementService) {
             return res.status(503).json({
                 success: false,
-                message: 'MTN MoMo disbursement service is not configured on this server.'
+                message: 'Moolre disbursement service is not configured on this server.'
             });
         }
 
@@ -109,7 +110,7 @@ exports.fiatWithdrawal = async (req, res) => {
         // uses it as the strict idempotency key for POST /v1_0/transfer.
         // We reuse the same UUID as TransactionHistory.txHash so the upstream
         // ledger and the downstream MoMo transfer share a single correlation.
-        reference = mtnDisbursementService.newReferenceId();
+        reference = moolreDisbursementService.newReferenceId();
 
         // ── Atomic debit + fee split + arbitrage capture (delegated) ─────────
         const data = await financeService.processFiatWithdrawal(
@@ -119,19 +120,21 @@ exports.fiatWithdrawal = async (req, res) => {
             { reference, retailRate: rates.retailRate, payoutGhs }
         );
 
-        // ── MTN MoMo disbursement (outside the DB transaction) ───────────────
+        // ── Moolre disbursement (outside the DB transaction) ────────────────
+        // Routes ALL networks through Moolre: MTN=ch1, Telecel/Vodafone=ch6, AT=ch7.
         let disbursementResult;
         try {
-            disbursementResult = await mtnDisbursementService.initiateTransfer({
+            disbursementResult = await moolreDisbursementService.initiateTransfer({
                 referenceId:    reference,
                 amountGhs:      payoutGhs,
                 recipientPhone,
+                network:        networkChoice,   // MTN | VODAFONE | AIRTELTIGO — Moolre maps to channel
                 externalId:     `AZAMAN_${userId}_${Date.now()}`,
                 payerMessage:   `Azaman withdrawal ref ${reference}`,
                 payeeNote:      `Azaman MoMo payout (${networkChoice})`
             });
         } catch (gatewayErr) {
-            console.error('[fiatWithdrawal] MTN MoMo dispatch failed:', gatewayErr.message);
+            console.error('[fiatWithdrawal] Moolre dispatch failed:', gatewayErr.message);
             // Roll back the debit + the SystemMasterCrypto capture so the
             // user is not stuck and Azaman is not double-credited.
             try {
@@ -143,15 +146,15 @@ exports.fiatWithdrawal = async (req, res) => {
                 if (emitBalanceUpdate) await emitBalanceUpdate(userId);
                 return res.status(502).json({
                     success: false,
-                    code:    'MTN_DISBURSEMENT_REJECTED',
-                    message: `MTN MoMo rejected the payout: ${gatewayErr.message}. Funds returned to your wallet.`,
+                    code:    'MOOLRE_DISBURSEMENT_REJECTED',
+                    message: `Payout rejected: ${gatewayErr.message}. Funds returned to your wallet.`,
                     data:    { reference, reversal }
                 });
             } catch (reverseErr) {
                 console.error('[fiatWithdrawal] CRITICAL reversal failure:', reverseErr.message);
                 return res.status(500).json({
                     success: false,
-                    code:    'MTN_DISBURSEMENT_REVERSAL_FAILED',
+                    code:    'MOOLRE_DISBURSEMENT_REVERSAL_FAILED',
                     message:
                         `MTN MoMo rejected the payout AND reversal failed. ` +
                         `An admin has been notified. Reference: ${reference}.`,
@@ -194,7 +197,7 @@ exports.fiatWithdrawal = async (req, res) => {
             message:
                 `Fiat withdrawal of ${data.withdrawalAmount} USDC accepted. ` +
                 `Exit fee: ${data.exitFee} USDC. ${data.arbitrageCapture} USDC ` +
-                `captured to SystemMasterCrypto. MTN MoMo status: ${disbursementResult.status}.`,
+                `captured to SystemMasterCrypto. Moolre disbursement status: ${disbursementResult.status}.`,
             data: {
                 ...data,
                 disbursement: {
