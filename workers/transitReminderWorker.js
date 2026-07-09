@@ -23,14 +23,14 @@ const sweepTransitReminders = async (prisma) => {
     const upcoming = await prisma.transitBooking.findMany({
         where: {
             status: 'CONFIRMED',
-            trip: { scheduledAt: { gte: windowStart, lte: windowEnd } },
+            trip: { departureAt: { gte: windowStart, lte: windowEnd } },
             reminderSentAt: null, // haven't sent a reminder yet
         },
         include: {
             trip: {
                 select: {
-                    routeName: true, departureCity: true, arrivalCity: true,
-                    scheduledAt: true, vehicle: { select: { type: true, make: true, model: true } }
+                    routeName: true, origin: true, destination: true,
+                    departureAt: true, vehicle: { select: { type: true, make: true, model: true } }
                 }
             },
             businessProfile: { select: { businessName: true } },
@@ -44,7 +44,7 @@ const sweepTransitReminders = async (prisma) => {
         try {
             results.processed++;
 
-            const departureTime = new Date(booking.trip.scheduledAt).toLocaleString('en-GH', {
+            const departureTime = new Date(booking.trip.departureAt).toLocaleString('en-GH', {
                 hour: '2-digit', minute: '2-digit', day: 'numeric', month: 'short'
             });
 
@@ -56,12 +56,12 @@ const sweepTransitReminders = async (prisma) => {
                     type: 'TRANSIT_REMINDER',
                     category: 'MARKETPLACE',
                     title: `Trip departing soon: ${booking.trip.routeName}`,
-                    body: `Your trip to ${booking.trip.arrivalCity} departs at ${departureTime}. Seat(s): ${seatLabels}. Vehicle: ${booking.trip.vehicle?.type || 'N/A'}.`,
+                    body: `Your trip to ${booking.trip.destination} departs at ${departureTime}. Seat(s): ${seatLabels}. Vehicle: ${booking.trip.vehicle?.type || 'N/A'}.`,
                     metadata: {
                         bookingId: booking.id,
                         tripId: booking.tripId,
                         routeName: booking.trip.routeName,
-                        scheduledAt: booking.trip.scheduledAt,
+                        departureAt: booking.trip.departureAt,
                     },
                     isRead: false,
                 }
@@ -78,9 +78,9 @@ const sweepTransitReminders = async (prisma) => {
                 global._io.to(`user_${booking.customerId}`).emit('transit_reminder', {
                     bookingId: booking.id,
                     routeName: booking.trip.routeName,
-                    departureCity: booking.trip.departureCity,
-                    arrivalCity: booking.trip.arrivalCity,
-                    scheduledAt: booking.trip.scheduledAt,
+                    origin: booking.trip.origin,
+                    destination: booking.trip.destination,
+                    departureAt: booking.trip.departureAt,
                     seats: seatLabels,
                 });
             }
