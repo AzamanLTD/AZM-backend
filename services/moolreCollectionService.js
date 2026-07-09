@@ -138,7 +138,7 @@ class MoolreCollectionService {
         };
         if (otpCode) body.otpcode = otpCode;
 
-        const data = await this._post('/open/transact/payment', body, this._privateHeaders());
+        const data = await this._post('/open/transact/payment', body, this._publicHeaders());
 
         if (Number(data.status) === 0) {
             const err = new Error(data.message || 'Payment initiation failed.');
