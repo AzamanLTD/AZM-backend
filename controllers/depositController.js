@@ -799,6 +799,7 @@ exports.validateMomoName = async (req, res) => {
         return res.status(200).json({ success: true, data: name });
     } catch (err) {
         console.error('[validateMomoName]', err.message);
-        return res.status(500).json({ success: false, message: 'Validation failed.' });
+        const rawInfo = err.raw ? JSON.stringify(err.raw) : err.message;
+        return res.status(500).json({ success: false, message: `Moolre Error: ${rawInfo}` });
     }
 };
