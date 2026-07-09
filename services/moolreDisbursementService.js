@@ -34,19 +34,23 @@
 //
 // =============================================================================
 //
-// ⚠️  VERIFY-AGAINST-SANDBOX BLOCK  ⚠️
-// -----------------------------------------------------------------------------
-// Moolre's docs site is a JS-rendered SPA, so the EXACT endpoint paths, request
-// body field names, network slugs, and async status strings could not be
-// confirmed at build time. Every one of those uncertain values is isolated as a
-// constant in this block. When you run the Moolre sandbox, adjust ONLY these —
-// the rest of the file (auth, envelope handling, idempotency, return shapes)
-// is provider-correct and should not need to change.
+// ✅ CONFIRMED 2026-07-09 against the official docs.moolre.com/ai/*.md pages
+// (initiate-transfer, transfer-status, validate-name, list-account-transactions,
+// create-payment-id, payment-webhook, initiate-payment). Every value below —
+// endpoint paths, body field names, channel codes, and the numeric txstatus
+// enum — has now been checked against Moolre's real, machine-readable API
+// reference (not guessed). One real bug was found and fixed in this pass:
+// the status-normalizer was reading a `data.status` field that Moolre never
+// actually sends on the transfer/status endpoints (the real field is the
+// NUMERIC `data.txstatus`: 0=Pending, 1=Success, 2=Failed) — every successful
+// payout was silently stuck reporting PENDING forever. Fixed below.
+// =============================================================================
 //
-// Confirmed from the reference summary you supplied:
-//   • Base URLs (sandbox + production)
-//   • Static header auth: X-API-USER + X-API-KEY on every request
-//   • Universal response envelope: { status: 1|0, code, message, data, go }
+// Endpoints/fields confirmed correct as originally written (no change needed):
+//   • TRANSFER_ENDPOINT '/open/transact/transfer', STATUS_ENDPOINT '/open/transact/status'
+//   • BODY_KEYS.recipient='receiver', .reference='externalref', .narration='reference'
+//   • BODY_KEYS.channel/currency/amount/accountNumber, TRANSFER_TYPE_CODE=1
+//   • NETWORK_TO_CHANNEL: MTN=1, VODAFONE/TELECEL=6, AIRTELTIGO=7
 // =============================================================================
 
 const axios          = require('axios');
@@ -58,15 +62,11 @@ const PROD_BASE_URL          = 'https://api.moolre.com';
 const SANDBOX_BASE_URL       = 'https://sandbox.moolre.com';
 const SUPPORTED_CURRENCY     = 'GHS';
 
-// ── ⚠️ VERIFY: endpoint paths ─────────────────────────────────────────────────
-// Intuitive guesses based on Moolre's documented product categories
-// (Disbursements / Transfers). Adjust to the real paths from the sandbox docs.
+// ── ✅ CONFIRMED: endpoint paths (docs.moolre.com/ai/initiate-transfer.md, transfer-status.md) ──
 const TRANSFER_ENDPOINT      = '/open/transact/transfer';      // POST — initiate payout
 const STATUS_ENDPOINT        = '/open/transact/status';        // POST — query by reference
 
-// ── ⚠️ VERIFY: request body field names ───────────────────────────────────────
-// The keys Moolre expects in the transfer/status request bodies. These are the
-// "standard/intuitive" names you asked for; rename to match the real schema.
+// ── ✅ CONFIRMED: request body field names (docs.moolre.com/ai/initiate-transfer.md) ──
 const BODY_KEYS = {
     type:           'type',            // txn type discriminator, if Moolre uses one
     channel:        'channel',         // network/channel selector
@@ -79,16 +79,11 @@ const BODY_KEYS = {
     accountNumber:  'accountnumber',   // YOUR Moolre payout account/wallet number
 };
 
-// ── ⚠️ VERIFY: a fixed transfer "type" code, if Moolre requires one ────────────
-// Some Moolre flows want an integer/string type discriminator in the body
-// (e.g. 1 = mobile money payout). Null = omit the field entirely.
+// ── ✅ CONFIRMED: type=1 is required on every transfer request. ──
 const TRANSFER_TYPE_CODE     = 1;
 
-// ── ⚠️ VERIFY: network/channel slugs ──────────────────────────────────────────
+// ── ✅ CONFIRMED numeric channel codes (docs.moolre.com/ai/initiate-transfer.md) ──
 // AZM passes network ∈ {MTN, VODAFONE, AIRTELTIGO} (VODAFONE is now Telecel).
-// Map each to whatever channel code Moolre expects. Using passthrough strings
-// as a safe default; replace values with Moolre's real slugs/codes.
-// Confirmed numeric codes from docs.moolre.com/ai/initiate-transfer.md
 const NETWORK_TO_CHANNEL = {
     MTN:         1,
     VODAFONE:    6,   // a.k.a. Telecel Ghana
@@ -96,12 +91,19 @@ const NETWORK_TO_CHANNEL = {
     AIRTELTIGO:  7,
 };
 
-// ── ⚠️ VERIFY: async status string mapping ────────────────────────────────────
-// Moolre's `data.status` (or equivalent) for a payout. AZM's reconciliation
-// worker + finance webhook understand exactly three normalized states:
-// 'PENDING' | 'SUCCESSFUL' | 'FAILED'. Map Moolre's raw values onto those.
-// Keys MUST be upper-cased (we upper-case the raw value before lookup).
+// ── CONFIRMED 2026-07-09 against docs.moolre.com/ai/{initiate-transfer,
+// transfer-status,list-account-transactions}.md — Moolre's payout/transfer
+// status field is ALWAYS `data.txstatus`, and it is a NUMBER, not a word:
+//   0 = Pending, 1 = Success, 2 = Failed
+// (There is no `data.status` field in the transfer/status response bodies —
+// that name was a guess from before we could confirm against the real docs.
+// Keeping the numeric keys as strings below since we String()-coerce the
+// raw value before lookup. Word-based fallback keys are kept defensively
+// in case Moolre ever changes this to a string enum.)
 const STATUS_MAP = {
+    '0':         'PENDING',
+    '1':         'SUCCESSFUL',
+    '2':         'FAILED',
     PENDING:     'PENDING',
     PROCESSING:  'PENDING',
     SUCCESS:     'SUCCESSFUL',
@@ -245,7 +247,13 @@ class MoolreDisbursementService {
 
             // Moolre may settle synchronously OR return a PENDING that settles via
             // webhook. Normalize whatever it gives us; default to PENDING (async).
-            const rawStatus = (data && (data.status || data.txstatus)) || 'PENDING';
+            // txstatus is the confirmed field (0/1/2 — see STATUS_MAP comment above).
+            // Explicit undefined/null check because 0 ("Pending") is falsy and
+            // would otherwise wrongly fall through to data.status (which Moolre
+            // never actually sends on this endpoint).
+            const rawStatus = (data && data.txstatus !== undefined && data.txstatus !== null)
+                ? data.txstatus
+                : (data && data.status) || 'PENDING';
             const normalized = this._normalizeStatus(rawStatus);
 
             return {
@@ -301,7 +309,9 @@ class MoolreDisbursementService {
                     source:      'LIVE'
                 };
             }
-            const rawStatus = (data && (data.status || data.txstatus)) || 'PENDING';
+            const rawStatus = (data && data.txstatus !== undefined && data.txstatus !== null)
+                ? data.txstatus
+                : (data && data.status) || 'PENDING';
             return {
                 provider:    PROVIDER_NAME,
                 referenceId,

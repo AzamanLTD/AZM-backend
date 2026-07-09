@@ -573,14 +573,23 @@ exports.moolreDisbursementWebhook = async (req, res) => {
             });
         }
 
-        // Normalize Moolre's status onto AZM's terminal states. Moolre's success
-        // sentinel may arrive as the integer 1 / string "1" (envelope-style) or
-        // as a word ("SUCCESS"/"FAILED"/"PENDING"). Handle all three.
+        // Normalize Moolre's status onto AZM's terminal states.
+        //
+        // ✅ CONFIRMED 2026-07-09 against docs.moolre.com/ai/list-account-transactions.md
+        // (whose `status` filter param and `txstatus` response field share the
+        // same enum): Moolre's txstatus is NUMERIC — 0=Pending, 1=Success,
+        // 2=Failed. This branch previously treated '0' as FAILED and had no
+        // case at all for '2' (the REAL failed code, which fell through to the
+        // 400 "Unrecognized status" branch) — meaning a genuine Moolre payout
+        // failure would never trigger reverseFiatWithdrawal, and a merely
+        // still-processing payout (txstatus=0) would have been wrongly
+        // reported/refunded as failed. Fixed: 0→PENDING, 1→SUCCESSFUL, 2→FAILED,
+        // with the original word-based sentinels kept as a defensive fallback.
         const upper = String(rawStatus).toUpperCase();
         let normalized;
         if (upper === '1' || upper === 'SUCCESS' || upper === 'SUCCESSFUL' || upper === 'COMPLETED' || upper === 'PAID') {
             normalized = 'SUCCESSFUL';
-        } else if (upper === 'PENDING' || upper === 'PROCESSING') {
+        } else if (upper === '0' || upper === 'PENDING' || upper === 'PROCESSING') {
             // Emit a real-time PROCESSING tick to the user's progress popup, then
             // acknowledge without mutating the ledger (debit already committed at
             // dispatch). `original` is fetched below for SUCCESS/FAILED, but on
@@ -608,7 +617,7 @@ exports.moolreDisbursementWebhook = async (req, res) => {
                 message: 'PENDING status acknowledged; no ledger mutation.',
                 data:    { reference, status: 'PENDING' }
             });
-        } else if (upper === '0' || upper === 'FAILED' || upper === 'REJECTED' || upper === 'REVERSED' || upper === 'CANCELLED') {
+        } else if (upper === '2' || upper === 'FAILED' || upper === 'REJECTED' || upper === 'REVERSED' || upper === 'CANCELLED') {
             normalized = 'FAILED';
         } else {
             return res.status(400).json({
