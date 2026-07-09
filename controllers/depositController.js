@@ -611,7 +611,10 @@ exports.initiateMoolreFiatDeposit = async (req, res) => {
                 return res.status(409).json({ success: false, message: 'Duplicate deposit reference. Please retry.' });
             await prisma.transactionHistory.update({ where: { id: tx.id }, data: { status: 'FAILED' } });
             console.error('[initiateMoolreFiatDeposit] Moolre error:', moolreErr.message);
-            return res.status(502).json({ success: false, message: 'Payment provider error. Please retry.' });
+            // Surface the real provider message so the user knows what went wrong
+            // (e.g. "Invalid account", "Network unavailable") instead of a generic blurb.
+            const providerMsg = moolreErr.message?.replace(/^\[MoolreCollectionService\]\s*/, '') || 'Payment provider error. Please retry.';
+            return res.status(502).json({ success: false, message: providerMsg });
         }
 
         if (moolreResult.providerRef) {
