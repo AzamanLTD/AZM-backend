@@ -138,7 +138,7 @@ class MoolreCollectionService {
         };
         if (otpCode) body.otpcode = otpCode;
 
-        const data = await this._post('/open/transact/payment', body, this._publicHeaders());
+        const data = await this._post('/open/transact/payment', body, this._privateHeaders());
 
         if (Number(data.status) === 0) {
             const err = new Error(data.message || 'Payment initiation failed.');
@@ -163,12 +163,8 @@ class MoolreCollectionService {
             channel, currency: SUPPORTED_CURRENCY, accountnumber: this.accountNumber,
         }, this._publicHeaders());
 
-        if (Number(data.status) === 0) {
-            const error = new Error("Moolre status 0");
-            error.raw = data;
-            throw error;
-        }
-        return typeof data.data === 'string' ? data.data : JSON.stringify(data.data);
+        if (Number(data.status) === 0) return null;   // not found — callers expect null
+        return typeof data.data === 'string' ? data.data : null;
     }
 
     /**
