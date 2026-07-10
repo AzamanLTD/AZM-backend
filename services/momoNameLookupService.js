@@ -11,7 +11,7 @@
 // already confirmed correct against docs.moolre.com/ai/validate-name.md and
 // shares the same MOOLRE_PROVIDER / MOOLRE_API_* env vars.
 //
-// Provider must be one of: MTN | VODAFONE | TELECEL | AIRTELTIGO.
+// Provider must be one of: MTN | TELECEL | AIRTELTIGO (VODAFONE accepted as legacy alias).
 // Phone format: GH local (0XXXXXXXXX) or E.164 (+233XXXXXXXXX).
 // =============================================================================
 
@@ -53,7 +53,7 @@ class MomoNameLookupService {
         // Canonical provider key (VALIDATE_CHANNEL_MAP uses these as keys).
         const network = this._canonicalNetwork(provider);
         if (!network) {
-            return { ok: false, message: `Unsupported provider "${provider}". Use MTN, VODAFONE, TELECEL, or AIRTELTIGO.` };
+            return { ok: false, message: `Unsupported provider "${provider}". Use MTN, TELECEL, or AIRTELTIGO.` };
         }
 
         try {
@@ -68,9 +68,12 @@ class MomoNameLookupService {
 
             return { ok: true, name, msisdn: normalisedPhone, provider: network };
         } catch (err) {
-            console.error('[MomoNameLookupService] validateName error:', err.message);
-            const rawInfo = err.raw ? JSON.stringify(err.raw) : err.message;
-            return { ok: false, message: `Moolre Error: ${rawInfo}` };
+            console.error('[MomoNameLookupService] validateName error:', err.message, err.raw || '');
+            // Return a user-friendly message — do not expose raw API internals to the client.
+            const friendly = err.message?.includes('status 0')
+                ? 'Number not found on this network. Check the number and provider.'
+                : 'Could not verify account. Please try again.';
+            return { ok: false, message: friendly };
         }
     }
 
@@ -96,15 +99,15 @@ class MomoNameLookupService {
         if (!provider) return null;
         const map = {
             MTN:       'MTN',
-            VODAFONE:  'VODAFONE',
-            TELECEL:   'TELECEL',     // Vodafone rebranded → channel 6
+            TELECEL:   'TELECEL',     // Telecel Ghana (formerly Vodafone) → channel 6
+            VODAFONE:  'TELECEL',     // LEGACY ALIAS — Vodafone rebranded to Telecel
             AIRTELTIGO:'AIRTELTIGO',  // channel 7
             AT:        'AIRTELTIGO',
             // Legacy form strings coming from the saved-momo add sheet
-            MTN_MOMO:       'MTN',
-            VODAFONE_CASH:  'VODAFONE',
-            TELECEL_CASH:   'TELECEL',
-            AIRTELTIGO_CASH:'AIRTELTIGO',
+            MTN_MOMO:        'MTN',
+            TELECEL_CASH:    'TELECEL',
+            VODAFONE_CASH:   'TELECEL',  // LEGACY ALIAS
+            AIRTELTIGO_CASH: 'AIRTELTIGO',
         };
         return map[provider.toUpperCase().replace(/[^A-Z_]/g, '')] ?? null;
     }

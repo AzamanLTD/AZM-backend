@@ -48,7 +48,7 @@ function _safeEqual(a, b) {
 
 // ── Constants ────────────────────────────────────────────────────────────────
 const FIAT_REF_PREFIX = 'FIAT_DEPOSIT_';
-const PROVIDERS       = new Set(['MTN_MOMO', 'VODAFONE_CASH', 'AIRTELTIGO', 'BANK_TRANSFER']);
+const PROVIDERS       = new Set(['MTN_MOMO', 'TELECEL_CASH', 'VODAFONE_CASH', 'AIRTELTIGO', 'BANK_TRANSFER']);
 
 // =============================================================================
 // 1. INITIATE LOCAL FIAT DEPOSIT
@@ -545,7 +545,7 @@ exports.tatumCryptoWebhook = async (req, res) => {
 
 // ── Export 1: initiateMoolreFiatDeposit ──────────────────────────────────────
 // POST /api/deposit/fiat/initiate/moolre  (auth)
-// Body: { amountGhs, provider, phoneNumber }   provider ∈ MTN_MOMO|VODAFONE_CASH|AIRTELTIGO
+// Body: { amountGhs, provider, phoneNumber }   provider ∈ MTN_MOMO|TELECEL_CASH|VODAFONE_CASH|AIRTELTIGO
 exports.initiateMoolreFiatDeposit = async (req, res) => {
     const prisma = req.app.get('prisma');
     const moolre = req.app.get('moolreCollectionService');
@@ -555,7 +555,7 @@ exports.initiateMoolreFiatDeposit = async (req, res) => {
         const { amountGhs, provider, phoneNumber, memo } = req.body;
         const userId = req.user.id;
 
-        const MOMO = new Set(['MTN_MOMO', 'VODAFONE_CASH', 'AIRTELTIGO']);
+        const MOMO = new Set(['MTN_MOMO', 'TELECEL_CASH', 'VODAFONE_CASH', 'AIRTELTIGO']);
         if (!amountGhs || Number(amountGhs) <= 0)
             return res.status(400).json({ success: false, message: 'Invalid deposit amount.' });
         if (!MOMO.has(provider))
@@ -563,7 +563,7 @@ exports.initiateMoolreFiatDeposit = async (req, res) => {
         if (!phoneNumber || String(phoneNumber).replace(/\D/g, '').length < 9)
             return res.status(400).json({ success: false, message: 'A valid phone number is required.' });
 
-        const networkMap = { MTN_MOMO: 'MTN', VODAFONE_CASH: 'VODAFONE', AIRTELTIGO: 'AIRTELTIGO' };
+        const networkMap = { MTN_MOMO: 'MTN', TELECEL_CASH: 'TELECEL', VODAFONE_CASH: 'TELECEL', AIRTELTIGO: 'AIRTELTIGO' };
         const network    = networkMap[provider] || 'MTN';
 
         let settings = await prisma.globalSettings.findUnique({ where: { id: 1 } });
@@ -789,8 +789,8 @@ exports.validateMomoName = async (req, res) => {
         if (!phoneNumber) return res.status(400).json({ success: false, message: 'phoneNumber required.' });
 
         const nm = {
-            MTN: 'MTN', VODAFONE: 'VODAFONE', AIRTELTIGO: 'AIRTELTIGO',
-            MTN_MOMO: 'MTN', VODAFONE_CASH: 'VODAFONE',
+            MTN: 'MTN', TELECEL: 'TELECEL', VODAFONE: 'TELECEL', AIRTELTIGO: 'AIRTELTIGO',
+            MTN_MOMO: 'MTN', TELECEL_CASH: 'TELECEL', VODAFONE_CASH: 'TELECEL',
         };
         const network = nm[(provider || '').toUpperCase()] || 'MTN';
         const name = await moolre.validateName({ payerPhone: phoneNumber, network });
@@ -798,8 +798,7 @@ exports.validateMomoName = async (req, res) => {
 
         return res.status(200).json({ success: true, data: name });
     } catch (err) {
-        console.error('[validateMomoName]', err.message);
-        const rawInfo = err.raw ? JSON.stringify(err.raw) : err.message;
-        return res.status(500).json({ success: false, message: `Moolre Error: ${rawInfo}` });
+        console.error('[validateMomoName]', err.message, err.raw || '');
+        return res.status(500).json({ success: false, message: 'Could not verify account. Please check the number and try again.' });
     }
 };
