@@ -39,6 +39,10 @@ enum NotificationCategory {
   SECURITY_ACCOUNT
   VENDOR_PRIORITY
   ADMIN_SYSTEM
+  MONEY
+  SOCIAL
+  CHAT
+  SYSTEM
   // Master Sprint (2026-05-27)
   VAULT
   SUSU
