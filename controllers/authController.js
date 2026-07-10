@@ -337,7 +337,7 @@ exports.login = async (req, res) => {
             // Fire-and-forget security notification for new login
             setImmediate(async () => {
                 try {
-                    const { NotificationService } = require('../services/notificationService');
+                    const NotificationService = require('../services/notificationService');
                     const notifSvc = new NotificationService(prisma, req.app.get('io'));
                     const ip = req.ip || req.headers['x-forwarded-for'] || 'unknown';
                     const ua = (req.headers['user-agent'] || '').substring(0, 60);
