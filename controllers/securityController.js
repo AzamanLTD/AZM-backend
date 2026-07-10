@@ -463,7 +463,7 @@ exports.verifyPhoneOtp = async (req, res) => {
             });
         }
 
-        const verification = smsService.verifyOTP(phoneNumber, code);
+        const verification = await smsService.verifyOTP(phoneNumber, code);
 
         if (!verification.success) {
             return res.status(400).json({

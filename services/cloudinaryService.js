@@ -101,8 +101,15 @@ async function uploadToCloudinary(file, folder = 'others', options = {}) {
             throw new Error('File has neither buffer nor path');
         }
         
-        const localUrl = `/uploads/${resolvedFolder}/${filename}`;
-        console.log(`[CloudinaryMock] Saved local fallback file: ${destPath} -> ${localUrl}`);
+        // Return an absolute URL so Flutter/web clients can actually load it.
+        // RENDER WARNING: /uploads/ is ephemeral — files are lost on redeploy.
+        // Set CLOUDINARY_CLOUD_NAME + CLOUDINARY_API_KEY + CLOUDINARY_API_SECRET
+        // in your Render dashboard to enable persistent cloud storage.
+        const serverBase = process.env.SERVER_BASE_URL ||
+            process.env.RENDER_EXTERNAL_URL ||
+            `http://localhost:${process.env.PORT || 3000}`;
+        const localUrl = `${serverBase}/uploads/${resolvedFolder}/${filename}`;
+        console.warn(`[CloudinaryMock] ⚠️  Saved to LOCAL disk (ephemeral on Render): ${localUrl}`);
         return { url: localUrl, publicId: null };
     }
 

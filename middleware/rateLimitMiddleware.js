@@ -34,13 +34,17 @@ let _redisClient = null;
 const _getStore = () => {
     if (!process.env.REDIS_URL) return undefined;
     if (!_redisClient) {
+        // Upstash uses rediss:// (TLS). ioredis handles the protocol automatically
+        // but needs tls:{} option set explicitly when the URL is rediss://.
+        const isTLS = process.env.REDIS_URL.startsWith('rediss://');
         _redisClient = new Redis(process.env.REDIS_URL, {
             maxRetriesPerRequest: 3,
             enableReadyCheck: false,
             lazyConnect: true,
+            ...(isTLS ? { tls: {} } : {}),
         });
         _redisClient.on('error', (e) => console.error('[RateLimit] Redis error:', e.message));
-        console.log('[RateLimit] Using Redis store — multi-instance safe');
+        console.log('[RateLimit] Using Redis store — multi-instance safe' + (isTLS ? ' (TLS/Upstash)' : ''));
     }
     // A fresh RedisStore per limiter (each gets its own key prefix) but they all
     // share the single underlying connection.

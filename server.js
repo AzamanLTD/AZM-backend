@@ -501,7 +501,8 @@ if (process.env.REDIS_URL) {
     try {
         const { createAdapter } = require('@socket.io/redis-adapter');
         const { Redis } = require('ioredis');
-        const pubClient = new Redis(process.env.REDIS_URL);
+        const isTLS = process.env.REDIS_URL.startsWith('rediss://');
+        const pubClient = new Redis(process.env.REDIS_URL, isTLS ? { tls: {} } : {});
         const subClient = pubClient.duplicate();
         pubClient.on('connect', () => { redisStatus = 'connected'; });
         pubClient.on('error', (e) => {
@@ -518,6 +519,14 @@ if (process.env.REDIS_URL) {
     }
 } else {
     console.log('REDIS_URL not set — Socket.IO using in-memory adapter (single instance).');
+}
+
+// ── STARTUP: warn if Cloudinary not configured (profile pics will use local disk) ──
+if (process.env.NODE_ENV === 'production' &&
+    !(process.env.CLOUDINARY_CLOUD_NAME && process.env.CLOUDINARY_API_KEY && process.env.CLOUDINARY_API_SECRET)) {
+    console.warn('⚠️  [STARTUP] CLOUDINARY credentials not set. Profile pictures & media uploads');
+    console.warn('   will be saved to EPHEMERAL local disk — files will be lost on every redeploy.');
+    console.warn('   Set CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET in Render.');
 }
 
 // CRITICAL-4: Socket.IO JWT Authentication Middleware

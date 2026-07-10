@@ -31,8 +31,31 @@ class SMSService {
         const forceLive = process.env.SMS_FORCE_LIVE === 'true';
         this.isTestMode = process.env.NODE_ENV !== 'production' && !forceLive;
 
-        // Store OTP codes in memory for testing (use Redis in production)
-        this.otpStore = new Map();
+        // OTP store: use Redis when REDIS_URL is set (Upstash-compatible via ioredis),
+        // otherwise fall back to in-process Map (single-instance / dev only).
+        this._redisClient = null;
+        if (process.env.REDIS_URL) {
+            try {
+                const Redis = require('ioredis');
+                const isTLS = process.env.REDIS_URL.startsWith('rediss://');
+                this._redisClient = new Redis(process.env.REDIS_URL, {
+                    maxRetriesPerRequest: 2,
+                    enableReadyCheck: false,
+                    lazyConnect: true,
+                    ...(isTLS ? { tls: {} } : {}),
+                });
+                this._redisClient.on('error', (e) => {
+                    console.error('[SMSService] Redis error (OTP store):', e.message);
+                });
+                console.log('[SMSService] OTP store: Redis' + (isTLS ? ' (TLS/Upstash)' : ''));
+            } catch (e) {
+                console.warn('[SMSService] Could not init Redis OTP store, falling back to Map:', e.message);
+                this._redisClient = null;
+            }
+        } else {
+            console.warn('[SMSService] REDIS_URL not set — OTP codes stored in-process memory (not safe for multi-instance).');
+        }
+        this.otpStore = new Map(); // fallback for when Redis is unavailable
     }
 
     /**
@@ -91,13 +114,19 @@ class SMSService {
         const otp = this._generateOTP(length);
         const expiresAt = new Date(Date.now() + expiryMinutes * 60 * 1000);
         
-        // Store OTP for verification
-        this.otpStore.set(phoneNumber, {
+        // Store OTP for verification (Redis if available, else in-memory Map)
+        const otpPayload = JSON.stringify({
             code: otp,
-            expiresAt: expiresAt,
+            expiresAt: expiresAt.toISOString(),
             attempts: 0,
             maxAttempts: 3
         });
+        const otpKey = `otp:${phoneNumber}`;
+        if (this._redisClient) {
+            await this._redisClient.set(otpKey, otpPayload, 'EX', expiryMinutes * 60);
+        } else {
+            this.otpStore.set(phoneNumber, { code: otp, expiresAt, attempts: 0, maxAttempts: 3 });
+        }
 
         const message = `Your Azaman verification code is: ${otp}. Valid for ${expiryMinutes} minutes. Do not share this code.`;
         
@@ -116,45 +145,51 @@ class SMSService {
      * @param {string} code - OTP code to verify
      * @returns {Object} Verification result
      */
-    verifyOTP(phoneNumber, code) {
-        const otpData = this.otpStore.get(phoneNumber);
-        
-        if (!otpData) {
-            return {
-                success: false,
-                message: 'No OTP found for this phone number'
-            };
+    async verifyOTP(phoneNumber, code) {
+        const otpKey = `otp:${phoneNumber}`;
+        let otpData;
+
+        if (this._redisClient) {
+            const raw = await this._redisClient.get(otpKey);
+            if (!raw) {
+                return { success: false, message: 'No OTP found for this phone number' };
+            }
+            otpData = JSON.parse(raw);
+            otpData.expiresAt = new Date(otpData.expiresAt);
+        } else {
+            otpData = this.otpStore.get(phoneNumber);
+            if (!otpData) {
+                return { success: false, message: 'No OTP found for this phone number' };
+            }
         }
 
         if (new Date() > otpData.expiresAt) {
-            this.otpStore.delete(phoneNumber);
-            return {
-                success: false,
-                message: 'OTP has expired'
-            };
+            if (this._redisClient) await this._redisClient.del(otpKey);
+            else this.otpStore.delete(phoneNumber);
+            return { success: false, message: 'OTP has expired' };
         }
 
         if (otpData.attempts >= otpData.maxAttempts) {
-            this.otpStore.delete(phoneNumber);
-            return {
-                success: false,
-                message: 'Maximum verification attempts exceeded'
-            };
+            if (this._redisClient) await this._redisClient.del(otpKey);
+            else this.otpStore.delete(phoneNumber);
+            return { success: false, message: 'Maximum verification attempts exceeded' };
         }
 
         otpData.attempts++;
 
         if (otpData.code !== code) {
-            this.otpStore.set(phoneNumber, otpData);
-            return {
-                success: false,
-                message: 'Invalid OTP code',
-                attemptsLeft: otpData.maxAttempts - otpData.attempts
-            };
+            if (this._redisClient) {
+                const ttl = await this._redisClient.ttl(otpKey);
+                await this._redisClient.set(otpKey, JSON.stringify(otpData), 'EX', Math.max(ttl, 1));
+            } else {
+                this.otpStore.set(phoneNumber, otpData);
+            }
+            return { success: false, message: 'Invalid OTP code', attemptsLeft: otpData.maxAttempts - otpData.attempts };
         }
 
         // OTP verified successfully
-        this.otpStore.delete(phoneNumber);
+        if (this._redisClient) await this._redisClient.del(otpKey);
+        else this.otpStore.delete(phoneNumber);
         return {
             success: true,
             message: 'OTP verified successfully'
