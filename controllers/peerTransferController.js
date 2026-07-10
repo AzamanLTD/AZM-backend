@@ -243,7 +243,7 @@ exports.sendFunds = async (req, res) => {
             userId: receiverId,
             title: `💸 ${result.senderUsername} sent you ${transferAmount.toFixed(2)} USDC`,
             body: reference ? `Reference: "${reference}"` : `${transferAmount.toFixed(2)} USDC has been added to your balance.`,
-            category: 'GENERAL',
+            category: 'MONEY',
             actionPayload: {
                 route: `/friends/chat/${friendshipId}`,
                 action: 'OPEN_FRIEND_CHAT',
@@ -419,7 +419,7 @@ exports.requestFunds = async (req, res) => {
             userId: payerId,
             title: `💰 ${requesterUser.username} requested ${requestAmount.toFixed(2)} USDC`,
             body: reference ? `Reason: "${reference}"` : 'Open to review and fulfill this request.',
-            category: 'GENERAL',
+            category: 'MONEY',
             actionPayload: {
                 route: `/friends/chat/${friendshipId}`,
                 action: 'OPEN_FRIEND_TRANSFER_REQUEST',
@@ -643,7 +643,7 @@ exports.fulfillTransferRequest = async (req, res) => {
             userId: receiverId,
             title: `✅ ${result.payerUsername} fulfilled your request`,
             body: `${transferAmount.toFixed(2)} USDC has been added to your balance.`,
-            category: 'GENERAL',
+            category: 'MONEY',
             actionPayload: {
                 route: `/friends/chat/${friendshipId}`,
                 action: 'OPEN_FRIEND_CHAT',
@@ -809,7 +809,7 @@ exports.declineTransferRequest = async (req, res) => {
             userId: receiverId,
             title: 'Request Declined',
             body: `${declineUser.username} declined your request for ${transfer.amount.toFixed(2)} USDC.`,
-            category: 'GENERAL',
+            category: 'MONEY',
             actionPayload: {
                 route: `/friends/chat/${friendshipId}`,
                 action: 'OPEN_FRIEND_CHAT',

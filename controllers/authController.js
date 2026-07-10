@@ -334,6 +334,23 @@ exports.login = async (req, res) => {
                 { userAgent: req.headers['user-agent'], ipAddress: req.ip }
             );
 
+            // Fire-and-forget security notification for new login
+            setImmediate(async () => {
+                try {
+                    const { NotificationService } = require('../services/notificationService');
+                    const notifSvc = new NotificationService(prisma, req.app.get('io'));
+                    const ip = req.ip || req.headers['x-forwarded-for'] || 'unknown';
+                    const ua = (req.headers['user-agent'] || '').substring(0, 60);
+                    await notifSvc.sendNotification({
+                        userId: user.id,
+                        title: '🔐 New Login Detected',
+                        body: `Logged in from ${ip}. Device: ${ua || 'Unknown device'}`,
+                        category: 'SECURITY_ACCOUNT',
+                        actionPayload: { action: 'SECURITY_ALERT', ip, userAgent: ua }
+                    });
+                } catch (_) {} // non-fatal
+            });
+
             return res.status(200).json({
                 success: true,
                 message: "Login successful",

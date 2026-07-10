@@ -194,7 +194,7 @@ class NotificationService {
         return {
             title:         'Trade Started',
             body:          `Trade #${tradeId} has been opened.`,
-            category:      'VENDOR_PRIORITY',
+            category:      'MONEY',
             actionPayload: {
                 route:   `/trade/${tradeId}`,
                 action:  'OPEN_TRADE',
@@ -207,7 +207,7 @@ class NotificationService {
         return {
             title:         '🎉 Trade Complete',
             body:          `Trade #${tradeId} has been completed successfully.`,
-            category:      'GENERAL',
+            category:      'MONEY',
             actionPayload: {
                 route:   `/trade/${tradeId}`,
                 action:  'OPEN_TRADE',
@@ -235,7 +235,7 @@ class NotificationService {
             body:          amountUsdc
                 ? `GH₵${amountUsdc} USDC added to your wallet.`
                 : 'Your deposit has been confirmed.',
-            category:      'GENERAL',
+            category:      'MONEY',
             actionPayload: {
                 route:     '/wallet',
                 action:    'OPEN_WALLET',
@@ -248,7 +248,7 @@ class NotificationService {
         return {
             title:         `💸 ${fromUsername} sent you ${amountUsdc} USDC`,
             body:          `${amountUsdc} USDC has been transferred to your account.`,
-            category:      'GENERAL',
+            category:      'MONEY',
             actionPayload: {
                 route:          `/chat/${conversationId}`,
                 action:         'OPEN_CHAT',
@@ -289,7 +289,7 @@ class NotificationService {
         return {
             title:       `🏆 You're #${rank} on the Leaderboard!`,
             body:        `You traded ${totalVolume.toFixed(2)} USDC this week. A discount credit is on its way.`,
-            category:    'GENERAL',
+            category:    'SOCIAL',
             actionPayload: {
                 route:       '/leaderboard',
                 action:      'VIEW_LEADERBOARD',
@@ -426,7 +426,7 @@ class NotificationService {
     // =========================================================================
 
     _normalizeCategory(category) {
-        const valid = ['GENERAL', 'SECURITY_ACCOUNT', 'VENDOR_PRIORITY', 'ADMIN_SYSTEM', 'VAULT', 'SUSU', 'SMART_ROUTE', 'AUCTION'];
+        const valid = ['GENERAL', 'SECURITY_ACCOUNT', 'VENDOR_PRIORITY', 'ADMIN_SYSTEM', 'MONEY', 'SOCIAL', 'CHAT', 'SYSTEM', 'VAULT', 'SUSU', 'SMART_ROUTE', 'AUCTION'];
         return valid.includes(category) ? category : 'GENERAL';
     }
 }

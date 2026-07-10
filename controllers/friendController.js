@@ -245,7 +245,7 @@ exports.sendFriendRequest = async (req, res) => {
                     userId: targetId,
                     title: 'New Friend Request',
                     body: `${req.user.username || 'Someone'} wants to be your friend${message ? `: "${message}"` : '.'}`,
-                    category: 'GENERAL',
+                    category: 'SOCIAL',
                     actionPayload: {
                         route: '/friends/requests',
                         action: 'OPEN_FRIEND_REQUEST',
@@ -296,7 +296,7 @@ exports.sendFriendRequest = async (req, res) => {
             userId: targetId,
             title: 'New Friend Request',
             body: `${requesterUser.username} wants to be your friend${message ? `: "${message}"` : '.'}`,
-            category: 'GENERAL',
+            category: 'SOCIAL',
             actionPayload: {
                 route: '/friends/requests',
                 action: 'OPEN_FRIEND_REQUEST',
@@ -481,7 +481,7 @@ exports.acceptFriendRequest = async (req, res) => {
             userId: friendship.requesterId,
             title: 'Friend Request Accepted',
             body: `${friendship.addressee.username} accepted your friend request! You can now chat and transfer funds.`,
-            category: 'GENERAL',
+            category: 'SOCIAL',
             actionPayload: {
                 route: `/friends/chat/${friendship.id}`,
                 action: 'OPEN_FRIEND_CHAT',
