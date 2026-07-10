@@ -138,7 +138,7 @@ class MoolreCollectionService {
         };
         if (otpCode) body.otpcode = otpCode;
 
-        const data = await this._post('/open/transact/payment', body, this._privateHeaders());
+        const data = await this._post('/open/transact/payment', body, this._publicHeaders());
 
         if (Number(data.status) === 0) {
             const err = new Error(data.message || 'Payment initiation failed.');
@@ -161,7 +161,7 @@ class MoolreCollectionService {
         const data = await this._post('/open/transact/validate', {
             type: 1, receiver: this._sanitizeMsisdn(payerPhone),
             channel, currency: SUPPORTED_CURRENCY, accountnumber: this.accountNumber,
-        }, this._privateHeaders());
+        }, this._publicHeaders());
 
         if (Number(data.status) === 0) return null;   // not found — callers expect null
         return typeof data.data === 'string' ? data.data : null;
