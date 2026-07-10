@@ -47,6 +47,7 @@ if (IS_CONFIGURED) {
 // the key itself so the migration is non-breaking for existing callers.
 const FOLDER_MAP = {
     avatars:          'avatars',
+    'users/avatars':  'users/avatars',
     'chat/images':    'chat/images',
     'chat/audio':     'chat/audio',
     'chat/video':     'chat/video',

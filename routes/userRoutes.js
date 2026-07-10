@@ -36,7 +36,18 @@ router.put('/profile', protect, profileController.updateProfile);
 router.post(
     '/profile/avatar',
     protect,
-    avatarUpload.single('avatar'),
+    (req, res, next) => {
+        // Catch multer errors (file too large, wrong type) and return JSON
+        avatarUpload.single('avatar')(req, res, (err) => {
+            if (err) {
+                return res.status(400).json({
+                    success: false,
+                    message: err.message || 'File upload error.',
+                });
+            }
+            next();
+        });
+    },
     profileController.uploadAvatar
 );
 
