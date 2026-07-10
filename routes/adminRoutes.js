@@ -358,6 +358,8 @@ const businessAdminCtrl = require('../controllers/businessAdminController');
 router.get('/businesses',                    businessAdminCtrl.getBusinesses);
 router.post('/businesses/:bizId/suspend',    businessAdminCtrl.suspendBusiness);
 router.post('/businesses/:bizId/unsuspend',  businessAdminCtrl.unsuspendBusiness);
+router.delete('/businesses/:bizId',          businessAdminCtrl.deleteBusiness);
+router.delete('/ad-posts/:id',               businessAdminCtrl.deleteAdPost);
 
 // ─── GENERAL AUDIT LOG (append-only ledger of privileged actions) ────────────
 // NOTE: the bare GET /audit-log path above maps to the settings-change log
