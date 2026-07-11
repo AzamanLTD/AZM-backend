@@ -679,6 +679,15 @@ exports.confirmMoolreOtp = async (req, res) => {
 // ⚠️ BEFORE GOING LIVE: run a real sandbox test and log req.body verbatim to
 //    confirm the field names inside `data` (externalref, payer, amount).
 exports.moolreCollectionWebhook = async (req, res) => {
+    // Raw payload log — helps confirm Moolre is reaching this endpoint and
+    // shows the exact field names in the envelope so we can verify our
+    // data?.externalref / data?.payer / data?.amount reads are correct.
+    console.log('[moolreCollectionWebhook] RECEIVED:', JSON.stringify(req.body, null, 2));
+    console.log('[moolreCollectionWebhook] headers:', JSON.stringify({
+        'x-moolre-signature': req.headers['x-moolre-signature'],
+        'x-moolre-webhook-secret': req.headers['x-moolre-webhook-secret'] ? '***present***' : 'missing',
+    }));
+
     const prisma = req.app.get('prisma');
     try {
         const expectedSecret = process.env.MOOLRE_WEBHOOK_SECRET;
