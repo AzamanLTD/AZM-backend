@@ -107,7 +107,7 @@ class GatewayService {
      * @param {{
      *   amountGhs: number,
      *   recipientPhone: string,
-     *   network: 'MTN'|'VODAFONE'|'AIRTELTIGO',
+     *   network: 'MTN'|'TELECEL'|'AIRTELTIGO',  // VODAFONE accepted as legacy alias
      *   reference: string,                       // idempotency key — reuses TransactionHistory.txHash
      *   accountName?: string
      * }} payload

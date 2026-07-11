@@ -114,7 +114,7 @@ const logCorporatePurchase = async (req, res) => {
 // Body: {
 //   fiatGhs:          number,          // total GHS the admin sent OTC
 //   recipientPhone?:  string,          // optional (informational metadata)
-//   recipientNetwork?: 'MTN'|'VODAFONE'|'AIRTELTIGO',
+//   recipientNetwork?: 'MTN'|'TELECEL'|'AIRTELTIGO',  // VODAFONE accepted as legacy alias
 //   screenshotUrl?:   string,          // optional proof of OTC settlement
 //   gatewayReference?: string          // optional override (otherwise generated)
 // }

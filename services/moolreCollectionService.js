@@ -30,9 +30,9 @@ const SANDBOX_BASE_URL = 'https://sandbox.moolre.com';
 const SUPPORTED_CURRENCY = 'GHS';
 
 // Source: docs.moolre.com/ai/initiate-payment.md
-const PAYMENT_CHANNEL_MAP  = { MTN: 13, VODAFONE: 6, TELECEL: 6, AIRTELTIGO: 7 };
+const PAYMENT_CHANNEL_MAP  = { MTN: 13, TELECEL: 6, VODAFONE: 6, AIRTELTIGO: 7 }; // VODAFONE = legacy alias for Telecel
 // Source: docs.moolre.com/ai/validate-name.md (same as initiate-transfer.md)
-const VALIDATE_CHANNEL_MAP = { MTN: 1,  VODAFONE: 6, TELECEL: 6, AIRTELTIGO: 7 };
+const VALIDATE_CHANNEL_MAP = { MTN: 1,  TELECEL: 6, VODAFONE: 6, AIRTELTIGO: 7 }; // VODAFONE = legacy alias for Telecel
 
 class MoolreCollectionService {
     constructor(opts = {}) {

@@ -66,8 +66,32 @@ exports.fiatWithdrawal = async (req, res) => {
                                  // catch block can call reverseFiatWithdrawal.
 
     try {
-        const { amount, recipientPhone, network, accountName } = req.body;
+        const { amount, recipientPhone, network, accountName, savedAccountId } = req.body;
         const userId = req.user.id;
+
+        // ── Saved MoMo account verification (Task 3) ───────────────────────
+        // If the client passes a savedAccountId (the saved-momo account the
+        // user selected as the payout destination), verify it belongs to the
+        // user AND that isVerified === true before proceeding with the payout.
+        // This prevents withdrawals to unverified / name-not-resolved numbers.
+        if (savedAccountId) {
+            const savedAccount = await prisma.savedMomoAccount.findUnique({
+                where: { id: savedAccountId },
+            });
+            if (!savedAccount || savedAccount.userId !== userId) {
+                return res.status(404).json({
+                    success: false,
+                    message: 'Saved payout account not found.'
+                });
+            }
+            if (!savedAccount.isVerified) {
+                return res.status(400).json({
+                    success: false,
+                    code: 'ACCOUNT_NOT_VERIFIED',
+                    message: 'This payout account has not been verified. Please verify the number before withdrawing.'
+                });
+            }
+        }
 
         // ── Validation ───────────────────────────────────────────────────────
         if (!amount || Number(amount) <= 0) {
@@ -79,13 +103,16 @@ exports.fiatWithdrawal = async (req, res) => {
                 message: 'recipientPhone is required (E.164 or local format, min 9 digits).'
             });
         }
-        const networkChoice = (network || 'MTN').toString().toUpperCase();
-        if (!['MTN', 'VODAFONE', 'AIRTELTIGO'].includes(networkChoice)) {
+        let networkChoice = (network || 'MTN').toString().toUpperCase();
+        // Accept TELECEL (primary) and VODAFONE (legacy alias → Telecel) for backward compat.
+        if (!['MTN', 'TELECEL', 'VODAFONE', 'AIRTELTIGO'].includes(networkChoice)) {
             return res.status(400).json({
                 success: false,
-                message: 'network must be one of: MTN, VODAFONE, AIRTELTIGO.'
+                message: 'network must be one of: MTN, TELECEL, or AIRTELTIGO.'
             });
         }
+        // Canonicalise legacy VODAFONE → TELECEL so existing saved accounts still work.
+        if (networkChoice === 'VODAFONE') networkChoice = 'TELECEL';
         if (!gatewayService) {
             return res.status(503).json({
                 success: false,
@@ -121,14 +148,14 @@ exports.fiatWithdrawal = async (req, res) => {
         );
 
         // ── Moolre disbursement (outside the DB transaction) ────────────────
-        // Routes ALL networks through Moolre: MTN=ch1, Telecel/Vodafone=ch6, AT=ch7.
+        // Routes ALL networks through Moolre: MTN=ch1, Telecel=ch6, AT=ch7.
         let disbursementResult;
         try {
             disbursementResult = await moolreDisbursementService.initiateTransfer({
                 referenceId:    reference,
                 amountGhs:      payoutGhs,
                 recipientPhone,
-                network:        networkChoice,   // MTN | VODAFONE | AIRTELTIGO — Moolre maps to channel
+                network:        networkChoice,   // MTN | TELECEL | AIRTELTIGO — Moolre maps to channel
                 externalId:     `AZAMAN_${userId}_${Date.now()}`,
                 payerMessage:   `Azaman withdrawal ref ${reference}`,
                 payeeNote:      `Azaman MoMo payout (${networkChoice})`

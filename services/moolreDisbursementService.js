@@ -50,7 +50,7 @@
 //   • TRANSFER_ENDPOINT '/open/transact/transfer', STATUS_ENDPOINT '/open/transact/status'
 //   • BODY_KEYS.recipient='receiver', .reference='externalref', .narration='reference'
 //   • BODY_KEYS.channel/currency/amount/accountNumber, TRANSFER_TYPE_CODE=1
-//   • NETWORK_TO_CHANNEL: MTN=1, VODAFONE/TELECEL=6, AIRTELTIGO=7
+//   • NETWORK_TO_CHANNEL: MTN=1, TELECEL=6, AIRTELTIGO=7  (VODAFONE accepted as legacy alias)
 // =============================================================================
 
 const axios          = require('axios');
@@ -83,11 +83,11 @@ const BODY_KEYS = {
 const TRANSFER_TYPE_CODE     = 1;
 
 // ── ✅ CONFIRMED numeric channel codes (docs.moolre.com/ai/initiate-transfer.md) ──
-// AZM passes network ∈ {MTN, VODAFONE, AIRTELTIGO} (VODAFONE is now Telecel).
+// AZM passes network ∈ {MTN, TELECEL, AIRTELTIGO} (VODAFONE accepted as legacy alias → Telecel).
 const NETWORK_TO_CHANNEL = {
     MTN:         1,
-    VODAFONE:    6,   // a.k.a. Telecel Ghana
-    TELECEL:     6,
+    TELECEL:     6,   // Telecel Ghana (formerly Vodafone)
+    VODAFONE:    6,   // LEGACY ALIAS — Vodafone rebranded to Telecel
     AIRTELTIGO:  7,
 };
 
@@ -162,7 +162,7 @@ class MoolreDisbursementService {
      *   externalId?: string,                 // your own audit reference
      *   payerMessage?: string,
      *   payeeNote?: string,
-     *   network?: 'MTN'|'VODAFONE'|'AIRTELTIGO'  // optional; defaults MTN
+     *   network?: 'MTN'|'TELECEL'|'AIRTELTIGO'  // optional; defaults MTN (VODAFONE accepted as legacy alias)
      * }} payload
      *
      * @returns {Promise<{

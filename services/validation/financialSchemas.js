@@ -15,7 +15,7 @@ const { z } = require('zod');
 // controllers/depositController.initiateLocalFiatDeposit reads { amountGhs, provider }.
 exports.initiateFiatDepositSchema = z.object({
   amountGhs: z.coerce.number().positive('Amount must be positive'),
-  provider:  z.enum(['MTN_MOMO', 'VODAFONE_CASH', 'AIRTELTIGO', 'BANK_TRANSFER']),
+  provider:  z.enum(['MTN_MOMO', 'TELECEL_CASH', 'VODAFONE_CASH', 'AIRTELTIGO', 'BANK_TRANSFER']),
 });
 
 // ── Withdrawal ────────────────────────────────────────────────────────────────
@@ -84,12 +84,12 @@ exports.forceReleaseSchema = z.object({
 // { amountGhs, provider, phoneNumber, memo? }. Only MoMo providers are valid on
 // this endpoint (BANK_TRANSFER is not). .passthrough() keeps the optional `memo`
 // (Susu trace) intact; the controller's own checks remain as fallback.
-const MOMO_PROVIDERS = new Set(['MTN_MOMO', 'VODAFONE_CASH', 'TELECEL_CASH', 'AIRTELTIGO']);
+const MOMO_PROVIDERS = new Set(['MTN_MOMO', 'TELECEL_CASH', 'VODAFONE_CASH', 'AIRTELTIGO']);
 
 exports.initiateMoolreFiatDepositSchema = z.object({
   amountGhs:   z.coerce.number().positive({ message: 'Amount must be greater than zero.' }),
   provider:    z.string().refine(v => MOMO_PROVIDERS.has(v), {
-                 message: 'provider must be MTN_MOMO, VODAFONE_CASH, TELECEL_CASH, or AIRTELTIGO.',
+                 message: 'provider must be MTN_MOMO, TELECEL_CASH, or AIRTELTIGO.',
                }),
   phoneNumber: z.string().min(9, { message: 'A valid phone number is required.' }),
 }).passthrough();

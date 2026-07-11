@@ -106,7 +106,17 @@ const getBusinessProfile = async (prisma, { bizId, userId }) => {
 const searchBusinesses = async (prisma, { query, category, verified, limit, cursor, subcategory, priceRange, minRating, sort }) => {
     const take = Math.min(Math.max(parseInt(limit, 10) || 20, 1), 50);
 
-    const where = { isSuspended: false }; // CRITICAL: never show suspended businesses publicly
+    // Names that must never appear in the public marketplace feed (test/seed accounts).
+    const EXCLUDED_NAMES = ['test portal biz', 'azaman', 'test chop bar', 'az-qa transit test co'];
+    const where = {
+        isSuspended: false, // CRITICAL: never show suspended businesses publicly
+        NOT: {
+            businessName: {
+                in: EXCLUDED_NAMES,
+                mode: 'insensitive',
+            },
+        },
+    };
     if (query) {
         where.OR = [
             { businessName: { contains: query, mode: 'insensitive' } },

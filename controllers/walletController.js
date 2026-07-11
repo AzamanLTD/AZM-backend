@@ -202,7 +202,7 @@ exports.addSavedWallet = async (req, res) => {
         }
 
         // Phase UI Sprint (2026-05-26): SavedWallet is exclusively for
-        // PAYOUT destinations — local mobile money (MTN, Vodafone,
+        // PAYOUT destinations — local mobile money (MTN, Telecel,
         // AirtelTigo / Telecel) and crypto wallets. Global-fiat
         // handles (CashApp, Zelle, Venmo, PayPal, Apple Pay, Bank
         // Transfer) belong to the vendor's TradeAccount, not here.
@@ -237,7 +237,7 @@ exports.addSavedWallet = async (req, res) => {
         //     identify Binance Pay ID, TRC20, ERC20.
         //   • Fiat trade accounts were rejected earlier in this handler.
         const mobileMoneyNetworks = new Set([
-            'MTN_MOMO', 'VODAFONE_CASH', 'AIRTELTIGO', 'TELECEL_CASH'
+            'MTN_MOMO', 'TELECEL_CASH', 'VODAFONE_CASH', 'AIRTELTIGO'
         ]);
         if (mobileMoneyNetworks.has(requestedType)) {
             provider = type;

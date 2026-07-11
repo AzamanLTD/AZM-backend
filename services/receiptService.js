@@ -386,7 +386,8 @@ function _formatPayoutMethod(method) {
     const map = {
         'BINANCE_ID': 'Binance ID',
         'MTN_MOMO': 'MTN Mobile Money',
-        'VODAFONE_CASH': 'Vodafone Cash',
+        'TELECEL_CASH':  'Telecel Cash',
+        'VODAFONE_CASH': 'Telecel Cash',  // legacy alias
         'POLYGON_USDC': 'Polygon (USDC)',
         'BANK_TRANSFER': 'Bank Transfer',
     };
