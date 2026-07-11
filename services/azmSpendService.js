@@ -34,10 +34,10 @@ const AZM_COSTS = {
 
     // Card skins (2026-07-06): cosmetic skins for the peer-transfer chat card.
     // 'classic' is free/default and NOT in this map (never purchasable, always owned).
-    CARD_SKIN_GOLD:     20.0,
-    CARD_SKIN_MIDNIGHT: 20.0,
-    CARD_SKIN_EMERALD:  30.0,
-    CARD_SKIN_SUNSET:   30.0,
+    CARD_SKIN_GOLD:     1.0,
+    CARD_SKIN_MIDNIGHT: 1.0,
+    CARD_SKIN_EMERALD:  1.0,
+    CARD_SKIN_SUNSET:   1.0,
 };
 
 // ── Spend source keys ────────────────────────────────────────────────────────
