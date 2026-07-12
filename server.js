@@ -485,7 +485,8 @@ app.post('/api/admin/susu/release', protectRelease, adminOnlyRelease, async (req
 const io = new Server(server, {
     cors: {
         origin: corsOrigins.includes('*') ? '*' : corsOrigins,
-        methods: ["GET", "POST"]
+        methods: ["GET", "POST"],
+        credentials: true
     }
 });
 
