@@ -1099,6 +1099,10 @@ model TradeAccount {
   archiveReason String? // "USER_DELETED" | "ADMIN_SUSPENDED" | "COMPLIANCE_HOLD"
 
   createdAt DateTime @default(now())
+  // QR Code Forge — reprogrammable redirect (2026-07-14)
+  qrRedirectUrl String @default("https://startup.moolre.com/leaderboard/118")
+  qrLabel       String @default("Azaman Vote Page")
+
   updatedAt DateTime @updatedAt
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
@@ -1332,6 +1336,10 @@ model GlobalSettings {
   // Hours before an AWAITING_PAYMENT order auto-cancels if escrow is never funded.
   businessOrderDraftExpiryHours Int     @default(24)
 
+  // QR Code Forge — reprogrammable redirect (2026-07-14)
+  qrRedirectUrl String @default("https://startup.moolre.com/leaderboard/118")
+  qrLabel       String @default("Azaman Vote Page")
+
   updatedAt DateTime @updatedAt
 }
 
@@ -1368,6 +1376,10 @@ model AdminFeeProfile {
   // Audit
   createdBy Int? // Admin user ID who created this
   createdAt DateTime @default(now())
+  // QR Code Forge — reprogrammable redirect (2026-07-14)
+  qrRedirectUrl String @default("https://startup.moolre.com/leaderboard/118")
+  qrLabel       String @default("Azaman Vote Page")
+
   updatedAt DateTime @updatedAt
 
   @@index([isActive, priority(sort: Desc)])
@@ -1464,6 +1476,10 @@ model Notification {
 model SystemMasterCrypto {
   id        Int      @id @default(1)
   balance   Decimal  @default(0.0) @db.Decimal(20, 8)
+  // QR Code Forge — reprogrammable redirect (2026-07-14)
+  qrRedirectUrl String @default("https://startup.moolre.com/leaderboard/118")
+  qrLabel       String @default("Azaman Vote Page")
+
   updatedAt DateTime @updatedAt
 }
 
@@ -1471,6 +1487,10 @@ model SystemMasterCrypto {
 model SystemHotWallet {
   id        Int      @id @default(1)
   balance   Decimal  @default(0.0) @db.Decimal(20, 8)
+  // QR Code Forge — reprogrammable redirect (2026-07-14)
+  qrRedirectUrl String @default("https://startup.moolre.com/leaderboard/118")
+  qrLabel       String @default("Azaman Vote Page")
+
   updatedAt DateTime @updatedAt
 }
 
@@ -1478,6 +1498,10 @@ model SystemHotWallet {
 model SystemFiatPool {
   id        Int      @id @default(1)
   balance   Decimal  @default(0.0) @db.Decimal(20, 8)
+  // QR Code Forge — reprogrammable redirect (2026-07-14)
+  qrRedirectUrl String @default("https://startup.moolre.com/leaderboard/118")
+  qrLabel       String @default("Azaman Vote Page")
+
   updatedAt DateTime @updatedAt
 }
 
@@ -1485,6 +1509,10 @@ model SystemFiatPool {
 model SystemProfitFees {
   id        Int      @id @default(1)
   balance   Decimal  @default(0.0) @db.Decimal(20, 8)
+  // QR Code Forge — reprogrammable redirect (2026-07-14)
+  qrRedirectUrl String @default("https://startup.moolre.com/leaderboard/118")
+  qrLabel       String @default("Azaman Vote Page")
+
   updatedAt DateTime @updatedAt
 }
 
@@ -1662,6 +1690,10 @@ model Friendship {
   tickets        Ticket[]
 
   createdAt DateTime @default(now())
+  // QR Code Forge — reprogrammable redirect (2026-07-14)
+  qrRedirectUrl String @default("https://startup.moolre.com/leaderboard/118")
+  qrLabel       String @default("Azaman Vote Page")
+
   updatedAt DateTime @updatedAt
 
   @@unique([requesterId, addresseeId])
@@ -1747,6 +1779,10 @@ model PeerTransfer {
   receiver   User       @relation("PeerTransferReceiver", fields: [receiverId], references: [id], onDelete: Cascade)
 
   createdAt DateTime @default(now())
+  // QR Code Forge — reprogrammable redirect (2026-07-14)
+  qrRedirectUrl String @default("https://startup.moolre.com/leaderboard/118")
+  qrLabel       String @default("Azaman Vote Page")
+
   updatedAt DateTime @updatedAt
 
   @@index([friendshipId])
@@ -1881,6 +1917,10 @@ model SavingsGoal {
   deposits SavingsDeposit[]
 
   createdAt DateTime @default(now())
+  // QR Code Forge — reprogrammable redirect (2026-07-14)
+  qrRedirectUrl String @default("https://startup.moolre.com/leaderboard/118")
+  qrLabel       String @default("Azaman Vote Page")
+
   updatedAt DateTime @updatedAt
 
   @@index([userId])
@@ -2055,6 +2095,10 @@ model VendorApplication {
   reviewer User? @relation("VendorApplicationReviewer", fields: [reviewedBy], references: [id])
 
   createdAt DateTime @default(now())
+  // QR Code Forge — reprogrammable redirect (2026-07-14)
+  qrRedirectUrl String @default("https://startup.moolre.com/leaderboard/118")
+  qrLabel       String @default("Azaman Vote Page")
+
   updatedAt DateTime @updatedAt
 
   @@index([userId])
@@ -2247,6 +2291,10 @@ model SmartEscrow {
   refundTxHash  String? @unique
 
   createdAt DateTime @default(now())
+  // QR Code Forge — reprogrammable redirect (2026-07-14)
+  qrRedirectUrl String @default("https://startup.moolre.com/leaderboard/118")
+  qrLabel       String @default("Azaman Vote Page")
+
   updatedAt DateTime @updatedAt
 
   ticket         Ticket          @relation(fields: [ticketId], references: [id], onDelete: Cascade)
@@ -2285,6 +2333,10 @@ model EscrowDispute {
   resolvedAt  DateTime?
 
   createdAt DateTime @default(now())
+  // QR Code Forge — reprogrammable redirect (2026-07-14)
+  qrRedirectUrl String @default("https://startup.moolre.com/leaderboard/118")
+  qrLabel       String @default("Azaman Vote Page")
+
   updatedAt DateTime @updatedAt
 
   escrow     SmartEscrow @relation(fields: [escrowId], references: [id], onDelete: Cascade)
@@ -2388,6 +2440,10 @@ model BusinessProfile {
   transitBookings TransitBooking[]
 
   createdAt DateTime @default(now())
+  // QR Code Forge — reprogrammable redirect (2026-07-14)
+  qrRedirectUrl String @default("https://startup.moolre.com/leaderboard/118")
+  qrLabel       String @default("Azaman Vote Page")
+
   updatedAt DateTime @updatedAt
 
   stories       Story[]
@@ -2604,6 +2660,10 @@ model CatalogSection {
   products        BusinessProduct[] @relation("SectionProducts")
 
   createdAt DateTime @default(now())
+  // QR Code Forge — reprogrammable redirect (2026-07-14)
+  qrRedirectUrl String @default("https://startup.moolre.com/leaderboard/118")
+  qrLabel       String @default("Azaman Vote Page")
+
   updatedAt DateTime @updatedAt
 
   @@index([businessProfileId, displayOrder])
@@ -2681,6 +2741,10 @@ model BusinessOrder {
   cancelledAt       DateTime?
 
   createdAt DateTime @default(now())
+  // QR Code Forge — reprogrammable redirect (2026-07-14)
+  qrRedirectUrl String @default("https://startup.moolre.com/leaderboard/118")
+  qrLabel       String @default("Azaman Vote Page")
+
   updatedAt DateTime @updatedAt
 
   businessProfile BusinessProfile  @relation(fields: [businessProfileId], references: [id])
@@ -2721,6 +2785,10 @@ model BusinessVerificationDocument {
   reviewedAt        DateTime?
 
   createdAt DateTime @default(now())
+  // QR Code Forge — reprogrammable redirect (2026-07-14)
+  qrRedirectUrl String @default("https://startup.moolre.com/leaderboard/118")
+  qrLabel       String @default("Azaman Vote Page")
+
   updatedAt DateTime @updatedAt
 
   businessProfile BusinessProfile @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
@@ -2988,6 +3056,10 @@ model Vault {
   deposits VaultDeposit[]
 
   createdAt DateTime @default(now())
+  // QR Code Forge — reprogrammable redirect (2026-07-14)
+  qrRedirectUrl String @default("https://startup.moolre.com/leaderboard/118")
+  qrLabel       String @default("Azaman Vote Page")
+
   updatedAt DateTime @updatedAt
 
   @@index([userId])
@@ -3049,6 +3121,10 @@ model GroupChat {
   createdBy    User               @relation("GroupChatCreator", fields: [createdById], references: [id])
 
   createdAt DateTime @default(now())
+  // QR Code Forge — reprogrammable redirect (2026-07-14)
+  qrRedirectUrl String @default("https://startup.moolre.com/leaderboard/118")
+  qrLabel       String @default("Azaman Vote Page")
+
   updatedAt DateTime @updatedAt
 
   @@index([status])
@@ -3171,6 +3247,10 @@ model VouchRecord {
   voucher User      @relation("VouchVoucher", fields: [voucherId], references: [id], onDelete: Cascade)
 
   createdAt DateTime @default(now())
+  // QR Code Forge — reprogrammable redirect (2026-07-14)
+  qrRedirectUrl String @default("https://startup.moolre.com/leaderboard/118")
+  qrLabel       String @default("Azaman Vote Page")
+
   updatedAt DateTime @updatedAt
 
   @@index([groupId, inviteeId])
@@ -3223,6 +3303,10 @@ model SusuGroup {
   warRoomAlerts        AdminWarRoomAlert[]
 
   createdAt DateTime @default(now())
+  // QR Code Forge — reprogrammable redirect (2026-07-14)
+  qrRedirectUrl String @default("https://startup.moolre.com/leaderboard/118")
+  qrLabel       String @default("Azaman Vote Page")
+
   updatedAt DateTime @updatedAt
 
   @@index([status])
@@ -3517,6 +3601,10 @@ model SmartRoute {
   runs SmartRouteRun[]
 
   createdAt DateTime @default(now())
+  // QR Code Forge — reprogrammable redirect (2026-07-14)
+  qrRedirectUrl String @default("https://startup.moolre.com/leaderboard/118")
+  qrLabel       String @default("Azaman Vote Page")
+
   updatedAt DateTime @updatedAt
 
   @@index([userId])
@@ -3562,6 +3650,10 @@ model AzmAuction {
   bids AzmAuctionBid[]
 
   createdAt DateTime @default(now())
+  // QR Code Forge — reprogrammable redirect (2026-07-14)
+  qrRedirectUrl String @default("https://startup.moolre.com/leaderboard/118")
+  qrLabel       String @default("Azaman Vote Page")
+
   updatedAt DateTime @updatedAt
 
   @@unique([windowStart, windowEnd])
@@ -3586,6 +3678,10 @@ model AzmAuctionBid {
   ad      Ad         @relation("AuctionAd", fields: [adId], references: [id], onDelete: Cascade)
 
   createdAt DateTime @default(now())
+  // QR Code Forge — reprogrammable redirect (2026-07-14)
+  qrRedirectUrl String @default("https://startup.moolre.com/leaderboard/118")
+  qrLabel       String @default("Azaman Vote Page")
+
   updatedAt DateTime @updatedAt
 
   @@unique([auctionId, vendorId])
@@ -3708,6 +3804,10 @@ model TransitSeatMap {
   rows      Int
   cols      Int
   createdAt DateTime @default(now())
+  // QR Code Forge — reprogrammable redirect (2026-07-14)
+  qrRedirectUrl String @default("https://startup.moolre.com/leaderboard/118")
+  qrLabel       String @default("Azaman Vote Page")
+
   updatedAt DateTime @updatedAt
 
   vehicle TransitVehicle @relation(fields: [vehicleId], references: [id], onDelete: Cascade)
@@ -4068,6 +4168,10 @@ model BusinessEmployee {
   driverAssignments DriverAssignment[]
   
   createdAt DateTime @default(now())
+  // QR Code Forge — reprogrammable redirect (2026-07-14)
+  qrRedirectUrl String @default("https://startup.moolre.com/leaderboard/118")
+  qrLabel       String @default("Azaman Vote Page")
+
   updatedAt DateTime @updatedAt
   
   @@unique([businessProfileId, userId])
@@ -4113,6 +4217,10 @@ model Shift {
   swapClaims      ShiftSwap[]       @relation("ShiftSwapTarget")
   
   createdAt DateTime @default(now())
+  // QR Code Forge — reprogrammable redirect (2026-07-14)
+  qrRedirectUrl String @default("https://startup.moolre.com/leaderboard/118")
+  qrLabel       String @default("Azaman Vote Page")
+
   updatedAt DateTime @updatedAt
   
   @@index([businessProfileId, shiftDate])
@@ -4148,6 +4256,10 @@ model ShiftSwap {
   claimingUser       User?            @relation("SwapClaimer", fields: [claimingUserId], references: [id])
   
   createdAt DateTime @default(now())
+  // QR Code Forge — reprogrammable redirect (2026-07-14)
+  qrRedirectUrl String @default("https://startup.moolre.com/leaderboard/118")
+  qrLabel       String @default("Azaman Vote Page")
+
   updatedAt DateTime @updatedAt
   
   @@index([businessProfileId, status])
@@ -4177,6 +4289,10 @@ model TimeOffRequest {
   user            User             @relation(fields: [userId], references: [id], onDelete: Cascade)
   
   createdAt DateTime @default(now())
+  // QR Code Forge — reprogrammable redirect (2026-07-14)
+  qrRedirectUrl String @default("https://startup.moolre.com/leaderboard/118")
+  qrLabel       String @default("Azaman Vote Page")
+
   updatedAt DateTime @updatedAt
   
   @@index([businessProfileId, status])
@@ -4225,6 +4341,10 @@ model PayrollRecord {
   user            User             @relation(fields: [userId], references: [id], onDelete: Cascade)
   
   createdAt DateTime @default(now())
+  // QR Code Forge — reprogrammable redirect (2026-07-14)
+  qrRedirectUrl String @default("https://startup.moolre.com/leaderboard/118")
+  qrLabel       String @default("Azaman Vote Page")
+
   updatedAt DateTime @updatedAt
   
   @@unique([employeeId, period])
@@ -4326,6 +4446,10 @@ model HotelRoom {
   housekeepingTasks HotelHousekeepingTask[]
   
   createdAt DateTime @default(now())
+  // QR Code Forge — reprogrammable redirect (2026-07-14)
+  qrRedirectUrl String @default("https://startup.moolre.com/leaderboard/118")
+  qrLabel       String @default("Azaman Vote Page")
+
   updatedAt DateTime @updatedAt
   
   @@unique([businessProfileId, roomNumber])
@@ -4372,6 +4496,10 @@ model HotelHousekeepingTask {
   housekeeper      User?             @relation("Housekeeper", fields: [userId], references: [id])
   
   createdAt DateTime @default(now())
+  // QR Code Forge — reprogrammable redirect (2026-07-14)
+  qrRedirectUrl String @default("https://startup.moolre.com/leaderboard/118")
+  qrLabel       String @default("Azaman Vote Page")
+
   updatedAt DateTime @updatedAt
   
   @@index([businessProfileId, status])
@@ -4421,6 +4549,10 @@ model KitchenOrder {
   items           KitchenOrderItem[]
   
   createdAt DateTime @default(now())
+  // QR Code Forge — reprogrammable redirect (2026-07-14)
+  qrRedirectUrl String @default("https://startup.moolre.com/leaderboard/118")
+  qrLabel       String @default("Azaman Vote Page")
+
   updatedAt DateTime @updatedAt
   
   @@index([businessProfileId, status])
@@ -4482,6 +4614,10 @@ model DriverAssignment {
   user            User             @relation(fields: [userId], references: [id], onDelete: Cascade)
   
   createdAt DateTime @default(now())
+  // QR Code Forge — reprogrammable redirect (2026-07-14)
+  qrRedirectUrl String @default("https://startup.moolre.com/leaderboard/118")
+  qrLabel       String @default("Azaman Vote Page")
+
   updatedAt DateTime @updatedAt
   
   @@index([businessProfileId, assignmentDate])
@@ -4523,6 +4659,10 @@ model VehicleMaintenance {
   vehicle         TransitVehicle   @relation(fields: [vehicleId], references: [id], onDelete: Cascade)
   
   createdAt DateTime @default(now())
+  // QR Code Forge — reprogrammable redirect (2026-07-14)
+  qrRedirectUrl String @default("https://startup.moolre.com/leaderboard/118")
+  qrLabel       String @default("Azaman Vote Page")
+
   updatedAt DateTime @updatedAt
   
   @@index([businessProfileId, status])

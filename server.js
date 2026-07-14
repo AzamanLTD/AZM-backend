@@ -263,6 +263,7 @@ const followRoutes = require('./routes/followRoutes');
 const adPostRoutes = require('./routes/adPostRoutes');
 const dineInRoutes = require('./routes/dineInRoutes');
 const showcaseRoutes = require('./routes/showcaseRoutes');
+const qrRoutes        = require('./routes/qrRoutes');
 const marketplaceFinanceRoutes = require('./routes/marketplaceFinanceRoutes');
 const marketplaceSeatMapRoutes = require('./routes/marketplaceSeatMapRoutes');
 const marketplacePenaltyRoutes = require('./routes/marketplacePenaltyRoutes');
@@ -1236,6 +1237,7 @@ app.use('/api/admin/susu',                generalLimiter, adminSusuRoutes);
 // MARKETPLACE EXPANSION — Phase B-2
 app.use('/api/marketplace',               generalLimiter, marketplaceRoutes);
 app.use('/api/business-os',   generalLimiter,   businessOSRoutes);
+app.use('/api/qr',            generalLimiter,   qrRoutes);          // QR Forge — public redirect + admin config
 
 // --- CHAT MEDIA UPLOAD (Phase UI-3, 2026-05-26) ──────────────────────────────
 //
