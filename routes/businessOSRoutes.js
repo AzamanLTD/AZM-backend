@@ -25,6 +25,7 @@ const { EmployeeFeedbackService } = require('../services/businessOS/employeeFeed
 // Auth middleware — the existing backend exports { protect, adminOnly }
 const { protect } = require('../middleware/authMiddleware');
 const { protectActive } = require('../middleware/banGuardMiddleware');
+const { requirePermission } = require("../middleware/requirePermission");
 
 // Helper: get the shared PrismaClient from the Express app (adapter-backed)
 // The existing server.js creates ONE PrismaClient with PrismaPg adapter and
@@ -302,10 +303,12 @@ router.get('/employees', wrap(async (req, res) => {
 }));
 
 // POST /api/business-os/employees
-router.post('/employees', wrap(async (req, res) => {
+router.post('/employees', requirePermission('employees.create'), wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
+    const { logBusinessAudit } = require('../utils/businessAudit');
     const employee = await svc.employeeService.addEmployee({ ...req.body, businessProfileId: bpId });
+    await logBusinessAudit(svc.prisma, { businessProfileId: bpId, actorId: req.user.id, actorName: req.user.username, action: 'EMPLOYEE_CREATED', targetType: 'Employee', targetId: employee.id, metadata: { name: employee.fullName, email: employee.email, role: employee.role }, ipAddress: req.ip });
     res.status(201).json({ success: true, employee });
 }));
 
@@ -318,7 +321,7 @@ router.get('/employees/:id', wrap(async (req, res) => {
 }));
 
 // PATCH /api/business-os/employees/:id
-router.patch('/employees/:id', wrap(async (req, res) => {
+router.patch('/employees/:id', requirePermission('employees.manage'), wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
     const employee = await svc.employeeService.updateEmployee(req.params.id, bpId, req.body);
@@ -326,18 +329,22 @@ router.patch('/employees/:id', wrap(async (req, res) => {
 }));
 
 // DELETE /api/business-os/employees/:id
-router.delete('/employees/:id', wrap(async (req, res) => {
+router.delete('/employees/:id', requirePermission('employees.manage'), wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
+    const { logBusinessAudit } = require('../utils/businessAudit');
     await svc.employeeService.removeEmployee(req.params.id, bpId);
+    await logBusinessAudit(svc.prisma, { businessProfileId: bpId, actorId: req.user.id, actorName: req.user.username, action: 'EMPLOYEE_TERMINATED', targetType: 'Employee', targetId: req.params.id, metadata: {}, ipAddress: req.ip });
     res.status(200).json({ success: true });
 }));
 
 // POST /api/business-os/employees/:id/permissions
-router.post('/employees/:id/permissions', wrap(async (req, res) => {
+router.post('/employees/:id/permissions', requirePermission('employees.permissions'), wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
+    const { logBusinessAudit } = require('../utils/businessAudit');
     const employee = await svc.employeeService.updatePermissions(req.params.id, bpId, req.body.permissions);
+    await logBusinessAudit(svc.prisma, { businessProfileId: bpId, actorId: req.user.id, actorName: req.user.username, action: 'PERMISSION_CHANGED', targetType: 'Employee', targetId: req.params.id, metadata: { permissions: req.body.permissions }, ipAddress: req.ip });
     res.json({ success: true, employee });
 }));
 
@@ -354,7 +361,7 @@ router.get('/shifts', wrap(async (req, res) => {
 }));
 
 // POST /api/business-os/shifts
-router.post('/shifts', wrap(async (req, res) => {
+router.post('/shifts', requirePermission('shifts.create'), wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
     const shift = await svc.shiftService.createShift({ ...req.body, businessProfileId: bpId });
@@ -370,14 +377,14 @@ router.post('/shifts/rotation', wrap(async (req, res) => {
 }));
 
 // PATCH /api/business-os/shifts/:id
-router.patch('/shifts/:id', wrap(async (req, res) => {
+router.patch('/shifts/:id', requirePermission('shifts.update'), wrap(async (req, res) => {
     const svc = getServices(req);
     const shift = await svc.shiftService.updateShift(req.params.id, req.body);
     res.json({ success: true, shift });
 }));
 
 // DELETE /api/business-os/shifts/:id
-router.delete('/shifts/:id', wrap(async (req, res) => {
+router.delete('/shifts/:id', requirePermission('shifts.delete'), wrap(async (req, res) => {
     const svc = getServices(req);
     await svc.shiftService.deleteShift(req.params.id);
     res.status(200).json({ success: true });
@@ -441,13 +448,13 @@ router.post('/shifts/swaps/:id/claim', wrap(async (req, res) => {
     res.json({ success: true, swap });
 }));
 
-router.post('/shifts/swaps/:id/approve', wrap(async (req, res) => {
+router.post('/shifts/swaps/:id/approve', requirePermission('shifts.approve_swap'), wrap(async (req, res) => {
     const svc = getServices(req);
     const swap = await svc.shiftService.approveShiftSwap(req.params.id, req.body.managerNote);
     res.json({ success: true, swap });
 }));
 
-router.post('/shifts/swaps/:id/reject', wrap(async (req, res) => {
+router.post('/shifts/swaps/:id/reject', requirePermission('shifts.approve_swap'), wrap(async (req, res) => {
     const svc = getServices(req);
     const swap = await svc.shiftService.rejectShiftSwap(req.params.id, req.body.managerNote);
     res.json({ success: true, swap });
@@ -478,13 +485,13 @@ router.post('/time-off', wrap(async (req, res) => {
     res.status(201).json({ success: true, request });
 }));
 
-router.post('/time-off/:id/approve', wrap(async (req, res) => {
+router.post('/time-off/:id/approve', requirePermission('shifts.approve_timeoff'), wrap(async (req, res) => {
     const svc = getServices(req);
     const request = await svc.timeOffService.approveTimeOff(req.params.id, req.user.id, req.body.managerNote);
     res.json({ success: true, request });
 }));
 
-router.post('/time-off/:id/reject', wrap(async (req, res) => {
+router.post('/time-off/:id/reject', requirePermission('shifts.approve_timeoff'), wrap(async (req, res) => {
     const svc = getServices(req);
     const request = await svc.timeOffService.rejectTimeOff(req.params.id, req.user.id, req.body.managerNote);
     res.json({ success: true, request });
@@ -507,7 +514,7 @@ router.get('/payroll', wrap(async (req, res) => {
     res.json({ success: true, records });
 }));
 
-router.post('/payroll/process', wrap(async (req, res) => {
+router.post('/payroll/process', requirePermission('payroll.process'), wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
     const { period, employeeId } = req.body;
@@ -518,9 +525,11 @@ router.post('/payroll/process', wrap(async (req, res) => {
         const results = await svc.payrollService.processAllPayroll(bpId, period);
         res.json({ success: true, results });
     }
+    const { logBusinessAudit } = require('../utils/businessAudit');
+    await logBusinessAudit(svc.prisma, { businessProfileId: bpId, actorId: req.user.id, actorName: req.user.username, action: 'PAYROLL_PROCESSED', targetType: 'Payroll', targetId: null, metadata: { period }, ipAddress: req.ip });
 }));
 
-router.post('/payroll/disburse', wrap(async (req, res) => {
+router.post('/payroll/disburse', requirePermission('payroll.disburse'), wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
     const { payrollId, period } = req.body;
@@ -533,6 +542,8 @@ router.post('/payroll/disburse', wrap(async (req, res) => {
     } else {
         res.status(400).json({ success: false, message: 'Either payrollId or period is required.' });
     }
+    const { logBusinessAudit: _auditPay } = require('../utils/businessAudit');
+    await _auditPay(svc.prisma, { businessProfileId: bpId, actorId: req.user.id, actorName: req.user.username, action: 'PAYROLL_DISBURSED', targetType: 'Payroll', targetId: null, metadata: { payrollId, period }, ipAddress: req.ip });
 }));
 
 router.get('/payroll/summary', wrap(async (req, res) => {
@@ -582,14 +593,14 @@ router.get('/ledger', wrap(async (req, res) => {
     res.json({ success: true, result });
 }));
 
-router.post('/ledger', wrap(async (req, res) => {
+router.post('/ledger', requirePermission('finance.ledger.manage'), wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
     const entry = await svc.ledgerService.createEntry({ ...req.body, businessProfileId: bpId });
     res.status(201).json({ success: true, entry });
 }));
 
-router.delete('/ledger/:id', wrap(async (req, res) => {
+router.delete('/ledger/:id', requirePermission('finance.ledger.manage'), wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
     await svc.ledgerService.deleteEntry(req.params.id, bpId);
@@ -1181,6 +1192,229 @@ router.post('/restaurant/inventory/deduct/:orderId', protect, protectActive, wra
         }
     });
     res.json({ success: true, message: 'Inventory deducted', deductions });
+}));
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MODULE 01 — GOVERNANCE: PERMISSION TEMPLATES, AUDIT LOG, NOTIFICATIONS
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── Permission Templates ───────────────────────────────────────────────────
+
+// GET /api/business-os/permission-templates — list all available templates + keys
+router.get('/permission-templates', wrap(async (req, res) => {
+    const { PERMISSION_KEYS, ALL_KEYS, ROLE_TEMPLATES } = require('../config/permissionTemplates');
+    res.json({
+        success: true,
+        templates: ROLE_TEMPLATES,
+        permissionKeys: PERMISSION_KEYS,
+        allKeys: ALL_KEYS,
+    });
+}));
+
+// POST /api/business-os/permission-templates — save a custom template
+// (Custom templates are returned alongside system templates; they're stored
+//  in a config-style JSON on the business profile's businessMeta for simplicity)
+router.post('/permission-templates', requirePermission('settings.manage'), wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+    const { name, permissions, description } = req.body;
+    if (!name || !Array.isArray(permissions)) {
+        return res.status(400).json({ success: false, message: 'name and permissions[] are required.' });
+    }
+    const bp = await prisma.businessProfile.findUnique({ where: { id: bpId }, select: { businessMeta: true } });
+    const meta = bp.businessMeta || {};
+    const customTemplates = meta.customPermissionTemplates || [];
+    const existing = customTemplates.findIndex(t => t.name === name);
+    const template = { name, permissions, description: description || '', system: false, createdAt: new Date().toISOString() };
+    if (existing >= 0) {
+        customTemplates[existing] = { ...customTemplates[existing], ...template };
+    } else {
+        customTemplates.push(template);
+    }
+    await prisma.businessProfile.update({
+        where: { id: bpId },
+        data: { businessMeta: { ...meta, customPermissionTemplates: customTemplates } },
+    });
+    res.json({ success: true, template });
+}));
+
+// ── Audit Log ───────────────────────────────────────────────────────────────
+
+// GET /api/business-os/audit-log — paginated, filterable business audit log
+router.get('/audit-log', wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+    const { actorId, action, targetType, startDate, endDate, page = 1, limit = 50 } = req.query;
+    const pageNum = Math.max(1, parseInt(page));
+    const limitNum = Math.min(200, parseInt(limit) || 50);
+    const skip = (pageNum - 1) * limitNum;
+
+    // Build where clause — filter by businessProfileId in metadata JSON
+    // Since AuditLog stores businessProfileId inside metadata, we filter with
+    // a JSON path query. Prisma supports filtering on Json fields with
+    // stringContains for PostgreSQL jsonb.
+    const where = {
+        AND: [
+            // The _bizAudit tag + businessProfileId are set by logBusinessAudit
+            { metadata: { path: ['businessProfileId'], equals: bpId } },
+        ],
+    };
+    if (actorId) where.AND.push({ actorId: Number(actorId) });
+    if (action) where.AND.push({ action: { contains: action, mode: 'insensitive' } });
+    if (targetType) where.AND.push({ targetType });
+
+    // Date range filter
+    if (startDate || endDate) {
+        const dateFilter = {};
+        if (startDate) dateFilter.gte = new Date(startDate);
+        if (endDate) dateFilter.lte = new Date(endDate);
+        where.AND.push({ createdAt: dateFilter });
+    }
+
+    const [entries, total] = await Promise.all([
+        prisma.auditLog.findMany({
+            where,
+            orderBy: { createdAt: 'desc' },
+            skip,
+            take: limitNum,
+        }),
+        prisma.auditLog.count({ where }),
+    ]);
+
+    res.json({
+        success: true,
+        entries,
+        pagination: {
+            page: pageNum,
+            limit: limitNum,
+            total,
+            pages: Math.ceil(total / limitNum),
+        },
+    });
+}));
+
+// ── Notification Preferences ─────────────────────────────────────────────────
+
+// GET /api/business-os/notification-preferences
+router.get('/notification-preferences', wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+    const pref = await prisma.businessNotificationPreference.findUnique({
+        where: { businessProfileId: bpId },
+    });
+    // Default preferences if no row exists yet
+    const defaults = {
+        new_order:         { portal: true,  email: true  },
+        low_inventory:     { portal: true,  email: false },
+        shift_no_show:     { portal: true,  email: true  },
+        negative_review:   { portal: true,  email: true  },
+        kyb_status_change: { portal: true,  email: true  },
+        large_transaction: { portal: true,  email: true  },
+        payroll_due:       { portal: true,  email: true  },
+        maintenance_due:   { portal: true,  email: false },
+    };
+    res.json({ success: true, preferences: pref?.preferences || defaults });
+}));
+
+// PATCH /api/business-os/notification-preferences
+router.patch('/notification-preferences', requirePermission('settings.manage'), wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+    const { preferences } = req.body;
+    if (!preferences || typeof preferences !== 'object') {
+        return res.status(400).json({ success: false, message: 'preferences object is required.' });
+    }
+    const pref = await prisma.businessNotificationPreference.upsert({
+        where: { businessProfileId: bpId },
+        update: { preferences },
+        create: { businessProfileId: bpId, preferences },
+    });
+    res.json({ success: true, preferences: pref.preferences });
+}));
+
+// ── Location Hours Exceptions ───────────────────────────────────────────────
+
+// GET /api/business-os/locations/:locationId/hours-exceptions
+router.get('/locations/:locationId/hours-exceptions', wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+    // Verify the location belongs to this business
+    const loc = await prisma.businessLocation.findFirst({
+        where: { id: req.params.locationId, businessProfileId: bpId },
+    });
+    if (!loc) return res.status(404).json({ success: false, message: 'Location not found.' });
+    const exceptions = await prisma.businessLocationHoursException.findMany({
+        where: { locationId: req.params.locationId },
+        orderBy: { date: 'asc' },
+    });
+    res.json({ success: true, exceptions });
+}));
+
+// POST /api/business-os/locations/:locationId/hours-exceptions
+router.post('/locations/:locationId/hours-exceptions', requirePermission('locations.manage'), wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+    const loc = await prisma.businessLocation.findFirst({
+        where: { id: req.params.locationId, businessProfileId: bpId },
+    });
+    if (!loc) return res.status(404).json({ success: false, message: 'Location not found.' });
+    const { date, isClosed, openTime, closeTime, note } = req.body;
+    if (!date) return res.status(400).json({ success: false, message: 'date is required.' });
+    const exception = await prisma.businessLocationHoursException.upsert({
+        where: { locationId_date: { locationId: req.params.locationId, date: new Date(date) } },
+        update: { isClosed: !!isClosed, openTime, closeTime, note },
+        create: {
+            locationId: req.params.locationId,
+            date: new Date(date),
+            isClosed: !!isClosed,
+            openTime,
+            closeTime,
+            note,
+        },
+    });
+    res.json({ success: true, exception });
+}));
+
+// DELETE /api/business-os/locations/:locationId/hours-exceptions/:exceptionId
+router.delete('/locations/:locationId/hours-exceptions/:exceptionId', requirePermission('locations.manage'), wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+    const loc = await prisma.businessLocation.findFirst({
+        where: { id: req.params.locationId, businessProfileId: bpId },
+    });
+    if (!loc) return res.status(404).json({ success: false, message: 'Location not found.' });
+    await prisma.businessLocationHoursException.delete({
+        where: { id: req.params.exceptionId },
+    });
+    res.json({ success: true, message: 'Exception deleted.' });
+}));
+
+// ── Business Pause (Danger Zone) ────────────────────────────────────────────
+
+// PATCH /api/business-os/pause — toggle isPausedByOwner
+router.patch('/pause', requirePermission('settings.manage'), wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+    const { paused } = req.body;
+    const bp = await prisma.businessProfile.update({
+        where: { id: bpId },
+        data: { isPausedByOwner: !!paused },
+        select: { isPausedByOwner: true },
+    });
+    // Audit log
+    const { logBusinessAudit } = require('../utils/businessAudit');
+    await logBusinessAudit(prisma, {
+        businessProfileId: bpId,
+        actorId: req.user.id,
+        actorName: req.user.username,
+        action: paused ? 'BUSINESS_PAUSED' : 'BUSINESS_UNPAUSED',
+        targetType: 'BUSINESS_PROFILE',
+        targetId: bpId,
+        metadata: { isPausedByOwner: bp.isPausedByOwner },
+        ipAddress: req.ip,
+    });
+    res.json({ success: true, isPausedByOwner: bp.isPausedByOwner });
 }));
 
 module.exports = router;
