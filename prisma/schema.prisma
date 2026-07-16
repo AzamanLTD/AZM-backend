@@ -2469,7 +2469,6 @@ model BusinessProfile {
   vehicleMaintenances VehicleMaintenance[]
   cargoParcelsSent     CargoParcel[]
   inventoryItems       InventoryItem[]
-  locationHoursExceptions BusinessLocationHoursException[]
   notificationPreferences BusinessNotificationPreference?
 
   @@index([bizId])
