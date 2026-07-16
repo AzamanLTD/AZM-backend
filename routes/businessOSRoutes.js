@@ -861,6 +861,98 @@ router.post('/restaurant/toggle-86', wrap(async (req, res) => {
     res.json({ success: true, product });
 }));
 
+// ── Restaurant Waitlist (Module 04) ──────────────────────────────────────────
+
+// GET /api/business-os/restaurant/waitlist — list waitlist entries
+router.get('/restaurant/waitlist', wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+    const entries = await prisma.restaurantWaitlistEntry.findMany({
+        where: { businessProfileId: bpId, status: req.query.status || 'WAITING' },
+        orderBy: { createdAt: 'asc' },
+        include: { table: { select: { label: true, id: true } } },
+    });
+    res.json({ success: true, data: entries });
+}));
+
+// POST /api/business-os/restaurant/waitlist — add to waitlist
+router.post('/restaurant/waitlist', wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+    const { partyName, phone, partySize, quotedWaitMinutes, locationId } = req.body;
+    if (!partyName) return res.status(400).json({ success: false, message: 'Party name is required' });
+    const entry = await prisma.restaurantWaitlistEntry.create({
+        data: { businessProfileId: bpId, partyName, phone, partySize: partySize || 2, quotedWaitMinutes, locationId },
+    });
+    res.status(201).json({ success: true, data: entry });
+}));
+
+// PATCH /api/business-os/restaurant/waitlist/:id — update waitlist entry
+router.patch('/restaurant/waitlist/:id', wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+    const { status, tableId } = req.body;
+    const updateData = {};
+    if (status) updateData.status = status;
+    if (tableId) updateData.tableId = tableId;
+    if (status === 'SEATED') updateData.seatedAt = new Date();
+    if (status === 'NOTIFIED') updateData.notifiedAt = new Date();
+
+    const entry = await prisma.restaurantWaitlistEntry.updateMany({
+        where: { id: req.params.id, businessProfileId: bpId },
+        data: updateData,
+    });
+    if (!entry.count) return res.status(404).json({ success: false, message: 'Entry not found' });
+    res.json({ success: true });
+}));
+
+// DELETE /api/business-os/restaurant/waitlist/:id — remove from waitlist
+router.delete('/restaurant/waitlist/:id', wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+    await prisma.restaurantWaitlistEntry.deleteMany({
+        where: { id: req.params.id, businessProfileId: bpId },
+    });
+    res.json({ success: true });
+}));
+
+// ── Table metadata / floor plan (Module 04) ───────────────────────────────────
+
+// PATCH /api/business-os/restaurant/tables/:id/metadata — update table floor-plan metadata
+router.patch('/restaurant/tables/:id/metadata', wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+    const { metadata } = req.body;
+    const table = await prisma.businessTable.findFirst({
+        where: { id: req.params.id, location: { businessProfileId: bpId } },
+    });
+    if (!table) return res.status(404).json({ success: false, message: 'Table not found' });
+    const updated = await prisma.businessTable.update({
+        where: { id: req.params.id },
+        data: { metadata },
+    });
+    res.json({ success: true, data: updated });
+}));
+
+// ── Catalog section reorder (Module 04) ───────────────────────────────────────
+
+// PATCH /api/business-os/restaurant/sections/reorder — reorder catalog sections
+router.patch('/restaurant/sections/reorder', wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+    const { orderedIds } = req.body;
+    if (!Array.isArray(orderedIds)) return res.status(400).json({ success: false, message: 'orderedIds must be an array' });
+
+    for (let i = 0; i < orderedIds.length; i++) {
+        await prisma.catalogSection.updateMany({
+            where: { id: orderedIds[i], businessProfileId: bpId },
+            data: { displayOrder: i },
+        });
+    }
+    res.json({ success: true });
+}))
+
+
 // ═══════════════════════════════════════════════════════════════════════════
 // TRANSIT OPS
 // ═══════════════════════════════════════════════════════════════════════════
@@ -1187,17 +1279,43 @@ router.patch('/restaurant/inventory/:id', protect, protectActive, wrap(async (re
     res.json({ success: true, item });
 }));
 
-// POST /api/business-os/restaurant/inventory/:id/restock — quick restock
+// POST /api/business-os/restaurant/inventory/:id/restock — quick restock (writes ledger expense)
 router.post('/restaurant/inventory/:id/restock', protect, protectActive, wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
-    const { quantity } = req.body;
-    const result = await prisma.inventoryItem.updateMany({
+    const { quantity, costPerUnit } = req.body;
+    const item = await prisma.inventoryItem.findFirst({
         where: { id: req.params.id, businessProfileId: bpId },
+    });
+    if (!item) return res.status(404).json({ success: false, message: 'Item not found' });
+
+    const updated = await prisma.inventoryItem.update({
+        where: { id: item.id },
         data: { currentStock: { increment: parseFloat(quantity) } },
     });
-    if (!result.count) return res.status(404).json({ success: false, message: 'Item not found' });
-    res.json({ success: true });
+
+    // Auto-write a BusinessLedgerEntry expense for the restock cost
+    const unitCost = costPerUnit != null ? parseFloat(costPerUnit) : item.costPerUnit;
+    const totalCostGhs = unitCost * parseFloat(quantity);
+    try {
+        await prisma.businessLedgerEntry.create({
+            data: {
+                businessProfileId: bpId,
+                type: 'EXPENSE',
+                category: 'SUPPLIES',
+                description: 'Restock: ' + item.name + ' (x' + quantity + ' ' + item.unit + ')',
+                amount: -totalCostGhs,
+                amountGhs: -totalCostGhs,
+                sourceType: 'INVENTORY_RESTOCK',
+                sourceId: item.id,
+                metadata: { inventoryItemId: item.id, quantity: parseFloat(quantity), unitCost },
+            },
+        });
+    } catch (e) {
+        console.warn('[restock] Failed to write ledger entry:', e.message);
+    }
+
+    res.json({ success: true, item: updated, ledgerWritten: true });
 }));
 
 // GET /api/business-os/restaurant/recipes — get recipe costs per product

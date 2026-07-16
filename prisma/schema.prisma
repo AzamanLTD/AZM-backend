@@ -2465,6 +2465,7 @@ model BusinessProfile {
   hotelRooms         HotelRoom[]
   housekeepingTasks  HotelHousekeepingTask[]
   hotelRateOverrides HotelRateOverride[]
+  waitlistEntries   RestaurantWaitlistEntry[]
   kitchenOrders      KitchenOrder[]
   driverAssignments  DriverAssignment[]
   vehicleMaintenances VehicleMaintenance[]
@@ -2520,10 +2521,12 @@ model BusinessLocation {
   reviews         BusinessReview[]
   sections        CatalogSection[] // catalog sections scoped to this branch (2026-06-24)
   hoursExceptions  BusinessLocationHoursException[]
+  waitlistEntries  RestaurantWaitlistEntry[]
 
   createdAt  DateTime    @default(now())
   updatedAt  DateTime    @updatedAt
   dineInTabs DineInTab[]
+  waitlistEntries RestaurantWaitlistEntry[]
 
   @@index([businessProfileId])
   @@index([businessProfileId, isActive])
@@ -2536,6 +2539,7 @@ model BusinessTable {
   locationId String
   label      String  @db.VarChar(50) // e.g. "Table 4", "Counter 1", "VIP Room"
   isActive   Boolean @default(true)
+  metadata   Json?   // floor-plan layout: { positionX, positionY, shape, seats, rotation }
 
   location BusinessLocation  @relation(fields: [locationId], references: [id], onDelete: Cascade)
   invoices BusinessInvoice[]
@@ -2545,6 +2549,33 @@ model BusinessTable {
 
   @@unique([locationId, label]) // no duplicate table labels within a location
   @@index([locationId])
+}
+
+
+// ── Restaurant Waitlist (Module 04) ──────────────────────────────────────────
+// When all tables are full, host adds a party to the waitlist.
+model RestaurantWaitlistEntry {
+  id                String   @id @default(uuid())
+  businessProfileId String
+  locationId        String?
+  partyName         String   @db.VarChar(100)
+  phone             String?  @db.VarChar(20)
+  partySize         Int      @default(2)
+  quotedWaitMinutes Int?     // estimated wait in minutes
+  status            String   @default("WAITING") // WAITING, SEATED, LEFT, CANCELLED
+  notifiedAt        DateTime?
+  seatedAt          DateTime?
+  tableId           String?   // which table they were seated at
+
+  businessProfile BusinessProfile   @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+  location        BusinessLocation? @relation(fields: [locationId], references: [id])
+  table           BusinessTable?    @relation(fields: [tableId], references: [id])
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([businessProfileId, status])
+  @@index([locationId, status])
 }
 
 model BusinessInvoice {

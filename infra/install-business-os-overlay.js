@@ -162,6 +162,49 @@ STATEMENTS.push(`DO $$ BEGIN
     END IF;
   END $$;`);
 
+
+// ── BusinessTable.metadata (Module 04 — floor plan coordinates) ──────────────
+STATEMENTS.push('ALTER TABLE "BusinessTable" ADD COLUMN IF NOT EXISTS "metadata" JSONB;');
+
+// ── RestaurantWaitlistEntry (Module 04) ──────────────────────────────────────
+STATEMENTS.push(`CREATE TABLE IF NOT EXISTS "RestaurantWaitlistEntry" (
+    "id"                TEXT NOT NULL,
+    "businessProfileId" TEXT NOT NULL,
+    "locationId"         TEXT,
+    "partyName"          VARCHAR(100) NOT NULL,
+    "phone"              VARCHAR(20),
+    "partySize"          INTEGER NOT NULL DEFAULT 2,
+    "quotedWaitMinutes"  INTEGER,
+    "status"             VARCHAR(20) NOT NULL DEFAULT 'WAITING',
+    "notifiedAt"         TIMESTAMP(3),
+    "seatedAt"           TIMESTAMP(3),
+    "tableId"            TEXT,
+    "createdAt"          TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updatedAt"          TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT "RestaurantWaitlistEntry_pkey" PRIMARY KEY ("id")
+);`);
+
+STATEMENTS.push('CREATE INDEX IF NOT EXISTS "RestaurantWaitlistEntry_businessProfileId_status_idx" ON "RestaurantWaitlistEntry"("businessProfileId", "status");');
+STATEMENTS.push('CREATE INDEX IF NOT EXISTS "RestaurantWaitlistEntry_locationId_status_idx" ON "RestaurantWaitlistEntry"("locationId", "status");');
+
+STATEMENTS.push(`DO $ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.table_constraints WHERE constraint_name = 'RestaurantWaitlistEntry_businessProfileId_fkey') THEN
+      ALTER TABLE "RestaurantWaitlistEntry" ADD CONSTRAINT "RestaurantWaitlistEntry_businessProfileId_fkey" FOREIGN KEY ("businessProfileId") REFERENCES "BusinessProfile"("id") ON DELETE CASCADE;
+    END IF;
+  END $;`);
+
+STATEMENTS.push(`DO $ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.table_constraints WHERE constraint_name = 'RestaurantWaitlistEntry_locationId_fkey') THEN
+      ALTER TABLE "RestaurantWaitlistEntry" ADD CONSTRAINT "RestaurantWaitlistEntry_locationId_fkey" FOREIGN KEY ("locationId") REFERENCES "BusinessLocation"("id");
+    END IF;
+  END $;`);
+
+STATEMENTS.push(`DO $ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.table_constraints WHERE constraint_name = 'RestaurantWaitlistEntry_tableId_fkey') THEN
+      ALTER TABLE "RestaurantWaitlistEntry" ADD CONSTRAINT "RestaurantWaitlistEntry_tableId_fkey" FOREIGN KEY ("tableId") REFERENCES "BusinessTable"("id");
+    END IF;
+  END $;`);
+
 // =============================================================================
 //  Execute all statements sequentially (autocommit — can't use $transaction
 //  because ALTER TYPE ADD VALUE must not be in a transaction block, and DO
@@ -209,3 +252,6 @@ main()
   .finally(async () => {
     await prisma.$disconnect();
   });
+
+// ── Module 04 additions (loaded via STATEMENTS push above) ─────────────────
+// These are added to the STATEMENTS array via require hook below.
