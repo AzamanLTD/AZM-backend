@@ -187,23 +187,23 @@ STATEMENTS.push(`CREATE TABLE IF NOT EXISTS "RestaurantWaitlistEntry" (
 STATEMENTS.push('CREATE INDEX IF NOT EXISTS "RestaurantWaitlistEntry_businessProfileId_status_idx" ON "RestaurantWaitlistEntry"("businessProfileId", "status");');
 STATEMENTS.push('CREATE INDEX IF NOT EXISTS "RestaurantWaitlistEntry_locationId_status_idx" ON "RestaurantWaitlistEntry"("locationId", "status");');
 
-STATEMENTS.push(`DO $ BEGIN
+STATEMENTS.push(`DO $$ BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.table_constraints WHERE constraint_name = 'RestaurantWaitlistEntry_businessProfileId_fkey') THEN
       ALTER TABLE "RestaurantWaitlistEntry" ADD CONSTRAINT "RestaurantWaitlistEntry_businessProfileId_fkey" FOREIGN KEY ("businessProfileId") REFERENCES "BusinessProfile"("id") ON DELETE CASCADE;
     END IF;
-  END $;`);
+  END $$;`);
 
-STATEMENTS.push(`DO $ BEGIN
+STATEMENTS.push(`DO $$ BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.table_constraints WHERE constraint_name = 'RestaurantWaitlistEntry_locationId_fkey') THEN
       ALTER TABLE "RestaurantWaitlistEntry" ADD CONSTRAINT "RestaurantWaitlistEntry_locationId_fkey" FOREIGN KEY ("locationId") REFERENCES "BusinessLocation"("id");
     END IF;
-  END $;`);
+  END $$;`);
 
-STATEMENTS.push(`DO $ BEGIN
+STATEMENTS.push(`DO $$ BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.table_constraints WHERE constraint_name = 'RestaurantWaitlistEntry_tableId_fkey') THEN
       ALTER TABLE "RestaurantWaitlistEntry" ADD CONSTRAINT "RestaurantWaitlistEntry_tableId_fkey" FOREIGN KEY ("tableId") REFERENCES "BusinessTable"("id");
     END IF;
-  END $;`);
+  END $$;`);
 
 // =============================================================================
 //  Execute all statements sequentially (autocommit — can't use $transaction
