@@ -2464,6 +2464,7 @@ model BusinessProfile {
   employeeFeedbacks  EmployeeFeedback[]
   hotelRooms         HotelRoom[]
   housekeepingTasks  HotelHousekeepingTask[]
+  hotelRateOverrides HotelRateOverride[]
   kitchenOrders      KitchenOrder[]
   driverAssignments  DriverAssignment[]
   vehicleMaintenances VehicleMaintenance[]
@@ -4447,6 +4448,7 @@ model HotelRoom {
   businessProfile BusinessProfile  @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
   location        BusinessLocation? @relation(fields: [locationId], references: [id])
   housekeepingTasks HotelHousekeepingTask[]
+  roomBlocks      HotelRoomBlock[]
   
   createdAt DateTime @default(now())
   // QR Code Forge — reprogrammable redirect (2026-07-14)
@@ -4508,6 +4510,47 @@ model HotelHousekeepingTask {
   @@index([businessProfileId, status])
   @@index([roomId, status])
   @@index([employeeId, status])
+}
+
+
+// ── Hotel Rate Overrides ──────────────────────────────────────────────────────
+// Date-specific price overrides per room type (e.g. Christmas week, events).
+// The booking engine checks this table first before falling back to basePriceUsdc.
+model HotelRateOverride {
+  id                String   @id @default(uuid())
+  businessProfileId String
+  roomType          String?  @db.VarChar(50) // null = applies to all types
+  roomId            String?  // null = applies to whole room type
+  date              DateTime @db.Date
+  priceUsdc         Decimal  @db.Decimal(20, 8)
+  note              String?  @db.VarChar(255) // "Christmas Eve", "Event weekend"
+
+  businessProfile   BusinessProfile @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  @@unique([businessProfileId, roomType, roomId, date])
+  @@index([businessProfileId, date])
+}
+
+// ── Hotel Room Blocks ─────────────────────────────────────────────────────────
+// Blocks a room from being booked for a date range (renovation, broken AC, etc.)
+// Distinct from housekeeping status — this is a booking-engine block.
+model HotelRoomBlock {
+  id        String   @id @default(uuid())
+  roomId    String
+  startDate DateTime @db.Date
+  endDate   DateTime @db.Date
+  reason    String?  @db.VarChar(255)
+  createdBy String?  // employee id who created the block
+
+  room      HotelRoom @relation(fields: [roomId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([roomId, startDate, endDate])
 }
 
 // ── Restaurant Operations Models ──────────────────────────────────────────────

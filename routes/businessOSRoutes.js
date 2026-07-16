@@ -712,6 +712,81 @@ router.get('/hotel/front-desk', wrap(async (req, res) => {
 // ═══════════════════════════════════════════════════════════════════════════
 
 // KDS
+// ── Hotel: Rate Calendar ──────────────────────────────────────────────────────
+router.get('/hotel/rate-calendar', wrap(async (req, res) => {
+    const bpId = req.businessProfileId;
+    const days = parseInt(req.query.days) || 14;
+    const data = await svc.hotelOpsService.getRateCalendar(bpId, days);
+    res.json({ data });
+}));
+
+router.post('/hotel/rate-calendar', wrap(async (req, res) => {
+    const bpId = req.businessProfileId;
+    const override = await svc.hotelOpsService.upsertRateOverride(bpId, req.body);
+    res.json({ data: override });
+}));
+
+router.delete('/hotel/rate-calendar/:id', wrap(async (req, res) => {
+    await svc.hotelOpsService.deleteRateOverride(req.params.id);
+    res.json({ ok: true });
+}));
+
+// ── Hotel: Room Block ─────────────────────────────────────────────────────────
+router.post('/hotel/rooms/:id/block', wrap(async (req, res) => {
+    const block = await svc.hotelOpsService.blockRoom(req.params.id, req.body);
+    res.json({ data: block });
+}));
+
+router.delete('/hotel/rooms/block/:blockId', wrap(async (req, res) => {
+    await svc.hotelOpsService.deleteRoomBlock(req.params.blockId);
+    res.json({ ok: true });
+}));
+
+// ── Hotel: Room Update (full) ─────────────────────────────────────────────────
+router.patch('/hotel/rooms/:id', wrap(async (req, res) => {
+    const room = await svc.hotelOpsService.updateRoom(req.params.id, req.body);
+    res.json({ data: room });
+}));
+
+// ── Hotel: Bulk Room Creation ─────────────────────────────────────────────────
+router.post('/hotel/rooms/bulk', wrap(async (req, res) => {
+    const bpId = req.businessProfileId;
+    const result = await svc.hotelOpsService.bulkCreateRooms(bpId, req.body);
+    res.json({ data: result });
+}));
+
+// ── Hotel: Walk-In Booking ────────────────────────────────────────────────────
+router.post('/hotel/front-desk/walk-in', wrap(async (req, res) => {
+    const bpId = req.businessProfileId;
+    const reservation = await svc.hotelOpsService.createWalkIn(bpId, req.body);
+    res.json({ data: reservation });
+}));
+
+// ── Hotel: Room Move ──────────────────────────────────────────────────────────
+router.post('/hotel/front-desk/:reservationId/move-room', wrap(async (req, res) => {
+    const result = await svc.hotelOpsService.moveRoom(req.params.reservationId, req.body);
+    res.json({ data: result });
+}));
+
+// ── Hotel: Create Housekeeping Task (manual) ──────────────────────────────────
+router.post('/hotel/housekeeping', wrap(async (req, res) => {
+    const bpId = req.businessProfileId;
+    const { roomId, taskType, priority, notes, checklistItems } = req.body;
+    const task = await svc.hotelOpsService.prisma.hotelHousekeepingTask.create({
+        data: {
+            businessProfileId: bpId,
+            roomId,
+            taskType: taskType || 'DAILY_REFRESH',
+            priority: priority ? parseInt(priority) : 5,
+            description: notes,
+            checklistItems: checklistItems || [],
+            status: 'PENDING',
+        },
+    });
+    res.json({ data: task });
+}));
+
+
 router.get('/restaurant/kds', wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);

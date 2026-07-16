@@ -343,3 +343,164 @@ class HotelOpsService {
 
 module.exports = { HotelOpsService };
 
+
+// ═══ RATE OVERRIDES (injected at module level) ═════════════════════════════
+
+// Temporarily patching the class — will be clean in next refactor
+
+HotelOpsService.prototype.getRateCalendar = async function(businessProfileId, days = 14) {
+    const today = new Date(); today.setHours(0,0,0,0);
+    const end = new Date(today); end.setDate(end.getDate() + days);
+
+    const [rooms, overrides] = await Promise.all([
+        this.prisma.hotelRoom.findMany({
+            where: { businessProfileId },
+            select: { roomType: true, basePriceUsdc: true, weekendPriceUsdc: true },
+            distinct: ['roomType'],
+        }),
+        this.prisma.hotelRateOverride.findMany({
+            where: { businessProfileId, date: { gte: today, lt: end } },
+        }),
+    ]);
+
+    const dates = [];
+    for (let d = new Date(today); d < end; d.setDate(d.getDate() + 1)) {
+        dates.push(new Date(d).toISOString().split('T')[0]);
+    }
+
+    const roomTypes = [...new Set(rooms.map(r => r.roomType).filter(Boolean))];
+    const baseMap = Object.fromEntries(rooms.map(r => [r.roomType, { base: r.basePriceUsdc, weekend: r.weekendPriceUsdc }]));
+
+    const calendar = dates.map(date => {
+        const dow = new Date(date).getDay();
+        const isWeekend = dow === 0 || dow === 6;
+        const cells = {};
+        roomTypes.forEach(rt => {
+            const override = overrides.find(o => o.date.toISOString().split('T')[0] === date && (o.roomType === rt || o.roomType === null));
+            const base = baseMap[rt];
+            cells[rt] = {
+                price: override ? override.priceUsdc : (isWeekend && base?.weekend ? base.weekend : base?.base),
+                hasOverride: !!override,
+                overrideNote: override?.note || null,
+                overrideId: override?.id || null,
+            };
+        });
+        return { date, isWeekend, cells };
+    });
+
+    return { roomTypes, calendar };
+};
+
+HotelOpsService.prototype.upsertRateOverride = async function(businessProfileId, { roomType, date, priceUsdc, note }) {
+    const dateObj = new Date(date);
+    const existing = await this.prisma.hotelRateOverride.findFirst({
+        where: { businessProfileId, roomType: roomType || null, roomId: null, date: dateObj },
+    });
+    if (existing) {
+        return this.prisma.hotelRateOverride.update({
+            where: { id: existing.id },
+            data: { priceUsdc: parseFloat(priceUsdc), note },
+        });
+    }
+    return this.prisma.hotelRateOverride.create({
+        data: { businessProfileId, roomType: roomType || null, date: dateObj, priceUsdc: parseFloat(priceUsdc), note },
+    });
+};
+
+HotelOpsService.prototype.deleteRateOverride = async function(overrideId) {
+    return this.prisma.hotelRateOverride.delete({ where: { id: overrideId } });
+};
+
+HotelOpsService.prototype.blockRoom = async function(roomId, { startDate, endDate, reason }) {
+    return this.prisma.hotelRoomBlock.create({
+        data: { roomId, startDate: new Date(startDate), endDate: new Date(endDate), reason },
+    });
+};
+
+HotelOpsService.prototype.deleteRoomBlock = async function(blockId) {
+    return this.prisma.hotelRoomBlock.delete({ where: { id: blockId } });
+};
+
+HotelOpsService.prototype.createWalkIn = async function(businessProfileId, { guestName, phone, roomId, nights, depositUsdc, notes }) {
+    const room = await this.prisma.hotelRoom.findUnique({ where: { id: roomId } });
+    if (!room) throw new Error('Room not found');
+    if (room.status !== 'AVAILABLE') throw new Error('Room is not available');
+
+    const startDatetime = new Date();
+    const endDatetime = new Date(startDatetime);
+    endDatetime.setDate(endDatetime.getDate() + (parseInt(nights) || 1));
+
+    const reservation = await this.prisma.reservation.create({
+        data: {
+            businessProfileId,
+            serviceItemId: roomId,
+            customerName: guestName,
+            notes: `Phone: ${phone || 'N/A'}. ${notes || ''}`.trim(),
+            status: 'CHECKED_IN',
+            startDatetime,
+            endDatetime,
+            depositUsdc: depositUsdc ? parseFloat(depositUsdc) : null,
+            amountUsdc: room.basePriceUsdc * (parseInt(nights) || 1),
+            metadata: { channel: 'FRONT_DESK', phone },
+        },
+    });
+
+    await this.prisma.hotelRoom.update({
+        where: { id: roomId },
+        data: {
+            status: 'OCCUPIED',
+            currentReservationId: reservation.id,
+            checkedInAt: new Date(),
+            checkoutDueAt: endDatetime,
+        },
+    });
+
+    return reservation;
+};
+
+HotelOpsService.prototype.moveRoom = async function(reservationId, { newRoomId, reason }) {
+    const reservation = await this.prisma.reservation.findUnique({ where: { id: reservationId } });
+    if (!reservation) throw new Error('Reservation not found');
+    const oldRoomId = reservation.serviceItemId;
+    const newRoom = await this.prisma.hotelRoom.findUnique({ where: { id: newRoomId } });
+    if (!newRoom) throw new Error('New room not found');
+    if (newRoom.status !== 'AVAILABLE') throw new Error('New room is not available');
+
+    await Promise.all([
+        this.prisma.reservation.update({ where: { id: reservationId }, data: { serviceItemId: newRoomId, metadata: { ...reservation.metadata, movedFrom: oldRoomId, moveReason: reason } } }),
+        oldRoomId ? this.prisma.hotelRoom.update({ where: { id: oldRoomId }, data: { status: 'DIRTY', currentReservationId: null } }) : Promise.resolve(),
+        this.prisma.hotelRoom.update({ where: { id: newRoomId }, data: { status: 'OCCUPIED', currentReservationId: reservationId, checkedInAt: reservation.checkedInAt || new Date() } }),
+    ]);
+
+    return { ok: true };
+};
+
+HotelOpsService.prototype.bulkCreateRooms = async function(businessProfileId, { startNumber, endNumber, roomType, floor, basePrice, weekendPrice, capacity, locationId }) {
+    const rooms = [];
+    const start = parseInt(startNumber);
+    const end = parseInt(endNumber);
+    for (let n = start; n <= end; n++) {
+        rooms.push({
+            businessProfileId,
+            locationId: locationId || null,
+            roomNumber: String(n),
+            roomType: roomType || 'STANDARD',
+            floor: floor ? parseInt(floor) : null,
+            basePriceUsdc: parseFloat(basePrice) || 0,
+            weekendPriceUsdc: weekendPrice ? parseFloat(weekendPrice) : null,
+            capacity: parseInt(capacity) || 2,
+            status: 'AVAILABLE',
+        });
+    }
+    return this.prisma.hotelRoom.createMany({ data: rooms, skipDuplicates: true });
+};
+
+HotelOpsService.prototype.updateRoom = async function(roomId, data) {
+    const allowed = ['roomNumber', 'roomType', 'floor', 'capacity', 'bedConfig', 'basePriceUsdc', 'weekendPriceUsdc', 'amenities', 'notes', 'status'];
+    const update = {};
+    allowed.forEach(k => { if (data[k] !== undefined) update[k] = data[k]; });
+    if (data.basePrice) update.basePriceUsdc = parseFloat(data.basePrice);
+    if (data.weekendPrice) update.weekendPriceUsdc = parseFloat(data.weekendPrice);
+    return this.prisma.hotelRoom.update({ where: { id: roomId }, data: update });
+};
+
