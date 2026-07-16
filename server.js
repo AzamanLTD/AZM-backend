@@ -629,6 +629,15 @@ const { autoRelease } = require('./infra/autoRelease');
         // booting auth.test.js must not trigger the installer/seed path.
         if (process.env.NODE_ENV !== 'test') {
             await autoRelease(prisma);
+
+            // Apply business OS schema additions (Modules 01+03) idempotently.
+            // Same pattern as the susu overlay: plain DDL with IF NOT EXISTS guards.
+            try {
+                const { execSync } = require('child_process');
+                execSync('node infra/install-business-os-overlay.js', { stdio: 'inherit', timeout: 30000 });
+            } catch (e) {
+                console.warn('[business-os-overlay] boot-time install skipped:', e.message);
+            }
         }
 
         // Resolve + cache the treasury id (seeded by autoRelease if it was
