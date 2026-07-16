@@ -2470,6 +2470,7 @@ model BusinessProfile {
   driverAssignments  DriverAssignment[]
   vehicleMaintenances VehicleMaintenance[]
   cargoParcelsSent     CargoParcel[]
+  routeTemplates       TransitRouteTemplate[]
   inventoryItems       InventoryItem[]
   notificationPreferences BusinessNotificationPreference?
 
@@ -2975,6 +2976,7 @@ model TransitVehicle {
 
   driverAssignments  DriverAssignment[]
   maintenances        VehicleMaintenance[]
+  routeTemplates      TransitRouteTemplate[]
   @@index([businessProfileId])
   @@index([businessProfileId, isActive])
   @@index([type])
@@ -4779,6 +4781,7 @@ model CargoParcel {
   status            CargoStatus @default(PENDING)
   loadedAt          DateTime?
   deliveredAt       DateTime?
+  proofOfDeliveryUrl String?
   createdAt         DateTime    @default(now())
   updatedAt         DateTime    @updatedAt
 
@@ -4789,6 +4792,29 @@ model CargoParcel {
   @@index([businessProfileId])
 }
 
+
+// ── Transit: Route Templates (Module 05) ──────────────────────────────────────
+model TransitRouteTemplate {
+  id                String    @id @default(uuid())
+  businessProfileId String
+  name              String    @db.VarChar(200)
+  origin            String    @db.VarChar(255)
+  destination       String    @db.VarChar(255)
+  typicalFareUsdc   Decimal   @db.Decimal(20, 8) @default(0)
+  typicalDurationMins Int?
+  vehicleId         String?
+  defaultDepartureTimes Json?   // e.g. ["07:00", "14:00"]
+  notes             String?
+  isActive          Boolean   @default(true)
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  businessProfile BusinessProfile   @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+  vehicle         TransitVehicle?  @relation(fields: [vehicleId], references: [id], onDelete: SetNull)
+
+  @@index([businessProfileId])
+  @@index([businessProfileId, isActive])
+}
 // ── Restaurant: Inventory Management ──────────────────────────────────────────
 model InventoryItem {
   id                String  @id @default(uuid())

@@ -1214,6 +1214,152 @@ router.post('/transit/irops/reassign', protect, protectActive, wrap(async (req, 
 }));
 
 // ── RESTAURANT: INVENTORY MANAGEMENT ──────────────────────────────────────────
+// ── MODULE 05: TRANSIT ROUTE TEMPLATES ────────────────────────────────────────
+
+// GET /api/business-os/transit/routes — list route templates
+router.get('/transit/routes', protect, protectActive, wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+    const templates = await prisma.transitRouteTemplate.findMany({
+        where: { businessProfileId: bpId },
+        include: { vehicle: true },
+        orderBy: { createdAt: 'desc' },
+    });
+    res.json({ success: true, templates });
+}));
+
+// POST /api/business-os/transit/routes — create route template
+router.post('/transit/routes', protect, protectActive, wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+    const tpl = await prisma.transitRouteTemplate.create({
+        data: {
+            businessProfileId: bpId,
+            name: req.body.name,
+            origin: req.body.origin,
+            destination: req.body.destination,
+            typicalFareUsdc: req.body.typicalFareUsdc || 0,
+            typicalDurationMins: req.body.typicalDurationMins || null,
+            vehicleId: req.body.vehicleId || null,
+            defaultDepartureTimes: req.body.defaultDepartureTimes || null,
+            notes: req.body.notes || null,
+            isActive: true,
+        },
+        include: { vehicle: true },
+    });
+    res.status(201).json({ success: true, template: tpl });
+}));
+
+// DELETE /api/business-os/transit/routes/:id — delete route template
+router.delete('/transit/routes/:id', protect, protectActive, wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+    const tpl = await prisma.transitRouteTemplate.findFirst({
+        where: { id: req.params.id, businessProfileId: bpId },
+    });
+    if (!tpl) return res.status(404).json({ success: false, message: 'Route template not found' });
+    await prisma.transitRouteTemplate.delete({ where: { id: req.params.id } });
+    res.json({ success: true });
+}));
+
+// POST /api/business-os/transit/routes/generate-trips — generate trips from template
+router.post('/transit/routes/generate-trips', protect, protectActive, wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+    const { templateId, startDate, daysAhead } = req.body;
+    if (!templateId || !startDate) {
+        return res.status(400).json({ success: false, message: 'templateId and startDate are required' });
+    }
+    const tpl = await prisma.transitRouteTemplate.findFirst({
+        where: { id: templateId, businessProfileId: bpId },
+    });
+    if (!tpl) return res.status(404).json({ success: false, message: 'Route template not found' });
+    const start = new Date(startDate);
+    const days = daysAhead || 30;
+    const created = [];
+    const departureTimes = tpl.defaultDepartureTimes || ['07:00'];
+    for (let d = 0; d < days; d++) {
+        const day = new Date(start);
+        day.setDate(day.getDate() + d);
+        for (const timeStr of departureTimes) {
+            const [hh, mm] = timeStr.split(':').map(Number);
+            const departureAt = new Date(day);
+            departureAt.setHours(hh, mm || 0, 0, 0);
+            const arrivalAt = tpl.typicalDurationMins
+                ? new Date(departureAt.getTime() + tpl.typicalDurationMins * 60000) : null;
+            const trip = await prisma.transitTrip.create({
+                data: {
+                    businessProfileId: bpId, vehicleId: tpl.vehicleId,
+                    routeName: tpl.name, origin: tpl.origin, destination: tpl.destination,
+                    departureAt, arrivalAt, fareUsdc: tpl.typicalFareUsdc,
+                    availableSeats: tpl.vehicleId ? (await prisma.transitVehicle.findUnique({ where: { id: tpl.vehicleId }, select: { capacity: true } }))?.capacity || 0 : 0,
+                    status: 'SCHEDULED',
+                },
+            });
+            created.push(trip);
+        }
+    }
+    res.status(201).json({ success: true, count: created.length, trips: created });
+}));
+
+// POST /api/business-os/transit/trips/:id/cancel — cancel trip with refund handling
+router.post('/transit/trips/:id/cancel', protect, protectActive, wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+    const trip = await prisma.transitTrip.findFirst({
+        where: { id: req.params.id, businessProfileId: bpId },
+        include: { bookings: { where: { status: { in: ['PENDING', 'CONFIRMED', 'CHECKED_IN'] } } } },
+    });
+    if (!trip) return res.status(404).json({ success: false, message: 'Trip not found' });
+    if (trip.status === 'CANCELLED') return res.status(400).json({ success: false, message: 'Trip already cancelled' });
+    const affectedBookings = trip.bookings;
+    await prisma.transitTrip.update({ where: { id: req.params.id }, data: { status: 'CANCELLED' } });
+    if (affectedBookings.length > 0) {
+        await prisma.transitBooking.updateMany({
+            where: { transitTripId: req.params.id, status: { in: ['PENDING', 'CONFIRMED', 'CHECKED_IN'] } },
+            data: { status: 'CANCELLED' },
+        });
+    }
+    res.json({
+        success: true,
+        message: `Trip cancelled. ${affectedBookings.length} booking(s) marked for refund.`,
+        cancelledBookings: affectedBookings.length,
+        bookings: affectedBookings.map(b => ({ id: b.id, userId: b.userId, amountUsdc: b.amountUsdc })),
+    });
+}));
+
+// GET /api/business-os/transit/maintenance/overdue — get vehicles with overdue maintenance
+router.get('/transit/maintenance/overdue', protect, protectActive, wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+    const vehicles = await prisma.transitVehicle.findMany({
+        where: { businessProfileId: bpId, isActive: true },
+        include: { maintenances: { where: { status: 'SCHEDULED' }, orderBy: { scheduledDate: 'asc' } } },
+    });
+    const now = new Date();
+    const overdue = vehicles.filter(v => v.maintenances.some(m => new Date(m.scheduledDate) < now))
+        .map(v => ({ id: v.id, make: v.make, model: v.model, licensePlate: v.licensePlate,
+            overdueSince: v.maintenances.find(m => new Date(m.scheduledDate) < now)?.scheduledDate }));
+    res.json({ success: true, overdue });
+}));
+
+// PATCH /api/business-os/transit/cargo/:id/proof — attach proof of delivery
+router.patch('/transit/cargo/:id/proof', protect, protectActive, wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+    const cargo = await prisma.cargoParcel.findFirst({ where: { id: req.params.id, businessProfileId: bpId } });
+    if (!cargo) return res.status(404).json({ success: false, message: 'Cargo parcel not found' });
+    const updated = await prisma.cargoParcel.update({
+        where: { id: req.params.id },
+        data: {
+            proofOfDeliveryUrl: req.body.proofOfDeliveryUrl,
+            status: cargo.status === 'IN_TRANSIT' ? 'DELIVERED' : cargo.status,
+            deliveredAt: cargo.status === 'IN_TRANSIT' ? new Date() : cargo.deliveredAt,
+        },
+    });
+    res.json({ success: true, cargo: updated });
+}));
+
 
 // GET /api/business-os/restaurant/inventory — list inventory items
 router.get('/restaurant/inventory', protect, protectActive, wrap(async (req, res) => {

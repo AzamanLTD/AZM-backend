@@ -244,6 +244,43 @@ async function main() {
   }
 }
 
+
+// ── Module 05: TransitRouteTemplate table ───────────────────────────────────
+STATEMENTS.push(`CREATE TABLE IF NOT EXISTS "TransitRouteTemplate" (
+    "id"                  TEXT NOT NULL,
+    "businessProfileId"   TEXT NOT NULL,
+    "name"                VARCHAR(200) NOT NULL,
+    "origin"              VARCHAR(255) NOT NULL,
+    "destination"         VARCHAR(255) NOT NULL,
+    "typicalFareUsdc"     DECIMAL(20,8) NOT NULL DEFAULT 0,
+    "typicalDurationMins" INTEGER,
+    "vehicleId"           TEXT,
+    "defaultDepartureTimes" JSONB,
+    "notes"               TEXT,
+    "isActive"            BOOLEAN NOT NULL DEFAULT true,
+    "createdAt"           TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updatedAt"           TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT "TransitRouteTemplate_pkey" PRIMARY KEY ("id")
+);`);
+
+STATEMENTS.push('CREATE INDEX IF NOT EXISTS "TransitRouteTemplate_businessProfileId_idx" ON "TransitRouteTemplate"("businessProfileId");');
+
+STATEMENTS.push(`DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.table_constraints WHERE constraint_name = 'TransitRouteTemplate_businessProfileId_fkey') THEN
+      ALTER TABLE "TransitRouteTemplate" ADD CONSTRAINT "TransitRouteTemplate_businessProfileId_fkey" FOREIGN KEY ("businessProfileId") REFERENCES "BusinessProfile"("id") ON DELETE CASCADE;
+    END IF;
+  END $$;`);
+
+STATEMENTS.push(`DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.table_constraints WHERE constraint_name = 'TransitRouteTemplate_vehicleId_fkey') THEN
+      ALTER TABLE "TransitRouteTemplate" ADD CONSTRAINT "TransitRouteTemplate_vehicleId_fkey" FOREIGN KEY ("vehicleId") REFERENCES "TransitVehicle"("id") ON DELETE SET NULL;
+    END IF;
+  END $$;`);
+
+// ── Module 05: CargoParcel.proofOfDeliveryUrl ────────────────────────────────
+STATEMENTS.push('ALTER TABLE "CargoParcel" ADD COLUMN IF NOT EXISTS "proofOfDeliveryUrl" TEXT;');
+
+
 main()
   .catch((e) => {
     console.error('[business-os-overlay] Fatal:', e);
