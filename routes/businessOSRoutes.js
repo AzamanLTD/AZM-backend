@@ -25,6 +25,7 @@ const { EmployeeFeedbackService } = require('../services/businessOS/employeeFeed
 // Auth middleware — the existing backend exports { protect, adminOnly }
 const { protect } = require('../middleware/authMiddleware');
 const { protectActive } = require('../middleware/banGuardMiddleware');
+const { requirePermission } = require("../middleware/requirePermission");
 
 // Helper: get the shared PrismaClient from the Express app (adapter-backed)
 // The existing server.js creates ONE PrismaClient with PrismaPg adapter and
@@ -1181,6 +1182,229 @@ router.post('/restaurant/inventory/deduct/:orderId', protect, protectActive, wra
         }
     });
     res.json({ success: true, message: 'Inventory deducted', deductions });
+}));
+
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MODULE 01 — GOVERNANCE: PERMISSION TEMPLATES, AUDIT LOG, NOTIFICATIONS
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── Permission Templates ───────────────────────────────────────────────────
+
+// GET /api/business-os/permission-templates — list all available templates + keys
+router.get('/permission-templates', wrap(async (req, res) => {
+    const { PERMISSION_KEYS, ALL_KEYS, ROLE_TEMPLATES } = require('../config/permissionTemplates');
+    res.json({
+        success: true,
+        templates: ROLE_TEMPLATES,
+        permissionKeys: PERMISSION_KEYS,
+        allKeys: ALL_KEYS,
+    });
+}));
+
+// POST /api/business-os/permission-templates — save a custom template
+// (Custom templates are returned alongside system templates; they're stored
+//  in a config-style JSON on the business profile's businessMeta for simplicity)
+router.post('/permission-templates', requirePermission('settings.manage'), wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+    const { name, permissions, description } = req.body;
+    if (!name || !Array.isArray(permissions)) {
+        return res.status(400).json({ success: false, message: 'name and permissions[] are required.' });
+    }
+    const bp = await prisma.businessProfile.findUnique({ where: { id: bpId }, select: { businessMeta: true } });
+    const meta = bp.businessMeta || {};
+    const customTemplates = meta.customPermissionTemplates || [];
+    const existing = customTemplates.findIndex(t => t.name === name);
+    const template = { name, permissions, description: description || '', system: false, createdAt: new Date().toISOString() };
+    if (existing >= 0) {
+        customTemplates[existing] = { ...customTemplates[existing], ...template };
+    } else {
+        customTemplates.push(template);
+    }
+    await prisma.businessProfile.update({
+        where: { id: bpId },
+        data: { businessMeta: { ...meta, customPermissionTemplates: customTemplates } },
+    });
+    res.json({ success: true, template });
+}));
+
+// ── Audit Log ───────────────────────────────────────────────────────────────
+
+// GET /api/business-os/audit-log — paginated, filterable business audit log
+router.get('/audit-log', wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+    const { actorId, action, targetType, startDate, endDate, page = 1, limit = 50 } = req.query;
+    const pageNum = Math.max(1, parseInt(page));
+    const limitNum = Math.min(200, parseInt(limit) || 50);
+    const skip = (pageNum - 1) * limitNum;
+
+    // Build where clause — filter by businessProfileId in metadata JSON
+    // Since AuditLog stores businessProfileId inside metadata, we filter with
+    // a JSON path query. Prisma supports filtering on Json fields with
+    // stringContains for PostgreSQL jsonb.
+    const where = {
+        AND: [
+            // The _bizAudit tag + businessProfileId are set by logBusinessAudit
+            { metadata: { path: ['businessProfileId'], equals: bpId } },
+        ],
+    };
+    if (actorId) where.AND.push({ actorId: Number(actorId) });
+    if (action) where.AND.push({ action: { contains: action, mode: 'insensitive' } });
+    if (targetType) where.AND.push({ targetType });
+
+    // Date range filter
+    if (startDate || endDate) {
+        const dateFilter = {};
+        if (startDate) dateFilter.gte = new Date(startDate);
+        if (endDate) dateFilter.lte = new Date(endDate);
+        where.AND.push({ createdAt: dateFilter });
+    }
+
+    const [entries, total] = await Promise.all([
+        prisma.auditLog.findMany({
+            where,
+            orderBy: { createdAt: 'desc' },
+            skip,
+            take: limitNum,
+        }),
+        prisma.auditLog.count({ where }),
+    ]);
+
+    res.json({
+        success: true,
+        entries,
+        pagination: {
+            page: pageNum,
+            limit: limitNum,
+            total,
+            pages: Math.ceil(total / limitNum),
+        },
+    });
+}));
+
+// ── Notification Preferences ─────────────────────────────────────────────────
+
+// GET /api/business-os/notification-preferences
+router.get('/notification-preferences', wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+    const pref = await prisma.businessNotificationPreference.findUnique({
+        where: { businessProfileId: bpId },
+    });
+    // Default preferences if no row exists yet
+    const defaults = {
+        new_order:         { portal: true,  email: true  },
+        low_inventory:     { portal: true,  email: false },
+        shift_no_show:     { portal: true,  email: true  },
+        negative_review:   { portal: true,  email: true  },
+        kyb_status_change: { portal: true,  email: true  },
+        large_transaction: { portal: true,  email: true  },
+        payroll_due:       { portal: true,  email: true  },
+        maintenance_due:   { portal: true,  email: false },
+    };
+    res.json({ success: true, preferences: pref?.preferences || defaults });
+}));
+
+// PATCH /api/business-os/notification-preferences
+router.patch('/notification-preferences', wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+    const { preferences } = req.body;
+    if (!preferences || typeof preferences !== 'object') {
+        return res.status(400).json({ success: false, message: 'preferences object is required.' });
+    }
+    const pref = await prisma.businessNotificationPreference.upsert({
+        where: { businessProfileId: bpId },
+        update: { preferences },
+        create: { businessProfileId: bpId, preferences },
+    });
+    res.json({ success: true, preferences: pref.preferences });
+}));
+
+// ── Location Hours Exceptions ───────────────────────────────────────────────
+
+// GET /api/business-os/locations/:locationId/hours-exceptions
+router.get('/locations/:locationId/hours-exceptions', wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+    // Verify the location belongs to this business
+    const loc = await prisma.businessLocation.findFirst({
+        where: { id: req.params.locationId, businessProfileId: bpId },
+    });
+    if (!loc) return res.status(404).json({ success: false, message: 'Location not found.' });
+    const exceptions = await prisma.businessLocationHoursException.findMany({
+        where: { locationId: req.params.locationId },
+        orderBy: { date: 'asc' },
+    });
+    res.json({ success: true, exceptions });
+}));
+
+// POST /api/business-os/locations/:locationId/hours-exceptions
+router.post('/locations/:locationId/hours-exceptions', wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+    const loc = await prisma.businessLocation.findFirst({
+        where: { id: req.params.locationId, businessProfileId: bpId },
+    });
+    if (!loc) return res.status(404).json({ success: false, message: 'Location not found.' });
+    const { date, isClosed, openTime, closeTime, note } = req.body;
+    if (!date) return res.status(400).json({ success: false, message: 'date is required.' });
+    const exception = await prisma.businessLocationHoursException.upsert({
+        where: { locationId_date: { locationId: req.params.locationId, date: new Date(date) } },
+        update: { isClosed: !!isClosed, openTime, closeTime, note },
+        create: {
+            locationId: req.params.locationId,
+            date: new Date(date),
+            isClosed: !!isClosed,
+            openTime,
+            closeTime,
+            note,
+        },
+    });
+    res.json({ success: true, exception });
+}));
+
+// DELETE /api/business-os/locations/:locationId/hours-exceptions/:exceptionId
+router.delete('/locations/:locationId/hours-exceptions/:exceptionId', wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+    const loc = await prisma.businessLocation.findFirst({
+        where: { id: req.params.locationId, businessProfileId: bpId },
+    });
+    if (!loc) return res.status(404).json({ success: false, message: 'Location not found.' });
+    await prisma.businessLocationHoursException.delete({
+        where: { id: req.params.exceptionId },
+    });
+    res.json({ success: true, message: 'Exception deleted.' });
+}));
+
+// ── Business Pause (Danger Zone) ────────────────────────────────────────────
+
+// PATCH /api/business-os/pause — toggle isPausedByOwner
+router.patch('/pause', wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+    const { paused } = req.body;
+    const bp = await prisma.businessProfile.update({
+        where: { id: bpId },
+        data: { isPausedByOwner: !!paused },
+        select: { isPausedByOwner: true },
+    });
+    // Audit log
+    const { logBusinessAudit } = require('../utils/businessAudit');
+    await logBusinessAudit(prisma, {
+        businessProfileId: bpId,
+        actorId: req.user.id,
+        actorName: req.user.username,
+        action: paused ? 'BUSINESS_PAUSED' : 'BUSINESS_UNPAUSED',
+        targetType: 'BUSINESS_PROFILE',
+        targetId: bpId,
+        metadata: { isPausedByOwner: bp.isPausedByOwner },
+        ipAddress: req.ip,
+    });
+    res.json({ success: true, isPausedByOwner: bp.isPausedByOwner });
 }));
 
 module.exports = router;

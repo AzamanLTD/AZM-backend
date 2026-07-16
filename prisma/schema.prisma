@@ -2403,6 +2403,7 @@ model BusinessProfile {
   // Admin moderation (WS4): a suspended business is hidden/blocked from new
   // activity until an admin unsuspends it. suspendReason is operator-facing.
   isSuspended   Boolean @default(false)
+  isPausedByOwner  Boolean @default(false) // owner-initiated pause — stops new orders/bookings without admin suspension
   suspendReason String? @db.VarChar(500)
 
   // Public contact info
@@ -2468,6 +2469,8 @@ model BusinessProfile {
   vehicleMaintenances VehicleMaintenance[]
   cargoParcelsSent     CargoParcel[]
   inventoryItems       InventoryItem[]
+  locationHoursExceptions BusinessLocationHoursException[]
+  notificationPreferences BusinessNotificationPreference?
 
   @@index([bizId])
   @@index([category])
@@ -2516,6 +2519,7 @@ model BusinessLocation {
   invoices        BusinessInvoice[]
   reviews         BusinessReview[]
   sections        CatalogSection[] // catalog sections scoped to this branch (2026-06-24)
+  hoursExceptions  BusinessLocationHoursException[]
 
   createdAt  DateTime    @default(now())
   updatedAt  DateTime    @updatedAt
@@ -4746,4 +4750,46 @@ model RecipeIngredient {
   @@unique([productId, inventoryItemId])
   @@index([productId])
   @@index([inventoryItemId])
+}
+
+// =============================================================================
+// MODULE 01 — GOVERNANCE ADDITIONS (2026-07-16)
+// =============================================================================
+
+// ── Business Location Hours Exceptions ─────────────────────────────────────
+// Holiday/exception hours per location — overrides the recurring operatingHours
+// JSON for specific dates (e.g. New Year's Eve, public holidays).
+model BusinessLocationHoursException {
+  id                String  @id @default(uuid())
+  locationId        String
+  date              DateTime  @db.Date
+  isClosed          Boolean   @default(false)
+  openTime          String?   @db.VarChar(10) // "08:00"
+  closeTime         String?   @db.VarChar(10) // "18:00"
+  note              String?   @db.VarChar(255) // "Christmas Eve — half day"
+
+  location          BusinessLocation @relation(fields: [locationId], references: [id], onDelete: Cascade)
+
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  @@unique([locationId, date])
+  @@index([locationId])
+}
+
+// ── Business Notification Preferences ──────────────────────────────────────
+// Per-business owner-controlled notification preferences per event type.
+// Stored as a single row per business; if no row exists, defaults apply.
+model BusinessNotificationPreference {
+  id                String  @id @default(uuid())
+  businessProfileId String  @unique
+  // JSON shape: { new_order: { portal: true, email: true }, low_inventory: { portal: true, email: false }, ... }
+  // Event types: new_order, low_inventory, shift_no_show, negative_review,
+  // kyb_status_change, large_transaction, payroll_due, maintenance_due
+  preferences       Json    @default("{}")
+
+  businessProfile   BusinessProfile @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
 }
