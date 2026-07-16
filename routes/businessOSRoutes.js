@@ -303,10 +303,12 @@ router.get('/employees', wrap(async (req, res) => {
 }));
 
 // POST /api/business-os/employees
-router.post('/employees', wrap(async (req, res) => {
+router.post('/employees', requirePermission('employees.create'), wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
+    const { logBusinessAudit } = require('../utils/businessAudit');
     const employee = await svc.employeeService.addEmployee({ ...req.body, businessProfileId: bpId });
+    await logBusinessAudit(svc.prisma, { businessProfileId: bpId, actorId: req.user.id, actorName: req.user.username, action: 'EMPLOYEE_CREATED', targetType: 'Employee', targetId: employee.id, metadata: { name: employee.fullName, email: employee.email, role: employee.role }, ipAddress: req.ip });
     res.status(201).json({ success: true, employee });
 }));
 
@@ -319,7 +321,7 @@ router.get('/employees/:id', wrap(async (req, res) => {
 }));
 
 // PATCH /api/business-os/employees/:id
-router.patch('/employees/:id', wrap(async (req, res) => {
+router.patch('/employees/:id', requirePermission('employees.manage'), wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
     const employee = await svc.employeeService.updateEmployee(req.params.id, bpId, req.body);
@@ -327,18 +329,22 @@ router.patch('/employees/:id', wrap(async (req, res) => {
 }));
 
 // DELETE /api/business-os/employees/:id
-router.delete('/employees/:id', wrap(async (req, res) => {
+router.delete('/employees/:id', requirePermission('employees.manage'), wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
+    const { logBusinessAudit } = require('../utils/businessAudit');
     await svc.employeeService.removeEmployee(req.params.id, bpId);
+    await logBusinessAudit(svc.prisma, { businessProfileId: bpId, actorId: req.user.id, actorName: req.user.username, action: 'EMPLOYEE_TERMINATED', targetType: 'Employee', targetId: req.params.id, metadata: {}, ipAddress: req.ip });
     res.status(200).json({ success: true });
 }));
 
 // POST /api/business-os/employees/:id/permissions
-router.post('/employees/:id/permissions', wrap(async (req, res) => {
+router.post('/employees/:id/permissions', requirePermission('employees.permissions'), wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
+    const { logBusinessAudit } = require('../utils/businessAudit');
     const employee = await svc.employeeService.updatePermissions(req.params.id, bpId, req.body.permissions);
+    await logBusinessAudit(svc.prisma, { businessProfileId: bpId, actorId: req.user.id, actorName: req.user.username, action: 'PERMISSION_CHANGED', targetType: 'Employee', targetId: req.params.id, metadata: { permissions: req.body.permissions }, ipAddress: req.ip });
     res.json({ success: true, employee });
 }));
 
@@ -355,7 +361,7 @@ router.get('/shifts', wrap(async (req, res) => {
 }));
 
 // POST /api/business-os/shifts
-router.post('/shifts', wrap(async (req, res) => {
+router.post('/shifts', requirePermission('shifts.create'), wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
     const shift = await svc.shiftService.createShift({ ...req.body, businessProfileId: bpId });
@@ -371,14 +377,14 @@ router.post('/shifts/rotation', wrap(async (req, res) => {
 }));
 
 // PATCH /api/business-os/shifts/:id
-router.patch('/shifts/:id', wrap(async (req, res) => {
+router.patch('/shifts/:id', requirePermission('shifts.update'), wrap(async (req, res) => {
     const svc = getServices(req);
     const shift = await svc.shiftService.updateShift(req.params.id, req.body);
     res.json({ success: true, shift });
 }));
 
 // DELETE /api/business-os/shifts/:id
-router.delete('/shifts/:id', wrap(async (req, res) => {
+router.delete('/shifts/:id', requirePermission('shifts.delete'), wrap(async (req, res) => {
     const svc = getServices(req);
     await svc.shiftService.deleteShift(req.params.id);
     res.status(200).json({ success: true });
@@ -442,13 +448,13 @@ router.post('/shifts/swaps/:id/claim', wrap(async (req, res) => {
     res.json({ success: true, swap });
 }));
 
-router.post('/shifts/swaps/:id/approve', wrap(async (req, res) => {
+router.post('/shifts/swaps/:id/approve', requirePermission('shifts.approve_swap'), wrap(async (req, res) => {
     const svc = getServices(req);
     const swap = await svc.shiftService.approveShiftSwap(req.params.id, req.body.managerNote);
     res.json({ success: true, swap });
 }));
 
-router.post('/shifts/swaps/:id/reject', wrap(async (req, res) => {
+router.post('/shifts/swaps/:id/reject', requirePermission('shifts.approve_swap'), wrap(async (req, res) => {
     const svc = getServices(req);
     const swap = await svc.shiftService.rejectShiftSwap(req.params.id, req.body.managerNote);
     res.json({ success: true, swap });
@@ -479,13 +485,13 @@ router.post('/time-off', wrap(async (req, res) => {
     res.status(201).json({ success: true, request });
 }));
 
-router.post('/time-off/:id/approve', wrap(async (req, res) => {
+router.post('/time-off/:id/approve', requirePermission('shifts.approve_timeoff'), wrap(async (req, res) => {
     const svc = getServices(req);
     const request = await svc.timeOffService.approveTimeOff(req.params.id, req.user.id, req.body.managerNote);
     res.json({ success: true, request });
 }));
 
-router.post('/time-off/:id/reject', wrap(async (req, res) => {
+router.post('/time-off/:id/reject', requirePermission('shifts.approve_timeoff'), wrap(async (req, res) => {
     const svc = getServices(req);
     const request = await svc.timeOffService.rejectTimeOff(req.params.id, req.user.id, req.body.managerNote);
     res.json({ success: true, request });
@@ -508,7 +514,7 @@ router.get('/payroll', wrap(async (req, res) => {
     res.json({ success: true, records });
 }));
 
-router.post('/payroll/process', wrap(async (req, res) => {
+router.post('/payroll/process', requirePermission('payroll.process'), wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
     const { period, employeeId } = req.body;
@@ -519,9 +525,11 @@ router.post('/payroll/process', wrap(async (req, res) => {
         const results = await svc.payrollService.processAllPayroll(bpId, period);
         res.json({ success: true, results });
     }
+    const { logBusinessAudit } = require('../utils/businessAudit');
+    await logBusinessAudit(svc.prisma, { businessProfileId: bpId, actorId: req.user.id, actorName: req.user.username, action: 'PAYROLL_PROCESSED', targetType: 'Payroll', targetId: null, metadata: { period }, ipAddress: req.ip });
 }));
 
-router.post('/payroll/disburse', wrap(async (req, res) => {
+router.post('/payroll/disburse', requirePermission('payroll.disburse'), wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
     const { payrollId, period } = req.body;
@@ -534,6 +542,8 @@ router.post('/payroll/disburse', wrap(async (req, res) => {
     } else {
         res.status(400).json({ success: false, message: 'Either payrollId or period is required.' });
     }
+    const { logBusinessAudit: _auditPay } = require('../utils/businessAudit');
+    await _auditPay(svc.prisma, { businessProfileId: bpId, actorId: req.user.id, actorName: req.user.username, action: 'PAYROLL_DISBURSED', targetType: 'Payroll', targetId: null, metadata: { payrollId, period }, ipAddress: req.ip });
 }));
 
 router.get('/payroll/summary', wrap(async (req, res) => {
@@ -583,14 +593,14 @@ router.get('/ledger', wrap(async (req, res) => {
     res.json({ success: true, result });
 }));
 
-router.post('/ledger', wrap(async (req, res) => {
+router.post('/ledger', requirePermission('finance.ledger.manage'), wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
     const entry = await svc.ledgerService.createEntry({ ...req.body, businessProfileId: bpId });
     res.status(201).json({ success: true, entry });
 }));
 
-router.delete('/ledger/:id', wrap(async (req, res) => {
+router.delete('/ledger/:id', requirePermission('finance.ledger.manage'), wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
     await svc.ledgerService.deleteEntry(req.params.id, bpId);
@@ -1308,7 +1318,7 @@ router.get('/notification-preferences', wrap(async (req, res) => {
 }));
 
 // PATCH /api/business-os/notification-preferences
-router.patch('/notification-preferences', wrap(async (req, res) => {
+router.patch('/notification-preferences', requirePermission('settings.manage'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
     const { preferences } = req.body;
@@ -1342,7 +1352,7 @@ router.get('/locations/:locationId/hours-exceptions', wrap(async (req, res) => {
 }));
 
 // POST /api/business-os/locations/:locationId/hours-exceptions
-router.post('/locations/:locationId/hours-exceptions', wrap(async (req, res) => {
+router.post('/locations/:locationId/hours-exceptions', requirePermission('locations.manage'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
     const loc = await prisma.businessLocation.findFirst({
@@ -1367,7 +1377,7 @@ router.post('/locations/:locationId/hours-exceptions', wrap(async (req, res) => 
 }));
 
 // DELETE /api/business-os/locations/:locationId/hours-exceptions/:exceptionId
-router.delete('/locations/:locationId/hours-exceptions/:exceptionId', wrap(async (req, res) => {
+router.delete('/locations/:locationId/hours-exceptions/:exceptionId', requirePermission('locations.manage'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
     const loc = await prisma.businessLocation.findFirst({
@@ -1383,7 +1393,7 @@ router.delete('/locations/:locationId/hours-exceptions/:exceptionId', wrap(async
 // ── Business Pause (Danger Zone) ────────────────────────────────────────────
 
 // PATCH /api/business-os/pause — toggle isPausedByOwner
-router.patch('/pause', wrap(async (req, res) => {
+router.patch('/pause', requirePermission('settings.manage'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
     const { paused } = req.body;
