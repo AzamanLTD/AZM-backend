@@ -2521,16 +2521,15 @@ model BusinessLocation {
   reviews         BusinessReview[]
   sections        CatalogSection[] // catalog sections scoped to this branch (2026-06-24)
   hoursExceptions  BusinessLocationHoursException[]
-  waitlistEntries  RestaurantWaitlistEntry[]
 
   createdAt  DateTime    @default(now())
   updatedAt  DateTime    @updatedAt
   dineInTabs DineInTab[]
-  waitlistEntries RestaurantWaitlistEntry[]
 
   @@index([businessProfileId])
   @@index([businessProfileId, isActive])
   @@index([latitude]) // used by bounding-box nearby search
+  waitlistEntries RestaurantWaitlistEntry[]
   @@index([longitude])
 }
 
@@ -2546,6 +2545,7 @@ model BusinessTable {
 
   createdAt  DateTime    @default(now())
   dineInTabs DineInTab[]
+  waitlistEntries RestaurantWaitlistEntry[]
 
   @@unique([locationId, label]) // no duplicate table labels within a location
   @@index([locationId])
