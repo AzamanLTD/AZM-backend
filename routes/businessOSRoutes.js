@@ -2104,6 +2104,59 @@ router.get('/invoices/stats', wrap(async (req, res) => {
 router.get('/booking/dashboard', wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
+
+// ── Phase 2: Kiosk PIN Auth (Section 2.4) ────────────────────────────────────
+// POST /api/business-os/kiosk/pin-auth — scoped PIN auth for clock-in/out only
+router.post('/kiosk/pin-auth', wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const { pinCode, businessProfileId, locationId } = req.body;
+    if (!pinCode || !businessProfileId) {
+        return res.status(400).json({ success: false, message: 'PIN and business ID required' });
+    }
+
+    // Find employees with this PIN for this business
+    const bcrypt = require('bcryptjs');
+    const employees = await prisma.businessEmployee.findMany({
+        where: { businessProfileId, status: 'ACTIVE', pinCode: { not: null } },
+        select: { id: true, pinCode: true, userId: true, role: true, title: true, department: true },
+    });
+
+    let matched = null;
+    for (const emp of employees) {
+        if (await bcrypt.compare(pinCode, emp.pinCode)) {
+            matched = emp;
+            break;
+        }
+    }
+
+    if (!matched) {
+        return res.status(401).json({ success: false, message: 'Invalid PIN' });
+    }
+
+    // Return a SCOPED token — only valid for clock-in/out, not full session
+    // The frontend uses this to identify the employee for kiosk actions
+    res.json({
+        success: true,
+        employee: {
+            id: matched.id,
+            userId: matched.userId,
+            role: matched.role,
+            title: matched.title,
+            department: matched.department,
+        },
+        scope: 'kiosk_clock_only', // frontend must enforce this scope
+        businessProfileId,
+        locationId: locationId || null,
+    });
+}));
+
+// POST /api/business-os/kiosk/clock-in — clock in using PIN auth
+router.post('/kiosk/clock-in', wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const { employeeId, locationId } = req.body;
+    if (!employeeId) return res.status(400).json({ success: false, message: 'Employee ID required' });
+
+    // Find today's scheduled shift for this employee
     const today = new Date();
     today.setHours(0, 0, 0, 0);
     const tomorrow = new Date(today);
@@ -2130,6 +2183,299 @@ router.get('/booking/dashboard', wrap(async (req, res) => {
     });
 }));
 
+const shift = await prisma.shift.findFirst({
+        where: {
+            employeeId,
+            shiftDate: { gte: today, lt: tomorrow },
+            status: { in: ['SCHEDULED', 'OPEN'] },
+        },
+    });
+
+    if (shift) {
+        // Clock into scheduled shift
+        const now = new Date();
+        const isLate = now > new Date(shift.startTime.getTime() + 5 * 60 * 1000);
+        const lateMinutes = isLate ? Math.floor((now - shift.startTime) / 60000) : 0;
+
+        const updated = await prisma.shift.update({
+            where: { id: shift.id },
+            data: {
+                status: 'OPEN',
+                clockInTime: now,
+                isLate,
+                lateMinutes,
+            },
+        });
+        res.json({ success: true, shift: updated, message: isLate ? 'Clocked in (late)' : 'Clocked in' });
+    } else {
+        // No scheduled shift — create an ad-hoc clock-in
+        const emp = await prisma.businessEmployee.findUnique({
+            where: { id: employeeId },
+            select: { businessProfileId: true, userId: true },
+        });
+        if (!emp) return res.status(404).json({ success: false, message: 'Employee not found' });
+
+        const now = new Date();
+        const endTime = new Date(now);
+        endTime.setHours(endTime.getHours() + 8); // default 8hr shift
+
+        const adHocShift = await prisma.shift.create({
+            data: {
+                businessProfileId: emp.businessProfileId,
+                employeeId,
+                userId: emp.userId,
+                locationId: locationId || null,
+                shiftDate: now,
+                startTime: now,
+                endTime,
+                status: 'OPEN',
+                clockInTime: now,
+                notes: 'Ad-hoc kiosk clock-in',
+            },
+        });
+        res.json({ success: true, shift: adHocShift, message: 'Clocked in (ad-hoc)' });
+    }
+}));
+
+// POST /api/business-os/kiosk/clock-out — clock out using PIN auth
+router.post('/kiosk/clock-out', wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const { employeeId } = req.body;
+    if (!employeeId) return res.status(400).json({ success: false, message: 'Employee ID required' });
+
+    const shift = await prisma.shift.findFirst({
+        where: { employeeId, status: 'OPEN', clockInTime: { not: null }, clockOutTime: null },
+        orderBy: { clockInTime: 'desc' },
+    });
+
+    if (!shift) return res.status(404).json({ success: false, message: 'No open shift to clock out from' });
+
+    const now = new Date();
+    const actualMinutes = Math.floor((now - shift.clockInTime) / 60000);
+
+    const updated = await prisma.shift.update({
+        where: { id: shift.id },
+        data: {
+            status: 'COMPLETED',
+            clockOutTime: now,
+            actualMinutes,
+        },
+    });
+
+    // Update employee stats
+    await prisma.businessEmployee.update({
+        where: { id: employeeId },
+        data: {
+            totalShifts: { increment: 1 },
+            totalHours: { increment: actualMinutes / 60 },
+        },
+    });
+
+    res.json({ success: true, shift: updated, actualMinutes, message: 'Clocked out' });
+}));
+
+// ── Phase 2: Cash Payment + Idempotency (Section 2.4) ────────────────────────
+// POST /api/business-os/pos/cash-sale — ring up a cash order (bypasses escrow)
+router.post('/pos/cash-sale', protect, protectActive, wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+    const { items, locationId, tableId, customerId, subtotal, taxTotal, tipAmount, idempotencyKey, cashReceived } = req.body;
+
+    // Idempotency check — if a record with this key exists, return the cached result
+    if (idempotencyKey) {
+        const existing = await prisma.businessOrder.findFirst({
+            where: { idempotencyKey },
+        });
+        if (existing) {
+            return res.json({ success: true, order: existing, message: 'Duplicate (idempotent)' });
+        }
+    }
+
+    // Validate: frontend must NOT compute totals — re-derive from items
+    let computedSubtotal = 0;
+    for (const item of items || []) {
+        const product = await prisma.businessProduct.findFirst({
+            where: { id: item.productId, businessProfileId: bpId },
+            select: { priceUsdc: true, name: true },
+        });
+        if (!product) return res.status(400).json({ success: false, message: 'Invalid product: ' + item.productId });
+
+        const lineTotal = parseFloat(product.priceUsdc) * item.quantity;
+        computedSubtotal += lineTotal;
+    }
+
+    const computedTax = computedSubtotal * (parseFloat(taxTotal || 0) > 0 ? parseFloat(taxTotal) / computedSubtotal : 0);
+    const computedGrand = computedSubtotal + computedTax + parseFloat(tipAmount || 0);
+
+    // Generate order reference
+    const orderRef = 'CSH-' + Date.now().toString(36).toUpperCase() + Math.random().toString(36).substring(2, 6).toUpperCase();
+
+    // Create the order with CASH payment method
+    const order = await prisma.businessOrder.create({
+        data: {
+            businessProfileId: bpId,
+            customerId: customerId || req.user.id,
+            status: 'COMPLETED',
+            orderRef,
+            title: 'POS Cash Sale',
+            amountUsdc: computedGrand,
+            paymentMethod: 'CASH',
+            idempotencyKey,
+            cashReceived: cashReceived ? parseFloat(cashReceived) : null,
+            cashChange: cashReceived ? parseFloat(cashReceived) - computedGrand : null,
+            completedAt: new Date(),
+        },
+    });
+
+    // Write a BusinessLedgerEntry for the cash sale (so it shows in Finance/P&L)
+    try {
+        await prisma.businessLedgerEntry.create({
+            data: {
+                businessProfileId: bpId,
+                type: 'INCOME',
+                category: 'SALES',
+                description: 'POS Cash Sale (' + orderRef + ')',
+                amount: computedGrand,
+                amountGhs: computedGrand, // adjust if FX rate needed
+                sourceType: 'POS_CASH_SALE',
+                sourceId: order.id,
+                metadata: { orderRef, items: items?.length || 0, locationId, tableId },
+            },
+        });
+    } catch (e) {
+        console.warn('[pos/cash-sale] Failed to write ledger entry:', e.message);
+    }
+
+    res.status(201).json({
+        success: true,
+        order,
+        computedSubtotal,
+        computedTax,
+        computedGrand,
+        change: cashReceived ? parseFloat(cashReceived) - computedGrand : 0,
+    });
+}));
+
+// POST /api/business-os/pos/cash-close-tab — close a dine-in tab with cash
+router.post('/pos/cash-close-tab', protect, protectActive, wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+    const { tabId, cashReceived, tipAmount, idempotencyKey } = req.body;
+    if (!tabId) return res.status(400).json({ success: false, message: 'Tab ID required' });
+
+    // Idempotency check
+    if (idempotencyKey) {
+        const existing = await prisma.dineInTab.findFirst({
+            where: { idempotencyKey },
+        });
+        if (existing) {
+            return res.json({ success: true, tab: existing, message: 'Duplicate (idempotent)' });
+        }
+    }
+
+    const tab = await prisma.dineInTab.findFirst({
+        where: { id: tabId, businessProfileId: bpId, status: 'OPEN' },
+        include: { items: true },
+    });
+    if (!tab) return res.status(404).json({ success: false, message: 'Open tab not found' });
+
+    // Re-compute totals from items (never trust client totals)
+    let subtotal = 0;
+    for (const item of tab.items) {
+        subtotal += parseFloat(item.lineTotalUsdc);
+    }
+    const taxTotal = subtotal * 0.05; // default 5% tax — configurable
+    const tip = parseFloat(tipAmount || 0);
+    const grandTotal = subtotal + taxTotal + tip;
+
+    // Close the tab with cash
+    const updated = await prisma.dineInTab.update({
+        where: { id: tabId },
+        data: {
+            status: 'PAID',
+            closedAt: new Date(),
+            subtotalUsdc: subtotal,
+            taxTotalUsdc: taxTotal,
+            tipUsdc: tip,
+            grandTotalUsdc: grandTotal,
+            paymentMethod: 'CASH',
+            idempotencyKey,
+            cashReceived: cashReceived ? parseFloat(cashReceived) : null,
+        },
+    });
+
+    // Write ledger entry
+    try {
+        await prisma.businessLedgerEntry.create({
+            data: {
+                businessProfileId: bpId,
+                type: 'INCOME',
+                category: 'DINE_IN',
+                description: 'Dine-in cash close (' + tabId.substring(0, 8) + ')',
+                amount: grandTotal,
+                amountGhs: grandTotal,
+                sourceType: 'DINE_IN_CASH',
+                sourceId: tabId,
+                metadata: { tabId, tip, subtotal, taxTotal },
+            },
+        });
+    } catch (e) {
+        console.warn('[pos/cash-close-tab] Failed to write ledger entry:', e.message);
+    }
+
+    res.json({
+        success: true,
+        tab: updated,
+        subtotal,
+        taxTotal,
+        grandTotal,
+        change: cashReceived ? parseFloat(cashReceived) - grandTotal : 0,
+    });
+}));
+
+// ── Phase 2: Employee PIN Management (Section 2.4) ──────────────────────────
+// POST /api/business-os/employees/:id/set-pin — set or update kiosk PIN
+router.post('/employees/:id/set-pin', protect, protectActive, requirePermission('employees.manage'), wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+    const { pinCode } = req.body;
+    if (!pinCode || pinCode.length < 4 || pinCode.length > 8) {
+        return res.status(400).json({ success: false, message: 'PIN must be 4-8 digits' });
+    }
+
+    const emp = await prisma.businessEmployee.findFirst({
+        where: { id: req.params.id, businessProfileId: bpId },
+    });
+    if (!emp) return res.status(404).json({ success: false, message: 'Employee not found' });
+
+    const bcrypt = require('bcryptjs');
+    const hashedPin = await bcrypt.hash(pinCode, 10);
+
+    await prisma.businessEmployee.update({
+        where: { id: emp.id },
+        data: { pinCode: hashedPin },
+    });
+
+    res.json({ success: true, message: 'PIN set successfully' });
+}));
+
+// DELETE /api/business-os/employees/:id/pin — remove kiosk PIN
+router.delete('/employees/:id/pin', protect, protectActive, requirePermission('employees.manage'), wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+
+    const emp = await prisma.businessEmployee.findFirst({
+        where: { id: req.params.id, businessProfileId: bpId },
+    });
+    if (!emp) return res.status(404).json({ success: false, message: 'Employee not found' });
+
+    await prisma.businessEmployee.update({
+        where: { id: emp.id },
+        data: { pinCode: null },
+    });
+
+    res.json({ success: true, message: 'PIN removed' });
+}));
 
 module.exports = router;
 

@@ -2623,6 +2623,8 @@ model BusinessInvoice {
   paidAt             DateTime?
   voidedAt           DateTime?
   payTxHash          String?       @unique // idempotency anchor — set at PAID
+  paymentMethod      String?       @db.VarChar(20) // "AZAMAN_BALANCE" | "CASH" | "SPLIT"
+  idempotencyKey     String?       @unique // client-supplied dedup for offline sync
 
   businessProfile BusinessProfile           @relation(fields: [businessProfileId], references: [id])
   location        BusinessLocation?         @relation(fields: [locationId], references: [id])
@@ -2861,6 +2863,11 @@ model BusinessOrder {
   // QR Code Forge — reprogrammable redirect (2026-07-14)
   qrRedirectUrl String @default("https://startup.moolre.com/leaderboard/118")
   qrLabel       String @default("Azaman Vote Page")
+
+  paymentMethod   String?  @db.VarChar(20) // "AZAMAN_BALANCE" | "CASH" | "SPLIT"
+  idempotencyKey  String?  @unique // client-supplied dedup key for offline sync
+  cashReceived    Decimal? @db.Decimal(20, 8) // for CASH payments — actual cash tendered
+  cashChange      Decimal? @db.Decimal(20, 8) // change given back
 
   updatedAt DateTime @updatedAt
 
@@ -4005,6 +4012,9 @@ model DineInTab {
   grandTotalUsdc    Decimal   @default(0.0) @db.Decimal(20, 8)
   invoiceId         String?   @unique
   escrowId          String?   @unique
+  paymentMethod     String?   @db.VarChar(20) // "AZAMAN_BALANCE" | "CASH" | "SPLIT"
+  idempotencyKey    String?   @unique // for offline sync dedup
+  cashReceived      Decimal?  @db.Decimal(20, 8)
 
   businessProfile BusinessProfile   @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
   location        BusinessLocation? @relation(fields: [locationId], references: [id])
@@ -4275,6 +4285,7 @@ model BusinessEmployee {
   // Metadata
   emergencyContact  Json? // { name, phone, relationship }
   notes             String? @db.VarChar(1000)
+  pinCode           String? @db.VarChar(255) // hashed PIN for kiosk clock-in/out
   
   businessProfile BusinessProfile @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
   user            User            @relation("EmployeeUser", fields: [userId], references: [id], onDelete: Cascade)

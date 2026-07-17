@@ -205,6 +205,29 @@ STATEMENTS.push(`DO $$ BEGIN
     END IF;
   END $$;`);
 
+
+// ── Phase 2: Offline POS additions ──────────────────────────────────────────
+// BusinessEmployee.pinCode (hashed PIN for kiosk clock-in/out)
+STATEMENTS.push('ALTER TABLE "BusinessEmployee" ADD COLUMN IF NOT EXISTS "pinCode" VARCHAR(255);');
+
+// BusinessOrder payment method + idempotency
+STATEMENTS.push('ALTER TABLE "BusinessOrder" ADD COLUMN IF NOT EXISTS "paymentMethod" VARCHAR(20);');
+STATEMENTS.push('ALTER TABLE "BusinessOrder" ADD COLUMN IF NOT EXISTS "idempotencyKey" TEXT;');
+STATEMENTS.push('ALTER TABLE "BusinessOrder" ADD COLUMN IF NOT EXISTS "cashReceived" DECIMAL(20,8);');
+STATEMENTS.push('ALTER TABLE "BusinessOrder" ADD COLUMN IF NOT EXISTS "cashChange" DECIMAL(20,8);');
+STATEMENTS.push('CREATE UNIQUE INDEX IF NOT EXISTS "BusinessOrder_idempotencyKey_key" ON "BusinessOrder"("idempotencyKey") WHERE "idempotencyKey" IS NOT NULL;');
+
+// DineInTab payment method + idempotency
+STATEMENTS.push('ALTER TABLE "DineInTab" ADD COLUMN IF NOT EXISTS "paymentMethod" VARCHAR(20);');
+STATEMENTS.push('ALTER TABLE "DineInTab" ADD COLUMN IF NOT EXISTS "idempotencyKey" TEXT;');
+STATEMENTS.push('ALTER TABLE "DineInTab" ADD COLUMN IF NOT EXISTS "cashReceived" DECIMAL(20,8);');
+STATEMENTS.push('CREATE UNIQUE INDEX IF NOT EXISTS "DineInTab_idempotencyKey_key" ON "DineInTab"("idempotencyKey") WHERE "idempotencyKey" IS NOT NULL;');
+
+// BusinessInvoice payment method + idempotency
+STATEMENTS.push('ALTER TABLE "BusinessInvoice" ADD COLUMN IF NOT EXISTS "paymentMethod" VARCHAR(20);');
+STATEMENTS.push('ALTER TABLE "BusinessInvoice" ADD COLUMN IF NOT EXISTS "idempotencyKey" TEXT;');
+STATEMENTS.push('CREATE UNIQUE INDEX IF NOT EXISTS "BusinessInvoice_idempotencyKey_key" ON "BusinessInvoice"("idempotencyKey") WHERE "idempotencyKey" IS NOT NULL;');
+
 // =============================================================================
 //  Execute all statements sequentially (autocommit — can't use $transaction
 //  because ALTER TYPE ADD VALUE must not be in a transaction block, and DO
