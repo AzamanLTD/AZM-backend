@@ -1,6 +1,8 @@
 const axios = require('axios');
 const crypto = require('crypto');
-const prisma = require('../../prisma/client');
+const { PrismaClient } = require('@prisma/client');
+const prisma = global.prisma || new PrismaClient();
+if (process.env.NODE_ENV !== 'production') global.prisma = prisma;
 
 class WebhookDispatcher {
     /**

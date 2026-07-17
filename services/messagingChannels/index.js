@@ -1,4 +1,6 @@
-const prisma = require('../../prisma/client');
+const { PrismaClient } = require('@prisma/client');
+const prisma = global.prisma || new PrismaClient();
+if (process.env.NODE_ENV !== 'production') global.prisma = prisma;
 
 /**
  * Service to handle dispatching notifications to external channels like SMS and WhatsApp
