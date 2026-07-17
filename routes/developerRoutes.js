@@ -2,7 +2,8 @@ const express = require('express');
 const router = express.Router();
 const crypto = require('crypto');
 const { wrap } = require('../utils/catchAsync');
-const { protect, protectActive } = require('../middleware/authMiddleware');
+const { protect } = require('../middleware/authMiddleware');
+const { protectActive } = require('../middleware/banGuardMiddleware');
 
 const getPrisma = (req) => req.app.get('prisma') || require('../prisma/client');
 
