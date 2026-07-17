@@ -2507,6 +2507,8 @@ model BusinessProfile {
   routeTemplates       TransitRouteTemplate[]
   inventoryItems       InventoryItem[]
   notificationPreferences BusinessNotificationPreference?
+  apiKeys              BusinessApiKey[]
+  webhooks             BusinessWebhook[]
 
   @@index([bizId])
   @@index([category])
@@ -5021,4 +5023,37 @@ model BusinessNotificationPreference {
 
   createdAt         DateTime @default(now())
   updatedAt         DateTime @updatedAt
+}
+
+// ── Developer Options ──────────────────────────────────────────────────────────
+model BusinessApiKey {
+  id                String   @id @default(uuid())
+  businessProfileId String
+  name              String   // e.g. "Staging Key", "Production Web"
+  keyHash           String   // Hashed key for security
+  prefix            String   // e.g. "az_prod_abcd" to show in UI
+  permissions       String[] // ["read_orders", "write_orders"]
+  lastUsedAt        DateTime?
+  isActive          Boolean  @default(true)
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  businessProfile   BusinessProfile @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+
+  @@index([businessProfileId])
+}
+
+model BusinessWebhook {
+  id                String   @id @default(uuid())
+  businessProfileId String
+  url               String   // Endpoint to send POST requests
+  secret            String   // Used for signing payload (HMAC)
+  events            String[] // ["order.created", "booking.confirmed"]
+  isActive          Boolean  @default(true)
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  businessProfile   BusinessProfile @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+
+  @@index([businessProfileId])
 }

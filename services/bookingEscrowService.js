@@ -108,10 +108,24 @@ const fundBookingEscrow = async (prisma, { escrowId, payerId, bookingType, booki
         return updated;
     });
 
+    const _messagingChannelsService = require('./messagingChannels');
+
     if (bookingType === 'RESERVATION' && bookingId) {
-        await prisma.reservation.updateMany({ where: { id: bookingId, status: 'PENDING' }, data: { status: 'CONFIRMED', confirmedAt: new Date() } });
+        const resCount = await prisma.reservation.updateMany({ where: { id: bookingId, status: 'PENDING' }, data: { status: 'CONFIRMED', confirmedAt: new Date() } });
+        if (resCount.count > 0) {
+            const res = await prisma.reservation.findUnique({ where: { id: bookingId }, include: { user: true } });
+            if (res && res.user?.phoneNumber) {
+                _messagingChannelsService.notifyBookingConfirmed(res.businessProfileId, res.user.phoneNumber, res.id, res.reservationTime).catch(err => console.error('[MessagingChannels] Error:', err));
+            }
+        }
     } else if (bookingType === 'TRANSIT' && bookingId) {
-        await prisma.transitBooking.updateMany({ where: { id: bookingId, status: 'PENDING' }, data: { status: 'CONFIRMED' } });
+        const tbCount = await prisma.transitBooking.updateMany({ where: { id: bookingId, status: 'PENDING' }, data: { status: 'CONFIRMED' } });
+        if (tbCount.count > 0) {
+            const tb = await prisma.transitBooking.findUnique({ where: { id: bookingId }, include: { user: true, trip: true } });
+            if (tb && tb.user?.phoneNumber) {
+                _messagingChannelsService.notifyBookingConfirmed(tb.trip?.businessProfileId || tb.businessProfileId, tb.user.phoneNumber, tb.id, tb.trip?.scheduledDeparture || new Date()).catch(err => console.error('[MessagingChannels] Error:', err));
+            }
+        }
     }
 
     return { success: true, escrow: updatedEscrow, reference };

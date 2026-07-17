@@ -140,10 +140,25 @@ class RestaurantOpsService {
         if (status === 'READY') updates.readyAt = new Date();
         if (status === 'SERVED') updates.servedAt = new Date();
 
-        return this.prisma.kitchenOrder.update({
+        const updated = await this.prisma.kitchenOrder.update({
             where: { id: orderId },
             data: updates,
+            include: { businessOrder: { include: { customer: true } } }
         });
+
+        if (status === 'READY') {
+            const messagingChannelsService = require('../messagingChannels');
+            const customerPhone = updated.businessOrder?.customer?.phoneNumber;
+            if (customerPhone) {
+                messagingChannelsService.notifyOrderReady(
+                    updated.businessProfileId, 
+                    customerPhone, 
+                    updated.businessOrder?.orderRef || updated.ticketNumber.toString()
+                ).catch(err => console.error('[MessagingChannels] Error:', err));
+            }
+        }
+
+        return updated;
     }
 
     // Update individual item status

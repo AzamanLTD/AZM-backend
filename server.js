@@ -1170,6 +1170,7 @@ app.use('/api/trades', financialLimiter, tradeRoutes);
 app.use('/api/ads', generalLimiter, adRoutes);
 app.use('/api/chat', generalLimiter, chatRoutes);
 app.use('/api/chat-upload', generalLimiter, chatUploadRoutes);
+app.use('/api/direct-messages', generalLimiter, require('./routes/businessDirectMessageRoutes'));
 app.use('/api/wallet', financialLimiter, walletRoutes);
 app.use('/api/admin', generalLimiter, adminRoutes);
 app.use('/api/kyc', generalLimiter, kycRoutes);
@@ -1246,6 +1247,7 @@ app.use('/api/admin/susu',                generalLimiter, adminSusuRoutes);
 // MARKETPLACE EXPANSION — Phase B-2
 app.use('/api/marketplace',               generalLimiter, marketplaceRoutes);
 app.use('/api/business-os',   generalLimiter,   businessOSRoutes);
+app.use('/api/developer',     generalLimiter,   require('./routes/developerRoutes'));
 app.use('/api/qr',            generalLimiter,   qrRoutes);          // QR Forge — public redirect + admin config
 
 // --- CHAT MEDIA UPLOAD (Phase UI-3, 2026-05-26) ──────────────────────────────
