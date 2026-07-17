@@ -2477,6 +2477,141 @@ router.delete('/employees/:id/pin', protect, protectActive, requirePermission('e
     res.json({ success: true, message: 'PIN removed' });
 }));
 
+
+// ── Phase 2: In-Portal Messaging (Section 3) ────────────────────────────────
+// Reuses the existing Conversation/Message models with a new BUSINESS type.
+// BusinessConversation links a conversation to a business profile.
+
+// GET /api/business-os/messages/conversations — list conversations for this business
+router.get('/messages/conversations', wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+    const userId = req.user.id;
+
+    const conversations = await prisma.businessConversation.findMany({
+        where: {
+            businessProfileId: bpId,
+            OR: [{ participantAId: userId }, { participantBId: userId }],
+        },
+        include: {
+            participantA: { select: { id: true, username: true, avatarUrl: true } },
+            participantB: { select: { id: true, username: true, avatarUrl: true } },
+        },
+        orderBy: { lastMessageAt: 'desc' },
+    });
+
+    res.json({ success: true, conversations });
+}));
+
+// POST /api/business-os/messages/conversations — start a new conversation with a staff member
+router.post('/messages/conversations', wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+    const { recipientUserId } = req.body;
+    if (!recipientUserId) return res.status(400).json({ success: false, message: 'Recipient required' });
+
+    // Verify recipient is an employee of this business
+    const employee = await prisma.businessEmployee.findFirst({
+        where: { businessProfileId: bpId, userId: parseInt(recipientUserId), status: 'ACTIVE' },
+    });
+    if (!employee && parseInt(recipientUserId) !== req.user.id) {
+        return res.status(403).json({ success: false, message: 'Recipient must be an active employee' });
+    }
+
+    // Check if conversation already exists
+    const existing = await prisma.businessConversation.findFirst({
+        where: {
+            businessProfileId: bpId,
+            OR: [
+                { participantAId: req.user.id, participantBId: parseInt(recipientUserId) },
+                { participantAId: parseInt(recipientUserId), participantBId: req.user.id },
+            ],
+        },
+    });
+    if (existing) return res.json({ success: true, conversation: existing, message: 'Already exists' });
+
+    // Create Conversation + BusinessConversation
+    const conversation = await prisma.conversation.create({
+        data: { type: 'BUSINESS' },
+    });
+
+    const bizConv = await prisma.businessConversation.create({
+        data: {
+            businessProfileId: bpId,
+            conversationId: conversation.id,
+            participantAId: req.user.id,
+            participantBId: parseInt(recipientUserId),
+            createdBy: req.user.id,
+        },
+        include: {
+            participantA: { select: { id: true, username: true, avatarUrl: true } },
+            participantB: { select: { id: true, username: true, avatarUrl: true } },
+        },
+    });
+
+    res.status(201).json({ success: true, conversation: bizConv });
+}));
+
+// GET /api/business-os/messages/:conversationId — get messages for a conversation
+router.get('/messages/:conversationId', wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+    const { conversationId } = req.params;
+
+    // Verify this conversation belongs to this business
+    const bizConv = await prisma.businessConversation.findFirst({
+        where: { conversationId, businessProfileId: bpId,
+            OR: [{ participantAId: req.user.id }, { participantBId: req.user.id }],
+        },
+    });
+    if (!bizConv) return res.status(404).json({ success: false, message: 'Conversation not found' });
+
+    const messages = await prisma.message.findMany({
+        where: { conversationId },
+        orderBy: { createdAt: 'asc' },
+        take: 100,
+    });
+
+    res.json({ success: true, messages });
+}));
+
+// POST /api/business-os/messages/:conversationId/send — send a message
+router.post('/messages/:conversationId/send', wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+    const { conversationId } = req.params;
+    const { content } = req.body;
+    if (!content || !content.trim()) return res.status(400).json({ success: false, message: 'Message content required' });
+
+    // Verify ownership
+    const bizConv = await prisma.businessConversation.findFirst({
+        where: { conversationId, businessProfileId: bpId,
+            OR: [{ participantAId: req.user.id }, { participantBId: req.user.id }],
+        },
+    });
+    if (!bizConv) return res.status(404).json({ success: false, message: 'Conversation not found' });
+
+    const message = await prisma.message.create({
+        data: {
+            conversationId,
+            senderId: req.user.id,
+            messageType: 'TEXT',
+            content: content.trim(),
+        },
+    });
+
+    // Update conversation preview
+    await prisma.businessConversation.update({
+        where: { id: bizConv.id },
+        data: {
+            lastMessageAt: new Date(),
+            lastMessagePreview: content.trim().substring(0, 200),
+        },
+    });
+
+    res.status(201).json({ success: true, message });
+}));
+
 module.exports = router;
 
 // ═══════════════════════════════════════════════════════════════════════════════

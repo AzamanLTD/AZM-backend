@@ -228,6 +228,27 @@ STATEMENTS.push('ALTER TABLE "BusinessInvoice" ADD COLUMN IF NOT EXISTS "payment
 STATEMENTS.push('ALTER TABLE "BusinessInvoice" ADD COLUMN IF NOT EXISTS "idempotencyKey" TEXT;');
 STATEMENTS.push('CREATE UNIQUE INDEX IF NOT EXISTS "BusinessInvoice_idempotencyKey_key" ON "BusinessInvoice"("idempotencyKey") WHERE "idempotencyKey" IS NOT NULL;');
 
+
+// ── Phase 2: In-portal messaging (Section 3) ────────────────────────────────
+STATEMENTS.push('ALTER TYPE "ConversationType" ADD VALUE IF NOT EXISTS \'BUSINESS\';');
+
+STATEMENTS.push(`CREATE TABLE IF NOT EXISTS "BusinessConversation" (
+    "id" TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+    "businessProfileId" TEXT NOT NULL REFERENCES "BusinessProfile"("id") ON DELETE CASCADE,
+    "conversationId" TEXT NOT NULL UNIQUE REFERENCES "Conversation"("id") ON DELETE CASCADE,
+    "participantAId" INTEGER NOT NULL REFERENCES "User"("id"),
+    "participantBId" INTEGER NOT NULL REFERENCES "User"("id"),
+    "createdBy" INTEGER NOT NULL,
+    "lastMessageAt" TIMESTAMP(3) NOT NULL DEFAULT NOW(),
+    "lastMessagePreview" TEXT,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT NOW(),
+    "updatedAt" TIMESTAMP(3) NOT NULL
+);`);
+
+STATEMENTS.push('CREATE INDEX IF NOT EXISTS "BusinessConversation_businessProfileId_idx" ON "BusinessConversation"("businessProfileId");');
+STATEMENTS.push('CREATE INDEX IF NOT EXISTS "BusinessConversation_participantAId_idx" ON "BusinessConversation"("participantAId");');
+STATEMENTS.push('CREATE INDEX IF NOT EXISTS "BusinessConversation_participantBId_idx" ON "BusinessConversation"("participantBId");');
+
 // =============================================================================
 //  Execute all statements sequentially (autocommit — can't use $transaction
 //  because ALTER TYPE ADD VALUE must not be in a transaction block, and DO

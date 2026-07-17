@@ -141,6 +141,7 @@ enum ProfitSource {
 enum ConversationType {
   TRADE
   PERSONAL
+  BUSINESS
 }
 
 enum MessageType {
@@ -766,6 +767,8 @@ model User {
 
   // Social & Communication
   conversations Conversation[] @relation("ConversationParticipants")
+  bizConvParticipantA BusinessConversation[] @relation("BizConvParticipantA")
+  bizConvParticipantB BusinessConversation[] @relation("BizConvParticipantB")
   sentMessages  Message[]      @relation("MessageSender")
   contacts      Contact[]      @relation("ContactOwner")
   savedByUsers  Contact[]      @relation("ContactSavedUser")
@@ -1131,6 +1134,31 @@ model PayoutDestination {
 // DUAL-ENVIRONMENT CHAT
 // =============================================================================
 
+
+// ── Phase 2: Business-to-business messaging (Section 3) ──────────────────────
+model BusinessConversation {
+  id                String   @id @default(uuid())
+  businessProfileId String
+  conversationId     String   @unique // FK to Conversation.id
+  participantAId    Int      // business owner or staff userId
+  participantBId    Int      // the other party's userId
+  createdBy         Int      // who initiated
+  lastMessageAt     DateTime @default(now())
+  lastMessagePreview String? @db.VarChar(200)
+
+  businessProfile BusinessProfile @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+  conversation   Conversation     @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  participantA   User             @relation("BizConvParticipantA", fields: [participantAId], references: [id])
+  participantB   User             @relation("BizConvParticipantB", fields: [participantBId], references: [id])
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([businessProfileId])
+  @@index([participantAId])
+  @@index([participantBId])
+}
+
 model Conversation {
   id        String           @id @default(uuid())
   type      ConversationType
@@ -1140,6 +1168,7 @@ model Conversation {
 
   participants User[]    @relation("ConversationParticipants")
   messages     Message[]
+  businessConversation BusinessConversation?
 
   @@index([type])
 }
@@ -2458,6 +2487,7 @@ model BusinessProfile {
   showcase      BusinessShowcase[]
   // Business OS relations
   employees          BusinessEmployee[]
+  businessConversations BusinessConversation[]
   shifts             Shift[]
   shiftSwaps         ShiftSwap[]
   timeOffRequests    TimeOffRequest[]
