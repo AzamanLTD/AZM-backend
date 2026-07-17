@@ -21,6 +21,7 @@ const { HotelOpsService } = require('../services/businessOS/hotelOpsService');
 const { RestaurantOpsService } = require('../services/businessOS/restaurantOpsService');
 const { TransitOpsService } = require('../services/businessOS/transitOpsService');
 const { EmployeeFeedbackService } = require('../services/businessOS/employeeFeedbackService');
+const { BusinessGroupService } = require("../services/businessOS/businessGroupService");
 
 // Auth middleware — the existing backend exports { protect, adminOnly }
 const { protect } = require('../middleware/authMiddleware');
@@ -64,6 +65,7 @@ function getServices(req) {
         restaurantOpsService: new RestaurantOpsService(prisma),
         transitOpsService: new TransitOpsService(prisma),
         feedbackService: new EmployeeFeedbackService(prisma),
+        groupService: new BusinessGroupService(prisma),
     };
 }
 
@@ -3053,6 +3055,48 @@ router.post('/kiosk/clock-in', wrap(async (req, res) => {
     
     // In a full implementation, create a shift punch record here
     res.json({ success: true, employee: { id: employee.id, name: employee.role }, message: `Successfully ${type === 'CLOCK_IN' ? 'clocked in' : 'clocked out'}` });
+}));
+
+// ═══════════════════════════════════════════════════════════════════════════
+// BUSINESS GROUPS — multi-brand / multi-location ownership stats
+// ═══════════════════════════════════════════════════════════════════════════
+
+// GET /api/business-os/messaging-stats — this month's messaging cost breakdown
+router.get("/messaging-stats", wrap(async (req, res) => {
+    const prisma = req.app.get("prisma");
+    const bizProfileId = req.businessProfileId || (await prisma.businessProfile.findUnique({
+        where: { userId: req.user.id }, select: { id: true },
+    }))?.id;
+    if (!bizProfileId) return res.json({ whatsapp: 0, sms: 0, messages: 0 });
+
+    const monthStart = new Date(new Date().getFullYear(), new Date().getMonth(), 1);
+    const monthStartISO = monthStart.toISOString();
+
+    // Count total notifications this month (proxies for messages sent)
+    const totalCount = await prisma.businessNotification.count({
+        where: { businessProfileId, createdAt: { gte: monthStartISO } },
+    });
+
+    // Rough estimate: assume 70% WhatsApp, 30% SMS split
+    // Per-message cost: WhatsApp GHS 0.035, SMS GHS 0.05
+    const whatsappCount = Math.ceil(totalCount * 0.7);
+    const smsCount = totalCount - whatsappCount;
+    const whatsappCost = +(whatsappCount * 0.035).toFixed(2);
+    const smsCost = +(smsCount * 0.05).toFixed(2);
+
+    res.json({
+        whatsapp: whatsappCost,
+        sms: smsCost,
+        messages: totalCount,
+    });
+}));
+
+// GET /api/business-os/group-stats — aggregate stats across all owned businesses
+router.get("/group-stats", wrap(async (req, res) => {
+    const svc = getServices(req);
+    const groupId = req.query.groupId || null;
+    const stats = await svc.groupService.getGroupStats(req.user.id, groupId);
+    res.json({ success: true, ...stats });
 }));
 
 module.exports = router;

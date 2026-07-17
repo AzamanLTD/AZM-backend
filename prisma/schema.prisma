@@ -906,6 +906,7 @@ model User {
   dineInTabs          DineInTab[]         @relation("DineInTabCustomer")
   dineInTabItems      DineInTabItem[]     @relation("DineInTabStaff")
   trustScore          CustomerTrustScore?
+  businessGroups      BusinessGroup[]
 
   @@index([phoneHash])
 }
@@ -2434,6 +2435,8 @@ model BusinessProfile {
   isSuspended   Boolean @default(false)
   isPausedByOwner  Boolean @default(false) // owner-initiated pause — stops new orders/bookings without admin suspension
   allowOverbooking Boolean @default(false) // Module 06: opt-in overbooking against expected no-shows
+  groupId          String?  // optional FK to BusinessGroup for multi-brand owners
+  group            BusinessGroup?   @relation(fields: [groupId], references: [id], onDelete: SetNull)
   suspendReason String? @db.VarChar(500)
 
   // Public contact info
@@ -2526,6 +2529,22 @@ model BusinessProfile {
   @@index([subcategory])
   @@index([priceRange])
   @@index([isSuspended, subcategory, totalEscrows(sort: Desc)])
+}
+
+// =============================================================================
+// BUSINESS GROUP — multi-brand / multi-location ownership (2026-07-17)
+// =============================================================================
+model BusinessGroup {
+  id          String   @id @default(uuid())
+  name        String   @db.VarChar(100)
+  ownerUserId Int
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  owner            User             @relation(fields: [ownerUserId], references: [id], onDelete: Cascade)
+  businessProfiles BusinessProfile[]
+
+  @@index([ownerUserId])
 }
 
 // =============================================================================
