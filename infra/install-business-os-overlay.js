@@ -318,3 +318,69 @@ main()
 
 // ── Module 04 additions (loaded via STATEMENTS push above) ─────────────────
 // These are added to the STATEMENTS array via require hook below.
+
+// ── Module 07: RecurringExpenseTemplate table ───────────────────────────────
+STATEMENTS.push(`CREATE TABLE IF NOT EXISTS "RecurringExpenseTemplate" (
+    "id" TEXT NOT NULL DEFAULT gen_random_uuid()::text,
+    "businessProfileId" TEXT NOT NULL,
+    "name" VARCHAR(120) NOT NULL,
+    "category" VARCHAR(80) NOT NULL,
+    "amount" DECIMAL(20,8) NOT NULL,
+    "description" VARCHAR(500),
+    "frequency" VARCHAR(20) NOT NULL DEFAULT 'MONTHLY',
+    "dayOfMonth" INTEGER,
+    "dayOfWeek" INTEGER,
+    "isActive" BOOLEAN NOT NULL DEFAULT true,
+    "lastPostedAt" TIMESTAMP(3),
+    "nextDueAt" TIMESTAMP(3),
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT "RecurringExpenseTemplate_pkey" PRIMARY KEY ("id")
+);`);
+
+STATEMENTS.push('CREATE INDEX IF NOT EXISTS "RecurringExpenseTemplate_businessProfileId_isActive_idx" ON "RecurringExpenseTemplate"("businessProfileId", "isActive");');
+
+STATEMENTS.push(`DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.table_constraints WHERE constraint_name = 'RecurringExpenseTemplate_businessProfileId_fkey') THEN
+      ALTER TABLE "RecurringExpenseTemplate" ADD CONSTRAINT "RecurringExpenseTemplate_businessProfileId_fkey" FOREIGN KEY ("businessProfileId") REFERENCES "BusinessProfile"("id") ON DELETE CASCADE;
+    END IF;
+  END $$;`);
+
+// ── Module 08: BusinessPromotion table ───────────────────────────────────────
+STATEMENTS.push(`CREATE TABLE IF NOT EXISTS "BusinessPromotion" (
+    "id" TEXT NOT NULL DEFAULT gen_random_uuid()::text,
+    "businessProfileId" TEXT NOT NULL,
+    "code" VARCHAR(50),
+    "name" VARCHAR(120) NOT NULL,
+    "discountType" VARCHAR(20) NOT NULL,
+    "discountValue" DECIMAL(10,4) NOT NULL,
+    "buyQuantity" INTEGER,
+    "getQuantity" INTEGER,
+    "scope" VARCHAR(30) NOT NULL,
+    "minSpendUsdc" DECIMAL(20,8),
+    "applicableProductIds" TEXT[] NOT NULL DEFAULT '{}',
+    "startDate" TIMESTAMP(3) NOT NULL,
+    "endDate" TIMESTAMP(3) NOT NULL,
+    "usageLimit" INTEGER,
+    "perCustomerLimit" INTEGER,
+    "usageCount" INTEGER NOT NULL DEFAULT 0,
+    "isActive" BOOLEAN NOT NULL DEFAULT true,
+    "notes" VARCHAR(500),
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT "BusinessPromotion_pkey" PRIMARY KEY ("id")
+);`);
+
+STATEMENTS.push('CREATE INDEX IF NOT EXISTS "BusinessPromotion_businessProfileId_isActive_idx" ON "BusinessPromotion"("businessProfileId", "isActive");');
+STATEMENTS.push('CREATE INDEX IF NOT EXISTS "BusinessPromotion_code_idx" ON "BusinessPromotion"("code");');
+
+STATEMENTS.push(`DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.table_constraints WHERE constraint_name = 'BusinessPromotion_businessProfileId_fkey') THEN
+      ALTER TABLE "BusinessPromotion" ADD CONSTRAINT "BusinessPromotion_businessProfileId_fkey" FOREIGN KEY ("businessProfileId") REFERENCES "BusinessProfile"("id") ON DELETE CASCADE;
+    END IF;
+  END $$;`);
+
+// ── Module 08: BusinessReview businessResponse fields ────────────────────────
+STATEMENTS.push('ALTER TABLE "BusinessReview" ADD COLUMN IF NOT EXISTS "businessResponse" VARCHAR(1000);');
+STATEMENTS.push('ALTER TABLE "BusinessReview" ADD COLUMN IF NOT EXISTS "businessResponseAt" TIMESTAMP(3);');
+STATEMENTS.push('CREATE INDEX IF NOT EXISTS "BusinessReview_businessProfileId_createdAt_idx" ON "BusinessReview"("businessProfileId", "createdAt" DESC);');
