@@ -2132,3 +2132,274 @@ router.get('/booking/dashboard', wrap(async (req, res) => {
 
 
 module.exports = router;
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MODULE 07 — Finance/Ledger extended routes
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ── Ledger: dashboard stats ──────────────────────────────────────────────────
+// Alias that matches what FinanceV2 calls
+router.get('/finance/dashboard', wrap(async (req, res) => {
+    const bpId = req.businessProfileId;
+    const stats = await svc.ledgerService.getDashboardStats(bpId);
+    res.json({ data: stats });
+}));
+
+// ── Ledger: P&L with prior-period comparison ─────────────────────────────────
+router.get('/finance/pl', wrap(async (req, res) => {
+    const bpId = req.businessProfileId;
+    const { startDate, endDate } = req.query;
+    const [current, prior] = await Promise.all([
+        svc.ledgerService.getProfitLoss(bpId, { startDate, endDate }),
+        startDate && endDate ? (async () => {
+            const ms = new Date(endDate) - new Date(startDate);
+            const priorEnd = new Date(new Date(startDate) - 1).toISOString();
+            const priorStart = new Date(new Date(startDate) - ms).toISOString();
+            return svc.ledgerService.getProfitLoss(bpId, { startDate: priorStart, endDate: priorEnd });
+        })() : Promise.resolve(null),
+    ]);
+    res.json({ data: { current, prior } });
+}));
+
+// ── Ledger: cash flow ─────────────────────────────────────────────────────────
+router.get('/finance/cashflow', wrap(async (req, res) => {
+    const bpId = req.businessProfileId;
+    const cf = await svc.ledgerService.getCashFlow(bpId, req.query);
+    res.json({ data: cf });
+}));
+
+// ── Ledger: expense list ──────────────────────────────────────────────────────
+router.get('/finance/expenses', wrap(async (req, res) => {
+    const bpId = req.businessProfileId;
+    const exp = await svc.ledgerService.getExpenseBreakdown(bpId, req.query);
+    res.json({ data: exp });
+}));
+
+// ── Escrow: held funds total ──────────────────────────────────────────────────
+router.get('/finance/escrow-held', wrap(async (req, res) => {
+    const bpId = req.businessProfileId;
+    // Sum all open escrow balances for this business
+    const escrows = await svc.prisma.escrow.findMany({
+        where: {
+            status: { in: ['HELD', 'HOLDING', 'PENDING_RELEASE'] },
+            order: { businessProfileId: bpId },
+        },
+        select: { amountUsdc: true, status: true },
+    });
+    const totalHeld = escrows.reduce((s, e) => s + parseFloat(e.amountUsdc || 0), 0);
+    res.json({ data: { totalHeld, escrowCount: escrows.length, escrows } });
+}));
+
+// ── Recurring Expense Templates ────────────────────────────────────────────────
+router.get('/finance/recurring', wrap(async (req, res) => {
+    const bpId = req.businessProfileId;
+    const templates = await svc.prisma.recurringExpenseTemplate.findMany({
+        where: { businessProfileId: bpId },
+        orderBy: { name: 'asc' },
+    });
+    res.json({ data: templates });
+}));
+
+router.post('/finance/recurring', requirePermission('finance.ledger.manage'), wrap(async (req, res) => {
+    const bpId = req.businessProfileId;
+    const { name, category, amount, description, frequency, dayOfMonth, dayOfWeek } = req.body;
+    // Compute nextDueAt
+    const now = new Date();
+    let nextDueAt = new Date(now);
+    if (frequency === 'MONTHLY') { nextDueAt.setDate(dayOfMonth || 1); if (nextDueAt <= now) nextDueAt.setMonth(nextDueAt.getMonth() + 1); }
+    else if (frequency === 'WEEKLY') { const dow = dayOfWeek || 1; const diff = (dow + 7 - now.getDay()) % 7 || 7; nextDueAt.setDate(now.getDate() + diff); }
+
+    const template = await svc.prisma.recurringExpenseTemplate.create({
+        data: { businessProfileId: bpId, name, category, amount: parseFloat(amount), description, frequency, dayOfMonth, dayOfWeek, nextDueAt },
+    });
+    res.json({ data: template });
+}));
+
+router.patch('/finance/recurring/:id', requirePermission('finance.ledger.manage'), wrap(async (req, res) => {
+    const { name, category, amount, description, frequency, dayOfMonth, dayOfWeek, isActive } = req.body;
+    const template = await svc.prisma.recurringExpenseTemplate.update({
+        where: { id: req.params.id },
+        data: { name, category, amount: amount ? parseFloat(amount) : undefined, description, frequency, dayOfMonth, dayOfWeek, isActive },
+    });
+    res.json({ data: template });
+}));
+
+router.delete('/finance/recurring/:id', requirePermission('finance.ledger.manage'), wrap(async (req, res) => {
+    await svc.prisma.recurringExpenseTemplate.delete({ where: { id: req.params.id } });
+    res.json({ ok: true });
+}));
+
+// ── Payroll liability summary ─────────────────────────────────────────────────
+router.get('/finance/payroll-position', wrap(async (req, res) => {
+    const bpId = req.businessProfileId;
+    const [payrolls, ewaRequests] = await Promise.all([
+        svc.prisma.payrollRecord.findMany({
+            where: { businessProfileId: bpId, status: { in: ['PENDING', 'APPROVED'] } },
+            select: { netPayUsdc: true, status: true, periodEnd: true },
+        }),
+        svc.prisma.eWARequest.findMany({
+            where: { businessProfileId: bpId, status: 'APPROVED' },
+            select: { requestedAmountUsdc: true },
+        }),
+    ]);
+    const pendingPayroll = payrolls.filter(p => p.status === 'PENDING').reduce((s, p) => s + parseFloat(p.netPayUsdc || 0), 0);
+    const approvedPayroll = payrolls.filter(p => p.status === 'APPROVED').reduce((s, p) => s + parseFloat(p.netPayUsdc || 0), 0);
+    const ewaFloat = ewaRequests.reduce((s, e) => s + parseFloat(e.requestedAmountUsdc || 0), 0);
+    res.json({ data: { pendingPayroll, approvedPayroll, ewaFloat, totalLiability: pendingPayroll + approvedPayroll + ewaFloat } });
+}));
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// MODULE 08 — Marketing: Promotions + Reviews response + Followers broadcast
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ── Promotions CRUD ───────────────────────────────────────────────────────────
+router.get('/marketing/promotions', wrap(async (req, res) => {
+    const bpId = req.businessProfileId;
+    const promos = await svc.prisma.businessPromotion.findMany({
+        where: { businessProfileId: bpId },
+        orderBy: { createdAt: 'desc' },
+    });
+    res.json({ data: promos });
+}));
+
+router.post('/marketing/promotions', requirePermission('marketing.publish'), wrap(async (req, res) => {
+    const bpId = req.businessProfileId;
+    const promo = await svc.prisma.businessPromotion.create({
+        data: { ...req.body, businessProfileId: bpId, discountValue: parseFloat(req.body.discountValue) },
+    });
+    res.json({ data: promo });
+}));
+
+router.patch('/marketing/promotions/:id', requirePermission('marketing.publish'), wrap(async (req, res) => {
+    const promo = await svc.prisma.businessPromotion.update({
+        where: { id: req.params.id },
+        data: { ...req.body, ...(req.body.discountValue ? { discountValue: parseFloat(req.body.discountValue) } : {}) },
+    });
+    res.json({ data: promo });
+}));
+
+router.delete('/marketing/promotions/:id', requirePermission('marketing.publish'), wrap(async (req, res) => {
+    await svc.prisma.businessPromotion.delete({ where: { id: req.params.id } });
+    res.json({ ok: true });
+}));
+
+// ── Reviews: owner respond ─────────────────────────────────────────────────────
+router.post('/marketing/reviews/:id/respond', requirePermission('marketing.publish'), wrap(async (req, res) => {
+    const { response } = req.body;
+    if (!response?.trim()) return res.status(400).json({ message: 'Response text required' });
+    const review = await svc.prisma.businessReview.update({
+        where: { id: req.params.id },
+        data: { businessResponse: response.trim(), businessResponseAt: new Date() },
+    });
+    res.json({ data: review });
+}));
+
+// ── Reviews: flag/dispute ──────────────────────────────────────────────────────
+router.post('/marketing/reviews/:id/flag', requirePermission('marketing.publish'), wrap(async (req, res) => {
+    const { reason } = req.body;
+    const bpId = req.businessProfileId;
+    // Write an audit log entry for admin review
+    const { audit } = require('../utils/audit');
+    await audit(svc.prisma, {
+        actorId: req.user?.id || null,
+        actorName: req.user?.username || null,
+        action: 'REVIEW_FLAGGED',
+        targetType: 'BUSINESS_REVIEW',
+        targetId: req.params.id,
+        metadata: { businessProfileId: bpId, reason },
+        ipAddress: req.ip,
+    });
+    res.json({ ok: true, message: 'Review flagged for admin review' });
+}));
+
+// ── Followers broadcast ────────────────────────────────────────────────────────
+router.post('/marketing/broadcast', requirePermission('marketing.publish'), wrap(async (req, res) => {
+    const bpId = req.businessProfileId;
+    const { message, title } = req.body;
+    if (!message?.trim()) return res.status(400).json({ message: 'Message required' });
+
+    // Rate limit: max 3 broadcasts per 7 days
+    const weekAgo = new Date(); weekAgo.setDate(weekAgo.getDate() - 7);
+    const recentCount = await svc.prisma.businessNotification.count({
+        where: { businessProfileId: bpId, type: 'BROADCAST', createdAt: { gte: weekAgo } },
+    });
+    if (recentCount >= 3) return res.status(429).json({ message: 'Broadcast limit reached (3 per week). Try again later.' });
+
+    // Get all followers
+    const followers = await svc.prisma.businessFollower.findMany({
+        where: { businessProfileId: bpId },
+        select: { userId: true },
+    });
+
+    // Create a notification record for tracking (business-side)
+    await svc.prisma.businessNotification.create({
+        data: {
+            businessProfileId: bpId,
+            type: 'BROADCAST',
+            title: title || 'Update from your business',
+            body: message,
+            metadata: { recipientCount: followers.length },
+        },
+    });
+
+    // Emit socket events to each follower (best-effort)
+    const io = req.app.get('io');
+    if (io) {
+        followers.forEach(f => io.to(`user_${f.userId}`).emit('business_broadcast', { businessProfileId: bpId, title, message }));
+    }
+
+    res.json({ ok: true, sentTo: followers.length });
+}));
+
+// ── Follower stats ─────────────────────────────────────────────────────────────
+router.get('/marketing/followers', wrap(async (req, res) => {
+    const bpId = req.businessProfileId;
+    const [total, recent] = await Promise.all([
+        svc.prisma.businessFollower.count({ where: { businessProfileId: bpId } }),
+        svc.prisma.businessFollower.count({ where: { businessProfileId: bpId, createdAt: { gte: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000) } } }),
+    ]);
+    res.json({ data: { total, newThisMonth: recent } });
+}));
+
+// ── Analytics: customer + operational ─────────────────────────────────────────
+router.get('/analytics/customer', wrap(async (req, res) => {
+    const bpId = req.businessProfileId;
+    const { startDate, endDate } = req.query;
+    const dateFilter = startDate && endDate ? { gte: new Date(startDate), lte: new Date(endDate) } : undefined;
+    const where = { businessProfileId: bpId, ...(dateFilter ? { createdAt: dateFilter } : {}) };
+
+    const [orders, reviews] = await Promise.all([
+        svc.prisma.businessOrder.findMany({ where, select: { customerId: true, amountUsdc: true, createdAt: true, status: true } }),
+        svc.prisma.businessReview.findMany({ where: { businessProfileId: bpId }, select: { rating: true, createdAt: true } }),
+    ]);
+
+    const customerMap = {};
+    orders.forEach(o => { if (!customerMap[o.customerId]) customerMap[o.customerId] = []; customerMap[o.customerId].push(o); });
+    const repeatRate = Object.values(customerMap).filter(arr => arr.length > 1).length / Math.max(Object.keys(customerMap).length, 1) * 100;
+    const avgOrderValue = orders.reduce((s, o) => s + parseFloat(o.amountUsdc || 0), 0) / Math.max(orders.length, 1);
+    const avgRating = reviews.reduce((s, r) => s + r.rating, 0) / Math.max(reviews.length, 1);
+
+    res.json({ data: { totalOrders: orders.length, uniqueCustomers: Object.keys(customerMap).length, repeatRate, avgOrderValue, avgRating, reviewCount: reviews.length } });
+}));
+
+router.get('/analytics/operational', wrap(async (req, res) => {
+    const bpId = req.businessProfileId;
+    const [kitchenOrders, housekeepingTasks, trips] = await Promise.all([
+        svc.prisma.kitchenOrder.findMany({ where: { businessProfileId: bpId }, select: { sentAt: true, servedAt: true, status: true }, take: 500, orderBy: { sentAt: 'desc' } }),
+        svc.prisma.hotelHousekeepingTask.findMany({ where: { businessProfileId: bpId }, select: { startedAt: true, completedAt: true, status: true }, take: 500, orderBy: { createdAt: 'desc' } }),
+        svc.prisma.transitTrip.findMany({ where: { businessProfileId: bpId }, select: { scheduledDeparture: true, actualDeparture: true, status: true }, take: 500, orderBy: { scheduledDeparture: 'desc' } }),
+    ]);
+
+    const kitchenCompleted = kitchenOrders.filter(o => o.servedAt && o.sentAt);
+    const avgKitchenMins = kitchenCompleted.reduce((s, o) => s + (new Date(o.servedAt) - new Date(o.sentAt)) / 60000, 0) / Math.max(kitchenCompleted.length, 1);
+
+    const hkCompleted = housekeepingTasks.filter(t => t.completedAt && t.startedAt);
+    const avgHkMins = hkCompleted.reduce((s, t) => s + (new Date(t.completedAt) - new Date(t.startedAt)) / 60000, 0) / Math.max(hkCompleted.length, 1);
+
+    const tripsWithDep = trips.filter(t => t.actualDeparture && t.scheduledDeparture);
+    const onTimeTrips = tripsWithDep.filter(t => new Date(t.actualDeparture) <= new Date(t.scheduledDeparture));
+    const onTimeRate = tripsWithDep.length > 0 ? (onTimeTrips.length / tripsWithDep.length) * 100 : 0;
+
+    res.json({ data: { avgKitchenMins: Math.round(avgKitchenMins), avgHousekeepingMins: Math.round(avgHkMins), onTimeTripRate: Math.round(onTimeRate), kitchenOrderCount: kitchenCompleted.length, housekeepingTaskCount: hkCompleted.length, tripCount: tripsWithDep.length } });
+}));
+

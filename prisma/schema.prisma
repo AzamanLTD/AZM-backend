@@ -2467,6 +2467,8 @@ model BusinessProfile {
   hotelRooms         HotelRoom[]
   housekeepingTasks  HotelHousekeepingTask[]
   hotelRateOverrides HotelRateOverride[]
+  promotions         BusinessPromotion[]
+  recurringExpenses  RecurringExpenseTemplate[]
   waitlistEntries   RestaurantWaitlistEntry[]
   kitchenOrders      KitchenOrder[]
   driverAssignments  DriverAssignment[]
@@ -2692,10 +2694,68 @@ model BusinessReview {
   transitBooking   TransitBooking? @relation(fields: [transitBookingId], references: [id])
 
   @@index([businessProfileId])
+  // Owner response to review
+  businessResponse     String?  @db.VarChar(1000)
+  businessResponseAt   DateTime?
+
   @@index([businessProfileId, createdAt(sort: Desc)])
 }
 
 // =============================================================================
+
+// ── Business Promotions (Module 08 — Marketing) ───────────────────────────────
+model BusinessPromotion {
+  id                String   @id @default(uuid())
+  businessProfileId String
+  code              String?  @db.VarChar(50) // null = automatic (no code needed)
+  name              String   @db.VarChar(120)
+  discountType      String   @db.VarChar(20) // PERCENT | FLAT | BUY_X_GET_Y
+  discountValue     Decimal  @db.Decimal(10, 4) // percent or flat USDC amount
+  buyQuantity       Int?     // for BUY_X_GET_Y: X
+  getQuantity       Int?     // for BUY_X_GET_Y: Y
+  scope             String   @db.VarChar(30) // ORDER | PRODUCT | FIRST_TIME | MIN_SPEND
+  minSpendUsdc      Decimal? @db.Decimal(20, 8)
+  applicableProductIds String[] // empty = all products
+  startDate         DateTime
+  endDate           DateTime
+  usageLimit        Int?     // null = unlimited
+  perCustomerLimit  Int?     // null = unlimited
+  usageCount        Int      @default(0)
+  isActive          Boolean  @default(true)
+  notes             String?  @db.VarChar(500)
+
+  businessProfile   BusinessProfile @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  @@index([businessProfileId, isActive])
+  @@index([code])
+}
+
+// ── Recurring Expense Templates (Module 07 — Finance) ────────────────────────
+model RecurringExpenseTemplate {
+  id                String   @id @default(uuid())
+  businessProfileId String
+  name              String   @db.VarChar(120) // "Monthly Rent", "Electricity", "Staff Meals"
+  category          String   @db.VarChar(80)
+  amount            Decimal  @db.Decimal(20, 8)
+  description       String?  @db.VarChar(500)
+  frequency         String   @db.VarChar(20) // MONTHLY | WEEKLY | QUARTERLY
+  dayOfMonth        Int?     // 1-28 for MONTHLY; null for WEEKLY
+  dayOfWeek         Int?     // 0=Sun for WEEKLY
+  isActive          Boolean  @default(true)
+  lastPostedAt      DateTime?
+  nextDueAt         DateTime?
+
+  businessProfile   BusinessProfile @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  @@index([businessProfileId, isActive])
+}
+
 // CATALOG SECTION — Menu/product grouping (2026-06-24)
 // Restaurants use "Starters / Mains / Drinks". Hotels use "Rooms / Suites".
 // Linked to BusinessProduct via catalogSectionId.
@@ -2877,6 +2937,10 @@ model BusinessNotification {
   businessProfile BusinessProfile @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
 
   @@index([businessProfileId, isRead])
+  // Owner response to review
+  businessResponse     String?  @db.VarChar(1000)
+  businessResponseAt   DateTime?
+
   @@index([businessProfileId, createdAt(sort: Desc)])
 }
 
@@ -4462,6 +4526,10 @@ model EmployeeFeedback {
   createdAt DateTime @default(now())
   
   @@index([receiverEmployeeId])
+  // Owner response to review
+  businessResponse     String?  @db.VarChar(1000)
+  businessResponseAt   DateTime?
+
   @@index([businessProfileId, createdAt(sort: Desc)])
 }
 
