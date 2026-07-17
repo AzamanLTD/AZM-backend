@@ -2404,6 +2404,7 @@ model BusinessProfile {
   // activity until an admin unsuspends it. suspendReason is operator-facing.
   isSuspended   Boolean @default(false)
   isPausedByOwner  Boolean @default(false) // owner-initiated pause — stops new orders/bookings without admin suspension
+  allowOverbooking Boolean @default(false) // Module 06: opt-in overbooking against expected no-shows
   suspendReason String? @db.VarChar(500)
 
   // Public contact info
@@ -2451,6 +2452,7 @@ model BusinessProfile {
   transitTrips  TransitTrip[]
   followers     BusinessFollower[]
   adPosts       BusinessAdPost[]
+  taxPresets    BusinessTaxPreset[]
   dineInTabs    DineInTab[]
   penaltyPolicy PenaltyPolicy?
   showcase      BusinessShowcase[]
@@ -2497,6 +2499,25 @@ model BusinessProfile {
 // BusinessLocation is declared BEFORE BusinessProduct because
 // BusinessProduct.locationId references it.
 // =============================================================================
+// =============================================================================
+// MODULE 06: BUSINESS TAX PRESET — reusable tax line presets for invoices
+// =============================================================================
+model BusinessTaxPreset {
+  id                String      @id @default(uuid())
+  businessProfileId String
+  name              String      @db.VarChar(100) // e.g. "VAT", "NHIL", "Service Charge"
+  type              TaxLineType // PERCENTAGE or FLAT
+  value             Decimal     @db.Decimal(10, 4) // percent (15.0) or flat amount (5.00)
+  isDefault         Boolean     @default(false)
+
+  businessProfile BusinessProfile @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([businessProfileId])
+}
+
 model BusinessLocation {
   id                String  @id @default(uuid())
   businessProfileId String

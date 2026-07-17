@@ -1756,4 +1756,379 @@ router.patch('/pause', requirePermission('settings.manage'), wrap(async (req, re
     res.json({ success: true, isPausedByOwner: bp.isPausedByOwner });
 }));
 
+
+// ── MODULE 06: UNIVERSAL BOOKING, ORDERS & INVOICING ────────────────────────
+
+// ── Tax Presets ──────────────────────────────────────────────────────────────
+
+// GET /api/business-os/tax-presets — list tax presets for the business
+router.get('/tax-presets', wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+    const presets = await prisma.businessTaxPreset.findMany({
+        where: { businessProfileId: bpId },
+        orderBy: { createdAt: 'asc' },
+    });
+    res.json({ success: true, presets });
+}));
+
+// POST /api/business-os/tax-presets — create a tax preset
+router.post('/tax-presets', requirePermission('settings.manage'), wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+    const { name, type, value, isDefault } = req.body;
+    if (!name || !type || value === undefined) {
+        return res.status(400).json({ success: false, message: 'name, type, and value are required.' });
+    }
+    // If isDefault, unset other defaults
+    if (isDefault) {
+        await prisma.businessTaxPreset.updateMany({
+            where: { businessProfileId: bpId, isDefault: true },
+            data: { isDefault: false },
+        });
+    }
+    const preset = await prisma.businessTaxPreset.create({
+        data: {
+            businessProfileId: bpId,
+            name,
+            type,
+            value: parseFloat(value),
+            isDefault: !!isDefault,
+        },
+    });
+    res.status(201).json({ success: true, preset });
+}));
+
+// PATCH /api/business-os/tax-presets/:id — update a tax preset
+router.patch('/tax-presets/:id', requirePermission('settings.manage'), wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+    const { name, type, value, isDefault } = req.body;
+    // If setting as default, unset other defaults
+    if (isDefault) {
+        await prisma.businessTaxPreset.updateMany({
+            where: { businessProfileId: bpId, isDefault: true, id: { not: req.params.id } },
+            data: { isDefault: false },
+        });
+    }
+    const preset = await prisma.businessTaxPreset.update({
+        where: { id: req.params.id },
+        data: {
+            ...(name && { name }),
+            ...(type && { type }),
+            ...(value !== undefined && { value: parseFloat(value) }),
+            ...(isDefault !== undefined && { isDefault: !!isDefault }),
+        },
+    });
+    res.json({ success: true, preset });
+}));
+
+// DELETE /api/business-os/tax-presets/:id — delete a tax preset
+router.delete('/tax-presets/:id', requirePermission('settings.manage'), wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+    await prisma.businessTaxPreset.deleteMany({
+        where: { id: req.params.id, businessProfileId: bpId },
+    });
+    res.json({ success: true, message: 'Tax preset deleted.' });
+}));
+
+// ── Overbooking Toggle ──────────────────────────────────────────────────────
+
+// PATCH /api/business-os/overbooking — toggle allowOverbooking
+router.patch('/overbooking', requirePermission('settings.manage'), wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+    const { allowed } = req.body;
+    const bp = await prisma.businessProfile.update({
+        where: { id: bpId },
+        data: { allowOverbooking: !!allowed },
+        select: { allowOverbooking: true },
+    });
+    const { logBusinessAudit } = require('../utils/businessAudit');
+    await logBusinessAudit(prisma, {
+        businessProfileId: bpId,
+        actorId: req.user.id,
+        actorName: req.user.username,
+        action: bp.allowOverbooking ? 'OVERBOOKING_ENABLED' : 'OVERBOOKING_DISABLED',
+        targetType: 'BUSINESS_PROFILE',
+        targetId: bpId,
+        metadata: { allowOverbooking: bp.allowOverbooking },
+        ipAddress: req.ip,
+    });
+    res.json({ success: true, allowOverbooking: bp.allowOverbooking });
+}));
+
+// ── Reservation Reschedule/Negotiation ──────────────────────────────────────
+
+// POST /api/business-os/reservations/:id/propose-reschedule — owner proposes new time
+router.post('/reservations/:id/propose-reschedule', requirePermission('reservations.manage'), wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+    const { proposedStartDatetime, proposedEndDatetime, message } = req.body;
+    if (!proposedStartDatetime) {
+        return res.status(400).json({ success: false, message: 'proposedStartDatetime is required.' });
+    }
+    const reservation = await prisma.reservation.findFirst({
+        where: { id: req.params.id, businessProfileId: bpId },
+    });
+    if (!reservation) return res.status(404).json({ success: false, message: 'Reservation not found.' });
+    if (reservation.status !== 'PENDING' && reservation.status !== 'CONFIRMED') {
+        return res.status(400).json({ success: false, message: 'Can only reschedule PENDING or CONFIRMED reservations.' });
+    }
+    const updated = await prisma.reservation.update({
+        where: { id: req.params.id },
+        data: {
+            proposedStartDatetime: new Date(proposedStartDatetime),
+            proposedEndDatetime: proposedEndDatetime ? new Date(proposedEndDatetime) : null,
+            counterProposeMessage: message || null,
+            counterProposedAt: new Date(),
+        },
+    });
+    res.json({ success: true, reservation: updated });
+}));
+
+// POST /api/business-os/reservations/:id/respond-reschedule — owner responds to customer's reschedule request
+router.post('/reservations/:id/respond-reschedule', requirePermission('reservations.manage'), wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+    const { accept } = req.body;
+    const reservation = await prisma.reservation.findFirst({
+        where: { id: req.params.id, businessProfileId: bpId },
+    });
+    if (!reservation) return res.status(404).json({ success: false, message: 'Reservation not found.' });
+    if (!reservation.proposedStartDatetime) {
+        return res.status(400).json({ success: false, message: 'No pending reschedule proposal.' });
+    }
+    if (accept) {
+        // Apply the proposed times
+        const updated = await prisma.reservation.update({
+            where: { id: req.params.id },
+            data: {
+                startDatetime: reservation.proposedStartDatetime,
+                endDatetime: reservation.proposedEndDatetime || reservation.endDatetime,
+                proposedStartDatetime: null,
+                proposedEndDatetime: null,
+                counterProposeMessage: null,
+                counterProposedAt: null,
+            },
+        });
+        res.json({ success: true, reservation: updated, action: 'accepted' });
+    } else {
+        // Reject the proposal
+        const updated = await prisma.reservation.update({
+            where: { id: req.params.id },
+            data: {
+                proposedStartDatetime: null,
+                proposedEndDatetime: null,
+                counterProposeMessage: null,
+                counterProposedAt: null,
+            },
+        });
+        res.json({ success: true, reservation: updated, action: 'rejected' });
+    }
+}));
+
+// ── Slot Preview ─────────────────────────────────────────────────────────────
+
+// GET /api/business-os/availability/slots-preview?days=7 — show available slots
+router.get('/availability/slots-preview', wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+    const days = parseInt(req.query.days) || 7;
+    const locationId = req.query.locationId || null;
+
+    const rules = await prisma.availabilityRule.findMany({
+        where: { businessProfileId: bpId, isActive: true, ...(locationId && { locationId }) },
+        orderBy: { dayOfWeek: 'asc' },
+    });
+
+    // Get existing reservations for the next N days
+    const startDate = new Date();
+    startDate.setHours(0, 0, 0, 0);
+    const endDate = new Date(startDate);
+    endDate.setDate(endDate.getDate() + days);
+
+    const existing = await prisma.reservation.findMany({
+        where: {
+            businessProfileId: bpId,
+            status: { in: ['PENDING', 'CONFIRMED'] },
+            startDatetime: { gte: startDate, lt: endDate },
+            ...(locationId && { locationId }),
+        },
+        select: { startDatetime: true, endDatetime: true, partySize: true },
+    });
+
+    // Compute open slots per day based on rules
+    const slots = [];
+    const dayNames = ['SUNDAY', 'MONDAY', 'TUESDAY', 'WEDNESDAY', 'THURSDAY', 'FRIDAY', 'SATURDAY'];
+    for (let d = 0; d < days; d++) {
+        const date = new Date(startDate);
+        date.setDate(date.getDate() + d);
+        const dayOfWeek = dayNames[date.getDay()];
+        const dayRules = rules.filter(r => r.dayOfWeek === dayOfWeek);
+        const daySlot = {
+            date: date.toISOString().slice(0, 10),
+            dayName: dayOfWeek.charAt(0) + dayOfWeek.slice(1).toLowerCase(),
+            open: dayRules.length > 0,
+            windows: dayRules.map(r => ({
+                startTime: r.startTime,
+                endTime: r.endTime,
+                booked: existing.filter(e => {
+                    const eDate = new Date(e.startDatetime).toISOString().slice(0, 10);
+                    return eDate === date.toISOString().slice(0, 10);
+                }).length,
+            })),
+        };
+        slots.push(daySlot);
+    }
+
+    res.json({ success: true, slots, allowOverbooking: true });
+}));
+
+// ── Bulk Order Operations ───────────────────────────────────────────────────
+
+// POST /api/business-os/orders/bulk-status — bulk update order status
+router.post('/orders/bulk-status', requirePermission('orders.manage'), wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+    const { orderIds, status } = req.body;
+    if (!Array.isArray(orderIds) || !status) {
+        return res.status(400).json({ success: false, message: 'orderIds (array) and status are required.' });
+    }
+    const validStatuses = ['AWAITING_PAYMENT', 'PAID', 'DELIVERED', 'COMPLETED', 'CANCELLED'];
+    if (!validStatuses.includes(status)) {
+        return res.status(400).json({ success: false, message: 'Invalid status.' });
+    }
+    const updateData = { status };
+    if (status === 'DELIVERED') updateData.deliveredAt = new Date();
+    if (status === 'COMPLETED') updateData.completedAt = new Date();
+    if (status === 'CANCELLED') updateData.cancelledAt = new Date();
+
+    const result = await prisma.businessOrder.updateMany({
+        where: { id: { in: orderIds }, businessProfileId: bpId },
+        data: updateData,
+    });
+
+    // Audit log
+    const { logBusinessAudit } = require('../utils/businessAudit');
+    await logBusinessAudit(prisma, {
+        businessProfileId: bpId,
+        actorId: req.user.id,
+        actorName: req.user.username,
+        action: 'BULK_ORDER_STATUS_UPDATE',
+        targetType: 'BUSINESS_ORDER',
+        targetId: orderIds.join(','),
+        metadata: { status, count: result.count },
+        ipAddress: req.ip,
+    });
+
+    res.json({ success: true, updated: result.count });
+}));
+
+// ── Order Refund/Dispute ─────────────────────────────────────────────────────
+
+// POST /api/business-os/orders/:id/refund — initiate refund through escrow dispute
+router.post('/orders/:id/refund', requirePermission('orders.refund'), wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+    const { reason } = req.body;
+    if (!reason) {
+        return res.status(400).json({ success: false, message: 'A reason is required for refunds.' });
+    }
+    const order = await prisma.businessOrder.findFirst({
+        where: { id: req.params.id, businessProfileId: bpId },
+        include: { escrow: true },
+    });
+    if (!order) return res.status(404).json({ success: false, message: 'Order not found.' });
+    if (!order.escrow) {
+        return res.status(400).json({ success: false, message: 'No escrow linked to this order. Cannot process refund.' });
+    }
+    if (order.escrow.status === 'REFUNDED' || order.escrow.status === 'DISPUTED') {
+        return res.status(400).json({ success: false, message: 'Escrow already ' + order.escrow.status.toLowerCase() + '.' });
+    }
+    // Dispute the escrow
+    const escrow = require('../utils/escrow');
+    const result = await escrow.dispute(order.escrow.id, reason);
+
+    // Update order status
+    await prisma.businessOrder.update({
+        where: { id: req.params.id },
+        data: { status: 'CANCELLED', cancelledAt: new Date() },
+    });
+
+    // Audit log
+    const { logBusinessAudit } = require('../utils/businessAudit');
+    await logBusinessAudit(prisma, {
+        businessProfileId: bpId,
+        actorId: req.user.id,
+        actorName: req.user.username,
+        action: 'ORDER_REFUND_INITIATED',
+        targetType: 'BUSINESS_ORDER',
+        targetId: req.params.id,
+        metadata: { reason, escrowId: order.escrow.id, amountUsdc: order.amountUsdc.toString() },
+        ipAddress: req.ip,
+    });
+
+    res.json({ success: true, escrow: result, orderRef: order.orderRef });
+}));
+
+// ── Invoice Stats ────────────────────────────────────────────────────────────
+
+// GET /api/business-os/invoices/stats — invoice dashboard stats
+router.get('/invoices/stats', wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+    const [draft, sent, paid, voided, totalRevenue] = await Promise.all([
+        prisma.businessInvoice.count({ where: { businessProfileId: bpId, status: 'DRAFT' } }),
+        prisma.businessInvoice.count({ where: { businessProfileId: bpId, status: 'SENT' } }),
+        prisma.businessInvoice.count({ where: { businessProfileId: bpId, status: 'PAID' } }),
+        prisma.businessInvoice.count({ where: { businessProfileId: bpId, status: 'VOID' } }),
+        prisma.businessInvoice.aggregate({
+            where: { businessProfileId: bpId, status: 'PAID' },
+            _sum: { billTotalUsdc: true },
+        }),
+    ]);
+    res.json({
+        success: true,
+        stats: {
+            draft, sent, paid, voided,
+            totalRevenueUsdc: totalRevenue._sum.billTotalUsdc?.toString() || '0',
+        },
+    });
+}));
+
+// ── Booking Dashboard ────────────────────────────────────────────────────────
+
+// GET /api/business-os/booking/dashboard — unified booking stats
+router.get('/booking/dashboard', wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const tomorrow = new Date(today);
+    tomorrow.setDate(tomorrow.getDate() + 1);
+
+    const [pendingRes, confirmedRes, checkedInRes, todayCheckins, activeOrders, pendingOrders] = await Promise.all([
+        prisma.reservation.count({ where: { businessProfileId: bpId, status: 'PENDING' } }),
+        prisma.reservation.count({ where: { businessProfileId: bpId, status: 'CONFIRMED' } }),
+        prisma.reservation.count({ where: { businessProfileId: bpId, status: 'CHECKED_IN' } }),
+        prisma.reservation.count({
+            where: {
+                businessProfileId: bpId,
+                status: { in: ['CONFIRMED', 'CHECKED_IN'] },
+                startDatetime: { gte: today, lt: tomorrow },
+            },
+        }),
+        prisma.businessOrder.count({ where: { businessProfileId: bpId, status: { in: ['PAID', 'DELIVERED'] } } }),
+        prisma.businessOrder.count({ where: { businessProfileId: bpId, status: 'AWAITING_PAYMENT' } }),
+    ]);
+
+    res.json({
+        success: true,
+        stats: { pendingRes, confirmedRes, checkedInRes, todayCheckins, activeOrders, pendingOrders },
+    });
+}));
+
+
 module.exports = router;

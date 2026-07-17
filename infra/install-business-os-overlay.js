@@ -281,6 +281,32 @@ STATEMENTS.push(`DO $$ BEGIN
 STATEMENTS.push('ALTER TABLE "CargoParcel" ADD COLUMN IF NOT EXISTS "proofOfDeliveryUrl" TEXT;');
 
 
+
+// ── Module 06: BusinessTaxPreset table ──────────────────────────────────────
+STATEMENTS.push(`CREATE TABLE IF NOT EXISTS "BusinessTaxPreset" (
+    "id" TEXT NOT NULL DEFAULT gen_random_uuid()::text,
+    "businessProfileId" TEXT NOT NULL,
+    "name" VARCHAR(100) NOT NULL,
+    "type" TEXT NOT NULL,
+    "value" DECIMAL(10,4) NOT NULL,
+    "isDefault" BOOLEAN NOT NULL DEFAULT false,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT "BusinessTaxPreset_pkey" PRIMARY KEY ("id")
+);`);
+
+STATEMENTS.push('CREATE INDEX IF NOT EXISTS "BusinessTaxPreset_businessProfileId_idx" ON "BusinessTaxPreset"("businessProfileId");');
+
+STATEMENTS.push(`DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.table_constraints WHERE constraint_name = 'BusinessTaxPreset_businessProfileId_fkey') THEN
+      ALTER TABLE "BusinessTaxPreset" ADD CONSTRAINT "BusinessTaxPreset_businessProfileId_fkey" FOREIGN KEY ("businessProfileId") REFERENCES "BusinessProfile"("id") ON DELETE CASCADE;
+    END IF;
+  END $$;`);
+
+// ── Module 06: BusinessProfile.allowOverbooking ─────────────────────────────
+STATEMENTS.push('ALTER TABLE "BusinessProfile" ADD COLUMN IF NOT EXISTS "allowOverbooking" BOOLEAN NOT NULL DEFAULT false;');
+
+
 main()
   .catch((e) => {
     console.error('[business-os-overlay] Fatal:', e);
