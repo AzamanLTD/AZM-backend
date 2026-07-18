@@ -2210,7 +2210,202 @@ router.get('/invoices/stats', wrap(async (req, res) => {
 router.get('/booking/dashboard', wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
-    if (!bpId) return res.json({ success: true, stats: { totalOrders: 0, pending: 0, confirmed: 0, completed: 0, cancelled: 0, revenueUsdc: '0' } });
+    if (!bpId) return res.json({ success: true, stats: { totalOrders: 0, pending: 0, confirmed: 0, completed: 0, cancelled: 0, revenueUsdc: '0' }, overbookingAllowed: false });
+
+    const [totalOrders, pending, confirmed, completed, cancelled, revenueAgg, bp] = await Promise.all([
+        prisma.businessOrder.count({ where: { businessProfileId: bpId } }),
+        prisma.businessOrder.count({ where: { businessProfileId: bpId, status: 'PENDING' } }),
+        prisma.businessOrder.count({ where: { businessProfileId: bpId, status: 'CONFIRMED' } }),
+        prisma.businessOrder.count({ where: { businessProfileId: bpId, status: 'COMPLETED' } }),
+        prisma.businessOrder.count({ where: { businessProfileId: bpId, status: 'CANCELLED' } }),
+        prisma.businessOrder.aggregate({ where: { businessProfileId: bpId, status: 'COMPLETED' }, _sum: { amountUsdc: true } }),
+        prisma.businessProfile.findUnique({ where: { id: bpId }, select: { allowOverbooking: true } }),
+    ]);
+
+    res.json({
+        success: true,
+        stats: {
+            totalOrders, pending, confirmed, completed, cancelled,
+            revenueUsdc: (revenueAgg._sum?.amountUsdc || 0).toString(),
+        },
+        overbookingAllowed: bp?.allowOverbooking || false,
+    });
+}));
+
+// GET /api/business-os/dashboard/at-risk — aggregates urgent items across all verticals
+router.get('/dashboard/at-risk', wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+    if (!bpId) return res.json({ success: true, items: [] });
+
+    const now = new Date();
+    const fourHoursAgo = new Date(now.getTime() - 4 * 60 * 60 * 1000);
+    const thirtyMinAgo = new Date(now.getTime() - 30 * 60 * 1000);
+    const twoHoursAgo = new Date(now.getTime() - 2 * 60 * 60 * 1000);
+
+    const items = [];
+
+    // 1. Overdue housekeeping tasks (>4h, not done)
+    try {
+        const overdueHousekeeping = await prisma.hotelHousekeepingTask.findMany({
+            where: { businessProfileId: bpId, status: { not: 'DONE' }, createdAt: { lt: fourHoursAgo } },
+            select: { id: true, taskType: true, priority: true, createdAt: true, roomId: true },
+            take: 5,
+        });
+        for (const t of overdueHousekeeping) {
+            items.push({
+                type: 'HOUSEKEEPING_OVERDUE',
+                severity: t.priority <= 2 ? 'urgent' : 'warning',
+                title: `Overdue housekeeping: ${t.taskType}`,
+                subtitle: `Room ${t.roomId?.slice(-6) || 'N/A'} — pending ${Math.round((now - t.createdAt) / 60000)}min`,
+                link: '/hotel/housekeeping',
+                createdAt: t.createdAt,
+            });
+        }
+    } catch (e) { /* model may not exist */ }
+
+    // 2. Kitchen tickets aging (>30min, still new/preparing)
+    try {
+        const agingTickets = await prisma.kitchenOrder.findMany({
+            where: { businessProfileId: bpId, status: { in: ['NEW', 'PREPARING'] }, sentAt: { lt: thirtyMinAgo } },
+            select: { id: true, ticketNumber: true, tableNumber: true, sentAt: true },
+            take: 5,
+        });
+        for (const t of agingTickets) {
+            items.push({
+                type: 'KITCHEN_AGING',
+                severity: 'urgent',
+                title: `Kitchen ticket #${t.ticketNumber} aging`,
+                subtitle: `${t.tableNumber || 'Takeout'} — ${Math.round((now - t.sentAt) / 60000)}min in kitchen`,
+                link: '/restaurant/kitchen',
+                createdAt: t.sentAt,
+            });
+        }
+    } catch (e) { /* model may not exist */ }
+
+    // 3. Vehicles overdue for maintenance
+    try {
+        const overdueMaintenance = await prisma.vehicleMaintenance.findMany({
+            where: { businessProfileId: bpId, status: 'SCHEDULED', scheduledDate: { lt: now } },
+            select: { id: true, vehicleId: true, type: true, description: true, scheduledDate: true },
+            take: 5,
+        });
+        for (const m of overdueMaintenance) {
+            items.push({
+                type: 'VEHICLE_MAINTENANCE',
+                severity: 'warning',
+                title: `Vehicle maintenance overdue`,
+                subtitle: `${m.type}: ${m.description?.slice(0, 60) || 'Scheduled service'}`,
+                link: '/transit/fleet',
+                createdAt: m.scheduledDate,
+            });
+        }
+    } catch (e) { /* model may not exist */ }
+
+    // 4. Pending shift swaps
+    try {
+        const pendingSwaps = await prisma.shiftSwap.findMany({
+            where: { businessProfileId: bpId, status: 'PENDING' },
+            select: { id: true, reason: true, requestedAt: true },
+            take: 5,
+        });
+        for (const s of pendingSwaps) {
+            items.push({
+                type: 'SHIFT_SWAP_PENDING',
+                severity: 'warning',
+                title: 'Pending shift swap request',
+                subtitle: s.reason?.slice(0, 60) || 'Awaiting response',
+                link: '/employees',
+                createdAt: s.requestedAt,
+            });
+        }
+    } catch (e) { /* model may not exist */ }
+
+    // 5. Pending time-off requests
+    try {
+        const pendingTimeOff = await prisma.timeOffRequest.findMany({
+            where: { businessProfileId: bpId, status: 'PENDING' },
+            select: { id: true, type: true, startDate: true, isEmergency: true, reason: true },
+            take: 5,
+        });
+        for (const t of pendingTimeOff) {
+            items.push({
+                type: 'TIME_OFF_PENDING',
+                severity: t.isEmergency ? 'urgent' : 'warning',
+                title: `${t.isEmergency ? 'Emergency ' : ''}Time-off request: ${t.type}`,
+                subtitle: t.reason?.slice(0, 60) || `Starting ${t.startDate.toLocaleDateString()}`,
+                link: '/employees',
+                createdAt: t.startDate,
+            });
+        }
+    } catch (e) { /* model may not exist */ }
+
+    // 6. Unread negative reviews (rating <= 2, no response)
+    try {
+        const negativeReviews = await prisma.businessReview.findMany({
+            where: { businessProfileId: bpId, rating: { lte: 2 }, businessResponse: null },
+            select: { id: true, rating: true, comment: true, createdAt: true },
+            take: 5,
+        });
+        for (const r of negativeReviews) {
+            items.push({
+                type: 'NEGATIVE_REVIEW',
+                severity: 'urgent',
+                title: `${r.rating}-star review unanswered`,
+                subtitle: r.comment?.slice(0, 60) || 'No comment provided',
+                link: '/reviews',
+                createdAt: r.createdAt,
+            });
+        }
+    } catch (e) { /* model may not exist */ }
+
+    // 7. Pending reservations needing action (>2h old)
+    try {
+        const staleReservations = await prisma.reservation.findMany({
+            where: { businessProfileId: bpId, status: 'PENDING', createdAt: { lt: twoHoursAgo } },
+            select: { id: true, reservationRef: true, partySize: true, startDatetime: true, createdAt: true },
+            take: 5,
+        });
+        for (const r of staleReservations) {
+            items.push({
+                type: 'RESERVATION_PENDING',
+                severity: 'warning',
+                title: `Reservation ${r.reservationRef} awaiting confirmation`,
+                subtitle: `Party of ${r.partySize} — ${Math.round((now - r.createdAt) / 3600000)}h waiting`,
+                link: '/reservations',
+                createdAt: r.createdAt,
+            });
+        }
+    } catch (e) { /* model may not exist */ }
+
+    // 8. Low stock inventory items
+    try {
+        const lowStock = await prisma.inventoryItem.findMany({
+            where: { businessProfileId: bpId, isActive: true, currentStock: { lte: prisma.inventoryItem.fields.minimumStock } },
+            select: { id: true, name: true, currentStock: true, minimumStock: true, unit: true },
+            take: 5,
+        });
+        for (const i of lowStock) {
+            items.push({
+                type: 'LOW_STOCK',
+                severity: i.currentStock <= 0 ? 'urgent' : 'warning',
+                title: `Low stock: ${i.name}`,
+                subtitle: `${i.currentStock} ${i.unit} left (min: ${i.minimumStock})`,
+                link: '/restaurant/inventory',
+                createdAt: now,
+            });
+        }
+    } catch (e) { /* model may not exist */ }
+
+    // Sort: urgent first, then by createdAt (oldest first)
+    items.sort((a, b) => {
+        if (a.severity === 'urgent' && b.severity !== 'urgent') return -1;
+        if (a.severity !== 'urgent' && b.severity === 'urgent') return 1;
+        return new Date(a.createdAt) - new Date(b.createdAt);
+    });
+
+    res.json({ success: true, items });
+}));
 
 // ── Phase 2: Kiosk PIN Auth (Section 2.4) ────────────────────────────────────
 // POST /api/business-os/kiosk/pin-auth — scoped PIN auth for clock-in/out only
@@ -2257,13 +2452,12 @@ router.post('/kiosk/pin-auth', wrap(async (req, res) => {
     });
 }));
 
-// POST /api/business-os/kiosk/clock-in — clock in using PIN auth
-router.post('/kiosk/clock-in', wrap(async (req, res) => {
+// GET /api/business-os/reservation-stats — reservation + order summary
+router.get('/reservation-stats', wrap(async (req, res) => {
     const prisma = getPrisma(req);
-    const { employeeId, locationId } = req.body;
-    if (!employeeId) return res.status(400).json({ success: false, message: 'Employee ID required' });
+    const bpId = await getBusinessProfileId(req);
+    if (!bpId) return res.json({ success: true, stats: { pendingRes: 0, confirmedRes: 0, checkedInRes: 0, todayCheckins: 0, activeOrders: 0, pendingOrders: 0 } });
 
-    // Find today's scheduled shift for this employee
     const today = new Date();
     today.setHours(0, 0, 0, 0);
     const tomorrow = new Date(today);
@@ -2290,7 +2484,19 @@ router.post('/kiosk/clock-in', wrap(async (req, res) => {
     });
 }));
 
-const shift = await prisma.shift.findFirst({
+// POST /api/business-os/kiosk/clock-in — clock in using PIN auth
+router.post('/kiosk/clock-in', wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const { employeeId, locationId } = req.body;
+    if (!employeeId) return res.status(400).json({ success: false, message: 'Employee ID required' });
+
+    // Find today's scheduled shift for this employee
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    const tomorrow = new Date(today);
+    tomorrow.setDate(tomorrow.getDate() + 1);
+
+    const shift = await prisma.shift.findFirst({
         where: {
             employeeId,
             shiftDate: { gte: today, lt: tomorrow },
