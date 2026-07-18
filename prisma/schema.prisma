@@ -48,6 +48,7 @@ enum NotificationCategory {
   SUSU
   SMART_ROUTE
   AUCTION
+  STOREFRONT
 }
 
 enum BanStatus {
@@ -907,6 +908,9 @@ model User {
   dineInTabItems      DineInTabItem[]     @relation("DineInTabStaff")
   trustScore          CustomerTrustScore?
   businessGroups      BusinessGroup[]
+
+  // AZM Staking for Nitro
+  azmStakes           AzmStake[]
 
   @@index([phoneHash])
 }
@@ -2516,6 +2520,12 @@ model BusinessProfile {
   webhooks             BusinessWebhook[]
   messagingConfig     BusinessMessagingConfig?
   messageLogs         BusinessMessageLog[]
+
+  // Storefront SDUI
+  storefrontLayouts        BusinessStorefrontLayout[]
+  storefrontLayoutVersions  BusinessStorefrontLayoutVersion[]
+  storefrontDisabled        Boolean  @default(false)
+  storefrontAnalyticsEvents  StorefrontAnalyticsEvent[]
 
   @@index([bizId])
   @@index([category])
@@ -5165,4 +5175,184 @@ model BusinessMessageLog {
   @@index([businessProfileId, createdAt(sort: Desc)])
   @@index([businessProfileId, channel])
   @@index([status])
+}
+
+// STOREFRONT SDUI SYSTEM (July 2026)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+enum StorefrontTier {
+  FREE
+  NITRO_BRONZE
+  NITRO_SILVER
+  NITRO_GOLD
+}
+
+enum StorefrontLayoutStatus {
+  DRAFT
+  PUBLISHED
+  ARCHIVED
+}
+
+enum StorefrontWidgetCategory {
+  HEADER
+  CONTENT
+  COMMERCE
+  SOCIAL
+  MEDIA
+}
+
+enum AzmStakeStatus {
+  ACTIVE
+  UNSTAKING
+  COMPLETED
+  SLASHED
+}
+
+// ── Storefront SDUI Models ─────────────────────────────────────────────────────
+
+/// Theme catalog — platform-managed (seeded), not created by business owners.
+model BusinessStorefrontTheme {
+  id              String   @id @default(uuid())
+  key             String   @unique
+  name            String
+  description     String?  @db.VarChar(500)
+  tier            StorefrontTier @default(FREE)
+  minAzmStake     Int      @default(0)
+  category        String   @default("UNIVERSAL")
+  tokenSet        Json
+  typography      Json?
+  borderRadius    String?  @default("medium")
+  spacingScale    Float?   @default(1.0)
+  previewImageUrl String?
+  isActive        Boolean  @default(true)
+  displayOrder    Int      @default(0)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  layouts   BusinessStorefrontLayout[]
+  templates BusinessStorefrontLayoutTemplate[]
+
+  @@index([tier])
+  @@index([category])
+  @@index([isActive, displayOrder])
+}
+
+/// Widget type catalog — platform-managed (seeded).
+model BusinessStorefrontWidgetCatalog {
+  id            String   @id @default(uuid())
+  widgetType    String   @unique
+  displayName   String
+  description   String?  @db.VarChar(500)
+  tier          StorefrontTier @default(FREE)
+  minAzmStake   Int      @default(0)
+  category      StorefrontWidgetCategory
+  icon          String?
+  configSchema  Json
+  defaultProps   Json     @default("{}")
+  minRowSpan    Int      @default(1)
+  maxRowSpan    Int      @default(6)
+  minColSpan    Int      @default(1)
+  maxColSpan    Int      @default(4)
+  isActive      Boolean  @default(true)
+  displayOrder  Int      @default(0)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@index([tier])
+  @@index([category])
+  @@index([isActive, displayOrder])
+}
+
+/// Current DRAFT or PUBLISHED layout per business. Unique: one DRAFT + one PUBLISHED.
+model BusinessStorefrontLayout {
+  id                String   @id @default(uuid())
+  businessProfileId String
+  status            StorefrontLayoutStatus @default(DRAFT)
+  themeId           String
+  layoutJson        Json
+  publishedAt       DateTime?
+  publishedBy       Int?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  businessProfile BusinessProfile @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+  theme           BusinessStorefrontTheme @relation(fields: [themeId], references: [id])
+
+  @@unique([businessProfileId, status])
+  @@index([businessProfileId, status])
+}
+
+/// Version history for undo/revert. Separate from current layout.
+model BusinessStorefrontLayoutVersion {
+  id                String   @id @default(uuid())
+  businessProfileId String
+  version          Int
+  themeId           String
+  layoutJson        Json
+  publishedAt       DateTime?
+  publishedBy       Int?
+  createdAt         DateTime @default(now())
+
+  businessProfile BusinessProfile @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+
+  @@index([businessProfileId, version(sort: Desc)])
+  @@index([businessProfileId])
+}
+
+/// Pre-built layout templates — one-click apply. Monetizable (premium templates).
+model BusinessStorefrontLayoutTemplate {
+  id              String   @id @default(uuid())
+  name            String
+  description     String?  @db.VarChar(500)
+  category        String
+  tier            StorefrontTier @default(FREE)
+  minAzmStake     Int      @default(0)
+  previewImageUrl String?
+  themeId         String?
+  layoutJson      Json
+  isActive        Boolean  @default(true)
+  displayOrder    Int      @default(0)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  theme BusinessStorefrontTheme? @relation(fields: [themeId], references: [id])
+
+  @@index([category, tier])
+  @@index([isActive, displayOrder])
+}
+
+/// AZM Staking — purpose-built model for Nitro tier staking.
+/// NOT Vault/VaultDeposit (those are USDC savings).
+/// NOT User.azmBalance (that's loyalty points).
+model AzmStake {
+  id                  String   @id @default(uuid())
+  userId              Int
+  amountAzm           Decimal  @db.Decimal(20, 8)
+  status              AzmStakeStatus @default(ACTIVE)
+  stakedAt            DateTime @default(now())
+  unstakeRequestedAt  DateTime?
+  unstakeAvailableAt  DateTime?
+  completedAt         DateTime?
+  cooldownDays        Int      @default(7)
+  tierAtStake         String   @default("FREE")
+  user                User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  @@index([userId, status])
+  @@index([status, unstakeAvailableAt])
+}
+
+/// Analytics events for storefront interactions.
+model StorefrontAnalyticsEvent {
+  id                String   @id @default(uuid())
+  businessProfileId String
+  eventType         String
+  metadata          Json?
+  createdAt         DateTime @default(now())
+
+  businessProfile BusinessProfile @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+
+  @@index([businessProfileId, eventType])
+  @@index([createdAt])
 }
