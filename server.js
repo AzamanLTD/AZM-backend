@@ -1087,6 +1087,10 @@ const emitBalanceUpdate = async (userId) => {
 app.set('socketio', io);
 app.set('prisma', prisma);
 app.set('vendorStatus', vendorStatus);
+
+// ── Storefront Stake Worker ──────────────────────────────────────────────────
+const storefrontStakeWorker = require('./workers/storefrontStakeWorker');
+storefrontStakeWorker.start(prisma);
 app.set('emitBalanceUpdate', emitBalanceUpdate);
 
 // Smart Escrow & Business Accounts (2026-06-14): escrowService exports plain
@@ -1260,6 +1264,9 @@ app.use('/api/marketplace',               generalLimiter, marketplaceRoutes);
 app.use('/api/business-os',   generalLimiter,   businessOSRoutes);
 app.use('/api/developer',     generalLimiter,   require('./routes/developerRoutes'));
 app.use('/api/qr',            generalLimiter,   qrRoutes);          // QR Forge — public redirect + admin config
+app.use('/api/storefront',    generalLimiter,   require('./routes/storefrontRoutes'));
+app.use('/api/azm-stake',     generalLimiter,   require('./routes/azmStakeRoutes'));
+app.use('/api/admin/storefront', generalLimiter, require('./routes/adminStorefrontRoutes'));
 
 // --- CHAT MEDIA UPLOAD (Phase UI-3, 2026-05-26) ──────────────────────────────
 //

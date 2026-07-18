@@ -59,6 +59,7 @@ const FOLDER_MAP = {
     kyc:              'kyc',
     'vendor-docs':    'vendor-docs',
     transit:          'transit',
+    storefronts:      'storefronts',
     others:           'others',
 };
 
