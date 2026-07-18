@@ -65,6 +65,41 @@ router.get('/:businessProfileId/theme', wrap(async (req, res) => {
   res.json({ success: true, data: theme });
 }));
 
+// GET /api/storefront/:businessProfileId/public-theme — simplified theme for web ordering integration
+router.get('/:businessProfileId/public-theme', wrap(async (req, res) => {
+  const prisma = req.app.get('prisma');
+  const { businessProfileId } = req.params;
+
+  const layout = await prisma.businessStorefrontLayout.findFirst({
+    where: { businessProfileId, status: 'PUBLISHED' },
+    include: { theme: true },
+  });
+
+  if (!layout) {
+    const defaultTheme = await prisma.businessStorefrontTheme.findFirst({
+      where: { key: 'classic_light', isActive: true },
+    });
+    return res.json({
+      success: true,
+      data: {
+        accent: defaultTheme?.tokenSet?.accent || '#6C4FD1',
+        themeName: defaultTheme?.name || 'Classic',
+        hasPublishedLayout: false,
+      },
+    });
+  }
+
+  res.json({
+    success: true,
+    data: {
+      accent: layout.theme?.tokenSet?.accent || '#6C4FD1',
+      themeName: layout.theme?.name || 'Classic',
+      hasPublishedLayout: true,
+      layoutJson: layout.layoutJson,
+    },
+  });
+}));
+
 // ── AUTHENTICATED endpoints ──────────────────────────────────────────────────
 
 // All routes below require auth + active business + settings.manage permission
