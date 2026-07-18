@@ -27,6 +27,7 @@ const { BusinessGroupService } = require("../services/businessOS/businessGroupSe
 const { protect } = require('../middleware/authMiddleware');
 const { protectActive } = require('../middleware/banGuardMiddleware');
 const { requirePermission } = require("../middleware/requirePermission");
+const webhookDispatcher = require('../services/webhookDispatcher');
 
 // Helper: get the shared PrismaClient from the Express app (adapter-backed)
 // The existing server.js creates ONE PrismaClient with PrismaPg adapter and
@@ -771,6 +772,44 @@ router.post('/hotel/front-desk/:reservationId/move-room', wrap(async (req, res) 
 }));
 
 // ── Hotel: Create Housekeeping Task (manual) ──────────────────────────────────
+// GET /api/business-os/hotel/housekeeping/templates — list checklist templates
+router.get('/hotel/housekeeping/templates', wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+    const templates = await prisma.hotelHousekeepingTemplate.findMany({
+        where: { businessProfileId: bpId },
+        orderBy: { taskType: 'asc' },
+    });
+
+    // Group by taskType: { CHECKOUT_CLEAN: ['item1', ...], DEEP_CLEAN: [...] }
+    const grouped = {};
+    for (const t of templates) {
+        const items = Array.isArray(t.checklistItems) ? t.checklistItems : [];
+        if (!grouped[t.taskType]) grouped[t.taskType] = [];
+        grouped[t.taskType].push(...items);
+    }
+    res.json({ success: true, templates: grouped });
+}));
+
+// POST /api/business-os/hotel/housekeeping/templates — create or update a template
+router.post('/hotel/housekeeping/templates', wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+    const { taskType, name, checklistItems } = req.body;
+    if (!taskType || !name || !Array.isArray(checklistItems)) {
+        return res.status(400).json({ success: false, message: 'taskType, name, and checklistItems[] are required' });
+    }
+
+    const template = await prisma.hotelHousekeepingTemplate.upsert({
+        where: {
+            businessProfileId_taskType_name: { businessProfileId: bpId, taskType, name },
+        },
+        update: { checklistItems },
+        create: { businessProfileId: bpId, taskType, name, checklistItems },
+    });
+    res.status(201).json({ success: true, template });
+}));
+
 router.post('/hotel/housekeeping', wrap(async (req, res) => {
     const bpId = req.businessProfileId;
     const { roomId, taskType, priority, notes, checklistItems } = req.body;
@@ -846,6 +885,70 @@ router.get('/restaurant/tables', wrap(async (req, res) => {
     const bpId = await getBusinessProfileId(req);
     const tables = await svc.restaurantOpsService.getTableFloor(bpId, req.query);
     res.json({ success: true, tables });
+}));
+
+// PATCH /api/business-os/restaurant/tables/:id/status — update table status
+// Updates the active DineInTab status on the BusinessTable, or creates one if needed.
+router.patch('/restaurant/tables/:id/status', wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+    const { status } = req.body;
+    const validStatuses = ['OPEN', 'SEATED', 'ORDERED', 'EATING', 'BILLING', 'CLEANING'];
+    if (!validStatuses.includes(status)) {
+        return res.status(400).json({ success: false, message: 'Invalid status. Must be one of: ' + validStatuses.join(', ') });
+    }
+
+    // Verify table belongs to this business
+    const table = await prisma.businessTable.findUnique({
+        where: { id: req.params.id },
+        include: { location: { select: { businessProfileId: true } } },
+    });
+    if (!table || table.location.businessProfileId !== bpId) {
+        return res.status(404).json({ success: false, message: 'Table not found' });
+    }
+
+    // Find active (non-CLOSED) tab on this table
+    const activeTab = await prisma.dineInTab.findFirst({
+        where: { tableId: table.id, status: { not: 'CLOSED' } },
+        orderBy: { openedAt: 'desc' },
+    });
+
+    if (status === 'OPEN') {
+        // If going back to OPEN, close any active tab
+        if (activeTab) {
+            await prisma.dineInTab.update({
+                where: { id: activeTab.id },
+                data: { status: 'CLOSED', closedAt: new Date() },
+            });
+        }
+    } else if (activeTab) {
+        // Update existing tab status
+        await prisma.dineInTab.update({
+            where: { id: activeTab.id },
+            data: { status },
+        });
+    } else {
+        // No active tab — create one with this status
+        // Find a guest customer or create a walk-in placeholder
+        const guestUser = await prisma.user.findFirst({
+            where: { email: 'guest-walkin@azaman.azm' },
+            select: { id: true },
+        });
+        if (!guestUser) {
+            return res.status(400).json({ success: false, message: 'No active tab found and no guest user available. Open a tab first.' });
+        }
+        await prisma.dineInTab.create({
+            data: {
+                businessProfileId: bpId,
+                locationId: table.locationId,
+                tableId: table.id,
+                customerId: guestUser.id,
+                status,
+            },
+        });
+    }
+
+    res.json({ success: true, tableId: table.id, status });
 }));
 
 // Menu Engineering (86'd items)
@@ -2278,6 +2381,147 @@ router.post('/kiosk/clock-out', wrap(async (req, res) => {
 
 // ── Phase 2: Cash Payment + Idempotency (Section 2.4) ────────────────────────
 // POST /api/business-os/pos/cash-sale — ring up a cash order (bypasses escrow)
+// POST /api/business-os/pos/order — unified POS order (CASH, AZM balance, SPLIT)
+// Replaces the old pos/cash-sale with support for all payment methods.
+// Server-side total re-derivation — never trusts client totals.
+router.post('/pos/order', protect, protectActive, wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+    const {
+        items, paymentMethod = 'CASH', totalAmount,
+        cashGiven, azmAmount, idempotencyKey, source,
+        locationId, tableId, customerId,
+    } = req.body;
+
+    if (!items || !Array.isArray(items) || items.length === 0) {
+        return res.status(400).json({ success: false, message: 'Items are required.' });
+    }
+
+    // Idempotency check
+    if (idempotencyKey) {
+        const existing = await prisma.businessOrder.findFirst({ where: { idempotencyKey } });
+        if (existing) return res.json({ success: true, order: existing, message: 'Duplicate (idempotent)' });
+    }
+
+    // Re-derive totals from product prices (never trust client)
+    let computedSubtotal = 0;
+    for (const item of items) {
+        const product = await prisma.businessProduct.findFirst({
+            where: { id: item.productId, businessProfileId: bpId },
+            select: { priceUsdc: true, name: true, isActive: true, isAvailable: true },
+        });
+        if (!product) return res.status(400).json({ success: false, message: 'Invalid product: ' + item.productId });
+        if (product.isActive === false || product.isAvailable === false) {
+            return res.status(400).json({ success: false, message: 'Product unavailable: ' + product.name });
+        }
+        computedSubtotal += parseFloat(product.priceUsdc) * (item.qty || item.quantity || 1);
+    }
+
+    const computedTax = computedSubtotal * 0.025; // 2.5% tax
+    const computedGrand = computedSubtotal + computedTax;
+
+    // Validate payment
+    const pm = (paymentMethod || 'CASH').toUpperCase();
+    let cashReceived = null;
+    let cashChange = null;
+    let azmPortion = 0;
+
+    if (pm === 'CASH') {
+        cashReceived = parseFloat(cashGiven || 0);
+        if (cashReceived < computedGrand) {
+            return res.status(400).json({ success: false, message: 'Insufficient cash received.' });
+        }
+        cashChange = cashReceived - computedGrand;
+    } else if (pm === 'AZM') {
+        // Deduct from customer AZM balance
+        azmPortion = computedGrand;
+    } else if (pm === 'SPLIT') {
+        azmPortion = parseFloat(azmAmount || 0);
+        cashReceived = parseFloat(cashGiven || 0);
+        if (cashReceived + azmPortion < computedGrand) {
+            return res.status(400).json({ success: false, message: 'Insufficient payment (cash + AZM).' });
+        }
+        cashChange = Math.max(0, cashReceived - (computedGrand - azmPortion));
+    } else {
+        return res.status(400).json({ success: false, message: 'Invalid payment method: ' + pm });
+    }
+
+    // Generate order reference first (needed for AZM spend log)
+    const orderRef = 'POS-' + Date.now().toString(36).toUpperCase() + Math.random().toString(36).substring(2, 6).toUpperCase();
+
+    // For AZM/SPLIT: verify and deduct from customer azmBalance
+    if (azmPortion > 0) {
+        const user = await prisma.user.findUnique({
+            where: { id: req.user.id },
+            select: { azmBalance: true },
+        });
+        if (!user || parseFloat(user.azmBalance) < azmPortion) {
+            return res.status(400).json({ success: false, message: 'Insufficient AZM balance.' });
+        }
+        const newBalance = parseFloat(user.azmBalance) - azmPortion;
+        await prisma.user.update({
+            where: { id: req.user.id },
+            data: { azmBalance: newBalance },
+        });
+
+        // Record AZM spend log
+        await prisma.azmSpendLog.create({
+            data: {
+                userId: req.user.id,
+                amount: azmPortion,
+                reason: 'POS order (' + (source || 'POS') + ')',
+                source: 'POS_SALE',
+                balanceAfter: newBalance,
+                metadata: { orderRef },
+            },
+        });
+    }
+
+    const order = await prisma.businessOrder.create({
+        data: {
+            businessProfileId: bpId,
+            customerId: customerId || req.user.id,
+            status: 'COMPLETED',
+            orderRef,
+            title: 'POS Sale (' + pm + ')',
+            amountUsdc: computedGrand,
+            paymentMethod: pm,
+            idempotencyKey,
+            cashReceived: cashReceived || null,
+            cashChange: cashChange || null,
+            completedAt: new Date(),
+        },
+    });
+
+    // Write ledger entry
+    try {
+        await prisma.businessLedgerEntry.create({
+            data: {
+                businessProfileId: bpId,
+                type: 'INCOME',
+                category: 'SALES',
+                description: 'POS Sale (' + orderRef + ' - ' + pm + ')',
+                amount: computedGrand,
+                amountGhs: computedGrand,
+                sourceType: 'POS_SALE',
+                sourceId: order.id,
+                metadata: { orderRef, paymentMethod: pm, items: items.length, locationId, tableId },
+            },
+        });
+    } catch (e) {
+        console.warn('[pos/order] Ledger entry failed:', e.message);
+    }
+
+    res.status(201).json({
+        success: true,
+        order,
+        computedSubtotal,
+        computedTax,
+        computedGrand,
+        change: cashChange || 0,
+    });
+}));
+
 router.post('/pos/cash-sale', protect, protectActive, wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
@@ -2347,6 +2591,12 @@ router.post('/pos/cash-sale', protect, protectActive, wrap(async (req, res) => {
     } catch (e) {
         console.warn('[pos/cash-sale] Failed to write ledger entry:', e.message);
     }
+
+    // Fire webhook event
+    webhookDispatcher.dispatch(bpId, 'order.created', {
+        orderId: order.id, orderRef, amount: computedGrand,
+        paymentMethod: 'CASH', items: items?.length || 0,
+    }).catch(() => {});
 
     res.status(201).json({
         success: true,
@@ -2761,7 +3011,11 @@ router.patch('/marketing/promotions/:id', requirePermission('marketing.publish')
 }));
 
 router.delete('/marketing/promotions/:id', requirePermission('marketing.publish'), wrap(async (req, res) => {
-    await svc.prisma.businessPromotion.delete({ where: { id: req.params.id } });
+    // Soft-delete: deactivate instead of hard delete to preserve audit trail
+    await svc.prisma.businessPromotion.update({
+        where: { id: req.params.id },
+        data: { isActive: false, endDate: new Date() },
+    });
     res.json({ ok: true });
 }));
 
@@ -2795,6 +3049,47 @@ router.post('/marketing/reviews/:id/flag', requirePermission('marketing.publish'
 }));
 
 // ── Followers broadcast ────────────────────────────────────────────────────────
+// GET /api/business-os/marketing/broadcast/history — list past broadcasts
+router.get('/marketing/broadcast/history', wrap(async (req, res) => {
+    const bpId = req.businessProfileId;
+    const page = parseInt(req.query.page) || 1;
+    const limit = parseInt(req.query.limit) || 20;
+    const skip = (page - 1) * limit;
+
+    const [broadcasts, total] = await Promise.all([
+        svc.prisma.businessNotification.findMany({
+            where: { businessProfileId: bpId, type: 'BROADCAST' },
+            orderBy: { createdAt: 'desc' },
+            skip,
+            take: limit,
+            select: {
+                id: true,
+                title: true,
+                body: true,
+                metadata: true,
+                createdAt: true,
+            },
+        }),
+        svc.prisma.businessNotification.count({
+            where: { businessProfileId: bpId, type: 'BROADCAST' },
+        }),
+    ]);
+
+    res.json({
+        success: true,
+        broadcasts: broadcasts.map(b => ({
+            id: b.id,
+            title: b.title,
+            message: b.body,
+            recipientCount: b.metadata?.recipientCount || 0,
+            sentAt: b.createdAt,
+        })),
+        total,
+        page,
+        totalPages: Math.ceil(total / limit),
+    });
+}));
+
 router.post('/marketing/broadcast', requirePermission('marketing.publish'), wrap(async (req, res) => {
     const bpId = req.businessProfileId;
     const { message, title } = req.body;
@@ -3020,6 +3315,12 @@ router.post('/sync-outbox', protect, protectActive, wrap(async (req, res) => {
                         }
                     });
                 }
+                // Fire webhook event for synced order
+                webhookDispatcher.dispatch(bpId, 'order.created', {
+                    orderId: order.id, orderRef: order.orderRef,
+                    amount: parseFloat(payload.totalAmount || 0),
+                    paymentMethod: payload.paymentMethod,
+                }).catch(() => {});
                 results.push({ id: idempotencyKey, status: 'SYNCED' });
             } else if (type === 'clock_in' || type === 'clock_out') {
                 // Ignore for now or implement similarly
@@ -3061,6 +3362,192 @@ router.post('/kiosk/clock-in', wrap(async (req, res) => {
 // BUSINESS GROUPS — multi-brand / multi-location ownership stats
 // ═══════════════════════════════════════════════════════════════════════════
 
+// GET /api/business-os/messaging-config — get current messaging channel connections
+router.get("/messaging-config", wrap(async (req, res) => {
+    const prisma = req.app.get("prisma");
+    const bpId = req.businessProfileId || (await prisma.businessProfile.findUnique({
+        where: { userId: req.user.id }, select: { id: true },
+    }))?.id;
+    if (!bpId) return res.json({ waConnected: false, smsConnected: false });
+
+    const config = await prisma.businessMessagingConfig.findUnique({
+        where: { businessProfileId: bpId },
+    });
+
+    res.json({
+        waConnected: config?.waConnected || false,
+        waPhoneNumber: config?.waPhoneNumber || '',
+        smsConnected: config?.smsConnected || false,
+        smsSenderId: config?.smsSenderId || '',
+        smsProvider: config?.smsProvider || '',
+        lastTestNumber: config?.lastTestNumber || '',
+        lastTestAt: config?.lastTestAt || null,
+    });
+}));
+
+// POST /api/business-os/messaging-config/whatsapp — connect/disconnect WhatsApp
+router.post("/messaging-config/whatsapp", requirePermission("settings.manage"), wrap(async (req, res) => {
+    const prisma = req.app.get("prisma");
+    const bpId = req.businessProfileId || (await prisma.businessProfile.findUnique({
+        where: { userId: req.user.id }, select: { id: true },
+    }))?.id;
+    if (!bpId) return res.status(400).json({ success: false, message: "No business profile" });
+
+    const { action, phoneNumber, apiKey } = req.body; // action: 'connect' | 'disconnect'
+
+    if (action === 'disconnect') {
+        await prisma.businessMessagingConfig.upsert({
+            where: { businessProfileId: bpId },
+            update: { waConnected: false, waApiKeyEncrypted: null },
+            create: { businessProfileId: bpId, waConnected: false },
+        });
+        return res.json({ success: true, waConnected: false });
+    }
+
+    // Connect
+    if (!phoneNumber || !apiKey) return res.status(400).json({ success: false, message: "Phone number and API key required" });
+
+    // Simple encryption: base64 (replace with real encryption in production)
+    const crypto = require('crypto');
+    const encrypted = crypto.createHash('sha256').update(apiKey).digest('hex') + ':' + Buffer.from(apiKey).toString('base64');
+
+    await prisma.businessMessagingConfig.upsert({
+        where: { businessProfileId: bpId },
+        update: { waConnected: true, waPhoneNumber: phoneNumber, waApiKeyEncrypted: encrypted },
+        create: { businessProfileId: bpId, waConnected: true, waPhoneNumber: phoneNumber, waApiKeyEncrypted: encrypted },
+    });
+
+    res.json({ success: true, waConnected: true, waPhoneNumber: phoneNumber });
+}));
+
+// POST /api/business-os/messaging-config/sms — connect/disconnect SMS
+router.post("/messaging-config/sms", requirePermission("settings.manage"), wrap(async (req, res) => {
+    const prisma = req.app.get("prisma");
+    const bpId = req.businessProfileId || (await prisma.businessProfile.findUnique({
+        where: { userId: req.user.id }, select: { id: true },
+    }))?.id;
+    if (!bpId) return res.status(400).json({ success: false, message: "No business profile" });
+
+    const { action, apiKey, senderId, provider } = req.body;
+
+    if (action === 'disconnect') {
+        await prisma.businessMessagingConfig.upsert({
+            where: { businessProfileId: bpId },
+            update: { smsConnected: false, smsApiKeyEncrypted: null },
+            create: { businessProfileId: bpId, smsConnected: false },
+        });
+        return res.json({ success: true, smsConnected: false });
+    }
+
+    if (!apiKey || !senderId) return res.status(400).json({ success: false, message: "API key and sender ID required" });
+
+    const crypto = require('crypto');
+    const encrypted = crypto.createHash('sha256').update(apiKey).digest('hex') + ':' + Buffer.from(apiKey).toString('base64');
+
+    await prisma.businessMessagingConfig.upsert({
+        where: { businessProfileId: bpId },
+        update: { smsConnected: true, smsApiKeyEncrypted: encrypted, smsSenderId: senderId, smsProvider: provider || 'africas_talking' },
+        create: { businessProfileId: bpId, smsConnected: true, smsApiKeyEncrypted: encrypted, smsSenderId: senderId, smsProvider: provider || 'africas_talking' },
+    });
+
+    res.json({ success: true, smsConnected: true, smsSenderId: senderId });
+}));
+
+// POST /api/business-os/messaging-config/test — send a test message
+router.post("/messaging-config/test", requirePermission("settings.manage"), wrap(async (req, res) => {
+    const prisma = req.app.get("prisma");
+    const bpId = req.businessProfileId || (await prisma.businessProfile.findUnique({
+        where: { userId: req.user.id }, select: { id: true },
+    }))?.id;
+    if (!bpId) return res.status(400).json({ success: false, message: "No business profile" });
+
+    const { phoneNumber, channel } = req.body; // channel: 'whatsapp' | 'sms'
+    if (!phoneNumber) return res.status(400).json({ success: false, message: "Phone number required" });
+
+    const config = await prisma.businessMessagingConfig.findUnique({ where: { businessProfileId: bpId } });
+    if (!config) return res.status(400).json({ success: false, message: "No messaging config found" });
+
+    const bizProfile = await prisma.businessProfile.findUnique({ where: { id: bpId }, select: { businessName: true } });
+    const testMessage = `Hello from ${bizProfile?.businessName || 'Azaman Business'} — this is a test message. Your messaging channel is working!`;
+
+    let status = 'SENT', errorMsg = null;
+
+    try {
+        if (channel === 'whatsapp' && config.waConnected) {
+            // TODO: Replace with actual WhatsApp Cloud API call
+            console.log(`[MessagingTest] WhatsApp to ${phoneNumber}: "${testMessage}"`);
+        } else if (channel === 'sms' && config.smsConnected) {
+            // TODO: Replace with actual SMS gateway call (Africa's Talking, Twilio, etc.)
+            console.log(`[MessagingTest] SMS to ${phoneNumber}: "${testMessage}"`);
+        } else {
+            return res.status(400).json({ success: false, message: `Channel ${channel} is not connected` });
+        }
+    } catch (err) {
+        status = 'FAILED';
+        errorMsg = err.message;
+    }
+
+    // Log the message
+    await prisma.businessMessageLog.create({
+        data: {
+            businessProfileId: bpId,
+            channel,
+            recipient: phoneNumber,
+            message: testMessage,
+            status,
+            error: errorMsg,
+            eventType: 'test',
+            costGhs: channel === 'whatsapp' ? 0.035 : 0.05,
+        },
+    });
+
+    // Update last test info
+    await prisma.businessMessagingConfig.update({
+        where: { businessProfileId: bpId },
+        data: { lastTestNumber: phoneNumber, lastTestAt: new Date() },
+    });
+
+    if (status === 'FAILED') return res.status(500).json({ success: false, message: errorMsg });
+    res.json({ success: true, message: `Test message sent to ${phoneNumber}` });
+}));
+
+// PATCH /api/business-os/messaging-config/preferences — update notification routing
+router.patch("/messaging-config/preferences", requirePermission("settings.manage"), wrap(async (req, res) => {
+    const prisma = req.app.get("prisma");
+    const bpId = req.businessProfileId || (await prisma.businessProfile.findUnique({
+        where: { userId: req.user.id }, select: { id: true },
+    }))?.id;
+    if (!bpId) return res.status(400).json({ success: false, message: "No business profile" });
+
+    const { preferences } = req.body; // { order_ready: { whatsapp: true, sms: false }, ... }
+    if (!preferences) return res.status(400).json({ success: false, message: "Preferences required" });
+
+    // Merge into existing notification preferences
+    const existing = await prisma.businessNotificationPreference.findUnique({ where: { businessProfileId: bpId } });
+    const currentPrefs = existing?.preferences || {};
+    const merged = { ...currentPrefs, ...preferences };
+
+    await prisma.businessNotificationPreference.upsert({
+        where: { businessProfileId: bpId },
+        update: { preferences: merged },
+        create: { businessProfileId: bpId, preferences: merged },
+    });
+
+    res.json({ success: true, preferences: merged });
+}));
+
+// GET /api/business-os/messaging-config/preferences — get notification routing
+router.get("/messaging-config/preferences", wrap(async (req, res) => {
+    const prisma = req.app.get("prisma");
+    const bpId = req.businessProfileId || (await prisma.businessProfile.findUnique({
+        where: { userId: req.user.id }, select: { id: true },
+    }))?.id;
+    if (!bpId) return res.json({ preferences: {} });
+
+    const pref = await prisma.businessNotificationPreference.findUnique({ where: { businessProfileId: bpId } });
+    res.json({ preferences: pref?.preferences || {} });
+}));
+
 // GET /api/business-os/messaging-stats — this month's messaging cost breakdown
 router.get("/messaging-stats", wrap(async (req, res) => {
     const prisma = req.app.get("prisma");
@@ -3072,22 +3559,24 @@ router.get("/messaging-stats", wrap(async (req, res) => {
     const monthStart = new Date(new Date().getFullYear(), new Date().getMonth(), 1);
     const monthStartISO = monthStart.toISOString();
 
-    // Count total notifications this month (proxies for messages sent)
-    const totalCount = await prisma.businessNotification.count({
+    // Use real message logs for accurate stats
+    const logs = await prisma.businessMessageLog.findMany({
         where: { businessProfileId, createdAt: { gte: monthStartISO } },
+        select: { channel: true, costGhs: true, status: true },
     });
 
-    // Rough estimate: assume 70% WhatsApp, 30% SMS split
-    // Per-message cost: WhatsApp GHS 0.035, SMS GHS 0.05
-    const whatsappCount = Math.ceil(totalCount * 0.7);
-    const smsCount = totalCount - whatsappCount;
-    const whatsappCost = +(whatsappCount * 0.035).toFixed(2);
-    const smsCost = +(smsCount * 0.05).toFixed(2);
+    const whatsappLogs = logs.filter(l => l.channel === 'whatsapp');
+    const smsLogs = logs.filter(l => l.channel === 'sms');
+    const whatsappCost = whatsappLogs.reduce((sum, l) => sum + (parseFloat(l.costGhs) || 0), 0);
+    const smsCost = smsLogs.reduce((sum, l) => sum + (parseFloat(l.costGhs) || 0), 0);
 
     res.json({
-        whatsapp: whatsappCost,
-        sms: smsCost,
-        messages: totalCount,
+        whatsapp: +whatsappCost.toFixed(2),
+        sms: +smsCost.toFixed(2),
+        messages: logs.length,
+        whatsappCount: whatsappLogs.length,
+        smsCount: smsLogs.length,
+        failed: logs.filter(l => l.status === 'FAILED').length,
     });
 }));
 
@@ -3098,5 +3587,154 @@ router.get("/group-stats", wrap(async (req, res) => {
     const stats = await svc.groupService.getGroupStats(req.user.id, groupId);
     res.json({ success: true, ...stats });
 }));
+
+// GET /api/business-os/export — export business data as zip (orders, invoices, reviews, employees)
+router.get('/export', requirePermission('settings.manage'), wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = req.businessProfileId;
+    const archiver = require('archiver');
+
+    // Fetch data
+    const [orders, invoices, reviews, employees, products] = await Promise.all([
+        prisma.businessOrder.findMany({
+            where: { businessProfileId: bpId },
+            orderBy: { createdAt: 'desc' },
+        }),
+        prisma.businessInvoice.findMany({
+            where: { businessProfileId: bpId },
+            orderBy: { createdAt: 'desc' },
+        }),
+        prisma.businessReview.findMany({
+            where: { businessProfileId: bpId },
+            orderBy: { createdAt: 'desc' },
+        }),
+        prisma.businessEmployee.findMany({
+            where: { businessProfileId: bpId },
+            orderBy: { createdAt: 'desc' },
+        }),
+        prisma.businessProduct.findMany({
+            where: { businessProfileId: bpId },
+            orderBy: { createdAt: 'desc' },
+        }),
+    ]);
+
+    // Helper: convert array to CSV
+    function toCSV(rows) {
+        if (!rows.length) return '';
+        const keys = Object.keys(rows[0]);
+        const header = keys.join(',');
+        const lines = rows.map(row =>
+            keys.map(k => {
+                const val = row[k];
+                if (val === null || val === undefined) return '';
+                const s = typeof val === 'object' ? JSON.stringify(val) : String(val);
+                return s.includes(',') || s.includes('"') || s.includes('\n') ? `"${s.replace(/"/g, '""')}"` : s;
+            }).join(',')
+        );
+        return [header, ...lines].join('\n');
+    }
+
+    const zip = archiver('zip', { zlib: { level: 5 } });
+
+    const bizName = (req.businessProfile?.name || 'business').replace(/[^a-zA-Z0-9]/g, '_');
+    const dateStr = new Date().toISOString().split('T')[0];
+    const filename = `${bizName}_export_${dateStr}.zip`;
+
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    zip.pipe(res);
+
+    zip.append(toCSV(orders), { name: 'orders.csv' });
+    zip.append(toCSV(invoices), { name: 'invoices.csv' });
+    zip.append(toCSV(reviews), { name: 'reviews.csv' });
+    zip.append(toCSV(employees), { name: 'employees.csv' });
+    zip.append(toCSV(products), { name: 'products.csv' });
+
+    // Also include a JSON manifest
+    zip.append(JSON.stringify({
+        businessId: bpId,
+        businessName: req.businessProfile?.name,
+        exportDate: new Date().toISOString(),
+        counts: {
+            orders: orders.length,
+            invoices: invoices.length,
+            reviews: reviews.length,
+            employees: employees.length,
+            products: products.length,
+        },
+    }, null, 2), { name: 'manifest.json' });
+
+    await zip.finalize();
+}));
+
+// ── Missing routes found by route-checker ──────────────────────────────────
+
+// GET /api/business-os/finance/payout — process a payout to a destination
+router.post('/finance/payout', requirePermission('settings.manage'), wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = getBizProfileId(req);
+    const { amount, destination } = req.body;
+
+    if (!amount || amount <= 0) return res.status(400).json({ success: false, message: 'Amount must be positive' });
+    if (!destination) return res.status(400).json({ success: false, message: 'Destination required' });
+
+    // Look up the payout destination
+    const dest = await prisma.payoutDestination.findFirst({
+        where: { id: destination, userId: req.user.id },
+    });
+    if (!dest) return res.status(404).json({ success: false, message: 'Payout destination not found' });
+
+    // For now, just log the payout request — actual transfer requires payment API integration
+    const log = await prisma.auditLog.create({
+        data: {
+            businessProfileId: bpId,
+            action: 'PAYOUT_REQUESTED',
+            entity: 'Finance',
+            details: `Payout of ${amount} USDC to ${dest.nickname} (${dest.destinationType})`,
+            performedBy: req.user.id,
+        },
+    });
+
+    res.json({ success: true, message: 'Payout request submitted', payoutId: log.id });
+}));
+
+// PATCH /api/business-os/transit/vehicles/:id/status — update vehicle status
+router.patch('/transit/vehicles/:id/status', requirePermission('transit.manage'), wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = getBizProfileId(req);
+    const { id } = req.params;
+    const { status } = req.body;
+
+    if (!status) return res.status(400).json({ success: false, message: 'Status required' });
+
+    const vehicle = await prisma.transitVehicle.findFirst({
+        where: { id, businessProfileId: bpId },
+    });
+    if (!vehicle) return res.status(404).json({ success: false, message: 'Vehicle not found' });
+
+    // isActive maps to status ACTIVE/INACTIVE
+    const isActive = status === 'ACTIVE' || status === 'active';
+    const updated = await prisma.transitVehicle.update({
+        where: { id },
+        data: { isActive },
+    });
+
+    res.json({ success: true, vehicle: updated });
+}));
+
+// GET /api/business-os/transit/trips — list business transit trips
+router.get('/transit/trips', wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = getBizProfileId(req);
+
+    const trips = await prisma.transitTrip.findMany({
+        where: { businessProfileId: bpId },
+        orderBy: { departureAt: 'desc' },
+        take: 100,
+    });
+
+    res.json(trips);
+}));
+
 
 module.exports = router;

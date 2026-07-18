@@ -109,6 +109,128 @@ router.post('/vehicles',                       protect, protectActive, ctrl.crea
 router.patch('/vehicles/:vehicleId',           protect, protectActive, ctrl.updateVehicle);
 router.delete('/vehicles/:vehicleId',          protect, protectActive, ctrl.deleteVehicle);
 
+// ── MISSING ROUTES (found by route-checker) ─────────────────────────────────
+// These endpoints are called by the frontend but had no backend route.
+
+// GET /api/business/reservations/stats
+router.get('/reservations/stats', protect, async (req, res) => {
+    try {
+        const prisma = req.app.get('prisma');
+        const bpId = req.user.businessProfileId;
+        if (!bpId) return res.status(400).json({ success: false, message: 'No business profile' });
+
+        const [total, pending, confirmed, cancelled, checkedIn, completed, noShow] = await Promise.all([
+            prisma.reservation.count({ where: { businessProfileId: bpId } }),
+            prisma.reservation.count({ where: { businessProfileId: bpId, status: 'PENDING' } }),
+            prisma.reservation.count({ where: { businessProfileId: bpId, status: 'CONFIRMED' } }),
+            prisma.reservation.count({ where: { businessProfileId: bpId, status: 'CANCELLED' } }),
+            prisma.reservation.count({ where: { businessProfileId: bpId, status: 'CHECKED_IN' } }),
+            prisma.reservation.count({ where: { businessProfileId: bpId, status: 'COMPLETED' } }),
+            prisma.reservation.count({ where: { businessProfileId: bpId, status: 'NO_SHOW' } }),
+        ]);
+
+        res.json({ total, pending, confirmed, cancelled, checkedIn, completed, noShow });
+    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+// GET /api/business/checkin/stats
+router.get('/checkin/stats', protect, async (req, res) => {
+    try {
+        const prisma = req.app.get('prisma');
+        const bpId = req.user.businessProfileId;
+        if (!bpId) return res.status(400).json({ success: false, message: 'No business profile' });
+
+        const today = new Date();
+        today.setHours(0, 0, 0, 0);
+
+        const [todayCount, weekCount, monthCount] = await Promise.all([
+            prisma.reservation.count({ where: { businessProfileId: bpId, status: 'CHECKED_IN', createdAt: { gte: today } } }),
+            prisma.reservation.count({ where: { businessProfileId: bpId, status: 'CHECKED_IN', createdAt: { gte: new Date(Date.now() - 7 * 864e5) } } }),
+            prisma.reservation.count({ where: { businessProfileId: bpId, status: 'CHECKED_IN', createdAt: { gte: new Date(Date.now() - 30 * 864e5) } } }),
+        ]);
+
+        res.json({ today: todayCount, week: weekCount, month: monthCount });
+    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+// GET /api/business/checkin/recent
+router.get('/checkin/recent', protect, async (req, res) => {
+    try {
+        const prisma = req.app.get('prisma');
+        const bpId = req.user.businessProfileId;
+        if (!bpId) return res.status(400).json({ success: false, message: 'No business profile' });
+
+        const limit = parseInt(req.query.limit) || 20;
+        const skip = parseInt(req.query.skip) || 0;
+
+        const recent = await prisma.reservation.findMany({
+            where: { businessProfileId: bpId, status: 'CHECKED_IN' },
+            orderBy: { updatedAt: 'desc' },
+            take: limit,
+            skip,
+            select: { id: true, reservationRef: true, customerId: true, startDatetime: true, partySize: true, amountUsdc: true, updatedAt: true },
+        });
+
+        res.json(recent);
+    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+// GET /api/business/reviews/stats
+router.get('/reviews/stats', protect, async (req, res) => {
+    try {
+        const prisma = req.app.get('prisma');
+        const bpId = req.user.businessProfileId;
+        if (!bpId) return res.status(400).json({ success: false, message: 'No business profile' });
+
+        const reviews = await prisma.businessReview.findMany({
+            where: { businessProfileId: bpId },
+            select: { rating: true },
+        });
+
+        const total = reviews.length;
+        const avg = total > 0 ? (reviews.reduce((s, r) => s + (r.rating || 0), 0) / total) : 0;
+        const distribution = { 5: 0, 4: 0, 3: 0, 2: 0, 1: 0 };
+        reviews.forEach(r => { if (r.rating >= 1 && r.rating <= 5) distribution[r.rating]++; });
+
+        res.json({ total, average: +avg.toFixed(2), distribution });
+    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+// GET /api/business/marketplace/stats
+router.get('/marketplace/stats', protect, async (req, res) => {
+    try {
+        const prisma = req.app.get('prisma');
+        const bpId = req.user.businessProfileId;
+        if (!bpId) return res.status(400).json({ success: false, message: 'No business profile' });
+
+        const [orders, products, reviews, revenue] = await Promise.all([
+            prisma.businessOrder.count({ where: { businessProfileId: bpId } }),
+            prisma.businessProduct.count({ where: { businessProfileId: bpId } }),
+            prisma.businessReview.count({ where: { businessProfileId: bpId } }),
+            prisma.businessOrder.aggregate({ where: { businessProfileId: bpId, status: 'COMPLETED' }, _sum: { amountUsdc: true } }),
+        ]);
+
+        res.json({ orders, products, reviews, revenue: +((revenue._sum.amountUsdc || 0).toString()) });
+    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+// GET /api/business/transit/trips
+router.get('/transit/trips', protect, async (req, res) => {
+    try {
+        const prisma = req.app.get('prisma');
+        const bpId = req.user.businessProfileId;
+        if (!bpId) return res.status(400).json({ success: false, message: 'No business profile' });
+
+        const trips = await prisma.transitTrip.findMany({
+            where: { businessProfileId: bpId },
+            orderBy: { departureAt: 'desc' },
+            take: 100,
+        });
+        res.json(trips);
+    } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+
 // Public business profile lookup — MUST be last
 router.get('/:bizId', ctrl.getBusinessByBizId);
 

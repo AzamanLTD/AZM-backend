@@ -43,3 +43,58 @@ router.post('/transit/boarding', protect, ctrl.transitBoarding);
 
 // ── Customer Trust Score (NEW) ───────────────────────────────────────────────
 router.get('/trust-score/:azamanId', protect, ctrl.getCustomerTrustScore);
+
+// ── MISSING ROUTES (found by route-checker) ─────────────────────────────────
+// These checkin endpoints are called by the frontend but had no backend route.
+
+// POST /api/marketplace/checkin/verify — verify a QR token for check-in
+router.post('/checkin/verify', protect, async (req, res) => {
+    try {
+        const prisma = req.app.get('prisma');
+        const qrSvc = require('../services/qrCheckInService');
+        const { token } = req.body;
+        if (!token) return res.status(400).json({ success: false, message: 'Token required' });
+
+        const result = await qrSvc.verifyAndCheckIn(prisma, {
+            token, businessUserId: req.user.id,
+        });
+        res.json(result);
+    } catch (e) { res.status(400).json({ success: false, message: e.message }); }
+});
+
+// GET /api/marketplace/checkin/search — search customer by AZM ID for check-in
+router.get('/checkin/search', protect, async (req, res) => {
+    try {
+        const prisma = req.app.get('prisma');
+        const qrSvc = require('../services/qrCheckInService');
+        const { azamanId } = req.query;
+        if (!azamanId) return res.status(400).json({ success: false, message: 'azamanId required' });
+
+        const result = await qrSvc.searchByAzamanId(prisma, {
+            azamanId, businessUserId: req.user.id,
+        });
+        res.json(result);
+    } catch (e) { res.status(400).json({ success: false, message: e.message }); }
+});
+
+// POST /api/marketplace/checkin/direct — direct check-in by reservation ID
+router.post('/checkin/direct', protect, async (req, res) => {
+    try {
+        const prisma = req.app.get('prisma');
+        const { reservationId } = req.body;
+        if (!reservationId) return res.status(400).json({ success: false, message: 'reservationId required' });
+
+        const reservation = await prisma.reservation.findFirst({
+            where: { id: reservationId },
+        });
+        if (!reservation) return res.status(404).json({ success: false, message: 'Reservation not found' });
+
+        const updated = await prisma.reservation.update({
+            where: { id: reservationId },
+            data: { status: 'CHECKED_IN' },
+        });
+
+        res.json({ success: true, reservation: updated });
+    } catch (e) { res.status(400).json({ success: false, message: e.message }); }
+});
+

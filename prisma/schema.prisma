@@ -1120,9 +1120,10 @@ model PayoutDestination {
   id                 String   @id @default(uuid())
   userId             Int
   nickname           String
-  destinationType    String // "BINANCE_PAY", "TRC20", "ERC20", "MOMO", etc.
+  destinationType    String // "BINANCE_PAY", "TRC20", "ERC20", "MOMO", "BANK", etc.
   destinationAddress String
   isExternalCrypto   Boolean  @default(false)
+  isDefault          Boolean  @default(false)
   createdAt          DateTime @default(now())
   updatedAt          DateTime @updatedAt
 
@@ -2499,6 +2500,7 @@ model BusinessProfile {
   employeeFeedbacks  EmployeeFeedback[]
   hotelRooms         HotelRoom[]
   housekeepingTasks  HotelHousekeepingTask[]
+  housekeepingTemplates HotelHousekeepingTemplate[]
   hotelRateOverrides HotelRateOverride[]
   promotions         BusinessPromotion[]
   recurringExpenses  RecurringExpenseTemplate[]
@@ -2512,6 +2514,8 @@ model BusinessProfile {
   notificationPreferences BusinessNotificationPreference?
   apiKeys              BusinessApiKey[]
   webhooks             BusinessWebhook[]
+  messagingConfig     BusinessMessagingConfig?
+  messageLogs         BusinessMessageLog[]
 
   @@index([bizId])
   @@index([category])
@@ -4697,6 +4701,24 @@ model HotelHousekeepingTask {
 }
 
 
+// ── Hotel Housekeeping Templates (Phase 4) ─────────────────────────────────────
+// Reusable checklist templates per task type (e.g. "Checkout Clean", "Deep Clean").
+model HotelHousekeepingTemplate {
+  id                String   @id @default(uuid())
+  businessProfileId String
+  taskType          String   @db.VarChar(50) // "CHECKOUT_CLEAN", "DEEP_CLEAN", "INSPECTION"
+  name              String   @db.VarChar(100)
+  checklistItems    Json     // ["Strip beds", "Replace towels", "Vacuum", ...]
+
+  businessProfile BusinessProfile @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([businessProfileId, taskType, name])
+  @@index([businessProfileId])
+}
+
 // ── Hotel Rate Overrides ──────────────────────────────────────────────────────
 // Date-specific price overrides per room type (e.g. Christmas week, events).
 // The booking engine checks this table first before falling back to basePriceUsdc.
@@ -5073,6 +5095,74 @@ model BusinessWebhook {
   updatedAt         DateTime @updatedAt
 
   businessProfile   BusinessProfile @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+  deliveries        WebhookDelivery[]
 
   @@index([businessProfileId])
+}
+
+// WebhookDelivery — tracks each delivery attempt for reliability & retries
+model WebhookDelivery {
+  id                String   @id @default(uuid())
+  webhookId         String
+  event             String   @db.VarChar(100)
+  payload           Json
+  status            String   @default("PENDING") // PENDING | DELIVERED | FAILED | RETRYING
+  statusCode        Int?
+  responseBody      String?  @db.VarChar(2000)
+  attemptCount      Int      @default(0)
+  maxAttempts       Int      @default(5)
+  nextRetryAt       DateTime?
+  deliveredAt       DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  webhook BusinessWebhook @relation(fields: [webhookId], references: [id], onDelete: Cascade)
+
+  @@index([status, nextRetryAt])
+  @@index([status])
+}
+
+// BusinessMessagingConfig — stores WhatsApp/SMS connection credentials
+model BusinessMessagingConfig {
+  id                 String   @id @default(uuid())
+  businessProfileId  String   @unique
+  // WhatsApp
+  waPhoneNumber      String?  @db.VarChar(20)
+  waApiKeyEncrypted  String?
+  waConnected        Boolean  @default(false)
+  // SMS
+  smsApiKeyEncrypted String?
+  smsSenderId        String?  @db.VarChar(20)
+  smsConnected       Boolean  @default(false)
+  smsProvider        String?  @db.VarChar(50)
+  // Test
+  lastTestNumber     String?  @db.VarChar(20)
+  lastTestAt         DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  businessProfile BusinessProfile @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+}
+
+// BusinessMessageLog — tracks every external message sent (SMS, WhatsApp)
+model BusinessMessageLog {
+  id                String   @id @default(uuid())
+  businessProfileId String
+  channel           String   @db.VarChar(20) // 'sms' | 'whatsapp'
+  recipient         String   @db.VarChar(20)
+  message           String   @db.VarChar(500)
+  status            String   @default("SENT")
+  providerMessageId String?  @db.VarChar(200)
+  costGhs           Decimal? @db.Decimal(10, 4)
+  error             String?  @db.VarChar(500)
+  eventType         String?  @db.VarChar(50)
+  createdAt         DateTime @default(now())
+
+  businessProfile BusinessProfile @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+
+  @@index([businessProfileId, createdAt(sort: Desc)])
+  @@index([businessProfileId, channel])
+  @@index([status])
 }

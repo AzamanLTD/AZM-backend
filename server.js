@@ -997,6 +997,17 @@ if (process.env.NODE_ENV !== 'test') {
     const { sweepExpiredAds } = require('./workers/businessAdExpiryWorker');
     cron.schedule('*/15 * * * *', () => sweepTransitReminders(prisma));
     cron.schedule('*/30 * * * *', () => sweepExpiredAds(prisma));
+
+    // Webhook retry queue — process stuck RETRYING deliveries every 2 minutes
+    const webhookDispatcher = require('./services/webhookDispatcher');
+    cron.schedule('*/2 * * * *', async () => {
+        try {
+            const count = await webhookDispatcher.processRetryQueue();
+            if (count > 0) console.log(`[WebhookRetry] Processed ${count} stuck deliveries.`);
+        } catch (e) {
+            console.warn('[WebhookRetry] Error:', e.message);
+        }
+    });
 }
 
 // ── D-05: record worker liveness for GET /health ─────────────────────────────

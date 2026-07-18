@@ -242,33 +242,47 @@ class RestaurantOpsService {
     // This provides a floor-plan view of all active tables.
 
     async getTableFloor(businessProfileId, { locationId } = {}) {
-        const where = { businessProfileId, status: { in: ['OPEN', 'SEATED', 'ORDERED'] } };
-        if (locationId) where.locationId = locationId;
+        // Return actual BusinessTable records with nested DineInTabs,
+        // computing a derived 'status' from the active tab (or 'OPEN' if none).
+        const locWhere = { businessProfileId };
+        if (locationId) locWhere.id = locationId;
 
-        const tabs = await this.prisma.dineInTab.findMany({
-            where,
-            include: {
-                items: true,
-                customer: { select: { username: true } },
-                table: { select: { label: true } },
+        const tables = await this.prisma.businessTable.findMany({
+            where: {
+                isActive: true,
+                location: { businessProfileId, ...(locationId ? { id: locationId } : {}) },
             },
-            orderBy: { openedAt: 'asc' },
+            include: {
+                dineInTabs: {
+                    where: { status: { not: 'CLOSED' } },
+                    include: { items: true, customer: { select: { username: true } } },
+                    orderBy: { openedAt: 'desc' },
+                },
+            },
+            orderBy: { label: 'asc' },
         });
 
-        // Sort by table label if available
-        tabs.sort((a, b) => (a.table?.label || 'ZZZ').localeCompare(b.table?.label || 'ZZZ'));
-
-        return tabs.map(tab => ({
-            id: tab.id,
-            tableNumber: tab.table?.label || '—',
-            status: tab.status,
-            customerName: tab.customer?.username || 'Walk-in',
-            serverName: null, // DineInTab has no serverName field
-            itemCount: tab.items.length,
-            totalAmount: tab.items.reduce((s, i) => s + parseFloat(i.unitPriceUsdc) * i.quantity, 0),
-            openedAt: tab.openedAt,
-            durationMinutes: Math.round((new Date() - new Date(tab.openedAt)) / (1000 * 60)),
-        }));
+        return tables.map(table => {
+            const activeTab = table.dineInTabs?.[0] || null;
+            return {
+                id: table.id,
+                label: table.label,
+                locationId: table.locationId,
+                isActive: table.isActive,
+                metadata: table.metadata,
+                status: activeTab?.status || 'OPEN',
+                dineInTabs: table.dineInTabs || [],
+                currentTab: activeTab ? {
+                    id: activeTab.id,
+                    status: activeTab.status,
+                    customerName: activeTab.customer?.username || 'Walk-in',
+                    itemCount: activeTab.items.length,
+                    totalAmount: activeTab.items.reduce((s, i) => s + parseFloat(i.unitPriceUsdc) * i.quantity, 0),
+                    openedAt: activeTab.openedAt,
+                    durationMinutes: Math.round((new Date() - new Date(activeTab.openedAt)) / (1000 * 60)),
+                } : null,
+            };
+        });
     }
 
     // ═══ MENU ENGINEERING ═════════════════════════════════════════════════════

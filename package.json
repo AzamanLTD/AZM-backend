@@ -11,7 +11,8 @@
     "migrate:deploy": "prisma migrate deploy",
     "install:susu": "node infra/install-susu-overlay.js",
     "seed:susu": "node infra/seed-susu-foundation.js",
-    "release": "node infra/install-susu-overlay.js && node infra/seed-susu-foundation.js && node infra/install-business-os-overlay.js"
+    "release": "node infra/install-susu-overlay.js && node infra/seed-susu-foundation.js && node infra/install-business-os-overlay.js",
+    "route-check": "node scripts/route-checker.js"
   },
   "keywords": [],
   "author": "",
@@ -22,6 +23,7 @@
     "@prisma/client": "^6.19.2",
     "@sentry/node": "^10.58.0",
     "@socket.io/redis-adapter": "^8.3.0",
+    "archiver": "^8.0.0",
     "axios": "^1.14.0",
     "bcryptjs": "^2.4.3",
     "cloudinary": "^2.10.0",
