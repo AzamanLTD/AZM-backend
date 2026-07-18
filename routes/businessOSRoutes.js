@@ -48,7 +48,7 @@ async function getBusinessProfileId(req) {
     const bp = await prisma.businessProfile.findUnique({
         where: { userId: req.user.id },
     });
-    if (!bp) throw new Error('No business profile found for this user.');
+    if (!bp) return null;
     return bp.id;
 }
 
@@ -2184,6 +2184,7 @@ router.post('/orders/:id/refund', requirePermission('orders.refund'), wrap(async
 router.get('/invoices/stats', wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
+    if (!bpId) return res.json({ success: true, stats: { draft: 0, sent: 0, paid: 0, voided: 0, totalRevenueUsdc: '0' } });
     const [draft, sent, paid, voided, totalRevenue] = await Promise.all([
         prisma.businessInvoice.count({ where: { businessProfileId: bpId, status: 'DRAFT' } }),
         prisma.businessInvoice.count({ where: { businessProfileId: bpId, status: 'SENT' } }),
@@ -2209,6 +2210,7 @@ router.get('/invoices/stats', wrap(async (req, res) => {
 router.get('/booking/dashboard', wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
+    if (!bpId) return res.json({ success: true, stats: { totalOrders: 0, pending: 0, confirmed: 0, completed: 0, cancelled: 0, revenueUsdc: '0' } });
 
 // ── Phase 2: Kiosk PIN Auth (Section 2.4) ────────────────────────────────────
 // POST /api/business-os/kiosk/pin-auth — scoped PIN auth for clock-in/out only

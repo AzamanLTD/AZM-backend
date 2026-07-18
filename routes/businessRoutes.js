@@ -19,6 +19,23 @@ const { businessRegisterSchema, businessUpdateSchema } = require('../services/va
 
 const ctrl        = require('../controllers/businessController');
 const productCtrl = require('../controllers/businessProductController');
+
+// Resolves businessProfileId from DB and attaches to req.user.
+// The JWT doesn't include businessProfileId, so we look it up per-request.
+async function resolveBizProfile(req, res, next) {
+    if (req.businessProfileId) return next(); // admin scope already set
+    if (req.user?.businessProfileId) return next(); // already on JWT
+    try {
+        const prisma = req.app.get('prisma');
+        const bp = await prisma.businessProfile.findUnique({
+            where: { userId: req.user.id },
+            select: { id: true },
+        });
+        if (bp) req.user.businessProfileId = bp.id;
+    } catch (e) { /* swallow — endpoints handle null bpId */ }
+    next();
+}
+
 const orderCtrl   = require('../controllers/businessOrderController');
 const kybCtrl     = require('../controllers/businessKybController');
 const notifCtrl   = require('../controllers/bizNotificationController');
@@ -113,11 +130,11 @@ router.delete('/vehicles/:vehicleId',          protect, protectActive, ctrl.dele
 // These endpoints are called by the frontend but had no backend route.
 
 // GET /api/business/reservations/stats
-router.get('/reservations/stats', protect, async (req, res) => {
+router.get('/reservations/stats', protect, resolveBizProfile, async (req, res) => {
     try {
         const prisma = req.app.get('prisma');
         const bpId = req.user.businessProfileId;
-        if (!bpId) return res.status(400).json({ success: false, message: 'No business profile' });
+        if (!bpId) return res.json({ total: 0, pending: 0, confirmed: 0, cancelled: 0, checkedIn: 0, completed: 0, noShow: 0 });
 
         const [total, pending, confirmed, cancelled, checkedIn, completed, noShow] = await Promise.all([
             prisma.reservation.count({ where: { businessProfileId: bpId } }),
@@ -134,11 +151,11 @@ router.get('/reservations/stats', protect, async (req, res) => {
 });
 
 // GET /api/business/checkin/stats
-router.get('/checkin/stats', protect, async (req, res) => {
+router.get('/checkin/stats', protect, resolveBizProfile, async (req, res) => {
     try {
         const prisma = req.app.get('prisma');
         const bpId = req.user.businessProfileId;
-        if (!bpId) return res.status(400).json({ success: false, message: 'No business profile' });
+        if (!bpId) return res.json({ today: 0, week: 0, month: 0 });
 
         const today = new Date();
         today.setHours(0, 0, 0, 0);
@@ -154,11 +171,11 @@ router.get('/checkin/stats', protect, async (req, res) => {
 });
 
 // GET /api/business/checkin/recent
-router.get('/checkin/recent', protect, async (req, res) => {
+router.get('/checkin/recent', protect, resolveBizProfile, async (req, res) => {
     try {
         const prisma = req.app.get('prisma');
         const bpId = req.user.businessProfileId;
-        if (!bpId) return res.status(400).json({ success: false, message: 'No business profile' });
+        if (!bpId) return res.json([]);
 
         const limit = parseInt(req.query.limit) || 20;
         const skip = parseInt(req.query.skip) || 0;
@@ -176,11 +193,11 @@ router.get('/checkin/recent', protect, async (req, res) => {
 });
 
 // GET /api/business/reviews/stats
-router.get('/reviews/stats', protect, async (req, res) => {
+router.get('/reviews/stats', protect, resolveBizProfile, async (req, res) => {
     try {
         const prisma = req.app.get('prisma');
         const bpId = req.user.businessProfileId;
-        if (!bpId) return res.status(400).json({ success: false, message: 'No business profile' });
+        if (!bpId) return res.json({ total: 0, average: 0, distribution: { 5: 0, 4: 0, 3: 0, 2: 0, 1: 0 } });
 
         const reviews = await prisma.businessReview.findMany({
             where: { businessProfileId: bpId },
@@ -197,11 +214,11 @@ router.get('/reviews/stats', protect, async (req, res) => {
 });
 
 // GET /api/business/marketplace/stats
-router.get('/marketplace/stats', protect, async (req, res) => {
+router.get('/marketplace/stats', protect, resolveBizProfile, async (req, res) => {
     try {
         const prisma = req.app.get('prisma');
         const bpId = req.user.businessProfileId;
-        if (!bpId) return res.status(400).json({ success: false, message: 'No business profile' });
+        if (!bpId) return res.json({ totalOrders: 0, totalProducts: 0, totalReviews: 0, totalRevenueUsdc: '0' });
 
         const [orders, products, reviews, revenue] = await Promise.all([
             prisma.businessOrder.count({ where: { businessProfileId: bpId } }),
@@ -215,11 +232,11 @@ router.get('/marketplace/stats', protect, async (req, res) => {
 });
 
 // GET /api/business/transit/trips
-router.get('/transit/trips', protect, async (req, res) => {
+router.get('/transit/trips', protect, resolveBizProfile, async (req, res) => {
     try {
         const prisma = req.app.get('prisma');
         const bpId = req.user.businessProfileId;
-        if (!bpId) return res.status(400).json({ success: false, message: 'No business profile' });
+        if (!bpId) return res.json([]);
 
         const trips = await prisma.transitTrip.findMany({
             where: { businessProfileId: bpId },
