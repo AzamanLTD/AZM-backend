@@ -1,55 +1,160 @@
 'use strict';
 
-// NOTE: prisma is passed as the FIRST argument to every function (req.app.get('prisma')).
-// This matches the existing codebase DI pattern — services never import a prisma singleton.
-const { migrateLayout } = require('./storefrontSchemaMigration');
+// =============================================================================
+// AZAMAN — Storefront SDUI Service
+//
+// NOTE: `prisma` is passed as the first argument to every function.
+// This matches the existing codebase pattern: services never import a
+// prisma singleton. All callers get prisma via req.app.get('prisma').
+// =============================================================================
 
+const { migrateLayout, generateEmptyLayout } = require('./storefrontSchemaMigration');
+
+/**
+ * Generate a default layout for a business based on its category.
+ * @param {string} businessProfileId
+ * @param {string} category - Business category (RESTAURANT, HOTEL, RETAIL, etc.)
+ * @returns {object} - Default layout JSON
+ */
 function generateDefaultLayout(businessProfileId, category = 'UNIVERSAL') {
   const tiles = [];
+
+  // All businesses get a hero header
   tiles.push({
     id: `tile_${Math.random().toString(36).substring(2, 10)}`,
     widgetType: 'hero_header',
     position: { row: 0, col: 0, rowSpan: 2, colSpan: 4 },
-    props: { mediaUrl: null, mediaType: 'image', title: null, subtitle: 'Welcome to our store', overlayOpacity: 0.3, height: 'standard' },
+    props: {
+      mediaUrl: null,
+      mediaType: 'image',
+      title: null,
+      subtitle: 'Welcome to our store',
+      overlayOpacity: 0.3,
+      height: 'standard',
+    },
   });
+
+  // Quick info bar
   tiles.push({
     id: `tile_${Math.random().toString(36).substring(2, 10)}`,
     widgetType: 'quick_info_bar',
     position: { row: 2, col: 0, rowSpan: 1, colSpan: 4 },
     props: { showHours: true, showRating: true, showCategory: true, customInfo: '' },
   });
+
+  // Category-specific tiles
   if (category === 'RESTAURANT' || category === 'FOOD') {
-    tiles.push({ id: `tile_${Math.random().toString(36).substring(2, 10)}`, widgetType: 'product_grid', position: { row: 3, col: 0, rowSpan: 3, colSpan: 4 }, props: { title: 'Popular Dishes', maxItems: 6, columns: 2, showPrice: true } });
-    tiles.push({ id: `tile_${Math.random().toString(36).substring(2, 10)}`, widgetType: 'review_carousel', position: { row: 6, col: 0, rowSpan: 2, colSpan: 4 }, props: { title: 'What People Say', maxReviews: 5, minRating: 4 } });
+    tiles.push({
+      id: `tile_${Math.random().toString(36).substring(2, 10)}`,
+      widgetType: 'product_grid',
+      position: { row: 3, col: 0, rowSpan: 3, colSpan: 4 },
+      props: { title: 'Popular Dishes', maxItems: 6, columns: 2, showPrice: true },
+    });
+    tiles.push({
+      id: `tile_${Math.random().toString(36).substring(2, 10)}`,
+      widgetType: 'review_carousel',
+      position: { row: 6, col: 0, rowSpan: 2, colSpan: 4 },
+      props: { title: 'What People Say', maxReviews: 5, minRating: 4 },
+    });
   } else if (category === 'HOTEL' || category === 'LODGING') {
-    tiles.push({ id: `tile_${Math.random().toString(36).substring(2, 10)}`, widgetType: 'showcase_gallery', position: { row: 3, col: 0, rowSpan: 3, colSpan: 4 }, props: { title: 'Our Rooms', maxItems: 8, autoplay: false } });
-    tiles.push({ id: `tile_${Math.random().toString(36).substring(2, 10)}`, widgetType: 'location_map', position: { row: 6, col: 0, rowSpan: 2, colSpan: 4 }, props: { title: 'Find Us', zoom: 14 } });
-    tiles.push({ id: `tile_${Math.random().toString(36).substring(2, 10)}`, widgetType: 'action_buttons', position: { row: 8, col: 0, rowSpan: 1, colSpan: 4 }, props: { showOrder: false, showBook: true, showFollow: true, showShare: true } });
+    tiles.push({
+      id: `tile_${Math.random().toString(36).substring(2, 10)}`,
+      widgetType: 'showcase_gallery',
+      position: { row: 3, col: 0, rowSpan: 3, colSpan: 4 },
+      props: { title: 'Our Rooms', maxItems: 8, autoplay: false },
+    });
+    tiles.push({
+      id: `tile_${Math.random().toString(36).substring(2, 10)}`,
+      widgetType: 'location_map',
+      position: { row: 6, col: 0, rowSpan: 2, colSpan: 4 },
+      props: { title: 'Find Us', zoom: 14 },
+    });
+    tiles.push({
+      id: `tile_${Math.random().toString(36).substring(2, 10)}`,
+      widgetType: 'action_buttons',
+      position: { row: 8, col: 0, rowSpan: 1, colSpan: 4 },
+      props: { showOrder: false, showBook: true, showFollow: true, showShare: true },
+    });
   } else {
-    tiles.push({ id: `tile_${Math.random().toString(36).substring(2, 10)}`, widgetType: 'product_grid', position: { row: 3, col: 0, rowSpan: 3, colSpan: 4 }, props: { title: 'Featured Products', maxItems: 6, columns: 2, showPrice: true } });
-    tiles.push({ id: `tile_${Math.random().toString(36).substring(2, 10)}`, widgetType: 'contact_card', position: { row: 6, col: 0, rowSpan: 1, colSpan: 4 }, props: { showPhone: true, showWhatsApp: true, showEmail: true, showWebsite: false } });
+    // Retail / universal
+    tiles.push({
+      id: `tile_${Math.random().toString(36).substring(2, 10)}`,
+      widgetType: 'product_grid',
+      position: { row: 3, col: 0, rowSpan: 3, colSpan: 4 },
+      props: { title: 'Featured Products', maxItems: 6, columns: 2, showPrice: true },
+    });
+    tiles.push({
+      id: `tile_${Math.random().toString(36).substring(2, 10)}`,
+      widgetType: 'contact_card',
+      position: { row: 6, col: 0, rowSpan: 1, colSpan: 4 },
+      props: { showPhone: true, showWhatsApp: true, showEmail: true, showWebsite: false },
+    });
   }
-  return { schemaVersion: 1, gridColumns: 4, tiles };
+
+  return {
+    schemaVersion: 1,
+    gridColumns: 4,
+    tiles,
+  };
 }
 
+/**
+ * Get or create a draft layout for a business.
+ * @param {object} prisma - Prisma client instance (req.app.get('prisma'))
+ * @param {string} businessProfileId
+ * @param {string} [category]
+ */
 async function getOrCreateDraft(prisma, businessProfileId, category) {
   let draft = await prisma.businessStorefrontLayout.findUnique({
     where: { businessProfileId_status: { businessProfileId, status: 'DRAFT' } },
     include: { theme: true },
   });
+
   if (!draft) {
-    let defaultTheme = await prisma.businessStorefrontTheme.findFirst({ where: { key: 'classic_light', isActive: true } });
-    if (!defaultTheme) defaultTheme = await prisma.businessStorefrontTheme.findFirst({ where: { isActive: true }, orderBy: { createdAt: 'asc' } });
-    if (!defaultTheme) throw new Error('No active themes found. Run: npm run seed:storefront');
+    // Get the default theme
+    const defaultTheme = await prisma.businessStorefrontTheme.findFirst({
+      where: { key: 'classic_light', isActive: true },
+    });
+
+    if (!defaultTheme) {
+      // Try any active theme as fallback
+      const anyTheme = await prisma.businessStorefrontTheme.findFirst({
+        where: { isActive: true },
+        orderBy: { displayOrder: 'asc' },
+      });
+      if (!anyTheme) {
+        throw new Error('No active themes found. Run seed scripts: node scripts/seed-storefront-catalog.js');
+      }
+    }
+
+    const themeToUse = await prisma.businessStorefrontTheme.findFirst({
+      where: { key: 'classic_light', isActive: true },
+    }) || await prisma.businessStorefrontTheme.findFirst({ where: { isActive: true } });
+
+    if (!themeToUse) {
+      throw new Error('No active themes found. Run: node scripts/seed-storefront-catalog.js');
+    }
+
     const layoutJson = generateDefaultLayout(businessProfileId, category);
     draft = await prisma.businessStorefrontLayout.create({
-      data: { businessProfileId, status: 'DRAFT', themeId: defaultTheme.id, layoutJson },
+      data: {
+        businessProfileId,
+        status: 'DRAFT',
+        themeId: themeToUse.id,
+        layoutJson,
+      },
       include: { theme: true },
     });
   }
+
   return draft;
 }
 
+/**
+ * Get the published layout for a business.
+ * @param {object} prisma
+ * @param {string} businessProfileId
+ */
 async function getPublishedLayout(prisma, businessProfileId) {
   return prisma.businessStorefrontLayout.findUnique({
     where: { businessProfileId_status: { businessProfileId, status: 'PUBLISHED' } },
@@ -57,7 +162,16 @@ async function getPublishedLayout(prisma, businessProfileId) {
   });
 }
 
+/**
+ * Save a draft layout with optimistic concurrency check.
+ * @param {object} prisma
+ * @param {string} businessProfileId
+ * @param {object} layoutJson
+ * @param {string} themeId
+ * @param {string} [expectedUpdatedAt]
+ */
 async function saveDraft(prisma, businessProfileId, layoutJson, themeId, expectedUpdatedAt) {
+  // Optimistic concurrency: reject if draft changed since client loaded it
   if (expectedUpdatedAt) {
     const existing = await prisma.businessStorefrontLayout.findUnique({
       where: { businessProfileId_status: { businessProfileId, status: 'DRAFT' } },
@@ -66,49 +180,120 @@ async function saveDraft(prisma, businessProfileId, layoutJson, themeId, expecte
       throw new Error('Draft was modified by another editor. Please refresh.');
     }
   }
+
   const migratedLayout = migrateLayout(layoutJson);
-  return prisma.businessStorefrontLayout.upsert({
+
+  const draft = await prisma.businessStorefrontLayout.upsert({
     where: { businessProfileId_status: { businessProfileId, status: 'DRAFT' } },
-    create: { businessProfileId, status: 'DRAFT', themeId, layoutJson: migratedLayout },
-    update: { themeId, layoutJson: migratedLayout },
+    create: {
+      businessProfileId,
+      status: 'DRAFT',
+      themeId,
+      layoutJson: migratedLayout,
+    },
+    update: {
+      themeId,
+      layoutJson: migratedLayout,
+    },
     include: { theme: true },
   });
+
+  return draft;
 }
 
+/**
+ * Publish a draft layout — archives the current published version first.
+ * @param {object} prisma
+ * @param {string} businessProfileId
+ * @param {string} userId
+ */
 async function publishLayout(prisma, businessProfileId, userId) {
   const draft = await prisma.businessStorefrontLayout.findUnique({
     where: { businessProfileId_status: { businessProfileId, status: 'DRAFT' } },
     include: { theme: true },
   });
+
   if (!draft) throw new Error('No draft layout to publish.');
 
-  const business = await prisma.businessProfile.findUnique({ where: { id: businessProfileId }, select: { storefrontDisabled: true } });
-  if (business?.storefrontDisabled) throw new Error('Storefront is disabled by admin. Contact support.');
+  // Check storefront disabled flag
+  const business = await prisma.businessProfile.findUnique({
+    where: { id: businessProfileId },
+    select: { storefrontDisabled: true },
+  });
+  if (business?.storefrontDisabled) {
+    throw new Error('Storefront is disabled by admin. Contact support.');
+  }
 
+  // Archive the current published version into history
   const currentPublished = await prisma.businessStorefrontLayout.findUnique({
     where: { businessProfileId_status: { businessProfileId, status: 'PUBLISHED' } },
   });
+
   if (currentPublished) {
-    const maxV = await prisma.businessStorefrontLayoutVersion.aggregate({ where: { businessProfileId }, _max: { version: true } });
-    await prisma.businessStorefrontLayoutVersion.create({
-      data: { businessProfileId, version: (maxV._max.version || 0) + 1, themeId: currentPublished.themeId, layoutJson: currentPublished.layoutJson, publishedAt: currentPublished.publishedAt, publishedBy: currentPublished.publishedBy },
+    const maxVersion = await prisma.businessStorefrontLayoutVersion.aggregate({
+      where: { businessProfileId },
+      _max: { version: true },
     });
+    const nextVersion = (maxVersion._max.version || 0) + 1;
+
+    await prisma.businessStorefrontLayoutVersion.create({
+      data: {
+        businessProfileId,
+        version: nextVersion,
+        themeId: currentPublished.themeId,
+        layoutJson: currentPublished.layoutJson,
+        publishedAt: currentPublished.publishedAt,
+        publishedBy: currentPublished.publishedBy,
+      },
+    });
+
+    // Delete the old published layout
     await prisma.businessStorefrontLayout.delete({ where: { id: currentPublished.id } });
   }
 
+  // Create the new published layout
   const published = await prisma.businessStorefrontLayout.create({
-    data: { businessProfileId, status: 'PUBLISHED', themeId: draft.themeId, layoutJson: draft.layoutJson, publishedAt: new Date(), publishedBy: userId },
+    data: {
+      businessProfileId,
+      status: 'PUBLISHED',
+      themeId: draft.themeId,
+      layoutJson: draft.layoutJson,
+      publishedAt: new Date(),
+      publishedBy: userId,
+    },
     include: { theme: true },
   });
 
-  const maxV2 = await prisma.businessStorefrontLayoutVersion.aggregate({ where: { businessProfileId }, _max: { version: true } });
-  await prisma.businessStorefrontLayoutVersion.create({
-    data: { businessProfileId, version: (maxV2._max.version || 0) + 1, themeId: draft.themeId, layoutJson: draft.layoutJson, publishedAt: published.publishedAt, publishedBy: userId },
+  // Also archive the new published version for history
+  const maxVersion2 = await prisma.businessStorefrontLayoutVersion.aggregate({
+    where: { businessProfileId },
+    _max: { version: true },
   });
+  const nextVersion2 = (maxVersion2._max.version || 0) + 1;
+
+  await prisma.businessStorefrontLayoutVersion.create({
+    data: {
+      businessProfileId,
+      version: nextVersion2,
+      themeId: draft.themeId,
+      layoutJson: draft.layoutJson,
+      publishedAt: published.publishedAt,
+      publishedBy: userId,
+    },
+  });
+
+  // Delete the draft (now published)
   await prisma.businessStorefrontLayout.delete({ where: { id: draft.id } });
+
   return published;
 }
 
+/**
+ * Get version history for a business.
+ * @param {object} prisma
+ * @param {string} businessProfileId
+ * @param {number} [limit=20]
+ */
 async function getHistory(prisma, businessProfileId, limit = 20) {
   return prisma.businessStorefrontLayoutVersion.findMany({
     where: { businessProfileId },
@@ -118,13 +303,27 @@ async function getHistory(prisma, businessProfileId, limit = 20) {
   });
 }
 
+/**
+ * Revert to a specific version (creates/updates the draft).
+ * @param {object} prisma
+ * @param {string} businessProfileId
+ * @param {string} versionId
+ */
 async function revertToVersion(prisma, businessProfileId, versionId) {
-  const version = await prisma.businessStorefrontLayoutVersion.findUnique({ where: { id: versionId } });
-  if (!version || version.businessProfileId !== businessProfileId) throw new Error('Version not found.');
+  const version = await prisma.businessStorefrontLayoutVersion.findUnique({
+    where: { id: versionId },
+  });
+
+  if (!version || version.businessProfileId !== businessProfileId) {
+    throw new Error('Version not found.');
+  }
+
   const migratedLayout = migrateLayout(version.layoutJson);
+
   const existingDraft = await prisma.businessStorefrontLayout.findUnique({
     where: { businessProfileId_status: { businessProfileId, status: 'DRAFT' } },
   });
+
   if (existingDraft) {
     return prisma.businessStorefrontLayout.update({
       where: { id: existingDraft.id },
@@ -132,63 +331,145 @@ async function revertToVersion(prisma, businessProfileId, versionId) {
       include: { theme: true },
     });
   }
+
   return prisma.businessStorefrontLayout.create({
-    data: { businessProfileId, status: 'DRAFT', themeId: version.themeId, layoutJson: migratedLayout },
+    data: {
+      businessProfileId,
+      status: 'DRAFT',
+      themeId: version.themeId,
+      layoutJson: migratedLayout,
+    },
     include: { theme: true },
   });
 }
 
+/**
+ * Apply a template to a business's draft.
+ * @param {object} prisma
+ * @param {string} businessProfileId
+ * @param {string} templateId
+ */
 async function applyTemplate(prisma, businessProfileId, templateId) {
-  const template = await prisma.businessStorefrontLayoutTemplate.findUnique({ where: { id: templateId } });
-  if (!template || !template.isActive) throw new Error('Template not found or inactive.');
-  if (!template.themeId) throw new Error('Template has no theme assigned.');
+  const template = await prisma.businessStorefrontLayoutTemplate.findUnique({
+    where: { id: templateId },
+  });
+
+  if (!template || !template.isActive) {
+    throw new Error('Template not found or inactive.');
+  }
+
   const migratedLayout = migrateLayout(template.layoutJson);
+  const themeId = template.themeId;
+
+  if (!themeId) {
+    throw new Error('Template has no theme assigned.');
+  }
+
   const existingDraft = await prisma.businessStorefrontLayout.findUnique({
     where: { businessProfileId_status: { businessProfileId, status: 'DRAFT' } },
   });
+
   if (existingDraft) {
     return prisma.businessStorefrontLayout.update({
       where: { id: existingDraft.id },
-      data: { themeId: template.themeId, layoutJson: migratedLayout },
+      data: { themeId, layoutJson: migratedLayout },
       include: { theme: true },
     });
   }
+
   return prisma.businessStorefrontLayout.create({
-    data: { businessProfileId, status: 'DRAFT', themeId: template.themeId, layoutJson: migratedLayout },
+    data: {
+      businessProfileId,
+      status: 'DRAFT',
+      themeId,
+      layoutJson: migratedLayout,
+    },
     include: { theme: true },
   });
 }
 
+/**
+ * List all active themes, optionally filtered by category.
+ * @param {object} prisma
+ * @param {string} [category]
+ */
 async function listThemes(prisma, category) {
   const where = { isActive: true };
-  if (category) where.applicableCategories = { has: category };
-  return prisma.businessStorefrontTheme.findMany({ where, orderBy: [{ minAzmStake: 'asc' }, { name: 'asc' }] });
+  if (category) where.category = category;
+  return prisma.businessStorefrontTheme.findMany({
+    where,
+    orderBy: { displayOrder: 'asc' },
+  });
 }
 
+/**
+ * List all active widgets, optionally filtered by category.
+ * @param {object} prisma
+ * @param {string} [category]
+ */
 async function listWidgets(prisma, category) {
   const where = { isActive: true };
   if (category) where.category = category;
-  return prisma.businessStorefrontWidgetCatalog.findMany({ where, orderBy: [{ category: 'asc' }, { displayName: 'asc' }] });
+  return prisma.businessStorefrontWidgetCatalog.findMany({
+    where,
+    orderBy: { displayOrder: 'asc' },
+  });
 }
 
+/**
+ * List all active layout templates, optionally filtered by category.
+ * @param {object} prisma
+ * @param {string} [category]
+ */
 async function listTemplates(prisma, category) {
   const where = { isActive: true };
-  if (category) where.targetCategory = category;
-  return prisma.businessStorefrontLayoutTemplate.findMany({ where, include: { theme: true }, orderBy: { name: 'asc' } });
+  if (category) where.category = category;
+  return prisma.businessStorefrontLayoutTemplate.findMany({
+    where,
+    orderBy: { displayOrder: 'asc' },
+    include: { theme: true },
+  });
 }
 
+/**
+ * Check storefront eligibility for a business owner.
+ * Returns staked AZM balance, tier, and whether storefront is disabled.
+ * @param {object} prisma
+ * @param {string} businessProfileId
+ * @param {number|string} userId
+ */
 async function checkEligibility(prisma, businessProfileId, userId) {
-  const stakes = await prisma.azmStake.findMany({ where: { userId, status: 'ACTIVE' } });
+  const stakes = await prisma.azmStake.findMany({
+    where: { userId, status: 'ACTIVE' },
+  });
   const stakedBalance = stakes.reduce((sum, s) => sum + Number(s.amountAzm), 0);
-  const business = await prisma.businessProfile.findUnique({ where: { id: businessProfileId }, select: { storefrontDisabled: true } });
+
+  const business = await prisma.businessProfile.findUnique({
+    where: { id: businessProfileId },
+    select: { storefrontDisabled: true },
+  });
+
+  // Tier thresholds (must match azmStakeService.TIER_THRESHOLDS)
   let tier = 'FREE';
   if (stakedBalance >= 5000) tier = 'NITRO_GOLD';
   else if (stakedBalance >= 2000) tier = 'NITRO_SILVER';
   else if (stakedBalance >= 500) tier = 'NITRO_BRONZE';
-  return { stakedBalance, tier, storefrontDisabled: business?.storefrontDisabled || false };
+
+  return {
+    stakedBalance,
+    tier,
+    storefrontDisabled: business?.storefrontDisabled || false,
+  };
 }
 
-async function recordEvent(prisma, businessProfileId, eventType, metadata) {
+/**
+ * Record a storefront analytics event.
+ * @param {object} prisma
+ * @param {string} businessProfileId
+ * @param {string} eventType
+ * @param {object} [metadata={}]
+ */
+async function recordEvent(prisma, businessProfileId, eventType, metadata = {}) {
   return prisma.storefrontAnalyticsEvent.create({
     data: { businessProfileId, eventType, metadata },
   });

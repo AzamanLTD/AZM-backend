@@ -1091,6 +1091,10 @@ app.set('vendorStatus', vendorStatus);
 // ── Storefront Stake Worker ──────────────────────────────────────────────────
 const storefrontStakeWorker = require('./workers/storefrontStakeWorker');
 storefrontStakeWorker.start(prisma);
+
+// ── Keep-Alive Worker (prevents external services from sleeping) ─────────────
+const keepAliveWorker = require('./workers/keepAliveWorker');
+keepAliveWorker.start();
 app.set('emitBalanceUpdate', emitBalanceUpdate);
 
 // Smart Escrow & Business Accounts (2026-06-14): escrowService exports plain
