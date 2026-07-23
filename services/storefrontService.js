@@ -556,6 +556,21 @@ async function getAnalytics(prisma, businessProfileId, options = {}) {
     if (ev.metadata?.visitorId) visitorIds.add(ev.metadata.visitorId);
   }
 
+  // Order stats: count orders placed from the storefront in the date range
+  const orderStats = { totalOrders: 0, totalOrderValue: 0, pendingOrders: 0 };
+  try {
+    const orders = await prisma.businessOrder.findMany({
+      where: {
+        businessProfileId,
+        createdAt: { gte: startDate },
+      },
+      select: { id: true, status: true, amountUsdc: true },
+    });
+    orderStats.totalOrders = orders.length;
+    orderStats.totalOrderValue = orders.reduce((sum, o) => sum + (parseFloat(o.amountUsdc) || 0), 0);
+    orderStats.pendingOrders = orders.filter(o => o.status === 'AWAITING_PAYMENT').length;
+  } catch (_) { /* order stats are best-effort */ }
+
   return {
     summary: {
       totalEvents: events.length,
@@ -577,6 +592,7 @@ async function getAnalytics(prisma, businessProfileId, options = {}) {
       .map(([widgetType, data]) => ({ widgetType, ...data })),
     ctaBreakdown,
     trafficSources,
+    orderStats,
   };
 }
 
