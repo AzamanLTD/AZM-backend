@@ -475,6 +475,111 @@ async function recordEvent(prisma, businessProfileId, eventType, metadata = {}) 
   });
 }
 
+
+/**
+ * Get storefront analytics for a business.
+ * Returns aggregated metrics: total views, widget engagement, CTA clicks,
+ * time-series data, and top-performing widgets.
+ * @param {object} prisma
+ * @param {string} businessProfileId
+ * @param {object} [options] — { days, startDate, endDate }
+ */
+async function getAnalytics(prisma, businessProfileId, options = {}) {
+  const days = options.days || 30;
+  const startDate = new Date();
+  startDate.setDate(startDate.getDate() - days);
+
+  // Fetch all events in the date range
+  const events = await prisma.storefrontAnalyticsEvent.findMany({
+    where: {
+      businessProfileId,
+      createdAt: { gte: startDate },
+    },
+    orderBy: { createdAt: 'desc' },
+  });
+
+  // Aggregate by event type
+  const byEventType = {};
+  for (const ev of events) {
+    byEventType[ev.eventType] = (byEventType[ev.eventType] || 0) + 1;
+  }
+
+  // Time series: group by day
+  const timeSeries = {};
+  for (const ev of events) {
+    const day = ev.createdAt.toISOString().split('T')[0];
+    if (!timeSeries[day]) timeSeries[day] = { views: 0, clicks: 0, interactions: 0 };
+    if (ev.eventType === 'storefront_view' || ev.eventType === 'widget_view') {
+      timeSeries[day].views++;
+    } else if (ev.eventType === 'cta_click' || ev.eventType === 'product_tap') {
+      timeSeries[day].clicks++;
+    } else {
+      timeSeries[day].interactions++;
+    }
+  }
+
+  // Widget engagement: group by widgetType in metadata
+  const widgetEngagement = {};
+  for (const ev of events) {
+    const widgetType = ev.metadata?.widgetType;
+    if (!widgetType) continue;
+    if (!widgetEngagement[widgetType]) {
+      widgetEngagement[widgetType] = { views: 0, clicks: 0, taps: 0, total: 0 };
+    }
+    widgetEngagement[widgetType].total++;
+    if (ev.eventType === 'widget_view') widgetEngagement[widgetType].views++;
+    if (ev.eventType === 'cta_click') widgetEngagement[widgetType].clicks++;
+    if (ev.eventType === 'product_tap') widgetEngagement[widgetType].taps++;
+  }
+
+  // CTA breakdown
+  const ctaBreakdown = {};
+  for (const ev of events) {
+    if (ev.eventType === 'cta_click') {
+      const action = ev.metadata?.action || 'unknown';
+      ctaBreakdown[action] = (ctaBreakdown[action] || 0) + 1;
+    }
+  }
+
+  // Traffic source breakdown (from metadata.referrer)
+  const trafficSources = {};
+  for (const ev of events) {
+    if (ev.eventType === 'storefront_view') {
+      const source = ev.metadata?.source || 'direct';
+      trafficSources[source] = (trafficSources[source] || 0) + 1;
+    }
+  }
+
+  // Unique visitors (approximate by distinct metadata.visitorId)
+  const visitorIds = new Set();
+  for (const ev of events) {
+    if (ev.metadata?.visitorId) visitorIds.add(ev.metadata.visitorId);
+  }
+
+  return {
+    summary: {
+      totalEvents: events.length,
+      totalViews: byEventType.storefront_view || 0,
+      totalWidgetViews: byEventType.widget_view || 0,
+      totalCTAClicks: byEventType.cta_click || 0,
+      totalProductTaps: byEventType.product_tap || 0,
+      uniqueVisitors: visitorIds.size,
+      avgCTR: byEventType.storefront_view > 0
+        ? ((byEventType.cta_click || 0) / byEventType.storefront_view * 100).toFixed(1)
+        : '0',
+    },
+    byEventType,
+    timeSeries: Object.entries(timeSeries)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([date, data]) => ({ date, ...data })),
+    widgetEngagement: Object.entries(widgetEngagement)
+      .sort(([, a], [, b]) => b.total - a.total)
+      .map(([widgetType, data]) => ({ widgetType, ...data })),
+    ctaBreakdown,
+    trafficSources,
+  };
+}
+
 module.exports = {
   generateDefaultLayout,
   getOrCreateDraft,
@@ -489,4 +594,5 @@ module.exports = {
   listTemplates,
   checkEligibility,
   recordEvent,
+  getAnalytics,
 };

@@ -193,6 +193,43 @@ router.get('/me/eligibility', protect, protectActive, requirePermission('storefr
   res.json({ success: true, data: eligibility });
 }));
 
+
+
+// POST /api/storefront/:businessProfileId/events — record a storefront view event (public, optional auth)
+router.post('/:businessProfileId/events', wrap(async (req, res) => {
+  const prisma = req.app.get('prisma');
+  const { businessProfileId } = req.params;
+  const { eventType, metadata } = req.body;
+  if (!eventType) return res.status(400).json({ success: false, message: 'eventType is required.' });
+
+  // Validate eventType is a storefront event (not arbitrary)
+  const allowedEvents = ['storefront_view', 'widget_view', 'cta_click', 'product_tap', 'follow_click', 'review_click', 'message_click', 'share_click'];
+  if (!allowedEvents.includes(eventType)) {
+    return res.status(400).json({ success: false, message: 'Invalid event type.' });
+  }
+
+  // Add viewer info if authenticated (optional)
+  const enrichedMetadata = {
+    ...metadata,
+    viewerId: req.user?.id || null,
+    viewerType: req.user ? 'app_user' : 'guest',
+  };
+
+  await storefrontService.recordEvent(prisma, businessProfileId, eventType, enrichedMetadata);
+  res.json({ success: true });
+}));
+
+// GET /api/storefront/me/analytics — get aggregated storefront analytics
+router.get('/me/analytics', protect, protectActive, requirePermission('storefront.manage'), wrap(async (req, res) => {
+  const prisma = req.app.get('prisma');
+  const businessProfileId = req.user.businessProfileId;
+  if (!businessProfileId) return res.status(400).json({ success: false, message: 'Business profile required.' });
+
+  const days = parseInt(req.query.days, 10) || 30;
+  const analytics = await storefrontService.getAnalytics(prisma, businessProfileId, { days });
+  res.json({ success: true, data: analytics });
+}));
+
 // POST /api/storefront/me/analytics — record an analytics event
 router.post('/me/analytics', protect, protectActive, wrap(async (req, res) => {
   const prisma = req.app.get('prisma');
