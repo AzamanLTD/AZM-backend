@@ -87,7 +87,7 @@ async function renderStorefront(prisma, businessProfileId) {
   // Check if storefront is disabled
   const business = await prisma.businessProfile.findUnique({
     where: { id: businessProfileId },
-    select: { storefrontDisabled: true, isSuspended: true, businessName: true, category: true, logoUrl: true },
+    select: { storefrontDisabled: true, isSuspended: true, businessName: true, category: true, logoUrl: true, coverPhotoUrl: true, averageRating: true, phoneNumber: true },
   });
 
   if (!layout || !business || business.storefrontDisabled || business.isSuspended) {
@@ -119,6 +119,9 @@ async function renderStorefront(prisma, businessProfileId) {
       name: business.businessName,
       category: business.category,
       logoUrl: business.logoUrl,
+      coverPhotoUrl: business.coverPhotoUrl || null,
+      averageRating: business.averageRating ? Number(business.averageRating) : null,
+      phoneNumber: business.phoneNumber || null,
     },
     theme: {
       id: layout.theme.id,
