@@ -11,7 +11,7 @@ const tilePositionSchema = z.object({
 });
 
 const tileSchema = z.object({
-  id: z.string().regex(/^tile_[a-f0-9]{8}$/),
+  id: z.string().regex(/^tile_[a-z0-9]{4,16}$/),
   widgetType: z.string().min(1),
   position: tilePositionSchema,
   props: z.record(z.any()).default({}),

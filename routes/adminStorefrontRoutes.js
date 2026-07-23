@@ -91,4 +91,75 @@ router.get('/', wrap(async (req, res) => {
   });
 }));
 
+
+// POST /api/admin/storefront/:businessProfileId/revert/:versionId — force-revert a storefront layout
+router.post('/:businessProfileId/revert/:versionId', wrap(async (req, res) => {
+  const prisma = req.app.get('prisma');
+  const { businessProfileId, versionId } = req.params;
+  const storefrontService = require('../services/storefrontService');
+  const draft = await storefrontService.revertToVersion(prisma, businessProfileId, versionId);
+  // Invalidate delivery cache
+  const renderService = require('../services/storefrontRenderService');
+  await renderService.invalidateCache(businessProfileId);
+  res.json({ success: true, message: 'Storefront layout force-reverted by admin.', data: draft });
+}));
+
+// GET /api/admin/storefront/:businessProfileId/media — review uploaded media for a storefront
+router.get('/:businessProfileId/media', wrap(async (req, res) => {
+  const prisma = req.app.get('prisma');
+  const { businessProfileId } = req.params;
+
+  // Get the published layout
+  const layout = await prisma.businessStorefrontLayout.findFirst({
+    where: { businessProfileId, status: 'PUBLISHED' },
+    select: { id: true, layoutJson: true, publishedAt: true },
+  });
+
+  // Get the draft if exists
+  const draft = await prisma.businessStorefrontLayout.findFirst({
+    where: { businessProfileId, status: 'DRAFT' },
+    select: { id: true, layoutJson: true },
+  });
+
+  // Extract all media URLs from both layouts
+  const mediaItems = new Map();
+  const extractMedia = (layoutJson) => {
+    if (!layoutJson?.tiles) return;
+    for (const tile of layoutJson.tiles) {
+      const props = tile.props || {};
+      if (props.mediaUrl) {
+        mediaItems.set(props.mediaUrl, { url: props.mediaUrl, widgetType: tile.widgetType, tileId: tile.id, source: 'tile_media' });
+      }
+      if (props.imageUrl) {
+        mediaItems.set(props.imageUrl, { url: props.imageUrl, widgetType: tile.widgetType, tileId: tile.id, source: 'tile_image' });
+      }
+      if (props.videoUrl) {
+        mediaItems.set(props.videoUrl, { url: props.videoUrl, widgetType: tile.widgetType, tileId: tile.id, source: 'tile_video' });
+      }
+    }
+  };
+
+  if (layout) extractMedia(layout.layoutJson);
+  if (draft) extractMedia(draft.layoutJson);
+
+  // Also get the business profile cover photo and logo
+  const biz = await prisma.businessProfile.findUnique({
+    where: { id: businessProfileId },
+    select: { businessName: true, logoUrl: true, coverPhotoUrl: true },
+  });
+
+  if (biz?.logoUrl) mediaItems.set(biz.logoUrl, { url: biz.logoUrl, widgetType: 'business_logo', tileId: null, source: 'business' });
+  if (biz?.coverPhotoUrl) mediaItems.set(biz.coverPhotoUrl, { url: biz.coverPhotoUrl, widgetType: 'business_cover', tileId: null, source: 'business' });
+
+  res.json({
+    success: true,
+    data: {
+      businessName: biz?.businessName || 'Unknown',
+      media: Array.from(mediaItems.values()),
+      publishedAt: layout?.publishedAt || null,
+    },
+  });
+}));
+
+
 module.exports = router;

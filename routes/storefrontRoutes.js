@@ -12,6 +12,8 @@ const router = require('express').Router();
 const { protect } = require('../middleware/authMiddleware');
 const { protectActive } = require('../middleware/banGuardMiddleware');
 const { requirePermission } = require('../middleware/requirePermission');
+const multer = require('multer');
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
 const storefrontService = require('../services/storefrontService');
 const renderService = require('../services/storefrontRenderService');
 const { saveDraftSchema, applyTemplateSchema, revertSchema } = require('../services/validation/storefrontSchemas');
@@ -105,7 +107,7 @@ router.get('/:businessProfileId/public-theme', wrap(async (req, res) => {
 // All routes below require auth + active business + settings.manage permission
 
 // GET /api/storefront/me/draft — get or create draft layout for the current business
-router.get('/me/draft', protect, protectActive, requirePermission('settings.manage'), wrap(async (req, res) => {
+router.get('/me/draft', protect, protectActive, requirePermission('storefront.manage'), wrap(async (req, res) => {
   const prisma = req.app.get('prisma');
   const businessProfileId = req.businessProfileId || req.user.businessProfileId;
   if (!businessProfileId) return res.status(400).json({ success: false, message: 'No business profile found.' });
@@ -115,7 +117,7 @@ router.get('/me/draft', protect, protectActive, requirePermission('settings.mana
 }));
 
 // GET /api/storefront/me/published — get the published layout
-router.get('/me/published', protect, protectActive, requirePermission('settings.manage'), wrap(async (req, res) => {
+router.get('/me/published', protect, protectActive, requirePermission('storefront.manage'), wrap(async (req, res) => {
   const prisma = req.app.get('prisma');
   const businessProfileId = req.businessProfileId || req.user.businessProfileId;
   if (!businessProfileId) return res.status(400).json({ success: false, message: 'No business profile found.' });
@@ -124,7 +126,7 @@ router.get('/me/published', protect, protectActive, requirePermission('settings.
 }));
 
 // PUT /api/storefront/me/draft — save draft layout
-router.put('/me/draft', protect, protectActive, requirePermission('settings.manage'), wrap(async (req, res) => {
+router.put('/me/draft', protect, protectActive, requirePermission('storefront.manage'), wrap(async (req, res) => {
   const prisma = req.app.get('prisma');
   const businessProfileId = req.businessProfileId || req.user.businessProfileId;
   if (!businessProfileId) return res.status(400).json({ success: false, message: 'No business profile found.' });
@@ -137,7 +139,7 @@ router.put('/me/draft', protect, protectActive, requirePermission('settings.mana
 }));
 
 // POST /api/storefront/me/publish — publish the draft
-router.post('/me/publish', protect, protectActive, requirePermission('settings.manage'), wrap(async (req, res) => {
+router.post('/me/publish', protect, protectActive, requirePermission('storefront.manage'), wrap(async (req, res) => {
   const prisma = req.app.get('prisma');
   const businessProfileId = req.businessProfileId || req.user.businessProfileId;
   if (!businessProfileId) return res.status(400).json({ success: false, message: 'No business profile found.' });
@@ -148,7 +150,7 @@ router.post('/me/publish', protect, protectActive, requirePermission('settings.m
 }));
 
 // GET /api/storefront/me/history — get version history
-router.get('/me/history', protect, protectActive, requirePermission('settings.manage'), wrap(async (req, res) => {
+router.get('/me/history', protect, protectActive, requirePermission('storefront.manage'), wrap(async (req, res) => {
   const prisma = req.app.get('prisma');
   const businessProfileId = req.businessProfileId || req.user.businessProfileId;
   if (!businessProfileId) return res.status(400).json({ success: false, message: 'No business profile found.' });
@@ -157,7 +159,7 @@ router.get('/me/history', protect, protectActive, requirePermission('settings.ma
 }));
 
 // POST /api/storefront/me/revert — revert to a previous version
-router.post('/me/revert', protect, protectActive, requirePermission('settings.manage'), wrap(async (req, res) => {
+router.post('/me/revert', protect, protectActive, requirePermission('storefront.manage'), wrap(async (req, res) => {
   const prisma = req.app.get('prisma');
   const businessProfileId = req.businessProfileId || req.user.businessProfileId;
   if (!businessProfileId) return res.status(400).json({ success: false, message: 'No business profile found.' });
@@ -170,7 +172,7 @@ router.post('/me/revert', protect, protectActive, requirePermission('settings.ma
 }));
 
 // POST /api/storefront/me/apply-template — apply a template to the draft
-router.post('/me/apply-template', protect, protectActive, requirePermission('settings.manage'), wrap(async (req, res) => {
+router.post('/me/apply-template', protect, protectActive, requirePermission('storefront.manage'), wrap(async (req, res) => {
   const prisma = req.app.get('prisma');
   const businessProfileId = req.businessProfileId || req.user.businessProfileId;
   if (!businessProfileId) return res.status(400).json({ success: false, message: 'No business profile found.' });
@@ -183,7 +185,7 @@ router.post('/me/apply-template', protect, protectActive, requirePermission('set
 }));
 
 // GET /api/storefront/me/eligibility — check theme/widget eligibility
-router.get('/me/eligibility', protect, protectActive, requirePermission('settings.manage'), wrap(async (req, res) => {
+router.get('/me/eligibility', protect, protectActive, requirePermission('storefront.manage'), wrap(async (req, res) => {
   const prisma = req.app.get('prisma');
   const businessProfileId = req.businessProfileId || req.user.businessProfileId;
   if (!businessProfileId) return res.status(400).json({ success: false, message: 'No business profile found.' });
@@ -200,6 +202,19 @@ router.post('/me/analytics', protect, protectActive, wrap(async (req, res) => {
   if (!eventType) return res.status(400).json({ success: false, message: 'eventType is required.' });
   await storefrontService.recordEvent(prisma, businessProfileId, eventType, metadata || {});
   res.json({ success: true, message: 'Event recorded.' });
+}));
+
+
+// POST /api/storefront/me/media — upload media for a tile (multipart/form-data)
+router.post('/me/media', protect, protectActive, requirePermission('storefront.manage'), upload.single('file'), wrap(async (req, res) => {
+  const prisma = req.app.get('prisma');
+  const businessProfileId = req.businessProfileId || req.user.businessProfileId;
+  if (!businessProfileId) return res.status(400).json({ success: false, message: 'No business profile found.' });
+  if (!req.file) return res.status(400).json({ success: false, message: 'No file uploaded.' });
+
+  const { uploadToCloudinary } = require('../services/cloudinaryService');
+  const result = await uploadToCloudinary(req.file, 'storefronts');
+  res.json({ success: true, data: { url: result.url, publicId: result.publicId } });
 }));
 
 module.exports = router;
