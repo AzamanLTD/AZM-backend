@@ -448,7 +448,81 @@ router.post('/:businessProfileId/order', protect, protectActive, wrap(async (req
     });
   } catch (_) { /* analytics is best-effort */ }
 
+  // Create a BusinessNotification so the owner sees the new storefront order
+  try {
+    const customer = await prisma.user.findUnique({
+      where: { id: userId },
+      select: { displayName: true, walletAddress: true },
+    });
+    await prisma.businessNotification.create({
+      data: {
+        businessProfileId,
+        type: 'NEW_ORDER',
+        title: `New Storefront Order — ${orderRef}`,
+        body: `${customer?.displayName || 'A customer'} ordered ${orderTitle} (${amount.toFixed(2)} USDC). Status: Awaiting Payment.`,
+        metadata: { orderId: order.id, orderRef, amount, productId, quantity: qty, source: 'storefront' },
+      },
+    });
+  } catch (_) { /* notification is best-effort */ }
+
   res.status(201).json({ success: true, data: { order } });
+}));
+
+// GET /api/storefront/me/orders — customer's storefront order history
+router.get('/me/orders', protect, protectActive, wrap(async (req, res) => {
+  const prisma = req.app.get('prisma');
+  const userId = req.user.id;
+  const { status, limit: limitStr, cursor } = req.query;
+  const limit = Math.min(parseInt(limitStr, 10) || 20, 50);
+
+  const where = { customerId: userId };
+  if (status) where.status = String(status).toUpperCase();
+
+  const orders = await prisma.businessOrder.findMany({
+    where,
+    orderBy: { createdAt: 'desc' },
+    take: limit + 1,
+    ...(cursor ? { skip: 1, cursor: { id: cursor } } : {}),
+    include: {
+      businessProfile: {
+        select: { id: true, businessName: true, businessType: true, logoUrl: true },
+      },
+      product: {
+        select: { id: true, name: true, imageUrl: true, priceUsdc: true },
+      },
+    },
+  });
+
+  const hasMore = orders.length > limit;
+  const items = hasMore ? orders.slice(0, limit) : orders;
+
+  res.json({
+    success: true,
+    data: { orders: items, hasMore, nextCursor: hasMore ? items[items.length - 1].id : null },
+  });
+}));
+
+// GET /api/storefront/me/orders/:orderId — single order detail for customer
+router.get('/me/orders/:orderId', protect, protectActive, wrap(async (req, res) => {
+  const prisma = req.app.get('prisma');
+  const userId = req.user.id;
+  const { orderId } = req.params;
+
+  const order = await prisma.businessOrder.findFirst({
+    where: { id: orderId, customerId: userId },
+    include: {
+      businessProfile: {
+        select: { id: true, businessName: true, businessType: true, logoUrl: true, contactPhone: true },
+      },
+      product: {
+        select: { id: true, name: true, imageUrl: true, priceUsdc: true, description: true },
+      },
+    },
+  });
+
+  if (!order) return res.status(404).json({ success: false, message: 'Order not found.' });
+
+  res.json({ success: true, data: { order } });
 }));
 
 module.exports = router;
