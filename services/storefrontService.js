@@ -1,7 +1,13 @@
 'use strict';
 
-// NOTE: prisma is passed as the first argument to every function (req.app.get('prisma')).
-// This matches the existing codebase pattern — services never import a prisma singleton.
+// =============================================================================
+// AZAMAN — Storefront SDUI Service
+//
+// NOTE: `prisma` is passed as the first argument to every function.
+// This matches the existing codebase pattern: services never import a
+// prisma singleton. All callers get prisma via req.app.get('prisma').
+// =============================================================================
+
 const { migrateLayout, generateEmptyLayout } = require('./storefrontSchemaMigration');
 
 /**
@@ -94,8 +100,11 @@ function generateDefaultLayout(businessProfileId, category = 'UNIVERSAL') {
 
 /**
  * Get or create a draft layout for a business.
+ * @param {object} prisma - Prisma client instance (req.app.get('prisma'))
+ * @param {string} businessProfileId
+ * @param {string} [category]
  */
-async function getOrCreateDraft(businessProfileId, category) {
+async function getOrCreateDraft(prisma, businessProfileId, category) {
   let draft = await prisma.businessStorefrontLayout.findUnique({
     where: { businessProfileId_status: { businessProfileId, status: 'DRAFT' } },
     include: { theme: true },
@@ -108,7 +117,22 @@ async function getOrCreateDraft(businessProfileId, category) {
     });
 
     if (!defaultTheme) {
-      throw new Error('Default theme not found. Run seed scripts.');
+      // Try any active theme as fallback
+      const anyTheme = await prisma.businessStorefrontTheme.findFirst({
+        where: { isActive: true },
+        orderBy: { displayOrder: 'asc' },
+      });
+      if (!anyTheme) {
+        throw new Error('No active themes found. Run seed scripts: node scripts/seed-storefront-catalog.js');
+      }
+    }
+
+    const themeToUse = await prisma.businessStorefrontTheme.findFirst({
+      where: { key: 'classic_light', isActive: true },
+    }) || await prisma.businessStorefrontTheme.findFirst({ where: { isActive: true } });
+
+    if (!themeToUse) {
+      throw new Error('No active themes found. Run: node scripts/seed-storefront-catalog.js');
     }
 
     const layoutJson = generateDefaultLayout(businessProfileId, category);
@@ -116,7 +140,7 @@ async function getOrCreateDraft(businessProfileId, category) {
       data: {
         businessProfileId,
         status: 'DRAFT',
-        themeId: defaultTheme.id,
+        themeId: themeToUse.id,
         layoutJson,
       },
       include: { theme: true },
@@ -128,8 +152,10 @@ async function getOrCreateDraft(businessProfileId, category) {
 
 /**
  * Get the published layout for a business.
+ * @param {object} prisma
+ * @param {string} businessProfileId
  */
-async function getPublishedLayout(businessProfileId) {
+async function getPublishedLayout(prisma, businessProfileId) {
   return prisma.businessStorefrontLayout.findUnique({
     where: { businessProfileId_status: { businessProfileId, status: 'PUBLISHED' } },
     include: { theme: true },
@@ -137,10 +163,15 @@ async function getPublishedLayout(businessProfileId) {
 }
 
 /**
- * Save a draft layout.
+ * Save a draft layout with optimistic concurrency check.
+ * @param {object} prisma
+ * @param {string} businessProfileId
+ * @param {object} layoutJson
+ * @param {string} themeId
+ * @param {string} [expectedUpdatedAt]
  */
-async function saveDraft(businessProfileId, layoutJson, themeId, expectedUpdatedAt) {
-  // Check for concurrent edits
+async function saveDraft(prisma, businessProfileId, layoutJson, themeId, expectedUpdatedAt) {
+  // Optimistic concurrency: reject if draft changed since client loaded it
   if (expectedUpdatedAt) {
     const existing = await prisma.businessStorefrontLayout.findUnique({
       where: { businessProfileId_status: { businessProfileId, status: 'DRAFT' } },
@@ -171,9 +202,12 @@ async function saveDraft(businessProfileId, layoutJson, themeId, expectedUpdated
 }
 
 /**
- * Publish a draft layout.
+ * Publish a draft layout — archives the current published version first.
+ * @param {object} prisma
+ * @param {string} businessProfileId
+ * @param {string} userId
  */
-async function publishLayout(businessProfileId, userId) {
+async function publishLayout(prisma, businessProfileId, userId) {
   const draft = await prisma.businessStorefrontLayout.findUnique({
     where: { businessProfileId_status: { businessProfileId, status: 'DRAFT' } },
     include: { theme: true },
@@ -196,7 +230,6 @@ async function publishLayout(businessProfileId, userId) {
   });
 
   if (currentPublished) {
-    // Get the max version number
     const maxVersion = await prisma.businessStorefrontLayoutVersion.aggregate({
       where: { businessProfileId },
       _max: { version: true },
@@ -231,17 +264,17 @@ async function publishLayout(businessProfileId, userId) {
     include: { theme: true },
   });
 
-  // Also archive the new published version
-  const maxVersion = await prisma.businessStorefrontLayoutVersion.aggregate({
+  // Also archive the new published version for history
+  const maxVersion2 = await prisma.businessStorefrontLayoutVersion.aggregate({
     where: { businessProfileId },
     _max: { version: true },
   });
-  const nextVersion = (maxVersion._max.version || 0) + 1;
+  const nextVersion2 = (maxVersion2._max.version || 0) + 1;
 
   await prisma.businessStorefrontLayoutVersion.create({
     data: {
       businessProfileId,
-      version: nextVersion,
+      version: nextVersion2,
       themeId: draft.themeId,
       layoutJson: draft.layoutJson,
       publishedAt: published.publishedAt,
@@ -249,7 +282,7 @@ async function publishLayout(businessProfileId, userId) {
     },
   });
 
-  // Delete the draft
+  // Delete the draft (now published)
   await prisma.businessStorefrontLayout.delete({ where: { id: draft.id } });
 
   return published;
@@ -257,8 +290,11 @@ async function publishLayout(businessProfileId, userId) {
 
 /**
  * Get version history for a business.
+ * @param {object} prisma
+ * @param {string} businessProfileId
+ * @param {number} [limit=20]
  */
-async function getHistory(businessProfileId, limit = 20) {
+async function getHistory(prisma, businessProfileId, limit = 20) {
   return prisma.businessStorefrontLayoutVersion.findMany({
     where: { businessProfileId },
     orderBy: { version: 'desc' },
@@ -268,9 +304,12 @@ async function getHistory(businessProfileId, limit = 20) {
 }
 
 /**
- * Revert to a specific version.
+ * Revert to a specific version (creates/updates the draft).
+ * @param {object} prisma
+ * @param {string} businessProfileId
+ * @param {string} versionId
  */
-async function revertToVersion(businessProfileId, versionId) {
+async function revertToVersion(prisma, businessProfileId, versionId) {
   const version = await prisma.businessStorefrontLayoutVersion.findUnique({
     where: { id: versionId },
   });
@@ -279,12 +318,11 @@ async function revertToVersion(businessProfileId, versionId) {
     throw new Error('Version not found.');
   }
 
-  // Create or update a draft with the version's layout
+  const migratedLayout = migrateLayout(version.layoutJson);
+
   const existingDraft = await prisma.businessStorefrontLayout.findUnique({
     where: { businessProfileId_status: { businessProfileId, status: 'DRAFT' } },
   });
-
-  const migratedLayout = migrateLayout(version.layoutJson);
 
   if (existingDraft) {
     return prisma.businessStorefrontLayout.update({
@@ -307,8 +345,11 @@ async function revertToVersion(businessProfileId, versionId) {
 
 /**
  * Apply a template to a business's draft.
+ * @param {object} prisma
+ * @param {string} businessProfileId
+ * @param {string} templateId
  */
-async function applyTemplate(businessProfileId, templateId) {
+async function applyTemplate(prisma, businessProfileId, templateId) {
   const template = await prisma.businessStorefrontLayoutTemplate.findUnique({
     where: { id: templateId },
   });
@@ -348,9 +389,11 @@ async function applyTemplate(businessProfileId, templateId) {
 }
 
 /**
- * List themes.
+ * List all active themes, optionally filtered by category.
+ * @param {object} prisma
+ * @param {string} [category]
  */
-async function listThemes(category) {
+async function listThemes(prisma, category) {
   const where = { isActive: true };
   if (category) where.category = category;
   return prisma.businessStorefrontTheme.findMany({
@@ -360,9 +403,11 @@ async function listThemes(category) {
 }
 
 /**
- * List widgets.
+ * List all active widgets, optionally filtered by category.
+ * @param {object} prisma
+ * @param {string} [category]
  */
-async function listWidgets(category) {
+async function listWidgets(prisma, category) {
   const where = { isActive: true };
   if (category) where.category = category;
   return prisma.businessStorefrontWidgetCatalog.findMany({
@@ -372,9 +417,11 @@ async function listWidgets(category) {
 }
 
 /**
- * List templates.
+ * List all active layout templates, optionally filtered by category.
+ * @param {object} prisma
+ * @param {string} [category]
  */
-async function listTemplates(category) {
+async function listTemplates(prisma, category) {
   const where = { isActive: true };
   if (category) where.category = category;
   return prisma.businessStorefrontLayoutTemplate.findMany({
@@ -385,9 +432,13 @@ async function listTemplates(category) {
 }
 
 /**
- * Check eligibility (staked AZM balance, tier, etc.)
+ * Check storefront eligibility for a business owner.
+ * Returns staked AZM balance, tier, and whether storefront is disabled.
+ * @param {object} prisma
+ * @param {string} businessProfileId
+ * @param {number|string} userId
  */
-async function checkEligibility(businessProfileId, userId) {
+async function checkEligibility(prisma, businessProfileId, userId) {
   const stakes = await prisma.azmStake.findMany({
     where: { userId, status: 'ACTIVE' },
   });
@@ -398,6 +449,7 @@ async function checkEligibility(businessProfileId, userId) {
     select: { storefrontDisabled: true },
   });
 
+  // Tier thresholds (must match azmStakeService.TIER_THRESHOLDS)
   let tier = 'FREE';
   if (stakedBalance >= 5000) tier = 'NITRO_GOLD';
   else if (stakedBalance >= 2000) tier = 'NITRO_SILVER';
@@ -411,9 +463,13 @@ async function checkEligibility(businessProfileId, userId) {
 }
 
 /**
- * Record an analytics event.
+ * Record a storefront analytics event.
+ * @param {object} prisma
+ * @param {string} businessProfileId
+ * @param {string} eventType
+ * @param {object} [metadata={}]
  */
-async function recordEvent(businessProfileId, eventType, metadata) {
+async function recordEvent(prisma, businessProfileId, eventType, metadata = {}) {
   return prisma.storefrontAnalyticsEvent.create({
     data: { businessProfileId, eventType, metadata },
   });
