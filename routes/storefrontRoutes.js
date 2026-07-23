@@ -382,4 +382,73 @@ router.post('/me/media', protect, protectActive, requirePermission('storefront.m
   res.json({ success: true, data: { url: result.url, publicId: result.publicId } });
 }));
 
+// POST /api/storefront/:businessProfileId/order — customer places an order from the storefront
+// Requires authentication. Creates a BusinessOrder with status AWAITING_PAYMENT.
+router.post('/:businessProfileId/order', protect, protectActive, wrap(async (req, res) => {
+  const prisma = req.app.get('prisma');
+  const { businessProfileId } = req.params;
+  const userId = req.user.id;
+  const { productId, quantity = 1, customerNotes, deliveryNotes } = req.body;
+
+  if (!productId) return res.status(400).json({ success: false, message: 'productId is required.' });
+
+  // Verify business exists and is active
+  const business = await prisma.businessProfile.findUnique({
+    where: { id: businessProfileId },
+    select: { id: true, isSuspended: true, isPausedByOwner: true },
+  });
+  if (!business || business.isSuspended) {
+    return res.status(404).json({ success: false, message: 'Business not available.' });
+  }
+  if (business.isPausedByOwner) {
+    return res.status(400).json({ success: false, message: 'This business is currently not accepting orders.' });
+  }
+
+  // Get product and validate
+  const product = await prisma.businessProduct.findFirst({
+    where: { id: productId, businessProfileId, isActive: true, isAvailable: true },
+    select: { id: true, name: true, priceUsdc: true, isActive: true, isAvailable: true },
+  });
+  if (!product) {
+    return res.status(404).json({ success: false, message: 'Product not available.' });
+  }
+
+  const qty = Math.max(1, parseInt(quantity, 10) || 1);
+  const amount = parseFloat(product.priceUsdc) * qty;
+  const orderTitle = qty > 1 ? `${product.name} x${qty}` : product.name;
+
+  // Create the order
+  const { v4: uuidv4 } = require('uuid');
+  const orderRef = `ORD-${Date.now().toString(36).toUpperCase()}-${uuidv4().slice(0, 6).toUpperCase()}`;
+
+  const order = await prisma.businessOrder.create({
+    data: {
+      businessProfileId,
+      customerId: userId,
+      productId,
+      status: 'AWAITING_PAYMENT',
+      orderRef,
+      title: orderTitle,
+      description: `Storefront order for ${orderTitle}`,
+      amountUsdc: amount,
+      customerNotes: customerNotes ? String(customerNotes).slice(0, 500) : null,
+      deliveryNotes: deliveryNotes ? String(deliveryNotes).slice(0, 500) : null,
+    },
+  });
+
+  // Track order event
+  try {
+    await prisma.storefrontAnalyticsEvent.create({
+      data: {
+        businessProfileId,
+        eventType: 'order_placed',
+        visitorId: `user_${userId}`,
+        metadata: { orderId: order.id, productId, quantity: qty, amount },
+      },
+    });
+  } catch (_) { /* analytics is best-effort */ }
+
+  res.status(201).json({ success: true, data: { order } });
+}));
+
 module.exports = router;
