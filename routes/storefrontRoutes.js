@@ -53,6 +53,134 @@ router.get('/templates', wrap(async (req, res) => {
 }));
 
 // GET /api/storefront/:businessProfileId/render — public render endpoint (cached)
+
+// GET /api/storefront/discover — browse businesses with published storefronts
+// Public endpoint. Supports search, category filter, pagination.
+router.get('/discover', wrap(async (req, res) => {
+  const prisma = req.app.get('prisma');
+  const { q, category, limit = 20, offset = 0 } = req.query;
+  const take = Math.min(Math.max(parseInt(limit, 10) || 20, 1), 50);
+  const skip = Math.max(parseInt(offset, 10) || 0, 0);
+
+  // Find businesses that have a PUBLISHED storefront layout and are not suspended
+  const where = {
+    status: 'PUBLISHED',
+    businessProfile: {
+      isSuspended: false,
+      isPausedByOwner: false,
+      ...(category ? { businessProfile: { category } } : {}),
+    },
+  };
+
+  // If search query provided, filter by business name (case-insensitive)
+  if (q && q.trim()) {
+    where.businessProfile = {
+      ...where.businessProfile,
+      businessName: { contains: q.trim(), mode: 'insensitive' },
+    };
+  }
+
+  const [layouts, total] = await Promise.all([
+    prisma.businessStorefrontLayout.findMany({
+      where,
+      include: {
+        businessProfile: {
+          select: {
+            id: true,
+            bizId: true,
+            businessName: true,
+            category: true,
+            logoUrl: true,
+            coverPhotoUrl: true,
+            averageRating: true,
+            reviewCount: true,
+            description: true,
+            address: true,
+            phoneNumber: true,
+          },
+        },
+        theme: { select: { key: true, name: true, tokenSet: true } },
+      },
+      orderBy: { publishedAt: 'desc' },
+      take,
+      skip,
+    }),
+    prisma.businessStorefrontLayout.count({ where }),
+  ]);
+
+  const results = layouts.map(l => ({
+    businessProfileId: l.businessProfileId,
+    business: l.businessProfile,
+    theme: { key: l.theme.key, name: l.theme.name, accent: l.theme.tokenSet?.accent || '#6C4FD1' },
+    publishedAt: l.publishedAt,
+    tileCount: l.layoutJson?.tiles?.length || 0,
+  }));
+
+  res.json({ success: true, data: { results, total, hasMore: skip + take < total } });
+}));
+
+// GET /api/storefront/:businessProfileId/products — public product listing for storefront ordering
+router.get('/:businessProfileId/products', wrap(async (req, res) => {
+  const prisma = req.app.get('prisma');
+  const { businessProfileId } = req.params;
+  const { category, limit = 50 } = req.query;
+  const take = Math.min(Math.max(parseInt(limit, 10) || 50, 1), 100);
+
+  // Verify the business exists and has a published storefront
+  const [business, hasStorefront] = await Promise.all([
+    prisma.businessProfile.findUnique({
+      where: { id: businessProfileId },
+      select: { id: true, businessName: true, isSuspended: true, isPausedByOwner: true, category: true },
+    }),
+    prisma.businessStorefrontLayout.findUnique({
+      where: { businessProfileId_status: { businessProfileId, status: 'PUBLISHED' } },
+      select: { id: true },
+    }),
+  ]);
+
+  if (!business || business.isSuspended) {
+    return res.status(404).json({ success: false, message: 'Business not found.' });
+  }
+
+  // Return active products even if no published storefront (for ordering)
+  const products = await prisma.businessProduct.findMany({
+    where: {
+      businessProfileId,
+      isActive: true,
+      isAvailable: true,
+      ...(category ? { category } : {}),
+    },
+    select: {
+      id: true,
+      name: true,
+      description: true,
+      priceUsdc: true,
+      imageUrls: true,
+      category: true,
+      tags: true,
+      preparationMins: true,
+      variants: true,
+      modifierGroups: true,
+      slug: true,
+    },
+    orderBy: [{ catalogSectionId: 'asc' }, { name: 'asc' }],
+    take,
+  });
+
+  res.json({
+    success: true,
+    data: {
+      business: { id: business.id, name: business.businessName, category: business.category },
+      hasStorefront: !!hasStorefront,
+      products: products.map(p => ({
+        ...p,
+        priceUsdc: Number(p.priceUsdc),
+        imageUrls: p.imageUrls || [],
+      })),
+    },
+  });
+}));
+
 router.get('/:businessProfileId/render', wrap(async (req, res) => {
   const prisma = req.app.get('prisma');
   const rendered = await renderService.renderStorefront(prisma, req.params.businessProfileId);
