@@ -639,6 +639,17 @@ const NITRO_THRESHOLDS = {
 
 // Widget type → minimum tier required
 const PREMIUM_WIDGETS = {
+  // NITRO_BRONZE
+  video_player:      'NITRO_BRONZE',
+  promo_banner:      'NITRO_BRONZE',
+  social_feed:       'NITRO_BRONZE',
+  // NITRO_SILVER
+  live_stats:        'NITRO_SILVER',
+  animated_counter:  'NITRO_SILVER',
+  // NITRO_GOLD
+  custom_html:       'NITRO_GOLD',
+  gradient_hero:     'NITRO_GOLD',
+  // Legacy aliases (backward-compat with older layouts)
   video_header:      'NITRO_BRONZE',
   announcement_bar:  'NITRO_BRONZE',
   social_proof:      'NITRO_BRONZE',
@@ -752,13 +763,22 @@ function downgradePremiumWidgets(layoutJson) {
 
   const downgraded = [];
   const FREE_REPLACEMENTS = {
+    // Canonical (Flutter) names
+    video_player: 'hero_header',
+    promo_banner: 'hero_header',
+    social_feed: 'review_carousel',
+    live_stats: 'quick_info_bar',
+    animated_counter: 'product_grid',
+    custom_html: 'contact_card',
+    gradient_hero: 'hero_header',
+    // Legacy aliases
     video_header: 'hero_header',
     announcement_bar: 'hero_header',
-    social_proof: 'reviews_carousel',
+    social_proof: 'review_carousel',
     live_rate_ticker: 'quick_info_bar',
-    glass_card: 'business_info',
-    custom_embed: 'business_info',
-    loyalty_program: 'business_info',
+    glass_card: 'product_grid',
+    custom_embed: 'contact_card',
+    loyalty_program: 'hero_header',
   };
 
   const newTiles = layoutJson.tiles.map((tile) => {

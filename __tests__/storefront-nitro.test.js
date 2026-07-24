@@ -20,9 +20,9 @@ describe('Storefront Nitro Tier Logic', () => {
 
   function getAvailableWidgets(tier) {
     const base = ['hero_header', 'category_grid', 'product_list', 'business_info', 'hours_card', 'contact_card', 'photo_gallery', 'reviews_carousel'];
-    const bronzeExtras = ['video_header', 'announcement_bar', 'social_proof'];
-    const silverExtras = ['live_rate_ticker', 'glass_card'];
-    const goldExtras = ['custom_embed', 'loyalty_program'];
+    const bronzeExtras = ['video_player', 'promo_banner', 'social_feed'];
+    const silverExtras = ['live_stats', 'animated_counter'];
+    const goldExtras = ['custom_html', 'gradient_hero'];
 
     switch (tier) {
       case 'NITRO_GOLD': return [...base, ...bronzeExtras, ...silverExtras, ...goldExtras];
@@ -69,9 +69,9 @@ describe('Storefront Nitro Tier Logic', () => {
   }
 
   function _getRequiredTier(category, key) {
-    const bronzeWidgets = ['video_header', 'announcement_bar', 'social_proof'];
-    const silverWidgets = ['live_rate_ticker', 'glass_card'];
-    const goldWidgets = ['custom_embed', 'loyalty_program'];
+    const bronzeWidgets = ['video_player', 'promo_banner', 'social_feed'];
+    const silverWidgets = ['live_stats', 'animated_counter'];
+    const goldWidgets = ['custom_html', 'gradient_hero'];
     const bronzeThemes = ['ember', 'forest'];
     const silverThemes = ['neon', 'glass'];
     const goldThemes = ['royal'];
@@ -132,20 +132,20 @@ describe('Storefront Nitro Tier Logic', () => {
   });
 
   test('FREE tier cannot use premium widgets', () => {
-    const layout = { widgets: [{ type: 'video_header' }], themeKey: 'aurora' };
+    const layout = { widgets: [{ type: 'video_player' }], themeKey: 'aurora' };
     const result = validateNitroEligibility(layout, 'FREE');
     expect(result.eligible).toBe(false);
     expect(result.violations).toHaveLength(1);
-    expect(result.violations[0].key).toBe('video_header');
+    expect(result.violations[0].key).toBe('video_player');
     expect(result.violations[0].requiredTier).toBe('NITRO_BRONZE');
   });
 
   test('BRONZE tier can use video_header but not glass_card', () => {
-    const layout = { widgets: [{ type: 'video_header' }, { type: 'glass_card' }] };
+    const layout = { widgets: [{ type: 'video_player' }, { type: 'animated_counter' }] };
     const result = validateNitroEligibility(layout, 'NITRO_BRONZE');
     expect(result.eligible).toBe(false);
     expect(result.violations).toHaveLength(1);
-    expect(result.violations[0].key).toBe('glass_card');
+    expect(result.violations[0].key).toBe('animated_counter');
     expect(result.violations[0].requiredTier).toBe('NITRO_SILVER');
   });
 
@@ -153,10 +153,10 @@ describe('Storefront Nitro Tier Logic', () => {
     const layout = {
       widgets: [
         { type: 'hero_header' },
-        { type: 'video_header' },
-        { type: 'glass_card' },
-        { type: 'loyalty_program' },
-        { type: 'custom_embed' },
+        { type: 'video_player' },
+        { type: 'animated_counter' },
+        { type: 'gradient_hero' },
+        { type: 'custom_html' },
       ],
       themeKey: 'royal',
     };
