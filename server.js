@@ -38,18 +38,18 @@ require('dotenv').config();
 // ── Startup Validation ───────────────────────────────────────────────────────
 // CRITICAL-2: Fail fast if essential env vars are missing
 if (!process.env.JWT_SECRET) {
-    console.error('FATAL: JWT_SECRET is not set. Server cannot start.');
+    logger.fatal('JWT_SECRET is not set. Server cannot start.');
     process.exit(1);
 }
 // A short secret is brute-forceable and silently weakens every token. Enforce
 // at least 32 chars (256 bits) so a misconfigured deploy fails loudly at boot
 // instead of running with weak auth.
 if (process.env.JWT_SECRET.length < 32) {
-    console.error('FATAL: JWT_SECRET must be at least 32 characters (256 bits). Server cannot start.');
+    logger.fatal('JWT_SECRET must be at least 32 characters (256 bits). Server cannot start.');
     process.exit(1);
 }
 if (!process.env.DATABASE_URL) {
-    console.error('FATAL: DATABASE_URL is not set. Server cannot start.');
+    logger.fatal('DATABASE_URL is not set. Server cannot start.');
     process.exit(1);
 }
 
@@ -101,7 +101,7 @@ const pool = new Pool({
 });
 
 pool.on('error', (err) => {
-    console.error('Unexpected error on idle client', err.message);
+    logger.error({ err }, 'Unexpected error on idle client');
 });
 
 const adapter = new PrismaPg(pool);
@@ -111,9 +111,9 @@ const prisma = new PrismaClient({ adapter });
 (async () => {
     try {
         await prisma.$connect();
-        console.log('[DB] Prisma connected successfully');
+        logger.info('Prisma connected successfully');
     } catch (error) {
-        console.error('[DB] Failed to connect:', error.message);
+        logger.error({ err: error }, 'Database connection failed');
         process.exit(1);
     }
 })();
@@ -155,7 +155,7 @@ const moolreCollectionService = new MoolreCollectionService();
 // MOOLRE_WEBHOOK_SECRET is unset, so warn loudly at boot to make the disabled
 // endpoint obvious instead of silently rejecting every callback in production.
 if (!process.env.MOOLRE_WEBHOOK_SECRET) {
-    console.warn('[STARTUP] MOOLRE_WEBHOOK_SECRET is not set — webhook endpoint is disabled.');
+    logger.warn('MOOLRE_WEBHOOK_SECRET is not set — webhook endpoint is disabled');
 }
 
 // ── FALLBACK: MTN MoMo (kept intact — uncomment to revert) ────────────────────
@@ -340,9 +340,9 @@ app.use(cors({
 
 // Surface the CORS posture at boot so misconfigured deploys are obvious.
 if (IS_PRODUCTION) {
-    console.log(`CORS locked to: [${corsOrigins.join(', ')}]`);
+    logger.info({ origins: corsOrigins }, 'CORS locked');
 } else {
-    console.log('CORS open (development mode)');
+    logger.info('CORS open (development mode)');
 }
 
 // C-10: Force HTTPS in production (Render provides HTTPS proxy)
@@ -364,7 +364,7 @@ app.use(express.json({
 // Request logging (only in non-production or when LOG_REQUESTS=true)
 if (!IS_PRODUCTION || process.env.LOG_REQUESTS === 'true') {
     app.use((req, res, next) => {
-        console.log(`[${req.method}] ${req.url}`);
+        logger.debug({ method: req.method, url: req.url }, 'Request');
         next();
     });
 }
@@ -515,26 +515,24 @@ if (process.env.REDIS_URL) {
         pubClient.on('connect', () => { redisStatus = 'connected'; });
         pubClient.on('error', (e) => {
             redisStatus = 'disconnected';
-            console.error('[Redis] adapter error:', e.message);
+            logger.error({ err: e }, 'Redis adapter error');
         });
         io.adapter(createAdapter(pubClient, subClient));
-        console.log('Socket.IO Redis adapter enabled (multi-instance mode).');
+        logger.info('Socket.IO Redis adapter enabled (multi-instance mode)');
     } catch (e) {
         // Don't take the whole server down over a missing optional dep or a
         // bad URL — fall back to the in-memory adapter (single-instance only).
         redisStatus = 'disconnected';
-        console.error('[Redis] adapter init failed; using in-memory adapter:', e.message);
+        logger.error({ err: e }, 'Redis adapter init failed, using in-memory adapter');
     }
 } else {
-    console.log('REDIS_URL not set — Socket.IO using in-memory adapter (single instance).');
+    logger.info('REDIS_URL not set — Socket.IO using in-memory adapter (single instance)');
 }
 
 // ── STARTUP: warn if Cloudinary not configured (profile pics will use local disk) ──
 if (process.env.NODE_ENV === 'production' &&
     !(process.env.CLOUDINARY_CLOUD_NAME && process.env.CLOUDINARY_API_KEY && process.env.CLOUDINARY_API_SECRET)) {
-    console.warn('⚠️  [STARTUP] CLOUDINARY credentials not set. Profile pictures & media uploads');
-    console.warn('   will be saved to EPHEMERAL local disk — files will be lost on every redeploy.');
-    console.warn('   Set CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET in Render.');
+    logger.warn('CLOUDINARY credentials not set. Profile pictures & media uploads will be saved to EPHEMERAL local disk — files lost on redeploy. Set CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET.');
 }
 
 // CRITICAL-4: Socket.IO JWT Authentication Middleware
@@ -642,7 +640,7 @@ const { autoRelease } = require('./infra/autoRelease');
                 const { execSync } = require('child_process');
                 execSync('node infra/install-business-os-overlay.js', { stdio: 'inherit', timeout: 30000 });
             } catch (e) {
-                console.warn('[business-os-overlay] boot-time install skipped:', e.message);
+                logger.warn({ err: e }, 'business-os-overlay: boot-time install skipped');
             }
         }
 
@@ -651,30 +649,25 @@ const { autoRelease } = require('./infra/autoRelease');
         const id = await cacheTreasury();
 
         if (id) {
-            console.log(`[Susu] Treasury wallet cached (userId=${id})`);
+            logger.info({ userId: id }, 'Susu: treasury wallet cached');
         } else {
-            console.warn(
-                '[Susu] WARNING: azaman-treasury User row not found after ' +
-                'auto-release. Susu escrow/cycle features are DISABLED until ' +
-                'it is seeded. The rest of the backend is unaffected. ' +
-                'Retrying every 60s…'
-            );
+            logger.warn('Susu: azaman-treasury User row not found after auto-release. Susu escrow/cycle features are DISABLED until it is seeded. Retrying every 60s.');
             const retry = setInterval(async () => {
                 try {
                     const rid = await cacheTreasury();
                     if (rid) {
-                        console.log(`[Susu] Treasury wallet cached on retry (userId=${rid}).`);
+                        logger.info({ userId: rid }, 'Susu: treasury wallet cached on retry');
                         clearInterval(retry);
                     }
                 } catch (e) {
-                    console.warn('[Susu] treasury retry failed:', e.message);
+                    logger.warn({ err: e }, 'Susu: treasury retry failed');
                 }
             }, 60_000);
             retry.unref?.();
         }
     } catch (err) {
         // Non-fatal: log and continue. Susu stays dark; everything else runs.
-        console.warn('[Susu] WARNING: failed to cache treasury wallet id (non-fatal):', err.message);
+        logger.warn({ err }, 'Susu: treasury wallet cache failed (non-fatal)');
     }
 })();
 
@@ -702,7 +695,7 @@ const kycService = KYC_LIVE
     ? new DojahKYCService(prisma, notificationService)
     : new KYCService(prisma, notificationService);
 app.set('kycService', kycService);
-console.log(`🪪  [KYC] Provider = ${KYC_LIVE ? 'DOJAH (live)' : 'MOCK'}`);
+logger.info({ provider: KYC_LIVE ? 'DOJAH (live)' : 'MOCK' }, 'KYC provider');
 
 // --- RATE ALERT SERVICE (Phase Q12) ---
 // Singleton: manages user rate alerts (CRUD + threshold checking on oracle sync).
@@ -927,9 +920,7 @@ if (process.env.NODE_ENV !== 'test') {
         }
         const treasuryUserId = app.get('azamanTreasuryUserId');
         if (!treasuryUserId) {
-            console.warn('[SusuV2 Workers] treasury cache not resolved within 30 min; ' +
-                'cycle/reminder/PoR workers NOT started. Seed the treasury row and ' +
-                'restart the service to enable them. (Rest of backend unaffected.)');
+            logger.warn('SusuV2 Workers: treasury cache not resolved within 30 min. Cycle/reminder/PoR workers NOT started. Seed the treasury row and restart the service. Rest of backend unaffected.');
             return;
         }
         const susuCycleService = new SusuCycleService(prisma, {
@@ -954,7 +945,7 @@ if (process.env.NODE_ENV !== 'test') {
         porExpirySweep.start();
         app.set('porExpirySweep', porExpirySweep);
     };
-    startV2Workers().catch(err => console.error('[SusuV2 Workers] startup error:', err.message));
+    startV2Workers().catch(err => logger.error({ err }, 'SusuV2 workers startup error'));
 }
 
 const SmartRouteWorker = require('./workers/smartRouteWorker');
@@ -981,11 +972,11 @@ if (process.env.NODE_ENV !== 'test') {
     // Run every hour
     cron.schedule('0 * * * *', async () => {
         try {
-            console.log('[NoShowWorker] Running scheduled sweep...');
+            logger.info('NoShowWorker: running scheduled sweep');
             const results = await noShowWorker.sweepAll(prisma);
-            console.log('[NoShowWorker] Sweep complete:', JSON.stringify(results));
+            logger.info({ results }, 'NoShowWorker: sweep complete');
         } catch (err) {
-            console.error('[NoShowWorker] Sweep failed:', err.message);
+            logger.error({ err }, 'NoShowWorker: sweep failed');
         }
     });
 }
@@ -1009,9 +1000,9 @@ if (process.env.NODE_ENV !== 'test') {
     cron.schedule('*/2 * * * *', async () => {
         try {
             const count = await webhookDispatcher.processRetryQueue();
-            if (count > 0) console.log(`[WebhookRetry] Processed ${count} stuck deliveries.`);
+            if (count > 0) logger.info({ count }, 'WebhookRetry: processed stuck deliveries');
         } catch (e) {
-            console.warn('[WebhookRetry] Error:', e.message);
+            logger.warn({ err: e }, 'WebhookRetry error');
         }
     });
 }
@@ -1058,7 +1049,7 @@ const pushIfOffline = async (userId, title, body, extra = {}) => {
 
         await sendPushNotification(user.fcmToken, title, body, extra);
     } catch (err) {
-        console.error('pushIfOffline error:', err.message);
+        logger.error({ err }, 'pushIfOffline error');
     }
 };
 
@@ -1085,7 +1076,7 @@ const emitBalanceUpdate = async (userId) => {
             });
         }
     } catch (err) {
-        console.error("Balance Emit Error:", err.message);
+        logger.error({ err }, "Balance emit error");
     }
 };
 
@@ -1134,7 +1125,7 @@ app.set('storyService', storyService);
 
 // Stories expiration cron
 cron.schedule('*/15 * * * *', () => {
-    app.get('storyService').expireOldStories().catch(err => console.error('[StoryCron]', err));
+    app.get('storyService').expireOldStories().catch(err => logger.error({ err }, 'StoryCron error'));
 });
 
 // The KYC service runs webhook processing outside the request lifecycle (no
@@ -1350,7 +1341,7 @@ app.post('/api/chat/upload/image', protectChatUpload, chatImageUpload.single('fi
             filename: req.file.originalname
         });
     } catch (err) {
-        console.error('chat image upload error:', err.message);
+        logger.error({ err, mediaType: 'image' }, 'Chat media upload error');
         res.status(500).json({ success: false, message: 'Upload failed' });
     }
 });
@@ -1381,7 +1372,7 @@ app.post('/api/chat/upload/audio', protectChatUpload, chatAudioUpload.single('fi
             waveformPeaks
         });
     } catch (err) {
-        console.error('chat audio upload error:', err.message);
+        logger.error({ err, mediaType: 'audio' }, 'Chat media upload error');
         res.status(500).json({ success: false, message: 'Upload failed' });
     }
 });
@@ -1400,7 +1391,7 @@ app.post('/api/chat/upload/video', protectChatUpload, chatVideoUpload.single('fi
             duration: Number.isFinite(duration) ? duration : null
         });
     } catch (err) {
-        console.error('chat video upload error:', err.message);
+        logger.error({ err, mediaType: 'video' }, 'Chat media upload error');
         res.status(500).json({ success: false, message: 'Upload failed' });
     }
 });
@@ -1418,7 +1409,7 @@ app.post('/api/chat/upload/document', protectChatUpload, chatDocumentUpload.sing
             filename: req.file.originalname
         });
     } catch (err) {
-        console.error('chat document upload error:', err.message);
+        logger.error({ err, mediaType: 'document' }, 'Chat media upload error');
         res.status(500).json({ success: false, message: 'Upload failed' });
     }
 });
@@ -1451,7 +1442,7 @@ app.post('/api/business/upload/image', protectBizUpload, chatImageUpload.single(
             filename: req.file.originalname
         });
     } catch (err) {
-        console.error('business image upload error:', err.message);
+        logger.error({ err }, 'Business image upload error');
         res.status(500).json({ success: false, message: 'Upload failed' });
     }
 });
@@ -1469,7 +1460,7 @@ app.post('/api/chat/link-preview', protectChatUpload, async (req, res) => {
         if (!preview) return res.status(400).json({ success: false, message: 'invalid url' });
         return res.status(200).json({ success: true, preview });
     } catch (err) {
-        console.error('link-preview error:', err.message);
+        logger.error({ err }, 'Link preview error');
         return res.status(500).json({ success: false, message: 'preview failed' });
     }
 });
@@ -1489,7 +1480,7 @@ app.post('/api/chat/upload-media', chatMediaUpload.any(), async (req, res) => {
         const mediaUrl = await _uploadChatMediaUrl(file, 'image');
         res.status(200).json({ mediaUrl, path: mediaUrl, url: mediaUrl });
     } catch (err) {
-        console.error('Chat media upload error:', err.message);
+        logger.error({ err }, 'Chat media upload error');
         res.status(500).json({ error: 'Upload failed' });
     }
 });
@@ -1533,10 +1524,10 @@ app.post('/api/vendor/upload-docs', protectUpload, vendorDocsUpload.fields([
             }
         }
 
-        console.log(`✅ [Vendor] Documents uploaded by user ${req.user.id}:`, Object.keys(urls));
+        logger.info({ userId: req.user.id, keys: Object.keys(urls) }, 'Vendor: documents uploaded');
         return res.status(200).json({ success: true, urls });
     } catch (err) {
-        console.error('Vendor docs upload error:', err.message);
+        logger.error({ err }, 'Vendor docs upload error');
         return res.status(500).json({ success: false, message: 'Upload failed' });
     }
 });
@@ -1557,7 +1548,7 @@ io.on('connection', (socket) => {
 
     // Emit current balance immediately on connection
     emitBalanceUpdate(userId).catch(err => {
-        console.error('[socket.connect] initial balance emit error:', err.message);
+        logger.error({ err }, 'Socket connect: initial balance emit error');
     });
 
     // ── B-7: Online / Offline / Last-Seen tracking ────────────────────────────
@@ -1689,7 +1680,7 @@ io.on('connection', (socket) => {
                 readAt: new Date().toISOString()
             });
         } catch (err) {
-            console.error("mark_messages_read error:", err.message);
+            logger.error({ err }, "mark_messages_read error");
         }
     });
 
@@ -1762,7 +1753,7 @@ io.on('connection', (socket) => {
                 { type: 'TRADE_UPDATE', tradeId: tradeId }
             );
         } catch (e) {
-            console.error("vendor_accept Error:", e.message);
+            logger.error({ err: e }, "vendor_accept error");
         }
     });
 
@@ -1804,9 +1795,9 @@ if (process.env.SENTRY_DSN) {
 
 // HIGH-4: Global error handler — sanitize in production
 app.use((err, req, res, next) => {
-    console.error('SERVER ERROR:', err.message);
+    logger.error({ err }, 'Server error');
     if (!IS_PRODUCTION) {
-        console.error(err.stack);
+        logger.error({ err }, err.stack);
     }
 
     // Multer file size error
@@ -1847,7 +1838,7 @@ const PORT = process.env.PORT || 3000;
 // which also avoids EADDRINUSE and leaving a live listener after the suite ends.
 if (!IS_TEST_ENV) {
     server.listen(PORT, '0.0.0.0', () => {
-        console.log(`AZAMAN BACKEND LIVE ON PORT ${PORT} [${IS_PRODUCTION ? 'PRODUCTION' : 'DEVELOPMENT'}]`);
+        logger.info({ port: PORT, env: IS_PRODUCTION ? 'production' : 'development' }, 'Azaman backend live');
         tradeWorker.start();
         workerStatus.tradeWorker = 'running';
     });
@@ -1855,11 +1846,11 @@ if (!IS_TEST_ENV) {
 
 // Graceful shutdown handler
 const shutdown = async (signal) => {
-    console.log(`\n${signal} received. Shutting down gracefully...`);
+    logger.info({ signal }, 'Shutdown signal received');
 
     // Stop accepting new connections
     server.close(() => {
-        console.log('[Shutdown] HTTP server closed.');
+        logger.info('Shutdown: HTTP server closed');
     });
 
     // Stop workers
@@ -1870,23 +1861,23 @@ const shutdown = async (signal) => {
 
     // Close socket connections
     io.close(() => {
-        console.log('[Shutdown] Socket.IO closed.');
+        logger.info('Shutdown: Socket.IO closed');
     });
 
     // Disconnect Prisma
     try {
         await prisma.$disconnect();
-        console.log('[Shutdown] Database disconnected.');
+        logger.info('Shutdown: database disconnected');
     } catch (err) {
-        console.error('[Shutdown] Prisma disconnect error:', err.message);
+        logger.error({ err }, 'Shutdown: Prisma disconnect error');
     }
 
     // Close PG pool
     try {
         await pool.end();
-        console.log('[Shutdown] PG pool closed.');
+        logger.info('Shutdown: PG pool closed');
     } catch (err) {
-        console.error('[Shutdown] Pool close error:', err.message);
+        logger.error({ err }, 'Shutdown: pool close error');
     }
 
     process.exit(0);
@@ -1897,7 +1888,7 @@ process.on('SIGINT', () => shutdown('SIGINT'));
 
 // Prevent unhandled promise rejections from crashing the process silently
 process.on('unhandledRejection', (reason, promise) => {
-    console.error('[UnhandledRejection]', reason);
+    logger.error({ reason }, 'Unhandled rejection');
 });
 
 // A synchronous throw outside any try/catch lands here. Node's default is to
@@ -1905,7 +1896,7 @@ process.on('unhandledRejection', (reason, promise) => {
 // never silent, then exit non-zero so the process manager (PM2/Render) restarts
 // us into a known-good state rather than limping on in an undefined one.
 process.on('uncaughtException', (err) => {
-    console.error('[UncaughtException]', err && err.message);
-    if (err && err.stack) console.error(err.stack);
+    logger.error({ err }, 'Uncaught exception');
+    if (err && err.stack) logger.error({ err }, err.stack);
     process.exit(1);
 });
