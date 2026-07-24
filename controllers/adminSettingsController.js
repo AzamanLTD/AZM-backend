@@ -8,6 +8,7 @@
 // GET  /api/admin/audit-log      — Fetch settings change history
 //
 // Every mutation writes an AdminSettingsAuditLog row for full traceability.
+const logger = require('../src/config/logger');
 // Changes apply IMMEDIATELY to the next transaction — no caching.
 // =============================================================================
 

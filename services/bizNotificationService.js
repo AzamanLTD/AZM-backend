@@ -8,6 +8,7 @@
 //
 // Writes are ALWAYS fire-and-forget from the caller's perspective: a failed
 // notification must never roll back a financial transaction or fail an HTTP
+const logger = require('../src/config/logger');
 // request. createNotification therefore swallows its own errors (logs + returns
 // null) so callers can `await` it without a try/catch of their own.
 //

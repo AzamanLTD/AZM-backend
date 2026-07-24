@@ -1,3 +1,4 @@
+const logger = require('../src/config/logger');
 // controllers/profileController.js
 // =============================================================================
 // AZAMAN V4 — PROFILE CONTROLLER
@@ -576,7 +577,6 @@ exports.getDashboard = async (req, res) => {
 // =============================================================================
 exports.uploadAvatar = async (req, res) => {
     const prisma = req.app.get('prisma');
-    const logger = require('../src/config/logger');
     const { uploadToCloudinary } = require('../services/cloudinaryService');
 
     if (!req.file) {

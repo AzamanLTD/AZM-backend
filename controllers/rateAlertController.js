@@ -8,6 +8,7 @@
 //   DELETE /api/oracle/alerts/:id      — Delete/deactivate an alert
 //
 // All require authentication.
+const logger = require('../src/config/logger');
 // =============================================================================
 
 // 1. CREATE RATE ALERT

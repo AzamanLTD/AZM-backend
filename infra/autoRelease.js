@@ -1,3 +1,4 @@
+const logger = require('../src/config/logger');
 // infra/autoRelease.js
 // =============================================================================
 // Boot-time, idempotent "release" step for free-tier hosting (Render free
@@ -73,7 +74,6 @@ async function autoRelease(prisma, opts = {}) {
     // in prod. It's cheap (all statements no-op once applied) and never
     // drops or alters existing objects.
     try {
-      const logger = require('../src/config/logger');
       const { installSusuOverlay } = require('./install-susu-overlay');
       const r = await installSusuOverlay(prisma);
       releaseStatus.installerResult = { ok: r.ok, failed: r.failed };

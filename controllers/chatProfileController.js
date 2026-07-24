@@ -8,6 +8,7 @@
 //   • GET   /api/friends/:friendshipId/profile           — identity tier + my nickname
 //   • PATCH /api/friends/:friendshipId/nickname          — set/clear my nickname for the friend
 //   • GET   /api/friends/:friendshipId/media             — paginated images + videos (vault tab 1)
+const logger = require('../src/config/logger');
 //   • GET   /api/friends/:friendshipId/docs-links        — paginated documents + link previews (vault tab 2)
 //   • GET   /api/friends/:friendshipId/receipts          — paginated immutable P2P transfer receipts (vault tab 4)
 //

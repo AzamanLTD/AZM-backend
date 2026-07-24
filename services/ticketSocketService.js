@@ -8,6 +8,7 @@
 // Room naming contract:
 //   Ticket workspace room: ticket_${ticketId}
 //   User inbox:            user_${userId}  (shared with the rest of the app)
+const logger = require('../src/config/logger');
 //
 // Handled events:
 //   • join_ticket            — join a ticket workspace room

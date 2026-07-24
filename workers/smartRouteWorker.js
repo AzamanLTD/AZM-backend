@@ -6,6 +6,7 @@
 // smartRouteService.runOnce(...) for each, which handles balance
 // deduction, action dispatch, and nextRunAt advancement.
 // =============================================================================
+const logger = require('../src/config/logger');
 
 class SmartRouteWorker {
     constructor(prisma, smartRouteService) {

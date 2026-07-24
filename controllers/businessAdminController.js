@@ -8,6 +8,7 @@
 //
 //   GET  /api/admin/businesses                     paginated list (+ filters)
 //   POST /api/admin/businesses/:bizId/suspend      body: { reason }
+const logger = require('../src/config/logger');
 //   POST /api/admin/businesses/:bizId/unsuspend
 //
 // :bizId is the public BIZ-XXXXXXXXX identifier (BusinessProfile.bizId), not the

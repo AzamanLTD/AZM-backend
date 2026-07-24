@@ -8,6 +8,7 @@
 //
 // Registration in server.js:
 //   const { sweepTransitReminders } = require('./workers/transitReminderWorker');
+const logger = require('../src/config/logger');
 //   cron.schedule('*/15 * * * *', () => sweepTransitReminders(prisma));
 // =============================================================================
 

@@ -4,6 +4,7 @@
 // Mathematically proves: Sum(In) - Sum(Out) == user.availableBalance
 // Any inconsistency throws a hard error and freezes the calling transaction.
 // =============================================================================
+const logger = require('../src/config/logger');
 
 const TOLERANCE = 0.000001; // Floating-point epsilon for USDC comparisons
 

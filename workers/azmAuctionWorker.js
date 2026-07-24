@@ -8,6 +8,7 @@
 //   2. Settle any OPEN auctions whose windowEnd has passed.
 //
 // Tick interval: 1 minute. Settlement burns winners' AZM, flips
+const logger = require('../src/config/logger');
 // Ad.isBoosted, writes leaderboard, fires socket "auction:settled".
 // =============================================================================
 

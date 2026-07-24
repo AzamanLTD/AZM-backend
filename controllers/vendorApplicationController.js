@@ -8,6 +8,7 @@
 //   GET  /api/vendor/applications       — Admin: list all pending applications
 //   POST /api/vendor/applications/:id/review — Admin: approve/reject
 // =============================================================================
+const logger = require('../src/config/logger');
 
 /**
  * POST /api/vendor/apply

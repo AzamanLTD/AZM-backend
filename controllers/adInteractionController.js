@@ -8,6 +8,7 @@
 //   TRADE_INITIATED — user clicked "Start Trade" from the ad detail view
 //   CLOSED          — user swiped away / dismissed the ad without trading
 //
+const logger = require('../src/config/logger');
 // Endpoints:
 //   POST /api/ads/:id/interaction       — log a single interaction
 //   GET  /api/ads/:id/analytics         — vendor: get analytics for one ad

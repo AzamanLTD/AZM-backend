@@ -8,6 +8,7 @@
 //   3. System auto-executes escrow release based on ruling
 //   4. Both parties notified, stats updated
 //
+const logger = require('../src/config/logger');
 // Escrow math:
 //   - BUYER_WINS: full disputeEscrowBalance → buyer's availableBalance
 //   - VENDOR_WINS: full disputeEscrowBalance → vendor's availableBalance

@@ -8,6 +8,7 @@
 //      Scans Vault.autoRuleEnabled = true AND autoRuleNextRun <= now.
 //      Calls vaultService.runAutoRule(vault). When the call returns
 //      `{ ok: false, status: 'INSUFFICIENT' }`, we check the user's
+const logger = require('../src/config/logger');
 //      idle availableBalance: if it's >= the shortfall we fire the
 //      Duolingo-style "streak at risk" push so the user can move idle
 //      funds before the streak resets.

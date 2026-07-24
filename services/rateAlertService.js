@@ -8,6 +8,7 @@
 //
 // Usage:
 //   const rateAlertService = new RateAlertService(prisma, notificationService);
+const logger = require('../src/config/logger');
 //   await rateAlertService.checkAlerts(currentRate, 'USD_GHS');
 //
 // Called from oracleService.fetchAndUpdateRates() after each successful sync.

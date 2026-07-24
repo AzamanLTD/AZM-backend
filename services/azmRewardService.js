@@ -8,6 +8,7 @@
 //   2. AzmRewardLog audit row (transparent history for the user)
 //   3. Socket emission so the FE updates in real-time
 //   4. Optional notification for milestone rewards
+const logger = require('../src/config/logger');
 //
 // EARN SOURCES & RATES:
 //   TRADE_COMPLETE     → 5.0 AZM per completed trade (buyer receives)

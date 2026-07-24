@@ -2,6 +2,7 @@
 // =============================================================================
 // AZAMAN — SMART ROUTE CONTROLLER  (Master Sprint, 2026-05-27)
 // =============================================================================
+const logger = require('../src/config/logger');
 
 const wrap = (fn) => async (req, res) => {
     try { await fn(req, res); }

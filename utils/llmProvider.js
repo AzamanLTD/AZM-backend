@@ -1,3 +1,4 @@
+const logger = require('../src/config/logger');
 const generateText = async (prompt) => {
     const apiKey = process.env.OPENAI_API_KEY || process.env.LLM_API_KEY;
 

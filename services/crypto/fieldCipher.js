@@ -28,9 +28,9 @@
 //   node -e "logger.info(require('crypto').randomBytes(32).toString('hex'))"
 // =============================================================================
 
-const logger = require('../../src/config/logger');
 const crypto = require('crypto');
 
+const logger = require('../../src/config/logger');
 const PREFIX = 'enc:v1:';
 const ALGO = 'aes-256-gcm';
 const IV_BYTES = 12; // GCM standard nonce length

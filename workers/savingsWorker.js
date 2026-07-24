@@ -12,6 +12,8 @@
 // without a deposit.
 // =============================================================================
 
+const logger = require('../src/config/logger');
+
 class SavingsWorker {
     constructor(prisma, io) {
         this.prisma = prisma;
@@ -110,7 +112,6 @@ class SavingsWorker {
             if (existing) return; // Already sent today
 
             // Phase N2: route through notificationService for DB + socket + FCM
-            const logger = require('../src/config/logger');
             const NotificationService = require('../services/notificationService');
             const notifSvc = new NotificationService(this.prisma, this.io);
             await notifSvc.sendNotification({

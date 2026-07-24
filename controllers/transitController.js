@@ -1,3 +1,4 @@
+const logger = require('../src/config/logger');
 // controllers/transitController.js
 // =============================================================================
 // AZAMAN — TRANSIT BOOKING CONTROLLER (B-11, 2026-06-28)
@@ -254,7 +255,6 @@ exports.updateBookingStatus = async (req, res) => {
 // GET /api/transit/bookings/:id/checkin-qr
 exports.generateTransitCheckInQR = async (req, res) => {
     const prisma = req.app.get('prisma');
-    const logger = require('../src/config/logger');
     const { qrCheckInService } = require('../services/qrCheckInService') || { qrCheckInService: require('../services/qrCheckInService') };
     try {
         const userId = req.user.id;

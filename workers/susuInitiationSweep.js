@@ -8,6 +8,7 @@
 //     the parent GroupChat and drops their SusuMember row,
 //   • activates the Susu if ≥2 verified members remain (AZM-rank slots +
 //     cycles, via Susu_Service.activateSusuIfReady),
+const logger = require('../src/config/logger');
 //   • otherwise aborts the initiation and unbinds the SusuGroup so the
 //     chat returns to a plain group.
 //

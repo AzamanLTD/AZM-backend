@@ -1,3 +1,5 @@
+const logger = require('../src/config/logger');
+
 const getAiCapabilities = async (req, res) => {
     try {
         const capabilities = [
@@ -44,10 +46,8 @@ const getAiCapabilities = async (req, res) => {
 
 const triggerCfoAnalysis = async (req, res) => {
     try {
-        const logger = require('../src/config/logger');
         const CfoWorker = require('../workers/cfoWorker');
         const prisma = req.app.get('prisma');
-
         const worker = new CfoWorker(prisma);
         const result = await worker.analyzeExpenses();
 

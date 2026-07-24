@@ -8,6 +8,7 @@
 //   - General settings preferences (haptics, sounds, etc.)
 //
 // Endpoints:
+const logger = require('../src/config/logger');
 //   GET  /api/users/preferences            — Get all user preferences
 //   PUT  /api/users/preferences/theme      — Update selected theme
 //   PUT  /api/users/preferences/shortcuts  — Update custom shortcuts

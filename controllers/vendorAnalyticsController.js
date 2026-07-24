@@ -8,6 +8,7 @@
 // Returns aggregated vendor performance data:
 //   - Volume over time (daily buckets)
 //   - Revenue by payment method
+const logger = require('../src/config/logger');
 //   - Average trade completion time
 //   - Dispute rate
 //   - Trade count by status

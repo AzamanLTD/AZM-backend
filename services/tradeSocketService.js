@@ -1,3 +1,4 @@
+const logger = require('../src/config/logger');
 const ADMIN_SPY_ROOM = 'admin_spy_room';
 
 class TradeSocketService {
@@ -52,7 +53,6 @@ class TradeSocketService {
                     data: { expiresAt: newExpires }
                 });
 
-                const logger = require('../src/config/logger');
                 const NotificationService = require('./notificationService');
                 const notifSvc = new NotificationService(this.prisma, this.io);
 

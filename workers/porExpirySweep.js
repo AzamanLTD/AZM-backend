@@ -8,6 +8,7 @@
 // PENDING_VOUCH (Req 14.5) and the parent SusuGroup pushed back to
 // CONFIGURING (Req 2.6). A SUSU notification fires per affected user.
 //
+const logger = require('../src/config/logger');
 // Idempotent: the UPDATE is guarded by status='VERIFIED' so re-runs
 // against already-EXPIRED rows are no-ops.
 // =============================================================================

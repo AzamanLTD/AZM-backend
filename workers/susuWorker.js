@@ -7,6 +7,7 @@
 // payout. Default handler writes voucher trust-score penalties (Voucher
 // Accountability mandate).
 // =============================================================================
+const logger = require('../src/config/logger');
 
 class SusuWorker {
     constructor(prisma, susuService) {

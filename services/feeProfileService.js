@@ -8,6 +8,7 @@
 // context wins. Falls back to system default (priority 0) if none match.
 //
 // Usage:
+const logger = require('../src/config/logger');
 //   const { resolveFeeProfile } = require('./feeProfileService');
 //   const profile = await resolveFeeProfile(prisma, { vendorId, buyerId, amountCrypto });
 //   // profile.platformFeePct, profile.adminSplitPct, profile.vendorSplitPct, profile.exitFeePct

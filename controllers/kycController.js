@@ -8,6 +8,7 @@
 //   POST /api/kyc/admin/override   — Admin manual approve/reject (admin-only)
 
 /**
+const logger = require('../src/config/logger');
  * 1. INITIALIZE KYC SESSION
  * Creates a Dojah verification session and returns the widget URL
  * for the frontend to open in a WebView.

@@ -8,6 +8,7 @@
 // flips PENDING→COLLECTING atomically, processes per-member contributions
 // in independent transactions, applies seizures + Voucher_Slash, fires
 // the Circuit Breaker if needed, and finalizes with payout (or escrow
+const logger = require('../src/config/logger');
 // diversion if the recipient has defaulted).
 //
 // Multi-worker safety: the advisory-lock guard inside processCycle makes

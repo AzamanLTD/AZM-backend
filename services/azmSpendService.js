@@ -8,6 +8,7 @@
 //   2. AzmSpendLog audit row (transparent history for the user)
 //   3. Socket emission so the FE updates in real-time
 //
+const logger = require('../src/config/logger');
 // SPEND ACTIONS:
 //   FEE_DISCOUNT    → Spend AZM to reduce the 2% fiat withdrawal exit fee
 //   AD_BOOST        → Spend AZM for temporary "featured" ad placement (24h)

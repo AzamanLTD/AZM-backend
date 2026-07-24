@@ -8,6 +8,7 @@
  * Resolve which BusinessProfile a write should target.
  * - Normal users: always their own profile (unchanged behavior/security).
  * - ADMIN role only: may pass an explicit `businessProfileId` in the body to
+const logger = require('../src/config/logger');
  *   manage/seed another business's catalogue (oversight/support use, same
  *   trust tier as the existing admin suspend/KYB routes).
  */

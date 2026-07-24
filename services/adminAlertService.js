@@ -8,6 +8,7 @@
 //      mobile admin screens join this room) — instant in-dashboard banner.
 //   2. Email: a single digest line to ADMIN_ALERT_EMAIL — survives nobody
 //      being logged in at 3am. Email is fire-and-forget and mock-safe (the
+const logger = require('../src/config/logger');
 //      emailService no-ops cleanly until EMAIL_PROVIDER is configured), so this
 //      service is safe to run today and "lights up" once SendGrid is wired.
 //

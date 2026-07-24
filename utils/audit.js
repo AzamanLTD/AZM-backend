@@ -8,6 +8,7 @@
 //     actorId: req.user.id, actorName: req.user.username,
 //     action: 'APPROVE_KYC', targetType: 'USER', targetId: String(userId),
 //     metadata: { previousStatus: 'PENDING', newStatus: 'VERIFIED' },
+const logger = require('../src/config/logger');
 //     ipAddress: req.ip,
 //   });
 //
