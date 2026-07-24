@@ -149,10 +149,24 @@ router.post('/send', protect, protectActive, wrap(async (req, res) => {
         }
     });
 
-    // Optionally emit socket event here if io is available
+    // Emit socket events to both the customer and the business owner
     const io = req.app.get('socketio');
     if (io) {
         io.to(`user_${userId}`).emit('new_message', { message });
+        // Notify the business owner (if they're not the sender) so the portal
+        // inbox + thread update in real-time instead of polling.
+        if (bizConv.participantAId !== req.user.id) {
+            io.to(`user_${bizConv.participantAId}`).emit('biz_new_message', {
+                conversationId: bizConv.conversationId,
+                message: { id: message.id, text: message.content, createdAt: message.createdAt, senderId: message.senderId, senderType: 'business' },
+            });
+        }
+        if (bizConv.participantBId !== req.user.id) {
+            io.to(`user_${bizConv.participantBId}`).emit('biz_new_message', {
+                conversationId: bizConv.conversationId,
+                message: { id: message.id, text: message.content, createdAt: message.createdAt, senderId: message.senderId, senderType: 'business' },
+            });
+        }
     }
 
     res.json({ success: true, message: {

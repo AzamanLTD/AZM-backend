@@ -3106,6 +3106,21 @@ router.post('/messages/:conversationId/send', wrap(async (req, res) => {
         },
     });
 
+    // Emit socket events to both participants for real-time updates
+    const io = req.app.get('socketio');
+    if (io) {
+        const msgPayload = {
+            conversationId,
+            message: { id: message.id, text: message.content, createdAt: message.createdAt, senderId: message.senderId, senderType: 'business' },
+        };
+        if (bizConv.participantAId !== req.user.id) {
+            io.to(`user_${bizConv.participantAId}`).emit('biz_new_message', msgPayload);
+        }
+        if (bizConv.participantBId !== req.user.id) {
+            io.to(`user_${bizConv.participantBId}`).emit('biz_new_message', msgPayload);
+        }
+    }
+
     res.status(201).json({ success: true, message });
 }));
 
