@@ -16,7 +16,6 @@
 function _getNotificationService(req) {
     const svc = req.app.get('notificationService');
     if (svc) return svc;
-    const logger = require('../src/config/logger');
     const NotificationService = require('../services/notificationService');
     const prisma = req.app.get('prisma');
     const io = req.app.get('socketio');
@@ -34,6 +33,7 @@ function _getNotificationService(req) {
 // =============================================================================
 
 const { audit } = require('../utils/audit');
+const logger = require('../src/config/logger');
 
 const VALID_FREQUENCIES = ['DAILY', 'WEEKLY', 'BIWEEKLY', 'MONTHLY'];
 

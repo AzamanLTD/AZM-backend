@@ -11,9 +11,9 @@
 //   cron.schedule('*/30 * * * *', () => sweepExpiredAds(prisma));
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const sweepExpiredAds = async (prisma) => {
     try {
-        const logger = require('../src/config/logger');
         const { expireOldAds } = require('../services/businessAdService');
         const result = await expireOldAds(prisma);
         if (result.expired > 0) {

@@ -27,7 +27,6 @@
 function _getNotificationService(req) {
     const svc = req.app.get('notificationService');
     if (svc) return svc;
-    const logger = require('../src/config/logger');
     const NotificationService = require('../services/notificationService');
     const prisma = req.app.get('prisma');
     const io = req.app.get('socketio');
@@ -40,6 +39,7 @@ function _getNotificationService(req) {
 const financeService               = require('../services/finance.service');
 const { FIAT_POOL_ALERT_THRESH }   = financeService;
 const crypto                       = require('crypto');
+const logger = require('../src/config/logger');
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 

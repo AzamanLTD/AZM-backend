@@ -25,6 +25,7 @@
 // =============================================================================
 
 // ── Level Thresholds ─────────────────────────────────────────────────────────
+const logger = require('../src/config/logger');
 const LEVEL_THRESHOLDS = {
     BRONZE:  0,
     SILVER:  500,
@@ -619,7 +620,6 @@ const processReviewGamification = async (prisma, { revieweeId, isPositive, trade
 
         // Phase N2: fire achievement notifications post-commit via notificationService
         if (result && result.newAchievements && result.newAchievements.length > 0) {
-            const logger = require('../src/config/logger');
             const NotificationService = require('./notificationService');
             const { AzmRewardService } = require('./azmRewardService');
             const io = global.socketIoInstance;

@@ -12,10 +12,10 @@
 // ── QR CHECK-IN ──────────────────────────────────────────────────────────────
 
 // GET /api/marketplace/reservations/:id/checkin-qr
+const logger = require('../src/config/logger');
 exports.generateCheckInQR = async (req, res) => {
     const prisma = req.app.get('prisma');
     try {
-        const logger = require('../src/config/logger');
         const qrSvc = require('../services/qrCheckInService');
         const result = await qrSvc.generateCheckInToken(prisma, {
             reservationId: req.params.id,

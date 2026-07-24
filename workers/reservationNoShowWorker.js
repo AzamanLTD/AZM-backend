@@ -12,6 +12,7 @@
 //   (default 30 minutes after departure, no check-in).
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const GRACE_PERIOD_MINS = 30; // grace after departure before marking transit no-show
 
 // =============================================================================
@@ -54,7 +55,6 @@ const sweepNoShowReservations = async (prisma) => {
             }
 
             // Charge penalty via split-release
-            const logger = require('../src/config/logger');
             const { splitReleaseFundedEscrow } = require('../services/bookingEscrowService');
             const result = await splitReleaseFundedEscrow(prisma, {
                 escrowId: reservation.escrowId,

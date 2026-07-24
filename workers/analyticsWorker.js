@@ -1,3 +1,4 @@
+const logger = require('../src/config/logger');
 class AnalyticsWorker {
     constructor(prisma) {
         this.prisma = prisma;
@@ -5,7 +6,6 @@ class AnalyticsWorker {
     }
 
     start() {
-        const logger = require('../src/config/logger');
         const cron = require('node-cron');
         this.cronJob = cron.schedule('0 * * * *', () => {
             logger.info('📈 Analytics cron triggered — aggregating daily metrics...');

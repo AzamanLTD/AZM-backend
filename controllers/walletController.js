@@ -1,6 +1,7 @@
 // controllers/walletController.js
 
 /**
+const logger = require('../src/config/logger');
  * 1. REQUEST WITHDRAWAL (The Address Detective)
  */
 exports.requestWithdrawal = async (req, res) => {
@@ -169,7 +170,6 @@ exports.addSavedWallet = async (req, res) => {
         // password OR a 2FA token if 2FA is enabled. Prevents an attacker
         // who has access to a logged-in session from quietly seeding a
         // withdrawal address.
-        const logger = require('../src/config/logger');
         const bcrypt = require('bcryptjs');
         const speakeasy = require('speakeasy');
         const userRow = await prisma.user.findUnique({

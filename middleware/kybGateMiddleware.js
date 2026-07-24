@@ -11,13 +11,13 @@
 // This is a HARD 403 block, not a cosmetic badge.
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const kybGate = async (req, res, next) => {
     try {
         // Skip if no authenticated user (let auth middleware handle that)
         if (!req.user || !req.user.id) return next();
 
         // Look up the user's business profile
-        const logger = require('../src/config/logger');
         const { PrismaClient } = require('@prisma/client');
         const prisma = req.app.get('prisma') || new PrismaClient();
 

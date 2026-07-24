@@ -5,6 +5,7 @@
 // table management, and menu engineering (station routing, 86'd items).
 // =============================================================================
 
+const logger = require('../../src/config/logger');
 class RestaurantOpsService {
     constructor(prisma) {
         this.prisma = prisma;
@@ -147,7 +148,6 @@ class RestaurantOpsService {
         });
 
         if (status === 'READY') {
-            const logger = require('../../src/config/logger');
             const messagingChannelsService = require('../messagingChannels');
             const customerPhone = updated.businessOrder?.customer?.phoneNumber;
             if (customerPhone) {
