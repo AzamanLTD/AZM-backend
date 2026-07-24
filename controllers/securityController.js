@@ -1,3 +1,4 @@
+const logger = require('../src/config/logger');
 const speakeasy = require('speakeasy');
 const QRCode = require('qrcode');
 
@@ -303,7 +304,7 @@ exports.changePassword = async (req, res) => {
                 actionPayload: {}
             });
         } catch (logErr) {
-            console.warn('[SECURITY] failed to write password-change notification:', logErr.message);
+            logger.warn('[SECURITY] failed to write password-change notification:', logErr.message);
         }
 
         return res.status(200).json({
@@ -320,7 +321,7 @@ exports.changePassword = async (req, res) => {
             refreshExpiresAt: refreshExpiresAt.toISOString(),
         });
     } catch (error) {
-        console.error('[SECURITY] changePassword error:', error.message);
+        logger.error({ err: error }, '[SECURITY] changePassword error');
         return res.status(500).json({ success: false, error: error.message });
     }
 };
@@ -399,7 +400,7 @@ exports.sendPhoneOtp = async (req, res) => {
         }
 
         if (!smsService) {
-            console.error('[sendPhoneOtp] smsService not bound to app context.');
+            logger.error('[sendPhoneOtp] smsService not bound to app context.');
             return res.status(503).json({
                 success: false,
                 message: 'SMS service is unavailable. Try again later.'
@@ -416,7 +417,7 @@ exports.sendPhoneOtp = async (req, res) => {
             ...(result.otp ? { testOtp: result.otp } : {})
         });
     } catch (error) {
-        console.error('[sendPhoneOtp] error:', error.message);
+        logger.error({ err: error }, '[sendPhoneOtp] error');
         return res.status(500).json({ success: false, message: 'Failed to send OTP.' });
     }
 };
@@ -495,10 +496,10 @@ exports.verifyPhoneOtp = async (req, res) => {
                 SusuService.linkPreRegistrationVouches(prisma, userId, phoneNumber)
                     .then((linked) => {
                         if (linked > 0) {
-                            console.log(`[verifyPhoneOtp] Linked ${linked} pre-registration vouches for user ${userId}`);
+                            logger.info(`[verifyPhoneOtp] Linked ${linked} pre-registration vouches for user ${userId}`);
                         }
                     })
-                    .catch((err) => console.error('[verifyPhoneOtp] vouch link error:', err.message));
+                    .catch((err) => logger.error({ err: err }, '[verifyPhoneOtp] vouch link error'));
             } catch (_) { /* swallow */ }
         });
 
@@ -508,7 +509,7 @@ exports.verifyPhoneOtp = async (req, res) => {
             phoneNumber
         });
     } catch (error) {
-        console.error('[verifyPhoneOtp] error:', error.message);
+        logger.error({ err: error }, '[verifyPhoneOtp] error');
         return res.status(500).json({ success: false, message: 'Verification failed.' });
     }
 };

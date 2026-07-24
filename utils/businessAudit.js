@@ -24,6 +24,7 @@
 // to fail (same pattern as utils/audit.js).
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const { audit } = require('./audit');
 
 async function logBusinessAudit(prisma, payload) {
@@ -44,7 +45,7 @@ async function logBusinessAudit(prisma, payload) {
             ipAddress:  payload.ipAddress  || null,
         });
     } catch (err) {
-        console.error('[BusinessAudit] Failed to write audit row:', err.message, payload);
+        logger.error('[BusinessAudit] Failed to write audit row:', err.message, payload);
         // Intentionally swallowed — never break the request over a logging failure.
     }
 }

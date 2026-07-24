@@ -1,3 +1,4 @@
+const logger = require('../src/config/logger');
 const NotificationService = require('../services/notificationService');
 
 class AdminChatController {
@@ -103,7 +104,7 @@ class AdminChatController {
                 }
             });
         } catch (error) {
-            console.error('Admin chat intervention error:', error.message);
+            logger.error({ err: error }, 'Admin chat intervention error');
             res.status(500).json({ success: false, message: error.message });
         }
     }

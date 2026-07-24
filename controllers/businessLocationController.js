@@ -7,6 +7,7 @@
 // P2002 (duplicate table label) is surfaced as a 409.
 // =============================================================================
 'use strict';
+const logger = require('../src/config/logger');
 const locationSvc = require('../services/businessLocationService');
 
 // Shared ownership check — load the BusinessProfile owned by the caller.

@@ -7,6 +7,7 @@
 // 3 endpoints: disable/enable storefront, list all storefronts with analytics
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const router = require('express').Router();
 const { protect, adminOnly } = require('../middleware/authMiddleware');
 
@@ -15,7 +16,7 @@ function wrap(handler) {
     try {
       await handler(req, res);
     } catch (err) {
-      console.error('[AdminStorefront]', err.message);
+      logger.error({ err: err }, '[AdminStorefront]');
       res.status(400).json({ success: false, message: err.message });
     }
   };

@@ -177,7 +177,7 @@ exports.getProfile = async (req, res) => {
             }
         });
     } catch (err) {
-        console.error('[chatProfile.getProfile] error:', err.message);
+        logger.error({ err: err }, '[chatProfile.getProfile] error');
         return res.status(500).json({ success: false, message: err.message });
     }
 };
@@ -234,7 +234,7 @@ exports.setNickname = async (req, res) => {
             myNicknameForFriend: nickname
         });
     } catch (err) {
-        console.error('[chatProfile.setNickname] error:', err.message);
+        logger.error({ err: err }, '[chatProfile.setNickname] error');
         return res.status(500).json({ success: false, message: err.message });
     }
 };
@@ -329,7 +329,7 @@ exports.getMedia = async (req, res) => {
             count: merged.length
         });
     } catch (err) {
-        console.error('[chatProfile.getMedia] error:', err.message);
+        logger.error({ err: err }, '[chatProfile.getMedia] error');
         return res.status(500).json({ success: false, message: err.message });
     }
 };
@@ -407,7 +407,7 @@ exports.getDocsAndLinks = async (req, res) => {
             count: merged.length
         });
     } catch (err) {
-        console.error('[chatProfile.getDocsAndLinks] error:', err.message);
+        logger.error({ err: err }, '[chatProfile.getDocsAndLinks] error');
         return res.status(500).json({ success: false, message: err.message });
     }
 };
@@ -482,7 +482,7 @@ exports.getReceipts = async (req, res) => {
             nextCursor
         });
     } catch (err) {
-        console.error('[chatProfile.getReceipts] error:', err.message);
+        logger.error({ err: err }, '[chatProfile.getReceipts] error');
         return res.status(500).json({ success: false, message: err.message });
     }
 };
@@ -594,7 +594,7 @@ exports.getTrustMetrics = async (req, res) => {
             }
         });
     } catch (err) {
-        console.error('[chatProfile.getTrustMetrics] error:', err.message);
+        logger.error({ err: err }, '[chatProfile.getTrustMetrics] error');
         return res.status(500).json({ success: false, message: err.message });
     }
 };

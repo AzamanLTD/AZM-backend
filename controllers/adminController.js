@@ -1,4 +1,5 @@
 // controllers/adminController.js
+const logger = require('../src/config/logger');
 const { sendPushNotification } = require('../utils/firebaseService');
 const { parsePagination, buildPageEnvelope } = require('../utils/pagination');
 const { audit } = require('../utils/audit');
@@ -85,7 +86,7 @@ exports.getAllDisputes = async (req, res) => {
         const envelope = buildPageEnvelope(disputes, take, mode, page, total);
         res.status(200).json({ success: true, disputes, pagination: envelope });
     } catch (error) {
-        console.error("Fetch Disputes Error:", error);
+        logger.error("Fetch Disputes Error:", error);
         res.status(500).json({ success: false, message: "Could not fetch disputes." });
     }
 };
@@ -144,12 +145,12 @@ exports.getLiveTrades = async (req, res) => {
             wantsTotal ? prisma.trade.count({ where }) : Promise.resolve(undefined)
         ]);
 
-        console.log(`📊 Admin War Room: Returning ${trades.length} live trades (page ${page}, mode ${mode})`);
+        logger.info(`📊 Admin War Room: Returning ${trades.length} live trades (page ${page}, mode ${mode})`);
 
         const envelope = buildPageEnvelope(trades, take, mode, page, total);
         res.status(200).json({ success: true, trades, pagination: envelope });
     } catch (error) {
-        console.error("Fetch Live Trades Error:", error);
+        logger.error("Fetch Live Trades Error:", error);
         res.status(500).json({ success: false, message: "Could not fetch live network trades." });
     }
 };
@@ -243,7 +244,7 @@ exports.forceRelease = async (req, res) => {
             ipAddress: req.ip,
         });
     } catch (error) {
-        console.error("Force Release Error:", error);
+        logger.error("Force Release Error:", error);
         res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -362,7 +363,7 @@ exports.forceCancel = async (req, res) => {
                 message: 'Trade is no longer disputed (concurrent admin action).'
             });
         }
-        console.error("Force Cancel Error:", error);
+        logger.error("Force Cancel Error:", error);
         res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -463,7 +464,7 @@ exports.getPendingKyc = async (req, res) => {
         const envelope = buildPageEnvelope(decrypted, take, mode, page, total);
         res.status(200).json({ success: true, applications: decrypted, pagination: envelope });
     } catch (error) {
-        console.error("Fetch KYC Error:", error);
+        logger.error("Fetch KYC Error:", error);
         res.status(500).json({ success: false, message: "Could not fetch KYC applications." });
     }
 };
@@ -559,7 +560,7 @@ exports.approveKyc = async (req, res) => {
             ipAddress: req.ip,
         });
     } catch (error) {
-        console.error("Approve KYC Error:", error);
+        logger.error("Approve KYC Error:", error);
         res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -613,7 +614,7 @@ exports.rejectKyc = async (req, res) => {
             ipAddress: req.ip,
         });
     } catch (error) {
-        console.error("Reject KYC Error:", error);
+        logger.error("Reject KYC Error:", error);
         res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -692,7 +693,7 @@ exports.sendAdminMessage = async (req, res) => {
 
         res.status(200).json({ success: true, message: 'Admin message injected successfully.' });
     } catch (error) {
-        console.error('Admin Chat Error:', error);
+        logger.error('Admin Chat Error:', error);
         res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -730,7 +731,7 @@ exports.liquidateProfits = async (req, res) => {
                 timestamp:        new Date().toISOString()
             });
         } catch (socketErr) {
-            console.error('[liquidateProfits] Failed to emit socket alert:', socketErr.message);
+            logger.error({ err: socketErr }, '[liquidateProfits] Failed to emit socket alert');
         }
 
         // Append-only audit trail (fire-and-forget — never fails the request).
@@ -747,7 +748,7 @@ exports.liquidateProfits = async (req, res) => {
             data
         });
     } catch (error) {
-        console.error('[liquidateProfits] error:', error.message);
+        logger.error({ err: error }, '[liquidateProfits] error');
         return res.status(400).json({ success: false, message: error.message });
     }
 };
@@ -899,7 +900,7 @@ exports.getPlatformStats = async (req, res) => {
             }
         });
     } catch (error) {
-        console.error('[getPlatformStats] error:', error.message);
+        logger.error({ err: error }, '[getPlatformStats] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -1006,7 +1007,7 @@ exports.getProfitBreakdown = async (req, res) => {
             }
         });
     } catch (error) {
-        console.error('[getProfitBreakdown] error:', error.message);
+        logger.error({ err: error }, '[getProfitBreakdown] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -1093,7 +1094,7 @@ exports.getUsers = async (req, res) => {
             }
         });
     } catch (error) {
-        console.error('[getUsers] error:', error.message);
+        logger.error({ err: error }, '[getUsers] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -1188,7 +1189,7 @@ exports.banUser = async (req, res) => {
             } catch (sockErr) {
                 // Disconnect failure must not fail the ban — the DB row
                 // is already flipped, the next request will be rejected.
-                console.error(`[banUser] socket disconnect non-fatal: ${sockErr.message}`);
+                logger.error(`[banUser] socket disconnect non-fatal: ${sockErr.message}`);
             }
         }
 
@@ -1209,7 +1210,7 @@ exports.banUser = async (req, res) => {
             data: { userId, banStatus, banUntil }
         });
     } catch (error) {
-        console.error('[banUser] error:', error.message);
+        logger.error({ err: error }, '[banUser] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -1306,7 +1307,7 @@ exports.changeUserRole = async (req, res) => {
             data: { userId, previousRole: user.role, newRole: role }
         });
     } catch (error) {
-        console.error('[changeUserRole] error:', error.message);
+        logger.error({ err: error }, '[changeUserRole] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -1402,7 +1403,7 @@ exports.getPendingWithdrawals = async (req, res) => {
             }
         });
     } catch (error) {
-        console.error('[getPendingWithdrawals] error:', error.message);
+        logger.error({ err: error }, '[getPendingWithdrawals] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -1477,7 +1478,7 @@ exports.approveWithdrawal = async (req, res) => {
             data: { withdrawalId, userId: withdrawal.userId, amount: withdrawal.amount, adminNotes }
         });
     } catch (error) {
-        console.error('[approveWithdrawal] error:', error.message);
+        logger.error({ err: error }, '[approveWithdrawal] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -1575,7 +1576,7 @@ exports.rejectWithdrawal = async (req, res) => {
                 message: 'Withdrawal was already finalized by another admin (concurrent action).'
             });
         }
-        console.error('[rejectWithdrawal] error:', error.message);
+        logger.error({ err: error }, '[rejectWithdrawal] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -1652,7 +1653,7 @@ exports.getSystemHealth = async (req, res) => {
             }
         });
     } catch (error) {
-        console.error('[getSystemHealth] error:', error.message);
+        logger.error({ err: error }, '[getSystemHealth] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -1686,7 +1687,7 @@ exports.batchProcessPayouts = async (req, res) => {
             ...result
         });
     } catch (error) {
-        console.error('[batchProcessPayouts] error:', error.message);
+        logger.error({ err: error }, '[batchProcessPayouts] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -1720,7 +1721,7 @@ exports.getPayoutSettings = async (req, res) => {
             }
         });
     } catch (error) {
-        console.error('[getPayoutSettings] error:', error.message);
+        logger.error({ err: error }, '[getPayoutSettings] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -1777,7 +1778,7 @@ exports.updatePayoutSettings = async (req, res) => {
             data: updateData
         });
 
-        console.log(`[updatePayoutSettings] admin ${req.user.id} updated:`, JSON.stringify(updateData));
+        logger.info(`[updatePayoutSettings] admin ${req.user.id} updated:`, JSON.stringify(updateData));
 
         return res.status(200).json({
             success: true,
@@ -1790,7 +1791,7 @@ exports.updatePayoutSettings = async (req, res) => {
             }
         });
     } catch (error) {
-        console.error('[updatePayoutSettings] error:', error.message);
+        logger.error({ err: error }, '[updatePayoutSettings] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -1853,7 +1854,7 @@ exports.getNeedsManualReview = async (req, res) => {
             pagination: envelope
         });
     } catch (error) {
-        console.error('[getNeedsManualReview] error:', error.message);
+        logger.error({ err: error }, '[getNeedsManualReview] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -1889,7 +1890,7 @@ async function _injectEscrowSystemMessage(prisma, io, ticket, content, metadata 
             io.to(`user_${ticket.counterpartyId}`).emit('ticket_message', payload);
         }
     } catch (err) {
-        console.error('[admin._injectEscrowSystemMessage] error:', err.message);
+        logger.error({ err: err }, '[admin._injectEscrowSystemMessage] error');
     }
 }
 
@@ -1939,7 +1940,7 @@ exports.getEscrowDisputes = async (req, res) => {
             pagination: { page, limit, total, totalPages: Math.ceil(total / limit) }
         });
     } catch (error) {
-        console.error('[getEscrowDisputes] error:', error.message);
+        logger.error({ err: error }, '[getEscrowDisputes] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -1976,7 +1977,7 @@ exports.assignEscrowDispute = async (req, res) => {
 
         return res.status(200).json({ success: true, escrow: result.escrow, dispute: result.dispute });
     } catch (error) {
-        console.error('[assignEscrowDispute] error:', error.message);
+        logger.error({ err: error }, '[assignEscrowDispute] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -2081,7 +2082,7 @@ exports.resolveEscrowDispute = async (req, res) => {
 
         return res.status(200).json({ success: true, escrow: result.escrow, dispute: result.dispute });
     } catch (error) {
-        console.error('[resolveEscrowDispute] error:', error.message);
+        logger.error({ err: error }, '[resolveEscrowDispute] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -2115,7 +2116,7 @@ exports.getAuditLog = async (req, res) => {
             pagination: { page, limit, total, totalPages: Math.ceil(total / limit), hasNext: page * limit < total },
         });
     } catch (err) {
-        console.error('[getAuditLog]', err.message);
+        logger.error({ err: err }, '[getAuditLog]');
         return res.status(500).json({ success: false, message: err.message });
     }
 };

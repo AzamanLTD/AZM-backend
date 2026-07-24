@@ -20,6 +20,7 @@
 // Otherwise, the specific key must be present in the array.
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const { ROLE_TEMPLATES, ALL_KEYS } = require('../config/permissionTemplates');
 
 /**
@@ -116,7 +117,7 @@ function requirePermission(key) {
             req.resolvedPermissions = perms;
             next();
         } catch (err) {
-            console.error('[requirePermission]', err);
+            logger.error('[requirePermission]', err);
             res.status(500).json({ success: false, message: 'Permission check failed.' });
         }
     };

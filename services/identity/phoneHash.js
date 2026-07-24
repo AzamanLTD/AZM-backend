@@ -15,6 +15,7 @@
 // you rotate it.
 // =============================================================================
 
+const logger = require('../../src/config/logger');
 const crypto = require('crypto');
 
 function _pepper() {

@@ -23,6 +23,7 @@
 // Usage:  node infra/install-business-os-overlay.js
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const { PrismaClient } = require('@prisma/client');
 const prisma = new PrismaClient();
 
@@ -255,7 +256,7 @@ STATEMENTS.push('CREATE INDEX IF NOT EXISTS "BusinessConversation_participantBId
 //  blocks behave more predictably in autocommit).
 // =============================================================================
 async function main() {
-  console.log(`[business-os-overlay] Running ${STATEMENTS.length} DDL statements…`);
+  logger.info(`[business-os-overlay] Running ${STATEMENTS.length} DDL statements…`);
   let ok = 0;
   let skipped = 0;
   const errors = [];
@@ -273,18 +274,18 @@ async function main() {
       const msg = String(err.message || err);
       if (msg.includes('already exists') || msg.includes('duplicate')) {
         skipped++;
-        console.log(`  [skip] ${preview}… (${msg.slice(0, 60)})`);
+        logger.info(`  [skip] ${preview}… (${msg.slice(0, 60)})`);
       } else {
         errors.push({ stmt: preview, error: msg });
-        console.error(`  [ERR]  ${preview}…`);
-        console.error(`        ${msg.slice(0, 200)}`);
+        logger.error(`  [ERR]  ${preview}…`);
+        logger.error(`        ${msg.slice(0, 200)}`);
       }
     }
   }
 
-  console.log(`[business-os-overlay] Done: ${ok} applied, ${skipped} skipped, ${errors.length} errors.`);
+  logger.info(`[business-os-overlay] Done: ${ok} applied, ${skipped} skipped, ${errors.length} errors.`);
   if (errors.length) {
-    console.error('[business-os-overlay] ⚠ Errors occurred — review above.');
+    logger.error('[business-os-overlay] ⚠ Errors occurred — review above.');
   }
 }
 
@@ -353,7 +354,7 @@ STATEMENTS.push('ALTER TABLE "BusinessProfile" ADD COLUMN IF NOT EXISTS "allowOv
 
 main()
   .catch((e) => {
-    console.error('[business-os-overlay] Fatal:', e);
+    logger.error('[business-os-overlay] Fatal:', e);
     // Never crash the server — this is a best-effort installer.
   })
   .finally(async () => {

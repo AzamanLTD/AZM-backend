@@ -23,6 +23,7 @@
 // payer, amount, externalref) and the TP13/TP14 codes before trusting them.
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const axios = require('axios');
 
 const PROD_BASE_URL    = 'https://api.moolre.com';
@@ -51,7 +52,7 @@ class MoolreCollectionService {
         this._mockLedger = new Map();
 
         const mode = this.providerMode === 'LIVE' ? `LIVE → ${this.baseUrl}` : 'MOCK';
-        console.log(`[MoolreCollectionService] ${mode}`);
+        logger.info(`[MoolreCollectionService] ${mode}`);
     }
 
     // ── Internals ─────────────────────────────────────────────────────────────
@@ -124,7 +125,7 @@ class MoolreCollectionService {
             this._mockLedger.set(externalRef, {
                 status: 'PENDING', amount: amountGhs, payer: payerPhone, ref,
             });
-            console.log(`[MoolreCollectionService:MOCK] initiatePayment ref=${externalRef}`);
+            logger.info(`[MoolreCollectionService:MOCK] initiatePayment ref=${externalRef}`);
             return { providerRef: ref, requiresOtp: false };
         }
 

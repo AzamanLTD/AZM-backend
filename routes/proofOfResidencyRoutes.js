@@ -6,6 +6,7 @@
 //   app.use('/api/admin/proof-of-residency', adminPoRRouter);
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const express = require('express');
 const multer = require('multer');
 const ctrl = require('../controllers/susu/proofOfResidencyController');

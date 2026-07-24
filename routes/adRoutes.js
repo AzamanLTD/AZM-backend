@@ -9,6 +9,7 @@
 // matching "analytics" as an :id parameter.
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const express              = require('express');
 const router               = express.Router();
 const adController         = require('../controllers/adController');

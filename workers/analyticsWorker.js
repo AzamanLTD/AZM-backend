@@ -5,18 +5,19 @@ class AnalyticsWorker {
     }
 
     start() {
+        const logger = require('../src/config/logger');
         const cron = require('node-cron');
         this.cronJob = cron.schedule('0 * * * *', () => {
-            console.log('📈 Analytics cron triggered — aggregating daily metrics...');
+            logger.info('📈 Analytics cron triggered — aggregating daily metrics...');
             this.aggregateDailySnapshot();
         });
-        console.log('📈 Analytics cron scheduled (every hour)');
+        logger.info('📈 Analytics cron scheduled (every hour)');
     }
 
     stop() {
         if (this.cronJob) {
             this.cronJob.stop();
-            console.log('📈 Analytics cron stopped');
+            logger.info('📈 Analytics cron stopped');
         }
     }
 
@@ -94,12 +95,12 @@ class AnalyticsWorker {
                 },
             });
 
-            console.log(
+            logger.info(
                 `📈 DailySnapshot upserted for ${startOfDay.toISOString().split('T')[0]} | ` +
                 `Volume: ${totalVolumeUsdc} USDC | Profit: ${totalProfitUsdc} USDC | Active Users: ${activeUsers}`
             );
         } catch (error) {
-            console.error('📈 Analytics cron error:', error.message);
+            logger.error({ err: error }, '📈 Analytics cron error');
         }
     }
 }

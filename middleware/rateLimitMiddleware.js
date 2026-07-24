@@ -23,6 +23,7 @@
 // not loosened. The per-user keying on the financial tier is preserved too.
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const { rateLimit, ipKeyGenerator } = require('express-rate-limit');
 const { RedisStore } = require('rate-limit-redis');
 const Redis = require('ioredis');
@@ -43,8 +44,8 @@ const _getStore = () => {
             lazyConnect: true,
             ...(isTLS ? { tls: {} } : {}),
         });
-        _redisClient.on('error', (e) => console.error('[RateLimit] Redis error:', e.message));
-        console.log('[RateLimit] Using Redis store — multi-instance safe' + (isTLS ? ' (TLS/Upstash)' : ''));
+        _redisClient.on('error', (e) => logger.error({ err: e }, '[RateLimit] Redis error'));
+        logger.info('[RateLimit] Using Redis store — multi-instance safe' + (isTLS ? ' (TLS/Upstash)' : ''));
     }
     // A fresh RedisStore per limiter (each gets its own key prefix) but they all
     // share the single underlying connection.
@@ -56,7 +57,7 @@ const _getStore = () => {
 
 const _storeFactory = _getStore();
 if (!_storeFactory) {
-    console.warn('[RateLimit] REDIS_URL not set — using in-memory store. OK for dev, NOT for multi-instance production.');
+    logger.warn('[RateLimit] REDIS_URL not set — using in-memory store. OK for dev, NOT for multi-instance production.');
 }
 
 // Build the standard options for a limiter, attaching a Redis store (with a

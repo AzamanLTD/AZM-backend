@@ -42,7 +42,7 @@ exports.createSection = async (req, res) => {
         });
         return res.status(201).json({ success: true, section });
     } catch (err) {
-        console.error('[createSection]', err.message);
+        logger.error({ err: err }, '[createSection]');
         return res.status(500).json({ success: false, message: err.message });
     }
 };
@@ -66,7 +66,7 @@ exports.listMySections = async (req, res) => {
         });
         return res.status(200).json({ success: true, sections });
     } catch (err) {
-        console.error('[listMySections]', err.message);
+        logger.error({ err: err }, '[listMySections]');
         return res.status(500).json({ success: false, message: err.message });
     }
 };
@@ -93,7 +93,7 @@ exports.updateSection = async (req, res) => {
         const section = await prisma.catalogSection.update({ where: { id: sectionId }, data });
         return res.status(200).json({ success: true, section });
     } catch (err) {
-        console.error('[updateSection]', err.message);
+        logger.error({ err: err }, '[updateSection]');
         return res.status(500).json({ success: false, message: err.message });
     }
 };
@@ -123,7 +123,7 @@ exports.deleteSection = async (req, res) => {
         ]);
         return res.status(200).json({ success: true, message: 'Section removed.' });
     } catch (err) {
-        console.error('[deleteSection]', err.message);
+        logger.error({ err: err }, '[deleteSection]');
         return res.status(500).json({ success: false, message: err.message });
     }
 };
@@ -160,7 +160,7 @@ exports.getPublicMenu = async (req, res) => {
 
         return res.status(200).json({ success: true, sections, uncategorised });
     } catch (err) {
-        console.error('[getPublicMenu]', err.message);
+        logger.error({ err: err }, '[getPublicMenu]');
         return res.status(500).json({ success: false, message: err.message });
     }
 };

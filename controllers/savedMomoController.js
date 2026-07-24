@@ -11,13 +11,14 @@
 //   DELETE /api/saved-momo/:id
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const bcrypt = require('bcryptjs');
 const speakeasy = require('speakeasy');
 
 const wrap = (fn) => async (req, res) => {
     try { await fn(req, res); }
     catch (err) {
-        console.error(`[savedMomoController] ${fn.name || 'h'}:`, err.message);
+        logger.error(`[savedMomoController] ${fn.name || 'h'}:`, err.message);
         res.status(400).json({ success: false, message: err.message });
     }
 };

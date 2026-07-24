@@ -6,6 +6,7 @@
 // Fee profiles control: platform fee %, admin/vendor split %, exit fee %.
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const { resolveFeeProfile } = require('../services/feeProfileService');
 
 /**
@@ -29,7 +30,7 @@ exports.listFeeProfiles = async (req, res) => {
 
         res.status(200).json({ success: true, profiles });
     } catch (error) {
-        console.error('[AdminFeeProfile] listFeeProfiles error:', error.message);
+        logger.error({ err: error }, '[AdminFeeProfile] listFeeProfiles error');
         res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -91,7 +92,7 @@ exports.createFeeProfile = async (req, res) => {
 
         res.status(201).json({ success: true, message: 'Fee profile created.', profile });
     } catch (error) {
-        console.error('[AdminFeeProfile] createFeeProfile error:', error.message);
+        logger.error({ err: error }, '[AdminFeeProfile] createFeeProfile error');
         res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -155,7 +156,7 @@ exports.updateFeeProfile = async (req, res) => {
 
         res.status(200).json({ success: true, message: 'Fee profile updated.', profile: updated });
     } catch (error) {
-        console.error('[AdminFeeProfile] updateFeeProfile error:', error.message);
+        logger.error({ err: error }, '[AdminFeeProfile] updateFeeProfile error');
         res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -189,7 +190,7 @@ exports.deactivateFeeProfile = async (req, res) => {
 
         res.status(200).json({ success: true, message: 'Fee profile deactivated.' });
     } catch (error) {
-        console.error('[AdminFeeProfile] deactivateFeeProfile error:', error.message);
+        logger.error({ err: error }, '[AdminFeeProfile] deactivateFeeProfile error');
         res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -212,7 +213,7 @@ exports.resolveProfile = async (req, res) => {
 
         res.status(200).json({ success: true, resolvedProfile: profile });
     } catch (error) {
-        console.error('[AdminFeeProfile] resolveProfile error:', error.message);
+        logger.error({ err: error }, '[AdminFeeProfile] resolveProfile error');
         res.status(500).json({ success: false, message: error.message });
     }
 };

@@ -21,6 +21,7 @@
 //   Penalty for vouching for a defaulter: -25 (compounding) per default.
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const { Prisma } = require('@prisma/client');
 
 const FREQUENCY_MS = {
@@ -336,7 +337,7 @@ class SusuService {
                     }
                 });
             } catch (err) {
-                console.error('[susuService.processCycle] transaction error:', err.message);
+                logger.error({ err: err }, '[susuService.processCycle] transaction error');
                 defaulted.push({
                     memberId: member.id,
                     userId: member.userId,
@@ -618,7 +619,7 @@ class SusuService {
                 })
                 .catch(() => {});
         } catch (err) {
-            console.error('[susuService._handleDefault] failed:', err.message);
+            logger.error({ err: err }, '[susuService._handleDefault] failed');
         }
     }
 }

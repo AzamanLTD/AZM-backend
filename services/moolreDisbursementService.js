@@ -53,6 +53,7 @@
 //   • NETWORK_TO_CHANNEL: MTN=1, TELECEL=6, AIRTELTIGO=7  (VODAFONE accepted as legacy alias)
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const axios          = require('axios');
 const { randomUUID } = require('crypto');
 
@@ -141,12 +142,12 @@ class MoolreDisbursementService {
         this._mockTransfers = new Map();
 
         if (this.providerMode === 'MOCK') {
-            console.log(
+            logger.info(
                 '[MoolreDisbursementService] Running in MOCK mode ' +
                 '(set MOOLRE_API_USER + MOOLRE_API_KEY + MOOLRE_PROVIDER=LIVE for live calls).'
             );
         } else {
-            console.log(`[MoolreDisbursementService] Running in LIVE mode → ${this.baseUrl}`);
+            logger.info(`[MoolreDisbursementService] Running in LIVE mode → ${this.baseUrl}`);
         }
     }
 

@@ -8,6 +8,7 @@
 //   success → { success: true, ... }; error → { success: false, message }.
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const businessService = require('../services/businessService');
 
 // =============================================================================
@@ -50,7 +51,7 @@ exports.registerBusiness = async (req, res) => {
             alreadyRegistered: !!result.alreadyRegistered
         });
     } catch (err) {
-        console.error('[registerBusiness] error:', err.message);
+        logger.error({ err: err }, '[registerBusiness] error');
         return res.status(500).json({ success: false, message: err.message });
     }
 };
@@ -71,7 +72,7 @@ exports.getBusinessByBizId = async (req, res) => {
         }
         return res.status(200).json({ success: true, business });
     } catch (err) {
-        console.error('[getBusinessByBizId] error:', err.message);
+        logger.error({ err: err }, '[getBusinessByBizId] error');
         return res.status(500).json({ success: false, message: err.message });
     }
 };
@@ -103,7 +104,7 @@ exports.searchBusinesses = async (req, res) => {
 
         return res.status(200).json({ success: true, businesses, hasMore, nextCursor });
     } catch (err) {
-        console.error('[searchBusinesses] error:', err.message);
+        logger.error({ err: err }, '[searchBusinesses] error');
         return res.status(500).json({ success: false, message: err.message });
     }
 };
@@ -119,7 +120,7 @@ exports.updateBusinessProfile = async (req, res) => {
         const businessProfile = await businessService.updateBusinessProfile(prisma, { userId, updates });
         return res.status(200).json({ success: true, businessProfile });
     } catch (err) {
-        console.error('[updateBusinessProfile] error:', err.message);
+        logger.error({ err: err }, '[updateBusinessProfile] error');
         const code = /no business profile|no valid fields|must be/i.test(err.message) ? 400 : 500;
         return res.status(code).json({ success: false, message: err.message });
     }
@@ -138,7 +139,7 @@ exports.getMyBusiness = async (req, res) => {
         }
         return res.status(200).json({ success: true, business });
     } catch (err) {
-        console.error('[getMyBusiness] error:', err.message);
+        logger.error({ err: err }, '[getMyBusiness] error');
         return res.status(500).json({ success: false, message: err.message });
     }
 };
@@ -156,7 +157,7 @@ exports.getSubcategories = async (req, res) => {
         });
         return res.status(200).json({ success: true, subcategories });
     } catch (err) {
-        console.error('[getSubcategories] error:', err.message);
+        logger.error({ err: err }, '[getSubcategories] error');
         return res.status(500).json({ success: false, message: err.message });
     }
 };
@@ -182,7 +183,7 @@ exports.listVehicles = async (req, res) => {
 
         return res.status(200).json({ success: true, vehicles });
     } catch (err) {
-        console.error('[listVehicles] error:', err.message);
+        logger.error({ err: err }, '[listVehicles] error');
         return res.status(500).json({ success: false, message: err.message });
     }
 };
@@ -223,7 +224,7 @@ exports.createVehicle = async (req, res) => {
 
         return res.status(201).json({ success: true, vehicle });
     } catch (err) {
-        console.error('[createVehicle] error:', err.message);
+        logger.error({ err: err }, '[createVehicle] error');
         return res.status(500).json({ success: false, message: err.message });
     }
 };
@@ -271,7 +272,7 @@ exports.updateVehicle = async (req, res) => {
 
         return res.status(200).json({ success: true, vehicle });
     } catch (err) {
-        console.error('[updateVehicle] error:', err.message);
+        logger.error({ err: err }, '[updateVehicle] error');
         return res.status(500).json({ success: false, message: err.message });
     }
 };
@@ -302,7 +303,7 @@ exports.deleteVehicle = async (req, res) => {
 
         return res.status(200).json({ success: true, message: 'Vehicle deactivated.' });
     } catch (err) {
-        console.error('[deleteVehicle] error:', err.message);
+        logger.error({ err: err }, '[deleteVehicle] error');
         return res.status(500).json({ success: false, message: err.message });
     }
 };

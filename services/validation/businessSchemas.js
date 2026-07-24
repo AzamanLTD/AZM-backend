@@ -25,6 +25,7 @@
 // BUSINESS_CATEGORIES is pinned against services/businessService.VALID_CATEGORIES
 // by a regression test so the two cannot silently drift.
 // =============================================================================
+const logger = require('../../src/config/logger');
 const { z } = require('zod');
 
 const BUSINESS_CATEGORIES = [

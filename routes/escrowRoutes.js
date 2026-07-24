@@ -5,6 +5,7 @@
 // pure reads/term edits use protect.
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const router = require('express').Router();
 const ctrl = require('../controllers/escrowController');
 const { protect } = require('../middleware/authMiddleware');

@@ -19,7 +19,7 @@ class AzmAuctionWorker {
     }
 
     start(intervalMs = 60 * 1000) {
-        console.log('[AzmAuctionWorker] Started — ticking every 60 seconds');
+        logger.info('[AzmAuctionWorker] Started — ticking every 60 seconds');
         this._tick();
         this.interval = setInterval(() => this._tick(), intervalMs);
     }
@@ -45,11 +45,11 @@ class AzmAuctionWorker {
                 try {
                     await this.azmAuctionService.settle(auc.id);
                 } catch (err) {
-                    console.error(`[AzmAuctionWorker] settle failed ${auc.id}:`, err.message);
+                    logger.error(`[AzmAuctionWorker] settle failed ${auc.id}:`, err.message);
                 }
             }
         } catch (err) {
-            console.error('[AzmAuctionWorker.tick]', err.message);
+            logger.error({ err: err }, '[AzmAuctionWorker.tick]');
         }
     }
 }

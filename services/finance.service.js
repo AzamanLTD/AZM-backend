@@ -33,6 +33,7 @@
 // disbursement rejects the payout (sync error or async webhook = FAILED).
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const { runDoubleCheck } = require('../utils/securityCheck');
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -502,7 +503,7 @@ const processCryptoDeposit = async (prisma, { userId, amountUsdc, txHash, addres
         where: { txHash }
     });
     if (existingTx) {
-        console.log(`[Finance] Duplicate txHash ignored: ${txHash}`);
+        logger.info(`[Finance] Duplicate txHash ignored: ${txHash}`);
         return { alreadyProcessed: true };
     }
 
@@ -539,7 +540,7 @@ const processCryptoDeposit = async (prisma, { userId, amountUsdc, txHash, addres
         return { user, txRecord, newBalance: user.availableBalance + amountUsdc };
     });
 
-    console.log(`[Finance] Crypto deposit: ${amountUsdc} USDC → user ${userId} | txHash: ${txHash}`);
+    logger.info(`[Finance] Crypto deposit: ${amountUsdc} USDC → user ${userId} | txHash: ${txHash}`);
 
     return {
         alreadyProcessed: false,

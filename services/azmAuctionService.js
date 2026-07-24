@@ -15,6 +15,7 @@
 //     `boostExpiresAt = settledAt + 24h`. Existing boosts are extended.
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const { Prisma } = require('@prisma/client');
 
 const WINDOW_MS = 24 * 60 * 60 * 1000;
@@ -234,7 +235,7 @@ class AzmAuctionService {
                     dedupKey: `auction-win-${auctionId}-${winner.vendorId}`,
                 });
             } catch (err) {
-                console.error('[azmAuctionService.settle] AZM debit failed:', err.message);
+                logger.error({ err: err }, '[azmAuctionService.settle] AZM debit failed');
             }
 
             // Mark bid + boost ad

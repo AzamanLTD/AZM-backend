@@ -2,6 +2,7 @@
 // =============================================================================
 // Webhook Dispatcher — reliable event delivery with retry + backoff
 // =============================================================================
+const logger = require('../../src/config/logger');
 const axios = require('axios');
 const crypto = require('crypto');
 const { PrismaClient } = require('@prisma/client');
@@ -48,11 +49,11 @@ class WebhookDispatcher {
 
                 // Attempt immediate delivery (async, non-blocking)
                 this._attemptDelivery(delivery.id, webhook).catch(err => {
-                    console.error(`[WebhookDispatcher] Initial delivery error for ${delivery.id}:`, err.message);
+                    logger.error(`[WebhookDispatcher] Initial delivery error for ${delivery.id}:`, err.message);
                 });
             }
         } catch (error) {
-            console.error('[WebhookDispatcher] Error dispatching webhooks:', error);
+            logger.error('[WebhookDispatcher] Error dispatching webhooks:', error);
         }
     }
 
@@ -69,7 +70,7 @@ class WebhookDispatcher {
                 where: { id: deliveryId },
                 data: { status: 'FAILED', nextRetryAt: null },
             });
-            console.warn(`[WebhookDispatcher] Delivery ${deliveryId} permanently failed after ${delivery.maxAttempts} attempts.`);
+            logger.warn(`[WebhookDispatcher] Delivery ${deliveryId} permanently failed after ${delivery.maxAttempts} attempts.`);
             return;
         }
 
@@ -115,14 +116,14 @@ class WebhookDispatcher {
             });
 
             if (attemptNum < delivery.maxAttempts) {
-                console.warn(`[WebhookDispatcher] Delivery ${deliveryId} attempt ${attemptNum} failed, retrying in ${backoffSec}s.`);
+                logger.warn(`[WebhookDispatcher] Delivery ${deliveryId} attempt ${attemptNum} failed, retrying in ${backoffSec}s.`);
                 setTimeout(() => {
                     this._attemptDelivery(deliveryId, webhook).catch(e =>
-                        console.error(`[WebhookDispatcher] Retry error for ${deliveryId}:`, e.message)
+                        logger.error(`[WebhookDispatcher] Retry error for ${deliveryId}:`, e.message)
                     );
                 }, backoffSec * 1000);
             } else {
-                console.error(`[WebhookDispatcher] Delivery ${deliveryId} permanently failed after ${attemptNum} attempts.`);
+                logger.error(`[WebhookDispatcher] Delivery ${deliveryId} permanently failed after ${attemptNum} attempts.`);
             }
         }
     }
@@ -154,7 +155,7 @@ class WebhookDispatcher {
             }
 
             this._attemptDelivery(delivery.id, webhook).catch(err =>
-                console.error(`[WebhookDispatcher] Queue retry error for ${delivery.id}:`, err.message)
+                logger.error(`[WebhookDispatcher] Queue retry error for ${delivery.id}:`, err.message)
             );
         }
 

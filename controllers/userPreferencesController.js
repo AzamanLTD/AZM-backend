@@ -65,7 +65,7 @@ exports.getPreferences = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('[userPreferences.getPreferences] error:', error.message);
+        logger.error({ err: error }, '[userPreferences.getPreferences] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -103,7 +103,7 @@ exports.updateTheme = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('[userPreferences.updateTheme] error:', error.message);
+        logger.error({ err: error }, '[userPreferences.updateTheme] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -165,7 +165,7 @@ exports.updateShortcuts = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('[userPreferences.updateShortcuts] error:', error.message);
+        logger.error({ err: error }, '[userPreferences.updateShortcuts] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -252,7 +252,7 @@ exports.updateAll = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('[userPreferences.updateAll] error:', error.message);
+        logger.error({ err: error }, '[userPreferences.updateAll] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -301,7 +301,7 @@ exports.updatePreferredCurrency = async (req, res) => {
             data: { preferredCurrency: code }
         });
     } catch (error) {
-        console.error('[userPreferences.updatePreferredCurrency] error:', error.message);
+        logger.error({ err: error }, '[userPreferences.updatePreferredCurrency] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };

@@ -6,6 +6,7 @@
 // Integrates with NotificationService for real-time friend request alerts.
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const NotificationService = require('../services/notificationService');
 const { parsePagination, buildPageEnvelope } = require('../utils/pagination');
 
@@ -149,7 +150,7 @@ exports.searchUsers = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('[searchUsers] error:', error.message);
+        logger.error({ err: error }, '[searchUsers] error');
         return res.status(500).json({ success: false, message: 'Search failed.' });
     }
 };
@@ -322,7 +323,7 @@ exports.sendFriendRequest = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('[sendFriendRequest] error:', error.message);
+        logger.error({ err: error }, '[sendFriendRequest] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -387,7 +388,7 @@ exports.getPendingRequests = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('[getPendingRequests] error:', error.message);
+        logger.error({ err: error }, '[getPendingRequests] error');
         return res.status(500).json({ success: false, message: 'Failed to fetch requests.' });
     }
 };
@@ -429,7 +430,7 @@ exports.getSentRequests = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('[getSentRequests] error:', error.message);
+        logger.error({ err: error }, '[getSentRequests] error');
         return res.status(500).json({ success: false, message: 'Failed to fetch sent requests.' });
     }
 };
@@ -505,7 +506,7 @@ exports.acceptFriendRequest = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('[acceptFriendRequest] error:', error.message);
+        logger.error({ err: error }, '[acceptFriendRequest] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -548,7 +549,7 @@ exports.rejectFriendRequest = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('[rejectFriendRequest] error:', error.message);
+        logger.error({ err: error }, '[rejectFriendRequest] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -788,7 +789,7 @@ exports.getFriends = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('[getFriends] error:', error.message);
+        logger.error({ err: error }, '[getFriends] error');
         return res.status(500).json({ success: false, message: 'Failed to fetch friends.' });
     }
 };
@@ -824,7 +825,7 @@ exports.removeFriend = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('[removeFriend] error:', error.message);
+        logger.error({ err: error }, '[removeFriend] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -881,7 +882,7 @@ exports.getFriendProfile = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('[getFriendProfile] error:', error.message);
+        logger.error({ err: error }, '[getFriendProfile] error');
         return res.status(500).json({ success: false, message: 'Failed to fetch profile.' });
     }
 };

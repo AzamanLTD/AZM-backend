@@ -1,3 +1,4 @@
+const logger = require('../src/config/logger');
 const crypto = require('crypto');
  
 // POST /api/contacts/sync
@@ -16,7 +17,7 @@ exports.syncContacts = async (req, res) => {
         });
         res.json({ success: true, matches });
     } catch (err) {
-        console.error('[syncContacts]', err.message);
+        logger.error({ err: err }, '[syncContacts]');
         res.status(500).json({ success: false, message: 'Sync failed' });
     }
 };

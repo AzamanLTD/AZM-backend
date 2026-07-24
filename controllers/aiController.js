@@ -37,13 +37,14 @@ const getAiCapabilities = async (req, res) => {
 
         res.status(200).json({ success: true, capabilities });
     } catch (error) {
-        console.error('[AI Controller] getAiCapabilities error:', error);
+        logger.error('[AI Controller] getAiCapabilities error:', error);
         res.status(500).json({ success: false, message: error.message });
     }
 };
 
 const triggerCfoAnalysis = async (req, res) => {
     try {
+        const logger = require('../src/config/logger');
         const CfoWorker = require('../workers/cfoWorker');
         const prisma = req.app.get('prisma');
 
@@ -52,7 +53,7 @@ const triggerCfoAnalysis = async (req, res) => {
 
         res.status(200).json({ success: true, analysis: result });
     } catch (error) {
-        console.error('[AI Controller] triggerCfoAnalysis error:', error);
+        logger.error('[AI Controller] triggerCfoAnalysis error:', error);
         res.status(500).json({ success: false, message: error.message });
     }
 };

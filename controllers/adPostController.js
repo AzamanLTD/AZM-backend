@@ -1,3 +1,4 @@
+const logger = require('../src/config/logger');
 const { createAdPost, removeAdPost, getActiveAds, getFeedAds } = require('../services/businessAdService');
 const { kybGate } = require('../middleware/kybGateMiddleware');
 

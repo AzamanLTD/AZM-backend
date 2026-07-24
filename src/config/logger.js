@@ -6,7 +6,6 @@
  * In development: pretty-prints with colorized output via pino-pretty.
  *
  * Usage:
- *   const logger = require('./src/config/logger');
  *   logger.info({ userId, action: 'deposit', amount }, 'Deposit processed');
  *   logger.error({ err, userId }, 'Withdrawal failed');
  *   logger.warn({ poolName, balance, threshold }, 'Fiat pool low');

@@ -6,7 +6,7 @@
 const wrap = (fn) => async (req, res) => {
     try { await fn(req, res); }
     catch (err) {
-        console.error(`[groupChatController] ${fn.name || 'h'}:`, err.message);
+        logger.error(`[groupChatController] ${fn.name || 'h'}:`, err.message);
         res.status(400).json({ success: false, message: err.message });
     }
 };
@@ -147,7 +147,7 @@ function gjrFail(res, err) {
             ...(err.fields ? { fields: err.fields } : {}),
         });
     }
-    console.error('[groupChatController] gjr:', err.message);
+    logger.error({ err: err }, '[groupChatController] gjr');
     return res.status(500).json({ success: false, message: 'Internal server error', errorCode: 'INTERNAL' });
 }
 const gjrWrap = (fn) => async (req, res) => { try { await fn(req, res); } catch (e) { gjrFail(res, e); } };

@@ -22,6 +22,7 @@
 // or KYC fields ever leave this service.
 // =============================================================================
 
+const logger = require('../../src/config/logger');
 const crypto = require('crypto');
 const { hashPhone } = require('./phoneHash');
 

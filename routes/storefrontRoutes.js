@@ -8,6 +8,7 @@
 // history, revert, apply-template, eligibility, analytics, render (mixed)
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const router = require('express').Router();
 const { protect } = require('../middleware/authMiddleware');
 const { protectActive } = require('../middleware/banGuardMiddleware');
@@ -23,7 +24,7 @@ function wrap(handler) {
     try {
       await handler(req, res);
     } catch (err) {
-      console.error('[Storefront]', err.message);
+      logger.error({ err: err }, '[Storefront]');
       res.status(400).json({ success: false, message: err.message });
     }
   };

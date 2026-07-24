@@ -10,6 +10,7 @@
 //                             StatsSection (W-01).
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const express = require('express');
 const router = express.Router();
 
@@ -62,7 +63,7 @@ router.get('/stats', async (req, res) => {
         res.set('Cache-Control', 'public, max-age=300');
         return res.status(200).json({ success: true, stats: cache.payload });
     } catch (err) {
-        console.error('[public/stats] error:', err.message);
+        logger.error({ err: err }, '[public/stats] error');
         return res.status(500).json({ success: false, message: 'Could not load stats.' });
     }
 });

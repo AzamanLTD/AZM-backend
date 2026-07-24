@@ -3,6 +3,7 @@
 // /api/admin/war-room/alerts (adminOnly)
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const express = require('express');
 const ctrl = require('../controllers/susu/adminWarRoomController');
 const { protect, adminOnly } = require('../middleware/authMiddleware');

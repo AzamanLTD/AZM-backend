@@ -77,7 +77,7 @@ async function recordDailyLogin(prisma, user, azmRewardService) {
         // the AZM credit must never block or fail the auth response itself.
         setImmediate(() => {
             azmRewardService.rewardLoginStreak(user.id, loginStreak)
-                .catch((err) => console.error('[loginStreakService] AZM login streak reward error:', err.message));
+                .catch((err) => logger.error({ err: err }, '[loginStreakService] AZM login streak reward error'));
         });
     }
 

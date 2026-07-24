@@ -88,12 +88,12 @@ const sweepTransitReminders = async (prisma) => {
             results.sent++;
         } catch (err) {
             results.errors++;
-            console.error(`[transitReminderWorker] Booking ${booking.id}:`, err.message);
+            logger.error(`[transitReminderWorker] Booking ${booking.id}:`, err.message);
         }
     }
 
     if (results.processed > 0) {
-        console.log(`[transitReminderWorker] Processed: ${results.processed}, Sent: ${results.sent}, Errors: ${results.errors}`);
+        logger.info(`[transitReminderWorker] Processed: ${results.processed}, Sent: ${results.sent}, Errors: ${results.errors}`);
     }
 
     return results;

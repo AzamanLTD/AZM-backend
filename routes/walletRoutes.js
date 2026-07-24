@@ -5,6 +5,7 @@
 // access); writes go through the ban guard.
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const express                  = require('express');
 const router                   = express.Router();
 const walletController         = require('../controllers/walletController');
@@ -182,7 +183,7 @@ router.post('/internal-transfer', protectActive, async (req, res) => {
             data: { direction, amount: amountFloat }
         });
     } catch (error) {
-        console.error('[wallet.internalTransfer] error:', error.message);
+        logger.error({ err: error }, '[wallet.internalTransfer] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 });

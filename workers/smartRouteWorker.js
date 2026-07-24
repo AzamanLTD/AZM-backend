@@ -15,7 +15,7 @@ class SmartRouteWorker {
     }
 
     start(intervalMs = 5 * 60 * 1000) {
-        console.log('[SmartRouteWorker] Started — sweeping every 5 minutes');
+        logger.info('[SmartRouteWorker] Started — sweeping every 5 minutes');
         this._tick();
         this.interval = setInterval(() => this._tick(), intervalMs);
     }
@@ -36,11 +36,11 @@ class SmartRouteWorker {
                 try {
                     await this.smartRouteService.runOnce(route.id);
                 } catch (err) {
-                    console.error(`[SmartRouteWorker] route ${route.id} failed:`, err.message);
+                    logger.error(`[SmartRouteWorker] route ${route.id} failed:`, err.message);
                 }
             }
         } catch (err) {
-            console.error('[SmartRouteWorker.tick]', err.message);
+            logger.error({ err: err }, '[SmartRouteWorker.tick]');
         }
     }
 }

@@ -14,6 +14,7 @@
 //   GENERAL | SECURITY_ACCOUNT | VENDOR_PRIORITY | ADMIN_SYSTEM
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const { sendPushNotification } = require('../utils/firebaseService');
 
 class NotificationService {
@@ -153,7 +154,7 @@ class NotificationService {
 
             await sendPushNotification(user.fcmToken, title, body, data);
         } catch (err) {
-            console.error('[NotificationService] FCM error:', err.message);
+            logger.error({ err: err }, '[NotificationService] FCM error');
         }
     }
 

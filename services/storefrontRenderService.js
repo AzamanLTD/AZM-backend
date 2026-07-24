@@ -1,6 +1,7 @@
 'use strict';
 
 // NOTE: prisma is passed as the first argument to render functions (req.app.get('prisma')).
+const logger = require('../src/config/logger');
 const { migrateLayout } = require('./storefrontSchemaMigration');
 const storefrontService = require('./storefrontService');
 
@@ -19,11 +20,11 @@ try {
       lazyConnect: true,
       retryStrategy: (times) => (times > 3 ? null : Math.min(times * 200, 1000)),
     });
-    redisClient.on('error', (e) => console.warn('[StorefrontRender] Redis cache error:', e.message));
-    redisClient.on('connect', () => console.log('[StorefrontRender] Redis cache connected'));
+    redisClient.on('error', (e) => logger.warn('[StorefrontRender] Redis cache error:', e.message));
+    redisClient.on('connect', () => logger.info('[StorefrontRender] Redis cache connected'));
   }
 } catch (e) {
-  console.warn('[StorefrontRender] Redis not available, using in-memory cache');
+  logger.warn('[StorefrontRender] Redis not available, using in-memory cache');
 }
 
 function getCacheKey(businessProfileId) {
@@ -136,7 +137,7 @@ async function renderStorefront(prisma, businessProfileId) {
     }
   } catch (e) {
     // Non-blocking: if stake check fails, render the layout as-is
-    console.warn('[StorefrontRender] Stake check error:', e.message);
+    logger.warn('[StorefrontRender] Stake check error:', e.message);
   }
 
   // Merge widget defaultProps into tile props

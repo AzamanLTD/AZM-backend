@@ -13,6 +13,7 @@
 // the user is permitted to perform write actions.
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const { protect } = require('./authMiddleware');
 
 const APPEAL_EMAIL = process.env.APPEAL_EMAIL || 'support@azaman.me';
@@ -65,7 +66,7 @@ const checkBan = async (req, res, next) => {
                 where: { id: parseInt(req.user.id, 10) },
                 data:  { banStatus: 'ACTIVE', banUntil: null }
             });
-            console.log(`[banGuard] Auto-restored expired ban for user ${req.user.id}`);
+            logger.info(`[banGuard] Auto-restored expired ban for user ${req.user.id}`);
             return next();
         }
 
@@ -81,7 +82,7 @@ const checkBan = async (req, res, next) => {
                 `If you believe this is in error, contact ${APPEAL_EMAIL} to appeal.`
         });
     } catch (err) {
-        console.error('[banGuard] error:', err.message);
+        logger.error({ err: err }, '[banGuard] error');
         // Fail-closed on the strict reading: if we cannot verify ban status,
         // do not allow the write to proceed.
         return res.status(500).json({

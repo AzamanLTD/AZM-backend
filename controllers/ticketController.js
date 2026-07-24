@@ -29,6 +29,7 @@ const VALID_MESSAGE_TYPES = new Set([
 
 // Smart Escrow & Business Accounts (2026-06-14): ESCROW-type tickets auto-create
 // a SmartEscrow record; business-mode tickets bypass the friendship requirement.
+const logger = require('../src/config/logger');
 const escrowService = require('../services/escrowService');
 const businessOrderService = require('../services/businessOrderService');
 const bizNotificationService = require('../services/bizNotificationService');
@@ -264,7 +265,7 @@ exports.createTicket = async (req, res) => {
                         customerNotes:     customerNotes || null
                     });
                 } catch (orderErr) {
-                    console.error('[createTicket] BusinessOrder creation failed:', orderErr.message);
+                    logger.error({ err: orderErr }, '[createTicket] BusinessOrder creation failed');
                 }
             }
 
@@ -286,7 +287,7 @@ exports.createTicket = async (req, res) => {
                                 action:  'VIEW_BUSINESS_ORDER',
                                 orderId: businessOrder.id
                             }
-                        }).catch((e) => console.error('[createTicket] notification:', e.message));
+                        }).catch((e) => logger.error({ err: e }, '[createTicket] notification'));
                     });
                 }
 
@@ -295,7 +296,7 @@ exports.createTicket = async (req, res) => {
                     bizNotificationService.notifyOrderEvent(prisma, {
                         escrowId: escrow.id,
                         type: 'NEW_ORDER'
-                    }).catch((e) => console.error('[createTicket] biz notif:', e.message));
+                    }).catch((e) => logger.error({ err: e }, '[createTicket] biz notif'));
                 });
                 if (io && bizProfile) {
                     io.to(`user_${bizProfile.userId}`).emit('biz_notification', { type: 'NEW_ORDER' });
@@ -331,7 +332,7 @@ exports.createTicket = async (req, res) => {
 
         return res.status(201).json({ success: true, ticket });
     } catch (err) {
-        console.error('[createTicket] error:', err.message);
+        logger.error({ err: err }, '[createTicket] error');
         return res.status(500).json({ success: false, message: err.message });
     }
 };
@@ -420,7 +421,7 @@ exports.listTickets = async (req, res) => {
             nextCursor
         });
     } catch (err) {
-        console.error('[listTickets] error:', err.message);
+        logger.error({ err: err }, '[listTickets] error');
         return res.status(500).json({ success: false, message: err.message });
     }
 };
@@ -454,7 +455,7 @@ exports.getTicket = async (req, res) => {
             messages: messages.reverse() // chronological for client
         });
     } catch (err) {
-        console.error('[getTicket] error:', err.message);
+        logger.error({ err: err }, '[getTicket] error');
         return res.status(500).json({ success: false, message: err.message });
     }
 };
@@ -554,7 +555,7 @@ exports.sendTicketMessage = async (req, res) => {
 
         return res.status(201).json({ success: true, message });
     } catch (err) {
-        console.error('[sendTicketMessage] error:', err.message);
+        logger.error({ err: err }, '[sendTicketMessage] error');
         return res.status(500).json({ success: false, message: err.message });
     }
 };
@@ -652,7 +653,7 @@ exports.changeTicketStatus = async (req, res) => {
 
         return res.status(200).json({ success: true, ticket });
     } catch (err) {
-        console.error('[changeTicketStatus] error:', err.message);
+        logger.error({ err: err }, '[changeTicketStatus] error');
         return res.status(500).json({ success: false, message: err.message });
     }
 };
@@ -693,7 +694,7 @@ exports.pingPresence = async (req, res) => {
 
         return res.status(200).json({ success: true });
     } catch (err) {
-        console.error('[pingPresence] error:', err.message);
+        logger.error({ err: err }, '[pingPresence] error');
         return res.status(500).json({ success: false, message: err.message });
     }
 };

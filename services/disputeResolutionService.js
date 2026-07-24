@@ -177,7 +177,7 @@ class DisputeResolutionService {
                     actionPayload: { action: 'OPEN_TRADE', tradeId: String(tradeId) },
                 });
             } catch (err) {
-                console.error('[DisputeResolution] notification error:', err.message);
+                logger.error({ err: err }, '[DisputeResolution] notification error');
             }
         });
 

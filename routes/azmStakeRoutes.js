@@ -7,6 +7,7 @@
 // 4 endpoints: create stake, request unstake, list stakes, get tier info
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const router = require('express').Router();
 const { protect } = require('../middleware/authMiddleware');
 const { protectActive } = require('../middleware/banGuardMiddleware');
@@ -18,7 +19,7 @@ function wrap(handler) {
     try {
       await handler(req, res);
     } catch (err) {
-      console.error('[AzmStake]', err.message);
+      logger.error({ err: err }, '[AzmStake]');
       res.status(400).json({ success: false, message: err.message });
     }
   };

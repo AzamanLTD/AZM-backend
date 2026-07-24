@@ -1,3 +1,4 @@
+const logger = require('../src/config/logger');
 const express = require('express');
 const router = express.Router();
 const aiController = require('../controllers/aiController');
@@ -20,7 +21,7 @@ router.post('/queue/process/:adId', protect, adminOnly, async (req, res) => {
         const result = await queueController.processNextInQueue(adId, { prisma, io });
         res.status(200).json({ success: true, processed: result });
     } catch (error) {
-        console.error('[AI Routes] processNextInQueue error:', error);
+        logger.error('[AI Routes] processNextInQueue error:', error);
         res.status(500).json({ success: false, message: error.message });
     }
 });

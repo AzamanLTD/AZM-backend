@@ -1,6 +1,7 @@
 // services/groupChatSocketService.js
 // AZAMAN PREMIUM GROUP CHAT SOCKET SERVICE
 
+const logger = require('../src/config/logger');
 const crypto = require('crypto');
 
 class GroupChatSocketService {
@@ -117,7 +118,7 @@ class GroupChatSocketService {
           }
         }
       } catch (e) {
-        console.error("SOCKET ERROR:", e); socket.emit('message_error', { reason: 'server_error', localId: data.localId });
+        logger.error("SOCKET ERROR:", e); socket.emit('message_error', { reason: 'server_error', localId: data.localId });
       }
     });
 

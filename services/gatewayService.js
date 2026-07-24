@@ -20,6 +20,7 @@
 // the codebase reads from a single source (the GlobalSettings singleton).
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const axios  = require('axios');
 const crypto = require('crypto');
 
@@ -49,9 +50,9 @@ class GatewayService {
         this._mockPayouts   = new Map();   // reference → mock state (for status polling + simulateInbound)
 
         if (this.providerMode === 'MOCK') {
-            console.log('[GatewayService] Running in MOCK mode (set KOTANI_API_KEY + KOTANI_PROVIDER=LIVE for live calls).');
+            logger.info('[GatewayService] Running in MOCK mode (set KOTANI_API_KEY + KOTANI_PROVIDER=LIVE for live calls).');
         } else {
-            console.log(`[GatewayService] Running in LIVE mode → ${this.baseUrl}`);
+            logger.info(`[GatewayService] Running in LIVE mode → ${this.baseUrl}`);
         }
     }
 
@@ -94,7 +95,7 @@ class GatewayService {
                     source:        'LIVE'
                 };
             } catch (err) {
-                console.error('[GatewayService.fetchOfframpRates] LIVE call failed → falling back to MOCK:', err.message);
+                logger.error({ err: err }, '[GatewayService.fetchOfframpRates] LIVE call failed → falling back to MOCK');
                 // Fall through — never let a transient gateway outage break the platform.
             }
         }
@@ -222,13 +223,13 @@ class GatewayService {
                     liveUsdToGhs:      rates.retailRate
                 }
             });
-            console.log(
+            logger.info(
                 `[GatewayService] Rate sync ✓ retail=${rates.retailRate} ` +
                 `corporate=${rates.corporateRate} source=${rates.source}`
             );
             return rates;
         } catch (err) {
-            console.error('[GatewayService] Rate sync failed:', err.message);
+            logger.error({ err: err }, '[GatewayService] Rate sync failed');
             return null;
         }
     }
@@ -237,7 +238,7 @@ class GatewayService {
      * Boot the periodic rate sync. Mirrors OracleService.startOracle().
      */
     startRateSync() {
-        console.log(`[GatewayService] Rate sync booting (interval: ${this.syncIntervalMs / 1000}s)`);
+        logger.info(`[GatewayService] Rate sync booting (interval: ${this.syncIntervalMs / 1000}s)`);
         this.syncRatesToGlobalSettings();   // fire once immediately
         setInterval(() => this.syncRatesToGlobalSettings(), this.syncIntervalMs);
     }

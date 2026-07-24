@@ -70,7 +70,7 @@ const runDoubleCheck = async (prisma, userId) => {
             `  Action                   : transaction FROZEN — flagged for manual review.`
         ].join('\n');
 
-        console.error(msg);
+        logger.error(msg);
         throw new Error(msg);
     }
 

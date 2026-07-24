@@ -11,6 +11,7 @@
 // The worker receives the prisma instance from server.js on init.
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const azmStakeService = require('../services/azmStakeService');
 const storefrontService = require('../services/storefrontService');
 
@@ -68,10 +69,10 @@ async function autoDowngradeLapsedStakes(prisma) {
         }).catch(() => {});
 
         downgradedCount++;
-        console.log(`[StorefrontStakeWorker] Auto-downgraded layout for business ${layout.businessProfileId}: ${downgraded.length} widgets downgraded`);
+        logger.info(`[StorefrontStakeWorker] Auto-downgraded layout for business ${layout.businessProfileId}: ${downgraded.length} widgets downgraded`);
       }
     } catch (err) {
-      console.error(`[StorefrontStakeWorker] Error checking layout ${layout.id}:`, err.message);
+      logger.error(`[StorefrontStakeWorker] Error checking layout ${layout.id}:`, err.message);
     }
   }
 
@@ -84,37 +85,37 @@ function start(prisma) {
   // Daily check at 00:00 UTC (every 24 hours)
   const dailyCheck = async () => {
     try {
-      console.log('[StorefrontStakeWorker] Daily stake check starting...');
+      logger.info('[StorefrontStakeWorker] Daily stake check starting...');
       const result = await azmStakeService.checkActiveStakes(prismaInstance);
 
       // PHASE 8: Auto-downgrade layouts with lapsed stakes
       const downgradeResult = await autoDowngradeLapsedStakes(prismaInstance);
       if (downgradeResult.downgradedCount > 0) {
-        console.log(`[StorefrontStakeWorker] Auto-downgraded ${downgradeResult.downgradedCount} layouts out of ${downgradeResult.totalChecked} checked.`);
+        logger.info(`[StorefrontStakeWorker] Auto-downgraded ${downgradeResult.downgradedCount} layouts out of ${downgradeResult.totalChecked} checked.`);
       }
 
-      console.log('[StorefrontStakeWorker] Daily check complete:', { ...result, ...downgradeResult });
+      logger.info('[StorefrontStakeWorker] Daily check complete:', { ...result, ...downgradeResult });
     } catch (err) {
-      console.error('[StorefrontStakeWorker] Daily check error:', err.message);
+      logger.error({ err: err }, '[StorefrontStakeWorker] Daily check error');
     }
   };
 
   // Hourly unstake completion
   const hourlyUnstake = async () => {
     try {
-      console.log('[StorefrontStakeWorker] Hourly unstake queue processing...');
+      logger.info('[StorefrontStakeWorker] Hourly unstake queue processing...');
       const result = await azmStakeService.processUnstakeQueue(prismaInstance);
       if (result.completed > 0) {
-        console.log(`[StorefrontStakeWorker] Completed ${result.completed} unstakes.`);
+        logger.info(`[StorefrontStakeWorker] Completed ${result.completed} unstakes.`);
 
         // PHASE 8: After completing unstakes, check for layouts needing downgrade
         const downgradeResult = await autoDowngradeLapsedStakes(prismaInstance);
         if (downgradeResult.downgradedCount > 0) {
-          console.log(`[StorefrontStakeWorker] Post-unstake downgrade: ${downgradeResult.downgradedCount} layouts.`);
+          logger.info(`[StorefrontStakeWorker] Post-unstake downgrade: ${downgradeResult.downgradedCount} layouts.`);
         }
       }
     } catch (err) {
-      console.error('[StorefrontStakeWorker] Unstake queue error:', err.message);
+      logger.error({ err: err }, '[StorefrontStakeWorker] Unstake queue error');
     }
   };
 
@@ -125,7 +126,7 @@ function start(prisma) {
   dailyIntervalId = setInterval(dailyCheck, 24 * 60 * 60 * 1000);
   hourlyIntervalId = setInterval(hourlyUnstake, 60 * 60 * 1000);
 
-  console.log('[StorefrontStakeWorker] Started — daily check + hourly unstake queue + auto-downgrade');
+  logger.info('[StorefrontStakeWorker] Started — daily check + hourly unstake queue + auto-downgrade');
 }
 
 function stop() {
@@ -133,7 +134,7 @@ function stop() {
   if (hourlyIntervalId) clearInterval(hourlyIntervalId);
   dailyIntervalId = null;
   hourlyIntervalId = null;
-  console.log('[StorefrontStakeWorker] Stopped');
+  logger.info('[StorefrontStakeWorker] Stopped');
 }
 
 module.exports = { start, stop, autoDowngradeLapsedStakes };

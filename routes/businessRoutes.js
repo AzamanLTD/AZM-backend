@@ -11,6 +11,7 @@
 //   • /:bizId             MUST be last (it captures any single segment)
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const router = require('express').Router();
 const { protect }       = require('../middleware/authMiddleware');
 const { protectActive } = require('../middleware/banGuardMiddleware');

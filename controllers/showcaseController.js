@@ -1,3 +1,4 @@
+const logger = require('../src/config/logger');
 const showcaseService = require('../services/businessShowcaseService');
 
 exports.add = async (req, res) => {

@@ -132,7 +132,7 @@ exports.submitApplication = async (req, res) => {
       },
     });
 
-    console.log(`✅ [Vendor] New application submitted: user=${userId}, app=${application.id}`);
+    logger.info(`✅ [Vendor] New application submitted: user=${userId}, app=${application.id}`);
 
     // Notify admin War Room in real-time via socket
     try {
@@ -156,7 +156,7 @@ exports.submitApplication = async (req, res) => {
       status: application.status,
     });
   } catch (error) {
-    console.error('❌ [Vendor] Application submission error:', error);
+    logger.error('❌ [Vendor] Application submission error:', error);
     return res.status(500).json({
       success: false,
       message: 'Server error. Please try again.',
@@ -202,7 +202,7 @@ exports.getApplicationStatus = async (req, res) => {
       reviewedAt: application.reviewedAt,
     });
   } catch (error) {
-    console.error('❌ [Vendor] Status check error:', error);
+    logger.error('❌ [Vendor] Status check error:', error);
     return res.status(500).json({ success: false, message: 'Server error.' });
   }
 };
@@ -252,7 +252,7 @@ exports.listApplications = async (req, res) => {
       },
     });
   } catch (error) {
-    console.error('❌ [Vendor] List applications error:', error);
+    logger.error('❌ [Vendor] List applications error:', error);
     return res.status(500).json({ success: false, message: 'Server error.' });
   }
 };
@@ -326,7 +326,7 @@ exports.reviewApplication = async (req, res) => {
     });
 
     const action = decision === 'APPROVED' ? 'approved' : 'rejected';
-    console.log(`✅ [Vendor] Application ${id} ${action} by admin ${adminId}`);
+    logger.info(`✅ [Vendor] Application ${id} ${action} by admin ${adminId}`);
 
     // Send in-app notification to user about application result
     try {
@@ -348,7 +348,7 @@ exports.reviewApplication = async (req, res) => {
         });
       }
     } catch (notifErr) {
-      console.error('⚠️ [Vendor] Failed to send in-app notification:', notifErr.message);
+      logger.error({ err: notifErr }, '⚠️ [Vendor] Failed to send in-app notification');
     }
 
     // Send email notification to user about application result
@@ -392,11 +392,11 @@ exports.reviewApplication = async (req, res) => {
           : `Hi ${userName}, your vendor application has been rejected.${reason ? ' Reason: ' + reason : ''} You may submit a new application after addressing the issues.`;
 
         await emailService.sendEmail(application.user.email, subject, htmlContent, textContent);
-        console.log(`📧 [Vendor] Notification email sent to ${application.user.email} (${action})`);
+        logger.info(`📧 [Vendor] Notification email sent to ${application.user.email} (${action})`);
       }
     } catch (emailErr) {
       // Don't fail the review if email fails — log and continue
-      console.error('⚠️ [Vendor] Failed to send notification email:', emailErr.message);
+      logger.error({ err: emailErr }, '⚠️ [Vendor] Failed to send notification email');
     }
 
     return res.status(200).json({
@@ -405,7 +405,7 @@ exports.reviewApplication = async (req, res) => {
       application: updated,
     });
   } catch (error) {
-    console.error('❌ [Vendor] Review error:', error);
+    logger.error('❌ [Vendor] Review error:', error);
     return res.status(500).json({ success: false, message: 'Server error.' });
   }
 };

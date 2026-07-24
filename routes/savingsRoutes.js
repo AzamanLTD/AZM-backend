@@ -4,6 +4,7 @@
 // Mounted at /api/savings in server.js
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const express = require('express');
 const router = express.Router();
 const savingsController = require('../controllers/savingsController');

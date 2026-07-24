@@ -4,6 +4,7 @@
 // Mounted at /api/tickets. All endpoints authenticated.
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const express = require('express');
 const router  = express.Router();
 

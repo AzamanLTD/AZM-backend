@@ -10,6 +10,7 @@
 //   - FCM fan-out to every ADMIN-role user (excluding the treasury sentinel)
 // =============================================================================
 
+const logger = require('../../src/config/logger');
 const AdminWarRoomRepo = require('../../repositories/adminWarRoomRepo');
 
 class AdminWarRoomService {
@@ -31,7 +32,7 @@ class AdminWarRoomService {
     // Fan to admins on next tick so the cycle/seizure transaction commits first.
     if (this.notificationService) {
       setImmediate(() => this._fanToAdmins(alertType, payload, row.id).catch(err => {
-        console.warn('[AdminWarRoom] fan-out failed:', err.message);
+        logger.warn('[AdminWarRoom] fan-out failed:', err.message);
       }));
     }
     return row;
@@ -58,7 +59,7 @@ class AdminWarRoomService {
           actionPayload: { action: 'OPEN_WAR_ROOM', alertId, alertType },
         });
       } catch (err) {
-        console.warn(`[AdminWarRoom] notify admin ${a.id} failed:`, err.message);
+        logger.warn(`[AdminWarRoom] notify admin ${a.id} failed:`, err.message);
       }
     }
   }

@@ -149,6 +149,7 @@ const searchBusinesses = async (prisma, { query, category, verified, limit, curs
     });
 
     if (useTrending) {
+        const logger = require('../src/config/logger');
         const { discoveryScore } = require('../utils/ranking');
         rows.sort((a, b) => discoveryScore(b) - discoveryScore(a));
     }

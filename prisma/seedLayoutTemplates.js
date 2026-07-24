@@ -1,10 +1,11 @@
 'use strict';
 
+const logger = require('../src/config/logger');
 const { PrismaClient } = require('@prisma/client');
 const prisma = new PrismaClient();
 
 async function seedTemplates() {
-  console.log('[Seed] Seeding storefront layout templates...');
+  logger.info('[Seed] Seeding storefront layout templates...');
 
   // First ensure we have the themes to reference
   const classicLight = await prisma.businessStorefrontTheme.findUnique({ where: { key: 'classic_light' } });
@@ -151,13 +152,13 @@ async function seedTemplates() {
     }
   }
 
-  console.log(`[Seed] ${templates.length} storefront templates seeded`);
+  logger.info(`[Seed] ${templates.length} storefront templates seeded`);
 }
 
 module.exports = { seedTemplates };
 
 if (require.main === module) {
   seedTemplates()
-    .catch((e) => { console.error(e); process.exit(1); })
+    .catch((e) => { logger.error(e); process.exit(1); })
     .finally(() => prisma.$disconnect());
 }

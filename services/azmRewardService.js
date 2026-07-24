@@ -84,7 +84,7 @@ class AzmRewardService {
     async creditAzm({ userId, amount, source, reason, metadata = null, dedupKey = null }) {
         try {
             if (!userId || !amount || amount <= 0 || !source || !reason) {
-                console.error('[AzmRewardService.creditAzm] Invalid params:', { userId, amount, source });
+                logger.error('[AzmRewardService.creditAzm] Invalid params:', { userId, amount, source });
                 return { credited: false, newBalance: 0, logId: null };
             }
 
@@ -131,7 +131,7 @@ class AzmRewardService {
 
             return { credited: true, ...result };
         } catch (err) {
-            console.error(`[AzmRewardService.creditAzm] userId=${userId} source=${source} error:`, err.message);
+            logger.error(`[AzmRewardService.creditAzm] userId=${userId} source=${source} error:`, err.message);
             return { credited: false, newBalance: 0, logId: null };
         }
     }
@@ -486,7 +486,7 @@ class AzmRewardService {
                 timestamp: new Date().toISOString()
             });
         } catch (err) {
-            console.error('[AzmRewardService._emitBalanceUpdate] socket error:', err.message);
+            logger.error({ err: err }, '[AzmRewardService._emitBalanceUpdate] socket error');
         }
     }
 }

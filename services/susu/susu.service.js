@@ -16,6 +16,7 @@
 //   - assertVisibleToCaller: Req 5 privacy gate (uniform 404 fallthrough)
 // =============================================================================
 
+const logger = require('../../src/config/logger');
 const { Prisma } = require('@prisma/client');
 const { SusuError, ErrorCodes, susuNotFound } = require('./errors');
 const SusuRepo = require('../../repositories/susuRepo');

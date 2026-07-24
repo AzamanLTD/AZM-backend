@@ -41,6 +41,7 @@
 // services/finance.service.js (processCryptoDeposit).
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const axios          = require('axios');
 const crypto         = require('crypto');
 
@@ -66,12 +67,12 @@ class TatumService {
         this._addressCache = new Map();
 
         if (this.providerMode === 'MOCK') {
-            console.log(
+            logger.info(
                 '[TatumService] Running in MOCK mode ' +
                 '(set TATUM_API_KEY + TATUM_XPUB + TATUM_PROVIDER=LIVE for live calls).'
             );
         } else {
-            console.log(`[TatumService] Running in LIVE mode → ${this.baseUrl}`);
+            logger.info(`[TatumService] Running in LIVE mode → ${this.baseUrl}`);
         }
     }
 
@@ -144,7 +145,7 @@ class TatumService {
         }
 
         if (!this.webhookUrl) {
-            console.warn('[TatumService] TATUM_WEBHOOK_URL not set — skipping subscription.');
+            logger.warn('[TatumService] TATUM_WEBHOOK_URL not set — skipping subscription.');
             return { subscriptionId: null, source: 'LIVE' };
         }
 
@@ -171,7 +172,7 @@ class TatumService {
             return { subscriptionId: data.id || null, source: 'LIVE' };
         } catch (err) {
             const apiMsg = err.response?.data?.message || err.message;
-            console.error(`[TatumService] Subscription failed for ${address}: ${apiMsg}`);
+            logger.error(`[TatumService] Subscription failed for ${address}: ${apiMsg}`);
             // Non-fatal — the address is still valid, just won't get webhook pushes
             return { subscriptionId: null, source: 'LIVE' };
         }
@@ -187,7 +188,7 @@ class TatumService {
      */
     verifyWebhookSignature(rawBody, signatureHeader) {
         if (!this.webhookSecret) {
-            console.warn('[TatumService] TATUM_WEBHOOK_SECRET not set — cannot verify HMAC.');
+            logger.warn('[TatumService] TATUM_WEBHOOK_SECRET not set — cannot verify HMAC.');
             return false;
         }
         if (!signatureHeader || !rawBody) {

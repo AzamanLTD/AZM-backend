@@ -8,6 +8,7 @@
  * Admin-only:
  *   PATCH /qr/destination — update the redirect destination
  */
+const logger = require('../src/config/logger');
 const express = require('express');
 const router = express.Router();
 const { protect, adminOnly } = require('../middleware/authMiddleware');

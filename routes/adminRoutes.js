@@ -8,6 +8,7 @@
 // Mounted at /api/admin in server.js
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const express = require('express');
 const router = express.Router();
 const adminController = require('../controllers/adminController');
@@ -207,7 +208,7 @@ router.post('/users/:id/credit', async (req, res) => {
             data: { userId, username: user.username, credited: amountFloat }
         });
     } catch (error) {
-        console.error('[admin.creditUser] error:', error.message);
+        logger.error({ err: error }, '[admin.creditUser] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 });
@@ -257,7 +258,7 @@ router.put('/version-gate', async (req, res) => {
             select: { minAppVersion: true, forceUpdateUrl: true, updateMessage: true },
         });
 
-        console.log(`[Admin] Version gate updated: minAppVersion=${settings.minAppVersion}`);
+        logger.info(`[Admin] Version gate updated: minAppVersion=${settings.minAppVersion}`);
         return res.status(200).json({ success: true, data: settings });
     } catch (error) {
         return res.status(500).json({ success: false, message: error.message });
@@ -311,7 +312,7 @@ router.post('/disputes/:tradeId/resolve', async (req, res) => {
         return res.status(200).json({ success: true, data: resolution });
 
     } catch (error) {
-        console.error('[admin.resolveDispute] error:', error.message);
+        logger.error({ err: error }, '[admin.resolveDispute] error');
         const status = error.message.includes('not found') ? 404 :
                        error.message.includes('Invalid') || error.message.includes('required') ? 400 :
                        error.message.includes('already') ? 409 : 500;
@@ -333,7 +334,7 @@ router.get('/disputes/resolutions', async (req, res) => {
 
         return res.status(200).json({ success: true, data: resolutions });
     } catch (error) {
-        console.error('[admin.disputeResolutions] error:', error.message);
+        logger.error({ err: error }, '[admin.disputeResolutions] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 });

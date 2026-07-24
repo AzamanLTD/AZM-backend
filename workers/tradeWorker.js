@@ -10,6 +10,7 @@
 //     (lazy-create the trade conversation, write a SYSTEM_URGENCY message).
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const NotificationService = require('../services/notificationService');
 
 class TradeWorker {
@@ -26,13 +27,13 @@ class TradeWorker {
     start() {
         this.startMilestoneWorker();
         this.startEscrowAutoReleaseWorker();
-        console.log('🔄 Trade workers started (Milestone + Escrow Auto-Cancel)');
+        logger.info('🔄 Trade workers started (Milestone + Escrow Auto-Cancel)');
     }
 
     stop() {
         if (this.milestoneInterval) clearInterval(this.milestoneInterval);
         if (this.escrowInterval)    clearInterval(this.escrowInterval);
-        console.log('🛑 Trade workers stopped');
+        logger.info('🛑 Trade workers stopped');
     }
 
     // ── Milestone worker ─────────────────────────────────────────────────────
@@ -83,7 +84,7 @@ class TradeWorker {
                 }
             }
         } catch (err) {
-            console.error('Milestone worker error:', err.message);
+            logger.error({ err: err }, 'Milestone worker error');
         }
     }
 
@@ -149,16 +150,16 @@ class TradeWorker {
                         })
                     ]);
                 } catch (err) {
-                    console.error(`[tradeWorker._triggerMilestone] notification non-fatal: ${err.message}`);
+                    logger.error({ err }, '[tradeWorker._triggerMilestone] notification non-fatal');
                 }
             });
 
             if (this.tradeSocketService?.emitMilestoneWarning) {
                 this.tradeSocketService.emitMilestoneWarning(tradeId, percent);
             }
-            console.log(`⚠️ Milestone ${percent}% triggered for Trade #${tradeId}`);
+            logger.info(`⚠️ Milestone ${percent}% triggered for Trade #${tradeId}`);
         } catch (err) {
-            console.error(`Milestone trigger error for Trade #${tradeId}:`, err.message);
+            logger.error(`Milestone trigger error for Trade #${tradeId}:`, err.message);
         }
     }
 
@@ -190,7 +191,7 @@ class TradeWorker {
             if (expiredTrades.length === 0) return;
             for (const trade of expiredTrades) await this._autoCancelTrade(trade);
         } catch (err) {
-            console.error('Escrow auto-release worker error:', err.message);
+            logger.error({ err: err }, 'Escrow auto-release worker error');
         }
     }
 
@@ -270,11 +271,11 @@ class TradeWorker {
                         })
                     ]);
                 } catch (err) {
-                    console.error(`[tradeWorker._autoCancelTrade] notification non-fatal: ${err.message}`);
+                    logger.error({ err }, '[tradeWorker._autoCancelTrade] notification non-fatal');
                 }
             });
 
-            console.log(`🔄 Trade #${trade.id} auto-cancelled. Escrow returned: ${trade.amountCrypto} USDC.`);
+            logger.info(`🔄 Trade #${trade.id} auto-cancelled. Escrow returned: ${trade.amountCrypto} USDC.`);
 
             // Phase P1: auto-process queue — slot opened on this trade's ad
             setImmediate(async () => {
@@ -288,17 +289,17 @@ class TradeWorker {
                         await processNextInQueue(fullTrade.adId, { prisma: this.prisma, io: this.io });
                     }
                 } catch (queueErr) {
-                    console.error(`[tradeWorker] queue auto-process error tradeId=${trade.id}: ${queueErr.message}`);
+                    logger.error(`[tradeWorker] queue auto-process error tradeId=${trade.id}: ${queueErr.message}`);
                 }
             });
         } catch (err) {
             // Phase H9: race with another worker tick or buyer-cancel.
             // Already-handled trades are not an error condition.
             if (err.message === 'TRADE_ALREADY_FINALIZED') {
-                console.log(`[tradeWorker] Trade #${trade.id} already finalized — skipping auto-cancel.`);
+                logger.info(`[tradeWorker] Trade #${trade.id} already finalized — skipping auto-cancel.`);
                 return;
             }
-            console.error(`Auto-cancel error for Trade #${trade.id}:`, err.message);
+            logger.error(`Auto-cancel error for Trade #${trade.id}:`, err.message);
         }
     }
 }

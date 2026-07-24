@@ -13,6 +13,7 @@
  *   - "dojah" → real Dojah API calls (https://api.dojah.io)
  */
 
+const logger = require('../src/config/logger');
 const crypto = require('crypto');
 const fieldCipher = require('./crypto/fieldCipher');
 
@@ -94,7 +95,7 @@ class KYCService {
     async processWebhook(payload, signature, rawBody) {
         // 1. Verify HMAC signature
         if (!this._verifyWebhookSignature(payload, signature, rawBody)) {
-            console.error('❌ [KYC] Webhook signature verification FAILED');
+            logger.error('❌ [KYC] Webhook signature verification FAILED');
             return { success: false, message: 'Invalid webhook signature.' };
         }
 
@@ -107,7 +108,7 @@ class KYCService {
         } = this._normalizeWebhookPayload(payload);
 
         if (!referenceId) {
-            console.error('❌ [KYC] Webhook missing reference_id');
+            logger.error('❌ [KYC] Webhook missing reference_id');
             return { success: false, message: 'Missing reference_id in webhook payload.' };
         }
 
@@ -123,7 +124,7 @@ class KYCService {
         // userId to Int and validate.
         const userId = this._extractUserIdFromReference(referenceId);
         if (!userId) {
-            console.error(`❌ [KYC] Cannot extract userId from referenceId: ${referenceId}`);
+            logger.error(`❌ [KYC] Cannot extract userId from referenceId: ${referenceId}`);
             return { success: false, message: 'Invalid reference_id format.' };
         }
 
@@ -133,7 +134,7 @@ class KYCService {
         });
 
         if (!user) {
-            console.error(`❌ [KYC] User not found for referenceId: ${referenceId}`);
+            logger.error(`❌ [KYC] User not found for referenceId: ${referenceId}`);
             return { success: false, message: 'User not found.' };
         }
 
@@ -158,7 +159,7 @@ class KYCService {
             data: updateData
         });
 
-        console.log(`✅ [KYC] User ${userId} → ${newStatus} (confidence: ${overallConfidence}, provider status: ${verificationStatus})`);
+        logger.info(`✅ [KYC] User ${userId} → ${newStatus} (confidence: ${overallConfidence}, provider status: ${verificationStatus})`);
 
         // B-11: when the provider succeeded but the confidence score landed
         // BETWEEN the auto-reject and auto-approve thresholds, the result needs
@@ -235,7 +236,7 @@ class KYCService {
             data: { kycStatus: newStatus }
         });
 
-        console.log(`✅ [KYC] Admin override: user ${userIdInt} → ${newStatus} by admin ${adminId} (reason: ${reason})`);
+        logger.info(`✅ [KYC] Admin override: user ${userIdInt} → ${newStatus} by admin ${adminId} (reason: ${reason})`);
 
         // Send notification
         await this._sendKycResultNotification(userIdInt, newStatus);
@@ -326,7 +327,7 @@ class KYCService {
 
             if (!response.ok) {
                 const errorBody = await response.text();
-                console.error(`❌ [KYC/Dojah] Initialize failed (${response.status}): ${errorBody}`);
+                logger.error(`❌ [KYC/Dojah] Initialize failed (${response.status}): ${errorBody}`);
                 return {
                     success: false,
                     message: 'Failed to initialize KYC session with provider.'
@@ -341,7 +342,7 @@ class KYCService {
                 data: { kycStatus: 'PENDING' }
             });
 
-            console.log(`✅ [KYC/Dojah] Session initialized for user ${userId}, ref: ${referenceId}`);
+            logger.info(`✅ [KYC/Dojah] Session initialized for user ${userId}, ref: ${referenceId}`);
 
             return {
                 success: true,
@@ -351,7 +352,7 @@ class KYCService {
                 expiresAt: new Date(Date.now() + 30 * 60 * 1000).toISOString() // 30 min session
             };
         } catch (error) {
-            console.error('❌ [KYC/Dojah] Initialize error:', error.message);
+            logger.error({ err: error }, '❌ [KYC/Dojah] Initialize error');
             return {
                 success: false,
                 message: 'KYC provider unavailable. Please try again later.'
@@ -364,14 +365,14 @@ class KYCService {
     // ─────────────────────────────────────────────────────────────────────────
 
     _mockInitializeSession({ userId, email, referenceId }) {
-        console.log(`✅ [KYC/MOCK] Session initialized for user ${userId}, ref: ${referenceId}`);
+        logger.info(`✅ [KYC/MOCK] Session initialized for user ${userId}, ref: ${referenceId}`);
 
         // In MOCK mode, mark as PENDING immediately
         // (the mock webhook can be triggered manually or auto-fires in test)
         this.prisma.user.update({
             where: { id: userId },
             data: { kycStatus: 'PENDING' }
-        }).catch(err => console.error('[KYC/MOCK] Failed to set PENDING:', err.message));
+        }).catch(err => logger.error({ err: err }, '[KYC/MOCK] Failed to set PENDING'));
 
         return {
             success: true,
@@ -450,7 +451,7 @@ class KYCService {
                 Buffer.from(expectedClean, 'hex')
             );
         } catch (error) {
-            console.error('[KYC] Signature verification error:', error.message);
+            logger.error({ err: error }, '[KYC] Signature verification error');
             return false;
         }
     }
@@ -576,7 +577,7 @@ class KYCService {
                 actionPayload: { route: '/profile', action: 'OPEN_KYC' }
             });
         } catch (error) {
-            console.error(`[KYC] Failed to send notification to user ${userId}:`, error.message);
+            logger.error(`[KYC] Failed to send notification to user ${userId}:`, error.message);
         }
     }
 

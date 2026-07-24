@@ -14,6 +14,7 @@
 //        c) Write an ADMIN_SYSTEM notification flagging each for discount review
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const NotificationService = require('../services/notificationService');
 
 class LeaderboardWorker {
@@ -36,16 +37,16 @@ class LeaderboardWorker {
         const cron   = require('node-cron');
         // Every Sunday at 00:00
         this.cronJob = cron.schedule('0 0 * * 0', () => {
-            console.log('📊 Leaderboard cron triggered — computing weekly rankings...');
+            logger.info('📊 Leaderboard cron triggered — computing weekly rankings...');
             this.computeWeeklyLeaderboard();
         });
-        console.log('📊 Leaderboard cron scheduled (every Sunday at midnight)');
+        logger.info('📊 Leaderboard cron scheduled (every Sunday at midnight)');
     }
 
     stop() {
         if (this.cronJob) {
             this.cronJob.stop();
-            console.log('📊 Leaderboard cron stopped');
+            logger.info('📊 Leaderboard cron stopped');
         }
     }
 
@@ -74,7 +75,7 @@ class LeaderboardWorker {
             const top50 = volumeAggregation.slice(0, 50);
 
             if (top50.length === 0) {
-                console.log('📊 No transaction volume found for this week. Skipping leaderboard.');
+                logger.info('📊 No transaction volume found for this week. Skipping leaderboard.');
                 return;
             }
 
@@ -162,7 +163,7 @@ class LeaderboardWorker {
                         ...notifSvc.formatLeaderboardTopUser(rank, totalVolume)
                     });
                 } catch (e) {
-                    console.error(`[Leaderboard] User ${userId} notification error:`, e.message);
+                    logger.error(`[Leaderboard] User ${userId} notification error:`, e.message);
                 }
 
                 // 4c. Admin discount-approval flag (only for top-3)
@@ -173,18 +174,18 @@ class LeaderboardWorker {
                             ...notifSvc.formatAdminDiscountApprovalRequest(userId, rank, totalVolume)
                         });
                     } catch (e) {
-                        console.error(`[Leaderboard] Admin flag error for user ${userId}:`, e.message);
+                        logger.error(`[Leaderboard] Admin flag error for user ${userId}:`, e.message);
                     }
                 }
             }
 
-            console.log(
+            logger.info(
                 `📊 Leaderboard saved: ${top50.length} users ranked. ` +
                 `Top 5 awarded "High Volume" badge. Top 10 notified.`
             );
 
         } catch (error) {
-            console.error('📊 Leaderboard cron error:', error.message);
+            logger.error({ err: error }, '📊 Leaderboard cron error');
         }
     }
 }

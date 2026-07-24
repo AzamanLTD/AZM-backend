@@ -12,6 +12,7 @@
 // movement (PAID/COMPLETED/REFUNDED) are driven by escrowService hooks, not here.
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const businessOrderService = require('../services/businessOrderService');
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -144,7 +145,7 @@ exports.markDelivered = async (req, res) => {
                         action:  'VIEW_TICKET',
                         orderId: order.id
                     }
-                }).catch((e) => console.error('[markDelivered] notification:', e.message));
+                }).catch((e) => logger.error({ err: e }, '[markDelivered] notification'));
             });
         }
 

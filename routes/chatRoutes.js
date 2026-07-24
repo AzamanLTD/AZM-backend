@@ -5,6 +5,7 @@
 // any chat write (send, upload, transfer) is gated by the ban guard.
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const express                  = require('express');
 const router                   = express.Router();
 const multer                   = require('multer');

@@ -25,6 +25,7 @@
 // This is the same class of bug as businessFollowerService.js: real service
 // classes with correct, tested logic, wrapped by adapters nobody ever
 // exercised end to end.
+const logger = require('../src/config/logger');
 const AdPostService = require('./marketplace/adPostService');
 const FollowService = require('./marketplace/followService');
 

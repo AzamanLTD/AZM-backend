@@ -15,6 +15,7 @@
 //   completeTrade(prisma, { tradeId, releasedByUserId })
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const gamification = require('./vendorGamificationService');
 const { calculateFeeSplit } = require('../utils/feeMath');
 
@@ -901,7 +902,7 @@ const processPostCompletionGamification = async (prisma, {
             if (notifications.length > 0) {
                 setImmediate(() => {
                     Promise.all(notifications.map(n => notifSvc.sendNotification(n)))
-                        .catch(err => console.error('[p2p.gamification] post-commit notif error:', err.message));
+                        .catch(err => logger.error({ err: err }, '[p2p.gamification] post-commit notif error'));
                 });
             }
 
@@ -914,14 +915,14 @@ const processPostCompletionGamification = async (prisma, {
                         gamificationResult.newAchievements.map(a =>
                             azmSvc.rewardAchievementUnlock(vendorId, a.achievementId, a.name, a.tier)
                         )
-                    ).catch(err => console.error('[p2p.gamification] AZM achievement reward error:', err.message));
+                    ).catch(err => logger.error({ err: err }, '[p2p.gamification] AZM achievement reward error'));
                 });
             }
         }
 
         return gamificationResult;
     } catch (gamErr) {
-        console.error(
+        logger.error(
             `[p2p.processPostCompletionGamification] tradeId=${tradeId} vendorId=${vendorId} ` +
             `non-fatal error: ${gamErr.message}`
         );

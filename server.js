@@ -3,6 +3,7 @@
 // WS6: Sentry must be the very first require so its auto-instrumentation can
 // patch http/express/pg before they are loaded. No-op when SENTRY_DSN is unset.
 const Sentry = require('./instrument');
+const logger = require('./src/config/logger');
 
 // =============================================================================
 // AZAMAN V3 — PRODUCTION-HARDENED SERVER

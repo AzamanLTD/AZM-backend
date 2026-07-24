@@ -7,6 +7,7 @@
 // The legacy POST /api/trades/release route has been removed.
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const express             = require('express');
 const router              = express.Router();
 const tradeController     = require('../controllers/tradeController');
@@ -180,7 +181,7 @@ router.post('/extend', protectActive, async (req, res) => {
                     data: { content: JSON.stringify(parsedRequestContent) }
                 });
             } catch (e) {
-                console.warn('extend: failed to update request message:', e.message);
+                logger.warn('extend: failed to update request message:', e.message);
             }
         }
 
@@ -247,7 +248,7 @@ router.post('/extend', protectActive, async (req, res) => {
             newExpiresAt
         });
     } catch (error) {
-        console.error('extend trade error:', error.message);
+        logger.error({ err: error }, 'extend trade error');
         return res.status(500).json({ success: false, message: error.message });
     }
 });
@@ -337,7 +338,7 @@ router.post('/extend/respond', protectActive, async (req, res) => {
 
         return res.status(200).json({ success: true, message: 'Request declined.' });
     } catch (error) {
-        console.error('extend/respond error:', error.message);
+        logger.error({ err: error }, 'extend/respond error');
         return res.status(500).json({ success: false, message: error.message });
     }
 });
@@ -350,7 +351,7 @@ router.post(
         const uploadSingle = upload.single('proof');
         uploadSingle(req, res, (err) => {
             if (err) {
-                console.error('MULTER REJECTED UPLOAD:', err.message);
+                logger.error({ err: err }, 'MULTER REJECTED UPLOAD');
                 return res.status(400).json({ success: false, message: 'Upload failed: ' + err.message });
             }
             next();

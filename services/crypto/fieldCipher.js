@@ -25,9 +25,10 @@
 //
 // Key: ENCRYPTION_KEY env var — 32 bytes, provided as 64-hex-char or
 // base64 (44-char). Generate with:
-//   node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+//   node -e "logger.info(require('crypto').randomBytes(32).toString('hex'))"
 // =============================================================================
 
+const logger = require('../../src/config/logger');
 const crypto = require('crypto');
 
 const PREFIX = 'enc:v1:';
@@ -70,7 +71,7 @@ function encrypt(plaintext) {
   const key = _resolveKey();
   if (!key) {
     if (!_warned) {
-      console.warn(
+      logger.warn(
         '[fieldCipher] ENCRYPTION_KEY not set — sensitive fields are stored ' +
         'in PLAINTEXT. Set ENCRYPTION_KEY to enable at-rest encryption.',
       );

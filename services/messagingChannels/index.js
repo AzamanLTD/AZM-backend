@@ -6,6 +6,7 @@
  * 
  * Logs every send to BusinessMessageLog for cost tracking.
  */
+const logger = require('../../src/config/logger');
 const { PrismaClient } = require('@prisma/client');
 const prisma = global.prisma || new PrismaClient();
 if (process.env.NODE_ENV !== 'production') global.prisma = prisma;
@@ -35,7 +36,7 @@ class MessagingChannelsService {
 
             return false;
         } catch (error) {
-            console.error('[MessagingChannels] Error checking preferences:', error);
+            logger.error('[MessagingChannels] Error checking preferences:', error);
             return false;
         }
     }
@@ -45,7 +46,7 @@ class MessagingChannelsService {
         if (!config?.smsConnected) throw new Error('SMS channel not connected');
 
         // TODO: Replace with real Africa's Talking / Twilio API call
-        console.log(`[MessagingChannels] SMS to ${phoneNumber}: "${message}"`);
+        logger.info(`[MessagingChannels] SMS to ${phoneNumber}: "${message}"`);
 
         const result = { success: true, providerMessageId: `sms_${Date.now()}`, costGhs: 0.05 };
 
@@ -70,7 +71,7 @@ class MessagingChannelsService {
         if (!config?.waConnected) throw new Error('WhatsApp channel not connected');
 
         // TODO: Replace with real Meta WhatsApp Cloud API call
-        console.log(`[MessagingChannels] WhatsApp to ${phoneNumber}: "${message}"`);
+        logger.info(`[MessagingChannels] WhatsApp to ${phoneNumber}: "${message}"`);
 
         const result = { success: true, providerMessageId: `wa_${Date.now()}`, costGhs: 0.035 };
 

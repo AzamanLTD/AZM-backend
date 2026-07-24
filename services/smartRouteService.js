@@ -15,6 +15,7 @@
 // `runOnce(routeId)`, and increments `nextRunAt` by the configured cadence.
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const { Prisma } = require('@prisma/client');
 
 const FREQUENCY_MS = {

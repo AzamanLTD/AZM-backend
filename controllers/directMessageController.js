@@ -7,6 +7,7 @@
 // system). Real-time delivery via Socket.IO + FCM for offline users.
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const { sendPushNotification } = require('../utils/firebaseService');
 
 // Phase UI-3 helper: render a one-line preview body for FCM pushes when the
@@ -84,7 +85,7 @@ exports.getMessages = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('[getMessages] error:', error.message);
+        logger.error({ err: error }, '[getMessages] error');
         return res.status(500).json({ success: false, message: 'Failed to fetch messages.' });
     }
 };
@@ -280,7 +281,7 @@ exports.sendMessage = async (req, res) => {
                 }
             }
         } catch (pushErr) {
-            console.error('[sendMessage] FCM push error (non-fatal):', pushErr.message);
+            logger.error({ err: pushErr }, '[sendMessage] FCM push error (non-fatal)');
         }
 
         return res.status(201).json({
@@ -289,7 +290,7 @@ exports.sendMessage = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('[sendMessage] error:', error.message);
+        logger.error({ err: error }, '[sendMessage] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -356,7 +357,7 @@ exports.markAsRead = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('[markAsRead] error:', error.message);
+        logger.error({ err: error }, '[markAsRead] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -385,7 +386,7 @@ exports.getUnreadCount = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('[getUnreadCount] error:', error.message);
+        logger.error({ err: error }, '[getUnreadCount] error');
         return res.status(500).json({ success: false, message: 'Failed to get unread count.' });
     }
 };
@@ -466,7 +467,7 @@ exports.getConversationInfo = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('[getConversationInfo] error:', error.message);
+        logger.error({ err: error }, '[getConversationInfo] error');
         return res.status(500).json({ success: false, message: 'Failed to get conversation info.' });
     }
 };

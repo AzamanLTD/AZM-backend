@@ -3,6 +3,7 @@
 // AZAMAN — PER-SOCKET-EVENT RATE LIMITING
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const Redis = require('ioredis');
 
 let _redisClient = null;
@@ -14,7 +15,7 @@ const _getRedis = () => {
             enableReadyCheck: false,
             lazyConnect: true,
         });
-        _redisClient.on('error', (err) => console.error('[socketRateLimiter] redis error:', err.message));
+        _redisClient.on('error', (err) => logger.error({ err: err }, '[socketRateLimiter] redis error'));
     }
     return _redisClient;
 };
@@ -81,7 +82,7 @@ function attach(socket) {
             })
             .catch((err) => {
                 // Fail OPEN on limiter infra errors
-                console.error('[socketRateLimiter] check failed, failing open:', err.message);
+                logger.error({ err: err }, '[socketRateLimiter] check failed, failing open');
                 next();
             });
     });

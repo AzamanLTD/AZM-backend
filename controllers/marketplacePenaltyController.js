@@ -1,3 +1,4 @@
+const logger = require('../src/config/logger');
 const { PenaltyPolicyService } = require('../services/marketplace/penaltyPolicyService');
 
 exports.getPolicy = async (req, res) => {

@@ -7,6 +7,7 @@
 // All routes are mounted under /api/business-os/ and require business auth.
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const express = require('express');
 const router = express.Router();
 
@@ -76,7 +77,7 @@ function wrap(handler) {
         try {
             await handler(req, res);
         } catch (err) {
-            console.error('[BusinessOS]', err.message);
+            logger.error({ err: err }, '[BusinessOS]');
             res.status(400).json({ success: false, message: err.message });
         }
     };
@@ -1563,7 +1564,7 @@ router.post('/restaurant/inventory/:id/restock', protect, protectActive, wrap(as
             },
         });
     } catch (e) {
-        console.warn('[restock] Failed to write ledger entry:', e.message);
+        logger.warn('[restock] Failed to write ledger entry:', e.message);
     }
 
     res.json({ success: true, item: updated, ledgerWritten: true });
@@ -2717,7 +2718,7 @@ router.post('/pos/order', protect, protectActive, wrap(async (req, res) => {
             },
         });
     } catch (e) {
-        console.warn('[pos/order] Ledger entry failed:', e.message);
+        logger.warn('[pos/order] Ledger entry failed:', e.message);
     }
 
     res.status(201).json({
@@ -2797,7 +2798,7 @@ router.post('/pos/cash-sale', protect, protectActive, wrap(async (req, res) => {
             },
         });
     } catch (e) {
-        console.warn('[pos/cash-sale] Failed to write ledger entry:', e.message);
+        logger.warn('[pos/cash-sale] Failed to write ledger entry:', e.message);
     }
 
     // Fire webhook event
@@ -2880,7 +2881,7 @@ router.post('/pos/cash-close-tab', protect, protectActive, wrap(async (req, res)
             },
         });
     } catch (e) {
-        console.warn('[pos/cash-close-tab] Failed to write ledger entry:', e.message);
+        logger.warn('[pos/cash-close-tab] Failed to write ledger entry:', e.message);
     }
 
     res.json({
@@ -3683,10 +3684,10 @@ router.post("/messaging-config/test", requirePermission("settings.manage"), wrap
     try {
         if (channel === 'whatsapp' && config.waConnected) {
             // TODO: Replace with actual WhatsApp Cloud API call
-            console.log(`[MessagingTest] WhatsApp to ${phoneNumber}: "${testMessage}"`);
+            logger.info(`[MessagingTest] WhatsApp to ${phoneNumber}: "${testMessage}"`);
         } else if (channel === 'sms' && config.smsConnected) {
             // TODO: Replace with actual SMS gateway call (Africa's Talking, Twilio, etc.)
-            console.log(`[MessagingTest] SMS to ${phoneNumber}: "${testMessage}"`);
+            logger.info(`[MessagingTest] SMS to ${phoneNumber}: "${testMessage}"`);
         } else {
             return res.status(400).json({ success: false, message: `Channel ${channel} is not connected` });
         }

@@ -4,6 +4,7 @@
 // Mounted at /api/users. Includes profile, preferences, onboarding, balance.
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const express = require('express');
 const router = express.Router();
 const userController = require('../controllers/userController');

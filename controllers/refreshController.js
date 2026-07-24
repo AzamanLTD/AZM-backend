@@ -22,6 +22,7 @@
 //   JWTs immediately at protect() time.
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const {
     rotateRefreshToken,
     revokeRefreshToken,
@@ -68,7 +69,7 @@ exports.refresh = async (req, res) => {
         try {
             await recordDailyLogin(prisma, result.user, req.app.get('azmRewardService'));
         } catch (err) {
-            console.error('[refresh] login streak record error:', err.message);
+            logger.error({ err: err }, '[refresh] login streak record error');
         }
 
         return res.status(200).json({
@@ -87,7 +88,7 @@ exports.refresh = async (req, res) => {
             },
         });
     } catch (e) {
-        console.error('[refresh] error:', e.message);
+        logger.error({ err: e }, '[refresh] error');
         return res.status(500).json({
             success: false,
             message: 'Internal server error during refresh.',
@@ -107,7 +108,7 @@ exports.logout = async (req, res) => {
         }
         return res.status(200).json({ success: true, message: 'Logged out.' });
     } catch (e) {
-        console.error('[logout] error:', e.message);
+        logger.error({ err: e }, '[logout] error');
         // Still return 200 — client should clear local state regardless.
         return res.status(200).json({ success: true, message: 'Logged out.' });
     }

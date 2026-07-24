@@ -8,6 +8,7 @@
 // formally become vendors yet (they just won't have much data).
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const express = require('express');
 const router = express.Router();
 const vendorStatsController = require('../controllers/vendorStatsController');
@@ -58,7 +59,7 @@ router.post('/upload-docs', protect, vendorDocUpload.fields([
 
         return res.status(200).json({ success: true, urls });
     } catch (error) {
-        console.error('[vendor.uploadDocs] error:', error.message);
+        logger.error({ err: error }, '[vendor.uploadDocs] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 });
@@ -129,7 +130,7 @@ router.get('/badges/:vendorId', async (req, res) => {
             data: { vendorId, badges, count: badges.length },
         });
     } catch (error) {
-        console.error('[vendor.badges] error:', error.message);
+        logger.error({ err: error }, '[vendor.badges] error');
         return res.status(500).json({ success: false, message: 'Failed to fetch badges' });
     }
 });

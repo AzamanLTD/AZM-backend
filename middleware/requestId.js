@@ -19,6 +19,7 @@
 // response body. Mounted as early as possible (before morgan) so the access log
 // line carries the id.
 // =============================================================================
+const logger = require('../src/config/logger');
 const { randomUUID } = require('crypto');
 
 // Conservative: printable ascii, dashes/underscores, 8–128 chars. A typical

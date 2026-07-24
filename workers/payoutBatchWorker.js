@@ -31,6 +31,7 @@
 //   POST /api/admin/payouts/batch-process invokes processNow() directly.
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const { randomUUID } = require('crypto');
 
 const DEFAULT_INTERVAL_MS = 120_000;  // 2 minutes
@@ -49,7 +50,7 @@ class PayoutBatchWorker {
 
     start() {
         if (this._timer) return;
-        console.log('[PayoutBatchWorker] starting (interval configured via GlobalSettings.autoPayoutIntervalMs).');
+        logger.info('[PayoutBatchWorker] starting (interval configured via GlobalSettings.autoPayoutIntervalMs).');
         // Initial tick after 10s (let other services boot), then read interval from DB
         this._scheduleNext(10_000);
     }
@@ -91,7 +92,7 @@ class PayoutBatchWorker {
     _scheduleNext(delayMs) {
         this._timer = setTimeout(async () => {
             await this._tick().catch(err => {
-                console.error('[PayoutBatchWorker] tick error:', err.message);
+                logger.error({ err: err }, '[PayoutBatchWorker] tick error');
             });
             // Re-read interval from settings for next tick
             const nextDelay = this._lastIntervalMs || DEFAULT_INTERVAL_MS;
@@ -113,14 +114,14 @@ class PayoutBatchWorker {
             // Check master switch
             if (!settings.autoPayoutEnabled) {
                 if (this._lastEnabledState !== false) {
-                    console.log('[PayoutBatchWorker] auto-payout DISABLED — sleeping.');
+                    logger.info('[PayoutBatchWorker] auto-payout DISABLED — sleeping.');
                     this._lastEnabledState = false;
                 }
                 return;
             }
 
             if (this._lastEnabledState !== true) {
-                console.log('[PayoutBatchWorker] auto-payout ENABLED — processing.');
+                logger.info('[PayoutBatchWorker] auto-payout ENABLED — processing.');
                 this._lastEnabledState = true;
             }
 
@@ -280,10 +281,10 @@ class PayoutBatchWorker {
                     mtnStatus: dispatchResult.status
                 });
 
-                console.log(`[PayoutBatchWorker] dispatched withdrawal #${withdrawal.id}: $${amount} → GHS ${amountGhs} (ref: ${referenceId})`);
+                logger.info(`[PayoutBatchWorker] dispatched withdrawal #${withdrawal.id}: $${amount} → GHS ${amountGhs} (ref: ${referenceId})`);
 
             } catch (dispatchErr) {
-                console.error(`[PayoutBatchWorker] MTN dispatch failed for withdrawal #${withdrawal.id}:`, dispatchErr.message);
+                logger.error(`[PayoutBatchWorker] MTN dispatch failed for withdrawal #${withdrawal.id}:`, dispatchErr.message);
 
                 // Flag for manual review on dispatch failure
                 await this._flagForManualReview(withdrawal, 'MTN_DISPATCH_FAILED', {
@@ -343,9 +344,9 @@ class PayoutBatchWorker {
                 }).catch(() => {}); // non-fatal
             }
 
-            console.log(`[PayoutBatchWorker] flagged withdrawal #${withdrawal.id} → NEEDS_MANUAL_REVIEW (${reason})`);
+            logger.info(`[PayoutBatchWorker] flagged withdrawal #${withdrawal.id} → NEEDS_MANUAL_REVIEW (${reason})`);
         } catch (err) {
-            console.error(`[PayoutBatchWorker] failed to flag withdrawal #${withdrawal.id}:`, err.message);
+            logger.error(`[PayoutBatchWorker] failed to flag withdrawal #${withdrawal.id}:`, err.message);
         }
     }
 
@@ -357,7 +358,7 @@ class PayoutBatchWorker {
         try {
             return await this.prisma.globalSettings.findUnique({ where: { id: 1 } });
         } catch (err) {
-            console.error('[PayoutBatchWorker] failed to read GlobalSettings:', err.message);
+            logger.error({ err: err }, '[PayoutBatchWorker] failed to read GlobalSettings');
             return null;
         }
     }

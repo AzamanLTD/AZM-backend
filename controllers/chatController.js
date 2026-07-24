@@ -8,6 +8,7 @@
 // have to create it explicitly.
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const { parsePagination, buildPageEnvelope } = require('../utils/pagination');
 
 // ── Helper ───────────────────────────────────────────────────────────────────
@@ -87,7 +88,7 @@ exports.sendMessage = async (req, res) => {
 
         return res.status(201).json({ success: true, message });
     } catch (error) {
-        console.error('chat.sendMessage error:', error.message);
+        logger.error({ err: error }, 'chat.sendMessage error');
         return res.status(500).json({ success: false, error: error.message });
     }
 };
@@ -151,7 +152,7 @@ exports.sendImageMessage = async (req, res) => {
 
         return res.status(201).json({ success: true, message });
     } catch (error) {
-        console.error('chat.sendImageMessage error:', error.message);
+        logger.error({ err: error }, 'chat.sendImageMessage error');
         return res.status(500).json({ success: false, error: error.message });
     }
 };
@@ -231,7 +232,7 @@ exports.getChatHistory = async (req, res) => {
             ...envelope
         });
     } catch (error) {
-        console.error('chat.getChatHistory error:', error.message);
+        logger.error({ err: error }, 'chat.getChatHistory error');
         return res.status(500).json({ success: false, error: error.message });
     }
 };

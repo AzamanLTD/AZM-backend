@@ -1,3 +1,4 @@
+const logger = require('../src/config/logger');
 const authMiddleware = require('../middleware/authMiddleware');
 
 exports.addPayoutDestination = async (req, res) => {
@@ -36,7 +37,7 @@ exports.addPayoutDestination = async (req, res) => {
             destination: newDestination
         });
     } catch (error) {
-        console.error("Add Payout Destination Error:", error);
+        logger.error("Add Payout Destination Error:", error);
         res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -57,7 +58,7 @@ exports.getPayoutDestinations = async (req, res) => {
             destinations
         });
     } catch (error) {
-        console.error("Get Payout Destinations Error:", error);
+        logger.error("Get Payout Destinations Error:", error);
         res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -93,7 +94,7 @@ exports.deletePayoutDestination = async (req, res) => {
 
         res.json({ success: true, message: "Destination removed." });
     } catch (error) {
-        console.error("Delete Payout Destination Error:", error);
+        logger.error("Delete Payout Destination Error:", error);
         res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -122,7 +123,7 @@ exports.setDefaultPayoutDestination = async (req, res) => {
 
         res.json({ success: true, message: "Default destination updated." });
     } catch (error) {
-        console.error("Set Default Payout Destination Error:", error);
+        logger.error("Set Default Payout Destination Error:", error);
         res.status(500).json({ success: false, message: error.message });
     }
 };

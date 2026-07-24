@@ -37,6 +37,7 @@
  *   DOJAH_SANDBOX_BASE_URL      → defaults to https://sandbox.dojah.io
  */
 
+const logger = require('../src/config/logger');
 const axios = require('axios');
 const crypto = require('crypto');
 const fieldCipher = require('./crypto/fieldCipher');
@@ -126,9 +127,9 @@ class DojahKYCService {
         });
 
         if (!this.dojahAppId || !this.dojahPrivateKey) {
-            console.warn('⚠️  [KYC/Dojah] DOJAH_APP_ID and/or DOJAH_PRIVATE_KEY is not set — live calls will be rejected by Dojah until configured.');
+            logger.warn('⚠️  [KYC/Dojah] DOJAH_APP_ID and/or DOJAH_PRIVATE_KEY is not set — live calls will be rejected by Dojah until configured.');
         } else {
-            console.log(`✅ [KYC/Dojah] LIVE adapter ready → ${this.dojahBaseUrl}`);
+            logger.info(`✅ [KYC/Dojah] LIVE adapter ready → ${this.dojahBaseUrl}`);
         }
     }
 
@@ -184,7 +185,7 @@ class DojahKYCService {
         await this.prisma.user.update({
             where: { id: userIdInt },
             data: { kycStatus: 'PENDING' },
-        }).catch(err => console.error('[KYC/Dojah] Failed to set PENDING:', err.message));
+        }).catch(err => logger.error({ err: err }, '[KYC/Dojah] Failed to set PENDING'));
 
         // Build the query params: always the ID, plus DOB when supplied.
         const params = { [endpoint.idParam]: String(idNumber).trim() };
@@ -193,7 +194,7 @@ class DojahKYCService {
         if (lastName) params.last_name = lastName;
 
         const requestUrl = `${this.dojahBaseUrl}${endpoint.path}`;
-        console.log(`➡️  [KYC/Dojah] ${endpoint.label} lookup for user ${userIdInt} → GET ${requestUrl}?${endpoint.idParam}=${this._maskIdNumber(String(idNumber))}`);
+        logger.info(`➡️  [KYC/Dojah] ${endpoint.label} lookup for user ${userIdInt} → GET ${requestUrl}?${endpoint.idParam}=${this._maskIdNumber(String(idNumber))}`);
 
         let response;
         try {
@@ -218,7 +219,7 @@ class DojahKYCService {
             data: updateData,
         });
 
-        console.log(`✅ [KYC/Dojah] User ${userIdInt} → ${newStatus} (${endpoint.label}, confidence: ${confidence}, status: ${verificationStatus})`);
+        logger.info(`✅ [KYC/Dojah] User ${userIdInt} → ${newStatus} (${endpoint.label}, confidence: ${confidence}, status: ${verificationStatus})`);
 
         // Fire the same notification the webhook path would.
         await this._sendKycResultNotification(userIdInt, newStatus);
@@ -263,7 +264,7 @@ class DojahKYCService {
      */
     async processWebhook(payload, signature, rawBody) {
         if (!this._verifyWebhookSignature(payload, signature, rawBody)) {
-            console.error('❌ [KYC/Dojah] Webhook signature verification FAILED');
+            logger.error('❌ [KYC/Dojah] Webhook signature verification FAILED');
             return { success: false, message: 'Invalid webhook signature.' };
         }
 
@@ -275,13 +276,13 @@ class DojahKYCService {
         } = this._normalizeWebhookPayload(payload);
 
         if (!referenceId) {
-            console.error('❌ [KYC/Dojah] Webhook missing reference_id');
+            logger.error('❌ [KYC/Dojah] Webhook missing reference_id');
             return { success: false, message: 'Missing reference_id in webhook payload.' };
         }
 
         const userId = this._extractUserIdFromReference(referenceId);
         if (!userId) {
-            console.error(`❌ [KYC/Dojah] Cannot extract userId from referenceId: ${referenceId}`);
+            logger.error(`❌ [KYC/Dojah] Cannot extract userId from referenceId: ${referenceId}`);
             return { success: false, message: 'Invalid reference_id format.' };
         }
 
@@ -291,7 +292,7 @@ class DojahKYCService {
         });
 
         if (!user) {
-            console.error(`❌ [KYC/Dojah] User not found for referenceId: ${referenceId}`);
+            logger.error(`❌ [KYC/Dojah] User not found for referenceId: ${referenceId}`);
             return { success: false, message: 'User not found.' };
         }
 
@@ -309,7 +310,7 @@ class DojahKYCService {
             data: updateData,
         });
 
-        console.log(`✅ [KYC/Dojah] User ${userId} → ${newStatus} (confidence: ${overallConfidence}, provider status: ${verificationStatus})`);
+        logger.info(`✅ [KYC/Dojah] User ${userId} → ${newStatus} (confidence: ${overallConfidence}, provider status: ${verificationStatus})`);
 
         if (
             newStatus === 'PENDING' &&
@@ -371,7 +372,7 @@ class DojahKYCService {
             data: { kycStatus: newStatus },
         });
 
-        console.log(`✅ [KYC/Dojah] Admin override: user ${userIdInt} → ${newStatus} by admin ${adminId} (reason: ${reason})`);
+        logger.info(`✅ [KYC/Dojah] Admin override: user ${userIdInt} → ${newStatus} by admin ${adminId} (reason: ${reason})`);
 
         await this._sendKycResultNotification(userIdInt, newStatus);
 
@@ -466,7 +467,7 @@ class DojahKYCService {
             const notFound = status === 404
                 || (body && /not\s*found|no\s*record|invalid/i.test(JSON.stringify(body)));
 
-            console.error(`❌ [KYC/Dojah] ${endpoint.label} lookup HTTP ${status}:`, typeof body === 'string' ? body : JSON.stringify(body));
+            logger.error(`❌ [KYC/Dojah] ${endpoint.label} lookup HTTP ${status}:`, typeof body === 'string' ? body : JSON.stringify(body));
 
             if (notFound) {
                 await this.prisma.user.update({
@@ -494,7 +495,7 @@ class DojahKYCService {
         }
 
         // No response at all → network/timeout.
-        console.error(`❌ [KYC/Dojah] ${endpoint.label} lookup network error:`, error.message);
+        logger.error(`❌ [KYC/Dojah] ${endpoint.label} lookup network error:`, error.message);
         return { success: false, message: 'KYC provider unavailable. Please try again later.' };
     }
 
@@ -505,7 +506,7 @@ class DojahKYCService {
     _verifyWebhookSignature(payload, signature, rawBody) {
         if (!signature) return false;
         if (!this.dojahWebhookSecret) {
-            console.error('[KYC/Dojah] DOJAH_WEBHOOK_SECRET not set — cannot verify webhook.');
+            logger.error('[KYC/Dojah] DOJAH_WEBHOOK_SECRET not set — cannot verify webhook.');
             return false;
         }
 
@@ -525,7 +526,7 @@ class DojahKYCService {
                 Buffer.from(expectedClean, 'hex')
             );
         } catch (error) {
-            console.error('[KYC/Dojah] Signature verification error:', error.message);
+            logger.error({ err: error }, '[KYC/Dojah] Signature verification error');
             return false;
         }
     }
@@ -609,7 +610,7 @@ class DojahKYCService {
                 actionPayload: { route: '/profile', action: 'OPEN_KYC' },
             });
         } catch (error) {
-            console.error(`[KYC/Dojah] Failed to send notification to user ${userId}:`, error.message);
+            logger.error(`[KYC/Dojah] Failed to send notification to user ${userId}:`, error.message);
         }
     }
 

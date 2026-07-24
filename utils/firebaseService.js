@@ -1,3 +1,4 @@
+const logger = require('../src/config/logger');
 const admin = require('firebase-admin');
 const path = require('path');
 
@@ -32,16 +33,13 @@ try {
         admin.initializeApp({
             credential: admin.credential.cert(serviceAccount)
         });
-        console.log("🔥 Firebase Admin SDK Initialized Successfully");
+        logger.info("🔥 Firebase Admin SDK Initialized Successfully");
     }
 } catch (error) {
     // Under test, a missing service-account is expected — log at warn level so
     // CI output isn't polluted with error-level noise. Elsewhere keep it loud.
-    const log = process.env.NODE_ENV === 'test' ? console.warn : console.error;
-    log("⚠️ FIREBASE INIT WARNING: Could not load Firebase credentials.");
-    log("   Push notifications will be disabled until credentials are provided.");
-    log("   Options: set FIREBASE_SERVICE_ACCOUNT_BASE64 env var, or place service-account.json in project root.");
-    log("   Error details:", error.message);
+    const logFn = process.env.NODE_ENV === 'test' ? logger.warn.bind(logger) : logger.error.bind(logger);
+    logFn({ err: error }, 'FIREBASE INIT WARNING: Could not load Firebase credentials. Push notifications will be disabled. Set FIREBASE_SERVICE_ACCOUNT_BASE64 or place service-account.json in project root.');
 }
 
 /**
@@ -54,7 +52,7 @@ try {
 const sendPushNotification = async (fcmToken, title, body, data = {}) => {
     // Safety check: If no token or Firebase failed to load, stop.
     if (!fcmToken || !admin.apps.length) {
-        console.warn("⚠️ Cannot send notification: Missing Token or Firebase not init.");
+        logger.warn("⚠️ Cannot send notification: Missing Token or Firebase not init.");
         return;
     }
 
@@ -73,10 +71,10 @@ const sendPushNotification = async (fcmToken, title, body, data = {}) => {
 
     try {
         const response = await admin.messaging().send(message);
-        console.log(`🚀 Notification sent! Message ID: ${response}`);
+        logger.info(`🚀 Notification sent! Message ID: ${response}`);
         return response;
     } catch (error) {
-        console.error("❌ Error sending notification:", error.message);
+        logger.error({ err: error }, '❌ Error sending notification');
         // Tip: If error is 'registration-token-not-registered', the user uninstalled the app.
         // You could add logic here to delete the bad token from your DB.
     }

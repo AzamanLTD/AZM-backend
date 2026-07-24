@@ -13,6 +13,7 @@
 //   User inbox:       user_${userId} (shared with existing system)
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const { sendPushNotification } = require('../utils/firebaseService');
 const crypto = require('crypto');
 
@@ -57,7 +58,7 @@ class FriendSocketService {
                 socket.join(room);
                 socket.join(`user_${userId}`);
 
-                console.log(`👥 ${socket.id} → friend chat room ${room}`);
+                logger.info(`👥 ${socket.id} → friend chat room ${room}`);
 
                 socket.emit('friend_chat_joined', {
                     friendshipId,
@@ -75,7 +76,7 @@ class FriendSocketService {
                 });
 
             } catch (err) {
-                console.error('join_friend_chat error:', err.message);
+                logger.error({ err: err }, 'join_friend_chat error');
                 socket.emit('friend_chat_error', { reason: 'server_error' });
             }
         });
@@ -88,7 +89,7 @@ class FriendSocketService {
 
             const room = `friend_chat_${friendshipId}`;
             socket.leave(room);
-            console.log(`👥 ${socket.id} left friend chat room ${room}`);
+            logger.info(`👥 ${socket.id} left friend chat room ${room}`);
 
             // Notify other party
             socket.to(room).emit('friend_offline_in_chat', {
@@ -203,11 +204,11 @@ class FriendSocketService {
                         }
                     }
                 } catch (pushErr) {
-                    console.error('[FriendSocket] FCM push error:', pushErr.message);
+                    logger.error({ err: pushErr }, '[FriendSocket] FCM push error');
                 }
 
             } catch (err) {
-                console.error('send_friend_message error:', err.message);
+                logger.error({ err: err }, 'send_friend_message error');
                 socket.emit('friend_message_error', {
                     reason: 'server_error',
                     detail: err.message,
@@ -309,7 +310,7 @@ class FriendSocketService {
                     }
                 }
             } catch (e) {
-                console.error("SOCKET ERROR:", e); socket.emit('message_error', { reason: 'server_error', localId: data.localId });
+                logger.error("SOCKET ERROR:", e); socket.emit('message_error', { reason: 'server_error', localId: data.localId });
             }
         });
 
@@ -363,7 +364,7 @@ class FriendSocketService {
                     }
                 }
             } catch (err) {
-                console.error('mark_friend_messages_read error:', err.message);
+                logger.error({ err: err }, 'mark_friend_messages_read error');
             }
         });
     }

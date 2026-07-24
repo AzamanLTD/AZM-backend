@@ -5,6 +5,7 @@
 // envelope; IdentityError instances map to their httpStatus + code.
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const { IdentityService, IdentityError } = require('../services/identity/identity.service');
 
 function ok(res, data, status = 200) { return res.status(status).json({ success: true, data }); }
@@ -14,7 +15,7 @@ function fail(res, err) {
       success: false, message: err.message, errorCode: err.code,
     });
   }
-  console.error('[identityController]', err);
+  logger.error('[identityController]', err);
   return res.status(500).json({ success: false, message: 'Internal server error', errorCode: 'INTERNAL' });
 }
 const wrap = (h) => async (req, res) => { try { await h(req, res); } catch (e) { fail(res, e); } };

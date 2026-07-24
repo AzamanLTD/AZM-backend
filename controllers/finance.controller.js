@@ -27,6 +27,7 @@
 function _getNotificationService(req) {
     const svc = req.app.get('notificationService');
     if (svc) return svc;
+    const logger = require('../src/config/logger');
     const NotificationService = require('../services/notificationService');
     const prisma = req.app.get('prisma');
     const io = req.app.get('socketio');
@@ -161,7 +162,7 @@ exports.fiatWithdrawal = async (req, res) => {
                 payeeNote:      `Azaman MoMo payout (${networkChoice})`
             });
         } catch (gatewayErr) {
-            console.error('[fiatWithdrawal] Moolre dispatch failed:', gatewayErr.message);
+            logger.error({ err: gatewayErr }, '[fiatWithdrawal] Moolre dispatch failed');
             // Roll back the debit + the SystemMasterCrypto capture so the
             // user is not stuck and Azaman is not double-credited.
             try {
@@ -178,7 +179,7 @@ exports.fiatWithdrawal = async (req, res) => {
                     data:    { reference, reversal }
                 });
             } catch (reverseErr) {
-                console.error('[fiatWithdrawal] CRITICAL reversal failure:', reverseErr.message);
+                logger.error({ err: reverseErr }, '[fiatWithdrawal] CRITICAL reversal failure');
                 return res.status(500).json({
                     success: false,
                     code:    'MOOLRE_DISBURSEMENT_REVERSAL_FAILED',
@@ -199,7 +200,7 @@ exports.fiatWithdrawal = async (req, res) => {
                 `AI LIQUIDITY FLAG: SYSTEM_FIAT_POOL dropped to ` +
                 `$${data.fiatPoolBalance.toFixed(2)} ` +
                 `(threshold: $${FIAT_POOL_ALERT_THRESH}). Immediate replenishment required.`;
-            console.warn(`[LIQUIDITY ALERT] ${alertMsg}`);
+            logger.warn(`[LIQUIDITY ALERT] ${alertMsg}`);
             try {
                 await _getNotificationService(req).sendNotification({
                     userId,
@@ -215,7 +216,7 @@ exports.fiatWithdrawal = async (req, res) => {
                     timestamp: new Date().toISOString()
                 });
             } catch (alertErr) {
-                console.error('[fiatWithdrawal] Liquidity alert emit failed:', alertErr.message);
+                logger.error({ err: alertErr }, '[fiatWithdrawal] Liquidity alert emit failed');
             }
         }
 
@@ -241,7 +242,7 @@ exports.fiatWithdrawal = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('[finance.fiatWithdrawal] error:', error.message);
+        logger.error({ err: error }, '[finance.fiatWithdrawal] error');
 
         // Phase ADMIN-CONTROL-2 FIX 5: Fiat pool insufficient liquidity
         if (error.code === 'FIAT_POOL_INSUFFICIENT') {
@@ -265,7 +266,7 @@ exports.fiatWithdrawal = async (req, res) => {
                     }
                 });
             } catch (freezeErr) {
-                console.error('[fiatWithdrawal] Freeze record write failed:', freezeErr.message);
+                logger.error({ err: freezeErr }, '[fiatWithdrawal] Freeze record write failed');
             }
             return res.status(403).json({
                 success: false,
@@ -303,7 +304,7 @@ exports.liquidateProfits = async (req, res) => {
                 timestamp:        new Date().toISOString()
             });
         } catch (socketErr) {
-            console.error('[liquidateProfits] Socket emit failed:', socketErr.message);
+            logger.error({ err: socketErr }, '[liquidateProfits] Socket emit failed');
         }
 
         return res.status(200).json({
@@ -312,7 +313,7 @@ exports.liquidateProfits = async (req, res) => {
             data
         });
     } catch (error) {
-        console.error('[finance.liquidateProfits] error:', error.message);
+        logger.error({ err: error }, '[finance.liquidateProfits] error');
         return res.status(400).json({ success: false, message: error.message });
     }
 };
@@ -372,7 +373,7 @@ exports.cryptoDepositWebhook = async (req, res) => {
                 actionPayload: { action: 'OPEN_WALLET', reference: txHash }
             });
         } catch (notifErr) {
-            console.error('[cryptoDepositWebhook] Notification write failed:', notifErr.message);
+            logger.error({ err: notifErr }, '[cryptoDepositWebhook] Notification write failed');
         }
 
         return res.status(200).json({
@@ -381,7 +382,7 @@ exports.cryptoDepositWebhook = async (req, res) => {
             data:    result.data
         });
     } catch (error) {
-        console.error('[finance.cryptoDepositWebhook] error:', error.message);
+        logger.error({ err: error }, '[finance.cryptoDepositWebhook] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -402,7 +403,7 @@ exports.mtnDisbursementWebhook = async (req, res) => {
     try {
         const expectedSecret = process.env.MTN_WEBHOOK_SECRET;
         if (!expectedSecret) {
-            console.error('[mtnDisbursementWebhook] MTN_WEBHOOK_SECRET is not configured.');
+            logger.error('[mtnDisbursementWebhook] MTN_WEBHOOK_SECRET is not configured.');
             return res.status(503).json({
                 success: false,
                 message: 'Webhook endpoint is not configured. Refusing to mutate ledger.'
@@ -495,7 +496,7 @@ exports.mtnDisbursementWebhook = async (req, res) => {
                 actionPayload: { action: 'OPEN_WALLET', reference }
             });
         } catch (notifErr) {
-            console.error('[mtnDisbursementWebhook] Notification write failed:', notifErr.message);
+            logger.error({ err: notifErr }, '[mtnDisbursementWebhook] Notification write failed');
         }
 
         return res.status(200).json({
@@ -504,7 +505,7 @@ exports.mtnDisbursementWebhook = async (req, res) => {
             data:    reversal
         });
     } catch (error) {
-        console.error('[finance.mtnDisbursementWebhook] error:', error.message);
+        logger.error({ err: error }, '[finance.mtnDisbursementWebhook] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -535,7 +536,7 @@ exports.moolreDisbursementWebhook = async (req, res) => {
     try {
         const expectedSecret = process.env.MOOLRE_WEBHOOK_SECRET;
         if (!expectedSecret) {
-            console.error('[moolreDisbursementWebhook] MOOLRE_WEBHOOK_SECRET is not configured.');
+            logger.error('[moolreDisbursementWebhook] MOOLRE_WEBHOOK_SECRET is not configured.');
             return res.status(503).json({
                 success: false,
                 message: 'Webhook endpoint is not configured. Refusing to mutate ledger.'
@@ -570,7 +571,7 @@ exports.moolreDisbursementWebhook = async (req, res) => {
                 // timingSafeEqual throws on length mismatch — guard first.
                 authPassed = a.length === b.length && crypto.timingSafeEqual(a, b);
             } catch (sigErr) {
-                console.error('[moolreDisbursementWebhook] HMAC verification error:', sigErr.message);
+                logger.error({ err: sigErr }, '[moolreDisbursementWebhook] HMAC verification error');
                 authPassed = false;
             }
         } else {
@@ -639,7 +640,7 @@ exports.moolreDisbursementWebhook = async (req, res) => {
                         timestamp: new Date().toISOString()
                     });
                 } catch (emitErr) {
-                    console.error('[moolreDisbursementWebhook] Socket emit failed:', emitErr.message);
+                    logger.error({ err: emitErr }, '[moolreDisbursementWebhook] Socket emit failed');
                 }
             });
             return res.status(200).json({
@@ -688,7 +689,7 @@ exports.moolreDisbursementWebhook = async (req, res) => {
                         });
                     }
                 } catch (emitErr) {
-                    console.error('[moolreDisbursementWebhook] Socket emit failed:', emitErr.message);
+                    logger.error({ err: emitErr }, '[moolreDisbursementWebhook] Socket emit failed');
                 }
             });
 
@@ -729,7 +730,7 @@ exports.moolreDisbursementWebhook = async (req, res) => {
                     });
                 }
             } catch (emitErr) {
-                console.error('[moolreDisbursementWebhook] Socket emit failed:', emitErr.message);
+                logger.error({ err: emitErr }, '[moolreDisbursementWebhook] Socket emit failed');
             }
         });
 
@@ -745,7 +746,7 @@ exports.moolreDisbursementWebhook = async (req, res) => {
                 actionPayload: { action: 'OPEN_WALLET', reference }
             });
         } catch (notifErr) {
-            console.error('[moolreDisbursementWebhook] Notification write failed:', notifErr.message);
+            logger.error({ err: notifErr }, '[moolreDisbursementWebhook] Notification write failed');
         }
 
         return res.status(200).json({
@@ -754,7 +755,7 @@ exports.moolreDisbursementWebhook = async (req, res) => {
             data:    reversal
         });
     } catch (error) {
-        console.error('[finance.moolreDisbursementWebhook] error:', error.message);
+        logger.error({ err: error }, '[finance.moolreDisbursementWebhook] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -787,7 +788,7 @@ exports.getFiatPoolStatus = async (req, res) => {
             }
         });
     } catch (error) {
-        console.error('[finance.getFiatPoolStatus] error:', error.message);
+        logger.error({ err: error }, '[finance.getFiatPoolStatus] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -830,7 +831,7 @@ exports.getTransactionReceipt = async (req, res) => {
             }
         });
     } catch (error) {
-        console.error('[finance.getTransactionReceipt] error:', error.message);
+        logger.error({ err: error }, '[finance.getTransactionReceipt] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -894,7 +895,7 @@ exports.getTransactionHistory = async (req, res) => {
             nextCursor
         });
     } catch (error) {
-        console.error('[finance.getTransactionHistory] error:', error.message);
+        logger.error({ err: error }, '[finance.getTransactionHistory] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };

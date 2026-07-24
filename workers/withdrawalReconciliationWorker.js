@@ -33,6 +33,7 @@
 // reverseFiatWithdrawal returns alreadyReversed=true).
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const financeService = require('../services/finance.service');
 
 const RECONCILE_INTERVAL_MS = 60_000;     // Scan every 60s.
@@ -66,12 +67,12 @@ class WithdrawalReconciliationWorker {
     start() {
         if (this._timer) return;
         if (!this.mtn) {
-            console.warn('[WithdrawalReconciliation] mtnDisbursementService not bound — worker disabled.');
+            logger.warn('[WithdrawalReconciliation] mtnDisbursementService not bound — worker disabled.');
             return;
         }
-        console.log(`[WithdrawalReconciliation] starting (every ${RECONCILE_INTERVAL_MS / 1000}s, stale > ${STALE_AFTER_MS / 60000}min).`);
+        logger.info(`[WithdrawalReconciliation] starting (every ${RECONCILE_INTERVAL_MS / 1000}s, stale > ${STALE_AFTER_MS / 60000}min).`);
         this._timer = setInterval(() => this._tick().catch((e) => {
-            console.error('[WithdrawalReconciliation] tick crash:', e.message);
+            logger.error({ err: e }, '[WithdrawalReconciliation] tick crash');
         }), RECONCILE_INTERVAL_MS);
     }
 
@@ -105,11 +106,11 @@ class WithdrawalReconciliationWorker {
 
             if (stuck.length === 0) return;
 
-            console.log(`[WithdrawalReconciliation] reconciling ${stuck.length} stale PENDING withdrawal(s).`);
+            logger.info(`[WithdrawalReconciliation] reconciling ${stuck.length} stale PENDING withdrawal(s).`);
 
             for (const w of stuck) {
                 await this._reconcileOne(w).catch((err) => {
-                    console.error(`[WithdrawalReconciliation] row id=${w.id} reconcile error:`, err.message);
+                    logger.error(`[WithdrawalReconciliation] row id=${w.id} reconcile error:`, err.message);
                 });
             }
         } finally {
@@ -136,7 +137,7 @@ class WithdrawalReconciliationWorker {
         });
 
         if (!txRow || !txRow.txHash) {
-            console.warn(`[WithdrawalReconciliation] row id=${withdrawal.id}: no matching TransactionHistory.txHash — skipping.`);
+            logger.warn(`[WithdrawalReconciliation] row id=${withdrawal.id}: no matching TransactionHistory.txHash — skipping.`);
             return;
         }
 
@@ -145,7 +146,7 @@ class WithdrawalReconciliationWorker {
         try {
             statusResp = await this.mtn.getTransferStatus(reference);
         } catch (err) {
-            console.warn(`[WithdrawalReconciliation] MTN status query failed for ${reference}: ${err.message}`);
+            logger.warn(`[WithdrawalReconciliation] MTN status query failed for ${reference}: ${err.message}`);
             return;
         }
 
@@ -163,7 +164,7 @@ class WithdrawalReconciliationWorker {
             // The TransactionHistory row was already COMPLETED by the
             // initial finance.service.processFiatWithdrawal commit; no
             // ledger change needed here.
-            console.log(`[WithdrawalReconciliation] ref=${reference} settled SUCCESSFUL.`);
+            logger.info(`[WithdrawalReconciliation] ref=${reference} settled SUCCESSFUL.`);
             if (this.io) {
                 this.io.to(`user_${withdrawal.userId}`).emit('withdrawal_settled', {
                     reference, status: 'COMPLETED', amount: withdrawal.amount
@@ -214,7 +215,7 @@ class WithdrawalReconciliationWorker {
                     where: { id: withdrawal.id },
                     data:  { status: 'FAILED' }
                 });
-                console.warn(`[WithdrawalReconciliation] ref=${reference} REVERSED. user refund: ${result.refundedAmount} USDC.`);
+                logger.warn(`[WithdrawalReconciliation] ref=${reference} REVERSED. user refund: ${result.refundedAmount} USDC.`);
                 if (this.io) {
                     this.io.to(`user_${withdrawal.userId}`).emit('withdrawal_settled', {
                         reference,
@@ -269,7 +270,7 @@ class WithdrawalReconciliationWorker {
             } catch (revErr) {
                 // Reversal failed — escalate to admin and leave the row
                 // as-is so a human investigates.
-                console.error(`[WithdrawalReconciliation] CRITICAL: reverseFiatWithdrawal failed for ${reference}:`, revErr.message);
+                logger.error(`[WithdrawalReconciliation] CRITICAL: reverseFiatWithdrawal failed for ${reference}:`, revErr.message);
                 if (this.io) {
                     this.io.emit('admin_alert', {
                         type:         'WITHDRAWAL_REVERSAL_FAILED',
@@ -285,7 +286,7 @@ class WithdrawalReconciliationWorker {
             return;
         }
 
-        console.warn(`[WithdrawalReconciliation] ref=${reference} unexpected MTN status: ${remoteStatus}.`);
+        logger.warn(`[WithdrawalReconciliation] ref=${reference} unexpected MTN status: ${remoteStatus}.`);
     }
 }
 

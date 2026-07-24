@@ -15,6 +15,7 @@
 exports.generateCheckInQR = async (req, res) => {
     const prisma = req.app.get('prisma');
     try {
+        const logger = require('../src/config/logger');
         const qrSvc = require('../services/qrCheckInService');
         const result = await qrSvc.generateCheckInToken(prisma, {
             reservationId: req.params.id,
@@ -79,7 +80,7 @@ exports.businessCheckIn = async (req, res) => {
                 try {
                     const { releaseBookingEscrow } = require('../services/bookingEscrowService');
                     await releaseBookingEscrow(prisma, { escrowId: reservation.escrowId });
-                } catch (e) { console.error('[checkIn] escrow release:', e.message); }
+                } catch (e) { logger.error({ err: e }, '[checkIn] escrow release'); }
             }
 
             return res.status(200).json({ success: true, reservation: updated });
@@ -428,7 +429,7 @@ exports.generateTransitCheckInQR = async (req, res) => {
         });
         res.json({ success: true, ...result });
     } catch (err) {
-        console.error('[generateTransitCheckInQR]', err.message);
+        logger.error({ err: err }, '[generateTransitCheckInQR]');
         res.status(400).json({ success: false, message: err.message });
     }
 };
@@ -443,7 +444,7 @@ exports.transitBoarding = async (req, res) => {
         });
         res.json(result);
     } catch (err) {
-        console.error('[transitBoarding]', err.message);
+        logger.error({ err: err }, '[transitBoarding]');
         res.status(400).json({ success: false, message: err.message });
     }
 };
@@ -462,7 +463,7 @@ exports.getCustomerTrustScore = async (req, res) => {
         const score = await getTrustScore(req.prisma, customer.id);
         res.json({ success: true, ...score });
     } catch (err) {
-        console.error('[getCustomerTrustScore]', err.message);
+        logger.error({ err: err }, '[getCustomerTrustScore]');
         res.status(500).json({ success: false, message: err.message });
     }
 };

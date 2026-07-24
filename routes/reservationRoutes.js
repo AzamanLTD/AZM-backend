@@ -1,5 +1,6 @@
 // routes/reservationRoutes.js
 // Mounted at /api/reservations
+const logger = require('../src/config/logger');
 const router = require('express').Router();
 const { protect }       = require('../middleware/authMiddleware');
 const { protectActive } = require('../middleware/banGuardMiddleware');

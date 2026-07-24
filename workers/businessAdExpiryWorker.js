@@ -13,14 +13,15 @@
 
 const sweepExpiredAds = async (prisma) => {
     try {
+        const logger = require('../src/config/logger');
         const { expireOldAds } = require('../services/businessAdService');
         const result = await expireOldAds(prisma);
         if (result.expired > 0) {
-            console.log(`[businessAdExpiryWorker] Expired ${result.expired} ad posts.`);
+            logger.info(`[businessAdExpiryWorker] Expired ${result.expired} ad posts.`);
         }
         return result;
     } catch (err) {
-        console.error('[businessAdExpiryWorker]', err.message);
+        logger.error({ err: err }, '[businessAdExpiryWorker]');
         return { expired: 0, error: err.message };
     }
 };

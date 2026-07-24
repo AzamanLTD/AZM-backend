@@ -9,6 +9,7 @@
 // extra field a controller reads (feeDiscountTierId, clientRequestId, ...) is
 // preserved. Schemas therefore never need to enumerate every optional field.
 // =============================================================================
+const logger = require('../../src/config/logger');
 const { z } = require('zod');
 
 // ── Deposit ─────────────────────────────────────────────────────────────────

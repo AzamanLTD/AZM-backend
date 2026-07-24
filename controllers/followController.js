@@ -1,3 +1,4 @@
+const logger = require('../src/config/logger');
 const { followBusiness, unfollowBusiness, isFollowing, getFollowers, getFollowing } = require('../services/businessFollowerService');
 const FollowService = require('../services/marketplace/followService');
 

@@ -24,6 +24,7 @@
 //   REFUND  payer.{escrowLocked|disputeEscrow}Balance -> payer.availableBalance
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const { randomUUID } = require('crypto');
 const { runDoubleCheck } = require('../utils/securityCheck');
 
@@ -217,7 +218,7 @@ const fundEscrow = async (prisma, { escrowId, payerId }) => {
     setImmediate(() => {
         _getBizOrderService()
             .updateOrderStatusFromEscrow(prisma, escrowId, 'FUNDED')
-            .catch((err) => console.error('[escrowService.fundEscrow] order sync:', err.message));
+            .catch((err) => logger.error({ err: err }, '[escrowService.fundEscrow] order sync'));
     });
 
     // Owner-facing feed: the buyer has funded the escrow.
@@ -225,7 +226,7 @@ const fundEscrow = async (prisma, { escrowId, payerId }) => {
         _getBizNotificationService().notifyOrderEvent(prisma, {
             escrowId,
             type: 'ORDER_FUNDED'
-        }).catch((err) => console.error('[escrowService.fundEscrow] biz notif:', err.message));
+        }).catch((err) => logger.error({ err: err }, '[escrowService.fundEscrow] biz notif'));
     });
 
     return { success: true, escrow: updatedEscrow, reference };
@@ -278,7 +279,7 @@ const markSatisfied = async (prisma, { escrowId, userId }) => {
             _getBizNotificationService().notifyOrderEvent(prisma, {
                 escrowId,
                 type: 'ORDER_SATISFIED'
-            }).catch((err) => console.error('[escrowService.markSatisfied] biz notif:', err.message));
+            }).catch((err) => logger.error({ err: err }, '[escrowService.markSatisfied] biz notif'));
         });
     }
 
@@ -337,7 +338,7 @@ const raiseDispute = async (prisma, { escrowId, raisedById, reason, evidenceUrls
     setImmediate(() => {
         _getBizOrderService()
             .updateOrderStatusFromEscrow(prisma, escrowId, 'DISPUTED')
-            .catch((err) => console.error('[escrowService.raiseDispute] order sync:', err.message));
+            .catch((err) => logger.error({ err: err }, '[escrowService.raiseDispute] order sync'));
     });
 
     // Owner-facing feed: a dispute was opened on this order.
@@ -346,7 +347,7 @@ const raiseDispute = async (prisma, { escrowId, raisedById, reason, evidenceUrls
             escrowId,
             type: 'ORDER_DISPUTED',
             extraMetadata: { disputeId: result.dispute?.id, raisedById }
-        }).catch((err) => console.error('[escrowService.raiseDispute] biz notif:', err.message));
+        }).catch((err) => logger.error({ err: err }, '[escrowService.raiseDispute] biz notif'));
     });
 
     return result;
@@ -558,7 +559,7 @@ const _releaseEscrow = async (prisma, escrowId, finalStatus = 'SETTLED') => {
     setImmediate(() => {
         _getBizOrderService()
             .updateOrderStatusFromEscrow(prisma, escrowId, finalStatus)
-            .catch((err) => console.error('[escrowService._releaseEscrow] order sync:', err.message));
+            .catch((err) => logger.error({ err: err }, '[escrowService._releaseEscrow] order sync'));
     });
 
     if (finalStatus === 'SETTLED' || finalStatus === 'RELEASED') {
@@ -586,7 +587,7 @@ const _releaseEscrow = async (prisma, escrowId, finalStatus = 'SETTLED') => {
                     });
                 }
             } catch (err) {
-                console.error('[escrowService._releaseEscrow] profile stat sync:', err.message);
+                logger.error({ err: err }, '[escrowService._releaseEscrow] profile stat sync');
             }
         });
 
@@ -595,7 +596,7 @@ const _releaseEscrow = async (prisma, escrowId, finalStatus = 'SETTLED') => {
             _getBizNotificationService().notifyOrderEvent(prisma, {
                 escrowId,
                 type: 'ORDER_SETTLED'
-            }).catch((err) => console.error('[escrowService._releaseEscrow] biz notif:', err.message));
+            }).catch((err) => logger.error({ err: err }, '[escrowService._releaseEscrow] biz notif'));
         });
     }
 
@@ -665,7 +666,7 @@ const _refundEscrow = async (prisma, escrowId, finalStatus = 'REFUNDED') => {
     setImmediate(() => {
         _getBizOrderService()
             .updateOrderStatusFromEscrow(prisma, escrowId, finalStatus)
-            .catch((err) => console.error('[escrowService._refundEscrow] order sync:', err.message));
+            .catch((err) => logger.error({ err: err }, '[escrowService._refundEscrow] order sync'));
     });
 
     // Owner-facing feed: principal returned to the buyer (manual or worker sweep).
@@ -673,7 +674,7 @@ const _refundEscrow = async (prisma, escrowId, finalStatus = 'REFUNDED') => {
         _getBizNotificationService().notifyOrderEvent(prisma, {
             escrowId,
             type: 'ORDER_REFUNDED'
-        }).catch((err) => console.error('[escrowService._refundEscrow] biz notif:', err.message));
+        }).catch((err) => logger.error({ err: err }, '[escrowService._refundEscrow] biz notif'));
     });
 
     return updated;

@@ -47,7 +47,7 @@ const releaseStatus = {
 };
 
 function log(msg) {
-  console.log(`[autoRelease] ${msg}`);
+  logger.info(`[autoRelease] ${msg}`);
   releaseStatus.steps.push(`${new Date().toISOString()} ${msg}`);
   // Keep the step log bounded.
   if (releaseStatus.steps.length > 50) releaseStatus.steps.shift();
@@ -73,6 +73,7 @@ async function autoRelease(prisma, opts = {}) {
     // in prod. It's cheap (all statements no-op once applied) and never
     // drops or alters existing objects.
     try {
+      const logger = require('../src/config/logger');
       const { installSusuOverlay } = require('./install-susu-overlay');
       const r = await installSusuOverlay(prisma);
       releaseStatus.installerResult = { ok: r.ok, failed: r.failed };

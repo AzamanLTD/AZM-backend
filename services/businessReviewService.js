@@ -92,6 +92,7 @@ const createReview = async (prisma, {
 
   // Record trust score outcome after successful review
   try {
+      const logger = require('../src/config/logger');
       const { recordBookingOutcome } = require('./marketplace/trustScoreService');
       await recordBookingOutcome(prisma, { customerId: reviewerId, outcome: 'COMPLETED' });
   } catch (e) {

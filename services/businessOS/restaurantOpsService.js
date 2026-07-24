@@ -147,6 +147,7 @@ class RestaurantOpsService {
         });
 
         if (status === 'READY') {
+            const logger = require('../../src/config/logger');
             const messagingChannelsService = require('../messagingChannels');
             const customerPhone = updated.businessOrder?.customer?.phoneNumber;
             if (customerPhone) {
@@ -154,7 +155,7 @@ class RestaurantOpsService {
                     updated.businessProfileId, 
                     customerPhone, 
                     updated.businessOrder?.orderRef || updated.ticketNumber.toString()
-                ).catch(err => console.error('[MessagingChannels] Error:', err));
+                ).catch(err => logger.error('[MessagingChannels] Error:', err));
             }
         }
 

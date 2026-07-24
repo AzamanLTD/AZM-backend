@@ -26,7 +26,7 @@ class VaultWorker {
     }
 
     start(intervalMs = 60 * 60 * 1000) {
-        console.log('[VaultWorker] Started — sweeping every 60 minutes');
+        logger.info('[VaultWorker] Started — sweeping every 60 minutes');
         this._tick();
         this.interval = setInterval(() => this._tick(), intervalMs);
     }
@@ -36,8 +36,8 @@ class VaultWorker {
     }
 
     async _tick() {
-        await this._fireAutoRules().catch((e) => console.error('[VaultWorker.autoRules]', e.message));
-        await this._sweepMatured().catch((e) => console.error('[VaultWorker.matured]', e.message));
+        await this._fireAutoRules().catch((e) => logger.error({ err: e }, '[VaultWorker.autoRules]'));
+        await this._sweepMatured().catch((e) => logger.error({ err: e }, '[VaultWorker.matured]'));
     }
 
     async _fireAutoRules() {
@@ -81,7 +81,7 @@ class VaultWorker {
                     }
                 }
             } catch (err) {
-                console.error(`[VaultWorker] auto-rule failed vault=${vault.id}:`, err.message);
+                logger.error(`[VaultWorker] auto-rule failed vault=${vault.id}:`, err.message);
             }
         }
     }
@@ -99,7 +99,7 @@ class VaultWorker {
             try {
                 await this.vaultService.completeMatured(v);
             } catch (err) {
-                console.error(`[VaultWorker] complete failed vault=${v.id}:`, err.message);
+                logger.error(`[VaultWorker] complete failed vault=${v.id}:`, err.message);
             }
         }
     }

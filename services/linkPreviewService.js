@@ -17,6 +17,7 @@
 //     FAILED on read; the FE can choose to render a plain link if FAILED.
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const crypto = require('crypto');
 
 const CACHE_TTL_OK_MS     = 24 * 60 * 60 * 1000; // 24h for successful fetches

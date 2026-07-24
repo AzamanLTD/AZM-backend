@@ -10,6 +10,7 @@
 // GET  /api/azm/spend/history       — Paginated spend history
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const { AZM_SPEND_SOURCES, FEE_DISCOUNT_TIERS, AD_BOOST_OPTIONS, CARD_SKIN_OPTIONS } = require('../services/azmSpendService');
 
 // =============================================================================
@@ -28,7 +29,7 @@ exports.getSpendOptions = async (req, res) => {
 
         return res.status(200).json({ success: true, data: options });
     } catch (error) {
-        console.error('[azmSpend.getSpendOptions] Error:', error.message);
+        logger.error({ err: error }, '[azmSpend.getSpendOptions] Error');
         return res.status(500).json({ success: false, message: 'Failed to fetch spend options.' });
     }
 };
@@ -79,7 +80,7 @@ exports.applyFeeDiscount = async (req, res) => {
             }
         });
     } catch (error) {
-        console.error('[azmSpend.applyFeeDiscount] Error:', error.message);
+        logger.error({ err: error }, '[azmSpend.applyFeeDiscount] Error');
 
         if (error.message.includes('Insufficient AZM')) {
             return res.status(400).json({
@@ -144,7 +145,7 @@ exports.boostAd = async (req, res) => {
             }
         });
     } catch (error) {
-        console.error('[azmSpend.boostAd] Error:', error.message);
+        logger.error({ err: error }, '[azmSpend.boostAd] Error');
 
         if (error.message.includes('Insufficient AZM')) {
             return res.status(400).json({
@@ -202,7 +203,7 @@ exports.getSpendHistory = async (req, res) => {
             }
         });
     } catch (error) {
-        console.error('[azmSpend.getSpendHistory] Error:', error.message);
+        logger.error({ err: error }, '[azmSpend.getSpendHistory] Error');
         return res.status(500).json({ success: false, message: 'Failed to fetch AZM spend history.' });
     }
 };
@@ -222,7 +223,7 @@ exports.getCardSkinCatalog = async (req, res) => {
         const data = await azmSpendService.getCardSkinCatalog(req.user.id);
         return res.status(200).json({ success: true, data });
     } catch (error) {
-        console.error('[azmSpend.getCardSkinCatalog] Error:', error.message);
+        logger.error({ err: error }, '[azmSpend.getCardSkinCatalog] Error');
         return res.status(500).json({ success: false, message: 'Failed to fetch card skin catalog.' });
     }
 };
@@ -254,7 +255,7 @@ exports.purchaseCardSkin = async (req, res) => {
             data: result
         });
     } catch (error) {
-        console.error('[azmSpend.purchaseCardSkin] Error:', error.message);
+        logger.error({ err: error }, '[azmSpend.purchaseCardSkin] Error');
 
         if (error.message.includes('Insufficient AZM')) {
             return res.status(400).json({ success: false, code: 'INSUFFICIENT_AZM', message: error.message });
@@ -288,7 +289,7 @@ exports.equipCardSkin = async (req, res) => {
             data: result
         });
     } catch (error) {
-        console.error('[azmSpend.equipCardSkin] Error:', error.message);
+        logger.error({ err: error }, '[azmSpend.equipCardSkin] Error');
         return res.status(400).json({ success: false, message: error.message });
     }
 };

@@ -30,11 +30,11 @@ class SusuCycleSchedulerV2 {
 
   start() {
     if (this.interval) return;
-    console.log(`[SusuCycleSchedulerV2] starting (every ${this.intervalMs / 1000}s, batch ${this.batchSize})`);
+    logger.info(`[SusuCycleSchedulerV2] starting (every ${this.intervalMs / 1000}s, batch ${this.batchSize})`);
     // Initial tick on next loop turn so the worker picks up cycles
     // already due at boot. Subsequent ticks every intervalMs.
-    setImmediate(() => this._tick().catch(err => console.error('[SusuCycleSchedulerV2] initial tick error:', err.message)));
-    this.interval = setInterval(() => this._tick().catch(err => console.error('[SusuCycleSchedulerV2] tick error:', err.message)), this.intervalMs);
+    setImmediate(() => this._tick().catch(err => logger.error({ err: err }, '[SusuCycleSchedulerV2] initial tick error')));
+    this.interval = setInterval(() => this._tick().catch(err => logger.error({ err: err }, '[SusuCycleSchedulerV2] tick error')), this.intervalMs);
   }
 
   stop() {
@@ -73,7 +73,7 @@ class SusuCycleSchedulerV2 {
         try {
           await this.cycleService.processCycle(c.id);
         } catch (err) {
-          console.error(`[SusuCycleSchedulerV2] cycle ${c.id} failed:`, err.message);
+          logger.error(`[SusuCycleSchedulerV2] cycle ${c.id} failed:`, err.message);
         }
       }
     } finally {

@@ -4,6 +4,7 @@
 // Mounted at /api/finance.
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const express                  = require('express');
 const router                   = express.Router();
 const financeController        = require('../controllers/finance.controller');

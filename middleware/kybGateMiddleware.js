@@ -17,6 +17,7 @@ const kybGate = async (req, res, next) => {
         if (!req.user || !req.user.id) return next();
 
         // Look up the user's business profile
+        const logger = require('../src/config/logger');
         const { PrismaClient } = require('@prisma/client');
         const prisma = req.app.get('prisma') || new PrismaClient();
 
@@ -51,7 +52,7 @@ const kybGate = async (req, res, next) => {
         req.businessProfile = business;
         next();
     } catch (err) {
-        console.error('[kybGate]', err.message);
+        logger.error({ err: err }, '[kybGate]');
         // On error, fail open (let the request proceed) — don't block legit traffic
         // due to an internal error. Log it for investigation.
         next();

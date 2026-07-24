@@ -22,6 +22,7 @@
 //     (Req 10.10)
 // =============================================================================
 
+const logger = require('../../src/config/logger');
 const { Prisma } = require('@prisma/client');
 const { SusuError, ErrorCodes } = require('./errors');
 
@@ -353,7 +354,7 @@ class SusuCycleService {
           }
         }
       } catch (err) {
-        console.error(`[SusuCycleService] member ${member.id} cycle ${cycle.id} error:`, err.message);
+        logger.error(`[SusuCycleService] member ${member.id} cycle ${cycle.id} error:`, err.message);
         continue;
       }
 
@@ -407,7 +408,7 @@ class SusuCycleService {
         try {
           await this._applyMinorPenalty(member, cycle, susu);
         } catch (err) {
-          console.error(`[SusuCycleService] minor penalty member ${member.id} cycle ${cycle.id}:`, err.message);
+          logger.error(`[SusuCycleService] minor penalty member ${member.id} cycle ${cycle.id}:`, err.message);
         }
       }
     }
@@ -478,7 +479,7 @@ class SusuCycleService {
       // Anything else is logged and swallowed so a single member's penalty
       // failure never derails the cycle.
       if (err && err.code !== 'P2002') {
-        console.error(`[SusuCycleService] _applyMinorPenalty ${member.id}:`, err.message);
+        logger.error(`[SusuCycleService] _applyMinorPenalty ${member.id}:`, err.message);
       }
       return;
     }
@@ -723,7 +724,7 @@ class SusuCycleService {
     // Property 17 SLA: halt within 5 seconds. Log if we miss it.
     const elapsed = Date.now() - startedAt;
     if (elapsed > 5000) {
-      console.warn(`[SusuCycle] Circuit Breaker took ${elapsed}ms (>5s SLA)`);
+      logger.warn(`[SusuCycle] Circuit Breaker took ${elapsed}ms (>5s SLA)`);
     }
   }
 }

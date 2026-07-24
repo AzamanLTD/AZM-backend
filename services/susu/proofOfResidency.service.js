@@ -13,6 +13,7 @@
 // reads the persisted column value and never computes expiry inline.
 // =============================================================================
 
+const logger = require('../../src/config/logger');
 const { SusuError, ErrorCodes } = require('./errors');
 const ProofOfResidencyRepo = require('../../repositories/proofOfResidencyRepo');
 const SusuMemberService = require('./susuMember.service');

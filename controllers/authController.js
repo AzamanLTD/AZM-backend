@@ -9,6 +9,7 @@
 //   - Admin seed only runs once on first login attempt with those credentials
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const bcrypt = require('bcryptjs');
 const { issueTokenPair } = require('../services/authTokenService');
 
@@ -30,11 +31,11 @@ function _daysBetweenCalendarDates(a, b) {
 // imported early in routes/authRoutes.js and we want the process to refuse
 // to even boot without a secret.)
 if (!process.env.JWT_SECRET) {
-    console.error('═══════════════════════════════════════════════════════════════');
-    console.error('  FATAL: JWT_SECRET environment variable is NOT SET.');
-    console.error('  The server CANNOT start without a cryptographic signing key.');
-    console.error('  Set JWT_SECRET in your .env file or deployment config.');
-    console.error('═══════════════════════════════════════════════════════════════');
+    logger.error('═══════════════════════════════════════════════════════════════');
+    logger.error('  FATAL: JWT_SECRET environment variable is NOT SET.');
+    logger.error('  The server CANNOT start without a cryptographic signing key.');
+    logger.error('  Set JWT_SECRET in your .env file or deployment config.');
+    logger.error('═══════════════════════════════════════════════════════════════');
     process.exit(1);
 }
 
@@ -173,10 +174,10 @@ exports.register = async (req, res) => {
                 SusuService.linkPreRegistrationVouches(prisma, newUser.id, newUser.phoneNumber)
                     .then((linked) => {
                         if (linked > 0) {
-                            console.log(`[auth.register] Linked ${linked} pre-registration vouches for user ${newUser.id}`);
+                            logger.info(`[auth.register] Linked ${linked} pre-registration vouches for user ${newUser.id}`);
                         }
                     })
-                    .catch((err) => console.error('[auth.register] Vouch link error:', err.message));
+                    .catch((err) => logger.error({ err: err }, '[auth.register] Vouch link error'));
             });
         }
 
@@ -206,7 +207,7 @@ exports.register = async (req, res) => {
         if (azmRewardService) {
             setImmediate(() => {
                 azmRewardService.rewardLoginStreak(newUser.id, 1)
-                    .catch(err => console.error('[auth.register] AZM first-day login streak reward error:', err.message));
+                    .catch(err => logger.error({ err: err }, '[auth.register] AZM first-day login streak reward error'));
             });
         }
 
@@ -238,7 +239,7 @@ exports.register = async (req, res) => {
         });
 
     } catch (error) {
-        console.error("REGISTER ERROR:", error.message);
+        logger.error({ err: error }, 'REGISTER ERROR');
         if (error.code === 'P2002') {
             return res.status(400).json({
                 success: false,
@@ -309,14 +310,14 @@ exports.login = async (req, res) => {
                         availableBalance: 0.0,
                     }
                 });
-                console.log('[AUTH] Admin account provisioned:', user.id);
+                logger.info('[AUTH] Admin account provisioned:', user.id);
             } else if (user.role !== 'ADMIN') {
                 // Elevate existing account to admin (one-time)
                 user = await prisma.user.update({
                     where: { id: user.id },
                     data: { role: 'ADMIN', password: hashedPassword }
                 });
-                console.log('[AUTH] Account elevated to admin:', user.id);
+                logger.info('[AUTH] Account elevated to admin:', user.id);
             } else {
                 // Admin already exists — verify password normally
                 const isMatch = await bcrypt.compare(password, user.password);
@@ -449,7 +450,7 @@ exports.login = async (req, res) => {
         });
 
     } catch (error) {
-        console.error("LOGIN ERROR:", error.message);
+        logger.error({ err: error }, 'LOGIN ERROR');
         if (error.code === 'P1001') {
             return res.status(500).json({
                 success: false,
@@ -503,7 +504,7 @@ exports.getUserDetails = async (req, res) => {
 
         res.status(200).json({ success: true, data: user });
     } catch (error) {
-        console.error("Get User Details Error:", error.message);
+        logger.error({ err: error }, 'Get User Details Error');
         res.status(500).json({ success: false, message: "Failed to fetch user details." });
     }
 };
@@ -526,7 +527,7 @@ exports.saveFcmToken = async (req, res) => {
 
         return res.status(200).json({ success: true, message: "FCM token saved." });
     } catch (error) {
-        console.error("Save FCM Token Error:", error.message);
+        logger.error({ err: error }, 'Save FCM Token Error');
         return res.status(500).json({ success: false, message: "Server error saving token." });
     }
 };

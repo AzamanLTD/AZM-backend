@@ -619,6 +619,7 @@ const processReviewGamification = async (prisma, { revieweeId, isPositive, trade
 
         // Phase N2: fire achievement notifications post-commit via notificationService
         if (result && result.newAchievements && result.newAchievements.length > 0) {
+            const logger = require('../src/config/logger');
             const NotificationService = require('./notificationService');
             const { AzmRewardService } = require('./azmRewardService');
             const io = global.socketIoInstance;
@@ -644,13 +645,13 @@ const processReviewGamification = async (prisma, { revieweeId, isPositive, trade
                     ...result.newAchievements.map(a =>
                         azmSvc.rewardAchievementUnlock(revieweeId, a.achievementId, a.name, a.tier)
                     )
-                ]).catch(err => console.error('[gamification.reviewGamification] post-commit notif/azm error:', err.message));
+                ]).catch(err => logger.error({ err: err }, '[gamification.reviewGamification] post-commit notif/azm error'));
             });
         }
 
         return result;
     } catch (gamErr) {
-        console.error(
+        logger.error(
             `[gamification.processReviewGamification] tradeId=${tradeId} ` +
             `revieweeId=${revieweeId} non-fatal error: ${gamErr.message}`
         );

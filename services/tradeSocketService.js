@@ -21,7 +21,7 @@ class TradeSocketService {
             const { adminUserId } = data || {};
             if (!adminUserId) return;
             socket.join(ADMIN_SPY_ROOM);
-            console.log(`🕵️ Admin ${adminUserId} (${socket.id}) joined ${ADMIN_SPY_ROOM}`);
+            logger.info(`🕵️ Admin ${adminUserId} (${socket.id}) joined ${ADMIN_SPY_ROOM}`);
         });
 
         socket.on('extend_time', async (data) => {
@@ -52,6 +52,7 @@ class TradeSocketService {
                     data: { expiresAt: newExpires }
                 });
 
+                const logger = require('../src/config/logger');
                 const NotificationService = require('./notificationService');
                 const notifSvc = new NotificationService(this.prisma, this.io);
 
@@ -82,9 +83,9 @@ class TradeSocketService {
                     })
                 ]);
 
-                console.log(`⏱️ Trade #${tradeId} extended by ${addedMinutes}min → ${newExpires.toISOString()}`);
+                logger.info(`⏱️ Trade #${tradeId} extended by ${addedMinutes}min → ${newExpires.toISOString()}`);
             } catch (err) {
-                console.error('extend_time error:', err.message);
+                logger.error({ err: err }, 'extend_time error');
                 socket.emit('extend_time_error', { reason: 'server_error', detail: err.message });
             }
         });

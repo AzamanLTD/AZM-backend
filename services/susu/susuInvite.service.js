@@ -3,6 +3,7 @@
 // SusuInvite_Service — Req 6
 // =============================================================================
 
+const logger = require('../../src/config/logger');
 const crypto = require('crypto');
 const { Prisma } = require('@prisma/client');
 const { SusuError, ErrorCodes } = require('./errors');

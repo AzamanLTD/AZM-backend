@@ -1,10 +1,11 @@
 'use strict';
 
+const logger = require('../src/config/logger');
 const { PrismaClient } = require('@prisma/client');
 const prisma = new PrismaClient();
 
 async function seedWidgets() {
-  console.log('[Seed] Seeding storefront widget catalog...');
+  logger.info('[Seed] Seeding storefront widget catalog...');
 
   const widgets = [
     // ── FREE widgets ──
@@ -337,13 +338,13 @@ async function seedWidgets() {
     });
   }
 
-  console.log(`[Seed] ${widgets.length} storefront widgets seeded`);
+  logger.info(`[Seed] ${widgets.length} storefront widgets seeded`);
 }
 
 module.exports = { seedWidgets };
 
 if (require.main === module) {
   seedWidgets()
-    .catch((e) => { console.error(e); process.exit(1); })
+    .catch((e) => { logger.error(e); process.exit(1); })
     .finally(() => prisma.$disconnect());
 }

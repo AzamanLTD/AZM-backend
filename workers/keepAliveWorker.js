@@ -14,6 +14,7 @@
 // To add more targets, append URLs to the PING_URLS array below.
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const https = require('https');
 const url = require('url');
 
@@ -65,16 +66,16 @@ function ping(targetUrl) {
 
 async function pingAll() {
   const timestamp = new Date().toISOString();
-  console.log(`📡 [KeepAlive] Pinging ${PING_URLS.length} target(s) at ${timestamp}`);
+  logger.info(`📡 [KeepAlive] Pinging ${PING_URLS.length} target(s) at ${timestamp}`);
 
   const results = await Promise.all(PING_URLS.map(ping));
 
   for (const result of results) {
     lastResults[result.url] = { ...result, timestamp };
     if (result.ok) {
-      console.log(`  ✅ ${result.url} → ${result.status}`);
+      logger.info(`  ✅ ${result.url} → ${result.status}`);
     } else {
-      console.log(`  ❌ ${result.url} → ${result.status} ${result.error || ''}`);
+      logger.info(`  ❌ ${result.url} → ${result.status} ${result.error || ''}`);
     }
   }
 }
@@ -82,7 +83,7 @@ async function pingAll() {
 module.exports = {
   start() {
     if (intervalId) {
-      console.log('📡 [KeepAlive] Already running');
+      logger.info('📡 [KeepAlive] Already running');
       return;
     }
 
@@ -92,15 +93,15 @@ module.exports = {
     // Schedule recurring pings
     intervalId = setInterval(pingAll, PING_INTERVAL_MS);
 
-    console.log(`📡 [KeepAlive] Started — pinging ${PING_URLS.length} URL(s) every 5 min`);
-    console.log(`📡 [KeepAlive] Targets: ${PING_URLS.join(', ')}`);
+    logger.info(`📡 [KeepAlive] Started — pinging ${PING_URLS.length} URL(s) every 5 min`);
+    logger.info(`📡 [KeepAlive] Targets: ${PING_URLS.join(', ')}`);
   },
 
   stop() {
     if (intervalId) {
       clearInterval(intervalId);
       intervalId = null;
-      console.log('📡 [KeepAlive] Stopped');
+      logger.info('📡 [KeepAlive] Stopped');
     }
   },
 

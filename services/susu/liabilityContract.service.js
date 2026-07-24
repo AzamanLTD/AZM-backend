@@ -9,6 +9,7 @@
 //   - Admin publish-new-version flow with SHA-256 hash on body
 // =============================================================================
 
+const logger = require('../../src/config/logger');
 const crypto = require('crypto');
 const LiabilityContractRepo = require('../../repositories/liabilityContractRepo');
 const { SusuError, ErrorCodes, susuNotFound } = require('./errors');

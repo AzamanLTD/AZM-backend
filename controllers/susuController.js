@@ -6,7 +6,7 @@
 const wrap = (fn) => async (req, res) => {
     try { await fn(req, res); }
     catch (err) {
-        console.error(`[susuController] ${fn.name || 'h'}:`, err.message);
+        logger.error(`[susuController] ${fn.name || 'h'}:`, err.message);
         res.status(400).json({ success: false, message: err.message });
     }
 };

@@ -19,6 +19,7 @@
 // URLs) continue to resolve unchanged; only NEW uploads land in users/avatars.
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const multer = require('multer');
 const path = require('path');
 

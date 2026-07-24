@@ -12,6 +12,7 @@
 //   - cancelTransitBooking: cancel + refund escrow + free seats
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const crypto = require('crypto');
 
 const _genRef = () => 'TRN-' + crypto.randomBytes(4).toString('hex').toUpperCase();
@@ -219,7 +220,7 @@ const cancelTransitBooking = async (prisma, { bookingId, cancelledBy }) => {
             const { refundBookingEscrow } = require('./bookingEscrowService');
             refundResult = await refundBookingEscrow(prisma, { escrowId: booking.escrowId });
         } catch (err) {
-            console.error('[transitBookingService.cancel] escrow refund failed:', err.message);
+            logger.error({ err: err }, '[transitBookingService.cancel] escrow refund failed');
         }
     }
 

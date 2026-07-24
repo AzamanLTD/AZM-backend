@@ -8,6 +8,7 @@
 // prisma singleton. All callers get prisma via req.app.get('prisma').
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const { migrateLayout, generateEmptyLayout } = require('./storefrontSchemaMigration');
 
 /**

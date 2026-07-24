@@ -10,6 +10,7 @@
 // Or in-process from autoRelease at boot (free-tier path).
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const { PrismaClient } = require('@prisma/client');
 const fieldCipher = require('../services/crypto/fieldCipher');
 
@@ -24,7 +25,7 @@ async function encryptIdNumbers(client) {
   try {
     // No-op when encryption isn't configured — nothing to migrate to.
     if (!fieldCipher.isConfigured()) {
-      console.log('[encrypt-id-numbers] ENCRYPTION_KEY not set — skipping backfill.');
+      logger.info('[encrypt-id-numbers] ENCRYPTION_KEY not set — skipping backfill.');
       return stats;
     }
 
@@ -52,7 +53,7 @@ async function encryptIdNumbers(client) {
       }
     }
 
-    console.log(
+    logger.info(
       `[encrypt-id-numbers] done: scanned=${stats.scanned} ` +
       `encrypted=${stats.encrypted} skipped=${stats.skipped}`,
     );
@@ -68,7 +69,7 @@ if (require.main === module) {
   encryptIdNumbers()
     .then(() => process.exit(0))
     .catch((err) => {
-      console.error('[encrypt-id-numbers] fatal:', err.message);
+      logger.error({ err: err }, '[encrypt-id-numbers] fatal');
       process.exit(1);
     });
 }

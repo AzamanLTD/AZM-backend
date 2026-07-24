@@ -6,6 +6,7 @@
 // NEVER moves USDC — escrow integration uses existing escrowService.
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const crypto = require('crypto');
 
 function genRef() {
@@ -386,7 +387,7 @@ exports.counterProposeReservation = async (req, res) => {
 
         res.json({ success: true, reservation: updated });
     } catch (err) {
-        console.error('[counterProposeReservation]', err.message);
+        logger.error({ err: err }, '[counterProposeReservation]');
         res.status(500).json({ success: false, message: err.message });
     }
 };
@@ -435,7 +436,7 @@ exports.acceptCounterProposal = async (req, res) => {
 
         res.json({ success: true, reservation: updated });
     } catch (err) {
-        console.error('[acceptCounterProposal]', err.message);
+        logger.error({ err: err }, '[acceptCounterProposal]');
         res.status(500).json({ success: false, message: err.message });
     }
 };

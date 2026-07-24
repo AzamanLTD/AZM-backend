@@ -1,3 +1,4 @@
+const logger = require('../src/config/logger');
 const dineInTabService = require('../services/dineInTabService');
 
 exports.openTab = async (req, res) => {

@@ -12,6 +12,7 @@
 //   POST /api/auth/sso — Authenticate via Firebase ID token
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const { issueTokenPair } = require('../services/authTokenService');
 
 // Phase K hardening: when no Firebase Admin is initialised, the dev
@@ -76,7 +77,7 @@ exports.ssoLogin = async (req, res) => {
                 // any unsigned JWT with a valid email — turning the dev
                 // path into an unauthenticated identity oracle.
                 if (!SSO_EXPECTED_AUD) {
-                    console.error(
+                    logger.error(
                         '[SSO][dev-fallback] refused: SSO_DEV_FALLBACK=1 ' +
                         'but no SSO_EXPECTED_AUD or FIREBASE_PROJECT_ID set.'
                     );
@@ -95,7 +96,7 @@ exports.ssoLogin = async (req, res) => {
                 // guard above already proves it's set; this is the
                 // actual comparison.
                 if (decodedToken.aud !== SSO_EXPECTED_AUD) {
-                    console.error('[SSO][dev-fallback] aud mismatch:', decodedToken.aud);
+                    logger.error('[SSO][dev-fallback] aud mismatch:', decodedToken.aud);
                     return res.status(401).json({
                         success: false,
                         message: 'Invalid audience on ID token.'
@@ -119,7 +120,7 @@ exports.ssoLogin = async (req, res) => {
                 // already, so this is mostly a belt-and-braces on
                 // multi-tenant configs.
                 if (SSO_EXPECTED_AUD && decodedToken.aud !== SSO_EXPECTED_AUD) {
-                    console.error('[SSO] aud mismatch (post-verify):', decodedToken.aud);
+                    logger.error('[SSO] aud mismatch (post-verify):', decodedToken.aud);
                     return res.status(401).json({
                         success: false,
                         message: 'Invalid audience on ID token.'
@@ -127,7 +128,7 @@ exports.ssoLogin = async (req, res) => {
                 }
             }
         } catch (verifyError) {
-            console.error('[SSO] Token verification failed:', verifyError.message);
+            logger.error({ err: verifyError }, '[SSO] Token verification failed');
             return res.status(401).json({
                 success: false,
                 message: 'Invalid or expired ID token.'
@@ -263,7 +264,7 @@ exports.ssoLogin = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('[SSO] error:', error.message);
+        logger.error({ err: error }, '[SSO] error');
 
         // Handle unique constraint violations (race condition on double-tap)
         if (error.code === 'P2002') {

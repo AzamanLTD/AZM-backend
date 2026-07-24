@@ -11,6 +11,7 @@
 // exclusively from setImmediate hooks inside escrowService (Work Item 4).
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const { randomBytes } = require('crypto');
 
 // ── private helpers ───────────────────────────────────────────────────────────

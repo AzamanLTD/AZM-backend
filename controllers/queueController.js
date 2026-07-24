@@ -13,6 +13,7 @@
 //   queue_update           → { queueId, status, adId }  (legacy compat)
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const NotificationService = require('../services/notificationService');
 
 // =============================================================================
@@ -43,7 +44,7 @@ const _emitPositionUpdates = async (prisma, io, adId, excludeQueueId) => {
             });
         }
     } catch (err) {
-        console.error('[Queue] _emitPositionUpdates error:', err.message);
+        logger.error({ err: err }, '[Queue] _emitPositionUpdates error');
     }
 };
 
@@ -73,7 +74,7 @@ const processNextInQueue = async (adId, { prisma, io } = {}) => {
         });
 
         if (!nextInQueue) {
-            console.log(`[Smart Queue] No waiting users for Ad #${adId}`);
+            logger.info(`[Smart Queue] No waiting users for Ad #${adId}`);
             return null;
         }
 
@@ -123,7 +124,7 @@ const processNextInQueue = async (adId, { prisma, io } = {}) => {
                     adId: String(adId),
                     queueId: result.id,
                 }
-            }).catch(err => console.error('[Queue] post-commit notification error:', err.message));
+            }).catch(err => logger.error({ err: err }, '[Queue] post-commit notification error'));
         });
 
         if (io) {
@@ -145,10 +146,10 @@ const processNextInQueue = async (adId, { prisma, io } = {}) => {
         // Emit position updates to remaining WAITING buyers
         setImmediate(() => {
             _emitPositionUpdates(prisma, io, adId, result.id)
-                .catch(err => console.error('[Queue] position update error:', err.message));
+                .catch(err => logger.error({ err: err }, '[Queue] position update error'));
         });
 
-        console.log(`[Smart Queue] Promoted buyer ${result.buyerId} from queue for Ad #${adId}`);
+        logger.info(`[Smart Queue] Promoted buyer ${result.buyerId} from queue for Ad #${adId}`);
         return result;
     } catch (error) {
         // Phase H9: another concurrent caller already promoted this row.
@@ -158,10 +159,10 @@ const processNextInQueue = async (adId, { prisma, io } = {}) => {
         // their own outer call already covers them). We log it but
         // don't re-throw, so the trade-complete response stays clean.
         if (error.message === 'QUEUE_RACE') {
-            console.log(`[Smart Queue] race on Ad #${adId} — another completion already promoted; no-op.`);
+            logger.info(`[Smart Queue] race on Ad #${adId} — another completion already promoted; no-op.`);
             return null;
         }
-        console.error('[Smart Queue] processNextInQueue error:', error.message);
+        logger.error({ err: error }, '[Smart Queue] processNextInQueue error');
         throw error;
     }
 };
@@ -269,7 +270,7 @@ const initiateTradeWithQueue = async (req, res) => {
         const tradeController = require('./tradeController');
         return tradeController.initiateTrade(req, res);
     } catch (error) {
-        console.error('[Smart Queue] initiateTradeWithQueue error:', error);
+        logger.error('[Smart Queue] initiateTradeWithQueue error:', error);
         res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -314,7 +315,7 @@ const getQueueStatus = async (req, res) => {
 
         res.status(200).json({ success: true, queue: positions });
     } catch (error) {
-        console.error('[Smart Queue] getQueueStatus error:', error);
+        logger.error('[Smart Queue] getQueueStatus error:', error);
         res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -360,12 +361,12 @@ const leaveQueue = async (req, res) => {
         // Emit position updates to remaining WAITING buyers for this ad
         setImmediate(() => {
             _emitPositionUpdates(prisma, io, entry.adId, queueId)
-                .catch(err => console.error('[Queue] position update on leave error:', err.message));
+                .catch(err => logger.error({ err: err }, '[Queue] position update on leave error'));
         });
 
         res.status(200).json({ success: true, message: 'Left the queue successfully.' });
     } catch (error) {
-        console.error('[Smart Queue] leaveQueue error:', error);
+        logger.error('[Smart Queue] leaveQueue error:', error);
         res.status(500).json({ success: false, message: error.message });
     }
 };

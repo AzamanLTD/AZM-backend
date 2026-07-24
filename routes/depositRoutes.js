@@ -15,6 +15,7 @@
 // happen via POST /api/chat/transfer (chatTransferController.chatTransfer).
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const express              = require('express');
 const router               = express.Router();
 const depositController    = require('../controllers/depositController');

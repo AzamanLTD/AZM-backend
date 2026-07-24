@@ -15,6 +15,7 @@
 // Or in-process from autoRelease at boot (free-tier path).
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const { PrismaClient } = require('@prisma/client');
 const { IdentityService } = require('../services/identity/identity.service');
 const { hashPhone } = require('../services/identity/phoneHash');
@@ -57,7 +58,7 @@ async function backfillAzamanIds(client) {
         } catch (err) {
           // Unique-collision race → skip; next pass (or boot) will retry.
           stats.skipped += 1;
-          console.warn(`[backfill-azaman-ids] user ${row.id} skipped: ${err.message}`);
+          logger.warn(`[backfill-azaman-ids] user ${row.id} skipped: ${err.message}`);
         }
       }
       if (rows.length < BATCH) break;
@@ -78,7 +79,7 @@ async function backfillAzamanIds(client) {
       stats.phoneHashed += 1;
     }
 
-    console.log(
+    logger.info(
       `[backfill-azaman-ids] done: scanned=${stats.scanned} assigned=${stats.assigned} ` +
       `skipped=${stats.skipped} phoneHashed=${stats.phoneHashed}`,
     );
@@ -94,7 +95,7 @@ if (require.main === module) {
   backfillAzamanIds()
     .then(() => process.exit(0))
     .catch((err) => {
-      console.error('[backfill-azaman-ids] fatal:', err.message);
+      logger.error({ err: err }, '[backfill-azaman-ids] fatal');
       process.exit(1);
     });
 }

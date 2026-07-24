@@ -1,6 +1,7 @@
 // routes/chatUploadRoutes.js
 // AZAMAN PREMIUM CHAT UPLOADS — Chunked processing route
 
+const logger = require('../src/config/logger');
 const express = require('express');
 const router = express.Router();
 const multer = require('multer');
@@ -72,7 +73,7 @@ router.post('/chunk', upload.single('chunk'), async (req, res) => {
     res.json({ success: true, complete: false, progress: updated.chunksReceived / updated.chunkCount });
 
   } catch (error) {
-    console.error('Upload error:', error);
+    logger.error('Upload error:', error);
     res.status(500).json({ error: 'Server error' });
   }
 });

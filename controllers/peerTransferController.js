@@ -12,6 +12,7 @@
 // TransactionHistory records for the unified ledger.
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const NotificationService = require('../services/notificationService');
 
 let notificationService;
@@ -277,7 +278,7 @@ exports.sendFunds = async (req, res) => {
                 idempotent: true
             });
         }
-        console.error('[sendFunds] error:', error.message);
+        logger.error({ err: error }, '[sendFunds] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -436,7 +437,7 @@ exports.requestFunds = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('[requestFunds] error:', error.message);
+        logger.error({ err: error }, '[requestFunds] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -689,7 +690,7 @@ exports.fulfillTransferRequest = async (req, res) => {
                 idempotent: true
             });
         }
-        console.error('[fulfillTransferRequest] error:', error.message);
+        logger.error({ err: error }, '[fulfillTransferRequest] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -825,7 +826,7 @@ exports.declineTransferRequest = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('[declineTransferRequest] error:', error.message);
+        logger.error({ err: error }, '[declineTransferRequest] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -898,7 +899,7 @@ exports.getTransferDetails = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('[getTransferDetails] error:', error.message);
+        logger.error({ err: error }, '[getTransferDetails] error');
         return res.status(500).json({ success: false, message: 'Failed to get transfer details.' });
     }
 };
@@ -957,7 +958,7 @@ exports.getTransferHistory = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('[getTransferHistory] error:', error.message);
+        logger.error({ err: error }, '[getTransferHistory] error');
         return res.status(500).json({ success: false, message: 'Failed to get transfer history.' });
     }
 };
@@ -1001,7 +1002,7 @@ exports.getPendingTransferRequests = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('[getPendingTransferRequests] error:', error.message);
+        logger.error({ err: error }, '[getPendingTransferRequests] error');
         return res.status(500).json({ success: false, message: 'Failed to get pending requests.' });
     }
 };

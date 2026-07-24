@@ -22,6 +22,7 @@
 // initiation lifecycle. Activation is delegated to Susu_Service.
 // =============================================================================
 
+const logger = require('../../src/config/logger');
 const { Prisma } = require('@prisma/client');
 const { SusuError, ErrorCodes, susuNotFound } = require('./errors');
 
@@ -367,7 +368,7 @@ class SusuInitiationService {
       try {
         results.push(await this._enforceDeadline(susu));
       } catch (e) {
-        console.error(`[SusuInitiationSweep] susu ${susu.id} error:`, e.message);
+        logger.error(`[SusuInitiationSweep] susu ${susu.id} error:`, e.message);
       }
     }
     return results;

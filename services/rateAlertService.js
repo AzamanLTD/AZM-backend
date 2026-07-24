@@ -62,7 +62,7 @@ class RateAlertService {
 
             if (triggeredAlerts.length === 0) return;
 
-            console.log(`[RateAlertService] ${triggeredAlerts.length} alert(s) triggered at ${ratePair} = ${currentRate}`);
+            logger.info(`[RateAlertService] ${triggeredAlerts.length} alert(s) triggered at ${ratePair} = ${currentRate}`);
 
             // Mark all as triggered in batch
             const alertIds = triggeredAlerts.map(a => a.id);
@@ -93,14 +93,14 @@ class RateAlertService {
                             actionPayload: { action: 'OPEN_WALLET' },
                         });
                     } catch (err) {
-                        console.error(`[RateAlertService] notification error for alert ${alert.id}:`, err.message);
+                        logger.error(`[RateAlertService] notification error for alert ${alert.id}:`, err.message);
                     }
                 });
             }
 
         } catch (err) {
             // Non-fatal — don't crash the oracle sync
-            console.error('[RateAlertService] checkAlerts error:', err.message);
+            logger.error({ err: err }, '[RateAlertService] checkAlerts error');
         }
     }
 

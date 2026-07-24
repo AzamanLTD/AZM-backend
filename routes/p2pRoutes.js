@@ -4,6 +4,7 @@
 // Mounted at /api/p2p. All routes are protected AND gated by the V2 ban guard.
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const express              = require('express');
 const router               = express.Router();
 const p2pController        = require('../controllers/p2p.controller');

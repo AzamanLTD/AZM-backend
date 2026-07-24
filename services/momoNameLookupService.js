@@ -15,6 +15,7 @@
 // Phone format: GH local (0XXXXXXXXX) or E.164 (+233XXXXXXXXX).
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const MoolreCollectionService = require('./moolreCollectionService');
 
 // Singleton — shares the same underlying instance as the deposit on-ramp
@@ -68,7 +69,7 @@ class MomoNameLookupService {
 
             return { ok: true, name, msisdn: normalisedPhone, provider: network };
         } catch (err) {
-            console.error('[MomoNameLookupService] validateName error:', err.message, err.raw || '');
+            logger.error('[MomoNameLookupService] validateName error:', err.message, err.raw || '');
             // Return a user-friendly message — do not expose raw API internals to the client.
             const friendly = err.message?.includes('status 0')
                 ? 'Number not found on this network. Check the number and provider.'

@@ -38,7 +38,7 @@ async function resolveFeeProfile(prisma, { vendorId, buyerId, amountCrypto } = {
         });
     } catch (e) {
         // Table might not exist yet (pre-migration) — return defaults gracefully
-        console.warn('[feeProfileService] AdminFeeProfile query failed (table may not exist):', e.message);
+        logger.warn('[feeProfileService] AdminFeeProfile query failed (table may not exist):', e.message);
         return {
             platformFeePct: 0,
             adminSplitPct: 0,

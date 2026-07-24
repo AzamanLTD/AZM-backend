@@ -23,6 +23,7 @@
 //   res.send(pdfBuffer);
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const PDFDocument = require('pdfkit');
 const QRCode = require('qrcode');
 
@@ -87,7 +88,7 @@ async function generateQRDataUrl(text) {
             color: { dark: '#000000', light: '#FFFFFF' },
         });
     } catch (err) {
-        console.error('[receiptService] QR generation failed:', err.message);
+        logger.error({ err: err }, '[receiptService] QR generation failed');
         return null;
     }
 }

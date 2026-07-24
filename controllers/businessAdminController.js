@@ -75,7 +75,7 @@ exports.getBusinesses = async (req, res) => {
             pagination: { page, limit, total, totalPages: Math.ceil(total / limit) },
         });
     } catch (error) {
-        console.error('[getBusinesses] error:', error.message);
+        logger.error({ err: error }, '[getBusinesses] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -103,7 +103,7 @@ exports.suspendBusiness = async (req, res) => {
         if (io) io.to(`user_${biz.userId}`).emit('business_suspended', { bizId: updated.bizId, reason });
         return res.status(200).json({ success: true, business: updated });
     } catch (error) {
-        console.error('[suspendBusiness] error:', error.message);
+        logger.error({ err: error }, '[suspendBusiness] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -130,7 +130,7 @@ exports.unsuspendBusiness = async (req, res) => {
         if (io) io.to(`user_${biz.userId}`).emit('business_unsuspended', { bizId: updated.bizId });
         return res.status(200).json({ success: true, business: updated });
     } catch (error) {
-        console.error('[unsuspendBusiness] error:', error.message);
+        logger.error({ err: error }, '[unsuspendBusiness] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -185,7 +185,7 @@ exports.deleteBusiness = async (req, res) => {
             message: `Business "${biz.businessName}" (${bizId}) permanently deleted.`,
         });
     } catch (error) {
-        console.error('[deleteBusiness] error:', error.message);
+        logger.error({ err: error }, '[deleteBusiness] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -217,7 +217,7 @@ exports.deleteAdPost = async (req, res) => {
             message: `Ad post "${post.title}" deleted.`,
         });
     } catch (error) {
-        console.error('[deleteAdPost] error:', error.message);
+        logger.error({ err: error }, '[deleteAdPost] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };

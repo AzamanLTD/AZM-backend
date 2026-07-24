@@ -12,6 +12,7 @@
 //     is lazily created (Conversation.type = 'TRADE', tradeId = String(id)).
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const { sendPushNotification } = require('../utils/firebaseService');
 const gamification = require('../services/vendorGamificationService');
 const { parsePagination, buildPageEnvelope } = require('../utils/pagination');
@@ -294,7 +295,7 @@ exports.initiateTrade = async (req, res) => {
                     try {
                         await _getNotificationService(req).sendNotification(tradeResult._queueNotification);
                     } catch (err) {
-                        console.error('[initiateTrade] queue notification non-fatal:', err.message);
+                        logger.error({ err: err }, '[initiateTrade] queue notification non-fatal');
                     }
                 });
             }
@@ -345,7 +346,7 @@ exports.initiateTrade = async (req, res) => {
                     }
                 });
             } catch (err) {
-                console.error('[initiateTrade] notification non-fatal:', err.message);
+                logger.error({ err: err }, '[initiateTrade] notification non-fatal');
             }
         });
 
@@ -377,7 +378,7 @@ exports.initiateTrade = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('Initiate Trade Error:', error);
+        logger.error('Initiate Trade Error:', error);
         res.status(400).json({ success: false, message: error.message });
     }
 };
@@ -523,14 +524,14 @@ exports.acceptTrade = async (req, res) => {
                     }
                 });
             } catch (err) {
-                console.error('[acceptTrade] notification non-fatal:', err.message);
+                logger.error({ err: err }, '[acceptTrade] notification non-fatal');
             }
         });
 
         res.status(200).json({ success: true, trade: updatedTrade });
 
     } catch (error) {
-        console.error('acceptTrade error:', error.message);
+        logger.error({ err: error }, 'acceptTrade error');
         const status = error.message.includes('not found') ? 404
             : error.message.includes('Only') || error.message.includes('Cannot') ? 403
             : 400;
@@ -610,14 +611,14 @@ exports.declineTrade = async (req, res) => {
                     }
                 });
             } catch (err) {
-                console.error('[declineTrade] notification non-fatal:', err.message);
+                logger.error({ err: err }, '[declineTrade] notification non-fatal');
             }
         });
 
         res.status(200).json({ success: true, message: 'Trade declined successfully.' });
 
     } catch (error) {
-        console.error('declineTrade error:', error.message);
+        logger.error({ err: error }, 'declineTrade error');
         res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -677,7 +678,7 @@ exports.getTradeDetails = async (req, res) => {
             messages: conversation ? conversation.messages : []
         });
     } catch (error) {
-        console.error('getTradeDetails error:', error.message);
+        logger.error({ err: error }, 'getTradeDetails error');
         res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -808,13 +809,13 @@ exports.markAsPaid = async (req, res) => {
                     }
                 });
             } catch (err) {
-                console.error('[markAsPaid] notification non-fatal:', err.message);
+                logger.error({ err: err }, '[markAsPaid] notification non-fatal');
             }
         });
 
         return res.status(200).json({ success: true, trade: result.updatedTrade });
     } catch (error) {
-        console.error('markAsPaid error:', error.message);
+        logger.error({ err: error }, 'markAsPaid error');
         const status = error.message.includes('not found') ? 404
             : error.message.includes('Only') || error.message.includes('Cannot') ? 403
             : 400;
@@ -890,7 +891,7 @@ exports.getTradeHistory = async (req, res) => {
             res.status(200).json({ success: true, history });
         }
     } catch (error) {
-        console.error('getTradeHistory error:', error.message);
+        logger.error({ err: error }, 'getTradeHistory error');
         res.status(500).json({ success: false, message: 'Could not fetch history.' });
     }
 };
@@ -964,7 +965,7 @@ exports.disputeTrade = async (req, res) => {
 
         res.status(200).json({ success: true, message: 'Dispute raised successfully.' });
     } catch (error) {
-        console.error('disputeTrade error:', error.message);
+        logger.error({ err: error }, 'disputeTrade error');
         res.status(500).json({ success: false, error: error.message });
     }
 };
@@ -1063,7 +1064,7 @@ exports.submitReview = async (req, res) => {
                     // processReviewGamification already logs internally,
                     // so we don't double-log on the gamResult === null case.
                 } catch (deferredErr) {
-                    console.error(
+                    logger.error(
                         `[submitReview.deferred] tradeId=${trade.id} revieweeId=${revieweeId} ` +
                         `unexpected error: ${deferredErr.message}`
                     );
@@ -1073,7 +1074,7 @@ exports.submitReview = async (req, res) => {
     } catch (error) {
         if (error.code === 'P2002')
             return res.status(400).json({ success: false, message: 'You have already reviewed this trade.' });
-        console.error('submitReview error:', error.message);
+        logger.error({ err: error }, 'submitReview error');
         res.status(500).json({ success: false, error: error.message });
     }
 };
@@ -1104,7 +1105,7 @@ exports.getActiveTrades = async (req, res) => {
 
         return res.json({ success: true, trades, count: trades.length });
     } catch (error) {
-        console.error('getActiveTrades error:', error.message);
+        logger.error({ err: error }, 'getActiveTrades error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };

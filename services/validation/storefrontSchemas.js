@@ -1,5 +1,6 @@
 'use strict';
 
+const logger = require('../../src/config/logger');
 const { z } = require('zod');
 
 // ── layoutJson schema ──

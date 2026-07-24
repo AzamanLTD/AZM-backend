@@ -5,6 +5,7 @@
 // Also provides splitReleaseFundedEscrow — the no-show penalty primitive.
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const { randomUUID } = require('crypto');
 const { runDoubleCheck } = require('../utils/securityCheck');
 
@@ -115,7 +116,7 @@ const fundBookingEscrow = async (prisma, { escrowId, payerId, bookingType, booki
         if (resCount.count > 0) {
             const res = await prisma.reservation.findUnique({ where: { id: bookingId }, include: { user: true } });
             if (res && res.user?.phoneNumber) {
-                _messagingChannelsService.notifyBookingConfirmed(res.businessProfileId, res.user.phoneNumber, res.id, res.reservationTime).catch(err => console.error('[MessagingChannels] Error:', err));
+                _messagingChannelsService.notifyBookingConfirmed(res.businessProfileId, res.user.phoneNumber, res.id, res.reservationTime).catch(err => logger.error('[MessagingChannels] Error:', err));
             }
         }
     } else if (bookingType === 'TRANSIT' && bookingId) {
@@ -123,7 +124,7 @@ const fundBookingEscrow = async (prisma, { escrowId, payerId, bookingType, booki
         if (tbCount.count > 0) {
             const tb = await prisma.transitBooking.findUnique({ where: { id: bookingId }, include: { user: true, trip: true } });
             if (tb && tb.user?.phoneNumber) {
-                _messagingChannelsService.notifyBookingConfirmed(tb.trip?.businessProfileId || tb.businessProfileId, tb.user.phoneNumber, tb.id, tb.trip?.scheduledDeparture || new Date()).catch(err => console.error('[MessagingChannels] Error:', err));
+                _messagingChannelsService.notifyBookingConfirmed(tb.trip?.businessProfileId || tb.businessProfileId, tb.user.phoneNumber, tb.id, tb.trip?.scheduledDeparture || new Date()).catch(err => logger.error('[MessagingChannels] Error:', err));
             }
         }
     }

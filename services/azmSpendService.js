@@ -479,7 +479,7 @@ class AzmSpendService {
                 timestamp: new Date().toISOString()
             });
         } catch (err) {
-            console.error('[AzmSpendService._emitSpendUpdate] socket error:', err.message);
+            logger.error({ err: err }, '[AzmSpendService._emitSpendUpdate] socket error');
         }
     }
 }

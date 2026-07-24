@@ -6,7 +6,7 @@
 const wrap = (fn) => async (req, res) => {
     try { await fn(req, res); }
     catch (err) {
-        console.error(`[smartRouteController] ${fn.name || 'h'}:`, err.message);
+        logger.error(`[smartRouteController] ${fn.name || 'h'}:`, err.message);
         res.status(400).json({ success: false, message: err.message });
     }
 };

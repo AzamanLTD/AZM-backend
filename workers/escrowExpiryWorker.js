@@ -16,6 +16,7 @@
 //      escrowService._refundEscrow(..., 'EXPIRED'), SYSTEM message, close ticket.
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const escrowService = require('../services/escrowService');
 
 const THIRTY_MIN_MS = 30 * 60 * 1000;
@@ -34,11 +35,11 @@ class EscrowExpiryWorker {
 
     start() {
         if (this.interval) return;
-        console.log(`[EscrowExpiryWorker] scheduled (every ${this.intervalMs / 1000}s)`);
+        logger.info(`[EscrowExpiryWorker] scheduled (every ${this.intervalMs / 1000}s)`);
         // First sweep shortly after boot to catch anything that lapsed while down.
-        setTimeout(() => this._tick().catch((err) => console.error('[EscrowExpiryWorker] initial tick:', err.message)), 45_000);
+        setTimeout(() => this._tick().catch((err) => logger.error({ err: err }, '[EscrowExpiryWorker] initial tick')), 45_000);
         this.interval = setInterval(
-            () => this._tick().catch((err) => console.error('[EscrowExpiryWorker] tick:', err.message)),
+            () => this._tick().catch((err) => logger.error({ err: err }, '[EscrowExpiryWorker] tick')),
             this.intervalMs
         );
     }
@@ -89,9 +90,9 @@ class EscrowExpiryWorker {
                         '⏱️ Escrow expired — funds were never locked. This ticket has been closed.',
                         { event: 'ESCROW_EXPIRED_UNFUNDED', escrowId: escrow.id });
                 }
-                console.log(`[EscrowExpiryWorker] expired unfunded escrow ${escrow.id}`);
+                logger.info(`[EscrowExpiryWorker] expired unfunded escrow ${escrow.id}`);
             } catch (err) {
-                console.error(`[EscrowExpiryWorker] expire-unfunded ${escrow.id} failed:`, err.message);
+                logger.error(`[EscrowExpiryWorker] expire-unfunded ${escrow.id} failed:`, err.message);
             }
         }
     }
@@ -127,7 +128,7 @@ class EscrowExpiryWorker {
                     }
                 }
             } catch (err) {
-                console.error(`[EscrowExpiryWorker] warn ${escrow.id} failed:`, err.message);
+                logger.error(`[EscrowExpiryWorker] warn ${escrow.id} failed:`, err.message);
             }
         }
     }
@@ -155,9 +156,9 @@ class EscrowExpiryWorker {
                         '⏱️ Escrow expired after 30 days of inactivity — locked funds were refunded to the payer. This ticket has been closed.',
                         { event: 'ESCROW_EXPIRED_FUNDED', escrowId: escrow.id });
                 }
-                console.log(`[EscrowExpiryWorker] expired+refunded funded escrow ${escrow.id}`);
+                logger.info(`[EscrowExpiryWorker] expired+refunded funded escrow ${escrow.id}`);
             } catch (err) {
-                console.error(`[EscrowExpiryWorker] expire-funded ${escrow.id} failed:`, err.message);
+                logger.error(`[EscrowExpiryWorker] expire-funded ${escrow.id} failed:`, err.message);
             }
         }
     }
@@ -181,7 +182,7 @@ class EscrowExpiryWorker {
                 this.io.to(`user_${ticket.counterpartyId}`).emit('ticket_message', payload);
             }
         } catch (err) {
-            console.error('[EscrowExpiryWorker._injectSystem] error:', err.message);
+            logger.error({ err: err }, '[EscrowExpiryWorker._injectSystem] error');
         }
     }
 }

@@ -13,6 +13,7 @@
 //   POST /cold-storage             — log hardware-wallet movement (audit trail only)
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const crypto         = require('crypto');
 const financeService = require('../services/finance.service');
 
@@ -103,7 +104,7 @@ const logCorporatePurchase = async (req, res) => {
             }
         });
     } catch (error) {
-        console.error('logCorporatePurchase error:', error.message);
+        logger.error({ err: error }, 'logCorporatePurchase error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -232,7 +233,7 @@ const purchaseCorporateViaApi = async (req, res) => {
                 message: 'A corporate purchase with this gatewayReference already exists.'
             });
         }
-        console.error('purchaseCorporateViaApi error:', error.message);
+        logger.error({ err: error }, 'purchaseCorporateViaApi error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -268,7 +269,7 @@ const liquidateProfits = async (req, res) => {
                 timestamp:        new Date().toISOString()
             });
         } catch (socketErr) {
-            console.error('liquidateProfits socket emit failed:', socketErr.message);
+            logger.error({ err: socketErr }, 'liquidateProfits socket emit failed');
         }
 
         return res.status(200).json({
@@ -277,7 +278,7 @@ const liquidateProfits = async (req, res) => {
             data
         });
     } catch (error) {
-        console.error('liquidateProfits error:', error.message);
+        logger.error({ err: error }, 'liquidateProfits error');
         return res.status(400).json({ success: false, message: error.message });
     }
 };
@@ -322,7 +323,7 @@ const logColdStorage = async (req, res) => {
             data:    { log }
         });
     } catch (error) {
-        console.error('logColdStorage error:', error.message);
+        logger.error({ err: error }, 'logColdStorage error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };

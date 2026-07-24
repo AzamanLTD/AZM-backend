@@ -8,6 +8,7 @@
 // conventions: prisma/io/emitBalanceUpdate/notificationService from req.app.
 // =============================================================================
 'use strict';
+const logger = require('../src/config/logger');
 const invoiceSvc = require('../services/businessInvoiceService');
 const reviewSvc  = require('../services/businessReviewService');
 
@@ -129,7 +130,7 @@ exports.sendInvoice = async (req, res) => {
           businessName: profile.businessName,
           billTotalUsdc: Number(invoice.billTotalUsdc),
         });
-      } catch (e) { console.error("[invoice/send] notification error:", e.message); }
+      } catch (e) { logger.error({ err: e }, '[invoice/send] notification error'); }
     });
     return res.json({ success: true, invoice });
   } catch (err) { return _err(res, err); }
@@ -192,7 +193,7 @@ exports.payInvoice = async (req, res) => {
           invoiceId: invoice.id, invoiceRef: invoice.invoiceRef,
           customerPaidUsdc: customerPays, businessReceives, fee,
         });
-      } catch (e) { console.error("[invoice/pay] notification error:", e.message); }
+      } catch (e) { logger.error({ err: e }, '[invoice/pay] notification error'); }
     });
     return res.json({ success: true, invoice, customerPays, businessReceives, fee });
   } catch (err) {

@@ -5,6 +5,7 @@
  * with real email providers like SendGrid, AWS SES, or Mailgun.
  */
 
+const logger = require('../src/config/logger');
 const crypto = require('crypto');
 
 class EmailService {
@@ -29,17 +30,17 @@ class EmailService {
      * @returns {Promise<Object>} Email sending result
      */
     async sendEmail(to, subject, htmlContent, textContent = null, attachments = []) {
-        console.log(`📧 Email Service: Sending email to ${to}`);
-        console.log(`📝 Subject: ${subject}`);
+        logger.info(`📧 Email Service: Sending email to ${to}`);
+        logger.info(`📝 Subject: ${subject}`);
         
         if (this.isTestMode || this.provider === 'mock') {
             // Mock implementation - log to console and return success
             const messageId = this._generateMessageId();
             
-            console.log(`✅ [MOCK EMAIL] Sent to ${to}`);
-            console.log(`📋 Subject: ${subject}`);
-            console.log(`📋 Message ID: ${messageId}`);
-            console.log(`📄 Content Preview: ${htmlContent.substring(0, 100)}...`);
+            logger.info(`✅ [MOCK EMAIL] Sent to ${to}`);
+            logger.info(`📋 Subject: ${subject}`);
+            logger.info(`📋 Message ID: ${messageId}`);
+            logger.info(`📄 Content Preview: ${htmlContent.substring(0, 100)}...`);
             
             return {
                 success: true,
@@ -427,7 +428,7 @@ class EmailService {
     async sendWithdrawalReceipt(user, opts) {
         try {
             if (!user || !user.email) {
-                console.warn('[emailService.sendWithdrawalReceipt] missing user.email — skipping.');
+                logger.warn('[emailService.sendWithdrawalReceipt] missing user.email — skipping.');
                 return { success: false, skipped: true, reason: 'no_email' };
             }
             const kind = opts && opts.kind;
@@ -438,7 +439,7 @@ class EmailService {
                 case 'crypto_success': rendered = this._renderCryptoSuccess(user, opts); break;
                 case 'crypto_refund':  rendered = this._renderCryptoRefund(user, opts);  break;
                 default:
-                    console.warn(`[emailService.sendWithdrawalReceipt] unknown kind "${kind}" — skipping.`);
+                    logger.warn(`[emailService.sendWithdrawalReceipt] unknown kind "${kind}" — skipping.`);
                     return { success: false, skipped: true, reason: 'unknown_kind' };
             }
             return await this.sendEmail(user.email, rendered.subject, rendered.html, rendered.text);
@@ -446,7 +447,7 @@ class EmailService {
             // Defensive: sendEmail itself shouldn't throw in MOCK mode, but
             // a real provider integration could. Swallow + log so the
             // caller's main flow is never disrupted by an email failure.
-            console.error('[emailService.sendWithdrawalReceipt] error:', err.message);
+            logger.error({ err: err }, '[emailService.sendWithdrawalReceipt] error');
             return { success: false, error: err.message };
         }
     }
@@ -651,22 +652,22 @@ class EmailService {
             // SendGrid returns 202 Accepted on success (no body)
             if (response.status === 202 || response.status === 200) {
                 const messageId = response.headers.get('x-message-id') || this._generateMessageId();
-                console.log(`✅ [SendGrid] Email sent to ${to} (msgId: ${messageId})`);
+                logger.info(`✅ [SendGrid] Email sent to ${to} (msgId: ${messageId})`);
                 return { success: true, messageId, provider: 'sendgrid', status: 'accepted' };
             }
 
             const errorBody = await response.text();
-            console.error(`❌ [SendGrid] Failed (${response.status}): ${errorBody}`);
+            logger.error(`❌ [SendGrid] Failed (${response.status}): ${errorBody}`);
             return { success: false, provider: 'sendgrid', status: 'failed', error: errorBody };
         } catch (error) {
-            console.error(`❌ [SendGrid] Network error: ${error.message}`);
+            logger.error(`❌ [SendGrid] Network error: ${error.message}`);
             return { success: false, provider: 'sendgrid', status: 'error', error: error.message };
         }
     }
 
     async _sendViaAWS(to, subject, htmlContent, textContent) {
         // TODO: Implement AWS SES integration
-        console.log('🔧 [PLACEHOLDER] AWS SES email integration - Replace with real API');
+        logger.info('🔧 [PLACEHOLDER] AWS SES email integration - Replace with real API');
         
         return {
             success: true,
@@ -678,7 +679,7 @@ class EmailService {
 
     async _sendViaMailgun(to, subject, htmlContent, textContent) {
         // TODO: Implement Mailgun API integration
-        console.log('🔧 [PLACEHOLDER] Mailgun email integration - Replace with real API');
+        logger.info('🔧 [PLACEHOLDER] Mailgun email integration - Replace with real API');
         
         return {
             success: true,
@@ -690,7 +691,7 @@ class EmailService {
 
     async _sendViaNodemailer(to, subject, htmlContent, textContent) {
         // TODO: Implement Nodemailer SMTP integration
-        console.log('🔧 [PLACEHOLDER] Nodemailer SMTP integration - Replace with real API');
+        logger.info('🔧 [PLACEHOLDER] Nodemailer SMTP integration - Replace with real API');
         
         return {
             success: true,
