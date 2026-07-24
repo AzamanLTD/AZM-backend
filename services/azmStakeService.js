@@ -5,7 +5,7 @@
 // Tier thresholds based on staked AZM
 const TIER_THRESHOLDS = {
   NITRO_BRONZE: 500,
-  NITRO_SILVER: 2000,
+  NITRO_SILVER: 1500,
   NITRO_GOLD: 5000,
 };
 

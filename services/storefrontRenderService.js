@@ -2,6 +2,7 @@
 
 // NOTE: prisma is passed as the first argument to render functions (req.app.get('prisma')).
 const { migrateLayout } = require('./storefrontSchemaMigration');
+const storefrontService = require('./storefrontService');
 
 // Redis cache for rendered layouts (falls back to in-memory if Redis unavailable)
 let redisClient = null;
@@ -104,7 +105,39 @@ async function renderStorefront(prisma, businessProfileId) {
   }
 
   // Migrate layout to current schema version
-  const migratedLayout = migrateLayout(layout.layoutJson);
+  let migratedLayout = migrateLayout(layout.layoutJson);
+  let themeOverride = null;
+
+  // PHASE 8: Defensive stake check — if the owner's stake has lapsed
+  // post-publish, downgrade premium widgets to free equivalents.
+  const themeKey = layout.theme?.key || null;
+  try {
+    const eligibility = await storefrontService.validateNitroEligibility(prisma, businessProfileId, migratedLayout, themeKey);
+    if (!eligibility.eligible) {
+      const { layoutJson: downgradedLayout, downgraded } = storefrontService.downgradePremiumWidgets(migratedLayout);
+      migratedLayout = downgradedLayout;
+      // Also downgrade the theme to a free theme if needed
+      if (eligibility.violations.some(v => v.type === 'theme')) {
+        const freeTheme = await prisma.businessStorefrontTheme.findFirst({
+          where: { key: 'classic_light', isActive: true },
+        });
+        if (freeTheme) {
+          themeOverride = freeTheme;
+        }
+      }
+      // Track the downgrade event
+      await prisma.storefrontAnalyticsEvent.create({
+        data: {
+          businessProfileId,
+          eventType: 'nitro_auto_downgrade',
+          metadata: { downgraded, tier: eligibility.tier, stakedBalance: eligibility.stakedBalance },
+        },
+      }).catch(() => {});
+    }
+  } catch (e) {
+    // Non-blocking: if stake check fails, render the layout as-is
+    console.warn('[StorefrontRender] Stake check error:', e.message);
+  }
 
   // Merge widget defaultProps into tile props
   const widgetTypes = [...new Set(migratedLayout.tiles.map(t => t.widgetType))];
@@ -132,7 +165,15 @@ async function renderStorefront(prisma, businessProfileId) {
       averageRating: business.averageRating != null ? Number(business.averageRating) : null,
       phoneNumber: business.phoneNumber || null,
     },
-    theme: {
+    theme: themeOverride ? {
+      id: themeOverride.id,
+      key: themeOverride.key,
+      name: themeOverride.name,
+      tokenSet: themeOverride.tokenSet,
+      typography: themeOverride.typography,
+      borderRadius: themeOverride.borderRadius,
+      spacingScale: themeOverride.spacingScale,
+    } : {
       id: layout.theme.id,
       key: layout.theme.key,
       name: layout.theme.name,

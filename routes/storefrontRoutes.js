@@ -271,10 +271,33 @@ router.post('/me/publish', protect, protectActive, requirePermission('storefront
   const prisma = req.app.get('prisma');
   const businessProfileId = req.businessProfileId || req.user.businessProfileId;
   if (!businessProfileId) return res.status(400).json({ success: false, message: 'No business profile found.' });
-  const published = await storefrontService.publishLayout(prisma, businessProfileId, req.user.id);
-  // Invalidate render cache
-  await renderService.invalidateCache(businessProfileId);
-  res.json({ success: true, data: published, message: 'Storefront published successfully.' });
+  try {
+    const published = await storefrontService.publishLayout(prisma, businessProfileId, req.user.id);
+    // Invalidate render cache
+    await renderService.invalidateCache(businessProfileId);
+
+    // PHASE 8: Track analytics event
+    await prisma.storefrontAnalyticsEvent.create({
+      data: {
+        businessProfileId,
+        eventType: 'layout_published',
+        metadata: { themeId: published.themeId, tileCount: published.layoutJson?.tiles?.length || 0, tier: published.tier || 'FREE' },
+      },
+    }).catch(() => {}); // non-blocking
+
+    res.json({ success: true, data: published, message: 'Storefront published successfully.' });
+  } catch (err) {
+    if (err.statusCode === 402) {
+      return res.status(402).json({
+        success: false,
+        message: err.message,
+        violations: err.violations,
+        tier: err.tier,
+        stakedBalance: err.stakedBalance,
+      });
+    }
+    throw err;
+  }
 }));
 
 // GET /api/storefront/me/history — get version history

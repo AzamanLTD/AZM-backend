@@ -224,6 +224,19 @@ async function publishLayout(prisma, businessProfileId, userId) {
     throw new Error('Storefront is disabled by admin. Contact support.');
   }
 
+  // PHASE 8: Validate Nitro eligibility — reject if layout references
+  // premium widgets/themes the owner hasn't staked for.
+  const themeKey = draft.theme?.key || null;
+  const eligibility = await validateNitroEligibility(prisma, businessProfileId, draft.layoutJson, themeKey);
+  if (!eligibility.eligible) {
+    const err = new Error('Nitro eligibility check failed. Premium features require more staked AZM.');
+    err.statusCode = 402;
+    err.violations = eligibility.violations;
+    err.tier = eligibility.tier;
+    err.stakedBalance = eligibility.stakedBalance;
+    throw err;
+  }
+
   // Archive the current published version into history
   const currentPublished = await prisma.businessStorefrontLayout.findUnique({
     where: { businessProfileId_status: { businessProfileId, status: 'PUBLISHED' } },
@@ -452,7 +465,7 @@ async function checkEligibility(prisma, businessProfileId, userId) {
   // Tier thresholds (must match azmStakeService.TIER_THRESHOLDS)
   let tier = 'FREE';
   if (stakedBalance >= 5000) tier = 'NITRO_GOLD';
-  else if (stakedBalance >= 2000) tier = 'NITRO_SILVER';
+  else if (stakedBalance >= 1500) tier = 'NITRO_SILVER';
   else if (stakedBalance >= 500) tier = 'NITRO_BRONZE';
 
   return {
@@ -612,3 +625,158 @@ module.exports = {
   recordEvent,
   getAnalytics,
 };
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PHASE 8 — Nitro Economy: Tier Validation & Enforcement
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Tier thresholds (must match azmStakeService.TIER_THRESHOLDS)
+const NITRO_THRESHOLDS = {
+  NITRO_BRONZE: 500,
+  NITRO_SILVER: 1500,
+  NITRO_GOLD: 5000,
+};
+
+// Widget type → minimum tier required
+const PREMIUM_WIDGETS = {
+  video_header:      'NITRO_BRONZE',
+  announcement_bar:  'NITRO_BRONZE',
+  social_proof:      'NITRO_BRONZE',
+  live_rate_ticker:  'NITRO_SILVER',
+  glass_card:        'NITRO_SILVER',
+  custom_embed:      'NITRO_GOLD',
+  loyalty_program:   'NITRO_GOLD',
+};
+
+// Theme key → minimum tier required
+const PREMIUM_THEMES = {
+  ember:   'NITRO_BRONZE',
+  forest:  'NITRO_BRONZE',
+  neon:    'NITRO_SILVER',
+  glass:   'NITRO_SILVER',
+  royal:   'NITRO_GOLD',
+};
+
+const TIER_RANK = { FREE: 0, NITRO_BRONZE: 1, NITRO_SILVER: 2, NITRO_GOLD: 3 };
+
+/**
+ * Get the tier for a given staked AZM balance.
+ * @param {number} stakedBalance
+ * @returns {string} tier name
+ */
+function getTierForStake(stakedBalance) {
+  if (stakedBalance >= NITRO_THRESHOLDS.NITRO_GOLD) return 'NITRO_GOLD';
+  if (stakedBalance >= NITRO_THRESHOLDS.NITRO_SILVER) return 'NITRO_SILVER';
+  if (stakedBalance >= NITRO_THRESHOLDS.NITRO_BRONZE) return 'NITRO_BRONZE';
+  return 'FREE';
+}
+
+/**
+ * Validate that a layout does not reference premium widgets or themes
+ * the owner hasn't staked for.
+ *
+ * @param {object} prisma
+ * @param {string} businessProfileId
+ * @param {object} layoutJson - the layout JSON to validate
+ * @param {string} themeKey - the theme key to validate
+ * @returns {{ eligible: boolean, violations: array, tier: string, stakedBalance: number }}
+ */
+async function validateNitroEligibility(prisma, businessProfileId, layoutJson, themeKey) {
+  // Get the business owner's user ID
+  const business = await prisma.businessProfile.findUnique({
+    where: { id: businessProfileId },
+    select: { userId: true },
+  });
+  if (!business) throw new Error('Business not found.');
+
+  // Get staked balance
+  const stakes = await prisma.azmStake.findMany({
+    where: { userId: business.userId, status: 'ACTIVE' },
+  });
+  const stakedBalance = stakes.reduce((sum, s) => sum + Number(s.amountAzm), 0);
+  const tier = getTierForStake(stakedBalance);
+
+  const violations = [];
+
+  // Check theme
+  if (themeKey && PREMIUM_THEMES[themeKey]) {
+    const requiredTier = PREMIUM_THEMES[themeKey];
+    if (TIER_RANK[tier] < TIER_RANK[requiredTier]) {
+      violations.push({
+        type: 'theme',
+        key: themeKey,
+        requiredTier,
+        currentTier: tier,
+        shortage: NITRO_THRESHOLDS[requiredTier] - stakedBalance,
+      });
+    }
+  }
+
+  // Check widgets in layout
+  if (layoutJson && Array.isArray(layoutJson.tiles)) {
+    for (const tile of layoutJson.tiles) {
+      const widgetType = tile.widgetType || tile.type;
+      if (widgetType && PREMIUM_WIDGETS[widgetType]) {
+        const requiredTier = PREMIUM_WIDGETS[widgetType];
+        if (TIER_RANK[tier] < TIER_RANK[requiredTier]) {
+          violations.push({
+            type: 'widget',
+            key: widgetType,
+            tileId: tile.id || tile.position,
+            requiredTier,
+            currentTier: tier,
+            shortage: NITRO_THRESHOLDS[requiredTier] - stakedBalance,
+          });
+        }
+      }
+    }
+  }
+
+  return {
+    eligible: violations.length === 0,
+    violations,
+    tier,
+    stakedBalance,
+  };
+}
+
+/**
+ * Downgrade premium widgets in a layout to free equivalents.
+ * Called by the render service when a stake has lapsed post-publish.
+ *
+ * @param {object} layoutJson
+ * @returns {{ layoutJson: object, downgraded: array }}
+ */
+function downgradePremiumWidgets(layoutJson) {
+  if (!layoutJson || !Array.isArray(layoutJson.tiles)) return { layoutJson, downgraded: [] };
+
+  const downgraded = [];
+  const FREE_REPLACEMENTS = {
+    video_header: 'hero_header',
+    announcement_bar: 'hero_header',
+    social_proof: 'reviews_carousel',
+    live_rate_ticker: 'quick_info_bar',
+    glass_card: 'business_info',
+    custom_embed: 'business_info',
+    loyalty_program: 'business_info',
+  };
+
+  const newTiles = layoutJson.tiles.map((tile) => {
+    const widgetType = tile.widgetType || tile.type;
+    if (widgetType && PREMIUM_WIDGETS[widgetType] && FREE_REPLACEMENTS[widgetType]) {
+      downgraded.push({ from: widgetType, to: FREE_REPLACEMENTS[widgetType], tileId: tile.id });
+      return { ...tile, widgetType: FREE_REPLACEMENTS[widgetType], type: FREE_REPLACEMENTS[widgetType] };
+    }
+    return tile;
+  });
+
+  return { layoutJson: { ...layoutJson, tiles: newTiles }, downgraded };
+}
+
+module.exports.PREMIUM_WIDGETS = PREMIUM_WIDGETS;
+module.exports.PREMIUM_THEMES = PREMIUM_THEMES;
+module.exports.NITRO_THRESHOLDS = NITRO_THRESHOLDS;
+module.exports.TIER_RANK = TIER_RANK;
+module.exports.getTierForStake = getTierForStake;
+module.exports.validateNitroEligibility = validateNitroEligibility;
+module.exports.downgradePremiumWidgets = downgradePremiumWidgets;
