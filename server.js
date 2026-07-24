@@ -1252,260 +1252,36 @@ app.use('/api/storefront',    generalLimiter,   require('./routes/storefrontRout
 app.use('/api/azm-stake',     generalLimiter,   require('./routes/azmStakeRoutes'));
 app.use('/api/admin/storefront', generalLimiter, require('./routes/adminStorefrontRoutes'));
 
-// --- CHAT MEDIA UPLOAD (Phase UI-3, 2026-05-26) ──────────────────────────────
-//
-// Four typed multer endpoints for chat media + the legacy
-// /api/chat/upload-media endpoint (kept for backwards compat). All four new
-// endpoints are AUTHENTICATED via `protect`. The legacy endpoint was
-// historically open and image-only; it stays open here to avoid breaking any
-// in-the-wild builds, but the new clients should target the typed routes.
-//
-// Storage: Cloudinary (folders azaman/chat/{images,audio,video,documents}).
-// Files are buffered in memory by multer, then streamed to Cloudinary via the
-// shared uploadToCloudinary() service so the persisted URL survives Render
-// redeploys (the local disk is ephemeral on free-tier hosting).
-//
-// Size limits:
-//   • image    — 10 MB
-//   • audio    —  5 MB
-//   • video    — 50 MB
-//   • document — 25 MB
-const { uploadToCloudinary: uploadChatMedia } = require('./services/cloudinaryService');
+// --- CHAT MEDIA UPLOAD + BUSINESS/VENDOR UPLOADS (extracted to route file) ----
+const chatUploadExtended = require('./routes/chatUploadRoutesExtended');
+app.use('/api/chat', chatUploadExtended);          // upload/image|audio|video|document, link-preview, upload-media (legacy)
 
-// Cloudinary folder per media kind (the service prefixes everything with azaman/).
-const _chatFolderFor = { image: 'chat/images', audio: 'chat/audio', video: 'chat/video', document: 'chat/documents' };
-
-const _chatStorageFor = () => multer.memoryStorage();
-
-const _chatMimeFilter = (allowed) => (req, file, cb) => {
-    if (allowed.some((p) => file.mimetype === p || file.mimetype.startsWith(p))) {
-        cb(null, true);
-    } else {
-        cb(new Error(`Disallowed mime: ${file.mimetype}`), false);
-    }
-};
-
-const chatImageUpload = multer({
-    storage: _chatStorageFor('image'),
-    limits: { fileSize: 10 * 1024 * 1024 },
-    fileFilter: _chatMimeFilter(['image/'])
-});
-const chatAudioUpload = multer({
-    storage: _chatStorageFor('audio'),
-    limits: { fileSize: 5 * 1024 * 1024 },
-    fileFilter: _chatMimeFilter([
-        'audio/mp4', 'audio/m4a', 'audio/x-m4a',
-        'audio/mpeg', 'audio/webm', 'audio/ogg', 'audio/wav', 'audio/aac'
-    ])
-});
-const chatVideoUpload = multer({
-    storage: _chatStorageFor('video'),
-    limits: { fileSize: 50 * 1024 * 1024 },
-    fileFilter: _chatMimeFilter(['video/'])
-});
-const chatDocumentUpload = multer({
-    storage: _chatStorageFor('document'),
-    limits: { fileSize: 25 * 1024 * 1024 },
-    fileFilter: _chatMimeFilter([
-        'application/pdf',
-        'application/msword',
-        'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-        'application/vnd.ms-excel',
-        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-        'application/vnd.ms-powerpoint',
-        'application/vnd.openxmlformats-officedocument.presentationml.presentation',
-        'text/plain', 'text/csv'
-    ])
-});
-
-const { protect: protectChatUpload } = require('./middleware/authMiddleware');
-
-// Helper: upload a buffered multer file to Cloudinary and return its secure_url.
-// `kind` selects the destination folder; documents are stored as `raw` so office
-// formats (docx/xlsx/csv/txt) are served back with their original bytes.
-const _uploadChatMediaUrl = async (file, kind) => {
-    const opts = kind === 'document' ? { resource_type: 'raw' } : {};
-    const { url } = await uploadChatMedia(file, _chatFolderFor[kind], opts);
-    return url;
-};
-
-// POST /api/chat/upload/image — { url, mimeType, size, filename }
-app.post('/api/chat/upload/image', protectChatUpload, chatImageUpload.single('file'), async (req, res) => {
-    if (!req.file) return res.status(400).json({ success: false, message: 'No file uploaded' });
-    try {
-        const url = await _uploadChatMediaUrl(req.file, 'image');
-        res.status(200).json({
-            success: true,
-            url,
-            mimeType: req.file.mimetype,
-            size: req.file.size,
-            filename: req.file.originalname
-        });
-    } catch (err) {
-        logger.error({ err, mediaType: 'image' }, 'Chat media upload error');
-        res.status(500).json({ success: false, message: 'Upload failed' });
-    }
-});
-
-// POST /api/chat/upload/audio — { url, mimeType, size, duration, waveformPeaks }
-// `duration` (seconds) and `waveformPeaks` (50-bucket int array) are optional
-// body fields the client precomputes and includes alongside the file. The
-// server trusts them for MVP; a future PR can resample server-side via
-// audiowaveform if the trust model needs to tighten.
-app.post('/api/chat/upload/audio', protectChatUpload, chatAudioUpload.single('file'), async (req, res) => {
-    if (!req.file) return res.status(400).json({ success: false, message: 'No file uploaded' });
-    let waveformPeaks = null;
-    if (req.body.waveformPeaks) {
+// Business image upload — re-uses the chat image multer config from the extended router
+app.post('/api/business/upload/image',
+    require('./middleware/authMiddleware').protect,
+    chatUploadExtended.imageUpload.single('file'),
+    async (req, res) => {
+        if (!req.file) return res.status(400).json({ success: false, message: 'No file uploaded' });
         try {
-            const parsed = JSON.parse(req.body.waveformPeaks);
-            if (Array.isArray(parsed) && parsed.length <= 100) waveformPeaks = parsed;
-        } catch (_) { /* swallow */ }
+            const folder = req.query.folder === 'logos' ? 'business/logos'
+                         : req.query.folder === 'kyb'   ? 'business/kyb'
+                         : 'business/products';
+            const { url } = await require('./services/cloudinaryService').uploadToCloudinary(req.file, folder);
+            res.status(200).json({
+                success: true, url, mimeType: req.file.mimetype,
+                size: req.file.size, filename: req.file.originalname
+            });
+        } catch (err) {
+            logger.error({ err }, 'Business image upload error');
+            res.status(500).json({ success: false, message: 'Upload failed' });
+        }
     }
-    const duration = parseInt(req.body.duration, 10);
-    try {
-        const url = await _uploadChatMediaUrl(req.file, 'audio');
-        res.status(200).json({
-            success: true,
-            url,
-            mimeType: req.file.mimetype,
-            size: req.file.size,
-            duration: Number.isFinite(duration) ? duration : null,
-            waveformPeaks
-        });
-    } catch (err) {
-        logger.error({ err, mediaType: 'audio' }, 'Chat media upload error');
-        res.status(500).json({ success: false, message: 'Upload failed' });
-    }
-});
+);
 
-// POST /api/chat/upload/video — { url, mimeType, size, duration }
-app.post('/api/chat/upload/video', protectChatUpload, chatVideoUpload.single('file'), async (req, res) => {
-    if (!req.file) return res.status(400).json({ success: false, message: 'No file uploaded' });
-    const duration = parseInt(req.body.duration, 10);
-    try {
-        const url = await _uploadChatMediaUrl(req.file, 'video');
-        res.status(200).json({
-            success: true,
-            url,
-            mimeType: req.file.mimetype,
-            size: req.file.size,
-            duration: Number.isFinite(duration) ? duration : null
-        });
-    } catch (err) {
-        logger.error({ err, mediaType: 'video' }, 'Chat media upload error');
-        res.status(500).json({ success: false, message: 'Upload failed' });
-    }
-});
-
-// POST /api/chat/upload/document — { url, mimeType, size, filename }
-app.post('/api/chat/upload/document', protectChatUpload, chatDocumentUpload.single('file'), async (req, res) => {
-    if (!req.file) return res.status(400).json({ success: false, message: 'No file uploaded' });
-    try {
-        const url = await _uploadChatMediaUrl(req.file, 'document');
-        res.status(200).json({
-            success: true,
-            url,
-            mimeType: req.file.mimetype,
-            size: req.file.size,
-            filename: req.file.originalname
-        });
-    } catch (err) {
-        logger.error({ err, mediaType: 'document' }, 'Chat media upload error');
-        res.status(500).json({ success: false, message: 'Upload failed' });
-    }
-});
-
-// ── BUSINESS IMAGE UPLOAD ─────────────────────────────────────────────────────
-// Business image upload — uses the same multer memoryStorage + Cloudinary
-// pipeline as chat media, but routes files to azaman/business/ folders.
-const { protect: protectBizUpload } = require('./middleware/authMiddleware');
-
-// POST /api/business/upload/image — uploads to azaman/business/products/
-// Used by the Add Product image picker and business logo upload.
-// The ?folder= query param selects the destination:
-//   ?folder=products  → azaman/business/products/  (default)
-//   ?folder=logos     → azaman/business/logos/
-//   ?folder=kyb       → azaman/business/kyb/
-// Returns: { success, url, mimeType, size, filename }
-app.post('/api/business/upload/image', protectBizUpload, chatImageUpload.single('file'), async (req, res) => {
-    if (!req.file) return res.status(400).json({ success: false, message: 'No file uploaded' });
-    try {
-        const folder = req.query.folder === 'logos' ? 'business/logos'
-                     : req.query.folder === 'kyb'   ? 'business/kyb'
-                     : 'business/products';
-
-        const { url } = await uploadChatMedia(req.file, folder);
-        res.status(200).json({
-            success: true,
-            url,
-            mimeType: req.file.mimetype,
-            size: req.file.size,
-            filename: req.file.originalname
-        });
-    } catch (err) {
-        logger.error({ err }, 'Business image upload error');
-        res.status(500).json({ success: false, message: 'Upload failed' });
-    }
-});
-
-// POST /api/chat/link-preview — { url } -> { url, title, description, image, favicon, siteName, status }
-const LinkPreviewService = require('./services/linkPreviewService');
-const linkPreviewService = new LinkPreviewService(prisma);
-app.set('linkPreviewService', linkPreviewService);
-
-app.post('/api/chat/link-preview', protectChatUpload, async (req, res) => {
-    try {
-        const { url } = req.body;
-        if (!url) return res.status(400).json({ success: false, message: 'url required' });
-        const preview = await linkPreviewService.fetch(url);
-        if (!preview) return res.status(400).json({ success: false, message: 'invalid url' });
-        return res.status(200).json({ success: true, preview });
-    } catch (err) {
-        logger.error({ err }, 'Link preview error');
-        return res.status(500).json({ success: false, message: 'preview failed' });
-    }
-});
-
-// LEGACY (Phase 0): kept alive for older builds. Image-only, 8MB, public.
-// Phase UI-3 superseded this with the four typed endpoints above.
-const chatMediaUpload = multer({
-    storage: multer.memoryStorage(),
-    limits: { fileSize: 8 * 1024 * 1024 },
-    fileFilter: imageFileFilter
-});
-
-app.post('/api/chat/upload-media', chatMediaUpload.any(), async (req, res) => {
-    try {
-        const file = Array.isArray(req.files) ? req.files[0] : req.file;
-        if (!file) return res.status(400).json({ error: 'No file uploaded' });
-        const mediaUrl = await _uploadChatMediaUrl(file, 'image');
-        res.status(200).json({ mediaUrl, path: mediaUrl, url: mediaUrl });
-    } catch (err) {
-        logger.error({ err }, 'Chat media upload error');
-        res.status(500).json({ error: 'Upload failed' });
-    }
-});
-
-// --- VENDOR DOCUMENT UPLOAD ---
-const vendorDocsDir = 'uploads/vendor/';
-if (!fs.existsSync(vendorDocsDir)) fs.mkdirSync(vendorDocsDir, { recursive: true });
-
-const vendorDocsStorage = multer.diskStorage({
-    destination: (req, file, cb) => cb(null, vendorDocsDir),
-    filename: (req, file, cb) => {
-        const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-        cb(null, 'vendor-' + uniqueSuffix + path.extname(file.originalname));
-    }
-});
-const vendorDocsUpload = multer({
-    storage: vendorDocsStorage,
-    limits: { fileSize: 5 * 1024 * 1024 }, // 5MB per file
-    fileFilter: imageFileFilter
-});
-
-// POST /api/vendor/upload-docs — Upload vendor application documents (authenticated)
-const { protect: protectUpload } = require('./middleware/authMiddleware');
-app.post('/api/vendor/upload-docs', protectUpload, vendorDocsUpload.fields([
+// Vendor document upload — uses multer config from the extended router
+const { protect: protectVendorUpload } = require('./middleware/authMiddleware');
+const vendorDocsUpload = chatUploadExtended.vendorDocsUpload;
+app.post('/api/vendor/upload-docs', protectVendorUpload, vendorDocsUpload.fields([
     { name: 'idFront', maxCount: 1 },
     { name: 'idBack', maxCount: 1 },
     { name: 'selfie', maxCount: 1 },
@@ -1515,7 +1291,6 @@ app.post('/api/vendor/upload-docs', protectUpload, vendorDocsUpload.fields([
         if (!req.files || Object.keys(req.files).length === 0) {
             return res.status(400).json({ success: false, message: 'No files uploaded' });
         }
-
         const { uploadToCloudinary } = require('./services/cloudinaryService');
         const urls = {};
         for (const [field, files] of Object.entries(req.files)) {
@@ -1524,7 +1299,6 @@ app.post('/api/vendor/upload-docs', protectUpload, vendorDocsUpload.fields([
                 urls[field] = url;
             }
         }
-
         logger.info({ userId: req.user.id, keys: Object.keys(urls) }, 'Vendor: documents uploaded');
         return res.status(200).json({ success: true, urls });
     } catch (err) {
@@ -1532,6 +1306,11 @@ app.post('/api/vendor/upload-docs', protectUpload, vendorDocsUpload.fields([
         return res.status(500).json({ success: false, message: 'Upload failed' });
     }
 });
+
+// Link preview service singleton (shared across the app)
+const LinkPreviewService = require('./services/linkPreviewService');
+const linkPreviewService = new LinkPreviewService(prisma);
+app.set('linkPreviewService', linkPreviewService);
 
 // ══════════════════════════════════════════════════════════════════════════════
 // REAL-TIME CONNECTIONS (Authenticated — CRITICAL-4)
