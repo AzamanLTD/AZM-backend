@@ -2408,6 +2408,42 @@ router.get('/dashboard/at-risk', wrap(async (req, res) => {
     res.json({ success: true, items });
 }));
 
+// GET /api/business-os/dashboard/employee-stats — aggregated employee KPIs for the dashboard
+router.get('/dashboard/employee-stats', wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+    if (!bpId) return res.json({ success: true, stats: { totalEmployees: 0, activeShifts: 0, pendingTimeOff: 0, monthlyPayroll: 0 } });
+
+    const now = new Date();
+    const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+
+    const [totalEmployees, activeShifts, pendingTimeOff, payrollRecords] = await Promise.all([
+        prisma.businessEmployee.count({ where: { businessProfileId: bpId, isActive: true } }).catch(() => 0),
+        prisma.shift.findMany({
+            where: { businessProfileId: bpId, status: 'SCHEDULED', startTime: { lte: now }, endTime: { gte: now } },
+            select: { id: true },
+        }).catch(() => []),
+        prisma.timeOffRequest.count({ where: { businessProfileId: bpId, status: 'PENDING' } }).catch(() => 0),
+        prisma.payrollRecord.findMany({
+            where: { businessProfileId: bpId, status: 'PAID', periodStart: { gte: monthStart } },
+            select: { netAmountUsdc: true },
+        }).catch(() => []),
+    ]);
+
+    const monthlyPayroll = payrollRecords.reduce((sum, r) => sum + (Number(r.netAmountUsdc) || 0), 0);
+
+    res.json({
+        success: true,
+        stats: {
+            totalEmployees,
+            activeShifts: activeShifts.length,
+            pendingTimeOff,
+            monthlyPayroll: monthlyPayroll.toFixed(2),
+        },
+    });
+}));
+
+
 // ── Phase 2: Kiosk PIN Auth (Section 2.4) ────────────────────────────────────
 // POST /api/business-os/kiosk/pin-auth — scoped PIN auth for clock-in/out only
 router.post('/kiosk/pin-auth', wrap(async (req, res) => {
