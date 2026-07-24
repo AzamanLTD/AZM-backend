@@ -439,6 +439,12 @@ app.get('/health', async (req, res) => {
                     catch (_) { return null; }
                 })(),
             },
+            sockets: (() => {
+                try { 
+                    const sio = app.get('socketio');
+                    return sio ? sio.sockets.sockets.size : 0;
+                } catch (_) { return 0; }
+            })(),
         });
     } catch (err) {
         res.status(503).json({
@@ -1136,26 +1142,8 @@ cron.schedule('*/15 * * * *', () => {
 // the callsite keeps it safe if this ever isn't set.
 kycService.adminAlertService = adminAlertService;
 
-// C-8: Health check — no auth required
-app.get('/health', async (req, res) => {
-    const prisma = req.app.get('prisma');
-    let dbOk = false;
-    try {
-        await prisma.$queryRaw`SELECT 1`;
-        dbOk = true;
-    } catch (_) {}
-    const io = req.app.get('io');
-    let sockets = 0;
-    try { sockets = io ? (await io.allSockets()).size : 0; } catch (_) {}
-    return res.json({
-        status:    'ok',
-        uptime:    process.uptime(),
-        db:        dbOk ? 'connected' : 'error',
-        sockets,
-        env:       process.env.NODE_ENV,
-        timestamp: new Date().toISOString(),
-    });
-});
+// C-8: Duplicate health endpoint removed — unified /health at line 375
+// now includes sockets count. This stub was shadowing the comprehensive handler.
 
 // ══════════════════════════════════════════════════════════════════════════════
 // API VERSIONING + RESPONSE ENVELOPE (additive, non-breaking)
