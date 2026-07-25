@@ -13,14 +13,15 @@ const router = express.Router();
 const ctrl = require('../controllers/vaultController');
 const { protect } = require('../middleware/authMiddleware');
 const { protectActive } = require('../middleware/banGuardMiddleware');
+const { idempotency } = require('../middleware/idempotency');
 
 router.get('/',                  protect,        ctrl.list);
 router.post('/',                 protectActive,  ctrl.create);
 router.get('/:id',               protect,        ctrl.getDetail);
-router.post('/:id/deposit',      protectActive,  ctrl.deposit);
+router.post('/:id/deposit',      protectActive,  idempotency(), ctrl.deposit);
 router.post('/:id/auto-rule',    protectActive,  ctrl.setAutoRule);
 router.delete('/:id/auto-rule',  protectActive,  ctrl.disableAutoRule);
-router.post('/:id/break',        protectActive,  ctrl.breakEarly);
+router.post('/:id/break',        protectActive,  idempotency(), ctrl.breakEarly);
 router.get('/:id/receipt',       protect,        ctrl.getReceipt);
 router.get('/:id/deposits',      protect,        ctrl.listDeposits);
 

@@ -20,12 +20,12 @@ router.post('/withdraw',       protectActive, idempotency(), walletController.re
 router.get('/history',         protect,       walletController.getWithdrawalHistory);
 
 // Saved wallets / payout whitelist
-router.post('/saved',          protectActive, walletController.addSavedWallet);
+router.post('/saved',          protectActive, idempotency(), walletController.addSavedWallet);
 router.get('/saved',           protect,       walletController.getSavedWallets);
 router.delete('/saved/:id',    protectActive, walletController.deleteSavedWallet);
 
 // Fiat deposit gateway (initialize)
-router.post('/deposit/initialize', protectActive, walletController.initializeFiatDeposit);
+router.post('/deposit/initialize', protectActive, idempotency(), walletController.initializeFiatDeposit);
 
 // Polygon deposit address (Phase C: Tatum HD wallet derivation)
 router.get('/deposit-address/polygon', protect, walletController.getPolygonDepositAddress);

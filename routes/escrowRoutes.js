@@ -16,9 +16,9 @@ const { fundEscrowSchema, raiseDisputeSchema } = require('../services/validation
 
 router.get('/ticket/:ticketId', protect, ctrl.getEscrowForTicket);
 router.post('/fund', protectActive, idempotency(), validate(fundEscrowSchema), ctrl.fundEscrow);
-router.post('/satisfy', protectActive, ctrl.markSatisfied);
-router.post('/dispute', protectActive, validate(raiseDisputeSchema), ctrl.raiseDispute);
+router.post('/satisfy', protectActive, idempotency(), ctrl.markSatisfied);
+router.post('/dispute', protectActive, idempotency(), validate(raiseDisputeSchema), ctrl.raiseDispute);
 router.post('/update-terms', protect, ctrl.updateTerms);
-router.post('/cancel', protectActive, ctrl.cancelEscrow);
+router.post('/cancel', protectActive, idempotency(), ctrl.cancelEscrow);
 
 module.exports = router;

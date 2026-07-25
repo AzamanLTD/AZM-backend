@@ -9,20 +9,21 @@ const express              = require('express');
 const router               = express.Router();
 const p2pController        = require('../controllers/p2p.controller');
 const { protectActive }    = require('../middleware/banGuardMiddleware');
+const { idempotency }      = require('../middleware/idempotency');
 
 // Ping system
 router.post('/ping',         protectActive, p2pController.pingVendor);
-router.post('/ping/accept',  protectActive, p2pController.acceptPing);
+router.post('/ping/accept',  protectActive, idempotency(), p2pController.acceptPing);
 
 // P2P Ads listing (public — no auth required for browsing marketplace)
 router.get('/ads', p2pController.getAds);
 
 // Trade adjustments
-router.post('/underpayment', protectActive, p2pController.markUnderpaid);
-router.post('/overpayment',  protectActive, p2pController.flagOverpayment);
+router.post('/underpayment', protectActive, idempotency(), p2pController.markUnderpaid);
+router.post('/overpayment',  protectActive, idempotency(), p2pController.flagOverpayment);
 
 // Trade completion (the SINGLE SOURCE OF TRUTH for asset release)
-router.post('/complete',     protectActive, p2pController.completeTrade);
+router.post('/complete',     protectActive, idempotency(), p2pController.completeTrade);
 
 // B-9: Action-required indicator — returns pending items needing user attention.
 router.get('/action-required', protectActive, p2pController.getActionRequired);
