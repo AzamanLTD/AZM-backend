@@ -4442,4 +4442,34 @@ router.patch('/retail/products/:id/barcode', wrap(async (req, res) => {
     res.json({ success: true, product });
 }));
 
+
+// GET /api/business-os/retail/products/lookup?barcode=XXX or ?sku=XXX
+// Quick lookup product by barcode or SKU — used by barcode scanner
+router.get('/retail/products/lookup', wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+    const { barcode, sku } = req.query;
+
+    if (!barcode && !sku) return res.status(400).json({ error: 'Provide barcode or sku query param' });
+
+    const where = { businessProfileId: bpId, isActive: true };
+    if (barcode) where.barcode = barcode;
+    else if (sku) where.sku = sku;
+
+    const product = await prisma.businessProduct.findFirst({
+        where,
+        select: {
+            id: true, name: true, priceUsdc: true, sku: true, barcode: true,
+            stockQty: true, lowStockThreshold: true, costPrice: true,
+            supplierId: true, isActive: true, isAvailable: true,
+            imageUrls: true, category: true,
+        },
+    });
+
+    if (!product) return res.status(404).json({ error: 'No product matches that barcode/SKU' });
+
+    const isLowStock = product.stockQty !== null && product.stockQty <= (product.lowStockThreshold || 5);
+    res.json({ ...product, isLowStock });
+}));
+
 module.exports = router;
