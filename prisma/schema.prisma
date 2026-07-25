@@ -649,6 +649,7 @@ model User {
   googleId           String? @unique
   appleId            String? @unique
   twoFactorSecret    String?
+  webAuthnCredentials  WebAuthnCredential[]
   isTwoFactorEnabled Boolean @default(false)
   pinHash            String?
   profilePictureUrl  String?
@@ -951,6 +952,25 @@ model RefreshToken {
 
   @@index([userId])
   @@index([expiresAt])
+}
+
+// ── WebAuthn / Passkey Credentials (Phase 2: Scalability & Security) ────────
+// Stores FIDO2 passkey credentials for passwordless authentication.
+// One user can have multiple passkeys (phone, laptop, hardware key, etc).
+model WebAuthnCredential {
+  id              String   @id          // Base64URL-encoded credential ID
+  userId          Int
+  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  publicKey       Bytes                 // COSE-encoded public key
+  counter         Int      @default(0)  // Monotonic counter for replay detection
+  transports      String[] @default([])  // ["usb","nfc","ble","internal"]
+  deviceType      String?               // "singleDevice" | "multiDevice"
+  backedUp        Boolean  @default(false)
+  name            String?               // User-assigned label
+  createdAt       DateTime @default(now())
+  lastUsedAt      DateTime?
+
+  @@index([userId])
 }
 
 // =============================================================================

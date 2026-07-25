@@ -23,6 +23,8 @@
     "@prisma/adapter-pg": "^7.4.0",
     "@prisma/client": "^6.19.2",
     "@sentry/node": "^10.58.0",
+    "@simplewebauthn/server": "^13.3.2",
+    "@simplewebauthn/typescript-types": "^8.3.4",
     "@socket.io/redis-adapter": "^8.3.0",
     "archiver": "^8.0.0",
     "axios": "^1.14.0",

@@ -42,3 +42,18 @@ router.post('/sessions/:id/revoke', protect, sessionController.revokeSession);
 // ── GDPR Data Export (Enterprise Readiness) ───────────────────────────────
 const dataExportController = require('../controllers/dataExportController');
 router.get('/data-export', protect, dataExportController.exportUserData);
+
+// ── WebAuthn / Passkey Routes (Phase 2: Scalability & Security) ──────────────
+const webauthnController = require('../controllers/webauthnController');
+
+// Registration (requires existing auth — user must be logged in to add a passkey)
+router.post('/webauthn/register/begin', protect, webauthnController.beginRegistration);
+router.post('/webauthn/register/finish', protect, webauthnController.finishRegistration);
+
+// Login (no auth required — passwordless login via passkey)
+router.post('/webauthn/login/begin', webauthnController.beginLogin);
+router.post('/webauthn/login/finish', webauthnController.finishLogin);
+
+// Credential management (requires auth)
+router.get('/webauthn/credentials', protect, webauthnController.listCredentials);
+router.delete('/webauthn/credentials/:id', protect, webauthnController.deleteCredential);
