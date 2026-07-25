@@ -14,7 +14,7 @@ const { validate } = require('../middleware/validate');
 const { fundEscrowSchema, raiseDisputeSchema } = require('../services/validation/financialSchemas');
 
 router.get('/ticket/:ticketId', protect, ctrl.getEscrowForTicket);
-router.post('/fund', protectActive, validate(fundEscrowSchema), ctrl.fundEscrow);
+router.post('/fund', protectActive, idempotency(), validate(fundEscrowSchema), ctrl.fundEscrow);
 router.post('/satisfy', protectActive, ctrl.markSatisfied);
 router.post('/dispute', protectActive, validate(raiseDisputeSchema), ctrl.raiseDispute);
 router.post('/update-terms', protect, ctrl.updateTerms);

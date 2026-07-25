@@ -13,7 +13,7 @@ const { protect }              = require('../middleware/authMiddleware');
 const { protectActive }        = require('../middleware/banGuardMiddleware');
 
 // Withdrawals
-router.post('/withdraw',       protectActive, walletController.requestWithdrawal);
+router.post('/withdraw',       protectActive, idempotency(), walletController.requestWithdrawal);
 
 // Read-only history (banned users still need to see their own history)
 router.get('/history',         protect,       walletController.getWithdrawalHistory);
@@ -73,7 +73,7 @@ router.get('/pool-withdrawal-preview', protect, async (req, res) => {
 
 // POST /api/wallet/internal-transfer
 // Body: { direction: 'TO_POOL' | 'FROM_POOL', amount: number }
-router.post('/internal-transfer', protectActive, async (req, res) => {
+router.post('/internal-transfer', protectActive, idempotency(), async (req, res) => {
     const prisma = req.app.get('prisma');
     const emitBalanceUpdate = req.app.get('emitBalanceUpdate');
 

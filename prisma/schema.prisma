@@ -5277,3 +5277,21 @@ model StorefrontAnalyticsEvent {
   @@index([businessProfileId, eventType])
   @@index([createdAt])
 }
+
+/// Idempotency keys for safe retry of financial endpoints (Phase 2).
+/// When a client sends an Idempotency-Key header, the response is cached
+/// so a retried request with the same key returns the original result
+/// instead of re-executing the operation (preventing double-charges).
+model IdempotencyKey {
+  id          String   @id @default(uuid())
+  key         String   @unique
+  userId      Int?
+  endpoint    String
+  statusCode  Int
+  responseBody Json
+  createdAt   DateTime @default(now())
+  expiresAt   DateTime
+
+  @@index([key])
+  @@index([expiresAt])
+}

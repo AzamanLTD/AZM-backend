@@ -34,10 +34,10 @@ router.get('/history', protect, getTradeHistory);
 router.get('/:id',     protect, getTradeDetails);
 
 // ── Buyer actions ────────────────────────────────────────────────────────────
-router.post('/initiate', protectActive, initiateTrade);
+router.post('/initiate', protectActive, idempotency(), initiateTrade);
 
 // ── Vendor approval actions ──────────────────────────────────────────────────
-router.post('/accept',  protectActive, acceptTrade);
+router.post('/accept',  protectActive, idempotency(), acceptTrade);
 router.post('/decline', protectActive, declineTrade);
 
 // ── Time extension ───────────────────────────────────────────────────────────
