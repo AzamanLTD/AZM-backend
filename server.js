@@ -30,7 +30,6 @@ const { PrismaPg } = require('@prisma/adapter-pg');
 const { Pool } = require('pg');
 const path = require('path');
 const socketRateLimiter = require('./middleware/socketRateLimiter');
-const cors = require('cors');
 const multer = require('multer');
 const fs = require('fs');
 const jwt = require('jsonwebtoken');
@@ -229,205 +228,15 @@ app.set('trust proxy', 1);
 const server = http.createServer(app);
 
 // ══════════════════════════════════════════════════════════════════════════════
-// 3. MIDDLEWARES
+// 3. MIDDLEWARES (extracted to src/middleware/appMiddleware.js)
 // ══════════════════════════════════════════════════════════════════════════════
 
-// Request tracing (must precede morgan so the access log carries the id).
-// Assigns req.id / res.locals.requestId and the X-Request-Id response header.
-app.use(require('./middleware/requestId'));
+const { configureMiddleware } = require('./src/middleware/appMiddleware');
+const { corsOrigins } = configureMiddleware(app, { IS_PRODUCTION });
 
-// HTTP access logging (morgan). "combined" = IP, method, path, status,
-// response-time — enough to debug most production issues from the Render log
-// stream. We append the request id (":req-id" token) so a log line can be
-// correlated with an error report or a client bug submission. Skipped under
-// NODE_ENV=test to keep test output clean.
-const morgan = require('morgan');
-morgan.token('req-id', (req) => req.id || '-');
-if (process.env.NODE_ENV !== 'test') {
-    app.use(morgan(':remote-addr :method :url :status :response-time ms - :req-id'));
-}
-
-// HIGH-1: Security headers (helmet-equivalent without dependency)
-app.use((req, res, next) => {
-    res.setHeader('X-Content-Type-Options', 'nosniff');
-    res.setHeader('X-Frame-Options', 'DENY');
-    res.setHeader('X-XSS-Protection', '0');
-    res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
-    res.setHeader('X-Download-Options', 'noopen');
-    res.setHeader('X-Permitted-Cross-Domain-Policies', 'none');
-    res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
-    res.removeHeader('X-Powered-By');
-    next();
-});
-
-// HIGH-2: CORS locked to configured origins
-const corsOrigins = process.env.CORS_ORIGINS
-    ? process.env.CORS_ORIGINS.split(',').map(s => s.trim()).filter(Boolean)
-    : ['*']; // Dev fallback — override in production!
-
-// In production, explicitly reject any browser origin not on the allow-list.
-// In development (or when CORS_ORIGINS is the '*' wildcard), CORS stays open.
-// Requests without an Origin header (curl, mobile apps, server-to-server) are
-// always permitted since the browser same-origin policy does not apply to them.
-const corsOriginValidator = (origin, callback) => {
-    if (!origin) return callback(null, true);
-    if (!IS_PRODUCTION || corsOrigins.includes('*')) return callback(null, true);
-    if (corsOrigins.includes(origin)) return callback(null, true);
-    return callback(new Error(`CORS: origin ${origin} is not allowed`));
-};
-
-app.use(cors({
-    origin: corsOriginValidator,
-    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-    credentials: true
-}));
-
-// Surface the CORS posture at boot so misconfigured deploys are obvious.
-if (IS_PRODUCTION) {
-    logger.info({ origins: corsOrigins }, 'CORS locked');
-} else {
-    logger.info('CORS open (development mode)');
-}
-
-// C-10: Force HTTPS in production (Render provides HTTPS proxy)
-if (process.env.NODE_ENV === 'production') {
-    app.use((req, res, next) => {
-        if (req.headers['x-forwarded-proto'] !== 'https') {
-            return res.redirect(301, `https://${req.headers.host}${req.url}`);
-        }
-        next();
-    });
-}
-
-// Body parser with size limit (M-1 fix) + raw body for HMAC verification
-app.use(express.json({
-    limit: '2mb',
-    verify: (req, res, buf) => { req.rawBody = buf.toString('utf8'); }
-}));
-
-// Request logging (only in non-production or when LOG_REQUESTS=true)
-if (!IS_PRODUCTION || process.env.LOG_REQUESTS === 'true') {
-    app.use((req, res, next) => {
-        logger.debug({ method: req.method, url: req.url }, 'Request');
-        next();
-    });
-}
-
-app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
-
-// ── Health Check Endpoint ────────────────────────────────────────────────────
-app.get('/health', async (req, res) => {
-    try {
-        await prisma.$queryRaw`SELECT 1`;
-
-        // Phase Q15: Include version gate info for client startup check
-        let versionGate = null;
-        try {
-            const settings = await prisma.globalSettings.findUnique({
-                where: { id: 1 },
-                select: { minAppVersion: true, forceUpdateUrl: true, updateMessage: true },
-            });
-            if (settings) {
-                versionGate = {
-                    minVersion: settings.minAppVersion,
-                    updateUrl: settings.forceUpdateUrl,
-                    message: settings.updateMessage,
-                };
-            }
-        } catch (_) { /* non-fatal */ }
-
-        // WS7: Escrow + business system stats for the Admin Portal dashboard.
-        // Each block is independently guarded — a stats query failure must NEVER
-        // flip /health to 503 (the DB SELECT 1 above is the real liveness probe).
-        let escrowSystem = null;
-        try {
-            const startOfToday = new Date();
-            startOfToday.setHours(0, 0, 0, 0);
-            const [activeEscrows, disputedEscrows, expiredToday] = await Promise.all([
-                prisma.smartEscrow.count({ where: { status: { in: ['FUNDED', 'IN_PROGRESS', 'PENDING_SETTLEMENT'] } } }),
-                prisma.smartEscrow.count({ where: { status: { in: ['DISPUTED', 'ADMIN_REVIEW'] } } }),
-                prisma.smartEscrow.count({ where: { status: 'EXPIRED', updatedAt: { gte: startOfToday } } }),
-            ]);
-            escrowSystem = { activeEscrows, disputedEscrows, expiredToday };
-        } catch (_) { /* non-fatal */ }
-
-        let businessSystem = null;
-        try {
-            const [totalBusinesses, verifiedBusinesses, pendingKyb, activeOrders] = await Promise.all([
-                prisma.businessProfile.count(),
-                prisma.businessProfile.count({ where: { kybStatus: 'VERIFIED' } }),
-                prisma.businessProfile.count({ where: { kybStatus: 'PENDING' } }),
-                prisma.businessOrder.count({ where: { status: { in: ['PAID', 'DELIVERED'] } } }),
-            ]);
-            businessSystem = { totalBusinesses, verifiedBusinesses, pendingKyb, activeOrders };
-        } catch (_) { /* non-fatal */ }
-
-        res.status(200).json({
-            status: 'healthy',
-            timestamp: new Date().toISOString(),
-            version: APP_VERSION,
-            uptime: process.uptime(),
-            database: 'connected',
-            redis: redisStatus,
-            workers: workerStatus,
-            escrowSystem,
-            businessSystem,
-            versionGate,
-            // Susu Sprint (2026-06-01): surface the boot-time auto-release
-            // outcome + treasury cache state so deploy health can be checked
-            // with a single curl on free-tier hosting (no dashboard logs).
-            susu: {
-                treasuryCached: !!app.get('azamanTreasuryUserId'),
-                release: (() => {
-                    try { return require('./infra/autoRelease').releaseStatus; }
-                    catch (_) { return null; }
-                })(),
-            },
-            sockets: (() => {
-                try { 
-                    const sio = app.get('socketio');
-                    return sio ? sio.sockets.sockets.size : 0;
-                } catch (_) { return 0; }
-            })(),
-        });
-    } catch (err) {
-        res.status(503).json({
-            status: 'unhealthy',
-            timestamp: new Date().toISOString(),
-            version: APP_VERSION,
-            database: 'disconnected',
-            redis: redisStatus,
-            error: IS_PRODUCTION ? 'Service unavailable' : err.message
-        });
-    }
-});
-
-// --- ADMIN: manual one-time Susu release trigger (free-tier ops lever) ────────
-// Lets an authenticated admin run the idempotent migrate + seed on demand
-// without dashboard Shell access. Safe to call repeatedly. Returns the
-// release status object. Mirrors what boot-time autoRelease does.
-const { protect: protectRelease, adminOnly: adminOnlyRelease } = require('./middleware/authMiddleware');
-app.post('/api/admin/susu/release', protectRelease, adminOnlyRelease, async (req, res) => {
-    try {
-        const { autoRelease } = require('./infra/autoRelease');
-        const status = await autoRelease(prisma, { force: true });
-        // Re-resolve the treasury cache immediately so Susu comes online
-        // without waiting for the 60s retry tick.
-        try {
-            const treasury = await prisma.user.findUnique({
-                where: { username: 'azaman-treasury' },
-                select: { id: true },
-            });
-            if (treasury) app.set('azamanTreasuryUserId', treasury.id);
-        } catch (_) { /* non-fatal */ }
-        res.status(200).json({
-            success: true,
-            data: { release: status, treasuryCached: !!app.get('azamanTreasuryUserId') },
-        });
-    } catch (err) {
-        res.status(500).json({ success: false, message: err.message });
-    }
-});
+// ── Health Check + Admin Susu Release (extracted to src/routes/health.js) ──────
+const { mountHealthRoutes } = require('./src/routes/health');
+mountHealthRoutes(app, { prisma, workerStatus, redisStatusRef: () => redisStatus, APP_VERSION, IS_PRODUCTION });
 
 // ══════════════════════════════════════════════════════════════════════════════
 // 4. REAL-TIME ENGINE (Socket.IO)
