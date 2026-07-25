@@ -48,13 +48,17 @@ class GroupChatSocketService {
                 replyToId, replyToText, replyToSenderName,
                 mediaUrl, mediaType, mediaMimeType, mediaSize,
                 mediaDuration, mediaWaveformPeaks, linkPreview,
-                metadata } = data;
+                metadata, disappearAfterSeconds } = data;
         if (!groupId || !senderId || (!content && !mediaUrl && !metadata)) return;
 
         const member = await this.prisma.groupMember.findFirst({
           where: { groupId, userId: parseInt(senderId), removedAt: null }
         });
         if (!member) return socket.emit('group_error', { reason: 'not_member' });
+
+        const expiresAt = disappearAfterSeconds
+          ? new Date(Date.now() + disappearAfterSeconds * 1000)
+          : null;
 
         const message = await this.prisma.groupMessage.create({
           data: {
@@ -72,6 +76,8 @@ class GroupChatSocketService {
             mediaWaveformPeaks: mediaWaveformPeaks || null,
             linkPreview: linkPreview ? linkPreview : null,
             metadata: metadata || null,
+            disappearAfterSeconds: disappearAfterSeconds || null,
+            expiresAt,
           },
           include: { sender: { select: { id: true, username: true, profilePictureUrl: true } } }
         });
@@ -91,6 +97,8 @@ class GroupChatSocketService {
           replyToId, replyToText, replyToSenderName,
           mediaUrl, mediaType, mediaMimeType, mediaSize,
           mediaDuration, mediaWaveformPeaks, linkPreview, metadata,
+          disappearAfterSeconds: disappearAfterSeconds || null,
+          expiresAt,
         };
 
         this.io.to(`group_${groupId}`).emit('new_group_message', payload);

@@ -132,11 +132,15 @@ class ChatSocketService {
     socket.on('send_trade_message', async (data) => {
       try {
         const { senderId, content, tradeId, messageType, localId,
-                replyToId, replyToText, replyToSenderName } = data;
+                replyToId, replyToText, replyToSenderName, disappearAfterSeconds } = data;
         if (!senderId || !tradeId || !content) return;
         const cleanId = String(tradeId).replace(/^#/, '');
         const conversation = await this.getOrCreateTradeConversation(cleanId);
         if (!conversation) return socket.emit('chat_error', { reason: 'trade_not_found' });
+
+        const expiresAt = disappearAfterSeconds
+          ? new Date(Date.now() + disappearAfterSeconds * 1000)
+          : null;
 
         const message = await this.prisma.message.create({
           data: {
@@ -149,6 +153,8 @@ class ChatSocketService {
             replyToId: replyToId || null,
             replyToText: replyToText || null,
             replyToSenderName: replyToSenderName || null,
+            disappearAfterSeconds: disappearAfterSeconds || null,
+            expiresAt,
           },
           include: { sender: { select: { id: true, username: true } } }
         });
@@ -163,6 +169,8 @@ class ChatSocketService {
           messageType: message.messageType, content: message.content,
           text: message.content, createdAt: message.createdAt,
           status: 'sent', replyToId, replyToText, replyToSenderName,
+          disappearAfterSeconds: disappearAfterSeconds || null,
+          expiresAt,
         };
 
         // ② Broadcast to room
@@ -200,6 +208,10 @@ class ChatSocketService {
         const { conversation, roomHash } =
           await this.getOrCreatePersonalConversation(senderId, otherUserId);
 
+        const expiresAt = disappearAfterSeconds
+          ? new Date(Date.now() + disappearAfterSeconds * 1000)
+          : null;
+
         const message = await this.prisma.message.create({
           data: {
             conversationId: conversation.id,
@@ -211,6 +223,8 @@ class ChatSocketService {
             replyToId: replyToId || null,
             replyToText: replyToText || null,
             replyToSenderName: replyToSenderName || null,
+            disappearAfterSeconds: disappearAfterSeconds || null,
+            expiresAt,
           },
           include: { sender: { select: { id: true, username: true } } }
         });
@@ -221,6 +235,8 @@ class ChatSocketService {
           sender: message.sender, messageType: message.messageType,
           content: message.content, createdAt: message.createdAt,
           status: 'sent', replyToId, replyToText, replyToSenderName,
+          disappearAfterSeconds: disappearAfterSeconds || null,
+          expiresAt,
         };
         this.emitToRoomAndSpy(`personal_${roomHash}`, 'new_personal_message', payload);
         const other = await this.prisma.user.findUnique({

@@ -93,6 +93,11 @@ async function startWorkers(app, {
     const OnchainSweepWorker = require('../../workers/onchainSweepWorker');
     const onchainSweepWorker = new OnchainSweepWorker(prisma, null);
 
+    // ── Disappearing Message Worker (Phase 2) ──────────────────────────────
+    // Hard-deletes expired messages (expiresAt < now) from all chat tables.
+    const DisappearingMessageWorker = require('../../workers/disappearingMessageWorker');
+    const disappearingMessageWorker = new DisappearingMessageWorker(prisma);
+
     // ── Register all workers with the scheduler ───────────────────────────
     // Cron-based workers (use cron expressions)
     await register('leaderboard',        '0 0 * * 0',   () => leaderboardWorker.computeWeeklyLeaderboard());
@@ -109,6 +114,7 @@ async function startWorkers(app, {
     await register('smart-route',       String(60 * 1000),            () => smartRouteWorker._tick());
     await register('azm-auction',       String(5 * 60 * 1000),        () => azmAuctionWorker._tick());
     await register('onchain-sweep',     String(60 * 60 * 1000),        () => onchainSweepWorker._tick());
+    await register('disappearing-msg',   String(60 * 1000),              () => disappearingMessageWorker._tick());
 
     // ── Marketplace cron schedules ───────────────────────────────────────
     const noShowWorker = require('../../workers/reservationNoShowWorker');
@@ -212,6 +218,7 @@ async function startWorkers(app, {
         smartRouteWorker: IS_TEST_ENV ? 'disabled_in_test' : 'running',
         azmAuctionWorker: IS_TEST_ENV ? 'disabled_in_test' : 'running',
         onchainSweepWorker: IS_TEST_ENV ? 'disabled_in_test' : 'running',
+        disappearingMessageWorker: IS_TEST_ENV ? 'disabled_in_test' : 'running',
         tradeWorker: IS_TEST_ENV ? 'disabled_in_test' : 'pending_listen',
     });
 

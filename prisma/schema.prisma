@@ -1235,6 +1235,11 @@ model Message {
   replyToText       String?
   replyToSenderName String?
 
+  // Disappearing messages (Phase 2): if set, message is auto-deleted after
+  // this many seconds. expiresAt is computed on send = createdAt + seconds.
+  disappearAfterSeconds Int?
+  expiresAt              DateTime?
+
   conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
   sender       User?        @relation("MessageSender", fields: [senderId], references: [id])
   trade        Trade?       @relation("TradeMessages", fields: [tradeId], references: [id])
@@ -1246,6 +1251,7 @@ model Message {
   // (filter conversationId, order createdAt desc).
   @@index([conversationId, createdAt(sort: Desc)])
   @@index([localId])
+  @@index([expiresAt])
 }
 
 model Contact {
@@ -1790,6 +1796,10 @@ model DirectMessage {
   stickerAssetPath  String?
   stickerIsAnimated Boolean?
 
+  // Disappearing messages (Phase 2)
+  disappearAfterSeconds Int?
+  expiresAt              DateTime?
+
   friendship Friendship @relation(fields: [friendshipId], references: [id], onDelete: Cascade)
   sender     User       @relation("DirectMessageSender", fields: [senderId], references: [id], onDelete: Cascade)
   receiver   User       @relation("DirectMessageReceiver", fields: [receiverId], references: [id], onDelete: Cascade)
@@ -1804,6 +1814,7 @@ model DirectMessage {
   // (filter friendshipId, order createdAt desc).
   @@index([friendshipId, createdAt(sort: Desc)])
   @@index([localId])
+  @@index([expiresAt])
 }
 
 model PeerTransfer {
@@ -3384,6 +3395,10 @@ model GroupMessage {
   stickerAssetPath  String?
   stickerIsAnimated Boolean?
 
+  // Disappearing messages (Phase 2)
+  disappearAfterSeconds Int?
+  expiresAt              DateTime?
+
   group  GroupChat @relation(fields: [groupId], references: [id], onDelete: Cascade)
   sender User?     @relation("GroupMessageSender", fields: [senderId], references: [id], onDelete: SetNull)
 
@@ -3393,6 +3408,7 @@ model GroupMessage {
   @@index([senderId])
   @@index([groupId, type])
   @@index([localId])
+  @@index([expiresAt])
 }
 
 model VouchRecord {

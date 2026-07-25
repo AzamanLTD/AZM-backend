@@ -92,15 +92,16 @@ remaining work. Treat this as an ongoing standing checklist, not a one-time pass
 |--------|------|-------|
 | ✅ | Payment provider failover | `src/services/paymentFailoverService.js` — wraps Moolre (primary) + MTN (secondary) with automatic failover, health tracking (3 failures in 10min → unhealthy), recovery probing, admin health endpoint `/api/admin/payment-providers/health`. 11 tests. |
 | ✅ | Account lockout after failed logins | Implemented in auth middleware |
-| ✅ | Idempotency keys on financial endpoints | Implemented on all financial mutations |
+| ✅ | Idempotency keys on financial endpoints |
+| ✅ | 2FA enforcement for high-value ops | `middleware/require2FA.js` — step-up auth on all withdrawals, escrow, savings, vaults | Implemented on all financial mutations |
 | ✅ | Session management | `sessionController.js` — list, revoke, sign out everywhere |
 | ✅ | Data export / GDPR | `dataExportController.js` — structured PII export |
 | ✅ | 2FA enforcement | TOTP via speakeasy, integrated into MoMo + wallet transfers |
 | ✅ | BullMQ for workers | Multi-instance safe worker scheduling — `src/workers/bullmqScheduler.js` + BullMQ integration in `src/workers/index.js` |
 | ✅ | Read replica for analytics | Separate `replicaPrisma` client used for analytics/admin queries — `src/config/prisma.js` |
 | ✅ | Table partitioning | TransactionHistory by month — migration `20260725000004_partition_transaction_history` |
-| 🔲 | On-chain sweep worker | Automated USDC liquidity management |
+| ✅ | On-chain sweep worker | `workers/onchainSweepWorker.js` — hourly USDC consolidation from user addresses to treasury (MOCK-safe, LIVE via Tatum) |
 | ✅ | WebAuthn/passkey support | `controllers/webauthnController.js` — passwordless login + step-up auth factor |
 | ✅ | OpenAPI spec generation | `src/config/openapiGenerator.js` — auto-discovers routes from Express 5.x stack, produces OpenAPI 3.0.3 spec. Served at `/api/docs/openapi.json`. 16 tests. |
 | ✅ | VirtualizedList + VirtualizedGrid | Business portal — `@tanstack/react-virtual` based. Wired into Employees page (grid) and Messages conversations list. Handles 1000+ rows without DOM bottleneck. |
-| 🔲 | Disappearing messages | Mobile + backend support |
+| ✅ | Disappearing messages | `disappearAfterSeconds` + `expiresAt` on Message/DirectMessage/GroupMessage. Socket services accept `disappearAfterSeconds` in payload. `workers/disappearingMessageWorker.js` hard-deletes expired messages every 60s. |

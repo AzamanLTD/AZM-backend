@@ -104,7 +104,7 @@ class FriendSocketService {
         // immediate optimistic updates.
         socket.on('send_friend_message', async (data) => {
             try {
-                const { friendshipId, senderId, content, messageType, metadata, tempId } = data;
+                const { friendshipId, senderId, content, messageType, metadata, tempId, disappearAfterSeconds } = data;
                 if (!friendshipId || !senderId || !content) return;
 
                 const parsedSenderId = parseInt(senderId);
@@ -131,6 +131,10 @@ class FriendSocketService {
 
 
                 // Persist message
+                const expiresAt = disappearAfterSeconds
+                    ? new Date(Date.now() + disappearAfterSeconds * 1000)
+                    : null;
+
                 const message = await this.prisma.directMessage.create({
                     data: {
                         friendshipId,
@@ -138,7 +142,9 @@ class FriendSocketService {
                         receiverId,
                         content: content.trim(),
                         messageType: messageType || 'TEXT',
-                        metadata: metadata || null
+                        metadata: metadata || null,
+                        disappearAfterSeconds: disappearAfterSeconds || null,
+                        expiresAt,
                     },
                     include: {
                         sender: { select: { id: true, username: true, profilePictureUrl: true } }
@@ -162,7 +168,9 @@ class FriendSocketService {
                     metadata: message.metadata,
                     isRead: false,
                     createdAt: message.createdAt,
-                    tempId: tempId || null
+                    tempId: tempId || null,
+                    disappearAfterSeconds: disappearAfterSeconds || null,
+                    expiresAt: expiresAt,
                 };
 
                 // Broadcast to friend chat room
@@ -225,7 +233,7 @@ class FriendSocketService {
                     replyToId, replyToText, replyToSenderName,
                     mediaUrl, mediaType, mediaMimeType, mediaSize,
                     mediaDuration, mediaWaveformPeaks, linkPreview,
-                    metadata
+                    metadata, disappearAfterSeconds
                 } = data;
                 if (!friendshipId || !senderId || (!content && !mediaUrl && !metadata)) return;
 
@@ -240,6 +248,10 @@ class FriendSocketService {
 
                 const receiverId = friendship.requesterId === parseInt(senderId)
                     ? friendship.addresseeId : friendship.requesterId;
+
+                const expiresAt = disappearAfterSeconds
+                    ? new Date(Date.now() + disappearAfterSeconds * 1000)
+                    : null;
 
                 const message = await this.prisma.directMessage.create({
                     data: {
@@ -259,6 +271,8 @@ class FriendSocketService {
                         mediaWaveformPeaks: mediaWaveformPeaks || null,
                         linkPreview: linkPreview ? linkPreview : null,
                         metadata: metadata || null,
+                        disappearAfterSeconds: disappearAfterSeconds || null,
+                        expiresAt,
                     },
                     include: { sender: { select: { id: true, username: true, profilePictureUrl: true } } }
                 });
