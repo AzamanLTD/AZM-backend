@@ -21,7 +21,7 @@ remaining work. Treat this as an ongoing standing checklist, not a one-time pass
 | ✅ | `requirePermission` middleware | Applied on all sensitive mutating routes; audit completed July 2026 |
 | ✅ | Rate limiting | `authLimiter` on `/api/auth`, `financialLimiter` on trades, `generalLimiter` on public routes |
 | ✅ | JWT auth with refresh tokens | `protect` + `protectActive` middleware on all business routes |
-| 🔲 | Two-factor authentication | Not yet implemented — needed for payout changes + API key generation |
+| ✅ | Two-factor authentication | `securityController.js` — TOTP via speakeasy, QR code provisioning, integrated into saved MoMo + wallet transfers. Routes: `/api/security/2fa/setup`, `/verify`, `/disable` |
 | 🔲 | Session management screen | List active sessions/devices, "sign out everywhere" action |
 | ✅ | Dependency & secret scanning | GitHub Actions CI: `npm audit` job (fails on high/critical) + hardcoded secret pattern grep on every push |
 | ✅ | Secret encryption | API keys encrypted with SHA-256 + base64 in `BusinessMessagingConfig` |
