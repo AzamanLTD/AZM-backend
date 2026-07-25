@@ -53,6 +53,7 @@ function mountRoutes(app, {
     app.use('/api/contacts',             generalLimiter,   require('../../routes/contactRoutes'));
     app.use('/api/war-room',             generalLimiter,   require('../../routes/warRoomRoutes'));
     app.use('/api/ai',                   generalLimiter,   require('../../routes/aiRoutes'));
+    app.use('/api/admin/ai',            generalLimiter,   require('../../routes/aiRoutes'));
     app.use('/api/finance',              financialLimiter, require('../../routes/financeRoutes'));
     app.use('/api/p2p',                  financialLimiter, require('../../routes/p2pRoutes'));
     app.use('/api/friends',              generalLimiter,   require('../../routes/friendRoutes'));
