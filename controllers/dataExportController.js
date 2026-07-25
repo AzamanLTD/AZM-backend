@@ -86,7 +86,7 @@ exports.exportUserData = async (req, res) => {
 
             // Contacts (saved numbers)
             prisma.contact.findMany({
-                where: { savedByUserId: userId },
+                where: { userId },
                 select: { id: true, phoneNumber: true, displayName: true, createdAt: true },
                 take: limit,
             }),
@@ -100,7 +100,7 @@ exports.exportUserData = async (req, res) => {
 
             // P2P trades
             prisma.trade.findMany({
-                where: { OR: [{ buyerId: userId }, { sellerId: userId }] },
+                where: { OR: [{ userId }, { vendorId: userId }] },
                 orderBy: { createdAt: 'desc' },
                 take: limit,
             }),
