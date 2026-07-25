@@ -161,89 +161,9 @@ const {
     vendorStatus,
 } = createSocketServices(io, prisma, app);
 
-// --- ADMIN_DISPUTE_ESCROW (Private Susu Ecosystem, 2026-05-31) ───────────────
-// Cache the treasury wallet's User id at startup so cycle workers and
-// service code can look it up via req.app.get('azamanTreasuryUserId') in
-// O(1) instead of querying every cycle.
-//
-// Boot-time auto-release (Susu Sprint, 2026-06-01): free-tier hosting has
-// no Shell / Pre-Deploy hook, so we run the one-time, idempotent
-// migrate + seed step here at boot (infra/autoRelease.js). It only does
-// work when the treasury row is missing, never blocks request handling,
-// and never crashes the process. Once it seeds, the treasury cache below
-// resolves on its retry and Susu comes online — no redeploy required.
-//
-// Resilience: the treasury check is intentionally NON-FATAL. The treasury
-// row is required for the escrow-diversion path (Req 10.8) and self-default
-// seizure routing (Req 11.3), but a missing
-// row must NOT take down the entire backend (trades, wallet, chat, etc.).
-// If the seed hasn't run yet, we log a loud warning, leave
-// `azamanTreasuryUserId` unset, and let the Susu cycle workers skip
-// themselves (they already guard on the cache resolving — see the
-// startV2Workers poll below). Once `node infra/seed-susu-foundation.js`
-// runs and the service restarts, the id resolves and Susu comes online.
-// A self-heal retry also re-checks every 60s so a seed applied while the
-// process is live is picked up without a restart.
-const { autoRelease } = require('./infra/autoRelease');
-(async () => {
-    const cacheTreasury = async () => {
-        const treasury = await prisma.user.findUnique({
-            where: { username: 'azaman-treasury' },
-            select: { id: true },
-        });
-        if (treasury) {
-            app.set('azamanTreasuryUserId', treasury.id);
-            return treasury.id;
-        }
-        return null;
-    };
-
-    try {
-        // Run the boot release (installer converges schema; seed is
-        // internally gated on treasury-missing). This lands additive
-        // columns/tables on every deploy without prisma migrate (prod Neon
-        // is db push-managed behind a pooler — see infra/autoRelease.js).
-        // Skipped under test: CI applies the schema via `prisma db push`, and
-        // booting auth.test.js must not trigger the installer/seed path.
-        if (process.env.NODE_ENV !== 'test') {
-            await autoRelease(prisma);
-
-            // Apply business OS schema additions (Modules 01+03) idempotently.
-            // Same pattern as the susu overlay: plain DDL with IF NOT EXISTS guards.
-            try {
-                const { execSync } = require('child_process');
-                execSync('node infra/install-business-os-overlay.js', { stdio: 'inherit', timeout: 30000 });
-            } catch (e) {
-                logger.warn({ err: e }, 'business-os-overlay: boot-time install skipped');
-            }
-        }
-
-        // Resolve + cache the treasury id (seeded by autoRelease if it was
-        // missing).
-        const id = await cacheTreasury();
-
-        if (id) {
-            logger.info({ userId: id }, 'Susu: treasury wallet cached');
-        } else {
-            logger.warn('Susu: azaman-treasury User row not found after auto-release. Susu escrow/cycle features are DISABLED until it is seeded. Retrying every 60s.');
-            const retry = setInterval(async () => {
-                try {
-                    const rid = await cacheTreasury();
-                    if (rid) {
-                        logger.info({ userId: rid }, 'Susu: treasury wallet cached on retry');
-                        clearInterval(retry);
-                    }
-                } catch (e) {
-                    logger.warn({ err: e }, 'Susu: treasury retry failed');
-                }
-            }, 60_000);
-            retry.unref?.();
-        }
-    } catch (err) {
-        // Non-fatal: log and continue. Susu stays dark; everything else runs.
-        logger.warn({ err }, 'Susu: treasury wallet cache failed (non-fatal)');
-    }
-})();
+// ── Treasury boot (extracted to src/boot/treasury.js) ────────────────────────
+const { bootTreasury } = require('./src/boot/treasury');
+bootTreasury(app, prisma);
 
 // ── Service Registry (extracted to src/services/registry.js) ──────────────────
 const { registerServices } = require('./src/services/registry');
