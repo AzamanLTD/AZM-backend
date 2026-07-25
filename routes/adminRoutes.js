@@ -537,6 +537,154 @@ router.get('/marketplace-businesses/:bizId', async (req, res) => {
     }
 });
 
+
+
+// ─── ADMIN 2FA (Phase 3) ─────────────────────────────────────────────────────
+const speakeasy = require('speakeasy');
+const qrcode = require('qrcode');
+
+// POST /api/admin/2fa/setup — generate TOTP secret + QR code
+router.post('/2fa/setup', async (req, res) => {
+    try {
+        const prisma = req.app.get('prisma');
+        const userId = req.user.id;
+
+        // Generate new secret
+        const secret = speakeasy.generateSecret({
+            name: `AZAMAN Admin (${req.user.email || userId})`,
+            length: 32,
+        });
+
+        // Generate QR code data URL
+        const qrDataUrl = await qrcode.toDataURL(secret.otpauth_url);
+
+        // Temporarily store in user record (not verified yet)
+        await prisma.user.update({
+            where: { id: userId },
+            data: { twoFactorSecret: secret.base32 },
+        });
+
+        res.json({
+            success: true,
+            secret: secret.base32,
+            qrCode: qrDataUrl,
+            otpauthUrl: secret.otpauth_url,
+        });
+    } catch (err) {
+        logger.error('[AdminRoutes] 2FA setup error:', err);
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// POST /api/admin/2fa/verify — verify TOTP token and enable 2FA
+router.post('/2fa/verify', async (req, res) => {
+    try {
+        const prisma = req.app.get('prisma');
+        const userId = req.user.id;
+        const { token } = req.body;
+
+        if (!token) {
+            return res.status(400).json({ success: false, message: 'Token is required.' });
+        }
+
+        const user = await prisma.user.findUnique({
+            where: { id: userId },
+            select: { twoFactorSecret: true, twoFactorEnabled: true },
+        });
+
+        if (!user?.twoFactorSecret) {
+            return res.status(400).json({ success: false, message: '2FA not set up. Call /2fa/setup first.' });
+        }
+
+        if (user.twoFactorEnabled) {
+            return res.status(400).json({ success: false, message: '2FA is already enabled.' });
+        }
+
+        const verified = speakeasy.totp.verify({
+            secret: user.twoFactorSecret,
+            encoding: 'base32',
+            token,
+            window: 1,
+        });
+
+        if (!verified) {
+            return res.status(400).json({ success: false, message: 'Invalid token. Please try again.' });
+        }
+
+        await prisma.user.update({
+            where: { id: userId },
+            data: { twoFactorEnabled: true },
+        });
+
+        res.json({ success: true, message: '2FA enabled successfully.' });
+    } catch (err) {
+        logger.error('[AdminRoutes] 2FA verify error:', err);
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// POST /api/admin/2fa/disable — disable 2FA (requires current token)
+router.post('/2fa/disable', async (req, res) => {
+    try {
+        const prisma = req.app.get('prisma');
+        const userId = req.user.id;
+        const { token } = req.body;
+
+        if (!token) {
+            return res.status(400).json({ success: false, message: 'Token is required to disable 2FA.' });
+        }
+
+        const user = await prisma.user.findUnique({
+            where: { id: userId },
+            select: { twoFactorSecret: true, twoFactorEnabled: true },
+        });
+
+        if (!user?.twoFactorEnabled) {
+            return res.status(400).json({ success: false, message: '2FA is not enabled.' });
+        }
+
+        const verified = speakeasy.totp.verify({
+            secret: user.twoFactorSecret,
+            encoding: 'base32',
+            token,
+            window: 1,
+        });
+
+        if (!verified) {
+            return res.status(400).json({ success: false, message: 'Invalid token.' });
+        }
+
+        await prisma.user.update({
+            where: { id: userId },
+            data: { twoFactorEnabled: false, twoFactorSecret: null },
+        });
+
+        res.json({ success: true, message: '2FA disabled.' });
+    } catch (err) {
+        logger.error('[AdminRoutes] 2FA disable error:', err);
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
+// GET /api/admin/2fa/status — check 2FA status
+router.get('/2fa/status', async (req, res) => {
+    try {
+        const prisma = req.app.get('prisma');
+        const user = await prisma.user.findUnique({
+            where: { id: req.user.id },
+            select: { twoFactorEnabled: true, twoFactorSecret: true },
+        });
+
+        res.json({
+            success: true,
+            enabled: user?.twoFactorEnabled || false,
+            hasSecret: !!user?.twoFactorSecret,
+        });
+    } catch (err) {
+        res.status(500).json({ success: false, message: err.message });
+    }
+});
+
 module.exports = router;
 
 // ── Payment Provider Health (Phase 2: Failover) ─────────────────────────────
