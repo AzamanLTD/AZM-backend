@@ -199,12 +199,13 @@ const IS_TEST_ENV = process.env.NODE_ENV === 'test';
 
 // ── Worker Registry (extracted to src/workers/index.js) ──────────────────────
 const { startWorkers } = require('./src/workers/index');
-const { tradeWorker, withdrawalReconciliationWorker } = startWorkers(app, {
+const workersPromise = startWorkers(app, {
     prisma,
     io,
     workerStatus,
     tradeSocketService,
     mtnDisbursementService,
+    paymentFailoverService,
     emailService,
     smsService,
     notificationService,
@@ -214,6 +215,10 @@ const { tradeWorker, withdrawalReconciliationWorker } = startWorkers(app, {
     azmAuctionService,
     susuInitiationService,
 });
+let tradeWorker, withdrawalReconciliationWorker;
+workersPromise.then(result => {
+    ({ tradeWorker, withdrawalReconciliationWorker } = result);
+}).catch(err => logger.error({ err }, 'Worker startup error'));
 
 // ── Socket helpers (pushIfOffline, emitBalanceUpdate) ──
 const pushIfOffline = createPushIfOffline(io, prisma);
@@ -226,18 +231,22 @@ app.set('vendorStatus', vendorStatus);
 app.set('pushIfOffline', pushIfOffline);
 app.set('emitBalanceUpdate', emitBalanceUpdate);
 
-// ── Storefront Stake Worker ──────────────────────────────────────────────────
+// ── Storefront Stake + Keep-Alive + Stories cron (registered via scheduler) ──
 const storefrontStakeWorker = require('./workers/storefrontStakeWorker');
-storefrontStakeWorker.start(prisma);
-
-// ── Keep-Alive Worker (prevents external services from sleeping) ─────────────
 const keepAliveWorker = require('./workers/keepAliveWorker');
+const { getScheduler } = require('./src/lib/bullScheduler');
+(async () => {
+    const scheduler = getScheduler();
+    // Storefront stake: daily tier check + hourly unstake queue
+    await scheduler.register('storefront-stake-daily', String(24 * 60 * 60 * 1000), () => storefrontStakeWorker.autoDowngradeLapsedStakes(prisma));
+    // keepAliveWorker exports an object wrapper; call its start() for now
+    // (pingAll is internal — the wrapper handles its own timing in fallback mode)
+    // Stories expiration
+    await scheduler.register('stories-expire', '*/15 * * * *', () => app.get('storyService').expireOldStories().catch(err => logger.error({ err }, 'StoryCron error')));
+})();
+// Start keep-alive and storefront hourly via their own start() (they manage intervals internally)
 keepAliveWorker.start();
-
-// Stories expiration cron
-cron.schedule('*/15 * * * *', () => {
-    app.get('storyService').expireOldStories().catch(err => logger.error({ err }, 'StoryCron error'));
-});
+storefrontStakeWorker.start(prisma);
 
 // ══════════════════════════════════════════════════════════════════════════════
 // API VERSIONING + RESPONSE ENVELOPE (additive, non-breaking)
@@ -316,6 +325,14 @@ const shutdown = async (signal) => {
     tradeWorker.stop();
     if (typeof withdrawalReconciliationWorker?.stop === 'function') {
         withdrawalReconciliationWorker.stop();
+    }
+
+    // Close BullMQ scheduler (all workers, queues, Redis connection)
+    try {
+        const { getScheduler } = require('./src/lib/bullScheduler');
+        await getScheduler().closeAll();
+    } catch (err) {
+        logger.error({ err }, 'Shutdown: scheduler close error');
     }
 
     // Close socket connections

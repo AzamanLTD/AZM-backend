@@ -1,15 +1,19 @@
 /**
- * Worker Registry — instantiates and starts all background workers.
+ * Worker Registry — registers all background workers with the BullMQ
+ * distributed scheduler.
  *
- * Extracted from server.js as part of Phase 1 modularization.
- * Workers are NOT started in test mode (NODE_ENV === 'test') to avoid
- * open handles hanging the jest process.
+ * When REDIS_URL is set, BullMQ guarantees each scheduled tick fires on
+ * exactly ONE server instance (Redis-backed distributed locking). When
+ * REDIS_URL is absent, the scheduler falls back to in-process timers /
+ * node-cron — identical to the pre-BullMQ behavior.
+ *
+ * Workers are NOT started in test mode (NODE_ENV === 'test').
  *
  * @param {import('express').Express} app  - Express app (for app.set/get)
  * @param {object} deps                  - All service/dependency instances
  * @returns {{ tradeWorker, withdrawalReconciliationWorker }}
  */
-function startWorkers(app, {
+async function startWorkers(app, {
     prisma,
     io,
     workerStatus,
@@ -26,67 +30,101 @@ function startWorkers(app, {
     susuInitiationService,
 }) {
     const logger = require('../../src/config/logger');
-    const cron   = require('node-cron');
-
     const IS_TEST_ENV = process.env.NODE_ENV === 'test';
-    const startWorker = (w) => { if (!IS_TEST_ENV) w.start(); };
 
-    // ── Core Workers ──────────────────────────────────────────────────────────
+    // ── Initialise the distributed scheduler ──────────────────────────────
+    const { getScheduler } = require('../../src/lib/bullScheduler');
+    const scheduler = getScheduler();
+    await scheduler.init();
+    app.set('scheduler', scheduler);
+
+    // Helper: register a worker's tick handler with the scheduler
+    const register = async (name, schedule, handler, opts) => {
+        if (IS_TEST_ENV) return;
+        await scheduler.register(name, schedule, handler, opts);
+    };
+
+    // ── Instantiate workers (constructors are side-effect free) ──────────
     const TradeWorker = require('../../workers/tradeWorker');
     const tradeWorker = new TradeWorker(prisma, io, tradeSocketService);
 
     const LeaderboardWorker = require('../../workers/leaderboardWorker');
     const leaderboardWorker = new LeaderboardWorker(prisma, io);
-    startWorker(leaderboardWorker);
 
     const AnalyticsWorker = require('../../workers/analyticsWorker');
     const analyticsWorker = new AnalyticsWorker(prisma);
-    startWorker(analyticsWorker);
 
     const CfoWorker = require('../../workers/cfoWorker');
     const cfoWorker = new CfoWorker(prisma, io);
-    startWorker(cfoWorker);
 
     const SavingsWorker = require('../../workers/savingsWorker');
     const savingsWorker = new SavingsWorker(prisma, io);
-    startWorker(savingsWorker);
 
     const WithdrawalReconciliationWorker = require('../../workers/withdrawalReconciliationWorker');
     const withdrawalReconciliationWorker =
         new WithdrawalReconciliationWorker(prisma, io, paymentFailoverService || mtnDisbursementService, emailService, smsService);
-    startWorker(withdrawalReconciliationWorker);
 
-    // ── Payout Batch Worker (Phase Q8) ─────────────────────────────────────────
-    // Scans PENDING fiat withdrawals and auto-dispatches when pool has liquidity
-    // AND amount is below the admin-configured threshold. Flags oversized or
-    // under-funded withdrawals as NEEDS_MANUAL_REVIEW for the War Room.
+    // ── Payout Batch Worker (Phase Q8) ─────────────────────────────────────
     const PayoutBatchWorker = require('../../workers/payoutBatchWorker');
     const payoutBatchWorker = new PayoutBatchWorker(prisma, io, paymentFailoverService || mtnDisbursementService, notificationService);
-    startWorker(payoutBatchWorker);
     app.set('payoutBatchWorker', payoutBatchWorker);
 
-    // ── Smart Escrow Expiry Worker ─────────────────────────────────────────────
-    // Sweeps DRAFT escrows past 24h and FUNDED escrows past 30d of inactivity
-    // (refunding the payer), every 30 minutes. No-op safe in test mode.
+    // ── Smart Escrow Expiry Worker ─────────────────────────────────────────
     const EscrowExpiryWorker = require('../../workers/escrowExpiryWorker');
     const escrowExpiryWorker = new EscrowExpiryWorker(prisma, io, notificationService);
-    startWorker(escrowExpiryWorker);
     app.set('escrowExpiryWorker', escrowExpiryWorker);
 
-    // ── Master Sprint Workers (Vault / Susu / Smart Route / AZM Auction) ──────
+    // ── Master Sprint Workers ──────────────────────────────────────────────
     const VaultWorker = require('../../workers/vaultWorker');
     const vaultWorker = new VaultWorker(prisma, vaultService, notificationService);
-    startWorker(vaultWorker);
 
     const SusuWorker = require('../../workers/susuWorker');
     const susuWorker = new SusuWorker(prisma, susuService);
-    startWorker(susuWorker);
 
-    // ── Phase 3 (private-susu-ecosystem) workers ──────────────────────────────
-    // V2 cycle scheduler (60s cadence) handles SusuGroups with contractVersion
-    // set. Legacy susuWorker above continues to handle pre-Phase-3 SusuGroups
-    // whose contractVersion is null. Reminder cron + PoR expiry sweep complete
-    // the Phase 3 surface. All three workers are no-ops in test mode.
+    const SmartRouteWorker = require('../../workers/smartRouteWorker');
+    const smartRouteWorker = new SmartRouteWorker(prisma, smartRouteService);
+
+    const AzmAuctionWorker = require('../../workers/azmAuctionWorker');
+    const azmAuctionWorker = new AzmAuctionWorker(prisma, azmAuctionService);
+
+    // ── Register all workers with the scheduler ───────────────────────────
+    // Cron-based workers (use cron expressions)
+    await register('leaderboard',        '0 0 * * 0',   () => leaderboardWorker.computeWeeklyLeaderboard());
+    await register('analytics',         '0 * * * *',    () => analyticsWorker.computeHourlyAnalytics());
+    await register('cfo',               '0 * * * *',    () => cfoWorker.runCfoCycle());
+
+    // Interval-based workers (use millisecond intervals)
+    await register('savings',           String(60 * 60 * 1000),       () => savingsWorker._checkReminders());
+    await register('withdrawal-recon',  String(5 * 60 * 1000),        () => withdrawalReconciliationWorker._tick());
+    await register('payout-batch',      String(2 * 60 * 1000),        () => payoutBatchWorker._tick());
+    await register('escrow-expiry',     String(30 * 60 * 1000),       () => escrowExpiryWorker._tick());
+    await register('vault',             String(60 * 60 * 1000),       () => vaultWorker._tick());
+    await register('susu',              String(60 * 1000),            () => susuWorker._tick());
+    await register('smart-route',       String(60 * 1000),            () => smartRouteWorker._tick());
+    await register('azm-auction',       String(5 * 60 * 1000),        () => azmAuctionWorker._tick());
+
+    // ── Marketplace cron schedules ───────────────────────────────────────
+    const noShowWorker = require('../../workers/reservationNoShowWorker');
+    await register('no-show-sweep',     '0 * * * *',   async () => {
+        const results = await noShowWorker.sweepAll(prisma);
+        logger.info({ results }, 'NoShowWorker: sweep complete');
+    });
+
+    const { sweepTransitReminders } = require('../../workers/transitReminderWorker');
+    const { sweepExpiredAds } = require('../../workers/businessAdExpiryWorker');
+    await register('transit-reminders', '*/15 * * * *', () => sweepTransitReminders(prisma));
+    await register('expired-ads',        '*/30 * * * *', () => sweepExpiredAds(prisma));
+
+    // Webhook retry queue — process stuck RETRYING deliveries every 2 min
+    const webhookDispatcher = require('../../services/webhookDispatcher');
+    await register('webhook-retry',     '*/2 * * * *',  async () => {
+        const count = await webhookDispatcher.processRetryQueue();
+        if (count > 0) logger.info({ count }, 'WebhookRetry: processed stuck deliveries');
+    });
+
+    // ── Phase 3 (private-susu-ecosystem) workers ──────────────────────────
+    // V2 cycle scheduler (60s cadence) handles SusuGroups with contractVersion.
+    // Reminder cron + PoR expiry sweep complete the Phase 3 surface.
     if (!IS_TEST_ENV) {
         const SusuCycleService          = require('../../services/susu/susuCycle.service');
         const SusuCycleSchedulerV2      = require('../../workers/susuCycleSchedulerV2');
@@ -95,8 +133,6 @@ function startWorkers(app, {
 
         // Wait until the treasury cache has resolved before instantiating the
         // cycle service — it depends on azamanTreasuryUserId.
-        // Resilience: the treasury seed may land after boot. Rather than give up
-        // after 10s, we poll patiently (every 5s for up to 30 min).
         const startV2Workers = async () => {
             const start = Date.now();
             const MAX_WAIT_MS = 30 * 60 * 1000;
@@ -105,7 +141,7 @@ function startWorkers(app, {
             }
             const treasuryUserId = app.get('azamanTreasuryUserId');
             if (!treasuryUserId) {
-                logger.warn('SusuV2 Workers: treasury cache not resolved within 30 min. Cycle/reminder/PoR workers NOT started. Seed the treasury row and restart the service. Rest of backend unaffected.');
+                logger.warn('SusuV2 Workers: treasury cache not resolved within 30 min. Cycle/reminder/PoR workers NOT started.');
                 return;
             }
             const susuCycleService = new SusuCycleService(prisma, {
@@ -119,89 +155,57 @@ function startWorkers(app, {
             app.set('susuCycleService', susuCycleService);
 
             const cycleSchedulerV2 = new SusuCycleSchedulerV2(prisma, susuCycleService);
-            cycleSchedulerV2.start();
-            app.set('susuCycleSchedulerV2', cycleSchedulerV2);
-
             const reminderCron = new SusuReminderCron(prisma, notificationService);
-            reminderCron.start();
-            app.set('susuReminderCron', reminderCron);
-
             const porExpirySweep = new PorExpirySweep(prisma, app.get('susuMemberService'), notificationService);
-            porExpirySweep.start();
+
+            // Register with scheduler instead of calling .start() directly
+            await scheduler.register('susu-cycle-v2',   String(60 * 1000), () => cycleSchedulerV2._tick());
+            await scheduler.register('susu-reminder',    String(5 * 60 * 1000), () => reminderCron._tick());
+            await scheduler.register('por-expiry',       String(60 * 1000), () => porExpirySweep._tick());
+
+            app.set('susuCycleSchedulerV2', cycleSchedulerV2);
+            app.set('susuReminderCron', reminderCron);
             app.set('porExpirySweep', porExpirySweep);
+
+            logger.info('[SusuV2] Workers registered with distributed scheduler');
         };
         startV2Workers().catch(err => logger.error({ err }, 'SusuV2 workers startup error'));
-    }
 
-    const SmartRouteWorker = require('../../workers/smartRouteWorker');
-    const smartRouteWorker = new SmartRouteWorker(prisma, smartRouteService);
-    startWorker(smartRouteWorker);
-
-    // ── Susu initiation countdown sweep (every 60s) ───────────────────────────
-    // Independent of the treasury cache; starts unconditionally. No-op in test.
-    if (!IS_TEST_ENV) {
+        // Susu initiation countdown sweep (every 60s) — independent of treasury
         const SusuInitiationSweep = require('../../workers/susuInitiationSweep');
         const susuInitiationSweep = new SusuInitiationSweep(prisma, susuInitiationService);
-        susuInitiationSweep.start();
+        await scheduler.register('susu-initiation', String(60 * 1000), () => susuInitiationSweep._tick());
         app.set('susuInitiationSweep', susuInitiationSweep);
     }
 
-    const AzmAuctionWorker = require('../../workers/azmAuctionWorker');
-    const azmAuctionWorker = new AzmAuctionWorker(prisma, azmAuctionService);
-    startWorker(azmAuctionWorker);
-
-    // ── Marketplace cron schedules ───────────────────────────────────────────
+    // ── Graceful shutdown wiring ───────────────────────────────────────────
+    // Close all BullMQ workers + queues on process exit.
     if (!IS_TEST_ENV) {
-        // No-Show Penalty Sweep — every hour
-        const noShowWorker = require('../../workers/reservationNoShowWorker');
-        cron.schedule('0 * * * *', async () => {
-            try {
-                logger.info('NoShowWorker: running scheduled sweep');
-                const results = await noShowWorker.sweepAll(prisma);
-                logger.info({ results }, 'NoShowWorker: sweep complete');
-            } catch (err) {
-                logger.error({ err }, 'NoShowWorker: sweep failed');
-            }
-        });
-
-        // Transit reminders + expired ad sweep
-        const { sweepTransitReminders } = require('../../workers/transitReminderWorker');
-        const { sweepExpiredAds } = require('../../workers/businessAdExpiryWorker');
-        cron.schedule('*/15 * * * *', () => sweepTransitReminders(prisma));
-        cron.schedule('*/30 * * * *', () => sweepExpiredAds(prisma));
-
-        // Webhook retry queue — process stuck RETRYING deliveries every 2 min
-        const webhookDispatcher = require('../../services/webhookDispatcher');
-        cron.schedule('*/2 * * * *', async () => {
-            try {
-                const count = await webhookDispatcher.processRetryQueue();
-                if (count > 0) logger.info({ count }, 'WebhookRetry: processed stuck deliveries');
-            } catch (e) {
-                logger.warn({ err: e }, 'WebhookRetry error');
-            }
-        });
+        const gracefulShutdown = async () => {
+            await scheduler.closeAll();
+            process.exit(0);
+        };
+        process.on('SIGTERM', gracefulShutdown);
+        process.on('SIGINT', gracefulShutdown);
     }
 
-    // ── D-05: record worker liveness for GET /health ──────────────────────────
+    // ── D-05: record worker liveness for GET /health ──────────────────────
     // tradeWorker is special: instantiated here but only .start()'d in the
     // server.listen callback. Seeded as 'pending_listen', flipped to 'running'
     // from that callback.
     Object.assign(workerStatus, {
-        leaderboardWorker: 'running',
-        analyticsWorker: 'running',
-        cfoWorker: 'running',
-        savingsWorker: 'running',
-        withdrawalReconciliationWorker: 'running',
-        payoutBatchWorker: 'running',
-        vaultWorker: 'running',
-        susuWorker: 'running',
-        smartRouteWorker: 'running',
-        azmAuctionWorker: 'running',
-        tradeWorker: 'pending_listen',
+        leaderboardWorker: IS_TEST_ENV ? 'disabled_in_test' : 'running',
+        analyticsWorker: IS_TEST_ENV ? 'disabled_in_test' : 'running',
+        cfoWorker: IS_TEST_ENV ? 'disabled_in_test' : 'running',
+        savingsWorker: IS_TEST_ENV ? 'disabled_in_test' : 'running',
+        withdrawalReconciliationWorker: IS_TEST_ENV ? 'disabled_in_test' : 'running',
+        payoutBatchWorker: IS_TEST_ENV ? 'disabled_in_test' : 'running',
+        vaultWorker: IS_TEST_ENV ? 'disabled_in_test' : 'running',
+        susuWorker: IS_TEST_ENV ? 'disabled_in_test' : 'running',
+        smartRouteWorker: IS_TEST_ENV ? 'disabled_in_test' : 'running',
+        azmAuctionWorker: IS_TEST_ENV ? 'disabled_in_test' : 'running',
+        tradeWorker: IS_TEST_ENV ? 'disabled_in_test' : 'pending_listen',
     });
-    if (IS_TEST_ENV) {
-        for (const k of Object.keys(workerStatus)) workerStatus[k] = 'disabled_in_test';
-    }
 
     return { tradeWorker, withdrawalReconciliationWorker };
 }
