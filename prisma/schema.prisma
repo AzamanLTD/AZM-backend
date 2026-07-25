@@ -2498,6 +2498,9 @@ model BusinessProfile {
   // Business OS relations
   employees          BusinessEmployee[]
   businessConversations BusinessConversation[]
+  suppliers     Supplier[]
+  purchaseOrders PurchaseOrder[]
+  stockCounts  StockCount[]
   shifts             Shift[]
   shiftSwaps         ShiftSwap[]
   timeOffRequests    TimeOffRequest[]
@@ -2879,6 +2882,13 @@ model BusinessProduct {
   isAvailable      Boolean  @default(true) // real-time sold-out toggle
   preparationMins  Int? // estimated prep time in minutes
   tags             String[] // ["SPICY","VEGAN","GLUTEN_FREE","POPULAR","NEW"]
+  // Phase 3 Retail: barcode/SKU + stock tracking
+  sku              String? @unique @db.VarChar(50) // Stock Keeping Unit
+  barcode          String? @db.VarChar(100) // Barcode (EAN/UPC/QR)
+  costPrice        Decimal? @db.Decimal(20, 8) // Cost for margin calculation
+  stockQty         Int?    @default(0) // Current stock (null = untracked)
+  lowStockThreshold Int?   @default(5) // Low-stock alert threshold
+  supplierId       String? // Linked Supplier for POs
   calorieCount     Int?
   variants         Json? // [{ label:"Small", priceDelta:0 },{ label:"Large", priceDelta:2.5 }]
   modifierGroups   Json? // [{ name:"Add-ons", max:3, options:[{ name:"Extra Sauce", price:0.5 }] }]
@@ -2905,6 +2915,95 @@ model BusinessProduct {
 // Tracks the state of a business order. NEVER moves USDC — all financial
 // mutations live in escrowService.js. Linked 1:1 to a SmartEscrow and Ticket.
 // =============================================================================
+
+// =============================================================================
+// PHASE 3 RETAIL: Suppliers, Purchase Orders, Stock Counts
+// =============================================================================
+
+model Supplier {
+  id                String   @id @default(uuid())
+  businessProfileId String
+  name              String   @db.VarChar(200)
+  contactName       String?  @db.VarChar(200)
+  email             String?  @db.VarChar(200)
+  phone             String?  @db.VarChar(50)
+  address           String?  @db.VarChar(500)
+  notes             String?  @db.VarChar(1000)
+  isActive          Boolean  @default(true)
+  businessProfile   BusinessProfile @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+  products          BusinessProduct[] @relation("SupplierProducts")
+  purchaseOrders    PurchaseOrder[]
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+  @@index([businessProfileId])
+}
+
+model PurchaseOrder {
+  id                String   @id @default(uuid())
+  businessProfileId String
+  poNumber          String   @unique @db.VarChar(50)
+  supplierId        String
+  status            String   @default("DRAFT") // DRAFT, SUBMITTED, RECEIVED, CANCELLED
+  totalCost         Decimal  @default(0) @db.Decimal(20, 8)
+  notes             String?  @db.VarChar(1000)
+  expectedDate      DateTime?
+  receivedDate      DateTime?
+  createdById       Int
+  businessProfile   BusinessProfile @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+  supplier          Supplier       @relation(fields: [supplierId], references: [id])
+  items             PurchaseOrderItem[]
+  createdAt         DateTime       @default(now())
+  updatedAt         DateTime       @updatedAt
+  @@index([businessProfileId])
+  @@index([supplierId])
+  @@index([status])
+}
+
+model PurchaseOrderItem {
+  id              String         @id @default(uuid())
+  purchaseOrderId String
+  productId       String?
+  productName     String         @db.VarChar(200)
+  sku             String?        @db.VarChar(50)
+  quantity        Int            @default(1)
+  unitCost        Decimal        @default(0) @db.Decimal(20, 8)
+  lineTotal       Decimal        @default(0) @db.Decimal(20, 8)
+  receivedQty     Int            @default(0)
+  purchaseOrder   PurchaseOrder  @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
+  createdAt       DateTime       @default(now())
+  @@index([purchaseOrderId])
+}
+
+model StockCount {
+  id                String   @id @default(uuid())
+  businessProfileId String
+  countNumber       String   @unique @db.VarChar(50)
+  status            String   @default("OPEN") // OPEN, COUNTED, RECONCILED
+  notes             String?  @db.VarChar(1000)
+  createdById       Int
+  reconciledAt      DateTime?
+  businessProfile   BusinessProfile @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+  items             StockCountItem[]
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+  @@index([businessProfileId])
+  @@index([status])
+}
+
+model StockCountItem {
+  id              String     @id @default(uuid())
+  stockCountId    String
+  productId       String
+  systemQty       Int        @default(0)
+  countedQty      Int?
+  discrepancy     Int?
+  notes           String?    @db.VarChar(500)
+  stockCount      StockCount @relation(fields: [stockCountId], references: [id], onDelete: Cascade)
+  createdAt       DateTime   @default(now())
+  @@index([stockCountId])
+  @@index([productId])
+}
+
 model BusinessOrder {
   id                String              @id @default(uuid())
   businessProfileId String

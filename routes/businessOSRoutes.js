@@ -3997,4 +3997,316 @@ router.get('/transit/trips', wrap(async (req, res) => {
 }));
 
 
+
+// =============================================================================
+// PHASE 3 RETAIL: Suppliers, Purchase Orders, Stock Counts, Barcode/SKU
+// =============================================================================
+
+// ── Suppliers ─────────────────────────────────────────────────────────────────
+
+// GET /api/business-os/retail/suppliers
+router.get('/retail/suppliers', wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+    if (!bpId) return res.status(404).json({ success: false, message: 'No business profile found.' });
+
+    const suppliers = await prisma.supplier.findMany({
+        where: { businessProfileId: bpId },
+        orderBy: { name: 'asc' },
+    });
+    res.json({ success: true, suppliers });
+}));
+
+// POST /api/business-os/retail/suppliers
+router.post('/retail/suppliers', wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+    if (!bpId) return res.status(404).json({ success: false, message: 'No business profile found.' });
+
+    const { name, contactName, email, phone, address, notes } = req.body;
+    if (!name) return res.status(400).json({ success: false, message: 'Supplier name is required.' });
+
+    const supplier = await prisma.supplier.create({
+        data: { businessProfileId: bpId, name, contactName, email, phone, address, notes },
+    });
+    res.json({ success: true, supplier });
+}));
+
+// PATCH /api/business-os/retail/suppliers/:id
+router.patch('/retail/suppliers/:id', wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+    const { id } = req.params;
+
+    const supplier = await prisma.supplier.update({
+        where: { id, businessProfileId: bpId },
+        data: req.body,
+    });
+    res.json({ success: true, supplier });
+}));
+
+// DELETE /api/business-os/retail/suppliers/:id
+router.delete('/retail/suppliers/:id', wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+    const { id } = req.params;
+
+    await prisma.supplier.delete({ where: { id, businessProfileId: bpId } });
+    res.json({ success: true });
+}));
+
+// ── Purchase Orders ──────────────────────────────────────────────────────────
+
+// GET /api/business-os/retail/purchase-orders
+router.get('/retail/purchase-orders', wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+    if (!bpId) return res.status(404).json({ success: false, message: 'No business profile found.' });
+
+    const orders = await prisma.purchaseOrder.findMany({
+        where: { businessProfileId: bpId },
+        include: { supplier: true, items: true },
+        orderBy: { createdAt: 'desc' },
+        take: 100,
+    });
+    res.json({ success: true, purchaseOrders: orders });
+}));
+
+// POST /api/business-os/retail/purchase-orders
+router.post('/retail/purchase-orders', wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+    if (!bpId) return res.status(404).json({ success: false, message: 'No business profile found.' });
+
+    const { supplierId, items, notes, expectedDate } = req.body;
+    if (!supplierId) return res.status(400).json({ success: false, message: 'Supplier is required.' });
+    if (!items || !Array.isArray(items) || items.length === 0)
+        return res.status(400).json({ success: false, message: 'At least one item is required.' });
+
+    // Generate PO number
+    const count = await prisma.purchaseOrder.count({ where: { businessProfileId: bpId } });
+    const poNumber = `PO-${String(count + 1).padStart(5, '0')}`;
+
+    // Calculate totals
+    const processedItems = items.map(item => ({
+        productId: item.productId || null,
+        productName: item.productName,
+        sku: item.sku || null,
+        quantity: parseInt(item.quantity, 10) || 1,
+        unitCost: parseFloat(item.unitCost) || 0,
+        lineTotal: (parseInt(item.quantity, 10) || 1) * (parseFloat(item.unitCost) || 0),
+    }));
+    const totalCost = processedItems.reduce((sum, item) => sum + item.lineTotal, 0);
+
+    const po = await prisma.purchaseOrder.create({
+        data: {
+            businessProfileId: bpId,
+            poNumber,
+            supplierId,
+            status: 'SUBMITTED',
+            totalCost,
+            notes,
+            expectedDate: expectedDate ? new Date(expectedDate) : null,
+            createdById: req.user.id,
+            items: { create: processedItems },
+        },
+        include: { supplier: true, items: true },
+    });
+    res.json({ success: true, purchaseOrder: po });
+}));
+
+// PATCH /api/business-os/retail/purchase-orders/:id (status update)
+router.patch('/retail/purchase-orders/:id', wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+    const { id } = req.params;
+    const { status, notes, expectedDate } = req.body;
+
+    const updateData = {};
+    if (status) updateData.status = status;
+    if (notes !== undefined) updateData.notes = notes;
+    if (expectedDate !== undefined) updateData.expectedDate = expectedDate ? new Date(expectedDate) : null;
+    if (status === 'RECEIVED') updateData.receivedDate = new Date();
+
+    const po = await prisma.purchaseOrder.update({
+        where: { id, businessProfileId: bpId },
+        data: updateData,
+        include: { supplier: true, items: true },
+    });
+
+    // On RECEIVED, update product stock quantities
+    if (status === 'RECEIVED' && po.items) {
+        for (const item of po.items) {
+            if (item.productId) {
+                const product = await prisma.businessProduct.findUnique({ where: { id: item.productId } });
+                if (product) {
+                    const currentQty = product.stockQty || 0;
+                    const receivedQty = item.quantity;
+                    await prisma.businessProduct.update({
+                        where: { id: item.productId },
+                        data: { stockQty: currentQty + receivedQty },
+                    });
+                }
+            }
+        }
+    }
+
+    res.json({ success: true, purchaseOrder: po });
+}));
+
+// ── Stock Counts ─────────────────────────────────────────────────────────────
+
+// GET /api/business-os/retail/stock-counts
+router.get('/retail/stock-counts', wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+    if (!bpId) return res.status(404).json({ success: false, message: 'No business profile found.' });
+
+    const counts = await prisma.stockCount.findMany({
+        where: { businessProfileId: bpId },
+        include: { items: { include: { } } },
+        orderBy: { createdAt: 'desc' },
+        take: 50,
+    });
+    res.json({ success: true, stockCounts: counts });
+}));
+
+// POST /api/business-os/retail/stock-counts — create a new count with all products
+router.post('/retail/stock-counts', wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+    if (!bpId) return res.status(404).json({ success: false, message: 'No business profile found.' });
+
+    const { notes } = req.body;
+
+    // Generate count number
+    const count = await prisma.stockCount.count({ where: { businessProfileId: bpId } });
+    const countNumber = `SC-${String(count + 1).padStart(5, '0')}`;
+
+    // Get all products that have stock tracking enabled
+    const products = await prisma.businessProduct.findMany({
+        where: { businessProfileId: bpId, isActive: true, stockQty: { not: null } },
+        select: { id: true, stockQty: true, name: true, sku: true },
+    });
+
+    const stockCount = await prisma.stockCount.create({
+        data: {
+            businessProfileId: bpId,
+            countNumber,
+            status: 'OPEN',
+            notes,
+            createdById: req.user.id,
+            items: {
+                create: products.map(p => ({
+                    productId: p.id,
+                    systemQty: p.stockQty || 0,
+                })),
+            },
+        },
+        include: { items: true },
+    });
+    res.json({ success: true, stockCount });
+}));
+
+// PATCH /api/business-os/retail/stock-counts/:id/items/:itemId — record counted qty
+router.patch('/retail/stock-counts/:id/items/:itemId', wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+    const { id, itemId } = req.params;
+    const { countedQty, notes: itemNotes } = req.body;
+
+    const item = await prisma.stockCountItem.findFirst({
+        where: { id: itemId, stockCountId: id, stockCount: { businessProfileId: bpId } },
+        include: { stockCount: true },
+    });
+    if (!item) return res.status(404).json({ success: false, message: 'Stock count item not found.' });
+
+    const discrepancy = countedQty !== null && countedQty !== undefined
+        ? parseInt(countedQty, 10) - item.systemQty
+        : null;
+
+    const updated = await prisma.stockCountItem.update({
+        where: { id: itemId },
+        data: { countedQty: countedQty !== null && countedQty !== undefined ? parseInt(countedQty, 10) : null, discrepancy, notes: itemNotes },
+    });
+    res.json({ success: true, item: updated });
+}));
+
+// POST /api/business-os/retail/stock-counts/:id/reconcile — apply adjustments to product stock
+router.post('/retail/stock-counts/:id/reconcile', wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+    const { id } = req.params;
+
+    const stockCount = await prisma.stockCount.findFirst({
+        where: { id, businessProfileId: bpId },
+        include: { items: true },
+    });
+    if (!stockCount) return res.status(404).json({ success: false, message: 'Stock count not found.' });
+    if (stockCount.status === 'RECONCILED') return res.status(400).json({ success: false, message: 'Already reconciled.' });
+
+    // Apply counted quantities to products
+    for (const item of stockCount.items) {
+        if (item.countedQty !== null && item.countedQty !== undefined) {
+            await prisma.businessProduct.update({
+                where: { id: item.productId },
+                data: { stockQty: item.countedQty },
+            });
+        }
+    }
+
+    const updated = await prisma.stockCount.update({
+        where: { id },
+        data: { status: 'RECONCILED', reconciledAt: new Date() },
+        include: { items: true },
+    });
+    res.json({ success: true, stockCount: updated });
+}));
+
+// ── Low Stock Alert ──────────────────────────────────────────────────────────
+
+// GET /api/business-os/retail/low-stock
+router.get('/retail/low-stock', wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+    if (!bpId) return res.status(404).json({ success: false, message: 'No business profile found.' });
+
+    const products = await prisma.businessProduct.findMany({
+        where: {
+            businessProfileId: bpId,
+            isActive: true,
+            stockQty: { not: null },
+        },
+        select: { id: true, name: true, sku: true, stockQty: true, lowStockThreshold: true, priceUsdc: true },
+    });
+
+    const lowStockItems = products.filter(p => (p.stockQty || 0) <= (p.lowStockThreshold || 5));
+    res.json({ success: true, items: lowStockItems });
+}));
+
+// ── Product Barcode/SKU Update ────────────────────────────────────────────────
+
+// PATCH /api/business-os/retail/products/:id/barcode
+router.patch('/retail/products/:id/barcode', wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+    const { id } = req.params;
+    const { sku, barcode, costPrice, stockQty, lowStockThreshold, supplierId } = req.body;
+
+    const updateData = {};
+    if (sku !== undefined) updateData.sku = sku;
+    if (barcode !== undefined) updateData.barcode = barcode;
+    if (costPrice !== undefined) updateData.costPrice = costPrice;
+    if (stockQty !== undefined) updateData.stockQty = stockQty;
+    if (lowStockThreshold !== undefined) updateData.lowStockThreshold = lowStockThreshold;
+    if (supplierId !== undefined) updateData.supplierId = supplierId;
+
+    const product = await prisma.businessProduct.update({
+        where: { id, businessProfileId: bpId },
+        data: updateData,
+        select: { id: true, name: true, sku: true, barcode: true, costPrice: true, stockQty: true, lowStockThreshold: true, supplierId: true },
+    });
+    res.json({ success: true, product });
+}));
+
 module.exports = router;

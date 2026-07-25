@@ -255,6 +255,137 @@ STATEMENTS.push('CREATE INDEX IF NOT EXISTS "BusinessConversation_participantBId
 //  because ALTER TYPE ADD VALUE must not be in a transaction block, and DO
 //  blocks behave more predictably in autocommit).
 // =============================================================================
+
+// ── Phase 3 Retail: BusinessProduct barcode/SKU fields ──────────────────────
+STATEMENTS.push('ALTER TABLE "BusinessProduct" ADD COLUMN IF NOT EXISTS "sku" VARCHAR(50);');
+STATEMENTS.push('ALTER TABLE "BusinessProduct" ADD COLUMN IF NOT EXISTS "barcode" VARCHAR(100);');
+STATEMENTS.push('ALTER TABLE "BusinessProduct" ADD COLUMN IF NOT EXISTS "costPrice" DECIMAL(20,8);');
+STATEMENTS.push('ALTER TABLE "BusinessProduct" ADD COLUMN IF NOT EXISTS "stockQty" INTEGER DEFAULT 0;');
+STATEMENTS.push('ALTER TABLE "BusinessProduct" ADD COLUMN IF NOT EXISTS "lowStockThreshold" INTEGER DEFAULT 5;');
+STATEMENTS.push('ALTER TABLE "BusinessProduct" ADD COLUMN IF NOT EXISTS "supplierId" VARCHAR(36);');
+STATEMENTS.push('CREATE UNIQUE INDEX IF NOT EXISTS "BusinessProduct_sku_key" ON "BusinessProduct"("sku");');
+
+// ── Phase 3 Retail: Supplier ─────────────────────────────────────────────────
+STATEMENTS.push(`CREATE TABLE IF NOT EXISTS "Supplier" (
+    "id" VARCHAR(36) NOT NULL,
+    "businessProfileId" VARCHAR(36) NOT NULL,
+    "name" VARCHAR(200) NOT NULL,
+    "contactName" VARCHAR(200),
+    "email" VARCHAR(200),
+    "phone" VARCHAR(50),
+    "address" VARCHAR(500),
+    "notes" VARCHAR(1000),
+    "isActive" BOOLEAN NOT NULL DEFAULT true,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT "Supplier_pkey" PRIMARY KEY ("id")
+);`);
+STATEMENTS.push('CREATE INDEX IF NOT EXISTS "Supplier_businessProfileId_idx" ON "Supplier"("businessProfileId");');
+STATEMENTS.push(`DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.table_constraints WHERE constraint_name = 'Supplier_businessProfileId_fkey') THEN
+      ALTER TABLE "Supplier" ADD CONSTRAINT "Supplier_businessProfileId_fkey" FOREIGN KEY ("businessProfileId") REFERENCES "BusinessProfile"("id") ON DELETE CASCADE;
+    END IF;
+  END $$;`);
+STATEMENTS.push(`DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.table_constraints WHERE constraint_name = 'BusinessProduct_supplierId_fkey') THEN
+      ALTER TABLE "BusinessProduct" ADD CONSTRAINT "BusinessProduct_supplierId_fkey" FOREIGN KEY ("supplierId") REFERENCES "Supplier"("id") ON DELETE SET NULL;
+    END IF;
+  END $$;`);
+
+// ── Phase 3 Retail: PurchaseOrder ────────────────────────────────────────────
+STATEMENTS.push(`CREATE TABLE IF NOT EXISTS "PurchaseOrder" (
+    "id" VARCHAR(36) NOT NULL,
+    "businessProfileId" VARCHAR(36) NOT NULL,
+    "poNumber" VARCHAR(50) NOT NULL,
+    "supplierId" VARCHAR(36) NOT NULL,
+    "status" VARCHAR(20) NOT NULL DEFAULT 'DRAFT',
+    "totalCost" DECIMAL(20,8) NOT NULL DEFAULT 0,
+    "notes" VARCHAR(1000),
+    "expectedDate" TIMESTAMP(3),
+    "receivedDate" TIMESTAMP(3),
+    "createdById" INTEGER NOT NULL,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT "PurchaseOrder_pkey" PRIMARY KEY ("id")
+);`);
+STATEMENTS.push('CREATE UNIQUE INDEX IF NOT EXISTS "PurchaseOrder_poNumber_key" ON "PurchaseOrder"("poNumber");');
+STATEMENTS.push('CREATE INDEX IF NOT EXISTS "PurchaseOrder_businessProfileId_idx" ON "PurchaseOrder"("businessProfileId");');
+STATEMENTS.push('CREATE INDEX IF NOT EXISTS "PurchaseOrder_supplierId_idx" ON "PurchaseOrder"("supplierId");');
+STATEMENTS.push('CREATE INDEX IF NOT EXISTS "PurchaseOrder_status_idx" ON "PurchaseOrder"("status");');
+STATEMENTS.push(`DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.table_constraints WHERE constraint_name = 'PurchaseOrder_businessProfileId_fkey') THEN
+      ALTER TABLE "PurchaseOrder" ADD CONSTRAINT "PurchaseOrder_businessProfileId_fkey" FOREIGN KEY ("businessProfileId") REFERENCES "BusinessProfile"("id") ON DELETE CASCADE;
+    END IF;
+  END $$;`);
+STATEMENTS.push(`DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.table_constraints WHERE constraint_name = 'PurchaseOrder_supplierId_fkey') THEN
+      ALTER TABLE "PurchaseOrder" ADD CONSTRAINT "PurchaseOrder_supplierId_fkey" FOREIGN KEY ("supplierId") REFERENCES "Supplier"("id");
+    END IF;
+  END $$;`);
+
+// ── Phase 3 Retail: PurchaseOrderItem ────────────────────────────────────────
+STATEMENTS.push(`CREATE TABLE IF NOT EXISTS "PurchaseOrderItem" (
+    "id" VARCHAR(36) NOT NULL,
+    "purchaseOrderId" VARCHAR(36) NOT NULL,
+    "productId" VARCHAR(36),
+    "productName" VARCHAR(200) NOT NULL,
+    "sku" VARCHAR(50),
+    "quantity" INTEGER NOT NULL DEFAULT 1,
+    "unitCost" DECIMAL(20,8) NOT NULL DEFAULT 0,
+    "lineTotal" DECIMAL(20,8) NOT NULL DEFAULT 0,
+    "receivedQty" INTEGER NOT NULL DEFAULT 0,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT "PurchaseOrderItem_pkey" PRIMARY KEY ("id")
+);`);
+STATEMENTS.push('CREATE INDEX IF NOT EXISTS "PurchaseOrderItem_purchaseOrderId_idx" ON "PurchaseOrderItem"("purchaseOrderId");');
+STATEMENTS.push(`DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.table_constraints WHERE constraint_name = 'PurchaseOrderItem_purchaseOrderId_fkey') THEN
+      ALTER TABLE "PurchaseOrderItem" ADD CONSTRAINT "PurchaseOrderItem_purchaseOrderId_fkey" FOREIGN KEY ("purchaseOrderId") REFERENCES "PurchaseOrder"("id") ON DELETE CASCADE;
+    END IF;
+  END $$;`);
+
+// ── Phase 3 Retail: StockCount ───────────────────────────────────────────────
+STATEMENTS.push(`CREATE TABLE IF NOT EXISTS "StockCount" (
+    "id" VARCHAR(36) NOT NULL,
+    "businessProfileId" VARCHAR(36) NOT NULL,
+    "countNumber" VARCHAR(50) NOT NULL,
+    "status" VARCHAR(20) NOT NULL DEFAULT 'OPEN',
+    "notes" VARCHAR(1000),
+    "createdById" INTEGER NOT NULL,
+    "reconciledAt" TIMESTAMP(3),
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT "StockCount_pkey" PRIMARY KEY ("id")
+);`);
+STATEMENTS.push('CREATE UNIQUE INDEX IF NOT EXISTS "StockCount_countNumber_key" ON "StockCount"("countNumber");');
+STATEMENTS.push('CREATE INDEX IF NOT EXISTS "StockCount_businessProfileId_idx" ON "StockCount"("businessProfileId");');
+STATEMENTS.push('CREATE INDEX IF NOT EXISTS "StockCount_status_idx" ON "StockCount"("status");');
+STATEMENTS.push(`DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.table_constraints WHERE constraint_name = 'StockCount_businessProfileId_fkey') THEN
+      ALTER TABLE "StockCount" ADD CONSTRAINT "StockCount_businessProfileId_fkey" FOREIGN KEY ("businessProfileId") REFERENCES "BusinessProfile"("id") ON DELETE CASCADE;
+    END IF;
+  END $$;`);
+
+// ── Phase 3 Retail: StockCountItem ────────────────────────────────────────────
+STATEMENTS.push(`CREATE TABLE IF NOT EXISTS "StockCountItem" (
+    "id" VARCHAR(36) NOT NULL,
+    "stockCountId" VARCHAR(36) NOT NULL,
+    "productId" VARCHAR(36) NOT NULL,
+    "systemQty" INTEGER NOT NULL DEFAULT 0,
+    "countedQty" INTEGER,
+    "discrepancy" INTEGER,
+    "notes" VARCHAR(500),
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT "StockCountItem_pkey" PRIMARY KEY ("id")
+);`);
+STATEMENTS.push('CREATE INDEX IF NOT EXISTS "StockCountItem_stockCountId_idx" ON "StockCountItem"("stockCountId");');
+STATEMENTS.push('CREATE INDEX IF NOT EXISTS "StockCountItem_productId_idx" ON "StockCountItem"("productId");');
+STATEMENTS.push(`DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.table_constraints WHERE constraint_name = 'StockCountItem_stockCountId_fkey') THEN
+      ALTER TABLE "StockCountItem" ADD CONSTRAINT "StockCountItem_stockCountId_fkey" FOREIGN KEY ("stockCountId") REFERENCES "StockCount"("id") ON DELETE CASCADE;
+    END IF;
+  END $$;`);
+
 async function main() {
   logger.info(`[business-os-overlay] Running ${STATEMENTS.length} DDL statements…`);
   let ok = 0;
