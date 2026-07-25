@@ -32,3 +32,9 @@ router.post('/phone/send-otp', protect, validate(sendPhoneOtpSchema, 'singleMess
 router.post('/phone/verify-otp', protect, validate(verifyPhoneOtpSchema, 'singleMessage'), securityController.verifyPhoneOtp);
 
 module.exports = router;
+
+// ── Session Management (Enterprise Readiness) ──────────────────────────────
+const sessionController = require('../controllers/sessionController');
+router.get('/sessions', protect, sessionController.listSessions);
+router.post('/sessions/revoke-all', protect, sessionController.revokeAllSessions);
+router.post('/sessions/:id/revoke', protect, sessionController.revokeSession);

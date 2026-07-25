@@ -22,7 +22,7 @@ remaining work. Treat this as an ongoing standing checklist, not a one-time pass
 | ✅ | Rate limiting | `authLimiter` on `/api/auth`, `financialLimiter` on trades, `generalLimiter` on public routes |
 | ✅ | JWT auth with refresh tokens | `protect` + `protectActive` middleware on all business routes |
 | ✅ | Two-factor authentication | `securityController.js` — TOTP via speakeasy, QR code provisioning, integrated into saved MoMo + wallet transfers. Routes: `/api/security/2fa/setup`, `/verify`, `/disable` |
-| 🔲 | Session management screen | List active sessions/devices, "sign out everywhere" action |
+| ✅ | Session management | `sessionController.js` — list active sessions (device+IP), revoke single, sign out everywhere (revoke-all bumps tokenVersion). 13 tests. Routes: `/api/security/sessions`, `/sessions/revoke-all`, `/sessions/:id/revoke` |
 | ✅ | Dependency & secret scanning | GitHub Actions CI: `npm audit` job (fails on high/critical) + hardcoded secret pattern grep on every push |
 | ✅ | Secret encryption | API keys encrypted with SHA-256 + base64 in `BusinessMessagingConfig` |
 
