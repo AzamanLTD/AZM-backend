@@ -31,14 +31,13 @@ const mockPrisma = {
   contact: { findMany: jest.fn() },
   transactionHistory: { findMany: jest.fn() },
   trade: { findMany: jest.fn() },
-  deposit: { findMany: jest.fn() },
+  savingsDeposit: { findMany: jest.fn() },
   withdrawal: { findMany: jest.fn() },
-  savingsAccount: { findMany: jest.fn() },
+  savingsGoal: { findMany: jest.fn() },
   savedMomoAccount: { findMany: jest.fn() },
-  escrowLock: { findMany: jest.fn() },
-  feedback: { findMany: jest.fn() },
-  userBadge: { findMany: jest.fn() },
-  dailyLogin: { findMany: jest.fn() },
+  smartEscrow: { findMany: jest.fn() },
+  employeeFeedback: { findMany: jest.fn() },
+  vendorAchievement: { findMany: jest.fn() },
 };
 
 describe('GDPR Data Export: exportUserData', () => {
@@ -57,15 +56,14 @@ describe('GDPR Data Export: exportUserData', () => {
       { id: 1, amount: 50, type: 'DEPOSIT', createdAt: new Date() },
     ]);
     mockPrisma.trade.findMany.mockResolvedValue([]);
-    mockPrisma.deposit.findMany.mockResolvedValue([{ id: 1, amount: 50, status: 'COMPLETED' }]);
+    mockPrisma.savingsDeposit.findMany.mockResolvedValue([{ id: 1, amount: 50, status: 'COMPLETED' }]);
     mockPrisma.withdrawal.findMany.mockResolvedValue([]);
-    mockPrisma.savingsAccount.findMany.mockResolvedValue([]);
+    mockPrisma.savingsGoal.findMany.mockResolvedValue([]);
     mockPrisma.savedMomoAccount.findMany.mockResolvedValue([]);
-    mockPrisma.escrowLock.findMany.mockResolvedValue([]);
-    mockPrisma.feedback.findMany.mockResolvedValue([]);
-    mockPrisma.userBadge.findMany.mockResolvedValue([]);
-    mockPrisma.dailyLogin.findMany.mockResolvedValue([]);
-
+    mockPrisma.smartEscrow.findMany.mockResolvedValue([]);
+    mockPrisma.employeeFeedback.findMany.mockResolvedValue([]);
+    mockPrisma.vendorAchievement.findMany.mockResolvedValue([]);
+    
     const res = mockRes();
     await dataExportController.exportUserData(mockReq(), res);
 
@@ -102,15 +100,14 @@ describe('GDPR Data Export: exportUserData', () => {
     mockPrisma.contact.findMany.mockResolvedValue([]);
     mockPrisma.transactionHistory.findMany.mockResolvedValue([]);
     mockPrisma.trade.findMany.mockResolvedValue([]);
-    mockPrisma.deposit.findMany.mockResolvedValue([]);
+    mockPrisma.savingsDeposit.findMany.mockResolvedValue([]);
     mockPrisma.withdrawal.findMany.mockResolvedValue([]);
-    mockPrisma.savingsAccount.findMany.mockResolvedValue([]);
+    mockPrisma.savingsGoal.findMany.mockResolvedValue([]);
     mockPrisma.savedMomoAccount.findMany.mockResolvedValue([]);
-    mockPrisma.escrowLock.findMany.mockResolvedValue([]);
-    mockPrisma.feedback.findMany.mockResolvedValue([]);
-    mockPrisma.userBadge.findMany.mockResolvedValue([]);
-    mockPrisma.dailyLogin.findMany.mockResolvedValue([]);
-
+    mockPrisma.smartEscrow.findMany.mockResolvedValue([]);
+    mockPrisma.employeeFeedback.findMany.mockResolvedValue([]);
+    mockPrisma.vendorAchievement.findMany.mockResolvedValue([]);
+    
     await dataExportController.exportUserData(
       mockReq({ query: { limit: '1000' } }),
       mockRes()
@@ -127,15 +124,14 @@ describe('GDPR Data Export: exportUserData', () => {
     mockPrisma.contact.findMany.mockResolvedValue([]);
     mockPrisma.transactionHistory.findMany.mockResolvedValue([]);
     mockPrisma.trade.findMany.mockResolvedValue([]);
-    mockPrisma.deposit.findMany.mockResolvedValue([]);
+    mockPrisma.savingsDeposit.findMany.mockResolvedValue([]);
     mockPrisma.withdrawal.findMany.mockResolvedValue([]);
-    mockPrisma.savingsAccount.findMany.mockResolvedValue([]);
+    mockPrisma.savingsGoal.findMany.mockResolvedValue([]);
     mockPrisma.savedMomoAccount.findMany.mockResolvedValue([]);
-    mockPrisma.escrowLock.findMany.mockResolvedValue([]);
-    mockPrisma.feedback.findMany.mockResolvedValue([]);
-    mockPrisma.userBadge.findMany.mockResolvedValue([]);
-    mockPrisma.dailyLogin.findMany.mockResolvedValue([]);
-
+    mockPrisma.smartEscrow.findMany.mockResolvedValue([]);
+    mockPrisma.employeeFeedback.findMany.mockResolvedValue([]);
+    mockPrisma.vendorAchievement.findMany.mockResolvedValue([]);
+    
     await dataExportController.exportUserData(mockReq(), mockRes());
 
     const call = mockPrisma.transactionHistory.findMany.mock.calls[0][0];

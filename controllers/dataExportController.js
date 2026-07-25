@@ -35,7 +35,7 @@ exports.exportUserData = async (req, res) => {
                 idNumber: true,
                 profilePictureUrl: true,
                 phoneNumber: true,
-                isPhoneVerified: true,
+                phoneVerified: true,
                 kycStatus: true,
                 googleId: true,
                 appleId: true,
@@ -53,6 +53,8 @@ exports.exportUserData = async (req, res) => {
                 // Sensitive fields — included for data portability completeness
                 twoFactorSecret: true,
                 pinHash: true,
+                loginStreak: true,
+                lastLoginAt: true,
             },
         });
 
@@ -73,7 +75,6 @@ exports.exportUserData = async (req, res) => {
             escrowLocks,
             feedback,
             badges,
-            dailyLogins,
         ] = await Promise.all([
             // Active + revoked sessions
             prisma.refreshToken.findMany({
@@ -104,8 +105,8 @@ exports.exportUserData = async (req, res) => {
                 take: limit,
             }),
 
-            // Deposits
-            prisma.deposit.findMany({
+            // Savings deposits
+            prisma.savingsDeposit.findMany({
                 where: { userId },
                 orderBy: { createdAt: 'desc' },
                 take: limit,
@@ -118,10 +119,10 @@ exports.exportUserData = async (req, res) => {
                 take: limit,
             }),
 
-            // Savings accounts
-            prisma.savingsAccount.findMany({
+            // Savings goals
+            prisma.savingsGoal.findMany({
                 where: { userId },
-                include: { contributions: { orderBy: { createdAt: 'desc' }, take: 20 } },
+                include: { deposits: { orderBy: { createdAt: 'desc' }, take: 20 } },
             }),
 
             // Saved MoMo accounts
@@ -130,32 +131,29 @@ exports.exportUserData = async (req, res) => {
                 select: { id: true, nickname: true, provider: true, phoneNumber: true, isPrimary: true, createdAt: true },
             }),
 
-            // Escrow locks
-            prisma.escrowLock.findMany({
-                where: { userId },
+            // Smart escrows (as payer or payee)
+            prisma.smartEscrow.findMany({
+                where: { OR: [{ payerId: userId }, { payeeId: userId }] },
                 orderBy: { createdAt: 'desc' },
                 take: limit,
             }),
 
-            // Employee feedback
-            prisma.feedback.findMany({
+            // Employee feedback given
+            prisma.employeeFeedback.findMany({
                 where: { givenByUserId: userId },
                 select: { id: true, rating: true, comment: true, createdAt: true },
                 take: limit,
             }),
 
-            // Earned badges
-            prisma.userBadge.findMany({
+            // Vendor achievements earned
+            prisma.vendorAchievement.findMany({
                 where: { userId },
-                include: { badge: { select: { name: true, description: true } } },
+                select: { id: true, name: true, description: true, tier: true, xpAwarded: true, unlockedAt: true },
             }),
 
-            // Daily login streak
-            prisma.dailyLogin.findMany({
-                where: { userId },
-                orderBy: { date: 'desc' },
-                take: 90,
-            }),
+            // Account-level snapshot (no separate dailyLogin table; streak is on User)
+            // Return null if the model doesn't exist — avoids 500 on fresh DBs.
+            null,
         ]);
 
         const exportData = {
@@ -173,20 +171,20 @@ exports.exportUserData = async (req, res) => {
             escrowLocks,
             feedbackGiven: feedback,
             badges,
-            loginHistory: dailyLogins,
+            loginStreak: user.loginStreak,
+            lastLoginAt: user.lastLoginAt,
             summary: {
                 totalTransactions: transactions.length,
                 totalTrades: trades.length,
                 totalDeposits: deposits.length,
                 totalWithdrawals: withdrawals.length,
-                savingsAccounts: savings.length,
+                savingsGoals: savings.length,
                 savedPaymentMethods: savedMomo.length,
                 activeSessions: refreshTokens.filter(t => !t.revokedAt).length,
-                loginDays: dailyLogins.length,
             },
         };
 
-        logger.info({ userId, tablesExported: Object.keys(exportData).length - 2 }, '[data-export] export generated');
+        logger.info({ userId, tablesExported: Object.keys(exportData).length - 3 }, '[data-export] export generated');
 
         return res.json({
             success: true,
