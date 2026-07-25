@@ -7,6 +7,7 @@
  *
  * Admin-only:
  *   PATCH /qr/destination — update the redirect destination
+ *   GET  /qr/analytics    — scan analytics for the dashboard
  */
 const logger = require('../src/config/logger');
 const express = require('express');
@@ -75,8 +76,6 @@ router.patch('/destination', protect, adminOnly, async (req, res) => {
   }
 });
 
-
-
 // ── GET /qr/analytics ────────────────────────────────────────────────────────
 // Admin-only — scan analytics for the QR Forge dashboard
 router.get('/analytics', protect, adminOnly, async (req, res) => {
@@ -95,7 +94,6 @@ router.get('/analytics', protect, adminOnly, async (req, res) => {
 
     // Build daily breakdown
     const daily = {};
-    recentScansData = dailyBreakdown;
     for (const scan of dailyBreakdown) {
       const day = scan.createdAt.toISOString().slice(0, 10);
       daily[day] = (daily[day] || 0) + 1;
