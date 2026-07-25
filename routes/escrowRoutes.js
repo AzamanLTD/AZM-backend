@@ -9,6 +9,7 @@ const logger = require('../src/config/logger');
 const router = require('express').Router();
 const ctrl = require('../controllers/escrowController');
 const { protect } = require('../middleware/authMiddleware');
+const { idempotency } = require('../middleware/idempotency');
 const { protectActive } = require('../middleware/banGuardMiddleware');
 const { validate } = require('../middleware/validate');
 const { fundEscrowSchema, raiseDisputeSchema } = require('../services/validation/financialSchemas');

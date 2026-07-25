@@ -13,6 +13,7 @@ const router              = express.Router();
 const tradeController     = require('../controllers/tradeController');
 const { protect, adminOnly } = require('../middleware/authMiddleware');
 const { protectActive }   = require('../middleware/banGuardMiddleware');
+const { idempotency }       = require('../middleware/idempotency');
 const upload              = require('../middleware/uploadMiddleware');
 
 const {
