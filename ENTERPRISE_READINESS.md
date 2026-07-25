@@ -10,7 +10,7 @@ remaining work. Treat this as an ongoing standing checklist, not a one-time pass
 | ✅ | Request ID logging | `middleware/requestId.js` — assigns `req.id` + `X-Request-Id` header on every request |
 | ✅ | Structured logging | Pino with request ID, business ID, user ID on every log line |
 | ✅ | Health endpoint | `/health` returns DB + Redis status |
-| 🔲 | Centralized error tracking | Sentry (or equivalent) not yet wired — high priority |
+| ✅ | Centralized error tracking | `instrument.js` initializes `@sentry/node` when `SENTRY_DSN` is set; `src/middleware/errorHandler.js` mounts Sentry's Express error handler in production |
 | 🔲 | Uptime/health monitoring | External ping monitor on `/health` with alerting |
 | 🔲 | Public status page | Simple page for businesses to check during incidents |
 
@@ -23,7 +23,7 @@ remaining work. Treat this as an ongoing standing checklist, not a one-time pass
 | ✅ | JWT auth with refresh tokens | `protect` + `protectActive` middleware on all business routes |
 | 🔲 | Two-factor authentication | Not yet implemented — needed for payout changes + API key generation |
 | 🔲 | Session management screen | List active sessions/devices, "sign out everywhere" action |
-| 🔲 | Dependency & secret scanning | Add to CI pipeline; spot-check `messagingChannels` + `webhookDispatcher` |
+| ✅ | Dependency & secret scanning | GitHub Actions CI: `npm audit` job (fails on high/critical) + hardcoded secret pattern grep on every push |
 | ✅ | Secret encryption | API keys encrypted with SHA-256 + base64 in `BusinessMessagingConfig` |
 
 ## Data Integrity & Compliance
@@ -42,7 +42,7 @@ remaining work. Treat this as an ongoing standing checklist, not a one-time pass
 |--------|------|-------|
 | ✅ | API foundation tests | `__tests__/api-foundation.test.js` — request ID, error handling, pagination |
 | ✅ | Business OS tests | `__tests__/business-os.test.js` — employees, scheduling, time-off, EWA |
-| 🔲 | Financial calculation tests | Payroll computation, invoice tax-line math, promotion discount math, escrow reconciliation — highest priority for test coverage |
+| ✅ | Financial calculation tests | `__tests__/financial-calculations.test.js` — 46 tests covering invoice tax math, payroll (hourly/salary/OT/EWA), withdrawal exit fee + influencer split, escrow fee, fee discount tiers. Pure-math, no DB |
 | 🔲 | E2E smoke tests | Core flows per vertical (reservation→check-in→checkout→invoice; dine-in→kitchen→bump→close; trip→book→check-in) |
 
 ## Performance
