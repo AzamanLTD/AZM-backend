@@ -59,7 +59,7 @@ remaining work. Treat this as an ongoing standing checklist, not a one-time pass
 |--------|------|-------|
 | ✅ | In-app "What's New" / changelog | `changelogController.js` — Changelog + ChangelogView models, 8 endpoints (user list/unread-count/dismiss/dismiss-all + admin CRUD), per-user seen tracking, 22 tests |
 | 🔲 | Guided product tour | `react-joyride` for first-time users of major sections |
-| 🔲 | Sandbox/demo mode | Realistic seeded data for full-platform demos |
+| ✅ | Sandbox/demo mode (realistic seeded data) | `prisma/seed-demo.js` — 529 lines, 3 business verticals (hotel/restaurant/transit), 20 rooms, 6 menu items, 4 transit routes, 5 employees, 5 customers, reviews, notifications, changelog. Run with `npm run seed:demo` |
 | ✅ | Dark/light theme consistency | Pre-paint script, CSS vars throughout, toast theme wired |
 | ✅ | Onboarding checklist | `OnboardingChecklist.jsx` component with progress tracking |
 
