@@ -422,163 +422,38 @@ const { autoRelease } = require('./infra/autoRelease');
     }
 })();
 
-// --- KYC SERVICE (Phase Q6) ---
-// Singleton: manages KYC verification lifecycle (initialize, webhook, admin override).
-// Shared across controllers via req.app.get('kycService').
-//
-// SWAPPABLE ADAPTER (Phase Q6 LIVE):
-// kycService.js (MOCK) and dojahKycService.js (LIVE Ghana lookups) expose the
-// exact same public surface, so we bind ONE of them based on KYC_PROVIDER:
-//   - KYC_PROVIDER=LIVE | dojah → real Dojah sandbox/production calls
-//   - anything else (default)   → deterministic MOCK, safe for local dev + CI
-//
-// The MOCK wiring is preserved (commented out) right below the live wiring so we
-// always have a one-line fallback if the live provider misbehaves.
-const KYCService = require('./services/kycService');
-const DojahKYCService = require('./services/dojahKycService');
-
-const KYC_PROVIDER = (process.env.KYC_PROVIDER || 'mock').toLowerCase();
-const KYC_LIVE = KYC_PROVIDER === 'live' || KYC_PROVIDER === 'dojah';
-
-// ── LIVE Dojah wiring ────────────────────────────────────────────────────────
-// const kycService = new KYCService(prisma, notificationService); // ← MOCK fallback (uncomment to revert)
-const kycService = KYC_LIVE
-    ? new DojahKYCService(prisma, notificationService)
-    : new KYCService(prisma, notificationService);
-app.set('kycService', kycService);
-logger.info({ provider: KYC_LIVE ? 'DOJAH (live)' : 'MOCK' }, 'KYC provider');
-
-// --- RATE ALERT SERVICE (Phase Q12) ---
-// Singleton: manages user rate alerts (CRUD + threshold checking on oracle sync).
-// Shared across controllers via req.app.get('rateAlertService').
-const RateAlertService = require('./services/rateAlertService');
-const rateAlertService = new RateAlertService(prisma, notificationService);
-app.set('rateAlertService', rateAlertService);
-// Hook into oracle sync — check alerts after every rate update
-marketOracle.rateAlertService = rateAlertService;
-
-// --- AZM REWARD SERVICE (Phase E1) ---
-// Singleton: manages all AZM loyalty-point crediting with audit trail + socket.
-// Shared across controllers via req.app.get('azmRewardService').
-const { AzmRewardService } = require('./services/azmRewardService');
-const azmRewardService = new AzmRewardService(prisma, io);
-app.set('azmRewardService', azmRewardService);
-
-// --- AZM SPEND SERVICE (Phase E2) ---
-// Singleton: manages all AZM loyalty-point debiting (fee discounts, ad boosts).
-// Shared across controllers via req.app.get('azmSpendService').
-const { AzmSpendService } = require('./services/azmSpendService');
-const azmSpendService = new AzmSpendService(prisma, io);
-app.set('azmSpendService', azmSpendService);
-
-// ─────────────────────────────────────────────────────────────────────────────
-// MASTER SPRINT (2026-05-27): VAULTS, SUSU, GROUP CHAT, SMART ROUTE, AZM AUCTION
-// ─────────────────────────────────────────────────────────────────────────────
-
-const { VaultService } = require('./services/vaultService');
-const vaultService = new VaultService(prisma, io, notificationService, azmRewardService);
-app.set('vaultService', vaultService);
-
-const { GroupChatService } = require('./services/groupChatService');
-const groupChatService = new GroupChatService(prisma, io, notificationService);
-app.set('groupChatService', groupChatService);
-
-// PHASE 6 — member-proposed group adds + admin add-quota engine.
-const { GroupJoinRequestService } = require('./services/groups/groupJoinRequest.service');
-const groupJoinRequestService = new GroupJoinRequestService(prisma, { notificationService, io });
-app.set('groupJoinRequestService', groupJoinRequestService);
-
-const { SusuService } = require('./services/susuService');
-const susuService = new SusuService(prisma, io, notificationService, azmRewardService);
-app.set('susuService', susuService);
-
-// ── PRIVATE SUSU ECOSYSTEM OVERLAY (2026-05-31) ───────────────────────────────
-// New service layer for the additive Susu features (KYC/PoR gating,
-// three-channel invites, Liability Contract acceptance, Vouch slashing,
-// Admin War Room alerts). Lives in services/susu/ subdir to avoid
-// colliding with the legacy susuService.js above. Each overlay service
-// is exposed via its own app.set key.
-const SusuMemberService            = require('./services/susu/susuMember.service');
-const SusuVouchService             = require('./services/susu/susuVouch.service');
-const SusuOverlayService           = require('./services/susu/susu.service');
-const SusuInviteService            = require('./services/susu/susuInvite.service');
-const LiabilityContractServiceCls  = require('./services/susu/liabilityContract.service');
-const ProofOfResidencyServiceCls   = require('./services/susu/proofOfResidency.service');
-const AdminWarRoomServiceCls       = require('./services/susu/adminWarRoom.service');
-
-const susuMemberService            = new SusuMemberService(prisma);
-const susuVouchService             = new SusuVouchService(prisma, { notificationService });
-const liabilityContractService     = new LiabilityContractServiceCls(prisma);
-const susuOverlayService           = new SusuOverlayService(prisma, {
-    susuVouchService,
-    susuMemberService,
-    liabilityContractService,
-});
-const susuInviteService            = new SusuInviteService(prisma, {
-    susuVouchService,
-    susuMemberService,
-    notificationService,
-});
-const proofOfResidencyService      = new ProofOfResidencyServiceCls(prisma, { susuMemberService });
-const adminWarRoomService          = new AdminWarRoomServiceCls(prisma, { notificationService });
-
-// PHASE 5 / Workstream E — Admin Portal Susu monitor (list/detail/member
-// decryption/resolve). Reuses the vouch service for REFUND_AND_CLOSE vouch
-// voiding.
-const AdminSusuMonitorServiceCls   = require('./services/susu/adminSusuMonitor.service');
-const adminSusuMonitorService      = new AdminSusuMonitorServiceCls(prisma, {
-    susuVouchService,
-    notificationService,
-});
-
-// PHASE 5 / Workstream D — group-chat-first Susu initiation
-const SusuInitiationService        = require('./services/susu/susuInitiation.service');
-const susuInitiationService        = new SusuInitiationService(prisma, {
-    susuOverlayService,
-    susuMemberService,
-    liabilityContractService,
-    notificationService,
-    io,
-});
-
-app.set('susuMemberService',        susuMemberService);
-app.set('susuVouchService',         susuVouchService);
-app.set('susuOverlayService',       susuOverlayService);
-app.set('susuInviteService',        susuInviteService);
-app.set('liabilityContractService', liabilityContractService);
-app.set('proofOfResidencyService',  proofOfResidencyService);
-app.set('adminWarRoomService',      adminWarRoomService);
-app.set('susuInitiationService',    susuInitiationService);
-app.set('adminSusuMonitorService',  adminSusuMonitorService);
-
-const { SmartRouteService } = require('./services/smartRouteService');
-const smartRouteService = new SmartRouteService({
-    prisma,
-    io,
-    notificationService,
-    mtnDisbursementService,
+// ── Service Registry (extracted to src/services/registry.js) ──────────────────
+const { registerServices } = require('./src/services/registry');
+const {
+    kycService,
+    rateAlertService,
     vaultService,
-});
-app.set('smartRouteService', smartRouteService);
-
-const { AzmAuctionService } = require('./services/azmAuctionService');
-const azmAuctionService = new AzmAuctionService({
+    groupChatService,
+    smartRouteService,
+    azmAuctionService,
+    adminAlertService,
+    storyService,
+    susuService,
+    susuInitiationService,
+} = registerServices(app, {
     prisma,
     io,
-    azmSpendService,
     notificationService,
+    marketOracle,
+    gatewayService,
+    mtnDisbursementService,
+    moolreCollectionService,
+    emailService,
+    smsService,
+    tatumService,
 });
-app.set('azmAuctionService', azmAuctionService);
 
-// Master Sprint v2 (2026-05-27): MoMo name lookup — delegates to the already-
-// instantiated moolreCollectionService so there is exactly one authenticated
-// Moolre client in the process. We pass the shared instance in to avoid a
-// second independent constructor call with its own token/credential state.
-const { MomoNameLookupService } = require('./services/momoNameLookupService');
-const momoNameLookupService = new MomoNameLookupService(moolreCollectionService);
-app.set('momoNameLookupService', momoNameLookupService);
+// The KYC service runs webhook processing outside the request lifecycle (no
+// req.app handle), so hand it the alert service directly.
+kycService.adminAlertService = adminAlertService;
 
 const IS_TEST_ENV = process.env.NODE_ENV === 'test';
+
 // ── Worker Registry (extracted to src/workers/index.js) ──────────────────────
 const { startWorkers } = require('./src/workers/index');
 const { tradeWorker, withdrawalReconciliationWorker } = startWorkers(app, {
@@ -644,10 +519,12 @@ const emitBalanceUpdate = async (userId) => {
     }
 };
 
-// --- GLOBAL APP SETTINGS ---
+// ── Global app registrations (services already handled by registry) ──────────
 app.set('socketio', io);
 app.set('prisma', prisma);
 app.set('vendorStatus', vendorStatus);
+app.set('pushIfOffline', pushIfOffline);
+app.set('emitBalanceUpdate', emitBalanceUpdate);
 
 // ── Storefront Stake Worker ──────────────────────────────────────────────────
 const storefrontStakeWorker = require('./workers/storefrontStakeWorker');
@@ -656,60 +533,14 @@ storefrontStakeWorker.start(prisma);
 // ── Keep-Alive Worker (prevents external services from sleeping) ─────────────
 const keepAliveWorker = require('./workers/keepAliveWorker');
 keepAliveWorker.start();
-app.set('emitBalanceUpdate', emitBalanceUpdate);
-
-// Smart Escrow & Business Accounts (2026-06-14): escrowService exports plain
-// functions, so bind the module itself rather than an instance.
-const EscrowService = require('./services/escrowService');
-app.set('escrowService', EscrowService);
-app.set('pushIfOffline', pushIfOffline);
-app.set('gatewayService', gatewayService);
-app.set('mtnDisbursementService', mtnDisbursementService);
-// finance.controller.js reads 'moolreDisbursementService'; withdrawalController.js reads
-// 'mtnDisbursementService'. Both variables point at the same MoolreDisbursementService
-// instance — registering under both keys costs nothing and avoids silent 503 errors.
-app.set('moolreDisbursementService', mtnDisbursementService);
-app.set('moolreCollectionService', moolreCollectionService);
-app.set('tatumService', tatumService);
-app.set('emailService', emailService);
-app.set('smsService', smsService);
-
-// B-11: admin alert service (socket broadcast + email to ADMIN_ALERT_EMAIL).
-// Registered for controllers to fetch via req.app.get('adminAlertService').
-// Inert until trigger points are wired (see services/adminAlertService.js
-// WIRING block) and harmless until ADMIN_ALERT_EMAIL / a real email provider
-// are set.
-const AdminAlertService = require('./services/adminAlertService');
-const adminAlertService = new AdminAlertService({ io, emailService });
-app.set('adminAlertService', adminAlertService);
-
-const StoryService = require('./services/storyService');
-const storyService = new StoryService(io, prisma, azmSpendService, null);
-app.set('storyService', storyService);
 
 // Stories expiration cron
 cron.schedule('*/15 * * * *', () => {
     app.get('storyService').expireOldStories().catch(err => logger.error({ err }, 'StoryCron error'));
 });
 
-// The KYC service runs webhook processing outside the request lifecycle (no
-// req.app handle), so hand it the alert service directly. Optional chaining at
-// the callsite keeps it safe if this ever isn't set.
-kycService.adminAlertService = adminAlertService;
-
-// C-8: Duplicate health endpoint removed — unified /health at line 375
-// now includes sockets count. This stub was shadowing the comprehensive handler.
-
 // ══════════════════════════════════════════════════════════════════════════════
 // API VERSIONING + RESPONSE ENVELOPE (additive, non-breaking)
-// ──────────────────────────────────────────────────────────────────────────────
-// 1. apiVersioning resolves req.apiVersion from the path/headers.
-// 2. The alias rewrite maps `/api/v1/<x>` → `/api/<x>` IN PLACE so every
-//    existing mount below serves BOTH the legacy `/api/<x>` path and the new
-//    versioned `/api/v1/<x>` path — no router duplication, no client breakage.
-//    (Version is captured in step 1 BEFORE the prefix is stripped here.)
-// 3. responseHelpers adds opt-in res.ok()/res.fail(); it does NOT touch existing
-//    res.json(...) bodies the live Flutter client depends on.
 // ══════════════════════════════════════════════════════════════════════════════
 // ── Route Registry (extracted to src/routes/index.js) ───────────────────────
 const { mountRoutes } = require('./src/routes/index');
@@ -719,11 +550,6 @@ mountRoutes(app, {
     generalLimiter,
     webhookLimiter,
 });
-
-// Link preview service singleton (shared across the app)
-const LinkPreviewService = require('./services/linkPreviewService');
-const linkPreviewService = new LinkPreviewService(prisma);
-app.set('linkPreviewService', linkPreviewService);
 
 // ══════════════════════════════════════════════════════════════════════════════
 // REAL-TIME CONNECTIONS (Authenticated — CRITICAL-4)
