@@ -33,7 +33,7 @@ remaining work. Treat this as an ongoing standing checklist, not a one-time pass
 | ✅ | Soft-delete consistency | `BusinessPromotion` converted to soft-delete (isActive=false); hours exceptions + tax presets are safe to hard-delete (no FK references) |
 | ✅ | Row-level security | Prisma queries always filter by `businessProfileId` |
 | 🔲 | Automated DB backups | Need tested restore procedure (not just "backups exist") |
-| 🔲 | Data-export flow | GDPR/data-portability export in Danger Zone — scoped but not built |
+| ✅ | Data-export flow | `dataExportController.js` — `/api/security/data-export` returns structured JSON of all user PII (profile, sessions, contacts, transactions, trades, deposits, withdrawals, savings, MoMo, escrow, feedback, badges, login history). 5 tests. |
 | ✅ | Audit log | `ActivityLog` entity tracks all mutating actions with actor + diff |
 
 ## Testing

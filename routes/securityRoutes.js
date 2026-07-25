@@ -38,3 +38,7 @@ const sessionController = require('../controllers/sessionController');
 router.get('/sessions', protect, sessionController.listSessions);
 router.post('/sessions/revoke-all', protect, sessionController.revokeAllSessions);
 router.post('/sessions/:id/revoke', protect, sessionController.revokeSession);
+
+// ── GDPR Data Export (Enterprise Readiness) ───────────────────────────────
+const dataExportController = require('../controllers/dataExportController');
+router.get('/data-export', protect, dataExportController.exportUserData);
