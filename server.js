@@ -223,63 +223,6 @@ const upload = multer({
     fileFilter: imageFileFilter
 });
 
-// Import Routes
-const authRoutes = require('./routes/authRoutes');
-const tradeRoutes = require('./routes/tradeRoutes');
-const adRoutes = require('./routes/adRoutes');
-const chatRoutes = require('./routes/chatRoutes');
-const chatUploadRoutes = require('./routes/chatUploadRoutes');
-const walletRoutes = require('./routes/walletRoutes');
-const adminRoutes = require('./routes/adminRoutes');
-const kycRoutes = require('./routes/kycRoutes');
-const notificationRoutes = require('./routes/notificationRoutes');
-const depositRoutes = require('./routes/depositRoutes');
-const withdrawalRoutes = require('./routes/withdrawalRoutes');
-const tradeAccountRoutes = require('./routes/tradeAccountRoutes');
-const payoutDestinationRoutes = require('./routes/payoutDestinationRoutes');
-const adminChatRoutes = require('./routes/adminChatRoutes');
-const securityRoutes = require('./routes/securityRoutes');
-const userRoutes = require('./routes/userRoutes');
-const warRoomRoutes = require('./routes/warRoomRoutes');
-const aiRoutes = require('./routes/aiRoutes');
-const financeRoutes = require('./routes/financeRoutes');
-const p2pRoutes = require('./routes/p2pRoutes');
-const friendRoutes = require('./routes/friendRoutes');
-const vendorStatsRoutes = require('./routes/vendorStatsRoutes');
-const savingsRoutes     = require('./routes/savingsRoutes');
-const oracleRoutes      = require('./routes/oracleRoutes');
-const azmRoutes         = require('./routes/azmRoutes');
-const receiptRoutes     = require('./routes/receiptRoutes');
-const ticketRoutes      = require('./routes/ticketRoutes');
-
-// Smart Escrow & Business Accounts (2026-06-14)
-const escrowRoutes      = require('./routes/escrowRoutes');
-const businessRoutes    = require('./routes/businessRoutes');
-
-// Marketplace Foundation (2026-06-24): Reservation system
-const reservationRoutes = require('./routes/reservationRoutes');
-
-// Marketplace Expansion (2026-07-02)
-const followRoutes = require('./routes/followRoutes');
-const adPostRoutes = require('./routes/adPostRoutes');
-const dineInRoutes = require('./routes/dineInRoutes');
-const showcaseRoutes = require('./routes/showcaseRoutes');
-const qrRoutes        = require('./routes/qrRoutes');
-const marketplaceFinanceRoutes = require('./routes/marketplaceFinanceRoutes');
-const marketplaceSeatMapRoutes = require('./routes/marketplaceSeatMapRoutes');
-const marketplacePenaltyRoutes = require('./routes/marketplacePenaltyRoutes');
-
-const marketplaceRoutes = require('./routes/marketplaceRoutes');
-
-// Master Sprint (2026-05-27): Vault, Susu, Group Chat, Smart Route, AZM Auction
-const vaultRoutes       = require('./routes/vaultRoutes');
-const groupChatRoutes   = require('./routes/groupChatRoutes');
-const susuRoutes        = require('./routes/susuRoutes');
-const smartRouteRoutes  = require('./routes/smartRouteRoutes');
-const azmAuctionRoutes  = require('./routes/azmAuctionRoutes');
-
-// Master Sprint v2 (2026-05-27): Saved MoMo Accounts
-const savedMomoRoutes   = require('./routes/savedMomoRoutes');
 
 const app = express();
 app.set('trust proxy', 1);
@@ -561,8 +504,6 @@ io.use((socket, next) => {
 
 const vendorStatus = new Map();
 
-// B-11: Transit booking routes
-const transitRoutes = require('./routes/transitRoutes');
 
 // --- TRADE SOCKET SERVICE ---
 const TradeSocketService = require('./services/tradeSocketService');
@@ -1148,163 +1089,13 @@ kycService.adminAlertService = adminAlertService;
 // 3. responseHelpers adds opt-in res.ok()/res.fail(); it does NOT touch existing
 //    res.json(...) bodies the live Flutter client depends on.
 // ══════════════════════════════════════════════════════════════════════════════
-app.use('/api', require('./middleware/apiVersioning'));
-app.use((req, res, next) => {
-    const m = req.url.match(/^\/api\/v(\d+)(?=\/|\?|$)/);
-    if (m) req.url = '/api' + req.url.slice(m[0].length);
-    next();
-});
-app.use('/api', require('./middleware/responseHelpers'));
-
-// ══════════════════════════════════════════════════════════════════════════════
-// API ROUTES (with rate limiting — CRITICAL-3)
-// ══════════════════════════════════════════════════════════════════════════════
-
-app.use('/api/public', generalLimiter, require('./routes/publicRoutes'));
-const { adminBusinessScope } = require('./middleware/adminBusinessScope');
-app.use(adminBusinessScope);
-
-app.use('/api/auth', authLimiter, authRoutes);
-app.use('/api/trades', financialLimiter, tradeRoutes);
-app.use('/api/ads', generalLimiter, adRoutes);
-app.use('/api/chat', generalLimiter, chatRoutes);
-app.use('/api/chat-upload', generalLimiter, chatUploadRoutes);
-app.use('/api/direct-messages', generalLimiter, require('./routes/businessDirectMessageRoutes'));
-app.use('/api/wallet', financialLimiter, walletRoutes);
-app.use('/api/admin', generalLimiter, adminRoutes);
-app.use('/api/kyc', generalLimiter, kycRoutes);
-app.use('/api/notifications', generalLimiter, notificationRoutes);
-app.use('/api/deposit', webhookLimiter, depositRoutes);
-app.use('/api/withdraw', financialLimiter, withdrawalRoutes);
-app.use('/api/trade-accounts', generalLimiter, tradeAccountRoutes);
-app.use('/api/payout-destinations', generalLimiter, payoutDestinationRoutes);
-app.use('/api/admin/chat', generalLimiter, adminChatRoutes);
-app.use('/api/security', generalLimiter, securityRoutes);
-app.use('/api/users', generalLimiter, userRoutes);
-app.use('/api/stories', generalLimiter, require('./routes/storyRoutes'));
-app.use('/api/contacts', generalLimiter, require('./routes/contactRoutes'));
-app.use('/api/war-room', generalLimiter, warRoomRoutes);
-app.use('/api/ai', generalLimiter, aiRoutes);
-app.use('/api/finance', financialLimiter, financeRoutes);
-app.use('/api/p2p', financialLimiter, p2pRoutes);
-app.use('/api/friends', generalLimiter, friendRoutes);
-app.use('/api/vendor', generalLimiter, vendorStatsRoutes);
-app.use('/api/savings', generalLimiter, savingsRoutes);
-app.use('/api/oracle', generalLimiter, oracleRoutes);
-app.use('/api/azm', generalLimiter, azmRoutes);
-app.use('/api/receipts', generalLimiter, receiptRoutes);
-app.use('/api/tickets', generalLimiter, ticketRoutes);
-
-// Smart Escrow & Business Accounts (2026-06-14)
-app.use('/api/escrow',   financialLimiter, escrowRoutes);
-app.use('/api/business', generalLimiter,   businessRoutes);
-
-// Marketplace Foundation (2026-06-24): Reservation system
-app.use('/api/reservations', generalLimiter, reservationRoutes);
-
-// Marketplace Expansion (2026-07-02)
-app.use('/api/follows',      generalLimiter, followRoutes);
-app.use('/api/ad-posts',     generalLimiter, adPostRoutes);
-app.use('/api/dine-in',      financialLimiter, dineInRoutes);
-app.use('/api/showcases',    generalLimiter, showcaseRoutes);
-app.use('/api/marketplace-finance',  financialLimiter, marketplaceFinanceRoutes);
-app.use('/api/marketplace-seat-map', generalLimiter, marketplaceSeatMapRoutes);
-app.use('/api/marketplace-penalty',  generalLimiter, marketplacePenaltyRoutes);
-
-// Master Sprint (2026-05-27)
-app.use('/api/vaults',        financialLimiter, vaultRoutes);
-app.use('/api/group-chats',   generalLimiter,   groupChatRoutes);
-app.use('/api/susu',          financialLimiter, susuRoutes);
-app.use('/api/smart-routes',  financialLimiter, smartRouteRoutes);
-app.use('/api/azm-auction',   generalLimiter,   azmAuctionRoutes);
-
-// Master Sprint v2 (2026-05-27): Saved MoMo accounts (deposit address book)
-app.use('/api/saved-momo',    financialLimiter, savedMomoRoutes);
-
-// B-11: Transit booking system
-app.use('/api/transit',       generalLimiter,   transitRoutes);
-
-// ── PRIVATE SUSU ECOSYSTEM OVERLAY ROUTES (2026-05-31) ────────────────────────
-// PoR + Liability + Admin War Room. Susu overlay endpoints are added inside
-// the existing /api/susu router (routes/susuRoutes.js) so /api/susu remains
-// the single mount point.
-const { userRouter: porUserRouter, adminRouter: porAdminRouter } = require('./routes/proofOfResidencyRoutes');
-const { publicRouter: liabPublicRouter, adminRouter: liabAdminRouter } = require('./routes/liabilityContractRoutes');
-const adminWarRoomRoutes = require('./routes/adminWarRoomRoutes');
-
-app.use('/api/users/proof-of-residency',  generalLimiter, porUserRouter);
-app.use('/api/admin/proof-of-residency',  generalLimiter, porAdminRouter);
-app.use('/api/liability-contract',        generalLimiter, liabPublicRouter);
-app.use('/api/admin/liability-contract',  generalLimiter, liabAdminRouter);
-app.use('/api/admin/war-room',            generalLimiter, adminWarRoomRoutes);
-
-// PHASE 5 / Workstream E — Admin Portal Susu monitor + operator actions.
-const adminSusuRoutes = require('./routes/adminSusuRoutes');
-const businessOSRoutes  = require('./routes/businessOSRoutes');
-app.use('/api/admin/susu',                generalLimiter, adminSusuRoutes);
-
-// MARKETPLACE EXPANSION — Phase B-2
-app.use('/api/marketplace',               generalLimiter, marketplaceRoutes);
-app.use('/api/business-os',   generalLimiter,   businessOSRoutes);
-app.use('/api/developer',     generalLimiter,   require('./routes/developerRoutes'));
-app.use('/api/qr',            generalLimiter,   qrRoutes);          // QR Forge — public redirect + admin config
-app.use('/api/storefront',    generalLimiter,   require('./routes/storefrontRoutes'));
-app.use('/api/azm-stake',     generalLimiter,   require('./routes/azmStakeRoutes'));
-app.use('/api/admin/storefront', generalLimiter, require('./routes/adminStorefrontRoutes'));
-
-// --- CHAT MEDIA UPLOAD + BUSINESS/VENDOR UPLOADS (extracted to route file) ----
-const chatUploadExtended = require('./routes/chatUploadRoutesExtended');
-app.use('/api/chat', chatUploadExtended);          // upload/image|audio|video|document, link-preview, upload-media (legacy)
-
-// Business image upload — re-uses the chat image multer config from the extended router
-app.post('/api/business/upload/image',
-    require('./middleware/authMiddleware').protect,
-    chatUploadExtended.imageUpload.single('file'),
-    async (req, res) => {
-        if (!req.file) return res.status(400).json({ success: false, message: 'No file uploaded' });
-        try {
-            const folder = req.query.folder === 'logos' ? 'business/logos'
-                         : req.query.folder === 'kyb'   ? 'business/kyb'
-                         : 'business/products';
-            const { url } = await require('./services/cloudinaryService').uploadToCloudinary(req.file, folder);
-            res.status(200).json({
-                success: true, url, mimeType: req.file.mimetype,
-                size: req.file.size, filename: req.file.originalname
-            });
-        } catch (err) {
-            logger.error({ err }, 'Business image upload error');
-            res.status(500).json({ success: false, message: 'Upload failed' });
-        }
-    }
-);
-
-// Vendor document upload — uses multer config from the extended router
-const { protect: protectVendorUpload } = require('./middleware/authMiddleware');
-const vendorDocsUpload = chatUploadExtended.vendorDocsUpload;
-app.post('/api/vendor/upload-docs', protectVendorUpload, vendorDocsUpload.fields([
-    { name: 'idFront', maxCount: 1 },
-    { name: 'idBack', maxCount: 1 },
-    { name: 'selfie', maxCount: 1 },
-    { name: 'addressProof', maxCount: 1 },
-]), async (req, res) => {
-    try {
-        if (!req.files || Object.keys(req.files).length === 0) {
-            return res.status(400).json({ success: false, message: 'No files uploaded' });
-        }
-        const { uploadToCloudinary } = require('./services/cloudinaryService');
-        const urls = {};
-        for (const [field, files] of Object.entries(req.files)) {
-            if (files && files.length > 0) {
-                const { url } = await uploadToCloudinary(files[0], 'vendor-docs');
-                urls[field] = url;
-            }
-        }
-        logger.info({ userId: req.user.id, keys: Object.keys(urls) }, 'Vendor: documents uploaded');
-        return res.status(200).json({ success: true, urls });
-    } catch (err) {
-        logger.error({ err }, 'Vendor docs upload error');
-        return res.status(500).json({ success: false, message: 'Upload failed' });
-    }
+// ── Route Registry (extracted to src/routes/index.js) ───────────────────────
+const { mountRoutes } = require('./src/routes/index');
+mountRoutes(app, {
+    authLimiter,
+    financialLimiter,
+    generalLimiter,
+    webhookLimiter,
 });
 
 // Link preview service singleton (shared across the app)
