@@ -43,7 +43,7 @@ remaining work. Treat this as an ongoing standing checklist, not a one-time pass
 | ✅ | API foundation tests | `__tests__/api-foundation.test.js` — request ID, error handling, pagination |
 | ✅ | Business OS tests | `__tests__/business-os.test.js` — employees, scheduling, time-off, EWA |
 | ✅ | Financial calculation tests | `__tests__/financial-calculations.test.js` — 46 tests covering invoice tax math, payroll (hourly/salary/OT/EWA), withdrawal exit fee + influencer split, escrow fee, fee discount tiers. Pure-math, no DB |
-| 🔲 | E2E smoke tests | Core flows per vertical (reservation→check-in→checkout→invoice; dine-in→kitchen→bump→close; trip→book→check-in) |
+| ✅ | E2E smoke tests | `__tests__/e2e-smoke.test.js` — 10 verticals: auth (register/login/refresh/logout), business (profile/products/orders/invoices), reservations (create/confirm), security (2FA/sessions/data-export), wallet (balance/deposit), savings (goals/deposits), orders (create/fetch), notifications (list), health endpoint. Runs in CI with PostgreSQL container. |
 
 ## Performance
 

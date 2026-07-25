@@ -117,6 +117,7 @@ function mountRoutes(app, {
     app.use('/api/storefront',            generalLimiter,   require('../../routes/storefrontRoutes'));
     app.use('/api/azm-stake',             generalLimiter,   require('../../routes/azmStakeRoutes'));
     app.use('/api/admin/storefront',      generalLimiter,   require('../../routes/adminStorefrontRoutes'));
+    app.use('/api/changelog',               generalLimiter,   require('../../routes/changelogRoutes'));
 
     // ── Chat Media Upload + Business/Vendor Uploads ──────────────────────────
     const chatUploadExtended = require('../../routes/chatUploadRoutesExtended');

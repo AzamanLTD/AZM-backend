@@ -918,6 +918,7 @@ model User {
 
   // AZM Staking for Nitro
   azmStakes           AzmStake[]
+  changelogViews      ChangelogView[]
 
   @@index([phoneHash])
 }
@@ -5294,4 +5295,38 @@ model IdempotencyKey {
 
   @@index([key])
   @@index([expiresAt])
+}
+
+/// In-app changelog / "What's New" entries shown to users after updates.
+/// Admin creates entries; users see a badge until they dismiss or view them.
+model Changelog {
+  id          Int      @id @default(autoincrement())
+  version     String   // e.g. "v2.4.0"
+  title       String   // short headline e.g. "Savings Goals are here!"
+  body        String   // markdown body — rendered client-side
+  category    String   @default("feature") // feature | improvement | fix | security
+  severity    String   @default("info")    // info | warning | critical
+  imageUrl    String?
+  publishedAt DateTime @default(now())
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  // Track which users have seen each entry
+  views ChangelogView[]
+
+  @@index([publishedAt(sort: Desc)])
+}
+
+/// Per-user dismiss/seen tracking for changelog entries.
+model ChangelogView {
+  id          Int      @id @default(autoincrement())
+  changelogId Int
+  userId      Int
+  viewedAt    DateTime @default(now())
+
+  changelog Changelog @relation(fields: [changelogId], references: [id], onDelete: Cascade)
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([changelogId, userId])
+  @@index([userId])
 }
