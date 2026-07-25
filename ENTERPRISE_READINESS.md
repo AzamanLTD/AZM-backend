@@ -57,7 +57,7 @@ remaining work. Treat this as an ongoing standing checklist, not a one-time pass
 
 | Status | Item | Notes |
 |--------|------|-------|
-| 🔲 | In-app "What's New" / changelog | Pairs with notification center |
+| ✅ | In-app "What's New" / changelog | `changelogController.js` — Changelog + ChangelogView models, 8 endpoints (user list/unread-count/dismiss/dismiss-all + admin CRUD), per-user seen tracking, 22 tests |
 | 🔲 | Guided product tour | `react-joyride` for first-time users of major sections |
 | 🔲 | Sandbox/demo mode | Realistic seeded data for full-platform demos |
 | ✅ | Dark/light theme consistency | Pre-paint script, CSS vars throughout, toast theme wired |
