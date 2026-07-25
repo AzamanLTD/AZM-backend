@@ -19,11 +19,12 @@ const { protect, adminOnly } = require('../middleware/authMiddleware');
 // has programmed it. 302 so browsers/CDN don't cache it permanently.
 router.get('/go', async (req, res) => {
   try {
-    const settings = await req.prisma.globalSettings.findUnique({ where: { id: 1 }, select: { qrRedirectUrl: true } });
+    const prisma = req.app.get('prisma');
+    const settings = await prisma.globalSettings.findUnique({ where: { id: 1 }, select: { qrRedirectUrl: true } });
     const dest = settings?.qrRedirectUrl || 'https://startup.moolre.com/leaderboard/118';
 
     // Log scan asynchronously (don't block the redirect)
-    req.prisma.qrScan.create({
+    prisma.qrScan.create({
       data: {
         ipAddress: (req.headers['x-forwarded-for'] || '').split(',')[0].trim() || req.socket.remoteAddress || null,
         userAgent: (req.headers['user-agent'] || '').slice(0, 500) || null,
@@ -42,7 +43,8 @@ router.get('/go', async (req, res) => {
 // live destination without needing auth.
 router.get('/destination', async (req, res) => {
   try {
-    const settings = await req.prisma.globalSettings.findUnique({
+    const prisma = req.app.get('prisma');
+    const settings = await prisma.globalSettings.findUnique({
       where: { id: 1 },
       select: { qrRedirectUrl: true, qrLabel: true },
     });
@@ -60,11 +62,12 @@ router.get('/destination', async (req, res) => {
 // Admin-only — reprogramme where the permanent QR code points.
 router.patch('/destination', protect, adminOnly, async (req, res) => {
   try {
+    const prisma = req.app.get('prisma');
     const { url, label } = req.body;
     if (!url || typeof url !== 'string' || !url.startsWith('http')) {
       return res.status(400).json({ success: false, message: 'A valid URL is required.' });
     }
-    const updated = await req.prisma.globalSettings.upsert({
+    const updated = await prisma.globalSettings.upsert({
       where: { id: 1 },
       create: { id: 1, qrRedirectUrl: url, qrLabel: label || 'Azaman QR' },
       update: { qrRedirectUrl: url, ...(label !== undefined && { qrLabel: label }) },
@@ -80,13 +83,14 @@ router.patch('/destination', protect, adminOnly, async (req, res) => {
 // Admin-only — scan analytics for the QR Forge dashboard
 router.get('/analytics', protect, adminOnly, async (req, res) => {
   try {
+    const prisma = req.app.get('prisma');
     const days = parseInt(req.query.days, 10) || 30;
     const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
 
     const [totalScans, recentScans, dailyBreakdown] = await Promise.all([
-      req.prisma.qrScan.count(),
-      req.prisma.qrScan.count({ where: { createdAt: { gte: since } } }),
-      req.prisma.qrScan.findMany({
+      prisma.qrScan.count(),
+      prisma.qrScan.count({ where: { createdAt: { gte: since } } }),
+      prisma.qrScan.findMany({
         where: { createdAt: { gte: since } },
         select: { createdAt: true, ipAddress: true },
       }),
@@ -103,7 +107,7 @@ router.get('/analytics', protect, adminOnly, async (req, res) => {
     const uniqueIps = new Set(dailyBreakdown.map(s => s.ipAddress).filter(Boolean));
 
     // Last 10 scans
-    const lastScans = await req.prisma.qrScan.findMany({
+    const lastScans = await prisma.qrScan.findMany({
       orderBy: { createdAt: 'desc' },
       take: 10,
       select: { id: true, ipAddress: true, userAgent: true, referrer: true, createdAt: true },
