@@ -2454,6 +2454,7 @@ model BusinessProfile {
   dineInTabs    DineInTab[]
   penaltyPolicy PenaltyPolicy?
   showcase      BusinessShowcase[]
+  storefrontVersions StorefrontVersion[]
   // Business OS relations
   employees          BusinessEmployee[]
   businessConversations BusinessConversation[]
@@ -4081,6 +4082,21 @@ model BusinessShowcase {
 
   @@index([businessProfileId, isActive, displayOrder])
 }
+
+
+model StorefrontVersion {
+  id                String   @id @default(uuid())
+  businessProfileId String
+  snapshot          Json     // array of { mediaUrl, mediaType, thumbnailUrl, caption, displayOrder, isActive }
+  label             String?  @db.VarChar(200)  // optional human label e.g. "Summer menu launch"
+  publishedBy       String   @db.VarChar(100)
+  createdAt         DateTime @default(now())
+
+  businessProfile BusinessProfile @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+
+  @@index([businessProfileId, createdAt])
+}
+
 
 
 // BUSINESS OS — EMPLOYEE MANAGEMENT & CATEGORY OPERATIONS (July 2026)

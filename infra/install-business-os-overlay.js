@@ -429,3 +429,22 @@ STATEMENTS.push(`DO $$ BEGIN
 STATEMENTS.push('ALTER TABLE "BusinessReview" ADD COLUMN IF NOT EXISTS "businessResponse" VARCHAR(1000);');
 STATEMENTS.push('ALTER TABLE "BusinessReview" ADD COLUMN IF NOT EXISTS "businessResponseAt" TIMESTAMP(3);');
 STATEMENTS.push('CREATE INDEX IF NOT EXISTS "BusinessReview_businessProfileId_createdAt_idx" ON "BusinessReview"("businessProfileId", "createdAt" DESC);');
+
+// ── Storefront Version History ─────────────────────────────────────────────────
+STATEMENTS.push(`CREATE TABLE IF NOT EXISTS "StorefrontVersion" (
+    "id" VARCHAR(36) NOT NULL,
+    "businessProfileId" VARCHAR(36) NOT NULL,
+    "snapshot" JSONB NOT NULL,
+    "label" VARCHAR(200),
+    "publishedBy" VARCHAR(100) NOT NULL,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT "StorefrontVersion_pkey" PRIMARY KEY ("id")
+);`);
+
+STATEMENTS.push('CREATE INDEX IF NOT EXISTS "StorefrontVersion_businessProfileId_createdAt_idx" ON "StorefrontVersion"("businessProfileId", "createdAt" DESC);');
+
+STATEMENTS.push(`DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.table_constraints WHERE constraint_name = 'StorefrontVersion_businessProfileId_fkey') THEN
+      ALTER TABLE "StorefrontVersion" ADD CONSTRAINT "StorefrontVersion_businessProfileId_fkey" FOREIGN KEY ("businessProfileId") REFERENCES "BusinessProfile"("id") ON DELETE CASCADE;
+    END IF;
+  END $$;`);

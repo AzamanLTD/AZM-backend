@@ -11,4 +11,9 @@ router.patch('/:id',                  protect, kybGate, ctrl.update);
 router.delete('/:id',                 protect, kybGate, ctrl.delete);
 router.post('/reorder',               protect, kybGate, ctrl.reorder);
 
+// Storefront version history
+router.post('/:businessProfileId/publish',     protect, kybGate, ctrl.publishVersion);
+router.get('/:businessProfileId/versions',      protect, kybGate, ctrl.listVersions);
+router.post('/:businessProfileId/revert/:versionId', protect, kybGate, ctrl.revertToVersion);
+
 module.exports = router;
