@@ -920,6 +920,7 @@ model User {
   // AZM Staking for Nitro
   azmStakes           AzmStake[]
   changelogViews      ChangelogView[]
+  onchainSweeps       OnchainSweep[]
 
   @@index([phoneHash])
 }
@@ -5315,6 +5316,26 @@ model IdempotencyKey {
 
   @@index([key])
   @@index([expiresAt])
+}
+
+
+/// On-chain USDC sweep records — tracks consolidation from user deposit
+/// addresses to the platform treasury wallet on Polygon.
+model OnchainSweep {
+  id          String   @id @default(uuid())
+  userId      Int
+  fromAddress String
+  toAddress   String
+  amountUsdc  Decimal  @db.Decimal(20, 8)
+  status      String   @default("BROADCASTING") // BROADCASTING | CONFIRMED | FAILED
+  txHash      String?
+  createdAt   DateTime @default(now())
+  confirmedAt DateTime?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([status])
 }
 
 /// In-app changelog / "What's New" entries shown to users after updates.

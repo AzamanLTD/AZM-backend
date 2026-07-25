@@ -87,6 +87,12 @@ async function startWorkers(app, {
     const AzmAuctionWorker = require('../../workers/azmAuctionWorker');
     const azmAuctionWorker = new AzmAuctionWorker(prisma, azmAuctionService);
 
+    // ── On-Chain Sweep Worker (Phase 2: Scalability & Security) ─────────────
+    // Periodically consolidates USDC from individual user deposit addresses
+    // into the platform treasury wallet on Polygon. No-op in MOCK mode.
+    const OnchainSweepWorker = require('../../workers/onchainSweepWorker');
+    const onchainSweepWorker = new OnchainSweepWorker(prisma, null);
+
     // ── Register all workers with the scheduler ───────────────────────────
     // Cron-based workers (use cron expressions)
     await register('leaderboard',        '0 0 * * 0',   () => leaderboardWorker.computeWeeklyLeaderboard());
@@ -102,6 +108,7 @@ async function startWorkers(app, {
     await register('susu',              String(60 * 1000),            () => susuWorker._tick());
     await register('smart-route',       String(60 * 1000),            () => smartRouteWorker._tick());
     await register('azm-auction',       String(5 * 60 * 1000),        () => azmAuctionWorker._tick());
+    await register('onchain-sweep',     String(60 * 60 * 1000),        () => onchainSweepWorker._tick());
 
     // ── Marketplace cron schedules ───────────────────────────────────────
     const noShowWorker = require('../../workers/reservationNoShowWorker');
@@ -204,6 +211,7 @@ async function startWorkers(app, {
         susuWorker: IS_TEST_ENV ? 'disabled_in_test' : 'running',
         smartRouteWorker: IS_TEST_ENV ? 'disabled_in_test' : 'running',
         azmAuctionWorker: IS_TEST_ENV ? 'disabled_in_test' : 'running',
+        onchainSweepWorker: IS_TEST_ENV ? 'disabled_in_test' : 'running',
         tradeWorker: IS_TEST_ENV ? 'disabled_in_test' : 'pending_listen',
     });
 
