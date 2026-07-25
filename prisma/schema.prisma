@@ -2918,6 +2918,7 @@ model BusinessProduct {
   kitchenOrderItems KitchenOrderItem[]
   recipeIngredients RecipeIngredient[]
   orders          BusinessOrder[]
+  supplier        Supplier?      @relation("SupplierProducts", fields: [supplierId], references: [id])
 
   createdAt      DateTime        @default(now())
   updatedAt      DateTime        @updatedAt
