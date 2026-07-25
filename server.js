@@ -25,13 +25,8 @@ const express = require('express');
 const cron = require('node-cron');
 const http = require('http');
 const { Server } = require('socket.io');
-const { PrismaClient, Prisma } = require('@prisma/client');
-const { PrismaPg } = require('@prisma/adapter-pg');
-const { Pool } = require('pg');
 const path = require('path');
 const socketRateLimiter = require('./middleware/socketRateLimiter');
-const multer = require('multer');
-const fs = require('fs');
 const jwt = require('jsonwebtoken');
 require('dotenv').config();
 
@@ -67,20 +62,6 @@ const workerStatus = {};
 // 'connected' / 'disconnected' driven by the ioredis client events.
 let redisStatus = 'not_configured';
 
-// ── Phase J3: Prisma Decimal → Number JSON Serialization ─────────────────────
-// Prisma returns NUMERIC/DECIMAL columns as Decimal.js objects which serialize
-// to strings in JSON ("12.50" instead of 12.50). This patch ensures they
-// serialize as plain numbers for all res.json() calls and socket emissions.
-// decimal.js's valueOf() returns a string by default — we override it to
-// return a number so that arithmetic operators (+, -, *, /, <, >) work
-// correctly with Decimal fields in controller code without explicit casts.
-Prisma.Decimal.prototype.toJSON = function () {
-    return Number(this.toString());
-};
-Prisma.Decimal.prototype.valueOf = function () {
-    return Number(this.toString());
-};
-
 // --- FIREBASE CLOUD MESSAGING ---
 const { sendPushNotification } = require('./utils/firebaseService');
 
@@ -92,135 +73,15 @@ const {
     webhookLimiter
 } = require('./middleware/rateLimitMiddleware');
 
-// 1. Initialize PostgreSQL Connection Pool
-const pool = new Pool({
-    connectionString: process.env.DATABASE_URL,
-    max: 20,
-    idleTimeoutMillis: 30000,
-    connectionTimeoutMillis: 2000,
-});
+// ── Base Services (extracted to src/config/baseServices.js) ──────────────────
+const {
+    pool, prisma, marketOracle, gatewayService,
+    mtnDisbursementService, moolreCollectionService,
+    tatumService, emailService, smsService,
+} = require('./src/config/baseServices');
 
-pool.on('error', (err) => {
-    logger.error({ err }, 'Unexpected error on idle client');
-});
-
-const adapter = new PrismaPg(pool);
-const prisma = new PrismaClient({ adapter });
-
-// Test database connection on startup
-(async () => {
-    try {
-        await prisma.$connect();
-        logger.info('Prisma connected successfully');
-    } catch (error) {
-        logger.error({ err: error }, 'Database connection failed');
-        process.exit(1);
-    }
-})();
-
-// --- LIVE MARKET ORACLE ---
-const OracleService = require('./services/oracleService');
-const marketOracle = new OracleService(prisma);
-marketOracle.startOracle();
-
-// --- KOTANI PAY V3 GATEWAY ---
-const GatewayService = require('./services/gatewayService');
-const gatewayService = new GatewayService(prisma);
-gatewayService.startRateSync();
-
-// --- FIAT OFF-RAMP DISBURSEMENT (Moolre — primary; MTN MoMo — fallback) ──────
-// The off-ramp provider is bound to ONE variable (`mtnDisbursementService`) that
-// every consumer reads (finance.controller, withdrawalReconciliationWorker,
-// payoutBatchWorker, smartRouteService). Because MoolreDisbursementService
-// mirrors the MTN adapter's public method shape EXACTLY
-// (initiateTransfer / getTransferStatus / newReferenceId / simulateInboundWebhook,
-// and deliberately NO `dispatch`), swapping which class backs that variable
-// changes the provider for the whole platform with zero consumer edits.
-//
-// The legacy MTN wiring is preserved (commented) directly below as a safe
-// fallback — to revert, comment the Moolre block and uncomment the MTN block.
-
-// ── PRIMARY: Moolre ───────────────────────────────────────────────────────────
-const MoolreDisbursementService = require('./services/moolreDisbursementService');
-const mtnDisbursementService = new MoolreDisbursementService();
-
-// --- FIAT ON-RAMP COLLECTION (Moolre — 2026-06-23) ───────────────────────────
-// Inbound sibling of the disbursement adapter above: PIN-push MoMo deposits.
-// Bound under 'moolreCollectionService' (depositController reads it via
-// req.app.get). Pure I/O adapter — no Prisma, MOCK unless MOOLRE_PROVIDER=LIVE.
-const MoolreCollectionService = require('./services/moolreCollectionService');
-const moolreCollectionService = new MoolreCollectionService();
-
-// Startup guard: the Moolre settlement webhook hard-disables itself (503) if
-// MOOLRE_WEBHOOK_SECRET is unset, so warn loudly at boot to make the disabled
-// endpoint obvious instead of silently rejecting every callback in production.
-if (!process.env.MOOLRE_WEBHOOK_SECRET) {
-    logger.warn('MOOLRE_WEBHOOK_SECRET is not set — webhook endpoint is disabled');
-}
-
-// ── FALLBACK: MTN MoMo (kept intact — uncomment to revert) ────────────────────
-// const MtnDisbursementService = require('./services/mtnDisbursementService');
-// const mtnDisbursementService = new MtnDisbursementService();
-
-// --- TATUM WEB3 SERVICE ---
-const TatumService = require('./services/tatumService');
-const tatumService = new TatumService();
-
-// --- EMAIL SERVICE (Phase L1) ---
-// Stateless aside from in-memory token-store + provider config (env-driven).
-// Singleton: instantiated once here, shared across the worker (constructor
-// arg) and request handlers (req.app.get('emailService')). Defaults to
-// MOCK provider — set EMAIL_PROVIDER + EMAIL_API_KEY to flip to a real
-// transport. All sends from the receipt surface are fire-and-forget.
-const EmailService = require('./services/emailService');
-const emailService = new EmailService();
-
-// --- SMS SERVICE (Phase L2) ---
-// Mirrors the emailService singleton pattern. OTP state is stored in-memory
-// (use Redis in production for multi-process). Defaults to MOCK provider —
-// set SMS_PROVIDER + SMS_API_KEY in .env for real delivery. Shared across
-// security routes (phone OTP) and withdrawal controller (large-withdrawal
-// confirmations). All transactional sends are fire-and-forget.
-const SMSService = require('./services/smsService');
-const smsService = new SMSService();
-
-// --- MULTER SETUP (HIGH-9: Validated file uploads) ---
-const uploadDir = 'uploads/proofs/';
-if (!fs.existsSync(uploadDir)) {
-    fs.mkdirSync(uploadDir, { recursive: true });
-}
-
-// HIGH-9: File type validation — only allow images
-// Accepts both MIME type check AND file extension check because Android
-// devices frequently report incorrect MIME types (application/octet-stream)
-// for camera captures.
-const imageFileFilter = (req, file, cb) => {
-    const allowedMimes = ['image/jpeg', 'image/png', 'image/gif', 'image/webp', 'image/heic', 'image/heif'];
-    const allowedExts = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.heic', '.heif'];
-    const ext = path.extname(file.originalname).toLowerCase();
-    const mimeOk = allowedMimes.includes(file.mimetype);
-    const extOk = allowedExts.includes(ext);
-    if (mimeOk || extOk) {
-        cb(null, true);
-    } else {
-        cb(new Error('Only image files (JPEG, PNG, GIF, WebP, HEIC) are allowed.'), false);
-    }
-};
-
-const storage = multer.diskStorage({
-    destination: (req, file, cb) => cb(null, uploadDir),
-    filename: (req, file, cb) => {
-        const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-        cb(null, uniqueSuffix + path.extname(file.originalname));
-    }
-});
-
-// HIGH-9: 5MB limit + image-only filter
-const upload = multer({
-    storage: storage,
-    limits: { fileSize: 5 * 1024 * 1024 },
-    fileFilter: imageFileFilter
-});
+// ── Upload Config (extracted to src/config/upload.js) ────────────────────────
+const { upload } = require('./src/config/upload');
 
 
 const app = express();
@@ -311,32 +172,13 @@ io.use((socket, next) => {
     }
 });
 
-const vendorStatus = new Map();
-
-
-// --- TRADE SOCKET SERVICE ---
-const TradeSocketService = require('./services/tradeSocketService');
-const tradeSocketService = new TradeSocketService(io, prisma);
-
-// --- CHAT SOCKET SERVICE ---
-const ChatSocketService = require('./services/chatSocketService');
-const chatSocketService = new ChatSocketService(io, prisma);
-
-const GroupChatSocketService = require('./services/groupChatSocketService');
-const groupChatSocketService = new GroupChatSocketService(io, prisma);
-
-// --- FRIEND SOCKET SERVICE ---
-const FriendSocketService = require('./services/friendSocketService');
-const friendSocketService = new FriendSocketService(io, prisma);
-
-// --- TICKET SOCKET SERVICE (Phase UI-4, 2026-05-26) ---
-const TicketSocketService = require('./services/ticketSocketService');
-const ticketSocketService = new TicketSocketService(io, prisma);
-
-// --- NOTIFICATION SERVICE (canonical persistence + emit) ---
-const NotificationService = require('./services/notificationService');
-const notificationService = new NotificationService(prisma, io);
-app.set('notificationService', notificationService);
+// ── Socket Services (extracted to src/sockets/socketServices.js) ──────────────
+const { createSocketServices } = require('./src/sockets/socketServices');
+const {
+    tradeSocketService, chatSocketService, groupChatSocketService,
+    friendSocketService, ticketSocketService, notificationService,
+    vendorStatus,
+} = createSocketServices(io, prisma, app);
 
 // --- ADMIN_DISPUTE_ESCROW (Private Susu Ecosystem, 2026-05-31) ───────────────
 // Cache the treasury wallet's User id at startup so cycle workers and
