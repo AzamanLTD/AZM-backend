@@ -77,6 +77,7 @@ const {
 const {
     pool, prisma, marketOracle, gatewayService,
     mtnDisbursementService, moolreCollectionService,
+    paymentFailoverService,
     tatumService, emailService, smsService,
 } = require('./src/config/baseServices');
 
