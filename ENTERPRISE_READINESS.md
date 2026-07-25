@@ -85,3 +85,21 @@ remaining work. Treat this as an ongoing standing checklist, not a one-time pass
 | ✅ | Cron retry queue | Every 2 min, picks up RETRYING/FAILED deliveries with backoff |
 | ✅ | Webhook secret signing | HMAC-SHA256 signature on every payload |
 | ✅ | Webhook delivery wired into business events | `webhookEmitter.js` — fire-and-forget emitter wired into `businessOrderService.createOrder` (order.created), `businessInvoiceService.createInvoice` (invoice.created), `reservationController.createReservation` (reservation.created) + `confirmReservation` (reservation.confirmed). 5 tests. |
+
+## Phase 2: Scalability & Security (In Progress)
+
+| Status | Item | Notes |
+|--------|------|-------|
+| ✅ | Payment provider failover | `src/services/paymentFailoverService.js` — wraps Moolre (primary) + MTN (secondary) with automatic failover, health tracking (3 failures in 10min → unhealthy), recovery probing, admin health endpoint `/api/admin/payment-providers/health`. 11 tests. |
+| ✅ | Account lockout after failed logins | Implemented in auth middleware |
+| ✅ | Idempotency keys on financial endpoints | Implemented on all financial mutations |
+| ✅ | Session management | `sessionController.js` — list, revoke, sign out everywhere |
+| ✅ | Data export / GDPR | `dataExportController.js` — structured PII export |
+| ✅ | 2FA enforcement | TOTP via speakeasy, integrated into MoMo + wallet transfers |
+| 🔲 | BullMQ for workers | Multi-instance safe worker scheduling |
+| 🔲 | Read replica for analytics | Separate DB connection for list/analytics queries |
+| 🔲 | Table partitioning | TransactionHistory by month |
+| 🔲 | On-chain sweep worker | Automated USDC liquidity management |
+| 🔲 | WebAuthn/passkey support | Passwordless authentication |
+| 🔲 | OpenAPI spec generation | Auto-generate from route definitions |
+| 🔲 | Disappearing messages | Mobile + backend support |

@@ -15,6 +15,7 @@ function startWorkers(app, {
     workerStatus,
     tradeSocketService,
     mtnDisbursementService,
+    paymentFailoverService,
     emailService,
     smsService,
     notificationService,
@@ -52,7 +53,7 @@ function startWorkers(app, {
 
     const WithdrawalReconciliationWorker = require('../../workers/withdrawalReconciliationWorker');
     const withdrawalReconciliationWorker =
-        new WithdrawalReconciliationWorker(prisma, io, mtnDisbursementService, emailService, smsService);
+        new WithdrawalReconciliationWorker(prisma, io, paymentFailoverService || mtnDisbursementService, emailService, smsService);
     startWorker(withdrawalReconciliationWorker);
 
     // ── Payout Batch Worker (Phase Q8) ─────────────────────────────────────────
@@ -60,7 +61,7 @@ function startWorkers(app, {
     // AND amount is below the admin-configured threshold. Flags oversized or
     // under-funded withdrawals as NEEDS_MANUAL_REVIEW for the War Room.
     const PayoutBatchWorker = require('../../workers/payoutBatchWorker');
-    const payoutBatchWorker = new PayoutBatchWorker(prisma, io, mtnDisbursementService, notificationService);
+    const payoutBatchWorker = new PayoutBatchWorker(prisma, io, paymentFailoverService || mtnDisbursementService, notificationService);
     startWorker(payoutBatchWorker);
     app.set('payoutBatchWorker', payoutBatchWorker);
 

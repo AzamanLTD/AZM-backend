@@ -7,7 +7,7 @@
 //
 // Exposed: registerServices(app, baseDeps)
 //   baseDeps: { prisma, io, notificationService, marketOracle,
-//               mtnDisbursementService, moolreCollectionService,
+//               mtnDisbursementService, moolreCollectionService, paymentFailoverService,
 //               emailService, smsService, azmSpendService, azmRewardService }
 //   returns: { kycService, rateAlertService, vaultService, smartRouteService,
 //             azmAuctionService, adminAlertService, storyService }
@@ -40,6 +40,7 @@ function registerServices(app, baseDeps) {
     gatewayService,
     mtnDisbursementService,
     moolreCollectionService,
+    paymentFailoverService,
     emailService,
     smsService,
   } = baseDeps;
@@ -197,6 +198,7 @@ function registerServices(app, baseDeps) {
   // finance.controller.js reads 'moolreDisbursementService'; withdrawalController.js
   // reads 'mtnDisbursementService'. Both point at the same instance.
   app.set('moolreDisbursementService', mtnDisbursementService);
+  app.set('paymentFailoverService', paymentFailoverService);
   app.set('moolreCollectionService', moolreCollectionService);
   app.set('tatumService', baseDeps.tatumService);
   app.set('emailService', emailService);

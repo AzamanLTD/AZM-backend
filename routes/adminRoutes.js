@@ -442,3 +442,18 @@ router.get('/marketplace-businesses/:bizId', async (req, res) => {
 });
 
 module.exports = router;
+
+// ── Payment Provider Health (Phase 2: Failover) ─────────────────────────────
+router.get('/payment-providers/health', async (req, res) => {
+    try {
+        const failoverService = req.app.get('paymentFailoverService');
+        if (!failoverService) {
+            return res.json({ success: true, data: { message: 'Failover service not initialized (using single provider)' } });
+        }
+        const health = await failoverService.getHealthStatus();
+        res.json({ success: true, data: health });
+    } catch (err) {
+        logger.error({ err }, '[admin] Payment provider health check failed');
+        res.status(500).json({ success: false, message: 'Failed to get provider health' });
+    }
+});

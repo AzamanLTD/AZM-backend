@@ -6,7 +6,8 @@
 // composite service (see src/services/registry.js) builds on top of.
 //
 // Exports: { pool, prisma, marketOracle, gatewayService, mtnDisbursementService,
-//           moolreCollectionService, tatumService, emailService, smsService }
+//           moolreCollectionService, paymentFailoverService, tatumService,
+//           emailService, smsService }
 // =============================================================================
 
 const { PrismaClient, Prisma } = require('@prisma/client');
@@ -73,9 +74,18 @@ if (!process.env.MOOLRE_WEBHOOK_SECRET) {
     logger.warn('MOOLRE_WEBHOOK_SECRET is not set — webhook endpoint is disabled');
 }
 
-// ── FALLBACK: MTN MoMo (kept intact — uncomment to revert) ────────────────────
-// const MtnDisbursementService = require('../../services/mtnDisbursementService');
-// const mtnDisbursementService = new MtnDisbursementService();
+// ── FALLBACK: MTN MoMo (secondary provider for automatic failover) ─────────
+const MtnDisbursementService = require('../../services/mtnDisbursementService');
+const mtnFallbackService = new MtnDisbursementService();
+
+// ── PAYMENT FAILOVER SERVICE (wraps Moolre primary + MTN secondary) ─────────
+const { PaymentFailoverService } = require('../services/paymentFailoverService');
+const paymentFailoverService = new PaymentFailoverService({
+    providers: [
+        { name: 'moolre', instance: mtnDisbursementService, priority: 1 },
+        { name: 'mtn',    instance: mtnFallbackService,     priority: 2 },
+    ],
+});
 
 // --- TATUM WEB3 SERVICE ---
 const TatumService = require('../../services/tatumService');
@@ -96,6 +106,7 @@ module.exports = {
     gatewayService,
     mtnDisbursementService,
     moolreCollectionService,
+    paymentFailoverService,
     tatumService,
     emailService,
     smsService,

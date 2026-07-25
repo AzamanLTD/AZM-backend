@@ -61,7 +61,8 @@ exports.fiatWithdrawal = async (req, res) => {
     const io                        = req.app.get('socketio');
     const emitBalanceUpdate         = req.app.get('emitBalanceUpdate');
     const gatewayService            = req.app.get('gatewayService');             // rate oracle only
-    const moolreDisbursementService = req.app.get('moolreDisbursementService'); // off-ramp dispatch
+    const paymentFailoverService   = req.app.get("paymentFailoverService"); // failover-aware dispatch
+    const moolreDisbursementService = paymentFailoverService || req.app.get("moolreDisbursementService"); // backward compat
 
     let reference = null;        // populated after the service debit so the
                                  // catch block can call reverseFiatWithdrawal.
@@ -123,7 +124,7 @@ exports.fiatWithdrawal = async (req, res) => {
         if (!moolreDisbursementService) {
             return res.status(503).json({
                 success: false,
-                message: 'Moolre disbursement service is not configured on this server.'
+                message: 'Disbursement service is not configured on this server.'
             });
         }
 
@@ -138,7 +139,7 @@ exports.fiatWithdrawal = async (req, res) => {
         // uses it as the strict idempotency key for POST /v1_0/transfer.
         // We reuse the same UUID as TransactionHistory.txHash so the upstream
         // ledger and the downstream MoMo transfer share a single correlation.
-        reference = moolreDisbursementService.newReferenceId();
+        reference = moolreDisbursementService.newReferenceId(); // works for both failover and raw service
 
         // ── Atomic debit + fee split + arbitrage capture (delegated) ─────────
         const data = await financeService.processFiatWithdrawal(
@@ -162,7 +163,7 @@ exports.fiatWithdrawal = async (req, res) => {
                 payeeNote:      `Azaman MoMo payout (${networkChoice})`
             });
         } catch (gatewayErr) {
-            logger.error({ err: gatewayErr }, '[fiatWithdrawal] Moolre dispatch failed');
+            logger.error({ err: gatewayErr }, '[fiatWithdrawal] Disbursement dispatch failed');
             // Roll back the debit + the SystemMasterCrypto capture so the
             // user is not stuck and Azaman is not double-credited.
             try {
@@ -174,7 +175,7 @@ exports.fiatWithdrawal = async (req, res) => {
                 if (emitBalanceUpdate) await emitBalanceUpdate(userId);
                 return res.status(502).json({
                     success: false,
-                    code:    'MOOLRE_DISBURSEMENT_REJECTED',
+                    code:    'DISBURSEMENT_REJECTED',
                     message: `Payout rejected: ${gatewayErr.message}. Funds returned to your wallet.`,
                     data:    { reference, reversal }
                 });
@@ -182,7 +183,7 @@ exports.fiatWithdrawal = async (req, res) => {
                 logger.error({ err: reverseErr }, '[fiatWithdrawal] CRITICAL reversal failure');
                 return res.status(500).json({
                     success: false,
-                    code:    'MOOLRE_DISBURSEMENT_REVERSAL_FAILED',
+                    code:    'DISBURSEMENT_REVERSAL_FAILED',
                     message:
                         `MTN MoMo rejected the payout AND reversal failed. ` +
                         `An admin has been notified. Reference: ${reference}.`,

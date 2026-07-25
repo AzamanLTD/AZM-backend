@@ -50,7 +50,8 @@ exports.fiatWithdrawal = async (req, res) => {
     const prisma                  = req.app.get('prisma');
     const io                      = req.app.get('socketio');
     const emitBalanceUpdate       = req.app.get('emitBalanceUpdate');
-    const mtnDisbursementService  = req.app.get('mtnDisbursementService');
+    const paymentFailoverService  = req.app.get("paymentFailoverService");
+    const mtnDisbursementService  = paymentFailoverService || req.app.get("mtnDisbursementService"); // failover-aware
     const emailService            = req.app.get('emailService');
     const smsService              = req.app.get('smsService');
 
