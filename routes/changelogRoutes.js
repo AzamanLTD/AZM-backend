@@ -1,12 +1,9 @@
 // routes/changelogRoutes.js
-// =============================================================================
 // Changelog routes — user-facing + admin
-// =============================================================================
 
 const express = require('express');
 const router = express.Router();
-const { protect, protectActive } = require('../middleware/authMiddleware');
-const { adminOnly } = require('../middleware/adminMiddleware');
+const { protect, adminOnly } = require('../middleware/authMiddleware');
 const ctrl = require('../controllers/changelogController');
 
 // ── User-facing ────────────────────────────────────────────────────────────
