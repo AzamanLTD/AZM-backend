@@ -196,6 +196,7 @@ exports.exportUserData = async (req, res) => {
         return res.status(500).json({
             success: false,
             message: 'Could not generate data export.',
+            error: process.env.NODE_ENV === 'test' ? e.message : undefined,
         });
     }
 };

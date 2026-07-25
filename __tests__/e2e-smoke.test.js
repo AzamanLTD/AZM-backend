@@ -274,6 +274,7 @@ describeOrSkip('E2E Smoke Tests — Core Flows', () => {
             const res = await request(app)
                 .get('/api/security/data-export')
                 .set(authHeader(customerToken));
+            if (res.statusCode !== 200) console.error('DATA EXPORT ERROR:', JSON.stringify(res.body));
             expect(res.statusCode).toBe(200);
             expect(res.body.success).toBe(true);
             expect(res.body.data).toBeTruthy();
