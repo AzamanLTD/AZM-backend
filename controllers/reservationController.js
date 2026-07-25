@@ -7,6 +7,7 @@
 // =============================================================================
 
 const logger = require('../src/config/logger');
+const { emitWebhookEvent } = require('../services/webhookEmitter');
 const crypto = require('crypto');
 
 function genRef() {
@@ -61,6 +62,18 @@ exports.createReservation = async (req, res) => {
                 status:            'PENDING',
             },
         });
+
+        // Fire-and-forget webhook for reservation creation
+        emitWebhookEvent(biz.id, 'reservation.created', {
+            reservationId: reservation.id,
+            reservationRef: reservation.reservationRef,
+            customerId,
+            startDatetime: start.toISOString(),
+            endDatetime: end.toISOString(),
+            partySize: reservation.partySize,
+            amountUsdc: reservation.amountUsdc,
+        });
+
         return res.status(201).json({ success: true, reservation });
     } catch (err) {
         const code = err.status || 500;
@@ -181,6 +194,16 @@ exports.confirmReservation = async (req, res) => {
             where: { id: reservationId },
             data:  { status: 'CONFIRMED', confirmedAt: new Date(), businessNotes: req.body.businessNotes || null },
         });
+
+        // Fire-and-forget webhook for reservation confirmation
+        emitWebhookEvent(profile.id, 'reservation.confirmed', {
+            reservationId: updated.id,
+            reservationRef: updated.reservationRef,
+            customerId: updated.customerId,
+            status: 'CONFIRMED',
+            confirmedAt: updated.confirmedAt,
+        });
+
         return res.status(200).json({ success: true, reservation: updated });
     } catch (err) {
         return res.status(500).json({ success: false, message: err.message });

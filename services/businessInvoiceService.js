@@ -13,6 +13,7 @@
 // =============================================================================
 'use strict';
 const { computeLineItems, computeTaxLines } = require('../utils/invoiceMath');
+const { emitWebhookEvent } = require('./webhookEmitter');
 
 // Generates: INV-YYMMDD-XXXX (e.g. INV-260620-A3F2)
 const _invoiceRef = () => {
@@ -56,7 +57,7 @@ const createInvoice = async (prisma, {
   }
   if (!invoiceRef) throw new Error('Could not generate invoice reference. Retry.');
 
-  return prisma.businessInvoice.create({
+  const invoice = await prisma.businessInvoice.create({
     data: {
       businessProfileId, customerId, locationId: locationId || null,
       tableId: tableId || null,
@@ -69,6 +70,17 @@ const createInvoice = async (prisma, {
     },
     include: { lineItems: true, taxLines: true },
   });
+
+  // Fire-and-forget webhook for invoice creation
+  emitWebhookEvent(businessProfileId, 'invoice.created', {
+    invoiceId: invoice.id,
+    invoiceRef: invoice.invoiceRef,
+    customerId,
+    billTotal: invoice.billTotalUsdc,
+    status: invoice.status,
+  });
+
+  return invoice;
 };
 
 // ── sendInvoice ────────────────────────────────────────────────────────────

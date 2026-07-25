@@ -84,4 +84,4 @@ remaining work. Treat this as an ongoing standing checklist, not a one-time pass
 | ✅ | Manual retry endpoint | Force retry of failed deliveries |
 | ✅ | Cron retry queue | Every 2 min, picks up RETRYING/FAILED deliveries with backoff |
 | ✅ | Webhook secret signing | HMAC-SHA256 signature on every payload |
-| 🔲 | Webhook delivery to be wired into actual order/booking events | Dispatcher function exists, needs integration with event emitters |
+| ✅ | Webhook delivery wired into business events | `webhookEmitter.js` — fire-and-forget emitter wired into `businessOrderService.createOrder` (order.created), `businessInvoiceService.createInvoice` (invoice.created), `reservationController.createReservation` (reservation.created) + `confirmReservation` (reservation.confirmed). 5 tests. |
