@@ -1,5 +1,6 @@
 // controllers/adminController.js
 const logger = require('../src/config/logger');
+const { getReadPrisma } = require('../src/config/readReplica');
 const { sendPushNotification } = require('../utils/firebaseService');
 const { parsePagination, buildPageEnvelope } = require('../utils/pagination');
 const { audit } = require('../utils/audit');
@@ -372,7 +373,7 @@ exports.forceCancel = async (req, res) => {
  * 5. PLATFORM METRICS
  */
 exports.getPlatformStats = async (req, res) => {
-    const prisma = req.app.get('prisma');
+    const prisma = getReadPrisma(req.app);
 
     try {
         const totalUsers = await prisma.user.count();
@@ -769,7 +770,7 @@ exports.liquidateProfits = async (req, res) => {
 //  but the route now points here)
 const _originalGetPlatformStats = exports.getPlatformStats;
 exports.getPlatformStats = async (req, res) => {
-    const prisma = req.app.get('prisma');
+    const prisma = getReadPrisma(req.app);
 
     try {
         const now = new Date();
@@ -913,7 +914,7 @@ exports.getPlatformStats = async (req, res) => {
  *     Includes daily breakdown for charting and source categorization.
  */
 exports.getProfitBreakdown = async (req, res) => {
-    const prisma = req.app.get('prisma');
+    const prisma = getReadPrisma(req.app);
 
     try {
         const now = new Date();
@@ -1018,7 +1019,7 @@ exports.getProfitBreakdown = async (req, res) => {
  *     GET /api/admin/users?page=1&limit=20&search=john&role=VENDOR&banStatus=ACTIVE
  */
 exports.getUsers = async (req, res) => {
-    const prisma = req.app.get('prisma');
+    const prisma = getReadPrisma(req.app);
 
     try {
         const page = Math.max(1, parseInt(req.query.page) || 1);
@@ -1331,7 +1332,7 @@ exports.changeUserRole = async (req, res) => {
  * to evolve.
  */
 exports.getPendingWithdrawals = async (req, res) => {
-    const prisma = req.app.get('prisma');
+    const prisma = getReadPrisma(req.app);
 
     try {
         const queryHasNoPaginationParams =
@@ -1588,7 +1589,7 @@ exports.rejectWithdrawal = async (req, res) => {
  *     Returns all 4 system pool balances + operational status.
  */
 exports.getSystemHealth = async (req, res) => {
-    const prisma = req.app.get('prisma');
+    const prisma = getReadPrisma(req.app);
 
     try {
         const [masterCrypto, hotWallet, fiatPool, profitFees, settings, recentTrades, recentDeposits] = await Promise.all([
@@ -1802,7 +1803,7 @@ exports.updatePayoutSettings = async (req, res) => {
  * Supports cursor pagination.
  */
 exports.getNeedsManualReview = async (req, res) => {
-    const prisma = req.app.get('prisma');
+    const prisma = getReadPrisma(req.app);
 
     try {
         const queryHasNoPaginationParams =
@@ -1896,7 +1897,7 @@ async function _injectEscrowSystemMessage(prisma, io, ticket, content, metadata 
 
 // GET /api/admin/escrow-disputes?status=&page=&limit=
 exports.getEscrowDisputes = async (req, res) => {
-    const prisma = req.app.get('prisma');
+    const prisma = getReadPrisma(req.app);
     try {
         const { status } = req.query;
         const VALID = ['PENDING', 'ASSIGNED', 'UNDER_REVIEW', 'RESOLVED'];
@@ -2094,7 +2095,7 @@ exports.resolveEscrowDispute = async (req, res) => {
 // Filters: ?page=&limit=&action=&targetType=&actorId=
 // =============================================================================
 exports.getAuditLog = async (req, res) => {
-    const prisma = req.app.get('prisma');
+    const prisma = getReadPrisma(req.app);
     try {
         const page  = Math.max(1, parseInt(req.query.page)  || 1);
         const limit = Math.min(100, parseInt(req.query.limit) || 50);

@@ -52,6 +52,12 @@ const prisma = new PrismaClient({ adapter });
     }
 })();
 
+// ── Read Replica (Phase 2: Scalability & Security) ────────────────────────
+// Optional secondary PrismaClient for analytics / dashboard queries.
+// Falls back to primary when DATABASE_REPLICA_URL is not set.
+const { initReadReplica } = require('./readReplica');
+initReadReplica();
+
 // --- LIVE MARKET ORACLE ---
 const OracleService = require('../../services/oracleService');
 const marketOracle = new OracleService(prisma);

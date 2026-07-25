@@ -7,13 +7,14 @@
 // =============================================================================
 
 const logger = require('../src/config/logger');
+const { getReadPrisma } = require('../src/config/readReplica');
 const NotificationService = require('../services/notificationService');
 const { parsePagination, buildPageEnvelope } = require('../utils/pagination');
 
 let notificationService;
 function getNotificationService(req) {
     if (!notificationService) {
-        const prisma = req.app.get('prisma');
+        const prisma = getReadPrisma(req.app);
         const io = req.app.get('socketio');
         notificationService = new NotificationService(prisma, io);
     }
@@ -27,7 +28,7 @@ function getNotificationService(req) {
 // Returns matching users (excludes self, deleted accounts, sensitive fields)
 // =============================================================================
 exports.searchUsers = async (req, res) => {
-    const prisma = req.app.get('prisma');
+    const prisma = getReadPrisma(req.app);
 
     try {
         const { q } = req.query;
@@ -162,7 +163,7 @@ exports.searchUsers = async (req, res) => {
 // Body: { addresseeId, message }
 // =============================================================================
 exports.sendFriendRequest = async (req, res) => {
-    const prisma = req.app.get('prisma');
+    const prisma = getReadPrisma(req.app);
     const io = req.app.get('socketio');
 
     try {
@@ -334,7 +335,7 @@ exports.sendFriendRequest = async (req, res) => {
 // GET /api/friends/requests
 // =============================================================================
 exports.getPendingRequests = async (req, res) => {
-    const prisma = req.app.get('prisma');
+    const prisma = getReadPrisma(req.app);
 
     try {
         const userId = req.user.id;
@@ -399,7 +400,7 @@ exports.getPendingRequests = async (req, res) => {
 // GET /api/friends/requests/sent
 // =============================================================================
 exports.getSentRequests = async (req, res) => {
-    const prisma = req.app.get('prisma');
+    const prisma = getReadPrisma(req.app);
 
     try {
         const userId = req.user.id;
@@ -441,7 +442,7 @@ exports.getSentRequests = async (req, res) => {
 // PUT /api/friends/request/:id/accept
 // =============================================================================
 exports.acceptFriendRequest = async (req, res) => {
-    const prisma = req.app.get('prisma');
+    const prisma = getReadPrisma(req.app);
     const io = req.app.get('socketio');
 
     try {
@@ -517,7 +518,7 @@ exports.acceptFriendRequest = async (req, res) => {
 // PUT /api/friends/request/:id/reject
 // =============================================================================
 exports.rejectFriendRequest = async (req, res) => {
-    const prisma = req.app.get('prisma');
+    const prisma = getReadPrisma(req.app);
 
     try {
         const { id } = req.params;
@@ -575,7 +576,7 @@ exports.rejectFriendRequest = async (req, res) => {
 //     old `select` returned; only the spread-style construction changed.
 // =============================================================================
 exports.getFriends = async (req, res) => {
-    const prisma = req.app.get('prisma');
+    const prisma = getReadPrisma(req.app);
 
     try {
         const userId = req.user.id;
@@ -800,7 +801,7 @@ exports.getFriends = async (req, res) => {
 // DELETE /api/friends/:id
 // =============================================================================
 exports.removeFriend = async (req, res) => {
-    const prisma = req.app.get('prisma');
+    const prisma = getReadPrisma(req.app);
 
     try {
         const { id } = req.params;
@@ -836,7 +837,7 @@ exports.removeFriend = async (req, res) => {
 // GET /api/friends/profile/:userId
 // =============================================================================
 exports.getFriendProfile = async (req, res) => {
-    const prisma = req.app.get('prisma');
+    const prisma = getReadPrisma(req.app);
 
     try {
         const targetId = parseInt(req.params.userId);

@@ -52,7 +52,7 @@ async function startWorkers(app, {
     const leaderboardWorker = new LeaderboardWorker(prisma, io);
 
     const AnalyticsWorker = require('../../workers/analyticsWorker');
-    const analyticsWorker = new AnalyticsWorker(prisma);
+    const analyticsWorker = new AnalyticsWorker(prisma, app);
 
     const CfoWorker = require('../../workers/cfoWorker');
     const cfoWorker = new CfoWorker(prisma, io);
@@ -90,7 +90,7 @@ async function startWorkers(app, {
     // ── Register all workers with the scheduler ───────────────────────────
     // Cron-based workers (use cron expressions)
     await register('leaderboard',        '0 0 * * 0',   () => leaderboardWorker.computeWeeklyLeaderboard());
-    await register('analytics',         '0 * * * *',    () => analyticsWorker.computeHourlyAnalytics());
+    await register('analytics',         '0 * * * *',    () => analyticsWorker.aggregateDailySnapshot());
     await register('cfo',               '0 * * * *',    () => cfoWorker.runCfoCycle());
 
     // Interval-based workers (use millisecond intervals)

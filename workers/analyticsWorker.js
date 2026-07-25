@@ -1,8 +1,16 @@
 const logger = require('../src/config/logger');
+const { getReadPrisma } = require('../src/config/readReplica');
+
 class AnalyticsWorker {
-    constructor(prisma) {
+    constructor(prisma, app = null) {
         this.prisma = prisma;
+        this.app = app;
         this.cronJob = null;
+    }
+
+    /** Use the read replica for analytics queries when available. */
+    get readPrisma() {
+        return this.app ? getReadPrisma(this.app) : this.prisma;
     }
 
     start() {
@@ -29,7 +37,7 @@ class AnalyticsWorker {
             const endOfDay = new Date(now);
             endOfDay.setHours(23, 59, 59, 999);
 
-            const totalVolumeResult = await this.prisma.transactionHistory.aggregate({
+            const totalVolumeResult = await this.readPrisma.transactionHistory.aggregate({
                 where: {
                     createdAt: {
                         gte: startOfDay,
@@ -44,7 +52,7 @@ class AnalyticsWorker {
 
             const totalVolumeUsdc = totalVolumeResult._sum.amountUsdc || 0;
 
-            const profitBySourceRaw = await this.prisma.adminProfitLog.groupBy({
+            const profitBySourceRaw = await this.readPrisma.adminProfitLog.groupBy({
                 by: ['source'],
                 where: {
                     createdAt: {
@@ -65,7 +73,7 @@ class AnalyticsWorker {
                 totalProfitUsdc += sum;
             }
 
-            const activeUsers = await this.prisma.user.count({
+            const activeUsers = await this.readPrisma.user.count({
                 where: {
                     transactions: {
                         some: {
