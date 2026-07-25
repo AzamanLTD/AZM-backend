@@ -2205,6 +2205,139 @@ router.get('/invoices/stats', wrap(async (req, res) => {
     });
 }));
 
+
+// ── Recurring Invoice Endpoints (Phase 3) ────────────────────────────────────
+
+// GET /api/business-os/invoices/recurring — list recurring invoice templates
+router.get('/invoices/recurring', wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+    if (!bpId) return res.json({ success: true, invoices: [] });
+
+    const invoices = await prisma.businessInvoice.findMany({
+        where: { businessProfileId: bpId, isRecurring: true },
+        include: { lineItems: true, customer: { select: { id: true, email: true, full_name: true } } },
+        orderBy: { recurringNextDate: 'asc' },
+    });
+    res.json({ success: true, invoices });
+}));
+
+// POST /api/business-os/invoices/:id/enable-recurring — enable recurring on an invoice
+router.post('/invoices/:id/enable-recurring', wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+    const { id } = req.params;
+    const { interval } = req.body;
+
+    if (!['DAILY', 'WEEKLY', 'MONTHLY', 'QUARTERLY', 'YEARLY'].includes(interval)) {
+        return res.status(400).json({ success: false, message: 'Invalid interval.' });
+    }
+
+    const now = new Date();
+    let nextDate = new Date(now);
+    switch (interval) {
+        case 'DAILY':     nextDate.setDate(now.getDate() + 1); break;
+        case 'WEEKLY':    nextDate.setDate(now.getDate() + 7); break;
+        case 'MONTHLY':   nextDate.setMonth(now.getMonth() + 1); break;
+        case 'QUARTERLY': nextDate.setMonth(now.getMonth() + 3); break;
+        case 'YEARLY':    nextDate.setFullYear(now.getFullYear() + 1); break;
+    }
+
+    const invoice = await prisma.businessInvoice.update({
+        where: { id, businessProfileId: bpId },
+        data: { isRecurring: true, recurringInterval: interval, recurringNextDate: nextDate },
+        include: { lineItems: true },
+    });
+    res.json({ success: true, invoice });
+}));
+
+// POST /api/business-os/invoices/:id/disable-recurring — disable recurring
+router.post('/invoices/:id/disable-recurring', wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+    const { id } = req.params;
+
+    const invoice = await prisma.businessInvoice.update({
+        where: { id, businessProfileId: bpId },
+        data: { isRecurring: false, recurringInterval: null, recurringNextDate: null },
+    });
+    res.json({ success: true, invoice });
+}));
+
+// POST /api/business-os/invoices/process-recurring — auto-generate due recurring invoices
+router.post('/invoices/process-recurring', wrap(async (req, res) => {
+    const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+    const now = new Date();
+
+    const dueTemplates = await prisma.businessInvoice.findMany({
+        where: {
+            businessProfileId: bpId,
+            isRecurring: true,
+            recurringNextDate: { lte: now },
+            status: { in: ['PAID', 'SENT'] },
+        },
+        include: { lineItems: true, taxLines: true },
+    });
+
+    const created = [];
+    for (const template of dueTemplates) {
+        const dateStr = now.toISOString().slice(2, 10).replace(/-/g, '');
+        const rand = Math.random().toString(36).slice(2, 6).toUpperCase();
+        const newRef = `INV-${dateStr}-${rand}`;
+
+        const newInvoice = await prisma.businessInvoice.create({
+            data: {
+                businessProfileId: template.businessProfileId,
+                locationId: template.locationId,
+                tableId: null,
+                customerId: template.customerId,
+                invoiceRef: newRef,
+                status: 'DRAFT',
+                subtotalUsdc: template.subtotalUsdc,
+                taxTotalUsdc: template.taxTotalUsdc,
+                billTotalUsdc: template.billTotalUsdc,
+                businessNote: template.businessNote,
+                recurringParentId: template.id,
+                lineItems: {
+                    create: template.lineItems.map(li => ({
+                        description: li.description,
+                        quantity: li.quantity,
+                        unitPrice: li.unitPrice,
+                        lineTotal: li.lineTotal,
+                    })),
+                },
+                taxLines: {
+                    create: template.taxLines.map(tl => ({
+                        label: tl.label,
+                        type: tl.type,
+                        value: tl.value,
+                        amount: tl.amount,
+                    })),
+                },
+            },
+        });
+
+        let nextDate = new Date(now);
+        switch (template.recurringInterval) {
+            case 'DAILY':     nextDate.setDate(now.getDate() + 1); break;
+            case 'WEEKLY':    nextDate.setDate(now.getDate() + 7); break;
+            case 'MONTHLY':   nextDate.setMonth(now.getMonth() + 1); break;
+            case 'QUARTERLY': nextDate.setMonth(now.getMonth() + 3); break;
+            case 'YEARLY':    nextDate.setFullYear(now.getFullYear() + 1); break;
+        }
+
+        await prisma.businessInvoice.update({
+            where: { id: template.id },
+            data: { recurringNextDate: nextDate },
+        });
+
+        created.push({ id: newInvoice.id, ref: newRef });
+    }
+
+    res.json({ success: true, generated: created.length, invoices: created });
+}));
+
 // ── Booking Dashboard ────────────────────────────────────────────────────────
 
 // GET /api/business-os/booking/dashboard — unified booking stats

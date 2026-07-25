@@ -1410,6 +1410,20 @@ model GlobalSettings {
   updatedAt DateTime @updatedAt
 }
 
+// QR Forge scan tracking (Phase 3)
+model QrScan {
+  id        String   @id @default(uuid())
+  ipAddress String?  @db.VarChar(100)
+  userAgent String?  @db.VarChar(500)
+  referrer  String?  @db.VarChar(500)
+  country   String?  @db.VarChar(50)
+  city      String?  @db.VarChar(100)
+  createdAt DateTime @default(now())
+
+  @@index([createdAt])
+  @@index([ipAddress])
+}
+
 // =============================================================================
 // ADMIN FEE PROFILES — Dynamic Fee Override System
 //
@@ -2695,6 +2709,11 @@ model BusinessInvoice {
   payTxHash          String?       @unique // idempotency anchor — set at PAID
   paymentMethod      String?       @db.VarChar(20) // "AZAMAN_BALANCE" | "CASH" | "SPLIT"
   idempotencyKey     String?       @unique // client-supplied dedup for offline sync
+  // Phase 3: Recurring invoice support
+  isRecurring       Boolean       @default(false)
+  recurringInterval String?       @db.VarChar(20) // DAILY, WEEKLY, MONTHLY, QUARTERLY, YEARLY
+  recurringNextDate DateTime?
+  recurringParentId String?       @db.VarChar(36) // original invoice ID for cloned invoices
 
   businessProfile BusinessProfile           @relation(fields: [businessProfileId], references: [id])
   location        BusinessLocation?         @relation(fields: [locationId], references: [id])

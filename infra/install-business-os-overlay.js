@@ -386,6 +386,28 @@ STATEMENTS.push(`DO $$ BEGIN
     END IF;
   END $$;`);
 
+
+// ── Phase 3: QrScan table ────────────────────────────────────────────────────
+STATEMENTS.push(`CREATE TABLE IF NOT EXISTS "QrScan" (
+    "id" VARCHAR(36) NOT NULL,
+    "ipAddress" VARCHAR(100),
+    "userAgent" VARCHAR(500),
+    "referrer" VARCHAR(500),
+    "country" VARCHAR(50),
+    "city" VARCHAR(100),
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT "QrScan_pkey" PRIMARY KEY ("id")
+);`);
+STATEMENTS.push('CREATE INDEX IF NOT EXISTS "QrScan_createdAt_idx" ON "QrScan"("createdAt");');
+STATEMENTS.push('CREATE INDEX IF NOT EXISTS "QrScan_ipAddress_idx" ON "QrScan"("ipAddress");');
+
+// ── Phase 3: BusinessInvoice recurring fields ────────────────────────────────
+STATEMENTS.push('ALTER TABLE "BusinessInvoice" ADD COLUMN IF NOT EXISTS "isRecurring" BOOLEAN NOT NULL DEFAULT false;');
+STATEMENTS.push('ALTER TABLE "BusinessInvoice" ADD COLUMN IF NOT EXISTS "recurringInterval" VARCHAR(20);');
+STATEMENTS.push('ALTER TABLE "BusinessInvoice" ADD COLUMN IF NOT EXISTS "recurringNextDate" TIMESTAMP(3);');
+STATEMENTS.push('ALTER TABLE "BusinessInvoice" ADD COLUMN IF NOT EXISTS "recurringParentId" VARCHAR(36);');
+STATEMENTS.push('CREATE INDEX IF NOT EXISTS "BusinessInvoice_recurringNextDate_idx" ON "BusinessInvoice"("recurringNextDate");');
+
 async function main() {
   logger.info(`[business-os-overlay] Running ${STATEMENTS.length} DDL statements…`);
   let ok = 0;
