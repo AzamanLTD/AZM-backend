@@ -769,211 +769,24 @@ const { MomoNameLookupService } = require('./services/momoNameLookupService');
 const momoNameLookupService = new MomoNameLookupService(moolreCollectionService);
 app.set('momoNameLookupService', momoNameLookupService);
 
-// --- WORKERS ---
-// Background workers schedule cron jobs / setInterval timers inside their
-// .start(). Under test (NODE_ENV==='test' — e.g. __tests__/auth.test.js requires
-// this module via supertest) we must NOT start them: the open handles would hang
-// the jest process and the scheduled jobs would run against the disposable test
-// DB. We guard only .start() (not instantiation) so the references in the listen
-// callback and graceful-shutdown handler stay in module scope.
 const IS_TEST_ENV = process.env.NODE_ENV === 'test';
-const startWorker = (w) => { if (!IS_TEST_ENV) w.start(); };
-
-const TradeWorker = require('./workers/tradeWorker');
-const tradeWorker = new TradeWorker(prisma, io, tradeSocketService);
-
-const LeaderboardWorker = require('./workers/leaderboardWorker');
-const leaderboardWorker = new LeaderboardWorker(prisma, io);
-startWorker(leaderboardWorker);
-
-const AnalyticsWorker = require('./workers/analyticsWorker');
-const analyticsWorker = new AnalyticsWorker(prisma);
-startWorker(analyticsWorker);
-
-const CfoWorker = require('./workers/cfoWorker');
-const cfoWorker = new CfoWorker(prisma, io);
-startWorker(cfoWorker);
-
-const SavingsWorker = require('./workers/savingsWorker');
-const savingsWorker = new SavingsWorker(prisma, io);
-startWorker(savingsWorker);
-
-const WithdrawalReconciliationWorker = require('./workers/withdrawalReconciliationWorker');
-const withdrawalReconciliationWorker =
-    new WithdrawalReconciliationWorker(prisma, io, mtnDisbursementService, emailService, smsService);
-startWorker(withdrawalReconciliationWorker);
-
-// --- PAYOUT BATCH WORKER (Phase Q8) ---
-// Scans PENDING fiat withdrawals and auto-dispatches when pool has liquidity
-// AND amount is below the admin-configured threshold. Flags oversized or
-// under-funded withdrawals as NEEDS_MANUAL_REVIEW for the War Room.
-const PayoutBatchWorker = require('./workers/payoutBatchWorker');
-const payoutBatchWorker = new PayoutBatchWorker(prisma, io, mtnDisbursementService, notificationService);
-startWorker(payoutBatchWorker);
-app.set('payoutBatchWorker', payoutBatchWorker);
-
-// --- SMART ESCROW EXPIRY WORKER (2026-06-14) ---
-// Sweeps DRAFT escrows past 24h and FUNDED escrows past 30d of inactivity
-// (refunding the payer), every 30 minutes. No-op safe in test mode.
-const EscrowExpiryWorker = require('./workers/escrowExpiryWorker');
-const escrowExpiryWorker = new EscrowExpiryWorker(prisma, io, notificationService);
-startWorker(escrowExpiryWorker);
-app.set('escrowExpiryWorker', escrowExpiryWorker);
-
-// --- MASTER SPRINT WORKERS (Vault / Susu / Smart Route / AZM Auction) ---
-const VaultWorker = require('./workers/vaultWorker');
-const vaultWorker = new VaultWorker(prisma, vaultService, notificationService);
-startWorker(vaultWorker);
-
-const SusuWorker = require('./workers/susuWorker');
-const susuWorker = new SusuWorker(prisma, susuService);
-startWorker(susuWorker);
-
-// ── Phase 3 (private-susu-ecosystem) workers — 2026-05-31 ───────────────────
-// V2 cycle scheduler (60s cadence) handles SusuGroups with contractVersion
-// set. Legacy susuWorker above continues to handle pre-Phase-3 SusuGroups
-// whose contractVersion is null. Reminder cron + PoR expiry sweep complete
-// the Phase 3 surface. All three workers are no-ops in test mode.
-if (process.env.NODE_ENV !== 'test') {
-
-
-    const SusuCycleService          = require('./services/susu/susuCycle.service');
-    const SusuCycleSchedulerV2      = require('./workers/susuCycleSchedulerV2');
-    const SusuReminderCron          = require('./workers/susuReminderCron');
-    const PorExpirySweep            = require('./workers/porExpirySweep');
-
-    // Wait until the treasury cache (server.js earlier IIFE) has resolved
-    // before instantiating the cycle service — it depends on the
-    // azamanTreasuryUserId.
-    //
-    // Resilience (Susu Sprint, 2026-06-01): the treasury seed may land
-    // after boot (e.g. the release `migrate + seed` step runs in parallel
-    // with the first server start, or an operator seeds manually later).
-    // Rather than give up after 10s and leave the cycle workers dead until
-    // the next full restart, we poll patiently (every 5s for up to 30 min).
-    // The poll is cheap (an in-memory app.get) and self-terminates the
-    // moment the id resolves. Susu cycle execution thus comes online
-    // automatically once the DB is prepared — no redeploy required.
-    const startV2Workers = async () => {
-        const start = Date.now();
-        const MAX_WAIT_MS = 30 * 60 * 1000; // 30 minutes
-        while (!app.get('azamanTreasuryUserId') && Date.now() - start < MAX_WAIT_MS) {
-            await new Promise(r => setTimeout(r, 5000));
-        }
-        const treasuryUserId = app.get('azamanTreasuryUserId');
-        if (!treasuryUserId) {
-            logger.warn('SusuV2 Workers: treasury cache not resolved within 30 min. Cycle/reminder/PoR workers NOT started. Seed the treasury row and restart the service. Rest of backend unaffected.');
-            return;
-        }
-        const susuCycleService = new SusuCycleService(prisma, {
-            susuVouchService:    app.get('susuVouchService'),
-            susuMemberService:   app.get('susuMemberService'),
-            adminWarRoomService: app.get('adminWarRoomService'),
-            notificationService,
-            io,
-            treasuryUserId,
-        });
-        app.set('susuCycleService', susuCycleService);
-
-        const cycleSchedulerV2 = new SusuCycleSchedulerV2(prisma, susuCycleService);
-        cycleSchedulerV2.start();
-        app.set('susuCycleSchedulerV2', cycleSchedulerV2);
-
-        const reminderCron = new SusuReminderCron(prisma, notificationService);
-        reminderCron.start();
-        app.set('susuReminderCron', reminderCron);
-
-        const porExpirySweep = new PorExpirySweep(prisma, app.get('susuMemberService'), notificationService);
-        porExpirySweep.start();
-        app.set('porExpirySweep', porExpirySweep);
-    };
-    startV2Workers().catch(err => logger.error({ err }, 'SusuV2 workers startup error'));
-}
-
-const SmartRouteWorker = require('./workers/smartRouteWorker');
-const smartRouteWorker = new SmartRouteWorker(prisma, smartRouteService);
-startWorker(smartRouteWorker);
-
-// PHASE 5 / Workstream D — Susu initiation countdown sweep (every 60s).
-// Independent of the treasury cache (it only manages membership + activation),
-// so it starts unconditionally. No-op in test mode.
-if (process.env.NODE_ENV !== 'test') {
-    const SusuInitiationSweep = require('./workers/susuInitiationSweep');
-    const susuInitiationSweep = new SusuInitiationSweep(prisma, susuInitiationService);
-    susuInitiationSweep.start();
-    app.set('susuInitiationSweep', susuInitiationSweep);
-}
-
-const AzmAuctionWorker = require('./workers/azmAuctionWorker');
-const azmAuctionWorker = new AzmAuctionWorker(prisma, azmAuctionService);
-startWorker(azmAuctionWorker);
-
-// MARKETPLACE EXPANSION — No-Show Penalty Sweep
-if (process.env.NODE_ENV !== 'test') {
-    const noShowWorker = require('./workers/reservationNoShowWorker');
-    // Run every hour
-    cron.schedule('0 * * * *', async () => {
-        try {
-            logger.info('NoShowWorker: running scheduled sweep');
-            const results = await noShowWorker.sweepAll(prisma);
-            logger.info({ results }, 'NoShowWorker: sweep complete');
-        } catch (err) {
-            logger.error({ err }, 'NoShowWorker: sweep failed');
-        }
-    });
-}
-
-// FIX (2026-07-06): both workers below were fully written (and each has its
-// own internal try/catch) but were never actually registered with cron --
-// their own file headers literally said "ADD to server.js" as a to-do that
-// was never done. sweepExpiredAds in particular is what keeps the
-// marketplace "status"/ad-feed table from growing unbounded (reads already
-// filter expired rows out, so this was silent DB bloat, not a user-facing
-// bug -- but it's exactly the kind of thing that quietly gets worse over
-// time if never registered).
-if (process.env.NODE_ENV !== 'test') {
-    const { sweepTransitReminders } = require('./workers/transitReminderWorker');
-    const { sweepExpiredAds } = require('./workers/businessAdExpiryWorker');
-    cron.schedule('*/15 * * * *', () => sweepTransitReminders(prisma));
-    cron.schedule('*/30 * * * *', () => sweepExpiredAds(prisma));
-
-    // Webhook retry queue — process stuck RETRYING deliveries every 2 minutes
-    const webhookDispatcher = require('./services/webhookDispatcher');
-    cron.schedule('*/2 * * * *', async () => {
-        try {
-            const count = await webhookDispatcher.processRetryQueue();
-            if (count > 0) logger.info({ count }, 'WebhookRetry: processed stuck deliveries');
-        } catch (e) {
-            logger.warn({ err: e }, 'WebhookRetry error');
-        }
-    });
-}
-
-// ── D-05: record worker liveness for GET /health ─────────────────────────────
-// These all called .start() above. tradeWorker is special: it is instantiated
-// here but only .start()'d in the server.listen callback (so its expiry sweep
-// doesn't run before the server is accepting traffic). We seed it as
-// 'pending_listen' and flip it to 'running' from that callback, so /health
-// reflects its true state rather than omitting it. The Susu V2 cycle workers
-// start asynchronously after the treasury cache resolves and register
-// themselves via app.set(...); /health reflects them through the app registry.
-Object.assign(workerStatus, {
-    leaderboardWorker: 'running',
-    analyticsWorker: 'running',
-    cfoWorker: 'running',
-    savingsWorker: 'running',
-    withdrawalReconciliationWorker: 'running',
-    payoutBatchWorker: 'running',
-    vaultWorker: 'running',
-    susuWorker: 'running',
-    smartRouteWorker: 'running',
-    azmAuctionWorker: 'running',
-    tradeWorker: 'pending_listen',
+// ── Worker Registry (extracted to src/workers/index.js) ──────────────────────
+const { startWorkers } = require('./src/workers/index');
+const { tradeWorker, withdrawalReconciliationWorker } = startWorkers(app, {
+    prisma,
+    io,
+    workerStatus,
+    tradeSocketService,
+    mtnDisbursementService,
+    emailService,
+    smsService,
+    notificationService,
+    vaultService,
+    susuService,
+    smartRouteService,
+    azmAuctionService,
+    susuInitiationService,
 });
-if (process.env.NODE_ENV === 'test') {
-    // Workers are no-ops in test mode; don't claim they're running.
-    for (const k of Object.keys(workerStatus)) workerStatus[k] = 'disabled_in_test';
-}
 
 // --- OFFLINE PUSH HELPER ---
 const pushIfOffline = async (userId, title, body, extra = {}) => {
