@@ -62,8 +62,8 @@ const workerStatus = {};
 // 'connected' / 'disconnected' driven by the ioredis client events.
 let redisStatus = 'not_configured';
 
-// --- FIREBASE CLOUD MESSAGING ---
-const { sendPushNotification } = require('./utils/firebaseService');
+// ── Socket helpers (extracted to src/sockets/helpers.js) ─────────────────────
+const { createPushIfOffline, createEmitBalanceUpdate } = require('./src/sockets/helpers');
 
 // --- RATE LIMITING (CRITICAL-3) ---
 const {
@@ -295,52 +295,9 @@ const { tradeWorker, withdrawalReconciliationWorker } = startWorkers(app, {
     susuInitiationService,
 });
 
-// --- OFFLINE PUSH HELPER ---
-const pushIfOffline = async (userId, title, body, extra = {}) => {
-    try {
-        if (!userId) return;
-        const room = `user_${userId}`;
-        const sockets = await io.in(room).allSockets();
-        if (sockets && sockets.size > 0) return;
-
-        const user = await prisma.user.findUnique({
-            where: { id: parseInt(userId) },
-            select: { fcmToken: true }
-        });
-        if (!user || !user.fcmToken) return;
-
-        await sendPushNotification(user.fcmToken, title, body, extra);
-    } catch (err) {
-        logger.error({ err }, 'pushIfOffline error');
-    }
-};
-
-const emitBalanceUpdate = async (userId) => {
-    try {
-        const user = await prisma.user.findUnique({
-            where: { id: parseInt(userId) },
-            select: {
-                availableBalance: true,
-                vendorUnallocatedBalance: true,
-                escrowLockedBalance: true,
-                disputeEscrowBalance: true,
-                azmBalance: true
-            }
-        });
-        if (user) {
-            io.to(`balance_room_${userId}`).emit('balance_update', {
-                availableBalance: user.availableBalance,
-                vendorUnallocatedBalance: user.vendorUnallocatedBalance,
-                escrowLockedBalance: user.escrowLockedBalance,
-                disputeEscrowBalance: user.disputeEscrowBalance,
-                azmBalance: user.azmBalance,
-                currency: 'USDC'
-            });
-        }
-    } catch (err) {
-        logger.error({ err }, "Balance emit error");
-    }
-};
+// ── Socket helpers (pushIfOffline, emitBalanceUpdate) ──
+const pushIfOffline = createPushIfOffline(io, prisma);
+const emitBalanceUpdate = createEmitBalanceUpdate(io, prisma);
 
 // ── Global app registrations (services already handled by registry) ──────────
 app.set('socketio', io);
@@ -394,51 +351,10 @@ setupSocketHandlers(io, {
 });
 
 // ══════════════════════════════════════════════════════════════════════════════
-// ERROR HANDLING
+// ERROR HANDLING (extracted to src/middleware/errorHandler.js)
 // ══════════════════════════════════════════════════════════════════════════════
-
-// 404 catch-all
-app.use((req, res) => {
-    res.status(404).json({ success: false, error: 'Endpoint not found', path: req.originalUrl });
-});
-
-// WS6: Sentry error handler — must come AFTER all controllers/routes and the
-// 404 catch-all, but BEFORE our own error responder so the exception is
-// captured first, then formatted for the client below. No-op without SENTRY_DSN.
-if (process.env.SENTRY_DSN) {
-    Sentry.setupExpressErrorHandler(app);
-}
-
-// HIGH-4: Global error handler — sanitize in production
-app.use((err, req, res, next) => {
-    logger.error({ err }, 'Server error');
-    if (!IS_PRODUCTION) {
-        logger.error({ err }, err.stack);
-    }
-
-    // Multer file size error
-    if (err.code === 'LIMIT_FILE_SIZE') {
-        return res.status(413).json({
-            success: false,
-            message: 'File too large. Maximum size is 5MB.'
-        });
-    }
-
-    // Multer file type error
-    if (err.message && err.message.includes('Only image files')) {
-        return res.status(400).json({
-            success: false,
-            message: err.message
-        });
-    }
-
-    res.status(500).json({
-        success: false,
-        error: 'Internal Server Error',
-        // HIGH-4: Only expose details in non-production
-        ...(IS_PRODUCTION ? {} : { details: err.message })
-    });
-});
+const { mountErrorHandlers } = require('./src/middleware/errorHandler');
+mountErrorHandlers(app, { Sentry, isProduction: IS_PRODUCTION });
 
 // ══════════════════════════════════════════════════════════════════════════════
 // START SERVER + GRACEFUL SHUTDOWN
