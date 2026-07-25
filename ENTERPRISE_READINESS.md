@@ -101,5 +101,6 @@ remaining work. Treat this as an ongoing standing checklist, not a one-time pass
 | 🔲 | Table partitioning | TransactionHistory by month |
 | 🔲 | On-chain sweep worker | Automated USDC liquidity management |
 | 🔲 | WebAuthn/passkey support | Passwordless authentication |
-| 🔲 | OpenAPI spec generation | Auto-generate from route definitions |
+| ✅ | OpenAPI spec generation | `src/config/openapiGenerator.js` — auto-discovers routes from Express 5.x stack, produces OpenAPI 3.0.3 spec. Served at `/api/docs/openapi.json`. 16 tests. |
+| ✅ | VirtualizedList + VirtualizedGrid | Business portal — `@tanstack/react-virtual` based. Wired into Employees page (grid) and Messages conversations list. Handles 1000+ rows without DOM bottleneck. |
 | 🔲 | Disappearing messages | Mobile + backend support |
