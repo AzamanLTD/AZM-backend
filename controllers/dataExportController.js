@@ -87,7 +87,7 @@ exports.exportUserData = async (req, res) => {
             // Contacts (saved numbers)
             prisma.contact.findMany({
                 where: { userId },
-                select: { id: true, phoneNumber: true, displayName: true, createdAt: true },
+                select: { id: true, savedUserId: true, nickname: true, createdAt: true },
                 take: limit,
             }),
 
@@ -196,7 +196,6 @@ exports.exportUserData = async (req, res) => {
         return res.status(500).json({
             success: false,
             message: 'Could not generate data export.',
-            error: process.env.NODE_ENV === 'test' ? e.message : undefined,
         });
     }
 };
