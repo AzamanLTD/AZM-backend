@@ -72,6 +72,102 @@ const adminSettingsController = require('../controllers/adminSettingsController'
 router.get('/settings',              adminSettingsController.getSettings);
 router.put('/settings',              adminSettingsController.updateSettings);
 router.post('/users/:id/risk-tier',  adminSettingsController.setUserRiskTier);
+
+// ─── USER DETAIL DRAWER (Phase 3) ────────────────────────────────────────────
+router.get("/users/:id/detail", async (req, res) => {
+    const prisma = req.app.get("prisma");
+    const readPrisma = req.app.get("readPrisma") || prisma;
+    try {
+        const userId = parseInt(req.params.id, 10);
+        if (isNaN(userId)) return res.status(400).json({ success: false, message: "Invalid user ID." });
+
+        const user = await readPrisma.user.findUnique({
+            where: { id: userId },
+            select: {
+                id: true, username: true, email: true, role: true, kycStatus: true,
+                legalName: true, idType: true, idNumber: true, profilePictureUrl: true,
+                banStatus: true, banUntil: true, strikeCount: true, cancellationAbuseCount: true,
+                availableBalance: true, escrowLockedBalance: true, azmBalance: true, disputeEscrowBalance: true,
+                tradesCompleted: true, completionRate: true, positiveReviews: true, negativeReviews: true,
+                vendorLevel: true, vendorXp: true, loyaltyTier: true, withdrawalRiskTier: true,
+                loginStreak: true, lastLoginAt: true, createdAt: true, isOnline: true, lastSeenAt: true,
+                country: true, phoneNumber: true, phoneVerified: true, azamanId: true, displayName: true, bio: true,
+                totalVolumeUsdc: true, totalProfitUsdc: true, currentStreak: true, longestStreak: true,
+                equippedCardSkin: true, onboardingCompleted: true, preferredCurrency: true,
+                _count: {
+                    select: {
+                        tradesAsBuyer: true,
+                        tradesAsVendor: true,
+                        ads: true,
+                        withdrawals: true,
+                        transactions: true,
+                        notifications: true,
+                    }
+                }
+            }
+        });
+
+        if (!user) return res.status(404).json({ success: false, message: "User not found." });
+
+        // Fetch related data in parallel
+        const [recentTrades, recentWithdrawals, recentTransactions, recentDisputes, activeAds] = await Promise.all([
+            readPrisma.trade.findMany({
+                where: { OR: [{ buyerId: userId }, { vendorId: userId }] },
+                orderBy: { createdAt: "desc" },
+                take: 10,
+                select: { id: true, status: true, amountUsdc: true, feeUsdc: true, createdAt: true, adTitle: true, buyerId: true, vendorId: true }
+            }),
+            readPrisma.withdrawal.findMany({
+                where: { userId },
+                orderBy: { createdAt: "desc" },
+                take: 10,
+                select: { id: true, amountUsdc: true, feeUsdc: true, status: true, method: true, createdAt: true, destinationLabel: true }
+            }),
+            readPrisma.transactionHistory.findMany({
+                where: { userId },
+                orderBy: { createdAt: "desc" },
+                take: 15,
+                select: { id: true, type: true, amountUsdc: true, feeUsdc: true, status: true, createdAt: true, txHash: true }
+            }),
+            readPrisma.disputeResolution.findMany({
+                where: { OR: [{ buyerId: userId }, { vendorId: userId }] },
+                orderBy: { createdAt: "desc" },
+                take: 5,
+                select: { id: true, status: true, reason: true, createdAt: true, resolution: true, tradeId: true }
+            }),
+            readPrisma.ad.findMany({
+                where: { userId, status: "ACTIVE" },
+                orderBy: { createdAt: "desc" },
+                take: 5,
+                select: { id: true, title: true, type: true, pricePerUsdc: true, status: true, createdAt: true }
+            })
+        ]);
+
+        // Recent audit log entries for this user
+        const recentActions = await readPrisma.adminSettingsAuditLog.findMany({
+            where: { targetId: String(userId) },
+            orderBy: { createdAt: "desc" },
+            take: 10,
+            select: { id: true, action: true, adminName: true, changes: true, createdAt: true }
+        });
+
+        return res.status(200).json({
+            success: true,
+            data: {
+                user,
+                recentTrades,
+                recentWithdrawals,
+                recentTransactions,
+                recentDisputes,
+                activeAds,
+                recentActions
+            }
+        });
+    } catch (error) {
+        logger.error({ err: error }, "[userDetail] error");
+        return res.status(500).json({ success: false, message: error.message });
+    }
+});
 router.get('/audit-log',             adminSettingsController.getAuditLog);
 
 // ─── TRADE ACCOUNT VERIFICATION ──────────────────────────────────────────────
