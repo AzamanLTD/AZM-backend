@@ -149,28 +149,9 @@ if (process.env.NODE_ENV === 'production' &&
     logger.warn('CLOUDINARY credentials not set. Profile pictures & media uploads will be saved to EPHEMERAL local disk — files lost on redeploy. Set CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET.');
 }
 
-// CRITICAL-4: Socket.IO JWT Authentication Middleware
-io.use((socket, next) => {
-    const token = socket.handshake.auth?.token || socket.handshake.headers?.authorization?.replace('Bearer ', '');
-
-    if (!token) {
-        return next(new Error('Authentication required: No token provided.'));
-    }
-
-    try {
-        const decoded = jwt.verify(token, JWT_SECRET);
-        if (!decoded.id) {
-            return next(new Error('Authentication failed: Invalid token structure.'));
-        }
-        socket.user = decoded; // Attach user context to socket
-        next();
-    } catch (err) {
-        if (err.name === 'TokenExpiredError') {
-            return next(new Error('Authentication failed: Token expired.'));
-        }
-        return next(new Error('Authentication failed: Invalid token.'));
-    }
-});
+// CRITICAL-4: Socket.IO JWT Authentication (extracted to src/sockets/socketAuth.js)
+const { createSocketAuthMiddleware } = require('./src/sockets/socketAuth');
+io.use(createSocketAuthMiddleware(JWT_SECRET));
 
 // ── Socket Services (extracted to src/sockets/socketServices.js) ──────────────
 const { createSocketServices } = require('./src/sockets/socketServices');

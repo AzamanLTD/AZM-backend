@@ -11,6 +11,7 @@
 
 const logger = require('../src/config/logger');
 const bcrypt = require('bcryptjs');
+const { checkLockout, recordFailedAttempt, resetFailedAttempts } = require('../middleware/accountLockout');
 const { issueTokenPair } = require('../services/authTokenService');
 
 // Calendar-day difference (UTC midnight-to-midnight), NOT a rolling 24h
@@ -371,7 +372,31 @@ exports.login = async (req, res) => {
             });
         }
 
-        // ── Normal login flow ────────────────────────────────────────────────
+        // ── Normal login flow (with account lockout) ───────────────────────
+        if (!user) {
+            // Run lockout check — it returns null for unknown emails but
+            // also resets expired lockouts for known accounts
+            try {
+                user = await checkLockout(prisma, normalizedEmail);
+            } catch (lockErr) {
+                return res.status(lockErr.status || 423).json({
+                    success: false,
+                    message: lockErr.message
+                });
+            }
+        } else {
+            // User found via admin seed path — still check lockout
+            try {
+                const lockoutChecked = await checkLockout(prisma, normalizedEmail);
+                if (lockoutChecked) user = lockoutChecked;
+            } catch (lockErr) {
+                return res.status(lockErr.status || 423).json({
+                    success: false,
+                    message: lockErr.message
+                });
+            }
+        }
+
         if (!user) {
             return res.status(401).json({
                 success: false,
@@ -388,11 +413,16 @@ exports.login = async (req, res) => {
 
         const isMatch = await bcrypt.compare(password, user.password);
         if (!isMatch) {
+            // Record failed attempt — may trigger lockout
+            await recordFailedAttempt(prisma, user.id);
             return res.status(401).json({
                 success: false,
                 message: "Invalid email or password"
             });
         }
+
+        // Successful password match — reset failed attempt counter
+        await resetFailedAttempts(prisma, user.id);
 
         // ── Track login streak ────────────────────────────────────────────
         // Calendar-day streak logic (BUGFIX 2026-07-06: compares CALENDAR

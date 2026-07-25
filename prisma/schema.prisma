@@ -654,6 +654,13 @@ model User {
   profilePictureUrl  String?
   isDeleted          Boolean @default(false)
 
+  // --- ACCOUNT LOCKOUT (Phase 2 Security) ---
+  // Tracks consecutive failed login attempts. After MAX_FAILED_ATTEMPTS
+  // (5), the account is locked for LOCKOUT_DURATION_MINUTES (15). Reset
+  // to 0 on successful login. See middleware/accountLockout.js.
+  failedLoginAttempts Int       @default(0)
+  lockedUntil         DateTime?
+
   // --- PHASE K: TOKEN INVALIDATION ---
   // Bumped whenever the user's privileges change (today: USER -> VENDOR via
   // KYC approval). Embedded in the access JWT; `protect` rejects access
