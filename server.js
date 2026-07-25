@@ -217,8 +217,18 @@ const workersPromise = startWorkers(app, {
     susuInitiationService,
 });
 let tradeWorker, withdrawalReconciliationWorker;
+let tradeWorkerReady = false;
 workersPromise.then(result => {
     ({ tradeWorker, withdrawalReconciliationWorker } = result);
+    tradeWorkerReady = true;
+    // Start the trade worker now that it's instantiated.
+    // Previously this was in the server.listen callback, but the async
+    // workersPromise may not have resolved by the time the port is bound,
+    // causing "Cannot read properties of undefined (reading 'start')".
+    if (!IS_TEST_ENV && tradeWorker) {
+        tradeWorker.start();
+        workerStatus.tradeWorker = 'running';
+    }
 }).catch(err => logger.error({ err }, 'Worker startup error'));
 
 // ── Socket helpers (pushIfOffline, emitBalanceUpdate) ──
@@ -308,8 +318,8 @@ const PORT = process.env.PORT || 3000;
 if (!IS_TEST_ENV) {
     server.listen(PORT, '0.0.0.0', () => {
         logger.info({ port: PORT, env: IS_PRODUCTION ? 'production' : 'development' }, 'Azaman backend live');
-        tradeWorker.start();
-        workerStatus.tradeWorker = 'running';
+        // tradeWorker.start() is handled by the workersPromise.then() callback
+        // to avoid a race condition where the promise hadn't resolved yet.
     });
 }
 
