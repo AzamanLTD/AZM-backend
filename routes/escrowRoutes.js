@@ -10,12 +10,13 @@ const router = require('express').Router();
 const ctrl = require('../controllers/escrowController');
 const { protect } = require('../middleware/authMiddleware');
 const { idempotency } = require('../middleware/idempotency');
+const { require2FA } = require('../middleware/require2FA');
 const { protectActive } = require('../middleware/banGuardMiddleware');
 const { validate } = require('../middleware/validate');
 const { fundEscrowSchema, raiseDisputeSchema } = require('../services/validation/financialSchemas');
 
 router.get('/ticket/:ticketId', protect, ctrl.getEscrowForTicket);
-router.post('/fund', protectActive, idempotency(), validate(fundEscrowSchema), ctrl.fundEscrow);
+router.post('/fund', protectActive, require2FA(), idempotency(), validate(fundEscrowSchema), ctrl.fundEscrow);
 router.post('/satisfy', protectActive, idempotency(), ctrl.markSatisfied);
 router.post('/dispute', protectActive, idempotency(), validate(raiseDisputeSchema), ctrl.raiseDispute);
 router.post('/update-terms', protect, ctrl.updateTerms);

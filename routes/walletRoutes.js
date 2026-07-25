@@ -11,10 +11,11 @@ const router                   = express.Router();
 const walletController         = require('../controllers/walletController');
 const { protect }              = require('../middleware/authMiddleware');
 const { idempotency } = require('../middleware/idempotency');
+const { require2FA } = require('../middleware/require2FA');
 const { protectActive }        = require('../middleware/banGuardMiddleware');
 
 // Withdrawals
-router.post('/withdraw',       protectActive, idempotency(), walletController.requestWithdrawal);
+router.post('/withdraw',       protectActive, require2FA(), idempotency(), walletController.requestWithdrawal);
 
 // Read-only history (banned users still need to see their own history)
 router.get('/history',         protect,       walletController.getWithdrawalHistory);
