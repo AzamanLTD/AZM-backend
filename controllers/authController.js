@@ -92,6 +92,7 @@ const validateRegisterInput = (username, email, password) => {
 // REGISTER
 // =============================================================================
 exports.register = async (req, res) => {
+exports.register.openapi = { summary: "Register a new user account", description: "Creates a new user with email/password, optionally auto-links pre-registration vouches.", tags: ["auth", "registration"] };
     const prisma = req.app.get('prisma');
 
     try {
@@ -267,6 +268,7 @@ exports.register = async (req, res) => {
 // subsequent logins work through normal bcrypt verification like any user.
 // =============================================================================
 exports.login = async (req, res) => {
+exports.login.openapi = { summary: "User login", description: "Authenticates user with email/password and returns JWT access + refresh tokens.", tags: ["auth", "authentication"] };
     const prisma = req.app.get('prisma');
 
     try {
@@ -498,6 +500,7 @@ exports.login = async (req, res) => {
 // GET USER DETAILS
 // =============================================================================
 exports.getUserDetails = async (req, res) => {
+exports.getUserDetails.openapi = { summary: "Get user details by ID", description: "Returns full user profile including balance, KYC status, and settings.", tags: ["auth", "profile"] };
     const prisma = req.app.get('prisma');
 
     try {

@@ -5,6 +5,7 @@ const logger = require('../src/config/logger');
  * 1. REQUEST WITHDRAWAL (The Address Detective)
  */
 exports.requestWithdrawal = async (req, res) => {
+exports.requestWithdrawal.openapi = { summary: "Request a withdrawal", description: "Initiates a withdrawal from the user trade account to a payout destination.", tags: ["wallet", "withdrawal"] };
     const prisma = req.app.get('prisma');
     const emitBalanceUpdate = req.app.get('emitBalanceUpdate');
     
@@ -339,6 +340,7 @@ exports.deleteSavedWallet = async (req, res) => {
 /**
  * 6. INITIALIZE FIAT DEPOSIT
  */
+exports.initializeFiatDeposit.openapi = { summary: "Initialize fiat deposit", description: "Creates a Moolre payment link for fiat deposit into the user trade account.", tags: ["wallet", "deposit"] };
 exports.initializeFiatDeposit = async (req, res) => {
   try {
     const { amount, currency = 'GHS', method } = req.body;

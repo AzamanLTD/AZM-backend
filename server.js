@@ -243,6 +243,9 @@ cron.schedule('*/15 * * * *', () => {
 // API VERSIONING + RESPONSE ENVELOPE (additive, non-breaking)
 // ══════════════════════════════════════════════════════════════════════════════
 // ── Route Registry (extracted to src/routes/index.js) ───────────────────────
+const { captureMountPaths } = require('./src/config/openapiGenerator');
+captureMountPaths(app);
+
 const { mountRoutes } = require('./src/routes/index');
 mountRoutes(app, {
     authLimiter,
@@ -251,6 +254,10 @@ mountRoutes(app, {
     webhookLimiter,
 });
 
+
+// ── OpenAPI Spec Endpoint ─────────────────────────────────────────────────────
+const { serveSpec } = require('./src/config/openapiGenerator');
+app.get('/api/docs/openapi.json', serveSpec(app));
 // ══════════════════════════════════════════════════════════════════════════════
 // REAL-TIME CONNECTIONS (Authenticated — CRITICAL-4)
 // ══════════════════════════════════════════════════════════════════════════════
