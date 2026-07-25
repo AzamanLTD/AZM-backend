@@ -601,3 +601,97 @@ STATEMENTS.push(`DO $$ BEGIN
       ALTER TABLE "StorefrontVersion" ADD CONSTRAINT "StorefrontVersion_businessProfileId_fkey" FOREIGN KEY ("businessProfileId") REFERENCES "BusinessProfile"("id") ON DELETE CASCADE;
     END IF;
   END $$;`);
+
+// ── Module 09: Audit Log tables ───────────────────────────────────────────────
+STATEMENTS.push(`CREATE TABLE IF NOT EXISTS "AuditLog" (
+    "id" VARCHAR(36) NOT NULL,
+    "actorId" INTEGER,
+    "actorName" VARCHAR(255),
+    "action" VARCHAR(255) NOT NULL,
+    "targetType" VARCHAR(100) NOT NULL,
+    "targetId" VARCHAR(36),
+    "metadata" JSONB NOT NULL DEFAULT '{}'::jsonb,
+    "ipAddress" VARCHAR(45),
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT "AuditLog_pkey" PRIMARY KEY ("id")
+);`);
+
+STATEMENTS.push('CREATE INDEX IF NOT EXISTS "AuditLog_actorId_idx" ON "AuditLog"("actorId");');
+STATEMENTS.push('CREATE INDEX IF NOT EXISTS "AuditLog_action_idx" ON "AuditLog"("action");');
+STATEMENTS.push('CREATE INDEX IF NOT EXISTS "AuditLog_targetType_targetId_idx" ON "AuditLog"("targetType", "targetId");');
+STATEMENTS.push('CREATE INDEX IF NOT EXISTS "AuditLog_createdAt_idx" ON "AuditLog"("createdAt" DESC);');
+
+STATEMENTS.push(`CREATE TABLE IF NOT EXISTS "AdminSettingsAuditLog" (
+    "id" VARCHAR(36) NOT NULL,
+    "adminId" INTEGER NOT NULL,
+    "adminName" VARCHAR(255),
+    "action" VARCHAR(100) NOT NULL,
+    "targetType" VARCHAR(100) NOT NULL,
+    "targetId" VARCHAR(36),
+    "changes" JSONB NOT NULL,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT "AdminSettingsAuditLog_pkey" PRIMARY KEY ("id")
+);`);
+
+STATEMENTS.push('CREATE INDEX IF NOT EXISTS "AdminSettingsAuditLog_adminId_idx" ON "AdminSettingsAuditLog"("adminId");');
+STATEMENTS.push('CREATE INDEX IF NOT EXISTS "AdminSettingsAuditLog_createdAt_idx" ON "AdminSettingsAuditLog"("createdAt" DESC);');
+
+// ── Module 10: Restaurant Inventory (InventoryItem + RecipeIngredient) ─────────
+STATEMENTS.push(`CREATE TABLE IF NOT EXISTS "InventoryItem" (
+    "id" VARCHAR(36) NOT NULL,
+    "businessProfileId" VARCHAR(36) NOT NULL,
+    "name" VARCHAR(255) NOT NULL,
+    "unit" VARCHAR(50) NOT NULL,
+    "currentStock" DOUBLE PRECISION NOT NULL,
+    "minimumStock" DOUBLE PRECISION NOT NULL DEFAULT 0,
+    "costPerUnit" DOUBLE PRECISION NOT NULL,
+    "category" VARCHAR(100),
+    "supplier" VARCHAR(255),
+    "isActive" BOOLEAN NOT NULL DEFAULT true,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT "InventoryItem_pkey" PRIMARY KEY ("id")
+);`);
+
+STATEMENTS.push('CREATE INDEX IF NOT EXISTS "InventoryItem_businessProfileId_idx" ON "InventoryItem"("businessProfileId");');
+STATEMENTS.push('CREATE UNIQUE INDEX IF NOT EXISTS "InventoryItem_businessProfileId_name_key" ON "InventoryItem"("businessProfileId", "name");');
+
+STATEMENTS.push(`DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.table_constraints WHERE constraint_name = 'InventoryItem_businessProfileId_fkey') THEN
+      ALTER TABLE "InventoryItem" ADD CONSTRAINT "InventoryItem_businessProfileId_fkey" FOREIGN KEY ("businessProfileId") REFERENCES "BusinessProfile"("id");
+    END IF;
+  END $$;`);
+
+STATEMENTS.push(`CREATE TABLE IF NOT EXISTS "RecipeIngredient" (
+    "id" VARCHAR(36) NOT NULL,
+    "productId" VARCHAR(36) NOT NULL,
+    "inventoryItemId" VARCHAR(36) NOT NULL,
+    "quantityRequired" DOUBLE PRECISION NOT NULL,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT "RecipeIngredient_pkey" PRIMARY KEY ("id")
+);`);
+
+STATEMENTS.push('CREATE INDEX IF NOT EXISTS "RecipeIngredient_productId_idx" ON "RecipeIngredient"("productId");');
+STATEMENTS.push('CREATE INDEX IF NOT EXISTS "RecipeIngredient_inventoryItemId_idx" ON "RecipeIngredient"("inventoryItemId");');
+
+STATEMENTS.push(`DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.table_constraints WHERE constraint_name = 'RecipeIngredient_productId_fkey') THEN
+      ALTER TABLE "RecipeIngredient" ADD CONSTRAINT "RecipeIngredient_productId_fkey" FOREIGN KEY ("productId") REFERENCES "BusinessProduct"("id") ON DELETE CASCADE;
+    END IF;
+  END $$;`);
+
+STATEMENTS.push(`DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.table_constraints WHERE constraint_name = 'RecipeIngredient_inventoryItemId_fkey') THEN
+      ALTER TABLE "RecipeIngredient" ADD CONSTRAINT "RecipeIngredient_inventoryItemId_fkey" FOREIGN KEY ("inventoryItemId") REFERENCES "InventoryItem"("id") ON DELETE CASCADE;
+    END IF;
+  END $$;`);
+
+// ── Module 11: User table column additions ───────────────────────────────────
+STATEMENTS.push('ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "twoFactorSecret" VARCHAR(255);');
+STATEMENTS.push('ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "isTwoFactorEnabled" BOOLEAN NOT NULL DEFAULT false;');
+STATEMENTS.push('ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "pinHash" VARCHAR(255);');
+STATEMENTS.push('ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "isDeleted" BOOLEAN NOT NULL DEFAULT false;');
+STATEMENTS.push('ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "failedLoginAttempts" INTEGER NOT NULL DEFAULT 0;');
+STATEMENTS.push('ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "lockedUntil" TIMESTAMP(3);');
+STATEMENTS.push('ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "tokenVersion" INTEGER NOT NULL DEFAULT 0;');
