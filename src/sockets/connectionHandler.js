@@ -31,6 +31,7 @@ function setupSocketHandlers(io, deps) {
         friendSocketService,
         ticketSocketService,
         notificationService,
+        webrtcSocketService,
         pushIfOffline,
         emitBalanceUpdate,
     } = deps;
@@ -223,6 +224,11 @@ function setupSocketHandlers(io, deps) {
                 socket.emit('error', { message: 'Access denied: Admin role required.' });
             }
         });
+
+        // ── WebRTC CALL SIGNALING ────────────────────────────────────────────
+        if (webrtcSocketService) {
+            webrtcSocketService.register(socket, userId);
+        }
 
         socket.on('disconnect', () => {
             const now = new Date();

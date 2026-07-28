@@ -86,6 +86,7 @@ function mountRoutes(app, {
     app.use('/api/e2ee',                  generalLimiter,   require('../../routes/e2eeRoutes'));
     app.use('/api/marketplace-penalty',  generalLimiter,   require('../../routes/marketplacePenaltyRoutes'));
     app.use('/api/fraud',                generalLimiter,   require('../../routes/fraudRoutes'));
+    app.use('/api/calls',                 generalLimiter,   require('../../routes/callLogRoutes'));
 
     // ── Master Sprint ─────────────────────────────────────────────────────────
     app.use('/api/vaults',               financialLimiter, require('../../routes/vaultRoutes'));

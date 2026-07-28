@@ -25,8 +25,10 @@ function createSocketServices(io, prisma, app) {
     const friendSocketService = new FriendSocketService(io, prisma);
     const ticketSocketService = new TicketSocketService(io, prisma);
     const notificationService = new NotificationService(prisma, io);
+    const webrtcSocketService = new WebRTCSocketService(io, prisma);
 
     app.set('notificationService', notificationService);
+    app.set('webrtcSocketService', webrtcSocketService);
 
     return {
         tradeSocketService,

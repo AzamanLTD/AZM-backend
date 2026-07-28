@@ -775,6 +775,8 @@ model User {
   queuedTrades TradeQueue[]
 
   // Social & Communication
+  callsMade     CallLog[] @relation("CallLogCaller")
+  callsReceived CallLog[] @relation("CallLogCallee")
   conversations Conversation[] @relation("ConversationParticipants")
   bizConvParticipantA BusinessConversation[] @relation("BizConvParticipantA")
   bizConvParticipantB BusinessConversation[] @relation("BizConvParticipantB")
@@ -5693,4 +5695,59 @@ model FraudAssessment {
   @@index([userId, createdAt(sort: Desc)])
   @@index([action, createdAt(sort: Desc)])
   @@index([riskScore(sort: Desc)])
+}
+
+
+// ── WebRTC Voice/Video Calls ──────────────────────────────────────────────────
+
+enum CallType {
+  VOICE
+  VIDEO
+}
+
+enum CallStatus {
+  RINGING
+  ACCEPTED
+  REJECTED
+  MISSED
+  ENDED
+  FAILED
+  BUSY
+}
+
+model CallLog {
+  id          String    @id @default(uuid())
+  callerId    Int
+  calleeId   Int
+  type        CallType
+  status      CallStatus @default(RINGING)
+  
+  // WebRTC signaling metadata
+  offerSdp    String?  @db.Text
+  answerSdp   String?  @db.Text
+  
+  // Call metrics
+  startedAt   DateTime? // When media actually connected
+  endedAt     DateTime? // When call was terminated
+  durationSec Int      @default(0)
+  
+  // Quality metrics (populated on call end)
+  packetsLost   Int     @default(0)
+  jitterMs      Int     @default(0)
+  roundTripMs   Int     @default(0)
+  audioBitrate  Int     @default(0)
+  videoBitrate  Int     @default(0)
+  
+  // Optional: link to a trade conversation (for dispute resolution context)
+  tradeId       Int?
+  
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+  
+  caller User @relation("CallLogCaller", fields: [callerId], references: [id], onDelete: Cascade)
+  callee User @relation("CallLogCallee", fields: [calleeId], references: [id], onDelete: Cascade)
+  
+  @@index([callerId, createdAt(sort: Desc)])
+  @@index([calleeId, createdAt(sort: Desc)])
+  @@index([status, createdAt(sort: Desc)])
 }
