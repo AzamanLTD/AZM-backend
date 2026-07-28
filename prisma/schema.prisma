@@ -804,6 +804,7 @@ model User {
   e2eePreKeyBundle     E2EEPreKeyBundle?
   e2eeOneTimePreKeys   E2EEOneTimePreKey[] @relation("UserOneTimePreKeys")
   e2eeSessions         E2EESession[]       @relation("UserE2EESessions")
+  fraudAssessments     FraudAssessment[]
   sentPeerTransfers      PeerTransfer[]  @relation("PeerTransferSender")
   receivedPeerTransfers  PeerTransfer[]  @relation("PeerTransferReceiver")
 
@@ -5672,4 +5673,24 @@ model E2EESession {
   
   @@unique([userId, peerUserId])
   @@index([userId, peerUserId])
+}
+
+// ── Fraud Detection ─────────────────────────────────────────────────────────────
+
+model FraudAssessment {
+  id              String   @id @default(uuid())
+  userId          Int
+  transactionType String   @db.VarChar(50)
+  amountUsdc      Decimal  @db.Decimal(20, 8) @default(0)
+  riskScore       Int      @default(0)
+  triggeredRules  String   @db.VarChar(500)
+  action          String   @db.VarChar(20) @default("FLAGGED")
+  
+  createdAt       DateTime @default(now())
+  
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  @@index([userId, createdAt(sort: Desc)])
+  @@index([action, createdAt(sort: Desc)])
+  @@index([riskScore(sort: Desc)])
 }

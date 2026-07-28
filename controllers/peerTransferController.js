@@ -13,6 +13,7 @@
 // =============================================================================
 
 const logger = require('../src/config/logger');
+const fraudService = require('../services/fraudDetectionService');
 const journal = require('../services/journalIntegration');
 const NotificationService = require('../services/notificationService');
 
@@ -69,6 +70,25 @@ exports.sendFunds = async (req, res) => {
             return res.status(400).json({
                 success: false,
                 message: 'Amount must be a positive number.'
+            });
+        }
+
+        // Fraud detection check
+        const accountAgeMs = Date.now() - new Date(req.user.createdAt || req.user.created_at || Date.now()).getTime();
+        const accountAgeHours = accountAgeMs / (1000 * 60 * 60);
+        const fraudResult = await fraudService.evaluate({
+            userId: req.user.id,
+            type: 'TRANSFER',
+            amount: transferAmount,
+            accountAgeHours,
+        });
+        if (!fraudResult.allowed) {
+            logger.warn({ userId: req.user.id, rules: fraudResult.triggeredRules }, '[peerTransfer] Blocked by fraud detection');
+            return res.status(403).json({
+                success: false,
+                message: 'Transfer blocked by security checks. Please contact support.',
+                code: 'FRAUD_BLOCKED',
+                triggeredRules: fraudResult.triggeredRules,
             });
         }
 

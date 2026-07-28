@@ -15,6 +15,7 @@
 // =============================================================================
 
 const logger = require('../src/config/logger');
+const fraudService = require('../services/fraudDetectionService');
 const journal = require('../services/journalIntegration');
 const financeService          = require('../services/finance.service');
 const { runDoubleCheck }      = require('../utils/securityCheck');
@@ -62,6 +63,25 @@ exports.fiatWithdrawal = async (req, res) => {
 
         if (!amount || Number(amount) <= 0) {
             return res.status(400).json({ success: false, message: 'Invalid withdrawal amount.' });
+        }
+
+        // Fraud detection check
+        const accountAgeMs = Date.now() - new Date(req.user.createdAt || req.user.created_at || Date.now()).getTime();
+        const accountAgeHours = accountAgeMs / (1000 * 60 * 60);
+        const fraudResult = await fraudService.evaluate({
+            userId: req.user.id,
+            type: 'WITHDRAWAL',
+            amount: parseFloat(amount),
+            accountAgeHours,
+        });
+        if (!fraudResult.allowed) {
+            logger.warn({ userId: req.user.id, rules: fraudResult.triggeredRules }, '[fiatWithdrawal] Blocked by fraud detection');
+            return res.status(403).json({
+                success: false,
+                message: 'Transaction blocked by security checks. Please contact support.',
+                code: 'FRAUD_BLOCKED',
+                triggeredRules: fraudResult.triggeredRules,
+            });
         }
 
         // recipientPhone is required for MTN MoMo dispatch — fall back to the
@@ -427,6 +447,25 @@ exports.cryptoWithdrawal = async (req, res) => {
         }
 
         const amountFloat = parseFloat(amount);
+
+        // Fraud detection check (non-blocking for alerts, blocking for BLOCK severity)
+        const accountAgeMs = Date.now() - new Date(req.user.createdAt || req.user.created_at || Date.now()).getTime();
+        const accountAgeHours = accountAgeMs / (1000 * 60 * 60);
+        const fraudResult = await fraudService.evaluate({
+            userId: req.user.id,
+            type: 'WITHDRAWAL',
+            amount: amountFloat,
+            accountAgeHours,
+        });
+        if (!fraudResult.allowed) {
+            logger.warn({ userId: req.user.id, rules: fraudResult.triggeredRules }, '[cryptoWithdrawal] Blocked by fraud detection');
+            return res.status(403).json({
+                success: false,
+                message: 'Transaction blocked by security checks. Please contact support.',
+                code: 'FRAUD_BLOCKED',
+                triggeredRules: fraudResult.triggeredRules,
+            });
+        }
 
         // Double-Check before touching any balances
         await runDoubleCheck(prisma, userId);
