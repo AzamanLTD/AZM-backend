@@ -253,14 +253,12 @@ const { getScheduler } = require('./src/lib/bullScheduler');
     const scheduler = getScheduler();
     // Storefront stake: daily tier check + hourly unstake queue
     await scheduler.register('storefront-stake-daily', String(24 * 60 * 60 * 1000), () => storefrontStakeWorker.dailyStakeCheckTick(prisma));
-    // keepAliveWorker exports an object wrapper; call its start() for now
-    // (pingAll is internal — the wrapper handles its own timing in fallback mode)
+    await scheduler.register('storefront-stake-unstake', String(60 * 60 * 1000), () => storefrontStakeWorker.processUnstakeQueueTick(prisma));
+    // Keep-alive: ping external services every 5 min
+    await scheduler.register('keep-alive', String(5 * 60 * 1000), () => keepAliveWorker.pingAll());
     // Stories expiration
-    await scheduler.register('stories-expire', '*/15 * * * *', () => app.get('storyService').expireOldStories().catch(err => logger.error({ err }, 'StoryCron error')));
+    await scheduler.register('stories-expire', '*/15 * * * *', () => app.get('storyService')?.expireOldStories().catch(err => logger.error({ err }, 'StoryCron error')));
 })();
-// Register keep-alive + storefront unstake with BullMQ scheduler (no raw setInterval)
-scheduler.register('keep-alive', String(5 * 60 * 1000), () => keepAliveWorker.pingAll());
-scheduler.register('storefront-stake-unstake', String(60 * 60 * 1000), () => storefrontStakeWorker.processUnstakeQueueTick(prisma));
 
 // ══════════════════════════════════════════════════════════════════════════════
 // API VERSIONING + RESPONSE ENVELOPE (additive, non-breaking)
