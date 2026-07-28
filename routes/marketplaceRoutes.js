@@ -10,6 +10,7 @@ const express = require('express');
 const router = express.Router();
 const { protect } = require('../middleware/authMiddleware');
 const ctrl = require('../controllers/marketplaceController');
+const { require2FA } = require('../middleware/require2FA');
 
 // ── QR Check-in ──────────────────────────────────────────────────────────────
 router.get('/reservations/:id/checkin-qr', protect, ctrl.generateCheckInQR);

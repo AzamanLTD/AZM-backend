@@ -4,6 +4,7 @@ const router = express.Router();
 const { protect } = require('../middleware/authMiddleware');
 const ctrl = require('../controllers/dineInController');
 const { kybGate } = require('../middleware/kybGateMiddleware');
+const { require2FA } = require('../middleware/require2FA');
 
 // Business-side
 router.post('/tabs',                  protect, kybGate, ctrl.openTab);

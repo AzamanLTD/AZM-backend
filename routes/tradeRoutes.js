@@ -14,6 +14,7 @@ const tradeController     = require('../controllers/tradeController');
 const { protect, adminOnly } = require('../middleware/authMiddleware');
 const { protectActive }   = require('../middleware/banGuardMiddleware');
 const { idempotency }       = require('../middleware/idempotency');
+const { require2FA }    = require('../middleware/require2FA');
 const upload              = require('../middleware/uploadMiddleware');
 
 const {

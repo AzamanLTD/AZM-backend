@@ -10,6 +10,7 @@ const router               = express.Router();
 const p2pController        = require('../controllers/p2p.controller');
 const { protectActive }    = require('../middleware/banGuardMiddleware');
 const { idempotency }      = require('../middleware/idempotency');
+const { require2FA }    = require('../middleware/require2FA');
 
 // Ping system
 router.post('/ping',         protectActive, p2pController.pingVendor);
