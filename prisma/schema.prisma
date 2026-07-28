@@ -1248,6 +1248,11 @@ model Message {
   disappearAfterSeconds Int?
   expiresAt              DateTime?
 
+  // Phase 3.3.4: pin, star, forward
+  isPinned  Boolean  @default(false)
+  isStarred Boolean  @default(false)
+  pinnedAt  DateTime?
+
   conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
   sender       User?        @relation("MessageSender", fields: [senderId], references: [id])
   trade        Trade?       @relation("TradeMessages", fields: [tradeId], references: [id])
@@ -1821,6 +1826,11 @@ model DirectMessage {
   // Disappearing messages (Phase 2)
   disappearAfterSeconds Int?
   expiresAt              DateTime?
+
+  // Phase 3.3.4: pin, star, forward
+  isPinned  Boolean  @default(false)
+  isStarred Boolean  @default(false)
+  pinnedAt  DateTime?
 
   friendship Friendship @relation(fields: [friendshipId], references: [id], onDelete: Cascade)
   sender     User       @relation("DirectMessageSender", fields: [senderId], references: [id], onDelete: Cascade)
@@ -3525,6 +3535,11 @@ model GroupMessage {
   // Disappearing messages (Phase 2)
   disappearAfterSeconds Int?
   expiresAt              DateTime?
+
+  // Phase 3.3.4: pin, star, forward
+  isPinned  Boolean  @default(false)
+  isStarred Boolean  @default(false)
+  pinnedAt  DateTime?
 
   group  GroupChat @relation(fields: [groupId], references: [id], onDelete: Cascade)
   sender User?     @relation("GroupMessageSender", fields: [senderId], references: [id], onDelete: SetNull)

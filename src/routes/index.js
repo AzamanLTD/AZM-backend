@@ -87,6 +87,7 @@ function mountRoutes(app, {
     app.use('/api/marketplace-penalty',  generalLimiter,   require('../../routes/marketplacePenaltyRoutes'));
     app.use('/api/fraud',                generalLimiter,   require('../../routes/fraudRoutes'));
     app.use('/api/calls',                 generalLimiter,   require('../../routes/callLogRoutes'));
+    app.use('/api/messages',              generalLimiter,   require('../../routes/messageActionRoutes'));
 
     // ── Master Sprint ─────────────────────────────────────────────────────────
     app.use('/api/vaults',               financialLimiter, require('../../routes/vaultRoutes'));
