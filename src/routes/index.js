@@ -86,6 +86,7 @@ function mountRoutes(app, {
 
     // ── Master Sprint ─────────────────────────────────────────────────────────
     app.use('/api/vaults',               financialLimiter, require('../../routes/vaultRoutes'));
+    app.use('/api/shared-vaults',            financialLimiter, require('../../routes/sharedVaultRoutes'));
     app.use('/api/group-chats',          generalLimiter,   require('../../routes/groupChatRoutes'));
     app.use('/api/susu',                 financialLimiter, require('../../routes/susuRoutes'));
     app.use('/api/smart-routes',         financialLimiter, require('../../routes/smartRouteRoutes'));

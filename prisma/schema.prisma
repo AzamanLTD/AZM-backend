@@ -5506,3 +5506,44 @@ model ChangelogView {
   @@unique([changelogId, userId])
   @@index([userId])
 }
+
+// ── Shared Vaults (Phase 4) ──────────────────────────────────────────────────
+model SharedVault {
+  id                String   @id @default(uuid())
+  name              String   @db.VarChar(60)
+  emoji             String?  @db.VarChar(8)
+  targetAmountUsdc  Decimal  @db.Decimal(20, 8)
+  currentAmountUsdc Decimal  @default(0) @db.Decimal(20, 8)
+  status            String   @default("ACTIVE") // ACTIVE | COMPLETED | CANCELLED
+
+  creatorId         Int
+  linkedChatId       String?
+
+  startDate    DateTime  @default(now())
+  maturityDate DateTime?
+  completedAt DateTime?
+  cancelledAt DateTime?
+
+  members SharedVaultMember[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([creatorId])
+  @@index([status])
+}
+
+model SharedVaultMember {
+  id               String  @id @default(uuid())
+  sharedVaultId    String
+  userId           Int
+  role             String  @default("CONTRIBUTOR") // OWNER | CO_OWNER | CONTRIBUTOR
+  contributedUsdc  Decimal @default(0) @db.Decimal(20, 8)
+  joinedAt         DateTime @default(now())
+
+  sharedVault SharedVault @relation(fields: [sharedVaultId], references: [id], onDelete: Cascade)
+
+  @@unique([sharedVaultId, userId])
+  @@index([sharedVaultId])
+  @@index([userId])
+}
