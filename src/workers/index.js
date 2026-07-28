@@ -135,6 +135,12 @@ async function startWorkers(app, {
         if (count > 0) logger.info({ count }, 'WebhookRetry: processed stuck deliveries');
     });
 
+    // Phase 4: Business webhook delivery retry (exponential backoff)
+    const webhookController = require('../../controllers/webhookController');
+    await register('webhook-delivery-retry', '*/2 * * * *', async () => {
+        await webhookController.processRetries(prisma);
+    });
+
     // ── Phase 3 (private-susu-ecosystem) workers ──────────────────────────
     // V2 cycle scheduler (60s cadence) handles SusuGroups with contractVersion.
     // Reminder cron + PoR expiry sweep complete the Phase 3 surface.

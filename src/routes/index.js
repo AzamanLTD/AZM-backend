@@ -88,6 +88,7 @@ function mountRoutes(app, {
     app.use('/api/fraud',                generalLimiter,   require('../../routes/fraudRoutes'));
     app.use('/api/calls',                 generalLimiter,   require('../../routes/callLogRoutes'));
     app.use('/api/messages',              generalLimiter,   require('../../routes/messageActionRoutes'));
+    app.use('/api/webhooks',              generalLimiter,   require('../../routes/webhookRoutes'));
 
     // ── Master Sprint ─────────────────────────────────────────────────────────
     app.use('/api/vaults',               financialLimiter, require('../../routes/vaultRoutes'));
