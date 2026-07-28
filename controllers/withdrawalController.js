@@ -15,6 +15,7 @@
 // =============================================================================
 
 const logger = require('../src/config/logger');
+const journal = require('../services/journalIntegration');
 const financeService          = require('../services/finance.service');
 const { runDoubleCheck }      = require('../utils/securityCheck');
 const axios                   = require('axios');
@@ -666,6 +667,11 @@ exports.cryptoWithdrawal = async (req, res) => {
             metadata: { amountUsdc: amount, destination: String(destination || '').slice(0, 8) + '...' },
             ipAddress: req.ip,
         });
+
+        // Double-entry journal (non-blocking, fail-safe)
+        journal.recordWithdrawal(userId, amountFloat, result.txHash, { source: 'crypto', netPayout, gasFeeUsdc }).catch(e =>
+            logger.warn({ err: e.message, txHash: result.txHash }, '[withdrawalController] Journal recording failed')
+        );
 
         return res.status(200).json({
             success: true,

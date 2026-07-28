@@ -13,6 +13,7 @@
 // =============================================================================
 
 const logger = require('../src/config/logger');
+const journal = require('../services/journalIntegration');
 const NotificationService = require('../services/notificationService');
 
 let notificationService;
@@ -252,6 +253,11 @@ exports.sendFunds = async (req, res) => {
                 transferId: result.transfer.id
             }
         });
+
+        // Double-entry journal (non-blocking, fail-safe)
+        journal.recordTransfer(senderId, receiverId, transferAmount, result.transfer.id, {
+            reference: reference || null
+        }).catch(e => logger.warn({ err: e.message, transferId: result.transfer.id }, '[peerTransfer] Journal failed'));
 
         return res.status(200).json({
             success: true,

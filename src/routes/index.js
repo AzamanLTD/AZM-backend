@@ -82,6 +82,7 @@ function mountRoutes(app, {
     app.use('/api/showcases',            generalLimiter,   require('../../routes/showcaseRoutes'));
     app.use('/api/marketplace-finance',  financialLimiter, require('../../routes/marketplaceFinanceRoutes'));
     app.use('/api/marketplace-seat-map', generalLimiter,   require('../../routes/marketplaceSeatMapRoutes'));
+    app.use('/api/journal',               generalLimiter,   require('../../routes/journalRoutes'));
     app.use('/api/marketplace-penalty',  generalLimiter,   require('../../routes/marketplacePenaltyRoutes'));
 
     // ── Master Sprint ─────────────────────────────────────────────────────────

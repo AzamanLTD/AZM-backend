@@ -16,6 +16,7 @@
 // =============================================================================
 
 const logger = require('../src/config/logger');
+const journal = require('./journalIntegration');
 const gamification = require('./vendorGamificationService');
 const { calculateFeeSplit } = require('../utils/feeMath');
 
@@ -763,6 +764,21 @@ const completeTrade = async (prisma, { tradeId, releasedByUserId }) => {
 
         return { profitLog };
     });
+
+    // ── Double-entry journal (non-blocking, fail-safe) ──────────────────────
+    const escrowUserId = isSellAd ? trade.userId : trade.vendorId;
+    const receiverUserId = isSellAd ? trade.vendorId : trade.userId;
+    const tradeAmount = parseFloat(trade.amountCrypto);
+
+    journal.recordEscrowRelease(escrowUserId, receiverUserId, tradeAmount, String(tradeId), {
+        isSellAd, adminCutUsdc, vendorCutUsdc
+    }).catch(e => logger.warn({ err: e.message, tradeId }, '[p2p.service] Journal escrow release failed'));
+
+    if (parseFloat(adminCutUsdc) > 0) {
+        journal.recordFee(receiverUserId, adminCutUsdc, String(tradeId), { adminPct }).catch(e =>
+            logger.warn({ err: e.message, tradeId }, '[p2p.service] Journal fee failed')
+        );
+    }
 
     return {
         tradeId,

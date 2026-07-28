@@ -36,6 +36,7 @@ function _getNotificationService(req) {
 const crypto = require('crypto');
 const { audit } = require('../utils/audit');
 const logger = require('../src/config/logger');
+const journal = require('../services/journalIntegration');
 
 // Constant-time string comparison — avoids leaking secret length/content via
 // timing. Returns false on any type/length mismatch instead of throwing.
@@ -478,6 +479,11 @@ exports.tatumCryptoWebhook = async (req, res) => {
         // ── Step 6: Post-commit side effects ─────────────────────────────────
         if (emitBalanceUpdate) await emitBalanceUpdate(targetUserId);
 
+        // Double-entry journal recording (non-blocking, fail-safe)
+        journal.recordDeposit(targetUserId, amountUsdc, txHash, { source: 'crypto', txHash }).catch(e =>
+            logger.warn({ err: e.message, txHash }, '[depositController] Journal recording failed')
+        );
+
         if (io) {
             io.to(`user_${targetUserId}`).emit('deposit_success', {
                 type:       'DEPOSIT_CRYPTO',
@@ -779,6 +785,11 @@ exports.moolreCollectionWebhook = async (req, res) => {
             action: 'DEPOSIT_MOOLRE_COMPLETED', targetType: 'TRANSACTION', targetId: String(existing.id),
             metadata: { amountGhs: ghsFloat, amountUsdc: usdcCredit, externalRef }, ipAddress: req.ip,
         });
+
+        // Double-entry journal (non-blocking, fail-safe)
+        journal.recordDeposit(existing.userId, usdcCredit, externalRef, { source: 'moolre', amountGhs: ghsFloat }).catch(e =>
+            logger.warn({ err: e.message, externalRef }, '[moolreCollectionWebhook] Journal recording failed')
+        );
 
         return res.status(200).json({ success: true, message: 'Deposit credited.' });
     } catch (err) {

@@ -13,6 +13,7 @@
 // =============================================================================
 
 const logger = require('../src/config/logger');
+const journal = require('../services/journalIntegration');
 const { sendPushNotification } = require('../utils/firebaseService');
 const gamification = require('../services/vendorGamificationService');
 const { parsePagination, buildPageEnvelope } = require('../utils/pagination');
@@ -499,6 +500,12 @@ exports.acceptTrade = async (req, res) => {
             await emitBalanceUpdate(updatedTrade.vendorId);
             await emitBalanceUpdate(updatedTrade.userId);
         }
+
+        // Double-entry journal: escrow lock (non-blocking, fail-safe)
+        const escrowUserId = updatedTrade.adType === 'SELL' ? updatedTrade.userId : updatedTrade.vendorId;
+        journal.recordEscrowLock(escrowUserId, parseFloat(updatedTrade.amountCrypto), String(updatedTrade.id), {
+            adType: updatedTrade.adType
+        }).catch(e => logger.warn({ err: e.message, tradeId: updatedTrade.id }, '[tradeController] Journal escrow lock failed'));
 
         // Emit trade update to the trade room
         const room = `trade_${tradeIdInt}`;

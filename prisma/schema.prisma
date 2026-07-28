@@ -5547,3 +5547,52 @@ model SharedVaultMember {
   @@index([sharedVaultId])
   @@index([userId])
 }
+
+// ── Double-Entry Ledger (Phase 4) ─────────────────────────────────────────────
+// Every financial operation creates paired journal entries (debit + credit).
+// This enables: trial balance verification, balance sheet generation,
+// full audit trails, and O(1) balance verification.
+
+enum JournalEntryType {
+  DEPOSIT
+  WITHDRAWAL
+  TRADE
+  TRANSFER
+  ESCROW_LOCK
+  ESCROW_RELEASE
+  ESCROW_REFUND
+  VAULT_DEPOSIT
+  VAULT_RELEASE
+  SUSU_CONTRIBUTION
+  SUSU_PAYOUT
+  FEE
+  REWARD
+  ADJUSTMENT
+  BUSINESS_PAYMENT
+  SHARED_VAULT_DEPOSIT
+  SHARED_VAULT_REFUND
+}
+
+model JournalEntry {
+  id              String           @id @default(uuid())
+  transactionId   String           // Groups paired debit+credit entries
+  entryType       JournalEntryType
+  account         String           @db.VarChar(80)  // e.g. "user:available", "platform:revenue", "escrow:locked"
+  debit           Decimal          @default(0) @db.Decimal(20, 8)
+  credit          Decimal          @default(0) @db.Decimal(20, 8)
+  description      String           @db.VarChar(500)
+  reference        String?          @db.VarChar(100) // Optional human-readable ref
+  metadata        Json?
+
+  userId          Int?
+  relatedEntity   String?          @db.VarChar(50)  // "trade", "vault", "susu", etc.
+  relatedEntityId String?
+
+  createdAt       DateTime         @default(now())
+
+  @@index([transactionId])
+  @@index([account])
+  @@index([userId, createdAt(sort: Desc)])
+  @@index([entryType, createdAt(sort: Desc)])
+  @@index([relatedEntity, relatedEntityId])
+}
