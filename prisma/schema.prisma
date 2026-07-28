@@ -799,6 +799,11 @@ model User {
   receivedFriendRequests Friendship[]    @relation("FriendshipAddressee")
   sentDirectMessages     DirectMessage[] @relation("DirectMessageSender")
   receivedDirectMessages DirectMessage[] @relation("DirectMessageReceiver")
+  
+  // E2EE key material
+  e2eePreKeyBundle     E2EEPreKeyBundle?
+  e2eeOneTimePreKeys   E2EEOneTimePreKey[] @relation("UserOneTimePreKeys")
+  e2eeSessions         E2EESession[]       @relation("UserE2EESessions")
   sentPeerTransfers      PeerTransfer[]  @relation("PeerTransferSender")
   receivedPeerTransfers  PeerTransfer[]  @relation("PeerTransferReceiver")
 
@@ -5595,4 +5600,76 @@ model JournalEntry {
   @@index([userId, createdAt(sort: Desc)])
   @@index([entryType, createdAt(sort: Desc)])
   @@index([relatedEntity, relatedEntityId])
+}
+
+// ── E2EE (Signal-style Protocol) ─────────────────────────────────────────────
+
+model E2EEPreKeyBundle {
+  id                  String   @id @default(uuid())
+  userId              Int
+  
+  // Identity key (long-term, per user)
+  identityPublicKey   String   @db.VarChar(100)
+  identityPrivateKey  String?  @db.VarChar(100) // Only stored if user opts to back up; null otherwise
+  
+  // Signed preKey (rotated periodically)
+  signedPreKeyId       Int
+  signedPreKeyPublicKey String  @db.VarChar(100)
+  signedPreKeyPrivateKey String? @db.VarChar(100) // Server needs this to complete session on receiver side
+  signedPreKeySignature String  @db.VarChar(200)
+  
+  // Active session root key (per friendship/contact pair)
+  // Stored encrypted or as derived key material
+  activeRootKey       String?  @db.VarChar(200)
+  activeChainKey      String?  @db.VarChar(200)
+  messageNumber       Int      @default(0)
+  
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+  
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  
+  @@unique([userId])
+  @@index([userId])
+}
+
+model E2EEOneTimePreKey {
+  id          String   @id @default(uuid())
+  userId      Int
+  keyId       Int
+  publicKey   String   @db.VarChar(100)
+  privateKey  String   @db.VarChar(100) // Server needs this to complete X3DH
+  isUsed      Boolean  @default(false)
+  
+  createdAt   DateTime @default(now())
+  usedAt      DateTime?
+  
+  user User @relation("UserOneTimePreKeys", fields: [userId], references: [id], onDelete: Cascade)
+  
+  @@index([userId, isUsed])
+  @@index([keyId])
+}
+
+model E2EESession {
+  id              String   @id @default(uuid())
+  userId          Int      // The user who owns this session
+  peerUserId      Int      // The other party
+  
+  // Session state
+  rootKey         String   @db.VarChar(200)
+  sendingChainKey String?  @db.VarChar(200)
+  receivingChainKey String? @db.VarChar(200)
+  sendMessageNumber  Int   @default(0)
+  receiveMessageNumber Int @default(0)
+  
+  // Initial ephemeral key from X3DH
+  peerEphemeralPublicKey String? @db.VarChar(100)
+  
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  
+  user User @relation("UserE2EESessions", fields: [userId], references: [id], onDelete: Cascade)
+  
+  @@unique([userId, peerUserId])
+  @@index([userId, peerUserId])
 }
