@@ -75,7 +75,7 @@ router.get('/pool-withdrawal-preview', protect, async (req, res) => {
 
 // POST /api/wallet/internal-transfer
 // Body: { direction: 'TO_POOL' | 'FROM_POOL', amount: number }
-router.post('/internal-transfer', protectActive, idempotency(), async (req, res) => {
+router.post('/internal-transfer', protectActive, require2FA(), idempotency(), async (req, res) => {
     const prisma = req.app.get('prisma');
     const emitBalanceUpdate = req.app.get('emitBalanceUpdate');
 

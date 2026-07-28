@@ -19,7 +19,7 @@ const imageFileFilter = (req, file, cb) => {
     const ext = path.extname(file.originalname).toLowerCase();
     const mimeOk = allowedMimes.includes(file.mimetype);
     const extOk = allowedExts.includes(ext);
-    if (mimeOk || extOk) {
+    if (mimeOk && extOk) {
         cb(null, true);
     } else {
         cb(new Error('Only image files (JPEG, PNG, GIF, WebP, HEIC) are allowed.'), false);

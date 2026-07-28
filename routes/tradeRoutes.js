@@ -35,7 +35,7 @@ router.get('/history', protect, getTradeHistory);
 router.get('/:id',     protect, getTradeDetails);
 
 // ── Buyer actions ────────────────────────────────────────────────────────────
-router.post('/initiate', protectActive, idempotency(), initiateTrade);
+router.post('/initiate', protectActive, require2FA(), idempotency(), initiateTrade);
 
 // ── Vendor approval actions ──────────────────────────────────────────────────
 router.post('/accept',  protectActive, idempotency(), acceptTrade);

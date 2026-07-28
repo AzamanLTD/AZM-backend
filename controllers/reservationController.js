@@ -45,6 +45,29 @@ exports.createReservation = async (req, res) => {
 
         const biz = await _getBiz(prisma, bizId);
 
+        // ── Availability conflict check (Phase 2.3) ──────────────────────────
+        // Prevent double-booking: reject if an overlapping PENDING/CONFIRMED/
+        // CHECKED_IN reservation exists for the same business (+ optional
+        // location/service item).
+        const conflictWhere = {
+            businessProfileId: biz.id,
+            status: { in: ['PENDING', 'CONFIRMED', 'CHECKED_IN'] },
+            OR: [
+                { startDatetime: { lt: end }, endDatetime: { gt: start } },
+            ],
+        };
+        if (locationId) conflictWhere.locationId = locationId;
+        if (serviceItemId) conflictWhere.serviceItemId = serviceItemId;
+
+        const conflict = await prisma.reservation.findFirst({ where: conflictWhere });
+        if (conflict) {
+            return res.status(409).json({
+                success: false,
+                message: 'This time slot is already booked. Please choose another time.',
+                conflict: { id: conflict.id, start: conflict.startDatetime, end: conflict.endDatetime },
+            });
+        }
+
         const reservation = await prisma.reservation.create({
             data: {
                 reservationRef:    genRef(),

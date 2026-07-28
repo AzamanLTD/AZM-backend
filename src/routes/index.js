@@ -25,6 +25,10 @@ function mountRoutes(app, {
     });
     app.use('/api', require('../../middleware/responseHelpers'));
 
+    // ── Phase 2.4: Prisma injector — sets req.prisma for all controllers ──────
+    const prismaInjector = require('../../src/middleware/prismaInjector');
+    app.use('/api', prismaInjector);
+
     // ── API ROUTES (with rate limiting) ──────────────────────────────────────
     app.use('/api/public', generalLimiter, require('../../routes/publicRoutes'));
 

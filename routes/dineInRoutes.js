@@ -18,6 +18,6 @@ router.get('/guests/search',          protect, kybGate, ctrl.searchGuests);
 
 // Customer-side
 router.get('/tabs/:tabId',            protect, ctrl.getTab);
-router.post('/tabs/:tabId/pay',       protect, ctrl.confirmAndPay);
+router.post('/tabs/:tabId/pay',       protect, require2FA(), ctrl.confirmAndPay);
 
 module.exports = router;

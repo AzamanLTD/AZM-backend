@@ -18,7 +18,7 @@ router.post('/business/checkin', protect, ctrl.businessCheckIn);
 // ── Transit Trips + Seat Booking ─────────────────────────────────────────────
 router.get('/transit/trips', protect, ctrl.listTransitTrips);
 router.get('/transit/trips/:id/seats', protect, ctrl.getTripSeats);
-router.post('/transit/trips/:id/book', protect, ctrl.bookTripSeats);
+router.post('/transit/trips/:id/book', protect, require2FA(), ctrl.bookTripSeats);
 router.post('/transit/bookings/:id/checkin', protect, ctrl.transitCheckIn);
 router.delete('/transit/bookings/:id', protect, ctrl.cancelTransitBooking);
 

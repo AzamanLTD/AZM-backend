@@ -23,7 +23,7 @@ router.post('/underpayment', protectActive, idempotency(), p2pController.markUnd
 router.post('/overpayment',  protectActive, idempotency(), p2pController.flagOverpayment);
 
 // Trade completion (the SINGLE SOURCE OF TRUTH for asset release)
-router.post('/complete',     protectActive, idempotency(), p2pController.completeTrade);
+router.post('/complete',     protectActive, require2FA(), idempotency(), p2pController.completeTrade);
 
 // B-9: Action-required indicator — returns pending items needing user attention.
 router.get('/action-required', protectActive, p2pController.getActionRequired);

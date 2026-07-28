@@ -84,9 +84,9 @@ class SusuCycleService {
   async _acquireCycle(cycleId) {
     return this.prisma.$transaction(async (tx) => {
       const lockKey = await this._cycleIdToBigint(cycleId);
-      const [{ pg_try_advisory_xact_lock: locked }] = await tx.$queryRawUnsafe(
-        `SELECT pg_try_advisory_xact_lock(${lockKey}) AS pg_try_advisory_xact_lock`,
-      );
+      const [{ pg_try_advisory_xact_lock: locked }] = await tx.$queryRaw`
+        SELECT pg_try_advisory_xact_lock(${lockKey}::bigint) AS pg_try_advisory_xact_lock
+      `;
       if (!locked) return { acquired: false };
 
       // Read current status so we can record what we transitioned from
@@ -145,9 +145,9 @@ class SusuCycleService {
   async _cycleIdToBigint(cycleId) {
     // Postgres has hashtextextended(text, bigint) which yields a stable
     // 64-bit signed result we can hand to pg_try_advisory_xact_lock.
-    const rows = await this.prisma.$queryRawUnsafe(
-      `SELECT hashtextextended('${cycleId.replace(/'/g, "''")}'::text, 0)::int8 AS k`,
-    );
+    const rows = await this.prisma.$queryRaw`
+      SELECT hashtextextended(${cycleId}::text, 0)::int8 AS k
+    `;
     return rows[0].k;
   }
 

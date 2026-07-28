@@ -171,10 +171,14 @@ exports.cancelTransitBooking = async (req, res) => {
     const prisma = req.app.get('prisma');
     try {
         const transitSvc = require('../services/transitBookingService');
-        const result = await transitSvc.cancelTransitBooking(prisma, { bookingId: req.params.id });
+        const result = await transitSvc.cancelTransitBooking(prisma, {
+            bookingId: req.params.id,
+            cancelledBy: req.user.id,
+        });
         return res.status(200).json(result);
     } catch (err) {
-        return res.status(400).json({ success: false, message: err.message });
+        const code = err.message.includes('Not authorized') ? 403 : 400;
+        return res.status(code).json({ success: false, message: err.message });
     }
 };
 

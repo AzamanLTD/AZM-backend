@@ -2353,7 +2353,7 @@ model SmartEscrow {
 
   updatedAt DateTime @updatedAt
 
-  ticket         Ticket          @relation(fields: [ticketId], references: [id], onDelete: Cascade)
+  ticket         Ticket          @relation(fields: [ticketId], references: [id], onDelete: Restrict)
   payer          User            @relation("EscrowPayer", fields: [payerId], references: [id])
   payee          User            @relation("EscrowPayee", fields: [payeeId], references: [id])
   dispute        EscrowDispute?
