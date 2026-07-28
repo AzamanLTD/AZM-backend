@@ -81,6 +81,9 @@ async function pingAll() {
 }
 
 module.exports = {
+  // Expose pingAll for BullMQ scheduler registration
+  pingAll,
+
   start() {
     if (intervalId) {
       logger.info('📡 [KeepAlive] Already running');

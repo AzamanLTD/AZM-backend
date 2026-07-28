@@ -137,4 +137,42 @@ function stop() {
   logger.info('[StorefrontStakeWorker] Stopped');
 }
 
-module.exports = { start, stop, autoDowngradeLapsedStakes };
+/**
+ * Process the unstake queue + post-unstake downgrade check.
+ * Called by the BullMQ scheduler every hour.
+ */
+async function processUnstakeQueueTick(prisma) {
+  try {
+    logger.info('[StorefrontStakeWorker] Hourly unstake queue processing...');
+    const result = await azmStakeService.processUnstakeQueue(prisma);
+    if (result.completed > 0) {
+      logger.info(`[StorefrontStakeWorker] Completed ${result.completed} unstakes.`);
+      const downgradeResult = await autoDowngradeLapsedStakes(prisma);
+      if (downgradeResult.downgradedCount > 0) {
+        logger.info(`[StorefrontStakeWorker] Post-unstake downgrade: ${downgradeResult.downgradedCount} layouts.`);
+      }
+    }
+  } catch (err) {
+    logger.error({ err: err }, '[StorefrontStakeWorker] Unstake queue error');
+  }
+}
+
+/**
+ * Run the daily stake check (active stakes + auto-downgrade).
+ * Called by the BullMQ scheduler every 24h.
+ */
+async function dailyStakeCheckTick(prisma) {
+  try {
+    logger.info('[StorefrontStakeWorker] Daily stake check starting...');
+    const result = await azmStakeService.checkActiveStakes(prisma);
+    const downgradeResult = await autoDowngradeLapsedStakes(prisma);
+    if (downgradeResult.downgradedCount > 0) {
+      logger.info(`[StorefrontStakeWorker] Auto-downgraded ${downgradeResult.downgradedCount} layouts out of ${downgradeResult.totalChecked} checked.`);
+    }
+    logger.info('[StorefrontStakeWorker] Daily check complete:', { ...result, ...downgradeResult });
+  } catch (err) {
+    logger.error({ err: err }, '[StorefrontStakeWorker] Daily check error');
+  }
+}
+
+module.exports = { start, stop, autoDowngradeLapsedStakes, processUnstakeQueueTick, dailyStakeCheckTick };

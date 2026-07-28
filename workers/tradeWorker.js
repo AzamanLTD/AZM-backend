@@ -24,6 +24,12 @@ class TradeWorker {
         this._notificationService = new NotificationService(prisma, io);
     }
 
+    /**
+     * @deprecated — Workers are now registered with the BullMQ scheduler
+     * (src/lib/bullScheduler.js) which calls _checkMilestones() and
+     * _checkEscrowAutoRelease() directly. This method is kept for backward
+     * compatibility but should not be called in new deployments.
+     */
     start() {
         this.startMilestoneWorker();
         this.startEscrowAutoReleaseWorker();

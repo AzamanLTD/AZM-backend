@@ -226,7 +226,10 @@ workersPromise.then(result => {
     // workersPromise may not have resolved by the time the port is bound,
     // causing "Cannot read properties of undefined (reading 'start')".
     if (!IS_TEST_ENV && tradeWorker) {
-        tradeWorker.start();
+        // Register tradeWorker intervals with BullMQ scheduler (no raw setInterval)
+        const scheduler = getScheduler();
+        scheduler.register('trade-milestones', String(60 * 1000), () => tradeWorker._checkMilestones());
+        scheduler.register('trade-escrow-release', String(30 * 1000), () => tradeWorker._checkEscrowAutoRelease());
         workerStatus.tradeWorker = 'running';
     }
 }).catch(err => logger.error({ err }, 'Worker startup error'));
@@ -249,15 +252,15 @@ const { getScheduler } = require('./src/lib/bullScheduler');
 (async () => {
     const scheduler = getScheduler();
     // Storefront stake: daily tier check + hourly unstake queue
-    await scheduler.register('storefront-stake-daily', String(24 * 60 * 60 * 1000), () => storefrontStakeWorker.autoDowngradeLapsedStakes(prisma));
+    await scheduler.register('storefront-stake-daily', String(24 * 60 * 60 * 1000), () => storefrontStakeWorker.dailyStakeCheckTick(prisma));
     // keepAliveWorker exports an object wrapper; call its start() for now
     // (pingAll is internal — the wrapper handles its own timing in fallback mode)
     // Stories expiration
     await scheduler.register('stories-expire', '*/15 * * * *', () => app.get('storyService').expireOldStories().catch(err => logger.error({ err }, 'StoryCron error')));
 })();
-// Start keep-alive and storefront hourly via their own start() (they manage intervals internally)
-keepAliveWorker.start();
-storefrontStakeWorker.start(prisma);
+// Register keep-alive + storefront unstake with BullMQ scheduler (no raw setInterval)
+scheduler.register('keep-alive', String(5 * 60 * 1000), () => keepAliveWorker.pingAll());
+scheduler.register('storefront-stake-unstake', String(60 * 60 * 1000), () => storefrontStakeWorker.processUnstakeQueueTick(prisma));
 
 // ══════════════════════════════════════════════════════════════════════════════
 // API VERSIONING + RESPONSE ENVELOPE (additive, non-breaking)
