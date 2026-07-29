@@ -630,7 +630,7 @@ model User {
   // AZM is NOT a blockchain token — it is strictly a backend-controlled
   // database ledger. Phase D-2 incorrectly dropped this column; Phase D-3
   // restores it as an independent loyalty ledger.
-  azmBalance Decimal @default(0.0) @db.Decimal(20, 8) // AZM loyalty points (independent of USDC)
+  azmBalance       Decimal  @default(0.0) @db.Decimal(20, 8) // AZM loyalty points (independent of USDC)
   // Card skins (2026-07-06): purchasable cosmetic skins for the peer-transfer
   // chat card. 'classic' is always available (free, not in ownedCardSkins).
   // equippedCardSkin must be 'classic' or present in ownedCardSkins — enforced
@@ -646,14 +646,14 @@ model User {
   referredByCode String?
 
   // --- AUTH & SECURITY ---
-  googleId           String? @unique
-  appleId            String? @unique
-  twoFactorSecret    String?
-  webAuthnCredentials  WebAuthnCredential[]
-  isTwoFactorEnabled Boolean @default(false)
-  pinHash            String?
-  profilePictureUrl  String?
-  isDeleted          Boolean @default(false)
+  googleId            String?              @unique
+  appleId             String?              @unique
+  twoFactorSecret     String?
+  webAuthnCredentials WebAuthnCredential[]
+  isTwoFactorEnabled  Boolean              @default(false)
+  pinHash             String?
+  profilePictureUrl   String?
+  isDeleted           Boolean              @default(false)
 
   // --- ACCOUNT LOCKOUT (Phase 2 Security) ---
   // Tracks consecutive failed login attempts. After MAX_FAILED_ATTEMPTS
@@ -775,14 +775,14 @@ model User {
   queuedTrades TradeQueue[]
 
   // Social & Communication
-  callsMade     CallLog[] @relation("CallLogCaller")
-  callsReceived CallLog[] @relation("CallLogCallee")
-  conversations Conversation[] @relation("ConversationParticipants")
+  callsMade           CallLog[]              @relation("CallLogCaller")
+  callsReceived       CallLog[]              @relation("CallLogCallee")
+  conversations       Conversation[]         @relation("ConversationParticipants")
   bizConvParticipantA BusinessConversation[] @relation("BizConvParticipantA")
   bizConvParticipantB BusinessConversation[] @relation("BizConvParticipantB")
-  sentMessages  Message[]      @relation("MessageSender")
-  contacts      Contact[]      @relation("ContactOwner")
-  savedByUsers  Contact[]      @relation("ContactSavedUser")
+  sentMessages        Message[]              @relation("MessageSender")
+  contacts            Contact[]              @relation("ContactOwner")
+  savedByUsers        Contact[]              @relation("ContactSavedUser")
 
   // Reviews
   givenReviews    Review[] @relation("GivenReviews")
@@ -801,14 +801,14 @@ model User {
   receivedFriendRequests Friendship[]    @relation("FriendshipAddressee")
   sentDirectMessages     DirectMessage[] @relation("DirectMessageSender")
   receivedDirectMessages DirectMessage[] @relation("DirectMessageReceiver")
-  
+
   // E2EE key material
-  e2eePreKeyBundle     E2EEPreKeyBundle?
-  e2eeOneTimePreKeys   E2EEOneTimePreKey[] @relation("UserOneTimePreKeys")
-  e2eeSessions         E2EESession[]       @relation("UserE2EESessions")
-  fraudAssessments     FraudAssessment[]
-  sentPeerTransfers      PeerTransfer[]  @relation("PeerTransferSender")
-  receivedPeerTransfers  PeerTransfer[]  @relation("PeerTransferReceiver")
+  e2eePreKeyBundle      E2EEPreKeyBundle?
+  e2eeOneTimePreKeys    E2EEOneTimePreKey[] @relation("UserOneTimePreKeys")
+  e2eeSessions          E2EESession[]       @relation("UserE2EESessions")
+  fraudAssessments      FraudAssessment[]
+  sentPeerTransfers     PeerTransfer[]      @relation("PeerTransferSender")
+  receivedPeerTransfers PeerTransfer[]      @relation("PeerTransferReceiver")
 
   // Phase UI-4 (2026-05-26): Tickets Engine
   createdTickets     Ticket[]        @relation("TicketCreator")
@@ -905,30 +905,30 @@ model User {
   // PHASE 6 / Phase 4: Liability acceptances where this user vouched for another.
   vouchedLiabilityAcceptances LiabilityAcceptance[] @relation("LiabilityVoucher")
 
-  createdAt           DateTime            @default(now())
+  createdAt           DateTime                @default(now())
   stories             Story[]
   // Business OS relations
-  employeeProfiles      BusinessEmployee[]  @relation("EmployeeUser")
-  shifts               Shift[]             @relation("ShiftUser")
-  shiftSwapsRequested   ShiftSwap[]        @relation("SwapRequester")
-  shiftSwapsClaimed     ShiftSwap[]        @relation("SwapClaimer")
-  timeOffRequests       TimeOffRequest[]
-  payrollRecords        PayrollRecord[]
-  employeeFeedbacks     EmployeeFeedback[] @relation("FeedbackGiven")
-  housekeepingTasks     HotelHousekeepingTask[] @relation("Housekeeper")
-  driverAssignments    DriverAssignment[]
-  storyViews          StoryView[]         @relation("StoryViewer")
-  storyReactions      StoryReaction[]     @relation("StoryReactor")
-  followingBusinesses BusinessFollower[]  @relation("BusinessFollower")
-  dineInTabs          DineInTab[]         @relation("DineInTabCustomer")
-  dineInTabItems      DineInTabItem[]     @relation("DineInTabStaff")
+  employeeProfiles    BusinessEmployee[]      @relation("EmployeeUser")
+  shifts              Shift[]                 @relation("ShiftUser")
+  shiftSwapsRequested ShiftSwap[]             @relation("SwapRequester")
+  shiftSwapsClaimed   ShiftSwap[]             @relation("SwapClaimer")
+  timeOffRequests     TimeOffRequest[]
+  payrollRecords      PayrollRecord[]
+  employeeFeedbacks   EmployeeFeedback[]      @relation("FeedbackGiven")
+  housekeepingTasks   HotelHousekeepingTask[] @relation("Housekeeper")
+  driverAssignments   DriverAssignment[]
+  storyViews          StoryView[]             @relation("StoryViewer")
+  storyReactions      StoryReaction[]         @relation("StoryReactor")
+  followingBusinesses BusinessFollower[]      @relation("BusinessFollower")
+  dineInTabs          DineInTab[]             @relation("DineInTabCustomer")
+  dineInTabItems      DineInTabItem[]         @relation("DineInTabStaff")
   trustScore          CustomerTrustScore?
   businessGroups      BusinessGroup[]
 
   // AZM Staking for Nitro
-  azmStakes           AzmStake[]
-  changelogViews      ChangelogView[]
-  onchainSweeps       OnchainSweep[]
+  azmStakes      AzmStake[]
+  changelogViews ChangelogView[]
+  onchainSweeps  OnchainSweep[]
 
   @@index([phoneHash])
 }
@@ -967,17 +967,17 @@ model RefreshToken {
 // Stores FIDO2 passkey credentials for passwordless authentication.
 // One user can have multiple passkeys (phone, laptop, hardware key, etc).
 model WebAuthnCredential {
-  id              String   @id          // Base64URL-encoded credential ID
-  userId          Int
-  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-  publicKey       Bytes                 // COSE-encoded public key
-  counter         Int      @default(0)  // Monotonic counter for replay detection
-  transports      String[] @default([])  // ["usb","nfc","ble","internal"]
-  deviceType      String?               // "singleDevice" | "multiDevice"
-  backedUp        Boolean  @default(false)
-  name            String?               // User-assigned label
-  createdAt       DateTime @default(now())
-  lastUsedAt      DateTime?
+  id         String    @id // Base64URL-encoded credential ID
+  userId     Int
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  publicKey  Bytes // COSE-encoded public key
+  counter    Int       @default(0) // Monotonic counter for replay detection
+  transports String[]  @default([]) // ["usb","nfc","ble","internal"]
+  deviceType String? // "singleDevice" | "multiDevice"
+  backedUp   Boolean   @default(false)
+  name       String? // User-assigned label
+  createdAt  DateTime  @default(now())
+  lastUsedAt DateTime?
 
   @@index([userId])
 }
@@ -1174,22 +1174,21 @@ model PayoutDestination {
 // DUAL-ENVIRONMENT CHAT
 // =============================================================================
 
-
 // ── Phase 2: Business-to-business messaging (Section 3) ──────────────────────
 model BusinessConversation {
-  id                String   @id @default(uuid())
-  businessProfileId String
+  id                 String   @id @default(uuid())
+  businessProfileId  String
   conversationId     String   @unique // FK to Conversation.id
-  participantAId    Int      // business owner or staff userId
-  participantBId    Int      // the other party's userId
-  createdBy         Int      // who initiated
-  lastMessageAt     DateTime @default(now())
-  lastMessagePreview String? @db.VarChar(200)
+  participantAId     Int // business owner or staff userId
+  participantBId     Int // the other party's userId
+  createdBy          Int // who initiated
+  lastMessageAt      DateTime @default(now())
+  lastMessagePreview String?  @db.VarChar(200)
 
   businessProfile BusinessProfile @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
-  conversation   Conversation     @relation(fields: [conversationId], references: [id], onDelete: Cascade)
-  participantA   User             @relation("BizConvParticipantA", fields: [participantAId], references: [id])
-  participantB   User             @relation("BizConvParticipantB", fields: [participantBId], references: [id])
+  conversation    Conversation    @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  participantA    User            @relation("BizConvParticipantA", fields: [participantAId], references: [id])
+  participantB    User            @relation("BizConvParticipantB", fields: [participantBId], references: [id])
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -1206,8 +1205,8 @@ model Conversation {
   createdAt DateTime         @default(now())
   updatedAt DateTime         @updatedAt
 
-  participants User[]    @relation("ConversationParticipants")
-  messages     Message[]
+  participants         User[]                @relation("ConversationParticipants")
+  messages             Message[]
   businessConversation BusinessConversation?
 
   @@index([type])
@@ -1246,11 +1245,11 @@ model Message {
   // Disappearing messages (Phase 2): if set, message is auto-deleted after
   // this many seconds. expiresAt is computed on send = createdAt + seconds.
   disappearAfterSeconds Int?
-  expiresAt              DateTime?
+  expiresAt             DateTime?
 
   // Phase 3.3.4: pin, star, forward
-  isPinned  Boolean  @default(false)
-  isStarred Boolean  @default(false)
+  isPinned  Boolean   @default(false)
+  isStarred Boolean   @default(false)
   pinnedAt  DateTime?
 
   conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
@@ -1565,32 +1564,32 @@ model Notification {
 
 /// Tracks total USDT/crypto held across all on-chain wallets
 model SystemMasterCrypto {
-  id        Int      @id @default(1)
-  balance   Decimal  @default(0.0) @db.Decimal(20, 8)
+  id      Int     @id @default(1)
+  balance Decimal @default(0.0) @db.Decimal(20, 8)
 
   updatedAt DateTime @updatedAt
 }
 
 /// Tracks USDT immediately available for P2P escrow funding
 model SystemHotWallet {
-  id        Int      @id @default(1)
-  balance   Decimal  @default(0.0) @db.Decimal(20, 8)
+  id      Int     @id @default(1)
+  balance Decimal @default(0.0) @db.Decimal(20, 8)
 
   updatedAt DateTime @updatedAt
 }
 
 /// Tracks net fiat received from all completed P2P trades
 model SystemFiatPool {
-  id        Int      @id @default(1)
-  balance   Decimal  @default(0.0) @db.Decimal(20, 8)
+  id      Int     @id @default(1)
+  balance Decimal @default(0.0) @db.Decimal(20, 8)
 
   updatedAt DateTime @updatedAt
 }
 
 /// Tracks accumulated platform profit (fees, margins, spreads)
 model SystemProfitFees {
-  id        Int      @id @default(1)
-  balance   Decimal  @default(0.0) @db.Decimal(20, 8)
+  id      Int     @id @default(1)
+  balance Decimal @default(0.0) @db.Decimal(20, 8)
 
   updatedAt DateTime @updatedAt
 }
@@ -1825,11 +1824,11 @@ model DirectMessage {
 
   // Disappearing messages (Phase 2)
   disappearAfterSeconds Int?
-  expiresAt              DateTime?
+  expiresAt             DateTime?
 
   // Phase 3.3.4: pin, star, forward
-  isPinned  Boolean  @default(false)
-  isStarred Boolean  @default(false)
+  isPinned  Boolean   @default(false)
+  isStarred Boolean   @default(false)
   pinnedAt  DateTime?
 
   friendship Friendship @relation(fields: [friendshipId], references: [id], onDelete: Cascade)
@@ -2459,12 +2458,12 @@ model BusinessProfile {
   description     String?          @db.VarChar(500)
   website         String?          @db.VarChar(255)
   logoUrl         String?
-  coverPhotoUrl    String?  @db.VarChar(500) // Marketplace UI: business cover photo
+  coverPhotoUrl   String?          @db.VarChar(500) // Marketplace UI: business cover photo
   // Ad appearance customization (2026-07-06): lets a business pick its own
   // marketplace card tint from the business portal instead of always
   // inheriting the category-default tint. Hex string e.g. "#FFAA00", null
   // falls back to category tint (existing behavior in collapsible_business_bar.dart).
-  adAccentColor    String?  @db.VarChar(7)
+  adAccentColor   String?          @db.VarChar(7)
 
   // Verification
   isVerified Boolean   @default(false)
@@ -2473,12 +2472,12 @@ model BusinessProfile {
 
   // Admin moderation (WS4): a suspended business is hidden/blocked from new
   // activity until an admin unsuspends it. suspendReason is operator-facing.
-  isSuspended   Boolean @default(false)
-  isPausedByOwner  Boolean @default(false) // owner-initiated pause — stops new orders/bookings without admin suspension
-  allowOverbooking Boolean @default(false) // Module 06: opt-in overbooking against expected no-shows
-  groupId          String?  // optional FK to BusinessGroup for multi-brand owners
-  group            BusinessGroup?   @relation(fields: [groupId], references: [id], onDelete: SetNull)
-  suspendReason String? @db.VarChar(500)
+  isSuspended      Boolean        @default(false)
+  isPausedByOwner  Boolean        @default(false) // owner-initiated pause — stops new orders/bookings without admin suspension
+  allowOverbooking Boolean        @default(false) // Module 06: opt-in overbooking against expected no-shows
+  groupId          String? // optional FK to BusinessGroup for multi-brand owners
+  group            BusinessGroup? @relation(fields: [groupId], references: [id], onDelete: SetNull)
+  suspendReason    String?        @db.VarChar(500)
 
   // Public contact info
   phoneNumber  String? @db.VarChar(20)
@@ -2518,51 +2517,51 @@ model BusinessProfile {
 
   updatedAt DateTime @updatedAt
 
-  stories       Story[]
-  transitTrips  TransitTrip[]
-  followers     BusinessFollower[]
-  adPosts       BusinessAdPost[]
-  taxPresets    BusinessTaxPreset[]
-  dineInTabs    DineInTab[]
-  penaltyPolicy PenaltyPolicy?
-  showcase      BusinessShowcase[]
-  storefrontVersions StorefrontVersion[]
+  stories                 Story[]
+  transitTrips            TransitTrip[]
+  followers               BusinessFollower[]
+  adPosts                 BusinessAdPost[]
+  taxPresets              BusinessTaxPreset[]
+  dineInTabs              DineInTab[]
+  penaltyPolicy           PenaltyPolicy?
+  showcase                BusinessShowcase[]
+  storefrontVersions      StorefrontVersion[]
   // Business OS relations
-  employees          BusinessEmployee[]
-  businessConversations BusinessConversation[]
-  suppliers     Supplier[]
-  purchaseOrders PurchaseOrder[]
-  stockCounts  StockCount[]
-  shifts             Shift[]
-  shiftSwaps         ShiftSwap[]
-  timeOffRequests    TimeOffRequest[]
-  payrollRecords     PayrollRecord[]
-  ledgerEntries      BusinessLedgerEntry[]
-  employeeFeedbacks  EmployeeFeedback[]
-  hotelRooms         HotelRoom[]
-  housekeepingTasks  HotelHousekeepingTask[]
-  housekeepingTemplates HotelHousekeepingTemplate[]
-  hotelRateOverrides HotelRateOverride[]
-  promotions         BusinessPromotion[]
-  recurringExpenses  RecurringExpenseTemplate[]
-  waitlistEntries   RestaurantWaitlistEntry[]
-  kitchenOrders      KitchenOrder[]
-  driverAssignments  DriverAssignment[]
-  vehicleMaintenances VehicleMaintenance[]
-  cargoParcelsSent     CargoParcel[]
-  routeTemplates       TransitRouteTemplate[]
-  inventoryItems       InventoryItem[]
+  employees               BusinessEmployee[]
+  businessConversations   BusinessConversation[]
+  suppliers               Supplier[]
+  purchaseOrders          PurchaseOrder[]
+  stockCounts             StockCount[]
+  shifts                  Shift[]
+  shiftSwaps              ShiftSwap[]
+  timeOffRequests         TimeOffRequest[]
+  payrollRecords          PayrollRecord[]
+  ledgerEntries           BusinessLedgerEntry[]
+  employeeFeedbacks       EmployeeFeedback[]
+  hotelRooms              HotelRoom[]
+  housekeepingTasks       HotelHousekeepingTask[]
+  housekeepingTemplates   HotelHousekeepingTemplate[]
+  hotelRateOverrides      HotelRateOverride[]
+  promotions              BusinessPromotion[]
+  recurringExpenses       RecurringExpenseTemplate[]
+  waitlistEntries         RestaurantWaitlistEntry[]
+  kitchenOrders           KitchenOrder[]
+  driverAssignments       DriverAssignment[]
+  vehicleMaintenances     VehicleMaintenance[]
+  cargoParcelsSent        CargoParcel[]
+  routeTemplates          TransitRouteTemplate[]
+  inventoryItems          InventoryItem[]
   notificationPreferences BusinessNotificationPreference?
-  apiKeys              BusinessApiKey[]
-  webhooks             BusinessWebhook[]
-  messagingConfig     BusinessMessagingConfig?
-  messageLogs         BusinessMessageLog[]
+  apiKeys                 BusinessApiKey[]
+  webhooks                BusinessWebhook[]
+  messagingConfig         BusinessMessagingConfig?
+  messageLogs             BusinessMessageLog[]
 
   // Storefront SDUI
-  storefrontLayouts        BusinessStorefrontLayout[]
+  storefrontLayouts         BusinessStorefrontLayout[]
   storefrontLayoutVersions  BusinessStorefrontLayoutVersion[]
-  storefrontDisabled        Boolean  @default(false)
-  storefrontAnalyticsEvents  StorefrontAnalyticsEvent[]
+  storefrontDisabled        Boolean                           @default(false)
+  storefrontAnalyticsEvents StorefrontAnalyticsEvent[]
 
   @@index([bizId])
   @@index([category])
@@ -2592,7 +2591,7 @@ model BusinessGroup {
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 
-  owner            User             @relation(fields: [ownerUserId], references: [id], onDelete: Cascade)
+  owner            User              @relation(fields: [ownerUserId], references: [id], onDelete: Cascade)
   businessProfiles BusinessProfile[]
 
   @@index([ownerUserId])
@@ -2638,24 +2637,24 @@ model BusinessLocation {
   isPrimary         Boolean @default(false) // only one per business should be primary
   isActive          Boolean @default(true)
 
-  businessProfile BusinessProfile   @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
-  hotelRooms       HotelRoom[]
-  kitchenOrders    KitchenOrder[]
+  businessProfile BusinessProfile                  @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+  hotelRooms      HotelRoom[]
+  kitchenOrders   KitchenOrder[]
   products        BusinessProduct[] // products available at this specific location
   tables          BusinessTable[]
   invoices        BusinessInvoice[]
   reviews         BusinessReview[]
   sections        CatalogSection[] // catalog sections scoped to this branch (2026-06-24)
-  hoursExceptions  BusinessLocationHoursException[]
+  hoursExceptions BusinessLocationHoursException[]
 
-  createdAt  DateTime    @default(now())
-  updatedAt  DateTime    @updatedAt
-  dineInTabs DineInTab[]
+  createdAt       DateTime                  @default(now())
+  updatedAt       DateTime                  @updatedAt
+  dineInTabs      DineInTab[]
+  waitlistEntries RestaurantWaitlistEntry[]
 
   @@index([businessProfileId])
   @@index([businessProfileId, isActive])
   @@index([latitude]) // used by bounding-box nearby search
-  waitlistEntries RestaurantWaitlistEntry[]
   @@index([longitude])
 }
 
@@ -2664,34 +2663,33 @@ model BusinessTable {
   locationId String
   label      String  @db.VarChar(50) // e.g. "Table 4", "Counter 1", "VIP Room"
   isActive   Boolean @default(true)
-  metadata   Json?   // floor-plan layout: { positionX, positionY, shape, seats, rotation }
+  metadata   Json? // floor-plan layout: { positionX, positionY, shape, seats, rotation }
 
   location BusinessLocation  @relation(fields: [locationId], references: [id], onDelete: Cascade)
   invoices BusinessInvoice[]
 
-  createdAt  DateTime    @default(now())
-  dineInTabs DineInTab[]
+  createdAt       DateTime                  @default(now())
+  dineInTabs      DineInTab[]
   waitlistEntries RestaurantWaitlistEntry[]
 
   @@unique([locationId, label]) // no duplicate table labels within a location
   @@index([locationId])
 }
 
-
 // ── Restaurant Waitlist (Module 04) ──────────────────────────────────────────
 // When all tables are full, host adds a party to the waitlist.
 model RestaurantWaitlistEntry {
-  id                String   @id @default(uuid())
+  id                String    @id @default(uuid())
   businessProfileId String
   locationId        String?
-  partyName         String   @db.VarChar(100)
-  phone             String?  @db.VarChar(20)
-  partySize         Int      @default(2)
-  quotedWaitMinutes Int?     // estimated wait in minutes
-  status            String   @default("WAITING") // WAITING, SEATED, LEFT, CANCELLED
+  partyName         String    @db.VarChar(100)
+  phone             String?   @db.VarChar(20)
+  partySize         Int       @default(2)
+  quotedWaitMinutes Int? // estimated wait in minutes
+  status            String    @default("WAITING") // WAITING, SEATED, LEFT, CANCELLED
   notifiedAt        DateTime?
   seatedAt          DateTime?
-  tableId           String?   // which table they were seated at
+  tableId           String? // which table they were seated at
 
   businessProfile BusinessProfile   @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
   location        BusinessLocation? @relation(fields: [locationId], references: [id])
@@ -2728,10 +2726,10 @@ model BusinessInvoice {
   paymentMethod      String?       @db.VarChar(20) // "AZAMAN_BALANCE" | "CASH" | "SPLIT"
   idempotencyKey     String?       @unique // client-supplied dedup for offline sync
   // Phase 3: Recurring invoice support
-  isRecurring       Boolean       @default(false)
-  recurringInterval String?       @db.VarChar(20) // DAILY, WEEKLY, MONTHLY, QUARTERLY, YEARLY
-  recurringNextDate DateTime?
-  recurringParentId String?       @db.VarChar(36) // original invoice ID for cloned invoices
+  isRecurring        Boolean       @default(false)
+  recurringInterval  String?       @db.VarChar(20) // DAILY, WEEKLY, MONTHLY, QUARTERLY, YEARLY
+  recurringNextDate  DateTime?
+  recurringParentId  String?       @db.VarChar(36) // original invoice ID for cloned invoices
 
   businessProfile BusinessProfile           @relation(fields: [businessProfileId], references: [id])
   location        BusinessLocation?         @relation(fields: [locationId], references: [id])
@@ -2795,18 +2793,17 @@ model BusinessReview {
   order           BusinessOrder?    @relation(fields: [orderId], references: [id])
   invoice         BusinessInvoice?  @relation(fields: [invoiceId], references: [id])
 
-  createdAt        DateTime        @default(now())
-  photoUrls        Json?
-  reservationId    String?         @unique
-  transitBookingId String?         @unique
-  reservation      Reservation?    @relation(fields: [reservationId], references: [id])
-  transitBooking   TransitBooking? @relation(fields: [transitBookingId], references: [id])
+  createdAt          DateTime        @default(now())
+  photoUrls          Json?
+  reservationId      String?         @unique
+  transitBookingId   String?         @unique
+  reservation        Reservation?    @relation(fields: [reservationId], references: [id])
+  transitBooking     TransitBooking? @relation(fields: [transitBookingId], references: [id])
+  // Owner response to review
+  businessResponse   String?         @db.VarChar(1000)
+  businessResponseAt DateTime?
 
   @@index([businessProfileId])
-  // Owner response to review
-  businessResponse     String?  @db.VarChar(1000)
-  businessResponseAt   DateTime?
-
   @@index([businessProfileId, createdAt(sort: Desc)])
 }
 
@@ -2814,29 +2811,29 @@ model BusinessReview {
 
 // ── Business Promotions (Module 08 — Marketing) ───────────────────────────────
 model BusinessPromotion {
-  id                String   @id @default(uuid())
-  businessProfileId String
-  code              String?  @db.VarChar(50) // null = automatic (no code needed)
-  name              String   @db.VarChar(120)
-  discountType      String   @db.VarChar(20) // PERCENT | FLAT | BUY_X_GET_Y
-  discountValue     Decimal  @db.Decimal(10, 4) // percent or flat USDC amount
-  buyQuantity       Int?     // for BUY_X_GET_Y: X
-  getQuantity       Int?     // for BUY_X_GET_Y: Y
-  scope             String   @db.VarChar(30) // ORDER | PRODUCT | FIRST_TIME | MIN_SPEND
-  minSpendUsdc      Decimal? @db.Decimal(20, 8)
+  id                   String   @id @default(uuid())
+  businessProfileId    String
+  code                 String?  @db.VarChar(50) // null = automatic (no code needed)
+  name                 String   @db.VarChar(120)
+  discountType         String   @db.VarChar(20) // PERCENT | FLAT | BUY_X_GET_Y
+  discountValue        Decimal  @db.Decimal(10, 4) // percent or flat USDC amount
+  buyQuantity          Int? // for BUY_X_GET_Y: X
+  getQuantity          Int? // for BUY_X_GET_Y: Y
+  scope                String   @db.VarChar(30) // ORDER | PRODUCT | FIRST_TIME | MIN_SPEND
+  minSpendUsdc         Decimal? @db.Decimal(20, 8)
   applicableProductIds String[] // empty = all products
-  startDate         DateTime
-  endDate           DateTime
-  usageLimit        Int?     // null = unlimited
-  perCustomerLimit  Int?     // null = unlimited
-  usageCount        Int      @default(0)
-  isActive          Boolean  @default(true)
-  notes             String?  @db.VarChar(500)
+  startDate            DateTime
+  endDate              DateTime
+  usageLimit           Int? // null = unlimited
+  perCustomerLimit     Int? // null = unlimited
+  usageCount           Int      @default(0)
+  isActive             Boolean  @default(true)
+  notes                String?  @db.VarChar(500)
 
-  businessProfile   BusinessProfile @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+  businessProfile BusinessProfile @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
 
-  createdAt         DateTime @default(now())
-  updatedAt         DateTime @updatedAt
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
   @@index([businessProfileId, isActive])
   @@index([code])
@@ -2844,23 +2841,23 @@ model BusinessPromotion {
 
 // ── Recurring Expense Templates (Module 07 — Finance) ────────────────────────
 model RecurringExpenseTemplate {
-  id                String   @id @default(uuid())
+  id                String    @id @default(uuid())
   businessProfileId String
-  name              String   @db.VarChar(120) // "Monthly Rent", "Electricity", "Staff Meals"
-  category          String   @db.VarChar(80)
-  amount            Decimal  @db.Decimal(20, 8)
-  description       String?  @db.VarChar(500)
-  frequency         String   @db.VarChar(20) // MONTHLY | WEEKLY | QUARTERLY
-  dayOfMonth        Int?     // 1-28 for MONTHLY; null for WEEKLY
-  dayOfWeek         Int?     // 0=Sun for WEEKLY
-  isActive          Boolean  @default(true)
+  name              String    @db.VarChar(120) // "Monthly Rent", "Electricity", "Staff Meals"
+  category          String    @db.VarChar(80)
+  amount            Decimal   @db.Decimal(20, 8)
+  description       String?   @db.VarChar(500)
+  frequency         String    @db.VarChar(20) // MONTHLY | WEEKLY | QUARTERLY
+  dayOfMonth        Int? // 1-28 for MONTHLY; null for WEEKLY
+  dayOfWeek         Int? // 0=Sun for WEEKLY
+  isActive          Boolean   @default(true)
   lastPostedAt      DateTime?
   nextDueAt         DateTime?
 
-  businessProfile   BusinessProfile @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+  businessProfile BusinessProfile @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
 
-  createdAt         DateTime @default(now())
-  updatedAt         DateTime @updatedAt
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
   @@index([businessProfileId, isActive])
 }
@@ -2915,28 +2912,28 @@ model BusinessProduct {
   estimatedDelivery String? @db.VarChar(100) // e.g. '2-3 days'
 
   // Catalog section additions (2026-06-24)
-  catalogSectionId String? // which CatalogSection this item belongs to
-  isAvailable      Boolean  @default(true) // real-time sold-out toggle
-  preparationMins  Int? // estimated prep time in minutes
-  tags             String[] // ["SPICY","VEGAN","GLUTEN_FREE","POPULAR","NEW"]
+  catalogSectionId  String? // which CatalogSection this item belongs to
+  isAvailable       Boolean  @default(true) // real-time sold-out toggle
+  preparationMins   Int? // estimated prep time in minutes
+  tags              String[] // ["SPICY","VEGAN","GLUTEN_FREE","POPULAR","NEW"]
   // Phase 3 Retail: barcode/SKU + stock tracking
-  sku              String? @unique @db.VarChar(50) // Stock Keeping Unit
-  barcode          String? @db.VarChar(100) // Barcode (EAN/UPC/QR)
-  costPrice        Decimal? @db.Decimal(20, 8) // Cost for margin calculation
-  stockQty         Int?    @default(0) // Current stock (null = untracked)
-  lowStockThreshold Int?   @default(5) // Low-stock alert threshold
-  supplierId       String? // Linked Supplier for POs
-  calorieCount     Int?
-  variants         Json? // [{ label:"Small", priceDelta:0 },{ label:"Large", priceDelta:2.5 }]
-  modifierGroups   Json? // [{ name:"Add-ons", max:3, options:[{ name:"Extra Sauce", price:0.5 }] }]
+  sku               String?  @unique @db.VarChar(50) // Stock Keeping Unit
+  barcode           String?  @db.VarChar(100) // Barcode (EAN/UPC/QR)
+  costPrice         Decimal? @db.Decimal(20, 8) // Cost for margin calculation
+  stockQty          Int?     @default(0) // Current stock (null = untracked)
+  lowStockThreshold Int?     @default(5) // Low-stock alert threshold
+  supplierId        String? // Linked Supplier for POs
+  calorieCount      Int?
+  variants          Json? // [{ label:"Small", priceDelta:0 },{ label:"Large", priceDelta:2.5 }]
+  modifierGroups    Json? // [{ name:"Add-ons", max:3, options:[{ name:"Extra Sauce", price:0.5 }] }]
 
-  businessProfile BusinessProfile   @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
-  location        BusinessLocation? @relation(fields: [locationId], references: [id])
-  catalogSection  CatalogSection?   @relation("SectionProducts", fields: [catalogSectionId], references: [id])
+  businessProfile   BusinessProfile    @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+  location          BusinessLocation?  @relation(fields: [locationId], references: [id])
+  catalogSection    CatalogSection?    @relation("SectionProducts", fields: [catalogSectionId], references: [id])
   kitchenOrderItems KitchenOrderItem[]
   recipeIngredients RecipeIngredient[]
-  orders          BusinessOrder[]
-  supplier        Supplier?      @relation("SupplierProducts", fields: [supplierId], references: [id])
+  orders            BusinessOrder[]
+  supplier          Supplier?          @relation("SupplierProducts", fields: [supplierId], references: [id])
 
   createdAt      DateTime        @default(now())
   updatedAt      DateTime        @updatedAt
@@ -2959,85 +2956,90 @@ model BusinessProduct {
 // =============================================================================
 
 model Supplier {
-  id                String   @id @default(uuid())
+  id                String            @id @default(uuid())
   businessProfileId String
-  name              String   @db.VarChar(200)
-  contactName       String?  @db.VarChar(200)
-  email             String?  @db.VarChar(200)
-  phone             String?  @db.VarChar(50)
-  address           String?  @db.VarChar(500)
-  notes             String?  @db.VarChar(1000)
-  isActive          Boolean  @default(true)
-  businessProfile   BusinessProfile @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+  name              String            @db.VarChar(200)
+  contactName       String?           @db.VarChar(200)
+  email             String?           @db.VarChar(200)
+  phone             String?           @db.VarChar(50)
+  address           String?           @db.VarChar(500)
+  notes             String?           @db.VarChar(1000)
+  isActive          Boolean           @default(true)
+  businessProfile   BusinessProfile   @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
   products          BusinessProduct[] @relation("SupplierProducts")
   purchaseOrders    PurchaseOrder[]
-  createdAt         DateTime @default(now())
-  updatedAt         DateTime @updatedAt
+  createdAt         DateTime          @default(now())
+  updatedAt         DateTime          @updatedAt
+
   @@index([businessProfileId])
 }
 
 model PurchaseOrder {
-  id                String   @id @default(uuid())
+  id                String              @id @default(uuid())
   businessProfileId String
-  poNumber          String   @unique @db.VarChar(50)
+  poNumber          String              @unique @db.VarChar(50)
   supplierId        String
-  status            String   @default("DRAFT") // DRAFT, SUBMITTED, RECEIVED, CANCELLED
-  totalCost         Decimal  @default(0) @db.Decimal(20, 8)
-  notes             String?  @db.VarChar(1000)
+  status            String              @default("DRAFT") // DRAFT, SUBMITTED, RECEIVED, CANCELLED
+  totalCost         Decimal             @default(0) @db.Decimal(20, 8)
+  notes             String?             @db.VarChar(1000)
   expectedDate      DateTime?
   receivedDate      DateTime?
   createdById       Int
-  businessProfile   BusinessProfile @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
-  supplier          Supplier       @relation(fields: [supplierId], references: [id])
+  businessProfile   BusinessProfile     @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+  supplier          Supplier            @relation(fields: [supplierId], references: [id])
   items             PurchaseOrderItem[]
-  createdAt         DateTime       @default(now())
-  updatedAt         DateTime       @updatedAt
+  createdAt         DateTime            @default(now())
+  updatedAt         DateTime            @updatedAt
+
   @@index([businessProfileId])
   @@index([supplierId])
   @@index([status])
 }
 
 model PurchaseOrderItem {
-  id              String         @id @default(uuid())
+  id              String        @id @default(uuid())
   purchaseOrderId String
   productId       String?
-  productName     String         @db.VarChar(200)
-  sku             String?        @db.VarChar(50)
-  quantity        Int            @default(1)
-  unitCost        Decimal        @default(0) @db.Decimal(20, 8)
-  lineTotal       Decimal        @default(0) @db.Decimal(20, 8)
-  receivedQty     Int            @default(0)
-  purchaseOrder   PurchaseOrder  @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
-  createdAt       DateTime       @default(now())
+  productName     String        @db.VarChar(200)
+  sku             String?       @db.VarChar(50)
+  quantity        Int           @default(1)
+  unitCost        Decimal       @default(0) @db.Decimal(20, 8)
+  lineTotal       Decimal       @default(0) @db.Decimal(20, 8)
+  receivedQty     Int           @default(0)
+  purchaseOrder   PurchaseOrder @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
+  createdAt       DateTime      @default(now())
+
   @@index([purchaseOrderId])
 }
 
 model StockCount {
-  id                String   @id @default(uuid())
+  id                String           @id @default(uuid())
   businessProfileId String
-  countNumber       String   @unique @db.VarChar(50)
-  status            String   @default("OPEN") // OPEN, COUNTED, RECONCILED
-  notes             String?  @db.VarChar(1000)
+  countNumber       String           @unique @db.VarChar(50)
+  status            String           @default("OPEN") // OPEN, COUNTED, RECONCILED
+  notes             String?          @db.VarChar(1000)
   createdById       Int
   reconciledAt      DateTime?
-  businessProfile   BusinessProfile @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+  businessProfile   BusinessProfile  @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
   items             StockCountItem[]
-  createdAt         DateTime @default(now())
-  updatedAt         DateTime @updatedAt
+  createdAt         DateTime         @default(now())
+  updatedAt         DateTime         @updatedAt
+
   @@index([businessProfileId])
   @@index([status])
 }
 
 model StockCountItem {
-  id              String     @id @default(uuid())
-  stockCountId    String
-  productId       String
-  systemQty       Int        @default(0)
-  countedQty      Int?
-  discrepancy     Int?
-  notes           String?    @db.VarChar(500)
-  stockCount      StockCount @relation(fields: [stockCountId], references: [id], onDelete: Cascade)
-  createdAt       DateTime   @default(now())
+  id           String     @id @default(uuid())
+  stockCountId String
+  productId    String
+  systemQty    Int        @default(0)
+  countedQty   Int?
+  discrepancy  Int?
+  notes        String?    @db.VarChar(500)
+  stockCount   StockCount @relation(fields: [stockCountId], references: [id], onDelete: Cascade)
+  createdAt    DateTime   @default(now())
+
   @@index([stockCountId])
   @@index([productId])
 }
@@ -3062,10 +3064,10 @@ model BusinessOrder {
 
   createdAt DateTime @default(now())
 
-  paymentMethod   String?  @db.VarChar(20) // "AZAMAN_BALANCE" | "CASH" | "SPLIT"
-  idempotencyKey  String?  @unique // client-supplied dedup key for offline sync
-  cashReceived    Decimal? @db.Decimal(20, 8) // for CASH payments — actual cash tendered
-  cashChange      Decimal? @db.Decimal(20, 8) // change given back
+  paymentMethod  String?  @db.VarChar(20) // "AZAMAN_BALANCE" | "CASH" | "SPLIT"
+  idempotencyKey String?  @unique // client-supplied dedup key for offline sync
+  cashReceived   Decimal? @db.Decimal(20, 8) // for CASH payments — actual cash tendered
+  cashChange     Decimal? @db.Decimal(20, 8) // change given back
 
   updatedAt DateTime @updatedAt
 
@@ -3075,7 +3077,7 @@ model BusinessOrder {
   escrow          SmartEscrow?     @relation(fields: [escrowId], references: [id])
   ticket          Ticket?          @relation(fields: [ticketId], references: [id])
   review          BusinessReview? // Discovery Sprint: one optional review per order
-  kitchenOrder  KitchenOrder?
+  kitchenOrder    KitchenOrder?
 
   @@index([businessProfileId])
   @@index([businessProfileId, status])
@@ -3136,13 +3138,12 @@ model BusinessNotification {
   isRead            Boolean      @default(false)
   createdAt         DateTime     @default(now())
 
-  businessProfile BusinessProfile @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+  businessProfile    BusinessProfile @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+  // Owner response to review
+  businessResponse   String?         @db.VarChar(1000)
+  businessResponseAt DateTime?
 
   @@index([businessProfileId, isRead])
-  // Owner response to review
-  businessResponse     String?  @db.VarChar(1000)
-  businessResponseAt   DateTime?
-
   @@index([businessProfileId, createdAt(sort: Desc)])
 }
 
@@ -3212,7 +3213,7 @@ model Reservation {
 
   proposedStartDatetime DateTime?
   proposedEndDatetime   DateTime?
-  counterProposeMessage String?  @db.VarChar(500)
+  counterProposeMessage String?   @db.VarChar(500)
   counterProposedAt     DateTime?
 
   @@index([businessProfileId, startDatetime])
@@ -3261,9 +3262,10 @@ model TransitVehicle {
   transitTrips TransitTrip[]
   seatMap      TransitSeatMap?
 
-  driverAssignments  DriverAssignment[]
-  maintenances        VehicleMaintenance[]
-  routeTemplates      TransitRouteTemplate[]
+  driverAssignments DriverAssignment[]
+  maintenances      VehicleMaintenance[]
+  routeTemplates    TransitRouteTemplate[]
+
   @@index([businessProfileId])
   @@index([businessProfileId, isActive])
   @@index([type])
@@ -3534,11 +3536,11 @@ model GroupMessage {
 
   // Disappearing messages (Phase 2)
   disappearAfterSeconds Int?
-  expiresAt              DateTime?
+  expiresAt             DateTime?
 
   // Phase 3.3.4: pin, star, forward
-  isPinned  Boolean  @default(false)
-  isStarred Boolean  @default(false)
+  isPinned  Boolean   @default(false)
+  isStarred Boolean   @default(false)
   pinnedAt  DateTime?
 
   group  GroupChat @relation(fields: [groupId], references: [id], onDelete: Cascade)
@@ -4098,10 +4100,10 @@ model TransitTrip {
   createdAt         DateTime  @default(now())
   updatedAt         DateTime  @updatedAt
 
-  businessProfile BusinessProfile      @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
-  vehicle         TransitVehicle       @relation(fields: [vehicleId], references: [id], onDelete: Cascade)
-  bookings        TransitBooking[]
-  seats           TransitBookingSeat[]
+  businessProfile   BusinessProfile      @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+  vehicle           TransitVehicle       @relation(fields: [vehicleId], references: [id], onDelete: Cascade)
+  bookings          TransitBooking[]
+  seats             TransitBookingSeat[]
   cargoParcels      CargoParcel[]
   driverAssignments DriverAssignment[]
 
@@ -4270,12 +4272,11 @@ model BusinessShowcase {
   @@index([businessProfileId, isActive, displayOrder])
 }
 
-
 model StorefrontVersion {
   id                String   @id @default(uuid())
   businessProfileId String
-  snapshot          Json     // array of { mediaUrl, mediaType, thumbnailUrl, caption, displayOrder, isActive }
-  label             String?  @db.VarChar(200)  // optional human label e.g. "Summer menu launch"
+  snapshot          Json // array of { mediaUrl, mediaType, thumbnailUrl, caption, displayOrder, isActive }
+  label             String?  @db.VarChar(200) // optional human label e.g. "Summer menu launch"
   publishedBy       String   @db.VarChar(100)
   createdAt         DateTime @default(now())
 
@@ -4283,8 +4284,6 @@ model StorefrontVersion {
 
   @@index([businessProfileId, createdAt])
 }
-
-
 
 // BUSINESS OS — EMPLOYEE MANAGEMENT & CATEGORY OPERATIONS (July 2026)
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -4441,65 +4440,65 @@ enum MaintenanceType {
 // ── Employee Management Models ────────────────────────────────────────────────
 
 model BusinessEmployee {
-  id                String                  @id @default(uuid())
+  id                String         @id @default(uuid())
   businessProfileId String
   userId            Int
-  role              EmployeeRole            @default(STAFF)
-  status            EmployeeStatus          @default(ACTIVE)
-  title             String?                 @db.VarChar(100)
-  department        String?                 @db.VarChar(100) // e.g. "Front Desk", "Kitchen", "Housekeeping", "Driving"
-  
+  role              EmployeeRole   @default(STAFF)
+  status            EmployeeStatus @default(ACTIVE)
+  title             String?        @db.VarChar(100)
+  department        String?        @db.VarChar(100) // e.g. "Front Desk", "Kitchen", "Housekeeping", "Driving"
+
   // Compensation
-  payrollType       PayrollType             @default(SALARY)
-  salaryAmount      Decimal?                @db.Decimal(20, 8) // monthly salary in USDC
-  hourlyRate        Decimal?                @db.Decimal(20, 8) // hourly rate in USDC
+  payrollType       PayrollType               @default(SALARY)
+  salaryAmount      Decimal?                  @db.Decimal(20, 8) // monthly salary in USDC
+  hourlyRate        Decimal?                  @db.Decimal(20, 8) // hourly rate in USDC
   paymentPreference EmployeePaymentPreference @default(AZAMAN_BALANCE)
-  
+
   // Smart Route for payroll — employee sets their own routing
-  smartRouteId      String? // FK to SmartRoute.id — employee-configured split routing
-  
+  smartRouteId String? // FK to SmartRoute.id — employee-configured split routing
+
   // Permissions (JSON array of permission strings like ["manage_employees", "view_finance", "process_payroll"])
-  permissions       String[]
-  
+  permissions String[]
+
   // Stats (denormalized for quick portal display)
-  totalShifts       Int      @default(0)
-  totalHours        Decimal  @default(0.0) @db.Decimal(10, 2)
-  lateCount         Int      @default(0)
-  noShowCount       Int      @default(0)
-  rating            Decimal  @default(5.0) @db.Decimal(3, 2) // average from EmployeeFeedback
-  ratingCount       Int      @default(0)
-  
+  totalShifts Int     @default(0)
+  totalHours  Decimal @default(0.0) @db.Decimal(10, 2)
+  lateCount   Int     @default(0)
+  noShowCount Int     @default(0)
+  rating      Decimal @default(5.0) @db.Decimal(3, 2) // average from EmployeeFeedback
+  ratingCount Int     @default(0)
+
   // EWA (Earned Wage Access) tracking
-  accruedWages      Decimal  @default(0.0) @db.Decimal(20, 8) // running accrued wages
-  withdrawnEarly    Decimal  @default(0.0) @db.Decimal(20, 8) // total withdrawn via EWA
-  ewaEligible       Boolean  @default(true)
-  
+  accruedWages   Decimal @default(0.0) @db.Decimal(20, 8) // running accrued wages
+  withdrawnEarly Decimal @default(0.0) @db.Decimal(20, 8) // total withdrawn via EWA
+  ewaEligible    Boolean @default(true)
+
   // Employment dates
-  hireDate          DateTime @default(now())
-  terminationDate   DateTime?
-  
+  hireDate        DateTime  @default(now())
+  terminationDate DateTime?
+
   // Metadata
-  emergencyContact  Json? // { name, phone, relationship }
-  notes             String? @db.VarChar(1000)
-  pinCode           String? @db.VarChar(255) // hashed PIN for kiosk clock-in/out
-  
-  businessProfile BusinessProfile @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
-  user            User            @relation("EmployeeUser", fields: [userId], references: [id], onDelete: Cascade)
-  shifts          Shift[]
-  swapRequests    ShiftSwap[]      @relation("SwapRequesterEmployee")
-  swapClaims      ShiftSwap[]      @relation("SwapClaimerEmployee")
-  timeOffRequests TimeOffRequest[]
-  payrollRecords  PayrollRecord[]
-  feedbacksGiven   EmployeeFeedback[] @relation("FeedbackGiverEmployee")
-  feedbacksReceived EmployeeFeedback[] @relation("FeedbackReceiverEmployee")
+  emergencyContact Json? // { name, phone, relationship }
+  notes            String? @db.VarChar(1000)
+  pinCode          String? @db.VarChar(255) // hashed PIN for kiosk clock-in/out
+
+  businessProfile   BusinessProfile         @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+  user              User                    @relation("EmployeeUser", fields: [userId], references: [id], onDelete: Cascade)
+  shifts            Shift[]
+  swapRequests      ShiftSwap[]             @relation("SwapRequesterEmployee")
+  swapClaims        ShiftSwap[]             @relation("SwapClaimerEmployee")
+  timeOffRequests   TimeOffRequest[]
+  payrollRecords    PayrollRecord[]
+  feedbacksGiven    EmployeeFeedback[]      @relation("FeedbackGiverEmployee")
+  feedbacksReceived EmployeeFeedback[]      @relation("FeedbackReceiverEmployee")
   housekeepingTasks HotelHousekeepingTask[]
-  kitchenOrders    KitchenOrder[]      @relation("KitchenChefEmployee")
+  kitchenOrders     KitchenOrder[]          @relation("KitchenChefEmployee")
   driverAssignments DriverAssignment[]
-  
+
   createdAt DateTime @default(now())
 
   updatedAt DateTime @updatedAt
-  
+
   @@unique([businessProfileId, userId])
   @@index([businessProfileId, status])
   @@index([userId])
@@ -4507,45 +4506,45 @@ model BusinessEmployee {
 }
 
 model Shift {
-  id                String      @id @default(uuid())
+  id                String  @id @default(uuid())
   businessProfileId String
   employeeId        String
   userId            Int // denormalized from employee for quick lookups
   locationId        String? // which branch/location
-  
+
   // Scheduling
-  shiftDate         DateTime // the date of the shift (date only, time component is start)
-  startTime         DateTime
-  endTime           DateTime
-  breakMinutes      Int         @default(30)
-  
+  shiftDate    DateTime // the date of the shift (date only, time component is start)
+  startTime    DateTime
+  endTime      DateTime
+  breakMinutes Int      @default(30)
+
   // Clock in/out tracking
-  status            ShiftStatus @default(SCHEDULED)
-  clockInTime       DateTime?
-  clockOutTime      DateTime?
-  actualMinutes     Int? // calculated from clock in/out
-  
+  status        ShiftStatus @default(SCHEDULED)
+  clockInTime   DateTime?
+  clockOutTime  DateTime?
+  actualMinutes Int? // calculated from clock in/out
+
   // Late tracking
-  isLate            Boolean     @default(false)
-  lateMinutes       Int         @default(0)
-  
+  isLate      Boolean @default(false)
+  lateMinutes Int     @default(0)
+
   // Rotation info
-  rotationId        String? // links to a rotation group
-  shiftLabel        String?     @db.VarChar(50) // e.g. "Morning A", "Evening B"
-  
+  rotationId String? // links to a rotation group
+  shiftLabel String? @db.VarChar(50) // e.g. "Morning A", "Evening B"
+
   // Notes
-  notes             String?     @db.VarChar(500)
-  
-  businessProfile BusinessProfile   @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
-  employee        BusinessEmployee  @relation(fields: [employeeId], references: [id], onDelete: Cascade)
-  user            User              @relation("ShiftUser", fields: [userId], references: [id], onDelete: Cascade)
-  swapRequests    ShiftSwap[]       @relation("ShiftSwapOrigin")
-  swapClaims      ShiftSwap[]       @relation("ShiftSwapTarget")
-  
+  notes String? @db.VarChar(500)
+
+  businessProfile BusinessProfile  @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+  employee        BusinessEmployee @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  user            User             @relation("ShiftUser", fields: [userId], references: [id], onDelete: Cascade)
+  swapRequests    ShiftSwap[]      @relation("ShiftSwapOrigin")
+  swapClaims      ShiftSwap[]      @relation("ShiftSwapTarget")
+
   createdAt DateTime @default(now())
 
   updatedAt DateTime @updatedAt
-  
+
   @@index([businessProfileId, shiftDate])
   @@index([employeeId, shiftDate])
   @@index([userId, shiftDate])
@@ -4554,113 +4553,113 @@ model Shift {
 }
 
 model ShiftSwap {
-  id                String          @id @default(uuid())
-  businessProfileId String
-  requestingShiftId String
-  claimingShiftId   String? // the shift the claimer offers in return (null = one-way takeover)
+  id                   String  @id @default(uuid())
+  businessProfileId    String
+  requestingShiftId    String
+  claimingShiftId      String? // the shift the claimer offers in return (null = one-way takeover)
   requestingEmployeeId String
-  claimingEmployeeId  String?
-  requestingUserId    Int
-  claimingUserId      Int?
-  
-  status            ShiftSwapStatus @default(PENDING)
-  reason            String?         @db.VarChar(500)
-  managerNote       String?         @db.VarChar(500)
-  
-  requestedAt       DateTime        @default(now())
-  respondedAt       DateTime?
-  
-  requestingShift   Shift             @relation("ShiftSwapOrigin", fields: [requestingShiftId], references: [id], onDelete: Cascade)
-  claimingShift     Shift?            @relation("ShiftSwapTarget", fields: [claimingShiftId], references: [id])
-  requestingEmployee BusinessEmployee @relation("SwapRequesterEmployee", fields: [requestingEmployeeId], references: [id], onDelete: Cascade)
+  claimingEmployeeId   String?
+  requestingUserId     Int
+  claimingUserId       Int?
+
+  status      ShiftSwapStatus @default(PENDING)
+  reason      String?         @db.VarChar(500)
+  managerNote String?         @db.VarChar(500)
+
+  requestedAt DateTime  @default(now())
+  respondedAt DateTime?
+
+  requestingShift    Shift             @relation("ShiftSwapOrigin", fields: [requestingShiftId], references: [id], onDelete: Cascade)
+  claimingShift      Shift?            @relation("ShiftSwapTarget", fields: [claimingShiftId], references: [id])
+  requestingEmployee BusinessEmployee  @relation("SwapRequesterEmployee", fields: [requestingEmployeeId], references: [id], onDelete: Cascade)
   claimingEmployee   BusinessEmployee? @relation("SwapClaimerEmployee", fields: [claimingEmployeeId], references: [id])
-  businessProfile    BusinessProfile  @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
-  requestingUser     User             @relation("SwapRequester", fields: [requestingUserId], references: [id], onDelete: Cascade)
-  claimingUser       User?            @relation("SwapClaimer", fields: [claimingUserId], references: [id])
-  
+  businessProfile    BusinessProfile   @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+  requestingUser     User              @relation("SwapRequester", fields: [requestingUserId], references: [id], onDelete: Cascade)
+  claimingUser       User?             @relation("SwapClaimer", fields: [claimingUserId], references: [id])
+
   createdAt DateTime @default(now())
 
   updatedAt DateTime @updatedAt
-  
+
   @@index([businessProfileId, status])
   @@index([requestingEmployeeId])
   @@index([claimingEmployeeId])
 }
 
 model TimeOffRequest {
-  id                String         @id @default(uuid())
+  id                String @id @default(uuid())
   businessProfileId String
   employeeId        String
   userId            Int
-  
-  type              TimeOffType
-  status            TimeOffStatus  @default(PENDING)
-  
-  startDate         DateTime
-  endDate           DateTime
-  reason            String?        @db.VarChar(500)
-  managerNote       String?        @db.VarChar(500)
-  
+
+  type   TimeOffType
+  status TimeOffStatus @default(PENDING)
+
+  startDate   DateTime
+  endDate     DateTime
+  reason      String?  @db.VarChar(500)
+  managerNote String?  @db.VarChar(500)
+
   // For sick/emergency — can be same-day request
-  isEmergency       Boolean        @default(false)
-  
+  isEmergency Boolean @default(false)
+
   employee        BusinessEmployee @relation(fields: [employeeId], references: [id], onDelete: Cascade)
   businessProfile BusinessProfile  @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
   user            User             @relation(fields: [userId], references: [id], onDelete: Cascade)
-  
+
   createdAt DateTime @default(now())
 
   updatedAt DateTime @updatedAt
-  
+
   @@index([businessProfileId, status])
   @@index([employeeId])
   @@index([userId, status])
 }
 
 model PayrollRecord {
-  id                String         @id @default(uuid())
+  id                String @id @default(uuid())
   businessProfileId String
   employeeId        String
   userId            Int
-  
-  period            String         @db.VarChar(20) // e.g. "2026-07" for July 2026
-  payrollType       PayrollType
-  
+
+  period      String      @db.VarChar(20) // e.g. "2026-07" for July 2026
+  payrollType PayrollType
+
   // Earnings
-  grossAmount       Decimal        @db.Decimal(20, 8) // total gross in USDC
-  netAmount         Decimal        @db.Decimal(20, 8) // after deductions
-  baseAmount        Decimal        @db.Decimal(20, 8) // base salary or hours*rate
-  overtimeAmount    Decimal        @default(0.0) @db.Decimal(20, 8)
-  bonusAmount       Decimal        @default(0.0) @db.Decimal(20, 8)
-  tipsAmount        Decimal        @default(0.0) @db.Decimal(20, 8)
-  
+  grossAmount    Decimal @db.Decimal(20, 8) // total gross in USDC
+  netAmount      Decimal @db.Decimal(20, 8) // after deductions
+  baseAmount     Decimal @db.Decimal(20, 8) // base salary or hours*rate
+  overtimeAmount Decimal @default(0.0) @db.Decimal(20, 8)
+  bonusAmount    Decimal @default(0.0) @db.Decimal(20, 8)
+  tipsAmount     Decimal @default(0.0) @db.Decimal(20, 8)
+
   // Deductions
-  deductionAmount   Decimal        @default(0.0) @db.Decimal(20, 8)
-  ewaDeduction      Decimal        @default(0.0) @db.Decimal(20, 8) // EWA withdrawals to deduct
-  taxAmount         Decimal        @default(0.0) @db.Decimal(20, 8)
-  
+  deductionAmount Decimal @default(0.0) @db.Decimal(20, 8)
+  ewaDeduction    Decimal @default(0.0) @db.Decimal(20, 8) // EWA withdrawals to deduct
+  taxAmount       Decimal @default(0.0) @db.Decimal(20, 8)
+
   // Hours breakdown
-  totalHours        Decimal        @default(0.0) @db.Decimal(10, 2)
-  overtimeHours     Decimal        @default(0.0) @db.Decimal(10, 2)
-  
+  totalHours    Decimal @default(0.0) @db.Decimal(10, 2)
+  overtimeHours Decimal @default(0.0) @db.Decimal(10, 2)
+
   // Payment execution
-  status            PayrollStatus  @default(PENDING)
-  smartRouteId      String? // if Smart Route was used for disbursement
-  transactionHash   String? // blockchain tx hash if applicable
-  paidAt            DateTime?
-  failureReason     String?        @db.VarChar(500)
-  
+  status          PayrollStatus @default(PENDING)
+  smartRouteId    String? // if Smart Route was used for disbursement
+  transactionHash String? // blockchain tx hash if applicable
+  paidAt          DateTime?
+  failureReason   String?       @db.VarChar(500)
+
   // Breakdown details (JSON for audit)
-  breakdown         Json? // detailed breakdown of hours, rates, etc.
-  
+  breakdown Json? // detailed breakdown of hours, rates, etc.
+
   employee        BusinessEmployee @relation(fields: [employeeId], references: [id], onDelete: Cascade)
   businessProfile BusinessProfile  @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
   user            User             @relation(fields: [userId], references: [id], onDelete: Cascade)
-  
+
   createdAt DateTime @default(now())
 
   updatedAt DateTime @updatedAt
-  
+
   @@unique([employeeId, period])
   @@index([businessProfileId, period])
   @@index([employeeId, period])
@@ -4668,26 +4667,26 @@ model PayrollRecord {
 }
 
 model BusinessLedgerEntry {
-  id                String          @id @default(uuid())
+  id                String @id @default(uuid())
   businessProfileId String
-  
-  type              LedgerEntryType
-  category          String          @db.VarChar(100) // sub-category e.g. "Room Revenue", "Food Sales", "Fuel", "Salaries"
-  description       String          @db.VarChar(500)
-  amount            Decimal         @db.Decimal(20, 8) // positive for income, negative for expense
-  amountGhs         Decimal?        @db.Decimal(20, 8) // GHS equivalent at time of entry
-  
+
+  type        LedgerEntryType
+  category    String          @db.VarChar(100) // sub-category e.g. "Room Revenue", "Food Sales", "Fuel", "Salaries"
+  description String          @db.VarChar(500)
+  amount      Decimal         @db.Decimal(20, 8) // positive for income, negative for expense
+  amountGhs   Decimal?        @db.Decimal(20, 8) // GHS equivalent at time of entry
+
   // Source tracking
-  sourceType        String?         @db.VarChar(50) // "ORDER", "PAYROLL", "MANUAL", "ESCROW", "AD"
-  sourceId          String? // FK to the source entity (order id, payroll id, etc.)
-  
+  sourceType String? @db.VarChar(50) // "ORDER", "PAYROLL", "MANUAL", "ESCROW", "AD"
+  sourceId   String? // FK to the source entity (order id, payroll id, etc.)
+
   // Metadata
-  metadata          Json?
-  
+  metadata Json?
+
   businessProfile BusinessProfile @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
-  
+
   createdAt DateTime @default(now())
-  
+
   @@index([businessProfileId, type])
   @@index([businessProfileId, createdAt(sort: Desc)])
   @@index([businessProfileId, type, createdAt(sort: Desc)])
@@ -4695,79 +4694,78 @@ model BusinessLedgerEntry {
 }
 
 model EmployeeFeedback {
-  id                String          @id @default(uuid())
-  businessProfileId String
-  giverEmployeeId   String
+  id                 String @id @default(uuid())
+  businessProfileId  String
+  giverEmployeeId    String
   receiverEmployeeId String
-  givenByUserId     Int
-  receivedByUserId  Int
-  
-  rating            Int // 1-5
-  tags              FeedbackTag[]
-  comment           String?         @db.VarChar(500)
-  
-  // Period this feedback covers
-  periodStart       DateTime
-  periodEnd         DateTime
-  
-  giverEmployee    BusinessEmployee @relation("FeedbackGiverEmployee", fields: [giverEmployeeId], references: [id], onDelete: Cascade)
-  receiverEmployee  BusinessEmployee @relation("FeedbackReceiverEmployee", fields: [receiverEmployeeId], references: [id], onDelete: Cascade)
-  businessProfile   BusinessProfile  @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
-  givenByUser       User             @relation("FeedbackGiven", fields: [givenByUserId], references: [id], onDelete: Cascade)
-  
-  createdAt DateTime @default(now())
-  
-  @@index([receiverEmployeeId])
-  // Owner response to review
-  businessResponse     String?  @db.VarChar(1000)
-  businessResponseAt   DateTime?
+  givenByUserId      Int
+  receivedByUserId   Int
 
+  rating  Int // 1-5
+  tags    FeedbackTag[]
+  comment String?       @db.VarChar(500)
+
+  // Period this feedback covers
+  periodStart DateTime
+  periodEnd   DateTime
+
+  giverEmployee    BusinessEmployee @relation("FeedbackGiverEmployee", fields: [giverEmployeeId], references: [id], onDelete: Cascade)
+  receiverEmployee BusinessEmployee @relation("FeedbackReceiverEmployee", fields: [receiverEmployeeId], references: [id], onDelete: Cascade)
+  businessProfile  BusinessProfile  @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+  givenByUser      User             @relation("FeedbackGiven", fields: [givenByUserId], references: [id], onDelete: Cascade)
+
+  createdAt          DateTime  @default(now())
+  // Owner response to review
+  businessResponse   String?   @db.VarChar(1000)
+  businessResponseAt DateTime?
+
+  @@index([receiverEmployeeId])
   @@index([businessProfileId, createdAt(sort: Desc)])
 }
 
 // ── Hotel Operations Models ────────────────────────────────────────────────────
 
 model HotelRoom {
-  id                String      @id @default(uuid())
+  id                String  @id @default(uuid())
   businessProfileId String
   locationId        String?
-  
-  roomNumber        String      @db.VarChar(20)
-  roomType          String      @db.VarChar(50) // "STANDARD", "DELUXE", "SUITE", "EXECUTIVE"
-  floor             Int?
-  capacity          Int         @default(2)
-  bedConfig         String?     @db.VarChar(50) // "1 KING", "2 QUEEN", "1 QUEEN + 1 SINGLE"
-  
-  status            RoomStatus  @default(AVAILABLE)
-  
+
+  roomNumber String  @db.VarChar(20)
+  roomType   String  @db.VarChar(50) // "STANDARD", "DELUXE", "SUITE", "EXECUTIVE"
+  floor      Int?
+  capacity   Int     @default(2)
+  bedConfig  String? @db.VarChar(50) // "1 KING", "2 QUEEN", "1 QUEEN + 1 SINGLE"
+
+  status RoomStatus @default(AVAILABLE)
+
   // Pricing (per night in USDC)
-  basePriceUsdc     Decimal     @db.Decimal(20, 8)
-  weekendPriceUsdc  Decimal?    @db.Decimal(20, 8)
-  
+  basePriceUsdc    Decimal  @db.Decimal(20, 8)
+  weekendPriceUsdc Decimal? @db.Decimal(20, 8)
+
   // Amenities
-  amenities         String[] // ["AC", "WIFI", "TV", "MINIBAR", "BALCONY", "OCEAN_VIEW"]
-  
+  amenities String[] // ["AC", "WIFI", "TV", "MINIBAR", "BALCONY", "OCEAN_VIEW"]
+
   // Media
-  imageUrls         String[]
-  
+  imageUrls String[]
+
   // Current occupancy
   currentReservationId String? // FK to Reservation.id
-  checkedInAt         DateTime?
-  checkoutDueAt       DateTime?
-  
+  checkedInAt          DateTime?
+  checkoutDueAt        DateTime?
+
   // Maintenance
-  lastInspectedAt   DateTime?
-  notes             String?     @db.VarChar(500)
-  
-  businessProfile BusinessProfile  @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
-  location        BusinessLocation? @relation(fields: [locationId], references: [id])
+  lastInspectedAt DateTime?
+  notes           String?   @db.VarChar(500)
+
+  businessProfile   BusinessProfile         @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+  location          BusinessLocation?       @relation(fields: [locationId], references: [id])
   housekeepingTasks HotelHousekeepingTask[]
-  roomBlocks      HotelRoomBlock[]
-  
+  roomBlocks        HotelRoomBlock[]
+
   createdAt DateTime @default(now())
 
   updatedAt DateTime @updatedAt
-  
+
   @@unique([businessProfileId, roomNumber])
   @@index([businessProfileId, status])
   @@index([businessProfileId, roomType])
@@ -4775,60 +4773,59 @@ model HotelRoom {
 }
 
 model HotelHousekeepingTask {
-  id                String            @id @default(uuid())
+  id                String  @id @default(uuid())
   businessProfileId String
   roomId            String
   employeeId        String?
   userId            Int? // denormalized from employee
-  
-  status            HousekeepingStatus @default(PENDING)
-  
+
+  status HousekeepingStatus @default(PENDING)
+
   // Task details
-  taskType          String            @db.VarChar(50) // "CHECKOUT_CLEAN", "DAILY_REFRESH", "DEEP_CLEAN", "INSPECTION"
-  priority          Int               @default(5) // 1=urgent, 5=normal
-  description       String?           @db.VarChar(500)
-  
+  taskType    String  @db.VarChar(50) // "CHECKOUT_CLEAN", "DAILY_REFRESH", "DEEP_CLEAN", "INSPECTION"
+  priority    Int     @default(5) // 1=urgent, 5=normal
+  description String? @db.VarChar(500)
+
   // Checklist + reservation link (added for housekeeping workflow)
-  checklistItems    Json?             // [{ task: 'Strip beds', done: false }, ...]
-  reservationId     String?           // FK to Reservation.id (soft ref, no FK constraint)
-  
+  checklistItems Json? // [{ task: 'Strip beds', done: false }, ...]
+  reservationId  String? // FK to Reservation.id (soft ref, no FK constraint)
+
   // Photo proof
-  beforePhotoUrl    String?
-  afterPhotoUrl     String?
-  
+  beforePhotoUrl String?
+  afterPhotoUrl  String?
+
   // Timing
-  assignedAt        DateTime?
-  startedAt         DateTime?
-  completedAt       DateTime?
-  inspectedAt       DateTime?
-  
+  assignedAt  DateTime?
+  startedAt   DateTime?
+  completedAt DateTime?
+  inspectedAt DateTime?
+
   // Inspection result
-  inspectionPassed  Boolean?
-  inspectionNote    String?           @db.VarChar(500)
-  
-  room             HotelRoom         @relation(fields: [roomId], references: [id], onDelete: Cascade)
-  businessProfile  BusinessProfile   @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
-  employee         BusinessEmployee? @relation(fields: [employeeId], references: [id])
-  housekeeper      User?             @relation("Housekeeper", fields: [userId], references: [id])
-  
+  inspectionPassed Boolean?
+  inspectionNote   String?  @db.VarChar(500)
+
+  room            HotelRoom         @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  businessProfile BusinessProfile   @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+  employee        BusinessEmployee? @relation(fields: [employeeId], references: [id])
+  housekeeper     User?             @relation("Housekeeper", fields: [userId], references: [id])
+
   createdAt DateTime @default(now())
 
   updatedAt DateTime @updatedAt
-  
+
   @@index([businessProfileId, status])
   @@index([roomId, status])
   @@index([employeeId, status])
 }
 
-
 // ── Hotel Housekeeping Templates (Phase 4) ─────────────────────────────────────
 // Reusable checklist templates per task type (e.g. "Checkout Clean", "Deep Clean").
 model HotelHousekeepingTemplate {
-  id                String   @id @default(uuid())
+  id                String @id @default(uuid())
   businessProfileId String
-  taskType          String   @db.VarChar(50) // "CHECKOUT_CLEAN", "DEEP_CLEAN", "INSPECTION"
-  name              String   @db.VarChar(100)
-  checklistItems    Json     // ["Strip beds", "Replace towels", "Vacuum", ...]
+  taskType          String @db.VarChar(50) // "CHECKOUT_CLEAN", "DEEP_CLEAN", "INSPECTION"
+  name              String @db.VarChar(100)
+  checklistItems    Json // ["Strip beds", "Replace towels", "Vacuum", ...]
 
   businessProfile BusinessProfile @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
 
@@ -4846,15 +4843,15 @@ model HotelRateOverride {
   id                String   @id @default(uuid())
   businessProfileId String
   roomType          String?  @db.VarChar(50) // null = applies to all types
-  roomId            String?  // null = applies to whole room type
+  roomId            String? // null = applies to whole room type
   date              DateTime @db.Date
   priceUsdc         Decimal  @db.Decimal(20, 8)
   note              String?  @db.VarChar(255) // "Christmas Eve", "Event weekend"
 
-  businessProfile   BusinessProfile @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+  businessProfile BusinessProfile @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
 
-  createdAt         DateTime @default(now())
-  updatedAt         DateTime @updatedAt
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
   @@unique([businessProfileId, roomType, roomId, date])
   @@index([businessProfileId, date])
@@ -4869,9 +4866,9 @@ model HotelRoomBlock {
   startDate DateTime @db.Date
   endDate   DateTime @db.Date
   reason    String?  @db.VarChar(255)
-  createdBy String?  // employee id who created the block
+  createdBy String? // employee id who created the block
 
-  room      HotelRoom @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  room HotelRoom @relation(fields: [roomId], references: [id], onDelete: Cascade)
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -4882,71 +4879,71 @@ model HotelRoomBlock {
 // ── Restaurant Operations Models ──────────────────────────────────────────────
 
 model KitchenOrder {
-  id                String             @id @default(uuid())
+  id                String  @id @default(uuid())
   businessProfileId String
   locationId        String?
-  businessOrderId   String?  @unique // FK to BusinessOrder
-  
+  businessOrderId   String? @unique // FK to BusinessOrder
+
   // Kitchen ticket number (sequential per location per day)
-  ticketNumber      Int
-  tableNumber       String?  @db.VarChar(20) // "Table 4", "Table 12"
-  serverName        String?  @db.VarChar(100) // waiter who sent the order
-  
-  status            KitchenOrderStatus @default(NEW)
-  
+  ticketNumber Int
+  tableNumber  String? @db.VarChar(20) // "Table 4", "Table 12"
+  serverName   String? @db.VarChar(100) // waiter who sent the order
+
+  status KitchenOrderStatus @default(NEW)
+
   // Timing
-  sentAt            DateTime           @default(now())
-  startedAt         DateTime?
-  readyAt           DateTime?
-  servedAt          DateTime?
-  
+  sentAt    DateTime  @default(now())
+  startedAt DateTime?
+  readyAt   DateTime?
+  servedAt  DateTime?
+
   // Routing
-  station           String?            @db.VarChar(50) // "GRILL", "FRY", "SALAD", "BAR", "DESSERT"
-  prepTimeMinutes   Int? // estimated prep time
-  
+  station         String? @db.VarChar(50) // "GRILL", "FRY", "SALAD", "BAR", "DESSERT"
+  prepTimeMinutes Int? // estimated prep time
+
   // Allergy/special alerts
-  allergyAlerts     String[] // ["PEANUT", "GLUTEN", "SHELLFISH"]
-  specialInstructions String?           @db.VarChar(500)
-  
+  allergyAlerts       String[] // ["PEANUT", "GLUTEN", "SHELLFISH"]
+  specialInstructions String?  @db.VarChar(500)
+
   // Priority
-  isRush            Boolean            @default(false)
-  
+  isRush Boolean @default(false)
+
   // Chef assignment
-  employeeId        String?
-  
-  businessProfile BusinessProfile   @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
-  location        BusinessLocation? @relation(fields: [locationId], references: [id])
-  businessOrder   BusinessOrder?    @relation(fields: [businessOrderId], references: [id])
-  chef            BusinessEmployee? @relation("KitchenChefEmployee", fields: [employeeId], references: [id])
+  employeeId String?
+
+  businessProfile BusinessProfile    @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+  location        BusinessLocation?  @relation(fields: [locationId], references: [id])
+  businessOrder   BusinessOrder?     @relation(fields: [businessOrderId], references: [id])
+  chef            BusinessEmployee?  @relation("KitchenChefEmployee", fields: [employeeId], references: [id])
   items           KitchenOrderItem[]
-  
+
   createdAt DateTime @default(now())
 
   updatedAt DateTime @updatedAt
-  
+
   @@index([businessProfileId, status])
   @@index([locationId, status])
   @@index([station, status])
 }
 
 model KitchenOrderItem {
-  id                String   @id @default(uuid())
-  kitchenOrderId    String
-  productId         String?
-  
-  name              String   @db.VarChar(200)
-  quantity          Int      @default(1)
-  modifiers         String[] // ["NO ONION", "EXTRA CHEESE", "WELL DONE"]
-  station           String?  @db.VarChar(50) // override at item level
-  
-  status            KitchenOrderStatus @default(NEW)
-  bumpedAt          DateTime? // when chef taps "bump" (dismiss)
-  
-  kitchenOrder  KitchenOrder     @relation(fields: [kitchenOrderId], references: [id], onDelete: Cascade)
-  product       BusinessProduct? @relation(fields: [productId], references: [id])
-  
+  id             String  @id @default(uuid())
+  kitchenOrderId String
+  productId      String?
+
+  name      String   @db.VarChar(200)
+  quantity  Int      @default(1)
+  modifiers String[] // ["NO ONION", "EXTRA CHEESE", "WELL DONE"]
+  station   String?  @db.VarChar(50) // override at item level
+
+  status   KitchenOrderStatus @default(NEW)
+  bumpedAt DateTime? // when chef taps "bump" (dismiss)
+
+  kitchenOrder KitchenOrder     @relation(fields: [kitchenOrderId], references: [id], onDelete: Cascade)
+  product      BusinessProduct? @relation(fields: [productId], references: [id])
+
   createdAt DateTime @default(now())
-  
+
   @@index([kitchenOrderId])
   @@index([station, status])
 }
@@ -4954,38 +4951,38 @@ model KitchenOrderItem {
 // ── Transit Operations Models ─────────────────────────────────────────────────
 
 model DriverAssignment {
-  id                String   @id @default(uuid())
+  id                String  @id @default(uuid())
   businessProfileId String
   tripId            String?
   vehicleId         String?
   employeeId        String
   userId            Int // denormalized
-  
+
   // Assignment details
-  assignmentDate    DateTime
-  role              String   @db.VarChar(50) // "DRIVER", "CONDUCTOR", "ASSISTANT"
-  shiftLabel        String?  @db.VarChar(50)
-  
+  assignmentDate DateTime
+  role           String   @db.VarChar(50) // "DRIVER", "CONDUCTOR", "ASSISTANT"
+  shiftLabel     String?  @db.VarChar(50)
+
   // Status
-  status            String   @default("ASSIGNED") // ASSIGNED, CHECKED_IN, ON_DUTY, COMPLETED, CANCELLED
-  checkedInAt       DateTime?
-  startedAt         DateTime?
-  completedAt       DateTime?
-  
+  status      String    @default("ASSIGNED") // ASSIGNED, CHECKED_IN, ON_DUTY, COMPLETED, CANCELLED
+  checkedInAt DateTime?
+  startedAt   DateTime?
+  completedAt DateTime?
+
   // Route/trip info (denormalized for quick display)
-  routeName         String?  @db.VarChar(200)
-  departureTime     DateTime?
-  
+  routeName     String?   @db.VarChar(200)
+  departureTime DateTime?
+
   businessProfile BusinessProfile  @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
   trip            TransitTrip?     @relation(fields: [tripId], references: [id])
   vehicle         TransitVehicle?  @relation(fields: [vehicleId], references: [id])
   employee        BusinessEmployee @relation(fields: [employeeId], references: [id], onDelete: Cascade)
   user            User             @relation(fields: [userId], references: [id], onDelete: Cascade)
-  
+
   createdAt DateTime @default(now())
 
   updatedAt DateTime @updatedAt
-  
+
   @@index([businessProfileId, assignmentDate])
   @@index([employeeId, assignmentDate])
   @@index([userId, assignmentDate])
@@ -4993,46 +4990,45 @@ model DriverAssignment {
 }
 
 model VehicleMaintenance {
-  id                String           @id @default(uuid())
+  id                String @id @default(uuid())
   businessProfileId String
   vehicleId         String
-  
-  type              MaintenanceType  @default(SCHEDULED)
-  status            MaintenanceStatus @default(SCHEDULED)
-  
+
+  type   MaintenanceType   @default(SCHEDULED)
+  status MaintenanceStatus @default(SCHEDULED)
+
   // Scheduling
-  scheduledDate     DateTime
-  completedDate     DateTime?
-  
+  scheduledDate DateTime
+  completedDate DateTime?
+
   // Details
-  description       String           @db.VarChar(500)
-  cost              Decimal          @default(0.0) @db.Decimal(20, 8)
-  costGhs           Decimal?         @db.Decimal(20, 8)
-  serviceProvider   String?          @db.VarChar(200)
-  
+  description     String   @db.VarChar(500)
+  cost            Decimal  @default(0.0) @db.Decimal(20, 8)
+  costGhs         Decimal? @db.Decimal(20, 8)
+  serviceProvider String?  @db.VarChar(200)
+
   // Odometer-based scheduling
   odometerAtService Int?
   nextServiceDue    Int? // odometer reading for next service
-  
+
   // Parts & labor breakdown
-  partsCost         Decimal          @default(0.0) @db.Decimal(20, 8)
-  laborCost         Decimal          @default(0.0) @db.Decimal(20, 8)
-  
+  partsCost Decimal @default(0.0) @db.Decimal(20, 8)
+  laborCost Decimal @default(0.0) @db.Decimal(20, 8)
+
   // Notes
-  notes             String?          @db.VarChar(1000)
-  
-  businessProfile BusinessProfile  @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
-  vehicle         TransitVehicle   @relation(fields: [vehicleId], references: [id], onDelete: Cascade)
-  
+  notes String? @db.VarChar(1000)
+
+  businessProfile BusinessProfile @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+  vehicle         TransitVehicle  @relation(fields: [vehicleId], references: [id], onDelete: Cascade)
+
   createdAt DateTime @default(now())
 
   updatedAt DateTime @updatedAt
-  
+
   @@index([businessProfileId, status])
   @@index([vehicleId, status])
   @@index([vehicleId, scheduledDate])
 }
-
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // MOOLRE COMPETITION — Transit Cargo & Restaurant Inventory
@@ -5049,25 +5045,25 @@ enum CargoStatus {
 }
 
 model CargoParcel {
-  id                String      @id @default(uuid())
-  transitTripId     String
-  businessProfileId String
-  senderName        String
-  senderPhone       String?
-  receiverName      String
-  receiverPhone     String
-  receiverAddress   String?
-  description       String
-  weightKg          Float
-  priceUsdc         Decimal   @db.Decimal(20, 8)
-  fragile           Boolean     @default(false)
-  notes             String?
-  status            CargoStatus @default(PENDING)
-  loadedAt          DateTime?
-  deliveredAt       DateTime?
+  id                 String      @id @default(uuid())
+  transitTripId      String
+  businessProfileId  String
+  senderName         String
+  senderPhone        String?
+  receiverName       String
+  receiverPhone      String
+  receiverAddress    String?
+  description        String
+  weightKg           Float
+  priceUsdc          Decimal     @db.Decimal(20, 8)
+  fragile            Boolean     @default(false)
+  notes              String?
+  status             CargoStatus @default(PENDING)
+  loadedAt           DateTime?
+  deliveredAt        DateTime?
   proofOfDeliveryUrl String?
-  createdAt         DateTime    @default(now())
-  updatedAt         DateTime    @updatedAt
+  createdAt          DateTime    @default(now())
+  updatedAt          DateTime    @updatedAt
 
   transitTrip     TransitTrip     @relation(fields: [transitTripId], references: [id], onDelete: Cascade)
   businessProfile BusinessProfile @relation(fields: [businessProfileId], references: [id])
@@ -5076,55 +5072,55 @@ model CargoParcel {
   @@index([businessProfileId])
 }
 
-
 // ── Transit: Route Templates (Module 05) ──────────────────────────────────────
 model TransitRouteTemplate {
-  id                String    @id @default(uuid())
-  businessProfileId String
-  name              String    @db.VarChar(200)
-  origin            String    @db.VarChar(255)
-  destination       String    @db.VarChar(255)
-  typicalFareUsdc   Decimal   @db.Decimal(20, 8) @default(0)
-  typicalDurationMins Int?
-  vehicleId         String?
-  defaultDepartureTimes Json?   // e.g. ["07:00", "14:00"]
-  notes             String?
-  isActive          Boolean   @default(true)
-  createdAt         DateTime  @default(now())
-  updatedAt         DateTime  @updatedAt
+  id                    String   @id @default(uuid())
+  businessProfileId     String
+  name                  String   @db.VarChar(200)
+  origin                String   @db.VarChar(255)
+  destination           String   @db.VarChar(255)
+  typicalFareUsdc       Decimal  @default(0) @db.Decimal(20, 8)
+  typicalDurationMins   Int?
+  vehicleId             String?
+  defaultDepartureTimes Json? // e.g. ["07:00", "14:00"]
+  notes                 String?
+  isActive              Boolean  @default(true)
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
 
-  businessProfile BusinessProfile   @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
-  vehicle         TransitVehicle?  @relation(fields: [vehicleId], references: [id], onDelete: SetNull)
+  businessProfile BusinessProfile @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+  vehicle         TransitVehicle? @relation(fields: [vehicleId], references: [id], onDelete: SetNull)
 
   @@index([businessProfileId])
   @@index([businessProfileId, isActive])
 }
+
 // ── Restaurant: Inventory Management ──────────────────────────────────────────
 model InventoryItem {
-  id                String  @id @default(uuid())
+  id                String   @id @default(uuid())
   businessProfileId String
   name              String
-  unit              String  // "kg", "liters", "pieces", "grams"
+  unit              String // "kg", "liters", "pieces", "grams"
   currentStock      Float
-  minimumStock      Float   @default(0)
-  costPerUnit       Float   // cost in GHS
+  minimumStock      Float    @default(0)
+  costPerUnit       Float // cost in GHS
   category          String? // "Proteins", "Vegetables", "Beverages", "Dry Goods"
   supplier          String?
-  isActive          Boolean @default(true)
+  isActive          Boolean  @default(true)
   createdAt         DateTime @default(now())
   updatedAt         DateTime @updatedAt
 
-  businessProfile  BusinessProfile   @relation(fields: [businessProfileId], references: [id])
+  businessProfile   BusinessProfile    @relation(fields: [businessProfileId], references: [id])
   recipeIngredients RecipeIngredient[]
 
-  @@index([businessProfileId])
   @@unique([businessProfileId, name])
+  @@index([businessProfileId])
 }
 
 model RecipeIngredient {
-  id              String @id @default(uuid())
-  productId       String
-  inventoryItemId String
+  id               String @id @default(uuid())
+  productId        String
+  inventoryItemId  String
   quantityRequired Float // quantity per one serving of the product
 
   product       BusinessProduct @relation(fields: [productId], references: [id], onDelete: Cascade)
@@ -5143,18 +5139,18 @@ model RecipeIngredient {
 // Holiday/exception hours per location — overrides the recurring operatingHours
 // JSON for specific dates (e.g. New Year's Eve, public holidays).
 model BusinessLocationHoursException {
-  id                String  @id @default(uuid())
-  locationId        String
-  date              DateTime  @db.Date
-  isClosed          Boolean   @default(false)
-  openTime          String?   @db.VarChar(10) // "08:00"
-  closeTime         String?   @db.VarChar(10) // "18:00"
-  note              String?   @db.VarChar(255) // "Christmas Eve — half day"
+  id         String   @id @default(uuid())
+  locationId String
+  date       DateTime @db.Date
+  isClosed   Boolean  @default(false)
+  openTime   String?  @db.VarChar(10) // "08:00"
+  closeTime  String?  @db.VarChar(10) // "18:00"
+  note       String?  @db.VarChar(255) // "Christmas Eve — half day"
 
-  location          BusinessLocation @relation(fields: [locationId], references: [id], onDelete: Cascade)
+  location BusinessLocation @relation(fields: [locationId], references: [id], onDelete: Cascade)
 
-  createdAt         DateTime @default(now())
-  updatedAt         DateTime @updatedAt
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
   @@unique([locationId, date])
   @@index([locationId])
@@ -5164,33 +5160,33 @@ model BusinessLocationHoursException {
 // Per-business owner-controlled notification preferences per event type.
 // Stored as a single row per business; if no row exists, defaults apply.
 model BusinessNotificationPreference {
-  id                String  @id @default(uuid())
-  businessProfileId String  @unique
+  id                String @id @default(uuid())
+  businessProfileId String @unique
   // JSON shape: { new_order: { portal: true, email: true }, low_inventory: { portal: true, email: false }, ... }
   // Event types: new_order, low_inventory, shift_no_show, negative_review,
   // kyb_status_change, large_transaction, payroll_due, maintenance_due
-  preferences       Json    @default("{}")
+  preferences       Json   @default("{}")
 
-  businessProfile   BusinessProfile @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+  businessProfile BusinessProfile @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
 
-  createdAt         DateTime @default(now())
-  updatedAt         DateTime @updatedAt
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 }
 
 // ── Developer Options ──────────────────────────────────────────────────────────
 model BusinessApiKey {
-  id                String   @id @default(uuid())
+  id                String    @id @default(uuid())
   businessProfileId String
-  name              String   // e.g. "Staging Key", "Production Web"
-  keyHash           String   // Hashed key for security
-  prefix            String   // e.g. "az_prod_abcd" to show in UI
+  name              String // e.g. "Staging Key", "Production Web"
+  keyHash           String // Hashed key for security
+  prefix            String // e.g. "az_prod_abcd" to show in UI
   permissions       String[] // ["read_orders", "write_orders"]
   lastUsedAt        DateTime?
-  isActive          Boolean  @default(true)
-  createdAt         DateTime @default(now())
-  updatedAt         DateTime @updatedAt
+  isActive          Boolean   @default(true)
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
 
-  businessProfile   BusinessProfile @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+  businessProfile BusinessProfile @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
 
   @@index([businessProfileId])
 }
@@ -5198,32 +5194,32 @@ model BusinessApiKey {
 model BusinessWebhook {
   id                String   @id @default(uuid())
   businessProfileId String
-  url               String   // Endpoint to send POST requests
-  secret            String   // Used for signing payload (HMAC)
+  url               String // Endpoint to send POST requests
+  secret            String // Used for signing payload (HMAC)
   events            String[] // ["order.created", "booking.confirmed"]
   isActive          Boolean  @default(true)
   createdAt         DateTime @default(now())
   updatedAt         DateTime @updatedAt
 
-  businessProfile   BusinessProfile @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
-  deliveries        WebhookDelivery[]
+  businessProfile BusinessProfile   @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+  deliveries      WebhookDelivery[]
 
   @@index([businessProfileId])
 }
 
 // WebhookDelivery — tracks each delivery attempt for reliability & retries
 model WebhookDelivery {
-  id                String   @id @default(uuid())
-  webhookId         String
-  event             String   @db.VarChar(100)
-  payload           Json
-  status            String   @default("PENDING") // PENDING | DELIVERED | FAILED | RETRYING
-  statusCode        Int?
-  responseBody      String?  @db.VarChar(2000)
-  attemptCount      Int      @default(0)
-  maxAttempts       Int      @default(5)
-  nextRetryAt       DateTime?
-  deliveredAt       DateTime?
+  id           String    @id @default(uuid())
+  webhookId    String
+  event        String    @db.VarChar(100)
+  payload      Json
+  status       String    @default("PENDING") // PENDING | DELIVERED | FAILED | RETRYING
+  statusCode   Int?
+  responseBody String?   @db.VarChar(2000)
+  attemptCount Int       @default(0)
+  maxAttempts  Int       @default(5)
+  nextRetryAt  DateTime?
+  deliveredAt  DateTime?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -5236,19 +5232,19 @@ model WebhookDelivery {
 
 // BusinessMessagingConfig — stores WhatsApp/SMS connection credentials
 model BusinessMessagingConfig {
-  id                 String   @id @default(uuid())
-  businessProfileId  String   @unique
+  id                 String    @id @default(uuid())
+  businessProfileId  String    @unique
   // WhatsApp
-  waPhoneNumber      String?  @db.VarChar(20)
+  waPhoneNumber      String?   @db.VarChar(20)
   waApiKeyEncrypted  String?
-  waConnected        Boolean  @default(false)
+  waConnected        Boolean   @default(false)
   // SMS
   smsApiKeyEncrypted String?
-  smsSenderId        String?  @db.VarChar(20)
-  smsConnected       Boolean  @default(false)
-  smsProvider        String?  @db.VarChar(50)
+  smsSenderId        String?   @db.VarChar(20)
+  smsConnected       Boolean   @default(false)
+  smsProvider        String?   @db.VarChar(50)
   // Test
-  lastTestNumber     String?  @db.VarChar(20)
+  lastTestNumber     String?   @db.VarChar(20)
   lastTestAt         DateTime?
 
   createdAt DateTime @default(now())
@@ -5313,22 +5309,22 @@ enum AzmStakeStatus {
 
 /// Theme catalog — platform-managed (seeded), not created by business owners.
 model BusinessStorefrontTheme {
-  id              String   @id @default(uuid())
-  key             String   @unique
+  id              String         @id @default(uuid())
+  key             String         @unique
   name            String
-  description     String?  @db.VarChar(500)
+  description     String?        @db.VarChar(500)
   tier            StorefrontTier @default(FREE)
-  minAzmStake     Int      @default(0)
-  category        String   @default("UNIVERSAL")
+  minAzmStake     Int            @default(0)
+  category        String         @default("UNIVERSAL")
   tokenSet        Json
   typography      Json?
-  borderRadius    String?  @default("medium")
-  spacingScale    Float?   @default(1.0)
+  borderRadius    String?        @default("medium")
+  spacingScale    Float?         @default(1.0)
   previewImageUrl String?
-  isActive        Boolean  @default(true)
-  displayOrder    Int      @default(0)
-  createdAt       DateTime @default(now())
-  updatedAt       DateTime @updatedAt
+  isActive        Boolean        @default(true)
+  displayOrder    Int            @default(0)
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
 
   layouts   BusinessStorefrontLayout[]
   templates BusinessStorefrontLayoutTemplate[]
@@ -5340,24 +5336,24 @@ model BusinessStorefrontTheme {
 
 /// Widget type catalog — platform-managed (seeded).
 model BusinessStorefrontWidgetCatalog {
-  id            String   @id @default(uuid())
-  widgetType    String   @unique
-  displayName   String
-  description   String?  @db.VarChar(500)
-  tier          StorefrontTier @default(FREE)
-  minAzmStake   Int      @default(0)
-  category      StorefrontWidgetCategory
-  icon          String?
-  configSchema  Json
-  defaultProps   Json     @default("{}")
-  minRowSpan    Int      @default(1)
-  maxRowSpan    Int      @default(6)
-  minColSpan    Int      @default(1)
-  maxColSpan    Int      @default(4)
-  isActive      Boolean  @default(true)
-  displayOrder  Int      @default(0)
-  createdAt     DateTime @default(now())
-  updatedAt     DateTime @updatedAt
+  id           String                   @id @default(uuid())
+  widgetType   String                   @unique
+  displayName  String
+  description  String?                  @db.VarChar(500)
+  tier         StorefrontTier           @default(FREE)
+  minAzmStake  Int                      @default(0)
+  category     StorefrontWidgetCategory
+  icon         String?
+  configSchema Json
+  defaultProps Json                     @default("{}")
+  minRowSpan   Int                      @default(1)
+  maxRowSpan   Int                      @default(6)
+  minColSpan   Int                      @default(1)
+  maxColSpan   Int                      @default(4)
+  isActive     Boolean                  @default(true)
+  displayOrder Int                      @default(0)
+  createdAt    DateTime                 @default(now())
+  updatedAt    DateTime                 @updatedAt
 
   @@index([tier])
   @@index([category])
@@ -5366,17 +5362,17 @@ model BusinessStorefrontWidgetCatalog {
 
 /// Current DRAFT or PUBLISHED layout per business. Unique: one DRAFT + one PUBLISHED.
 model BusinessStorefrontLayout {
-  id                String   @id @default(uuid())
+  id                String                 @id @default(uuid())
   businessProfileId String
   status            StorefrontLayoutStatus @default(DRAFT)
   themeId           String
   layoutJson        Json
   publishedAt       DateTime?
   publishedBy       Int?
-  createdAt         DateTime @default(now())
-  updatedAt         DateTime @updatedAt
+  createdAt         DateTime               @default(now())
+  updatedAt         DateTime               @updatedAt
 
-  businessProfile BusinessProfile @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+  businessProfile BusinessProfile         @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
   theme           BusinessStorefrontTheme @relation(fields: [themeId], references: [id])
 
   @@unique([businessProfileId, status])
@@ -5385,14 +5381,14 @@ model BusinessStorefrontLayout {
 
 /// Version history for undo/revert. Separate from current layout.
 model BusinessStorefrontLayoutVersion {
-  id                String   @id @default(uuid())
+  id                String    @id @default(uuid())
   businessProfileId String
-  version          Int
+  version           Int
   themeId           String
   layoutJson        Json
   publishedAt       DateTime?
   publishedBy       Int?
-  createdAt         DateTime @default(now())
+  createdAt         DateTime  @default(now())
 
   businessProfile BusinessProfile @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
 
@@ -5402,19 +5398,19 @@ model BusinessStorefrontLayoutVersion {
 
 /// Pre-built layout templates — one-click apply. Monetizable (premium templates).
 model BusinessStorefrontLayoutTemplate {
-  id              String   @id @default(uuid())
+  id              String         @id @default(uuid())
   name            String
-  description     String?  @db.VarChar(500)
+  description     String?        @db.VarChar(500)
   category        String
   tier            StorefrontTier @default(FREE)
-  minAzmStake     Int      @default(0)
+  minAzmStake     Int            @default(0)
   previewImageUrl String?
   themeId         String?
   layoutJson      Json
-  isActive        Boolean  @default(true)
-  displayOrder    Int      @default(0)
-  createdAt       DateTime @default(now())
-  updatedAt       DateTime @updatedAt
+  isActive        Boolean        @default(true)
+  displayOrder    Int            @default(0)
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
 
   theme BusinessStorefrontTheme? @relation(fields: [themeId], references: [id])
 
@@ -5426,19 +5422,19 @@ model BusinessStorefrontLayoutTemplate {
 /// NOT Vault/VaultDeposit (those are USDC savings).
 /// NOT User.azmBalance (that's loyalty points).
 model AzmStake {
-  id                  String   @id @default(uuid())
-  userId              Int
-  amountAzm           Decimal  @db.Decimal(20, 8)
-  status              AzmStakeStatus @default(ACTIVE)
-  stakedAt            DateTime @default(now())
-  unstakeRequestedAt  DateTime?
-  unstakeAvailableAt  DateTime?
-  completedAt         DateTime?
-  cooldownDays        Int      @default(7)
-  tierAtStake         String   @default("FREE")
-  user                User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-  createdAt           DateTime @default(now())
-  updatedAt           DateTime @updatedAt
+  id                 String         @id @default(uuid())
+  userId             Int
+  amountAzm          Decimal        @db.Decimal(20, 8)
+  status             AzmStakeStatus @default(ACTIVE)
+  stakedAt           DateTime       @default(now())
+  unstakeRequestedAt DateTime?
+  unstakeAvailableAt DateTime?
+  completedAt        DateTime?
+  cooldownDays       Int            @default(7)
+  tierAtStake        String         @default("FREE")
+  user               User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  createdAt          DateTime       @default(now())
+  updatedAt          DateTime       @updatedAt
 
   @@index([userId, status])
   @@index([status, unstakeAvailableAt])
@@ -5463,31 +5459,30 @@ model StorefrontAnalyticsEvent {
 /// so a retried request with the same key returns the original result
 /// instead of re-executing the operation (preventing double-charges).
 model IdempotencyKey {
-  id          String   @id @default(uuid())
-  key         String   @unique
-  userId      Int?
-  endpoint    String
-  statusCode  Int
+  id           String   @id @default(uuid())
+  key          String   @unique
+  userId       Int?
+  endpoint     String
+  statusCode   Int
   responseBody Json
-  createdAt   DateTime @default(now())
-  expiresAt   DateTime
+  createdAt    DateTime @default(now())
+  expiresAt    DateTime
 
   @@index([key])
   @@index([expiresAt])
 }
 
-
 /// On-chain USDC sweep records — tracks consolidation from user deposit
 /// addresses to the platform treasury wallet on Polygon.
 model OnchainSweep {
-  id          String   @id @default(uuid())
+  id          String    @id @default(uuid())
   userId      Int
   fromAddress String
   toAddress   String
-  amountUsdc  Decimal  @db.Decimal(20, 8)
-  status      String   @default("BROADCASTING") // BROADCASTING | CONFIRMED | FAILED
+  amountUsdc  Decimal   @db.Decimal(20, 8)
+  status      String    @default("BROADCASTING") // BROADCASTING | CONFIRMED | FAILED
   txHash      String?
-  createdAt   DateTime @default(now())
+  createdAt   DateTime  @default(now())
   confirmedAt DateTime?
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
@@ -5500,11 +5495,11 @@ model OnchainSweep {
 /// Admin creates entries; users see a badge until they dismiss or view them.
 model Changelog {
   id          Int      @id @default(autoincrement())
-  version     String   // e.g. "v2.4.0"
-  title       String   // short headline e.g. "Savings Goals are here!"
-  body        String   // markdown body — rendered client-side
+  version     String // e.g. "v2.4.0"
+  title       String // short headline e.g. "Savings Goals are here!"
+  body        String // markdown body — rendered client-side
   category    String   @default("feature") // feature | improvement | fix | security
-  severity    String   @default("info")    // info | warning | critical
+  severity    String   @default("info") // info | warning | critical
   imageUrl    String?
   publishedAt DateTime @default(now())
   createdAt   DateTime @default(now())
@@ -5532,20 +5527,20 @@ model ChangelogView {
 
 // ── Shared Vaults (Phase 4) ──────────────────────────────────────────────────
 model SharedVault {
-  id                String   @id @default(uuid())
-  name              String   @db.VarChar(60)
-  emoji             String?  @db.VarChar(8)
-  targetAmountUsdc  Decimal  @db.Decimal(20, 8)
-  currentAmountUsdc Decimal  @default(0) @db.Decimal(20, 8)
-  status            String   @default("ACTIVE") // ACTIVE | COMPLETED | CANCELLED
+  id                String  @id @default(uuid())
+  name              String  @db.VarChar(60)
+  emoji             String? @db.VarChar(8)
+  targetAmountUsdc  Decimal @db.Decimal(20, 8)
+  currentAmountUsdc Decimal @default(0) @db.Decimal(20, 8)
+  status            String  @default("ACTIVE") // ACTIVE | COMPLETED | CANCELLED
 
-  creatorId         Int
-  linkedChatId       String?
+  creatorId    Int
+  linkedChatId String?
 
   startDate    DateTime  @default(now())
   maturityDate DateTime?
-  completedAt DateTime?
-  cancelledAt DateTime?
+  completedAt  DateTime?
+  cancelledAt  DateTime?
 
   members SharedVaultMember[]
 
@@ -5557,12 +5552,12 @@ model SharedVault {
 }
 
 model SharedVaultMember {
-  id               String  @id @default(uuid())
-  sharedVaultId    String
-  userId           Int
-  role             String  @default("CONTRIBUTOR") // OWNER | CO_OWNER | CONTRIBUTOR
-  contributedUsdc  Decimal @default(0) @db.Decimal(20, 8)
-  joinedAt         DateTime @default(now())
+  id              String   @id @default(uuid())
+  sharedVaultId   String
+  userId          Int
+  role            String   @default("CONTRIBUTOR") // OWNER | CO_OWNER | CONTRIBUTOR
+  contributedUsdc Decimal  @default(0) @db.Decimal(20, 8)
+  joinedAt        DateTime @default(now())
 
   sharedVault SharedVault @relation(fields: [sharedVaultId], references: [id], onDelete: Cascade)
 
@@ -5597,21 +5592,21 @@ enum JournalEntryType {
 }
 
 model JournalEntry {
-  id              String           @id @default(uuid())
-  transactionId   String           // Groups paired debit+credit entries
-  entryType       JournalEntryType
-  account         String           @db.VarChar(80)  // e.g. "user:available", "platform:revenue", "escrow:locked"
-  debit           Decimal          @default(0) @db.Decimal(20, 8)
-  credit          Decimal          @default(0) @db.Decimal(20, 8)
-  description      String           @db.VarChar(500)
-  reference        String?          @db.VarChar(100) // Optional human-readable ref
-  metadata        Json?
+  id            String           @id @default(uuid())
+  transactionId String // Groups paired debit+credit entries
+  entryType     JournalEntryType
+  account       String           @db.VarChar(80) // e.g. "user:available", "platform:revenue", "escrow:locked"
+  debit         Decimal          @default(0) @db.Decimal(20, 8)
+  credit        Decimal          @default(0) @db.Decimal(20, 8)
+  description   String           @db.VarChar(500)
+  reference     String?          @db.VarChar(100) // Optional human-readable ref
+  metadata      Json?
 
   userId          Int?
-  relatedEntity   String?          @db.VarChar(50)  // "trade", "vault", "susu", etc.
+  relatedEntity   String? @db.VarChar(50) // "trade", "vault", "susu", etc.
   relatedEntityId String?
 
-  createdAt       DateTime         @default(now())
+  createdAt DateTime @default(now())
 
   @@index([transactionId])
   @@index([account])
@@ -5623,71 +5618,71 @@ model JournalEntry {
 // ── E2EE (Signal-style Protocol) ─────────────────────────────────────────────
 
 model E2EEPreKeyBundle {
-  id                  String   @id @default(uuid())
-  userId              Int
-  
+  id     String @id @default(uuid())
+  userId Int
+
   // Identity key (long-term, per user)
-  identityPublicKey   String   @db.VarChar(100)
-  identityPrivateKey  String?  @db.VarChar(100) // Only stored if user opts to back up; null otherwise
-  
+  identityPublicKey  String  @db.VarChar(100)
+  identityPrivateKey String? @db.VarChar(100) // Only stored if user opts to back up; null otherwise
+
   // Signed preKey (rotated periodically)
-  signedPreKeyId       Int
-  signedPreKeyPublicKey String  @db.VarChar(100)
+  signedPreKeyId         Int
+  signedPreKeyPublicKey  String  @db.VarChar(100)
   signedPreKeyPrivateKey String? @db.VarChar(100) // Server needs this to complete session on receiver side
-  signedPreKeySignature String  @db.VarChar(200)
-  
+  signedPreKeySignature  String  @db.VarChar(200)
+
   // Active session root key (per friendship/contact pair)
   // Stored encrypted or as derived key material
-  activeRootKey       String?  @db.VarChar(200)
-  activeChainKey      String?  @db.VarChar(200)
-  messageNumber       Int      @default(0)
-  
-  createdAt           DateTime @default(now())
-  updatedAt           DateTime @updatedAt
-  
+  activeRootKey  String? @db.VarChar(200)
+  activeChainKey String? @db.VarChar(200)
+  messageNumber  Int     @default(0)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
-  
+
   @@unique([userId])
   @@index([userId])
 }
 
 model E2EEOneTimePreKey {
-  id          String   @id @default(uuid())
-  userId      Int
-  keyId       Int
-  publicKey   String   @db.VarChar(100)
-  privateKey  String   @db.VarChar(100) // Server needs this to complete X3DH
-  isUsed      Boolean  @default(false)
-  
-  createdAt   DateTime @default(now())
-  usedAt      DateTime?
-  
+  id         String  @id @default(uuid())
+  userId     Int
+  keyId      Int
+  publicKey  String  @db.VarChar(100)
+  privateKey String  @db.VarChar(100) // Server needs this to complete X3DH
+  isUsed     Boolean @default(false)
+
+  createdAt DateTime  @default(now())
+  usedAt    DateTime?
+
   user User @relation("UserOneTimePreKeys", fields: [userId], references: [id], onDelete: Cascade)
-  
+
   @@index([userId, isUsed])
   @@index([keyId])
 }
 
 model E2EESession {
-  id              String   @id @default(uuid())
-  userId          Int      // The user who owns this session
-  peerUserId      Int      // The other party
-  
+  id         String @id @default(uuid())
+  userId     Int // The user who owns this session
+  peerUserId Int // The other party
+
   // Session state
-  rootKey         String   @db.VarChar(200)
-  sendingChainKey String?  @db.VarChar(200)
-  receivingChainKey String? @db.VarChar(200)
-  sendMessageNumber  Int   @default(0)
-  receiveMessageNumber Int @default(0)
-  
+  rootKey              String  @db.VarChar(200)
+  sendingChainKey      String? @db.VarChar(200)
+  receivingChainKey    String? @db.VarChar(200)
+  sendMessageNumber    Int     @default(0)
+  receiveMessageNumber Int     @default(0)
+
   // Initial ephemeral key from X3DH
   peerEphemeralPublicKey String? @db.VarChar(100)
-  
-  createdAt       DateTime @default(now())
-  updatedAt       DateTime @updatedAt
-  
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
   user User @relation("UserE2EESessions", fields: [userId], references: [id], onDelete: Cascade)
-  
+
   @@unique([userId, peerUserId])
   @@index([userId, peerUserId])
 }
@@ -5695,23 +5690,22 @@ model E2EESession {
 // ── Fraud Detection ─────────────────────────────────────────────────────────────
 
 model FraudAssessment {
-  id              String   @id @default(uuid())
+  id              String  @id @default(uuid())
   userId          Int
-  transactionType String   @db.VarChar(50)
-  amountUsdc      Decimal  @db.Decimal(20, 8) @default(0)
-  riskScore       Int      @default(0)
-  triggeredRules  String   @db.VarChar(500)
-  action          String   @db.VarChar(20) @default("FLAGGED")
-  
-  createdAt       DateTime @default(now())
-  
+  transactionType String  @db.VarChar(50)
+  amountUsdc      Decimal @default(0) @db.Decimal(20, 8)
+  riskScore       Int     @default(0)
+  triggeredRules  String  @db.VarChar(500)
+  action          String  @default("FLAGGED") @db.VarChar(20)
+
+  createdAt DateTime @default(now())
+
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
-  
+
   @@index([userId, createdAt(sort: Desc)])
   @@index([action, createdAt(sort: Desc)])
   @@index([riskScore(sort: Desc)])
 }
-
 
 // ── WebRTC Voice/Video Calls ──────────────────────────────────────────────────
 
@@ -5731,37 +5725,37 @@ enum CallStatus {
 }
 
 model CallLog {
-  id          String    @id @default(uuid())
-  callerId    Int
-  calleeId   Int
-  type        CallType
-  status      CallStatus @default(RINGING)
-  
+  id       String     @id @default(uuid())
+  callerId Int
+  calleeId Int
+  type     CallType
+  status   CallStatus @default(RINGING)
+
   // WebRTC signaling metadata
-  offerSdp    String?  @db.Text
-  answerSdp   String?  @db.Text
-  
+  offerSdp  String? @db.Text
+  answerSdp String? @db.Text
+
   // Call metrics
   startedAt   DateTime? // When media actually connected
   endedAt     DateTime? // When call was terminated
-  durationSec Int      @default(0)
-  
+  durationSec Int       @default(0)
+
   // Quality metrics (populated on call end)
-  packetsLost   Int     @default(0)
-  jitterMs      Int     @default(0)
-  roundTripMs   Int     @default(0)
-  audioBitrate  Int     @default(0)
-  videoBitrate  Int     @default(0)
-  
+  packetsLost  Int @default(0)
+  jitterMs     Int @default(0)
+  roundTripMs  Int @default(0)
+  audioBitrate Int @default(0)
+  videoBitrate Int @default(0)
+
   // Optional: link to a trade conversation (for dispute resolution context)
-  tradeId       Int?
-  
-  createdAt  DateTime @default(now())
-  updatedAt  DateTime @updatedAt
-  
+  tradeId Int?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
   caller User @relation("CallLogCaller", fields: [callerId], references: [id], onDelete: Cascade)
   callee User @relation("CallLogCallee", fields: [calleeId], references: [id], onDelete: Cascade)
-  
+
   @@index([callerId, createdAt(sort: Desc)])
   @@index([calleeId, createdAt(sort: Desc)])
   @@index([status, createdAt(sort: Desc)])
