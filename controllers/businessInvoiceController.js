@@ -11,6 +11,7 @@
 const logger = require('../src/config/logger');
 const invoiceSvc = require('../services/businessInvoiceService');
 const reviewSvc  = require('../services/businessReviewService');
+const emailSvc   = require('../services/emailService');
 
 const _ownedProfile = async (prisma, userId) => {
   const p = await prisma.businessProfile.findUnique({ where: { userId } });
@@ -133,6 +134,62 @@ exports.sendInvoice = async (req, res) => {
       } catch (e) { logger.error({ err: e }, '[invoice/send] notification error'); }
     });
     return res.json({ success: true, invoice });
+  } catch (err) { return _err(res, err); }
+};
+
+
+
+// POST /api/business/invoices/:invoiceId/email — email invoice to customer
+exports.emailInvoice = async (req, res) => {
+  const prisma = req.app.get("prisma");
+  try {
+    const profile = await _ownedProfile(prisma, req.user.id);
+    const { email } = req.body;
+    const invoice = await invoiceSvc.getInvoice(prisma, { invoiceId: req.params.invoiceId });
+    if (!invoice) return res.status(404).json({ success: false, message: 'Invoice not found.' });
+    if (invoice.businessProfileId !== profile.id) {
+      return res.status(403).json({ success: false, message: 'Not authorized.' });
+    }
+
+    // Determine recipient email
+    const customer = await prisma.user.findUnique({
+      where: { id: invoice.customerId },
+      select: { email: true, displayName: true, username: true },
+    });
+    const recipientEmail = email || customer?.email;
+    if (!recipientEmail) {
+      return res.status(400).json({ success: false, message: 'No email address available for this customer.' });
+    }
+
+    // Build email content
+    const invoiceUrl = `${process.env.FRONTEND_URL || 'https://app.azaman.com'}/bills/${invoice.id}`;
+    const { html, text } = emailSvc.buildInvoiceEmail({
+      businessName: profile.businessName,
+      customerName: customer?.displayName || customer?.username || 'there',
+      invoiceRef: invoice.invoiceRef,
+      billTotal: invoice.billTotalUsdc,
+      lineItems: invoice.lineItems,
+      dueDate: invoice.dueDate,
+      invoiceUrl,
+    });
+
+    // Fire-and-forget email
+    setImmediate(async () => {
+      try {
+        await emailSvc.send({
+          to: recipientEmail,
+          subject: `Invoice from ${profile.businessName} — ${invoice.invoiceRef}`,
+          html,
+          text,
+          replyTo: profile.contactEmail,
+        });
+        logger.info({ invoiceId: invoice.id, to: recipientEmail }, '[invoice/email] sent');
+      } catch (e) {
+        logger.error({ err: e, invoiceId: invoice.id }, '[invoice/email] failed');
+      }
+    });
+
+    return res.json({ success: true, message: `Invoice emailed to ${recipientEmail}` });
   } catch (err) { return _err(res, err); }
 };
 

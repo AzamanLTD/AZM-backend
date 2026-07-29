@@ -104,6 +104,7 @@ router.post('/invoices',                   protect, protectActive, invoiceCtrl.c
 router.get('/invoices',                    protect,                invoiceCtrl.listInvoices);
 router.get('/invoices/:invoiceId',         protect,                invoiceCtrl.getInvoice);
 router.post('/invoices/:invoiceId/send',   protect, protectActive, invoiceCtrl.sendInvoice);
+router.post('/invoices/:invoiceId/email',  protect, protectActive, invoiceCtrl.emailInvoice);
 router.post('/invoices/:invoiceId/void',   protect, protectActive, invoiceCtrl.voidInvoice);
 router.post('/invoices/:invoiceId/pay',    protect, protectActive, invoiceCtrl.payInvoice);
 
