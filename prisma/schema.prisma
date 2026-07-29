@@ -866,6 +866,8 @@ model User {
   currencyWallets    CurrencyWallet[]
   currencyConversions CurrencyConversion[]
   approvalRequests   AdminApprovalRequest[] @relation("ApprovalRequester")
+  crossBorderConfigs  CrossBorderSusuConfig[]
+  crossBorderFx       CrossBorderFxSnapshot[]
 
   // Phase V: Vendor Applications
   vendorApplications         VendorApplication[]
@@ -3700,6 +3702,7 @@ model SusuGroup {
   voucherSlashLogs     VoucherSlashLog[]
   reminderRows         SusuReminderSent[]
   warRoomAlerts        AdminWarRoomAlert[]
+  crossBorderConfig   CrossBorderSusuConfig?
 
   createdAt DateTime @default(now())
 
@@ -6196,4 +6199,43 @@ model AdminApprovalRequest {
 
   @@index([status, createdAt(sort: Desc)])
   @@index([type, status])
+}
+
+// =============================================================================
+// PHASE 5: CROSS-BORDER SUSU — Multi-country Susu groups with FX conversion
+// =============================================================================
+model CrossBorderSusuConfig {
+  id              Int      @id @default(autoincrement())
+  susuGroupId     String   @unique
+  baseCurrency    String   @db.VarChar(8)
+  memberCountries Json     // [{ country: "GH", currency: "GHS" }, ...]
+  crossBorderFee  Decimal  @default(0.005) @db.Decimal(6, 4)
+  createdBy       Int
+  createdAt       DateTime @default(now())
+
+  susuGroup     SusuGroup              @relation(fields: [susuGroupId], references: [id], onDelete: Cascade)
+  fxSnapshots   CrossBorderFxSnapshot[]
+  creator       User                   @relation(fields: [createdBy], references: [id])
+
+  @@index([susuGroupId])
+}
+
+model CrossBorderFxSnapshot {
+  id            Int      @id @default(autoincrement())
+  susuGroupId   String
+  cycleId       String?
+  userId        Int
+  fromCurrency  String   @db.VarChar(8)
+  toCurrency    String   @db.VarChar(8)
+  localAmount   Decimal  @db.Decimal(20, 8)
+  baseAmount    Decimal  @db.Decimal(20, 8)
+  rate          Decimal  @db.Decimal(18, 8)
+  fee           Decimal  @default(0.0) @db.Decimal(20, 8)
+  createdAt     DateTime @default(now())
+
+  susuGroup       CrossBorderSusuConfig @relation(fields: [susuGroupId], references: [susuGroupId], onDelete: Cascade)
+  user            User                  @relation(fields: [userId], references: [id])
+
+  @@index([susuGroupId, createdAt(sort: Desc)])
+  @@index([userId])
 }
