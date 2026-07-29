@@ -868,6 +868,9 @@ model User {
   approvalRequests   AdminApprovalRequest[] @relation("ApprovalRequester")
   crossBorderConfigs  CrossBorderSusuConfig[]
   crossBorderFx       CrossBorderFxSnapshot[]
+  governanceProposals  GovernanceProposal[] @relation("GovernanceProposer")
+  governanceExecuted   GovernanceProposal[] @relation("GovernanceExecutor")
+  governanceVotes      GovernanceVote[]
 
   // Phase V: Vendor Applications
   vendorApplications         VendorApplication[]
@@ -6237,5 +6240,52 @@ model CrossBorderFxSnapshot {
   user            User                  @relation(fields: [userId], references: [id])
 
   @@index([susuGroupId, createdAt(sort: Desc)])
+  @@index([userId])
+}
+
+// =============================================================================
+// PHASE 5: AZM GOVERNANCE / DAO — Proposal + voting system
+// =============================================================================
+model GovernanceProposal {
+  id                Int       @id @default(autoincrement())
+  proposerId        Int
+  title             String    @db.VarChar(200)
+  description       String    @db.VarChar(2000)
+  type              String    @db.VarChar(30)  // PARAMETER_CHANGE | TREASURY_ACTION | FEATURE_FLAG | GENERAL
+  targetContract    String?   @db.VarChar(100)
+  callData          Json?
+  status            String    @db.VarChar(20) @default("ACTIVE") // DRAFT | ACTIVE | PASSED | REJECTED | EXECUTED | EXPIRED | CANCELLED
+  forVotes          Decimal   @default(0.0) @db.Decimal(20, 8)
+  againstVotes      Decimal   @default(0.0) @db.Decimal(20, 8)
+  abstainVotes      Decimal   @default(0.0) @db.Decimal(20, 8)
+  totalVotingPower  Decimal   @default(0.0) @db.Decimal(20, 8)
+  votingStartsAt    DateTime  @default(now())
+  votingEndsAt      DateTime
+  executionReadyAt  DateTime?
+  executedAt        DateTime?
+  executedById      Int?
+  createdAt         DateTime  @default(now())
+
+  proposer   User              @relation("GovernanceProposer", fields: [proposerId], references: [id])
+  executor  User?              @relation("GovernanceExecutor", fields: [executedById], references: [id])
+  votes     GovernanceVote[]
+
+  @@index([status, createdAt(sort: Desc)])
+  @@index([proposerId])
+}
+
+model GovernanceVote {
+  id          Int      @id @default(autoincrement())
+  proposalId  Int
+  userId      Int
+  vote        String   @db.VarChar(10) // FOR | AGAINST | ABSTAIN
+  votingPower Decimal  @db.Decimal(20, 8)
+  createdAt   DateTime @default(now())
+
+  proposal GovernanceProposal @relation(fields: [proposalId], references: [id], onDelete: Cascade)
+  user     User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([proposalId, userId])
+  @@index([proposalId])
   @@index([userId])
 }

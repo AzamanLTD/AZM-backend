@@ -110,6 +110,7 @@ function mountRoutes(app, {
     app.use('/api/order-book',            generalLimiter,   require('../../routes/orderBookRoutes')); // Phase 5: Order book
     app.use('/api/multi-currency',       generalLimiter,   require('../../routes/multiCurrencyRoutes')); // Phase 5: Multi-currency
     app.use('/api/cross-border-susu',  generalLimiter,   require('../../routes/crossBorderSusuRoutes')); // Phase 5: Cross-border Susu
+    app.use('/api/governance',          generalLimiter,   require('../../routes/governanceRoutes')); // Phase 5: AZM Governance/DAO
     app.use('/api/smart-routes',         financialLimiter, require('../../routes/smartRouteRoutes'));
     app.use('/api/azm-auction',          generalLimiter,   require('../../routes/azmAuctionRoutes'));
 
