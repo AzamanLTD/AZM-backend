@@ -1281,50 +1281,6 @@ model Contact {
   @@index([userId])
 }
 
-
-// =============================================================================
-// WEBHOOK SYSTEM (Phase 4): Business event delivery with retry + signatures
-// =============================================================================
-
-model WebhookEndpoint {
-  id            String   @id @default(uuid())
-  businessId    String   // FK to BusinessProfile.bizId
-  url           String   @db.VarChar(500) // HTTPS endpoint to deliver to
-  secret        String   @db.VarChar(255) // HMAC signing secret
-  events        String[] // ["order.created","order.completed","payment.received", ...]
-  isActive      Boolean  @default(true)
-  lastTriggered DateTime?
-  failureCount  Int      @default(0)
-  createdAt     DateTime @default(now())
-  updatedAt     DateTime @updatedAt
-
-  deliveries WebhookDelivery[]
-
-  @@index([businessId])
-  @@index([isActive])
-}
-
-model WebhookDelivery {
-  id            String   @id @default(uuid())
-  endpointId    String
-  event         String   // e.g. "order.created"
-  payload       Json     // The event data sent to the endpoint
-  status        String   @default("pending") // pending | delivered | failed | retry
-  attempts      Int      @default(0)
-  maxAttempts  Int      @default(5)
-  nextRetryAt   DateTime?
-  responseCode  Int?     // HTTP status from the endpoint
-  responseBody  String? @db.VarChar(2000) // Truncated response body
-  deliveredAt   DateTime?
-  createdAt     DateTime @default(now())
-
-  endpoint WebhookEndpoint @relation(fields: [endpointId], references: [id], onDelete: Cascade)
-
-  @@index([endpointId])
-  @@index([status])
-  @@index([nextRetryAt])
-}
-
 // =============================================================================
 // FINANCE: WITHDRAWALS, REVIEWS, SETTINGS
 // =============================================================================
