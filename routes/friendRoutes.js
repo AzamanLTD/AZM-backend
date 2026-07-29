@@ -18,7 +18,7 @@ const peerTransferController = require('../controllers/peerTransferController');
 
 const protect = authMiddleware.protect;
 const { require2FA } = require('../middleware/require2FA');
-const { idempotency } = require('../middleware/idempotencyMiddleware');
+const { idempotency } = require('../middleware/idempotency');
 
 // =============================================================================
 // USER DISCOVERY

@@ -856,6 +856,8 @@ model User {
 
   // Phase E2: AZM Spend History
   azmSpendLogs AzmSpendLog[]
+  azmGiftsSent     AzmGift[] @relation("AzmGiftSender")
+  azmGiftsReceived AzmGift[] @relation("AzmGiftReceiver")
 
   // Phase V: Vendor Applications
   vendorApplications         VendorApplication[]
@@ -6002,4 +6004,26 @@ model CreditScoreSnapshot {
   @@unique([userId, calculatedAt])
   @@index([userId])
   @@index([calculatedAt])
+}
+
+// =============================================================================
+// PHASE 5: AZM GIFTING & TIPPING — P2P loyalty point transfers
+// =============================================================================
+model AzmGift {
+  id           String   @id @default(uuid())
+  senderId     Int
+  receiverId   Int
+  amount       Decimal  @db.Decimal(20, 8)
+  type         String   @db.VarChar(20) // GIFT | TIP | REWARD
+  message      String?
+  contextType  String?  @db.VarChar(20) // TRADE | CHAT | MARKETPLACE | SUSU | BUSINESS | GENERAL
+  contextId   String?
+  createdAt    DateTime @default(now())
+
+  sender   User @relation("AzmGiftSender", fields: [senderId], references: [id], onDelete: Cascade)
+  receiver User @relation("AzmGiftReceiver", fields: [receiverId], references: [id], onDelete: Cascade)
+
+  @@index([senderId, createdAt(sort: Desc)])
+  @@index([receiverId, createdAt(sort: Desc)])
+  @@index([contextType, contextId])
 }
