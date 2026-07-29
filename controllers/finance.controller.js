@@ -900,3 +900,130 @@ exports.getTransactionHistory = async (req, res) => {
         return res.status(500).json({ success: false, message: error.message });
     }
 };
+
+// =============================================================================
+// Spending Insights — server-side aggregation
+// GET /api/finance/spending-insights
+// Returns category breakdown, weekly spending, month-over-month comparison
+// =============================================================================
+
+exports.getSpendingInsights = async (req, res) => {
+    const prisma = req.app.get('prisma');
+    try {
+        const userId = req.user.id;
+        const now = new Date();
+        const thisMonthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+        const lastMonthStart = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+        const lastMonthEnd = new Date(now.getFullYear(), now.getMonth(), 0, 23, 59, 59);
+
+        // Fetch this month + last month transactions in one query
+        const txns = await prisma.transactionHistory.findMany({
+            where: {
+                userId,
+                createdAt: { gte: lastMonthStart },
+                status: 'COMPLETED',
+            },
+            orderBy: { createdAt: 'desc' },
+        });
+
+        // Categorize spending
+        const DEBIT_TYPES = new Set([
+            'WITHDRAWAL_FIAT', 'WITHDRAWAL_CRYPTO', 'SUSU_CONTRIBUTION',
+            'VAULT_DEPOSIT', 'SUSU_SEIZURE', 'TICKET_ESCROW_FUND',
+            'TICKET_ESCROW_FEE', 'BUSINESS_INVOICE_PAYMENT', 'EWA_WITHDRAWAL',
+        ]);
+        const CREDIT_TYPES = new Set([
+            'DEPOSIT_FIAT', 'DEPOSIT_CRYPTO', 'SUSU_PAYOUT', 'VAULT_RELEASE',
+            'AZM_REWARD', 'SUSU_REFUND', 'SUSU_PROFIT', 'TICKET_ESCROW_RELEASE',
+            'TICKET_ESCROW_REFUND', 'BUSINESS_INVOICE_RECEIPT', 'PAYROLL_DISBURSEMENT',
+        ]);
+
+        const categoryMap = {
+            'WITHDRAWAL_FIAT': 'cash',
+            'WITHDRAWAL_CRYPTO': 'crypto',
+            'SUSU_CONTRIBUTION': 'susu',
+            'VAULT_DEPOSIT': 'vault',
+            'INTERNAL_TRANSFER': 'transfer',
+            'P2P_TRADE': 'trade',
+            'TICKET_ESCROW_FUND': 'escrow',
+            'TICKET_ESCROW_FEE': 'fees',
+            'BUSINESS_INVOICE_PAYMENT': 'business',
+            'EWA_WITHDRAWAL': 'ewa',
+        };
+
+        let totalSpentThisMonth = 0;
+        let totalIncomeThisMonth = 0;
+        let totalSpentLastMonth = 0;
+        const categorySpending = {};
+        const weeklySpending = {};
+
+        // Build 8 week buckets
+        const weekStarts = [];
+        for (let i = 7; i >= 0; i--) {
+            const ws = new Date(now);
+            ws.setDate(ws.getDate() - ((ws.getDay() + 6) % 7) - i * 7);
+            ws.setHours(0, 0, 0, 0);
+            weekStarts.push(ws);
+            weeklySpending[ws.toISOString()] = 0;
+        }
+
+        for (const txn of txns) {
+            const amount = parseFloat(txn.amountUsdc || 0) + parseFloat(txn.feeUsdc || 0);
+            const isThisMonth = txn.createdAt >= thisMonthStart;
+            const isLastMonth = txn.createdAt >= lastMonthStart && txn.createdAt <= lastMonthEnd;
+
+            if (DEBIT_TYPES.has(txn.type)) {
+                if (isThisMonth) totalSpentThisMonth += amount;
+                if (isLastMonth) totalSpentLastMonth += amount;
+
+                // Category breakdown (this month only)
+                if (isThisMonth) {
+                    const cat = categoryMap[txn.type] || 'other';
+                    categorySpending[cat] = (categorySpending[cat] || 0) + amount;
+                }
+
+                // Weekly buckets
+                for (let i = weekStarts.length - 1; i >= 0; i--) {
+                    if (txn.createdAt >= weekStarts[i]) {
+                        weeklySpending[weekStarts[i].toISOString()] += amount;
+                        break;
+                    }
+                }
+            } else if (CREDIT_TYPES.has(txn.type)) {
+                if (isThisMonth) totalIncomeThisMonth += amount;
+            }
+        }
+
+        // Month-over-month change
+        const momChange = totalSpentLastMonth > 0
+            ? Math.round(((totalSpentThisMonth - totalSpentLastMonth) / totalSpentLastMonth) * 100)
+            : 0;
+
+        // Top categories sorted
+        const topCategories = Object.entries(categorySpending)
+            .sort((a, b) => b[1] - a[1])
+            .map(([key, amount]) => ({ key, amount: Math.round(amount * 100) / 100 }));
+
+        // Weekly array
+        const weekly = weekStarts.map(ws => ({
+            weekStart: ws.toISOString(),
+            label: `${ws.getMonth() + 1}/${ws.getDate()}`,
+            amount: Math.round(weeklySpending[ws.toISOString()] * 100) / 100,
+        }));
+
+        return res.status(200).json({
+            success: true,
+            insights: {
+                totalSpentThisMonth: Math.round(totalSpentThisMonth * 100) / 100,
+                totalIncomeThisMonth: Math.round(totalIncomeThisMonth * 100) / 100,
+                totalSpentLastMonth: Math.round(totalSpentLastMonth * 100) / 100,
+                momChange,
+                topCategories,
+                weekly,
+            },
+        });
+    } catch (error) {
+        logger.error({ err: error }, '[finance.getSpendingInsights] error');
+        return res.status(500).json({ success: false, message: error.message });
+    }
+};
