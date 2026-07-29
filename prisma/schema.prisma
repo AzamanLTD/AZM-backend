@@ -431,6 +431,7 @@ enum VaultDepositType {
   MANUAL
   AUTO_RULE
   BONUS
+  ROUND_UP
 }
 
 enum VaultDepositStatus {
@@ -632,6 +633,7 @@ model User {
   // restores it as an independent loyalty ledger.
   azmBalance       Decimal  @default(0.0) @db.Decimal(20, 8) // AZM loyalty points (independent of USDC)
   notificationPrefs  Json?    // User-level notification preferences, quiet hours, per-category toggles
+  roundUpSettings   RoundUpSettings?
   // Card skins (2026-07-06): purchasable cosmetic skins for the peer-transfer
   // chat card. 'classic' is always available (free, not in ownedCardSkins).
   // equippedCardSkin must be 'classic' or present in ownedCardSkins — enforced
@@ -3352,6 +3354,8 @@ model TransitBooking {
 // =============================================================================
 
 model Vault {
+  // Round-up savings relation
+  roundUpSettings RoundUpSettings?  // back-relation
   id                String      @id @default(uuid())
   userId            Int
   name              String      @db.VarChar(60)
@@ -5936,4 +5940,20 @@ model OrderTracking {
 
   @@index([orderId])
   @@index([businessProfileId])
+}
+
+model RoundUpSettings {
+  id              String   @id @default(uuid())
+  userId          Int      @unique
+  enabled         Boolean  @default(false)
+  targetVaultId   String?  @unique
+  totalSavedUsdc  Float    @default(0)
+  multiplier      Float    @default(1.0)  // round to nearest $1 by default
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  targetVault     Vault?   @relation(fields: [targetVaultId], references: [id], onDelete: SetNull)
+
+  @@index([userId])
 }
