@@ -98,8 +98,8 @@ const TatumService = require('../../services/tatumService');
 const tatumService = new TatumService();
 
 // --- EMAIL SERVICE (Phase L1) ---
-const EmailService = require('../../services/emailService');
-const emailService = new EmailService();
+const emailService = require('../../services/emailService');
+
 
 // --- SMS SERVICE (Phase L2) ---
 const SMSService = require('../../services/smsService');

@@ -31,6 +31,7 @@
     "bcryptjs": "^2.4.3",
     "bullmq": "^5.81.2",
     "cloudinary": "^2.10.0",
+    "dotenv": "^17.4.2",
     "express": "^5.2.1",
     "express-rate-limit": "^8.5.2",
     "firebase-admin": "^13.6.1",
@@ -51,8 +52,7 @@
     "speakeasy": "^2.0.0",
     "tsx": "^4.21.0",
     "uuid": "^13.0.0",
-    "zod": "^4.4.3",
-    "dotenv": "^17.4.2"
+    "zod": "^4.4.3"
   },
   "devDependencies": {
     "@types/pg": "^8.16.0",
