@@ -907,6 +907,10 @@ model User {
 
   createdAt           DateTime                @default(now())
   stories             Story[]
+  storyHighlights     StoryHighlight[]
+  storyCloseFriends   StoryCloseFriend[] @relation("StoryCloseFriendOwner")
+  storyCloseFriendOf  StoryCloseFriend[] @relation("StoryCloseFriendMember")
+  loyaltyCards        LoyaltyCard[]
   // Business OS relations
   employeeProfiles    BusinessEmployee[]      @relation("EmployeeUser")
   shifts              Shift[]                 @relation("ShiftUser")
@@ -2518,6 +2522,8 @@ model BusinessProfile {
   updatedAt DateTime @updatedAt
 
   stories                 Story[]
+  storyAnalytics          StoryAnalytics[]
+  loyaltyPrograms        LoyaltyProgram[]
   transitTrips            TransitTrip[]
   followers               BusinessFollower[]
   adPosts                 BusinessAdPost[]
@@ -4059,6 +4065,8 @@ model Story {
   views     StoryView[]
   reactions StoryReaction[]
   adPost    BusinessAdPost?
+  highlightItems StoryHighlightItem[]
+  analytics      StoryAnalytics?
 }
 
 model StoryView {
@@ -5759,4 +5767,103 @@ model CallLog {
   @@index([callerId, createdAt(sort: Desc)])
   @@index([calleeId, createdAt(sort: Desc)])
   @@index([status, createdAt(sort: Desc)])
+}
+
+// ─── Phase 3: Story Highlights ───────────────────────────────────────────────
+// Permanent collections of stories on a user's profile (like Instagram highlights)
+model StoryHighlight {
+  id          Int      @id @default(autoincrement())
+  userId      Int
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  title       String   @db.VarChar(50)
+  coverUrl    String?
+  createdAt   DateTime @default(now())
+
+  items StoryHighlightItem[]
+}
+
+model StoryHighlightItem {
+  id           Int           @id @default(autoincrement())
+  highlightId  Int
+  highlight    StoryHighlight @relation(fields: [highlightId], references: [id], onDelete: Cascade)
+  storyId      Int?
+  story        Story?        @relation(fields: [storyId], references: [id], onDelete: SetNull)
+  mediaUrl     String  // snapshot of the story media (story may expire)
+  mediaType    String  @default("IMAGE")
+  caption      String?
+  addedAt      DateTime @default(now())
+}
+
+// ─── Phase 3: Story Close Friends List ──────────────────────────────────────
+// Private story audience — only selected friends can see these stories
+model StoryCloseFriend {
+  id        Int    @id @default(autoincrement())
+  userId    Int    // the story creator
+  user      User   @relation("StoryCloseFriendOwner", fields: [userId], references: [id], onDelete: Cascade)
+  friendId  Int    // the allowed viewer
+  friend    User   @relation("StoryCloseFriendMember", fields: [friendId], references: [id], onDelete: Cascade)
+  addedAt   DateTime @default(now())
+
+  @@unique([userId, friendId])
+}
+
+// ─── Phase 3: Story Analytics ────────────────────────────────────────────────
+// Aggregate per-story metrics for business stories
+model StoryAnalytics {
+  id              Int      @id @default(autoincrement())
+  storyId         Int      @unique
+  story           Story    @relation(fields: [storyId], references: [id], onDelete: Cascade)
+  businessProfileId String?
+  businessProfile   BusinessProfile? @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+  viewCount       Int      @default(0)
+  uniqueViewerCount Int    @default(0)
+  reactionCount   Int      @default(0)
+  replyCount      Int      @default(0)
+  shareCount      Int      @default(0)
+  profileClickCount Int    @default(0)
+  avgViewDurationSeconds Float @default(0)
+  updatedAt       DateTime @updatedAt
+}
+
+// ─── Phase 3: Business Loyalty Programs ─────────────────────────────────────
+// Stamp card loyalty program — buy N get 1 free style
+model LoyaltyProgram {
+  id                String   @id @default(uuid())
+  businessProfileId String
+  businessProfile   BusinessProfile @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+  name              String   @db.VarChar(100)
+  description       String?
+  type              String   @default("STAMP") // STAMP | POINTS | TIER
+  // STAMP: collect N stamps → reward
+  stampsRequired    Int      @default(10)
+  rewardDescription String   @db.VarChar(200)
+  // POINTS: earn points per spend
+  pointsPerCedi     Float?   // e.g. 1 point per GHS 5 spent
+  // TIER: vendor tiers Bronze/Silver/Gold
+  // color for the card
+  cardColor         String   @default("#FFD700")
+  isActive          Boolean  @default(true)
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  cards LoyaltyCard[]
+}
+
+// Per-customer loyalty card tracking their stamps/points
+model LoyaltyCard {
+  id                String   @id @default(uuid())
+  loyaltyProgramId  String
+  loyaltyProgram    LoyaltyProgram @relation(fields: [loyaltyProgramId], references: [id], onDelete: Cascade)
+  userId            Int
+  user              User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  stampsCollected   Int      @default(0)
+  pointsBalance     Float    @default(0)
+  currentTier       String   @default("BRONZE")
+  totalRewardsRedeemed Int   @default(0)
+  lastStampAt       DateTime?
+  redeemedAt        DateTime?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  @@unique([loyaltyProgramId, userId])
 }
