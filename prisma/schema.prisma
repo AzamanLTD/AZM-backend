@@ -631,6 +631,7 @@ model User {
   // database ledger. Phase D-2 incorrectly dropped this column; Phase D-3
   // restores it as an independent loyalty ledger.
   azmBalance       Decimal  @default(0.0) @db.Decimal(20, 8) // AZM loyalty points (independent of USDC)
+  notificationPrefs  Json?    // User-level notification preferences, quiet hours, per-category toggles
   // Card skins (2026-07-06): purchasable cosmetic skins for the peer-transfer
   // chat card. 'classic' is always available (free, not in ownedCardSkins).
   // equippedCardSkin must be 'classic' or present in ownedCardSkins — enforced
