@@ -105,6 +105,7 @@ function mountRoutes(app, {
     app.use('/api/susu',                 financialLimiter, require('../../routes/susuRoutes'));
     app.use('/api/credit-score',        generalLimiter,   require('../../routes/creditScoreRoutes')); // Phase 5: Credit scoring
     app.use('/api/azm-gifts',            generalLimiter,   require('../../routes/azmGiftRoutes')); // Phase 5: AZM gifting
+    app.use('/api/proof-of-reserves',     generalLimiter,   require('../../routes/proofOfReservesRoutes')); // Phase 5: Proof of reserves
     app.use('/api/smart-routes',         financialLimiter, require('../../routes/smartRouteRoutes'));
     app.use('/api/azm-auction',          generalLimiter,   require('../../routes/azmAuctionRoutes'));
 

@@ -6027,3 +6027,21 @@ model AzmGift {
   @@index([receiverId, createdAt(sort: Desc)])
   @@index([contextType, contextId])
 }
+
+// =============================================================================
+// PHASE 5: PROOF OF RESERVES — Solvency snapshots with Merkle verification
+// =============================================================================
+model ProofOfReservesSnapshot {
+  id               Int      @id @default(autoincrement())
+  totalLiabilities Decimal  @db.Decimal(20, 8)
+  totalReserves    Decimal  @db.Decimal(20, 8)
+  reserveRatio     Decimal  @db.Decimal(10, 4)
+  isFullyBacked     Boolean  @default(true)
+  userCount        Int
+  merkleRoot       String   @db.VarChar(64)
+  salt             String
+  breakdown        Json
+  createdAt        DateTime @default(now())
+
+  @@index([createdAt(sort: Desc)])
+}
