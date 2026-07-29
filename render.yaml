@@ -10,7 +10,7 @@
 #   Pre-Deploy Command:  npm run release      (Render "Pre-Deploy Command")
 #   Start Command:       npm start
 #
-# `npm run release` = `prisma migrate deploy && node infra/seed-susu-foundation.js`
+# `npm run release` = overlay installers + seed (all idempotent, safe to re-run)
 #   - prisma migrate deploy   → applies pending migrations (overlay + DAILY enum)
 #   - seed-susu-foundation.js → idempotently seeds the azaman-treasury wallet
 #                               and the v1.0 liability contract

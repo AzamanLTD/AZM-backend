@@ -15,6 +15,7 @@ const GroupChatSocketService = require('../../services/groupChatSocketService');
 const FriendSocketService = require('../../services/friendSocketService');
 const TicketSocketService = require('../../services/ticketSocketService');
 const NotificationService = require('../../services/notificationService');
+const WebRTCSocketService = require('../../services/webrtcSocketService');
 
 const vendorStatus = new Map();
 
@@ -37,6 +38,7 @@ function createSocketServices(io, prisma, app) {
         friendSocketService,
         ticketSocketService,
         notificationService,
+        webrtcSocketService,
         vendorStatus,
     };
 }

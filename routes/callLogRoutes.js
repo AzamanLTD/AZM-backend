@@ -11,7 +11,7 @@
 
 const express = require('express');
 const router = express.Router();
-const { protect } = require('../../middleware/authMiddleware');
+const { protect } = require('../middleware/authMiddleware');
 
 // GET /api/calls — list call history (paginated)
 router.get('/', protect, async (req, res) => {
