@@ -13,7 +13,14 @@
 // Sentry dashboard. Set SENTRY_DSN in the Render environment to enable.
 // =============================================================================
 
-require('dotenv').config();
+// dotenv is optional — on Render/PaaS, env vars are injected by the platform.
+// In local dev, dotenv loads them from .env. Wrap in try/catch so a missing
+// module never crashes the server.
+try {
+    require('dotenv').config();
+} catch (_e) {
+    // dotenv not installed (shouldn't happen, but be safe)
+}
 
 const Sentry = require('@sentry/node');
 

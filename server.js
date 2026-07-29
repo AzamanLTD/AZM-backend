@@ -28,7 +28,7 @@ const { Server } = require('socket.io');
 const path = require('path');
 const socketRateLimiter = require('./middleware/socketRateLimiter');
 const jwt = require('jsonwebtoken');
-require('dotenv').config();
+try { require('dotenv').config(); } catch (_e) { /* dotenv optional on PaaS */ }
 
 // ── Startup Validation ───────────────────────────────────────────────────────
 // CRITICAL-2: Fail fast if essential env vars are missing
