@@ -865,6 +865,7 @@ model User {
   orderBookTakerTrades OrderBookTrade[] @relation("OrderBookTaker")
   currencyWallets    CurrencyWallet[]
   currencyConversions CurrencyConversion[]
+  approvalRequests   AdminApprovalRequest[] @relation("ApprovalRequester")
 
   // Phase V: Vendor Applications
   vendorApplications         VendorApplication[]
@@ -6168,4 +6169,31 @@ model CurrencyConversion {
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([userId, createdAt(sort: Desc)])
+}
+
+// =============================================================================
+// PHASE 4: ADMIN RBAC & MULTI-STEP APPROVALS
+// =============================================================================
+model AdminApprovalRequest {
+  id                Int      @id @default(autoincrement())
+  type              String   @db.VarChar(30)  // WITHDRAWAL | SUSU_PAYOUT | VENDOR_TIER_CHANGE | USER_BAN | FEE_OVERRIDE | MANUAL_BALANCE_ADJUST
+  entityId          String   @db.VarChar(100) // ID of the entity being approved
+  amount            Decimal  @default(0.0) @db.Decimal(20, 8)
+  description       String   @db.VarChar(500)
+  metadata          Json
+  requestedBy       Int
+  requiredApprovals Int      @default(1)
+  approvals         Json     @default("[]") // array of { userId, role, at }
+  status            String   @db.VarChar(20) @default("PENDING") // PENDING | APPROVED | REJECTED | AUTO_APPROVED | EXECUTED | EXPIRED
+  approvedBy        Int?
+  approvedAt        DateTime?
+  rejectedBy        Int?
+  rejectedAt        DateTime?
+  rejectionReason   String?  @db.VarChar(500)
+  createdAt         DateTime @default(now())
+
+  requester User @relation("ApprovalRequester", fields: [requestedBy], references: [id])
+
+  @@index([status, createdAt(sort: Desc)])
+  @@index([type, status])
 }

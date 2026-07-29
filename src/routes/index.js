@@ -134,6 +134,7 @@ function mountRoutes(app, {
     const businessOSRoutes = require('../../routes/businessOSRoutes');
 
     app.use('/api/admin/susu',            generalLimiter,   adminSusuRoutes);
+    app.use('/api/admin/rbac',           generalLimiter,   require('../../routes/adminRbacRoutes')); // Phase 4: Admin RBAC
 
     // ── Marketplace Expansion — Phase B-2 ─────────────────────────────────────
     app.use('/api/marketplace',           generalLimiter,   require('../../routes/marketplaceRoutes'));
