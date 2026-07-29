@@ -114,6 +114,7 @@ enum TransactionType {
   BUSINESS_INVOICE_RECEIPT // business credit when invoice is paid
   EWA_WITHDRAWAL
   PAYROLL_DISBURSEMENT
+  AZM_CONVERSION_TO_USDC
 }
 
 enum TransactionStatus {
@@ -858,6 +859,7 @@ model User {
   azmSpendLogs AzmSpendLog[]
   azmGiftsSent     AzmGift[] @relation("AzmGiftSender")
   azmGiftsReceived AzmGift[] @relation("AzmGiftReceiver")
+  azmConversions    AzmConversionLog[]
 
   // Phase V: Vendor Applications
   vendorApplications         VendorApplication[]
@@ -6044,4 +6046,24 @@ model ProofOfReservesSnapshot {
   createdAt        DateTime @default(now())
 
   @@index([createdAt(sort: Desc)])
+}
+
+// =============================================================================
+// PHASE 5: AZM-TO-USDC CONVERSION LOG — Tracks loyalty point → stablecoin swaps
+// =============================================================================
+model AzmConversionLog {
+  id             Int      @id @default(autoincrement())
+  userId         Int
+  azmAmount      Decimal  @db.Decimal(20, 8)
+  usdcAmount     Decimal  @db.Decimal(20, 8)
+  rate           Decimal  @db.Decimal(10, 6)
+  baseRate       Decimal  @db.Decimal(10, 6)
+  holderBonus    Boolean  @default(false)
+  newAzmBalance  Decimal  @db.Decimal(20, 8)
+  newUsdcBalance Decimal  @db.Decimal(20, 8)
+  createdAt      DateTime @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt(sort: Desc)])
 }

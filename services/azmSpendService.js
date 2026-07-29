@@ -53,6 +53,7 @@ const AZM_SPEND_SOURCES = {
     // Card skins (2026-07-06)
     CARD_SKIN: 'CARD_SKIN',
     GIFT_TIP: 'GIFT_TIP',
+    AZM_CONVERSION: 'AZM_CONVERSION',
 };
 
 // ── Fee discount tiers ───────────────────────────────────────────────────────
