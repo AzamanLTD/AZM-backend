@@ -31,7 +31,7 @@ function _daysBetweenCalendarDates(a, b) {
 // Phase K. The startup-crash guard stays here because authController is
 // imported early in routes/authRoutes.js and we want the process to refuse
 // to even boot without a secret.)
-if (!process.env.JWT_SECRET) {
+if (!process.env.JWT_SECRET && process.env.NODE_ENV !== 'test') {
     logger.error('═══════════════════════════════════════════════════════════════');
     logger.error('  FATAL: JWT_SECRET environment variable is NOT SET.');
     logger.error('  The server CANNOT start without a cryptographic signing key.');

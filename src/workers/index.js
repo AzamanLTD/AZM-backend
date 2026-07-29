@@ -128,6 +128,11 @@ async function startWorkers(app, {
     await register('transit-reminders', '*/15 * * * *', () => sweepTransitReminders(prisma));
     await register('expired-ads',        '*/30 * * * *', () => sweepExpiredAds(prisma));
 
+    // Transit booking expiry — auto-cancel PENDING bookings older than 15 min
+    const TransitBookingExpiryWorker = require('../../workers/transitBookingExpiryWorker');
+    const transitBookingExpiryWorker = new TransitBookingExpiryWorker(prisma, io, notificationService);
+    await register('transit-booking-expiry', String(5 * 60 * 1000), () => transitBookingExpiryWorker._tick());
+
     // Webhook retry queue — process stuck RETRYING deliveries every 2 min
     const webhookDispatcher = require('../../services/webhookDispatcher');
     await register('webhook-retry',     '*/2 * * * *',  async () => {
