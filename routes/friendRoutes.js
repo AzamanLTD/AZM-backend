@@ -17,6 +17,8 @@ const chatProfileController = require('../controllers/chatProfileController');
 const peerTransferController = require('../controllers/peerTransferController');
 
 const protect = authMiddleware.protect;
+const { require2FA } = require('../middleware/require2FA');
+const { idempotency } = require('../middleware/idempotencyMiddleware');
 
 // =============================================================================
 // USER DISCOVERY
@@ -64,7 +66,7 @@ router.get('/:friendshipId/trust-metrics', protect, chatProfileController.getTru
 // =============================================================================
 // PEER TRANSFERS
 // =============================================================================
-router.post('/transfer/send', protect, peerTransferController.sendFunds);
+router.post('/transfer/send', protect, require2FA(), idempotency(), peerTransferController.sendFunds);
 router.post('/transfer/request', protect, peerTransferController.requestFunds);
 router.get('/transfer/pending', protect, peerTransferController.getPendingTransferRequests);
 router.get('/transfer/history/:friendshipId', protect, peerTransferController.getTransferHistory);
