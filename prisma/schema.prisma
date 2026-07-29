@@ -860,6 +860,9 @@ model User {
   azmGiftsSent     AzmGift[] @relation("AzmGiftSender")
   azmGiftsReceived AzmGift[] @relation("AzmGiftReceiver")
   azmConversions    AzmConversionLog[]
+  orderBookOrders   OrderBookOrder[]
+  orderBookMakerTrades OrderBookTrade[] @relation("OrderBookMaker")
+  orderBookTakerTrades OrderBookTrade[] @relation("OrderBookTaker")
 
   // Phase V: Vendor Applications
   vendorApplications         VendorApplication[]
@@ -6066,4 +6069,51 @@ model AzmConversionLog {
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([userId, createdAt(sort: Desc)])
+}
+
+// =============================================================================
+// PHASE 5: ORDER BOOK TRADING — Limit order book for AZM/USDC pair
+// =============================================================================
+model OrderBookOrder {
+  id               String   @id @default(uuid())
+  userId           Int
+  pair             String   @db.VarChar(20) // AZM/USDC
+  side             String   @db.VarChar(4)  // BUY | SELL
+  type             String   @db.VarChar(6)  // LIMIT | MARKET
+  price            Decimal? @db.Decimal(18, 8) // null for market orders
+  quantity         Decimal  @db.Decimal(20, 8)
+  remainingQuantity Decimal @db.Decimal(20, 8)
+  status           String   @db.VarChar(20) @default("OPEN") // OPEN | PARTIALLY_FILLED | FILLED | CANCELLED
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  user   User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  trades OrderBookTrade[] @relation("OrderBookMakerOrder")
+  takerTrades OrderBookTrade[] @relation("OrderBookTakerOrder")
+
+  @@index([pair, side, status, price])
+  @@index([userId, createdAt(sort: Desc)])
+}
+
+model OrderBookTrade {
+  id            String   @id @default(uuid())
+  pair          String   @db.VarChar(20)
+  makerOrderId  String
+  takerOrderId  String
+  price         Decimal  @db.Decimal(18, 8)
+  quantity      Decimal  @db.Decimal(20, 8)
+  makerFee      Decimal  @db.Decimal(20, 8)
+  takerFee      Decimal  @db.Decimal(20, 8)
+  makerUserId   Int
+  takerUserId   Int
+  createdAt     DateTime @default(now())
+
+  makerOrder OrderBookOrder @relation("OrderBookMakerOrder", fields: [makerOrderId], references: [id], onDelete: Cascade)
+  takerOrder OrderBookOrder @relation("OrderBookTakerOrder", fields: [takerOrderId], references: [id], onDelete: Cascade)
+  makerUser  User           @relation("OrderBookMaker", fields: [makerUserId], references: [id])
+  takerUser  User           @relation("OrderBookTaker", fields: [takerUserId], references: [id])
+
+  @@index([pair, createdAt(sort: Desc)])
+  @@index([makerUserId])
+  @@index([takerUserId])
 }

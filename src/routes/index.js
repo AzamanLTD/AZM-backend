@@ -107,6 +107,7 @@ function mountRoutes(app, {
     app.use('/api/azm-gifts',            generalLimiter,   require('../../routes/azmGiftRoutes')); // Phase 5: AZM gifting
     app.use('/api/proof-of-reserves',     generalLimiter,   require('../../routes/proofOfReservesRoutes')); // Phase 5: Proof of reserves
     app.use('/api/azm-convert',           generalLimiter,   require('../../routes/azmConversionRoutes')); // Phase 5: AZM-to-USDC
+    app.use('/api/order-book',            generalLimiter,   require('../../routes/orderBookRoutes')); // Phase 5: Order book
     app.use('/api/smart-routes',         financialLimiter, require('../../routes/smartRouteRoutes'));
     app.use('/api/azm-auction',          generalLimiter,   require('../../routes/azmAuctionRoutes'));
 
