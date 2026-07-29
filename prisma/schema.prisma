@@ -870,6 +870,7 @@ model User {
   vouchesGiven      VouchRecord[]      @relation("VouchVoucher")
   vouchesReceived   VouchRecord[]      @relation("VouchInvitee")
   susuMemberships   SusuMember[]       @relation("SusuMembership")
+  creditScoreSnapshots CreditScoreSnapshot[] @relation("CreditScoreSnapshots")
   susuPayoutsWon    SusuCycle[]        @relation("SusuCycleWinner")
   susuContributions SusuContribution[] @relation("SusuContributor")
   smartRoutes       SmartRoute[]
@@ -5978,4 +5979,27 @@ model RoundUpSettings {
   targetVault     Vault?   @relation(fields: [targetVaultId], references: [id], onDelete: SetNull)
 
   @@index([userId])
+}
+
+// =============================================================================
+// PHASE 5: CREDIT SCORING — Score snapshot history
+// =============================================================================
+model CreditScoreSnapshot {
+  id               Int      @id @default(autoincrement())
+  userId           Int
+  score            Int
+  rating           String   @db.VarChar(20)
+  band             String   @db.VarChar(5)
+  susuComponent    Int
+  tradeComponent   Int
+  accountComponent Int
+  financialComponent Int
+  reputationComponent Int
+  calculatedAt     DateTime
+
+  user User @relation("CreditScoreSnapshots", fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, calculatedAt])
+  @@index([userId])
+  @@index([calculatedAt])
 }
