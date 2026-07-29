@@ -2553,6 +2553,7 @@ model BusinessProfile {
   waitlistEntries         RestaurantWaitlistEntry[]
   kitchenOrders           KitchenOrder[]
   driverAssignments       DriverAssignment[]
+  orderTracking           OrderTracking[]
   vehicleMaintenances     VehicleMaintenance[]
   cargoParcelsSent        CargoParcel[]
   routeTemplates          TransitRouteTemplate[]
@@ -3084,6 +3085,7 @@ model BusinessOrder {
   ticket          Ticket?          @relation(fields: [ticketId], references: [id])
   review          BusinessReview? // Discovery Sprint: one optional review per order
   kitchenOrder    KitchenOrder?
+  orderTracking   OrderTracking?
 
   @@index([businessProfileId])
   @@index([businessProfileId, status])
@@ -3381,6 +3383,14 @@ model Vault {
   consistencyScore Decimal @default(0) @db.Decimal(5, 2)
   totalAzmEarned   Decimal @default(0) @db.Decimal(20, 8)
 
+  // ── Phase 3: DeFi Yield Integration ──
+  yieldEnabled       Boolean  @default(false)
+  yieldStrategy      String?  @db.VarChar(50)  // AAVE | COMPOUND | INTERNAL_LP
+  yieldApr           Decimal  @default(0) @db.Decimal(6, 4)  // e.g. 0.0450 = 4.50%
+  yieldEarnedUsdc    Decimal  @default(0) @db.Decimal(20, 8)
+  yieldLastCompoundAt DateTime?
+  yieldAutoCompound  Boolean  @default(true)
+
   // Receipt snapshot (denormalised on completion for fast UI render)
   receiptSnapshot Json?
 
@@ -3422,6 +3432,24 @@ model VaultDeposit {
   @@index([vaultId, createdAt(sort: Desc)])
   @@index([userId, createdAt(sort: Desc)])
   @@index([status])
+}
+
+// ── Phase 3: DeFi Yield Strategy Definitions ───────────────────────────────
+model DeFiYieldStrategy {
+  id          String   @id @default(uuid())
+  name        String   @db.VarChar(50)  // AAVE | COMPOUND | INTERNAL_LP
+  displayName String   @db.VarChar(100)
+  protocol    String   @db.VarChar(50)
+  apr         Decimal  @db.Decimal(6, 4)  // current APR
+  riskLevel   String   @default("LOW") @db.VarChar(20)  // LOW | MEDIUM | HIGH
+  minAmountUsdc Decimal @default(0) @db.Decimal(20, 8)
+  maxAmountUsdc Decimal? @db.Decimal(20, 8)
+  isActive    Boolean  @default(true)
+  description String?  @db.VarChar(500)
+  logoUrl     String?
+  updatedAt   DateTime @updatedAt
+
+  @@index([isActive])
 }
 
 // ── PHASE 2: GROUP CHAT + SUSU ─────────────────────────────────────────────
@@ -5866,4 +5894,45 @@ model LoyaltyCard {
   updatedAt         DateTime @updatedAt
 
   @@unique([loyaltyProgramId, userId])
+}
+
+// ── Phase 3: Real-time Order Tracking ────────────────────────────────────────
+model OrderTracking {
+  id              String   @id @default(uuid())
+  orderId         String   @unique
+  order           BusinessOrder @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  businessProfileId String
+  businessProfile   BusinessProfile @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+
+  // Live courier location
+  courierLatitude   Decimal? @db.Decimal(10, 7)
+  courierLongitude  Decimal? @db.Decimal(10, 7)
+  courierHeading    Float?   // degrees 0-360
+  courierSpeedKmh   Float?   // km/h
+
+  // Destination
+  deliveryLatitude  Decimal? @db.Decimal(10, 7)
+  deliveryLongitude Decimal? @db.Decimal(10, 7)
+  deliveryAddress   String?  @db.VarChar(500)
+
+  // ETA
+  estimatedArrival DateTime?
+  actualArrival    DateTime?
+
+  // Status timeline (JSON array of {status, timestamp, note})
+  timeline         Json     @default("[]")
+
+  // Driver info
+  driverName       String?  @db.VarChar(100)
+  driverPhone      String?  @db.VarChar(20)
+  vehiclePlate     String?  @db.VarChar(20)
+
+  // Socket room for real-time updates
+  lastPingAt       DateTime?
+
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  @@index([orderId])
+  @@index([businessProfileId])
 }

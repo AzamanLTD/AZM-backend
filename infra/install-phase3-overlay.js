@@ -134,3 +134,73 @@ async function main() {
 main()
   .catch((e) => { logger.error('Phase 3 overlay failed', e); process.exit(1); })
   .finally(() => prisma.$disconnect());
+
+// ── Phase 3: OrderTracking + DeFiYieldStrategy + Vault yield columns ─────────
+STATEMENTS.push(
+  `CREATE TABLE IF NOT EXISTS "OrderTracking" (
+    "id" TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+    "orderId" TEXT NOT NULL,
+    "businessProfileId" TEXT NOT NULL,
+    "courierLatitude" DECIMAL(10, 7),
+    "courierLongitude" DECIMAL(10, 7),
+    "courierHeading" DOUBLE PRECISION,
+    "courierSpeedKmh" DOUBLE PRECISION,
+    "deliveryLatitude" DECIMAL(10, 7),
+    "deliveryLongitude" DECIMAL(10, 7),
+    "deliveryAddress" VARCHAR(500),
+    "estimatedArrival" TIMESTAMP(3),
+    "actualArrival" TIMESTAMP(3),
+    "timeline" JSONB NOT NULL DEFAULT '[]'::jsonb,
+    "driverName" VARCHAR(100),
+    "driverPhone" VARCHAR(20),
+    "vehiclePlate" VARCHAR(20),
+    "lastPingAt" TIMESTAMP(3),
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updatedAt" TIMESTAMP(3) NOT NULL
+  )`,
+  `ALTER TABLE "OrderTracking" ADD CONSTRAINT "OrderTracking_orderId_fkey" FOREIGN KEY ("orderId") REFERENCES "BusinessOrder"("id") ON DELETE CASCADE NOT VALID`,
+  `ALTER TABLE "OrderTracking" ADD CONSTRAINT "OrderTracking_businessProfileId_fkey" FOREIGN KEY ("businessProfileId") REFERENCES "BusinessProfile"("id") ON DELETE CASCADE NOT VALID`,
+  `ALTER TABLE "OrderTracking" ADD CONSTRAINT "OrderTracking_orderId_key" UNIQUE ("orderId")`,
+  `CREATE INDEX IF NOT EXISTS "OrderTracking_orderId_idx" ON "OrderTracking"("orderId")`,
+  `CREATE INDEX IF NOT EXISTS "OrderTracking_businessProfileId_idx" ON "OrderTracking"("businessProfileId")`,
+
+  `CREATE TABLE IF NOT EXISTS "DeFiYieldStrategy" (
+    "id" TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
+    "name" VARCHAR(50) NOT NULL,
+    "displayName" VARCHAR(100) NOT NULL,
+    "protocol" VARCHAR(50) NOT NULL,
+    "apr" DECIMAL(6, 4) NOT NULL,
+    "riskLevel" VARCHAR(20) NOT NULL DEFAULT 'LOW',
+    "minAmountUsdc" DECIMAL(20, 8) NOT NULL DEFAULT 0,
+    "maxAmountUsdc" DECIMAL(20, 8),
+    "isActive" BOOLEAN NOT NULL DEFAULT true,
+    "description" VARCHAR(500),
+    "logoUrl" TEXT,
+    "updatedAt" TIMESTAMP(3) NOT NULL
+  )`,
+  `CREATE INDEX IF NOT EXISTS "DeFiYieldStrategy_isActive_idx" ON "DeFiYieldStrategy"("isActive")`,
+
+  `ALTER TABLE "Vault" ADD COLUMN IF NOT EXISTS "yieldEnabled" BOOLEAN NOT NULL DEFAULT false`,
+  `ALTER TABLE "Vault" ADD COLUMN IF NOT EXISTS "yieldStrategy" VARCHAR(50)`,
+  `ALTER TABLE "Vault" ADD COLUMN IF NOT EXISTS "yieldApr" DECIMAL(6, 4) NOT NULL DEFAULT 0`,
+  `ALTER TABLE "Vault" ADD COLUMN IF NOT EXISTS "yieldEarnedUsdc" DECIMAL(20, 8) NOT NULL DEFAULT 0`,
+  `ALTER TABLE "Vault" ADD COLUMN IF NOT EXISTS "yieldLastCompoundAt" TIMESTAMP(3)`,
+  `ALTER TABLE "Vault" ADD COLUMN IF NOT EXISTS "yieldAutoCompound" BOOLEAN NOT NULL DEFAULT true`,
+
+  // Seed default DeFi strategies
+  `INSERT INTO "DeFiYieldStrategy" ("name", "displayName", "protocol", "apr", "riskLevel", "minAmountUsdc", "isActive", "description", "logoUrl", "updatedAt")
+   SELECT 'AAVE', 'Aave V3 — Stablecoin Pool', 'AAVE', 0.0450, 'LOW', 10, true,
+     'Supply USDC to Aave V3 lending pool. Earns variable APR from borrower interest.',
+     'https://cryptologos.cc/logos/aave-aave-logo.png', CURRENT_TIMESTAMP
+   WHERE NOT EXISTS (SELECT 1 FROM "DeFiYieldStrategy" WHERE "name" = 'AAVE')`,
+  `INSERT INTO "DeFiYieldStrategy" ("name", "displayName", "protocol", "apr", "riskLevel", "minAmountUsdc", "isActive", "description", "logoUrl", "updatedAt")
+   SELECT 'COMPOUND', 'Compound V3 — USDC Market', 'COMPOUND', 0.0385, 'LOW', 10, true,
+     'Supply USDC to Compound V3 market. Earns COMP rewards + interest.',
+     'https://cryptologos.cc/logos/compound-comp-logo.png', CURRENT_TIMESTAMP
+   WHERE NOT EXISTS (SELECT 1 FROM "DeFiYieldStrategy" WHERE "name" = 'COMPOUND')`,
+  `INSERT INTO "DeFiYieldStrategy" ("name", "displayName", "protocol", "apr", "riskLevel", "minAmountUsdc", "maxAmountUsdc", "isActive", "description", "logoUrl", "updatedAt")
+   SELECT 'INTERNAL_LP', 'AZAMAN Internal LP', 'INTERNAL', 0.0650, 'MEDIUM', 50, 50000, true,
+     'Provide liquidity to AZAMAN P2P matching pool. Higher APR with platform risk. AZM bonus rewards.',
+     NULL, CURRENT_TIMESTAMP
+   WHERE NOT EXISTS (SELECT 1 FROM "DeFiYieldStrategy" WHERE "name" = 'INTERNAL_LP')`,
+);

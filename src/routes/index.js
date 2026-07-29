@@ -91,6 +91,10 @@ function mountRoutes(app, {
     app.use('/api/calls',                 generalLimiter,   require('../../routes/callLogRoutes'));
     app.use('/api/messages',              generalLimiter,   require('../../routes/messageActionRoutes'));
     app.use('/api/webhooks',              generalLimiter,   require('../../routes/webhookRoutes'));
+    app.use('/api/orders',               generalLimiter,   require('../../routes/orderTrackingRoutes')); // Phase 3: real-time order tracking
+    app.use('/api/wallet-pass',           generalLimiter,   require('../../routes/walletPassRoutes')); // Phase 3: Apple/Google Wallet passes
+    // Vault yield routes mounted on existing /api/vaults prefix
+    app.use('/api/vaults',                generalLimiter,   require('../../routes/vaultYieldRoutes')); // Phase 3: DeFi yield
 
     // ── Master Sprint ─────────────────────────────────────────────────────────
     app.use('/api/vaults',               financialLimiter, require('../../routes/vaultRoutes'));
