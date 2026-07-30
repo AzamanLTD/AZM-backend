@@ -712,7 +712,7 @@ exports.startConversation = async (req, res) => {
 // ── PATCH /api/friends/chat/messages/:messageId/link-preview ──────────────
 // Persists a link preview to a direct message (called by Flutter after async
 // OG metadata fetch). Non-critical — failures are logged, not 500'd.
-const updateLinkPreview = async (req, res) => {
+exports.updateLinkPreview = async (req, res) => {
     try {
         const { messageId } = req.params;
         const { linkPreview } = req.body;
