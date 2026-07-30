@@ -549,3 +549,161 @@ exports.reactToMessage = async (req, res) => {
         res.json({ success: true, reactions: updated.reactions });
     } catch (error) { res.status(500).json({ error: 'Server error' }); }
 };
+
+// =============================================================================
+// 9. GET CONVERSATIONS — List all friend conversations with last message + unread
+//
+// GET /api/friends/chat/conversations
+// =============================================================================
+exports.getConversations = async (req, res) => {
+    const prisma = req.app.get('prisma');
+    try {
+        const userId = req.user.id;
+
+        // Find all accepted friendships for this user
+        const friendships = await prisma.friendship.findMany({
+            where: {
+                status: 'ACCEPTED',
+                OR: [
+                    { requesterId: userId },
+                    { addresseeId: userId }
+                ]
+            },
+            select: {
+                id: true,
+                requesterId: true,
+                addresseeId: true,
+                updatedAt: true,
+                localNicknames: true,
+                requester: { select: { id: true, username: true, profilePictureUrl: true } },
+                addressee: { select: { id: true, username: true, profilePictureUrl: true } }
+            },
+            orderBy: { updatedAt: 'desc' }
+        });
+
+        if (!friendships.length) {
+            return res.status(200).json({ success: true, chats: [] });
+        }
+
+        // For each friendship, get the last message and unread count
+        const chatsWithMeta = await Promise.all(
+            friendships.map(async (f) => {
+                const otherUser = f.requesterId === userId ? f.addressee : f.requester;
+
+                // Get last message
+                const lastMsg = await prisma.directMessage.findFirst({
+                    where: { friendshipId: f.id, deletedAt: null },
+                    orderBy: { createdAt: 'desc' },
+                    select: {
+                        content: true,
+                        messageType: true,
+                        createdAt: true,
+                        senderId: true,
+                        mediaUrl: true
+                    }
+                });
+
+                // Get unread count
+                const unreadCount = await prisma.directMessage.count({
+                    where: {
+                        friendshipId: f.id,
+                        receiverId: userId,
+                        isRead: false,
+                        deletedAt: null
+                    }
+                });
+
+                // Resolve nickname if set
+                const nicknames = f.localNicknames || {};
+                const nickname = nicknames[String(userId)] || null;
+
+                return {
+                    id: f.id,
+                    contactId: String(otherUser.id),
+                    contactAzamanId: otherUser.username,
+                    contactName: nickname || otherUser.username,
+                    contactAvatar: otherUser.profilePictureUrl,
+                    lastMessage: lastMsg ? lastMsg.content : null,
+                    lastMessageType: lastMsg ? lastMsg.messageType : null,
+                    lastMessageTime: lastMsg ? lastMsg.createdAt : null,
+                    unreadCount
+                };
+            })
+        );
+
+        return res.status(200).json({ success: true, chats: chatsWithMeta });
+    } catch (error) {
+        logger.error({ err: error }, '[getConversations] error');
+        return res.status(500).json({ success: false, message: 'Failed to fetch conversations.' });
+    }
+};
+
+// =============================================================================
+// 10. START CONVERSATION — Find or start a conversation by Azaman ID (username)
+//
+// POST /api/friends/chat/start
+// Body: { azamanId } — the username of the user to chat with
+// =============================================================================
+exports.startConversation = async (req, res) => {
+    const prisma = req.app.get('prisma');
+    try {
+        const userId = req.user.id;
+        const { azamanId } = req.body;
+
+        if (!azamanId || typeof azamanId !== 'string' || azamanId.trim().length === 0) {
+            return res.status(400).json({ success: false, message: 'Azaman ID is required.' });
+        }
+
+        const trimmedId = azamanId.trim();
+
+        // Find the target user by username
+        const targetUser = await prisma.user.findUnique({
+            where: { username: trimmedId },
+            select: { id: true, username: true, profilePictureUrl: true }
+        });
+
+        if (!targetUser) {
+            return res.status(404).json({ success: false, message: 'User not found.' });
+        }
+
+        if (targetUser.id === userId) {
+            return res.status(400).json({ success: false, message: 'You cannot start a chat with yourself.' });
+        }
+
+        // Find an accepted friendship between the current user and the target user
+        const friendship = await prisma.friendship.findFirst({
+            where: {
+                status: 'ACCEPTED',
+                OR: [
+                    { requesterId: userId, addresseeId: targetUser.id },
+                    { requesterId: targetUser.id, addresseeId: userId }
+                ]
+            },
+            select: { id: true, localNicknames: true }
+        });
+
+        if (!friendship) {
+            return res.status(403).json({
+                success: false,
+                message: 'You can only chat with friends. Send a friend request first.',
+                userId: targetUser.id,
+                username: targetUser.username
+            });
+        }
+
+        // Resolve nickname if set
+        const nicknames = friendship.localNicknames || {};
+        const nickname = nicknames[String(userId)] || null;
+
+        return res.status(200).json({
+            success: true,
+            chatId: friendship.id,
+            contactId: String(targetUser.id),
+            contactName: nickname || targetUser.username,
+            contactAzamanId: targetUser.username
+        });
+    } catch (error) {
+        logger.error({ err: error }, '[startConversation] error');
+        return res.status(500).json({ success: false, message: 'Failed to start conversation.' });
+    }
+};

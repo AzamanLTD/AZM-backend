@@ -42,7 +42,14 @@ router.get('/', protect, friendController.getFriends);
 router.delete('/:id', protect, friendController.removeFriend);
 
 // =============================================================================
-// DIRECT MESSAGING
+// DIRECT MESSAGING — CONVERSATION LIST + START CHAT
+// (Phase 11.0 — canonical conversation endpoints for the Messages Hub)
+// =============================================================================
+router.get('/chat/conversations', protect, directMessageController.getConversations);
+router.post('/chat/start', protect, directMessageController.startConversation);
+
+// =============================================================================
+// DIRECT MESSAGING — MESSAGE CRUD
 // =============================================================================
 router.get('/chat/unread-count', protect, directMessageController.getUnreadCount);
 router.get('/chat/:friendshipId/messages', protect, directMessageController.getMessages);
@@ -73,19 +80,5 @@ router.get('/transfer/history/:friendshipId', protect, peerTransferController.ge
 router.get('/transfer/:id', protect, peerTransferController.getTransferDetails);
 router.put('/transfer/:id/fulfill', protect, peerTransferController.fulfillTransferRequest);
 router.put('/transfer/:id/decline', protect, peerTransferController.declineTransferRequest);
-
-
-// =============================================================================
-// CHAT PROFILE + VAULT (Phase UI-5, 2026-05-26)
-//
-// Powers the upgraded "Chat Profile Detail" screen reachable by tapping a
-// friend's avatar inside any chat surface. Identity tier + tabbed Media /
-// Docs & Links / Tickets / Receipts vault.
-// =============================================================================
-router.get('/:friendshipId/profile',     protect, chatProfileController.getProfile);
-router.patch('/:friendshipId/nickname',  protect, chatProfileController.setNickname);
-router.get('/:friendshipId/media',       protect, chatProfileController.getMedia);
-router.get('/:friendshipId/docs-links',  protect, chatProfileController.getDocsAndLinks);
-router.get('/:friendshipId/receipts',    protect, chatProfileController.getReceipts);
 
 module.exports = router;
