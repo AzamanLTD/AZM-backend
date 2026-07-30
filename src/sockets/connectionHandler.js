@@ -128,6 +128,32 @@ function setupSocketHandlers(io, deps) {
             } catch (err) { /* Silently reject invalid trade IDs */ }
         });
 
+        // Order tracking room — customer or business owner can join
+        socket.on('join_order', async (data) => {
+            const orderId = typeof data === 'object' ? data?.orderId : data;
+            if (!orderId) return;
+            try {
+                const order = await prisma.businessOrder.findUnique({
+                    where: { id: orderId.toString() },
+                    select: { customerId: true, businessProfileId: true }
+                });
+                if (order) {
+                    // Check if user is the customer or the business owner
+                    const bizProfile = await prisma.businessProfile.findUnique({
+                        where: { id: order.businessProfileId },
+                        select: { userId: true }
+                    });
+                    if (order.customerId === userId || bizProfile?.userId === userId) {
+                        socket.join(`order_${orderId}`);
+                    }
+                }
+            } catch (err) { /* Silently reject invalid order IDs */ }
+        });
+        socket.on('leave_order', (data) => {
+            const orderId = typeof data === 'object' ? data?.orderId : data;
+            if (orderId) socket.leave(`order_${orderId}`);
+        });
+
         // --- Socket Service Handlers ---
         tradeSocketService.registerHandlers(socket);
         chatSocketService.registerHandlers(socket);
