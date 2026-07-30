@@ -55,6 +55,7 @@ router.get('/chat/unread-count', protect, directMessageController.getUnreadCount
 router.get('/chat/:friendshipId/messages', protect, directMessageController.getMessages);
 router.post('/chat/:friendshipId/messages', protect, directMessageController.sendMessage);
 router.put('/chat/:friendshipId/read', protect, directMessageController.markAsRead);
+router.patch('/chat/messages/:messageId/link-preview', protect, directMessageController.updateLinkPreview);
 router.get('/chat/:friendshipId/info', protect, directMessageController.getConversationInfo);
 router.put('/chat/messages/:id/edit', protect, directMessageController.editMessage);
 router.delete('/chat/messages/:id', protect, directMessageController.deleteMessage);

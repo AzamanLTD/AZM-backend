@@ -707,3 +707,46 @@ exports.startConversation = async (req, res) => {
         return res.status(500).json({ success: false, message: 'Failed to start conversation.' });
     }
 };
+
+
+// ── PATCH /api/friends/chat/messages/:messageId/link-preview ──────────────
+// Persists a link preview to a direct message (called by Flutter after async
+// OG metadata fetch). Non-critical — failures are logged, not 500'd.
+const updateLinkPreview = async (req, res) => {
+    try {
+        const { messageId } = req.params;
+        const { linkPreview } = req.body;
+
+        if (!messageId) {
+            return res.status(400).json({ message: 'messageId is required' });
+        }
+        if (!linkPreview || typeof linkPreview !== 'object') {
+            return res.status(400).json({ message: 'linkPreview object is required' });
+        }
+
+        // Find the message and verify ownership
+        const message = await req.prisma.directMessage.findUnique({
+            where: { id: messageId },
+            select: { id: true, senderId: true },
+        });
+
+        if (!message) {
+            return res.status(404).json({ message: 'Message not found' });
+        }
+
+        // Only the sender can update the link preview
+        if (message.senderId !== req.user.id) {
+            return res.status(403).json({ message: 'Not authorized to update this message' });
+        }
+
+        await req.prisma.directMessage.update({
+            where: { id: messageId },
+            data: { linkPreview },
+        });
+
+        return res.json({ message: 'Link preview updated', linkPreview });
+    } catch (err) {
+        logger.error('updateLinkPreview error:', err.message);
+        return res.status(500).json({ message: 'Failed to update link preview' });
+    }
+};
