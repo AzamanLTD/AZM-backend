@@ -39,6 +39,6 @@ services:
         value: production
       # CORS allow-list — update when new frontend origins are added
       - key: CORS_ORIGINS
-        value: "https://azaman-admin-portal.onrender.com,https://azaman-business-portal.onrender.com,https://azaman.me,https://www.azaman.me"
+        value: "https://azm-admin-portal.vercel.app,https://azm-business-portal.vercel.app,https://azaman.me,https://www.azaman.me"
       # DATABASE_URL and all secrets remain managed in the Render dashboard /
       # environment group — they are intentionally NOT committed here.
