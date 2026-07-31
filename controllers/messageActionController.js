@@ -13,6 +13,8 @@
 
 // Prisma is accessed via req.app.get('prisma') — injected in each handler
 
+const logger = require('../src/config/logger');
+
 // ── Helpers ────────────────────────────────────────────────────────────────
 
 /**
@@ -175,7 +177,7 @@ exports.searchMessages = async (req, res) => {
         // Limit total results
         return res.json({ success: true, data: results.slice(0, 100) });
     } catch (err) {
-        console.error('[messageActionController.searchMessages]', err);
+        logger.error({ err }, '[messageActionController] searchMessages failed');
         return res.status(500).json({ success: false, message: 'Search failed' });
     }
 };
@@ -223,7 +225,7 @@ exports.togglePin = async (req, res) => {
             data: { id: updated.id, isPinned: updated.isPinned, pinnedAt: updated.pinnedAt },
         });
     } catch (err) {
-        console.error('[messageActionController.togglePin]', err);
+        logger.error({ err }, '[messageActionController] togglePin failed');
         return res.status(500).json({ success: false, message: 'Failed to toggle pin' });
     }
 };
@@ -268,7 +270,7 @@ exports.toggleStar = async (req, res) => {
             data: { id: updated.id, isStarred: updated.isStarred },
         });
     } catch (err) {
-        console.error('[messageActionController.toggleStar]', err);
+        logger.error({ err }, '[messageActionController] toggleStar failed');
         return res.status(500).json({ success: false, message: 'Failed to toggle star' });
     }
 };
@@ -362,7 +364,7 @@ exports.getStarredMessages = async (req, res) => {
 
         return res.json({ success: true, data: results });
     } catch (err) {
-        console.error('[messageActionController.getStarredMessages]', err);
+        logger.error({ err }, '[messageActionController] getStarredMessages failed');
         return res.status(500).json({ success: false, message: 'Failed to get starred messages' });
     }
 };
@@ -529,7 +531,7 @@ exports.forwardMessage = async (req, res) => {
 
         return res.json({ success: true, data: forwardedMessage });
     } catch (err) {
-        console.error('[messageActionController.forwardMessage]', err);
+        logger.error({ err }, '[messageActionController] forwardMessage failed');
         return res.status(500).json({ success: false, message: 'Failed to forward message' });
     }
 };

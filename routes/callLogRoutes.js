@@ -12,6 +12,8 @@
 const express = require('express');
 const router = express.Router();
 const { protect } = require('../middleware/authMiddleware');
+const logger = require('../src/config/logger');
+
 
 // GET /api/calls — list call history (paginated)
 router.get('/', protect, async (req, res) => {
@@ -52,7 +54,7 @@ router.get('/', protect, async (req, res) => {
       pagination: { total, limit, offset },
     });
   } catch (err) {
-    console.error('[CallLog] List error:', err);
+    logger.error({ err }, '[CallLog] list failed');
     res.status(500).json({ success: false, message: 'Failed to fetch call history' });
   }
 });
@@ -84,7 +86,7 @@ router.get('/:id', protect, async (req, res) => {
 
     res.json({ success: true, data: call });
   } catch (err) {
-    console.error('[CallLog] Get error:', err);
+    logger.error({ err }, '[CallLog] get failed');
     res.status(500).json({ success: false, message: 'Failed to fetch call' });
   }
 });
@@ -117,7 +119,7 @@ router.get('/stats/summary', protect, async (req, res) => {
       },
     });
   } catch (err) {
-    console.error('[CallLog] Stats error:', err);
+    logger.error({ err }, '[CallLog] stats failed');
     res.status(500).json({ success: false, message: 'Failed to fetch call stats' });
   }
 });
