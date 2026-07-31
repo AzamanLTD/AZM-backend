@@ -87,7 +87,7 @@ Then verify:
 node -e "const {PrismaClient}=require('@prisma/client');const p=new PrismaClient();p.user.findUnique({where:{username:'azaman-treasury'},select:{id:true,role:true}}).then(r=>{console.log(r);process.exit(0)})"
 
 # Active liability contract exists
-curl -s https://azaman-backend-9d3u.onrender.com/api/liability-contract/active | head -c 200
+curl -s https://azm-backend.onrender.com/api/liability-contract/active | head -c 200
 ```
 
 A `200` with a contract body on the second command confirms the overlay is
@@ -99,7 +99,7 @@ Run the Phase-2 API checks against the live host (read-mostly; uses fresh
 fixture accounts):
 
 ```bash
-node test_phase2_apis.js https://azaman-backend-9d3u.onrender.com
+node test_phase2_apis.js https://azm-backend.onrender.com
 ```
 
 ## Rollback

@@ -12,7 +12,7 @@
 const axios = require('axios');
 const { io } = require('socket.io-client');
 
-const BASE = 'https://azaman-backend-9d3u.onrender.com';
+const BASE = 'https://azm-backend.onrender.com';
 const API = `${BASE}/api`;
 
 const log = (icon, ...args) => console.log(icon, ...args);
