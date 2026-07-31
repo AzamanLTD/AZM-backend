@@ -2981,6 +2981,7 @@ model BusinessProduct {
   kitchenOrderItems KitchenOrderItem[]
   recipeIngredients RecipeIngredient[]
   orders            BusinessOrder[]
+  orderItems        BusinessOrderItem[]
   supplier          Supplier?          @relation("SupplierProducts", fields: [supplierId], references: [id])
 
   createdAt      DateTime        @default(now())
@@ -3125,6 +3126,7 @@ model BusinessOrder {
   escrow          SmartEscrow?     @relation(fields: [escrowId], references: [id])
   ticket          Ticket?          @relation(fields: [ticketId], references: [id])
   review          BusinessReview? // Discovery Sprint: one optional review per order
+  items           BusinessOrderItem[]
   kitchenOrder    KitchenOrder?
   orderTracking   OrderTracking?
 
@@ -3141,6 +3143,33 @@ model BusinessOrder {
   @@index([customerId, status, createdAt(sort: Desc)])
   @@index([customerId, createdAt(sort: Desc)])
 }
+
+// =============================================================================
+// BusinessOrderItem — line items for multi-item cart checkout (Phase C)
+// One BusinessOrder can have many BusinessOrderItems. For backwards compat,
+// orders placed via the legacy single-item endpoint keep productId on the
+// BusinessOrder itself and have zero BusinessOrderItem rows.
+// =============================================================================
+model BusinessOrderItem {
+  id          String   @id @default(uuid())
+  orderId     String
+  productId   String
+  name        String   @db.VarChar(200)
+  unitPrice   Decimal  @db.Decimal(20, 8)
+  quantity    Int      @default(1)
+  notes       String?  @db.VarChar(500)
+  lineTotal   Decimal  @db.Decimal(20, 8)
+
+  order   BusinessOrder   @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  product BusinessProduct @relation(fields: [productId], references: [id])
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([orderId])
+  @@index([productId])
+}
+
 
 // =============================================================================
 // BUSINESS VERIFICATION DOCUMENT (2026-06-16)

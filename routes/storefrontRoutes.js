@@ -406,6 +406,173 @@ router.post('/me/media', protect, protectActive, requirePermission('storefront.m
   res.json({ success: true, data: { url: result.url, publicId: result.publicId } });
 }));
 
+// POST /api/storefront/:businessProfileId/checkout — multi-item cart checkout (Phase C)
+// Accepts an array of items [{ productId, quantity, notes }] and creates a single
+// BusinessOrder with multiple BusinessOrderItem rows. Falls back to single-item
+// behavior if only one item is provided.
+router.post('/:businessProfileId/checkout', protect, protectActive, wrap(async (req, res) => {
+  const prisma = req.app.get('prisma');
+  const { businessProfileId } = req.params;
+  const userId = req.user.id;
+  const { items, customerNotes, deliveryNotes, idempotencyKey } = req.body;
+
+  // ── Validation ──────────────────────────────────────────────────────────────
+  if (!items || !Array.isArray(items) || items.length === 0) {
+    return res.status(400).json({ success: false, message: 'items array is required and must not be empty.' });
+  }
+  if (items.length > 50) {
+    return res.status(400).json({ success: false, message: 'Maximum 50 items per order.' });
+  }
+
+  // Idempotency check
+  if (idempotencyKey) {
+    const existing = await prisma.businessOrder.findUnique({
+      where: { idempotencyKey },
+      select: { id: true, orderRef: true, status: true },
+    });
+    if (existing) {
+      return res.status(200).json({ success: true, data: { order: existing, idempotent: true } });
+    }
+  }
+
+  // Verify business exists and is active
+  const business = await prisma.businessProfile.findUnique({
+    where: { id: businessProfileId },
+    select: { id: true, businessName: true, isSuspended: true, isPausedByOwner: true },
+  });
+  if (!business || business.isSuspended) {
+    return res.status(404).json({ success: false, message: 'Business not available.' });
+  }
+  if (business.isPausedByOwner) {
+    return res.status(400).json({ success: false, message: 'This business is currently not accepting orders.' });
+  }
+
+  // Fetch all products in one query
+  const productIds = items.map(i => i.productId).filter(Boolean);
+  if (productIds.length !== items.length) {
+    return res.status(400).json({ success: false, message: 'All items must have a productId.' });
+  }
+
+  const products = await prisma.businessProduct.findMany({
+    where: { id: { in: productIds }, businessProfileId, isActive: true, isAvailable: true },
+    select: { id: true, name: true, priceUsdc: true },
+  });
+
+  const productMap = new Map(products.map(p => [p.id, p]));
+  for (const item of items) {
+    if (!productMap.has(item.productId)) {
+      return res.status(404).json({ success: false, message: `Product ${item.productId} not available.` });
+    }
+  }
+
+  // Calculate totals and build order items
+  let totalAmount = 0;
+  const orderItemsData = items.map(item => {
+    const product = productMap.get(item.productId);
+    const qty = Math.max(1, parseInt(item.quantity, 10) || 1);
+    const unitPrice = parseFloat(product.priceUsdc);
+    const lineTotal = unitPrice * qty;
+    totalAmount += lineTotal;
+
+    return {
+      productId: item.productId,
+      name: product.name,
+      unitPrice: unitPrice,
+      quantity: qty,
+      notes: item.notes ? String(item.notes).slice(0, 500) : null,
+      lineTotal: lineTotal,
+    };
+  });
+
+  // Build order title (summary of items)
+  const itemSummary = orderItemsData.length === 1
+    ? `${orderItemsData[0].name}${orderItemsData[0].quantity > 1 ? ' x' + orderItemsData[0].quantity : ''}`
+    : `${orderItemsData.length} items`;
+  const orderTitle = itemSummary;
+
+  // Create the order with items in a transaction
+  const { v4: uuidv4 } = require('uuid');
+  const orderRef = `ORD-${Date.now().toString(36).toUpperCase()}-${uuidv4().slice(0, 6).toUpperCase()}`;
+
+  const result = await prisma.$transaction(async (tx) => {
+    const order = await tx.businessOrder.create({
+      data: {
+        businessProfileId,
+        customerId: userId,
+        status: 'AWAITING_PAYMENT',
+        orderRef,
+        title: orderTitle,
+        description: `Multi-item storefront order: ${orderItemsData.map(i => i.name + ' x' + i.quantity).join(', ')}`,
+        amountUsdc: totalAmount,
+        customerNotes: customerNotes ? String(customerNotes).slice(0, 500) : null,
+        deliveryNotes: deliveryNotes ? String(deliveryNotes).slice(0, 500) : null,
+        idempotencyKey: idempotencyKey || null,
+        items: {
+          create: orderItemsData,
+        },
+      },
+      include: { items: true },
+    });
+
+    // Update product order counts
+    for (const item of orderItemsData) {
+      await tx.businessProduct.update({
+        where: { id: item.productId },
+        data: {
+          totalOrders: { increment: item.quantity },
+          totalRevenue: { increment: item.lineTotal },
+        },
+      });
+    }
+
+    return order;
+  });
+
+  // Track order event
+  try {
+    await prisma.storefrontAnalyticsEvent.create({
+      data: {
+        businessProfileId,
+        eventType: 'order_placed',
+        visitorId: `user_${userId}`,
+        metadata: { orderId: result.id, orderRef, itemCount: items.length, amount: totalAmount, source: 'cart_checkout' },
+      },
+    });
+  } catch (_) { /* analytics is best-effort */ }
+
+  // Create a BusinessNotification so the owner sees the new storefront order
+  try {
+    const customer = await prisma.user.findUnique({
+      where: { id: userId },
+      select: { displayName: true, walletAddress: true },
+    });
+    await prisma.businessNotification.create({
+      data: {
+        businessProfileId,
+        type: 'NEW_ORDER',
+        title: `New Storefront Order — ${orderRef}`,
+        body: `${customer?.displayName || 'A customer'} ordered ${itemSummary} (${totalAmount.toFixed(2)} USDC). Status: Awaiting Payment.`,
+        metadata: { orderId: result.id, orderRef, amount: totalAmount, itemCount: items.length, source: 'cart_checkout' },
+      },
+    });
+  } catch (_) { /* notification is best-effort */ }
+
+  // Emit real-time event to the business
+  try {
+    const io = req.app.get('socketio');
+    if (io) {
+      io.to(`business:${businessProfileId}`).emit('storefront:order:new', {
+        orderId: result.id,
+        orderRef,
+        amount: totalAmount,
+        itemCount: items.length,
+      });
+    }
+  } catch (_) { /* socket is best-effort */ }
+
+  res.status(201).json({ success: true, data: { order: result } });
+}));
+
 // POST /api/storefront/:businessProfileId/order — customer places an order from the storefront
 // Requires authentication. Creates a BusinessOrder with status AWAITING_PAYMENT.
 router.post('/:businessProfileId/order', protect, protectActive, wrap(async (req, res) => {
