@@ -8,6 +8,7 @@
 // =============================================================================
 
 const logger = require('../src/config/logger');
+const { downloadInvoicePdf } = require('../controllers/invoiceController');
 const express = require('express');
 const router = express.Router();
 
@@ -2263,6 +2264,9 @@ router.post('/invoices/:id/disable-recurring', wrap(async (req, res) => {
     });
     res.json({ success: true, invoice });
 }));
+
+// GET /api/business-os/invoices/:id/pdf — download invoice as PDF (Phase G.4)
+router.get('/invoices/:id/pdf', downloadInvoicePdf);
 
 // POST /api/business-os/invoices/process-recurring — auto-generate due recurring invoices
 router.post('/invoices/process-recurring', wrap(async (req, res) => {
