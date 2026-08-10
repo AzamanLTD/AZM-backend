@@ -296,3 +296,68 @@ router.post('/evidence/encrypt', protect, async (req, res) => {
 });
 
 module.exports = router;
+
+// ── Simple key registration (for native clients with Android Keystore) ────────
+// The native app generates ECDH keys in Android Keystore and registers
+// the public key here. Other users can then fetch it for encryption.
+router.post('/keys/register', protect, async (req, res) => {
+    try {
+        const userId = req.user.id;
+        const { publicKey, fingerprint } = req.body;
+
+        if (!publicKey || typeof publicKey !== 'string') {
+            return res.status(400).json({ success: false, message: 'publicKey is required.' });
+        }
+
+        // Store/update the public key in the preKey bundle (identityPublicKey field)
+        const bundle = await prisma().e2eePreKeyBundle.upsert({
+            where: { userId },
+            create: {
+                userId,
+                identityPublicKey: publicKey,
+                identityPrivateKey: 'client_managed',
+                signedPreKeyId: 0,
+                signedPreKeyPublicKey: publicKey,
+                signedPreKeyPrivateKey: 'client_managed',
+                signedPreKeySignature: fingerprint || '',
+            },
+            update: {
+                identityPublicKey: publicKey,
+                signedPreKeyPublicKey: publicKey,
+                signedPreKeySignature: fingerprint || '',
+            },
+        });
+
+        return res.json({
+            success: true,
+            message: 'Public key registered.',
+            data: { fingerprint: fingerprint || bundle.signedPreKeySignature }
+        });
+    } catch (err) {
+        logger.error({ err: err.message }, '[e2ee] Register key failed');
+        return res.status(500).json({ success: false, message: 'Failed to register key.' });
+    }
+});
+
+// ── Get a user's public key (simple ECDH model) ──────────────────────────────
+router.get('/keys/public/:userId', protect, async (req, res) => {
+    try {
+        const targetUserId = parseInt(req.params.userId);
+        const bundle = await prisma().e2eePreKeyBundle.findUnique({
+            where: { userId: targetUserId },
+        });
+        if (!bundle) {
+            return res.status(404).json({ success: false, message: 'No public key found for this user.' });
+        }
+        return res.json({
+            success: true,
+            data: {
+                publicKey: bundle.identityPublicKey,
+                fingerprint: bundle.signedPreKeySignature || null,
+            }
+        });
+    } catch (err) {
+        logger.error({ err: err.message }, '[e2ee] Get public key failed');
+        return res.status(500).json({ success: false, message: 'Failed to fetch public key.' });
+    }
+});
