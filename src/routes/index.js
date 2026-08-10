@@ -102,6 +102,7 @@ function mountRoutes(app, {
     app.use('/api/vaults',               financialLimiter, require('../../routes/vaultRoutes'));
     app.use('/api/shared-vaults',            financialLimiter, require('../../routes/sharedVaultRoutes'));
     app.use('/api/group-chats',          generalLimiter,   require('../../routes/groupChatRoutes'));
+    app.use('/api/conversations',        generalLimiter,   require('../../routes/conversationRoutes'));
     app.use('/api/susu',                 financialLimiter, require('../../routes/susuRoutes'));
     app.use('/api/credit-score',        generalLimiter,   require('../../routes/creditScoreRoutes')); // Phase 5: Credit scoring
     app.use('/api/azm-gifts',            generalLimiter,   require('../../routes/azmGiftRoutes')); // Phase 5: AZM gifting
