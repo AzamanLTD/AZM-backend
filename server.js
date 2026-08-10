@@ -298,6 +298,20 @@ setupSocketHandlers(io, {
     emitBalanceUpdate,
 });
 
+// ── Raw WebSocket Bridge for native clients (Android/KMP) ────────────────
+// Sits alongside Socket.IO and provides a /ws endpoint that native clients
+// can connect to using Ktor's WebSocket client. Translates between the
+// Android client's kebab-case event format and the existing Socket.IO services.
+const { createWsBridge } = require('./src/sockets/wsBridge');
+const wsBridge = createWsBridge(server, {
+    prisma,
+    JWT_SECRET,
+    io,
+    chatSocketService,
+    groupChatSocketService,
+});
+app.set('wsBridge', wsBridge);
+
 // ══════════════════════════════════════════════════════════════════════════════
 // ERROR HANDLING (extracted to src/middleware/errorHandler.js)
 // ══════════════════════════════════════════════════════════════════════════════
