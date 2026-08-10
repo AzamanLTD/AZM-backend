@@ -14,7 +14,7 @@ const reviewSvc  = require('../services/businessReviewService');
 const emailSvc   = require('../services/emailService');
 
 const _ownedProfile = async (prisma, userId) => {
-  const p = await prisma.businessProfile.findUnique({ where: { userId } });
+  const p = await prisma.businessProfile.findFirst({ where: { userId } });
   if (!p) throw Object.assign(new Error('No business profile found.'), { status: 404 });
   if (p.isSuspended) {
     throw Object.assign(

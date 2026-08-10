@@ -16,7 +16,7 @@ async function _resolveTargetProfile(prisma, req) {
     if (req.user.role === 'ADMIN' && req.body.businessProfileId) {
         return prisma.businessProfile.findUnique({ where: { id: req.body.businessProfileId } });
     }
-    return prisma.businessProfile.findUnique({ where: { userId: req.user.id } });
+    return prisma.businessProfile.findFirst({ where: { userId: req.user.id } });
 }
 
 exports.createSection = async (req, res) => {
@@ -52,7 +52,7 @@ exports.createSection = async (req, res) => {
 exports.listMySections = async (req, res) => {
     const prisma = req.app.get('prisma');
     try {
-        const profile = await prisma.businessProfile.findUnique({ where: { userId: req.user.id } });
+        const profile = await prisma.businessProfile.findFirst({ where: { userId: req.user.id } });
         if (!profile) return res.status(404).json({ success: false, message: 'Business profile not found.' });
 
         const sections = await prisma.catalogSection.findMany({
@@ -76,7 +76,7 @@ exports.listMySections = async (req, res) => {
 exports.updateSection = async (req, res) => {
     const prisma = req.app.get('prisma');
     try {
-        const profile = await prisma.businessProfile.findUnique({ where: { userId: req.user.id } });
+        const profile = await prisma.businessProfile.findFirst({ where: { userId: req.user.id } });
         if (!profile) return res.status(404).json({ success: false, message: 'Business profile not found.' });
 
         const { sectionId } = req.params;
@@ -103,7 +103,7 @@ exports.updateSection = async (req, res) => {
 exports.deleteSection = async (req, res) => {
     const prisma = req.app.get('prisma');
     try {
-        const profile = await prisma.businessProfile.findUnique({ where: { userId: req.user.id } });
+        const profile = await prisma.businessProfile.findFirst({ where: { userId: req.user.id } });
         if (!profile) return res.status(404).json({ success: false, message: 'Business profile not found.' });
 
         const { sectionId } = req.params;

@@ -151,7 +151,7 @@ const searchByAzamanId = async (prisma, { azamanId, businessUserId }) => {
     if (!azamanId) throw new Error('azamanId is required.');
     if (!businessUserId) throw new Error('businessUserId is required.');
 
-    const profile = await prisma.businessProfile.findUnique({ where: { userId: businessUserId } });
+    const profile = await prisma.businessProfile.findFirst({ where: { userId: businessUserId } });
     if (!profile) throw new Error('Business profile not found.');
 
     const customer = await prisma.user.findFirst({

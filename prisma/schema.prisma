@@ -820,7 +820,7 @@ model User {
   sentTicketMessages TicketMessage[] @relation("TicketMessageSender")
 
   // Smart Escrow & Business Accounts (2026-06-14)
-  businessProfile      BusinessProfile?
+  businessProfiles      BusinessProfile[]
   escrowsAsPayer       SmartEscrow[]                  @relation("EscrowPayer")
   escrowsAsPayee       SmartEscrow[]                  @relation("EscrowPayee")
   disputesRaised       EscrowDispute[]                @relation("DisputeRaisedBy")
@@ -2489,7 +2489,7 @@ model BusinessSubcategory {
 
 model BusinessProfile {
   id              String           @id @default(uuid())
-  userId          Int              @unique
+  userId          Int
   bizId           String           @unique // BIZ-XXXXXXXXX (9 digits after prefix)
   moolrePaymentId String?          @unique // *203*<id># USSD payment ID for businesses (Moolre on-ramp, 2026-06-23)
   // Marketplace hierarchy additions (2026-06-24)

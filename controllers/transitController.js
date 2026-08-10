@@ -115,7 +115,7 @@ exports.listBookings = async (req, res) => {
 
         const where = {};
         if (role === 'business') {
-            const profile = await prisma.businessProfile.findUnique({ where: { userId }, select: { id: true } });
+            const profile = await prisma.businessProfile.findFirst({ where: { userId }, select: { id: true } });
             if (profile) where.businessProfileId = profile.id;
             else return res.status(200).json({ success: true, bookings: [], hasMore: false });
         } else {

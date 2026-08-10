@@ -1,0 +1,156 @@
+generator client {
+  provider = "prisma-client-js"
+  output   = "../node_modules/@prisma/test-client"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id              String   @id @default(uuid())
+  email           String   @unique
+  username        String   @unique
+  password        String
+  phoneNumber     String?
+  role            String   @default("user")
+  banStatus       String   @default("active")
+  tokenVersion    Int      @default(0)
+  isVerified      Boolean  @default(false)
+  azamanId        String?  @unique
+  availableBalance Float  @default(0.0)
+  escrowLockedBalance Float @default(0.0)
+  azmBalance      Float    @default(0.0)
+  fcmToken        String?
+  lastLoginAt     DateTime?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  
+  conversations   Conversation[] @relation("ConversationParticipants")
+  messages        Message[]
+  refreshTokens   RefreshToken[]
+  e2eeBundle      E2eePreKeyBundle?
+  e2eeOneTimePreKeys E2eeOneTimePreKey[]
+  e2eeSessions    E2eeSession[] @relation("E2eeSessionUser")
+  e2eeSessionsPeer E2eeSession[] @relation("E2eeSessionPeer")
+  sentEscrows     Escrow[]  @relation("EscrowBuyer")
+  receivedEscrows Escrow[]  @relation("EscrowVendor")
+}
+
+model RefreshToken {
+  id        String   @id @default(uuid())
+  token     String   @unique
+  userId    String
+  user      User     @relation(fields: [userId], references: [id])
+  createdAt DateTime @default(now())
+  expiresAt DateTime
+}
+
+model Conversation {
+  id        String   @id @default(uuid())
+  type      String   @default("personal")
+  tradeId   String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  
+  participants  User[]    @relation("ConversationParticipants")
+  messages      Message[]
+}
+
+model Message {
+  id              String   @id @default(uuid())
+  conversationId  String
+  senderId        String?
+  content         String?
+  messageType     String   @default("TEXT")
+  status          String   @default("sent")
+  moneyAmount     Float?
+  moneyDirection  String?
+  moneyStatus     String?
+  escrowTicket    Json?
+  createdAt       DateTime @default(now())
+  
+  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  sender       User?        @relation(fields: [senderId], references: [id], onDelete: SetNull)
+}
+
+model E2eePreKeyBundle {
+  userId              String   @id
+  identityPublicKey    String
+  identityPrivateKey   String
+  signedPreKeyId      Int
+  signedPreKeyPublicKey  String
+  signedPreKeyPrivateKey String
+  signedPreKeySignature  String
+  activeRootKey       String?
+  activeChainKey      String?
+  messageNumber       Int      @default(0)
+  
+  user User @relation(fields: [userId], references: [id])
+}
+
+model E2eeOneTimePreKey {
+  id        String   @id @default(uuid())
+  userId    String
+  keyId     Int
+  publicKey String
+  privateKey String
+  consumed  Boolean  @default(false)
+  createdAt DateTime @default(now())
+  
+  user User @relation(fields: [userId], references: [id])
+}
+
+model E2eeSession {
+  id          String   @id @default(uuid())
+  userId      String
+  peerId      String
+  rootKey     String
+  chainKey    String
+  messageNumber Int    @default(0)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+  
+  user User @relation("E2eeSessionUser", fields: [userId], references: [id])
+  peer User @relation("E2eeSessionPeer", fields: [peerId], references: [id])
+}
+
+model Escrow {
+  id              String   @id @default(uuid())
+  tradeId         String?
+  buyerId         String
+  vendorId        String
+  amount          Float
+  status          String   @default("PENDING")
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+  
+  buyer  User @relation("EscrowBuyer", fields: [buyerId], references: [id])
+  vendor User @relation("EscrowVendor", fields: [vendorId], references: [id])
+  disputes EscrowDispute[]
+}
+
+model EscrowDispute {
+  id        String   @id @default(uuid())
+  escrowId  String
+  reason    String
+  status    String   @default("OPEN")
+  createdAt DateTime @default(now())
+  
+  escrow Escrow @relation(fields: [escrowId], references: [id])
+}
+
+model GlobalSettings {
+  id                    Int     @id @default(1)
+  fiatWithdrawalFeePct  Float   @default(0.02)
+  cryptoPlatformFeePct  Float   @default(0.0)
+  cryptoWithdrawalFeePct Float  @default(0.01)
+  p2pFeePct             Float   @default(0.02)
+  tierThreshold         Float   @default(1000)
+  vendorShareUnder1k    Float   @default(0.40)
+  vendorShareOver1k     Float   @default(0.50)
+  bankMargin            Float   @default(0.03)
+  thirdPartyMargin      Float   @default(0.02)
+  susuProfitPct         Float   @default(0.03)
+}

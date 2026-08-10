@@ -171,7 +171,7 @@ exports.listBusinessReservations = async (req, res) => {
         const { status, limit, cursor } = req.query;
         const take = Math.min(parseInt(limit, 10) || 20, 50);
 
-        const profile = await prisma.businessProfile.findUnique({ where: { userId } });
+        const profile = await prisma.businessProfile.findFirst({ where: { userId } });
         if (!profile) return res.status(404).json({ success: false, message: 'Business profile not found.' });
 
         const where = { businessProfileId: profile.id };
@@ -203,7 +203,7 @@ exports.confirmReservation = async (req, res) => {
     const prisma = req.app.get('prisma');
     try {
         const userId  = req.user.id;
-        const profile = await prisma.businessProfile.findUnique({ where: { userId } });
+        const profile = await prisma.businessProfile.findFirst({ where: { userId } });
         if (!profile) return res.status(404).json({ success: false, message: 'Business profile not found.' });
 
         const { reservationId } = req.params;
@@ -238,7 +238,7 @@ exports.checkInReservation = async (req, res) => {
     const prisma = req.app.get('prisma');
     try {
         const userId  = req.user.id;
-        const profile = await prisma.businessProfile.findUnique({ where: { userId } });
+        const profile = await prisma.businessProfile.findFirst({ where: { userId } });
         if (!profile) return res.status(403).json({ success: false, message: 'Business profile required.' });
 
         const { reservationId } = req.params;
@@ -265,7 +265,7 @@ exports.markNoShowReservation = async (req, res) => {
     const prisma = req.app.get('prisma');
     try {
         const userId  = req.user.id;
-        const profile = await prisma.businessProfile.findUnique({ where: { userId } });
+        const profile = await prisma.businessProfile.findFirst({ where: { userId } });
         if (!profile) return res.status(403).json({ success: false, message: 'Business profile required.' });
 
         const { reservationId } = req.params;
@@ -289,7 +289,7 @@ exports.checkOutReservation = async (req, res) => {
     const prisma = req.app.get('prisma');
     try {
         const userId  = req.user.id;
-        const profile = await prisma.businessProfile.findUnique({ where: { userId } });
+        const profile = await prisma.businessProfile.findFirst({ where: { userId } });
         if (!profile) return res.status(403).json({ success: false, message: 'Business profile required.' });
 
         const { reservationId } = req.params;
@@ -323,7 +323,7 @@ exports.getReservation = async (req, res) => {
             },
         });
         if (!r) return res.status(404).json({ success: false, message: 'Reservation not found.' });
-        const profile = await prisma.businessProfile.findUnique({ where: { userId }, select: { id: true } });
+        const profile = await prisma.businessProfile.findFirst({ where: { userId }, select: { id: true } });
         const isOwner = profile?.id === r.businessProfileId;
         if (r.customerId !== userId && !isOwner)
             return res.status(403).json({ success: false, message: 'Forbidden.' });

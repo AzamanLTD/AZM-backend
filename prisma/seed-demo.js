@@ -55,12 +55,12 @@ async function main() {
     // ── 1. Demo business owner ──────────────────────────────────────────
     const owner = await prisma.user.upsert({
         where: { email: 'demo-owner@azm.azm' },
-        update: { password: hashedPassword, role: 'BUSINESS' },
+        update: { password: hashedPassword, role: 'VENDOR' },
         create: {
             username: 'DemoOwner',
             email: 'demo-owner@azm.azm',
             password: hashedPassword,
-            role: 'BUSINESS',
+            role: 'VENDOR',
             availableBalance: 15000.0,
             phoneHash: 'demo-owner-hash',
         },
@@ -324,8 +324,8 @@ async function main() {
                 sentAt: new Date(),
                 lineItems: {
                     create: [
-                        { name: products[i].name, quantity: 1 + i, unitPriceUsdc: products[i].priceUsdc, totalUsdc: (1 + i) * products[i].priceUsdc },
-                        { name: products[(i + 1) % products.length].name, quantity: 1, unitPriceUsdc: products[(i + 1) % products.length].priceUsdc, totalUsdc: products[(i + 1) % products.length].priceUsdc },
+                        { description: products[i].name, quantity: 1 + i, unitPrice: products[i].priceUsdc, lineTotal: (1 + i) * products[i].priceUsdc },
+                        { description: products[(i + 1) % products.length].name, quantity: 1, unitPrice: products[(i + 1) % products.length].priceUsdc, lineTotal: products[(i + 1) % products.length].priceUsdc },
                     ],
                 },
             },
