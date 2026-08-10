@@ -156,6 +156,7 @@ function makeFakeBusinessPrisma(initialProfile) {
     return {
         businessProfile: {
             findUnique: async () => ({ ...profile }),
+            findFirst: async () => ({ ...profile }),
             update: async ({ data }) => {
                 profile = { ...profile, ...data };
                 return { ...profile };

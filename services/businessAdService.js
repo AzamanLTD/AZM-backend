@@ -35,7 +35,7 @@ exports.createAdPost = async (prisma, { businessProfileId, userId, templateType,
 };
 
 exports.removeAdPost = async (prisma, { adPostId, userId }) => {
-    const business = await prisma.businessProfile.findUnique({
+    const business = await prisma.businessProfile.findFirst({
         where: { userId },
         select: { id: true },
     });

@@ -38,8 +38,23 @@ pool.on('error', (err) => {
     logger.error({ err }, 'Unexpected error on idle client');
 });
 
-const adapter = new PrismaPg(pool);
-const prisma = new PrismaClient({ adapter });
+// NOTE: @prisma/adapter-pg v7.x requires @prisma/client v7.x. If versions
+// mismatch, fall back to plain PrismaClient (which handles its own pooling).
+let prisma;
+try {
+    const adapterVersion = require('@prisma/adapter-pg/package.json').version;
+    const clientVersion = require('@prisma/client/package.json').version;
+    if (adapterVersion.split('.')[0] !== clientVersion.split('.')[0]) {
+        logger.warn({ adapterVersion, clientVersion }, 'Prisma adapter-pg major version mismatch — using plain PrismaClient');
+        prisma = new PrismaClient();
+    } else {
+        const adapter = new PrismaPg(pool);
+        prisma = new PrismaClient({ adapter });
+    }
+} catch (e) {
+    logger.warn({ err: e }, 'Prisma adapter-pg init failed — using plain PrismaClient');
+    prisma = new PrismaClient();
+}
 
 // Test database connection on startup
 (async () => {

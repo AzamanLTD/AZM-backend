@@ -53,8 +53,21 @@ function initReadReplica() {
             logger.error({ err }, '[ReadReplica] Pool error');
         });
 
-        const adapter = new PrismaPg(pool);
-        _readPrisma = new PrismaClient({ adapter });
+        // Guard against adapter-pg major version mismatch (v7 adapter with v6 client)
+        let adapterOk = false;
+        try {
+            const av = require('@prisma/adapter-pg/package.json').version;
+            const cv = require('@prisma/client/package.json').version;
+            adapterOk = av.split('.')[0] === cv.split('.')[0];
+        } catch (_) { adapterOk = false; }
+
+        if (adapterOk) {
+            const adapter = new PrismaPg(pool);
+            _readPrisma = new PrismaClient({ adapter });
+        } else {
+            logger.warn('[ReadReplica] Adapter version mismatch — using plain PrismaClient for replica');
+            _readPrisma = new PrismaClient({ datasources: { db: { url: process.env.DATABASE_REPLICA_URL } } });
+        }
 
         // Test connection
         _readPrisma.$connect()
