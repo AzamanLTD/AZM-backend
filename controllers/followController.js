@@ -58,7 +58,7 @@ exports.myFollowing = async (req, res) => {
 
 exports.myFollowers = async (req, res) => {
     try {
-        const business = await req.prisma.businessProfile.findUnique({
+        const business = await req.prisma.businessProfile.findFirst({
             where: { userId: req.user.id },
             select: { id: true }
         });

@@ -47,7 +47,7 @@ async function getBusinessProfileId(req) {
     if (req.businessProfileId) return req.businessProfileId;
     // Normal flow: look up the user's own business profile
     const prisma = getPrisma(req);
-    const bp = await prisma.businessProfile.findUnique({
+    const bp = await prisma.businessProfile.findFirst({
         where: { userId: req.user.id },
     });
     if (!bp) return null;
@@ -1668,7 +1668,7 @@ router.post('/permission-templates', requirePermission('settings.manage'), wrap(
     if (!name || !Array.isArray(permissions)) {
         return res.status(400).json({ success: false, message: 'name and permissions[] are required.' });
     }
-    const bp = await prisma.businessProfile.findUnique({ where: { id: bpId }, select: { businessMeta: true } });
+    const bp = await prisma.businessProfile.findFirst({ where: { id: bpId }, select: { businessMeta: true } });
     const meta = bp.businessMeta || {};
     const customTemplates = meta.customPermissionTemplates || [];
     const existing = customTemplates.findIndex(t => t.name === name);
@@ -2357,7 +2357,7 @@ router.get('/booking/dashboard', wrap(async (req, res) => {
         prisma.businessOrder.count({ where: { businessProfileId: bpId, status: 'COMPLETED' } }),
         prisma.businessOrder.count({ where: { businessProfileId: bpId, status: 'CANCELLED' } }),
         prisma.businessOrder.aggregate({ where: { businessProfileId: bpId, status: 'COMPLETED' }, _sum: { amountUsdc: true } }),
-        prisma.businessProfile.findUnique({ where: { id: bpId }, select: { allowOverbooking: true } }),
+        prisma.businessProfile.findFirst({ where: { id: bpId }, select: { allowOverbooking: true } }),
     ]);
 
     res.json({
@@ -3762,7 +3762,7 @@ router.post('/kiosk/clock-in', wrap(async (req, res) => {
 // GET /api/business-os/messaging-config — get current messaging channel connections
 router.get("/messaging-config", wrap(async (req, res) => {
     const prisma = req.app.get("prisma");
-    const bpId = req.businessProfileId || (await prisma.businessProfile.findUnique({
+    const bpId = req.businessProfileId || (await prisma.businessProfile.findFirst({
         where: { userId: req.user.id }, select: { id: true },
     }))?.id;
     if (!bpId) return res.json({ waConnected: false, smsConnected: false });
@@ -3785,7 +3785,7 @@ router.get("/messaging-config", wrap(async (req, res) => {
 // POST /api/business-os/messaging-config/whatsapp — connect/disconnect WhatsApp
 router.post("/messaging-config/whatsapp", requirePermission("settings.manage"), wrap(async (req, res) => {
     const prisma = req.app.get("prisma");
-    const bpId = req.businessProfileId || (await prisma.businessProfile.findUnique({
+    const bpId = req.businessProfileId || (await prisma.businessProfile.findFirst({
         where: { userId: req.user.id }, select: { id: true },
     }))?.id;
     if (!bpId) return res.status(400).json({ success: false, message: "No business profile" });
@@ -3820,7 +3820,7 @@ router.post("/messaging-config/whatsapp", requirePermission("settings.manage"), 
 // POST /api/business-os/messaging-config/sms — connect/disconnect SMS
 router.post("/messaging-config/sms", requirePermission("settings.manage"), wrap(async (req, res) => {
     const prisma = req.app.get("prisma");
-    const bpId = req.businessProfileId || (await prisma.businessProfile.findUnique({
+    const bpId = req.businessProfileId || (await prisma.businessProfile.findFirst({
         where: { userId: req.user.id }, select: { id: true },
     }))?.id;
     if (!bpId) return res.status(400).json({ success: false, message: "No business profile" });
@@ -3853,7 +3853,7 @@ router.post("/messaging-config/sms", requirePermission("settings.manage"), wrap(
 // POST /api/business-os/messaging-config/test — send a test message
 router.post("/messaging-config/test", requirePermission("settings.manage"), wrap(async (req, res) => {
     const prisma = req.app.get("prisma");
-    const bpId = req.businessProfileId || (await prisma.businessProfile.findUnique({
+    const bpId = req.businessProfileId || (await prisma.businessProfile.findFirst({
         where: { userId: req.user.id }, select: { id: true },
     }))?.id;
     if (!bpId) return res.status(400).json({ success: false, message: "No business profile" });
@@ -3864,7 +3864,7 @@ router.post("/messaging-config/test", requirePermission("settings.manage"), wrap
     const config = await prisma.businessMessagingConfig.findUnique({ where: { businessProfileId: bpId } });
     if (!config) return res.status(400).json({ success: false, message: "No messaging config found" });
 
-    const bizProfile = await prisma.businessProfile.findUnique({ where: { id: bpId }, select: { businessName: true } });
+    const bizProfile = await prisma.businessProfile.findFirst({ where: { id: bpId }, select: { businessName: true } });
     const testMessage = `Hello from ${bizProfile?.businessName || 'Azaman Business'} — this is a test message. Your messaging channel is working!`;
 
     let status = 'SENT', errorMsg = null;
@@ -3911,7 +3911,7 @@ router.post("/messaging-config/test", requirePermission("settings.manage"), wrap
 // PATCH /api/business-os/messaging-config/preferences — update notification routing
 router.patch("/messaging-config/preferences", requirePermission("settings.manage"), wrap(async (req, res) => {
     const prisma = req.app.get("prisma");
-    const bpId = req.businessProfileId || (await prisma.businessProfile.findUnique({
+    const bpId = req.businessProfileId || (await prisma.businessProfile.findFirst({
         where: { userId: req.user.id }, select: { id: true },
     }))?.id;
     if (!bpId) return res.status(400).json({ success: false, message: "No business profile" });
@@ -3936,7 +3936,7 @@ router.patch("/messaging-config/preferences", requirePermission("settings.manage
 // GET /api/business-os/messaging-config/preferences — get notification routing
 router.get("/messaging-config/preferences", wrap(async (req, res) => {
     const prisma = req.app.get("prisma");
-    const bpId = req.businessProfileId || (await prisma.businessProfile.findUnique({
+    const bpId = req.businessProfileId || (await prisma.businessProfile.findFirst({
         where: { userId: req.user.id }, select: { id: true },
     }))?.id;
     if (!bpId) return res.json({ preferences: {} });
@@ -3948,7 +3948,7 @@ router.get("/messaging-config/preferences", wrap(async (req, res) => {
 // GET /api/business-os/messaging-stats — this month's messaging cost breakdown
 router.get("/messaging-stats", wrap(async (req, res) => {
     const prisma = req.app.get("prisma");
-    const bizProfileId = req.businessProfileId || (await prisma.businessProfile.findUnique({
+    const bizProfileId = req.businessProfileId || (await prisma.businessProfile.findFirst({
         where: { userId: req.user.id }, select: { id: true },
     }))?.id;
     if (!bizProfileId) return res.json({ whatsapp: 0, sms: 0, messages: 0 });

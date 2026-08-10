@@ -28,7 +28,7 @@ const VALID_KYB_DOC_TYPES = new Set([
 
 /** Load the BusinessProfile owned by the calling user (null if none). */
 async function _ownedProfile(prisma, userId) {
-    return prisma.businessProfile.findUnique({
+    return prisma.businessProfile.findFirst({
         where: { userId },
         select: { id: true, businessName: true, kybStatus: true }
     });
@@ -226,7 +226,7 @@ exports.approveBusinessKyb = async (req, res) => {
     try {
         const { bizId } = req.params;
 
-        const profile = await prisma.businessProfile.findUnique({
+        const profile = await prisma.businessProfile.findFirst({
             where: { bizId },
             include: { verificationDocuments: true }
         });
@@ -295,7 +295,7 @@ exports.rejectBusinessKyb = async (req, res) => {
             return res.status(400).json({ success: false, message: 'reason is required.' });
         }
 
-        const profile = await prisma.businessProfile.findUnique({
+        const profile = await prisma.businessProfile.findFirst({
             where: { bizId },
             select: { id: true, userId: true }
         });

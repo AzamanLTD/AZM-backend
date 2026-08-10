@@ -19,7 +19,7 @@ const bizNotificationService = require('../services/bizNotificationService');
 
 /** Load the BusinessProfile owned by the calling user (null if none). */
 async function _ownedProfile(prisma, userId) {
-    return prisma.businessProfile.findUnique({
+    return prisma.businessProfile.findFirst({
         where: { userId },
         select: { id: true }
     });

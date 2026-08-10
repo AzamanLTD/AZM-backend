@@ -433,7 +433,7 @@ exports.processRetries = async (prisma) => {
 // ── Helper: get owned business profile ───────────────────────────────────────
 
 async function _ownedProfile(prisma, userId) {
-    return prisma.businessProfile.findUnique({
+    return prisma.businessProfile.findFirst({
         where: { userId },
         select: { id: true, bizId: true, businessName: true },
     });

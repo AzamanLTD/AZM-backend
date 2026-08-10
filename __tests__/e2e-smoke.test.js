@@ -411,4 +411,32 @@ describeOrSkip('E2E Smoke Tests — Core Flows', () => {
             expect([200, 404]).toContain(res.statusCode);
         });
     });
+
+    // ════════════════════════════════════════════════════════════════════════
+    // CLEANUP — delete all rows created by the smoke test in FK-safe order.
+    // Without this, Reservations / BusinessProfiles left behind cause FK
+    // constraint violations in subsequent test suites (e.g. azm-friends-leaderboard).
+    // ════════════════════════════════════════════════════════════════════════
+    afterAll(async () => {
+        const { PrismaClient } = require('@prisma/client');
+        const prisma = new PrismaClient();
+        try {
+            await prisma.reservation.deleteMany({});
+            await prisma.businessOrderItem.deleteMany({});
+            await prisma.businessOrder.deleteMany({});
+            await prisma.bizNotification.deleteMany({});
+            await prisma.businessProduct.deleteMany({});
+            await prisma.notification.deleteMany({});
+            await prisma.userPin.deleteMany({});
+            await prisma.refreshToken.deleteMany({});
+            await prisma.businessProfile.deleteMany({});
+            await prisma.user.deleteMany({});
+        } catch (e) {
+            // eslint-disable-next-line no-console
+            console.warn('[e2e-smoke] cleanup error:', e.message);
+        } finally {
+            await prisma.$disconnect();
+        }
+    });
+
 });

@@ -33,7 +33,7 @@ async function resolvePermissions(prisma, userId, businessProfileId) {
     // This is checked by the caller before invoking this function (see middleware below).
 
     // Check if user is the business owner
-    const bp = await prisma.businessProfile.findUnique({
+    const bp = await prisma.businessProfile.findFirst({
         where: { id: businessProfileId },
         select: { userId: true },
     });
@@ -84,7 +84,7 @@ function requirePermission(key) {
             // Resolve business profile ID (same logic as getBusinessProfileId in routes)
             let businessProfileId = req.businessProfileId; // admin impersonation
             if (!businessProfileId) {
-                const bp = await prisma.businessProfile.findUnique({
+                const bp = await prisma.businessProfile.findFirst({
                     where: { userId: req.user.id },
                     select: { id: true },
                 });

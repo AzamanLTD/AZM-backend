@@ -170,7 +170,7 @@ exports.getSubcategories = async (req, res) => {
 exports.listVehicles = async (req, res) => {
     const prisma = req.app.get('prisma');
     try {
-        const profile = await prisma.businessProfile.findUnique({
+        const profile = await prisma.businessProfile.findFirst({
             where: { userId: req.user.id },
             select: { id: true }
         });
@@ -192,7 +192,7 @@ exports.listVehicles = async (req, res) => {
 exports.createVehicle = async (req, res) => {
     const prisma = req.app.get('prisma');
     try {
-        const profile = await prisma.businessProfile.findUnique({
+        const profile = await prisma.businessProfile.findFirst({
             where: { userId: req.user.id },
             select: { id: true, isSuspended: true }
         });
@@ -233,7 +233,7 @@ exports.createVehicle = async (req, res) => {
 exports.updateVehicle = async (req, res) => {
     const prisma = req.app.get('prisma');
     try {
-        const profile = await prisma.businessProfile.findUnique({
+        const profile = await prisma.businessProfile.findFirst({
             where: { userId: req.user.id },
             select: { id: true }
         });
@@ -281,7 +281,7 @@ exports.updateVehicle = async (req, res) => {
 exports.deleteVehicle = async (req, res) => {
     const prisma = req.app.get('prisma');
     try {
-        const profile = await prisma.businessProfile.findUnique({
+        const profile = await prisma.businessProfile.findFirst({
             where: { userId: req.user.id },
             select: { id: true }
         });

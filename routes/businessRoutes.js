@@ -28,7 +28,7 @@ async function resolveBizProfile(req, res, next) {
     if (req.user?.businessProfileId) return next(); // already on JWT
     try {
         const prisma = req.app.get('prisma');
-        const bp = await prisma.businessProfile.findUnique({
+        const bp = await prisma.businessProfile.findFirst({
             where: { userId: req.user.id },
             select: { id: true },
         });
