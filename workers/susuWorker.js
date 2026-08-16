@@ -7,6 +7,7 @@
 // payout. Default handler writes voucher trust-score penalties (Voucher
 // Accountability mandate).
 // =============================================================================
+const logger = require('../src/config/logger');
 
 class SusuWorker {
     constructor(prisma, susuService) {
@@ -16,7 +17,7 @@ class SusuWorker {
     }
 
     start(intervalMs = 5 * 60 * 1000) {
-        console.log('[SusuWorker] Started — sweeping every 5 minutes');
+        logger.info('[SusuWorker] Started — sweeping every 5 minutes');
         this._tick();
         this.interval = setInterval(() => this._tick(), intervalMs);
     }
@@ -45,11 +46,11 @@ class SusuWorker {
                 try {
                     await this.susuService.processCycle(cycle.id);
                 } catch (err) {
-                    console.error(`[SusuWorker] cycle ${cycle.id} failed:`, err.message);
+                    logger.error(`[SusuWorker] cycle ${cycle.id} failed:`, err.message);
                 }
             }
         } catch (err) {
-            console.error('[SusuWorker.tick]', err.message);
+            logger.error({ err: err }, '[SusuWorker.tick]');
         }
     }
 }

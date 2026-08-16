@@ -17,6 +17,7 @@
 //   - Fires FCM push to the receiver if offline
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const crypto = require('crypto');
 
 // ── Internal: deterministic personal room hash ────────────────────────────────
@@ -227,7 +228,7 @@ exports.chatTransfer = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('[chatTransfer] error:', error.message);
+        logger.error({ err: error }, '[chatTransfer] error');
         return res.status(400).json({ success: false, message: error.message });
     }
 };

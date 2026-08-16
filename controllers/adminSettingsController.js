@@ -8,6 +8,7 @@
 // GET  /api/admin/audit-log      — Fetch settings change history
 //
 // Every mutation writes an AdminSettingsAuditLog row for full traceability.
+const logger = require('../src/config/logger');
 // Changes apply IMMEDIATELY to the next transaction — no caching.
 // =============================================================================
 
@@ -83,7 +84,7 @@ exports.getSettings = async (req, res) => {
             }
         });
     } catch (error) {
-        console.error('[adminSettings.get] error:', error.message);
+        logger.error({ err: error }, '[adminSettings.get] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -195,7 +196,7 @@ exports.updateSettings = async (req, res) => {
             settings: updateData,
         });
     } catch (error) {
-        console.error('[adminSettings.update] error:', error.message);
+        logger.error({ err: error }, '[adminSettings.update] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -265,7 +266,7 @@ exports.setUserRiskTier = async (req, res) => {
             user: { id: userId, username: user.username, withdrawalRiskTier: tier }
         });
     } catch (error) {
-        console.error('[adminSettings.setUserRiskTier] error:', error.message);
+        logger.error({ err: error }, '[adminSettings.setUserRiskTier] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -303,7 +304,7 @@ exports.getAuditLog = async (req, res) => {
             pagination: { page, limit, total, totalPages: Math.ceil(total / limit) },
         });
     } catch (error) {
-        console.error('[adminSettings.getAuditLog] error:', error.message);
+        logger.error({ err: error }, '[adminSettings.getAuditLog] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };

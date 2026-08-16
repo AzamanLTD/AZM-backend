@@ -8,6 +8,7 @@
 // context wins. Falls back to system default (priority 0) if none match.
 //
 // Usage:
+const logger = require('../src/config/logger');
 //   const { resolveFeeProfile } = require('./feeProfileService');
 //   const profile = await resolveFeeProfile(prisma, { vendorId, buyerId, amountCrypto });
 //   // profile.platformFeePct, profile.adminSplitPct, profile.vendorSplitPct, profile.exitFeePct
@@ -38,7 +39,7 @@ async function resolveFeeProfile(prisma, { vendorId, buyerId, amountCrypto } = {
         });
     } catch (e) {
         // Table might not exist yet (pre-migration) — return defaults gracefully
-        console.warn('[feeProfileService] AdminFeeProfile query failed (table may not exist):', e.message);
+        logger.warn('[feeProfileService] AdminFeeProfile query failed (table may not exist):', e.message);
         return {
             platformFeePct: 0,
             adminSplitPct: 0,

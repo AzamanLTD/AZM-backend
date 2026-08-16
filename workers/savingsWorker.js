@@ -12,6 +12,8 @@
 // without a deposit.
 // =============================================================================
 
+const logger = require('../src/config/logger');
+
 class SavingsWorker {
     constructor(prisma, io) {
         this.prisma = prisma;
@@ -20,14 +22,14 @@ class SavingsWorker {
     }
 
     start(intervalMs = 60 * 60 * 1000) { // Every hour
-        console.log('[SavingsWorker] Started — checking every 60 minutes');
+        logger.info('[SavingsWorker] Started — checking every 60 minutes');
         this._checkReminders();
         this.interval = setInterval(() => this._checkReminders(), intervalMs);
     }
 
     stop() {
         if (this.interval) clearInterval(this.interval);
-        console.log('[SavingsWorker] Stopped');
+        logger.info('[SavingsWorker] Stopped');
     }
 
     async _checkReminders() {
@@ -89,7 +91,7 @@ class SavingsWorker {
                 }
             }
         } catch (error) {
-            console.error('[SavingsWorker] Error:', error.message);
+            logger.error({ err: error }, '[SavingsWorker] Error');
         }
     }
 
@@ -125,7 +127,7 @@ class SavingsWorker {
             });
 
         } catch (err) {
-            console.error(`[SavingsWorker] Reminder send failed for goal ${goal.id}:`, err.message);
+            logger.error(`[SavingsWorker] Reminder send failed for goal ${goal.id}:`, err.message);
         }
     }
 
@@ -170,9 +172,9 @@ class SavingsWorker {
                 return;
             }
 
-            console.log(`[SavingsWorker] Streak broken for goal ${goal.id} (was ${goal.streakCount}); advanced to ${nextDue.toISOString()}`);
+            logger.info(`[SavingsWorker] Streak broken for goal ${goal.id} (was ${goal.streakCount}); advanced to ${nextDue.toISOString()}`);
         } catch (err) {
-            console.error(`[SavingsWorker] Streak break failed for goal ${goal.id}:`, err.message);
+            logger.error(`[SavingsWorker] Streak break failed for goal ${goal.id}:`, err.message);
         }
     }
 

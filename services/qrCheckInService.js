@@ -13,6 +13,7 @@
 // the valid window.
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const crypto = require('crypto');
 
 const _getSecret = () => process.env.JWT_SECRET || 'default_qr_secret_at_least_32_chars';
@@ -131,7 +132,7 @@ const verifyAndCheckIn = async (prisma, { token, businessUserId }) => {
             const { releaseBookingEscrow } = require('./bookingEscrowService');
             await releaseBookingEscrow(prisma, { escrowId: reservation.escrowId });
         } catch (err) {
-            console.error('[qrCheckIn] escrow release failed:', err.message);
+            logger.error({ err: err }, '[qrCheckIn] escrow release failed');
         }
     }
 
@@ -150,7 +151,7 @@ const searchByAzamanId = async (prisma, { azamanId, businessUserId }) => {
     if (!azamanId) throw new Error('azamanId is required.');
     if (!businessUserId) throw new Error('businessUserId is required.');
 
-    const profile = await prisma.businessProfile.findUnique({ where: { userId: businessUserId } });
+    const profile = await prisma.businessProfile.findFirst({ where: { userId: businessUserId } });
     if (!profile) throw new Error('Business profile not found.');
 
     const customer = await prisma.user.findFirst({

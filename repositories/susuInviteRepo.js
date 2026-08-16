@@ -4,6 +4,7 @@
 // invites). See design.md > Data Models > Invite, Vouch, and Slash tables.
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const crypto = require('crypto');
 
 const INVITE_TTL_MS = 72 * 60 * 60 * 1000; // 72 hours per Req 6.6

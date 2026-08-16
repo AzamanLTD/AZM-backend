@@ -1,3 +1,4 @@
+const logger = require('../src/config/logger');
 const jwt = require('jsonwebtoken');
 
 // Admin Business Scope — allows admin to act on behalf of any business

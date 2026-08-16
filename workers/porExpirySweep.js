@@ -8,6 +8,7 @@
 // PENDING_VOUCH (Req 14.5) and the parent SusuGroup pushed back to
 // CONFIGURING (Req 2.6). A SUSU notification fires per affected user.
 //
+const logger = require('../src/config/logger');
 // Idempotent: the UPDATE is guarded by status='VERIFIED' so re-runs
 // against already-EXPIRED rows are no-ops.
 // =============================================================================
@@ -27,11 +28,11 @@ class PorExpirySweep {
 
   start() {
     if (this.interval) return;
-    console.log(`[PorExpirySweep] starting (every ${this.intervalMs / 1000}s)`);
+    logger.info(`[PorExpirySweep] starting (every ${this.intervalMs / 1000}s)`);
     // First tick fires soon after boot to catch anything that expired
     // while the server was down. Subsequent ticks at intervalMs cadence.
-    setTimeout(() => this._tick().catch(err => console.error('[PorExpirySweep] initial tick:', err.message)), 30_000);
-    this.interval = setInterval(() => this._tick().catch(err => console.error('[PorExpirySweep] tick:', err.message)), this.intervalMs);
+    setTimeout(() => this._tick().catch(err => logger.error({ err: err }, '[PorExpirySweep] initial tick')), 30_000);
+    this.interval = setInterval(() => this._tick().catch(err => logger.error({ err: err }, '[PorExpirySweep] tick')), this.intervalMs);
   }
 
   stop() {
@@ -100,7 +101,7 @@ class PorExpirySweep {
           });
         });
       } catch (err) {
-        console.error(`[PorExpirySweep] revert member ${m.id} failed:`, err.message);
+        logger.error(`[PorExpirySweep] revert member ${m.id} failed:`, err.message);
       }
     }
 
@@ -114,7 +115,7 @@ class PorExpirySweep {
           actionPayload: { action: 'OPEN_PROOF_OF_RESIDENCY' },
         });
       } catch (err) {
-        console.warn(`[PorExpirySweep] notify ${userId} failed:`, err.message);
+        logger.warn(`[PorExpirySweep] notify ${userId} failed:`, err.message);
       }
     }
   }

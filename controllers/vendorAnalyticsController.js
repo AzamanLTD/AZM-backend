@@ -8,6 +8,7 @@
 // Returns aggregated vendor performance data:
 //   - Volume over time (daily buckets)
 //   - Revenue by payment method
+const logger = require('../src/config/logger');
 //   - Average trade completion time
 //   - Dispute rate
 //   - Trade count by status
@@ -156,7 +157,7 @@ exports.getVendorAnalytics = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('[vendorAnalytics] error:', error.message);
+        logger.error({ err: error }, '[vendorAnalytics] error');
         return res.status(500).json({ success: false, message: 'Failed to fetch analytics' });
     }
 };

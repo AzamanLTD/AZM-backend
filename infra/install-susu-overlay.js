@@ -24,6 +24,7 @@
 // Usage:  node infra/install-susu-overlay.js
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const { PrismaClient } = require('@prisma/client');
 const prisma = new PrismaClient();
 
@@ -274,7 +275,7 @@ async function install(client) {
       results.failed += 1;
       const head = sql.split('\n')[0].slice(0, 80);
       results.errors.push(`${head} … → ${err.message.split('\n')[0]}`);
-      console.warn(`[install-susu-overlay] statement failed (continuing): ${head}\n  ${err.message.split('\n')[0]}`);
+      logger.warn(`[install-susu-overlay] statement failed (continuing): ${head}\n  ${err.message.split('\n')[0]}`);
     }
   }
   return results;
@@ -286,13 +287,13 @@ module.exports = { installSusuOverlay: install };
 if (require.main === module) {
   install()
     .then((r) => {
-      console.log(`[install-susu-overlay] done: ${r.ok} ok, ${r.failed} failed`);
-      if (r.errors.length) console.log(r.errors.join('\n'));
+      logger.info(`[install-susu-overlay] done: ${r.ok} ok, ${r.failed} failed`);
+      if (r.errors.length) logger.info(r.errors.join('\n'));
       return prisma.$disconnect();
     })
     .then(() => process.exit(0))
     .catch((e) => {
-      console.error('[install-susu-overlay] fatal:', e.message);
+      logger.error({ err: e }, '[install-susu-overlay] fatal');
       process.exit(1);
     });
 }

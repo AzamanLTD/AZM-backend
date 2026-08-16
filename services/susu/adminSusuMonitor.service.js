@@ -22,6 +22,7 @@
 // gated member view).
 // =============================================================================
 
+const logger = require('../../src/config/logger');
 const { Prisma } = require('@prisma/client');
 const { SusuError, ErrorCodes } = require('./errors');
 const fieldCipher = require('../crypto/fieldCipher');

@@ -309,6 +309,169 @@ class TransitOpsService {
 
         return manifests;
     }
+    // ═══ MODULE 05: ROUTE TEMPLATES ═════════════════════════════════════════
+
+    async createRouteTemplate({ businessProfileId, name, origin, destination, typicalFareUsdc, typicalDurationMins, vehicleId, defaultDepartureTimes, notes }) {
+        return this.prisma.transitRouteTemplate.create({
+            data: {
+                businessProfileId,
+                name,
+                origin,
+                destination,
+                typicalFareUsdc: typicalFareUsdc || 0,
+                typicalDurationMins,
+                vehicleId: vehicleId || null,
+                defaultDepartureTimes: defaultDepartureTimes || null,
+                notes,
+                isActive: true,
+            },
+        });
+    }
+
+    async getRouteTemplates(businessProfileId) {
+        return this.prisma.transitRouteTemplate.findMany({
+            where: { businessProfileId },
+            include: { vehicle: true },
+            orderBy: { createdAt: 'desc' },
+        });
+    }
+
+    async deleteRouteTemplate(businessProfileId, templateId) {
+        const tpl = await this.prisma.transitRouteTemplate.findFirst({
+            where: { id: templateId, businessProfileId },
+        });
+        if (!tpl) throw new Error('Route template not found.');
+        return this.prisma.transitRouteTemplate.delete({ where: { id: templateId } });
+    }
+
+    async generateTripsFromTemplate({ businessProfileId, templateId, startDate, daysAhead = 30 }) {
+        const tpl = await this.prisma.transitRouteTemplate.findFirst({
+            where: { id: templateId, businessProfileId },
+        });
+        if (!tpl) throw new Error('Route template not found.');
+
+        const start = new Date(startDate);
+        const created = [];
+        const departureTimes = tpl.defaultDepartureTimes || ['07:00'];
+
+        for (let d = 0; d < daysAhead; d++) {
+            const day = new Date(start);
+            day.setDate(day.getDate() + d);
+
+            for (const timeStr of departureTimes) {
+                const [hh, mm] = timeStr.split(':').map(Number);
+                const departureAt = new Date(day);
+                departureAt.setHours(hh, mm || 0, 0, 0);
+
+                const arrivalAt = tpl.typicalDurationMins
+                    ? new Date(departureAt.getTime() + tpl.typicalDurationMins * 60000)
+                    : null;
+
+                const trip = await this.prisma.transitTrip.create({
+                    data: {
+                        businessProfileId,
+                        vehicleId: tpl.vehicleId,
+                        routeName: tpl.name,
+                        origin: tpl.origin,
+                        destination: tpl.destination,
+                        departureAt,
+                        arrivalAt,
+                        fareUsdc: tpl.typicalFareUsdc,
+                        availableSeats: tpl.vehicle ? (await this.prisma.transitVehicle.findUnique({ where: { id: tpl.vehicleId }, select: { capacity: true } }))?.capacity || 0 : 0,
+                        status: 'SCHEDULED',
+                    },
+                });
+                created.push(trip);
+            }
+        }
+        return { count: created.length, trips: created };
+    }
+
+    // ═══ MODULE 05: TRIP CANCEL WITH REFUND ═════════════════════════════════
+
+    async cancelTripWithRefund({ businessProfileId, tripId }) {
+        const trip = await this.prisma.transitTrip.findFirst({
+            where: { id: tripId, businessProfileId },
+            include: {
+                bookings: { where: { status: { in: ['PENDING', 'CONFIRMED', 'CHECKED_IN'] } } },
+            },
+        });
+        if (!trip) throw new Error('Trip not found.');
+        if (trip.status === 'CANCELLED') throw new Error('Trip already cancelled.');
+
+        const affectedBookings = trip.bookings;
+
+        // Cancel the trip
+        await this.prisma.transitTrip.update({
+            where: { id: tripId },
+            data: { status: 'CANCELLED' },
+        });
+
+        // Cancel all active bookings
+        if (affectedBookings.length > 0) {
+            await this.prisma.transitBooking.updateMany({
+                where: { transitTripId: tripId, status: { in: ['PENDING', 'CONFIRMED', 'CHECKED_IN'] } },
+                data: { status: 'CANCELLED' },
+            });
+        }
+
+        return {
+            tripId,
+            cancelledBookings: affectedBookings.length,
+            bookings: affectedBookings.map(b => ({
+                id: b.id,
+                userId: b.userId,
+                amountUsdc: b.amountUsdc,
+                status: 'CANCELLED',
+            })),
+            note: 'Trip cancelled. Bookings marked CANCELLED — escrow refund should be triggered via existing dispute/refund path.',
+        };
+    }
+
+    // ═══ MODULE 05: VEHICLE MAINTENANCE OVERDUE CHECK ════════════════════════
+
+    async getMaintenanceOverdueVehicles(businessProfileId) {
+        const vehicles = await this.prisma.transitVehicle.findMany({
+            where: { businessProfileId, isActive: true },
+            include: {
+                maintenances: {
+                    where: { status: 'SCHEDULED' },
+                    orderBy: { scheduledDate: 'asc' },
+                },
+            },
+        });
+
+        const now = new Date();
+        return vehicles.filter(v => {
+            const overdueMaint = v.maintenances.some(m => new Date(m.scheduledDate) < now);
+            return overdueMaint;
+        }).map(v => ({
+            id: v.id,
+            make: v.make,
+            model: v.model,
+            licensePlate: v.licensePlate,
+            overdueSince: v.maintenances.find(m => new Date(m.scheduledDate) < now)?.scheduledDate,
+        }));
+    }
+
+    // ═══ MODULE 05: PROOF OF DELIVERY ═══════════════════════════════════════
+
+    async updateCargoProofOfDelivery({ businessProfileId, cargoId, proofOfDeliveryUrl }) {
+        const cargo = await this.prisma.cargoParcel.findFirst({
+            where: { id: cargoId, businessProfileId },
+        });
+        if (!cargo) throw new Error('Cargo parcel not found.');
+
+        return this.prisma.cargoParcel.update({
+            where: { id: cargoId },
+            data: {
+                proofOfDeliveryUrl,
+                status: cargo.status === 'IN_TRANSIT' ? 'DELIVERED' : cargo.status,
+                deliveredAt: cargo.status === 'IN_TRANSIT' ? new Date() : cargo.deliveredAt,
+            },
+        });
+    }
+
 }
 
 module.exports = { TransitOpsService };

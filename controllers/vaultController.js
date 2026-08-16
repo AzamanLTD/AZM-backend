@@ -8,13 +8,14 @@
 // so a frozen account can still review their state.
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const { audit } = require('../utils/audit');
 
 const wrap = (fn) => async (req, res) => {
     try {
         await fn(req, res);
     } catch (err) {
-        console.error(`[vaultController] ${fn.name || 'handler'}:`, err.message);
+        logger.error(`[vaultController] ${fn.name || 'handler'}:`, err.message);
         res.status(400).json({ success: false, message: err.message });
     }
 };

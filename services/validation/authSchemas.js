@@ -25,6 +25,7 @@
 // transformed values here could change what the controller stores. We keep the
 // schema side-effect free; req.body passes through untouched.
 // =============================================================================
+const logger = require('../../src/config/logger');
 const { z } = require('zod');
 
 // Shared primitives -----------------------------------------------------------

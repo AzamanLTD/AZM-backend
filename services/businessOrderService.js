@@ -11,6 +11,8 @@
 // exclusively from setImmediate hooks inside escrowService (Work Item 4).
 // =============================================================================
 
+const logger = require('../src/config/logger');
+const { emitWebhookEvent } = require('./webhookEmitter');
 const { randomBytes } = require('crypto');
 
 // ── private helpers ───────────────────────────────────────────────────────────
@@ -82,7 +84,7 @@ const createOrder = async (prisma, {
 
     const orderRef = await _generateOrderRef(prisma);
 
-    return prisma.businessOrder.create({
+    const order = await prisma.businessOrder.create({
         data: {
             businessProfileId,
             customerId,
@@ -97,6 +99,17 @@ const createOrder = async (prisma, {
             customerNotes: customerNotes ? String(customerNotes).slice(0, 500) : null
         }
     });
+
+    // Fire-and-forget webhook for order creation
+    emitWebhookEvent(businessProfileId, 'order.created', {
+        orderId: order.id,
+        orderRef: order.orderRef,
+        customerId,
+        amount: order.amountUsdc,
+        status: order.status,
+    });
+
+    return order;
 };
 
 // =============================================================================

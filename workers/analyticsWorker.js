@@ -1,22 +1,31 @@
+const logger = require('../src/config/logger');
+const { getReadPrisma } = require('../src/config/readReplica');
+
 class AnalyticsWorker {
-    constructor(prisma) {
+    constructor(prisma, app = null) {
         this.prisma = prisma;
+        this.app = app;
         this.cronJob = null;
+    }
+
+    /** Use the read replica for analytics queries when available. */
+    get readPrisma() {
+        return this.app ? getReadPrisma(this.app) : this.prisma;
     }
 
     start() {
         const cron = require('node-cron');
         this.cronJob = cron.schedule('0 * * * *', () => {
-            console.log('📈 Analytics cron triggered — aggregating daily metrics...');
+            logger.info('📈 Analytics cron triggered — aggregating daily metrics...');
             this.aggregateDailySnapshot();
         });
-        console.log('📈 Analytics cron scheduled (every hour)');
+        logger.info('📈 Analytics cron scheduled (every hour)');
     }
 
     stop() {
         if (this.cronJob) {
             this.cronJob.stop();
-            console.log('📈 Analytics cron stopped');
+            logger.info('📈 Analytics cron stopped');
         }
     }
 
@@ -28,7 +37,7 @@ class AnalyticsWorker {
             const endOfDay = new Date(now);
             endOfDay.setHours(23, 59, 59, 999);
 
-            const totalVolumeResult = await this.prisma.transactionHistory.aggregate({
+            const totalVolumeResult = await this.readPrisma.transactionHistory.aggregate({
                 where: {
                     createdAt: {
                         gte: startOfDay,
@@ -43,7 +52,7 @@ class AnalyticsWorker {
 
             const totalVolumeUsdc = totalVolumeResult._sum.amountUsdc || 0;
 
-            const profitBySourceRaw = await this.prisma.adminProfitLog.groupBy({
+            const profitBySourceRaw = await this.readPrisma.adminProfitLog.groupBy({
                 by: ['source'],
                 where: {
                     createdAt: {
@@ -64,7 +73,7 @@ class AnalyticsWorker {
                 totalProfitUsdc += sum;
             }
 
-            const activeUsers = await this.prisma.user.count({
+            const activeUsers = await this.readPrisma.user.count({
                 where: {
                     transactions: {
                         some: {
@@ -94,12 +103,12 @@ class AnalyticsWorker {
                 },
             });
 
-            console.log(
+            logger.info(
                 `📈 DailySnapshot upserted for ${startOfDay.toISOString().split('T')[0]} | ` +
                 `Volume: ${totalVolumeUsdc} USDC | Profit: ${totalProfitUsdc} USDC | Active Users: ${activeUsers}`
             );
         } catch (error) {
-            console.error('📈 Analytics cron error:', error.message);
+            logger.error({ err: error }, '📈 Analytics cron error');
         }
     }
 }

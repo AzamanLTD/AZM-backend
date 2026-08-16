@@ -82,12 +82,12 @@ describe('AzmSpendService — card skins', () => {
     });
 
     test('purchaseCardSkin: insufficient balance throws and does NOT debit', async () => {
-        const prisma = makeFakePrisma({ id: 1, azmBalance: 5, ownedCardSkins: [], equippedCardSkin: FREE_CARD_SKIN });
+        const prisma = makeFakePrisma({ id: 1, azmBalance: 0.5, ownedCardSkins: [], equippedCardSkin: FREE_CARD_SKIN });
         const svc = new AzmSpendService(prisma, null);
 
-        const skin = CARD_SKIN_OPTIONS.find(s => s.cost > 5);
+        const skin = CARD_SKIN_OPTIONS[0];
         await expect(svc.purchaseCardSkin(1, skin.id)).rejects.toThrow(/Insufficient AZM/);
-        expect(prisma._debug.getUser().azmBalance).toBe(5); // untouched
+        expect(prisma._debug.getUser().azmBalance).toBe(0.5); // untouched
         expect(prisma._debug.getSpendLogs()).toHaveLength(0);
     });
 
@@ -156,6 +156,7 @@ function makeFakeBusinessPrisma(initialProfile) {
     return {
         businessProfile: {
             findUnique: async () => ({ ...profile }),
+            findFirst: async () => ({ ...profile }),
             update: async ({ data }) => {
                 profile = { ...profile, ...data };
                 return { ...profile };

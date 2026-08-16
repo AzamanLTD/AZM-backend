@@ -19,10 +19,19 @@
 // memory store with a loud warning — same behaviour class as before, single
 // instance only.
 //
+// HOTFIX (2026-07-25): Added fail-open wrappers around every limiter. When
+// the Redis store errors (e.g., Upstash monthly quota exhausted, network
+// partition), the limiter logs a warning and lets the request through instead
+// of crashing with a 500. This is the standard "fail open" posture for rate
+// limiting — it's better to temporarily lose rate-limit protection than to
+// take the entire API offline. Rate limiting resumes automatically once Redis
+// connectivity is restored.
+//
 // Thresholds are intentionally kept at the project's existing (stricter) values,
 // not loosened. The per-user keying on the financial tier is preserved too.
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const { rateLimit, ipKeyGenerator } = require('express-rate-limit');
 const { RedisStore } = require('rate-limit-redis');
 const Redis = require('ioredis');
@@ -31,6 +40,7 @@ const Redis = require('ioredis');
 // One ioredis client, lazily connected, shared by every limiter. If REDIS_URL
 // is unset we return undefined so each limiter falls back to the memory store.
 let _redisClient = null;
+let _redisErroring = false;
 const _getStore = () => {
     if (!process.env.REDIS_URL) return undefined;
     if (!_redisClient) {
@@ -43,8 +53,14 @@ const _getStore = () => {
             lazyConnect: true,
             ...(isTLS ? { tls: {} } : {}),
         });
-        _redisClient.on('error', (e) => console.error('[RateLimit] Redis error:', e.message));
-        console.log('[RateLimit] Using Redis store — multi-instance safe' + (isTLS ? ' (TLS/Upstash)' : ''));
+        _redisClient.on('error', (e) => {
+            _redisErroring = true;
+            logger.error({ err: e }, '[RateLimit] Redis error');
+        });
+        _redisClient.on('ready', () => {
+            _redisErroring = false;
+        });
+        logger.info('[RateLimit] Using Redis store — multi-instance safe' + (isTLS ? ' (TLS/Upstash)' : ''));
     }
     // A fresh RedisStore per limiter (each gets its own key prefix) but they all
     // share the single underlying connection.
@@ -56,8 +72,29 @@ const _getStore = () => {
 
 const _storeFactory = _getStore();
 if (!_storeFactory) {
-    console.warn('[RateLimit] REDIS_URL not set — using in-memory store. OK for dev, NOT for multi-instance production.');
+    logger.warn('[RateLimit] REDIS_URL not set — using in-memory store. OK for dev, NOT for multi-instance production.');
 }
+
+// ── Fail-open wrapper ─────────────────────────────────────────────────────────
+// Wraps an express-rate-limit middleware so that if the underlying store
+// throws (Redis down, Upstash quota exhausted, etc.), we log and let the
+// request through instead of returning a 500. Rate limiting is a protection
+// layer, not a critical path — failing open keeps the API alive.
+const _failOpen = (limiter) => (req, res, next) => {
+    // Fast path: if we already know Redis is erroring, skip the limiter entirely.
+    if (_storeFactory && _redisErroring) {
+        logger.warn('[RateLimit] Redis unavailable — failing open (rate limiting temporarily disabled)');
+        return next();
+    }
+    limiter(req, res, (err) => {
+        if (err) {
+            _redisErroring = true;
+            logger.warn({ err: err.message }, '[RateLimit] Store error — failing open');
+            return next();
+        }
+        next();
+    });
+};
 
 // Build the standard options for a limiter, attaching a Redis store (with a
 // unique prefix) only when one is available.
@@ -72,12 +109,12 @@ const _opts = ({ windowMs, max, message, keyGenerator, prefix }) => ({
 });
 
 // ── AUTH: 5 requests per minute per IP (brute-force protection) ───────────────
-const authLimiter = rateLimit(_opts({
+const authLimiter = _failOpen(rateLimit(_opts({
     windowMs: 60_000,
     max: 5,
     prefix: 'rl:auth:',
     message: 'Too many login attempts. Please wait 60 seconds before trying again.',
-}));
+})));
 
 // ── FINANCIAL: 10 requests per minute per USER (trade/withdraw/deposit) ───────
 // keyGenerator runs BEFORE `protect` sets req.user, so we decode the JWT here
@@ -96,37 +133,37 @@ const _financialKey = (req, res) => {
     return ipKeyGenerator(req, res);
 };
 
-const financialLimiter = rateLimit(_opts({
+const financialLimiter = _failOpen(rateLimit(_opts({
     windowMs: 60_000,
     max: 10,
     prefix: 'rl:fin:',
     keyGenerator: _financialKey,
     message: 'Too many financial requests. Please slow down.',
-}));
+})));
 
 // ── GENERAL API: 60 requests per minute per IP ───────────────────────────────
-const generalLimiter = rateLimit(_opts({
+const generalLimiter = _failOpen(rateLimit(_opts({
     windowMs: 60_000,
     max: 60,
     prefix: 'rl:gen:',
     message: 'Rate limit exceeded. Please try again shortly.',
-}));
+})));
 
 // ── WEBHOOK: 30 requests per minute per IP (payment provider callbacks) ───────
-const webhookLimiter = rateLimit(_opts({
+const webhookLimiter = _failOpen(rateLimit(_opts({
     windowMs: 60_000,
     max: 30,
     prefix: 'rl:hook:',
     message: 'Webhook rate limit exceeded.',
-}));
+})));
 
 // ── STRICT: 3 requests per minute (account deletion, security changes) ────────
-const strictLimiter = rateLimit(_opts({
+const strictLimiter = _failOpen(rateLimit(_opts({
     windowMs: 60_000,
     max: 3,
     prefix: 'rl:strict:',
     message: 'This action is rate-limited for security. Please wait.',
-}));
+})));
 
 module.exports = {
     authLimiter,

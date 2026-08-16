@@ -40,7 +40,7 @@ const registerBusiness = async (prisma, {
     if (!userId) throw new Error('userId is required.');
 
     // 1. If the user already owns a business profile, return it (idempotent).
-    const existing = await prisma.businessProfile.findUnique({ where: { userId } });
+    const existing = await prisma.businessProfile.findFirst({ where: { userId } });
     if (existing) {
         return { businessProfile: existing, bizId: existing.bizId, alreadyRegistered: true };
     }
@@ -149,6 +149,7 @@ const searchBusinesses = async (prisma, { query, category, verified, limit, curs
     });
 
     if (useTrending) {
+        const logger = require('../src/config/logger');
         const { discoveryScore } = require('../utils/ranking');
         rows.sort((a, b) => discoveryScore(b) - discoveryScore(a));
     }
@@ -190,7 +191,7 @@ const getSubcategories = async (prisma, { parentWire } = {}) => {
 // 4. UPDATE BUSINESS PROFILE — owner-only, whitelisted fields.
 // =============================================================================
 const updateBusinessProfile = async (prisma, { userId, updates }) => {
-    const profile = await prisma.businessProfile.findUnique({ where: { userId } });
+    const profile = await prisma.businessProfile.findFirst({ where: { userId } });
     if (!profile) throw new Error('No business profile found for this user.');
 
     const data = {};

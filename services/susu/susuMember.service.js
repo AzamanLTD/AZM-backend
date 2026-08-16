@@ -14,6 +14,7 @@
 // All other transitions are forbidden (Req 14.6).
 // =============================================================================
 
+const logger = require('../../src/config/logger');
 const { SusuError, ErrorCodes } = require('./errors');
 const SusuMemberRepo = require('../../repositories/susuMemberRepo');
 const SusuRepo = require('../../repositories/susuRepo');

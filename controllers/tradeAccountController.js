@@ -5,6 +5,7 @@
 // Phase Q2: Soft-delete archive pattern — accounts are NEVER hard-deleted.
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const { validateAccountDetails, getSupportedMethods } = require('../services/tradeAccountValidation');
 
 /**
@@ -76,7 +77,7 @@ exports.addTradeAccount = async (req, res) => {
             tradeAccount: newTradeAccount
         });
     } catch (error) {
-        console.error("Add Trade Account Error:", error);
+        logger.error("Add Trade Account Error:", error);
         res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -105,7 +106,7 @@ exports.getTradeAccounts = async (req, res) => {
 
         res.status(200).json({ success: true, accounts });
     } catch (error) {
-        console.error("Get Trade Accounts Error:", error);
+        logger.error("Get Trade Accounts Error:", error);
         res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -131,7 +132,7 @@ exports.getApprovedTradeAccounts = async (req, res) => {
 
         res.status(200).json({ success: true, accounts });
     } catch (error) {
-        console.error("Get Approved Trade Accounts Error:", error);
+        logger.error("Get Approved Trade Accounts Error:", error);
         res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -224,7 +225,7 @@ exports.deleteTradeAccount = async (req, res) => {
             message: 'Trade account removed. It has been archived for security purposes.'
         });
     } catch (error) {
-        console.error("Delete Trade Account Error:", error);
+        logger.error("Delete Trade Account Error:", error);
         res.status(500).json({ success: false, message: error.message });
     }
 };

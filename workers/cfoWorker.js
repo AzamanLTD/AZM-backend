@@ -14,6 +14,7 @@
 //   5. Persist the report as an ADMIN_SYSTEM notification for userId=1
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const { generateText } = require('../utils/llmProvider');
 const NotificationService = require('../services/notificationService');
 
@@ -40,16 +41,16 @@ class CfoWorker {
         const cron   = require('node-cron');
         // Run every hour on the hour
         this.cronJob = cron.schedule('0 * * * *', () => {
-            console.log('[CFO Worker] Hourly cron triggered — analysing system health...');
+            logger.info('[CFO Worker] Hourly cron triggered — analysing system health...');
             this.analyzeExpenses();
         });
-        console.log('[CFO Worker] Cron scheduled (every hour)');
+        logger.info('[CFO Worker] Cron scheduled (every hour)');
     }
 
     stop() {
         if (this.cronJob) {
             this.cronJob.stop();
-            console.log('[CFO Worker] Cron stopped');
+            logger.info('[CFO Worker] Cron stopped');
         }
     }
 
@@ -88,7 +89,7 @@ class CfoWorker {
 
             // ── 3. Low-balance socket alert + DB notification ──────────────
             if (isBalanceCritical) {
-                console.warn(
+                logger.warn(
                     `[CFO Worker] ⚠️  SystemHotWallet balance (${hotWalletBalance}) ` +
                     `is below threshold (${MATIC_ALERT_THRESHOLD})`
                 );
@@ -136,9 +137,9 @@ Keep the response concise (under 200 words).`;
 
             const aiAnalysis = await generateText(prompt);
 
-            console.log('\n=== AI CFO ANALYSIS ===');
-            console.log(aiAnalysis);
-            console.log('========================\n');
+            logger.info('\n=== AI CFO ANALYSIS ===');
+            logger.info(aiAnalysis);
+            logger.info('========================\n');
 
             // ── 5. Persist CFO report notification ────────────────────────
             // Phase N2: route through notificationService for DB + socket + FCM
@@ -173,7 +174,7 @@ Keep the response concise (under 200 words).`;
             };
 
         } catch (error) {
-            console.error('[CFO Worker] analyzeExpenses error:', error.message);
+            logger.error({ err: error }, '[CFO Worker] analyzeExpenses error');
         }
     }
 }

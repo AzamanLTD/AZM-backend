@@ -43,6 +43,7 @@
 //     behaviour: the privilege change should propagate.
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 
@@ -51,7 +52,7 @@ if (!JWT_SECRET) {
     // authController already crashes the process at boot if this is unset,
     // but require() ordering means this file might be imported first in
     // some hot-reload scenarios. Belt-and-braces.
-    console.error('[authTokenService] FATAL: JWT_SECRET is not configured.');
+    logger.error('[authTokenService] FATAL: JWT_SECRET is not configured.');
 }
 
 const ACCESS_EXPIRY = process.env.JWT_ACCESS_EXPIRY || '15m';

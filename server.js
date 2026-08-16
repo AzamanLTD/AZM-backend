@@ -3,6 +3,7 @@
 // WS6: Sentry must be the very first require so its auto-instrumentation can
 // patch http/express/pg before they are loaded. No-op when SENTRY_DSN is unset.
 const Sentry = require('./instrument');
+const logger = require('./src/config/logger');
 
 // =============================================================================
 // AZAMAN V3 — PRODUCTION-HARDENED SERVER
@@ -24,32 +25,26 @@ const express = require('express');
 const cron = require('node-cron');
 const http = require('http');
 const { Server } = require('socket.io');
-const { PrismaClient, Prisma } = require('@prisma/client');
-const { PrismaPg } = require('@prisma/adapter-pg');
-const { Pool } = require('pg');
 const path = require('path');
 const socketRateLimiter = require('./middleware/socketRateLimiter');
-const cors = require('cors');
-const multer = require('multer');
-const fs = require('fs');
 const jwt = require('jsonwebtoken');
-require('dotenv').config();
+try { require('dotenv').config(); } catch (_e) { /* dotenv optional on PaaS */ }
 
 // ── Startup Validation ───────────────────────────────────────────────────────
 // CRITICAL-2: Fail fast if essential env vars are missing
 if (!process.env.JWT_SECRET) {
-    console.error('FATAL: JWT_SECRET is not set. Server cannot start.');
+    logger.fatal('JWT_SECRET is not set. Server cannot start.');
     process.exit(1);
 }
 // A short secret is brute-forceable and silently weakens every token. Enforce
 // at least 32 chars (256 bits) so a misconfigured deploy fails loudly at boot
 // instead of running with weak auth.
 if (process.env.JWT_SECRET.length < 32) {
-    console.error('FATAL: JWT_SECRET must be at least 32 characters (256 bits). Server cannot start.');
+    logger.fatal('JWT_SECRET must be at least 32 characters (256 bits). Server cannot start.');
     process.exit(1);
 }
 if (!process.env.DATABASE_URL) {
-    console.error('FATAL: DATABASE_URL is not set. Server cannot start.');
+    logger.fatal('DATABASE_URL is not set. Server cannot start.');
     process.exit(1);
 }
 
@@ -67,22 +62,8 @@ const workerStatus = {};
 // 'connected' / 'disconnected' driven by the ioredis client events.
 let redisStatus = 'not_configured';
 
-// ── Phase J3: Prisma Decimal → Number JSON Serialization ─────────────────────
-// Prisma returns NUMERIC/DECIMAL columns as Decimal.js objects which serialize
-// to strings in JSON ("12.50" instead of 12.50). This patch ensures they
-// serialize as plain numbers for all res.json() calls and socket emissions.
-// decimal.js's valueOf() returns a string by default — we override it to
-// return a number so that arithmetic operators (+, -, *, /, <, >) work
-// correctly with Decimal fields in controller code without explicit casts.
-Prisma.Decimal.prototype.toJSON = function () {
-    return Number(this.toString());
-};
-Prisma.Decimal.prototype.valueOf = function () {
-    return Number(this.toString());
-};
-
-// --- FIREBASE CLOUD MESSAGING ---
-const { sendPushNotification } = require('./utils/firebaseService');
+// ── Socket helpers (extracted to src/sockets/helpers.js) ─────────────────────
+const { createPushIfOffline, createEmitBalanceUpdate } = require('./src/sockets/helpers');
 
 // --- RATE LIMITING (CRITICAL-3) ---
 const {
@@ -92,391 +73,32 @@ const {
     webhookLimiter
 } = require('./middleware/rateLimitMiddleware');
 
-// 1. Initialize PostgreSQL Connection Pool
-const pool = new Pool({
-    connectionString: process.env.DATABASE_URL,
-    max: 20,
-    idleTimeoutMillis: 30000,
-    connectionTimeoutMillis: 2000,
-});
+// ── Base Services (extracted to src/config/baseServices.js) ──────────────────
+const {
+    pool, prisma, marketOracle, gatewayService,
+    mtnDisbursementService, moolreCollectionService,
+    paymentFailoverService,
+    tatumService, emailService, smsService,
+} = require('./src/config/baseServices');
 
-pool.on('error', (err) => {
-    console.error('Unexpected error on idle client', err.message);
-});
+// ── Upload Config (extracted to src/config/upload.js) ────────────────────────
+const { upload } = require('./src/config/upload');
 
-const adapter = new PrismaPg(pool);
-const prisma = new PrismaClient({ adapter });
-
-// Test database connection on startup
-(async () => {
-    try {
-        await prisma.$connect();
-        console.log('[DB] Prisma connected successfully');
-    } catch (error) {
-        console.error('[DB] Failed to connect:', error.message);
-        process.exit(1);
-    }
-})();
-
-// --- LIVE MARKET ORACLE ---
-const OracleService = require('./services/oracleService');
-const marketOracle = new OracleService(prisma);
-marketOracle.startOracle();
-
-// --- KOTANI PAY V3 GATEWAY ---
-const GatewayService = require('./services/gatewayService');
-const gatewayService = new GatewayService(prisma);
-gatewayService.startRateSync();
-
-// --- FIAT OFF-RAMP DISBURSEMENT (Moolre — primary; MTN MoMo — fallback) ──────
-// The off-ramp provider is bound to ONE variable (`mtnDisbursementService`) that
-// every consumer reads (finance.controller, withdrawalReconciliationWorker,
-// payoutBatchWorker, smartRouteService). Because MoolreDisbursementService
-// mirrors the MTN adapter's public method shape EXACTLY
-// (initiateTransfer / getTransferStatus / newReferenceId / simulateInboundWebhook,
-// and deliberately NO `dispatch`), swapping which class backs that variable
-// changes the provider for the whole platform with zero consumer edits.
-//
-// The legacy MTN wiring is preserved (commented) directly below as a safe
-// fallback — to revert, comment the Moolre block and uncomment the MTN block.
-
-// ── PRIMARY: Moolre ───────────────────────────────────────────────────────────
-const MoolreDisbursementService = require('./services/moolreDisbursementService');
-const mtnDisbursementService = new MoolreDisbursementService();
-
-// --- FIAT ON-RAMP COLLECTION (Moolre — 2026-06-23) ───────────────────────────
-// Inbound sibling of the disbursement adapter above: PIN-push MoMo deposits.
-// Bound under 'moolreCollectionService' (depositController reads it via
-// req.app.get). Pure I/O adapter — no Prisma, MOCK unless MOOLRE_PROVIDER=LIVE.
-const MoolreCollectionService = require('./services/moolreCollectionService');
-const moolreCollectionService = new MoolreCollectionService();
-
-// Startup guard: the Moolre settlement webhook hard-disables itself (503) if
-// MOOLRE_WEBHOOK_SECRET is unset, so warn loudly at boot to make the disabled
-// endpoint obvious instead of silently rejecting every callback in production.
-if (!process.env.MOOLRE_WEBHOOK_SECRET) {
-    console.warn('[STARTUP] MOOLRE_WEBHOOK_SECRET is not set — webhook endpoint is disabled.');
-}
-
-// ── FALLBACK: MTN MoMo (kept intact — uncomment to revert) ────────────────────
-// const MtnDisbursementService = require('./services/mtnDisbursementService');
-// const mtnDisbursementService = new MtnDisbursementService();
-
-// --- TATUM WEB3 SERVICE ---
-const TatumService = require('./services/tatumService');
-const tatumService = new TatumService();
-
-// --- EMAIL SERVICE (Phase L1) ---
-// Stateless aside from in-memory token-store + provider config (env-driven).
-// Singleton: instantiated once here, shared across the worker (constructor
-// arg) and request handlers (req.app.get('emailService')). Defaults to
-// MOCK provider — set EMAIL_PROVIDER + EMAIL_API_KEY to flip to a real
-// transport. All sends from the receipt surface are fire-and-forget.
-const EmailService = require('./services/emailService');
-const emailService = new EmailService();
-
-// --- SMS SERVICE (Phase L2) ---
-// Mirrors the emailService singleton pattern. OTP state is stored in-memory
-// (use Redis in production for multi-process). Defaults to MOCK provider —
-// set SMS_PROVIDER + SMS_API_KEY in .env for real delivery. Shared across
-// security routes (phone OTP) and withdrawal controller (large-withdrawal
-// confirmations). All transactional sends are fire-and-forget.
-const SMSService = require('./services/smsService');
-const smsService = new SMSService();
-
-// --- MULTER SETUP (HIGH-9: Validated file uploads) ---
-const uploadDir = 'uploads/proofs/';
-if (!fs.existsSync(uploadDir)) {
-    fs.mkdirSync(uploadDir, { recursive: true });
-}
-
-// HIGH-9: File type validation — only allow images
-// Accepts both MIME type check AND file extension check because Android
-// devices frequently report incorrect MIME types (application/octet-stream)
-// for camera captures.
-const imageFileFilter = (req, file, cb) => {
-    const allowedMimes = ['image/jpeg', 'image/png', 'image/gif', 'image/webp', 'image/heic', 'image/heif'];
-    const allowedExts = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.heic', '.heif'];
-    const ext = path.extname(file.originalname).toLowerCase();
-    const mimeOk = allowedMimes.includes(file.mimetype);
-    const extOk = allowedExts.includes(ext);
-    if (mimeOk || extOk) {
-        cb(null, true);
-    } else {
-        cb(new Error('Only image files (JPEG, PNG, GIF, WebP, HEIC) are allowed.'), false);
-    }
-};
-
-const storage = multer.diskStorage({
-    destination: (req, file, cb) => cb(null, uploadDir),
-    filename: (req, file, cb) => {
-        const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-        cb(null, uniqueSuffix + path.extname(file.originalname));
-    }
-});
-
-// HIGH-9: 5MB limit + image-only filter
-const upload = multer({
-    storage: storage,
-    limits: { fileSize: 5 * 1024 * 1024 },
-    fileFilter: imageFileFilter
-});
-
-// Import Routes
-const authRoutes = require('./routes/authRoutes');
-const tradeRoutes = require('./routes/tradeRoutes');
-const adRoutes = require('./routes/adRoutes');
-const chatRoutes = require('./routes/chatRoutes');
-const chatUploadRoutes = require('./routes/chatUploadRoutes');
-const walletRoutes = require('./routes/walletRoutes');
-const adminRoutes = require('./routes/adminRoutes');
-const kycRoutes = require('./routes/kycRoutes');
-const notificationRoutes = require('./routes/notificationRoutes');
-const depositRoutes = require('./routes/depositRoutes');
-const withdrawalRoutes = require('./routes/withdrawalRoutes');
-const tradeAccountRoutes = require('./routes/tradeAccountRoutes');
-const payoutDestinationRoutes = require('./routes/payoutDestinationRoutes');
-const adminChatRoutes = require('./routes/adminChatRoutes');
-const securityRoutes = require('./routes/securityRoutes');
-const userRoutes = require('./routes/userRoutes');
-const warRoomRoutes = require('./routes/warRoomRoutes');
-const aiRoutes = require('./routes/aiRoutes');
-const financeRoutes = require('./routes/financeRoutes');
-const p2pRoutes = require('./routes/p2pRoutes');
-const friendRoutes = require('./routes/friendRoutes');
-const vendorStatsRoutes = require('./routes/vendorStatsRoutes');
-const savingsRoutes     = require('./routes/savingsRoutes');
-const oracleRoutes      = require('./routes/oracleRoutes');
-const azmRoutes         = require('./routes/azmRoutes');
-const receiptRoutes     = require('./routes/receiptRoutes');
-const ticketRoutes      = require('./routes/ticketRoutes');
-
-// Smart Escrow & Business Accounts (2026-06-14)
-const escrowRoutes      = require('./routes/escrowRoutes');
-const businessRoutes    = require('./routes/businessRoutes');
-
-// Marketplace Foundation (2026-06-24): Reservation system
-const reservationRoutes = require('./routes/reservationRoutes');
-
-// Marketplace Expansion (2026-07-02)
-const followRoutes = require('./routes/followRoutes');
-const adPostRoutes = require('./routes/adPostRoutes');
-const dineInRoutes = require('./routes/dineInRoutes');
-const showcaseRoutes = require('./routes/showcaseRoutes');
-const marketplaceFinanceRoutes = require('./routes/marketplaceFinanceRoutes');
-const marketplaceSeatMapRoutes = require('./routes/marketplaceSeatMapRoutes');
-const marketplacePenaltyRoutes = require('./routes/marketplacePenaltyRoutes');
-
-const marketplaceRoutes = require('./routes/marketplaceRoutes');
-
-// Master Sprint (2026-05-27): Vault, Susu, Group Chat, Smart Route, AZM Auction
-const vaultRoutes       = require('./routes/vaultRoutes');
-const groupChatRoutes   = require('./routes/groupChatRoutes');
-const susuRoutes        = require('./routes/susuRoutes');
-const smartRouteRoutes  = require('./routes/smartRouteRoutes');
-const azmAuctionRoutes  = require('./routes/azmAuctionRoutes');
-
-// Master Sprint v2 (2026-05-27): Saved MoMo Accounts
-const savedMomoRoutes   = require('./routes/savedMomoRoutes');
 
 const app = express();
 app.set('trust proxy', 1);
 const server = http.createServer(app);
 
 // ══════════════════════════════════════════════════════════════════════════════
-// 3. MIDDLEWARES
+// 3. MIDDLEWARES (extracted to src/middleware/appMiddleware.js)
 // ══════════════════════════════════════════════════════════════════════════════
 
-// Request tracing (must precede morgan so the access log carries the id).
-// Assigns req.id / res.locals.requestId and the X-Request-Id response header.
-app.use(require('./middleware/requestId'));
+const { configureMiddleware } = require('./src/middleware/appMiddleware');
+const { corsOrigins } = configureMiddleware(app, { IS_PRODUCTION });
 
-// HTTP access logging (morgan). "combined" = IP, method, path, status,
-// response-time — enough to debug most production issues from the Render log
-// stream. We append the request id (":req-id" token) so a log line can be
-// correlated with an error report or a client bug submission. Skipped under
-// NODE_ENV=test to keep test output clean.
-const morgan = require('morgan');
-morgan.token('req-id', (req) => req.id || '-');
-if (process.env.NODE_ENV !== 'test') {
-    app.use(morgan(':remote-addr :method :url :status :response-time ms - :req-id'));
-}
-
-// HIGH-1: Security headers (helmet-equivalent without dependency)
-app.use((req, res, next) => {
-    res.setHeader('X-Content-Type-Options', 'nosniff');
-    res.setHeader('X-Frame-Options', 'DENY');
-    res.setHeader('X-XSS-Protection', '0');
-    res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
-    res.setHeader('X-Download-Options', 'noopen');
-    res.setHeader('X-Permitted-Cross-Domain-Policies', 'none');
-    res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
-    res.removeHeader('X-Powered-By');
-    next();
-});
-
-// HIGH-2: CORS locked to configured origins
-const corsOrigins = process.env.CORS_ORIGINS
-    ? process.env.CORS_ORIGINS.split(',').map(s => s.trim()).filter(Boolean)
-    : ['*']; // Dev fallback — override in production!
-
-// In production, explicitly reject any browser origin not on the allow-list.
-// In development (or when CORS_ORIGINS is the '*' wildcard), CORS stays open.
-// Requests without an Origin header (curl, mobile apps, server-to-server) are
-// always permitted since the browser same-origin policy does not apply to them.
-const corsOriginValidator = (origin, callback) => {
-    if (!origin) return callback(null, true);
-    if (!IS_PRODUCTION || corsOrigins.includes('*')) return callback(null, true);
-    if (corsOrigins.includes(origin)) return callback(null, true);
-    return callback(new Error(`CORS: origin ${origin} is not allowed`));
-};
-
-app.use(cors({
-    origin: corsOriginValidator,
-    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-    credentials: true
-}));
-
-// Surface the CORS posture at boot so misconfigured deploys are obvious.
-if (IS_PRODUCTION) {
-    console.log(`CORS locked to: [${corsOrigins.join(', ')}]`);
-} else {
-    console.log('CORS open (development mode)');
-}
-
-// C-10: Force HTTPS in production (Render provides HTTPS proxy)
-if (process.env.NODE_ENV === 'production') {
-    app.use((req, res, next) => {
-        if (req.headers['x-forwarded-proto'] !== 'https') {
-            return res.redirect(301, `https://${req.headers.host}${req.url}`);
-        }
-        next();
-    });
-}
-
-// Body parser with size limit (M-1 fix) + raw body for HMAC verification
-app.use(express.json({
-    limit: '2mb',
-    verify: (req, res, buf) => { req.rawBody = buf.toString('utf8'); }
-}));
-
-// Request logging (only in non-production or when LOG_REQUESTS=true)
-if (!IS_PRODUCTION || process.env.LOG_REQUESTS === 'true') {
-    app.use((req, res, next) => {
-        console.log(`[${req.method}] ${req.url}`);
-        next();
-    });
-}
-
-app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
-
-// ── Health Check Endpoint ────────────────────────────────────────────────────
-app.get('/health', async (req, res) => {
-    try {
-        await prisma.$queryRaw`SELECT 1`;
-
-        // Phase Q15: Include version gate info for client startup check
-        let versionGate = null;
-        try {
-            const settings = await prisma.globalSettings.findUnique({
-                where: { id: 1 },
-                select: { minAppVersion: true, forceUpdateUrl: true, updateMessage: true },
-            });
-            if (settings) {
-                versionGate = {
-                    minVersion: settings.minAppVersion,
-                    updateUrl: settings.forceUpdateUrl,
-                    message: settings.updateMessage,
-                };
-            }
-        } catch (_) { /* non-fatal */ }
-
-        // WS7: Escrow + business system stats for the Admin Portal dashboard.
-        // Each block is independently guarded — a stats query failure must NEVER
-        // flip /health to 503 (the DB SELECT 1 above is the real liveness probe).
-        let escrowSystem = null;
-        try {
-            const startOfToday = new Date();
-            startOfToday.setHours(0, 0, 0, 0);
-            const [activeEscrows, disputedEscrows, expiredToday] = await Promise.all([
-                prisma.smartEscrow.count({ where: { status: { in: ['FUNDED', 'IN_PROGRESS', 'PENDING_SETTLEMENT'] } } }),
-                prisma.smartEscrow.count({ where: { status: { in: ['DISPUTED', 'ADMIN_REVIEW'] } } }),
-                prisma.smartEscrow.count({ where: { status: 'EXPIRED', updatedAt: { gte: startOfToday } } }),
-            ]);
-            escrowSystem = { activeEscrows, disputedEscrows, expiredToday };
-        } catch (_) { /* non-fatal */ }
-
-        let businessSystem = null;
-        try {
-            const [totalBusinesses, verifiedBusinesses, pendingKyb, activeOrders] = await Promise.all([
-                prisma.businessProfile.count(),
-                prisma.businessProfile.count({ where: { kybStatus: 'VERIFIED' } }),
-                prisma.businessProfile.count({ where: { kybStatus: 'PENDING' } }),
-                prisma.businessOrder.count({ where: { status: { in: ['PAID', 'DELIVERED'] } } }),
-            ]);
-            businessSystem = { totalBusinesses, verifiedBusinesses, pendingKyb, activeOrders };
-        } catch (_) { /* non-fatal */ }
-
-        res.status(200).json({
-            status: 'healthy',
-            timestamp: new Date().toISOString(),
-            version: APP_VERSION,
-            uptime: process.uptime(),
-            database: 'connected',
-            redis: redisStatus,
-            workers: workerStatus,
-            escrowSystem,
-            businessSystem,
-            versionGate,
-            // Susu Sprint (2026-06-01): surface the boot-time auto-release
-            // outcome + treasury cache state so deploy health can be checked
-            // with a single curl on free-tier hosting (no dashboard logs).
-            susu: {
-                treasuryCached: !!app.get('azamanTreasuryUserId'),
-                release: (() => {
-                    try { return require('./infra/autoRelease').releaseStatus; }
-                    catch (_) { return null; }
-                })(),
-            },
-        });
-    } catch (err) {
-        res.status(503).json({
-            status: 'unhealthy',
-            timestamp: new Date().toISOString(),
-            version: APP_VERSION,
-            database: 'disconnected',
-            redis: redisStatus,
-            error: IS_PRODUCTION ? 'Service unavailable' : err.message
-        });
-    }
-});
-
-// --- ADMIN: manual one-time Susu release trigger (free-tier ops lever) ────────
-// Lets an authenticated admin run the idempotent migrate + seed on demand
-// without dashboard Shell access. Safe to call repeatedly. Returns the
-// release status object. Mirrors what boot-time autoRelease does.
-const { protect: protectRelease, adminOnly: adminOnlyRelease } = require('./middleware/authMiddleware');
-app.post('/api/admin/susu/release', protectRelease, adminOnlyRelease, async (req, res) => {
-    try {
-        const { autoRelease } = require('./infra/autoRelease');
-        const status = await autoRelease(prisma, { force: true });
-        // Re-resolve the treasury cache immediately so Susu comes online
-        // without waiting for the 60s retry tick.
-        try {
-            const treasury = await prisma.user.findUnique({
-                where: { username: 'azaman-treasury' },
-                select: { id: true },
-            });
-            if (treasury) app.set('azamanTreasuryUserId', treasury.id);
-        } catch (_) { /* non-fatal */ }
-        res.status(200).json({
-            success: true,
-            data: { release: status, treasuryCached: !!app.get('azamanTreasuryUserId') },
-        });
-    } catch (err) {
-        res.status(500).json({ success: false, message: err.message });
-    }
-});
+// ── Health Check + Admin Susu Release (extracted to src/routes/health.js) ──────
+const { mountHealthRoutes } = require('./src/routes/health');
+mountHealthRoutes(app, { prisma, workerStatus, redisStatusRef: () => redisStatus, APP_VERSION, IS_PRODUCTION });
 
 // ══════════════════════════════════════════════════════════════════════════════
 // 4. REAL-TIME ENGINE (Socket.IO)
@@ -485,7 +107,8 @@ app.post('/api/admin/susu/release', protectRelease, adminOnlyRelease, async (req
 const io = new Server(server, {
     cors: {
         origin: corsOrigins.includes('*') ? '*' : corsOrigins,
-        methods: ["GET", "POST"]
+        methods: ["GET", "POST"],
+        credentials: true
     }
 });
 
@@ -507,1307 +130,193 @@ if (process.env.REDIS_URL) {
         pubClient.on('connect', () => { redisStatus = 'connected'; });
         pubClient.on('error', (e) => {
             redisStatus = 'disconnected';
-            console.error('[Redis] adapter error:', e.message);
+            logger.error({ err: e }, 'Redis adapter error');
         });
         io.adapter(createAdapter(pubClient, subClient));
-        console.log('Socket.IO Redis adapter enabled (multi-instance mode).');
+        logger.info('Socket.IO Redis adapter enabled (multi-instance mode)');
     } catch (e) {
         // Don't take the whole server down over a missing optional dep or a
         // bad URL — fall back to the in-memory adapter (single-instance only).
         redisStatus = 'disconnected';
-        console.error('[Redis] adapter init failed; using in-memory adapter:', e.message);
+        logger.error({ err: e }, 'Redis adapter init failed, using in-memory adapter');
     }
 } else {
-    console.log('REDIS_URL not set — Socket.IO using in-memory adapter (single instance).');
+    logger.info('REDIS_URL not set — Socket.IO using in-memory adapter (single instance)');
 }
 
 // ── STARTUP: warn if Cloudinary not configured (profile pics will use local disk) ──
 if (process.env.NODE_ENV === 'production' &&
     !(process.env.CLOUDINARY_CLOUD_NAME && process.env.CLOUDINARY_API_KEY && process.env.CLOUDINARY_API_SECRET)) {
-    console.warn('⚠️  [STARTUP] CLOUDINARY credentials not set. Profile pictures & media uploads');
-    console.warn('   will be saved to EPHEMERAL local disk — files will be lost on every redeploy.');
-    console.warn('   Set CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET in Render.');
+    logger.warn('CLOUDINARY credentials not set. Profile pictures & media uploads will be saved to EPHEMERAL local disk — files lost on redeploy. Set CLOUDINARY_CLOUD_NAME, CLOUDINARY_API_KEY, CLOUDINARY_API_SECRET.');
 }
 
-// CRITICAL-4: Socket.IO JWT Authentication Middleware
-io.use((socket, next) => {
-    const token = socket.handshake.auth?.token || socket.handshake.headers?.authorization?.replace('Bearer ', '');
+// CRITICAL-4: Socket.IO JWT Authentication (extracted to src/sockets/socketAuth.js)
+const { createSocketAuthMiddleware } = require('./src/sockets/socketAuth');
+io.use(createSocketAuthMiddleware(JWT_SECRET));
 
-    if (!token) {
-        return next(new Error('Authentication required: No token provided.'));
-    }
+// ── Socket Services (extracted to src/sockets/socketServices.js) ──────────────
+const { createSocketServices } = require('./src/sockets/socketServices');
+const {
+    tradeSocketService, chatSocketService, groupChatSocketService,
+    friendSocketService, ticketSocketService, notificationService,
+    vendorStatus,
+} = createSocketServices(io, prisma, app);
 
-    try {
-        const decoded = jwt.verify(token, JWT_SECRET);
-        if (!decoded.id) {
-            return next(new Error('Authentication failed: Invalid token structure.'));
-        }
-        socket.user = decoded; // Attach user context to socket
-        next();
-    } catch (err) {
-        if (err.name === 'TokenExpiredError') {
-            return next(new Error('Authentication failed: Token expired.'));
-        }
-        return next(new Error('Authentication failed: Invalid token.'));
-    }
-});
+// ── Treasury boot (extracted to src/boot/treasury.js) ────────────────────────
+const { bootTreasury } = require('./src/boot/treasury');
+bootTreasury(app, prisma);
 
-const vendorStatus = new Map();
-
-// B-11: Transit booking routes
-const transitRoutes = require('./routes/transitRoutes');
-
-// --- TRADE SOCKET SERVICE ---
-const TradeSocketService = require('./services/tradeSocketService');
-const tradeSocketService = new TradeSocketService(io, prisma);
-
-// --- CHAT SOCKET SERVICE ---
-const ChatSocketService = require('./services/chatSocketService');
-const chatSocketService = new ChatSocketService(io, prisma);
-
-const GroupChatSocketService = require('./services/groupChatSocketService');
-const groupChatSocketService = new GroupChatSocketService(io, prisma);
-
-// --- FRIEND SOCKET SERVICE ---
-const FriendSocketService = require('./services/friendSocketService');
-const friendSocketService = new FriendSocketService(io, prisma);
-
-// --- TICKET SOCKET SERVICE (Phase UI-4, 2026-05-26) ---
-const TicketSocketService = require('./services/ticketSocketService');
-const ticketSocketService = new TicketSocketService(io, prisma);
-
-// --- NOTIFICATION SERVICE (canonical persistence + emit) ---
-const NotificationService = require('./services/notificationService');
-const notificationService = new NotificationService(prisma, io);
-app.set('notificationService', notificationService);
-
-// --- ADMIN_DISPUTE_ESCROW (Private Susu Ecosystem, 2026-05-31) ───────────────
-// Cache the treasury wallet's User id at startup so cycle workers and
-// service code can look it up via req.app.get('azamanTreasuryUserId') in
-// O(1) instead of querying every cycle.
-//
-// Boot-time auto-release (Susu Sprint, 2026-06-01): free-tier hosting has
-// no Shell / Pre-Deploy hook, so we run the one-time, idempotent
-// migrate + seed step here at boot (infra/autoRelease.js). It only does
-// work when the treasury row is missing, never blocks request handling,
-// and never crashes the process. Once it seeds, the treasury cache below
-// resolves on its retry and Susu comes online — no redeploy required.
-//
-// Resilience: the treasury check is intentionally NON-FATAL. The treasury
-// row is required for the escrow-diversion path (Req 10.8) and self-default
-// seizure routing (Req 11.3), but a missing
-// row must NOT take down the entire backend (trades, wallet, chat, etc.).
-// If the seed hasn't run yet, we log a loud warning, leave
-// `azamanTreasuryUserId` unset, and let the Susu cycle workers skip
-// themselves (they already guard on the cache resolving — see the
-// startV2Workers poll below). Once `node infra/seed-susu-foundation.js`
-// runs and the service restarts, the id resolves and Susu comes online.
-// A self-heal retry also re-checks every 60s so a seed applied while the
-// process is live is picked up without a restart.
-const { autoRelease } = require('./infra/autoRelease');
-(async () => {
-    const cacheTreasury = async () => {
-        const treasury = await prisma.user.findUnique({
-            where: { username: 'azaman-treasury' },
-            select: { id: true },
-        });
-        if (treasury) {
-            app.set('azamanTreasuryUserId', treasury.id);
-            return treasury.id;
-        }
-        return null;
-    };
-
-    try {
-        // Run the boot release (installer converges schema; seed is
-        // internally gated on treasury-missing). This lands additive
-        // columns/tables on every deploy without prisma migrate (prod Neon
-        // is db push-managed behind a pooler — see infra/autoRelease.js).
-        // Skipped under test: CI applies the schema via `prisma db push`, and
-        // booting auth.test.js must not trigger the installer/seed path.
-        if (process.env.NODE_ENV !== 'test') {
-            await autoRelease(prisma);
-        }
-
-        // Resolve + cache the treasury id (seeded by autoRelease if it was
-        // missing).
-        const id = await cacheTreasury();
-
-        if (id) {
-            console.log(`[Susu] Treasury wallet cached (userId=${id})`);
-        } else {
-            console.warn(
-                '[Susu] WARNING: azaman-treasury User row not found after ' +
-                'auto-release. Susu escrow/cycle features are DISABLED until ' +
-                'it is seeded. The rest of the backend is unaffected. ' +
-                'Retrying every 60s…'
-            );
-            const retry = setInterval(async () => {
-                try {
-                    const rid = await cacheTreasury();
-                    if (rid) {
-                        console.log(`[Susu] Treasury wallet cached on retry (userId=${rid}).`);
-                        clearInterval(retry);
-                    }
-                } catch (e) {
-                    console.warn('[Susu] treasury retry failed:', e.message);
-                }
-            }, 60_000);
-            retry.unref?.();
-        }
-    } catch (err) {
-        // Non-fatal: log and continue. Susu stays dark; everything else runs.
-        console.warn('[Susu] WARNING: failed to cache treasury wallet id (non-fatal):', err.message);
-    }
-})();
-
-// --- KYC SERVICE (Phase Q6) ---
-// Singleton: manages KYC verification lifecycle (initialize, webhook, admin override).
-// Shared across controllers via req.app.get('kycService').
-//
-// SWAPPABLE ADAPTER (Phase Q6 LIVE):
-// kycService.js (MOCK) and dojahKycService.js (LIVE Ghana lookups) expose the
-// exact same public surface, so we bind ONE of them based on KYC_PROVIDER:
-//   - KYC_PROVIDER=LIVE | dojah → real Dojah sandbox/production calls
-//   - anything else (default)   → deterministic MOCK, safe for local dev + CI
-//
-// The MOCK wiring is preserved (commented out) right below the live wiring so we
-// always have a one-line fallback if the live provider misbehaves.
-const KYCService = require('./services/kycService');
-const DojahKYCService = require('./services/dojahKycService');
-
-const KYC_PROVIDER = (process.env.KYC_PROVIDER || 'mock').toLowerCase();
-const KYC_LIVE = KYC_PROVIDER === 'live' || KYC_PROVIDER === 'dojah';
-
-// ── LIVE Dojah wiring ────────────────────────────────────────────────────────
-// const kycService = new KYCService(prisma, notificationService); // ← MOCK fallback (uncomment to revert)
-const kycService = KYC_LIVE
-    ? new DojahKYCService(prisma, notificationService)
-    : new KYCService(prisma, notificationService);
-app.set('kycService', kycService);
-console.log(`🪪  [KYC] Provider = ${KYC_LIVE ? 'DOJAH (live)' : 'MOCK'}`);
-
-// --- RATE ALERT SERVICE (Phase Q12) ---
-// Singleton: manages user rate alerts (CRUD + threshold checking on oracle sync).
-// Shared across controllers via req.app.get('rateAlertService').
-const RateAlertService = require('./services/rateAlertService');
-const rateAlertService = new RateAlertService(prisma, notificationService);
-app.set('rateAlertService', rateAlertService);
-// Hook into oracle sync — check alerts after every rate update
-marketOracle.rateAlertService = rateAlertService;
-
-// --- AZM REWARD SERVICE (Phase E1) ---
-// Singleton: manages all AZM loyalty-point crediting with audit trail + socket.
-// Shared across controllers via req.app.get('azmRewardService').
-const { AzmRewardService } = require('./services/azmRewardService');
-const azmRewardService = new AzmRewardService(prisma, io);
-app.set('azmRewardService', azmRewardService);
-
-// --- AZM SPEND SERVICE (Phase E2) ---
-// Singleton: manages all AZM loyalty-point debiting (fee discounts, ad boosts).
-// Shared across controllers via req.app.get('azmSpendService').
-const { AzmSpendService } = require('./services/azmSpendService');
-const azmSpendService = new AzmSpendService(prisma, io);
-app.set('azmSpendService', azmSpendService);
-
-// ─────────────────────────────────────────────────────────────────────────────
-// MASTER SPRINT (2026-05-27): VAULTS, SUSU, GROUP CHAT, SMART ROUTE, AZM AUCTION
-// ─────────────────────────────────────────────────────────────────────────────
-
-const { VaultService } = require('./services/vaultService');
-const vaultService = new VaultService(prisma, io, notificationService, azmRewardService);
-app.set('vaultService', vaultService);
-
-const { GroupChatService } = require('./services/groupChatService');
-const groupChatService = new GroupChatService(prisma, io, notificationService);
-app.set('groupChatService', groupChatService);
-
-// PHASE 6 — member-proposed group adds + admin add-quota engine.
-const { GroupJoinRequestService } = require('./services/groups/groupJoinRequest.service');
-const groupJoinRequestService = new GroupJoinRequestService(prisma, { notificationService, io });
-app.set('groupJoinRequestService', groupJoinRequestService);
-
-const { SusuService } = require('./services/susuService');
-const susuService = new SusuService(prisma, io, notificationService, azmRewardService);
-app.set('susuService', susuService);
-
-// ── PRIVATE SUSU ECOSYSTEM OVERLAY (2026-05-31) ───────────────────────────────
-// New service layer for the additive Susu features (KYC/PoR gating,
-// three-channel invites, Liability Contract acceptance, Vouch slashing,
-// Admin War Room alerts). Lives in services/susu/ subdir to avoid
-// colliding with the legacy susuService.js above. Each overlay service
-// is exposed via its own app.set key.
-const SusuMemberService            = require('./services/susu/susuMember.service');
-const SusuVouchService             = require('./services/susu/susuVouch.service');
-const SusuOverlayService           = require('./services/susu/susu.service');
-const SusuInviteService            = require('./services/susu/susuInvite.service');
-const LiabilityContractServiceCls  = require('./services/susu/liabilityContract.service');
-const ProofOfResidencyServiceCls   = require('./services/susu/proofOfResidency.service');
-const AdminWarRoomServiceCls       = require('./services/susu/adminWarRoom.service');
-
-const susuMemberService            = new SusuMemberService(prisma);
-const susuVouchService             = new SusuVouchService(prisma, { notificationService });
-const liabilityContractService     = new LiabilityContractServiceCls(prisma);
-const susuOverlayService           = new SusuOverlayService(prisma, {
-    susuVouchService,
-    susuMemberService,
-    liabilityContractService,
-});
-const susuInviteService            = new SusuInviteService(prisma, {
-    susuVouchService,
-    susuMemberService,
-    notificationService,
-});
-const proofOfResidencyService      = new ProofOfResidencyServiceCls(prisma, { susuMemberService });
-const adminWarRoomService          = new AdminWarRoomServiceCls(prisma, { notificationService });
-
-// PHASE 5 / Workstream E — Admin Portal Susu monitor (list/detail/member
-// decryption/resolve). Reuses the vouch service for REFUND_AND_CLOSE vouch
-// voiding.
-const AdminSusuMonitorServiceCls   = require('./services/susu/adminSusuMonitor.service');
-const adminSusuMonitorService      = new AdminSusuMonitorServiceCls(prisma, {
-    susuVouchService,
-    notificationService,
-});
-
-// PHASE 5 / Workstream D — group-chat-first Susu initiation
-const SusuInitiationService        = require('./services/susu/susuInitiation.service');
-const susuInitiationService        = new SusuInitiationService(prisma, {
-    susuOverlayService,
-    susuMemberService,
-    liabilityContractService,
-    notificationService,
-    io,
-});
-
-app.set('susuMemberService',        susuMemberService);
-app.set('susuVouchService',         susuVouchService);
-app.set('susuOverlayService',       susuOverlayService);
-app.set('susuInviteService',        susuInviteService);
-app.set('liabilityContractService', liabilityContractService);
-app.set('proofOfResidencyService',  proofOfResidencyService);
-app.set('adminWarRoomService',      adminWarRoomService);
-app.set('susuInitiationService',    susuInitiationService);
-app.set('adminSusuMonitorService',  adminSusuMonitorService);
-
-const { SmartRouteService } = require('./services/smartRouteService');
-const smartRouteService = new SmartRouteService({
-    prisma,
-    io,
-    notificationService,
-    mtnDisbursementService,
+// ── Service Registry (extracted to src/services/registry.js) ──────────────────
+const { registerServices } = require('./src/services/registry');
+const {
+    kycService,
+    rateAlertService,
     vaultService,
-});
-app.set('smartRouteService', smartRouteService);
-
-const { AzmAuctionService } = require('./services/azmAuctionService');
-const azmAuctionService = new AzmAuctionService({
+    groupChatService,
+    smartRouteService,
+    azmAuctionService,
+    adminAlertService,
+    storyService,
+    susuService,
+    susuInitiationService,
+} = registerServices(app, {
     prisma,
     io,
-    azmSpendService,
     notificationService,
-});
-app.set('azmAuctionService', azmAuctionService);
-
-// Master Sprint v2 (2026-05-27): MoMo name lookup — delegates to the already-
-// instantiated moolreCollectionService so there is exactly one authenticated
-// Moolre client in the process. We pass the shared instance in to avoid a
-// second independent constructor call with its own token/credential state.
-const { MomoNameLookupService } = require('./services/momoNameLookupService');
-const momoNameLookupService = new MomoNameLookupService(moolreCollectionService);
-app.set('momoNameLookupService', momoNameLookupService);
-
-// --- WORKERS ---
-// Background workers schedule cron jobs / setInterval timers inside their
-// .start(). Under test (NODE_ENV==='test' — e.g. __tests__/auth.test.js requires
-// this module via supertest) we must NOT start them: the open handles would hang
-// the jest process and the scheduled jobs would run against the disposable test
-// DB. We guard only .start() (not instantiation) so the references in the listen
-// callback and graceful-shutdown handler stay in module scope.
-const IS_TEST_ENV = process.env.NODE_ENV === 'test';
-const startWorker = (w) => { if (!IS_TEST_ENV) w.start(); };
-
-const TradeWorker = require('./workers/tradeWorker');
-const tradeWorker = new TradeWorker(prisma, io, tradeSocketService);
-
-const LeaderboardWorker = require('./workers/leaderboardWorker');
-const leaderboardWorker = new LeaderboardWorker(prisma, io);
-startWorker(leaderboardWorker);
-
-const AnalyticsWorker = require('./workers/analyticsWorker');
-const analyticsWorker = new AnalyticsWorker(prisma);
-startWorker(analyticsWorker);
-
-const CfoWorker = require('./workers/cfoWorker');
-const cfoWorker = new CfoWorker(prisma, io);
-startWorker(cfoWorker);
-
-const SavingsWorker = require('./workers/savingsWorker');
-const savingsWorker = new SavingsWorker(prisma, io);
-startWorker(savingsWorker);
-
-const WithdrawalReconciliationWorker = require('./workers/withdrawalReconciliationWorker');
-const withdrawalReconciliationWorker =
-    new WithdrawalReconciliationWorker(prisma, io, mtnDisbursementService, emailService, smsService);
-startWorker(withdrawalReconciliationWorker);
-
-// --- PAYOUT BATCH WORKER (Phase Q8) ---
-// Scans PENDING fiat withdrawals and auto-dispatches when pool has liquidity
-// AND amount is below the admin-configured threshold. Flags oversized or
-// under-funded withdrawals as NEEDS_MANUAL_REVIEW for the War Room.
-const PayoutBatchWorker = require('./workers/payoutBatchWorker');
-const payoutBatchWorker = new PayoutBatchWorker(prisma, io, mtnDisbursementService, notificationService);
-startWorker(payoutBatchWorker);
-app.set('payoutBatchWorker', payoutBatchWorker);
-
-// --- SMART ESCROW EXPIRY WORKER (2026-06-14) ---
-// Sweeps DRAFT escrows past 24h and FUNDED escrows past 30d of inactivity
-// (refunding the payer), every 30 minutes. No-op safe in test mode.
-const EscrowExpiryWorker = require('./workers/escrowExpiryWorker');
-const escrowExpiryWorker = new EscrowExpiryWorker(prisma, io, notificationService);
-startWorker(escrowExpiryWorker);
-app.set('escrowExpiryWorker', escrowExpiryWorker);
-
-// --- MASTER SPRINT WORKERS (Vault / Susu / Smart Route / AZM Auction) ---
-const VaultWorker = require('./workers/vaultWorker');
-const vaultWorker = new VaultWorker(prisma, vaultService, notificationService);
-startWorker(vaultWorker);
-
-const SusuWorker = require('./workers/susuWorker');
-const susuWorker = new SusuWorker(prisma, susuService);
-startWorker(susuWorker);
-
-// ── Phase 3 (private-susu-ecosystem) workers — 2026-05-31 ───────────────────
-// V2 cycle scheduler (60s cadence) handles SusuGroups with contractVersion
-// set. Legacy susuWorker above continues to handle pre-Phase-3 SusuGroups
-// whose contractVersion is null. Reminder cron + PoR expiry sweep complete
-// the Phase 3 surface. All three workers are no-ops in test mode.
-if (process.env.NODE_ENV !== 'test') {
-
-
-    const SusuCycleService          = require('./services/susu/susuCycle.service');
-    const SusuCycleSchedulerV2      = require('./workers/susuCycleSchedulerV2');
-    const SusuReminderCron          = require('./workers/susuReminderCron');
-    const PorExpirySweep            = require('./workers/porExpirySweep');
-
-    // Wait until the treasury cache (server.js earlier IIFE) has resolved
-    // before instantiating the cycle service — it depends on the
-    // azamanTreasuryUserId.
-    //
-    // Resilience (Susu Sprint, 2026-06-01): the treasury seed may land
-    // after boot (e.g. the release `migrate + seed` step runs in parallel
-    // with the first server start, or an operator seeds manually later).
-    // Rather than give up after 10s and leave the cycle workers dead until
-    // the next full restart, we poll patiently (every 5s for up to 30 min).
-    // The poll is cheap (an in-memory app.get) and self-terminates the
-    // moment the id resolves. Susu cycle execution thus comes online
-    // automatically once the DB is prepared — no redeploy required.
-    const startV2Workers = async () => {
-        const start = Date.now();
-        const MAX_WAIT_MS = 30 * 60 * 1000; // 30 minutes
-        while (!app.get('azamanTreasuryUserId') && Date.now() - start < MAX_WAIT_MS) {
-            await new Promise(r => setTimeout(r, 5000));
-        }
-        const treasuryUserId = app.get('azamanTreasuryUserId');
-        if (!treasuryUserId) {
-            console.warn('[SusuV2 Workers] treasury cache not resolved within 30 min; ' +
-                'cycle/reminder/PoR workers NOT started. Seed the treasury row and ' +
-                'restart the service to enable them. (Rest of backend unaffected.)');
-            return;
-        }
-        const susuCycleService = new SusuCycleService(prisma, {
-            susuVouchService:    app.get('susuVouchService'),
-            susuMemberService:   app.get('susuMemberService'),
-            adminWarRoomService: app.get('adminWarRoomService'),
-            notificationService,
-            io,
-            treasuryUserId,
-        });
-        app.set('susuCycleService', susuCycleService);
-
-        const cycleSchedulerV2 = new SusuCycleSchedulerV2(prisma, susuCycleService);
-        cycleSchedulerV2.start();
-        app.set('susuCycleSchedulerV2', cycleSchedulerV2);
-
-        const reminderCron = new SusuReminderCron(prisma, notificationService);
-        reminderCron.start();
-        app.set('susuReminderCron', reminderCron);
-
-        const porExpirySweep = new PorExpirySweep(prisma, app.get('susuMemberService'), notificationService);
-        porExpirySweep.start();
-        app.set('porExpirySweep', porExpirySweep);
-    };
-    startV2Workers().catch(err => console.error('[SusuV2 Workers] startup error:', err.message));
-}
-
-const SmartRouteWorker = require('./workers/smartRouteWorker');
-const smartRouteWorker = new SmartRouteWorker(prisma, smartRouteService);
-startWorker(smartRouteWorker);
-
-// PHASE 5 / Workstream D — Susu initiation countdown sweep (every 60s).
-// Independent of the treasury cache (it only manages membership + activation),
-// so it starts unconditionally. No-op in test mode.
-if (process.env.NODE_ENV !== 'test') {
-    const SusuInitiationSweep = require('./workers/susuInitiationSweep');
-    const susuInitiationSweep = new SusuInitiationSweep(prisma, susuInitiationService);
-    susuInitiationSweep.start();
-    app.set('susuInitiationSweep', susuInitiationSweep);
-}
-
-const AzmAuctionWorker = require('./workers/azmAuctionWorker');
-const azmAuctionWorker = new AzmAuctionWorker(prisma, azmAuctionService);
-startWorker(azmAuctionWorker);
-
-// MARKETPLACE EXPANSION — No-Show Penalty Sweep
-if (process.env.NODE_ENV !== 'test') {
-    const noShowWorker = require('./workers/reservationNoShowWorker');
-    // Run every hour
-    cron.schedule('0 * * * *', async () => {
-        try {
-            console.log('[NoShowWorker] Running scheduled sweep...');
-            const results = await noShowWorker.sweepAll(prisma);
-            console.log('[NoShowWorker] Sweep complete:', JSON.stringify(results));
-        } catch (err) {
-            console.error('[NoShowWorker] Sweep failed:', err.message);
-        }
-    });
-}
-
-// FIX (2026-07-06): both workers below were fully written (and each has its
-// own internal try/catch) but were never actually registered with cron --
-// their own file headers literally said "ADD to server.js" as a to-do that
-// was never done. sweepExpiredAds in particular is what keeps the
-// marketplace "status"/ad-feed table from growing unbounded (reads already
-// filter expired rows out, so this was silent DB bloat, not a user-facing
-// bug -- but it's exactly the kind of thing that quietly gets worse over
-// time if never registered).
-if (process.env.NODE_ENV !== 'test') {
-    const { sweepTransitReminders } = require('./workers/transitReminderWorker');
-    const { sweepExpiredAds } = require('./workers/businessAdExpiryWorker');
-    cron.schedule('*/15 * * * *', () => sweepTransitReminders(prisma));
-    cron.schedule('*/30 * * * *', () => sweepExpiredAds(prisma));
-}
-
-// ── D-05: record worker liveness for GET /health ─────────────────────────────
-// These all called .start() above. tradeWorker is special: it is instantiated
-// here but only .start()'d in the server.listen callback (so its expiry sweep
-// doesn't run before the server is accepting traffic). We seed it as
-// 'pending_listen' and flip it to 'running' from that callback, so /health
-// reflects its true state rather than omitting it. The Susu V2 cycle workers
-// start asynchronously after the treasury cache resolves and register
-// themselves via app.set(...); /health reflects them through the app registry.
-Object.assign(workerStatus, {
-    leaderboardWorker: 'running',
-    analyticsWorker: 'running',
-    cfoWorker: 'running',
-    savingsWorker: 'running',
-    withdrawalReconciliationWorker: 'running',
-    payoutBatchWorker: 'running',
-    vaultWorker: 'running',
-    susuWorker: 'running',
-    smartRouteWorker: 'running',
-    azmAuctionWorker: 'running',
-    tradeWorker: 'pending_listen',
-});
-if (process.env.NODE_ENV === 'test') {
-    // Workers are no-ops in test mode; don't claim they're running.
-    for (const k of Object.keys(workerStatus)) workerStatus[k] = 'disabled_in_test';
-}
-
-// --- OFFLINE PUSH HELPER ---
-const pushIfOffline = async (userId, title, body, extra = {}) => {
-    try {
-        if (!userId) return;
-        const room = `user_${userId}`;
-        const sockets = await io.in(room).allSockets();
-        if (sockets && sockets.size > 0) return;
-
-        const user = await prisma.user.findUnique({
-            where: { id: parseInt(userId) },
-            select: { fcmToken: true }
-        });
-        if (!user || !user.fcmToken) return;
-
-        await sendPushNotification(user.fcmToken, title, body, extra);
-    } catch (err) {
-        console.error('pushIfOffline error:', err.message);
-    }
-};
-
-const emitBalanceUpdate = async (userId) => {
-    try {
-        const user = await prisma.user.findUnique({
-            where: { id: parseInt(userId) },
-            select: {
-                availableBalance: true,
-                vendorUnallocatedBalance: true,
-                escrowLockedBalance: true,
-                disputeEscrowBalance: true,
-                azmBalance: true
-            }
-        });
-        if (user) {
-            io.to(`balance_room_${userId}`).emit('balance_update', {
-                availableBalance: user.availableBalance,
-                vendorUnallocatedBalance: user.vendorUnallocatedBalance,
-                escrowLockedBalance: user.escrowLockedBalance,
-                disputeEscrowBalance: user.disputeEscrowBalance,
-                azmBalance: user.azmBalance,
-                currency: 'USDC'
-            });
-        }
-    } catch (err) {
-        console.error("Balance Emit Error:", err.message);
-    }
-};
-
-// --- GLOBAL APP SETTINGS ---
-app.set('socketio', io);
-app.set('prisma', prisma);
-app.set('vendorStatus', vendorStatus);
-app.set('emitBalanceUpdate', emitBalanceUpdate);
-
-// Smart Escrow & Business Accounts (2026-06-14): escrowService exports plain
-// functions, so bind the module itself rather than an instance.
-const EscrowService = require('./services/escrowService');
-app.set('escrowService', EscrowService);
-app.set('pushIfOffline', pushIfOffline);
-app.set('gatewayService', gatewayService);
-app.set('mtnDisbursementService', mtnDisbursementService);
-// finance.controller.js reads 'moolreDisbursementService'; withdrawalController.js reads
-// 'mtnDisbursementService'. Both variables point at the same MoolreDisbursementService
-// instance — registering under both keys costs nothing and avoids silent 503 errors.
-app.set('moolreDisbursementService', mtnDisbursementService);
-app.set('moolreCollectionService', moolreCollectionService);
-app.set('tatumService', tatumService);
-app.set('emailService', emailService);
-app.set('smsService', smsService);
-
-// B-11: admin alert service (socket broadcast + email to ADMIN_ALERT_EMAIL).
-// Registered for controllers to fetch via req.app.get('adminAlertService').
-// Inert until trigger points are wired (see services/adminAlertService.js
-// WIRING block) and harmless until ADMIN_ALERT_EMAIL / a real email provider
-// are set.
-const AdminAlertService = require('./services/adminAlertService');
-const adminAlertService = new AdminAlertService({ io, emailService });
-app.set('adminAlertService', adminAlertService);
-
-const StoryService = require('./services/storyService');
-const storyService = new StoryService(io, prisma, azmSpendService, null);
-app.set('storyService', storyService);
-
-// Stories expiration cron
-cron.schedule('*/15 * * * *', () => {
-    app.get('storyService').expireOldStories().catch(err => console.error('[StoryCron]', err));
+    marketOracle,
+    gatewayService,
+    mtnDisbursementService,
+    moolreCollectionService,
+    emailService,
+    smsService,
+    tatumService,
 });
 
 // The KYC service runs webhook processing outside the request lifecycle (no
-// req.app handle), so hand it the alert service directly. Optional chaining at
-// the callsite keeps it safe if this ever isn't set.
+// req.app handle), so hand it the alert service directly.
 kycService.adminAlertService = adminAlertService;
 
-// C-8: Health check — no auth required
-app.get('/health', async (req, res) => {
-    const prisma = req.app.get('prisma');
-    let dbOk = false;
-    try {
-        await prisma.$queryRaw`SELECT 1`;
-        dbOk = true;
-    } catch (_) {}
-    const io = req.app.get('io');
-    let sockets = 0;
-    try { sockets = io ? (await io.allSockets()).size : 0; } catch (_) {}
-    return res.json({
-        status:    'ok',
-        uptime:    process.uptime(),
-        db:        dbOk ? 'connected' : 'error',
-        sockets,
-        env:       process.env.NODE_ENV,
-        timestamp: new Date().toISOString(),
-    });
+const IS_TEST_ENV = process.env.NODE_ENV === 'test';
+
+// ── Worker Registry (extracted to src/workers/index.js) ──────────────────────
+const { startWorkers } = require('./src/workers/index');
+const workersPromise = startWorkers(app, {
+    prisma,
+    io,
+    workerStatus,
+    tradeSocketService,
+    mtnDisbursementService,
+    paymentFailoverService,
+    emailService,
+    smsService,
+    notificationService,
+    vaultService,
+    susuService,
+    smartRouteService,
+    azmAuctionService,
+    susuInitiationService,
 });
+let tradeWorker, withdrawalReconciliationWorker;
+let tradeWorkerReady = false;
+workersPromise.then(result => {
+    ({ tradeWorker, withdrawalReconciliationWorker } = result);
+    tradeWorkerReady = true;
+    // Start the trade worker now that it's instantiated.
+    // Previously this was in the server.listen callback, but the async
+    // workersPromise may not have resolved by the time the port is bound,
+    // causing "Cannot read properties of undefined (reading 'start')".
+    if (!IS_TEST_ENV && tradeWorker) {
+        // Register tradeWorker intervals with BullMQ scheduler (no raw setInterval)
+        const scheduler = getScheduler();
+        scheduler.register('trade-milestones', String(60 * 1000), () => tradeWorker._checkMilestones());
+        scheduler.register('trade-escrow-release', String(30 * 1000), () => tradeWorker._checkEscrowAutoRelease());
+        workerStatus.tradeWorker = 'running';
+    }
+}).catch(err => logger.error({ err }, 'Worker startup error'));
+
+// ── Socket helpers (pushIfOffline, emitBalanceUpdate) ──
+const pushIfOffline = createPushIfOffline(io, prisma);
+const emitBalanceUpdate = createEmitBalanceUpdate(io, prisma);
+
+// ── Global app registrations (services already handled by registry) ──────────
+app.set('socketio', io);
+app.set('prisma', prisma);
+app.set('vendorStatus', vendorStatus);
+app.set('pushIfOffline', pushIfOffline);
+app.set('emitBalanceUpdate', emitBalanceUpdate);
+
+// ── Storefront Stake + Keep-Alive + Stories cron (registered via scheduler) ──
+const storefrontStakeWorker = require('./workers/storefrontStakeWorker');
+const keepAliveWorker = require('./workers/keepAliveWorker');
+const { getScheduler } = require('./src/lib/bullScheduler');
+(async () => {
+    const scheduler = getScheduler();
+    // Storefront stake: daily tier check + hourly unstake queue
+    await scheduler.register('storefront-stake-daily', String(24 * 60 * 60 * 1000), () => storefrontStakeWorker.dailyStakeCheckTick(prisma));
+    await scheduler.register('storefront-stake-unstake', String(60 * 60 * 1000), () => storefrontStakeWorker.processUnstakeQueueTick(prisma));
+    // Keep-alive: ping external services every 5 min
+    await scheduler.register('keep-alive', String(5 * 60 * 1000), () => keepAliveWorker.pingAll());
+    // Stories expiration
+    await scheduler.register('stories-expire', '*/15 * * * *', () => app.get('storyService')?.expireOldStories().catch(err => logger.error({ err }, 'StoryCron error')));
+})();
 
 // ══════════════════════════════════════════════════════════════════════════════
 // API VERSIONING + RESPONSE ENVELOPE (additive, non-breaking)
-// ──────────────────────────────────────────────────────────────────────────────
-// 1. apiVersioning resolves req.apiVersion from the path/headers.
-// 2. The alias rewrite maps `/api/v1/<x>` → `/api/<x>` IN PLACE so every
-//    existing mount below serves BOTH the legacy `/api/<x>` path and the new
-//    versioned `/api/v1/<x>` path — no router duplication, no client breakage.
-//    (Version is captured in step 1 BEFORE the prefix is stripped here.)
-// 3. responseHelpers adds opt-in res.ok()/res.fail(); it does NOT touch existing
-//    res.json(...) bodies the live Flutter client depends on.
 // ══════════════════════════════════════════════════════════════════════════════
-app.use('/api', require('./middleware/apiVersioning'));
-app.use((req, res, next) => {
-    const m = req.url.match(/^\/api\/v(\d+)(?=\/|\?|$)/);
-    if (m) req.url = '/api' + req.url.slice(m[0].length);
-    next();
-});
-app.use('/api', require('./middleware/responseHelpers'));
+// ── Route Registry (extracted to src/routes/index.js) ───────────────────────
+const { captureMountPaths } = require('./src/config/openapiGenerator');
+captureMountPaths(app);
 
-// ══════════════════════════════════════════════════════════════════════════════
-// API ROUTES (with rate limiting — CRITICAL-3)
-// ══════════════════════════════════════════════════════════════════════════════
-
-app.use('/api/public', generalLimiter, require('./routes/publicRoutes'));
-const { adminBusinessScope } = require('./middleware/adminBusinessScope');
-app.use(adminBusinessScope);
-
-app.use('/api/auth', authLimiter, authRoutes);
-app.use('/api/trades', financialLimiter, tradeRoutes);
-app.use('/api/ads', generalLimiter, adRoutes);
-app.use('/api/chat', generalLimiter, chatRoutes);
-app.use('/api/chat-upload', generalLimiter, chatUploadRoutes);
-app.use('/api/wallet', financialLimiter, walletRoutes);
-app.use('/api/admin', generalLimiter, adminRoutes);
-app.use('/api/kyc', generalLimiter, kycRoutes);
-app.use('/api/notifications', generalLimiter, notificationRoutes);
-app.use('/api/deposit', webhookLimiter, depositRoutes);
-app.use('/api/withdraw', financialLimiter, withdrawalRoutes);
-app.use('/api/trade-accounts', generalLimiter, tradeAccountRoutes);
-app.use('/api/payout-destinations', generalLimiter, payoutDestinationRoutes);
-app.use('/api/admin/chat', generalLimiter, adminChatRoutes);
-app.use('/api/security', generalLimiter, securityRoutes);
-app.use('/api/users', generalLimiter, userRoutes);
-app.use('/api/stories', generalLimiter, require('./routes/storyRoutes'));
-app.use('/api/contacts', generalLimiter, require('./routes/contactRoutes'));
-app.use('/api/war-room', generalLimiter, warRoomRoutes);
-app.use('/api/ai', generalLimiter, aiRoutes);
-app.use('/api/finance', financialLimiter, financeRoutes);
-app.use('/api/p2p', financialLimiter, p2pRoutes);
-app.use('/api/friends', generalLimiter, friendRoutes);
-app.use('/api/vendor', generalLimiter, vendorStatsRoutes);
-app.use('/api/savings', generalLimiter, savingsRoutes);
-app.use('/api/oracle', generalLimiter, oracleRoutes);
-app.use('/api/azm', generalLimiter, azmRoutes);
-app.use('/api/receipts', generalLimiter, receiptRoutes);
-app.use('/api/tickets', generalLimiter, ticketRoutes);
-
-// Smart Escrow & Business Accounts (2026-06-14)
-app.use('/api/escrow',   financialLimiter, escrowRoutes);
-app.use('/api/business', generalLimiter,   businessRoutes);
-
-// Marketplace Foundation (2026-06-24): Reservation system
-app.use('/api/reservations', generalLimiter, reservationRoutes);
-
-// Marketplace Expansion (2026-07-02)
-app.use('/api/follows',      generalLimiter, followRoutes);
-app.use('/api/ad-posts',     generalLimiter, adPostRoutes);
-app.use('/api/dine-in',      financialLimiter, dineInRoutes);
-app.use('/api/showcases',    generalLimiter, showcaseRoutes);
-app.use('/api/marketplace-finance',  financialLimiter, marketplaceFinanceRoutes);
-app.use('/api/marketplace-seat-map', generalLimiter, marketplaceSeatMapRoutes);
-app.use('/api/marketplace-penalty',  generalLimiter, marketplacePenaltyRoutes);
-
-// Master Sprint (2026-05-27)
-app.use('/api/vaults',        financialLimiter, vaultRoutes);
-app.use('/api/group-chats',   generalLimiter,   groupChatRoutes);
-app.use('/api/susu',          financialLimiter, susuRoutes);
-app.use('/api/smart-routes',  financialLimiter, smartRouteRoutes);
-app.use('/api/azm-auction',   generalLimiter,   azmAuctionRoutes);
-
-// Master Sprint v2 (2026-05-27): Saved MoMo accounts (deposit address book)
-app.use('/api/saved-momo',    financialLimiter, savedMomoRoutes);
-
-// B-11: Transit booking system
-app.use('/api/transit',       generalLimiter,   transitRoutes);
-
-// ── PRIVATE SUSU ECOSYSTEM OVERLAY ROUTES (2026-05-31) ────────────────────────
-// PoR + Liability + Admin War Room. Susu overlay endpoints are added inside
-// the existing /api/susu router (routes/susuRoutes.js) so /api/susu remains
-// the single mount point.
-const { userRouter: porUserRouter, adminRouter: porAdminRouter } = require('./routes/proofOfResidencyRoutes');
-const { publicRouter: liabPublicRouter, adminRouter: liabAdminRouter } = require('./routes/liabilityContractRoutes');
-const adminWarRoomRoutes = require('./routes/adminWarRoomRoutes');
-
-app.use('/api/users/proof-of-residency',  generalLimiter, porUserRouter);
-app.use('/api/admin/proof-of-residency',  generalLimiter, porAdminRouter);
-app.use('/api/liability-contract',        generalLimiter, liabPublicRouter);
-app.use('/api/admin/liability-contract',  generalLimiter, liabAdminRouter);
-app.use('/api/admin/war-room',            generalLimiter, adminWarRoomRoutes);
-
-// PHASE 5 / Workstream E — Admin Portal Susu monitor + operator actions.
-const adminSusuRoutes = require('./routes/adminSusuRoutes');
-const businessOSRoutes  = require('./routes/businessOSRoutes');
-app.use('/api/admin/susu',                generalLimiter, adminSusuRoutes);
-
-// MARKETPLACE EXPANSION — Phase B-2
-app.use('/api/marketplace',               generalLimiter, marketplaceRoutes);
-app.use('/api/business-os',   generalLimiter,   businessOSRoutes);
-
-// --- CHAT MEDIA UPLOAD (Phase UI-3, 2026-05-26) ──────────────────────────────
-//
-// Four typed multer endpoints for chat media + the legacy
-// /api/chat/upload-media endpoint (kept for backwards compat). All four new
-// endpoints are AUTHENTICATED via `protect`. The legacy endpoint was
-// historically open and image-only; it stays open here to avoid breaking any
-// in-the-wild builds, but the new clients should target the typed routes.
-//
-// Storage: Cloudinary (folders azaman/chat/{images,audio,video,documents}).
-// Files are buffered in memory by multer, then streamed to Cloudinary via the
-// shared uploadToCloudinary() service so the persisted URL survives Render
-// redeploys (the local disk is ephemeral on free-tier hosting).
-//
-// Size limits:
-//   • image    — 10 MB
-//   • audio    —  5 MB
-//   • video    — 50 MB
-//   • document — 25 MB
-const { uploadToCloudinary: uploadChatMedia } = require('./services/cloudinaryService');
-
-// Cloudinary folder per media kind (the service prefixes everything with azaman/).
-const _chatFolderFor = { image: 'chat/images', audio: 'chat/audio', video: 'chat/video', document: 'chat/documents' };
-
-const _chatStorageFor = () => multer.memoryStorage();
-
-const _chatMimeFilter = (allowed) => (req, file, cb) => {
-    if (allowed.some((p) => file.mimetype === p || file.mimetype.startsWith(p))) {
-        cb(null, true);
-    } else {
-        cb(new Error(`Disallowed mime: ${file.mimetype}`), false);
-    }
-};
-
-const chatImageUpload = multer({
-    storage: _chatStorageFor('image'),
-    limits: { fileSize: 10 * 1024 * 1024 },
-    fileFilter: _chatMimeFilter(['image/'])
-});
-const chatAudioUpload = multer({
-    storage: _chatStorageFor('audio'),
-    limits: { fileSize: 5 * 1024 * 1024 },
-    fileFilter: _chatMimeFilter([
-        'audio/mp4', 'audio/m4a', 'audio/x-m4a',
-        'audio/mpeg', 'audio/webm', 'audio/ogg', 'audio/wav', 'audio/aac'
-    ])
-});
-const chatVideoUpload = multer({
-    storage: _chatStorageFor('video'),
-    limits: { fileSize: 50 * 1024 * 1024 },
-    fileFilter: _chatMimeFilter(['video/'])
-});
-const chatDocumentUpload = multer({
-    storage: _chatStorageFor('document'),
-    limits: { fileSize: 25 * 1024 * 1024 },
-    fileFilter: _chatMimeFilter([
-        'application/pdf',
-        'application/msword',
-        'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-        'application/vnd.ms-excel',
-        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-        'application/vnd.ms-powerpoint',
-        'application/vnd.openxmlformats-officedocument.presentationml.presentation',
-        'text/plain', 'text/csv'
-    ])
+const { mountRoutes } = require('./src/routes/index');
+mountRoutes(app, {
+    authLimiter,
+    financialLimiter,
+    generalLimiter,
+    webhookLimiter,
 });
 
-const { protect: protectChatUpload } = require('./middleware/authMiddleware');
 
-// Helper: upload a buffered multer file to Cloudinary and return its secure_url.
-// `kind` selects the destination folder; documents are stored as `raw` so office
-// formats (docx/xlsx/csv/txt) are served back with their original bytes.
-const _uploadChatMediaUrl = async (file, kind) => {
-    const opts = kind === 'document' ? { resource_type: 'raw' } : {};
-    const { url } = await uploadChatMedia(file, _chatFolderFor[kind], opts);
-    return url;
-};
-
-// POST /api/chat/upload/image — { url, mimeType, size, filename }
-app.post('/api/chat/upload/image', protectChatUpload, chatImageUpload.single('file'), async (req, res) => {
-    if (!req.file) return res.status(400).json({ success: false, message: 'No file uploaded' });
-    try {
-        const url = await _uploadChatMediaUrl(req.file, 'image');
-        res.status(200).json({
-            success: true,
-            url,
-            mimeType: req.file.mimetype,
-            size: req.file.size,
-            filename: req.file.originalname
-        });
-    } catch (err) {
-        console.error('chat image upload error:', err.message);
-        res.status(500).json({ success: false, message: 'Upload failed' });
-    }
-});
-
-// POST /api/chat/upload/audio — { url, mimeType, size, duration, waveformPeaks }
-// `duration` (seconds) and `waveformPeaks` (50-bucket int array) are optional
-// body fields the client precomputes and includes alongside the file. The
-// server trusts them for MVP; a future PR can resample server-side via
-// audiowaveform if the trust model needs to tighten.
-app.post('/api/chat/upload/audio', protectChatUpload, chatAudioUpload.single('file'), async (req, res) => {
-    if (!req.file) return res.status(400).json({ success: false, message: 'No file uploaded' });
-    let waveformPeaks = null;
-    if (req.body.waveformPeaks) {
-        try {
-            const parsed = JSON.parse(req.body.waveformPeaks);
-            if (Array.isArray(parsed) && parsed.length <= 100) waveformPeaks = parsed;
-        } catch (_) { /* swallow */ }
-    }
-    const duration = parseInt(req.body.duration, 10);
-    try {
-        const url = await _uploadChatMediaUrl(req.file, 'audio');
-        res.status(200).json({
-            success: true,
-            url,
-            mimeType: req.file.mimetype,
-            size: req.file.size,
-            duration: Number.isFinite(duration) ? duration : null,
-            waveformPeaks
-        });
-    } catch (err) {
-        console.error('chat audio upload error:', err.message);
-        res.status(500).json({ success: false, message: 'Upload failed' });
-    }
-});
-
-// POST /api/chat/upload/video — { url, mimeType, size, duration }
-app.post('/api/chat/upload/video', protectChatUpload, chatVideoUpload.single('file'), async (req, res) => {
-    if (!req.file) return res.status(400).json({ success: false, message: 'No file uploaded' });
-    const duration = parseInt(req.body.duration, 10);
-    try {
-        const url = await _uploadChatMediaUrl(req.file, 'video');
-        res.status(200).json({
-            success: true,
-            url,
-            mimeType: req.file.mimetype,
-            size: req.file.size,
-            duration: Number.isFinite(duration) ? duration : null
-        });
-    } catch (err) {
-        console.error('chat video upload error:', err.message);
-        res.status(500).json({ success: false, message: 'Upload failed' });
-    }
-});
-
-// POST /api/chat/upload/document — { url, mimeType, size, filename }
-app.post('/api/chat/upload/document', protectChatUpload, chatDocumentUpload.single('file'), async (req, res) => {
-    if (!req.file) return res.status(400).json({ success: false, message: 'No file uploaded' });
-    try {
-        const url = await _uploadChatMediaUrl(req.file, 'document');
-        res.status(200).json({
-            success: true,
-            url,
-            mimeType: req.file.mimetype,
-            size: req.file.size,
-            filename: req.file.originalname
-        });
-    } catch (err) {
-        console.error('chat document upload error:', err.message);
-        res.status(500).json({ success: false, message: 'Upload failed' });
-    }
-});
-
-// ── BUSINESS IMAGE UPLOAD ─────────────────────────────────────────────────────
-// Business image upload — uses the same multer memoryStorage + Cloudinary
-// pipeline as chat media, but routes files to azaman/business/ folders.
-const { protect: protectBizUpload } = require('./middleware/authMiddleware');
-
-// POST /api/business/upload/image — uploads to azaman/business/products/
-// Used by the Add Product image picker and business logo upload.
-// The ?folder= query param selects the destination:
-//   ?folder=products  → azaman/business/products/  (default)
-//   ?folder=logos     → azaman/business/logos/
-//   ?folder=kyb       → azaman/business/kyb/
-// Returns: { success, url, mimeType, size, filename }
-app.post('/api/business/upload/image', protectBizUpload, chatImageUpload.single('file'), async (req, res) => {
-    if (!req.file) return res.status(400).json({ success: false, message: 'No file uploaded' });
-    try {
-        const folder = req.query.folder === 'logos' ? 'business/logos'
-                     : req.query.folder === 'kyb'   ? 'business/kyb'
-                     : 'business/products';
-
-        const { url } = await uploadChatMedia(req.file, folder);
-        res.status(200).json({
-            success: true,
-            url,
-            mimeType: req.file.mimetype,
-            size: req.file.size,
-            filename: req.file.originalname
-        });
-    } catch (err) {
-        console.error('business image upload error:', err.message);
-        res.status(500).json({ success: false, message: 'Upload failed' });
-    }
-});
-
-// POST /api/chat/link-preview — { url } -> { url, title, description, image, favicon, siteName, status }
-const LinkPreviewService = require('./services/linkPreviewService');
-const linkPreviewService = new LinkPreviewService(prisma);
-app.set('linkPreviewService', linkPreviewService);
-
-app.post('/api/chat/link-preview', protectChatUpload, async (req, res) => {
-    try {
-        const { url } = req.body;
-        if (!url) return res.status(400).json({ success: false, message: 'url required' });
-        const preview = await linkPreviewService.fetch(url);
-        if (!preview) return res.status(400).json({ success: false, message: 'invalid url' });
-        return res.status(200).json({ success: true, preview });
-    } catch (err) {
-        console.error('link-preview error:', err.message);
-        return res.status(500).json({ success: false, message: 'preview failed' });
-    }
-});
-
-// LEGACY (Phase 0): kept alive for older builds. Image-only, 8MB, public.
-// Phase UI-3 superseded this with the four typed endpoints above.
-const chatMediaUpload = multer({
-    storage: multer.memoryStorage(),
-    limits: { fileSize: 8 * 1024 * 1024 },
-    fileFilter: imageFileFilter
-});
-
-app.post('/api/chat/upload-media', chatMediaUpload.any(), async (req, res) => {
-    try {
-        const file = Array.isArray(req.files) ? req.files[0] : req.file;
-        if (!file) return res.status(400).json({ error: 'No file uploaded' });
-        const mediaUrl = await _uploadChatMediaUrl(file, 'image');
-        res.status(200).json({ mediaUrl, path: mediaUrl, url: mediaUrl });
-    } catch (err) {
-        console.error('Chat media upload error:', err.message);
-        res.status(500).json({ error: 'Upload failed' });
-    }
-});
-
-// --- VENDOR DOCUMENT UPLOAD ---
-const vendorDocsDir = 'uploads/vendor/';
-if (!fs.existsSync(vendorDocsDir)) fs.mkdirSync(vendorDocsDir, { recursive: true });
-
-const vendorDocsStorage = multer.diskStorage({
-    destination: (req, file, cb) => cb(null, vendorDocsDir),
-    filename: (req, file, cb) => {
-        const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-        cb(null, 'vendor-' + uniqueSuffix + path.extname(file.originalname));
-    }
-});
-const vendorDocsUpload = multer({
-    storage: vendorDocsStorage,
-    limits: { fileSize: 5 * 1024 * 1024 }, // 5MB per file
-    fileFilter: imageFileFilter
-});
-
-// POST /api/vendor/upload-docs — Upload vendor application documents (authenticated)
-const { protect: protectUpload } = require('./middleware/authMiddleware');
-app.post('/api/vendor/upload-docs', protectUpload, vendorDocsUpload.fields([
-    { name: 'idFront', maxCount: 1 },
-    { name: 'idBack', maxCount: 1 },
-    { name: 'selfie', maxCount: 1 },
-    { name: 'addressProof', maxCount: 1 },
-]), async (req, res) => {
-    try {
-        if (!req.files || Object.keys(req.files).length === 0) {
-            return res.status(400).json({ success: false, message: 'No files uploaded' });
-        }
-
-        const { uploadToCloudinary } = require('./services/cloudinaryService');
-        const urls = {};
-        for (const [field, files] of Object.entries(req.files)) {
-            if (files && files.length > 0) {
-                const { url } = await uploadToCloudinary(files[0], 'vendor-docs');
-                urls[field] = url;
-            }
-        }
-
-        console.log(`✅ [Vendor] Documents uploaded by user ${req.user.id}:`, Object.keys(urls));
-        return res.status(200).json({ success: true, urls });
-    } catch (err) {
-        console.error('Vendor docs upload error:', err.message);
-        return res.status(500).json({ success: false, message: 'Upload failed' });
-    }
-});
-
+// ── OpenAPI Spec Endpoint ─────────────────────────────────────────────────────
+const { serveSpec } = require('./src/config/openapiGenerator');
+app.get('/api/docs/openapi.json', serveSpec(app));
 // ══════════════════════════════════════════════════════════════════════════════
 // REAL-TIME CONNECTIONS (Authenticated — CRITICAL-4)
 // ══════════════════════════════════════════════════════════════════════════════
 
-io.on('connection', (socket) => {
-    const userId = socket.user.id;
-
-    // Attach BEFORE any event handlers below run so it guards every one.
-    socketRateLimiter.attach(socket);
-
-    // Auto-join user's own rooms (safe — verified by JWT)
-    socket.join(`user_${userId}`);
-    socket.join(`balance_room_${userId}`);
-
-    // Emit current balance immediately on connection
-    emitBalanceUpdate(userId).catch(err => {
-        console.error('[socket.connect] initial balance emit error:', err.message);
-    });
-
-    // ── B-7: Online / Offline / Last-Seen tracking ────────────────────────────
-    // Mark user online on connect, offline on disconnect. Emit to friends so
-    // chat surfaces show presence dots. Track lastSeenAt for "seen X ago" UI.
-    prisma.user.update({
-        where: { id: userId },
-        data: { isOnline: true, lastSeenAt: new Date() },
-    }).catch(() => {});
-
-    // Broadcast to friend rooms that this user came online (each friend's
-    // user_${friendId} room). Any friend who has this user as a friend can
-    // pick up the event.
-    socket.broadcast.emit('user_online', { userId, lastSeenAt: new Date().toISOString() });
-
-    socket.on('user_heartbeat', () => {
-        prisma.user.update({
-            where: { id: userId },
-            data: { lastSeenAt: new Date() },
-        }).catch(() => {});
-    });
-
-    // 1. Room Management — VALIDATED against socket.user
-    socket.on('join_balance_room', (requestedUserId) => {
-        // Only allow joining own balance room
-        if (parseInt(requestedUserId) === userId) {
-            socket.join(`balance_room_${userId}`);
-        }
-    });
-
-    socket.on('join_user_room', (data) => {
-        let requestedId;
-        if (typeof data === 'object' && data !== null) {
-            requestedId = data.userId || data.id;
-        } else {
-            requestedId = data;
-        }
-        // Only allow joining own user room
-        if (parseInt(requestedId) === userId) {
-            socket.join(`user_${userId}`);
-        }
-    });
-
-    // Master Sprint (2026-05-27): Group chat & Susu rooms.
-    // Membership check before joining — uses JWT-attached userId.
-    socket.on('join_group', async (groupId) => {
-        if (!groupId) return;
-        try {
-            const member = await prisma.groupMember.findUnique({
-                where: { groupId_userId: { groupId, userId } },
-            });
-            if (member && !member.removedAt) {
-                socket.join(`group_${groupId}`);
-            }
-        } catch (_) { /* swallow */ }
-    });
-    socket.on('leave_group', (groupId) => {
-        if (groupId) socket.leave(`group_${groupId}`);
-    });
-
-    socket.on('join_susu', async (susuGroupId) => {
-        if (!susuGroupId) return;
-        try {
-            const m = await prisma.susuMember.findUnique({
-                where: { susuGroupId_userId: { susuGroupId, userId } },
-            });
-            if (m) socket.join(`susu_${susuGroupId}`);
-        } catch (_) { /* swallow */ }
-    });
-    socket.on('leave_susu', (susuGroupId) => {
-        if (susuGroupId) socket.leave(`susu_${susuGroupId}`);
-    });
-
-    socket.on('join_trade', async (tradeId) => {
-        if (!tradeId) return;
-        const cleanId = tradeId.toString().replace(/^#/, '');
-        // Verify user is participant in this trade
-        try {
-            const trade = await prisma.trade.findUnique({
-                where: { id: parseInt(cleanId) },
-                select: { userId: true, vendorId: true }
-            });
-            if (trade && (trade.userId === userId || trade.vendorId === userId)) {
-                socket.join(`trade_${cleanId}`);
-            }
-        } catch (err) {
-            // Silently reject invalid trade IDs
-        }
-    });
-
-    // --- TRADE SOCKET SERVICE HANDLERS ---
-    tradeSocketService.registerHandlers(socket);
-
-    // --- CHAT SOCKET SERVICE HANDLERS ---
-    chatSocketService.registerHandlers(socket);
-    groupChatSocketService.registerHandlers(socket);
-
-    // --- FRIEND SOCKET SERVICE HANDLERS ---
-    friendSocketService.registerHandlers(socket);
-
-    // --- TICKET SOCKET SERVICE HANDLERS (Phase UI-4) ---
-    ticketSocketService.registerHandlers(socket);
-
-    // 2. LIVE CHAT
-    socket.on('typing', (data) => {
-        if (data && data.tradeId) {
-            socket.to(`trade_${data.tradeId}`).emit('vendor_typing', { isTyping: data.isTyping });
-        }
-    });
-
-    // HIGH-5: Fixed mark_messages_read — removed references to non-existent fields
-    socket.on('mark_messages_read', async (data) => {
-        try {
-            const rawTradeId = (data.tradeId || '').toString().replace(/^#/, '');
-            const tradeId = parseInt(rawTradeId);
-            if (isNaN(tradeId)) return;
-
-            const trade = await prisma.trade.findUnique({ where: { id: tradeId } });
-            if (!trade) return;
-
-            // Verify the reader is a participant
-            if (trade.userId !== userId && trade.vendorId !== userId) return;
-
-            // Emit read update to the other party (UI-only, no DB write for
-            // non-existent status/readAt fields on Message model)
-            socket.to(`trade_${tradeId}`).emit('messages_read_update', {
-                readerId: userId === trade.userId ? 'buyer' : 'vendor',
-                tradeId: tradeId,
-                readAt: new Date().toISOString()
-            });
-        } catch (err) {
-            console.error("mark_messages_read error:", err.message);
-        }
-    });
-
-    // 3. TRADE EXECUTION — CRITICAL-5: Authorization check
-    socket.on('vendor_accept', async (data) => {
-        try {
-            const tradeId = parseInt((data.tradeId || '').toString().replace(/^#/, ''));
-            if (isNaN(tradeId)) return;
-
-            // CRITICAL-5: Verify the socket user IS the vendor on this trade
-            const trade = await prisma.trade.findUnique({
-                where: { id: tradeId },
-                select: { vendorId: true, userId: true, status: true }
-            });
-
-            if (!trade) {
-                socket.emit('trade_error', { message: 'Trade not found.', tradeId });
-                return;
-            }
-
-            if (trade.vendorId !== userId) {
-                socket.emit('trade_error', { message: 'Not authorized: You are not the vendor on this trade.', tradeId });
-                return;
-            }
-
-            if (trade.status !== 'PENDING' && trade.status !== 'PENDING_PAYMENT') {
-                socket.emit('trade_error', { message: `Cannot accept: trade is already ${trade.status}.`, tradeId });
-                return;
-            }
-
-            // Phase H9 BUGFIX (2026-05-27): atomic conditional flip.
-            // Two concurrent vendor_accept emits (network retry) would
-            // both pass the status check above and both update the row.
-            // The conditional updateMany scopes the flip to the
-            // PENDING/PENDING_PAYMENT preconditions; if the second ack
-            // sees count=0 we skip the duplicate notification + socket
-            // emit silently.
-            const claimed = await prisma.trade.updateMany({
-                where: { id: tradeId, status: { in: ['PENDING', 'PENDING_PAYMENT'] } },
-                data:  { status: 'PENDING_PAYMENT' }
-            });
-            if (claimed.count === 0) {
-                // Already handled by an earlier in-flight ack — silent no-op.
-                return;
-            }
-            const updatedTrade = await prisma.trade.findUnique({
-                where: { id: tradeId }
-            });
-
-            io.to(`trade_${tradeId}`).emit('trade_update', {
-                status: 'PENDING_PAYMENT',
-                vendorPaymentDetails: updatedTrade.vendorPaymentDetails
-            });
-
-            // Persist + emit (notificationService handles both DB write and
-            // WS emission). Replaces the previous fire-and-forget
-            // io.emit('new_notification') which never wrote to the DB and
-            // produced the "the bell is empty after I reopen the app" bug.
-            await notificationService.sendNotification({
-                userId:        trade.userId,
-                title:         'Trade Accepted',
-                body:          `Vendor accepted your order #${tradeId}. Complete payment to continue.`,
-                category:      'TRADE',
-                actionPayload: { action: 'OPEN_TRADE', tradeId: String(tradeId) }
-            });
-            pushIfOffline(
-                trade.userId,
-                'Trade Accepted',
-                `Vendor accepted your order #${tradeId}. Complete payment to continue.`,
-                { type: 'TRADE_UPDATE', tradeId: tradeId }
-            );
-        } catch (e) {
-            console.error("vendor_accept Error:", e.message);
-        }
-    });
-
-    // HIGH-10: Admin spy room — verify ADMIN role
-    socket.on('join_admin_spy', () => {
-        if (socket.user.role === 'ADMIN') {
-            socket.join('admin_spy_room');
-        } else {
-            socket.emit('error', { message: 'Access denied: Admin role required.' });
-        }
-    });
-
-    socket.on('disconnect', () => {
-        // B-7: mark user offline and broadcast to friends
-        const now = new Date();
-        prisma.user.update({
-            where: { id: userId },
-            data: { isOnline: false, lastSeenAt: now },
-        }).catch(() => {});
-        socket.broadcast.emit('user_offline', { userId, lastSeenAt: now.toISOString() });
-    });
+// ── Socket event handlers (extracted to src/sockets/connectionHandler.js) ──
+const { setupSocketHandlers } = require('./src/sockets/connectionHandler');
+setupSocketHandlers(io, {
+    prisma,
+    socketRateLimiter,
+    tradeSocketService,
+    chatSocketService,
+    groupChatSocketService,
+    friendSocketService,
+    ticketSocketService,
+    notificationService,
+    pushIfOffline,
+    emitBalanceUpdate,
 });
+
+// ── Raw WebSocket Bridge for native clients (Android/KMP) ────────────────
+// Sits alongside Socket.IO and provides a /ws endpoint that native clients
+// can connect to using Ktor's WebSocket client. Translates between the
+// Android client's kebab-case event format and the existing Socket.IO services.
+const { createWsBridge } = require('./src/sockets/wsBridge');
+const wsBridge = createWsBridge(server, {
+    prisma,
+    JWT_SECRET,
+    io,
+    chatSocketService,
+    groupChatSocketService,
+});
+app.set('wsBridge', wsBridge);
 
 // ══════════════════════════════════════════════════════════════════════════════
-// ERROR HANDLING
+// ERROR HANDLING (extracted to src/middleware/errorHandler.js)
 // ══════════════════════════════════════════════════════════════════════════════
-
-// 404 catch-all
-app.use((req, res) => {
-    res.status(404).json({ success: false, error: 'Endpoint not found', path: req.originalUrl });
-});
-
-// WS6: Sentry error handler — must come AFTER all controllers/routes and the
-// 404 catch-all, but BEFORE our own error responder so the exception is
-// captured first, then formatted for the client below. No-op without SENTRY_DSN.
-if (process.env.SENTRY_DSN) {
-    Sentry.setupExpressErrorHandler(app);
-}
-
-// HIGH-4: Global error handler — sanitize in production
-app.use((err, req, res, next) => {
-    console.error('SERVER ERROR:', err.message);
-    if (!IS_PRODUCTION) {
-        console.error(err.stack);
-    }
-
-    // Multer file size error
-    if (err.code === 'LIMIT_FILE_SIZE') {
-        return res.status(413).json({
-            success: false,
-            message: 'File too large. Maximum size is 5MB.'
-        });
-    }
-
-    // Multer file type error
-    if (err.message && err.message.includes('Only image files')) {
-        return res.status(400).json({
-            success: false,
-            message: err.message
-        });
-    }
-
-    res.status(500).json({
-        success: false,
-        error: 'Internal Server Error',
-        // HIGH-4: Only expose details in non-production
-        ...(IS_PRODUCTION ? {} : { details: err.message })
-    });
-});
+const { mountErrorHandlers } = require('./src/middleware/errorHandler');
+mountErrorHandlers(app, { Sentry, isProduction: IS_PRODUCTION });
 
 // ══════════════════════════════════════════════════════════════════════════════
 // START SERVER + GRACEFUL SHUTDOWN
@@ -1823,19 +332,19 @@ const PORT = process.env.PORT || 3000;
 // which also avoids EADDRINUSE and leaving a live listener after the suite ends.
 if (!IS_TEST_ENV) {
     server.listen(PORT, '0.0.0.0', () => {
-        console.log(`AZAMAN BACKEND LIVE ON PORT ${PORT} [${IS_PRODUCTION ? 'PRODUCTION' : 'DEVELOPMENT'}]`);
-        tradeWorker.start();
-        workerStatus.tradeWorker = 'running';
+        logger.info({ port: PORT, env: IS_PRODUCTION ? 'production' : 'development' }, 'Azaman backend live');
+        // tradeWorker.start() is handled by the workersPromise.then() callback
+        // to avoid a race condition where the promise hadn't resolved yet.
     });
 }
 
 // Graceful shutdown handler
 const shutdown = async (signal) => {
-    console.log(`\n${signal} received. Shutting down gracefully...`);
+    logger.info({ signal }, 'Shutdown signal received');
 
     // Stop accepting new connections
     server.close(() => {
-        console.log('[Shutdown] HTTP server closed.');
+        logger.info('Shutdown: HTTP server closed');
     });
 
     // Stop workers
@@ -1844,25 +353,33 @@ const shutdown = async (signal) => {
         withdrawalReconciliationWorker.stop();
     }
 
+    // Close BullMQ scheduler (all workers, queues, Redis connection)
+    try {
+        const { getScheduler } = require('./src/lib/bullScheduler');
+        await getScheduler().closeAll();
+    } catch (err) {
+        logger.error({ err }, 'Shutdown: scheduler close error');
+    }
+
     // Close socket connections
     io.close(() => {
-        console.log('[Shutdown] Socket.IO closed.');
+        logger.info('Shutdown: Socket.IO closed');
     });
 
     // Disconnect Prisma
     try {
         await prisma.$disconnect();
-        console.log('[Shutdown] Database disconnected.');
+        logger.info('Shutdown: database disconnected');
     } catch (err) {
-        console.error('[Shutdown] Prisma disconnect error:', err.message);
+        logger.error({ err }, 'Shutdown: Prisma disconnect error');
     }
 
     // Close PG pool
     try {
         await pool.end();
-        console.log('[Shutdown] PG pool closed.');
+        logger.info('Shutdown: PG pool closed');
     } catch (err) {
-        console.error('[Shutdown] Pool close error:', err.message);
+        logger.error({ err }, 'Shutdown: pool close error');
     }
 
     process.exit(0);
@@ -1873,7 +390,7 @@ process.on('SIGINT', () => shutdown('SIGINT'));
 
 // Prevent unhandled promise rejections from crashing the process silently
 process.on('unhandledRejection', (reason, promise) => {
-    console.error('[UnhandledRejection]', reason);
+    logger.error({ reason }, 'Unhandled rejection');
 });
 
 // A synchronous throw outside any try/catch lands here. Node's default is to
@@ -1881,7 +398,7 @@ process.on('unhandledRejection', (reason, promise) => {
 // never silent, then exit non-zero so the process manager (PM2/Render) restarts
 // us into a known-good state rather than limping on in an undefined one.
 process.on('uncaughtException', (err) => {
-    console.error('[UncaughtException]', err && err.message);
-    if (err && err.stack) console.error(err.stack);
+    logger.error({ err }, 'Uncaught exception');
+    if (err && err.stack) logger.error({ err }, err.stack);
     process.exit(1);
 });

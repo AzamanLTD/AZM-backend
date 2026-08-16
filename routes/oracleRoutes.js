@@ -8,6 +8,7 @@
 // Mounted at /api/oracle in server.js
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const express = require('express');
 const router = express.Router();
 
@@ -50,7 +51,7 @@ router.get('/yellowcard-rate', async (req, res) => {
             lastSync: settings.lastRateSync || null
         });
     } catch (error) {
-        console.error('[Oracle] yellowcard-rate error:', error.message);
+        logger.error({ err: error }, '[Oracle] yellowcard-rate error');
         return res.status(500).json({
             success: false,
             message: 'Failed to fetch oracle rate'
@@ -83,7 +84,7 @@ router.get('/rates', async (req, res) => {
             }
         });
     } catch (error) {
-        console.error('[Oracle] rates error:', error.message);
+        logger.error({ err: error }, '[Oracle] rates error');
         return res.status(500).json({
             success: false,
             message: 'Failed to fetch rates'

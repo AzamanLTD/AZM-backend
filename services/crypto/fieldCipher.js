@@ -25,11 +25,12 @@
 //
 // Key: ENCRYPTION_KEY env var — 32 bytes, provided as 64-hex-char or
 // base64 (44-char). Generate with:
-//   node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+//   node -e "logger.info(require('crypto').randomBytes(32).toString('hex'))"
 // =============================================================================
 
 const crypto = require('crypto');
 
+const logger = require('../../src/config/logger');
 const PREFIX = 'enc:v1:';
 const ALGO = 'aes-256-gcm';
 const IV_BYTES = 12; // GCM standard nonce length
@@ -70,7 +71,7 @@ function encrypt(plaintext) {
   const key = _resolveKey();
   if (!key) {
     if (!_warned) {
-      console.warn(
+      logger.warn(
         '[fieldCipher] ENCRYPTION_KEY not set — sensitive fields are stored ' +
         'in PLAINTEXT. Set ENCRYPTION_KEY to enable at-rest encryption.',
       );

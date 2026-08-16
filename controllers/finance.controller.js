@@ -39,6 +39,7 @@ function _getNotificationService(req) {
 const financeService               = require('../services/finance.service');
 const { FIAT_POOL_ALERT_THRESH }   = financeService;
 const crypto                       = require('crypto');
+const logger = require('../src/config/logger');
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -60,7 +61,8 @@ exports.fiatWithdrawal = async (req, res) => {
     const io                        = req.app.get('socketio');
     const emitBalanceUpdate         = req.app.get('emitBalanceUpdate');
     const gatewayService            = req.app.get('gatewayService');             // rate oracle only
-    const moolreDisbursementService = req.app.get('moolreDisbursementService'); // off-ramp dispatch
+    const paymentFailoverService   = req.app.get("paymentFailoverService"); // failover-aware dispatch
+    const moolreDisbursementService = paymentFailoverService || req.app.get("moolreDisbursementService"); // backward compat
 
     let reference = null;        // populated after the service debit so the
                                  // catch block can call reverseFiatWithdrawal.
@@ -122,7 +124,7 @@ exports.fiatWithdrawal = async (req, res) => {
         if (!moolreDisbursementService) {
             return res.status(503).json({
                 success: false,
-                message: 'Moolre disbursement service is not configured on this server.'
+                message: 'Disbursement service is not configured on this server.'
             });
         }
 
@@ -137,7 +139,7 @@ exports.fiatWithdrawal = async (req, res) => {
         // uses it as the strict idempotency key for POST /v1_0/transfer.
         // We reuse the same UUID as TransactionHistory.txHash so the upstream
         // ledger and the downstream MoMo transfer share a single correlation.
-        reference = moolreDisbursementService.newReferenceId();
+        reference = moolreDisbursementService.newReferenceId(); // works for both failover and raw service
 
         // ── Atomic debit + fee split + arbitrage capture (delegated) ─────────
         const data = await financeService.processFiatWithdrawal(
@@ -161,7 +163,7 @@ exports.fiatWithdrawal = async (req, res) => {
                 payeeNote:      `Azaman MoMo payout (${networkChoice})`
             });
         } catch (gatewayErr) {
-            console.error('[fiatWithdrawal] Moolre dispatch failed:', gatewayErr.message);
+            logger.error({ err: gatewayErr }, '[fiatWithdrawal] Disbursement dispatch failed');
             // Roll back the debit + the SystemMasterCrypto capture so the
             // user is not stuck and Azaman is not double-credited.
             try {
@@ -173,15 +175,15 @@ exports.fiatWithdrawal = async (req, res) => {
                 if (emitBalanceUpdate) await emitBalanceUpdate(userId);
                 return res.status(502).json({
                     success: false,
-                    code:    'MOOLRE_DISBURSEMENT_REJECTED',
+                    code:    'DISBURSEMENT_REJECTED',
                     message: `Payout rejected: ${gatewayErr.message}. Funds returned to your wallet.`,
                     data:    { reference, reversal }
                 });
             } catch (reverseErr) {
-                console.error('[fiatWithdrawal] CRITICAL reversal failure:', reverseErr.message);
+                logger.error({ err: reverseErr }, '[fiatWithdrawal] CRITICAL reversal failure');
                 return res.status(500).json({
                     success: false,
-                    code:    'MOOLRE_DISBURSEMENT_REVERSAL_FAILED',
+                    code:    'DISBURSEMENT_REVERSAL_FAILED',
                     message:
                         `MTN MoMo rejected the payout AND reversal failed. ` +
                         `An admin has been notified. Reference: ${reference}.`,
@@ -199,7 +201,7 @@ exports.fiatWithdrawal = async (req, res) => {
                 `AI LIQUIDITY FLAG: SYSTEM_FIAT_POOL dropped to ` +
                 `$${data.fiatPoolBalance.toFixed(2)} ` +
                 `(threshold: $${FIAT_POOL_ALERT_THRESH}). Immediate replenishment required.`;
-            console.warn(`[LIQUIDITY ALERT] ${alertMsg}`);
+            logger.warn(`[LIQUIDITY ALERT] ${alertMsg}`);
             try {
                 await _getNotificationService(req).sendNotification({
                     userId,
@@ -215,7 +217,7 @@ exports.fiatWithdrawal = async (req, res) => {
                     timestamp: new Date().toISOString()
                 });
             } catch (alertErr) {
-                console.error('[fiatWithdrawal] Liquidity alert emit failed:', alertErr.message);
+                logger.error({ err: alertErr }, '[fiatWithdrawal] Liquidity alert emit failed');
             }
         }
 
@@ -241,7 +243,7 @@ exports.fiatWithdrawal = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('[finance.fiatWithdrawal] error:', error.message);
+        logger.error({ err: error }, '[finance.fiatWithdrawal] error');
 
         // Phase ADMIN-CONTROL-2 FIX 5: Fiat pool insufficient liquidity
         if (error.code === 'FIAT_POOL_INSUFFICIENT') {
@@ -265,7 +267,7 @@ exports.fiatWithdrawal = async (req, res) => {
                     }
                 });
             } catch (freezeErr) {
-                console.error('[fiatWithdrawal] Freeze record write failed:', freezeErr.message);
+                logger.error({ err: freezeErr }, '[fiatWithdrawal] Freeze record write failed');
             }
             return res.status(403).json({
                 success: false,
@@ -303,7 +305,7 @@ exports.liquidateProfits = async (req, res) => {
                 timestamp:        new Date().toISOString()
             });
         } catch (socketErr) {
-            console.error('[liquidateProfits] Socket emit failed:', socketErr.message);
+            logger.error({ err: socketErr }, '[liquidateProfits] Socket emit failed');
         }
 
         return res.status(200).json({
@@ -312,7 +314,7 @@ exports.liquidateProfits = async (req, res) => {
             data
         });
     } catch (error) {
-        console.error('[finance.liquidateProfits] error:', error.message);
+        logger.error({ err: error }, '[finance.liquidateProfits] error');
         return res.status(400).json({ success: false, message: error.message });
     }
 };
@@ -372,7 +374,7 @@ exports.cryptoDepositWebhook = async (req, res) => {
                 actionPayload: { action: 'OPEN_WALLET', reference: txHash }
             });
         } catch (notifErr) {
-            console.error('[cryptoDepositWebhook] Notification write failed:', notifErr.message);
+            logger.error({ err: notifErr }, '[cryptoDepositWebhook] Notification write failed');
         }
 
         return res.status(200).json({
@@ -381,7 +383,7 @@ exports.cryptoDepositWebhook = async (req, res) => {
             data:    result.data
         });
     } catch (error) {
-        console.error('[finance.cryptoDepositWebhook] error:', error.message);
+        logger.error({ err: error }, '[finance.cryptoDepositWebhook] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -402,7 +404,7 @@ exports.mtnDisbursementWebhook = async (req, res) => {
     try {
         const expectedSecret = process.env.MTN_WEBHOOK_SECRET;
         if (!expectedSecret) {
-            console.error('[mtnDisbursementWebhook] MTN_WEBHOOK_SECRET is not configured.');
+            logger.error('[mtnDisbursementWebhook] MTN_WEBHOOK_SECRET is not configured.');
             return res.status(503).json({
                 success: false,
                 message: 'Webhook endpoint is not configured. Refusing to mutate ledger.'
@@ -495,7 +497,7 @@ exports.mtnDisbursementWebhook = async (req, res) => {
                 actionPayload: { action: 'OPEN_WALLET', reference }
             });
         } catch (notifErr) {
-            console.error('[mtnDisbursementWebhook] Notification write failed:', notifErr.message);
+            logger.error({ err: notifErr }, '[mtnDisbursementWebhook] Notification write failed');
         }
 
         return res.status(200).json({
@@ -504,7 +506,7 @@ exports.mtnDisbursementWebhook = async (req, res) => {
             data:    reversal
         });
     } catch (error) {
-        console.error('[finance.mtnDisbursementWebhook] error:', error.message);
+        logger.error({ err: error }, '[finance.mtnDisbursementWebhook] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -535,7 +537,7 @@ exports.moolreDisbursementWebhook = async (req, res) => {
     try {
         const expectedSecret = process.env.MOOLRE_WEBHOOK_SECRET;
         if (!expectedSecret) {
-            console.error('[moolreDisbursementWebhook] MOOLRE_WEBHOOK_SECRET is not configured.');
+            logger.error('[moolreDisbursementWebhook] MOOLRE_WEBHOOK_SECRET is not configured.');
             return res.status(503).json({
                 success: false,
                 message: 'Webhook endpoint is not configured. Refusing to mutate ledger.'
@@ -570,7 +572,7 @@ exports.moolreDisbursementWebhook = async (req, res) => {
                 // timingSafeEqual throws on length mismatch — guard first.
                 authPassed = a.length === b.length && crypto.timingSafeEqual(a, b);
             } catch (sigErr) {
-                console.error('[moolreDisbursementWebhook] HMAC verification error:', sigErr.message);
+                logger.error({ err: sigErr }, '[moolreDisbursementWebhook] HMAC verification error');
                 authPassed = false;
             }
         } else {
@@ -639,7 +641,7 @@ exports.moolreDisbursementWebhook = async (req, res) => {
                         timestamp: new Date().toISOString()
                     });
                 } catch (emitErr) {
-                    console.error('[moolreDisbursementWebhook] Socket emit failed:', emitErr.message);
+                    logger.error({ err: emitErr }, '[moolreDisbursementWebhook] Socket emit failed');
                 }
             });
             return res.status(200).json({
@@ -688,7 +690,7 @@ exports.moolreDisbursementWebhook = async (req, res) => {
                         });
                     }
                 } catch (emitErr) {
-                    console.error('[moolreDisbursementWebhook] Socket emit failed:', emitErr.message);
+                    logger.error({ err: emitErr }, '[moolreDisbursementWebhook] Socket emit failed');
                 }
             });
 
@@ -729,7 +731,7 @@ exports.moolreDisbursementWebhook = async (req, res) => {
                     });
                 }
             } catch (emitErr) {
-                console.error('[moolreDisbursementWebhook] Socket emit failed:', emitErr.message);
+                logger.error({ err: emitErr }, '[moolreDisbursementWebhook] Socket emit failed');
             }
         });
 
@@ -745,7 +747,7 @@ exports.moolreDisbursementWebhook = async (req, res) => {
                 actionPayload: { action: 'OPEN_WALLET', reference }
             });
         } catch (notifErr) {
-            console.error('[moolreDisbursementWebhook] Notification write failed:', notifErr.message);
+            logger.error({ err: notifErr }, '[moolreDisbursementWebhook] Notification write failed');
         }
 
         return res.status(200).json({
@@ -754,7 +756,7 @@ exports.moolreDisbursementWebhook = async (req, res) => {
             data:    reversal
         });
     } catch (error) {
-        console.error('[finance.moolreDisbursementWebhook] error:', error.message);
+        logger.error({ err: error }, '[finance.moolreDisbursementWebhook] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -787,7 +789,7 @@ exports.getFiatPoolStatus = async (req, res) => {
             }
         });
     } catch (error) {
-        console.error('[finance.getFiatPoolStatus] error:', error.message);
+        logger.error({ err: error }, '[finance.getFiatPoolStatus] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -830,7 +832,7 @@ exports.getTransactionReceipt = async (req, res) => {
             }
         });
     } catch (error) {
-        console.error('[finance.getTransactionReceipt] error:', error.message);
+        logger.error({ err: error }, '[finance.getTransactionReceipt] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -894,7 +896,134 @@ exports.getTransactionHistory = async (req, res) => {
             nextCursor
         });
     } catch (error) {
-        console.error('[finance.getTransactionHistory] error:', error.message);
+        logger.error({ err: error }, '[finance.getTransactionHistory] error');
+        return res.status(500).json({ success: false, message: error.message });
+    }
+};
+
+// =============================================================================
+// Spending Insights — server-side aggregation
+// GET /api/finance/spending-insights
+// Returns category breakdown, weekly spending, month-over-month comparison
+// =============================================================================
+
+exports.getSpendingInsights = async (req, res) => {
+    const prisma = req.app.get('prisma');
+    try {
+        const userId = req.user.id;
+        const now = new Date();
+        const thisMonthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+        const lastMonthStart = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+        const lastMonthEnd = new Date(now.getFullYear(), now.getMonth(), 0, 23, 59, 59);
+
+        // Fetch this month + last month transactions in one query
+        const txns = await prisma.transactionHistory.findMany({
+            where: {
+                userId,
+                createdAt: { gte: lastMonthStart },
+                status: 'COMPLETED',
+            },
+            orderBy: { createdAt: 'desc' },
+        });
+
+        // Categorize spending
+        const DEBIT_TYPES = new Set([
+            'WITHDRAWAL_FIAT', 'WITHDRAWAL_CRYPTO', 'SUSU_CONTRIBUTION',
+            'VAULT_DEPOSIT', 'SUSU_SEIZURE', 'TICKET_ESCROW_FUND',
+            'TICKET_ESCROW_FEE', 'BUSINESS_INVOICE_PAYMENT', 'EWA_WITHDRAWAL',
+        ]);
+        const CREDIT_TYPES = new Set([
+            'DEPOSIT_FIAT', 'DEPOSIT_CRYPTO', 'SUSU_PAYOUT', 'VAULT_RELEASE',
+            'AZM_REWARD', 'SUSU_REFUND', 'SUSU_PROFIT', 'TICKET_ESCROW_RELEASE',
+            'TICKET_ESCROW_REFUND', 'BUSINESS_INVOICE_RECEIPT', 'PAYROLL_DISBURSEMENT',
+        ]);
+
+        const categoryMap = {
+            'WITHDRAWAL_FIAT': 'cash',
+            'WITHDRAWAL_CRYPTO': 'crypto',
+            'SUSU_CONTRIBUTION': 'susu',
+            'VAULT_DEPOSIT': 'vault',
+            'INTERNAL_TRANSFER': 'transfer',
+            'P2P_TRADE': 'trade',
+            'TICKET_ESCROW_FUND': 'escrow',
+            'TICKET_ESCROW_FEE': 'fees',
+            'BUSINESS_INVOICE_PAYMENT': 'business',
+            'EWA_WITHDRAWAL': 'ewa',
+        };
+
+        let totalSpentThisMonth = 0;
+        let totalIncomeThisMonth = 0;
+        let totalSpentLastMonth = 0;
+        const categorySpending = {};
+        const weeklySpending = {};
+
+        // Build 8 week buckets
+        const weekStarts = [];
+        for (let i = 7; i >= 0; i--) {
+            const ws = new Date(now);
+            ws.setDate(ws.getDate() - ((ws.getDay() + 6) % 7) - i * 7);
+            ws.setHours(0, 0, 0, 0);
+            weekStarts.push(ws);
+            weeklySpending[ws.toISOString()] = 0;
+        }
+
+        for (const txn of txns) {
+            const amount = parseFloat(txn.amountUsdc || 0) + parseFloat(txn.feeUsdc || 0);
+            const isThisMonth = txn.createdAt >= thisMonthStart;
+            const isLastMonth = txn.createdAt >= lastMonthStart && txn.createdAt <= lastMonthEnd;
+
+            if (DEBIT_TYPES.has(txn.type)) {
+                if (isThisMonth) totalSpentThisMonth += amount;
+                if (isLastMonth) totalSpentLastMonth += amount;
+
+                // Category breakdown (this month only)
+                if (isThisMonth) {
+                    const cat = categoryMap[txn.type] || 'other';
+                    categorySpending[cat] = (categorySpending[cat] || 0) + amount;
+                }
+
+                // Weekly buckets
+                for (let i = weekStarts.length - 1; i >= 0; i--) {
+                    if (txn.createdAt >= weekStarts[i]) {
+                        weeklySpending[weekStarts[i].toISOString()] += amount;
+                        break;
+                    }
+                }
+            } else if (CREDIT_TYPES.has(txn.type)) {
+                if (isThisMonth) totalIncomeThisMonth += amount;
+            }
+        }
+
+        // Month-over-month change
+        const momChange = totalSpentLastMonth > 0
+            ? Math.round(((totalSpentThisMonth - totalSpentLastMonth) / totalSpentLastMonth) * 100)
+            : 0;
+
+        // Top categories sorted
+        const topCategories = Object.entries(categorySpending)
+            .sort((a, b) => b[1] - a[1])
+            .map(([key, amount]) => ({ key, amount: Math.round(amount * 100) / 100 }));
+
+        // Weekly array
+        const weekly = weekStarts.map(ws => ({
+            weekStart: ws.toISOString(),
+            label: `${ws.getMonth() + 1}/${ws.getDate()}`,
+            amount: Math.round(weeklySpending[ws.toISOString()] * 100) / 100,
+        }));
+
+        return res.status(200).json({
+            success: true,
+            insights: {
+                totalSpentThisMonth: Math.round(totalSpentThisMonth * 100) / 100,
+                totalIncomeThisMonth: Math.round(totalIncomeThisMonth * 100) / 100,
+                totalSpentLastMonth: Math.round(totalSpentLastMonth * 100) / 100,
+                momChange,
+                topCategories,
+                weekly,
+            },
+        });
+    } catch (error) {
+        logger.error({ err: error }, '[finance.getSpendingInsights] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };

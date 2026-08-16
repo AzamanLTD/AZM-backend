@@ -8,6 +8,7 @@
 //   TRADE_INITIATED — user clicked "Start Trade" from the ad detail view
 //   CLOSED          — user swiped away / dismissed the ad without trading
 //
+const logger = require('../src/config/logger');
 // Endpoints:
 //   POST /api/ads/:id/interaction       — log a single interaction
 //   GET  /api/ads/:id/analytics         — vendor: get analytics for one ad
@@ -111,7 +112,7 @@ exports.logInteraction = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('[adInteraction.logInteraction] error:', error.message);
+        logger.error({ err: error }, '[adInteraction.logInteraction] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -215,7 +216,7 @@ exports.getAdAnalytics = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('[adInteraction.getAdAnalytics] error:', error.message);
+        logger.error({ err: error }, '[adInteraction.getAdAnalytics] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -339,7 +340,7 @@ exports.getVendorAnalyticsOverview = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('[adInteraction.getVendorAnalyticsOverview] error:', error.message);
+        logger.error({ err: error }, '[adInteraction.getVendorAnalyticsOverview] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -378,7 +379,7 @@ exports.getAnalyticsTimeline = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('[adInteraction.getAnalyticsTimeline] error:', error.message);
+        logger.error({ err: error }, '[adInteraction.getAnalyticsTimeline] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -445,7 +446,7 @@ exports.getAdSummary = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('[adInteraction.getAdSummary] error:', error.message);
+        logger.error({ err: error }, '[adInteraction.getAdSummary] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -515,7 +516,7 @@ exports.getVendorAnalyticsQuick = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('[adInteraction.getVendorAnalyticsQuick] error:', error.message);
+        logger.error({ err: error }, '[adInteraction.getVendorAnalyticsQuick] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };

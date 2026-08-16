@@ -1,3 +1,4 @@
+const logger = require('../src/config/logger');
 const express = require('express');
 const router = express.Router();
 const withdrawalController = require('../controllers/withdrawalController');
@@ -5,10 +6,12 @@ const authMiddleware = require('../middleware/authMiddleware');
 const { validate } = require('../middleware/validate');
 const { fiatWithdrawalSchema, cryptoWithdrawalSchema } = require('../services/validation/financialSchemas');
 
+const { idempotency } = require('../middleware/idempotency');
+const { require2FA } = require('../middleware/require2FA');
 const protect = authMiddleware.protect;
 
-router.post('/fiat', protect, validate(fiatWithdrawalSchema), withdrawalController.fiatWithdrawal);
-router.post('/crypto', protect, validate(cryptoWithdrawalSchema), withdrawalController.cryptoWithdrawal);
+router.post('/fiat', protect, require2FA(), idempotency(), validate(fiatWithdrawalSchema), withdrawalController.fiatWithdrawal);
+router.post('/crypto', protect, require2FA(), idempotency(), validate(cryptoWithdrawalSchema), withdrawalController.cryptoWithdrawal);
 
 // Real-time withdrawal progress popup — polling fallback for the Socket.IO
 // `withdrawal_progress` event. Owner-only; returns a {stage,label,pct} triple.

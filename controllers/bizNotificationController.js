@@ -12,13 +12,14 @@
 // notification can only be read by the business it belongs to.
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const bizNotificationService = require('../services/bizNotificationService');
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 /** Load the BusinessProfile owned by the calling user (null if none). */
 async function _ownedProfile(prisma, userId) {
-    return prisma.businessProfile.findUnique({
+    return prisma.businessProfile.findFirst({
         where: { userId },
         select: { id: true }
     });
@@ -89,7 +90,7 @@ exports.markAsRead = async (req, res) => {
                 });
             }
         } catch (sockErr) {
-            console.error('[bizNotification.markAsRead] socket emit non-fatal:', sockErr.message);
+            logger.error({ err: sockErr }, '[bizNotification.markAsRead] socket emit non-fatal');
         }
 
         return res.status(200).json({ success: true, notification });
@@ -121,7 +122,7 @@ exports.markAllAsRead = async (req, res) => {
                 });
             }
         } catch (sockErr) {
-            console.error('[bizNotification.markAllAsRead] socket emit non-fatal:', sockErr.message);
+            logger.error({ err: sockErr }, '[bizNotification.markAllAsRead] socket emit non-fatal');
         }
 
         return res.status(200).json({ success: true, ...result });

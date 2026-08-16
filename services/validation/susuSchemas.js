@@ -16,6 +16,7 @@
 // latter's JSDoc explicitly accepts {string|number}), so the coercion is safe.
 // =============================================================================
 
+const logger = require('../../src/config/logger');
 const { z } = require('zod');
 
 const E164  = /^\+[1-9]\d{6,14}$/;

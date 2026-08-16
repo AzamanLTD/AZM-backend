@@ -11,6 +11,7 @@
 // This is a HARD 403 block, not a cosmetic badge.
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const kybGate = async (req, res, next) => {
     try {
         // Skip if no authenticated user (let auth middleware handle that)
@@ -51,7 +52,7 @@ const kybGate = async (req, res, next) => {
         req.businessProfile = business;
         next();
     } catch (err) {
-        console.error('[kybGate]', err.message);
+        logger.error({ err: err }, '[kybGate]');
         // On error, fail open (let the request proceed) — don't block legit traffic
         // due to an internal error. Log it for investigation.
         next();

@@ -14,6 +14,7 @@
 // SYSTEM TicketMessages into the parent ticket workspace.
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const escrowService = require('../services/escrowService');
 const bizNotificationService = require('../services/bizNotificationService');
 const { audit } = require('../utils/audit');
@@ -58,7 +59,7 @@ async function _injectSystemMessage(prisma, io, ticket, content, metadata = {}) 
         return message;
     } catch (err) {
         // Non-fatal: the financial action already committed.
-        console.error('[escrow._injectSystemMessage] error:', err.message);
+        logger.error({ err: err }, '[escrow._injectSystemMessage] error');
         return null;
     }
 }
@@ -95,7 +96,7 @@ exports.getEscrowForTicket = async (req, res) => {
         }
         return res.status(200).json({ success: true, escrow });
     } catch (err) {
-        console.error('[getEscrowForTicket] error:', err.message);
+        logger.error({ err: err }, '[getEscrowForTicket] error');
         return res.status(500).json({ success: false, message: err.message });
     }
 };
@@ -144,7 +145,7 @@ exports.fundEscrow = async (req, res) => {
 
         return res.status(200).json({ success: true, escrow });
     } catch (err) {
-        console.error('[fundEscrow] error:', err.message);
+        logger.error({ err: err }, '[fundEscrow] error');
         const code = /insufficient/i.test(err.message) ? 400 : 500;
         return res.status(code).json({ success: false, message: err.message });
     }
@@ -212,7 +213,7 @@ exports.markSatisfied = async (req, res) => {
 
         return res.status(200).json({ success: true, settled: result.settled, escrow });
     } catch (err) {
-        console.error('[markSatisfied] error:', err.message);
+        logger.error({ err: err }, '[markSatisfied] error');
         return res.status(500).json({ success: false, message: err.message });
     }
 };
@@ -306,7 +307,7 @@ exports.raiseDispute = async (req, res) => {
 
         return res.status(200).json({ success: true, escrow, dispute: result.dispute });
     } catch (err) {
-        console.error('[raiseDispute] error:', err.message);
+        logger.error({ err: err }, '[raiseDispute] error');
         return res.status(500).json({ success: false, message: err.message });
     }
 };
@@ -351,7 +352,7 @@ exports.updateTerms = async (req, res) => {
 
         return res.status(200).json({ success: true, escrow });
     } catch (err) {
-        console.error('[updateTerms] error:', err.message);
+        logger.error({ err: err }, '[updateTerms] error');
         return res.status(500).json({ success: false, message: err.message });
     }
 };
@@ -416,7 +417,7 @@ exports.cancelEscrow = async (req, res) => {
                 type: 'ORDER_CANCELLED'
             }).then((res) => {
                 if (res && io) io.to(`user_${res.order.businessProfile.userId}`).emit('biz_notification', { type: 'ORDER_CANCELLED' });
-            }).catch((err) => console.error('[cancelEscrow] biz notif:', err.message));
+            }).catch((err) => logger.error({ err: err }, '[cancelEscrow] biz notif'));
         });
 
         await audit(prisma, {
@@ -427,7 +428,7 @@ exports.cancelEscrow = async (req, res) => {
 
         return res.status(200).json({ success: true, escrow: result });
     } catch (err) {
-        console.error('[cancelEscrow] error:', err.message);
+        logger.error({ err: err }, '[cancelEscrow] error');
         return res.status(500).json({ success: false, message: err.message });
     }
 };

@@ -31,6 +31,7 @@
 //     cleverness.
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const jwt = require('jsonwebtoken');
 
 // CRITICAL-2: No fallback. If JWT_SECRET is missing, authController.js will
@@ -65,7 +66,7 @@ const protect = async (req, res, next) => {
     }
 
     if (!JWT_SECRET) {
-        console.error('[authMiddleware] FATAL: JWT_SECRET is not configured.');
+        logger.error('[authMiddleware] FATAL: JWT_SECRET is not configured.');
         return res.status(500).json({
             success: false,
             message: "Server configuration error."
@@ -154,7 +155,7 @@ const protect = async (req, res, next) => {
             }
         }
     } catch (dbErr) {
-        console.error('[authMiddleware] live-user lookup failed:', dbErr.message);
+        logger.error({ err: dbErr }, '[authMiddleware] live-user lookup failed');
         // Fail closed: if we can't verify the live state, refuse the
         // request. Better to surface a 503 to the client than to let
         // a stale token through during a DB hiccup.

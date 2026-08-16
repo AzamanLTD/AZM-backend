@@ -1,3 +1,4 @@
+const logger = require('../src/config/logger');
 // controllers/transitController.js
 // =============================================================================
 // AZAMAN — TRANSIT BOOKING CONTROLLER (B-11, 2026-06-28)
@@ -99,7 +100,7 @@ exports.createBooking = async (req, res) => {
 
         return res.status(201).json({ success: true, booking });
     } catch (err) {
-        console.error('[transit.createBooking] error:', err.message);
+        logger.error({ err: err }, '[transit.createBooking] error');
         return res.status(500).json({ success: false, message: err.message });
     }
 };
@@ -114,7 +115,7 @@ exports.listBookings = async (req, res) => {
 
         const where = {};
         if (role === 'business') {
-            const profile = await prisma.businessProfile.findUnique({ where: { userId }, select: { id: true } });
+            const profile = await prisma.businessProfile.findFirst({ where: { userId }, select: { id: true } });
             if (profile) where.businessProfileId = profile.id;
             else return res.status(200).json({ success: true, bookings: [], hasMore: false });
         } else {
@@ -139,7 +140,7 @@ exports.listBookings = async (req, res) => {
 
         return res.status(200).json({ success: true, bookings: slice, hasMore, nextCursor });
     } catch (err) {
-        console.error('[transit.listBookings] error:', err.message);
+        logger.error({ err: err }, '[transit.listBookings] error');
         return res.status(500).json({ success: false, message: err.message });
     }
 };
@@ -171,7 +172,7 @@ exports.getBooking = async (req, res) => {
 
         return res.status(200).json({ success: true, booking });
     } catch (err) {
-        console.error('[transit.getBooking] error:', err.message);
+        logger.error({ err: err }, '[transit.getBooking] error');
         return res.status(500).json({ success: false, message: err.message });
     }
 };
@@ -246,7 +247,7 @@ exports.updateBookingStatus = async (req, res) => {
 
         return res.status(200).json({ success: true, booking: updated });
     } catch (err) {
-        console.error('[transit.updateBookingStatus] error:', err.message);
+        logger.error({ err: err }, '[transit.updateBookingStatus] error');
         return res.status(500).json({ success: false, message: err.message });
     }
 };
@@ -277,7 +278,7 @@ exports.generateTransitCheckInQR = async (req, res) => {
         const tokenData = await svc.generateTransitCheckInToken(bookingId, userId);
         return res.status(200).json({ success: true, qrData: tokenData });
     } catch (err) {
-        console.error('[transit.generateTransitCheckInQR] error:', err.message);
+        logger.error({ err: err }, '[transit.generateTransitCheckInQR] error');
         return res.status(500).json({ success: false, message: err.message });
     }
 };
@@ -303,7 +304,7 @@ exports.transitBoarding = async (req, res) => {
 
         return res.status(200).json(result);
     } catch (err) {
-        console.error('[transit.transitBoarding] error:', err.message);
+        logger.error({ err: err }, '[transit.transitBoarding] error');
         return res.status(500).json({ success: false, message: err.message });
     }
 };

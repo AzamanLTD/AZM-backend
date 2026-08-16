@@ -22,6 +22,7 @@
 //     (Req 10.10)
 // =============================================================================
 
+const logger = require('../../src/config/logger');
 const { Prisma } = require('@prisma/client');
 const { SusuError, ErrorCodes } = require('./errors');
 
@@ -83,9 +84,9 @@ class SusuCycleService {
   async _acquireCycle(cycleId) {
     return this.prisma.$transaction(async (tx) => {
       const lockKey = await this._cycleIdToBigint(cycleId);
-      const [{ pg_try_advisory_xact_lock: locked }] = await tx.$queryRawUnsafe(
-        `SELECT pg_try_advisory_xact_lock(${lockKey}) AS pg_try_advisory_xact_lock`,
-      );
+      const [{ pg_try_advisory_xact_lock: locked }] = await tx.$queryRaw`
+        SELECT pg_try_advisory_xact_lock(${lockKey}::bigint) AS pg_try_advisory_xact_lock
+      `;
       if (!locked) return { acquired: false };
 
       // Read current status so we can record what we transitioned from
@@ -144,9 +145,9 @@ class SusuCycleService {
   async _cycleIdToBigint(cycleId) {
     // Postgres has hashtextextended(text, bigint) which yields a stable
     // 64-bit signed result we can hand to pg_try_advisory_xact_lock.
-    const rows = await this.prisma.$queryRawUnsafe(
-      `SELECT hashtextextended('${cycleId.replace(/'/g, "''")}'::text, 0)::int8 AS k`,
-    );
+    const rows = await this.prisma.$queryRaw`
+      SELECT hashtextextended(${cycleId}::text, 0)::int8 AS k
+    `;
     return rows[0].k;
   }
 
@@ -353,7 +354,7 @@ class SusuCycleService {
           }
         }
       } catch (err) {
-        console.error(`[SusuCycleService] member ${member.id} cycle ${cycle.id} error:`, err.message);
+        logger.error(`[SusuCycleService] member ${member.id} cycle ${cycle.id} error:`, err.message);
         continue;
       }
 
@@ -407,7 +408,7 @@ class SusuCycleService {
         try {
           await this._applyMinorPenalty(member, cycle, susu);
         } catch (err) {
-          console.error(`[SusuCycleService] minor penalty member ${member.id} cycle ${cycle.id}:`, err.message);
+          logger.error(`[SusuCycleService] minor penalty member ${member.id} cycle ${cycle.id}:`, err.message);
         }
       }
     }
@@ -478,7 +479,7 @@ class SusuCycleService {
       // Anything else is logged and swallowed so a single member's penalty
       // failure never derails the cycle.
       if (err && err.code !== 'P2002') {
-        console.error(`[SusuCycleService] _applyMinorPenalty ${member.id}:`, err.message);
+        logger.error(`[SusuCycleService] _applyMinorPenalty ${member.id}:`, err.message);
       }
       return;
     }
@@ -723,7 +724,7 @@ class SusuCycleService {
     // Property 17 SLA: halt within 5 seconds. Log if we miss it.
     const elapsed = Date.now() - startedAt;
     if (elapsed > 5000) {
-      console.warn(`[SusuCycle] Circuit Breaker took ${elapsed}ms (>5s SLA)`);
+      logger.warn(`[SusuCycle] Circuit Breaker took ${elapsed}ms (>5s SLA)`);
     }
   }
 }

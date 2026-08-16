@@ -12,6 +12,7 @@
 //   - cancelTransitBooking: cancel + refund escrow + free seats
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const crypto = require('crypto');
 
 const _genRef = () => 'TRN-' + crypto.randomBytes(4).toString('hex').toUpperCase();
@@ -181,9 +182,16 @@ const getTripSeatAvailability = async (prisma, { tripId }) => {
 const cancelTransitBooking = async (prisma, { bookingId, cancelledBy }) => {
     const booking = await prisma.transitBooking.findUnique({
         where: { id: bookingId },
-        include: { seats: true, trip: true }
+        include: { seats: true, trip: true, businessProfile: { select: { userId: true } } }
     });
     if (!booking) throw new Error('Booking not found.');
+
+    // Authorization: only the booking customer or the business owner can cancel
+    const isOwner = booking.businessProfile?.userId === cancelledBy;
+    const isCustomer = booking.customerId === cancelledBy;
+    if (!isOwner && !isCustomer) {
+        throw new Error('Not authorized to cancel this booking.');
+    }
 
     const cancellable = ['PENDING', 'CONFIRMED'];
     if (!cancellable.includes(booking.status)) {
@@ -219,7 +227,7 @@ const cancelTransitBooking = async (prisma, { bookingId, cancelledBy }) => {
             const { refundBookingEscrow } = require('./bookingEscrowService');
             refundResult = await refundBookingEscrow(prisma, { escrowId: booking.escrowId });
         } catch (err) {
-            console.error('[transitBookingService.cancel] escrow refund failed:', err.message);
+            logger.error({ err: err }, '[transitBookingService.cancel] escrow refund failed');
         }
     }
 

@@ -8,6 +8,7 @@
 // controllers/refreshController.js's POST /api/auth/refresh — which is what
 // silently fires on almost every app re-open once a user has a valid session
 // (JWT refresh-token rotation) — never touched loginStreak / lastLoginAt /
+const logger = require('../src/config/logger');
 // azmRewardService.rewardLoginStreak AT ALL. Since a rotating refresh token
 // means most users never hit /login again after their very first sign-in,
 // their streak was frozen at day 1 for essentially every normal "just open
@@ -77,7 +78,7 @@ async function recordDailyLogin(prisma, user, azmRewardService) {
         // the AZM credit must never block or fail the auth response itself.
         setImmediate(() => {
             azmRewardService.rewardLoginStreak(user.id, loginStreak)
-                .catch((err) => console.error('[loginStreakService] AZM login streak reward error:', err.message));
+                .catch((err) => logger.error({ err: err }, '[loginStreakService] AZM login streak reward error'));
         });
     }
 

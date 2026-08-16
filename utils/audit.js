@@ -8,6 +8,7 @@
 //     actorId: req.user.id, actorName: req.user.username,
 //     action: 'APPROVE_KYC', targetType: 'USER', targetId: String(userId),
 //     metadata: { previousStatus: 'PENDING', newStatus: 'VERIFIED' },
+const logger = require('../src/config/logger');
 //     ipAddress: req.ip,
 //   });
 //
@@ -29,7 +30,7 @@ async function audit(prisma, payload) {
       },
     });
   } catch (err) {
-    console.error('[AuditLog] Failed to write audit row:', err.message, payload);
+    logger.error('[AuditLog] Failed to write audit row:', err.message, payload);
     // Intentionally swallowed — never break the request over a logging failure.
   }
 }

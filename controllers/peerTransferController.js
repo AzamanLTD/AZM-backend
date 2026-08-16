@@ -12,6 +12,9 @@
 // TransactionHistory records for the unified ledger.
 // =============================================================================
 
+const logger = require('../src/config/logger');
+const fraudService = require('../services/fraudDetectionService');
+const journal = require('../services/journalIntegration');
 const NotificationService = require('../services/notificationService');
 
 let notificationService;
@@ -67,6 +70,25 @@ exports.sendFunds = async (req, res) => {
             return res.status(400).json({
                 success: false,
                 message: 'Amount must be a positive number.'
+            });
+        }
+
+        // Fraud detection check
+        const accountAgeMs = Date.now() - new Date(req.user.createdAt || req.user.created_at || Date.now()).getTime();
+        const accountAgeHours = accountAgeMs / (1000 * 60 * 60);
+        const fraudResult = await fraudService.evaluate({
+            userId: req.user.id,
+            type: 'TRANSFER',
+            amount: transferAmount,
+            accountAgeHours,
+        });
+        if (!fraudResult.allowed) {
+            logger.warn({ userId: req.user.id, rules: fraudResult.triggeredRules }, '[peerTransfer] Blocked by fraud detection');
+            return res.status(403).json({
+                success: false,
+                message: 'Transfer blocked by security checks. Please contact support.',
+                code: 'FRAUD_BLOCKED',
+                triggeredRules: fraudResult.triggeredRules,
             });
         }
 
@@ -252,6 +274,11 @@ exports.sendFunds = async (req, res) => {
             }
         });
 
+        // Double-entry journal (non-blocking, fail-safe)
+        journal.recordTransfer(senderId, receiverId, transferAmount, result.transfer.id, {
+            reference: reference || null
+        }).catch(e => logger.warn({ err: e.message, transferId: result.transfer.id }, '[peerTransfer] Journal failed'));
+
         return res.status(200).json({
             success: true,
             message: `${transferAmount.toFixed(2)} USDC sent successfully.`,
@@ -277,7 +304,7 @@ exports.sendFunds = async (req, res) => {
                 idempotent: true
             });
         }
-        console.error('[sendFunds] error:', error.message);
+        logger.error({ err: error }, '[sendFunds] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -436,7 +463,7 @@ exports.requestFunds = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('[requestFunds] error:', error.message);
+        logger.error({ err: error }, '[requestFunds] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -689,7 +716,7 @@ exports.fulfillTransferRequest = async (req, res) => {
                 idempotent: true
             });
         }
-        console.error('[fulfillTransferRequest] error:', error.message);
+        logger.error({ err: error }, '[fulfillTransferRequest] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -825,7 +852,7 @@ exports.declineTransferRequest = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('[declineTransferRequest] error:', error.message);
+        logger.error({ err: error }, '[declineTransferRequest] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -898,7 +925,7 @@ exports.getTransferDetails = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('[getTransferDetails] error:', error.message);
+        logger.error({ err: error }, '[getTransferDetails] error');
         return res.status(500).json({ success: false, message: 'Failed to get transfer details.' });
     }
 };
@@ -957,7 +984,7 @@ exports.getTransferHistory = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('[getTransferHistory] error:', error.message);
+        logger.error({ err: error }, '[getTransferHistory] error');
         return res.status(500).json({ success: false, message: 'Failed to get transfer history.' });
     }
 };
@@ -1001,7 +1028,7 @@ exports.getPendingTransferRequests = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('[getPendingTransferRequests] error:', error.message);
+        logger.error({ err: error }, '[getPendingTransferRequests] error');
         return res.status(500).json({ success: false, message: 'Failed to get pending requests.' });
     }
 };

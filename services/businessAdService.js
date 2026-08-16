@@ -25,6 +25,7 @@
 // This is the same class of bug as businessFollowerService.js: real service
 // classes with correct, tested logic, wrapped by adapters nobody ever
 // exercised end to end.
+const logger = require('../src/config/logger');
 const AdPostService = require('./marketplace/adPostService');
 const FollowService = require('./marketplace/followService');
 
@@ -34,7 +35,7 @@ exports.createAdPost = async (prisma, { businessProfileId, userId, templateType,
 };
 
 exports.removeAdPost = async (prisma, { adPostId, userId }) => {
-    const business = await prisma.businessProfile.findUnique({
+    const business = await prisma.businessProfile.findFirst({
         where: { userId },
         select: { id: true },
     });

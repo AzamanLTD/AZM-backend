@@ -8,6 +8,7 @@
 //   2. Settle any OPEN auctions whose windowEnd has passed.
 //
 // Tick interval: 1 minute. Settlement burns winners' AZM, flips
+const logger = require('../src/config/logger');
 // Ad.isBoosted, writes leaderboard, fires socket "auction:settled".
 // =============================================================================
 
@@ -19,7 +20,7 @@ class AzmAuctionWorker {
     }
 
     start(intervalMs = 60 * 1000) {
-        console.log('[AzmAuctionWorker] Started — ticking every 60 seconds');
+        logger.info('[AzmAuctionWorker] Started — ticking every 60 seconds');
         this._tick();
         this.interval = setInterval(() => this._tick(), intervalMs);
     }
@@ -45,11 +46,11 @@ class AzmAuctionWorker {
                 try {
                     await this.azmAuctionService.settle(auc.id);
                 } catch (err) {
-                    console.error(`[AzmAuctionWorker] settle failed ${auc.id}:`, err.message);
+                    logger.error(`[AzmAuctionWorker] settle failed ${auc.id}:`, err.message);
                 }
             }
         } catch (err) {
-            console.error('[AzmAuctionWorker.tick]', err.message);
+            logger.error({ err: err }, '[AzmAuctionWorker.tick]');
         }
     }
 }

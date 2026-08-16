@@ -13,6 +13,7 @@
 //   - VoucherSlashLog persistence including absent-vouch case (voucherId=null)
 // =============================================================================
 
+const logger = require('../../src/config/logger');
 const { Prisma } = require('@prisma/client');
 const { SusuError, ErrorCodes } = require('./errors');
 const VouchRepo = require('../../repositories/vouchRepo');
@@ -194,7 +195,7 @@ class SusuVouchService {
       };
       setImmediate(() => {
         this.notificationService.sendNotification(payload).catch(err => {
-          console.warn('[SusuVouchService] slash notification failed:', err.message);
+          logger.warn('[SusuVouchService] slash notification failed:', err.message);
         });
       });
     }

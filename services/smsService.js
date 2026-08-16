@@ -5,6 +5,7 @@
  * with real SMS providers like Twilio, AWS SNS, or local providers.
  */
 
+const logger = require('../src/config/logger');
 const crypto = require('crypto');
 const axios  = require('axios');
 
@@ -45,15 +46,15 @@ class SMSService {
                     ...(isTLS ? { tls: {} } : {}),
                 });
                 this._redisClient.on('error', (e) => {
-                    console.error('[SMSService] Redis error (OTP store):', e.message);
+                    logger.error({ err: e }, '[SMSService] Redis error (OTP store)');
                 });
-                console.log('[SMSService] OTP store: Redis' + (isTLS ? ' (TLS/Upstash)' : ''));
+                logger.info('[SMSService] OTP store: Redis' + (isTLS ? ' (TLS/Upstash)' : ''));
             } catch (e) {
-                console.warn('[SMSService] Could not init Redis OTP store, falling back to Map:', e.message);
+                logger.warn('[SMSService] Could not init Redis OTP store, falling back to Map:', e.message);
                 this._redisClient = null;
             }
         } else {
-            console.warn('[SMSService] REDIS_URL not set — OTP codes stored in-process memory (not safe for multi-instance).');
+            logger.warn('[SMSService] REDIS_URL not set — OTP codes stored in-process memory (not safe for multi-instance).');
         }
         this.otpStore = new Map(); // fallback for when Redis is unavailable
     }
@@ -66,15 +67,15 @@ class SMSService {
      * @returns {Promise<Object>} SMS sending result
      */
     async sendSMS(phoneNumber, message, sender = 'AZAMAN') {
-        console.log(`📱 SMS Service: Sending SMS to ${phoneNumber}`);
-        console.log(`📝 Message: ${message}`);
+        logger.info(`📱 SMS Service: Sending SMS to ${phoneNumber}`);
+        logger.info(`📝 Message: ${message}`);
         
         if (this.isTestMode || this.provider === 'mock') {
             // Mock implementation - log to console and return success
             const messageId = this._generateMessageId();
             
-            console.log(`✅ [MOCK SMS] Sent to ${phoneNumber}: ${message}`);
-            console.log(`📋 Message ID: ${messageId}`);
+            logger.info(`✅ [MOCK SMS] Sent to ${phoneNumber}: ${message}`);
+            logger.info(`📋 Message ID: ${messageId}`);
             
             return {
                 success: true,
@@ -238,7 +239,7 @@ class SMSService {
 
             return await this.sendSMS(phoneNumber, message);
         } catch (err) {
-            console.error('[SMSService] sendWithdrawalConfirmation error (swallowed):', err.message);
+            logger.error({ err: err }, '[SMSService] sendWithdrawalConfirmation error (swallowed)');
             return { success: false, error: err.message, provider: this.provider };
         }
     }
@@ -296,7 +297,7 @@ class SMSService {
         // const twilio = require('twilio');
         // const client = twilio(accountSid, authToken);
         
-        console.log('🔧 [PLACEHOLDER] Twilio SMS integration - Replace with real API');
+        logger.info('🔧 [PLACEHOLDER] Twilio SMS integration - Replace with real API');
         
         return {
             success: true,
@@ -309,7 +310,7 @@ class SMSService {
 
     async _sendViaAWS(phoneNumber, message) {
         // TODO: Implement AWS SNS SMS integration
-        console.log('🔧 [PLACEHOLDER] AWS SNS SMS integration - Replace with real API');
+        logger.info('🔧 [PLACEHOLDER] AWS SNS SMS integration - Replace with real API');
         
         return {
             success: true,
@@ -322,7 +323,7 @@ class SMSService {
 
     async _sendViaHubtel(phoneNumber, message, sender) {
         // TODO: Implement Hubtel SMS API (Ghana)
-        console.log('🔧 [PLACEHOLDER] Hubtel SMS integration - Replace with real API');
+        logger.info('🔧 [PLACEHOLDER] Hubtel SMS integration - Replace with real API');
         
         return {
             success: true,
@@ -357,7 +358,7 @@ class SMSService {
 
             if (response.ok && data.status === 'success') {
                 const messageId = data.data?.[0]?.id || this._generateMessageId();
-                console.log(`✅ [Arkesel] SMS sent to ${phoneNumber} (id: ${messageId})`);
+                logger.info(`✅ [Arkesel] SMS sent to ${phoneNumber} (id: ${messageId})`);
                 return {
                     success: true,
                     messageId,
@@ -367,7 +368,7 @@ class SMSService {
                 };
             }
 
-            console.error(`❌ [Arkesel] Failed (${response.status}): ${JSON.stringify(data)}`);
+            logger.error(`❌ [Arkesel] Failed (${response.status}): ${JSON.stringify(data)}`);
             return {
                 success: false,
                 provider: 'arkesel',
@@ -375,7 +376,7 @@ class SMSService {
                 error: data.message || 'Unknown Arkesel error'
             };
         } catch (error) {
-            console.error(`❌ [Arkesel] Network error: ${error.message}`);
+            logger.error(`❌ [Arkesel] Network error: ${error.message}`);
             return { success: false, provider: 'arkesel', status: 'error', error: error.message };
         }
     }
@@ -440,7 +441,7 @@ class SMSService {
             if (envelope && Number(envelope.status) === 1) {
                 const data = envelope.data || {};
                 const messageId = data?.id || data?.messageid || data?.transactionid || null;
-                console.log(`✅ [Moolre] SMS sent to ${phoneNumber} (id: ${messageId})`);
+                logger.info(`✅ [Moolre] SMS sent to ${phoneNumber} (id: ${messageId})`);
                 return {
                     success:   true,
                     messageId,

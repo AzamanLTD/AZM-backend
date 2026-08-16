@@ -5,6 +5,7 @@
 // Phase I  : cursor pagination (non-AI mode) + composite indexes
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const { parsePagination, buildPageEnvelope } = require('../utils/pagination');
 
 // 1. CREATE AD (With Vendor & Collateral Check)
@@ -81,7 +82,7 @@ exports.createAd = async (req, res) => {
         res.status(201).json({ success: true, message: 'Ad posted successfully!', ad: newAd });
 
     } catch (error) {
-        console.error('Create Ad Error:', error);
+        logger.error('Create Ad Error:', error);
         res.status(500).json({ success: false, error: error.message });
     }
 };
@@ -170,7 +171,7 @@ exports.getMarketplaceAds = async (req, res) => {
                 prisma.ad.updateMany({
                     where: { id: { in: expiredBoostIds } },
                     data: { isBoosted: false }
-                }).catch(err => console.error('[adController] boost expiry cleanup error:', err.message));
+                }).catch(err => logger.error({ err: err }, '[adController] boost expiry cleanup error'));
             });
         }
 
@@ -329,7 +330,7 @@ exports.getMarketplaceAds = async (req, res) => {
         }
 
     } catch (error) {
-        console.error('Get Ads Error:', error);
+        logger.error('Get Ads Error:', error);
         res.status(500).json({ success: false, error: error.message });
     }
 };
@@ -382,7 +383,7 @@ exports.getMyAds = async (req, res) => {
 
         res.status(200).json({ success: true, ads });
     } catch (error) {
-        console.error('Get My Ads Error:', error);
+        logger.error('Get My Ads Error:', error);
         res.status(500).json({ success: false, error: error.message });
     }
 };
@@ -409,7 +410,7 @@ exports.toggleAdStatus = async (req, res) => {
 
         res.status(200).json({ success: true, message: `Ad is now ${newStatus}.`, ad: updatedAd });
     } catch (error) {
-        console.error('Toggle Ad Error:', error);
+        logger.error('Toggle Ad Error:', error);
         res.status(500).json({ success: false, error: error.message });
     }
 };
@@ -477,7 +478,7 @@ exports.archiveAd = async (req, res) => {
             ad: archivedAd
         });
     } catch (error) {
-        console.error('Archive Ad Error:', error);
+        logger.error('Archive Ad Error:', error);
         res.status(500).json({ success: false, error: error.message });
     }
 };

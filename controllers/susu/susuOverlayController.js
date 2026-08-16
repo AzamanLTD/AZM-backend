@@ -6,6 +6,7 @@
 // canonical envelope.
 // =============================================================================
 
+const logger = require('../../src/config/logger');
 const { SusuError } = require('../../services/susu/errors');
 const susuSchemas = require('../../services/validation/susuSchemas');
 
@@ -24,7 +25,7 @@ function fail(res, err) {
     return res.status(err.httpStatus || 400).json(body);
   }
   // Unknown error — log + generic envelope
-  console.error('[susuOverlayController] unhandled:', err);
+  logger.error('[susuOverlayController] unhandled:', err);
   return res.status(500).json({
     success: false,
     message: 'Internal server error',

@@ -13,6 +13,7 @@
 //   - Only generate receipts for COMPLETED trades / COMPLETED withdrawals
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const { generateTradeReceipt, generateWithdrawalReceipt, generateTransferReceipt } = require('../services/receiptService');
 
 // =============================================================================
@@ -74,7 +75,7 @@ exports.getTransactionReceipt = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('[receipt.getTransactionReceipt] error:', error.message);
+        logger.error({ err: error }, '[receipt.getTransactionReceipt] error');
         return res.status(500).json({ success: false, message: 'Failed to fetch receipt data' });
     }
 };
@@ -136,7 +137,7 @@ exports.getTradeReceipt = async (req, res) => {
         return res.send(pdfBuffer);
 
     } catch (error) {
-        console.error('[receipt.getTradeReceipt] error:', error.message);
+        logger.error({ err: error }, '[receipt.getTradeReceipt] error');
         return res.status(500).json({ success: false, message: 'Failed to generate receipt' });
     }
 };
@@ -197,7 +198,7 @@ exports.getWithdrawalReceipt = async (req, res) => {
         return res.send(pdfBuffer);
 
     } catch (error) {
-        console.error('[receipt.getWithdrawalReceipt] error:', error.message);
+        logger.error({ err: error }, '[receipt.getWithdrawalReceipt] error');
         return res.status(500).json({ success: false, message: 'Failed to generate receipt' });
     }
 };
@@ -256,7 +257,7 @@ exports.getTransferReceipt = async (req, res) => {
         });
         return res.send(pdfBuffer);
     } catch (error) {
-        console.error('[receipt.getTransferReceipt] error:', error.message);
+        logger.error({ err: error }, '[receipt.getTransferReceipt] error');
         return res.status(500).json({ success: false, message: 'Failed to generate receipt' });
     }
 };

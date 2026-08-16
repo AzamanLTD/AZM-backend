@@ -3,6 +3,7 @@
 // HTTP boundary for Proof of Residency endpoints.
 // =============================================================================
 
+const logger = require('../../src/config/logger');
 const { SusuError } = require('../../services/susu/errors');
 
 function ok(res, data, status = 200) { return res.status(status).json({ success: true, data }); }
@@ -12,7 +13,7 @@ function fail(res, err) {
     if (err.fields) body.fields = err.fields;
     return res.status(err.httpStatus || 400).json(body);
   }
-  console.error('[proofOfResidencyController]', err);
+  logger.error('[proofOfResidencyController]', err);
   return res.status(500).json({ success: false, message: 'Internal server error', errorCode: 'INTERNAL' });
 }
 const wrap = (h) => async (req, res) => { try { await h(req, res); } catch (e) { fail(res, e); } };

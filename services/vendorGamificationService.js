@@ -25,6 +25,7 @@
 // =============================================================================
 
 // ── Level Thresholds ─────────────────────────────────────────────────────────
+const logger = require('../src/config/logger');
 const LEVEL_THRESHOLDS = {
     BRONZE:  0,
     SILVER:  500,
@@ -644,13 +645,13 @@ const processReviewGamification = async (prisma, { revieweeId, isPositive, trade
                     ...result.newAchievements.map(a =>
                         azmSvc.rewardAchievementUnlock(revieweeId, a.achievementId, a.name, a.tier)
                     )
-                ]).catch(err => console.error('[gamification.reviewGamification] post-commit notif/azm error:', err.message));
+                ]).catch(err => logger.error({ err: err }, '[gamification.reviewGamification] post-commit notif/azm error'));
             });
         }
 
         return result;
     } catch (gamErr) {
-        console.error(
+        logger.error(
             `[gamification.processReviewGamification] tradeId=${tradeId} ` +
             `revieweeId=${revieweeId} non-fatal error: ${gamErr.message}`
         );

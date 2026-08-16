@@ -1,3 +1,4 @@
+const logger = require('../src/config/logger');
 // infra/autoRelease.js
 // =============================================================================
 // Boot-time, idempotent "release" step for free-tier hosting (Render free
@@ -47,7 +48,7 @@ const releaseStatus = {
 };
 
 function log(msg) {
-  console.log(`[autoRelease] ${msg}`);
+  logger.info(`[autoRelease] ${msg}`);
   releaseStatus.steps.push(`${new Date().toISOString()} ${msg}`);
   // Keep the step log bounded.
   if (releaseStatus.steps.length > 50) releaseStatus.steps.shift();

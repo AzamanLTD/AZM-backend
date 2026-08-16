@@ -7,6 +7,7 @@
 //   POST /api/kyc/webhook/dojah   — Dojah webhook receiver (HMAC-only, NO auth)
 //   POST /api/kyc/admin/override  — Admin manual approve/reject (admin-only)
 
+const logger = require('../src/config/logger');
 const express = require('express');
 const router = express.Router();
 const kycController = require('../controllers/kycController');

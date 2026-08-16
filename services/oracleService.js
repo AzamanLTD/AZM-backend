@@ -1,4 +1,5 @@
 // services/oracleService.js
+const logger = require('../src/config/logger');
 const axios = require('axios');
 
 class OracleService {
@@ -9,7 +10,7 @@ class OracleService {
     }
 
     startOracle() {
-        console.log("🌐 Azaman Live Market Oracle: INITIALIZED");
+        logger.info("🌐 Azaman Live Market Oracle: INITIALIZED");
         this.fetchAndUpdateRates(); 
         setInterval(() => this.fetchAndUpdateRates(), this.updateInterval);
     }
@@ -47,18 +48,18 @@ class OracleService {
                 }
             });
 
-            console.log(`📈 Oracle Sync: 1 USD = ${usdToGhsRate} GHS | USDT = $${tetherPrice}`);
+            logger.info(`📈 Oracle Sync: 1 USD = ${usdToGhsRate} GHS | USDT = $${tetherPrice}`);
 
             // Phase Q12: Check rate alerts after successful sync
             if (this.rateAlertService && usdToGhsRate) {
                 setImmediate(() => {
                     this.rateAlertService.checkAlerts(usdToGhsRate, 'USD_GHS')
-                        .catch(err => console.error('[Oracle] alert check error:', err.message));
+                        .catch(err => logger.error({ err: err }, '[Oracle] alert check error'));
                 });
             }
 
         } catch (error) {
-            console.error("🚨 Oracle Sync Failed. Retrying in 10 mins.", error.message);
+            logger.error({ err: error }, '🚨 Oracle Sync Failed. Retrying in 10 mins.');
         }
     }
 }

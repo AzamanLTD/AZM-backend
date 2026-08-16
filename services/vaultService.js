@@ -19,6 +19,7 @@
 //   provided by Postgres CHECK (availableBalance >= 0) on User.
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const { Prisma } = require('@prisma/client');
 
 const FREQUENCY_MS = {

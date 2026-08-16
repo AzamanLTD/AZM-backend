@@ -1,3 +1,4 @@
+const logger = require('../src/config/logger');
 const NotificationService = require('../services/notificationService');
 
 const checkMilestones = async (userId, tradeId) => {
@@ -72,7 +73,7 @@ const checkMilestones = async (userId, tradeId) => {
                                 tradeId: tradeId ? parseInt(tradeId) : null
                             }
                         })
-                    ]).catch(err => console.error('[Milestones] post-commit notif error:', err.message));
+                    ]).catch(err => logger.error({ err: err }, '[Milestones] post-commit notif error'));
                 });
 
                 if (io) {
@@ -93,11 +94,11 @@ const checkMilestones = async (userId, tradeId) => {
                     });
                 }
 
-                console.log(`[Milestones] User #${userId} unlocked badge "${badge.name}" at volume ${totalVolume} USDC. Discount approval sent to Admin.`);
+                logger.info(`[Milestones] User #${userId} unlocked badge "${badge.name}" at volume ${totalVolume} USDC. Discount approval sent to Admin.`);
             }
         }
     } catch (error) {
-        console.error('[Milestones] checkMilestones error:', error.message);
+        logger.error({ err: error }, '[Milestones] checkMilestones error');
     }
 };
 

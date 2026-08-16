@@ -8,6 +8,7 @@
 //   DELETE /api/oracle/alerts/:id      — Delete/deactivate an alert
 //
 // All require authentication.
+const logger = require('../src/config/logger');
 // =============================================================================
 
 // 1. CREATE RATE ALERT
@@ -44,7 +45,7 @@ exports.createAlert = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('[rateAlert.create] error:', error.message);
+        logger.error({ err: error }, '[rateAlert.create] error');
         const status = error.message.includes('Maximum') ? 400 : 500;
         return res.status(status).json({ success: false, message: error.message });
     }
@@ -76,7 +77,7 @@ exports.listAlerts = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('[rateAlert.list] error:', error.message);
+        logger.error({ err: error }, '[rateAlert.list] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -97,7 +98,7 @@ exports.deleteAlert = async (req, res) => {
         return res.status(200).json({ success: true, message: 'Alert deleted' });
 
     } catch (error) {
-        console.error('[rateAlert.delete] error:', error.message);
+        logger.error({ err: error }, '[rateAlert.delete] error');
         const status = error.message.includes('Not authorized') ? 403 :
                        error.message.includes('not found') ? 404 : 500;
         return res.status(status).json({ success: false, message: error.message });

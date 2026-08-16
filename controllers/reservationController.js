@@ -6,6 +6,8 @@
 // NEVER moves USDC — escrow integration uses existing escrowService.
 // =============================================================================
 
+const logger = require('../src/config/logger');
+const { emitWebhookEvent } = require('../services/webhookEmitter');
 const crypto = require('crypto');
 
 function genRef() {
@@ -43,6 +45,29 @@ exports.createReservation = async (req, res) => {
 
         const biz = await _getBiz(prisma, bizId);
 
+        // ── Availability conflict check (Phase 2.3) ──────────────────────────
+        // Prevent double-booking: reject if an overlapping PENDING/CONFIRMED/
+        // CHECKED_IN reservation exists for the same business (+ optional
+        // location/service item).
+        const conflictWhere = {
+            businessProfileId: biz.id,
+            status: { in: ['PENDING', 'CONFIRMED', 'CHECKED_IN'] },
+            OR: [
+                { startDatetime: { lt: end }, endDatetime: { gt: start } },
+            ],
+        };
+        if (locationId) conflictWhere.locationId = locationId;
+        if (serviceItemId) conflictWhere.serviceItemId = serviceItemId;
+
+        const conflict = await prisma.reservation.findFirst({ where: conflictWhere });
+        if (conflict) {
+            return res.status(409).json({
+                success: false,
+                message: 'This time slot is already booked. Please choose another time.',
+                conflict: { id: conflict.id, start: conflict.startDatetime, end: conflict.endDatetime },
+            });
+        }
+
         const reservation = await prisma.reservation.create({
             data: {
                 reservationRef:    genRef(),
@@ -60,6 +85,18 @@ exports.createReservation = async (req, res) => {
                 status:            'PENDING',
             },
         });
+
+        // Fire-and-forget webhook for reservation creation
+        emitWebhookEvent(biz.id, 'reservation.created', {
+            reservationId: reservation.id,
+            reservationRef: reservation.reservationRef,
+            customerId,
+            startDatetime: start.toISOString(),
+            endDatetime: end.toISOString(),
+            partySize: reservation.partySize,
+            amountUsdc: reservation.amountUsdc,
+        });
+
         return res.status(201).json({ success: true, reservation });
     } catch (err) {
         const code = err.status || 500;
@@ -134,7 +171,7 @@ exports.listBusinessReservations = async (req, res) => {
         const { status, limit, cursor } = req.query;
         const take = Math.min(parseInt(limit, 10) || 20, 50);
 
-        const profile = await prisma.businessProfile.findUnique({ where: { userId } });
+        const profile = await prisma.businessProfile.findFirst({ where: { userId } });
         if (!profile) return res.status(404).json({ success: false, message: 'Business profile not found.' });
 
         const where = { businessProfileId: profile.id };
@@ -166,7 +203,7 @@ exports.confirmReservation = async (req, res) => {
     const prisma = req.app.get('prisma');
     try {
         const userId  = req.user.id;
-        const profile = await prisma.businessProfile.findUnique({ where: { userId } });
+        const profile = await prisma.businessProfile.findFirst({ where: { userId } });
         if (!profile) return res.status(404).json({ success: false, message: 'Business profile not found.' });
 
         const { reservationId } = req.params;
@@ -180,6 +217,16 @@ exports.confirmReservation = async (req, res) => {
             where: { id: reservationId },
             data:  { status: 'CONFIRMED', confirmedAt: new Date(), businessNotes: req.body.businessNotes || null },
         });
+
+        // Fire-and-forget webhook for reservation confirmation
+        emitWebhookEvent(profile.id, 'reservation.confirmed', {
+            reservationId: updated.id,
+            reservationRef: updated.reservationRef,
+            customerId: updated.customerId,
+            status: 'CONFIRMED',
+            confirmedAt: updated.confirmedAt,
+        });
+
         return res.status(200).json({ success: true, reservation: updated });
     } catch (err) {
         return res.status(500).json({ success: false, message: err.message });
@@ -191,7 +238,7 @@ exports.checkInReservation = async (req, res) => {
     const prisma = req.app.get('prisma');
     try {
         const userId  = req.user.id;
-        const profile = await prisma.businessProfile.findUnique({ where: { userId } });
+        const profile = await prisma.businessProfile.findFirst({ where: { userId } });
         if (!profile) return res.status(403).json({ success: false, message: 'Business profile required.' });
 
         const { reservationId } = req.params;
@@ -218,7 +265,7 @@ exports.markNoShowReservation = async (req, res) => {
     const prisma = req.app.get('prisma');
     try {
         const userId  = req.user.id;
-        const profile = await prisma.businessProfile.findUnique({ where: { userId } });
+        const profile = await prisma.businessProfile.findFirst({ where: { userId } });
         if (!profile) return res.status(403).json({ success: false, message: 'Business profile required.' });
 
         const { reservationId } = req.params;
@@ -242,7 +289,7 @@ exports.checkOutReservation = async (req, res) => {
     const prisma = req.app.get('prisma');
     try {
         const userId  = req.user.id;
-        const profile = await prisma.businessProfile.findUnique({ where: { userId } });
+        const profile = await prisma.businessProfile.findFirst({ where: { userId } });
         if (!profile) return res.status(403).json({ success: false, message: 'Business profile required.' });
 
         const { reservationId } = req.params;
@@ -276,7 +323,7 @@ exports.getReservation = async (req, res) => {
             },
         });
         if (!r) return res.status(404).json({ success: false, message: 'Reservation not found.' });
-        const profile = await prisma.businessProfile.findUnique({ where: { userId }, select: { id: true } });
+        const profile = await prisma.businessProfile.findFirst({ where: { userId }, select: { id: true } });
         const isOwner = profile?.id === r.businessProfileId;
         if (r.customerId !== userId && !isOwner)
             return res.status(403).json({ success: false, message: 'Forbidden.' });
@@ -386,7 +433,7 @@ exports.counterProposeReservation = async (req, res) => {
 
         res.json({ success: true, reservation: updated });
     } catch (err) {
-        console.error('[counterProposeReservation]', err.message);
+        logger.error({ err: err }, '[counterProposeReservation]');
         res.status(500).json({ success: false, message: err.message });
     }
 };
@@ -435,7 +482,7 @@ exports.acceptCounterProposal = async (req, res) => {
 
         res.json({ success: true, reservation: updated });
     } catch (err) {
-        console.error('[acceptCounterProposal]', err.message);
+        logger.error({ err: err }, '[acceptCounterProposal]');
         res.status(500).json({ success: false, message: err.message });
     }
 };

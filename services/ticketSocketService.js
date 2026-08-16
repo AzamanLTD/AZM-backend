@@ -8,6 +8,7 @@
 // Room naming contract:
 //   Ticket workspace room: ticket_${ticketId}
 //   User inbox:            user_${userId}  (shared with the rest of the app)
+const logger = require('../src/config/logger');
 //
 // Handled events:
 //   • join_ticket            — join a ticket workspace room
@@ -59,7 +60,7 @@ class TicketSocketService {
 
                 const room = `ticket_${ticket.id}`;
                 socket.join(room);
-                console.log(`🎟️ ${socket.id} → ${room}`);
+                logger.info(`🎟️ ${socket.id} → ${room}`);
 
                 socket.emit('ticket_joined', { ticketId: ticket.id, room });
 
@@ -72,7 +73,7 @@ class TicketSocketService {
                     viewing: true
                 });
             } catch (err) {
-                console.error('join_ticket error:', err.message);
+                logger.error({ err: err }, 'join_ticket error');
                 socket.emit('ticket_error', { reason: 'server_error' });
             }
         });
@@ -100,7 +101,7 @@ class TicketSocketService {
                     });
                 }
             } catch (err) {
-                console.error('leave_ticket error:', err.message);
+                logger.error({ err: err }, 'leave_ticket error');
             }
         });
 

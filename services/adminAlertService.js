@@ -8,6 +8,7 @@
 //      mobile admin screens join this room) — instant in-dashboard banner.
 //   2. Email: a single digest line to ADMIN_ALERT_EMAIL — survives nobody
 //      being logged in at 3am. Email is fire-and-forget and mock-safe (the
+const logger = require('../src/config/logger');
 //      emailService no-ops cleanly until EMAIL_PROVIDER is configured), so this
 //      service is safe to run today and "lights up" once SendGrid is wired.
 //
@@ -59,7 +60,7 @@ class AdminAlertService {
     emit(type, payload = {}) {
         const def = ALERT_DEFS[type];
         if (!def) {
-            console.warn(`[adminAlert] unknown alert type: ${type}`);
+            logger.warn(`[adminAlert] unknown alert type: ${type}`);
             return;
         }
 
@@ -76,7 +77,7 @@ class AdminAlertService {
         try {
             if (this.io) this.io.to(ADMIN_ROOM).emit('admin_alert', alert);
         } catch (e) {
-            console.error('[adminAlert] socket emit failed:', e.message);
+            logger.error({ err: e }, '[adminAlert] socket emit failed');
         }
 
         // 2. Email — fire-and-forget, mock-safe. Only attempt if configured.
@@ -90,7 +91,7 @@ class AdminAlertService {
                 `${JSON.stringify(payload)}\n${alert.timestamp}`;
             Promise.resolve()
                 .then(() => this.emailService.sendEmail(this.alertEmail, subject, html, text))
-                .catch((e) => console.error('[adminAlert] email failed:', e.message));
+                .catch((e) => logger.error({ err: e }, '[adminAlert] email failed'));
         }
     }
 

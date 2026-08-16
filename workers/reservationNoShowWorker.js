@@ -12,6 +12,7 @@
 //   (default 30 minutes after departure, no check-in).
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const GRACE_PERIOD_MINS = 30; // grace after departure before marking transit no-show
 
 // =============================================================================
@@ -80,12 +81,12 @@ const sweepNoShowReservations = async (prisma) => {
                     outcome: 'NO_SHOW'
                 });
             } catch (e) {
-                console.error(`[noShowWorker] Trust score update failed for reservation ${reservation.id}:`, e.message);
+                logger.error(`[noShowWorker] Trust score update failed for reservation ${reservation.id}:`, e.message);
             }
         } catch (err) {
             results.errors++;
             results.details.push({ id: reservation.id, error: err.message });
-            console.error(`[noShowWorker] Reservation ${reservation.id}:`, err.message);
+            logger.error(`[noShowWorker] Reservation ${reservation.id}:`, err.message);
         }
     }
 
@@ -154,12 +155,12 @@ const sweepNoShowTransitBookings = async (prisma) => {
                     outcome: 'NO_SHOW'
                 });
             } catch (e) {
-                console.error(`[noShowWorker] Trust score update failed for transit booking ${booking.id}:`, e.message);
+                logger.error(`[noShowWorker] Trust score update failed for transit booking ${booking.id}:`, e.message);
             }
         } catch (err) {
             results.errors++;
             results.details.push({ id: booking.id, error: err.message });
-            console.error(`[noShowWorker] Transit booking ${booking.id}:`, err.message);
+            logger.error(`[noShowWorker] Transit booking ${booking.id}:`, err.message);
         }
     }
 

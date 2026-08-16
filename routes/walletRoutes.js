@@ -5,25 +5,28 @@
 // access); writes go through the ban guard.
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const express                  = require('express');
 const router                   = express.Router();
 const walletController         = require('../controllers/walletController');
 const { protect }              = require('../middleware/authMiddleware');
+const { idempotency } = require('../middleware/idempotency');
+const { require2FA } = require('../middleware/require2FA');
 const { protectActive }        = require('../middleware/banGuardMiddleware');
 
 // Withdrawals
-router.post('/withdraw',       protectActive, walletController.requestWithdrawal);
+router.post('/withdraw',       protectActive, require2FA(), idempotency(), walletController.requestWithdrawal);
 
 // Read-only history (banned users still need to see their own history)
 router.get('/history',         protect,       walletController.getWithdrawalHistory);
 
 // Saved wallets / payout whitelist
-router.post('/saved',          protectActive, walletController.addSavedWallet);
+router.post('/saved',          protectActive, idempotency(), walletController.addSavedWallet);
 router.get('/saved',           protect,       walletController.getSavedWallets);
 router.delete('/saved/:id',    protectActive, walletController.deleteSavedWallet);
 
 // Fiat deposit gateway (initialize)
-router.post('/deposit/initialize', protectActive, walletController.initializeFiatDeposit);
+router.post('/deposit/initialize', protectActive, idempotency(), walletController.initializeFiatDeposit);
 
 // Polygon deposit address (Phase C: Tatum HD wallet derivation)
 router.get('/deposit-address/polygon', protect, walletController.getPolygonDepositAddress);
@@ -72,7 +75,7 @@ router.get('/pool-withdrawal-preview', protect, async (req, res) => {
 
 // POST /api/wallet/internal-transfer
 // Body: { direction: 'TO_POOL' | 'FROM_POOL', amount: number }
-router.post('/internal-transfer', protectActive, async (req, res) => {
+router.post('/internal-transfer', protectActive, require2FA(), idempotency(), async (req, res) => {
     const prisma = req.app.get('prisma');
     const emitBalanceUpdate = req.app.get('emitBalanceUpdate');
 
@@ -182,7 +185,7 @@ router.post('/internal-transfer', protectActive, async (req, res) => {
             data: { direction, amount: amountFloat }
         });
     } catch (error) {
-        console.error('[wallet.internalTransfer] error:', error.message);
+        logger.error({ err: error }, '[wallet.internalTransfer] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 });

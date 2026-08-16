@@ -2,11 +2,12 @@
 // =============================================================================
 // AZAMAN — AZM AUCTION CONTROLLER  (Master Sprint, 2026-05-27)
 // =============================================================================
+const logger = require('../src/config/logger');
 
 const wrap = (fn) => async (req, res) => {
     try { await fn(req, res); }
     catch (err) {
-        console.error(`[azmAuctionController] ${fn.name || 'h'}:`, err.message);
+        logger.error(`[azmAuctionController] ${fn.name || 'h'}:`, err.message);
         res.status(400).json({ success: false, message: err.message });
     }
 };

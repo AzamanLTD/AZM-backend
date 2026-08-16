@@ -12,13 +12,14 @@
 // movement (PAID/COMPLETED/REFUNDED) are driven by escrowService hooks, not here.
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const businessOrderService = require('../services/businessOrderService');
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 /** Load the BusinessProfile owned by the calling user (null if none). */
 async function _ownedProfile(prisma, userId) {
-    return prisma.businessProfile.findUnique({
+    return prisma.businessProfile.findFirst({
         where: { userId },
         select: { id: true, businessName: true, kybStatus: true }
     });
@@ -144,9 +145,19 @@ exports.markDelivered = async (req, res) => {
                         action:  'VIEW_TICKET',
                         orderId: order.id
                     }
-                }).catch((e) => console.error('[markDelivered] notification:', e.message));
+                }).catch((e) => logger.error({ err: e }, '[markDelivered] notification'));
             });
         }
+
+        // Phase 4: Trigger webhook for order completion
+        try {
+            const webhookController = require('./webhookController');
+            await webhookController.triggerEvent(prisma, profile.id, 'order.completed', {
+                orderId: order.id,
+                orderRef: order.orderRef,
+                amount: parseFloat(order.amountUsdc),
+            });
+        } catch (_) { /* best-effort */ }
 
         return res.status(200).json({ success: true, order });
     } catch (err) {

@@ -21,6 +21,7 @@
 // matches the controller's first-failing message. No transforms → req.body is
 // passed through untouched.
 // =============================================================================
+const logger = require('../../src/config/logger');
 const { z } = require('zod');
 
 const passthrough = () => z.object({}).passthrough();

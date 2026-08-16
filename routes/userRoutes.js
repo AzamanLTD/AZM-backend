@@ -4,6 +4,7 @@
 // Mounted at /api/users. Includes profile, preferences, onboarding, balance.
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const express = require('express');
 const router = express.Router();
 const userController = require('../controllers/userController');
@@ -18,6 +19,11 @@ const avatarUpload = require('../middleware/avatarUploadMiddleware.js');
 const { strictLimiter } = require('../middleware/rateLimitMiddleware');
 
 const protect = authMiddleware.protect;
+
+// Async wrapper — catches rejected promises and forwards to Express error handler
+function wrap(handler) {
+  return (req, res, next) => Promise.resolve(handler(req, res, next)).catch(next);
+}
 
 // ─── PHASE 6: IDENTITY + CONTACT DISCOVERY ───────────────────────────────────
 // Find a user by Azaman ID; discover contacts (hash-matched, rate-limited);
@@ -69,6 +75,66 @@ router.put('/preferences/shortcuts', protect, userPreferencesController.updateSh
 router.put('/preferences', protect, userPreferencesController.updateAll);
 // B-10: preferred display currency (USD, GHS, NGN, KES, etc.)
 router.put('/preferences/currency', protect, userPreferencesController.updatePreferredCurrency);
+
+// Notification preferences & quiet hours
+router.get('/me/notification-preferences', protect, wrap(async (req, res) => {
+    const prisma = require('../lib/prisma');
+    const user = await prisma.prisma.user.findUnique({
+        where: { id: req.user.id },
+        select: { notificationPrefs: true },
+    });
+    // Return defaults if not set
+    const prefs = user?.notificationPrefs || {
+        pushEnabled: true,
+        inAppEnabled: true,
+        emailEnabled: false,
+        quietHoursEnabled: false,
+        quietStart: '22:00',
+        quietEnd: '07:00',
+        categories: {
+            money: true, social: true, chat: true,
+            security: true, system: true, vendor: true, admin: true,
+        },
+        bypassQuiet: {
+            money: false, social: false, chat: false,
+            security: true, system: false, vendor: false, admin: false,
+        },
+    };
+    res.json({ data: prefs });
+}));
+
+router.put('/me/notification-preferences', protect, wrap(async (req, res) => {
+    const prisma = require('../lib/prisma');
+    const {
+        pushEnabled, inAppEnabled, emailEnabled,
+        quietHoursEnabled, quietStart, quietEnd,
+        categories, bypassQuiet,
+    } = req.body;
+
+    const prefs = {
+        pushEnabled: typeof pushEnabled === 'boolean' ? pushEnabled : true,
+        inAppEnabled: typeof inAppEnabled === 'boolean' ? inAppEnabled : true,
+        emailEnabled: typeof emailEnabled === 'boolean' ? emailEnabled : false,
+        quietHoursEnabled: typeof quietHoursEnabled === 'boolean' ? quietHoursEnabled : false,
+        quietStart: quietStart || '22:00',
+        quietEnd: quietEnd || '07:00',
+        categories: categories || {
+            money: true, social: true, chat: true,
+            security: true, system: true, vendor: true, admin: true,
+        },
+        bypassQuiet: bypassQuiet || {
+            money: false, social: false, chat: false,
+            security: true, system: false, vendor: false, admin: false,
+        },
+    };
+
+    await prisma.prisma.user.update({
+        where: { id: req.user.id },
+        data: { notificationPrefs: prefs },
+    });
+
+    res.json({ data: prefs });
+}));
 
 // ─── MILESTONES & SECURITY LOGS ──────────────────────────────────────────────
 router.get('/me/milestones', protect, milestoneController.getMilestones);

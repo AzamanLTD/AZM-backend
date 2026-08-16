@@ -1,3 +1,4 @@
+const logger = require('../src/config/logger');
 const { followBusiness, unfollowBusiness, isFollowing, getFollowers, getFollowing } = require('../services/businessFollowerService');
 const FollowService = require('../services/marketplace/followService');
 
@@ -57,7 +58,7 @@ exports.myFollowing = async (req, res) => {
 
 exports.myFollowers = async (req, res) => {
     try {
-        const business = await req.prisma.businessProfile.findUnique({
+        const business = await req.prisma.businessProfile.findFirst({
             where: { userId: req.user.id },
             select: { id: true }
         });

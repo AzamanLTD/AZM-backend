@@ -1,6 +1,7 @@
 // controllers/walletController.js
 
 /**
+const logger = require('../src/config/logger');
  * 1. REQUEST WITHDRAWAL (The Address Detective)
  */
 exports.requestWithdrawal = async (req, res) => {
@@ -133,6 +134,7 @@ exports.requestWithdrawal = async (req, res) => {
         res.status(400).json({ success: false, message: error.message });
     }
 };
+exports.requestWithdrawal.openapi = { summary: "Request a withdrawal", description: "Initiates a withdrawal from the user trade account to a payout destination.", tags: ["wallet", "withdrawal"] };
 
 /**
  * 2. GET WITHDRAWAL HISTORY
@@ -286,7 +288,7 @@ exports.addSavedWallet = async (req, res) => {
 
         res.status(201).json({ success: true, wallet: newWallet, message: "Account verified and saved!" });
     } catch (error) {
-        console.error("Save Wallet Error:", error);
+        logger.error("Save Wallet Error:", error);
         res.status(500).json({ success: false, message: "Server error saving account." });
     }
 };
@@ -330,7 +332,7 @@ exports.deleteSavedWallet = async (req, res) => {
         await prisma.savedWallet.delete({ where: { id: walletId } });
         res.status(200).json({ success: true, message: "Payment method removed." });
     } catch (error) {
-        console.error("Delete Wallet Error:", error);
+        logger.error("Delete Wallet Error:", error);
         res.status(500).json({ success: false, message: "Server error deleting wallet." });
     }
 };
@@ -374,10 +376,11 @@ exports.initializeFiatDeposit = async (req, res) => {
       expiresAt: new Date(Date.now() + 30 * 60 * 1000).toISOString(),
     });
   } catch (e) {
-    console.error('initializeFiatDeposit error', e);
+    logger.error('initializeFiatDeposit error', e);
     return res.status(500).json({ error: 'Failed to initialize deposit' });
   }
 };
+exports.initializeFiatDeposit.openapi = { summary: "Initialize fiat deposit", description: "Creates a Moolre payment link for fiat deposit into the user trade account.", tags: ["wallet", "deposit"] };
 
 
 // =============================================================================
@@ -446,7 +449,7 @@ exports.getPolygonDepositAddress = async (req, res) => {
         try {
             subscription = await tatumService.subscribeAddress(normalizedAddress);
         } catch (subErr) {
-            console.error('[getPolygonDepositAddress] Subscription failed (non-fatal):', subErr.message);
+            logger.error({ err: subErr }, '[getPolygonDepositAddress] Subscription failed (non-fatal)');
         }
 
         return res.status(201).json({
@@ -465,7 +468,7 @@ exports.getPolygonDepositAddress = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('[getPolygonDepositAddress] error:', error.message);
+        logger.error({ err: error }, '[getPolygonDepositAddress] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };

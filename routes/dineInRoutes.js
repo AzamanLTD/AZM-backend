@@ -1,8 +1,10 @@
+const logger = require('../src/config/logger');
 const express = require('express');
 const router = express.Router();
 const { protect } = require('../middleware/authMiddleware');
 const ctrl = require('../controllers/dineInController');
 const { kybGate } = require('../middleware/kybGateMiddleware');
+const { require2FA } = require('../middleware/require2FA');
 
 // Business-side
 router.post('/tabs',                  protect, kybGate, ctrl.openTab);
@@ -17,6 +19,6 @@ router.get('/guests/search',          protect, kybGate, ctrl.searchGuests);
 
 // Customer-side
 router.get('/tabs/:tabId',            protect, ctrl.getTab);
-router.post('/tabs/:tabId/pay',       protect, ctrl.confirmAndPay);
+router.post('/tabs/:tabId/pay',       protect, require2FA(), ctrl.confirmAndPay);
 
 module.exports = router;

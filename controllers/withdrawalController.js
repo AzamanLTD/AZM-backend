@@ -14,6 +14,9 @@
 //     the on-chain transfer succeeded.
 // =============================================================================
 
+const logger = require('../src/config/logger');
+const fraudService = require('../services/fraudDetectionService');
+const journal = require('../services/journalIntegration');
 const financeService          = require('../services/finance.service');
 const { runDoubleCheck }      = require('../utils/securityCheck');
 const axios                   = require('axios');
@@ -49,7 +52,8 @@ exports.fiatWithdrawal = async (req, res) => {
     const prisma                  = req.app.get('prisma');
     const io                      = req.app.get('socketio');
     const emitBalanceUpdate       = req.app.get('emitBalanceUpdate');
-    const mtnDisbursementService  = req.app.get('mtnDisbursementService');
+    const paymentFailoverService  = req.app.get("paymentFailoverService");
+    const mtnDisbursementService  = paymentFailoverService || req.app.get("mtnDisbursementService"); // failover-aware
     const emailService            = req.app.get('emailService');
     const smsService              = req.app.get('smsService');
 
@@ -59,6 +63,25 @@ exports.fiatWithdrawal = async (req, res) => {
 
         if (!amount || Number(amount) <= 0) {
             return res.status(400).json({ success: false, message: 'Invalid withdrawal amount.' });
+        }
+
+        // Fraud detection check
+        const accountAgeMs = Date.now() - new Date(req.user.createdAt || req.user.created_at || Date.now()).getTime();
+        const accountAgeHours = accountAgeMs / (1000 * 60 * 60);
+        const fraudResult = await fraudService.evaluate({
+            userId: req.user.id,
+            type: 'WITHDRAWAL',
+            amount: parseFloat(amount),
+            accountAgeHours,
+        });
+        if (!fraudResult.allowed) {
+            logger.warn({ userId: req.user.id, rules: fraudResult.triggeredRules }, '[fiatWithdrawal] Blocked by fraud detection');
+            return res.status(403).json({
+                success: false,
+                message: 'Transaction blocked by security checks. Please contact support.',
+                code: 'FRAUD_BLOCKED',
+                triggeredRules: fraudResult.triggeredRules,
+            });
         }
 
         // recipientPhone is required for MTN MoMo dispatch — fall back to the
@@ -142,7 +165,7 @@ exports.fiatWithdrawal = async (req, res) => {
             });
         } catch (rowErr) {
             // Non-fatal: the canonical record is the TransactionHistory row.
-            console.warn('[fiatWithdrawal] Withdrawal mirror row insert failed:', rowErr.message);
+            logger.warn('[fiatWithdrawal] Withdrawal mirror row insert failed:', rowErr.message);
         }
 
         // B-11: notify admins of a large pending withdrawal (fire-and-forget,
@@ -162,7 +185,7 @@ exports.fiatWithdrawal = async (req, res) => {
         // Step 3 — Dispatch payout to MTN MoMo. On synchronous failure, fully
         // reverse the ledger so the user is not silently debited.
         if (!mtnDisbursementService) {
-            console.error('[fiatWithdrawal] mtnDisbursementService is not bound to the app context.');
+            logger.error('[fiatWithdrawal] mtnDisbursementService is not bound to the app context.');
             await financeService.reverseFiatWithdrawal(prisma, reference, {
                 reason: 'mtn_service_unavailable'
             });
@@ -220,7 +243,7 @@ exports.fiatWithdrawal = async (req, res) => {
                     `AI LIQUIDITY FLAG: SYSTEM_FIAT_POOL dropped to ` +
                     `$${data.fiatPoolBalance.toFixed(2)} ` +
                     `(threshold: $${FIAT_POOL_ALERT_THRESH}). Immediate replenishment required.`;
-                console.warn(`[LIQUIDITY ALERT] ${alertMsg}`);
+                logger.warn(`[LIQUIDITY ALERT] ${alertMsg}`);
                 try {
                     // Phase N2: route through notificationService for DB + socket + FCM
                     const NotificationService = require('../services/notificationService');
@@ -241,7 +264,7 @@ exports.fiatWithdrawal = async (req, res) => {
                         });
                     }
                 } catch (alertErr) {
-                    console.error('[fiatWithdrawal] liquidity alert emit failed:', alertErr.message);
+                    logger.error({ err: alertErr }, '[fiatWithdrawal] liquidity alert emit failed');
                 }
             }
 
@@ -283,7 +306,7 @@ exports.fiatWithdrawal = async (req, res) => {
                 }
             });
         } catch (mtnErr) {
-            console.error('[fiatWithdrawal] MTN dispatch failed — unwinding ledger:', mtnErr.message);
+            logger.error({ err: mtnErr }, '[fiatWithdrawal] MTN dispatch failed — unwinding ledger');
             let reversalSucceeded = false;
             try {
                 await financeService.reverseFiatWithdrawal(prisma, reference, {
@@ -293,7 +316,7 @@ exports.fiatWithdrawal = async (req, res) => {
             } catch (reverseErr) {
                 // If the reversal itself fails the system is in an
                 // inconsistent state — flag loudly so an admin investigates.
-                console.error('[fiatWithdrawal] CRITICAL: reversal failed after MTN error:', reverseErr.message);
+                logger.error({ err: reverseErr }, '[fiatWithdrawal] CRITICAL: reversal failed after MTN error');
                 if (io) {
                     io.emit('admin_alert', {
                         type:       'WITHDRAWAL_REVERSAL_FAILED',
@@ -361,7 +384,7 @@ exports.fiatWithdrawal = async (req, res) => {
         }
 
     } catch (error) {
-        console.error('[fiatWithdrawal] error:', error.message);
+        logger.error({ err: error }, '[fiatWithdrawal] error');
 
         // If the Double-Check threw, freeze the transaction record and return 403.
         if (error.message.includes('[DoubleCheck]')) {
@@ -376,7 +399,7 @@ exports.fiatWithdrawal = async (req, res) => {
                     }
                 });
             } catch (freezeErr) {
-                console.error('[fiatWithdrawal] Failed to write freeze record:', freezeErr.message);
+                logger.error({ err: freezeErr }, '[fiatWithdrawal] Failed to write freeze record');
             }
 
             return res.status(403).json({
@@ -425,6 +448,25 @@ exports.cryptoWithdrawal = async (req, res) => {
 
         const amountFloat = parseFloat(amount);
 
+        // Fraud detection check (non-blocking for alerts, blocking for BLOCK severity)
+        const accountAgeMs = Date.now() - new Date(req.user.createdAt || req.user.created_at || Date.now()).getTime();
+        const accountAgeHours = accountAgeMs / (1000 * 60 * 60);
+        const fraudResult = await fraudService.evaluate({
+            userId: req.user.id,
+            type: 'WITHDRAWAL',
+            amount: amountFloat,
+            accountAgeHours,
+        });
+        if (!fraudResult.allowed) {
+            logger.warn({ userId: req.user.id, rules: fraudResult.triggeredRules }, '[cryptoWithdrawal] Blocked by fraud detection');
+            return res.status(403).json({
+                success: false,
+                message: 'Transaction blocked by security checks. Please contact support.',
+                code: 'FRAUD_BLOCKED',
+                triggeredRules: fraudResult.triggeredRules,
+            });
+        }
+
         // Double-Check before touching any balances
         await runDoubleCheck(prisma, userId);
 
@@ -437,7 +479,7 @@ exports.cryptoWithdrawal = async (req, res) => {
             );
             maticUsdcRate = oracleRes.data?.['matic-network']?.usd || 0.55;
         } catch {
-            console.warn('[cryptoWithdrawal] Oracle unreachable — using fallback MATIC rate 0.55 USD');
+            logger.warn('[cryptoWithdrawal] Oracle unreachable — using fallback MATIC rate 0.55 USD');
         }
 
         // V2 Blueprint: 100% of gas fee is deducted from user's withdrawal.
@@ -534,9 +576,9 @@ exports.cryptoWithdrawal = async (req, res) => {
                     timeout: 10000
                 }
             );
-            console.log(`[Tatum] Crypto withdrawal broadcast: ${result.txHash} → ${destination} (${netPayout} USDC)`);
+            logger.info(`[Tatum] Crypto withdrawal broadcast: ${result.txHash} → ${destination} (${netPayout} USDC)`);
         } catch (tatumErr) {
-            console.error(`[Tatum] Broadcast FAILED for ${result.txHash}: ${tatumErr.message} — refunding user.`);
+            logger.error(`[Tatum] Broadcast FAILED for ${result.txHash}: ${tatumErr.message} — refunding user.`);
 
             // Refund: re-credit the user, debit back the gas-fee profit row,
             // re-credit SystemHotWallet, and mark TransactionHistory FAILED.
@@ -570,7 +612,7 @@ exports.cryptoWithdrawal = async (req, res) => {
                 });
                 refundSucceeded = true;
             } catch (refundErr) {
-                console.error('[cryptoWithdrawal] CRITICAL: refund failed after Tatum error:', refundErr.message);
+                logger.error({ err: refundErr }, '[cryptoWithdrawal] CRITICAL: refund failed after Tatum error');
                 if (io) {
                     io.emit('admin_alert', {
                         type:        'CRYPTO_WITHDRAWAL_REFUND_FAILED',
@@ -665,6 +707,11 @@ exports.cryptoWithdrawal = async (req, res) => {
             ipAddress: req.ip,
         });
 
+        // Double-entry journal (non-blocking, fail-safe)
+        journal.recordWithdrawal(userId, amountFloat, result.txHash, { source: 'crypto', netPayout, gasFeeUsdc }).catch(e =>
+            logger.warn({ err: e.message, txHash: result.txHash }, '[withdrawalController] Journal recording failed')
+        );
+
         return res.status(200).json({
             success: true,
             message: `Crypto withdrawal of ${amountFloat} USDC to ${destination} on Polygon. Gas fee: ${gasFeeUsdc} USDC (100% user-borne). Net payout: ${netPayout} USDC.`,
@@ -684,7 +731,7 @@ exports.cryptoWithdrawal = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('[cryptoWithdrawal] error:', error.message);
+        logger.error({ err: error }, '[cryptoWithdrawal] error');
 
         if (error.message.includes('[DoubleCheck]')) {
             try {
@@ -698,7 +745,7 @@ exports.cryptoWithdrawal = async (req, res) => {
                     }
                 });
             } catch (freezeErr) {
-                console.error('[cryptoWithdrawal] Failed to write freeze record:', freezeErr.message);
+                logger.error({ err: freezeErr }, '[cryptoWithdrawal] Failed to write freeze record');
             }
 
             return res.status(403).json({
@@ -791,7 +838,7 @@ exports.getWithdrawalStatus = async (req, res) => {
             updatedAt:    tx.createdAt ? tx.createdAt.toISOString() : null
         });
     } catch (error) {
-        console.error('[getWithdrawalStatus] error:', error.message);
+        logger.error({ err: error }, '[getWithdrawalStatus] error');
         return res.status(500).json({ success: false, code: 'SERVER_ERROR', message: error.message });
     }
 };

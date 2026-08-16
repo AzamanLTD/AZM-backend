@@ -12,6 +12,7 @@
 // ── QR CHECK-IN ──────────────────────────────────────────────────────────────
 
 // GET /api/marketplace/reservations/:id/checkin-qr
+const logger = require('../src/config/logger');
 exports.generateCheckInQR = async (req, res) => {
     const prisma = req.app.get('prisma');
     try {
@@ -79,7 +80,7 @@ exports.businessCheckIn = async (req, res) => {
                 try {
                     const { releaseBookingEscrow } = require('../services/bookingEscrowService');
                     await releaseBookingEscrow(prisma, { escrowId: reservation.escrowId });
-                } catch (e) { console.error('[checkIn] escrow release:', e.message); }
+                } catch (e) { logger.error({ err: e }, '[checkIn] escrow release'); }
             }
 
             return res.status(200).json({ success: true, reservation: updated });
@@ -170,10 +171,14 @@ exports.cancelTransitBooking = async (req, res) => {
     const prisma = req.app.get('prisma');
     try {
         const transitSvc = require('../services/transitBookingService');
-        const result = await transitSvc.cancelTransitBooking(prisma, { bookingId: req.params.id });
+        const result = await transitSvc.cancelTransitBooking(prisma, {
+            bookingId: req.params.id,
+            cancelledBy: req.user.id,
+        });
         return res.status(200).json(result);
     } catch (err) {
-        return res.status(400).json({ success: false, message: err.message });
+        const code = err.message.includes('Not authorized') ? 403 : 400;
+        return res.status(code).json({ success: false, message: err.message });
     }
 };
 
@@ -228,7 +233,7 @@ exports.setPenaltyPolicy = async (req, res) => {
             return res.status(400).json({ success: false, message: `Penalty cannot exceed ${MAX_PENALTY_PCT * 100}% of the deposit.` });
         }
 
-        const profile = await prisma.businessProfile.findUnique({ where: { userId } });
+        const profile = await prisma.businessProfile.findFirst({ where: { userId } });
         if (!profile) return res.status(404).json({ success: false, message: 'Business profile not found.' });
 
         if (reservationId) {
@@ -264,7 +269,7 @@ exports.createTransitTrip = async (req, res) => {
     const prisma = req.app.get('prisma');
     try {
         const userId = req.user.id;
-        const profile = await prisma.businessProfile.findUnique({ where: { userId } });
+        const profile = await prisma.businessProfile.findFirst({ where: { userId } });
         if (!profile) return res.status(404).json({ success: false, message: 'Business profile not found.' });
 
         const { vehicleId, routeName, origin, destination, departureAt, arrivalAt, fareUsdc } = req.body;
@@ -304,7 +309,7 @@ exports.listMyTransitTrips = async (req, res) => {
     const prisma = req.app.get('prisma');
     try {
         const userId = req.user.id;
-        const profile = await prisma.businessProfile.findUnique({ where: { userId } });
+        const profile = await prisma.businessProfile.findFirst({ where: { userId } });
         if (!profile) return res.status(404).json({ success: false, message: 'Business profile not found.' });
 
         const { status } = req.query;
@@ -334,7 +339,7 @@ exports.updateTransitTrip = async (req, res) => {
     try {
         const userId = req.user.id;
         const { id } = req.params;
-        const profile = await prisma.businessProfile.findUnique({ where: { userId } });
+        const profile = await prisma.businessProfile.findFirst({ where: { userId } });
         if (!profile) return res.status(404).json({ success: false, message: 'Business profile not found.' });
 
         const trip = await prisma.transitTrip.findUnique({ where: { id } });
@@ -367,7 +372,7 @@ exports.deleteTransitTrip = async (req, res) => {
     try {
         const userId = req.user.id;
         const { id } = req.params;
-        const profile = await prisma.businessProfile.findUnique({ where: { userId } });
+        const profile = await prisma.businessProfile.findFirst({ where: { userId } });
         if (!profile) return res.status(404).json({ success: false, message: 'Business profile not found.' });
 
         const trip = await prisma.transitTrip.findUnique({
@@ -393,7 +398,7 @@ exports.setSeatMap = async (req, res) => {
     const prisma = req.app.get('prisma');
     try {
         const userId = req.user.id;
-        const profile = await prisma.businessProfile.findUnique({ where: { userId } });
+        const profile = await prisma.businessProfile.findFirst({ where: { userId } });
         if (!profile) return res.status(404).json({ success: false, message: 'Business profile not found.' });
 
         const { vehicleId, layout, rows, cols } = req.body;
@@ -428,7 +433,7 @@ exports.generateTransitCheckInQR = async (req, res) => {
         });
         res.json({ success: true, ...result });
     } catch (err) {
-        console.error('[generateTransitCheckInQR]', err.message);
+        logger.error({ err: err }, '[generateTransitCheckInQR]');
         res.status(400).json({ success: false, message: err.message });
     }
 };
@@ -443,7 +448,7 @@ exports.transitBoarding = async (req, res) => {
         });
         res.json(result);
     } catch (err) {
-        console.error('[transitBoarding]', err.message);
+        logger.error({ err: err }, '[transitBoarding]');
         res.status(400).json({ success: false, message: err.message });
     }
 };
@@ -462,7 +467,7 @@ exports.getCustomerTrustScore = async (req, res) => {
         const score = await getTrustScore(req.prisma, customer.id);
         res.json({ success: true, ...score });
     } catch (err) {
-        console.error('[getCustomerTrustScore]', err.message);
+        logger.error({ err: err }, '[getCustomerTrustScore]');
         res.status(500).json({ success: false, message: err.message });
     }
 };

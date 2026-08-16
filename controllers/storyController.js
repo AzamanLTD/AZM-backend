@@ -1,3 +1,4 @@
+const logger = require('../src/config/logger');
 const { uploadToCloudinary } = require('../services/cloudinaryService');
 
 exports.createStory = async (req, res) => {
@@ -17,7 +18,7 @@ exports.createStory = async (req, res) => {
         });
         res.status(201).json({ success: true, story });
     } catch (err) {
-        console.error('[createStory]', err.message);
+        logger.error({ err: err }, '[createStory]');
         res.status(500).json({ success: false, message: err.message });
     }
 };

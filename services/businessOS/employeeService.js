@@ -8,6 +8,7 @@
 // from both route controllers and test suites.
 // =============================================================================
 
+const logger = require('../../src/config/logger');
 const { PrismaClient } = require('@prisma/client');
 
 // Default permissions by role

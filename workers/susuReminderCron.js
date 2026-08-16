@@ -10,6 +10,7 @@
 // unique index is the source of truth, so the cron can safely re-run.
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const { Prisma } = require('@prisma/client');
 
 const REMINDER_TYPE = 'T_24H_SHORTFALL';
@@ -27,9 +28,9 @@ class SusuReminderCron {
 
   start() {
     if (this.interval) return;
-    console.log(`[SusuReminderCron] starting (every ${this.intervalMs / 1000}s)`);
-    setImmediate(() => this._tick().catch(err => console.error('[SusuReminderCron] initial tick:', err.message)));
-    this.interval = setInterval(() => this._tick().catch(err => console.error('[SusuReminderCron] tick:', err.message)), this.intervalMs);
+    logger.info(`[SusuReminderCron] starting (every ${this.intervalMs / 1000}s)`);
+    setImmediate(() => this._tick().catch(err => logger.error({ err: err }, '[SusuReminderCron] initial tick')));
+    this.interval = setInterval(() => this._tick().catch(err => logger.error({ err: err }, '[SusuReminderCron] tick')), this.intervalMs);
   }
 
   stop() {
@@ -114,7 +115,7 @@ class SusuReminderCron {
                 },
               });
             } catch (err) {
-              console.warn(`[SusuReminderCron] notify ${member.userId} failed:`, err.message);
+              logger.warn(`[SusuReminderCron] notify ${member.userId} failed:`, err.message);
             }
           }
         }

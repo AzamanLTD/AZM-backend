@@ -1,3 +1,4 @@
+const logger = require('../src/config/logger');
 // controllers/profileController.js
 // =============================================================================
 // AZAMAN V4 — PROFILE CONTROLLER
@@ -130,7 +131,7 @@ exports.getProfile = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('[profile.getProfile] error:', error.message);
+        logger.error({ err: error }, '[profile.getProfile] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -233,7 +234,7 @@ exports.updateProfile = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('[profile.updateProfile] error:', error.message);
+        logger.error({ err: error }, '[profile.updateProfile] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -275,7 +276,7 @@ exports.getBalance = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('[profile.getBalance] error:', error.message);
+        logger.error({ err: error }, '[profile.getBalance] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -320,7 +321,7 @@ exports.getOnboarding = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('[profile.getOnboarding] error:', error.message);
+        logger.error({ err: error }, '[profile.getOnboarding] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -367,7 +368,7 @@ exports.updateOnboarding = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('[profile.updateOnboarding] error:', error.message);
+        logger.error({ err: error }, '[profile.updateOnboarding] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -398,7 +399,7 @@ exports.completeOnboarding = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('[profile.completeOnboarding] error:', error.message);
+        logger.error({ err: error }, '[profile.completeOnboarding] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -556,7 +557,7 @@ exports.getDashboard = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('[profile.getDashboard] error:', error.message);
+        logger.error({ err: error }, '[profile.getDashboard] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -603,7 +604,7 @@ exports.uploadAvatar = async (req, res) => {
             data: updated,
         });
     } catch (error) {
-        console.error('[profile.uploadAvatar] error:', error.message);
+        logger.error({ err: error }, '[profile.uploadAvatar] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };

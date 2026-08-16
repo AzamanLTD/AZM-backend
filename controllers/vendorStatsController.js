@@ -9,6 +9,8 @@
 //   POST /api/vendor/xp/review       — Award/penalize XP on review received
 // =============================================================================
 
+const logger = require('../src/config/logger');
+const { getReadPrisma } = require('../src/config/readReplica');
 const gamification = require('../services/vendorGamificationService');
 
 // =============================================================================
@@ -24,7 +26,7 @@ const gamification = require('../services/vendorGamificationService');
 //    - Ad analytics summary
 // =============================================================================
 exports.getVendorStats = async (req, res) => {
-    const prisma = req.app.get('prisma');
+    const prisma = getReadPrisma(req.app);
 
     try {
         const vendorId = req.user.id;
@@ -174,7 +176,7 @@ exports.getVendorStats = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('[vendorStats.getVendorStats] error:', error.message);
+        logger.error({ err: error }, '[vendorStats.getVendorStats] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -187,7 +189,7 @@ exports.getVendorStats = async (req, res) => {
 //    Returns all achievement definitions with status (locked/unlocked).
 // =============================================================================
 exports.getAchievements = async (req, res) => {
-    const prisma = req.app.get('prisma');
+    const prisma = getReadPrisma(req.app);
 
     try {
         const vendorId = req.user.id;
@@ -266,7 +268,7 @@ exports.getAchievements = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('[vendorStats.getAchievements] error:', error.message);
+        logger.error({ err: error }, '[vendorStats.getAchievements] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -281,7 +283,7 @@ exports.getAchievements = async (req, res) => {
 //    Returns the top vendors ranked by the selected metric.
 // =============================================================================
 exports.getLeaderboard = async (req, res) => {
-    const prisma = req.app.get('prisma');
+    const prisma = getReadPrisma(req.app);
 
     try {
         const vendorId = req.user.id;
@@ -378,7 +380,7 @@ exports.getLeaderboard = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('[vendorStats.getLeaderboard] error:', error.message);
+        logger.error({ err: error }, '[vendorStats.getLeaderboard] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -393,7 +395,7 @@ exports.getLeaderboard = async (req, res) => {
 //    Also checks for new achievements related to reviews.
 // =============================================================================
 exports.awardXpForReview = async (req, res) => {
-    const prisma = req.app.get('prisma');
+    const prisma = getReadPrisma(req.app);
 
     try {
         const { vendorId, isPositive } = req.body;
@@ -454,7 +456,7 @@ exports.awardXpForReview = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('[vendorStats.awardXpForReview] error:', error.message);
+        logger.error({ err: error }, '[vendorStats.awardXpForReview] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -469,7 +471,7 @@ exports.awardXpForReview = async (req, res) => {
 //    the full dashboard data.
 // =============================================================================
 exports.getVendorStatsQuick = async (req, res) => {
-    const prisma = req.app.get('prisma');
+    const prisma = getReadPrisma(req.app);
 
     try {
         const vendorId = req.user.id;
@@ -528,7 +530,7 @@ exports.getVendorStatsQuick = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('[vendorStats.getVendorStatsQuick] error:', error.message);
+        logger.error({ err: error }, '[vendorStats.getVendorStatsQuick] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };

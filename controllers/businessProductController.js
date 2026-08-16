@@ -12,13 +12,14 @@
 // calling user. GET /products/:productId is PUBLIC (no protect middleware).
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const businessProductService = require('../services/businessProductService');
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 /** Load the BusinessProfile owned by the calling user (null if none). */
 async function _ownedProfile(prisma, userId) {
-    return prisma.businessProfile.findUnique({
+    return prisma.businessProfile.findFirst({
         where: { userId },
         select: { id: true, businessName: true, kybStatus: true }
     });
@@ -34,7 +35,7 @@ async function _ownedProfile(prisma, userId) {
  */
 async function _resolveTargetProfile(prisma, req) {
     if (req.user.role === 'ADMIN' && req.body.businessProfileId) {
-        const profile = await prisma.businessProfile.findUnique({
+        const profile = await prisma.businessProfile.findFirst({
             where: { id: req.body.businessProfileId },
             select: { id: true, businessName: true, kybStatus: true }
         });
@@ -189,7 +190,7 @@ exports.listProductsByBizId = async (req, res) => {
         const { bizId } = req.params;
 
         // Look up the business profile by bizId
-        const biz = await prisma.businessProfile.findUnique({
+        const biz = await prisma.businessProfile.findFirst({
             where: { bizId },
             select: { id: true, isSuspended: true }
         });
@@ -212,7 +213,7 @@ exports.listProductsByBizId = async (req, res) => {
 
         return res.status(200).json({ success: true, ...result });
     } catch (err) {
-        console.error('[listProductsByBizId] error:', err.message);
+        logger.error({ err: err }, '[listProductsByBizId] error');
         return res.status(400).json({ success: false, message: err.message });
     }
 };

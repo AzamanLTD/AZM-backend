@@ -1,3 +1,6 @@
+const logger = require('../src/config/logger');
+const authMiddleware = require('../middleware/authMiddleware');
+
 exports.addPayoutDestination = async (req, res) => {
     const prisma = req.app.get('prisma');
 
@@ -12,13 +15,19 @@ exports.addPayoutDestination = async (req, res) => {
             });
         }
 
+        // If this is the first destination, make it the default
+        const existingCount = await prisma.payoutDestination.count({
+            where: { userId }
+        });
+
         const newDestination = await prisma.payoutDestination.create({
             data: {
-                userId: userId.toString(),
+                userId,
                 nickname,
                 destinationType,
                 destinationAddress,
-                isExternalCrypto: isExternalCrypto || false
+                isExternalCrypto: isExternalCrypto || false,
+                isDefault: existingCount === 0,
             }
         });
 
@@ -28,7 +37,7 @@ exports.addPayoutDestination = async (req, res) => {
             destination: newDestination
         });
     } catch (error) {
-        console.error("Add Payout Destination Error:", error);
+        logger.error("Add Payout Destination Error:", error);
         res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -40,10 +49,8 @@ exports.getPayoutDestinations = async (req, res) => {
         const userId = req.user.id;
 
         const destinations = await prisma.payoutDestination.findMany({
-            where: {
-                userId: userId.toString()
-            },
-            orderBy: { createdAt: "desc" }
+            where: { userId },
+            orderBy: [{ isDefault: 'desc' }, { createdAt: "desc" }]
         });
 
         res.status(200).json({
@@ -51,7 +58,72 @@ exports.getPayoutDestinations = async (req, res) => {
             destinations
         });
     } catch (error) {
-        console.error("Get Payout Destinations Error:", error);
+        logger.error("Get Payout Destinations Error:", error);
+        res.status(500).json({ success: false, message: error.message });
+    }
+};
+
+exports.deletePayoutDestination = async (req, res) => {
+    const prisma = req.app.get('prisma');
+
+    try {
+        const userId = req.user.id;
+        const destId = req.params.id;
+
+        const dest = await prisma.payoutDestination.findUnique({ where: { id: destId } });
+        if (!dest || dest.userId !== userId) {
+            return res.status(404).json({ success: false, message: "Destination not found." });
+        }
+
+        const wasDefault = dest.isDefault;
+        await prisma.payoutDestination.delete({ where: { id: destId } });
+
+        // If we deleted the default, make the most recent remaining one the default
+        if (wasDefault) {
+            const nextDest = await prisma.payoutDestination.findFirst({
+                where: { userId },
+                orderBy: { createdAt: 'desc' }
+            });
+            if (nextDest) {
+                await prisma.payoutDestination.update({
+                    where: { id: nextDest.id },
+                    data: { isDefault: true }
+                });
+            }
+        }
+
+        res.json({ success: true, message: "Destination removed." });
+    } catch (error) {
+        logger.error("Delete Payout Destination Error:", error);
+        res.status(500).json({ success: false, message: error.message });
+    }
+};
+
+exports.setDefaultPayoutDestination = async (req, res) => {
+    const prisma = req.app.get('prisma');
+
+    try {
+        const userId = req.user.id;
+        const destId = req.params.id;
+
+        const dest = await prisma.payoutDestination.findUnique({ where: { id: destId } });
+        if (!dest || dest.userId !== userId) {
+            return res.status(404).json({ success: false, message: "Destination not found." });
+        }
+
+        // Unset all others, then set this one
+        await prisma.payoutDestination.updateMany({
+            where: { userId, isDefault: true },
+            data: { isDefault: false }
+        });
+        await prisma.payoutDestination.update({
+            where: { id: destId },
+            data: { isDefault: true }
+        });
+
+        res.json({ success: true, message: "Default destination updated." });
+    } catch (error) {
+        logger.error("Set Default Payout Destination Error:", error);
         res.status(500).json({ success: false, message: error.message });
     }
 };

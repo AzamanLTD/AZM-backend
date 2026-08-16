@@ -2,6 +2,7 @@
 // Run: node prisma/seedSubcategories.js
 // Safe to re-run — uses upsert on wire value.
 
+const logger = require('../src/config/logger');
 const { PrismaClient } = require('@prisma/client');
 const prisma = new PrismaClient();
 
@@ -77,7 +78,7 @@ const SUBCATEGORIES = [
 ];
 
 async function main() {
-  console.log(`Seeding ${SUBCATEGORIES.length} subcategories...`);
+  logger.info(`Seeding ${SUBCATEGORIES.length} subcategories...`);
   let created = 0;
   let updated = 0;
   for (const sub of SUBCATEGORIES) {
@@ -95,9 +96,9 @@ async function main() {
     });
     if (existing) updated++; else created++;
   }
-  console.log(`Done. Created: ${created}, Updated: ${updated}`);
+  logger.info(`Done. Created: ${created}, Updated: ${updated}`);
 }
 
 main()
-  .catch(e => { console.error(e); process.exit(1); })
+  .catch(e => { logger.error(e); process.exit(1); })
   .finally(() => prisma.$disconnect());

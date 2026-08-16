@@ -7,11 +7,12 @@
 // P2002 (duplicate table label) is surfaced as a 409.
 // =============================================================================
 'use strict';
+const logger = require('../src/config/logger');
 const locationSvc = require('../services/businessLocationService');
 
 // Shared ownership check — load the BusinessProfile owned by the caller.
 const _ownedProfile = async (prisma, userId) => {
-  const profile = await prisma.businessProfile.findUnique({ where: { userId } });
+  const profile = await prisma.businessProfile.findFirst({ where: { userId } });
   if (!profile) throw Object.assign(new Error('No business profile found.'), { status: 404 });
   if (profile.isSuspended) {
     throw Object.assign(

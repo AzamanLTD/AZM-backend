@@ -8,6 +8,7 @@
 //     the parent GroupChat and drops their SusuMember row,
 //   • activates the Susu if ≥2 verified members remain (AZM-rank slots +
 //     cycles, via Susu_Service.activateSusuIfReady),
+const logger = require('../src/config/logger');
 //   • otherwise aborts the initiation and unbinds the SusuGroup so the
 //     chat returns to a plain group.
 //
@@ -27,10 +28,10 @@ class SusuInitiationSweep {
 
   start() {
     if (this.interval) return;
-    console.log(`[SusuInitiationSweep] starting (every ${this.intervalMs / 1000}s)`);
-    setImmediate(() => this._tick().catch((e) => console.error('[SusuInitiationSweep] initial tick:', e.message)));
+    logger.info(`[SusuInitiationSweep] starting (every ${this.intervalMs / 1000}s)`);
+    setImmediate(() => this._tick().catch((e) => logger.error({ err: e }, '[SusuInitiationSweep] initial tick')));
     this.interval = setInterval(
-      () => this._tick().catch((e) => console.error('[SusuInitiationSweep] tick:', e.message)),
+      () => this._tick().catch((e) => logger.error({ err: e }, '[SusuInitiationSweep] tick')),
       this.intervalMs,
     );
   }
@@ -48,7 +49,7 @@ class SusuInitiationSweep {
     try {
       const results = await this.svc.sweepExpiredInitiations();
       if (results && results.length) {
-        console.log(`[SusuInitiationSweep] processed ${results.length} expired initiation(s):`,
+        logger.info(`[SusuInitiationSweep] processed ${results.length} expired initiation(s):`,
           results.map((r) => `${r.susuId}=${r.outcome}`).join(', '));
       }
     } finally {

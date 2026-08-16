@@ -1,4 +1,5 @@
 // Adapter: bridges showcaseController to ShowcaseService class
+const logger = require('../src/config/logger');
 const { ShowcaseService } = require('./marketplace/showcaseService');
 
 exports.addSlide = async (prisma, opts) => {

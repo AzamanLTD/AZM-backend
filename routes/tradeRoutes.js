@@ -7,11 +7,14 @@
 // The legacy POST /api/trades/release route has been removed.
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const express             = require('express');
 const router              = express.Router();
 const tradeController     = require('../controllers/tradeController');
 const { protect, adminOnly } = require('../middleware/authMiddleware');
 const { protectActive }   = require('../middleware/banGuardMiddleware');
+const { idempotency }       = require('../middleware/idempotency');
+const { require2FA }    = require('../middleware/require2FA');
 const upload              = require('../middleware/uploadMiddleware');
 
 const {
@@ -33,10 +36,10 @@ router.get('/history', protect, getTradeHistory);
 router.get('/:id',     protect, getTradeDetails);
 
 // ── Buyer actions ────────────────────────────────────────────────────────────
-router.post('/initiate', protectActive, initiateTrade);
+router.post('/initiate', protectActive, require2FA(), idempotency(), initiateTrade);
 
 // ── Vendor approval actions ──────────────────────────────────────────────────
-router.post('/accept',  protectActive, acceptTrade);
+router.post('/accept',  protectActive, idempotency(), acceptTrade);
 router.post('/decline', protectActive, declineTrade);
 
 // ── Time extension ───────────────────────────────────────────────────────────
@@ -180,7 +183,7 @@ router.post('/extend', protectActive, async (req, res) => {
                     data: { content: JSON.stringify(parsedRequestContent) }
                 });
             } catch (e) {
-                console.warn('extend: failed to update request message:', e.message);
+                logger.warn('extend: failed to update request message:', e.message);
             }
         }
 
@@ -247,7 +250,7 @@ router.post('/extend', protectActive, async (req, res) => {
             newExpiresAt
         });
     } catch (error) {
-        console.error('extend trade error:', error.message);
+        logger.error({ err: error }, 'extend trade error');
         return res.status(500).json({ success: false, message: error.message });
     }
 });
@@ -337,7 +340,7 @@ router.post('/extend/respond', protectActive, async (req, res) => {
 
         return res.status(200).json({ success: true, message: 'Request declined.' });
     } catch (error) {
-        console.error('extend/respond error:', error.message);
+        logger.error({ err: error }, 'extend/respond error');
         return res.status(500).json({ success: false, message: error.message });
     }
 });
@@ -350,7 +353,7 @@ router.post(
         const uploadSingle = upload.single('proof');
         uploadSingle(req, res, (err) => {
             if (err) {
-                console.error('MULTER REJECTED UPLOAD:', err.message);
+                logger.error({ err: err }, 'MULTER REJECTED UPLOAD');
                 return res.status(400).json({ success: false, message: 'Upload failed: ' + err.message });
             }
             next();

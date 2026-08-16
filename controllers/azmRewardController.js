@@ -10,6 +10,7 @@
 // GET /api/azm/rates         — Current earn rates (public info)
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const { AZM_RATES, AZM_SOURCES } = require('../services/azmRewardService');
 
 // =============================================================================
@@ -54,7 +55,7 @@ exports.getHistory = async (req, res) => {
             }
         });
     } catch (error) {
-        console.error('[azmReward.getHistory] Error:', error.message);
+        logger.error({ err: error }, '[azmReward.getHistory] Error');
         return res.status(500).json({ success: false, message: 'Failed to fetch AZM history.' });
     }
 };
@@ -78,7 +79,7 @@ exports.getSummary = async (req, res) => {
             data: summary
         });
     } catch (error) {
-        console.error('[azmReward.getSummary] Error:', error.message);
+        logger.error({ err: error }, '[azmReward.getSummary] Error');
         return res.status(500).json({ success: false, message: 'Failed to fetch AZM summary.' });
     }
 };
@@ -102,7 +103,7 @@ exports.getFriendsLeaderboard = async (req, res) => {
 
         return res.status(200).json({ success: true, data: result });
     } catch (error) {
-        console.error('[azmReward.getFriendsLeaderboard] Error:', error.message);
+        logger.error({ err: error }, '[azmReward.getFriendsLeaderboard] Error');
         return res.status(500).json({ success: false, message: 'Failed to fetch friends leaderboard.' });
     }
 };

@@ -18,6 +18,7 @@
 //   POST /api/p2p/complete        — complete trade       (protect)
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const p2pService = require('../services/p2p.service');
 const { audit } = require('../utils/audit');
 
@@ -35,7 +36,7 @@ function _firePostCommitNotifications(req, notifications) {
             try {
                 await notifSvc.sendNotification(n);
             } catch (err) {
-                console.error(`[p2p._firePostCommitNotifications] non-fatal: ${err.message}`);
+                logger.error({ err }, '[p2p._firePostCommitNotifications] non-fatal');
             }
         }
     });
@@ -128,14 +129,14 @@ exports.getAds = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('[p2p.getAds] error:', error.message);
+        logger.error({ err: error }, '[p2p.getAds] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
 
 // ── Shared error handler ─────────────────────────────────────────────────────
 const _handleError = (res, label, error) => {
-    console.error(`[p2p.${label}] error:`, error.message);
+    logger.error(`[p2p.${label}] error:`, error.message);
     const status = error.message.includes('not found') ? 404
         : error.message.includes('Only') || error.message.includes('Cannot') ? 403
         : 400;
@@ -533,7 +534,7 @@ exports.completeTrade = async (req, res) => {
                     // but a setImmediate-level error (e.g. socket emit failure)
                     // still needs a safety net so it doesn't propagate as an
                     // unhandled rejection.
-                    console.error(
+                    logger.error(
                         `[p2p.completeTrade] deferred gamification top-level error tradeId=${tradeId}: ${deferredErr.message}`
                     );
                 }
@@ -588,7 +589,7 @@ exports.completeTrade = async (req, res) => {
                         }
                     }
                 } catch (azmErr) {
-                    console.error(`[p2p.completeTrade] AZM reward error tradeId=${tradeId}: ${azmErr.message}`);
+                    logger.error(`[p2p.completeTrade] AZM reward error tradeId=${tradeId}: ${azmErr.message}`);
                 }
 
                 // ── Phase P1: auto-process queue for the trade's ad ──────────
@@ -604,7 +605,7 @@ exports.completeTrade = async (req, res) => {
                         await processNextInQueue(completedTrade.adId, { prisma, io });
                     }
                 } catch (queueErr) {
-                    console.error(`[p2p.completeTrade] queue auto-process error tradeId=${tradeId}: ${queueErr.message}`);
+                    logger.error(`[p2p.completeTrade] queue auto-process error tradeId=${tradeId}: ${queueErr.message}`);
                 }
             });
         }

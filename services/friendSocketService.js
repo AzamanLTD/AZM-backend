@@ -13,6 +13,7 @@
 //   User inbox:       user_${userId} (shared with existing system)
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const { sendPushNotification } = require('../utils/firebaseService');
 const crypto = require('crypto');
 
@@ -57,7 +58,7 @@ class FriendSocketService {
                 socket.join(room);
                 socket.join(`user_${userId}`);
 
-                console.log(`👥 ${socket.id} → friend chat room ${room}`);
+                logger.info(`👥 ${socket.id} → friend chat room ${room}`);
 
                 socket.emit('friend_chat_joined', {
                     friendshipId,
@@ -75,7 +76,7 @@ class FriendSocketService {
                 });
 
             } catch (err) {
-                console.error('join_friend_chat error:', err.message);
+                logger.error({ err: err }, 'join_friend_chat error');
                 socket.emit('friend_chat_error', { reason: 'server_error' });
             }
         });
@@ -88,7 +89,7 @@ class FriendSocketService {
 
             const room = `friend_chat_${friendshipId}`;
             socket.leave(room);
-            console.log(`👥 ${socket.id} left friend chat room ${room}`);
+            logger.info(`👥 ${socket.id} left friend chat room ${room}`);
 
             // Notify other party
             socket.to(room).emit('friend_offline_in_chat', {
@@ -103,7 +104,7 @@ class FriendSocketService {
         // immediate optimistic updates.
         socket.on('send_friend_message', async (data) => {
             try {
-                const { friendshipId, senderId, content, messageType, metadata, tempId } = data;
+                const { friendshipId, senderId, content, messageType, metadata, tempId, disappearAfterSeconds } = data;
                 if (!friendshipId || !senderId || !content) return;
 
                 const parsedSenderId = parseInt(senderId);
@@ -130,6 +131,10 @@ class FriendSocketService {
 
 
                 // Persist message
+                const expiresAt = disappearAfterSeconds
+                    ? new Date(Date.now() + disappearAfterSeconds * 1000)
+                    : null;
+
                 const message = await this.prisma.directMessage.create({
                     data: {
                         friendshipId,
@@ -137,7 +142,9 @@ class FriendSocketService {
                         receiverId,
                         content: content.trim(),
                         messageType: messageType || 'TEXT',
-                        metadata: metadata || null
+                        metadata: metadata || null,
+                        disappearAfterSeconds: disappearAfterSeconds || null,
+                        expiresAt,
                     },
                     include: {
                         sender: { select: { id: true, username: true, profilePictureUrl: true } }
@@ -161,7 +168,9 @@ class FriendSocketService {
                     metadata: message.metadata,
                     isRead: false,
                     createdAt: message.createdAt,
-                    tempId: tempId || null
+                    tempId: tempId || null,
+                    disappearAfterSeconds: disappearAfterSeconds || null,
+                    expiresAt: expiresAt,
                 };
 
                 // Broadcast to friend chat room
@@ -203,11 +212,11 @@ class FriendSocketService {
                         }
                     }
                 } catch (pushErr) {
-                    console.error('[FriendSocket] FCM push error:', pushErr.message);
+                    logger.error({ err: pushErr }, '[FriendSocket] FCM push error');
                 }
 
             } catch (err) {
-                console.error('send_friend_message error:', err.message);
+                logger.error({ err: err }, 'send_friend_message error');
                 socket.emit('friend_message_error', {
                     reason: 'server_error',
                     detail: err.message,
@@ -224,7 +233,7 @@ class FriendSocketService {
                     replyToId, replyToText, replyToSenderName,
                     mediaUrl, mediaType, mediaMimeType, mediaSize,
                     mediaDuration, mediaWaveformPeaks, linkPreview,
-                    metadata
+                    metadata, disappearAfterSeconds
                 } = data;
                 if (!friendshipId || !senderId || (!content && !mediaUrl && !metadata)) return;
 
@@ -239,6 +248,10 @@ class FriendSocketService {
 
                 const receiverId = friendship.requesterId === parseInt(senderId)
                     ? friendship.addresseeId : friendship.requesterId;
+
+                const expiresAt = disappearAfterSeconds
+                    ? new Date(Date.now() + disappearAfterSeconds * 1000)
+                    : null;
 
                 const message = await this.prisma.directMessage.create({
                     data: {
@@ -258,6 +271,8 @@ class FriendSocketService {
                         mediaWaveformPeaks: mediaWaveformPeaks || null,
                         linkPreview: linkPreview ? linkPreview : null,
                         metadata: metadata || null,
+                        disappearAfterSeconds: disappearAfterSeconds || null,
+                        expiresAt,
                     },
                     include: { sender: { select: { id: true, username: true, profilePictureUrl: true } } }
                 });
@@ -309,7 +324,7 @@ class FriendSocketService {
                     }
                 }
             } catch (e) {
-                console.error("SOCKET ERROR:", e); socket.emit('message_error', { reason: 'server_error', localId: data.localId });
+                logger.error("SOCKET ERROR:", e); socket.emit('message_error', { reason: 'server_error', localId: data.localId });
             }
         });
 
@@ -363,7 +378,7 @@ class FriendSocketService {
                     }
                 }
             } catch (err) {
-                console.error('mark_friend_messages_read error:', err.message);
+                logger.error({ err: err }, 'mark_friend_messages_read error');
             }
         });
     }

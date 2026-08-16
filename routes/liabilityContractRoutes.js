@@ -4,6 +4,7 @@
 // /api/admin/liability-contract  (adminOnly POST)
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const express = require('express');
 const overlay = require('../controllers/susu/susuOverlayController');
 const { protect, adminOnly } = require('../middleware/authMiddleware');

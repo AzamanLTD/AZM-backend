@@ -4,6 +4,7 @@
 // Mounted at /api/transit. All endpoints are authenticated.
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const express = require('express');
 const router = express.Router();
 const transitController = require('../controllers/transitController');

@@ -1,8 +1,9 @@
+const logger = require('../src/config/logger');
 const generateText = async (prompt) => {
     const apiKey = process.env.OPENAI_API_KEY || process.env.LLM_API_KEY;
 
     if (!apiKey) {
-        console.log('[LLM Provider] No API key configured, returning mock response');
+        logger.info('[LLM Provider] No API key configured, returning mock response');
         return `[MOCK AI RESPONSE] Processed prompt: "${prompt.substring(0, 80)}..."`;
     }
 
@@ -22,14 +23,14 @@ const generateText = async (prompt) => {
         });
 
         if (!response.ok) {
-            console.error(`[LLM Provider] API error: ${response.status} ${response.statusText}`);
+            logger.error(`[LLM Provider] API error: ${response.status} ${response.statusText}`);
             return `[MOCK AI RESPONSE] API unavailable (${response.status}). Processed prompt: "${prompt.substring(0, 80)}..."`;
         }
 
         const data = await response.json();
         return data.choices?.[0]?.message?.content || '[MOCK AI RESPONSE] No content returned.';
     } catch (error) {
-        console.error('[LLM Provider] Network error:', error.message);
+        logger.error({ err: error }, '[LLM Provider] Network error');
         return `[MOCK AI RESPONSE] Network error. Processed prompt: "${prompt.substring(0, 80)}..."`;
     }
 };

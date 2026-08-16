@@ -1,3 +1,4 @@
+const logger = require('../src/config/logger');
 const NotificationService = require('../services/notificationService');
 const { parsePagination, buildPageEnvelope } = require('../utils/pagination');
 
@@ -36,7 +37,7 @@ exports.getNotifications = async (req, res) => {
             ...envelope
         });
     } catch (error) {
-        console.error('getNotifications error:', error.message);
+        logger.error({ err: error }, 'getNotifications error');
         res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -47,7 +48,7 @@ exports.getUnreadCount = async (req, res) => {
         const count = await getService(req).getUnreadCount(userId);
         res.status(200).json({ success: true, count });
     } catch (error) {
-        console.error('getUnreadCount error:', error.message);
+        logger.error({ err: error }, 'getUnreadCount error');
         res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -74,12 +75,12 @@ exports.markAsRead = async (req, res) => {
                 });
             }
         } catch (sockErr) {
-            console.error(`[markAsRead] socket emit non-fatal: ${sockErr.message}`);
+            logger.error(`[markAsRead] socket emit non-fatal: ${sockErr.message}`);
         }
 
         res.status(200).json({ success: true, notification: updated });
     } catch (error) {
-        console.error('markAsRead error:', error.message);
+        logger.error({ err: error }, 'markAsRead error');
         if (error.message === 'Notification not found') {
             return res.status(404).json({ success: false, message: error.message });
         }
@@ -107,12 +108,12 @@ exports.markAllAsRead = async (req, res) => {
                 });
             }
         } catch (sockErr) {
-            console.error(`[markAllAsRead] socket emit non-fatal: ${sockErr.message}`);
+            logger.error(`[markAllAsRead] socket emit non-fatal: ${sockErr.message}`);
         }
 
         res.status(200).json({ success: true, updated: result.count });
     } catch (error) {
-        console.error('markAllAsRead error:', error.message);
+        logger.error({ err: error }, 'markAllAsRead error');
         res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -126,7 +127,7 @@ exports.sendTradeStarted = async (req, res) => {
         const notification = await getService(req).sendTradeStarted(userId, tradeId);
         res.status(201).json({ success: true, notification });
     } catch (error) {
-        console.error('sendTradeStarted error:', error.message);
+        logger.error({ err: error }, 'sendTradeStarted error');
         res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -140,7 +141,7 @@ exports.sendDisputeUpdated = async (req, res) => {
         const notification = await getService(req).sendDisputeUpdated(userId, disputeId);
         res.status(201).json({ success: true, notification });
     } catch (error) {
-        console.error('sendDisputeUpdated error:', error.message);
+        logger.error({ err: error }, 'sendDisputeUpdated error');
         res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -154,7 +155,7 @@ exports.sendDepositSuccess = async (req, res) => {
         const notification = await getService(req).sendDepositSuccess(userId);
         res.status(201).json({ success: true, notification });
     } catch (error) {
-        console.error('sendDepositSuccess error:', error.message);
+        logger.error({ err: error }, 'sendDepositSuccess error');
         res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -168,7 +169,7 @@ exports.sendAiMaticLowWarning = async (req, res) => {
         const notification = await getService(req).sendAiMaticLowWarning(userId);
         res.status(201).json({ success: true, notification });
     } catch (error) {
-        console.error('sendAiMaticLowWarning error:', error.message);
+        logger.error({ err: error }, 'sendAiMaticLowWarning error');
         res.status(500).json({ success: false, message: error.message });
     }
 };

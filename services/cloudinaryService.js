@@ -19,6 +19,7 @@
 //   CLOUDINARY_API_SECRET
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const cloudinary = require('cloudinary').v2;
 const fs = require('fs');
 const path = require('path');
@@ -37,9 +38,9 @@ const IS_CONFIGURED = !!(
 );
 
 if (IS_CONFIGURED) {
-    console.log('☁️  Cloudinary configured successfully');
+    logger.info('☁️  Cloudinary configured successfully');
 } else {
-    console.warn('⚠️  Cloudinary NOT configured — file uploads will use local disk (ephemeral on Render)');
+    logger.warn('⚠️  Cloudinary NOT configured — file uploads will use local disk (ephemeral on Render)');
 }
 
 // B-3: Allowed folder keys mapped to their Cloudinary path suffix.
@@ -59,6 +60,7 @@ const FOLDER_MAP = {
     kyc:              'kyc',
     'vendor-docs':    'vendor-docs',
     transit:          'transit',
+    storefronts:      'storefronts',
     others:           'others',
 };
 
@@ -110,7 +112,7 @@ async function uploadToCloudinary(file, folder = 'others', options = {}) {
             process.env.RENDER_EXTERNAL_URL ||
             `http://localhost:${process.env.PORT || 3000}`;
         const localUrl = `${serverBase}/uploads/${resolvedFolder}/${filename}`;
-        console.warn(`[CloudinaryMock] ⚠️  Saved to LOCAL disk (ephemeral on Render): ${localUrl}`);
+        logger.warn(`[CloudinaryMock] ⚠️  Saved to LOCAL disk (ephemeral on Render): ${localUrl}`);
         return { url: localUrl, publicId: null };
     }
 
@@ -126,7 +128,7 @@ async function uploadToCloudinary(file, folder = 'others', options = {}) {
             uploadOptions,
             (error, result) => {
                 if (error) {
-                    console.error('[Cloudinary] Upload error:', error.message);
+                    logger.error({ err: error }, '[Cloudinary] Upload error');
                     reject(error);
                 } else {
                     resolve({
@@ -165,7 +167,7 @@ async function deleteFromCloudinary(publicId) {
     try {
         await cloudinary.uploader.destroy(publicId);
     } catch (e) {
-        console.error('[Cloudinary] Delete error:', e.message);
+        logger.error({ err: e }, '[Cloudinary] Delete error');
     }
 }
 

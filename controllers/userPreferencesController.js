@@ -8,6 +8,7 @@
 //   - General settings preferences (haptics, sounds, etc.)
 //
 // Endpoints:
+const logger = require('../src/config/logger');
 //   GET  /api/users/preferences            — Get all user preferences
 //   PUT  /api/users/preferences/theme      — Update selected theme
 //   PUT  /api/users/preferences/shortcuts  — Update custom shortcuts
@@ -65,7 +66,7 @@ exports.getPreferences = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('[userPreferences.getPreferences] error:', error.message);
+        logger.error({ err: error }, '[userPreferences.getPreferences] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -103,7 +104,7 @@ exports.updateTheme = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('[userPreferences.updateTheme] error:', error.message);
+        logger.error({ err: error }, '[userPreferences.updateTheme] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -165,7 +166,7 @@ exports.updateShortcuts = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('[userPreferences.updateShortcuts] error:', error.message);
+        logger.error({ err: error }, '[userPreferences.updateShortcuts] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -252,7 +253,7 @@ exports.updateAll = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('[userPreferences.updateAll] error:', error.message);
+        logger.error({ err: error }, '[userPreferences.updateAll] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -301,7 +302,7 @@ exports.updatePreferredCurrency = async (req, res) => {
             data: { preferredCurrency: code }
         });
     } catch (error) {
-        console.error('[userPreferences.updatePreferredCurrency] error:', error.message);
+        logger.error({ err: error }, '[userPreferences.updatePreferredCurrency] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };

@@ -28,6 +28,7 @@
 // (to admin), OPEN_GROUP_PROFILE (to target/proposer).
 // =============================================================================
 
+const logger = require('../../src/config/logger');
 const { GroupError, GroupErrorCodes } = require('./errors');
 
 class GroupJoinRequestService {
@@ -458,7 +459,7 @@ class GroupJoinRequestService {
     if (!this.notificationService) return;
     setImmediate(() => {
       Promise.resolve(this.notificationService.sendNotification(payload)).catch((err) => {
-        console.error('[GroupJoinRequestService] notify error:', err.message);
+        logger.error({ err: err }, '[GroupJoinRequestService] notify error');
       });
     });
   }
@@ -470,7 +471,7 @@ class GroupJoinRequestService {
       });
       if (this.io) this.io.to(`group_${groupId}`).emit('group:message', msg);
     } catch (err) {
-      console.error('[GroupJoinRequestService] system message error:', err.message);
+      logger.error({ err: err }, '[GroupJoinRequestService] system message error');
     }
   }
 

@@ -33,6 +33,7 @@ function _getNotificationService(req) {
 // =============================================================================
 
 const { audit } = require('../utils/audit');
+const logger = require('../src/config/logger');
 
 const VALID_FREQUENCIES = ['DAILY', 'WEEKLY', 'BIWEEKLY', 'MONTHLY'];
 
@@ -113,7 +114,7 @@ exports.createGoal = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('[savings.createGoal] error:', error.message);
+        logger.error({ err: error }, '[savings.createGoal] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -142,7 +143,7 @@ exports.listGoals = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('[savings.listGoals] error:', error.message);
+        logger.error({ err: error }, '[savings.listGoals] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -197,7 +198,7 @@ exports.getGoal = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('[savings.getGoal] error:', error.message);
+        logger.error({ err: error }, '[savings.getGoal] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -354,7 +355,7 @@ exports.deposit = async (req, res) => {
                         actionPayload: { action: 'VIEW_SAVINGS', goalId: id }
                     });
                 } catch (err) {
-                    console.error('[savings.deposit] streak notification non-fatal:', err.message);
+                    logger.error({ err: err }, '[savings.deposit] streak notification non-fatal');
                 }
             });
         }
@@ -386,7 +387,7 @@ exports.deposit = async (req, res) => {
                 message: 'Deposit already processed (concurrent idempotent replay).'
             });
         }
-        console.error('[savings.deposit] error:', error.message);
+        logger.error({ err: error }, '[savings.deposit] error');
         return res.status(400).json({ success: false, message: error.message });
     }
 };
@@ -521,7 +522,7 @@ exports.withdraw = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('[savings.withdraw] error:', error.message);
+        logger.error({ err: error }, '[savings.withdraw] error');
         return res.status(400).json({ success: false, message: error.message });
     }
 };
@@ -556,7 +557,7 @@ exports.pauseGoal = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('[savings.pauseGoal] error:', error.message);
+        logger.error({ err: error }, '[savings.pauseGoal] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -593,7 +594,7 @@ exports.resumeGoal = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('[savings.resumeGoal] error:', error.message);
+        logger.error({ err: error }, '[savings.resumeGoal] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -672,7 +673,7 @@ exports.getOverview = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('[savings.getOverview] error:', error.message);
+        logger.error({ err: error }, '[savings.getOverview] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };

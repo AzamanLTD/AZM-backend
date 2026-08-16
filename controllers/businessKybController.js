@@ -11,6 +11,7 @@
 //   success → { success: true, ... }; error → { success: false, message }.
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const bizNotificationService = require('../services/bizNotificationService');
 
 const VALID_KYB_DOC_TYPES = new Set([
@@ -27,7 +28,7 @@ const VALID_KYB_DOC_TYPES = new Set([
 
 /** Load the BusinessProfile owned by the calling user (null if none). */
 async function _ownedProfile(prisma, userId) {
-    return prisma.businessProfile.findUnique({
+    return prisma.businessProfile.findFirst({
         where: { userId },
         select: { id: true, businessName: true, kybStatus: true }
     });
@@ -225,7 +226,7 @@ exports.approveBusinessKyb = async (req, res) => {
     try {
         const { bizId } = req.params;
 
-        const profile = await prisma.businessProfile.findUnique({
+        const profile = await prisma.businessProfile.findFirst({
             where: { bizId },
             include: { verificationDocuments: true }
         });
@@ -258,7 +259,7 @@ exports.approveBusinessKyb = async (req, res) => {
                     body: 'Your KYB documents have been approved. Your business is now publicly visible and can receive orders.',
                     category: 'GENERAL',
                     actionPayload: { action: 'BUSINESS_KYB_RESULT', decision: 'APPROVED' }
-                }).catch((e) => console.error('[approveBusinessKyb] notification:', e.message));
+                }).catch((e) => logger.error({ err: e }, '[approveBusinessKyb] notification'));
             });
         }
 
@@ -294,7 +295,7 @@ exports.rejectBusinessKyb = async (req, res) => {
             return res.status(400).json({ success: false, message: 'reason is required.' });
         }
 
-        const profile = await prisma.businessProfile.findUnique({
+        const profile = await prisma.businessProfile.findFirst({
             where: { bizId },
             select: { id: true, userId: true }
         });
@@ -322,7 +323,7 @@ exports.rejectBusinessKyb = async (req, res) => {
                     body: String(reason).slice(0, 100),
                     category: 'GENERAL',
                     actionPayload: { action: 'BUSINESS_KYB_RESULT', decision: 'REJECTED' }
-                }).catch((e) => console.error('[rejectBusinessKyb] notification:', e.message));
+                }).catch((e) => logger.error({ err: e }, '[rejectBusinessKyb] notification'));
             });
         }
 

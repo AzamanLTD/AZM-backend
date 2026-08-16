@@ -21,6 +21,7 @@
  *   - On Render via release-phase command after `prisma migrate deploy`
  */
 
+const logger = require('../src/config/logger');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
@@ -31,7 +32,7 @@ async function ensureTreasuryWallet(prisma) {
     where: { username: 'azaman-treasury' },
   });
   if (existing) {
-    console.log(`✓ treasury wallet already exists (id=${existing.id})`);
+    logger.info(`✓ treasury wallet already exists (id=${existing.id})`);
     return existing;
   }
   // Sentinel password value — auth controller refuses any login attempt
@@ -50,7 +51,7 @@ async function ensureTreasuryWallet(prisma) {
       trustRating: 100,
     },
   });
-  console.log(`✓ treasury wallet created (id=${created.id})`);
+  logger.info(`✓ treasury wallet created (id=${created.id})`);
   return created;
 }
 
@@ -71,7 +72,7 @@ async function ensureLiabilityContractV1(prisma, publisherUserId) {
         `to overwrite. To revise, publish a new version (v1.1) instead.`
       );
     }
-    console.log(`✓ liability contract ${version} already seeded (hash matches)`);
+    logger.info(`✓ liability contract ${version} already seeded (hash matches)`);
     return existing;
   }
   const created = await prisma.liabilityContractVersion.create({
@@ -82,7 +83,7 @@ async function ensureLiabilityContractV1(prisma, publisherUserId) {
       publishedBy: publisherUserId,
     },
   });
-  console.log(`✓ liability contract ${version} seeded (hash=${contractHash.slice(0, 12)}...)`);
+  logger.info(`✓ liability contract ${version} seeded (hash=${contractHash.slice(0, 12)}...)`);
   return created;
 }
 
@@ -99,7 +100,7 @@ async function seedSusuFoundation(client) {
   try {
     const treasury = await ensureTreasuryWallet(prisma);
     await ensureLiabilityContractV1(prisma, treasury.id);
-    console.log('✓ susu-foundation seed complete');
+    logger.info('✓ susu-foundation seed complete');
     return treasury;
   } finally {
     if (ownClient) await prisma.$disconnect();
@@ -113,7 +114,7 @@ if (require.main === module) {
   seedSusuFoundation()
     .then(() => process.exit(0))
     .catch((err) => {
-      console.error('✗ susu-foundation seed failed:', err.message);
+      logger.error({ err: err }, '✗ susu-foundation seed failed');
       process.exit(1);
     });
 }

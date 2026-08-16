@@ -4,7 +4,7 @@
 // Tests all new marketplace services against a live PostgreSQL database.
 // =============================================================================
 
-require('dotenv').config();
+require('dotenv').config({ path: require('path').resolve(__dirname, '../.env.test') });
 const { PrismaClient } = require('@prisma/client');
 const bcrypt = require('bcryptjs');
 const FollowService = require('../services/marketplace/followService');

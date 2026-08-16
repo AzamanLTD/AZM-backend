@@ -18,6 +18,7 @@
 // therefore the controller/route layer the live app actually uses)
 // entirely. Follow/unfollow via the real API has been fully broken since
 // this file was written.
+const logger = require('../src/config/logger');
 const FollowService = require('./marketplace/followService');
 
 exports.followBusiness = async (prisma, { customerId, businessProfileId }) => {

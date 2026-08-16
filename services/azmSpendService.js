@@ -8,6 +8,7 @@
 //   2. AzmSpendLog audit row (transparent history for the user)
 //   3. Socket emission so the FE updates in real-time
 //
+const logger = require('../src/config/logger');
 // SPEND ACTIONS:
 //   FEE_DISCOUNT    → Spend AZM to reduce the 2% fiat withdrawal exit fee
 //   AD_BOOST        → Spend AZM for temporary "featured" ad placement (24h)
@@ -34,10 +35,10 @@ const AZM_COSTS = {
 
     // Card skins (2026-07-06): cosmetic skins for the peer-transfer chat card.
     // 'classic' is free/default and NOT in this map (never purchasable, always owned).
-    CARD_SKIN_GOLD:     20.0,
-    CARD_SKIN_MIDNIGHT: 20.0,
-    CARD_SKIN_EMERALD:  30.0,
-    CARD_SKIN_SUNSET:   30.0,
+    CARD_SKIN_GOLD:     1.0,
+    CARD_SKIN_MIDNIGHT: 1.0,
+    CARD_SKIN_EMERALD:  1.0,
+    CARD_SKIN_SUNSET:   1.0,
 };
 
 // ── Spend source keys ────────────────────────────────────────────────────────
@@ -51,6 +52,8 @@ const AZM_SPEND_SOURCES = {
     AD_AUCTION_BID: 'AD_AUCTION_BID',
     // Card skins (2026-07-06)
     CARD_SKIN: 'CARD_SKIN',
+    GIFT_TIP: 'GIFT_TIP',
+    AZM_CONVERSION: 'AZM_CONVERSION',
 };
 
 // ── Fee discount tiers ───────────────────────────────────────────────────────
@@ -479,7 +482,7 @@ class AzmSpendService {
                 timestamp: new Date().toISOString()
             });
         } catch (err) {
-            console.error('[AzmSpendService._emitSpendUpdate] socket error:', err.message);
+            logger.error({ err: err }, '[AzmSpendService._emitSpendUpdate] socket error');
         }
     }
 }

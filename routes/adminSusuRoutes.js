@@ -11,6 +11,7 @@
 //                                            FROZEN_DISPUTE Susu
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const express = require('express');
 const ctrl = require('../controllers/susu/adminSusuMonitorController');
 const { protect, adminOnly } = require('../middleware/authMiddleware');

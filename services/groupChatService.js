@@ -11,6 +11,7 @@
 // the room on connect (handled in server.js socket handler bridge).
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const { Prisma } = require('@prisma/client');
 
 class GroupChatService {

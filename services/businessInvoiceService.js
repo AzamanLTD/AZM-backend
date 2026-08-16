@@ -12,6 +12,8 @@
 // inside the $transaction.
 // =============================================================================
 'use strict';
+const { computeLineItems, computeTaxLines } = require('../utils/invoiceMath');
+const { emitWebhookEvent } = require('./webhookEmitter');
 
 // Generates: INV-YYMMDD-XXXX (e.g. INV-260620-A3F2)
 const _invoiceRef = () => {
@@ -34,35 +36,9 @@ const createInvoice = async (prisma, {
   if (lineItems.length > 50)
     throw new Error('Maximum 50 line items per invoice.');
 
-  // Compute subtotal
-  let subtotalUsdc = 0;
-  const cleanLineItems = lineItems.map(item => {
-    const qty = Math.max(1, parseInt(item.quantity, 10) || 1);
-    const unit = parseFloat(item.unitPrice);
-    if (isNaN(unit) || unit < 0) throw new Error('Invalid unitPrice in line item.');
-    const lineTotal = qty * unit;
-    subtotalUsdc += lineTotal;
-    return {
-      description: String(item.description || "").trim().slice(0, 200),
-      quantity: qty,
-      unitPrice: unit,
-      lineTotal,
-    };
-  });
-
-  // Compute tax lines
-  let taxTotalUsdc = 0;
-  const cleanTaxLines = (taxLines || []).map(t => {
-    const name = String(t.name || '').trim().slice(0, 100);
-    if (!name) throw new Error('Tax line name is required.');
-    const type = t.type === 'FLAT' ? 'FLAT' : 'PERCENTAGE';
-    const value = parseFloat(t.value);
-    if (isNaN(value) || value < 0) throw new Error(`Invalid tax value for '${name}'.`);
-    const computed = type === 'PERCENTAGE' ? subtotalUsdc * (value / 100) : value;
-    taxTotalUsdc += computed;
-    return { name, type, value, computedAmount: computed };
-  });
-
+  // Compute subtotal + tax lines (extracted to utils/invoiceMath.js)
+  const { subtotal: subtotalUsdc, lineItems: cleanLineItems } = computeLineItems(lineItems);
+  const { taxTotal: taxTotalUsdc, taxLines: cleanTaxLines } = computeTaxLines(taxLines, subtotalUsdc);
   const billTotalUsdc = subtotalUsdc + taxTotalUsdc;
 
   // Validate customer exists
@@ -81,7 +57,7 @@ const createInvoice = async (prisma, {
   }
   if (!invoiceRef) throw new Error('Could not generate invoice reference. Retry.');
 
-  return prisma.businessInvoice.create({
+  const invoice = await prisma.businessInvoice.create({
     data: {
       businessProfileId, customerId, locationId: locationId || null,
       tableId: tableId || null,
@@ -94,6 +70,17 @@ const createInvoice = async (prisma, {
     },
     include: { lineItems: true, taxLines: true },
   });
+
+  // Fire-and-forget webhook for invoice creation
+  emitWebhookEvent(businessProfileId, 'invoice.created', {
+    invoiceId: invoice.id,
+    invoiceRef: invoice.invoiceRef,
+    customerId,
+    billTotal: invoice.billTotalUsdc,
+    status: invoice.status,
+  });
+
+  return invoice;
 };
 
 // ── sendInvoice ────────────────────────────────────────────────────────────

@@ -2,6 +2,7 @@
 // AZAMAN PREMIUM CHAT — Telegram-Inspired Socket Service
 // Preserves all existing event names. Adds new premium events.
 
+const logger = require('../src/config/logger');
 const crypto = require('crypto');
 
 const ADMIN_SPY_ROOM = 'admin_spy_room';
@@ -131,11 +132,15 @@ class ChatSocketService {
     socket.on('send_trade_message', async (data) => {
       try {
         const { senderId, content, tradeId, messageType, localId,
-                replyToId, replyToText, replyToSenderName } = data;
+                replyToId, replyToText, replyToSenderName, disappearAfterSeconds } = data;
         if (!senderId || !tradeId || !content) return;
         const cleanId = String(tradeId).replace(/^#/, '');
         const conversation = await this.getOrCreateTradeConversation(cleanId);
         if (!conversation) return socket.emit('chat_error', { reason: 'trade_not_found' });
+
+        const expiresAt = disappearAfterSeconds
+          ? new Date(Date.now() + disappearAfterSeconds * 1000)
+          : null;
 
         const message = await this.prisma.message.create({
           data: {
@@ -148,6 +153,8 @@ class ChatSocketService {
             replyToId: replyToId || null,
             replyToText: replyToText || null,
             replyToSenderName: replyToSenderName || null,
+            disappearAfterSeconds: disappearAfterSeconds || null,
+            expiresAt,
           },
           include: { sender: { select: { id: true, username: true } } }
         });
@@ -162,6 +169,8 @@ class ChatSocketService {
           messageType: message.messageType, content: message.content,
           text: message.content, createdAt: message.createdAt,
           status: 'sent', replyToId, replyToText, replyToSenderName,
+          disappearAfterSeconds: disappearAfterSeconds || null,
+          expiresAt,
         };
 
         // ② Broadcast to room
@@ -199,6 +208,10 @@ class ChatSocketService {
         const { conversation, roomHash } =
           await this.getOrCreatePersonalConversation(senderId, otherUserId);
 
+        const expiresAt = disappearAfterSeconds
+          ? new Date(Date.now() + disappearAfterSeconds * 1000)
+          : null;
+
         const message = await this.prisma.message.create({
           data: {
             conversationId: conversation.id,
@@ -210,6 +223,8 @@ class ChatSocketService {
             replyToId: replyToId || null,
             replyToText: replyToText || null,
             replyToSenderName: replyToSenderName || null,
+            disappearAfterSeconds: disappearAfterSeconds || null,
+            expiresAt,
           },
           include: { sender: { select: { id: true, username: true } } }
         });
@@ -220,6 +235,8 @@ class ChatSocketService {
           sender: message.sender, messageType: message.messageType,
           content: message.content, createdAt: message.createdAt,
           status: 'sent', replyToId, replyToText, replyToSenderName,
+          disappearAfterSeconds: disappearAfterSeconds || null,
+          expiresAt,
         };
         this.emitToRoomAndSpy(`personal_${roomHash}`, 'new_personal_message', payload);
         const other = await this.prisma.user.findUnique({
@@ -303,7 +320,7 @@ class ChatSocketService {
             }
           }
         }
-      } catch (e) { console.error('mark_messages_read:', e.message); }
+      } catch (e) { logger.error({ err: e }, 'mark_messages_read'); }
     });
 
     // ── REACT TO MESSAGE ────────────────────────────────────────────────
@@ -375,7 +392,7 @@ class ChatSocketService {
             messageId, reactions: updatedReactions, context
           });
         }
-      } catch (e) { console.error('react_to_message:', e.message); }
+      } catch (e) { logger.error({ err: e }, 'react_to_message'); }
     });
 
     // ── EDIT MESSAGE ────────────────────────────────────────────────────
@@ -416,7 +433,7 @@ class ChatSocketService {
             messageId, newContent: newContent.trim(), editedAt: new Date(), context
           });
         }
-      } catch (e) { console.error('edit_message:', e.message); }
+      } catch (e) { logger.error({ err: e }, 'edit_message'); }
     });
 
     // ── DELETE MESSAGE (soft) ───────────────────────────────────────────
@@ -455,7 +472,7 @@ class ChatSocketService {
           // Only admin can delete trade messages (no self-delete in escrow chats)
           return socket.emit('delete_error', { reason: 'not_allowed_in_trade', messageId });
         }
-      } catch (e) { console.error('delete_message:', e.message); }
+      } catch (e) { logger.error({ err: e }, 'delete_message'); }
     });
 
     // ── TYPING INDICATORS (debounced) ───────────────────────────────────

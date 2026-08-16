@@ -46,6 +46,7 @@
 // this module is a pure I/O adapter and does NOT touch Prisma.
 // =============================================================================
 
+const logger = require('../src/config/logger');
 const axios            = require('axios');
 const { randomUUID }   = require('crypto');
 
@@ -79,13 +80,13 @@ class MtnDisbursementService {
         this._mockTransfers = new Map();
 
         if (this.providerMode === 'MOCK') {
-            console.log(
+            logger.info(
                 '[MtnDisbursementService] Running in MOCK mode ' +
                 '(set MTN_MOMO_API_USER + MTN_MOMO_API_KEY + ' +
                 'MTN_MOMO_SUBSCRIPTION_KEY + MTN_MOMO_PROVIDER=LIVE for live calls).'
             );
         } else {
-            console.log(`[MtnDisbursementService] Running in LIVE mode → ${this.baseUrl}`);
+            logger.info(`[MtnDisbursementService] Running in LIVE mode → ${this.baseUrl}`);
         }
     }
 

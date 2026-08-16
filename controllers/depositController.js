@@ -35,6 +35,8 @@ function _getNotificationService(req) {
 
 const crypto = require('crypto');
 const { audit } = require('../utils/audit');
+const logger = require('../src/config/logger');
+const journal = require('../services/journalIntegration');
 
 // Constant-time string comparison — avoids leaking secret length/content via
 // timing. Returns false on any type/length mismatch instead of throwing.
@@ -119,7 +121,7 @@ exports.initiateLocalFiatDeposit = async (req, res) => {
             }
         });
     } catch (error) {
-        console.error('initiateLocalFiatDeposit error:', error.message);
+        logger.error({ err: error }, 'initiateLocalFiatDeposit error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -142,7 +144,7 @@ exports.localFiatDepositWebhook = async (req, res) => {
     try {
         const expectedSecret = process.env.FIAT_WEBHOOK_SECRET;
         if (!expectedSecret) {
-            console.error('[localFiatDepositWebhook] FIAT_WEBHOOK_SECRET is not configured.');
+            logger.error('[localFiatDepositWebhook] FIAT_WEBHOOK_SECRET is not configured.');
             return res.status(503).json({
                 success: false,
                 message: 'Webhook endpoint is not configured. Refusing to credit funds.'
@@ -250,7 +252,7 @@ exports.localFiatDepositWebhook = async (req, res) => {
                     actionPayload: { action: 'OPEN_WALLET', reference }
                 });
             } catch (err) {
-                console.error('[localFiatDepositWebhook] notification non-fatal:', err.message);
+                logger.error({ err: err }, '[localFiatDepositWebhook] notification non-fatal');
             }
         });
 
@@ -266,7 +268,7 @@ exports.localFiatDepositWebhook = async (req, res) => {
             });
         }
 
-        console.log(`[localFiatDepositWebhook] Confirmed: ref=${reference} userId=${existing.userId} +${usdcEquivalent} USDC`);
+        logger.info(`[localFiatDepositWebhook] Confirmed: ref=${reference} userId=${existing.userId} +${usdcEquivalent} USDC`);
 
         await audit(prisma, {
             actorId: existing.userId, actorName: '',
@@ -287,7 +289,7 @@ exports.localFiatDepositWebhook = async (req, res) => {
             }
         });
     } catch (error) {
-        console.error('localFiatDepositWebhook error:', error.message);
+        logger.error({ err: error }, 'localFiatDepositWebhook error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -311,7 +313,7 @@ exports.localFiatDepositWebhook = async (req, res) => {
 // Idempotent: duplicate txHash → 200 OK with no mutation.
 // =============================================================================
 exports.tatumCryptoWebhook = async (req, res) => {
-    console.log("TATUM PAYLOAD:", JSON.stringify(req.body, null, 2));
+    logger.info("TATUM PAYLOAD:", JSON.stringify(req.body, null, 2));
     const prisma            = req.app.get('prisma');
     const io                = req.app.get('socketio');
     const emitBalanceUpdate = req.app.get('emitBalanceUpdate');
@@ -324,7 +326,7 @@ exports.tatumCryptoWebhook = async (req, res) => {
         // mutate the ledger (503).
         const webhookSecret = process.env.TATUM_WEBHOOK_SECRET;
         if (!webhookSecret) {
-            console.error('[tatumCryptoWebhook] TATUM_WEBHOOK_SECRET is not configured.');
+            logger.error('[tatumCryptoWebhook] TATUM_WEBHOOK_SECRET is not configured.');
             return res.status(503).json({
                 success: false,
                 message: 'Tatum webhook endpoint is not configured. Refusing to credit funds.'
@@ -340,7 +342,7 @@ exports.tatumCryptoWebhook = async (req, res) => {
         if (tatumService && signatureHeader) {
             const isValid = tatumService.verifyWebhookSignature(rawBody, signatureHeader);
             if (!isValid) {
-                console.warn('[tatumCryptoWebhook] HMAC verification failed.');
+                logger.warn('[tatumCryptoWebhook] HMAC verification failed.');
                 return res.status(401).json({
                     success: false,
                     message: 'Invalid webhook signature (HMAC verification failed).'
@@ -408,7 +410,7 @@ exports.tatumCryptoWebhook = async (req, res) => {
                 select: { id: true }
             });
             if (!user) {
-                console.warn(`[tatumCryptoWebhook] No user found for address ${address}. txHash: ${txHash}`);
+                logger.warn(`[tatumCryptoWebhook] No user found for address ${address}. txHash: ${txHash}`);
                 return res.status(200).json({
                     success: true,
                     message: 'Address not associated with any user. Possibly a treasury sweep — acknowledged.',
@@ -477,6 +479,11 @@ exports.tatumCryptoWebhook = async (req, res) => {
         // ── Step 6: Post-commit side effects ─────────────────────────────────
         if (emitBalanceUpdate) await emitBalanceUpdate(targetUserId);
 
+        // Double-entry journal recording (non-blocking, fail-safe)
+        journal.recordDeposit(targetUserId, amountUsdc, txHash, { source: 'crypto', txHash }).catch(e =>
+            logger.warn({ err: e.message, txHash }, '[depositController] Journal recording failed')
+        );
+
         if (io) {
             io.to(`user_${targetUserId}`).emit('deposit_success', {
                 type:       'DEPOSIT_CRYPTO',
@@ -500,11 +507,11 @@ exports.tatumCryptoWebhook = async (req, res) => {
                     actionPayload: { action: 'OPEN_WALLET', reference: txHash, network: 'Polygon' }
                 });
             } catch (err) {
-                console.error('[tatumCryptoWebhook] notification non-fatal:', err.message);
+                logger.error({ err: err }, '[tatumCryptoWebhook] notification non-fatal');
             }
         });
 
-        console.log(`[tatumCryptoWebhook] Confirmed: txHash=${txHash} userId=${targetUserId} +${amountUsdc} USDC (Polygon)`);
+        logger.info(`[tatumCryptoWebhook] Confirmed: txHash=${txHash} userId=${targetUserId} +${amountUsdc} USDC (Polygon)`);
 
         await audit(prisma, {
             actorId: targetUserId, actorName: '',
@@ -527,7 +534,7 @@ exports.tatumCryptoWebhook = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('[tatumCryptoWebhook] error:', error.message);
+        logger.error({ err: error }, '[tatumCryptoWebhook] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -610,7 +617,7 @@ exports.initiateMoolreFiatDeposit = async (req, res) => {
             if (moolreErr.isDuplicate)
                 return res.status(409).json({ success: false, message: 'Duplicate deposit reference. Please retry.' });
             await prisma.transactionHistory.update({ where: { id: tx.id }, data: { status: 'FAILED' } });
-            console.error('[initiateMoolreFiatDeposit] Moolre error:', moolreErr.message);
+            logger.error({ err: moolreErr }, '[initiateMoolreFiatDeposit] Moolre error');
             // Surface the real provider message so the user knows what went wrong
             // (e.g. "Invalid account", "Network unavailable") instead of a generic blurb.
             const providerMsg = moolreErr.message?.replace(/^\[MoolreCollectionService\]\s*/, '') || 'Payment provider error. Please retry.';
@@ -628,7 +635,7 @@ exports.initiateMoolreFiatDeposit = async (req, res) => {
             data: { reference, amountGhs: ghsFloat, usdcEstimate, provider, phoneNumber },
         });
     } catch (err) {
-        console.error('[initiateMoolreFiatDeposit]', err.message);
+        logger.error({ err: err }, '[initiateMoolreFiatDeposit]');
         return res.status(500).json({ success: false, message: 'An unexpected error occurred.' });
     }
 };
@@ -667,7 +674,7 @@ exports.confirmMoolreOtp = async (req, res) => {
 
         return res.status(200).json({ success: true, requiresOtp: false, data: { reference } });
     } catch (err) {
-        console.error('[confirmMoolreOtp]', err.message);
+        logger.error({ err: err }, '[confirmMoolreOtp]');
         return res.status(500).json({ success: false, message: 'An unexpected error occurred.' });
     }
 };
@@ -679,11 +686,20 @@ exports.confirmMoolreOtp = async (req, res) => {
 // ⚠️ BEFORE GOING LIVE: run a real sandbox test and log req.body verbatim to
 //    confirm the field names inside `data` (externalref, payer, amount).
 exports.moolreCollectionWebhook = async (req, res) => {
+    // Raw payload log — helps confirm Moolre is reaching this endpoint and
+    // shows the exact field names in the envelope so we can verify our
+    // data?.externalref / data?.payer / data?.amount reads are correct.
+    logger.info('[moolreCollectionWebhook] RECEIVED:', JSON.stringify(req.body, null, 2));
+    logger.info('[moolreCollectionWebhook] headers:', JSON.stringify({
+        'x-moolre-signature': req.headers['x-moolre-signature'],
+        'x-moolre-webhook-secret': req.headers['x-moolre-webhook-secret'] ? '***present***' : 'missing',
+    }));
+
     const prisma = req.app.get('prisma');
     try {
         const expectedSecret = process.env.MOOLRE_WEBHOOK_SECRET;
         if (!expectedSecret) {
-            console.error('[moolreCollectionWebhook] MOOLRE_WEBHOOK_SECRET is not configured.');
+            logger.error('[moolreCollectionWebhook] MOOLRE_WEBHOOK_SECRET is not configured.');
             return res.status(503).json({ success: false, message: 'Webhook endpoint not configured. Refusing to credit funds.' });
         }
 
@@ -760,7 +776,7 @@ exports.moolreCollectionWebhook = async (req, res) => {
                 actionPayload: { action: 'OPEN_WALLET', reference: externalRef },
             });
         } catch (notifErr) {
-            console.error('[moolreCollectionWebhook] Notification failed:', notifErr.message);
+            logger.error({ err: notifErr }, '[moolreCollectionWebhook] Notification failed');
         }
 
         // Append-only audit trail (fire-and-forget — never fails the request).
@@ -770,9 +786,14 @@ exports.moolreCollectionWebhook = async (req, res) => {
             metadata: { amountGhs: ghsFloat, amountUsdc: usdcCredit, externalRef }, ipAddress: req.ip,
         });
 
+        // Double-entry journal (non-blocking, fail-safe)
+        journal.recordDeposit(existing.userId, usdcCredit, externalRef, { source: 'moolre', amountGhs: ghsFloat }).catch(e =>
+            logger.warn({ err: e.message, externalRef }, '[moolreCollectionWebhook] Journal recording failed')
+        );
+
         return res.status(200).json({ success: true, message: 'Deposit credited.' });
     } catch (err) {
-        console.error('[moolreCollectionWebhook]', err.message);
+        logger.error({ err: err }, '[moolreCollectionWebhook]');
         return res.status(500).json({ success: false, message: 'Internal error.' });
     }
 };
@@ -798,7 +819,7 @@ exports.validateMomoName = async (req, res) => {
 
         return res.status(200).json({ success: true, data: name });
     } catch (err) {
-        console.error('[validateMomoName]', err.message, err.raw || '');
+        logger.error('[validateMomoName]', err.message, err.raw || '');
         return res.status(500).json({ success: false, message: 'Could not verify account. Please check the number and try again.' });
     }
 };

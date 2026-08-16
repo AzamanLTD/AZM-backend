@@ -8,6 +8,7 @@
 //   POST /api/kyc/admin/override   — Admin manual approve/reject (admin-only)
 
 /**
+const logger = require('../src/config/logger');
  * 1. INITIALIZE KYC SESSION
  * Creates a Dojah verification session and returns the widget URL
  * for the frontend to open in a WebView.
@@ -52,7 +53,7 @@ exports.initializeKyc = async (req, res) => {
             ...(process.env.NODE_ENV !== 'production' && result._mockHint ? { _mockHint: result._mockHint } : {})
         });
     } catch (error) {
-        console.error('❌ [KYC] Initialize error:', error);
+        logger.error('❌ [KYC] Initialize error:', error);
         res.status(500).json({ success: false, message: 'Server error during KYC initialization.' });
     }
 };
@@ -84,7 +85,7 @@ exports.handleDojahWebhook = async (req, res) => {
         if (!result.success) {
             // Return 200 to Dojah anyway to prevent retries on signature failures
             // (log the error server-side for investigation)
-            console.error(`❌ [KYC/Webhook] Processing failed: ${result.message}`);
+            logger.error(`❌ [KYC/Webhook] Processing failed: ${result.message}`);
             return res.status(200).json({ received: true, processed: false });
         }
 
@@ -96,7 +97,7 @@ exports.handleDojahWebhook = async (req, res) => {
             newStatus: result.newStatus
         });
     } catch (error) {
-        console.error('❌ [KYC/Webhook] Unhandled error:', error);
+        logger.error('❌ [KYC/Webhook] Unhandled error:', error);
         // Still return 200 to prevent infinite webhook retries
         res.status(200).json({ received: true, processed: false, error: 'Internal processing error.' });
     }
@@ -129,7 +130,7 @@ exports.getKycStatus = async (req, res) => {
             }
         });
     } catch (error) {
-        console.error('❌ [KYC] Status check error:', error);
+        logger.error('❌ [KYC] Status check error:', error);
         res.status(500).json({ success: false, message: 'Server error checking KYC status.' });
     }
 };
@@ -180,7 +181,7 @@ exports.adminKycOverride = async (req, res) => {
             reason: result.reason
         });
     } catch (error) {
-        console.error('❌ [KYC] Admin override error:', error);
+        logger.error('❌ [KYC] Admin override error:', error);
         res.status(500).json({ success: false, message: 'Server error during KYC override.' });
     }
 };

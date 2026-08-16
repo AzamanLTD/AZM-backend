@@ -6,13 +6,15 @@
 // Integrates with NotificationService for real-time friend request alerts.
 // =============================================================================
 
+const logger = require('../src/config/logger');
+const { getReadPrisma } = require('../src/config/readReplica');
 const NotificationService = require('../services/notificationService');
 const { parsePagination, buildPageEnvelope } = require('../utils/pagination');
 
 let notificationService;
 function getNotificationService(req) {
     if (!notificationService) {
-        const prisma = req.app.get('prisma');
+        const prisma = getReadPrisma(req.app);
         const io = req.app.get('socketio');
         notificationService = new NotificationService(prisma, io);
     }
@@ -26,7 +28,7 @@ function getNotificationService(req) {
 // Returns matching users (excludes self, deleted accounts, sensitive fields)
 // =============================================================================
 exports.searchUsers = async (req, res) => {
-    const prisma = req.app.get('prisma');
+    const prisma = getReadPrisma(req.app);
 
     try {
         const { q } = req.query;
@@ -149,7 +151,7 @@ exports.searchUsers = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('[searchUsers] error:', error.message);
+        logger.error({ err: error }, '[searchUsers] error');
         return res.status(500).json({ success: false, message: 'Search failed.' });
     }
 };
@@ -161,7 +163,7 @@ exports.searchUsers = async (req, res) => {
 // Body: { addresseeId, message }
 // =============================================================================
 exports.sendFriendRequest = async (req, res) => {
-    const prisma = req.app.get('prisma');
+    const prisma = getReadPrisma(req.app);
     const io = req.app.get('socketio');
 
     try {
@@ -322,7 +324,7 @@ exports.sendFriendRequest = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('[sendFriendRequest] error:', error.message);
+        logger.error({ err: error }, '[sendFriendRequest] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -333,7 +335,7 @@ exports.sendFriendRequest = async (req, res) => {
 // GET /api/friends/requests
 // =============================================================================
 exports.getPendingRequests = async (req, res) => {
-    const prisma = req.app.get('prisma');
+    const prisma = getReadPrisma(req.app);
 
     try {
         const userId = req.user.id;
@@ -387,7 +389,7 @@ exports.getPendingRequests = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('[getPendingRequests] error:', error.message);
+        logger.error({ err: error }, '[getPendingRequests] error');
         return res.status(500).json({ success: false, message: 'Failed to fetch requests.' });
     }
 };
@@ -398,7 +400,7 @@ exports.getPendingRequests = async (req, res) => {
 // GET /api/friends/requests/sent
 // =============================================================================
 exports.getSentRequests = async (req, res) => {
-    const prisma = req.app.get('prisma');
+    const prisma = getReadPrisma(req.app);
 
     try {
         const userId = req.user.id;
@@ -429,7 +431,7 @@ exports.getSentRequests = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('[getSentRequests] error:', error.message);
+        logger.error({ err: error }, '[getSentRequests] error');
         return res.status(500).json({ success: false, message: 'Failed to fetch sent requests.' });
     }
 };
@@ -440,7 +442,7 @@ exports.getSentRequests = async (req, res) => {
 // PUT /api/friends/request/:id/accept
 // =============================================================================
 exports.acceptFriendRequest = async (req, res) => {
-    const prisma = req.app.get('prisma');
+    const prisma = getReadPrisma(req.app);
     const io = req.app.get('socketio');
 
     try {
@@ -505,7 +507,7 @@ exports.acceptFriendRequest = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('[acceptFriendRequest] error:', error.message);
+        logger.error({ err: error }, '[acceptFriendRequest] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -516,7 +518,7 @@ exports.acceptFriendRequest = async (req, res) => {
 // PUT /api/friends/request/:id/reject
 // =============================================================================
 exports.rejectFriendRequest = async (req, res) => {
-    const prisma = req.app.get('prisma');
+    const prisma = getReadPrisma(req.app);
 
     try {
         const { id } = req.params;
@@ -548,7 +550,7 @@ exports.rejectFriendRequest = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('[rejectFriendRequest] error:', error.message);
+        logger.error({ err: error }, '[rejectFriendRequest] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -574,7 +576,7 @@ exports.rejectFriendRequest = async (req, res) => {
 //     old `select` returned; only the spread-style construction changed.
 // =============================================================================
 exports.getFriends = async (req, res) => {
-    const prisma = req.app.get('prisma');
+    const prisma = getReadPrisma(req.app);
 
     try {
         const userId = req.user.id;
@@ -788,7 +790,7 @@ exports.getFriends = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('[getFriends] error:', error.message);
+        logger.error({ err: error }, '[getFriends] error');
         return res.status(500).json({ success: false, message: 'Failed to fetch friends.' });
     }
 };
@@ -799,7 +801,7 @@ exports.getFriends = async (req, res) => {
 // DELETE /api/friends/:id
 // =============================================================================
 exports.removeFriend = async (req, res) => {
-    const prisma = req.app.get('prisma');
+    const prisma = getReadPrisma(req.app);
 
     try {
         const { id } = req.params;
@@ -824,7 +826,7 @@ exports.removeFriend = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('[removeFriend] error:', error.message);
+        logger.error({ err: error }, '[removeFriend] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
@@ -835,7 +837,7 @@ exports.removeFriend = async (req, res) => {
 // GET /api/friends/profile/:userId
 // =============================================================================
 exports.getFriendProfile = async (req, res) => {
-    const prisma = req.app.get('prisma');
+    const prisma = getReadPrisma(req.app);
 
     try {
         const targetId = parseInt(req.params.userId);
@@ -881,7 +883,7 @@ exports.getFriendProfile = async (req, res) => {
         });
 
     } catch (error) {
-        console.error('[getFriendProfile] error:', error.message);
+        logger.error({ err: error }, '[getFriendProfile] error');
         return res.status(500).json({ success: false, message: 'Failed to fetch profile.' });
     }
 };
