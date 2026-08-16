@@ -373,7 +373,17 @@ router.get('/marketplace-businesses', async (req, res) => {
     const prisma = req.app.get('prisma');
     try {
         const { category, kybStatus, search } = req.query;
-        const where = {};
+        // Exclude test/seed businesses from the admin portal list (same list
+        // as the public searchBusinesses exclusion in businessService.js).
+        const EXCLUDED_NAMES = ['test portal biz', 'azaman', 'test chop bar', 'az-qa transit test co'];
+        const where = {
+            NOT: {
+                businessName: {
+                    in: EXCLUDED_NAMES,
+                    mode: 'insensitive',
+                },
+            },
+        };
         if (category) where.category = category;
         if (kybStatus) where.kybStatus = kybStatus;
         if (search) {
