@@ -2,7 +2,7 @@
   "name": "azaman-backend",
   "version": "1.0.0",
   "description": "",
-  "main": "index.js",
+  "main": "server.js",
   "scripts": {
     "test": "jest --testEnvironment=node --runInBand --forceExit",
     "test:coverage": "jest --testEnvironment=node --coverage --runInBand --forceExit",
