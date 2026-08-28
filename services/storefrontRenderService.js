@@ -72,6 +72,20 @@ async function invalidateCache(businessProfileId) {
   memoryCache.delete(key);
 }
 
+
+/**
+ * Read the retail escrow-protection capability from a business profile's
+ * businessMeta JSON. Only the explicit boolean at this namespaced location
+ * is authoritative.
+ */
+function _escrowProtectionAvailable(business) {
+  if (!business?.businessMeta) return false;
+  const meta = typeof business.businessMeta === 'string'
+    ? (() => { try { return JSON.parse(business.businessMeta); } catch { return {}; } })()
+    : business.businessMeta;
+  return meta?.escrowProtection?.enabled === true;
+}
+
 /**
  * Render a storefront layout for public consumption.
  * Returns a single JSON object with the layout, theme tokens, and widget catalog merged.
@@ -97,7 +111,8 @@ async function renderStorefront(prisma, businessProfileId) {
       logoUrl: true,
       coverPhotoUrl: true,
       averageRating: true,
-      phoneNumber: true 
+      phoneNumber: true,
+      businessMeta: true,
     },
   });
 
@@ -165,6 +180,7 @@ async function renderStorefront(prisma, businessProfileId) {
       coverPhotoUrl: business.coverPhotoUrl || null,
       averageRating: business.averageRating != null ? Number(business.averageRating) : null,
       phoneNumber: business.phoneNumber || null,
+      escrowProtectionAvailable: _escrowProtectionAvailable(business),
     },
     theme: themeOverride ? {
       id: themeOverride.id,
@@ -227,4 +243,5 @@ module.exports = {
   renderStorefront,
   getPublicTheme,
   invalidateCache,
+  _escrowProtectionAvailable,
 };
