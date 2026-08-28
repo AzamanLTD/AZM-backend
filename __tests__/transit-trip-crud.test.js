@@ -23,11 +23,13 @@ describeOrSkip('Transit trip CRUD (business portal)', () => {
 
   afterAll(async () => { await prisma.$disconnect(); });
 
+  // PostgreSQL cleanup can occasionally exceed Jest's default 5s timeout on the
+  // shared CI service. This is test-harness cleanup, not application behavior.
   afterEach(async () => {
     await prisma.$executeRawUnsafe(
       'TRUNCATE TABLE "User", "BusinessProfile", "BusinessProduct", "TransitVehicle", "TransitTrip", "TransitSeatMap", "TransitBooking", "TransitBookingSeat" RESTART IDENTITY CASCADE'
     );
-  });
+  }, 15000);
 
   function mockReqRes({ user, params = {}, query = {}, body = {} } = {}) {
     const req = {
