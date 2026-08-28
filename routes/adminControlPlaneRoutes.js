@@ -24,6 +24,15 @@ function deny(res, permission) {
   return res.status(403).json({ success: false, message: `Control-plane permission required: ${permission}` });
 }
 
+async function actorProfile(req, p) {
+  return getStaffProfile(p, Number(req.user.id));
+}
+
+async function isGlobalController(req, p) {
+  const profile = await actorProfile(req, p);
+  return Boolean(profile?.status === 'ACTIVE' && profile?.isGlobalSuperAdmin);
+}
+
 router.get('/staff', async (req, res) => {
   if (!(await authorize(req, 'staff.view'))) return deny(res, 'staff.view');
   try {
@@ -98,6 +107,15 @@ router.post('/staff', async (req, res) => {
 
   try {
     const p = prisma(req);
+    const actorGlobal = await isGlobalController(req, p);
+    const legacyAdminBootstrap = req.user.role === 'ADMIN';
+    if (authority === 'ADMIN' && !actorGlobal && !legacyAdminBootstrap) {
+      return res.status(403).json({ success: false, message: 'Only a global super admin may create administrator profiles.' });
+    }
+    if (Boolean(isGlobalSuperAdmin) && !actorGlobal) {
+      return res.status(403).json({ success: false, message: 'Only a global super admin may grant global super-admin authority.' });
+    }
+
     const user = await p.user.findUnique({ where: { id: Number(userId) }, select: { id: true } });
     if (!user) return res.status(404).json({ success: false, message: 'User not found.' });
     const existing = await getStaffProfile(p, Number(userId));
@@ -117,7 +135,7 @@ router.post('/staff', async (req, res) => {
       eventType: 'STAFF_PROFILE_CREATED',
       targetType: 'STAFF_PROFILE',
       targetId: rows[0].id,
-      metadata: { authorityClass: authority, adminType: admin, employeeType: employeeType || null },
+      metadata: { authorityClass: authority, adminType: admin, employeeType: employeeType || null, isGlobalSuperAdmin: Boolean(isGlobalSuperAdmin) },
     });
     return res.status(201).json({ success: true, staff: rows[0] });
   } catch (err) {
@@ -139,6 +157,16 @@ router.patch('/staff/:id', async (req, res) => {
     const currentRows = await p.$queryRawUnsafe('SELECT * FROM "StaffProfile" WHERE id = $1', Number(req.params.id));
     const current = currentRows[0];
     if (!current) return res.status(404).json({ success: false, message: 'Staff profile not found.' });
+    const actorGlobal = await isGlobalController(req, p);
+    const authorityChange = Object.prototype.hasOwnProperty.call(body, 'adminType') || Object.prototype.hasOwnProperty.call(body, 'authorityClass') || Object.prototype.hasOwnProperty.call(body, 'isGlobalSuperAdmin');
+    if (current."isGlobalSuperAdmin" && !actorGlobal) return res.status(403).json({ success: false, message: 'Only a global super admin may modify a global super-admin profile.' });
+    if (authorityChange && !actorGlobal) return res.status(403).json({ success: false, message: 'Only a global super admin may change staff authority.' });
+    if (current."userId" === Number(req.user.id) && (authorityChange || status === 'SUSPENDED' || status === 'INACTIVE')) {
+      return res.status(403).json({ success: false, message: 'You cannot modify your own authority or deactivate your own staff profile.' });
+    }
+    if (Object.prototype.hasOwnProperty.call(body, 'isGlobalSuperAdmin') && Boolean(body.isGlobalSuperAdmin) && String(body.adminType || current.adminType).toUpperCase() !== 'SUPER_ADMIN') {
+      return res.status(400).json({ success: false, message: 'Global super admin authority requires SUPER_ADMIN.' });
+    }
     const nextAdmin = body.adminType == null ? current.adminType : String(body.adminType).toUpperCase();
     if (current.authorityClass === 'ADMIN' && !ADMIN_TYPES.has(nextAdmin)) return res.status(400).json({ success: false, message: 'Invalid adminType.' });
 
@@ -150,6 +178,7 @@ router.patch('/staff/:id', async (req, res) => {
           "supervisorId" = COALESCE($5, "supervisorId"),
           "employeeType" = COALESCE($6, "employeeType"),
           "adminType" = COALESCE($7, "adminType"),
+          "isGlobalSuperAdmin" = CASE WHEN $8::boolean IS NULL THEN "isGlobalSuperAdmin" ELSE $8::boolean END,
           "lastActiveAt" = CASE WHEN $3 IS NOT NULL THEN CURRENT_TIMESTAMP ELSE "lastActiveAt" END,
           "updatedAt" = CURRENT_TIMESTAMP
       WHERE id = $1
@@ -157,7 +186,8 @@ router.patch('/staff/:id', async (req, res) => {
     `, Number(req.params.id), status, presence,
        body.departmentId == null ? null : Number(body.departmentId),
        body.supervisorId == null ? null : Number(body.supervisorId),
-       body.employeeType == null ? null : String(body.employeeType), nextAdmin);
+       body.employeeType == null ? null : String(body.employeeType), nextAdmin,
+       Object.prototype.hasOwnProperty.call(body, 'isGlobalSuperAdmin') ? Boolean(body.isGlobalSuperAdmin) : null);
 
     await recordActivity(p, { staffProfileId: current.id, actorUserId: req.user.id, eventType: 'STAFF_PROFILE_UPDATED', targetType: 'STAFF_PROFILE', targetId: current.id, metadata: { fields: allowed.filter(k => Object.prototype.hasOwnProperty.call(body, k)) } });
     return res.json({ success: true, staff: rows[0] });
@@ -178,10 +208,17 @@ router.put('/staff/:id/permissions', async (req, res) => {
   try {
     const p = prisma(req);
     const staffId = Number(req.params.id);
-    const staff = await p.$queryRawUnsafe('SELECT id FROM "StaffProfile" WHERE id = $1', staffId);
+    const actorGlobal = await isGlobalController(req, p);
+    const staff = await p.$queryRawUnsafe('SELECT id, "userId", "isGlobalSuperAdmin" FROM "StaffProfile" WHERE id = $1', staffId);
     if (!staff[0]) return res.status(404).json({ success: false, message: 'Staff profile not found.' });
+    if (staff[0].isGlobalSuperAdmin && !actorGlobal) return res.status(403).json({ success: false, message: 'Only a global super admin may modify global-super-admin permissions.' });
     const permissionRows = keys.length ? await p.$queryRawUnsafe('SELECT id, "key" FROM "ControlPermission" WHERE "key" = ANY($1::text[]) AND "isActive" = TRUE', keys) : [];
     if (permissionRows.length !== keys.length) return res.status(400).json({ success: false, message: 'One or more permissions are invalid or inactive.' });
+    if (!actorGlobal) {
+      const actorPermissions = await p.$queryRawUnsafe(`SELECT cp."key" FROM "StaffPermissionGrant" spg JOIN "ControlPermission" cp ON cp.id = spg."permissionId" WHERE spg."staffProfileId" = (SELECT id FROM "StaffProfile" WHERE "userId" = $1) AND cp."isActive" = TRUE AND (spg."expiresAt" IS NULL OR spg."expiresAt" > CURRENT_TIMESTAMP)`, Number(req.user.id));
+      const allowed = new Set(actorPermissions.map((row) => row.key));
+      if (keys.some((key) => !allowed.has(key))) return res.status(403).json({ success: false, message: 'You cannot grant a permission you do not possess.' });
+    }
     await p.$queryRawUnsafe('DELETE FROM "StaffPermissionGrant" WHERE "staffProfileId" = $1', staffId);
     for (const permission of permissionRows) {
       await p.$queryRawUnsafe('INSERT INTO "StaffPermissionGrant" ("staffProfileId", "permissionId", "grantedByUserId") VALUES ($1, $2, $3)', staffId, permission.id, Number(req.user.id));
