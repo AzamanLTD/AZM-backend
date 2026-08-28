@@ -10,6 +10,7 @@
 
 const logger = require('../src/config/logger');
 const businessService = require('../services/businessService');
+const storefrontRenderService = require('../services/storefrontRenderService');
 
 // =============================================================================
 // 1. POST /api/business/register — register the calling user as a business.
@@ -118,6 +119,14 @@ exports.updateBusinessProfile = async (req, res) => {
         const userId = req.user.id;
         const updates = req.body || {};
         const businessProfile = await businessService.updateBusinessProfile(prisma, { userId, updates });
+
+        // The public storefront response is cached and includes the merchant's
+        // escrow-protection capability. Invalidate only when that capability
+        // changes so customers see the merchant's current choice immediately.
+        if (Object.prototype.hasOwnProperty.call(updates, 'offerEscrowProtection')) {
+            await storefrontRenderService.invalidateCache(businessProfile.id);
+        }
+
         return res.status(200).json({ success: true, businessProfile });
     } catch (err) {
         logger.error({ err: err }, '[updateBusinessProfile] error');
@@ -146,7 +155,7 @@ exports.getMyBusiness = async (req, res) => {
 
 // =============================================================================
 // 6. GET /api/business/subcategories?parentWire=FOOD_BEVERAGE
-// Public — returns the marketplace category hierarchy for drill-down UI.
+// Public — returns all active subcategories for a given parent.
 // =============================================================================
 exports.getSubcategories = async (req, res) => {
     const prisma = req.app.get('prisma');
