@@ -414,7 +414,7 @@ router.post('/:businessProfileId/checkout', protect, protectActive, wrap(async (
   const prisma = req.app.get('prisma');
   const { businessProfileId } = req.params;
   const userId = req.user.id;
-  const { items, customerNotes, deliveryNotes, idempotencyKey } = req.body;
+  const { items, customerNotes, deliveryNotes, idempotencyKey, paymentMode } = req.body;
 
   // ── Validation ──────────────────────────────────────────────────────────────
   if (!items || !Array.isArray(items) || items.length === 0) {
@@ -438,13 +438,27 @@ router.post('/:businessProfileId/checkout', protect, protectActive, wrap(async (
   // Verify business exists and is active
   const business = await prisma.businessProfile.findUnique({
     where: { id: businessProfileId },
-    select: { id: true, businessName: true, isSuspended: true, isPausedByOwner: true },
+    select: { id: true, businessName: true, isSuspended: true, isPausedByOwner: true, businessMeta: true },
   });
   if (!business || business.isSuspended) {
     return res.status(404).json({ success: false, message: 'Business not available.' });
   }
   if (business.isPausedByOwner) {
     return res.status(400).json({ success: false, message: 'This business is currently not accepting orders.' });
+  }
+
+  // ── Escrow protection enforcement ───────────────────────────────────────────
+  // The server is authoritative: never trust the client's paymentMode alone.
+  // Omitted paymentMode defaults to DIRECT for backward compatibility.
+  const mode = (paymentMode || 'DIRECT').toUpperCase();
+  if (mode === 'ESCROW') {
+    const { _escrowProtectionAvailable } = require('../services/storefrontRenderService');
+    if (!_escrowProtectionAvailable(business)) {
+      return res.status(403).json({
+        success: false,
+        message: 'This store does not offer escrow protection. Choose direct payment instead.',
+      });
+    }
   }
 
   // Fetch all products in one query
