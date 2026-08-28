@@ -138,6 +138,7 @@ function mountRoutes(app, {
 
     app.use('/api/admin/susu',            generalLimiter,   adminSusuRoutes);
     app.use('/api/admin/rbac',           generalLimiter,   require('../../routes/adminRbacRoutes')); // Phase 4: Admin RBAC
+    app.use('/api/admin/control-plane',  generalLimiter,   require('../../routes/adminControlPlaneRoutes')); // Control Plane: staff management
 
     // ── Marketplace Expansion — Phase B-2 ─────────────────────────────────────
     app.use('/api/marketplace',           generalLimiter,   require('../../routes/marketplaceRoutes'));
