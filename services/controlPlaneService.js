@@ -36,7 +36,7 @@ async function hasPermission(prisma, user, permission) {
   if (staff.isGlobalSuperAdmin) return true;
 
   const adminType = normalize(staff.adminType);
-  if (adminType === 'SUPER_ADMIN') return true;
+  if (adminType === 'SUPER_ADMIN' && staff.isGlobalSuperAdmin) return true;
   if (!ADMIN_ROLES.has(adminType) && normalize(staff.authorityClass) !== 'EMPLOYEE') return false;
 
   const rows = await prisma.$queryRawUnsafe(`

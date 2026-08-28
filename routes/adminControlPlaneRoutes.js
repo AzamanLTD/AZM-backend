@@ -159,9 +159,9 @@ router.patch('/staff/:id', async (req, res) => {
     if (!current) return res.status(404).json({ success: false, message: 'Staff profile not found.' });
     const actorGlobal = await isGlobalController(req, p);
     const authorityChange = Object.prototype.hasOwnProperty.call(body, 'adminType') || Object.prototype.hasOwnProperty.call(body, 'authorityClass') || Object.prototype.hasOwnProperty.call(body, 'isGlobalSuperAdmin');
-    if (current."isGlobalSuperAdmin" && !actorGlobal) return res.status(403).json({ success: false, message: 'Only a global super admin may modify a global super-admin profile.' });
+    if (current.isGlobalSuperAdmin && !actorGlobal) return res.status(403).json({ success: false, message: 'Only a global super admin may modify a global super-admin profile.' });
     if (authorityChange && !actorGlobal) return res.status(403).json({ success: false, message: 'Only a global super admin may change staff authority.' });
-    if (current."userId" === Number(req.user.id) && (authorityChange || status === 'SUSPENDED' || status === 'INACTIVE')) {
+    if (current.userId === Number(req.user.id) && (authorityChange || status === 'SUSPENDED' || status === 'INACTIVE')) {
       return res.status(403).json({ success: false, message: 'You cannot modify your own authority or deactivate your own staff profile.' });
     }
     if (Object.prototype.hasOwnProperty.call(body, 'isGlobalSuperAdmin') && Boolean(body.isGlobalSuperAdmin) && String(body.adminType || current.adminType).toUpperCase() !== 'SUPER_ADMIN') {
