@@ -77,6 +77,7 @@ const businessUpdateSchema = z.object({
   contactEmail: freeString,
   address: freeString,
   country: freeString,
+  offerEscrowProtection: z.boolean().optional(),
 });
 
 module.exports = {

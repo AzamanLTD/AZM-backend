@@ -18,7 +18,7 @@ const VALID_CATEGORIES = new Set([
 const UPDATABLE_FIELDS = new Set([
     'businessName', 'description', 'website', 'logoUrl', 'phoneNumber',
     'contactEmail', 'address', 'country', 'category', 'coverPhotoUrl',
-    'adAccentColor'
+    'adAccentColor', 'offerEscrowProtection'
 ]);
 
 // Ad appearance customization (2026-07-06): must be a 6-digit hex color
@@ -29,6 +29,23 @@ const HEX_COLOR_RE = /^#[0-9A-Fa-f]{6}$/;
 /** Generate a BIZ-XXXXXXXXX id (literal prefix + 9 digits). */
 const _generateBizId = () =>
     'BIZ-' + String(Math.floor(100000000 + Math.random() * 900000000));
+
+/**
+ * Retail payment-protection capability is stored inside the existing
+ * businessMeta JSON so this additive feature does not require a destructive
+ * schema migration. Only the explicit boolean at this namespaced location is
+ * authoritative; all other businessMeta content is preserved.
+ */
+const _escrowProtectionAvailable = (profile) =>
+    profile?.businessMeta?.escrowProtection?.enabled === true;
+
+const _withEscrowProtectionCapability = (profile) => {
+    if (!profile) return profile;
+    return {
+        ...profile,
+        escrowProtectionAvailable: _escrowProtectionAvailable(profile)
+    };
+};
 
 // =============================================================================
 // 1. REGISTER BUSINESS — create the BusinessProfile (no role change).
@@ -42,7 +59,7 @@ const registerBusiness = async (prisma, {
     // 1. If the user already owns a business profile, return it (idempotent).
     const existing = await prisma.businessProfile.findFirst({ where: { userId } });
     if (existing) {
-        return { businessProfile: existing, bizId: existing.bizId, alreadyRegistered: true };
+        return { businessProfile: _withEscrowProtectionCapability(existing), bizId: existing.bizId, alreadyRegistered: true };
     }
 
     const cleanName = String(businessName || '').trim();
@@ -79,7 +96,7 @@ const registerBusiness = async (prisma, {
         }
     });
 
-    return { businessProfile, bizId };
+    return { businessProfile: _withEscrowProtectionCapability(businessProfile), bizId };
 };
 
 // =============================================================================
@@ -87,7 +104,7 @@ const registerBusiness = async (prisma, {
 // =============================================================================
 const getBusinessProfile = async (prisma, { bizId, userId }) => {
     if (!bizId && !userId) throw new Error('Either bizId or userId is required.');
-    return prisma.businessProfile.findFirst({
+    const profile = await prisma.businessProfile.findFirst({
         where: bizId ? { bizId } : { userId },
         include: {
             user: {
@@ -98,6 +115,7 @@ const getBusinessProfile = async (prisma, { bizId, userId }) => {
             }
         }
     });
+    return _withEscrowProtectionCapability(profile);
 };
 
 // =============================================================================
@@ -171,7 +189,7 @@ const searchBusinesses = async (prisma, { query, category, verified, limit, curs
         }
     }
 
-    return rows;
+    return rows.map(_withEscrowProtectionCapability);
 };
 
 // =============================================================================
@@ -220,6 +238,24 @@ const updateBusinessProfile = async (prisma, { userId, updates }) => {
             data.adAccentColor = value;
             continue;
         }
+        if (key === 'offerEscrowProtection') {
+            if (typeof value !== 'boolean') {
+                throw new Error('offerEscrowProtection must be a boolean.');
+            }
+            const existingMeta = profile.businessMeta && typeof profile.businessMeta === 'object'
+                ? profile.businessMeta
+                : {};
+            data.businessMeta = {
+                ...existingMeta,
+                escrowProtection: {
+                    ...(existingMeta.escrowProtection && typeof existingMeta.escrowProtection === 'object'
+                        ? existingMeta.escrowProtection
+                        : {}),
+                    enabled: value
+                }
+            };
+            continue;
+        }
         data[key] = value;
     }
 
@@ -227,7 +263,8 @@ const updateBusinessProfile = async (prisma, { userId, updates }) => {
         throw new Error('No valid fields to update.');
     }
 
-    return prisma.businessProfile.update({ where: { userId }, data });
+    const updated = await prisma.businessProfile.update({ where: { userId }, data });
+    return _withEscrowProtectionCapability(updated);
 };
 
 module.exports = {
