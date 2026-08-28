@@ -62,13 +62,23 @@ describe('Admin Smart Escrow platform settings', () => {
 
     expect(res.status).toHaveBeenCalledWith(200);
     expect(prisma.$transaction).toHaveBeenCalledTimes(1);
-    const [operations] = prisma.$transaction.mock.calls[0];
-    expect(operations[0].data).toMatchObject({
-      smartEscrowFeePct: 0.0075,
-      escrowDraftExpiryHours: 48,
-      escrowFundedExpiryDays: 45,
+    expect(prisma.globalSettings.update).toHaveBeenCalledWith({
+      where: { id: 1 },
+      data: {
+        smartEscrowFeePct: 0.0075,
+        escrowDraftExpiryHours: 48,
+        escrowFundedExpiryDays: 45,
+      },
     });
-    expect(operations[1].data.action).toBe('UPDATE_SETTINGS');
+    expect(prisma.adminSettingsAuditLog.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          action: 'UPDATE_SETTINGS',
+          targetType: 'GLOBAL_SETTINGS',
+          targetId: '1',
+        }),
+      })
+    );
   });
 
   test.each([
