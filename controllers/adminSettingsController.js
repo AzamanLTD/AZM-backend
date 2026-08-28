@@ -81,6 +81,11 @@ exports.getSettings = async (req, res) => {
 
                 // Phase 5: Susu profit percentage
                 susuProfitPct: Number(settings.susuProfitPct),
+
+                // Smart Escrow platform policy
+                smartEscrowFeePct: Number(settings.smartEscrowFeePct),
+                escrowDraftExpiryHours: Number(settings.escrowDraftExpiryHours),
+                escrowFundedExpiryDays: Number(settings.escrowFundedExpiryDays),
             }
         });
     } catch (error) {
@@ -115,7 +120,8 @@ exports.updateSettings = async (req, res) => {
             'gasFeeTrc20', 'gasFeeErc20', 'gasFeeBep20',
             'autoPayoutEnabled', 'autoPayoutThresholdUsdc', 'autoPayoutMaxAmountUsdc', 'autoPayoutIntervalMs',
             'minAppVersion', 'forceUpdateUrl', 'updateMessage',
-            'susuProfitPct', // Phase 5: Admin profit engine
+            'susuProfitPct',
+            'smartEscrowFeePct', 'escrowDraftExpiryHours', 'escrowFundedExpiryDays',
         ];
 
         const updateData = {};
@@ -127,12 +133,15 @@ exports.updateSettings = async (req, res) => {
             let newValue = req.body[field];
             const oldValue = current[field];
 
-            // Type coercion for Decimal fields
+            // Type coercion for Decimal fields. Preserve integer expiry settings.
             if (typeof newValue === 'number' || (typeof newValue === 'string' && !isNaN(parseFloat(newValue)))) {
                 if (field !== 'autoPayoutEnabled' && field !== 'autoPayoutIntervalMs'
                     && field !== 'minAppVersion' && field !== 'forceUpdateUrl' && field !== 'updateMessage'
-                    && field !== 'withdrawalFeeByRiskTier') {
+                    && field !== 'withdrawalFeeByRiskTier'
+                    && field !== 'escrowDraftExpiryHours' && field !== 'escrowFundedExpiryDays') {
                     newValue = parseFloat(newValue);
+                } else if (field === 'escrowDraftExpiryHours' || field === 'escrowFundedExpiryDays') {
+                    newValue = parseInt(newValue, 10);
                 }
             }
 
@@ -141,7 +150,7 @@ exports.updateSettings = async (req, res) => {
                 'p2pFeePct', 'bankMargin', 'thirdPartyMargin',
                 'vendorShareUnder1k', 'vendorShareOver1k',
                 'baseExitFeePct', 'fiatWithdrawalFeePct', 'cryptoWithdrawalFeePct', 'cryptoPlatformFeePct',
-                'susuProfitPct', // Phase 5
+                'susuProfitPct', 'smartEscrowFeePct',
             ];
             if (pctFields.includes(field)) {
                 if (typeof newValue !== 'number' || newValue < 0 || newValue > 1) {
@@ -160,9 +169,21 @@ exports.updateSettings = async (req, res) => {
                 });
             }
 
-            // Validation: vendor shares — warn but don't block (admin knows best)
-            // The admin portal UI enforces admin + vendor = 100%, but the API
-            // doesn't hard-block it to allow edge cases.
+            // Smart Escrow policy bounds prevent accidental zero/negative expiry
+            // or unbounded operational windows. These are platform policy values,
+            // not per-merchant settings.
+            if (field === 'escrowDraftExpiryHours' && (!Number.isInteger(newValue) || newValue < 1 || newValue > 720)) {
+                return res.status(400).json({
+                    success: false,
+                    message: 'escrowDraftExpiryHours must be an integer between 1 and 720.'
+                });
+            }
+            if (field === 'escrowFundedExpiryDays' && (!Number.isInteger(newValue) || newValue < 1 || newValue > 3650)) {
+                return res.status(400).json({
+                    success: false,
+                    message: 'escrowFundedExpiryDays must be an integer between 1 and 3650.'
+                });
+            }
 
             updateData[field] = newValue;
             changes[field] = { old: oldValue, new: newValue };
