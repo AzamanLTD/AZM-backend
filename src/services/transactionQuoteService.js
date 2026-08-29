@@ -47,6 +47,43 @@ function createTransactionQuote({
   };
 }
 
+async function getServerRateGhsPerUsdc({ prisma, marketOracle }) {
+  if (!prisma) throw new Error('Quote service requires Prisma');
+
+  const settings = await prisma.globalSettings.findUnique({ where: { id: 1 } });
+  const usdToGhs = Number(settings?.liveUsdToGhs);
+  const usdcToUsd = Number(settings?.liveUsdcToUsd);
+
+  if (!Number.isFinite(usdToGhs) || usdToGhs <= 0 || !Number.isFinite(usdcToUsd) || usdcToUsd <= 0) {
+    throw new Error('A current USDC/GHS rate is not available');
+  }
+
+  // marketOracle is accepted as an explicit dependency so callers cannot
+  // accidentally create a second rate source. The values are persisted by
+  // the existing oracle service; the quote service reads that authoritative
+  // server-side snapshot.
+  void marketOracle;
+  return usdToGhs / usdcToUsd;
+}
+
+async function createServerTransactionQuote({
+  prisma,
+  marketOracle,
+  amountGhs,
+  feeGhs = 0,
+  ttlSeconds = DEFAULT_QUOTE_TTL_SECONDS,
+  now = new Date(),
+}) {
+  const rateGhsPerUsdc = await getServerRateGhsPerUsdc({ prisma, marketOracle });
+  return createTransactionQuote({
+    amountGhs,
+    rateGhsPerUsdc,
+    feeGhs,
+    ttlSeconds,
+    now,
+  });
+}
+
 function assertQuoteActive(quote, now = new Date()) {
   if (!quote || !quote.id || !quote.expiresAt) {
     throw new Error('Invalid transaction quote');
@@ -60,6 +97,8 @@ function assertQuoteActive(quote, now = new Date()) {
 module.exports = {
   DEFAULT_QUOTE_TTL_SECONDS,
   createTransactionQuote,
+  createServerTransactionQuote,
+  getServerRateGhsPerUsdc,
   assertQuoteActive,
   roundMoney,
 };
