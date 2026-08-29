@@ -27,29 +27,14 @@ const {
   initiateMoolreFiatDepositSchema,
 } = require('../services/validation/financialSchemas');
 
-// Quote-backed local fiat deposit. The quote is persisted before the pending
-// transaction is created and is consumed atomically with wallet credit.
-router.post(
-  '/fiat/initiate',
-  protectActive,
-  idempotency(),
-  validate(initiateFiatDepositSchema),
-  quoteFiatDepositController.initiate,
-);
+router.post('/fiat/initiate', protectActive, idempotency(), validate(initiateFiatDepositSchema), quoteFiatDepositController.initiate);
 router.post('/fiat/webhook', quoteFiatDepositController.webhook);
-
-// Tatum Crypto Webhook (legacy alias — delegates to the existing crypto path).
 router.post('/webhook/tatum', depositController.tatumCryptoWebhook);
 
-// Moolre MoMo PIN-push collection on-ramp.
-router.post(
-  '/fiat/initiate/moolre',
-  protectActive,
-  idempotency(),
-  validate(initiateMoolreFiatDepositSchema),
-  quoteMoolreDepositController.initiate,
-);
-router.post('/fiat/initiate/moolre/otp', protectActive, depositController.confirmMoolreOtp);
+// All Moolre initiation/OTP/webhook mutations use the quote-backed controllers.
+// Do not route financial settlement through the legacy depositController copies.
+router.post('/fiat/initiate/moolre', protectActive, idempotency(), validate(initiateMoolreFiatDepositSchema), quoteMoolreDepositController.initiate);
+router.post('/fiat/initiate/moolre/otp', protectActive, quoteFiatDepositController.confirmMoolreOtp);
 router.post('/fiat/webhook/moolre', quoteMoolreDepositController.webhook);
 router.post('/validate-name', protectActive, depositController.validateMomoName);
 
