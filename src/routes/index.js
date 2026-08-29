@@ -113,6 +113,7 @@ function mountRoutes(app, {
     app.use('/api/business-os', generalLimiter, require('../../routes/businessOSRoutes'));
     app.use('/api/developer', generalLimiter, require('../../routes/developerRoutes'));
     app.use('/api/qr', generalLimiter, require('../../routes/qrRoutes'));
+    app.use('/api/storefront', generalLimiter, require('../../routes/storefrontCheckoutReadinessRoutes'));
     app.use('/api/storefront', generalLimiter, require('../../routes/storefrontCheckoutIntegrityRoutes'));
     app.use('/api/storefront', generalLimiter, require('../../routes/storefrontRoutes'));
     app.use('/api/azm-stake', generalLimiter, require('../../routes/azmStakeRoutes'));
@@ -145,7 +146,7 @@ function mountRoutes(app, {
             return res.status(200).json({ success: true, urls });
         } catch (err) {
             logger.error({ err }, 'Vendor docs upload error');
-            return res.status(500).json({ success: false, message: 'Upload failed' });
+            res.status(500).json({ success: false, message: 'Upload failed' });
         }
     });
 }
