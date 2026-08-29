@@ -99,7 +99,7 @@ function mountRoutes(app, {
     const { userRouter: porUserRouter, adminRouter: porAdminRouter } = require('../../routes/proofOfResidencyRoutes');
     const { publicRouter: liabPublicRouter, adminRouter: liabAdminRouter } = require('../../routes/liabilityContractRoutes');
     app.use('/api/users/proof-of-residency', generalLimiter, porUserRouter);
-    app.use('/api/admin/proof-of-residency', generalLimiter, liabAdminRouter);
+    app.use('/api/admin/proof-of-residency', generalLimiter, porAdminRouter);
     app.use('/api/liability-contract', generalLimiter, liabPublicRouter);
     app.use('/api/admin/liability-contract', generalLimiter, liabAdminRouter);
     app.use('/api/admin/war-room', generalLimiter, require('../../routes/adminWarRoomRoutes'));
