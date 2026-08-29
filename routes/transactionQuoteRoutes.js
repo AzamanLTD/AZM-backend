@@ -33,16 +33,13 @@ async function createQuoteHandler(req, res) {
     const quote = await createServerTransactionQuote({
       prisma,
       marketOracle,
+      userId: Number(req.user.id),
+      purpose: parsed.data.purpose,
       amountGhs: parsed.data.amountGhs,
       ttlSeconds: parsed.data.ttlSeconds,
     });
 
-    return res.status(201).json({
-      quote: {
-        ...quote,
-        purpose: parsed.data.purpose,
-      },
-    });
+    return res.status(201).json({ quote });
   } catch (error) {
     return res.status(400).json({ error: error.message });
   }
