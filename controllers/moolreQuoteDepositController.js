@@ -68,9 +68,12 @@ exports.initiate = async (req, res) => {
       ttlSeconds: QUOTE_TTL_SECONDS,
     });
 
-    await prisma.$transaction(async (tx) => {
+    // Return the transaction created in the same transaction that persists the
+    // quote. Avoid a second, non-atomic lookup that could select an unrelated
+    // pending deposit if multiple deposits are created concurrently.
+    const pending = await prisma.$transaction(async (tx) => {
       await persistTransactionQuote(tx, quote);
-      await tx.transactionHistory.create({
+      return tx.transactionHistory.create({
         data: {
           userId,
           type: 'DEPOSIT_FIAT',
@@ -93,12 +96,6 @@ exports.initiate = async (req, res) => {
         },
       });
     });
-
-    const pending = await prisma.transactionHistory.findFirst({
-      where: { userId, status: 'PENDING', metadata: { path: ['quoteId'], equals: quote.id } },
-      orderBy: { id: 'desc' },
-    });
-    if (!pending) throw new Error('Unable to create pending deposit.');
 
     let moolreResult;
     try {
