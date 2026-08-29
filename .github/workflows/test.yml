@@ -47,6 +47,9 @@ jobs:
         # is safe here: the CI Postgres is disposable and recreated each run.
         run: npx prisma db push --accept-data-loss
 
+      - name: Install transaction quote overlay
+        run: node infra/install-transaction-quote-overlay.js
+
       - name: Generate Prisma client
         run: npx prisma generate
 
