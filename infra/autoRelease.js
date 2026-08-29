@@ -7,8 +7,7 @@ const logger = require('../src/config/logger');
 //
 // What it does:
 //   1. Installs the additive Susu overlay schema objects.
-//   2. Installs the additive platform control-plane access schema.
-//   3. Seeds the azaman-treasury wallet + v1.0 liability contract when needed.
+//   2. Seeds the azaman-treasury wallet + v1.0 liability contract when needed.
 //
 // Production Neon is db-push managed behind PgBouncer, so the installers use
 // plain idempotent SQL rather than prisma migrate deploy.
@@ -19,7 +18,6 @@ const releaseStatus = {
   startedAt: null,
   finishedAt: null,
   overlayInstalled: null,
-  controlPlaneInstalled: null,
   installerResult: null,
   installerErrors: null,
   seedOk: null,
@@ -57,19 +55,6 @@ async function autoRelease(prisma, opts = {}) {
     } catch (e) {
       log(`overlay installer threw (non-fatal): ${e.message}`);
       releaseStatus.installerResult = { error: e.message };
-    }
-
-    try {
-      const { installControlPlaneOverlay } = require('./install-control-plane-overlay');
-      const r = await installControlPlaneOverlay(prisma);
-      releaseStatus.controlPlaneInstalled = r.failed === 0;
-      if (r.errors && r.errors.length) releaseStatus.installerErrors = [
-        ...(releaseStatus.installerErrors || []),
-        ...r.errors.slice(0, 10),
-      ].slice(0, 20);
-      log(`control-plane installer: ${r.ok} ok, ${r.failed} failed`);
-    } catch (e) {
-      log(`control-plane installer threw (non-fatal): ${e.message}`);
     }
 
     try {
