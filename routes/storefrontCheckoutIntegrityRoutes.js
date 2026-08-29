@@ -6,6 +6,10 @@ const router = require('express').Router();
 const { protect } = require('../middleware/authMiddleware');
 const { protectActive } = require('../middleware/banGuardMiddleware');
 
+const ORDER_STATUSES = new Set([
+  'AWAITING_PAYMENT', 'PAID', 'DELIVERED', 'COMPLETED', 'DISPUTED', 'REFUNDED', 'CANCELLED',
+]);
+
 function stableJson(value) {
   if (value === null || typeof value !== 'object') return JSON.stringify(value);
   if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
@@ -137,9 +141,6 @@ function encodeCursor(order) {
   return Buffer.from(JSON.stringify({ createdAt: order.createdAt.toISOString(), id: order.id })).toString('base64url');
 }
 
-// This router intentionally sits before the legacy storefront router. It adds
-// the security/integrity contract around the existing checkout implementation
-// without duplicating its escrow/order lifecycle logic.
 router.post('/:businessProfileId/checkout', protect, protectActive, async (req, res, next) => {
   try {
     const prisma = req.app.get('prisma');
@@ -188,15 +189,9 @@ router.post('/:businessProfileId/checkout', protect, protectActive, async (req, 
       const existing = await findExistingByScopedKey(prisma, businessProfileId, userId, idempotencyKey);
       if (existing) {
         if (existing.idempotencyRequestHash && existing.idempotencyRequestHash !== requestHash) {
-          return res.status(409).json({
-            success: false,
-            message: 'This checkout idempotency key was already used for different cart contents.',
-          });
+          return res.status(409).json({ success: false, message: 'This checkout idempotency key was already used for different cart contents.' });
         }
-        const order = await prisma.businessOrder.findUnique({
-          where: { id: existing.id },
-          include: { items: true, escrow: true },
-        });
+        const order = await prisma.businessOrder.findUnique({ where: { id: existing.id }, include: { items: true, escrow: true } });
         await attachVariantSnapshots(prisma, order);
         return res.status(200).json({ success: true, data: { order, idempotent: true } });
       }
@@ -213,22 +208,14 @@ router.post('/:businessProfileId/checkout', protect, protectActive, async (req, 
     };
     res.json = async payload => {
       try {
-        if (statusCode === 400 && idempotencyKey &&
-            typeof payload?.message === 'string' &&
-            payload.message.includes('idempotencyKey')) {
+        if (statusCode === 400 && idempotencyKey && typeof payload?.message === 'string' && payload.message.includes('idempotencyKey')) {
           const existing = await findExistingByScopedKey(prisma, businessProfileId, userId, idempotencyKey);
           if (existing) {
             if (existing.idempotencyRequestHash && existing.idempotencyRequestHash !== requestHash) {
               originalStatus(409);
-              return originalJson({
-                success: false,
-                message: 'This checkout idempotency key was already used for different cart contents.',
-              });
+              return originalJson({ success: false, message: 'This checkout idempotency key was already used for different cart contents.' });
             }
-            const order = await prisma.businessOrder.findUnique({
-              where: { id: existing.id },
-              include: { items: true, escrow: true },
-            });
+            const order = await prisma.businessOrder.findUnique({ where: { id: existing.id }, include: { items: true, escrow: true } });
             await attachVariantSnapshots(prisma, order);
             originalStatus(200);
             return originalJson({ success: true, data: { order, idempotent: true } });
@@ -246,7 +233,6 @@ router.post('/:businessProfileId/checkout', protect, protectActive, async (req, 
                 AND "customerId" = ${userId}
             `;
           }
-
           const returnedItems = Array.isArray(order.items) ? order.items : [];
           for (let index = 0; index < returnedItems.length && index < body.items.length; index += 1) {
             const returnedItem = returnedItems[index];
@@ -272,14 +258,17 @@ router.post('/:businessProfileId/checkout', protect, protectActive, async (req, 
   }
 });
 
-// Canonical customer order-history contract used by the existing frontend
-// StorefrontService: /storefront/me/orders and /storefront/me/orders/:orderId.
 router.get('/me/orders', protect, protectActive, async (req, res, next) => {
   try {
     const prisma = req.app.get('prisma');
     const take = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 50);
-    const cursor = decodeCursor(req.query.cursor);
+    const cursorRaw = req.query.cursor ? String(req.query.cursor) : null;
+    const cursor = decodeCursor(cursorRaw);
+    if (cursorRaw && !cursor) return res.status(400).json({ success: false, message: 'Invalid order history cursor.' });
+
     const status = req.query.status ? String(req.query.status).trim().toUpperCase() : null;
+    if (status && !ORDER_STATUSES.has(status)) return res.status(400).json({ success: false, message: 'Invalid order status filter.' });
+
     const where = {
       customerId: req.user.id,
       ...(status ? { status } : {}),
@@ -304,14 +293,7 @@ router.get('/me/orders', protect, protectActive, async (req, res, next) => {
     const hasMore = rows.length > take;
     const orders = hasMore ? rows.slice(0, take) : rows;
     await attachVariantSnapshotsToOrders(prisma, orders);
-    return res.json({
-      success: true,
-      data: {
-        orders,
-        hasMore,
-        nextCursor: hasMore ? encodeCursor(orders[orders.length - 1]) : null,
-      },
-    });
+    return res.json({ success: true, data: { orders, hasMore, nextCursor: hasMore ? encodeCursor(orders[orders.length - 1]) : null } });
   } catch (err) {
     return next(err);
   }
@@ -337,8 +319,6 @@ router.get('/me/orders/:orderId', protect, protectActive, async (req, res, next)
   }
 });
 
-// Business-scoped variants of the same history contract are useful to
-// storefronts that already know the business profile ID.
 router.get('/:businessProfileId/orders', protect, protectActive, async (req, res, next) => {
   try {
     const prisma = req.app.get('prisma');
@@ -346,13 +326,7 @@ router.get('/:businessProfileId/orders', protect, protectActive, async (req, res
     const take = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 50);
     const skip = Math.max(parseInt(req.query.offset, 10) || 0, 0);
     const [orders, total] = await Promise.all([
-      prisma.businessOrder.findMany({
-        where: { businessProfileId, customerId: req.user.id },
-        include: { items: true, escrow: true },
-        orderBy: { createdAt: 'desc' },
-        take,
-        skip,
-      }),
+      prisma.businessOrder.findMany({ where: { businessProfileId, customerId: req.user.id }, include: { items: true, escrow: true }, orderBy: { createdAt: 'desc' }, take, skip }),
       prisma.businessOrder.count({ where: { businessProfileId, customerId: req.user.id } }),
     ]);
     await attachVariantSnapshotsToOrders(prisma, orders);
@@ -365,14 +339,7 @@ router.get('/:businessProfileId/orders', protect, protectActive, async (req, res
 router.get('/:businessProfileId/orders/:orderId', protect, protectActive, async (req, res, next) => {
   try {
     const prisma = req.app.get('prisma');
-    const order = await prisma.businessOrder.findFirst({
-      where: {
-        id: req.params.orderId,
-        businessProfileId: req.params.businessProfileId,
-        customerId: req.user.id,
-      },
-      include: { items: true, escrow: true, ticket: true },
-    });
+    const order = await prisma.businessOrder.findFirst({ where: { id: req.params.orderId, businessProfileId: req.params.businessProfileId, customerId: req.user.id }, include: { items: true, escrow: true, ticket: true } });
     if (!order) return res.status(404).json({ success: false, message: 'Order not found.' });
     await attachVariantSnapshots(prisma, order);
     return res.json({ success: true, data: { order } });
