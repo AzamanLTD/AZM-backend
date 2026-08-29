@@ -19,6 +19,7 @@ const logger = require('../src/config/logger');
 const express              = require('express');
 const router               = express.Router();
 const depositController    = require('../controllers/depositController');
+const quoteDepositController = require('../controllers/moolreQuoteDepositController');
 const { idempotency } = require('../middleware/idempotency');
 const { protectActive }    = require('../middleware/banGuardMiddleware');
 const { validate }         = require('../middleware/validate');
@@ -34,9 +35,11 @@ router.post('/fiat/webhook',   depositController.localFiatDepositWebhook);
 router.post('/webhook/tatum',  depositController.tatumCryptoWebhook);
 
 // ── Moolre MoMo PIN-push collection on-ramp (2026-06-23) ──────────────────────
-router.post('/fiat/initiate/moolre',     protectActive, idempotency(), validate(initiateMoolreFiatDepositSchema), depositController.initiateMoolreFiatDeposit);
+// Quote-backed variants lock the server-calculated GHS/USDC rate through
+// settlement and atomically consume the quote with the wallet credit.
+router.post('/fiat/initiate/moolre',     protectActive, idempotency(), validate(initiateMoolreFiatDepositSchema), quoteDepositController.initiate);
 router.post('/fiat/initiate/moolre/otp', protectActive, depositController.confirmMoolreOtp);
-router.post('/fiat/webhook/moolre',      depositController.moolreCollectionWebhook); // no JWT — secret-guarded
+router.post('/fiat/webhook/moolre',      quoteDepositController.webhook); // no JWT — secret-guarded
 router.post('/validate-name',            protectActive, depositController.validateMomoName);
 
 module.exports = router;
