@@ -1,12 +1,5 @@
 /**
  * Route Registry — mounts all API route modules onto the Express app.
- *
- * Extracted from server.js as part of Phase 1 modularization.
- * Rate limiters and middleware are passed in to keep this module
- * side-effect free and testable.
- *
- * @param {import('express').Express} app     - Express app instance
- * @param {object} limiters                     - { authLimiter, financialLimiter, generalLimiter, webhookLimiter }
  */
 function mountRoutes(app, {
     authLimiter,
@@ -16,7 +9,6 @@ function mountRoutes(app, {
 }) {
     const logger = require('../../src/config/logger');
 
-    // API versioning + response helpers
     app.use('/api', require('../../middleware/apiVersioning'));
     app.use((req, res, next) => {
         const m = req.url.match(/^\/api\/v(\d+)(?=\/|\?|$)/);
@@ -29,10 +21,8 @@ function mountRoutes(app, {
     app.use('/api', prismaInjector);
 
     app.use('/api/public', generalLimiter, require('../../routes/publicRoutes'));
-
     const { adminBusinessScope } = require('../../middleware/adminBusinessScope');
     app.use(adminBusinessScope);
-
     app.use('/api/auth', authLimiter, require('../../routes/authRoutes'));
     app.use('/api/trades', financialLimiter, require('../../routes/tradeRoutes'));
     app.use('/api/ads', generalLimiter, require('../../routes/adRoutes'));
@@ -66,7 +56,6 @@ function mountRoutes(app, {
     app.use('/api/azm', generalLimiter, require('../../routes/azmRoutes'));
     app.use('/api/receipts', generalLimiter, require('../../routes/receiptRoutes'));
     app.use('/api/tickets', generalLimiter, require('../../routes/ticketRoutes'));
-
     app.use('/api/escrow', financialLimiter, require('../../routes/escrowRoutes'));
     app.use('/api/business', generalLimiter, require('../../routes/businessRoutes'));
     app.use('/api/reservations', generalLimiter, require('../../routes/reservationRoutes'));
@@ -87,7 +76,6 @@ function mountRoutes(app, {
     app.use('/api/wallet-pass', generalLimiter, require('../../routes/walletPassRoutes'));
     app.use('/api/round-up', generalLimiter, require('../../routes/roundUpRoutes'));
     app.use('/api/vaults', generalLimiter, require('../../routes/vaultYieldRoutes'));
-
     app.use('/api/vaults', financialLimiter, require('../../routes/vaultRoutes'));
     app.use('/api/shared-vaults', financialLimiter, require('../../routes/sharedVaultRoutes'));
     app.use('/api/group-chats', generalLimiter, require('../../routes/groupChatRoutes'));
@@ -108,24 +96,19 @@ function mountRoutes(app, {
 
     const { userRouter: porUserRouter, adminRouter: porAdminRouter } = require('../../routes/proofOfResidencyRoutes');
     const { publicRouter: liabPublicRouter, adminRouter: liabAdminRouter } = require('../../routes/liabilityContractRoutes');
-    const adminWarRoomRoutes = require('../../routes/adminWarRoomRoutes');
-
     app.use('/api/users/proof-of-residency', generalLimiter, porUserRouter);
     app.use('/api/admin/proof-of-residency', generalLimiter, porAdminRouter);
     app.use('/api/liability-contract', generalLimiter, liabPublicRouter);
     app.use('/api/admin/liability-contract', generalLimiter, liabAdminRouter);
-    app.use('/api/admin/war-room', generalLimiter, adminWarRoomRoutes);
-
-    const adminSusuRoutes = require('../../routes/adminSusuRoutes');
-    const businessOSRoutes = require('../../routes/businessOSRoutes');
-
-    app.use('/api/admin/susu', generalLimiter, adminSusuRoutes);
+    app.use('/api/admin/war-room', generalLimiter, require('../../routes/adminWarRoomRoutes'));
+    app.use('/api/admin/susu', generalLimiter, require('../../routes/adminSusuRoutes'));
     app.use('/api/admin/rbac', generalLimiter, require('../../routes/adminRbacRoutes'));
     app.use('/api/admin/control-plane', generalLimiter, require('../../routes/adminControlPlaneRoutes'));
     app.use('/api/admin/control-plane', generalLimiter, require('../../routes/adminControlPlaneSummaryRoutes'));
+    app.use('/api/admin/control-plane', generalLimiter, require('../../routes/adminControlPlaneExecutiveRoutes'));
 
     app.use('/api/marketplace', generalLimiter, require('../../routes/marketplaceRoutes'));
-    app.use('/api/business-os', generalLimiter, businessOSRoutes);
+    app.use('/api/business-os', generalLimiter, require('../../routes/businessOSRoutes'));
     app.use('/api/developer', generalLimiter, require('../../routes/developerRoutes'));
     app.use('/api/qr', generalLimiter, require('../../routes/qrRoutes'));
     app.use('/api/storefront', generalLimiter, require('../../routes/storefrontRoutes'));
@@ -135,45 +118,26 @@ function mountRoutes(app, {
 
     const chatUploadExtended = require('../../routes/chatUploadRoutesExtended');
     app.use('/api/chat', chatUploadExtended);
-
-    app.post('/api/business/upload/image',
-        require('../../middleware/authMiddleware').protect,
-        chatUploadExtended.imageUpload.single('file'),
-        async (req, res) => {
-            if (!req.file) return res.status(400).json({ success: false, message: 'No file uploaded' });
-            try {
-                const folder = req.query.folder === 'logos' ? 'business/logos'
-                             : req.query.folder === 'kyb' ? 'business/kyb'
-                             : 'business/products';
-                const { url } = await require('../../services/cloudinaryService').uploadToCloudinary(req.file, folder);
-                res.status(200).json({ success: true, url, mimeType: req.file.mimetype, size: req.file.size, filename: req.file.originalname });
-            } catch (err) {
-                logger.error({ err }, 'Business image upload error');
-                res.status(500).json({ success: false, message: 'Upload failed' });
-            }
+    app.post('/api/business/upload/image', require('../../middleware/authMiddleware').protect, chatUploadExtended.imageUpload.single('file'), async (req, res) => {
+        if (!req.file) return res.status(400).json({ success: false, message: 'No file uploaded' });
+        try {
+            const folder = req.query.folder === 'logos' ? 'business/logos' : req.query.folder === 'kyb' ? 'business/kyb' : 'business/products';
+            const { url } = await require('../../services/cloudinaryService').uploadToCloudinary(req.file, folder);
+            res.status(200).json({ success: true, url, mimeType: req.file.mimetype, size: req.file.size, filename: req.file.originalname });
+        } catch (err) {
+            logger.error({ err }, 'Business image upload error');
+            res.status(500).json({ success: false, message: 'Upload failed' });
         }
-    );
+    });
 
     const { protect: protectVendorUpload } = require('../../middleware/authMiddleware');
     const vendorDocsUpload = chatUploadExtended.vendorDocsUpload;
-    app.post('/api/vendor/upload-docs', protectVendorUpload, vendorDocsUpload.fields([
-        { name: 'idFront', maxCount: 1 },
-        { name: 'idBack', maxCount: 1 },
-        { name: 'selfie', maxCount: 1 },
-        { name: 'addressProof', maxCount: 1 },
-    ]), async (req, res) => {
+    app.post('/api/vendor/upload-docs', protectVendorUpload, vendorDocsUpload.fields([{ name: 'idFront', maxCount: 1 }, { name: 'idBack', maxCount: 1 }, { name: 'selfie', maxCount: 1 }, { name: 'addressProof', maxCount: 1 }]), async (req, res) => {
         try {
-            if (!req.files || Object.keys(req.files).length === 0) {
-                return res.status(400).json({ success: false, message: 'No files uploaded' });
-            }
+            if (!req.files || Object.keys(req.files).length === 0) return res.status(400).json({ success: false, message: 'No files uploaded' });
             const { uploadToCloudinary } = require('../../services/cloudinaryService');
             const urls = {};
-            for (const [field, files] of Object.entries(req.files)) {
-                if (files && files.length > 0) {
-                    const { url } = await uploadToCloudinary(files[0], 'vendor-docs');
-                    urls[field] = url;
-                }
-            }
+            for (const [field, files] of Object.entries(req.files)) if (files && files.length > 0) urls[field] = (await uploadToCloudinary(files[0], 'vendor-docs')).url;
             logger.info({ userId: req.user.id, keys: Object.keys(urls) }, 'Vendor: documents uploaded');
             return res.status(200).json({ success: true, urls });
         } catch (err) {
