@@ -33,7 +33,6 @@ async function isGlobalController(req, p) {
   return Boolean(profile?.status === 'ACTIVE' && profile?.isGlobalSuperAdmin);
 }
 
-
 function cleanText(value) {
   return typeof value === 'string' ? value.trim() : '';
 }
@@ -43,6 +42,25 @@ function parsePositiveInt(value) {
   return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
 }
 
+function parseDate(value) {
+  if (typeof value !== 'string' || !value.trim()) return null;
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+function sanitizeActivityMetadata(value) {
+  const blocked = new Set([
+    'password', 'passwordHash', 'token', 'accessToken', 'refreshToken', 'authorization',
+    'secret', 'clientSecret', 'apiKey', 'privateKey', 'otp', 'code', 'sessionToken',
+  ]);
+  if (Array.isArray(value)) return value.map(sanitizeActivityMetadata);
+  if (!value || typeof value !== 'object') return value;
+  return Object.fromEntries(
+    Object.entries(value)
+      .filter(([key]) => !blocked.has(key) && !/password|token|secret|authorization|private.?key|api.?key/i.test(key))
+      .map(([key, entry]) => [key, sanitizeActivityMetadata(entry)])
+  );
+}
 
 async function loadStaffById(p, staffId) {
   const rows = await p.$queryRawUnsafe('SELECT * FROM "StaffProfile" WHERE id = $1', staffId);
@@ -105,7 +123,6 @@ async function transitionStaffLifecycle(req, res, nextStatus, eventType) {
     return res.status(500).json({ success: false, message: 'Failed to update staff lifecycle.' });
   }
 }
-
 
 router.post('/me/presence', async (req, res) => {
   const presence = String(req.body?.presence || '').toUpperCase();
@@ -520,10 +537,93 @@ router.delete('/staff/:id/duties/:dutyId', async (req, res) => {
   }
 });
 
+router.get('/activity', async (req, res) => {
+  if (!(await authorize(req, 'staff.activity.view'))) return deny(res, 'staff.activity.view');
+
+  const limitValue = req.query.limit == null ? 50 : Number(req.query.limit);
+  const pageValue = req.query.page == null ? 1 : Number(req.query.page);
+  if (!Number.isInteger(limitValue) || limitValue < 1 || limitValue > 100) {
+    return res.status(400).json({ success: false, message: 'limit must be an integer between 1 and 100.' });
+  }
+  if (!Number.isInteger(pageValue) || pageValue < 1 || pageValue > 10000) {
+    return res.status(400).json({ success: false, message: 'page must be an integer between 1 and 10000.' });
+  }
+
+  const staffId = req.query.staffId == null ? null : parsePositiveInt(req.query.staffId);
+  const actorUserId = req.query.actorUserId == null ? null : parsePositiveInt(req.query.actorUserId);
+  const targetId = req.query.targetId == null ? null : cleanText(req.query.targetId);
+  const eventType = req.query.eventType == null ? null : cleanText(req.query.eventType);
+  const targetType = req.query.targetType == null ? null : cleanText(req.query.targetType);
+  const startAt = req.query.startAt == null ? null : parseDate(req.query.startAt);
+  const endAt = req.query.endAt == null ? null : parseDate(req.query.endAt);
+
+  if (req.query.staffId != null && !staffId) return res.status(400).json({ success: false, message: 'staffId must be a positive integer.' });
+  if (req.query.actorUserId != null && !actorUserId) return res.status(400).json({ success: false, message: 'actorUserId must be a positive integer.' });
+  if (req.query.targetId != null && !targetId) return res.status(400).json({ success: false, message: 'targetId cannot be empty.' });
+  if (req.query.eventType != null && !eventType) return res.status(400).json({ success: false, message: 'eventType cannot be empty.' });
+  if (req.query.targetType != null && !targetType) return res.status(400,).json({ success: false, message: 'targetType cannot be empty.' });
+  if (req.query.startAt != null && !startAt) return res.status(400).json({ success: false, message: 'startAt must be a valid date.' });
+  if (req.query.endAt != null && !endAt) return res.status(400).json({ success: false, message: 'endAt must be a valid date.' });
+  if (startAt && endAt && startAt > endAt) return res.status(400).json({ success: false, message: 'startAt cannot be after endAt.' });
+
+  try {
+    const p = prisma(req);
+    const where = [];
+    const params = [];
+    const addParam = (value) => {
+      params.push(value);
+      return `$${params.length}`;
+    };
+
+    if (staffId) where.push(`ae."staffProfileId" = ${addParam(staffId)}`);
+    if (actorUserId) where.push(`ae."actorUserId" = ${addParam(actorUserId)}`);
+    if (eventType) where.push(`ae."eventType" = ${addParam(eventType)}`);
+    if (targetType) where.push(`ae."targetType" = ${addParam(targetType)}`);
+    if (targetId) where.push(`ae."targetId" = ${addParam(targetId)}`);
+    if (startAt) where.push(`ae."createdAt" >= ${addParam(startAt)}`);
+    if (endAt) where.push(`ae."createdAt" <= ${addParam(endAt)}`);
+
+    const offset = (pageValue - 1) * limitValue;
+    const limitParam = addParam(limitValue + 1);
+    const offsetParam = addParam(offset);
+    const rows = await p.$queryRawUnsafe(`
+      SELECT ae.id, ae."staffProfileId", ae."actorUserId", ae."eventType", ae."targetType", ae."targetId", ae.metadata, ae."createdAt",
+             actor.username AS "actorUsername", actor.email AS "actorEmail",
+             subject.username AS "staffUsername", subject.email AS "staffEmail"
+      FROM "StaffActivityEvent" ae
+      LEFT JOIN "User" actor ON actor.id = ae."actorUserId"
+      LEFT JOIN "StaffProfile" staff ON staff.id = ae."staffProfileId"
+      LEFT JOIN "User" subject ON subject.id = staff."userId"
+      ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
+      ORDER BY ae."createdAt" DESC, ae.id DESC
+      LIMIT ${limitParam} OFFSET ${offsetParam}
+    `, ...params);
+
+    const hasMore = rows.length > limitValue;
+    const events = rows.slice(0, limitValue).map((row) => ({
+      ...row,
+      metadata: sanitizeActivityMetadata(row.metadata),
+    }));
+    return res.json({
+      success: true,
+      events,
+      pagination: {
+        page: pageValue,
+        limit: limitValue,
+        hasMore,
+        nextPage: hasMore ? pageValue + 1 : null,
+      },
+    });
+  } catch (err) {
+    req.app.get('logger')?.error?.({ err }, 'control-plane activity feed failed');
+    return res.status(500).json({ success: false, message: 'Failed to load activity feed.' });
+  }
+});
+
 router.get('/staff/:id/activity', async (req, res) => {
   if (!(await authorize(req, 'staff.activity.view'))) return deny(res, 'staff.activity.view');
   const rows = await prisma(req).$queryRawUnsafe(`SELECT id, "eventType", "targetType", "targetId", metadata, "createdAt" FROM "StaffActivityEvent" WHERE "staffProfileId" = $1 ORDER BY "createdAt" DESC LIMIT 200`, Number(req.params.id));
-  return res.json({ success: true, events: rows });
+  return res.json({ success: true, events: rows.map((row) => ({ ...row, metadata: sanitizeActivityMetadata(row.metadata) })) });
 });
 
 module.exports = router;
