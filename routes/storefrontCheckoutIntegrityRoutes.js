@@ -164,8 +164,6 @@ router.post('/:businessProfileId/checkout', protect, protectActive, async (req, 
       }
     }
 
-    // Preserve the existing checkout implementation and its authoritative
-    // pricing/escrow behavior, but never pass the client-global key through.
     req.body = { ...body, ...(idempotencyKey ? { idempotencyKey } : {}) };
 
     let statusCode = 200;
@@ -177,18 +175,14 @@ router.post('/:businessProfileId/checkout', protect, protectActive, async (req, 
     };
     res.json = async payload => {
       try {
-        // The legacy route catches Prisma unique violations and turns them into
-        // HTTP 400. Convert only an idempotency-key collision back into the
-        // correct idempotent success response after the transaction has rolled
-        // back. This closes the concurrent retry race without duplicating the
-        // financial/escrow transaction itself.
         if (statusCode === 400 && idempotencyKey &&
             typeof payload?.message === 'string' &&
             payload.message.includes('idempotencyKey')) {
           const existing = await findExistingByScopedKey(prisma, businessProfileId, userId, idempotencyKey);
           if (existing) {
             if (existing.idempotencyRequestHash && existing.idempotencyRequestHash !== requestHash) {
-              return originalStatus(409).json({
+              originalStatus(409);
+              return originalJson({
                 success: false,
                 message: 'This checkout idempotency key was already used for different cart contents.',
               });
@@ -198,7 +192,8 @@ router.post('/:businessProfileId/checkout', protect, protectActive, async (req, 
               include: { items: true, escrow: true },
             });
             await attachVariantSnapshots(prisma, order);
-            return originalStatus(200).json({ success: true, data: { order, idempotent: true } });
+            originalStatus(200);
+            return originalJson({ success: true, data: { order, idempotent: true } });
           }
         }
 
@@ -228,9 +223,6 @@ router.post('/:businessProfileId/checkout', protect, protectActive, async (req, 
           }
         }
       } catch (err) {
-        // Variant/idempotency snapshots are non-financial metadata. Never turn
-        // an already-created order into a failure because this auxiliary write
-        // could not complete; the order remains recoverable by its id.
         req.app.get('logger')?.warn?.({ err }, 'Retail checkout snapshot persistence failed');
       }
       return originalJson(payload);
@@ -242,9 +234,6 @@ router.post('/:businessProfileId/checkout', protect, protectActive, async (req, 
   }
 });
 
-// Customer-scoped order list. This deliberately returns line items so a
-// multi-item checkout can be reconstructed without relying on BusinessOrder's
-// legacy single-productId column.
 router.get('/:businessProfileId/orders', protect, protectActive, async (req, res, next) => {
   try {
     const prisma = req.app.get('prisma');
