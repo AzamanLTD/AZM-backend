@@ -113,6 +113,7 @@ function mountRoutes(app, {
     app.use('/api/business-os', generalLimiter, require('../../routes/businessOSRoutes'));
     app.use('/api/developer', generalLimiter, require('../../routes/developerRoutes'));
     app.use('/api/qr', generalLimiter, require('../../routes/qrRoutes'));
+    app.use('/api/storefront', generalLimiter, require('../../routes/storefrontCheckoutIntegrityRoutes'));
     app.use('/api/storefront', generalLimiter, require('../../routes/storefrontRoutes'));
     app.use('/api/azm-stake', generalLimiter, require('../../routes/azmStakeRoutes'));
     app.use('/api/admin/storefront', generalLimiter, require('../../routes/adminStorefrontRoutes'));
