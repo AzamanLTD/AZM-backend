@@ -9,8 +9,8 @@ describe('retail checkout schema convergence', () => {
     const result = await installRetailCheckoutIntegrity(prisma);
 
     expect(result.ok).toBe(true);
-    expect(result.steps).toHaveLength(5);
-    expect(prisma.$executeRawUnsafe).toHaveBeenCalledTimes(5);
+    expect(result.steps).toHaveLength(8);
+    expect(prisma.$executeRawUnsafe).toHaveBeenCalledTimes(8);
     expect(prisma.$executeRawUnsafe.mock.calls[0][0]).toMatch(
       /DROP CONSTRAINT IF EXISTS "BusinessOrder_idempotencyKey_key"/,
     );
@@ -19,6 +19,12 @@ describe('retail checkout schema convergence', () => {
     );
     expect(prisma.$executeRawUnsafe.mock.calls[4][0]).toMatch(
       /BusinessOrderItem.*variants.*JSONB/,
+    );
+    expect(prisma.$executeRawUnsafe.mock.calls[6][0]).toMatch(
+      /azaman_retail_reserve_stock/,
+    );
+    expect(prisma.$executeRawUnsafe.mock.calls[7][0]).toMatch(
+      /azaman_retail_release_stock/,
     );
   });
 
