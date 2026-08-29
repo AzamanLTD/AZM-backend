@@ -9,9 +9,9 @@
 // scoping. This installer is deliberately idempotent and runs after db-push
 // convergence so the financial boundary is restored before normal traffic.
 //
-// Keep every statement static: this module must never interpolate request data
-// into DDL. The migration remains the canonical historical change; this is the
-// boot-time convergence guard for the deployed environment.
+// The same boundary reserves tracked inventory atomically with BusinessOrderItem
+// creation and returns it exactly once when an order is cancelled/refunded.
+// Untracked inventory (stockQty IS NULL) remains unaffected.
 
 async function installRetailCheckoutIntegrity(prisma) {
   const steps = [];
@@ -44,6 +44,84 @@ async function installRetailCheckoutIntegrity(prisma) {
   await run(
     'add immutable variant snapshot column',
     'ALTER TABLE "BusinessOrderItem" ADD COLUMN IF NOT EXISTS "variants" JSONB',
+  );
+
+  await run(
+    'add stock reservation marker',
+    'ALTER TABLE "BusinessOrderItem" ADD COLUMN IF NOT EXISTS "stockReserved" BOOLEAN NOT NULL DEFAULT FALSE',
+  );
+
+  await run(
+    'install atomic inventory reservation trigger',
+    `CREATE OR REPLACE FUNCTION azaman_retail_reserve_stock()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+DECLARE
+  tracked_stock INTEGER;
+BEGIN
+  SELECT "stockQty" INTO tracked_stock
+  FROM "BusinessProduct"
+  WHERE id = NEW."productId"
+  FOR UPDATE;
+
+  IF tracked_stock IS NULL THEN
+    NEW."stockReserved" := FALSE;
+    RETURN NEW;
+  END IF;
+
+  IF tracked_stock < NEW.quantity THEN
+    RAISE EXCEPTION 'INSUFFICIENT_STOCK:%:%', NEW."productId", tracked_stock
+      USING ERRCODE = 'P0001';
+  END IF;
+
+  UPDATE "BusinessProduct"
+  SET "stockQty" = "stockQty" - NEW.quantity
+  WHERE id = NEW."productId";
+
+  NEW."stockReserved" := TRUE;
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS azaman_retail_reserve_stock ON "BusinessOrderItem";
+CREATE TRIGGER azaman_retail_reserve_stock
+BEFORE INSERT ON "BusinessOrderItem"
+FOR EACH ROW
+EXECUTE FUNCTION azaman_retail_reserve_stock()` ,
+  );
+
+  await run(
+    'install inventory release trigger',
+    `CREATE OR REPLACE FUNCTION azaman_retail_release_stock()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  IF NEW.status IN ('CANCELLED', 'REFUNDED')
+     AND OLD.status NOT IN ('CANCELLED', 'REFUNDED') THEN
+    UPDATE "BusinessProduct" p
+    SET "stockQty" = p."stockQty" + i.quantity
+    FROM "BusinessOrderItem" i
+    WHERE i."orderId" = NEW.id
+      AND i."stockReserved" = TRUE
+      AND i."productId" = p.id;
+
+    UPDATE "BusinessOrderItem"
+    SET "stockReserved" = FALSE
+    WHERE "orderId" = NEW.id
+      AND "stockReserved" = TRUE;
+  END IF;
+
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS azaman_retail_release_stock ON "BusinessOrder";
+CREATE TRIGGER azaman_retail_release_stock
+AFTER UPDATE OF status ON "BusinessOrder"
+FOR EACH ROW
+EXECUTE FUNCTION azaman_retail_release_stock()` ,
   );
 
   return { ok: true, steps };
