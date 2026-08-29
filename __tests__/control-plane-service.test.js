@@ -17,10 +17,23 @@ describe('controlPlaneService authorization', () => {
     await expect(hasPermission(prisma, { id: 2, role: 'USER' }, 'staff.view')).resolves.toBe(false);
   });
 
+  test('suspended staff profile is denied', async () => {
+    const prisma = { $queryRawUnsafe: jest.fn().mockResolvedValueOnce([{ id: 10, status: 'SUSPENDED', authorityClass: 'EMPLOYEE' }]) };
+    await expect(hasPermission(prisma, { id: 2, role: 'USER' }, 'staff.view')).resolves.toBe(false);
+    expect(prisma.$queryRawUnsafe).toHaveBeenCalledTimes(1);
+  });
+
   test('global super admin is granted any permission', async () => {
     const prisma = { $queryRawUnsafe: jest.fn().mockResolvedValueOnce([{ id: 10, status: 'ACTIVE', authorityClass: 'ADMIN', isGlobalSuperAdmin: true, adminType: 'SUPER_ADMIN' }]) };
     await expect(hasPermission(prisma, { id: 2, role: 'USER' }, 'funds.move')).resolves.toBe(true);
     expect(prisma.$queryRawUnsafe).toHaveBeenCalledTimes(1);
+  });
+
+  test('non-global SUPER_ADMIN staff profile is not granted implicit global access', async () => {
+    const prisma = { $queryRawUnsafe: jest.fn()
+      .mockResolvedValueOnce([{ id: 10, status: 'ACTIVE', authorityClass: 'ADMIN', isGlobalSuperAdmin: false, adminType: 'SUPER_ADMIN' }])
+      .mockResolvedValueOnce([{ key: 'staff.view' }]) };
+    await expect(hasPermission(prisma, { id: 2, role: 'USER' }, 'funds.move')).resolves.toBe(false);
   });
 
   test('active staff receives explicitly granted permission', async () => {
