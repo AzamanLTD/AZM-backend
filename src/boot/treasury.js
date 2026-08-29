@@ -11,11 +11,10 @@
 // at boot (infra/autoRelease.js). It only does work when the treasury row is
 // missing, never blocks request handling, and never crashes the process.
 //
-// Resilience: the treasury check is intentionally NON-FATAL. A missing row must
-// NOT take down the entire backend. If the seed hasn't run yet, we log a loud
-// warning, leave `azamanTreasuryUserId` unset, and let the Susu cycle workers
-// skip themselves. A self-heal retry re-checks every 60s so a seed applied while
-// the process is live is picked up without a restart.
+// Retail checkout integrity is different: it is a financial safety boundary.
+// The app exposes checkout only after its schema/idempotency/inventory overlay
+// has converged. If convergence fails, checkout stays fail-closed while the
+// rest of the platform can continue serving non-checkout traffic.
 // =============================================================================
 
 const logger = require('../config/logger');
@@ -28,6 +27,11 @@ const logger = require('../config/logger');
  */
 async function bootTreasury(app, prisma) {
     const { autoRelease } = require('../../infra/autoRelease');
+
+    // Checkout is unavailable until the integrity installer explicitly marks
+    // the database ready. This is set synchronously before the first await so
+    // requests racing startup cannot enter the checkout transaction early.
+    app.set('retailCheckoutIntegrityReady', false);
 
     const cacheTreasury = async () => {
         const treasury = await prisma.user.findUnique({
@@ -45,7 +49,13 @@ async function bootTreasury(app, prisma) {
         // Run the boot release (installer converges schema; seed is internally
         // gated on treasury-missing). Skipped under test.
         if (process.env.NODE_ENV !== 'test') {
-            await autoRelease(prisma);
+            const release = await autoRelease(prisma);
+            if (release.retailCheckoutIntegrityInstalled === true) {
+                app.set('retailCheckoutIntegrityReady', true);
+                logger.info('Retail checkout integrity is ready for traffic.');
+            } else {
+                logger.error('Retail checkout integrity did not converge; storefront checkout remains fail-closed.');
+            }
 
             // Apply business OS schema additions (Modules 01+03) idempotently.
             try {
@@ -54,6 +64,10 @@ async function bootTreasury(app, prisma) {
             } catch (e) {
                 logger.warn({ err: e }, 'business-os-overlay: boot-time install skipped');
             }
+        } else {
+            // Unit/integration tests mount route modules directly and do not run
+            // production boot. They must not be blocked by the production gate.
+            app.set('retailCheckoutIntegrityReady', true);
         }
 
         const id = await cacheTreasury();
@@ -76,8 +90,10 @@ async function bootTreasury(app, prisma) {
             retry.unref?.();
         }
     } catch (err) {
-        // Non-fatal: log and continue. Susu stays dark; everything else runs.
-        logger.warn({ err }, 'Susu: treasury wallet cache failed (non-fatal)');
+        // Non-fatal for the rest of the platform, but explicitly fail closed
+        // for storefront checkout if the integrity release itself errors.
+        app.set('retailCheckoutIntegrityReady', false);
+        logger.warn({ err }, 'Susu/retail boot sequence failed; checkout remains fail-closed');
     }
 }
 
