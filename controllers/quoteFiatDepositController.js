@@ -50,43 +50,50 @@ exports.initiate = async (req, res) => {
       });
     }
 
-    const quote = await createServerTransactionQuote({
-      prisma,
-      marketOracle: req.app.get('marketOracle'),
-      userId,
-      purpose: 'deposit',
-      amountGhs,
-      ttlSeconds: QUOTE_TTL_SECONDS,
-    });
-
-    const reference = `${FIAT_REF_PREFIX}${userId}_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
-    const tx = await prisma.transactionHistory.create({
-      data: {
+    // Keep quote creation and pending-transaction creation in one DB
+    // transaction. This prevents an orphaned quote when transaction creation
+    // fails after the quote has already been persisted.
+    const { quote, tx } = await prisma.$transaction(async (db) => {
+      const quote = await createServerTransactionQuote({
+        prisma: db,
+        marketOracle: req.app.get('marketOracle'),
         userId,
-        type: 'DEPOSIT_FIAT',
-        amountUsdc: quote.usdcAmount,
-        feeUsdc: 0,
-        txHash: reference,
-        status: 'PENDING',
-        initiatedByUserId: userId,
-        metadata: {
-          provider,
-          amountGhs: quote.amountGhs,
-          quoteId: quote.id,
-          quoteAmountUsdc: quote.usdcAmount,
-          quoteExpiresAt: quote.expiresAt,
-          rateAtInitiation: quote.rateGhsPerUsdc,
-          rateSource: quote.rateSource,
-          rateAsOf: quote.rateAsOf,
+        purpose: 'deposit',
+        amountGhs,
+        ttlSeconds: QUOTE_TTL_SECONDS,
+      });
+
+      const reference = `${FIAT_REF_PREFIX}${userId}_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+      const tx = await db.transactionHistory.create({
+        data: {
+          userId,
+          type: 'DEPOSIT_FIAT',
+          amountUsdc: quote.usdcAmount,
+          feeUsdc: 0,
+          txHash: reference,
+          status: 'PENDING',
+          initiatedByUserId: userId,
+          metadata: {
+            provider,
+            amountGhs: quote.amountGhs,
+            quoteId: quote.id,
+            quoteAmountUsdc: quote.usdcAmount,
+            quoteExpiresAt: quote.expiresAt,
+            rateAtInitiation: quote.rateGhsPerUsdc,
+            rateSource: quote.rateSource,
+            rateAsOf: quote.rateAsOf,
+          },
         },
-      },
+      });
+
+      return { quote, tx };
     });
 
     return res.status(201).json({
       success: true,
       message: 'Deposit initiated. Complete the payment with your provider, then await confirmation.',
       data: {
-        reference,
+        reference: tx.txHash,
         quoteId: quote.id,
         status: 'PENDING',
         provider,
@@ -96,7 +103,7 @@ exports.initiate = async (req, res) => {
         quoteValidUntil: quote.expiresAt,
         instructions: [
           `Send GHS ${quote.amountGhs.toFixed(2)} via ${provider}.`,
-          `Use reference: ${reference}`,
+          `Use reference: ${tx.txHash}`,
           'Funds will appear in your Azaman wallet after provider confirmation.',
         ],
         transaction: tx,
