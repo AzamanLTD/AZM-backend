@@ -67,7 +67,7 @@ exports.getSettings = async (req, res) => {
                 autoPayoutMaxAmountUsdc: Number(settings.autoPayoutMaxAmountUsdc),
                 autoPayoutIntervalMs: settings.autoPayoutIntervalMs,
 
-                // Oracle rates (read-only display)
+                // Oracle rates
                 liveUsdToGhs: Number(settings.liveUsdToGhs),
                 liveRetailRate: Number(settings.liveRetailRate),
                 liveCorporateRate: Number(settings.liveCorporateRate),
@@ -119,6 +119,7 @@ exports.updateSettings = async (req, res) => {
             'withdrawalFeeByRiskTier', 'feeByPaymentMethod', 'supportedPaymentMethods',
             'gasFeeTrc20', 'gasFeeErc20', 'gasFeeBep20',
             'autoPayoutEnabled', 'autoPayoutThresholdUsdc', 'autoPayoutMaxAmountUsdc', 'autoPayoutIntervalMs',
+            'liveUsdToGhs', 'liveRateSource',
             'minAppVersion', 'forceUpdateUrl', 'updateMessage',
             'susuProfitPct',
             'smartEscrowFeePct', 'escrowDraftExpiryHours', 'escrowFundedExpiryDays',
@@ -138,6 +139,7 @@ exports.updateSettings = async (req, res) => {
                 if (field !== 'autoPayoutEnabled' && field !== 'autoPayoutIntervalMs'
                     && field !== 'minAppVersion' && field !== 'forceUpdateUrl' && field !== 'updateMessage'
                     && field !== 'withdrawalFeeByRiskTier'
+                    && field !== 'liveRateSource'
                     && field !== 'escrowDraftExpiryHours' && field !== 'escrowFundedExpiryDays') {
                     newValue = parseFloat(newValue);
                 } else if (field === 'escrowDraftExpiryHours' || field === 'escrowFundedExpiryDays') {
@@ -159,6 +161,26 @@ exports.updateSettings = async (req, res) => {
                         message: `${field} must be a number between 0 and 1 (got ${newValue}).`
                     });
                 }
+            }
+
+            // Validation: the mock/admin USDC→GHS rate must be finite and positive.
+            if (field === 'liveUsdToGhs') {
+                if (typeof newValue !== 'number' || !Number.isFinite(newValue) || newValue <= 0 || newValue > 1000000) {
+                    return res.status(400).json({
+                        success: false,
+                        message: 'liveUsdToGhs must be a positive number no greater than 1,000,000.'
+                    });
+                }
+            }
+
+            if (field === 'liveRateSource') {
+                if (typeof newValue !== 'string' || newValue.trim().length < 1 || newValue.length > 100) {
+                    return res.status(400).json({
+                        success: false,
+                        message: 'liveRateSource must be a non-empty string of at most 100 characters.'
+                    });
+                }
+                newValue = newValue.trim();
             }
 
             // Validation: tierThreshold must be positive
@@ -187,6 +209,13 @@ exports.updateSettings = async (req, res) => {
 
             updateData[field] = newValue;
             changes[field] = { old: oldValue, new: newValue };
+        }
+
+        // Any admin rate change creates a fresh rate snapshot timestamp. Existing
+        // quotes keep the rate they were issued with until their own expiry.
+        if (Object.prototype.hasOwnProperty.call(updateData, 'liveUsdToGhs')) {
+            updateData.lastRateSync = new Date();
+            changes.lastRateSync = { old: current.lastRateSync, new: updateData.lastRateSync };
         }
 
         if (Object.keys(updateData).length === 0) {
