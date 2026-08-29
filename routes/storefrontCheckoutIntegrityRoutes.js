@@ -87,6 +87,18 @@ async function findExistingByScopedKey(prisma, businessProfileId, customerId, id
   return rows[0] || null;
 }
 
+async function attachVariantSnapshots(prisma, order) {
+  if (!order || !Array.isArray(order.items) || order.items.length === 0) return order;
+  const rows = await prisma.$queryRaw`
+    SELECT id, variants
+    FROM "BusinessOrderItem"
+    WHERE "orderId" = ${order.id}
+  `;
+  const byId = new Map(rows.map(row => [row.id, row.variants ?? {}]));
+  order.items = order.items.map(item => ({ ...item, variants: byId.get(item.id) ?? {} }));
+  return order;
+}
+
 // This router intentionally sits before the legacy storefront router. It adds
 // the security/integrity contract around the existing checkout implementation
 // without duplicating its escrow/order lifecycle logic.
@@ -147,6 +159,7 @@ router.post('/:businessProfileId/checkout', protect, protectActive, async (req, 
           where: { id: existing.id },
           include: { items: true, escrow: true },
         });
+        await attachVariantSnapshots(prisma, order);
         return res.status(200).json({ success: true, data: { order, idempotent: true } });
       }
     }
@@ -155,9 +168,40 @@ router.post('/:businessProfileId/checkout', protect, protectActive, async (req, 
     // pricing/escrow behavior, but never pass the client-global key through.
     req.body = { ...body, ...(idempotencyKey ? { idempotencyKey } : {}) };
 
+    let statusCode = 200;
+    const originalStatus = res.status.bind(res);
     const originalJson = res.json.bind(res);
+    res.status = code => {
+      statusCode = code;
+      return originalStatus(code);
+    };
     res.json = async payload => {
       try {
+        // The legacy route catches Prisma unique violations and turns them into
+        // HTTP 400. Convert only an idempotency-key collision back into the
+        // correct idempotent success response after the transaction has rolled
+        // back. This closes the concurrent retry race without duplicating the
+        // financial/escrow transaction itself.
+        if (statusCode === 400 && idempotencyKey &&
+            typeof payload?.message === 'string' &&
+            payload.message.includes('idempotencyKey')) {
+          const existing = await findExistingByScopedKey(prisma, businessProfileId, userId, idempotencyKey);
+          if (existing) {
+            if (existing.idempotencyRequestHash && existing.idempotencyRequestHash !== requestHash) {
+              return originalStatus(409).json({
+                success: false,
+                message: 'This checkout idempotency key was already used for different cart contents.',
+              });
+            }
+            const order = await prisma.businessOrder.findUnique({
+              where: { id: existing.id },
+              include: { items: true, escrow: true },
+            });
+            await attachVariantSnapshots(prisma, order);
+            return originalStatus(200).json({ success: true, data: { order, idempotent: true } });
+          }
+        }
+
         const order = payload?.data?.order;
         if (payload?.success && order?.id) {
           if (idempotencyKey) {
@@ -171,11 +215,10 @@ router.post('/:businessProfileId/checkout', protect, protectActive, async (req, 
           }
 
           const returnedItems = Array.isArray(order.items) ? order.items : [];
-          for (let index = 0; index < returnedItems.length; index += 1) {
+          for (let index = 0; index < returnedItems.length && index < body.items.length; index += 1) {
             const returnedItem = returnedItems[index];
-            const sourceItem = body.items.find(item => item.productId === returnedItem.productId &&
-              JSON.stringify(item.variants ?? {}) === JSON.stringify(returnedItem.variants ?? {}));
-            if (!sourceItem || !returnedItem.id) continue;
+            const sourceItem = body.items[index];
+            if (!returnedItem?.id) continue;
             await prisma.$executeRaw`
               UPDATE "BusinessOrderItem"
               SET variants = ${JSON.stringify(sourceItem.variants ?? {})}::jsonb
@@ -185,9 +228,9 @@ router.post('/:businessProfileId/checkout', protect, protectActive, async (req, 
           }
         }
       } catch (err) {
-        // Do not turn a successfully-created order into an HTTP failure because
-        // the non-financial snapshot persistence failed. Log via the app logger
-        // if available; the next order retrieval can still expose the core line.
+        // Variant/idempotency snapshots are non-financial metadata. Never turn
+        // an already-created order into a failure because this auxiliary write
+        // could not complete; the order remains recoverable by its id.
         req.app.get('logger')?.warn?.({ err }, 'Retail checkout snapshot persistence failed');
       }
       return originalJson(payload);
@@ -218,6 +261,7 @@ router.get('/:businessProfileId/orders', protect, protectActive, async (req, res
       }),
       prisma.businessOrder.count({ where: { businessProfileId, customerId: req.user.id } }),
     ]);
+    for (const order of orders) await attachVariantSnapshots(prisma, order);
     return res.json({ success: true, data: { orders, total, hasMore: skip + orders.length < total } });
   } catch (err) {
     return next(err);
@@ -236,6 +280,7 @@ router.get('/:businessProfileId/orders/:orderId', protect, protectActive, async 
       include: { items: true, escrow: true, ticket: true },
     });
     if (!order) return res.status(404).json({ success: false, message: 'Order not found.' });
+    await attachVariantSnapshots(prisma, order);
     return res.json({ success: true, data: { order } });
   } catch (err) {
     return next(err);
