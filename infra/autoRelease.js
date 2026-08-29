@@ -2,15 +2,13 @@ const logger = require('../src/config/logger');
 // infra/autoRelease.js
 // =============================================================================
 // Boot-time, idempotent "release" step for free-tier hosting (Render free
-// instances have no Shell and no Pre-Deploy hook). Runs ONCE per process
-// start, in the background, and NEVER crashes the server if it fails.
+// instances have no Shell and no Pre-Deploy hook). Runs ONCE per process start,
+// in the background, and NEVER crashes the server if it fails.
 //
 // What it does:
 //   1. Installs the additive Susu overlay schema objects.
-//   2. Seeds the azaman-treasury wallet + v1.0 liability contract when needed.
-//
-// Production Neon is db-push managed behind PgBouncer, so the installers use
-// plain idempotent SQL rather than prisma migrate deploy.
+//   2. Installs the transaction quote overlay schema objects.
+//   3. Seeds the azaman-treasury wallet + v1.0 liability contract when needed.
 // =============================================================================
 
 const releaseStatus = {
@@ -18,8 +16,11 @@ const releaseStatus = {
   startedAt: null,
   finishedAt: null,
   overlayInstalled: null,
+  quoteOverlayInstalled: null,
   installerResult: null,
+  quoteInstallerResult: null,
   installerErrors: null,
+  quoteInstallerErrors: null,
   seedOk: null,
   seedOutput: null,
   skipped: false,
@@ -55,6 +56,18 @@ async function autoRelease(prisma, opts = {}) {
     } catch (e) {
       log(`overlay installer threw (non-fatal): ${e.message}`);
       releaseStatus.installerResult = { error: e.message };
+    }
+
+    try {
+      const { installTransactionQuoteOverlay } = require('./install-transaction-quote-overlay');
+      const r = await installTransactionQuoteOverlay(prisma);
+      releaseStatus.quoteInstallerResult = { ok: r.ok, failed: r.failed };
+      releaseStatus.quoteOverlayInstalled = r.failed === 0;
+      if (r.errors && r.errors.length) releaseStatus.quoteInstallerErrors = r.errors.slice(0, 10);
+      log(`transaction quote overlay: ${r.ok} ok, ${r.failed} failed`);
+    } catch (e) {
+      log(`transaction quote overlay threw (non-fatal): ${e.message}`);
+      releaseStatus.quoteInstallerResult = { error: e.message };
     }
 
     try {
