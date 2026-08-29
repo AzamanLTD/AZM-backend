@@ -43,12 +43,19 @@ Selected variants are persisted as JSONB on `BusinessOrderItem`. The snapshot is
 
 ## Order history
 
-Customer-scoped endpoints expose complete multi-item orders, including line items and variant snapshots:
+The customer-facing frontend already uses the `/me/orders` contract, so the backend provides it directly:
+
+- `GET /api/storefront/me/orders?limit=20&status=PAID&cursor=...`
+- `GET /api/storefront/me/orders/:orderId`
+
+The list is cursor-paginated and supports the canonical `BusinessOrderStatus` values. Invalid filters/cursors are rejected rather than silently falling back to the first page. Both endpoints scope queries to the authenticated customer ID, so an order ID alone cannot be used to retrieve another customer's order.
+
+Business-scoped equivalents are also available:
 
 - `GET /api/storefront/:businessProfileId/orders`
 - `GET /api/storefront/:businessProfileId/orders/:orderId`
 
-Both endpoints enforce the authenticated customer ID and business profile ID in the query, so an order ID alone cannot be used to retrieve another customer's order.
+All order-history responses include complete multi-item line items and their persisted variant snapshots.
 
 ## Migration
 
