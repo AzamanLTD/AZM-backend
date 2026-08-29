@@ -69,6 +69,22 @@ async function getServerRateGhsPerUsdc({ prisma, marketOracle }) {
   };
 }
 
+async function persistTransactionQuote(prisma, quote) {
+  if (!prisma?.$executeRaw) throw new Error('Quote service requires Prisma raw SQL support');
+
+  await prisma.$executeRaw`
+    INSERT INTO "TransactionQuote"
+      ("id", "userId", "purpose", "amountGhs", "feeGhs", "netGhs",
+       "rateGhsPerUsdc", "usdcAmount", "rateSource", "rateAsOf", "createdAt", "expiresAt")
+    VALUES
+      (${quote.id}::uuid, ${quote.userId}, ${quote.purpose}, ${quote.amountGhs}, ${quote.feeGhs}, ${quote.netGhs},
+       ${quote.rateGhsPerUsdc}, ${quote.usdcAmount}, ${quote.rateSource}, ${new Date(quote.rateAsOf)},
+       ${new Date(quote.createdAt)}, ${new Date(quote.expiresAt)})
+  `;
+
+  return quote;
+}
+
 async function createServerTransactionQuote({
   prisma,
   marketOracle,
@@ -80,7 +96,7 @@ async function createServerTransactionQuote({
   now = new Date(),
 }) {
   const rate = await getServerRateGhsPerUsdc({ prisma, marketOracle });
-  return createTransactionQuote({
+  const quote = createTransactionQuote({
     userId,
     purpose,
     amountGhs,
@@ -91,6 +107,55 @@ async function createServerTransactionQuote({
     ttlSeconds,
     now,
   });
+
+  return persistTransactionQuote(prisma, quote);
+}
+
+async function consumeTransactionQuote({
+  prisma,
+  quoteId,
+  userId,
+  purpose,
+  now = new Date(),
+}) {
+  if (!prisma?.$queryRaw) throw new Error('Quote service requires Prisma raw SQL support');
+  if (!quoteId || !userId || !Number.isInteger(Number(userId))) throw new Error('quoteId and userId are required');
+
+  const rows = await prisma.$queryRaw`
+    UPDATE "TransactionQuote"
+    SET "consumedAt" = ${new Date(now)},
+        "consumedFor" = ${purpose || null}
+    WHERE "id" = ${quoteId}::uuid
+      AND "userId" = ${Number(userId)}
+      AND (${purpose || null}::text IS NULL OR "purpose" = ${purpose})
+      AND "consumedAt" IS NULL
+      AND "expiresAt" > ${new Date(now)}
+    RETURNING "id", "userId", "purpose", "amountGhs", "feeGhs", "netGhs",
+              "rateGhsPerUsdc", "usdcAmount", "rateSource", "rateAsOf",
+              "createdAt", "expiresAt", "consumedAt", "consumedFor"
+  `;
+
+  if (!rows.length) {
+    throw new Error('Transaction quote is invalid, expired, already consumed, or not owned by this user');
+  }
+
+  const row = rows[0];
+  return {
+    id: row.id,
+    userId: Number(row.userId),
+    purpose: row.purpose,
+    amountGhs: Number(row.amountGhs),
+    feeGhs: Number(row.feeGhs),
+    netGhs: Number(row.netGhs),
+    rateGhsPerUsdc: Number(row.rateGhsPerUsdc),
+    usdcAmount: Number(row.usdcAmount),
+    rateSource: row.rateSource,
+    rateAsOf: new Date(row.rateAsOf).toISOString(),
+    createdAt: new Date(row.createdAt).toISOString(),
+    expiresAt: new Date(row.expiresAt).toISOString(),
+    consumedAt: new Date(row.consumedAt).toISOString(),
+    consumedFor: row.consumedFor,
+  };
 }
 
 function assertQuoteActive(quote, now = new Date()) {
@@ -103,6 +168,8 @@ module.exports = {
   DEFAULT_QUOTE_TTL_SECONDS,
   createTransactionQuote,
   createServerTransactionQuote,
+  persistTransactionQuote,
+  consumeTransactionQuote,
   getServerRateGhsPerUsdc,
   assertQuoteActive,
   roundMoney,
