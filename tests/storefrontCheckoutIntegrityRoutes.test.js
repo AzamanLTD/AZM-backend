@@ -13,11 +13,12 @@ jest.mock('../middleware/banGuardMiddleware', () => ({
 
 const router = require('../routes/storefrontCheckoutIntegrityRoutes');
 
-function makeApp(prisma) {
+function makeApp(prisma, downstream) {
   const app = express();
   app.use(express.json());
   app.set('prisma', prisma);
   app.use('/api/storefront', router);
+  if (downstream) app.use('/api/storefront', downstream);
   app.use((req, res) => res.status(204).end());
   return app;
 }
@@ -97,7 +98,83 @@ describe('storefront checkout integrity boundary', () => {
     expect(String(values[2])).toMatch(/^v1:business-1:7:/);
   });
 
-  test('returns customer-scoped multi-item order lists with line items', async () => {
+  test('forwards a valid checkout to the existing transaction and persists variant snapshots', async () => {
+    const prisma = {
+      businessProduct: {
+        findMany: jest.fn().mockResolvedValue([
+          { id: 'product-1', variants: { Size: ['Small', 'Large'] } },
+        ]),
+      },
+      $queryRaw: jest.fn().mockResolvedValue([]),
+      $executeRaw: jest.fn().mockResolvedValue(1),
+    };
+
+    const downstream = (req, res) => {
+      expect(req.body.idempotencyKey).toMatch(/^v1:business-1:7:/);
+      return res.status(201).json({
+        success: true,
+        data: {
+          order: {
+            id: 'order-1',
+            items: [{ id: 'line-1', productId: 'product-1' }],
+          },
+        },
+      });
+    };
+
+    const response = await request(makeApp(prisma, downstream))
+      .post('/api/storefront/business-1/checkout')
+      .send({
+        idempotencyKey: 'client-key',
+        items: [{ productId: 'product-1', quantity: 1, variants: { Size: 'Large' } }],
+      });
+
+    expect(response.status).toBe(201);
+    expect(response.body.data.order.items[0].variants).toEqual({ Size: 'Large' });
+    expect(prisma.$executeRaw).toHaveBeenCalledTimes(2);
+  });
+
+  test('converts a concurrent idempotency collision into a safe retry response', async () => {
+    const prisma = {
+      businessProduct: {
+        findMany: jest.fn().mockResolvedValue([
+          { id: 'product-1', variants: {} },
+        ]),
+      },
+      $queryRaw: jest.fn()
+        .mockResolvedValueOnce([])
+        .mockResolvedValueOnce([{
+          id: 'order-1',
+          orderRef: 'ORD-1',
+          status: 'AWAITING_PAYMENT',
+          idempotencyRequestHash: 'placeholder',
+        }]),
+      businessOrder: {
+        findUnique: jest.fn().mockResolvedValue({
+          id: 'order-1',
+          items: [],
+          escrow: null,
+        }),
+      },
+    };
+
+    const downstream = (_req, res) => res.status(400).json({
+      success: false,
+      message: 'Unique constraint failed on the fields: (`idempotencyKey`)',
+    });
+
+    const response = await request(makeApp(prisma, downstream))
+      .post('/api/storefront/business-1/checkout')
+      .send({
+        idempotencyKey: 'client-key',
+        items: [{ productId: 'product-1', quantity: 1, variants: {} }],
+      });
+
+    expect(response.status).toBe(200);
+    expect(response.body.data.idempotent).toBe(true);
+  });
+
+  test('returns customer-scoped multi-item order lists with line items and variants', async () => {
     const prisma = {
       businessOrder: {
         findMany: jest.fn().mockResolvedValue([
@@ -105,12 +182,15 @@ describe('storefront checkout integrity boundary', () => {
             id: 'order-1',
             businessProfileId: 'business-1',
             customerId: 7,
-            items: [{ id: 'line-1', productId: 'product-1', variants: { Size: 'Large' } }],
+            items: [{ id: 'line-1', productId: 'product-1' }],
             escrow: null,
           },
         ]),
         count: jest.fn().mockResolvedValue(1),
       },
+      $queryRaw: jest.fn().mockResolvedValue([
+        { id: 'line-1', variants: { Size: 'Large' } },
+      ]),
     };
 
     const response = await request(makeApp(prisma))
@@ -120,6 +200,7 @@ describe('storefront checkout integrity boundary', () => {
     expect(response.status).toBe(200);
     expect(response.body.data.total).toBe(1);
     expect(response.body.data.orders[0].items).toHaveLength(1);
+    expect(response.body.data.orders[0].items[0].variants).toEqual({ Size: 'Large' });
     expect(prisma.businessOrder.findMany).toHaveBeenCalledWith(expect.objectContaining({
       where: { businessProfileId: 'business-1', customerId: 7 },
     }));
