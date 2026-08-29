@@ -10,6 +10,7 @@ describe('transaction quote service', () => {
   test('creates a deterministic conversion snapshot with expiry', () => {
     const now = new Date('2026-08-29T05:00:00.000Z');
     const quote = createTransactionQuote({
+      userId: 42,
       amountGhs: 1500,
       rateGhsPerUsdc: 15,
       feeGhs: 15,
@@ -19,6 +20,7 @@ describe('transaction quote service', () => {
       rateAsOf: now,
     });
 
+    expect(quote.userId).toBe(42);
     expect(quote.amountGhs).toBe(1500);
     expect(quote.feeGhs).toBe(15);
     expect(quote.netGhs).toBe(1485);
@@ -33,6 +35,7 @@ describe('transaction quote service', () => {
   test('rejects an expired quote', () => {
     const now = new Date('2026-08-29T05:00:00.000Z');
     const quote = createTransactionQuote({
+      userId: 42,
       amountGhs: 100,
       rateGhsPerUsdc: 10,
       now,
@@ -42,9 +45,13 @@ describe('transaction quote service', () => {
   });
 
   test('rejects invalid amounts and rates', () => {
-    expect(() => createTransactionQuote({ amountGhs: 0, rateGhsPerUsdc: 10 })).toThrow();
-    expect(() => createTransactionQuote({ amountGhs: 100, rateGhsPerUsdc: 0 })).toThrow();
-    expect(() => createTransactionQuote({ amountGhs: 100, rateGhsPerUsdc: 10, ttlSeconds: 901 })).toThrow();
+    expect(() => createTransactionQuote({ userId: 42, amountGhs: 0, rateGhsPerUsdc: 10 })).toThrow('amountGhs');
+    expect(() => createTransactionQuote({ userId: 42, amountGhs: 100, rateGhsPerUsdc: 0 })).toThrow('rateGhsPerUsdc');
+    expect(() => createTransactionQuote({ userId: 42, amountGhs: 100, rateGhsPerUsdc: 10, ttlSeconds: 901 })).toThrow('ttlSeconds');
+  });
+
+  test('requires quote ownership', () => {
+    expect(() => createTransactionQuote({ amountGhs: 100, rateGhsPerUsdc: 10 })).toThrow('userId is required');
   });
 
   test('rounds money consistently', () => {
