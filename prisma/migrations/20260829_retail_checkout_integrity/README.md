@@ -1,0 +1,1 @@
+This migration is part of the accumulated retail checkout integrity batch. It is intentionally paired with the corresponding Prisma schema and checkout-route changes before verification.
