@@ -20,8 +20,8 @@ router.post('/refresh', refreshController.refresh);
 router.post('/logout', refreshController.logout);
 
 // Business Portal browser sessions keep the rotated refresh token in an
-// HttpOnly cookie. The initial Phase-K refresh token is supplied once by the
-// Business Portal and is never persisted by browser JavaScript afterward.
+// HttpOnly cookie. Browser login never exposes the refresh credential to JS.
+router.post('/business-session/login', validate(loginSchema, 'authList'), businessSessionController.login);
 router.post('/business-session', businessSessionController.bootstrap);
 router.post('/business-session/logout', businessSessionController.logout);
 
