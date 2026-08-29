@@ -147,7 +147,7 @@ describe('storefront checkout integrity boundary', () => {
           id: 'order-1',
           orderRef: 'ORD-1',
           status: 'AWAITING_PAYMENT',
-          idempotencyRequestHash: 'placeholder',
+          idempotencyRequestHash: null,
         }]),
       businessOrder: {
         findUnique: jest.fn().mockResolvedValue({
