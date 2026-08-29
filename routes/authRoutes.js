@@ -13,7 +13,6 @@ const protect = authMiddleware.protect;
 
 router.post('/register', validate(registerSchema, 'authList'), authController.register);
 router.post('/login', validate(loginSchema, 'authList'), authController.login);
-
 router.post('/sso', ssoController.ssoLogin);
 
 // Phase K: refresh-token rotation + logout.
@@ -68,8 +67,6 @@ router.get('/platform/config', generalLimiter, async (req, res) => {
             config: {
                 fiatWithdrawalFeePct: 0.02,
                 cryptoPlatformFeePct: 0.00,
-                cryptoWithdrawalFeePct: 0.01,
-                p2pFeePct: 0.02,
                 cryptoWithdrawalFeePct: 0.01,
                 p2pFeePct: 0.02,
                 tierThreshold: 1000,
