@@ -43,6 +43,128 @@ function parsePositiveInt(value) {
   return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
 }
 
+
+async function loadStaffById(p, staffId) {
+  const rows = await p.$queryRawUnsafe('SELECT * FROM "StaffProfile" WHERE id = $1', staffId);
+  return rows[0] || null;
+}
+
+async function assertStaffLifecycleMutable(req, p, staff, nextStatus) {
+  const actorGlobal = await isGlobalController(req, p);
+  if (staff.isGlobalSuperAdmin && !actorGlobal) {
+    return { ok: false, status: 403, message: 'Only a global super admin may modify a global super-admin profile.' };
+  }
+  if (staff.userId === Number(req.user.id) && ['SUSPENDED', 'INACTIVE'].includes(nextStatus)) {
+    return { ok: false, status: 403, message: 'You cannot suspend or deactivate your own staff profile.' };
+  }
+  return { ok: true };
+}
+
+async function transitionStaffLifecycle(req, res, nextStatus, eventType) {
+  if (!(await authorize(req, 'staff.manage'))) return deny(res, 'staff.manage');
+  const staffId = parsePositiveInt(req.params.id);
+  if (!staffId) return res.status(400).json({ success: false, message: 'Valid staff id is required.' });
+  const reason = cleanText(req.body?.reason);
+  if (['SUSPENDED', 'INACTIVE'].includes(nextStatus) && reason.length < 3) {
+    return res.status(400).json({ success: false, message: 'A reason is required for this staff lifecycle change.' });
+  }
+  if (reason.length > 500) {
+    return res.status(400).json({ success: false, message: 'Reason cannot exceed 500 characters.' });
+  }
+
+  try {
+    const p = prisma(req);
+    const current = await loadStaffById(p, staffId);
+    if (!current) return res.status(404).json({ success: false, message: 'Staff profile not found.' });
+    const mutable = await assertStaffLifecycleMutable(req, p, current, nextStatus);
+    if (!mutable.ok) return res.status(mutable.status).json({ success: false, message: mutable.message });
+
+    const nextPresence = nextStatus === 'ACTIVE' ? current.presence : 'OFFLINE';
+    const rows = await p.$queryRawUnsafe(`
+      UPDATE "StaffProfile"
+      SET status = $2,
+          presence = $3,
+          "lastActiveAt" = CASE WHEN $3 != presence THEN CURRENT_TIMESTAMP ELSE "lastActiveAt" END,
+          "updatedAt" = CURRENT_TIMESTAMP
+      WHERE id = $1
+      RETURNING *
+    `, staffId, nextStatus, nextPresence);
+
+    const actor = await actorProfile(req, p);
+    await recordActivity(p, {
+      staffProfileId: staffId,
+      actorUserId: req.user.id,
+      eventType,
+      targetType: 'STAFF_PROFILE',
+      targetId: staffId,
+      metadata: { beforeStatus: current.status, afterStatus: nextStatus, beforePresence: current.presence, afterPresence: nextPresence, reason: reason || null, actorStaffProfileId: actor?.id || null },
+    });
+    return res.json({ success: true, staff: rows[0] });
+  } catch (err) {
+    req.app.get('logger')?.error?.({ err }, 'control-plane staff lifecycle transition failed');
+    return res.status(500).json({ success: false, message: 'Failed to update staff lifecycle.' });
+  }
+}
+
+
+router.post('/me/presence', async (req, res) => {
+  const presence = String(req.body?.presence || '').toUpperCase();
+  if (!PRESENCE.has(presence)) return res.status(400).json({ success: false, message: 'Invalid presence.' });
+  try {
+    const p = prisma(req);
+    const staff = await actorProfile(req, p);
+    if (!staff) return res.status(403).json({ success: false, message: 'Staff profile is required to update presence.' });
+    if (staff.status !== 'ACTIVE') return res.status(403).json({ success: false, message: 'Inactive or suspended staff cannot update presence.' });
+
+    const rows = await p.$queryRawUnsafe(`
+      UPDATE "StaffProfile"
+      SET presence = $2, "lastActiveAt" = CURRENT_TIMESTAMP, "updatedAt" = CURRENT_TIMESTAMP
+      WHERE id = $1
+      RETURNING *
+    `, Number(staff.id), presence);
+    await recordActivity(p, {
+      staffProfileId: staff.id,
+      actorUserId: req.user.id,
+      eventType: 'STAFF_PRESENCE_UPDATED',
+      targetType: 'STAFF_PROFILE',
+      targetId: staff.id,
+      metadata: { beforePresence: staff.presence, afterPresence: presence },
+    });
+    return res.json({ success: true, staff: rows[0] });
+  } catch (err) {
+    req.app.get('logger')?.error?.({ err }, 'control-plane presence update failed');
+    return res.status(500).json({ success: false, message: 'Failed to update presence.' });
+  }
+});
+
+router.get('/presence', async (req, res) => {
+  if (!(await authorize(req, 'staff.view'))) return deny(res, 'staff.view');
+  try {
+    const rows = await prisma(req).$queryRawUnsafe(`
+      SELECT sp.id, sp."userId", sp.presence, sp."lastActiveAt", sp.status,
+             sp."departmentId", d.name AS "departmentName",
+             u.username, u.email,
+             COUNT(sda.id)::int AS "activeDutyCount"
+      FROM "StaffProfile" sp
+      JOIN "User" u ON u.id = sp."userId"
+      LEFT JOIN "ControlDepartment" d ON d.id = sp."departmentId"
+      LEFT JOIN "StaffDutyAssignment" sda ON sda."staffProfileId" = sp.id AND sda.status = 'ACTIVE'
+      GROUP BY sp.id, d.name, u.username, u.email
+      ORDER BY
+        CASE sp.presence WHEN 'ONLINE' THEN 1 WHEN 'AWAY' THEN 2 ELSE 3 END,
+        sp."lastActiveAt" DESC NULLS LAST
+    `);
+    return res.json({ success: true, presence: rows });
+  } catch (err) {
+    req.app.get('logger')?.error?.({ err }, 'control-plane presence list failed');
+    return res.status(500).json({ success: false, message: 'Failed to load staff presence.' });
+  }
+});
+
+router.post('/staff/:id/suspend', async (req, res) => transitionStaffLifecycle(req, res, 'SUSPENDED', 'STAFF_SUSPENDED'));
+router.post('/staff/:id/activate', async (req, res) => transitionStaffLifecycle(req, res, 'ACTIVE', 'STAFF_ACTIVATED'));
+router.post('/staff/:id/deactivate', async (req, res) => transitionStaffLifecycle(req, res, 'INACTIVE', 'STAFF_DEACTIVATED'));
+
 router.get('/departments', async (req, res) => {
   if (!(await authorize(req, 'staff.view'))) return deny(res, 'staff.view');
   try {
