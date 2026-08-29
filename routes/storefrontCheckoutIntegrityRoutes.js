@@ -141,6 +141,16 @@ function encodeCursor(order) {
   return Buffer.from(JSON.stringify({ createdAt: order.createdAt.toISOString(), id: order.id })).toString('base64url');
 }
 
+function persistenceFailure(res, originalStatus, originalJson, logger, err) {
+  logger?.error?.({ err }, 'Retail checkout confirmation metadata persistence failed');
+  originalStatus(503);
+  return originalJson({
+    success: false,
+    message: 'Checkout completed but confirmation data could not be finalized. Please retry safely.',
+    retryable: true,
+  });
+}
+
 router.post('/:businessProfileId/checkout', protect, protectActive, async (req, res, next) => {
   try {
     const prisma = req.app.get('prisma');
@@ -191,9 +201,13 @@ router.post('/:businessProfileId/checkout', protect, protectActive, async (req, 
         if (existing.idempotencyRequestHash && existing.idempotencyRequestHash !== requestHash) {
           return res.status(409).json({ success: false, message: 'This checkout idempotency key was already used for different cart contents.' });
         }
-        const order = await prisma.businessOrder.findUnique({ where: { id: existing.id }, include: { items: true, escrow: true } });
-        await attachVariantSnapshots(prisma, order);
-        return res.status(200).json({ success: true, data: { order, idempotent: true } });
+        try {
+          const order = await prisma.businessOrder.findUnique({ where: { id: existing.id }, include: { items: true, escrow: true } });
+          await attachVariantSnapshots(prisma, order);
+          return res.status(200).json({ success: true, data: { order, idempotent: true } });
+        } catch (err) {
+          return persistenceFailure(res, res.status.bind(res), res.json.bind(res), req.app.get('logger'), err);
+        }
       }
     }
 
@@ -215,10 +229,14 @@ router.post('/:businessProfileId/checkout', protect, protectActive, async (req, 
               originalStatus(409);
               return originalJson({ success: false, message: 'This checkout idempotency key was already used for different cart contents.' });
             }
-            const order = await prisma.businessOrder.findUnique({ where: { id: existing.id }, include: { items: true, escrow: true } });
-            await attachVariantSnapshots(prisma, order);
-            originalStatus(200);
-            return originalJson({ success: true, data: { order, idempotent: true } });
+            try {
+              const order = await prisma.businessOrder.findUnique({ where: { id: existing.id }, include: { items: true, escrow: true } });
+              await attachVariantSnapshots(prisma, order);
+              originalStatus(200);
+              return originalJson({ success: true, data: { order, idempotent: true } });
+            } catch (err) {
+              return persistenceFailure(res, originalStatus, originalJson, req.app.get('logger'), err);
+            }
           }
         }
 
@@ -247,7 +265,7 @@ router.post('/:businessProfileId/checkout', protect, protectActive, async (req, 
           }
         }
       } catch (err) {
-        req.app.get('logger')?.warn?.({ err }, 'Retail checkout snapshot persistence failed');
+        return persistenceFailure(res, originalStatus, originalJson, req.app.get('logger'), err);
       }
       return originalJson(payload);
     };
@@ -265,28 +283,17 @@ router.get('/me/orders', protect, protectActive, async (req, res, next) => {
     const cursorRaw = req.query.cursor ? String(req.query.cursor) : null;
     const cursor = decodeCursor(cursorRaw);
     if (cursorRaw && !cursor) return res.status(400).json({ success: false, message: 'Invalid order history cursor.' });
-
     const status = req.query.status ? String(req.query.status).trim().toUpperCase() : null;
     if (status && !ORDER_STATUSES.has(status)) return res.status(400).json({ success: false, message: 'Invalid order status filter.' });
 
     const where = {
       customerId: req.user.id,
       ...(status ? { status } : {}),
-      ...(cursor ? {
-        OR: [
-          { createdAt: { lt: cursor.createdAt } },
-          { createdAt: cursor.createdAt, id: { lt: cursor.id } },
-        ],
-      } : {}),
+      ...(cursor ? { OR: [{ createdAt: { lt: cursor.createdAt } }, { createdAt: cursor.createdAt, id: { lt: cursor.id } }] } : {}),
     };
-
     const rows = await prisma.businessOrder.findMany({
       where,
-      include: {
-        items: true,
-        escrow: true,
-        businessProfile: { select: { id: true, businessName: true, category: true, logoUrl: true } },
-      },
+      include: { items: true, escrow: true, businessProfile: { select: { id: true, businessName: true, category: true, logoUrl: true } } },
       orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
       take: take + 1,
     });
@@ -304,12 +311,7 @@ router.get('/me/orders/:orderId', protect, protectActive, async (req, res, next)
     const prisma = req.app.get('prisma');
     const order = await prisma.businessOrder.findFirst({
       where: { id: req.params.orderId, customerId: req.user.id },
-      include: {
-        items: true,
-        escrow: true,
-        ticket: true,
-        businessProfile: { select: { id: true, businessName: true, category: true, logoUrl: true } },
-      },
+      include: { items: true, escrow: true, ticket: true, businessProfile: { select: { id: true, businessName: true, category: true, logoUrl: true } } },
     });
     if (!order) return res.status(404).json({ success: false, message: 'Order not found.' });
     await attachVariantSnapshots(prisma, order);
