@@ -1,6 +1,7 @@
 'use strict';
 
 const crypto = require('crypto');
+const { Prisma } = require('@prisma/client');
 const router = require('express').Router();
 const { protect } = require('../middleware/authMiddleware');
 const { protectActive } = require('../middleware/banGuardMiddleware');
@@ -97,6 +98,43 @@ async function attachVariantSnapshots(prisma, order) {
   const byId = new Map(rows.map(row => [row.id, row.variants ?? {}]));
   order.items = order.items.map(item => ({ ...item, variants: byId.get(item.id) ?? {} }));
   return order;
+}
+
+async function attachVariantSnapshotsToOrders(prisma, orders) {
+  if (!orders.length) return orders;
+  const orderIds = orders.map(order => order.id);
+  const rows = await prisma.$queryRaw`
+    SELECT id, "orderId", variants
+    FROM "BusinessOrderItem"
+    WHERE "orderId" IN (${Prisma.join(orderIds)})
+  `;
+  const byOrder = new Map();
+  for (const row of rows) {
+    if (!byOrder.has(row.orderId)) byOrder.set(row.orderId, new Map());
+    byOrder.get(row.orderId).set(row.id, row.variants ?? {});
+  }
+  for (const order of orders) {
+    const byId = byOrder.get(order.id) || new Map();
+    order.items = (order.items || []).map(item => ({ ...item, variants: byId.get(item.id) ?? {} }));
+  }
+  return orders;
+}
+
+function decodeCursor(raw) {
+  if (!raw) return null;
+  try {
+    const decoded = JSON.parse(Buffer.from(String(raw), 'base64url').toString('utf8'));
+    if (!decoded?.createdAt || !decoded?.id) return null;
+    const createdAt = new Date(decoded.createdAt);
+    if (Number.isNaN(createdAt.getTime())) return null;
+    return { createdAt, id: String(decoded.id) };
+  } catch (_) {
+    return null;
+  }
+}
+
+function encodeCursor(order) {
+  return Buffer.from(JSON.stringify({ createdAt: order.createdAt.toISOString(), id: order.id })).toString('base64url');
 }
 
 // This router intentionally sits before the legacy storefront router. It adds
@@ -234,6 +272,73 @@ router.post('/:businessProfileId/checkout', protect, protectActive, async (req, 
   }
 });
 
+// Canonical customer order-history contract used by the existing frontend
+// StorefrontService: /storefront/me/orders and /storefront/me/orders/:orderId.
+router.get('/me/orders', protect, protectActive, async (req, res, next) => {
+  try {
+    const prisma = req.app.get('prisma');
+    const take = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 50);
+    const cursor = decodeCursor(req.query.cursor);
+    const status = req.query.status ? String(req.query.status).trim().toUpperCase() : null;
+    const where = {
+      customerId: req.user.id,
+      ...(status ? { status } : {}),
+      ...(cursor ? {
+        OR: [
+          { createdAt: { lt: cursor.createdAt } },
+          { createdAt: cursor.createdAt, id: { lt: cursor.id } },
+        ],
+      } : {}),
+    };
+
+    const rows = await prisma.businessOrder.findMany({
+      where,
+      include: {
+        items: true,
+        escrow: true,
+        businessProfile: { select: { id: true, businessName: true, category: true, logoUrl: true } },
+      },
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      take: take + 1,
+    });
+    const hasMore = rows.length > take;
+    const orders = hasMore ? rows.slice(0, take) : rows;
+    await attachVariantSnapshotsToOrders(prisma, orders);
+    return res.json({
+      success: true,
+      data: {
+        orders,
+        hasMore,
+        nextCursor: hasMore ? encodeCursor(orders[orders.length - 1]) : null,
+      },
+    });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+router.get('/me/orders/:orderId', protect, protectActive, async (req, res, next) => {
+  try {
+    const prisma = req.app.get('prisma');
+    const order = await prisma.businessOrder.findFirst({
+      where: { id: req.params.orderId, customerId: req.user.id },
+      include: {
+        items: true,
+        escrow: true,
+        ticket: true,
+        businessProfile: { select: { id: true, businessName: true, category: true, logoUrl: true } },
+      },
+    });
+    if (!order) return res.status(404).json({ success: false, message: 'Order not found.' });
+    await attachVariantSnapshots(prisma, order);
+    return res.json({ success: true, data: { order } });
+  } catch (err) {
+    return next(err);
+  }
+});
+
+// Business-scoped variants of the same history contract are useful to
+// storefronts that already know the business profile ID.
 router.get('/:businessProfileId/orders', protect, protectActive, async (req, res, next) => {
   try {
     const prisma = req.app.get('prisma');
@@ -250,7 +355,7 @@ router.get('/:businessProfileId/orders', protect, protectActive, async (req, res
       }),
       prisma.businessOrder.count({ where: { businessProfileId, customerId: req.user.id } }),
     ]);
-    for (const order of orders) await attachVariantSnapshots(prisma, order);
+    await attachVariantSnapshotsToOrders(prisma, orders);
     return res.json({ success: true, data: { orders, total, hasMore: skip + orders.length < total } });
   } catch (err) {
     return next(err);
