@@ -17,6 +17,13 @@ const PROVIDERS = new Set([
   'AIRTELTIGO',
   'BANK_TRANSFER',
 ]);
+const MOMO_PROVIDERS = new Set(['MTN_MOMO', 'TELECEL_CASH', 'VODAFONE_CASH', 'AIRTELTIGO']);
+const NETWORK_MAP = {
+  MTN_MOMO: 'MTN',
+  TELECEL_CASH: 'TELECEL',
+  VODAFONE_CASH: 'TELECEL',
+  AIRTELTIGO: 'AIRTELTIGO',
+};
 const QUOTE_TTL_SECONDS = 600;
 
 function safeEqual(a, b) {
@@ -50,9 +57,6 @@ exports.initiate = async (req, res) => {
       });
     }
 
-    // Keep quote creation and pending-transaction creation in one DB
-    // transaction. This prevents an orphaned quote when transaction creation
-    // fails after the quote has already been persisted.
     const { quote, tx } = await prisma.$transaction(async (db) => {
       const quote = await createServerTransactionQuote({
         prisma: db,
@@ -112,6 +116,158 @@ exports.initiate = async (req, res) => {
   } catch (error) {
     logger.error({ err: error }, '[quoteFiatDeposit] initiation error');
     return res.status(500).json({ success: false, message: 'Unable to create deposit quote.' });
+  }
+};
+
+exports.initiateMoolre = async (req, res) => {
+  const prisma = req.app.get('prisma');
+  const moolre = req.app.get('moolreCollectionService');
+  if (!moolre) return res.status(503).json({ success: false, message: 'Deposit service unavailable.' });
+
+  try {
+    const { amountGhs, provider, phoneNumber, memo } = req.body;
+    const userId = Number(req.user.id);
+    const ghsFloat = Number(amountGhs);
+
+    if (!Number.isFinite(ghsFloat) || ghsFloat <= 0)
+      return res.status(400).json({ success: false, message: 'Invalid deposit amount.' });
+    if (!MOMO_PROVIDERS.has(provider))
+      return res.status(400).json({ success: false, message: 'Use this endpoint only for MoMo providers.' });
+    if (!phoneNumber || String(phoneNumber).replace(/\D/g, '').length < 9)
+      return res.status(400).json({ success: false, message: 'A valid phone number is required.' });
+
+    const settings = await prisma.globalSettings.findUnique({ where: { id: 1 } });
+    const rate = Number(settings?.liveUsdToGhs);
+    if (!Number.isFinite(rate) || rate <= 0)
+      return res.status(503).json({ success: false, message: 'Exchange rate unavailable. Please retry shortly.' });
+
+    const network = NETWORK_MAP[provider];
+    const quote = require('../src/services/transactionQuoteService').createTransactionQuote({
+      id: crypto.randomUUID(),
+      userId,
+      purpose: 'deposit',
+      amountGhs: ghsFloat,
+      feeGhs: 0,
+      rateGhsPerUsdc: rate,
+      rateSource: settings.liveRateSource || 'AZM_ADMIN_MOCK',
+      rateAsOf: settings.lastRateSync || new Date(),
+      ttlSeconds: QUOTE_TTL_SECONDS,
+    });
+
+    const pending = await prisma.$transaction(async (tx) => {
+      await require('../src/services/transactionQuoteService').persistTransactionQuote(tx, quote);
+      return tx.transactionHistory.create({
+        data: {
+          userId,
+          type: 'DEPOSIT_FIAT',
+          amountUsdc: quote.usdcAmount,
+          txHash: `MOOLRE_DEP_${userId}_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`,
+          status: 'PENDING',
+          initiatedByUserId: userId,
+          metadata: {
+            provider,
+            network,
+            amountGhs: ghsFloat,
+            quoteId: quote.id,
+            quoteAmountUsdc: quote.usdcAmount,
+            quoteExpiresAt: quote.expiresAt,
+            rateAtInitiation: rate,
+            payerPhone: phoneNumber,
+            channel: 'APP',
+            ...(memo ? { memo: String(memo) } : {}),
+          },
+        },
+      });
+    });
+
+    let moolreResult;
+    try {
+      moolreResult = await moolre.initiatePayment({
+        externalRef: pending.txHash,
+        amountGhs: ghsFloat,
+        payerPhone: phoneNumber,
+        network,
+      });
+    } catch (moolreErr) {
+      await prisma.transactionHistory.update({ where: { id: pending.id }, data: { status: 'FAILED' } });
+      logger.error({ err: moolreErr }, '[quoteMoolreDeposit] provider initiation failed');
+      return res.status(502).json({
+        success: false,
+        message: moolreErr.message?.replace(/^\[MoolreCollectionService\]\s*/, '') || 'Payment provider error. Please retry.',
+      });
+    }
+
+    if (moolreResult.providerRef) {
+      await prisma.transactionHistory.update({ where: { id: pending.id }, data: { providerRef: moolreResult.providerRef } });
+    }
+
+    return res.status(201).json({
+      success: true,
+      requiresOtp: moolreResult.requiresOtp,
+      data: {
+        reference: pending.txHash,
+        quoteId: quote.id,
+        status: 'PENDING',
+        amountGhs: quote.amountGhs,
+        quotedRate: quote.rateGhsPerUsdc,
+        usdcAmount: quote.usdcAmount,
+        quoteValidUntil: quote.expiresAt,
+        provider,
+        phoneNumber,
+      },
+    });
+  } catch (err) {
+    logger.error({ err }, '[quoteMoolreDeposit] initiation error');
+    return res.status(500).json({ success: false, message: 'An unexpected error occurred.' });
+  }
+};
+
+exports.confirmMoolreOtp = async (req, res) => {
+  const prisma = req.app.get('prisma');
+  const moolre = req.app.get('moolreCollectionService');
+  if (!moolre) return res.status(503).json({ success: false, message: 'Deposit service unavailable.' });
+
+  try {
+    const { reference, otpCode } = req.body || {};
+    const userId = Number(req.user.id);
+    if (!reference || !otpCode)
+      return res.status(400).json({ success: false, message: 'reference and otpCode are required.' });
+
+    const pending = await prisma.transactionHistory.findUnique({ where: { txHash: reference } });
+    if (!pending || pending.userId !== userId || pending.type !== 'DEPOSIT_FIAT')
+      return res.status(404).json({ success: false, message: 'Deposit not found.' });
+    if (pending.status !== 'PENDING')
+      return res.status(409).json({ success: false, message: `Deposit is already ${pending.status}.` });
+
+    const meta = pending.metadata || {};
+    const quoteId = meta.quoteId;
+    if (!quoteId || !meta.amountGhs || !meta.payerPhone || !meta.network)
+      return res.status(409).json({ success: false, message: 'Deposit is missing its transaction quote.' });
+
+    const moolreResult = await moolre.initiatePayment({
+      externalRef: reference,
+      amountGhs: meta.amountGhs,
+      payerPhone: meta.payerPhone,
+      network: meta.network,
+      otpCode,
+    });
+
+    if (moolreResult.requiresOtp)
+      return res.status(400).json({ success: false, message: 'OTP verification failed. Check the code and retry.' });
+    if (moolreResult.providerRef) {
+      await prisma.transactionHistory.update({
+        where: { id: pending.id, status: 'PENDING' },
+        data: { providerRef: moolreResult.providerRef },
+      });
+    }
+
+    return res.status(200).json({ success: true, requiresOtp: false, data: { reference, quoteId } });
+  } catch (err) {
+    logger.error({ err }, '[quoteMoolreDeposit] OTP confirmation error');
+    return res.status(502).json({
+      success: false,
+      message: err.message?.replace(/^\[MoolreCollectionService\]\s*/, '') || 'Payment provider error. Please retry.',
+    });
   }
 };
 
@@ -276,3 +432,5 @@ exports.webhook = async (req, res) => {
     return res.status(409).json({ success: false, message: error.message });
   }
 };
+
+exports.webhookMoolre = require('./moolreQuoteDepositController').webhook;
