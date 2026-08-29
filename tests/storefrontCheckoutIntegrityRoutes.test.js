@@ -189,7 +189,7 @@ describe('storefront checkout integrity boundary', () => {
         count: jest.fn().mockResolvedValue(1),
       },
       $queryRaw: jest.fn().mockResolvedValue([
-        { id: 'line-1', variants: { Size: 'Large' } },
+        { id: 'line-1', orderId: 'order-1', variants: { Size: 'Large' } },
       ]),
     };
 
@@ -203,6 +203,52 @@ describe('storefront checkout integrity boundary', () => {
     expect(response.body.data.orders[0].items[0].variants).toEqual({ Size: 'Large' });
     expect(prisma.businessOrder.findMany).toHaveBeenCalledWith(expect.objectContaining({
       where: { businessProfileId: 'business-1', customerId: 7 },
+    }));
+  });
+
+  test('supports the existing /me/orders frontend contract with cursor pagination', async () => {
+    const createdAt = new Date('2026-08-29T20:00:00.000Z');
+    const prisma = {
+      businessOrder: {
+        findMany: jest.fn().mockResolvedValue([
+          {
+            id: 'order-1',
+            createdAt,
+            customerId: 7,
+            items: [{ id: 'line-1', productId: 'product-1' }],
+            escrow: null,
+            businessProfile: { id: 'business-1', businessName: 'Store', category: 'RETAIL', logoUrl: null },
+          },
+        ]),
+      },
+      $queryRaw: jest.fn().mockResolvedValue([
+        { id: 'line-1', orderId: 'order-1', variants: { Size: 'Large' } },
+      ]),
+    };
+
+    const response = await request(makeApp(prisma))
+      .get('/api/storefront/me/orders')
+      .query({ limit: 20 });
+
+    expect(response.status).toBe(200);
+    expect(response.body.data.orders[0].businessProfile.businessName).toBe('Store');
+    expect(response.body.data.orders[0].items[0].variants).toEqual({ Size: 'Large' });
+    expect(response.body.data.nextCursor).toBeNull();
+  });
+
+  test('protects order detail from cross-customer access', async () => {
+    const prisma = {
+      businessOrder: {
+        findFirst: jest.fn().mockResolvedValue(null),
+      },
+    };
+
+    const response = await request(makeApp(prisma))
+      .get('/api/storefront/me/orders/order-owned-by-someone-else');
+
+    expect(response.status).toBe(404);
+    expect(prisma.businessOrder.findFirst).toHaveBeenCalledWith(expect.objectContaining({
+      where: { id: 'order-owned-by-someone-else', customerId: 7 },
     }));
   });
 });
