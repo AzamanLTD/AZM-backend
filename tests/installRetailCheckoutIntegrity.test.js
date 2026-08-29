@@ -1,0 +1,32 @@
+const { installRetailCheckoutIntegrity } = require('../infra/install-retail-checkout-integrity');
+
+describe('retail checkout schema convergence', () => {
+  test('applies the full idempotent integrity sequence', async () => {
+    const prisma = {
+      $executeRawUnsafe: jest.fn().mockResolvedValue(0),
+    };
+
+    const result = await installRetailCheckoutIntegrity(prisma);
+
+    expect(result.ok).toBe(true);
+    expect(result.steps).toHaveLength(5);
+    expect(prisma.$executeRawUnsafe).toHaveBeenCalledTimes(5);
+    expect(prisma.$executeRawUnsafe.mock.calls[0][0]).toMatch(
+      /DROP CONSTRAINT IF EXISTS "BusinessOrder_idempotencyKey_key"/,
+    );
+    expect(prisma.$executeRawUnsafe.mock.calls[2][0]).toMatch(
+      /CREATE UNIQUE INDEX IF NOT EXISTS "BusinessOrder_businessProfileId_customerId_idempotencyKey_key"/,
+    );
+    expect(prisma.$executeRawUnsafe.mock.calls[4][0]).toMatch(
+      /BusinessOrderItem.*variants.*JSONB/,
+    );
+  });
+
+  test('surfaces schema convergence failure to the boot coordinator', async () => {
+    const prisma = {
+      $executeRawUnsafe: jest.fn().mockRejectedValue(new Error('database unavailable')),
+    };
+
+    await expect(installRetailCheckoutIntegrity(prisma)).rejects.toThrow('database unavailable');
+  });
+});
