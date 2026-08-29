@@ -3,6 +3,7 @@
 const express = require('express');
 const { z } = require('zod');
 const { createServerTransactionQuote } = require('../services/transactionQuoteService');
+const { protect } = require('../../middleware/authMiddleware');
 
 const router = express.Router();
 
@@ -47,6 +48,6 @@ async function createQuoteHandler(req, res) {
   }
 }
 
-router.post('/', createQuoteHandler);
+router.post('/', protect, createQuoteHandler);
 
 module.exports = router;
