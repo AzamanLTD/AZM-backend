@@ -33,6 +33,127 @@ async function isGlobalController(req, p) {
   return Boolean(profile?.status === 'ACTIVE' && profile?.isGlobalSuperAdmin);
 }
 
+
+function cleanText(value) {
+  return typeof value === 'string' ? value.trim() : '';
+}
+
+function parsePositiveInt(value) {
+  const parsed = Number(value);
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
+}
+
+router.get('/departments', async (req, res) => {
+  if (!(await authorize(req, 'staff.view'))) return deny(res, 'staff.view');
+  try {
+    const rows = await prisma(req).$queryRawUnsafe(`
+      SELECT d.id, d.name, d.description, d."isActive", d."createdAt", d."updatedAt",
+             COUNT(sp.id)::int AS "staffCount"
+      FROM "ControlDepartment" d
+      LEFT JOIN "StaffProfile" sp ON sp."departmentId" = d.id
+      GROUP BY d.id
+      ORDER BY d.name ASC
+    `);
+    return res.json({ success: true, departments: rows });
+  } catch (err) {
+    req.app.get('logger')?.error?.({ err }, 'control-plane department list failed');
+    return res.status(500).json({ success: false, message: 'Failed to load departments.' });
+  }
+});
+
+router.post('/departments', async (req, res) => {
+  if (!(await authorize(req, 'departments.manage'))) return deny(res, 'departments.manage');
+  const name = cleanText(req.body?.name);
+  const description = cleanText(req.body?.description) || null;
+  if (name.length < 2 || name.length > 80) {
+    return res.status(400).json({ success: false, message: 'Department name must be between 2 and 80 characters.' });
+  }
+  if (description && description.length > 500) {
+    return res.status(400).json({ success: false, message: 'Department description cannot exceed 500 characters.' });
+  }
+
+  try {
+    const p = prisma(req);
+    const rows = await p.$queryRawUnsafe(`
+      INSERT INTO "ControlDepartment" (name, description)
+      VALUES ($1, $2)
+      RETURNING *
+    `, name, description);
+    const actor = await actorProfile(req, p);
+    await recordActivity(p, {
+      staffProfileId: actor?.id || null,
+      actorUserId: req.user.id,
+      eventType: 'DEPARTMENT_CREATED',
+      targetType: 'CONTROL_DEPARTMENT',
+      targetId: rows[0].id,
+      metadata: { name, description },
+    });
+    return res.status(201).json({ success: true, department: rows[0] });
+  } catch (err) {
+    if (err?.code === '23505') return res.status(409).json({ success: false, message: 'Department already exists.' });
+    req.app.get('logger')?.error?.({ err }, 'control-plane department create failed');
+    return res.status(500).json({ success: false, message: 'Failed to create department.' });
+  }
+});
+
+router.patch('/departments/:id', async (req, res) => {
+  if (!(await authorize(req, 'departments.manage'))) return deny(res, 'departments.manage');
+  const hasName = Object.prototype.hasOwnProperty.call(req.body || {}, 'name');
+  const hasDescription = Object.prototype.hasOwnProperty.call(req.body || {}, 'description');
+  const hasIsActive = Object.prototype.hasOwnProperty.call(req.body || {}, 'isActive');
+  if (!hasName && !hasDescription && !hasIsActive) {
+    return res.status(400).json({ success: false, message: 'At least one department field is required.' });
+  }
+
+  const name = hasName ? cleanText(req.body.name) : null;
+  const description = hasDescription ? cleanText(req.body.description) || null : null;
+  if (hasIsActive && typeof req.body.isActive !== 'boolean') {
+    return res.status(400).json({ success: false, message: 'isActive must be a boolean.' });
+  }
+  const isActive = hasIsActive ? req.body.isActive : null;
+  if (hasName && (name.length < 2 || name.length > 80)) {
+    return res.status(400).json({ success: false, message: 'Department name must be between 2 and 80 characters.' });
+  }
+  if (description && description.length > 500) {
+    return res.status(400).json({ success: false, message: 'Department description cannot exceed 500 characters.' });
+  }
+
+  try {
+    const departmentId = parsePositiveInt(req.params.id);
+    if (!departmentId) return res.status(400).json({ success: false, message: 'Valid department id is required.' });
+    const p = prisma(req);
+    const currentRows = await p.$queryRawUnsafe('SELECT * FROM "ControlDepartment" WHERE id = $1', departmentId);
+    if (!currentRows[0]) return res.status(404).json({ success: false, message: 'Department not found.' });
+    const rows = await p.$queryRawUnsafe(`
+      UPDATE "ControlDepartment"
+      SET name = CASE WHEN $2::text IS NULL THEN name ELSE $2::text END,
+          description = CASE WHEN $3::boolean THEN $4::text ELSE description END,
+          "isActive" = CASE WHEN $5::boolean IS NULL THEN "isActive" ELSE $5::boolean END,
+          "updatedAt" = CURRENT_TIMESTAMP
+      WHERE id = $1
+      RETURNING *
+    `, departmentId, hasName ? name : null, hasDescription, description, hasIsActive ? isActive : null);
+    const actor = await actorProfile(req, p);
+    await recordActivity(p, {
+      staffProfileId: actor?.id || null,
+      actorUserId: req.user.id,
+      eventType: 'DEPARTMENT_UPDATED',
+      targetType: 'CONTROL_DEPARTMENT',
+      targetId: rows[0].id,
+      metadata: {
+        fields: ['name', 'description', 'isActive'].filter((field) => Object.prototype.hasOwnProperty.call(req.body || {}, field)),
+        before: currentRows[0],
+        after: rows[0],
+      },
+    });
+    return res.json({ success: true, department: rows[0] });
+  } catch (err) {
+    if (err?.code === '23505') return res.status(409).json({ success: false, message: 'Department already exists.' });
+    req.app.get('logger')?.error?.({ err }, 'control-plane department update failed');
+    return res.status(500).json({ success: false, message: 'Failed to update department.' });
+  }
+});
+
 router.get('/staff', async (req, res) => {
   if (!(await authorize(req, 'staff.view'))) return deny(res, 'staff.view');
   try {
