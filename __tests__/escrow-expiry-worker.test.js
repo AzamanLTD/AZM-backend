@@ -8,7 +8,7 @@ const EscrowExpiryWorker = require('../workers/escrowExpiryWorker');
 describe('EscrowExpiryWorker refund convergence', () => {
     afterEach(() => jest.clearAllMocks());
 
-    test('emits escrow_refunded and balance_update only after refund succeeds', async () => {
+    test('emits escrow_refunded and canonical balance convergence only after refund succeeds', async () => {
         const escrow = {
             id: 'escrow-1',
             ticketId: 'ticket-1',
@@ -32,6 +32,7 @@ describe('EscrowExpiryWorker refund convergence', () => {
         const io = {
             to: jest.fn(() => ({ emit })),
         };
+        const emitBalanceUpdate = jest.fn().mockResolvedValue(undefined);
         const prisma = {
             smartEscrow: {
                 findMany: jest.fn().mockResolvedValue([escrow]),
@@ -45,7 +46,7 @@ describe('EscrowExpiryWorker refund convergence', () => {
         };
         escrowService._refundEscrow.mockResolvedValue(refunded);
 
-        const worker = new EscrowExpiryWorker(prisma, io, null);
+        const worker = new EscrowExpiryWorker(prisma, io, null, { emitBalanceUpdate });
         await worker._expireInactiveFunded(new Date('2026-08-30T00:00:00.000Z'));
 
         expect(escrowService._refundEscrow).toHaveBeenCalledWith(prisma, 'escrow-1', 'EXPIRED');
@@ -58,11 +59,8 @@ describe('EscrowExpiryWorker refund convergence', () => {
             status: 'EXPIRED',
             reason: 'EXPIRY',
         }));
-        expect(emit).toHaveBeenCalledWith('balance_update', {
-            userId: 11,
-            escrowId: 'escrow-1',
-            reason: 'escrow_refunded',
-        });
+        expect(emitBalanceUpdate).toHaveBeenCalledWith(11);
+        expect(emit).not.toHaveBeenCalledWith('balance_update', expect.anything());
         expect(prisma.ticket.update).toHaveBeenCalledWith(expect.objectContaining({
             where: { id: 'ticket-1' },
         }));
@@ -78,14 +76,16 @@ describe('EscrowExpiryWorker refund convergence', () => {
         };
         const emit = jest.fn();
         const io = { to: jest.fn(() => ({ emit })) };
+        const emitBalanceUpdate = jest.fn();
         const prisma = {
             smartEscrow: { findMany: jest.fn().mockResolvedValue([escrow]) },
         };
         escrowService._refundEscrow.mockRejectedValue(new Error('ESCROW_ALREADY_FINALIZED'));
 
-        const worker = new EscrowExpiryWorker(prisma, io, null);
+        const worker = new EscrowExpiryWorker(prisma, io, null, { emitBalanceUpdate });
         await worker._expireInactiveFunded(new Date());
 
         expect(emit).not.toHaveBeenCalled();
+        expect(emitBalanceUpdate).not.toHaveBeenCalled();
     });
 });
