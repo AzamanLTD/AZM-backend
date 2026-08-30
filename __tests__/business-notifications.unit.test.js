@@ -25,8 +25,63 @@ describe('BusinessNotification service', () => {
         });
         expect(result.notifications).toEqual(rows.slice(0, 2));
         expect(result.hasMore).toBe(true);
-        expect(result.nextCursor).toBe('n-2');
+        expect(result.nextCursor).toEqual(expect.any(String));
         expect(result.unreadCount).toBe(4);
+    });
+
+    test('pagination cursor advances by createdAt and id without skipping equal-timestamp rows', async () => {
+        const anchorTime = new Date('2026-08-30T12:00:00.000Z');
+        const firstRows = [
+            { id: 'n-3', createdAt: anchorTime },
+            { id: 'n-2', createdAt: anchorTime },
+            { id: 'n-1', createdAt: anchorTime },
+        ];
+        const secondRows = [{ id: 'n-1', createdAt: anchorTime }];
+        const prisma = {
+            businessNotification: {
+                findMany: jest.fn()
+                    .mockResolvedValueOnce(firstRows)
+                    .mockResolvedValueOnce(secondRows),
+                findFirst: jest.fn().mockResolvedValue({ id: 'n-2', createdAt: anchorTime }),
+                count: jest.fn().mockResolvedValue(3),
+            },
+        };
+
+        const first = await notificationService.getNotifications(prisma, 'biz-1', { limit: 2 });
+        const second = await notificationService.getNotifications(prisma, 'biz-1', {
+            limit: 2,
+            cursor: first.nextCursor,
+        });
+
+        expect(first.nextCursor).toEqual(expect.any(String));
+        expect(prisma.businessNotification.findMany).toHaveBeenNthCalledWith(2, expect.objectContaining({
+            where: {
+                AND: [
+                    { businessProfileId: 'biz-1' },
+                    {
+                        OR: [
+                            { createdAt: { lt: anchorTime } },
+                            { createdAt: anchorTime, id: { lt: 'n-2' } },
+                        ],
+                    },
+                ],
+            },
+            orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+        }));
+        expect(second.notifications).toEqual(secondRows);
+    });
+
+    test('rejects a cursor belonging to another business', async () => {
+        const prisma = {
+            businessNotification: {
+                findFirst: jest.fn().mockResolvedValue(null),
+                count: jest.fn().mockResolvedValue(0),
+            },
+        };
+
+        await expect(notificationService.getNotifications(prisma, 'biz-2', {
+            cursor: Buffer.from(JSON.stringify({ createdAt: '2026-08-30T12:00:00.000Z', id: 'foreign' }), 'utf8').toString('base64url'),
+        })).rejects.toThrow('Notification cursor must reference an existing notification.');
     });
 
     test('unreadOnly scopes the page without changing the global unread badge count', async () => {
