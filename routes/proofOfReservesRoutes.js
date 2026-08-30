@@ -1,15 +1,40 @@
 const express = require('express');
 const router = express.Router();
 const authMiddleware = require('../middleware/authMiddleware');
-const porController = require('../controllers/proofOfReservesController');
-
+const legacyController = require('../controllers/proofOfReservesController');
+const integrityService = require('../services/proofOfReservesIntegrityService');
+const logger = require('../src/config/logger');
 const protect = authMiddleware.protect;
-
-// Public endpoints (no auth)
-router.get('/',         porController.getReserveSnapshot);
-router.get('/history',  porController.getReserveHistory);
-
-// Authenticated endpoint
-router.get('/verify',   protect, porController.verifyBalanceInclusion);
-
+const adminOnly = authMiddleware.adminOnly;
+router.get('/', async (req, res) => {
+  try {
+    const snapshot = await integrityService.getLatestSnapshot();
+    if (!snapshot) return res.status(503).json({ success: false, code: 'POR_UNAVAILABLE', message: 'No reserve snapshot available.' });
+    return res.json({ success: true, ...snapshot });
+  } catch (err) {
+    logger.error({ err: err.message }, '[proofOfReserves] latest snapshot failed');
+    return res.status(500).json({ success: false, message: 'Failed to load reserve snapshot.' });
+  }
+});
+router.get('/history', legacyController.getReserveHistory);
+router.post('/refresh', protect, adminOnly, async (req, res) => {
+  try {
+    const { snapshot } = await integrityService.createSnapshot();
+    return res.status(201).json({ success: true, snapshotId: snapshot.id, timestamp: snapshot.createdAt.toISOString(), merkleRoot: snapshot.merkleRoot, isFullyBacked: snapshot.isFullyBacked, totalLiabilities: snapshot.totalLiabilities.toString(), totalReserves: snapshot.totalReserves.toString() });
+  } catch (err) {
+    logger.error({ err: err.message }, '[proofOfReserves] refresh failed');
+    return res.status(500).json({ success: false, message: 'Failed to generate reserve snapshot.' });
+  }
+});
+router.get('/verify', protect, async (req, res) => {
+  try {
+    const result = await integrityService.verifyUser(req.user.id, req.query.snapshotId);
+    if (!result) return res.status(404).json({ success: false, message: 'No snapshot available.' });
+    if (!result.verified) return res.status(409).json({ success: false, data: result });
+    return res.json({ success: true, verified: true, snapshotId: result.snapshot.id, merkleRoot: result.snapshot.merkleRoot, proof: result.proof, snapshotTimestamp: result.snapshot.createdAt.toISOString(), yourBalance: result.yourBalance });
+  } catch (err) {
+    logger.error({ err: err.message }, '[proofOfReserves] verification failed');
+    return res.status(500).json({ success: false, message: 'Verification failed.' });
+  }
+});
 module.exports = router;

@@ -31,80 +31,53 @@ async function startWorkers(app, {
 }) {
     const logger = require('../../src/config/logger');
     const IS_TEST_ENV = process.env.NODE_ENV === 'test';
-
-    // ── Initialise the distributed scheduler ──────────────────────────────
     const { getScheduler } = require('../../src/lib/bullScheduler');
     const scheduler = getScheduler();
     await scheduler.init();
     app.set('scheduler', scheduler);
-
-    // Helper: register a worker's tick handler with the scheduler
     const register = async (name, schedule, handler, opts) => {
         if (IS_TEST_ENV) return;
         await scheduler.register(name, schedule, handler, opts);
     };
 
-    // ── Instantiate workers (constructors are side-effect free) ──────────
     const TradeWorker = require('../../workers/tradeWorker');
     const tradeWorker = new TradeWorker(prisma, io, tradeSocketService);
-
     const LeaderboardWorker = require('../../workers/leaderboardWorker');
     const leaderboardWorker = new LeaderboardWorker(prisma, io);
-
     const AnalyticsWorker = require('../../workers/analyticsWorker');
     const analyticsWorker = new AnalyticsWorker(prisma, app);
-
     const CfoWorker = require('../../workers/cfoWorker');
     const cfoWorker = new CfoWorker(prisma, io);
-
     const SavingsWorker = require('../../workers/savingsWorker');
     const savingsWorker = new SavingsWorker(prisma, io);
-
     const WithdrawalReconciliationWorker = require('../../workers/withdrawalReconciliationWorker');
-    const withdrawalReconciliationWorker =
-        new WithdrawalReconciliationWorker(prisma, io, paymentFailoverService || mtnDisbursementService, emailService, smsService);
+    const withdrawalReconciliationWorker = new WithdrawalReconciliationWorker(prisma, io, paymentFailoverService || mtnDisbursementService, emailService, smsService);
 
-    // ── Payout Batch Worker (Phase Q8) ─────────────────────────────────────
     const PayoutBatchWorker = require('../../workers/payoutBatchWorker');
     const payoutBatchWorker = new PayoutBatchWorker(prisma, io, paymentFailoverService || mtnDisbursementService, notificationService);
     app.set('payoutBatchWorker', payoutBatchWorker);
 
-    // ── Smart Escrow Expiry Worker ─────────────────────────────────────────
     const EscrowExpiryWorker = require('../../workers/escrowExpiryWorker');
     const escrowExpiryWorker = new EscrowExpiryWorker(prisma, io, notificationService);
     app.set('escrowExpiryWorker', escrowExpiryWorker);
 
-    // ── Master Sprint Workers ──────────────────────────────────────────────
     const VaultWorker = require('../../workers/vaultWorker');
     const vaultWorker = new VaultWorker(prisma, vaultService, notificationService);
-
     const SusuWorker = require('../../workers/susuWorker');
     const susuWorker = new SusuWorker(prisma, susuService);
-
     const SmartRouteWorker = require('../../workers/smartRouteWorker');
     const smartRouteWorker = new SmartRouteWorker(prisma, smartRouteService);
-
     const AzmAuctionWorker = require('../../workers/azmAuctionWorker');
     const azmAuctionWorker = new AzmAuctionWorker(prisma, azmAuctionService);
 
-    // ── On-Chain Sweep Worker (Phase 2: Scalability & Security) ─────────────
-    // Periodically consolidates USDC from individual user deposit addresses
-    // into the platform treasury wallet on Polygon. No-op in MOCK mode.
     const OnchainSweepWorker = require('../../workers/onchainSweepWorker');
     const onchainSweepWorker = new OnchainSweepWorker(prisma, null);
-
-    // ── Disappearing Message Worker (Phase 2) ──────────────────────────────
-    // Hard-deletes expired messages (expiresAt < now) from all chat tables.
     const DisappearingMessageWorker = require('../../workers/disappearingMessageWorker');
     const disappearingMessageWorker = new DisappearingMessageWorker(prisma);
 
-    // ── Register all workers with the scheduler ───────────────────────────
-    // Cron-based workers (use cron expressions)
     await register('leaderboard',        '0 0 * * 0',   () => leaderboardWorker.computeWeeklyLeaderboard());
     await register('analytics',         '0 * * * *',    () => analyticsWorker.aggregateDailySnapshot());
     await register('cfo',               '0 * * * *',    () => cfoWorker.runCfoCycle());
-
-    // Interval-based workers (use millisecond intervals)
     await register('savings',           String(60 * 60 * 1000),       () => savingsWorker._checkReminders());
     await register('withdrawal-recon',  String(5 * 60 * 1000),        () => withdrawalReconciliationWorker._tick());
     await register('payout-batch',      String(2 * 60 * 1000),        () => payoutBatchWorker._tick());
@@ -114,11 +87,14 @@ async function startWorkers(app, {
     await register('smart-route',       String(60 * 1000),            () => smartRouteWorker._tick());
     await register('azm-auction',       String(5 * 60 * 1000),        () => azmAuctionWorker._tick());
     await register('onchain-sweep',     String(60 * 60 * 1000),        () => onchainSweepWorker._tick());
-    await register('disappearing-msg',   String(60 * 1000),              () => disappearingMessageWorker._tick());
+    await register('disappearing-msg',  String(60 * 1000),             () => disappearingMessageWorker._tick());
 
-    // ── Marketplace cron schedules ───────────────────────────────────────
+    // Financial truth: immutable reserve/liability commitment once per hour.
+    const proofOfReservesWorker = require('../../workers/proofOfReservesWorker');
+    await register('proof-of-reserves', String(60 * 60 * 1000), () => proofOfReservesWorker.run());
+
     const noShowWorker = require('../../workers/reservationNoShowWorker');
-    await register('no-show-sweep',     '0 * * * *',   async () => {
+    await register('no-show-sweep', '0 * * * *', async () => {
         const results = await noShowWorker.sweepAll(prisma);
         logger.info({ results }, 'NoShowWorker: sweep complete');
     });
@@ -126,37 +102,27 @@ async function startWorkers(app, {
     const { sweepTransitReminders } = require('../../workers/transitReminderWorker');
     const { sweepExpiredAds } = require('../../workers/businessAdExpiryWorker');
     await register('transit-reminders', '*/15 * * * *', () => sweepTransitReminders(prisma));
-    await register('expired-ads',        '*/30 * * * *', () => sweepExpiredAds(prisma));
+    await register('expired-ads', '*/30 * * * *', () => sweepExpiredAds(prisma));
 
-    // Transit booking expiry — auto-cancel PENDING bookings older than 15 min
     const TransitBookingExpiryWorker = require('../../workers/transitBookingExpiryWorker');
     const transitBookingExpiryWorker = new TransitBookingExpiryWorker(prisma, io, notificationService);
     await register('transit-booking-expiry', String(5 * 60 * 1000), () => transitBookingExpiryWorker._tick());
 
-    // Webhook retry queue — process stuck RETRYING deliveries every 2 min
     const webhookDispatcher = require('../../services/webhookDispatcher');
-    await register('webhook-retry',     '*/2 * * * *',  async () => {
+    await register('webhook-retry', '*/2 * * * *', async () => {
         const count = await webhookDispatcher.processRetryQueue();
         if (count > 0) logger.info({ count }, 'WebhookRetry: processed stuck deliveries');
     });
-
-    // Phase 4: Business webhook delivery retry (exponential backoff)
     const webhookController = require('../../controllers/webhookController');
     await register('webhook-delivery-retry', '*/2 * * * *', async () => {
         await webhookController.processRetries(prisma);
     });
 
-    // ── Phase 3 (private-susu-ecosystem) workers ──────────────────────────
-    // V2 cycle scheduler (60s cadence) handles SusuGroups with contractVersion.
-    // Reminder cron + PoR expiry sweep complete the Phase 3 surface.
     if (!IS_TEST_ENV) {
-        const SusuCycleService          = require('../../services/susu/susuCycle.service');
-        const SusuCycleSchedulerV2      = require('../../workers/susuCycleSchedulerV2');
-        const SusuReminderCron          = require('../../workers/susuReminderCron');
-        const PorExpirySweep            = require('../../workers/porExpirySweep');
-
-        // Wait until the treasury cache has resolved before instantiating the
-        // cycle service — it depends on azamanTreasuryUserId.
+        const SusuCycleService = require('../../services/susu/susuCycle.service');
+        const SusuCycleSchedulerV2 = require('../../workers/susuCycleSchedulerV2');
+        const SusuReminderCron = require('../../workers/susuReminderCron');
+        const PorExpirySweep = require('../../workers/porExpirySweep');
         const startV2Workers = async () => {
             const start = Date.now();
             const MAX_WAIT_MS = 30 * 60 * 1000;
@@ -169,41 +135,33 @@ async function startWorkers(app, {
                 return;
             }
             const susuCycleService = new SusuCycleService(prisma, {
-                susuVouchService:    app.get('susuVouchService'),
-                susuMemberService:   app.get('susuMemberService'),
+                susuVouchService: app.get('susuVouchService'),
+                susuMemberService: app.get('susuMemberService'),
                 adminWarRoomService: app.get('adminWarRoomService'),
                 notificationService,
                 io,
                 treasuryUserId,
             });
             app.set('susuCycleService', susuCycleService);
-
             const cycleSchedulerV2 = new SusuCycleSchedulerV2(prisma, susuCycleService);
             const reminderCron = new SusuReminderCron(prisma, notificationService);
             const porExpirySweep = new PorExpirySweep(prisma, app.get('susuMemberService'), notificationService);
-
-            // Register with scheduler instead of calling .start() directly
-            await scheduler.register('susu-cycle-v2',   String(60 * 1000), () => cycleSchedulerV2._tick());
-            await scheduler.register('susu-reminder',    String(5 * 60 * 1000), () => reminderCron._tick());
-            await scheduler.register('por-expiry',       String(60 * 1000), () => porExpirySweep._tick());
-
+            await scheduler.register('susu-cycle-v2', String(60 * 1000), () => cycleSchedulerV2._tick());
+            await scheduler.register('susu-reminder', String(5 * 60 * 1000), () => reminderCron._tick());
+            await scheduler.register('por-expiry', String(60 * 1000), () => porExpirySweep._tick());
             app.set('susuCycleSchedulerV2', cycleSchedulerV2);
             app.set('susuReminderCron', reminderCron);
             app.set('porExpirySweep', porExpirySweep);
-
             logger.info('[SusuV2] Workers registered with distributed scheduler');
         };
         startV2Workers().catch(err => logger.error({ err }, 'SusuV2 workers startup error'));
 
-        // Susu initiation countdown sweep (every 60s) — independent of treasury
         const SusuInitiationSweep = require('../../workers/susuInitiationSweep');
         const susuInitiationSweep = new SusuInitiationSweep(prisma, susuInitiationService);
         await scheduler.register('susu-initiation', String(60 * 1000), () => susuInitiationSweep._tick());
         app.set('susuInitiationSweep', susuInitiationSweep);
     }
 
-    // ── Graceful shutdown wiring ───────────────────────────────────────────
-    // Close all BullMQ workers + queues on process exit.
     if (!IS_TEST_ENV) {
         const gracefulShutdown = async () => {
             await scheduler.closeAll();
@@ -213,10 +171,6 @@ async function startWorkers(app, {
         process.on('SIGINT', gracefulShutdown);
     }
 
-    // ── D-05: record worker liveness for GET /health ──────────────────────
-    // tradeWorker is special: instantiated here but only .start()'d in the
-    // server.listen callback. Seeded as 'pending_listen', flipped to 'running'
-    // from that callback.
     Object.assign(workerStatus, {
         leaderboardWorker: IS_TEST_ENV ? 'disabled_in_test' : 'running',
         analyticsWorker: IS_TEST_ENV ? 'disabled_in_test' : 'running',
@@ -230,6 +184,7 @@ async function startWorkers(app, {
         azmAuctionWorker: IS_TEST_ENV ? 'disabled_in_test' : 'running',
         onchainSweepWorker: IS_TEST_ENV ? 'disabled_in_test' : 'running',
         disappearingMessageWorker: IS_TEST_ENV ? 'disabled_in_test' : 'running',
+        proofOfReservesWorker: IS_TEST_ENV ? 'disabled_in_test' : 'running',
         tradeWorker: IS_TEST_ENV ? 'disabled_in_test' : 'pending_listen',
     });
 
