@@ -53,6 +53,100 @@ router.get('/exceptions', async (req, res) => {
   }
 });
 
+router.post('/exceptions/:id/claim', async (req, res) => {
+  if (!(await authorize(req, 'staff.manage'))) return deny(res, 'staff.manage');
+
+  try {
+    const p = prisma(req);
+    const actor = await getStaffProfile(p, Number(req.user.id));
+    if (!actor) return res.status(403).json({ success: false, message: 'Staff profile is required.' });
+
+    const rows = await p.$queryRawUnsafe(`
+      UPDATE "ReconciliationException"
+      SET "details" = COALESCE("details", '{}'::jsonb) || jsonb_build_object(
+            'claim', jsonb_build_object(
+              'staffProfileId', $2::int,
+              'actorUserId', $3::int,
+              'claimedAt', CURRENT_TIMESTAMP,
+              'expiresAt', CURRENT_TIMESTAMP + INTERVAL '15 minutes'
+            )
+          ),
+          "lastSeenAt" = CURRENT_TIMESTAMP
+      WHERE "id" = $1
+        AND "status" = 'OPEN'
+        AND (
+          "details"->'claim' IS NULL
+          OR ("details"->'claim'->>'expiresAt')::timestamptz <= CURRENT_TIMESTAMP
+          OR ("details"->'claim'->>'actorUserId')::int = $3
+        )
+      RETURNING "id", "entityType", "entityId", "reference", "reason", "status", "details", "firstSeenAt", "lastSeenAt"
+    `, String(req.params.id), actor.id, Number(req.user.id));
+
+    if (!rows[0]) {
+      const existing = await p.$queryRawUnsafe(`
+        SELECT "id", "status", "details" FROM "ReconciliationException" WHERE "id" = $1
+      `, String(req.params.id));
+      if (!existing[0]) return res.status(404).json({ success: false, message: 'Reconciliation exception not found.' });
+      if (existing[0].status !== 'OPEN') return res.status(409).json({ success: false, message: 'Only open reconciliation exceptions can be claimed.' });
+      return res.status(409).json({ success: false, message: 'Reconciliation exception is currently claimed by another operator.' });
+    }
+
+    await recordActivity(p, {
+      staffProfileId: actor.id,
+      actorUserId: req.user.id,
+      eventType: 'RECONCILIATION_EXCEPTION_CLAIMED',
+      targetType: 'RECONCILIATION_EXCEPTION',
+      targetId: rows[0].id,
+      metadata: { entityType: rows[0].entityType, entityId: rows[0].entityId, leaseMinutes: 15 },
+    });
+
+    return res.json({ success: true, exception: rows[0] });
+  } catch (err) {
+    req.app.get('logger')?.error?.({ err }, 'admin reconciliation exception claim failed');
+    return res.status(500).json({ success: false, message: 'Failed to claim reconciliation exception.' });
+  }
+});
+
+router.post('/exceptions/:id/release', async (req, res) => {
+  if (!(await authorize(req, 'staff.manage'))) return deny(res, 'staff.manage');
+
+  try {
+    const p = prisma(req);
+    const actor = await getStaffProfile(p, Number(req.user.id));
+    if (!actor) return res.status(403).json({ success: false, message: 'Staff profile is required.' });
+
+    const rows = await p.$queryRawUnsafe(`
+      UPDATE "ReconciliationException"
+      SET "details" = COALESCE("details", '{}'::jsonb) - 'claim',
+          "lastSeenAt" = CURRENT_TIMESTAMP
+      WHERE "id" = $1
+        AND "status" = 'OPEN'
+        AND (
+          "details"->'claim' IS NULL
+          OR ("details"->'claim'->>'actorUserId')::int = $2
+          OR ("details"->'claim'->>'expiresAt')::timestamptz <= CURRENT_TIMESTAMP
+        )
+      RETURNING "id", "entityType", "entityId", "reference", "reason", "status", "details", "firstSeenAt", "lastSeenAt"
+    `, String(req.params.id), Number(req.user.id));
+
+    if (!rows[0]) return res.status(409).json({ success: false, message: 'Exception is claimed by another active operator.' });
+
+    await recordActivity(p, {
+      staffProfileId: actor.id,
+      actorUserId: req.user.id,
+      eventType: 'RECONCILIATION_EXCEPTION_RELEASED',
+      targetType: 'RECONCILIATION_EXCEPTION',
+      targetId: rows[0].id,
+      metadata: { entityType: rows[0].entityType, entityId: rows[0].entityId },
+    });
+
+    return res.json({ success: true, exception: rows[0] });
+  } catch (err) {
+    req.app.get('logger')?.error?.({ err }, 'admin reconciliation exception release failed');
+    return res.status(500).json({ success: false, message: 'Failed to release reconciliation exception.' });
+  }
+});
+
 router.post('/exceptions/:id/resolve', async (req, res) => {
   if (!(await authorize(req, 'staff.manage'))) return deny(res, 'staff.manage');
   const reason = typeof req.body?.reason === 'string' ? req.body.reason.trim() : '';
@@ -66,11 +160,16 @@ router.post('/exceptions/:id/resolve', async (req, res) => {
       UPDATE "ReconciliationException"
       SET "status" = 'RESOLVED', "resolvedAt" = CURRENT_TIMESTAMP, "resolvedBy" = $2,
           "lastSeenAt" = CURRENT_TIMESTAMP,
-          "details" = COALESCE("details", '{}'::jsonb) || jsonb_build_object('resolutionReason', $3::text)
+          "details" = (COALESCE("details", '{}'::jsonb) || jsonb_build_object('resolutionReason', $3::text)) - 'claim'
       WHERE "id" = $1 AND "status" = 'OPEN'
+        AND (
+          "details"->'claim' IS NULL
+          OR ("details"->'claim'->>'actorUserId')::int = $2
+          OR ("details"->'claim'->>'expiresAt')::timestamptz <= CURRENT_TIMESTAMP
+        )
       RETURNING "id", "entityType", "entityId", "reference", "reason", "status", "details", "firstSeenAt", "lastSeenAt", "resolvedAt", "resolvedBy"
     `, String(req.params.id), Number(req.user.id), reason);
-    if (!rows[0]) return res.status(404).json({ success: false, message: 'Open reconciliation exception not found.' });
+    if (!rows[0]) return res.status(409).json({ success: false, message: 'Exception is claimed by another active operator or is no longer open.' });
     await recordActivity(p, {
       staffProfileId: actor.id,
       actorUserId: req.user.id,
