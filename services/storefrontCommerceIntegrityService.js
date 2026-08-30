@@ -1,0 +1,82 @@
+'use strict';
+
+const crypto = require('crypto');
+
+const MAX_IDEMPOTENCY_KEY_LENGTH = 128;
+
+/**
+ * Normalize a client-supplied idempotency key without changing its identity.
+ * Empty/whitespace-only values are treated as absent.
+ */
+function normalizeIdempotencyKey(value) {
+  if (value == null) return null;
+  const key = String(value).trim();
+  if (!key) return null;
+  if (key.length > MAX_IDEMPOTENCY_KEY_LENGTH) {
+    const error = new Error(`idempotencyKey must be ${MAX_IDEMPOTENCY_KEY_LENGTH} characters or fewer.`);
+    error.statusCode = 400;
+    throw error;
+  }
+  return key;
+}
+
+function normalizeText(value, maxLength = 500) {
+  if (value == null) return null;
+  const text = String(value).trim();
+  return text ? text.slice(0, maxLength) : null;
+}
+
+function normalizeQuantity(value) {
+  const quantity = parseInt(value, 10);
+  return Number.isFinite(quantity) && quantity > 0 ? quantity : 1;
+}
+
+/**
+ * Build a canonical representation of the economic intent sent to storefront
+ * checkout. Product ordering is normalized because cart ordering has no
+ * economic meaning; product, quantity and notes do.
+ */
+function canonicalizeCheckoutIntent({
+  businessProfileId,
+  customerId,
+  items,
+  customerNotes,
+  deliveryNotes,
+  paymentMode,
+}) {
+  const canonicalItems = (Array.isArray(items) ? items : [])
+    .map(item => ({
+      productId: String(item?.productId || '').trim(),
+      quantity: normalizeQuantity(item?.quantity),
+      notes: normalizeText(item?.notes),
+    }))
+    .sort((a, b) => {
+      const productCompare = a.productId.localeCompare(b.productId);
+      if (productCompare !== 0) return productCompare;
+      const quantityCompare = a.quantity - b.quantity;
+      if (quantityCompare !== 0) return quantityCompare;
+      return (a.notes || '').localeCompare(b.notes || '');
+    });
+
+  return {
+    businessProfileId: String(businessProfileId || '').trim(),
+    customerId: String(customerId || '').trim(),
+    items: canonicalItems,
+    customerNotes: normalizeText(customerNotes),
+    deliveryNotes: normalizeText(deliveryNotes),
+    paymentMode: String(paymentMode || 'DIRECT').trim().toUpperCase(),
+  };
+}
+
+function fingerprintCheckoutIntent(input) {
+  const canonical = canonicalizeCheckoutIntent(input);
+  const serialized = JSON.stringify(canonical);
+  return crypto.createHash('sha256').update(serialized, 'utf8').digest('hex');
+}
+
+module.exports = {
+  MAX_IDEMPOTENCY_KEY_LENGTH,
+  normalizeIdempotencyKey,
+  canonicalizeCheckoutIntent,
+  fingerprintCheckoutIntent,
+};
