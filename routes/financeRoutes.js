@@ -8,6 +8,7 @@ const logger = require('../src/config/logger');
 const express                  = require('express');
 const router                   = express.Router();
 const financeController        = require('../controllers/finance.controller');
+const fiatSettlementWebhook    = require('../controllers/fiatSettlementWebhook.controller');
 const { adminOnly }            = require('../middleware/authMiddleware');
 const { protect }              = require('../middleware/authMiddleware');
 const { protectActive }        = require('../middleware/banGuardMiddleware');
@@ -23,18 +24,17 @@ router.post(
     financeController.liquidateProfits
 );
 
-// Webhook endpoints (no auth — external providers; idempotency via txHash)
-router.post('/webhook/deposit',          financeController.cryptoDepositWebhook);
-// MTN MoMo settlement webhook (fallback off-ramp — kept active alongside Moolre).
-router.post('/webhook/mtn-disbursement', financeController.mtnDisbursementWebhook);
-// Moolre settlement webhook (primary off-ramp). Shared-secret guarded via
-// X-Moolre-Webhook-Secret. Same idempotent PENDING/SUCCESSFUL/FAILED semantics
-// as the MTN webhook. Point your Moolre dashboard callback URL here.
-router.post('/webhook/moolre-disbursement', financeController.moolreDisbursementWebhook);
+// Webhook endpoints (no auth — external providers).
+router.post('/webhook/deposit', financeController.cryptoDepositWebhook);
+
+// Provider settlement callbacks are deliberately routed through the dedicated
+// adapter. The old controller handlers remain available for compatibility, but
+// are no longer the production route: callbacks now transition the canonical
+// TransactionHistory row immediately and emit one normalized realtime contract.
+router.post('/webhook/mtn-disbursement', fiatSettlementWebhook.mtnDisbursementWebhook);
+router.post('/webhook/moolre-disbursement', fiatSettlementWebhook.moolreDisbursementWebhook);
 
 // Phase C: Tatum Polygon deposit webhook (canonical V2 path)
-// Tatum POSTs here when USDC lands on a user's derived Polygon address.
-// HMAC-verified via x-payload-hash header + TATUM_WEBHOOK_SECRET.
 const depositController = require('../controllers/depositController');
 router.post('/webhook/tatum', depositController.tatumCryptoWebhook);
 
