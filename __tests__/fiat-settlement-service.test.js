@@ -74,7 +74,7 @@ describe('fiatSettlementService', () => {
         expect(financeService.reverseFiatWithdrawal).not.toHaveBeenCalled();
     });
 
-    test('delegates a still-PENDING provider failure to the existing atomic reversal path', async () => {
+    test('delegates a still-PENDING provider failure to the existing atomic reversal path and preserves provider reference', async () => {
         const pending = {
             txHash: 'ref-3',
             userId: 13,
@@ -82,7 +82,11 @@ describe('fiatSettlementService', () => {
             status: 'PENDING',
             providerRef: null
         };
-        const failed = { ...pending, status: 'FAILED', providerRef: 'moolre-fail-3' };
+        // The reversal owns the financial refund. Provider reference enrichment
+        // belongs to the settlement boundary and happens only after the row is
+        // terminal, so the test models the intermediate post-reversal state.
+        const reversedWithoutProviderRef = { ...pending, status: 'FAILED', providerRef: null };
+        const failedWithProviderRef = { ...pending, status: 'FAILED', providerRef: 'moolre-fail-3' };
         financeService.reverseFiatWithdrawal.mockResolvedValue({
             alreadyReversed: false,
             userId: 13,
@@ -93,10 +97,9 @@ describe('fiatSettlementService', () => {
             transactionHistory: {
                 findUnique: jest.fn()
                     .mockResolvedValueOnce(pending)
-                    .mockResolvedValueOnce(failed)
-                    .mockResolvedValueOnce(failed),
+                    .mockResolvedValueOnce(reversedWithoutProviderRef),
                 updateMany: jest.fn(),
-                update: jest.fn()
+                update: jest.fn().mockResolvedValue(failedWithProviderRef)
             }
         };
 
