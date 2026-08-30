@@ -1,4 +1,10 @@
-const { merkleRootFromHashes, merkleProofFromHashes, verifyMerkleProof, sha256 } = require('../services/proofOfReservesIntegrityService');
+const {
+  merkleRootFromHashes,
+  merkleProofFromHashes,
+  verifyMerkleProof,
+  calculateReserveCoverage,
+  sha256,
+} = require('../services/proofOfReservesIntegrityService');
 
 describe('Proof-of-reserves Merkle integrity', () => {
   test('root is deterministic and duplicates the odd leaf consistently', () => {
@@ -26,5 +32,17 @@ describe('Proof-of-reserves Merkle integrity', () => {
     const proofForUser3 = merkleProofFromHashes(hashes, 2);
     expect(verifyMerkleProof(hashes[1], proofForUser2, root)).toBe(true);
     expect(verifyMerkleProof(hashes[1], proofForUser3, root)).toBe(false);
+  });
+
+  test('fiat liquidity is never counted as USDT reserve backing', () => {
+    const result = calculateReserveCoverage({
+      systemCrypto: 60,
+      hotWallet: 40,
+      fiatPool: 1000,
+      liabilities: 200,
+    });
+    expect(result.totalReserves).toBe(100);
+    expect(result.reserveRatio).toBe(0.5);
+    expect(result.fiatPool).toBe(1000);
   });
 });
