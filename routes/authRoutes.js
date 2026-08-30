@@ -5,6 +5,7 @@ const authController = require('../controllers/authController');
 const ssoController = require('../controllers/ssoController');
 const refreshController = require('../controllers/refreshController');
 const businessSessionController = require('../controllers/businessSessionController');
+const adminSessionController = require('../controllers/adminSessionController');
 const authMiddleware = require('../middleware/authMiddleware.js');
 const { validate } = require('../middleware/validate');
 const { registerSchema, loginSchema } = require('../services/validation/authSchemas');
@@ -24,6 +25,13 @@ router.post('/logout', refreshController.logout);
 router.post('/business-session/login', validate(loginSchema, 'authList'), businessSessionController.login);
 router.post('/business-session', businessSessionController.bootstrap);
 router.post('/business-session/logout', businessSessionController.logout);
+
+// Admin Portal browser sessions use a separate cookie namespace and enforce
+// ADMIN at the session boundary. This prevents a vendor/customer refresh token
+// from being accepted by an administrative browser session.
+router.post('/admin-session/login', validate(loginSchema, 'authList'), adminSessionController.login);
+router.post('/admin-session', adminSessionController.bootstrap);
+router.post('/admin-session/logout', adminSessionController.logout);
 
 router.get('/settings/rates', authController.getPublicRates);
 
@@ -69,7 +77,6 @@ router.get('/platform/config', generalLimiter, async (req, res) => {
                 cryptoPlatformFeePct: 0.00,
                 cryptoWithdrawalFeePct: 0.01,
                 p2pFeePct: 0.02,
-                tierThreshold: 1000,
                 vendorShareUnder1k: 0.40,
                 vendorShareOver1k: 0.50,
                 bankMargin: 0.03,
