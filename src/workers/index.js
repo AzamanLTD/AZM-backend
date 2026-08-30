@@ -3,15 +3,10 @@
  * distributed scheduler.
  *
  * When REDIS_URL is set, BullMQ guarantees each scheduled tick fires on
- * exactly ONE server instance (Redis-backed distributed locking). When
- * REDIS_URL is absent, the scheduler falls back to in-process timers /
- * node-cron — identical to the pre-BullMQ behavior.
+ * exactly ONE server instance. When REDIS_URL is absent, the scheduler
+ * falls back to its local timer implementation.
  *
  * Workers are NOT started in test mode (NODE_ENV === 'test').
- *
- * @param {import('express').Express} app  - Express app (for app.set/get)
- * @param {object} deps                  - All service/dependency instances
- * @returns {{ tradeWorker, withdrawalReconciliationWorker }}
  */
 async function startWorkers(app, {
     prisma,
@@ -51,7 +46,13 @@ async function startWorkers(app, {
     const SavingsWorker = require('../../workers/savingsWorker');
     const savingsWorker = new SavingsWorker(prisma, io);
     const WithdrawalReconciliationWorker = require('../../workers/withdrawalReconciliationWorker');
-    const withdrawalReconciliationWorker = new WithdrawalReconciliationWorker(prisma, io, paymentFailoverService || mtnDisbursementService, emailService, smsService);
+    const withdrawalReconciliationWorker = new WithdrawalReconciliationWorker(
+        prisma,
+        io,
+        paymentFailoverService || mtnDisbursementService,
+        emailService,
+        smsService
+    );
 
     const PayoutBatchWorker = require('../../workers/payoutBatchWorker');
     const payoutBatchWorker = new PayoutBatchWorker(prisma, io, paymentFailoverService || mtnDisbursementService, notificationService);
@@ -69,27 +70,27 @@ async function startWorkers(app, {
     const smartRouteWorker = new SmartRouteWorker(prisma, smartRouteService);
     const AzmAuctionWorker = require('../../workers/azmAuctionWorker');
     const azmAuctionWorker = new AzmAuctionWorker(prisma, azmAuctionService);
-
     const OnchainSweepWorker = require('../../workers/onchainSweepWorker');
     const onchainSweepWorker = new OnchainSweepWorker(prisma, null);
     const DisappearingMessageWorker = require('../../workers/disappearingMessageWorker');
     const disappearingMessageWorker = new DisappearingMessageWorker(prisma);
 
-    await register('leaderboard',        '0 0 * * 0',   () => leaderboardWorker.computeWeeklyLeaderboard());
-    await register('analytics',         '0 * * * *',    () => analyticsWorker.aggregateDailySnapshot());
-    await register('cfo',               '0 * * * *',    () => cfoWorker.runCfoCycle());
-    await register('savings',           String(60 * 60 * 1000),       () => savingsWorker._checkReminders());
-    await register('withdrawal-recon',  String(5 * 60 * 1000),        () => withdrawalReconciliationWorker._tick());
-    await register('payout-batch',      String(2 * 60 * 1000),        () => payoutBatchWorker._tick());
-    await register('escrow-expiry',     String(30 * 60 * 1000),       () => escrowExpiryWorker._tick());
-    await register('vault',             String(60 * 60 * 1000),       () => vaultWorker._tick());
-    await register('susu',              String(60 * 1000),            () => susuWorker._tick());
-    await register('smart-route',       String(60 * 1000),            () => smartRouteWorker._tick());
-    await register('azm-auction',       String(5 * 60 * 1000),        () => azmAuctionWorker._tick());
-    await register('onchain-sweep',     String(60 * 60 * 1000),        () => onchainSweepWorker._tick());
-    await register('disappearing-msg',  String(60 * 1000),             () => disappearingMessageWorker._tick());
+    await register('leaderboard', '0 0 * * 0', () => leaderboardWorker.computeWeeklyLeaderboard());
+    await register('analytics', '0 * * * *', () => analyticsWorker.aggregateDailySnapshot());
+    await register('cfo', '0 * * * *', () => cfoWorker.runCfoCycle());
+    await register('savings', String(60 * 60 * 1000), () => savingsWorker._checkReminders());
+    // Settlement is a user-visible financial lifecycle. Keep the reconciliation
+    // cadence short enough that a missed provider webhook is repaired quickly.
+    await register('withdrawal-recon', String(30 * 1000), () => withdrawalReconciliationWorker._tick());
+    await register('payout-batch', String(2 * 60 * 1000), () => payoutBatchWorker._tick());
+    await register('escrow-expiry', String(30 * 60 * 1000), () => escrowExpiryWorker._tick());
+    await register('vault', String(60 * 60 * 1000), () => vaultWorker._tick());
+    await register('susu', String(60 * 1000), () => susuWorker._tick());
+    await register('smart-route', String(60 * 1000), () => smartRouteWorker._tick());
+    await register('azm-auction', String(5 * 60 * 1000), () => azmAuctionWorker._tick());
+    await register('onchain-sweep', String(60 * 60 * 1000), () => onchainSweepWorker._tick());
+    await register('disappearing-msg', String(60 * 1000), () => disappearingMessageWorker._tick());
 
-    // Financial truth: immutable reserve/liability commitment once per hour.
     const proofOfReservesWorker = require('../../workers/proofOfReservesWorker');
     await register('proof-of-reserves', String(60 * 60 * 1000), () => proofOfReservesWorker.run());
 
