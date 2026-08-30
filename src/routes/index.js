@@ -16,8 +16,10 @@ function mountRoutes(app, {
         next();
     });
     app.use('/api', require('../../middleware/responseHelpers'));
+
     const prismaInjector = require('../../src/middleware/prismaInjector');
     app.use('/api', prismaInjector);
+
     app.use('/api/public', generalLimiter, require('../../routes/publicRoutes'));
     const { adminBusinessScope } = require('../../middleware/adminBusinessScope');
     app.use(adminBusinessScope);
@@ -91,7 +93,9 @@ function mountRoutes(app, {
     app.use('/api/azm-auction', generalLimiter, require('../../routes/azmAuctionRoutes'));
     app.use('/api/saved-momo', financialLimiter, require('../../routes/savedMomoRoutes'));
     app.use('/api/transit', generalLimiter, require('../../routes/transitRoutes'));
+
     app.use('/api/quotes', financialLimiter, require('../../routes/transactionQuoteRoutes'));
+
     const { userRouter: porUserRouter, adminRouter: porAdminRouter } = require('../../routes/proofOfResidencyRoutes');
     const { publicRouter: liabPublicRouter, adminRouter: liabAdminRouter } = require('../../routes/liabilityContractRoutes');
     app.use('/api/users/proof-of-residency', generalLimiter, porUserRouter);
@@ -105,6 +109,7 @@ function mountRoutes(app, {
     app.use('/api/admin/control-plane', generalLimiter, require('../../routes/adminControlPlaneSummaryRoutes'));
     app.use('/api/admin/control-plane', generalLimiter, require('../../routes/adminControlPlaneExecutiveRoutes'));
     app.use('/api/admin/control-plane', generalLimiter, require('../../routes/adminReconciliationRoutes'));
+
     app.use('/api/marketplace', generalLimiter, require('../../routes/marketplaceRoutes'));
     app.use('/api/business-os', generalLimiter, require('../../routes/businessOSRoutes'));
     app.use('/api/developer', generalLimiter, require('../../routes/developerRoutes'));
@@ -115,6 +120,7 @@ function mountRoutes(app, {
     app.use('/api/azm-stake', generalLimiter, require('../../routes/azmStakeRoutes'));
     app.use('/api/admin/storefront', generalLimiter, require('../../routes/adminStorefrontRoutes'));
     app.use('/api/changelog', generalLimiter, require('../../routes/changelogRoutes'));
+
     const chatUploadExtended = require('../../routes/chatUploadRoutesExtended');
     app.use('/api/chat', chatUploadExtended);
     app.post('/api/business/upload/image', require('../../middleware/authMiddleware').protect, chatUploadExtended.imageUpload.single('file'), async (req, res) => {
@@ -123,8 +129,12 @@ function mountRoutes(app, {
             const folder = req.query.folder === 'logos' ? 'business/logos' : req.query.folder === 'kyb' ? 'business/kyb' : 'business/products';
             const { url } = await require('../../services/cloudinaryService').uploadToCloudinary(req.file, folder);
             res.status(200).json({ success: true, url, mimeType: req.file.mimetype, size: req.file.size, filename: req.file.originalname });
-        } catch (err) { logger.error({ err }, 'Business image upload error'); res.status(500).json({ success: false, message: 'Upload failed' }); }
+        } catch (err) {
+            logger.error({ err }, 'Business image upload error');
+            res.status(500).json({ success: false, message: 'Upload failed' });
+        }
     });
+
     const { protect: protectVendorUpload } = require('../../middleware/authMiddleware');
     const vendorDocsUpload = chatUploadExtended.vendorDocsUpload;
     app.post('/api/vendor/upload-docs', protectVendorUpload, vendorDocsUpload.fields([{ name: 'idFront', maxCount: 1 }, { name: 'idBack', maxCount: 1 }, { name: 'selfie', maxCount: 1 }, { name: 'addressProof', maxCount: 1 }]), async (req, res) => {
@@ -135,7 +145,10 @@ function mountRoutes(app, {
             for (const [field, files] of Object.entries(req.files)) if (files && files.length > 0) urls[field] = (await uploadToCloudinary(files[0], 'vendor-docs')).url;
             logger.info({ userId: req.user.id, keys: Object.keys(urls) }, 'Vendor: documents uploaded');
             return res.status(200).json({ success: true, urls });
-        } catch (err) { logger.error({ err }, 'Vendor docs upload error'); res.status(500).json({ success: false, message: 'Upload failed' }); }
+        } catch (err) {
+            logger.error({ err }, 'Vendor docs upload error');
+            res.status(500).json({ success: false, message: 'Upload failed' });
+        }
     });
 }
 
