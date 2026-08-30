@@ -8,6 +8,17 @@ jest.mock('../services/finance.service', () => ({
 describe('fiatSettlementService', () => {
     beforeEach(() => jest.clearAllMocks());
 
+    const attemptDb = () => ({
+        $queryRawUnsafe: jest.fn().mockResolvedValue([{
+            id: 'attempt-1',
+            transactionHistoryId: 'tx-1',
+            provider: 'MTN_MOMO_DISBURSEMENT',
+            providerReference: 'ref-1',
+            status: 'PENDING'
+        }]),
+        $executeRawUnsafe: jest.fn().mockResolvedValue(1)
+    });
+
     test('moves a PENDING withdrawal to COMPLETED and records provider reference atomically', async () => {
         const pending = {
             txHash: 'ref-1',
@@ -18,6 +29,7 @@ describe('fiatSettlementService', () => {
         };
         const completed = { ...pending, status: 'COMPLETED', providerRef: 'moolre-991' };
         const prisma = {
+            ...attemptDb(),
             transactionHistory: {
                 findUnique: jest.fn()
                     .mockResolvedValueOnce(pending)
@@ -29,6 +41,7 @@ describe('fiatSettlementService', () => {
 
         const result = await settleFiatWithdrawal(prisma, {
             reference: 'ref-1',
+            provider: 'MOOLRE',
             status: 'SUCCESSFUL',
             providerTxId: 'moolre-991'
         });
@@ -56,6 +69,7 @@ describe('fiatSettlementService', () => {
             providerRef: null
         };
         const prisma = {
+            ...attemptDb(),
             transactionHistory: {
                 findUnique: jest.fn().mockResolvedValue(failed),
                 updateMany: jest.fn().mockResolvedValue({ count: 0 }),
@@ -65,6 +79,7 @@ describe('fiatSettlementService', () => {
 
         const result = await settleFiatWithdrawal(prisma, {
             reference: 'ref-2',
+            provider: 'MOOLRE',
             status: 'SUCCESSFUL',
             providerTxId: 'late-success'
         });
@@ -82,9 +97,6 @@ describe('fiatSettlementService', () => {
             status: 'PENDING',
             providerRef: null
         };
-        // The reversal owns the financial refund. Provider reference enrichment
-        // belongs to the settlement boundary and happens only after the row is
-        // terminal, so the test models the intermediate post-reversal state.
         const reversedWithoutProviderRef = { ...pending, status: 'FAILED', providerRef: null };
         const failedWithProviderRef = { ...pending, status: 'FAILED', providerRef: 'moolre-fail-3' };
         financeService.reverseFiatWithdrawal.mockResolvedValue({
@@ -94,6 +106,7 @@ describe('fiatSettlementService', () => {
         });
 
         const prisma = {
+            ...attemptDb(),
             transactionHistory: {
                 findUnique: jest.fn()
                     .mockResolvedValueOnce(pending)
@@ -105,6 +118,7 @@ describe('fiatSettlementService', () => {
 
         const result = await settleFiatWithdrawal(prisma, {
             reference: 'ref-3',
+            provider: 'MOOLRE',
             status: 'FAILED',
             providerTxId: 'moolre-fail-3',
             reason: 'provider rejected transfer'
