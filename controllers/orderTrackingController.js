@@ -16,35 +16,42 @@ const wrap = (fn) => async (req, res) => {
     }
 };
 
+const isFiniteNumber = (value) => typeof value === 'number' && Number.isFinite(value);
+const isValidLatitude = (value) => isFiniteNumber(value) && value >= -90 && value <= 90;
+const isValidLongitude = (value) => isFiniteNumber(value) && value >= -180 && value <= 180;
+
+const assertOrderParticipant = async (prisma, orderId, userId) => {
+    const order = await prisma.businessOrder.findUnique({
+        where: { id: orderId },
+        select: { customerId: true, businessProfileId: true, status: true, orderRef: true }
+    });
+
+    if (!order) return { order: null, authorized: false };
+    if (order.customerId === userId) return { order, authorized: true };
+
+    const biz = await prisma.businessProfile.findUnique({
+        where: { id: order.businessProfileId },
+        select: { ownerId: true }
+    });
+
+    return { order, authorized: Boolean(biz && biz.ownerId === userId) };
+};
+
 // GET /api/orders/:orderId/tracking — get tracking info for an order
 exports.getTracking = wrap(async function getTracking(req, res) {
     const prisma = req.app.get('prisma');
     const { orderId } = req.params;
     const userId = req.user.id;
 
-    const order = await prisma.businessOrder.findUnique({
-        where: { id: orderId },
-        select: { customerId: true, businessProfileId: true, status: true, orderRef: true }
-    });
-
+    const { order, authorized } = await assertOrderParticipant(prisma, orderId, userId);
     if (!order) return res.status(404).json({ success: false, message: 'Order not found' });
-    if (order.customerId !== userId) {
-        // Also allow the business owner
-        const biz = await prisma.businessProfile.findUnique({
-            where: { id: order.businessProfileId },
-            select: { ownerId: true }
-        });
-        if (!biz || biz.ownerId !== userId) {
-            return res.status(403).json({ success: false, message: 'Not authorized' });
-        }
-    }
+    if (!authorized) return res.status(403).json({ success: false, message: 'Not authorized' });
 
     let tracking = await prisma.orderTracking.findUnique({
         where: { orderId },
     });
 
     if (!tracking) {
-        // Auto-create tracking record when order is PAID
         if (order.status === 'PAID' || order.status === 'DELIVERED') {
             tracking = await prisma.orderTracking.create({
                 data: { orderId, businessProfileId: order.businessProfileId }
@@ -64,18 +71,23 @@ exports.updateLocation = wrap(async function updateLocation(req, res) {
     const userId = req.user.id;
     const { latitude, longitude, heading, speedKmh } = req.body;
 
-    if (latitude == null || longitude == null) {
-        return res.status(400).json({ success: false, message: 'latitude and longitude required' });
+    if (!isValidLatitude(latitude) || !isValidLongitude(longitude)) {
+        return res.status(400).json({ success: false, message: 'valid latitude and longitude required' });
+    }
+    if (heading != null && (!isFiniteNumber(heading) || heading < 0 || heading >= 360)) {
+        return res.status(400).json({ success: false, message: 'invalid heading' });
+    }
+    if (speedKmh != null && (!isFiniteNumber(speedKmh) || speedKmh < 0)) {
+        return res.status(400).json({ success: false, message: 'invalid speedKmh' });
     }
 
     const order = await prisma.businessOrder.findUnique({
         where: { id: orderId },
-        select: { customerId: true, businessProfileId: true, status: true }
+        select: { businessProfileId: true }
     });
 
     if (!order) return res.status(404).json({ success: false, message: 'Order not found' });
 
-    // Verify business owner
     const biz = await prisma.businessProfile.findUnique({
         where: { id: order.businessProfileId },
         select: { ownerId: true }
@@ -91,27 +103,27 @@ exports.updateLocation = wrap(async function updateLocation(req, res) {
         });
     }
 
+    const eventTimestamp = new Date().toISOString();
     tracking = await prisma.orderTracking.update({
         where: { orderId },
         data: {
             courierLatitude: latitude,
             courierLongitude: longitude,
-            courierHeading: heading || null,
-            courierSpeedKmh: speedKmh || null,
-            lastPingAt: new Date(),
+            courierHeading: heading ?? null,
+            courierSpeedKmh: speedKmh ?? null,
+            lastPingAt: new Date(eventTimestamp),
         },
     });
 
-    // Emit real-time update
     const io = req.app.get('io');
     if (io) {
         io.to(`order:${orderId}`).emit('order:location', {
             orderId,
             latitude,
             longitude,
-            heading: heading || null,
-            speedKmh: speedKmh || null,
-            timestamp: new Date().toISOString(),
+            heading: heading ?? null,
+            speedKmh: speedKmh ?? null,
+            timestamp: eventTimestamp,
         });
     }
 
@@ -124,6 +136,10 @@ exports.updateEta = wrap(async function updateEta(req, res) {
     const { orderId } = req.params;
     const userId = req.user.id;
     const { estimatedArrival } = req.body;
+
+    if (estimatedArrival == null || Number.isNaN(Date.parse(estimatedArrival))) {
+        return res.status(400).json({ success: false, message: 'valid estimatedArrival required' });
+    }
 
     const order = await prisma.businessOrder.findUnique({
         where: { id: orderId },
@@ -167,13 +183,19 @@ exports.updateStatus = wrap(async function updateStatus(req, res) {
     });
     if (!order) return res.status(404).json({ success: false, message: 'Order not found' });
 
-    // Verify business owner
     const biz = await prisma.businessProfile.findUnique({
         where: { id: order.businessProfileId },
         select: { ownerId: true }
     });
     if (!biz || biz.ownerId !== userId) {
         return res.status(403).json({ success: false, message: 'Not authorized' });
+    }
+
+    if (deliveryLat != null && !isValidLatitude(deliveryLat)) {
+        return res.status(400).json({ success: false, message: 'invalid deliveryLat' });
+    }
+    if (deliveryLng != null && !isValidLongitude(deliveryLng)) {
+        return res.status(400).json({ success: false, message: 'invalid deliveryLng' });
     }
 
     let tracking = await prisma.orderTracking.findUnique({ where: { orderId } });
@@ -183,25 +205,24 @@ exports.updateStatus = wrap(async function updateStatus(req, res) {
         });
     }
 
-    // Append to timeline
+    const eventTimestamp = new Date().toISOString();
     const timeline = tracking.timeline || [];
-    timeline.push({ status, note: note || '', timestamp: new Date().toISOString() });
+    timeline.push({ status, note: note || '', timestamp: eventTimestamp });
 
     const updateData = { timeline };
     if (driverName) updateData.driverName = driverName;
     if (driverPhone) updateData.driverPhone = driverPhone;
     if (vehiclePlate) updateData.vehiclePlate = vehiclePlate;
     if (deliveryAddress) updateData.deliveryAddress = deliveryAddress;
-    if (deliveryLat) updateData.deliveryLatitude = deliveryLat;
-    if (deliveryLng) updateData.deliveryLongitude = deliveryLng;
-    if (status === 'DELIVERED') updateData.actualArrival = new Date();
+    if (deliveryLat != null) updateData.deliveryLatitude = deliveryLat;
+    if (deliveryLng != null) updateData.deliveryLongitude = deliveryLng;
+    if (status === 'DELIVERED') updateData.actualArrival = new Date(eventTimestamp);
 
     tracking = await prisma.orderTracking.update({
         where: { orderId },
         data: updateData,
     });
 
-    // Send notification to customer
     const notificationService = req.app.get('notificationService');
     if (notificationService) {
         await notificationService.sendToUser(order.customerId, {
@@ -215,7 +236,7 @@ exports.updateStatus = wrap(async function updateStatus(req, res) {
     const io = req.app.get('io');
     if (io) {
         io.to(`order:${orderId}`).emit('order:status', {
-            orderId, status, note: note || '', timestamp: new Date().toISOString(),
+            orderId, status, note: note || '', timestamp: eventTimestamp,
             tracking,
         });
     }
@@ -227,6 +248,11 @@ exports.updateStatus = wrap(async function updateStatus(req, res) {
 exports.getTimeline = wrap(async function getTimeline(req, res) {
     const prisma = req.app.get('prisma');
     const { orderId } = req.params;
+    const userId = req.user.id;
+
+    const { order, authorized } = await assertOrderParticipant(prisma, orderId, userId);
+    if (!order) return res.status(404).json({ success: false, message: 'Order not found' });
+    if (!authorized) return res.status(403).json({ success: false, message: 'Not authorized' });
 
     const tracking = await prisma.orderTracking.findUnique({
         where: { orderId },
