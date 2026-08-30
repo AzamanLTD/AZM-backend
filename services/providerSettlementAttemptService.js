@@ -65,7 +65,7 @@ const recordProviderSettlementAttempt = async (prisma, {
 
     if (existingRows[0]) {
         const row = existingRows[0];
-        await prisma.$executeRawUnsafe(
+        const updatedRows = await prisma.$queryRawUnsafe(
             `UPDATE "ProviderSettlementAttempt"
                 SET "providerTransactionId" = COALESCE($1, "providerTransactionId"),
                     "status" = CASE
@@ -84,18 +84,19 @@ const recordProviderSettlementAttempt = async (prisma, {
                         ELSE "failureReason"
                     END,
                     "metadata" = COALESCE($4::jsonb, "metadata")
-              WHERE "id" = $5`,
+              WHERE "id" = $5
+              RETURNING "id", "transactionHistoryId", "provider", "providerReference", "providerTransactionId", "status", "firstSeenAt", "lastSeenAt", "settledAt", "failureReason", "metadata"`,
             providerTransactionId ? String(providerTransactionId) : null,
             normalizedStatus,
             failureReason || null,
             metadata == null ? null : JSON.stringify(metadata),
             row.id
         );
+        const effective = updatedRows[0] || row;
         return {
-            ...row,
-            changed: !terminalStatus(row.status) && row.status !== normalizedStatus,
-            id: row.id,
-            status: terminalStatus(row.status) ? row.status : normalizedStatus
+            ...effective,
+            changed: row.status !== effective.status,
+            id: row.id
         };
     }
 
