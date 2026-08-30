@@ -1,4 +1,3 @@
-// workers/escrowExpiryWorker.js
 // =============================================================================
 // AZAMAN — SMART ESCROW EXPIRY WORKER (2026-06-14)
 //
@@ -25,10 +24,16 @@ const DAY_MS = 24 * 60 * 60 * 1000;
 const WARN_BEFORE_DAYS = 5; // warn 5 days before a FUNDED escrow expires
 
 class EscrowExpiryWorker {
-    constructor(prisma, io, notificationService, { intervalMs = THIRTY_MIN_MS } = {}) {
+    constructor(prisma, io, notificationService, {
+        intervalMs = THIRTY_MIN_MS,
+        emitBalanceUpdate = null
+    } = {}) {
         this.prisma = prisma;
         this.io = io || null;
         this.notificationService = notificationService || null;
+        this.emitBalanceUpdate = typeof emitBalanceUpdate === 'function'
+            ? emitBalanceUpdate
+            : null;
         this.intervalMs = intervalMs;
         this.interval = null;
         this._running = false;
@@ -149,7 +154,7 @@ class EscrowExpiryWorker {
                 // The financial transaction has committed. Realtime delivery is
                 // deliberately a convergence signal: clients must refetch their
                 // canonical escrow/balance state instead of trusting this payload.
-                this._emitRefundConvergence(refunded, {
+                await this._emitRefundConvergence(refunded, {
                     payerId: escrow.payerId,
                     payeeId: escrow.payeeId,
                     ticketId: escrow.ticketId
@@ -173,7 +178,7 @@ class EscrowExpiryWorker {
         }
     }
 
-    _emitRefundConvergence(escrow, { payerId, payeeId, ticketId }) {
+    async _emitRefundConvergence(escrow, { payerId, payeeId, ticketId }) {
         if (!this.io || !escrow) return;
         const payload = {
             escrowId: escrow.id,
@@ -190,13 +195,12 @@ class EscrowExpiryWorker {
             this.io.to(`user_${userId}`).emit('escrow_refunded', payload);
         }
 
-        // The payer's balance changed; emit a signal, not a balance snapshot.
-        // Clients refetch GET /api/users/balance as the source of truth.
-        this.io.to(`user_${payerId}`).emit('balance_update', {
-            userId: payerId,
-            escrowId: escrow.id,
-            reason: 'escrow_refunded'
-        });
+        // Reuse the platform-wide canonical balance emitter so every financial
+        // mutation uses the same private balance-room contract and payload shape.
+        // It runs only after _refundEscrow has committed successfully.
+        if (this.emitBalanceUpdate) {
+            await this.emitBalanceUpdate(payerId);
+        }
 
         // Admin is a governance projection and should converge on the same
         // terminal financial transition without receiving private balance data.
