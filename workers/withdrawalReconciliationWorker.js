@@ -57,8 +57,15 @@ class WithdrawalReconciliationWorker {
         this._running = true;
         try {
             const cutoff = new Date(Date.now() - STALE_AFTER_MS);
+            // PENDING covers manual/legacy withdrawals that have not yet been
+            // dispatched. PROCESSING covers auto-payout rows claimed before
+            // provider I/O. Without both states, an auto-payout crash after the
+            // claim would leave the customer's funds permanently stranded.
             const stuck = await this.prisma.withdrawal.findMany({
-                where: { status: 'PENDING', createdAt: { lt: cutoff } },
+                where: {
+                    status: { in: ['PENDING', 'PROCESSING'] },
+                    createdAt: { lt: cutoff }
+                },
                 include: {
                     user: { select: { id: true, email: true, username: true, phoneNumber: true, phoneVerified: true } }
                 },
@@ -66,7 +73,7 @@ class WithdrawalReconciliationWorker {
                 take: MAX_BATCH_SIZE
             });
             if (stuck.length === 0) return;
-            logger.info(`[WithdrawalReconciliation] reconciling ${stuck.length} pending withdrawal(s).`);
+            logger.info(`[WithdrawalReconciliation] reconciling ${stuck.length} pending/processing withdrawal(s).`);
             for (const w of stuck) {
                 await this._reconcileOne(w).catch((err) => {
                     logger.error(`[WithdrawalReconciliation] row id=${w.id} reconcile error:`, err.message);
@@ -198,7 +205,7 @@ class WithdrawalReconciliationWorker {
             await this._recordException(
                 withdrawal,
                 'PROVIDER_STATUS_UNAVAILABLE',
-                { provider: 'MTN_MOMO_DISBURSEMENT', error: err.message },
+                { provider: 'DISBURSEMENT', error: err.message },
                 reference
             );
             logger.warn(`[WithdrawalReconciliation] provider status query failed for ${reference}: ${err.message}`);
@@ -210,7 +217,7 @@ class WithdrawalReconciliationWorker {
 
         await recordProviderSettlementAttempt(this.prisma, {
             reference,
-            provider: 'MTN_MOMO_DISBURSEMENT',
+            provider: statusResp?.provider || 'DISBURSEMENT',
             providerReference: reference,
             providerTransactionId: providerRef,
             status: ['SUCCESSFUL', 'COMPLETED'].includes(remoteStatus)
@@ -335,7 +342,7 @@ class WithdrawalReconciliationWorker {
         await this._recordException(
             withdrawal,
             'UNEXPECTED_PROVIDER_STATUS',
-            { provider: 'MTN_MOMO_DISBURSEMENT', status: remoteStatus, response: statusResp },
+            { provider: statusResp?.provider || 'DISBURSEMENT', status: remoteStatus, response: statusResp },
             reference
         );
         logger.warn(`[WithdrawalReconciliation] ref=${reference} unexpected provider status: ${remoteStatus}.`);
