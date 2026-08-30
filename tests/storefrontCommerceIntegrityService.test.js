@@ -7,9 +7,9 @@ const {
 } = require('../services/storefrontCommerceIntegrityService');
 
 describe('storefrontCommerceIntegrityService', () => {
-  test('normalizes an idempotency key and rejects oversized keys', () => {
+  test('normalizes an idempotency key and rejects blank or oversized keys', () => {
     expect(normalizeIdempotencyKey('  checkout-123  ')).toBe('checkout-123');
-    expect(normalizeIdempotencyKey('   ')).toBeNull();
+    expect(() => normalizeIdempotencyKey('   ')).toThrow(/must not be empty/);
     expect(() => normalizeIdempotencyKey('x'.repeat(129))).toThrow(/128/);
   });
 
