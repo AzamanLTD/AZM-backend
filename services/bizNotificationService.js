@@ -8,7 +8,6 @@
 //
 // Writes are ALWAYS fire-and-forget from the caller's perspective: a failed
 // notification must never roll back a financial transaction or fail an HTTP
-const logger = require('../src/config/logger');
 // request. createNotification therefore swallows its own errors (logs + returns
 // null) so callers can `await` it without a try/catch of their own.
 //
@@ -18,12 +17,12 @@ const logger = require('../src/config/logger');
 // order (e.g. peer-to-peer escrows), so callers can fire it unconditionally.
 // =============================================================================
 
+const logger = require('../src/config/logger');
+
 const VALID_TYPES = new Set([
     'NEW_ORDER', 'ORDER_FUNDED', 'ORDER_SATISFIED', 'ORDER_DISPUTED',
     'ORDER_SETTLED', 'ORDER_CANCELLED', 'ORDER_REFUNDED', 'KYB_STATUS_CHANGED'
 ]);
-
-// ── private helpers ───────────────────────────────────────────────────────────
 
 const _clip = (value, max) => {
     if (value == null) return null;
@@ -35,10 +34,7 @@ const _clip = (value, max) => {
 const _orderLabel = (order) =>
     order.orderRef || (order.ticketId ? `#${String(order.ticketId).slice(-8)}` : 'your order');
 
-/**
- * Default owner-facing copy keyed by notification type. Centralised here so the
- * escrow hooks only have to pass a `type`. `order` is the resolved BusinessOrder.
- */
+/** Default owner-facing copy keyed by notification type. */
 const _defaultCopy = (type, order) => {
     const amount = Number(order.amountUsdc);
     const ref = _orderLabel(order);
@@ -63,10 +59,6 @@ const _defaultCopy = (type, order) => {
     }
 };
 
-// =============================================================================
-// 1. CREATE NOTIFICATION — fire-and-forget. Never throws; logs + returns null
-//    on failure so financial flows are never disrupted by the feed.
-// =============================================================================
 const createNotification = async (prisma, { businessProfileId, type, title, body, metadata }) => {
     try {
         if (!businessProfileId) throw new Error('businessProfileId is required.');
@@ -92,12 +84,6 @@ const createNotification = async (prisma, { businessProfileId, type, title, body
     }
 };
 
-// =============================================================================
-// 2. NOTIFY ORDER EVENT — escrow-keyed chokepoint. Resolves the BusinessOrder
-//    linked to an escrow, then writes a notification for its owning business.
-//    Silent no-op when no business order is linked to the escrow.
-//    Returns { notification, order } | null.
-// =============================================================================
 const notifyOrderEvent = async (prisma, { escrowId, type, title, body, extraMetadata }) => {
     try {
         if (!escrowId) return null;
@@ -110,7 +96,7 @@ const notifyOrderEvent = async (prisma, { escrowId, type, title, body, extraMeta
                 businessProfile: { select: { userId: true } }
             }
         });
-        if (!order) return null; // not every escrow is a business order
+        if (!order) return null;
 
         const copy = _defaultCopy(type, order);
         const notification = await createNotification(prisma, {
@@ -136,10 +122,29 @@ const notifyOrderEvent = async (prisma, { escrowId, type, title, body, extraMeta
     }
 };
 
-// =============================================================================
-// 3. LIST NOTIFICATIONS — cursor pagination by id, newest first. Returns the
-//    live unreadCount alongside the page.
-// =============================================================================
+const _encodeCursor = ({ createdAt, id }) => Buffer.from(
+    JSON.stringify({ createdAt: new Date(createdAt).toISOString(), id }),
+    'utf8'
+).toString('base64url');
+
+const _decodeCursor = (cursor) => {
+    try {
+        const decoded = Buffer.from(cursor, 'base64url').toString('utf8');
+        const parsed = JSON.parse(decoded);
+        if (parsed && typeof parsed.id === 'string' && typeof parsed.createdAt === 'string') {
+            const createdAt = new Date(parsed.createdAt);
+            if (!Number.isNaN(createdAt.getTime())) return { id: parsed.id, createdAt };
+        }
+    } catch (_) {
+        // Preserve compatibility with the previous id-only cursor format.
+    }
+    return { id: cursor };
+};
+
+// Cursor pagination uses the complete (createdAt, id) ordering key. Legacy
+// id-only cursors remain accepted for already-issued Portal links, but every
+// newly-issued cursor carries both values so equal-timestamp rows cannot be
+// skipped or repeated.
 const getNotifications = async (prisma, businessProfileId, { limit, cursor, unreadOnly } = {}) => {
     if (!businessProfileId) throw new Error('businessProfileId is required.');
     const take = Math.min(Math.max(parseInt(limit, 10) || 20, 1), 50);
@@ -147,37 +152,56 @@ const getNotifications = async (prisma, businessProfileId, { limit, cursor, unre
     const where = { businessProfileId };
     if (unreadOnly === true || unreadOnly === 'true') where.isRead = false;
 
+    let cursorFilter = {};
+    if (cursor) {
+        const decoded = _decodeCursor(cursor);
+        if (!decoded.createdAt) {
+            const anchor = await prisma.businessNotification.findFirst({
+                where: { id: decoded.id, businessProfileId },
+                select: { id: true, createdAt: true }
+            });
+            if (!anchor) throw new Error('Notification cursor must reference an existing notification.');
+            decoded.createdAt = anchor.createdAt;
+        } else {
+            const anchor = await prisma.businessNotification.findFirst({
+                where: { id: decoded.id, businessProfileId },
+                select: { id: true, createdAt: true }
+            });
+            if (!anchor) throw new Error('Notification cursor must reference an existing notification.');
+        }
+
+        cursorFilter = {
+            OR: [
+                { createdAt: { lt: decoded.createdAt } },
+                { createdAt: decoded.createdAt, id: { lt: decoded.id } }
+            ]
+        };
+    }
+
+    const pageWhere = cursor ? { AND: [where, cursorFilter] } : where;
+
     const [rows, unreadCount] = await Promise.all([
         prisma.businessNotification.findMany({
-            where,
+            where: pageWhere,
             take: take + 1,
-            orderBy: { createdAt: 'desc' },
-            ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {})
+            orderBy: [{ createdAt: 'desc' }, { id: 'desc' }]
         }),
         prisma.businessNotification.count({ where: { businessProfileId, isRead: false } })
     ]);
 
     const hasMore = rows.length > take;
     const notifications = hasMore ? rows.slice(0, take) : rows;
-    const nextCursor = hasMore ? notifications[notifications.length - 1].id : null;
+    const last = notifications[notifications.length - 1];
+    const nextCursor = hasMore && last ? _encodeCursor(last) : null;
 
     return { notifications, hasMore, nextCursor, unreadCount };
 };
 
-// =============================================================================
-// 4. UNREAD COUNT — badge value for the portal bell.
-// =============================================================================
 const getUnreadCount = async (prisma, businessProfileId) => {
     if (!businessProfileId) throw new Error('businessProfileId is required.');
-    return prisma.businessNotification.count({
-        where: { businessProfileId, isRead: false }
-    });
+    return prisma.businessNotification.count({ where: { businessProfileId, isRead: false } });
 };
 
-// =============================================================================
-// 5. MARK AS READ — owner-scoped. Verifies ownership via the compound where so
-//    a notification belonging to another business can never be flipped.
-// =============================================================================
 const markAsRead = async (prisma, notificationId, businessProfileId) => {
     if (!notificationId) throw new Error('notificationId is required.');
     if (!businessProfileId) throw new Error('businessProfileId is required.');
@@ -191,9 +215,6 @@ const markAsRead = async (prisma, notificationId, businessProfileId) => {
     return prisma.businessNotification.findUnique({ where: { id: notificationId } });
 };
 
-// =============================================================================
-// 6. MARK ALL AS READ — bulk clear for the calling business.
-// =============================================================================
 const markAllAsRead = async (prisma, businessProfileId) => {
     if (!businessProfileId) throw new Error('businessProfileId is required.');
     const result = await prisma.businessNotification.updateMany({

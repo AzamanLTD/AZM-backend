@@ -6,9 +6,10 @@ const logger = require('../src/config/logger');
 // in the background, and NEVER crashes the server if it fails.
 //
 // What it does:
-//   1. Installs the additive Susu overlay schema objects.
-//   2. Installs the transaction quote overlay schema objects.
-//   3. Seeds the azaman-treasury wallet + v1.0 liability contract when needed.
+//   1. Converges the retail checkout integrity schema after production db-push.
+//   2. Installs the additive Susu overlay schema objects.
+//   3. Installs the transaction quote overlay schema objects.
+//   4. Seeds the azaman-treasury wallet + v1.0 liability contract when needed.
 // =============================================================================
 
 const releaseStatus = {
@@ -17,10 +18,13 @@ const releaseStatus = {
   finishedAt: null,
   overlayInstalled: null,
   quoteOverlayInstalled: null,
+  retailCheckoutIntegrityInstalled: null,
   installerResult: null,
   quoteInstallerResult: null,
+  retailCheckoutIntegrityResult: null,
   installerErrors: null,
   quoteInstallerErrors: null,
+  retailCheckoutIntegrityErrors: null,
   seedOk: null,
   seedOutput: null,
   skipped: false,
@@ -45,6 +49,18 @@ async function autoRelease(prisma, opts = {}) {
     releaseStatus.ran = true;
     releaseStatus.startedAt = new Date().toISOString();
     releaseStatus.error = null;
+
+    try {
+      const { installRetailCheckoutIntegrity } = require('./install-retail-checkout-integrity');
+      const r = await installRetailCheckoutIntegrity(prisma);
+      releaseStatus.retailCheckoutIntegrityResult = { ok: r.ok, steps: r.steps };
+      releaseStatus.retailCheckoutIntegrityInstalled = r.ok === true;
+      log(`retail checkout integrity: ${r.steps.length} schema steps converged`);
+    } catch (e) {
+      releaseStatus.retailCheckoutIntegrityInstalled = false;
+      releaseStatus.retailCheckoutIntegrityErrors = [e.message];
+      log(`retail checkout integrity failed (non-fatal): ${e.message}`);
+    }
 
     try {
       const { installSusuOverlay } = require('./install-susu-overlay');

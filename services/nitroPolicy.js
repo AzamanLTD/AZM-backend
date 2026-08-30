@@ -31,7 +31,9 @@ function meetsTier(currentTier, requiredTier) {
 function shortageForTier(stakedBalance, requiredTier) {
   const threshold = NITRO_THRESHOLDS[requiredTier];
   if (threshold == null) return 0;
-  return Math.max(0, threshold - Number(stakedBalance));
+  const balance = Number(stakedBalance);
+  if (!Number.isFinite(balance)) return threshold;
+  return Math.max(0, threshold - balance);
 }
 
 module.exports = {
