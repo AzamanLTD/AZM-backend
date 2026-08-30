@@ -8,9 +8,13 @@ const MAX_IDEMPOTENCY_KEY_LENGTH = 128;
 function normalizeIdempotencyKey(value) {
   if (value == null) return null;
   const key = String(value).trim();
-  // Treat an explicitly blank key like an omitted key. This keeps optional
-  // client input ergonomic while still rejecting keys that exceed the limit.
-  if (!key) return null;
+  // An explicitly supplied blank key is malformed input. Only an omitted/null
+  // key means the client chose not to use idempotency.
+  if (!key) {
+    const error = new Error('idempotencyKey must not be empty.');
+    error.statusCode = 400;
+    throw error;
+  }
   if (key.length > MAX_IDEMPOTENCY_KEY_LENGTH) {
     const error = new Error(`idempotencyKey must be ${MAX_IDEMPOTENCY_KEY_LENGTH} characters or fewer.`);
     error.statusCode = 400;
