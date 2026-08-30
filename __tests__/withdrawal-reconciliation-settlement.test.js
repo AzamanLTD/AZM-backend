@@ -19,11 +19,11 @@ describe('WithdrawalReconciliationWorker settlement lifecycle', () => {
     },
   };
 
-  const attemptDb = () => ({
+  const attemptDb = (transactionHistoryId = 'tx-1') => ({
     $queryRawUnsafe: jest.fn().mockResolvedValue([{
-      transactionHistoryId: 'tx-1',
+      transactionHistoryId,
       provider: 'MTN_MOMO_DISBURSEMENT',
-      providerReference: 'ref-1',
+      providerReference: transactionHistoryId === 'tx-2' ? 'ref-2' : 'ref-1',
       status: 'PENDING',
     }]),
     $executeRawUnsafe: jest.fn().mockResolvedValue(1),
@@ -89,7 +89,7 @@ describe('WithdrawalReconciliationWorker settlement lifecycle', () => {
 
   test('provider failure uses the canonical reversal service and marks the mirror failed', async () => {
     const prisma = {
-      ...attemptDb(),
+      ...attemptDb('tx-2'),
       transactionHistory: {
         findUnique: jest.fn().mockResolvedValue({
           id: 'tx-2',
@@ -155,7 +155,7 @@ describe('WithdrawalReconciliationWorker settlement lifecycle', () => {
     await worker._reconcileOne(withdrawal);
 
     expect(provider.getTransferStatus).not.toHaveBeenCalled();
-    expect(prisma.$queryRawUnsafe).toHaveBeenCalledTimes(1);
+    expect(prisma.$queryRawUnsafe).toHaveBeenCalledTimes(2);
     expect(prisma.withdrawal.update).not.toHaveBeenCalled();
   });
 
@@ -179,5 +179,6 @@ describe('WithdrawalReconciliationWorker settlement lifecycle', () => {
     expect(provider.getTransferStatus).not.toHaveBeenCalled();
     expect(prisma.transactionHistory.updateMany).not.toHaveBeenCalled();
     expect(prisma.withdrawal.update).not.toHaveBeenCalled();
+    expect(prisma.$queryRawUnsafe).toHaveBeenCalledTimes(2);
   });
 });
