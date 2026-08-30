@@ -17,6 +17,8 @@ const wrap = (fn) => async (req, res) => {
 };
 
 const isFiniteNumber = (value) => typeof value === 'number' && Number.isFinite(value);
+const isValidLatitude = (value) => isFiniteNumber(value) && value >= -90 && value <= 90;
+const isValidLongitude = (value) => isFiniteNumber(value) && value >= -180 && value <= 180;
 
 const assertOrderParticipant = async (prisma, orderId, userId) => {
     const order = await prisma.businessOrder.findUnique({
@@ -65,7 +67,7 @@ exports.updateLocation = wrap(async function updateLocation(req, res) {
     const userId = req.user.id;
     const { latitude, longitude, heading, speedKmh } = req.body;
 
-    if (!isFiniteNumber(latitude) || !isFiniteNumber(longitude) || latitude < -90 || latitude > 90 || longitude < -180 || longitude > 180) {
+    if (!isValidLatitude(latitude) || !isValidLongitude(longitude)) {
         return res.status(400).json({ success: false, message: 'valid latitude and longitude required' });
     }
     if (heading != null && (!isFiniteNumber(heading) || heading < 0 || heading >= 360)) {
@@ -97,6 +99,7 @@ exports.updateLocation = wrap(async function updateLocation(req, res) {
         });
     }
 
+    const eventTimestamp = new Date().toISOString();
     tracking = await prisma.orderTracking.update({
         where: { orderId },
         data: {
@@ -104,7 +107,7 @@ exports.updateLocation = wrap(async function updateLocation(req, res) {
             courierLongitude: longitude,
             courierHeading: heading ?? null,
             courierSpeedKmh: speedKmh ?? null,
-            lastPingAt: new Date(),
+            lastPingAt: new Date(eventTimestamp),
         },
     });
 
@@ -114,7 +117,7 @@ exports.updateLocation = wrap(async function updateLocation(req, res) {
             orderId, latitude, longitude,
             heading: heading ?? null,
             speedKmh: speedKmh ?? null,
-            timestamp: new Date().toISOString(),
+            timestamp: eventTimestamp,
         });
     }
 
@@ -176,6 +179,13 @@ exports.updateStatus = wrap(async function updateStatus(req, res) {
         return res.status(403).json({ success: false, message: 'Not authorized' });
     }
 
+    if (deliveryLat != null && !isValidLatitude(deliveryLat)) {
+        return res.status(400).json({ success: false, message: 'invalid deliveryLat' });
+    }
+    if (deliveryLng != null && !isValidLongitude(deliveryLng)) {
+        return res.status(400).json({ success: false, message: 'invalid deliveryLng' });
+    }
+
     let tracking = await prisma.orderTracking.findUnique({ where: { orderId } });
     if (!tracking) {
         tracking = await prisma.orderTracking.create({
@@ -183,8 +193,9 @@ exports.updateStatus = wrap(async function updateStatus(req, res) {
         });
     }
 
+    const eventTimestamp = new Date().toISOString();
     const timeline = tracking.timeline || [];
-    timeline.push({ status, note: note || '', timestamp: new Date().toISOString() });
+    timeline.push({ status, note: note || '', timestamp: eventTimestamp });
 
     const updateData = { timeline };
     if (driverName) updateData.driverName = driverName;
@@ -193,7 +204,7 @@ exports.updateStatus = wrap(async function updateStatus(req, res) {
     if (deliveryAddress) updateData.deliveryAddress = deliveryAddress;
     if (deliveryLat != null) updateData.deliveryLatitude = deliveryLat;
     if (deliveryLng != null) updateData.deliveryLongitude = deliveryLng;
-    if (status === 'DELIVERED') updateData.actualArrival = new Date();
+    if (status === 'DELIVERED') updateData.actualArrival = new Date(eventTimestamp);
 
     tracking = await prisma.orderTracking.update({ where: { orderId }, data: updateData });
 
@@ -210,7 +221,7 @@ exports.updateStatus = wrap(async function updateStatus(req, res) {
     const io = req.app.get('io');
     if (io) {
         io.to(`order:${orderId}`).emit('order:status', {
-            orderId, status, note: note || '', timestamp: new Date().toISOString(), tracking,
+            orderId, status, note: note || '', timestamp: eventTimestamp, tracking,
         });
     }
 
