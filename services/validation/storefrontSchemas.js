@@ -31,6 +31,13 @@ const saveDraftSchema = z.object({
   expectedUpdatedAt: z.string().datetime().optional(),
 });
 
+// Publishing is an optimistic-concurrency operation too. The client may omit
+// expectedUpdatedAt for backward compatibility, but when supplied it identifies
+// the exact draft snapshot the caller intends to publish.
+const publishLayoutSchema = z.object({
+  expectedUpdatedAt: z.string().datetime().optional(),
+});
+
 const applyTemplateSchema = z.object({
   templateId: z.string().uuid(),
 });
@@ -69,6 +76,7 @@ module.exports = {
   tileSchema,
   tilePositionSchema,
   saveDraftSchema,
+  publishLayoutSchema,
   applyTemplateSchema,
   revertSchema,
   createStakeSchema,
