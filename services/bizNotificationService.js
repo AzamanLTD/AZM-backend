@@ -122,9 +122,29 @@ const notifyOrderEvent = async (prisma, { escrowId, type, title, body, extraMeta
     }
 };
 
-// Cursor pagination uses both createdAt and id as the stable ordering key.
-// The unique id remains the cursor, while the secondary key prevents rows
-// created in the same clock tick from changing page order between requests.
+const _encodeCursor = ({ createdAt, id }) => Buffer.from(
+    JSON.stringify({ createdAt: new Date(createdAt).toISOString(), id }),
+    'utf8'
+).toString('base64url');
+
+const _decodeCursor = (cursor) => {
+    try {
+        const decoded = Buffer.from(cursor, 'base64url').toString('utf8');
+        const parsed = JSON.parse(decoded);
+        if (parsed && typeof parsed.id === 'string' && typeof parsed.createdAt === 'string') {
+            const createdAt = new Date(parsed.createdAt);
+            if (!Number.isNaN(createdAt.getTime())) return { id: parsed.id, createdAt };
+        }
+    } catch (_) {
+        // Preserve compatibility with the previous id-only cursor format.
+    }
+    return { id: cursor };
+};
+
+// Cursor pagination uses the complete (createdAt, id) ordering key. Legacy
+// id-only cursors remain accepted for already-issued Portal links, but every
+// newly-issued cursor carries both values so equal-timestamp rows cannot be
+// skipped or repeated.
 const getNotifications = async (prisma, businessProfileId, { limit, cursor, unreadOnly } = {}) => {
     if (!businessProfileId) throw new Error('businessProfileId is required.');
     const take = Math.min(Math.max(parseInt(limit, 10) || 20, 1), 50);
@@ -132,19 +152,47 @@ const getNotifications = async (prisma, businessProfileId, { limit, cursor, unre
     const where = { businessProfileId };
     if (unreadOnly === true || unreadOnly === 'true') where.isRead = false;
 
+    let cursorFilter = {};
+    if (cursor) {
+        const decoded = _decodeCursor(cursor);
+        if (!decoded.createdAt) {
+            const anchor = await prisma.businessNotification.findFirst({
+                where: { id: decoded.id, businessProfileId },
+                select: { id: true, createdAt: true }
+            });
+            if (!anchor) throw new Error('Notification cursor must reference an existing notification.');
+            decoded.createdAt = anchor.createdAt;
+        } else {
+            const anchor = await prisma.businessNotification.findFirst({
+                where: { id: decoded.id, businessProfileId },
+                select: { id: true, createdAt: true }
+            });
+            if (!anchor) throw new Error('Notification cursor must reference an existing notification.');
+        }
+
+        cursorFilter = {
+            OR: [
+                { createdAt: { lt: decoded.createdAt } },
+                { createdAt: decoded.createdAt, id: { lt: decoded.id } }
+            ]
+        };
+    }
+
+    const pageWhere = cursor ? { AND: [where, cursorFilter] } : where;
+
     const [rows, unreadCount] = await Promise.all([
         prisma.businessNotification.findMany({
-            where,
+            where: pageWhere,
             take: take + 1,
-            orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
-            ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {})
+            orderBy: [{ createdAt: 'desc' }, { id: 'desc' }]
         }),
         prisma.businessNotification.count({ where: { businessProfileId, isRead: false } })
     ]);
 
     const hasMore = rows.length > take;
     const notifications = hasMore ? rows.slice(0, take) : rows;
-    const nextCursor = hasMore ? notifications[notifications.length - 1].id : null;
+    const last = notifications[notifications.length - 1];
+    const nextCursor = hasMore && last ? _encodeCursor(last) : null;
 
     return { notifications, hasMore, nextCursor, unreadCount };
 };
