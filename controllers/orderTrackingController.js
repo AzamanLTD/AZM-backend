@@ -16,28 +16,32 @@ const wrap = (fn) => async (req, res) => {
     }
 };
 
+const assertOrderParticipant = async (prisma, orderId, userId) => {
+    const order = await prisma.businessOrder.findUnique({
+        where: { id: orderId },
+        select: { customerId: true, businessProfileId: true, status: true, orderRef: true }
+    });
+
+    if (!order) return { order: null, authorized: false };
+    if (order.customerId === userId) return { order, authorized: true };
+
+    const biz = await prisma.businessProfile.findUnique({
+        where: { id: order.businessProfileId },
+        select: { ownerId: true }
+    });
+
+    return { order, authorized: Boolean(biz && biz.ownerId === userId) };
+};
+
 // GET /api/orders/:orderId/tracking — get tracking info for an order
 exports.getTracking = wrap(async function getTracking(req, res) {
     const prisma = req.app.get('prisma');
     const { orderId } = req.params;
     const userId = req.user.id;
 
-    const order = await prisma.businessOrder.findUnique({
-        where: { id: orderId },
-        select: { customerId: true, businessProfileId: true, status: true, orderRef: true }
-    });
-
+    const { order, authorized } = await assertOrderParticipant(prisma, orderId, userId);
     if (!order) return res.status(404).json({ success: false, message: 'Order not found' });
-    if (order.customerId !== userId) {
-        // Also allow the business owner
-        const biz = await prisma.businessProfile.findUnique({
-            where: { id: order.businessProfileId },
-            select: { ownerId: true }
-        });
-        if (!biz || biz.ownerId !== userId) {
-            return res.status(403).json({ success: false, message: 'Not authorized' });
-        }
-    }
+    if (!authorized) return res.status(403).json({ success: false, message: 'Not authorized' });
 
     let tracking = await prisma.orderTracking.findUnique({
         where: { orderId },
@@ -96,8 +100,8 @@ exports.updateLocation = wrap(async function updateLocation(req, res) {
         data: {
             courierLatitude: latitude,
             courierLongitude: longitude,
-            courierHeading: heading || null,
-            courierSpeedKmh: speedKmh || null,
+            courierHeading: heading ?? null,
+            courierSpeedKmh: speedKmh ?? null,
             lastPingAt: new Date(),
         },
     });
@@ -109,8 +113,8 @@ exports.updateLocation = wrap(async function updateLocation(req, res) {
             orderId,
             latitude,
             longitude,
-            heading: heading || null,
-            speedKmh: speedKmh || null,
+            heading: heading ?? null,
+            speedKmh: speedKmh ?? null,
             timestamp: new Date().toISOString(),
         });
     }
@@ -123,7 +127,6 @@ exports.updateEta = wrap(async function updateEta(req, res) {
     const prisma = req.app.get('prisma');
     const { orderId } = req.params;
     const userId = req.user.id;
-    const { estimatedArrival } = req.body;
 
     const order = await prisma.businessOrder.findUnique({
         where: { id: orderId },
@@ -192,8 +195,8 @@ exports.updateStatus = wrap(async function updateStatus(req, res) {
     if (driverPhone) updateData.driverPhone = driverPhone;
     if (vehiclePlate) updateData.vehiclePlate = vehiclePlate;
     if (deliveryAddress) updateData.deliveryAddress = deliveryAddress;
-    if (deliveryLat) updateData.deliveryLatitude = deliveryLat;
-    if (deliveryLng) updateData.deliveryLongitude = deliveryLng;
+    if (deliveryLat != null) updateData.deliveryLatitude = deliveryLat;
+    if (deliveryLng != null) updateData.deliveryLongitude = deliveryLng;
     if (status === 'DELIVERED') updateData.actualArrival = new Date();
 
     tracking = await prisma.orderTracking.update({
@@ -227,6 +230,11 @@ exports.updateStatus = wrap(async function updateStatus(req, res) {
 exports.getTimeline = wrap(async function getTimeline(req, res) {
     const prisma = req.app.get('prisma');
     const { orderId } = req.params;
+    const userId = req.user.id;
+
+    const { order, authorized } = await assertOrderParticipant(prisma, orderId, userId);
+    if (!order) return res.status(404).json({ success: false, message: 'Order not found' });
+    if (!authorized) return res.status(403).json({ success: false, message: 'Not authorized' });
 
     const tracking = await prisma.orderTracking.findUnique({
         where: { orderId },
