@@ -1,5 +1,4 @@
 // services/businessOrderService.js
-const logger = require('../src/config/logger');
 const { emitWebhookEvent } = require('./webhookEmitter');
 const { randomBytes } = require('crypto');
 
@@ -26,6 +25,22 @@ const _ESCROW_TO_ORDER = {
     DISPUTED: 'DISPUTED', REFUNDED: 'REFUNDED', EXPIRED: 'REFUNDED'
 };
 
+const _ESCROW_ALLOWED_ORDER_STATES = {
+    FUNDED: ['AWAITING_PAYMENT'],
+    SETTLED: ['PAID', 'DELIVERED', 'DISPUTED'],
+    RELEASED: ['PAID', 'DELIVERED', 'DISPUTED'],
+    DISPUTED: ['AWAITING_PAYMENT', 'PAID', 'DELIVERED'],
+    REFUNDED: ['AWAITING_PAYMENT', 'PAID', 'DELIVERED', 'DISPUTED'],
+    EXPIRED: ['AWAITING_PAYMENT', 'PAID', 'DELIVERED', 'DISPUTED']
+};
+
+const _parseDate = (value, fieldName) => {
+    if (value == null || value === '') return null;
+    const parsed = new Date(value);
+    if (Number.isNaN(parsed.getTime())) throw new Error(`${fieldName} must be a valid date.`);
+    return parsed;
+};
+
 const createOrder = async (prisma, { businessProfileId, customerId, productId, escrowId, ticketId, amountUsdc, title, description, customerNotes }) => {
     if (!businessProfileId) throw new Error('businessProfileId is required.');
     if (!customerId) throw new Error('customerId is required.');
@@ -50,14 +65,17 @@ const getOrder = async (prisma, { orderId }) => prisma.businessOrder.findUnique(
 
 const listOrdersForBusiness = async (prisma, { businessProfileId, status, limit, cursor, customerId, productId, dateFrom, dateTo }) => {
     const take = Math.min(Math.max(parseInt(limit, 10) || 20, 1), 50);
+    const from = _parseDate(dateFrom, 'dateFrom');
+    const to = _parseDate(dateTo, 'dateTo');
+    if (from && to && from > to) throw new Error('dateFrom must be earlier than or equal to dateTo.');
     const where = { businessProfileId };
     if (status) where.status = status;
     if (customerId) where.customerId = parseInt(customerId, 10);
     if (productId) where.productId = productId;
-    if (dateFrom || dateTo) { where.createdAt = {}; if (dateFrom) where.createdAt.gte = new Date(dateFrom); if (dateTo) where.createdAt.lte = new Date(dateTo); }
+    if (from || to) { where.createdAt = {}; if (from) where.createdAt.gte = from; if (to) where.createdAt.lte = to; }
     const [total, rows] = await Promise.all([
         prisma.businessOrder.count({ where }),
-        prisma.businessOrder.findMany({ where, take: take + 1, orderBy: { createdAt: 'desc' }, include: ORDER_INCLUDE, ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}) })
+        prisma.businessOrder.findMany({ where, take: take + 1, orderBy: [{ createdAt: 'desc' }, { id: 'desc' }], include: ORDER_INCLUDE, ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}) })
     ]);
     const hasMore = rows.length > take;
     const orders = hasMore ? rows.slice(0, take) : rows;
@@ -66,9 +84,7 @@ const listOrdersForBusiness = async (prisma, { businessProfileId, status, limit,
 
 const listOrdersForCustomer = async (prisma, { customerId, status, limit, cursor }) => {
     const take = Math.min(Math.max(parseInt(limit, 10) || 20, 1), 50);
-    const where = { customerId };
-    if (status) where.status = status;
-    const rows = await prisma.businessOrder.findMany({ where, take: take + 1, orderBy: { createdAt: 'desc' }, include: ORDER_INCLUDE, ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}) });
+    const rows = await prisma.businessOrder.findMany({ where: { customerId, ...(status ? { status } : {}) }, take: take + 1, orderBy: [{ createdAt: 'desc' }, { id: 'desc' }], include: ORDER_INCLUDE, ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}) });
     const hasMore = rows.length > take;
     const orders = hasMore ? rows.slice(0, take) : rows;
     return { orders, hasMore, nextCursor: hasMore ? orders[orders.length - 1].id : null };
@@ -93,19 +109,11 @@ const updateOrderStatusFromEscrow = async (prisma, escrowId, escrowStatus) => {
     if (!mapped) return null;
     const order = await prisma.businessOrder.findFirst({ where: { escrowId }, select: { id: true, status: true } });
     if (!order) return null;
-    const allowedTransitions = {
-        FUNDED: ['AWAITING_PAYMENT'],
-        SETTLED: ['PAID', 'DELIVERED'],
-        RELEASED: ['PAID', 'DELIVERED'],
-        DISPUTED: ['AWAITING_PAYMENT', 'PAID', 'DELIVERED'],
-        REFUNDED: ['AWAITING_PAYMENT', 'PAID', 'DELIVERED', 'DISPUTED'],
-        EXPIRED: ['AWAITING_PAYMENT', 'PAID', 'DELIVERED', 'DISPUTED']
-    };
-    if (!allowedTransitions[escrowStatus]?.includes(order.status)) return order;
+    if (!_ESCROW_ALLOWED_ORDER_STATES[escrowStatus]?.includes(order.status)) return order;
     const data = { status: mapped };
     if (mapped === 'COMPLETED') data.completedAt = new Date();
     const transitioned = await prisma.businessOrder.updateMany({ where: { id: order.id, status: order.status }, data });
-    if (transitioned.count === 0) return prisma.businessOrder.findUnique({ where: { id: order.id }, select: { id: true, status: true } });
+    if (transitioned.count === 0) return prisma.businessOrder.findUnique({ where: { id: order.id }, select: { id: true, status: true, completedAt: true, cancelledAt: true } });
     return prisma.businessOrder.findUnique({ where: { id: order.id }, select: { id: true, status: true, completedAt: true, cancelledAt: true } });
 };
 
@@ -117,7 +125,7 @@ const getBusinessStats = async (prisma, { businessProfileId }) => {
         prisma.businessOrder.count({ where: { businessProfileId, status: 'DISPUTED' } }),
         prisma.businessOrder.count({ where: { businessProfileId, status: { in: ['REFUNDED', 'CANCELLED'] } } }),
         prisma.businessOrder.aggregate({ where: { businessProfileId, status: 'COMPLETED' }, _sum: { amountUsdc: true } }),
-        prisma.businessOrder.findMany({ where: { businessProfileId }, orderBy: { createdAt: 'desc' }, take: 5, include: ORDER_INCLUDE })
+        prisma.businessOrder.findMany({ where: { businessProfileId }, orderBy: [{ createdAt: 'desc' }, { id: 'desc' }], take: 5, include: ORDER_INCLUDE })
     ]);
     const totalRevenue = Number(revenueAgg._sum.amountUsdc || 0);
     return { totalOrders, completedOrders, pendingOrders, disputedOrders, cancelledOrders, totalRevenue, avgOrderValue: completedOrders > 0 ? totalRevenue / completedOrders : 0, recentOrders };
