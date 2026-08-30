@@ -251,7 +251,7 @@ describeOrSkip('E2E Smoke Tests — Core Flows', () => {
     // ════════════════════════════════════════════════════════════════════════
     // 4. SECURITY FLOW
     // ════════════════════════════════════════════════════════════════════════
-    describe('4. Security & Session Management', () => {
+    describe('4. SECURITY FLOW', () => {
         test('list active sessions', async () => {
             const res = await request(app)
                 .get('/api/security/sessions')
@@ -285,7 +285,7 @@ describeOrSkip('E2E Smoke Tests — Core Flows', () => {
     // ════════════════════════════════════════════════════════════════════════
     // 5. WALLET FLOW
     // ════════════════════════════════════════════════════════════════════════
-    describe('5. Wallet Flow', () => {
+    describe('5. WALLET FLOW', () => {
         test('list withdrawal history', async () => {
             const res = await request(app)
                 .get('/api/wallet/history')
@@ -310,7 +310,7 @@ describeOrSkip('E2E Smoke Tests — Core Flows', () => {
     // ════════════════════════════════════════════════════════════════════════
     // 6. SAVINGS / VAULT FLOW
     // ════════════════════════════════════════════════════════════════════════
-    describe('6. Savings / Vault Flow', () => {
+    describe('6. SAVINGS / VAULT FLOW', () => {
         test('get savings overview', async () => {
             const res = await request(app)
                 .get('/api/savings/overview')
@@ -358,7 +358,7 @@ describeOrSkip('E2E Smoke Tests — Core Flows', () => {
     // ════════════════════════════════════════════════════════════════════════
     // 8. ORDER FLOW (business → customer)
     // ════════════════════════════════════════════════════════════════════════
-    describe('8. Order Flow', () => {
+    describe('8. Order Flow (business → customer)', () => {
         test('business lists own orders (empty OK)', async () => {
             const res = await request(app)
                 .get('/api/business/orders')
@@ -400,7 +400,7 @@ describeOrSkip('E2E Smoke Tests — Core Flows', () => {
     // ════════════════════════════════════════════════════════════════════════
     // 10. HEALTH CHECK
     // ════════════════════════════════════════════════════════════════════════
-    describe('10. Health Check', () => {
+    describe('10. HEALTH CHECK', () => {
         test('GET /health returns 200', async () => {
             const res = await request(app).get('/health');
             expect(res.statusCode).toBe(200);
@@ -413,27 +413,45 @@ describeOrSkip('E2E Smoke Tests — Core Flows', () => {
     });
 
     // ════════════════════════════════════════════════════════════════════════
-    // CLEANUP — delete all rows created by the smoke test in FK-safe order.
-    // Without this, Reservations / BusinessProfiles left behind cause FK
-    // constraint violations in subsequent test suites (e.g. azm-friends-leaderboard).
+    // CLEANUP — remove only fixtures created by this test run. Every delegate
+    // used here is confirmed by the active Prisma schema/service contract:
+    // User owns pinHash; there is no UserPin delegate and the current schema
+    // has no BusinessOrderItem model. Do not broaden cleanup to unrelated data.
     // ════════════════════════════════════════════════════════════════════════
     afterAll(async () => {
         const { PrismaClient } = require('@prisma/client');
         const prisma = new PrismaClient();
         try {
-            await prisma.reservation.deleteMany({});
-            await prisma.businessOrderItem.deleteMany({});
-            await prisma.businessOrder.deleteMany({});
-            await prisma.bizNotification.deleteMany({});
-            await prisma.businessProduct.deleteMany({});
-            await prisma.notification.deleteMany({});
-            await prisma.userPin.deleteMany({});
-            await prisma.refreshToken.deleteMany({});
-            await prisma.businessProfile.deleteMany({});
-            await prisma.user.deleteMany({});
+            const users = await prisma.user.findMany({
+                where: { email: { in: [customerCreds.email, businessCreds.email] } },
+                select: { id: true },
+            });
+            const userIds = users.map(user => user.id);
+
+            // Delete the exact reservation created by this fixture.
+            if (reservationId) {
+                await prisma.reservation.deleteMany({ where: { id: reservationId } });
+            }
+
+            // Business-scoped records are removed before their owning profile.
+            if (businessProfileId) {
+                await prisma.businessNotification.deleteMany({ where: { businessProfileId } });
+                await prisma.businessOrder.deleteMany({ where: { businessProfileId } });
+                await prisma.businessProduct.deleteMany({ where: { businessProfileId } });
+                await prisma.businessProfile.deleteMany({ where: { id: businessProfileId } });
+            }
+
+            if (userIds.length) {
+                await prisma.notification.deleteMany({ where: { userId: { in: userIds } } });
+                await prisma.refreshToken.deleteMany({ where: { userId: { in: userIds } } });
+                // PIN is a scalar on User, not a separate model.
+                await prisma.user.updateMany({ where: { id: { in: userIds } }, data: { pinHash: null } });
+                await prisma.user.deleteMany({ where: { id: { in: userIds } } });
+            }
         } catch (e) {
             // eslint-disable-next-line no-console
             console.warn('[e2e-smoke] cleanup error:', e.message);
+            throw e;
         } finally {
             await prisma.$disconnect();
         }
