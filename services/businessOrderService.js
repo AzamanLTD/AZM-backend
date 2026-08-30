@@ -41,6 +41,13 @@ const _parseDate = (value, fieldName) => {
     return parsed;
 };
 
+const _cursorBoundary = async (prisma, cursor) => {
+    if (!cursor) return null;
+    const row = await prisma.businessOrder.findUnique({ where: { id: String(cursor) }, select: { id: true, createdAt: true } });
+    if (!row) throw new Error('cursor must reference an existing order.');
+    return row;
+};
+
 const createOrder = async (prisma, { businessProfileId, customerId, productId, escrowId, ticketId, amountUsdc, title, description, customerNotes }) => {
     if (!businessProfileId) throw new Error('businessProfileId is required.');
     if (!customerId) throw new Error('customerId is required.');
@@ -68,14 +75,21 @@ const listOrdersForBusiness = async (prisma, { businessProfileId, status, limit,
     const from = _parseDate(dateFrom, 'dateFrom');
     const to = _parseDate(dateTo, 'dateTo');
     if (from && to && from > to) throw new Error('dateFrom must be earlier than or equal to dateTo.');
+    const boundary = await _cursorBoundary(prisma, cursor);
     const where = { businessProfileId };
     if (status) where.status = status;
     if (customerId) where.customerId = parseInt(customerId, 10);
     if (productId) where.productId = productId;
     if (from || to) { where.createdAt = {}; if (from) where.createdAt.gte = from; if (to) where.createdAt.lte = to; }
+    if (boundary) {
+        where.AND = [
+            ...(where.AND || []),
+            { OR: [{ createdAt: { lt: boundary.createdAt } }, { createdAt: boundary.createdAt, id: { lt: boundary.id } }] },
+        ];
+    }
     const [total, rows] = await Promise.all([
         prisma.businessOrder.count({ where }),
-        prisma.businessOrder.findMany({ where, take: take + 1, orderBy: [{ createdAt: 'desc' }, { id: 'desc' }], include: ORDER_INCLUDE, ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}) })
+        prisma.businessOrder.findMany({ where, take: take + 1, orderBy: [{ createdAt: 'desc' }, { id: 'desc' }], include: ORDER_INCLUDE })
     ]);
     const hasMore = rows.length > take;
     const orders = hasMore ? rows.slice(0, take) : rows;
@@ -84,7 +98,10 @@ const listOrdersForBusiness = async (prisma, { businessProfileId, status, limit,
 
 const listOrdersForCustomer = async (prisma, { customerId, status, limit, cursor }) => {
     const take = Math.min(Math.max(parseInt(limit, 10) || 20, 1), 50);
-    const rows = await prisma.businessOrder.findMany({ where: { customerId, ...(status ? { status } : {}) }, take: take + 1, orderBy: [{ createdAt: 'desc' }, { id: 'desc' }], include: ORDER_INCLUDE, ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}) });
+    const boundary = await _cursorBoundary(prisma, cursor);
+    const where = { customerId, ...(status ? { status } : {}) };
+    if (boundary) where.AND = [{ OR: [{ createdAt: { lt: boundary.createdAt } }, { createdAt: boundary.createdAt, id: { lt: boundary.id } }] }];
+    const rows = await prisma.businessOrder.findMany({ where, take: take + 1, orderBy: [{ createdAt: 'desc' }, { id: 'desc' }], include: ORDER_INCLUDE });
     const hasMore = rows.length > take;
     const orders = hasMore ? rows.slice(0, take) : rows;
     return { orders, hasMore, nextCursor: hasMore ? orders[orders.length - 1].id : null };
