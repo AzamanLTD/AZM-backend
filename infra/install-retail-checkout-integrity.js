@@ -3,14 +3,9 @@
 // Runtime schema convergence for the retail checkout integrity overlay.
 // Production uses `prisma db push`, so safety-critical overlay objects must be
 // converged at boot rather than relying on migration history alone.
-//
-// This installer owns the retail idempotency/inventory boundary and the shared
-// SmartEscrow funding/state guard. The latter protects every escrow funding
-// path and prevents stale terminal-state writes from resurrecting an escrow.
 
 async function installRetailCheckoutIntegrity(prisma) {
   const steps = [];
-
   const run = async (label, query) => {
     await prisma.$executeRawUnsafe(query);
     steps.push(label);
@@ -27,8 +22,10 @@ async function installRetailCheckoutIntegrity(prisma) {
 RETURNS trigger
 LANGUAGE plpgsql
 AS $$
-DECLARE tracked_stock INTEGER;
+DECLARE tracked_stock INTEGER; parent_status TEXT;
 BEGIN
+  SELECT "status" INTO parent_status FROM "BusinessOrder" WHERE id = NEW."orderId";
+  IF parent_status IS DISTINCT FROM 'AWAITING_PAYMENT' THEN NEW."stockReserved" := FALSE; RETURN NEW; END IF;
   SELECT "stockQty" INTO tracked_stock FROM "BusinessProduct" WHERE id = NEW."productId" FOR UPDATE;
   IF tracked_stock IS NULL THEN NEW."stockReserved" := FALSE; RETURN NEW; END IF;
   IF tracked_stock < NEW.quantity THEN RAISE EXCEPTION 'INSUFFICIENT_STOCK:%:%', NEW."productId", tracked_stock USING ERRCODE = 'P0001'; END IF;
@@ -45,7 +42,14 @@ LANGUAGE plpgsql
 AS $$
 BEGIN
   IF NEW.status IN ('CANCELLED', 'REFUNDED') AND OLD.status NOT IN ('CANCELLED', 'REFUNDED') THEN
-    UPDATE "BusinessProduct" p SET "stockQty" = p."stockQty" + i.quantity FROM "BusinessOrderItem" i WHERE i."orderId" = NEW.id AND i."stockReserved" = TRUE AND i."productId" = p.id;
+    WITH release_totals AS (
+      SELECT "productId", SUM(quantity) AS quantity
+      FROM "BusinessOrderItem"
+      WHERE "orderId" = NEW.id AND "stockReserved" = TRUE
+      GROUP BY "productId"
+    )
+    UPDATE "BusinessProduct" p SET "stockQty" = p."stockQty" + release_totals.quantity
+    FROM release_totals WHERE p.id = release_totals."productId";
     UPDATE "BusinessOrderItem" SET "stockReserved" = FALSE WHERE "orderId" = NEW.id AND "stockReserved" = TRUE;
   END IF;
   RETURN NEW;
@@ -59,12 +63,8 @@ RETURNS trigger
 LANGUAGE plpgsql
 AS $$
 BEGIN
-  IF NEW.status = 'FUNDED' AND OLD.status <> 'DRAFT' THEN
-    RAISE EXCEPTION 'ESCROW_FUNDING_TRANSITION_INVALID: escrow % is already %', OLD.id, OLD.status USING ERRCODE = 'P0001';
-  END IF;
-  IF NEW.status = 'PENDING_SETTLEMENT' AND OLD.status IN ('SETTLED', 'RELEASED', 'REFUNDED', 'EXPIRED') THEN
-    RAISE EXCEPTION 'ESCROW_STATE_REGRESSION_INVALID: escrow % is already %', OLD.id, OLD.status USING ERRCODE = 'P0001';
-  END IF;
+  IF NEW.status = 'FUNDED' AND OLD.status <> 'DRAFT' THEN RAISE EXCEPTION 'ESCROW_FUNDING_TRANSITION_INVALID: escrow % is already %', OLD.id, OLD.status USING ERRCODE = 'P0001'; END IF;
+  IF NEW.status = 'PENDING_SETTLEMENT' AND OLD.status IN ('SETTLED', 'RELEASED', 'REFUNDED', 'EXPIRED') THEN RAISE EXCEPTION 'ESCROW_STATE_REGRESSION_INVALID: escrow % is already %', OLD.id, OLD.status USING ERRCODE = 'P0001'; END IF;
   RETURN NEW;
 END;
 $$;
