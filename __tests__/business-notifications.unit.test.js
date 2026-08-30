@@ -1,6 +1,10 @@
 const notificationService = require('../services/bizNotificationService');
 
 describe('BusinessNotification service', () => {
+    afterEach(() => {
+        notificationService.setSocketIO(null);
+    });
+
     test('getNotifications uses deterministic createdAt + id ordering and preserves unread count', async () => {
         const rows = [
             { id: 'n-3', createdAt: new Date('2026-08-30T12:00:00Z') },
@@ -127,5 +131,89 @@ describe('BusinessNotification service', () => {
             escrowId: 'escrow-peer',
             type: 'ORDER_FUNDED',
         })).resolves.toBeNull();
+    });
+
+    test('notifyOrderEvent emits one business convergence signal after persistence', async () => {
+        const emit = jest.fn();
+        const io = { to: jest.fn().mockReturnValue({ emit }) };
+        notificationService.setSocketIO(io);
+
+        const notification = {
+            id: 'notification-1',
+            businessProfileId: 'biz-1',
+            type: 'ORDER_FUNDED',
+            metadata: { escrowId: 'escrow-1' },
+            createdAt: new Date('2026-08-30T12:00:00Z'),
+        };
+        const prisma = {
+            businessOrder: {
+                findFirst: jest.fn().mockResolvedValue({
+                    id: 'order-1',
+                    businessProfileId: 'biz-1',
+                    productId: 'product-1',
+                    ticketId: 'ticket-1',
+                    title: 'Test order',
+                    amountUsdc: 25,
+                    orderRef: 'AZM-1001',
+                    businessProfile: { userId: 42 },
+                }),
+            },
+            businessNotification: {
+                create: jest.fn().mockResolvedValue(notification),
+            },
+        };
+
+        const result = await notificationService.notifyOrderEvent(prisma, {
+            escrowId: 'escrow-1',
+            type: 'ORDER_FUNDED',
+        });
+
+        expect(result.notification).toBe(notification);
+        expect(io.to).toHaveBeenCalledWith('user_42');
+        expect(emit).toHaveBeenCalledTimes(1);
+        expect(emit).toHaveBeenCalledWith('biz_notification', {
+            notificationId: 'notification-1',
+            businessProfileId: 'biz-1',
+            type: 'ORDER_FUNDED',
+            orderId: 'order-1',
+            orderRef: 'AZM-1001',
+            ticketId: 'ticket-1',
+            escrowId: 'escrow-1',
+            createdAt: notification.createdAt,
+        });
+    });
+
+    test('notification persistence succeeds when realtime transport is unavailable', async () => {
+        notificationService.setSocketIO(null);
+
+        const notification = {
+            id: 'notification-2',
+            businessProfileId: 'biz-1',
+            type: 'ORDER_DISPUTED',
+            metadata: { escrowId: 'escrow-2' },
+            createdAt: new Date('2026-08-30T13:00:00Z'),
+        };
+        const prisma = {
+            businessOrder: {
+                findFirst: jest.fn().mockResolvedValue({
+                    id: 'order-2',
+                    businessProfileId: 'biz-1',
+                    productId: null,
+                    ticketId: 'ticket-2',
+                    title: null,
+                    amountUsdc: 50,
+                    orderRef: 'AZM-1002',
+                    businessProfile: { userId: 43 },
+                }),
+            },
+            businessNotification: {
+                create: jest.fn().mockResolvedValue(notification),
+            },
+        };
+
+        await expect(notificationService.notifyOrderEvent(prisma, {
+            escrowId: 'escrow-2',
+            type: 'ORDER_DISPUTED',
+        })).resolves.toEqual(expect.objectContaining({ notification }));
     });
 });
