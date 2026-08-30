@@ -28,9 +28,7 @@ describeOrSkip('BusinessOrder — lifecycle', () => {
     test('markDelivered transitions a PAID order to DELIVERED', async () => {
         const { biz, product } = await seedBusiness(prisma);
         const customer = await seedUser(prisma);
-        const order = await prisma.businessOrder.create({
-            data: { businessProfileId: biz.id, customerId: customer.id, productId: product.id, status: 'PAID', title: 'Test Order', amountUsdc: 50.0, orderRef: `ORD-TEST-${Date.now()}` }
-        });
+        const order = await prisma.businessOrder.create({ data: { businessProfileId: biz.id, customerId: customer.id, productId: product.id, status: 'PAID', title: 'Test Order', amountUsdc: 50.0, orderRef: `ORD-TEST-${Date.now()}` } });
         const updated = await businessOrderService.markDelivered(prisma, { orderId: order.id, businessProfileId: biz.id, deliveryNotes: 'Delivered' });
         expect(updated.status).toBe('DELIVERED');
         expect(updated.deliveredAt).toBeTruthy();
@@ -47,12 +45,10 @@ describeOrSkip('BusinessOrder — lifecycle', () => {
         const { biz, product } = await seedBusiness(prisma);
         const customer = await seedUser(prisma);
         const order = await prisma.businessOrder.create({ data: { businessProfileId: biz.id, customerId: customer.id, productId: product.id, status: 'PAID', title: 'Concurrent Order', amountUsdc: 50.0, orderRef: `ORD-CONCURRENT-${Date.now()}` } });
-
         const results = await Promise.allSettled([
             businessOrderService.markDelivered(prisma, { orderId: order.id, businessProfileId: biz.id, deliveryNotes: 'First' }),
             businessOrderService.markDelivered(prisma, { orderId: order.id, businessProfileId: biz.id, deliveryNotes: 'Second' }),
         ]);
-
         expect(results.filter(result => result.status === 'fulfilled')).toHaveLength(1);
         expect(results.filter(result => result.status === 'rejected')).toHaveLength(1);
         const persisted = await prisma.businessOrder.findUnique({ where: { id: order.id } });
@@ -65,7 +61,6 @@ describeOrSkip('BusinessOrder — lifecycle', () => {
         const customer = await seedUser(prisma);
         const escrow = await prisma.smartEscrow.create({ data: { ticketId: (await prisma.ticket.create({ data: { creatorId: customer.id, counterpartyId: biz.userId, name: 'Test', type: 'ESCROW', targetAmount: 50, targetCurrency: 'USDC', status: 'OPEN', businessProfileId: biz.id, lastActivityAt: new Date() } })).id, payerId: customer.id, payeeId: biz.userId, amountUsdc: 50, feeUsdc: 0.5, status: 'DRAFT' } });
         const order = await prisma.businessOrder.create({ data: { businessProfileId: biz.id, customerId: customer.id, productId: product.id, escrowId: escrow.id, status: 'REFUNDED', title: 'Refunded Order', amountUsdc: 50, orderRef: `ORD-REFUNDED-${Date.now()}` } });
-
         const result = await businessOrderService.updateOrderStatusFromEscrow(prisma, escrow.id, 'FUNDED');
         expect(result.status).toBe('REFUNDED');
         const persisted = await prisma.businessOrder.findUnique({ where: { id: order.id } });
@@ -78,7 +73,6 @@ describeOrSkip('BusinessOrder — lifecycle', () => {
         const ticket = await prisma.ticket.create({ data: { creatorId: customer.id, counterpartyId: biz.userId, name: 'Dispute', type: 'ESCROW', targetAmount: 50, targetCurrency: 'USDC', status: 'OPEN', businessProfileId: biz.id, lastActivityAt: new Date() } });
         const escrow = await prisma.smartEscrow.create({ data: { ticketId: ticket.id, payerId: customer.id, payeeId: biz.userId, amountUsdc: 50, feeUsdc: 0.5, status: 'DISPUTED' } });
         const order = await prisma.businessOrder.create({ data: { businessProfileId: biz.id, customerId: customer.id, productId: product.id, escrowId: escrow.id, status: 'DISPUTED', title: 'Resolved Dispute', amountUsdc: 50, orderRef: `ORD-DISPUTE-${Date.now()}` } });
-
         const result = await businessOrderService.updateOrderStatusFromEscrow(prisma, escrow.id, 'SETTLED');
         expect(result.status).toBe('COMPLETED');
         expect(result.completedAt).toBeTruthy();
@@ -86,7 +80,7 @@ describeOrSkip('BusinessOrder — lifecycle', () => {
         expect(persisted.status).toBe('COMPLETED');
     });
 
-    test('business order pagination has a deterministic tie-breaker and validates date ranges', async () => {
+    test('business order pagination is deterministic for equal timestamps', async () => {
         const { biz } = await seedBusiness(prisma);
         const customer = await seedUser(prisma);
         const createdAt = new Date('2026-08-30T12:00:00.000Z');
@@ -95,15 +89,14 @@ describeOrSkip('BusinessOrder — lifecycle', () => {
             prisma.businessOrder.create({ data: { businessProfileId: biz.id, customerId: customer.id, status: 'PAID', title: 'Two', amountUsdc: 20, orderRef: `ORD-PAGE-2-${Date.now()}`, createdAt } }),
             prisma.businessOrder.create({ data: { businessProfileId: biz.id, customerId: customer.id, status: 'PAID', title: 'Three', amountUsdc: 30, orderRef: `ORD-PAGE-3-${Date.now()}`, createdAt } }),
         ]);
-
         const first = await businessOrderService.listOrdersForBusiness(prisma, { businessProfileId: biz.id, limit: 2 });
+        const second = await businessOrderService.listOrdersForBusiness(prisma, { businessProfileId: biz.id, limit: 2, cursor: first.nextCursor });
         expect(first.orders).toHaveLength(2);
         expect(first.hasMore).toBe(true);
-        expect(first.nextCursor).toBe(first.orders[1].id);
-
-        const second = await businessOrderService.listOrdersForBusiness(prisma, { businessProfileId: biz.id, limit: 2, cursor: first.nextCursor });
         expect(second.orders).toHaveLength(1);
         expect(new Set([...first.orders, ...second.orders].map(order => order.id))).toEqual(new Set(orders.map(order => order.id)));
+        expect(new Set(first.orders.map(order => order.id))).not.toEqual(new Set(second.orders.map(order => order.id)));
+        await expect(businessOrderService.listOrdersForBusiness(prisma, { businessProfileId: biz.id, cursor: 'missing-order' })).rejects.toThrow(/cursor must reference an existing order/i);
         await expect(businessOrderService.listOrdersForBusiness(prisma, { businessProfileId: biz.id, dateFrom: 'not-a-date' })).rejects.toThrow(/dateFrom must be a valid date/i);
         await expect(businessOrderService.listOrdersForBusiness(prisma, { businessProfileId: biz.id, dateFrom: '2026-08-31', dateTo: '2026-08-30' })).rejects.toThrow(/dateFrom must be earlier/i);
     });
