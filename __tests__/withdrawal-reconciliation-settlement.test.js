@@ -21,7 +21,6 @@ describe('WithdrawalReconciliationWorker settlement lifecycle', () => {
 
   const attemptDb = () => ({
     $queryRawUnsafe: jest.fn().mockResolvedValue([{
-      id: 'attempt-1',
       transactionHistoryId: 'tx-1',
       provider: 'MTN_MOMO_DISBURSEMENT',
       providerReference: 'ref-1',
@@ -40,18 +39,19 @@ describe('WithdrawalReconciliationWorker settlement lifecycle', () => {
     }]),
   });
 
-  test('provider success advances canonical TransactionHistory from PENDING to COMPLETED', async () => {
+  test('provider success advances canonical TransactionHistory from PENDING to COMPLETED through the durable link', async () => {
     const prisma = {
       ...attemptDb(),
       transactionHistory: {
-        findMany: jest.fn().mockResolvedValue([{
+        findUnique: jest.fn().mockResolvedValue({
           id: 'tx-1',
           txHash: 'ref-1',
           userId: 7,
           type: 'WITHDRAWAL_FIAT',
           amountUsdc: 100,
           status: 'PENDING',
-        }]),
+        }),
+        findMany: jest.fn(),
         updateMany: jest.fn().mockResolvedValue({ count: 1 }),
       },
       withdrawal: {
@@ -69,6 +69,8 @@ describe('WithdrawalReconciliationWorker settlement lifecycle', () => {
     const worker = new WithdrawalReconciliationWorker(prisma, io, provider);
     await worker._reconcileOne(withdrawal);
 
+    expect(prisma.transactionHistory.findMany).not.toHaveBeenCalled();
+    expect(prisma.transactionHistory.findUnique).toHaveBeenCalledWith({ where: { id: 'tx-1' } });
     expect(prisma.transactionHistory.updateMany).toHaveBeenCalledWith({
       where: { id: 'tx-1', status: 'PENDING' },
       data: { status: 'COMPLETED', providerRef: 'provider-123' },
@@ -89,14 +91,15 @@ describe('WithdrawalReconciliationWorker settlement lifecycle', () => {
     const prisma = {
       ...attemptDb(),
       transactionHistory: {
-        findMany: jest.fn().mockResolvedValue([{
+        findUnique: jest.fn().mockResolvedValue({
           id: 'tx-2',
           txHash: 'ref-2',
           userId: 7,
           type: 'WITHDRAWAL_FIAT',
           amountUsdc: 100,
           status: 'PENDING',
-        }]),
+        }),
+        findMany: jest.fn(),
         updateMany: jest.fn().mockResolvedValue({ count: 1 }),
       },
       withdrawal: {
@@ -121,6 +124,8 @@ describe('WithdrawalReconciliationWorker settlement lifecycle', () => {
     const worker = new WithdrawalReconciliationWorker(prisma, io, provider);
     await worker._reconcileOne(withdrawal);
 
+    expect(prisma.transactionHistory.findMany).not.toHaveBeenCalled();
+    expect(prisma.transactionHistory.findUnique).toHaveBeenCalledWith({ where: { id: 'tx-2' } });
     expect(prisma.transactionHistory.updateMany).toHaveBeenCalledWith({
       where: { id: 'tx-2', status: 'PENDING' },
       data: { providerRef: 'provider-456' },
