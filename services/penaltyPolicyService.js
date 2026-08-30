@@ -49,6 +49,8 @@ async function processBusinessNoShow(prisma, {
     }
 
     // 2. Apply business penalty (deduct from stake, log it)
+    let penaltyApplied = false;
+    let penaltyAmount = 0;
     try {
         const escrow = await prisma.smartEscrow.findUnique({
             where: { id: escrowId },
@@ -56,7 +58,7 @@ async function processBusinessNoShow(prisma, {
         });
 
         if (escrow) {
-            const penaltyAmount = parseFloat(escrow.amountUsdc) * MAX_PENALTY_PCT;
+            penaltyAmount = parseFloat(escrow.amountUsdc) * MAX_PENALTY_PCT;
 
             // Deduct penalty from business stake balance if it exists
             const stake = await prisma.businessProfile.findUnique({
@@ -73,6 +75,7 @@ async function processBusinessNoShow(prisma, {
                         },
                     },
                 });
+                penaltyApplied = penaltyAmount > 0;
 
                 logger.info({ businessProfileId, penaltyAmount },
                     '[penaltyPolicy] business stake penalized for no-show');
@@ -100,6 +103,8 @@ async function processBusinessNoShow(prisma, {
                     escrowId,
                     reason,
                     refundAmount: refundResult?.refundAmount || null,
+                    penaltyAmount,
+                    penaltyApplied,
                     penaltyPct: MAX_PENALTY_PCT,
                 },
             },
@@ -111,7 +116,8 @@ async function processBusinessNoShow(prisma, {
 
     return {
         refunded: true,
-        penaltyApplied: true,
+        penaltyApplied,
+        penaltyAmount,
         refundResult,
     };
 }
