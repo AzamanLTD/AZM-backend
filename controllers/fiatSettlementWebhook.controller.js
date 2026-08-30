@@ -150,6 +150,18 @@ const handleSettlement = (provider, authenticate, normalize) => async (req, res)
                 changed: result.changed,
                 timestamp: new Date().toISOString()
             });
+
+            // Admin is a projection of the same canonical settlement. Publish a
+            // small invalidation signal to the admin room; the portal refetches
+            // authoritative data instead of trusting this payload as ledger truth.
+            io.to('admin_spy').emit('admin_alert', {
+                type: result.status === 'COMPLETED' ? 'WITHDRAWAL_SETTLED' : 'WITHDRAWAL_FAILED',
+                reference: result.reference,
+                status: result.status,
+                providerTxId: result.providerTxId || null,
+                changed: result.changed,
+                timestamp: new Date().toISOString()
+            });
         }
 
         if (result.status === 'FAILED' && result.changed) {
