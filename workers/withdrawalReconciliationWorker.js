@@ -12,6 +12,7 @@
 const logger = require('../src/config/logger');
 const financeService = require('../services/finance.service');
 const { recordProviderSettlementAttempt } = require('../services/providerSettlementAttemptService');
+const { recordReconciliationException } = require('../services/reconciliationExceptionService');
 
 const RECONCILE_INTERVAL_MS = 30_000;
 const STALE_AFTER_MS        = 30_000;
@@ -76,12 +77,28 @@ class WithdrawalReconciliationWorker {
         }
     }
 
+    async _recordException(withdrawal, reason, details = null, reference = null) {
+        try {
+            await recordReconciliationException(this.prisma, {
+                entityType: 'WITHDRAWAL',
+                entityId: String(withdrawal.id),
+                reference,
+                reason,
+                details
+            });
+        } catch (exceptionError) {
+            logger.error({ err: exceptionError, withdrawalId: withdrawal.id, reason },
+                '[WithdrawalReconciliation] failed to persist reconciliation exception');
+        }
+    }
+
     async _reconcileOne(withdrawal) {
         // Legacy Withdrawal rows predate an explicit reference column. Until
-        // that mirror is migrated, the canonical TransactionHistory row is the
-        // recovery correlation source. Once found, the provider attempt itself
-        // is persisted explicitly and becomes the durable external identity.
-        const txRow = await this.prisma.transactionHistory.findFirst({
+        // that mirror is migrated, correlation is deliberately treated as a
+        // recovery heuristic and is SAFE only when exactly one candidate exists.
+        // Missing or ambiguous matches become durable operational exceptions;
+        // the worker never guesses and never mutates money on an unsafe match.
+        const txRows = await this.prisma.transactionHistory.findMany({
             where: {
                 userId: withdrawal.userId,
                 type: 'WITHDRAWAL_FIAT',
@@ -91,11 +108,38 @@ class WithdrawalReconciliationWorker {
                     lte: new Date(withdrawal.createdAt.getTime() + 5_000)
                 }
             },
-            orderBy: { createdAt: 'desc' }
+            orderBy: { createdAt: 'desc' },
+            take: 2
         });
 
-        if (!txRow || !txRow.txHash) {
-            logger.warn(`[WithdrawalReconciliation] row id=${withdrawal.id}: no matching TransactionHistory reference — skipping.`);
+        if (txRows.length === 0) {
+            await this._recordException(
+                withdrawal,
+                'MISSING_TRANSACTION_REFERENCE',
+                { userId: withdrawal.userId, amount: String(withdrawal.amount), createdAt: withdrawal.createdAt.toISOString() }
+            );
+            logger.warn(`[WithdrawalReconciliation] row id=${withdrawal.id}: no matching TransactionHistory reference — queued exception.`);
+            return;
+        }
+
+        if (txRows.length > 1) {
+            await this._recordException(
+                withdrawal,
+                'AMBIGUOUS_TRANSACTION_REFERENCE',
+                { candidateTransactionIds: txRows.map((row) => row.id), candidateReferences: txRows.map((row) => row.txHash).filter(Boolean) }
+            );
+            logger.error(`[WithdrawalReconciliation] row id=${withdrawal.id}: multiple TransactionHistory candidates — refusing to guess.`);
+            return;
+        }
+
+        const txRow = txRows[0];
+        if (!txRow.txHash) {
+            await this._recordException(
+                withdrawal,
+                'TRANSACTION_MISSING_REFERENCE',
+                { transactionId: txRow.id }
+            );
+            logger.error(`[WithdrawalReconciliation] row id=${withdrawal.id}: canonical transaction ${txRow.id} has no txHash.`);
             return;
         }
 
@@ -104,6 +148,12 @@ class WithdrawalReconciliationWorker {
         try {
             statusResp = await this.mtn.getTransferStatus(reference);
         } catch (err) {
+            await this._recordException(
+                withdrawal,
+                'PROVIDER_STATUS_UNAVAILABLE',
+                { provider: 'MTN_MOMO_DISBURSEMENT', error: err.message },
+                reference
+            );
             logger.warn(`[WithdrawalReconciliation] provider status query failed for ${reference}: ${err.message}`);
             return;
         }
@@ -127,8 +177,6 @@ class WithdrawalReconciliationWorker {
         if (remoteStatus === 'PENDING' || remoteStatus === 'PROCESSING') return;
 
         if (remoteStatus === 'SUCCESSFUL' || remoteStatus === 'COMPLETED') {
-            // Advance the canonical ledger status and provider correlation in
-            // one conditional write. Replayed ticks become harmless no-ops.
             await this.prisma.transactionHistory.updateMany({
                 where: { id: txRow.id, status: 'PENDING' },
                 data: {
@@ -217,6 +265,12 @@ class WithdrawalReconciliationWorker {
                     }).catch(() => {}));
                 }
             } catch (revErr) {
+                await this._recordException(
+                    withdrawal,
+                    'REVERSAL_FAILED',
+                    { error: revErr.message, providerReason: statusResp.reason || null },
+                    reference
+                );
                 logger.error(`[WithdrawalReconciliation] CRITICAL: reverseFiatWithdrawal failed for ${reference}:`, revErr.message);
                 if (this.io) {
                     this.io.emit('admin_alert', {
@@ -231,6 +285,12 @@ class WithdrawalReconciliationWorker {
             return;
         }
 
+        await this._recordException(
+            withdrawal,
+            'UNEXPECTED_PROVIDER_STATUS',
+            { provider: 'MTN_MOMO_DISBURSEMENT', status: remoteStatus, response: statusResp },
+            reference
+        );
         logger.warn(`[WithdrawalReconciliation] ref=${reference} unexpected provider status: ${remoteStatus}.`);
     }
 }
