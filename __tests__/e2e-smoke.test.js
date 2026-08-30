@@ -74,30 +74,4 @@ describeOrSkip('E2E Smoke Tests — Core Flows', () => {
         test('GET /health returns 200', async () => { const res = await request(app).get('/health'); expect(res.statusCode).toBe(200); });
         test('GET /api/public returns 200', async () => { const res = await request(app).get('/api/public'); expect([200, 404]).toContain(res.statusCode); });
     });
-
-    afterAll(async () => {
-        const { PrismaClient } = require('@prisma/client');
-        const prisma = new PrismaClient();
-        try {
-            const users = await prisma.user.findMany({ where: { email: { in: [customerCreds.email, businessCreds.email] } }, select: { id: true } });
-            const userIds = users.map(u => u.id);
-            if (userIds.length) {
-                await prisma.reservation.deleteMany({ where: { customerId: { in: userIds } } });
-                await prisma.notification.deleteMany({ where: { userId: { in: userIds } } });
-                await prisma.userPin.deleteMany({ where: { userId: { in: userIds } } });
-                await prisma.refreshToken.deleteMany({ where: { userId: { in: userIds } } });
-                const profiles = await prisma.businessProfile.findMany({ where: { userId: { in: userIds } }, select: { id: true } });
-                const profileIds = profiles.map(p => p.id);
-                if (profileIds.length) {
-                    await prisma.bizNotification.deleteMany({ where: { businessProfileId: { in: profileIds } } });
-                    await prisma.businessOrder.deleteMany({ where: { businessProfileId: { in: profileIds } } });
-                    await prisma.businessProduct.deleteMany({ where: { businessProfileId: { in: profileIds } } });
-                    await prisma.businessProfile.deleteMany({ where: { id: { in: profileIds } } });
-                }
-                await prisma.user.deleteMany({ where: { id: { in: userIds } } });
-            }
-        } finally {
-            await prisma.$disconnect();
-        }
-    });
 });
