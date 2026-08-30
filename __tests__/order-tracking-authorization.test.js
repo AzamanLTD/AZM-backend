@@ -100,4 +100,50 @@ describe('Order tracking controller boundaries', () => {
         }));
         expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ success: true }));
     });
+
+    test('location rejects non-finite or out-of-range coordinates before database access', async () => {
+        const prisma = {
+            businessOrder: { findUnique: jest.fn() },
+        };
+        const req = {
+            params: { orderId: 'order-1' },
+            user: { id: 'owner-1' },
+            body: { latitude: 91, longitude: 0 },
+            app: { get: jest.fn((key) => key === 'prisma' ? prisma : undefined) },
+        };
+        const res = makeResponse();
+
+        await controller.updateLocation(req, res);
+
+        expect(res.status).toHaveBeenCalledWith(400);
+        expect(res.json).toHaveBeenCalledWith({
+            success: false,
+            message: 'valid latitude and longitude required',
+        });
+        expect(prisma.businessOrder.findUnique).not.toHaveBeenCalled();
+    });
+
+    test('location rejects invalid heading and speed before database access', async () => {
+        const prisma = {
+            businessOrder: { findUnique: jest.fn() },
+        };
+        const makeRequest = (body) => ({
+            params: { orderId: 'order-1' },
+            user: { id: 'owner-1' },
+            body,
+            app: { get: jest.fn((key) => key === 'prisma' ? prisma : undefined) },
+        });
+
+        const headingRes = makeResponse();
+        await controller.updateLocation(makeRequest({ latitude: 5, longitude: 5, heading: 360 }), headingRes);
+        expect(headingRes.status).toHaveBeenCalledWith(400);
+        expect(headingRes.json).toHaveBeenCalledWith({ success: false, message: 'invalid heading' });
+
+        const speedRes = makeResponse();
+        await controller.updateLocation(makeRequest({ latitude: 5, longitude: 5, speedKmh: -1 }), speedRes);
+        expect(speedRes.status).toHaveBeenCalledWith(400);
+        expect(speedRes.json).toHaveBeenCalledWith({ success: false, message: 'invalid speedKmh' });
+
+        expect(prisma.businessOrder.findUnique).not.toHaveBeenCalled();
+    });
 });
