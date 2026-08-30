@@ -5,8 +5,8 @@
 // converged at boot rather than relying on migration history alone.
 //
 // This installer owns the retail idempotency/inventory boundary and the shared
-// SmartEscrow funding guard. The latter protects every escrow funding path,
-// including retail, hotel and transit booking escrow.
+// SmartEscrow funding/state guard. The latter protects every escrow funding
+// path and prevents stale terminal-state writes from resurrecting an escrow.
 
 async function installRetailCheckoutIntegrity(prisma) {
   const steps = [];
@@ -54,7 +54,7 @@ $$;
 DROP TRIGGER IF EXISTS azaman_retail_release_stock ON "BusinessOrder";
 CREATE TRIGGER azaman_retail_release_stock AFTER UPDATE OF status ON "BusinessOrder" FOR EACH ROW EXECUTE FUNCTION azaman_retail_release_stock()`,);
 
-  await run('install SmartEscrow funding transition guard', `CREATE OR REPLACE FUNCTION azm_guard_smart_escrow_funding_transition()
+  await run('install SmartEscrow funding/state guard', `CREATE OR REPLACE FUNCTION azm_guard_smart_escrow_funding_transition()
 RETURNS trigger
 LANGUAGE plpgsql
 AS $$
@@ -62,11 +62,14 @@ BEGIN
   IF NEW.status = 'FUNDED' AND OLD.status <> 'DRAFT' THEN
     RAISE EXCEPTION 'ESCROW_FUNDING_TRANSITION_INVALID: escrow % is already %', OLD.id, OLD.status USING ERRCODE = 'P0001';
   END IF;
+  IF NEW.status = 'PENDING_SETTLEMENT' AND OLD.status IN ('SETTLED', 'RELEASED', 'REFUNDED', 'EXPIRED') THEN
+    RAISE EXCEPTION 'ESCROW_STATE_REGRESSION_INVALID: escrow % is already %', OLD.id, OLD.status USING ERRCODE = 'P0001';
+  END IF;
   RETURN NEW;
 END;
 $$;
 DROP TRIGGER IF EXISTS azm_guard_smart_escrow_funding_transition ON "SmartEscrow";
-CREATE TRIGGER azm_guard_smart_escrow_funding_transition BEFORE UPDATE OF status ON "SmartEscrow" FOR EACH ROW WHEN (NEW.status = 'FUNDED') EXECUTE FUNCTION azm_guard_smart_escrow_funding_transition()`,);
+CREATE TRIGGER azm_guard_smart_escrow_funding_transition BEFORE UPDATE OF status ON "SmartEscrow" FOR EACH ROW WHEN (NEW.status = 'FUNDED' OR NEW.status = 'PENDING_SETTLEMENT') EXECUTE FUNCTION azm_guard_smart_escrow_funding_transition()`,);
 
   return { ok: true, steps };
 }
