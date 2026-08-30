@@ -8,9 +8,10 @@ describe('PayoutBatchWorker canonical withdrawal transaction', () => {
         autoPayoutIntervalMs: 120000,
     };
 
-    test('dispatches with the existing canonical transaction reference and does not create a duplicate history row', async () => {
+    test('atomically claims before dispatching with the existing canonical transaction reference', async () => {
         const initiateTransfer = jest.fn().mockResolvedValue({ status: 'ACCEPTED' });
         const withdrawalUpdate = jest.fn().mockResolvedValue({});
+        const withdrawalUpdateMany = jest.fn().mockResolvedValue({ count: 1 });
         const txCreate = jest.fn();
         const txFindMany = jest.fn().mockResolvedValue([{
             id: 'tx-1',
@@ -32,6 +33,7 @@ describe('PayoutBatchWorker canonical withdrawal transaction', () => {
                     createdAt: new Date('2026-08-30T10:00:00.000Z'),
                 }]),
                 update: withdrawalUpdate,
+                updateMany: withdrawalUpdateMany,
             },
             transactionHistory: {
                 findMany: txFindMany,
@@ -39,21 +41,57 @@ describe('PayoutBatchWorker canonical withdrawal transaction', () => {
                 create: txCreate,
             },
         };
-        const mtn = { initiateTransfer };
-        const worker = new PayoutBatchWorker(prisma, null, mtn, null);
+        const worker = new PayoutBatchWorker(prisma, null, { initiateTransfer }, null);
 
         const result = await worker._processBatch(settings, { isManualTrigger: true });
 
         expect(result.processed).toBe(1);
+        expect(withdrawalUpdateMany).toHaveBeenCalledWith({
+            where: { id: 91, status: 'PENDING' },
+            data: { status: 'PROCESSING' },
+        });
         expect(initiateTransfer).toHaveBeenCalledWith(expect.objectContaining({
             referenceId: 'canonical-ref-1',
             externalId: 'auto_payout_91',
         }));
-        expect(withdrawalUpdate).toHaveBeenCalledWith({
-            where: { id: 91 },
-            data: { status: 'PROCESSING' },
-        });
+        expect(withdrawalUpdate).not.toHaveBeenCalled();
         expect(txCreate).not.toHaveBeenCalled();
+    });
+
+    test('refuses auto-dispatch when another worker has already claimed the withdrawal', async () => {
+        const initiateTransfer = jest.fn();
+        const prisma = {
+            globalSettings: { findUnique: jest.fn().mockResolvedValue(settings) },
+            systemFiatPool: { findUnique: jest.fn().mockResolvedValue({ balance: 1000 }) },
+            withdrawal: {
+                findMany: jest.fn().mockResolvedValue([{
+                    id: 93,
+                    userId: 7,
+                    amount: 50,
+                    destination: '0240000000',
+                    payoutMethod: 'MTN_MOMO',
+                    createdAt: new Date('2026-08-30T10:00:00.000Z'),
+                }]),
+                update: jest.fn(),
+                updateMany: jest.fn().mockResolvedValue({ count: 0 }),
+            },
+            transactionHistory: {
+                findMany: jest.fn().mockResolvedValue([{
+                    id: 'tx-3', txHash: 'ref-3', status: 'PENDING', amountUsdc: 50
+                }]),
+                findUnique: jest.fn(),
+            },
+        };
+        const worker = new PayoutBatchWorker(prisma, null, { initiateTransfer }, null);
+
+        const result = await worker._processBatch(settings, { isManualTrigger: true });
+
+        expect(result.processed).toBe(0);
+        expect(result.flagged).toBe(0);
+        expect(result.details.errors).toEqual([
+            { id: 93, reason: 'WITHDRAWAL_ALREADY_CLAIMED' }
+        ]);
+        expect(initiateTransfer).not.toHaveBeenCalled();
     });
 
     test('refuses auto-dispatch when canonical transaction correlation is ambiguous', async () => {
@@ -71,6 +109,7 @@ describe('PayoutBatchWorker canonical withdrawal transaction', () => {
                     createdAt: new Date('2026-08-30T10:00:00.000Z'),
                 }]),
                 update: jest.fn().mockResolvedValue({}),
+                updateMany: jest.fn(),
             },
             transactionHistory: {
                 findMany: jest.fn().mockResolvedValue([

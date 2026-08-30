@@ -25,8 +25,9 @@
 //      a. If amount > autoPayoutMaxAmountUsdc → mark NEEDS_MANUAL_REVIEW
 //      b. If pool < amount → mark NEEDS_MANUAL_REVIEW (pool exhausted)
 //      c. Resolve the canonical PENDING TransactionHistory row first.
-//      d. Dispatch using that row's existing txHash as the provider reference.
-//      e. Mark PROCESSING; reconciliation owns the final transition.
+//      d. Atomically claim the withdrawal as PROCESSING before provider I/O.
+//      e. Dispatch using that row's existing txHash as the provider reference.
+//      f. Reconciliation owns the final transition.
 //   6. Emit admin_alert socket events for flagged withdrawals
 //
 // IMPORTANT: The finance withdrawal flow already creates the canonical
@@ -273,6 +274,20 @@ class PayoutBatchWorker {
                 continue;
             }
 
+            // Claim the withdrawal before any provider I/O. Multiple worker
+            // instances may read the same PENDING row; only one can transition
+            // it to PROCESSING. If the process dies after this point, the
+            // reconciliation worker can safely resume from PROCESSING using the
+            // canonical provider reference.
+            const claim = await this.prisma.withdrawal.updateMany({
+                where: { id: withdrawal.id, status: 'PENDING' },
+                data: { status: 'PROCESSING' }
+            });
+            if (claim.count !== 1) {
+                results.errors.push({ id: withdrawal.id, reason: 'WITHDRAWAL_ALREADY_CLAIMED' });
+                continue;
+            }
+
             try {
                 const amountGhs = parseFloat((amount * liveRate).toFixed(2));
                 const referenceId = String(canonical.row.txHash);
@@ -284,11 +299,6 @@ class PayoutBatchWorker {
                     externalId: `auto_payout_${withdrawal.id}`,
                     payerMessage: 'Azaman withdrawal',
                     payeeNote: `Payout #${withdrawal.id}`
-                });
-
-                await this.prisma.withdrawal.update({
-                    where: { id: withdrawal.id },
-                    data: { status: 'PROCESSING' }
                 });
 
                 runningPoolBalance -= amount;
