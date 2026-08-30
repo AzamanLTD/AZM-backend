@@ -17,6 +17,8 @@ describe('retail checkout schema convergence', () => {
     expect(prisma.$executeRawUnsafe.mock.calls[6][0]).toMatch(/azaman_retail_reserve_stock/);
     expect(prisma.$executeRawUnsafe.mock.calls[7][0]).toMatch(/azaman_retail_release_stock/);
     expect(prisma.$executeRawUnsafe.mock.calls[8][0]).toMatch(/azm_guard_smart_escrow_funding_transition/);
+    expect(prisma.$executeRawUnsafe.mock.calls[8][0]).toMatch(/PENDING_SETTLEMENT/);
+    expect(prisma.$executeRawUnsafe.mock.calls[8][0]).toMatch(/SETTLED.*RELEASED.*REFUNDED.*EXPIRED/);
   });
 
   test('surfaces schema convergence failure to the boot coordinator', async () => {
