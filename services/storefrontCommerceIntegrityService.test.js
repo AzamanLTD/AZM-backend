@@ -12,7 +12,7 @@ describe('storefrontCommerceIntegrityService', () => {
   });
 
   test('rejects an empty or oversized idempotency key', () => {
-    expect(() => normalizeIdempotencyKey('   ')).toThrow();
+    expect(() => normalizeIdempotencyKey('   ')).toThrow(/must not be empty/i);
     expect(() => normalizeIdempotencyKey('x'.repeat(129))).toThrow();
   });
 
@@ -21,7 +21,7 @@ describe('storefrontCommerceIntegrityService', () => {
       businessProfileId: 'biz-1',
       customerId: 'user-1',
       paymentMode: 'ESCROW',
-      notes: ' deliver quickly ',
+      customerNotes: ' deliver quickly ',
       items: [
         { productId: 'p2', quantity: 1, variantId: 'v2', modifierSelections: ['b', 'a'] },
         { productId: 'p1', quantity: 2 },
@@ -31,7 +31,7 @@ describe('storefrontCommerceIntegrityService', () => {
       businessProfileId: 'biz-1',
       customerId: 'user-1',
       paymentMode: 'ESCROW',
-      notes: 'deliver quickly',
+      customerNotes: 'deliver quickly',
       items: [
         { productId: 'p1', quantity: 2 },
         { productId: 'p2', quantity: 1, variantId: 'v2', modifierSelections: ['a', 'b'] },
@@ -39,6 +39,21 @@ describe('storefrontCommerceIntegrityService', () => {
     });
     expect(a).toEqual(b);
     expect(fingerprintCheckoutIntent(a)).toBe(fingerprintCheckoutIntent(b));
+  });
+
+  test('variant or modifier changes alter the economic fingerprint', () => {
+    const base = {
+      businessProfileId: 'biz-1',
+      customerId: 'user-1',
+      paymentMode: 'DIRECT',
+      items: [{ productId: 'p1', quantity: 1, variantId: 'small', modifierSelections: ['milk'] }],
+    };
+    expect(fingerprintCheckoutIntent(base)).not.toBe(
+      fingerprintCheckoutIntent({ ...base, items: [{ ...base.items[0], variantId: 'large' }] }),
+    );
+    expect(fingerprintCheckoutIntent(base)).not.toBe(
+      fingerprintCheckoutIntent({ ...base, items: [{ ...base.items[0], modifierSelections: ['oat'] }] }),
+    );
   });
 
   test('changes to economic intent change the fingerprint', () => {
