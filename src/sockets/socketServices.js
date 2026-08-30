@@ -16,10 +16,16 @@ const FriendSocketService = require('../../services/friendSocketService');
 const TicketSocketService = require('../../services/ticketSocketService');
 const NotificationService = require('../../services/notificationService');
 const WebRTCSocketService = require('../../services/webrtcSocketService');
+const { setSocketIO: setBusinessNotificationSocketIO } = require('../../services/bizNotificationService');
 
 const vendorStatus = new Map();
 
 function createSocketServices(io, prisma, app) {
+    // BusinessNotification is persisted by a service used from financial
+    // workflows, so wire the already-authoritative Socket.IO instance into
+    // that chokepoint once at server bootstrap. No second transport is created.
+    setBusinessNotificationSocketIO(io);
+
     const tradeSocketService = new TradeSocketService(io, prisma);
     const chatSocketService = new ChatSocketService(io, prisma);
     const groupChatSocketService = new GroupChatSocketService(io, prisma);
