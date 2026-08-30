@@ -246,10 +246,19 @@ exports.payInvoice = async (req, res) => {
             actionPayload: { action: 'OPEN_INVOICE', invoiceId: invoice.id, route: `/business/invoices/${invoice.id}` },
           });
         }
-        if (io && bizOwnerId) io.to(`user_${bizOwnerId}`).emit('invoice_paid', {
+        const invoicePaidPayload = {
           invoiceId: invoice.id, invoiceRef: invoice.invoiceRef,
           customerPaidUsdc: customerPays, businessReceives, fee,
-        });
+        };
+        // The same post-commit convergence event goes to both the payer and
+        // the business owner. The business portal and Flutter customer inbox
+        // can therefore converge from the same authoritative settlement edge.
+        if (io) {
+          io.to(`user_${req.user.id}`).emit('invoice_paid', invoicePaidPayload);
+          if (bizOwnerId && bizOwnerId !== req.user.id) {
+            io.to(`user_${bizOwnerId}`).emit('invoice_paid', invoicePaidPayload);
+          }
+        }
       } catch (e) { logger.error({ err: e }, '[invoice/pay] notification error'); }
     });
     return res.json({ success: true, invoice, customerPays, businessReceives, fee });
