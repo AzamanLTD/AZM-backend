@@ -130,12 +130,14 @@ const payInvoice = async (prisma, {
   });
   if (!invoice) throw new Error('Invoice not found.');
   if (invoice.customerId !== customerId) throw new Error('Not authorized to pay this invoice.');
-  if (invoice.status !== 'SENT') throw new Error(`Invoice cannot be paid from status ${invoice.status}.`);
 
   // ── IDEMPOTENCY REPLAY ──────────────────────────────────────────────────
+  // Check the durable marker before the status gate. A committed PAID invoice
+  // is a successful replay, not an invalid state transition.
   if (invoice.payTxHash) {
     return { invoice, customerPays: Number(invoice.customerPaidUsdc), alreadyPaid: true };
   }
+  if (invoice.status !== 'SENT') throw new Error(`Invoice cannot be paid from status ${invoice.status}.`);
 
   // ── FEE CALCULATION ─────────────────────────────────────────────────────
   const settings = await prisma.globalSettings.findUnique({ where: { id: 1 } });
