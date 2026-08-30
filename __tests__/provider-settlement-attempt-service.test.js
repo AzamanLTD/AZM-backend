@@ -40,15 +40,19 @@ describe('providerSettlementAttemptService', () => {
     });
 
     test('updates a pending provider attempt to completed', async () => {
+        const pending = {
+            id: 'attempt-1',
+            transactionHistoryId: 'tx-1',
+            provider: 'MOOLRE',
+            providerReference: 'external-1',
+            status: 'PENDING'
+        };
+        const completed = { ...pending, status: 'COMPLETED', providerTransactionId: 'moolre-tx-1' };
         const prisma = {
-            $queryRawUnsafe: jest.fn().mockResolvedValueOnce([{
-                id: 'attempt-1',
-                transactionHistoryId: 'tx-1',
-                provider: 'MOOLRE',
-                providerReference: 'external-1',
-                status: 'PENDING'
-            }]),
-            $executeRawUnsafe: jest.fn().mockResolvedValue(1)
+            $queryRawUnsafe: jest.fn()
+                .mockResolvedValueOnce([pending])
+                .mockResolvedValueOnce([completed]),
+            $executeRawUnsafe: jest.fn()
         };
 
         const result = await recordProviderSettlementAttempt(prisma, {
