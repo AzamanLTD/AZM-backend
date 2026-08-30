@@ -16,6 +16,8 @@ const wrap = (fn) => async (req, res) => {
     }
 };
 
+const isFiniteNumber = (value) => typeof value === 'number' && Number.isFinite(value);
+
 const assertOrderParticipant = async (prisma, orderId, userId) => {
     const order = await prisma.businessOrder.findUnique({
         where: { id: orderId },
@@ -63,8 +65,14 @@ exports.updateLocation = wrap(async function updateLocation(req, res) {
     const userId = req.user.id;
     const { latitude, longitude, heading, speedKmh } = req.body;
 
-    if (latitude == null || longitude == null) {
-        return res.status(400).json({ success: false, message: 'latitude and longitude required' });
+    if (!isFiniteNumber(latitude) || !isFiniteNumber(longitude) || latitude < -90 || latitude > 90 || longitude < -180 || longitude > 180) {
+        return res.status(400).json({ success: false, message: 'valid latitude and longitude required' });
+    }
+    if (heading != null && (!isFiniteNumber(heading) || heading < 0 || heading >= 360)) {
+        return res.status(400).json({ success: false, message: 'invalid heading' });
+    }
+    if (speedKmh != null && (!isFiniteNumber(speedKmh) || speedKmh < 0)) {
+        return res.status(400).json({ success: false, message: 'invalid speedKmh' });
     }
 
     const order = await prisma.businessOrder.findUnique({
