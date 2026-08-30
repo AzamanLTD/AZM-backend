@@ -146,4 +146,69 @@ describe('Order tracking controller boundaries', () => {
 
         expect(prisma.businessOrder.findUnique).not.toHaveBeenCalled();
     });
+
+    test('status updates preserve zero-valued delivery coordinates and reuse one event timestamp', async () => {
+        const tracking = { timeline: [] };
+        const io = { to: jest.fn().mockReturnThis(), emit: jest.fn() };
+        const prisma = {
+            businessOrder: {
+                findUnique: jest.fn().mockResolvedValue({
+                    businessProfileId: 'biz-1',
+                    customerId: 'customer-1',
+                    status: 'PAID',
+                    orderRef: 'ORD-1',
+                }),
+            },
+            businessProfile: { findUnique: jest.fn().mockResolvedValue({ ownerId: 'owner-1' }) },
+            orderTracking: {
+                findUnique: jest.fn().mockResolvedValue(tracking),
+                update: jest.fn().mockImplementation(({ data }) => Promise.resolve({ ...tracking, ...data })),
+            },
+        };
+        const req = {
+            params: { orderId: 'order-1' },
+            user: { id: 'owner-1' },
+            body: {
+                status: 'DELIVERED',
+                deliveryLat: 0,
+                deliveryLng: 0,
+            },
+            app: { get: jest.fn((key) => key === 'prisma' ? prisma : key === 'io' ? io : undefined) },
+        };
+        const res = makeResponse();
+
+        await controller.updateStatus(req, res);
+
+        expect(prisma.orderTracking.update).toHaveBeenCalledWith(expect.objectContaining({
+            data: expect.objectContaining({ deliveryLatitude: 0, deliveryLongitude: 0 }),
+        }));
+        const updateCall = prisma.orderTracking.update.mock.calls[0][0];
+        const timelineTimestamp = updateCall.data.timeline[0].timestamp;
+        expect(io.emit).toHaveBeenCalledWith('order:status', expect.objectContaining({ timestamp: timelineTimestamp }));
+        expect(updateCall.data.actualArrival.toISOString()).toBe(timelineTimestamp);
+    });
+
+    test('status rejects invalid delivery coordinates before tracking mutation', async () => {
+        const prisma = {
+            businessOrder: {
+                findUnique: jest.fn().mockResolvedValue({ businessProfileId: 'biz-1' }),
+            },
+            businessProfile: { findUnique: jest.fn().mockResolvedValue({ ownerId: 'owner-1' }) },
+            orderTracking: { findUnique: jest.fn(), update: jest.fn() },
+        };
+        const req = {
+            params: { orderId: 'order-1' },
+            user: { id: 'owner-1' },
+            body: { status: 'DELIVERED', deliveryLat: 91, deliveryLng: 0 },
+            app: { get: jest.fn((key) => key === 'prisma' ? prisma : undefined) },
+        };
+        const res = makeResponse();
+
+        await controller.updateStatus(req, res);
+
+        expect(res.status).toHaveBeenCalledWith(400);
+        expect(res.json).toHaveBeenCalledWith({ success: false, message: 'invalid deliveryLat' });
+        expect(prisma.orderTracking.findUnique).not.toHaveBeenCalled();
+        expect(prisma.orderTracking.update).not.toHaveBeenCalled();
+    });
 });
