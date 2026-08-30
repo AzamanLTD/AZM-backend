@@ -11,11 +11,9 @@ describe('BusinessOrder — concurrency guards', () => {
 
     test('markDelivered uses a conditional PAID -> DELIVERED write', async () => {
         const updateMany = jest.fn().mockResolvedValue({ count: 1 });
-        const findUnique = jest.fn().mockResolvedValue({
-            id: 'order-1',
-            status: 'DELIVERED',
-            deliveredAt: new Date(),
-        });
+        const findUnique = jest.fn()
+            .mockResolvedValueOnce({ id: 'order-1', businessProfileId: 'biz-1', status: 'PAID' })
+            .mockResolvedValueOnce({ id: 'order-1', businessProfileId: 'biz-1', status: 'DELIVERED', deliveredAt: new Date() });
         const prisma = { businessOrder: { updateMany, findUnique } };
 
         const result = await service.markDelivered(prisma, {
@@ -32,7 +30,23 @@ describe('BusinessOrder — concurrency guards', () => {
 
     test('markDelivered does not overwrite a concurrent state transition', async () => {
         const updateMany = jest.fn().mockResolvedValue({ count: 0 });
+        const findUnique = jest.fn()
+            .mockResolvedValueOnce({ id: 'order-1', businessProfileId: 'biz-1', status: 'PAID' })
+            .mockResolvedValueOnce({ id: 'order-1', businessProfileId: 'biz-1', status: 'COMPLETED' });
+        const prisma = { businessOrder: { updateMany, findUnique } };
+
+        await expect(service.markDelivered(prisma, {
+            orderId: 'order-1',
+            businessProfileId: 'biz-1',
+        })).rejects.toThrow(/changed before delivery/i);
+
+        expect(updateMany).toHaveBeenCalledTimes(1);
+    });
+
+    test('markDelivered rejects a stale non-PAID snapshot before writing', async () => {
+        const updateMany = jest.fn();
         const findUnique = jest.fn().mockResolvedValue({
+            id: 'order-1',
             businessProfileId: 'biz-1',
             status: 'COMPLETED',
         });
@@ -42,8 +56,7 @@ describe('BusinessOrder — concurrency guards', () => {
             orderId: 'order-1',
             businessProfileId: 'biz-1',
         })).rejects.toThrow(/must be in PAID status/i);
-
-        expect(updateMany).toHaveBeenCalledTimes(1);
+        expect(updateMany).not.toHaveBeenCalled();
     });
 
     test('escrow propagation ignores an impossible source state instead of regressing the order', async () => {
