@@ -59,22 +59,33 @@ describe('providerSettlementAttemptService', () => {
             status: 'COMPLETED'
         });
 
-        expect(prisma.$executeRawUnsafe).toHaveBeenCalledTimes(1);
+        expect(prisma.$executeRawUnsafe).not.toHaveBeenCalled();
+        expect(prisma.$queryRawUnsafe).toHaveBeenCalledTimes(2);
         expect(result).toMatchObject({ id: 'attempt-1', changed: true, status: 'COMPLETED' });
     });
 
     test('does not regress a completed provider attempt when a late failed callback arrives', async () => {
         const prisma = {
-            $queryRawUnsafe: jest.fn().mockResolvedValueOnce([{
-                id: 'attempt-1',
-                transactionHistoryId: 'tx-1',
-                provider: 'MOOLRE',
-                providerReference: 'external-1',
-                providerTransactionId: 'moolre-tx-1',
-                status: 'COMPLETED',
-                failureReason: null
-            }]),
-            $executeRawUnsafe: jest.fn().mockResolvedValue(1)
+            $queryRawUnsafe: jest.fn()
+                .mockResolvedValueOnce([{
+                    id: 'attempt-1',
+                    transactionHistoryId: 'tx-1',
+                    provider: 'MOOLRE',
+                    providerReference: 'external-1',
+                    providerTransactionId: 'moolre-tx-1',
+                    status: 'COMPLETED',
+                    failureReason: null
+                }])
+                .mockResolvedValueOnce([{
+                    id: 'attempt-1',
+                    transactionHistoryId: 'tx-1',
+                    provider: 'MOOLRE',
+                    providerReference: 'external-1',
+                    providerTransactionId: 'late-failed-tx',
+                    status: 'COMPLETED',
+                    failureReason: null
+                }]),
+            $executeRawUnsafe: jest.fn()
         };
 
         const result = await recordProviderSettlementAttempt(prisma, {
@@ -86,22 +97,32 @@ describe('providerSettlementAttemptService', () => {
             failureReason: 'late contradictory callback'
         });
 
-        expect(prisma.$executeRawUnsafe).toHaveBeenCalledTimes(1);
+        expect(prisma.$executeRawUnsafe).not.toHaveBeenCalled();
         expect(result).toMatchObject({ id: 'attempt-1', changed: false, status: 'COMPLETED' });
     });
 
     test('does not regress a failed provider attempt when a late success callback arrives', async () => {
         const prisma = {
-            $queryRawUnsafe: jest.fn().mockResolvedValueOnce([{
-                id: 'attempt-1',
-                transactionHistoryId: 'tx-1',
-                provider: 'MOOLRE',
-                providerReference: 'external-1',
-                providerTransactionId: 'moolre-failed-tx',
-                status: 'FAILED',
-                failureReason: 'provider rejected transfer'
-            }]),
-            $executeRawUnsafe: jest.fn().mockResolvedValue(1)
+            $queryRawUnsafe: jest.fn()
+                .mockResolvedValueOnce([{
+                    id: 'attempt-1',
+                    transactionHistoryId: 'tx-1',
+                    provider: 'MOOLRE',
+                    providerReference: 'external-1',
+                    providerTransactionId: 'moolre-failed-tx',
+                    status: 'FAILED',
+                    failureReason: 'provider rejected transfer'
+                }])
+                .mockResolvedValueOnce([{
+                    id: 'attempt-1',
+                    transactionHistoryId: 'tx-1',
+                    provider: 'MOOLRE',
+                    providerReference: 'external-1',
+                    providerTransactionId: 'late-success-tx',
+                    status: 'FAILED',
+                    failureReason: 'provider rejected transfer'
+                }]),
+            $executeRawUnsafe: jest.fn()
         };
 
         const result = await recordProviderSettlementAttempt(prisma, {
@@ -112,7 +133,39 @@ describe('providerSettlementAttemptService', () => {
             status: 'COMPLETED'
         });
 
-        expect(prisma.$executeRawUnsafe).toHaveBeenCalledTimes(1);
+        expect(prisma.$executeRawUnsafe).not.toHaveBeenCalled();
         expect(result).toMatchObject({ id: 'attempt-1', changed: false, status: 'FAILED' });
+    });
+
+    test('returns the database winner if a concurrent callback terminalizes after the initial read', async () => {
+        const prisma = {
+            $queryRawUnsafe: jest.fn()
+                .mockResolvedValueOnce([{
+                    id: 'attempt-1',
+                    transactionHistoryId: 'tx-1',
+                    provider: 'MOOLRE',
+                    providerReference: 'external-1',
+                    status: 'PENDING'
+                }])
+                .mockResolvedValueOnce([{
+                    id: 'attempt-1',
+                    transactionHistoryId: 'tx-1',
+                    provider: 'MOOLRE',
+                    providerReference: 'external-1',
+                    status: 'FAILED',
+                    failureReason: 'another callback won'
+                }]),
+            $executeRawUnsafe: jest.fn()
+        };
+
+        const result = await recordProviderSettlementAttempt(prisma, {
+            reference: 'ref-1',
+            provider: 'MOOLRE',
+            providerReference: 'external-1',
+            providerTransactionId: 'late-success-tx',
+            status: 'COMPLETED'
+        });
+
+        expect(result).toMatchObject({ id: 'attempt-1', changed: true, status: 'FAILED' });
     });
 });
