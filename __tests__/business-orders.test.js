@@ -71,4 +71,40 @@ describeOrSkip('BusinessOrder — lifecycle', () => {
         const persisted = await prisma.businessOrder.findUnique({ where: { id: order.id } });
         expect(persisted.status).toBe('REFUNDED');
     });
+
+    test('escrow settlement can complete an order that was previously disputed', async () => {
+        const { biz, product } = await seedBusiness(prisma);
+        const customer = await seedUser(prisma);
+        const ticket = await prisma.ticket.create({ data: { creatorId: customer.id, counterpartyId: biz.userId, name: 'Dispute', type: 'ESCROW', targetAmount: 50, targetCurrency: 'USDC', status: 'OPEN', businessProfileId: biz.id, lastActivityAt: new Date() } });
+        const escrow = await prisma.smartEscrow.create({ data: { ticketId: ticket.id, payerId: customer.id, payeeId: biz.userId, amountUsdc: 50, feeUsdc: 0.5, status: 'DISPUTED' } });
+        const order = await prisma.businessOrder.create({ data: { businessProfileId: biz.id, customerId: customer.id, productId: product.id, escrowId: escrow.id, status: 'DISPUTED', title: 'Resolved Dispute', amountUsdc: 50, orderRef: `ORD-DISPUTE-${Date.now()}` } });
+
+        const result = await businessOrderService.updateOrderStatusFromEscrow(prisma, escrow.id, 'SETTLED');
+        expect(result.status).toBe('COMPLETED');
+        expect(result.completedAt).toBeTruthy();
+        const persisted = await prisma.businessOrder.findUnique({ where: { id: order.id } });
+        expect(persisted.status).toBe('COMPLETED');
+    });
+
+    test('business order pagination has a deterministic tie-breaker and validates date ranges', async () => {
+        const { biz } = await seedBusiness(prisma);
+        const customer = await seedUser(prisma);
+        const createdAt = new Date('2026-08-30T12:00:00.000Z');
+        const orders = await Promise.all([
+            prisma.businessOrder.create({ data: { businessProfileId: biz.id, customerId: customer.id, status: 'PAID', title: 'One', amountUsdc: 10, orderRef: `ORD-PAGE-1-${Date.now()}`, createdAt } }),
+            prisma.businessOrder.create({ data: { businessProfileId: biz.id, customerId: customer.id, status: 'PAID', title: 'Two', amountUsdc: 20, orderRef: `ORD-PAGE-2-${Date.now()}`, createdAt } }),
+            prisma.businessOrder.create({ data: { businessProfileId: biz.id, customerId: customer.id, status: 'PAID', title: 'Three', amountUsdc: 30, orderRef: `ORD-PAGE-3-${Date.now()}`, createdAt } }),
+        ]);
+
+        const first = await businessOrderService.listOrdersForBusiness(prisma, { businessProfileId: biz.id, limit: 2 });
+        expect(first.orders).toHaveLength(2);
+        expect(first.hasMore).toBe(true);
+        expect(first.nextCursor).toBe(first.orders[1].id);
+
+        const second = await businessOrderService.listOrdersForBusiness(prisma, { businessProfileId: biz.id, limit: 2, cursor: first.nextCursor });
+        expect(second.orders).toHaveLength(1);
+        expect(new Set([...first.orders, ...second.orders].map(order => order.id))).toEqual(new Set(orders.map(order => order.id)));
+        await expect(businessOrderService.listOrdersForBusiness(prisma, { businessProfileId: biz.id, dateFrom: 'not-a-date' })).rejects.toThrow(/dateFrom must be a valid date/i);
+        await expect(businessOrderService.listOrdersForBusiness(prisma, { businessProfileId: biz.id, dateFrom: '2026-08-31', dateTo: '2026-08-30' })).rejects.toThrow(/dateFrom must be earlier/i);
+    });
 });
