@@ -47,7 +47,7 @@ const _cursorBoundary = async (prisma, cursor, scopeWhere) => {
         where: { id: String(cursor), ...scopeWhere },
         select: { id: true, createdAt: true },
     });
-    if (!row) throw new Error('cursor must reference an order in the requested scope.');
+    if (!row) throw new Error('cursor must reference an existing order in the requested scope.');
     return row;
 };
 
@@ -68,13 +68,8 @@ const createOrder = async (prisma, { businessProfileId, customerId, productId, e
         if (!product.isActive) throw new Error('Product is not available.');
     }
 
-    // Legacy order creation may accept an escrow id, but it must never be able
-    // to attach another customer's or another business owner's escrow.
     if (escrowId) {
-        const escrow = await prisma.smartEscrow.findUnique({
-            where: { id: escrowId },
-            select: { id: true, payerId: true, payeeId: true, amountUsdc: true },
-        });
+        const escrow = await prisma.smartEscrow.findUnique({ where: { id: escrowId }, select: { id: true, payerId: true, payeeId: true, amountUsdc: true } });
         if (!escrow) throw new Error('Escrow not found.');
         if (escrow.payerId !== customerId) throw new Error('Escrow payer does not match the customer.');
         if (escrow.payeeId !== business.userId) throw new Error('Escrow payee does not match the business owner.');
