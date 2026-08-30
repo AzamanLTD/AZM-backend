@@ -6,13 +6,14 @@
 // provider + providerReference identifies one external attempt and links it
 // directly to the canonical TransactionHistory row.
 //
-// This module deliberately uses parameterized raw SQL because the repository's
-// Prisma schema/client is generated from a very large legacy schema. The SQL
-// migration is the source of truth for this additive table; no financial state
-// is trusted from the attempt row itself.
+// Provider callbacks are not assumed to arrive in order. Once an attempt is
+// terminal, a later contradictory callback may enrich its evidence but may not
+// regress its terminal status. TransactionHistory remains the financial source
+// of truth; this table is durable provider evidence and correlation metadata.
 // =============================================================================
 
 const PROVIDER_VALUES = new Set(['MTN_MOMO_DISBURSEMENT', 'MOOLRE']);
+const ATTEMPT_STATUSES = new Set(['PENDING', 'COMPLETED', 'FAILED']);
 
 const normalizeProvider = (provider) => {
     const value = String(provider || '').trim().toUpperCase();
@@ -23,6 +24,18 @@ const normalizeProvider = (provider) => {
     }
     return value;
 };
+
+const normalizeStatus = (status) => {
+    const value = String(status || 'PENDING').trim().toUpperCase();
+    if (!ATTEMPT_STATUSES.has(value)) {
+        const error = new Error(`[providerSettlementAttempt] unsupported status: ${status}`);
+        error.code = 'UNSUPPORTED_STATUS';
+        throw error;
+    }
+    return value;
+};
+
+const terminalStatus = (status) => status === 'COMPLETED' || status === 'FAILED';
 
 const recordProviderSettlementAttempt = async (prisma, {
     reference,
@@ -37,6 +50,7 @@ const recordProviderSettlementAttempt = async (prisma, {
     if (!providerReference) throw new Error('[providerSettlementAttempt] providerReference is required.');
 
     const normalizedProvider = normalizeProvider(provider);
+    const normalizedStatus = normalizeStatus(status);
     const existingRows = await prisma.$queryRawUnsafe(
         `SELECT psa."id", psa."transactionHistoryId", psa."provider", psa."providerReference",
                 psa."providerTransactionId", psa."status", psa."firstSeenAt", psa."lastSeenAt",
@@ -54,19 +68,35 @@ const recordProviderSettlementAttempt = async (prisma, {
         await prisma.$executeRawUnsafe(
             `UPDATE "ProviderSettlementAttempt"
                 SET "providerTransactionId" = COALESCE($1, "providerTransactionId"),
-                    "status" = $2,
+                    "status" = CASE
+                        WHEN "status" IN ('COMPLETED', 'FAILED') THEN "status"
+                        ELSE $2
+                    END,
                     "lastSeenAt" = CURRENT_TIMESTAMP,
-                    "settledAt" = CASE WHEN $2 IN ('COMPLETED','FAILED') THEN COALESCE("settledAt", CURRENT_TIMESTAMP) ELSE "settledAt" END,
-                    "failureReason" = COALESCE($3, "failureReason"),
+                    "settledAt" = CASE
+                        WHEN "status" IN ('COMPLETED', 'FAILED') THEN COALESCE("settledAt", CURRENT_TIMESTAMP)
+                        WHEN $2 IN ('COMPLETED', 'FAILED') THEN CURRENT_TIMESTAMP
+                        ELSE "settledAt"
+                    END,
+                    "failureReason" = CASE
+                        WHEN "status" = 'COMPLETED' THEN "failureReason"
+                        WHEN $2 = 'FAILED' THEN COALESCE($3, "failureReason")
+                        ELSE "failureReason"
+                    END,
                     "metadata" = COALESCE($4::jsonb, "metadata")
               WHERE "id" = $5`,
             providerTransactionId ? String(providerTransactionId) : null,
-            String(status),
+            normalizedStatus,
             failureReason || null,
             metadata == null ? null : JSON.stringify(metadata),
             row.id
         );
-        return { ...row, changed: false, id: row.id };
+        return {
+            ...row,
+            changed: !terminalStatus(row.status) && row.status !== normalizedStatus,
+            id: row.id,
+            status: terminalStatus(row.status) ? row.status : normalizedStatus
+        };
     }
 
     const txRows = await prisma.$queryRawUnsafe(
@@ -88,17 +118,28 @@ const recordProviderSettlementAttempt = async (prisma, {
                  $6, $7::jsonb)
          ON CONFLICT ("provider", "providerReference") DO UPDATE
             SET "providerTransactionId" = COALESCE(EXCLUDED."providerTransactionId", "ProviderSettlementAttempt"."providerTransactionId"),
-                "status" = EXCLUDED."status",
+                "status" = CASE
+                    WHEN "ProviderSettlementAttempt"."status" IN ('COMPLETED', 'FAILED') THEN "ProviderSettlementAttempt"."status"
+                    ELSE EXCLUDED."status"
+                END,
                 "lastSeenAt" = CURRENT_TIMESTAMP,
-                "settledAt" = CASE WHEN EXCLUDED."status" IN ('COMPLETED','FAILED') THEN COALESCE("ProviderSettlementAttempt"."settledAt", CURRENT_TIMESTAMP) ELSE "ProviderSettlementAttempt"."settledAt" END,
-                "failureReason" = COALESCE(EXCLUDED."failureReason", "ProviderSettlementAttempt"."failureReason"),
+                "settledAt" = CASE
+                    WHEN "ProviderSettlementAttempt"."status" IN ('COMPLETED', 'FAILED') THEN COALESCE("ProviderSettlementAttempt"."settledAt", CURRENT_TIMESTAMP)
+                    WHEN EXCLUDED."status" IN ('COMPLETED','FAILED') THEN CURRENT_TIMESTAMP
+                    ELSE "ProviderSettlementAttempt"."settledAt"
+                END,
+                "failureReason" = CASE
+                    WHEN "ProviderSettlementAttempt"."status" = 'COMPLETED' THEN "ProviderSettlementAttempt"."failureReason"
+                    WHEN EXCLUDED."status" = 'FAILED' THEN COALESCE(EXCLUDED."failureReason", "ProviderSettlementAttempt"."failureReason")
+                    ELSE "ProviderSettlementAttempt"."failureReason"
+                END,
                 "metadata" = COALESCE(EXCLUDED."metadata", "ProviderSettlementAttempt"."metadata")
          RETURNING "id", "transactionHistoryId", "provider", "providerReference", "providerTransactionId", "status", "firstSeenAt", "lastSeenAt", "settledAt", "failureReason", "metadata"`,
         transaction.id,
         normalizedProvider,
         String(providerReference),
         providerTransactionId ? String(providerTransactionId) : null,
-        String(status),
+        normalizedStatus,
         failureReason || null,
         metadata == null ? null : JSON.stringify(metadata)
     );
@@ -120,6 +161,7 @@ const getProviderSettlementAttempt = async (prisma, { provider, providerReferenc
 
 module.exports = {
     normalizeProvider,
+    normalizeStatus,
     recordProviderSettlementAttempt,
     getProviderSettlementAttempt
 };
