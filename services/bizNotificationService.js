@@ -19,6 +19,12 @@
 
 const logger = require('../src/config/logger');
 
+let _socketIo = null;
+
+const setSocketIO = (io) => {
+    _socketIo = io || null;
+};
+
 const VALID_TYPES = new Set([
     'NEW_ORDER', 'ORDER_FUNDED', 'ORDER_SATISFIED', 'ORDER_DISPUTED',
     'ORDER_SETTLED', 'ORDER_CANCELLED', 'ORDER_REFUNDED', 'KYB_STATUS_CHANGED'
@@ -84,6 +90,27 @@ const createNotification = async (prisma, { businessProfileId, type, title, body
     }
 };
 
+const _emitNotificationSignal = (notification, order) => {
+    if (!_socketIo || !notification || !order?.businessProfile?.userId) return;
+
+    const payload = {
+        notificationId: notification.id,
+        businessProfileId: notification.businessProfileId,
+        type: notification.type,
+        orderId: order.id,
+        orderRef: order.orderRef,
+        ticketId: order.ticketId,
+        escrowId: notification.metadata?.escrowId || null,
+        createdAt: notification.createdAt
+    };
+
+    try {
+        _socketIo.to(`user_${order.businessProfile.userId}`).emit('biz_notification', payload);
+    } catch (err) {
+        logger.warn({ err, notificationId: notification.id }, '[bizNotificationService] realtime emit failed');
+    }
+};
+
 const notifyOrderEvent = async (prisma, { escrowId, type, title, body, extraMetadata }) => {
     try {
         if (!escrowId) return null;
@@ -115,6 +142,7 @@ const notifyOrderEvent = async (prisma, { escrowId, type, title, body, extraMeta
             }
         });
 
+        if (notification) _emitNotificationSignal(notification, order);
         return { notification, order };
     } catch (err) {
         logger.error({ err: err }, '[bizNotificationService.notifyOrderEvent]');
@@ -230,5 +258,6 @@ module.exports = {
     getNotifications,
     getUnreadCount,
     markAsRead,
-    markAllAsRead
+    markAllAsRead,
+    setSocketIO
 };
