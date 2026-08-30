@@ -8,7 +8,7 @@ describe('PayoutBatchWorker canonical withdrawal transaction', () => {
         autoPayoutIntervalMs: 120000,
     };
 
-    test('atomically claims before dispatching with the existing canonical transaction reference', async () => {
+    test('atomically claims before dispatching with the existing canonical transaction reference and network', async () => {
         const initiateTransfer = jest.fn().mockResolvedValue({ status: 'ACCEPTED' });
         const withdrawalUpdate = jest.fn().mockResolvedValue({});
         const withdrawalUpdateMany = jest.fn().mockResolvedValue({ count: 1 });
@@ -29,6 +29,7 @@ describe('PayoutBatchWorker canonical withdrawal transaction', () => {
                     userId: 7,
                     amount: 50,
                     destination: '0240000000',
+                    network: 'TELECEL',
                     payoutMethod: 'MTN_MOMO',
                     createdAt: new Date('2026-08-30T10:00:00.000Z'),
                 }]),
@@ -53,6 +54,7 @@ describe('PayoutBatchWorker canonical withdrawal transaction', () => {
         expect(initiateTransfer).toHaveBeenCalledWith(expect.objectContaining({
             referenceId: 'canonical-ref-1',
             externalId: 'auto_payout_91',
+            network: 'TELECEL',
         }));
         expect(withdrawalUpdate).not.toHaveBeenCalled();
         expect(txCreate).not.toHaveBeenCalled();
@@ -69,6 +71,7 @@ describe('PayoutBatchWorker canonical withdrawal transaction', () => {
                     userId: 7,
                     amount: 50,
                     destination: '0240000000',
+                    network: 'MTN',
                     payoutMethod: 'MTN_MOMO',
                     createdAt: new Date('2026-08-30T10:00:00.000Z'),
                 }]),
@@ -105,6 +108,7 @@ describe('PayoutBatchWorker canonical withdrawal transaction', () => {
                     userId: 7,
                     amount: 50,
                     destination: '0240000000',
+                    network: 'AIRTELTIGO',
                     payoutMethod: 'MTN_MOMO',
                     createdAt: new Date('2026-08-30T10:00:00.000Z'),
                 }]),

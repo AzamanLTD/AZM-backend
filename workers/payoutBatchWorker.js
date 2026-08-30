@@ -13,7 +13,7 @@
 // admins can see them in a dedicated War Room section.
 //
 // This worker does NOT replace withdrawalReconciliationWorker — that one
-// handles MTN settlement status polling. This worker handles the DECISION
+// handles provider settlement status polling. This worker handles the DECISION
 // of whether to auto-dispatch vs. flag for manual admin action.
 //
 // Flow per tick:
@@ -39,7 +39,7 @@
 const logger = require('../src/config/logger');
 
 const DEFAULT_INTERVAL_MS = 120_000;  // 2 minutes
-const MAX_BATCH_SIZE      = 25;       // Don't overwhelm MTN in one tick
+const MAX_BATCH_SIZE      = 25;       // Don't overwhelm the provider in one tick
 
 class PayoutBatchWorker {
     constructor(prisma, io, mtnDisbursementService, notificationService) {
@@ -296,9 +296,10 @@ class PayoutBatchWorker {
                     referenceId,
                     amountGhs,
                     recipientPhone,
+                    network: withdrawal.network || 'MTN',
                     externalId: `auto_payout_${withdrawal.id}`,
                     payerMessage: 'Azaman withdrawal',
-                    payeeNote: `Payout #${withdrawal.id}`
+                    payeeNote: `Payout #${withdrawal.id} (${withdrawal.network || 'MTN'})`
                 });
 
                 runningPoolBalance -= amount;
@@ -308,18 +309,19 @@ class PayoutBatchWorker {
                     amount,
                     amountGhs,
                     referenceId,
+                    network: withdrawal.network || 'MTN',
                     mtnStatus: dispatchResult.status
                 });
 
-                logger.info(`[PayoutBatchWorker] dispatched withdrawal #${withdrawal.id}: $${amount} → GHS ${amountGhs} (ref: ${referenceId})`);
+                logger.info(`[PayoutBatchWorker] dispatched withdrawal #${withdrawal.id}: $${amount} → GHS ${amountGhs} (network: ${withdrawal.network || 'MTN'}, ref: ${referenceId})`);
             } catch (dispatchErr) {
-                logger.error(`[PayoutBatchWorker] MTN dispatch failed for withdrawal #${withdrawal.id}:`, dispatchErr.message);
-                await this._flagForManualReview(withdrawal, 'MTN_DISPATCH_FAILED', {
+                logger.error(`[PayoutBatchWorker] provider dispatch failed for withdrawal #${withdrawal.id}:`, dispatchErr.message);
+                await this._flagForManualReview(withdrawal, 'DISBURSEMENT_DISPATCH_FAILED', {
                     amount,
                     error: dispatchErr.message,
-                    message: `MTN dispatch failed: ${dispatchErr.message}`
+                    message: `Disbursement dispatch failed: ${dispatchErr.message}`
                 });
-                results.flaggedManualReview.push({ id: withdrawal.id, reason: 'MTN_DISPATCH_FAILED', amount, error: dispatchErr.message });
+                results.flaggedManualReview.push({ id: withdrawal.id, reason: 'DISBURSEMENT_DISPATCH_FAILED', amount, error: dispatchErr.message });
             }
         }
 
