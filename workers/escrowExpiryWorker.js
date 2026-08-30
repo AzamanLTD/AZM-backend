@@ -10,10 +10,11 @@
 //   1. EXPIRE UNFUNDED  — DRAFT escrows past expiresAt → EXPIRED, parent ticket
 //      CANCELLED, SYSTEM message injected. No money has moved.
 //   2. WARN INACTIVE    — FUNDED escrows whose updatedAt is older than
-//      (FUNDED window - 5 days) and not yet warned → push both parties,
-//      stamp warningSentAt.
+//      (FUNDED window - 5 days) and not yet warned → push both parties, stamp
+//      warningSentAt.
 //   3. EXPIRE INACTIVE  — FUNDED escrows past expiresAt → refund payer via
-//      escrowService._refundEscrow(..., 'EXPIRED'), SYSTEM message, close ticket.
+//      escrowService._refundEscrow(..., 'EXPIRED'), SYSTEM message, close ticket,
+//      and emit canonical realtime convergence signals.
 // =============================================================================
 
 const logger = require('../src/config/logger');
@@ -143,7 +144,16 @@ class EscrowExpiryWorker {
         for (const escrow of expired) {
             try {
                 // Refund the payer and stamp EXPIRED (transactional inside service).
-                await escrowService._refundEscrow(this.prisma, escrow.id, 'EXPIRED');
+                const refunded = await escrowService._refundEscrow(this.prisma, escrow.id, 'EXPIRED');
+
+                // The financial transaction has committed. Realtime delivery is
+                // deliberately a convergence signal: clients must refetch their
+                // canonical escrow/balance state instead of trusting this payload.
+                this._emitRefundConvergence(refunded, {
+                    payerId: escrow.payerId,
+                    payeeId: escrow.payeeId,
+                    ticketId: escrow.ticketId
+                });
 
                 if (escrow.ticket && escrow.ticket.status === 'OPEN') {
                     await this.prisma.ticket.update({
@@ -161,6 +171,36 @@ class EscrowExpiryWorker {
                 logger.error(`[EscrowExpiryWorker] expire-funded ${escrow.id} failed:`, err.message);
             }
         }
+    }
+
+    _emitRefundConvergence(escrow, { payerId, payeeId, ticketId }) {
+        if (!this.io || !escrow) return;
+        const payload = {
+            escrowId: escrow.id,
+            ticketId: ticketId || escrow.ticketId,
+            status: escrow.status,
+            amountUsdc: escrow.amountUsdc,
+            payerId,
+            payeeId,
+            reason: 'EXPIRY'
+        };
+
+        // Both participants need to converge their escrow/order projections.
+        for (const userId of [payerId, payeeId]) {
+            this.io.to(`user_${userId}`).emit('escrow_refunded', payload);
+        }
+
+        // The payer's balance changed; emit a signal, not a balance snapshot.
+        // Clients refetch GET /api/users/balance as the source of truth.
+        this.io.to(`user_${payerId}`).emit('balance_update', {
+            userId: payerId,
+            escrowId: escrow.id,
+            reason: 'escrow_refunded'
+        });
+
+        // Admin is a governance projection and should converge on the same
+        // terminal financial transition without receiving private balance data.
+        this.io.to('admin_spy_room').emit('escrow_refunded', payload);
     }
 
     // ── helper: inject a SYSTEM TicketMessage + fan out ───────────────────────
