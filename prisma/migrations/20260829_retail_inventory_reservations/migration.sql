@@ -1,7 +1,7 @@
 -- Retail inventory integrity: reserve tracked stock atomically when an order line
 -- is created and release the reservation exactly once on cancellation/refund.
--- The boot-time installer mirrors these statements because production currently
--- converges with `prisma db push` rather than `prisma migrate deploy`.
+-- The reservation trigger only acts for order lines belonging to an
+-- AWAITING_PAYMENT order, which is the canonical retail checkout state.
 
 ALTER TABLE "BusinessOrderItem"
   ADD COLUMN IF NOT EXISTS "stockReserved" BOOLEAN NOT NULL DEFAULT FALSE;
@@ -12,7 +12,17 @@ LANGUAGE plpgsql
 AS $$
 DECLARE
   tracked_stock INTEGER;
+  parent_status TEXT;
 BEGIN
+  SELECT "status" INTO parent_status
+  FROM "BusinessOrder"
+  WHERE id = NEW."orderId";
+
+  IF parent_status IS DISTINCT FROM 'AWAITING_PAYMENT' THEN
+    NEW."stockReserved" := FALSE;
+    RETURN NEW;
+  END IF;
+
   SELECT "stockQty" INTO tracked_stock
   FROM "BusinessProduct"
   WHERE id = NEW."productId"
@@ -50,12 +60,17 @@ AS $$
 BEGIN
   IF NEW.status IN ('CANCELLED', 'REFUNDED')
      AND OLD.status NOT IN ('CANCELLED', 'REFUNDED') THEN
+    WITH release_totals AS (
+      SELECT "productId", SUM(quantity) AS quantity
+      FROM "BusinessOrderItem"
+      WHERE "orderId" = NEW.id
+        AND "stockReserved" = TRUE
+      GROUP BY "productId"
+    )
     UPDATE "BusinessProduct" p
-    SET "stockQty" = p."stockQty" + i.quantity
-    FROM "BusinessOrderItem" i
-    WHERE i."orderId" = NEW.id
-      AND i."stockReserved" = TRUE
-      AND i."productId" = p.id;
+    SET "stockQty" = p."stockQty" + release_totals.quantity
+    FROM release_totals
+    WHERE p.id = release_totals."productId";
 
     UPDATE "BusinessOrderItem"
     SET "stockReserved" = FALSE
