@@ -59,7 +59,9 @@ async function startWorkers(app, {
     app.set('payoutBatchWorker', payoutBatchWorker);
 
     const EscrowExpiryWorker = require('../../workers/escrowExpiryWorker');
-    const escrowExpiryWorker = new EscrowExpiryWorker(prisma, io, notificationService);
+    const escrowExpiryWorker = new EscrowExpiryWorker(prisma, io, notificationService, {
+        emitBalanceUpdate: app.get('emitBalanceUpdate')
+    });
     app.set('escrowExpiryWorker', escrowExpiryWorker);
 
     const VaultWorker = require('../../workers/vaultWorker');
