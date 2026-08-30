@@ -108,6 +108,7 @@ function mountRoutes(app, {
     app.use('/api/admin/control-plane', generalLimiter, require('../../routes/adminControlPlaneRoutes'));
     app.use('/api/admin/control-plane', generalLimiter, require('../../routes/adminControlPlaneSummaryRoutes'));
     app.use('/api/admin/control-plane', generalLimiter, require('../../routes/adminControlPlaneExecutiveRoutes'));
+    app.use('/api/admin/control-plane', generalLimiter, require('../../routes/adminReconciliationRoutes'));
 
     app.use('/api/marketplace', generalLimiter, require('../../routes/marketplaceRoutes'));
     app.use('/api/business-os', generalLimiter, require('../../routes/businessOSRoutes'));
