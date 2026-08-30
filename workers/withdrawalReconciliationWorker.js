@@ -92,12 +92,34 @@ class WithdrawalReconciliationWorker {
         }
     }
 
-    async _reconcileOne(withdrawal) {
-        // Legacy Withdrawal rows predate an explicit reference column. Until
-        // that mirror is migrated, correlation is deliberately treated as a
-        // recovery heuristic and is SAFE only when exactly one candidate exists.
-        // Missing or ambiguous matches become durable operational exceptions;
-        // the worker never guesses and never mutates money on an unsafe match.
+    async _findCanonicalTransaction(withdrawal) {
+        // The durable identity bridge is stored on Withdrawal by the SQL
+        // migration. It is read through raw SQL until the generated Prisma
+        // client is regenerated from the additive schema relation. This keeps
+        // the worker compatible with the current checked-in client while making
+        // the database identity authoritative immediately.
+        if (typeof this.prisma.$queryRawUnsafe === 'function') {
+            const linkedRows = await this.prisma.$queryRawUnsafe(
+                'SELECT "transactionHistoryId" FROM "Withdrawal" WHERE "id" = $1 LIMIT 1',
+                withdrawal.id
+            );
+            const linkedId = linkedRows?.[0]?.transactionHistoryId;
+            if (linkedId) {
+                const linked = await this.prisma.transactionHistory.findUnique({ where: { id: linkedId } });
+                if (linked) return { row: linked, linked: true };
+
+                await this._recordException(
+                    withdrawal,
+                    'LINKED_TRANSACTION_NOT_FOUND',
+                    { transactionHistoryId: String(linkedId) }
+                );
+                return { row: null, linked: true };
+            }
+        }
+
+        // Legacy rows and rows created before the link trigger may not yet have
+        // a direct identity. Correlation is therefore a strictly guarded
+        // migration fallback: exactly one candidate or no mutation.
         const txRows = await this.prisma.transactionHistory.findMany({
             where: {
                 userId: withdrawal.userId,
@@ -118,8 +140,7 @@ class WithdrawalReconciliationWorker {
                 'MISSING_TRANSACTION_REFERENCE',
                 { userId: withdrawal.userId, amount: String(withdrawal.amount), createdAt: withdrawal.createdAt.toISOString() }
             );
-            logger.warn(`[WithdrawalReconciliation] row id=${withdrawal.id}: no matching TransactionHistory reference — queued exception.`);
-            return;
+            return { row: null, linked: false };
         }
 
         if (txRows.length > 1) {
@@ -128,8 +149,7 @@ class WithdrawalReconciliationWorker {
                 'AMBIGUOUS_TRANSACTION_REFERENCE',
                 { candidateTransactionIds: txRows.map((row) => row.id), candidateReferences: txRows.map((row) => row.txHash).filter(Boolean) }
             );
-            logger.error(`[WithdrawalReconciliation] row id=${withdrawal.id}: multiple TransactionHistory candidates — refusing to guess.`);
-            return;
+            return { row: null, linked: false };
         }
 
         const txRow = txRows[0];
@@ -139,7 +159,34 @@ class WithdrawalReconciliationWorker {
                 'TRANSACTION_MISSING_REFERENCE',
                 { transactionId: txRow.id }
             );
-            logger.error(`[WithdrawalReconciliation] row id=${withdrawal.id}: canonical transaction ${txRow.id} has no txHash.`);
+            return { row: null, linked: false };
+        }
+
+        // Promote a safely correlated legacy row into the durable identity
+        // bridge. The UPDATE is conditional so two workers cannot overwrite a
+        // link that another process established first.
+        if (typeof this.prisma.$executeRawUnsafe === 'function') {
+            await this.prisma.$executeRawUnsafe(
+                'UPDATE "Withdrawal" SET "transactionHistoryId" = $1 WHERE "id" = $2 AND "transactionHistoryId" IS NULL',
+                txRow.id,
+                withdrawal.id
+            );
+        }
+
+        return { row: txRow, linked: false };
+    }
+
+    async _reconcileOne(withdrawal) {
+        const canonical = await this._findCanonicalTransaction(withdrawal);
+        const txRow = canonical.row;
+        if (!txRow) return;
+
+        if (!txRow.txHash) {
+            await this._recordException(
+                withdrawal,
+                'TRANSACTION_MISSING_REFERENCE',
+                { transactionId: txRow.id }
+            );
             return;
         }
 
