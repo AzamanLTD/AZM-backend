@@ -19,8 +19,20 @@ describe('WithdrawalReconciliationWorker settlement lifecycle', () => {
     },
   };
 
+  const attemptDb = () => ({
+    $queryRawUnsafe: jest.fn().mockResolvedValue([{
+      id: 'attempt-1',
+      transactionHistoryId: 'tx-1',
+      provider: 'MTN_MOMO_DISBURSEMENT',
+      providerReference: 'ref-1',
+      status: 'PENDING',
+    }]),
+    $executeRawUnsafe: jest.fn().mockResolvedValue(1),
+  });
+
   test('provider success advances canonical TransactionHistory from PENDING to COMPLETED', async () => {
     const prisma = {
+      ...attemptDb(),
       transactionHistory: {
         findFirst: jest.fn().mockResolvedValue({
           id: 'tx-1',
@@ -65,6 +77,7 @@ describe('WithdrawalReconciliationWorker settlement lifecycle', () => {
 
   test('provider failure uses the canonical reversal service and marks the mirror failed', async () => {
     const prisma = {
+      ...attemptDb(),
       transactionHistory: {
         findFirst: jest.fn().mockResolvedValue({
           id: 'tx-2',

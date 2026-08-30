@@ -11,8 +11,9 @@
 
 const logger = require('../src/config/logger');
 const financeService = require('../services/finance.service');
+const { recordProviderSettlementAttempt } = require('../services/providerSettlementAttemptService');
 
-const RECONCILE_INTERVAL_MS = 60_000;
+const RECONCILE_INTERVAL_MS = 30_000;
 const STALE_AFTER_MS        = 30_000;
 const MAX_BATCH_SIZE        = 50;
 
@@ -76,9 +77,10 @@ class WithdrawalReconciliationWorker {
     }
 
     async _reconcileOne(withdrawal) {
-        // Legacy Withdrawal rows predate an explicit reference column, so the
-        // canonical TransactionHistory row remains the correlation source.
-        // Once the providerRef is known it is persisted there for audit/search.
+        // Legacy Withdrawal rows predate an explicit reference column. Until
+        // that mirror is migrated, the canonical TransactionHistory row is the
+        // recovery correlation source. Once found, the provider attempt itself
+        // is persisted explicitly and becomes the durable external identity.
         const txRow = await this.prisma.transactionHistory.findFirst({
             where: {
                 userId: withdrawal.userId,
@@ -108,6 +110,19 @@ class WithdrawalReconciliationWorker {
 
         const remoteStatus = String((statusResp && statusResp.status) || 'PENDING').toUpperCase();
         const providerRef = statusResp?.providerRef || statusResp?.referenceId || statusResp?.transactionId || statusResp?.txId || null;
+
+        await recordProviderSettlementAttempt(this.prisma, {
+            reference,
+            provider: 'MTN_MOMO_DISBURSEMENT',
+            providerReference: reference,
+            providerTransactionId: providerRef,
+            status: ['SUCCESSFUL', 'COMPLETED'].includes(remoteStatus)
+                ? 'COMPLETED'
+                : ['FAILED', 'REJECTED'].includes(remoteStatus) ? 'FAILED' : 'PENDING',
+            failureReason: ['FAILED', 'REJECTED'].includes(remoteStatus)
+                ? (statusResp.reason || 'provider_async_failure')
+                : null
+        });
 
         if (remoteStatus === 'PENDING' || remoteStatus === 'PROCESSING') return;
 

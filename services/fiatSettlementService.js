@@ -11,10 +11,12 @@
 // =============================================================================
 
 const financeService = require('./finance.service');
+const { recordProviderSettlementAttempt } = require('./providerSettlementAttemptService');
 
 const settleFiatWithdrawal = async (prisma, {
     reference,
     status,
+    provider = 'MTN_MOMO_DISBURSEMENT',
     providerTxId = null,
     reason = null
 }) => {
@@ -37,6 +39,18 @@ const settleFiatWithdrawal = async (prisma, {
         error.code = 'WRONG_TRANSACTION_TYPE';
         throw error;
     }
+
+    // Durable external identity is recorded independently of the ledger state.
+    // This means duplicate/late callbacks can always be correlated to the same
+    // provider attempt without user+amount+timestamp heuristics.
+    await recordProviderSettlementAttempt(prisma, {
+        reference,
+        provider,
+        providerReference: reference,
+        providerTransactionId: providerTxId,
+        status: status === 'SUCCESSFUL' ? 'COMPLETED' : 'FAILED',
+        failureReason: status === 'FAILED' ? reason : null
+    });
 
     // SUCCESSFUL: atomically claim only PENDING rows. A duplicate callback is
     // therefore harmless, and a late SUCCESS cannot resurrect a FAILED row.

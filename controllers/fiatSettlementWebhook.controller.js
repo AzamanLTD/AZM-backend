@@ -10,6 +10,7 @@
 const crypto = require('crypto');
 const logger = require('../src/config/logger');
 const { settleFiatWithdrawal } = require('../services/fiatSettlementService');
+const { recordProviderSettlementAttempt } = require('../services/providerSettlementAttemptService');
 
 const notificationService = (req) => {
     const existing = req.app.get('notificationService');
@@ -108,6 +109,15 @@ const handleSettlement = (provider, authenticate, normalize) => async (req, res)
         const prisma = req.app.get('prisma');
         const io = req.app.get('socketio');
         const row = await prisma.transactionHistory.findUnique({ where: { txHash: normalized.reference } });
+        if (row) {
+            await recordProviderSettlementAttempt(prisma, {
+                reference: normalized.reference,
+                provider,
+                providerReference: normalized.reference,
+                providerTransactionId: normalized.providerTxId,
+                status: 'PENDING'
+            });
+        }
         if (row && io) {
             io.to(`user_${row.userId}`).emit('withdrawal_progress', {
                 reference: normalized.reference,
@@ -125,7 +135,7 @@ const handleSettlement = (provider, authenticate, normalize) => async (req, res)
         const prisma = req.app.get('prisma');
         const io = req.app.get('socketio');
         const emitBalanceUpdate = req.app.get('emitBalanceUpdate');
-        const result = await settleFiatWithdrawal(prisma, normalized);
+        const result = await settleFiatWithdrawal(prisma, { ...normalized, provider });
 
         if (result.changed && emitBalanceUpdate) {
             await emitBalanceUpdate(result.userId);
@@ -199,5 +209,5 @@ const handleSettlement = (provider, authenticate, normalize) => async (req, res)
 
 module.exports = {
     moolreDisbursementWebhook: handleSettlement('MOOLRE', authenticateMoolre, normalizeMoolre),
-    mtnDisbursementWebhook: handleSettlement('MTN', authenticateMtn, normalizeMtn)
+    mtnDisbursementWebhook: handleSettlement('MTN_MOMO_DISBURSEMENT', authenticateMtn, normalizeMtn)
 };
