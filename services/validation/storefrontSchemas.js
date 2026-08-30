@@ -3,7 +3,6 @@
 const logger = require('../../src/config/logger');
 const { z } = require('zod');
 
-// ── layoutJson schema ──
 const tilePositionSchema = z.object({
   row: z.number().int().min(0),
   col: z.number().int().min(0),
@@ -24,26 +23,29 @@ const layoutJsonSchema = z.object({
   tiles: z.array(tileSchema),
 });
 
-// ── API request schemas ──
+const expectedUpdatedAtSchema = z.string().datetime().optional();
+
 const saveDraftSchema = z.object({
   layoutJson: layoutJsonSchema,
   themeId: z.string().uuid(),
-  expectedUpdatedAt: z.string().datetime().optional(),
+  expectedUpdatedAt: expectedUpdatedAtSchema,
 });
 
-// Publishing is an optimistic-concurrency operation too. The client may omit
-// expectedUpdatedAt for backward compatibility, but when supplied it identifies
-// the exact draft snapshot the caller intends to publish.
 const publishLayoutSchema = z.object({
-  expectedUpdatedAt: z.string().datetime().optional(),
+  expectedUpdatedAt: expectedUpdatedAtSchema,
 });
 
+// Revert/template are draft mutations too. Keeping the same optimistic
+// concurrency contract prevents a stale editor from replacing another
+// editor's current draft through an alternate mutation path.
 const applyTemplateSchema = z.object({
   templateId: z.string().uuid(),
+  expectedUpdatedAt: expectedUpdatedAtSchema,
 });
 
 const revertSchema = z.object({
   versionId: z.string().uuid(),
+  expectedUpdatedAt: expectedUpdatedAtSchema,
 });
 
 const createStakeSchema = z.object({
@@ -54,7 +56,6 @@ const unstakeSchema = z.object({
   stakeId: z.string().uuid(),
 });
 
-// ── Token set schema for themes ──
 const tokenSetSchema = z.object({
   background: z.string().optional(),
   surface: z.string().optional(),
