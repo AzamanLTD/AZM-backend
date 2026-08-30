@@ -30,18 +30,28 @@ describe('WithdrawalReconciliationWorker settlement lifecycle', () => {
     $executeRawUnsafe: jest.fn().mockResolvedValue(1),
   });
 
+  const exceptionDb = () => ({
+    $queryRawUnsafe: jest.fn().mockResolvedValue([{
+      id: 'exception-1',
+      entityType: 'WITHDRAWAL',
+      entityId: '42',
+      reason: 'MISSING_TRANSACTION_REFERENCE',
+      status: 'OPEN',
+    }]),
+  });
+
   test('provider success advances canonical TransactionHistory from PENDING to COMPLETED', async () => {
     const prisma = {
       ...attemptDb(),
       transactionHistory: {
-        findFirst: jest.fn().mockResolvedValue({
+        findMany: jest.fn().mockResolvedValue([{
           id: 'tx-1',
           txHash: 'ref-1',
           userId: 7,
           type: 'WITHDRAWAL_FIAT',
           amountUsdc: 100,
           status: 'PENDING',
-        }),
+        }]),
         updateMany: jest.fn().mockResolvedValue({ count: 1 }),
       },
       withdrawal: {
@@ -79,14 +89,14 @@ describe('WithdrawalReconciliationWorker settlement lifecycle', () => {
     const prisma = {
       ...attemptDb(),
       transactionHistory: {
-        findFirst: jest.fn().mockResolvedValue({
+        findMany: jest.fn().mockResolvedValue([{
           id: 'tx-2',
           txHash: 'ref-2',
           userId: 7,
           type: 'WITHDRAWAL_FIAT',
           amountUsdc: 100,
           status: 'PENDING',
-        }),
+        }]),
         updateMany: jest.fn().mockResolvedValue({ count: 1 }),
       },
       withdrawal: {
@@ -124,5 +134,45 @@ describe('WithdrawalReconciliationWorker settlement lifecycle', () => {
       where: { id: 42 },
       data: { status: 'FAILED' },
     });
+  });
+
+  test('missing canonical transaction is queued as an exception and never queried at the provider', async () => {
+    const prisma = {
+      ...exceptionDb(),
+      transactionHistory: {
+        findMany: jest.fn().mockResolvedValue([]),
+      },
+      withdrawal: { update: jest.fn() },
+    };
+    const provider = { getTransferStatus: jest.fn() };
+    const worker = new WithdrawalReconciliationWorker(prisma, null, provider);
+
+    await worker._reconcileOne(withdrawal);
+
+    expect(provider.getTransferStatus).not.toHaveBeenCalled();
+    expect(prisma.$queryRawUnsafe).toHaveBeenCalledTimes(1);
+    expect(prisma.withdrawal.update).not.toHaveBeenCalled();
+  });
+
+  test('ambiguous canonical matches are queued as exceptions and never mutate money', async () => {
+    const prisma = {
+      ...exceptionDb(),
+      transactionHistory: {
+        findMany: jest.fn().mockResolvedValue([
+          { id: 'tx-a', txHash: 'ref-a' },
+          { id: 'tx-b', txHash: 'ref-b' },
+        ]),
+        updateMany: jest.fn(),
+      },
+      withdrawal: { update: jest.fn() },
+    };
+    const provider = { getTransferStatus: jest.fn() };
+    const worker = new WithdrawalReconciliationWorker(prisma, null, provider);
+
+    await worker._reconcileOne(withdrawal);
+
+    expect(provider.getTransferStatus).not.toHaveBeenCalled();
+    expect(prisma.transactionHistory.updateMany).not.toHaveBeenCalled();
+    expect(prisma.withdrawal.update).not.toHaveBeenCalled();
   });
 });
