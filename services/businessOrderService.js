@@ -58,11 +58,29 @@ const createOrder = async (prisma, { businessProfileId, customerId, productId, e
     if (!Number.isFinite(amount) || amount <= 0) throw new Error('amountUsdc must be a positive finite number.');
     const cleanTitle = String(title || '').trim();
     if (cleanTitle.length < 1 || cleanTitle.length > 200) throw new Error('title must be 1–200 chars.');
+
+    const business = await prisma.businessProfile.findUnique({ where: { id: businessProfileId }, select: { id: true, userId: true } });
+    if (!business) throw new Error('Business profile not found.');
+
     if (productId) {
         const product = await prisma.businessProduct.findUnique({ where: { id: productId }, select: { id: true, businessProfileId: true, isActive: true } });
         if (!product || product.businessProfileId !== businessProfileId) throw new Error('Product not found.');
         if (!product.isActive) throw new Error('Product is not available.');
     }
+
+    // Legacy order creation may accept an escrow id, but it must never be able
+    // to attach another customer's or another business owner's escrow.
+    if (escrowId) {
+        const escrow = await prisma.smartEscrow.findUnique({
+            where: { id: escrowId },
+            select: { id: true, payerId: true, payeeId: true, amountUsdc: true },
+        });
+        if (!escrow) throw new Error('Escrow not found.');
+        if (escrow.payerId !== customerId) throw new Error('Escrow payer does not match the customer.');
+        if (escrow.payeeId !== business.userId) throw new Error('Escrow payee does not match the business owner.');
+        if (Number(escrow.amountUsdc) !== amount) throw new Error('Escrow amount does not match the order amount.');
+    }
+
     const orderRef = await _generateOrderRef(prisma);
     const order = await prisma.businessOrder.create({
         data: { businessProfileId, customerId, productId: productId || null, escrowId: escrowId || null, ticketId: ticketId || null, status: 'AWAITING_PAYMENT', orderRef, title: cleanTitle, description: description ? String(description).slice(0, 500) : null, amountUsdc: amount, customerNotes: customerNotes ? String(customerNotes).slice(0, 500) : null }
@@ -109,10 +127,7 @@ const listOrdersForCustomer = async (prisma, { customerId, status, limit, cursor
 };
 
 const markDelivered = async (prisma, { orderId, businessProfileId, deliveryNotes }) => {
-    const updated = await prisma.businessOrder.updateMany({
-        where: { id: orderId, businessProfileId, status: 'PAID' },
-        data: { status: 'DELIVERED', deliveredAt: new Date(), deliveryNotes: deliveryNotes ? String(deliveryNotes).slice(0, 500) : null }
-    });
+    const updated = await prisma.businessOrder.updateMany({ where: { id: orderId, businessProfileId, status: 'PAID' }, data: { status: 'DELIVERED', deliveredAt: new Date(), deliveryNotes: deliveryNotes ? String(deliveryNotes).slice(0, 500) : null } });
     if (updated.count === 0) {
         const order = await prisma.businessOrder.findUnique({ where: { id: orderId }, select: { businessProfileId: true, status: true } });
         if (!order) throw new Error('Order not found.');
