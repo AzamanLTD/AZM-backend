@@ -179,28 +179,13 @@ exports.forceRelease = async (req, res) => {
         // The party authorized to release is the one receiving fiat.
         const releasedByUserId = trade.type === 'SELL' ? trade.vendorId : trade.userId;
 
-        // Phase H9 BUGFIX (2026-05-27): atomic conditional status flip
-        // before delegating to completeTrade. Two concurrent admins
-        // hitting the force-release button could both flip DISPUTED →
-        // PAID and both call completeTrade. The H8 fix on completeTrade
-        // catches the duplicate at the second layer (one of the calls
-        // gets TRADE_ALREADY_FINALIZED), but a failed completeTrade
-        // would leave the trade stranded in PAID. With the conditional
-        // flip here, only one admin's call ever proceeds — the second
-        // gets a clean 409 before any lower-level work.
-        const claimed = await prisma.trade.updateMany({
-            where: { id, status: 'DISPUTED' },
-            data:  { status: 'PAID' }
-        });
-        if (claimed.count === 0) {
-            return res.status(409).json({
-                success: false,
-                message: 'Trade is no longer disputed (concurrent admin action).'
-            });
-        }
-
+        // Issue #48: The separate DISPUTED → PAID claim is removed.
+        // completeTrade now accepts adminOverride and atomically claims
+        // DISPUTED → COMPLETED in one transaction. If the settlement fails,
+        // the trade remains DISPUTED (full rollback). Concurrent admins
+        // get TRADE_ALREADY_FINALIZED from the atomic claim, mapped to 409.
         const p2pService = require('../services/p2p.service');
-        const result     = await p2pService.completeTrade(prisma, { tradeId: id, releasedByUserId });
+        const result     = await p2pService.completeTrade(prisma, { tradeId: id, releasedByUserId, adminOverride: true });
 
         // Lazy-create conversation, drop ADMIN_INTERVENTION message
         let conversation = await prisma.conversation.findUnique({ where: { tradeId: String(id) } });
@@ -246,6 +231,12 @@ exports.forceRelease = async (req, res) => {
         });
     } catch (error) {
         logger.error("Force Release Error:", error);
+        if (error.message === 'TRADE_ALREADY_FINALIZED') {
+            return res.status(409).json({
+                success: false,
+                message: 'Trade is no longer disputed (concurrent admin action).'
+            });
+        }
         res.status(500).json({ success: false, message: error.message });
     }
 };

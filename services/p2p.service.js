@@ -558,7 +558,7 @@ const flagOverpayment = async (prisma, { tradeId, buyerId, overpaidAmountUsdc })
  *   releasedByUserId: number   // must be vendorId for SELL ad, userId for BUY ad
  * }} params
  */
-const completeTrade = async (prisma, { tradeId, releasedByUserId }) => {
+const completeTrade = async (prisma, { tradeId, releasedByUserId, adminOverride = false }) => {
     // Pre-fetch outside the transaction (read-only checks)
     const trade = await prisma.trade.findUnique({
         where:  { id: tradeId },
@@ -572,18 +572,24 @@ const completeTrade = async (prisma, { tradeId, releasedByUserId }) => {
 
     if (!trade) throw new Error('Trade not found.');
     if (trade.status === 'COMPLETED') throw new Error('Trade is already completed.');
-    // HIGH-11: Only allow completion from PAID status (buyer must have submitted proof)
-    if (trade.status !== 'PAID') {
-        throw new Error(`Cannot complete trade: status must be PAID (current: ${trade.status}). Buyer must submit payment proof first.`);
+    // HIGH-11: Only allow completion from PAID status (buyer must have submitted proof).
+    // Admin override (issue #48) allows DISPUTED → COMPLETED in one atomic transaction.
+    const allowedStatus = adminOverride ? 'DISPUTED' : 'PAID';
+    if (trade.status !== allowedStatus) {
+        throw new Error(`Cannot complete trade: status must be ${allowedStatus} (current: ${trade.status}).${adminOverride ? ' Admin override path.' : ' Buyer must submit payment proof first.'}`);
     }
 
     const isSellAd = trade.type === 'SELL';
 
-    // Authorization: only the party receiving fiat can release crypto
-    if (isSellAd  && trade.vendorId !== releasedByUserId)
-        throw new Error('Only the vendor can release assets on a SELL ad.');
-    if (!isSellAd && trade.userId  !== releasedByUserId)
-        throw new Error('Only the buyer can release assets on a BUY ad.');
+    // Authorization: only the party receiving fiat can release crypto.
+    // Admin override bypasses counterparty authorization — the admin route
+    // (adminOnly middleware) is the authorization gate for that path.
+    if (!adminOverride) {
+        if (isSellAd  && trade.vendorId !== releasedByUserId)
+            throw new Error('Only the vendor can release assets on a SELL ad.');
+        if (!isSellAd && trade.userId  !== releasedByUserId)
+            throw new Error('Only the buyer can release assets on a BUY ad.');
+    }
 
     // ── Fetch settings for fee percentage ─────────────────────────────────
     const settings = await prisma.globalSettings.findUnique({ where: { id: 1 } });
@@ -648,8 +654,9 @@ const completeTrade = async (prisma, { tradeId, releasedByUserId }) => {
         // and only if it's still PAID. The second concurrent caller
         // gets count=0 and aborts the transaction before any balance
         // mutation runs.
+        const claimStatus = adminOverride ? 'DISPUTED' : 'PAID';
         const claimed = await tx.trade.updateMany({
-            where: { id: tradeId, status: 'PAID' },
+            where: { id: tradeId, status: claimStatus },
             data: {
                 status:          'COMPLETED',
                 completedAt:     new Date(),
