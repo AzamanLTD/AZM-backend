@@ -129,20 +129,41 @@ const markDelivered = async (prisma, { orderId, businessProfileId, deliveryNotes
         if (order.businessProfileId !== businessProfileId) throw new Error('You do not own this order.');
         throw new Error(`Order must be in PAID status to mark as delivered. Current status: ${order.status}.`);
     }
-    return prisma.businessOrder.findUnique({ where: { id: orderId }, include: ORDER_INCLUDE });
+    const order = await prisma.businessOrder.findUnique({ where: { id: orderId }, include: ORDER_INCLUDE });
+    if (order) {
+        emitWebhookEvent(businessProfileId, 'order.delivered', {
+            orderId: order.id,
+            orderRef: order.orderRef,
+            amount: Number(order.amountUsdc),
+            status: order.status,
+        });
+    }
+    return order;
 };
 
 const updateOrderStatusFromEscrow = async (prisma, escrowId, escrowStatus) => {
     const mapped = _ESCROW_TO_ORDER[escrowStatus];
     if (!mapped) return null;
-    const order = await prisma.businessOrder.findFirst({ where: { escrowId }, select: { id: true, status: true } });
+    const order = await prisma.businessOrder.findFirst({
+        where: { escrowId },
+        select: { id: true, status: true, businessProfileId: true, orderRef: true, amountUsdc: true }
+    });
     if (!order) return null;
     if (!_ESCROW_ALLOWED_ORDER_STATES[escrowStatus]?.includes(order.status)) return order;
     const data = { status: mapped };
     if (mapped === 'COMPLETED') data.completedAt = new Date();
     const transitioned = await prisma.businessOrder.updateMany({ where: { id: order.id, status: order.status }, data });
     if (transitioned.count === 0) return prisma.businessOrder.findUnique({ where: { id: order.id }, select: { id: true, status: true, completedAt: true, cancelledAt: true } });
-    return prisma.businessOrder.findUnique({ where: { id: order.id }, select: { id: true, status: true, completedAt: true, cancelledAt: true } });
+    const updated = await prisma.businessOrder.findUnique({ where: { id: order.id }, select: { id: true, status: true, completedAt: true, cancelledAt: true, orderRef: true, amountUsdc: true } });
+    if (mapped === 'COMPLETED' && updated?.status === 'COMPLETED') {
+        emitWebhookEvent(order.businessProfileId, 'order.completed', {
+            orderId: updated.id,
+            orderRef: updated.orderRef || order.orderRef,
+            amount: Number(updated.amountUsdc ?? order.amountUsdc),
+            status: updated.status,
+        });
+    }
+    return updated;
 };
 
 const getBusinessStats = async (prisma, { businessProfileId }) => {
