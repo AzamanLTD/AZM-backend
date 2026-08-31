@@ -139,4 +139,127 @@ describe('fiatSettlementService', () => {
             providerTxId: 'moolre-fail-3'
         });
     });
+
+    test('rejects an unknown provider reference before recording or mutating ledger state', async () => {
+        const prisma = {
+            ...attemptDb(),
+            transactionHistory: {
+                findUnique: jest.fn().mockResolvedValue(null),
+                updateMany: jest.fn(),
+                update: jest.fn()
+            }
+        };
+
+        await expect(settleFiatWithdrawal(prisma, {
+            reference: 'unknown-ref',
+            provider: 'MOOLRE',
+            status: 'SUCCESSFUL',
+            providerTxId: 'moolre-404'
+        })).rejects.toMatchObject({ code: 'UNKNOWN_REFERENCE' });
+
+        expect(prisma.$queryRawUnsafe).not.toHaveBeenCalled();
+        expect(prisma.$executeRawUnsafe).not.toHaveBeenCalled();
+        expect(prisma.transactionHistory.updateMany).not.toHaveBeenCalled();
+        expect(financeService.reverseFiatWithdrawal).not.toHaveBeenCalled();
+    });
+
+    test('rejects a non-fiat transaction reference', async () => {
+        const trade = {
+            txHash: 'trade-ref-1',
+            userId: 14,
+            type: 'TRADE_PAYMENT',
+            status: 'PENDING',
+            providerRef: null
+        };
+        const prisma = {
+            ...attemptDb(),
+            transactionHistory: {
+                findUnique: jest.fn().mockResolvedValue(trade),
+                updateMany: jest.fn(),
+                update: jest.fn()
+            }
+        };
+
+        await expect(settleFiatWithdrawal(prisma, {
+            reference: 'trade-ref-1',
+            provider: 'MOOLRE',
+            status: 'SUCCESSFUL',
+            providerTxId: 'moolre-trade-1'
+        })).rejects.toMatchObject({ code: 'WRONG_TRANSACTION_TYPE' });
+
+        expect(prisma.transactionHistory.updateMany).not.toHaveBeenCalled();
+        expect(financeService.reverseFiatWithdrawal).not.toHaveBeenCalled();
+    });
+
+    test('keeps a FAILED withdrawal terminal and does not reverse it twice', async () => {
+        const failed = {
+            txHash: 'ref-4',
+            userId: 15,
+            type: 'WITHDRAWAL_FIAT',
+            status: 'FAILED',
+            providerRef: 'previous-failure'
+        };
+        const prisma = {
+            ...attemptDb(),
+            transactionHistory: {
+                findUnique: jest.fn().mockResolvedValue(failed),
+                updateMany: jest.fn(),
+                update: jest.fn()
+            }
+        };
+
+        const result = await settleFiatWithdrawal(prisma, {
+            reference: 'ref-4',
+            provider: 'MOOLRE',
+            status: 'FAILED',
+            providerTxId: 'duplicate-failure',
+            reason: 'same provider failure retried'
+        });
+
+        expect(result).toMatchObject({
+            status: 'FAILED',
+            changed: false,
+            alreadyReversed: true,
+            providerTxId: 'duplicate-failure'
+        });
+        expect(prisma.transactionHistory.updateMany).not.toHaveBeenCalled();
+        expect(prisma.transactionHistory.update).not.toHaveBeenCalled();
+        expect(financeService.reverseFiatWithdrawal).not.toHaveBeenCalled();
+    });
+
+    test('does not reverse a COMPLETED withdrawal on a contradictory late failure callback', async () => {
+        const completed = {
+            txHash: 'ref-5',
+            userId: 16,
+            type: 'WITHDRAWAL_FIAT',
+            status: 'COMPLETED',
+            providerRef: 'moolre-success-5'
+        };
+        const prisma = {
+            ...attemptDb(),
+            transactionHistory: {
+                findUnique: jest.fn().mockResolvedValue(completed),
+                updateMany: jest.fn(),
+                update: jest.fn()
+            }
+        };
+
+        const result = await settleFiatWithdrawal(prisma, {
+            reference: 'ref-5',
+            provider: 'MOOLRE',
+            status: 'FAILED',
+            providerTxId: 'late-failure',
+            reason: 'contradictory callback'
+        });
+
+        expect(result).toMatchObject({
+            status: 'COMPLETED',
+            changed: false,
+            conflictingTerminalCallback: true,
+            providerTxId: 'late-failure'
+        });
+        expect(prisma.transactionHistory.updateMany).not.toHaveBeenCalled();
+        expect(prisma.transactionHistory.update).not.toHaveBeenCalled();
+        expect(financeService.reverseFiatWithdrawal).not.toHaveBeenCalled();
+    });
 });
