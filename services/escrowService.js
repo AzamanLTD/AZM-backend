@@ -237,6 +237,26 @@ const fundEscrow = async (prisma, { escrowId, payerId }) => {
         }).catch((err) => logger.error({ err: err }, '[escrowService.fundEscrow] biz notif'));
     });
 
+
+    // Realtime convergence: emit only after the $transaction commits.
+    if (_socketIo) {
+        const payload = {
+            escrowId: updatedEscrow.id,
+            ticketId: updatedEscrow.ticketId,
+            status: updatedEscrow.status,
+            amountUsdc: updatedEscrow.amountUsdc,
+            payerId: updatedEscrow.payerId,
+            payeeId: updatedEscrow.payeeId,
+        };
+        try {
+            _socketIo.to(`user_${updatedEscrow.payerId}`).emit('escrow_funded', payload);
+            _socketIo.to(`user_${updatedEscrow.payeeId}`).emit('escrow_funded', payload);
+            _socketIo.to('admin_spy_room').emit('escrow_funded', payload);
+        } catch (err) {
+            logger.warn({ err, escrowId: updatedEscrow.id }, '[escrowService.fundEscrow] realtime emit failed');
+        }
+    }
+
     return { success: true, escrow: updatedEscrow, reference };
 };
 
@@ -316,6 +336,25 @@ const markSatisfied = async (prisma, { escrowId, userId }) => {
             where: { id: escrowId },
             data: { status: 'PENDING_SETTLEMENT' }
         });
+        // Realtime convergence: emit only after the PENDING_SETTLEMENT update commits.
+        if (_socketIo) {
+            const payload = {
+                escrowId: pending.id,
+                ticketId: pending.ticketId,
+                status: pending.status,
+                amountUsdc: pending.amountUsdc,
+                payerId: pending.payerId,
+                payeeId: pending.payeeId,
+            };
+            try {
+                _socketIo.to(`user_${pending.payerId}`).emit('escrow_pending_settlement', payload);
+                _socketIo.to(`user_${pending.payeeId}`).emit('escrow_pending_settlement', payload);
+                _socketIo.to('admin_spy_room').emit('escrow_pending_settlement', payload);
+            } catch (err) {
+                logger.warn({ err, escrowId: pending.id }, '[escrowService.markSatisfied] realtime emit failed');
+            }
+        }
+
         return { settled: false, escrow: pending };
     } catch (err) {
         // A concurrent opposite-party request can settle between the read above
@@ -594,6 +633,25 @@ const _releaseEscrow = async (prisma, escrowId, finalStatus = 'SETTLED') => {
 
         return result;
     });
+
+    // Realtime convergence: emit only after the $transaction commits.
+    if (_socketIo && finalStatus === 'SETTLED') {
+        const payload = {
+            escrowId: updated.id,
+            ticketId: updated.ticketId,
+            status: updated.status,
+            amountUsdc: updated.amountUsdc,
+            payerId: updated.payerId,
+            payeeId: updated.payeeId,
+        };
+        try {
+            _socketIo.to(`user_${updated.payerId}`).emit('escrow_settled', payload);
+            _socketIo.to(`user_${updated.payeeId}`).emit('escrow_settled', payload);
+            _socketIo.to('admin_spy_room').emit('escrow_settled', payload);
+        } catch (err) {
+            logger.warn({ err, escrowId: updated.id }, '[escrowService._releaseEscrow] realtime emit failed');
+        }
+    }
 
     setImmediate(() => {
         _getBizOrderService()
