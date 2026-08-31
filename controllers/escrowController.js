@@ -176,6 +176,18 @@ exports.markSatisfied = async (req, res) => {
         });
         const actorName = actor ? actor.username : 'A participant';
 
+        if (result.alreadySettled) {
+            // Convergence response only: the settlement was committed by another
+            // concurrent/retried request. Do not emit a second socket event or
+            // inject a duplicate system message.
+            await audit(prisma, {
+                actorId: req.user.id, actorName: req.user.username,
+                action: 'ESCROW_SATISFIED_CONVERGED', targetType: 'SMARTESCROW', targetId: String(escrow.id),
+                metadata: { settled: true, alreadySettled: true }, ipAddress: req.ip,
+            });
+            return res.status(200).json({ success: true, settled: true, alreadySettled: true, escrow });
+        }
+
         if (result.settled) {
             const payee = await prisma.user.findUnique({
                 where: { id: escrow.payeeId },

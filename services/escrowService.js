@@ -238,6 +238,11 @@ const fundEscrow = async (prisma, { escrowId, payerId }) => {
 const markSatisfied = async (prisma, { escrowId, userId }) => {
     const escrow = await prisma.smartEscrow.findUnique({ where: { id: escrowId } });
     if (!escrow) throw new Error('Escrow not found.');
+    if (escrow.status === 'SETTLED') {
+        // Idempotent convergence: another request may have committed settlement
+        // before this retry reached the service. Never run settlement again.
+        return { settled: true, alreadySettled: true, escrow };
+    }
     if (!['FUNDED', 'IN_PROGRESS', 'PENDING_SETTLEMENT'].includes(escrow.status)) {
         throw new Error(`Cannot mark satisfied from status ${escrow.status}.`);
     }
@@ -260,6 +265,10 @@ const markSatisfied = async (prisma, { escrowId, userId }) => {
         data
     });
     if (claimed.count === 0) {
+        const current = await prisma.smartEscrow.findUnique({ where: { id: escrowId } });
+        if (current && current.status === 'SETTLED') {
+            return { settled: true, alreadySettled: true, escrow: current };
+        }
         throw new Error('You have already marked this escrow as satisfied.');
     }
     const updated = await prisma.smartEscrow.findUnique({ where: { id: escrowId } });
@@ -267,8 +276,18 @@ const markSatisfied = async (prisma, { escrowId, userId }) => {
     // Both satisfied → release to payee (SETTLED). _releaseEscrow fires
     // ORDER_SETTLED itself, so we do NOT also fire ORDER_SATISFIED here.
     if (updated.payerSatisfied && updated.payeeSatisfied) {
-        const settled = await _releaseEscrow(prisma, escrowId, 'SETTLED');
-        return { settled: true, escrow: settled };
+        try {
+            const settled = await _releaseEscrow(prisma, escrowId, 'SETTLED');
+            return { settled: true, escrow: settled };
+        } catch (err) {
+            if (err && err.message === 'ESCROW_ALREADY_FINALIZED') {
+                const current = await prisma.smartEscrow.findUnique({ where: { id: escrowId } });
+                if (current && current.status === 'SETTLED') {
+                    return { settled: true, alreadySettled: true, escrow: current };
+                }
+            }
+            throw err;
+        }
     }
 
     // Buyer (payer) signalled completion but the owner hasn't confirmed yet —
@@ -284,11 +303,23 @@ const markSatisfied = async (prisma, { escrowId, userId }) => {
     }
 
     // Otherwise mark we are awaiting the other side.
-    const pending = await prisma.smartEscrow.update({
-        where: { id: escrowId },
-        data: { status: 'PENDING_SETTLEMENT' }
-    });
-    return { settled: false, escrow: pending };
+    try {
+        const pending = await prisma.smartEscrow.update({
+            where: { id: escrowId },
+            data: { status: 'PENDING_SETTLEMENT' }
+        });
+        return { settled: false, escrow: pending };
+    } catch (err) {
+        // A concurrent opposite-party request can settle between the read above
+        // and this pending-state write. The database terminal-state guard must
+        // remain intact; converge to the committed settlement instead of turning
+        // a successful concurrent settlement into a misleading 500.
+        const current = await prisma.smartEscrow.findUnique({ where: { id: escrowId } });
+        if (current && current.status === 'SETTLED') {
+            return { settled: true, alreadySettled: true, escrow: current };
+        }
+        throw err;
+    }
 };
 
 // =============================================================================
