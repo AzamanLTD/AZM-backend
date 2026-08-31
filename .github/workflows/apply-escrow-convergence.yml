@@ -1,0 +1,196 @@
+name: Apply guarded escrow convergence implementation
+
+on:
+  push:
+    branches: [codex/escrow-convergence-20260831]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  patch-test-pr:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: azm_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d azm_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/azm_test?schema=public
+      TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/azm_test?schema=public
+      JWT_SECRET: test_secret_exactly_32_characters_long
+      NODE_ENV: test
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Apply schema
+        run: npx prisma db push --accept-data-loss
+
+      - name: Install transaction quote overlay
+        run: node infra/install-transaction-quote-overlay.js
+
+      - name: Generate Prisma client
+        run: npx prisma generate
+
+      - name: Apply guarded source patch and regression test
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+
+          service = Path('services/escrowService.js')
+          text = service.read_text()
+
+          old = """    const escrow = await prisma.smartEscrow.findUnique({ where: { id: escrowId } });\n    if (!escrow) throw new Error('Escrow not found.');\n    if (!['FUNDED', 'IN_PROGRESS', 'PENDING_SETTLEMENT'].includes(escrow.status)) {\n        throw new Error(`Cannot mark satisfied from status ${escrow.status}.`);\n    }\n"""
+          new = """    const escrow = await prisma.smartEscrow.findUnique({ where: { id: escrowId } });\n    if (!escrow) throw new Error('Escrow not found.');\n    if (escrow.status === 'SETTLED') {\n        // Idempotent convergence: another request may have committed settlement\n        // before this retry reached the service. Never run settlement again.\n        return { settled: true, alreadySettled: true, escrow };\n    }\n    if (!['FUNDED', 'IN_PROGRESS', 'PENDING_SETTLEMENT'].includes(escrow.status)) {\n        throw new Error(`Cannot mark satisfied from status ${escrow.status}.`);\n    }\n"""
+          if text.count(old) != 1:
+              raise SystemExit(f'expected exactly one initial markSatisfied anchor, found {text.count(old)}')
+          text = text.replace(old, new, 1)
+
+          old = """    const claimed = await prisma.smartEscrow.updateMany({\n        where: { id: escrowId, ...guard },\n        data\n    });\n    if (claimed.count === 0) {\n        throw new Error('You have already marked this escrow as satisfied.');\n    }\n    const updated = await prisma.smartEscrow.findUnique({ where: { id: escrowId } });\n\n    // Both satisfied → release to payee (SETTLED). _releaseEscrow fires\n    // ORDER_SETTLED itself, so we do NOT also fire ORDER_SATISFIED here.\n    if (updated.payerSatisfied && updated.payeeSatisfied) {\n        const settled = await _releaseEscrow(prisma, escrowId, 'SETTLED');\n        return { settled: true, escrow: settled };\n    }\n"""
+          new = """    const claimed = await prisma.smartEscrow.updateMany({\n        where: { id: escrowId, ...guard },\n        data\n    });\n    if (claimed.count === 0) {\n        const current = await prisma.smartEscrow.findUnique({ where: { id: escrowId } });\n        if (current && current.status === 'SETTLED') {\n            return { settled: true, alreadySettled: true, escrow: current };\n        }\n        throw new Error('You have already marked this escrow as satisfied.');\n    }\n    const updated = await prisma.smartEscrow.findUnique({ where: { id: escrowId } });\n\n    // Both satisfied → release to payee (SETTLED). _releaseEscrow fires\n    // ORDER_SETTLED itself, so we do NOT also fire ORDER_SATISFIED here.\n    if (updated.payerSatisfied && updated.payeeSatisfied) {\n        try {\n            const settled = await _releaseEscrow(prisma, escrowId, 'SETTLED');\n            return { settled: true, escrow: settled };\n        } catch (err) {\n            if (err && err.message === 'ESCROW_ALREADY_FINALIZED') {\n                const current = await prisma.smartEscrow.findUnique({ where: { id: escrowId } });\n                if (current && current.status === 'SETTLED') {\n                    return { settled: true, alreadySettled: true, escrow: current };\n                }\n            }\n            throw err;\n        }\n    }\n"""
+          if text.count(old) != 1:
+              raise SystemExit(f'expected exactly one satisfaction claim anchor, found {text.count(old)}')
+          text = text.replace(old, new, 1)
+
+          old = """    const pending = await prisma.smartEscrow.update({\n        where: { id: escrowId },\n        data: { status: 'PENDING_SETTLEMENT' }\n    });\n    return { settled: false, escrow: pending };\n"""
+          new = """    try {\n        const pending = await prisma.smartEscrow.update({\n            where: { id: escrowId },\n            data: { status: 'PENDING_SETTLEMENT' }\n        });\n        return { settled: false, escrow: pending };\n    } catch (err) {\n        // A concurrent opposite-party request can settle between the read above\n        // and this pending-state write. The database terminal-state guard must\n        // remain intact; converge to the committed settlement instead of turning\n        // a successful concurrent settlement into a misleading 500.\n        const current = await prisma.smartEscrow.findUnique({ where: { id: escrowId } });\n        if (current && current.status === 'SETTLED') {\n            return { settled: true, alreadySettled: true, escrow: current };\n        }\n        throw err;\n    }\n"""
+          if text.count(old) != 1:
+              raise SystemExit(f'expected exactly one pending transition anchor, found {text.count(old)}')
+          text = text.replace(old, new, 1)
+          service.write_text(text)
+
+          controller = Path('controllers/escrowController.js')
+          text = controller.read_text()
+          old = """        if (result.settled) {\n            const payee = await prisma.user.findUnique({\n"""
+          new = """        if (result.alreadySettled) {\n            // Convergence response only: the settlement was committed by another\n            // concurrent/retried request. Do not emit a second socket event or\n            // inject a duplicate system message.\n            await audit(prisma, {\n                actorId: req.user.id, actorName: req.user.username,\n                action: 'ESCROW_SATISFIED_CONVERGED', targetType: 'SMARTESCROW', targetId: String(escrow.id),\n                metadata: { settled: true, alreadySettled: true }, ipAddress: req.ip,\n            });\n            return res.status(200).json({ success: true, settled: true, alreadySettled: true, escrow });\n        }\n\n        if (result.settled) {\n            const payee = await prisma.user.findUnique({\n"""
+          if text.count(old) != 1:
+              raise SystemExit(f'expected exactly one controller settled anchor, found {text.count(old)}')
+          controller.write_text(text.replace(old, new, 1))
+          print('guarded patch applied')
+          PY
+
+          cat > __tests__/escrow-convergence.test.js <<'EOF'
+          const { seedEscrowTicket } = require('./helpers/factories');
+
+          const hasDb = !!process.env.TEST_DATABASE_URL;
+          const describeOrSkip = hasDb ? describe : describe.skip;
+
+          if (!hasDb) {
+              // eslint-disable-next-line no-console
+              console.warn('[escrow-convergence.test] TEST_DATABASE_URL not set — skipping.');
+          }
+
+          describeOrSkip('SmartEscrow concurrent satisfaction convergence', () => {
+              let prisma;
+              let escrowService;
+
+              beforeAll(() => {
+                  process.env.DATABASE_URL = process.env.TEST_DATABASE_URL;
+                  process.env.NODE_ENV = 'test';
+                  process.env.JWT_SECRET = process.env.JWT_SECRET || 'test_secret_at_least_32_chars_long_xxxxx';
+                  const { PrismaClient } = require('@prisma/client');
+                  prisma = new PrismaClient();
+                  escrowService = require('../services/escrowService');
+              });
+
+              afterAll(async () => {
+                  await prisma.$disconnect();
+              });
+
+              afterEach(async () => {
+                  await prisma.$executeRawUnsafe(
+                      'TRUNCATE TABLE "User", "SystemProfitFees", "AdminProfitLog" RESTART IDENTITY CASCADE'
+                  );
+              }, 15000);
+
+              test('opposite-party concurrent satisfaction converges with exactly one payout and one release history row', async () => {
+                  const { payer, payee, escrow } = await seedEscrowTicket(prisma, 'FUNDED');
+                  const payeeBefore = Number((await prisma.user.findUnique({ where: { id: payee.id } })).availableBalance);
+
+                  const call = (userId) => escrowService
+                      .markSatisfied(prisma, { escrowId: escrow.id, userId })
+                      .then((result) => ({ ok: true, result }))
+                      .catch((error) => ({ ok: false, error }));
+
+                  const [a, b] = await Promise.all([call(payer.id), call(payee.id)]);
+                  expect(a.ok).toBe(true);
+                  expect(b.ok).toBe(true);
+
+                  const finalEscrow = await prisma.smartEscrow.findUnique({ where: { id: escrow.id } });
+                  expect(finalEscrow.status).toBe('SETTLED');
+                  expect(finalEscrow.payerSatisfied).toBe(true);
+                  expect(finalEscrow.payeeSatisfied).toBe(true);
+
+                  const payeeAfter = await prisma.user.findUnique({ where: { id: payee.id } });
+                  expect(Number(payeeAfter.availableBalance)).toBeCloseTo(payeeBefore + Number(finalEscrow.amountUsdc), 6);
+
+                  const releases = await prisma.transactionHistory.count({
+                      where: { type: 'TICKET_ESCROW_RELEASE', userId: payee.id }
+                  });
+                  expect(releases).toBe(1);
+              });
+          });
+          EOF
+
+      - name: Run focused escrow regression
+        run: npx jest __tests__/escrow-flow.test.js __tests__/escrow-convergence.test.js --runInBand --forceExit
+
+      - name: Verify no accidental duplicate settlement implementation
+        run: |
+          test "$(grep -R "type: 'TICKET_ESCROW_RELEASE'" -n services/escrowService.js | wc -l)" -ge 1
+          test "$(grep -R "const _releaseEscrow" -n services/escrowService.js | wc -l)" -eq 1
+          git diff --check
+
+      - name: Commit implementation and remove temporary workflow
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add services/escrowService.js controllers/escrowController.js __tests__/escrow-convergence.test.js
+          git commit -m 'fix: converge concurrent escrow satisfaction responses'
+          git rm .github/workflows/apply-escrow-convergence.yml
+          git commit -m 'chore: remove temporary escrow patch workflow'
+          git push origin HEAD
+
+      - name: Open pull request
+        run: |
+          gh pr create \
+            --repo "$GITHUB_REPOSITORY" \
+            --head "codex/escrow-convergence-20260831" \
+            --base main \
+            --title "fix: converge concurrent escrow satisfaction responses" \
+            --body-file <(cat <<'BODY'
+          ## Summary
+
+          Research-first implementation for Backend issue #51.
+
+          - preserves the existing DB terminal-state guard;
+          - preserves the single-winner escrow release claim;
+          - converges retries/concurrent losers to canonical SETTLED state;
+          - prevents duplicate settlement socket/system-message emission;
+          - adds DB-backed opposite-party concurrency regression coverage.
+
+          No second settlement path is introduced.
+          BODY
+          )
