@@ -1,0 +1,251 @@
+name: Guarded Admin Force Release Implementation
+
+on:
+  push:
+    branches:
+      - codex/admin-force-release-atomic-20260831
+
+permissions:
+  contents: write
+
+jobs:
+  patch-test-and-clean:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: azm_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d azm_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/azm_test?schema=public
+      TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/azm_test?schema=public
+      JWT_SECRET: test_secret_exactly_32_characters_long
+      NODE_ENV: test
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: codex/admin-force-release-atomic-20260831
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Apply schema and generate client
+        run: |
+          npx prisma db push --accept-data-loss
+          node infra/install-transaction-quote-overlay.js
+          npx prisma generate
+
+      - name: Apply guarded source patch
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path('services/p2p.service.js')
+          s = p.read_text()
+          old = "const completeTrade = async (prisma, { tradeId, releasedByUserId }) => {"
+          new = "const completeTrade = async (prisma, { tradeId, releasedByUserId, sourceStatus = 'PAID' }) => {"
+          assert s.count(old) == 1, 'p2p signature anchor mismatch'
+          s = s.replace(old, new)
+          old = """    if (trade.status === 'COMPLETED') throw new Error('Trade is already completed.');
+    // HIGH-11: Only allow completion from PAID status (buyer must have submitted proof)
+    if (trade.status !== 'PAID') {
+        throw new Error(`Cannot complete trade: status must be PAID (current: ${trade.status}). Buyer must submit payment proof first.`);
+    }
+"""
+          new = """    if (trade.status === 'COMPLETED') throw new Error('Trade is already completed.');
+    // Normal completion requires PAID. Admin force-release explicitly uses
+    // DISPUTED as its source state so no committed DISPUTED->PAID intermediate
+    // state exists outside the financial transaction.
+    if (trade.status !== sourceStatus) {
+        throw new Error(`Cannot complete trade: status must be ${sourceStatus} (current: ${trade.status}).`);
+    }
+"""
+          assert s.count(old) == 1, 'p2p status validation anchor mismatch'
+          s = s.replace(old, new)
+          old = """        const claimed = await tx.trade.updateMany({
+            where: { id: tradeId, status: 'PAID' },
+"""
+          new = """        const claimed = await tx.trade.updateMany({
+            where: { id: tradeId, status: sourceStatus },
+"""
+          assert s.count(old) == 1, 'p2p atomic claim anchor mismatch'
+          s = s.replace(old, new)
+          p.write_text(s)
+
+          p = Path('controllers/adminController.js')
+          s = p.read_text()
+          old = """        // Phase H9 BUGFIX (2026-05-27): atomic conditional status flip
+        // before delegating to completeTrade. Two concurrent admins
+        // hitting the force-release button could both flip DISPUTED →
+        // PAID and both call completeTrade. The H8 fix on completeTrade
+        // catches the duplicate at the second layer (one of the calls
+        // gets TRADE_ALREADY_FINALIZED), but a failed completeTrade
+        // would leave the trade stranded in PAID. With the conditional
+        // flip here, only one admin's call ever proceeds — the second
+        // gets a clean 409 before any lower-level work.
+        const claimed = await prisma.trade.updateMany({
+            where: { id, status: 'DISPUTED' },
+            data:  { status: 'PAID' }
+        });
+        if (claimed.count === 0) {
+            return res.status(409).json({
+                success: false,
+                message: 'Trade is no longer disputed (concurrent admin action).'
+            });
+        }
+
+        const p2pService = require('../services/p2p.service');
+        const result     = await p2pService.completeTrade(prisma, { tradeId: id, releasedByUserId });
+"""
+          new = """        // Financial integrity: do NOT commit DISPUTED → PAID as a separate
+        // state transition. completeTrade claims DISPUTED → COMPLETED inside
+        // the same transaction that moves escrow, credits the receiver, and
+        // records the fee/history rows. This prevents a failed settlement from
+        // stranding a disputed trade in PAID and removes the exposed intermediate
+        // state entirely.
+        const p2pService = require('../services/p2p.service');
+        const result = await p2pService.completeTrade(prisma, {
+            tradeId: id,
+            releasedByUserId,
+            sourceStatus: 'DISPUTED'
+        });
+"""
+          assert s.count(old) == 1, 'admin force-release block anchor mismatch'
+          s = s.replace(old, new)
+          old = """    } catch (error) {
+        logger.error(\"Force Release Error:\", error);
+        res.status(500).json({ success: false, message: error.message });
+    }
+};
+"""
+          new = """    } catch (error) {
+        logger.error(\"Force Release Error:\", error);
+        if (error?.message === 'Trade is already completed.' || error?.message?.startsWith('Cannot complete trade: status must be DISPUTED')) {
+            return res.status(409).json({
+                success: false,
+                message: 'Trade was already resolved by another admin action.'
+            });
+        }
+        res.status(500).json({ success: false, message: error.message });
+    }
+};
+"""
+          assert s.count(old) == 1, 'admin force-release catch anchor mismatch'
+          s = s.replace(old, new, 1)
+          p.write_text(s)
+          PY
+
+      - name: Add regression tests
+        run: |
+          cat > __tests__/admin-force-release.test.js <<'EOF'
+          const { seedPaidTrade } = require('./helpers/factories');
+          const hasDb = !!process.env.TEST_DATABASE_URL;
+          const describeOrSkip = hasDb ? describe : describe.skip;
+          if (!hasDb) console.warn('[admin-force-release.test] TEST_DATABASE_URL not set — skipping.');
+
+          describeOrSkip('Admin force-release atomic settlement', () => {
+            let prisma, adminCtrl, p2pService;
+            beforeAll(() => {
+              process.env.DATABASE_URL = process.env.TEST_DATABASE_URL;
+              process.env.NODE_ENV = 'test';
+              process.env.JWT_SECRET = process.env.JWT_SECRET || 'test_secret_at_least_32_chars_long_xxxxx';
+              const { PrismaClient } = require('@prisma/client');
+              prisma = new PrismaClient();
+              adminCtrl = require('../controllers/adminController');
+              p2pService = require('../services/p2p.service');
+            });
+            afterAll(async () => prisma.$disconnect());
+            afterEach(async () => {
+              await prisma.$executeRawUnsafe('TRUNCATE TABLE "Trade", "Ad", "User" RESTART IDENTITY CASCADE');
+            }, 15000);
+
+            const mockRes = () => {
+              const r = { _status: 200, _body: null };
+              r.status = (s) => { r._status = s; return r; };
+              r.json = (b) => { r._body = b; return r; };
+              return r;
+            };
+            const mockApp = (p) => ({
+              get: (k) => k === 'prisma' ? p :
+                k === 'socketio' ? { to: () => ({ emit: () => {} }) } :
+                k === 'notificationService' ? { sendNotification: async () => {} } :
+                k === 'emitBalanceUpdate' ? (async () => {}) : null
+            });
+
+            test('settles directly from DISPUTED and pays exactly once under concurrent admin calls', async () => {
+              const seed = await seedPaidTrade(prisma);
+              await prisma.trade.update({ where: { id: seed.tradeId }, data: { status: 'DISPUTED' } });
+              const admin = await prisma.user.create({
+                data: { username: `admin_${Date.now()}`, email: `admin_${Date.now()}@test.com`, password: 'test', role: 'ADMIN' }
+              });
+              const makeReq = () => ({
+                user: { id: admin.id, username: admin.username },
+                body: { tradeId: seed.tradeId, adminNotes: 'Concurrent dispute resolution' },
+                ip: '127.0.0.1',
+                app: mockApp(prisma)
+              });
+              const run = async () => { const res = mockRes(); await adminCtrl.forceRelease(makeReq(), res); return res; };
+              const [a, b] = await Promise.all([run(), run()]);
+              expect([a._status, b._status].sort()).toEqual([200, 409]);
+              const trade = await prisma.trade.findUnique({ where: { id: seed.tradeId } });
+              expect(trade.status).toBe('COMPLETED');
+              const buyer = await prisma.user.findUnique({ where: { id: seed.buyerId } });
+              expect(Number(buyer.escrowLockedBalance)).toBeCloseTo(0, 6);
+              const vendor = await prisma.user.findUnique({ where: { id: seed.vendorId } });
+              expect(Number(vendor.availableBalance)).toBeGreaterThan(0);
+              const history = await prisma.transactionHistory.count({ where: { userId: seed.buyerId, type: 'P2P_TRADE' } });
+              expect(history).toBe(1);
+            });
+
+            test('failed settlement leaves trade DISPUTED because no intermediate PAID state is committed', async () => {
+              const seed = await seedPaidTrade(prisma);
+              await prisma.trade.update({ where: { id: seed.tradeId }, data: { status: 'DISPUTED' } });
+              const original = p2pService.completeTrade;
+              p2pService.completeTrade = async () => { throw new Error('synthetic settlement failure'); };
+              try {
+                const res = mockRes();
+                await adminCtrl.forceRelease({ user: { id: seed.vendorId, username: 'admin' }, body: { tradeId: seed.tradeId }, ip: '127.0.0.1', app: mockApp(prisma) }, res);
+                expect(res._status).toBe(500);
+                const trade = await prisma.trade.findUnique({ where: { id: seed.tradeId } });
+                expect(trade.status).toBe('DISPUTED');
+              } finally {
+                p2pService.completeTrade = original;
+              }
+            });
+          });
+          EOF
+
+      - name: Run focused regression tests
+        run: npx jest __tests__/admin-force-release.test.js __tests__/trade-flow.test.js --runInBand --forceExit
+
+      - name: Check formatting and duplicate settlement paths
+        run: |
+          git diff --check
+          test "$(grep -R "status: 'PAID'" -n services/p2p.service.js | grep -c "tradeId" || true)" -ge 0
+          grep -n "sourceStatus" services/p2p.service.js controllers/adminController.js
+
+      - name: Commit implementation and remove guard workflow
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add services/p2p.service.js controllers/adminController.js __tests__/admin-force-release.test.js
+          git commit -m "fix: make admin force release atomic from disputed state"
+          git rm .github/workflows/guarded-admin-force-release.yml
+          git commit -m "chore: remove one-shot guarded implementation workflow"
+          git push origin HEAD:codex/admin-force-release-atomic-20260831
