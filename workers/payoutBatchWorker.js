@@ -13,7 +13,7 @@
 // admins can see them in a dedicated War Room section.
 //
 // This worker does NOT replace withdrawalReconciliationWorker — that one
-// handles MTN settlement status polling. This worker handles the DECISION
+// handles provider settlement status polling. This worker handles the DECISION
 // of whether to auto-dispatch vs. flag for manual admin action.
 //
 // Flow per tick:
@@ -24,18 +24,22 @@
 //   5. For each:
 //      a. If amount > autoPayoutMaxAmountUsdc → mark NEEDS_MANUAL_REVIEW
 //      b. If pool < amount → mark NEEDS_MANUAL_REVIEW (pool exhausted)
-//      c. Otherwise → dispatch via mtnDisbursementService, mark PROCESSING
+//      c. Resolve the canonical PENDING TransactionHistory row first.
+//      d. Atomically claim the withdrawal as PROCESSING before provider I/O.
+//      e. Dispatch using that row's existing txHash as the provider reference.
+//      f. Reconciliation owns the final transition.
 //   6. Emit admin_alert socket events for flagged withdrawals
 //
-// Manual trigger:
-//   POST /api/admin/payouts/batch-process invokes processNow() directly.
+// IMPORTANT: The finance withdrawal flow already creates the canonical
+// TransactionHistory row and reserves the user's funds. Auto-payout must never
+// create a second financial history row or invent a second provider reference;
+// doing so can make reconciliation ambiguous and can double-refund failures.
 // =============================================================================
 
 const logger = require('../src/config/logger');
-const { randomUUID } = require('crypto');
 
 const DEFAULT_INTERVAL_MS = 120_000;  // 2 minutes
-const MAX_BATCH_SIZE      = 25;       // Don't overwhelm MTN in one tick
+const MAX_BATCH_SIZE      = 25;       // Don't overwhelm the provider in one tick
 
 class PayoutBatchWorker {
     constructor(prisma, io, mtnDisbursementService, notificationService) {
@@ -73,7 +77,6 @@ class PayoutBatchWorker {
             return { success: false, message: 'GlobalSettings not found.' };
         }
 
-        // If not forced, respect the enabled flag
         if (!force && !settings.autoPayoutEnabled) {
             return {
                 success: false,
@@ -85,16 +88,11 @@ class PayoutBatchWorker {
         return await this._processBatch(settings, { isManualTrigger: true });
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // PRIVATE: Scheduling
-    // ─────────────────────────────────────────────────────────────────────────
-
     _scheduleNext(delayMs) {
         this._timer = setTimeout(async () => {
             await this._tick().catch(err => {
                 logger.error({ err: err }, '[PayoutBatchWorker] tick error');
             });
-            // Re-read interval from settings for next tick
             const nextDelay = this._lastIntervalMs || DEFAULT_INTERVAL_MS;
             this._scheduleNext(nextDelay);
         }, delayMs);
@@ -108,10 +106,8 @@ class PayoutBatchWorker {
             const settings = await this._getSettings();
             if (!settings) return;
 
-            // Cache interval for scheduling
             this._lastIntervalMs = settings.autoPayoutIntervalMs || DEFAULT_INTERVAL_MS;
 
-            // Check master switch
             if (!settings.autoPayoutEnabled) {
                 if (this._lastEnabledState !== false) {
                     logger.info('[PayoutBatchWorker] auto-payout DISABLED — sleeping.');
@@ -131,27 +127,71 @@ class PayoutBatchWorker {
         }
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // PRIVATE: Core batch logic
-    // ─────────────────────────────────────────────────────────────────────────
+    /**
+     * Resolve the transaction already created by financeService.processFiatWithdrawal.
+     * Prefer the durable Withdrawal.transactionHistoryId bridge when the additive
+     * migration exists. Fall back only when exactly one PENDING fiat transaction
+     * matches the withdrawal identity. Ambiguity is never auto-dispatched.
+     */
+    async _findCanonicalTransaction(withdrawal) {
+        if (typeof this.prisma.$queryRawUnsafe === 'function') {
+            try {
+                const linkedRows = await this.prisma.$queryRawUnsafe(
+                    'SELECT "transactionHistoryId" FROM "Withdrawal" WHERE "id" = $1 LIMIT 1',
+                    withdrawal.id
+                );
+                const linkedId = linkedRows?.[0]?.transactionHistoryId;
+                if (linkedId) {
+                    const linked = await this.prisma.transactionHistory.findUnique({ where: { id: linkedId } });
+                    if (linked) return { row: linked, ambiguous: false };
+                }
+            } catch (err) {
+                logger.warn({ err, withdrawalId: withdrawal.id }, '[PayoutBatchWorker] durable transaction link unavailable');
+            }
+        }
+
+        const createdAt = withdrawal.createdAt instanceof Date
+            ? withdrawal.createdAt
+            : new Date(withdrawal.createdAt);
+        if (Number.isNaN(createdAt.getTime())) {
+            return { row: null, ambiguous: false };
+        }
+
+        const txRows = await this.prisma.transactionHistory.findMany({
+            where: {
+                userId: withdrawal.userId,
+                type: 'WITHDRAWAL_FIAT',
+                amountUsdc: withdrawal.amount,
+                status: 'PENDING',
+                createdAt: {
+                    gte: new Date(createdAt.getTime() - 5_000),
+                    lte: new Date(createdAt.getTime() + 5_000)
+                }
+            },
+            orderBy: { createdAt: 'desc' },
+            take: 2
+        });
+
+        if (txRows.length !== 1 || !txRows[0]?.txHash) {
+            return { row: null, ambiguous: txRows.length > 1 };
+        }
+
+        return { row: txRows[0], ambiguous: false };
+    }
 
     async _processBatch(settings, { isManualTrigger = false } = {}) {
         const maxAmount = Number(settings.autoPayoutMaxAmountUsdc) || 200;
         const threshold = Number(settings.autoPayoutThresholdUsdc) || 500;
 
-        // 1. Read fiat pool balance
         const fiatPool = await this.prisma.systemFiatPool.findUnique({ where: { id: 1 } });
         const poolBalance = fiatPool ? Number(fiatPool.balance) : 0;
 
-        // 2. Get live rate for GHS conversion
         const globalSettings = await this.prisma.globalSettings.findUnique({ where: { id: 1 } });
         const liveRate = globalSettings ? Number(globalSettings.liveRetailRate) : 12.5;
 
-        // 3. Scan PENDING fiat withdrawals (not already flagged)
         const pendingWithdrawals = await this.prisma.withdrawal.findMany({
             where: {
                 status: 'PENDING',
-                // Only fiat/MoMo withdrawals (not crypto)
                 OR: [
                     { payoutMethod: { contains: 'MOMO' } },
                     { payoutMethod: { contains: 'momo' } },
@@ -190,22 +230,16 @@ class PayoutBatchWorker {
         for (const withdrawal of pendingWithdrawals) {
             const amount = Number(withdrawal.amount);
 
-            // Gate A: Amount exceeds auto-approve threshold
             if (amount > maxAmount) {
                 await this._flagForManualReview(withdrawal, 'AMOUNT_EXCEEDS_THRESHOLD', {
                     amount,
                     maxAmount,
                     message: `Withdrawal $${amount} exceeds auto-approve max ($${maxAmount})`
                 });
-                results.flaggedManualReview.push({
-                    id: withdrawal.id,
-                    reason: 'AMOUNT_EXCEEDS_THRESHOLD',
-                    amount
-                });
+                results.flaggedManualReview.push({ id: withdrawal.id, reason: 'AMOUNT_EXCEEDS_THRESHOLD', amount });
                 continue;
             }
 
-            // Gate B: Pool has insufficient liquidity
             if (runningPoolBalance < threshold || runningPoolBalance < amount) {
                 await this._flagForManualReview(withdrawal, 'INSUFFICIENT_POOL_LIQUIDITY', {
                     amount,
@@ -213,64 +247,61 @@ class PayoutBatchWorker {
                     threshold,
                     message: `Fiat pool ($${runningPoolBalance.toFixed(2)}) below threshold ($${threshold}) or insufficient for $${amount}`
                 });
-                results.flaggedManualReview.push({
-                    id: withdrawal.id,
-                    reason: 'INSUFFICIENT_POOL_LIQUIDITY',
-                    amount,
-                    poolBalance: runningPoolBalance
-                });
+                results.flaggedManualReview.push({ id: withdrawal.id, reason: 'INSUFFICIENT_POOL_LIQUIDITY', amount, poolBalance: runningPoolBalance });
                 continue;
             }
 
-            // Gate C: Recipient phone required for MoMo dispatch
+            const canonical = await this._findCanonicalTransaction(withdrawal);
+            if (!canonical.row) {
+                const reason = canonical.ambiguous
+                    ? 'AMBIGUOUS_TRANSACTION_REFERENCE'
+                    : 'MISSING_TRANSACTION_REFERENCE';
+                await this._flagForManualReview(withdrawal, reason, {
+                    amount,
+                    message: 'Auto-payout refused because the canonical pending withdrawal transaction could not be identified uniquely.'
+                });
+                results.flaggedManualReview.push({ id: withdrawal.id, reason, amount });
+                continue;
+            }
+
             const recipientPhone = withdrawal.destination;
             if (!recipientPhone || recipientPhone === 'OLD_RECORD') {
                 await this._flagForManualReview(withdrawal, 'MISSING_RECIPIENT_PHONE', {
                     amount,
                     message: 'No recipient phone number on withdrawal record'
                 });
-                results.flaggedManualReview.push({
-                    id: withdrawal.id,
-                    reason: 'MISSING_RECIPIENT_PHONE',
-                    amount
-                });
+                results.flaggedManualReview.push({ id: withdrawal.id, reason: 'MISSING_RECIPIENT_PHONE', amount });
                 continue;
             }
 
-            // All gates passed — dispatch via MTN MoMo
+            // Claim the withdrawal before any provider I/O. Multiple worker
+            // instances may read the same PENDING row; only one can transition
+            // it to PROCESSING. If the process dies after this point, the
+            // reconciliation worker can safely resume from PROCESSING using the
+            // canonical provider reference.
+            const claim = await this.prisma.withdrawal.updateMany({
+                where: { id: withdrawal.id, status: 'PENDING' },
+                data: { status: 'PROCESSING' }
+            });
+            if (claim.count !== 1) {
+                results.errors.push({ id: withdrawal.id, reason: 'WITHDRAWAL_ALREADY_CLAIMED' });
+                continue;
+            }
+
             try {
                 const amountGhs = parseFloat((amount * liveRate).toFixed(2));
-                const referenceId = randomUUID();
+                const referenceId = String(canonical.row.txHash);
 
                 const dispatchResult = await this.mtn.initiateTransfer({
                     referenceId,
                     amountGhs,
                     recipientPhone,
+                    network: withdrawal.network || 'MTN',
                     externalId: `auto_payout_${withdrawal.id}`,
                     payerMessage: 'Azaman withdrawal',
-                    payeeNote: `Payout #${withdrawal.id}`
+                    payeeNote: `Payout #${withdrawal.id} (${withdrawal.network || 'MTN'})`
                 });
 
-                // Mark as PROCESSING (reconciliation worker will poll for final status)
-                await this.prisma.withdrawal.update({
-                    where: { id: withdrawal.id },
-                    data: { status: 'PROCESSING' }
-                });
-
-                // Write the TransactionHistory row with the MTN reference so
-                // reconciliation worker can find it
-                await this.prisma.transactionHistory.create({
-                    data: {
-                        userId: withdrawal.userId,
-                        type: 'WITHDRAWAL_FIAT',
-                        amountUsdc: amount,
-                        feeUsdc: 0, // Fee was already captured at creation time
-                        txHash: referenceId,
-                        status: 'COMPLETED'
-                    }
-                });
-
-                // Optimistically decrement running pool balance
                 runningPoolBalance -= amount;
 
                 results.processed.push({
@@ -278,26 +309,19 @@ class PayoutBatchWorker {
                     amount,
                     amountGhs,
                     referenceId,
+                    network: withdrawal.network || 'MTN',
                     mtnStatus: dispatchResult.status
                 });
 
-                logger.info(`[PayoutBatchWorker] dispatched withdrawal #${withdrawal.id}: $${amount} → GHS ${amountGhs} (ref: ${referenceId})`);
-
+                logger.info(`[PayoutBatchWorker] dispatched withdrawal #${withdrawal.id}: $${amount} → GHS ${amountGhs} (network: ${withdrawal.network || 'MTN'}, ref: ${referenceId})`);
             } catch (dispatchErr) {
-                logger.error(`[PayoutBatchWorker] MTN dispatch failed for withdrawal #${withdrawal.id}:`, dispatchErr.message);
-
-                // Flag for manual review on dispatch failure
-                await this._flagForManualReview(withdrawal, 'MTN_DISPATCH_FAILED', {
+                logger.error(`[PayoutBatchWorker] provider dispatch failed for withdrawal #${withdrawal.id}:`, dispatchErr.message);
+                await this._flagForManualReview(withdrawal, 'DISBURSEMENT_DISPATCH_FAILED', {
                     amount,
                     error: dispatchErr.message,
-                    message: `MTN dispatch failed: ${dispatchErr.message}`
+                    message: `Disbursement dispatch failed: ${dispatchErr.message}`
                 });
-                results.flaggedManualReview.push({
-                    id: withdrawal.id,
-                    reason: 'MTN_DISPATCH_FAILED',
-                    amount,
-                    error: dispatchErr.message
-                });
+                results.flaggedManualReview.push({ id: withdrawal.id, reason: 'DISBURSEMENT_DISPATCH_FAILED', amount, error: dispatchErr.message });
             }
         }
 
@@ -322,10 +346,6 @@ class PayoutBatchWorker {
         return summary;
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // PRIVATE: Flag a withdrawal for manual review
-    // ─────────────────────────────────────────────────────────────────────────
-
     async _flagForManualReview(withdrawal, reason, metadata = {}) {
         try {
             await this.prisma.withdrawal.update({
@@ -333,7 +353,6 @@ class PayoutBatchWorker {
                 data: { status: 'NEEDS_MANUAL_REVIEW' }
             });
 
-            // Notify the user their withdrawal needs extra time
             if (this.notificationService) {
                 await this.notificationService.sendNotification({
                     userId: withdrawal.userId,
@@ -341,7 +360,7 @@ class PayoutBatchWorker {
                     message: 'Your withdrawal is being reviewed by our team. This usually takes less than 24 hours.',
                     type: 'WITHDRAWAL_REVIEW',
                     category: 'GENERAL'
-                }).catch(() => {}); // non-fatal
+                }).catch(() => {});
             }
 
             logger.info(`[PayoutBatchWorker] flagged withdrawal #${withdrawal.id} → NEEDS_MANUAL_REVIEW (${reason})`);
@@ -349,10 +368,6 @@ class PayoutBatchWorker {
             logger.error(`[PayoutBatchWorker] failed to flag withdrawal #${withdrawal.id}:`, err.message);
         }
     }
-
-    // ─────────────────────────────────────────────────────────────────────────
-    // PRIVATE: Read settings
-    // ─────────────────────────────────────────────────────────────────────────
 
     async _getSettings() {
         try {

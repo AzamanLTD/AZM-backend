@@ -17,6 +17,7 @@ const ATTEMPT_STATUSES = new Set(['PENDING', 'COMPLETED', 'FAILED']);
 
 const normalizeProvider = (provider) => {
     const value = String(provider || '').trim().toUpperCase();
+    if (value === 'DISBURSEMENT') return 'MTN_MOMO_DISBURSEMENT';
     if (!PROVIDER_VALUES.has(value)) {
         const error = new Error(`[providerSettlementAttempt] unsupported provider: ${provider}`);
         error.code = 'UNSUPPORTED_PROVIDER';

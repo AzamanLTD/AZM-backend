@@ -57,8 +57,15 @@ class WithdrawalReconciliationWorker {
         this._running = true;
         try {
             const cutoff = new Date(Date.now() - STALE_AFTER_MS);
+            // PENDING covers manual/legacy withdrawals that have not yet been
+            // dispatched. PROCESSING covers auto-payout rows claimed before
+            // provider I/O. Without both states, an auto-payout crash after the
+            // claim would leave the customer's funds permanently stranded.
             const stuck = await this.prisma.withdrawal.findMany({
-                where: { status: 'PENDING', createdAt: { lt: cutoff } },
+                where: {
+                    status: { in: ['PENDING', 'PROCESSING'] },
+                    createdAt: { lt: cutoff }
+                },
                 include: {
                     user: { select: { id: true, email: true, username: true, phoneNumber: true, phoneVerified: true } }
                 },
@@ -66,7 +73,7 @@ class WithdrawalReconciliationWorker {
                 take: MAX_BATCH_SIZE
             });
             if (stuck.length === 0) return;
-            logger.info(`[WithdrawalReconciliation] reconciling ${stuck.length} pending withdrawal(s).`);
+            logger.info(`[WithdrawalReconciliation] reconciling ${stuck.length} pending/processing withdrawal(s).`);
             for (const w of stuck) {
                 await this._reconcileOne(w).catch((err) => {
                     logger.error(`[WithdrawalReconciliation] row id=${w.id} reconcile error:`, err.message);
@@ -93,11 +100,6 @@ class WithdrawalReconciliationWorker {
     }
 
     async _findCanonicalTransaction(withdrawal) {
-        // The durable identity bridge is stored on Withdrawal by the SQL
-        // migration. It is read through raw SQL until the generated Prisma
-        // client is regenerated from the additive schema relation. This keeps
-        // the worker compatible with the current checked-in client while making
-        // the database identity authoritative immediately.
         if (typeof this.prisma.$queryRawUnsafe === 'function') {
             const linkedRows = await this.prisma.$queryRawUnsafe(
                 'SELECT "transactionHistoryId" FROM "Withdrawal" WHERE "id" = $1 LIMIT 1',
@@ -117,9 +119,6 @@ class WithdrawalReconciliationWorker {
             }
         }
 
-        // Legacy rows and rows created before the link trigger may not yet have
-        // a direct identity. Correlation is therefore a strictly guarded
-        // migration fallback: exactly one candidate or no mutation.
         const txRows = await this.prisma.transactionHistory.findMany({
             where: {
                 userId: withdrawal.userId,
@@ -162,9 +161,6 @@ class WithdrawalReconciliationWorker {
             return { row: null, linked: false };
         }
 
-        // Promote a safely correlated legacy row into the durable identity
-        // bridge. The UPDATE is conditional so two workers cannot overwrite a
-        // link that another process established first.
         if (typeof this.prisma.$executeRawUnsafe === 'function') {
             await this.prisma.$executeRawUnsafe(
                 'UPDATE "Withdrawal" SET "transactionHistoryId" = $1 WHERE "id" = $2 AND "transactionHistoryId" IS NULL',
@@ -198,7 +194,7 @@ class WithdrawalReconciliationWorker {
             await this._recordException(
                 withdrawal,
                 'PROVIDER_STATUS_UNAVAILABLE',
-                { provider: 'MTN_MOMO_DISBURSEMENT', error: err.message },
+                { provider: 'DISBURSEMENT', error: err.message },
                 reference
             );
             logger.warn(`[WithdrawalReconciliation] provider status query failed for ${reference}: ${err.message}`);
@@ -210,7 +206,7 @@ class WithdrawalReconciliationWorker {
 
         await recordProviderSettlementAttempt(this.prisma, {
             reference,
-            provider: 'MTN_MOMO_DISBURSEMENT',
+            provider: statusResp?.provider || 'DISBURSEMENT',
             providerReference: reference,
             providerTransactionId: providerRef,
             status: ['SUCCESSFUL', 'COMPLETED'].includes(remoteStatus)
@@ -335,7 +331,7 @@ class WithdrawalReconciliationWorker {
         await this._recordException(
             withdrawal,
             'UNEXPECTED_PROVIDER_STATUS',
-            { provider: 'MTN_MOMO_DISBURSEMENT', status: remoteStatus, response: statusResp },
+            { provider: statusResp?.provider || 'DISBURSEMENT', status: remoteStatus, response: statusResp },
             reference
         );
         logger.warn(`[WithdrawalReconciliation] ref=${reference} unexpected provider status: ${remoteStatus}.`);
