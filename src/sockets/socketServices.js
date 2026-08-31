@@ -17,6 +17,7 @@ const TicketSocketService = require('../../services/ticketSocketService');
 const NotificationService = require('../../services/notificationService');
 const WebRTCSocketService = require('../../services/webrtcSocketService');
 const { setSocketIO: setBusinessNotificationSocketIO } = require('../../services/bizNotificationService');
+const { setSocketIO: setEscrowSocketIO } = require('../../services/escrowService');
 
 const vendorStatus = new Map();
 
@@ -25,6 +26,9 @@ function createSocketServices(io, prisma, app) {
     // workflows, so wire the already-authoritative Socket.IO instance into
     // that chokepoint once at server bootstrap. No second transport is created.
     setBusinessNotificationSocketIO(io);
+    // Refund convergence is emitted by the canonical escrow financial service
+    // after its atomic transaction commits.
+    setEscrowSocketIO(io);
 
     const tradeSocketService = new TradeSocketService(io, prisma);
     const chatSocketService = new ChatSocketService(io, prisma);
