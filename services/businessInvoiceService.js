@@ -1,4 +1,3 @@
-// services/businessInvoiceService.js
 // =============================================================================
 // AZAMAN — BUSINESS INVOICE SERVICE (Discovery Sprint, 2026-06-20)
 //
@@ -117,8 +116,8 @@ const voidInvoice = async (prisma, { invoiceId, businessProfileId }) => {
 
 // ── payInvoice ─────────────────────────────────────────────────────────────
 // THE FINANCIAL FUNCTION. Mirrors peerTransferController.sendFunds.
-// Idempotency: invoice.payTxHash is the anchor. If it is already set, the
-// invoice was already paid — return it (replay).
+// Idempotency: invoice.payTxHash is the anchor. The claim below makes that
+// anchor atomic, so two concurrent payment requests cannot both debit funds.
 const payInvoice = async (prisma, {
   invoiceId, customerId, tipUsdc, customerNote, customerCoveredFee,
 }) => {
@@ -131,12 +130,14 @@ const payInvoice = async (prisma, {
   });
   if (!invoice) throw new Error('Invoice not found.');
   if (invoice.customerId !== customerId) throw new Error('Not authorized to pay this invoice.');
-  if (invoice.status !== 'SENT') throw new Error(`Invoice cannot be paid from status ${invoice.status}.`);
 
   // ── IDEMPOTENCY REPLAY ──────────────────────────────────────────────────
+  // Check the durable marker before the status gate. A committed PAID invoice
+  // is a successful replay, not an invalid state transition.
   if (invoice.payTxHash) {
     return { invoice, customerPays: Number(invoice.customerPaidUsdc), alreadyPaid: true };
   }
+  if (invoice.status !== 'SENT') throw new Error(`Invoice cannot be paid from status ${invoice.status}.`);
 
   // ── FEE CALCULATION ─────────────────────────────────────────────────────
   const settings = await prisma.globalSettings.findUnique({ where: { id: 1 } });
@@ -157,73 +158,106 @@ const payInvoice = async (prisma, {
   const payTxHash = `INV_PAY_${invoiceId}`;  // invoiceId IS the idempotency anchor
 
   // ── ATOMIC TRANSACTION ──────────────────────────────────────────────────
-  const result = await prisma.$transaction(async (tx) => {
-    const customer = await tx.user.findUnique({
-      where: { id: customerId }, select: { availableBalance: true, username: true },
-    });
-    if (!customer) throw new Error('Customer not found.');
-    if (Number(customer.availableBalance) < customerPays) {
-      throw new Error('INSUFFICIENT_FUNDS');
-    }
-
-    // Debit customer
-    await tx.user.update({
-      where: { id: customerId },
-      data: { availableBalance: { decrement: customerPays } },
-    });
-    // Credit business owner
-    await tx.user.update({
-      where: { id: businessOwnerUserId },
-      data: { availableBalance: { increment: businessReceives } },
-    });
-    // Platform fee
-    if (fee > 0) {
-      await tx.systemProfitFees.upsert({
-        where: { id: 1 },
-        update: { balance: { increment: fee } },
-        create: { id: 1, balance: fee },
+  try {
+    const result = await prisma.$transaction(async (tx) => {
+      // Claim the invoice before any balance mutation. The unique deterministic
+      // payTxHash is written only while the invoice is still SENT and unclaimed.
+      // PostgreSQL/Prisma waits for a concurrent update on the same row, then
+      // returns count=0 to the losing request. If this transaction later fails,
+      // the claim rolls back with all other financial mutations.
+      const claim = await tx.businessInvoice.updateMany({
+        where: { id: invoiceId, status: 'SENT', payTxHash: null },
+        data: { payTxHash },
       });
-      await tx.adminProfitLog.create({ data: {
-        source: 'BUSINESS_INVOICE_FEE',
-        amountUsdc: fee,
-        relatedTxId: payTxHash,
-      }});
-    }
-    // Mark invoice PAID
-    const updated = await tx.businessInvoice.update({
-      where: { id: invoiceId },
-      data: {
-        status: 'PAID', paidAt: new Date(),
-        tipUsdc: tip, customerCoveredFee: coveredFee,
-        feeUsdc: fee, customerPaidUsdc: customerPays,
-        payTxHash,
-        customerNote: customerNote ? String(customerNote).slice(0, 500) : null,
-      },
-      include: { lineItems: true, taxLines: true,
-        businessProfile: { select: { userId: true, businessName: true, bizId: true } } },
-    });
-    // TransactionHistory — customer debit (signed: negative)
-    await tx.transactionHistory.create({ data: {
-      userId: customerId,
-      type: 'BUSINESS_INVOICE_PAYMENT',
-      amountUsdc: -customerPays,
-      feeUsdc: coveredFee ? fee : 0,
-      txHash: `${payTxHash}_PAYER`,
-      status: 'COMPLETED',
-    }});
-    // TransactionHistory — business credit (signed: positive)
-    await tx.transactionHistory.create({ data: {
-      userId: businessOwnerUserId,
-      type: 'BUSINESS_INVOICE_RECEIPT',
-      amountUsdc: businessReceives,
-      feeUsdc: coveredFee ? 0 : fee,
-      txHash: `${payTxHash}_PAYEE`,
-      status: 'COMPLETED',
-    }});
-    return updated;
-  }); // end $transaction
+      if (claim.count !== 1) {
+        throw new Error('INVOICE_ALREADY_PAID');
+      }
 
-  return { invoice: result, customerPays, businessReceives, fee };
+      const customer = await tx.user.findUnique({
+        where: { id: customerId }, select: { availableBalance: true, username: true },
+      });
+      if (!customer) throw new Error('Customer not found.');
+      if (Number(customer.availableBalance) < customerPays) {
+        throw new Error('INSUFFICIENT_FUNDS');
+      }
+
+      // Debit customer
+      await tx.user.update({
+        where: { id: customerId },
+        data: { availableBalance: { decrement: customerPays } },
+      });
+      // Credit business owner
+      await tx.user.update({
+        where: { id: businessOwnerUserId },
+        data: { availableBalance: { increment: businessReceives } },
+      });
+      // Platform fee
+      if (fee > 0) {
+        await tx.systemProfitFees.upsert({
+          where: { id: 1 },
+          update: { balance: { increment: fee } },
+          create: { id: 1, balance: fee },
+        });
+        await tx.adminProfitLog.create({ data: {
+          source: 'BUSINESS_INVOICE_FEE',
+          amountUsdc: fee,
+          relatedTxId: payTxHash,
+        }});
+      }
+      // Mark invoice PAID. payTxHash was already claimed above in the same
+      // transaction; this final update supplies the settlement fields.
+      const updated = await tx.businessInvoice.update({
+        where: { id: invoiceId },
+        data: {
+          status: 'PAID', paidAt: new Date(),
+          tipUsdc: tip, customerCoveredFee: coveredFee,
+          feeUsdc: fee, customerPaidUsdc: customerPays,
+          customerNote: customerNote ? String(customerNote).slice(0, 500) : null,
+        },
+        include: { lineItems: true, taxLines: true,
+          businessProfile: { select: { userId: true, businessName: true, bizId: true } } },
+      });
+      // TransactionHistory — customer debit (signed: negative)
+      await tx.transactionHistory.create({ data: {
+        userId: customerId,
+        type: 'BUSINESS_INVOICE_PAYMENT',
+        amountUsdc: -customerPays,
+        feeUsdc: coveredFee ? fee : 0,
+        txHash: `${payTxHash}_PAYER`,
+        status: 'COMPLETED',
+      }});
+      // TransactionHistory — business credit (signed: positive)
+      await tx.transactionHistory.create({ data: {
+        userId: businessOwnerUserId,
+        type: 'BUSINESS_INVOICE_RECEIPT',
+        amountUsdc: businessReceives,
+        feeUsdc: coveredFee ? 0 : fee,
+        txHash: `${payTxHash}_PAYEE`,
+        status: 'COMPLETED',
+      }});
+      return updated;
+    });
+
+    return { invoice: result, customerPays, businessReceives, fee };
+  } catch (err) {
+    if (err.message === 'INVOICE_ALREADY_PAID') {
+      // The losing concurrent request must return the committed invoice rather
+      // than re-running any financial mutation. A refetch also handles a
+      // replay arriving after the first payment has fully committed.
+      const paidInvoice = await prisma.businessInvoice.findUnique({
+        where: { id: invoiceId },
+        include: { businessProfile: { select: { userId: true, businessName: true, bizId: true } } },
+      });
+      if (paidInvoice?.payTxHash) {
+        return {
+          invoice: paidInvoice,
+          customerPays: Number(paidInvoice.customerPaidUsdc),
+          alreadyPaid: true,
+        };
+      }
+    }
+    throw err;
+  }
 };
 
 // ── getInvoice ─────────────────────────────────────────────────────────────
