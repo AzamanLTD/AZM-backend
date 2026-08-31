@@ -28,6 +28,14 @@ const logger = require('../src/config/logger');
 const { randomUUID } = require('crypto');
 const { runDoubleCheck } = require('../utils/securityCheck');
 
+// Socket.IO is wired once at bootstrap by src/sockets/socketServices.js.
+// Refund convergence is emitted from this canonical financial mutation so all
+// refund entry points share exactly one post-commit event producer.
+let _socketIo = null;
+const setSocketIO = (io) => {
+    _socketIo = io || null;
+};
+
 // Lazy-require to avoid circular dependency: escrowService <-> businessOrderService.
 // Do NOT change this to a top-level require().
 let _bizOrderService = null;
@@ -226,7 +234,7 @@ const fundEscrow = async (prisma, { escrowId, payerId }) => {
         _getBizNotificationService().notifyOrderEvent(prisma, {
             escrowId,
             type: 'ORDER_FUNDED'
-        }).catch((err) => logger.error({ err: err }, '[escrowService.fundEscrow] biz notif'));
+        }).catch((err) => logger.error({ err: err }, '[escrowService.fundEscrow] biz notif')));
     });
 
     return { success: true, escrow: updatedEscrow, reference };
@@ -378,7 +386,7 @@ const raiseDispute = async (prisma, { escrowId, raisedById, reason, evidenceUrls
             escrowId,
             type: 'ORDER_DISPUTED',
             extraMetadata: { disputeId: result.dispute?.id, raisedById }
-        }).catch((err) => logger.error({ err: err }, '[escrowService.raiseDispute] biz notif'));
+        }).catch((err) => logger.error({ err: err }, '[escrowService.raiseDispute] biz notif')));
     });
 
     return result;
@@ -692,6 +700,29 @@ const _refundEscrow = async (prisma, escrowId, finalStatus = 'REFUNDED') => {
         return result;
     });
 
+    // The transaction callback has completed, so the financial claim is
+    // committed before this convergence signal is emitted. All refund callers
+    // (expiry worker, Admin/manual resolution, and payer cancellation) therefore
+    // share one event producer and cannot drift into duplicate transports.
+    if (_socketIo) {
+        const payload = {
+            escrowId: updated.id,
+            ticketId: updated.ticketId,
+            status: updated.status,
+            amountUsdc: updated.amountUsdc,
+            payerId: updated.payerId,
+            payeeId: updated.payeeId,
+            reason: finalStatus === 'EXPIRED' ? 'EXPIRY' : 'REFUND'
+        };
+        try {
+            _socketIo.to(`user_${updated.payerId}`).emit('escrow_refunded', payload);
+            _socketIo.to(`user_${updated.payeeId}`).emit('escrow_refunded', payload);
+            _socketIo.to('admin_spy_room').emit('escrow_refunded', payload);
+        } catch (err) {
+            logger.warn({ err, escrowId: updated.id }, '[escrowService._refundEscrow] realtime emit failed');
+        }
+    }
+
     // finalStatus is either 'REFUNDED' (admin/manual) or 'EXPIRED' (worker sweep).
     // Both map to BusinessOrderStatus.REFUNDED in updateOrderStatusFromEscrow.
     setImmediate(() => {
@@ -806,6 +837,7 @@ module.exports = {
     assignDisputeToAdmin,
     getEscrowForTicket,
     cancelEscrow,
+    setSocketIO,
     // Exposed for the expiry worker (Work Item 9).
     _refundEscrow,
     _releaseEscrow,
