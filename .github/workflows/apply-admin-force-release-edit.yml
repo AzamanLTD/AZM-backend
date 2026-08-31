@@ -1,0 +1,111 @@
+name: apply-admin-force-release-edit
+
+on:
+  push:
+    branches:
+      - fix/admin-force-release-atomicity-20260831
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+      - name: Apply reviewed surgical edits
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path('services/p2p.service.js')
+          s = p.read_text()
+          old = "const completeTrade = async (prisma, { tradeId, releasedByUserId }) => {"
+          new = "const completeTrade = async (prisma, { tradeId, releasedByUserId, adminOverride = false }) => {"
+          assert s.count(old) == 1, 'completeTrade signature not found exactly once'
+          s = s.replace(old, new)
+
+          old = "    // HIGH-11: Only allow completion from PAID status (buyer must have submitted proof)\n    if (trade.status !== 'PAID') {\n        throw new Error(`Cannot complete trade: status must be PAID (current: ${trade.status}). Buyer must submit payment proof first.`);\n    }"
+          new = "    // HIGH-11: normal completion requires PAID. Admin force-release is the\n    // explicit exception: a disputed trade may be settled directly to COMPLETED.\n    const allowedCompletionStatus = adminOverride ? ['PAID', 'DISPUTED'] : ['PAID'];\n    if (!allowedCompletionStatus.includes(trade.status)) {\n        throw new Error(`Cannot complete trade: status must be ${adminOverride ? 'PAID or DISPUTED' : 'PAID'} (current: ${trade.status}).`);\n    }"
+          assert s.count(old) == 1, 'completion status guard not found exactly once'
+          s = s.replace(old, new)
+
+          old = "            where: { id: tradeId, status: 'PAID' },"
+          new = "            where: { id: tradeId, status: adminOverride ? 'DISPUTED' : 'PAID' },"
+          assert s.count(old) == 1, 'completeTrade atomic claim not found exactly once'
+          s = s.replace(old, new)
+
+          p.write_text(s)
+
+          p = Path('controllers/adminController.js')
+          s = p.read_text()
+          old = '''        // Phase H9 BUGFIX (2026-05-27): atomic conditional status flip
+        // before delegating to completeTrade. Two concurrent admins
+        // hitting the force-release button could both flip DISPUTED →
+        // PAID and both call completeTrade. The H8 fix on completeTrade
+        // catches the duplicate at the second layer (one of the calls
+        // gets TRADE_ALREADY_FINALIZED), but a failed completeTrade
+        // would leave the trade stranded in PAID. With the conditional
+        // flip here, only one admin's call ever proceeds — the second
+        // gets a clean 409 before any lower-level work.
+        const claimed = await prisma.trade.updateMany({
+            where: { id, status: 'DISPUTED' },
+            data:  { status: 'PAID' }
+        });
+        if (claimed.count === 0) {
+            return res.status(409).json({
+                success: false,
+                message: 'Trade is no longer disputed (concurrent admin action).'
+            });
+        }
+
+        const p2pService = require('../services/p2p.service');
+        const result     = await p2pService.completeTrade(prisma, { tradeId: id, releasedByUserId });'''
+          new = '''        // The canonical completeTrade transaction owns the DISPUTED → COMPLETED
+        // claim. Do not pre-flip DISPUTED → PAID: that creates an intermediate
+        // committed state and can strand a trade if settlement subsequently fails.
+        const p2pService = require('../services/p2p.service');
+        const result     = await p2pService.completeTrade(prisma, {
+            tradeId: id,
+            releasedByUserId,
+            adminOverride: true
+        });'''
+          assert s.count(old) == 1, 'admin force-release pre-claim block not found exactly once'
+          s = s.replace(old, new)
+
+          old = '''    } catch (error) {
+        logger.error("Force Release Error:", error);
+        res.status(500).json({ success: false, message: error.message });
+    }
+};'''
+          new = '''    } catch (error) {
+        logger.error("Force Release Error:", error);
+        if (error.message === 'TRADE_ALREADY_FINALIZED') {
+            return res.status(409).json({
+                success: false,
+                message: 'Trade is no longer disputed (concurrent admin action).'
+            });
+        }
+        res.status(500).json({ success: false, message: error.message });
+    }
+};'''
+          assert s.count(old) == 1, 'force-release catch block not found exactly once'
+          s = s.replace(old, new)
+          p.write_text(s)
+          PY
+
+          node --check services/p2p.service.js
+          node --check controllers/adminController.js
+
+      - name: Commit source changes and remove temporary workflow
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add services/p2p.service.js controllers/adminController.js
+          git rm .github/workflows/apply-admin-force-release-edit.yml
+          git commit -m 'fix(admin): make force release atomic'
+          git push origin HEAD:${GITHUB_REF_NAME}
