@@ -9,7 +9,8 @@ if [[ "${BACKUP_DRILL_ALLOW_MUTATION:-0}" != "1" ]]; then
   exit 2
 fi
 
-BACKUP_FILE="${BACKUP_FILE:-$(mktemp "${TMPDIR:-/tmp}/azaman-db-backup-XXXXXX.dump")}"
+WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/azaman-db-recovery-XXXXXX")"
+BACKUP_FILE="${BACKUP_FILE:-$WORK_DIR/backup.dump}"
 DRILL_DB="${DRILL_DB:-azm_backup_drill_$$}"
 KEEP_BACKUP="${KEEP_BACKUP:-0}"
 
@@ -18,14 +19,15 @@ cleanup() {
   psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c 'DROP SCHEMA IF EXISTS backup_drill CASCADE;' >/dev/null 2>&1
   psql "$PG_ADMIN_URL" -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS \"$DRILL_DB\";" >/dev/null 2>&1
   if [[ "$KEEP_BACKUP" != "1" ]]; then
-    rm -f "$BACKUP_FILE"
+    rm -rf "$WORK_DIR"
   else
     echo "Backup retained at $BACKUP_FILE"
+    rmdir "$WORK_DIR" 2>/dev/null || true
   fi
 }
 trap cleanup EXIT
 
-if [[ -e "$BACKUP_FILE" ]]; then
+if [[ "$BACKUP_FILE" != "$WORK_DIR/backup.dump" && -e "$BACKUP_FILE" ]]; then
   echo "Backup target already exists: $BACKUP_FILE" >&2
   exit 3
 fi
