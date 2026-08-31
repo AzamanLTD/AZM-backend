@@ -4,6 +4,8 @@ on:
   push:
     branches:
       - fix/admin-force-release-atomicity-20260831
+  pull_request:
+    types: [opened, synchronize]
 
 permissions:
   contents: write
@@ -15,7 +17,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.ref_name }}
+          ref: ${{ github.event.pull_request.head.ref || github.ref_name }}
           fetch-depth: 0
       - name: Apply reviewed surgical edits
         run: |
@@ -107,5 +109,6 @@ jobs:
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add services/p2p.service.js controllers/adminController.js
           git rm .github/workflows/apply-admin-force-release-edit.yml
+          git rm docs/ADMIN_FORCE_RELEASE_EDIT_TRIGGER.md || true
           git commit -m 'fix(admin): make force release atomic'
-          git push origin HEAD:${GITHUB_REF_NAME}
+          git push origin HEAD:${{ github.event.pull_request.head.ref || github.ref_name }}
