@@ -1,0 +1,59 @@
+name: Harden admin force-cancel validation
+
+on:
+  push:
+    branches: [fix/admin-force-cancel-request-contract]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/admin-force-cancel-request-contract
+          fetch-depth: 1
+
+      - name: Apply exact route validation
+        shell: bash
+        run: |
+          set -euo pipefail
+          file=routes/adminRoutes.js
+          grep -Fq "router.post('/disputes/force-cancel', adminController.forceCancel);" "$file"
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('routes/adminRoutes.js')
+          s = p.read_text()
+          old_import = "    forceReleaseSchema,\n"
+          new_import = "    forceReleaseSchema,\n"
+          old_route = "router.post('/disputes/force-cancel', adminController.forceCancel);"
+          new_route = "router.post('/disputes/force-cancel', validate(forceReleaseSchema), adminController.forceCancel);"
+          assert s.count(old_route) == 1
+          s = s.replace(old_route, new_route, 1)
+          p.write_text(s)
+          PY
+          grep -Fq "router.post('/disputes/force-cancel', validate(forceReleaseSchema), adminController.forceCancel);" "$file"
+          git diff --check
+
+      - name: Commit route hardening
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add routes/adminRoutes.js
+          git diff --cached --check
+          git diff --cached -- routes/adminRoutes.js
+          git commit -m "fix(admin): validate force-cancel request contract"
+          git push origin HEAD:fix/admin-force-cancel-request-contract
+
+      - name: Remove temporary workflow
+        shell: bash
+        run: |
+          set -euo pipefail
+          git rm .github/workflows/validate-admin-force-cancel.yml
+          git commit -m "chore: remove temporary force-cancel validation workflow"
+          git push origin HEAD:fix/admin-force-cancel-request-contract
