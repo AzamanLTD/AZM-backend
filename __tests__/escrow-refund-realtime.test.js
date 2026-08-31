@@ -4,6 +4,12 @@ jest.mock('../src/config/logger', () => ({
     info: jest.fn(),
 }));
 jest.mock('../utils/securityCheck', () => ({ runDoubleCheck: jest.fn() }));
+jest.mock('../services/businessOrderService', () => ({
+    updateOrderStatusFromEscrow: jest.fn().mockResolvedValue(undefined),
+}));
+jest.mock('../services/bizNotificationService', () => ({
+    notifyOrderEvent: jest.fn().mockResolvedValue(undefined),
+}));
 
 const escrowService = require('../services/escrowService');
 
@@ -36,6 +42,9 @@ describe('escrowService _refundEscrow realtime convergence', () => {
         };
 
         await escrowService._refundEscrow(prisma, 'escrow-1', 'EXPIRED');
+
+        // Flush setImmediate callbacks so they don't fire after Jest tears down
+        await new Promise(resolve => setImmediate(resolve));
 
         expect(prisma.$transaction).toHaveBeenCalledTimes(1);
         expect(emit).toHaveBeenCalledTimes(3);
