@@ -149,16 +149,6 @@ exports.markDelivered = async (req, res) => {
             });
         }
 
-        // Phase 4: Trigger webhook for order completion
-        try {
-            const webhookController = require('./webhookController');
-            await webhookController.triggerEvent(prisma, profile.id, 'order.completed', {
-                orderId: order.id,
-                orderRef: order.orderRef,
-                amount: parseFloat(order.amountUsdc),
-            });
-        } catch (_) { /* best-effort */ }
-
         return res.status(200).json({ success: true, order });
     } catch (err) {
         return res.status(400).json({ success: false, message: err.message });
