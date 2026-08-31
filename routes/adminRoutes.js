@@ -36,7 +36,7 @@ router.get('/profit-breakdown', adminController.getProfitBreakdown);
 router.get('/trades/live', adminController.getLiveTrades);
 router.get('/disputes', adminController.getAllDisputes);
 router.post('/disputes/force-release', validate(forceReleaseSchema), adminController.forceRelease);
-router.post('/disputes/force-cancel', adminController.forceCancel);
+router.post('/disputes/force-cancel', validate(forceReleaseSchema), adminController.forceCancel);
 
 // ─── USER MANAGEMENT ─────────────────────────────────────────────────────────
 router.get('/users', adminController.getUsers);
