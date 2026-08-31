@@ -234,7 +234,7 @@ const fundEscrow = async (prisma, { escrowId, payerId }) => {
         _getBizNotificationService().notifyOrderEvent(prisma, {
             escrowId,
             type: 'ORDER_FUNDED'
-        }).catch((err) => logger.error({ err: err }, '[escrowService.fundEscrow] biz notif')));
+        }).catch((err) => logger.error({ err: err }, '[escrowService.fundEscrow] biz notif'));
     });
 
     return { success: true, escrow: updatedEscrow, reference };
@@ -386,7 +386,7 @@ const raiseDispute = async (prisma, { escrowId, raisedById, reason, evidenceUrls
             escrowId,
             type: 'ORDER_DISPUTED',
             extraMetadata: { disputeId: result.dispute?.id, raisedById }
-        }).catch((err) => logger.error({ err: err }, '[escrowService.raiseDispute] biz notif')));
+        }).catch((err) => logger.error({ err: err }, '[escrowService.raiseDispute] biz notif'));
     });
 
     return result;
