@@ -13,16 +13,15 @@ const FINANCIAL_EVENTS = new Set([
     'admin_alert',
 ]);
 
-const wrapOperator = (operator) => new Proxy(operator, {
-    get(target, property, receiver) {
-        if (property !== 'emit') return Reflect.get(target, property, receiver);
-        return (event, payload, ...args) => target.emit(
-            event,
-            FINANCIAL_EVENTS.has(event) ? withRequestId(payload) : payload,
-            ...args,
-        );
-    },
-});
+const wrapOperator = (operator) => {
+    const originalEmit = operator.emit.bind(operator);
+    operator.emit = (event, payload, ...args) => originalEmit(
+        event,
+        FINANCIAL_EVENTS.has(event) ? withRequestId(payload) : payload,
+        ...args,
+    );
+    return operator;
+};
 
 const attachFinancialCorrelation = (io) => {
     if (!io || io.__azmFinancialCorrelation) return io;
