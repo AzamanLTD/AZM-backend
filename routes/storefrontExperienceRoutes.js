@@ -6,6 +6,8 @@ const { protectActive } = require('../middleware/banGuardMiddleware');
 const { requirePermission } = require('../middleware/requirePermission');
 const experienceBlueprintService = require('../services/experienceBlueprintService');
 const storefrontService = require('../services/storefrontService');
+const { preserveDraftExperience } = require('../services/storefrontDraftExperienceGuard');
+const { saveDraftSchema } = require('../services/validation/storefrontSchemas');
 const { renderStorefront, invalidateCache } = require('../services/storefrontRenderService');
 
 const router = express.Router();
@@ -66,10 +68,43 @@ router.get('/me/experience', protect, protectActive, requirePermission('storefro
         blueprint,
         defaults: experienceBlueprintService.defaultsForCategory(business.category),
         presets: experienceBlueprintService.PRESETS,
+        navigationModes: experienceBlueprintService.NAVIGATION_MODES,
+        detailPresentations: experienceBlueprintService.DETAIL_PRESENTATIONS,
         motionTempos: experienceBlueprintService.MOTION_TEMPOS,
         commitStyles: Object.values(experienceBlueprintService.COMMIT_STYLES),
       },
     });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// The generic draft endpoint is mounted by storefrontRoutes after this router.
+// Keeping this boundary here makes Experience Blueprint preservation a server
+// invariant for the public API path rather than relying on portal/Flutter clients
+// to merge the current snapshot correctly.
+router.put('/me/draft', protect, protectActive, requirePermission('storefront.manage'), async (req, res, next) => {
+  try {
+    const prisma = req.app.get('prisma');
+    const businessProfileId = businessProfileIdFromRequest(req);
+    if (!businessProfileId) return res.status(400).json({ success: false, message: 'No business profile found.' });
+
+    const parsed = saveDraftSchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.status(400).json({ success: false, message: 'Validation failed', errors: parsed.error.flatten() });
+    }
+
+    const currentDraft = await storefrontService.getOrCreateDraft(prisma, businessProfileId);
+    const safeLayoutJson = preserveDraftExperience(parsed.data.layoutJson, currentDraft.layoutJson);
+    const draft = await storefrontService.saveDraft(
+      prisma,
+      businessProfileId,
+      safeLayoutJson,
+      parsed.data.themeId,
+      parsed.data.expectedUpdatedAt,
+    );
+
+    res.json({ success: true, data: draft });
   } catch (err) {
     next(err);
   }
