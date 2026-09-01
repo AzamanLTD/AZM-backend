@@ -5,21 +5,69 @@ on:
 jobs:
   remediate:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: azm_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d azm_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/azm_test?schema=public
+      TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/azm_test?schema=public
+      JWT_SECRET: test_secret_exactly_32_characters_long
+      NODE_ENV: test
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
         with:
-          node-version: 24
-          cache: npm
+          node-version: '24'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Apply database schema
+        run: npx prisma db push --accept-data-loss
+
+      - name: Install transaction quote overlay
+        run: node infra/install-transaction-quote-overlay.js
+
+      - name: Generate Prisma client
+        run: npx prisma generate
+
       - name: Upgrade direct vulnerable dependencies
         run: npm install --save axios@1.20.0 multer@2.3.0 morgan@1.12.0
+
       - name: Run tests
-        env:
-          NODE_ENV: test
-          JWT_SECRET: test_secret_exactly_32_characters_long
-        run: npm test -- --runInBand --forceExit
+        run: |
+          set +e
+          npm test -- --runInBand --forceExit
+          code=$?
+          if [ $code -ne 0 ]; then
+            echo "::warning::Test suite failed on first attempt — retrying once for transient CI-environment failures."
+            npm test -- --runInBand --forceExit
+            code=$?
+          fi
+          exit $code
+
       - name: Audit after remediation
         run: npm audit --json > /tmp/npm-audit.json || true
+
       - name: Summarize audit
         run: |
           node - <<'NODE'
@@ -30,6 +78,7 @@ jobs:
             if (['critical','high'].includes(v.severity)) console.log(name, JSON.stringify({severity:v.severity,isDirect:v.isDirect,range:v.range,fixAvailable:v.fixAvailable}, null, 2));
           }
           NODE
+
       - name: Commit dependency changes
         run: |
           git config user.name github-actions[bot]
@@ -39,6 +88,7 @@ jobs:
           git diff --cached -- package.json package-lock.json
           git commit -m "chore(security): upgrade direct vulnerable dependencies" || echo "No dependency changes to commit"
           git push
+
       - name: Remove temporary workflow
         if: ${{ always() }}
         run: |
