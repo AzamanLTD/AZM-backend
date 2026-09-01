@@ -69,7 +69,9 @@ if (!process.env.MOOLRE_WEBHOOK_SECRET) {
 const MtnDisbursementService = require('../../services/mtnDisbursementService');
 const mtnFallbackService = new MtnDisbursementService();
 
-const { PaymentFailoverService } = require('../../services/paymentFailoverService');
+// Unlike the legacy I/O adapters above, failover orchestration is a src-level
+// domain service and therefore lives under src/services.
+const { PaymentFailoverService } = require('../services/paymentFailoverService');
 const paymentFailoverService = new PaymentFailoverService({
     providers: [
         { name: 'moolre', instance: moolreDisbursementService, priority: 1 },
@@ -80,8 +82,8 @@ const paymentFailoverService = new PaymentFailoverService({
 const TatumService = require('../../services/tatumService');
 const tatumService = new TatumService();
 
-const EmailService = require('../../services/emailService');
-const emailService = new EmailService();
+// The email adapter exports a ready-to-use singleton, not its class.
+const emailService = require('../../services/emailService');
 const SMSService = require('../../services/smsService');
 const smsService = new SMSService();
 
