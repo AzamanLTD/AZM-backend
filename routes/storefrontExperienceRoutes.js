@@ -5,6 +5,7 @@ const { protect } = require('../middleware/authMiddleware');
 const { protectActive } = require('../middleware/banGuardMiddleware');
 const { requirePermission } = require('../middleware/requirePermission');
 const experienceBlueprintService = require('../services/experienceBlueprintService');
+const storefrontService = require('../services/storefrontService');
 const { renderStorefront, invalidateCache } = require('../services/storefrontRenderService');
 
 const router = express.Router();
@@ -59,9 +60,27 @@ router.put('/me/experience', protect, protectActive, requirePermission('storefro
       req.body,
     );
 
+    // Keep editable experience settings in the same draft/publish lifecycle
+    // as the rest of the storefront. Public render reads only the published
+    // layout snapshot, so editor saves cannot leak into customer traffic.
+    const draft = await storefrontService.getOrCreateDraft(prisma, businessProfileId);
+    await prisma.businessStorefrontLayout.update({
+      where: { id: draft.id },
+      data: {
+        layoutJson: {
+          ...(draft.layoutJson || {}),
+          experience: blueprint,
+        },
+      },
+    });
+
     await invalidateCache(businessProfileId);
 
-    res.json({ success: true, data: blueprint, message: 'Experience settings saved.' });
+    res.json({
+      success: true,
+      data: blueprint,
+      message: 'Experience settings saved to the storefront draft. Publish the storefront to make them live.',
+    });
   } catch (err) {
     next(err);
   }
