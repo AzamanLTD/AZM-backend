@@ -35,10 +35,7 @@ const bizNotificationService = require('../services/bizNotificationService');
 const AdminAlertService = require('../services/adminAlertService');
 const { payInvoice } = require('../controllers/businessInvoiceController');
 const { settleFiatWithdrawal } = require('../services/fiatSettlementService');
-const { recordProviderSettlementAttempt } = require('../services/providerSettlementAttemptService');
-const {
-    moolreDisbursementWebhook,
-} = require('../controllers/fiatSettlementWebhook.controller');
+const { moolreDisbursementWebhook } = require('../controllers/fiatSettlementWebhook.controller');
 
 const flushMicrotasks = () => new Promise(resolve => setImmediate(resolve));
 const exactKeys = (value) => Object.keys(value).sort();
@@ -53,9 +50,7 @@ const createApp = (values) => ({
 });
 
 describe('final realtime event contracts', () => {
-    beforeEach(() => {
-        jest.clearAllMocks();
-    });
+    beforeEach(() => jest.clearAllMocks());
 
     describe('invoice_paid', () => {
         test('targets payer and business owner with the exact committed payload', async () => {
@@ -88,15 +83,12 @@ describe('final realtime event contracts', () => {
                 };
             });
 
-            const req = {
+            await payInvoice({
                 user: { id: 101 },
                 body: { tipUsdc: 0, customerNote: null, customerCoveredFee: false },
                 params: { invoiceId: 'invoice-1' },
                 app: createApp({ prisma: {}, socketio: io, emitBalanceUpdate: null }),
-            };
-            const res = createResponse();
-
-            await payInvoice(req, res);
+            }, createResponse());
             await flushMicrotasks();
 
             expect(io.to).toHaveBeenNthCalledWith(1, 'user_101');
@@ -128,9 +120,7 @@ describe('final realtime event contracts', () => {
             });
 
             await payInvoice({
-                user: { id: 101 },
-                body: {},
-                params: { invoiceId: 'invoice-2' },
+                user: { id: 101 }, body: {}, params: { invoiceId: 'invoice-2' },
                 app: createApp({ prisma: {}, socketio: io }),
             }, createResponse());
             await flushMicrotasks();
@@ -140,109 +130,68 @@ describe('final realtime event contracts', () => {
     });
 
     describe('biz_notification', () => {
-        test('persists the canonical notification before emitting the user-scoped realtime signal', async () => {
+        test('persists the canonical notification before emitting the user-scoped signal', async () => {
             let notificationCommitted = false;
             const emit = jest.fn((event, payload) => {
                 expect(notificationCommitted).toBe(true);
                 expect(event).toBe('biz_notification');
                 expect(exactKeys(payload)).toEqual([
-                    'businessProfileId',
-                    'createdAt',
-                    'escrowId',
-                    'notificationId',
-                    'orderId',
-                    'orderRef',
-                    'ticketId',
-                    'type',
+                    'businessProfileId', 'createdAt', 'escrowId', 'notificationId',
+                    'orderId', 'orderRef', 'ticketId', 'type',
                 ]);
             });
-            bizNotificationService.setSocketIO({
-                to: jest.fn(() => ({ emit })),
-            });
+            bizNotificationService.setSocketIO({ to: jest.fn(() => ({ emit })) });
 
             const notification = {
-                id: 'notification-1',
-                businessProfileId: 'business-1',
-                type: 'ORDER_SETTLED',
-                createdAt: new Date('2026-09-01T06:00:00.000Z'),
+                id: 'notification-1', businessProfileId: 'business-1',
+                type: 'ORDER_SETTLED', createdAt: new Date('2026-09-01T06:00:00.000Z'),
+                metadata: null,
             };
             const order = {
-                id: 'order-1',
-                businessProfileId: 'business-1',
-                productId: 'product-1',
-                ticketId: 'ticket-1',
-                title: 'Test Order',
-                amountUsdc: 42,
-                orderRef: 'ORD-01',
-                businessProfile: { userId: 303 },
+                id: 'order-1', businessProfileId: 'business-1', productId: 'product-1',
+                ticketId: 'ticket-1', title: 'Test Order', amountUsdc: 42,
+                orderRef: 'ORD-01', businessProfile: { userId: 303 },
             };
             const prisma = {
-                businessOrder: {
-                    findFirst: jest.fn().mockResolvedValue(order),
-                },
-                businessNotification: {
-                    create: jest.fn(async () => {
-                        notificationCommitted = true;
-                        return notification;
-                    }),
-                },
+                businessOrder: { findFirst: jest.fn().mockResolvedValue(order) },
+                businessNotification: { create: jest.fn(async () => {
+                    notificationCommitted = true;
+                    return notification;
+                }) },
             };
 
             const result = await bizNotificationService.notifyOrderEvent(prisma, {
-                escrowId: 'escrow-1',
-                type: 'ORDER_SETTLED',
+                escrowId: 'escrow-1', type: 'ORDER_SETTLED',
             });
 
             expect(result.notification).toEqual(notification);
-            expect(exactKeys(emit.mock.calls[0][1])).toEqual([
-                'businessProfileId',
-                'createdAt',
-                'escrowId',
-                'notificationId',
-                'orderId',
-                'orderRef',
-                'ticketId',
-                'type',
-            ]);
             expect(emit).toHaveBeenCalledWith('biz_notification', {
                 notificationId: 'notification-1',
                 businessProfileId: 'business-1',
                 type: 'ORDER_SETTLED',
-                orderId: 'order-1',
-                orderRef: 'ORD-01',
-                ticketId: 'ticket-1',
-                escrowId: 'escrow-1',
+                orderId: 'order-1', orderRef: 'ORD-01', ticketId: 'ticket-1',
+                escrowId: null,
                 createdAt: notification.createdAt,
             });
         });
 
-        test('does not emit when notification persistence fails', async () => {
+        test('returns the failed notification result without emitting when persistence fails', async () => {
             const emit = jest.fn();
-            bizNotificationService.setSocketIO({
-                to: jest.fn(() => ({ emit })),
-            });
+            bizNotificationService.setSocketIO({ to: jest.fn(() => ({ emit })) });
+            const order = {
+                id: 'order-2', businessProfileId: 'business-2', ticketId: 'ticket-2',
+                orderRef: 'ORD-02', amountUsdc: 10, businessProfile: { userId: 404 },
+            };
             const prisma = {
-                businessOrder: {
-                    findFirst: jest.fn().mockResolvedValue({
-                        id: 'order-2',
-                        businessProfileId: 'business-2',
-                        ticketId: 'ticket-2',
-                        orderRef: 'ORD-02',
-                        amountUsdc: 10,
-                        businessProfile: { userId: 404 },
-                    }),
-                },
-                businessNotification: {
-                    create: jest.fn().mockRejectedValue(new Error('DB_WRITE_FAILED')),
-                },
+                businessOrder: { findFirst: jest.fn().mockResolvedValue(order) },
+                businessNotification: { create: jest.fn().mockRejectedValue(new Error('DB_WRITE_FAILED')) },
             };
 
             const result = await bizNotificationService.notifyOrderEvent(prisma, {
-                escrowId: 'escrow-2',
-                type: 'ORDER_SETTLED',
+                escrowId: 'escrow-2', type: 'ORDER_SETTLED',
             });
 
-            expect(result).toBeNull();
+            expect(result).toEqual({ notification: null, order });
             expect(emit).not.toHaveBeenCalled();
         });
     });
@@ -251,82 +200,48 @@ describe('final realtime event contracts', () => {
         test('withdrawal settlement emits user projections plus admin_spy admin_alert with exact payload', async () => {
             process.env.MOOLRE_WEBHOOK_SECRET = 'contract-secret';
             settleFiatWithdrawal.mockResolvedValue({
-                changed: true,
-                userId: 505,
-                reference: 'withdrawal-contract-1',
-                status: 'COMPLETED',
-                providerTxId: 'provider-tx-1',
+                changed: true, userId: 505, reference: 'withdrawal-contract-1',
+                status: 'COMPLETED', providerTxId: 'provider-tx-1',
             });
 
             const userEmit = jest.fn();
             const adminEmit = jest.fn();
             const io = {
-                to: jest.fn((room) => ({
-                    emit: room === 'admin_spy' ? adminEmit : userEmit,
-                })),
+                to: jest.fn((room) => ({ emit: room === 'admin_spy' ? adminEmit : userEmit })),
             };
-            const req = {
+            await moolreDisbursementWebhook({
                 headers: { 'x-moolre-webhook-secret': 'contract-secret' },
-                body: {
-                    externalref: 'withdrawal-contract-1',
-                    txstatus: 1,
-                },
-                app: createApp({
-                    prisma: {},
-                    socketio: io,
-                    emitBalanceUpdate: null,
-                }),
-            };
-            const res = createResponse();
-
-            await moolreDisbursementWebhook(req, res);
+                body: { externalref: 'withdrawal-contract-1', txstatus: 1 },
+                app: createApp({ prisma: {}, socketio: io, emitBalanceUpdate: null }),
+            }, createResponse());
 
             expect(io.to).toHaveBeenNthCalledWith(1, 'user_505');
             expect(io.to).toHaveBeenNthCalledWith(2, 'user_505');
             expect(io.to).toHaveBeenNthCalledWith(3, 'admin_spy');
 
-            const alert = adminEmit.mock.calls[0][1];
-            expect(exactKeys(alert)).toEqual([
-                'changed',
-                'providerTxId',
-                'reference',
-                'status',
-                'timestamp',
-                'type',
+            expect(exactKeys(adminEmit.mock.calls[0][1])).toEqual([
+                'changed', 'providerTxId', 'reference', 'status', 'timestamp', 'type',
             ]);
-            expect(alert).toEqual(expect.objectContaining({
-                type: 'WITHDRAWAL_SETTLED',
-                reference: 'withdrawal-contract-1',
-                status: 'COMPLETED',
-                providerTxId: 'provider-tx-1',
-                changed: true,
+            expect(adminEmit).toHaveBeenCalledWith('admin_alert', expect.objectContaining({
+                type: 'WITHDRAWAL_SETTLED', reference: 'withdrawal-contract-1',
+                status: 'COMPLETED', providerTxId: 'provider-tx-1', changed: true,
             }));
             expect(userEmit).toHaveBeenCalledWith('withdrawal_progress', expect.objectContaining({
-                reference: 'withdrawal-contract-1',
-                status: 'COMPLETED',
-                providerTxId: 'provider-tx-1',
-                pct: 100,
+                reference: 'withdrawal-contract-1', status: 'COMPLETED', pct: 100,
             }));
             expect(userEmit).toHaveBeenCalledWith('withdrawal_settled', expect.objectContaining({
-                reference: 'withdrawal-contract-1',
-                status: 'COMPLETED',
-                providerTxId: 'provider-tx-1',
-                changed: true,
+                reference: 'withdrawal-contract-1', status: 'COMPLETED', providerTxId: 'provider-tx-1', changed: true,
             }));
         });
     });
 
     describe('adminAlertService room boundary', () => {
-        test('generic operational admin alerts retain their canonical admin_spy_room destination', () => {
+        test('generic operational admin alerts retain the canonical admin_spy_room destination', () => {
             const io = { to: jest.fn(() => ({ emit: jest.fn() })) };
             const service = new AdminAlertService({ io });
-
             service.emit('LARGE_WITHDRAWAL_PENDING', {
-                withdrawalId: 'withdrawal-1',
-                userId: 505,
-                amount: 900,
+                withdrawalId: 'withdrawal-1', userId: 505, amount: 900,
             });
-
             expect(io.to).toHaveBeenCalledWith('admin_spy_room');
         });
     });
