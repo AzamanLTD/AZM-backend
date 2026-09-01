@@ -11,6 +11,30 @@
 const logger = require('../src/config/logger');
 const { migrateLayout, generateEmptyLayout } = require('./storefrontSchemaMigration');
 
+function hasOwnExperience(layoutJson) {
+  return Boolean(
+    layoutJson &&
+    typeof layoutJson === 'object' &&
+    Object.prototype.hasOwnProperty.call(layoutJson, 'experience'),
+  );
+}
+
+/**
+ * Preserve the current draft's Experience Blueprint when applying a historical
+ * layout/template that predates the blueprint being stored in layoutJson.
+ * An explicit `experience` on the target always wins, including null, because
+ * that is an intentional snapshot rather than an absent legacy field.
+ */
+function preserveExperienceSnapshot(nextLayout, currentDraftLayout) {
+  if (
+    !hasOwnExperience(nextLayout) &&
+    hasOwnExperience(currentDraftLayout)
+  ) {
+    return { ...nextLayout, experience: currentDraftLayout.experience };
+  }
+  return nextLayout;
+}
+
 /**
  * Generate a default layout for a business based on its category.
  * @param {string} businessProfileId
@@ -339,9 +363,10 @@ async function revertToVersion(prisma, businessProfileId, versionId) {
   });
 
   if (existingDraft) {
+    const layoutJson = preserveExperienceSnapshot(migratedLayout, existingDraft.layoutJson);
     return prisma.businessStorefrontLayout.update({
       where: { id: existingDraft.id },
-      data: { themeId: version.themeId, layoutJson: migratedLayout },
+      data: { themeId: version.themeId, layoutJson },
       include: { theme: true },
     });
   }
@@ -384,9 +409,10 @@ async function applyTemplate(prisma, businessProfileId, templateId) {
   });
 
   if (existingDraft) {
+    const layoutJson = preserveExperienceSnapshot(migratedLayout, existingDraft.layoutJson);
     return prisma.businessStorefrontLayout.update({
       where: { id: existingDraft.id },
-      data: { themeId, layoutJson: migratedLayout },
+      data: { themeId, layoutJson },
       include: { theme: true },
     });
   }
@@ -625,6 +651,7 @@ module.exports = {
   checkEligibility,
   recordEvent,
   getAnalytics,
+  preserveExperienceSnapshot,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
