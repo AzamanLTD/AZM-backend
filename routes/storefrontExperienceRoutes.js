@@ -5,42 +5,13 @@ const { protect } = require('../middleware/authMiddleware');
 const { protectActive } = require('../middleware/banGuardMiddleware');
 const { requirePermission } = require('../middleware/requirePermission');
 const experienceBlueprintService = require('../services/experienceBlueprintService');
+const { renderStorefront, invalidateCache } = require('../services/storefrontRenderService');
 
 const router = express.Router();
 
 function businessProfileIdFromRequest(req) {
   return req.businessProfileId || req.user?.businessProfileId;
 }
-
-// Public: the experience contract is safe to expose with the published
-// storefront. It contains only presentation/interaction policy, never private
-// operational data.
-router.get('/:businessProfileId/experience', async (req, res, next) => {
-  try {
-    const prisma = req.app.get('prisma');
-    const business = await prisma.businessProfile.findUnique({
-      where: { id: req.params.businessProfileId },
-      select: {
-        id: true,
-        category: true,
-        businessMeta: true,
-        isSuspended: true,
-        storefrontDisabled: true,
-      },
-    });
-
-    if (!business || business.isSuspended || business.storefrontDisabled) {
-      return res.status(404).json({ success: false, message: 'Experience not available.' });
-    }
-
-    res.json({
-      success: true,
-      data: experienceBlueprintService.getExperienceBlueprint(business),
-    });
-  } catch (err) {
-    next(err);
-  }
-});
 
 // Authenticated business editor: retrieve the effective blueprint plus safe
 // category defaults so the portal can present a useful editor immediately.
@@ -88,10 +59,26 @@ router.put('/me/experience', protect, protectActive, requirePermission('storefro
       req.body,
     );
 
-    const { invalidateCache } = require('../services/storefrontRenderService');
     await invalidateCache(businessProfileId);
 
     res.json({ success: true, data: blueprint, message: 'Experience settings saved.' });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Public contract is derived from the published storefront. This prevents a
+// business's unsaved/private experience metadata from leaking into customer
+// discovery and keeps the experience contract in lockstep with storefront publication.
+router.get('/:businessProfileId/experience', async (req, res, next) => {
+  try {
+    const prisma = req.app.get('prisma');
+    const rendered = await renderStorefront(prisma, req.params.businessProfileId);
+    if (!rendered) {
+      return res.status(404).json({ success: false, message: 'Experience not available.' });
+    }
+
+    res.json({ success: true, data: rendered.experience });
   } catch (err) {
     next(err);
   }
