@@ -36,7 +36,7 @@ router.get('/me/experience', protect, protectActive, requirePermission('storefro
         defaults: experienceBlueprintService.defaultsForCategory(business.category),
         presets: experienceBlueprintService.PRESETS,
         motionTempos: experienceBlueprintService.MOTION_TEMPOS,
-        commitStyles: experienceBlueprintService.COMMIT_STYLES,
+        commitStyles: Object.values(experienceBlueprintService.COMMIT_STYLES),
       },
     });
   } catch (err) {
