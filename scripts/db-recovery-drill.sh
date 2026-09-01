@@ -14,10 +14,25 @@ BACKUP_FILE="${BACKUP_FILE:-$WORK_DIR/backup.dump}"
 DRILL_DB="${DRILL_DB:-azm_backup_drill_$$}"
 KEEP_BACKUP="${KEEP_BACKUP:-0}"
 
+# Prisma DATABASE_URL values may contain ?schema=..., which Prisma accepts but
+# PostgreSQL's native CLI tools reject. Keep the application URL untouched and
+# normalize only the URL passed to psql/pg_dump/pg_restore.
+normalize_pg_cli_url() {
+  node - "$1" <<'NODE'
+const value = process.argv[2];
+const url = new URL(value);
+url.searchParams.delete('schema');
+process.stdout.write(url.toString());
+NODE
+}
+
+PG_CLI_URL="$(normalize_pg_cli_url "$DATABASE_URL")"
+PG_ADMIN_CLI_URL="$(normalize_pg_cli_url "$PG_ADMIN_URL")"
+
 cleanup() {
   set +e
-  psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -c 'DROP SCHEMA IF EXISTS backup_drill CASCADE;' >/dev/null 2>&1
-  psql "$PG_ADMIN_URL" -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS \"$DRILL_DB\";" >/dev/null 2>&1
+  psql "$PG_CLI_URL" -v ON_ERROR_STOP=1 -c 'DROP SCHEMA IF EXISTS backup_drill CASCADE;' >/dev/null 2>&1
+  psql "$PG_ADMIN_CLI_URL" -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS \"$DRILL_DB\";" >/dev/null 2>&1
   if [[ "$KEEP_BACKUP" != "1" ]]; then
     rm -rf "$WORK_DIR"
   else
@@ -35,7 +50,7 @@ fi
 export PGCONNECT_TIMEOUT="${PGCONNECT_TIMEOUT:-10}"
 
 printf '[recovery-drill] creating sentinel data in disposable source database\n'
-psql "$DATABASE_URL" -v ON_ERROR_STOP=1 <<'SQL'
+psql "$PG_CLI_URL" -v ON_ERROR_STOP=1 <<'SQL'
 CREATE SCHEMA IF NOT EXISTS backup_drill;
 CREATE TABLE backup_drill.sentinel (
   id integer PRIMARY KEY,
@@ -52,22 +67,20 @@ pg_dump \
   --no-owner \
   --no-acl \
   --file="$BACKUP_FILE" \
-  "$DATABASE_URL"
+  "$PG_CLI_URL"
 
 printf '[recovery-drill] validating archive\n'
 pg_restore --list "$BACKUP_FILE" >/dev/null
 
 printf '[recovery-drill] creating disposable restore database %s\n' "$DRILL_DB"
-psql "$PG_ADMIN_URL" -v ON_ERROR_STOP=1 -c "CREATE DATABASE \"$DRILL_DB\";"
+psql "$PG_ADMIN_CLI_URL" -v ON_ERROR_STOP=1 -c "CREATE DATABASE \"$DRILL_DB\";"
 
-RESTORE_URL="$(python3 - "$PG_ADMIN_URL" "$DRILL_DB" <<'PY'
-import sys
-from urllib.parse import urlsplit, urlunsplit
-
-base, db = sys.argv[1:]
-parts = urlsplit(base)
-print(urlunsplit((parts.scheme, parts.netloc, '/' + db, parts.query, parts.fragment)))
-PY
+RESTORE_URL="$(node - "$PG_ADMIN_CLI_URL" "$DRILL_DB" <<'NODE'
+const base = new URL(process.argv[2]);
+const db = process.argv[3];
+base.pathname = `/${db}`;
+process.stdout.write(base.toString());
+NODE
 )"
 
 printf '[recovery-drill] restoring archive\n'
