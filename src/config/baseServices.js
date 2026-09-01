@@ -82,8 +82,8 @@ const paymentFailoverService = new PaymentFailoverService({
 const TatumService = require('../../services/tatumService');
 const tatumService = new TatumService();
 
-const EmailService = require('../../services/emailService');
-const emailService = new EmailService();
+// The email adapter exports a ready-to-use singleton, not its class.
+const emailService = require('../../services/emailService');
 const SMSService = require('../../services/smsService');
 const smsService = new SMSService();
 
