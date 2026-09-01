@@ -11,7 +11,6 @@
 // =============================================================================
 
 const { PrismaClient, Prisma } = require('@prisma/client');
-const { PrismaPg } = require('@prisma/adapter-pg');
 const { Pool } = require('pg');
 const logger = require('../config/logger');
 
@@ -38,14 +37,28 @@ pool.on('error', (err) => {
     logger.error({ err }, 'Unexpected error on idle client');
 });
 
-// NOTE: @prisma/adapter-pg v7.x requires @prisma/client v7.x. If versions
-// mismatch, fall back to plain PrismaClient (which handles its own pooling).
+// @prisma/adapter-pg is optional. Prisma Client 6 can use its native driver
+// path, and the adapter must only be loaded when it is present AND compatible
+// with the installed Prisma Client major version. Keeping the require inside
+// this guarded block makes the fallback real: removing the optional package no
+// longer crashes module evaluation before the fallback can run.
 let prisma;
 try {
-    const adapterVersion = require('@prisma/adapter-pg/package.json').version;
     const clientVersion = require('@prisma/client/package.json').version;
-    if (adapterVersion.split('.')[0] !== clientVersion.split('.')[0]) {
-        logger.warn({ adapterVersion, clientVersion }, 'Prisma adapter-pg major version mismatch — using plain PrismaClient');
+    let PrismaPg = null;
+    let adapterVersion = null;
+
+    try {
+        ({ PrismaPg } = require('@prisma/adapter-pg'));
+        adapterVersion = require('@prisma/adapter-pg/package.json').version;
+    } catch (adapterLoadError) {
+        logger.info({ err: adapterLoadError.message }, 'Prisma pg adapter unavailable — using plain PrismaClient');
+    }
+
+    if (!PrismaPg || !adapterVersion || adapterVersion.split('.')[0] !== clientVersion.split('.')[0]) {
+        if (adapterVersion && adapterVersion.split('.')[0] !== clientVersion.split('.')[0]) {
+            logger.warn({ adapterVersion, clientVersion }, 'Prisma adapter-pg major version mismatch — using plain PrismaClient');
+        }
         prisma = new PrismaClient();
     } else {
         const adapter = new PrismaPg(pool);
