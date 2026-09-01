@@ -53,17 +53,32 @@ const GatewayService = require('../../services/gatewayService');
 const gatewayService = new GatewayService(prisma);
 gatewayService.startRateSync();
 
+// Moolre is the primary fiat disbursement provider.
 const MoolreDisbursementService = require('../../services/moolreDisbursementService');
-const mtnDisbursementService = new MoolreDisbursementService(prisma);
+const moolreDisbursementService = new MoolreDisbursementService();
 
+// Moolre fiat collection remains a standalone I/O adapter.
 const MoolreCollectionService = require('../../services/moolreCollectionService');
-const moolreCollectionService = new MoolreCollectionService(prisma);
+const moolreCollectionService = new MoolreCollectionService();
 
-const PaymentFailoverService = require('../../services/paymentFailoverService');
-const paymentFailoverService = new PaymentFailoverService(prisma);
+if (!process.env.MOOLRE_WEBHOOK_SECRET) {
+    logger.warn('MOOLRE_WEBHOOK_SECRET is not set — webhook endpoint is disabled');
+}
+
+// MTN remains the secondary provider for automatic off-ramp failover.
+const MtnDisbursementService = require('../../services/mtnDisbursementService');
+const mtnFallbackService = new MtnDisbursementService();
+
+const { PaymentFailoverService } = require('../../services/paymentFailoverService');
+const paymentFailoverService = new PaymentFailoverService({
+    providers: [
+        { name: 'moolre', instance: moolreDisbursementService, priority: 1 },
+        { name: 'mtn', instance: mtnFallbackService, priority: 2 },
+    ],
+});
 
 const TatumService = require('../../services/tatumService');
-const tatumService = new TatumService(prisma);
+const tatumService = new TatumService();
 
 const EmailService = require('../../services/emailService');
 const emailService = new EmailService();
@@ -75,7 +90,7 @@ module.exports = {
     prisma,
     marketOracle,
     gatewayService,
-    mtnDisbursementService,
+    mtnDisbursementService: moolreDisbursementService,
     moolreCollectionService,
     paymentFailoverService,
     tatumService,
