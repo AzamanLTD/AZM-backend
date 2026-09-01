@@ -1,0 +1,99 @@
+name: Security audit remediation verification
+
+on:
+  push:
+    branches: [chore/security-nonforce-audit-fix-verify]
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: azm_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d azm_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/azm_test?schema=public
+      TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/azm_test?schema=public
+      JWT_SECRET: test_secret_exactly_32_characters_long
+      NODE_ENV: test
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - name: Install baseline dependencies
+        run: npm ci
+
+      - name: Apply non-force npm audit fix and record residuals
+        run: |
+          set +e
+          npm audit fix
+          audit_fix_code=$?
+          set -e
+          echo "npm audit fix exit code: ${audit_fix_code}"
+          npm audit --json > audit-after-fix.json || true
+          node - <<'NODE'
+          const fs=require('fs');
+          const report=JSON.parse(fs.readFileSync('audit-after-fix.json','utf8'));
+          console.log(JSON.stringify(report.metadata || {}, null, 2));
+          NODE
+
+      - name: Apply database schema
+        run: npx prisma db push --accept-data-loss
+
+      - name: Install transaction quote overlay
+        run: node infra/install-transaction-quote-overlay.js
+
+      - name: Generate Prisma client
+        run: npx prisma generate
+
+      - name: Run tests
+        run: npm test -- --runInBand --forceExit
+
+      - name: Database backup and restore drill
+        env:
+          PG_ADMIN_URL: postgres://postgres:postgres@localhost:5432/postgres
+          BACKUP_DRILL_ALLOW_MUTATION: '1'
+        run: npm run db:recovery-drill
+
+      - name: Persist dependency state through GitHub API
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          API="https://api.github.com/repos/${REPO}"
+          parent_sha="$(git rev-parse HEAD)"
+          base_tree="$(git rev-parse HEAD^{tree})"
+          create_blob() {
+            jq -Rs '{content:.,encoding:"utf-8"}' < "$1" |
+              curl -fsS -X POST -H "Authorization: Bearer ${GH_TOKEN}" -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2022-11-28' "${API}/git/blobs" -d @- | jq -er '.sha'
+          }
+          pkg_sha="$(create_blob package.json)"
+          lock_sha="$(create_blob package-lock.json)"
+          tree_sha="$(jq -cn --arg base "${base_tree}" --arg pkg "${pkg_sha}" --arg lock "${lock_sha}" '{base_tree:$base,tree:[{path:"package.json",mode:"100644",type:"blob",sha:$pkg},{path:"package-lock.json",mode:"100644",type:"blob",sha:$lock}]}' | curl -fsS -X POST -H "Authorization: Bearer ${GH_TOKEN}" -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2022-11-28' "${API}/git/trees" -d @- | jq -er '.sha')"
+          dependency_commit_sha="$(jq -cn --arg message 'security: apply non-force npm audit fixes' --arg tree "${tree_sha}" --arg parent "${parent_sha}" '{message:$message,tree:$tree,parents:[$parent]}' | curl -fsS -X POST -H "Authorization: Bearer ${GH_TOKEN}" -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2022-11-28' "${API}/git/commits" -d @- | jq -er '.sha')"
+          echo "dependency_commit_sha=${dependency_commit_sha}" >> "$GITHUB_OUTPUT"
+          echo "Dependency commit object: ${dependency_commit_sha}"
