@@ -35,7 +35,12 @@ const DETAIL_PRESENTATIONS = Object.freeze([
 ]);
 
 const MOTION_TEMPOS = Object.freeze(['RELAXED', 'BALANCED', 'QUICK']);
-const COMMIT_STYLES = Object.freeze(['MATERIAL', 'PAPER_RIP', 'LIFT_INTO_TRAY']);
+const COMMIT_STYLES = Object.freeze({
+  MATERIAL: 'MATERIAL',
+  PAPER_RIP: 'PAPER_RIP',
+  LIFT_INTO_TRAY: 'LIFT_INTO_TRAY',
+});
+const COMMIT_STYLE_VALUES = Object.freeze(Object.values(COMMIT_STYLES));
 
 function categoryKey(category) {
   return String(category || '').toUpperCase();
@@ -141,7 +146,7 @@ function normalizeExperienceBlueprint(input, category) {
       passenger: bool(raw.customerContext?.passenger, defaults.customerContext.passenger === true),
     },
     commit: {
-      style: enumValue(raw.commit?.style, COMMIT_STYLES, defaults.commit.style),
+      style: enumValue(raw.commit?.style, COMMIT_STYLE_VALUES, defaults.commit.style),
       persistentTray: bool(raw.commit?.persistentTray, defaults.commit.persistentTray),
     },
     motion: {
