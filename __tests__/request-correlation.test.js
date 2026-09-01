@@ -68,11 +68,12 @@ describe('request correlation', () => {
 
         const logger = require('../src/config/logger');
         expect(logger).toEqual(expect.anything());
+        const freshRequestMiddleware = require('../middleware/requestId');
 
         const req = { headers: { 'x-request-id': 'logger-correlation-789' } };
         const res = { locals: {}, setHeader: jest.fn() };
         let fields;
-        requestMiddleware(req, res, () => {
+        freshRequestMiddleware(req, res, () => {
             fields = require('pino').options.mixin();
         });
 
