@@ -12,6 +12,8 @@ CI runs a disposable PostgreSQL recovery drill after the normal Jest suite. The 
 6. verifies the sentinel and confirms application tables were restored; and
 7. removes the sentinel schema, restore database, and temporary archive.
 
+The drill normalizes Prisma's optional `schema` query parameter before calling PostgreSQL CLI tools because `psql`/`pg_dump` do not accept that Prisma-specific parameter.
+
 The manual command is:
 
 ```bash
