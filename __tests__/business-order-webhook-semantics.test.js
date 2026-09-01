@@ -20,16 +20,33 @@ const makeOrder = (overrides = {}) => ({
     ...overrides,
 });
 
+const exactKeys = (value) => Object.keys(value).sort();
+
 describe('business order webhook semantics', () => {
     beforeEach(() => {
         jest.clearAllMocks();
     });
 
-    test('markDelivered emits order.delivered only after the delivery mutation succeeds', async () => {
+    test('markDelivered emits order.delivered with the exact committed payload', async () => {
         const order = makeOrder();
+        let deliveryCommitted = false;
+        emitWebhookEvent.mockImplementation((businessProfileId, event, payload) => {
+            expect(deliveryCommitted).toBe(true);
+            expect(businessProfileId).toBe('business-1');
+            expect(event).toBe('order.delivered');
+            expect(exactKeys(payload)).toEqual([
+                'amount',
+                'orderId',
+                'orderRef',
+                'status',
+            ]);
+        });
         const prisma = {
             businessOrder: {
-                updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+                updateMany: jest.fn(async () => {
+                    deliveryCommitted = true;
+                    return { count: 1 };
+                }),
                 findUnique: jest.fn().mockResolvedValue(order),
             },
         };
@@ -44,12 +61,12 @@ describe('business order webhook semantics', () => {
         expect(emitWebhookEvent).toHaveBeenCalledWith(
             'business-1',
             'order.delivered',
-            expect.objectContaining({
+            {
                 orderId: 'order-1',
                 orderRef: 'ORD-TEST-01',
                 amount: 25,
                 status: 'DELIVERED',
-            }),
+            },
         );
     });
 
@@ -72,13 +89,28 @@ describe('business order webhook semantics', () => {
         expect(emitWebhookEvent).not.toHaveBeenCalled();
     });
 
-    test('escrow-driven completion emits order.completed only when the conditional transition wins', async () => {
+    test('escrow-driven completion emits order.completed with the exact committed payload', async () => {
         const order = makeOrder({ status: 'DELIVERED', amountUsdc: 40 });
         const updated = makeOrder({ status: 'COMPLETED', amountUsdc: 40, completedAt: new Date() });
+        let completionCommitted = false;
+        emitWebhookEvent.mockImplementation((businessProfileId, event, payload) => {
+            expect(completionCommitted).toBe(true);
+            expect(businessProfileId).toBe('business-1');
+            expect(event).toBe('order.completed');
+            expect(exactKeys(payload)).toEqual([
+                'amount',
+                'orderId',
+                'orderRef',
+                'status',
+            ]);
+        });
         const prisma = {
             businessOrder: {
                 findFirst: jest.fn().mockResolvedValue(order),
-                updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+                updateMany: jest.fn(async () => {
+                    completionCommitted = true;
+                    return { count: 1 };
+                }),
                 findUnique: jest.fn().mockResolvedValue(updated),
             },
         };
@@ -89,12 +121,12 @@ describe('business order webhook semantics', () => {
         expect(emitWebhookEvent).toHaveBeenCalledWith(
             'business-1',
             'order.completed',
-            expect.objectContaining({
+            {
                 orderId: 'order-1',
                 orderRef: 'ORD-TEST-01',
                 amount: 40,
                 status: 'COMPLETED',
-            }),
+            },
         );
     });
 
