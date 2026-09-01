@@ -81,3 +81,9 @@ jobs:
             code=$?
           fi
           exit $code
+
+      - name: Database backup and restore drill
+        env:
+          PG_ADMIN_URL: postgres://postgres:postgres@localhost:5432/postgres
+          BACKUP_DRILL_ALLOW_MUTATION: '1'
+        run: npm run db:recovery-drill
