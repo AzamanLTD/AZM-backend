@@ -58,6 +58,7 @@ describe('financial realtime event contracts', () => {
     });
 
     test('escrow_funded targets the two participants plus admin and carries the full contract', async () => {
+        const fundedAt = new Date('2026-09-01T05:00:00.000Z');
         const updatedEscrow = {
             id: 'escrow-contract-1',
             ticketId: 'ticket-contract-1',
@@ -65,6 +66,7 @@ describe('financial realtime event contracts', () => {
             payeeId: 202,
             status: 'FUNDED',
             amountUsdc: 125,
+            fundedAt,
         };
         const tx = {
             user: {
@@ -110,8 +112,8 @@ describe('financial realtime event contracts', () => {
         const payload = fundedPayloads[0][1];
         expect(exactKeys(payload)).toEqual([
             'amountUsdc',
-            'fundedAt',
             'escrowId',
+            'fundedAt',
             'payeeId',
             'payerId',
             'status',
@@ -124,10 +126,12 @@ describe('financial realtime event contracts', () => {
             amountUsdc: 125,
             payerId: 101,
             payeeId: 202,
+            fundedAt,
         }));
     });
 
     test('escrow_settled targets the same rooms, but RELEASED dispute resolution is not this event', async () => {
+        const settledAt = new Date('2026-09-01T05:01:00.000Z');
         const tx = {
             smartEscrow: {
                 updateMany: jest.fn().mockResolvedValue({ count: 1 }),
@@ -138,6 +142,7 @@ describe('financial realtime event contracts', () => {
                     payeeId: 202,
                     status: 'SETTLED',
                     amountUsdc: 80,
+                    settledAt,
                 }),
             },
             user: { update: jest.fn().mockResolvedValue({}) },
@@ -174,6 +179,7 @@ describe('financial realtime event contracts', () => {
             amountUsdc: 80,
             payerId: 101,
             payeeId: 202,
+            settledAt,
         }));
         expect(exactKeys(settledCalls[0][1])).toEqual([
             'amountUsdc',
@@ -197,11 +203,12 @@ describe('financial realtime event contracts', () => {
                     payeeId: 202,
                     status: 'RELEASED',
                     amountUsdc: 80,
+                    settledAt,
                 }),
             },
             user: { update: jest.fn().mockResolvedValue({}) },
             transactionHistory: { create: jest.fn().mockResolvedValue({}) },
-        };
+            };
         const releasedPrisma = {
             smartEscrow: {
                 findUnique: jest.fn().mockResolvedValue({
