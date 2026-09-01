@@ -22,7 +22,6 @@
 
 const logger = require('./logger');
 const { PrismaClient } = require('@prisma/client');
-const { PrismaPg } = require('@prisma/adapter-pg');
 const { Pool } = require('pg');
 
 let _readPrisma = null;
@@ -53,20 +52,38 @@ function initReadReplica() {
             logger.error({ err }, '[ReadReplica] Pool error');
         });
 
-        // Guard against adapter-pg major version mismatch (v7 adapter with v6 client)
-        let adapterOk = false;
+        // @prisma/adapter-pg is optional. Use it only when it is installed and
+        // matches the Prisma Client major version; otherwise the generated
+        // PrismaClient can connect directly to the replica URL.
+        let PrismaPg = null;
+        let adapterVersion = null;
         try {
-            const av = require('@prisma/adapter-pg/package.json').version;
-            const cv = require('@prisma/client/package.json').version;
-            adapterOk = av.split('.')[0] === cv.split('.')[0];
-        } catch (_) { adapterOk = false; }
+            ({ PrismaPg } = require('@prisma/adapter-pg'));
+            adapterVersion = require('@prisma/adapter-pg/package.json').version;
+        } catch (adapterLoadError) {
+            logger.info({ err: adapterLoadError.message }, '[ReadReplica] Prisma pg adapter unavailable — using plain PrismaClient');
+        }
+
+        const clientVersion = require('@prisma/client/package.json').version;
+        const adapterOk = Boolean(
+            PrismaPg &&
+            adapterVersion &&
+            adapterVersion.split('.')[0] === clientVersion.split('.')[0]
+        );
 
         if (adapterOk) {
             const adapter = new PrismaPg(pool);
             _readPrisma = new PrismaClient({ adapter });
         } else {
-            logger.warn('[ReadReplica] Adapter version mismatch — using plain PrismaClient for replica');
-            _readPrisma = new PrismaClient({ datasources: { db: { url: process.env.DATABASE_REPLICA_URL } } });
+            if (adapterVersion && adapterVersion.split('.')[0] !== clientVersion.split('.')[0]) {
+                logger.warn(
+                    { adapterVersion, clientVersion },
+                    '[ReadReplica] Adapter version mismatch — using plain PrismaClient for replica'
+                );
+            }
+            _readPrisma = new PrismaClient({
+                datasources: { db: { url: process.env.DATABASE_REPLICA_URL } },
+            });
         }
 
         // Test connection
