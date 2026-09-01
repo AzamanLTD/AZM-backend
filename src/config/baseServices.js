@@ -4,20 +4,12 @@
 // client, market oracle, payment gateway, Moolre disbursement/collection,
 // Tatum Web3, email, and SMS. These are the leaf dependencies that every
 // composite service (see src/services/registry.js) builds on top of.
-//
-// Exports: { pool, prisma, marketOracle, gatewayService, mtnDisbursementService,
-//           moolreCollectionService, paymentFailoverService, tatumService,
-//           emailService, smsService }
 // =============================================================================
 
 const { PrismaClient, Prisma } = require('@prisma/client');
 const { Pool } = require('pg');
 const logger = require('../config/logger');
 
-// ── Phase J3: Prisma Decimal → Number JSON Serialization ─────────────────────
-// Prisma returns NUMERIC/DECIMAL columns as Decimal.js objects which serialize
-// to strings in JSON ("12.50" instead of 12.50). This patch ensures they
-// serialize as plain numbers for all res.json() calls and socket emissions.
 Prisma.Decimal.prototype.toJSON = function () {
     return Number(this.toString());
 };
@@ -25,7 +17,6 @@ Prisma.Decimal.prototype.valueOf = function () {
     return Number(this.toString());
 };
 
-// 1. Initialize PostgreSQL Connection Pool
 const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
     max: 20,
@@ -37,39 +28,10 @@ pool.on('error', (err) => {
     logger.error({ err }, 'Unexpected error on idle client');
 });
 
-// @prisma/adapter-pg is optional. Prisma Client 6 can use its native driver
-// path, and the adapter must only be loaded when it is present AND compatible
-// with the installed Prisma Client major version. Keeping the require inside
-// this guarded block makes the fallback real: removing the optional package no
-// longer crashes module evaluation before the fallback can run.
-let prisma;
-try {
-    const clientVersion = require('@prisma/client/package.json').version;
-    let PrismaPg = null;
-    let adapterVersion = null;
+// Prisma Client 6 uses its native PostgreSQL driver path. The pg adapter is
+// not required by the primary client and is intentionally not loaded here.
+const prisma = new PrismaClient();
 
-    try {
-        ({ PrismaPg } = require('@prisma/adapter-pg'));
-        adapterVersion = require('@prisma/adapter-pg/package.json').version;
-    } catch (adapterLoadError) {
-        logger.info({ err: adapterLoadError.message }, 'Prisma pg adapter unavailable — using plain PrismaClient');
-    }
-
-    if (!PrismaPg || !adapterVersion || adapterVersion.split('.')[0] !== clientVersion.split('.')[0]) {
-        if (adapterVersion && adapterVersion.split('.')[0] !== clientVersion.split('.')[0]) {
-            logger.warn({ adapterVersion, clientVersion }, 'Prisma adapter-pg major version mismatch — using plain PrismaClient');
-        }
-        prisma = new PrismaClient();
-    } else {
-        const adapter = new PrismaPg(pool);
-        prisma = new PrismaClient({ adapter });
-    }
-} catch (e) {
-    logger.warn({ err: e }, 'Prisma adapter-pg init failed — using plain PrismaClient');
-    prisma = new PrismaClient();
-}
-
-// Test database connection on startup
 (async () => {
     try {
         await prisma.$connect();
@@ -80,56 +42,31 @@ try {
     }
 })();
 
-// ── Read Replica (Phase 2: Scalability & Security) ────────────────────────
-// Optional secondary PrismaClient for analytics / dashboard queries.
-// Falls back to primary when DATABASE_REPLICA_URL is not set.
 const { initReadReplica } = require('./readReplica');
 initReadReplica();
 
-// --- LIVE MARKET ORACLE ---
 const OracleService = require('../../services/oracleService');
 const marketOracle = new OracleService(prisma);
 marketOracle.startOracle();
 
-// --- KOTANI PAY V3 GATEWAY ---
 const GatewayService = require('../../services/gatewayService');
 const gatewayService = new GatewayService(prisma);
 gatewayService.startRateSync();
 
-// ── PRIMARY: Moolre (fiat off-ramp disbursement) ──────────────────────────────
 const MoolreDisbursementService = require('../../services/moolreDisbursementService');
-const mtnDisbursementService = new MoolreDisbursementService();
+const mtnDisbursementService = new MoolreDisbursementService(prisma);
 
-// ── PRIMARY: Moolre (fiat on-ramp collection) ────────────────────────────────
 const MoolreCollectionService = require('../../services/moolreCollectionService');
-const moolreCollectionService = new MoolreCollectionService();
+const moolreCollectionService = new MoolreCollectionService(prisma);
 
-if (!process.env.MOOLRE_WEBHOOK_SECRET) {
-    logger.warn('MOOLRE_WEBHOOK_SECRET is not set — webhook endpoint is disabled');
-}
+const PaymentFailoverService = require('../../services/paymentFailoverService');
+const paymentFailoverService = new PaymentFailoverService(prisma);
 
-// ── FALLBACK: MTN MoMo (secondary provider for automatic failover) ─────────
-const MtnDisbursementService = require('../../services/mtnDisbursementService');
-const mtnFallbackService = new MtnDisbursementService();
-
-// ── PAYMENT FAILOVER SERVICE (wraps Moolre primary + MTN secondary) ─────────
-const { PaymentFailoverService } = require('../services/paymentFailoverService');
-const paymentFailoverService = new PaymentFailoverService({
-    providers: [
-        { name: 'moolre', instance: mtnDisbursementService, priority: 1 },
-        { name: 'mtn',    instance: mtnFallbackService,     priority: 2 },
-    ],
-});
-
-// --- TATUM WEB3 SERVICE ---
 const TatumService = require('../../services/tatumService');
-const tatumService = new TatumService();
+const tatumService = new TatumService(prisma);
 
-// --- EMAIL SERVICE (Phase L1) ---
-const emailService = require('../../services/emailService');
-
-
-// --- SMS SERVICE (Phase L2) ---
+const EmailService = require('../../services/emailService');
+const emailService = new EmailService();
 const SMSService = require('../../services/smsService');
 const smsService = new SMSService();
 
