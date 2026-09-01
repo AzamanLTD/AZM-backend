@@ -54,4 +54,30 @@ describe('request correlation', () => {
             { text: 'hello' },
         );
     });
+
+    test('Pino mixin receives the active request id', () => {
+        jest.resetModules();
+        jest.doMock('pino', () => {
+            const mockPino = jest.fn((options) => {
+                mockPino.options = options;
+                return {};
+            });
+            mockPino.stdSerializers = { err: jest.fn(), error: jest.fn() };
+            return mockPino;
+        });
+
+        const logger = require('../src/config/logger');
+        expect(logger).toEqual(expect.anything());
+
+        const req = { headers: { 'x-request-id': 'logger-correlation-789' } };
+        const res = { locals: {}, setHeader: jest.fn() };
+        let fields;
+        requestMiddleware(req, res, () => {
+            fields = require('pino').options.mixin();
+        });
+
+        expect(fields).toEqual({ requestId: 'logger-correlation-789' });
+        jest.dontMock('pino');
+        jest.resetModules();
+    });
 });
