@@ -6,15 +6,18 @@ describe('request correlation', () => {
         const req = { headers: { 'x-request-id': 'azm-test-request-123' } };
         const res = { locals: {}, setHeader: jest.fn() };
         let observed;
+        let activeRequestId;
 
         requestMiddleware(req, res, () => {
+            activeRequestId = requestMiddleware.getRequestId();
             observed = requestMiddleware.withRequestId({ operation: 'fund' });
         });
 
         expect(req.id).toBe('azm-test-request-123');
         expect(res.locals.requestId).toBe('azm-test-request-123');
         expect(res.setHeader).toHaveBeenCalledWith('X-Request-Id', 'azm-test-request-123');
-        expect(requestMiddleware.getRequestId()).toBe('azm-test-request-123');
+        expect(activeRequestId).toBe('azm-test-request-123');
+        expect(requestMiddleware.getRequestId()).toBeNull();
         expect(observed).toEqual({ operation: 'fund', requestId: 'azm-test-request-123' });
     });
 
@@ -30,6 +33,8 @@ describe('request correlation', () => {
     test('adds requestId only to financial socket events and preserves non-financial payloads', () => {
         const financialOperator = { emit: jest.fn() };
         const otherOperator = { emit: jest.fn() };
+        const financialEmit = financialOperator.emit;
+        const otherEmit = otherOperator.emit;
         const io = {
             to: jest.fn((room) => room === 'financial' ? financialOperator : otherOperator),
         };
@@ -45,11 +50,11 @@ describe('request correlation', () => {
             io.to('other').emit('chat_message', { text: 'hello' });
         });
 
-        expect(financialOperator.emit).toHaveBeenCalledWith(
+        expect(financialEmit).toHaveBeenCalledWith(
             'escrow_funded',
             { escrowId: 'escrow-1', requestId: 'correlation-456' },
         );
-        expect(otherOperator.emit).toHaveBeenCalledWith(
+        expect(otherEmit).toHaveBeenCalledWith(
             'chat_message',
             { text: 'hello' },
         );
