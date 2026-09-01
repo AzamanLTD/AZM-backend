@@ -95,18 +95,11 @@ describe('final realtime event contracts', () => {
             expect(io.to).toHaveBeenNthCalledWith(2, 'user_202');
             const customerPayload = customerEmit.mock.calls[0][1];
             expect(exactKeys(customerPayload)).toEqual([
-                'businessReceives',
-                'customerPaidUsdc',
-                'fee',
-                'invoiceId',
-                'invoiceRef',
+                'businessReceives', 'customerPaidUsdc', 'fee', 'invoiceId', 'invoiceRef',
             ]);
             expect(customerPayload).toEqual({
-                invoiceId: 'invoice-1',
-                invoiceRef: 'INV-260901-TEST',
-                customerPaidUsdc: 31.5,
-                businessReceives: 30,
-                fee: 1.5,
+                invoiceId: 'invoice-1', invoiceRef: 'INV-260901-TEST',
+                customerPaidUsdc: 31.5, businessReceives: 30, fee: 1.5,
             });
             expect(businessEmit).toHaveBeenCalledWith('invoice_paid', customerPayload);
         });
@@ -114,9 +107,7 @@ describe('final realtime event contracts', () => {
         test('does not emit on an idempotent replay', async () => {
             const io = { to: jest.fn(() => ({ emit: jest.fn() })) };
             invoiceSvc.payInvoice.mockResolvedValue({
-                invoice: { id: 'invoice-2' },
-                customerPays: 20,
-                alreadyPaid: true,
+                invoice: { id: 'invoice-2' }, customerPays: 20, alreadyPaid: true,
             });
 
             await payInvoice({
@@ -166,12 +157,9 @@ describe('final realtime event contracts', () => {
 
             expect(result.notification).toEqual(notification);
             expect(emit).toHaveBeenCalledWith('biz_notification', {
-                notificationId: 'notification-1',
-                businessProfileId: 'business-1',
-                type: 'ORDER_SETTLED',
-                orderId: 'order-1', orderRef: 'ORD-01', ticketId: 'ticket-1',
-                escrowId: null,
-                createdAt: notification.createdAt,
+                notificationId: 'notification-1', businessProfileId: 'business-1',
+                type: 'ORDER_SETTLED', orderId: 'order-1', orderRef: 'ORD-01',
+                ticketId: 'ticket-1', escrowId: null, createdAt: notification.createdAt,
             });
         });
 
@@ -230,7 +218,8 @@ describe('final realtime event contracts', () => {
                 reference: 'withdrawal-contract-1', status: 'COMPLETED', pct: 100,
             }));
             expect(userEmit).toHaveBeenCalledWith('withdrawal_settled', expect.objectContaining({
-                reference: 'withdrawal-contract-1', status: 'COMPLETED', providerTxId: 'provider-tx-1', changed: true,
+                reference: 'withdrawal-contract-1', status: 'COMPLETED',
+                providerTxId: 'provider-tx-1', changed: true,
             }));
         });
     });
