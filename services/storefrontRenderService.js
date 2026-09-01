@@ -4,6 +4,7 @@
 const logger = require('../src/config/logger');
 const { migrateLayout } = require('./storefrontSchemaMigration');
 const storefrontService = require('./storefrontService');
+const experienceBlueprintService = require('./experienceBlueprintService');
 
 // Redis cache for rendered layouts (falls back to in-memory if Redis unavailable)
 let redisClient = null;
@@ -72,7 +73,6 @@ async function invalidateCache(businessProfileId) {
   memoryCache.delete(key);
 }
 
-
 /**
  * Read the retail escrow-protection capability from a business profile's
  * businessMeta JSON. Only the explicit boolean at this namespaced location
@@ -88,7 +88,8 @@ function _escrowProtectionAvailable(business) {
 
 /**
  * Render a storefront layout for public consumption.
- * Returns a single JSON object with the layout, theme tokens, and widget catalog merged.
+ * Returns a single JSON object with the layout, theme tokens, widget catalog,
+ * and the category-native experience blueprint.
  */
 async function renderStorefront(prisma, businessProfileId) {
   const cacheKey = getCacheKey(businessProfileId);
@@ -103,11 +104,11 @@ async function renderStorefront(prisma, businessProfileId) {
   // Check if storefront is disabled
   const business = await prisma.businessProfile.findUnique({
     where: { id: businessProfileId },
-    select: { 
-      storefrontDisabled: true, 
-      isSuspended: true, 
-      businessName: true, 
-      category: true, 
+    select: {
+      storefrontDisabled: true,
+      isSuspended: true,
+      businessName: true,
+      category: true,
       logoUrl: true,
       coverPhotoUrl: true,
       averageRating: true,
@@ -172,6 +173,13 @@ async function renderStorefront(prisma, businessProfileId) {
     };
   });
 
+  // Experience is part of the published layout snapshot. Business metadata
+  // may contain an unsaved editor state and must never change the public render.
+  const publishedExperience = experienceBlueprintService.normalizeExperienceBlueprint(
+    migratedLayout.experience,
+    business.category,
+  );
+
   const result = {
     business: {
       name: business.businessName,
@@ -182,6 +190,7 @@ async function renderStorefront(prisma, businessProfileId) {
       phoneNumber: business.phoneNumber || null,
       escrowProtectionAvailable: _escrowProtectionAvailable(business),
     },
+    experience: publishedExperience,
     theme: themeOverride ? {
       id: themeOverride.id,
       key: themeOverride.key,
