@@ -12,7 +12,7 @@
     "install:susu": "node infra/install-susu-overlay.js",
     "seed:susu": "node infra/seed-susu-foundation.js",
     "seed:demo": "node prisma/seed-demo.js",
-    "release": "node infra/install-susu-overlay.js && node infra/install-transaction-quote-overlay.js && node infra/seed-susu-foundation.js && node infra/install-business-os-overlay.js && node infra/install-phase3-overlay.js",
+    "release": "node infra/install-susu-overlay.js && node infra/install-transaction-quote-overlay.js && node prisma/seed-susu-foundation.js && node infra/install-business-os-overlay.js && node infra/install-phase3-overlay.js",
     "route-check": "node scripts/route-checker.js",
     "db:recovery-drill": "bash scripts/db-recovery-drill.sh"
   },
