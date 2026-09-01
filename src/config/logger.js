@@ -15,6 +15,7 @@
  */
 
 const pino = require('pino');
+const { getRequestId } = require('../../middleware/requestId');
 
 const isProduction = process.env.NODE_ENV === 'production';
 const isTest = process.env.NODE_ENV === 'test';
@@ -45,6 +46,10 @@ const logger = pino({
     transport: (!isProduction && !isTest)
         ? { target: 'pino-pretty', options: { colorize: true, translateTime: 'SYS:HH:MM:ss', ignore: 'pid,hostname' } }
         : undefined,
+    mixin() {
+        const requestId = getRequestId();
+        return requestId ? { requestId } : {};
+    },
     serializers: {
         err: pino.stdSerializers.err,
         error: pino.stdSerializers.err,
