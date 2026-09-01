@@ -18,10 +18,15 @@ const NotificationService = require('../../services/notificationService');
 const WebRTCSocketService = require('../../services/webrtcSocketService');
 const { setSocketIO: setBusinessNotificationSocketIO } = require('../../services/bizNotificationService');
 const { setSocketIO: setEscrowSocketIO } = require('../../services/escrowService');
+const { attachFinancialCorrelation } = require('./financialCorrelation');
 
 const vendorStatus = new Map();
 
 function createSocketServices(io, prisma, app) {
+    // Decorate the canonical Socket.IO singleton in place so all later
+    // references to this object share the same financial correlation boundary.
+    attachFinancialCorrelation(io);
+
     // BusinessNotification is persisted by a service used from financial
     // workflows, so wire the already-authoritative Socket.IO instance into
     // that chokepoint once at server bootstrap. No second transport is created.
