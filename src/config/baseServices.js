@@ -45,20 +45,20 @@ const prisma = new PrismaClient();
 const { initReadReplica } = require('./readReplica');
 initReadReplica();
 
-const OracleService = require('../../services/oracleService');
+const OracleService = require('../services/oracleService');
 const marketOracle = new OracleService(prisma);
 marketOracle.startOracle();
 
-const GatewayService = require('../../services/gatewayService');
+const GatewayService = require('../services/gatewayService');
 const gatewayService = new GatewayService(prisma);
 gatewayService.startRateSync();
 
 // Moolre is the primary fiat disbursement provider.
-const MoolreDisbursementService = require('../../services/moolreDisbursementService');
+const MoolreDisbursementService = require('../services/moolreDisbursementService');
 const moolreDisbursementService = new MoolreDisbursementService();
 
 // Moolre fiat collection remains a standalone I/O adapter.
-const MoolreCollectionService = require('../../services/moolreCollectionService');
+const MoolreCollectionService = require('../services/moolreCollectionService');
 const moolreCollectionService = new MoolreCollectionService();
 
 if (!process.env.MOOLRE_WEBHOOK_SECRET) {
@@ -66,10 +66,10 @@ if (!process.env.MOOLRE_WEBHOOK_SECRET) {
 }
 
 // MTN remains the secondary provider for automatic off-ramp failover.
-const MtnDisbursementService = require('../../services/mtnDisbursementService');
+const MtnDisbursementService = require('../services/mtnDisbursementService');
 const mtnFallbackService = new MtnDisbursementService();
 
-const { PaymentFailoverService } = require('../../services/paymentFailoverService');
+const { PaymentFailoverService } = require('../services/paymentFailoverService');
 const paymentFailoverService = new PaymentFailoverService({
     providers: [
         { name: 'moolre', instance: moolreDisbursementService, priority: 1 },
@@ -77,12 +77,12 @@ const paymentFailoverService = new PaymentFailoverService({
     ],
 });
 
-const TatumService = require('../../services/tatumService');
+const TatumService = require('../services/tatumService');
 const tatumService = new TatumService();
 
-const EmailService = require('../../services/emailService');
+const EmailService = require('../services/emailService');
 const emailService = new EmailService();
-const SMSService = require('../../services/smsService');
+const SMSService = require('../services/smsService');
 const smsService = new SMSService();
 
 module.exports = {
