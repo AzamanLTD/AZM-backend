@@ -15,7 +15,6 @@
 // =============================================================================
 'use strict';
 
-const logger = require('../src/config/logger');
 const { randomUUID } = require('crypto');
 const { AsyncLocalStorage } = require('async_hooks');
 
