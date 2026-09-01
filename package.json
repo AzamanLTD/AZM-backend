@@ -10,6 +10,7 @@
     "build": "prisma generate",
     "migrate:deploy": "prisma migrate deploy",
     "install:susu": "node infra/install-susu-overlay.js",
+    "seed:susu": "node prisma/seed-demo.js",
     "seed:susu": "node infra/seed-susu-foundation.js",
     "seed:demo": "node prisma/seed-demo.js",
     "release": "node infra/install-susu-overlay.js && node infra/install-transaction-quote-overlay.js && node infra/seed-susu-foundation.js && node infra/install-business-os-overlay.js && node infra/install-phase3-overlay.js",
@@ -21,7 +22,6 @@
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
-    "@prisma/adapter-pg": "^7.4.0",
     "@prisma/client": "^6.19.2",
     "@sentry/node": "^10.58.0",
     "@simplewebauthn/server": "^13.3.2",
