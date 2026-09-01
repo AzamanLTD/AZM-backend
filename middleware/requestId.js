@@ -4,27 +4,31 @@
 // logs, error reports (Sentry) and (optionally) client bug reports.
 //
 // Behaviour:
-//   • If the caller sends an `X-Request-Id` header, we trust and reuse it so a
-//     single id can span the Flutter client → backend → worker hop. We bound
-//     its length/charset to avoid log-injection or header-bloat from hostile
-//     input; anything unacceptable is replaced with a fresh uuid.
-//   • Otherwise we mint a uuid v4.
+//   • If the caller sends an `X-Request-Id` header, reuse it when it passes the
+//     bounded allow-list. Otherwise mint a fresh uuid.
+//   • The id is exposed as req.id, res.locals.requestId and the response header.
+//   • AsyncLocalStorage keeps the id available to downstream service code so
+//     structured logs and financial domain events can correlate without
+//     threading Express req objects through domain APIs.
 //
-// The id is exposed three ways:
-//   • req.id          — for downstream middleware/controllers and morgan.
-//   • res.locals.requestId — for the response-envelope helpers (meta.requestId).
-//   • `X-Request-Id` response header — so clients/proxies can log it too.
-//
-// This is purely additive: it sets fields and one header, and never alters a
-// response body. Mounted as early as possible (before morgan) so the access log
-// line carries the id.
+// This is mounted before morgan in src/middleware/appMiddleware.js.
 // =============================================================================
+'use strict';
+
 const logger = require('../src/config/logger');
 const { randomUUID } = require('crypto');
+const { AsyncLocalStorage } = require('async_hooks');
 
-// Conservative: printable ascii, dashes/underscores, 8–128 chars. A typical
-// uuid (36 chars) or a client trace id passes; junk does not.
 const SAFE_ID = /^[A-Za-z0-9._-]{8,128}$/;
+const storage = new AsyncLocalStorage();
+
+const getRequestId = () => storage.getStore()?.requestId || null;
+
+const withRequestId = (payload) => {
+  const requestId = getRequestId();
+  if (!requestId || payload === null || typeof payload !== 'object') return payload;
+  return { ...payload, requestId };
+};
 
 module.exports = function requestId(req, res, next) {
   const incoming = req.headers['x-request-id'];
@@ -35,5 +39,8 @@ module.exports = function requestId(req, res, next) {
   req.id = id;
   res.locals.requestId = id;
   res.setHeader('X-Request-Id', id);
-  next();
+  storage.run({ requestId: id }, next);
 };
+
+module.exports.getRequestId = getRequestId;
+module.exports.withRequestId = withRequestId;
