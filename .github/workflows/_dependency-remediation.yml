@@ -2,6 +2,10 @@ name: _dependency-remediation
 on:
   push:
     branches: [chore/security-direct-dependency-remediation]
+  pull_request:
+    branches: [main]
+permissions:
+  contents: write
 jobs:
   remediate:
     runs-on: ubuntu-latest
@@ -64,6 +68,12 @@ jobs:
             code=$?
           fi
           exit $code
+
+      - name: Database backup and restore drill
+        env:
+          PG_ADMIN_URL: postgres://postgres:postgres@localhost:5432/postgres
+          BACKUP_DRILL_ALLOW_MUTATION: '1'
+        run: npm run db:recovery-drill
 
       - name: Audit after remediation
         run: npm audit --json > /tmp/npm-audit.json || true
