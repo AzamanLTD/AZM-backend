@@ -85,11 +85,9 @@ const createEscrow = async (prisma, { ticketId, payerId, payeeId, amountUsdc, de
     }
     if (payerId === payeeId) throw new Error('Payer and payee cannot be the same user.');
 
-    // 1. No SmartEscrow may already exist for this ticket (unique constraint).
     const existing = await prisma.smartEscrow.findUnique({ where: { ticketId } });
     if (existing) throw new Error('An escrow already exists for this ticket.');
 
-    // 2. Resolve the fee pct from GlobalSettings (fallback to constant).
     const settings = await prisma.globalSettings.findUnique({ where: { id: 1 } });
     const feePct = settings && settings.smartEscrowFeePct != null
         ? Number(settings.smartEscrowFeePct)
@@ -98,13 +96,9 @@ const createEscrow = async (prisma, { ticketId, payerId, payeeId, amountUsdc, de
         ? Number(settings.escrowDraftExpiryHours)
         : DRAFT_EXPIRY_HOURS;
 
-    // 3. Fee on the principal.
     const feeUsdc = _round6(amount * feePct);
-
-    // 4. DRAFT expiry window.
     const expiresAt = new Date(Date.now() + draftExpiryHours * HOUR_MS);
 
-    // 5. Create (no balance mutation → no $transaction needed).
     const escrow = await prisma.smartEscrow.create({
         data: {
             ticketId,
@@ -138,7 +132,6 @@ const fundEscrow = async (prisma, { escrowId, payerId }) => {
         throw new Error('Only the payer can fund this escrow.');
     }
 
-    // Pre-flight ledger audit (read-only, outside the tx) — same as withdrawal.
     await runDoubleCheck(prisma, payerId);
 
     const amount = Number(escrow.amountUsdc);
@@ -165,26 +158,22 @@ const fundEscrow = async (prisma, { escrowId, payerId }) => {
             );
         }
 
-        // a. Debit payer available balance (principal + fee).
         await tx.user.update({
             where: { id: payerId },
             data: { availableBalance: { decrement: total } }
         });
 
-        // b. Lock the principal (fee is NOT locked — it is platform revenue).
         await tx.user.update({
             where: { id: payerId },
             data: { escrowLockedBalance: { increment: amount } }
         });
 
-        // c. Route the fee into SystemProfitFees.
         await _ensureProfitFeesSingleton(tx);
         await tx.systemProfitFees.update({
             where: { id: 1 },
             data: { balance: { increment: fee } }
         });
 
-        // d. Flip escrow → FUNDED with the 30d inactivity window.
         const updated = await tx.smartEscrow.update({
             where: { id: escrowId },
             data: {
@@ -195,13 +184,10 @@ const fundEscrow = async (prisma, { escrowId, payerId }) => {
             }
         });
 
-        // e. Canonical TransactionHistory row (payer debit).
         await tx.transactionHistory.create({
             data: {
                 userId: payerId,
                 type: 'TICKET_ESCROW_FUND',
-                // amountUsdc is NEGATIVE: debit (OUT) convention per runDoubleCheck.
-                // feeUsdc is always POSITIVE (a cost).
                 amountUsdc: -amount,
                 feeUsdc: fee,
                 txHash: reference,
@@ -209,7 +195,6 @@ const fundEscrow = async (prisma, { escrowId, payerId }) => {
             }
         });
 
-        // f. AdminProfitLog audit row for the fee (relatedTxId, not notes).
         if (fee > 0) {
             await tx.adminProfitLog.create({
                 data: {
@@ -229,14 +214,12 @@ const fundEscrow = async (prisma, { escrowId, payerId }) => {
             .catch((err) => logger.error({ err: err }, '[escrowService.fundEscrow] order sync'));
     });
 
-    // Owner-facing feed: the buyer has funded the escrow.
     setImmediate(() => {
         _getBizNotificationService().notifyOrderEvent(prisma, {
             escrowId,
             type: 'ORDER_FUNDED'
         }).catch((err) => logger.error({ err: err }, '[escrowService.fundEscrow] biz notif'));
     });
-
 
     // Realtime convergence: emit only after the $transaction commits.
     if (_socketIo) {
@@ -247,6 +230,7 @@ const fundEscrow = async (prisma, { escrowId, payerId }) => {
             amountUsdc: updatedEscrow.amountUsdc,
             payerId: updatedEscrow.payerId,
             payeeId: updatedEscrow.payeeId,
+            fundedAt: updatedEscrow.fundedAt,
         };
         try {
             _socketIo.to(`user_${updatedEscrow.payerId}`).emit('escrow_funded', payload);
@@ -267,8 +251,6 @@ const markSatisfied = async (prisma, { escrowId, userId }) => {
     const escrow = await prisma.smartEscrow.findUnique({ where: { id: escrowId } });
     if (!escrow) throw new Error('Escrow not found.');
     if (escrow.status === 'SETTLED') {
-        // Idempotent convergence: another request may have committed settlement
-        // before this retry reached the service. Never run settlement again.
         return { settled: true, alreadySettled: true, escrow };
     }
     if (!['FUNDED', 'IN_PROGRESS', 'PENDING_SETTLEMENT'].includes(escrow.status)) {
@@ -280,13 +262,6 @@ const markSatisfied = async (prisma, { escrowId, userId }) => {
 
     const isPayer = escrow.payerId === userId;
     const data = isPayer ? { payerSatisfied: true } : { payeeSatisfied: true };
-
-    // TOCTOU guard: claim this party's satisfaction flag with a conditional
-    // update so two concurrent markSatisfied calls for the SAME party cannot
-    // both "win" (the loser sees count=0 and bails). Combined with the
-    // single-winner claim inside _releaseEscrow, this makes double-settlement
-    // (and therefore double-payout) impossible even under concurrent calls
-    // from both parties at once. Mirrors the completeTrade atomic-flip pattern.
     const guard = isPayer ? { payerSatisfied: false } : { payeeSatisfied: false };
     const claimed = await prisma.smartEscrow.updateMany({
         where: { id: escrowId, ...guard },
@@ -301,8 +276,6 @@ const markSatisfied = async (prisma, { escrowId, userId }) => {
     }
     const updated = await prisma.smartEscrow.findUnique({ where: { id: escrowId } });
 
-    // Both satisfied → release to payee (SETTLED). _releaseEscrow fires
-    // ORDER_SETTLED itself, so we do NOT also fire ORDER_SATISFIED here.
     if (updated.payerSatisfied && updated.payeeSatisfied) {
         try {
             const settled = await _releaseEscrow(prisma, escrowId, 'SETTLED');
@@ -318,9 +291,6 @@ const markSatisfied = async (prisma, { escrowId, userId }) => {
         }
     }
 
-    // Buyer (payer) signalled completion but the owner hasn't confirmed yet —
-    // surface it on the owner-facing feed. (Owner marking their own side needs
-    // no notification.)
     if (escrow.payerId === userId) {
         setImmediate(() => {
             _getBizNotificationService().notifyOrderEvent(prisma, {
@@ -330,13 +300,11 @@ const markSatisfied = async (prisma, { escrowId, userId }) => {
         });
     }
 
-    // Otherwise mark we are awaiting the other side.
     try {
         const pending = await prisma.smartEscrow.update({
             where: { id: escrowId },
             data: { status: 'PENDING_SETTLEMENT' }
         });
-        // Realtime convergence: emit only after the PENDING_SETTLEMENT update commits.
         if (_socketIo) {
             const payload = {
                 escrowId: pending.id,
@@ -357,10 +325,6 @@ const markSatisfied = async (prisma, { escrowId, userId }) => {
 
         return { settled: false, escrow: pending };
     } catch (err) {
-        // A concurrent opposite-party request can settle between the read above
-        // and this pending-state write. The database terminal-state guard must
-        // remain intact; converge to the committed settlement instead of turning
-        // a successful concurrent settlement into a misleading 500.
         const current = await prisma.smartEscrow.findUnique({ where: { id: escrowId } });
         if (current && current.status === 'SETTLED') {
             return { settled: true, alreadySettled: true, escrow: current };
@@ -385,7 +349,6 @@ const raiseDispute = async (prisma, { escrowId, raisedById, reason, evidenceUrls
     const amount = Number(escrow.amountUsdc);
 
     const result = await prisma.$transaction(async (tx) => {
-        // a. Move the locked principal into the dispute bucket on the payer.
         await tx.user.update({
             where: { id: escrow.payerId },
             data: {
@@ -394,7 +357,6 @@ const raiseDispute = async (prisma, { escrowId, raisedById, reason, evidenceUrls
             }
         });
 
-        // b. Create the dispute record.
         const dispute = await tx.escrowDispute.create({
             data: {
                 escrowId,
@@ -404,7 +366,6 @@ const raiseDispute = async (prisma, { escrowId, raisedById, reason, evidenceUrls
             }
         });
 
-        // c. Flip escrow → DISPUTED.
         const updated = await tx.smartEscrow.update({
             where: { id: escrowId },
             data: { status: 'DISPUTED' }
@@ -419,7 +380,6 @@ const raiseDispute = async (prisma, { escrowId, raisedById, reason, evidenceUrls
             .catch((err) => logger.error({ err: err }, '[escrowService.raiseDispute] order sync'));
     });
 
-    // Owner-facing feed: a dispute was opened on this order.
     setImmediate(() => {
         _getBizNotificationService().notifyOrderEvent(prisma, {
             escrowId,
@@ -448,7 +408,6 @@ const resolveDispute = async (prisma, { escrowId, adminId, ruling, rulingNotes, 
         throw new Error('ruling must be FULL_RELEASE, FULL_REFUND, or SPLIT.');
     }
 
-    // FULL_RELEASE → release to payee from the dispute bucket.
     if (ruling === 'FULL_RELEASE') {
         const released = await _releaseEscrow(prisma, escrowId, 'RELEASED');
         const dispute = await prisma.escrowDispute.update({
@@ -464,7 +423,6 @@ const resolveDispute = async (prisma, { escrowId, adminId, ruling, rulingNotes, 
         return { escrow: released, dispute };
     }
 
-    // FULL_REFUND → refund to payer from the dispute bucket.
     if (ruling === 'FULL_REFUND') {
         const refunded = await _refundEscrow(prisma, escrowId);
         const dispute = await prisma.escrowDispute.update({
@@ -480,7 +438,6 @@ const resolveDispute = async (prisma, { escrowId, adminId, ruling, rulingNotes, 
         return { escrow: refunded, dispute };
     }
 
-    // SPLIT → custom percentage split. payerPct + payeePct must equal 100.
     const pPct = Number(payerPct);
     const qPct = Number(payeePct);
     if (!Number.isFinite(pPct) || !Number.isFinite(qPct) || Math.abs(pPct + qPct - 100) > 0.001) {
@@ -489,20 +446,16 @@ const resolveDispute = async (prisma, { escrowId, adminId, ruling, rulingNotes, 
 
     const amount = Number(escrow.amountUsdc);
     const payerAmount = _round6(amount * (pPct / 100));
-    // Give the payee the remainder so the two always sum to the principal
-    // exactly (avoids a rounding dust leak in disputeEscrowBalance).
     const payeeAmount = _round6(amount - payerAmount);
     const releaseRef = randomUUID();
     const refundRef = randomUUID();
 
     const result = await prisma.$transaction(async (tx) => {
-        // Drain the full principal out of the payer's dispute bucket.
         await tx.user.update({
             where: { id: escrow.payerId },
             data: { disputeEscrowBalance: { decrement: amount } }
         });
 
-        // Payer's share back to their available balance.
         if (payerAmount > 0) {
             await tx.user.update({
                 where: { id: escrow.payerId },
@@ -520,7 +473,6 @@ const resolveDispute = async (prisma, { escrowId, adminId, ruling, rulingNotes, 
             });
         }
 
-        // Payee's share to their available balance.
         if (payeeAmount > 0) {
             await tx.user.update({
                 where: { id: escrow.payeeId },
@@ -577,23 +529,14 @@ const _releaseEscrow = async (prisma, escrowId, finalStatus = 'SETTLED') => {
     if (!escrow) throw new Error('Escrow not found.');
 
     const amount = Number(escrow.amountUsdc);
-    // Funds sit in the dispute bucket only once a dispute moved them there.
     const fromDispute = escrow.status === 'DISPUTED' || escrow.status === 'ADMIN_REVIEW';
     const sourceColumn = fromDispute ? 'disputeEscrowBalance' : 'escrowLockedBalance';
-    // The set of statuses we are allowed to release FROM. Used as the atomic
-    // claim precondition below so the same escrow can never be released twice.
     const claimableStatuses = fromDispute
         ? ['DISPUTED', 'ADMIN_REVIEW']
         : ['FUNDED', 'IN_PROGRESS', 'PENDING_SETTLEMENT'];
     const reference = randomUUID();
 
     const updated = await prisma.$transaction(async (tx) => {
-        // SINGLE-WINNER CLAIM (TOCTOU guard): flip the escrow to its final
-        // status if and only if it is still in a releasable state. A second
-        // concurrent release sees count=0 and aborts BEFORE any balance moves,
-        // exactly like the completeTrade PAID->COMPLETED atomic flip. Without
-        // this, two settlements racing (e.g. both parties marking satisfied at
-        // once) would each pay the payee — real money loss.
         const claim = await tx.smartEscrow.updateMany({
             where: { id: escrowId, status: { in: claimableStatuses } },
             data: {
@@ -606,13 +549,11 @@ const _releaseEscrow = async (prisma, escrowId, finalStatus = 'SETTLED') => {
             throw new Error('ESCROW_ALREADY_FINALIZED');
         }
 
-        // Release the locked principal from the payer's holding bucket.
         await tx.user.update({
             where: { id: escrow.payerId },
             data: { [sourceColumn]: { decrement: amount } }
         });
 
-        // Credit the payee.
         await tx.user.update({
             where: { id: escrow.payeeId },
             data: { availableBalance: { increment: amount } }
@@ -643,6 +584,7 @@ const _releaseEscrow = async (prisma, escrowId, finalStatus = 'SETTLED') => {
             amountUsdc: updated.amountUsdc,
             payerId: updated.payerId,
             payeeId: updated.payeeId,
+            settledAt: updated.settledAt,
         };
         try {
             _socketIo.to(`user_${updated.payerId}`).emit('escrow_settled', payload);
@@ -688,7 +630,6 @@ const _releaseEscrow = async (prisma, escrowId, finalStatus = 'SETTLED') => {
             }
         });
 
-        // Owner-facing feed: funds delivered to the business.
         setImmediate(() => {
             _getBizNotificationService().notifyOrderEvent(prisma, {
                 escrowId,
@@ -712,16 +653,12 @@ const _refundEscrow = async (prisma, escrowId, finalStatus = 'REFUNDED') => {
     const amount = Number(escrow.amountUsdc);
     const fromDispute = escrow.status === 'DISPUTED' || escrow.status === 'ADMIN_REVIEW';
     const sourceColumn = fromDispute ? 'disputeEscrowBalance' : 'escrowLockedBalance';
-    // Statuses we are allowed to refund FROM — the atomic claim precondition.
     const claimableStatuses = fromDispute
         ? ['DISPUTED', 'ADMIN_REVIEW']
         : ['FUNDED', 'IN_PROGRESS', 'PENDING_SETTLEMENT'];
     const reference = randomUUID();
 
     const updated = await prisma.$transaction(async (tx) => {
-        // SINGLE-WINNER CLAIM (TOCTOU guard): mirror _releaseEscrow so a refund
-        // can never run twice (e.g. the expiry worker and an admin refund both
-        // firing on the same escrow). The loser aborts before any balance moves.
         const claim = await tx.smartEscrow.updateMany({
             where: { id: escrowId, status: { in: claimableStatuses } },
             data: {
@@ -758,10 +695,6 @@ const _refundEscrow = async (prisma, escrowId, finalStatus = 'REFUNDED') => {
         return result;
     });
 
-    // The transaction callback has completed, so the financial claim is
-    // committed before this convergence signal is emitted. All refund callers
-    // (expiry worker, Admin/manual resolution, and payer cancellation) therefore
-    // share one event producer and cannot drift into duplicate transports.
     if (_socketIo) {
         const payload = {
             escrowId: updated.id,
@@ -781,15 +714,12 @@ const _refundEscrow = async (prisma, escrowId, finalStatus = 'REFUNDED') => {
         }
     }
 
-    // finalStatus is either 'REFUNDED' (admin/manual) or 'EXPIRED' (worker sweep).
-    // Both map to BusinessOrderStatus.REFUNDED in updateOrderStatusFromEscrow.
     setImmediate(() => {
         _getBizOrderService()
             .updateOrderStatusFromEscrow(prisma, escrowId, finalStatus)
             .catch((err) => logger.error({ err: err }, '[escrowService._refundEscrow] order sync'));
     });
 
-    // Owner-facing feed: principal returned to the buyer (manual or worker sweep).
     setImmediate(() => {
         _getBizNotificationService().notifyOrderEvent(prisma, {
             escrowId,
@@ -852,13 +782,6 @@ const getEscrowForTicket = async (prisma, ticketId) =>
 
 // =============================================================================
 // 8. CANCEL ESCROW — payer aborts the escrow.
-//   • DRAFT  → no money ever moved → mark EXPIRED.
-//   • FUNDED/IN_PROGRESS/PENDING_SETTLEMENT → refund the locked principal to
-//     the payer (via _refundEscrow) and mark REFUNDED.
-//   Only the payer may cancel. Mirrors controllers/escrowController.cancelEscrow
-//   (DRAFT-only) but adds the funded-refund path; the controller may adopt this
-//   service function later. The DRAFT flip is an atomic conditional update so a
-//   concurrent fund cannot race a cancel.
 // =============================================================================
 const cancelEscrow = async (prisma, { escrowId, userId }) => {
     const escrow = await prisma.smartEscrow.findUnique({ where: { id: escrowId } });
@@ -879,7 +802,6 @@ const cancelEscrow = async (prisma, { escrowId, userId }) => {
     }
 
     if (['FUNDED', 'IN_PROGRESS', 'PENDING_SETTLEMENT'].includes(escrow.status)) {
-        // _refundEscrow performs the atomic claim + balance move + history row.
         return _refundEscrow(prisma, escrowId, 'REFUNDED');
     }
 
@@ -896,10 +818,8 @@ module.exports = {
     getEscrowForTicket,
     cancelEscrow,
     setSocketIO,
-    // Exposed for the expiry worker (Work Item 9).
     _refundEscrow,
     _releaseEscrow,
-    // Constants for reuse/testing.
     SMART_ESCROW_FEE_PCT_DEFAULT,
     DRAFT_EXPIRY_HOURS,
     FUNDED_EXPIRY_DAYS
