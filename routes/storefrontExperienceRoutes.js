@@ -66,6 +66,8 @@ router.get('/me/experience', protect, protectActive, requirePermission('storefro
         blueprint,
         defaults: experienceBlueprintService.defaultsForCategory(business.category),
         presets: experienceBlueprintService.PRESETS,
+        navigationModes: experienceBlueprintService.NAVIGATION_MODES,
+        detailPresentations: experienceBlueprintService.DETAIL_PRESENTATIONS,
         motionTempos: experienceBlueprintService.MOTION_TEMPOS,
         commitStyles: Object.values(experienceBlueprintService.COMMIT_STYLES),
       },
