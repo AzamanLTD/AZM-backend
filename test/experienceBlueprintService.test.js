@@ -1,6 +1,7 @@
 const {
   EXPERIENCE_BLUEPRINT_VERSION,
   PRESETS,
+  COMMIT_STYLES,
   defaultsForCategory,
   normalizeExperienceBlueprint,
   getExperienceBlueprint,
@@ -14,26 +15,30 @@ describe('experienceBlueprintService', () => {
     expect(defaultsForCategory('LOGISTICS').preset).toBe(PRESETS.TRAVEL_JOURNEY);
   });
 
-  test('food businesses default to contextual table-aware ordering and paper rip commit', () => {
+  test('commit styles expose stable enum values and category defaults', () => {
+    expect(COMMIT_STYLES.MATERIAL).toBe('MATERIAL');
+    expect(COMMIT_STYLES.PAPER_RIP).toBe('PAPER_RIP');
+    expect(COMMIT_STYLES.LIFT_INTO_TRAY).toBe('LIFT_INTO_TRAY');
+
     const blueprint = defaultsForCategory('FOOD_BEVERAGE');
     expect(blueprint.detail.presentation).toBe('DISH_DOSSIER');
     expect(blueprint.customerContext.tableNumber).toBe(true);
     expect(blueprint.customerContext.serviceMode).toBe(true);
-    expect(blueprint.commit.style).toBe('PAPER_RIP');
+    expect(blueprint.commit.style).toBe(COMMIT_STYLES.PAPER_RIP);
   });
 
   test('invalid or cross-category preset requests normalize back to the category grammar', () => {
     const blueprint = normalizeExperienceBlueprint(
       {
         preset: PRESETS.BUILDING_WALK,
-        commit: { style: 'PAPER_RIP' },
+        commit: { style: COMMIT_STYLES.PAPER_RIP },
       },
       'FOOD_BEVERAGE',
     );
 
     expect(blueprint.schemaVersion).toBe(EXPERIENCE_BLUEPRINT_VERSION);
     expect(blueprint.preset).toBe(PRESETS.DINING_JOURNEY);
-    expect(blueprint.commit.style).toBe('PAPER_RIP');
+    expect(blueprint.commit.style).toBe(COMMIT_STYLES.PAPER_RIP);
   });
 
   test('reduced-motion fallback is always platform controlled', () => {
