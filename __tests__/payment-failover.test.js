@@ -3,7 +3,6 @@
 
 const { PaymentFailoverService } = require('../src/services/paymentFailoverService');
 
-// Mock providers that mimic the MoolreDisbursementService / MtnDisbursementService shape
 function makeMockProvider(name, { fail = false, delay = 0 } = {}) {
     return {
         name,
@@ -89,36 +88,61 @@ describe('PaymentFailoverService', () => {
         const secondary = makeMockProvider('mtn');
         const svc = new PaymentFailoverService({ primary, secondary });
 
-        // Fail primary 3 times to exceed threshold
         for (let i = 0; i < 3; i++) {
             await svc.initiateTransfer({
                 referenceId: `test-${i}`,
                 amountGhs: 50,
                 recipientPhone: '0244556677',
-            }).catch(() => {}); // suppress
+            }).catch(() => {});
         }
 
-        // Now primary should be unhealthy (but may be probed 50% of the time)
-        // Run enough calls to verify it's skipped at least sometimes
+        // This test previously depended on Math.random(), making CI flaky.
+        // Force an exact alternating probe/skip pattern so the routing policy
+        // is exercised deterministically while keeping production behavior
+        // unchanged.
+        const randomSpy = jest.spyOn(Math, 'random');
+        randomSpy
+            .mockReturnValueOnce(0.25)
+            .mockReturnValueOnce(0.75)
+            .mockReturnValueOnce(0.25)
+            .mockReturnValueOnce(0.75)
+            .mockReturnValueOnce(0.25)
+            .mockReturnValueOnce(0.75)
+            .mockReturnValueOnce(0.25)
+            .mockReturnValueOnce(0.75)
+            .mockReturnValueOnce(0.25)
+            .mockReturnValueOnce(0.75)
+            .mockReturnValueOnce(0.25)
+            .mockReturnValueOnce(0.75)
+            .mockReturnValueOnce(0.25)
+            .mockReturnValueOnce(0.75)
+            .mockReturnValueOnce(0.25)
+            .mockReturnValueOnce(0.75)
+            .mockReturnValueOnce(0.25)
+            .mockReturnValueOnce(0.75)
+            .mockReturnValueOnce(0.25)
+            .mockReturnValueOnce(0.75);
+
         let primaryProbed = 0;
         let secondaryUsed = 0;
-        for (let i = 0; i < 20; i++) {
-            primary._calls = [];
-            secondary._calls = [];
-            await svc.initiateTransfer({
-                referenceId: `probe-${i}`,
-                amountGhs: 10,
-                recipientPhone: '0244556677',
-            });
-            if (primary._calls.length > 0) primaryProbed++;
-            if (secondary._calls.length > 0) secondaryUsed++;
+        try {
+            for (let i = 0; i < 20; i++) {
+                primary._calls = [];
+                secondary._calls = [];
+                await svc.initiateTransfer({
+                    referenceId: `probe-${i}`,
+                    amountGhs: 10,
+                    recipientPhone: '0244556677',
+                });
+                if (primary._calls.length > 0) primaryProbed++;
+                if (secondary._calls.length > 0) secondaryUsed++;
+            }
+        } finally {
+            randomSpy.mockRestore();
         }
 
-        // Primary should be probed less than 100% of the time (recovery probe)
-        expect(primaryProbed).toBeLessThan(20);
-        expect(primaryProbed).toBeGreaterThan(0); // but still probed sometimes
-        // Secondary should handle most/all calls
-        expect(secondaryUsed).toBeGreaterThan(15);
+        expect(primaryProbed).toBe(10);
+        expect(secondaryUsed).toBe(20);
     });
 
     test('health resets after success', async () => {
@@ -128,7 +152,6 @@ describe('PaymentFailoverService', () => {
             secondary: makeMockProvider('mtn'),
         });
 
-        // Succeed first
         await svc.initiateTransfer({
             referenceId: 'test-success',
             amountGhs: 100,
@@ -157,7 +180,6 @@ describe('PaymentFailoverService', () => {
 
         await svc.getTransferStatus('ref-123', 'mtn');
 
-        // primary should NOT be called when hint is 'mtn'
         expect(primary._calls).toHaveLength(0);
         expect(secondary._calls).toHaveLength(1);
     });
@@ -168,8 +190,6 @@ describe('PaymentFailoverService', () => {
         const svc = new PaymentFailoverService({ primary, secondary });
 
         await svc.getTransferStatus('ref-456', 'moolre');
-
-        // hint failed, so should try secondary
         expect(secondary._calls).toHaveLength(1);
     });
 
@@ -201,7 +221,6 @@ describe('PaymentFailoverService', () => {
             ]
         });
 
-        // MTN should be first since it has lower priority number
         const result = await svc.initiateTransfer({
             referenceId: 'test-priority',
             amountGhs: 100,
