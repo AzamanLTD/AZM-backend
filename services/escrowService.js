@@ -247,6 +247,7 @@ const fundEscrow = async (prisma, { escrowId, payerId }) => {
             amountUsdc: updatedEscrow.amountUsdc,
             payerId: updatedEscrow.payerId,
             payeeId: updatedEscrow.payeeId,
+            fundedAt: updatedEscrow.fundedAt,
         };
         try {
             _socketIo.to(`user_${updatedEscrow.payerId}`).emit('escrow_funded', payload);
@@ -643,6 +644,7 @@ const _releaseEscrow = async (prisma, escrowId, finalStatus = 'SETTLED') => {
             amountUsdc: updated.amountUsdc,
             payerId: updated.payerId,
             payeeId: updated.payeeId,
+            settledAt: updated.settledAt,
         };
         try {
             _socketIo.to(`user_${updated.payerId}`).emit('escrow_settled', payload);
