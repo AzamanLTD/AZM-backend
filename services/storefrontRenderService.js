@@ -173,6 +173,13 @@ async function renderStorefront(prisma, businessProfileId) {
     };
   });
 
+  // Experience is part of the published layout snapshot. Business metadata
+  // may contain an unsaved editor state and must never change the public render.
+  const publishedExperience = experienceBlueprintService.normalizeExperienceBlueprint(
+    migratedLayout.experience,
+    business.category,
+  );
+
   const result = {
     business: {
       name: business.businessName,
@@ -183,7 +190,7 @@ async function renderStorefront(prisma, businessProfileId) {
       phoneNumber: business.phoneNumber || null,
       escrowProtectionAvailable: _escrowProtectionAvailable(business),
     },
-    experience: experienceBlueprintService.getExperienceBlueprint(business),
+    experience: publishedExperience,
     theme: themeOverride ? {
       id: themeOverride.id,
       key: themeOverride.key,
