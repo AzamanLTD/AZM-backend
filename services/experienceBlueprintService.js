@@ -40,7 +40,6 @@ const COMMIT_STYLES = Object.freeze({
   PAPER_RIP: 'PAPER_RIP',
   LIFT_INTO_TRAY: 'LIFT_INTO_TRAY',
 });
-const COMMIT_STYLE_VALUES = Object.freeze(Object.values(COMMIT_STYLES));
 
 const CATEGORY_OPTIONS = Object.freeze({
   FOOD_BEVERAGE: Object.freeze({
@@ -119,7 +118,10 @@ function defaultsForCategory(category) {
     },
     commit: {
       style: options.commitStyles[0],
-      persistentTray: key === 'FOOD_BEVERAGE' || key === 'RETAIL',
+      // Keep the historical persisted-contract default. Category-aware commit
+      // semantics are enforced by commit.style; a persistent tray is merely a
+      // UI preference and remains backwards compatible until a category opts out.
+      persistentTray: true,
     },
     motion: { tempo: 'BALANCED', reducedMotionSafe: true },
   };
@@ -171,8 +173,6 @@ function normalizeExperienceBlueprint(input, category) {
     navigation: {
       mode: enumValue(raw.navigation?.mode, options.navigationModes, defaults.navigation.mode),
       showProgress: bool(raw.navigation?.showProgress, defaults.navigation.showProgress),
-      // Direct jumping remains platform-controlled until a later information
-      // architecture proves it helps the specific journey.
       allowDirectJump: false,
     },
     detail: {
@@ -184,9 +184,15 @@ function normalizeExperienceBlueprint(input, category) {
     },
     customerContext: {
       enabled: bool(raw.customerContext?.enabled, defaults.customerContext.enabled),
-      tableNumber: bool(raw.customerContext?.tableNumber, options.customerContext.tableNumber),
-      serviceMode: bool(raw.customerContext?.serviceMode, options.customerContext.serviceMode),
-      passenger: bool(raw.customerContext?.passenger, options.customerContext.passenger),
+      tableNumber: options.customerContext.tableNumber
+        ? bool(raw.customerContext?.tableNumber, defaults.customerContext.tableNumber)
+        : false,
+      serviceMode: options.customerContext.serviceMode
+        ? bool(raw.customerContext?.serviceMode, defaults.customerContext.serviceMode)
+        : false,
+      passenger: options.customerContext.passenger
+        ? bool(raw.customerContext?.passenger, defaults.customerContext.passenger)
+        : false,
     },
     commit: {
       style: enumValue(raw.commit?.style, options.commitStyles, defaults.commit.style),
