@@ -1,0 +1,68 @@
+name: Hotel customer id contract patch
+
+on:
+  push:
+    branches: [fix/hotel-ops-business-scope-v2]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/hotel-ops-business-scope-v2
+          fetch-depth: 1
+      - name: Align public customer identity contract
+        run: |
+          set -eu
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('services/businessOS/hotelOpsService.js')
+          s = p.read_text()
+          old = "HotelOpsService.prototype.createWalkIn = async function(businessProfileId, { customerId, phone, roomId, nights, depositUsdc, notes }) {\n    if (!businessProfileId) throw new Error('Business profile context is required.');\n    if (!customerId) throw new Error('A registered Azaman customer is required for a walk-in booking.');\n    const [room, customer] = await Promise.all([\n        this.prisma.hotelRoom.findFirst({ where: { id: roomId, businessProfileId } }),\n        this.prisma.user.findUnique({ where: { id: customerId }, select: { id: true } }),\n    ]);"
+          new = "HotelOpsService.prototype.createWalkIn = async function(businessProfileId, { customerAzamanId, phone, roomId, nights, depositUsdc, notes }) {\n    if (!businessProfileId) throw new Error('Business profile context is required.');\n    if (!customerAzamanId) throw new Error('A registered Azaman customer is required for a walk-in booking.');\n    const [room, customer] = await Promise.all([\n        this.prisma.hotelRoom.findFirst({ where: { id: roomId, businessProfileId } }),\n        this.prisma.user.findUnique({ where: { azamanId: customerAzamanId }, select: { id: true } }),\n    ]);"
+          if old not in s: raise SystemExit('missing createWalkIn identity block')
+          s = s.replace(old, new, 1)
+          s = s.replace('            customerId,\n', '            customerId: customer.id,\n', 1)
+          p.write_text(s)
+
+          p = Path('__tests__/hotelOpsService.business-scope.test.js')
+          s = p.read_text()
+          insert = """
+    test('resolves a walk-in customer by public Azaman ID', async () => {
+        const prisma = {
+            hotelRoom: { findFirst: jest.fn().mockResolvedValue({ id: 'room-a', status: 'AVAILABLE', basePriceUsdc: 100 }) },
+            user: { findUnique: jest.fn().mockResolvedValue({ id: 42, azamanId: 'AZM-123456789' }) },
+            reservation: { create: jest.fn().mockResolvedValue({ id: 'reservation-a' }) },
+        };
+        const svc = new HotelOpsService(prisma);
+        prisma.hotelRoom.update = jest.fn();
+
+        await expect(svc.createWalkIn('business-a', {
+            customerAzamanId: 'AZM-123456789', roomId: 'room-a', nights: 1,
+        })).resolves.toEqual({ id: 'reservation-a' });
+        expect(prisma.user.findUnique).toHaveBeenCalledWith({
+            where: { azamanId: 'AZM-123456789' },
+            select: { id: true },
+        });
+        expect(prisma.reservation.create).toHaveBeenCalledWith(expect.objectContaining({
+            data: expect.objectContaining({ customerId: 42 }),
+        }));
+    });
+"""
+          marker = "    test('rejects room moves across business boundaries', async () => {"
+          if marker not in s: raise SystemExit('missing hotel test insertion marker')
+          s = s.replace(marker, insert + "\n" + marker, 1)
+          p.write_text(s)
+
+          Path('.github/workflows/hotel-customer-id-patch.yml').unlink()
+          import subprocess
+          subprocess.run(['git', 'config', 'user.name', 'azaman-automation'], check=True)
+          subprocess.run(['git', 'config', 'user.email', 'automation@azaman.local'], check=True)
+          subprocess.run(['git', 'add', 'services/businessOS/hotelOpsService.js', '__tests__/hotelOpsService.business-scope.test.js', '.github/workflows/hotel-customer-id-patch.yml'], check=True)
+          subprocess.run(['git', 'commit', '-m', 'fix(hotel): resolve walk-in customers by Azaman ID'], check=True)
+          subprocess.run(['git', 'push', 'origin', 'HEAD:fix/hotel-ops-business-scope-v2'], check=True)
+          PY
