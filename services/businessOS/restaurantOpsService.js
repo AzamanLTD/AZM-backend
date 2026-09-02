@@ -15,7 +15,6 @@ class RestaurantOpsService {
 
     // Create a kitchen order from a BusinessOrder
     async createKitchenOrder({ businessProfileId, locationId, businessOrderId, tableNumber, serverName, items, station, specialInstructions, isRush }) {
-        // Generate ticket number (sequential per location per day)
         const today = new Date();
         today.setHours(0, 0, 0, 0);
         const tomorrow = new Date(today);
@@ -29,25 +28,17 @@ class RestaurantOpsService {
             },
         });
 
-        // Collect allergy alerts from items
         const allergyAlerts = [];
         const orderItems = [];
 
         for (const item of items) {
-            // Fetch product to check for allergens
-            const product = await this.prisma.businessProduct.findUnique({
-                where: { id: item.productId },
+            const product = await this.prisma.businessProduct.findFirst({
+                where: { id: item.productId, businessProfileId },
             });
             if (product) {
-                // Check product metadata for allergen info
                 const allergens = product.metadata?.allergens || [];
-                if (allergens.length > 0) {
-                    allergyAlerts.push(...allergens);
-                }
-
-                // Determine station from product category or metadata
+                if (allergens.length > 0) allergyAlerts.push(...allergens);
                 const itemStation = item.station || product.metadata?.station || station || 'HOT';
-
                 orderItems.push({
                     productId: item.productId,
                     name: product.name,
@@ -59,10 +50,9 @@ class RestaurantOpsService {
             }
         }
 
-        // Dedupe allergy alerts
         const uniqueAllergies = [...new Set(allergyAlerts)];
 
-        const kitchenOrder = await this.prisma.kitchenOrder.create({
+        return this.prisma.kitchenOrder.create({
             data: {
                 businessProfileId,
                 locationId,
@@ -81,11 +71,8 @@ class RestaurantOpsService {
                 items: true,
             },
         });
-
-        return kitchenOrder;
     }
 
-    // Get KDS board (grouped by station)
     async getKDSBoard(businessProfileId, { locationId, status } = {}) {
         const where = {
             businessProfileId,
@@ -98,24 +85,22 @@ class RestaurantOpsService {
             orderBy: { ticketNumber: 'asc' },
         });
 
-        // Sort: rush orders first, then by ticket number
         orders.sort((a, b) => {
             if (a.isRush && !b.isRush) return -1;
             if (!a.isRush && b.isRush) return 1;
             return a.ticketNumber - b.ticketNumber;
         });
 
-        // Group by station
         const byStation = {};
         orders.forEach(order => {
             const items = order.orderItems || [];
             items.forEach(item => {
-                const station = item.station || order.station || 'HOT';
-                if (!byStation[station]) byStation[station] = [];
-                if (!byStation[station].find(o => o.id === order.id)) {
-                    byStation[station].push({
+                const itemStation = item.station || order.station || 'HOT';
+                if (!byStation[itemStation]) byStation[itemStation] = [];
+                if (!byStation[itemStation].find(o => o.id === order.id)) {
+                    byStation[itemStation].push({
                         ...order,
-                        stationItems: items.filter(i => (i.station || order.station) === station),
+                        stationItems: items.filter(i => (i.station || order.station) === itemStation),
                     });
                 }
             });
@@ -129,10 +114,11 @@ class RestaurantOpsService {
         };
     }
 
-    // Update order status (KDS bump bar)
-    async updateOrderStatus(orderId, status) {
-        const order = await this.prisma.kitchenOrder.findUnique({
-            where: { id: orderId },
+    // KDS bump bar — business scope is mandatory for portal callers.
+    async updateOrderStatus(orderId, status, businessProfileId) {
+        if (!businessProfileId) throw new Error('Business profile context is required.');
+        const order = await this.prisma.kitchenOrder.findFirst({
+            where: { id: orderId, businessProfileId },
         });
         if (!order) throw new Error('Kitchen order not found.');
 
@@ -144,7 +130,7 @@ class RestaurantOpsService {
         const updated = await this.prisma.kitchenOrder.update({
             where: { id: orderId },
             data: updates,
-            include: { businessOrder: { include: { customer: true } } }
+            include: { businessOrder: { include: { customer: true } } },
         });
 
         if (status === 'READY') {
@@ -152,9 +138,9 @@ class RestaurantOpsService {
             const customerPhone = updated.businessOrder?.customer?.phoneNumber;
             if (customerPhone) {
                 messagingChannelsService.notifyOrderReady(
-                    updated.businessProfileId, 
-                    customerPhone, 
-                    updated.businessOrder?.orderRef || updated.ticketNumber.toString()
+                    updated.businessProfileId,
+                    customerPhone,
+                    updated.businessOrder?.orderRef || updated.ticketNumber.toString(),
                 ).catch(err => logger.error('[MessagingChannels] Error:', err));
             }
         }
@@ -162,10 +148,10 @@ class RestaurantOpsService {
         return updated;
     }
 
-    // Update individual item status
-    async updateItemStatus(orderId, itemIndex, status) {
-        const order = await this.prisma.kitchenOrder.findUnique({
-            where: { id: orderId },
+    async updateItemStatus(orderId, itemIndex, status, businessProfileId) {
+        if (!businessProfileId) throw new Error('Business profile context is required.');
+        const order = await this.prisma.kitchenOrder.findFirst({
+            where: { id: orderId, businessProfileId },
         });
         if (!order) throw new Error('Order not found.');
 
@@ -174,7 +160,6 @@ class RestaurantOpsService {
             items[itemIndex] = { ...items[itemIndex], status };
         }
 
-        // If all items are ready/served, update the order status too
         const allReady = items.every(i => i.status === 'READY' || i.status === 'SERVED');
         const allServed = items.every(i => i.status === 'SERVED');
 
@@ -193,15 +178,21 @@ class RestaurantOpsService {
         });
     }
 
-    // Assign chef to order
-    async assignChef(orderId, employeeId) {
-        const employee = await this.prisma.businessEmployee.findUnique({
-            where: { id: employeeId },
+    async assignChef(orderId, employeeId, businessProfileId) {
+        if (!businessProfileId) throw new Error('Business profile context is required.');
+        const employee = await this.prisma.businessEmployee.findFirst({
+            where: { id: employeeId, businessProfileId },
         });
         if (!employee) throw new Error('Employee not found.');
         if (employee.role !== 'CHEF' && employee.role !== 'MANAGER') {
             throw new Error('Only chefs or managers can be assigned to orders.');
         }
+
+        const order = await this.prisma.kitchenOrder.findFirst({
+            where: { id: orderId, businessProfileId },
+            select: { id: true },
+        });
+        if (!order) throw new Error('Kitchen order not found.');
 
         return this.prisma.kitchenOrder.update({
             where: { id: orderId },
@@ -209,7 +200,6 @@ class RestaurantOpsService {
         });
     }
 
-    // Get KDS stats
     async getKDSStats(businessProfileId, { startDate, endDate } = {}) {
         const where = { businessProfileId };
         if (startDate && endDate) {
@@ -217,14 +207,11 @@ class RestaurantOpsService {
         }
 
         const orders = await this.prisma.kitchenOrder.findMany({ where });
-
         const total = orders.length;
         const avgPrepTime = orders
             .filter(o => o.readyAt && o.sentAt)
-            .reduce((sum, o) => {
-                const prepTime = (new Date(o.readyAt) - new Date(o.sentAt)) / (1000 * 60);
-                return sum + prepTime;
-            }, 0) / (orders.filter(o => o.readyAt && o.sentAt).length || 1);
+            .reduce((sum, o) => sum + ((new Date(o.readyAt) - new Date(o.sentAt)) / (1000 * 60)), 0)
+            / (orders.filter(o => o.readyAt && o.sentAt).length || 1);
 
         return {
             totalOrders: total,
@@ -239,15 +226,8 @@ class RestaurantOpsService {
     }
 
     // ═══ TABLE MANAGEMENT ═════════════════════════════════════════════════════
-    // Note: Table management uses DineInTab model which already exists in the schema.
-    // This provides a floor-plan view of all active tables.
 
     async getTableFloor(businessProfileId, { locationId } = {}) {
-        // Return actual BusinessTable records with nested DineInTabs,
-        // computing a derived 'status' from the active tab (or 'OPEN' if none).
-        const locWhere = { businessProfileId };
-        if (locationId) locWhere.id = locationId;
-
         const tables = await this.prisma.businessTable.findMany({
             where: {
                 isActive: true,
@@ -287,10 +267,8 @@ class RestaurantOpsService {
     }
 
     // ═══ MENU ENGINEERING ═════════════════════════════════════════════════════
-    // 86'd items management (items that are unavailable)
 
     async toggleItem86({ businessProfileId, productId, is86ed, reason }) {
-        // Toggle the "86'd" status of a product
         const product = await this.prisma.businessProduct.findUnique({
             where: { id: productId },
         });
@@ -299,18 +277,13 @@ class RestaurantOpsService {
             throw new Error('Product does not belong to this business.');
         }
 
-        // BusinessProduct schema uses `isAvailable` (not metadata)
-        // is86ed = true means sold out → isAvailable = false
         return this.prisma.businessProduct.update({
             where: { id: productId },
-            data: {
-                isAvailable: !is86ed,
-            },
+            data: { isAvailable: !is86ed },
         });
     }
 
     async get86edItems(businessProfileId) {
-        // 86'd items = products that are not available
         return this.prisma.businessProduct.findMany({
             where: { businessProfileId, isAvailable: false },
         });
@@ -329,4 +302,3 @@ class RestaurantOpsService {
 }
 
 module.exports = { RestaurantOpsService };
-
