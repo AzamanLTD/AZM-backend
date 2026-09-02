@@ -14,11 +14,23 @@ exports.addItem = async (prisma, opts) => {
     const svc = new DineInService(prisma);
     return svc.addItem({
         tabId: opts.tabId,
+        productId: opts.productId,
         name: opts.name,
         price: opts.price ?? opts.unitPriceUsdc,
         quantity: opts.quantity,
         notes: opts.notes,
         addedBy: opts.addedBy ?? opts.userId,
+    });
+};
+
+exports.addCustomerItem = async (prisma, opts) => {
+    const svc = new DineInService(prisma);
+    return svc.addCustomerItem({
+        tabId: opts.tabId,
+        customerId: opts.customerId ?? opts.userId,
+        productId: opts.productId,
+        selection: opts.selection,
+        quantity: opts.quantity,
     });
 };
 
@@ -54,14 +66,14 @@ exports.confirmTab = async (prisma, { tabId, customerId }) => {
     return svc.confirmTab(tabId, customerId);
 };
 
-// Compatibility alias for the existing controller route. This performs the
-// domain's confirmation step only; payment/escrow is not fabricated here.
-exports.confirmAndPay = exports.confirmTab;
+exports.confirmAndPay = async (prisma, { tabId, customerId, tipUsdc }) => {
+    const svc = new DineInService(prisma);
+    return svc.confirmAndPay(tabId, customerId, { tipUsdc });
+};
 
 exports.cancelTab = async (prisma, { tabId }) => {
     const svc = new DineInService(prisma);
     return svc.cancelTab(tabId);
 };
 
-// Existing business route name maps to the domain's cancellation operation.
 exports.reportDefault = exports.cancelTab;
