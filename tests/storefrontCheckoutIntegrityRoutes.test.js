@@ -98,15 +98,27 @@ describe('storefront checkout integrity boundary', () => {
     expect(String(values[2])).toMatch(/^v1:business-1:7:/);
   });
 
-  test('forwards a valid checkout to the existing transaction and persists variant snapshots', async () => {
+  test('forwards a valid checkout to the existing transaction and persists authoritative configuration', async () => {
+    const transactionExecuteRaw = jest.fn().mockResolvedValue(1);
+    const transactionProductUpdateMany = jest.fn().mockResolvedValue({ count: 1 });
     const prisma = {
       businessProduct: {
         findMany: jest.fn().mockResolvedValue([
-          { id: 'product-1', variants: { Size: ['Small', 'Large'] } },
+          {
+            id: 'product-1',
+            priceUsdc: 10,
+            variants: { Size: [{ name: 'Small', priceDelta: 0 }, { name: 'Large', priceDelta: 2 }] },
+            modifierGroups: [{ name: 'Sauce', required: false, maxSelection: 1, options: [{ name: 'Pepper', priceDelta: 1 }] }],
+          },
         ]),
       },
       $queryRaw: jest.fn().mockResolvedValue([]),
       $executeRaw: jest.fn().mockResolvedValue(1),
+      $transaction: jest.fn(async callback => callback({
+        $executeRaw: transactionExecuteRaw,
+        businessProduct: { updateMany: transactionProductUpdateMany },
+        globalSettings: { findUnique: jest.fn().mockResolvedValue(null) },
+      })),
     };
 
     const downstream = (req, res) => {
@@ -116,7 +128,8 @@ describe('storefront checkout integrity boundary', () => {
         data: {
           order: {
             id: 'order-1',
-            items: [{ id: 'line-1', productId: 'product-1' }],
+            items: [{ id: 'line-1', productId: 'product-1', unitPrice: 10, quantity: 1 }],
+            escrow: null,
           },
         },
       });
@@ -126,12 +139,18 @@ describe('storefront checkout integrity boundary', () => {
       .post('/api/storefront/business-1/checkout')
       .send({
         idempotencyKey: 'client-key',
-        items: [{ productId: 'product-1', quantity: 1, variants: { Size: 'Large' } }],
+        items: [{ productId: 'product-1', quantity: 1, variants: { Size: 'Large', Sauce: 'Pepper' } }],
       });
 
     expect(response.status).toBe(201);
-    expect(response.body.data.order.items[0].variants).toEqual({ Size: 'Large' });
-    expect(prisma.$executeRaw).toHaveBeenCalledTimes(2);
+    expect(response.body.data.order.items[0].variants).toEqual({ Size: 'Large', Sauce: ['Pepper'] });
+    expect(response.body.data.order.items[0].unitPrice).toBe(13);
+    expect(response.body.data.order.amountUsdc).toBe(13);
+    expect(prisma.$executeRaw).toHaveBeenCalledTimes(1);
+    expect(transactionExecuteRaw).toHaveBeenCalledTimes(2);
+    expect(transactionProductUpdateMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: { id: 'product-1' },
+    }));
   });
 
   test('converts a concurrent idempotency collision into a safe retry response', async () => {
