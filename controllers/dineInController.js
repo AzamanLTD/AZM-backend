@@ -2,8 +2,8 @@ const logger = require('../src/config/logger');
 const dineInTabService = require('../services/dineInTabService');
 
 const serviceOptions = (req, extra = {}) => ({
-    io: req.app.get('socketio') || req.app.get('io'),
     ...extra,
+    io: req.app.get('socketio') || req.app.get('io'),
 });
 
 exports.openTab = async (req, res) => {
