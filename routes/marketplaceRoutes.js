@@ -10,11 +10,18 @@ const express = require('express');
 const router = express.Router();
 const { protect } = require('../middleware/authMiddleware');
 const ctrl = require('../controllers/marketplaceController');
+const hotelCtrl = require('../controllers/hotelMarketplaceController');
 const { require2FA } = require('../middleware/require2FA');
 
 // ── QR Check-in ──────────────────────────────────────────────────────────────
 router.get('/reservations/:id/checkin-qr', protect, ctrl.generateCheckInQR);
 router.post('/business/checkin', protect, ctrl.businessCheckIn);
+
+// ── Public category business detail ──────────────────────────────────────────
+// Backwards-compatible marketplace contract consumed by the Flutter vertical
+// experiences. Hotel detail includes the authoritative HotelRoom inventory.
+router.get('/business/:bizId', hotelCtrl.getBusinessDetail);
+router.post('/business/:bizId/reservations', protect, hotelCtrl.createHotelReservation);
 
 // ── Transit Trips + Seat Booking ─────────────────────────────────────────────
 router.get('/transit/trips', protect, ctrl.listTransitTrips);
