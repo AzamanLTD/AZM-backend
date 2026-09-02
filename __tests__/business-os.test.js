@@ -654,14 +654,14 @@ describeIf('Business OS — Restaurant Operations (KDS)', () => {
             items: [{ productId: testProduct.id, quantity: 1 }],
         });
 
-        const preparing = await svc.updateOrderStatus(order.id, 'PREPARING');
+        const preparing = await svc.updateOrderStatus(order.id, 'PREPARING', businessProfile.id);
         expect(preparing.status).toBe('PREPARING');
         expect(preparing.startedAt).toBeTruthy();
 
-        const ready = await svc.updateOrderStatus(order.id, 'READY');
+        const ready = await svc.updateOrderStatus(order.id, 'READY', businessProfile.id);
         expect(ready.status).toBe('READY');
 
-        const served = await svc.updateOrderStatus(order.id, 'SERVED');
+        const served = await svc.updateOrderStatus(order.id, 'SERVED', businessProfile.id);
         expect(served.status).toBe('SERVED');
     });
 
