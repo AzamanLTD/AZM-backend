@@ -1,0 +1,52 @@
+name: Hotel walk-in contract v2
+
+on:
+  push:
+    branches: [fix/hotel-ops-business-scope-v2]
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/hotel-ops-business-scope-v2
+          fetch-depth: 1
+      - name: Align walk-in route with public customer identity
+        run: |
+          set -eu
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('routes/businessOSRoutes.js')
+          s = p.read_text()
+          old = """router.post('/hotel/front-desk/walk-in', wrap(async (req, res) => {\n    const svc = getServices(req);\n    const bpId = await getBusinessProfileId(req);\n    const reservation = await svc.hotelOpsService.createWalkIn(bpId, req.body);\n    res.json({ data: reservation });\n}));"""
+          new = """router.post('/hotel/front-desk/walk-in', wrap(async (req, res) => {\n    const svc = getServices(req);\n    const prisma = getPrisma(req);\n    const bpId = await getBusinessProfileId(req);\n    const { customerAzamanId, ...walkIn } = req.body || {};\n    if (!customerAzamanId) {\n        return res.status(400).json({ success: false, message: 'customerAzamanId is required.' });\n    }\n    const customer = await prisma.user.findUnique({\n        where: { azamanId: customerAzamanId },\n        select: { id: true },\n    });\n    if (!customer) {\n        return res.status(404).json({ success: false, message: 'Customer not found.' });\n    }\n    const reservation = await svc.hotelOpsService.createWalkIn(bpId, { ...walkIn, customerId: customer.id });\n    res.json({ data: reservation });\n}));"""
+          if s.count(old) != 1:
+              raise SystemExit(f'expected one walk-in route block, found {s.count(old)}')
+          p.write_text(s.replace(old, new, 1))
+
+          test = Path('__tests__/hotelFrontDeskWalkInRoute.contract.test.js')
+          test.write_text(r'''const { readFileSync } = require('fs');
+
+describe('Hotel front desk walk-in route contract', () => {
+    test('resolves public Azaman ID server-side before creating the reservation', () => {
+        const source = readFileSync('routes/businessOSRoutes.js', 'utf8');
+        expect(source).toContain("const { customerAzamanId, ...walkIn } = req.body || {};");
+        expect(source).toContain("where: { azamanId: customerAzamanId }");
+        expect(source).toContain("createWalkIn(bpId, { ...walkIn, customerId: customer.id })");
+        expect(source).not.toContain("createWalkIn(bpId, req.body)");
+    });
+});
+''')
+          p = Path('.github/workflows/hotel-walkin-contract-v2.yml')
+          p.unlink()
+          import subprocess
+          subprocess.run(['git','config','user.name','azaman-automation'], check=True)
+          subprocess.run(['git','config','user.email','automation@azaman.local'], check=True)
+          subprocess.run(['git','add','routes/businessOSRoutes.js','__tests__/hotelFrontDeskWalkInRoute.contract.test.js','.github/workflows/hotel-walkin-contract-v2.yml'], check=True)
+          subprocess.run(['git','commit','-m','fix(hotel): resolve walk-in customers by Azaman ID'], check=True)
+          subprocess.run(['git','push','origin','HEAD:fix/hotel-ops-business-scope-v2'], check=True)
+          PY
