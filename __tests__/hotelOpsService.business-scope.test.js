@@ -97,6 +97,37 @@ describe('HotelOpsService business scoping', () => {
         expect(prisma.hotelRoom.findFirst).not.toHaveBeenCalled();
     });
 
+
+    test('rejects bulk room ranges larger than 500 rooms', async () => {
+        const prisma = { businessLocation: { findFirst: jest.fn() }, hotelRoom: { createMany: jest.fn() } };
+        const svc = new HotelOpsService(prisma);
+        await expect(svc.bulkCreateRooms(bpA, { startNumber: 1, endNumber: 501 })).rejects.toThrow('limited to 500');
+        expect(prisma.hotelRoom.createMany).not.toHaveBeenCalled();
+    });
+
+    test('rejects bulk room creation with a foreign location', async () => {
+        const prisma = { businessLocation: { findFirst: jest.fn().mockResolvedValue(null) }, hotelRoom: { createMany: jest.fn() } };
+        const svc = new HotelOpsService(prisma);
+        await expect(svc.bulkCreateRooms(bpA, { startNumber: 1, endNumber: 2, locationId: 'location-b' })).rejects.toThrow('Location not found for this business.');
+        expect(prisma.hotelRoom.createMany).not.toHaveBeenCalled();
+    });
+
+    test('rolls back a walk-in reservation when room occupancy update fails', async () => {
+        const tx = {
+            reservation: { create: jest.fn().mockResolvedValue({ id: 'reservation-a' }) },
+            hotelRoom: { update: jest.fn().mockRejectedValue(new Error('room update failed')) },
+        };
+        const prisma = {
+            hotelRoom: { findFirst: jest.fn().mockResolvedValue({ id: 'room-a', status: 'AVAILABLE', basePriceUsdc: 100 }) },
+            user: { findUnique: jest.fn().mockResolvedValue({ id: 42 }) },
+            $transaction: jest.fn(async callback => callback(tx)),
+        };
+        const svc = new HotelOpsService(prisma);
+        await expect(svc.createWalkIn(bpA, { customerId: 42, roomId: 'room-a', nights: 1 })).rejects.toThrow('room update failed');
+        expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+        expect(tx.reservation.create).toHaveBeenCalledTimes(1);
+    });
+
     test('rejects room moves across business boundaries', async () => {
         const prisma = {
             reservation: { findFirst: jest.fn().mockResolvedValue(null) },

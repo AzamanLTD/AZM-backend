@@ -470,32 +470,34 @@ HotelOpsService.prototype.createWalkIn = async function(businessProfileId, { cus
     const endDatetime = new Date(startDatetime);
     endDatetime.setDate(endDatetime.getDate() + (parseInt(nights) || 1));
 
-    const reservation = await this.prisma.reservation.create({
-        data: {
-            businessProfileId,
-            serviceItemId: roomId,
-            customerId,
-            notes: `Phone: ${phone || 'N/A'}. ${notes || ''}`.trim(),
-            status: 'CHECKED_IN',
-            startDatetime,
-            endDatetime,
-            depositUsdc: depositUsdc ? parseFloat(depositUsdc) : null,
-            amountUsdc: Number(room.basePriceUsdc) * Math.max(1, parseInt(nights) || 1),
-            metadata: { channel: 'FRONT_DESK', phone },
-        },
-    });
+    return this.prisma.$transaction(async (tx) => {
+        const reservation = await tx.reservation.create({
+            data: {
+                businessProfileId,
+                serviceItemId: roomId,
+                customerId,
+                notes: `Phone: ${phone || 'N/A'}. ${notes || ''}`.trim(),
+                status: 'CHECKED_IN',
+                startDatetime,
+                endDatetime,
+                depositUsdc: depositUsdc ? parseFloat(depositUsdc) : null,
+                amountUsdc: Number(room.basePriceUsdc) * Math.max(1, parseInt(nights) || 1),
+                metadata: { channel: 'FRONT_DESK', phone },
+            },
+        });
 
-    await this.prisma.hotelRoom.update({
-        where: { id: roomId },
-        data: {
-            status: 'OCCUPIED',
-            currentReservationId: reservation.id,
-            checkedInAt: new Date(),
-            checkoutDueAt: endDatetime,
-        },
-    });
+        await tx.hotelRoom.update({
+            where: { id: roomId },
+            data: {
+                status: 'OCCUPIED',
+                currentReservationId: reservation.id,
+                checkedInAt: new Date(),
+                checkoutDueAt: endDatetime,
+            },
+        });
 
-    return reservation;
+        return reservation;
+    });
 };
 
 HotelOpsService.prototype.moveRoom = async function(reservationId, { newRoomId, reason }, businessProfileId) {
@@ -523,9 +525,23 @@ HotelOpsService.prototype.moveRoom = async function(reservationId, { newRoomId, 
 };
 
 HotelOpsService.prototype.bulkCreateRooms = async function(businessProfileId, { startNumber, endNumber, roomType, floor, basePrice, weekendPrice, capacity, locationId }) {
+    if (!businessProfileId) throw new Error('Business profile context is required.');
+    const start = Number.parseInt(startNumber, 10);
+    const end = Number.parseInt(endNumber, 10);
+    if (!Number.isInteger(start) || !Number.isInteger(end) || start < 1 || end < start) {
+        throw new Error('A valid room number range is required.');
+    }
+    if (end - start + 1 > 500) {
+        throw new Error('Bulk room creation is limited to 500 rooms at a time.');
+    }
+    if (locationId) {
+        const location = await this.prisma.businessLocation.findFirst({
+            where: { id: locationId, businessProfileId },
+            select: { id: true },
+        });
+        if (!location) throw new Error('Location not found for this business.');
+    }
     const rooms = [];
-    const start = parseInt(startNumber);
-    const end = parseInt(endNumber);
     for (let n = start; n <= end; n++) {
         rooms.push({
             businessProfileId,
