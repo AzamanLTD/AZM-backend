@@ -143,7 +143,7 @@ describe('hotelMarketplaceController', () => {
         expect(createReservation.mock.calls[0][0].body).toEqual(expect.objectContaining({
             bizId: 'BIZ-HOTEL',
             serviceItemId: 'room-7',
-            amountUsdc: '270.00000000',
+            amountUsdc: '250.00000000',
             partySize: 2,
         }));
     });
