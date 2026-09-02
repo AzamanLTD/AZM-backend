@@ -146,18 +146,29 @@ exports.searchGuests = async (req, res) => {
         const { query } = req.query;
         if (!query) return res.json({ success: true, guests: [] });
 
-        const guests = await prisma.user.findMany({
+        const businessId = req.adminScopedBusiness?.id ||
+            (await prisma.businessProfile.findFirst({
+                where: { userId: req.user.id }, select: { id: true }
+            }))?.id;
+
+        if (!businessId) return res.status(404).json({ success: false, message: 'No business profile.' });
+
+        const guests = await prisma.dineInTab.findMany({
             where: {
-                OR: [
-                    { username: { contains: query, mode: 'insensitive' } },
-                    { azamanId: { contains: query, mode: 'insensitive' } },
-                ]
+                businessProfileId: businessId,
+                customer: {
+                    OR: [
+                        { username: { contains: query, mode: 'insensitive' } },
+                        { azamanId: { contains: query, mode: 'insensitive' } },
+                    ],
+                },
             },
-            select: { id: true, username: true, azamanId: true },
+            select: { customer: { select: { id: true, username: true, azamanId: true } } },
+            distinct: ['customerId'],
             take: 10,
         });
 
-        res.json({ success: true, guests });
+        res.json({ success: true, guests: guests.map(g => g.customer) });
     } catch (err) { res.status(500).json({ success: false, message: err.message }); }
 };
 
