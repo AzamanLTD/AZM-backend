@@ -1,0 +1,39 @@
+name: Restaurant KDS scope wiring
+on:
+  push:
+    branches: [fix/restaurant-kds-business-scope]
+permissions:
+  contents: write
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Patch KDS routes
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('routes/businessOSRoutes.js')
+          s = p.read_text()
+          reps = [
+            ("const updated = await svc.restaurantOpsService.updateOrderStatus(req.params.id, req.body.status);", "const bpId = await getBusinessProfileId(req);\n    const updated = await svc.restaurantOpsService.updateOrderStatus(req.params.id, req.body.status, bpId);"),
+            ("const updated = await svc.restaurantOpsService.updateItemStatus(req.params.id, req.body.itemIndex, req.body.status);", "const bpId = await getBusinessProfileId(req);\n    const updated = await svc.restaurantOpsService.updateItemStatus(req.params.id, req.body.itemIndex, req.body.status, bpId);"),
+            ("const updated = await svc.restaurantOpsService.assignChef(req.params.id, req.body.employeeId);", "const bpId = await getBusinessProfileId(req);\n    const updated = await svc.restaurantOpsService.assignChef(req.params.id, req.body.employeeId, bpId);"),
+          ]
+          count = 0
+          for old, new in reps:
+              if old in s:
+                  s = s.replace(old, new, 1)
+                  count += 1
+          print(f'patched {count} KDS calls')
+          if count != len(reps):
+              raise SystemExit(f'expected {len(reps)} replacements, got {count}')
+          p.write_text(s)
+          PY
+          git config user.name 'azaman-ci'
+          git config user.email 'azaman-ci@users.noreply.github.com'
+          git add routes/businessOSRoutes.js
+          git commit -m 'fix(restaurant): pass business scope through KDS routes'
+          git push origin HEAD:fix/restaurant-kds-business-scope
