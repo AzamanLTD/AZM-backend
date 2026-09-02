@@ -24,6 +24,19 @@ function addUtcDays(value, days) {
     return d;
 }
 
+function publicBusinessMeta(rawMeta) {
+    if (!rawMeta || typeof rawMeta !== 'object' || Array.isArray(rawMeta)) return {};
+
+    const meta = {};
+    if (Array.isArray(rawMeta.showcaseUrls)) {
+        meta.showcaseUrls = rawMeta.showcaseUrls.filter((url) => typeof url === 'string');
+    }
+    if (rawMeta.penaltyPolicy && typeof rawMeta.penaltyPolicy === 'object' && !Array.isArray(rawMeta.penaltyPolicy)) {
+        meta.penaltyPolicy = rawMeta.penaltyPolicy;
+    }
+    return meta;
+}
+
 function toPublicRoom(room) {
     return {
         id: room.id,
@@ -149,6 +162,7 @@ exports.getBusinessDetail = async (req, res) => {
         data: {
             business: {
                 ...business,
+                businessMeta: publicBusinessMeta(business.businessMeta),
                 totalVolume: Number(business.totalVolume),
                 averageRating: Number(business.averageRating),
                 products,
