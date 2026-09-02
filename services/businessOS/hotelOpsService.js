@@ -338,16 +338,19 @@ class HotelOpsService {
             }),
         ]);
 
-        // Enrich with product names (serviceItemId → BusinessProduct.name)
+        // Enrich from the authoritative HotelRoom inventory, not legacy BusinessProduct rows.
         const allReservations = [...arrivals, ...departures, ...inHouse];
-        const productIds = [...new Set(allReservations.map(r => r.serviceItemId).filter(Boolean))];
-        const products = productIds.length > 0
-            ? await this.prisma.businessProduct.findMany({ where: { id: { in: productIds } }, select: { id: true, name: true } })
+        const roomIds = [...new Set(allReservations.map(r => r.serviceItemId).filter(Boolean))];
+        const rooms = roomIds.length > 0
+            ? await this.prisma.hotelRoom.findMany({
+                where: { id: { in: roomIds }, businessProfileId },
+                select: { id: true, roomNumber: true, roomType: true, floor: true, status: true },
+            })
             : [];
-        const productMap = Object.fromEntries(products.map(p => [p.id, p.name]));
+        const roomMap = Object.fromEntries(rooms.map(r => [r.id, r]));
         const enrich = (list) => list.map(r => ({
             ...r,
-            room: r.serviceItemId ? { roomNumber: productMap[r.serviceItemId] || '—', roomType: '—' } : null,
+            room: r.serviceItemId ? (roomMap[r.serviceItemId] || null) : null,
         }));
 
         return {
