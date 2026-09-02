@@ -1,6 +1,6 @@
 // Adapter: bridges dineInController to DineInService class
 const logger = require('../src/config/logger');
-const { DineInService } = require('./marketplace/dineInService');
+const DineInService = require('./marketplace/dineInService');
 
 exports.openTab = async (prisma, opts) => {
     const svc = new DineInService(prisma);
