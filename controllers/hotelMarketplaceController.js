@@ -24,19 +24,6 @@ function addUtcDays(value, days) {
     return d;
 }
 
-function publicBusinessMeta(rawMeta) {
-    if (!rawMeta || typeof rawMeta !== 'object' || Array.isArray(rawMeta)) return {};
-
-    const meta = {};
-    if (Array.isArray(rawMeta.showcaseUrls)) {
-        meta.showcaseUrls = rawMeta.showcaseUrls.filter((url) => typeof url === 'string');
-    }
-    if (rawMeta.penaltyPolicy && typeof rawMeta.penaltyPolicy === 'object' && !Array.isArray(rawMeta.penaltyPolicy)) {
-        meta.penaltyPolicy = rawMeta.penaltyPolicy;
-    }
-    return meta;
-}
-
 function toPublicRoom(room) {
     return {
         id: room.id,
@@ -53,6 +40,25 @@ function toPublicRoom(room) {
         amenities: room.amenities || [],
         imageUrls: room.imageUrls || [],
     };
+}
+
+function toPublicBusinessMeta(meta) {
+    if (!meta || typeof meta !== 'object') return null;
+    const publicMeta = {};
+    if (Array.isArray(meta.showcaseUrls)) {
+        publicMeta.showcaseUrls = meta.showcaseUrls.filter((url) => typeof url === 'string').slice(0, 20);
+    }
+    if (meta.penaltyPolicy && typeof meta.penaltyPolicy === 'object') {
+        const penaltyPct = Number(meta.penaltyPolicy.penaltyPct);
+        const gracePeriodMins = Number(meta.penaltyPolicy.gracePeriodMins);
+        if (Number.isFinite(penaltyPct) || Number.isFinite(gracePeriodMins)) {
+            publicMeta.penaltyPolicy = {
+                ...(Number.isFinite(penaltyPct) ? { penaltyPct } : {}),
+                ...(Number.isFinite(gracePeriodMins) ? { gracePeriodMins } : {}),
+            };
+        }
+    }
+    return Object.keys(publicMeta).length ? publicMeta : null;
 }
 
 async function findNightlyRates(prisma, room, checkInDay, checkOutDay) {
@@ -138,6 +144,7 @@ exports.getBusinessDetail = async (req, res) => {
                 orderBy: [{ catalogSectionId: 'asc' }, { name: 'asc' }],
             },
             hotelRooms: {
+                where: { status: { not: 'MAINTENANCE' } },
                 orderBy: [{ floor: 'asc' }, { roomNumber: 'asc' }],
             },
         },
@@ -162,7 +169,7 @@ exports.getBusinessDetail = async (req, res) => {
         data: {
             business: {
                 ...business,
-                businessMeta: publicBusinessMeta(business.businessMeta),
+                businessMeta: toPublicBusinessMeta(business.businessMeta),
                 totalVolume: Number(business.totalVolume),
                 averageRating: Number(business.averageRating),
                 products,
