@@ -252,6 +252,7 @@ class TransitOpsService {
         const trip = await this.prisma.transitTrip.findFirst({
             where: { id: tripId, businessProfileId },
             include: {
+                vehicle: { select: { id: true, capacity: true } },
                 reservations: {
                     where: { status: { in: ['CONFIRMED', 'CHECKED_IN', 'BOARDED'] } },
                     include: {
