@@ -3,7 +3,9 @@ const dineInTabService = require('../services/dineInTabService');
 
 const serviceOptions = (req, extra = {}) => ({
     ...extra,
-    io: req.app.get('socketio') || req.app.get('io'),
+    io: req.app && typeof req.app.get === 'function'
+        ? (req.app.get('socketio') || req.app.get('io'))
+        : undefined,
 });
 
 exports.openTab = async (req, res) => {
@@ -129,32 +131,10 @@ exports.getGuests = async (req, res) => {
 
         const guests = await prisma.dineInTab.findMany({
             where: { businessProfileId: businessId },
-            include: { customer: { select: { id: true, username: true, azamanId: true } } },
-            distinct: ['customerId'],
-            take: 50,
+            include: { customer: true },
         });
-
-        res.json({ success: true, guests: guests.map(g => g.customer) });
-    } catch (err) { res.status(500).json({ success: false, message: err.message }); }
-};
-
-exports.searchGuests = async (req, res) => {
-    try {
-        const prisma = req.prisma || req.app.get('prisma');
-        const { query } = req.query;
-        if (!query) return res.json({ success: true, guests: [] });
-
-        const guests = await prisma.user.findMany({
-            where: {
-                OR: [
-                    { username: { contains: query, mode: 'insensitive' } },
-                    { azamanId: { contains: query, mode: 'insensitive' } },
-                ]
-            },
-            select: { id: true, username: true, azamanId: true },
-            take: 10,
-        });
-
         res.json({ success: true, guests });
-    } catch (err) { res.status(500).json({ success: false, message: err.message }); }
+    } catch (err) { res.status(400).json({ success: false, message: err.message }); }
 };
+
+module.exports.serviceOptions = serviceOptions;
