@@ -15,6 +15,22 @@ class RestaurantOpsService {
 
     // Create a kitchen order from a BusinessOrder
     async createKitchenOrder({ businessProfileId, locationId, businessOrderId, tableNumber, serverName, items, station, specialInstructions, isRush }) {
+        if (!businessProfileId) throw new Error('Business profile context is required.');
+        if (locationId) {
+            const location = await this.prisma.businessLocation.findFirst({
+                where: { id: locationId, businessProfileId },
+                select: { id: true },
+            });
+            if (!location) throw new Error('Location not found for this business.');
+        }
+        if (businessOrderId) {
+            const businessOrder = await this.prisma.businessOrder.findFirst({
+                where: { id: businessOrderId, businessProfileId },
+                select: { id: true },
+            });
+            if (!businessOrder) throw new Error('Business order not found for this business.');
+        }
+
         // Generate ticket number (sequential per location per day)
         const today = new Date();
         today.setHours(0, 0, 0, 0);
@@ -35,10 +51,11 @@ class RestaurantOpsService {
 
         for (const item of items) {
             // Fetch product to check for allergens
-            const product = await this.prisma.businessProduct.findUnique({
-                where: { id: item.productId },
+            const product = await this.prisma.businessProduct.findFirst({
+                where: { id: item.productId, businessProfileId, isActive: true },
             });
-            if (product) {
+            if (!product) throw new Error('Product not found for this business: ' + item.productId);
+            {
                 // Check product metadata for allergen info
                 const allergens = product.metadata?.allergens || [];
                 if (allergens.length > 0) {
