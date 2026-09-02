@@ -24,7 +24,7 @@ describe('dine-in customer tab context contract', () => {
       .rejects.toThrow('Not authorized to view this tab.');
   });
 
-  test('customer tab controller enriches an existing table reference with the real table label', async () => {
+  test('customer tab controller enriches an existing table reference and business identity', async () => {
     jest.doMock('../services/dineInTabService', () => ({
       getTab: jest.fn().mockResolvedValue({
         id: 'tab-1',
@@ -46,6 +46,14 @@ describe('dine-in customer tab context contract', () => {
             isActive: true,
           }),
         },
+        businessProfile: {
+          findUnique: jest.fn().mockResolvedValue({
+            id: 'biz-1',
+            bizId: 'BIZ-123456789',
+            businessName: 'Table & Co',
+            logoUrl: null,
+          }),
+        },
       },
       user: { id: 42 },
       params: { tabId: 'tab-1' },
@@ -59,10 +67,20 @@ describe('dine-in customer tab context contract', () => {
       where: { id: 'table-7' },
       select: { id: true, label: true, locationId: true, isActive: true },
     });
+    expect(req.prisma.businessProfile.findUnique).toHaveBeenCalledWith({
+      where: { id: 'biz-1' },
+      select: { id: true, bizId: true, businessName: true, logoUrl: true },
+    });
     expect(json).toHaveBeenCalledWith({
       success: true,
       tab: expect.objectContaining({
         tableId: 'table-7',
+        businessProfile: {
+          id: 'biz-1',
+          bizId: 'BIZ-123456789',
+          businessName: 'Table & Co',
+          logoUrl: null,
+        },
         table: {
           id: 'table-7',
           label: 'Table 7',
