@@ -69,6 +69,30 @@ describe('Experience Blueprint category grammar', () => {
     expect(blueprint.customerContext.passenger).toBe(true);
   });
 
+  test('normalization is case-insensitive for category keys', () => {
+    expect(defaultsForCategory(' retail ').preset).toBe(defaultsForCategory('RETAIL').preset);
+    expect(categoryOptions('hospitality')).toEqual(categoryOptions('HOSPITALITY'));
+  });
+
+  test('unknown categories receive a safe service grammar', () => {
+    const blueprint = normalizeExperienceBlueprint({
+      navigation: { mode: 'AISLE_TRAVERSE' },
+      detail: { presentation: 'PRODUCT_DOSSIER' },
+      commit: { style: 'PAPER_RIP' },
+      customerContext: { tableNumber: true, serviceMode: true, passenger: true },
+    }, 'HEALTH_WELLNESS');
+
+    expect(blueprint.navigation.mode).toBe('CONTEXTUAL');
+    expect(blueprint.detail.presentation).toBe('SERVICE_DOSSIER');
+    expect(blueprint.commit.style).toBe('MATERIAL');
+    expect(blueprint.customerContext).toEqual({
+      enabled: true,
+      tableNumber: false,
+      serviceMode: false,
+      passenger: false,
+    });
+  });
+
   test('default grammar remains immutable to callers', () => {
     expect(Object.isFrozen(CATEGORY_OPTIONS.FOOD_BEVERAGE)).toBe(true);
     expect(Object.isFrozen(CATEGORY_OPTIONS.FOOD_BEVERAGE.navigationModes)).toBe(true);
