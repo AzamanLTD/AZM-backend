@@ -9,16 +9,17 @@ const {
 
 describe('Experience Blueprint category grammar', () => {
   test.each([
-    ['FOOD_BEVERAGE', 'CONTEXTUAL', 'DISH_DOSSIER', 'PAPER_RIP'],
-    ['RETAIL', 'AISLE_TRAVERSE', 'PRODUCT_DOSSIER', 'LIFT_INTO_TRAY'],
-    ['HOSPITALITY', 'FLOOR_TRAVERSE', 'ROOM_DOSSIER', 'MATERIAL'],
-    ['LOGISTICS', 'JOURNEY_TIMELINE', 'SEAT_DOSSIER', 'MATERIAL'],
-  ])('defaults stay inside the valid %s grammar', (category, navigation, detail, commit) => {
+    ['FOOD_BEVERAGE', 'CONTEXTUAL', 'DISH_DOSSIER', 'PAPER_RIP', true],
+    ['RETAIL', 'AISLE_TRAVERSE', 'PRODUCT_DOSSIER', 'LIFT_INTO_TRAY', true],
+    ['HOSPITALITY', 'FLOOR_TRAVERSE', 'ROOM_DOSSIER', 'MATERIAL', false],
+    ['LOGISTICS', 'JOURNEY_TIMELINE', 'SEAT_DOSSIER', 'MATERIAL', false],
+  ])('defaults stay inside the valid %s grammar', (category, navigation, detail, commit, persistentTray) => {
     const blueprint = defaultsForCategory(category);
 
     expect(blueprint.navigation.mode).toBe(navigation);
     expect(blueprint.detail.presentation).toBe(detail);
     expect(blueprint.commit.style).toBe(commit);
+    expect(blueprint.commit.persistentTray).toBe(persistentTray);
     expect(categoryOptions(category).navigationModes).toContain(blueprint.navigation.mode);
     expect(categoryOptions(category).detailPresentations).toContain(blueprint.detail.presentation);
     expect(categoryOptions(category).commitStyles).toContain(blueprint.commit.style);
@@ -55,6 +56,7 @@ describe('Experience Blueprint category grammar', () => {
     }, 'HOSPITALITY');
 
     expect(blueprint.commit.style).toBe('MATERIAL');
+    expect(blueprint.commit.persistentTray).toBe(false);
     expect(blueprint.customerContext.tableNumber).toBe(false);
     expect(blueprint.customerContext.passenger).toBe(false);
   });
@@ -64,12 +66,13 @@ describe('Experience Blueprint category grammar', () => {
       customerContext: { tableNumber: true, serviceMode: true, passenger: true },
     }, 'LOGISTICS');
 
+    expect(blueprint.commit.persistentTray).toBe(false);
     expect(blueprint.customerContext.tableNumber).toBe(false);
     expect(blueprint.customerContext.serviceMode).toBe(false);
     expect(blueprint.customerContext.passenger).toBe(true);
   });
 
-  test('normalization is case-insensitive for category keys', () => {
+  test('normalization is case-insensitive and trims category keys', () => {
     expect(defaultsForCategory(' retail ').preset).toBe(defaultsForCategory('RETAIL').preset);
     expect(categoryOptions('hospitality')).toEqual(categoryOptions('HOSPITALITY'));
   });
@@ -85,6 +88,7 @@ describe('Experience Blueprint category grammar', () => {
     expect(blueprint.navigation.mode).toBe('CONTEXTUAL');
     expect(blueprint.detail.presentation).toBe('SERVICE_DOSSIER');
     expect(blueprint.commit.style).toBe('MATERIAL');
+    expect(blueprint.commit.persistentTray).toBe(false);
     expect(blueprint.customerContext).toEqual({
       enabled: true,
       tableNumber: false,
