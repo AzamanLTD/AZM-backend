@@ -55,6 +55,6 @@ describe('storefront product configuration', () => {
   test('calculates authoritative configured price and normalized snapshot', () => {
     const selection = { size: 'Large', Sauce: 'Pepper', Extras: 'Egg, Plantain' };
     expect(configuredUnitPrice(product, selection)).toBe(20.5);
-    expect(normalizedSelection(product, selection)).toEqual({ size: 'Large', Sauce: ['Pepper'], Extras: ['Egg', 'Plantain'] });
+    expect(normalizedSelection(product, selection)).toEqual({ Size: 'Large', Sauce: ['Pepper'], Extras: ['Egg', 'Plantain'] });
   });
 });
