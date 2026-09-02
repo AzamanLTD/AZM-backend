@@ -555,11 +555,11 @@ describeIf('Business OS — Hotel Operations', () => {
         const { HotelOpsService } = require('../services/businessOS/hotelOpsService');
         const svc = new HotelOpsService(prisma);
 
-        const updated = await svc.updateRoomStatus(testRoom.id, 'MAINTENANCE', 'AC repair needed');
+        const updated = await svc.updateRoomStatus(testRoom.id, 'MAINTENANCE', 'AC repair needed', businessProfile.id);
         expect(updated.status).toBe('MAINTENANCE');
 
         // Restore
-        await svc.updateRoomStatus(testRoom.id, 'AVAILABLE', null);
+        await svc.updateRoomStatus(testRoom.id, 'AVAILABLE', null, businessProfile.id);
     });
 
     test('should generate housekeeping task and assign it', async () => {
@@ -588,22 +588,22 @@ describeIf('Business OS — Hotel Operations', () => {
             },
         });
 
-        const task = await svc.generateHousekeepingTask(reservation.id);
+        const task = await svc.generateHousekeepingTask(reservation.id, businessProfile.id);
         expect(task).toBeTruthy();
         expect(task.status).toBe('PENDING');
         expect(task.checklistItems.length).toBeGreaterThan(0);
 
         // Assign to housekeeper
-        const assigned = await svc.assignHousekeepingTask(task.id, testEmployee.id);
+        const assigned = await svc.assignHousekeepingTask(task.id, testEmployee.id, businessProfile.id);
         expect(assigned.status).toBe('IN_PROGRESS');
 
         // Update checklist
-        const checklistUpdated = await svc.updateChecklist(task.id, 0, true);
+        const checklistUpdated = await svc.updateChecklist(task.id, 0, true, businessProfile.id);
         const checklistItem = checklistUpdated.checklistItems[0];
         expect(checklistItem.done).toBe(true);
 
         // Complete task
-        const completed = await svc.completeHousekeeping(task.id, { notes: 'All clean' });
+        const completed = await svc.completeHousekeeping(task.id, { notes: 'All clean' }, businessProfile.id);
         expect(completed.status).toBe('COMPLETED');
 
         // Verify room is available again
