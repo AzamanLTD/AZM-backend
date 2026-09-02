@@ -6,7 +6,7 @@ const {
     validateConfiguredProduct,
     configuredUnitPrice,
     normalizedSelection,
-} = require('../storefrontProductConfigurationService');
+} = require('../services/storefrontProductConfigurationService');
 
 const selectionLabel = (selection) => {
     const entries = Object.entries(selection || {});
@@ -75,7 +75,6 @@ class DineInService {
         const tab = await this.prisma.dineInTab.findUnique({ where: { id: tabId }, include: { items: true } });
         if (!tab) throw new Error('Tab not found.');
         if (tab.status !== 'OPEN') throw new Error('Tab is not OPEN.');
-        if (!tab.items.length) throw new Error('Cannot finalize an empty dine-in tab.');
         const total = tab.items.reduce((sum, item) => sum + Number(item.unitPriceUsdc) * item.quantity, 0);
         const finalized = await this.prisma.dineInTab.update({ where: { id: tabId }, data: { status: 'FINALIZED', closedAt: new Date(), grandTotalUsdc: total, subtotalUsdc: total }, include: { items: true } });
         this.io?.to(`user_${tab.customerId}`).emit('dine_in_tab_finalized', { tabId, totalAmount: finalized.grandTotalUsdc, items: finalized.items });
@@ -90,7 +89,7 @@ class DineInService {
 
         let invoice = tab.invoice;
         if (invoice?.status === 'PAID') {
-            return { tab, invoice, payment: { invoice, customerPays: Number(invoice.billTotalUsdc), businessReceives: null, fee: null, idempotent: true } };
+            return { tab, invoice, payment: { invoice, customerPays: Number(invoice.customerPaidUsdc), businessReceives: null, fee: null, idempotent: true } };
         }
         if (!invoice) {
             if (!tab.items.length) throw new Error('Cannot pay an empty dine-in tab.');
@@ -111,7 +110,8 @@ class DineInService {
 
         const payment = await invoiceService.payInvoice(this.prisma, { invoiceId: invoice.id, customerId, tipUsdc });
         const tip = Math.max(0, Number(tipUsdc) || 0);
-        const grandTotal = Number(invoice.billTotalUsdc) + tip;
+        const billTotal = Number(payment.invoice?.billTotalUsdc ?? invoice.billTotalUsdc);
+        const grandTotal = billTotal + tip;
         const closed = await this.prisma.dineInTab.update({ where: { id: tabId }, data: { status: 'CLOSED', closedAt: new Date(), tipUsdc: tip, grandTotalUsdc: grandTotal, paymentMethod: 'AZAMAN_BALANCE' }, include: { items: true, invoice: true } });
         this.io?.to(`user_${customerId}`).emit('dine_in_tab_paid', { tabId, invoiceId: invoice.id, customerPays: payment.customerPays, businessReceives: payment.businessReceives, fee: payment.fee });
         return { tab: closed, invoice: payment.invoice, payment };
@@ -120,7 +120,7 @@ class DineInService {
     async confirmTab(tabId, customerId) {
         const tab = await this.prisma.dineInTab.findUnique({ where: { id: tabId } });
         if (!tab) throw new Error('Tab not found.');
-        if (tab.customerId !== customerId) throw new Error('Not authorized to confirm this tab.');
+        if (tab.customerId !== customerId) throw new Error('Not authorized.');
         if (tab.status !== 'FINALIZED') throw new Error('Tab must be FINALIZED before confirmation.');
         return this.prisma.dineInTab.update({ where: { id: tabId }, data: { status: 'CLOSED', closedAt: new Date() }, include: { items: true } });
     }
