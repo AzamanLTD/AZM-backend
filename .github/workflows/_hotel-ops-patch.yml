@@ -1,0 +1,178 @@
+name: Hotel ops surgical patch
+on:
+  push:
+    branches: [fix/hotel-ops-business-scope-clean]
+permissions:
+  contents: write
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: Apply hotel scope hardening
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          def replace(p, old, new, label):
+              s = p.read_text()
+              if old not in s:
+                  raise SystemExit(f'{label}: source pattern not found')
+              p.write_text(s.replace(old, new, 1))
+
+          service = Path('services/businessOS/hotelOpsService.js')
+          replace(service,
+              "async updateRoomStatus(roomId, status, notes) {\n        const room = await this.prisma.hotelRoom.findUnique({ where: { id: roomId } });",
+              "async updateRoomStatus(roomId, status, notes, businessProfileId) {\n        if (!businessProfileId) throw new Error('Business profile context is required.');\n        const room = await this.prisma.hotelRoom.findFirst({ where: { id: roomId, businessProfileId }, select: { id: true } });",
+              'updateRoomStatus')
+
+          replace(service,
+              "async generateHousekeepingTask(reservationId) {\n        const reservation = await this.prisma.reservation.findUnique({\n            where: { id: reservationId },\n            include: { businessProfile: true },\n        });",
+              "async generateHousekeepingTask(reservationId, businessProfileId) {\n        if (!businessProfileId) throw new Error('Business profile context is required.');\n        const reservation = await this.prisma.reservation.findFirst({\n            where: { id: reservationId, businessProfileId },\n            include: { businessProfile: true },\n        });",
+              'generateHousekeepingTask signature')
+          replace(service,
+              "        // Check if there's already a pending task for this room\n        const existing = await this.prisma.hotelHousekeepingTask.findFirst({\n            where: {\n                roomId: reservation.serviceItemId,\n                status: { in: ['PENDING', 'IN_PROGRESS'] },\n            },\n        });",
+              "        const room = await this.prisma.hotelRoom.findFirst({\n            where: { id: reservation.serviceItemId, businessProfileId },\n            select: { id: true },\n        });\n        if (!room) throw new Error('Reservation room not found for this business.');\n\n        // Check if there's already a pending task for this room\n        const existing = await this.prisma.hotelHousekeepingTask.findFirst({\n            where: {\n                roomId: reservation.serviceItemId,\n                businessProfileId,\n                status: { in: ['PENDING', 'IN_PROGRESS'] },\n            },\n        });",
+              'generateHousekeepingTask room scope')
+          replace(service,
+              "                businessProfileId: reservation.businessProfileId,",
+              "                businessProfileId,",
+              'generateHousekeepingTask create scope')
+          replace(service,
+              "        await this.prisma.hotelRoom.update({\n            where: { id: reservation.serviceItemId },",
+              "        await this.prisma.hotelRoom.update({\n            where: { id: room.id },",
+              'generateHousekeepingTask room update')
+
+          replace(service,
+              "    async assignHousekeepingTask(taskId, employeeId) {\n        const employee = await this.prisma.businessEmployee.findUnique({\n            where: { id: employeeId },\n        });",
+              "    async assignHousekeepingTask(taskId, employeeId, businessProfileId) {\n        if (!businessProfileId) throw new Error('Business profile context is required.');\n        const employee = await this.prisma.businessEmployee.findFirst({\n            where: { id: employeeId, businessProfileId },\n        });",
+              'assignHousekeepingTask')
+          replace(service,
+              "        return this.prisma.hotelHousekeepingTask.update({\n            where: { id: taskId },",
+              "        const task = await this.prisma.hotelHousekeepingTask.findFirst({\n            where: { id: taskId, businessProfileId },\n            select: { id: true },\n        });\n        if (!task) throw new Error('Task not found.');\n\n        return this.prisma.hotelHousekeepingTask.update({\n            where: { id: taskId },",
+              'assignHousekeepingTask task scope')
+
+          replace(service,
+              "    async updateChecklist(taskId, itemIndex, done) {\n        const task = await this.prisma.hotelHousekeepingTask.findUnique({\n            where: { id: taskId },\n        });",
+              "    async updateChecklist(taskId, itemIndex, done, businessProfileId) {\n        if (!businessProfileId) throw new Error('Business profile context is required.');\n        const task = await this.prisma.hotelHousekeepingTask.findFirst({\n            where: { id: taskId, businessProfileId },\n        });",
+              'updateChecklist')
+
+          replace(service,
+              "    async completeHousekeeping(taskId, { photoProofUrl, notes }) {\n        const task = await this.prisma.hotelHousekeepingTask.findUnique({\n            where: { id: taskId },\n        });",
+              "    async completeHousekeeping(taskId, { photoProofUrl, notes }, businessProfileId) {\n        if (!businessProfileId) throw new Error('Business profile context is required.');\n        const task = await this.prisma.hotelHousekeepingTask.findFirst({\n            where: { id: taskId, businessProfileId },\n        });",
+              'completeHousekeeping')
+          replace(service,
+              "        const updated = await this.prisma.hotelHousekeepingTask.update({",
+              "        const room = await this.prisma.hotelRoom.findFirst({ where: { id: task.roomId, businessProfileId }, select: { id: true } });\n        if (!room) throw new Error('Task room not found for this business.');\n\n        const updated = await this.prisma.hotelHousekeepingTask.update({",
+              'completeHousekeeping room scope')
+          replace(service,
+              "        await this.prisma.hotelRoom.update({\n            where: { id: task.roomId },",
+              "        await this.prisma.hotelRoom.update({\n            where: { id: room.id },",
+              'completeHousekeeping room update')
+
+          replace(service,
+              "    async inspectHousekeeping(taskId, { passed, inspectorId, notes }) {\n        const task = await this.prisma.hotelHousekeepingTask.findUnique({\n            where: { id: taskId },\n        });",
+              "    async inspectHousekeeping(taskId, { passed, inspectorId, notes }, businessProfileId) {\n        if (!businessProfileId) throw new Error('Business profile context is required.');\n        const task = await this.prisma.hotelHousekeepingTask.findFirst({\n            where: { id: taskId, businessProfileId },\n        });",
+              'inspectHousekeeping')
+
+          replace(service,
+              "HotelOpsService.prototype.deleteRateOverride = async function(overrideId) {\n    return this.prisma.hotelRateOverride.delete({ where: { id: overrideId } });\n};",
+              "HotelOpsService.prototype.deleteRateOverride = async function(overrideId, businessProfileId) {\n    if (!businessProfileId) throw new Error('Business profile context is required.');\n    const existing = await this.prisma.hotelRateOverride.findFirst({ where: { id: overrideId, businessProfileId }, select: { id: true } });\n    if (!existing) throw new Error('Rate override not found.');\n    return this.prisma.hotelRateOverride.delete({ where: { id: overrideId } });\n};",
+              'deleteRateOverride')
+
+          replace(service,
+              "HotelOpsService.prototype.blockRoom = async function(roomId, { startDate, endDate, reason }) {\n    return this.prisma.hotelRoomBlock.create({",
+              "HotelOpsService.prototype.blockRoom = async function(roomId, { startDate, endDate, reason }, businessProfileId) {\n    if (!businessProfileId) throw new Error('Business profile context is required.');\n    const room = await this.prisma.hotelRoom.findFirst({ where: { id: roomId, businessProfileId }, select: { id: true } });\n    if (!room) throw new Error('Room not found.');\n    return this.prisma.hotelRoomBlock.create({",
+              'blockRoom')
+
+          replace(service,
+              "HotelOpsService.prototype.deleteRoomBlock = async function(blockId) {\n    return this.prisma.hotelRoomBlock.delete({ where: { id: blockId } });\n};",
+              "HotelOpsService.prototype.deleteRoomBlock = async function(blockId, businessProfileId) {\n    if (!businessProfileId) throw new Error('Business profile context is required.');\n    const block = await this.prisma.hotelRoomBlock.findFirst({ where: { id: blockId, room: { businessProfileId } }, select: { id: true } });\n    if (!block) throw new Error('Room block not found.');\n    return this.prisma.hotelRoomBlock.delete({ where: { id: blockId } });\n};",
+              'deleteRoomBlock')
+
+          replace(service,
+              "HotelOpsService.prototype.createWalkIn = async function(businessProfileId, { guestName, phone, roomId, nights, depositUsdc, notes }) {\n    const room = await this.prisma.hotelRoom.findUnique({ where: { id: roomId } });",
+              "HotelOpsService.prototype.createWalkIn = async function(businessProfileId, { customerId, phone, roomId, nights, depositUsdc, notes }) {\n    if (!businessProfileId) throw new Error('Business profile context is required.');\n    if (!customerId) throw new Error('A registered Azaman customer is required for a walk-in booking.');\n    const [room, customer] = await Promise.all([\n        this.prisma.hotelRoom.findFirst({ where: { id: roomId, businessProfileId } }),\n        this.prisma.user.findUnique({ where: { id: customerId }, select: { id: true } }),\n    ]);",
+              'createWalkIn ownership')
+          replace(service,
+              "    if (!room) throw new Error('Room not found');\n    if (room.status !== 'AVAILABLE') throw new Error('Room is not available');",
+              "    if (!room) throw new Error('Room not found');\n    if (!customer) throw new Error('Customer not found.');\n    if (room.status !== 'AVAILABLE') throw new Error('Room is not available');",
+              'createWalkIn validation')
+          replace(service,
+              "            customerName: guestName,",
+              "            customerId,",
+              'createWalkIn customer')
+          replace(service,
+              "            amountUsdc: room.basePriceUsdc * (parseInt(nights) || 1),",
+              "            amountUsdc: Number(room.basePriceUsdc) * Math.max(1, parseInt(nights) || 1),",
+              'createWalkIn amount')
+
+          replace(service,
+              "HotelOpsService.prototype.moveRoom = async function(reservationId, { newRoomId, reason }) {\n    const reservation = await this.prisma.reservation.findUnique({ where: { id: reservationId } });",
+              "HotelOpsService.prototype.moveRoom = async function(reservationId, { newRoomId, reason }, businessProfileId) {\n    if (!businessProfileId) throw new Error('Business profile context is required.');\n    const reservation = await this.prisma.reservation.findFirst({ where: { id: reservationId, businessProfileId } });",
+              'moveRoom ownership')
+          replace(service,
+              "    const newRoom = await this.prisma.hotelRoom.findUnique({ where: { id: newRoomId } });",
+              "    const newRoom = await this.prisma.hotelRoom.findFirst({ where: { id: newRoomId, businessProfileId } });",
+              'moveRoom target scope')
+          replace(service,
+              "    await Promise.all([\n        this.prisma.reservation.update({ where: { id: reservationId }, data: { serviceItemId: newRoomId, metadata: { ...reservation.metadata, movedFrom: oldRoomId, moveReason: reason } } }),\n        oldRoomId ? this.prisma.hotelRoom.update({ where: { id: oldRoomId }, data: { status: 'DIRTY', currentReservationId: null } }) : Promise.resolve(),\n        this.prisma.hotelRoom.update({ where: { id: newRoomId }, data: { status: 'OCCUPIED', currentReservationId: reservationId, checkedInAt: reservation.checkedInAt || new Date() } }),\n    ]);\n\n    return { ok: true };",
+              "    return this.prisma.$transaction(async (tx) => {\n        const updatedReservation = await tx.reservation.update({\n            where: { id: reservationId },\n            data: { serviceItemId: newRoomId, metadata: { ...(reservation.metadata || {}), movedFrom: oldRoomId, moveReason: reason } },\n        });\n        if (oldRoomId) {\n            const oldRoom = await tx.hotelRoom.findFirst({ where: { id: oldRoomId, businessProfileId }, select: { id: true } });\n            if (!oldRoom) throw new Error('Current room not found for this business.');\n            await tx.hotelRoom.update({ where: { id: oldRoom.id }, data: { status: 'DIRTY', currentReservationId: null } });\n        }\n        await tx.hotelRoom.update({ where: { id: newRoom.id }, data: { status: 'OCCUPIED', currentReservationId: reservationId, checkedInAt: reservation.checkedInAt || new Date(), checkoutDueAt: reservation.endDatetime } });\n        return { ok: true, reservation: updatedReservation };\n    });",
+              'moveRoom atomic')
+
+          routes = Path('routes/businessOSRoutes.js')
+          for old, new, label in [
+              ("const svc = getServices(req);\n    const room = await svc.hotelOpsService.updateRoomStatus(req.params.id, req.body.status, req.body.notes);", "const svc = getServices(req);\n    const bpId = await getBusinessProfileId(req);\n    const room = await svc.hotelOpsService.updateRoomStatus(req.params.id, req.body.status, req.body.notes, bpId);", 'room status route'),
+              ("const svc = getServices(req);\n    const task = await svc.hotelOpsService.assignHousekeepingTask(req.params.id, req.body.employeeId);", "const svc = getServices(req);\n    const bpId = await getBusinessProfileId(req);\n    const task = await svc.hotelOpsService.assignHousekeepingTask(req.params.id, req.body.employeeId, bpId);", 'assign route'),
+              ("const svc = getServices(req);\n    const task = await svc.hotelOpsService.updateChecklist(req.params.id, req.body.itemIndex, req.body.done);", "const svc = getServices(req);\n    const bpId = await getBusinessProfileId(req);\n    const task = await svc.hotelOpsService.updateChecklist(req.params.id, req.body.itemIndex, req.body.done, bpId);", 'checklist route'),
+              ("const svc = getServices(req);\n    const task = await svc.hotelOpsService.completeHousekeeping(req.params.id, req.body);", "const svc = getServices(req);\n    const bpId = await getBusinessProfileId(req);\n    const task = await svc.hotelOpsService.completeHousekeeping(req.params.id, req.body, bpId);", 'complete route'),
+              ("const svc = getServices(req);\n    const task = await svc.hotelOpsService.inspectHousekeeping(req.params.id, req.body);", "const svc = getServices(req);\n    const bpId = await getBusinessProfileId(req);\n    const task = await svc.hotelOpsService.inspectHousekeeping(req.params.id, req.body, bpId);", 'inspect route'),
+              ("router.get('/hotel/rate-calendar', wrap(async (req, res) => {\n    const bpId = req.businessProfileId;", "router.get('/hotel/rate-calendar', wrap(async (req, res) => {\n    const svc = getServices(req);\n    const bpId = await getBusinessProfileId(req);", 'rate get route'),
+              ("router.post('/hotel/rate-calendar', wrap(async (req, res) => {\n    const bpId = req.businessProfileId;", "router.post('/hotel/rate-calendar', wrap(async (req, res) => {\n    const svc = getServices(req);\n    const bpId = await getBusinessProfileId(req);", 'rate post route'),
+              ("router.delete('/hotel/rate-calendar/:id', wrap(async (req, res) => {\n    await svc.hotelOpsService.deleteRateOverride(req.params.id);", "router.delete('/hotel/rate-calendar/:id', wrap(async (req, res) => {\n    const svc = getServices(req);\n    const bpId = await getBusinessProfileId(req);\n    await svc.hotelOpsService.deleteRateOverride(req.params.id, bpId);", 'rate delete route'),
+              ("router.post('/hotel/rooms/:id/block', wrap(async (req, res) => {\n    const block = await svc.hotelOpsService.blockRoom(req.params.id, req.body);", "router.post('/hotel/rooms/:id/block', wrap(async (req, res) => {\n    const svc = getServices(req);\n    const bpId = await getBusinessProfileId(req);\n    const block = await svc.hotelOpsService.blockRoom(req.params.id, req.body, bpId);", 'block route'),
+              ("router.delete('/hotel/rooms/block/:blockId', wrap(async (req, res) => {\n    await svc.hotelOpsService.deleteRoomBlock(req.params.blockId);", "router.delete('/hotel/rooms/block/:blockId', wrap(async (req, res) => {\n    const svc = getServices(req);\n    const bpId = await getBusinessProfileId(req);\n    await svc.hotelOpsService.deleteRoomBlock(req.params.blockId, bpId);", 'delete block route'),
+              ("router.patch('/hotel/rooms/:id', wrap(async (req, res) => {\n    const room = await svc.hotelOpsService.updateRoom(req.params.id, req.body);", "router.patch('/hotel/rooms/:id', wrap(async (req, res) => {\n    const svc = getServices(req);\n    const bpId = await getBusinessProfileId(req);\n    const room = await svc.hotelOpsService.updateRoom(req.params.id, req.body, bpId);", 'room update route'),
+              ("router.post('/hotel/rooms/bulk', wrap(async (req, res) => {\n    const bpId = req.businessProfileId;", "router.post('/hotel/rooms/bulk', wrap(async (req, res) => {\n    const svc = getServices(req);\n    const bpId = await getBusinessProfileId(req);", 'bulk route'),
+              ("router.post('/hotel/front-desk/walk-in', wrap(async (req, res) => {\n    const bpId = req.businessProfileId;", "router.post('/hotel/front-desk/walk-in', wrap(async (req, res) => {\n    const svc = getServices(req);\n    const bpId = await getBusinessProfileId(req);", 'walkin route'),
+              ("router.post('/hotel/front-desk/:reservationId/move-room', wrap(async (req, res) => {\n    const result = await svc.hotelOpsService.moveRoom(req.params.reservationId, req.body);", "router.post('/hotel/front-desk/:reservationId/move-room', wrap(async (req, res) => {\n    const svc = getServices(req);\n    const bpId = await getBusinessProfileId(req);\n    const result = await svc.hotelOpsService.moveRoom(req.params.reservationId, req.body, bpId);", 'move route'),
+              ("router.post('/hotel/housekeeping', wrap(async (req, res) => {\n    const bpId = req.businessProfileId;", "router.post('/hotel/housekeeping', wrap(async (req, res) => {\n    const prisma = getPrisma(req);\n    const bpId = await getBusinessProfileId(req);", 'manual housekeeping route'),
+          ]:
+              replace(routes, old, new, label)
+
+          # Tighten manual housekeeping room ownership before create.
+          replace(routes,
+              "    const { roomId, taskType, priority, notes, checklistItems } = req.body;\n    const task = await svc.hotelOpsService.prisma.hotelHousekeepingTask.create({",
+              "    const { roomId, taskType, priority, notes, checklistItems } = req.body;\n    const room = await prisma.hotelRoom.findFirst({ where: { id: roomId, businessProfileId }, select: { id: true } });\n    if (!room) return res.status(404).json({ success: false, message: 'Room not found' });\n    const task = await prisma.hotelHousekeepingTask.create({",
+              'manual housekeeping ownership')
+
+          test = Path('__tests__/business-os.test.js')
+          s = test.read_text()
+          replacements = {
+              "const updated = await svc.updateRoomStatus(testRoom.id, 'MAINTENANCE', 'AC repair needed');": "const updated = await svc.updateRoomStatus(testRoom.id, 'MAINTENANCE', 'AC repair needed', businessProfile.id);",
+              "await svc.updateRoomStatus(testRoom.id, 'AVAILABLE', null);": "await svc.updateRoomStatus(testRoom.id, 'AVAILABLE', null, businessProfile.id);",
+              "const task = await svc.generateHousekeepingTask(reservation.id);": "const task = await svc.generateHousekeepingTask(reservation.id, businessProfile.id);",
+              "const assigned = await svc.assignHousekeepingTask(task.id, testEmployee.id);": "const assigned = await svc.assignHousekeepingTask(task.id, testEmployee.id, businessProfile.id);",
+              "const checklistUpdated = await svc.updateChecklist(task.id, 0, true);": "const checklistUpdated = await svc.updateChecklist(task.id, 0, true, businessProfile.id);",
+              "const completed = await svc.completeHousekeeping(task.id, { notes: 'All clean' });": "const completed = await svc.completeHousekeeping(task.id, { notes: 'All clean' }, businessProfile.id);",
+          }
+          for a,b in replacements.items():
+              if a in s:
+                  s = s.replace(a,b,1)
+              else:
+                  raise SystemExit(f'test pattern missing: {a}')
+          test.write_text(s)
+
+          # Self-delete this temporary workflow in the same commit.
+          self_path = Path('.github/workflows/_hotel-ops-patch.yml')
+          self_path.unlink()
+
+          import subprocess
+          subprocess.run(['git','config','user.name','azaman-ci'], check=True)
+          subprocess.run(['git','config','user.email','azaman-ci@users.noreply.github.com'], check=True)
+          subprocess.run(['git','add','services/businessOS/hotelOpsService.js','routes/businessOSRoutes.js','__tests__/business-os.test.js','.github/workflows/_hotel-ops-patch.yml'], check=True)
+          subprocess.run(['git','commit','-m','fix(hotel): enforce business-scoped hotel operations'], check=True)
+          subprocess.run(['git','push','origin','HEAD:fix/hotel-ops-business-scope-clean'], check=True)
+          PY
