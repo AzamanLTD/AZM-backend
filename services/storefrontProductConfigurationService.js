@@ -131,7 +131,7 @@ function normalizedSelection(product, selected) {
   for (const group of normalizeVariantGroups(product.variants)) {
     const isSizeGroup = group.name.toLowerCase() === 'size';
     const chosen = selectionNames(input[group.name] ?? (isSizeGroup ? input.size : input.variant));
-    if (chosen.length) result[isSizeGroup ? 'size' : group.name] = chosen[0];
+    if (chosen.length) result[group.name] = chosen[0];
   }
   for (const group of normalizeModifierGroups(product.modifierGroups)) {
     const chosen = [...new Set(selectionNames(input[group.name]))].sort();
