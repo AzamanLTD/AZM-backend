@@ -1,75 +1,82 @@
 const logger = require('../src/config/logger');
 const dineInTabService = require('../services/dineInTabService');
 
+const serviceOptions = (req, extra = {}) => ({
+    ...extra,
+    io: req.app && typeof req.app.get === 'function'
+        ? (req.app.get('socketio') || req.app.get('io'))
+        : undefined,
+});
+
 exports.openTab = async (req, res) => {
     try {
-        const result = await dineInTabService.openTab(req.prisma, {
+        const result = await dineInTabService.openTab(req.prisma, serviceOptions(req, {
             businessProfileId: req.body.businessProfileId,
             userId: req.user.id,
             customerAzamanId: req.body.customerAzamanId,
             locationId: req.body.locationId,
             tableId: req.body.tableId,
-        });
+        }));
         res.status(201).json(result);
     } catch (err) { res.status(400).json({ success: false, message: err.message }); }
 };
 
 exports.addItem = async (req, res) => {
     try {
-        const result = await dineInTabService.addItem(req.prisma, {
+        const result = await dineInTabService.addItem(req.prisma, serviceOptions(req, {
             tabId: req.params.tabId,
             userId: req.user.id,
             productId: req.body.productId,
             name: req.body.name,
             unitPriceUsdc: req.body.unitPriceUsdc,
             quantity: req.body.quantity,
-        });
+        }));
         res.json(result);
     } catch (err) { res.status(400).json({ success: false, message: err.message }); }
 };
 
 exports.addCustomerItem = async (req, res) => {
     try {
-        const result = await dineInTabService.addCustomerItem(req.prisma, {
+        const result = await dineInTabService.addCustomerItem(req.prisma, serviceOptions(req, {
             tabId: req.params.tabId,
             customerId: req.user.id,
             productId: req.body.productId,
             selection: req.body.selection ?? req.body.variants ?? {},
             quantity: req.body.quantity,
-        });
+        }));
         res.status(201).json({ success: true, item: result });
     } catch (err) { res.status(err.status || 400).json({ success: false, message: err.message }); }
 };
 
 exports.finalizeTab = async (req, res) => {
     try {
-        const result = await dineInTabService.finalizeTab(req.prisma, {
+        const result = await dineInTabService.finalizeTab(req.prisma, serviceOptions(req, {
             tabId: req.params.tabId,
             userId: req.user.id,
             taxRatePct: req.body.taxRatePct,
             tipUsdc: req.body.tipUsdc,
-        });
+        }));
         res.json(result);
     } catch (err) { res.status(400).json({ success: false, message: err.message }); }
 };
 
 exports.confirmAndPay = async (req, res) => {
     try {
-        const result = await dineInTabService.confirmAndPay(req.prisma, {
+        const result = await dineInTabService.confirmAndPay(req.prisma, serviceOptions(req, {
             tabId: req.params.tabId,
             customerId: req.user.id,
             tipUsdc: req.body.tipUsdc,
-        });
+        }));
         res.json({ success: true, ...result });
     } catch (err) { res.status(400).json({ success: false, message: err.message }); }
 };
 
 exports.getTab = async (req, res) => {
     try {
-        const tab = await dineInTabService.getTab(req.prisma, {
+        const tab = await dineInTabService.getTab(req.prisma, serviceOptions(req, {
             tabId: req.params.tabId,
             customerId: req.user.id,
-        });
+        }));
         const prisma = req.prisma || req.app.get('prisma');
         const table = tab?.tableId
             ? await prisma.businessTable.findUnique({
@@ -92,22 +99,22 @@ exports.getTab = async (req, res) => {
 
 exports.getOpenTabs = async (req, res) => {
     try {
-        const tabs = await dineInTabService.getOpenTabs(req.prisma, {
+        const tabs = await dineInTabService.getOpenTabs(req.prisma, serviceOptions(req, {
             businessProfileId: req.query.businessProfileId,
             userId: req.user.id,
             status: req.query.status,
-        });
+        }));
         res.json({ success: true, tabs });
     } catch (err) { res.status(400).json({ success: false, message: err.message }); }
 };
 
 exports.reportDefault = async (req, res) => {
     try {
-        const result = await dineInTabService.reportDefault(req.prisma, {
+        const result = await dineInTabService.reportDefault(req.prisma, serviceOptions(req, {
             tabId: req.params.tabId,
             userId: req.user.id,
             reason: req.body.reason,
-        });
+        }));
         res.json(result);
     } catch (err) { res.status(400).json({ success: false, message: err.message }); }
 };
@@ -153,3 +160,5 @@ exports.searchGuests = async (req, res) => {
         res.json({ success: true, guests });
     } catch (err) { res.status(500).json({ success: false, message: err.message }); }
 };
+
+module.exports.serviceOptions = serviceOptions;
