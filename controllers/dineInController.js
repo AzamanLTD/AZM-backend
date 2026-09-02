@@ -64,9 +64,15 @@ exports.getTab = async (req, res) => {
                 select: { id: true, label: true, locationId: true, isActive: true },
             })
             : null;
+        const business = tab?.businessProfile?.id
+            ? await prisma.businessProfile.findUnique({
+                where: { id: tab.businessProfile.id },
+                select: { id: true, bizId: true, businessName: true, logoUrl: true },
+            })
+            : tab?.businessProfile;
         res.json({
             success: true,
-            tab: tab ? { ...tab, table } : tab,
+            tab: tab ? { ...tab, table, businessProfile: business } : tab,
         });
     } catch (err) { res.status(400).json({ success: false, message: err.message }); }
 };
