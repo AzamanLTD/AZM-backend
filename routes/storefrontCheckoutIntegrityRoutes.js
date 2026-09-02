@@ -5,6 +5,11 @@ const { Prisma } = require('@prisma/client');
 const router = require('express').Router();
 const { protect } = require('../middleware/authMiddleware');
 const { protectActive } = require('../middleware/banGuardMiddleware');
+const {
+  validateConfiguredProduct,
+  configuredUnitPrice,
+  normalizedSelection,
+} = require('../services/storefrontProductConfigurationService');
 
 const ORDER_STATUSES = new Set([
   'AWAITING_PAYMENT', 'PAID', 'DELIVERED', 'COMPLETED', 'DISPUTED', 'REFUNDED', 'CANCELLED',
@@ -22,47 +27,6 @@ function sha256(value) {
 
 function scopedIdempotencyKey(businessProfileId, userId, clientKey) {
   return `v1:${businessProfileId}:${userId}:${sha256(String(clientKey)).slice(0, 48)}`;
-}
-
-function normalizeVariantOptions(raw) {
-  if (!Array.isArray(raw)) return [];
-  return raw.map(option => {
-    if (option && typeof option === 'object') {
-      return String(option.label ?? option.value ?? option.name ?? '').trim();
-    }
-    return String(option ?? '').trim();
-  }).filter(Boolean);
-}
-
-function validateVariants(product, selected) {
-  const definition = product.variants;
-  const selection = selected == null ? {} : selected;
-  if (!selection || Array.isArray(selection) || typeof selection !== 'object') {
-    return 'variants must be an object keyed by option group.';
-  }
-
-  const groups = definition && typeof definition === 'object' && !Array.isArray(definition)
-    ? definition
-    : {};
-  const groupNames = Object.keys(groups);
-  const selectedNames = Object.keys(selection);
-
-  for (const group of selectedNames) {
-    if (!Object.prototype.hasOwnProperty.call(groups, group)) {
-      return `Unknown variant option group: ${group}.`;
-    }
-  }
-  for (const group of groupNames) {
-    const value = selection[group];
-    if (value == null || String(value).trim() === '') {
-      return `Variant option ${group} must be selected.`;
-    }
-    const allowed = normalizeVariantOptions(groups[group]);
-    if (allowed.length > 0 && !allowed.includes(String(value))) {
-      return `Invalid value for variant option ${group}.`;
-    }
-  }
-  return null;
 }
 
 function checkoutFingerprint(body) {
@@ -142,13 +106,93 @@ function encodeCursor(order) {
 }
 
 function persistenceFailure(res, originalStatus, originalJson, logger, err) {
-  logger?.error?.({ err }, 'Retail checkout confirmation metadata persistence failed');
+  logger?.error?.({ err }, 'Storefront checkout configuration persistence failed');
   originalStatus(503);
   return originalJson({
     success: false,
-    message: 'Checkout completed but confirmation data could not be finalized. Please retry safely.',
+    message: 'Checkout completed but configuration data could not be finalized. Please retry safely.',
     retryable: true,
   });
+}
+
+async function finalizeConfiguredCheckout(prisma, order, preparedItems, paymentMode, logger) {
+  if (!order?.id || !Array.isArray(preparedItems) || preparedItems.length === 0) return order;
+
+  const currentItems = Array.isArray(order.items) ? order.items : [];
+  const configuredTotals = preparedItems.reduce((sum, item) => sum + item.unitPrice * item.quantity, 0);
+  const baseTotals = currentItems.reduce((sum, item) => sum + Number(item.unitPrice || 0) * Number(item.quantity || 0), 0);
+  const revenueAdjustments = new Map();
+
+  const updated = await prisma.$transaction(async tx => {
+    for (let index = 0; index < currentItems.length && index < preparedItems.length; index += 1) {
+      const returnedItem = currentItems[index];
+      const prepared = preparedItems[index];
+      const lineTotal = Number((prepared.unitPrice * prepared.quantity).toFixed(6));
+      const baseLineTotal = Number((Number(returnedItem.unitPrice || 0) * Number(returnedItem.quantity || 0)).toFixed(6));
+      const delta = Number((lineTotal - baseLineTotal).toFixed(6));
+      if (delta !== 0) revenueAdjustments.set(prepared.productId, (revenueAdjustments.get(prepared.productId) || 0) + delta);
+
+      await tx.$executeRaw`
+        UPDATE "BusinessOrderItem"
+        SET "unitPrice" = ${prepared.unitPrice},
+            "lineTotal" = ${lineTotal},
+            variants = ${JSON.stringify(prepared.selection)}::jsonb
+        WHERE id = ${returnedItem.id}
+          AND "orderId" = ${order.id}
+      `;
+
+      returnedItem.unitPrice = prepared.unitPrice;
+      returnedItem.lineTotal = lineTotal;
+      returnedItem.variants = prepared.selection;
+    }
+
+    const authoritativeTotal = Number(configuredTotals.toFixed(6));
+    await tx.$executeRaw`
+      UPDATE "BusinessOrder"
+      SET "amountUsdc" = ${authoritativeTotal}
+      WHERE id = ${order.id}
+    `;
+    order.amountUsdc = authoritativeTotal;
+
+    for (const [productId, delta] of revenueAdjustments.entries()) {
+      await tx.businessProduct.updateMany({
+        where: { id: productId },
+        data: { totalRevenue: { increment: delta } },
+      });
+    }
+
+    if (String(paymentMode || 'DIRECT').toUpperCase() === 'ESCROW') {
+      let feePct = null;
+      const settings = await tx.globalSettings.findUnique({ where: { id: 1 }, select: { smartEscrowFeePct: true } });
+      if (settings?.smartEscrowFeePct != null) feePct = Number(settings.smartEscrowFeePct);
+      if (!Number.isFinite(feePct)) feePct = 0.01;
+      const feeUsdc = Number((authoritativeTotal * feePct).toFixed(6));
+      if (order.escrow?.id) {
+        await tx.$executeRaw`
+          UPDATE "SmartEscrow"
+          SET "amountUsdc" = ${authoritativeTotal},
+              "feeUsdc" = ${feeUsdc}
+          WHERE id = ${order.escrow.id}
+        `;
+        order.escrow.amountUsdc = authoritativeTotal;
+        order.escrow.feeUsdc = feeUsdc;
+      }
+      if (order.ticketId) {
+        await tx.$executeRaw`
+          UPDATE "Ticket"
+          SET "targetAmount" = ${authoritativeTotal}
+          WHERE id = ${order.ticketId}
+        `;
+      }
+    }
+
+    return order;
+  });
+
+  if (configuredTotals !== baseTotals) {
+    logger?.info?.({ orderId: updated.id, baseTotals, configuredTotals }, 'Storefront checkout amount reconciled from authoritative product configuration');
+  }
+  return updated;
 }
 
 router.post('/:businessProfileId/checkout', protect, protectActive, async (req, res, next) => {
@@ -172,23 +216,31 @@ router.post('/:businessProfileId/checkout', protect, protectActive, async (req, 
 
     const products = await prisma.businessProduct.findMany({
       where: { id: { in: productIds }, businessProfileId, isActive: true, isAvailable: true },
-      select: { id: true, variants: true },
+      select: { id: true, priceUsdc: true, variants: true, modifierGroups: true },
     });
     const productMap = new Map(products.map(product => [product.id, product]));
+    const preparedItems = [];
 
     for (const item of body.items) {
       const product = productMap.get(item.productId);
       if (!product) {
         return res.status(404).json({ success: false, message: `Product ${item.productId} not available.` });
       }
-      const variantError = validateVariants(product, item.variants);
-      if (variantError) {
-        return res.status(400).json({ success: false, message: variantError });
-      }
+
       const quantity = Number(item.quantity);
       if (!Number.isInteger(quantity) || quantity < 1 || quantity > 1000) {
         return res.status(400).json({ success: false, message: `Invalid quantity for product ${item.productId}.` });
       }
+
+      const validation = validateConfiguredProduct(product, item.variants);
+      if (validation.error) return res.status(400).json({ success: false, message: validation.error });
+
+      preparedItems.push({
+        productId: product.id,
+        quantity,
+        unitPrice: configuredUnitPrice(product, item.variants),
+        selection: normalizedSelection(product, item.variants),
+      });
     }
 
     const clientKey = body.idempotencyKey == null ? null : String(body.idempotencyKey).trim();
@@ -212,6 +264,7 @@ router.post('/:businessProfileId/checkout', protect, protectActive, async (req, 
     }
 
     req.body = { ...body, ...(idempotencyKey ? { idempotencyKey } : {}) };
+    req._storefrontConfiguredItems = preparedItems;
 
     let statusCode = 200;
     const originalStatus = res.status.bind(res);
@@ -251,18 +304,17 @@ router.post('/:businessProfileId/checkout', protect, protectActive, async (req, 
                 AND "customerId" = ${userId}
             `;
           }
+
           const returnedItems = Array.isArray(order.items) ? order.items : [];
-          for (let index = 0; index < returnedItems.length && index < body.items.length; index += 1) {
-            const returnedItem = returnedItems[index];
-            const sourceItem = body.items[index];
-            if (!returnedItem?.id) continue;
-            await prisma.$executeRaw`
-              UPDATE "BusinessOrderItem"
-              SET variants = ${JSON.stringify(sourceItem.variants ?? {})}::jsonb
-              WHERE id = ${returnedItem.id} AND "orderId" = ${order.id}
-            `;
-            returnedItem.variants = sourceItem.variants ?? {};
-          }
+          const configuredOrder = await finalizeConfiguredCheckout(
+            prisma,
+            order,
+            req._storefrontConfiguredItems,
+            body.paymentMode,
+            req.app.get('logger'),
+          );
+
+          if (configuredOrder?.items) payload.data.order = configuredOrder;
         }
       } catch (err) {
         return persistenceFailure(res, originalStatus, originalJson, req.app.get('logger'), err);
