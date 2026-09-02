@@ -14,7 +14,6 @@ exports.addItem = async (prisma, opts) => {
     const svc = new DineInService(prisma);
     return svc.addItem({
         tabId: opts.tabId,
-        productId: opts.productId,
         name: opts.name,
         price: opts.price ?? opts.unitPriceUsdc,
         quantity: opts.quantity,
@@ -68,7 +67,10 @@ exports.confirmTab = async (prisma, { tabId, customerId }) => {
 
 exports.confirmAndPay = async (prisma, { tabId, customerId, tipUsdc }) => {
     const svc = new DineInService(prisma);
-    return svc.confirmAndPay(tabId, customerId, { tipUsdc });
+    if (typeof svc.confirmAndPay === 'function') {
+        return svc.confirmAndPay(tabId, customerId, { tipUsdc });
+    }
+    return svc.confirmTab(tabId, customerId);
 };
 
 exports.cancelTab = async (prisma, { tabId }) => {
