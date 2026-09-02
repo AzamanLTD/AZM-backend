@@ -28,6 +28,19 @@ exports.addItem = async (req, res) => {
     } catch (err) { res.status(400).json({ success: false, message: err.message }); }
 };
 
+exports.addCustomerItem = async (req, res) => {
+    try {
+        const result = await dineInTabService.addCustomerItem(req.prisma, {
+            tabId: req.params.tabId,
+            customerId: req.user.id,
+            productId: req.body.productId,
+            selection: req.body.selection ?? req.body.variants ?? {},
+            quantity: req.body.quantity,
+        });
+        res.status(201).json({ success: true, item: result });
+    } catch (err) { res.status(err.status || 400).json({ success: false, message: err.message }); }
+};
+
 exports.finalizeTab = async (req, res) => {
     try {
         const result = await dineInTabService.finalizeTab(req.prisma, {
@@ -47,7 +60,7 @@ exports.confirmAndPay = async (req, res) => {
             customerId: req.user.id,
             tipUsdc: req.body.tipUsdc,
         });
-        res.json(result);
+        res.json({ success: true, ...result });
     } catch (err) { res.status(400).json({ success: false, message: err.message }); }
 };
 
@@ -102,7 +115,7 @@ exports.reportDefault = async (req, res) => {
 exports.getGuests = async (req, res) => {
     try {
         const prisma = req.prisma || req.app.get('prisma');
-        const businessId = req.adminScopedBusiness?.id || 
+        const businessId = req.adminScopedBusiness?.id ||
             (await prisma.businessProfile.findFirst({
                 where: { userId: req.user.id }, select: { id: true }
             }))?.id;

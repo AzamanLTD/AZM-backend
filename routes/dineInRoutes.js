@@ -17,8 +17,11 @@ router.post('/tabs/:tabId/default',   protect, kybGate, ctrl.reportDefault);
 router.get('/guests',                 protect, kybGate, ctrl.getGuests);
 router.get('/guests/search',          protect, kybGate, ctrl.searchGuests);
 
-// Customer-side
-router.get('/tabs/:tabId',            protect, ctrl.getTab);
-router.post('/tabs/:tabId/pay',       protect, require2FA(), ctrl.confirmAndPay);
+// Customer-side. This deliberately uses a distinct path from the KYB-gated
+// business item endpoint so a customer can never be granted business access
+// merely by reaching the same URL.
+router.post('/tabs/:tabId/customer-items', protect, ctrl.addCustomerItem);
+router.get('/tabs/:tabId',                 protect, ctrl.getTab);
+router.post('/tabs/:tabId/pay',            protect, require2FA(), ctrl.confirmAndPay);
 
 module.exports = router;

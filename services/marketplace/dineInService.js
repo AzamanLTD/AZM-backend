@@ -1,242 +1,147 @@
 // services/marketplace/dineInService.js
-// =============================================================================
-// AZAMAN — DINE-IN TAB SERVICE (2026-07-03)
-// Restaurant open-tab system: waiter opens tab via AZM-ID, adds items,
-// finalizes bill, customer confirms on phone before payment.
-//
-// Flow:
-//   1. WAITER opens tab (searchByAzamanId → create DineInTab OPEN)
-//   2. WAITER adds items (DineInTabItem rows)
-//   3. WAITER finalizes (status → FINALIZED, totalAmount computed)
-//   4. CUSTOMER confirms (status → CLOSED, escrow created via bookingEscrowService)
-// =============================================================================
+'use strict';
+
+const invoiceService = require('../businessInvoiceService');
+const {
+    validateConfiguredProduct,
+    configuredUnitPrice,
+    normalizedSelection,
+} = require('../storefrontProductConfigurationService');
+
+const selectionLabel = (selection) => {
+    const entries = Object.entries(selection || {});
+    if (!entries.length) return '';
+    return entries.map(([group, value]) => `${group}: ${(Array.isArray(value) ? value : [value]).join(', ')}`).join(' · ');
+};
 
 class DineInService {
-    constructor(prisma, io) {
-        this.prisma = prisma;
-        this.io = io;
-    }
+    constructor(prisma, io) { this.prisma = prisma; this.io = io; }
 
-    /**
-     * Open a dine-in tab for a customer identified by AZM-ID.
-     * @param {string} businessProfileId
-     * @param {string} azamanId - Customer's AZM-ID
-     * @param {string} tableLabel - e.g. "Table 5"
-     * @returns {Promise<object>} The new DineInTab
-     */
     async openTab({ businessProfileId, azamanId, tableId }) {
         if (!businessProfileId) throw new Error('businessProfileId is required.');
         if (!azamanId) throw new Error('azamanId is required.');
-
-        // Find customer by AZM-ID
-        const customer = await this.prisma.user.findUnique({
-            where: { azamanId },
-            select: { id: true, username: true },
-        });
+        const customer = await this.prisma.user.findUnique({ where: { azamanId }, select: { id: true, username: true } });
         if (!customer) throw new Error(`No customer found with AZM-ID: ${azamanId}`);
-
-        // Check no existing OPEN tab for this customer at this business
-        const existing = await this.prisma.dineInTab.findFirst({
-            where: { businessProfileId, customerId: customer.id, status: 'OPEN' },
-        });
+        const existing = await this.prisma.dineInTab.findFirst({ where: { businessProfileId, customerId: customer.id, status: 'OPEN' } });
         if (existing) throw new Error('Customer already has an open tab at this business.');
-
-        const tab = await this.prisma.dineInTab.create({
-            data: {
-                businessProfileId,
-                customerId: customer.id,
-                tableId: tableId || null,
-                status: 'OPEN',
-            },
-            include: { items: true },
-        });
-
-        // Notify customer in real-time
-        this.io?.to(`user_${customer.id}`).emit('dine_in_tab_opened', {
-            tabId: tab.id,
-            businessProfileId,
-            tableLabel,
-        });
-
+        const tab = await this.prisma.dineInTab.create({ data: { businessProfileId, customerId: customer.id, tableId: tableId || null, status: 'OPEN' }, include: { items: true } });
+        this.io?.to(`user_${customer.id}`).emit('dine_in_tab_opened', { tabId: tab.id, businessProfileId, tableId: tableId || null });
         return tab;
     }
 
-    /**
-     * Add an item to an open tab.
-     */
-    async addItem({ tabId, name, price, quantity, notes, addedBy }) {
+    async addItem({ tabId, productId, name, price, quantity, addedBy }) {
         if (!tabId) throw new Error('tabId is required.');
         if (!name) throw new Error('name is required.');
         const priceNum = Number(price);
         if (!Number.isFinite(priceNum) || priceNum <= 0) throw new Error('price must be positive.');
-        const qty = quantity || 1;
-
-        const tab = await this.prisma.dineInTab.findUnique({
-            where: { id: tabId },
-            select: { id: true, status: true, customerId: true },
-        });
+        const qty = Number(quantity || 1);
+        if (!Number.isInteger(qty) || qty < 1 || qty > 50) throw new Error('quantity must be an integer from 1 to 50.');
+        const tab = await this.prisma.dineInTab.findUnique({ where: { id: tabId }, select: { id: true, status: true, customerId: true } });
         if (!tab) throw new Error('Tab not found.');
         if (tab.status !== 'OPEN') throw new Error('Cannot add items to a tab that is not OPEN.');
-
-        const item = await this.prisma.dineInTabItem.create({
-            data: { 
-                dineInTabId: tabId, 
-                name, 
-                unitPriceUsdc: priceNum, 
-                quantity: qty, 
-                lineTotalUsdc: priceNum * qty,
-                addedBy: addedBy || tab.customerId,
-            },
-        });
-
-        // Notify customer
-        this.io?.to(`user_${tab.customerId}`).emit('dine_in_item_added', {
-            tabId, item: { name, price: priceNum, quantity: qty },
-        });
-
+        const item = await this.prisma.dineInTabItem.create({ data: { dineInTabId: tabId, productId: productId || null, name: String(name).slice(0, 200), unitPriceUsdc: priceNum, quantity: qty, lineTotalUsdc: priceNum * qty, addedBy: addedBy || tab.customerId } });
+        this.io?.to(`user_${tab.customerId}`).emit('dine_in_item_added', { tabId, item });
         return item;
     }
 
-    /**
-     * Remove an item from an open tab.
-     */
+    async addCustomerItem({ tabId, customerId, productId, selection, quantity }) {
+        if (!tabId) throw new Error('tabId is required.');
+        if (!productId) throw new Error('productId is required.');
+        if (!customerId) throw new Error('customerId is required.');
+        const tab = await this.prisma.dineInTab.findUnique({ where: { id: tabId }, select: { id: true, businessProfileId: true, customerId: true, status: true } });
+        if (!tab) throw new Error('Tab not found.');
+        if (tab.customerId !== customerId) throw new Error('Not authorized to add items to this tab.');
+        if (tab.status !== 'OPEN') throw new Error('Cannot add items to a tab that is not OPEN.');
+        const product = await this.prisma.businessProduct.findFirst({ where: { id: productId, businessProfileId: tab.businessProfileId, isActive: true, isAvailable: true }, select: { id: true, name: true, priceUsdc: true, variants: true, modifierGroups: true } });
+        if (!product) throw new Error('Product is unavailable for this restaurant.');
+        const validation = validateConfiguredProduct(product, selection);
+        if (validation.error) throw new Error(validation.error);
+        const normalized = normalizedSelection(product, selection);
+        const unitPrice = configuredUnitPrice(product, normalized);
+        if (!(unitPrice > 0)) throw new Error('Product price must be positive.');
+        const label = selectionLabel(normalized);
+        return this.addItem({ tabId, productId: product.id, name: label ? `${product.name} — ${label}` : product.name, price: unitPrice, quantity, addedBy: customerId });
+    }
+
     async removeItem({ tabId, itemId }) {
-        const item = await this.prisma.dineInTabItem.findUnique({
-            where: { id: itemId },
-            include: { dineInTab: { select: { status: true } } },
-        });
+        const item = await this.prisma.dineInTabItem.findUnique({ where: { id: itemId }, include: { dineInTab: { select: { status: true } } } });
         if (!item || item.dineInTabId !== tabId) throw new Error('Item not found on this tab.');
         if (item.dineInTab.status !== 'OPEN') throw new Error('Cannot remove items from a finalized tab.');
-
         await this.prisma.dineInTabItem.delete({ where: { id: itemId } });
         return { success: true };
     }
 
-    /**
-     * Finalize a tab — compute total, set status to FINALIZED.
-     * Customer must confirm before payment is processed.
-     */
     async finalizeTab(tabId) {
-        const tab = await this.prisma.dineInTab.findUnique({
-            where: { id: tabId },
-            include: { items: true },
-        });
+        const tab = await this.prisma.dineInTab.findUnique({ where: { id: tabId }, include: { items: true } });
         if (!tab) throw new Error('Tab not found.');
         if (tab.status !== 'OPEN') throw new Error('Tab is not OPEN.');
-
         const total = tab.items.reduce((sum, item) => sum + Number(item.unitPriceUsdc) * item.quantity, 0);
-
-        const finalized = await this.prisma.dineInTab.update({
-            where: { id: tabId },
-            data: {
-                status: 'FINALIZED',
-                closedAt: new Date(),
-                grandTotalUsdc: total,
-                subtotalUsdc: total,
-            },
-            include: { items: true },
-        });
-
-        // Notify customer to review and confirm
-        this.io?.to(`user_${tab.customerId}`).emit('dine_in_tab_finalized', {
-            tabId,
-            totalAmount: finalized.totalAmount,
-            items: finalized.items,
-        });
-
+        const finalized = await this.prisma.dineInTab.update({ where: { id: tabId }, data: { status: 'FINALIZED', closedAt: new Date(), grandTotalUsdc: total, subtotalUsdc: total }, include: { items: true } });
+        this.io?.to(`user_${tab.customerId}`).emit('dine_in_tab_finalized', { tabId, totalAmount: finalized.grandTotalUsdc, items: finalized.items });
         return finalized;
     }
 
-    /**
-     * Customer confirms the finalized tab — status → CLOSED.
-     * The escrow creation is handled by the caller (route/controller) which
-     * has access to bookingEscrowService.
-     */
-    async confirmTab(tabId, customerId) {
-        const tab = await this.prisma.dineInTab.findUnique({
-            where: { id: tabId },
-            include: { items: true },
-        });
+    async confirmAndPay(tabId, customerId, { tipUsdc } = {}) {
+        let tab = await this.prisma.dineInTab.findUnique({ where: { id: tabId }, include: { items: true, invoice: true } });
         if (!tab) throw new Error('Tab not found.');
-        if (tab.customerId !== customerId) throw new Error('Not authorized to confirm this tab.');
-        if (tab.status !== 'FINALIZED') throw new Error('Tab must be FINALIZED before confirming.');
-
-        const closed = await this.prisma.dineInTab.update({
-            where: { id: tabId },
-            data: {
-                status: 'CLOSED',
-                closedAt: new Date(),
-            },
-            include: { items: true },
-        });
-
-        return closed;
+        if (tab.customerId !== customerId) throw new Error('Not authorized to pay this tab.');
+        if (tab.status !== 'FINALIZED' && tab.status !== 'CLOSED') throw new Error('Tab must be FINALIZED before payment.');
+        let invoice = tab.invoice;
+        if (invoice?.status === 'PAID') return { tab, invoice, payment: { invoice, customerPays: Number(invoice.customerPaidUsdc), alreadyPaid: true } };
+        if (!invoice) {
+            if (!tab.items.length) throw new Error('Cannot pay an empty dine-in tab.');
+            invoice = await invoiceService.createInvoice(this.prisma, {
+                businessProfileId: tab.businessProfileId,
+                customerId: tab.customerId,
+                locationId: tab.locationId,
+                tableId: tab.tableId,
+                lineItems: tab.items.map(item => ({ description: item.name, quantity: item.quantity, unitPrice: Number(item.unitPriceUsdc) })),
+                taxLines: [],
+                businessNote: 'Dine-in tab settlement',
+            });
+            invoice = await invoiceService.sendInvoice(this.prisma, { invoiceId: invoice.id, businessProfileId: tab.businessProfileId });
+            tab = await this.prisma.dineInTab.update({ where: { id: tabId }, data: { invoiceId: invoice.id }, include: { items: true, invoice: true } });
+        } else if (invoice.status === 'DRAFT') {
+            invoice = await invoiceService.sendInvoice(this.prisma, { invoiceId: invoice.id, businessProfileId: tab.businessProfileId });
+        }
+        const payment = await invoiceService.payInvoice(this.prisma, { invoiceId: invoice.id, customerId, tipUsdc });
+        const tip = Math.max(0, Number(tipUsdc) || 0);
+        const billTotal = Number(payment.invoice?.billTotalUsdc ?? invoice.billTotalUsdc);
+        const grandTotal = billTotal + tip;
+        const closed = await this.prisma.dineInTab.update({ where: { id: tabId }, data: { status: 'CLOSED', closedAt: new Date(), tipUsdc: tip, grandTotalUsdc: grandTotal, paymentMethod: 'AZAMAN_BALANCE' }, include: { items: true, invoice: true } });
+        this.io?.to(`user_${customerId}`).emit('dine_in_tab_paid', { tabId, invoiceId: invoice.id, customerPays: payment.customerPays, businessReceives: payment.businessReceives, fee: payment.fee });
+        return { tab: closed, invoice: payment.invoice, payment };
     }
 
-    /**
-     * Cancel a tab (only if OPEN or FINALIZED, not CLOSED).
-     */
+    async confirmTab(tabId, customerId) {
+        const tab = await this.prisma.dineInTab.findUnique({ where: { id: tabId } });
+        if (!tab) throw new Error('Tab not found.');
+        if (tab.customerId !== customerId) throw new Error('Not authorized.');
+        if (tab.status !== 'FINALIZED') throw new Error('Tab must be FINALIZED before confirmation.');
+        return this.prisma.dineInTab.update({ where: { id: tabId }, data: { status: 'CLOSED', closedAt: new Date() }, include: { items: true } });
+    }
+
     async cancelTab(tabId) {
-        const tab = await this.prisma.dineInTab.findUnique({
-            where: { id: tabId },
-            select: { status: true, customerId: true },
-        });
+        const tab = await this.prisma.dineInTab.findUnique({ where: { id: tabId }, select: { status: true, customerId: true } });
         if (!tab) throw new Error('Tab not found.');
         if (tab.status === 'CLOSED') throw new Error('Cannot cancel a closed tab.');
-
-        await this.prisma.dineInTab.update({
-            where: { id: tabId },
-            data: { status: 'CANCELLED' },
-        });
-
+        await this.prisma.dineInTab.update({ where: { id: tabId }, data: { status: 'CANCELLED' } });
         this.io?.to(`user_${tab.customerId}`).emit('dine_in_tab_cancelled', { tabId });
         return { success: true };
     }
 
-    /**
-     * Get all tabs for a business (portal view).
-     */
     async getBusinessTabs(businessProfileId, status) {
-        const where = { businessProfileId };
-        if (status) where.status = status;
-        return this.prisma.dineInTab.findMany({
-            where,
-            include: {
-                items: true,
-                customer: { select: { id: true, username: true, azamanId: true } },
-            },
-            orderBy: { openedAt: 'desc' },
-        });
+        const where = { businessProfileId }; if (status) where.status = status;
+        return this.prisma.dineInTab.findMany({ where, include: { items: true, customer: { select: { id: true, username: true, azamanId: true } }, invoice: true }, orderBy: { openedAt: 'desc' } });
     }
 
-    /**
-     * Get a single tab by ID.
-     */
     async getTab(tabId) {
-        return this.prisma.dineInTab.findUnique({
-            where: { id: tabId },
-            include: {
-                items: true,
-                customer: { select: { id: true, username: true, azamanId: true } },
-                businessProfile: { select: { id: true, businessName: true, logoUrl: true } },
-            },
-        });
+        return this.prisma.dineInTab.findUnique({ where: { id: tabId }, include: { items: true, invoice: true, customer: { select: { id: true, username: true, azamanId: true } }, businessProfile: { select: { id: true, businessName: true, logoUrl: true } } } });
     }
 
-    /**
-     * Get all open/active tabs for a customer.
-     */
     async getCustomerTabs(userId, status) {
-        const where = { customerId: userId };
-        if (status) where.status = status;
-        return this.prisma.dineInTab.findMany({
-            where,
-            include: {
-                items: true,
-                businessProfile: { select: { id: true, businessName: true, logoUrl: true } },
-            },
-            orderBy: { openedAt: 'desc' },
-        });
+        const where = { customerId: userId }; if (status) where.status = status;
+        return this.prisma.dineInTab.findMany({ where, include: { items: true, invoice: true, businessProfile: { select: { id: true, businessName: true, logoUrl: true } } }, orderBy: { openedAt: 'desc' } });
     }
 }
 
