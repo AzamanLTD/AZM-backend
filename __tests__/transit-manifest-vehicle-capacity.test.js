@@ -18,7 +18,8 @@ describe('TransitOpsService manifest vehicle capacity', () => {
         const svc = new TransitOpsService(prisma);
         const manifest = await svc.getTripManifest('trip-a', 'business-a');
 
-        expect(manifest.availableSeats).toBe(14);
+        expect(manifest.stats.availableSeats).toBe(14);
+        expect(manifest.stats.totalSeats).toBe(14);
         expect(prisma.transitTrip.findFirst.mock.calls[0][0].include.vehicle).toBeTruthy();
     });
 });
