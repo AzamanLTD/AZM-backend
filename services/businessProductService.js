@@ -16,14 +16,171 @@ const VALID_CATEGORIES = new Set([
     'FINANCIAL_SERVICES', 'OTHER'
 ]);
 
-// Fields a business owner may set via updateProduct.
 const UPDATABLE_FIELDS = new Set([
-    'name', 'description', 'priceUsdc', 'imageUrls', 'category', 'isActive'
+    'name', 'description', 'priceUsdc', 'imageUrls', 'category', 'isActive',
+    'catalogSectionId', 'tags', 'calorieCount', 'preparationMins', 'variants',
+    'modifierGroups', 'locationId', 'deliveryTerms', 'estimatedDelivery', 'isAvailable'
 ]);
 
-// ── private helpers ───────────────────────────────────────────────────────────
+const _cleanOptionRows = (value, label, max) => {
+    if (value === undefined) return undefined;
+    if (!Array.isArray(value)) throw new Error(`${label} must be an array.`);
+    if (value.length > max) throw new Error(`${label} max ${max} items.`);
+    return value.map((row, index) => {
+        if (!row || typeof row !== 'object' || Array.isArray(row)) {
+            throw new Error(`${label}[${index}] must be an object.`);
+        }
+        const name = String(row.name ?? '').trim();
+        if (name.length < 1 || name.length > 100) {
+            throw new Error(`${label}[${index}].name must be 1–100 chars.`);
+        }
+        const priceDelta = Number(row.priceDelta ?? 0);
+        if (!Number.isFinite(priceDelta)) {
+            throw new Error(`${label}[${index}].priceDelta must be finite.`);
+        }
+        return { name, priceDelta };
+    });
+};
 
-/** Generate a unique slug from businessName + productName, suffixing on clash. */
+const _cleanModifierGroups = (value) => {
+    if (value === undefined) return undefined;
+    if (!Array.isArray(value)) throw new Error('modifierGroups must be an array.');
+    if (value.length > 20) throw new Error('modifierGroups max 20 groups.');
+    return value.map((group, index) => {
+        if (!group || typeof group !== 'object' || Array.isArray(group)) {
+            throw new Error(`modifierGroups[${index}] must be an object.`);
+        }
+        const name = String(group.name ?? '').trim();
+        if (name.length < 1 || name.length > 100) {
+            throw new Error(`modifierGroups[${index}].name must be 1–100 chars.`);
+        }
+        const maxSelection = Number(group.maxSelection ?? 1);
+        if (!Number.isInteger(maxSelection) || maxSelection < 1 || maxSelection > 20) {
+            throw new Error(`modifierGroups[${index}].maxSelection must be an integer from 1 to 20.`);
+        }
+        const options = Array.isArray(group.options) ? group.options : [];
+        if (options.length > 30) throw new Error(`modifierGroups[${index}].options max 30 items.`);
+        return {
+            name,
+            maxSelection,
+            options: options.map((option, optionIndex) => {
+                if (!option || typeof option !== 'object' || Array.isArray(option)) {
+                    throw new Error(`modifierGroups[${index}].options[${optionIndex}] must be an object.`);
+                }
+                const optionName = String(option.name ?? '').trim();
+                if (optionName.length < 1 || optionName.length > 100) {
+                    throw new Error(`modifierGroups[${index}].options[${optionIndex}].name must be 1–100 chars.`);
+                }
+                const priceDelta = Number(option.priceDelta ?? 0);
+                if (!Number.isFinite(priceDelta)) {
+                    throw new Error(`modifierGroups[${index}].options[${optionIndex}].priceDelta must be finite.`);
+                }
+                return { name: optionName, priceDelta };
+            }),
+        };
+    });
+};
+
+const _validateFields = ({
+    name, description, priceUsdc, imageUrls, category, catalogSectionId, tags,
+    calorieCount, preparationMins, variants, modifierGroups, locationId,
+    deliveryTerms, estimatedDelivery, isAvailable,
+}, { partial }) => {
+    const data = {};
+
+    if (name !== undefined || !partial) {
+        const clean = String(name || '').trim();
+        if (clean.length < 2 || clean.length > 200) throw new Error('name must be 2–200 chars.');
+        data.name = clean;
+    }
+
+    if (priceUsdc !== undefined || !partial) {
+        const price = Number(priceUsdc);
+        if (!Number.isFinite(price) || price <= 0) throw new Error('priceUsdc must be a positive finite number.');
+        data.priceUsdc = price;
+    }
+
+    if (imageUrls !== undefined) {
+        if (!Array.isArray(imageUrls) || !imageUrls.every((u) => typeof u === 'string')) {
+            throw new Error('imageUrls must be an array of strings.');
+        }
+        if (imageUrls.length > 10) throw new Error('imageUrls max 10 items.');
+        data.imageUrls = imageUrls;
+    }
+
+    if (description !== undefined) {
+        if (description != null && String(description).length > 1000) throw new Error('description must be max 1000 chars.');
+        data.description = description ? String(description) : null;
+    }
+
+    if (category !== undefined) {
+        if (category != null && !VALID_CATEGORIES.has(category)) {
+            throw new Error(`category must be one of: ${[...VALID_CATEGORIES].join(', ')}`);
+        }
+        data.category = category || null;
+    }
+
+    if (catalogSectionId !== undefined) data.catalogSectionId = catalogSectionId ? String(catalogSectionId) : null;
+    if (locationId !== undefined) data.locationId = locationId ? String(locationId) : null;
+
+    if (tags !== undefined) {
+        if (!Array.isArray(tags) || !tags.every((tag) => typeof tag === 'string')) {
+            throw new Error('tags must be an array of strings.');
+        }
+        if (tags.length > 30) throw new Error('tags max 30 items.');
+        data.tags = tags.map((tag) => String(tag).trim()).filter(Boolean).slice(0, 30);
+    }
+
+    for (const [key, value] of [['calorieCount', calorieCount], ['preparationMins', preparationMins]]) {
+        if (value !== undefined) {
+            if (value === null || value === '') data[key] = null;
+            else {
+                const number = Number(value);
+                if (!Number.isInteger(number) || number < 0 || number > 100000) {
+                    throw new Error(`${key} must be a non-negative integer.`);
+                }
+                data[key] = number;
+            }
+        }
+    }
+
+    const normalizedVariants = _cleanOptionRows(variants, 'variants', 30);
+    if (normalizedVariants !== undefined) data.variants = normalizedVariants;
+
+    const normalizedModifiers = _cleanModifierGroups(modifierGroups);
+    if (normalizedModifiers !== undefined) data.modifierGroups = normalizedModifiers;
+
+    if (deliveryTerms !== undefined) {
+        if (deliveryTerms != null && String(deliveryTerms).length > 1000) throw new Error('deliveryTerms must be max 1000 chars.');
+        data.deliveryTerms = deliveryTerms ? String(deliveryTerms) : null;
+    }
+    if (estimatedDelivery !== undefined) {
+        if (estimatedDelivery != null && String(estimatedDelivery).length > 120) throw new Error('estimatedDelivery must be max 120 chars.');
+        data.estimatedDelivery = estimatedDelivery ? String(estimatedDelivery) : null;
+    }
+    if (isAvailable !== undefined) data.isAvailable = !!isAvailable;
+
+    return data;
+};
+
+const _resolveSection = async (prisma, businessProfileId, catalogSectionId) => {
+    if (!catalogSectionId) return null;
+    const section = await prisma.catalogSection.findUnique({
+        where: { id: catalogSectionId },
+        select: { id: true, businessProfileId: true },
+    });
+    return section && section.businessProfileId === businessProfileId ? section.id : null;
+};
+
+const _resolveLocation = async (prisma, businessProfileId, locationId) => {
+    if (!locationId) return null;
+    const location = await prisma.businessLocation.findUnique({
+        where: { id: locationId },
+        select: { id: true, businessProfileId: true },
+    });
+    return location && location.businessProfileId === businessProfileId ? location.id : null;
+};
+
 const _generateSlug = async (prisma, businessName, productName) => {
     const base = `${businessName}-${productName}`
         .toLowerCase()
@@ -38,112 +195,65 @@ const _generateSlug = async (prisma, businessName, productName) => {
     throw new Error('Could not generate a unique product slug. Please retry.');
 };
 
-/**
- * Validate + normalise a field bag shared by create and update. Returns a clean
- * object containing only the provided, valid fields. Throws on invalid values.
- */
-const _validateFields = ({ name, description, priceUsdc, imageUrls, category }, { partial }) => {
-    const data = {};
-
-    if (name !== undefined || !partial) {
-        const clean = String(name || '').trim();
-        if (clean.length < 2 || clean.length > 200) {
-            throw new Error('name must be 2–200 chars.');
-        }
-        data.name = clean;
-    }
-
-    if (priceUsdc !== undefined || !partial) {
-        const price = Number(priceUsdc);
-        if (!Number.isFinite(price) || price <= 0) {
-            throw new Error('priceUsdc must be a positive finite number.');
-        }
-        data.priceUsdc = price;
-    }
-
-    if (imageUrls !== undefined) {
-        if (!Array.isArray(imageUrls) || !imageUrls.every((u) => typeof u === 'string')) {
-            throw new Error('imageUrls must be an array of strings.');
-        }
-        if (imageUrls.length > 10) {
-            throw new Error('imageUrls max 10 items.');
-        }
-        data.imageUrls = imageUrls;
-    }
-
-    if (description !== undefined) {
-        if (description != null && String(description).length > 1000) {
-            throw new Error('description must be max 1000 chars.');
-        }
-        data.description = description ? String(description) : null;
-    }
-
-    if (category !== undefined) {
-        if (category != null && !VALID_CATEGORIES.has(category)) {
-            throw new Error(`category must be one of: ${[...VALID_CATEGORIES].join(', ')}`);
-        }
-        data.category = category || null;
-    }
-
-    return data;
-};
-
-// =============================================================================
-// 1. CREATE PRODUCT
-// =============================================================================
-const createProduct = async (prisma, { businessProfileId, name, description, priceUsdc, imageUrls, category, catalogSectionId, tags, calorieCount, preparationMins }) => {
+const createProduct = async (prisma, {
+    businessProfileId, name, description, priceUsdc, imageUrls, category,
+    catalogSectionId, tags, calorieCount, preparationMins, variants,
+    modifierGroups, locationId, deliveryTerms, estimatedDelivery, isAvailable,
+}) => {
     if (!businessProfileId) throw new Error('businessProfileId is required.');
 
     const profile = await prisma.businessProfile.findUnique({
         where: { id: businessProfileId },
-        select: { id: true, businessName: true }
+        select: { id: true, businessName: true },
     });
     if (!profile) throw new Error('Business profile not found.');
 
-    const data = _validateFields({ name, description, priceUsdc, imageUrls, category }, { partial: false });
+    const data = _validateFields(
+        {
+            name, description, priceUsdc, imageUrls, category, catalogSectionId,
+            tags, calorieCount, preparationMins, variants, modifierGroups,
+            locationId, deliveryTerms, estimatedDelivery, isAvailable,
+        },
+        { partial: false },
+    );
     const slug = await _generateSlug(prisma, profile.businessName, data.name);
 
-    // Optional catalogue-section link — only wired to this business's own sections.
-    let resolvedSectionId = null;
-    if (catalogSectionId) {
-        const section = await prisma.catalogSection.findUnique({ where: { id: catalogSectionId }, select: { id: true, businessProfileId: true } });
-        if (section && section.businessProfileId === businessProfileId) resolvedSectionId = section.id;
-    }
+    const resolvedSectionId = await _resolveSection(prisma, businessProfileId, data.catalogSectionId);
+    const resolvedLocationId = await _resolveLocation(prisma, businessProfileId, data.locationId);
 
     return prisma.businessProduct.create({
         data: {
             businessProfileId,
             name: data.name,
-            description: data.description ?? (description ? String(description) : null),
+            description: data.description ?? null,
             priceUsdc: data.priceUsdc,
-            imageUrls: data.imageUrls ?? (Array.isArray(imageUrls) ? imageUrls : null),
-            category: data.category ?? (category && VALID_CATEGORIES.has(category) ? category : null),
+            imageUrls: data.imageUrls ?? [],
+            category: data.category ?? null,
             slug,
             catalogSectionId: resolvedSectionId,
-            tags: Array.isArray(tags) ? tags : [],
-            calorieCount: (calorieCount !== undefined && calorieCount !== null) ? parseInt(calorieCount, 10) : null,
-            preparationMins: (preparationMins !== undefined && preparationMins !== null) ? parseInt(preparationMins, 10) : null,
-        }
+            tags: data.tags ?? [],
+            calorieCount: data.calorieCount ?? null,
+            preparationMins: data.preparationMins ?? null,
+            variants: data.variants ?? [],
+            modifierGroups: data.modifierGroups ?? [],
+            locationId: resolvedLocationId,
+            deliveryTerms: data.deliveryTerms ?? null,
+            estimatedDelivery: data.estimatedDelivery ?? null,
+            isAvailable: data.isAvailable !== false,
+        },
     });
 };
 
-// =============================================================================
-// 2. UPDATE PRODUCT — whitelisted fields, owner-scoped. Regenerates slug on
-//    name change.
-// =============================================================================
 const updateProduct = async (prisma, { productId, businessProfileId, updates }) => {
     if (!productId) throw new Error('productId is required.');
 
     const product = await prisma.businessProduct.findUnique({
         where: { id: productId },
-        include: { businessProfile: { select: { businessName: true } } }
+        include: { businessProfile: { select: { businessName: true } } },
     });
     if (!product) throw new Error('Product not found.');
-    if (product.businessProfileId !== businessProfileId) {
-        throw new Error('You do not own this product.');
-    }
+    if (product.businessProfileId !== businessProfileId) throw new Error('You do not own this product.');
 
-    // Keep only whitelisted keys before validating.
     const filtered = {};
     for (const [key, value] of Object.entries(updates || {})) {
         if (UPDATABLE_FIELDS.has(key)) filtered[key] = value;
@@ -151,28 +261,21 @@ const updateProduct = async (prisma, { productId, businessProfileId, updates }) 
 
     const data = _validateFields(filtered, { partial: true });
 
-    if ('isActive' in filtered) {
-        data.isActive = !!filtered.isActive;
-    }
+    if ('catalogSectionId' in data) data.catalogSectionId = await _resolveSection(prisma, businessProfileId, data.catalogSectionId);
+    if ('locationId' in data) data.locationId = await _resolveLocation(prisma, businessProfileId, data.locationId);
+    if ('isActive' in filtered) data.isActive = !!filtered.isActive;
 
-    // Regenerate slug when the name changes.
     if (data.name && data.name !== product.name) {
         data.slug = await _generateSlug(prisma, product.businessProfile.businessName, data.name);
     }
 
-    if (Object.keys(data).length === 0) {
-        throw new Error('No valid fields to update.');
-    }
+    if (Object.keys(data).length === 0) throw new Error('No valid fields to update.');
 
     return prisma.businessProduct.update({ where: { id: productId }, data });
 };
 
-// =============================================================================
-// 3. LIST PRODUCTS — cursor pagination by id.
-// =============================================================================
 const listProducts = async (prisma, { businessProfileId, isActive, limit, cursor }) => {
     const take = Math.min(Math.max(parseInt(limit, 10) || 20, 1), 50);
-
     const where = { businessProfileId };
     if (typeof isActive === 'boolean') where.isActive = isActive;
 
@@ -180,19 +283,15 @@ const listProducts = async (prisma, { businessProfileId, isActive, limit, cursor
         where,
         take: take + 1,
         orderBy: { createdAt: 'desc' },
-        ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {})
+        ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
     });
 
     const hasMore = rows.length > take;
     const products = hasMore ? rows.slice(0, take) : rows;
     const nextCursor = hasMore ? products[products.length - 1].id : null;
-
     return { products, hasMore, nextCursor };
 };
 
-// =============================================================================
-// 4. GET PRODUCT — optionally include a slim business profile projection.
-// =============================================================================
 const getProduct = async (prisma, { productId, includeBusinessProfile }) =>
     prisma.businessProduct.findUnique({
         where: { id: productId },
@@ -200,42 +299,29 @@ const getProduct = async (prisma, { productId, includeBusinessProfile }) =>
             ? {
                 include: {
                     businessProfile: {
-                        select: { bizId: true, businessName: true, isVerified: true, kybStatus: true }
-                    }
-                }
+                        select: { bizId: true, businessName: true, isVerified: true, kybStatus: true },
+                    },
+                },
             }
-            : {})
+            : {}),
     });
 
-// =============================================================================
-// 5. DELETE PRODUCT — soft delete (isActive=false). Blocked if active orders.
-// =============================================================================
 const deleteProduct = async (prisma, { productId, businessProfileId }) => {
     if (!productId) throw new Error('productId is required.');
 
     const product = await prisma.businessProduct.findUnique({
         where: { id: productId },
-        select: { id: true, businessProfileId: true }
+        select: { id: true, businessProfileId: true },
     });
     if (!product) throw new Error('Product not found.');
-    if (product.businessProfileId !== businessProfileId) {
-        throw new Error('You do not own this product.');
-    }
+    if (product.businessProfileId !== businessProfileId) throw new Error('You do not own this product.');
 
     const activeOrders = await prisma.businessOrder.count({
-        where: {
-            productId,
-            status: { notIn: ['COMPLETED', 'REFUNDED', 'CANCELLED'] }
-        }
+        where: { productId, status: { notIn: ['COMPLETED', 'REFUNDED', 'CANCELLED'] } },
     });
-    if (activeOrders > 0) {
-        throw new Error('Cannot delete a product with active orders. Mark it inactive instead.');
-    }
+    if (activeOrders > 0) throw new Error('Cannot delete a product with active orders. Mark it inactive instead.');
 
-    return prisma.businessProduct.update({
-        where: { id: productId },
-        data: { isActive: false }
-    });
+    return prisma.businessProduct.update({ where: { id: productId }, data: { isActive: false } });
 };
 
 module.exports = {
@@ -243,5 +329,5 @@ module.exports = {
     updateProduct,
     listProducts,
     getProduct,
-    deleteProduct
+    deleteProduct,
 };
