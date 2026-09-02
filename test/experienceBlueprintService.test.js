@@ -68,6 +68,13 @@ describe('experienceBlueprintService', () => {
     expect(result.preset).toBe(PRESETS.BUILDING_WALK);
     expect(result.navigation.showProgress).toBe(false);
     expect(result.motion.reducedMotionSafe).toBe(true);
-    expect(result.commit.persistentTray).toBe(true);
+    expect(result.commit.persistentTray).toBe(false);
+  });
+
+  test('category keys are trimmed and normalized before grammar selection', () => {
+    expect(defaultsForCategory(' hospitality ').preset)
+      .toBe(PRESETS.BUILDING_WALK);
+    expect(defaultsForCategory(' logistics ').preset)
+      .toBe(PRESETS.TRAVEL_JOURNEY);
   });
 });
