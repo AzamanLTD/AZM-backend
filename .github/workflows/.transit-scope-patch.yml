@@ -31,15 +31,12 @@ jobs:
                   s = s.replace(old, new, 1)
                   changed = True
           if not changed:
-              print('No route changes needed; already patched or source drifted.')
-          else:
-              p.write_text(s)
+              print('No route changes needed')
+              raise SystemExit(0)
+          p.write_text(s)
           PY
-          if git diff --quiet -- routes/businessOSRoutes.js; then
-            exit 0
-          fi
           git config user.name 'azaman-ci'
           git config user.email 'azaman-ci@users.noreply.github.com'
           git add routes/businessOSRoutes.js
           git commit -m 'fix(transit): pass business scope through ops routes'
-          git push origin "$BRANCH"
+          git push --force-with-lease origin "$BRANCH"
