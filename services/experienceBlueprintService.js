@@ -42,8 +42,45 @@ const COMMIT_STYLES = Object.freeze({
 });
 const COMMIT_STYLE_VALUES = Object.freeze(Object.values(COMMIT_STYLES));
 
+const CATEGORY_OPTIONS = Object.freeze({
+  FOOD_BEVERAGE: Object.freeze({
+    navigationModes: Object.freeze(['CONTEXTUAL']),
+    detailPresentations: Object.freeze(['MORPH', 'DISH_DOSSIER']),
+    commitStyles: Object.freeze([COMMIT_STYLES.MATERIAL, COMMIT_STYLES.PAPER_RIP]),
+    customerContext: Object.freeze({ tableNumber: true, serviceMode: true, passenger: false }),
+  }),
+  RETAIL: Object.freeze({
+    navigationModes: Object.freeze(['CONTEXTUAL', 'AISLE_TRAVERSE']),
+    detailPresentations: Object.freeze(['MORPH', 'PRODUCT_DOSSIER']),
+    commitStyles: Object.freeze([COMMIT_STYLES.MATERIAL, COMMIT_STYLES.LIFT_INTO_TRAY]),
+    customerContext: Object.freeze({ tableNumber: false, serviceMode: false, passenger: false }),
+  }),
+  HOSPITALITY: Object.freeze({
+    navigationModes: Object.freeze(['CONTEXTUAL', 'FLOOR_TRAVERSE']),
+    detailPresentations: Object.freeze(['MORPH', 'ROOM_DOSSIER']),
+    commitStyles: Object.freeze([COMMIT_STYLES.MATERIAL]),
+    customerContext: Object.freeze({ tableNumber: false, serviceMode: false, passenger: false }),
+  }),
+  LOGISTICS: Object.freeze({
+    navigationModes: Object.freeze(['CONTEXTUAL', 'JOURNEY_TIMELINE']),
+    detailPresentations: Object.freeze(['MORPH', 'SEAT_DOSSIER']),
+    commitStyles: Object.freeze([COMMIT_STYLES.MATERIAL]),
+    customerContext: Object.freeze({ tableNumber: false, serviceMode: false, passenger: true }),
+  }),
+  DEFAULT: Object.freeze({
+    navigationModes: Object.freeze(['CONTEXTUAL']),
+    detailPresentations: Object.freeze(['MORPH', 'SERVICE_DOSSIER']),
+    commitStyles: Object.freeze([COMMIT_STYLES.MATERIAL]),
+    customerContext: Object.freeze({ tableNumber: false, serviceMode: false, passenger: false }),
+  }),
+});
+
 function categoryKey(category) {
   return String(category || '').toUpperCase();
+}
+
+function categoryOptions(category) {
+  return CATEGORY_OPTIONS[categoryKey(category)] || CATEGORY_OPTIONS.DEFAULT;
 }
 
 function presetForCategory(category) {
@@ -58,34 +95,41 @@ function presetForCategory(category) {
 
 function defaultsForCategory(category) {
   const key = categoryKey(category);
+  const options = categoryOptions(key);
   const base = {
     schemaVersion: EXPERIENCE_BLUEPRINT_VERSION,
     preset: presetForCategory(key),
     navigation: {
-      mode: 'CONTEXTUAL',
+      mode: options.navigationModes[0],
       showProgress: true,
       allowDirectJump: false,
     },
     detail: {
-      presentation: 'MORPH',
+      presentation: options.detailPresentations[options.detailPresentations.length - 1],
       showGallery: true,
       showSpecifications: true,
       showOptions: true,
       showQuantity: true,
     },
-    customerContext: { enabled: true },
-    commit: { style: COMMIT_STYLES.MATERIAL, persistentTray: true },
+    customerContext: {
+      enabled: true,
+      tableNumber: options.customerContext.tableNumber,
+      serviceMode: options.customerContext.serviceMode,
+      passenger: options.customerContext.passenger,
+    },
+    commit: {
+      style: options.commitStyles[0],
+      persistentTray: key === 'FOOD_BEVERAGE' || key === 'RETAIL',
+    },
     motion: { tempo: 'BALANCED', reducedMotionSafe: true },
   };
 
   if (key === 'FOOD_BEVERAGE') {
     base.detail.presentation = 'DISH_DOSSIER';
-    base.customerContext = { enabled: true, tableNumber: true, serviceMode: true };
     base.commit.style = COMMIT_STYLES.PAPER_RIP;
   } else if (key === 'HOSPITALITY') {
     base.navigation.mode = 'FLOOR_TRAVERSE';
     base.detail.presentation = 'ROOM_DOSSIER';
-    base.commit.style = COMMIT_STYLES.LIFT_INTO_TRAY;
   } else if (key === 'RETAIL') {
     base.navigation.mode = 'AISLE_TRAVERSE';
     base.detail.presentation = 'PRODUCT_DOSSIER';
@@ -93,9 +137,6 @@ function defaultsForCategory(category) {
   } else if (key === 'LOGISTICS') {
     base.navigation.mode = 'JOURNEY_TIMELINE';
     base.detail.presentation = 'SEAT_DOSSIER';
-    base.customerContext = { enabled: true, passenger: true };
-  } else {
-    base.detail.presentation = 'SERVICE_DOSSIER';
   }
 
   return base;
@@ -118,7 +159,9 @@ function enumValue(value, allowed, fallback) {
 }
 
 function normalizeExperienceBlueprint(input, category) {
-  const defaults = defaultsForCategory(category);
+  const key = categoryKey(category);
+  const defaults = defaultsForCategory(key);
+  const options = categoryOptions(key);
   const raw = asPlainObject(input);
   const preset = enumValue(raw.preset, [defaults.preset], defaults.preset);
 
@@ -126,14 +169,14 @@ function normalizeExperienceBlueprint(input, category) {
     schemaVersion: EXPERIENCE_BLUEPRINT_VERSION,
     preset,
     navigation: {
-      mode: enumValue(raw.navigation?.mode, NAVIGATION_MODES, defaults.navigation.mode),
+      mode: enumValue(raw.navigation?.mode, options.navigationModes, defaults.navigation.mode),
       showProgress: bool(raw.navigation?.showProgress, defaults.navigation.showProgress),
       // Direct jumping remains platform-controlled until a later information
       // architecture proves it helps the specific journey.
       allowDirectJump: false,
     },
     detail: {
-      presentation: enumValue(raw.detail?.presentation, DETAIL_PRESENTATIONS, defaults.detail.presentation),
+      presentation: enumValue(raw.detail?.presentation, options.detailPresentations, defaults.detail.presentation),
       showGallery: bool(raw.detail?.showGallery, defaults.detail.showGallery),
       showSpecifications: bool(raw.detail?.showSpecifications, defaults.detail.showSpecifications),
       showOptions: bool(raw.detail?.showOptions, defaults.detail.showOptions),
@@ -141,12 +184,12 @@ function normalizeExperienceBlueprint(input, category) {
     },
     customerContext: {
       enabled: bool(raw.customerContext?.enabled, defaults.customerContext.enabled),
-      tableNumber: bool(raw.customerContext?.tableNumber, defaults.customerContext.tableNumber === true),
-      serviceMode: bool(raw.customerContext?.serviceMode, defaults.customerContext.serviceMode === true),
-      passenger: bool(raw.customerContext?.passenger, defaults.customerContext.passenger === true),
+      tableNumber: bool(raw.customerContext?.tableNumber, options.customerContext.tableNumber),
+      serviceMode: bool(raw.customerContext?.serviceMode, options.customerContext.serviceMode),
+      passenger: bool(raw.customerContext?.passenger, options.customerContext.passenger),
     },
     commit: {
-      style: enumValue(raw.commit?.style, COMMIT_STYLE_VALUES, defaults.commit.style),
+      style: enumValue(raw.commit?.style, options.commitStyles, defaults.commit.style),
       persistentTray: bool(raw.commit?.persistentTray, defaults.commit.persistentTray),
     },
     motion: {
@@ -195,6 +238,8 @@ module.exports = {
   DETAIL_PRESENTATIONS,
   MOTION_TEMPOS,
   COMMIT_STYLES,
+  CATEGORY_OPTIONS,
+  categoryOptions,
   presetForCategory,
   defaultsForCategory,
   normalizeExperienceBlueprint,
