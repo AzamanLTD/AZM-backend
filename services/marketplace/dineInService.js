@@ -29,7 +29,7 @@ class DineInService {
         return tab;
     }
 
-    async addItem({ tabId, productId, name, price, quantity, notes, addedBy }) {
+    async addItem({ tabId, productId, name, price, quantity, addedBy }) {
         if (!tabId) throw new Error('tabId is required.');
         if (!name) throw new Error('name is required.');
         const priceNum = Number(price);
@@ -86,11 +86,8 @@ class DineInService {
         if (!tab) throw new Error('Tab not found.');
         if (tab.customerId !== customerId) throw new Error('Not authorized to pay this tab.');
         if (tab.status !== 'FINALIZED' && tab.status !== 'CLOSED') throw new Error('Tab must be FINALIZED before payment.');
-
         let invoice = tab.invoice;
-        if (invoice?.status === 'PAID') {
-            return { tab, invoice, payment: { invoice, customerPays: Number(invoice.customerPaidUsdc), alreadyPaid: true } };
-        }
+        if (invoice?.status === 'PAID') return { tab, invoice, payment: { invoice, customerPays: Number(invoice.customerPaidUsdc), alreadyPaid: true } };
         if (!invoice) {
             if (!tab.items.length) throw new Error('Cannot pay an empty dine-in tab.');
             invoice = await invoiceService.createInvoice(this.prisma, {
@@ -107,7 +104,6 @@ class DineInService {
         } else if (invoice.status === 'DRAFT') {
             invoice = await invoiceService.sendInvoice(this.prisma, { invoiceId: invoice.id, businessProfileId: tab.businessProfileId });
         }
-
         const payment = await invoiceService.payInvoice(this.prisma, { invoiceId: invoice.id, customerId, tipUsdc });
         const tip = Math.max(0, Number(tipUsdc) || 0);
         const billTotal = Number(payment.invoice?.billTotalUsdc ?? invoice.billTotalUsdc);
