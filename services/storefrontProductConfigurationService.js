@@ -23,8 +23,13 @@ function normalizedOptionList(options) {
 
 function normalizeVariantGroups(raw) {
   if (Array.isArray(raw)) {
-    return raw.map(group => ({
-      name: String(group?.name ?? group?.id ?? '').trim(),
+    const objectEntries = raw.filter(entry => entry && typeof entry === 'object');
+    const isFlatOptionList = objectEntries.length > 0 && objectEntries.every(entry => !Array.isArray(entry.options) && !Array.isArray(entry.values));
+    if (isFlatOptionList) {
+      return [{ name: 'Size', required: true, options: normalizedOptionList(raw) }];
+    }
+    return raw.map((group, index) => ({
+      name: String(group?.name ?? group?.id ?? `Variant ${index + 1}`).trim(),
       required: group?.required !== false,
       options: normalizedOptionList(group?.options ?? group?.values),
     })).filter(group => group.name);
@@ -39,8 +44,8 @@ function normalizeVariantGroups(raw) {
 
 function normalizeModifierGroups(raw) {
   if (!Array.isArray(raw)) return [];
-  return raw.map(group => ({
-    name: String(group?.name ?? group?.id ?? '').trim(),
+  return raw.map((group, index) => ({
+    name: String(group?.name ?? group?.id ?? `Options ${index + 1}`).trim(),
     required: group?.required === true,
     maxSelection: Math.max(1, Math.floor(numeric(group?.maxSelection ?? group?.max ?? 1))),
     options: normalizedOptionList(group?.options ?? group?.values),
@@ -75,7 +80,8 @@ function validateConfiguredProduct(product, selected) {
   }
 
   for (const group of variants) {
-    const chosen = selectionNames(selection[group.name] ?? (group.name.toLowerCase() === 'size' ? selection.size : selection.variant));
+    const isSizeGroup = group.name.toLowerCase() === 'size';
+    const chosen = selectionNames(selection[group.name] ?? (isSizeGroup ? selection.size : selection.variant));
     if (group.required && chosen.length !== 1) return { error: `Variant option ${group.name} must be selected.` };
     if (!group.required && chosen.length === 0) continue;
     if (chosen.length > 1) return { error: `Variant option ${group.name} allows one selection.` };
@@ -102,7 +108,8 @@ function configuredUnitPrice(product, selected) {
   let total = base;
 
   for (const group of normalizeVariantGroups(product.variants)) {
-    const chosen = selectionNames(selection[group.name] ?? (group.name.toLowerCase() === 'size' ? selection.size : selection.variant));
+    const isSizeGroup = group.name.toLowerCase() === 'size';
+    const chosen = selectionNames(selection[group.name] ?? (isSizeGroup ? selection.size : selection.variant));
     if (!chosen.length) continue;
     const option = group.options.find(candidate => candidate.name === chosen[0]);
     if (option) total += option.priceDelta;
@@ -122,8 +129,9 @@ function normalizedSelection(product, selected) {
   const input = selected && typeof selected === 'object' ? selected : {};
   const result = {};
   for (const group of normalizeVariantGroups(product.variants)) {
-    const chosen = selectionNames(input[group.name] ?? (group.name.toLowerCase() === 'size' ? input.size : input.variant));
-    if (chosen.length) result[group.name.toLowerCase() === 'size' ? 'size' : group.name] = chosen[0];
+    const isSizeGroup = group.name.toLowerCase() === 'size';
+    const chosen = selectionNames(input[group.name] ?? (isSizeGroup ? input.size : input.variant));
+    if (chosen.length) result[isSizeGroup ? 'size' : group.name] = chosen[0];
   }
   for (const group of normalizeModifierGroups(product.modifierGroups)) {
     const chosen = [...new Set(selectionNames(input[group.name]))].sort();
