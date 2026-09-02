@@ -29,9 +29,6 @@ function legacyExperienceFromBusiness(business) {
   return experienceBlueprintService.getExperienceBlueprint(business);
 }
 
-// Authenticated business editor reads from the storefront draft. This keeps
-// experience settings inside the same draft/publish lifecycle as the rest of
-// the storefront rather than maintaining a second editable copy in businessMeta.
 router.get('/me/experience', protect, protectActive, requirePermission('storefront.manage'), async (req, res, next) => {
   try {
     const prisma = req.app.get('prisma');
@@ -51,8 +48,6 @@ router.get('/me/experience', protect, protectActive, requirePermission('storefro
       ? experienceBlueprintService.normalizeExperienceBlueprint(draftLayout.experience, business.category)
       : legacyExperienceFromBusiness(business);
 
-    // One-time migration for older businesses whose experience was stored only
-    // in businessMeta. After this, the draft snapshot is the editor authority.
     if (!hasOwnExperience(draftLayout)) {
       blueprint = legacyExperienceFromBusiness(business);
       await prisma.businessStorefrontLayout.update({
@@ -68,6 +63,7 @@ router.get('/me/experience', protect, protectActive, requirePermission('storefro
         blueprint,
         defaults: experienceBlueprintService.defaultsForCategory(business.category),
         presets: experienceBlueprintService.PRESETS,
+        categoryOptions: experienceBlueprintService.categoryOptions(business.category),
         navigationModes: experienceBlueprintService.NAVIGATION_MODES,
         detailPresentations: experienceBlueprintService.DETAIL_PRESENTATIONS,
         motionTempos: experienceBlueprintService.MOTION_TEMPOS,
@@ -79,10 +75,6 @@ router.get('/me/experience', protect, protectActive, requirePermission('storefro
   }
 });
 
-// The generic draft endpoint is mounted by storefrontRoutes after this router.
-// Keeping this boundary here makes Experience Blueprint preservation a server
-// invariant for the public API path rather than relying on portal/Flutter clients
-// to merge the current snapshot correctly.
 router.put('/me/draft', protect, protectActive, requirePermission('storefront.manage'), async (req, res, next) => {
   try {
     const prisma = req.app.get('prisma');
@@ -152,9 +144,6 @@ router.put('/me/experience', protect, protectActive, requirePermission('storefro
   }
 });
 
-// Public contract is derived from the published storefront. This prevents a
-// business's unsaved/private experience metadata from leaking into customer
-// discovery and keeps the experience contract in lockstep with storefront publication.
 router.get('/:businessProfileId/experience', async (req, res, next) => {
   try {
     const prisma = req.app.get('prisma');
