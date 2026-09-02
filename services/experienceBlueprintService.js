@@ -47,35 +47,40 @@ const CATEGORY_OPTIONS = Object.freeze({
     detailPresentations: Object.freeze(['MORPH', 'DISH_DOSSIER']),
     commitStyles: Object.freeze([COMMIT_STYLES.MATERIAL, COMMIT_STYLES.PAPER_RIP]),
     customerContext: Object.freeze({ tableNumber: true, serviceMode: true, passenger: false }),
+    persistentTray: true,
   }),
   RETAIL: Object.freeze({
     navigationModes: Object.freeze(['CONTEXTUAL', 'AISLE_TRAVERSE']),
     detailPresentations: Object.freeze(['MORPH', 'PRODUCT_DOSSIER']),
     commitStyles: Object.freeze([COMMIT_STYLES.MATERIAL, COMMIT_STYLES.LIFT_INTO_TRAY]),
     customerContext: Object.freeze({ tableNumber: false, serviceMode: false, passenger: false }),
+    persistentTray: true,
   }),
   HOSPITALITY: Object.freeze({
     navigationModes: Object.freeze(['CONTEXTUAL', 'FLOOR_TRAVERSE']),
     detailPresentations: Object.freeze(['MORPH', 'ROOM_DOSSIER']),
     commitStyles: Object.freeze([COMMIT_STYLES.MATERIAL]),
     customerContext: Object.freeze({ tableNumber: false, serviceMode: false, passenger: false }),
+    persistentTray: false,
   }),
   LOGISTICS: Object.freeze({
     navigationModes: Object.freeze(['CONTEXTUAL', 'JOURNEY_TIMELINE']),
     detailPresentations: Object.freeze(['MORPH', 'SEAT_DOSSIER']),
     commitStyles: Object.freeze([COMMIT_STYLES.MATERIAL]),
     customerContext: Object.freeze({ tableNumber: false, serviceMode: false, passenger: true }),
+    persistentTray: false,
   }),
   DEFAULT: Object.freeze({
     navigationModes: Object.freeze(['CONTEXTUAL']),
     detailPresentations: Object.freeze(['MORPH', 'SERVICE_DOSSIER']),
     commitStyles: Object.freeze([COMMIT_STYLES.MATERIAL]),
     customerContext: Object.freeze({ tableNumber: false, serviceMode: false, passenger: false }),
+    persistentTray: false,
   }),
 });
 
 function categoryKey(category) {
-  return String(category || '').toUpperCase();
+  return String(category || '').trim().toUpperCase();
 }
 
 function categoryOptions(category) {
@@ -118,10 +123,7 @@ function defaultsForCategory(category) {
     },
     commit: {
       style: options.commitStyles[0],
-      // Keep the historical persisted-contract default. Category-aware commit
-      // semantics are enforced by commit.style; a persistent tray is merely a
-      // UI preference and remains backwards compatible until a category opts out.
-      persistentTray: true,
+      persistentTray: options.persistentTray,
     },
     motion: { tempo: 'BALANCED', reducedMotionSafe: true },
   };
@@ -196,7 +198,9 @@ function normalizeExperienceBlueprint(input, category) {
     },
     commit: {
       style: enumValue(raw.commit?.style, options.commitStyles, defaults.commit.style),
-      persistentTray: bool(raw.commit?.persistentTray, defaults.commit.persistentTray),
+      persistentTray: options.persistentTray
+        ? bool(raw.commit?.persistentTray, defaults.commit.persistentTray)
+        : false,
     },
     motion: {
       tempo: enumValue(raw.motion?.tempo, MOTION_TEMPOS, defaults.motion.tempo),
