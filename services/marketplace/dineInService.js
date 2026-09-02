@@ -6,7 +6,7 @@ const {
     validateConfiguredProduct,
     configuredUnitPrice,
     normalizedSelection,
-} = require('../services/storefrontProductConfigurationService');
+} = require('../storefrontProductConfigurationService');
 
 const selectionLabel = (selection) => {
     const entries = Object.entries(selection || {});
@@ -89,7 +89,7 @@ class DineInService {
 
         let invoice = tab.invoice;
         if (invoice?.status === 'PAID') {
-            return { tab, invoice, payment: { invoice, customerPays: Number(invoice.customerPaidUsdc), businessReceives: null, fee: null, idempotent: true } };
+            return { tab, invoice, payment: { invoice, customerPays: Number(invoice.customerPaidUsdc), alreadyPaid: true } };
         }
         if (!invoice) {
             if (!tab.items.length) throw new Error('Cannot pay an empty dine-in tab.');
