@@ -34,20 +34,26 @@ exports.getOpenTabs = exports.getTabs;
 
 exports.getCustomerTabs = async (prisma, opts) => service(prisma, opts).getCustomerTabs(opts.userId, opts.status);
 
-exports.getTab = async (prisma, opts) => {
-    const svc = service(prisma, opts);
-    const tab = await svc.getTab(opts.tabId);
+exports.getTab = async (prisma, { tabId, customerId, io }) => {
+    const svc = new DineInService(prisma, io);
+    const tab = await svc.getTab(tabId);
     if (!tab) throw new Error('Tab not found.');
-    if (opts.customerId != null && tab.customerId !== opts.customerId) {
+    if (customerId != null && tab.customerId !== customerId) {
         throw new Error('Not authorized to view this tab.');
     }
     return tab;
 };
 
-exports.confirmTab = async (prisma, opts) => service(prisma, opts).confirmTab(opts.tabId, opts.customerId);
+exports.confirmTab = async (prisma, { tabId, customerId, io }) => service(prisma, { io }).confirmTab(tabId, customerId);
 
-exports.confirmAndPay = async (prisma, opts) => service(prisma, opts).confirmAndPay(opts.tabId, opts.customerId, { tipUsdc: opts.tipUsdc });
+exports.confirmAndPay = async (prisma, { tabId, customerId, tipUsdc, io }) => {
+    const svc = new DineInService(prisma, io);
+    if (typeof svc.confirmAndPay === 'function') {
+        return svc.confirmAndPay(tabId, customerId, { tipUsdc });
+    }
+    return svc.confirmTab(tabId, customerId);
+};
 
-exports.cancelTab = async (prisma, opts) => service(prisma, opts).cancelTab(opts.tabId);
+exports.cancelTab = async (prisma, { tabId, io }) => service(prisma, { io }).cancelTab(tabId);
 
 exports.reportDefault = exports.cancelTab;
