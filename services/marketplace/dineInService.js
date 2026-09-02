@@ -14,6 +14,19 @@ const selectionLabel = (selection) => {
     return entries.map(([group, value]) => `${group}: ${(Array.isArray(value) ? value : [value]).join(', ')}`).join(' · ');
 };
 
+// Keep the canonical invoice service authoritative while allowing its payment
+// transaction to participate in a larger interactive transaction. The proxy
+// delegates all Prisma model access to the transaction client and replaces only
+// $transaction so invoiceService.payInvoice executes on the existing transaction
+// instead of opening a nested transaction.
+const transactionScopedPrisma = (prisma, tx) => new Proxy(prisma, {
+    get(target, property, receiver) {
+        if (property === '$transaction') return async (callback) => callback(tx);
+        if (property in tx) return tx[property];
+        return Reflect.get(target, property, receiver);
+    },
+});
+
 class DineInService {
     constructor(prisma, io) { this.prisma = prisma; this.io = io; }
 
@@ -87,7 +100,15 @@ class DineInService {
         if (tab.customerId !== customerId) throw new Error('Not authorized to pay this tab.');
         if (tab.status !== 'FINALIZED' && tab.status !== 'CLOSED') throw new Error('Tab must be FINALIZED before payment.');
         let invoice = tab.invoice;
-        if (invoice?.status === 'PAID') return { tab, invoice, payment: { invoice, customerPays: Number(invoice.customerPaidUsdc), alreadyPaid: true } };
+
+        if (invoice?.status === 'PAID') {
+            return { tab, invoice, payment: { invoice, customerPays: Number(invoice.customerPaidUsdc), alreadyPaid: true } };
+        }
+
+        // Invoice creation/sending is non-financial preparation. Keep it on the
+        // canonical invoice service, then make the actual debit/credit AND the
+        // final tab close one atomic transaction below. A failed payment leaves
+        // the SENT invoice and FINALIZED tab intact and safely retryable.
         if (!invoice) {
             if (!tab.items.length) throw new Error('Cannot pay an empty dine-in tab.');
             invoice = await invoiceService.createInvoice(this.prisma, {
@@ -104,13 +125,35 @@ class DineInService {
         } else if (invoice.status === 'DRAFT') {
             invoice = await invoiceService.sendInvoice(this.prisma, { invoiceId: invoice.id, businessProfileId: tab.businessProfileId });
         }
-        const payment = await invoiceService.payInvoice(this.prisma, { invoiceId: invoice.id, customerId, tipUsdc });
-        const tip = Math.max(0, Number(tipUsdc) || 0);
-        const billTotal = Number(payment.invoice?.billTotalUsdc ?? invoice.billTotalUsdc);
-        const grandTotal = billTotal + tip;
-        const closed = await this.prisma.dineInTab.update({ where: { id: tabId }, data: { status: 'CLOSED', closedAt: new Date(), tipUsdc: tip, grandTotalUsdc: grandTotal, paymentMethod: 'AZAMAN_BALANCE' }, include: { items: true, invoice: true } });
-        this.io?.to(`user_${customerId}`).emit('dine_in_tab_paid', { tabId, invoiceId: invoice.id, customerPays: payment.customerPays, businessReceives: payment.businessReceives, fee: payment.fee });
-        return { tab: closed, invoice: payment.invoice, payment };
+
+        const settlement = await this.prisma.$transaction(async (tx) => {
+            const scopedPrisma = transactionScopedPrisma(this.prisma, tx);
+            const payment = await invoiceService.payInvoice(scopedPrisma, { invoiceId: invoice.id, customerId, tipUsdc });
+            const tip = Math.max(0, Number(tipUsdc) || 0);
+            const billTotal = Number(payment.invoice?.billTotalUsdc ?? invoice.billTotalUsdc);
+            const grandTotal = billTotal + tip;
+            const closed = await tx.dineInTab.update({
+                where: { id: tabId },
+                data: {
+                    status: 'CLOSED',
+                    closedAt: new Date(),
+                    tipUsdc: tip,
+                    grandTotalUsdc: grandTotal,
+                    paymentMethod: 'AZAMAN_BALANCE',
+                },
+                include: { items: true, invoice: true },
+            });
+            return { closed, payment };
+        });
+
+        this.io?.to(`user_${customerId}`).emit('dine_in_tab_paid', {
+            tabId,
+            invoiceId: invoice.id,
+            customerPays: settlement.payment.customerPays,
+            businessReceives: settlement.payment.businessReceives,
+            fee: settlement.payment.fee,
+        });
+        return { tab: settlement.closed, invoice: settlement.payment.invoice, payment: settlement.payment };
     }
 
     async confirmTab(tabId, customerId) {
