@@ -15,6 +15,22 @@ class RestaurantOpsService {
 
     // Create a kitchen order from a BusinessOrder
     async createKitchenOrder({ businessProfileId, locationId, businessOrderId, tableNumber, serverName, items, station, specialInstructions, isRush }) {
+        if (!businessProfileId) throw new Error('Business profile context is required.');
+        if (locationId) {
+            const location = await this.prisma.businessLocation.findFirst({
+                where: { id: locationId, businessProfileId },
+                select: { id: true },
+            });
+            if (!location) throw new Error('Location not found for this business.');
+        }
+        if (businessOrderId) {
+            const businessOrder = await this.prisma.businessOrder.findFirst({
+                where: { id: businessOrderId, businessProfileId },
+                select: { id: true },
+            });
+            if (!businessOrder) throw new Error('Business order not found for this business.');
+        }
+
         const today = new Date();
         today.setHours(0, 0, 0, 0);
         const tomorrow = new Date(today);
@@ -33,21 +49,21 @@ class RestaurantOpsService {
 
         for (const item of items) {
             const product = await this.prisma.businessProduct.findFirst({
-                where: { id: item.productId, businessProfileId },
+                where: { id: item.productId, businessProfileId, isActive: true },
             });
-            if (product) {
-                const allergens = product.metadata?.allergens || [];
-                if (allergens.length > 0) allergyAlerts.push(...allergens);
-                const itemStation = item.station || product.metadata?.station || station || 'HOT';
-                orderItems.push({
-                    productId: item.productId,
-                    name: product.name,
-                    quantity: item.quantity,
-                    station: itemStation,
-                    modifiers: item.modifiers || [],
-                    status: 'NEW',
-                });
-            }
+            if (!product) throw new Error('Product not found for this business: ' + item.productId);
+
+            const allergens = product.metadata?.allergens || [];
+            if (allergens.length > 0) allergyAlerts.push(...allergens);
+            const itemStation = item.station || product.metadata?.station || station || 'HOT';
+            orderItems.push({
+                productId: item.productId,
+                name: product.name,
+                quantity: item.quantity,
+                station: itemStation,
+                modifiers: item.modifiers || [],
+                status: 'NEW',
+            });
         }
 
         const uniqueAllergies = [...new Set(allergyAlerts)];
