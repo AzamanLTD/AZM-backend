@@ -15,6 +15,7 @@
 
 const logger = require('../src/config/logger');
 const { protect } = require('./authMiddleware');
+const requestContext = require('../src/context/requestContext');
 
 const APPEAL_EMAIL = process.env.APPEAL_EMAIL || 'support@azaman.me';
 
@@ -27,6 +28,11 @@ const APPEAL_EMAIL = process.env.APPEAL_EMAIL || 'support@azaman.me';
  * blocked unless banStatus === 'ACTIVE' or the time-bound ban has expired.
  */
 const checkBan = async (req, res, next) => {
+    // Establish an async request context before any route-specific middleware
+    // or handler runs. Service-level authorization can then bind mutations to
+    // the authenticated business context without passing Express objects down.
+    requestContext.enter(req);
+
     // No user context → let the route's own protect/auth handler reject it.
     if (!req.user || !req.user.id) return next();
 
