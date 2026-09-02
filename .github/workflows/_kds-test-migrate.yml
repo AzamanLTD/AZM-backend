@@ -1,0 +1,44 @@
+name: KDS test migration
+on:
+  push:
+    branches: [fix/restaurant-kds-business-scope-clean]
+permissions:
+  contents: write
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: Migrate shared KDS integration test
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('__tests__/business-os.test.js')
+          s = p.read_text()
+          old = [
+              "const preparing = await svc.updateOrderStatus(order.id, 'PREPARING');",
+              "const ready = await svc.updateOrderStatus(order.id, 'READY');",
+              "const served = await svc.updateOrderStatus(order.id, 'SERVED');",
+          ]
+          new = [
+              "const preparing = await svc.updateOrderStatus(order.id, 'PREPARING', businessProfile.id);",
+              "const ready = await svc.updateOrderStatus(order.id, 'READY', businessProfile.id);",
+              "const served = await svc.updateOrderStatus(order.id, 'SERVED', businessProfile.id);",
+          ]
+          changed = 0
+          for a, b in zip(old, new):
+              if a in s:
+                  s = s.replace(a, b, 1)
+                  changed += 1
+          if changed != 3:
+              raise SystemExit(f'expected 3 replacements, got {changed}')
+          p.write_text(s)
+          PY
+          git config user.name 'azaman-ci'
+          git config user.email 'azaman-ci@users.noreply.github.com'
+          git add __tests__/business-os.test.js
+          git diff --cached --quiet && exit 0
+          git commit -m 'test(restaurant): update shared KDS scope contract'
+          git push origin HEAD:fix/restaurant-kds-business-scope-clean
