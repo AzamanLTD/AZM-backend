@@ -654,14 +654,14 @@ describeIf('Business OS — Restaurant Operations (KDS)', () => {
             items: [{ productId: testProduct.id, quantity: 1 }],
         });
 
-        const preparing = await svc.updateOrderStatus(order.id, 'PREPARING');
+        const preparing = await svc.updateOrderStatus(order.id, 'PREPARING', businessProfile.id);
         expect(preparing.status).toBe('PREPARING');
         expect(preparing.startedAt).toBeTruthy();
 
-        const ready = await svc.updateOrderStatus(order.id, 'READY');
+        const ready = await svc.updateOrderStatus(order.id, 'READY', businessProfile.id);
         expect(ready.status).toBe('READY');
 
-        const served = await svc.updateOrderStatus(order.id, 'SERVED');
+        const served = await svc.updateOrderStatus(order.id, 'SERVED', businessProfile.id);
         expect(served.status).toBe('SERVED');
     });
 
@@ -726,14 +726,14 @@ describeIf('Business OS — Transit Operations', () => {
         const records = await svc.getMaintenanceRecords(businessProfile.id, { vehicleId: testVehicle.id });
         const record = records[0];
 
-        const inProgress = await svc.updateMaintenanceStatus(record.id, { status: 'IN_PROGRESS' });
+        const inProgress = await svc.updateMaintenanceStatus(record.id, { status: 'IN_PROGRESS' }, businessProfile.id);
         expect(inProgress.status).toBe('IN_PROGRESS');
 
         const completed = await svc.updateMaintenanceStatus(record.id, {
             status: 'COMPLETED',
             actualCost: 175.00,
             notes: 'Also replaced filter',
-        });
+        }, businessProfile.id);
         expect(completed.status).toBe('COMPLETED');
         expect(parseFloat(completed.cost)).toBe(175);
     });

@@ -1081,7 +1081,8 @@ router.post('/transit/drivers/assign', wrap(async (req, res) => {
 
 router.patch('/transit/drivers/:id/status', wrap(async (req, res) => {
     const svc = getServices(req);
-    const assignment = await svc.transitOpsService.updateAssignmentStatus(req.params.id, req.body.status);
+    const bpId = await getBusinessProfileId(req);
+    const assignment = await svc.transitOpsService.updateAssignmentStatus(req.params.id, req.body.status, bpId);
     res.json({ success: true, assignment });
 }));
 
@@ -1122,14 +1123,16 @@ router.post('/transit/fleet/maintenance', wrap(async (req, res) => {
 
 router.patch('/transit/fleet/maintenance/:id', wrap(async (req, res) => {
     const svc = getServices(req);
-    const record = await svc.transitOpsService.updateMaintenanceStatus(req.params.id, req.body);
+    const bpId = await getBusinessProfileId(req);
+    const record = await svc.transitOpsService.updateMaintenanceStatus(req.params.id, req.body, bpId);
     res.json({ success: true, record });
 }));
 
 // Manifests
 router.get('/transit/manifests/:tripId', wrap(async (req, res) => {
     const svc = getServices(req);
-    const manifest = await svc.transitOpsService.getTripManifest(req.params.tripId);
+    const bpId = await getBusinessProfileId(req);
+    const manifest = await svc.transitOpsService.getTripManifest(req.params.tripId, bpId);
     res.json({ success: true, manifest });
 }));
 
@@ -1143,7 +1146,8 @@ router.get('/transit/manifests', wrap(async (req, res) => {
 
 router.post('/transit/manifests/board', wrap(async (req, res) => {
     const svc = getServices(req);
-    const result = await svc.transitOpsService.boardPassenger(req.body.reservationId);
+    const bpId = await getBusinessProfileId(req);
+    const result = await svc.transitOpsService.boardPassenger(req.body.reservationId, bpId);
     res.json({ success: true, result });
 }));
 
