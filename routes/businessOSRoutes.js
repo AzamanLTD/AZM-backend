@@ -846,31 +846,35 @@ router.post('/restaurant/kds', wrap(async (req, res) => {
 
 router.patch('/restaurant/kds/:id/status', wrap(async (req, res) => {
     const svc = getServices(req);
-    const order = await svc.restaurantOpsService.updateOrderStatus(req.params.id, req.body.status);
+    const bpId = await getBusinessProfileId(req);
+    const order = await svc.restaurantOpsService.updateOrderStatus(req.params.id, req.body.status, bpId);
     res.json({ success: true, order });
 }));
 
 // Bump (advance to next status): NEW → PREPARING → READY → SERVED
 router.post('/restaurant/kds/:id/bump', wrap(async (req, res) => {
     const svc = getServices(req);
+    const bpId = await getBusinessProfileId(req);
     const FLOW = ['NEW', 'PREPARING', 'READY', 'SERVED'];
-    const order = await svc.prisma.kitchenOrder.findUnique({ where: { id: req.params.id } });
+    const order = await svc.prisma.kitchenOrder.findFirst({ where: { id: req.params.id, businessProfileId: bpId } });
     if (!order) throw new Error('Kitchen order not found.');
     const currentIdx = FLOW.indexOf(order.status);
     const nextStatus = currentIdx >= 0 && currentIdx < FLOW.length - 1 ? FLOW[currentIdx + 1] : 'SERVED';
-    const updated = await svc.restaurantOpsService.updateOrderStatus(req.params.id, nextStatus);
+    const updated = await svc.restaurantOpsService.updateOrderStatus(req.params.id, nextStatus, bpId);
     res.json({ success: true, order: updated });
 }));
 
 router.patch('/restaurant/kds/:id/item-status', wrap(async (req, res) => {
     const svc = getServices(req);
-    const order = await svc.restaurantOpsService.updateItemStatus(req.params.id, req.body.itemIndex, req.body.status);
+    const bpId = await getBusinessProfileId(req);
+    const order = await svc.restaurantOpsService.updateItemStatus(req.params.id, req.body.itemIndex, req.body.status, bpId);
     res.json({ success: true, order });
 }));
 
 router.post('/restaurant/kds/:id/assign-chef', wrap(async (req, res) => {
     const svc = getServices(req);
-    const order = await svc.restaurantOpsService.assignChef(req.params.id, req.body.employeeId);
+    const bpId = await getBusinessProfileId(req);
+    const order = await svc.restaurantOpsService.assignChef(req.params.id, req.body.employeeId, bpId);
     res.json({ success: true, order });
 }));
 
