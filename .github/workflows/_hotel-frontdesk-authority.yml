@@ -1,0 +1,30 @@
+name: Hotel front desk authority patch
+on:
+  push:
+    branches: [fix/hotel-ops-business-scope-clean]
+permissions:
+  contents: write
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: Replace legacy room enrichment
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          p=Path('services/businessOS/hotelOpsService.js')
+          s=p.read_text()
+          old="""        // Enrich with product names (serviceItemId → BusinessProduct.name)\n        const allReservations = [...arrivals, ...departures, ...inHouse];\n        const productIds = [...new Set(allReservations.map(r => r.serviceItemId).filter(Boolean))];\n        const products = productIds.length > 0\n            ? await this.prisma.businessProduct.findMany({ where: { id: { in: productIds } }, select: { id: true, name: true } })\n            : [];\n        const productMap = Object.fromEntries(products.map(p => [p.id, p.name]));\n        const enrich = (list) => list.map(r => ({\n            ...r,\n            room: r.serviceItemId ? { roomNumber: productMap[r.serviceItemId] || '—', roomType: '—' } : null,\n        }));"""
+          new="""        // Enrich from the authoritative HotelRoom inventory, not legacy BusinessProduct rows.\n        const allReservations = [...arrivals, ...departures, ...inHouse];\n        const roomIds = [...new Set(allReservations.map(r => r.serviceItemId).filter(Boolean))];\n        const rooms = roomIds.length > 0\n            ? await this.prisma.hotelRoom.findMany({\n                where: { id: { in: roomIds }, businessProfileId },\n                select: { id: true, roomNumber: true, roomType: true, floor: true, status: true },\n            })\n            : [];\n        const roomMap = Object.fromEntries(rooms.map(r => [r.id, r]));\n        const enrich = (list) => list.map(r => ({\n            ...r,\n            room: r.serviceItemId ? (roomMap[r.serviceItemId] || null) : null,\n        }));"""
+          if old not in s: raise SystemExit('legacy enrichment pattern missing')
+          p.write_text(s.replace(old,new,1))
+          PY
+          rm .github/workflows/_hotel-frontdesk-authority.yml
+          git config user.name 'azaman-ci'
+          git config user.email 'azaman-ci@users.noreply.github.com'
+          git add services/businessOS/hotelOpsService.js .github/workflows/_hotel-frontdesk-authority.yml
+          git commit -m 'fix(hotel): use authoritative rooms in front desk'
+          git push origin HEAD:fix/hotel-ops-business-scope-clean
