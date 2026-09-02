@@ -57,6 +57,7 @@ describe('dine-in customer ordering and settlement', () => {
     jest.doMock('../services/businessInvoiceService', () => ({ createInvoice, sendInvoice, payInvoice }));
     const Service = require('../services/marketplace/dineInService');
     const prisma = {
+      $transaction: jest.fn(async (callback) => callback(prisma)),
       dineInTab: {
         findUnique: jest.fn().mockResolvedValue({ id: 'tab-1', customerId: 7, status: 'FINALIZED', businessProfileId: 'biz-1', locationId: 'loc-1', tableId: 'table-1', invoice: null, items: [{ name: 'Burger', unitPriceUsdc: 20, quantity: 1 }] }),
         update: jest.fn()
@@ -72,7 +73,9 @@ describe('dine-in customer ordering and settlement', () => {
       lineItems: [{ description: 'Burger', quantity: 1, unitPrice: 20 }], taxLines: [],
     }));
     expect(sendInvoice).toHaveBeenCalledWith(prisma, { invoiceId: 'invoice-1', businessProfileId: 'biz-1' });
-    expect(payInvoice).toHaveBeenCalledWith(prisma, { invoiceId: 'invoice-1', customerId: 7, tipUsdc: 2 });
+    expect(payInvoice).toHaveBeenCalledWith(expect.objectContaining({
+      dineInTab: prisma.dineInTab,
+    }), { invoiceId: 'invoice-1', customerId: 7, tipUsdc: 2 });
     expect(prisma.dineInTab.update).toHaveBeenLastCalledWith(expect.objectContaining({
       where: { id: 'tab-1' },
       data: expect.objectContaining({ status: 'CLOSED', tipUsdc: 2, grandTotalUsdc: 22, paymentMethod: 'AZAMAN_BALANCE' }),
