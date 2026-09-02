@@ -39,25 +39,36 @@ class TransitOpsService {
             throw new Error('Only drivers or managers can be assigned to trips.');
         }
 
-        // Check for conflicts — same date, overlapping trips
+        let trip = null;
         if (tripId) {
-            const trip = await this.prisma.transitTrip.findUnique({
-                where: { id: tripId },
+            trip = await this.prisma.transitTrip.findFirst({
+                where: { id: tripId, businessProfileId },
             });
-            if (trip) {
-                const existing = await this.prisma.driverAssignment.findFirst({
-                    where: {
-                        employeeId,
-                        assignmentDate: new Date(assignmentDate),
-                        status: { in: ['ASSIGNED', 'CHECKED_IN', 'ON_DUTY'] },
-                    },
-                    include: { trip: true },
-                });
-                if (existing && existing.trip) {
-                    // Check time overlap
-                    if (existing.trip.departureAt < trip.arrivalTime && existing.trip.arrivalTime > trip.departureAt) {
-                        throw new Error('Driver has a conflicting trip at this time.');
-                    }
+            if (!trip) throw new Error('Trip not found for this business.');
+        }
+
+        if (vehicleId) {
+            const vehicle = await this.prisma.transitVehicle.findFirst({
+                where: { id: vehicleId, businessProfileId },
+            });
+            if (!vehicle) throw new Error('Vehicle not found for this business.');
+        }
+
+        // Check for conflicts — same date, overlapping trips
+        if (tripId && trip) {
+            const existing = await this.prisma.driverAssignment.findFirst({
+                where: {
+                    businessProfileId,
+                    employeeId,
+                    assignmentDate: new Date(assignmentDate),
+                    status: { in: ['ASSIGNED', 'CHECKED_IN', 'ON_DUTY'] },
+                },
+                include: { trip: true },
+            });
+            if (existing && existing.trip) {
+                // Check time overlap
+                if (existing.trip.departureAt < trip.arrivalTime && existing.trip.arrivalTime > trip.departureAt) {
+                    throw new Error('Driver has a conflicting trip at this time.');
                 }
             }
         }
@@ -99,9 +110,10 @@ class TransitOpsService {
         });
     }
 
-    async updateAssignmentStatus(assignmentId, status) {
-        const assignment = await this.prisma.driverAssignment.findUnique({
-            where: { id: assignmentId },
+    async updateAssignmentStatus(assignmentId, status, businessProfileId) {
+        if (!businessProfileId) throw new Error('Business profile context is required.');
+        const assignment = await this.prisma.driverAssignment.findFirst({
+            where: { id: assignmentId, businessProfileId },
         });
         if (!assignment) throw new Error('Assignment not found.');
 
@@ -140,6 +152,12 @@ class TransitOpsService {
     // ═══ FLEET MANAGEMENT ═════════════════════════════════════════════════════
 
     async createMaintenanceRecord({ businessProfileId, vehicleId, type, scheduledDate, description, cost, odometer, serviceProvider, notes }) {
+        const vehicle = await this.prisma.transitVehicle.findFirst({
+            where: { id: vehicleId, businessProfileId },
+            select: { id: true },
+        });
+        if (!vehicle) throw new Error('Vehicle not found for this business.');
+
         // VehicleMaintenance uses `description` not `notes`; merge if both provided
         const finalDescription = description || notes;
         return this.prisma.vehicleMaintenance.create({
@@ -170,9 +188,15 @@ class TransitOpsService {
         });
     }
 
-    async updateMaintenanceStatus(maintenanceId, { status, completedDate, actualCost, notes, performedBy }) {
+    async updateMaintenanceStatus(maintenanceId, { status, completedDate, actualCost, notes, performedBy }, businessProfileId) {
+        if (!businessProfileId) throw new Error('Business profile context is required.');
+        const maintenance = await this.prisma.vehicleMaintenance.findFirst({
+            where: { id: maintenanceId, businessProfileId },
+            select: { id: true },
+        });
+        if (!maintenance) throw new Error('Maintenance record not found.');
+
         const updates = { status };
-        // if (status === 'IN_PROGRESS') — no startedAt field in schema, skip
         if (status === 'COMPLETED') {
             updates.completedDate = completedDate ? new Date(completedDate) : new Date();
             if (actualCost) updates.cost = parseFloat(actualCost);
@@ -223,9 +247,10 @@ class TransitOpsService {
 
     // ═══ LIVE MANIFESTS ═══════════════════════════════════════════════════════
 
-    async getTripManifest(tripId) {
-        const trip = await this.prisma.transitTrip.findUnique({
-            where: { id: tripId },
+    async getTripManifest(tripId, businessProfileId) {
+        if (!businessProfileId) throw new Error('Business profile context is required.');
+        const trip = await this.prisma.transitTrip.findFirst({
+            where: { id: tripId, businessProfileId },
             include: {
                 reservations: {
                     where: { status: { in: ['CONFIRMED', 'CHECKED_IN', 'BOARDED'] } },
@@ -235,7 +260,7 @@ class TransitOpsService {
                     orderBy: { seatNumber: 'asc' },
                 },
                 driverAssignments: {
-                    where: { status: { in: ['ASSIGNED', 'CHECKED_IN', 'ON_DUTY'] } },
+                    where: { businessProfileId, status: { in: ['ASSIGNED', 'CHECKED_IN', 'ON_DUTY'] } },
                     include: {
                         employee: { include: { user: { select: { username: true, phone: true } } } },
                         vehicle: true,
@@ -273,13 +298,21 @@ class TransitOpsService {
     }
 
     // Boarding — mark passenger as boarded (called by driver scanner)
-    async boardPassenger(reservationId) {
-        const reservation = await this.prisma.reservation.findUnique({
-            where: { id: reservationId },
+    async boardPassenger(reservationId, businessProfileId) {
+        if (!businessProfileId) throw new Error('Business profile context is required.');
+        const reservation = await this.prisma.reservation.findFirst({
+            where: { id: reservationId, businessProfileId },
+            include: { trip: { select: { id: true, businessProfileId: true } } },
         });
         if (!reservation) throw new Error('Reservation not found.');
+        if (reservation.trip && reservation.trip.businessProfileId !== businessProfileId) {
+            throw new Error('Reservation does not belong to this business.');
+        }
         if (reservation.status === 'BOARDED') throw new Error('Passenger already boarded.');
         if (reservation.status === 'CANCELLED') throw new Error('Reservation was cancelled.');
+        if (!['CONFIRMED', 'CHECKED_IN'].includes(reservation.status)) {
+            throw new Error('Passenger is not eligible for boarding.');
+        }
 
         return this.prisma.reservation.update({
             where: { id: reservationId },
@@ -303,7 +336,7 @@ class TransitOpsService {
 
         const manifests = [];
         for (const trip of trips) {
-            const manifest = await this.getTripManifest(trip.id);
+            const manifest = await this.getTripManifest(trip.id, businessProfileId);
             manifests.push(manifest);
         }
 
@@ -312,6 +345,14 @@ class TransitOpsService {
     // ═══ MODULE 05: ROUTE TEMPLATES ═════════════════════════════════════════
 
     async createRouteTemplate({ businessProfileId, name, origin, destination, typicalFareUsdc, typicalDurationMins, vehicleId, defaultDepartureTimes, notes }) {
+        if (vehicleId) {
+            const vehicle = await this.prisma.transitVehicle.findFirst({
+                where: { id: vehicleId, businessProfileId },
+                select: { id: true },
+            });
+            if (!vehicle) throw new Error('Vehicle not found for this business.');
+        }
+
         return this.prisma.transitRouteTemplate.create({
             data: {
                 businessProfileId,
@@ -350,6 +391,16 @@ class TransitOpsService {
         });
         if (!tpl) throw new Error('Route template not found.');
 
+        let vehicleCapacity = 0;
+        if (tpl.vehicleId) {
+            const vehicle = await this.prisma.transitVehicle.findFirst({
+                where: { id: tpl.vehicleId, businessProfileId },
+                select: { capacity: true },
+            });
+            if (!vehicle) throw new Error('Route template vehicle no longer belongs to this business.');
+            vehicleCapacity = vehicle.capacity || 0;
+        }
+
         const start = new Date(startDate);
         const created = [];
         const departureTimes = tpl.defaultDepartureTimes || ['07:00'];
@@ -377,7 +428,7 @@ class TransitOpsService {
                         departureAt,
                         arrivalAt,
                         fareUsdc: tpl.typicalFareUsdc,
-                        availableSeats: tpl.vehicle ? (await this.prisma.transitVehicle.findUnique({ where: { id: tpl.vehicleId }, select: { capacity: true } }))?.capacity || 0 : 0,
+                        availableSeats: vehicleCapacity,
                         status: 'SCHEDULED',
                     },
                 });
@@ -475,4 +526,3 @@ class TransitOpsService {
 }
 
 module.exports = { TransitOpsService };
-
