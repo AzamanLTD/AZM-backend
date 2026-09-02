@@ -22,9 +22,14 @@ exports.getTabs = async (prisma, opts) => {
     return svc.getOpenTabs(opts);
 };
 
-exports.getTab = async (prisma, { tabId }) => {
+exports.getTab = async (prisma, { tabId, customerId }) => {
     const svc = new DineInService(prisma);
-    return svc.getTabById(tabId);
+    const tab = await svc.getTab(tabId);
+    if (!tab) throw new Error('Tab not found.');
+    if (customerId != null && tab.customerId !== customerId) {
+        throw new Error('Not authorized to view this tab.');
+    }
+    return tab;
 };
 
 exports.confirmAndPay = async (prisma, opts) => {
