@@ -17,9 +17,17 @@ const kybGate = async (req, res, next) => {
         // Skip if no authenticated user (let auth middleware handle that)
         if (!req.user || !req.user.id) return next();
 
-        // Look up the user's business profile
-        const { PrismaClient } = require('@prisma/client');
-        const prisma = req.app.get('prisma') || new PrismaClient();
+        // Reuse the request-scoped Prisma client when available so the gate
+        // participates in the same DB lifecycle as the rest of the request.
+        const prisma = req.app.get('prisma');
+        if (!prisma) {
+            logger.error('[kybGate] Prisma client unavailable. Failing closed.');
+            return res.status(503).json({
+                success: false,
+                message: 'Business verification is temporarily unavailable. Please try again.',
+                code: 'KYB_GATE_UNAVAILABLE',
+            });
+        }
 
         const business = await prisma.businessProfile.findFirst({
             where: { userId: req.user.id },
@@ -52,10 +60,12 @@ const kybGate = async (req, res, next) => {
         req.businessProfile = business;
         next();
     } catch (err) {
-        logger.error({ err: err }, '[kybGate]');
-        // On error, fail open (let the request proceed) — don't block legit traffic
-        // due to an internal error. Log it for investigation.
-        next();
+        logger.error({ err }, '[kybGate] Business verification lookup failed; failing closed.');
+        return res.status(503).json({
+            success: false,
+            message: 'Business verification is temporarily unavailable. Please try again.',
+            code: 'KYB_GATE_UNAVAILABLE',
+        });
     }
 };
 
