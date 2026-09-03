@@ -1,41 +1,28 @@
-jest.mock('../src/lib/businessRequestContext', () => ({
-    getBusinessRequestContext: jest.fn(),
-}));
-
-const { getBusinessRequestContext } = require('../src/lib/businessRequestContext');
 const { TimeOffService } = require('../services/businessOS/timeOffService');
 
-const context = {
-    businessProfileId: 'biz-1',
-    userId: 99,
-    isAdmin: false,
-    isBusinessOwner: true,
-};
-
 describe('TimeOffService approval mutations', () => {
-    beforeEach(() => {
-        jest.clearAllMocks();
-        getBusinessRequestContext.mockReturnValue(context);
-    });
-
-    test('scopes approval to the active business and pending status', async () => {
+    test('scopes approval to the request business and pending status', async () => {
         const prisma = {
-            timeOffRequest: {
-                findFirst: jest.fn().mockResolvedValue({ id: 'req-1', status: 'PENDING', employeeId: 'emp-2' }),
-                updateMany: jest.fn().mockResolvedValue({ count: 1 }),
-                findUnique: jest.fn().mockResolvedValue({ id: 'req-1', status: 'APPROVED' }),
+            user: {
+                findUnique: jest.fn().mockResolvedValue({ role: 'MANAGER' }),
             },
             businessEmployee: {
-                findFirst: jest.fn().mockResolvedValue(null),
+                findFirst: jest.fn().mockResolvedValue({ id: 'emp-manager', businessProfileId: 'biz-1' }),
+            },
+            timeOffRequest: {
+                findUnique: jest.fn()
+                    .mockResolvedValueOnce({ id: 'req-1', businessProfileId: 'biz-1', status: 'PENDING', employeeId: 'emp-2' })
+                    .mockResolvedValueOnce({ id: 'req-1', status: 'APPROVED' }),
+                updateMany: jest.fn().mockResolvedValue({ count: 1 }),
             },
         };
 
         const result = await new TimeOffService(prisma).approveTimeOff('req-1', 99, 'Approved');
 
         expect(result.status).toBe('APPROVED');
-        expect(prisma.timeOffRequest.findFirst).toHaveBeenCalledWith({
-            where: { id: 'req-1', businessProfileId: 'biz-1' },
-            select: { id: true, status: true, employeeId: true },
+        expect(prisma.businessEmployee.findFirst).toHaveBeenCalledWith({
+            where: { userId: 99, businessProfileId: 'biz-1', status: 'ACTIVE' },
+            select: { id: true, businessProfileId: true },
         });
         expect(prisma.timeOffRequest.updateMany).toHaveBeenCalledWith({
             where: { id: 'req-1', businessProfileId: 'biz-1', status: 'PENDING' },
@@ -44,17 +31,15 @@ describe('TimeOffService approval mutations', () => {
     });
 
     test('rejects a worker attempting to approve their own request', async () => {
-        getBusinessRequestContext.mockReturnValue({
-            ...context,
-            isBusinessOwner: false,
-            userId: 11,
-        });
         const prisma = {
-            timeOffRequest: {
-                findFirst: jest.fn().mockResolvedValue({ id: 'req-2', status: 'PENDING', employeeId: 'emp-1' }),
+            user: {
+                findUnique: jest.fn().mockResolvedValue({ role: 'USER' }),
             },
             businessEmployee: {
-                findFirst: jest.fn().mockResolvedValue({ id: 'emp-1' }),
+                findFirst: jest.fn().mockResolvedValue({ id: 'emp-1', businessProfileId: 'biz-1' }),
+            },
+            timeOffRequest: {
+                findUnique: jest.fn().mockResolvedValue({ id: 'req-2', businessProfileId: 'biz-1', status: 'PENDING', employeeId: 'emp-1' }),
             },
         };
 
@@ -62,17 +47,20 @@ describe('TimeOffService approval mutations', () => {
             .rejects.toThrow(/cannot approve their own/i);
     });
 
-    test('fails closed when the target request is outside the business scope', async () => {
+    test('fails closed when the approver is not an active employee of the request business', async () => {
         const prisma = {
-            timeOffRequest: {
+            user: {
+                findUnique: jest.fn().mockResolvedValue({ role: 'USER' }),
+            },
+            businessEmployee: {
                 findFirst: jest.fn().mockResolvedValue(null),
+            },
+            timeOffRequest: {
+                findUnique: jest.fn().mockResolvedValue({ id: 'req-other', businessProfileId: 'biz-2', status: 'PENDING', employeeId: 'emp-9' }),
             },
         };
 
         await expect(new TimeOffService(prisma).approveTimeOff('req-other', 99, 'Approve'))
-            .rejects.toThrow(/not found/i);
-        expect(prisma.timeOffRequest.findFirst).toHaveBeenCalledWith(expect.objectContaining({
-            where: { id: 'req-other', businessProfileId: 'biz-1' },
-        }));
+            .rejects.toThrow(/not authorized/i);
     });
 });
