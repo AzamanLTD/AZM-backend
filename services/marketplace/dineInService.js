@@ -39,25 +39,48 @@ const transactionScopedPrisma = (prisma, tx) => new Proxy(prisma, {
 class DineInService {
     constructor(prisma, io) { this.prisma = prisma; this.io = io; }
 
-    async openTab({ businessProfileId, azamanId, tableId }) {
+    async openTab({ businessProfileId, azamanId, locationId, tableId }) {
         if (!businessProfileId) throw new Error('businessProfileId is required.');
         if (!azamanId) throw new Error('azamanId is required.');
+        if (tableId && !locationId) throw new Error('tableId requires locationId.');
+
         const customer = await this.prisma.user.findUnique({ where: { azamanId }, select: { id: true, username: true } });
         if (!customer) throw new Error(`No customer found with AZM-ID: ${azamanId}`);
 
         for (let attempt = 0; attempt < SERIALIZABLE_RETRY_LIMIT; attempt += 1) {
             try {
                 const tab = await this.prisma.$transaction(async (tx) => {
+                    if (locationId) {
+                        const location = await tx.businessLocation.findFirst({
+                            where: { id: locationId, businessProfileId, isActive: true },
+                            select: { id: true },
+                        });
+                        if (!location) throw new Error('Invalid or inactive business location.');
+                    }
+                    if (tableId) {
+                        const table = await tx.businessTable.findFirst({
+                            where: { id: tableId, locationId, isActive: true },
+                            select: { id: true },
+                        });
+                        if (!table) throw new Error('Invalid or inactive business table for location.');
+                    }
+
                     const existing = await tx.dineInTab.findFirst({
                         where: { businessProfileId, customerId: customer.id, status: 'OPEN' },
                     });
                     if (existing) throw new Error('Customer already has an open tab at this business.');
                     return tx.dineInTab.create({
-                        data: { businessProfileId, customerId: customer.id, tableId: tableId || null, status: 'OPEN' },
+                        data: {
+                            businessProfileId,
+                            customerId: customer.id,
+                            locationId: locationId || null,
+                            tableId: tableId || null,
+                            status: 'OPEN',
+                        },
                         include: { items: true },
                     });
                 }, { isolationLevel: 'Serializable' });
-                this.io?.to(`user_${customer.id}`).emit('dine_in_tab_opened', { tabId: tab.id, businessProfileId, tableId: tableId || null });
+                this.io?.to(`user_${customer.id}`).emit('dine_in_tab_opened', { tabId: tab.id, businessProfileId, locationId: locationId || null, tableId: tableId || null });
                 return tab;
             } catch (error) {
                 if (!isSerializableConflict(error) || attempt === SERIALIZABLE_RETRY_LIMIT - 1) throw error;
@@ -65,6 +88,12 @@ class DineInService {
             }
         }
         throw new Error('Could not open dine-in tab after retries.');
+    }
+
+    async _productWhereForTab(tab, productId) {
+        const where = { id: productId, businessProfileId: tab.businessProfileId, isActive: true, isAvailable: true };
+        if (tab.locationId) where.OR = [{ locationId: null }, { locationId: tab.locationId }];
+        return where;
     }
 
     async addItem({ tabId, productId, name, price, quantity, addedBy }) {
@@ -75,22 +104,19 @@ class DineInService {
 
         const tab = await this.prisma.dineInTab.findUnique({
             where: { id: tabId },
-            select: { id: true, businessProfileId: true, status: true, customerId: true },
+            select: { id: true, businessProfileId: true, locationId: true, status: true, customerId: true },
         });
         if (!tab) throw new Error('Tab not found.');
         if (tab.status !== 'OPEN') throw new Error('Cannot add items to a tab that is not OPEN.');
 
-        // Business-side additions resolve product pricing from the catalog. The
-        // supplied price is ignored when a product ID is present, preventing a
-        // caller from manufacturing a settlement amount.
         let itemName = name;
         let authoritativePrice = priceNum;
         if (productId) {
             const product = await this.prisma.businessProduct.findFirst({
-                where: { id: productId, businessProfileId: tab.businessProfileId, isActive: true, isAvailable: true },
+                where: await this._productWhereForTab(tab, productId),
                 select: { id: true, name: true, priceUsdc: true },
             });
-            if (!product) throw new Error('Product is unavailable for this restaurant.');
+            if (!product) throw new Error('Product is unavailable for this restaurant/location.');
             authoritativePrice = Number(product.priceUsdc);
             itemName = product.name;
         }
@@ -116,12 +142,12 @@ class DineInService {
         if (!tabId) throw new Error('tabId is required.');
         if (!productId) throw new Error('productId is required.');
         if (!customerId) throw new Error('customerId is required.');
-        const tab = await this.prisma.dineInTab.findUnique({ where: { id: tabId }, select: { id: true, businessProfileId: true, customerId: true, status: true } });
+        const tab = await this.prisma.dineInTab.findUnique({ where: { id: tabId }, select: { id: true, businessProfileId: true, locationId: true, customerId: true, status: true } });
         if (!tab) throw new Error('Tab not found.');
         if (tab.customerId !== customerId) throw new Error('Not authorized to add items to this tab.');
         if (tab.status !== 'OPEN') throw new Error('Cannot add items to a tab that is not OPEN.');
-        const product = await this.prisma.businessProduct.findFirst({ where: { id: productId, businessProfileId: tab.businessProfileId, isActive: true, isAvailable: true }, select: { id: true, name: true, priceUsdc: true, variants: true, modifierGroups: true } });
-        if (!product) throw new Error('Product is unavailable for this restaurant.');
+        const product = await this.prisma.businessProduct.findFirst({ where: await this._productWhereForTab(tab, productId), select: { id: true, name: true, priceUsdc: true, variants: true, modifierGroups: true } });
+        if (!product) throw new Error('Product is unavailable for this restaurant/location.');
         const validation = validateConfiguredProduct(product, selection);
         if (validation.error) throw new Error(validation.error);
         const normalized = normalizedSelection(product, selection);
@@ -188,10 +214,6 @@ class DineInService {
             return { tab, invoice, payment: { invoice, customerPays: Number(invoice.customerPaidUsdc), alreadyPaid: true } };
         }
 
-        // Invoice creation/sending is non-financial preparation. Keep it on the
-        // canonical invoice service, then make the actual debit/credit AND the
-        // final tab close one atomic transaction below. A failed payment leaves
-        // the SENT invoice and FINALIZED tab intact and safely retryable.
         if (!invoice) {
             if (!tab.items.length) throw new Error('Cannot pay an empty dine-in tab.');
             const idempotencyKey = `DINE_IN_TAB:${tabId}`;
