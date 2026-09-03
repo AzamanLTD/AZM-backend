@@ -4,8 +4,8 @@ describe('PosOrderService atomic settlement', () => {
     test('re-derives catalog prices and commits balance, order and ledger together', async () => {
         const tx = {
             user: {
-                findUnique: jest.fn().mockResolvedValue({ azmBalance: 100 }),
-                update: jest.fn().mockResolvedValue({}),
+                updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+                findUnique: jest.fn().mockResolvedValue({ azmBalance: 59 }),
             },
             azmSpendLog: { create: jest.fn().mockResolvedValue({}) },
             businessOrder: { findFirst: jest.fn().mockResolvedValue(null), create: jest.fn().mockResolvedValue({ id: 'order-1', businessProfileId: 'biz-1', cashChange: 0 }) },
@@ -26,9 +26,13 @@ describe('PosOrderService atomic settlement', () => {
         });
 
         expect(result.computedGrand).toBe(41);
-        expect(prisma.businessOrder.findFirst).toHaveBeenCalledWith({ where: { idempotencyKey: 'pos-1' } });
-        expect(tx.user.update).toHaveBeenCalledWith({ where: { id: 7 }, data: { azmBalance: 59 } });
-        expect(tx.azmSpendLog.create).toHaveBeenCalled();
+        expect(tx.user.updateMany).toHaveBeenCalledWith({
+            where: { id: 7, azmBalance: { gte: 41 } },
+            data: { azmBalance: { decrement: 41 } },
+        });
+        expect(tx.azmSpendLog.create).toHaveBeenCalledWith(expect.objectContaining({
+            data: expect.objectContaining({ userId: 7, amount: 41, balanceAfter: 59 }),
+        }));
         expect(tx.businessOrder.create).toHaveBeenCalled();
         expect(tx.businessLedgerEntry.create).toHaveBeenCalled();
     });
