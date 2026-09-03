@@ -8,20 +8,22 @@
 const { getRequestContext } = require('../../utils/requestContext');
 
 class ShiftService {
-    constructor(prisma) {
-        this.prisma = prisma;
-    }
+    constructor(prisma) { this.prisma = prisma; }
 
     async _resolveCallerBusinessProfileId(explicitBusinessProfileId) {
         if (explicitBusinessProfileId) return explicitBusinessProfileId;
         const req = getRequestContext();
         if (req?.businessProfileId) return req.businessProfileId;
         if (!req?.user?.id) return null;
-        const bp = await this.prisma.businessProfile.findFirst({
-            where: { userId: req.user.id },
-            select: { id: true },
+
+        const ownedBusiness = await this.prisma.businessProfile.findFirst({ where: { userId: req.user.id }, select: { id: true } });
+        if (ownedBusiness?.id) return ownedBusiness.id;
+
+        const employee = await this.prisma.businessEmployee.findFirst({
+            where: { userId: req.user.id, status: 'ACTIVE' },
+            select: { businessProfileId: true },
         });
-        return bp?.id || null;
+        return employee?.businessProfileId || null;
     }
 
     async _assertShiftAccess(shift, explicitBusinessProfileId) {
@@ -35,83 +37,45 @@ class ShiftService {
         if (!req?.user?.id || shift.userId !== req.user.id) throw new Error('Shift not found.');
     }
 
-    // ── Create Shift ───────────────────────────────────────────────────────
     async createShift({ businessProfileId, employeeId, shiftDate, startTime, endTime, locationId, breakMinutes = 30, shiftLabel, rotationId, notes }) {
         const employee = await this.prisma.businessEmployee.findUnique({ where: { id: employeeId } });
         if (!employee || employee.businessProfileId !== businessProfileId) throw new Error('Employee not found in this business.');
         if (employee.status !== 'ACTIVE') throw new Error('Cannot schedule an inactive employee.');
-
-        const existing = await this.prisma.shift.findFirst({
-            where: {
-                employeeId,
-                shiftDate: new Date(shiftDate),
-                status: { in: ['SCHEDULED', 'CLOCKED_IN', 'LATE'] },
-                startTime: { lt: new Date(endTime) },
-                endTime: { gt: new Date(startTime) },
-            },
-        });
+        const existing = await this.prisma.shift.findFirst({ where: { employeeId, shiftDate: new Date(shiftDate), status: { in: ['SCHEDULED', 'CLOCKED_IN', 'LATE'] }, startTime: { lt: new Date(endTime) }, endTime: { gt: new Date(startTime) } } });
         if (existing) throw new Error('Employee already has a conflicting shift at this time.');
-
-        return this.prisma.shift.create({
-            data: {
-                businessProfileId, employeeId, userId: employee.userId, locationId,
-                shiftDate: new Date(shiftDate), startTime: new Date(startTime), endTime: new Date(endTime),
-                breakMinutes, shiftLabel, rotationId, notes,
-            },
-            include: { employee: { include: { user: { select: { username: true } } } } },
-        });
+        return this.prisma.shift.create({ data: { businessProfileId, employeeId, userId: employee.userId, locationId, shiftDate: new Date(shiftDate), startTime: new Date(startTime), endTime: new Date(endTime), breakMinutes, shiftLabel, rotationId, notes }, include: { employee: { include: { user: { select: { username: true } } } } } });
     }
 
     async createShiftRotation({ businessProfileId, employeeIds, startDate, endDate, rotationPattern, locationId, shiftLabel, breakMinutes = 30 }) {
         const shifts = [];
-        for (const pattern of rotationPattern) {
-            shifts.push(await this.createShift({
-                businessProfileId,
-                employeeId: pattern.employeeId,
-                shiftDate: pattern.date,
-                startTime: pattern.startTime,
-                endTime: pattern.endTime,
-                locationId,
-                breakMinutes,
-                shiftLabel: pattern.label || shiftLabel,
-                rotationId: pattern.rotationId,
-            }));
-        }
+        for (const pattern of rotationPattern) shifts.push(await this.createShift({ businessProfileId, employeeId: pattern.employeeId, shiftDate: pattern.date, startTime: pattern.startTime, endTime: pattern.endTime, locationId, breakMinutes, shiftLabel: pattern.label || shiftLabel, rotationId: pattern.rotationId }));
         return shifts;
     }
 
-    // ── Clock In ───────────────────────────────────────────────────────────
     async clockIn(shiftId, businessProfileId) {
         const shift = await this.prisma.shift.findUnique({ where: { id: shiftId }, include: { employee: true } });
         await this._assertShiftAccess(shift, businessProfileId);
         if (shift.status === 'CLOCKED_IN') throw new Error('Already clocked in.');
         if (shift.status === 'CLOCKED_OUT') throw new Error('Shift already completed.');
         if (shift.status === 'NO_SHOW') throw new Error('Shift marked as no-show.');
-
         const now = new Date();
         const isLate = now > new Date(shift.startTime);
         const lateMinutes = isLate ? Math.round((now - new Date(shift.startTime)) / (1000 * 60)) : 0;
-        const updated = await this.prisma.shift.update({
-            where: { id: shiftId },
-            data: { status: isLate ? 'LATE' : 'CLOCKED_IN', clockInTime: now, isLate, lateMinutes },
-        });
+        const updated = await this.prisma.shift.update({ where: { id: shiftId }, data: { status: isLate ? 'LATE' : 'CLOCKED_IN', clockInTime: now, isLate, lateMinutes } });
         if (isLate) await this.prisma.businessEmployee.update({ where: { id: shift.employeeId }, data: { lateCount: { increment: 1 } } });
         return updated;
     }
 
-    // ── Clock Out ──────────────────────────────────────────────────────────
     async clockOut(shiftId, businessProfileId) {
         const shift = await this.prisma.shift.findUnique({ where: { id: shiftId }, include: { employee: true } });
         await this._assertShiftAccess(shift, businessProfileId);
         if (shift.status !== 'CLOCKED_IN' && shift.status !== 'LATE') throw new Error('Must be clocked in to clock out.');
-
         const now = new Date();
         const clockInTime = new Date(shift.clockInTime);
         const actualMinutes = Math.round((now - clockInTime) / (1000 * 60));
         const workedHours = Math.max(0, (actualMinutes - shift.breakMinutes) / 60);
         const updated = await this.prisma.shift.update({ where: { id: shiftId }, data: { status: 'CLOCKED_OUT', clockOutTime: now, actualMinutes } });
         await this.prisma.businessEmployee.update({ where: { id: shift.employeeId }, data: { totalShifts: { increment: 1 }, totalHours: { increment: workedHours } } });
-
         let accrued = 0;
         if (shift.employee.payrollType === 'HOURLY' && shift.employee.hourlyRate) accrued = workedHours * parseFloat(shift.employee.hourlyRate);
         else if (shift.employee.payrollType === 'SALARY' && shift.employee.salaryAmount) accrued = workedHours * (parseFloat(shift.employee.salaryAmount) / 160);
@@ -119,7 +83,6 @@ class ShiftService {
         return { shift: updated, workedHours, accruedThisShift: accrued };
     }
 
-    // ── Mark No-Show ───────────────────────────────────────────────────────
     async markNoShow(shiftId, businessProfileId) {
         const shift = await this.prisma.shift.findUnique({ where: { id: shiftId }, include: { employee: true } });
         await this._assertShiftAccess(shift, businessProfileId);
@@ -151,21 +114,13 @@ class ShiftService {
         return this.prisma.shift.findMany({ where, include: { employee: { include: { businessProfile: { select: { businessName: true, logoUrl: true } } } } }, orderBy: { startTime: 'asc' } });
     }
 
-    async getTeamOnDuty(businessProfileId) {
-        return this.prisma.shift.findMany({ where: { businessProfileId, status: 'CLOCKED_IN' }, include: { employee: { include: { user: { select: { username: true, email: true } } } } }, orderBy: { clockInTime: 'asc' } });
-    }
+    async getTeamOnDuty(businessProfileId) { return this.prisma.shift.findMany({ where: { businessProfileId, status: 'CLOCKED_IN' }, include: { employee: { include: { user: { select: { username: true, email: true } } } } }, orderBy: { clockInTime: 'asc' } }); }
+    async getUpcomingTeam(businessProfileId) { const now = new Date(); return this.prisma.shift.findMany({ where: { businessProfileId, status: 'SCHEDULED', shiftDate: { gte: now } }, include: { employee: { include: { user: { select: { username: true, email: true } } } } }, orderBy: { startTime: 'asc' }, take: 20 }); }
 
-    async getUpcomingTeam(businessProfileId) {
-        const now = new Date();
-        return this.prisma.shift.findMany({ where: { businessProfileId, status: 'SCHEDULED', shiftDate: { gte: now } }, include: { employee: { include: { user: { select: { username: true, email: true } } } } }, orderBy: { startTime: 'asc' }, take: 20 });
-    }
-
-    // ── Update/Delete ──────────────────────────────────────────────────────
     async updateShift(shiftId, updates, businessProfileId) {
         const allowed = ['startTime', 'endTime', 'breakMinutes', 'shiftLabel', 'locationId', 'notes', 'status', 'rotationId'];
         const data = {};
-        for (const key of allowed) if (key in updates) data[key] = updates[key] instanceof Date || typeof updates[key] === 'string'
-            ? (key === 'startTime' || key === 'endTime' ? new Date(updates[key]) : updates[key]) : updates[key];
+        for (const key of allowed) if (key in updates) data[key] = updates[key] instanceof Date || typeof updates[key] === 'string' ? (key === 'startTime' || key === 'endTime' ? new Date(updates[key]) : updates[key]) : updates[key];
         const existing = await this.prisma.shift.findUnique({ where: { id: shiftId } });
         await this._assertShiftAccess(existing, businessProfileId);
         return this.prisma.shift.update({ where: { id: shiftId }, data });
@@ -178,7 +133,6 @@ class ShiftService {
         return this.prisma.shift.delete({ where: { id: shiftId } });
     }
 
-    // ── Shift Swaps ────────────────────────────────────────────────────────
     async requestShiftSwap({ businessProfileId, shiftId, requestingEmployeeId, reason }) {
         const shift = await this.prisma.shift.findFirst({ where: { id: shiftId, businessProfileId } });
         if (!shift) throw new Error('Shift not found.');
@@ -197,7 +151,9 @@ class ShiftService {
         if (swap.status !== 'PENDING') throw new Error('Swap is no longer pending.');
         const employee = await this.prisma.businessEmployee.findFirst({ where: { id: claimingEmployeeId, businessProfileId: callerBusinessProfileId, status: 'ACTIVE' } });
         if (!employee) throw new Error('Employee not found.');
-        if (employee.userId !== getRequestContext()?.user?.id && !businessProfileId) throw new Error('Only the claiming employee can claim this swap.');
+        const req = getRequestContext();
+        const callerIsScopedBusinessOperator = Boolean(businessProfileId || req?.businessProfileId);
+        if (!callerIsScopedBusinessOperator && employee.userId !== req?.user?.id) throw new Error('Only the claiming employee can claim this swap.');
         if (claimingShiftId) {
             const claimingShift = await this.prisma.shift.findFirst({ where: { id: claimingShiftId, businessProfileId: callerBusinessProfileId } });
             if (!claimingShift) throw new Error('Claiming shift not found in this business.');
