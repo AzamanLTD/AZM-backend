@@ -7,6 +7,15 @@
 
 const { getBusinessRequestContext } = require('../../src/lib/businessRequestContext');
 
+const SERIALIZABLE_RETRY_LIMIT = 3;
+const SERIALIZABLE_BACKOFF_MS = 10;
+
+const isSerializableConflict = (error) => error?.code === 'P2034';
+
+const waitForSerializableRetry = (attempt) => new Promise((resolve) => {
+    setTimeout(resolve, SERIALIZABLE_BACKOFF_MS * (2 ** attempt));
+});
+
 class ShiftService {
     constructor(prisma) {
         this.prisma = prisma;
@@ -405,69 +414,81 @@ class ShiftService {
 
     async approveShiftSwap(swapId, managerNote) {
         const context = this._getBusinessContext();
-        return this.prisma.$transaction(async (tx) => {
-            const swap = await tx.shiftSwap.findFirst({
-                where: { id: swapId, businessProfileId: context.businessProfileId },
-                include: { requestingShift: true, claimingShift: true },
-            });
-            if (!swap) throw new Error('Swap not found.');
-            if (swap.status !== 'PENDING' && swap.status !== 'OPEN') throw new Error('Swap is no longer pending.');
-            if (!swap.claimingEmployeeId) throw new Error('No employee has claimed this swap yet.');
 
-            const origShift = swap.requestingShift;
-            const claimShift = swap.claimingShift;
-            if (!origShift || origShift.businessProfileId !== context.businessProfileId) {
-                throw new Error('Original shift not found in this business.');
-            }
-            if (claimShift && claimShift.businessProfileId !== context.businessProfileId) {
-                throw new Error('Claiming shift not found in this business.');
-            }
+        for (let attempt = 0; attempt < SERIALIZABLE_RETRY_LIMIT; attempt += 1) {
+            try {
+                return await this.prisma.$transaction(async (tx) => {
+                    const swap = await tx.shiftSwap.findFirst({
+                        where: { id: swapId, businessProfileId: context.businessProfileId },
+                        include: { requestingShift: true, claimingShift: true },
+                    });
+                    if (!swap) throw new Error('Swap not found.');
+                    if (swap.status !== 'PENDING' && swap.status !== 'OPEN') throw new Error('Swap is no longer pending.');
+                    if (!swap.claimingEmployeeId) throw new Error('No employee has claimed this swap yet.');
 
-            const claimedEmployee = await tx.businessEmployee.findFirst({
-                where: { id: swap.claimingEmployeeId, businessProfileId: context.businessProfileId },
-                select: { id: true, userId: true, status: true },
-            });
-            const requestingEmployee = await tx.businessEmployee.findFirst({
-                where: { id: swap.requestingEmployeeId, businessProfileId: context.businessProfileId },
-                select: { id: true, userId: true, status: true },
-            });
-            if (!claimedEmployee || !requestingEmployee) throw new Error('Swap employee is not part of this business.');
-            if (claimedEmployee.status !== 'ACTIVE' || requestingEmployee.status !== 'ACTIVE') {
-                throw new Error('Both employees must be active to approve a swap.');
-            }
-            if (origShift.employeeId !== requestingEmployee.id) {
-                throw new Error('The requested shift assignment changed before approval.');
-            }
-            if (claimShift && claimShift.employeeId !== claimedEmployee.id) {
-                throw new Error('The claiming shift assignment changed before approval.');
-            }
-            if (claimShift && claimShift.status !== 'SCHEDULED') {
-                throw new Error('The claiming shift must still be scheduled.');
-            }
+                    const origShift = swap.requestingShift;
+                    const claimShift = swap.claimingShift;
+                    if (!origShift || origShift.businessProfileId !== context.businessProfileId) {
+                        throw new Error('Original shift not found in this business.');
+                    }
+                    if (claimShift && claimShift.businessProfileId !== context.businessProfileId) {
+                        throw new Error('Claiming shift not found in this business.');
+                    }
 
-            await tx.shift.update({
-                where: { id: origShift.id },
-                data: { employeeId: claimedEmployee.id, userId: claimedEmployee.userId },
-            });
+                    const claimedEmployee = await tx.businessEmployee.findFirst({
+                        where: { id: swap.claimingEmployeeId, businessProfileId: context.businessProfileId },
+                        select: { id: true, userId: true, status: true },
+                    });
+                    const requestingEmployee = await tx.businessEmployee.findFirst({
+                        where: { id: swap.requestingEmployeeId, businessProfileId: context.businessProfileId },
+                        select: { id: true, userId: true, status: true },
+                    });
+                    if (!claimedEmployee || !requestingEmployee) throw new Error('Swap employee is not part of this business.');
+                    if (claimedEmployee.status !== 'ACTIVE' || requestingEmployee.status !== 'ACTIVE') {
+                        throw new Error('Both employees must be active to approve a swap.');
+                    }
+                    if (origShift.employeeId !== requestingEmployee.id) {
+                        throw new Error('The requested shift assignment changed before approval.');
+                    }
+                    if (claimShift && claimShift.employeeId !== claimedEmployee.id) {
+                        throw new Error('The claiming shift assignment changed before approval.');
+                    }
+                    if (claimShift && claimShift.status !== 'SCHEDULED') {
+                        throw new Error('The claiming shift must still be scheduled.');
+                    }
 
-            if (claimShift) {
-                await tx.shift.update({
-                    where: { id: claimShift.id },
-                    data: { employeeId: requestingEmployee.id, userId: requestingEmployee.userId },
-                });
+                    await tx.shift.update({
+                        where: { id: origShift.id },
+                        data: { employeeId: claimedEmployee.id, userId: claimedEmployee.userId },
+                    });
+
+                    if (claimShift) {
+                        await tx.shift.update({
+                            where: { id: claimShift.id },
+                            data: { employeeId: requestingEmployee.id, userId: requestingEmployee.userId },
+                        });
+                    }
+
+                    const finalized = await tx.shiftSwap.updateMany({
+                        where: {
+                            id: swapId,
+                            businessProfileId: context.businessProfileId,
+                            status: { in: ['PENDING', 'OPEN'] },
+                        },
+                        data: { status: 'APPROVED', managerNote, respondedAt: new Date() },
+                    });
+                    if (finalized.count !== 1) throw new Error('Swap was already resolved.');
+                    return tx.shiftSwap.findUnique({ where: { id: swapId } });
+                }, { isolationLevel: 'Serializable' });
+            } catch (error) {
+                if (!isSerializableConflict(error) || attempt === SERIALIZABLE_RETRY_LIMIT - 1) {
+                    throw error;
+                }
+                await waitForSerializableRetry(attempt);
             }
+        }
 
-            const finalized = await tx.shiftSwap.updateMany({
-                where: {
-                    id: swapId,
-                    businessProfileId: context.businessProfileId,
-                    status: { in: ['PENDING', 'OPEN'] },
-                },
-                data: { status: 'APPROVED', managerNote, respondedAt: new Date() },
-            });
-            if (finalized.count !== 1) throw new Error('Swap was already resolved.');
-            return tx.shiftSwap.findUnique({ where: { id: swapId } });
-        }, { isolationLevel: 'Serializable' });
+        throw new Error('Shift swap approval failed after retries.');
     }
 
     async rejectShiftSwap(swapId, managerNote) {
