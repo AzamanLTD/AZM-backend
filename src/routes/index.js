@@ -51,7 +51,7 @@ function mountRoutes(app, {
     app.use('/api/p2p', financialLimiter, require('../../routes/p2pRoutes'));
     app.use('/api/friends', generalLimiter, require('../../routes/friendRoutes'));
     app.use('/api/vendor', generalLimiter, require('../../routes/vendorStatsRoutes'));
-    app.use('/api/savings', financialLimiter, require('../../routes/savingsRoutes'));
+    app.use('/api/savings', generalLimiter, require('../../routes/savingsRoutes'));
     app.use('/api/oracle', generalLimiter, require('../../routes/oracleRoutes'));
     app.use('/api/azm', generalLimiter, require('../../routes/azmRoutes'));
     app.use('/api/receipts', generalLimiter, require('../../routes/receiptRoutes'));
@@ -111,10 +111,10 @@ function mountRoutes(app, {
     app.use('/api/admin/control-plane', generalLimiter, require('../../routes/adminReconciliationRoutes'));
 
     app.use('/api/marketplace', generalLimiter, require('../../routes/marketplaceRoutes'));
-    // Canonical scoped Business OS financial and operational security routes
-    // run before the legacy monolithic router during cleanup.
+    // Finance has a canonical scoped router mounted before the legacy Business OS
+    // surface. The legacy handlers remain available only for paths not claimed here
+    // until their dead block is removed in the follow-up cleanup.
     app.use('/api/business-os', financialLimiter, require('../../routes/businessOSFinanceRoutes'));
-    app.use('/api/business-os', financialLimiter, require('../../routes/businessOSPosRoutes'));
     app.use('/api/business-os', generalLimiter, require('../../routes/businessOSKioskRoutes'));
     app.use('/api/business-os', generalLimiter, require('../../routes/businessOSRoutes'));
     app.use('/api/developer', generalLimiter, require('../../routes/developerRoutes'));
