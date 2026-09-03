@@ -314,7 +314,10 @@ class ShiftService {
 
     async updateShift(shiftId, updates) {
         const context = this._getBusinessContext();
-        const allowed = ['startTime', 'endTime', 'breakMinutes', 'shiftLabel', 'locationId', 'notes', 'status', 'rotationId'];
+        if (Object.prototype.hasOwnProperty.call(updates, 'status')) {
+            throw new Error('Shift status must be changed through the clock-in, clock-out, or no-show actions.');
+        }
+        const allowed = ['startTime', 'endTime', 'breakMinutes', 'shiftLabel', 'locationId', 'notes', 'rotationId'];
         const data = {};
         for (const key of allowed) {
             if (key in updates) {
