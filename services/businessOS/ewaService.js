@@ -45,64 +45,70 @@ class EwaService {
     }
 
     // ── Request EWA Withdrawal ─────────────────────────────────────────────
-    // Uses an atomic conditional update to prevent TOCTOU double-withdrawal bugs.
-    // Two concurrent requests cannot both pass the eligibility check and withdraw
-    // beyond the 30% limit because the updateMany enforces a WHERE guard.
+    // The employee read, cap check, withdrawnEarly claim, balance credit, and
+    // both ledger records are one serializable transaction. This prevents a
+    // successful claim from becoming a permanent balance deduction when a later
+    // ledger/balance write fails, and makes concurrent withdrawals serialize.
     async requestWithdrawal({ employeeId, amount, destination }) {
-        const eligibility = await this.checkEligibility(employeeId);
-        if (!eligibility.eligible) {
-            throw new Error('Not eligible for EWA withdrawal.');
+        const withdrawAmount = Number(amount);
+        if (!Number.isFinite(withdrawAmount)) {
+            throw new Error('Amount must be a valid number.');
         }
-
-        const withdrawAmount = parseFloat(amount);
         if (withdrawAmount < 1) {
             throw new Error('Minimum withdrawal is 1 AZM.');
         }
-        if (withdrawAmount > eligibility.remainingWithdrawable) {
-            throw new Error(
-                `Amount exceeds available EWA balance. Max: ${eligibility.remainingWithdrawable.toFixed(2)} AZM`
-            );
-        }
 
-        const employee = await this.prisma.businessEmployee.findUnique({
-            where: { id: employeeId },
-        });
+        return this.prisma.$transaction(async (tx) => {
+            const employee = await tx.businessEmployee.findUnique({
+                where: { id: employeeId },
+            });
+            if (!employee) throw new Error('Employee not found.');
+            if (!employee.ewaEligible) throw new Error('EWA is not available for this employee.');
+            if (employee.status !== 'ACTIVE') throw new Error('Only active employees can request EWA.');
 
-        // Calculate fee (1%)
-        const fee = withdrawAmount * 0.01;
-        const netToEmployee = withdrawAmount - fee;
+            const accrued = parseFloat(employee.accruedWages);
+            const alreadyWithdrawn = parseFloat(employee.withdrawnEarly);
+            const maxAvailable = accrued * 0.30;
+            const remaining = maxAvailable - alreadyWithdrawn;
 
-        // ── CONCURRENCY GUARD ──────────────────────────────────────────────
-        // Atomically increment withdrawnEarly ONLY if the current value + amount
-        // does not exceed maxAvailable. This prevents double-withdrawal races.
-        const maxAvailable = parseFloat(employee.accruedWages) * 0.30;
-        const guardResult = await this.prisma.businessEmployee.updateMany({
-            where: {
-                id: employeeId,
-                withdrawnEarly: { lte: maxAvailable - withdrawAmount },
-            },
-            data: {
-                withdrawnEarly: { increment: withdrawAmount },
-            },
-        });
+            if (withdrawAmount > remaining) {
+                throw new Error(
+                    `Amount exceeds available EWA balance. Max: ${Math.max(0, remaining).toFixed(2)} AZM`,
+                );
+            }
 
-        if (guardResult.count !== 1) {
-            throw new Error('EWA withdrawal failed — insufficient available balance (concurrent withdrawal detected).');
-        }
+            const fee = withdrawAmount * 0.01;
+            const netToEmployee = withdrawAmount - fee;
 
-        // Process the withdrawal — credit employee's balance immediately
-        // Azaman fronts the cash; business settles on payday
-        const [updatedEmployee] = await this.prisma.$transaction([
-            // Credit employee's AZM balance
-            this.prisma.user.update({
+            // Claim the EWA capacity conditionally inside the same transaction as
+            // all downstream money/ledger mutations. A concurrent request that
+            // would exceed the 30% cap cannot claim the same capacity.
+            const guardResult = await tx.businessEmployee.updateMany({
+                where: {
+                    id: employeeId,
+                    status: 'ACTIVE',
+                    ewaEligible: true,
+                    withdrawnEarly: { lte: maxAvailable - withdrawAmount },
+                },
+                data: {
+                    withdrawnEarly: { increment: withdrawAmount },
+                },
+            });
+
+            if (guardResult.count !== 1) {
+                throw new Error(
+                    'EWA withdrawal failed — insufficient available balance (concurrent withdrawal detected).',
+                );
+            }
+
+            await tx.user.update({
                 where: { id: employee.userId },
                 data: {
                     azmBalance: { increment: netToEmployee },
                 },
-            }),
-            // Record the EWA transaction in TransactionHistory (atomic ledger compliance)
-            // Every USDC/AZM movement MUST have a TransactionHistory record for reconciliation.
-            this.prisma.transactionHistory.create({
+            });
+
+            await tx.transactionHistory.create({
                 data: {
                     userId: employee.userId,
                     type: 'EWA_WITHDRAWAL',
@@ -116,9 +122,9 @@ class EwaService {
                         source: 'BUSINESS_OS_EWA',
                     },
                 },
-            }),
-            // Record the EWA transaction in the business ledger
-            this.prisma.businessLedgerEntry.create({
+            });
+
+            await tx.businessLedgerEntry.create({
                 data: {
                     businessProfileId: employee.businessProfileId,
                     type: 'PAYROLL',
@@ -135,22 +141,21 @@ class EwaService {
                         destination: destination || 'AZM_BALANCE',
                     },
                 },
-            }),
-        ]);
+            });
 
-        // Fetch the updated employee (withdrawnEarly was already incremented by the guard)
-        const finalEmployee = await this.prisma.businessEmployee.findUnique({
-            where: { id: employeeId },
-        });
+            const finalEmployee = await tx.businessEmployee.findUnique({
+                where: { id: employeeId },
+            });
 
-        return {
-            success: true,
-            grossAmount: withdrawAmount,
-            fee,
-            netToEmployee,
-            remainingWithdrawable: eligibility.remainingWithdrawable - withdrawAmount,
-            employee: finalEmployee,
-        };
+            return {
+                success: true,
+                grossAmount: withdrawAmount,
+                fee,
+                netToEmployee,
+                remainingWithdrawable: Math.max(0, remaining - withdrawAmount),
+                employee: finalEmployee,
+            };
+        }, { isolationLevel: 'Serializable' });
     }
 
     // ── Get EWA History for Employee ───────────────────────────────────────
@@ -189,7 +194,7 @@ class EwaService {
                 username: e.user.username,
                 accrued: parseFloat(e.accruedWages),
                 withdrawn: parseFloat(e.withdrawnEarly),
-                available: parseFloat(e.accruedWages) * 0.30 - parseFloat(e.withdrawnEarly),
+                available: Math.max(0, parseFloat(e.accruedWages) * 0.30 - parseFloat(e.withdrawnEarly)),
             })),
         };
     }
