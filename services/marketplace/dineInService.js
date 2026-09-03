@@ -23,7 +23,11 @@ const waitForSerializableRetry = (attempt) => new Promise((resolve) => {
     setTimeout(resolve, SERIALIZABLE_BACKOFF_MS * (2 ** attempt));
 });
 
-// Keep canonical invoice settlement inside the caller's transaction when needed.
+// Keep the canonical invoice service authoritative while allowing its payment
+// transaction to participate in a larger interactive transaction. The proxy
+// delegates all Prisma model access to the transaction client and replaces only
+// $transaction so invoiceService.payInvoice executes on the existing transaction
+// instead of opening a nested transaction.
 const transactionScopedPrisma = (prisma, tx) => new Proxy(prisma, {
     get(target, property, receiver) {
         if (property === '$transaction') return async (callback) => callback(tx);
@@ -76,8 +80,9 @@ class DineInService {
         if (!tab) throw new Error('Tab not found.');
         if (tab.status !== 'OPEN') throw new Error('Cannot add items to a tab that is not OPEN.');
 
-        // Product price/name are authoritative when a product ID is supplied.
-        // A stale caller-provided price is intentionally ignored.
+        // Business-side additions resolve product pricing from the catalog. The
+        // supplied price is ignored when a product ID is present, preventing a
+        // caller from manufacturing a settlement amount.
         let itemName = name;
         let authoritativePrice = priceNum;
         if (productId) {
@@ -123,7 +128,20 @@ class DineInService {
         const unitPrice = configuredUnitPrice(product, normalized);
         if (!(unitPrice > 0)) throw new Error('Product price must be positive.');
         const label = selectionLabel(normalized);
-        return this.addItem({ tabId, productId: product.id, name: label ? `${product.name} — ${label}` : product.name, price: unitPrice, quantity, addedBy: customerId });
+
+        const configuredItem = await this.prisma.dineInTabItem.create({
+            data: {
+                dineInTabId: tabId,
+                productId: product.id,
+                name: String(label ? `${product.name} — ${label}` : product.name).slice(0, 200),
+                unitPriceUsdc: unitPrice,
+                quantity: Number(quantity || 1),
+                lineTotalUsdc: unitPrice * Number(quantity || 1),
+                addedBy: customerId,
+            },
+        });
+        this.io?.to(`user_${tab.customerId}`).emit('dine_in_item_added', { tabId, item: configuredItem });
+        return configuredItem;
     }
 
     async removeItem({ tabId, itemId }) {
@@ -170,6 +188,10 @@ class DineInService {
             return { tab, invoice, payment: { invoice, customerPays: Number(invoice.customerPaidUsdc), alreadyPaid: true } };
         }
 
+        // Invoice creation/sending is non-financial preparation. Keep it on the
+        // canonical invoice service, then make the actual debit/credit AND the
+        // final tab close one atomic transaction below. A failed payment leaves
+        // the SENT invoice and FINALIZED tab intact and safely retryable.
         if (!invoice) {
             if (!tab.items.length) throw new Error('Cannot pay an empty dine-in tab.');
             const idempotencyKey = `DINE_IN_TAB:${tabId}`;
@@ -207,10 +229,11 @@ class DineInService {
             const tip = Math.max(0, Number(settledInvoice?.tipUsdc ?? invoice.tipUsdc) || 0);
             const billTotal = Number(settledInvoice?.billTotalUsdc ?? invoice.billTotalUsdc);
             const grandTotal = billTotal + tip;
-            await tx.dineInTab.updateMany({
+            const closedUpdate = await tx.dineInTab.updateMany({
                 where: { id: tabId, status: 'FINALIZED', invoiceId: invoice.id },
                 data: { status: 'CLOSED', closedAt: new Date(), tipUsdc: tip, grandTotalUsdc: grandTotal, paymentMethod: 'AZAMAN_BALANCE' },
             });
+            if (closedUpdate.count !== 1) throw new Error('Tab could not be closed after payment; transaction rolled back.');
             const closed = await tx.dineInTab.findUnique({ where: { id: tabId }, include: { items: true, invoice: true } });
             return { closed, payment };
         });
