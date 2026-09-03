@@ -18,6 +18,22 @@ class PosOrderService {
 
         if (!businessProfileId) throw new Error('Business context required.');
         if (!actorId) throw new Error('Authentication required.');
+
+        // Idempotency is checked before catalog availability/pricing validation so
+        // a legitimate offline replay remains replayable even if the catalog has
+        // since changed, while preserving tenant ownership of the key.
+        const existing = await this._findIdempotentOrder(businessProfileId, idempotencyKey);
+        if (existing) {
+            return {
+                order: existing,
+                duplicate: true,
+                computedSubtotal: null,
+                computedTax: null,
+                computedGrand: Number(existing.amountUsdc || 0),
+                change: Number(existing.cashChange || 0),
+            };
+        }
+
         if (!Array.isArray(items) || items.length === 0) throw new Error('Items are required.');
 
         const pm = String(paymentMethod || 'CASH').toUpperCase();
@@ -53,18 +69,6 @@ class PosOrderService {
             }
             if (cash + azmPortion < computedGrand) throw new Error('Insufficient payment (cash + AZM).');
             cashChange = Math.max(0, cash - (computedGrand - azmPortion));
-        }
-
-        const existing = await this._findIdempotentOrder(businessProfileId, idempotencyKey);
-        if (existing) {
-            return {
-                order: existing,
-                duplicate: true,
-                computedSubtotal: computed.subtotal,
-                computedTax,
-                computedGrand,
-                change: Number(existing.cashChange || 0),
-            };
         }
 
         const orderRef = `POS-${Date.now().toString(36).toUpperCase()}-${Math.random().toString(36).slice(2, 7).toUpperCase()}`;
@@ -181,9 +185,9 @@ class PosOrderService {
                         return {
                             order: replay,
                             duplicate: true,
-                            computedSubtotal: computed.subtotal,
-                            computedTax,
-                            computedGrand,
+                            computedSubtotal: null,
+                            computedTax: null,
+                            computedGrand: Number(replay.amountUsdc || 0),
                             change: Number(replay.cashChange || 0),
                         };
                     }
