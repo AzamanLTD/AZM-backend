@@ -14,6 +14,8 @@
 //   and deducted from their net pay on payroll day
 // =============================================================================
 
+const { getBusinessRequestContext } = require('../../src/lib/businessRequestContext');
+
 const SERIALIZABLE_RETRY_LIMIT = 3;
 const SERIALIZABLE_BACKOFF_MS = 10;
 
@@ -28,10 +30,23 @@ class EwaService {
         this.prisma = prisma;
     }
 
+    _resolveBusinessProfileId(explicitBusinessProfileId) {
+        const contextBusinessProfileId = getBusinessRequestContext()?.businessProfileId;
+        const businessProfileId = explicitBusinessProfileId || contextBusinessProfileId;
+        if (!businessProfileId) {
+            throw new Error('Business context required.');
+        }
+        if (explicitBusinessProfileId && contextBusinessProfileId && explicitBusinessProfileId !== contextBusinessProfileId) {
+            throw new Error('Business scope mismatch.');
+        }
+        return businessProfileId;
+    }
+
     // ── Check EWA Eligibility ──────────────────────────────────────────────
-    async checkEligibility(employeeId) {
-        const employee = await this.prisma.businessEmployee.findUnique({
-            where: { id: employeeId },
+    async checkEligibility(employeeId, businessProfileId) {
+        const scopedBusinessProfileId = this._resolveBusinessProfileId(businessProfileId);
+        const employee = await this.prisma.businessEmployee.findFirst({
+            where: { id: employeeId, businessProfileId: scopedBusinessProfileId },
         });
         if (!employee) throw new Error('Employee not found.');
         if (employee.status !== 'ACTIVE') {
@@ -59,6 +74,7 @@ class EwaService {
     // successful claim from becoming a permanent balance deduction when a later
     // ledger/balance write fails, and makes concurrent withdrawals serialize.
     async requestWithdrawal({ employeeId, amount, destination, businessProfileId }) {
+        const scopedBusinessProfileId = this._resolveBusinessProfileId(businessProfileId);
         const withdrawAmount = Number(amount);
         if (!Number.isFinite(withdrawAmount)) {
             throw new Error('Amount must be a valid number.');
@@ -70,10 +86,8 @@ class EwaService {
         for (let attempt = 0; attempt < SERIALIZABLE_RETRY_LIMIT; attempt += 1) {
             try {
                 return await this.prisma.$transaction(async (tx) => {
-                    const employee = await tx.businessEmployee.findUnique({
-                        where: businessProfileId
-                            ? { id: employeeId, businessProfileId }
-                            : { id: employeeId },
+                    const employee = await tx.businessEmployee.findFirst({
+                        where: { id: employeeId, businessProfileId: scopedBusinessProfileId },
                     });
                     if (!employee) throw new Error('Employee not found.');
                     if (!employee.ewaEligible) throw new Error('EWA is not available for this employee.');
@@ -99,7 +113,7 @@ class EwaService {
                     const guardResult = await tx.businessEmployee.updateMany({
                         where: {
                             id: employeeId,
-                            ...(businessProfileId ? { businessProfileId } : {}),
+                            businessProfileId: scopedBusinessProfileId,
                             status: 'ACTIVE',
                             ewaEligible: true,
                             withdrawnEarly: { lte: maxAvailable - withdrawAmount },
@@ -157,8 +171,8 @@ class EwaService {
                         },
                     });
 
-                    const finalEmployee = await tx.businessEmployee.findUnique({
-                        where: { id: employeeId },
+                    const finalEmployee = await tx.businessEmployee.findFirst({
+                        where: { id: employeeId, businessProfileId: scopedBusinessProfileId },
                     });
 
                     return {
@@ -182,9 +196,11 @@ class EwaService {
     }
 
     // ── Get EWA History for Employee ───────────────────────────────────────
-    async getEwaHistory(employeeId) {
+    async getEwaHistory(employeeId, businessProfileId) {
+        const scopedBusinessProfileId = this._resolveBusinessProfileId(businessProfileId);
         return this.prisma.businessLedgerEntry.findMany({
             where: {
+                businessProfileId: scopedBusinessProfileId,
                 sourceType: 'EWA',
                 sourceId: employeeId,
             },
@@ -194,8 +210,9 @@ class EwaService {
 
     // ── Get EWA Summary for Business ───────────────────────────────────────
     async getEwaSummary(businessProfileId) {
+        const scopedBusinessProfileId = this._resolveBusinessProfileId(businessProfileId);
         const employees = await this.prisma.businessEmployee.findMany({
-            where: { businessProfileId, status: 'ACTIVE' },
+            where: { businessProfileId: scopedBusinessProfileId, status: 'ACTIVE' },
             select: {
                 id: true,
                 accruedWages: true,
