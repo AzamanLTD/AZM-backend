@@ -49,30 +49,12 @@ class PosOrderService {
             }
         }
 
-        const computed = await this._priceItems(businessProfileId, normalizedItems);
-        const computedTax = computed.subtotal * 0.025;
-        const computedGrand = computed.subtotal + computedTax;
         const cash = Number(cashGiven || 0);
         const requestedAzm = Number(azmAmount || 0);
-        let azmPortion = 0;
-        let cashChange = 0;
-
-        if (pm === 'CASH') {
-            if (cash < computedGrand) throw new Error('Insufficient cash received.');
-            cashChange = cash - computedGrand;
-        } else if (pm === 'AZM') {
-            azmPortion = computedGrand;
-        } else {
-            azmPortion = requestedAzm;
-            if (!Number.isFinite(azmPortion) || azmPortion <= 0 || azmPortion > computedGrand) {
-                throw new Error('Invalid AZM portion.');
-            }
-            if (cash + azmPortion < computedGrand) throw new Error('Insufficient payment (cash + AZM).');
-            cashChange = Math.max(0, cash - (computedGrand - azmPortion));
-        }
+        if (!Number.isFinite(cash) || cash < 0) throw new Error('Invalid cash amount.');
+        if (!Number.isFinite(requestedAzm) || requestedAzm < 0) throw new Error('Invalid AZM amount.');
 
         const orderRef = `POS-${Date.now().toString(36).toUpperCase()}-${Math.random().toString(36).slice(2, 7).toUpperCase()}`;
-        const effectiveCustomerId = pm === 'CASH' ? (customerId || actorId) : actorId;
 
         for (let attempt = 0; attempt < SERIALIZABLE_RETRY_LIMIT; attempt += 1) {
             try {
@@ -85,6 +67,30 @@ class PosOrderService {
                             }
                             return { order: txExisting, duplicate: true };
                         }
+                    }
+
+                    // Catalog truth is deliberately loaded inside the same
+                    // Serializable transaction as inventory/payment/order writes.
+                    // This prevents a product being changed or disabled between a
+                    // pre-transaction quote and settlement.
+                    const computed = await this._priceItems(tx, businessProfileId, normalizedItems);
+                    const computedTax = computed.subtotal * 0.025;
+                    const computedGrand = computed.subtotal + computedTax;
+
+                    let azmPortion = 0;
+                    let cashChange = 0;
+                    if (pm === 'CASH') {
+                        if (cash < computedGrand) throw new Error('Insufficient cash received.');
+                        cashChange = cash - computedGrand;
+                    } else if (pm === 'AZM') {
+                        azmPortion = computedGrand;
+                    } else {
+                        azmPortion = requestedAzm;
+                        if (azmPortion <= 0 || azmPortion > computedGrand) {
+                            throw new Error('Invalid AZM portion.');
+                        }
+                        if (cash + azmPortion < computedGrand) throw new Error('Insufficient payment (cash + AZM).');
+                        cashChange = Math.max(0, cash - (computedGrand - azmPortion));
                     }
 
                     // Re-check stock inside the same Serializable transaction that
@@ -115,6 +121,7 @@ class PosOrderService {
                         });
                     }
 
+                    const effectiveCustomerId = pm === 'CASH' ? (customerId || actorId) : actorId;
                     const order = await tx.businessOrder.create({
                         data: {
                             businessProfileId,
@@ -166,7 +173,14 @@ class PosOrderService {
                         },
                     });
 
-                    return { order, duplicate: false };
+                    return {
+                        order,
+                        duplicate: false,
+                        computedSubtotal: computed.subtotal,
+                        computedTax,
+                        computedGrand,
+                        change: cashChange,
+                    };
                 }, { isolationLevel: 'Serializable' });
 
                 logger.info({
@@ -176,13 +190,16 @@ class PosOrderService {
                     duplicate: result.duplicate,
                 }, '[POS] order settled atomically');
 
-                return {
-                    ...result,
-                    computedSubtotal: computed.subtotal,
-                    computedTax,
-                    computedGrand,
-                    change: result.duplicate ? Number(result.order.cashChange || 0) : cashChange,
-                };
+                if (result.duplicate) {
+                    return {
+                        ...result,
+                        computedSubtotal: null,
+                        computedTax: null,
+                        computedGrand: Number(result.order.amountUsdc || 0),
+                        change: Number(result.order.cashChange || 0),
+                    };
+                }
+                return result;
             } catch (error) {
                 if (error?.code === 'P2002' && idempotencyKey) {
                     const replay = await this._findIdempotentOrder(businessProfileId, idempotencyKey);
@@ -216,11 +233,11 @@ class PosOrderService {
         return existing;
     }
 
-    async _priceItems(businessProfileId, items) {
+    async _priceItems(tx, businessProfileId, items) {
         let subtotal = 0;
         const priced = [];
         for (const item of items) {
-            const product = await this.prisma.businessProduct.findFirst({
+            const product = await tx.businessProduct.findFirst({
                 where: {
                     id: item.productId,
                     businessProfileId,
