@@ -33,6 +33,7 @@ describe('RestaurantOpsService business scoping', () => {
             .rejects.toThrow('Order not found.');
         expect(prisma.kitchenOrder.findFirst).toHaveBeenCalledWith({
             where: { id: 'order-b', businessProfileId: bpA },
+            include: { orderItems: true },
         });
         expect(prisma.kitchenOrder.update).not.toHaveBeenCalled();
     });
