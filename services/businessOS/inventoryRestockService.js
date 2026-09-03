@@ -31,6 +31,7 @@ class InventoryRestockService {
                     category: 'SUPPLIES',
                     description: `Restock: ${item.name} (x${qty} ${item.unit})`,
                     amount: -totalCostGhs,
+                    amountGhs: -totalCostGhs,
                     sourceType: 'INVENTORY_RESTOCK',
                     sourceId: item.id,
                     metadata: { inventoryItemId: item.id, quantity: qty, unitCost },
