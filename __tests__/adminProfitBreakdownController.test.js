@@ -12,20 +12,24 @@ function makeRes() {
     };
 }
 
-function makePrisma({ snapshots = [], logs = [] } = {}) {
+function makePrisma({ snapshots = [], logs = [], onGroupBy, onSnapshotFindMany } = {}) {
     return {
         systemProfitFees: { findUnique: jest.fn().mockResolvedValue({ balance: 12.5 }) },
         systemFiatPool: { findUnique: jest.fn().mockResolvedValue({ balance: 50 }) },
         systemHotWallet: { findUnique: jest.fn().mockResolvedValue({ balance: 80 }) },
         systemMasterCrypto: { findUnique: jest.fn().mockResolvedValue({ balance: 100 }) },
         adminProfitLog: {
-            groupBy: jest.fn().mockResolvedValue([
-                { source: 'TRADING_FEE', _sum: { amountUsdc: 20 }, _count: 2 },
-            ]),
+            groupBy: jest.fn(async (args) => {
+                onGroupBy?.(args);
+                return [{ source: 'TRADING_FEE', _sum: { amountUsdc: 20 }, _count: 2 }];
+            }),
             findMany: jest.fn().mockResolvedValue(logs),
         },
         dailySnapshot: {
-            findMany: jest.fn().mockResolvedValue(snapshots),
+            findMany: jest.fn(async (args) => {
+                onSnapshotFindMany?.(args);
+                return snapshots;
+            }),
         },
     };
 }
@@ -41,7 +45,13 @@ describe('adminProfitBreakdownController', () => {
             activeUsers: 7,
             profitBySource: { TRADING_FEE: 4 },
         }];
-        const prisma = makePrisma({ snapshots });
+        let groupByArgs;
+        let snapshotArgs;
+        const prisma = makePrisma({
+            snapshots,
+            onGroupBy: (args) => { groupByArgs = args; },
+            onSnapshotFindMany: (args) => { snapshotArgs = args; },
+        });
         getReadPrisma.mockReturnValue(prisma);
         const req = { app: {}, query: { period } };
         const res = makeRes();
@@ -59,13 +69,9 @@ describe('adminProfitBreakdownController', () => {
             }),
         }));
 
-        const [groupByArgs] = prisma.adminProfitLog.groupBy.mock.calls;
-        const [snapshotArgs] = prisma.dailySnapshot.findMany.mock.calls;
-        expect(groupByArgs.where.createdAt.gte).toBeInstanceOf(Date);
-        expect(snapshotArgs.where.date.gte).toBeInstanceOf(Date);
-        expect(new Date(snapshotArgs.where.date.gte).getTime()).toBe(
-            new Date(groupByArgs.where.createdAt.gte).getTime(),
-        );
+        expect(groupByArgs?.where?.createdAt?.gte).toBeInstanceOf(Date);
+        expect(snapshotArgs?.where?.date?.gte).toBeInstanceOf(Date);
+        expect(snapshotArgs.where.date.gte.getTime()).toBe(groupByArgs.where.createdAt.gte.getTime());
     });
 
     test('rejects an unknown period instead of silently showing another period', async () => {
