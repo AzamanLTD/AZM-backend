@@ -6,11 +6,13 @@ const service = (prisma, opts = {}) => new DineInService(prisma, opts.io);
 exports.openTab = async (prisma, opts) => service(prisma, opts).openTab({
     businessProfileId: opts.businessProfileId,
     azamanId: opts.azamanId || opts.customerAzamanId,
+    locationId: opts.locationId,
     tableId: opts.tableId,
 });
 
 exports.addItem = async (prisma, opts) => service(prisma, opts).addItem({
     tabId: opts.tabId,
+    productId: opts.productId,
     name: opts.name,
     price: opts.price ?? opts.unitPriceUsdc,
     quantity: opts.quantity,
