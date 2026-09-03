@@ -197,7 +197,7 @@ async function teardownFixtures() {
     await prisma.businessProfile.delete({ where: { id: businessProfile.id } });
     // Users
     const empUserIds = [testEmployee?.userId, secondEmployee?.userId].filter(Boolean);
-    if (empUserIds.length) await prisma.user.deleteMany({ where: { id: { in: empUserIds } } });
+    if (empUserIds.length) await prisma.user.deleteMany({ where: { id: { in: empUserIds } });
     await prisma.user.delete({ where: { id: businessOwner.id } });
     } catch (err) {
         console.error('[teardownFixtures] Error:', err.message);
