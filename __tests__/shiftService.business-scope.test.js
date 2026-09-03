@@ -90,6 +90,7 @@ describe('ShiftService business scoping and atomicity', () => {
 
     test('claiming a swap requires a same-business employee and claimant identity', async () => {
         const prisma = {
+            $transaction: jest.fn(async (callback) => callback(prisma)),
             shiftSwap: {
                 findFirst: jest.fn().mockResolvedValue({ id: 'swap-a', businessProfileId: bpA, status: 'PENDING' }),
                 update: jest.fn(),

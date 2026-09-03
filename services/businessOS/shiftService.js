@@ -29,7 +29,6 @@ class ShiftService {
 
     // ── Create Shift ───────────────────────────────────────────────────────
     async createShift({ businessProfileId, employeeId, shiftDate, startTime, endTime, locationId, breakMinutes = 30, shiftLabel, rotationId, notes }) {
-        // Verify employee belongs to this business
         const employee = await this.prisma.businessEmployee.findUnique({
             where: { id: employeeId },
         });
@@ -40,7 +39,6 @@ class ShiftService {
             throw new Error('Cannot schedule an inactive employee.');
         }
 
-        // Check for conflicting shifts (same date, overlapping time)
         const existing = await this.prisma.shift.findFirst({
             where: {
                 employeeId,
@@ -76,7 +74,6 @@ class ShiftService {
         });
     }
 
-    // ── Bulk Create Shifts (for rotation scheduling) ───────────────────────
     async createShiftRotation({ businessProfileId, employeeIds, startDate, endDate, rotationPattern, locationId, shiftLabel, breakMinutes = 30 }) {
         const shifts = [];
         for (const pattern of rotationPattern) {
@@ -105,125 +102,128 @@ class ShiftService {
         });
         if (!shift) throw new Error('Shift not found.');
         this._assertActorCanOperateEmployee(shift.employee.userId, context);
-        if (shift.status === 'CLOCKED_IN') throw new Error('Already clocked in.');
+        if (shift.status === 'CLOCKED_IN' || shift.status === 'LATE') throw new Error('Already clocked in.');
         if (shift.status === 'CLOCKED_OUT') throw new Error('Shift already completed.');
         if (shift.status === 'NO_SHOW') throw new Error('Shift marked as no-show.');
 
         const now = new Date();
         const isLate = now > new Date(shift.startTime);
         const lateMinutes = isLate
-            ? Math.round((now - new Date(shift.startTime)) / (1000 * 60))
+            ? Math.round((now - new Date(shift.startTime)) / 60000)
             : 0;
 
-        const updated = await this.prisma.shift.update({
-            where: { id: shiftId },
-            data: {
-                status: isLate ? 'LATE' : 'CLOCKED_IN',
-                clockInTime: now,
-                isLate,
-                lateMinutes,
-            },
-        });
-
-        if (isLate) {
-            await this.prisma.businessEmployee.update({
-                where: { id: shift.employeeId },
-                data: { lateCount: { increment: 1 } },
+        return this.prisma.$transaction(async (tx) => {
+            const transitioned = await tx.shift.updateMany({
+                where: {
+                    id: shiftId,
+                    businessProfileId: context.businessProfileId,
+                    status: 'SCHEDULED',
+                },
+                data: {
+                    status: isLate ? 'LATE' : 'CLOCKED_IN',
+                    clockInTime: now,
+                    isLate,
+                    lateMinutes,
+                },
             });
-        }
+            if (transitioned.count !== 1) throw new Error('Shift was already resolved or clocked in.');
 
-        return updated;
+            if (isLate) {
+                await tx.businessEmployee.update({
+                    where: { id: shift.employeeId },
+                    data: { lateCount: { increment: 1 } },
+                });
+            }
+
+            return tx.shift.findUnique({ where: { id: shiftId } });
+        });
     }
 
     // ── Clock Out ──────────────────────────────────────────────────────────
     async clockOut(shiftId) {
         const context = this._getBusinessContext();
-        const shift = await this.prisma.shift.findFirst({
-            where: { id: shiftId, businessProfileId: context.businessProfileId },
-            include: { employee: true },
-        });
-        if (!shift) throw new Error('Shift not found.');
-        this._assertActorCanOperateEmployee(shift.employee.userId, context);
-        if (shift.status !== 'CLOCKED_IN' && shift.status !== 'LATE') {
-            throw new Error('Must be clocked in to clock out.');
-        }
+        return this.prisma.$transaction(async (tx) => {
+            const shift = await tx.shift.findFirst({
+                where: { id: shiftId, businessProfileId: context.businessProfileId },
+                include: { employee: true },
+            });
+            if (!shift) throw new Error('Shift not found.');
+            this._assertActorCanOperateEmployee(shift.employee.userId, context);
+            if (shift.status !== 'CLOCKED_IN' && shift.status !== 'LATE') {
+                throw new Error('Must be clocked in to clock out.');
+            }
 
-        const now = new Date();
-        const clockInTime = new Date(shift.clockInTime);
-        const actualMinutes = Math.round((now - clockInTime) / (1000 * 60));
-        const workedHours = Math.max(0, (actualMinutes - shift.breakMinutes) / 60);
+            const now = new Date();
+            const actualMinutes = Math.round((now - new Date(shift.clockInTime)) / 60000);
+            const workedHours = Math.max(0, (actualMinutes - shift.breakMinutes) / 60);
 
-        const updated = await this.prisma.shift.update({
-            where: { id: shiftId },
-            data: {
-                status: 'CLOCKED_OUT',
-                clockOutTime: now,
-                actualMinutes,
-            },
-        });
-
-        await this.prisma.businessEmployee.update({
-            where: { id: shift.employeeId },
-            data: {
-                totalShifts: { increment: 1 },
-                totalHours: { increment: workedHours },
-            },
-        });
-
-        const employee = shift.employee;
-        let accrued = 0;
-        if (employee.payrollType === 'HOURLY' && employee.hourlyRate) {
-            accrued = workedHours * parseFloat(employee.hourlyRate);
-        } else if (employee.payrollType === 'SALARY' && employee.salaryAmount) {
-            const hourlyEquivalent = parseFloat(employee.salaryAmount) / 160;
-            accrued = workedHours * hourlyEquivalent;
-        }
-
-        if (accrued > 0) {
-            await this.prisma.businessEmployee.update({
-                where: { id: shift.employeeId },
+            const closed = await tx.shift.updateMany({
+                where: {
+                    id: shiftId,
+                    businessProfileId: context.businessProfileId,
+                    status: { in: ['CLOCKED_IN', 'LATE'] },
+                },
                 data: {
-                    accruedWages: { increment: accrued },
+                    status: 'CLOCKED_OUT',
+                    clockOutTime: now,
+                    actualMinutes,
                 },
             });
-        }
+            if (closed.count !== 1) throw new Error('Shift was already clocked out.');
 
-        return { shift: updated, workedHours, accruedThisShift: accrued };
+            const employee = shift.employee;
+            let accrued = 0;
+            if (employee.payrollType === 'HOURLY' && employee.hourlyRate) {
+                accrued = workedHours * parseFloat(employee.hourlyRate);
+            } else if (employee.payrollType === 'SALARY' && employee.salaryAmount) {
+                accrued = workedHours * (parseFloat(employee.salaryAmount) / 160);
+            }
+
+            await tx.businessEmployee.update({
+                where: { id: shift.employeeId },
+                data: {
+                    totalShifts: { increment: 1 },
+                    totalHours: { increment: workedHours },
+                    ...(accrued > 0 ? { accruedWages: { increment: accrued } } : {}),
+                },
+            });
+
+            const updated = await tx.shift.findUnique({ where: { id: shiftId } });
+            return { shift: updated, workedHours, accruedThisShift: accrued };
+        });
     }
 
     // ── Mark No-Show ───────────────────────────────────────────────────────
     async markNoShow(shiftId) {
         const context = this._getBusinessContext();
-        const shift = await this.prisma.shift.findFirst({
-            where: { id: shiftId, businessProfileId: context.businessProfileId },
-            include: { employee: true },
-        });
-        if (!shift) throw new Error('Shift not found.');
         if (!context.isAdmin && !context.isBusinessOwner) {
             throw new Error('Only a business owner or administrator can mark a no-show.');
         }
-        if (shift.status !== 'SCHEDULED') {
-            throw new Error('Can only mark SCHEDULED shifts as no-show.');
-        }
 
-        if (new Date() < new Date(shift.endTime)) {
-            throw new Error('Cannot mark no-show before shift ends.');
-        }
+        return this.prisma.$transaction(async (tx) => {
+            const shift = await tx.shift.findFirst({
+                where: { id: shiftId, businessProfileId: context.businessProfileId },
+                include: { employee: true },
+            });
+            if (!shift) throw new Error('Shift not found.');
+            if (shift.status !== 'SCHEDULED') throw new Error('Can only mark SCHEDULED shifts as no-show.');
+            if (new Date() < new Date(shift.endTime)) throw new Error('Cannot mark no-show before shift ends.');
 
-        const updated = await this.prisma.shift.update({
-            where: { id: shiftId },
-            data: { status: 'NO_SHOW' },
+            const updated = await tx.shift.updateMany({
+                where: { id: shiftId, businessProfileId: context.businessProfileId, status: 'SCHEDULED' },
+                data: { status: 'NO_SHOW' },
+            });
+            if (updated.count !== 1) throw new Error('Shift was already resolved.');
+
+            await tx.businessEmployee.update({
+                where: { id: shift.employeeId },
+                data: { noShowCount: { increment: 1 } },
+            });
+
+            return tx.shift.findUnique({ where: { id: shiftId } });
         });
-
-        await this.prisma.businessEmployee.update({
-            where: { id: shift.employeeId },
-            data: { noShowCount: { increment: 1 } },
-        });
-
-        return updated;
     }
 
-    // ── Get Shifts for a Business (date range) ─────────────────────────────
     async getShifts(businessProfileId, { startDate, endDate, employeeId, status, locationId } = {}) {
         const where = { businessProfileId };
         if (startDate && endDate) {
@@ -244,26 +244,19 @@ class ShiftService {
         });
     }
 
-    // ── Get Employee Schedule ──────────────────────────────────────────────
     async getEmployeeSchedule(employeeId, { startDate, endDate } = {}) {
         const where = { employeeId };
         if (startDate && endDate) {
             where.shiftDate = { gte: new Date(startDate), lte: new Date(endDate) };
         }
-
-        return this.prisma.shift.findMany({
-            where,
-            orderBy: { startTime: 'asc' },
-        });
+        return this.prisma.shift.findMany({ where, orderBy: { startTime: 'asc' } });
     }
 
-    // ── Get User Schedule (for worker sub-portal) ──────────────────────────
     async getUserSchedule(userId, { startDate, endDate } = {}) {
         const where = { userId };
         if (startDate && endDate) {
             where.shiftDate = { gte: new Date(startDate), lte: new Date(endDate) };
         }
-
         return this.prisma.shift.findMany({
             where,
             include: {
@@ -277,12 +270,11 @@ class ShiftService {
         });
     }
 
-    // ── Get Team On Duty ───────────────────────────────────────────────────
     async getTeamOnDuty(businessProfileId) {
         return this.prisma.shift.findMany({
             where: {
                 businessProfileId,
-                status: 'CLOCKED_IN',
+                status: { in: ['CLOCKED_IN', 'LATE'] },
             },
             include: {
                 employee: {
@@ -293,7 +285,6 @@ class ShiftService {
         });
     }
 
-    // ── Get Upcoming Team (who's next) ─────────────────────────────────────
     async getUpcomingTeam(businessProfileId) {
         const now = new Date();
         return this.prisma.shift.findMany({
@@ -312,7 +303,6 @@ class ShiftService {
         });
     }
 
-    // ── Update Shift ───────────────────────────────────────────────────────
     async updateShift(shiftId, updates) {
         const context = this._getBusinessContext();
         const allowed = ['startTime', 'endTime', 'breakMinutes', 'shiftLabel', 'locationId', 'notes', 'status', 'rotationId'];
@@ -332,15 +322,13 @@ class ShiftService {
         return this.prisma.shift.update({ where: { id: shiftId }, data });
     }
 
-    // ── Delete Shift ───────────────────────────────────────────────────────
     async deleteShift(shiftId) {
         const context = this._getBusinessContext();
         const shift = await this.prisma.shift.findFirst({
             where: { id: shiftId, businessProfileId: context.businessProfileId },
         });
         if (!shift) throw new Error('Shift not found.');
-        if (shift.status === 'CLOCKED_IN') throw new Error('Cannot delete an active shift.');
-
+        if (shift.status === 'CLOCKED_IN' || shift.status === 'LATE') throw new Error('Cannot delete an active shift.');
         return this.prisma.shift.delete({ where: { id: shiftId } });
     }
 
@@ -377,37 +365,41 @@ class ShiftService {
 
     async claimShiftSwap({ swapId, claimingEmployeeId, claimingShiftId }) {
         const context = this._getBusinessContext();
-        const swap = await this.prisma.shiftSwap.findFirst({
-            where: { id: swapId, businessProfileId: context.businessProfileId },
-        });
-        if (!swap) throw new Error('Swap request not found.');
-        if (swap.status !== 'PENDING' && swap.status !== 'OPEN') throw new Error('Swap is no longer pending.');
-
-        const employee = await this.prisma.businessEmployee.findFirst({
-            where: { id: claimingEmployeeId, businessProfileId: context.businessProfileId },
-        });
-        if (!employee) throw new Error('Employee not found in this business.');
-        this._assertActorCanOperateEmployee(employee.userId, context);
-
-        if (claimingShiftId) {
-            const claimingShift = await this.prisma.shift.findFirst({
-                where: {
-                    id: claimingShiftId,
-                    businessProfileId: context.businessProfileId,
-                    employeeId: employee.id,
-                    status: 'SCHEDULED',
-                },
+        return this.prisma.$transaction(async (tx) => {
+            const swap = await tx.shiftSwap.findFirst({
+                where: { id: swapId, businessProfileId: context.businessProfileId },
             });
-            if (!claimingShift) throw new Error('Claiming shift not found in this business.');
-        }
+            if (!swap) throw new Error('Swap request not found.');
+            if (swap.status !== 'PENDING' && swap.status !== 'OPEN') throw new Error('Swap is no longer pending.');
 
-        return this.prisma.shiftSwap.update({
-            where: { id: swapId },
-            data: {
-                claimingEmployeeId,
-                claimingUserId: employee.userId,
-                claimingShiftId,
-            },
+            const employee = await tx.businessEmployee.findFirst({
+                where: { id: claimingEmployeeId, businessProfileId: context.businessProfileId },
+            });
+            if (!employee) throw new Error('Employee not found in this business.');
+            this._assertActorCanOperateEmployee(employee.userId, context);
+
+            if (claimingShiftId) {
+                const claimingShift = await tx.shift.findFirst({
+                    where: {
+                        id: claimingShiftId,
+                        businessProfileId: context.businessProfileId,
+                        employeeId: employee.id,
+                        status: 'SCHEDULED',
+                    },
+                });
+                if (!claimingShift) throw new Error('Claiming shift not found in this business.');
+            }
+
+            const claimed = await tx.shiftSwap.updateMany({
+                where: {
+                    id: swapId,
+                    businessProfileId: context.businessProfileId,
+                    status: { in: ['PENDING', 'OPEN'] },
+                },
+                data: { claimingEmployeeId, claimingUserId: employee.userId, claimingShiftId },
+            });
+            if (claimed.count !== 1) throw new Error('Swap is no longer pending.');
+            return tx.shiftSwap.findUnique({ where: { id: swapId } });
         });
     }
 
@@ -443,7 +435,6 @@ class ShiftService {
             if (claimedEmployee.status !== 'ACTIVE' || requestingEmployee.status !== 'ACTIVE') {
                 throw new Error('Both employees must be active to approve a swap.');
             }
-
             if (origShift.employeeId !== requestingEmployee.id) {
                 throw new Error('The requested shift assignment changed before approval.');
             }
@@ -472,14 +463,9 @@ class ShiftService {
                     businessProfileId: context.businessProfileId,
                     status: { in: ['PENDING', 'OPEN'] },
                 },
-                data: {
-                    status: 'APPROVED',
-                    managerNote,
-                    respondedAt: new Date(),
-                },
+                data: { status: 'APPROVED', managerNote, respondedAt: new Date() },
             });
             if (finalized.count !== 1) throw new Error('Swap was already resolved.');
-
             return tx.shiftSwap.findUnique({ where: { id: swapId } });
         }, { isolationLevel: 'Serializable' });
     }
@@ -492,11 +478,7 @@ class ShiftService {
                 businessProfileId: context.businessProfileId,
                 status: { in: ['PENDING', 'OPEN'] },
             },
-            data: {
-                status: 'REJECTED',
-                managerNote,
-                respondedAt: new Date(),
-            },
+            data: { status: 'REJECTED', managerNote, respondedAt: new Date() },
         });
         if (result.count !== 1) throw new Error('Swap not found or already resolved.');
         return this.prisma.shiftSwap.findUnique({ where: { id: swapId } });
@@ -505,18 +487,13 @@ class ShiftService {
     async getShiftSwaps(businessProfileId, { status } = {}) {
         const where = { businessProfileId };
         if (status) where.status = status;
-
         return this.prisma.shiftSwap.findMany({
             where,
             include: {
                 requestingShift: true,
                 claimingShift: true,
-                requestingEmployee: {
-                    include: { user: { select: { username: true } } },
-                },
-                claimingEmployee: {
-                    include: { user: { select: { username: true } } },
-                },
+                requestingEmployee: { include: { user: { select: { username: true } } } },
+                claimingEmployee: { include: { user: { select: { username: true } } } },
             },
             orderBy: { createdAt: 'desc' },
         });
