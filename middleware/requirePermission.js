@@ -23,49 +23,57 @@
 const logger = require('../src/config/logger');
 const { ROLE_TEMPLATES, ALL_KEYS } = require('../config/permissionTemplates');
 
+// Permission-gated routes with resource IDs must prove that the target
+// resource belongs to the same business before the handler is reached.
+// This closes the common "valid permission + foreign resource ID" gap.
+const MUTATION_TARGET_MODELS = {
+    'shifts.update': 'shift',
+    'shifts.delete': 'shift',
+    'shifts.approve_swap': 'shiftSwap',
+    'employees.manage': 'businessEmployee',
+    'employees.permissions': 'businessEmployee',
+};
+
+async function validateMutationTarget(prisma, key, businessProfileId, req) {
+    const modelName = MUTATION_TARGET_MODELS[key];
+    const targetId = req.params?.id;
+    if (!modelName || !targetId) return true;
+
+    const target = await prisma[modelName].findFirst({
+        where: { id: targetId, businessProfileId },
+        select: { id: true },
+    });
+
+    return Boolean(target);
+}
+
 /**
  * Resolve a user's effective permission set for a given business.
  * Returns an array of permission strings. ['*'] means all permissions.
  */
 async function resolvePermissions(prisma, userId, businessProfileId) {
-    // Admin impersonation: if req.businessProfileId is set by adminBusinessScope,
-    // the user is an admin — they get all permissions.
-    // This is checked by the caller before invoking this function (see middleware below).
-
-    // Check if user is the business owner
     const bp = await prisma.businessProfile.findFirst({
         where: { id: businessProfileId },
         select: { userId: true },
     });
     if (!bp) return [];
 
-    // Owner gets all permissions
     if (bp.userId === userId) return ['*'];
 
-    // Check if user is an employee of this business
     const employee = await prisma.businessEmployee.findUnique({
         where: { businessProfileId_userId: { businessProfileId, userId } },
         select: { permissions: true, status: true, role: true },
     });
 
     if (!employee) return [];
-
-    // Suspended or terminated employees have no permissions
     if (employee.status === 'SUSPENDED' || employee.status === 'TERMINATED') return [];
 
-    // If they have '*' in their permissions, they have everything
-    if (employee.permissions.includes('*')) return ['*'];
+    const explicitPerms = employee.permissions || [];
+    if (explicitPerms.includes('*')) return ['*'];
 
-    // Resolve: merge template defaults with explicit overrides
     const template = ROLE_TEMPLATES[employee.role];
     const templatePerms = template ? template.permissions : [];
-    const explicitPerms = employee.permissions || [];
-
-    // Merge: template perms + any explicit perms that aren't already covered
-    // (explicit perms may add or override; for removal, the frontend stores
-    // only the final resolved set, so no need for subtraction logic here)
-    const merged = new Set([...templatePerms, ...explicitPerms]);
-    return Array.from(merged);
+    return Array.from(new Set([...templatePerms, ...explicitPerms]));
 }
 
 /**
@@ -81,8 +89,7 @@ function requirePermission(key) {
 
             const prisma = req.app.get('prisma');
 
-            // Resolve business profile ID (same logic as getBusinessProfileId in routes)
-            let businessProfileId = req.businessProfileId; // admin impersonation
+            let businessProfileId = req.businessProfileId;
             if (!businessProfileId) {
                 const bp = await prisma.businessProfile.findFirst({
                     where: { userId: req.user.id },
@@ -94,16 +101,19 @@ function requirePermission(key) {
                 businessProfileId = bp.id;
             }
 
-            // Admin users (impersonating) get all permissions
+            // Resource ownership is checked independently of permission level,
+            // including admin impersonation, so an ID from another business
+            // can never reach a mutation handler through this boundary.
+            if (!(await validateMutationTarget(prisma, key, businessProfileId, req))) {
+                return res.status(403).json({ success: false, message: 'Resource does not belong to this business.' });
+            }
+
             if (req.businessProfileId && req.user.role === 'ADMIN') {
                 return next();
             }
 
             const perms = await resolvePermissions(prisma, req.user.id, businessProfileId);
-
-            if (perms.includes('*')) {
-                return next();
-            }
+            if (perms.includes('*')) return next();
 
             if (!perms.includes(key)) {
                 return res.status(403).json({
@@ -113,7 +123,6 @@ function requirePermission(key) {
                 });
             }
 
-            // Attach resolved permissions to req for downstream use
             req.resolvedPermissions = perms;
             next();
         } catch (err) {
@@ -123,4 +132,4 @@ function requirePermission(key) {
     };
 }
 
-module.exports = { requirePermission, resolvePermissions };
+module.exports = { requirePermission, resolvePermissions, validateMutationTarget };
