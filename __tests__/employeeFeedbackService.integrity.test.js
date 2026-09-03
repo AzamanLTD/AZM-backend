@@ -2,6 +2,13 @@ const { EmployeeFeedbackService } = require('../services/businessOS/employeeFeed
 
 describe('EmployeeFeedbackService integrity', () => {
     test('recomputes rating only from the receiver business history inside one transaction', async () => {
+        const txEmployeeFeedback = {
+            create: jest.fn().mockResolvedValue({ id: 'feedback-a' }),
+            findMany: jest.fn().mockResolvedValue([{ rating: 5 }, { rating: 3 }]),
+        };
+        const txBusinessEmployee = {
+            updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+        };
         const prisma = {
             businessEmployee: {
                 findUnique: jest.fn()
@@ -9,13 +16,8 @@ describe('EmployeeFeedbackService integrity', () => {
                     .mockResolvedValueOnce({ id: 'to-a', businessProfileId: 'bp-a', userId: 'user-b' }),
             },
             $transaction: jest.fn(async (callback) => callback({
-                employeeFeedback: {
-                    create: jest.fn().mockResolvedValue({ id: 'feedback-a' }),
-                    findMany: jest.fn().mockResolvedValue([{ rating: 5 }, { rating: 3 }]),
-                },
-                businessEmployee: {
-                    updateMany: jest.fn().mockResolvedValue({ count: 1 }),
-                },
+                employeeFeedback: txEmployeeFeedback,
+                businessEmployee: txBusinessEmployee,
             })),
         };
         const svc = new EmployeeFeedbackService(prisma);
@@ -27,8 +29,15 @@ describe('EmployeeFeedbackService integrity', () => {
             rating: 3,
         })).resolves.toEqual({ id: 'feedback-a' });
 
-        const tx = await prisma.$transaction.mock.results[0].value;
-        expect(tx).toBeTruthy();
+        expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+        expect(txEmployeeFeedback.findMany).toHaveBeenCalledWith({
+            where: { businessProfileId: 'bp-a', receiverEmployeeId: 'to-a' },
+            select: { rating: true },
+        });
+        expect(txBusinessEmployee.updateMany).toHaveBeenCalledWith({
+            where: { id: 'to-a', businessProfileId: 'bp-a' },
+            data: { rating: 4, ratingCount: 2 },
+        });
     });
 
     test('rejects cross-business receiver before creating feedback', async () => {
