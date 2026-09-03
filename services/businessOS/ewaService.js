@@ -58,7 +58,7 @@ class EwaService {
     // both ledger records are one serializable transaction. This prevents a
     // successful claim from becoming a permanent balance deduction when a later
     // ledger/balance write fails, and makes concurrent withdrawals serialize.
-    async requestWithdrawal({ employeeId, amount, destination }) {
+    async requestWithdrawal({ employeeId, amount, destination, businessProfileId }) {
         const withdrawAmount = Number(amount);
         if (!Number.isFinite(withdrawAmount)) {
             throw new Error('Amount must be a valid number.');
@@ -71,7 +71,9 @@ class EwaService {
             try {
                 return await this.prisma.$transaction(async (tx) => {
                     const employee = await tx.businessEmployee.findUnique({
-                        where: { id: employeeId },
+                        where: businessProfileId
+                            ? { id: employeeId, businessProfileId }
+                            : { id: employeeId },
                     });
                     if (!employee) throw new Error('Employee not found.');
                     if (!employee.ewaEligible) throw new Error('EWA is not available for this employee.');
@@ -97,6 +99,7 @@ class EwaService {
                     const guardResult = await tx.businessEmployee.updateMany({
                         where: {
                             id: employeeId,
+                            ...(businessProfileId ? { businessProfileId } : {}),
                             status: 'ACTIVE',
                             ewaEligible: true,
                             withdrawnEarly: { lte: maxAvailable - withdrawAmount },
