@@ -165,83 +165,66 @@ class PayrollService {
     }
 
     // ── Disburse Payroll (execute payment) ─────────────────────────────────
-    // This integrates with Smart Routes for automatic payment splitting.
-    // The employee's Smart Route determines where the money goes.
+    // Direct payroll settlement is atomic: balance credit, transaction history,
+    // business ledger, payroll completion, and EWA/accrual reset commit together.
+    // Smart Route payroll requires a worker capable of routing the payroll's exact
+    // net amount; this method no longer marks such payroll as paid without a
+    // corresponding settlement operation.
     async disbursePayroll(payrollId) {
-        const payroll = await this.prisma.payrollRecord.findUnique({
-            where: { id: payrollId },
-            include: { employee: true },
-        });
-        if (!payroll) throw new Error('Payroll record not found.');
-        if (payroll.status === 'PROCESSED') throw new Error('Payroll already disbursed.');
-
-        const netAmount = parseFloat(payroll.netAmount);
-        if (netAmount <= 0) {
-            // Nothing to pay — mark as processed
-            return this.prisma.payrollRecord.update({
+        return this.prisma.$transaction(async (tx) => {
+            const payroll = await tx.payrollRecord.findUnique({
                 where: { id: payrollId },
-                data: {
-                    status: 'PROCESSED',
-                    paidAt: new Date(),
-                    failureReason: 'Net amount was zero or negative after deductions.',
-                },
+                include: { employee: true },
             });
-        }
+            if (!payroll) throw new Error('Payroll record not found.');
+            if (payroll.status === 'PROCESSED') throw new Error('Payroll already disbursed.');
 
-        try {
-            // Check if employee has a Smart Route configured
+            if (payroll.employee.businessProfileId !== payroll.businessProfileId) {
+                throw new Error('Payroll employee does not belong to this business.');
+            }
+
             if (payroll.employee.smartRouteId) {
-                // Execute via Smart Route — this handles the splitting automatically
-                // The Smart Route worker will handle the actual execution
-                await this.prisma.payrollRecord.update({
-                    where: { id: payrollId },
-                    data: {
-                        status: 'PROCESSED',
-                        smartRouteId: payroll.employee.smartRouteId,
-                        paidAt: new Date(),
-                    },
-                });
-            } else {
-                // Direct payment to employee's Azaman balance
-                // Credit the employee's azmBalance AND create TransactionHistory record
-                // (atomic ledger compliance — every USDC/AZM movement must be tracked)
-                await this.prisma.$transaction([
-                    // Credit employee's AZM balance
-                    this.prisma.user.update({
-                        where: { id: payroll.userId },
-                        data: {
-                            azmBalance: { increment: netAmount },
-                        },
-                    }),
-                    // Record in TransactionHistory for ledger reconciliation
-                    this.prisma.transactionHistory.create({
-                        data: {
-                            userId: payroll.userId,
-                            type: 'PAYROLL_DISBURSEMENT',
-                            amountUsdc: netAmount,
-                            feeUsdc: 0,
-                            status: 'COMPLETED',
-                            metadata: {
-                                employeeId: payroll.employeeId,
-                                period: payroll.period,
-                                payrollId,
-                                source: 'BUSINESS_OS_PAYROLL',
-                            },
-                        },
-                    }),
-                ]);
+                throw new Error('Payroll with Smart Route requires the payroll settlement worker; it was not marked as paid.');
+            }
 
-                await this.prisma.payrollRecord.update({
+            const netAmount = parseFloat(payroll.netAmount);
+            if (!Number.isFinite(netAmount)) throw new Error('Payroll net amount is invalid.');
+
+            if (netAmount <= 0) {
+                return tx.payrollRecord.update({
                     where: { id: payrollId },
                     data: {
                         status: 'PROCESSED',
                         paidAt: new Date(),
+                        failureReason: 'Net amount was zero or negative after deductions.',
                     },
                 });
             }
 
-            // Create ledger entry
-            await this.prisma.businessLedgerEntry.create({
+            await tx.user.update({
+                where: { id: payroll.userId },
+                data: {
+                    azmBalance: { increment: netAmount },
+                },
+            });
+
+            await tx.transactionHistory.create({
+                data: {
+                    userId: payroll.userId,
+                    type: 'PAYROLL_DISBURSEMENT',
+                    amountUsdc: netAmount,
+                    feeUsdc: 0,
+                    status: 'COMPLETED',
+                    metadata: {
+                        employeeId: payroll.employeeId,
+                        period: payroll.period,
+                        payrollId,
+                        source: 'BUSINESS_OS_PAYROLL',
+                    },
+                },
+            });
+
+            await tx.businessLedgerEntry.create({
                 data: {
                     businessProfileId: payroll.businessProfileId,
                     type: 'PAYROLL',
@@ -254,8 +237,7 @@ class PayrollService {
                 },
             });
 
-            // Reset employee's accrued wages and EWA withdrawn
-            await this.prisma.businessEmployee.update({
+            await tx.businessEmployee.update({
                 where: { id: payroll.employeeId },
                 data: {
                     accruedWages: 0.0,
@@ -263,19 +245,15 @@ class PayrollService {
                 },
             });
 
-            return this.prisma.payrollRecord.findUnique({
-                where: { id: payrollId },
-            });
-        } catch (err) {
-            await this.prisma.payrollRecord.update({
+            return tx.payrollRecord.update({
                 where: { id: payrollId },
                 data: {
-                    status: 'FAILED',
-                    failureReason: err.message,
+                    status: 'PROCESSED',
+                    paidAt: new Date(),
+                    failureReason: null,
                 },
             });
-            throw err;
-        }
+        }, { isolationLevel: 'Serializable' });
     }
 
     // ── Disburse All Payroll for a Period ──────────────────────────────────
@@ -287,7 +265,7 @@ class PayrollService {
         const results = [];
         for (const record of records) {
             try {
-                const result = await this.disbursePayroll(record.id);
+                await this.disbursePayroll(record.id);
                 results.push({ payrollId: record.id, status: 'success' });
             } catch (err) {
                 results.push({ payrollId: record.id, status: 'error', error: err.message });
