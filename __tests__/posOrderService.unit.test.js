@@ -16,6 +16,8 @@ describe('PosOrderService atomic settlement', () => {
             },
             businessOrderItem: { createMany: jest.fn().mockResolvedValue({ count: 1 }) },
             businessLedgerEntry: { create: jest.fn().mockResolvedValue({ id: 'ledger-1' }) },
+            businessLocation: { findFirst: jest.fn().mockResolvedValue({ id: 'loc-1' }) },
+            businessTable: { findFirst: jest.fn().mockResolvedValue({ id: 'table-1' }) },
             businessProduct: {
                 findFirst: jest.fn().mockResolvedValue(defaultProduct),
                 updateMany: jest.fn().mockResolvedValue({ count: 1 }),
@@ -68,7 +70,7 @@ describe('PosOrderService atomic settlement', () => {
 
         await expect(new PosOrderService(prisma).createOrder({
             businessProfileId: 'biz-1', actorId: 7, items: [{ productId: 'prod-1', quantity: 1 }], paymentMethod: 'CASH', cashGiven: 25, idempotencyKey: 'catalog-race-1',
-        })).rejects.toThrow('Invalid or unavailable product: prod-1');
+        })).rejects.toThrow('Invalid, unavailable, or out-of-location product: prod-1');
         expect(prisma.businessProduct.findFirst).not.toHaveBeenCalled();
         expect(tx.businessOrder.create).not.toHaveBeenCalled();
     });
@@ -94,6 +96,89 @@ describe('PosOrderService atomic settlement', () => {
         expect(tx.businessOrder.create).toHaveBeenCalledWith(expect.objectContaining({
             data: expect.objectContaining({ paymentMethod: 'CASH', cashReceived: 25, cashChange: 4.5 }),
         }));
+    });
+
+    test('rejects a table without a location context', async () => {
+        const tx = baseTx();
+        const prisma = {
+            businessProduct: { findFirst: jest.fn() },
+            businessOrder: { findFirst: jest.fn().mockResolvedValue(null) },
+            $transaction: jest.fn(async (fn) => fn(tx)),
+        };
+
+        await expect(new PosOrderService(prisma).createOrder({
+            businessProfileId: 'biz-1', actorId: 7, items: [{ productId: 'prod-1', quantity: 1 }], paymentMethod: 'CASH', cashGiven: 21, tableId: 'table-1', idempotencyKey: 'table-no-location',
+        })).rejects.toThrow('tableId requires locationId.');
+        expect(tx.businessLocation.findFirst).not.toHaveBeenCalled();
+        expect(tx.businessTable.findFirst).not.toHaveBeenCalled();
+        expect(tx.businessOrder.create).not.toHaveBeenCalled();
+    });
+
+    test('rejects a location that is not active and owned by the business', async () => {
+        const tx = baseTx({ businessLocation: { findFirst: jest.fn().mockResolvedValue(null) } });
+        const prisma = {
+            businessProduct: { findFirst: jest.fn() },
+            businessOrder: { findFirst: jest.fn().mockResolvedValue(null) },
+            $transaction: jest.fn(async (fn) => fn(tx)),
+        };
+
+        await expect(new PosOrderService(prisma).createOrder({
+            businessProfileId: 'biz-1', actorId: 7, items: [{ productId: 'prod-1', quantity: 1 }], paymentMethod: 'CASH', cashGiven: 21, locationId: 'loc-other', idempotencyKey: 'location-boundary',
+        })).rejects.toThrow('Invalid or inactive business location.');
+        expect(tx.businessLocation.findFirst).toHaveBeenCalledWith({
+            where: { id: 'loc-other', businessProfileId: 'biz-1', isActive: true },
+            select: { id: true },
+        });
+        expect(tx.businessTable.findFirst).not.toHaveBeenCalled();
+        expect(tx.businessOrder.create).not.toHaveBeenCalled();
+    });
+
+    test('rejects a table that belongs to another location even inside the same business', async () => {
+        const tx = baseTx({ businessTable: { findFirst: jest.fn().mockResolvedValue(null) } });
+        const prisma = {
+            businessProduct: { findFirst: jest.fn() },
+            businessOrder: { findFirst: jest.fn().mockResolvedValue(null) },
+            $transaction: jest.fn(async (fn) => fn(tx)),
+        };
+
+        await expect(new PosOrderService(prisma).createOrder({
+            businessProfileId: 'biz-1', actorId: 7, items: [{ productId: 'prod-1', quantity: 1 }], paymentMethod: 'CASH', cashGiven: 21, locationId: 'loc-1', tableId: 'table-other', idempotencyKey: 'table-boundary',
+        })).rejects.toThrow('Invalid or inactive business table for location.');
+        expect(tx.businessLocation.findFirst).toHaveBeenCalledWith({
+            where: { id: 'loc-1', businessProfileId: 'biz-1', isActive: true },
+            select: { id: 'loc-1' },
+        });
+        expect(tx.businessTable.findFirst).toHaveBeenCalledWith({
+            where: { id: 'table-other', locationId: 'loc-1', isActive: true },
+            select: { id: 'table-1' },
+        });
+        expect(tx.businessOrder.create).not.toHaveBeenCalled();
+    });
+
+    test('allows a branch-global product at a valid requested location', async () => {
+        const tx = baseTx({
+            businessProduct: { findFirst: jest.fn().mockResolvedValue({ ...defaultProduct, locationId: null }), updateMany: jest.fn().mockResolvedValue({ count: 1 }) },
+        });
+        const prisma = {
+            businessProduct: { findFirst: jest.fn() },
+            businessOrder: { findFirst: jest.fn().mockResolvedValue(null) },
+            $transaction: jest.fn(async (fn) => fn(tx)),
+        };
+
+        await new PosOrderService(prisma).createOrder({
+            businessProfileId: 'biz-1', actorId: 7, items: [{ productId: 'prod-1', quantity: 1 }], paymentMethod: 'CASH', cashGiven: 21, locationId: 'loc-1', idempotencyKey: 'location-valid',
+        });
+
+        expect(tx.businessProduct.findFirst).toHaveBeenCalledWith({
+            where: {
+                id: 'prod-1',
+                businessProfileId: 'biz-1',
+                isActive: true,
+                isAvailable: true,
+                OR: [{ locationId: null }, { locationId: 'loc-1' }],
+            },
+            select: { id: 'prod-1', name: 'Meal', priceUsdc: 20, stockQty: null },
+        });
     });
 
     test('decrements tracked retail stock in the same transaction as the sale', async () => {
@@ -135,6 +220,8 @@ describe('PosOrderService atomic settlement', () => {
         const prisma = {
             businessProduct: { findFirst: jest.fn() },
             businessOrder: { findFirst: jest.fn().mockResolvedValue(null) },
+            businessOrderItem: { createMany: jest.fn() },
+            businessLedgerEntry: { create: jest.fn() },
             $transaction: jest.fn(async (fn) => fn(tx)),
         };
 
