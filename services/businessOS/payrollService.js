@@ -5,21 +5,8 @@
 // for automatic disbursement, and track payroll history.
 // =============================================================================
 
-const { getRequestContext } = require('../../utils/requestContext');
-
 class PayrollService {
     constructor(prisma) { this.prisma = prisma; }
-
-    async _resolveCallerBusinessProfileId(explicitBusinessProfileId) {
-        if (explicitBusinessProfileId) return explicitBusinessProfileId;
-        const req = getRequestContext();
-        if (req?.businessProfileId) return req.businessProfileId;
-        if (!req?.user?.id) return null;
-        const ownedBusiness = await this.prisma.businessProfile.findFirst({ where: { userId: req.user.id }, select: { id: true } });
-        if (ownedBusiness?.id) return ownedBusiness.id;
-        const employee = await this.prisma.businessEmployee.findFirst({ where: { userId: req.user.id, status: 'ACTIVE' }, select: { businessProfileId: true } });
-        return employee?.businessProfileId || null;
-    }
 
     // ── Process Payroll for a Single Employee ──────────────────────────────
     async processEmployeePayroll({ businessProfileId, employeeId, period }) {
@@ -92,17 +79,16 @@ class PayrollService {
 
     // ── Disburse Payroll (execute payment) ─────────────────────────────────
     async disbursePayroll(payrollId, businessProfileId) {
-        const scopedBusinessProfileId = await this._resolveCallerBusinessProfileId(businessProfileId);
-        if (!scopedBusinessProfileId) throw new Error('Business context required.');
+        if (!businessProfileId) throw new Error('Business context required.');
 
         return this.prisma.$transaction(async (tx) => {
             const payroll = await tx.payrollRecord.findFirst({
-                where: { id: payrollId, businessProfileId: scopedBusinessProfileId },
+                where: { id: payrollId, businessProfileId },
                 include: { employee: true },
             });
             if (!payroll) throw new Error('Payroll record not found.');
             if (payroll.status === 'PROCESSED') throw new Error('Payroll already disbursed.');
-            if (payroll.employee.businessProfileId !== scopedBusinessProfileId || payroll.employee.businessProfileId !== payroll.businessProfileId) {
+            if (payroll.employee.businessProfileId !== businessProfileId || payroll.employee.businessProfileId !== payroll.businessProfileId) {
                 throw new Error('Payroll employee does not belong to this business.');
             }
             if (payroll.employee.smartRouteId) throw new Error('Payroll with Smart Route requires the payroll settlement worker; it was not marked as paid.');
