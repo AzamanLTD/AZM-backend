@@ -1,0 +1,67 @@
+name: Temporary Diagnostic Test Capture 2
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: azm_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d azm_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/azm_test?schema=public
+      TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/azm_test?schema=public
+      JWT_SECRET: test_secret_exactly_32_characters_long
+      NODE_ENV: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+      - name: Capture everything
+        shell: bash
+        run: |
+          set +e
+          : > diagnostic.log
+          run_cmd() {
+            echo "===== $1 =====" >> diagnostic.log
+            shift
+            "$@" >> diagnostic.log 2>&1
+            code=$?
+            echo "EXIT_CODE=$code" >> diagnostic.log
+            return 0
+          }
+          run_cmd "node-version" node --version
+          run_cmd "npm-version" npm --version
+          run_cmd "npm-ci" npm ci
+          run_cmd "prisma-db-push" npx prisma db push --accept-data-loss
+          run_cmd "overlay" node infra/install-transaction-quote-overlay.js
+          run_cmd "prisma-generate" npx prisma generate
+          run_cmd "jest" npm test -- --runInBand --forceExit
+          echo "===== END =====" >> diagnostic.log
+      - name: Upload diagnostic log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jest-diagnostic-log-2
+          path: diagnostic.log
+          if-no-files-found: warn
+          retention-days: 2
