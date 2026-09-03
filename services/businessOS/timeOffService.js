@@ -70,7 +70,6 @@ class TimeOffService {
             data: {
                 status: 'APPROVED',
                 managerNote,
-                approverId,
             },
         });
         if (transitioned.count !== 1) throw new Error('Request is no longer pending.');
@@ -107,7 +106,6 @@ class TimeOffService {
             data: {
                 status: 'REJECTED',
                 managerNote,
-                approverId,
             },
         });
         if (transitioned.count !== 1) throw new Error('Request is no longer pending.');
