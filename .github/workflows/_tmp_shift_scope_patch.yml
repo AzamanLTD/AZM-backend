@@ -22,20 +22,30 @@ jobs:
           "async clockOut(shiftId) {\n        const shift = await this.prisma.shift.findUnique({\n            where: { id: shiftId },": "async clockOut(shiftId, businessProfileId) {\n        const shift = await this.prisma.shift.findFirst({\n            where: { id: shiftId, businessProfileId },",
           "async markNoShow(shiftId) {\n        const shift = await this.prisma.shift.findUnique({\n            where: { id: shiftId },": "async markNoShow(shiftId, businessProfileId) {\n        const shift = await this.prisma.shift.findFirst({\n            where: { id: shiftId, businessProfileId },",
           "async updateShift(shiftId, updates) {": "async updateShift(shiftId, updates, businessProfileId) {\n        const shift = await this.prisma.shift.findFirst({ where: { id: shiftId, businessProfileId } });\n        if (!shift) throw new Error('Shift not found in this business.');",
-          "return this.prisma.shift.update({ where: { id: shiftId }, data });": "return this.prisma.shift.update({ where: { id: shiftId }, data });",
           "async deleteShift(shiftId) {\n        // Check if shift is active\n        const shift = await this.prisma.shift.findUnique({ where: { id: shiftId } });": "async deleteShift(shiftId, businessProfileId) {\n        // Check if shift is active and belongs to this business\n        const shift = await this.prisma.shift.findFirst({ where: { id: shiftId, businessProfileId } });",
           "async requestShiftSwap({ businessProfileId, shiftId, requestingEmployeeId, reason }) {\n        const shift = await this.prisma.shift.findUnique({\n            where: { id: shiftId },": "async requestShiftSwap({ businessProfileId, shiftId, requestingEmployeeId, reason }) {\n        const shift = await this.prisma.shift.findFirst({\n            where: { id: shiftId, businessProfileId },",
-          "        if (!employee) throw new Error('Employee not found.');\n\n        return this.prisma.shiftSwap.create({": "        if (!employee || employee.businessProfileId !== businessProfileId) throw new Error('Employee not found in this business.');\n\n        return this.prisma.shiftSwap.create({",
           "async claimShiftSwap({ swapId, claimingEmployeeId, claimingShiftId }) {\n        const swap = await this.prisma.shiftSwap.findUnique({\n            where: { id: swapId },": "async claimShiftSwap({ swapId, claimingEmployeeId, claimingShiftId, businessProfileId }) {\n        const swap = await this.prisma.shiftSwap.findFirst({\n            where: { id: swapId, businessProfileId },",
-          "        const employee = await this.prisma.businessEmployee.findUnique({\n            where: { id: claimingEmployeeId },\n        });\n        if (!employee) throw new Error('Employee not found.');": "        const employee = await this.prisma.businessEmployee.findFirst({\n            where: { id: claimingEmployeeId, businessProfileId },\n        });\n        if (!employee) throw new Error('Employee not found in this business.');\n        if (claimingShiftId) {\n            const claimingShift = await this.prisma.shift.findFirst({ where: { id: claimingShiftId, businessProfileId } });\n            if (!claimingShift) throw new Error('Claiming shift not found in this business.');\n        }",
           "async approveShiftSwap(swapId, managerNote) {\n        const swap = await this.prisma.shiftSwap.findUnique({\n            where: { id: swapId },": "async approveShiftSwap(swapId, managerNote, businessProfileId) {\n        const swap = await this.prisma.shiftSwap.findFirst({\n            where: { id: swapId, businessProfileId },",
-          "        // Update the original shift to the claiming employee\n        await this.prisma.shift.update({": "        const result = await this.prisma.$transaction(async (tx) => {\n            // Update the original shift to the claiming employee\n            await tx.shift.update({",
-          "        // If there's a claiming shift, update it to the requesting employee\n        if (claimShift) {\n            await this.prisma.shift.update({\n                where: { id: claimShift.id },\n                data: { employeeId: swap.requestingEmployeeId, userId: swap.requestingUserId },\n            });\n        }\n\n        return this.prisma.shiftSwap.update({\n            where: { id: swapId },\n            data: {\n                status: 'APPROVED',\n                managerNote,\n                respondedAt: new Date(),\n            },\n        });": "            // If there's a claiming shift, update it to the requesting employee\n            if (claimShift) {\n                await tx.shift.update({\n                    where: { id: claimShift.id },\n                    data: { employeeId: swap.requestingEmployeeId, userId: swap.requestingUserId },\n                });\n            }\n\n            return tx.shiftSwap.update({\n                where: { id: swapId },\n                data: { status: 'APPROVED', managerNote, respondedAt: new Date() },\n            });\n        });\n        return result;",
           "async rejectShiftSwap(swapId, managerNote) {\n        return this.prisma.shiftSwap.update({\n            where: { id: swapId },": "async rejectShiftSwap(swapId, managerNote, businessProfileId) {\n        const swap = await this.prisma.shiftSwap.findFirst({ where: { id: swapId, businessProfileId } });\n        if (!swap) throw new Error('Swap not found in this business.');\n        return this.prisma.shiftSwap.update({\n            where: { id: swapId },"
           }
           for old,new in repl.items():
               if old not in s: raise SystemExit(f'PATTERN NOT FOUND: {old[:80]}')
               s=s.replace(old,new,1)
+          # tighten employee lookup in swap claim
+          old="const employee = await this.prisma.businessEmployee.findUnique({\n            where: { id: claimingEmployeeId },\n        });\n        if (!employee) throw new Error('Employee not found.');"
+          new="const employee = await this.prisma.businessEmployee.findFirst({\n            where: { id: claimingEmployeeId, businessProfileId },\n        });\n        if (!employee) throw new Error('Employee not found in this business.');\n        if (claimingShiftId) {\n            const claimingShift = await this.prisma.shift.findFirst({ where: { id: claimingShiftId, businessProfileId } });\n            if (!claimingShift) throw new Error('Claiming shift not found in this business.');\n        }"
+          if old not in s: raise SystemExit('CLAIM EMPLOYEE PATTERN NOT FOUND')
+          s=s.replace(old,new,1)
+          # same-business employee required for request swap
+          old="if (!employee) throw new Error('Employee not found.');\n\n        return this.prisma.shiftSwap.create({"
+          new="if (!employee || employee.businessProfileId !== businessProfileId) throw new Error('Employee not found in this business.');\n\n        return this.prisma.shiftSwap.create({"
+          if old not in s: raise SystemExit('REQUEST EMPLOYEE PATTERN NOT FOUND')
+          s=s.replace(old,new,1)
+          # atomically swap both shifts + mark swap approved
+          old="        // Update the original shift to the claiming employee\n        await this.prisma.shift.update({\n            where: { id: origShift.id },\n            data: { employeeId: swap.claimingEmployeeId, userId: swap.claimingUserId },\n        });\n\n        // If there's a claiming shift, update it to the requesting employee\n        if (claimShift) {\n            await this.prisma.shift.update({\n                where: { id: claimShift.id },\n                data: { employeeId: swap.requestingEmployeeId, userId: swap.requestingUserId },\n            });\n        }\n\n        return this.prisma.shiftSwap.update({\n            where: { id: swapId },\n            data: {\n                status: 'APPROVED',\n                managerNote,\n                respondedAt: new Date(),\n            },\n        });"
+          new="        const result = await this.prisma.$transaction(async (tx) => {\n            await tx.shift.update({\n                where: { id: origShift.id },\n                data: { employeeId: swap.claimingEmployeeId, userId: swap.claimingUserId },\n            });\n            if (claimShift) {\n                await tx.shift.update({\n                    where: { id: claimShift.id },\n                    data: { employeeId: swap.requestingEmployeeId, userId: swap.requestingUserId },\n                });\n            }\n            return tx.shiftSwap.update({\n                where: { id: swapId },\n                data: { status: 'APPROVED', managerNote, respondedAt: new Date() },\n            });\n        });\n        return result;"
+          if old not in s: raise SystemExit('APPROVE BLOCK NOT FOUND')
+          s=s.replace(old,new,1)
           p.write_text(s)
 
           p=Path('routes/businessOSRoutes.js')
@@ -56,50 +66,14 @@ jobs:
               if s.count(old)!=1: raise SystemExit(f'ROUTE PATTERN COUNT {s.count(old)}: {old[:80]}')
               s=s.replace(old,new,1)
           p.write_text(s)
-          PY
-          cat > __tests__/shiftOpsService.business-scope.test.js <<'JS'
-          const { ShiftService } = require('../services/businessOS/shiftService');
 
-          describe('ShiftService business scoping', () => {
-            const bpA='bp-a', bpB='bp-b';
-
-            test('cannot update or delete another business shift', async () => {
-              const prisma={
-                shift:{
-                  findFirst: jest.fn().mockResolvedValue(null),
-                  update: jest.fn(), delete: jest.fn(),
-                },
-              };
-              const svc=new ShiftService(prisma);
-              await expect(svc.updateShift('shift-b',{},bpA)).rejects.toThrow('Shift not found in this business.');
-              await expect(svc.deleteShift('shift-b',bpA)).rejects.toThrow('Shift not found.');
-              expect(prisma.shift.update).not.toHaveBeenCalled();
-              expect(prisma.shift.delete).not.toHaveBeenCalled();
-            });
-
-            test('cannot clock another business shift', async () => {
-              const prisma={ shift:{ findFirst: jest.fn().mockResolvedValue(null), update: jest.fn() } };
-              const svc=new ShiftService(prisma);
-              await expect(svc.clockIn('shift-b',bpA)).rejects.toThrow('Shift not found.');
-              await expect(svc.clockOut('shift-b',bpA)).rejects.toThrow('Shift not found.');
-              await expect(svc.markNoShow('shift-b',bpA)).rejects.toThrow('Shift not found.');
-            });
-
-            test('swap claim requires same-business employee and claiming shift', async () => {
-              const prisma={
-                shiftSwap:{findFirst:jest.fn().mockResolvedValue({id:'swap',businessProfileId:bpA,status:'PENDING'}),update:jest.fn()},
-                businessEmployee:{findFirst:jest.fn().mockResolvedValue(null)},
-              };
-              const svc=new ShiftService(prisma);
-              await expect(svc.claimShiftSwap({swapId:'swap',claimingEmployeeId:'employee-b',claimingShiftId:'shift-b',businessProfileId:bpA}))
-                .rejects.toThrow('Employee not found in this business.');
-            });
-          });
-          JS
+          test=Path('__tests__/shiftOpsService.business-scope.test.js')
+          test.write_text("""const { ShiftService } = require('../services/businessOS/shiftService');\n\ndescribe('ShiftService business scoping', () => {\n  const bpA='bp-a';\n  test('cannot update/delete/clock/no-show another business shift', async () => {\n    const prisma={shift:{findFirst:jest.fn().mockResolvedValue(null),update:jest.fn(),delete:jest.fn()}};\n    const svc=new ShiftService(prisma);\n    await expect(svc.updateShift('shift-b',{},bpA)).rejects.toThrow('Shift not found in this business.');\n    await expect(svc.deleteShift('shift-b',bpA)).rejects.toThrow('Shift not found.');\n    await expect(svc.clockIn('shift-b',bpA)).rejects.toThrow('Shift not found.');\n    await expect(svc.clockOut('shift-b',bpA)).rejects.toThrow('Shift not found.');\n    await expect(svc.markNoShow('shift-b',bpA)).rejects.toThrow('Shift not found.');\n  });\n  test('cannot claim a swap with a foreign employee', async () => {\n    const prisma={shiftSwap:{findFirst:jest.fn().mockResolvedValue({id:'swap',businessProfileId:bpA,status:'PENDING'}),update:jest.fn()},businessEmployee:{findFirst:jest.fn().mockResolvedValue(null)}};\n    const svc=new ShiftService(prisma);\n    await expect(svc.claimShiftSwap({swapId:'swap',claimingEmployeeId:'employee-b',claimingShiftId:'shift-b',businessProfileId:bpA})).rejects.toThrow('Employee not found in this business.');\n  });\n});\n""")
           git add services/businessOS/shiftService.js routes/businessOSRoutes.js __tests__/shiftOpsService.business-scope.test.js
           git commit -m "fix(business-os): scope shift mutations to business"
           git push
-          rm .github/workflows/_tmp_shift_scope_patch.yml
-          git add .github/workflows/_tmp_shift_scope_patch.yml
+          rm .github/workflows/_tmp_shift_scope_patch.yml PATCH_TRIGGER.txt
+          git add .github/workflows/_tmp_shift_scope_patch.yml PATCH_TRIGGER.txt
           git commit -m "chore: remove temporary shift scope patch runner"
           git push
+          
