@@ -366,19 +366,19 @@ class EmployeeService {
             orderBy: { startTime: 'asc' },
         });
 
-        // Get current shift (if clocked in)
+        // Get current shift (both on-time and late starts are still active)
         const currentShift = await this.prisma.shift.findFirst({
             where: {
                 employeeId: employee.id,
-                status: 'CLOCKED_IN',
+                status: { in: ['CLOCKED_IN', 'LATE'] },
             },
         });
 
-        // Get team members on duty now
+        // Get team members on duty now; LATE is an active attendance state too.
         const teamOnDuty = await this.prisma.shift.findMany({
             where: {
                 businessProfileId: employee.businessProfileId,
-                status: 'CLOCKED_IN',
+                status: { in: ['CLOCKED_IN', 'LATE'] },
             },
             include: {
                 employee: {
