@@ -1,4 +1,4 @@
-const { AtomicShiftService } = require('../services/businessOS/atomicShiftService');
+const { ShiftService } = require('../services/businessOS/shiftService');
 const { runWithBusinessRequestContext } = require('../src/lib/businessRequestContext');
 
 const context = {
@@ -10,7 +10,7 @@ const context = {
 
 const withContext = (fn, overrides = {}) => runWithBusinessRequestContext({ ...context, ...overrides }, fn);
 
-describe('AtomicShiftService state transitions', () => {
+describe('ShiftService atomic state transitions', () => {
     test('clock-in accepts only SCHEDULED and increments lateness once', async () => {
         const tx = {
             shift: {
@@ -29,7 +29,7 @@ describe('AtomicShiftService state transitions', () => {
             },
             $transaction: jest.fn(async callback => callback(tx)),
         };
-        const result = await withContext(() => new AtomicShiftService(prisma).clockIn('shift-1'));
+        const result = await withContext(() => new ShiftService(prisma).clockIn('shift-1'));
 
         expect(result.status).toBe('LATE');
         expect(tx.shift.updateMany).toHaveBeenCalledWith(expect.objectContaining({
@@ -53,7 +53,7 @@ describe('AtomicShiftService state transitions', () => {
         };
         const prisma = { $transaction: jest.fn(async callback => callback(tx)) };
 
-        const result = await withContext(() => new AtomicShiftService(prisma).clockOut('shift-2'));
+        const result = await withContext(() => new ShiftService(prisma).clockOut('shift-2'));
 
         expect(result.shift.status).toBe('CLOCKED_OUT');
         expect(tx.shift.updateMany).toHaveBeenCalledWith(expect.objectContaining({
@@ -78,7 +78,7 @@ describe('AtomicShiftService state transitions', () => {
         };
         const prisma = { $transaction: jest.fn(async callback => callback(tx)) };
 
-        await expect(withContext(() => new AtomicShiftService(prisma).markNoShow('shift-3')))
+        await expect(withContext(() => new ShiftService(prisma).markNoShow('shift-3')))
             .rejects.toThrow(/already resolved/i);
         expect(tx.businessEmployee.update).not.toHaveBeenCalled();
     });
@@ -96,7 +96,7 @@ describe('AtomicShiftService state transitions', () => {
         };
         const prisma = { $transaction: jest.fn(async callback => callback(tx)) };
 
-        const result = await withContext(() => new AtomicShiftService(prisma).claimShiftSwap({
+        const result = await withContext(() => new ShiftService(prisma).claimShiftSwap({
             swapId: 'swap-1',
             claimingEmployeeId: 'emp-2',
         }));
