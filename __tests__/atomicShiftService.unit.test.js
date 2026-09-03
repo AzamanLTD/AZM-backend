@@ -150,4 +150,19 @@ describe('ShiftService atomic state transitions', () => {
             where: expect.objectContaining({ status: { in: ['PENDING', 'OPEN'] }, businessProfileId: 'biz-1' }),
         }));
     });
+
+    test('generic shift updates reject lifecycle status mutation before touching the database', async () => {
+        const prisma = {
+            shift: {
+                findFirst: jest.fn(),
+                update: jest.fn(),
+            },
+        };
+
+        await expect(withContext(() => new ShiftService(prisma).updateShift('shift-1', {
+            status: 'CLOCKED_OUT',
+        }))).rejects.toThrow('Shift status must be changed through the clock-in, clock-out, or no-show actions.');
+        expect(prisma.shift.findFirst).not.toHaveBeenCalled();
+        expect(prisma.shift.update).not.toHaveBeenCalled();
+    });
 });
