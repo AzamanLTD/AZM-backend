@@ -74,7 +74,7 @@ describe('EwaService integrity', () => {
         expect(prisma.tx.businessLedgerEntry.create).toHaveBeenCalledTimes(1);
     });
 
-    test('rejects invalid and over-limit amounts before any transaction', async () => {
+    test('rejects invalid and over-limit amounts without performing a settlement write', async () => {
         const prisma = buildPrisma();
         const svc = new EwaService(prisma);
 
@@ -85,7 +85,11 @@ describe('EwaService integrity', () => {
         await expect(svc.requestWithdrawal({ employeeId: 'employee-a', amount: 21 }))
             .rejects.toThrow('Amount exceeds available EWA balance. Max: 20.00 AZM');
 
-        expect(prisma.$transaction).not.toHaveBeenCalled();
+        expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+        expect(prisma.tx.businessEmployee.updateMany).not.toHaveBeenCalled();
+        expect(prisma.tx.user.update).not.toHaveBeenCalled();
+        expect(prisma.tx.transactionHistory.create).not.toHaveBeenCalled();
+        expect(prisma.tx.businessLedgerEntry.create).not.toHaveBeenCalled();
     });
 
     test('does not perform a detached withdrawnEarly claim when the settlement transaction fails', async () => {
