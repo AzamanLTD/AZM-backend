@@ -38,6 +38,30 @@ describe('ShiftService atomic state transitions', () => {
         expect(tx.businessEmployee.update).toHaveBeenCalledTimes(1);
     });
 
+    test('clock-in race loss does not increment lateCount', async () => {
+        const tx = {
+            shift: {
+                updateMany: jest.fn().mockResolvedValue({ count: 0 }),
+                findUnique: jest.fn(),
+            },
+            businessEmployee: { update: jest.fn() },
+        };
+        const prisma = {
+            shift: {
+                findFirst: jest.fn().mockResolvedValue({
+                    id: 'shift-race', businessProfileId: 'biz-1', status: 'SCHEDULED',
+                    startTime: new Date(Date.now() - 60_000), employeeId: 'emp-1',
+                    employee: { userId: 101 },
+                }),
+            },
+            $transaction: jest.fn(async callback => callback(tx)),
+        };
+
+        await expect(withContext(() => new ShiftService(prisma).clockIn('shift-race')))
+            .rejects.toThrow(/already resolved|clocked in/i);
+        expect(tx.businessEmployee.update).not.toHaveBeenCalled();
+    });
+
     test('clock-out conditionally closes the shift before applying employee totals', async () => {
         const tx = {
             shift: {
@@ -62,6 +86,26 @@ describe('ShiftService atomic state transitions', () => {
         expect(tx.businessEmployee.update).toHaveBeenCalledWith(expect.objectContaining({
             data: expect.objectContaining({ totalShifts: { increment: 1 } }),
         }));
+    });
+
+    test('clock-out race loss prevents duplicate employee totals', async () => {
+        const tx = {
+            shift: {
+                findFirst: jest.fn().mockResolvedValue({
+                    id: 'shift-race-out', businessProfileId: 'biz-1', status: 'CLOCKED_IN',
+                    clockInTime: new Date(Date.now() - 3_600_000), breakMinutes: 0,
+                    employee: { userId: 101, payrollType: 'HOURLY', hourlyRate: 20 },
+                }),
+                updateMany: jest.fn().mockResolvedValue({ count: 0 }),
+                findUnique: jest.fn(),
+            },
+            businessEmployee: { update: jest.fn() },
+        };
+        const prisma = { $transaction: jest.fn(async callback => callback(tx)) };
+
+        await expect(withContext(() => new ShiftService(prisma).clockOut('shift-race-out')))
+            .rejects.toThrow(/already clocked out/i);
+        expect(tx.businessEmployee.update).not.toHaveBeenCalled();
     });
 
     test('losing the conditional transition prevents duplicate no-show accounting', async () => {
