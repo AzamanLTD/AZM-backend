@@ -1,6 +1,8 @@
 const { PosOrderService } = require('../services/businessOS/posOrderService');
 
 describe('PosOrderService atomic settlement', () => {
+    const defaultProduct = { id: 'prod-1', name: 'Meal', priceUsdc: 20, stockQty: null, isActive: true, isAvailable: true };
+
     function baseTx(overrides = {}) {
         return {
             user: {
@@ -14,17 +16,20 @@ describe('PosOrderService atomic settlement', () => {
             },
             businessOrderItem: { createMany: jest.fn().mockResolvedValue({ count: 1 }) },
             businessLedgerEntry: { create: jest.fn().mockResolvedValue({ id: 'ledger-1' }) },
-            businessProduct: { updateMany: jest.fn().mockResolvedValue({ count: 1 }) },
+            businessProduct: {
+                findFirst: jest.fn().mockResolvedValue(defaultProduct),
+                updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+            },
             recipeIngredient: { findMany: jest.fn().mockResolvedValue([]) },
             inventoryItem: { updateMany: jest.fn().mockResolvedValue({ count: 1 }) },
             ...overrides,
         };
     }
 
-    test('re-derives catalog prices and commits balance, line items, order and ledger together', async () => {
+    test('re-derives catalog prices from the transaction client and commits balance, line items, order and ledger together', async () => {
         const tx = baseTx();
         const prisma = {
-            businessProduct: { findFirst: jest.fn().mockResolvedValue({ id: 'prod-1', name: 'Meal', priceUsdc: 20, stockQty: null }) },
+            businessProduct: { findFirst: jest.fn(() => { throw new Error('catalog must be read through transaction client'); }) },
             businessOrder: { findFirst: jest.fn().mockResolvedValue(null) },
             $transaction: jest.fn(async (fn) => fn(tx)),
         };
@@ -34,6 +39,9 @@ describe('PosOrderService atomic settlement', () => {
         });
 
         expect(result.computedGrand).toBe(41);
+        expect(tx.businessProduct.findFirst).toHaveBeenCalledWith(expect.objectContaining({
+            where: { id: 'prod-1', businessProfileId: 'biz-1', isActive: true, isAvailable: true },
+        }));
         expect(tx.user.updateMany).toHaveBeenCalledWith({
             where: { id: 7, azmBalance: { gte: 41 } },
             data: { azmBalance: { decrement: 41 } },
@@ -48,12 +56,29 @@ describe('PosOrderService atomic settlement', () => {
         expect(tx.businessLedgerEntry.create).toHaveBeenCalled();
     });
 
+    test('uses transaction-time catalog state for availability and pricing', async () => {
+        const tx = baseTx({
+            businessProduct: { findFirst: jest.fn().mockResolvedValue(null), updateMany: jest.fn() },
+        });
+        const prisma = {
+            businessProduct: { findFirst: jest.fn().mockResolvedValue({ id: 'prod-1', name: 'Stale quote', priceUsdc: 1, stockQty: null }) },
+            businessOrder: { findFirst: jest.fn().mockResolvedValue(null) },
+            $transaction: jest.fn(async (fn) => fn(tx)),
+        };
+
+        await expect(new PosOrderService(prisma).createOrder({
+            businessProfileId: 'biz-1', actorId: 7, items: [{ productId: 'prod-1', quantity: 1 }], paymentMethod: 'CASH', cashGiven: 25, idempotencyKey: 'catalog-race-1',
+        })).rejects.toThrow('Invalid or unavailable product: prod-1');
+        expect(prisma.businessProduct.findFirst).not.toHaveBeenCalled();
+        expect(tx.businessOrder.create).not.toHaveBeenCalled();
+    });
+
     test('computes the legacy 2.5% POS tax and cash change server-side', async () => {
         const tx = baseTx({
             businessOrder: { findFirst: jest.fn().mockResolvedValue(null), create: jest.fn().mockResolvedValue({ id: 'order-cash', amountUsdc: 20.5, cashChange: 4.5 }) },
         });
         const prisma = {
-            businessProduct: { findFirst: jest.fn().mockResolvedValue({ id: 'prod-1', name: 'Meal', priceUsdc: 20, stockQty: null }) },
+            businessProduct: { findFirst: jest.fn() },
             businessOrder: { findFirst: jest.fn().mockResolvedValue(null) },
             $transaction: jest.fn(async (fn) => fn(tx)),
         };
@@ -72,9 +97,14 @@ describe('PosOrderService atomic settlement', () => {
     });
 
     test('decrements tracked retail stock in the same transaction as the sale', async () => {
-        const tx = baseTx();
+        const tx = baseTx({
+            businessProduct: {
+                findFirst: jest.fn().mockResolvedValue({ id: 'prod-1', name: 'Bottle', priceUsdc: 5, stockQty: 10, isActive: true, isAvailable: true }),
+                updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+            },
+        });
         const prisma = {
-            businessProduct: { findFirst: jest.fn().mockResolvedValue({ id: 'prod-1', name: 'Bottle', priceUsdc: 5, stockQty: 10 }) },
+            businessProduct: { findFirst: jest.fn() },
             businessOrder: { findFirst: jest.fn().mockResolvedValue(null) },
             $transaction: jest.fn(async (fn) => fn(tx)),
         };
@@ -91,6 +121,10 @@ describe('PosOrderService atomic settlement', () => {
 
     test('decrements recipe ingredients atomically for restaurant products', async () => {
         const tx = baseTx({
+            businessProduct: {
+                findFirst: jest.fn().mockResolvedValue({ id: 'prod-1', name: 'Jollof', priceUsdc: 10, stockQty: null, isActive: true, isAvailable: true }),
+                updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+            },
             recipeIngredient: {
                 findMany: jest.fn().mockResolvedValue([
                     { productId: 'prod-1', inventoryItemId: 'inv-rice', quantityRequired: 0.25 },
@@ -99,7 +133,7 @@ describe('PosOrderService atomic settlement', () => {
             },
         });
         const prisma = {
-            businessProduct: { findFirst: jest.fn().mockResolvedValue({ id: 'prod-1', name: 'Jollof', priceUsdc: 10, stockQty: null }) },
+            businessProduct: { findFirst: jest.fn() },
             businessOrder: { findFirst: jest.fn().mockResolvedValue(null) },
             $transaction: jest.fn(async (fn) => fn(tx)),
         };
@@ -120,6 +154,10 @@ describe('PosOrderService atomic settlement', () => {
 
     test('aggregates duplicate order lines before recipe ingredient consumption', async () => {
         const tx = baseTx({
+            businessProduct: {
+                findFirst: jest.fn().mockResolvedValue({ id: 'prod-1', name: 'Jollof', priceUsdc: 10, stockQty: null, isActive: true, isAvailable: true }),
+                updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+            },
             recipeIngredient: {
                 findMany: jest.fn().mockResolvedValue([
                     { productId: 'prod-1', inventoryItemId: 'inv-rice', quantityRequired: 0.25 },
@@ -127,7 +165,7 @@ describe('PosOrderService atomic settlement', () => {
             },
         });
         const prisma = {
-            businessProduct: { findFirst: jest.fn().mockResolvedValue({ id: 'prod-1', name: 'Jollof', priceUsdc: 10, stockQty: null }) },
+            businessProduct: { findFirst: jest.fn() },
             businessOrder: { findFirst: jest.fn().mockResolvedValue(null) },
             $transaction: jest.fn(async (fn) => fn(tx)),
         };
@@ -151,9 +189,14 @@ describe('PosOrderService atomic settlement', () => {
     });
 
     test('refuses a sale when tracked product stock is insufficient before order creation', async () => {
-        const tx = baseTx({ businessProduct: { updateMany: jest.fn().mockResolvedValue({ count: 0 }) } });
+        const tx = baseTx({
+            businessProduct: {
+                findFirst: jest.fn().mockResolvedValue({ id: 'prod-1', name: 'Bottle', priceUsdc: 5, stockQty: 1, isActive: true, isAvailable: true }),
+                updateMany: jest.fn().mockResolvedValue({ count: 0 }),
+            },
+        });
         const prisma = {
-            businessProduct: { findFirst: jest.fn().mockResolvedValue({ id: 'prod-1', name: 'Bottle', priceUsdc: 5, stockQty: 1 }) },
+            businessProduct: { findFirst: jest.fn() },
             businessOrder: { findFirst: jest.fn().mockResolvedValue(null) },
             $transaction: jest.fn(async (fn) => fn(tx)),
         };
