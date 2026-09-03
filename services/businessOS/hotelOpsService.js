@@ -42,8 +42,9 @@ class HotelOpsService {
         });
     }
 
-    async updateRoomStatus(roomId, status, notes) {
-        const room = await this.prisma.hotelRoom.findUnique({ where: { id: roomId } });
+    async updateRoomStatus(roomId, status, notes, businessProfileId) {
+        if (!businessProfileId) throw new Error('Business profile context is required.');
+        const room = await this.prisma.hotelRoom.findFirst({ where: { id: roomId, businessProfileId }, select: { id: true } });
         if (!room) throw new Error('Room not found.');
 
         return this.prisma.hotelRoom.update({
@@ -88,18 +89,26 @@ class HotelOpsService {
     // ═══ HOUSEKEEPING ═══════════════════════════════════════════════════════
 
     // Auto-generate housekeeping task on checkout
-    async generateHousekeepingTask(reservationId) {
-        const reservation = await this.prisma.reservation.findUnique({
-            where: { id: reservationId },
+    async generateHousekeepingTask(reservationId, businessProfileId) {
+        if (!businessProfileId) throw new Error('Business profile context is required.');
+        const reservation = await this.prisma.reservation.findFirst({
+            where: { id: reservationId, businessProfileId },
             include: { businessProfile: true },
         });
         if (!reservation) throw new Error('Reservation not found.');
         if (!reservation.serviceItemId) throw new Error('Reservation has no room assigned.');
 
+        const room = await this.prisma.hotelRoom.findFirst({
+            where: { id: reservation.serviceItemId, businessProfileId },
+            select: { id: true },
+        });
+        if (!room) throw new Error('Reservation room not found for this business.');
+
         // Check if there's already a pending task for this room
         const existing = await this.prisma.hotelHousekeepingTask.findFirst({
             where: {
                 roomId: reservation.serviceItemId,
+                businessProfileId,
                 status: { in: ['PENDING', 'IN_PROGRESS'] },
             },
         });
@@ -118,7 +127,7 @@ class HotelOpsService {
 
         const task = await this.prisma.hotelHousekeepingTask.create({
             data: {
-                businessProfileId: reservation.businessProfileId,
+                businessProfileId,
                 roomId: reservation.serviceItemId,
                 reservationId,
                 taskType: 'CHECKOUT_CLEAN',
@@ -129,21 +138,28 @@ class HotelOpsService {
 
         // Set room to CLEANING
         await this.prisma.hotelRoom.update({
-            where: { id: reservation.serviceItemId },
+            where: { id: room.id },
             data: { status: 'CLEANING' },
         });
 
         return task;
     }
 
-    async assignHousekeepingTask(taskId, employeeId) {
-        const employee = await this.prisma.businessEmployee.findUnique({
-            where: { id: employeeId },
+    async assignHousekeepingTask(taskId, employeeId, businessProfileId) {
+        if (!businessProfileId) throw new Error('Business profile context is required.');
+        const employee = await this.prisma.businessEmployee.findFirst({
+            where: { id: employeeId, businessProfileId },
         });
         if (!employee) throw new Error('Employee not found.');
         if (employee.role !== 'HOUSEKEEPER' && employee.role !== 'MANAGER' && employee.role !== 'SUPERVISOR') {
             throw new Error('Only housekeepers, supervisors, or managers can be assigned.');
         }
+
+        const task = await this.prisma.hotelHousekeepingTask.findFirst({
+            where: { id: taskId, businessProfileId },
+            select: { id: true },
+        });
+        if (!task) throw new Error('Task not found.');
 
         return this.prisma.hotelHousekeepingTask.update({
             where: { id: taskId },
@@ -156,9 +172,10 @@ class HotelOpsService {
         });
     }
 
-    async updateChecklist(taskId, itemIndex, done) {
-        const task = await this.prisma.hotelHousekeepingTask.findUnique({
-            where: { id: taskId },
+    async updateChecklist(taskId, itemIndex, done, businessProfileId) {
+        if (!businessProfileId) throw new Error('Business profile context is required.');
+        const task = await this.prisma.hotelHousekeepingTask.findFirst({
+            where: { id: taskId, businessProfileId },
         });
         if (!task) throw new Error('Task not found.');
 
@@ -178,11 +195,15 @@ class HotelOpsService {
         });
     }
 
-    async completeHousekeeping(taskId, { photoProofUrl, notes }) {
-        const task = await this.prisma.hotelHousekeepingTask.findUnique({
-            where: { id: taskId },
+    async completeHousekeeping(taskId, { photoProofUrl, notes }, businessProfileId) {
+        if (!businessProfileId) throw new Error('Business profile context is required.');
+        const task = await this.prisma.hotelHousekeepingTask.findFirst({
+            where: { id: taskId, businessProfileId },
         });
         if (!task) throw new Error('Task not found.');
+
+        const room = await this.prisma.hotelRoom.findFirst({ where: { id: task.roomId, businessProfileId }, select: { id: true } });
+        if (!room) throw new Error('Task room not found for this business.');
 
         const updated = await this.prisma.hotelHousekeepingTask.update({
             where: { id: taskId },
@@ -196,16 +217,17 @@ class HotelOpsService {
 
         // Set room back to AVAILABLE
         await this.prisma.hotelRoom.update({
-            where: { id: task.roomId },
+            where: { id: room.id },
             data: { status: 'AVAILABLE' },
         });
 
         return updated;
     }
 
-    async inspectHousekeeping(taskId, { passed, inspectorId, notes }) {
-        const task = await this.prisma.hotelHousekeepingTask.findUnique({
-            where: { id: taskId },
+    async inspectHousekeeping(taskId, { passed, inspectorId, notes }, businessProfileId) {
+        if (!businessProfileId) throw new Error('Business profile context is required.');
+        const task = await this.prisma.hotelHousekeepingTask.findFirst({
+            where: { id: taskId, businessProfileId },
         });
         if (!task) throw new Error('Task not found.');
 
@@ -316,16 +338,19 @@ class HotelOpsService {
             }),
         ]);
 
-        // Enrich with product names (serviceItemId → BusinessProduct.name)
+        // Enrich from the authoritative HotelRoom inventory, not legacy BusinessProduct rows.
         const allReservations = [...arrivals, ...departures, ...inHouse];
-        const productIds = [...new Set(allReservations.map(r => r.serviceItemId).filter(Boolean))];
-        const products = productIds.length > 0
-            ? await this.prisma.businessProduct.findMany({ where: { id: { in: productIds } }, select: { id: true, name: true } })
+        const roomIds = [...new Set(allReservations.map(r => r.serviceItemId).filter(Boolean))];
+        const rooms = roomIds.length > 0
+            ? await this.prisma.hotelRoom.findMany({
+                where: { id: { in: roomIds }, businessProfileId },
+                select: { id: true, roomNumber: true, roomType: true, floor: true, status: true },
+            })
             : [];
-        const productMap = Object.fromEntries(products.map(p => [p.id, p.name]));
+        const roomMap = Object.fromEntries(rooms.map(r => [r.id, r]));
         const enrich = (list) => list.map(r => ({
             ...r,
-            room: r.serviceItemId ? { roomNumber: productMap[r.serviceItemId] || '—', roomType: '—' } : null,
+            room: r.serviceItemId ? (roomMap[r.serviceItemId] || null) : null,
         }));
 
         return {
@@ -407,78 +432,116 @@ HotelOpsService.prototype.upsertRateOverride = async function(businessProfileId,
     });
 };
 
-HotelOpsService.prototype.deleteRateOverride = async function(overrideId) {
+HotelOpsService.prototype.deleteRateOverride = async function(overrideId, businessProfileId) {
+    if (!businessProfileId) throw new Error('Business profile context is required.');
+    const existing = await this.prisma.hotelRateOverride.findFirst({ where: { id: overrideId, businessProfileId }, select: { id: true } });
+    if (!existing) throw new Error('Rate override not found.');
     return this.prisma.hotelRateOverride.delete({ where: { id: overrideId } });
 };
 
-HotelOpsService.prototype.blockRoom = async function(roomId, { startDate, endDate, reason }) {
+HotelOpsService.prototype.blockRoom = async function(roomId, { startDate, endDate, reason }, businessProfileId) {
+    if (!businessProfileId) throw new Error('Business profile context is required.');
+    const room = await this.prisma.hotelRoom.findFirst({ where: { id: roomId, businessProfileId }, select: { id: true } });
+    if (!room) throw new Error('Room not found.');
     return this.prisma.hotelRoomBlock.create({
         data: { roomId, startDate: new Date(startDate), endDate: new Date(endDate), reason },
     });
 };
 
-HotelOpsService.prototype.deleteRoomBlock = async function(blockId) {
+HotelOpsService.prototype.deleteRoomBlock = async function(blockId, businessProfileId) {
+    if (!businessProfileId) throw new Error('Business profile context is required.');
+    const block = await this.prisma.hotelRoomBlock.findFirst({ where: { id: blockId, room: { businessProfileId } }, select: { id: true } });
+    if (!block) throw new Error('Room block not found.');
     return this.prisma.hotelRoomBlock.delete({ where: { id: blockId } });
 };
 
-HotelOpsService.prototype.createWalkIn = async function(businessProfileId, { guestName, phone, roomId, nights, depositUsdc, notes }) {
-    const room = await this.prisma.hotelRoom.findUnique({ where: { id: roomId } });
+HotelOpsService.prototype.createWalkIn = async function(businessProfileId, { customerId, phone, roomId, nights, depositUsdc, notes }) {
+    if (!businessProfileId) throw new Error('Business profile context is required.');
+    if (!customerId) throw new Error('A registered Azaman customer is required for a walk-in booking.');
+    const [room, customer] = await Promise.all([
+        this.prisma.hotelRoom.findFirst({ where: { id: roomId, businessProfileId } }),
+        this.prisma.user.findUnique({ where: { id: customerId }, select: { id: true } }),
+    ]);
     if (!room) throw new Error('Room not found');
+    if (!customer) throw new Error('Customer not found.');
     if (room.status !== 'AVAILABLE') throw new Error('Room is not available');
 
     const startDatetime = new Date();
     const endDatetime = new Date(startDatetime);
     endDatetime.setDate(endDatetime.getDate() + (parseInt(nights) || 1));
 
-    const reservation = await this.prisma.reservation.create({
-        data: {
-            businessProfileId,
-            serviceItemId: roomId,
-            customerName: guestName,
-            notes: `Phone: ${phone || 'N/A'}. ${notes || ''}`.trim(),
-            status: 'CHECKED_IN',
-            startDatetime,
-            endDatetime,
-            depositUsdc: depositUsdc ? parseFloat(depositUsdc) : null,
-            amountUsdc: room.basePriceUsdc * (parseInt(nights) || 1),
-            metadata: { channel: 'FRONT_DESK', phone },
-        },
-    });
+    return this.prisma.$transaction(async (tx) => {
+        const reservation = await tx.reservation.create({
+            data: {
+                businessProfileId,
+                serviceItemId: roomId,
+                customerId,
+                notes: `Phone: ${phone || 'N/A'}. ${notes || ''}`.trim(),
+                status: 'CHECKED_IN',
+                startDatetime,
+                endDatetime,
+                depositUsdc: depositUsdc ? parseFloat(depositUsdc) : null,
+                amountUsdc: Number(room.basePriceUsdc) * Math.max(1, parseInt(nights) || 1),
+                metadata: { channel: 'FRONT_DESK', phone },
+            },
+        });
 
-    await this.prisma.hotelRoom.update({
-        where: { id: roomId },
-        data: {
-            status: 'OCCUPIED',
-            currentReservationId: reservation.id,
-            checkedInAt: new Date(),
-            checkoutDueAt: endDatetime,
-        },
-    });
+        await tx.hotelRoom.update({
+            where: { id: roomId },
+            data: {
+                status: 'OCCUPIED',
+                currentReservationId: reservation.id,
+                checkedInAt: new Date(),
+                checkoutDueAt: endDatetime,
+            },
+        });
 
-    return reservation;
+        return reservation;
+    });
 };
 
-HotelOpsService.prototype.moveRoom = async function(reservationId, { newRoomId, reason }) {
-    const reservation = await this.prisma.reservation.findUnique({ where: { id: reservationId } });
+HotelOpsService.prototype.moveRoom = async function(reservationId, { newRoomId, reason }, businessProfileId) {
+    if (!businessProfileId) throw new Error('Business profile context is required.');
+    const reservation = await this.prisma.reservation.findFirst({ where: { id: reservationId, businessProfileId } });
     if (!reservation) throw new Error('Reservation not found');
     const oldRoomId = reservation.serviceItemId;
-    const newRoom = await this.prisma.hotelRoom.findUnique({ where: { id: newRoomId } });
+    const newRoom = await this.prisma.hotelRoom.findFirst({ where: { id: newRoomId, businessProfileId } });
     if (!newRoom) throw new Error('New room not found');
     if (newRoom.status !== 'AVAILABLE') throw new Error('New room is not available');
 
-    await Promise.all([
-        this.prisma.reservation.update({ where: { id: reservationId }, data: { serviceItemId: newRoomId, metadata: { ...reservation.metadata, movedFrom: oldRoomId, moveReason: reason } } }),
-        oldRoomId ? this.prisma.hotelRoom.update({ where: { id: oldRoomId }, data: { status: 'DIRTY', currentReservationId: null } }) : Promise.resolve(),
-        this.prisma.hotelRoom.update({ where: { id: newRoomId }, data: { status: 'OCCUPIED', currentReservationId: reservationId, checkedInAt: reservation.checkedInAt || new Date() } }),
-    ]);
-
-    return { ok: true };
+    return this.prisma.$transaction(async (tx) => {
+        const updatedReservation = await tx.reservation.update({
+            where: { id: reservationId },
+            data: { serviceItemId: newRoomId, metadata: { ...(reservation.metadata || {}), movedFrom: oldRoomId, moveReason: reason } },
+        });
+        if (oldRoomId) {
+            const oldRoom = await tx.hotelRoom.findFirst({ where: { id: oldRoomId, businessProfileId }, select: { id: true } });
+            if (!oldRoom) throw new Error('Current room not found for this business.');
+            await tx.hotelRoom.update({ where: { id: oldRoom.id }, data: { status: 'DIRTY', currentReservationId: null } });
+        }
+        await tx.hotelRoom.update({ where: { id: newRoom.id }, data: { status: 'OCCUPIED', currentReservationId: reservationId, checkedInAt: reservation.checkedInAt || new Date(), checkoutDueAt: reservation.endDatetime } });
+        return { ok: true, reservation: updatedReservation };
+    });
 };
 
 HotelOpsService.prototype.bulkCreateRooms = async function(businessProfileId, { startNumber, endNumber, roomType, floor, basePrice, weekendPrice, capacity, locationId }) {
+    if (!businessProfileId) throw new Error('Business profile context is required.');
+    const start = Number.parseInt(startNumber, 10);
+    const end = Number.parseInt(endNumber, 10);
+    if (!Number.isInteger(start) || !Number.isInteger(end) || start < 1 || end < start) {
+        throw new Error('A valid room number range is required.');
+    }
+    if (end - start + 1 > 500) {
+        throw new Error('Bulk room creation is limited to 500 rooms at a time.');
+    }
+    if (locationId) {
+        const location = await this.prisma.businessLocation.findFirst({
+            where: { id: locationId, businessProfileId },
+            select: { id: true },
+        });
+        if (!location) throw new Error('Location not found for this business.');
+    }
     const rooms = [];
-    const start = parseInt(startNumber);
-    const end = parseInt(endNumber);
     for (let n = start; n <= end; n++) {
         rooms.push({
             businessProfileId,

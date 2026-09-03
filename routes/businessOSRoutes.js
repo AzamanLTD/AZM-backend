@@ -660,7 +660,8 @@ router.post('/hotel/rooms', wrap(async (req, res) => {
 
 router.patch('/hotel/rooms/:id/status', wrap(async (req, res) => {
     const svc = getServices(req);
-    const room = await svc.hotelOpsService.updateRoomStatus(req.params.id, req.body.status, req.body.notes);
+    const bpId = await getBusinessProfileId(req);
+    const room = await svc.hotelOpsService.updateRoomStatus(req.params.id, req.body.status, req.body.notes, bpId);
     res.json({ success: true, room });
 }));
 
@@ -682,25 +683,29 @@ router.get('/hotel/housekeeping', wrap(async (req, res) => {
 
 router.post('/hotel/housekeeping/:id/assign', wrap(async (req, res) => {
     const svc = getServices(req);
-    const task = await svc.hotelOpsService.assignHousekeepingTask(req.params.id, req.body.employeeId);
+    const bpId = await getBusinessProfileId(req);
+    const task = await svc.hotelOpsService.assignHousekeepingTask(req.params.id, req.body.employeeId, bpId);
     res.json({ success: true, task });
 }));
 
 router.patch('/hotel/housekeeping/:id/checklist', wrap(async (req, res) => {
     const svc = getServices(req);
-    const task = await svc.hotelOpsService.updateChecklist(req.params.id, req.body.itemIndex, req.body.done);
+    const bpId = await getBusinessProfileId(req);
+    const task = await svc.hotelOpsService.updateChecklist(req.params.id, req.body.itemIndex, req.body.done, bpId);
     res.json({ success: true, task });
 }));
 
 router.post('/hotel/housekeeping/:id/complete', wrap(async (req, res) => {
     const svc = getServices(req);
-    const task = await svc.hotelOpsService.completeHousekeeping(req.params.id, req.body);
+    const bpId = await getBusinessProfileId(req);
+    const task = await svc.hotelOpsService.completeHousekeeping(req.params.id, req.body, bpId);
     res.json({ success: true, task });
 }));
 
 router.post('/hotel/housekeeping/:id/inspect', wrap(async (req, res) => {
     const svc = getServices(req);
-    const task = await svc.hotelOpsService.inspectHousekeeping(req.params.id, req.body);
+    const bpId = await getBusinessProfileId(req);
+    const task = await svc.hotelOpsService.inspectHousekeeping(req.params.id, req.body, bpId);
     res.json({ success: true, task });
 }));
 
@@ -719,57 +724,71 @@ router.get('/hotel/front-desk', wrap(async (req, res) => {
 // KDS
 // ── Hotel: Rate Calendar ──────────────────────────────────────────────────────
 router.get('/hotel/rate-calendar', wrap(async (req, res) => {
-    const bpId = req.businessProfileId;
+    const svc = getServices(req);
+    const bpId = await getBusinessProfileId(req);
     const days = parseInt(req.query.days) || 14;
     const data = await svc.hotelOpsService.getRateCalendar(bpId, days);
     res.json({ data });
 }));
 
 router.post('/hotel/rate-calendar', wrap(async (req, res) => {
-    const bpId = req.businessProfileId;
+    const svc = getServices(req);
+    const bpId = await getBusinessProfileId(req);
     const override = await svc.hotelOpsService.upsertRateOverride(bpId, req.body);
     res.json({ data: override });
 }));
 
 router.delete('/hotel/rate-calendar/:id', wrap(async (req, res) => {
-    await svc.hotelOpsService.deleteRateOverride(req.params.id);
+    const svc = getServices(req);
+    const bpId = await getBusinessProfileId(req);
+    await svc.hotelOpsService.deleteRateOverride(req.params.id, bpId);
     res.json({ ok: true });
 }));
 
 // ── Hotel: Room Block ─────────────────────────────────────────────────────────
 router.post('/hotel/rooms/:id/block', wrap(async (req, res) => {
-    const block = await svc.hotelOpsService.blockRoom(req.params.id, req.body);
+    const svc = getServices(req);
+    const bpId = await getBusinessProfileId(req);
+    const block = await svc.hotelOpsService.blockRoom(req.params.id, req.body, bpId);
     res.json({ data: block });
 }));
 
 router.delete('/hotel/rooms/block/:blockId', wrap(async (req, res) => {
-    await svc.hotelOpsService.deleteRoomBlock(req.params.blockId);
+    const svc = getServices(req);
+    const bpId = await getBusinessProfileId(req);
+    await svc.hotelOpsService.deleteRoomBlock(req.params.blockId, bpId);
     res.json({ ok: true });
 }));
 
 // ── Hotel: Room Update (full) ─────────────────────────────────────────────────
 router.patch('/hotel/rooms/:id', wrap(async (req, res) => {
-    const room = await svc.hotelOpsService.updateRoom(req.params.id, req.body);
+    const svc = getServices(req);
+    const bpId = await getBusinessProfileId(req);
+    const room = await svc.hotelOpsService.updateRoom(req.params.id, req.body, bpId);
     res.json({ data: room });
 }));
 
 // ── Hotel: Bulk Room Creation ─────────────────────────────────────────────────
 router.post('/hotel/rooms/bulk', wrap(async (req, res) => {
-    const bpId = req.businessProfileId;
+    const svc = getServices(req);
+    const bpId = await getBusinessProfileId(req);
     const result = await svc.hotelOpsService.bulkCreateRooms(bpId, req.body);
     res.json({ data: result });
 }));
 
 // ── Hotel: Walk-In Booking ────────────────────────────────────────────────────
 router.post('/hotel/front-desk/walk-in', wrap(async (req, res) => {
-    const bpId = req.businessProfileId;
+    const svc = getServices(req);
+    const bpId = await getBusinessProfileId(req);
     const reservation = await svc.hotelOpsService.createWalkIn(bpId, req.body);
     res.json({ data: reservation });
 }));
 
 // ── Hotel: Room Move ──────────────────────────────────────────────────────────
 router.post('/hotel/front-desk/:reservationId/move-room', wrap(async (req, res) => {
-    const result = await svc.hotelOpsService.moveRoom(req.params.reservationId, req.body);
+    const svc = getServices(req);
+    const bpId = await getBusinessProfileId(req);
+    const result = await svc.hotelOpsService.moveRoom(req.params.reservationId, req.body, bpId);
     res.json({ data: result });
 }));
 
@@ -813,9 +832,12 @@ router.post('/hotel/housekeeping/templates', wrap(async (req, res) => {
 }));
 
 router.post('/hotel/housekeeping', wrap(async (req, res) => {
-    const bpId = req.businessProfileId;
+    const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
     const { roomId, taskType, priority, notes, checklistItems } = req.body;
-    const task = await svc.hotelOpsService.prisma.hotelHousekeepingTask.create({
+    const room = await prisma.hotelRoom.findFirst({ where: { id: roomId, businessProfileId }, select: { id: true } });
+    if (!room) return res.status(404).json({ success: false, message: 'Room not found' });
+    const task = await prisma.hotelHousekeepingTask.create({
         data: {
             businessProfileId: bpId,
             roomId,
