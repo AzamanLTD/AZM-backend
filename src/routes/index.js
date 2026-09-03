@@ -111,6 +111,11 @@ function mountRoutes(app, {
     app.use('/api/admin/control-plane', generalLimiter, require('../../routes/adminReconciliationRoutes'));
 
     app.use('/api/marketplace', generalLimiter, require('../../routes/marketplaceRoutes'));
+    // Canonical financial Business OS and POS handlers are mounted before the
+    // legacy monolithic Business OS router while its dead duplicate blocks are
+    // removed in follow-up cleanup batches.
+    app.use('/api/business-os', financialLimiter, require('../../routes/businessOSFinanceRoutes'));
+    app.use('/api/business-os', financialLimiter, require('../../routes/businessOSPosRoutes'));
     app.use('/api/business-os', generalLimiter, require('../../routes/businessOSRoutes'));
     app.use('/api/developer', generalLimiter, require('../../routes/developerRoutes'));
     app.use('/api/qr', generalLimiter, require('../../routes/qrRoutes'));
