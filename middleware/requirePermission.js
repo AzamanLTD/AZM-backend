@@ -23,6 +23,7 @@
 const logger = require('../src/config/logger');
 const { ROLE_TEMPLATES, ALL_KEYS } = require('../config/permissionTemplates');
 const { runWithRequestContext } = require('../utils/requestContext');
+const { runWithBusinessRequestContext } = require('../src/lib/businessRequestContext');
 
 /**
  * Resolve a user's effective permission set for a given business.
@@ -84,23 +85,40 @@ function requirePermission(key) {
 
             // Resolve business profile ID (same logic as getBusinessProfileId in routes)
             let businessProfileId = req.businessProfileId; // admin impersonation
+            let businessProfile;
             if (!businessProfileId) {
-                const bp = await prisma.businessProfile.findFirst({
+                businessProfile = await prisma.businessProfile.findFirst({
                     where: { userId: req.user.id },
-                    select: { id: true },
+                    select: { id: true, userId: true },
                 });
-                if (!bp) {
+                if (!businessProfile) {
                     return res.status(403).json({ success: false, message: 'No business profile found.' });
                 }
-                businessProfileId = bp.id;
+                businessProfileId = businessProfile.id;
+            } else {
+                businessProfile = await prisma.businessProfile.findFirst({
+                    where: { id: businessProfileId },
+                    select: { userId: true },
+                });
+                if (!businessProfile) {
+                    return res.status(403).json({ success: false, message: 'Business profile not found.' });
+                }
             }
 
             const requestContext = {
                 businessProfileId,
                 user: req.user,
+                isAdmin: Boolean(req.businessProfileId && req.user.role === 'ADMIN'),
+                isBusinessOwner: businessProfile.userId === req.user.id,
             };
 
-            const runAuthorized = () => runWithRequestContext(requestContext, next);
+            // Payroll still consumes the legacy request context while the
+            // shift and EWA services consume the Business OS context. Keep
+            // both stores in scope until their callers share one context API.
+            const runAuthorized = () => runWithRequestContext(
+                requestContext,
+                () => runWithBusinessRequestContext(requestContext, next),
+            );
 
             // Admin users (impersonating) get all permissions
             if (req.businessProfileId && req.user.role === 'ADMIN') {
