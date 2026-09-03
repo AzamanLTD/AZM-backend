@@ -111,10 +111,11 @@ function mountRoutes(app, {
     app.use('/api/admin/control-plane', generalLimiter, require('../../routes/adminReconciliationRoutes'));
 
     app.use('/api/marketplace', generalLimiter, require('../../routes/marketplaceRoutes'));
-    // Finance has a canonical scoped router mounted before the legacy Business OS
-    // surface. The legacy handlers remain available only for paths not claimed here
-    // until their dead block is removed in the follow-up cleanup.
+    // Canonical scoped Business OS financial/operational mutation handlers are
+    // mounted before the legacy monolithic router during the cleanup migration.
     app.use('/api/business-os', financialLimiter, require('../../routes/businessOSFinanceRoutes'));
+    app.use('/api/business-os', financialLimiter, require('../../routes/businessOSPosRoutes'));
+    app.use('/api/business-os', generalLimiter, require('../../routes/businessOSInventoryRoutes'));
     app.use('/api/business-os', generalLimiter, require('../../routes/businessOSRoutes'));
     app.use('/api/developer', generalLimiter, require('../../routes/developerRoutes'));
     app.use('/api/qr', generalLimiter, require('../../routes/qrRoutes'));
