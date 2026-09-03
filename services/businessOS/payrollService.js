@@ -7,6 +7,15 @@
 
 const { getRequestContext } = require('../../utils/requestContext');
 
+const SERIALIZABLE_RETRY_LIMIT = 3;
+const SERIALIZABLE_BACKOFF_MS = 10;
+
+const isSerializableConflict = (error) => error?.code === 'P2034';
+
+const waitForSerializableRetry = (attempt) => new Promise((resolve) => {
+    setTimeout(resolve, SERIALIZABLE_BACKOFF_MS * (2 ** attempt));
+});
+
 class PayrollService {
     constructor(prisma) { this.prisma = prisma; }
 
@@ -95,30 +104,41 @@ class PayrollService {
         const scopedBusinessProfileId = await this._resolveCallerBusinessProfileId(businessProfileId);
         if (!scopedBusinessProfileId) throw new Error('Business context required.');
 
-        return this.prisma.$transaction(async (tx) => {
-            const payroll = await tx.payrollRecord.findFirst({
-                where: { id: payrollId, businessProfileId: scopedBusinessProfileId },
-                include: { employee: true },
-            });
-            if (!payroll) throw new Error('Payroll record not found.');
-            if (payroll.status === 'PROCESSED') throw new Error('Payroll already disbursed.');
-            if (payroll.employee.businessProfileId !== scopedBusinessProfileId || payroll.employee.businessProfileId !== payroll.businessProfileId) {
-                throw new Error('Payroll employee does not belong to this business.');
-            }
-            if (payroll.employee.smartRouteId) throw new Error('Payroll with Smart Route requires the payroll settlement worker; it was not marked as paid.');
+        for (let attempt = 0; attempt < SERIALIZABLE_RETRY_LIMIT; attempt += 1) {
+            try {
+                return await this.prisma.$transaction(async (tx) => {
+                    const payroll = await tx.payrollRecord.findFirst({
+                        where: { id: payrollId, businessProfileId: scopedBusinessProfileId },
+                        include: { employee: true },
+                    });
+                    if (!payroll) throw new Error('Payroll record not found.');
+                    if (payroll.status === 'PROCESSED') throw new Error('Payroll already disbursed.');
+                    if (payroll.employee.businessProfileId !== scopedBusinessProfileId || payroll.employee.businessProfileId !== payroll.businessProfileId) {
+                        throw new Error('Payroll employee does not belong to this business.');
+                    }
+                    if (payroll.employee.smartRouteId) throw new Error('Payroll with Smart Route requires the payroll settlement worker; it was not marked as paid.');
 
-            const netAmount = parseFloat(payroll.netAmount);
-            if (!Number.isFinite(netAmount)) throw new Error('Payroll net amount is invalid.');
-            if (netAmount <= 0) {
-                return tx.payrollRecord.update({ where: { id: payrollId }, data: { status: 'PROCESSED', paidAt: new Date(), failureReason: 'Net amount was zero or negative after deductions.' } });
-            }
+                    const netAmount = parseFloat(payroll.netAmount);
+                    if (!Number.isFinite(netAmount)) throw new Error('Payroll net amount is invalid.');
+                    if (netAmount <= 0) {
+                        return tx.payrollRecord.update({ where: { id: payrollId }, data: { status: 'PROCESSED', paidAt: new Date(), failureReason: 'Net amount was zero or negative after deductions.' } });
+                    }
 
-            await tx.user.update({ where: { id: payroll.userId }, data: { azmBalance: { increment: netAmount } } });
-            await tx.transactionHistory.create({ data: { userId: payroll.userId, type: 'PAYROLL_DISBURSEMENT', amountUsdc: netAmount, feeUsdc: 0, status: 'COMPLETED', metadata: { employeeId: payroll.employeeId, period: payroll.period, payrollId, source: 'BUSINESS_OS_PAYROLL' } } });
-            await tx.businessLedgerEntry.create({ data: { businessProfileId: payroll.businessProfileId, type: 'PAYROLL', category: 'Salary Payment', description: `Payroll for ${payroll.period}`, amount: -netAmount, sourceType: 'PAYROLL', sourceId: payrollId, metadata: { employeeId: payroll.employeeId, period: payroll.period } } });
-            await tx.businessEmployee.update({ where: { id: payroll.employeeId }, data: { accruedWages: 0.0, withdrawnEarly: 0.0 } });
-            return tx.payrollRecord.update({ where: { id: payrollId }, data: { status: 'PROCESSED', paidAt: new Date(), failureReason: null } });
-        }, { isolationLevel: 'Serializable' });
+                    await tx.user.update({ where: { id: payroll.userId }, data: { azmBalance: { increment: netAmount } } });
+                    await tx.transactionHistory.create({ data: { userId: payroll.userId, type: 'PAYROLL_DISBURSEMENT', amountUsdc: netAmount, feeUsdc: 0, status: 'COMPLETED', metadata: { employeeId: payroll.employeeId, period: payroll.period, payrollId, source: 'BUSINESS_OS_PAYROLL' } } });
+                    await tx.businessLedgerEntry.create({ data: { businessProfileId: payroll.businessProfileId, type: 'PAYROLL', category: 'Salary Payment', description: `Payroll for ${payroll.period}`, amount: -netAmount, sourceType: 'PAYROLL', sourceId: payrollId, metadata: { employeeId: payroll.employeeId, period: payroll.period } } });
+                    await tx.businessEmployee.update({ where: { id: payroll.employeeId }, data: { accruedWages: 0.0, withdrawnEarly: 0.0 } });
+                    return tx.payrollRecord.update({ where: { id: payrollId }, data: { status: 'PROCESSED', paidAt: new Date(), failureReason: null } });
+                }, { isolationLevel: 'Serializable' });
+            } catch (error) {
+                if (!isSerializableConflict(error) || attempt === SERIALIZABLE_RETRY_LIMIT - 1) {
+                    throw error;
+                }
+                await waitForSerializableRetry(attempt);
+            }
+        }
+
+        throw new Error('Payroll disbursement failed after retries.');
     }
 
     async disburseAllPayroll(businessProfileId, period) {
