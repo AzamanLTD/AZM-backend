@@ -9,14 +9,79 @@
 //   - Time-bound bans (banUntil in the past) auto-restore to ACTIVE.
 //
 // Pairs with the existing `protect` middleware. The exported `protectActive`
-// chain runs `protect` first to populate req.user, then `checkBan` to verify
-// the user is permitted to perform write actions.
+// chain runs `protect` first to populate req.user, then establishes a request-
+// scoped business context for Business OS mutations, then checks the ban.
 // =============================================================================
 
 const logger = require('../src/config/logger');
 const { protect } = require('./authMiddleware');
+const { runWithBusinessRequestContext } = require('../src/lib/businessRequestContext');
 
 const APPEAL_EMAIL = process.env.APPEAL_EMAIL || 'support@azaman.me';
+
+/**
+ * Establish the tenant/user context used by Business OS mutation services.
+ *
+ * Business OS routes already run `adminBusinessScope` before this middleware,
+ * so an admin's selected business is available as req.businessProfileId.
+ * Normal business owners are resolved by their owned BusinessProfile; worker
+ * accounts are resolved by their active BusinessEmployee record.
+ *
+ * The context is request-local via AsyncLocalStorage, avoiding a shared global
+ * mutable value on the singleton Prisma client.
+ */
+const establishBusinessRequestContext = async (req, res, next) => {
+    if (!req.user?.id || req.method === 'GET' || req.baseUrl !== '/api/business-os') {
+        return next();
+    }
+
+    const prisma = req.app.get('prisma');
+    const userId = req.user.id;
+
+    try {
+        let businessProfileId = req.businessProfileId || null;
+        let isBusinessOwner = false;
+
+        if (businessProfileId) {
+            const scopedBusiness = await prisma.businessProfile.findFirst({
+                where: { id: businessProfileId, userId },
+                select: { id: true },
+            });
+            isBusinessOwner = Boolean(scopedBusiness);
+        } else {
+            const ownedBusiness = await prisma.businessProfile.findFirst({
+                where: { userId },
+                select: { id: true },
+            });
+            if (ownedBusiness) {
+                businessProfileId = ownedBusiness.id;
+                isBusinessOwner = true;
+            }
+        }
+
+        if (!businessProfileId) {
+            const employee = await prisma.businessEmployee.findFirst({
+                where: { userId, status: 'ACTIVE' },
+                select: { businessProfileId: true },
+            });
+            businessProfileId = employee?.businessProfileId || null;
+        }
+
+        return runWithBusinessRequestContext({
+            userId,
+            businessProfileId,
+            isBusinessOwner,
+            isAdmin: req.user.role?.toUpperCase?.() === 'ADMIN',
+            adminScopedBusinessId: req.businessProfileId || null,
+        }, next);
+    } catch (err) {
+        logger.error({ err }, '[businessRequestContext] error');
+        return res.status(500).json({
+            success: false,
+            message: 'Unable to establish business authorization context.',
+        });
+    }
+};
 
 /**
  * checkBan
@@ -37,7 +102,7 @@ const checkBan = async (req, res, next) => {
 
     try {
         const user = await prisma.user.findUnique({
-            where:  { id: parseInt(req.user.id, 10) },
+            where: { id: parseInt(req.user.id, 10) },
             select: { banStatus: true, banUntil: true, isDeleted: true }
         });
 
@@ -98,12 +163,9 @@ const checkBan = async (req, res, next) => {
  *
  * Drop-in replacement for `protect` on routes that mutate state. Ensures the
  * caller is both authenticated AND has an ACTIVE banStatus before the
- * controller runs.
- *
- * Usage:
- *   const { protectActive } = require('../middleware/banGuardMiddleware');
- *   router.post('/initiate', protectActive, controller.initiateTrade);
+ * controller runs. Business OS mutations also receive request-local tenant
+ * context before the ban check runs.
  */
-const protectActive = [protect, checkBan];
+const protectActive = [protect, establishBusinessRequestContext, checkBan];
 
-module.exports = { checkBan, protectActive, APPEAL_EMAIL };
+module.exports = { checkBan, protectActive, APPEAL_EMAIL, establishBusinessRequestContext };

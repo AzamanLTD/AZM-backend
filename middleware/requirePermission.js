@@ -22,6 +22,7 @@
 
 const logger = require('../src/config/logger');
 const { ROLE_TEMPLATES, ALL_KEYS } = require('../config/permissionTemplates');
+const { runWithRequestContext } = require('../utils/requestContext');
 
 /**
  * Resolve a user's effective permission set for a given business.
@@ -94,15 +95,22 @@ function requirePermission(key) {
                 businessProfileId = bp.id;
             }
 
+            const requestContext = {
+                businessProfileId,
+                user: req.user,
+            };
+
+            const runAuthorized = () => runWithRequestContext(requestContext, next);
+
             // Admin users (impersonating) get all permissions
             if (req.businessProfileId && req.user.role === 'ADMIN') {
-                return next();
+                return runAuthorized();
             }
 
             const perms = await resolvePermissions(prisma, req.user.id, businessProfileId);
 
             if (perms.includes('*')) {
-                return next();
+                return runAuthorized();
             }
 
             if (!perms.includes(key)) {
@@ -115,7 +123,7 @@ function requirePermission(key) {
 
             // Attach resolved permissions to req for downstream use
             req.resolvedPermissions = perms;
-            next();
+            runAuthorized();
         } catch (err) {
             logger.error('[requirePermission]', err);
             res.status(500).json({ success: false, message: 'Permission check failed.' });
