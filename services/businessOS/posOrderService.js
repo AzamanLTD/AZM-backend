@@ -141,7 +141,11 @@ class PosOrderService {
             const where = { id: item.productId, businessProfileId, isActive: true, isAvailable: true };
             if (locationId) where.OR = [{ locationId: null }, { locationId }];
             const product = await tx.businessProduct.findFirst({ where, select: { id: true, name: true, priceUsdc: true, stockQty: true } });
-            if (!product) throw new Error(`Invalid, unavailable, or out-of-location product: ${item.productId}`);
+            if (!product) {
+                throw new Error(locationId
+                    ? `Invalid, unavailable, or out-of-location product: ${item.productId}`
+                    : `Invalid or unavailable product: ${item.productId}`);
+            }
             const price = Number(product.priceUsdc);
             if (!Number.isFinite(price) || price <= 0) throw new Error(`Invalid catalog price for product: ${product.name}`);
             subtotal += price * item.quantity;
