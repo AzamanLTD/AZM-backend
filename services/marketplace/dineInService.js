@@ -23,11 +23,7 @@ const waitForSerializableRetry = (attempt) => new Promise((resolve) => {
     setTimeout(resolve, SERIALIZABLE_BACKOFF_MS * (2 ** attempt));
 });
 
-// Keep the canonical invoice service authoritative while allowing its payment
-// transaction to participate in a larger interactive transaction. The proxy
-// delegates all Prisma model access to the transaction client and replaces only
-// $transaction so invoiceService.payInvoice executes on the existing transaction
-// instead of opening a nested transaction.
+// Keep canonical invoice settlement inside the caller's transaction when needed.
 const transactionScopedPrisma = (prisma, tx) => new Proxy(prisma, {
     get(target, property, receiver) {
         if (property === '$transaction') return async (callback) => callback(tx);
@@ -80,8 +76,8 @@ class DineInService {
         if (!tab) throw new Error('Tab not found.');
         if (tab.status !== 'OPEN') throw new Error('Cannot add items to a tab that is not OPEN.');
 
-        // Business-side additions must resolve price from the authoritative catalog.
-        // Never trust a caller-supplied monetary amount for a persisted tab item.
+        // Product price/name are authoritative when a product ID is supplied.
+        // A stale caller-provided price is intentionally ignored.
         let itemName = name;
         let authoritativePrice = priceNum;
         if (productId) {
@@ -95,9 +91,6 @@ class DineInService {
         }
         if (!itemName) throw new Error('name is required.');
         if (!Number.isFinite(authoritativePrice) || authoritativePrice <= 0) throw new Error('price must be positive.');
-        if (productId && Number.isFinite(priceNum) && priceNum > 0 && Math.abs(priceNum - authoritativePrice) > 1e-8) {
-            throw new Error('Product price does not match the current catalog price.');
-        }
 
         const item = await this.prisma.dineInTabItem.create({
             data: {
@@ -177,10 +170,6 @@ class DineInService {
             return { tab, invoice, payment: { invoice, customerPays: Number(invoice.customerPaidUsdc), alreadyPaid: true } };
         }
 
-        // Invoice creation/sending is non-financial preparation. Keep it on the
-        // canonical invoice service, then make the actual debit/credit AND the
-        // final tab close one atomic transaction below. A failed payment leaves
-        // the SENT invoice and FINALIZED tab intact and safely retryable.
         if (!invoice) {
             if (!tab.items.length) throw new Error('Cannot pay an empty dine-in tab.');
             const idempotencyKey = `DINE_IN_TAB:${tabId}`;
@@ -220,21 +209,14 @@ class DineInService {
             const grandTotal = billTotal + tip;
             await tx.dineInTab.updateMany({
                 where: { id: tabId, status: 'FINALIZED', invoiceId: invoice.id },
-                data: {
-                    status: 'CLOSED',
-                    closedAt: new Date(),
-                    tipUsdc: tip,
-                    grandTotalUsdc: grandTotal,
-                    paymentMethod: 'AZAMAN_BALANCE',
-                },
+                data: { status: 'CLOSED', closedAt: new Date(), tipUsdc: tip, grandTotalUsdc: grandTotal, paymentMethod: 'AZAMAN_BALANCE' },
             });
             const closed = await tx.dineInTab.findUnique({ where: { id: tabId }, include: { items: true, invoice: true } });
             return { closed, payment };
         });
 
         this.io?.to(`user_${customerId}`).emit('dine_in_tab_paid', {
-            tabId,
-            invoiceId: invoice.id,
+            tabId, invoiceId: invoice.id,
             customerPays: settlement.payment.customerPays,
             businessReceives: settlement.payment.businessReceives,
             fee: settlement.payment.fee,
