@@ -43,6 +43,8 @@ class EmployeeFeedbackService {
 
             // Recalculate only this business's feedback so another business can
             // never influence the employee's rating or ratingCount.
+            // Serializable isolation prevents concurrent submissions from both
+            // observing an incomplete history and writing a stale aggregate.
             const allFeedback = await tx.employeeFeedback.findMany({
                 where: {
                     businessProfileId,
@@ -64,7 +66,7 @@ class EmployeeFeedbackService {
             if (!updated.count) throw new Error('Employee no longer belongs to this business.');
 
             return feedback;
-        });
+        }, { isolationLevel: 'Serializable' });
     }
 
     async getFeedbackForEmployee(employeeId) {
