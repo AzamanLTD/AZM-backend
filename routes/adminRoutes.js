@@ -12,6 +12,7 @@ const logger = require('../src/config/logger');
 const express = require('express');
 const router = express.Router();
 const adminController = require('../controllers/adminController');
+const profitBreakdownController = require('../controllers/adminProfitBreakdownController');
 const { protect, adminOnly } = require('../middleware/authMiddleware');
 const { validate } = require('../middleware/validate');
 const {
@@ -30,7 +31,7 @@ router.use(adminOnly);
 // ─── PLATFORM OVERVIEW ───────────────────────────────────────────────────────
 router.get('/stats', adminController.getPlatformStats);
 router.get('/system-health', adminController.getSystemHealth);
-router.get('/profit-breakdown', adminController.getProfitBreakdown);
+router.get('/profit-breakdown', profitBreakdownController.getProfitBreakdown);
 
 // ─── TRADE OVERSIGHT ─────────────────────────────────────────────────────────
 router.get('/trades/live', adminController.getLiveTrades);
