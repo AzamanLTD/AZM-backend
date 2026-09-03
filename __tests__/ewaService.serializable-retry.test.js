@@ -14,9 +14,9 @@ describe('EwaService Serializable retry', () => {
     function transactionClient() {
         return {
             businessEmployee: {
-                findUnique: jest.fn()
+                findFirst: jest.fn()
                     .mockResolvedValueOnce(employee)
-                    .mockResolvedValueOnce({ ...employee, withdrawnEarly: 9.09 }),
+                    .mockResolvedValueOnce({ ...employee, withdrawnEarly: 10 }),
                 updateMany: jest.fn().mockResolvedValue({ count: 1 }),
             },
             user: { update: jest.fn().mockResolvedValue({}) },
@@ -43,6 +43,7 @@ describe('EwaService Serializable retry', () => {
 
         await expect(service.requestWithdrawal({
             employeeId: 'employee-1',
+            businessProfileId: 'business-a',
             amount: 10,
             destination: 'AZM_BALANCE',
         })).resolves.toEqual(expect.objectContaining({
@@ -66,6 +67,7 @@ describe('EwaService Serializable retry', () => {
 
         await expect(service.requestWithdrawal({
             employeeId: 'employee-1',
+            businessProfileId: 'business-a',
             amount: 10,
         })).rejects.toBe(error);
 
@@ -79,6 +81,7 @@ describe('EwaService Serializable retry', () => {
 
         await expect(service.requestWithdrawal({
             employeeId: 'employee-1',
+            businessProfileId: 'business-a',
             amount: 10,
         })).rejects.toBe(conflict);
 
