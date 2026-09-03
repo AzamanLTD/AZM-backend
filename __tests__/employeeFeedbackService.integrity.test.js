@@ -1,7 +1,7 @@
 const { EmployeeFeedbackService } = require('../services/businessOS/employeeFeedbackService');
 
 describe('EmployeeFeedbackService integrity', () => {
-    test('recomputes rating only from the receiver business history inside one transaction', async () => {
+    test('recomputes rating only from the receiver business history inside one serializable transaction', async () => {
         const txEmployeeFeedback = {
             create: jest.fn().mockResolvedValue({ id: 'feedback-a' }),
             findMany: jest.fn().mockResolvedValue([{ rating: 5 }, { rating: 3 }]),
@@ -29,7 +29,10 @@ describe('EmployeeFeedbackService integrity', () => {
             rating: 3,
         })).resolves.toEqual({ id: 'feedback-a' });
 
-        expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+        expect(prisma.$transaction).toHaveBeenCalledWith(
+            expect.any(Function),
+            { isolationLevel: 'Serializable' },
+        );
         expect(txEmployeeFeedback.findMany).toHaveBeenCalledWith({
             where: { businessProfileId: 'bp-a', receiverEmployeeId: 'to-a' },
             select: { rating: true },
