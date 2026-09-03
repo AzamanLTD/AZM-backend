@@ -10,6 +10,7 @@
 
 const logger = require('../../src/config/logger');
 const { PrismaClient } = require('@prisma/client');
+const { EwaService } = require('./ewaService');
 
 // Default permissions by role
 const ROLE_PERMISSIONS = {
@@ -241,53 +242,21 @@ class EmployeeService {
     }
 
     // ── EWA: Earned Wage Access ────────────────────────────────────────────
-    // Employees can withdraw up to 30% of their accrued wages before payday.
-    // Azaman fronts the cash and settles it automatically on payday.
+    // Keep the legacy service method as a compatibility boundary for worker
+    // callers, but route every money mutation through the canonical EWA engine.
     async requestEWA(employeeId, amount) {
-        const employee = await this.prisma.businessEmployee.findUnique({
-            where: { id: employeeId },
-        });
-        if (!employee) throw new Error('Employee not found.');
-        if (!employee.ewaEligible) throw new Error('EWA is not available for this employee.');
-        if (employee.status !== 'ACTIVE') throw new Error('Only active employees can request EWA.');
-
-        const accrued = parseFloat(employee.accruedWages);
-        const alreadyWithdrawn = parseFloat(employee.withdrawnEarly);
-        const maxAvailable = accrued * 0.30; // 30% cap
-        const remaining = maxAvailable - alreadyWithdrawn;
-
-        if (amount > remaining) {
-            throw new Error(`EWA limit exceeded. You can withdraw up to ${remaining.toFixed(2)} USDC more.`);
-        }
-        if (amount <= 0) throw new Error('Amount must be positive.');
-
-        // Update employee's withdrawn amount
-        const updated = await this.prisma.businessEmployee.update({
-            where: { id: employeeId },
-            data: {
-                withdrawnEarly: alreadyWithdrawn + amount,
-            },
+        const result = await new EwaService(this.prisma).requestWithdrawal({
+            employeeId,
+            amount,
+            destination: 'AZM_BALANCE',
         });
 
-        // Create a ledger entry for the EWA advance
-        await this.prisma.businessLedgerEntry.create({
-            data: {
-                businessProfileId: employee.businessProfileId,
-                type: 'PAYROLL',
-                category: 'EWA Advance',
-                description: `EWA withdrawal for employee`,
-                amount: -amount, // negative = expense for the business
-                sourceType: 'EWA',
-                sourceId: employeeId,
-                metadata: { employeeId, amount, remainingAfter: remaining - amount },
-            },
-        });
-
+        // Preserve the legacy response fields consumed by the worker endpoint
+        // while exposing the canonical fee/net fields as well.
         return {
-            success: true,
-            withdrawn: amount,
-            remainingEwa: remaining - amount,
-            employee: updated,
+            ...result,
+            withdrawn: result.grossAmount,
+            remainingEwa: result.remainingWithdrawable,
         };
     }
 
@@ -458,4 +427,3 @@ class EmployeeService {
 }
 
 module.exports = { EmployeeService, ROLE_PERMISSIONS };
-
