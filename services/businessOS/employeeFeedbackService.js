@@ -54,21 +54,22 @@ class EmployeeFeedbackService {
                 ? allFeedback.reduce((s, f) => s + f.rating, 0) / allFeedback.length
                 : 0;
 
-            await tx.businessEmployee.updateMany({
+            const updated = await tx.businessEmployee.updateMany({
                 where: { id: toEmployeeId, businessProfileId },
                 data: {
                     rating: Math.round(avgRating * 100) / 100,
                     ratingCount: allFeedback.length,
                 },
             });
+            if (!updated.count) throw new Error('Employee no longer belongs to this business.');
 
             return feedback;
         });
     }
 
-    async getFeedbackForEmployee(employeeId, businessProfileId) {
+    async getFeedbackForEmployee(employeeId) {
         return this.prisma.employeeFeedback.findMany({
-            where: { receiverEmployeeId: employeeId, businessProfileId },
+            where: { receiverEmployeeId: employeeId },
             include: {
                 giverEmployee: {
                     include: { user: { select: { username: true } } },
@@ -78,9 +79,9 @@ class EmployeeFeedbackService {
         });
     }
 
-    async getFeedbackByEmployee(employeeId, businessProfileId) {
+    async getFeedbackByEmployee(employeeId) {
         return this.prisma.employeeFeedback.findMany({
-            where: { giverEmployeeId: employeeId, businessProfileId },
+            where: { giverEmployeeId: employeeId },
             include: {
                 receiverEmployee: {
                     include: { user: { select: { username: true } } },
