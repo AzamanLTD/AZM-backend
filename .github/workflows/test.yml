@@ -55,6 +55,8 @@ jobs:
         run: npm ci
 
       - name: Apply database schema
+        # CI uses a disposable PostgreSQL instance. Production remains managed
+        # by the repository's established db-push release process.
         run: npx prisma db push --accept-data-loss
 
       - name: Install transaction quote overlay
@@ -64,6 +66,11 @@ jobs:
         run: npx prisma generate
 
       - name: Run tests
+        # DB-backed suites share one disposable database and truncate between
+        # tests, so Jest must remain serial. The application bootstrap also
+        # leaves Prisma/pg handles open, hence forceExit.
+        # Retry once only to absorb a transient CI database/runner timeout;
+        # genuine test failures must reproduce and still fail the job.
         run: |
           set +e
           npm test -- --runInBand --forceExit
