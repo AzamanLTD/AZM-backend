@@ -7,7 +7,7 @@ describe('EwaService business scoping', () => {
                 expect(options).toEqual({ isolationLevel: 'Serializable' });
                 return callback({
                     businessEmployee: {
-                        findUnique: jest.fn().mockResolvedValue(null),
+                        findFirst: jest.fn().mockResolvedValue(null),
                     },
                 });
             }),
@@ -33,9 +33,11 @@ describe('EwaService business scoping', () => {
         };
         const tx = {
             businessEmployee: {
-                findUnique: jest.fn().mockResolvedValue(employee),
+                findFirst: jest
+                    .fn()
+                    .mockResolvedValueOnce(employee)
+                    .mockResolvedValueOnce({ ...employee, withdrawnEarly: 10 }),
                 updateMany: jest.fn().mockResolvedValue({ count: 1 }),
-                findUnique: jest.fn().mockResolvedValue({ ...employee, withdrawnEarly: 10 }),
             },
             user: { update: jest.fn().mockResolvedValue({}) },
             transactionHistory: { create: jest.fn().mockResolvedValue({}) },
@@ -59,9 +61,11 @@ describe('EwaService business scoping', () => {
             netToEmployee: 9.9,
         });
 
-        expect(tx.businessEmployee.findUnique).toHaveBeenNthCalledWith(1, {
+        expect(tx.businessEmployee.findFirst).toHaveBeenNthCalledWith(1, {
             where: { id: 'employee-a', businessProfileId: 'business-a' },
         });
-        expect(tx.businessEmployee.updateMany).toHaveBeenCalled();
+        expect(tx.businessEmployee.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+            where: expect.objectContaining({ businessProfileId: 'business-a' }),
+        }), expect.anything());
     });
 });
