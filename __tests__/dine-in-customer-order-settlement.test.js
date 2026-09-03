@@ -27,7 +27,33 @@ describe('dine-in customer ordering and settlement', () => {
     expect(prisma.businessProduct.findFirst).toHaveBeenCalledWith(expect.objectContaining({
       where: expect.objectContaining({ id: 'product-1', businessProfileId: 'biz-1', isActive: true, isAvailable: true }),
     }));
-    expect(addItem).toHaveBeenCalledWith(expect.objectContaining({ tabId: 'tab-1', productId: 'product-1', price: 14, quantity: 2, addedBy: 7 }));
+    expect(addItem).not.toHaveBeenCalled();
+    expect(prisma.dineInTabItem.create).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ productId: 'product-1', unitPriceUsdc: 14, lineTotalUsdc: 28, quantity: 2, addedBy: 7 }),
+    }));
+  });
+
+  test('business-side item additions use the catalog price instead of a caller-supplied price', async () => {
+    jest.doMock('../services/businessInvoiceService', () => ({ createInvoice: jest.fn(), sendInvoice: jest.fn(), payInvoice: jest.fn() }));
+    const Service = require('../services/marketplace/dineInService');
+    const prisma = {
+      dineInTab: {
+        findUnique: jest.fn().mockResolvedValue({ id: 'tab-1', businessProfileId: 'biz-1', customerId: 7, status: 'OPEN' }),
+      },
+      businessProduct: {
+        findFirst: jest.fn().mockResolvedValue({ id: 'product-1', name: 'Burger', priceUsdc: 10, isActive: true, isAvailable: true }),
+      },
+      dineInTabItem: { create: jest.fn().mockResolvedValue({ id: 'item-1', unitPriceUsdc: 10 }) },
+    };
+
+    await new Service(prisma).addItem({ tabId: 'tab-1', productId: 'product-1', name: 'Forged Burger', price: 999, quantity: 1, addedBy: 42 });
+
+    expect(prisma.businessProduct.findFirst).toHaveBeenCalledWith(expect.objectContaining({
+      where: { id: 'product-1', businessProfileId: 'biz-1', isActive: true, isAvailable: true },
+    }));
+    expect(prisma.dineInTabItem.create).toHaveBeenCalledWith(expect.objectContaining({
+      data: expect.objectContaining({ name: 'Burger', unitPriceUsdc: 10, lineTotalUsdc: 10 }),
+    }));
   });
 
   test('finalizing a tab does not create or send an invoice', async () => {
@@ -37,17 +63,51 @@ describe('dine-in customer ordering and settlement', () => {
     const Service = require('../services/marketplace/dineInService');
     const prisma = {
       dineInTab: {
-        findUnique: jest.fn().mockResolvedValue({ id: 'tab-1', businessProfileId: 'biz-1', customerId: 7, status: 'OPEN', items: [{ id: 'item-1', name: 'Burger', unitPriceUsdc: 10, quantity: 2 }] }),
-        update: jest.fn().mockResolvedValue({ id: 'tab-1', status: 'FINALIZED', grandTotalUsdc: 20, items: [] }),
+        findUnique: jest.fn()
+          .mockResolvedValueOnce({ id: 'tab-1', businessProfileId: 'biz-1', customerId: 7, status: 'OPEN', items: [{ id: 'item-1', name: 'Burger', unitPriceUsdc: 10, quantity: 2 }] })
+          .mockResolvedValueOnce({ id: 'tab-1', status: 'FINALIZED', grandTotalUsdc: 20, items: [], customerId: 7 }),
+        update: jest.fn(),
+        updateMany: jest.fn().mockResolvedValue({ count: 1 }),
       },
+      $transaction: jest.fn(async (callback) => callback(prisma)),
     };
 
     const result = await new Service(prisma).finalizeTab('tab-1');
 
     expect(result.status).toBe('FINALIZED');
     expect(result.grandTotalUsdc).toBe(20);
+    expect(prisma.dineInTab.update).not.toHaveBeenCalled();
     expect(createInvoice).not.toHaveBeenCalled();
     expect(sendInvoice).not.toHaveBeenCalled();
+  });
+
+  test('finalization retries a transient serialization conflict and only commits the OPEN tab once', async () => {
+    jest.doMock('../services/businessInvoiceService', () => ({ createInvoice: jest.fn(), sendInvoice: jest.fn(), payInvoice: jest.fn() }));
+    const Service = require('../services/marketplace/dineInService');
+    const tx = {
+      dineInTab: {
+        findUnique: jest.fn().mockResolvedValueOnce({ id: 'tab-1', businessProfileId: 'biz-1', customerId: 7, status: 'OPEN', items: [{ unitPriceUsdc: 10, quantity: 2 }] })
+          .mockResolvedValueOnce({ id: 'tab-1', businessProfileId: 'biz-1', customerId: 7, status: 'FINALIZED', grandTotalUsdc: 20, items: [] }),
+        updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+      },
+    };
+    let attempts = 0;
+    const prisma = {
+      $transaction: jest.fn(async (callback) => {
+        attempts += 1;
+        if (attempts === 1) throw Object.assign(new Error('serialization conflict'), { code: 'P2034' });
+        return callback(tx);
+      }),
+    };
+
+    const result = await new Service(prisma).finalizeTab('tab-1');
+
+    expect(result.status).toBe('FINALIZED');
+    expect(prisma.$transaction).toHaveBeenCalledTimes(2);
+    expect(tx.dineInTab.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: { id: 'tab-1', status: 'OPEN' },
+      data: expect.objectContaining({ status: 'FINALIZED', grandTotalUsdc: 20, subtotalUsdc: 20 }),
+    }));
   });
 
   test('customer payment creates, sends, settles and links the canonical invoice', async () => {
