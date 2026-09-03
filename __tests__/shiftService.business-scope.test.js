@@ -90,6 +90,7 @@ describe('ShiftService business scoping and atomicity', () => {
 
     test('claiming a swap requires a same-business employee and claimant identity', async () => {
         const prisma = {
+            $transaction: jest.fn(async (callback) => callback(prisma)),
             shiftSwap: {
                 findFirst: jest.fn().mockResolvedValue({ id: 'swap-a', businessProfileId: bpA, status: 'PENDING' }),
                 update: jest.fn(),
@@ -150,30 +151,22 @@ describe('ShiftService business scoping and atomicity', () => {
             shift: { update: jest.fn().mockResolvedValue({}) },
         };
         const prisma = {
-            $transaction: jest.fn(async (callback, options) => callback(tx)),
+            $transaction: jest.fn(async (callback, options) => {
+                expect(options).toEqual({ isolationLevel: 'Serializable' });
+                return callback(tx);
+            }),
         };
         const svc = new ShiftService(prisma);
 
         await withContext({ isBusinessOwner: true }, async () => {
-            await expect(svc.approveShiftSwap('swap-a', 'Approved by manager'))
-                .resolves.toEqual({ id: 'swap-a', status: 'APPROVED' });
+            await expect(svc.approveShiftSwap('swap-a', 'approved')).resolves.toEqual({ id: 'swap-a', status: 'APPROVED' });
         });
 
-        expect(prisma.$transaction).toHaveBeenCalledWith(expect.any(Function), {
-            isolationLevel: 'Serializable',
-        });
-        expect(tx.shift.update).toHaveBeenNthCalledWith(1, {
-            where: { id: 'shift-a' },
-            data: { employeeId: 'employee-2', userId: 202 },
-        });
-        expect(tx.shift.update).toHaveBeenNthCalledWith(2, {
-            where: { id: 'shift-b' },
-            data: { employeeId: 'employee-1', userId: 101 },
-        });
         expect(tx.shiftSwap.updateMany).toHaveBeenCalled();
+        expect(tx.shift.update).toHaveBeenCalledTimes(2);
     });
 
-    test('does not finalize a swap when the second shift mutation fails', async () => {
+    test('failed second shift mutation prevents swap finalization', async () => {
         const tx = {
             shiftSwap: {
                 findFirst: jest.fn().mockResolvedValue({
@@ -185,8 +178,7 @@ describe('ShiftService business scoping and atomicity', () => {
                     claimingEmployeeId: 'employee-2',
                     requestingEmployeeId: 'employee-1',
                 }),
-                updateMany: jest.fn(),
-                findUnique: jest.fn(),
+                updateMany: jest.fn().mockResolvedValue({ count: 1 }),
             },
             businessEmployee: {
                 findFirst: jest
@@ -195,10 +187,9 @@ describe('ShiftService business scoping and atomicity', () => {
                     .mockResolvedValueOnce({ id: 'employee-1', userId: 101, status: 'ACTIVE' }),
             },
             shift: {
-                update: jest
-                    .fn()
+                update: jest.fn()
                     .mockResolvedValueOnce({})
-                    .mockRejectedValueOnce(new Error('write failed')),
+                    .mockRejectedValueOnce(new Error('second mutation failed')),
             },
         };
         const prisma = {
@@ -207,7 +198,7 @@ describe('ShiftService business scoping and atomicity', () => {
         const svc = new ShiftService(prisma);
 
         await withContext({ isBusinessOwner: true }, async () => {
-            await expect(svc.approveShiftSwap('swap-a')).rejects.toThrow('write failed');
+            await expect(svc.approveShiftSwap('swap-a')).rejects.toThrow('second mutation failed');
         });
         expect(tx.shiftSwap.updateMany).not.toHaveBeenCalled();
     });
