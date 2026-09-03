@@ -4,19 +4,9 @@
 // Time-Off Request Service — sick, vacation, personal, emergency, unpaid.
 // =============================================================================
 
-const { getBusinessRequestContext } = require('../../src/lib/businessRequestContext');
-
 class TimeOffService {
     constructor(prisma) {
         this.prisma = prisma;
-    }
-
-    _getContext() {
-        const context = getBusinessRequestContext();
-        if (!context?.businessProfileId) {
-            throw new Error('Business scope is required for this mutation.');
-        }
-        return context;
     }
 
     async requestTimeOff({ businessProfileId, employeeId, type, startDate, endDate, reason, supportingDocUrl }) {
@@ -41,30 +31,44 @@ class TimeOffService {
         });
     }
 
+    async _resolveApprovalScope(approverId, request) {
+        const approver = await this.prisma.user.findUnique({
+            where: { id: Number(approverId) },
+            select: { role: true },
+        });
+        if (approver?.role === 'ADMIN') return { isAdmin: true, employee: null };
+
+        const employee = await this.prisma.businessEmployee.findFirst({
+            where: {
+                userId: Number(approverId),
+                businessProfileId: request.businessProfileId,
+                status: 'ACTIVE',
+            },
+            select: { id: true, businessProfileId: true },
+        });
+        if (!employee) {
+            throw new Error('You are not authorized to resolve this business time-off request.');
+        }
+        return { isAdmin: false, employee };
+    }
+
     async approveTimeOff(requestId, approverId, managerNote) {
-        const context = this._getContext();
-        const request = await this.prisma.timeOffRequest.findFirst({
-            where: { id: requestId, businessProfileId: context.businessProfileId },
-            select: { id: true, status: true, employeeId: true },
+        const request = await this.prisma.timeOffRequest.findUnique({
+            where: { id: requestId },
+            select: { id: true, businessProfileId: true, status: true, employeeId: true },
         });
         if (!request) throw new Error('Time-off request not found.');
         if (request.status !== 'PENDING') throw new Error('Request is no longer pending.');
 
-        const actorEmployee = await this.prisma.businessEmployee.findFirst({
-            where: { userId: approverId, businessProfileId: context.businessProfileId, status: 'ACTIVE' },
-            select: { id: true },
-        });
-        if (!context.isAdmin && !context.isBusinessOwner && !actorEmployee) {
-            throw new Error('You are not authorized to approve time-off requests for this business.');
-        }
-        if (!context.isAdmin && !context.isBusinessOwner && actorEmployee.id === request.employeeId) {
+        const scope = await this._resolveApprovalScope(approverId, request);
+        if (!scope.isAdmin && scope.employee.id === request.employeeId) {
             throw new Error('Employees cannot approve their own time-off request.');
         }
 
         const transitioned = await this.prisma.timeOffRequest.updateMany({
             where: {
                 id: requestId,
-                businessProfileId: context.businessProfileId,
+                businessProfileId: request.businessProfileId,
                 status: 'PENDING',
             },
             data: {
@@ -78,29 +82,22 @@ class TimeOffService {
     }
 
     async rejectTimeOff(requestId, approverId, managerNote) {
-        const context = this._getContext();
-        const request = await this.prisma.timeOffRequest.findFirst({
-            where: { id: requestId, businessProfileId: context.businessProfileId },
-            select: { id: true, status: true, employeeId: true },
+        const request = await this.prisma.timeOffRequest.findUnique({
+            where: { id: requestId },
+            select: { id: true, businessProfileId: true, status: true, employeeId: true },
         });
         if (!request) throw new Error('Time-off request not found.');
         if (request.status !== 'PENDING') throw new Error('Request is no longer pending.');
 
-        const actorEmployee = await this.prisma.businessEmployee.findFirst({
-            where: { userId: approverId, businessProfileId: context.businessProfileId, status: 'ACTIVE' },
-            select: { id: true },
-        });
-        if (!context.isAdmin && !context.isBusinessOwner && !actorEmployee) {
-            throw new Error('You are not authorized to reject time-off requests for this business.');
-        }
-        if (!context.isAdmin && !context.isBusinessOwner && actorEmployee.id === request.employeeId) {
+        const scope = await this._resolveApprovalScope(approverId, request);
+        if (!scope.isAdmin && scope.employee.id === request.employeeId) {
             throw new Error('Employees cannot reject their own time-off request.');
         }
 
         const transitioned = await this.prisma.timeOffRequest.updateMany({
             where: {
                 id: requestId,
-                businessProfileId: context.businessProfileId,
+                businessProfileId: request.businessProfileId,
                 status: 'PENDING',
             },
             data: {
