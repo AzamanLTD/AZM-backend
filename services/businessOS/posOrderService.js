@@ -31,6 +31,7 @@ class PosOrderService {
         if (existing) return { order: existing, duplicate: true, computedSubtotal: computed.subtotal, computedTax, computedGrand, change: Number(existing.cashChange || 0) };
         const orderRef = `POS-${Date.now().toString(36).toUpperCase()}-${Math.random().toString(36).slice(2, 7).toUpperCase()}`;
         const effectiveCustomerId = pm === 'CASH' ? (customerId || actorId) : actorId;
+        // Financial side effects below must remain inside the same Serializable transaction.
         for (let attempt = 0; attempt < SERIALIZABLE_RETRY_LIMIT; attempt += 1) {
             try {
                 const result = await this.prisma.$transaction(async (tx) => {
