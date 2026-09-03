@@ -259,11 +259,11 @@ describeIf('Business OS — Employee Management', () => {
         const { EmployeeService } = require('../services/businessOS/employeeService');
         const svc = new EmployeeService(prisma);
 
-        const updated = await svc.updateEmployee(testEmployee.id, { status: 'SUSPENDED' });
+        const updated = await svc.updateEmployee(testEmployee.id, businessProfile.id, { status: 'SUSPENDED' });
         expect(updated.status).toBe('SUSPENDED');
 
         // Restore
-        await svc.updateEmployee(testEmployee.id, { status: 'ACTIVE' });
+        await svc.updateEmployee(testEmployee.id, businessProfile.id, { status: 'ACTIVE' });
     });
 
     test('should update employee permissions', async () => {
@@ -271,7 +271,7 @@ describeIf('Business OS — Employee Management', () => {
         const svc = new EmployeeService(prisma);
 
         const newPerms = ['manage_products', 'view_finance'];
-        const updated = await svc.updateEmployee(testEmployee.id, { permissions: newPerms });
+        const updated = await svc.updateEmployee(testEmployee.id, businessProfile.id, { permissions: newPerms });
         expect(updated.permissions).toEqual(expect.arrayContaining(newPerms));
     });
 
@@ -864,4 +864,3 @@ describeIf('Business OS — Employee Feedback', () => {
         expect(summary.avgRating).toBeGreaterThan(0);
     });
 });
-

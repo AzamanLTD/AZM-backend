@@ -87,9 +87,12 @@ class EmployeeService {
     }
 
     // ── Get Employee by ID ─────────────────────────────────────────────────
-    async getEmployee(employeeId) {
-        return this.prisma.businessEmployee.findUnique({
-            where: { id: employeeId },
+    // Business profile is part of the authorization boundary; callers must
+    // provide the server-derived tenant ID instead of relying on employee ID.
+    async getEmployee(employeeId, businessProfileId) {
+        if (!businessProfileId) throw new Error('Business context required.');
+        return this.prisma.businessEmployee.findFirst({
+            where: { id: employeeId, businessProfileId },
             include: {
                 user: { select: { id: true, username: true, email: true } },
                 shifts: { orderBy: { shiftDate: 'desc' }, take: 10 },
@@ -126,7 +129,8 @@ class EmployeeService {
     }
 
     // ── Update Employee ────────────────────────────────────────────────────
-    async updateEmployee(employeeId, updates) {
+    async updateEmployee(employeeId, businessProfileId, updates) {
+        if (!businessProfileId) throw new Error('Business context required.');
         const allowed = ['role', 'title', 'department', 'payrollType', 'salaryAmount', 'hourlyRate', 'paymentPreference', 'permissions', 'status', 'emergencyContact', 'notes', 'terminationDate', 'ewaEligible'];
         const data = {};
         for (const key of allowed) {
@@ -149,8 +153,14 @@ class EmployeeService {
             data.terminationDate = new Date();
         }
 
+        const existing = await this.prisma.businessEmployee.findFirst({
+            where: { id: employeeId, businessProfileId },
+            select: { id: true },
+        });
+        if (!existing) throw new Error('Employee not found.');
+
         return this.prisma.businessEmployee.update({
-            where: { id: employeeId },
+            where: { id: existing.id },
             data,
             include: {
                 user: { select: { id: true, username: true, email: true } },
@@ -159,9 +169,16 @@ class EmployeeService {
     }
 
     // ── Remove / Terminate Employee ────────────────────────────────────────
-    async terminateEmployee(employeeId, reason) {
+    async terminateEmployee(employeeId, businessProfileId, reason) {
+        if (!businessProfileId) throw new Error('Business context required.');
+        const existing = await this.prisma.businessEmployee.findFirst({
+            where: { id: employeeId, businessProfileId },
+            select: { id: true },
+        });
+        if (!existing) throw new Error('Employee not found.');
+
         return this.prisma.businessEmployee.update({
-            where: { id: employeeId },
+            where: { id: existing.id },
             data: {
                 status: 'TERMINATED',
                 terminationDate: new Date(),
@@ -170,13 +187,45 @@ class EmployeeService {
         });
     }
 
+    // Route-compatible alias used by the Business OS API.
+    async removeEmployee(employeeId, businessProfileId, reason) {
+        return this.terminateEmployee(employeeId, businessProfileId, reason);
+    }
+
     // ── Re-activate Employee ───────────────────────────────────────────────
-    async reactivateEmployee(employeeId) {
+    async reactivateEmployee(employeeId, businessProfileId) {
+        if (!businessProfileId) throw new Error('Business context required.');
+        const existing = await this.prisma.businessEmployee.findFirst({
+            where: { id: employeeId, businessProfileId },
+            select: { id: true },
+        });
+        if (!existing) throw new Error('Employee not found.');
+
         return this.prisma.businessEmployee.update({
-            where: { id: employeeId },
+            where: { id: existing.id },
             data: {
                 status: 'ACTIVE',
                 terminationDate: null,
+            },
+        });
+    }
+
+    // ── Permission Management ──────────────────────────────────────────────
+    async updatePermissions(employeeId, businessProfileId, permissions) {
+        if (!businessProfileId) throw new Error('Business context required.');
+        if (!Array.isArray(permissions)) throw new Error('Permissions must be an array.');
+
+        const existing = await this.prisma.businessEmployee.findFirst({
+            where: { id: employeeId, businessProfileId },
+            select: { id: true },
+        });
+        if (!existing) throw new Error('Employee not found.');
+
+        return this.prisma.businessEmployee.update({
+            where: { id: existing.id },
+            data: { permissions },
+            include: {
+                user: { select: { id: true, username: true, email: true } },
             },
         });
     }
@@ -199,15 +248,22 @@ class EmployeeService {
     }
 
     // ── Get Employee Stats ─────────────────────────────────────────────────
-    async getEmployeeStats(employeeId) {
+    async getEmployeeStats(employeeId, businessProfileId) {
+        if (!businessProfileId) throw new Error('Business context required.');
+        const employee = await this.prisma.businessEmployee.findFirst({
+            where: { id: employeeId, businessProfileId },
+            select: { id: true },
+        });
+        if (!employee) throw new Error('Employee not found.');
+
         const [shifts, feedbacks, payroll] = await Promise.all([
-            this.prisma.shift.count({ where: { employeeId } }),
+            this.prisma.shift.count({ where: { employeeId: employee.id, businessProfileId } }),
             this.prisma.employeeFeedback.findMany({
-                where: { receiverEmployeeId: employeeId },
+                where: { receiverEmployeeId: employee.id, businessProfileId },
                 select: { rating: true, tags: true },
             }),
             this.prisma.payrollRecord.findMany({
-                where: { employeeId },
+                where: { employeeId: employee.id, businessProfileId },
                 select: { grossAmount: true, netAmount: true, period: true, status: true },
                 orderBy: { period: 'desc' },
                 take: 12,
