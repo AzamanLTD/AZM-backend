@@ -14,6 +14,15 @@
 //   and deducted from their net pay on payroll day
 // =============================================================================
 
+const SERIALIZABLE_RETRY_LIMIT = 3;
+const SERIALIZABLE_BACKOFF_MS = 10;
+
+const isSerializableConflict = (error) => error?.code === 'P2034';
+
+const waitForSerializableRetry = (attempt) => new Promise((resolve) => {
+    setTimeout(resolve, SERIALIZABLE_BACKOFF_MS * (2 ** attempt));
+});
+
 class EwaService {
     constructor(prisma) {
         this.prisma = prisma;
@@ -58,104 +67,115 @@ class EwaService {
             throw new Error('Minimum withdrawal is 1 AZM.');
         }
 
-        return this.prisma.$transaction(async (tx) => {
-            const employee = await tx.businessEmployee.findUnique({
-                where: { id: employeeId },
-            });
-            if (!employee) throw new Error('Employee not found.');
-            if (!employee.ewaEligible) throw new Error('EWA is not available for this employee.');
-            if (employee.status !== 'ACTIVE') throw new Error('Only active employees can request EWA.');
+        for (let attempt = 0; attempt < SERIALIZABLE_RETRY_LIMIT; attempt += 1) {
+            try {
+                return await this.prisma.$transaction(async (tx) => {
+                    const employee = await tx.businessEmployee.findUnique({
+                        where: { id: employeeId },
+                    });
+                    if (!employee) throw new Error('Employee not found.');
+                    if (!employee.ewaEligible) throw new Error('EWA is not available for this employee.');
+                    if (employee.status !== 'ACTIVE') throw new Error('Only active employees can request EWA.');
 
-            const accrued = parseFloat(employee.accruedWages);
-            const alreadyWithdrawn = parseFloat(employee.withdrawnEarly);
-            const maxAvailable = accrued * 0.30;
-            const remaining = maxAvailable - alreadyWithdrawn;
+                    const accrued = parseFloat(employee.accruedWages);
+                    const alreadyWithdrawn = parseFloat(employee.withdrawnEarly);
+                    const maxAvailable = accrued * 0.30;
+                    const remaining = maxAvailable - alreadyWithdrawn;
 
-            if (withdrawAmount > remaining) {
-                throw new Error(
-                    `Amount exceeds available EWA balance. Max: ${Math.max(0, remaining).toFixed(2)} AZM`,
-                );
-            }
+                    if (withdrawAmount > remaining) {
+                        throw new Error(
+                            `Amount exceeds available EWA balance. Max: ${Math.max(0, remaining).toFixed(2)} AZM`,
+                        );
+                    }
 
-            const fee = withdrawAmount * 0.01;
-            const netToEmployee = withdrawAmount - fee;
+                    const fee = withdrawAmount * 0.01;
+                    const netToEmployee = withdrawAmount - fee;
 
-            // Claim the EWA capacity conditionally inside the same transaction as
-            // all downstream money/ledger mutations. A concurrent request that
-            // would exceed the 30% cap cannot claim the same capacity.
-            const guardResult = await tx.businessEmployee.updateMany({
-                where: {
-                    id: employeeId,
-                    status: 'ACTIVE',
-                    ewaEligible: true,
-                    withdrawnEarly: { lte: maxAvailable - withdrawAmount },
-                },
-                data: {
-                    withdrawnEarly: { increment: withdrawAmount },
-                },
-            });
+                    // Claim the EWA capacity conditionally inside the same transaction as
+                    // all downstream money/ledger mutations. A concurrent request that
+                    // would exceed the 30% cap cannot claim the same capacity.
+                    const guardResult = await tx.businessEmployee.updateMany({
+                        where: {
+                            id: employeeId,
+                            status: 'ACTIVE',
+                            ewaEligible: true,
+                            withdrawnEarly: { lte: maxAvailable - withdrawAmount },
+                        },
+                        data: {
+                            withdrawnEarly: { increment: withdrawAmount },
+                        },
+                    });
 
-            if (guardResult.count !== 1) {
-                throw new Error(
-                    'EWA withdrawal failed — insufficient available balance (concurrent withdrawal detected).',
-                );
-            }
+                    if (guardResult.count !== 1) {
+                        throw new Error(
+                            'EWA withdrawal failed — insufficient available balance (concurrent withdrawal detected).',
+                        );
+                    }
 
-            await tx.user.update({
-                where: { id: employee.userId },
-                data: {
-                    azmBalance: { increment: netToEmployee },
-                },
-            });
+                    await tx.user.update({
+                        where: { id: employee.userId },
+                        data: {
+                            azmBalance: { increment: netToEmployee },
+                        },
+                    });
 
-            await tx.transactionHistory.create({
-                data: {
-                    userId: employee.userId,
-                    type: 'EWA_WITHDRAWAL',
-                    amountUsdc: netToEmployee,
-                    feeUsdc: fee,
-                    status: 'COMPLETED',
-                    metadata: {
-                        employeeId,
-                        grossAmount: withdrawAmount,
-                        destination: destination || 'AZM_BALANCE',
-                        source: 'BUSINESS_OS_EWA',
-                    },
-                },
-            });
+                    await tx.transactionHistory.create({
+                        data: {
+                            userId: employee.userId,
+                            type: 'EWA_WITHDRAWAL',
+                            amountUsdc: netToEmployee,
+                            feeUsdc: fee,
+                            status: 'COMPLETED',
+                            metadata: {
+                                employeeId,
+                                grossAmount: withdrawAmount,
+                                destination: destination || 'AZM_BALANCE',
+                                source: 'BUSINESS_OS_EWA',
+                            },
+                        },
+                    });
 
-            await tx.businessLedgerEntry.create({
-                data: {
-                    businessProfileId: employee.businessProfileId,
-                    type: 'PAYROLL',
-                    category: 'EWA Withdrawal',
-                    description: `EWA withdrawal by employee ${employeeId}`,
-                    amount: -withdrawAmount,
-                    sourceType: 'EWA',
-                    sourceId: employeeId,
-                    metadata: {
-                        employeeId,
+                    await tx.businessLedgerEntry.create({
+                        data: {
+                            businessProfileId: employee.businessProfileId,
+                            type: 'PAYROLL',
+                            category: 'EWA Withdrawal',
+                            description: `EWA withdrawal by employee ${employeeId}`,
+                            amount: -withdrawAmount,
+                            sourceType: 'EWA',
+                            sourceId: employeeId,
+                            metadata: {
+                                employeeId,
+                                grossAmount: withdrawAmount,
+                                fee,
+                                netToEmployee,
+                                destination: destination || 'AZM_BALANCE',
+                            },
+                        },
+                    });
+
+                    const finalEmployee = await tx.businessEmployee.findUnique({
+                        where: { id: employeeId },
+                    });
+
+                    return {
+                        success: true,
                         grossAmount: withdrawAmount,
                         fee,
                         netToEmployee,
-                        destination: destination || 'AZM_BALANCE',
-                    },
-                },
-            });
+                        remainingWithdrawable: Math.max(0, remaining - withdrawAmount),
+                        employee: finalEmployee,
+                    };
+                }, { isolationLevel: 'Serializable' });
+            } catch (error) {
+                if (!isSerializableConflict(error) || attempt === SERIALIZABLE_RETRY_LIMIT - 1) {
+                    throw error;
+                }
+                await waitForSerializableRetry(attempt);
+            }
+        }
 
-            const finalEmployee = await tx.businessEmployee.findUnique({
-                where: { id: employeeId },
-            });
-
-            return {
-                success: true,
-                grossAmount: withdrawAmount,
-                fee,
-                netToEmployee,
-                remainingWithdrawable: Math.max(0, remaining - withdrawAmount),
-                employee: finalEmployee,
-            };
-        }, { isolationLevel: 'Serializable' });
+        throw new Error('EWA withdrawal failed after retries.');
     }
 
     // ── Get EWA History for Employee ───────────────────────────────────────
