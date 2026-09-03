@@ -166,18 +166,23 @@ class RestaurantOpsService {
 
     async updateItemStatus(orderId, itemIndex, status, businessProfileId) {
         if (!businessProfileId) throw new Error('Business profile context is required.');
+        if (!Number.isInteger(itemIndex) || itemIndex < 0) {
+            throw new Error('Invalid kitchen item index.');
+        }
+
         const order = await this.prisma.kitchenOrder.findFirst({
             where: { id: orderId, businessProfileId },
+            include: { orderItems: true },
         });
         if (!order) throw new Error('Order not found.');
 
-        const items = [...order.orderItems];
-        if (itemIndex >= 0 && itemIndex < items.length) {
-            items[itemIndex] = { ...items[itemIndex], status };
-        }
+        const items = Array.isArray(order.orderItems) ? [...order.orderItems] : [];
+        if (itemIndex >= items.length) throw new Error('Kitchen item not found.');
 
-        const allReady = items.every(i => i.status === 'READY' || i.status === 'SERVED');
-        const allServed = items.every(i => i.status === 'SERVED');
+        items[itemIndex] = { ...items[itemIndex], status };
+
+        const allReady = items.length > 0 && items.every(i => i.status === 'READY' || i.status === 'SERVED');
+        const allServed = items.length > 0 && items.every(i => i.status === 'SERVED');
 
         const updates = { orderItems: items };
         if (allServed) {
