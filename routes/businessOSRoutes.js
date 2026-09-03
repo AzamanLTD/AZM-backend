@@ -374,7 +374,7 @@ router.post('/shifts', requirePermission('shifts.create'), wrap(async (req, res)
 }));
 
 // POST /api/business-os/shifts/rotation
-router.post('/shifts/rotation', wrap(async (req, res) => {
+router.post('/shifts/rotation', requirePermission('shifts.create'), wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
     const shifts = await svc.shiftService.createShiftRotation({ ...req.body, businessProfileId: bpId });
@@ -396,21 +396,21 @@ router.delete('/shifts/:id', requirePermission('shifts.delete'), wrap(async (req
 }));
 
 // POST /api/business-os/shifts/:id/clock-in
-router.post('/shifts/:id/clock-in', wrap(async (req, res) => {
+router.post('/shifts/:id/clock-in', requirePermission('shifts.update'), wrap(async (req, res) => {
     const svc = getServices(req);
     const result = await svc.shiftService.clockIn(req.params.id);
     res.json({ success: true, result });
 }));
 
 // POST /api/business-os/shifts/:id/clock-out
-router.post('/shifts/:id/clock-out', wrap(async (req, res) => {
+router.post('/shifts/:id/clock-out', requirePermission('shifts.update'), wrap(async (req, res) => {
     const svc = getServices(req);
     const result = await svc.shiftService.clockOut(req.params.id);
     res.json({ success: true, result });
 }));
 
 // POST /api/business-os/shifts/:id/no-show
-router.post('/shifts/:id/no-show', wrap(async (req, res) => {
+router.post('/shifts/:id/no-show', requirePermission('shifts.update'), wrap(async (req, res) => {
     const svc = getServices(req);
     const result = await svc.shiftService.markNoShow(req.params.id);
     res.json({ success: true, result });
@@ -562,25 +562,25 @@ router.get('/payroll/summary', wrap(async (req, res) => {
 // EWA (Earned Wage Access)
 // ═══════════════════════════════════════════════════════════════════════════
 
-router.get('/ewa/eligibility/:employeeId', wrap(async (req, res) => {
+router.get('/ewa/eligibility/:employeeId', requirePermission('ewa.manage'), wrap(async (req, res) => {
     const svc = getServices(req);
     const eligibility = await svc.ewaService.checkEligibility(req.params.employeeId);
     res.json({ success: true, eligibility });
 }));
 
-router.post('/ewa/withdraw', wrap(async (req, res) => {
+router.post('/ewa/withdraw', requirePermission('ewa.manage'), wrap(async (req, res) => {
     const svc = getServices(req);
     const result = await svc.ewaService.requestWithdrawal(req.body);
     res.json({ success: true, result });
 }));
 
-router.get('/ewa/history/:employeeId', wrap(async (req, res) => {
+router.get('/ewa/history/:employeeId', requirePermission('ewa.manage'), wrap(async (req, res) => {
     const svc = getServices(req);
     const history = await svc.ewaService.getEwaHistory(req.params.employeeId);
     res.json({ success: true, history });
 }));
 
-router.get('/ewa/summary', wrap(async (req, res) => {
+router.get('/ewa/summary', requirePermission('ewa.manage'), wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
     const summary = await svc.ewaService.getEwaSummary(bpId);
