@@ -118,6 +118,38 @@ describe('PosOrderService atomic settlement', () => {
         });
     });
 
+    test('aggregates duplicate order lines before recipe ingredient consumption', async () => {
+        const tx = baseTx({
+            recipeIngredient: {
+                findMany: jest.fn().mockResolvedValue([
+                    { productId: 'prod-1', inventoryItemId: 'inv-rice', quantityRequired: 0.25 },
+                ]),
+            },
+        });
+        const prisma = {
+            businessProduct: { findFirst: jest.fn().mockResolvedValue({ id: 'prod-1', name: 'Jollof', priceUsdc: 10, stockQty: null }) },
+            businessOrder: { findFirst: jest.fn().mockResolvedValue(null) },
+            $transaction: jest.fn(async (fn) => fn(tx)),
+        };
+
+        await new PosOrderService(prisma).createOrder({
+            businessProfileId: 'biz-1',
+            actorId: 7,
+            items: [
+                { productId: 'prod-1', quantity: 2 },
+                { productId: 'prod-1', quantity: 3 },
+            ],
+            paymentMethod: 'CASH',
+            cashGiven: 55,
+            idempotencyKey: 'recipe-duplicate-1',
+        });
+
+        expect(tx.inventoryItem.updateMany).toHaveBeenCalledWith({
+            where: { id: 'inv-rice', businessProfileId: 'biz-1', isActive: true, currentStock: { gte: 1.25 } },
+            data: { currentStock: { decrement: 1.25 } },
+        });
+    });
+
     test('refuses a sale when tracked product stock is insufficient before order creation', async () => {
         const tx = baseTx({ businessProduct: { updateMany: jest.fn().mockResolvedValue({ count: 0 }) } });
         const prisma = {
