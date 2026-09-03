@@ -1,14 +1,18 @@
 const { PosOrderService } = require('../services/businessOS/posOrderService');
 
 describe('PosOrderService atomic settlement', () => {
-    test('re-derives catalog prices and commits balance, order and ledger together', async () => {
+    test('re-derives catalog prices and commits balance, line items, order and ledger together', async () => {
         const tx = {
             user: {
                 updateMany: jest.fn().mockResolvedValue({ count: 1 }),
                 findUnique: jest.fn().mockResolvedValue({ azmBalance: 59 }),
             },
             azmSpendLog: { create: jest.fn().mockResolvedValue({}) },
-            businessOrder: { findFirst: jest.fn().mockResolvedValue(null), create: jest.fn().mockResolvedValue({ id: 'order-1', businessProfileId: 'biz-1', cashChange: 0 }) },
+            businessOrder: {
+                findFirst: jest.fn().mockResolvedValue(null),
+                create: jest.fn().mockResolvedValue({ id: 'order-1', businessProfileId: 'biz-1', cashChange: 0 }),
+            },
+            businessOrderItem: { createMany: jest.fn().mockResolvedValue({ count: 1 }) },
             businessLedgerEntry: { create: jest.fn().mockResolvedValue({ id: 'ledger-1' }) },
         };
         const prisma = {
@@ -33,6 +37,16 @@ describe('PosOrderService atomic settlement', () => {
         expect(tx.azmSpendLog.create).toHaveBeenCalledWith(expect.objectContaining({
             data: expect.objectContaining({ userId: 7, amount: 41, balanceAfter: 59 }),
         }));
+        expect(tx.businessOrderItem.createMany).toHaveBeenCalledWith({
+            data: [{
+                orderId: 'order-1',
+                productId: 'prod-1',
+                name: 'Meal',
+                unitPrice: 20,
+                quantity: 2,
+                lineTotal: 40,
+            }],
+        });
         expect(tx.businessOrder.create).toHaveBeenCalled();
         expect(tx.businessLedgerEntry.create).toHaveBeenCalled();
     });
