@@ -51,6 +51,42 @@ const _cursorBoundary = async (prisma, cursor, scopeWhere) => {
     return row;
 };
 
+const _getRevenueByDay = async (prisma, businessProfileId) => {
+    const to = new Date();
+    const from = new Date(to);
+    from.setUTCHours(0, 0, 0, 0);
+    from.setUTCDate(from.getUTCDate() - 29);
+
+    const rows = await prisma.$queryRaw`
+        SELECT DATE_TRUNC('day', "createdAt") AS date,
+               COALESCE(SUM("amountUsdc"), 0) AS revenue
+        FROM "BusinessOrder"
+        WHERE "businessProfileId" = ${businessProfileId}
+          AND status = 'COMPLETED'
+          AND "createdAt" >= ${from}
+        GROUP BY 1
+        ORDER BY 1 ASC
+    `;
+
+    const byDate = new Map();
+    for (const row of rows) {
+        const key = new Date(row.date).toISOString().slice(0, 10);
+        byDate.set(key, Number(row.revenue) || 0);
+    }
+
+    const result = [];
+    for (let cursor = new Date(from); cursor <= to; cursor.setUTCDate(cursor.getUTCDate() + 1)) {
+        const key = cursor.toISOString().slice(0, 10);
+        const label = new Intl.DateTimeFormat('en', {
+            month: 'short',
+            day: 'numeric',
+            timeZone: 'UTC',
+        }).format(cursor);
+        result.push({ date: key, label, revenue: byDate.get(key) || 0 });
+    }
+    return result;
+};
+
 const createOrder = async (prisma, { businessProfileId, customerId, productId, escrowId, ticketId, amountUsdc, title, description, customerNotes }) => {
     if (!businessProfileId) throw new Error('businessProfileId is required.');
     if (!customerId) throw new Error('customerId is required.');
@@ -167,17 +203,18 @@ const updateOrderStatusFromEscrow = async (prisma, escrowId, escrowStatus) => {
 };
 
 const getBusinessStats = async (prisma, { businessProfileId }) => {
-    const [totalOrders, completedOrders, pendingOrders, disputedOrders, cancelledOrders, revenueAgg, recentOrders] = await Promise.all([
+    const [totalOrders, completedOrders, pendingOrders, disputedOrders, cancelledOrders, revenueAgg, recentOrders, revenueByDay] = await Promise.all([
         prisma.businessOrder.count({ where: { businessProfileId } }),
         prisma.businessOrder.count({ where: { businessProfileId, status: 'COMPLETED' } }),
         prisma.businessOrder.count({ where: { businessProfileId, status: { in: ['AWAITING_PAYMENT', 'PAID', 'DELIVERED'] } } }),
         prisma.businessOrder.count({ where: { businessProfileId, status: 'DISPUTED' } }),
         prisma.businessOrder.count({ where: { businessProfileId, status: { in: ['REFUNDED', 'CANCELLED'] } } }),
         prisma.businessOrder.aggregate({ where: { businessProfileId, status: 'COMPLETED' }, _sum: { amountUsdc: true } }),
-        prisma.businessOrder.findMany({ where: { businessProfileId }, orderBy: [{ createdAt: 'desc' }, { id: 'desc' }], take: 5, include: ORDER_INCLUDE })
+        prisma.businessOrder.findMany({ where: { businessProfileId }, orderBy: [{ createdAt: 'desc' }, { id: 'desc' }], take: 5, include: ORDER_INCLUDE }),
+        _getRevenueByDay(prisma, businessProfileId),
     ]);
     const totalRevenue = Number(revenueAgg._sum.amountUsdc || 0);
-    return { totalOrders, completedOrders, pendingOrders, disputedOrders, cancelledOrders, totalRevenue, avgOrderValue: completedOrders > 0 ? totalRevenue / completedOrders : 0, recentOrders };
+    return { totalOrders, completedOrders, pendingOrders, disputedOrders, cancelledOrders, totalRevenue, avgOrderValue: completedOrders > 0 ? totalRevenue / completedOrders : 0, recentOrders, revenueByDay };
 };
 
 module.exports = { createOrder, getOrder, listOrdersForBusiness, listOrdersForCustomer, markDelivered, updateOrderStatusFromEscrow, getBusinessStats };
