@@ -25,39 +25,48 @@ class EmployeeFeedbackService {
             throw new Error('Both employees must belong to the same business.');
         }
 
-        const feedback = await this.prisma.employeeFeedback.create({
-            data: {
-                businessProfileId,
-                giverEmployeeId: fromEmployeeId,
-                receiverEmployeeId: toEmployeeId,
-                givenByUserId: fromEmployee.userId,
-                receivedByUserId: toEmployee.userId,
-                rating,
-                tags,
-                comment,
-                periodStart: new Date(Date.now() - 30 * 86400000), // Default 30 days
-                periodEnd: new Date(),
-            },
-        });
+        return this.prisma.$transaction(async (tx) => {
+            const feedback = await tx.employeeFeedback.create({
+                data: {
+                    businessProfileId,
+                    giverEmployeeId: fromEmployeeId,
+                    receiverEmployeeId: toEmployeeId,
+                    givenByUserId: fromEmployee.userId,
+                    receivedByUserId: toEmployee.userId,
+                    rating,
+                    tags,
+                    comment,
+                    periodStart: new Date(Date.now() - 30 * 86400000), // Default 30 days
+                    periodEnd: new Date(),
+                },
+            });
 
-        // Recalculate employee's average rating
-        const allFeedback = await this.prisma.employeeFeedback.findMany({
-            where: { receiverEmployeeId: toEmployeeId },
-            select: { rating: true },
-        });
-        const avgRating = allFeedback.length > 0
-            ? allFeedback.reduce((s, f) => s + f.rating, 0) / allFeedback.length
-            : 0;
+            // Recalculate only this business's feedback so another business can
+            // never influence the employee's rating or ratingCount.
+            // Serializable isolation prevents concurrent submissions from both
+            // observing an incomplete history and writing a stale aggregate.
+            const allFeedback = await tx.employeeFeedback.findMany({
+                where: {
+                    businessProfileId,
+                    receiverEmployeeId: toEmployeeId,
+                },
+                select: { rating: true },
+            });
+            const avgRating = allFeedback.length > 0
+                ? allFeedback.reduce((s, f) => s + f.rating, 0) / allFeedback.length
+                : 0;
 
-        await this.prisma.businessEmployee.update({
-            where: { id: toEmployeeId },
-            data: {
-                rating: Math.round(avgRating * 100) / 100,
-                ratingCount: allFeedback.length,
-            },
-        });
+            const updated = await tx.businessEmployee.updateMany({
+                where: { id: toEmployeeId, businessProfileId },
+                data: {
+                    rating: Math.round(avgRating * 100) / 100,
+                    ratingCount: allFeedback.length,
+                },
+            });
+            if (!updated.count) throw new Error('Employee no longer belongs to this business.');
 
-        return feedback;
+            return feedback;
+        }, { isolationLevel: 'Serializable' });
     }
 
     async getFeedbackForEmployee(employeeId) {
