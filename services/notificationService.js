@@ -76,14 +76,20 @@ class NotificationService {
 
     async _tryBatchUpdate(userId, batchKey, newBody, category) {
         const cutoff = new Date(Date.now() - this.BATCH_WINDOW_MS);
+        const where = {
+            userId,
+            category,
+            createdAt: { gte: cutoff },
+        };
+
+        if (batchKey.filters?.length) {
+            where.AND = batchKey.filters;
+        } else if (batchKey.path && batchKey.value !== undefined) {
+            where.actionPayload = { path: batchKey.path, equals: batchKey.value };
+        }
 
         const existing = await this.prisma.notification.findFirst({
-            where: {
-                userId,
-                category,
-                actionPayload: { path: batchKey.path, equals: batchKey.value },
-                createdAt:     { gte: cutoff }
-            },
+            where,
             orderBy: { createdAt: 'desc' }
         });
 
@@ -101,7 +107,12 @@ class NotificationService {
     _buildBatchKey(actionPayload) {
         if (!actionPayload) return null;
         if (actionPayload.action === 'OPEN_TRADE' && actionPayload.tradeId) {
-            return { path: ['action'], value: 'OPEN_TRADE', tradeId: actionPayload.tradeId };
+            return {
+                filters: [
+                    { actionPayload: { path: ['action'], equals: 'OPEN_TRADE' } },
+                    { actionPayload: { path: ['tradeId'], equals: String(actionPayload.tradeId) } },
+                ],
+            };
         }
         if (actionPayload.action === 'OPEN_WALLET' && actionPayload.reference) {
             return { path: ['reference'], value: actionPayload.reference };
