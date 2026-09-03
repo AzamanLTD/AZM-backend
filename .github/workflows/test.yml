@@ -19,6 +19,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+
     services:
       postgres:
         image: postgres:16
@@ -33,28 +34,43 @@ jobs:
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
+
     env:
       DATABASE_URL: postgres://postgres:postgres@localhost:5432/azm_test?schema=public
       TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/azm_test?schema=public
       JWT_SECRET: test_secret_exactly_32_characters_long
       NODE_ENV: test
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
           node-version: '24'
           cache: 'npm'
+
       - name: Install dependencies
         run: npm ci
+
       - name: Apply database schema
+        # CI uses a disposable PostgreSQL instance. Production remains managed
+        # by the repository's established db-push release process.
         run: npx prisma db push --accept-data-loss
+
       - name: Install transaction quote overlay
         run: node infra/install-transaction-quote-overlay.js
+
       - name: Generate Prisma client
         run: npx prisma generate
+
       - name: Run tests
+        # DB-backed suites share one disposable database and truncate between
+        # tests, so Jest must remain serial. The application bootstrap also
+        # leaves Prisma/pg handles open, hence forceExit.
+        # Retry once only to absorb a transient CI database/runner timeout;
+        # genuine test failures must reproduce and still fail the job.
         run: |
           set +e
           npm test -- --runInBand --forceExit
@@ -65,6 +81,7 @@ jobs:
             code=$?
           fi
           exit $code
+
       - name: Database backup and restore drill
         env:
           PG_ADMIN_URL: postgres://postgres:postgres@localhost:5432/postgres
