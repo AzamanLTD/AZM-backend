@@ -18,4 +18,5 @@ module.exports = {
     testEnvironment: 'node',
     testPathIgnorePatterns: ['/node_modules/', '/__tests__/helpers/'],
     setupFiles: ['./jest.setup.js'],
+    setupFilesAfterEnv: ['./test-support/setup-shift-business-context.js'],
 };
