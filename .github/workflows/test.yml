@@ -55,26 +55,17 @@ jobs:
       - name: Generate Prisma client
         run: npx prisma generate
       - name: Run tests
-        shell: bash
         run: |
           set +e
-          npm test -- --runInBand --forceExit 2>&1 | tee test-output.log
-          code=${PIPESTATUS[0]}
+          npm test -- --runInBand --forceExit
+          code=$?
           if [ $code -ne 0 ]; then
             echo "::warning::Test suite failed on first attempt — retrying once for transient CI-environment failures."
-            npm test -- --runInBand --forceExit 2>&1 | tee -a test-output.log
-            code=${PIPESTATUS[0]}
+            npm test -- --runInBand --forceExit
+            code=$?
           fi
           exit $code
-      - name: Upload test diagnostic
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: mandatory-test-output
-          path: test-output.log
-          retention-days: 1
       - name: Database backup and restore drill
-        if: success()
         env:
           PG_ADMIN_URL: postgres://postgres:postgres@localhost:5432/postgres
           BACKUP_DRILL_ALLOW_MUTATION: '1'
