@@ -115,6 +115,8 @@ function mountRoutes(app, {
     // mounted before the legacy monolithic router during the cleanup migration.
     app.use('/api/business-os', financialLimiter, require('../../routes/businessOSFinanceRoutes'));
     app.use('/api/business-os', generalLimiter, require('../../routes/businessOSInventoryRoutes'));
+    app.use('/api/business-os', financialLimiter, require('../../routes/businessOSPosRoutes'));
+    app.use('/api/business-os', generalLimiter, require('../../routes/businessOSKioskRoutes'));
     app.use('/api/business-os', generalLimiter, require('../../routes/businessOSRoutes'));
     app.use('/api/developer', generalLimiter, require('../../routes/developerRoutes'));
     app.use('/api/qr', generalLimiter, require('../../routes/qrRoutes'));
