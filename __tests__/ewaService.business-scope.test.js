@@ -93,12 +93,20 @@ describe('EwaService business scoping', () => {
             withdrawnEarly: 0,
         };
         const otherEmployee = { ...employee, id: 'employee-b', userId: 202 };
+        const unauthorizedActor = {
+            id: 'employee-2',
+            businessProfileId: 'business-a',
+            userId: 303,
+            permissions: ['view_own_shifts'],
+        };
         const tx = {
             businessEmployee: {
                 findFirst: jest
                     .fn()
                     .mockResolvedValueOnce(employee)
-                    .mockResolvedValueOnce({ ...employee, withdrawnEarly: 10 }),
+                    .mockResolvedValueOnce({ ...employee, withdrawnEarly: 10 })
+                    .mockResolvedValueOnce(otherEmployee)
+                    .mockResolvedValueOnce(unauthorizedActor),
                 updateMany: jest.fn().mockResolvedValue({ count: 1 }),
             },
             user: { update: jest.fn().mockResolvedValue({}) },
@@ -117,15 +125,7 @@ describe('EwaService business scoping', () => {
             })).resolves.toMatchObject({ success: true });
         });
 
-        tx.businessEmployee.findFirst.mockReset();
-        tx.businessEmployee.findFirst.mockResolvedValueOnce(otherEmployee).mockResolvedValueOnce({
-            id: 'employee-2',
-            businessProfileId: 'business-a',
-            userId: 303,
-            permissions: ['ewa.manage'],
-        });
-
-        await runWithBusinessRequestContext({ businessProfileId: 'business-a', userId: 101 }, async () => {
+        await runWithBusinessRequestContext({ businessProfileId: 'business-a', userId: 303 }, async () => {
             await expect(service.requestWithdrawal({
                 employeeId: 'employee-b',
                 amount: 10,
