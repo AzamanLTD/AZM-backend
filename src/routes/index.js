@@ -114,7 +114,6 @@ function mountRoutes(app, {
     // Canonical scoped Business OS financial/operational mutation handlers are
     // mounted before the legacy monolithic router during the cleanup migration.
     app.use('/api/business-os', financialLimiter, require('../../routes/businessOSFinanceRoutes'));
-    app.use('/api/business-os', financialLimiter, require('../../routes/businessOSPosRoutes'));
     app.use('/api/business-os', generalLimiter, require('../../routes/businessOSInventoryRoutes'));
     app.use('/api/business-os', generalLimiter, require('../../routes/businessOSRoutes'));
     app.use('/api/developer', generalLimiter, require('../../routes/developerRoutes'));
