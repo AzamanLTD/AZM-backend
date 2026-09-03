@@ -263,16 +263,21 @@ class PosOrderService {
         }
 
         // Restaurant products can consume ingredients rather than a simple
-        // product stock count. Aggregate requirements first so a single order
-        // containing the same ingredient through multiple menu items remains
-        // atomic and cannot overspend a shared inventory quantity.
+        // product stock count. Aggregate product quantities first so duplicate
+        // order lines cannot under-consume their shared recipe ingredients.
         const recipes = await tx.recipeIngredient.findMany({
             where: { productId: { in: items.map((item) => item.productId) } },
             select: { productId: true, inventoryItemId: true, quantityRequired: true },
         });
         if (recipes.length === 0) return;
 
-        const quantityByProduct = new Map(items.map((item) => [item.productId, item.quantity]));
+        const quantityByProduct = new Map();
+        for (const item of items) {
+            quantityByProduct.set(
+                item.productId,
+                (quantityByProduct.get(item.productId) || 0) + item.quantity,
+            );
+        }
         const requiredByInventory = new Map();
         for (const recipe of recipes) {
             const productQty = quantityByProduct.get(recipe.productId) || 0;
