@@ -10,7 +10,7 @@ describe('PosOrderService atomic settlement', () => {
             azmSpendLog: { create: jest.fn().mockResolvedValue({}) },
             businessOrder: {
                 findFirst: jest.fn().mockResolvedValue(null),
-                create: jest.fn().mockResolvedValue({ id: 'order-1', businessProfileId: 'biz-1', cashChange: 0 }),
+                create: jest.fn().mockResolvedValue({ id: 'order-1', businessProfileId: 'biz-1', cashChange: 0, amountUsdc: 41 }),
             },
             businessOrderItem: { createMany: jest.fn().mockResolvedValue({ count: 1 }) },
             businessLedgerEntry: { create: jest.fn().mockResolvedValue({ id: 'ledger-1' }) },
@@ -51,9 +51,31 @@ describe('PosOrderService atomic settlement', () => {
         expect(tx.businessLedgerEntry.create).toHaveBeenCalled();
     });
 
+    test('replays idempotently before catalog validation when the product is no longer available', async () => {
+        const existing = { id: 'order-1', businessProfileId: 'biz-1', amountUsdc: 41, cashChange: 0 };
+        const prisma = {
+            businessProduct: { findFirst: jest.fn() },
+            businessOrder: { findFirst: jest.fn().mockResolvedValue(existing) },
+            $transaction: jest.fn(),
+        };
+
+        const result = await new PosOrderService(prisma).createOrder({
+            businessProfileId: 'biz-1',
+            actorId: 7,
+            items: [{ productId: 'removed-product', quantity: 1 }],
+            paymentMethod: 'AZM',
+            idempotencyKey: 'pos-1',
+        });
+
+        expect(result.duplicate).toBe(true);
+        expect(result.computedGrand).toBe(41);
+        expect(prisma.businessProduct.findFirst).not.toHaveBeenCalled();
+        expect(prisma.$transaction).not.toHaveBeenCalled();
+    });
+
     test('rejects an idempotency key owned by another business', async () => {
         const prisma = {
-            businessProduct: { findFirst: jest.fn().mockResolvedValue({ id: 'prod-1', name: 'Meal', priceUsdc: 20 }) },
+            businessProduct: { findFirst: jest.fn() },
             businessOrder: { findFirst: jest.fn().mockResolvedValue({ id: 'order-other', businessProfileId: 'biz-2' }) },
             $transaction: jest.fn(),
         };
