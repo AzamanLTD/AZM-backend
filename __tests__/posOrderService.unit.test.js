@@ -22,11 +22,7 @@ describe('PosOrderService atomic settlement', () => {
         };
 
         const result = await new PosOrderService(prisma).createOrder({
-            businessProfileId: 'biz-1',
-            actorId: 7,
-            items: [{ productId: 'prod-1', quantity: 2 }],
-            paymentMethod: 'AZM',
-            idempotencyKey: 'pos-1',
+            businessProfileId: 'biz-1', actorId: 7, items: [{ productId: 'prod-1', quantity: 2 }], paymentMethod: 'AZM', idempotencyKey: 'pos-1',
         });
 
         expect(result.computedGrand).toBe(41);
@@ -38,17 +34,35 @@ describe('PosOrderService atomic settlement', () => {
             data: expect.objectContaining({ userId: 7, amount: 41, balanceAfter: 59 }),
         }));
         expect(tx.businessOrderItem.createMany).toHaveBeenCalledWith({
-            data: [{
-                orderId: 'order-1',
-                productId: 'prod-1',
-                name: 'Meal',
-                unitPrice: 20,
-                quantity: 2,
-                lineTotal: 40,
-            }],
+            data: [{ orderId: 'order-1', productId: 'prod-1', name: 'Meal', unitPrice: 20, quantity: 2, lineTotal: 40 }],
         });
         expect(tx.businessOrder.create).toHaveBeenCalled();
         expect(tx.businessLedgerEntry.create).toHaveBeenCalled();
+    });
+
+    test('computes the legacy 2.5% POS tax and cash change server-side', async () => {
+        const tx = {
+            businessOrder: { findFirst: jest.fn().mockResolvedValue(null), create: jest.fn().mockResolvedValue({ id: 'order-cash', amountUsdc: 20.5, cashChange: 4.5 }) },
+            businessOrderItem: { createMany: jest.fn().mockResolvedValue({ count: 1 }) },
+            businessLedgerEntry: { create: jest.fn().mockResolvedValue({ id: 'ledger-cash' }) },
+        };
+        const prisma = {
+            businessProduct: { findFirst: jest.fn().mockResolvedValue({ id: 'prod-1', name: 'Meal', priceUsdc: 20 }) },
+            businessOrder: { findFirst: jest.fn().mockResolvedValue(null) },
+            $transaction: jest.fn(async (fn) => fn(tx)),
+        };
+
+        const result = await new PosOrderService(prisma).createOrder({
+            businessProfileId: 'biz-1', actorId: 7, items: [{ productId: 'prod-1', quantity: 1 }], paymentMethod: 'CASH', cashGiven: 25, idempotencyKey: 'cash-1',
+        });
+
+        expect(result.computedSubtotal).toBe(20);
+        expect(result.computedTax).toBe(0.5);
+        expect(result.computedGrand).toBe(20.5);
+        expect(result.change).toBe(4.5);
+        expect(tx.businessOrder.create).toHaveBeenCalledWith(expect.objectContaining({
+            data: expect.objectContaining({ paymentMethod: 'CASH', cashReceived: 25, cashChange: 4.5 }),
+        }));
     });
 
     test('replays idempotently before catalog validation when the product is no longer available', async () => {
@@ -60,11 +74,7 @@ describe('PosOrderService atomic settlement', () => {
         };
 
         const result = await new PosOrderService(prisma).createOrder({
-            businessProfileId: 'biz-1',
-            actorId: 7,
-            items: [{ productId: 'removed-product', quantity: 1 }],
-            paymentMethod: 'AZM',
-            idempotencyKey: 'pos-1',
+            businessProfileId: 'biz-1', actorId: 7, items: [{ productId: 'removed-product', quantity: 1 }], paymentMethod: 'AZM', idempotencyKey: 'pos-1',
         });
 
         expect(result.duplicate).toBe(true);
