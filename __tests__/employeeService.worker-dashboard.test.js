@@ -25,6 +25,14 @@ describe('EmployeeService worker dashboard attendance state', () => {
             shiftLabel: 'Opening',
             employee: { role: 'STAFF', user: { username: 'worker', email: 'worker@example.com' } },
         };
+        const upcomingShift = {
+            id: 'shift-upcoming',
+            employeeId: 'employee-2',
+            businessProfileId: 'business-a',
+            status: 'SCHEDULED',
+            startTime: new Date(Date.now() + 3600000),
+            employee: { role: 'STAFF', user: { username: 'next-worker' } },
+        };
 
         const prisma = {
             businessEmployee: { findFirst: jest.fn().mockResolvedValue(employee) },
@@ -32,14 +40,8 @@ describe('EmployeeService worker dashboard attendance state', () => {
                 findFirst: jest
                     .fn()
                     .mockResolvedValueOnce(lateShift)
-                    .mockResolvedValueOnce({
-                        id: 'shift-upcoming',
-                        employeeId: 'employee-2',
-                        businessProfileId: 'business-a',
-                        status: 'SCHEDULED',
-                        startTime: new Date(Date.now() + 3600000),
-                        employee: { role: 'STAFF', user: { username: 'next-worker' } },
-                    }),
+                    .mockResolvedValueOnce(lateShift)
+                    .mockResolvedValueOnce(upcomingShift),
                 findMany: jest.fn().mockResolvedValue([lateShift]),
             },
             employeeFeedback: { findMany: jest.fn().mockResolvedValue([]) },
@@ -52,10 +54,10 @@ describe('EmployeeService worker dashboard attendance state', () => {
         expect(result.teamOnDuty).toEqual([
             { name: 'worker', role: 'STAFF', shiftLabel: 'Opening' },
         ]);
-        expect(prisma.shift.findFirst.mock.calls[0][0]).toEqual(expect.objectContaining({
+        expect(prisma.shift.findFirst.mock.calls[1][0]).toEqual(expect.objectContaining({
             where: {
                 employeeId: 'employee-1',
-                status: { in: ['SCHEDULED', 'LATE'] },
+                status: { in: ['CLOCKED_IN', 'LATE'] },
             },
         }));
         expect(prisma.shift.findMany).toHaveBeenCalledWith(expect.objectContaining({
