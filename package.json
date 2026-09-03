@@ -16,9 +16,6 @@
     "route-check": "node scripts/route-checker.js",
     "db:recovery-drill": "bash scripts/db-recovery-drill.sh"
   },
-  "jest": {
-    "setupFilesAfterEnv": ["<rootDir>/__tests__/setup-shift-business-context.js"]
-  },
   "keywords": [],
   "author": "",
   "license": "ISC",
@@ -32,7 +29,7 @@
     "archiver": "^8.0.0",
     "axios": "^1.20.0",
     "bcryptjs": "^2.4.3",
-    "bullmq": "^5.81.2",
+    "bullmq": "^5.81.0",
     "cloudinary": "^2.10.0",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
@@ -54,7 +51,7 @@
     "speakeasy": "^2.0.0",
     "tsx": "^4.21.0",
     "uuid": "^13.0.0",
-    "ws": "^8.21.3",
+    "ws": "^8.21.0",
     "zod": "^4.4.3"
   },
   "devDependencies": {
