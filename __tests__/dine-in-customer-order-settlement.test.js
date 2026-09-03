@@ -18,9 +18,9 @@ describe('dine-in customer ordering and settlement', () => {
           isActive: true, isAvailable: true,
         }),
       },
+      dineInTabItem: { create: jest.fn().mockResolvedValue({ id: 'item-1', unitPriceUsdc: 14 }) },
     };
     const service = new Service(prisma);
-    service.addItem = addItem;
 
     await service.addCustomerItem({ tabId: 'tab-1', customerId: 7, productId: 'product-1', selection: { Size: 'Large', Extras: ['Cheese'] }, quantity: 2 });
 
