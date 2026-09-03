@@ -27,7 +27,7 @@ const _invoiceRef = () => {
 // ── createInvoice ──────────────────────────────────────────────────────────
 const createInvoice = async (prisma, {
   businessProfileId, customerId, locationId, tableId,
-  lineItems, taxLines, businessNote,
+  lineItems, taxLines, businessNote, idempotencyKey,
 }) => {
   // Validate line items
   if (!Array.isArray(lineItems) || lineItems.length === 0)
@@ -61,6 +61,7 @@ const createInvoice = async (prisma, {
       businessProfileId, customerId, locationId: locationId || null,
       tableId: tableId || null,
       invoiceRef,
+      idempotencyKey: idempotencyKey || null,
       status: 'DRAFT',
       subtotalUsdc, taxTotalUsdc, billTotalUsdc,
       businessNote: businessNote ? String(businessNote).slice(0, 500) : null,
