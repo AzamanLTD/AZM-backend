@@ -6,6 +6,9 @@ describe('TimeOffService approval mutations', () => {
             user: {
                 findUnique: jest.fn().mockResolvedValue({ role: 'MANAGER' }),
             },
+            businessProfile: {
+                findUnique: jest.fn().mockResolvedValue({ userId: 12345 }),
+            },
             businessEmployee: {
                 findFirst: jest.fn().mockResolvedValue({ id: 'emp-manager', businessProfileId: 'biz-1' }),
             },
@@ -35,6 +38,9 @@ describe('TimeOffService approval mutations', () => {
             user: {
                 findUnique: jest.fn().mockResolvedValue({ role: 'USER' }),
             },
+            businessProfile: {
+                findUnique: jest.fn().mockResolvedValue({ userId: 12345 }),
+            },
             businessEmployee: {
                 findFirst: jest.fn().mockResolvedValue({ id: 'emp-1', businessProfileId: 'biz-1' }),
             },
@@ -52,6 +58,9 @@ describe('TimeOffService approval mutations', () => {
             user: {
                 findUnique: jest.fn().mockResolvedValue({ role: 'USER' }),
             },
+            businessProfile: {
+                findUnique: jest.fn().mockResolvedValue({ userId: 12345 }),
+            },
             businessEmployee: {
                 findFirst: jest.fn().mockResolvedValue(null),
             },
@@ -68,6 +77,9 @@ describe('TimeOffService approval mutations', () => {
         const prisma = {
             user: {
                 findUnique: jest.fn().mockResolvedValue({ role: 'MANAGER' }),
+            },
+            businessProfile: {
+                findUnique: jest.fn().mockResolvedValue({ userId: 12345 }),
             },
             businessEmployee: {
                 findFirst: jest.fn().mockResolvedValue({ id: 'emp-manager', businessProfileId: 'biz-7' }),
@@ -93,6 +105,9 @@ describe('TimeOffService approval mutations', () => {
         const prisma = {
             user: {
                 findUnique: jest.fn().mockResolvedValue({ role: 'MANAGER' }),
+            },
+            businessProfile: {
+                findUnique: jest.fn().mockResolvedValue({ userId: 12345 }),
             },
             businessEmployee: {
                 findFirst: jest.fn().mockResolvedValue({ id: 'emp-manager', businessProfileId: 'biz-3' }),
