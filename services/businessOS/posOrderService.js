@@ -19,9 +19,6 @@ class PosOrderService {
         if (!businessProfileId) throw new Error('Business context required.');
         if (!actorId) throw new Error('Authentication required.');
 
-        // Idempotency is checked before catalog validation so a legitimate
-        // offline replay survives catalog changes. Tenant ownership of the key
-        // is still enforced at the read and transaction boundaries.
         const existing = await this._findIdempotentOrder(businessProfileId, idempotencyKey);
         if (existing) {
             return {
@@ -54,6 +51,11 @@ class PosOrderService {
         if (!Number.isFinite(cash) || cash < 0) throw new Error('Invalid cash amount.');
         if (!Number.isFinite(requestedAzm) || requestedAzm < 0) throw new Error('Invalid AZM amount.');
 
+        const requestedCustomerId = customerId == null ? null : Number(customerId);
+        if (requestedCustomerId != null && (!Number.isInteger(requestedCustomerId) || requestedCustomerId < 1)) {
+            throw new Error('Invalid customerId.');
+        }
+
         const orderRef = `POS-${Date.now().toString(36).toUpperCase()}-${Math.random().toString(36).slice(2, 7).toUpperCase()}`;
 
         for (let attempt = 0; attempt < SERIALIZABLE_RETRY_LIMIT; attempt += 1) {
@@ -69,11 +71,9 @@ class PosOrderService {
                         }
                     }
 
-                    // Catalog truth is deliberately loaded inside the same
-                    // Serializable transaction as inventory/payment/order writes.
-                    // This prevents a product being changed or disabled between a
-                    // pre-transaction quote and settlement.
-                    const computed = await this._priceItems(tx, businessProfileId, normalizedItems);
+                    await this._validateOrderContext(tx, businessProfileId, locationId, tableId);
+
+                    const computed = await this._priceItems(tx, businessProfileId, normalizedItems, locationId);
                     const computedTax = computed.subtotal * 0.025;
                     const computedGrand = computed.subtotal + computedTax;
 
@@ -93,9 +93,6 @@ class PosOrderService {
                         cashChange = Math.max(0, cash - (computedGrand - azmPortion));
                     }
 
-                    // Re-check stock inside the same Serializable transaction that
-                    // creates the order and financial entries. This closes the race
-                    // between catalog pricing and inventory consumption.
                     await this._consumeInventory(tx, businessProfileId, computed.items);
 
                     if (azmPortion > 0) {
@@ -121,7 +118,12 @@ class PosOrderService {
                         });
                     }
 
-                    const effectiveCustomerId = pm === 'CASH' ? (customerId || actorId) : actorId;
+                    const effectiveCustomerId = pm === 'CASH' ? (requestedCustomerId || actorId) : actorId;
+                    if (pm === 'CASH' && requestedCustomerId) {
+                        const customer = await tx.user.findUnique({ where: { id: requestedCustomerId }, select: { id: true } });
+                        if (!customer) throw new Error('Customer not found.');
+                    }
+
                     const order = await tx.businessOrder.create({
                         data: {
                             businessProfileId,
@@ -183,12 +185,7 @@ class PosOrderService {
                     };
                 }, { isolationLevel: 'Serializable' });
 
-                logger.info({
-                    businessProfileId,
-                    actorId,
-                    orderId: result.order.id,
-                    duplicate: result.duplicate,
-                }, '[POS] order settled atomically');
+                logger.info({ businessProfileId, actorId, orderId: result.order.id, duplicate: result.duplicate }, '[POS] order settled atomically');
 
                 if (result.duplicate) {
                     return {
@@ -214,7 +211,6 @@ class PosOrderService {
                         };
                     }
                 }
-
                 if (!isSerializableConflict(error) || attempt === SERIALIZABLE_RETRY_LIMIT - 1) throw error;
                 await waitForRetry(attempt);
             }
@@ -233,25 +229,37 @@ class PosOrderService {
         return existing;
     }
 
-    async _priceItems(tx, businessProfileId, items) {
+    async _validateOrderContext(tx, businessProfileId, locationId, tableId) {
+        if (tableId && !locationId) throw new Error('tableId requires locationId.');
+        if (locationId) {
+            const location = await tx.businessLocation.findFirst({
+                where: { id: locationId, businessProfileId, isActive: true },
+                select: { id: true },
+            });
+            if (!location) throw new Error('Invalid or inactive business location.');
+        }
+        if (tableId) {
+            const table = await tx.businessTable.findFirst({
+                where: { id: tableId, locationId, isActive: true },
+                select: { id: true },
+            });
+            if (!table) throw new Error('Invalid or inactive business table for location.');
+        }
+    }
+
+    async _priceItems(tx, businessProfileId, items, locationId) {
         let subtotal = 0;
         const priced = [];
         for (const item of items) {
+            const where = { id: item.productId, businessProfileId, isActive: true, isAvailable: true };
+            if (locationId) where.OR = [{ locationId: null }, { locationId }];
             const product = await tx.businessProduct.findFirst({
-                where: {
-                    id: item.productId,
-                    businessProfileId,
-                    isActive: true,
-                    isAvailable: true,
-                },
+                where,
                 select: { id: true, name: true, priceUsdc: true, stockQty: true },
             });
-            if (!product) throw new Error(`Invalid or unavailable product: ${item.productId}`);
-
+            if (!product) throw new Error(`Invalid, unavailable, or out-of-location product: ${item.productId}`);
             const price = Number(product.priceUsdc);
-            if (!Number.isFinite(price) || price <= 0) {
-                throw new Error(`Invalid catalog price for product: ${product.name}`);
-            }
+            if (!Number.isFinite(price) || price <= 0) throw new Error(`Invalid catalog price for product: ${product.name}`);
             subtotal += price * item.quantity;
             priced.push({ ...item, name: product.name, unitPrice: price, trackedStockQty: product.stockQty });
         }
@@ -259,29 +267,16 @@ class PosOrderService {
     }
 
     async _consumeInventory(tx, businessProfileId, items) {
-        // Retail/stocked products use BusinessProduct.stockQty. A null value
-        // means inventory is not tracked for that product and must not block sale.
         for (const item of items) {
             if (item.trackedStockQty != null) {
                 const result = await tx.businessProduct.updateMany({
-                    where: {
-                        id: item.productId,
-                        businessProfileId,
-                        isActive: true,
-                        isAvailable: true,
-                        stockQty: { gte: item.quantity },
-                    },
+                    where: { id: item.productId, businessProfileId, isActive: true, isAvailable: true, stockQty: { gte: item.quantity } },
                     data: { stockQty: { decrement: item.quantity } },
                 });
-                if (result.count !== 1) {
-                    throw new Error(`Insufficient stock for product: ${item.name}`);
-                }
+                if (result.count !== 1) throw new Error(`Insufficient stock for product: ${item.name}`);
             }
         }
 
-        // Restaurant products can consume ingredients rather than a simple
-        // product stock count. Aggregate product quantities first so duplicate
-        // order lines cannot under-consume their shared recipe ingredients.
         const recipes = await tx.recipeIngredient.findMany({
             where: { productId: { in: items.map((item) => item.productId) } },
             select: { productId: true, inventoryItemId: true, quantityRequired: true },
@@ -289,39 +284,23 @@ class PosOrderService {
         if (recipes.length === 0) return;
 
         const quantityByProduct = new Map();
-        for (const item of items) {
-            quantityByProduct.set(
-                item.productId,
-                (quantityByProduct.get(item.productId) || 0) + item.quantity,
-            );
-        }
+        for (const item of items) quantityByProduct.set(item.productId, (quantityByProduct.get(item.productId) || 0) + item.quantity);
+
         const requiredByInventory = new Map();
         for (const recipe of recipes) {
             const productQty = quantityByProduct.get(recipe.productId) || 0;
             const required = Number(recipe.quantityRequired) * productQty;
-            if (!Number.isFinite(required) || required < 0) {
-                throw new Error(`Invalid recipe quantity for product: ${recipe.productId}`);
-            }
-            requiredByInventory.set(
-                recipe.inventoryItemId,
-                (requiredByInventory.get(recipe.inventoryItemId) || 0) + required,
-            );
+            if (!Number.isFinite(required) || required < 0) throw new Error(`Invalid recipe quantity for product: ${recipe.productId}`);
+            requiredByInventory.set(recipe.inventoryItemId, (requiredByInventory.get(recipe.inventoryItemId) || 0) + required);
         }
 
         for (const [inventoryItemId, required] of requiredByInventory.entries()) {
             if (required === 0) continue;
             const result = await tx.inventoryItem.updateMany({
-                where: {
-                    id: inventoryItemId,
-                    businessProfileId,
-                    isActive: true,
-                    currentStock: { gte: required },
-                },
+                where: { id: inventoryItemId, businessProfileId, isActive: true, currentStock: { gte: required } },
                 data: { currentStock: { decrement: required } },
             });
-            if (result.count !== 1) {
-                throw new Error(`Insufficient ingredient stock: ${inventoryItemId}`);
-            }
+            if (result.count !== 1) throw new Error(`Insufficient ingredient stock: ${inventoryItemId}`);
         }
     }
 }
