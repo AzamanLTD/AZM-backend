@@ -1,11 +1,30 @@
 'use strict';
 
+const crypto = require('crypto');
 const logger = require('../../src/config/logger');
 
 const SERIALIZABLE_RETRY_LIMIT = 3;
 const SERIALIZABLE_BACKOFF_MS = 10;
 const isSerializableConflict = (error) => error?.code === 'P2034';
 const waitForRetry = (attempt) => new Promise((resolve) => setTimeout(resolve, SERIALIZABLE_BACKOFF_MS * (2 ** attempt)));
+
+function buildIdempotencyFingerprint({ businessProfileId, actorId, normalizedItems, paymentMethod, cash, requestedAzm, source, locationId, tableId, requestedCustomerId }) {
+    const canonical = {
+        businessProfileId: String(businessProfileId),
+        actorId: Number(actorId),
+        items: [...normalizedItems]
+            .map(({ productId, quantity }) => ({ productId: String(productId), quantity: Number(quantity) }))
+            .sort((a, b) => a.productId.localeCompare(b.productId) || a.quantity - b.quantity),
+        paymentMethod,
+        cash,
+        requestedAzm,
+        source: source ?? null,
+        locationId: locationId ?? null,
+        tableId: tableId ?? null,
+        customerId: requestedCustomerId ?? null,
+    };
+    return crypto.createHash('sha256').update(JSON.stringify(canonical)).digest('hex');
+}
 
 class PosOrderService {
     constructor(prisma) { this.prisma = prisma; }
@@ -17,9 +36,6 @@ class PosOrderService {
         } = args;
         if (!businessProfileId) throw new Error('Business context required.');
         if (!actorId) throw new Error('Authentication required.');
-
-        const existing = await this._findIdempotentOrder(businessProfileId, idempotencyKey);
-        if (existing) return { order: existing, duplicate: true, computedSubtotal: null, computedTax: null, computedGrand: Number(existing.amountUsdc || 0), change: Number(existing.cashChange || 0) };
         if (!Array.isArray(items) || items.length === 0) throw new Error('Items are required.');
 
         const pm = String(paymentMethod || 'CASH').toUpperCase();
@@ -35,19 +51,23 @@ class PosOrderService {
 
         const requestedCustomerId = customerId == null ? null : Number(customerId);
         if (requestedCustomerId != null && (!Number.isInteger(requestedCustomerId) || requestedCustomerId < 1)) throw new Error('Invalid customerId.');
-        const orderRef = `POS-${Date.now().toString(36).toUpperCase()}-${Math.random().toString(36).slice(2, 7).toUpperCase()}`;
+        const idempotencyFingerprint = idempotencyKey
+            ? buildIdempotencyFingerprint({
+                businessProfileId, actorId, normalizedItems, paymentMethod: pm,
+                cash, requestedAzm, source, locationId, tableId, requestedCustomerId,
+            })
+            : null;
+        const existing = await this._findIdempotentOrder(businessProfileId, idempotencyKey, idempotencyFingerprint);
+        if (existing) return { order: existing, duplicate: true, computedSubtotal: null, computedTax: null, computedGrand: Number(existing.amountUsdc || 0), change: Number(existing.cashChange || 0) };
 
+        const orderRef = `POS-${Date.now().toString(36).toUpperCase()}-${Math.random().toString(36).slice(2, 7).toUpperCase()}`;
         for (let attempt = 0; attempt < SERIALIZABLE_RETRY_LIMIT; attempt += 1) {
             try {
                 const result = await this.prisma.$transaction(async (tx) => {
                     if (idempotencyKey) {
-                        const txExisting = await tx.businessOrder.findFirst({ where: { idempotencyKey } });
-                        if (txExisting) {
-                            if (txExisting.businessProfileId !== businessProfileId) throw new Error('Idempotency key already belongs to another business.');
-                            return { order: txExisting, duplicate: true };
-                        }
+                        const txExisting = await this._findIdempotentOrder(businessProfileId, idempotencyKey, idempotencyFingerprint, tx);
+                        if (txExisting) return { order: txExisting, duplicate: true };
                     }
-
                     await this._validateOrderContext(tx, businessProfileId, locationId, tableId);
                     const computed = await this._priceItems(tx, businessProfileId, normalizedItems, locationId);
                     const computedTax = computed.subtotal * 0.025;
@@ -68,7 +88,6 @@ class PosOrderService {
                     }
 
                     await this._consumeInventory(tx, businessProfileId, computed.items);
-
                     if (azmPortion > 0) {
                         const debit = await tx.user.updateMany({ where: { id: actorId, azmBalance: { gte: azmPortion } }, data: { azmBalance: { decrement: azmPortion } } });
                         if (debit.count !== 1) throw new Error('Insufficient AZM balance.');
@@ -81,30 +100,25 @@ class PosOrderService {
                         const customer = await tx.user.findUnique({ where: { id: requestedCustomerId }, select: { id: true } });
                         if (!customer) throw new Error('Customer not found.');
                     }
-
                     const order = await tx.businessOrder.create({ data: {
                         businessProfileId, customerId: effectiveCustomerId, status: 'COMPLETED', orderRef,
                         title: `POS Sale (${pm})`, amountUsdc: computedGrand, paymentMethod: pm, idempotencyKey,
                         cashReceived: cash || null, cashChange: cashChange || null, completedAt: new Date(),
                     } });
-
                     if (tx.businessOrderItem?.createMany) await tx.businessOrderItem.createMany({ data: computed.items.map((item) => ({ orderId: order.id, productId: item.productId, name: item.name, unitPrice: item.unitPrice, quantity: item.quantity, lineTotal: item.unitPrice * item.quantity })) });
-
                     await tx.businessLedgerEntry.create({ data: {
                         businessProfileId, type: 'INCOME', category: 'SALES', description: `POS Sale (${orderRef} - ${pm})`, amount: computedGrand,
                         sourceType: 'POS_SALE', sourceId: order.id,
-                        metadata: { orderRef, paymentMethod: pm, subtotal: computed.subtotal, tax: computedTax, items: normalizedItems.length, locationId, tableId, azmPortion },
+                        metadata: { orderRef, paymentMethod: pm, subtotal: computed.subtotal, tax: computedTax, items: normalizedItems.length, locationId, tableId, azmPortion, ...(idempotencyFingerprint ? { posIdempotencyFingerprint: idempotencyFingerprint } : {}) },
                     } });
-
                     return { order, duplicate: false, computedSubtotal: computed.subtotal, computedTax, computedGrand, change: cashChange };
                 }, { isolationLevel: 'Serializable' });
-
                 logger.info({ businessProfileId, actorId, orderId: result.order.id, duplicate: result.duplicate }, '[POS] order settled atomically');
                 if (result.duplicate) return { ...result, computedSubtotal: null, computedTax: null, computedGrand: Number(result.order.amountUsdc || 0), change: Number(result.order.cashChange || 0) };
                 return result;
             } catch (error) {
                 if (error?.code === 'P2002' && idempotencyKey) {
-                    const replay = await this._findIdempotentOrder(businessProfileId, idempotencyKey);
+                    const replay = await this._findIdempotentOrder(businessProfileId, idempotencyKey, idempotencyFingerprint);
                     if (replay) return { order: replay, duplicate: true, computedSubtotal: null, computedTax: null, computedGrand: Number(replay.amountUsdc || 0), change: Number(replay.cashChange || 0) };
                 }
                 if (!isSerializableConflict(error) || attempt === SERIALIZABLE_RETRY_LIMIT - 1) throw error;
@@ -114,11 +128,21 @@ class PosOrderService {
         throw new Error('Could not settle POS order after retries.');
     }
 
-    async _findIdempotentOrder(businessProfileId, idempotencyKey) {
+    async _findIdempotentOrder(businessProfileId, idempotencyKey, fingerprint = null, client = this.prisma) {
         if (!idempotencyKey) return null;
-        const existing = await this.prisma.businessOrder.findFirst({ where: { idempotencyKey } });
+        const existing = await client.businessOrder.findFirst({ where: { idempotencyKey } });
         if (!existing) return null;
         if (existing.businessProfileId !== businessProfileId) throw new Error('Idempotency key already belongs to another business.');
+        // Legacy rows may not have a fingerprint; preserve their safe replay semantics.
+        // New POS rows store the fingerprint in the atomic POS ledger entry.
+        if (fingerprint && client.businessLedgerEntry?.findFirst) {
+            const ledger = await client.businessLedgerEntry.findFirst({
+                where: { sourceType: 'POS_SALE', sourceId: existing.id },
+                select: { metadata: true },
+            });
+            const storedFingerprint = ledger?.metadata?.posIdempotencyFingerprint;
+            if (storedFingerprint && storedFingerprint !== fingerprint) throw new Error('Idempotency key already used for a different POS request.');
+        }
         return existing;
     }
 
@@ -142,9 +166,7 @@ class PosOrderService {
             if (locationId) where.OR = [{ locationId: null }, { locationId }];
             const product = await tx.businessProduct.findFirst({ where, select: { id: true, name: true, priceUsdc: true, stockQty: true } });
             if (!product) {
-                throw new Error(locationId
-                    ? `Invalid, unavailable, or out-of-location product: ${item.productId}`
-                    : `Invalid or unavailable product: ${item.productId}`);
+                throw new Error(locationId ? `Invalid, unavailable, or out-of-location product: ${item.productId}` : `Invalid or unavailable product: ${item.productId}`);
             }
             const price = Number(product.priceUsdc);
             if (!Number.isFinite(price) || price <= 0) throw new Error(`Invalid catalog price for product: ${product.name}`);
