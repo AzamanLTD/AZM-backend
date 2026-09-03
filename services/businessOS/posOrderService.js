@@ -106,7 +106,6 @@ class PosOrderService {
                             category: 'SALES',
                             description: `POS Sale (${orderRef} - ${pm})`,
                             amount: computedGrand,
-                            amountGhs: computedGrand,
                             sourceType: 'POS_SALE',
                             sourceId: order.id,
                             metadata: { orderRef, paymentMethod: pm, items: normalizedItems.length, locationId, tableId, azmPortion },
