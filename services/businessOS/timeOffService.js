@@ -36,7 +36,15 @@ class TimeOffService {
             where: { id: Number(approverId) },
             select: { role: true },
         });
-        if (approver?.role === 'ADMIN') return { isAdmin: true, employee: null };
+        if (approver?.role === 'ADMIN') return { isAdmin: true, isOwner: false, employee: null };
+
+        const businessProfile = await this.prisma.businessProfile.findUnique({
+            where: { id: request.businessProfileId },
+            select: { userId: true },
+        });
+        if (businessProfile?.userId === Number(approverId)) {
+            return { isAdmin: false, isOwner: true, employee: null };
+        }
 
         const employee = await this.prisma.businessEmployee.findFirst({
             where: {
@@ -49,7 +57,7 @@ class TimeOffService {
         if (!employee) {
             throw new Error('You are not authorized to resolve this business time-off request.');
         }
-        return { isAdmin: false, employee };
+        return { isAdmin: false, isOwner: false, employee };
     }
 
     async approveTimeOff(requestId, approverId, managerNote) {
@@ -61,7 +69,7 @@ class TimeOffService {
         if (request.status !== 'PENDING') throw new Error('Request is no longer pending.');
 
         const scope = await this._resolveApprovalScope(approverId, request);
-        if (!scope.isAdmin && scope.employee.id === request.employeeId) {
+        if (scope.employee?.id === request.employeeId) {
             throw new Error('Employees cannot approve their own time-off request.');
         }
 
@@ -90,7 +98,7 @@ class TimeOffService {
         if (request.status !== 'PENDING') throw new Error('Request is no longer pending.');
 
         const scope = await this._resolveApprovalScope(approverId, request);
-        if (!scope.isAdmin && scope.employee.id === request.employeeId) {
+        if (scope.employee?.id === request.employeeId) {
             throw new Error('Employees cannot reject their own time-off request.');
         }
 
