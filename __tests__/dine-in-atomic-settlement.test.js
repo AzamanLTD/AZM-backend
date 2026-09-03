@@ -14,10 +14,12 @@ const makePrisma = () => ({
   dineInTab: {
     findUnique: jest.fn(),
     update: jest.fn(),
+    updateMany: jest.fn().mockResolvedValue({ count: 1 }),
   },
   $transaction: jest.fn(async (callback) => callback({
     dineInTab: {
-      update: jest.fn().mockResolvedValue({ id: 'tab-1', status: 'CLOSED', invoice: { id: 'inv-1' }, items: [] }),
+      updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+      findUnique: jest.fn().mockResolvedValue({ id: 'tab-1', status: 'CLOSED', invoice: { id: 'inv-1' }, items: [] }),
     },
     businessInvoice: {},
     user: {},

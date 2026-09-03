@@ -111,29 +111,45 @@ class DineInService {
         // the SENT invoice and FINALIZED tab intact and safely retryable.
         if (!invoice) {
             if (!tab.items.length) throw new Error('Cannot pay an empty dine-in tab.');
-            invoice = await invoiceService.createInvoice(this.prisma, {
-                businessProfileId: tab.businessProfileId,
-                customerId: tab.customerId,
-                locationId: tab.locationId,
-                tableId: tab.tableId,
-                lineItems: tab.items.map(item => ({ description: item.name, quantity: item.quantity, unitPrice: Number(item.unitPriceUsdc) })),
-                taxLines: [],
-                businessNote: 'Dine-in tab settlement',
+            const idempotencyKey = `DINE_IN_TAB:${tabId}`;
+            try {
+                invoice = await invoiceService.createInvoice(this.prisma, {
+                    businessProfileId: tab.businessProfileId, customerId: tab.customerId,
+                    locationId: tab.locationId, tableId: tab.tableId,
+                    lineItems: tab.items.map(item => ({ description: item.name, quantity: item.quantity, unitPrice: Number(item.unitPriceUsdc) })),
+                    taxLines: [], businessNote: 'Dine-in tab settlement', idempotencyKey,
+                });
+            } catch (error) {
+                if (error?.code !== 'P2002') throw error;
+                invoice = await this.prisma.businessInvoice.findUnique({ where: { idempotencyKey } });
+                if (!invoice) throw error;
+            }
+            await this.prisma.dineInTab.updateMany({
+                where: { id: tabId, invoiceId: null }, data: { invoiceId: invoice.id },
             });
-            invoice = await invoiceService.sendInvoice(this.prisma, { invoiceId: invoice.id, businessProfileId: tab.businessProfileId });
-            tab = await this.prisma.dineInTab.update({ where: { id: tabId }, data: { invoiceId: invoice.id }, include: { items: true, invoice: true } });
+            tab = await this.prisma.dineInTab.findUnique({ where: { id: tabId }, include: { items: true, invoice: true } });
+            invoice = tab.invoice;
         } else if (invoice.status === 'DRAFT') {
-            invoice = await invoiceService.sendInvoice(this.prisma, { invoiceId: invoice.id, businessProfileId: tab.businessProfileId });
+            // Another concurrent request may send the same canonical invoice;
+            // re-read its durable state rather than treating that as failure.
+            try { invoice = await invoiceService.sendInvoice(this.prisma, { invoiceId: invoice.id, businessProfileId: tab.businessProfileId }); }
+            catch (error) {
+                invoice = await this.prisma.businessInvoice.findUnique({ where: { id: invoice.id } });
+                if (!invoice || invoice.status === 'DRAFT') throw error;
+            }
         }
+
+        if (invoice.status === 'DRAFT') invoice = await invoiceService.sendInvoice(this.prisma, { invoiceId: invoice.id, businessProfileId: tab.businessProfileId });
 
         const settlement = await this.prisma.$transaction(async (tx) => {
             const scopedPrisma = transactionScopedPrisma(this.prisma, tx);
             const payment = await invoiceService.payInvoice(scopedPrisma, { invoiceId: invoice.id, customerId, tipUsdc });
-            const tip = Math.max(0, Number(tipUsdc) || 0);
-            const billTotal = Number(payment.invoice?.billTotalUsdc ?? invoice.billTotalUsdc);
+            const settledInvoice = payment.invoice;
+            const tip = Math.max(0, Number(settledInvoice?.tipUsdc ?? invoice.tipUsdc) || 0);
+            const billTotal = Number(settledInvoice?.billTotalUsdc ?? invoice.billTotalUsdc);
             const grandTotal = billTotal + tip;
-            const closed = await tx.dineInTab.update({
-                where: { id: tabId },
+            await tx.dineInTab.updateMany({
+                where: { id: tabId, status: 'FINALIZED', invoiceId: invoice.id },
                 data: {
                     status: 'CLOSED',
                     closedAt: new Date(),
@@ -141,8 +157,8 @@ class DineInService {
                     grandTotalUsdc: grandTotal,
                     paymentMethod: 'AZAMAN_BALANCE',
                 },
-                include: { items: true, invoice: true },
             });
+            const closed = await tx.dineInTab.findUnique({ where: { id: tabId }, include: { items: true, invoice: true } });
             return { closed, payment };
         });
 
