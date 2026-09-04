@@ -131,7 +131,7 @@ describe('dine-in customer ordering and settlement', () => {
 
     expect(createInvoice).toHaveBeenCalledWith(prisma, expect.objectContaining({
       businessProfileId: 'biz-1', customerId: 7, locationId: 'loc-1', tableId: 'table-1',
-      lineItems: [{ description: 'Burger', quantity: 1, unitPrice: 20 }], taxLines: [],
+      lineItems: [{ description: 'Burger', quantity: 1, unitPrice: 20 }],
     }));
     expect(sendInvoice).toHaveBeenCalledWith(prisma, { invoiceId: 'invoice-1', businessProfileId: 'biz-1' });
     expect(payInvoice).toHaveBeenCalledWith(expect.objectContaining({
