@@ -40,7 +40,7 @@ describe('PosOrderService atomic settlement', () => {
 
         expect(result.computedGrand).toBe(41);
         expect(tx.businessProduct.findFirst).toHaveBeenCalledWith(expect.objectContaining({
-            where: { id: 'prod-1', businessProfileId: 'biz-1', isActive: true, isAvailable: true },
+            where: { id: 'prod-1', businessProfileId: 'biz-1', isActive: true, isAvailable: true, locationId: null },
         }));
         expect(tx.user.updateMany).toHaveBeenCalledWith({
             where: { id: 7, azmBalance: { gte: 41 } },
@@ -68,7 +68,7 @@ describe('PosOrderService atomic settlement', () => {
 
         await expect(new PosOrderService(prisma).createOrder({
             businessProfileId: 'biz-1', actorId: 7, items: [{ productId: 'prod-1', quantity: 1 }], paymentMethod: 'CASH', cashGiven: 25, idempotencyKey: 'catalog-race-1',
-        })).rejects.toThrow('Invalid or unavailable product: prod-1');
+        })).rejects.toThrow('Invalid or unavailable global product: prod-1');
         expect(prisma.businessProduct.findFirst).not.toHaveBeenCalled();
         expect(tx.businessOrder.create).not.toHaveBeenCalled();
     });
