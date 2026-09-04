@@ -24,8 +24,12 @@ const extractKotaniRate = (payload) => {
         if (rate) return rate;
     }
 
-    const cryptoAmount = asFinitePositive(payload?.cryptoAmount ?? payload?.data?.cryptoAmount ?? payload?.result?.cryptoAmount);
-    const fiatAmount = asFinitePositive(payload?.fiatAmount ?? payload?.data?.fiatAmount ?? payload?.result?.fiatAmount);
+    const cryptoAmount = asFinitePositive(
+        payload?.cryptoAmount ?? payload?.data?.cryptoAmount ?? payload?.result?.cryptoAmount
+    );
+    const fiatAmount = asFinitePositive(
+        payload?.fiatAmount ?? payload?.data?.fiatAmount ?? payload?.result?.fiatAmount
+    );
     if (cryptoAmount && fiatAmount) return fiatAmount / cryptoAmount;
 
     return null;
@@ -46,14 +50,18 @@ class OracleService {
 
     async fetchKotaniUsdcToGhsRate() {
         const provider = String(process.env.KOTANI_PROVIDER || 'MOCK').toUpperCase();
-        const apiKey = process.env.KOTANI_API_KEY;
-        if (provider !== 'LIVE' || !apiKey || apiKey === 'mock-key') return null;
+        const token = process.env.KOTANI_API_TOKEN || process.env.KOTANI_API_KEY;
+        if (provider !== 'LIVE' || !token || token === 'mock-key') return null;
 
         const baseUrl = String(process.env.KOTANI_API_BASE_URL || KOTANI_DEFAULT_BASE_URL).replace(/\/$/, '');
         const from = process.env.KOTANI_RATE_FROM || 'USDC';
         const to = process.env.KOTANI_RATE_TO || 'CGHS';
-        const response = await axios.get(`${baseUrl}/rate/${encodeURIComponent(from)}/${encodeURIComponent(to)}`, {
-            headers: { Authorization: `Bearer ${apiKey}` },
+        const response = await axios.post(`${baseUrl}/rate/offramp`, {
+            from,
+            to,
+            cryptoAmount: 1,
+        }, {
+            headers: { Authorization: `Bearer ${token}` },
             timeout: 8000,
         });
         const rate = extractKotaniRate(response.data);
@@ -115,7 +123,7 @@ class OracleService {
             if (this.rateAlertService && usdToGhsRate) {
                 setImmediate(() => {
                     this.rateAlertService.checkAlerts(usdToGhsRate, 'USD_GHS')
-                        .catch(err => logger.error({ err: err }, '[Oracle] alert check error'));
+                        .catch(err => logger.error({ err }, '[Oracle] alert check error'));
                 });
             }
         } catch (error) {
