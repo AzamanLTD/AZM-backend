@@ -80,6 +80,29 @@ describe('DineInService context boundaries', () => {
     });
   });
 
+  test('legacy locationless tabs can only use global products', async () => {
+    const prisma = {
+      dineInTab: {
+        findUnique: jest.fn().mockResolvedValue({
+          id: 'tab-legacy', businessProfileId: 'biz-1', locationId: null, customerId: 7, status: 'OPEN',
+        }),
+      },
+      businessProduct: { findFirst: jest.fn().mockResolvedValue(null) },
+    };
+
+    await expect(new DineInService(prisma).addItem({
+      tabId: 'tab-legacy', productId: 'branch-prod', name: 'Branch meal', price: 10, quantity: 1, addedBy: 42,
+    })).rejects.toThrow('Product is unavailable for this restaurant/location.');
+
+    expect(prisma.businessProduct.findFirst).toHaveBeenCalledWith({
+      where: {
+        id: 'branch-prod', businessProfileId: 'biz-1', isActive: true, isAvailable: true,
+        locationId: null,
+      },
+      select: { id: true, name: true, priceUsdc: true },
+    });
+  });
+
   test('customer item pricing uses the same branch/global product boundary', async () => {
     const prisma = {
       dineInTab: {
