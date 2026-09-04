@@ -13,6 +13,10 @@
 const financeService = require('./finance.service');
 const { recordProviderSettlementAttempt } = require('./providerSettlementAttemptService');
 
+// Provider references are mutable only while a withdrawal is still in its
+// reservation lifecycle. Once a terminal state has a provider reference, a
+// later callback must never overwrite it: contradictory callbacks are evidence
+// to retain, not an instruction to rewrite the authoritative settlement record.
 const enrichProviderReference = async (prisma, reference, currentTransaction, providerTxId) => {
     if (!providerTxId || currentTransaction?.providerRef) return currentTransaction;
 
@@ -64,24 +68,33 @@ const settleFiatWithdrawal = async (prisma, {
     });
 
     if (status === 'SUCCESSFUL') {
+        // The finance service owns the authoritative PENDING -> COMPLETED
+        // transition and its economics. For an already-COMPLETED record, the
+        // call is intentionally a no-op; a missing provider reference can then
+        // be filled once, without touching balances or economics. For a FAILED
+        // terminal record, do not mutate the stored provider reference even if
+        // it is absent: the late SUCCESS is contradictory evidence and must not
+        // turn into a new authoritative provider identity.
         const result = await financeService.completeFiatWithdrawal(prisma, reference, {
             providerTxId
         });
 
-        // A SUCCESSFUL callback may be a duplicate for a row that was already
-        // completed by an earlier callback/reconciliation. In that case the
-        // economics boundary correctly does nothing; we can still persist the
-        // provider transaction reference as harmless idempotent metadata.
-        const transaction = await enrichProviderReference(
-            prisma,
-            reference,
-            result.transaction,
-            providerTxId
-        );
+        let transaction = result.transaction;
+        if (original.status === 'COMPLETED') {
+            transaction = await enrichProviderReference(
+                prisma,
+                reference,
+                result.transaction,
+                providerTxId
+            );
+        }
 
         return {
             ...result,
-            providerTxId: transaction?.providerRef || result.providerTxId || providerTxId || null,
+            // Preserve the callback's providerTxId for the settlement-attempt
+            // result. The transaction row itself remains authoritative and is
+            // never overwritten once terminal.
+            providerTxId: providerTxId || result.providerTxId || transaction?.providerRef || null,
             transaction
         };
     }
@@ -90,55 +103,37 @@ const settleFiatWithdrawal = async (prisma, {
     // reversal. This prevents a contradictory late FAILED callback from
     // refunding a withdrawal that has already been authoritatively completed.
     if (original.status === 'FAILED') {
-        const transaction = await enrichProviderReference(
-            prisma,
-            reference,
-            original,
-            providerTxId
-        );
         return {
             reference,
             userId: original.userId,
             status: 'FAILED',
             changed: false,
             alreadyReversed: true,
-            providerTxId: transaction?.providerRef || providerTxId || null,
-            transaction
+            providerTxId: providerTxId || original.providerRef || null,
+            transaction: original
         };
     }
 
     if (original.status === 'COMPLETED') {
-        const transaction = await enrichProviderReference(
-            prisma,
-            reference,
-            original,
-            providerTxId
-        );
         return {
             reference,
             userId: original.userId,
             status: 'COMPLETED',
             changed: false,
             conflictingTerminalCallback: true,
-            providerTxId: transaction?.providerRef || providerTxId || null,
-            transaction
+            providerTxId: providerTxId || original.providerRef || null,
+            transaction: original
         };
     }
 
     if (original.status !== 'PENDING') {
-        const transaction = await enrichProviderReference(
-            prisma,
-            reference,
-            original,
-            providerTxId
-        );
         return {
             reference,
             userId: original.userId,
             status: original.status,
             changed: false,
-            providerTxId: transaction?.providerRef || providerTxId || null,
-            transaction
+            providerTxId: providerTxId || original.providerRef || null,
+            transaction: original
         };
     }
 
