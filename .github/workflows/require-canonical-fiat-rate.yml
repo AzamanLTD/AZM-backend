@@ -1,0 +1,53 @@
+name: Prepare canonical fiat payout rate guard
+on:
+  push:
+    branches: [fix/fiat-payout-require-canonical-retail-rate]
+permissions:
+  contents: write
+jobs:
+  patch:
+    if: ${{ github.actor == 'pyraxxz' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Patch finance service
+        shell: bash
+        run: |
+          python - <<'PY'
+          import re
+          from pathlib import Path
+          p=Path('services/finance.service.js')
+          s=p.read_text()
+          pattern=r"const _resolveFiatRetailRate = \(settings, opts = \{\}\) => \{.*?^\};"
+          replacement='''const _resolveFiatRetailRate = (settings, opts = {}) => {\n    const explicit = Number(opts.retailRate);\n    if (Number.isFinite(explicit) && explicit > 0) return explicit;\n\n    // Fiat payout amounts are customer-facing GHS values. They must be priced\n    // from the canonical USDC/GHS retail snapshot, never from legacy USD/GHS.\n    const canonical = Number(settings?.liveRetailRate);\n    return Number.isFinite(canonical) && canonical > 0 ? canonical : 0;\n};'''
+          s2,n=re.subn(pattern,replacement,s,count=1,flags=re.S|re.M)
+          if n != 1: raise SystemExit(f'expected one retail-rate resolver, found {n}')
+          p.write_text(s2)
+          t=Path('__tests__/financeCanonicalFiatRate.contract.test.js')
+          t.write_text(r'''const fs = require('fs');
+const path = require('path');
+
+describe('fiat payout canonical rate contract', () => {
+  test('finance service cannot fall back to legacy USD/GHS for GHS payout pricing', () => {
+    const source = fs.readFileSync(
+      path.join(__dirname, '..', 'services', 'finance.service.js'),
+      'utf8',
+    );
+
+    expect(source).toContain('const canonical = Number(settings?.liveRetailRate);');
+    expect(source).toContain('return Number.isFinite(canonical) && canonical > 0 ? canonical : 0;');
+    expect(source).not.toContain("const compatibility = Number(settings?.liveUsdToGhs);");
+    expect(source).not.toContain('compatibility : 0');
+  });
+});
+''')
+          PY
+      - name: Commit and remove workflow
+        shell: bash
+        run: |
+          rm .github/workflows/require-canonical-fiat-rate.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add services/finance.service.js __tests__/financeCanonicalFiatRate.contract.test.js .github/workflows/require-canonical-fiat-rate.yml
+          git commit -m 'fix(finance): require canonical USDC/GHS rate for fiat payout'
+          git push origin HEAD:${{ github.ref_name }}
