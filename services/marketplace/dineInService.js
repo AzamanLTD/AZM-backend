@@ -229,7 +229,10 @@ class DineInService {
                     businessProfileId: tab.businessProfileId, customerId: tab.customerId,
                     locationId: tab.locationId, tableId: tab.tableId,
                     lineItems: tab.items.map(item => ({ description: item.name, quantity: item.quantity, unitPrice: Number(item.unitPriceUsdc) })),
-                    taxLines: [], businessNote: 'Dine-in tab settlement', idempotencyKey,
+                    // A missing taxLines argument lets the invoice service use the
+                    // business's current default tax preset. Explicit tax-free
+                    // callers can continue to pass taxLines: [].
+                    businessNote: 'Dine-in tab settlement', idempotencyKey,
                 });
             } catch (error) {
                 if (error?.code !== 'P2002') throw error;

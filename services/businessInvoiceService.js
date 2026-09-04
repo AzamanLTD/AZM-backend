@@ -35,9 +35,22 @@ const createInvoice = async (prisma, {
   if (lineItems.length > 50)
     throw new Error('Maximum 50 line items per invoice.');
 
+  // A missing taxLines value means "use the business default preset". An
+  // explicit [] remains authoritative for callers that intentionally request
+  // a tax-free invoice.
+  let effectiveTaxLines = taxLines;
+  if (effectiveTaxLines === undefined) {
+    const defaultPreset = await prisma.businessTaxPreset.findFirst({
+      where: { businessProfileId, isDefault: true },
+      orderBy: { createdAt: 'asc' },
+      select: { name: true, type: true, value: true },
+    });
+    effectiveTaxLines = defaultPreset ? [defaultPreset] : [];
+  }
+
   // Compute subtotal + tax lines (extracted to utils/invoiceMath.js)
   const { subtotal: subtotalUsdc, lineItems: cleanLineItems } = computeLineItems(lineItems);
-  const { taxTotal: taxTotalUsdc, taxLines: cleanTaxLines } = computeTaxLines(taxLines, subtotalUsdc);
+  const { taxTotal: taxTotalUsdc, taxLines: cleanTaxLines } = computeTaxLines(effectiveTaxLines, subtotalUsdc);
   const billTotalUsdc = subtotalUsdc + taxTotalUsdc;
 
   // Validate customer exists
