@@ -9,12 +9,15 @@ const { getRequestContext } = require('../../utils/requestContext');
 
 const SERIALIZABLE_RETRY_LIMIT = 3;
 const SERIALIZABLE_BACKOFF_MS = 10;
+const PAYROLL_SNAPSHOT_TOLERANCE = 0.000001;
 
 const isSerializableConflict = (error) => error?.code === 'P2034';
 
 const waitForSerializableRetry = (attempt) => new Promise((resolve) => {
     setTimeout(resolve, SERIALIZABLE_BACKOFF_MS * (2 ** attempt));
 });
+
+const nearlyEqual = (left, right) => Math.abs(Number(left) - Number(right)) <= PAYROLL_SNAPSHOT_TOLERANCE;
 
 class PayrollService {
     constructor(prisma) { this.prisma = prisma; }
@@ -28,6 +31,95 @@ class PayrollService {
         if (ownedBusiness?.id) return ownedBusiness.id;
         const employee = await this.prisma.businessEmployee.findFirst({ where: { userId: req.user.id, status: 'ACTIVE' }, select: { businessProfileId: true } });
         return employee?.businessProfileId || null;
+    }
+
+    // Re-read the immutable payroll inputs inside the disbursement transaction.
+    // Payroll records are prepared ahead of payment, while clock-out and EWA
+    // mutations can legitimately occur between preparation and settlement. A
+    // stale record must never move money; the caller can regenerate the pending
+    // payroll record from the current period inputs instead.
+    async _getCurrentPayrollSnapshot(tx, payroll) {
+        const period = String(payroll.period || '');
+        const match = /^(\d{4})-(\d{2})$/.exec(period);
+        if (!match) throw new Error(`Invalid payroll period: ${period}`);
+
+        const year = Number(match[1]);
+        const month = Number(match[2]);
+        const periodStart = new Date(year, month - 1, 1);
+        const periodEnd = new Date(year, month, 0, 23, 59, 59);
+        const shifts = await tx.shift.findMany({
+            where: {
+                employeeId: payroll.employeeId,
+                businessProfileId: payroll.businessProfileId,
+                shiftDate: { gte: periodStart, lte: periodEnd },
+                status: 'CLOCKED_OUT',
+            },
+            select: { actualMinutes: true, breakMinutes: true },
+        });
+
+        const employee = payroll.employee || {};
+        const payrollType = employee.payrollType || payroll.payrollType;
+        let baseAmount = 0;
+        let totalHours = 0;
+        let overtimeHours = 0;
+
+        if (payrollType === 'SALARY') {
+            baseAmount = parseFloat(employee.salaryAmount) || 0;
+            totalHours = shifts.reduce((sum, shift) => sum + (
+                shift.actualMinutes
+                    ? Math.max(0, (shift.actualMinutes - shift.breakMinutes) / 60)
+                    : 0
+            ), 0);
+        } else if (payrollType === 'HOURLY') {
+            const rate = parseFloat(employee.hourlyRate) || 0;
+            shifts.forEach((shift) => {
+                if (!shift.actualMinutes) return;
+                const workedHours = Math.max(0, (shift.actualMinutes - shift.breakMinutes) / 60);
+                totalHours += workedHours;
+                overtimeHours += Math.max(0, workedHours - 8);
+                baseAmount += workedHours * rate;
+            });
+        }
+
+        const overtimeAmount = overtimeHours * (parseFloat(employee.hourlyRate) || 0) * 0.5;
+        const ewaDeduction = parseFloat(employee.withdrawnEarly) || 0;
+        const taxAmount = 0;
+        const deductionAmount = 0;
+        const grossAmount = baseAmount + overtimeAmount;
+        const netAmount = grossAmount - ewaDeduction - taxAmount - deductionAmount;
+
+        return {
+            baseAmount,
+            overtimeAmount,
+            grossAmount,
+            ewaDeduction,
+            netAmount,
+            totalHours: Math.round(totalHours * 100) / 100,
+            overtimeHours: Math.round(overtimeHours * 100) / 100,
+            shiftCount: shifts.length,
+        };
+    }
+
+    _assertPayrollSnapshotCurrent(payroll, current) {
+        const recordedBreakdown = payroll.breakdown && typeof payroll.breakdown === 'object'
+            ? payroll.breakdown
+            : {};
+        const recordedShiftCount = Number(recordedBreakdown.shifts);
+
+        const matches = (
+            nearlyEqual(payroll.baseAmount, current.baseAmount)
+            && nearlyEqual(payroll.overtimeAmount, current.overtimeAmount)
+            && nearlyEqual(payroll.grossAmount, current.grossAmount)
+            && nearlyEqual(payroll.ewaDeduction, current.ewaDeduction)
+            && nearlyEqual(payroll.netAmount, current.netAmount)
+            && nearlyEqual(payroll.totalHours, current.totalHours)
+            && nearlyEqual(payroll.overtimeHours, current.overtimeHours)
+            && (!Number.isFinite(recordedShiftCount) || recordedShiftCount === current.shiftCount)
+        );
+
+        if (!matches) {
+            throw new Error(`Payroll for period ${payroll.period} is stale; regenerate it before disbursement.`);
+        }
     }
 
     // ── Process Payroll for a Single Employee ──────────────────────────────
@@ -116,6 +208,10 @@ class PayrollService {
                     if (payroll.employee.businessProfileId !== scopedBusinessProfileId || payroll.employee.businessProfileId !== payroll.businessProfileId) {
                         throw new Error('Payroll employee does not belong to this business.');
                     }
+
+                    const current = await this._getCurrentPayrollSnapshot(tx, payroll);
+                    this._assertPayrollSnapshotCurrent(payroll, current);
+
                     if (payroll.employee.smartRouteId) throw new Error('Payroll with Smart Route requires the payroll settlement worker; it was not marked as paid.');
 
                     const netAmount = parseFloat(payroll.netAmount);
