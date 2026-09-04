@@ -29,14 +29,14 @@ describe('finance reversal and crypto deposit idempotency', () => {
     expect(prisma.$transaction).not.toHaveBeenCalled();
   });
 
-  test('claims only PENDING withdrawals when reversing', async () => {
+  test('claims only PENDING withdrawals when reversing a deferred reservation', async () => {
     const tx = {
       transactionHistory: {
         updateMany: jest.fn().mockResolvedValue({ count: 1 }),
       },
       systemProfitFees: {
         upsert: jest.fn().mockResolvedValue({}),
-        update: jest.fn().mockResolvedValue({}),
+        update: jest.fn(),
         findUnique: jest.fn().mockResolvedValue({ balance: 5 }),
       },
       systemFiatPool: {
@@ -51,10 +51,12 @@ describe('finance reversal and crypto deposit idempotency', () => {
       },
       user: {
         update: jest.fn().mockResolvedValue({}),
+        updateMany: jest.fn(),
         findUnique: jest.fn().mockResolvedValue({ availableBalance: 50 }),
       },
       adminProfitLog: {
-        create: jest.fn().mockResolvedValue({ id: 'log' }),
+        create: jest.fn(),
+        deleteMany: jest.fn(),
       },
     };
 
@@ -67,10 +69,11 @@ describe('finance reversal and crypto deposit idempotency', () => {
           userId: 7,
           amountUsdc: 10,
           feeUsdc: 0.2,
+          metadata: { economicsDeferred: true },
         }),
       },
       user: {
-        findUnique: jest.fn().mockResolvedValue({ referredByCode: null }),
+        findUnique: jest.fn(),
         findFirst: jest.fn(),
       },
       $transaction: jest.fn(async (callback) => callback(tx)),
@@ -82,6 +85,9 @@ describe('finance reversal and crypto deposit idempotency', () => {
       where: { txHash: 'PENDING-1', status: 'PENDING' },
       data: { status: 'FAILED' },
     });
+    expect(tx.systemProfitFees.update).not.toHaveBeenCalled();
+    expect(tx.adminProfitLog.create).not.toHaveBeenCalled();
+    expect(tx.adminProfitLog.deleteMany).not.toHaveBeenCalled();
   });
 
   test('duplicate crypto webhook is fenced by the transaction and existing txHash', async () => {
