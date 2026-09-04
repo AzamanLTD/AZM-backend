@@ -3,22 +3,29 @@ jest.mock('../src/config/logger', () => ({ error: jest.fn(), warn: jest.fn(), in
 jest.mock('../services/journalIntegration', () => ({ recordDeposit: jest.fn() }));
 jest.mock('../src/services/transactionQuoteService', () => ({
   createTransactionQuote: jest.fn(({ id, userId, purpose, amountGhs, rateGhsPerUsdc, rateSource, rateAsOf, ttlSeconds }) => ({
-    id, userId, purpose, amountGhs, feeGhs: 0, rateGhsPerUsdc, rateSource, rateAsOf, ttlSeconds,
+    id,
+    userId,
+    purpose,
+    amountGhs,
+    feeGhs: 0,
+    rateGhsPerUsdc,
+    rateSource,
+    rateAsOf,
+    ttlSeconds,
     usdcAmount: Number((amountGhs / rateGhsPerUsdc).toFixed(8)),
     expiresAt: '2026-09-04T12:00:00.000Z',
   })),
-  createServerTransactionQuote: jest.fn(),
   persistTransactionQuote: jest.fn().mockResolvedValue(undefined),
   consumeTransactionQuote: jest.fn(),
 }));
 
-const { initiateMoolre } = require('../controllers/quoteFiatDepositController');
+const { initiate } = require('../controllers/moolreQuoteDepositController');
 const { createTransactionQuote } = require('../src/services/transactionQuoteService');
 
-describe('quoteFiatDeposit Moolre retail FX contract', () => {
+describe('moolreQuoteDeposit canonical retail FX contract', () => {
   beforeEach(() => jest.clearAllMocks());
 
-  test('uses liveRetailRate before the legacy headline rate', async () => {
+  test('uses liveRetailRate before the legacy headline rate and records the canonical rail metadata', async () => {
     const transaction = { id: 'tx-1', txHash: 'MOOLRE-1' };
     const tx = {
       transactionHistory: {
@@ -62,27 +69,30 @@ describe('quoteFiatDeposit Moolre retail FX contract', () => {
       json: jest.fn().mockReturnThis(),
     };
 
-    await initiateMoolre(req, res);
+    await initiate(req, res);
 
     expect(createTransactionQuote).toHaveBeenCalledWith(expect.objectContaining({
       amountGhs: 134.2,
       rateGhsPerUsdc: 13.42,
       rateSource: 'KOTANI_PAY',
     }));
-    expect(tx.transactionHistory.create).toHaveBeenCalledWith(expect.objectContaining({
+    expect(tx.transactionHistory.create).toHaveBeenCalledWith({
       data: expect.objectContaining({
         metadata: expect.objectContaining({
           rateAtInitiation: 13.42,
+          rateSource: 'KOTANI_PAY',
           ratePair: 'USDC/GHS',
           settlementCurrency: 'USDC',
           displayCurrency: 'GHS',
         }),
       }),
-    }));
-    expect(moolre.initiatePayment).toHaveBeenCalledWith(expect.objectContaining({
+    });
+    expect(moolre.initiatePayment).toHaveBeenCalledWith({
+      externalRef: 'MOOLRE-1',
       amountGhs: 134.2,
+      payerPhone: '0241234567',
       network: 'MTN',
-    }));
+    });
     expect(res.status).toHaveBeenCalledWith(201);
   });
 });
