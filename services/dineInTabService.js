@@ -13,15 +13,42 @@ const notify = (prisma, opts, result, type, extra = {}) => notifyDineInEvent(pri
     io: opts?.io,
 }).catch(() => null);
 
+const normalizeQuantity = (quantity) => {
+    const qty = Number(quantity ?? 1);
+    if (!Number.isInteger(qty) || qty < 1 || qty > 50) {
+        throw new Error('quantity must be an integer from 1 to 50.');
+    }
+    return qty;
+};
+
+const replayPaymentFromDurableState = (tab) => {
+    const invoice = tab?.invoice;
+    if (!tab || invoice?.status !== 'PAID' || !invoice.payTxHash) return null;
+    const billPlusTip = Number(invoice.billTotalUsdc || 0) + Number(invoice.tipUsdc || 0);
+    const fee = Number(invoice.feeUsdc || 0);
+    const businessReceives = invoice.customerCoveredFee ? billPlusTip : billPlusTip - fee;
+    return {
+        tab,
+        invoice,
+        payment: {
+            invoice,
+            customerPays: Number(invoice.customerPaidUsdc || 0),
+            businessReceives,
+            fee,
+            alreadyPaid: true,
+        },
+    };
+};
+
 exports.openTab = async (prisma, opts) => {
     const result = await service(prisma, opts).openTab({ businessProfileId: opts.businessProfileId, azamanId: opts.azamanId || opts.customerAzamanId, locationId: opts.locationId, tableId: opts.tableId });
     await notify(prisma, opts, result, 'DINE_IN_TAB_OPENED');
     return result;
 };
 
-exports.addItem = async (prisma, opts) => service(prisma, opts).addItem({ tabId: opts.tabId, productId: opts.productId, name: opts.name, price: opts.price ?? opts.unitPriceUsdc, quantity: opts.quantity, notes: opts.notes, addedBy: opts.addedBy ?? opts.userId });
+exports.addItem = async (prisma, opts) => service(prisma, opts).addItem({ tabId: opts.tabId, productId: opts.productId, name: opts.name, price: opts.price ?? opts.unitPriceUsdc, quantity: normalizeQuantity(opts.quantity), notes: opts.notes, addedBy: opts.addedBy ?? opts.userId });
 
-exports.addCustomerItem = async (prisma, opts) => service(prisma, opts).addCustomerItem({ tabId: opts.tabId, customerId: opts.customerId ?? opts.userId, productId: opts.productId, selection: opts.selection, quantity: opts.quantity });
+exports.addCustomerItem = async (prisma, opts) => service(prisma, opts).addCustomerItem({ tabId: opts.tabId, customerId: opts.customerId ?? opts.userId, productId: opts.productId, selection: opts.selection, quantity: normalizeQuantity(opts.quantity) });
 
 exports.finalizeTab = async (prisma, opts) => {
     const result = await service(prisma, opts).finalizeTab(opts.tabId);
@@ -47,15 +74,42 @@ exports.confirmTab = async (prisma, { tabId, customerId, io }) => service(prisma
 
 exports.confirmAndPay = async (prisma, { tabId, customerId, tipUsdc, io }) => {
     const svc = new DineInService(prisma, io);
-    if (typeof svc.confirmAndPay === 'function') {
+    // Preserve the adapter's historical compatibility contract for service
+    // implementations that expose only confirmTab. The durable replay recovery
+    // path requires confirmAndPay + getTab and is intentionally opt-in.
+    if (typeof svc.confirmAndPay !== 'function') {
+        return svc.confirmTab(tabId, customerId);
+    }
+
+    try {
         const result = await svc.confirmAndPay(tabId, customerId, { tipUsdc });
         if (result?.payment?.alreadyPaid && result.tab?.status === 'FINALIZED') result.tab = await svc.confirmTab(tabId, customerId);
         if (!result?.payment?.alreadyPaid) {
             await notify(prisma, { io }, result, 'DINE_IN_TAB_PAID', { tabId, totalAmount: result?.tab?.grandTotalUsdc, metadata: { invoiceId: result?.invoice?.id || result?.payment?.invoice?.id } });
         }
         return result;
+    } catch (error) {
+        // A concurrent request may successfully commit the payment and close
+        // the tab before this request reaches the compare-and-set close step.
+        // Recover only from durable proof of the same tab's PAID invoice so a
+        // financial success is never surfaced as a false failure.
+        if (typeof svc.getTab !== 'function') throw error;
+        const recovered = replayPaymentFromDurableState(await svc.getTab(tabId));
+        if (!recovered || recovered.tab.customerId !== customerId) throw error;
+
+        if (recovered.tab.status === 'FINALIZED') {
+            try {
+                recovered.tab = await svc.confirmTab(tabId, customerId);
+                recovered.payment.invoice = recovered.tab?.invoice || recovered.invoice;
+            } catch (recoveryError) {
+                const reread = await svc.getTab(tabId);
+                if (reread?.status !== 'CLOSED') throw recoveryError;
+                recovered.tab = reread;
+            }
+        }
+        if (recovered.tab.status !== 'CLOSED') throw error;
+        return recovered;
     }
-    return svc.confirmTab(tabId, customerId);
 };
 
 exports.cancelTab = async (prisma, opts) => service(prisma, opts).cancelTab(opts.tabId);
