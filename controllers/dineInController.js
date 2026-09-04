@@ -92,9 +92,14 @@ exports.confirmAndPay = async (req, res) => {
 exports.getTab = async (req, res) => {
     try {
         const prisma = req.prisma || req.app.get('prisma');
+        // This endpoint serves both the customer and business portal. Resolve
+        // business context from trusted auth state, then let the adapter accept
+        // either the owning business or the owning customer as the reader.
+        const businessProfileId = await getEffectiveBusinessProfileId(req, prisma);
         const tab = await dineInTabService.getTab(prisma, serviceOptions(req, {
             tabId: req.params.tabId,
             customerId: req.user.id,
+            businessProfileId,
         }));
         const table = tab?.tableId
             ? await prisma.businessTable.findUnique({
