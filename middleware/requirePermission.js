@@ -25,60 +25,97 @@ const { ROLE_TEMPLATES, ALL_KEYS } = require('../config/permissionTemplates');
 const { runWithRequestContext } = require('../utils/requestContext');
 const { runWithBusinessRequestContext } = require('../src/lib/businessRequestContext');
 
+/**
+ * Resolve a user's effective permission set for a given business.
+ * Returns an array of permission strings. ['*'] means all permissions.
+ */
 async function resolvePermissions(prisma, userId, businessProfileId) {
+    // Admin impersonation: if req.businessProfileId is set by adminBusinessScope,
+    // the user is an admin — they get all permissions.
+    // This is checked by the caller before invoking this function (see middleware below).
+
+    // Check if user is the business owner
     const bp = await prisma.businessProfile.findFirst({
         where: { id: businessProfileId },
         select: { userId: true },
     });
     if (!bp) return [];
+
+    // Owner gets all permissions
     if (bp.userId === userId) return ['*'];
 
+    // Check if user is an employee of this business
     const employee = await prisma.businessEmployee.findUnique({
         where: { businessProfileId_userId: { businessProfileId, userId } },
         select: { permissions: true, status: true, role: true },
     });
+
     if (!employee) return [];
+
+    // Suspended or terminated employees have no permissions
     if (employee.status === 'SUSPENDED' || employee.status === 'TERMINATED') return [];
+
+    // If they have '*' in their permissions, they have everything
     if (employee.permissions.includes('*')) return ['*'];
 
+    // Resolve: merge template defaults with explicit overrides
     const template = ROLE_TEMPLATES[employee.role];
     const templatePerms = template ? template.permissions : [];
     const explicitPerms = employee.permissions || [];
-    return Array.from(new Set([...templatePerms, ...explicitPerms]));
+
+    // Merge: template perms + any explicit perms that aren't already covered
+    // (explicit perms may add or override; for removal, the frontend stores
+    // only the final resolved set, so no need for subtraction logic here)
+    const merged = new Set([...templatePerms, ...explicitPerms]);
+    return Array.from(merged);
 }
 
+/**
+ * Express middleware factory: requirePermission(key)
+ * Usage: router.post('/...', requirePermission('employees.create'), wrap(handler))
+ */
 function requirePermission(key) {
     return async (req, res, next) => {
         try {
-            if (!req.user?.id) return res.status(401).json({ success: false, message: 'Authentication required.' });
+            if (!req.user?.id) {
+                return res.status(401).json({ success: false, message: 'Authentication required.' });
+            }
 
             const prisma = req.app.get('prisma');
-            let businessProfileId = req.businessProfileId;
+
+            // Resolve business profile ID (same logic as getBusinessProfileId in routes)
+            let businessProfileId = req.businessProfileId; // admin impersonation
             let businessProfile;
             if (!businessProfileId) {
                 businessProfile = await prisma.businessProfile.findFirst({
                     where: { userId: req.user.id },
                     select: { id: true, userId: true },
                 });
-                if (!businessProfile) return res.status(403).json({ success: false, message: 'No business profile found.' });
+                if (!businessProfile) {
+                    return res.status(403).json({ success: false, message: 'No business profile found.' });
+                }
                 businessProfileId = businessProfile.id;
             } else {
                 businessProfile = await prisma.businessProfile.findFirst({
                     where: { id: businessProfileId },
                     select: { userId: true },
                 });
-                if (!businessProfile) return res.status(403).json({ success: false, message: 'Business profile not found.' });
+                if (!businessProfile) {
+                    return res.status(403).json({ success: false, message: 'Business profile not found.' });
+                }
             }
 
             // Resource-level tenant guard for the legacy tax-preset PATCH route.
-            // The route itself updates by bare id, so verify the target belongs to
-            // the effective business before allowing the handler to run.
+            // The route updates by bare id, so verify the target belongs to the
+            // effective business before allowing the handler to run.
             if (req.method === 'PATCH' && /^\/tax-presets\/[^/]+$/.test(req.path)) {
                 const preset = await prisma.businessTaxPreset.findFirst({
                     where: { id: req.params.id, businessProfileId },
                     select: { id: true },
                 });
-                if (!preset) return res.status(404).json({ success: false, message: 'Tax preset not found.' });
+                if (!preset) {
+                    return res.status(404).json({ success: false, message: 'Tax preset not found.' });
+                }
             }
 
             const requestContext = {
@@ -87,14 +124,26 @@ function requirePermission(key) {
                 isAdmin: Boolean(req.businessProfileId && req.user.role === 'ADMIN'),
                 isBusinessOwner: businessProfile.userId === req.user.id,
             };
+
+            // Payroll still consumes the legacy request context while the
+            // shift and EWA services consume the Business OS context. Keep
+            // both stores in scope until their callers share one context API.
             const runAuthorized = () => runWithRequestContext(
                 requestContext,
                 () => runWithBusinessRequestContext(requestContext, next),
             );
 
-            if (req.businessProfileId && req.user.role === 'ADMIN') return runAuthorized();
+            // Admin users (impersonating) get all permissions
+            if (req.businessProfileId && req.user.role === 'ADMIN') {
+                return runAuthorized();
+            }
+
             const perms = await resolvePermissions(prisma, req.user.id, businessProfileId);
-            if (perms.includes('*')) return runAuthorized();
+
+            if (perms.includes('*')) {
+                return runAuthorized();
+            }
+
             if (!perms.includes(key)) {
                 return res.status(403).json({
                     success: false,
@@ -102,11 +151,13 @@ function requirePermission(key) {
                     requiredPermission: key,
                 });
             }
+
+            // Attach resolved permissions to req for downstream use
             req.resolvedPermissions = perms;
-            return runAuthorized();
+            runAuthorized();
         } catch (err) {
             logger.error('[requirePermission]', err);
-            return res.status(500).json({ success: false, message: 'Permission check failed.' });
+            res.status(500).json({ success: false, message: 'Permission check failed.' });
         }
     };
 }
