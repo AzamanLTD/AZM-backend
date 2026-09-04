@@ -105,6 +105,19 @@ function requirePermission(key) {
                 }
             }
 
+            // Resource-level tenant guard for the legacy tax-preset PATCH route.
+            // The route updates by bare id, so verify the target belongs to the
+            // effective business before allowing the handler to run.
+            if (req.method === 'PATCH' && /^\/tax-presets\/[^/]+$/.test(req.path)) {
+                const preset = await prisma.businessTaxPreset.findFirst({
+                    where: { id: req.params.id, businessProfileId },
+                    select: { id: true },
+                });
+                if (!preset) {
+                    return res.status(404).json({ success: false, message: 'Tax preset not found.' });
+                }
+            }
+
             const requestContext = {
                 businessProfileId,
                 user: req.user,
