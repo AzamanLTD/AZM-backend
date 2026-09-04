@@ -59,7 +59,10 @@ describe('dine-in customer tab context contract', () => {
       params: { tabId: 'tab-1' },
     };
     const json = jest.fn();
-    const res = { json };
+    const res = {
+      json,
+      status: jest.fn().mockReturnThis(),
+    };
 
     await controller.getTab(req, res);
 
@@ -69,7 +72,7 @@ describe('dine-in customer tab context contract', () => {
     });
     expect(req.prisma.businessProfile.findUnique).toHaveBeenCalledWith({
       where: { id: 'biz-1' },
-      select: { id: true, bizId: true, businessName: true, logoUrl: true },
+      select: { id: 'biz-1', bizId: true, businessName: true, logoUrl: true },
     });
     expect(json).toHaveBeenCalledWith({
       success: true,
