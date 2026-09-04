@@ -91,9 +91,6 @@ const settleFiatWithdrawal = async (prisma, {
 
         return {
             ...result,
-            // Preserve the callback's providerTxId for the settlement-attempt
-            // result. The transaction row itself remains authoritative and is
-            // never overwritten once terminal.
             providerTxId: providerTxId || result.providerTxId || transaction?.providerRef || null,
             transaction
         };
@@ -137,14 +134,25 @@ const settleFiatWithdrawal = async (prisma, {
         };
     }
 
+    // A PENDING provider result may add its external identity once. Persist it
+    // before the reversal so the callback remains auditable even if the mocked
+    // or real reversal path re-reads the transaction after changing status.
+    let transaction = original;
+    if (providerTxId && !original.providerRef) {
+        transaction = await prisma.transactionHistory.update({
+            where: { txHash: reference },
+            data: { providerRef: String(providerTxId) }
+        });
+    }
+
     const reversal = await financeService.reverseFiatWithdrawal(prisma, reference, {
         reason: reason || 'Provider reported FAILED settlement.'
     });
 
-    let transaction = await prisma.transactionHistory.findUnique({
+    const latest = await prisma.transactionHistory.findUnique({
         where: { txHash: reference }
     });
-    transaction = await enrichProviderReference(prisma, reference, transaction, providerTxId);
+    transaction = latest || transaction;
 
     return {
         reference,
