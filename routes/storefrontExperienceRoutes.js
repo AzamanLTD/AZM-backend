@@ -6,6 +6,7 @@ const { protectActive } = require('../middleware/banGuardMiddleware');
 const { requirePermission } = require('../middleware/requirePermission');
 const experienceBlueprintService = require('../services/experienceBlueprintService');
 const storefrontService = require('../services/storefrontService');
+const { publishStorefrontSafely } = require('../services/storefrontSafePublishService');
 const { preserveDraftExperience } = require('../services/storefrontDraftExperienceGuard');
 const { saveDraftSchema } = require('../services/validation/storefrontSchemas');
 const { renderStorefront, invalidateCache } = require('../services/storefrontRenderService');
@@ -140,6 +141,49 @@ router.put('/me/experience', protect, protectActive, requirePermission('storefro
       message: 'Experience settings saved to the storefront draft. Publish the storefront to make them live.',
     });
   } catch (err) {
+    next(err);
+  }
+});
+
+router.post('/me/publish-safe', protect, protectActive, requirePermission('storefront.manage'), async (req, res, next) => {
+  try {
+    const prisma = req.app.get('prisma');
+    const businessProfileId = businessProfileIdFromRequest(req);
+    if (!businessProfileId) return res.status(400).json({ success: false, message: 'No business profile found.' });
+
+    const published = await publishStorefrontSafely(
+      prisma,
+      businessProfileId,
+      req.user.id,
+      req.body?.expectedUpdatedAt,
+    );
+    await invalidateCache(businessProfileId);
+
+    await prisma.storefrontAnalyticsEvent.create({
+      data: {
+        businessProfileId,
+        eventType: 'layout_published',
+        metadata: {
+          themeId: published.themeId,
+          tileCount: published.layoutJson?.tiles?.length || 0,
+          tier: published.tier || 'FREE',
+        },
+      },
+    }).catch(() => {});
+
+    res.json({ success: true, data: published, message: 'Storefront published successfully.' });
+  } catch (err) {
+    if (err.statusCode === 402 || err.statusCode === 409) {
+      return res.status(err.statusCode).json({
+        success: false,
+        message: err.message,
+        ...(err.statusCode === 402 ? {
+          violations: err.violations,
+          tier: err.tier,
+          stakedBalance: err.stakedBalance,
+        } : { code: err.code }),
+      });
+    }
     next(err);
   }
 });
