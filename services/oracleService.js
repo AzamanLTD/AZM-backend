@@ -82,24 +82,34 @@ class OracleService {
             const daiPrice = asFinitePositive(cryptoResponse.data?.dai?.usd);
             if (!tetherPrice || !usdcPrice || !daiPrice) throw new Error('CoinGecko returned incomplete stablecoin rates.');
 
-            let usdToGhsRate = null;
+            const fallbackUsdToGhs = await this.fetchFallbackUsdToGhsRate();
+            if (!fallbackUsdToGhs && !process.env.KOTANI_PROVIDER) {
+                throw new Error('No usable USD/GHS fallback rate is available.');
+            }
+
+            let usdcToGhsRate = null;
             let rateSource = 'FALLBACK_FX';
             try {
-                usdToGhsRate = await this.fetchKotaniUsdcToGhsRate();
-                if (usdToGhsRate) rateSource = 'KOTANI_PAY';
+                usdcToGhsRate = await this.fetchKotaniUsdcToGhsRate();
+                if (usdcToGhsRate) rateSource = 'KOTANI_PAY';
             } catch (error) {
                 logger.warn({ err: error }, '[Oracle] Kotani Pay rate unavailable; using fallback FX provider.');
             }
 
-            if (!usdToGhsRate) usdToGhsRate = await this.fetchFallbackUsdToGhsRate();
-            if (!usdToGhsRate) throw new Error('No usable USD/USDC to GHS rate is available.');
+            // The fallback provider quotes USD/GHS, while CoinGecko gives the
+            // current USDC/USD market price. Convert the two explicitly rather
+            // than silently assuming USDC is exactly USD.
+            if (!usdcToGhsRate && fallbackUsdToGhs) {
+                usdcToGhsRate = fallbackUsdToGhs * usdcPrice;
+            }
+            if (!usdcToGhsRate) throw new Error('No usable USD/USDC to GHS rate is available.');
 
             const lastRateSync = new Date();
             await this.prisma.globalSettings.upsert({
                 where: { id: 1 },
                 update: {
-                    liveUsdToGhs: usdToGhsRate,
-                    liveRetailRate: usdToGhsRate,
+                    liveUsdToGhs: fallbackUsdToGhs || usdcToGhsRate,
+                    liveRetailRate: usdcToGhsRate,
                     liveUsdtToUsd: tetherPrice,
                     liveUsdcToUsd: usdcPrice,
                     liveDaiToUsd: daiPrice,
@@ -108,8 +118,8 @@ class OracleService {
                 },
                 create: {
                     id: 1,
-                    liveUsdToGhs: usdToGhsRate,
-                    liveRetailRate: usdToGhsRate,
+                    liveUsdToGhs: fallbackUsdToGhs || usdcToGhsRate,
+                    liveRetailRate: usdcToGhsRate,
                     liveUsdtToUsd: tetherPrice,
                     liveUsdcToUsd: usdcPrice,
                     liveDaiToUsd: daiPrice,
@@ -118,11 +128,11 @@ class OracleService {
                 }
             });
 
-            logger.info(`📈 Oracle Sync: 1 USDC ≈ ${usdToGhsRate} GHS | source=${rateSource}`);
+            logger.info(`📈 Oracle Sync: 1 USDC ≈ ${usdcToGhsRate} GHS | source=${rateSource}`);
 
-            if (this.rateAlertService && usdToGhsRate) {
+            if (this.rateAlertService && usdcToGhsRate) {
                 setImmediate(() => {
-                    this.rateAlertService.checkAlerts(usdToGhsRate, 'USDC_GHS')
+                    this.rateAlertService.checkAlerts(usdcToGhsRate, 'USDC_GHS')
                         .catch(err => logger.error({ err }, '[Oracle] alert check error'));
                 });
             }
