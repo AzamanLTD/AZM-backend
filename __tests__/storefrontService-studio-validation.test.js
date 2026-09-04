@@ -13,7 +13,7 @@ const invalidExperience = {
       id: 'button',
       type: 'button',
       children: [],
-      props: { html: '<script>alert(1)</script>' },
+      props: { innerHTML: '<script>alert(1)</script>' },
       style: {},
       layout: {},
       responsive: {},
@@ -66,7 +66,7 @@ describe('Storefront Studio server validation boundary', () => {
         create: jest.fn(),
         delete: jest.fn(),
       },
-      businessProfile: { findUnique: jest.fn() },
+      businessProfile: { findUnique: jest.fn().mockResolvedValue({ storefrontDisabled: false }) },
     };
 
     await expect(publishLayout(prisma, 'business-1', 'user-1')).rejects.toMatchObject({
