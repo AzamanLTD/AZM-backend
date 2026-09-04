@@ -16,6 +16,21 @@ const waitForSerializableRetry = (attempt) => new Promise((resolve) => {
     setTimeout(resolve, SERIALIZABLE_BACKOFF_MS * (2 ** attempt));
 });
 
+const getPeriodWindow = (period) => {
+    const [year, month] = String(period).split('-').map(Number);
+    if (!Number.isInteger(year) || !Number.isInteger(month) || month < 1 || month > 12) {
+        throw new Error(`Invalid payroll period: ${period}`);
+    }
+    return {
+        periodStart: new Date(year, month - 1, 1),
+        periodEnd: new Date(year, month, 0, 23, 59, 59, 999),
+    };
+};
+
+const getWorkedHours = (shift) => shift.actualMinutes
+    ? Math.max(0, (shift.actualMinutes - shift.breakMinutes) / 60)
+    : 0;
+
 class PayrollService {
     constructor(prisma) { this.prisma = prisma; }
 
@@ -30,6 +45,29 @@ class PayrollService {
         return employee?.businessProfileId || null;
     }
 
+    async _readPeriodShiftSnapshot(tx, employeeId, period) {
+        const { periodStart, periodEnd } = getPeriodWindow(period);
+        const shifts = await tx.shift.findMany({
+            where: { employeeId, shiftDate: { gte: periodStart, lte: periodEnd }, status: 'CLOCKED_OUT' },
+            select: { actualMinutes: true, breakMinutes: true },
+        });
+        const totalHours = shifts.reduce((sum, shift) => sum + getWorkedHours(shift), 0);
+        return { shiftCount: shifts.length, totalHours: Math.round(totalHours * 100) / 100 };
+    }
+
+    _assertPayrollSnapshotCurrent(payroll, snapshot) {
+        const recordedShiftCount = Number(payroll.breakdown?.shifts);
+        const recordedHours = Math.round(Number(payroll.totalHours) * 100) / 100;
+        if (!Number.isFinite(recordedShiftCount) || recordedShiftCount !== snapshot.shiftCount || recordedHours !== snapshot.totalHours) {
+            throw new Error(`Payroll period ${payroll.period} changed after processing; reprocess the payroll before disbursement.`);
+        }
+        const recordedEwa = Math.round((Number(payroll.ewaDeduction) || 0) * 100) / 100;
+        const currentEwa = Math.round((Number(payroll.employee.withdrawnEarly) || 0) * 100) / 100;
+        if (recordedEwa !== currentEwa) {
+            throw new Error(`Payroll period ${payroll.period} earned-wage withdrawal changed after processing; reprocess the payroll before disbursement.`);
+        }
+    }
+
     // ── Process Payroll for a Single Employee ──────────────────────────────
     async processEmployeePayroll({ businessProfileId, employeeId, period }) {
         const employee = await this.prisma.businessEmployee.findUnique({ where: { id: employeeId } });
@@ -40,9 +78,7 @@ class PayrollService {
         const existing = await this.prisma.payrollRecord.findUnique({ where: { employeeId_period: { employeeId, period } } });
         if (existing && existing.status === 'PROCESSED') throw new Error(`Payroll for period ${period} already processed.`);
 
-        const [year, month] = period.split('-').map(Number);
-        const periodStart = new Date(year, month - 1, 1);
-        const periodEnd = new Date(year, month, 0, 23, 59, 59);
+        const { periodStart, periodEnd } = getPeriodWindow(period);
         const shifts = await this.prisma.shift.findMany({ where: { employeeId, shiftDate: { gte: periodStart, lte: periodEnd }, status: 'CLOCKED_OUT' } });
 
         let baseAmount = 0;
@@ -50,16 +86,14 @@ class PayrollService {
         let overtimeHours = 0;
         if (employee.payrollType === 'SALARY') {
             baseAmount = parseFloat(employee.salaryAmount) || 0;
-            totalHours = shifts.reduce((sum, s) => sum + (s.actualMinutes ? Math.max(0, (s.actualMinutes - s.breakMinutes) / 60) : 0), 0);
+            totalHours = shifts.reduce((sum, s) => sum + getWorkedHours(s), 0);
         } else if (employee.payrollType === 'HOURLY') {
             const rate = parseFloat(employee.hourlyRate) || 0;
             shifts.forEach(s => {
-                if (s.actualMinutes) {
-                    const workedHours = Math.max(0, (s.actualMinutes - s.breakMinutes) / 60);
-                    totalHours += workedHours;
-                    overtimeHours += Math.max(0, workedHours - 8);
-                    baseAmount += workedHours * rate;
-                }
+                const workedHours = getWorkedHours(s);
+                totalHours += workedHours;
+                overtimeHours += Math.max(0, workedHours - 8);
+                baseAmount += workedHours * rate;
             });
         }
         const overtimeAmount = overtimeHours * (parseFloat(employee.hourlyRate) || 0) * 0.5;
@@ -117,6 +151,9 @@ class PayrollService {
                         throw new Error('Payroll employee does not belong to this business.');
                     }
                     if (payroll.employee.smartRouteId) throw new Error('Payroll with Smart Route requires the payroll settlement worker; it was not marked as paid.');
+
+                    const currentSnapshot = await this._readPeriodShiftSnapshot(tx, payroll.employeeId, payroll.period);
+                    this._assertPayrollSnapshotCurrent(payroll, currentSnapshot);
 
                     const netAmount = parseFloat(payroll.netAmount);
                     if (!Number.isFinite(netAmount)) throw new Error('Payroll net amount is invalid.');
