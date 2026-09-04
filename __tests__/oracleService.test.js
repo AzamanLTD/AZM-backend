@@ -25,13 +25,6 @@ describe('OracleService Kotani rate preference', () => {
     });
 
     test('prefers Kotani USDC/CGHS over fallback FX data', async () => {
-        axios.get
-            .mockResolvedValueOnce({ data: { rate: 12.75 } })
-            .mockResolvedValueOnce({ data: { tether: { usd: 1 }, 'usd-coin': { usd: 1 }, dai: { usd: 1 } } });
-
-        // fetchAndUpdateRates requests CoinGecko first in the implementation;
-        // queue the calls accordingly and verify no fallback request is made.
-        axios.get.mockReset();
         axios.get.mockImplementation((url) => {
             if (url.includes('coingecko')) {
                 return Promise.resolve({ data: { tether: { usd: 1 }, 'usd-coin': { usd: 1 }, dai: { usd: 1 } } });
@@ -50,7 +43,11 @@ describe('OracleService Kotani rate preference', () => {
         await service.fetchAndUpdateRates();
 
         expect(prisma.globalSettings.upsert).toHaveBeenCalledWith(expect.objectContaining({
-            update: expect.objectContaining({ liveUsdToGhs: 12.75, liveRateSource: 'KOTANI_PAY' }),
+            update: expect.objectContaining({
+                liveUsdToGhs: 12.75,
+                liveRetailRate: 12.75,
+                liveRateSource: 'KOTANI_PAY',
+            }),
         }));
     });
 
@@ -73,7 +70,11 @@ describe('OracleService Kotani rate preference', () => {
         await service.fetchAndUpdateRates();
 
         expect(prisma.globalSettings.upsert).toHaveBeenCalledWith(expect.objectContaining({
-            update: expect.objectContaining({ liveUsdToGhs: 12.11, liveRateSource: 'FALLBACK_FX' }),
+            update: expect.objectContaining({
+                liveUsdToGhs: 12.11,
+                liveRetailRate: 12.11,
+                liveRateSource: 'FALLBACK_FX',
+            }),
         }));
     });
 });
