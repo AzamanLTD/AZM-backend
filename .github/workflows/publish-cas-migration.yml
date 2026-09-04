@@ -1,0 +1,259 @@
+name: Storefront Publish CAS Migration
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout feature branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref || github.ref_name }}
+          fetch-depth: 0
+
+      - name: Patch publish service and route
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('services/storefrontService.js')
+          s = p.read_text()
+          start = s.index('async function publishLayout(')
+          end = s.index('\n\n/**\n * Get version history for a business.', start)
+          old = s[start:end]
+          new = '''async function publishLayout(prisma, businessProfileId, userId, expectedUpdatedAt) {
+  const stalePublishError = () => {
+    const err = new Error('Storefront draft was modified by another editor. Please refresh before publishing.');
+    err.code = 'STALE_STOREFRONT_DRAFT';
+    err.statusCode = 409;
+    return err;
+  };
+
+  let expectedDate = null;
+  if (expectedUpdatedAt !== undefined && expectedUpdatedAt !== null && expectedUpdatedAt !== '') {
+    expectedDate = new Date(expectedUpdatedAt);
+    if (Number.isNaN(expectedDate.getTime())) throw stalePublishError();
+  }
+
+  return prisma.$transaction(async (tx) => {
+    let draft = await tx.businessStorefrontLayout.findUnique({
+      where: { businessProfileId_status: { businessProfileId, status: 'DRAFT' } },
+      include: { theme: true },
+    });
+
+    if (!draft) throw new Error('No draft layout to publish.');
+
+    // Claim the exact version the publishing client observed. This is the
+    // compare-and-swap boundary: a concurrent versioned save/publish can no
+    // longer mutate this draft after the claim succeeds.
+    if (expectedDate) {
+      const claim = await tx.businessStorefrontLayout.updateMany({
+        where: {
+          id: draft.id,
+          businessProfileId,
+          status: 'DRAFT',
+          updatedAt: expectedDate,
+        },
+        data: {
+          layoutJson: draft.layoutJson,
+          themeId: draft.themeId,
+        },
+      });
+      if (claim.count !== 1) throw stalePublishError();
+
+      draft = await tx.businessStorefrontLayout.findUnique({
+        where: { id: draft.id },
+        include: { theme: true },
+      });
+      if (!draft) throw new Error('Draft disappeared during publish.');
+    }
+
+    const business = await tx.businessProfile.findUnique({
+      where: { id: businessProfileId },
+      select: { storefrontDisabled: true },
+    });
+    if (business?.storefrontDisabled) {
+      throw new Error('Storefront is disabled by admin. Contact support.');
+    }
+
+    validateStudioExperience(draft.layoutJson);
+
+    const themeKey = draft.theme?.key || null;
+    const eligibility = await validateNitroEligibility(tx, businessProfileId, draft.layoutJson, themeKey);
+    if (!eligibility.eligible) {
+      const err = new Error('Nitro eligibility check failed. Premium features require more staked AZM.');
+      err.statusCode = 402;
+      err.violations = eligibility.violations;
+      err.tier = eligibility.tier;
+      err.stakedBalance = eligibility.stakedBalance;
+      throw err;
+    }
+
+    const currentPublished = await tx.businessStorefrontLayout.findUnique({
+      where: { businessProfileId_status: { businessProfileId, status: 'PUBLISHED' } },
+    });
+
+    if (currentPublished) {
+      const maxVersion = await tx.businessStorefrontLayoutVersion.aggregate({
+        where: { businessProfileId },
+        _max: { version: true },
+      });
+      const nextVersion = (maxVersion._max.version || 0) + 1;
+
+      await tx.businessStorefrontLayoutVersion.create({
+        data: {
+          businessProfileId,
+          version: nextVersion,
+          themeId: currentPublished.themeId,
+          layoutJson: currentPublished.layoutJson,
+          publishedAt: currentPublished.publishedAt,
+          publishedBy: currentPublished.publishedBy,
+        },
+      });
+
+      await tx.businessStorefrontLayout.delete({ where: { id: currentPublished.id } });
+    }
+
+    const published = await tx.businessStorefrontLayout.create({
+      data: {
+        businessProfileId,
+        status: 'PUBLISHED',
+        themeId: draft.themeId,
+        layoutJson: draft.layoutJson,
+        publishedAt: new Date(),
+        publishedBy: userId,
+      },
+      include: { theme: true },
+    });
+
+    const maxVersion2 = await tx.businessStorefrontLayoutVersion.aggregate({
+      where: { businessProfileId },
+      _max: { version: true },
+    });
+    const nextVersion2 = (maxVersion2._max.version || 0) + 1;
+
+    await tx.businessStorefrontLayoutVersion.create({
+      data: {
+        businessProfileId,
+        version: nextVersion2,
+        themeId: draft.themeId,
+        layoutJson: draft.layoutJson,
+        publishedAt: published.publishedAt,
+        publishedBy: userId,
+      },
+    });
+
+    await tx.businessStorefrontLayout.delete({ where: { id: draft.id } });
+
+    return published;
+  });
+}'''
+          p.write_text(s[:start] + new + s[end:])
+
+          q = Path('routes/storefrontRoutes.js')
+          r = q.read_text()
+          old_route = "const published = await storefrontService.publishLayout(prisma, businessProfileId, req.user.id);"
+          new_route = "const published = await storefrontService.publishLayout(prisma, businessProfileId, req.user.id, req.body?.expectedUpdatedAt);"
+          if old_route not in r:
+              raise SystemExit('publish route call target not found')
+          q.write_text(r.replace(old_route, new_route, 1))
+          PY
+
+      - name: Add publish CAS regression coverage
+        shell: bash
+        run: |
+          cat > __tests__/storefrontPublishCas.test.js <<'EOF'
+          jest.mock('../services/storefrontSchemaMigration', () => ({
+            migrateLayout: (layout) => layout,
+            generateEmptyLayout: () => ({}),
+          }));
+
+          jest.mock('../services/storefrontStudioValidation', () => ({
+            validateStudioDocument: () => {},
+          }));
+
+          const { publishLayout } = require('../services/storefrontService');
+
+          const draft = {
+            id: 'draft-1',
+            businessProfileId: 'business-1',
+            status: 'DRAFT',
+            updatedAt: new Date('2026-09-04T18:00:00.000Z'),
+            themeId: 'theme-1',
+            theme: { key: 'classic_light' },
+            layoutJson: { experience: { schemaVersion: 2, pages: [{ id: 'home', root: [] }], nodes: {} } },
+          };
+
+          const baseTx = () => ({
+            businessStorefrontLayout: {
+              findUnique: jest.fn(),
+              updateMany: jest.fn(),
+              delete: jest.fn(),
+              create: jest.fn(),
+            },
+            businessProfile: { findUnique: jest.fn().mockResolvedValue({ storefrontDisabled: false }) },
+            businessStorefrontLayoutVersion: {
+              aggregate: jest.fn().mockResolvedValue({ _max: { version: 0 } }),
+              create: jest.fn(),
+            },
+            azmStake: { findMany: jest.fn().mockResolvedValue([]) },
+          });
+
+          describe('Storefront publish compare-and-swap', () => {
+            test('claims the observed draft version before publishing', async () => {
+              const tx = baseTx();
+              tx.businessStorefrontLayout.findUnique
+                .mockResolvedValueOnce(draft)
+                .mockResolvedValueOnce({ ...draft, updatedAt: new Date('2026-09-04T18:00:01.000Z') })
+                .mockResolvedValueOnce(null)
+                .mockResolvedValueOnce({ ...draft, status: 'PUBLISHED' });
+              tx.businessStorefrontLayout.updateMany.mockResolvedValue({ count: 1 });
+              tx.businessStorefrontLayout.create.mockResolvedValue({ id: 'pub-1', themeId: 'theme-1', layoutJson: draft.layoutJson, publishedAt: new Date(), publishedBy: 99 });
+              const prisma = { $transaction: jest.fn((callback) => callback(tx)) };
+
+              await publishLayout(prisma, 'business-1', 99, '2026-09-04T18:00:00.000Z');
+
+              expect(tx.businessStorefrontLayout.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+                where: expect.objectContaining({ id: 'draft-1', updatedAt: new Date('2026-09-04T18:00:00.000Z') }),
+              }));
+            });
+
+            test('fails with a conflict when the observed version is stale', async () => {
+              const tx = baseTx();
+              tx.businessStorefrontLayout.findUnique.mockResolvedValue(draft);
+              tx.businessStorefrontLayout.updateMany.mockResolvedValue({ count: 0 });
+              const prisma = { $transaction: jest.fn((callback) => callback(tx)) };
+
+              await expect(publishLayout(prisma, 'business-1', 99, '2026-09-04T18:00:00.000Z'))
+                .rejects.toMatchObject({ code: 'STALE_STOREFRONT_DRAFT', statusCode: 409 });
+            });
+
+            test('invalid observed timestamp fails closed', async () => {
+              const tx = baseTx();
+              const prisma = { $transaction: jest.fn((callback) => callback(tx)) };
+              await expect(publishLayout(prisma, 'business-1', 99, 'not-a-date'))
+                .rejects.toMatchObject({ code: 'STALE_STOREFRONT_DRAFT', statusCode: 409 });
+              expect(prisma.$transaction).not.toHaveBeenCalled();
+            });
+          });
+          EOF
+
+      - name: Verify targeted tests
+        run: npm test -- --runInBand __tests__/storefrontPublishCas.test.js
+
+      - name: Commit patch and remove workflow
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add services/storefrontService.js routes/storefrontRoutes.js __tests__/storefrontPublishCas.test.js
+          git rm .github/workflows/publish-cas-migration.yml
+          git commit -m "fix(storefront): enforce publish optimistic concurrency"
+          git push origin HEAD:${{ github.head_ref || github.ref_name }}
