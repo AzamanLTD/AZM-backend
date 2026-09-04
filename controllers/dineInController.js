@@ -1,4 +1,3 @@
-const logger = require('../src/config/logger');
 const dineInTabService = require('../services/dineInTabService');
 
 const serviceOptions = (req, extra = {}) => ({
@@ -8,11 +7,26 @@ const serviceOptions = (req, extra = {}) => ({
         : undefined,
 });
 
+// Business-side controllers derive the effective business from trusted admin
+// scope or the authenticated user's owned profile. Never trust a body/query
+// businessProfileId because the service accepts that identifier directly.
+const getEffectiveBusinessProfileId = async (req, prisma) => {
+    if (req.adminScopedBusiness?.id) return req.adminScopedBusiness.id;
+    if (req.user?.role === 'ADMIN' && req.businessProfileId) return req.businessProfileId;
+    const profile = await prisma.businessProfile.findFirst({
+        where: { userId: req.user.id },
+        select: { id: true },
+    });
+    return profile?.id || null;
+};
+
 exports.openTab = async (req, res) => {
     try {
-        const result = await dineInTabService.openTab(req.prisma, serviceOptions(req, {
-            businessProfileId: req.body.businessProfileId,
-            userId: req.user.id,
+        const prisma = req.prisma || req.app.get('prisma');
+        const businessProfileId = await getEffectiveBusinessProfileId(req, prisma);
+        if (!businessProfileId) return res.status(403).json({ success: false, message: 'No business profile.' });
+        const result = await dineInTabService.openTab(prisma, serviceOptions(req, {
+            businessProfileId,
             customerAzamanId: req.body.customerAzamanId,
             locationId: req.body.locationId,
             tableId: req.body.tableId,
@@ -23,7 +37,8 @@ exports.openTab = async (req, res) => {
 
 exports.addItem = async (req, res) => {
     try {
-        const result = await dineInTabService.addItem(req.prisma, serviceOptions(req, {
+        const prisma = req.prisma || req.app.get('prisma');
+        const result = await dineInTabService.addItem(prisma, serviceOptions(req, {
             tabId: req.params.tabId,
             userId: req.user.id,
             productId: req.body.productId,
@@ -37,7 +52,8 @@ exports.addItem = async (req, res) => {
 
 exports.addCustomerItem = async (req, res) => {
     try {
-        const result = await dineInTabService.addCustomerItem(req.prisma, serviceOptions(req, {
+        const prisma = req.prisma || req.app.get('prisma');
+        const result = await dineInTabService.addCustomerItem(prisma, serviceOptions(req, {
             tabId: req.params.tabId,
             customerId: req.user.id,
             productId: req.body.productId,
@@ -50,7 +66,8 @@ exports.addCustomerItem = async (req, res) => {
 
 exports.finalizeTab = async (req, res) => {
     try {
-        const result = await dineInTabService.finalizeTab(req.prisma, serviceOptions(req, {
+        const prisma = req.prisma || req.app.get('prisma');
+        const result = await dineInTabService.finalizeTab(prisma, serviceOptions(req, {
             tabId: req.params.tabId,
             userId: req.user.id,
             taxRatePct: req.body.taxRatePct,
@@ -62,7 +79,8 @@ exports.finalizeTab = async (req, res) => {
 
 exports.confirmAndPay = async (req, res) => {
     try {
-        const result = await dineInTabService.confirmAndPay(req.prisma, serviceOptions(req, {
+        const prisma = req.prisma || req.app.get('prisma');
+        const result = await dineInTabService.confirmAndPay(prisma, serviceOptions(req, {
             tabId: req.params.tabId,
             customerId: req.user.id,
             tipUsdc: req.body.tipUsdc,
@@ -73,11 +91,11 @@ exports.confirmAndPay = async (req, res) => {
 
 exports.getTab = async (req, res) => {
     try {
-        const tab = await dineInTabService.getTab(req.prisma, serviceOptions(req, {
+        const prisma = req.prisma || req.app.get('prisma');
+        const tab = await dineInTabService.getTab(prisma, serviceOptions(req, {
             tabId: req.params.tabId,
             customerId: req.user.id,
         }));
-        const prisma = req.prisma || req.app.get('prisma');
         const table = tab?.tableId
             ? await prisma.businessTable.findUnique({
                 where: { id: tab.tableId },
@@ -90,27 +108,29 @@ exports.getTab = async (req, res) => {
                 select: { id: true, bizId: true, businessName: true, logoUrl: true },
             })
             : tab?.businessProfile;
-        res.json({
-            success: true,
-            tab: tab ? { ...tab, table, businessProfile: business } : tab,
-        });
+        res.json({ success: true, tab: tab ? { ...tab, table, businessProfile: business } : tab });
     } catch (err) { res.status(400).json({ success: false, message: err.message }); }
 };
 
 exports.getOpenTabs = async (req, res) => {
     try {
-        const tabs = await dineInTabService.getOpenTabs(req.prisma, serviceOptions(req, {
-            businessProfileId: req.query.businessProfileId,
+        const prisma = req.prisma || req.app.get('prisma');
+        const businessProfileId = await getEffectiveBusinessProfileId(req, prisma);
+        if (!businessProfileId) return res.status(403).json({ success: false, message: 'No business profile.' });
+        const tabs = await dineInTabService.getOpenTabs(prisma, serviceOptions(req, {
+            businessProfileId,
             userId: req.user.id,
             status: req.query.status,
         }));
         res.json({ success: true, tabs });
-    } catch (err) { res.status(400).json({ success: false, message: err.message }); }
+    } catch (err) { res.status(400).json({ success: false, message: err.message });
+    }
 };
 
 exports.reportDefault = async (req, res) => {
     try {
-        const result = await dineInTabService.reportDefault(req.prisma, serviceOptions(req, {
+        const prisma = req.prisma || req.app.get('prisma');
+        const result = await dineInTabService.reportDefault(prisma, serviceOptions(req, {
             tabId: req.params.tabId,
             userId: req.user.id,
             reason: req.body.reason,
@@ -122,11 +142,7 @@ exports.reportDefault = async (req, res) => {
 exports.getGuests = async (req, res) => {
     try {
         const prisma = req.prisma || req.app.get('prisma');
-        const businessId = req.adminScopedBusiness?.id ||
-            (await prisma.businessProfile.findFirst({
-                where: { userId: req.user.id }, select: { id: true }
-            }))?.id;
-
+        const businessId = await getEffectiveBusinessProfileId(req, prisma);
         if (!businessId) return res.status(404).json({ success: false, message: 'No business profile.' });
 
         const guests = await prisma.dineInTab.findMany({
@@ -135,7 +151,6 @@ exports.getGuests = async (req, res) => {
             distinct: ['customerId'],
             take: 50,
         });
-
         res.json({ success: true, guests: guests.map(g => g.customer) });
     } catch (err) { res.status(500).json({ success: false, message: err.message }); }
 };
@@ -146,11 +161,7 @@ exports.searchGuests = async (req, res) => {
         const { query } = req.query;
         if (!query) return res.json({ success: true, guests: [] });
 
-        const businessId = req.adminScopedBusiness?.id ||
-            (await prisma.businessProfile.findFirst({
-                where: { userId: req.user.id }, select: { id: true }
-            }))?.id;
-
+        const businessId = await getEffectiveBusinessProfileId(req, prisma);
         if (!businessId) return res.status(404).json({ success: false, message: 'No business profile.' });
 
         const guests = await prisma.dineInTab.findMany({
@@ -167,7 +178,6 @@ exports.searchGuests = async (req, res) => {
             distinct: ['customerId'],
             take: 10,
         });
-
         res.json({ success: true, guests: guests.map(g => g.customer) });
     } catch (err) { res.status(500).json({ success: false, message: err.message }); }
 };
