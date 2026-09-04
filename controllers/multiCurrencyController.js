@@ -142,7 +142,7 @@ async function convertCurrency(req, res) {
       return res.status(400).json({ success: false, message: 'Unsupported currency pair.' });
     }
 
-    if (amt < MIN_CONVERSION) {
+    if (!Number.isFinite(amt) || amt < MIN_CONVERSION) {
       return res.status(400).json({ success: false, message: `Minimum conversion is ${MIN_CONVERSION}.` });
     }
 
@@ -160,7 +160,9 @@ async function convertCurrency(req, res) {
     const effectiveRate = rate * (1 - FX_SPREAD);
     const toAmount = amt * effectiveRate;
 
-    // Check source wallet balance
+    // Resolve the source wallet once; the actual balance check happens in the
+    // conditional transaction update below so concurrent conversions cannot
+    // both spend the same stale balance snapshot.
     const sourceWallet = await prisma.currencyWallet.findUnique({
       where: { userId_currency: { userId, currency: from } },
     });
@@ -169,29 +171,28 @@ async function convertCurrency(req, res) {
       return res.status(404).json({ success: false, message: `${from} wallet not found.` });
     }
 
-    const sourceBal = parseFloat(sourceWallet.balance.toString());
-    if (sourceBal < amt) {
-      return res.status(400).json({ success: false, message: 'Insufficient balance.' });
-    }
-
     // Execute conversion
     const result = await prisma.$transaction(async (tx) => {
-      // Debit source wallet
-      await tx.currencyWallet.update({
-        where: { id: sourceWallet.id },
+      // Debit source wallet atomically. The predicate is the authoritative
+      // insufficient-balance check under concurrency.
+      const debit = await tx.currencyWallet.updateMany({
+        where: { id: sourceWallet.id, balance: { gte: amt } },
         data: { balance: { decrement: amt } },
       });
 
-      // Get or create destination wallet
-      let destWallet = await tx.currencyWallet.findUnique({
-        where: { userId_currency: { userId, currency: to } },
-      });
-
-      if (!destWallet) {
-        destWallet = await tx.currencyWallet.create({
-          data: { userId, currency: to, balance: 0 },
-        });
+      if (debit.count !== 1) {
+        const err = new Error('Insufficient balance. Your wallet changed; please retry.');
+        err.code = 'INSUFFICIENT_CURRENCY_BALANCE';
+        throw err;
       }
+
+      // Upsert prevents simultaneous conversions from racing to create the
+      // same destination wallet under the unique user/currency key.
+      const destWallet = await tx.currencyWallet.upsert({
+        where: { userId_currency: { userId, currency: to } },
+        update: {},
+        create: { userId, currency: to, balance: 0 },
+      });
 
       // Credit destination wallet
       await tx.currencyWallet.update({
@@ -241,7 +242,8 @@ async function convertCurrency(req, res) {
     });
   } catch (err) {
     logger.error({ err }, '[multiCurrency] convert error');
-    return res.status(500).json({ success: false, message: 'Conversion failed.' });
+    const status = err?.code === 'INSUFFICIENT_CURRENCY_BALANCE' ? 400 : 500;
+    return res.status(status).json({ success: false, message: err?.message || 'Conversion failed.' });
   }
 }
 
