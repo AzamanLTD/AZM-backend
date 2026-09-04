@@ -92,7 +92,14 @@ class DineInService {
 
     async _productWhereForTab(tab, productId) {
         const where = { id: productId, businessProfileId: tab.businessProfileId, isActive: true, isAvailable: true };
-        if (tab.locationId) where.OR = [{ locationId: null }, { locationId: tab.locationId }];
+        // A location-bound tab may use global products or exact-branch products.
+        // A legacy/locationless tab may only use global products; otherwise an old
+        // tab could bypass the branch boundary by omitting location context.
+        if (tab.locationId) {
+            where.OR = [{ locationId: null }, { locationId: tab.locationId }];
+        } else {
+            where.locationId = null;
+        }
         return where;
     }
 

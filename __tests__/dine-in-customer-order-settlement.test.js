@@ -49,7 +49,7 @@ describe('dine-in customer ordering and settlement', () => {
     await new Service(prisma).addItem({ tabId: 'tab-1', productId: 'product-1', name: 'Forged Burger', price: 999, quantity: 1, addedBy: 42 });
 
     expect(prisma.businessProduct.findFirst).toHaveBeenCalledWith(expect.objectContaining({
-      where: { id: 'product-1', businessProfileId: 'biz-1', isActive: true, isAvailable: true },
+      where: expect.objectContaining({ id: 'product-1', businessProfileId: 'biz-1', isActive: true, isAvailable: true, locationId: null }),
     }));
     expect(prisma.dineInTabItem.create).toHaveBeenCalledWith(expect.objectContaining({
       data: expect.objectContaining({ name: 'Burger', unitPriceUsdc: 10, lineTotalUsdc: 10 }),
