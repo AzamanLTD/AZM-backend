@@ -253,12 +253,24 @@ const payInvoice = async (prisma, {
     });
 
     return { invoice: result, customerPays, businessReceives, fee };
-  } catch (error) {
-    if (error.message === 'INVOICE_ALREADY_PAID') {
-      const settled = await prisma.businessInvoice.findUnique({ where: { id: invoiceId }, include: { lineItems: true, taxLines: true } });
-      if (settled?.payTxHash) return { invoice: settled, customerPays: Number(settled.customerPaidUsdc), alreadyPaid: true };
+  } catch (err) {
+    if (err.message === 'INVOICE_ALREADY_PAID') {
+      // The losing concurrent request must return the committed invoice rather
+      // than re-running any financial mutation. A refetch also handles a
+      // replay arriving after the first payment has fully committed.
+      const paidInvoice = await prisma.businessInvoice.findUnique({
+        where: { id: invoiceId },
+        include: { businessProfile: { select: { userId: true, businessName: true, bizId: true } } },
+      });
+      if (paidInvoice?.payTxHash) {
+        return {
+          invoice: paidInvoice,
+          customerPays: Number(paidInvoice.customerPaidUsdc),
+          alreadyPaid: true,
+        };
+      }
     }
-    throw error;
+    throw err;
   }
 };
 
