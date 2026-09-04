@@ -13,6 +13,20 @@
 const financeService = require('./finance.service');
 const { recordProviderSettlementAttempt } = require('./providerSettlementAttemptService');
 
+const enrichProviderReference = async (prisma, reference, currentTransaction, providerTxId) => {
+    if (!providerTxId || currentTransaction?.providerRef) return currentTransaction;
+
+    const latest = await prisma.transactionHistory.findUnique({
+        where: { txHash: reference }
+    });
+    if (!latest || latest.providerRef) return latest || currentTransaction;
+
+    return prisma.transactionHistory.update({
+        where: { txHash: reference },
+        data: { providerRef: String(providerTxId) }
+    });
+};
+
 const settleFiatWithdrawal = async (prisma, {
     reference,
     status,
@@ -53,9 +67,22 @@ const settleFiatWithdrawal = async (prisma, {
         const result = await financeService.completeFiatWithdrawal(prisma, reference, {
             providerTxId
         });
+
+        // A SUCCESSFUL callback may be a duplicate for a row that was already
+        // completed by an earlier callback/reconciliation. In that case the
+        // economics boundary correctly does nothing; we can still persist the
+        // provider transaction reference as harmless idempotent metadata.
+        const transaction = await enrichProviderReference(
+            prisma,
+            reference,
+            result.transaction,
+            providerTxId
+        );
+
         return {
             ...result,
-            providerTxId: result.providerTxId || providerTxId || null
+            providerTxId: transaction?.providerRef || result.providerTxId || providerTxId || null,
+            transaction
         };
     }
 
@@ -63,37 +90,55 @@ const settleFiatWithdrawal = async (prisma, {
     // reversal. This prevents a contradictory late FAILED callback from
     // refunding a withdrawal that has already been authoritatively completed.
     if (original.status === 'FAILED') {
+        const transaction = await enrichProviderReference(
+            prisma,
+            reference,
+            original,
+            providerTxId
+        );
         return {
             reference,
             userId: original.userId,
             status: 'FAILED',
             changed: false,
             alreadyReversed: true,
-            providerTxId: providerTxId || original.providerRef || null,
-            transaction: original
+            providerTxId: transaction?.providerRef || providerTxId || null,
+            transaction
         };
     }
 
     if (original.status === 'COMPLETED') {
+        const transaction = await enrichProviderReference(
+            prisma,
+            reference,
+            original,
+            providerTxId
+        );
         return {
             reference,
             userId: original.userId,
             status: 'COMPLETED',
             changed: false,
             conflictingTerminalCallback: true,
-            providerTxId: providerTxId || original.providerRef || null,
-            transaction: original
+            providerTxId: transaction?.providerRef || providerTxId || null,
+            transaction
         };
     }
 
     if (original.status !== 'PENDING') {
+        const transaction = await enrichProviderReference(
+            prisma,
+            reference,
+            original,
+            providerTxId
+        );
         return {
             reference,
             userId: original.userId,
             status: original.status,
             changed: false,
-            providerTxId: providerTxId || original.providerRef || null,
-            transaction: original
+            providerTxId: transaction?.providerRef || providerTxId || null,
+            transaction
         };
     }
 
@@ -104,12 +149,7 @@ const settleFiatWithdrawal = async (prisma, {
     let transaction = await prisma.transactionHistory.findUnique({
         where: { txHash: reference }
     });
-    if (transaction && providerTxId && !transaction.providerRef) {
-        transaction = await prisma.transactionHistory.update({
-            where: { txHash: reference },
-            data: { providerRef: String(providerTxId) }
-        });
-    }
+    transaction = await enrichProviderReference(prisma, reference, transaction, providerTxId);
 
     return {
         reference,
