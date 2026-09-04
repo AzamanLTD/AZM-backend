@@ -42,7 +42,12 @@ describe('processFiatWithdrawal customer balance concurrency guard', () => {
         findFirst: jest.fn().mockResolvedValue(referrer),
       },
       globalSettings: {
-        findUnique: jest.fn().mockResolvedValue(null),
+        findUnique: jest.fn().mockResolvedValue({
+          liveRetailRate: 13.25,
+          liveUsdToGhs: 13.10,
+          liveRateSource: 'KOTANI_PAY',
+          lastRateSync: '2026-09-04T11:30:00.000Z',
+        }),
       },
       systemFiatPool: {
         findUnique: jest.fn().mockResolvedValue({ balance: 40 }),
@@ -63,6 +68,26 @@ describe('processFiatWithdrawal customer balance concurrency guard', () => {
       data: { availableBalance: { decrement: 20.4 } },
     });
     expect(tx.transactionHistory.create).toHaveBeenCalled();
+  });
+
+  test('derives the GHS payout from liveRetailRate rather than treating USDC as GHS', async () => {
+    const { prisma, tx } = buildPrisma();
+
+    await processFiatWithdrawal(prisma, 7, 20, { reference: 'RATE-1' });
+
+    expect(tx.transactionHistory.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        amountUsdc: 20,
+        metadata: expect.objectContaining({
+          retailRate: 13.25,
+          payoutGhs: 265,
+          rateSource: 'KOTANI_PAY',
+          ratePair: 'USDC/GHS',
+          settlementCurrency: 'USDC',
+          displayCurrency: 'GHS',
+        }),
+      }),
+    });
   });
 
   test('stores settlement economics but does not realize fees or referral rewards while PENDING', async () => {
