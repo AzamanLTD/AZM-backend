@@ -40,7 +40,11 @@ describe('processFiatWithdrawal fiat-pool concurrency guard', () => {
         findFirst: jest.fn(),
       },
       globalSettings: {
-        findUnique: jest.fn().mockResolvedValue(null),
+        findUnique: jest.fn().mockResolvedValue({
+          liveRetailRate: 13,
+          liveRateSource: 'KOTANI_PAY',
+          lastRateSync: new Date('2026-09-04T00:00:00.000Z'),
+        }),
       },
       systemFiatPool: {
         findUnique: jest.fn().mockResolvedValue({ balance: 40 }),
