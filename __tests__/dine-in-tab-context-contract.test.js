@@ -47,6 +47,7 @@ describe('dine-in customer tab context contract', () => {
           }),
         },
         businessProfile: {
+          findFirst: jest.fn().mockResolvedValue(null),
           findUnique: jest.fn().mockResolvedValue({
             id: 'biz-1',
             bizId: 'BIZ-123456789',
