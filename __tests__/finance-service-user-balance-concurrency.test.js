@@ -3,7 +3,7 @@ jest.mock('../utils/securityCheck', () => ({ runDoubleCheck: jest.fn().mockResol
 const { processFiatWithdrawal } = require('../services/finance.service');
 
 describe('processFiatWithdrawal customer balance concurrency guard', () => {
-  const buildPrisma = ({ userClaimCount = 1 } = {}) => {
+  const buildPrisma = ({ userClaimCount = 1, referrer = null } = {}) => {
     const tx = {
       user: {
         findUnique: jest.fn().mockResolvedValue({ id: 7, availableBalance: 20.4, withdrawalRiskTier: 'STANDARD' }),
@@ -30,14 +30,16 @@ describe('processFiatWithdrawal customer balance concurrency guard', () => {
         create: jest.fn().mockResolvedValue({ id: 'log' }),
       },
       transactionHistory: {
-        create: jest.fn().mockResolvedValue({ id: 'tx', status: 'PENDING' }),
+        create: jest.fn().mockImplementation(({ data }) => Promise.resolve({ id: 'tx', ...data })),
       },
     };
 
     const prisma = {
       user: {
-        findUnique: jest.fn().mockResolvedValue({ referredByCode: null }),
-        findFirst: jest.fn(),
+        findUnique: jest.fn()
+          .mockResolvedValueOnce(referrer ? { referredByCode: 'REFCODE' } : { referredByCode: null })
+          .mockResolvedValueOnce({ withdrawalRiskTier: 'STANDARD' }),
+        findFirst: jest.fn().mockResolvedValue(referrer),
       },
       globalSettings: {
         findUnique: jest.fn().mockResolvedValue(null),
@@ -61,6 +63,36 @@ describe('processFiatWithdrawal customer balance concurrency guard', () => {
       data: { availableBalance: { decrement: 20.4 } },
     });
     expect(tx.transactionHistory.create).toHaveBeenCalled();
+  });
+
+  test('stores settlement economics but does not realize fees or referral rewards while PENDING', async () => {
+    const referrer = { id: 99, username: 'ref-user' };
+    const { prisma, tx } = buildPrisma({ referrer });
+
+    await processFiatWithdrawal(prisma, 7, 20, {
+      reference: 'BAL-DEFER',
+      retailRate: 13.25,
+      payoutGhs: 265,
+    });
+
+    expect(tx.transactionHistory.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({
+        txHash: 'BAL-DEFER',
+        status: 'PENDING',
+        metadata: expect.objectContaining({
+          economicsDeferred: true,
+          referrerId: 99,
+          referrerShareUsdc: 0.2,
+          systemFeeShareUsdc: 0.2,
+          retailRate: 13.25,
+          payoutGhs: 265,
+        }),
+      }),
+    });
+    expect(tx.user.update).not.toHaveBeenCalled();
+    expect(tx.systemProfitFees.update).not.toHaveBeenCalled();
+    expect(tx.adminProfitLog.create).not.toHaveBeenCalled();
+    expect(tx.adminProfitLog.createMany).not.toHaveBeenCalled();
   });
 
   test('aborts the withdrawal when the conditional customer debit loses the race', async () => {
