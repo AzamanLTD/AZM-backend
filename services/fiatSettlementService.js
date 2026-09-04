@@ -13,6 +13,24 @@
 const financeService = require('./finance.service');
 const { recordProviderSettlementAttempt } = require('./providerSettlementAttemptService');
 
+// Provider references are mutable only while a withdrawal is still in its
+// reservation lifecycle. Once a terminal state has a provider reference, a
+// later callback must never overwrite it: contradictory callbacks are evidence
+// to retain, not an instruction to rewrite the authoritative settlement record.
+const enrichProviderReference = async (prisma, reference, currentTransaction, providerTxId) => {
+    if (!providerTxId || currentTransaction?.providerRef) return currentTransaction;
+
+    const latest = await prisma.transactionHistory.findUnique({
+        where: { txHash: reference }
+    });
+    if (!latest || latest.providerRef) return latest || currentTransaction;
+
+    return prisma.transactionHistory.update({
+        where: { txHash: reference },
+        data: { providerRef: String(providerTxId) }
+    });
+};
+
 const settleFiatWithdrawal = async (prisma, {
     reference,
     status,
@@ -40,9 +58,6 @@ const settleFiatWithdrawal = async (prisma, {
         throw error;
     }
 
-    // Durable external identity is recorded independently of the ledger state.
-    // This means duplicate/late callbacks can always be correlated to the same
-    // provider attempt without user+amount+timestamp heuristics.
     await recordProviderSettlementAttempt(prisma, {
         reference,
         provider,
@@ -52,62 +67,32 @@ const settleFiatWithdrawal = async (prisma, {
         failureReason: status === 'FAILED' ? reason : null
     });
 
-    // SUCCESSFUL: atomically claim only PENDING rows. A duplicate callback is
-    // therefore harmless, and a late SUCCESS cannot resurrect a FAILED row.
     if (status === 'SUCCESSFUL') {
-        const claim = await prisma.transactionHistory.updateMany({
-            where: {
-                txHash: reference,
-                status: 'PENDING'
-            },
-            data: {
-                status: 'COMPLETED',
-                ...(providerTxId ? { providerRef: String(providerTxId) } : {})
-            }
+        // The finance service owns the authoritative PENDING -> COMPLETED
+        // transition and its economics. For an already-COMPLETED record, the
+        // call is intentionally a no-op; a missing provider reference can then
+        // be filled once, without touching balances or economics. For a FAILED
+        // terminal record, do not mutate the stored provider reference even if
+        // it is absent: the late SUCCESS is contradictory evidence and must not
+        // turn into a new authoritative provider identity.
+        const result = await financeService.completeFiatWithdrawal(prisma, reference, {
+            providerTxId
         });
 
-        if (claim.count === 1) {
-            const transaction = await prisma.transactionHistory.findUnique({
-                where: { txHash: reference }
-            });
-            return {
+        let transaction = result.transaction;
+        if (original.status === 'COMPLETED') {
+            transaction = await enrichProviderReference(
+                prisma,
                 reference,
-                userId: original.userId,
-                status: 'COMPLETED',
-                changed: true,
-                providerTxId: providerTxId || transaction?.providerRef || null,
-                transaction
-            };
-        }
-
-        // The row may already be COMPLETED from a duplicate callback or an
-        // older provider path. Preserve terminal state and enrich providerRef
-        // only when it has not been recorded yet.
-        const current = await prisma.transactionHistory.findUnique({
-            where: { txHash: reference }
-        });
-        if (current?.status === 'COMPLETED' && providerTxId && !current.providerRef) {
-            const transaction = await prisma.transactionHistory.update({
-                where: { txHash: reference },
-                data: { providerRef: String(providerTxId) }
-            });
-            return {
-                reference,
-                userId: current.userId,
-                status: 'COMPLETED',
-                changed: false,
-                providerTxId: transaction.providerRef,
-                transaction
-            };
+                result.transaction,
+                providerTxId
+            );
         }
 
         return {
-            reference,
-            userId: current?.userId || original.userId,
-            status: current?.status || original.status,
-            changed: false,
-            providerTxId: providerTxId || current?.providerRef || null,
-            transaction: current
+            ...result,
+            providerTxId: providerTxId || result.providerTxId || transaction?.providerRef || null,
+            transaction
         };
     }
 
@@ -149,22 +134,25 @@ const settleFiatWithdrawal = async (prisma, {
         };
     }
 
-    const reversal = await financeService.reverseFiatWithdrawal(prisma, reference, {
-        reason: reason || 'Provider reported FAILED settlement.'
-    });
-
-    // Keep the provider transaction identifier on the canonical ledger row.
-    // reverseFiatWithdrawal deliberately owns the financial refund; this update
-    // only enriches the already-terminal audit record.
-    let transaction = await prisma.transactionHistory.findUnique({
-        where: { txHash: reference }
-    });
-    if (transaction && providerTxId && !transaction.providerRef) {
+    // A PENDING provider result may add its external identity once. Persist it
+    // before the reversal so the callback remains auditable even if the mocked
+    // or real reversal path re-reads the transaction after changing status.
+    let transaction = original;
+    if (providerTxId && !original.providerRef) {
         transaction = await prisma.transactionHistory.update({
             where: { txHash: reference },
             data: { providerRef: String(providerTxId) }
         });
     }
+
+    const reversal = await financeService.reverseFiatWithdrawal(prisma, reference, {
+        reason: reason || 'Provider reported FAILED settlement.'
+    });
+
+    const latest = await prisma.transactionHistory.findUnique({
+        where: { txHash: reference }
+    });
+    transaction = latest || transaction;
 
     return {
         reference,
