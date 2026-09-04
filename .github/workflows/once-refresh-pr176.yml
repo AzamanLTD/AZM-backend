@@ -1,0 +1,30 @@
+name: Refresh fiat withdrawal PR against main
+
+"on":
+  push:
+    branches:
+      - fix/fiat-withdrawal-user-balance-concurrency
+
+permissions:
+  contents: write
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Rebase branch onto current main
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git fetch origin main
+          git merge origin/main --no-edit
+          git push origin HEAD:fix/fiat-withdrawal-user-balance-concurrency
+          rm -f .github/workflows/once-refresh-pr176.yml
+          git add .github/workflows/once-refresh-pr176.yml
+          git commit -m 'chore: remove temporary PR refresh workflow'
+          git push origin HEAD:fix/fiat-withdrawal-user-balance-concurrency
