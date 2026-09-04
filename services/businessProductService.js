@@ -274,10 +274,11 @@ const updateProduct = async (prisma, { productId, businessProfileId, updates }) 
     return prisma.businessProduct.update({ where: { id: productId }, data });
 };
 
-const listProducts = async (prisma, { businessProfileId, isActive, limit, cursor }) => {
+const listProducts = async (prisma, { businessProfileId, isActive, locationId, limit, cursor }) => {
     const take = Math.min(Math.max(parseInt(limit, 10) || 20, 1), 50);
     const where = { businessProfileId };
     if (typeof isActive === 'boolean') where.isActive = isActive;
+    if (locationId) where.OR = [{ locationId: null }, { locationId }];
 
     const rows = await prisma.businessProduct.findMany({
         where,
@@ -324,10 +325,4 @@ const deleteProduct = async (prisma, { productId, businessProfileId }) => {
     return prisma.businessProduct.update({ where: { id: productId }, data: { isActive: false } });
 };
 
-module.exports = {
-    createProduct,
-    updateProduct,
-    listProducts,
-    getProduct,
-    deleteProduct,
-};
+module.exports = { createProduct, updateProduct, listProducts, getProduct, deleteProduct };
