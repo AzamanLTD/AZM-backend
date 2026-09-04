@@ -148,13 +148,15 @@ const pingVendor = async (prisma, { tradeId, buyerId }) => {
  * availableBalance into vendorUnallocatedBalance so the escrow can proceed.
  *
  * ACID guarantee: both sides of the balance move happen in one $transaction.
+ * The balance predicate is evaluated by the database, not by a stale pre-read,
+ * so concurrent ping accepts cannot overspend availableBalance.
  *
  * @param {object} prisma
  * @param {{ tradeId: number, vendorId: number, topUpAmount: number }} params
  * @returns {Promise<{ newAvailableBalance: number, newVendorUnallocatedBalance: number }>}
  */
 const acceptPing = async (prisma, { tradeId, vendorId, topUpAmount }) => {
-    if (!topUpAmount || topUpAmount <= 0) throw new Error('topUpAmount must be positive.');
+    if (!Number.isFinite(topUpAmount) || topUpAmount <= 0) throw new Error('topUpAmount must be positive.');
 
     const trade = await prisma.trade.findUnique({
         where:  { id: tradeId },
@@ -167,29 +169,32 @@ const acceptPing = async (prisma, { tradeId, vendorId, topUpAmount }) => {
         throw new Error(`Cannot accept ping: trade status is ${trade.status}.`);
 
     const result = await prisma.$transaction(async (tx) => {
-        const vendor = await tx.user.findUnique({ where: { id: vendorId } });
-        if (!vendor) throw new Error('Vendor not found.');
-
-        if (vendor.availableBalance < topUpAmount) {
-            throw new Error(
-                `Insufficient available balance. ` +
-                `Required: ${topUpAmount} USDC, available: ${vendor.availableBalance.toFixed(6)} USDC.`
-            );
-        }
-
-        const updated = await tx.user.update({
-            where: { id: vendorId },
+        const updated = await tx.user.updateMany({
+            where: {
+                id: vendorId,
+                availableBalance: { gte: topUpAmount }
+            },
             data: {
                 availableBalance:         { decrement: topUpAmount },
                 vendorUnallocatedBalance: { increment: topUpAmount }
-            },
-            select: { availableBalance: true, vendorUnallocatedBalance: true }
+            }
         });
 
-        // Notify the buyer that the vendor has topped up
-        // Phase N: removed from transaction — delivered post-commit via controller.
+        if (updated.count !== 1) {
+            throw new Error(
+                'Insufficient available balance. Your balance changed; please retry the top-up.'
+            );
+        }
 
-        return updated;
+        // Read the row after the successful conditional mutation so the response
+        // reflects committed balance values rather than a stale snapshot.
+        const balances = await tx.user.findUnique({
+            where: { id: vendorId },
+            select: { availableBalance: true, vendorUnallocatedBalance: true }
+        });
+        if (!balances) throw new Error('Vendor not found after balance update.');
+
+        return balances;
     });
 
     return {
@@ -532,7 +537,7 @@ const flagOverpayment = async (prisma, { tradeId, buyerId, overpaidAmountUsdc })
                 title:         '⚠️ Overpayment Dispute — Funds Frozen',
                 body:          `Buyer reported an overpayment on Trade #${tradeId}. ${overpaidAmountUsdc} USDC has been moved to dispute escrow.`,
                 category:      'VENDOR_PRIORITY',
-                actionPayload: { action: 'OPEN_TRADE', tradeId: String(tradeId) }
+                actionPayload: { action: 'VENDOR_PRIORITY', tradeId: String(tradeId) }
             }
         ]
     };
@@ -554,7 +559,7 @@ const flagOverpayment = async (prisma, { tradeId, buyerId, overpaidAmountUsdc })
  *
  * @param {object} prisma
  * @param {{
- *   tradeId:         number,
+ *   tradeId: number,
  *   releasedByUserId: number   // must be vendorId for SELL ad, userId for BUY ad
  * }} params
  */
@@ -640,7 +645,7 @@ const completeTrade = async (prisma, { tradeId, releasedByUserId, adminOverride 
     const result = await prisma.$transaction(async (tx) => {
         // Phase H8 BUGFIX (2026-05-27): atomic conditional status flip.
         // The status check was happening OUTSIDE the transaction
-        // (`findUnique` at the top of the function), so two concurrent
+        // (`findUnique` at the top of this function), so two concurrent
         // `completeTrade` calls (vendor double-tapping the release
         // button under bad latency) both saw status=PAID, both passed
         // auth, and both entered this transaction. Without a unique
@@ -825,7 +830,7 @@ const completeTrade = async (prisma, { tradeId, releasedByUserId, adminOverride 
                     title:         '🎉 USDC Received!',
                     body:          `Trade #${tradeId} settled. ${(trade.amountCrypto - adminCutUsdc).toFixed(4)} USDC credited to your wallet.`,
                     category:      'VENDOR_PRIORITY',
-                    actionPayload: { action: 'OPEN_WALLET', tradeId: String(tradeId) }
+                    actionPayload: { action: 'OPEN_TRADE', tradeId: String(tradeId) }
                 }
             ]
             : [
@@ -841,7 +846,7 @@ const completeTrade = async (prisma, { tradeId, releasedByUserId, adminOverride 
                     title:         '✅ Trade Settled',
                     body:          `Trade #${tradeId} settled. Escrow released.`,
                     category:      'VENDOR_PRIORITY',
-                    actionPayload: { action: 'OPEN_WALLET', tradeId: String(tradeId) }
+                    actionPayload: { action: 'OPEN_TRADE', tradeId: String(tradeId) }
                 }
             ]
     };
@@ -852,8 +857,7 @@ const completeTrade = async (prisma, { tradeId, releasedByUserId, adminOverride 
 //     Runs the vendor gamification engine OUTSIDE the trade-complete
 //     transaction, scheduled via setImmediate from the controller after the
 //     HTTP response has been sent. Uses the regular `prisma` client (not a
-//     transaction) so each gamification write commits independently. Errors
-//     are caught and logged — they cannot fail the already-settled trade.
+//     transaction) so each gamification write commits independently.
 //
 //     Returns the gamification engine's result (or null on failure) so the
 //     caller can emit the `gamification_update` socket event with the same

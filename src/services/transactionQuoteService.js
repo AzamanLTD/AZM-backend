@@ -10,18 +10,7 @@ function roundMoney(value) {
   return Math.round((value + Number.EPSILON) * 100) / 100;
 }
 
-function createTransactionQuote({
-  amountGhs,
-  rateGhsPerUsdc,
-  feeGhs = 0,
-  ttlSeconds = DEFAULT_QUOTE_TTL_SECONDS,
-  now = new Date(),
-  rateSource = 'AZM_ADMIN_MOCK',
-  rateAsOf = now,
-  id = crypto.randomUUID(),
-  purpose = 'usdc_purchase',
-  userId = null,
-}) {
+function createTransactionQuote({ amountGhs, rateGhsPerUsdc, feeGhs = 0, ttlSeconds = DEFAULT_QUOTE_TTL_SECONDS, now = new Date(), rateSource = 'AZM_ADMIN_MOCK', rateAsOf = now, id = crypto.randomUUID(), purpose = 'usdc_purchase', userId = null }) {
   if (!Number.isFinite(amountGhs) || amountGhs <= 0) throw new Error('amountGhs must be greater than zero');
   if (!Number.isFinite(rateGhsPerUsdc) || rateGhsPerUsdc < MIN_RATE_GHS_PER_USDC || rateGhsPerUsdc > MAX_RATE_GHS_PER_USDC) throw new Error('rateGhsPerUsdc is outside the permitted range');
   if (!Number.isFinite(feeGhs) || feeGhs < 0) throw new Error('feeGhs must be zero or greater');
@@ -53,17 +42,23 @@ async function getServerRateGhsPerUsdc({ prisma, marketOracle }) {
 
   const settings = await prisma.globalSettings.findUnique({
     where: { id: 1 },
-    select: { liveUsdToGhs: true, liveRateSource: true, lastRateSync: true },
+    select: { liveRetailRate: true, liveUsdToGhs: true, liveRateSource: true, lastRateSync: true },
   });
-  const usdToGhs = Number(settings?.liveUsdToGhs);
 
-  if (!Number.isFinite(usdToGhs) || usdToGhs <= 0) {
+  // `liveRetailRate` is the canonical user-facing USDC/GHS rate. The legacy
+  // USD/GHS field is retained only as a compatibility fallback for older
+  // installations that predate the explicit USDC retail-rate field.
+  const retailRate = Number(settings?.liveRetailRate);
+  const legacyRate = Number(settings?.liveUsdToGhs);
+  const rateGhsPerUsdc = Number.isFinite(retailRate) && retailRate > 0 ? retailRate : legacyRate;
+
+  if (!Number.isFinite(rateGhsPerUsdc) || rateGhsPerUsdc <= 0) {
     throw new Error('A current USDC/GHS rate is not available');
   }
 
   void marketOracle;
   return {
-    rateGhsPerUsdc: usdToGhs,
+    rateGhsPerUsdc,
     rateSource: settings?.liveRateSource || 'AZM_ADMIN_MOCK',
     rateAsOf: settings?.lastRateSync || new Date(),
   };
@@ -85,46 +80,19 @@ async function persistTransactionQuote(prisma, quote) {
   return quote;
 }
 
-async function createServerTransactionQuote({
-  prisma,
-  marketOracle,
-  userId,
-  purpose,
-  amountGhs,
-  feeGhs = 0,
-  ttlSeconds = DEFAULT_QUOTE_TTL_SECONDS,
-  now = new Date(),
-}) {
+async function createServerTransactionQuote({ prisma, marketOracle, userId, purpose, amountGhs, feeGhs = 0, ttlSeconds = DEFAULT_QUOTE_TTL_SECONDS, now = new Date() }) {
   const rate = await getServerRateGhsPerUsdc({ prisma, marketOracle });
-  const quote = createTransactionQuote({
-    userId,
-    purpose,
-    amountGhs,
-    rateGhsPerUsdc: rate.rateGhsPerUsdc,
-    rateSource: rate.rateSource,
-    rateAsOf: rate.rateAsOf,
-    feeGhs,
-    ttlSeconds,
-    now,
-  });
-
+  const quote = createTransactionQuote({ userId, purpose, amountGhs, rateGhsPerUsdc: rate.rateGhsPerUsdc, rateSource: rate.rateSource, rateAsOf: rate.rateAsOf, feeGhs, ttlSeconds, now });
   return persistTransactionQuote(prisma, quote);
 }
 
-async function consumeTransactionQuote({
-  prisma,
-  quoteId,
-  userId,
-  purpose,
-  now = new Date(),
-}) {
+async function consumeTransactionQuote({ prisma, quoteId, userId, purpose, now = new Date() }) {
   if (!prisma?.$queryRaw) throw new Error('Quote service requires Prisma raw SQL support');
   if (!quoteId || !userId || !Number.isInteger(Number(userId))) throw new Error('quoteId and userId are required');
 
   const rows = await prisma.$queryRaw`
     UPDATE "TransactionQuote"
-    SET "consumedAt" = ${new Date(now)},
-        "consumedFor" = ${purpose || null}
+    SET "consumedAt" = ${new Date(now)}, "consumedFor" = ${purpose || null}
     WHERE "id" = ${quoteId}::uuid
       AND "userId" = ${Number(userId)}
       AND (${purpose || null}::text IS NULL OR "purpose" = ${purpose})
@@ -135,9 +103,7 @@ async function consumeTransactionQuote({
               "createdAt", "expiresAt", "consumedAt", "consumedFor"
   `;
 
-  if (!rows.length) {
-    throw new Error('Transaction quote is invalid, expired, already consumed, or not owned by this user');
-  }
+  if (!rows.length) throw new Error('Transaction quote is invalid, expired, already consumed, or not owned by this user');
 
   const row = rows[0];
   return {
