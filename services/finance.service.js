@@ -3,100 +3,59 @@
 // AZAMAN V2 — FINANCE SERVICE   (Phase B v2: The Arbitrage Capture)
 // Pure business-logic layer. No req/res. All multi-step DB writes are wrapped
 // in a single prisma.$transaction block to guarantee ACID compliance.
-//
-// Exported functions:
-//   processFiatWithdrawal(prisma, userId, amountFloat, opts)
-//   reverseFiatWithdrawal(prisma, reference, opts)
-//   liquidateProfits(prisma, amountFloat, adminId)
-//   processCryptoDeposit(prisma, { userId, amountUsdc, txHash })
-//
-// Phase B v2 — Arbitrage Fix
-// --------------------------
-// The off-ramp gateway (MTN MoMo Disbursement) NEVER receives Azaman's
-// USDC. Instead, when a user withdraws fiat:
-//
-//     • 100% of the principal (the `amountFloat`, i.e. the 98% net of the
-//       2 % exit fee) is moved into SYSTEM_MASTER_CRYPTO. Azaman now owns
-//       this crypto and will liquidate it later at the OTC premium —
-//       this is the entire reason the platform exists (see §1 / §4 of
-//       AZAMAN_MASTER_SOUL.md).
-//     • The 2 % exit fee continues to split 1 % to the influencer (when
-//       referredByCode → influencerCode resolves) and 1 % to
-//       SystemProfitFees, OR the full 2 % to SystemProfitFees otherwise.
-//     • SYSTEM_FIAT_POOL is debited the equivalent GHS, which the
-//       controller then disburses to the user via mtnDisbursementService.
-//
-// reverseFiatWithdrawal is the controlled refund path: re-credits the
-// user, refunds the influencer split, refunds SystemFiatPool, AND
-// unwinds the SYSTEM_MASTER_CRYPTO capture, then transitions the
-// original WITHDRAWAL_FIAT row → FAILED. Used when the MTN MoMo
-// disbursement rejects the payout (sync error or async webhook = FAILED).
 // =============================================================================
 
 const logger = require('../src/config/logger');
 const { runDoubleCheck } = require('../utils/securityCheck');
 
-// ── Constants ────────────────────────────────────────────────────────────────
-const EXIT_FEE_PERCENT        = 0.02;   // 2 % exit fee on fiat withdrawals
-const FIAT_POOL_ALERT_THRESH  = 5_000;  // USD — warn when fiat pool drops below
+const EXIT_FEE_PERCENT        = 0.02;
+const FIAT_POOL_ALERT_THRESH  = 5_000;
 
-// ── Internal helpers ─────────────────────────────────────────────────────────
-
-/** Lazy-upsert the SystemProfitFees singleton (id = 1). */
 const _ensureProfitFeesSingleton = async (tx) =>
-    tx.systemProfitFees.upsert({
-        where:  { id: 1 },
-        update: {},
-        create: { id: 1, balance: 0.0 }
-    });
+    tx.systemProfitFees.upsert({ where: { id: 1 }, update: {}, create: { id: 1, balance: 0.0 } });
 
-/** Lazy-upsert the SystemFiatPool singleton (id = 1). */
 const _ensureFiatPoolSingleton = async (tx) =>
-    tx.systemFiatPool.upsert({
-        where:  { id: 1 },
-        update: {},
-        create: { id: 1, balance: 0.0 }
-    });
+    tx.systemFiatPool.upsert({ where: { id: 1 }, update: {}, create: { id: 1, balance: 0.0 } });
 
-/** Lazy-upsert the SystemMasterCrypto singleton (id = 1). */
 const _ensureMasterCryptoSingleton = async (tx) =>
-    tx.systemMasterCrypto.upsert({
-        where:  { id: 1 },
-        update: {},
-        create: { id: 1, balance: 0.0 }
-    });
+    tx.systemMasterCrypto.upsert({ where: { id: 1 }, update: {}, create: { id: 1, balance: 0.0 } });
 
-/** Resolve the influencer (referrer) for a given user, or null. */
 const _resolveReferrer = async (prisma, userId) => {
-    const user = await prisma.user.findUnique({
-        where:  { id: userId },
-        select: { referredByCode: true }
-    });
+    const user = await prisma.user.findUnique({ where: { id: userId }, select: { referredByCode: true } });
     if (!user?.referredByCode) return null;
     return prisma.user.findFirst({
-        where:  { influencerCode: user.referredByCode },
+        where: { influencerCode: user.referredByCode },
         select: { id: true, username: true }
     });
 };
 
-// =============================================================================
-// 1. FIAT WITHDRAWAL  — Double-Check + Exit-Fee + Influencer Split + Arbitrage Capture
-//
-// The ledger mutation is committed before provider settlement, but the
-// canonical TransactionHistory row remains PENDING until the provider reports
-// success. This prevents the customer/status API from claiming money was sent
-// merely because Azaman reserved the funds internally.
-// =============================================================================
-const processFiatWithdrawal = async (prisma, userId, amountFloat, opts = {}) => {
+/**
+ * Atomically reserve fiat liquidity. The conditional update is the actual
+ * concurrency guard; a preflight read alone is not sufficient because two
+ * withdrawals can observe the same available balance before either commits.
+ */
+const _reserveFiatPool = async (tx, amountFloat) => {
+    const claim = await tx.systemFiatPool.updateMany({
+        where: { id: 1, balance: { gte: amountFloat } },
+        data: { balance: { decrement: amountFloat } },
+    });
 
+    if (claim.count !== 1) {
+        const err = new Error(
+            'MoMo payouts are temporarily at capacity. Your USDC has not been deducted. ' +
+            'Please try again in a few minutes or contact support.'
+        );
+        err.code = 'FIAT_POOL_INSUFFICIENT';
+        throw err;
+    }
+};
+
+const processFiatWithdrawal = async (prisma, userId, amountFloat, opts = {}) => {
     await runDoubleCheck(prisma, userId);
     const referrer = await _resolveReferrer(prisma, userId);
 
     const settings = await prisma.globalSettings.findUnique({ where: { id: 1 } });
-    const user = await prisma.user.findUnique({
-        where: { id: userId },
-        select: { withdrawalRiskTier: true }
-    });
+    const user = await prisma.user.findUnique({ where: { id: userId }, select: { withdrawalRiskTier: true } });
 
     let effectiveExitFeePct = EXIT_FEE_PERCENT;
     if (settings) {
@@ -141,24 +100,19 @@ const processFiatWithdrawal = async (prisma, userId, amountFloat, opts = {}) => 
             );
         }
 
-        await tx.user.update({
-            where: { id: userId },
-            data:  { availableBalance: { decrement: totalDeduct } }
-        });
+        // Reserve fiat liquidity before mutating the customer ledger. The
+        // conditional UPDATE makes concurrent withdrawals serialize safely at
+        // the treasury row instead of relying on a stale preflight snapshot.
+        await _reserveFiatPool(tx, amountFloat);
+
+        await tx.user.update({ where: { id: userId }, data: { availableBalance: { decrement: totalDeduct } } });
 
         await _ensureProfitFeesSingleton(tx);
-        await _ensureFiatPoolSingleton(tx);
         await _ensureMasterCryptoSingleton(tx);
 
         if (referrer) {
-            await tx.user.update({
-                where: { id: referrer.id },
-                data:  { availableBalance: { increment: halfFee } }
-            });
-            await tx.systemProfitFees.update({
-                where: { id: 1 },
-                data:  { balance: { increment: halfFee } }
-            });
+            await tx.user.update({ where: { id: referrer.id }, data: { availableBalance: { increment: halfFee } } });
+            await tx.systemProfitFees.update({ where: { id: 1 }, data: { balance: { increment: halfFee } } });
             await tx.adminProfitLog.createMany({
                 data: [
                     { amountUsdc: halfFee, source: 'EXIT_FEE', relatedTxId: `referral_split_system_${reference}` },
@@ -166,37 +120,21 @@ const processFiatWithdrawal = async (prisma, userId, amountFloat, opts = {}) => 
                 ]
             });
         } else {
-            await tx.systemProfitFees.update({
-                where: { id: 1 },
-                data:  { balance: { increment: exitFee } }
-            });
-            await tx.adminProfitLog.create({
-                data: { amountUsdc: exitFee, source: 'EXIT_FEE', relatedTxId: `full_fee_${reference}` }
-            });
+            await tx.systemProfitFees.update({ where: { id: 1 }, data: { balance: { increment: exitFee } } });
+            await tx.adminProfitLog.create({ data: { amountUsdc: exitFee, source: 'EXIT_FEE', relatedTxId: `full_fee_${reference}` } });
         }
 
-        await tx.systemMasterCrypto.update({
-            where: { id: 1 },
-            data:  { balance: { increment: amountFloat } }
-        });
-        await tx.adminProfitLog.create({
-            data: { amountUsdc: amountFloat, source: 'ARBITRAGE_SPREAD', relatedTxId: `arbitrage_capture_${reference}` }
-        });
+        await tx.systemMasterCrypto.update({ where: { id: 1 }, data: { balance: { increment: amountFloat } } });
+        await tx.adminProfitLog.create({ data: { amountUsdc: amountFloat, source: 'ARBITRAGE_SPREAD', relatedTxId: `arbitrage_capture_${reference}` } });
 
-        await tx.systemFiatPool.update({
-            where: { id: 1 },
-            data:  { balance: { decrement: amountFloat } }
-        });
-
-        // PENDING is deliberate: the provider has not settled yet.
         const txRecord = await tx.transactionHistory.create({
             data: {
                 userId,
-                type:       'WITHDRAWAL_FIAT',
+                type: 'WITHDRAWAL_FIAT',
                 amountUsdc: amountFloat,
-                feeUsdc:    exitFee,
-                txHash:     reference,
-                status:     'PENDING'
+                feeUsdc: exitFee,
+                txHash: reference,
+                status: 'PENDING'
             }
         });
 
@@ -237,34 +175,25 @@ const processFiatWithdrawal = async (prisma, userId, amountFloat, opts = {}) => 
     };
 };
 
-// =============================================================================
-// 2. REVERSE FIAT WITHDRAWAL  — Atomic refund when provider rejects
-//
-// PENDING is a valid pre-settlement state and may be reversed. The operation
-// remains idempotent: FAILED is the terminal already-reversed state.
-// =============================================================================
 const reverseFiatWithdrawal = async (prisma, reference, opts = {}) => {
     if (!reference) throw new Error('[reverseFiatWithdrawal] reference is required.');
 
     const original = await prisma.transactionHistory.findUnique({ where: { txHash: reference } });
     if (!original) throw new Error(`[reverseFiatWithdrawal] No row with reference ${reference}.`);
-    if (original.type !== 'WITHDRAWAL_FIAT') {
-        throw new Error(`[reverseFiatWithdrawal] Reference ${reference} is not a fiat withdrawal.`);
-    }
+    if (original.type !== 'WITHDRAWAL_FIAT') throw new Error(`[reverseFiatWithdrawal] Reference ${reference} is not a fiat withdrawal.`);
     if (original.status === 'FAILED') return { reference, alreadyReversed: true };
     if (original.status !== 'PENDING' && original.status !== 'COMPLETED') {
         throw new Error(`[reverseFiatWithdrawal] Cannot reverse row in state ${original.status}.`);
     }
 
-    const userId      = original.userId;
+    const userId = original.userId;
     const amountFloat = Number(original.amountUsdc);
-    const exitFee     = Number(original.feeUsdc);
-    const halfFee     = parseFloat((exitFee / 2).toFixed(6));
+    const exitFee = Number(original.feeUsdc);
+    const halfFee = parseFloat((exitFee / 2).toFixed(6));
     const totalDeduct = parseFloat((amountFloat + exitFee).toFixed(6));
     const referrer = await _resolveReferrer(prisma, userId);
 
     const result = await prisma.$transaction(async (tx) => {
-        // Claim the reversal first. Only one concurrent webhook/retry may win.
         const claim = await tx.transactionHistory.updateMany({
             where: { txHash: reference, status: { in: ['PENDING', 'COMPLETED'] } },
             data: { status: 'FAILED' }
@@ -275,10 +204,7 @@ const reverseFiatWithdrawal = async (prisma, reference, opts = {}) => {
         await _ensureFiatPoolSingleton(tx);
         await _ensureMasterCryptoSingleton(tx);
 
-        await tx.user.update({
-            where: { id: userId },
-            data:  { availableBalance: { increment: totalDeduct } }
-        });
+        await tx.user.update({ where: { id: userId }, data: { availableBalance: { increment: totalDeduct } } });
 
         if (referrer && halfFee > 0) {
             await tx.user.update({ where: { id: referrer.id }, data: { availableBalance: { decrement: halfFee } } });
@@ -291,20 +217,10 @@ const reverseFiatWithdrawal = async (prisma, reference, opts = {}) => {
         await tx.systemFiatPool.update({ where: { id: 1 }, data: { balance: { increment: amountFloat } } });
 
         const reversalLog = await tx.adminProfitLog.create({
-            data: {
-                amountUsdc: -exitFee,
-                source: 'EXIT_FEE',
-                relatedTxId: `provider_reversal_fee_${reference}_${Date.now()}`,
-                isSubsidized: true
-            }
+            data: { amountUsdc: -exitFee, source: 'EXIT_FEE', relatedTxId: `provider_reversal_fee_${reference}_${Date.now()}`, isSubsidized: true }
         });
         await tx.adminProfitLog.create({
-            data: {
-                amountUsdc: -amountFloat,
-                source: 'ARBITRAGE_SPREAD',
-                relatedTxId: `provider_reversal_capture_${reference}_${Date.now()}`,
-                isSubsidized: true
-            }
+            data: { amountUsdc: -amountFloat, source: 'ARBITRAGE_SPREAD', relatedTxId: `provider_reversal_capture_${reference}_${Date.now()}`, isSubsidized: true }
         });
 
         const [profitFees, updatedFiatPool, masterCrypto, user] = await Promise.all([
@@ -317,7 +233,6 @@ const reverseFiatWithdrawal = async (prisma, reference, opts = {}) => {
     });
 
     if (result.alreadyReversed) return { reference, alreadyReversed: true };
-
     return {
         reference,
         alreadyReversed: false,
@@ -333,9 +248,6 @@ const reverseFiatWithdrawal = async (prisma, reference, opts = {}) => {
     };
 };
 
-// =============================================================================
-// 3. ADMIN LIQUIDATE PROFITS
-// =============================================================================
 const liquidateProfits = async (prisma, amountFloat, adminId) => {
     const result = await prisma.$transaction(async (tx) => {
         await _ensureProfitFeesSingleton(tx);
@@ -346,9 +258,7 @@ const liquidateProfits = async (prisma, amountFloat, adminId) => {
         }
         await tx.systemProfitFees.update({ where: { id: 1 }, data: { balance: { decrement: amountFloat } } });
         await tx.systemFiatPool.update({ where: { id: 1 }, data: { balance: { increment: amountFloat } } });
-        const profitLog = await tx.adminProfitLog.create({
-            data: { amountUsdc: amountFloat, source: 'ARBITRAGE_SPREAD', relatedTxId: `liquidation_admin_${adminId}_${Date.now()}` }
-        });
+        const profitLog = await tx.adminProfitLog.create({ data: { amountUsdc: amountFloat, source: 'ARBITRAGE_SPREAD', relatedTxId: `liquidation_admin_${adminId}_${Date.now()}` } });
         const [updatedProfitFees, updatedFiatPool] = await Promise.all([
             tx.systemProfitFees.findUnique({ where: { id: 1 } }),
             tx.systemFiatPool.findUnique({ where: { id: 1 } })
@@ -358,9 +268,6 @@ const liquidateProfits = async (prisma, amountFloat, adminId) => {
     return { amountLiquidated: amountFloat, newProfitFees: result.updatedProfitFees.balance, newFiatPool: result.updatedFiatPool.balance, profitLog: result.profitLog };
 };
 
-// =============================================================================
-// 4. CRYPTO DEPOSIT WEBHOOK  (Tatum / Alchemy external push)
-// =============================================================================
 const processCryptoDeposit = async (prisma, { userId, amountUsdc, txHash, address }) => {
     const existingTx = await prisma.transactionHistory.findUnique({ where: { txHash } });
     if (existingTx) {
@@ -374,9 +281,7 @@ const processCryptoDeposit = async (prisma, { userId, amountUsdc, txHash, addres
         await tx.user.update({ where: { id: userId }, data: { availableBalance: { increment: amountUsdc } } });
         await tx.systemMasterCrypto.upsert({ where: { id: 1 }, update: { balance: { increment: amountUsdc } }, create: { id: 1, balance: amountUsdc } });
         await tx.systemHotWallet.upsert({ where: { id: 1 }, update: { balance: { increment: amountUsdc } }, create: { id: 1, balance: amountUsdc } });
-        const txRecord = await tx.transactionHistory.create({
-            data: { userId, type: 'DEPOSIT_CRYPTO', amountUsdc, feeUsdc: 0, txHash, status: 'COMPLETED' }
-        });
+        const txRecord = await tx.transactionHistory.create({ data: { userId, type: 'DEPOSIT_CRYPTO', amountUsdc, feeUsdc: 0, txHash, status: 'COMPLETED' } });
         return { user, txRecord, newBalance: user.availableBalance + amountUsdc };
     });
     logger.info(`[Finance] Crypto deposit: ${amountUsdc} USDC → user ${userId} | txHash: ${txHash}`);
