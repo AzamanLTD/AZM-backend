@@ -2,6 +2,7 @@ const { settleFiatWithdrawal } = require('../services/fiatSettlementService');
 const financeService = require('../services/finance.service');
 
 jest.mock('../services/finance.service', () => ({
+    completeFiatWithdrawal: jest.fn(),
     reverseFiatWithdrawal: jest.fn()
 }));
 
@@ -19,7 +20,7 @@ describe('fiatSettlementService', () => {
         $executeRawUnsafe: jest.fn().mockResolvedValue(1)
     });
 
-    test('moves a PENDING withdrawal to COMPLETED and records provider reference atomically', async () => {
+    test('delegates provider SUCCESS to the atomic finance settlement boundary', async () => {
         const pending = {
             txHash: 'ref-1',
             userId: 11,
@@ -28,13 +29,18 @@ describe('fiatSettlementService', () => {
             providerRef: null
         };
         const completed = { ...pending, status: 'COMPLETED', providerRef: 'moolre-991' };
+        financeService.completeFiatWithdrawal.mockResolvedValue({
+            reference: 'ref-1',
+            userId: 11,
+            status: 'COMPLETED',
+            changed: true,
+            providerTxId: 'moolre-991',
+            transaction: completed
+        });
         const prisma = {
             ...attemptDb(),
             transactionHistory: {
-                findUnique: jest.fn()
-                    .mockResolvedValueOnce(pending)
-                    .mockResolvedValueOnce(completed),
-                updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+                findUnique: jest.fn().mockResolvedValue(pending),
                 update: jest.fn()
             }
         };
@@ -46,10 +52,11 @@ describe('fiatSettlementService', () => {
             providerTxId: 'moolre-991'
         });
 
-        expect(prisma.transactionHistory.updateMany).toHaveBeenCalledWith({
-            where: { txHash: 'ref-1', status: 'PENDING' },
-            data: { status: 'COMPLETED', providerRef: 'moolre-991' }
-        });
+        expect(financeService.completeFiatWithdrawal).toHaveBeenCalledWith(
+            prisma,
+            'ref-1',
+            { providerTxId: 'moolre-991' }
+        );
         expect(result).toMatchObject({
             reference: 'ref-1',
             userId: 11,
@@ -68,11 +75,18 @@ describe('fiatSettlementService', () => {
             status: 'FAILED',
             providerRef: null
         };
+        financeService.completeFiatWithdrawal.mockResolvedValue({
+            reference: 'ref-2',
+            userId: 12,
+            status: 'FAILED',
+            changed: false,
+            providerTxId: 'late-success',
+            transaction: failed
+        });
         const prisma = {
             ...attemptDb(),
             transactionHistory: {
                 findUnique: jest.fn().mockResolvedValue(failed),
-                updateMany: jest.fn().mockResolvedValue({ count: 0 }),
                 update: jest.fn()
             }
         };
@@ -87,6 +101,45 @@ describe('fiatSettlementService', () => {
         expect(result).toMatchObject({ status: 'FAILED', changed: false });
         expect(prisma.transactionHistory.update).not.toHaveBeenCalled();
         expect(financeService.reverseFiatWithdrawal).not.toHaveBeenCalled();
+    });
+
+    test('enriches a duplicate completed success with a missing provider reference without re-running economics', async () => {
+        const completed = {
+            txHash: 'ref-dup',
+            userId: 17,
+            type: 'WITHDRAWAL_FIAT',
+            status: 'COMPLETED',
+            providerRef: null
+        };
+        const enriched = { ...completed, providerRef: 'provider-dup' };
+        financeService.completeFiatWithdrawal.mockResolvedValue({
+            reference: 'ref-dup',
+            userId: 17,
+            status: 'COMPLETED',
+            changed: false,
+            providerTxId: 'provider-dup',
+            transaction: completed
+        });
+        const prisma = {
+            ...attemptDb(),
+            transactionHistory: {
+                findUnique: jest.fn().mockResolvedValue(completed),
+                update: jest.fn().mockResolvedValue(enriched)
+            }
+        };
+
+        const result = await settleFiatWithdrawal(prisma, {
+            reference: 'ref-dup',
+            provider: 'MOOLRE',
+            status: 'SUCCESSFUL',
+            providerTxId: 'provider-dup'
+        });
+
+        expect(prisma.transactionHistory.update).toHaveBeenCalledWith({
+            where: { txHash: 'ref-dup' },
+            data: { providerRef: 'provider-dup' }
+        });
+        expect(result).toMatchObject({ status: 'COMPLETED', changed: false, providerTxId: 'provider-dup' });
     });
 
     test('delegates a still-PENDING provider failure to the existing atomic reversal path and preserves provider reference', async () => {
@@ -111,7 +164,6 @@ describe('fiatSettlementService', () => {
                 findUnique: jest.fn()
                     .mockResolvedValueOnce(pending)
                     .mockResolvedValueOnce(reversedWithoutProviderRef),
-                updateMany: jest.fn(),
                 update: jest.fn().mockResolvedValue(failedWithProviderRef)
             }
         };
@@ -145,7 +197,6 @@ describe('fiatSettlementService', () => {
             ...attemptDb(),
             transactionHistory: {
                 findUnique: jest.fn().mockResolvedValue(null),
-                updateMany: jest.fn(),
                 update: jest.fn()
             }
         };
@@ -159,7 +210,7 @@ describe('fiatSettlementService', () => {
 
         expect(prisma.$queryRawUnsafe).not.toHaveBeenCalled();
         expect(prisma.$executeRawUnsafe).not.toHaveBeenCalled();
-        expect(prisma.transactionHistory.updateMany).not.toHaveBeenCalled();
+        expect(financeService.completeFiatWithdrawal).not.toHaveBeenCalled();
         expect(financeService.reverseFiatWithdrawal).not.toHaveBeenCalled();
     });
 
@@ -175,7 +226,6 @@ describe('fiatSettlementService', () => {
             ...attemptDb(),
             transactionHistory: {
                 findUnique: jest.fn().mockResolvedValue(trade),
-                updateMany: jest.fn(),
                 update: jest.fn()
             }
         };
@@ -187,7 +237,7 @@ describe('fiatSettlementService', () => {
             providerTxId: 'moolre-trade-1'
         })).rejects.toMatchObject({ code: 'WRONG_TRANSACTION_TYPE' });
 
-        expect(prisma.transactionHistory.updateMany).not.toHaveBeenCalled();
+        expect(financeService.completeFiatWithdrawal).not.toHaveBeenCalled();
         expect(financeService.reverseFiatWithdrawal).not.toHaveBeenCalled();
     });
 
@@ -203,7 +253,6 @@ describe('fiatSettlementService', () => {
             ...attemptDb(),
             transactionHistory: {
                 findUnique: jest.fn().mockResolvedValue(failed),
-                updateMany: jest.fn(),
                 update: jest.fn()
             }
         };
@@ -222,8 +271,7 @@ describe('fiatSettlementService', () => {
             alreadyReversed: true,
             providerTxId: 'duplicate-failure'
         });
-        expect(prisma.transactionHistory.updateMany).not.toHaveBeenCalled();
-        expect(prisma.transactionHistory.update).not.toHaveBeenCalled();
+        expect(financeService.completeFiatWithdrawal).not.toHaveBeenCalled();
         expect(financeService.reverseFiatWithdrawal).not.toHaveBeenCalled();
     });
 
@@ -239,7 +287,6 @@ describe('fiatSettlementService', () => {
             ...attemptDb(),
             transactionHistory: {
                 findUnique: jest.fn().mockResolvedValue(completed),
-                updateMany: jest.fn(),
                 update: jest.fn()
             }
         };
@@ -258,8 +305,7 @@ describe('fiatSettlementService', () => {
             conflictingTerminalCallback: true,
             providerTxId: 'late-failure'
         });
-        expect(prisma.transactionHistory.updateMany).not.toHaveBeenCalled();
-        expect(prisma.transactionHistory.update).not.toHaveBeenCalled();
+        expect(financeService.completeFiatWithdrawal).not.toHaveBeenCalled();
         expect(financeService.reverseFiatWithdrawal).not.toHaveBeenCalled();
     });
 });
