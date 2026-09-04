@@ -51,7 +51,7 @@ exports.initiate = async (req, res) => {
       return res.status(400).json({ success: false, message: 'A valid phone number is required.' });
 
     const settings = await prisma.globalSettings.findUnique({ where: { id: 1 } });
-    const rate = Number(settings?.liveUsdToGhs);
+    const rate = Number(settings?.liveRetailRate ?? settings?.liveUsdToGhs);
     if (!Number.isFinite(rate) || rate <= 0)
       return res.status(503).json({ success: false, message: 'Exchange rate unavailable. Please retry shortly.' });
 
@@ -89,6 +89,11 @@ exports.initiate = async (req, res) => {
             quoteAmountUsdc: quote.usdcAmount,
             quoteExpiresAt: quote.expiresAt,
             rateAtInitiation: rate,
+            rateSource: quote.rateSource,
+            rateAsOf: quote.rateAsOf,
+            ratePair: 'USDC/GHS',
+            settlementCurrency: 'USDC',
+            displayCurrency: 'GHS',
             payerPhone: phoneNumber,
             channel: 'APP',
             ...(memo ? { memo: String(memo) } : {}),
