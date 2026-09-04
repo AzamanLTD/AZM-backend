@@ -1,4 +1,5 @@
 const dineInTabService = require('../services/dineInTabService');
+const { resolvePermissions } = require('../middleware/requirePermission');
 
 const serviceOptions = (req, extra = {}) => ({
     ...extra,
@@ -92,9 +93,22 @@ exports.confirmAndPay = async (req, res) => {
 exports.getTab = async (req, res) => {
     try {
         const prisma = req.prisma || req.app.get('prisma');
+        // This endpoint serves both customer clients and the business portal.
+        // A business identity is only granted to the shared-read adapter after
+        // resolving the same canonical permission used by business mutations.
+        // Otherwise the request remains customer-scoped by req.user.id.
+        const candidateBusinessProfileId = await getEffectiveBusinessProfileId(req, prisma);
+        let businessProfileId = null;
+        if (candidateBusinessProfileId) {
+            const permissions = await resolvePermissions(prisma, req.user.id, candidateBusinessProfileId);
+            if (permissions.includes('*') || permissions.includes('restaurant.dinein.manage')) {
+                businessProfileId = candidateBusinessProfileId;
+            }
+        }
         const tab = await dineInTabService.getTab(prisma, serviceOptions(req, {
             tabId: req.params.tabId,
             customerId: req.user.id,
+            businessProfileId,
         }));
         const table = tab?.tableId
             ? await prisma.businessTable.findUnique({

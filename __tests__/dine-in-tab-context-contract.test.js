@@ -47,6 +47,7 @@ describe('dine-in customer tab context contract', () => {
           }),
         },
         businessProfile: {
+          findFirst: jest.fn().mockResolvedValue(null),
           findUnique: jest.fn().mockResolvedValue({
             id: 'biz-1',
             bizId: 'BIZ-123456789',
@@ -59,7 +60,10 @@ describe('dine-in customer tab context contract', () => {
       params: { tabId: 'tab-1' },
     };
     const json = jest.fn();
-    const res = { json };
+    const res = {
+      json,
+      status: jest.fn().mockReturnThis(),
+    };
 
     await controller.getTab(req, res);
 

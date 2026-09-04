@@ -36,11 +36,13 @@ exports.getOpenTabs = exports.getTabs;
 
 exports.getCustomerTabs = async (prisma, opts) => service(prisma, opts).getCustomerTabs(opts.userId, opts.status);
 
-exports.getTab = async (prisma, { tabId, customerId, io }) => {
+exports.getTab = async (prisma, { tabId, customerId, businessProfileId, io }) => {
     const svc = new DineInService(prisma, io);
     const tab = await svc.getTab(tabId);
     if (!tab) throw new Error('Tab not found.');
-    if (customerId != null && tab.customerId !== customerId) {
+    const isBusinessReader = businessProfileId != null && tab.businessProfile?.id === businessProfileId;
+    const isCustomerReader = customerId != null && tab.customerId === customerId;
+    if (!isBusinessReader && !isCustomerReader) {
         throw new Error('Not authorized to view this tab.');
     }
     return tab;
