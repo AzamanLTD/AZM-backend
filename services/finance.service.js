@@ -29,6 +29,9 @@ const _resolveReferrer = async (prisma, userId) => {
     });
 };
 
+const _isDeferredWithdrawal = (transaction) =>
+    transaction?.metadata && transaction.metadata.economicsDeferred === true;
+
 /**
  * Atomically reserve fiat liquidity. The conditional update is the actual
  * concurrency guard; a preflight read alone is not sufficient because two
@@ -95,7 +98,7 @@ const processFiatWithdrawal = async (prisma, userId, amountFloat, opts = {}) => 
 
     const reference = opts.reference || `FIAT_OUT_${userId}_${Date.now()}`;
     const retailRate = Number(opts.retailRate) > 0 ? Number(opts.retailRate) : null;
-    const payoutGhs  = Number(opts.payoutGhs)  > 0 ? Number(opts.payoutGhs)  : null;
+    const payoutGhs  = Number(opts.payoutGhs) > 0 ? Number(opts.payoutGhs) : null;
 
     const fiatPool = await prisma.systemFiatPool.findUnique({ where: { id: 1 } });
     if (!fiatPool || Number(fiatPool.balance) < amountFloat) {
@@ -108,13 +111,13 @@ const processFiatWithdrawal = async (prisma, userId, amountFloat, opts = {}) => 
     }
 
     const result = await prisma.$transaction(async (tx) => {
-        const user = await tx.user.findUnique({ where: { id: userId } });
-        if (!user) throw new Error('User not found.');
+        const liveUser = await tx.user.findUnique({ where: { id: userId } });
+        if (!liveUser) throw new Error('User not found.');
 
-        if (user.availableBalance < totalDeduct) {
+        if (liveUser.availableBalance < totalDeduct) {
             const err = new Error(
                 `Insufficient balance. Required: ${totalDeduct} USDC ` +
-                `(amount + exit fee), available: ${user.availableBalance.toFixed(6)} USDC.`
+                `(amount + exit fee), available: ${liveUser.availableBalance.toFixed(6)} USDC.`
             );
             err.code = 'INSUFFICIENT_BALANCE';
             throw err;
@@ -123,25 +126,15 @@ const processFiatWithdrawal = async (prisma, userId, amountFloat, opts = {}) => 
         await _reserveFiatPool(tx, amountFloat);
         await _debitUserBalance(tx, userId, totalDeduct);
 
+        // A PENDING provider payout is a reservation, not realized economics.
+        // Keep the principal in master crypto, but defer referral rewards,
+        // platform fee recognition and profit logs until provider SUCCESS.
         await _ensureProfitFeesSingleton(tx);
         await _ensureMasterCryptoSingleton(tx);
-
-        if (referrer) {
-            await tx.user.update({ where: { id: referrer.id }, data: { availableBalance: { increment: halfFee } } });
-            await tx.systemProfitFees.update({ where: { id: 1 }, data: { balance: { increment: halfFee } } });
-            await tx.adminProfitLog.createMany({
-                data: [
-                    { amountUsdc: halfFee, source: 'EXIT_FEE', relatedTxId: `referral_split_system_${reference}` },
-                    { amountUsdc: halfFee, source: 'EXIT_FEE', relatedTxId: `referral_split_referrer_${referrer.id}_${reference}` }
-                ]
-            });
-        } else {
-            await tx.systemProfitFees.update({ where: { id: 1 }, data: { balance: { increment: exitFee } } });
-            await tx.adminProfitLog.create({ data: { amountUsdc: exitFee, source: 'EXIT_FEE', relatedTxId: `full_fee_${reference}` } });
-        }
-
-        await tx.systemMasterCrypto.update({ where: { id: 1 }, data: { balance: { increment: amountFloat } } });
-        await tx.adminProfitLog.create({ data: { amountUsdc: amountFloat, source: 'ARBITRAGE_SPREAD', relatedTxId: `arbitrage_capture_${reference}` } });
+        await tx.systemMasterCrypto.update({
+            where: { id: 1 },
+            data: { balance: { increment: amountFloat } }
+        });
 
         const txRecord = await tx.transactionHistory.create({
             data: {
@@ -150,7 +143,16 @@ const processFiatWithdrawal = async (prisma, userId, amountFloat, opts = {}) => 
                 amountUsdc: amountFloat,
                 feeUsdc: exitFee,
                 txHash: reference,
-                status: 'PENDING'
+                status: 'PENDING',
+                metadata: {
+                    economicsDeferred: true,
+                    referrerId: referrer?.id ?? null,
+                    referrerUsername: referrer?.username ?? null,
+                    referrerShareUsdc: referrer ? halfFee : 0,
+                    systemFeeShareUsdc: referrer ? halfFee : exitFee,
+                    retailRate,
+                    payoutGhs
+                }
             }
         });
 
@@ -192,6 +194,99 @@ const processFiatWithdrawal = async (prisma, userId, amountFloat, opts = {}) => 
     };
 };
 
+/**
+ * Authoritatively settle a provider-successful fiat withdrawal. New withdrawals
+ * carry economicsDeferred=true, so fee/referral/profit recognition occurs only
+ * after this PENDING -> COMPLETED claim succeeds. Legacy PENDING rows have no
+ * marker because they already recognized economics at request time; those rows
+ * are only transitioned and are never credited twice.
+ */
+const completeFiatWithdrawal = async (prisma, reference, { providerTxId = null } = {}) => {
+    if (!reference) throw new Error('[completeFiatWithdrawal] reference is required.');
+
+    const result = await prisma.$transaction(async (tx) => {
+        const pending = await tx.transactionHistory.findUnique({ where: { txHash: reference } });
+        if (!pending) {
+            const err = new Error(`[completeFiatWithdrawal] No row with reference ${reference}.`);
+            err.code = 'UNKNOWN_REFERENCE';
+            throw err;
+        }
+        if (pending.type !== 'WITHDRAWAL_FIAT') {
+            const err = new Error(`[completeFiatWithdrawal] Reference ${reference} is not a fiat withdrawal.`);
+            err.code = 'WRONG_TRANSACTION_TYPE';
+            throw err;
+        }
+
+        const claim = await tx.transactionHistory.updateMany({
+            where: { txHash: reference, status: 'PENDING' },
+            data: {
+                status: 'COMPLETED',
+                ...(providerTxId ? { providerRef: String(providerTxId) } : {})
+            }
+        });
+
+        if (claim.count !== 1) {
+            const current = await tx.transactionHistory.findUnique({ where: { txHash: reference } });
+            return { changed: false, transaction: current };
+        }
+
+        if (_isDeferredWithdrawal(pending)) {
+            const amountFloat = Number(pending.amountUsdc);
+            const exitFee = Number(pending.feeUsdc);
+            const metadata = pending.metadata || {};
+            const referrerId = Number(metadata.referrerId) > 0 ? Number(metadata.referrerId) : null;
+            const referrerShare = Math.max(0, Number(metadata.referrerShareUsdc) || 0);
+            const systemShare = Math.max(0, Number(metadata.systemFeeShareUsdc) || 0);
+
+            await _ensureProfitFeesSingleton(tx);
+
+            if (referrerId && referrerShare > 0) {
+                await tx.user.update({
+                    where: { id: referrerId },
+                    data: { availableBalance: { increment: referrerShare } }
+                });
+                await tx.systemProfitFees.update({
+                    where: { id: 1 },
+                    data: { balance: { increment: systemShare } }
+                });
+                await tx.adminProfitLog.createMany({
+                    data: [
+                        { amountUsdc: systemShare, source: 'EXIT_FEE', relatedTxId: `referral_split_system_${reference}` },
+                        { amountUsdc: referrerShare, source: 'EXIT_FEE', relatedTxId: `referral_split_referrer_${referrerId}_${reference}` }
+                    ]
+                });
+            } else {
+                const realizedFee = systemShare > 0 ? systemShare : exitFee;
+                await tx.systemProfitFees.update({
+                    where: { id: 1 },
+                    data: { balance: { increment: realizedFee } }
+                });
+                if (realizedFee > 0) {
+                    await tx.adminProfitLog.create({
+                        data: { amountUsdc: realizedFee, source: 'EXIT_FEE', relatedTxId: `full_fee_${reference}` }
+                    });
+                }
+            }
+
+            await tx.adminProfitLog.create({
+                data: { amountUsdc: amountFloat, source: 'ARBITRAGE_SPREAD', relatedTxId: `arbitrage_capture_${reference}` }
+            });
+        }
+
+        const transaction = await tx.transactionHistory.findUnique({ where: { txHash: reference } });
+        return { changed: true, transaction };
+    });
+
+    return {
+        reference,
+        userId: result.transaction?.userId || null,
+        status: result.transaction?.status || null,
+        changed: result.changed,
+        providerTxId: result.transaction?.providerRef || providerTxId || null,
+        transaction: result.transaction
+    };
+};
+
 const reverseFiatWithdrawal = async (prisma, reference, opts = {}) => {
     if (!reference) throw new Error('[reverseFiatWithdrawal] reference is required.');
 
@@ -200,9 +295,6 @@ const reverseFiatWithdrawal = async (prisma, reference, opts = {}) => {
     if (original.type !== 'WITHDRAWAL_FIAT') throw new Error(`[reverseFiatWithdrawal] Reference ${reference} is not a fiat withdrawal.`);
     if (original.status === 'FAILED') return { reference, alreadyReversed: true };
 
-    // A provider failure can reverse only a still-pending internal reservation.
-    // Once Azaman has marked the transfer COMPLETED, a late failure callback is
-    // informational and must never claw the customer funds back a second time.
     if (original.status !== 'PENDING') {
         return { reference, alreadyReversed: true, notReversible: true, status: original.status };
     }
@@ -212,7 +304,8 @@ const reverseFiatWithdrawal = async (prisma, reference, opts = {}) => {
     const exitFee = Number(original.feeUsdc);
     const halfFee = parseFloat((exitFee / 2).toFixed(6));
     const totalDeduct = parseFloat((amountFloat + exitFee).toFixed(6));
-    const referrer = await _resolveReferrer(prisma, userId);
+    const economicsDeferred = _isDeferredWithdrawal(original);
+    const referrer = economicsDeferred ? null : await _resolveReferrer(prisma, userId);
 
     const result = await prisma.$transaction(async (tx) => {
         const claim = await tx.transactionHistory.updateMany({
@@ -225,23 +318,49 @@ const reverseFiatWithdrawal = async (prisma, reference, opts = {}) => {
         await _ensureFiatPoolSingleton(tx);
         await _ensureMasterCryptoSingleton(tx);
 
-        await tx.user.update({ where: { id: userId }, data: { availableBalance: { increment: totalDeduct } } });
+        await tx.user.update({
+            where: { id: userId },
+            data: { availableBalance: { increment: totalDeduct } }
+        });
 
-        if (referrer && halfFee > 0) {
-            await tx.user.update({ where: { id: referrer.id }, data: { availableBalance: { decrement: halfFee } } });
-            await tx.systemProfitFees.update({ where: { id: 1 }, data: { balance: { decrement: halfFee } } });
-        } else {
-            await tx.systemProfitFees.update({ where: { id: 1 }, data: { balance: { decrement: exitFee } } });
+        // Legacy rows recognized fees before provider settlement. Unwind those
+        // exact economics without inserting negative AdminProfitLog amounts,
+        // which are prohibited by the database. New deferred rows skip this
+        // block entirely because no fee/referral economics exist yet.
+        if (!economicsDeferred) {
+            if (referrer && halfFee > 0) {
+                const referralDebit = await tx.user.updateMany({
+                    where: { id: referrer.id, availableBalance: { gte: halfFee } },
+                    data: { availableBalance: { decrement: halfFee } }
+                });
+                if (referralDebit.count !== 1) {
+                    const err = new Error('Legacy referral reward can no longer be clawed back automatically; manual reconciliation is required.');
+                    err.code = 'LEGACY_REFERRAL_REVERSAL_REQUIRES_RECONCILIATION';
+                    throw err;
+                }
+                await tx.systemProfitFees.update({
+                    where: { id: 1 },
+                    data: { balance: { decrement: halfFee } }
+                });
+            } else if (exitFee > 0) {
+                await tx.systemProfitFees.update({
+                    where: { id: 1 },
+                    data: { balance: { decrement: exitFee } }
+                });
+            }
+
+            await tx.adminProfitLog.deleteMany({
+                where: { relatedTxId: { endsWith: reference } }
+            });
         }
 
-        await tx.systemMasterCrypto.update({ where: { id: 1 }, data: { balance: { decrement: amountFloat } } });
-        await tx.systemFiatPool.update({ where: { id: 1 }, data: { balance: { increment: amountFloat } } });
-
-        const reversalLog = await tx.adminProfitLog.create({
-            data: { amountUsdc: -exitFee, source: 'EXIT_FEE', relatedTxId: `provider_reversal_fee_${reference}_${Date.now()}`, isSubsidized: true }
+        await tx.systemMasterCrypto.update({
+            where: { id: 1 },
+            data: { balance: { decrement: amountFloat } }
         });
-        await tx.adminProfitLog.create({
-            data: { amountUsdc: -amountFloat, source: 'ARBITRAGE_SPREAD', relatedTxId: `provider_reversal_capture_${reference}_${Date.now()}`, isSubsidized: true }
+        await tx.systemFiatPool.update({
+            where: { id: 1 },
+            data: { balance: { increment: amountFloat } }
         });
 
         const [profitFees, updatedFiatPool, masterCrypto, user] = await Promise.all([
@@ -250,7 +369,7 @@ const reverseFiatWithdrawal = async (prisma, reference, opts = {}) => {
             tx.systemMasterCrypto.findUnique({ where: { id: 1 } }),
             tx.user.findUnique({ where: { id: userId }, select: { availableBalance: true } })
         ]);
-        return { alreadyReversed: false, reversalLog, profitFees, fiatPool: updatedFiatPool, masterCrypto, user };
+        return { alreadyReversed: false, profitFees, fiatPool: updatedFiatPool, masterCrypto, user };
     });
 
     if (result.alreadyReversed) return { reference, alreadyReversed: true };
@@ -264,8 +383,7 @@ const reverseFiatWithdrawal = async (prisma, reference, opts = {}) => {
         systemFiatPool: result.fiatPool.balance,
         systemMasterCrypto: result.masterCrypto.balance,
         unwoundCapture: amountFloat,
-        reason: opts.reason || null,
-        reversalLog: result.reversalLog
+        reason: opts.reason || null
     };
 };
 
@@ -312,8 +430,6 @@ const processCryptoDeposit = async (prisma, { userId, amountUsdc, txHash, addres
         logger.info(`[Finance] Crypto deposit: ${amountUsdc} USDC → user ${userId} | txHash: ${txHash}`);
         return { alreadyProcessed: false, data: { userId, amountUsdc, txHash, address: address || null, newBalance: result.newBalance, transaction: result.txRecord } };
     } catch (error) {
-        // Concurrent identical webhooks can race the in-transaction existence
-        // check; the unique txHash constraint is the final idempotency fence.
         if (error?.code === 'P2002') {
             logger.info(`[Finance] Duplicate txHash ignored after unique constraint: ${txHash}`);
             return { alreadyProcessed: true };
@@ -324,6 +440,7 @@ const processCryptoDeposit = async (prisma, { userId, amountUsdc, txHash, addres
 
 module.exports = {
     processFiatWithdrawal,
+    completeFiatWithdrawal,
     reverseFiatWithdrawal,
     liquidateProfits,
     processCryptoDeposit,
