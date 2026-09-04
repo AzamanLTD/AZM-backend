@@ -1,0 +1,41 @@
+name: Patch RateAlert schema default once
+
+on:
+  push:
+    branches:
+      - fix/rate-alert-db-default-replay
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout branch
+        uses: actions/checkout@v4
+        with:
+          ref: fix/rate-alert-db-default-replay
+          fetch-depth: 0
+      - name: Patch Prisma schema default
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('prisma/schema.prisma')
+          text = p.read_text()
+          old = '  ratePair      String    @default("USD_GHS") // Which rate pair to watch\n'
+          new = '  ratePair      String    @default("USDC_GHS") // Which rate pair to watch\n'
+          if old not in text:
+              raise SystemExit('expected legacy RateAlert default not found')
+          p.write_text(text.replace(old, new, 1))
+          PY
+      - name: Commit schema patch
+        shell: bash
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add prisma/schema.prisma
+          git commit -m 'fix(rate-alerts): align Prisma schema default with USDC/GHS'
+          git push origin HEAD:fix/rate-alert-db-default-replay
