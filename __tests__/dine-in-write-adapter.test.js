@@ -53,6 +53,46 @@ describe('dine-in tab service adapter', () => {
     });
   });
 
+  test('rejects invalid item quantities before reaching the domain service', async () => {
+    const addCustomerItem = jest.fn();
+    jest.doMock('../services/marketplace/dineInService', () =>
+      jest.fn().mockImplementation(() => ({ addCustomerItem })),
+    );
+
+    const adapter = require('../services/dineInTabService');
+    for (const quantity of [0, -1, 1.5, 51, 'not-a-number']) {
+      await expect(adapter.addCustomerItem({}, {
+        tabId: 'tab-1',
+        customerId: 42,
+        productId: 'product-1',
+        quantity,
+      })).rejects.toThrow('quantity must be an integer from 1 to 50.');
+    }
+    expect(addCustomerItem).not.toHaveBeenCalled();
+  });
+
+  test('normalizes omitted customer item quantity to one', async () => {
+    const addCustomerItem = jest.fn().mockResolvedValue({ id: 'item-1' });
+    jest.doMock('../services/marketplace/dineInService', () =>
+      jest.fn().mockImplementation(() => ({ addCustomerItem })),
+    );
+
+    const adapter = require('../services/dineInTabService');
+    await adapter.addCustomerItem({}, {
+      tabId: 'tab-1',
+      customerId: 42,
+      productId: 'product-1',
+    });
+
+    expect(addCustomerItem).toHaveBeenCalledWith({
+      tabId: 'tab-1',
+      customerId: 42,
+      productId: 'product-1',
+      selection: undefined,
+      quantity: 1,
+    });
+  });
+
   test('maps finalize and business tab reads to their domain methods', async () => {
     const finalizeTab = jest.fn().mockResolvedValue({ id: 'tab-1' });
     const getBusinessTabs = jest.fn().mockResolvedValue([]);
