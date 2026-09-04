@@ -67,7 +67,7 @@ describe('acceptPing balance concurrency', () => {
       tradeId: 101,
       vendorId: 7,
       topUpAmount: 10,
-    })).rejects.toThrow('Funds changed; please retry');
+    })).rejects.toThrow('Insufficient available balance. Your balance changed; please retry');
 
     expect(tx.user.updateMany).toHaveBeenCalledTimes(1);
     expect(tx.user.findUnique).not.toHaveBeenCalled();
