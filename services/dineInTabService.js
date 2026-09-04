@@ -74,6 +74,13 @@ exports.confirmTab = async (prisma, { tabId, customerId, io }) => service(prisma
 
 exports.confirmAndPay = async (prisma, { tabId, customerId, tipUsdc, io }) => {
     const svc = new DineInService(prisma, io);
+    // Preserve the adapter's historical compatibility contract for service
+    // implementations that expose only confirmTab. The durable replay recovery
+    // path requires confirmAndPay + getTab and is intentionally opt-in.
+    if (typeof svc.confirmAndPay !== 'function') {
+        return svc.confirmTab(tabId, customerId);
+    }
+
     try {
         const result = await svc.confirmAndPay(tabId, customerId, { tipUsdc });
         if (result?.payment?.alreadyPaid && result.tab?.status === 'FINALIZED') result.tab = await svc.confirmTab(tabId, customerId);
@@ -86,6 +93,7 @@ exports.confirmAndPay = async (prisma, { tabId, customerId, tipUsdc, io }) => {
         // the tab before this request reaches the compare-and-set close step.
         // Recover only from durable proof of the same tab's PAID invoice so a
         // financial success is never surfaced as a false failure.
+        if (typeof svc.getTab !== 'function') throw error;
         const recovered = replayPaymentFromDurableState(await svc.getTab(tabId));
         if (!recovered || recovered.tab.customerId !== customerId) throw error;
 
