@@ -7,11 +7,13 @@
 //   GET    /api/oracle/alerts          — List user's alerts
 //   DELETE /api/oracle/alerts/:id      — Delete/deactivate an alert
 //
-// All require authentication.
-const logger = require('../src/config/logger');
+// Legacy USD_GHS alerts remain readable/triggerable for compatibility, but new
+// alerts and response metadata use the canonical USDC_GHS pair.
 // =============================================================================
 
-// 1. CREATE RATE ALERT
+const logger = require('../src/config/logger');
+const CANONICAL_RATE_PAIR = 'USDC_GHS';
+
 exports.createAlert = async (req, res) => {
     try {
         const rateAlertService = req.app.get('rateAlertService');
@@ -35,54 +37,50 @@ exports.createAlert = async (req, res) => {
         const alert = await rateAlertService.createAlert(userId, {
             targetRate: parseFloat(targetRate),
             direction: direction || 'ABOVE',
-            ratePair: ratePair || 'USD_GHS',
+            ratePair: ratePair || CANONICAL_RATE_PAIR,
             note,
         });
 
-        return res.status(201).json({
-            success: true,
-            data: alert,
-        });
-
+        return res.status(201).json({ success: true, data: alert });
     } catch (error) {
         logger.error({ err: error }, '[rateAlert.create] error');
-        const status = error.message.includes('Maximum') ? 400 : 500;
+        const status = error.message.includes('Maximum') || error.message.includes('ratePair') ? 400 : 500;
         return res.status(status).json({ success: false, message: error.message });
     }
 };
 
-// 2. LIST RATE ALERTS
 exports.listAlerts = async (req, res) => {
     try {
         const rateAlertService = req.app.get('rateAlertService');
         const userId = req.user.id;
         const includeTriggered = req.query.includeTriggered !== 'false';
-
         const alerts = await rateAlertService.listAlerts(userId, { includeTriggered });
 
-        // Get current rate for context
         const prisma = req.app.get('prisma');
         const settings = await prisma.globalSettings.findUnique({
             where: { id: 1 },
-            select: { liveUsdToGhs: true },
+            select: { liveRetailRate: true, liveUsdToGhs: true },
         });
+        const currentRate = Number(settings?.liveRetailRate) > 0
+            ? Number(settings.liveRetailRate)
+            : Number(settings?.liveUsdToGhs) > 0
+                ? Number(settings.liveUsdToGhs)
+                : null;
 
         return res.status(200).json({
             success: true,
             data: {
                 alerts,
-                currentRate: settings?.liveUsdToGhs || null,
-                ratePair: 'USD_GHS',
+                currentRate,
+                ratePair: CANONICAL_RATE_PAIR,
             },
         });
-
     } catch (error) {
         logger.error({ err: error }, '[rateAlert.list] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
 
-// 3. DELETE RATE ALERT
 exports.deleteAlert = async (req, res) => {
     try {
         const rateAlertService = req.app.get('rateAlertService');
@@ -94,9 +92,7 @@ exports.deleteAlert = async (req, res) => {
         }
 
         await rateAlertService.deleteAlert(userId, alertId);
-
         return res.status(200).json({ success: true, message: 'Alert deleted' });
-
     } catch (error) {
         logger.error({ err: error }, '[rateAlert.delete] error');
         const status = error.message.includes('Not authorized') ? 403 :
