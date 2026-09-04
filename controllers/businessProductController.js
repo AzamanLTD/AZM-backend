@@ -85,7 +85,7 @@ exports.listMyProducts = async (req, res) => {
         const profile = await _ownedProfile(prisma, userId);
         if (!profile) return res.status(403).json({ success: false, message: 'You do not own a business profile.' });
 
-        const { isActive, limit, cursor } = req.query;
+        const { isActive, locationId, limit, cursor } = req.query;
         let isActiveFilter;
         if (isActive === 'true') isActiveFilter = true;
         else if (isActive === 'false') isActiveFilter = false;
@@ -93,6 +93,7 @@ exports.listMyProducts = async (req, res) => {
         const result = await businessProductService.listProducts(prisma, {
             businessProfileId: profile.id,
             isActive: isActiveFilter,
+            locationId: locationId ? String(locationId) : undefined,
             limit,
             cursor
         });
@@ -167,10 +168,11 @@ exports.listProductsByBizId = async (req, res) => {
         });
         if (!biz || biz.isSuspended) return res.status(404).json({ success: false, message: 'Business not found.' });
 
-        const { limit, cursor } = req.query;
+        const { limit, cursor, locationId } = req.query;
         const result = await businessProductService.listProducts(prisma, {
             businessProfileId: biz.id,
             isActive: true,
+            locationId: locationId ? String(locationId) : undefined,
             limit,
             cursor
         });
