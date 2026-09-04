@@ -16,8 +16,10 @@
   - Success: `{ "success": true, "message": "...", "data": { ... } }`
   - Error:   `{ "success": false, "code": "...", "message": "..." }`
 - **Currencies**: Internal balances are USDC. GHS values displayed to users
-  are computed as `availableBalance × GlobalSettings.liveUsdToGhs` ("the
-  Hologram"). The backend never persists GHS as a balance.
+  are computed from the canonical `USDC/GHS` retail oracle snapshot, using
+  `availableBalance × GlobalSettings.liveRetailRate` ("the Hologram"). The
+  backend never persists GHS as a balance. Legacy `liveUsdToGhs` values are
+  compatibility metadata and are not the canonical user-facing rate.
 - **Idempotency**: All financial mutations are wrapped in
   `prisma.$transaction`. Webhook endpoints are idempotent by `txHash` /
   `reference`.
@@ -77,7 +79,9 @@ public profile.
 Body: `{ email, password }`. Returns `{ token, user }`.
 
 ### `GET /auth/settings/rates` (public)
-Returns the live oracle rates: `{ liveUsdToGhs, bankMargin, thirdPartyMargin }`.
+Returns the live oracle snapshot, including the canonical `USDC/GHS`
+retail rate (`liveRetailRate`), settlement/display currency metadata, source,
+and freshness information. `liveUsdToGhs` is legacy compatibility metadata.
 
 ### `GET /auth/me/:id` (auth)
 Returns the authenticated user's full balance shape: `availableBalance`,
@@ -227,8 +231,9 @@ On success, atomically:
   `AZAMAN_MASTER_SOUL.md`). An `AdminProfitLog (source =
   'ARBITRAGE_SPREAD')` row records the capture.
 - Debits `SystemFiatPool` by `amount` (the GHS being paid out to the user).
-- Writes `TransactionHistory(WITHDRAWAL_FIAT, COMPLETED, txHash =
-  X-Reference-Id)`.
+- Creates the fiat withdrawal transaction in `PENDING` while the external
+  provider is settling. Provider `SUCCESS` atomically transitions it to
+  `COMPLETED`; provider `FAILED` reverses only a still-PENDING reservation.
 
 Outside the DB transaction the controller dispatches the GHS to the
 user's MoMo wallet via the MTN MoMo Disbursement API
@@ -261,7 +266,7 @@ Response (success) shape:
     "arbitrageCapture":   100,
     "fiatPoolLow":        false,
     "fiatPoolBalance":    ...,
-    "transaction":        { "id": ..., "status": "COMPLETED", "txHash": "<uuid-v4>" },
+    "transaction":        { "id": ..., "status": "PENDING", "txHash": "<uuid-v4>" },
     "disbursement": {
       "provider":       "MTN_MOMO_DISBURSEMENT",
       "referenceId":    "<uuid-v4>",
