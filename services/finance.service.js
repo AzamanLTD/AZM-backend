@@ -50,6 +50,24 @@ const _reserveFiatPool = async (tx, amountFloat) => {
     }
 };
 
+/**
+ * Atomically debit a customer balance. The predicate makes the balance
+ * reservation concurrency-safe; a stale snapshot cannot authorize a second
+ * withdrawal once the first one has consumed the available funds.
+ */
+const _debitUserBalance = async (tx, userId, amount) => {
+    const claim = await tx.user.updateMany({
+        where: { id: userId, availableBalance: { gte: amount } },
+        data: { availableBalance: { decrement: amount } },
+    });
+
+    if (claim.count !== 1) {
+        const err = new Error('Insufficient USDC balance. Your available balance changed; please retry.');
+        err.code = 'INSUFFICIENT_BALANCE';
+        throw err;
+    }
+};
+
 const processFiatWithdrawal = async (prisma, userId, amountFloat, opts = {}) => {
     await runDoubleCheck(prisma, userId);
     const referrer = await _resolveReferrer(prisma, userId);
@@ -94,10 +112,12 @@ const processFiatWithdrawal = async (prisma, userId, amountFloat, opts = {}) => 
         if (!user) throw new Error('User not found.');
 
         if (user.availableBalance < totalDeduct) {
-            throw new Error(
+            const err = new Error(
                 `Insufficient balance. Required: ${totalDeduct} USDC ` +
                 `(amount + exit fee), available: ${user.availableBalance.toFixed(6)} USDC.`
             );
+            err.code = 'INSUFFICIENT_BALANCE';
+            throw err;
         }
 
         // Reserve fiat liquidity before mutating the customer ledger. The
@@ -105,7 +125,9 @@ const processFiatWithdrawal = async (prisma, userId, amountFloat, opts = {}) => 
         // the treasury row instead of relying on a stale preflight snapshot.
         await _reserveFiatPool(tx, amountFloat);
 
-        await tx.user.update({ where: { id: userId }, data: { availableBalance: { decrement: totalDeduct } } });
+        // The user snapshot above is only for the human-readable error. The
+        // conditional UPDATE below is authoritative for the actual debit.
+        await _debitUserBalance(tx, userId, totalDeduct);
 
         await _ensureProfitFeesSingleton(tx);
         await _ensureMasterCryptoSingleton(tx);
