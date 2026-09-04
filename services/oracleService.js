@@ -82,13 +82,10 @@ class OracleService {
             const daiPrice = asFinitePositive(cryptoResponse.data?.dai?.usd);
             if (!tetherPrice || !usdcPrice || !daiPrice) throw new Error('CoinGecko returned incomplete stablecoin rates.');
 
-            const fallbackUsdToGhs = await this.fetchFallbackUsdToGhsRate();
-            if (!fallbackUsdToGhs && !process.env.KOTANI_PROVIDER) {
-                throw new Error('No usable USD/GHS fallback rate is available.');
-            }
-
             let usdcToGhsRate = null;
+            let usdToGhsRate = null;
             let rateSource = 'FALLBACK_FX';
+
             try {
                 usdcToGhsRate = await this.fetchKotaniUsdcToGhsRate();
                 if (usdcToGhsRate) rateSource = 'KOTANI_PAY';
@@ -96,19 +93,28 @@ class OracleService {
                 logger.warn({ err: error }, '[Oracle] Kotani Pay rate unavailable; using fallback FX provider.');
             }
 
-            // The fallback provider quotes USD/GHS, while CoinGecko gives the
-            // current USDC/USD market price. Convert the two explicitly rather
-            // than silently assuming USDC is exactly USD.
-            if (!usdcToGhsRate && fallbackUsdToGhs) {
-                usdcToGhsRate = fallbackUsdToGhs * usdcPrice;
+            if (!usdcToGhsRate) {
+                usdToGhsRate = await this.fetchFallbackUsdToGhsRate();
+                if (usdToGhsRate) {
+                    // The fallback quotes USD/GHS; apply the live USDC/USD
+                    // market price so the user-facing rate remains USDC/GHS.
+                    usdcToGhsRate = usdToGhsRate * usdcPrice;
+                }
+            } else {
+                // Kotani supplies the direct USDC/GHS rate. Keep the legacy
+                // USD/GHS field at the same value for backward-compatible API
+                // consumers; the canonical retail field is the authoritative
+                // USDC/GHS display rate.
+                usdToGhsRate = usdcToGhsRate;
             }
+
             if (!usdcToGhsRate) throw new Error('No usable USD/USDC to GHS rate is available.');
 
             const lastRateSync = new Date();
             await this.prisma.globalSettings.upsert({
                 where: { id: 1 },
                 update: {
-                    liveUsdToGhs: fallbackUsdToGhs || usdcToGhsRate,
+                    liveUsdToGhs: usdToGhsRate,
                     liveRetailRate: usdcToGhsRate,
                     liveUsdtToUsd: tetherPrice,
                     liveUsdcToUsd: usdcPrice,
@@ -118,7 +124,7 @@ class OracleService {
                 },
                 create: {
                     id: 1,
-                    liveUsdToGhs: fallbackUsdToGhs || usdcToGhsRate,
+                    liveUsdToGhs: usdToGhsRate,
                     liveRetailRate: usdcToGhsRate,
                     liveUsdtToUsd: tetherPrice,
                     liveUsdcToUsd: usdcPrice,
