@@ -49,35 +49,13 @@ const settleFiatWithdrawal = async (prisma, {
         failureReason: status === 'FAILED' ? reason : null
     });
 
-    // Provider SUCCESS is the accounting boundary. finance.service owns both
-    // the PENDING -> COMPLETED idempotency claim and, for new withdrawals, the
-    // deferred fee/referral/profit recognition that must happen exactly once.
     if (status === 'SUCCESSFUL') {
-        let completion = await financeService.completeFiatWithdrawal(prisma, reference, {
+        const result = await financeService.completeFiatWithdrawal(prisma, reference, {
             providerTxId
         });
-
-        // A duplicate success may carry a provider transaction id that an older
-        // success callback did not. Enrich identity without re-running economics.
-        if (completion.transaction?.status === 'COMPLETED' && providerTxId && !completion.transaction.providerRef) {
-            const transaction = await prisma.transactionHistory.update({
-                where: { txHash: reference },
-                data: { providerRef: String(providerTxId) }
-            });
-            completion = {
-                ...completion,
-                providerTxId: transaction.providerRef,
-                transaction
-            };
-        }
-
         return {
-            reference,
-            userId: completion.userId || original.userId,
-            status: completion.status || original.status,
-            changed: completion.changed,
-            providerTxId: completion.providerTxId || providerTxId || completion.transaction?.providerRef || null,
-            transaction: completion.transaction
+            ...result,
+            providerTxId: result.providerTxId || providerTxId || null
         };
     }
 
