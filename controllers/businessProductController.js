@@ -1,15 +1,6 @@
 // controllers/businessProductController.js
 // =============================================================================
-// AZAMAN — BUSINESS PRODUCT CONTROLLER (2026-06-16)
-//
-// HTTP layer for the Business Portal product catalogue. Mirrors the conventions
-// in businessController.js / escrowController.js:
-//   prisma = req.app.get('prisma'); io = req.app.get('socketio');
-//   userId = req.user.id;
-//   success → { success: true, ... }; error → { success: false, message }.
-//
-// Ownership is determined purely by the existence of a BusinessProfile for the
-// calling user. GET /products/:productId is PUBLIC (no protect middleware).
+// AZAMAN — BUSINESS PRODUCT CONTROLLER
 // =============================================================================
 
 const logger = require('../src/config/logger');
@@ -34,147 +25,68 @@ async function _resolveTargetProfile(prisma, req) {
     return _ownedProfile(prisma, req.user.id);
 }
 
-// =============================================================================
-// 1. POST /api/business/products — create a product (owner only).
-// =============================================================================
 exports.createProduct = async (req, res) => {
     const prisma = req.app.get('prisma');
     try {
-        const {
-            name, description, priceUsdc, imageUrls, category, catalogSectionId,
-            tags, calorieCount, preparationMins, variants, modifierGroups,
-            locationId, deliveryTerms, estimatedDelivery, isAvailable,
-        } = req.body;
-
-        if (!name || priceUsdc === undefined || priceUsdc === null) {
-            return res.status(400).json({ success: false, message: 'name and priceUsdc are required.' });
-        }
-
+        const { name, description, priceUsdc, imageUrls, category, catalogSectionId, tags, calorieCount, preparationMins, variants, modifierGroups, locationId, deliveryTerms, estimatedDelivery, isAvailable } = req.body;
+        if (!name || priceUsdc === undefined || priceUsdc === null) return res.status(400).json({ success: false, message: 'name and priceUsdc are required.' });
         const profile = await _resolveTargetProfile(prisma, req);
         if (!profile) return res.status(403).json({ success: false, message: 'You do not own a business profile.' });
-
-        const product = await businessProductService.createProduct(prisma, {
-            businessProfileId: profile.id,
-            name,
-            description,
-            priceUsdc,
-            imageUrls,
-            category,
-            catalogSectionId,
-            tags,
-            calorieCount,
-            preparationMins,
-            variants,
-            modifierGroups,
-            locationId,
-            deliveryTerms,
-            estimatedDelivery,
-            isAvailable,
-        });
-
+        const product = await businessProductService.createProduct(prisma, { businessProfileId: profile.id, name, description, priceUsdc, imageUrls, category, catalogSectionId, tags, calorieCount, preparationMins, variants, modifierGroups, locationId, deliveryTerms, estimatedDelivery, isAvailable });
         return res.status(201).json({ success: true, product });
-    } catch (err) {
-        return res.status(err.status || 400).json({ success: false, message: err.message });
-    }
+    } catch (err) { return res.status(err.status || 400).json({ success: false, message: err.message }); }
 };
 
 exports.listMyProducts = async (req, res) => {
     const prisma = req.app.get('prisma');
     try {
-        const userId = req.user.id;
-        const profile = await _ownedProfile(prisma, userId);
+        const profile = await _ownedProfile(prisma, req.user.id);
         if (!profile) return res.status(403).json({ success: false, message: 'You do not own a business profile.' });
-
-        const { isActive, limit, cursor } = req.query;
+        const { isActive, locationId, limit, cursor } = req.query;
         let isActiveFilter;
         if (isActive === 'true') isActiveFilter = true;
         else if (isActive === 'false') isActiveFilter = false;
-
-        const result = await businessProductService.listProducts(prisma, {
-            businessProfileId: profile.id,
-            isActive: isActiveFilter,
-            limit,
-            cursor
-        });
-
+        const result = await businessProductService.listProducts(prisma, { businessProfileId: profile.id, isActive: isActiveFilter, locationId: locationId ? String(locationId) : undefined, limit, cursor });
         return res.status(200).json({ success: true, ...result });
-    } catch (err) {
-        return res.status(400).json({ success: false, message: err.message });
-    }
+    } catch (err) { return res.status(400).json({ success: false, message: err.message }); }
 };
 
 exports.getProduct = async (req, res) => {
     const prisma = req.app.get('prisma');
     try {
-        const { productId } = req.params;
-        const product = await businessProductService.getProduct(prisma, {
-            productId,
-            includeBusinessProfile: true
-        });
+        const product = await businessProductService.getProduct(prisma, { productId: req.params.productId, includeBusinessProfile: true });
         if (!product) return res.status(404).json({ success: false, message: 'Product not found.' });
         return res.status(200).json({ success: true, product });
-    } catch (err) {
-        return res.status(400).json({ success: false, message: err.message });
-    }
+    } catch (err) { return res.status(400).json({ success: false, message: err.message }); }
 };
 
 exports.updateProduct = async (req, res) => {
     const prisma = req.app.get('prisma');
     try {
-        const userId = req.user.id;
-        const { productId } = req.params;
-        const profile = await _ownedProfile(prisma, userId);
+        const profile = await _ownedProfile(prisma, req.user.id);
         if (!profile) return res.status(403).json({ success: false, message: 'You do not own a business profile.' });
-
-        const product = await businessProductService.updateProduct(prisma, {
-            productId,
-            businessProfileId: profile.id,
-            updates: req.body
-        });
-
+        const product = await businessProductService.updateProduct(prisma, { productId: req.params.productId, businessProfileId: profile.id, updates: req.body });
         return res.status(200).json({ success: true, product });
-    } catch (err) {
-        return res.status(400).json({ success: false, message: err.message });
-    }
+    } catch (err) { return res.status(400).json({ success: false, message: err.message }); }
 };
 
 exports.deleteProduct = async (req, res) => {
     const prisma = req.app.get('prisma');
     try {
-        const userId = req.user.id;
-        const { productId } = req.params;
-        const profile = await _ownedProfile(prisma, userId);
+        const profile = await _ownedProfile(prisma, req.user.id);
         if (!profile) return res.status(403).json({ success: false, message: 'You do not own a business profile.' });
-
-        const product = await businessProductService.deleteProduct(prisma, {
-            productId,
-            businessProfileId: profile.id
-        });
-
+        const product = await businessProductService.deleteProduct(prisma, { productId: req.params.productId, businessProfileId: profile.id });
         return res.status(200).json({ success: true, product, message: 'Product deactivated.' });
-    } catch (err) {
-        return res.status(400).json({ success: false, message: err.message });
-    }
+    } catch (err) { return res.status(400).json({ success: false, message: err.message }); }
 };
 
 exports.listProductsByBizId = async (req, res) => {
     const prisma = req.app.get('prisma');
     try {
-        const { bizId } = req.params;
-        const biz = await prisma.businessProfile.findFirst({
-            where: { bizId },
-            select: { id: true, isSuspended: true }
-        });
+        const biz = await prisma.businessProfile.findFirst({ where: { bizId: req.params.bizId }, select: { id: true, isSuspended: true } });
         if (!biz || biz.isSuspended) return res.status(404).json({ success: false, message: 'Business not found.' });
-
-        const { limit, cursor } = req.query;
-        const result = await businessProductService.listProducts(prisma, {
-            businessProfileId: biz.id,
-            isActive: true,
-            limit,
-            cursor
-        });
-
+        const { limit, cursor, locationId } = req.query;
+        const result = await businessProductService.listProducts(prisma, { businessProfileId: biz.id, isActive: true, locationId: locationId ? String(locationId) : undefined, limit, cursor });
         return res.status(200).json({ success: true, ...result });
     } catch (err) {
         logger.error({ err: err }, '[listProductsByBizId] error');
