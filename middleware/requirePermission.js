@@ -10,7 +10,7 @@
 //   const { requirePermission } = require('../middleware/requirePermission');
 //   router.post('/employees', requirePermission('employees.create'), wrap(async (req, res) => { ... }));
 //
-// The middleware resolves the user's effective permission set:
+// The middleware resolves a user's effective permission set:
 //   1. If the user IS the BusinessProfile owner (userId === bp.userId) → all perms
 //   2. If the user is an admin impersonating a business → all perms (admin override)
 //   3. If the user is a BusinessEmployee → check their resolved permissions[]
@@ -102,6 +102,22 @@ function requirePermission(key) {
                 });
                 if (!businessProfile) {
                     return res.status(403).json({ success: false, message: 'Business profile not found.' });
+                }
+            }
+
+            // Resource-level tenant guard for the legacy tax-preset PATCH route.
+            // The route historically verified the business only when clearing
+            // other defaults, then updated the requested preset by bare ID.
+            // Verify ownership here before the handler runs so an otherwise
+            // authorized business user/admin cannot mutate another business's
+            // preset by guessing or obtaining its ID.
+            if (req.method === 'PATCH' && /^\/tax-presets\/[^/]+$/.test(req.path)) {
+                const preset = await prisma.businessTaxPreset.findFirst({
+                    where: { id: req.params.id, businessProfileId },
+                    select: { id: true },
+                });
+                if (!preset) {
+                    return res.status(404).json({ success: false, message: 'Tax preset not found.' });
                 }
             }
 
