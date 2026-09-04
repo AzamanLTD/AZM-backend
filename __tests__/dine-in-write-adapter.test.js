@@ -20,6 +20,7 @@ describe('dine-in tab service adapter', () => {
     expect(openTab).toHaveBeenCalledWith({
       businessProfileId: 'biz-1',
       azamanId: 'AZM-123',
+      locationId: 'location-1',
       tableId: 'table-7',
     });
   });
@@ -43,6 +44,7 @@ describe('dine-in tab service adapter', () => {
 
     expect(addItem).toHaveBeenCalledWith({
       tabId: 'tab-1',
+      productId: 'product-1',
       name: 'Jollof rice',
       price: '12.50',
       quantity: 2,
