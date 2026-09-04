@@ -7,8 +7,9 @@ describe('OracleService Kotani rate preference', () => {
     const originalEnv = process.env;
 
     beforeEach(() => {
-        process.env = { ...originalEnv, KOTANI_PROVIDER: 'LIVE', KOTANI_API_KEY: 'test-key' };
+        process.env = { ...originalEnv, KOTANI_PROVIDER: 'LIVE', KOTANI_API_TOKEN: 'test-token' };
         axios.get.mockReset();
+        axios.post.mockReset();
     });
 
     afterAll(() => {
@@ -29,9 +30,13 @@ describe('OracleService Kotani rate preference', () => {
             if (url.includes('coingecko')) {
                 return Promise.resolve({ data: { tether: { usd: 1 }, 'usd-coin': { usd: 1 }, dai: { usd: 1 } } });
             }
-            if (url.includes('/rate/USDC/CGHS')) return Promise.resolve({ data: { rate: 12.75 } });
             if (url.includes('open.er-api.com')) throw new Error('fallback must not be called');
-            throw new Error(`unexpected URL: ${url}`);
+            throw new Error(`unexpected GET URL: ${url}`);
+        });
+        axios.post.mockImplementation((url, body) => {
+            expect(url).toContain('/api/v3/rate/offramp');
+            expect(body).toEqual({ from: 'USDC', to: 'CGHS', cryptoAmount: 1 });
+            return Promise.resolve({ data: { rate: 12.75 } });
         });
 
         const prisma = {
@@ -56,9 +61,12 @@ describe('OracleService Kotani rate preference', () => {
             if (url.includes('coingecko')) {
                 return Promise.resolve({ data: { tether: { usd: 1 }, 'usd-coin': { usd: 1 }, dai: { usd: 1 } } });
             }
-            if (url.includes('/rate/USDC/CGHS')) return Promise.reject(new Error('kotani unavailable'));
             if (url.includes('open.er-api.com')) return Promise.resolve({ data: { rates: { GHS: 12.11 } } });
-            throw new Error(`unexpected URL: ${url}`);
+            throw new Error(`unexpected GET URL: ${url}`);
+        });
+        axios.post.mockImplementation((url) => {
+            if (url.includes('/api/v3/rate/offramp')) return Promise.reject(new Error('kotani unavailable'));
+            throw new Error(`unexpected POST URL: ${url}`);
         });
 
         const prisma = {
