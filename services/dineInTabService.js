@@ -51,7 +51,16 @@ exports.confirmTab = async (prisma, { tabId, customerId, io }) => service(prisma
 exports.confirmAndPay = async (prisma, { tabId, customerId, tipUsdc, io }) => {
     const svc = new DineInService(prisma, io);
     if (typeof svc.confirmAndPay === 'function') {
-        return svc.confirmAndPay(tabId, customerId, { tipUsdc });
+        const result = await svc.confirmAndPay(tabId, customerId, { tipUsdc });
+
+        // A payment may have committed before the original request crashed
+        // during tab closure. A replay against the already-paid invoice must
+        // therefore finish the durable tab state transition instead of merely
+        // returning the stale FINALIZED tab forever.
+        if (result?.payment?.alreadyPaid && result.tab?.status === 'FINALIZED') {
+            result.tab = await svc.confirmTab(tabId, customerId);
+        }
+        return result;
     }
     return svc.confirmTab(tabId, customerId);
 };
