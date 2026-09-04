@@ -23,11 +23,6 @@ const waitForSerializableRetry = (attempt) => new Promise((resolve) => {
     setTimeout(resolve, SERIALIZABLE_BACKOFF_MS * (2 ** attempt));
 });
 
-// Keep the canonical invoice service authoritative while allowing its payment
-// transaction to participate in a larger interactive transaction. The proxy
-// delegates all Prisma model access to the transaction client and replaces only
-// $transaction so invoiceService.payInvoice executes on the existing transaction
-// instead of opening a nested transaction.
 const transactionScopedPrisma = (prisma, tx) => new Proxy(prisma, {
     get(target, property, receiver) {
         if (property === '$transaction') return async (callback) => callback(tx);
@@ -51,32 +46,17 @@ class DineInService {
             try {
                 const tab = await this.prisma.$transaction(async (tx) => {
                     if (locationId) {
-                        const location = await tx.businessLocation.findFirst({
-                            where: { id: locationId, businessProfileId, isActive: true },
-                            select: { id: true },
-                        });
+                        const location = await tx.businessLocation.findFirst({ where: { id: locationId, businessProfileId, isActive: true }, select: { id: true } });
                         if (!location) throw new Error('Invalid or inactive business location.');
                     }
                     if (tableId) {
-                        const table = await tx.businessTable.findFirst({
-                            where: { id: tableId, locationId, isActive: true },
-                            select: { id: true },
-                        });
+                        const table = await tx.businessTable.findFirst({ where: { id: tableId, locationId, isActive: true }, select: { id: true } });
                         if (!table) throw new Error('Invalid or inactive business table for location.');
                     }
-
-                    const existing = await tx.dineInTab.findFirst({
-                        where: { businessProfileId, customerId: customer.id, status: 'OPEN' },
-                    });
+                    const existing = await tx.dineInTab.findFirst({ where: { businessProfileId, customerId: customer.id, status: 'OPEN' } });
                     if (existing) throw new Error('Customer already has an open tab at this business.');
                     return tx.dineInTab.create({
-                        data: {
-                            businessProfileId,
-                            customerId: customer.id,
-                            locationId: locationId || null,
-                            tableId: tableId || null,
-                            status: 'OPEN',
-                        },
+                        data: { businessProfileId, customerId: customer.id, locationId: locationId || null, tableId: tableId || null, status: 'OPEN' },
                         include: { items: true },
                     });
                 }, { isolationLevel: 'Serializable' });
@@ -92,14 +72,8 @@ class DineInService {
 
     async _productWhereForTab(tab, productId) {
         const where = { id: productId, businessProfileId: tab.businessProfileId, isActive: true, isAvailable: true };
-        // A location-bound tab may use global products or exact-branch products.
-        // A legacy/locationless tab may only use global products; otherwise an old
-        // tab could bypass the branch boundary by omitting location context.
-        if (tab.locationId) {
-            where.OR = [{ locationId: null }, { locationId: tab.locationId }];
-        } else {
-            where.locationId = null;
-        }
+        if (tab.locationId) where.OR = [{ locationId: null }, { locationId: tab.locationId }];
+        else where.locationId = null;
         return where;
     }
 
@@ -109,20 +83,14 @@ class DineInService {
         const qty = Number(quantity || 1);
         if (!Number.isInteger(qty) || qty < 1 || qty > 50) throw new Error('quantity must be an integer from 1 to 50.');
 
-        const tab = await this.prisma.dineInTab.findUnique({
-            where: { id: tabId },
-            select: { id: true, businessProfileId: true, locationId: true, status: true, customerId: true },
-        });
+        const tab = await this.prisma.dineInTab.findUnique({ where: { id: tabId }, select: { id: true, businessProfileId: true, locationId: true, status: true, customerId: true } });
         if (!tab) throw new Error('Tab not found.');
         if (tab.status !== 'OPEN') throw new Error('Cannot add items to a tab that is not OPEN.');
 
         let itemName = name;
         let authoritativePrice = priceNum;
         if (productId) {
-            const product = await this.prisma.businessProduct.findFirst({
-                where: await this._productWhereForTab(tab, productId),
-                select: { id: true, name: true, priceUsdc: true },
-            });
+            const product = await this.prisma.businessProduct.findFirst({ where: await this._productWhereForTab(tab, productId), select: { id: true, name: true, priceUsdc: true } });
             if (!product) throw new Error('Product is unavailable for this restaurant/location.');
             authoritativePrice = Number(product.priceUsdc);
             itemName = product.name;
@@ -130,17 +98,7 @@ class DineInService {
         if (!itemName) throw new Error('name is required.');
         if (!Number.isFinite(authoritativePrice) || authoritativePrice <= 0) throw new Error('price must be positive.');
 
-        const item = await this.prisma.dineInTabItem.create({
-            data: {
-                dineInTabId: tabId,
-                productId: productId || null,
-                name: String(itemName).slice(0, 200),
-                unitPriceUsdc: authoritativePrice,
-                quantity: qty,
-                lineTotalUsdc: authoritativePrice * qty,
-                addedBy: addedBy || tab.customerId,
-            },
-        });
+        const item = await this.prisma.dineInTabItem.create({ data: { dineInTabId: tabId, productId: productId || null, name: String(itemName).slice(0, 200), unitPriceUsdc: authoritativePrice, quantity: qty, lineTotalUsdc: authoritativePrice * qty, addedBy: addedBy || tab.customerId } });
         this.io?.to(`user_${tab.customerId}`).emit('dine_in_item_added', { tabId, item });
         return item;
     }
@@ -162,17 +120,7 @@ class DineInService {
         if (!(unitPrice > 0)) throw new Error('Product price must be positive.');
         const label = selectionLabel(normalized);
 
-        const configuredItem = await this.prisma.dineInTabItem.create({
-            data: {
-                dineInTabId: tabId,
-                productId: product.id,
-                name: String(label ? `${product.name} — ${label}` : product.name).slice(0, 200),
-                unitPriceUsdc: unitPrice,
-                quantity: Number(quantity || 1),
-                lineTotalUsdc: unitPrice * Number(quantity || 1),
-                addedBy: customerId,
-            },
-        });
+        const configuredItem = await this.prisma.dineInTabItem.create({ data: { dineInTabId: tabId, productId: product.id, name: String(label ? `${product.name} — ${label}` : product.name).slice(0, 200), unitPriceUsdc: unitPrice, quantity: Number(quantity || 1), lineTotalUsdc: unitPrice * Number(quantity || 1), addedBy: customerId } });
         this.io?.to(`user_${tab.customerId}`).emit('dine_in_item_added', { tabId, item: configuredItem });
         return configuredItem;
     }
@@ -193,10 +141,7 @@ class DineInService {
                     if (!tab) throw new Error('Tab not found.');
                     if (tab.status !== 'OPEN') throw new Error('Tab is not OPEN.');
                     const total = tab.items.reduce((sum, item) => sum + Number(item.unitPriceUsdc) * item.quantity, 0);
-                    const claimed = await tx.dineInTab.updateMany({
-                        where: { id: tabId, status: 'OPEN' },
-                        data: { status: 'FINALIZED', closedAt: new Date(), grandTotalUsdc: total, subtotalUsdc: total },
-                    });
+                    const claimed = await tx.dineInTab.updateMany({ where: { id: tabId, status: 'OPEN' }, data: { status: 'FINALIZED', closedAt: new Date(), grandTotalUsdc: total, subtotalUsdc: total } });
                     if (claimed.count !== 1) throw new Error('Tab was finalized by another request.');
                     return tx.dineInTab.findUnique({ where: { id: tabId }, include: { items: true } });
                 }, { isolationLevel: 'Serializable' });
@@ -215,30 +160,32 @@ class DineInService {
         if (!tab) throw new Error('Tab not found.');
         if (tab.customerId !== customerId) throw new Error('Not authorized to pay this tab.');
         if (tab.status !== 'FINALIZED' && tab.status !== 'CLOSED') throw new Error('Tab must be FINALIZED before payment.');
-        let invoice = tab.invoice;
 
-        if (invoice?.status === 'PAID') {
-            return { tab, invoice, payment: { invoice, customerPays: Number(invoice.customerPaidUsdc), alreadyPaid: true } };
-        }
+        let invoice = tab.invoice;
+        if (invoice?.status === 'PAID') return { tab, invoice, payment: { invoice, customerPays: Number(invoice.customerPaidUsdc), alreadyPaid: true } };
 
         if (!invoice) {
             if (!tab.items.length) throw new Error('Cannot pay an empty dine-in tab.');
             const idempotencyKey = `DINE_IN_TAB:${tabId}`;
             try {
                 invoice = await invoiceService.createInvoice(this.prisma, {
-                    businessProfileId: tab.businessProfileId, customerId: tab.customerId,
-                    locationId: tab.locationId, tableId: tab.tableId,
+                    businessProfileId: tab.businessProfileId,
+                    customerId: tab.customerId,
+                    locationId: tab.locationId,
+                    tableId: tab.tableId,
                     lineItems: tab.items.map(item => ({ description: item.name, quantity: item.quantity, unitPrice: Number(item.unitPriceUsdc) })),
-                    taxLines: [], businessNote: 'Dine-in tab settlement', idempotencyKey,
+                    // Omitted deliberately: createInvoice applies the business's
+                    // default tax preset when the caller has not selected explicit
+                    // tax lines. An explicit [] remains tax-free by contract.
+                    businessNote: 'Dine-in tab settlement',
+                    idempotencyKey,
                 });
             } catch (error) {
                 if (error?.code !== 'P2002') throw error;
                 invoice = await this.prisma.businessInvoice.findUnique({ where: { idempotencyKey } });
                 if (!invoice) throw error;
             }
-            await this.prisma.dineInTab.updateMany({
-                where: { id: tabId, invoiceId: null }, data: { invoiceId: invoice.id },
-            });
+            await this.prisma.dineInTab.updateMany({ where: { id: tabId, invoiceId: null }, data: { invoiceId: invoice.id } });
             tab = await this.prisma.dineInTab.findUnique({ where: { id: tabId }, include: { items: true, invoice: true } });
             invoice = tab.invoice;
         } else if (invoice.status === 'DRAFT') {
@@ -258,21 +205,13 @@ class DineInService {
             const tip = Math.max(0, Number(settledInvoice?.tipUsdc ?? invoice.tipUsdc) || 0);
             const billTotal = Number(settledInvoice?.billTotalUsdc ?? invoice.billTotalUsdc);
             const grandTotal = billTotal + tip;
-            const closedUpdate = await tx.dineInTab.updateMany({
-                where: { id: tabId, status: 'FINALIZED', invoiceId: invoice.id },
-                data: { status: 'CLOSED', closedAt: new Date(), tipUsdc: tip, grandTotalUsdc: grandTotal, paymentMethod: 'AZAMAN_BALANCE' },
-            });
+            const closedUpdate = await tx.dineInTab.updateMany({ where: { id: tabId, status: 'FINALIZED', invoiceId: invoice.id }, data: { status: 'CLOSED', closedAt: new Date(), tipUsdc: tip, grandTotalUsdc: grandTotal, paymentMethod: 'AZAMAN_BALANCE' } });
             if (closedUpdate.count !== 1) throw new Error('Tab could not be closed after payment; transaction rolled back.');
             const closed = await tx.dineInTab.findUnique({ where: { id: tabId }, include: { items: true, invoice: true } });
             return { closed, payment };
         });
 
-        this.io?.to(`user_${customerId}`).emit('dine_in_tab_paid', {
-            tabId, invoiceId: invoice.id,
-            customerPays: settlement.payment.customerPays,
-            businessReceives: settlement.payment.businessReceives,
-            fee: settlement.payment.fee,
-        });
+        this.io?.to(`user_${customerId}`).emit('dine_in_tab_paid', { tabId, invoiceId: invoice.id, customerPays: settlement.payment.customerPays, businessReceives: settlement.payment.businessReceives, fee: settlement.payment.fee });
         return { tab: settlement.closed, invoice: settlement.payment.invoice, payment: settlement.payment };
     }
 
@@ -299,7 +238,7 @@ class DineInService {
     }
 
     async getTab(tabId) {
-        return this.prisma.dineInTab.findUnique({ where: { id: tabId }, include: { items: true, invoice: true, customer: { select: { id: true, username: true, azamanId: true } }, businessProfile: { select: { id: true, businessName: true, logoUrl: true } } } });
+        return this.prisma.dineInTab.findUnique({ where: { id: tabId }, include: { items: true, invoice: true, customer: { select: { id: true, username: true, azamanId: true } }, businessProfile: { select: { id: true, businessName: true, logoUrl: true } } });
     }
 
     async getCustomerTabs(userId, status) {
