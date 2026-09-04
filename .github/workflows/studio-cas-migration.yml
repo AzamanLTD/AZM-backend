@@ -1,9 +1,8 @@
 name: Storefront CAS Migration
 
 on:
-  push:
-    branches:
-      - fix/storefront-draft-save-cas
+  pull_request:
+    types: [opened, synchronize]
   workflow_dispatch:
 
 permissions:
@@ -16,7 +15,7 @@ jobs:
       - name: Checkout feature branch
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.ref_name }}
+          ref: ${{ github.head_ref || github.ref_name }}
           fetch-depth: 0
 
       - name: Patch saveDraft with compare-and-swap
@@ -216,4 +215,4 @@ jobs:
           git add services/storefrontService.js __tests__/storefrontService-draft-cas.test.js
           git rm .github/workflows/studio-cas-migration.yml
           git commit -m "fix(storefront): make draft saves compare-and-swap safe"
-          git push origin HEAD:${{ github.ref_name }}
+          git push origin HEAD:${{ github.head_ref || github.ref_name }}
