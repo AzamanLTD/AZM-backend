@@ -46,7 +46,7 @@ exports.initiate = async (req, res) => {
       const tx = await db.transactionHistory.create({
         data: {
           userId, type: 'DEPOSIT_FIAT', amountUsdc: quote.usdcAmount, feeUsdc: 0, txHash: reference, status: 'PENDING', initiatedByUserId: userId,
-          metadata: { provider, amountGhs: quote.amountGhs, quoteId: quote.id, quoteAmountUsdc: quote.usdcAmount, quoteExpiresAt: quote.expiresAt, rateAtInitiation: quote.rateGhsPerUsdc, rateSource: quote.rateSource, rateAsOf: quote.rateAsOf },
+          metadata: { provider, amountGhs: quote.amountGhs, quoteId: quote.id, quoteAmountUsdc: quote.usdcAmount, quoteExpiresAt: quote.expiresAt, rateAtInitiation: quote.rateGhsPerUsdc, rateSource: quote.rateSource, rateAsOf: quote.rateAsOf, ratePair: 'USDC/GHS', settlementCurrency: 'USDC', displayCurrency: 'GHS' },
         },
       });
       return { quote, tx };
@@ -76,7 +76,7 @@ exports.initiateMoolre = async (req, res) => {
     if (!phoneNumber || String(phoneNumber).replace(/\D/g, '').length < 9) return res.status(400).json({ success: false, message: 'A valid phone number is required.' });
 
     const settings = await prisma.globalSettings.findUnique({ where: { id: 1 } });
-    const rate = Number(settings?.liveUsdToGhs);
+    const rate = Number(settings?.liveRetailRate ?? settings?.liveUsdToGhs);
     if (!Number.isFinite(rate) || rate <= 0) return res.status(503).json({ success: false, message: 'Exchange rate unavailable. Please retry shortly.' });
     const network = NETWORK_MAP[provider];
     const quote = createTransactionQuote({ id: crypto.randomUUID(), userId, purpose: 'deposit', amountGhs: ghsFloat, feeGhs: 0, rateGhsPerUsdc: rate, rateSource: settings.liveRateSource || 'AZM_ADMIN_MOCK', rateAsOf: settings.lastRateSync || new Date(), ttlSeconds: QUOTE_TTL_SECONDS });
@@ -86,7 +86,7 @@ exports.initiateMoolre = async (req, res) => {
       return tx.transactionHistory.create({
         data: {
           userId, type: 'DEPOSIT_FIAT', amountUsdc: quote.usdcAmount, txHash: `MOOLRE_DEP_${userId}_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`, status: 'PENDING', initiatedByUserId: userId,
-          metadata: { provider, network, amountGhs: ghsFloat, quoteId: quote.id, quoteAmountUsdc: quote.usdcAmount, quoteExpiresAt: quote.expiresAt, rateAtInitiation: rate, payerPhone: phoneNumber, channel: 'APP', ...(memo ? { memo: String(memo) } : {}) },
+          metadata: { provider, network, amountGhs: ghsFloat, quoteId: quote.id, quoteAmountUsdc: quote.usdcAmount, quoteExpiresAt: quote.expiresAt, rateAtInitiation: rate, rateSource: quote.rateSource, rateAsOf: quote.rateAsOf, ratePair: 'USDC/GHS', settlementCurrency: 'USDC', displayCurrency: 'GHS', payerPhone: phoneNumber, channel: 'APP', ...(memo ? { memo: String(memo) } : {}) },
         },
       });
     });
