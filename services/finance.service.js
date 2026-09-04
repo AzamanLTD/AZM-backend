@@ -120,13 +120,7 @@ const processFiatWithdrawal = async (prisma, userId, amountFloat, opts = {}) => 
             throw err;
         }
 
-        // Reserve fiat liquidity before mutating the customer ledger. The
-        // conditional UPDATE makes concurrent withdrawals serialize safely at
-        // the treasury row instead of relying on a stale preflight snapshot.
         await _reserveFiatPool(tx, amountFloat);
-
-        // The user snapshot above is only for the human-readable error. The
-        // conditional UPDATE below is authoritative for the actual debit.
         await _debitUserBalance(tx, userId, totalDeduct);
 
         await _ensureProfitFeesSingleton(tx);
@@ -160,19 +154,20 @@ const processFiatWithdrawal = async (prisma, userId, amountFloat, opts = {}) => 
             }
         });
 
-        const [profitFees, updatedFiatPool, masterCrypto] = await Promise.all([
+        const [profitFees, updatedFiatPool, masterCrypto, updatedUser] = await Promise.all([
             tx.systemProfitFees.findUnique({ where: { id: 1 } }),
             tx.systemFiatPool.findUnique({ where: { id: 1 } }),
-            tx.systemMasterCrypto.findUnique({ where: { id: 1 } })
+            tx.systemMasterCrypto.findUnique({ where: { id: 1 } }),
+            tx.user.findUnique({ where: { id: userId }, select: { availableBalance: true } })
         ]);
 
         return {
-            user,
+            user: updatedUser,
             txRecord,
             profitFees,
             fiatPool: updatedFiatPool,
             masterCrypto,
-            newUserBalance: user.availableBalance - totalDeduct
+            newUserBalance: updatedUser.availableBalance
         };
     });
 
@@ -204,8 +199,12 @@ const reverseFiatWithdrawal = async (prisma, reference, opts = {}) => {
     if (!original) throw new Error(`[reverseFiatWithdrawal] No row with reference ${reference}.`);
     if (original.type !== 'WITHDRAWAL_FIAT') throw new Error(`[reverseFiatWithdrawal] Reference ${reference} is not a fiat withdrawal.`);
     if (original.status === 'FAILED') return { reference, alreadyReversed: true };
-    if (original.status !== 'PENDING' && original.status !== 'COMPLETED') {
-        throw new Error(`[reverseFiatWithdrawal] Cannot reverse row in state ${original.status}.`);
+
+    // A provider failure can reverse only a still-pending internal reservation.
+    // Once Azaman has marked the transfer COMPLETED, a late failure callback is
+    // informational and must never claw the customer funds back a second time.
+    if (original.status !== 'PENDING') {
+        return { reference, alreadyReversed: true, notReversible: true, status: original.status };
     }
 
     const userId = original.userId;
@@ -217,7 +216,7 @@ const reverseFiatWithdrawal = async (prisma, reference, opts = {}) => {
 
     const result = await prisma.$transaction(async (tx) => {
         const claim = await tx.transactionHistory.updateMany({
-            where: { txHash: reference, status: { in: ['PENDING', 'COMPLETED'] } },
+            where: { txHash: reference, status: 'PENDING' },
             data: { status: 'FAILED' }
         });
         if (claim.count === 0) return { alreadyReversed: true };
@@ -291,23 +290,36 @@ const liquidateProfits = async (prisma, amountFloat, adminId) => {
 };
 
 const processCryptoDeposit = async (prisma, { userId, amountUsdc, txHash, address }) => {
-    const existingTx = await prisma.transactionHistory.findUnique({ where: { txHash } });
-    if (existingTx) {
-        logger.info(`[Finance] Duplicate txHash ignored: ${txHash}`);
-        return { alreadyProcessed: true };
-    }
+    try {
+        const result = await prisma.$transaction(async (tx) => {
+            const existingTx = await tx.transactionHistory.findUnique({ where: { txHash } });
+            if (existingTx) return { alreadyProcessed: true };
 
-    const result = await prisma.$transaction(async (tx) => {
-        const user = await tx.user.findUnique({ where: { id: userId } });
-        if (!user) throw new Error(`User ${userId} not found for crypto deposit.`);
-        await tx.user.update({ where: { id: userId }, data: { availableBalance: { increment: amountUsdc } } });
-        await tx.systemMasterCrypto.upsert({ where: { id: 1 }, update: { balance: { increment: amountUsdc } }, create: { id: 1, balance: amountUsdc } });
-        await tx.systemHotWallet.upsert({ where: { id: 1 }, update: { balance: { increment: amountUsdc } }, create: { id: 1, balance: amountUsdc } });
-        const txRecord = await tx.transactionHistory.create({ data: { userId, type: 'DEPOSIT_CRYPTO', amountUsdc, feeUsdc: 0, txHash, status: 'COMPLETED' } });
-        return { user, txRecord, newBalance: user.availableBalance + amountUsdc };
-    });
-    logger.info(`[Finance] Crypto deposit: ${amountUsdc} USDC → user ${userId} | txHash: ${txHash}`);
-    return { alreadyProcessed: false, data: { userId, amountUsdc, txHash, address: address || null, newBalance: result.newBalance, transaction: result.txRecord } };
+            const user = await tx.user.findUnique({ where: { id: userId } });
+            if (!user) throw new Error(`User ${userId} not found for crypto deposit.`);
+            await tx.user.update({ where: { id: userId }, data: { availableBalance: { increment: amountUsdc } } });
+            await tx.systemMasterCrypto.upsert({ where: { id: 1 }, update: { balance: { increment: amountUsdc } }, create: { id: 1, balance: amountUsdc } });
+            await tx.systemHotWallet.upsert({ where: { id: 1 }, update: { balance: { increment: amountUsdc } }, create: { id: 1, balance: amountUsdc } });
+            const txRecord = await tx.transactionHistory.create({ data: { userId, type: 'DEPOSIT_CRYPTO', amountUsdc, feeUsdc: 0, txHash, status: 'COMPLETED' } });
+            return { alreadyProcessed: false, user, txRecord, newBalance: user.availableBalance + amountUsdc };
+        });
+
+        if (result.alreadyProcessed) {
+            logger.info(`[Finance] Duplicate txHash ignored: ${txHash}`);
+            return { alreadyProcessed: true };
+        }
+
+        logger.info(`[Finance] Crypto deposit: ${amountUsdc} USDC → user ${userId} | txHash: ${txHash}`);
+        return { alreadyProcessed: false, data: { userId, amountUsdc, txHash, address: address || null, newBalance: result.newBalance, transaction: result.txRecord } };
+    } catch (error) {
+        // Concurrent identical webhooks can race the in-transaction existence
+        // check; the unique txHash constraint is the final idempotency fence.
+        if (error?.code === 'P2002') {
+            logger.info(`[Finance] Duplicate txHash ignored after unique constraint: ${txHash}`);
+            return { alreadyProcessed: true };
+        }
+        throw error;
+    }
 };
 
 module.exports = {
