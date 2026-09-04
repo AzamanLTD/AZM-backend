@@ -7,6 +7,7 @@ describe('processFiatWithdrawal fiat-pool concurrency guard', () => {
     const tx = {
       user: {
         findUnique: jest.fn().mockResolvedValue({ id: 7, availableBalance: 100, withdrawalRiskTier: 'STANDARD' }),
+        updateMany: jest.fn().mockResolvedValue({ count: 1 }),
         update: jest.fn().mockResolvedValue({}),
       },
       systemFiatPool: {
@@ -63,8 +64,8 @@ describe('processFiatWithdrawal fiat-pool concurrency guard', () => {
       where: { id: 1, balance: { gte: 10 } },
       data: { balance: { decrement: 10 } },
     });
-    expect(tx.user.update).toHaveBeenCalledWith({
-      where: { id: 7 },
+    expect(tx.user.updateMany).toHaveBeenCalledWith({
+      where: { id: 7, availableBalance: { gte: 10.2 } },
       data: { availableBalance: { decrement: 10.2 } },
     });
     expect(result.reference).toBe('REF-1');
@@ -77,6 +78,7 @@ describe('processFiatWithdrawal fiat-pool concurrency guard', () => {
       .rejects
       .toMatchObject({ code: 'FIAT_POOL_INSUFFICIENT' });
 
+    expect(tx.user.updateMany).not.toHaveBeenCalled();
     expect(tx.user.update).not.toHaveBeenCalled();
     expect(tx.adminProfitLog.create).not.toHaveBeenCalled();
     expect(tx.transactionHistory.create).not.toHaveBeenCalled();
