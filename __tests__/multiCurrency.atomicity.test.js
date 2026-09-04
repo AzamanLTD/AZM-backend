@@ -1,56 +1,76 @@
-jest.mock('../utils/securityCheck', () => ({ runDoubleCheck: jest.fn().mockResolvedValue(undefined) }));
+const prismaMock = {};
 
-const controller = require('../controllers/multiCurrencyController');
+jest.mock('@prisma/client', () => ({
+  PrismaClient: jest.fn(() => prismaMock),
+}));
+
+const { convertCurrency } = require('../controllers/multiCurrencyController');
 
 describe('multi-currency conversion atomicity', () => {
-  function requestFor({ debitCount = 1, destinationExists = true } = {}) {
+  function setup({ debitCount = 1 } = {}) {
     const tx = {
       currencyWallet: {
         updateMany: jest.fn().mockResolvedValue({ count: debitCount }),
-        upsert: jest.fn().mockResolvedValue({ id: 'dest', balance: 0, currency: 'GHS' }),
+        upsert: jest.fn().mockResolvedValue({ id: 'dest', userId: 7, currency: 'GHS', balance: 0 }),
         update: jest.fn().mockResolvedValue({}),
-        findUnique: jest.fn().mockResolvedValue(destinationExists ? { id: 'dest' } : null),
       },
       currencyConversion: {
         create: jest.fn().mockResolvedValue({ id: 'conv' }),
       },
     };
-    const prisma = {
-      currencyWallet: {
-        findUnique: jest.fn().mockImplementation(({ where }) => {
-          if (where.userId_currency.currency === 'USD') {
-            return Promise.resolve({ id: 'source', balance: 100 });
-          }
-          return Promise.resolve(null);
-        }),
-        $transaction: null,
-      },
-      fxRate: {
-        findUnique: jest.fn().mockResolvedValue({ rate: 15 }),
-      },
-      $transaction: jest.fn(async (callback) => callback(tx)),
+
+    prismaMock.fxRate = {
+      findUnique: jest.fn().mockResolvedValue({ rate: 15 }),
     };
+    prismaMock.currencyWallet = {
+      findUnique: jest.fn().mockResolvedValue({ id: 'source', userId: 7, currency: 'USD', balance: 100 }),
+    };
+    prismaMock.$transaction = jest.fn(async (callback) => callback(tx));
+
     const req = {
       user: { id: 7 },
       body: { fromCurrency: 'USD', toCurrency: 'GHS', amount: '10' },
-      app: { get: jest.fn().mockReturnValue(null) },
+      app: {
+        get: jest.fn((key) => (key === 'prisma' ? prismaMock : key === 'io' ? null : null)),
+      },
     };
-    const json = jest.fn();
-    const res = { json, status: jest.fn(() => res) };
-    return { req, res, prisma, tx, json };
+    const res = {
+      status: jest.fn(() => res),
+      json: jest.fn(() => res),
+    };
+    return { req, res, tx };
   }
 
-  test('atomically debits source balance and upserts destination wallet', async () => {
-    const ctx = requestFor();
-    // Replace module-level Prisma used by the legacy controller through its
-    // exported dependency surface is not currently injectable; this regression
-    // captures the transaction shape through the real controller contract only.
-    expect(controller.convertCurrency).toBeInstanceOf(Function);
-    expect(ctx.tx.currencyWallet.updateMany).toHaveBeenCalledTimes(0);
+  test('debits the source wallet conditionally and upserts the destination wallet', async () => {
+    const { req, res, tx } = setup();
+
+    await convertCurrency(req, res);
+
+    expect(tx.currencyWallet.updateMany).toHaveBeenCalledWith({
+      where: { id: 'source', balance: { gte: 10 } },
+      data: { balance: { decrement: 10 } },
+    });
+    expect(tx.currencyWallet.upsert).toHaveBeenCalledWith({
+      where: { userId_currency: { userId: 7, currency: 'GHS' } },
+      update: {},
+      create: { userId: 7, currency: 'GHS', balance: 0 },
+    });
+    expect(tx.currencyConversion.create).toHaveBeenCalled();
+    expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ success: true }));
   });
 
-  test('conditional debit has an explicit losing-race contract', () => {
-    const debit = { count: 0 };
-    expect(debit.count).toBe(0);
+  test('does not credit destination or write a conversion when source debit loses the race', async () => {
+    const { req, res, tx } = setup({ debitCount: 0 });
+
+    await convertCurrency(req, res);
+
+    expect(tx.currencyWallet.updateMany).toHaveBeenCalledTimes(1);
+    expect(tx.currencyWallet.upsert).not.toHaveBeenCalled();
+    expect(tx.currencyConversion.create).not.toHaveBeenCalled();
+    expect(res.status).toHaveBeenCalledWith(400);
+    expect(res.json).toHaveBeenCalledWith(expect.objectContaining({
+      success: false,
+      message: 'Insufficient balance. Your wallet changed; please retry.',
+    }));
   });
 });
