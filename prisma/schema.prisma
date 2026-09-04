@@ -2098,7 +2098,7 @@ model RateAlert {
   userId        Int
   targetRate    Decimal   @db.Decimal(18, 8) // The rate threshold
   direction     String    @default("ABOVE") // ABOVE | BELOW
-  ratePair      String    @default("USD_GHS") // Which rate pair to watch
+  ratePair      String    @default("") // Which rate pair to watch
   isTriggered   Boolean   @default(false)
   triggeredAt   DateTime?
   triggeredRate Decimal?  @db.Decimal(18, 8) // The rate when alert fired
