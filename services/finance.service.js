@@ -32,6 +32,15 @@ const _resolveReferrer = async (prisma, userId) => {
 const _isDeferredWithdrawal = (transaction) =>
     transaction?.metadata && transaction.metadata.economicsDeferred === true;
 
+const _resolveFiatRetailRate = (settings, opts = {}) => {
+    const explicit = Number(opts.retailRate);
+    if (Number.isFinite(explicit) && explicit > 0) return explicit;
+    const canonical = Number(settings?.liveRetailRate);
+    if (Number.isFinite(canonical) && canonical > 0) return canonical;
+    const compatibility = Number(settings?.liveUsdToGhs);
+    return Number.isFinite(compatibility) && compatibility > 0 ? compatibility : 0;
+};
+
 /**
  * Atomically reserve fiat liquidity. The conditional update is the actual
  * concurrency guard; a preflight read alone is not sufficient because two
@@ -97,8 +106,18 @@ const processFiatWithdrawal = async (prisma, userId, amountFloat, opts = {}) => 
     const totalDeduct = parseFloat((amountFloat + exitFee).toFixed(6));
 
     const reference = opts.reference || `FIAT_OUT_${userId}_${Date.now()}`;
-    const retailRate = Number(opts.retailRate) > 0 ? Number(opts.retailRate) : null;
-    const payoutGhs  = Number(opts.payoutGhs) > 0 ? Number(opts.payoutGhs) : null;
+    const retailRate = _resolveFiatRetailRate(settings, opts);
+    const payoutGhs  = retailRate > 0 ? parseFloat((amountFloat * retailRate).toFixed(2)) : 0;
+    const rateSource = settings?.liveRetailRate && Number(settings.liveRetailRate) > 0
+        ? (settings.liveRateSource || 'KOTANI_PAY')
+        : (settings?.liveRateSource || 'LEGACY_COMPATIBILITY');
+    const rateAsOf = settings?.lastRateSync || new Date();
+
+    if (!(retailRate > 0) || !(payoutGhs > 0)) {
+        const err = new Error('Current USDC/GHS retail exchange rate is unavailable. No fiat payout was created.');
+        err.code = 'FIAT_RATE_UNAVAILABLE';
+        throw err;
+    }
 
     const fiatPool = await prisma.systemFiatPool.findUnique({ where: { id: 1 } });
     if (!fiatPool || Number(fiatPool.balance) < amountFloat) {
@@ -151,7 +170,12 @@ const processFiatWithdrawal = async (prisma, userId, amountFloat, opts = {}) => 
                     referrerShareUsdc: referrer ? halfFee : 0,
                     systemFeeShareUsdc: referrer ? halfFee : exitFee,
                     retailRate,
-                    payoutGhs
+                    payoutGhs,
+                    rateSource,
+                    rateAsOf,
+                    ratePair: 'USDC/GHS',
+                    settlementCurrency: 'USDC',
+                    displayCurrency: 'GHS'
                 }
             }
         });
@@ -180,6 +204,11 @@ const processFiatWithdrawal = async (prisma, userId, amountFloat, opts = {}) => 
         totalDeducted: totalDeduct,
         retailRate,
         payoutGhs,
+        rateSource,
+        rateAsOf,
+        ratePair: 'USDC/GHS',
+        settlementCurrency: 'USDC',
+        displayCurrency: 'GHS',
         feeSplit: referrer
             ? { referrerId: referrer.id, referrerUsername: referrer.username, referrerShare: halfFee, systemShare: halfFee }
             : { referrerId: null, referrerUsername: null, referrerShare: 0, systemShare: exitFee },
