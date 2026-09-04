@@ -24,15 +24,8 @@ const extractKotaniRate = (payload) => {
         if (rate) return rate;
     }
 
-    // Some Kotani quote responses expose both sides of the conversion rather
-    // than a dedicated rate field. Prefer an actual USDC→CGHS conversion when
-    // both values are present rather than assuming USD and USDC are identical.
-    const cryptoAmount = asFinitePositive(
-        payload?.cryptoAmount ?? payload?.data?.cryptoAmount ?? payload?.result?.cryptoAmount
-    );
-    const fiatAmount = asFinitePositive(
-        payload?.fiatAmount ?? payload?.data?.fiatAmount ?? payload?.result?.fiatAmount
-    );
+    const cryptoAmount = asFinitePositive(payload?.cryptoAmount ?? payload?.data?.cryptoAmount ?? payload?.result?.cryptoAmount);
+    const fiatAmount = asFinitePositive(payload?.fiatAmount ?? payload?.data?.fiatAmount ?? payload?.result?.fiatAmount);
     if (cryptoAmount && fiatAmount) return fiatAmount / cryptoAmount;
 
     return null;
@@ -41,8 +34,8 @@ const extractKotaniRate = (payload) => {
 class OracleService {
     constructor(prisma) {
         this.prisma = prisma;
-        this.updateInterval = 10 * 60 * 1000; // Run every 10 minutes
-        this.rateAlertService = null; // Injected by server.js after construction
+        this.updateInterval = 10 * 60 * 1000;
+        this.rateAlertService = null;
     }
 
     startOracle() {
@@ -75,11 +68,7 @@ class OracleService {
 
     async fetchAndUpdateRates() {
         try {
-            const cryptoResponse = await axios.get(
-                'https://api.coingecko.com/api/v3/simple/price?ids=tether,usd-coin,dai&vs_currencies=usd',
-                { timeout: 8000 }
-            );
-
+            const cryptoResponse = await axios.get('https://api.coingecko.com/api/v3/simple/price?ids=tether,usd-coin,dai&vs_currencies=usd', { timeout: 8000 });
             const tetherPrice = asFinitePositive(cryptoResponse.data?.tether?.usd);
             const usdcPrice = asFinitePositive(cryptoResponse.data?.['usd-coin']?.usd);
             const daiPrice = asFinitePositive(cryptoResponse.data?.dai?.usd);
@@ -102,6 +91,7 @@ class OracleService {
                 where: { id: 1 },
                 update: {
                     liveUsdToGhs: usdToGhsRate,
+                    liveRetailRate: usdToGhsRate,
                     liveUsdtToUsd: tetherPrice,
                     liveUsdcToUsd: usdcPrice,
                     liveDaiToUsd: daiPrice,
@@ -111,6 +101,7 @@ class OracleService {
                 create: {
                     id: 1,
                     liveUsdToGhs: usdToGhsRate,
+                    liveRetailRate: usdToGhsRate,
                     liveUsdtToUsd: tetherPrice,
                     liveUsdcToUsd: usdcPrice,
                     liveDaiToUsd: daiPrice,
