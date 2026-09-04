@@ -122,7 +122,7 @@ class OracleService {
 
             if (this.rateAlertService && usdToGhsRate) {
                 setImmediate(() => {
-                    this.rateAlertService.checkAlerts(usdToGhsRate, 'USD_GHS')
+                    this.rateAlertService.checkAlerts(usdToGhsRate, 'USDC_GHS')
                         .catch(err => logger.error({ err }, '[Oracle] alert check error'));
                 });
             }

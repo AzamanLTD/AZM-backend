@@ -6,13 +6,15 @@
 // un-triggered alerts against the new rate and fires notifications for
 // any that cross their threshold.
 //
-// Usage:
-//   const rateAlertService = new RateAlertService(prisma, notificationService);
-const logger = require('../src/config/logger');
-//   await rateAlertService.checkAlerts(currentRate, 'USD_GHS');
-//
-// Called from oracleService.fetchAndUpdateRates() after each successful sync.
+// Legacy USD_GHS alerts remain supported for backward compatibility.
+// New alerts default to the canonical USDC_GHS pair because USDC is the
+// platform settlement unit and GHS is its local display equivalent.
 // =============================================================================
+
+const logger = require('../src/config/logger');
+
+const CANONICAL_RATE_PAIR = 'USDC_GHS';
+const LEGACY_RATE_PAIRS = new Set(['USD_GHS', CANONICAL_RATE_PAIR]);
 
 class RateAlertService {
     constructor(prisma, notificationService) {
@@ -20,55 +22,56 @@ class RateAlertService {
         this.notificationService = notificationService;
     }
 
-    // =========================================================================
-    // CHECK ALERTS — called after each oracle rate sync
-    // =========================================================================
-
-    /**
-     * Check all active, un-triggered alerts for a given rate pair.
-     * Fires notifications for any alerts that have crossed their threshold.
-     *
-     * @param {number} currentRate - The new live rate (e.g., 15.2 for USD/GHS)
-     * @param {string} ratePair - The pair identifier (e.g., 'USD_GHS')
-     */
-    async checkAlerts(currentRate, ratePair = 'USD_GHS') {
+    async checkAlerts(currentRate, ratePair = CANONICAL_RATE_PAIR) {
         try {
             if (!currentRate || currentRate <= 0) return;
+            const normalizedPair = String(ratePair || CANONICAL_RATE_PAIR).toUpperCase();
+            if (!LEGACY_RATE_PAIRS.has(normalizedPair)) return;
 
-            // Find ABOVE alerts where currentRate >= targetRate
-            const aboveAlerts = await this.prisma.rateAlert.findMany({
-                where: {
-                    ratePair,
-                    isActive: true,
-                    isTriggered: false,
-                    direction: 'ABOVE',
-                    targetRate: { lte: currentRate },
-                },
-                select: { id: true, userId: true, targetRate: true, note: true },
-            });
+            const pairAliases = normalizedPair === CANONICAL_RATE_PAIR
+                ? [CANONICAL_RATE_PAIR, 'USD_GHS']
+                : ['USD_GHS', CANONICAL_RATE_PAIR];
 
-            // Find BELOW alerts where currentRate <= targetRate
-            const belowAlerts = await this.prisma.rateAlert.findMany({
-                where: {
-                    ratePair,
-                    isActive: true,
-                    isTriggered: false,
-                    direction: 'BELOW',
-                    targetRate: { gte: currentRate },
-                },
-                select: { id: true, userId: true, targetRate: true, note: true },
-            });
+            const select = {
+                id: true,
+                userId: true,
+                targetRate: true,
+                note: true,
+                ratePair: true,
+                direction: true,
+            };
+
+            const [aboveAlerts, belowAlerts] = await Promise.all([
+                this.prisma.rateAlert.findMany({
+                    where: {
+                        ratePair: { in: pairAliases },
+                        isActive: true,
+                        isTriggered: false,
+                        direction: 'ABOVE',
+                        targetRate: { lte: currentRate },
+                    },
+                    select,
+                }),
+                this.prisma.rateAlert.findMany({
+                    where: {
+                        ratePair: { in: pairAliases },
+                        isActive: true,
+                        isTriggered: false,
+                        direction: 'BELOW',
+                        targetRate: { gte: currentRate },
+                    },
+                    select,
+                }),
+            ]);
 
             const triggeredAlerts = [...aboveAlerts, ...belowAlerts];
-
             if (triggeredAlerts.length === 0) return;
 
-            logger.info(`[RateAlertService] ${triggeredAlerts.length} alert(s) triggered at ${ratePair} = ${currentRate}`);
+            logger.info(`[RateAlertService] ${triggeredAlerts.length} alert(s) triggered at ${CANONICAL_RATE_PAIR} = ${currentRate}`);
 
-            // Mark all as triggered in batch
             const alertIds = triggeredAlerts.map(a => a.id);
             await this.prisma.rateAlert.updateMany({
-                where: { id: { in: alertIds } },
+                where: { id: { in: alertIds }, isTriggered: false, isActive: true },
                 data: {
                     isTriggered: true,
                     triggeredAt: new Date(),
@@ -77,11 +80,10 @@ class RateAlertService {
                 },
             });
 
-            // Fire notifications (fire-and-forget)
             for (const alert of triggeredAlerts) {
                 setImmediate(async () => {
                     try {
-                        const direction = aboveAlerts.includes(alert) ? 'above' : 'below';
+                        const direction = alert.direction === 'BELOW' ? 'below' : 'above';
                         const formattedRate = Number(currentRate).toFixed(2);
                         const formattedTarget = Number(alert.targetRate).toFixed(2);
                         const label = alert.note ? ` (${alert.note})` : '';
@@ -89,31 +91,24 @@ class RateAlertService {
                         await this.notificationService.sendNotification({
                             userId: alert.userId,
                             title: 'Rate Alert Triggered',
-                            body: `USD/GHS is now ${formattedRate} — crossed your ${direction} target of ${formattedTarget}${label}`,
+                            body: `USDC/GHS is now ${formattedRate} — crossed your ${direction} target of ${formattedTarget}${label}`,
                             category: 'MARKET',
-                            actionPayload: { action: 'OPEN_WALLET' },
+                            actionPayload: {
+                                action: 'OPEN_WALLET',
+                                ratePair: CANONICAL_RATE_PAIR,
+                            },
                         });
                     } catch (err) {
                         logger.error(`[RateAlertService] notification error for alert ${alert.id}:`, err.message);
                     }
                 });
             }
-
         } catch (err) {
-            // Non-fatal — don't crash the oracle sync
-            logger.error({ err: err }, '[RateAlertService] checkAlerts error');
+            logger.error({ err }, '[RateAlertService] checkAlerts error');
         }
     }
 
-    // =========================================================================
-    // CRUD OPERATIONS (used by controller)
-    // =========================================================================
-
-    /**
-     * Create a new rate alert for a user.
-     */
-    async createAlert(userId, { targetRate, direction = 'ABOVE', ratePair = 'USD_GHS', note }) {
-        // Limit: max 10 active alerts per user
+    async createAlert(userId, { targetRate, direction = 'ABOVE', ratePair = CANONICAL_RATE_PAIR, note }) {
         const activeCount = await this.prisma.rateAlert.count({
             where: { userId, isActive: true, isTriggered: false },
         });
@@ -122,22 +117,22 @@ class RateAlertService {
             throw new Error('Maximum 10 active alerts allowed. Delete an existing alert to add a new one.');
         }
 
-        const alert = await this.prisma.rateAlert.create({
+        const normalizedPair = String(ratePair || CANONICAL_RATE_PAIR).toUpperCase();
+        if (!LEGACY_RATE_PAIRS.has(normalizedPair)) {
+            throw new Error('ratePair must be USDC_GHS (canonical) or USD_GHS (legacy).');
+        }
+
+        return this.prisma.rateAlert.create({
             data: {
                 userId,
                 targetRate,
                 direction: direction.toUpperCase(),
-                ratePair,
+                ratePair: normalizedPair,
                 note: note || null,
             },
         });
-
-        return alert;
     }
 
-    /**
-     * List alerts for a user (active first, then triggered).
-     */
     async listAlerts(userId, { includeTriggered = true } = {}) {
         const where = { userId };
         if (!includeTriggered) {
@@ -145,7 +140,7 @@ class RateAlertService {
             where.isActive = true;
         }
 
-        const alerts = await this.prisma.rateAlert.findMany({
+        return this.prisma.rateAlert.findMany({
             where,
             orderBy: [
                 { isActive: 'desc' },
@@ -153,18 +148,10 @@ class RateAlertService {
             ],
             take: 50,
         });
-
-        return alerts;
     }
 
-    /**
-     * Delete (deactivate) an alert.
-     */
     async deleteAlert(userId, alertId) {
-        const alert = await this.prisma.rateAlert.findUnique({
-            where: { id: alertId },
-        });
-
+        const alert = await this.prisma.rateAlert.findUnique({ where: { id: alertId } });
         if (!alert) throw new Error('Alert not found');
         if (alert.userId !== userId) throw new Error('Not authorized');
 
@@ -178,3 +165,4 @@ class RateAlertService {
 }
 
 module.exports = RateAlertService;
+module.exports.CANONICAL_RATE_PAIR = CANONICAL_RATE_PAIR;
