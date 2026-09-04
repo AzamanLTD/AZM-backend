@@ -10,6 +10,7 @@
 
 const logger = require('../src/config/logger');
 const { migrateLayout, generateEmptyLayout } = require('./storefrontSchemaMigration');
+const { validateStudioDocument } = require('./storefrontStudioValidation');
 
 function hasOwnExperience(layoutJson) {
   return Boolean(
@@ -25,6 +26,20 @@ function hasOwnExperience(layoutJson) {
  * An explicit `experience` on the target always wins, including null, because
  * that is an intentional snapshot rather than an absent legacy field.
  */
+function validateStudioExperience(layoutJson) {
+  const experience = layoutJson?.experience;
+  if (experience?.schemaVersion !== 2) return;
+  try {
+    validateStudioDocument(experience);
+  } catch (error) {
+    const err = new Error('Storefront Studio document validation failed.');
+    err.code = error.code || 'STOREFRONT_DOCUMENT_INVALID';
+    err.validationCode = err.code;
+    err.statusCode = 422;
+    throw err;
+  }
+}
+
 function preserveExperienceSnapshot(nextLayout, currentDraftLayout) {
   if (
     !hasOwnExperience(nextLayout) &&
@@ -207,6 +222,7 @@ async function saveDraft(prisma, businessProfileId, layoutJson, themeId, expecte
   }
 
   const migratedLayout = migrateLayout(layoutJson);
+  validateStudioExperience(migratedLayout);
 
   const draft = await prisma.businessStorefrontLayout.upsert({
     where: { businessProfileId_status: { businessProfileId, status: 'DRAFT' } },
@@ -248,6 +264,8 @@ async function publishLayout(prisma, businessProfileId, userId) {
   if (business?.storefrontDisabled) {
     throw new Error('Storefront is disabled by admin. Contact support.');
   }
+
+  validateStudioExperience(draft.layoutJson);
 
   // PHASE 8: Validate Nitro eligibility — reject if layout references
   // premium widgets/themes the owner hasn't staked for.
