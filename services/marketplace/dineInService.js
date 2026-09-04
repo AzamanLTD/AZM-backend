@@ -297,7 +297,15 @@ class DineInService {
     }
 
     async getBusinessTabs(businessProfileId, status) {
-        const where = { businessProfileId }; if (status) where.status = status;
+        const where = { businessProfileId };
+        if (status) {
+            where.status = status;
+        } else {
+            // "Open tabs" is an operations queue: OPEN tabs are still being
+            // served and FINALIZED tabs are awaiting customer payment. CLOSED
+            // and CANCELLED belong to history and must not remain in that queue.
+            where.status = { in: ['OPEN', 'FINALIZED'] };
+        }
         return this.prisma.dineInTab.findMany({ where, include: { items: true, customer: { select: { id: true, username: true, azamanId: true } }, invoice: true }, orderBy: { openedAt: 'desc' } });
     }
 
