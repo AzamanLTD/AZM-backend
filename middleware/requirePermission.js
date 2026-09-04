@@ -72,7 +72,7 @@ async function resolvePermissions(prisma, userId, businessProfileId) {
 
 /**
  * Express middleware factory: requirePermission(key)
- * Usage: router.post('/...', requirePermission('employees.create'), wrap(handler))
+ * Usage: router.post('/...', requirePermission('...'), wrap(...))
  */
 function requirePermission(key) {
     return async (req, res, next) => {
@@ -105,6 +105,10 @@ function requirePermission(key) {
                 }
             }
 
+            // Make the effective business explicit for downstream controllers.
+            // Controllers must never trust a caller-supplied businessProfileId.
+            req.businessProfileId = businessProfileId;
+
             // Resource-level tenant guard for the legacy tax-preset PATCH route.
             // The route updates by bare id, so verify the target belongs to the
             // effective business before allowing the handler to run.
@@ -134,7 +138,7 @@ function requirePermission(key) {
             );
 
             // Admin users (impersonating) get all permissions
-            if (req.businessProfileId && req.user.role === 'ADMIN') {
+            if (req.adminBusinessScope && req.user.role === 'ADMIN') {
                 return runAuthorized();
             }
 
