@@ -1,0 +1,171 @@
+name: Storefront Draft CAS Migration
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout feature branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref || github.ref_name }}
+          fetch-depth: 0
+
+      - name: Patch draft save with compare-and-swap
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('services/storefrontService.js')
+          s = p.read_text()
+          start = s.index('async function saveDraft(')
+          end = s.index('\n\n/**\n * Publish a draft layout', start)
+          new = '''async function saveDraft(prisma, businessProfileId, layoutJson, themeId, expectedUpdatedAt) {
+  const migratedLayout = migrateLayout(layoutJson);
+  validateStudioExperience(migratedLayout);
+
+  const staleDraftError = () => {
+    const err = new Error('Draft was modified by another editor. Please refresh.');
+    err.code = 'STALE_STOREFRONT_DRAFT';
+    err.statusCode = 409;
+    return err;
+  };
+
+  if (!expectedUpdatedAt) {
+    return prisma.businessStorefrontLayout.upsert({
+      where: { businessProfileId_status: { businessProfileId, status: 'DRAFT' } },
+      create: {
+        businessProfileId,
+        status: 'DRAFT',
+        themeId,
+        layoutJson: migratedLayout,
+      },
+      update: {
+        themeId,
+        layoutJson: migratedLayout,
+      },
+      include: { theme: true },
+    });
+  }
+
+  const expectedDate = new Date(expectedUpdatedAt);
+  if (Number.isNaN(expectedDate.getTime())) throw staleDraftError();
+
+  const existing = await prisma.businessStorefrontLayout.findUnique({
+    where: { businessProfileId_status: { businessProfileId, status: 'DRAFT' } },
+  });
+
+  if (!existing) {
+    try {
+      return await prisma.businessStorefrontLayout.create({
+        data: {
+          businessProfileId,
+          status: 'DRAFT',
+          themeId,
+          layoutJson: migratedLayout,
+        },
+        include: { theme: true },
+      });
+    } catch (error) {
+      if (error?.code === 'P2002') throw staleDraftError();
+      throw error;
+    }
+  }
+
+  const claim = await prisma.businessStorefrontLayout.updateMany({
+    where: {
+      id: existing.id,
+      businessProfileId,
+      status: 'DRAFT',
+      updatedAt: expectedDate,
+    },
+    data: {
+      themeId,
+      layoutJson: migratedLayout,
+    },
+  });
+
+  if (claim.count !== 1) throw staleDraftError();
+
+  return prisma.businessStorefrontLayout.findUnique({
+    where: { id: existing.id },
+    include: { theme: true },
+  });
+}'''
+          p.write_text(s[:start] + new + s[end:])
+          PY
+
+      - name: Add draft CAS regression tests
+        shell: bash
+        run: |
+          cat > __tests__/storefrontDraftCas.test.js <<'EOF'
+          jest.mock('../services/storefrontSchemaMigration', () => ({
+            migrateLayout: (layout) => layout,
+            generateEmptyLayout: () => ({}),
+          }));
+
+          jest.mock('../services/storefrontStudioValidation', () => ({
+            validateStudioDocument: () => {},
+          }));
+
+          const { saveDraft } = require('../services/storefrontService');
+          const layout = { experience: { schemaVersion: 2, pages: [{ id: 'home', root: [] }], nodes: {} } };
+
+          describe('Storefront draft compare-and-swap', () => {
+            test('claims a matching draft version and returns it', async () => {
+              const findUnique = jest.fn()
+                .mockResolvedValueOnce({ id: 'draft-1', businessProfileId: 'business-1', status: 'DRAFT', updatedAt: new Date('2026-09-04T18:00:00.000Z') })
+                .mockResolvedValueOnce({ id: 'draft-1', layoutJson: layout });
+              const updateMany = jest.fn().mockResolvedValue({ count: 1 });
+              const prisma = { businessStorefrontLayout: { findUnique, updateMany } };
+              const result = await saveDraft(prisma, 'business-1', layout, 'theme-1', '2026-09-04T18:00:00.000Z');
+              expect(result).toEqual({ id: 'draft-1', layoutJson: layout });
+              expect(updateMany).toHaveBeenCalledWith(expect.objectContaining({ where: expect.objectContaining({ id: 'draft-1', updatedAt: new Date('2026-09-04T18:00:00.000Z') }) }));
+            });
+
+            test('returns 409 conflict when another writer wins', async () => {
+              const prisma = { businessStorefrontLayout: {
+                findUnique: jest.fn().mockResolvedValue({ id: 'draft-1', businessProfileId: 'business-1', status: 'DRAFT', updatedAt: new Date('2026-09-04T18:00:00.000Z') }),
+                updateMany: jest.fn().mockResolvedValue({ count: 0 }),
+              } };
+              await expect(saveDraft(prisma, 'business-1', layout, 'theme-1', '2026-09-04T18:00:00.000Z'))
+                .rejects.toMatchObject({ code: 'STALE_STOREFRONT_DRAFT', statusCode: 409 });
+            });
+
+            test('invalid version fails closed', async () => {
+              const prisma = { businessStorefrontLayout: { findUnique: jest.fn() } };
+              await expect(saveDraft(prisma, 'business-1', layout, 'theme-1', 'bad-version'))
+                .rejects.toMatchObject({ code: 'STALE_STOREFRONT_DRAFT', statusCode: 409 });
+              expect(prisma.businessStorefrontLayout.findUnique).not.toHaveBeenCalled();
+            });
+
+            test('first writer races are converted to a stale conflict', async () => {
+              const prisma = { businessStorefrontLayout: {
+                findUnique: jest.fn().mockResolvedValue(null),
+                create: jest.fn().mockRejectedValue({ code: 'P2002' }),
+              } };
+              await expect(saveDraft(prisma, 'business-1', layout, 'theme-1', '2026-09-04T18:00:00.000Z'))
+                .rejects.toMatchObject({ code: 'STALE_STOREFRONT_DRAFT', statusCode: 409 });
+            });
+          });
+          EOF
+
+      - name: Verify targeted tests
+        run: npm test -- --runInBand __tests__/storefrontDraftCas.test.js
+
+      - name: Commit patch and remove workflow
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add services/storefrontService.js __tests__/storefrontDraftCas.test.js
+          git rm .github/workflows/draft-cas-migration.yml
+          git commit -m "fix(storefront): enforce draft optimistic concurrency"
+          git push origin HEAD:${{ github.head_ref || github.ref_name }}
