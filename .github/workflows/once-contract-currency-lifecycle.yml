@@ -1,0 +1,55 @@
+name: One-shot API contract correction
+
+on:
+  push:
+    branches: [docs/currency-and-fiat-lifecycle-contract]
+
+permissions:
+  contents: write
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+      - name: Update stale currency and fiat lifecycle language
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          path = Path('api_contract.md')
+          text = path.read_text()
+          replacements = [
+              (
+                  'Internal balances are USDC. GHS values displayed to users\n  are computed as `availableBalance × GlobalSettings.liveUsdToGhs` ("the\n  Hologram"). The backend never persists GHS as a balance.',
+                  'Internal balances are USDC. GHS values displayed to users\n  are computed from the canonical `USDC/GHS` retail oracle snapshot, using\n  `availableBalance × GlobalSettings.liveRetailRate` ("the Hologram"). The\n  backend never persists GHS as a balance. Legacy `liveUsdToGhs` values are\n  compatibility metadata and are not the canonical user-facing rate.',
+              ),
+              (
+                  'Returns the live oracle rates: `{ liveUsdToGhs, bankMargin, thirdPartyMargin }`.',
+                  'Returns the live oracle snapshot, including the canonical `USDC/GHS`\nretail rate (`liveRetailRate`), settlement/display currency metadata, source,\nand freshness information. `liveUsdToGhs` is legacy compatibility metadata.',
+              ),
+              (
+                  'Writes `TransactionHistory(WITHDRAWAL_FIAT, COMPLETED, txHash =\n  X-Reference-Id)`.',
+                  'Creates the fiat withdrawal transaction in `PENDING` while the external\n  provider is settling. Provider `SUCCESS` atomically transitions it to\n  `COMPLETED`; provider `FAILED` reverses only an still-PENDING reservation.',
+              ),
+              (
+                  '"transaction":        { "id": ..., "status": "COMPLETED", "txHash": "<uuid-v4>" },',
+                  '"transaction":        { "id": ..., "status": "PENDING", "txHash": "<uuid-v4>" },',
+              ),
+          ]
+          for old, new in replacements:
+              if old not in text:
+                  raise SystemExit(f'Expected contract text not found: {old[:80]!r}')
+              text = text.replace(old, new, 1)
+          path.write_text(text)
+          PY
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add api_contract.md
+          git commit -m "docs: align currency and fiat lifecycle contract"
+          git push origin HEAD
+          git rm -f .github/workflows/once-contract-currency-lifecycle.yml
+          git commit -m "ci: remove one-shot contract workflow"
+          git push origin HEAD
