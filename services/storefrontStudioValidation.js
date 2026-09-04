@@ -130,7 +130,7 @@ function validateStudioDocument(document) {
         walkSafeObject(node.style, `nodes.${nodeId}.style`);
         walkSafeObject(node.layout, `nodes.${nodeId}.layout`);
         walkSafeObject(node.responsive, `nodes.${nodeId}.responsive`);
-        if (node.children.includes(nodeId)) throw validationError('STOREFRONT_TREE_CYCLE', `Node ${nodeId} cannot contain itself.`);
+        if (node.children.includes(nodeId)) throw validationError('STOREFRONT_TREE_CYCLE', `Studio tree contains a cycle: node ${nodeId} cannot contain itself.`);
     }
 
     for (const id of referenced) {
