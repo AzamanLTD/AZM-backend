@@ -134,6 +134,7 @@ exports.getPublicMenu = async (req, res) => {
     const prisma = req.app.get('prisma');
     try {
         const { bizId } = req.params;
+        const requestedLocationId = req.query?.locationId ? String(req.query.locationId).trim() : null;
         const profile = await prisma.businessProfile.findUnique({
             where:  { bizId },
             select: { id: true, isSuspended: true },
@@ -141,12 +142,26 @@ exports.getPublicMenu = async (req, res) => {
         if (!profile || profile.isSuspended)
             return res.status(404).json({ success: false, message: 'Business not found.' });
 
+        if (requestedLocationId) {
+            const location = await prisma.businessLocation.findFirst({
+                where: { id: requestedLocationId, businessProfileId: profile.id, isActive: true },
+                select: { id: true, label: true },
+            });
+            if (!location) {
+                return res.status(404).json({ success: false, message: 'Business location not found.' });
+            }
+        }
+
+        const locationFilter = requestedLocationId
+            ? { OR: [{ locationId: null }, { locationId: requestedLocationId }] }
+            : {};
+
         const sections = await prisma.catalogSection.findMany({
-            where:   { businessProfileId: profile.id, isActive: true },
+            where:   { businessProfileId: profile.id, isActive: true, ...locationFilter },
             orderBy: { displayOrder: 'asc' },
             include: {
                 products: {
-                    where:   { isActive: true, isAvailable: true },
+                    where: { isActive: true, isAvailable: true, ...locationFilter },
                     // BusinessProduct has no displayOrder — sort by popularity
                     orderBy: { totalOrders: 'desc' },
                 },
@@ -155,11 +170,16 @@ exports.getPublicMenu = async (req, res) => {
 
         // Products not assigned to any section
         const uncategorised = await prisma.businessProduct.findMany({
-            where:   { businessProfileId: profile.id, isActive: true, isAvailable: true, catalogSectionId: null },
+            where:   { businessProfileId: profile.id, isActive: true, isAvailable: true, catalogSectionId: null, ...locationFilter },
             orderBy: { totalOrders: 'desc' },
         });
 
-        return res.status(200).json({ success: true, sections, uncategorised });
+        return res.status(200).json({
+            success: true,
+            locationId: requestedLocationId,
+            sections,
+            uncategorised,
+        });
     } catch (err) {
         logger.error({ err: err }, '[getPublicMenu]');
         return res.status(500).json({ success: false, message: err.message });
