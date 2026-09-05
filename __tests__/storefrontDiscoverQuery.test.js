@@ -1,12 +1,13 @@
 const { buildDiscoverWhere } = require('../routes/storefrontDiscoverRoutes');
 
 describe('buildDiscoverWhere', () => {
-  test('filters published storefronts by direct business category', () => {
+  test('filters published storefronts by direct business category and availability', () => {
     expect(buildDiscoverWhere({ category: 'RESTAURANT' })).toEqual({
       status: 'PUBLISHED',
       businessProfile: {
         isSuspended: false,
         isPausedByOwner: false,
+        storefrontDisabled: false,
         category: 'RESTAURANT',
       },
     });
@@ -18,6 +19,7 @@ describe('buildDiscoverWhere', () => {
       businessProfile: {
         isSuspended: false,
         isPausedByOwner: false,
+        storefrontDisabled: false,
         category: 'RETAIL',
         businessName: {
           contains: 'Acme',
