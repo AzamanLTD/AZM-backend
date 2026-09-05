@@ -26,8 +26,12 @@ describe('PosOrderService atomic settlement', () => {
         };
     }
 
-    test('re-derives catalog prices from the transaction client and commits balance, line items, order and ledger together', async () => {
-        const tx = baseTx();
+    test('uses the transaction business tax authority while re-deriving catalog prices and committing atomically', async () => {
+        const tx = baseTx({
+            businessTaxPreset: {
+                findFirst: jest.fn().mockResolvedValue({ name: 'POS Tax', type: 'PERCENTAGE', value: 2.5 }),
+            },
+        });
         const prisma = {
             businessProduct: { findFirst: jest.fn(() => { throw new Error('catalog must be read through transaction client'); }) },
             businessOrder: { findFirst: jest.fn().mockResolvedValue(null) },
@@ -39,6 +43,11 @@ describe('PosOrderService atomic settlement', () => {
         });
 
         expect(result.computedGrand).toBe(41);
+        expect(tx.businessTaxPreset.findFirst).toHaveBeenCalledWith({
+            where: { businessProfileId: 'biz-1', isDefault: true },
+            orderBy: { createdAt: 'asc' },
+            select: { name: true, type: true, value: true },
+        });
         expect(tx.businessProduct.findFirst).toHaveBeenCalledWith(expect.objectContaining({
             where: { id: 'prod-1', businessProfileId: 'biz-1', isActive: true, isAvailable: true, locationId: null },
         }));
@@ -53,7 +62,16 @@ describe('PosOrderService atomic settlement', () => {
             data: [{ orderId: 'order-1', productId: 'prod-1', name: 'Meal', unitPrice: 20, quantity: 2, lineTotal: 40 }],
         });
         expect(tx.businessOrder.create).toHaveBeenCalled();
-        expect(tx.businessLedgerEntry.create).toHaveBeenCalled();
+        expect(tx.businessLedgerEntry.create).toHaveBeenCalledWith(expect.objectContaining({
+            data: expect.objectContaining({
+                amount: 41,
+                metadata: expect.objectContaining({
+                    subtotal: 40,
+                    tax: 1,
+                    taxLines: [{ name: 'POS Tax', type: 'PERCENTAGE', value: 2.5, computedAmount: 1 }],
+                }),
+            }),
+        }));
     });
 
     test('uses transaction-time catalog state for availability and pricing', async () => {
@@ -73,8 +91,11 @@ describe('PosOrderService atomic settlement', () => {
         expect(tx.businessOrder.create).not.toHaveBeenCalled();
     });
 
-    test('computes the legacy 2.5% POS tax and cash change server-side', async () => {
+    test('uses the business default tax authority and computes cash change server-side', async () => {
         const tx = baseTx({
+            businessTaxPreset: {
+                findFirst: jest.fn().mockResolvedValue({ name: 'POS Tax', type: 'PERCENTAGE', value: 2.5 }),
+            },
             businessOrder: { findFirst: jest.fn().mockResolvedValue(null), create: jest.fn().mockResolvedValue({ id: 'order-cash', amountUsdc: 20.5, cashChange: 4.5 }) },
         });
         const prisma = {
@@ -91,6 +112,11 @@ describe('PosOrderService atomic settlement', () => {
         expect(result.computedTax).toBe(0.5);
         expect(result.computedGrand).toBe(20.5);
         expect(result.change).toBe(4.5);
+        expect(tx.businessTaxPreset.findFirst).toHaveBeenCalledWith({
+            where: { businessProfileId: 'biz-1', isDefault: true },
+            orderBy: { createdAt: 'asc' },
+            select: { name: true, type: true, value: true },
+        });
         expect(tx.businessOrder.create).toHaveBeenCalledWith(expect.objectContaining({
             data: expect.objectContaining({ paymentMethod: 'CASH', cashReceived: 25, cashChange: 4.5 }),
         }));

@@ -19,6 +19,23 @@ function fingerprint(intent) {
     return crypto.createHash('sha256').update(JSON.stringify(canonical)).digest('hex');
 }
 
+const baseTx = () => ({
+    businessOrder: {
+        findFirst: jest.fn().mockResolvedValue(null),
+        create: jest.fn(),
+    },
+    businessLedgerEntry: { findFirst: jest.fn().mockResolvedValue(null), create: jest.fn().mockResolvedValue({ id: 'ledger-1' }) },
+    businessTaxPreset: { findFirst: jest.fn().mockResolvedValue(null) },
+    businessProduct: { findFirst: jest.fn().mockResolvedValue({ id: 'prod-1', name: 'Meal', priceUsdc: 20, stockQty: null }), updateMany: jest.fn() },
+    businessOrderItem: { createMany: jest.fn().mockResolvedValue({ count: 1 }) },
+    recipeIngredient: { findMany: jest.fn().mockResolvedValue([]) },
+    inventoryItem: { updateMany: jest.fn() },
+    user: { updateMany: jest.fn().mockResolvedValue({ count: 1 }), findUnique: jest.fn().mockResolvedValue({ id: 7, azmBalance: 10 }) },
+    azmSpendLog: { create: jest.fn() },
+    businessLocation: { findFirst: jest.fn() },
+    businessTable: { findFirst: jest.fn() },
+});
+
 describe('PosOrderService idempotency intent binding', () => {
     test('rejects reuse of a POS key for a different request intent', async () => {
         const existing = { id: 'order-1', businessProfileId: 'biz-1', amountUsdc: 20.5, cashChange: 4.5 };
@@ -60,20 +77,10 @@ describe('PosOrderService idempotency intent binding', () => {
         expect(prisma.$transaction).not.toHaveBeenCalled();
     });
 
-    test('persists the request fingerprint in the atomic POS ledger entry', async () => {
-        const tx = {
-            businessOrder: {
-                findFirst: jest.fn().mockResolvedValue(null),
-                create: jest.fn().mockResolvedValue({ id: 'order-1', businessProfileId: 'biz-1', amountUsdc: 20.5, cashChange: 4.5 }),
-            },
-            businessLedgerEntry: { findFirst: jest.fn().mockResolvedValue(null), create: jest.fn().mockResolvedValue({ id: 'ledger-1' }) },
-            businessProduct: { findFirst: jest.fn().mockResolvedValue({ id: 'prod-1', name: 'Meal', priceUsdc: 20, stockQty: null }), updateMany: jest.fn() },
-            businessOrderItem: { createMany: jest.fn().mockResolvedValue({ count: 1 }) },
-            recipeIngredient: { findMany: jest.fn().mockResolvedValue([]) },
-            inventoryItem: { updateMany: jest.fn() },
-            user: { updateMany: jest.fn().mockResolvedValue({ count: 1 }), findUnique: jest.fn().mockResolvedValue({ id: 7, azmBalance: 10 }) },
-            azmSpendLog: { create: jest.fn() },
-        };
+    test('persists the request fingerprint and authoritative tax in the atomic POS ledger entry', async () => {
+        const tx = baseTx();
+        tx.businessOrder.create.mockResolvedValue({ id: 'order-1', businessProfileId: 'biz-1', amountUsdc: 20.5, cashChange: 4.5 });
+        tx.businessTaxPreset.findFirst.mockResolvedValue({ name: 'VAT', type: 'PERCENTAGE', value: 2.5 });
         const prisma = {
             businessOrder: { findFirst: jest.fn().mockResolvedValue(null) },
             businessLedgerEntry: { findFirst: jest.fn().mockResolvedValue(null) },
@@ -89,8 +96,46 @@ describe('PosOrderService idempotency intent binding', () => {
 
         expect(tx.businessLedgerEntry.create).toHaveBeenCalledWith(expect.objectContaining({
             data: expect.objectContaining({
-                metadata: expect.objectContaining({ posIdempotencyFingerprint: fingerprint(intent) }),
+                amount: 20.5,
+                metadata: expect.objectContaining({
+                    tax: 0.5,
+                    taxLines: [{ name: 'VAT', type: 'PERCENTAGE', value: 2.5, computedAmount: 0.5 }],
+                    posIdempotencyFingerprint: fingerprint(intent),
+                }),
             }),
         }));
+    });
+
+    test('uses flat business tax preset instead of a hard-coded percentage', async () => {
+        const tx = baseTx();
+        tx.businessOrder.create.mockResolvedValue({ id: 'order-2', businessProfileId: 'biz-1', amountUsdc: 25, cashChange: 0 });
+        tx.businessTaxPreset.findFirst.mockResolvedValue({ name: 'Service', type: 'FLAT', value: 5 });
+        tx.businessProduct.findFirst.mockResolvedValue({ id: 'prod-2', name: 'Meal', priceUsdc: 20, stockQty: null });
+        const prisma = { businessOrder: { findFirst: jest.fn().mockResolvedValue(null) }, $transaction: jest.fn(async (fn) => fn(tx)) };
+
+        const result = await new PosOrderService(prisma).createOrder({
+            businessProfileId: 'biz-1', actorId: 7,
+            items: [{ productId: 'prod-2', quantity: 1 }],
+            paymentMethod: 'CASH', cashGiven: 25,
+        });
+
+        expect(result.computedTax).toBe(5);
+        expect(result.computedGrand).toBe(25);
+        expect(tx.businessTaxPreset.findFirst).toHaveBeenCalledWith(expect.objectContaining({
+            where: { businessProfileId: 'biz-1', isDefault: true },
+        }));
+    });
+
+    test('rejects an unsupported business tax preset type instead of silently charging a percentage', async () => {
+        const tx = baseTx();
+        tx.businessTaxPreset.findFirst.mockResolvedValue({ name: 'Unknown', type: 'WEIRD', value: 10 });
+        const prisma = { businessOrder: { findFirst: jest.fn().mockResolvedValue(null) }, $transaction: jest.fn(async (fn) => fn(tx)) };
+
+        await expect(new PosOrderService(prisma).createOrder({
+            businessProfileId: 'biz-1', actorId: 7,
+            items: [{ productId: 'prod-3', quantity: 1 }],
+            paymentMethod: 'CASH', cashGiven: 25,
+        })).rejects.toThrow("Unsupported tax line type for 'Unknown'");
+        expect(tx.businessOrder.create).not.toHaveBeenCalled();
     });
 });
