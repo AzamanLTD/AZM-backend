@@ -1,0 +1,101 @@
+name: One-shot Storefront Publish Safe Migration
+
+on:
+  push:
+    branches: [fix/storefront-publish-safe-cas]
+
+permissions:
+  contents: write
+
+jobs:
+  migrate:
+    if: ${{ !contains(github.event.head_commit.message, 'feat(storefront): add transactional publish CAS boundary') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout feature branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+
+      - name: Apply migration
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          route = Path('routes/storefrontRoutes.js')
+          text = route.read_text()
+          marker = "// GET /api/storefront/me/history — get version history"
+          block = r'''// POST /api/storefront/me/publish-safe — transactional compare-and-swap publish
+          router.post('/me/publish-safe', protect, protectActive, requirePermission('storefront.manage'), wrap(async (req, res) => {
+            const prisma = req.app.get('prisma');
+            const businessProfileId = req.businessProfileId || req.user.businessProfileId;
+            if (!businessProfileId) return res.status(400).json({ success: false, message: 'No business profile found.' });
+
+            const expectedUpdatedAt = req.body?.expectedUpdatedAt;
+            if (expectedUpdatedAt !== undefined && expectedUpdatedAt !== null && typeof expectedUpdatedAt !== 'string') {
+              return res.status(400).json({ success: false, message: 'expectedUpdatedAt must be an ISO timestamp string.' });
+            }
+
+            try {
+              const published = await storefrontPublishSafeService.publishLayoutSafe(
+                prisma,
+                businessProfileId,
+                req.user.id,
+                expectedUpdatedAt || null,
+              );
+              await renderService.invalidateCache(businessProfileId);
+              await prisma.storefrontAnalyticsEvent.create({
+                data: {
+                  businessProfileId,
+                  eventType: 'layout_published',
+                  metadata: { themeId: published.themeId, tileCount: published.layoutJson?.tiles?.length || 0, tier: published.tier || 'FREE' },
+                },
+              }).catch(() => {});
+
+              return res.json({ success: true, data: published, message: 'Storefront published successfully.' });
+            } catch (err) {
+              if (err.statusCode === 402) {
+                return res.status(402).json({
+                  success: false,
+                  message: err.message,
+                  violations: err.violations,
+                  tier: err.tier,
+                  stakedBalance: err.stakedBalance,
+                });
+              }
+              if (err.statusCode === 409) {
+                return res.status(409).json({ success: false, message: err.message, code: err.code });
+              }
+              throw err;
+            }
+          }));
+
+          '''
+          if marker not in text:
+              raise SystemExit('route marker not found')
+          if "router.post('/me/publish-safe'" in text:
+              raise SystemExit('publish-safe route already present')
+          text = text.replace(marker, block + marker, 1)
+          text = text.replace("const storefrontService = require('../services/storefrontService');", "const storefrontService = require('../services/storefrontService');\nconst storefrontPublishSafeService = require('../services/storefrontPublishSafeService');", 1)
+          route.write_text(text)
+
+          service = Path('services/storefrontPublishSafeService.js')
+          service.write_text("""'use strict';\n\nconst storefrontService = require('./storefrontService');\n\nconst DRAFT_TABLE = 'BusinessStorefrontLayout';\n\nfunction makeError(message, code, statusCode) {\n  const error = new Error(message);\n  error.code = code;\n  error.statusCode = statusCode;\n  return error;\n}\n\n/**\n * Publish a storefront draft behind a database row lock. The lock turns the\n * existing multi-write publish flow into a transactionally serialized\n * compare-and-swap boundary without changing the legacy /me/publish handler.\n */\nasync function publishLayoutSafe(prisma, businessProfileId, userId, expectedUpdatedAt = null) {\n  let expected = null;\n  if (expectedUpdatedAt) {\n    expected = new Date(expectedUpdatedAt);\n    if (Number.isNaN(expected.getTime())) {\n      throw makeError('expectedUpdatedAt must be a valid ISO timestamp.', 'INVALID_EXPECTED_UPDATED_AT', 400);\n    }\n  }\n\n  return prisma.$transaction(async (tx) => {\n    const rows = expected\n      ? await tx.$queryRaw`SELECT \"id\" FROM \"${DRAFT_TABLE}\" WHERE \"businessProfileId\" = ${businessProfileId} AND \"status\" = 'DRAFT' AND \"updatedAt\" = ${expected} FOR UPDATE`\n      : await tx.$queryRaw`SELECT \"id\" FROM \"${DRAFT_TABLE}\" WHERE \"businessProfileId\" = ${businessProfileId} AND \"status\" = 'DRAFT' FOR UPDATE`;\n\n    if (rows.length !== 1) {\n      if (expected) {\n        throw makeError(\n          'Draft was modified by another editor or is no longer available. Refresh before publishing.',\n          'STOREFRONT_DRAFT_STALE',\n          409,\n        );\n      }\n      throw makeError('No draft layout to publish.', 'STOREFRONT_DRAFT_NOT_FOUND', 400);\n    }\n\n    return storefrontService.publishLayout(tx, businessProfileId, userId);\n  });\n}\n\nmodule.exports = { publishLayoutSafe };\n""")
+
+          test = Path('__tests__/storefrontPublishSafeService.test.js')
+          test.write_text("""'use strict';\n\nconst { publishLayoutSafe } = require('../services/storefrontPublishSafeService');\nconst storefrontService = require('../services/storefrontService');\n\njest.mock('../services/storefrontService', () => ({\n  publishLayout: jest.fn().mockResolvedValue({ id: 'published-1', status: 'PUBLISHED' }),\n}));\n\ndescribe('storefrontPublishSafeService', () => {\n  function makePrisma(rows) {\n    const tx = {\n      $queryRaw: jest.fn().mockResolvedValue(rows),\n    };\n    return {\n      tx,\n      prisma: {\n        $transaction: jest.fn(async (callback) => callback(tx)),\n      },\n    };\n  }\n\n  afterEach(() => jest.clearAllMocks());\n\n  test('locks the draft and delegates publish inside one transaction', async () => {\n    const { prisma, tx } = makePrisma([{ id: 'draft-1' }]);\n    const result = await publishLayoutSafe(prisma, 'biz-1', 7, '2026-09-05T00:00:00.000Z');\n\n    expect(result).toEqual({ id: 'published-1', status: 'PUBLISHED' });\n    expect(prisma.$transaction).toHaveBeenCalledTimes(1);\n    expect(tx.$queryRaw).toHaveBeenCalledTimes(1);\n    expect(storefrontService.publishLayout).toHaveBeenCalledWith(tx, 'biz-1', 7);\n  });\n\n  test('rejects stale or missing versioned drafts with conflict', async () => {\n    const { prisma } = makePrisma([]);\n\n    await expect(\n      publishLayoutSafe(prisma, 'biz-1', 7, '2026-09-05T00:00:00.000Z'),\n    ).rejects.toMatchObject({\n      code: 'STOREFRONT_DRAFT_STALE',\n      statusCode: 409,\n    });\n    expect(storefrontService.publishLayout).not.toHaveBeenCalled();\n  });\n\n  test('rejects malformed expectedUpdatedAt before opening a transaction', async () => {\n    const { prisma } = makePrisma([{ id: 'draft-1' }]);\n\n    await expect(\n      publishLayoutSafe(prisma, 'biz-1', 7, 'not-a-date'),\n    ).rejects.toMatchObject({\n      code: 'INVALID_EXPECTED_UPDATED_AT',\n      statusCode: 400,\n    });\n    expect(prisma.$transaction).not.toHaveBeenCalled();\n  });\n\n  test('supports an unversioned compatibility call while serializing publishes', async () => {\n    const { prisma, tx } = makePrisma([{ id: 'draft-1' }]);\n\n    await publishLayoutSafe(prisma, 'biz-1', 7);\n\n    expect(prisma.$transaction).toHaveBeenCalledTimes(1);\n    expect(tx.$queryRaw).toHaveBeenCalledTimes(1);\n    expect(storefrontService.publishLayout).toHaveBeenCalledWith(tx, 'biz-1', 7);\n  });\n});\n""")
+
+          route_test = Path('__tests__/storefrontPublishSafeRoute.contract.test.js')
+          route_test.write_text("""'use strict';\n\nconst fs = require('fs');\n\ndescribe('storefront publish-safe route contract', () => {\n  test('mounts the transactional publish-safe endpoint', () => {\n    const source = fs.readFileSync(require.resolve('../routes/storefrontRoutes'), 'utf8');\n    expect(source).toContain("require('../services/storefrontPublishSafeService')");\n    expect(source).toContain("router.post('/me/publish-safe'");\n    expect(source).toContain('publishLayoutSafe');\n    expect(source).toContain('status(409)');\n  });\n});\n""")
+          PY
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add routes/storefrontRoutes.js services/storefrontPublishSafeService.js __tests__/storefrontPublishSafeService.test.js __tests__/storefrontPublishSafeRoute.contract.test.js .github/workflows/one-shot-storefront-publish-safe.yml
+          git commit -m "feat(storefront): add transactional publish CAS boundary"
+          git rm .github/workflows/one-shot-storefront-publish-safe.yml
+          git commit -m "chore: remove one-shot storefront migration"
+          git push origin HEAD:${GITHUB_REF_NAME}
