@@ -35,37 +35,46 @@ function getCacheKey(businessProfileId) {
   return `storefront:render:${businessProfileId}`;
 }
 
-async function getCached(key) {
-  if (isRedisReady(redisClient)) {
-    try {
-      const cached = await redisClient.get(key);
-      if (cached) return JSON.parse(cached);
-    } catch (e) { /* fall through */ }
-    return null;
-  }
+function getMemoryCached(key) {
   const memItem = memoryCache.get(key);
-  if (memItem && memItem.expiresAt > Date.now()) {
-    return memItem.value;
-  }
+  if (memItem && memItem.expiresAt > Date.now()) return memItem.value;
   memoryCache.delete(key);
   return null;
 }
 
-async function setCached(key, value, ttl) {
-  if (isRedisReady(redisClient)) {
-    try {
-      await redisClient.setex(key, ttl, JSON.stringify(value));
-    } catch (e) { /* fall through */ }
-    return;
-  }
+function setMemoryCached(key, value, ttl) {
   memoryCache.set(key, { value, expiresAt: Date.now() + ttl * 1000 });
-  // Clean up expired entries periodically
   if (memoryCache.size > 100) {
     const now = Date.now();
     for (const [k, v] of memoryCache) {
       if (v.expiresAt <= now) memoryCache.delete(k);
     }
   }
+}
+
+async function getCached(key) {
+  if (isRedisReady(redisClient)) {
+    try {
+      const cached = await redisClient.get(key);
+      if (cached) return JSON.parse(cached);
+      return null;
+    } catch (e) {
+      logger.warn('[StorefrontRender] Redis cache read failed, using in-memory fallback:', e.message);
+    }
+  }
+  return getMemoryCached(key);
+}
+
+async function setCached(key, value, ttl) {
+  if (isRedisReady(redisClient)) {
+    try {
+      await redisClient.setex(key, ttl, JSON.stringify(value));
+      return;
+    } catch (e) {
+      logger.warn('[StorefrontRender] Redis cache write failed, using in-memory fallback:', e.message);
+    }
+  }
+  setMemoryCached(key, value, ttl);
 }
 
 async function invalidateCache(businessProfileId) {
@@ -257,4 +266,8 @@ module.exports = {
   invalidateCache,
   _escrowProtectionAvailable,
   isRedisReady,
+  // Internal cache helpers are exported for deterministic failure-path tests.
+  _getCached: getCached,
+  _setCached: setCached,
+  _memoryCache: memoryCache,
 };
