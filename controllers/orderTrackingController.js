@@ -157,6 +157,8 @@ exports.updateEta = wrap(async function updateEta(req, res) {
         return res.status(403).json({ success: false, message: 'Not authorized' });
     }
 
+    await ensureTracking(prisma, orderId, order.businessProfileId);
+
     const tracking = await prisma.orderTracking.update({
         where: { orderId },
         data: { estimatedArrival: new Date(estimatedArrival) },
@@ -208,8 +210,6 @@ exports.updateStatus = wrap(async function updateStatus(req, res) {
         orderId,
         order.businessProfileId,
         async (tx, tracking) => {
-            // Generate the event timestamp only after acquiring the order lock;
-            // the persisted timeline order therefore matches timestamp order.
             eventTimestamp = new Date().toISOString();
             const timeline = Array.isArray(tracking.timeline) ? [...tracking.timeline] : [];
             timeline.push({ status, note: note || '', timestamp: eventTimestamp });
