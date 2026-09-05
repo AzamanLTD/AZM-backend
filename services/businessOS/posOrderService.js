@@ -135,7 +135,12 @@ class PosOrderService {
     }
 
     async _computeTax(tx, businessProfileId, subtotal) {
-        const defaultPreset = await tx.businessTaxPreset.findFirst({
+        // Real Prisma transactions always expose BusinessTaxPreset. Keep unit
+        // and compatibility adapters that predate the model usable by treating
+        // an absent model delegate as "no configured tax" rather than crashing.
+        const taxPreset = tx.businessTaxPreset;
+        if (!taxPreset?.findFirst) return computeTaxLines([], subtotal);
+        const defaultPreset = await taxPreset.findFirst({
             where: { businessProfileId, isDefault: true },
             orderBy: { createdAt: 'asc' },
             select: { name: true, type: true, value: true },
