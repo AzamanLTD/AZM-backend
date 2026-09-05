@@ -6,18 +6,41 @@
 // order against a database whose idempotency/inventory guarantees are unknown.
 const router = require('express').Router();
 
-router.use('/:businessProfileId/checkout', (req, res, next) => {
-  if (process.env.NODE_ENV !== 'production') return next();
+router.use('/:businessProfileId/checkout', async (req, res, next) => {
+  try {
+    if (process.env.NODE_ENV === 'production' && req.app.get('retailCheckoutIntegrityReady') !== true) {
+      return res.status(503).json({
+        success: false,
+        message: 'Checkout is temporarily initializing. Please retry shortly.',
+        retryable: true,
+      });
+    }
 
-  if (req.app.get('retailCheckoutIntegrityReady') !== true) {
-    return res.status(503).json({
-      success: false,
-      message: 'Checkout is temporarily initializing. Please retry shortly.',
-      retryable: true,
+    // Administrative storefront disablement is a delivery-boundary decision,
+    // not merely a rendering hint. Reject checkout before the legacy order
+    // creator can accept a request against a storefront that public render and
+    // discovery intentionally treat as unavailable.
+    const prisma = req.app.get('prisma');
+    if (!prisma?.businessProfile?.findUnique) {
+      return next();
+    }
+
+    const business = await prisma.businessProfile.findUnique({
+      where: { id: req.params.businessProfileId },
+      select: { storefrontDisabled: true },
     });
-  }
 
-  return next();
+    if (business?.storefrontDisabled) {
+      return res.status(404).json({
+        success: false,
+        message: 'Storefront not available.',
+      });
+    }
+
+    return next();
+  } catch (err) {
+    return next(err);
+  }
 });
 
 module.exports = router;
