@@ -37,6 +37,14 @@ const assertOrderParticipant = async (prisma, orderId, userId) => {
     return { order, authorized: Boolean(biz && biz.ownerId === userId) };
 };
 
+const ensureTracking = async (prisma, orderId, businessProfileId) => {
+    return prisma.orderTracking.upsert({
+        where: { orderId },
+        create: { orderId, businessProfileId },
+        update: {},
+    });
+};
+
 // GET /api/orders/:orderId/tracking — get tracking info for an order
 exports.getTracking = wrap(async function getTracking(req, res) {
     const prisma = req.app.get('prisma');
@@ -53,9 +61,7 @@ exports.getTracking = wrap(async function getTracking(req, res) {
 
     if (!tracking) {
         if (order.status === 'PAID' || order.status === 'DELIVERED') {
-            tracking = await prisma.orderTracking.create({
-                data: { orderId, businessProfileId: order.businessProfileId }
-            });
+            tracking = await ensureTracking(prisma, orderId, order.businessProfileId);
         } else {
             return res.json({ success: true, tracking: null, message: 'Tracking not available yet' });
         }
@@ -96,15 +102,10 @@ exports.updateLocation = wrap(async function updateLocation(req, res) {
         return res.status(403).json({ success: false, message: 'Only the business can update location' });
     }
 
-    let tracking = await prisma.orderTracking.findUnique({ where: { orderId } });
-    if (!tracking) {
-        tracking = await prisma.orderTracking.create({
-            data: { orderId, businessProfileId: order.businessProfileId }
-        });
-    }
+    await ensureTracking(prisma, orderId, order.businessProfileId);
 
     const eventTimestamp = new Date().toISOString();
-    tracking = await prisma.orderTracking.update({
+    const tracking = await prisma.orderTracking.update({
         where: { orderId },
         data: {
             courierLatitude: latitude,
@@ -198,15 +199,9 @@ exports.updateStatus = wrap(async function updateStatus(req, res) {
         return res.status(400).json({ success: false, message: 'invalid deliveryLng' });
     }
 
-    let tracking = await prisma.orderTracking.findUnique({ where: { orderId } });
-    if (!tracking) {
-        tracking = await prisma.orderTracking.create({
-            data: { orderId, businessProfileId: order.businessProfileId }
-        });
-    }
-
+    const tracking = await ensureTracking(prisma, orderId, order.businessProfileId);
     const eventTimestamp = new Date().toISOString();
-    const timeline = tracking.timeline || [];
+    const timeline = Array.isArray(tracking.timeline) ? [...tracking.timeline] : [];
     timeline.push({ status, note: note || '', timestamp: eventTimestamp });
 
     const updateData = { timeline };
@@ -218,7 +213,7 @@ exports.updateStatus = wrap(async function updateStatus(req, res) {
     if (deliveryLng != null) updateData.deliveryLongitude = deliveryLng;
     if (status === 'DELIVERED') updateData.actualArrival = new Date(eventTimestamp);
 
-    tracking = await prisma.orderTracking.update({
+    const updatedTracking = await prisma.orderTracking.update({
         where: { orderId },
         data: updateData,
     });
@@ -237,11 +232,11 @@ exports.updateStatus = wrap(async function updateStatus(req, res) {
     if (io) {
         io.to(`order:${orderId}`).emit('order:status', {
             orderId, status, note: note || '', timestamp: eventTimestamp,
-            tracking,
+            tracking: updatedTracking,
         });
     }
 
-    res.json({ success: true, tracking });
+    res.json({ success: true, tracking: updatedTracking });
 });
 
 // GET /api/orders/:orderId/tracking/timeline — get status timeline only
