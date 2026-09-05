@@ -175,6 +175,30 @@ async function seedWidgets() {
       minRowSpan: 1, maxRowSpan: 1, minColSpan: 4, maxColSpan: 4,
       isActive: true, displayOrder: 7,
     },
+    {
+      widgetType: 'retail_collection_box',
+      displayName: 'Retail Collection',
+      description: 'Horizontal product collection with images, names, prices, and quick lookups',
+      tier: 'FREE',
+      minAzmStake: 0,
+      category: 'COMMERCE',
+      icon: 'ShoppingBag',
+      configSchema: {
+        type: 'object',
+        properties: {
+          collectionId: { type: 'string', title: 'Collection ID' },
+          title: { type: 'string', default: 'Collection' },
+          subtitle: { type: 'string', default: '' },
+          products: {
+            type: 'array',
+            items: { type: 'object' },
+          },
+        },
+      },
+      defaultProps: { collectionId: null, title: 'Collection', subtitle: '', products: [] },
+      minRowSpan: 2, maxRowSpan: 6, minColSpan: 4, maxColSpan: 4,
+      isActive: true, displayOrder: 8,
+    },
 
     // ── NITRO BRONZE widgets ──
     {
@@ -197,7 +221,7 @@ async function seedWidgets() {
       },
       defaultProps: { videoUrl: null, posterUrl: null, autoplay: false, loop: true, muted: true },
       minRowSpan: 2, maxRowSpan: 4, minColSpan: 4, maxColSpan: 4,
-      isActive: true, displayOrder: 8,
+      isActive: true, displayOrder: 9,
     },
     {
       widgetType: 'promo_banner',
@@ -219,7 +243,7 @@ async function seedWidgets() {
       },
       defaultProps: { title: '', subtitle: '', ctaText: 'Shop Now', ctaAction: '', backgroundColor: null },
       minRowSpan: 1, maxRowSpan: 2, minColSpan: 4, maxColSpan: 4,
-      isActive: true, displayOrder: 9,
+      isActive: true, displayOrder: 10,
     },
     {
       widgetType: 'social_feed',
@@ -239,7 +263,7 @@ async function seedWidgets() {
       },
       defaultProps: { platform: 'instagram', handle: '', maxPosts: 6 },
       minRowSpan: 2, maxRowSpan: 4, minColSpan: 4, maxColSpan: 4,
-      isActive: true, displayOrder: 10,
+      isActive: true, displayOrder: 11,
     },
 
     // ── NITRO SILVER widgets ──
@@ -262,7 +286,7 @@ async function seedWidgets() {
       },
       defaultProps: { showFollowers: true, showReviews: true, showOrders: true, showRating: true },
       minRowSpan: 1, maxRowSpan: 2, minColSpan: 4, maxColSpan: 4,
-      isActive: true, displayOrder: 11,
+      isActive: true, displayOrder: 12,
     },
     {
       widgetType: 'animated_counter',
@@ -283,7 +307,7 @@ async function seedWidgets() {
       },
       defaultProps: { label: 'Happy Customers', value: 0, suffix: '+', prefix: '' },
       minRowSpan: 1, maxRowSpan: 1, minColSpan: 2, maxColSpan: 4,
-      isActive: true, displayOrder: 12,
+      isActive: true, displayOrder: 13,
     },
 
     // ── NITRO GOLD widgets ──
@@ -304,7 +328,7 @@ async function seedWidgets() {
       },
       defaultProps: { html: '', sanitize: true },
       minRowSpan: 1, maxRowSpan: 6, minColSpan: 4, maxColSpan: 4,
-      isActive: true, displayOrder: 13,
+      isActive: true, displayOrder: 14,
     },
     {
       widgetType: 'gradient_hero',
@@ -326,7 +350,7 @@ async function seedWidgets() {
       },
       defaultProps: { title: '', subtitle: '', gradientFrom: '#6C4FD1', gradientTo: '#E07B30', animationSpeed: 'medium' },
       minRowSpan: 3, maxRowSpan: 6, minColSpan: 4, maxColSpan: 4,
-      isActive: true, displayOrder: 14,
+      isActive: true, displayOrder: 15,
     },
   ];
 
