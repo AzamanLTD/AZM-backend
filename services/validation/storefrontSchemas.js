@@ -25,18 +25,22 @@ const layoutJsonSchema = z.object({
 });
 
 // ── API request schemas ──
+const expectedUpdatedAtSchema = z.string().datetime().optional();
+
 const saveDraftSchema = z.object({
   layoutJson: layoutJsonSchema,
   themeId: z.string().uuid(),
-  expectedUpdatedAt: z.string().datetime().optional(),
+  expectedUpdatedAt: expectedUpdatedAtSchema,
 });
 
 const applyTemplateSchema = z.object({
   templateId: z.string().uuid(),
+  expectedUpdatedAt: expectedUpdatedAtSchema,
 });
 
 const revertSchema = z.object({
   versionId: z.string().uuid(),
+  expectedUpdatedAt: expectedUpdatedAtSchema,
 });
 
 const createStakeSchema = z.object({
@@ -68,6 +72,7 @@ module.exports = {
   layoutJsonSchema,
   tileSchema,
   tilePositionSchema,
+  expectedUpdatedAtSchema,
   saveDraftSchema,
   applyTemplateSchema,
   revertSchema,
