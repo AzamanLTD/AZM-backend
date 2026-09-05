@@ -7,6 +7,7 @@
 // =============================================================================
 
 const logger = require('../src/config/logger');
+const { withOrderTrackingMutation } = require('../services/orderTrackingMutationSafeService');
 
 const wrap = (fn) => async (req, res) => {
     try { await fn(req, res); }
@@ -199,24 +200,34 @@ exports.updateStatus = wrap(async function updateStatus(req, res) {
         return res.status(400).json({ success: false, message: 'invalid deliveryLng' });
     }
 
-    const tracking = await ensureTracking(prisma, orderId, order.businessProfileId);
+    let updatedTracking;
     const eventTimestamp = new Date().toISOString();
-    const timeline = Array.isArray(tracking.timeline) ? [...tracking.timeline] : [];
-    timeline.push({ status, note: note || '', timestamp: eventTimestamp });
 
-    const updateData = { timeline };
-    if (driverName) updateData.driverName = driverName;
-    if (driverPhone) updateData.driverPhone = driverPhone;
-    if (vehiclePlate) updateData.vehiclePlate = vehiclePlate;
-    if (deliveryAddress) updateData.deliveryAddress = deliveryAddress;
-    if (deliveryLat != null) updateData.deliveryLatitude = deliveryLat;
-    if (deliveryLng != null) updateData.deliveryLongitude = deliveryLng;
-    if (status === 'DELIVERED') updateData.actualArrival = new Date(eventTimestamp);
+    await withOrderTrackingMutation(
+        prisma,
+        orderId,
+        order.businessProfileId,
+        async (tx, tracking) => {
+            const timeline = Array.isArray(tracking.timeline) ? [...tracking.timeline] : [];
+            timeline.push({ status, note: note || '', timestamp: eventTimestamp });
 
-    const updatedTracking = await prisma.orderTracking.update({
-        where: { orderId },
-        data: updateData,
-    });
+            const updateData = { timeline };
+            if (driverName) updateData.driverName = driverName;
+            if (driverPhone) updateData.driverPhone = driverPhone;
+            if (vehiclePlate) updateData.vehiclePlate = vehiclePlate;
+            if (deliveryAddress) updateData.deliveryAddress = deliveryAddress;
+            if (deliveryLat != null) updateData.deliveryLatitude = deliveryLat;
+            if (deliveryLng != null) updateData.deliveryLongitude = deliveryLng;
+            if (status === 'DELIVERED') updateData.actualArrival = new Date(eventTimestamp);
+
+            updatedTracking = await tx.orderTracking.update({
+                where: { orderId },
+                data: updateData,
+            });
+
+            return updatedTracking;
+        },
+    );
 
     const notificationService = req.app.get('notificationService');
     if (notificationService) {
