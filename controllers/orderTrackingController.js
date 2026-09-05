@@ -139,7 +139,7 @@ exports.updateEta = wrap(async function updateEta(req, res) {
     const userId = req.user.id;
     const { estimatedArrival } = req.body;
 
-    if (estimatedArrival == null || Number.isNaN(Date.parse(estimatedArrival))) {
+    if (typeof estimatedArrival !== 'string' || Number.isNaN(Date.parse(estimatedArrival))) {
         return res.status(400).json({ success: false, message: 'valid estimatedArrival required' });
     }
 
@@ -181,6 +181,13 @@ exports.updateStatus = wrap(async function updateStatus(req, res) {
     const userId = req.user.id;
     const { status, note, driverName, driverPhone, vehiclePlate, deliveryAddress, deliveryLat, deliveryLng } = req.body;
 
+    if (typeof status !== 'string' || status.trim().length === 0 || status.length > 64) {
+        return res.status(400).json({ success: false, message: 'invalid status' });
+    }
+    if (note != null && (typeof note !== 'string' || note.length > 1000)) {
+        return res.status(400).json({ success: false, message: 'invalid note' });
+    }
+
     const order = await prisma.businessOrder.findUnique({
         where: { id: orderId },
         select: { businessProfileId: true, customerId: true, status: true, orderRef: true }
@@ -212,7 +219,7 @@ exports.updateStatus = wrap(async function updateStatus(req, res) {
         async (tx, tracking) => {
             eventTimestamp = new Date().toISOString();
             const timeline = Array.isArray(tracking.timeline) ? [...tracking.timeline] : [];
-            timeline.push({ status, note: note || '', timestamp: eventTimestamp });
+            timeline.push({ status: status.trim(), note: note || '', timestamp: eventTimestamp });
 
             const updateData = { timeline };
             if (driverName) updateData.driverName = driverName;
@@ -221,7 +228,7 @@ exports.updateStatus = wrap(async function updateStatus(req, res) {
             if (deliveryAddress) updateData.deliveryAddress = deliveryAddress;
             if (deliveryLat != null) updateData.deliveryLatitude = deliveryLat;
             if (deliveryLng != null) updateData.deliveryLongitude = deliveryLng;
-            if (status === 'DELIVERED') updateData.actualArrival = new Date(eventTimestamp);
+            if (status.trim() === 'DELIVERED') updateData.actualArrival = new Date(eventTimestamp);
 
             updatedTracking = await tx.orderTracking.update({
                 where: { orderId },
@@ -236,16 +243,16 @@ exports.updateStatus = wrap(async function updateStatus(req, res) {
     if (notificationService) {
         await notificationService.sendToUser(order.customerId, {
             type: 'ORDER_TRACKING',
-            title: `Order ${order.orderRef} — ${status}`,
-            body: note || `Your order status has been updated to: ${status}`,
-            data: { orderId, status },
+            title: `Order ${order.orderRef} — ${status.trim()}`,
+            body: note || `Your order status has been updated to: ${status.trim()}`,
+            data: { orderId, status: status.trim() },
         }).catch(() => {});
     }
 
     const io = req.app.get('io');
     if (io) {
         io.to(`order:${orderId}`).emit('order:status', {
-            orderId, status, note: note || '', timestamp: eventTimestamp,
+            orderId, status: status.trim(), note: note || '', timestamp: eventTimestamp,
             tracking: updatedTracking,
         });
     }
