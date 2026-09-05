@@ -23,9 +23,6 @@ function mountRoutes(app, {
     app.use('/api/public', generalLimiter, require('../../routes/publicRoutes'));
     const { adminBusinessScope } = require('../../middleware/adminBusinessScope');
     app.use(adminBusinessScope);
-    // Compatibility replacement for /admin/stats with complete volume fields.
-    // Mounted before the legacy admin router so existing clients immediately
-    // receive fiatVolume24h/cryptoVolume24h without a breaking URL change.
     app.use('/api/admin', generalLimiter, require('../../routes/adminStatsRoutes'));
     app.use('/api/auth', authLimiter, require('../../routes/authRoutes'));
     app.use('/api/trades', financialLimiter, require('../../routes/tradeRoutes'));
@@ -55,7 +52,7 @@ function mountRoutes(app, {
     app.use('/api/p2p', financialLimiter, require('../../routes/p2pRoutes'));
     app.use('/api/friends', generalLimiter, require('../../routes/friendRoutes'));
     app.use('/api/vendor', generalLimiter, require('../../routes/vendorStatsRoutes'));
-    app.use('/api/savings', generalLimiter, require('../../routes/savingsRoutes'));
+    app.use('/api/savings', financialLimiter, require('../../routes/savingsRoutes'));
     app.use('/api/oracle', generalLimiter, require('../../routes/oracleRoutes'));
     app.use('/api/azm', generalLimiter, require('../../routes/azmRoutes'));
     app.use('/api/receipts', generalLimiter, require('../../routes/receiptRoutes'));
@@ -115,8 +112,6 @@ function mountRoutes(app, {
     app.use('/api/admin/control-plane', generalLimiter, require('../../routes/adminReconciliationRoutes'));
 
     app.use('/api/marketplace', generalLimiter, require('../../routes/marketplaceRoutes'));
-    // Canonical scoped Business OS financial/operational mutation handlers are
-    // mounted before the legacy monolithic router during the cleanup migration.
     app.use('/api/business-os', financialLimiter, require('../../routes/businessOSFinanceRoutes'));
     app.use('/api/business-os', generalLimiter, require('../../routes/businessOSInventoryRoutes'));
     app.use('/api/business-os', financialLimiter, require('../../routes/businessOSPosRoutes'));
@@ -127,6 +122,8 @@ function mountRoutes(app, {
     app.use('/api/storefront', generalLimiter, require('../../routes/storefrontCheckoutReadinessRoutes'));
     app.use('/api/storefront', generalLimiter, require('../../routes/storefrontCheckoutIntegrityRoutes'));
     app.use('/api/storefront', generalLimiter, require('../../routes/storefrontExperienceRoutes'));
+    app.use('/api/storefront', generalLimiter, require('../../routes/storefrontSaveDraftSafeRoutes'));
+    app.use('/api/storefront', generalLimiter, require('../../routes/storefrontDraftMutationRoutes'));
     app.use('/api/storefront', generalLimiter, require('../../routes/storefrontRoutes'));
     app.use('/api/azm-stake', generalLimiter, require('../../routes/azmStakeRoutes'));
     app.use('/api/admin/storefront', generalLimiter, require('../../routes/adminStorefrontRoutes'));
