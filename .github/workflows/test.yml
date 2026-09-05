@@ -51,25 +51,8 @@ jobs:
           node-version: '24'
           cache: 'npm'
 
-      - name: Refresh lockfile and inspect production audit
-        if: startsWith(github.head_ref, 'chore/security-audit-current-main')
-        run: |
-          npm install --package-lock-only --ignore-scripts
-          echo '--- production dependency audit ---'
-          npm audit --omit=dev --audit-level=low || true
-
       - name: Install dependencies
         run: npm ci
-
-      - name: Inspect resolved security tree
-        if: startsWith(github.head_ref, 'chore/security-audit-current-main')
-        run: |
-          echo '--- resolved uuid tree ---'
-          npm ls uuid --all || true
-          echo '--- resolved deepmerge-ts tree ---'
-          npm ls deepmerge-ts --all || true
-          echo '--- production dependency audit after install ---'
-          npm audit --omit=dev --audit-level=low || true
 
       - name: Apply database schema
         # CI uses a disposable PostgreSQL instance. Production remains managed
@@ -83,6 +66,11 @@ jobs:
         run: npx prisma generate
 
       - name: Run tests
+        # DB-backed suites share one disposable database and truncate between
+        # tests, so Jest must remain serial. The application bootstrap also
+        # leaves Prisma/pg handles open, hence forceExit.
+        # Retry once only to absorb a transient CI database/runner timeout;
+        # genuine test failures must reproduce and still fail the job.
         run: |
           set +e
           npm test -- --runInBand --forceExit
