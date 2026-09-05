@@ -25,7 +25,7 @@ describe('dine-in tab service adapter', () => {
     });
   });
 
-  test('maps item price and actor fields to addItem', async () => {
+  test('maps item price and actor fields to atomic addItem', async () => {
     const addItem = jest.fn().mockResolvedValue({ id: 'item-1' });
     jest.doMock('../services/marketplace/dineInService', () =>
       jest.fn().mockImplementation(() => ({ addItem })),
@@ -46,7 +46,7 @@ describe('dine-in tab service adapter', () => {
       io,
     });
 
-    expect(addItem).toHaveBeenCalledWith({
+    expect(addItem).toHaveBeenCalledWith(prisma, {
       tabId: 'tab-1',
       productId: 'product-1',
       name: 'Jollof rice',
@@ -54,6 +54,7 @@ describe('dine-in tab service adapter', () => {
       quantity: 2,
       addedBy: 42,
       io,
+      notes: 'No pepper',
     });
   });
 
@@ -92,7 +93,7 @@ describe('dine-in tab service adapter', () => {
       io,
     });
 
-    expect(addCustomerItem).toHaveBeenCalledWith({
+    expect(addCustomerItem).toHaveBeenCalledWith(prisma, {
       tabId: 'tab-1',
       customerId: 42,
       productId: 'product-1',
