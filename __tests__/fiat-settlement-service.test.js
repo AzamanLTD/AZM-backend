@@ -11,7 +11,7 @@ describe('fiatSettlementService', () => {
 
     const attemptDb = () => ({
         $queryRawUnsafe: jest.fn().mockResolvedValue([{
-            id: 'attempt-1',
+            id: 'tx-1',
             transactionHistoryId: 'tx-1',
             provider: 'MTN_MOMO_DISBURSEMENT',
             providerReference: 'ref-1',
