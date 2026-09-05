@@ -68,4 +68,46 @@ describe('storefrontStudioValidation', () => {
         }
         expect(() => validateStudioDocument(doc)).toThrow(/at most 250 nodes/);
     });
+
+    test('rejects invalid grid geometry', () => {
+        const invalid = base();
+        invalid.nodes.button.layout = { mode: 'grid-item', grid: { row: 0, col: 3, rowSpan: 1, colSpan: 2 } };
+        expect(() => validateStudioDocument(invalid)).toThrow(/must fit within 4 columns/);
+
+        invalid.nodes.button.layout.grid = { row: 0, col: 0, rowSpan: 0, colSpan: 1 };
+        expect(() => validateStudioDocument(invalid)).toThrow(/row geometry is invalid/);
+    });
+
+    test('rejects overlapping sibling grid items', () => {
+        const doc = base();
+        doc.pages[0].root = ['button', 'second'];
+        doc.nodes.button.layout = { mode: 'grid-item', grid: { row: 0, col: 0, rowSpan: 2, colSpan: 2 } };
+        doc.nodes.second = {
+            id: 'second',
+            type: 'text',
+            props: {},
+            style: {},
+            layout: { mode: 'grid-item', grid: { row: 1, col: 1, rowSpan: 2, colSpan: 2 } },
+            responsive: {},
+            actions: {},
+            children: [],
+        };
+        expect(() => validateStudioDocument(doc)).toThrow(/overlap/);
+    });
+
+    test('rejects a node referenced by multiple parents', () => {
+        const doc = base();
+        doc.nodes.section = {
+            id: 'section',
+            type: 'section',
+            props: {},
+            style: {},
+            layout: {},
+            responsive: {},
+            actions: {},
+            children: ['button'],
+        };
+        doc.pages[0].root = ['button', 'section'];
+        expect(() => validateStudioDocument(doc)).toThrow(/multiple parents/);
+    });
 });
