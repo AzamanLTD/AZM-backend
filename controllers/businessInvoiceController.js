@@ -34,12 +34,16 @@ exports.createInvoice = async (req, res) => {
     const profile = await _ownedProfile(prisma, req.user.id);
     const { customerId, locationId, tableId, lineItems, taxLines, businessNote, idempotencyKey: bodyIdempotencyKey } = req.body;
     const headerIdempotencyKey = req.get('Idempotency-Key');
-    const normalizedHeader = headerIdempotencyKey == null ? null : String(headerIdempotencyKey).trim();
+    const hasHeaderIdempotencyKey = headerIdempotencyKey !== undefined && headerIdempotencyKey !== null;
+    const normalizedHeader = hasHeaderIdempotencyKey ? String(headerIdempotencyKey).trim() : null;
     const normalizedBody = bodyIdempotencyKey == null ? null : String(bodyIdempotencyKey).trim();
+    if (hasHeaderIdempotencyKey && !normalizedHeader) {
+      return res.status(400).json({ success: false, message: 'Idempotency-Key header cannot be blank.' });
+    }
     if (normalizedHeader && normalizedBody && normalizedHeader !== normalizedBody) {
       return res.status(400).json({ success: false, message: 'Idempotency-Key header does not match body idempotencyKey.' });
     }
-    const idempotencyKey = normalizedHeader || normalizedBody || null;
+    const idempotencyKey = hasHeaderIdempotencyKey ? normalizedHeader : normalizedBody;
     if (!customerId) return res.status(400).json({ success: false, message: "customerId required." });
     const result = await invoiceCreationBoundary.createInvoice(prisma, {
       businessProfileId: profile.id, customerId, locationId, tableId,
