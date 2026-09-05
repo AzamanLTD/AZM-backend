@@ -2,6 +2,7 @@
 
 const crypto = require('crypto');
 const logger = require('../../src/config/logger');
+const { computeTaxLines } = require('../../utils/invoiceMath');
 
 const SERIALIZABLE_RETRY_LIMIT = 3;
 const SERIALIZABLE_BACKOFF_MS = 10;
@@ -70,7 +71,8 @@ class PosOrderService {
                     }
                     await this._validateOrderContext(tx, businessProfileId, locationId, tableId);
                     const computed = await this._priceItems(tx, businessProfileId, normalizedItems, locationId);
-                    const computedTax = computed.subtotal * 0.025;
+                    const taxResult = await this._computeTax(tx, businessProfileId, computed.subtotal);
+                    const computedTax = taxResult.taxTotal;
                     const computedGrand = computed.subtotal + computedTax;
 
                     let azmPortion = 0;
@@ -109,7 +111,11 @@ class PosOrderService {
                     await tx.businessLedgerEntry.create({ data: {
                         businessProfileId, type: 'INCOME', category: 'SALES', description: `POS Sale (${orderRef} - ${pm})`, amount: computedGrand,
                         sourceType: 'POS_SALE', sourceId: order.id,
-                        metadata: { orderRef, paymentMethod: pm, subtotal: computed.subtotal, tax: computedTax, items: normalizedItems.length, locationId, tableId, azmPortion, ...(idempotencyFingerprint ? { posIdempotencyFingerprint: idempotencyFingerprint } : {}) },
+                        metadata: {
+                            orderRef, paymentMethod: pm, subtotal: computed.subtotal, tax: computedTax,
+                            taxLines: taxResult.taxLines, items: normalizedItems.length, locationId, tableId, azmPortion,
+                            ...(idempotencyFingerprint ? { posIdempotencyFingerprint: idempotencyFingerprint } : {}),
+                        },
                     } });
                     return { order, duplicate: false, computedSubtotal: computed.subtotal, computedTax, computedGrand, change: cashChange };
                 }, { isolationLevel: 'Serializable' });
@@ -128,18 +134,23 @@ class PosOrderService {
         throw new Error('Could not settle POS order after retries.');
     }
 
+    async _computeTax(tx, businessProfileId, subtotal) {
+        const defaultPreset = await tx.businessTaxPreset.findFirst({
+            where: { businessProfileId, isDefault: true },
+            orderBy: { createdAt: 'asc' },
+            select: { name: true, type: true, value: true },
+        });
+        const effectiveTaxLines = defaultPreset ? [defaultPreset] : [];
+        return computeTaxLines(effectiveTaxLines, subtotal);
+    }
+
     async _findIdempotentOrder(businessProfileId, idempotencyKey, fingerprint = null, client = this.prisma) {
         if (!idempotencyKey) return null;
         const existing = await client.businessOrder.findFirst({ where: { idempotencyKey } });
         if (!existing) return null;
         if (existing.businessProfileId !== businessProfileId) throw new Error('Idempotency key already belongs to another business.');
-        // Legacy rows may not have a fingerprint; preserve their safe replay semantics.
-        // New POS rows store the fingerprint in the atomic POS ledger entry.
         if (fingerprint && client.businessLedgerEntry?.findFirst) {
-            const ledger = await client.businessLedgerEntry.findFirst({
-                where: { sourceType: 'POS_SALE', sourceId: existing.id },
-                select: { metadata: true },
-            });
+            const ledger = await client.businessLedgerEntry.findFirst({ where: { sourceType: 'POS_SALE', sourceId: existing.id }, select: { metadata: true } });
             const storedFingerprint = ledger?.metadata?.posIdempotencyFingerprint;
             if (storedFingerprint && storedFingerprint !== fingerprint) throw new Error('Idempotency key already used for a different POS request.');
         }
@@ -166,9 +177,7 @@ class PosOrderService {
             if (locationId) where.OR = [{ locationId: null }, { locationId }];
             else where.locationId = null;
             const product = await tx.businessProduct.findFirst({ where, select: { id: true, name: true, priceUsdc: true, stockQty: true } });
-            if (!product) {
-                throw new Error(locationId ? `Invalid, unavailable, or out-of-location product: ${item.productId}` : `Invalid or unavailable global product: ${item.productId}`);
-            }
+            if (!product) throw new Error(locationId ? `Invalid, unavailable, or out-of-location product: ${item.productId}` : `Invalid or unavailable global product: ${item.productId}`);
             const price = Number(product.priceUsdc);
             if (!Number.isFinite(price) || price <= 0) throw new Error(`Invalid catalog price for product: ${product.name}`);
             subtotal += price * item.quantity;
