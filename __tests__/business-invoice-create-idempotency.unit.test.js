@@ -21,17 +21,19 @@ describe('business invoice creation idempotency boundary', () => {
 
   beforeEach(() => jest.clearAllMocks());
 
+  const replayInvoice = () => ({
+    id: 'inv-existing',
+    businessProfileId: 'biz-1',
+    customerId: 7,
+    locationId: 'loc-1',
+    tableId: 'table-1',
+    businessNote: 'Lunch',
+    lineItems: [{ description: 'Meal', quantity: 2, unitPrice: 20 }],
+    taxLines: [],
+  });
+
   test('normalizes and passes a new idempotency key to the canonical service', async () => {
-    const invoice = {
-      id: 'inv-1',
-      businessProfileId: 'biz-1',
-      customerId: 7,
-      locationId: 'loc-1',
-      tableId: 'table-1',
-      businessNote: 'Lunch',
-      lineItems: [{ description: 'Meal', quantity: 2, unitPrice: 20 }],
-      taxLines: [],
-    };
+    const invoice = replayInvoice();
     const prisma = { businessInvoice: { findUnique: jest.fn().mockResolvedValue(null) } };
     invoiceService.createInvoice.mockResolvedValue(invoice);
 
@@ -45,16 +47,7 @@ describe('business invoice creation idempotency boundary', () => {
   });
 
   test('replays a committed invoice without invoking creation again', async () => {
-    const invoice = {
-      id: 'inv-existing',
-      businessProfileId: 'biz-1',
-      customerId: 7,
-      locationId: 'loc-1',
-      tableId: 'table-1',
-      businessNote: 'Lunch',
-      lineItems: [{ description: 'Meal', quantity: 2, unitPrice: 20 }],
-      taxLines: [],
-    };
+    const invoice = replayInvoice();
     const prisma = { businessInvoice: { findUnique: jest.fn().mockResolvedValue(invoice) } };
 
     const result = await boundary.createInvoice(prisma, args);
@@ -64,17 +57,7 @@ describe('business invoice creation idempotency boundary', () => {
   });
 
   test('rejects reuse of a key for a materially different request', async () => {
-    const invoice = {
-      id: 'inv-existing',
-      businessProfileId: 'biz-1',
-      customerId: 7,
-      locationId: 'loc-1',
-      tableId: 'table-1',
-      businessNote: 'Lunch',
-      lineItems: [{ description: 'Meal', quantity: 2, unitPrice: 20 }],
-      taxLines: [],
-    };
-    const prisma = { businessInvoice: { findUnique: jest.fn().mockResolvedValue(invoice) } };
+    const prisma = { businessInvoice: { findUnique: jest.fn().mockResolvedValue(replayInvoice()) } };
 
     await expect(boundary.createInvoice(prisma, {
       ...args,
@@ -85,17 +68,32 @@ describe('business invoice creation idempotency boundary', () => {
     });
   });
 
+  test('rejects reuse of a key for a materially different tax request', async () => {
+    const invoice = replayInvoice();
+    invoice.taxLines = [{ name: 'VAT', type: 'PERCENTAGE', value: 12.5, computedAmount: 5 }];
+    const prisma = { businessInvoice: { findUnique: jest.fn().mockResolvedValue(invoice) } };
+
+    await expect(boundary.createInvoice(prisma, {
+      ...args,
+      taxLines: [{ name: 'VAT', type: 'PERCENTAGE', value: 15 }],
+    })).rejects.toMatchObject({
+      code: 'IDEMPOTENCY_INTENT_MISMATCH',
+      status: 409,
+    });
+  });
+
+  test('omitted taxLines retain default-tax semantics during replay checks', async () => {
+    const invoice = replayInvoice();
+    invoice.taxLines = [{ name: 'VAT', type: 'PERCENTAGE', value: 12.5, computedAmount: 5 }];
+    const prisma = { businessInvoice: { findUnique: jest.fn().mockResolvedValue(invoice) } };
+
+    const result = await boundary.createInvoice(prisma, { ...args, taxLines: undefined });
+
+    expect(result).toEqual({ invoice, replayed: true });
+  });
+
   test('recovers from a concurrent unique-key race with an exact replay', async () => {
-    const invoice = {
-      id: 'inv-race-winner',
-      businessProfileId: 'biz-1',
-      customerId: 7,
-      locationId: 'loc-1',
-      tableId: 'table-1',
-      businessNote: 'Lunch',
-      lineItems: [{ description: 'Meal', quantity: 2, unitPrice: 20 }],
-      taxLines: [],
-    };
+    const invoice = replayInvoice();
     const findUnique = jest.fn()
       .mockResolvedValueOnce(null)
       .mockResolvedValueOnce(invoice);
