@@ -15,6 +15,7 @@ const makeConcurrentPrisma = () => {
     },
     initialReads: 0,
     releaseInitialReads: null,
+    settlementCommitted: null,
     claimCalls: 0,
     balanceMutations: 0,
     historyWrites: 0,
@@ -24,6 +25,9 @@ const makeConcurrentPrisma = () => {
 
   let releaseResolve;
   state.releaseInitialReads = new Promise((resolve) => { releaseResolve = resolve; });
+
+  let settlementResolve;
+  state.settlementCommitted = new Promise((resolve) => { settlementResolve = resolve; });
 
   const snapshotInvoice = () => ({ ...state.invoice, businessProfile: { ...state.invoice.businessProfile } });
 
@@ -36,6 +40,11 @@ const makeConcurrentPrisma = () => {
         state.initialReads += 1;
         if (state.initialReads === 2) releaseResolve();
         if (state.initialReads <= 2) await state.releaseInitialReads;
+        if (state.initialReads > 2 && state.invoice.payTxHash && !state.invoice.customerPaidUsdc) {
+          // A concurrent loser can only observe the durable replay marker after
+          // the winner's transaction commits all settlement fields.
+          await state.settlementCommitted;
+        }
         return snapshotInvoice();
       }),
       updateMany: jest.fn(async () => {
@@ -46,6 +55,7 @@ const makeConcurrentPrisma = () => {
       }),
       update: jest.fn(async ({ data }) => {
         Object.assign(state.invoice, data, { status: 'PAID' });
+        settlementResolve();
         return snapshotInvoice();
       }),
     },
@@ -92,8 +102,13 @@ describe('business invoice payment concurrency', () => {
       payInvoice(prisma, { invoiceId: 'invoice-1', customerId: 7 }),
     ]);
 
-    expect(results.filter((result) => result.alreadyPaid).length).toBe(1);
-    expect(results.filter((result) => !result.alreadyPaid).length).toBe(1);
+    const settlement = results.find((result) => !result.alreadyPaid);
+    const replay = results.find((result) => result.alreadyPaid);
+
+    expect(settlement).toBeDefined();
+    expect(replay).toBeDefined();
+    expect(Number(settlement.customerPays)).toBe(100);
+    expect(Number(replay.customerPays)).toBe(100);
     expect(state.claimCalls).toBe(2);
     expect(state.transactionCalls).toBe(2);
     expect(state.balanceMutations).toBe(2);
@@ -101,6 +116,5 @@ describe('business invoice payment concurrency', () => {
     expect(state.feeWrites).toBe(2);
     expect(state.invoice.status).toBe('PAID');
     expect(state.invoice.payTxHash).toBe('INV_PAY_invoice-1');
-    expect(results.every((result) => Number(result.customerPays) === 100)).toBe(true);
   });
 });
