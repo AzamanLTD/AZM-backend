@@ -6,9 +6,7 @@ const { protectActive } = require('../middleware/banGuardMiddleware');
 const { requirePermission } = require('../middleware/requirePermission');
 const experienceBlueprintService = require('../services/experienceBlueprintService');
 const storefrontService = require('../services/storefrontService');
-const { publishStorefrontSafely } = require('../services/storefrontSafePublishService');
-const { preserveDraftExperience } = require('../services/storefrontDraftExperienceGuard');
-const { saveDraftSchema } = require('../services/validation/storefrontSchemas');
+const { updateExperienceSafe } = require('../services/storefrontDraftMutationSafeService');
 const { renderStorefront, invalidateCache } = require('../services/storefrontRenderService');
 
 const router = express.Router();
@@ -76,33 +74,6 @@ router.get('/me/experience', protect, protectActive, requirePermission('storefro
   }
 });
 
-router.put('/me/draft', protect, protectActive, requirePermission('storefront.manage'), async (req, res, next) => {
-  try {
-    const prisma = req.app.get('prisma');
-    const businessProfileId = businessProfileIdFromRequest(req);
-    if (!businessProfileId) return res.status(400).json({ success: false, message: 'No business profile found.' });
-
-    const parsed = saveDraftSchema.safeParse(req.body);
-    if (!parsed.success) {
-      return res.status(400).json({ success: false, message: 'Validation failed', errors: parsed.error.flatten() });
-    }
-
-    const currentDraft = await storefrontService.getOrCreateDraft(prisma, businessProfileId);
-    const safeLayoutJson = preserveDraftExperience(parsed.data.layoutJson, currentDraft.layoutJson);
-    const draft = await storefrontService.saveDraft(
-      prisma,
-      businessProfileId,
-      safeLayoutJson,
-      parsed.data.themeId,
-      parsed.data.expectedUpdatedAt,
-    );
-
-    res.json({ success: true, data: draft });
-  } catch (err) {
-    next(err);
-  }
-});
-
 router.put('/me/experience', protect, protectActive, requirePermission('storefront.manage'), async (req, res, next) => {
   try {
     const prisma = req.app.get('prisma');
@@ -119,20 +90,10 @@ router.put('/me/experience', protect, protectActive, requirePermission('storefro
     });
     if (!business) return res.status(404).json({ success: false, message: 'Business profile not found.' });
 
-    const draft = await storefrontService.getOrCreateDraft(prisma, businessProfileId, business.category);
-    const draftLayout = draft.layoutJson && typeof draft.layoutJson === 'object' ? draft.layoutJson : {};
-    const blueprint = experienceBlueprintService.normalizeExperienceBlueprint(req.body, business.category);
+    const { expectedUpdatedAt, ...blueprintInput } = req.body;
+    const blueprint = experienceBlueprintService.normalizeExperienceBlueprint(blueprintInput, business.category);
 
-    await prisma.businessStorefrontLayout.update({
-      where: { id: draft.id },
-      data: {
-        layoutJson: {
-          ...draftLayout,
-          experience: blueprint,
-        },
-      },
-    });
-
+    await updateExperienceSafe(prisma, businessProfileId, blueprint, expectedUpdatedAt);
     await invalidateCache(businessProfileId);
 
     res.json({
@@ -141,47 +102,11 @@ router.put('/me/experience', protect, protectActive, requirePermission('storefro
       message: 'Experience settings saved to the storefront draft. Publish the storefront to make them live.',
     });
   } catch (err) {
-    next(err);
-  }
-});
-
-router.post('/me/publish-safe', protect, protectActive, requirePermission('storefront.manage'), async (req, res, next) => {
-  try {
-    const prisma = req.app.get('prisma');
-    const businessProfileId = businessProfileIdFromRequest(req);
-    if (!businessProfileId) return res.status(400).json({ success: false, message: 'No business profile found.' });
-
-    const published = await publishStorefrontSafely(
-      prisma,
-      businessProfileId,
-      req.user.id,
-      req.body?.expectedUpdatedAt,
-    );
-    await invalidateCache(businessProfileId);
-
-    await prisma.storefrontAnalyticsEvent.create({
-      data: {
-        businessProfileId,
-        eventType: 'layout_published',
-        metadata: {
-          themeId: published.themeId,
-          tileCount: published.layoutJson?.tiles?.length || 0,
-          tier: published.tier || 'FREE',
-        },
-      },
-    }).catch(() => {});
-
-    res.json({ success: true, data: published, message: 'Storefront published successfully.' });
-  } catch (err) {
-    if (err.statusCode === 402 || err.statusCode === 409) {
-      return res.status(err.statusCode).json({
+    if (err.statusCode === 409 || err.code === 'INVALID_EXPECTED_UPDATED_AT') {
+      return res.status(err.statusCode || 400).json({
         success: false,
         message: err.message,
-        ...(err.statusCode === 402 ? {
-          violations: err.violations,
-          tier: err.tier,
-          stakedBalance: err.stakedBalance,
-        } : { code: err.code }),
+        code: err.code,
       });
     }
     next(err);
