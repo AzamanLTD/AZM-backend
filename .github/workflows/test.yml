@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
   group: backend-test-${{ github.workflow }}-${{ github.ref }}
@@ -51,12 +51,19 @@ jobs:
           node-version: '24'
           cache: 'npm'
 
-      - name: Refresh lockfile and expose diff for security branch
+      - name: Regenerate and commit security lockfile
         if: startsWith(github.head_ref, 'chore/security-audit-current-main')
         run: |
           npm install --package-lock-only --ignore-scripts
-          echo '--- regenerated package-lock diff ---'
-          git diff -- package-lock.json
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add package-lock.json
+          if git diff --cached --quiet; then
+            echo 'package-lock.json already matches package.json'
+          else
+            git commit -m "chore(security): commit regenerated npm lockfile"
+            git push origin HEAD:${{ github.head_ref }}
+          fi
 
       - name: Install dependencies
         run: npm ci
