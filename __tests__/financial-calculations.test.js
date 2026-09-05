@@ -125,13 +125,11 @@ describe('Invoice: tax line computation', () => {
     expect(() => computeTaxLines([{ name: '', type: 'PERCENTAGE', value: 5 }], 100)).toThrow('Tax line name');
   });
 
-  test('defaults unknown type to PERCENTAGE', () => {
-    const { taxLines } = computeTaxLines(
+  test('rejects unsupported tax type', () => {
+    expect(() => computeTaxLines(
       [{ name: 'X', type: 'WEIRD', value: 10 }],
       100
-    );
-    expect(taxLines[0].type).toBe('PERCENTAGE');
-    expect(taxLines[0].computedAmount).toBe(10);
+    )).toThrow("Unsupported tax line type for 'X'");
   });
 });
 

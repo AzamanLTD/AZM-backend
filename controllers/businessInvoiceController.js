@@ -10,6 +10,7 @@
 'use strict';
 const logger = require('../src/config/logger');
 const invoiceSvc = require('../services/businessInvoiceService');
+const invoiceCreationBoundary = require('../services/businessInvoiceCreationBoundary');
 const reviewSvc  = require('../services/businessReviewService');
 const emailSvc   = require('../services/emailService');
 
@@ -31,13 +32,28 @@ exports.createInvoice = async (req, res) => {
   const prisma = req.app.get("prisma");
   try {
     const profile = await _ownedProfile(prisma, req.user.id);
-    const { customerId, locationId, tableId, lineItems, taxLines, businessNote } = req.body;
+    const { customerId, locationId, tableId, lineItems, taxLines, businessNote, idempotencyKey: bodyIdempotencyKey } = req.body;
+    const headerIdempotencyKey = req.get('Idempotency-Key');
+    const hasHeaderIdempotencyKey = headerIdempotencyKey !== undefined && headerIdempotencyKey !== null;
+    const normalizedHeader = hasHeaderIdempotencyKey ? String(headerIdempotencyKey).trim() : null;
+    const normalizedBody = bodyIdempotencyKey == null ? null : String(bodyIdempotencyKey).trim();
+    if (hasHeaderIdempotencyKey && !normalizedHeader) {
+      return res.status(400).json({ success: false, message: 'Idempotency-Key header cannot be blank.' });
+    }
+    if (normalizedHeader && normalizedBody && normalizedHeader !== normalizedBody) {
+      return res.status(400).json({ success: false, message: 'Idempotency-Key header does not match body idempotencyKey.' });
+    }
+    const idempotencyKey = hasHeaderIdempotencyKey ? normalizedHeader : normalizedBody;
     if (!customerId) return res.status(400).json({ success: false, message: "customerId required." });
-    const invoice = await invoiceSvc.createInvoice(prisma, {
+    const result = await invoiceCreationBoundary.createInvoice(prisma, {
       businessProfileId: profile.id, customerId, locationId, tableId,
-      lineItems, taxLines, businessNote,
+      lineItems, taxLines, businessNote, idempotencyKey,
     });
-    return res.status(201).json({ success: true, invoice });
+    return res.status(result.replayed ? 200 : 201).json({
+      success: true,
+      invoice: result.invoice,
+      ...(result.replayed ? { replayed: true } : {}),
+    });
   } catch (err) { return _err(res, err); }
 };
 

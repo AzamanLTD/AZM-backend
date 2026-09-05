@@ -2,6 +2,7 @@
 
 const assert = require('node:assert/strict');
 const { createInvoice } = require('../services/businessInvoiceService');
+const { computeTaxLines } = require('../utils/invoiceMath');
 
 describe('business invoice default tax contract', () => {
   test('omitted taxLines use the business default preset', async () => {
@@ -50,5 +51,12 @@ describe('business invoice default tax contract', () => {
     assert.equal(invoice.billTotalUsdc, 20);
     assert.deepEqual(invoice.taxLines, []);
     assert.equal(defaultLookups, 0);
+  });
+
+  test('unsupported tax line types fail closed instead of becoming percentage tax', () => {
+    assert.throws(
+      () => computeTaxLines([{ name: 'Unknown', type: 'BOGUS', value: 10 }], 100),
+      /Unsupported tax line type for 'Unknown'/,
+    );
   });
 });
