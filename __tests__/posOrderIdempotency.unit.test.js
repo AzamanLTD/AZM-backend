@@ -20,7 +20,10 @@ function fingerprint(intent) {
 }
 
 const baseTx = () => ({
-    businessOrder: { findFirst: jest.fn().mockResolvedValue(null) },
+    businessOrder: {
+        findFirst: jest.fn().mockResolvedValue(null),
+        create: jest.fn(),
+    },
     businessLedgerEntry: { findFirst: jest.fn().mockResolvedValue(null), create: jest.fn().mockResolvedValue({ id: 'ledger-1' }) },
     businessTaxPreset: { findFirst: jest.fn().mockResolvedValue(null) },
     businessProduct: { findFirst: jest.fn().mockResolvedValue({ id: 'prod-1', name: 'Meal', priceUsdc: 20, stockQty: null }), updateMany: jest.fn() },
