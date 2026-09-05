@@ -116,8 +116,6 @@ function mountRoutes(app, {
 
     app.use('/api/marketplace', generalLimiter, require('../../routes/marketplaceRoutes'));
     // CAS-protected draft bootstrap/save/mutations must precede the legacy handlers at the same paths.
-    app.use('/api/storefront', generalLimiter, require('../../routes/storefrontDraftBootstrapSafeRoutes'));
-    app.use('/api/storefront', generalLimiter, require('../../routes/storefrontSaveDraftSafeRoutes'));
     app.use('/api/business-os', financialLimiter, require('../../routes/businessOSFinanceRoutes'));
     app.use('/api/business-os', generalLimiter, require('../../routes/businessOSInventoryRoutes'));
     app.use('/api/business-os', financialLimiter, require('../../routes/businessOSPosRoutes'));
@@ -128,6 +126,8 @@ function mountRoutes(app, {
     app.use('/api/storefront', generalLimiter, require('../../routes/storefrontCheckoutReadinessRoutes'));
     app.use('/api/storefront', generalLimiter, require('../../routes/storefrontCheckoutIntegrityRoutes'));
     app.use('/api/storefront', generalLimiter, require('../../routes/storefrontExperienceRoutes'));
+    app.use('/api/storefront', generalLimiter, require('../../routes/storefrontDraftBootstrapSafeRoutes'));
+    app.use('/api/storefront', generalLimiter, require('../../routes/storefrontSaveDraftSafeRoutes'));
     app.use('/api/storefront', generalLimiter, require('../../routes/storefrontDraftMutationRoutes'));
     app.use('/api/storefront', generalLimiter, require('../../routes/storefrontRoutes'));
     app.use('/api/azm-stake', generalLimiter, require('../../routes/azmStakeRoutes'));
