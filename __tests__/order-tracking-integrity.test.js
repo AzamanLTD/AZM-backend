@@ -147,6 +147,61 @@ describe('Order tracking controller boundaries', () => {
         expect(prisma.businessOrder.findUnique).not.toHaveBeenCalled();
     });
 
+    test('ETA updates initialize missing tracking rows', async () => {
+        const tracking = { orderId: 'order-1', businessProfileId: 'biz-1' };
+        const prisma = {
+            businessOrder: {
+                findUnique: jest.fn().mockResolvedValue({ businessProfileId: 'biz-1' }),
+            },
+            businessProfile: {
+                findUnique: jest.fn().mockResolvedValue({ ownerId: 'owner-1' }),
+            },
+            orderTracking: {
+                upsert: jest.fn().mockResolvedValue(tracking),
+                update: jest.fn().mockResolvedValue({ ...tracking, estimatedArrival: new Date('2026-09-05T04:00:00.000Z') }),
+            },
+        };
+        const req = {
+            params: { orderId: 'order-1' },
+            user: { id: 'owner-1' },
+            body: { estimatedArrival: '2026-09-05T04:00:00.000Z' },
+            app: { get: jest.fn((key) => key === 'prisma' ? prisma : key === 'io' ? null : undefined) },
+        };
+        const res = makeResponse();
+
+        await controller.updateEta(req, res);
+
+        expect(prisma.orderTracking.upsert).toHaveBeenCalledWith({
+            where: { orderId: 'order-1' },
+            create: { orderId: 'order-1', businessProfileId: 'biz-1' },
+            update: {},
+        });
+        expect(prisma.orderTracking.update).toHaveBeenCalledWith({
+            where: { orderId: 'order-1' },
+            data: { estimatedArrival: new Date('2026-09-05T04:00:00.000Z') },
+        });
+        expect(res.json).toHaveBeenCalledWith(expect.objectContaining({ success: true }));
+    });
+
+    test('ETA rejects invalid dates before database access', async () => {
+        const prisma = {
+            businessOrder: { findUnique: jest.fn() },
+        };
+        const req = {
+            params: { orderId: 'order-1' },
+            user: { id: 'owner-1' },
+            body: { estimatedArrival: 'not-a-date' },
+            app: { get: jest.fn((key) => key === 'prisma' ? prisma : undefined) },
+        };
+        const res = makeResponse();
+
+        await controller.updateEta(req, res);
+
+        expect(res.status).toHaveBeenCalledWith(400);
+        expect(res.json).toHaveBeenCalledWith({ success: false, message: 'valid estimatedArrival required' });
+        expect(prisma.businessOrder.findUnique).not.toHaveBeenCalled();
+    });
+
     test('status updates preserve zero-valued delivery coordinates and reuse one event timestamp', async () => {
         const tracking = { timeline: [] };
         const io = { to: jest.fn().mockReturnThis(), emit: jest.fn() };
