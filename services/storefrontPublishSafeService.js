@@ -10,10 +10,12 @@ function makeError(message, code, statusCode) {
 }
 
 /**
- * Publish a storefront draft behind a database row lock.
- * A versioned call is a compare-and-swap: only the exact draft snapshot the
- * editor observed may be claimed. The legacy /me/publish endpoint remains
- * available for compatibility while new clients use this boundary.
+ * Publish a storefront draft behind the canonical business-level advisory
+ * lock and a row-level compare-and-swap check.
+ *
+ * The advisory lock is shared with draft save/revert/template mutations, so a
+ * publish cannot interleave with another draft writer for the same business.
+ * The row lock then protects the exact draft snapshot being claimed.
  */
 async function publishLayoutSafe(prisma, businessProfileId, userId, expectedUpdatedAt = null) {
   let expected = null;
@@ -29,6 +31,8 @@ async function publishLayoutSafe(prisma, businessProfileId, userId, expectedUpda
   }
 
   return prisma.$transaction(async (tx) => {
+    await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${businessProfileId}))`;
+
     const rows = expected
       ? await tx.$queryRaw`
           SELECT "id"

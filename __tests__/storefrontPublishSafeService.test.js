@@ -18,18 +18,18 @@ describe('storefrontPublishSafeService', () => {
 
   afterEach(() => jest.clearAllMocks());
 
-  test('locks the draft and delegates publish inside one transaction', async () => {
+  test('serializes on the business advisory lock before locking and publishing the draft', async () => {
     const { prisma, tx } = makePrisma([{ id: 'draft-1' }]);
     const result = await publishLayoutSafe(prisma, 'biz-1', 7, '2026-09-05T00:00:00.000Z');
 
     expect(result).toEqual({ id: 'published-1', status: 'PUBLISHED' });
     expect(prisma.$transaction).toHaveBeenCalledTimes(1);
-    expect(tx.$queryRaw).toHaveBeenCalledTimes(1);
+    expect(tx.$queryRaw).toHaveBeenCalledTimes(2);
     expect(storefrontService.publishLayout).toHaveBeenCalledWith(tx, 'biz-1', 7);
   });
 
   test('rejects stale or missing versioned drafts with conflict', async () => {
-    const { prisma } = makePrisma([]);
+    const { prisma, tx } = makePrisma([]);
 
     await expect(
       publishLayoutSafe(prisma, 'biz-1', 7, '2026-09-05T00:00:00.000Z'),
@@ -37,6 +37,7 @@ describe('storefrontPublishSafeService', () => {
       code: 'STOREFRONT_DRAFT_STALE',
       statusCode: 409,
     });
+    expect(tx.$queryRaw).toHaveBeenCalledTimes(2);
     expect(storefrontService.publishLayout).not.toHaveBeenCalled();
   });
 
@@ -58,7 +59,7 @@ describe('storefrontPublishSafeService', () => {
     await publishLayoutSafe(prisma, 'biz-1', 7);
 
     expect(prisma.$transaction).toHaveBeenCalledTimes(1);
-    expect(tx.$queryRaw).toHaveBeenCalledTimes(1);
+    expect(tx.$queryRaw).toHaveBeenCalledTimes(2);
     expect(storefrontService.publishLayout).toHaveBeenCalledWith(tx, 'biz-1', 7);
   });
 });
