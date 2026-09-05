@@ -16,6 +16,7 @@ const { requirePermission } = require('../middleware/requirePermission');
 const multer = require('multer');
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
 const storefrontService = require('../services/storefrontService');
+const storefrontPublishSafeService = require('../services/storefrontPublishSafeService');
 const renderService = require('../services/storefrontRenderService');
 const { saveDraftSchema, applyTemplateSchema, revertSchema } = require('../services/validation/storefrontSchemas');
 
@@ -296,6 +297,51 @@ router.post('/me/publish', protect, protectActive, requirePermission('storefront
         tier: err.tier,
         stakedBalance: err.stakedBalance,
       });
+    }
+    throw err;
+  }
+}));
+
+// POST /api/storefront/me/publish-safe — transactional compare-and-swap publish
+router.post('/me/publish-safe', protect, protectActive, requirePermission('storefront.manage'), wrap(async (req, res) => {
+  const prisma = req.app.get('prisma');
+  const businessProfileId = req.businessProfileId || req.user.businessProfileId;
+  if (!businessProfileId) return res.status(400).json({ success: false, message: 'No business profile found.' });
+
+  const expectedUpdatedAt = req.body?.expectedUpdatedAt;
+  if (expectedUpdatedAt !== undefined && expectedUpdatedAt !== null && typeof expectedUpdatedAt !== 'string') {
+    return res.status(400).json({ success: false, message: 'expectedUpdatedAt must be an ISO timestamp string.' });
+  }
+
+  try {
+    const published = await storefrontPublishSafeService.publishLayoutSafe(
+      prisma,
+      businessProfileId,
+      req.user.id,
+      expectedUpdatedAt || null,
+    );
+    await renderService.invalidateCache(businessProfileId);
+    await prisma.storefrontAnalyticsEvent.create({
+      data: {
+        businessProfileId,
+        eventType: 'layout_published',
+        metadata: { themeId: published.themeId, tileCount: published.layoutJson?.tiles?.length || 0, tier: published.tier || 'FREE' },
+      },
+    }).catch(() => {});
+
+    return res.json({ success: true, data: published, message: 'Storefront published successfully.' });
+  } catch (err) {
+    if (err.statusCode === 402) {
+      return res.status(402).json({
+        success: false,
+        message: err.message,
+        violations: err.violations,
+        tier: err.tier,
+        stakedBalance: err.stakedBalance,
+      });
+    }
+    if (err.statusCode === 409) {
+      return res.status(409).json({ success: false, message: err.message, code: err.code });
     }
     throw err;
   }
