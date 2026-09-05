@@ -76,7 +76,7 @@ describe('Order tracking controller boundaries', () => {
                 findUnique: jest.fn().mockResolvedValue({ ownerId: 'owner-1' }),
             },
             orderTracking: {
-                findUnique: jest.fn().mockResolvedValue(tracking),
+                upsert: jest.fn().mockResolvedValue(tracking),
                 update: jest.fn().mockResolvedValue(tracking),
             },
         };
@@ -161,7 +161,7 @@ describe('Order tracking controller boundaries', () => {
             },
             businessProfile: { findUnique: jest.fn().mockResolvedValue({ ownerId: 'owner-1' }) },
             orderTracking: {
-                findUnique: jest.fn().mockResolvedValue(tracking),
+                upsert: jest.fn().mockResolvedValue(tracking),
                 update: jest.fn().mockImplementation(({ data }) => Promise.resolve({ ...tracking, ...data })),
             },
         };
@@ -194,7 +194,7 @@ describe('Order tracking controller boundaries', () => {
                 findUnique: jest.fn().mockResolvedValue({ businessProfileId: 'biz-1' }),
             },
             businessProfile: { findUnique: jest.fn().mockResolvedValue({ ownerId: 'owner-1' }) },
-            orderTracking: { findUnique: jest.fn(), update: jest.fn() },
+            orderTracking: { upsert: jest.fn(), update: jest.fn() },
         };
         const req = {
             params: { orderId: 'order-1' },
@@ -208,7 +208,7 @@ describe('Order tracking controller boundaries', () => {
 
         expect(res.status).toHaveBeenCalledWith(400);
         expect(res.json).toHaveBeenCalledWith({ success: false, message: 'invalid deliveryLat' });
-        expect(prisma.orderTracking.findUnique).not.toHaveBeenCalled();
+        expect(prisma.orderTracking.upsert).not.toHaveBeenCalled();
         expect(prisma.orderTracking.update).not.toHaveBeenCalled();
     });
 });
