@@ -25,8 +25,9 @@ describe('dine-in payment durable replay convergence', () => {
     });
 
     test('returns successful replay when payment errors after invoice payment and tab closure committed', async () => {
+        const adapter = require('../services/dineInTabService');
         const DineInService = require('../services/marketplace/dineInService');
-        const instance = DineInService.mock.results[0]?.value;
+        const instance = DineInService.mock.instances[0];
         instance.confirmAndPay.mockRejectedValue(new Error('socket timeout'));
         instance.getTab.mockResolvedValue({
             id: 'tab-1',
@@ -45,7 +46,6 @@ describe('dine-in payment durable replay convergence', () => {
             },
         });
 
-        const adapter = require('../services/dineInTabService');
         const result = await adapter.confirmAndPay({ marker: 'prisma' }, {
             tabId: 'tab-1',
             customerId: 7,
@@ -66,9 +66,11 @@ describe('dine-in payment durable replay convergence', () => {
     });
 
     test('does not convert another customer\'s paid tab into a successful replay', async () => {
+        const adapter = require('../services/dineInTabService');
         const DineInService = require('../services/marketplace/dineInService');
-        const instance = DineInService.mock.results[0]?.value;
-        instance.confirmAndPay.mockRejectedValue(new Error('socket timeout'));
+        const instance = DineInService.mock.instances[0];
+        const originalError = new Error('socket timeout');
+        instance.confirmAndPay.mockRejectedValue(originalError);
         instance.getTab.mockResolvedValue({
             id: 'tab-2',
             customerId: 99,
@@ -84,10 +86,6 @@ describe('dine-in payment durable replay convergence', () => {
                 customerCoveredFee: false,
             },
         });
-
-        const adapter = require('../services/dineInTabService');
-        const originalError = new Error('socket timeout');
-        instance.confirmAndPay.mockRejectedValueOnce(originalError);
 
         await expect(adapter.confirmAndPay({ marker: 'prisma' }, {
             tabId: 'tab-2',
