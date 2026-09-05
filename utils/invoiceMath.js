@@ -44,7 +44,10 @@ function computeTaxLines(taxLines, subtotal) {
   const clean = (taxLines || []).map(t => {
     const name = String(t.name || '').trim().slice(0, 100);
     if (!name) throw new Error('Tax line name is required.');
-    const type = t.type === 'FLAT' ? 'FLAT' : 'PERCENTAGE';
+    if (t.type !== 'FLAT' && t.type !== 'PERCENTAGE') {
+      throw new Error(`Unsupported tax line type for '${name}'.`);
+    }
+    const type = t.type;
     const value = parseFloat(t.value);
     if (isNaN(value) || value < 0) throw new Error(`Invalid tax value for '${name}'.`);
     const computed = type === 'PERCENTAGE' ? subtotal * (value / 100) : value;
