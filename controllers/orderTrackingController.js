@@ -200,14 +200,17 @@ exports.updateStatus = wrap(async function updateStatus(req, res) {
         return res.status(400).json({ success: false, message: 'invalid deliveryLng' });
     }
 
+    let eventTimestamp;
     let updatedTracking;
-    const eventTimestamp = new Date().toISOString();
 
     await withOrderTrackingMutation(
         prisma,
         orderId,
         order.businessProfileId,
         async (tx, tracking) => {
+            // Generate the event timestamp only after acquiring the order lock;
+            // the persisted timeline order therefore matches timestamp order.
+            eventTimestamp = new Date().toISOString();
             const timeline = Array.isArray(tracking.timeline) ? [...tracking.timeline] : [];
             timeline.push({ status, note: note || '', timestamp: eventTimestamp });
 
