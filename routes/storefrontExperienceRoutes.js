@@ -49,10 +49,7 @@ router.get('/me/experience', protect, protectActive, requirePermission('storefro
 
     if (!hasOwnExperience(draftLayout)) {
       blueprint = legacyExperienceFromBusiness(business);
-      await prisma.businessStorefrontLayout.update({
-        where: { id: draft.id },
-        data: { layoutJson: { ...draftLayout, experience: blueprint } },
-      });
+      await updateExperienceSafe(prisma, businessProfileId, blueprint);
     }
 
     res.json({
