@@ -52,6 +52,9 @@ router.patch('/:businessProfileId/enable', wrap(async (req, res) => {
     where: { id: businessProfileId },
     data: { storefrontDisabled: false },
   });
+  // Enabling changes the public renderability state just like disabling does.
+  const renderService = require('../services/storefrontRenderService');
+  await renderService.invalidateCache(businessProfileId);
   res.json({ success: true, message: 'Storefront enabled.' });
 }));
 
