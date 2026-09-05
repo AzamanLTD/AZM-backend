@@ -6,6 +6,27 @@
 // order against a database whose idempotency/inventory guarantees are unknown.
 const router = require('express').Router();
 
+async function findBusiness(prisma, businessProfileId) {
+  if (!prisma?.businessProfile?.findUnique) return null;
+  return prisma.businessProfile.findUnique({
+    where: { id: businessProfileId },
+    select: {
+      storefrontDisabled: true,
+      isSuspended: true,
+      isPausedByOwner: true,
+    },
+  });
+}
+
+function unavailable(res) {
+  return res.status(404).json({
+    success: false,
+    message: 'Storefront not available.',
+  });
+}
+
+// Checkout has an additional production readiness gate, then enforces the same
+// storefront availability boundary as public discovery/rendering.
 router.use('/:businessProfileId/checkout', async (req, res, next) => {
   try {
     if (process.env.NODE_ENV === 'production' && req.app.get('retailCheckoutIntegrityReady') !== true) {
@@ -16,25 +37,9 @@ router.use('/:businessProfileId/checkout', async (req, res, next) => {
       });
     }
 
-    // Administrative storefront disablement is a delivery-boundary decision,
-    // not merely a rendering hint. Reject checkout before the legacy order
-    // creator can accept a request against a storefront that public render and
-    // discovery intentionally treat as unavailable.
-    const prisma = req.app.get('prisma');
-    if (!prisma?.businessProfile?.findUnique) {
-      return next();
-    }
-
-    const business = await prisma.businessProfile.findUnique({
-      where: { id: req.params.businessProfileId },
-      select: { storefrontDisabled: true },
-    });
-
-    if (business?.storefrontDisabled) {
-      return res.status(404).json({
-        success: false,
-        message: 'Storefront not available.',
-      });
+    const business = await findBusiness(req.app.get('prisma'), req.params.businessProfileId);
+    if (business?.storefrontDisabled || business?.isSuspended || business?.isPausedByOwner) {
+      return unavailable(res);
     }
 
     return next();
@@ -42,5 +47,21 @@ router.use('/:businessProfileId/checkout', async (req, res, next) => {
     return next(err);
   }
 });
+
+// Public delivery endpoints must not continue exposing an admin-disabled,
+// suspended, or owner-paused storefront through a previously known URL.
+for (const resource of ['render', 'products', 'theme', 'public-theme']) {
+  router.use(`/:businessProfileId/${resource}`, async (req, res, next) => {
+    try {
+      const business = await findBusiness(req.app.get('prisma'), req.params.businessProfileId);
+      if (!business || business.storefrontDisabled || business.isSuspended || business.isPausedByOwner) {
+        return unavailable(res);
+      }
+      return next();
+    } catch (err) {
+      return next(err);
+    }
+  });
+}
 
 module.exports = router;

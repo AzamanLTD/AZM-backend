@@ -4,18 +4,31 @@ const request = require('supertest');
 const router = require('../routes/storefrontCheckoutReadinessRoutes');
 
 describe('storefront checkout readiness gate', () => {
-  function makeApp(ready, { storefrontDisabled = false } = {}) {
+  function makeApp(ready, {
+    storefrontDisabled = false,
+    isSuspended = false,
+    isPausedByOwner = false,
+  } = {}) {
     const app = express();
     app.set('retailCheckoutIntegrityReady', ready);
     app.set('prisma', {
       businessProfile: {
-        findUnique: jest.fn().mockResolvedValue({ storefrontDisabled }),
+        findUnique: jest.fn().mockResolvedValue({
+          storefrontDisabled,
+          isSuspended,
+          isPausedByOwner,
+        }),
       },
     });
     app.use('/api/storefront', router);
     app.post('/api/storefront/business-1/checkout', (_req, res) => {
       res.status(201).json({ success: true });
     });
+    for (const resource of ['render', 'products', 'theme', 'public-theme']) {
+      app.get(`/api/storefront/business-1/${resource}`, (_req, res) => {
+        res.status(200).json({ success: true });
+      });
+    }
     return app;
   }
 
@@ -66,6 +79,14 @@ describe('storefront checkout readiness gate', () => {
     }
   });
 
+  test('rejects checkout for an owner-paused storefront', async () => {
+    const response = await request(makeApp(true, { isPausedByOwner: true }))
+      .post('/api/storefront/business-1/checkout')
+      .send({ items: [] });
+
+    expect(response.status).toBe(404);
+  });
+
   test('honors storefront disablement outside production too', async () => {
     const previous = process.env.NODE_ENV;
     process.env.NODE_ENV = 'test';
@@ -78,5 +99,32 @@ describe('storefront checkout readiness gate', () => {
     } finally {
       process.env.NODE_ENV = previous;
     }
+  });
+
+  test.each(['/render', '/products', '/theme', '/public-theme'])
+    ('blocks disabled storefronts from public %s access', async (resource) => {
+      const response = await request(makeApp(true, { storefrontDisabled: true }))
+        .get(`/api/storefront/business-1${resource}`);
+
+      expect(response.status).toBe(404);
+      expect(response.body).toEqual({
+        success: false,
+        message: 'Storefront not available.',
+      });
+    });
+
+  test.each(['/render', '/products', '/theme', '/public-theme'])
+    ('blocks paused storefronts from public %s access', async (resource) => {
+      const response = await request(makeApp(true, { isPausedByOwner: true }))
+        .get(`/api/storefront/business-1${resource}`);
+
+      expect(response.status).toBe(404);
+    });
+
+  test('preserves public access for an available storefront', async () => {
+    const response = await request(makeApp(true))
+      .get('/api/storefront/business-1/products');
+
+    expect(response.status).toBe(200);
   });
 });
