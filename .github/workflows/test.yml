@@ -51,6 +51,17 @@ jobs:
           node-version: '24'
           cache: 'npm'
 
+      - name: Refresh lockfile and inspect production audit
+        if: startsWith(github.head_ref, 'chore/security-audit-current-main')
+        run: |
+          npm install --package-lock-only --ignore-scripts
+          echo '--- production dependency audit ---'
+          npm audit --omit=dev --audit-level=low || true
+          echo '--- resolved uuid ---'
+          npm ls uuid --all
+          echo '--- resolved esbuild ---'
+          npm ls esbuild --all || true
+
       - name: Install dependencies
         run: npm ci
 
