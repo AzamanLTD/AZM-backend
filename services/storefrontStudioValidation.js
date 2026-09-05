@@ -13,6 +13,7 @@ const MAX_DEPTH = 12;
 const MAX_CHILDREN = 40;
 const MAX_ACTIONS_PER_NODE = 8;
 const MAX_STRING_LENGTH = 2000;
+const GRID_COLUMNS = 4;
 
 const NODE_TYPES = new Set([
     'page', 'section', 'stack', 'row', 'column', 'grid', 'overlay',
@@ -88,6 +89,76 @@ function validateAction(action, pageIds, nodeIds) {
     return null;
 }
 
+function validateGrid(nodeId, node) {
+    const grid = node.layout?.grid;
+    if (grid == null) return null;
+    if (!isPlainObject(grid)) {
+        throw validationError('STOREFRONT_GRID_INVALID', `Node ${nodeId} grid layout must be an object.`);
+    }
+
+    const fields = ['row', 'col', 'rowSpan', 'colSpan'];
+    for (const field of fields) {
+        if (!Number.isInteger(grid[field])) {
+            throw validationError('STOREFRONT_GRID_INVALID', `Node ${nodeId} grid.${field} must be an integer.`);
+        }
+    }
+
+    if (grid.row < 0 || grid.rowSpan < 1) {
+        throw validationError('STOREFRONT_GRID_INVALID', `Node ${nodeId} grid row geometry is invalid.`);
+    }
+    if (grid.col < 0 || grid.col >= GRID_COLUMNS || grid.colSpan < 1 || grid.col + grid.colSpan > GRID_COLUMNS) {
+        throw validationError('STOREFRONT_GRID_INVALID', `Node ${nodeId} grid column geometry must fit within ${GRID_COLUMNS} columns.`);
+    }
+
+    return grid;
+}
+
+function gridsOverlap(a, b) {
+    return a.col < b.col + b.colSpan &&
+        a.col + a.colSpan > b.col &&
+        a.row < b.row + b.rowSpan &&
+        a.row + a.rowSpan > b.row;
+}
+
+function validateSiblingGeometry(document, ids, ownerLabel) {
+    const positioned = [];
+    for (const id of ids) {
+        const node = document.nodes[id];
+        const grid = validateGrid(id, node);
+        if (!grid) continue;
+        for (const existing of positioned) {
+            if (gridsOverlap(existing.grid, grid)) {
+                throw validationError(
+                    'STOREFRONT_GRID_OVERLAP',
+                    `Nodes ${existing.id} and ${id} overlap within ${ownerLabel}.`,
+                );
+            }
+        }
+        positioned.push({ id, grid });
+    }
+}
+
+function validateSingleParent(document) {
+    const owners = new Map();
+    const recordOwner = (nodeId, owner) => {
+        const previous = owners.get(nodeId);
+        if (previous) {
+            throw validationError(
+                'STOREFRONT_MULTI_PARENT',
+                `Node ${nodeId} is referenced by multiple parents (${previous} and ${owner}).`,
+            );
+        }
+        owners.set(nodeId, owner);
+    };
+
+    for (const page of document.pages) {
+        for (const childId of page.root) recordOwner(childId, `page:${page.id}`);
+    }
+    for (const [nodeId, node] of Object.entries(document.nodes)) {
+        for (const childId of node.children) recordOwner(childId, `node:${nodeId}`);
+    }
+}
+
 function validateStudioDocument(document) {
     if (!isPlainObject(document)) throw validationError('STOREFRONT_DOCUMENT_REQUIRED', 'Studio document must be an object.');
     if (document.schemaVersion !== 2) throw validationError('STOREFRONT_SCHEMA_UNSUPPORTED', 'Studio document schemaVersion must be 2.');
@@ -136,6 +207,10 @@ function validateStudioDocument(document) {
     for (const id of referenced) {
         if (!nodeIds.has(id)) throw validationError('STOREFRONT_DANGLING_REFERENCE', `Unknown child/root node reference: ${id}.`);
     }
+
+    validateSingleParent(document);
+    for (const page of document.pages) validateSiblingGeometry(document, page.root, `page ${page.id}`);
+    for (const [nodeId, node] of nodeEntries) validateSiblingGeometry(document, node.children, `node ${nodeId}`);
 
     const visiting = new Set();
     const visited = new Set();
