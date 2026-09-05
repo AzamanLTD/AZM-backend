@@ -45,7 +45,18 @@ describe('order tracking atomic initialization', () => {
     test('POST tracking status initializes with upsert instead of find-then-create', async () => {
         const tracking = { orderId: 'order-1', businessProfileId: 'biz-1', timeline: [] };
         const updatedTracking = { ...tracking, timeline: [{ status: 'IN_TRANSIT', note: '', timestamp: expect.any(String) }] };
+        const orderTracking = {
+            upsert: jest.fn().mockResolvedValue(tracking),
+            update: jest.fn().mockResolvedValue(updatedTracking),
+            findUnique: jest.fn(),
+            create: jest.fn(),
+        };
+        const tx = {
+            $queryRaw: jest.fn().mockResolvedValue([{ pg_advisory_xact_lock: null }]),
+            orderTracking,
+        };
         const prisma = {
+            $transaction: jest.fn((callback) => callback(tx)),
             businessOrder: {
                 findUnique: jest.fn().mockResolvedValue({
                     businessProfileId: 'biz-1',
@@ -57,12 +68,7 @@ describe('order tracking atomic initialization', () => {
             businessProfile: {
                 findUnique: jest.fn().mockResolvedValue({ ownerId: 11 }),
             },
-            orderTracking: {
-                upsert: jest.fn().mockResolvedValue(tracking),
-                update: jest.fn().mockResolvedValue(updatedTracking),
-                findUnique: jest.fn(),
-                create: jest.fn(),
-            },
+            orderTracking,
         };
         const req = {
             app: { get: jest.fn((key) => key === 'prisma' ? prisma : undefined) },
@@ -74,6 +80,8 @@ describe('order tracking atomic initialization', () => {
 
         await controller.updateStatus(req, res);
 
+        expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+        expect(tx.$queryRaw).toHaveBeenCalledTimes(1);
         expect(prisma.orderTracking.upsert).toHaveBeenCalledWith({
             where: { orderId: 'order-1' },
             create: { orderId: 'order-1', businessProfileId: 'biz-1' },
