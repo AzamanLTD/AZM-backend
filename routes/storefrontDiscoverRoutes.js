@@ -22,6 +22,7 @@ function buildDiscoverWhere(query = {}) {
   const businessProfile = {
     isSuspended: false,
     isPausedByOwner: false,
+    storefrontDisabled: false,
   };
 
   if (category) businessProfile.category = String(category).trim();
