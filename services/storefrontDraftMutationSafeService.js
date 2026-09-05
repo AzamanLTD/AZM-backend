@@ -72,9 +72,28 @@ async function applyTemplateSafe(prisma, businessProfileId, templateId, expected
   );
 }
 
+async function updateExperienceSafe(prisma, businessProfileId, experience, expectedUpdatedAt) {
+  return withDraftMutation(prisma, businessProfileId, expectedUpdatedAt, async (tx) => {
+    const draft = await storefrontService.getOrCreateDraft(tx, businessProfileId);
+    const draftLayout = draft.layoutJson && typeof draft.layoutJson === 'object' ? draft.layoutJson : {};
+
+    return tx.businessStorefrontLayout.update({
+      where: { id: draft.id },
+      data: {
+        layoutJson: {
+          ...draftLayout,
+          experience,
+        },
+      },
+      include: { theme: true },
+    });
+  });
+}
+
 module.exports = {
   parseExpectedUpdatedAt,
   withDraftMutation,
   revertToVersionSafe,
   applyTemplateSafe,
+  updateExperienceSafe,
 };
