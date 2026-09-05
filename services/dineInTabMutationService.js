@@ -38,13 +38,10 @@ const productWhereForTab = (tab, productId) => {
 };
 
 const addItem = async (prisma, { tabId, productId, name, price, quantity, addedBy, io }) => {
-    const priceNum = Number(price);
-    if (!Number.isFinite(priceNum) || priceNum <= 0) throw new Error('price must be positive.');
-
     return prisma.$transaction(async (tx) => {
         const tab = await lockOpenTab(tx, tabId);
         let itemName = name;
-        let authoritativePrice = priceNum;
+        let authoritativePrice = productId ? null : Number(price);
 
         if (productId) {
             const product = await tx.businessProduct.findFirst({
