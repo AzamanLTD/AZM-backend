@@ -73,6 +73,11 @@ function wrap(handler) {
 
 router.use(protect, protectActive);
 
+// Canonical tax-preset authority is mounted before the legacy Business OS
+// router below. The nested router owns its own protected/permission-checked
+// routes and transaction-scopes every default mutation per business.
+router.use(require('./businessTaxPresetCanonicalRoutes'));
+
 router.get('/finance/dashboard', requirePermission('finance.view'), wrap(async (req, res) => {
     const bpId = await getBusinessProfileId(req);
     res.json({ data: mapDashboard(await getLedgerService(req).getDashboardStats(bpId)) });
