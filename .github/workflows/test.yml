@@ -51,6 +51,13 @@ jobs:
           node-version: '24'
           cache: 'npm'
 
+      - name: Refresh lockfile and expose diff for security branch
+        if: startsWith(github.head_ref, 'chore/security-audit-current-main')
+        run: |
+          npm install --package-lock-only --ignore-scripts
+          echo '--- regenerated package-lock diff ---'
+          git diff -- package-lock.json
+
       - name: Install dependencies
         run: npm ci
 
