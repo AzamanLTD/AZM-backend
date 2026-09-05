@@ -150,7 +150,16 @@ describe('Order tracking controller boundaries', () => {
     test('status updates preserve zero-valued delivery coordinates and reuse one event timestamp', async () => {
         const tracking = { timeline: [] };
         const io = { to: jest.fn().mockReturnThis(), emit: jest.fn() };
+        const orderTracking = {
+            upsert: jest.fn().mockResolvedValue(tracking),
+            update: jest.fn().mockImplementation(({ data }) => Promise.resolve({ ...tracking, ...data })),
+        };
+        const tx = {
+            $queryRaw: jest.fn().mockResolvedValue([{ pg_advisory_xact_lock: null }]),
+            orderTracking,
+        };
         const prisma = {
+            $transaction: jest.fn((callback) => callback(tx)),
             businessOrder: {
                 findUnique: jest.fn().mockResolvedValue({
                     businessProfileId: 'biz-1',
@@ -160,10 +169,7 @@ describe('Order tracking controller boundaries', () => {
                 }),
             },
             businessProfile: { findUnique: jest.fn().mockResolvedValue({ ownerId: 'owner-1' }) },
-            orderTracking: {
-                upsert: jest.fn().mockResolvedValue(tracking),
-                update: jest.fn().mockImplementation(({ data }) => Promise.resolve({ ...tracking, ...data })),
-            },
+            orderTracking,
         };
         const req = {
             params: { orderId: 'order-1' },
@@ -179,6 +185,8 @@ describe('Order tracking controller boundaries', () => {
 
         await controller.updateStatus(req, res);
 
+        expect(prisma.$transaction).toHaveBeenCalledTimes(1);
+        expect(tx.$queryRaw).toHaveBeenCalledTimes(1);
         expect(prisma.orderTracking.update).toHaveBeenCalledWith(expect.objectContaining({
             data: expect.objectContaining({ deliveryLatitude: 0, deliveryLongitude: 0 }),
         }));
