@@ -45,6 +45,17 @@ const replayPaymentFromDurableState = (tab) => {
     };
 };
 
+const notifyRecoveredPayment = async (prisma, tab, io) => {
+    await notify(prisma, { io }, {
+        tab,
+        businessProfileId: tab?.businessProfileId,
+    }, 'DINE_IN_TAB_PAID', {
+        tabId: tab?.id,
+        totalAmount: Number(tab?.invoice?.customerPaidUsdc || 0),
+        metadata: { invoiceId: tab?.invoice?.id },
+    });
+};
+
 exports.openTab = async (prisma, opts) => {
     const result = await service(prisma, opts).openTab({ businessProfileId: opts.businessProfileId, azamanId: opts.azamanId || opts.customerAzamanId, locationId: opts.locationId, tableId: opts.tableId });
     await notify(prisma, opts, result, 'DINE_IN_TAB_OPENED');
@@ -125,6 +136,7 @@ exports.confirmAndPay = async (prisma, { tabId, customerId, tipUsdc, io }) => {
             }
         }
         if (recovered.tab.status !== 'CLOSED') throw error;
+        await notifyRecoveredPayment(prisma, recovered.tab, io);
         return recovered;
     }
 };
