@@ -7,6 +7,7 @@ describe('buildDiscoverWhere', () => {
       businessProfile: {
         isSuspended: false,
         isPausedByOwner: false,
+        storefrontDisabled: false,
         category: 'RESTAURANT',
       },
     });
@@ -18,6 +19,7 @@ describe('buildDiscoverWhere', () => {
       businessProfile: {
         isSuspended: false,
         isPausedByOwner: false,
+        storefrontDisabled: false,
         category: 'RETAIL',
         businessName: {
           contains: 'Acme',
