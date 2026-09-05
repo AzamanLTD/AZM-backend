@@ -48,10 +48,9 @@ router.use('/:businessProfileId/checkout', async (req, res, next) => {
   }
 });
 
-// Products and public theme endpoints are part of the public delivery surface.
-// They must not continue exposing an admin-disabled, suspended, or owner-paused
-// storefront through a previously known business URL.
-for (const resource of ['products', 'theme', 'public-theme']) {
+// Public delivery endpoints must not continue exposing an admin-disabled,
+// suspended, or owner-paused storefront through a previously known URL.
+for (const resource of ['render', 'products', 'theme', 'public-theme']) {
   router.use(`/:businessProfileId/${resource}`, async (req, res, next) => {
     try {
       const business = await findBusiness(req.app.get('prisma'), req.params.businessProfileId);
