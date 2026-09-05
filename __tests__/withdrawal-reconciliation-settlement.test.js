@@ -21,6 +21,7 @@ describe('WithdrawalReconciliationWorker settlement lifecycle', () => {
 
   const attemptDb = (transactionHistoryId = 'tx-1') => ({
     $queryRawUnsafe: jest.fn().mockResolvedValue([{
+      id: transactionHistoryId,
       transactionHistoryId,
       provider: 'MTN_MOMO_DISBURSEMENT',
       providerReference: transactionHistoryId === 'tx-2' ? 'ref-2' : 'ref-1',
