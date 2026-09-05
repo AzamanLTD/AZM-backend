@@ -71,7 +71,7 @@ describe('PosOrderService atomic settlement', () => {
                     taxLines: [{ name: 'POS Tax', type: 'PERCENTAGE', value: 2.5, computedAmount: 1 }],
                 }),
             }),
-        });
+        }));
     });
 
     test('uses transaction-time catalog state for availability and pricing', async () => {
