@@ -54,6 +54,9 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Audit production dependencies
+        run: npm audit --omit=dev --audit-level=low
+
       - name: Apply database schema
         # CI uses a disposable PostgreSQL instance. Production remains managed
         # by the repository's established db-push release process.
