@@ -12,9 +12,16 @@ const {
     deleteTaxPreset,
 } = require('../services/businessTaxPresetService');
 
-function getBusinessProfileId(req) {
+async function getBusinessProfileId(req) {
+    if (!req.user?.id) return null;
     if (req.businessProfileId) return req.businessProfileId;
-    return req.user?.businessProfileId || null;
+    if (req.user.businessProfileId) return req.user.businessProfileId;
+
+    const profile = await req.app.get('prisma').businessProfile.findFirst({
+        where: { userId: req.user.id },
+        select: { id: true },
+    });
+    return profile?.id || null;
 }
 
 function wrap(handler) {
@@ -37,25 +44,25 @@ function wrap(handler) {
 router.use(protect, protectActive);
 
 router.get('/tax-presets', wrap(async (req, res) => {
-    const bpId = getBusinessProfileId(req);
+    const bpId = await getBusinessProfileId(req);
     const presets = await listTaxPresets(req.app.get('prisma'), bpId);
     res.json({ success: true, presets });
 }));
 
 router.post('/tax-presets', requirePermission('settings.manage'), wrap(async (req, res) => {
-    const bpId = getBusinessProfileId(req);
+    const bpId = await getBusinessProfileId(req);
     const preset = await createTaxPreset(req.app.get('prisma'), bpId, req.body || {});
     res.status(201).json({ success: true, preset });
 }));
 
 router.patch('/tax-presets/:id', requirePermission('settings.manage'), wrap(async (req, res) => {
-    const bpId = getBusinessProfileId(req);
+    const bpId = await getBusinessProfileId(req);
     const preset = await updateTaxPreset(req.app.get('prisma'), bpId, req.params.id, req.body || {});
     res.json({ success: true, preset });
 }));
 
 router.delete('/tax-presets/:id', requirePermission('settings.manage'), wrap(async (req, res) => {
-    const bpId = getBusinessProfileId(req);
+    const bpId = await getBusinessProfileId(req);
     await deleteTaxPreset(req.app.get('prisma'), bpId, req.params.id);
     res.json({ success: true, message: 'Tax preset deleted.' });
 }));
