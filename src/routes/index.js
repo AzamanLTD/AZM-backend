@@ -23,6 +23,10 @@ function mountRoutes(app, {
     app.use('/api/public', generalLimiter, require('../../routes/publicRoutes'));
     const { adminBusinessScope } = require('../../middleware/adminBusinessScope');
     app.use(adminBusinessScope);
+    // Compatibility replacement for /admin/stats with complete volume fields.
+    // Mounted before the legacy admin router so existing clients immediately
+    // receive fiatVolume24h/cryptoVolume24h without a breaking URL change.
+    app.use('/api/admin', generalLimiter, require('../../routes/adminStatsRoutes'));
     app.use('/api/auth', authLimiter, require('../../routes/authRoutes'));
     app.use('/api/trades', financialLimiter, require('../../routes/tradeRoutes'));
     app.use('/api/ads', generalLimiter, require('../../routes/adRoutes'));
