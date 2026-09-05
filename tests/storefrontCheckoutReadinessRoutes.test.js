@@ -24,15 +24,11 @@ describe('storefront checkout readiness gate', () => {
     app.post('/api/storefront/business-1/checkout', (_req, res) => {
       res.status(201).json({ success: true });
     });
-    app.get('/api/storefront/business-1/products', (_req, res) => {
-      res.status(200).json({ success: true });
-    });
-    app.get('/api/storefront/business-1/theme', (_req, res) => {
-      res.status(200).json({ success: true });
-    });
-    app.get('/api/storefront/business-1/public-theme', (_req, res) => {
-      res.status(200).json({ success: true });
-    });
+    for (const resource of ['render', 'products', 'theme', 'public-theme']) {
+      app.get(`/api/storefront/business-1/${resource}`, (_req, res) => {
+        res.status(200).json({ success: true });
+      });
+    }
     return app;
   }
 
@@ -83,6 +79,14 @@ describe('storefront checkout readiness gate', () => {
     }
   });
 
+  test('rejects checkout for an owner-paused storefront', async () => {
+    const response = await request(makeApp(true, { isPausedByOwner: true }))
+      .post('/api/storefront/business-1/checkout')
+      .send({ items: [] });
+
+    expect(response.status).toBe(404);
+  });
+
   test('honors storefront disablement outside production too', async () => {
     const previous = process.env.NODE_ENV;
     process.env.NODE_ENV = 'test';
@@ -97,7 +101,7 @@ describe('storefront checkout readiness gate', () => {
     }
   });
 
-  test.each(['/products', '/theme', '/public-theme'])
+  test.each(['/render', '/products', '/theme', '/public-theme'])
     ('blocks disabled storefronts from public %s access', async (resource) => {
       const response = await request(makeApp(true, { storefrontDisabled: true }))
         .get(`/api/storefront/business-1${resource}`);
@@ -109,7 +113,7 @@ describe('storefront checkout readiness gate', () => {
       });
     });
 
-  test.each(['/products', '/theme', '/public-theme'])
+  test.each(['/render', '/products', '/theme', '/public-theme'])
     ('blocks paused storefronts from public %s access', async (resource) => {
       const response = await request(makeApp(true, { isPausedByOwner: true }))
         .get(`/api/storefront/business-1${resource}`);
