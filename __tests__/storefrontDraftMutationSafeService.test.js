@@ -5,10 +5,12 @@ const {
   withDraftMutation,
   revertToVersionSafe,
   applyTemplateSafe,
+  updateExperienceSafe,
 } = require('../services/storefrontDraftMutationSafeService');
 const storefrontService = require('../services/storefrontService');
 
 jest.mock('../services/storefrontService', () => ({
+  getOrCreateDraft: jest.fn(),
   revertToVersion: jest.fn().mockResolvedValue({ id: 'draft-1' }),
   applyTemplate: jest.fn().mockResolvedValue({ id: 'draft-2' }),
 }));
@@ -19,6 +21,7 @@ describe('storefrontDraftMutationSafeService', () => {
       $queryRaw: jest.fn().mockResolvedValue([]),
       businessStorefrontLayout: {
         findUnique: jest.fn().mockResolvedValue(draft),
+        update: jest.fn().mockResolvedValue({ id: 'draft-1', layoutJson: {} }),
       },
     };
     return {
@@ -81,5 +84,32 @@ describe('storefrontDraftMutationSafeService', () => {
 
     expect(storefrontService.revertToVersion).toHaveBeenCalledWith(tx, 'biz-1', 'version-1');
     expect(storefrontService.applyTemplate).toHaveBeenCalledWith(tx, 'biz-1', 'template-1');
+  });
+
+  test('updates the experience inside the same transaction and preserves the rest of the layout', async () => {
+    const updatedAt = new Date('2026-09-05T00:00:00.000Z');
+    const existingLayout = { tiles: [{ id: 'tile-1' }], experience: { old: true } };
+    const { prisma, tx } = makePrisma({ id: 'draft-1', updatedAt });
+    storefrontService.getOrCreateDraft.mockResolvedValue({ id: 'draft-1', layoutJson: existingLayout });
+
+    await updateExperienceSafe(
+      prisma,
+      'biz-1',
+      { schemaVersion: 2, categoryOptions: { selectedCategory: 'FOOD' } },
+      updatedAt.toISOString(),
+    );
+
+    expect(storefrontService.getOrCreateDraft).toHaveBeenCalledWith(tx, 'biz-1');
+    expect(tx.businessStorefrontLayout.update).toHaveBeenCalledWith(expect.objectContaining({
+      where: { id: 'draft-1' },
+      data: {
+        layoutJson: {
+          ...existingLayout,
+          experience: { schemaVersion: 2, categoryOptions: { selectedCategory: 'FOOD' } },
+        },
+      },
+      include: { theme: true },
+    }));
+    expect(tx.$queryRaw).toHaveBeenCalledTimes(1);
   });
 });
