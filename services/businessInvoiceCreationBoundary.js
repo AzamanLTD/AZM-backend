@@ -14,6 +14,16 @@ function normalizeIdempotencyKey(value) {
   return key;
 }
 
+function normalizeTaxIntent(taxLines) {
+  if (taxLines === undefined) return null; // undefined means "use current business default"
+  if (!Array.isArray(taxLines)) return [];
+  return taxLines.map((tax) => ({
+    name: String(tax.name || '').trim(),
+    type: String(tax.type || '').toUpperCase(),
+    value: Number(tax.value),
+  }));
+}
+
 function assertReplayBelongsToIntent(invoice, args) {
   if (!invoice || !args?.idempotencyKey) return;
 
@@ -39,6 +49,16 @@ function assertReplayBelongsToIntent(invoice, args) {
 
   const requestedNote = args.businessNote ? String(args.businessNote).slice(0, 500) : null;
   if ((invoice.businessNote || null) !== requestedNote) mismatches.push('businessNote');
+
+  const requestedTax = normalizeTaxIntent(args.taxLines);
+  if (requestedTax !== null) {
+    const storedTax = (invoice.taxLines || []).map((tax) => ({
+      name: String(tax.name || '').trim(),
+      type: String(tax.type || '').toUpperCase(),
+      value: Number(tax.value),
+    }));
+    if (JSON.stringify(storedTax) !== JSON.stringify(requestedTax)) mismatches.push('taxLines');
+  }
 
   if (mismatches.length) {
     throw Object.assign(
@@ -91,8 +111,6 @@ async function createInvoice(prisma, args = {}) {
     const invoice = await invoiceService.createInvoice(prisma, effectiveArgs);
     return { invoice, replayed: false };
   } catch (error) {
-    // The unique database constraint is the race winner. Never assume every
-    // P2002 is this key: invoiceRef has its own uniqueness guarantee.
     if (!isIdempotencyUniqueViolation(error)) throw error;
 
     const replay = await findReplay(prisma, normalizedKey);
