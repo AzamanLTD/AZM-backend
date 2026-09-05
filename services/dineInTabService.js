@@ -1,6 +1,11 @@
 // Adapter: bridges dineInController to DineInService class
 const DineInService = require('./marketplace/dineInService');
 const { notifyDineInEvent } = require('./bizNotificationService');
+const {
+    addItem: addItemAtomically,
+    addCustomerItem: addCustomerItemAtomically,
+    removeItem: removeItemAtomically,
+} = require('./dineInTabMutationService');
 
 const service = (prisma, opts = {}) => new DineInService(prisma, opts.io);
 
@@ -46,9 +51,25 @@ exports.openTab = async (prisma, opts) => {
     return result;
 };
 
-exports.addItem = async (prisma, opts) => service(prisma, opts).addItem({ tabId: opts.tabId, productId: opts.productId, name: opts.name, price: opts.price ?? opts.unitPriceUsdc, quantity: normalizeQuantity(opts.quantity), notes: opts.notes, addedBy: opts.addedBy ?? opts.userId });
+exports.addItem = async (prisma, opts) => addItemAtomically(prisma, {
+    tabId: opts.tabId,
+    productId: opts.productId,
+    name: opts.name,
+    price: opts.price ?? opts.unitPriceUsdc,
+    quantity: normalizeQuantity(opts.quantity),
+    notes: opts.notes,
+    addedBy: opts.addedBy ?? opts.userId,
+    io: opts.io,
+});
 
-exports.addCustomerItem = async (prisma, opts) => service(prisma, opts).addCustomerItem({ tabId: opts.tabId, customerId: opts.customerId ?? opts.userId, productId: opts.productId, selection: opts.selection, quantity: normalizeQuantity(opts.quantity) });
+exports.addCustomerItem = async (prisma, opts) => addCustomerItemAtomically(prisma, {
+    tabId: opts.tabId,
+    customerId: opts.customerId ?? opts.userId,
+    productId: opts.productId,
+    selection: opts.selection,
+    quantity: normalizeQuantity(opts.quantity),
+    io: opts.io,
+});
 
 exports.finalizeTab = async (prisma, opts) => {
     const result = await service(prisma, opts).finalizeTab(opts.tabId);
@@ -89,10 +110,6 @@ exports.confirmAndPay = async (prisma, { tabId, customerId, tipUsdc, io }) => {
         }
         return result;
     } catch (error) {
-        // A concurrent request may successfully commit the payment and close
-        // the tab before this request reaches the compare-and-set close step.
-        // Recover only from durable proof of the same tab's PAID invoice so a
-        // financial success is never surfaced as a false failure.
         if (typeof svc.getTab !== 'function') throw error;
         const recovered = replayPaymentFromDurableState(await svc.getTab(tabId));
         if (!recovered || recovered.tab.customerId !== customerId) throw error;
@@ -114,3 +131,11 @@ exports.confirmAndPay = async (prisma, { tabId, customerId, tipUsdc, io }) => {
 
 exports.cancelTab = async (prisma, opts) => service(prisma, opts).cancelTab(opts.tabId);
 exports.reportDefault = exports.cancelTab;
+
+// Kept as an internal adapter export for callers that historically invoked item
+// removal through the service module; the HTTP business route currently does
+// not expose it, but any future mutation must use the same row-lock boundary.
+exports.removeItem = async (prisma, opts) => removeItemAtomically(prisma, {
+    tabId: opts.tabId,
+    itemId: opts.itemId,
+});

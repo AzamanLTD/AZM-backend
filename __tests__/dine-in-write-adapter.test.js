@@ -25,14 +25,17 @@ describe('dine-in tab service adapter', () => {
     });
   });
 
-  test('maps item price and actor fields to addItem', async () => {
+  test('maps item price and actor fields to atomic addItem', async () => {
     const addItem = jest.fn().mockResolvedValue({ id: 'item-1' });
     jest.doMock('../services/marketplace/dineInService', () =>
       jest.fn().mockImplementation(() => ({ addItem })),
     );
+    jest.doMock('../services/dineInTabMutationService', () => ({ addItem }));
 
     const adapter = require('../services/dineInTabService');
-    await adapter.addItem({}, {
+    const prisma = { marker: 'prisma' };
+    const io = { marker: 'io' };
+    await adapter.addItem(prisma, {
       tabId: 'tab-1',
       productId: 'product-1',
       name: 'Jollof rice',
@@ -40,16 +43,18 @@ describe('dine-in tab service adapter', () => {
       quantity: 2,
       notes: 'No pepper',
       userId: 42,
+      io,
     });
 
-    expect(addItem).toHaveBeenCalledWith({
+    expect(addItem).toHaveBeenCalledWith(prisma, {
       tabId: 'tab-1',
       productId: 'product-1',
       name: 'Jollof rice',
       price: '12.50',
       quantity: 2,
-      notes: 'No pepper',
       addedBy: 42,
+      io,
+      notes: 'No pepper',
     });
   });
 
@@ -76,20 +81,25 @@ describe('dine-in tab service adapter', () => {
     jest.doMock('../services/marketplace/dineInService', () =>
       jest.fn().mockImplementation(() => ({ addCustomerItem })),
     );
+    jest.doMock('../services/dineInTabMutationService', () => ({ addCustomerItem }));
 
     const adapter = require('../services/dineInTabService');
-    await adapter.addCustomerItem({}, {
+    const prisma = { marker: 'prisma' };
+    const io = { marker: 'io' };
+    await adapter.addCustomerItem(prisma, {
       tabId: 'tab-1',
       customerId: 42,
       productId: 'product-1',
+      io,
     });
 
-    expect(addCustomerItem).toHaveBeenCalledWith({
+    expect(addCustomerItem).toHaveBeenCalledWith(prisma, {
       tabId: 'tab-1',
       customerId: 42,
       productId: 'product-1',
       selection: undefined,
       quantity: 1,
+      io,
     });
   });
 
