@@ -23,6 +23,9 @@ function mountRoutes(app, {
     app.use('/api/public', generalLimiter, require('../../routes/publicRoutes'));
     const { adminBusinessScope } = require('../../middleware/adminBusinessScope');
     app.use(adminBusinessScope);
+    // Compatibility replacement for /admin/stats with complete volume fields.
+    // Mounted before the legacy admin router so existing clients immediately
+    // receive fiatVolume24h/cryptoVolume24h without a breaking URL change.
     app.use('/api/admin', generalLimiter, require('../../routes/adminStatsRoutes'));
     app.use('/api/auth', authLimiter, require('../../routes/authRoutes'));
     app.use('/api/trades', financialLimiter, require('../../routes/tradeRoutes'));
@@ -112,6 +115,8 @@ function mountRoutes(app, {
     app.use('/api/admin/control-plane', generalLimiter, require('../../routes/adminReconciliationRoutes'));
 
     app.use('/api/marketplace', generalLimiter, require('../../routes/marketplaceRoutes'));
+    // Canonical scoped Business OS financial/operational mutation handlers are
+    // mounted before the legacy monolithic router during the cleanup migration.
     app.use('/api/business-os', financialLimiter, require('../../routes/businessOSFinanceRoutes'));
     app.use('/api/business-os', generalLimiter, require('../../routes/businessOSInventoryRoutes'));
     app.use('/api/business-os', financialLimiter, require('../../routes/businessOSPosRoutes'));
