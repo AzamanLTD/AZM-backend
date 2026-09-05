@@ -2,14 +2,14 @@ name: Azaman Test Suite
 
 on:
   push:
-    branches: [main, develop, chore/security-audit-current-main]
+    branches: [main, develop]
   pull_request:
     branches: [main]
   merge_group:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: backend-test-${{ github.workflow }}-${{ github.ref }}
@@ -51,22 +51,11 @@ jobs:
           node-version: '24'
           cache: 'npm'
 
-      - name: Regenerate and commit security lockfile
-        if: github.ref_name == 'chore/security-audit-current-main' && github.event_name == 'push'
-        run: |
-          npm install --package-lock-only --ignore-scripts
-          if git diff --quiet -- package-lock.json; then
-            echo 'package-lock.json already matches package.json'
-          else
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add package-lock.json
-            git commit -m "chore(security): regenerate npm lockfile"
-            git push origin HEAD:chore/security-audit-current-main
-          fi
-
       - name: Install dependencies
         run: npm ci
+
+      - name: Audit production dependencies
+        run: npm audit --omit=dev --audit-level=low
 
       - name: Apply database schema
         # CI uses a disposable PostgreSQL instance. Production remains managed
