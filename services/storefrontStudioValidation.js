@@ -14,6 +14,7 @@ const MAX_CHILDREN = 40;
 const MAX_ACTIONS_PER_NODE = 8;
 const MAX_STRING_LENGTH = 2000;
 const GRID_COLUMNS = 4;
+const RESPONSIVE_VIEWPORTS = ['phone', 'tablet', 'desktop'];
 
 const NODE_TYPES = new Set([
     'page', 'section', 'stack', 'row', 'column', 'grid', 'overlay',
@@ -89,25 +90,63 @@ function validateAction(action, pageIds, nodeIds) {
     return null;
 }
 
-function validateGrid(nodeId, node) {
-    const grid = node.layout?.grid;
+function applyResponsiveLayoutOverride(layout, rawOverride) {
+    if (!isPlainObject(rawOverride) || !isPlainObject(rawOverride.layout)) return layout;
+    return {
+        ...(isPlainObject(layout) ? layout : {}),
+        ...rawOverride.layout,
+    };
+}
+
+function resolveResponsiveLayout(node, viewport) {
+    let layout = node.layout;
+    const responsive = node.responsive;
+    if (!isPlainObject(responsive)) return layout;
+
+    if (viewport === 'phone') {
+        return applyResponsiveLayoutOverride(layout, responsive.phone);
+    }
+
+    if (viewport === 'tablet') {
+        layout = applyResponsiveLayoutOverride(layout, responsive.phone);
+        return applyResponsiveLayoutOverride(layout, responsive.tablet);
+    }
+
+    // Match the browser resolver's backward-compatible desktop cascade: a
+    // desktop-only document resolves from base + desktop, while the presence
+    // of a tablet layer makes desktop inherit phone + tablet before desktop.
+    if (isPlainObject(responsive.tablet)) {
+        layout = applyResponsiveLayoutOverride(layout, responsive.phone);
+        layout = applyResponsiveLayoutOverride(layout, responsive.tablet);
+    }
+    return applyResponsiveLayoutOverride(layout, responsive.desktop);
+}
+
+function gridForViewport(node, viewport = null) {
+    const layout = viewport ? resolveResponsiveLayout(node, viewport) : node.layout;
+    return isPlainObject(layout) ? layout.grid : undefined;
+}
+
+function validateGrid(nodeId, node, viewport = null) {
+    const grid = gridForViewport(node, viewport);
     if (grid == null) return null;
+    const context = viewport ? ` at ${viewport} viewport` : '';
     if (!isPlainObject(grid)) {
-        throw validationError('STOREFRONT_GRID_INVALID', `Node ${nodeId} grid layout must be an object.`);
+        throw validationError('STOREFRONT_GRID_INVALID', `Node ${nodeId} grid layout${context} must be an object.`);
     }
 
     const fields = ['row', 'col', 'rowSpan', 'colSpan'];
     for (const field of fields) {
         if (!Number.isInteger(grid[field])) {
-            throw validationError('STOREFRONT_GRID_INVALID', `Node ${nodeId} grid.${field} must be an integer.`);
+            throw validationError('STOREFRONT_GRID_INVALID', `Node ${nodeId} grid.${field}${context} must be an integer.`);
         }
     }
 
     if (grid.row < 0 || grid.rowSpan < 1) {
-        throw validationError('STOREFRONT_GRID_INVALID', `Node ${nodeId} grid row geometry is invalid.`);
+        throw validationError('STOREFRONT_GRID_INVALID', `Node ${nodeId} grid row geometry${context} is invalid.`);
     }
     if (grid.col < 0 || grid.col >= GRID_COLUMNS || grid.colSpan < 1 || grid.col + grid.colSpan > GRID_COLUMNS) {
-        throw validationError('STOREFRONT_GRID_INVALID', `Node ${nodeId} grid column geometry must fit within ${GRID_COLUMNS} columns.`);
+        throw validationError('STOREFRONT_GRID_INVALID', `Node ${nodeId} grid column geometry${context} must fit within ${GRID_COLUMNS} columns.`);
     }
 
     return grid;
@@ -120,17 +159,18 @@ function gridsOverlap(a, b) {
         a.row + a.rowSpan > b.row;
 }
 
-function validateSiblingGeometry(document, ids, ownerLabel) {
+function validateSiblingGeometry(document, ids, ownerLabel, viewport = null) {
     const positioned = [];
     for (const id of ids) {
         const node = document.nodes[id];
-        const grid = validateGrid(id, node);
+        const grid = gridForViewport(node, viewport);
         if (!grid) continue;
         for (const existing of positioned) {
             if (gridsOverlap(existing.grid, grid)) {
+                const context = viewport ? ` at ${viewport} viewport` : '';
                 throw validationError(
                     'STOREFRONT_GRID_OVERLAP',
-                    `Nodes ${existing.id} and ${id} overlap within ${ownerLabel}.`,
+                    `Nodes ${existing.id} and ${id} overlap within ${ownerLabel}${context}.`,
                 );
             }
         }
@@ -201,6 +241,8 @@ function validateStudioDocument(document) {
         walkSafeObject(node.style, `nodes.${nodeId}.style`);
         walkSafeObject(node.layout, `nodes.${nodeId}.layout`);
         walkSafeObject(node.responsive, `nodes.${nodeId}.responsive`);
+        validateGrid(nodeId, node);
+        for (const viewport of RESPONSIVE_VIEWPORTS) validateGrid(nodeId, node, viewport);
         if (node.children.includes(nodeId)) throw validationError('STOREFRONT_TREE_CYCLE', `Studio tree contains a cycle: node ${nodeId} cannot contain itself.`);
     }
 
@@ -209,8 +251,14 @@ function validateStudioDocument(document) {
     }
 
     validateSingleParent(document);
-    for (const page of document.pages) validateSiblingGeometry(document, page.root, `page ${page.id}`);
-    for (const [nodeId, node] of nodeEntries) validateSiblingGeometry(document, node.children, `node ${nodeId}`);
+    for (const page of document.pages) {
+        validateSiblingGeometry(document, page.root, `page ${page.id}`);
+        for (const viewport of RESPONSIVE_VIEWPORTS) validateSiblingGeometry(document, page.root, `page ${page.id}`, viewport);
+    }
+    for (const [nodeId, node] of nodeEntries) {
+        validateSiblingGeometry(document, node.children, `node ${nodeId}`);
+        for (const viewport of RESPONSIVE_VIEWPORTS) validateSiblingGeometry(document, node.children, `node ${nodeId}`, viewport);
+    }
 
     const visiting = new Set();
     const visited = new Set();
