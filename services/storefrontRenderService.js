@@ -9,7 +9,7 @@ const experienceBlueprintService = require('./experienceBlueprintService');
 // Redis cache for rendered layouts (falls back to in-memory if Redis unavailable)
 let redisClient = null;
 const memoryCache = new Map();
-const CACHE_TTL = 200; // seconds (200ms target for GET /render)
+const CACHE_TTL = 200; // seconds
 
 try {
   const Redis = require('ioredis');
@@ -18,7 +18,6 @@ try {
     redisClient = new Redis(process.env.REDIS_URL, {
       maxRetriesPerRequest: 2,
       tls: isTLS ? { rejectUnauthorized: false } : undefined,
-      lazyConnect: true,
       retryStrategy: (times) => (times > 3 ? null : Math.min(times * 200, 1000)),
     });
     redisClient.on('error', (e) => logger.warn('[StorefrontRender] Redis cache error:', e.message));
@@ -28,12 +27,16 @@ try {
   logger.warn('[StorefrontRender] Redis not available, using in-memory cache');
 }
 
+function isRedisReady(client) {
+  return client?.status === 'ready' || client?.status === 'connect';
+}
+
 function getCacheKey(businessProfileId) {
   return `storefront:render:${businessProfileId}`;
 }
 
 async function getCached(key) {
-  if (redisClient && redisClient.status === 'connect') {
+  if (isRedisReady(redisClient)) {
     try {
       const cached = await redisClient.get(key);
       if (cached) return JSON.parse(cached);
@@ -49,7 +52,7 @@ async function getCached(key) {
 }
 
 async function setCached(key, value, ttl) {
-  if (redisClient && redisClient.status === 'connect') {
+  if (isRedisReady(redisClient)) {
     try {
       await redisClient.setex(key, ttl, JSON.stringify(value));
     } catch (e) { /* fall through */ }
@@ -67,7 +70,7 @@ async function setCached(key, value, ttl) {
 
 async function invalidateCache(businessProfileId) {
   const key = getCacheKey(businessProfileId);
-  if (redisClient && redisClient.status === 'connect') {
+  if (isRedisReady(redisClient)) {
     try { await redisClient.del(key); } catch (e) { /* ignore */ }
   }
   memoryCache.delete(key);
@@ -253,4 +256,5 @@ module.exports = {
   getPublicTheme,
   invalidateCache,
   _escrowProtectionAvailable,
+  isRedisReady,
 };
