@@ -127,6 +127,8 @@ function mountRoutes(app, {
     app.use('/api/storefront', generalLimiter, require('../../routes/storefrontCheckoutReadinessRoutes'));
     app.use('/api/storefront', generalLimiter, require('../../routes/storefrontCheckoutIntegrityRoutes'));
     app.use('/api/storefront', generalLimiter, require('../../routes/storefrontExperienceRoutes'));
+    // CAS-protected draft saves must precede the legacy draft handler.
+    app.use('/api/storefront', generalLimiter, require('../../routes/storefrontSaveDraftSafeRoutes'));
     // CAS-protected draft mutations must precede the legacy handlers at the same paths.
     app.use('/api/storefront', generalLimiter, require('../../routes/storefrontDraftMutationRoutes'));
     app.use('/api/storefront', generalLimiter, require('../../routes/storefrontRoutes'));
