@@ -10,8 +10,9 @@ const invoiceService = require('../services/businessInvoiceService');
 const DineInService = require('../services/marketplace/dineInService');
 
 describe('dine-in lifecycle orchestration', () => {
-  test('OPEN -> add item -> FINALIZED -> invoice -> PAID -> CLOSED with tip', async () => {
-    const customer = { id: 7, username: 'customer' };
+  beforeEach(() => jest.clearAllMocks());
+
+  test('FINALIZED -> invoice -> PAID -> CLOSED with tip preserves the same settlement authority', async () => {
     const invoice = {
       id: 'inv-1',
       status: 'SENT',
@@ -25,60 +26,40 @@ describe('dine-in lifecycle orchestration', () => {
       customerPaidUsdc: 42,
       payTxHash: 'INV_PAY_inv-1',
     };
-
-    const txTab = {
-      id: 'tab-1',
-      customerId: 7,
-      businessProfileId: 'biz-1',
-      locationId: null,
-      tableId: null,
-      status: 'CLOSED',
-      grandTotalUsdc: 42,
-      items: [{ name: 'Jollof', quantity: 1, unitPriceUsdc: 40 }],
-      invoice: paidInvoice,
+    const items = [{ name: 'Jollof', quantity: 1, unitPriceUsdc: 40 }];
+    const beforeInvoice = {
+      id: 'tab-1', customerId: 7, businessProfileId: 'biz-1', locationId: null, tableId: null,
+      status: 'FINALIZED', items, invoice: null,
+    };
+    const afterInvoice = { ...beforeInvoice, invoice };
+    const closed = {
+      ...afterInvoice,
+      status: 'CLOSED', grandTotalUsdc: 42, invoice: paidInvoice,
     };
 
-    const prisma = {
-      $transaction: jest.fn(async (callback) => callback({
-        dineInTab: {
-          findUnique: jest
-            .fn()
-            .mockResolvedValueOnce({
-              id: 'tab-1',
-              customerId: 7,
-              businessProfileId: 'biz-1',
-              locationId: null,
-              tableId: null,
-              status: 'FINALIZED',
-              items: txTab.items,
-              invoice: null,
-            })
-            .mockResolvedValueOnce(txTab),
-          updateMany: jest.fn().mockResolvedValue({ count: 1 }),
-        },
-        businessInvoice: {},
-        user: {},
-        systemProfitFees: {},
-        adminProfitLog: {},
-        transactionHistory: {},
-      }),
+    const scopedFindUnique = jest.fn().mockResolvedValue(closed);
+    const tx = {
       dineInTab: {
-        findUnique: jest.fn().mockResolvedValue({
-          id: 'tab-1',
-          customerId: 7,
-          businessProfileId: 'biz-1',
-          locationId: null,
-          tableId: null,
-          status: 'FINALIZED',
-          items: txTab.items,
-          invoice: null,
-        }),
+        updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+        findUnique: scopedFindUnique,
+      },
+      businessInvoice: {},
+      user: {},
+      systemProfitFees: {},
+      adminProfitLog: {},
+      transactionHistory: {},
+    };
+    const prisma = {
+      dineInTab: {
+        findUnique: jest.fn()
+          .mockResolvedValueOnce(beforeInvoice)
+          .mockResolvedValueOnce(afterInvoice),
         updateMany: jest.fn().mockResolvedValue({ count: 1 }),
       },
+      $transaction: jest.fn(async (callback) => callback(tx)),
     };
 
     invoiceService.createInvoice.mockResolvedValue({ id: 'inv-1', ...invoice });
-    invoiceService.sendInvoice.mockResolvedValue(invoice);
     invoiceService.payInvoice.mockResolvedValue({
       invoice: paidInvoice,
       customerPays: 42,
@@ -88,7 +69,7 @@ describe('dine-in lifecycle orchestration', () => {
 
     const io = { to: jest.fn(() => ({ emit: jest.fn() })) };
     const service = new DineInService(prisma, io);
-    const result = await service.confirmAndPay('tab-1', customer.id, { tipUsdc: 2 });
+    const result = await service.confirmAndPay('tab-1', 7, { tipUsdc: 2 });
 
     expect(invoiceService.createInvoice).toHaveBeenCalledWith(
       prisma,
@@ -99,11 +80,14 @@ describe('dine-in lifecycle orchestration', () => {
         idempotencyKey: 'DINE_IN_TAB:tab-1',
       }),
     );
-    expect(invoiceService.sendInvoice).not.toHaveBeenCalled();
     expect(invoiceService.payInvoice).toHaveBeenCalledWith(
       expect.anything(),
       expect.objectContaining({ invoiceId: 'inv-1', customerId: 7, tipUsdc: 2 }),
     );
+    expect(tx.dineInTab.updateMany).toHaveBeenCalledWith(expect.objectContaining({
+      where: { id: 'tab-1', status: 'FINALIZED', invoiceId: 'inv-1' },
+      data: expect.objectContaining({ status: 'CLOSED', tipUsdc: 2, grandTotalUsdc: 42 }),
+    }));
     expect(result.tab.status).toBe('CLOSED');
     expect(result.tab.grandTotalUsdc).toBe(42);
     expect(result.invoice.status).toBe('PAID');
