@@ -308,6 +308,33 @@ if (!hasDb) console.warn('[admin-control-plane-integrity.test] TEST_DATABASE_URL
     prisma = new PrismaClient();
     await prisma.$connect();
 
+    // The CI test DB is provisioned with `prisma db push`, which only creates
+    // tables that exist as models in schema.prisma. The control-plane tables
+    // (StaffProfile, ControlPermission, ...) are created in production by the
+    // 20260828040000_control_plane_staff_access migration, whose DDL is not
+    // part of schema.prisma. Apply that migration file directly — idempotently
+    // (tolerating already-exists / duplicate-seed errors) — so this suite runs
+    // against the real control-plane schema, exactly as production has it.
+    const fs = require('fs');
+    const path = require('path');
+    const ddl = fs.readFileSync(
+      path.join(__dirname, '..', 'prisma', 'migrations', '20260828040000_control_plane_staff_access', 'migration.sql'),
+      'utf8',
+    );
+    const tolerable = new Set(['42P07', '42710', '42P06', '42701', '23505', '42P16']);
+    const statements = ddl
+      .replace(/^\s*--.*$/gm, '') // strip comment-only lines
+      .split(/;\s*(?:\n|$)/)
+      .map((st) => st.trim())
+      .filter(Boolean);
+    for (const st of statements) {
+      try {
+        await prisma.$executeRawUnsafe(st);
+      } catch (e) {
+        if (!tolerable.has(e.code)) throw e; // already created / re-seeded — fine
+      }
+    }
+
     await q('DELETE FROM "User" WHERE username LIKE $1', RUN + '%');
 
     const mkUser = (n) => q('INSERT INTO "User" (email, username, password, role) VALUES ($1, $2, $3, \'USER\') RETURNING id, username',
