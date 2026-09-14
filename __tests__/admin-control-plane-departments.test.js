@@ -34,6 +34,7 @@ describe('admin control-plane departments API', () => {
   test('lists departments with staff counts for staff viewers', async () => {
     controlPlaneService.hasPermission.mockResolvedValue(true);
     const prisma = {
+      $transaction: async (fn) => fn(prisma),
       $queryRawUnsafe: jest.fn().mockResolvedValueOnce([
         { id: 1, name: 'Escrow', description: 'Dispute operations', isActive: true, staffCount: 3 },
       ]),
@@ -48,7 +49,7 @@ describe('admin control-plane departments API', () => {
 
   test('requires departments.manage to create departments', async () => {
     controlPlaneService.hasPermission.mockResolvedValue(false);
-    const prisma = { $queryRawUnsafe: jest.fn() };
+    const prisma = { $transaction: async (fn) => fn(prisma), $queryRawUnsafe: jest.fn() };
 
     const res = await request(buildApp(prisma))
       .post('/api/admin/control-plane/departments')
@@ -62,7 +63,7 @@ describe('admin control-plane departments API', () => {
   test('creates and audits a valid department', async () => {
     controlPlaneService.hasPermission.mockResolvedValue(true);
     const created = { id: 9, name: 'Escrow Operations', description: 'Dispute owners', isActive: true };
-    const prisma = { $queryRawUnsafe: jest.fn().mockResolvedValueOnce([created]) };
+    const prisma = { $transaction: async (fn) => fn(prisma), $queryRawUnsafe: jest.fn().mockResolvedValueOnce([created]) };
 
     const res = await request(buildApp(prisma))
       .post('/api/admin/control-plane/departments')
@@ -81,7 +82,7 @@ describe('admin control-plane departments API', () => {
 
   test('rejects department updates without fields', async () => {
     controlPlaneService.hasPermission.mockResolvedValue(true);
-    const prisma = { $queryRawUnsafe: jest.fn() };
+    const prisma = { $transaction: async (fn) => fn(prisma), $queryRawUnsafe: jest.fn() };
 
     const res = await request(buildApp(prisma))
       .patch('/api/admin/control-plane/departments/1')
