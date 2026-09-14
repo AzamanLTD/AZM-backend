@@ -1,27 +1,27 @@
 'use strict';
 
-const notifyDineInEvent = jest.fn().mockResolvedValue(null);
-const addItemAtomically = jest.fn();
-const addCustomerItemAtomically = jest.fn();
-const removeItemAtomically = jest.fn();
-const confirmAndPay = jest.fn();
-const getTab = jest.fn();
-const confirmTab = jest.fn();
+const mockNotifyDineInEvent = jest.fn().mockResolvedValue(null);
+const mockAddItem = jest.fn();
+const mockAddCustomerItem = jest.fn();
+const mockRemoveItem = jest.fn();
+const mockConfirmAndPay = jest.fn();
+const mockGetTab = jest.fn();
+const mockConfirmTab = jest.fn();
 
 jest.mock('../services/bizNotificationService', () => ({
-  notifyDineInEvent,
+  notifyDineInEvent: mockNotifyDineInEvent,
 }));
 
 jest.mock('../services/dineInTabMutationService', () => ({
-  addItem: addItemAtomically,
-  addCustomerItem: addCustomerItemAtomically,
-  removeItem: removeItemAtomically,
+  addItem: mockAddItem,
+  addCustomerItem: mockAddCustomerItem,
+  removeItem: mockRemoveItem,
 }));
 
 jest.mock('../services/marketplace/dineInService', () => jest.fn().mockImplementation(() => ({
-  confirmAndPay,
-  getTab,
-  confirmTab,
+  confirmAndPay: mockConfirmAndPay,
+  getTab: mockGetTab,
+  confirmTab: mockConfirmTab,
 })));
 
 const dineInTabService = require('../services/dineInTabService');
@@ -36,7 +36,7 @@ describe('dine-in adapter authority boundary', () => {
     const io = { to: jest.fn(() => ({ emit: jest.fn() })) };
     const tab = { id: 'tab-1', customerId: 7, businessProfileId: 'biz-1', status: 'CLOSED', grandTotalUsdc: 42 };
     const invoice = { id: 'inv-1', status: 'PAID' };
-    confirmAndPay.mockResolvedValue({
+    mockConfirmAndPay.mockResolvedValue({
       tab,
       invoice,
       payment: { alreadyPaid: false, customerPays: 42, businessReceives: 41.37, fee: 0.63 },
@@ -46,11 +46,11 @@ describe('dine-in adapter authority boundary', () => {
       tabId: 'tab-1', customerId: 7, tipUsdc: 2, io,
     });
 
-    expect(confirmAndPay).toHaveBeenCalledWith('tab-1', 7, { tipUsdc: 2 });
+    expect(mockConfirmAndPay).toHaveBeenCalledWith('tab-1', 7, { tipUsdc: 2 });
     expect(result.tab).toBe(tab);
     expect(result.invoice).toBe(invoice);
-    expect(notifyDineInEvent).toHaveBeenCalledTimes(1);
-    expect(notifyDineInEvent).toHaveBeenCalledWith(prisma, expect.objectContaining({
+    expect(mockNotifyDineInEvent).toHaveBeenCalledTimes(1);
+    expect(mockNotifyDineInEvent).toHaveBeenCalledWith(prisma, expect.objectContaining({
       businessProfileId: 'biz-1',
       tabId: 'tab-1',
       type: 'DINE_IN_TAB_PAID',
@@ -63,8 +63,8 @@ describe('dine-in adapter authority boundary', () => {
   test('ambiguous payment recovers only from durable CLOSED + PAID state and never recharges', async () => {
     const prisma = {};
     const io = { to: jest.fn(() => ({ emit: jest.fn() })) };
-    confirmAndPay.mockRejectedValue(new Error('response lost after commit'));
-    getTab.mockResolvedValue({
+    mockConfirmAndPay.mockRejectedValue(new Error('response lost after commit'));
+    mockGetTab.mockResolvedValue({
       id: 'tab-1',
       customerId: 7,
       businessProfileId: 'biz-1',
@@ -85,15 +85,15 @@ describe('dine-in adapter authority boundary', () => {
       tabId: 'tab-1', customerId: 7, tipUsdc: 2, io,
     });
 
-    expect(confirmAndPay).toHaveBeenCalledTimes(1);
-    expect(getTab).toHaveBeenCalledWith('tab-1');
+    expect(mockConfirmAndPay).toHaveBeenCalledTimes(1);
+    expect(mockGetTab).toHaveBeenCalledWith('tab-1');
     expect(result.tab.status).toBe('CLOSED');
     expect(result.invoice.status).toBe('PAID');
     expect(result.payment.alreadyPaid).toBe(true);
     expect(result.payment.customerPays).toBe(42);
     expect(result.payment.businessReceives).toBe(41.37);
     expect(result.payment.fee).toBe(0.63);
-    expect(notifyDineInEvent).toHaveBeenCalledWith(prisma, expect.objectContaining({
+    expect(mockNotifyDineInEvent).toHaveBeenCalledWith(prisma, expect.objectContaining({
       businessProfileId: 'biz-1',
       tabId: 'tab-1',
       type: 'DINE_IN_TAB_PAID',
@@ -105,8 +105,8 @@ describe('dine-in adapter authority boundary', () => {
 
   test('durable recovery cannot be used for a paid tab owned by another customer', async () => {
     const prisma = {};
-    confirmAndPay.mockRejectedValue(new Error('payment transport failure'));
-    getTab.mockResolvedValue({
+    mockConfirmAndPay.mockRejectedValue(new Error('payment transport failure'));
+    mockGetTab.mockResolvedValue({
       id: 'tab-1', customerId: 99, status: 'CLOSED',
       invoice: { id: 'inv-1', status: 'PAID', customerPaidUsdc: 42, payTxHash: 'INV_PAY_inv-1' },
     });
@@ -115,6 +115,6 @@ describe('dine-in adapter authority boundary', () => {
       tabId: 'tab-1', customerId: 7,
     })).rejects.toThrow('payment transport failure');
 
-    expect(notifyDineInEvent).not.toHaveBeenCalled();
+    expect(mockNotifyDineInEvent).not.toHaveBeenCalled();
   });
 });
