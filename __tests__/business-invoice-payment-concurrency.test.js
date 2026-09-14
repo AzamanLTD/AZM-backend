@@ -2,7 +2,7 @@
 
 const { payInvoice } = require('../services/businessInvoiceService');
 
-const makeConcurrentPrisma = () => {
+const makeConcurrentPrisma = ({ synchronizeInitialReads = false } = {}) => {
   const state = {
     invoice: {
       id: 'invoice-1',
@@ -17,6 +17,7 @@ const makeConcurrentPrisma = () => {
     releaseInitialReads: null,
     settlementCommitted: null,
     claimCalls: 0,
+    balanceClaims: 0,
     balanceMutations: 0,
     historyWrites: 0,
     feeWrites: 0,
@@ -38,11 +39,9 @@ const makeConcurrentPrisma = () => {
     businessInvoice: {
       findUnique: jest.fn(async () => {
         state.initialReads += 1;
-        if (state.initialReads === 2) releaseResolve();
-        if (state.initialReads <= 2) await state.releaseInitialReads;
+        if (synchronizeInitialReads && state.initialReads === 2) releaseResolve();
+        if (synchronizeInitialReads && state.initialReads <= 2) await state.releaseInitialReads;
         if (state.initialReads > 2 && state.invoice.payTxHash && !state.invoice.customerPaidUsdc) {
-          // A concurrent loser can only observe the durable replay marker after
-          // the winner's transaction commits all settlement fields.
           await state.settlementCommitted;
         }
         return snapshotInvoice();
@@ -60,7 +59,14 @@ const makeConcurrentPrisma = () => {
       }),
     },
     user: {
-      findUnique: jest.fn().mockResolvedValue({ availableBalance: 1000, username: 'customer' }),
+      updateMany: jest.fn(async () => {
+        state.balanceClaims += 1;
+        if (state.balanceClaims === 1) {
+          state.balanceMutations += 1;
+          return { count: 1 };
+        }
+        return { count: 0 };
+      }),
       update: jest.fn(async () => {
         state.balanceMutations += 1;
         return {};
@@ -86,7 +92,22 @@ const makeConcurrentPrisma = () => {
     },
     $transaction: jest.fn(async (callback) => {
       state.transactionCalls += 1;
-      return callback(prisma);
+      const invoiceBeforeTransaction = {
+        payTxHash: state.invoice.payTxHash,
+        status: state.invoice.status,
+        customerPaidUsdc: state.invoice.customerPaidUsdc,
+      };
+      try {
+        return await callback(prisma);
+      } catch (error) {
+        // Prisma would roll the entire interactive transaction back. Keep this
+        // mock honest by undoing the durable invoice mutation performed before
+        // the failing wallet claim so the test verifies the real commit boundary.
+        state.invoice.payTxHash = invoiceBeforeTransaction.payTxHash;
+        state.invoice.status = invoiceBeforeTransaction.status;
+        state.invoice.customerPaidUsdc = invoiceBeforeTransaction.customerPaidUsdc;
+        throw error;
+      }
     }),
   };
 
@@ -95,7 +116,7 @@ const makeConcurrentPrisma = () => {
 
 describe('business invoice payment concurrency', () => {
   test('two concurrent payers produce one settlement and one replay', async () => {
-    const { prisma, state } = makeConcurrentPrisma();
+    const { prisma, state } = makeConcurrentPrisma({ synchronizeInitialReads: true });
 
     const results = await Promise.all([
       payInvoice(prisma, { invoiceId: 'invoice-1', customerId: 7 }),
@@ -111,10 +132,42 @@ describe('business invoice payment concurrency', () => {
     expect(Number(replay.customerPays)).toBe(100);
     expect(state.claimCalls).toBe(2);
     expect(state.transactionCalls).toBe(2);
+    expect(state.balanceClaims).toBe(1);
     expect(state.balanceMutations).toBe(2);
     expect(state.historyWrites).toBe(2);
     expect(state.feeWrites).toBe(2);
     expect(state.invoice.status).toBe('PAID');
     expect(state.invoice.payTxHash).toBe('INV_PAY_invoice-1');
+  });
+
+  test('payment fails closed when the atomic wallet claim cannot obtain sufficient funds', async () => {
+    const { prisma, state } = makeConcurrentPrisma();
+    prisma.user.updateMany.mockImplementationOnce(async () => {
+      state.balanceClaims += 1;
+      return { count: 0 };
+    });
+
+    await expect(payInvoice(prisma, { invoiceId: 'invoice-1', customerId: 7 }))
+      .rejects.toThrow('INSUFFICIENT_FUNDS');
+
+    expect(state.balanceClaims).toBe(1);
+    expect(state.balanceMutations).toBe(0);
+    expect(state.historyWrites).toBe(0);
+    expect(state.invoice.payTxHash).toBeNull();
+  });
+
+  test('wallet debit is a conditional updateMany claim, never a read-then-unconditional decrement', async () => {
+    const { prisma } = makeConcurrentPrisma();
+
+    await payInvoice(prisma, { invoiceId: 'invoice-1', customerId: 7 });
+
+    expect(prisma.user.updateMany).toHaveBeenCalledWith({
+      where: { id: 7, availableBalance: { gte: 100 } },
+      data: { availableBalance: { decrement: 100 } },
+    });
+    expect(prisma.user.update).toHaveBeenCalledWith({
+      where: { id: 8 },
+      data: { availableBalance: { increment: 98.5 } },
+    });
   });
 });
