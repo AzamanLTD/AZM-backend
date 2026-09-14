@@ -72,6 +72,7 @@ describe('financial realtime event contracts', () => {
             user: {
                 findUnique: jest.fn().mockResolvedValue({ availableBalance: 500 }),
                 update: jest.fn().mockResolvedValue({}),
+                updateMany: jest.fn().mockResolvedValue({ count: 1 }),
             },
             smartEscrow: {
                 update: jest.fn().mockResolvedValue(updatedEscrow),
@@ -145,7 +146,7 @@ describe('financial realtime event contracts', () => {
                     settledAt,
                 }),
             },
-            user: { update: jest.fn().mockResolvedValue({}) },
+            user: { update: jest.fn().mockResolvedValue({}), updateMany: jest.fn().mockResolvedValue({ count: 1 }) },
             transactionHistory: { create: jest.fn().mockResolvedValue({}) },
         };
         const prisma = {
@@ -206,7 +207,7 @@ describe('financial realtime event contracts', () => {
                     settledAt,
                 }),
             },
-            user: { update: jest.fn().mockResolvedValue({}) },
+            user: { update: jest.fn().mockResolvedValue({}), updateMany: jest.fn().mockResolvedValue({ count: 1 }) },
             transactionHistory: { create: jest.fn().mockResolvedValue({}) },
             };
         const releasedPrisma = {

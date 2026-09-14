@@ -273,14 +273,15 @@ describeOrSkip('SmartEscrow dispute integrity', () => {
             });
 
             const payeeBefore = Number((await prisma.user.findUnique({ where: { id: payee.id } })).availableBalance);
-            const result = await expect(escrowService.resolveDispute(prisma, {
+            const result = await escrowService.resolveDispute(prisma, {
                 escrowId: escrow.id,
                 adminId: payer.id,
                 ruling: 'FULL_RELEASE',
-            })).resolves.toBeDefined();
+            });
+            expect(result).toBeDefined();
 
-            expect(result.value.escrow.status).toBe('RELEASED');
-            expect(result.value.dispute.status).toBe('RESOLVED');
+            expect(result.escrow.status).toBe('RELEASED');
+            expect(result.dispute.status).toBe('RESOLVED');
             const payeeAfter = Number((await prisma.user.findUnique({ where: { id: payee.id } })).availableBalance);
             expect(payeeAfter).toBeCloseTo(payeeBefore, 6);
         });

@@ -32,6 +32,7 @@ describe('escrowService fundEscrow realtime convergence', () => {
             user: {
                 findUnique: jest.fn().mockResolvedValue({ availableBalance: 200 }),
                 update: jest.fn().mockResolvedValue({}),
+                updateMany: jest.fn().mockResolvedValue({ count: 1 }),
             },
             smartEscrow: {
                 update: jest.fn().mockResolvedValue(updatedEscrow),
@@ -138,7 +139,7 @@ describe('escrowService markSatisfied realtime convergence (pending settlement)'
                 updateMany: jest.fn().mockResolvedValue({ count: 1 }),
                 findUnique: jest.fn().mockResolvedValue(settledEscrow),
             },
-            user: { update: jest.fn().mockResolvedValue({}) },
+            user: { update: jest.fn().mockResolvedValue({}), updateMany: jest.fn().mockResolvedValue({ count: 1 }) },
             transactionHistory: { create: jest.fn().mockResolvedValue({}) },
         };
         const prisma = {
@@ -189,7 +190,7 @@ describe('escrowService _releaseEscrow realtime convergence (settled)', () => {
                 updateMany: jest.fn().mockResolvedValue({ count: 1 }),
                 findUnique: jest.fn().mockResolvedValue(updated),
             },
-            user: { update: jest.fn().mockResolvedValue({}) },
+            user: { update: jest.fn().mockResolvedValue({}), updateMany: jest.fn().mockResolvedValue({ count: 1 }) },
             transactionHistory: { create: jest.fn().mockResolvedValue({}) },
         };
         const prisma = {
@@ -225,7 +226,7 @@ describe('escrowService _releaseEscrow realtime convergence (settled)', () => {
                 updateMany: jest.fn().mockResolvedValue({ count: 1 }),
                 findUnique: jest.fn().mockResolvedValue(updated),
             },
-            user: { update: jest.fn().mockResolvedValue({}) },
+            user: { update: jest.fn().mockResolvedValue({}), updateMany: jest.fn().mockResolvedValue({ count: 1 }) },
             transactionHistory: { create: jest.fn().mockResolvedValue({}) },
         };
         const prisma = {
