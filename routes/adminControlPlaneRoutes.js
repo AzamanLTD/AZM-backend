@@ -92,32 +92,42 @@ async function transitionStaffLifecycle(req, res, nextStatus, eventType) {
 
   try {
     const p = prisma(req);
-    const current = await loadStaffById(p, staffId);
-    if (!current) return res.status(404).json({ success: false, message: 'Staff profile not found.' });
-    const mutable = await assertStaffLifecycleMutable(req, p, current, nextStatus);
-    if (!mutable.ok) return res.status(mutable.status).json({ success: false, message: mutable.message });
+    // One atomic unit: validated read, guarded mutation, and audit event.
+    // The UPDATE is keyed on the authority state that was validated, so a
+    // concurrent privileged change to this profile yields zero rows and a
+    // deliberate 409 instead of a silently stale overwrite.
+    const outcome = await p.$transaction(async (tx) => {
+      const current = await loadStaffById(tx, staffId);
+      if (!current) return { status: 404, body: { success: false, message: 'Staff profile not found.' } };
+      const mutable = await assertStaffLifecycleMutable(req, tx, current, nextStatus);
+      if (!mutable.ok) return { status: mutable.status, body: { success: false, message: mutable.message } };
 
-    const nextPresence = nextStatus === 'ACTIVE' ? current.presence : 'OFFLINE';
-    const rows = await p.$queryRawUnsafe(`
-      UPDATE "StaffProfile"
-      SET status = $2,
-          presence = $3,
-          "lastActiveAt" = CASE WHEN $3 != presence THEN CURRENT_TIMESTAMP ELSE "lastActiveAt" END,
-          "updatedAt" = CURRENT_TIMESTAMP
-      WHERE id = $1
-      RETURNING *
-    `, staffId, nextStatus, nextPresence);
+      const nextPresence = nextStatus === 'ACTIVE' ? current.presence : 'OFFLINE';
+      const rows = await tx.$queryRawUnsafe(`
+        UPDATE "StaffProfile"
+        SET status = $2,
+            presence = $3,
+            "lastActiveAt" = CASE WHEN $3 != presence THEN CURRENT_TIMESTAMP ELSE "lastActiveAt" END,
+            "updatedAt" = CURRENT_TIMESTAMP
+        WHERE id = $1 AND "isGlobalSuperAdmin" = $4::boolean
+        RETURNING *
+      `, staffId, nextStatus, nextPresence, Boolean(current.isGlobalSuperAdmin));
+      if (!rows.length) {
+        return { status: 409, body: { success: false, message: 'Staff profile changed during the operation. Please retry.' } };
+      }
 
-    const actor = await actorProfile(req, p);
-    await recordActivity(p, {
-      staffProfileId: staffId,
-      actorUserId: req.user.id,
-      eventType,
-      targetType: 'STAFF_PROFILE',
-      targetId: staffId,
-      metadata: { beforeStatus: current.status, afterStatus: nextStatus, beforePresence: current.presence, afterPresence: nextPresence, reason: reason || null, actorStaffProfileId: actor?.id || null },
+      const actor = await actorProfile(req, tx);
+      await recordActivity(tx, {
+        staffProfileId: staffId,
+        actorUserId: req.user.id,
+        eventType,
+        targetType: 'STAFF_PROFILE',
+        targetId: staffId,
+        metadata: { beforeStatus: current.status, afterStatus: nextStatus, beforePresence: current.presence, afterPresence: nextPresence, reason: reason || null, actorStaffProfileId: actor?.id || null },
+      });
+      return { status: 200, body: { success: true, staff: rows[0] } };
     });
-    return res.json({ success: true, staff: rows[0] });
+    return res.status(outcome.status).json(outcome.body);
   } catch (err) {
     req.app.get('logger')?.error?.({ err }, 'control-plane staff lifecycle transition failed');
     return res.status(500).json({ success: false, message: 'Failed to update staff lifecycle.' });
@@ -213,21 +223,25 @@ router.post('/departments', async (req, res) => {
 
   try {
     const p = prisma(req);
-    const rows = await p.$queryRawUnsafe(`
-      INSERT INTO "ControlDepartment" (name, description)
-      VALUES ($1, $2)
-      RETURNING *
-    `, name, description);
-    const actor = await actorProfile(req, p);
-    await recordActivity(p, {
-      staffProfileId: actor?.id || null,
-      actorUserId: req.user.id,
-      eventType: 'DEPARTMENT_CREATED',
-      targetType: 'CONTROL_DEPARTMENT',
-      targetId: rows[0].id,
-      metadata: { name, description },
+    // The department insert and its audit event commit or roll back together.
+    const outcome = await p.$transaction(async (tx) => {
+      const rows = await tx.$queryRawUnsafe(`
+        INSERT INTO "ControlDepartment" (name, description)
+        VALUES ($1, $2)
+        RETURNING *
+      `, name, description);
+      const actor = await actorProfile(req, tx);
+      await recordActivity(tx, {
+        staffProfileId: actor?.id || null,
+        actorUserId: req.user.id,
+        eventType: 'DEPARTMENT_CREATED',
+        targetType: 'CONTROL_DEPARTMENT',
+        targetId: rows[0].id,
+        metadata: { name, description },
+      });
+      return { status: 201, body: { success: true, department: rows[0] } };
     });
-    return res.status(201).json({ success: true, department: rows[0] });
+    return res.status(outcome.status).json(outcome.body);
   } catch (err) {
     if (err?.code === '23505') return res.status(409).json({ success: false, message: 'Department already exists.' });
     req.app.get('logger')?.error?.({ err }, 'control-plane department create failed');
@@ -261,31 +275,37 @@ router.patch('/departments/:id', async (req, res) => {
     const departmentId = parsePositiveInt(req.params.id);
     if (!departmentId) return res.status(400).json({ success: false, message: 'Valid department id is required.' });
     const p = prisma(req);
-    const currentRows = await p.$queryRawUnsafe('SELECT * FROM "ControlDepartment" WHERE id = $1', departmentId);
-    if (!currentRows[0]) return res.status(404).json({ success: false, message: 'Department not found.' });
-    const rows = await p.$queryRawUnsafe(`
-      UPDATE "ControlDepartment"
-      SET name = CASE WHEN $2::text IS NULL THEN name ELSE $2::text END,
-          description = CASE WHEN $3::boolean THEN $4::text ELSE description END,
-          "isActive" = CASE WHEN $5::boolean IS NULL THEN "isActive" ELSE $5::boolean END,
-          "updatedAt" = CURRENT_TIMESTAMP
-      WHERE id = $1
-      RETURNING *
-    `, departmentId, hasName ? name : null, hasDescription, description, hasIsActive ? isActive : null);
-    const actor = await actorProfile(req, p);
-    await recordActivity(p, {
-      staffProfileId: actor?.id || null,
-      actorUserId: req.user.id,
-      eventType: 'DEPARTMENT_UPDATED',
-      targetType: 'CONTROL_DEPARTMENT',
-      targetId: rows[0].id,
-      metadata: {
-        fields: ['name', 'description', 'isActive'].filter((field) => Object.prototype.hasOwnProperty.call(req.body || {}, field)),
-        before: currentRows[0],
-        after: rows[0],
-      },
+    // Read, mutation, and audit event are one atomic unit so the audit's
+    // before/after metadata always describes a committed mutation.
+    const outcome = await p.$transaction(async (tx) => {
+      const currentRows = await tx.$queryRawUnsafe('SELECT * FROM "ControlDepartment" WHERE id = $1', departmentId);
+      if (!currentRows[0]) return { status: 404, body: { success: false, message: 'Department not found.' } };
+      const rows = await tx.$queryRawUnsafe(`
+        UPDATE "ControlDepartment"
+        SET name = CASE WHEN $2::text IS NULL THEN name ELSE $2::text END,
+            description = CASE WHEN $3::boolean THEN $4::text ELSE description END,
+            "isActive" = CASE WHEN $5::boolean IS NULL THEN "isActive" ELSE $5::boolean END,
+            "updatedAt" = CURRENT_TIMESTAMP
+        WHERE id = $1
+        RETURNING *
+      `, departmentId, hasName ? name : null, hasDescription, description, hasIsActive ? isActive : null);
+      if (!rows.length) return { status: 404, body: { success: false, message: 'Department not found.' } };
+      const actor = await actorProfile(req, tx);
+      await recordActivity(tx, {
+        staffProfileId: actor?.id || null,
+        actorUserId: req.user.id,
+        eventType: 'DEPARTMENT_UPDATED',
+        targetType: 'CONTROL_DEPARTMENT',
+        targetId: rows[0].id,
+        metadata: {
+          fields: ['name', 'description', 'isActive'].filter((field) => Object.prototype.hasOwnProperty.call(req.body || {}, field)),
+          before: currentRows[0],
+          after: rows[0],
+        },
+      });
+      return { status: 200, body: { success: true, department: rows[0] } };
     });
-    return res.json({ success: true, department: rows[0] });
+    return res.status(outcome.status).json(outcome.body);
   } catch (err) {
     if (err?.code === '23505') return res.status(409).json({ success: false, message: 'Department already exists.' });
     req.app.get('logger')?.error?.({ err }, 'control-plane department update failed');
@@ -367,38 +387,45 @@ router.post('/staff', async (req, res) => {
 
   try {
     const p = prisma(req);
-    const actorGlobal = await isGlobalController(req, p);
-    const legacyAdminBootstrap = req.user.role === 'ADMIN';
-    if (authority === 'ADMIN' && !actorGlobal && !legacyAdminBootstrap) {
-      return res.status(403).json({ success: false, message: 'Only a global super admin may create administrator profiles.' });
-    }
-    if (Boolean(isGlobalSuperAdmin) && !actorGlobal) {
-      return res.status(403).json({ success: false, message: 'Only a global super admin may grant global super-admin authority.' });
-    }
+    // Existence checks, profile insert, and audit event are one atomic unit;
+    // a concurrent duplicate profile creation surfaces as the same 409 via
+    // the unique userId constraint instead of a partial/unaudited write.
+    const outcome = await p.$transaction(async (tx) => {
+      const actorGlobal = await isGlobalController(req, tx);
+      const legacyAdminBootstrap = req.user.role === 'ADMIN';
+      if (authority === 'ADMIN' && !actorGlobal && !legacyAdminBootstrap) {
+        return { status: 403, body: { success: false, message: 'Only a global super admin may create administrator profiles.' } };
+      }
+      if (Boolean(isGlobalSuperAdmin) && !actorGlobal) {
+        return { status: 403, body: { success: false, message: 'Only a global super admin may grant global super-admin authority.' } };
+      }
 
-    const user = await p.user.findUnique({ where: { id: Number(userId) }, select: { id: true } });
-    if (!user) return res.status(404).json({ success: false, message: 'User not found.' });
-    const existing = await getStaffProfile(p, Number(userId));
-    if (existing) return res.status(409).json({ success: false, message: 'User already has a staff profile.' });
+      const user = await tx.user.findUnique({ where: { id: Number(userId) }, select: { id: true } });
+      if (!user) return { status: 404, body: { success: false, message: 'User not found.' } };
+      const existing = await getStaffProfile(tx, Number(userId));
+      if (existing) return { status: 409, body: { success: false, message: 'User already has a staff profile.' } };
 
-    const rows = await p.$queryRawUnsafe(`
-      INSERT INTO "StaffProfile"
-        ("userId", "authorityClass", "adminType", "employeeType", "departmentId", "supervisorId", "isGlobalSuperAdmin")
-      VALUES ($1, $2, $3, $4, $5, $6, $7)
-      RETURNING *
-    `, Number(userId), authority, admin, authority === 'EMPLOYEE' ? String(employeeType) : null,
-       departmentId == null ? null : Number(departmentId), supervisorId == null ? null : Number(supervisorId), Boolean(isGlobalSuperAdmin));
+      const rows = await tx.$queryRawUnsafe(`
+        INSERT INTO "StaffProfile"
+          ("userId", "authorityClass", "adminType", "employeeType", "departmentId", "supervisorId", "isGlobalSuperAdmin")
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        RETURNING *
+      `, Number(userId), authority, admin, authority === 'EMPLOYEE' ? String(employeeType) : null,
+         departmentId == null ? null : Number(departmentId), supervisorId == null ? null : Number(supervisorId), Boolean(isGlobalSuperAdmin));
 
-    await recordActivity(p, {
-      staffProfileId: rows[0].id,
-      actorUserId: req.user.id,
-      eventType: 'STAFF_PROFILE_CREATED',
-      targetType: 'STAFF_PROFILE',
-      targetId: rows[0].id,
-      metadata: { authorityClass: authority, adminType: admin, employeeType: employeeType || null, isGlobalSuperAdmin: Boolean(isGlobalSuperAdmin) },
+      await recordActivity(tx, {
+        staffProfileId: rows[0].id,
+        actorUserId: req.user.id,
+        eventType: 'STAFF_PROFILE_CREATED',
+        targetType: 'STAFF_PROFILE',
+        targetId: rows[0].id,
+        metadata: { authorityClass: authority, adminType: admin, employeeType: employeeType || null, isGlobalSuperAdmin: Boolean(isGlobalSuperAdmin) },
+      });
+      return { status: 201, body: { success: true, staff: rows[0] } };
     });
-    return res.status(201).json({ success: true, staff: rows[0] });
+    return res.status(outcome.status).json(outcome.body);
   } catch (err) {
+    if (err?.code === '23505') return res.status(409).json({ success: false, message: 'User already has a staff profile.' });
     return res.status(500).json({ success: false, message: 'Failed to create staff profile.' });
   }
 });
@@ -414,43 +441,56 @@ router.patch('/staff/:id', async (req, res) => {
 
   try {
     const p = prisma(req);
-    const currentRows = await p.$queryRawUnsafe('SELECT * FROM "StaffProfile" WHERE id = $1', Number(req.params.id));
-    const current = currentRows[0];
-    if (!current) return res.status(404).json({ success: false, message: 'Staff profile not found.' });
-    const actorGlobal = await isGlobalController(req, p);
-    const authorityChange = Object.prototype.hasOwnProperty.call(body, 'adminType') || Object.prototype.hasOwnProperty.call(body, 'authorityClass') || Object.prototype.hasOwnProperty.call(body, 'isGlobalSuperAdmin');
-    if (current.isGlobalSuperAdmin && !actorGlobal) return res.status(403).json({ success: false, message: 'Only a global super admin may modify a global super-admin profile.' });
-    if (authorityChange && !actorGlobal) return res.status(403).json({ success: false, message: 'Only a global super admin may change staff authority.' });
-    if (current.userId === Number(req.user.id) && (authorityChange || status === 'SUSPENDED' || status === 'INACTIVE')) {
-      return res.status(403).json({ success: false, message: 'You cannot modify your own authority or deactivate your own staff profile.' });
-    }
-    if (Object.prototype.hasOwnProperty.call(body, 'isGlobalSuperAdmin') && Boolean(body.isGlobalSuperAdmin) && String(body.adminType || current.adminType).toUpperCase() !== 'SUPER_ADMIN') {
-      return res.status(400).json({ success: false, message: 'Global super admin authority requires SUPER_ADMIN.' });
-    }
-    const nextAdmin = body.adminType == null ? current.adminType : String(body.adminType).toUpperCase();
-    if (current.authorityClass === 'ADMIN' && !ADMIN_TYPES.has(nextAdmin)) return res.status(400).json({ success: false, message: 'Invalid adminType.' });
+    // Closes the time-of-check/time-of-use window: the validated read, the
+    // protections, the mutation, and the audit event are one atomic unit,
+    // and the UPDATE is keyed on the exact authority state that was
+    // validated ("isGlobalSuperAdmin"). A concurrent privileged change to
+    // that state yields zero rows and a deliberate 409 instead of a
+    // silently stale overwrite.
+    const outcome = await p.$transaction(async (tx) => {
+      const currentRows = await tx.$queryRawUnsafe('SELECT * FROM "StaffProfile" WHERE id = $1', Number(req.params.id));
+      const current = currentRows[0];
+      if (!current) return { status: 404, body: { success: false, message: 'Staff profile not found.' } };
+      const actorGlobal = await isGlobalController(req, tx);
+      const authorityChange = Object.prototype.hasOwnProperty.call(body, 'adminType') || Object.prototype.hasOwnProperty.call(body, 'authorityClass') || Object.prototype.hasOwnProperty.call(body, 'isGlobalSuperAdmin');
+      if (current.isGlobalSuperAdmin && !actorGlobal) return { status: 403, body: { success: false, message: 'Only a global super admin may modify a global super-admin profile.' } };
+      if (authorityChange && !actorGlobal) return { status: 403, body: { success: false, message: 'Only a global super admin may change staff authority.' } };
+      if (current.userId === Number(req.user.id) && (authorityChange || status === 'SUSPENDED' || status === 'INACTIVE')) {
+        return { status: 403, body: { success: false, message: 'You cannot modify your own authority or deactivate your own staff profile.' } };
+      }
+      if (Object.prototype.hasOwnProperty.call(body, 'isGlobalSuperAdmin') && Boolean(body.isGlobalSuperAdmin) && String(body.adminType || current.adminType).toUpperCase() !== 'SUPER_ADMIN') {
+        return { status: 400, body: { success: false, message: 'Global super admin authority requires SUPER_ADMIN.' } };
+      }
+      const nextAdmin = body.adminType == null ? current.adminType : String(body.adminType).toUpperCase();
+      if (current.authorityClass === 'ADMIN' && !ADMIN_TYPES.has(nextAdmin)) return { status: 400, body: { success: false, message: 'Invalid adminType.' } };
 
-    const rows = await p.$queryRawUnsafe(`
-      UPDATE "StaffProfile"
-      SET status = COALESCE($2, status),
-          presence = COALESCE($3, presence),
-          "departmentId" = COALESCE($4, "departmentId"),
-          "supervisorId" = COALESCE($5, "supervisorId"),
-          "employeeType" = COALESCE($6, "employeeType"),
-          "adminType" = COALESCE($7, "adminType"),
-          "isGlobalSuperAdmin" = CASE WHEN $8::boolean IS NULL THEN "isGlobalSuperAdmin" ELSE $8::boolean END,
-          "lastActiveAt" = CASE WHEN $3 IS NOT NULL THEN CURRENT_TIMESTAMP ELSE "lastActiveAt" END,
-          "updatedAt" = CURRENT_TIMESTAMP
-      WHERE id = $1
-      RETURNING *
-    `, Number(req.params.id), status, presence,
-       body.departmentId == null ? null : Number(body.departmentId),
-       body.supervisorId == null ? null : Number(body.supervisorId),
-       body.employeeType == null ? null : String(body.employeeType), nextAdmin,
-       Object.prototype.hasOwnProperty.call(body, 'isGlobalSuperAdmin') ? Boolean(body.isGlobalSuperAdmin) : null);
+      const rows = await tx.$queryRawUnsafe(`
+        UPDATE "StaffProfile"
+        SET status = COALESCE($2, status),
+            presence = COALESCE($3, presence),
+            "departmentId" = COALESCE($4, "departmentId"),
+            "supervisorId" = COALESCE($5, "supervisorId"),
+            "employeeType" = COALESCE($6, "employeeType"),
+            "adminType" = COALESCE($7, "adminType"),
+            "isGlobalSuperAdmin" = CASE WHEN $8::boolean IS NULL THEN "isGlobalSuperAdmin" ELSE $8::boolean END,
+            "lastActiveAt" = CASE WHEN $3 IS NOT NULL THEN CURRENT_TIMESTAMP ELSE "lastActiveAt" END,
+            "updatedAt" = CURRENT_TIMESTAMP
+        WHERE id = $1 AND "isGlobalSuperAdmin" = $9::boolean
+        RETURNING *
+      `, Number(req.params.id), status, presence,
+         body.departmentId == null ? null : Number(body.departmentId),
+         body.supervisorId == null ? null : Number(body.supervisorId),
+         body.employeeType == null ? null : String(body.employeeType), nextAdmin,
+         Object.prototype.hasOwnProperty.call(body, 'isGlobalSuperAdmin') ? Boolean(body.isGlobalSuperAdmin) : null,
+         Boolean(current.isGlobalSuperAdmin));
+      if (!rows.length) {
+        return { status: 409, body: { success: false, message: 'Staff profile changed during the operation. Please retry.' } };
+      }
 
-    await recordActivity(p, { staffProfileId: current.id, actorUserId: req.user.id, eventType: 'STAFF_PROFILE_UPDATED', targetType: 'STAFF_PROFILE', targetId: current.id, metadata: { fields: allowed.filter(k => Object.prototype.hasOwnProperty.call(body, k)) } });
-    return res.json({ success: true, staff: rows[0] });
+      await recordActivity(tx, { staffProfileId: current.id, actorUserId: req.user.id, eventType: 'STAFF_PROFILE_UPDATED', targetType: 'STAFF_PROFILE', targetId: current.id, metadata: { fields: allowed.filter(k => Object.prototype.hasOwnProperty.call(body, k)) } });
+      return { status: 200, body: { success: true, staff: rows[0] } };
+    });
+    return res.status(outcome.status).json(outcome.body);
   } catch (err) {
     return res.status(500).json({ success: false, message: 'Failed to update staff profile.' });
   }
@@ -469,22 +509,35 @@ router.put('/staff/:id/permissions', async (req, res) => {
     const p = prisma(req);
     const staffId = Number(req.params.id);
     const actorGlobal = await isGlobalController(req, p);
-    const staff = await p.$queryRawUnsafe('SELECT id, "userId", "isGlobalSuperAdmin" FROM "StaffProfile" WHERE id = $1', staffId);
-    if (!staff[0]) return res.status(404).json({ success: false, message: 'Staff profile not found.' });
-    if (staff[0].isGlobalSuperAdmin && !actorGlobal) return res.status(403).json({ success: false, message: 'Only a global super admin may modify global-super-admin permissions.' });
-    const permissionRows = keys.length ? await p.$queryRawUnsafe('SELECT id, "key" FROM "ControlPermission" WHERE "key" = ANY($1::text[]) AND "isActive" = TRUE', keys) : [];
-    if (permissionRows.length !== keys.length) return res.status(400).json({ success: false, message: 'One or more permissions are invalid or inactive.' });
-    if (!actorGlobal) {
-      const actorPermissions = await p.$queryRawUnsafe(`SELECT cp."key" FROM "StaffPermissionGrant" spg JOIN "ControlPermission" cp ON cp.id = spg."permissionId" WHERE spg."staffProfileId" = (SELECT id FROM "StaffProfile" WHERE "userId" = $1) AND cp."isActive" = TRUE AND (spg."expiresAt" IS NULL OR spg."expiresAt" > CURRENT_TIMESTAMP)`, Number(req.user.id));
-      const allowed = new Set(actorPermissions.map((row) => row.key));
-      if (keys.some((key) => !allowed.has(key))) return res.status(403).json({ success: false, message: 'You cannot grant a permission you do not possess.' });
-    }
-    await p.$queryRawUnsafe('DELETE FROM "StaffPermissionGrant" WHERE "staffProfileId" = $1', staffId);
-    for (const permission of permissionRows) {
-      await p.$queryRawUnsafe('INSERT INTO "StaffPermissionGrant" ("staffProfileId", "permissionId", "grantedByUserId") VALUES ($1, $2, $3)', staffId, permission.id, Number(req.user.id));
-    }
-    await recordActivity(p, { staffProfileId: staffId, actorUserId: req.user.id, eventType: 'STAFF_PERMISSIONS_REPLACED', targetType: 'STAFF_PROFILE', targetId: staffId, metadata: { permissions: keys } });
-    return res.json({ success: true, permissions: permissionRows });
+    // The ENTIRE replacement is one transaction: validation reads, the
+    // delete of the old grant set, every new grant insert, and the audit
+    // event all use tx. If any step fails, the previous grant set remains
+    // intact — no partial authorization state and no unaudited change.
+    const outcome = await p.$transaction(async (tx) => {
+      // Row-level lock on the target: serializes concurrent replacements of the
+      // same staff member's grants. Without it, two parallel transactions both
+      // DELETE-then-INSERT under READ COMMITTED and the second commit produces a
+      // UNION of both grant sets — the target ends up with more access than
+      // either admin intended. With FOR UPDATE, the second transaction waits at
+      // this read, then replaces the first transaction's committed set in full.
+      const staff = await tx.$queryRawUnsafe('SELECT id, "userId", "isGlobalSuperAdmin" FROM "StaffProfile" WHERE id = $1 FOR UPDATE', staffId);
+      if (!staff[0]) return { status: 404, body: { success: false, message: 'Staff profile not found.' } };
+      if (staff[0].isGlobalSuperAdmin && !actorGlobal) return { status: 403, body: { success: false, message: 'Only a global super admin may modify global-super-admin permissions.' } };
+      const permissionRows = keys.length ? await tx.$queryRawUnsafe('SELECT id, "key" FROM "ControlPermission" WHERE "key" = ANY($1::text[]) AND "isActive" = TRUE', keys) : [];
+      if (permissionRows.length !== keys.length) return { status: 400, body: { success: false, message: 'One or more permissions are invalid or inactive.' } };
+      if (!actorGlobal) {
+        const actorPermissions = await tx.$queryRawUnsafe(`SELECT cp."key" FROM "StaffPermissionGrant" spg JOIN "ControlPermission" cp ON cp.id = spg."permissionId" WHERE spg."staffProfileId" = (SELECT id FROM "StaffProfile" WHERE "userId" = $1) AND cp."isActive" = TRUE AND (spg."expiresAt" IS NULL OR spg."expiresAt" > CURRENT_TIMESTAMP)`, Number(req.user.id));
+        const allowed = new Set(actorPermissions.map((row) => row.key));
+        if (keys.some((key) => !allowed.has(key))) return { status: 403, body: { success: false, message: 'You cannot grant a permission you do not possess.' } };
+      }
+      await tx.$queryRawUnsafe('DELETE FROM "StaffPermissionGrant" WHERE "staffProfileId" = $1', staffId);
+      for (const permission of permissionRows) {
+        await tx.$queryRawUnsafe('INSERT INTO "StaffPermissionGrant" ("staffProfileId", "permissionId", "grantedByUserId") VALUES ($1, $2, $3)', staffId, permission.id, Number(req.user.id));
+      }
+      await recordActivity(tx, { staffProfileId: staffId, actorUserId: req.user.id, eventType: 'STAFF_PERMISSIONS_REPLACED', targetType: 'STAFF_PROFILE', targetId: staffId, metadata: { permissions: keys } });
+      return { status: 200, body: { success: true, permissions: permissionRows } };
+    });
+    return res.status(outcome.status).json(outcome.body);
   } catch (err) {
     return res.status(500).json({ success: false, message: 'Failed to update staff permissions.' });
   }
@@ -507,18 +560,23 @@ router.post('/staff/:id/duties', async (req, res) => {
   try {
     const p = prisma(req);
     const staffId = Number(req.params.id);
-    const duty = await p.$queryRawUnsafe('SELECT id, "key", name FROM "ControlDuty" WHERE "key" = $1 AND "isActive" = TRUE', dutyKey);
-    if (!duty[0]) return res.status(404).json({ success: false, message: 'Duty not found.' });
-    const staff = await p.$queryRawUnsafe('SELECT id FROM "StaffProfile" WHERE id = $1', staffId);
-    if (!staff[0]) return res.status(404).json({ success: false, message: 'Staff profile not found.' });
-    const rows = await p.$queryRawUnsafe(`
-      INSERT INTO "StaffDutyAssignment" ("staffProfileId", "dutyId", "assignedByUserId")
-      VALUES ($1, $2, $3)
-      ON CONFLICT ("staffProfileId", "dutyId") DO UPDATE SET status = 'ACTIVE', "assignedAt" = CURRENT_TIMESTAMP
-      RETURNING *
-    `, staffId, duty[0].id, Number(req.user.id));
-    await recordActivity(p, { staffProfileId: staffId, actorUserId: req.user.id, eventType: 'DUTY_ASSIGNED', targetType: 'DUTY', targetId: duty[0].id, metadata: { dutyKey } });
-    return res.status(201).json({ success: true, assignment: rows[0], duty: duty[0] });
+    // Lookups, the atomic ON CONFLICT upsert, and the audit event are one
+    // transaction; the upsert semantics themselves are unchanged.
+    const outcome = await p.$transaction(async (tx) => {
+      const duty = await tx.$queryRawUnsafe('SELECT id, "key", name FROM "ControlDuty" WHERE "key" = $1 AND "isActive" = TRUE', dutyKey);
+      if (!duty[0]) return { status: 404, body: { success: false, message: 'Duty not found.' } };
+      const staff = await tx.$queryRawUnsafe('SELECT id FROM "StaffProfile" WHERE id = $1', staffId);
+      if (!staff[0]) return { status: 404, body: { success: false, message: 'Staff profile not found.' } };
+      const rows = await tx.$queryRawUnsafe(`
+        INSERT INTO "StaffDutyAssignment" ("staffProfileId", "dutyId", "assignedByUserId")
+        VALUES ($1, $2, $3)
+        ON CONFLICT ("staffProfileId", "dutyId") DO UPDATE SET status = 'ACTIVE', "assignedAt" = CURRENT_TIMESTAMP
+        RETURNING *
+      `, staffId, duty[0].id, Number(req.user.id));
+      await recordActivity(tx, { staffProfileId: staffId, actorUserId: req.user.id, eventType: 'DUTY_ASSIGNED', targetType: 'DUTY', targetId: duty[0].id, metadata: { dutyKey } });
+      return { status: 201, body: { success: true, assignment: rows[0], duty: duty[0] } };
+    });
+    return res.status(outcome.status).json(outcome.body);
   } catch (err) {
     return res.status(500).json({ success: false, message: 'Failed to assign duty.' });
   }
@@ -528,10 +586,15 @@ router.delete('/staff/:id/duties/:dutyId', async (req, res) => {
   if (!(await authorize(req, 'staff.duties.manage'))) return deny(res, 'staff.duties.manage');
   try {
     const p = prisma(req);
-    const rows = await p.$queryRawUnsafe(`UPDATE "StaffDutyAssignment" SET status = 'REVOKED' WHERE "staffProfileId" = $1 AND "dutyId" = $2 RETURNING *`, Number(req.params.id), Number(req.params.dutyId));
-    if (!rows[0]) return res.status(404).json({ success: false, message: 'Duty assignment not found.' });
-    await recordActivity(p, { staffProfileId: Number(req.params.id), actorUserId: req.user.id, eventType: 'DUTY_REVOKED', targetType: 'DUTY', targetId: Number(req.params.dutyId) });
-    return res.json({ success: true, assignment: rows[0] });
+    // Revocation mutation and audit event are one atomic unit; a missing
+    // assignment is reported before any audit is written.
+    const outcome = await p.$transaction(async (tx) => {
+      const rows = await tx.$queryRawUnsafe(`UPDATE "StaffDutyAssignment" SET status = 'REVOKED' WHERE "staffProfileId" = $1 AND "dutyId" = $2 RETURNING *`, Number(req.params.id), Number(req.params.dutyId));
+      if (!rows[0]) return { status: 404, body: { success: false, message: 'Duty assignment not found.' } };
+      await recordActivity(tx, { staffProfileId: Number(req.params.id), actorUserId: req.user.id, eventType: 'DUTY_REVOKED', targetType: 'DUTY', targetId: Number(req.params.dutyId) });
+      return { status: 200, body: { success: true, assignment: rows[0] } };
+    });
+    return res.status(outcome.status).json(outcome.body);
   } catch (err) {
     return res.status(500).json({ success: false, message: 'Failed to revoke duty.' });
   }

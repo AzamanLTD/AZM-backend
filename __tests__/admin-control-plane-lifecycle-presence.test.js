@@ -33,7 +33,7 @@ describe('admin control-plane lifecycle and presence API', () => {
 
   test('updates the authenticated staff member presence and audits it', async () => {
     const updated = { id: 42, userId: 7, status: 'ACTIVE', presence: 'AWAY' };
-    const prisma = { $queryRawUnsafe: jest.fn().mockResolvedValueOnce([updated]) };
+    const prisma = { $transaction: async (fn) => fn(prisma), $queryRawUnsafe: jest.fn().mockResolvedValueOnce([updated]) };
 
     const res = await request(buildApp(prisma))
       .post('/api/admin/control-plane/me/presence')
@@ -52,7 +52,7 @@ describe('admin control-plane lifecycle and presence API', () => {
 
   test('rejects presence updates for inactive staff', async () => {
     controlPlaneService.getStaffProfile.mockResolvedValueOnce({ id: 42, userId: 7, status: 'SUSPENDED', presence: 'OFFLINE' });
-    const prisma = { $queryRawUnsafe: jest.fn() };
+    const prisma = { $transaction: async (fn) => fn(prisma), $queryRawUnsafe: jest.fn() };
 
     const res = await request(buildApp(prisma))
       .post('/api/admin/control-plane/me/presence')
@@ -64,7 +64,7 @@ describe('admin control-plane lifecycle and presence API', () => {
 
   test('lists staff presence for staff viewers', async () => {
     controlPlaneService.hasPermission.mockResolvedValue(true);
-    const prisma = { $queryRawUnsafe: jest.fn().mockResolvedValueOnce([{ id: 42, presence: 'ONLINE', activeDutyCount: 2 }]) };
+    const prisma = { $transaction: async (fn) => fn(prisma), $queryRawUnsafe: jest.fn().mockResolvedValueOnce([{ id: 42, presence: 'ONLINE', activeDutyCount: 2 }]) };
 
     const res = await request(buildApp(prisma)).get('/api/admin/control-plane/presence');
 
@@ -75,7 +75,7 @@ describe('admin control-plane lifecycle and presence API', () => {
 
   test('requires staff.manage for lifecycle transitions', async () => {
     controlPlaneService.hasPermission.mockResolvedValue(false);
-    const prisma = { $queryRawUnsafe: jest.fn() };
+    const prisma = { $transaction: async (fn) => fn(prisma), $queryRawUnsafe: jest.fn() };
 
     const res = await request(buildApp(prisma))
       .post('/api/admin/control-plane/staff/9/suspend')
@@ -88,7 +88,7 @@ describe('admin control-plane lifecycle and presence API', () => {
 
   test('requires a reason for suspension', async () => {
     controlPlaneService.hasPermission.mockResolvedValue(true);
-    const prisma = { $queryRawUnsafe: jest.fn() };
+    const prisma = { $transaction: async (fn) => fn(prisma), $queryRawUnsafe: jest.fn() };
 
     const res = await request(buildApp(prisma))
       .post('/api/admin/control-plane/staff/9/suspend')
@@ -101,7 +101,7 @@ describe('admin control-plane lifecycle and presence API', () => {
   test('prevents self suspension', async () => {
     controlPlaneService.hasPermission.mockResolvedValue(true);
     controlPlaneService.getStaffProfile.mockResolvedValueOnce({ id: 42, userId: 7, status: 'ACTIVE', isGlobalSuperAdmin: true });
-    const prisma = { $queryRawUnsafe: jest.fn().mockResolvedValueOnce([{ id: 42, userId: 7, status: 'ACTIVE', presence: 'ONLINE', isGlobalSuperAdmin: true }]) };
+    const prisma = { $transaction: async (fn) => fn(prisma), $queryRawUnsafe: jest.fn().mockResolvedValueOnce([{ id: 42, userId: 7, status: 'ACTIVE', presence: 'ONLINE', isGlobalSuperAdmin: true }]) };
 
     const res = await request(buildApp(prisma))
       .post('/api/admin/control-plane/staff/42/suspend')
@@ -118,7 +118,7 @@ describe('admin control-plane lifecycle and presence API', () => {
       .mockResolvedValueOnce({ id: 42, userId: 7, status: 'ACTIVE', isGlobalSuperAdmin: true });
     const current = { id: 9, userId: 99, status: 'ACTIVE', presence: 'ONLINE', isGlobalSuperAdmin: false };
     const updated = { ...current, status: 'SUSPENDED', presence: 'OFFLINE' };
-    const prisma = { $queryRawUnsafe: jest.fn().mockResolvedValueOnce([current]).mockResolvedValueOnce([updated]) };
+    const prisma = { $transaction: async (fn) => fn(prisma), $queryRawUnsafe: jest.fn().mockResolvedValueOnce([current]).mockResolvedValueOnce([updated]) };
 
     const res = await request(buildApp(prisma))
       .post('/api/admin/control-plane/staff/9/suspend')
