@@ -92,7 +92,22 @@ const makeConcurrentPrisma = ({ synchronizeInitialReads = false } = {}) => {
     },
     $transaction: jest.fn(async (callback) => {
       state.transactionCalls += 1;
-      return callback(prisma);
+      const invoiceBeforeTransaction = {
+        payTxHash: state.invoice.payTxHash,
+        status: state.invoice.status,
+        customerPaidUsdc: state.invoice.customerPaidUsdc,
+      };
+      try {
+        return await callback(prisma);
+      } catch (error) {
+        // Prisma would roll the entire interactive transaction back. Keep this
+        // mock honest by undoing the durable invoice mutation performed before
+        // the failing wallet claim so the test verifies the real commit boundary.
+        state.invoice.payTxHash = invoiceBeforeTransaction.payTxHash;
+        state.invoice.status = invoiceBeforeTransaction.status;
+        state.invoice.customerPaidUsdc = invoiceBeforeTransaction.customerPaidUsdc;
+        throw error;
+      }
     }),
   };
 
@@ -127,12 +142,15 @@ describe('business invoice payment concurrency', () => {
 
   test('payment fails closed when the atomic wallet claim cannot obtain sufficient funds', async () => {
     const { prisma, state } = makeConcurrentPrisma();
-    prisma.user.updateMany.mockImplementationOnce(async () => ({ count: 0 }));
+    prisma.user.updateMany.mockImplementationOnce(async () => {
+      state.balanceClaims += 1;
+      return { count: 0 };
+    });
 
     await expect(payInvoice(prisma, { invoiceId: 'invoice-1', customerId: 7 }))
       .rejects.toThrow('INSUFFICIENT_FUNDS');
 
-    expect(state.balanceClaims).toBe(0);
+    expect(state.balanceClaims).toBe(1);
     expect(state.balanceMutations).toBe(0);
     expect(state.historyWrites).toBe(0);
     expect(state.invoice.payTxHash).toBeNull();
