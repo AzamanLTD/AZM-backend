@@ -43,8 +43,12 @@ class ShiftService {
     // schedule. Same pattern as businessTaxPresetService / orderTracking
     // mutation-safe services. Acquired through `tx` only — held until commit.
     async _lockEmployeeSchedule(tx, employeeId) {
+        // pg_advisory_xact_lock() returns void, which Prisma's query engine
+        // cannot deserialize in either $queryRaw form (CI-proven failure).
+        // Selecting a constant FROM the lock function yields a real int column
+        // while still acquiring the lock inside the transaction.
         await tx.$queryRawUnsafe(
-            'SELECT pg_advisory_xact_lock(hashtext($1))',
+            'SELECT 1 AS locked FROM pg_advisory_xact_lock(hashtext($1))',
             'business_shift_schedule:' + String(employeeId),
         );
     }
