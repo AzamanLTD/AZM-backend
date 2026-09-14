@@ -2,7 +2,7 @@
 
 const { payInvoice } = require('../services/businessInvoiceService');
 
-const makeConcurrentPrisma = () => {
+const makeConcurrentPrisma = ({ synchronizeInitialReads = false } = {}) => {
   const state = {
     invoice: {
       id: 'invoice-1',
@@ -39,8 +39,8 @@ const makeConcurrentPrisma = () => {
     businessInvoice: {
       findUnique: jest.fn(async () => {
         state.initialReads += 1;
-        if (state.initialReads === 2) releaseResolve();
-        if (state.initialReads <= 2) await state.releaseInitialReads;
+        if (synchronizeInitialReads && state.initialReads === 2) releaseResolve();
+        if (synchronizeInitialReads && state.initialReads <= 2) await state.releaseInitialReads;
         if (state.initialReads > 2 && state.invoice.payTxHash && !state.invoice.customerPaidUsdc) {
           await state.settlementCommitted;
         }
@@ -101,7 +101,7 @@ const makeConcurrentPrisma = () => {
 
 describe('business invoice payment concurrency', () => {
   test('two concurrent payers produce one settlement and one replay', async () => {
-    const { prisma, state } = makeConcurrentPrisma();
+    const { prisma, state } = makeConcurrentPrisma({ synchronizeInitialReads: true });
 
     const results = await Promise.all([
       payInvoice(prisma, { invoiceId: 'invoice-1', customerId: 7 }),
@@ -127,7 +127,7 @@ describe('business invoice payment concurrency', () => {
 
   test('payment fails closed when the atomic wallet claim cannot obtain sufficient funds', async () => {
     const { prisma, state } = makeConcurrentPrisma();
-    prisma.user.updateMany.mockResolvedValueOnce({ count: 0 });
+    prisma.user.updateMany.mockImplementationOnce(async () => ({ count: 0 }));
 
     await expect(payInvoice(prisma, { invoiceId: 'invoice-1', customerId: 7 }))
       .rejects.toThrow('INSUFFICIENT_FUNDS');
