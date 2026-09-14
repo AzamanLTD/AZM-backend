@@ -114,19 +114,23 @@ describeOrSkip('Shift scheduling/state integrity (real PostgreSQL)', () => {
         const shiftB = await ownerCtx(biz.id, () =>
             svc.createShift(mkShiftArgs(biz, employee, '2026-10-01T16:00:00.000Z', '2026-10-01T20:00:00.000Z')));
 
-        // Both updates would overlap the OTHER shift if they both committed.
-        const extendA = () => ownerCtx(biz.id, () =>
-            svc.updateShift(shiftA.id, { endTime: '2026-10-01T18:00:00.000Z' }))
+        // Each update is VALID against the committed schedule but the two
+        // RESULTS would overlap each other — without serialization both
+        // could commit an invalid schedule (the race the lock closes).
+        const growA = () => ownerCtx(biz.id, () =>
+            svc.updateShift(shiftA.id, { endTime: '2026-10-01T15:30:00.000Z' }))
             .then(() => ({ ok: true })).catch((e) => ({ ok: false, e }));
-        const extendB = () => ownerCtx(biz.id, () =>
-            svc.updateShift(shiftB.id, { startTime: '2026-10-01T10:00:00.000Z' }))
+        const growB = () => ownerCtx(biz.id, () =>
+            svc.updateShift(shiftB.id, { startTime: '2026-10-01T15:00:00.000Z' }))
             .then(() => ({ ok: true })).catch((e) => ({ ok: false, e }));
 
-        const outcomes = await Promise.all([extendA(), extendB()]);
+        const outcomes = await Promise.all([growA(), growB()]);
 
-        // The advisory lock serializes them: the first commits its overlap,
-        // the second sees the conflict and is rejected.
+        // The advisory lock serializes them: the first commits, the second
+        // sees the now-committed overlap and is rejected.
         expect(outcomes.filter((o) => o.ok)).toHaveLength(1);
+        expect(outcomes.filter((o) => !o.ok)[0].e.message)
+            .toBe('Employee already has a conflicting shift at this time.');
 
         const [a, b] = await Promise.all([
             prisma.shift.findUnique({ where: { id: shiftA.id } }),
@@ -182,7 +186,10 @@ describeOrSkip('Shift scheduling/state integrity (real PostgreSQL)', () => {
         const row = await prisma.shift.findUnique({ where: { id: shift.id } });
         if (delOutcome.ok) {
             expect(row).toBeNull();               // delete won: shift is gone
-            expect(clockOutcome.e.message).toBe('Shift not found.');
+            // clockIn's pre-read may have beaten the committed delete, but its
+            // guarded SCHEDULED-only transition then correctly refuses.
+            expect(['Shift not found.', 'Shift was already resolved or clocked in.'])
+                .toContain(clockOutcome.e.message);
         } else {
             expect(row).not.toBeNull();           // clock-in won: shift is active
             expect(['CLOCKED_IN', 'LATE']).toContain(row.status);
