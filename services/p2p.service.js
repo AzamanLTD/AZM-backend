@@ -295,8 +295,25 @@ const markUnderpaid = async (prisma, { tradeId, callerUserId, paidAmountFiat, in
         const isSellAd = trade.type === 'SELL';
 
         if (isSellAd) {
-            // SELL ad: vendor escrowed USDC. Release paid portion to buyer,
-            // refund unpaid portion back to vendor.
+            // SELL ad: the VENDOR holds the escrow (tradeController accept-flow
+            // locks the vendor's trading pool for SELL ads). The buyer paid
+            // `paidFractionUsdc` worth of fiat, so the escrowed principal
+            // splits: paid portion → buyer, unpaid portion → back to the
+            // vendor's available balance. The FULL principal leaves the escrow
+            // in ONE guarded conditional claim — the pre-fix code credited the
+            // buyer without debiting the escrow for the paid portion, leaving
+            // it stuck in escrow while minting an unbacked credit.
+            const escrowClaim = await tx.user.updateMany({
+                where: {
+                    id:                  trade.vendorId,
+                    escrowLockedBalance: { gte: totalLockedUsdc }
+                },
+                data: { escrowLockedBalance: { decrement: totalLockedUsdc } }
+            });
+            if (escrowClaim.count !== 1) {
+                throw new Error('ESCROW_INSUFFICIENT_FUNDS');
+            }
+
             await tx.user.update({
                 where: { id: trade.userId },
                 data:  { availableBalance: { increment: paidFractionUsdc } }
@@ -305,16 +322,26 @@ const markUnderpaid = async (prisma, { tradeId, callerUserId, paidAmountFiat, in
             if (unpaidFractionUsdc > 0) {
                 await tx.user.update({
                     where: { id: trade.vendorId },
-                    data: {
-                        escrowLockedBalance: { decrement: unpaidFractionUsdc },
-                        availableBalance:    { increment: unpaidFractionUsdc }
-                    }
+                    data:  { availableBalance: { increment: unpaidFractionUsdc } }
                 });
             }
         } else {
-            // BUY ad: user escrowed USDC (they're selling crypto to vendor).
-            // Vendor underpaid fiat — release paid USDC portion to vendor,
-            // refund unpaid portion back to user.
+            // BUY ad: trade.userId holds the escrow (tradeController accept-flow
+            // locks trade.userId's availableBalance for BUY ads — they're
+            // selling crypto to the vendor). The vendor underpaid fiat: paid
+            // portion → vendor, unpaid portion → back to the user's available
+            // balance. Full principal leaves the escrow in ONE guarded claim.
+            const escrowClaim = await tx.user.updateMany({
+                where: {
+                    id:                  trade.userId,
+                    escrowLockedBalance: { gte: totalLockedUsdc }
+                },
+                data: { escrowLockedBalance: { decrement: totalLockedUsdc } }
+            });
+            if (escrowClaim.count !== 1) {
+                throw new Error('ESCROW_INSUFFICIENT_FUNDS');
+            }
+
             await tx.user.update({
                 where: { id: trade.vendorId },
                 data:  { availableBalance: { increment: paidFractionUsdc } }
@@ -323,10 +350,7 @@ const markUnderpaid = async (prisma, { tradeId, callerUserId, paidAmountFiat, in
             if (unpaidFractionUsdc > 0) {
                 await tx.user.update({
                     where: { id: trade.userId },
-                    data: {
-                        escrowLockedBalance: { decrement: unpaidFractionUsdc },
-                        availableBalance:    { increment: unpaidFractionUsdc }
-                    }
+                    data:  { availableBalance: { increment: unpaidFractionUsdc } }
                 });
             }
         }
@@ -476,14 +500,35 @@ const flagOverpayment = async (prisma, { tradeId, buyerId, overpaidAmountUsdc })
             fromAvailable = remainingToLock;
         }
 
-        // Atomically move to disputeEscrowBalance
+        // Guarded conditional drains — the split computed above is
+        // informational only; each debit must win a sufficient-balance
+        // predicate or the WHOLE transaction rolls back. A stale snapshot
+        // can never push a bucket negative.
+        if (fromUnallocated > 0) {
+            const unallocatedClaim = await tx.user.updateMany({
+                where: { id: trade.vendorId, vendorUnallocatedBalance: { gte: fromUnallocated } },
+                data:  { vendorUnallocatedBalance: { decrement: fromUnallocated } }
+            });
+            if (unallocatedClaim.count !== 1) {
+                throw new Error('ESCROW_INSUFFICIENT_FUNDS');
+            }
+        }
+        if (fromAvailable > 0) {
+            const availableClaim = await tx.user.updateMany({
+                where: { id: trade.vendorId, availableBalance: { gte: fromAvailable } },
+                data:  { availableBalance: { decrement: fromAvailable } }
+            });
+            if (availableClaim.count !== 1) {
+                throw new Error('ESCROW_INSUFFICIENT_FUNDS');
+            }
+        }
+
+        // Credit the frozen amount into dispute escrow. The total credited
+        // is exactly the total guarded-debited (fromUnallocated +
+        // fromAvailable === overpaidAmountUsdc) — never more.
         await tx.user.update({
             where: { id: trade.vendorId },
-            data: {
-                vendorUnallocatedBalance: { decrement: fromUnallocated },
-                availableBalance:         { decrement: fromAvailable },
-                disputeEscrowBalance:     { increment: overpaidAmountUsdc }
-            }
+            data:  { disputeEscrowBalance: { increment: overpaidAmountUsdc } }
         });
 
         // Escalate trade to DISPUTED (idempotent — already-disputed trades
@@ -672,42 +717,77 @@ const completeTrade = async (prisma, { tradeId, releasedByUserId, adminOverride 
             throw new Error('TRADE_ALREADY_FINALIZED');
         }
 
-        // 1. BUY/SELL diverge on who receives USDC from escrow.
+        // 1. BUY/SELL diverge on WHO holds the escrow and WHO paid fiat.
+        //    Authoritative escrow direction — tradeController accept-flow:
+        //      SELL ad → the VENDOR's trading pool was locked
+        //                (vendorUnallocatedBalance → escrowLockedBalance).
+        //                The BUYER paid fiat, so completing the trade
+        //                releases the escrowed USDC TO THE BUYER.
+        //      BUY ad  → trade.userId's availableBalance was locked
+        //                (they sold crypto to the vendor). The VENDOR paid
+        //                fiat, so completing the trade releases the escrowed
+        //                USDC TO THE VENDOR.
+        //    (The pre-fix code debited the NON-escrow-holding party's bucket
+        //    — pushing it negative — and credited the fiat payer twice.
+        //    Direction reconciled with tradeController + markUnderpaid +
+        //    flagOverpayment, which all already encode this authority.)
         if (isSellAd) {
-            // SELL ad: user escrowed USDC. Vendor sent fiat.
-            // User releases → vendor gets net USDC, user's escrow cleared.
-            await tx.user.update({
-                where: { id: trade.userId },
-                data: {
-                    escrowLockedBalance: { decrement: trade.amountCrypto }
-                }
-            });
-
-            // Vendor receives net USDC (amountCrypto minus admin fee)
-            const vendorNetUsdc = trade.amountCrypto - adminCutUsdc;
-            await tx.user.update({
-                where: { id: trade.vendorId },
-                data: {
-                    availableBalance: { increment: vendorNetUsdc },
-                    tradesCompleted:  { increment: 1 }
-                }
-            });
-        } else {
-            // BUY ad: vendor escrowed USDC. User sent fiat.
-            // Vendor releases → user gets net USDC, vendor's escrow cleared.
-            await tx.user.update({
-                where: { id: trade.vendorId },
+            // Guarded conditional escrow debit: the vendor's bucket must
+            // still hold the full principal or the whole settlement rolls
+            // back (never below zero, never from a read snapshot).
+            const escrowClaim = await tx.user.updateMany({
+                where: {
+                    id:                  trade.vendorId,
+                    escrowLockedBalance: { gte: trade.amountCrypto }
+                },
                 data: {
                     escrowLockedBalance: { decrement: trade.amountCrypto },
                     tradesCompleted:     { increment: 1 }
                 }
             });
+            if (escrowClaim.count !== 1) {
+                throw new Error('ESCROW_INSUFFICIENT_FUNDS');
+            }
 
-            // User receives net USDC (amountCrypto minus admin fee)
+            // Buyer paid the fiat — buyer receives the net USDC
+            // (amountCrypto minus the total platform fee).
             await tx.user.update({
                 where: { id: trade.userId },
+                data:  { availableBalance: { increment: netUsdc } }
+            });
+
+            // The vendor's share of the platform margin is paid to the
+            // vendor (section design: "Vendor cut → vendor's
+            // availableBalance"). Conservation: netUsdc + vendorCutUsdc +
+            // adminCutUsdc === amountCrypto.
+            await tx.user.update({
+                where: { id: trade.vendorId },
+                data:  { availableBalance: { increment: vendorCutUsdc } }
+            });
+        } else {
+            // BUY ad: trade.userId holds the escrow.
+            const escrowClaim = await tx.user.updateMany({
+                where: {
+                    id:                  trade.userId,
+                    escrowLockedBalance: { gte: trade.amountCrypto }
+                },
+                data: { escrowLockedBalance: { decrement: trade.amountCrypto } }
+            });
+            if (escrowClaim.count !== 1) {
+                throw new Error('ESCROW_INSUFFICIENT_FUNDS');
+            }
+
+            // Vendor paid the fiat — vendor receives the net USDC plus
+            // their own margin share (identical to the SELL-ad vendor
+            // outcome: amountCrypto - adminCutUsdc) and completes the trade.
+            // Conservation: (netUsdc + vendorCutUsdc) + adminCutUsdc ===
+            // amountCrypto. (The pre-fix code paid only netUsdc here and
+            // silently destroyed vendorCutUsdc.)
+            await tx.user.update({
+                where: { id: trade.vendorId },
                 data: {
-                    availableBalance: { increment: netUsdc }
+                    availableBalance: { increment: netUsdc + vendorCutUsdc },
+                    tradesCompleted:  { increment: 1 }
                 }
             });
         }

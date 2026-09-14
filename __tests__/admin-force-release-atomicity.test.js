@@ -21,7 +21,7 @@ const p2pService = require('../services/p2p.service');
 function makeTx(overrides = {}) {
     const defaults = {
         trade: { updateMany: jest.fn().mockResolvedValue({ count: 1 }) },
-        user: { update: jest.fn().mockResolvedValue({}) },
+        user: { update: jest.fn().mockResolvedValue({}), updateMany: jest.fn().mockResolvedValue({ count: 1 }) },
         systemProfitFees: {
             upsert: jest.fn().mockResolvedValue({}),
             update: jest.fn().mockResolvedValue({}),
@@ -190,7 +190,29 @@ describe('Admin force-release atomicity (issue #48)', () => {
                     data: expect.objectContaining({ status: 'COMPLETED' })
                 })
             );
-            expect(tx.user.update).toHaveBeenCalledTimes(2);
+            // BUY ad: trade.userId's escrow is claimed with a guarded
+            // updateMany (debited only if it still holds the principal);
+            // the vendor (fiat payer) receives net + vendor cut and
+            // completes the trade — one credit update.
+            expect(tx.user.updateMany).toHaveBeenCalledTimes(1);
+            expect(tx.user.updateMany).toHaveBeenCalledWith(
+                expect.objectContaining({
+                    where: expect.objectContaining({
+                        id: 9,
+                        escrowLockedBalance: expect.objectContaining({ gte: 100 })
+                    })
+                })
+            );
+            expect(tx.user.update).toHaveBeenCalledTimes(1);
+            expect(tx.user.update).toHaveBeenCalledWith(
+                expect.objectContaining({
+                    where: { id: 7 },
+                    data: expect.objectContaining({
+                        availableBalance: expect.objectContaining({ increment: expect.any(Number) }),
+                        tradesCompleted: expect.objectContaining({ increment: 1 })
+                    })
+                })
+            );
         });
     });
 });

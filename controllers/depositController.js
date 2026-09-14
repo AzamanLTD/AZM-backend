@@ -218,25 +218,56 @@ exports.localFiatDepositWebhook = async (req, res) => {
         const liveUsdToGhs   = settings.liveUsdToGhs;
         const usdcEquivalent = parseFloat((amountGhsFloat / liveUsdToGhs).toFixed(6));
 
-        // ── ACID transition ──────────────────────────────────────────────────
+        // ── ACID transition (exactly-once settlement) ──────────────────────────
+        // The PENDING → COMPLETED flip is ITSELF the winner claim and runs
+        // BEFORE the wallet credit, inside the SAME transaction. Two
+        // concurrent SUCCESS webhooks for the same reference can no longer
+        // both observe PENDING and double-credit: the conditional updateMany
+        // only matches a row that is still PENDING, so exactly one caller
+        // gets count=1. The loser re-reads the row and converges WITHOUT any
+        // financial mutation. If the wallet credit fails, the transaction
+        // rolls the COMPLETED claim back to PENDING.
         const result = await prisma.$transaction(async (tx) => {
-            const user = await tx.user.findUnique({ where: { id: existing.userId } });
-            if (!user) throw new Error('User no longer exists for this deposit.');
+            const claim = await tx.transactionHistory.updateMany({
+                where: { txHash: reference, status: 'PENDING' },
+                data:  { status: 'COMPLETED', amountUsdc: usdcEquivalent }
+            });
 
+            if (claim.count !== 1) {
+                // Someone else already settled this reference. A completed
+                // settlement is an idempotent replay; any other state keeps
+                // the endpoint's existing 409 contract (thrown below after
+                // the re-read so the rollback semantics are real).
+                const current = await tx.transactionHistory.findUnique({
+                    where: { txHash: reference }
+                });
+                if (current && current.status === 'COMPLETED') {
+                    return { alreadyProcessed: true };
+                }
+                throw new Error(
+                    `Cannot complete deposit in state ${current ? current.status : existing.status}.`
+                );
+            }
+
+            // Only the winner of the PENDING claim may credit the wallet —
+            // same transaction, so a failure here rolls the claim back.
             await tx.user.update({
                 where: { id: existing.userId },
                 data:  { availableBalance: { increment: usdcEquivalent } }
             });
 
-            const updatedTx = await tx.transactionHistory.update({
-                where: { txHash: reference },
-                data:  { amountUsdc: usdcEquivalent, status: 'COMPLETED' }
-            });
-
-            // Phase N: notification moved post-commit for full pipeline delivery.
-
-            return { user, updatedTx };
+            return { alreadyProcessed: false, updatedTx: { ...existing, status: 'COMPLETED', amountUsdc: usdcEquivalent } };
         });
+
+        if (result.alreadyProcessed) {
+            // Replay after a committed settlement: no financial mutation and
+            // no duplicate post-commit side effects.
+            return res.status(200).json({
+                success: true,
+                message: 'Deposit already processed.',
+                data:    { reference, alreadyProcessed: true }
+            });
+        }
 
         // Side-effects (post-commit)
         if (emitBalanceUpdate) await emitBalanceUpdate(existing.userId);
@@ -741,13 +772,15 @@ exports.moolreCollectionWebhook = async (req, res) => {
         const ghsFloat   = parseFloat(amountGhsRaw || existing.metadata?.amountGhs || 0);
         const usdcCredit = parseFloat((ghsFloat / Number(settings.liveUsdToGhs)).toFixed(6));
 
-        await prisma.$transaction([
-            prisma.user.update({
-                where: { id: existing.userId },
-                data:  { availableBalance: { increment: usdcCredit } },
-            }),
-            prisma.transactionHistory.update({
-                where: { id: existing.id },
+        // ── Exactly-once settlement ────────────────────────────────────────────
+        // The PENDING → COMPLETED flip is the winner claim and precedes the
+        // wallet credit inside the SAME transaction (the read above is only
+        // a lookup, never an authorization to credit). Concurrent duplicate
+        // webhooks converge: exactly one count=1 claim, one credit; the
+        // loser commits nothing.
+        const result = await prisma.$transaction(async (tx) => {
+            const claim = await tx.transactionHistory.updateMany({
+                where: { txHash: externalRef, status: 'PENDING' },
                 data: {
                     status: 'COMPLETED', amountUsdc: usdcCredit,
                     payerMsisdn: payerMsisdn || null,
@@ -759,8 +792,33 @@ exports.moolreCollectionWebhook = async (req, res) => {
                         moolreData: data,
                     },
                 },
-            }),
-        ]);
+            });
+
+            if (claim.count !== 1) {
+                const current = await tx.transactionHistory.findUnique({
+                    where: { txHash: externalRef }
+                });
+                if (current && current.status === 'COMPLETED') {
+                    return { alreadyProcessed: true };
+                }
+                throw new Error(`Cannot complete deposit in state ${current ? current.status : existing.status}.`);
+            }
+
+            // Only the winner of the PENDING claim credits the wallet — a
+            // failure here rolls the claim back (no phantom COMPLETED row).
+            await tx.user.update({
+                where: { id: existing.userId },
+                data:  { availableBalance: { increment: usdcCredit } },
+            });
+
+            return { alreadyProcessed: false };
+        });
+
+        if (result.alreadyProcessed) {
+            // Replay after a committed settlement: nothing moved, no duplicate
+            // socket/notification/audit/journal side effects.
+            return res.status(200).json({ success: true, message: 'Already processed.' });
+        }
 
         try {
             const io = req.app.get('socketio');

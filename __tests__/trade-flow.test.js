@@ -56,7 +56,7 @@ describeOrSkip('completeTrade — concurrent finalize is single-winner', () => {
     }, 15000);
 
     test('two simultaneous completeTrade calls: exactly one succeeds', async () => {
-        // Real seed: a PAID SELL trade where the buyer has escrowed amountCrypto.
+        // Real seed: a PAID SELL trade where the vendor has escrowed amountCrypto.
         const seed = await seedPaidTrade(prisma);
 
         const complete = () =>
@@ -72,14 +72,17 @@ describeOrSkip('completeTrade — concurrent finalize is single-winner', () => {
         const successes = [a, b].filter((x) => x.ok).length;
         expect(successes).toBe(1);
 
-        // Exactly one payout: the buyer's escrow is drained exactly once (a
-        // double-payout would push escrowLockedBalance negative), and the vendor
-        // is credited once with the net (0 < net <= amountCrypto after fees).
+        // Exactly one payout under the authoritative escrow direction (SELL ad:
+        // vendor's trading pool was locked — tradeController accept-flow). The
+        // VENDOR's escrow is drained exactly once (a double-payout would leave
+        // it at amountCrypto - 2*amountCrypto), and the BUYER — who paid the
+        // fiat — is credited once with the net.
         const buyer = await prisma.user.findUnique({ where: { id: seed.buyerId } });
+        expect(Number(buyer.availableBalance)).toBeGreaterThan(0);
+        expect(Number(buyer.availableBalance)).toBeLessThanOrEqual(seed.amountCrypto);
         expect(Number(buyer.escrowLockedBalance)).toBeCloseTo(0, 6);
 
         const vendor = await prisma.user.findUnique({ where: { id: seed.vendorId } });
-        expect(Number(vendor.availableBalance)).toBeGreaterThan(0);
-        expect(Number(vendor.availableBalance)).toBeLessThanOrEqual(seed.amountCrypto);
+        expect(Number(vendor.escrowLockedBalance)).toBeCloseTo(0, 6);
     });
 });
