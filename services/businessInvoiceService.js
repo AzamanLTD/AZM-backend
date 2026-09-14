@@ -24,20 +24,15 @@ const _invoiceRef = () => {
   return `INV-${yy}${mm}${dd}-${rand}`;
 };
 
-// ── createInvoice ──────────────────────────────────────────────────────────
 const createInvoice = async (prisma, {
   businessProfileId, customerId, locationId, tableId,
   lineItems, taxLines, businessNote, idempotencyKey,
 }) => {
-  // Validate line items
   if (!Array.isArray(lineItems) || lineItems.length === 0)
     throw new Error('At least one line item is required.');
   if (lineItems.length > 50)
     throw new Error('Maximum 50 line items per invoice.');
 
-  // A missing taxLines value means "use the business default preset". An
-  // explicit [] remains authoritative for callers that intentionally request
-  // a tax-free invoice.
   let effectiveTaxLines = taxLines;
   if (effectiveTaxLines === undefined) {
     const defaultPreset = await prisma.businessTaxPreset.findFirst({
@@ -48,19 +43,16 @@ const createInvoice = async (prisma, {
     effectiveTaxLines = defaultPreset ? [defaultPreset] : [];
   }
 
-  // Compute subtotal + tax lines (extracted to utils/invoiceMath.js)
   const { subtotal: subtotalUsdc, lineItems: cleanLineItems } = computeLineItems(lineItems);
   const { taxTotal: taxTotalUsdc, taxLines: cleanTaxLines } = computeTaxLines(effectiveTaxLines, subtotalUsdc);
   const billTotalUsdc = subtotalUsdc + taxTotalUsdc;
 
-  // Validate customer exists
   const customer = await prisma.user.findUnique({
     where: { id: customerId },
     select: { id: true, username: true },
   });
   if (!customer) throw new Error('Customer not found.');
 
-  // Generate unique invoiceRef (retry on collision)
   let invoiceRef = null;
   for (let i = 0; i < 5; i++) {
     const candidate = _invoiceRef();
@@ -84,7 +76,6 @@ const createInvoice = async (prisma, {
     include: { lineItems: true, taxLines: true },
   });
 
-  // Fire-and-forget webhook for invoice creation
   emitWebhookEvent(businessProfileId, 'invoice.created', {
     invoiceId: invoice.id,
     invoiceRef: invoice.invoiceRef,
@@ -96,7 +87,6 @@ const createInvoice = async (prisma, {
   return invoice;
 };
 
-// ── sendInvoice ────────────────────────────────────────────────────────────
 const sendInvoice = async (prisma, { invoiceId, businessProfileId }) => {
   const invoice = await prisma.businessInvoice.findUnique({
     where: { id: invoiceId },
@@ -114,7 +104,6 @@ const sendInvoice = async (prisma, { invoiceId, businessProfileId }) => {
   });
 };
 
-// ── voidInvoice ────────────────────────────────────────────────────────────
 const voidInvoice = async (prisma, { invoiceId, businessProfileId }) => {
   const invoice = await prisma.businessInvoice.findUnique({ where: { id: invoiceId } });
   if (!invoice) throw new Error('Invoice not found.');
@@ -128,10 +117,6 @@ const voidInvoice = async (prisma, { invoiceId, businessProfileId }) => {
   });
 };
 
-// ── payInvoice ─────────────────────────────────────────────────────────────
-// THE FINANCIAL FUNCTION. Mirrors peerTransferController.sendFunds.
-// Idempotency: invoice.payTxHash is the anchor. The claim below makes that
-// anchor atomic, so two concurrent payment requests cannot both debit funds.
 const payInvoice = async (prisma, {
   invoiceId, customerId, tipUsdc, customerNote, customerCoveredFee,
 }) => {
@@ -145,15 +130,11 @@ const payInvoice = async (prisma, {
   if (!invoice) throw new Error('Invoice not found.');
   if (invoice.customerId !== customerId) throw new Error('Not authorized to pay this invoice.');
 
-  // ── IDEMPOTENCY REPLAY ──────────────────────────────────────────────────
-  // Check the durable marker before the status gate. A committed PAID invoice
-  // is a successful replay, not an invalid state transition.
   if (invoice.payTxHash) {
     return { invoice, customerPays: Number(invoice.customerPaidUsdc), alreadyPaid: true };
   }
   if (invoice.status !== 'SENT') throw new Error(`Invoice cannot be paid from status ${invoice.status}.`);
 
-  // ── FEE CALCULATION ─────────────────────────────────────────────────────
   const settings = await prisma.globalSettings.findUnique({ where: { id: 1 } });
   const feePct = Number(settings?.businessInvoiceFeePct ?? 0.015);
   const billPlusTip = Number(invoice.billTotalUsdc) + tip;
@@ -162,23 +143,17 @@ const payInvoice = async (prisma, {
   let customerPays, businessReceives;
   if (coveredFee) {
     customerPays = parseFloat((billPlusTip + fee).toFixed(8));
-    businessReceives = billPlusTip;          // business gets full amount
+    businessReceives = billPlusTip;
   } else {
     customerPays = billPlusTip;
-    businessReceives = parseFloat((billPlusTip - fee).toFixed(8));  // business absorbs fee
+    businessReceives = parseFloat((billPlusTip - fee).toFixed(8));
   }
 
   const businessOwnerUserId = invoice.businessProfile.userId;
-  const payTxHash = `INV_PAY_${invoiceId}`;  // invoiceId IS the idempotency anchor
+  const payTxHash = `INV_PAY_${invoiceId}`;
 
-  // ── ATOMIC TRANSACTION ──────────────────────────────────────────────────
   try {
     const result = await prisma.$transaction(async (tx) => {
-      // Claim the invoice before any balance mutation. The unique deterministic
-      // payTxHash is written only while the invoice is still SENT and unclaimed.
-      // PostgreSQL/Prisma waits for a concurrent update on the same row, then
-      // returns count=0 to the losing request. If this transaction later fails,
-      // the claim rolls back with all other financial mutations.
       const claim = await tx.businessInvoice.updateMany({
         where: { id: invoiceId, status: 'SENT', payTxHash: null },
         data: { payTxHash },
@@ -187,25 +162,23 @@ const payInvoice = async (prisma, {
         throw new Error('INVOICE_ALREADY_PAID');
       }
 
-      const customer = await tx.user.findUnique({
-        where: { id: customerId }, select: { availableBalance: true, username: true },
+      // The balance mutation itself is the concurrency guard. A read-then-
+      // unconditional decrement is unsafe when the same customer pays two
+      // different invoices concurrently: both transactions can observe the
+      // same balance and both can subtract. This conditional UPDATE serializes
+      // on the user row and only one claim succeeds when funds are exhausted.
+      const balanceClaim = await tx.user.updateMany({
+        where: { id: customerId, availableBalance: { gte: customerPays } },
+        data: { availableBalance: { decrement: customerPays } },
       });
-      if (!customer) throw new Error('Customer not found.');
-      if (Number(customer.availableBalance) < customerPays) {
+      if (balanceClaim.count !== 1) {
         throw new Error('INSUFFICIENT_FUNDS');
       }
 
-      // Debit customer
-      await tx.user.update({
-        where: { id: customerId },
-        data: { availableBalance: { decrement: customerPays } },
-      });
-      // Credit business owner
       await tx.user.update({
         where: { id: businessOwnerUserId },
         data: { availableBalance: { increment: businessReceives } },
       });
-      // Platform fee
       if (fee > 0) {
         await tx.systemProfitFees.upsert({
           where: { id: 1 },
@@ -218,8 +191,6 @@ const payInvoice = async (prisma, {
           relatedTxId: payTxHash,
         }});
       }
-      // Mark invoice PAID. payTxHash was already claimed above in the same
-      // transaction; this final update supplies the settlement fields.
       const updated = await tx.businessInvoice.update({
         where: { id: invoiceId },
         data: {
@@ -231,7 +202,6 @@ const payInvoice = async (prisma, {
         include: { lineItems: true, taxLines: true,
           businessProfile: { select: { userId: true, businessName: true, bizId: true } } },
       });
-      // TransactionHistory — customer debit (signed: negative)
       await tx.transactionHistory.create({ data: {
         userId: customerId,
         type: 'BUSINESS_INVOICE_PAYMENT',
@@ -240,7 +210,6 @@ const payInvoice = async (prisma, {
         txHash: `${payTxHash}_PAYER`,
         status: 'COMPLETED',
       }});
-      // TransactionHistory — business credit (signed: positive)
       await tx.transactionHistory.create({ data: {
         userId: businessOwnerUserId,
         type: 'BUSINESS_INVOICE_RECEIPT',
@@ -255,9 +224,6 @@ const payInvoice = async (prisma, {
     return { invoice: result, customerPays, businessReceives, fee };
   } catch (err) {
     if (err.message === 'INVOICE_ALREADY_PAID') {
-      // The losing concurrent request must return the committed invoice rather
-      // than re-running any financial mutation. A refetch also handles a
-      // replay arriving after the first payment has fully committed.
       const paidInvoice = await prisma.businessInvoice.findUnique({
         where: { id: invoiceId },
         include: { businessProfile: { select: { userId: true, businessName: true, bizId: true } } },
@@ -274,7 +240,6 @@ const payInvoice = async (prisma, {
   }
 };
 
-// ── getInvoice ─────────────────────────────────────────────────────────────
 const getInvoice = async (prisma, { invoiceId }) => {
   return prisma.businessInvoice.findUnique({
     where: { id: invoiceId },
@@ -290,7 +255,6 @@ const getInvoice = async (prisma, { invoiceId }) => {
   });
 };
 
-// ── listInvoicesForBusiness ─────────────────────────────────────────────────
 const listInvoicesForBusiness = async (prisma, { businessProfileId, status, limit, cursor }) => {
   const take = Math.min(parseInt(limit, 10) || 20, 50);
   const where = { businessProfileId };
@@ -309,7 +273,6 @@ const listInvoicesForBusiness = async (prisma, { businessProfileId, status, limi
   return { invoices: invoices.slice(0, take), hasMore, nextCursor: hasMore ? invoices[take-1].id : null };
 };
 
-// ── listInvoicesForCustomer ─────────────────────────────────────────────────
 const listInvoicesForCustomer = async (prisma, { customerId, status, limit, cursor }) => {
   const take = Math.min(parseInt(limit, 10) || 20, 50);
   const where = { customerId, status: status || { in: ['SENT','PAID'] } };
@@ -328,9 +291,6 @@ const listInvoicesForCustomer = async (prisma, { customerId, status, limit, curs
   return { invoices: invoices.slice(0, take), hasMore, nextCursor: hasMore ? invoices[take-1].id : null };
 };
 
-// ── lookupCustomerByAzamanId ────────────────────────────────────────────────
-// Powers the business portal "find customer to bill" search field.
-// ONLY returns public-safe fields — never balance, email, or phone.
 const lookupCustomerByAzamanId = async (prisma, { azamanId }) => {
   if (!azamanId || !String(azamanId).trim()) return null;
   return prisma.user.findUnique({
