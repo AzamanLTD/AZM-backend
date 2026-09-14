@@ -2510,6 +2510,11 @@ model BusinessProfile {
   // falls back to category tint (existing behavior in collapsible_business_bar.dart).
   adAccentColor   String?          @db.VarChar(7)
 
+  // Business stake balance (2026-09-14): the reserable security deposit a
+  // business posts; business no-show penalties are deducted from it with a
+  // guarded conditional claim (never below zero). Default 0 = no stake posted.
+  stakeBalance    Decimal         @default(0) @db.Decimal(20, 8)
+
   // Verification
   isVerified Boolean   @default(false)
   verifiedAt DateTime?

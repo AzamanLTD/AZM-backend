@@ -1115,6 +1115,12 @@ const cancelEscrow = async (prisma, { escrowId, userId }) => {
     throw new Error(`Escrow cannot be cancelled from status ${escrow.status}.`);
 };
 
+// Transaction-scoped financial primitives for OTHER authoritative services.
+// bookingEscrowService.processBusinessNoShow reuses _refundEscrowTx on its
+// own caller transaction so the refund, the business-stake penalty, the
+// booking terminal transition and the audit row commit as ONE unit.
+const refundEscrowInTransaction = _refundEscrowTx;
+
 module.exports = {
     createEscrow,
     fundEscrow,
@@ -1128,6 +1134,12 @@ module.exports = {
     // Exposed for the expiry worker (Work Item 9).
     _refundEscrow,
     _releaseEscrow,
+    // Transaction-scoped canonical financial primitives — reuse these, never
+    // reimplement escrow money movement in another service.
+    _claimEscrowStatusTx,
+    _releaseEscrowTx,
+    _refundEscrowTx,
+    refundEscrowInTransaction,
     // Constants for reuse/testing.
     SMART_ESCROW_FEE_PCT_DEFAULT,
     DRAFT_EXPIRY_HOURS,
