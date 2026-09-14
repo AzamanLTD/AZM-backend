@@ -633,7 +633,7 @@ describeOrSkip('Admin RBAC — real-DB concurrency (compare-and-swap)', () => {
                 res()
             ),
             ctrl.approveRequest(
-                { user: { id: comp.id, role: 'COMPLIANCE_ADMIN' }, params: { id: String(request.id) }, body: {}, app: app() },
+                { user: { id: comp.id, role: 'SUPER_ADMIN' }, params: { id: String(request.id) }, body: {}, app: app() },
                 res()
             ),
         ]);
@@ -646,7 +646,7 @@ describeOrSkip('Admin RBAC — real-DB concurrency (compare-and-swap)', () => {
 
         // Retry the loser after its refresh — now the total is exactly two,
         // not one overwritten and not three.
-        const retryUser = r1._status === 409 ? { id: fin.id, role: 'FINANCE_ADMIN' } : { id: comp.id, role: 'COMPLIANCE_ADMIN' };
+        const retryUser = r1._status === 409 ? { id: fin.id, role: 'FINANCE_ADMIN' } : { id: comp.id, role: 'SUPER_ADMIN' };
         const r3 = res();
         await ctrl.approveRequest({ user: retryUser, params: { id: String(request.id) }, body: {}, app: app() }, r3);
         expect(r3._status).toBe(200);
@@ -701,7 +701,7 @@ describeOrSkip('Admin RBAC — real-DB concurrency (compare-and-swap)', () => {
                 res()
             ),
             ctrl.rejectRequest(
-                { user: { id: fin.id, role: 'FINANCE_ADMIN' }, params: { id: String(request.id) }, body: { reason: 'second' }, app: app() },
+                { user: { id: fin.id, role: 'SUPER_ADMIN' }, params: { id: String(request.id) }, body: { reason: 'second' }, app: app() },
                 res()
             ),
         ]);
