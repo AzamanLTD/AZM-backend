@@ -103,9 +103,7 @@ describeOrSkip('SmartEscrow dispute integrity', () => {
 
     describe('resolveDispute', () => {
         test('concurrent FULL_RELEASE resolutions pay the payee exactly once', async () => {
-            const { payer, payee, escrow } = await seedEscrowTicket(prisma, 'DISPUTED', {
-                escrow: { dispute: undefined },
-            });
+            const { payer, payee, escrow } = await seedEscrowTicket(prisma, 'DISPUTED');
             await prisma.escrowDispute.create({
                 data: {
                     escrowId: escrow.id,

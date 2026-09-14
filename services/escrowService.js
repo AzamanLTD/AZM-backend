@@ -374,28 +374,79 @@ const markSatisfied = async (prisma, { escrowId, userId }) => {
 // 4. RAISE DISPUTE — moves principal into disputeEscrowBalance, opens dispute.
 // =============================================================================
 const raiseDispute = async (prisma, { escrowId, raisedById, reason, evidenceUrls }) => {
-    const escrow = await prisma.smartEscrow.findUnique({ where: { id: escrowId } });
-    if (!escrow) throw new Error('Escrow not found.');
-    if (!['FUNDED', 'IN_PROGRESS', 'PENDING_SETTLEMENT'].includes(escrow.status)) {
-        throw new Error(`Cannot dispute an escrow in status ${escrow.status}.`);
-    }
-    if (escrow.payerId !== raisedById && escrow.payeeId !== raisedById) {
-        throw new Error('Only a participant can dispute this escrow.');
-    }
-
-    const amount = Number(escrow.amountUsdc);
-
     const result = await prisma.$transaction(async (tx) => {
-        // a. Move the locked principal into the dispute bucket on the payer.
-        await tx.user.update({
-            where: { id: escrow.payerId },
+        // Authoritative read — INSIDE the transaction that claims the escrow,
+        // so the authorization decision is made against the row this
+        // transaction will mutate (no TOCTOU window between check and claim).
+        const escrow = await tx.smartEscrow.findUnique({
+            where: { id: escrowId },
+            include: { dispute: true }
+        });
+        if (!escrow) throw new Error('Escrow not found.');
+        if (escrow.dispute) throw new Error('ESCROW_ALREADY_DISPUTED');
+        if (!['FUNDED', 'IN_PROGRESS', 'PENDING_SETTLEMENT'].includes(escrow.status)) {
+            throw new Error(`Cannot dispute an escrow in status ${escrow.status}.`);
+        }
+        if (escrow.payerId !== raisedById && escrow.payeeId !== raisedById) {
+            throw new Error('Only a participant can dispute this escrow.');
+        }
+
+        const amount = Number(escrow.amountUsdc);
+
+        /*
+         * SINGLE-WINNER DISPUTE CLAIM.
+         *
+         * Two concurrent requests may both have read FUNDED above, but only
+         * one can atomically transition FUNDED/IN_PROGRESS/PENDING_SETTLEMENT
+         * -> DISPUTED. The loser fails before touching balances or inserting
+         * a dispute row.
+         */
+        const claimed = await tx.smartEscrow.updateMany({
+            where: {
+                id: escrowId,
+                status: { in: ['FUNDED', 'IN_PROGRESS', 'PENDING_SETTLEMENT'] }
+            },
+            data: { status: 'DISPUTED' }
+        });
+        if (claimed.count === 0) {
+            const current = await tx.smartEscrow.findUnique({
+                where: { id: escrowId },
+                include: { dispute: true }
+            });
+            if (current && current.dispute && ['DISPUTED', 'ADMIN_REVIEW'].includes(current.status)) {
+                throw new Error('ESCROW_ALREADY_DISPUTED');
+            }
+            if (current) {
+                throw new Error(`Cannot dispute an escrow in status ${current.status}.`);
+            }
+            throw new Error('Escrow not found.');
+        }
+
+        // Move the locked principal into the dispute bucket on the payer —
+        // atomically guarded (escrowLockedBalance >= amount) so a bucket can
+        // never go negative, even on a checkless database. The claim above
+        // already guarantees single-winner for this escrow; the guard makes
+        // the bucket invariant a database-level property of the statement.
+        const moved = await tx.user.updateMany({
+            where: {
+                id: escrow.payerId,
+                escrowLockedBalance: { gte: amount }
+            },
             data: {
                 escrowLockedBalance: { decrement: amount },
                 disputeEscrowBalance: { increment: amount }
             }
         });
+        if (moved.count === 0) {
+            throw new Error(
+                `ESCROW_BUCKET_INSUFFICIENT: payer escrowLockedBalance is short of the ${amount} USDC principal.`
+            );
+        }
 
-        // b. Create the dispute record.
+        // EscrowDispute.escrowId is UNIQUE in Prisma/Postgres — the final
+        // database-level one-dispute-per-escrow backstop. A collision here
+        // (theoretically unreachable past the claim above) rolls the whole
+        // transaction back, including the balance move and the DISPUTED flip.
         const dispute = await tx.escrowDispute.create({
             data: {
                 escrowId,
@@ -405,15 +456,11 @@ const raiseDispute = async (prisma, { escrowId, raisedById, reason, evidenceUrls
             }
         });
 
-        // c. Flip escrow → DISPUTED.
-        const updated = await tx.smartEscrow.update({
-            where: { id: escrowId },
-            data: { status: 'DISPUTED' }
-        });
-
+        const updated = await tx.smartEscrow.findUnique({ where: { id: escrowId } });
         return { escrow: updated, dispute };
     });
 
+    // EVERYTHING BELOW IS POST-COMMIT.
     setImmediate(() => {
         _getBizOrderService()
             .updateOrderStatusFromEscrow(prisma, escrowId, 'DISPUTED')
@@ -436,72 +483,122 @@ const raiseDispute = async (prisma, { escrowId, raisedById, reason, evidenceUrls
 // 5. RESOLVE DISPUTE — admin/worker ruling. Handles all three outcomes.
 // =============================================================================
 const resolveDispute = async (prisma, { escrowId, adminId, ruling, rulingNotes, payerPct, payeePct }) => {
-    const escrow = await prisma.smartEscrow.findUnique({
-        where: { id: escrowId },
-        include: { dispute: true }
-    });
-    if (!escrow) throw new Error('Escrow not found.');
-    if (!['DISPUTED', 'ADMIN_REVIEW'].includes(escrow.status)) {
-        throw new Error(`Escrow is not in a resolvable state (status ${escrow.status}).`);
-    }
-    if (!escrow.dispute) throw new Error('No dispute exists for this escrow.');
     if (!['FULL_RELEASE', 'FULL_REFUND', 'SPLIT'].includes(ruling)) {
         throw new Error('ruling must be FULL_RELEASE, FULL_REFUND, or SPLIT.');
     }
-
-    // FULL_RELEASE → release to payee from the dispute bucket.
-    if (ruling === 'FULL_RELEASE') {
-        const released = await _releaseEscrow(prisma, escrowId, 'RELEASED');
-        const dispute = await prisma.escrowDispute.update({
-            where: { id: escrow.dispute.id },
-            data: {
-                ruling,
-                rulingNotes: rulingNotes || null,
-                resolvedAt: new Date(),
-                status: 'RESOLVED',
-                assignedToId: escrow.dispute.assignedToId || adminId
-            }
-        });
-        return { escrow: released, dispute };
+    if (ruling === 'SPLIT') {
+        const pPct = Number(payerPct);
+        const qPct = Number(payeePct);
+        if (!Number.isFinite(pPct) || !Number.isFinite(qPct) || Math.abs(pPct + qPct - 100) > 0.001) {
+            throw new Error('For SPLIT rulings, payerPct + payeePct must equal 100.');
+        }
+        if (pPct < 0 || qPct < 0 || pPct > 100 || qPct > 100) {
+            throw new Error('For SPLIT rulings, payerPct and payeePct must be between 0 and 100.');
+        }
     }
 
-    // FULL_REFUND → refund to payer from the dispute bucket.
-    if (ruling === 'FULL_REFUND') {
-        const refunded = await _refundEscrow(prisma, escrowId);
-        const dispute = await prisma.escrowDispute.update({
-            where: { id: escrow.dispute.id },
-            data: {
-                ruling,
-                rulingNotes: rulingNotes || null,
-                resolvedAt: new Date(),
-                status: 'RESOLVED',
-                assignedToId: escrow.dispute.assignedToId || adminId
-            }
-        });
-        return { escrow: refunded, dispute };
-    }
-
-    // SPLIT → custom percentage split. payerPct + payeePct must equal 100.
-    const pPct = Number(payerPct);
-    const qPct = Number(payeePct);
-    if (!Number.isFinite(pPct) || !Number.isFinite(qPct) || Math.abs(pPct + qPct - 100) > 0.001) {
-        throw new Error('For SPLIT rulings, payerPct + payeePct must equal 100.');
-    }
-
-    const amount = Number(escrow.amountUsdc);
-    const payerAmount = _round6(amount * (pPct / 100));
-    // Give the payee the remainder so the two always sum to the principal
-    // exactly (avoids a rounding dust leak in disputeEscrowBalance).
-    const payeeAmount = _round6(amount - payerAmount);
-    const releaseRef = randomUUID();
-    const refundRef = randomUUID();
-
+    /*
+     * The dispute transition and every financial mutation share ONE
+     * transaction. Previously _releaseEscrow/_refundEscrow each opened their
+     * OWN transaction and the dispute flip ran after that commit — a failure
+     * in the dispute update left committed money movement with an unresolved
+     * dispute, and two concurrent resolutions could both pay out. Now:
+     * a failed dispute update rolls the money back, and the escrow status
+     * claim inside the same transaction guarantees a single financial winner.
+     */
     const result = await prisma.$transaction(async (tx) => {
-        // Drain the full principal out of the payer's dispute bucket.
-        await tx.user.update({
-            where: { id: escrow.payerId },
+        const escrow = await tx.smartEscrow.findUnique({
+            where: { id: escrowId },
+            include: { dispute: true }
+        });
+        if (!escrow) throw new Error('Escrow not found.');
+        if (!escrow.dispute) throw new Error('No dispute exists for this escrow.');
+
+        /*
+         * IDEMPOTENT CONVERGENCE (sequential replay): a retry AFTER a
+         * successfully committed resolution returns the already-committed
+         * canonical state and never moves money again.
+         */
+        if (['RELEASED', 'REFUNDED'].includes(escrow.status) && escrow.dispute.status === 'RESOLVED') {
+            return { escrow, dispute: escrow.dispute, alreadyResolved: true };
+        }
+        if (!['DISPUTED', 'ADMIN_REVIEW'].includes(escrow.status)) {
+            throw new Error(`Escrow is not in a resolvable state (status ${escrow.status}).`);
+        }
+
+        const resolvedAt = new Date();
+
+        if (ruling === 'FULL_RELEASE') {
+            // _releaseEscrowTx performs the atomic escrow claim, the
+            // disputeEscrowBalance debit, the payee credit and the
+            // transaction-history row — ALL on this same tx client.
+            const updatedEscrow = await _releaseEscrowTx(tx, escrow, 'RELEASED');
+            const updatedDispute = await tx.escrowDispute.update({
+                where: { id: escrow.dispute.id, status: { not: 'RESOLVED' } },
+                data: {
+                    ruling: 'FULL_RELEASE',
+                    rulingNotes: rulingNotes || null,
+                    resolvedAt,
+                    status: 'RESOLVED',
+                    assignedToId: escrow.dispute.assignedToId || adminId
+                }
+            });
+            return { escrow: updatedEscrow, dispute: updatedDispute };
+        }
+
+        if (ruling === 'FULL_REFUND') {
+            const updatedEscrow = await _refundEscrowTx(tx, escrow, 'REFUNDED');
+            const updatedDispute = await tx.escrowDispute.update({
+                where: { id: escrow.dispute.id, status: { not: 'RESOLVED' } },
+                data: {
+                    ruling: 'FULL_REFUND',
+                    rulingNotes: rulingNotes || null,
+                    resolvedAt,
+                    status: 'RESOLVED',
+                    assignedToId: escrow.dispute.assignedToId || adminId
+                }
+            });
+            return { escrow: updatedEscrow, dispute: updatedDispute };
+        }
+
+        // SPLIT — claim RELEASED first, inside this same transaction, so a
+        // concurrent resolver cannot interleave balance mutations with us.
+        const pPct = Number(payerPct);
+        const qPct = Number(payeePct);
+        const amount = Number(escrow.amountUsdc);
+        const payerAmount = _round6(amount * (pPct / 100));
+        // Give the payee the remainder so the two always sum to the principal
+        // exactly (no rounding dust left in disputeEscrowBalance).
+        const payeeAmount = _round6(amount - payerAmount);
+        const releaseRef = randomUUID();
+        const refundRef = randomUUID();
+
+        const updatedEscrow = await _claimEscrowStatusTx(
+            tx,
+            escrowId,
+            ['DISPUTED', 'ADMIN_REVIEW'],
+            {
+                status: 'RELEASED',
+                settledAt: resolvedAt,
+                releaseTxHash: releaseRef,
+                refundTxHash: refundRef
+            }
+        );
+
+        // Drain the full principal out of the payer's dispute bucket —
+        // atomically guarded against a short bucket.
+        const drained = await tx.user.updateMany({
+            where: {
+                id: escrow.payerId,
+                disputeEscrowBalance: { gte: amount }
+            },
             data: { disputeEscrowBalance: { decrement: amount } }
         });
+        if (drained.count === 0) {
+            throw new Error(
+                `ESCROW_BUCKET_INSUFFICIENT: payer disputeEscrowBalance is short of the ${amount} USDC principal.`
+            );
+        }
 
         // Payer's share back to their available balance.
         if (payerAmount > 0) {
@@ -539,24 +636,14 @@ const resolveDispute = async (prisma, { escrowId, adminId, ruling, rulingNotes, 
             });
         }
 
-        const updatedEscrow = await tx.smartEscrow.update({
-            where: { id: escrowId },
-            data: {
-                status: 'RELEASED',
-                settledAt: new Date(),
-                releaseTxHash: releaseRef,
-                refundTxHash: refundRef
-            }
-        });
-
         const updatedDispute = await tx.escrowDispute.update({
-            where: { id: escrow.dispute.id },
+            where: { id: escrow.dispute.id, status: { not: 'RESOLVED' } },
             data: {
                 ruling: 'SPLIT',
                 rulingNotes: rulingNotes || null,
                 payerPct: pPct,
                 payeePct: qPct,
-                resolvedAt: new Date(),
+                resolvedAt,
                 status: 'RESOLVED',
                 assignedToId: escrow.dispute.assignedToId || adminId
             }
@@ -565,7 +652,244 @@ const resolveDispute = async (prisma, { escrowId, adminId, ruling, rulingNotes, 
         return { escrow: updatedEscrow, dispute: updatedDispute };
     });
 
+    /*
+     * IMPORTANT: a resolver that loses the escrow claim to a concurrent winner
+     * REJECTS with ESCROW_ALREADY_FINALIZED — it never performs or repeats any
+     * financial mutation. Sequential retries against an already-committed
+     * resolution converge earlier, at the authoritative read inside the
+     * transaction (alreadyResolved), so they do not reach this point.
+     */
+
+    // Successful resolution side effects happen ONLY HERE, after the
+    // authoritative money + dispute transaction has committed.
+    if (!result.alreadyResolved) {
+        if (ruling === 'FULL_RELEASE') {
+            setImmediate(() => {
+                _getBizOrderService()
+                    .updateOrderStatusFromEscrow(prisma, escrowId, 'RELEASED')
+                    .catch((err) => logger.error({ err: err }, '[escrowService.resolveDispute] release order sync'));
+            });
+
+            // Business stats — same post-commit semantics as _releaseEscrow.
+            setImmediate(async () => {
+                try {
+                    const order = await prisma.businessOrder.findFirst({
+                        where: { escrowId },
+                        select: { businessProfileId: true, amountUsdc: true, productId: true }
+                    });
+                    if (!order) return;
+                    await prisma.businessProfile.update({
+                        where: { id: order.businessProfileId },
+                        data: {
+                            completedEscrows: { increment: 1 },
+                            totalVolume: { increment: Number(result.escrow.amountUsdc) }
+                        }
+                    });
+                    if (order.productId) {
+                        await prisma.businessProduct.update({
+                            where: { id: order.productId },
+                            data: {
+                                totalOrders: { increment: 1 },
+                                totalRevenue: { increment: Number(result.escrow.amountUsdc) }
+                            }
+                        });
+                    }
+                } catch (err) {
+                    logger.error({ err: err }, '[escrowService.resolveDispute] release profile stat sync');
+                }
+            });
+
+            setImmediate(() => {
+                _getBizNotificationService().notifyOrderEvent(prisma, {
+                    escrowId,
+                    type: 'ORDER_SETTLED'
+                }).catch((err) => logger.error({ err: err }, '[escrowService.resolveDispute] release biz notif'));
+            });
+        }
+
+        if (ruling === 'FULL_REFUND') {
+            setImmediate(() => {
+                _getBizOrderService()
+                    .updateOrderStatusFromEscrow(prisma, escrowId, 'REFUNDED')
+                    .catch((err) => logger.error({ err: err }, '[escrowService.resolveDispute] refund order sync'));
+            });
+
+            if (_socketIo) {
+                const payload = {
+                    escrowId: result.escrow.id,
+                    ticketId: result.escrow.ticketId,
+                    status: result.escrow.status,
+                    amountUsdc: result.escrow.amountUsdc,
+                    payerId: result.escrow.payerId,
+                    payeeId: result.escrow.payeeId,
+                    reason: 'REFUND'
+                };
+                try {
+                    _socketIo.to(`user_${result.escrow.payerId}`).emit('escrow_refunded', payload);
+                    _socketIo.to(`user_${result.escrow.payeeId}`).emit('escrow_refunded', payload);
+                    _socketIo.to('admin_spy_room').emit('escrow_refunded', payload);
+                } catch (err) {
+                    logger.warn(
+                        { err: err, escrowId: result.escrow.id },
+                        '[escrowService.resolveDispute] refund realtime emit failed'
+                    );
+                }
+            }
+
+            setImmediate(() => {
+                _getBizNotificationService().notifyOrderEvent(prisma, {
+                    escrowId,
+                    type: 'ORDER_REFUNDED'
+                }).catch((err) => logger.error({ err: err }, '[escrowService.resolveDispute] refund biz notif'));
+            });
+        }
+
+        // SPLIT deliberately introduces no new event type. Keep the existing
+        // API/event vocabulary; at minimum, synchronize the canonical order
+        // state after commit.
+        if (ruling === 'SPLIT') {
+            setImmediate(() => {
+                _getBizOrderService()
+                    .updateOrderStatusFromEscrow(prisma, escrowId, 'RELEASED')
+                    .catch((err) => logger.error({ err: err }, '[escrowService.resolveDispute] split order sync'));
+            });
+        }
+    }
+
     return result;
+};
+
+// =============================================================================
+// PRIVATE TX PRIMITIVES — the canonical escrow financial mutation path.
+//   These operate on a tx client passed IN (they never open their own
+//   transaction) so callers can compose the money movement with the dispute
+//   transition in ONE atomic unit. Do not create another escrow-finance
+//   service; extend or reuse these.
+// =============================================================================
+
+// Atomically claim an escrow's status. Returns the refreshed escrow row.
+// Throws ESCROW_ALREADY_FINALIZED when another transaction claimed it first —
+// the single-winner guard for every financial mutation below.
+const _claimEscrowStatusTx = async (tx, escrowId, claimableStatuses, data) => {
+    const claim = await tx.smartEscrow.updateMany({
+        where: {
+            id: escrowId,
+            status: { in: claimableStatuses }
+        },
+        data
+    });
+    if (claim.count === 0) {
+        throw new Error('ESCROW_ALREADY_FINALIZED');
+    }
+    return tx.smartEscrow.findUnique({ where: { id: escrowId } });
+};
+
+// Release (pay the payee) on the caller's transaction.
+const _releaseEscrowTx = async (tx, escrow, finalStatus = 'SETTLED') => {
+    const amount = Number(escrow.amountUsdc);
+    const fromDispute =
+        escrow.status === 'DISPUTED' || escrow.status === 'ADMIN_REVIEW';
+    const sourceColumn = fromDispute
+        ? 'disputeEscrowBalance'
+        : 'escrowLockedBalance';
+    const claimableStatuses = fromDispute
+        ? ['DISPUTED', 'ADMIN_REVIEW']
+        : ['FUNDED', 'IN_PROGRESS', 'PENDING_SETTLEMENT'];
+    const reference = randomUUID();
+
+    const updatedEscrow = await _claimEscrowStatusTx(tx, escrow.id, claimableStatuses, {
+        status: finalStatus,
+        settledAt: new Date(),
+        releaseTxHash: reference
+    });
+
+    // Release the locked principal from the payer's holding bucket. The
+    // decrement is ATOMICALLY GUARDED (bucket >= amount in the same UPDATE),
+    // so a bucket can never go negative — no check-then-act window, and the
+    // same invariant holds on databases without CHECK constraints.
+    const drained = await tx.user.updateMany({
+        where: {
+            id: escrow.payerId,
+            [sourceColumn]: { gte: amount }
+        },
+        data: { [sourceColumn]: { decrement: amount } }
+    });
+    if (drained.count === 0) {
+        throw new Error(
+            `ESCROW_BUCKET_INSUFFICIENT: payer ${sourceColumn} is short of the ${amount} USDC principal.`
+        );
+    }
+
+    // Credit the payee.
+    await tx.user.update({
+        where: { id: escrow.payeeId },
+        data: { availableBalance: { increment: amount } }
+    });
+
+    await tx.transactionHistory.create({
+        data: {
+            userId: escrow.payeeId,
+            type: 'TICKET_ESCROW_RELEASE',
+            amountUsdc: amount,
+            feeUsdc: 0,
+            txHash: reference,
+            status: 'COMPLETED'
+        }
+    });
+
+    return tx.smartEscrow.findUnique({ where: { id: escrow.id } });
+};
+
+// Refund (return the principal to the payer) on the caller's transaction.
+const _refundEscrowTx = async (tx, escrow, finalStatus = 'REFUNDED') => {
+    const amount = Number(escrow.amountUsdc);
+    const fromDispute =
+        escrow.status === 'DISPUTED' || escrow.status === 'ADMIN_REVIEW';
+    const sourceColumn = fromDispute
+        ? 'disputeEscrowBalance'
+        : 'escrowLockedBalance';
+    const claimableStatuses = fromDispute
+        ? ['DISPUTED', 'ADMIN_REVIEW']
+        : ['FUNDED', 'IN_PROGRESS', 'PENDING_SETTLEMENT'];
+    const reference = randomUUID();
+
+    await _claimEscrowStatusTx(tx, escrow.id, claimableStatuses, {
+        status: finalStatus,
+        refundedAt: new Date(),
+        refundTxHash: reference
+    });
+
+    // Guarded, atomic bucket drain + payer credit in ONE statement — the
+    // refund can never take the bucket negative or credit the payer when the
+    // bucket is short. If no row matches, the whole transaction rolls back.
+    const refunded = await tx.user.updateMany({
+        where: {
+            id: escrow.payerId,
+            [sourceColumn]: { gte: amount }
+        },
+        data: {
+            [sourceColumn]: { decrement: amount },
+            availableBalance: { increment: amount }
+        }
+    });
+    if (refunded.count === 0) {
+        throw new Error(
+            `ESCROW_BUCKET_INSUFFICIENT: payer ${sourceColumn} is short of the ${amount} USDC principal.`
+        );
+    }
+
+    await tx.transactionHistory.create({
+        data: {
+            userId: escrow.payerId,
+            type: 'TICKET_ESCROW_REFUND',
+            amountUsdc: amount,
+            feeUsdc: 0,
+            txHash: reference,
+            status: 'COMPLETED'
+        }
+    });
+
+    return tx.smartEscrow.findUnique({ where: { id: escrow.id } });
 };
 
 // =============================================================================
@@ -574,65 +898,13 @@ const resolveDispute = async (prisma, { escrowId, adminId, ruling, rulingNotes, 
 //   'RELEASED' (admin from a dispute, source disputeEscrowBalance).
 // =============================================================================
 const _releaseEscrow = async (prisma, escrowId, finalStatus = 'SETTLED') => {
-    const escrow = await prisma.smartEscrow.findUnique({ where: { id: escrowId } });
-    if (!escrow) throw new Error('Escrow not found.');
-
-    const amount = Number(escrow.amountUsdc);
-    // Funds sit in the dispute bucket only once a dispute moved them there.
-    const fromDispute = escrow.status === 'DISPUTED' || escrow.status === 'ADMIN_REVIEW';
-    const sourceColumn = fromDispute ? 'disputeEscrowBalance' : 'escrowLockedBalance';
-    // The set of statuses we are allowed to release FROM. Used as the atomic
-    // claim precondition below so the same escrow can never be released twice.
-    const claimableStatuses = fromDispute
-        ? ['DISPUTED', 'ADMIN_REVIEW']
-        : ['FUNDED', 'IN_PROGRESS', 'PENDING_SETTLEMENT'];
-    const reference = randomUUID();
-
+    // The authoritative escrow row is read INSIDE the transaction that claims
+    // it — closing the helper's own TOCTOU window (a status change between the
+    // old outer read and the claim no longer misdirects the balance mutation).
     const updated = await prisma.$transaction(async (tx) => {
-        // SINGLE-WINNER CLAIM (TOCTOU guard): flip the escrow to its final
-        // status if and only if it is still in a releasable state. A second
-        // concurrent release sees count=0 and aborts BEFORE any balance moves,
-        // exactly like the completeTrade PAID->COMPLETED atomic flip. Without
-        // this, two settlements racing (e.g. both parties marking satisfied at
-        // once) would each pay the payee — real money loss.
-        const claim = await tx.smartEscrow.updateMany({
-            where: { id: escrowId, status: { in: claimableStatuses } },
-            data: {
-                status: finalStatus,
-                settledAt: new Date(),
-                releaseTxHash: reference
-            }
-        });
-        if (claim.count === 0) {
-            throw new Error('ESCROW_ALREADY_FINALIZED');
-        }
-
-        // Release the locked principal from the payer's holding bucket.
-        await tx.user.update({
-            where: { id: escrow.payerId },
-            data: { [sourceColumn]: { decrement: amount } }
-        });
-
-        // Credit the payee.
-        await tx.user.update({
-            where: { id: escrow.payeeId },
-            data: { availableBalance: { increment: amount } }
-        });
-
-        const result = await tx.smartEscrow.findUnique({ where: { id: escrowId } });
-
-        await tx.transactionHistory.create({
-            data: {
-                userId: escrow.payeeId,
-                type: 'TICKET_ESCROW_RELEASE',
-                amountUsdc: amount,
-                feeUsdc: 0,
-                txHash: reference,
-                status: 'COMPLETED'
-            }
-        });
-
-        return result;
+        const escrow = await tx.smartEscrow.findUnique({ where: { id: escrowId } });
+        if (!escrow) throw new Error('Escrow not found.');
+        return _releaseEscrowTx(tx, escrow, finalStatus);
     });
 
     // Realtime convergence: emit only after the $transaction commits.
@@ -651,7 +923,7 @@ const _releaseEscrow = async (prisma, escrowId, finalStatus = 'SETTLED') => {
             _socketIo.to(`user_${updated.payeeId}`).emit('escrow_settled', payload);
             _socketIo.to('admin_spy_room').emit('escrow_settled', payload);
         } catch (err) {
-            logger.warn({ err, escrowId: updated.id }, '[escrowService._releaseEscrow] realtime emit failed');
+            logger.warn({ err: err, escrowId: updated.id }, '[escrowService._releaseEscrow] realtime emit failed');
         }
     }
 
@@ -673,7 +945,7 @@ const _releaseEscrow = async (prisma, escrowId, finalStatus = 'SETTLED') => {
                     where: { id: order.businessProfileId },
                     data: {
                         completedEscrows: { increment: 1 },
-                        totalVolume:      { increment: Number(escrow.amountUsdc) }
+                        totalVolume:      { increment: Number(updated.amountUsdc) }
                     }
                 });
                 if (order.productId) {
@@ -681,7 +953,7 @@ const _releaseEscrow = async (prisma, escrowId, finalStatus = 'SETTLED') => {
                         where: { id: order.productId },
                         data: {
                             totalOrders:  { increment: 1 },
-                            totalRevenue: { increment: Number(escrow.amountUsdc) }
+                            totalRevenue: { increment: Number(updated.amountUsdc) }
                         }
                     });
                 }
@@ -708,56 +980,11 @@ const _releaseEscrow = async (prisma, escrowId, finalStatus = 'SETTLED') => {
 //   finalStatus 'REFUNDED' (admin/auto refund) or 'EXPIRED' (worker sweep).
 // =============================================================================
 const _refundEscrow = async (prisma, escrowId, finalStatus = 'REFUNDED') => {
-    const escrow = await prisma.smartEscrow.findUnique({ where: { id: escrowId } });
-    if (!escrow) throw new Error('Escrow not found.');
-
-    const amount = Number(escrow.amountUsdc);
-    const fromDispute = escrow.status === 'DISPUTED' || escrow.status === 'ADMIN_REVIEW';
-    const sourceColumn = fromDispute ? 'disputeEscrowBalance' : 'escrowLockedBalance';
-    // Statuses we are allowed to refund FROM — the atomic claim precondition.
-    const claimableStatuses = fromDispute
-        ? ['DISPUTED', 'ADMIN_REVIEW']
-        : ['FUNDED', 'IN_PROGRESS', 'PENDING_SETTLEMENT'];
-    const reference = randomUUID();
-
+    // Authoritative read inside the claiming transaction (TOCTOU-safe).
     const updated = await prisma.$transaction(async (tx) => {
-        // SINGLE-WINNER CLAIM (TOCTOU guard): mirror _releaseEscrow so a refund
-        // can never run twice (e.g. the expiry worker and an admin refund both
-        // firing on the same escrow). The loser aborts before any balance moves.
-        const claim = await tx.smartEscrow.updateMany({
-            where: { id: escrowId, status: { in: claimableStatuses } },
-            data: {
-                status: finalStatus,
-                refundedAt: new Date(),
-                refundTxHash: reference
-            }
-        });
-        if (claim.count === 0) {
-            throw new Error('ESCROW_ALREADY_FINALIZED');
-        }
-
-        await tx.user.update({
-            where: { id: escrow.payerId },
-            data: {
-                [sourceColumn]: { decrement: amount },
-                availableBalance: { increment: amount }
-            }
-        });
-
-        const result = await tx.smartEscrow.findUnique({ where: { id: escrowId } });
-
-        await tx.transactionHistory.create({
-            data: {
-                userId: escrow.payerId,
-                type: 'TICKET_ESCROW_REFUND',
-                amountUsdc: amount,
-                feeUsdc: 0,
-                txHash: reference,
-                status: 'COMPLETED'
-            }
-        });
-
-        return result;
+        const escrow = await tx.smartEscrow.findUnique({ where: { id: escrowId } });
+        if (!escrow) throw new Error('Escrow not found.');
+        return _refundEscrowTx(tx, escrow, finalStatus);
     });
 
     // The transaction callback has completed, so the financial claim is
@@ -779,7 +1006,7 @@ const _refundEscrow = async (prisma, escrowId, finalStatus = 'REFUNDED') => {
             _socketIo.to(`user_${updated.payeeId}`).emit('escrow_refunded', payload);
             _socketIo.to('admin_spy_room').emit('escrow_refunded', payload);
         } catch (err) {
-            logger.warn({ err, escrowId: updated.id }, '[escrowService._refundEscrow] realtime emit failed');
+            logger.warn({ err: err, escrowId: updated.id }, '[escrowService._refundEscrow] realtime emit failed');
         }
     }
 
