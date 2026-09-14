@@ -135,6 +135,7 @@ async function seedBusiness(prisma, overrides = {}) {
             category: 'FREELANCE_SERVICES',
             kybStatus: 'VERIFIED',
             isVerified: true,
+            stakeBalance: overrides.stakeBalance ?? 0,
         },
     });
     const product = await prisma.businessProduct.create({

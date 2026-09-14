@@ -206,7 +206,14 @@ const releaseBookingEscrow = async (prisma, { escrowId }) => {
         });
         if (claim.count === 0) throw new Error('ESCROW_ALREADY_FINALIZED');
 
-        await tx.user.update({ where: { id: escrow.payerId }, data: { escrowLockedBalance: { decrement: amount } } });
+        // Guarded, atomic bucket drain: the payer's escrowLockedBalance is
+        // debited only if it still holds the full principal — a short bucket
+        // fails the whole release instead of going negative.
+        const debit = await tx.user.updateMany({
+            where: { id: escrow.payerId, escrowLockedBalance: { gte: amount } },
+            data: { escrowLockedBalance: { decrement: amount } }
+        });
+        if (debit.count !== 1) throw new Error('ESCROW_BALANCE_INSUFFICIENT');
         await tx.user.update({ where: { id: escrow.payeeId }, data: { availableBalance: { increment: amount } } });
         await tx.transactionHistory.create({
             data: { userId: escrow.payeeId, type: 'TICKET_ESCROW_RELEASE', amountUsdc: amount, feeUsdc: 0, txHash: reference, status: 'COMPLETED' }
@@ -232,10 +239,14 @@ const refundBookingEscrow = async (prisma, { escrowId }) => {
         });
         if (claim.count === 0) throw new Error('ESCROW_ALREADY_FINALIZED');
 
-        await tx.user.update({
-            where: { id: escrow.payerId },
+        // Guarded, atomic refund: the locked principal moves back to the
+        // payer's available balance in ONE conditional statement — a short
+        // bucket can never go negative and never credits the payer.
+        const debit = await tx.user.updateMany({
+            where: { id: escrow.payerId, escrowLockedBalance: { gte: amount } },
             data: { escrowLockedBalance: { decrement: amount }, availableBalance: { increment: amount } }
         });
+        if (debit.count !== 1) throw new Error('ESCROW_BALANCE_INSUFFICIENT');
         await tx.transactionHistory.create({
             data: { userId: escrow.payerId, type: 'TICKET_ESCROW_REFUND', amountUsdc: amount, feeUsdc: 0, txHash: reference, status: 'COMPLETED' }
         });
@@ -280,7 +291,13 @@ const splitReleaseFundedEscrow = async (prisma, {
         });
         if (claim.count === 0) throw new Error('ESCROW_ALREADY_FINALIZED');
 
-        await tx.user.update({ where: { id: escrow.payerId }, data: { escrowLockedBalance: { decrement: principal } } });
+        // Guarded, atomic principal drain — the full principal leaves the
+        // payer's escrow bucket only if the bucket still holds it.
+        const debit = await tx.user.updateMany({
+            where: { id: escrow.payerId, escrowLockedBalance: { gte: principal } },
+            data: { escrowLockedBalance: { decrement: principal } }
+        });
+        if (debit.count !== 1) throw new Error('ESCROW_BALANCE_INSUFFICIENT');
 
         if (penaltyAmount > 0) {
             await tx.user.update({ where: { id: escrow.payeeId }, data: { availableBalance: { increment: penaltyAmount } } });
