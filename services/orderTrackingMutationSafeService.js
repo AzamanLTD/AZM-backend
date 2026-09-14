@@ -11,7 +11,10 @@
  */
 async function withOrderTrackingMutation(prisma, orderId, businessProfileId, mutate) {
     return prisma.$transaction(async (tx) => {
-        await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${orderId}))`;
+        await tx.$queryRawUnsafe(
+            'SELECT 1 AS locked FROM pg_advisory_xact_lock(hashtext($1))',
+            String(orderId),
+        );
 
         const tracking = await tx.orderTracking.upsert({
             where: { orderId },

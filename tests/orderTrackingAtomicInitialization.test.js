@@ -53,6 +53,7 @@ describe('order tracking atomic initialization', () => {
         };
         const tx = {
             $queryRaw: jest.fn().mockResolvedValue([{ pg_advisory_xact_lock: null }]),
+            $queryRawUnsafe: jest.fn().mockResolvedValue([{ locked: 1 }]),
             orderTracking,
         };
         const prisma = {
@@ -81,7 +82,7 @@ describe('order tracking atomic initialization', () => {
         await controller.updateStatus(req, res);
 
         expect(prisma.$transaction).toHaveBeenCalledTimes(1);
-        expect(tx.$queryRaw).toHaveBeenCalledTimes(1);
+        expect(tx.$queryRawUnsafe).toHaveBeenCalledTimes(1);
         expect(prisma.orderTracking.upsert).toHaveBeenCalledWith({
             where: { orderId: 'order-1' },
             create: { orderId: 'order-1', businessProfileId: 'biz-1' },
