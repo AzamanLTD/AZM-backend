@@ -420,12 +420,22 @@ const liquidateProfits = async (prisma, amountFloat, adminId) => {
     const result = await prisma.$transaction(async (tx) => {
         await _ensureProfitFeesSingleton(tx);
         await _ensureFiatPoolSingleton(tx);
-        const profitFees = await tx.systemProfitFees.findUnique({ where: { id: 1 } });
-        if (profitFees.balance < amountFloat) {
-            throw new Error(`Insufficient profit balance. Available: ${profitFees.balance.toFixed(6)} USDC, Requested: ${amountFloat.toFixed(6)} USDC.`);
+
+        const claim = await tx.systemProfitFees.updateMany({
+            where: { id: 1, balance: { gte: amountFloat } },
+            data: { balance: { decrement: amountFloat } }
+        });
+
+        if (claim.count !== 1) {
+            const err = new Error(`Insufficient profit balance. Requested: ${amountFloat.toFixed(6)} USDC.`);
+            err.code = 'INSUFFICIENT_PROFIT_BALANCE';
+            throw err;
         }
-        await tx.systemProfitFees.update({ where: { id: 1 }, data: { balance: { decrement: amountFloat } } });
-        await tx.systemFiatPool.update({ where: { id: 1 }, data: { balance: { increment: amountFloat } } });
+
+        await tx.systemFiatPool.update({
+            where: { id: 1 },
+            data: { balance: { increment: amountFloat } }
+        });
         const profitLog = await tx.adminProfitLog.create({ data: { amountUsdc: amountFloat, source: 'ARBITRAGE_SPREAD', relatedTxId: `liquidation_admin_${adminId}_${Date.now()}` } });
         const [updatedProfitFees, updatedFiatPool] = await Promise.all([
             tx.systemProfitFees.findUnique({ where: { id: 1 } }),
