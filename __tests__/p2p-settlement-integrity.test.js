@@ -31,8 +31,8 @@ describeOrSkip('P2P escrow settlement integrity (real PostgreSQL)', () => {
     beforeEach(async () => {
         await prisma.globalSettings.upsert({
             where:  { id: 1 },
-            update: { p2pFeePct: 1, tierThreshold: 1000, vendorShareUnder1k: 0.4, vendorShareOver1k: 0.5 },
-            create: { id: 1, p2pFeePct: 1, tierThreshold: 1000, vendorShareUnder1k: 0.4, vendorShareOver1k: 0.5 },
+            update: { p2pFeePct: 0.01, tierThreshold: 1000, vendorShareUnder1k: 0.4, vendorShareOver1k: 0.5 },
+            create: { id: 1, p2pFeePct: 0.01, tierThreshold: 1000, vendorShareUnder1k: 0.4, vendorShareOver1k: 0.5 },
         });
     });
 
@@ -198,7 +198,7 @@ describeOrSkip('P2P escrow settlement integrity (real PostgreSQL)', () => {
         const s = await seedBuyTrade({ amountCrypto: 100 });
 
         await p2pService.markUnderpaid(prisma, {
-            tradeId: s.trade.id, callerUserId: s.vendorId,
+            tradeId: s.trade.id, callerUserId: s.vendor.id,
             paidAmountFiat: 775, intentional: false,
         });
 

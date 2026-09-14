@@ -115,6 +115,9 @@ enum TransactionType {
   EWA_WITHDRAWAL
   PAYROLL_DISBURSEMENT
   AZM_CONVERSION_TO_USDC
+  // P2P overpayment freeze (Phase H11 idempotency lock — was missing from the
+  // enum, which made every flagOverpayment insert fail on real Postgres)
+  OVERPAYMENT_FREEZE
 }
 
 enum TransactionStatus {
@@ -632,15 +635,15 @@ model User {
   // AZM is NOT a blockchain token — it is strictly a backend-controlled
   // database ledger. Phase D-2 incorrectly dropped this column; Phase D-3
   // restores it as an independent loyalty ledger.
-  azmBalance       Decimal  @default(0.0) @db.Decimal(20, 8) // AZM loyalty points (independent of USDC)
-  notificationPrefs  Json?    // User-level notification preferences, quiet hours, per-category toggles
+  azmBalance        Decimal          @default(0.0) @db.Decimal(20, 8) // AZM loyalty points (independent of USDC)
+  notificationPrefs Json? // User-level notification preferences, quiet hours, per-category toggles
   roundUpSettings   RoundUpSettings?
   // Card skins (2026-07-06): purchasable cosmetic skins for the peer-transfer
   // chat card. 'classic' is always available (free, not in ownedCardSkins).
   // equippedCardSkin must be 'classic' or present in ownedCardSkins — enforced
   // in azmSpendService.equipCardSkin, not at the DB level.
-  equippedCardSkin String   @default("classic") @db.VarChar(20)
-  ownedCardSkins   String[] @default([])
+  equippedCardSkin  String           @default("classic") @db.VarChar(20)
+  ownedCardSkins    String[]         @default([])
 
   // --- TATUM INTEGRATION ---
   tatumPolygonAddress String?
@@ -820,7 +823,7 @@ model User {
   sentTicketMessages TicketMessage[] @relation("TicketMessageSender")
 
   // Smart Escrow & Business Accounts (2026-06-14)
-  businessProfiles      BusinessProfile[]
+  businessProfiles     BusinessProfile[]
   escrowsAsPayer       SmartEscrow[]                  @relation("EscrowPayer")
   escrowsAsPayee       SmartEscrow[]                  @relation("EscrowPayee")
   disputesRaised       EscrowDispute[]                @relation("DisputeRaisedBy")
@@ -856,20 +859,20 @@ model User {
   azmRewardLogs AzmRewardLog[]
 
   // Phase E2: AZM Spend History
-  azmSpendLogs AzmSpendLog[]
-  azmGiftsSent     AzmGift[] @relation("AzmGiftSender")
-  azmGiftsReceived AzmGift[] @relation("AzmGiftReceiver")
-  azmConversions    AzmConversionLog[]
-  orderBookOrders   OrderBookOrder[]
-  orderBookMakerTrades OrderBookTrade[] @relation("OrderBookMaker")
-  orderBookTakerTrades OrderBookTrade[] @relation("OrderBookTaker")
-  currencyWallets    CurrencyWallet[]
-  currencyConversions CurrencyConversion[]
-  approvalRequests   AdminApprovalRequest[] @relation("ApprovalRequester")
-  crossBorderConfigs  CrossBorderSusuConfig[]
-  crossBorderFx       CrossBorderFxSnapshot[]
-  governanceProposals  GovernanceProposal[] @relation("GovernanceProposer")
-  governanceExecuted   GovernanceProposal[] @relation("GovernanceExecutor")
+  azmSpendLogs         AzmSpendLog[]
+  azmGiftsSent         AzmGift[]               @relation("AzmGiftSender")
+  azmGiftsReceived     AzmGift[]               @relation("AzmGiftReceiver")
+  azmConversions       AzmConversionLog[]
+  orderBookOrders      OrderBookOrder[]
+  orderBookMakerTrades OrderBookTrade[]        @relation("OrderBookMaker")
+  orderBookTakerTrades OrderBookTrade[]        @relation("OrderBookTaker")
+  currencyWallets      CurrencyWallet[]
+  currencyConversions  CurrencyConversion[]
+  approvalRequests     AdminApprovalRequest[]  @relation("ApprovalRequester")
+  crossBorderConfigs   CrossBorderSusuConfig[]
+  crossBorderFx        CrossBorderFxSnapshot[]
+  governanceProposals  GovernanceProposal[]    @relation("GovernanceProposer")
+  governanceExecuted   GovernanceProposal[]    @relation("GovernanceExecutor")
   governanceVotes      GovernanceVote[]
 
   // Phase V: Vendor Applications
@@ -877,20 +880,20 @@ model User {
   reviewedVendorApplications VendorApplication[] @relation("VendorApplicationReviewer")
 
   // ── MASTER SPRINT (2026-05-27): Vault, Susu, Smart Route, AZM Auction ──
-  vaults            Vault[]
-  vaultDeposits     VaultDeposit[]
-  groupsCreated     GroupChat[]        @relation("GroupChatCreator")
-  groupMemberships  GroupMember[]      @relation("GroupMembership")
-  sentGroupMessages GroupMessage[]     @relation("GroupMessageSender")
-  vouchesGiven      VouchRecord[]      @relation("VouchVoucher")
-  vouchesReceived   VouchRecord[]      @relation("VouchInvitee")
-  susuMemberships   SusuMember[]       @relation("SusuMembership")
+  vaults               Vault[]
+  vaultDeposits        VaultDeposit[]
+  groupsCreated        GroupChat[]           @relation("GroupChatCreator")
+  groupMemberships     GroupMember[]         @relation("GroupMembership")
+  sentGroupMessages    GroupMessage[]        @relation("GroupMessageSender")
+  vouchesGiven         VouchRecord[]         @relation("VouchVoucher")
+  vouchesReceived      VouchRecord[]         @relation("VouchInvitee")
+  susuMemberships      SusuMember[]          @relation("SusuMembership")
   creditScoreSnapshots CreditScoreSnapshot[] @relation("CreditScoreSnapshots")
-  susuPayoutsWon    SusuCycle[]        @relation("SusuCycleWinner")
-  susuContributions SusuContribution[] @relation("SusuContributor")
-  smartRoutes       SmartRoute[]
-  smartRouteRuns    SmartRouteRun[]    @relation("SmartRouteRunUser")
-  azmAuctionBids    AzmAuctionBid[]    @relation("AuctionBidder")
+  susuPayoutsWon       SusuCycle[]           @relation("SusuCycleWinner")
+  susuContributions    SusuContribution[]    @relation("SusuContributor")
+  smartRoutes          SmartRoute[]
+  smartRouteRuns       SmartRouteRun[]       @relation("SmartRouteRunUser")
+  azmAuctionBids       AzmAuctionBid[]       @relation("AuctionBidder")
 
   // ── PRIVATE SUSU ECOSYSTEM (2026-05-31) ────────────────────────────────────
   // Proof of Residency (Req 3) — admin-reviewed residency document with
@@ -927,8 +930,8 @@ model User {
   createdAt           DateTime                @default(now())
   stories             Story[]
   storyHighlights     StoryHighlight[]
-  storyCloseFriends   StoryCloseFriend[] @relation("StoryCloseFriendOwner")
-  storyCloseFriendOf  StoryCloseFriend[] @relation("StoryCloseFriendMember")
+  storyCloseFriends   StoryCloseFriend[]      @relation("StoryCloseFriendOwner")
+  storyCloseFriendOf  StoryCloseFriend[]      @relation("StoryCloseFriendMember")
   loyaltyCards        LoyaltyCard[]
   // Business OS relations
   employeeProfiles    BusinessEmployee[]      @relation("EmployeeUser")
@@ -1456,7 +1459,7 @@ model QrScan {
   campaignId String?  @db.VarChar(36)
   createdAt  DateTime @default(now())
 
-  campaign   QrCampaign? @relation(fields: [campaignId], references: [id], onDelete: SetNull)
+  campaign QrCampaign? @relation(fields: [campaignId], references: [id], onDelete: SetNull)
 
   @@index([createdAt])
   @@index([ipAddress])
@@ -1469,13 +1472,13 @@ model QrCampaign {
   name           String   @db.VarChar(200)
   slug           String   @unique @db.VarChar(100)
   destinationUrl String
-  label          String   @db.VarChar(200) @default("Azaman QR")
+  label          String   @default("Azaman QR") @db.VarChar(200)
   isActive       Boolean  @default(true)
   totalScans     Int      @default(0)
   createdAt      DateTime @default(now())
   updatedAt      DateTime @updatedAt
 
-  scans          QrScan[]
+  scans QrScan[]
 
   @@index([slug])
   @@index([isActive])
@@ -2513,7 +2516,7 @@ model BusinessProfile {
   // Business stake balance (2026-09-14): the reserable security deposit a
   // business posts; business no-show penalties are deducted from it with a
   // guarded conditional claim (never below zero). Default 0 = no stake posted.
-  stakeBalance    Decimal         @default(0) @db.Decimal(20, 8)
+  stakeBalance Decimal @default(0) @db.Decimal(20, 8)
 
   // Verification
   isVerified Boolean   @default(false)
@@ -2569,7 +2572,7 @@ model BusinessProfile {
 
   stories                 Story[]
   storyAnalytics          StoryAnalytics[]
-  loyaltyPrograms        LoyaltyProgram[]
+  loyaltyPrograms         LoyaltyProgram[]
   transitTrips            TransitTrip[]
   followers               BusinessFollower[]
   adPosts                 BusinessAdPost[]
@@ -2980,14 +2983,14 @@ model BusinessProduct {
   variants          Json? // [{ label:"Small", priceDelta:0 },{ label:"Large", priceDelta:2.5 }]
   modifierGroups    Json? // [{ name:"Add-ons", max:3, options:[{ name:"Extra Sauce", price:0.5 }] }]
 
-  businessProfile   BusinessProfile    @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
-  location          BusinessLocation?  @relation(fields: [locationId], references: [id])
-  catalogSection    CatalogSection?    @relation("SectionProducts", fields: [catalogSectionId], references: [id])
+  businessProfile   BusinessProfile     @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+  location          BusinessLocation?   @relation(fields: [locationId], references: [id])
+  catalogSection    CatalogSection?     @relation("SectionProducts", fields: [catalogSectionId], references: [id])
   kitchenOrderItems KitchenOrderItem[]
   recipeIngredients RecipeIngredient[]
   orders            BusinessOrder[]
   orderItems        BusinessOrderItem[]
-  supplier          Supplier?          @relation("SupplierProducts", fields: [supplierId], references: [id])
+  supplier          Supplier?           @relation("SupplierProducts", fields: [supplierId], references: [id])
 
   createdAt      DateTime        @default(now())
   updatedAt      DateTime        @updatedAt
@@ -3125,11 +3128,11 @@ model BusinessOrder {
 
   updatedAt DateTime @updatedAt
 
-  businessProfile BusinessProfile  @relation(fields: [businessProfileId], references: [id])
-  customer        User             @relation("OrderCustomer", fields: [customerId], references: [id])
-  product         BusinessProduct? @relation(fields: [productId], references: [id])
-  escrow          SmartEscrow?     @relation(fields: [escrowId], references: [id])
-  ticket          Ticket?          @relation(fields: [ticketId], references: [id])
+  businessProfile BusinessProfile     @relation(fields: [businessProfileId], references: [id])
+  customer        User                @relation("OrderCustomer", fields: [customerId], references: [id])
+  product         BusinessProduct?    @relation(fields: [productId], references: [id])
+  escrow          SmartEscrow?        @relation(fields: [escrowId], references: [id])
+  ticket          Ticket?             @relation(fields: [ticketId], references: [id])
   review          BusinessReview? // Discovery Sprint: one optional review per order
   items           BusinessOrderItem[]
   kitchenOrder    KitchenOrder?
@@ -3156,14 +3159,14 @@ model BusinessOrder {
 // BusinessOrder itself and have zero BusinessOrderItem rows.
 // =============================================================================
 model BusinessOrderItem {
-  id          String   @id @default(uuid())
-  orderId     String
-  productId   String
-  name        String   @db.VarChar(200)
-  unitPrice   Decimal  @db.Decimal(20, 8)
-  quantity    Int      @default(1)
-  notes       String?  @db.VarChar(500)
-  lineTotal   Decimal  @db.Decimal(20, 8)
+  id        String  @id @default(uuid())
+  orderId   String
+  productId String
+  name      String  @db.VarChar(200)
+  unitPrice Decimal @db.Decimal(20, 8)
+  quantity  Int     @default(1)
+  notes     String? @db.VarChar(500)
+  lineTotal Decimal @db.Decimal(20, 8)
 
   order   BusinessOrder   @relation(fields: [orderId], references: [id], onDelete: Cascade)
   product BusinessProduct @relation(fields: [productId], references: [id])
@@ -3174,7 +3177,6 @@ model BusinessOrderItem {
   @@index([orderId])
   @@index([productId])
 }
-
 
 // =============================================================================
 // BUSINESS VERIFICATION DOCUMENT (2026-06-16)
@@ -3427,13 +3429,13 @@ model TransitBooking {
 
 model Vault {
   // Round-up savings relation
-  roundUpSettings RoundUpSettings?  // back-relation
-  id                String      @id @default(uuid())
+  roundUpSettings   RoundUpSettings? // back-relation
+  id                String           @id @default(uuid())
   userId            Int
-  name              String      @db.VarChar(60)
-  targetAmountUsdc  Decimal     @db.Decimal(20, 8)
-  currentAmountUsdc Decimal     @default(0) @db.Decimal(20, 8)
-  status            VaultStatus @default(ACTIVE)
+  name              String           @db.VarChar(60)
+  targetAmountUsdc  Decimal          @db.Decimal(20, 8)
+  currentAmountUsdc Decimal          @default(0) @db.Decimal(20, 8)
+  status            VaultStatus      @default(ACTIVE)
 
   // Rules-of-the-game contract (mandatory acceptance before creation)
   rulesAcceptedAt      DateTime
@@ -3461,12 +3463,12 @@ model Vault {
   totalAzmEarned   Decimal @default(0) @db.Decimal(20, 8)
 
   // ── Phase 3: DeFi Yield Integration ──
-  yieldEnabled       Boolean  @default(false)
-  yieldStrategy      String?  @db.VarChar(50)  // AAVE | COMPOUND | INTERNAL_LP
-  yieldApr           Decimal  @default(0) @db.Decimal(6, 4)  // e.g. 0.0450 = 4.50%
-  yieldEarnedUsdc    Decimal  @default(0) @db.Decimal(20, 8)
+  yieldEnabled        Boolean   @default(false)
+  yieldStrategy       String?   @db.VarChar(50) // AAVE | COMPOUND | INTERNAL_LP
+  yieldApr            Decimal   @default(0) @db.Decimal(6, 4) // e.g. 0.0450 = 4.50%
+  yieldEarnedUsdc     Decimal   @default(0) @db.Decimal(20, 8)
   yieldLastCompoundAt DateTime?
-  yieldAutoCompound  Boolean  @default(true)
+  yieldAutoCompound   Boolean   @default(true)
 
   // Receipt snapshot (denormalised on completion for fast UI render)
   receiptSnapshot Json?
@@ -3513,18 +3515,18 @@ model VaultDeposit {
 
 // ── Phase 3: DeFi Yield Strategy Definitions ───────────────────────────────
 model DeFiYieldStrategy {
-  id          String   @id @default(uuid())
-  name        String   @db.VarChar(50)  // AAVE | COMPOUND | INTERNAL_LP
-  displayName String   @db.VarChar(100)
-  protocol    String   @db.VarChar(50)
-  apr         Decimal  @db.Decimal(6, 4)  // current APR
-  riskLevel   String   @default("LOW") @db.VarChar(20)  // LOW | MEDIUM | HIGH
-  minAmountUsdc Decimal @default(0) @db.Decimal(20, 8)
+  id            String   @id @default(uuid())
+  name          String   @db.VarChar(50) // AAVE | COMPOUND | INTERNAL_LP
+  displayName   String   @db.VarChar(100)
+  protocol      String   @db.VarChar(50)
+  apr           Decimal  @db.Decimal(6, 4) // current APR
+  riskLevel     String   @default("LOW") @db.VarChar(20) // LOW | MEDIUM | HIGH
+  minAmountUsdc Decimal  @default(0) @db.Decimal(20, 8)
   maxAmountUsdc Decimal? @db.Decimal(20, 8)
-  isActive    Boolean  @default(true)
-  description String?  @db.VarChar(500)
-  logoUrl     String?
-  updatedAt   DateTime @updatedAt
+  isActive      Boolean  @default(true)
+  description   String?  @db.VarChar(500)
+  logoUrl       String?
+  updatedAt     DateTime @updatedAt
 
   @@index([isActive])
 }
@@ -3739,7 +3741,7 @@ model SusuGroup {
   voucherSlashLogs     VoucherSlashLog[]
   reminderRows         SusuReminderSent[]
   warRoomAlerts        AdminWarRoomAlert[]
-  crossBorderConfig   CrossBorderSusuConfig?
+  crossBorderConfig    CrossBorderSusuConfig?
 
   createdAt DateTime @default(now())
 
@@ -4168,9 +4170,9 @@ model Story {
   boostAzmSpent Decimal  @default(0.0) @db.Decimal(20, 8)
   createdAt     DateTime @default(now())
 
-  views     StoryView[]
-  reactions StoryReaction[]
-  adPost    BusinessAdPost?
+  views          StoryView[]
+  reactions      StoryReaction[]
+  adPost         BusinessAdPost?
   highlightItems StoryHighlightItem[]
   analytics      StoryAnalytics?
 }
@@ -5878,37 +5880,37 @@ model CallLog {
 // ─── Phase 3: Story Highlights ───────────────────────────────────────────────
 // Permanent collections of stories on a user's profile (like Instagram highlights)
 model StoryHighlight {
-  id          Int      @id @default(autoincrement())
-  userId      Int
-  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-  title       String   @db.VarChar(50)
-  coverUrl    String?
-  createdAt   DateTime @default(now())
+  id        Int      @id @default(autoincrement())
+  userId    Int
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  title     String   @db.VarChar(50)
+  coverUrl  String?
+  createdAt DateTime @default(now())
 
   items StoryHighlightItem[]
 }
 
 model StoryHighlightItem {
-  id           Int           @id @default(autoincrement())
-  highlightId  Int
-  highlight    StoryHighlight @relation(fields: [highlightId], references: [id], onDelete: Cascade)
-  storyId      Int?
-  story        Story?        @relation(fields: [storyId], references: [id], onDelete: SetNull)
-  mediaUrl     String  // snapshot of the story media (story may expire)
-  mediaType    String  @default("IMAGE")
-  caption      String?
-  addedAt      DateTime @default(now())
+  id          Int            @id @default(autoincrement())
+  highlightId Int
+  highlight   StoryHighlight @relation(fields: [highlightId], references: [id], onDelete: Cascade)
+  storyId     Int?
+  story       Story?         @relation(fields: [storyId], references: [id], onDelete: SetNull)
+  mediaUrl    String // snapshot of the story media (story may expire)
+  mediaType   String         @default("IMAGE")
+  caption     String?
+  addedAt     DateTime       @default(now())
 }
 
 // ─── Phase 3: Story Close Friends List ──────────────────────────────────────
 // Private story audience — only selected friends can see these stories
 model StoryCloseFriend {
-  id        Int    @id @default(autoincrement())
-  userId    Int    // the story creator
-  user      User   @relation("StoryCloseFriendOwner", fields: [userId], references: [id], onDelete: Cascade)
-  friendId  Int    // the allowed viewer
-  friend    User   @relation("StoryCloseFriendMember", fields: [friendId], references: [id], onDelete: Cascade)
-  addedAt   DateTime @default(now())
+  id       Int      @id @default(autoincrement())
+  userId   Int // the story creator
+  user     User     @relation("StoryCloseFriendOwner", fields: [userId], references: [id], onDelete: Cascade)
+  friendId Int // the allowed viewer
+  friend   User     @relation("StoryCloseFriendMember", fields: [friendId], references: [id], onDelete: Cascade)
+  addedAt  DateTime @default(now())
 
   @@unique([userId, friendId])
 }
@@ -5916,77 +5918,77 @@ model StoryCloseFriend {
 // ─── Phase 3: Story Analytics ────────────────────────────────────────────────
 // Aggregate per-story metrics for business stories
 model StoryAnalytics {
-  id              Int      @id @default(autoincrement())
-  storyId         Int      @unique
-  story           Story    @relation(fields: [storyId], references: [id], onDelete: Cascade)
-  businessProfileId String?
-  businessProfile   BusinessProfile? @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
-  viewCount       Int      @default(0)
-  uniqueViewerCount Int    @default(0)
-  reactionCount   Int      @default(0)
-  replyCount      Int      @default(0)
-  shareCount      Int      @default(0)
-  profileClickCount Int    @default(0)
-  avgViewDurationSeconds Float @default(0)
-  updatedAt       DateTime @updatedAt
+  id                     Int              @id @default(autoincrement())
+  storyId                Int              @unique
+  story                  Story            @relation(fields: [storyId], references: [id], onDelete: Cascade)
+  businessProfileId      String?
+  businessProfile        BusinessProfile? @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+  viewCount              Int              @default(0)
+  uniqueViewerCount      Int              @default(0)
+  reactionCount          Int              @default(0)
+  replyCount             Int              @default(0)
+  shareCount             Int              @default(0)
+  profileClickCount      Int              @default(0)
+  avgViewDurationSeconds Float            @default(0)
+  updatedAt              DateTime         @updatedAt
 }
 
 // ─── Phase 3: Business Loyalty Programs ─────────────────────────────────────
 // Stamp card loyalty program — buy N get 1 free style
 model LoyaltyProgram {
-  id                String   @id @default(uuid())
+  id                String          @id @default(uuid())
   businessProfileId String
   businessProfile   BusinessProfile @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
-  name              String   @db.VarChar(100)
+  name              String          @db.VarChar(100)
   description       String?
-  type              String   @default("STAMP") // STAMP | POINTS | TIER
+  type              String          @default("STAMP") // STAMP | POINTS | TIER
   // STAMP: collect N stamps → reward
-  stampsRequired    Int      @default(10)
-  rewardDescription String   @db.VarChar(200)
+  stampsRequired    Int             @default(10)
+  rewardDescription String          @db.VarChar(200)
   // POINTS: earn points per spend
-  pointsPerCedi     Float?   // e.g. 1 point per GHS 5 spent
+  pointsPerCedi     Float? // e.g. 1 point per GHS 5 spent
   // TIER: vendor tiers Bronze/Silver/Gold
   // color for the card
-  cardColor         String   @default("#FFD700")
-  isActive          Boolean  @default(true)
-  createdAt         DateTime @default(now())
-  updatedAt         DateTime @updatedAt
+  cardColor         String          @default("#FFD700")
+  isActive          Boolean         @default(true)
+  createdAt         DateTime        @default(now())
+  updatedAt         DateTime        @updatedAt
 
   cards LoyaltyCard[]
 }
 
 // Per-customer loyalty card tracking their stamps/points
 model LoyaltyCard {
-  id                String   @id @default(uuid())
-  loyaltyProgramId  String
-  loyaltyProgram    LoyaltyProgram @relation(fields: [loyaltyProgramId], references: [id], onDelete: Cascade)
-  userId            Int
-  user              User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-  stampsCollected   Int      @default(0)
-  pointsBalance     Float    @default(0)
-  currentTier       String   @default("BRONZE")
-  totalRewardsRedeemed Int   @default(0)
-  lastStampAt       DateTime?
-  redeemedAt        DateTime?
-  createdAt         DateTime @default(now())
-  updatedAt         DateTime @updatedAt
+  id                   String         @id @default(uuid())
+  loyaltyProgramId     String
+  loyaltyProgram       LoyaltyProgram @relation(fields: [loyaltyProgramId], references: [id], onDelete: Cascade)
+  userId               Int
+  user                 User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  stampsCollected      Int            @default(0)
+  pointsBalance        Float          @default(0)
+  currentTier          String         @default("BRONZE")
+  totalRewardsRedeemed Int            @default(0)
+  lastStampAt          DateTime?
+  redeemedAt           DateTime?
+  createdAt            DateTime       @default(now())
+  updatedAt            DateTime       @updatedAt
 
   @@unique([loyaltyProgramId, userId])
 }
 
 // ── Phase 3: Real-time Order Tracking ────────────────────────────────────────
 model OrderTracking {
-  id              String   @id @default(uuid())
-  orderId         String   @unique
-  order           BusinessOrder @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  id                String          @id @default(uuid())
+  orderId           String          @unique
+  order             BusinessOrder   @relation(fields: [orderId], references: [id], onDelete: Cascade)
   businessProfileId String
   businessProfile   BusinessProfile @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
 
   // Live courier location
-  courierLatitude   Decimal? @db.Decimal(10, 7)
-  courierLongitude  Decimal? @db.Decimal(10, 7)
-  courierHeading    Float?   // degrees 0-360
-  courierSpeedKmh   Float?   // km/h
+  courierLatitude  Decimal? @db.Decimal(10, 7)
+  courierLongitude Decimal? @db.Decimal(10, 7)
+  courierHeading   Float? // degrees 0-360
+  courierSpeedKmh  Float? // km/h
 
   // Destination
   deliveryLatitude  Decimal? @db.Decimal(10, 7)
@@ -5998,35 +6000,35 @@ model OrderTracking {
   actualArrival    DateTime?
 
   // Status timeline (JSON array of {status, timestamp, note})
-  timeline         Json     @default("[]")
+  timeline Json @default("[]")
 
   // Driver info
-  driverName       String?  @db.VarChar(100)
-  driverPhone      String?  @db.VarChar(20)
-  vehiclePlate     String?  @db.VarChar(20)
+  driverName   String? @db.VarChar(100)
+  driverPhone  String? @db.VarChar(20)
+  vehiclePlate String? @db.VarChar(20)
 
   // Socket room for real-time updates
-  lastPingAt       DateTime?
+  lastPingAt DateTime?
 
-  createdAt        DateTime @default(now())
-  updatedAt        DateTime @updatedAt
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
   @@index([orderId])
   @@index([businessProfileId])
 }
 
 model RoundUpSettings {
-  id              String   @id @default(uuid())
-  userId          Int      @unique
-  enabled         Boolean  @default(false)
-  targetVaultId   String?  @unique
-  totalSavedUsdc  Float    @default(0)
-  multiplier      Float    @default(1.0)  // round to nearest $1 by default
-  createdAt       DateTime @default(now())
-  updatedAt       DateTime @updatedAt
+  id             String   @id @default(uuid())
+  userId         Int      @unique
+  enabled        Boolean  @default(false)
+  targetVaultId  String?  @unique
+  totalSavedUsdc Float    @default(0)
+  multiplier     Float    @default(1.0) // round to nearest $1 by default
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
 
-  user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-  targetVault     Vault?   @relation(fields: [targetVaultId], references: [id], onDelete: SetNull)
+  user        User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  targetVault Vault? @relation(fields: [targetVaultId], references: [id], onDelete: SetNull)
 
   @@index([userId])
 }
@@ -6035,17 +6037,17 @@ model RoundUpSettings {
 // PHASE 5: CREDIT SCORING — Score snapshot history
 // =============================================================================
 model CreditScoreSnapshot {
-  id               Int      @id @default(autoincrement())
-  userId           Int
-  score            Int
-  rating           String   @db.VarChar(20)
-  band             String   @db.VarChar(5)
-  susuComponent    Int
-  tradeComponent   Int
-  accountComponent Int
-  financialComponent Int
+  id                  Int      @id @default(autoincrement())
+  userId              Int
+  score               Int
+  rating              String   @db.VarChar(20)
+  band                String   @db.VarChar(5)
+  susuComponent       Int
+  tradeComponent      Int
+  accountComponent    Int
+  financialComponent  Int
   reputationComponent Int
-  calculatedAt     DateTime
+  calculatedAt        DateTime
 
   user User @relation("CreditScoreSnapshots", fields: [userId], references: [id], onDelete: Cascade)
 
@@ -6058,15 +6060,15 @@ model CreditScoreSnapshot {
 // PHASE 5: AZM GIFTING & TIPPING — P2P loyalty point transfers
 // =============================================================================
 model AzmGift {
-  id           String   @id @default(uuid())
-  senderId     Int
-  receiverId   Int
-  amount       Decimal  @db.Decimal(20, 8)
-  type         String   @db.VarChar(20) // GIFT | TIP | REWARD
-  message      String?
-  contextType  String?  @db.VarChar(20) // TRADE | CHAT | MARKETPLACE | SUSU | BUSINESS | GENERAL
+  id          String   @id @default(uuid())
+  senderId    Int
+  receiverId  Int
+  amount      Decimal  @db.Decimal(20, 8)
+  type        String   @db.VarChar(20) // GIFT | TIP | REWARD
+  message     String?
+  contextType String?  @db.VarChar(20) // TRADE | CHAT | MARKETPLACE | SUSU | BUSINESS | GENERAL
   contextId   String?
-  createdAt    DateTime @default(now())
+  createdAt   DateTime @default(now())
 
   sender   User @relation("AzmGiftSender", fields: [senderId], references: [id], onDelete: Cascade)
   receiver User @relation("AzmGiftReceiver", fields: [receiverId], references: [id], onDelete: Cascade)
@@ -6084,7 +6086,7 @@ model ProofOfReservesSnapshot {
   totalLiabilities Decimal  @db.Decimal(20, 8)
   totalReserves    Decimal  @db.Decimal(20, 8)
   reserveRatio     Decimal  @db.Decimal(10, 4)
-  isFullyBacked     Boolean  @default(true)
+  isFullyBacked    Boolean  @default(true)
   userCount        Int
   merkleRoot       String   @db.VarChar(64)
   salt             String
@@ -6118,20 +6120,20 @@ model AzmConversionLog {
 // PHASE 5: ORDER BOOK TRADING — Limit order book for AZM/USDC pair
 // =============================================================================
 model OrderBookOrder {
-  id               String   @id @default(uuid())
-  userId           Int
-  pair             String   @db.VarChar(20) // AZM/USDC
-  side             String   @db.VarChar(4)  // BUY | SELL
-  type             String   @db.VarChar(6)  // LIMIT | MARKET
-  price            Decimal? @db.Decimal(18, 8) // null for market orders
-  quantity         Decimal  @db.Decimal(20, 8)
-  remainingQuantity Decimal @db.Decimal(20, 8)
-  status           String   @db.VarChar(20) @default("OPEN") // OPEN | PARTIALLY_FILLED | FILLED | CANCELLED
-  createdAt        DateTime @default(now())
-  updatedAt        DateTime @updatedAt
+  id                String   @id @default(uuid())
+  userId            Int
+  pair              String   @db.VarChar(20) // AZM/USDC
+  side              String   @db.VarChar(4) // BUY | SELL
+  type              String   @db.VarChar(6) // LIMIT | MARKET
+  price             Decimal? @db.Decimal(18, 8) // null for market orders
+  quantity          Decimal  @db.Decimal(20, 8)
+  remainingQuantity Decimal  @db.Decimal(20, 8)
+  status            String   @default("OPEN") @db.VarChar(20) // OPEN | PARTIALLY_FILLED | FILLED | CANCELLED
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
 
-  user   User              @relation(fields: [userId], references: [id], onDelete: Cascade)
-  trades OrderBookTrade[] @relation("OrderBookMakerOrder")
+  user        User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  trades      OrderBookTrade[] @relation("OrderBookMakerOrder")
   takerTrades OrderBookTrade[] @relation("OrderBookTakerOrder")
 
   @@index([pair, side, status, price])
@@ -6139,17 +6141,17 @@ model OrderBookOrder {
 }
 
 model OrderBookTrade {
-  id            String   @id @default(uuid())
-  pair          String   @db.VarChar(20)
-  makerOrderId  String
-  takerOrderId  String
-  price         Decimal  @db.Decimal(18, 8)
-  quantity      Decimal  @db.Decimal(20, 8)
-  makerFee      Decimal  @db.Decimal(20, 8)
-  takerFee      Decimal  @db.Decimal(20, 8)
-  makerUserId   Int
-  takerUserId   Int
-  createdAt     DateTime @default(now())
+  id           String   @id @default(uuid())
+  pair         String   @db.VarChar(20)
+  makerOrderId String
+  takerOrderId String
+  price        Decimal  @db.Decimal(18, 8)
+  quantity     Decimal  @db.Decimal(20, 8)
+  makerFee     Decimal  @db.Decimal(20, 8)
+  takerFee     Decimal  @db.Decimal(20, 8)
+  makerUserId  Int
+  takerUserId  Int
+  createdAt    DateTime @default(now())
 
   makerOrder OrderBookOrder @relation("OrderBookMakerOrder", fields: [makerOrderId], references: [id], onDelete: Cascade)
   takerOrder OrderBookOrder @relation("OrderBookTakerOrder", fields: [takerOrderId], references: [id], onDelete: Cascade)
@@ -6167,13 +6169,13 @@ model OrderBookTrade {
 // Conversion between currencies uses platform rates with a small FX spread.
 // =============================================================================
 model CurrencyWallet {
-  id          Int      @id @default(autoincrement())
-  userId      Int
-  currency    String   @db.VarChar(8)   // GHS, NGN, KES, USD, EUR, GBP etc.
-  balance     Decimal  @default(0.0) @db.Decimal(20, 8)
-  isDefault   Boolean  @default(false)  // primary wallet for deposits/withdrawals
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
+  id        Int      @id @default(autoincrement())
+  userId    Int
+  currency  String   @db.VarChar(8) // GHS, NGN, KES, USD, EUR, GBP etc.
+  balance   Decimal  @default(0.0) @db.Decimal(20, 8)
+  isDefault Boolean  @default(false) // primary wallet for deposits/withdrawals
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
@@ -6183,11 +6185,11 @@ model CurrencyWallet {
 
 // FX rate snapshots updated periodically by a worker
 model FxRate {
-  id          Int      @id @default(autoincrement())
-  fromCurrency String  @db.VarChar(8)
-  toCurrency   String  @db.VarChar(8)
+  id           Int      @id @default(autoincrement())
+  fromCurrency String   @db.VarChar(8)
+  toCurrency   String   @db.VarChar(8)
   rate         Decimal  @db.Decimal(18, 8)
-  source       String   @db.VarChar(20) @default("platform") // platform | manual
+  source       String   @default("platform") @db.VarChar(20) // platform | manual
   fetchedAt    DateTime @default(now())
 
   @@unique([fromCurrency, toCurrency])
@@ -6196,15 +6198,15 @@ model FxRate {
 
 // Conversion log for audit trail
 model CurrencyConversion {
-  id            Int      @id @default(autoincrement())
-  userId        Int
-  fromCurrency  String   @db.VarChar(8)
-  toCurrency    String   @db.VarChar(8)
-  fromAmount    Decimal  @db.Decimal(20, 8)
-  toAmount      Decimal  @db.Decimal(20, 8)
-  rate          Decimal  @db.Decimal(18, 8)
-  feeUsdc       Decimal  @default(0.0) @db.Decimal(20, 8)
-  createdAt     DateTime @default(now())
+  id           Int      @id @default(autoincrement())
+  userId       Int
+  fromCurrency String   @db.VarChar(8)
+  toCurrency   String   @db.VarChar(8)
+  fromAmount   Decimal  @db.Decimal(20, 8)
+  toAmount     Decimal  @db.Decimal(20, 8)
+  rate         Decimal  @db.Decimal(18, 8)
+  feeUsdc      Decimal  @default(0.0) @db.Decimal(20, 8)
+  createdAt    DateTime @default(now())
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
@@ -6215,22 +6217,22 @@ model CurrencyConversion {
 // PHASE 4: ADMIN RBAC & MULTI-STEP APPROVALS
 // =============================================================================
 model AdminApprovalRequest {
-  id                Int      @id @default(autoincrement())
-  type              String   @db.VarChar(30)  // WITHDRAWAL | SUSU_PAYOUT | VENDOR_TIER_CHANGE | USER_BAN | FEE_OVERRIDE | MANUAL_BALANCE_ADJUST
-  entityId          String   @db.VarChar(100) // ID of the entity being approved
-  amount            Decimal  @default(0.0) @db.Decimal(20, 8)
-  description       String   @db.VarChar(500)
+  id                Int       @id @default(autoincrement())
+  type              String    @db.VarChar(30) // WITHDRAWAL | SUSU_PAYOUT | VENDOR_TIER_CHANGE | USER_BAN | FEE_OVERRIDE | MANUAL_BALANCE_ADJUST
+  entityId          String    @db.VarChar(100) // ID of the entity being approved
+  amount            Decimal   @default(0.0) @db.Decimal(20, 8)
+  description       String    @db.VarChar(500)
   metadata          Json
   requestedBy       Int
-  requiredApprovals Int      @default(1)
-  approvals         Json     @default("[]") // array of { userId, role, at }
-  status            String   @db.VarChar(20) @default("PENDING") // PENDING | APPROVED | REJECTED | AUTO_APPROVED | EXECUTED | EXPIRED
+  requiredApprovals Int       @default(1)
+  approvals         Json      @default("[]") // array of { userId, role, at }
+  status            String    @default("PENDING") @db.VarChar(20) // PENDING | APPROVED | REJECTED | AUTO_APPROVED | EXECUTED | EXPIRED
   approvedBy        Int?
   approvedAt        DateTime?
   rejectedBy        Int?
   rejectedAt        DateTime?
-  rejectionReason   String?  @db.VarChar(500)
-  createdAt         DateTime @default(now())
+  rejectionReason   String?   @db.VarChar(500)
+  createdAt         DateTime  @default(now())
 
   requester User @relation("ApprovalRequester", fields: [requestedBy], references: [id])
 
@@ -6245,33 +6247,33 @@ model CrossBorderSusuConfig {
   id              Int      @id @default(autoincrement())
   susuGroupId     String   @unique
   baseCurrency    String   @db.VarChar(8)
-  memberCountries Json     // [{ country: "GH", currency: "GHS" }, ...]
+  memberCountries Json // [{ country: "GH", currency: "GHS" }, ...]
   crossBorderFee  Decimal  @default(0.005) @db.Decimal(6, 4)
   createdBy       Int
   createdAt       DateTime @default(now())
 
-  susuGroup     SusuGroup              @relation(fields: [susuGroupId], references: [id], onDelete: Cascade)
-  fxSnapshots   CrossBorderFxSnapshot[]
-  creator       User                   @relation(fields: [createdBy], references: [id])
+  susuGroup   SusuGroup               @relation(fields: [susuGroupId], references: [id], onDelete: Cascade)
+  fxSnapshots CrossBorderFxSnapshot[]
+  creator     User                    @relation(fields: [createdBy], references: [id])
 
   @@index([susuGroupId])
 }
 
 model CrossBorderFxSnapshot {
-  id            Int      @id @default(autoincrement())
-  susuGroupId   String
-  cycleId       String?
-  userId        Int
-  fromCurrency  String   @db.VarChar(8)
-  toCurrency    String   @db.VarChar(8)
-  localAmount   Decimal  @db.Decimal(20, 8)
-  baseAmount    Decimal  @db.Decimal(20, 8)
-  rate          Decimal  @db.Decimal(18, 8)
-  fee           Decimal  @default(0.0) @db.Decimal(20, 8)
-  createdAt     DateTime @default(now())
+  id           Int      @id @default(autoincrement())
+  susuGroupId  String
+  cycleId      String?
+  userId       Int
+  fromCurrency String   @db.VarChar(8)
+  toCurrency   String   @db.VarChar(8)
+  localAmount  Decimal  @db.Decimal(20, 8)
+  baseAmount   Decimal  @db.Decimal(20, 8)
+  rate         Decimal  @db.Decimal(18, 8)
+  fee          Decimal  @default(0.0) @db.Decimal(20, 8)
+  createdAt    DateTime @default(now())
 
-  susuGroup       CrossBorderSusuConfig @relation(fields: [susuGroupId], references: [susuGroupId], onDelete: Cascade)
-  user            User                  @relation(fields: [userId], references: [id])
+  susuGroup CrossBorderSusuConfig @relation(fields: [susuGroupId], references: [susuGroupId], onDelete: Cascade)
+  user      User                  @relation(fields: [userId], references: [id])
 
   @@index([susuGroupId, createdAt(sort: Desc)])
   @@index([userId])
@@ -6281,28 +6283,28 @@ model CrossBorderFxSnapshot {
 // PHASE 5: AZM GOVERNANCE / DAO — Proposal + voting system
 // =============================================================================
 model GovernanceProposal {
-  id                Int       @id @default(autoincrement())
-  proposerId        Int
-  title             String    @db.VarChar(200)
-  description       String    @db.VarChar(2000)
-  type              String    @db.VarChar(30)  // PARAMETER_CHANGE | TREASURY_ACTION | FEATURE_FLAG | GENERAL
-  targetContract    String?   @db.VarChar(100)
-  callData          Json?
-  status            String    @db.VarChar(20) @default("ACTIVE") // DRAFT | ACTIVE | PASSED | REJECTED | EXECUTED | EXPIRED | CANCELLED
-  forVotes          Decimal   @default(0.0) @db.Decimal(20, 8)
-  againstVotes      Decimal   @default(0.0) @db.Decimal(20, 8)
-  abstainVotes      Decimal   @default(0.0) @db.Decimal(20, 8)
-  totalVotingPower  Decimal   @default(0.0) @db.Decimal(20, 8)
-  votingStartsAt    DateTime  @default(now())
-  votingEndsAt      DateTime
-  executionReadyAt  DateTime?
-  executedAt        DateTime?
-  executedById      Int?
-  createdAt         DateTime  @default(now())
+  id               Int       @id @default(autoincrement())
+  proposerId       Int
+  title            String    @db.VarChar(200)
+  description      String    @db.VarChar(2000)
+  type             String    @db.VarChar(30) // PARAMETER_CHANGE | TREASURY_ACTION | FEATURE_FLAG | GENERAL
+  targetContract   String?   @db.VarChar(100)
+  callData         Json?
+  status           String    @default("ACTIVE") @db.VarChar(20) // DRAFT | ACTIVE | PASSED | REJECTED | EXECUTED | EXPIRED | CANCELLED
+  forVotes         Decimal   @default(0.0) @db.Decimal(20, 8)
+  againstVotes     Decimal   @default(0.0) @db.Decimal(20, 8)
+  abstainVotes     Decimal   @default(0.0) @db.Decimal(20, 8)
+  totalVotingPower Decimal   @default(0.0) @db.Decimal(20, 8)
+  votingStartsAt   DateTime  @default(now())
+  votingEndsAt     DateTime
+  executionReadyAt DateTime?
+  executedAt       DateTime?
+  executedById     Int?
+  createdAt        DateTime  @default(now())
 
-  proposer   User              @relation("GovernanceProposer", fields: [proposerId], references: [id])
-  executor  User?              @relation("GovernanceExecutor", fields: [executedById], references: [id])
-  votes     GovernanceVote[]
+  proposer User             @relation("GovernanceProposer", fields: [proposerId], references: [id])
+  executor User?            @relation("GovernanceExecutor", fields: [executedById], references: [id])
+  votes    GovernanceVote[]
 
   @@index([status, createdAt(sort: Desc)])
   @@index([proposerId])
