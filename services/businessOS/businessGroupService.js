@@ -39,11 +39,27 @@ class BusinessGroupService {
     async getGroupStats(userId, groupId = null) {
         const prisma = this.prisma;
 
-        // Find all businesses for this user
+        // Find all businesses for this user. When a group is requested, the
+        // group itself must also belong to the caller; otherwise a guessed
+        // groupId would expose another owner's businesses and aggregate data.
         let businesses;
         if (groupId) {
+            const group = await prisma.businessGroup.findFirst({
+                where: { id: groupId, ownerUserId: userId },
+                select: { id: true },
+            });
+            if (!group) {
+                return {
+                    totalRevenue: 0,
+                    totalOrders: 0,
+                    totalEmployees: 0,
+                    avgRating: 0,
+                    businesses: [],
+                };
+            }
+
             businesses = await prisma.businessProfile.findMany({
-                where: { groupId },
+                where: { groupId, userId },
                 select: { id: true, businessName: true, category: true, address: true,
                           totalVolume: true, totalEscrows: true, completedEscrows: true,
                           averageRating: true, reviewCount: true },
