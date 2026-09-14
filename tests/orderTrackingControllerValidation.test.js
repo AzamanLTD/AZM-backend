@@ -61,6 +61,7 @@ describe('order tracking controller payload validation', () => {
         };
         const tx = {
             $queryRaw: jest.fn().mockResolvedValue([]),
+            $queryRawUnsafe: jest.fn().mockResolvedValue([{ locked: 1 }]),
             orderTracking,
         };
         const io = { to: jest.fn().mockReturnThis(), emit: jest.fn() };

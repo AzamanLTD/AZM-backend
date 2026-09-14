@@ -211,6 +211,7 @@ describe('Order tracking controller boundaries', () => {
         };
         const tx = {
             $queryRaw: jest.fn().mockResolvedValue([{ pg_advisory_xact_lock: null }]),
+            $queryRawUnsafe: jest.fn().mockResolvedValue([{ locked: 1 }]),
             orderTracking,
         };
         const prisma = {
@@ -241,7 +242,7 @@ describe('Order tracking controller boundaries', () => {
         await controller.updateStatus(req, res);
 
         expect(prisma.$transaction).toHaveBeenCalledTimes(1);
-        expect(tx.$queryRaw).toHaveBeenCalledTimes(1);
+        expect(tx.$queryRawUnsafe).toHaveBeenCalledTimes(1);
         expect(prisma.orderTracking.update).toHaveBeenCalledWith(expect.objectContaining({
             data: expect.objectContaining({ deliveryLatitude: 0, deliveryLongitude: 0 }),
         }));

@@ -19,6 +19,7 @@ describe('storefrontDraftMutationSafeService', () => {
   function makePrisma(draft) {
     const tx = {
       $queryRaw: jest.fn().mockResolvedValue([]),
+      $queryRawUnsafe: jest.fn().mockResolvedValue([{ locked: 1 }]),
       businessStorefrontLayout: {
         findUnique: jest.fn().mockResolvedValue(draft),
         update: jest.fn().mockResolvedValue({ id: 'draft-1', layoutJson: {} }),
@@ -56,7 +57,7 @@ describe('storefrontDraftMutationSafeService', () => {
     );
 
     expect(result).toEqual({ ok: true });
-    expect(tx.$queryRaw).toHaveBeenCalledTimes(1);
+    expect(tx.$queryRawUnsafe).toHaveBeenCalledTimes(1);
     expect(tx.businessStorefrontLayout.findUnique).toHaveBeenCalledTimes(1);
   });
 
@@ -110,6 +111,6 @@ describe('storefrontDraftMutationSafeService', () => {
       },
       include: { theme: true },
     }));
-    expect(tx.$queryRaw).toHaveBeenCalledTimes(1);
+    expect(tx.$queryRawUnsafe).toHaveBeenCalledTimes(1);
   });
 });

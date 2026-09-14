@@ -41,7 +41,10 @@ async function withDraftMutation(prisma, businessProfileId, expectedUpdatedAt, m
   const expected = parseExpectedUpdatedAt(expectedUpdatedAt);
 
   return prisma.$transaction(async (tx) => {
-    await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${businessProfileId}))`;
+    await tx.$queryRawUnsafe(
+      'SELECT 1 AS locked FROM pg_advisory_xact_lock(hashtext($1))',
+      String(businessProfileId),
+    );
 
     const draft = await tx.businessStorefrontLayout.findUnique({
       where: { businessProfileId_status: { businessProfileId, status: 'DRAFT' } },

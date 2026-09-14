@@ -34,7 +34,7 @@ const lockBusinessTaxPresets = async (tx, businessProfileId) => {
     // deterministic across concurrent requests before the database unique
     // index is even consulted.
     await tx.$queryRawUnsafe(
-        'SELECT pg_advisory_xact_lock(hashtext($1))',
+        'SELECT 1 AS locked FROM pg_advisory_xact_lock(hashtext($1))',
         `business-tax-presets:${businessProfileId}`,
     );
 };

@@ -7,6 +7,7 @@ describe('order tracking mutation safety', () => {
         };
         const tx = {
             $queryRaw: jest.fn().mockResolvedValue([]),
+            $queryRawUnsafe: jest.fn().mockResolvedValue([{ locked: 1 }]),
             orderTracking,
         };
         const prisma = {
@@ -18,7 +19,7 @@ describe('order tracking mutation safety', () => {
 
         expect(result).toBe('done');
         expect(prisma.$transaction).toHaveBeenCalledTimes(1);
-        expect(tx.$queryRaw).toHaveBeenCalledTimes(1);
+        expect(tx.$queryRawUnsafe).toHaveBeenCalledTimes(1);
         expect(tx.orderTracking.upsert).toHaveBeenCalledWith({
             where: { orderId: 'order-1' },
             create: { orderId: 'order-1', businessProfileId: 'biz-1' },
