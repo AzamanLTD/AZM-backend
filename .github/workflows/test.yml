@@ -85,6 +85,9 @@ jobs:
           fi
           exit $code
 
+      - name: Verify route registry against frontend API usage
+        run: npm run route-check
+
       - name: Database backup and restore drill
         env:
           PG_ADMIN_URL: postgres://postgres:postgres@localhost:5432/postgres
