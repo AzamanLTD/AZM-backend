@@ -21,11 +21,14 @@ function withContext(context, fn) {
 
 describe('ShiftService business scoping and atomicity', () => {
     test('rejects cross-business shift update before mutation', async () => {
-        const prisma = {
+        const tx = {
             shift: {
                 findFirst: jest.fn().mockResolvedValue(null),
                 update: jest.fn(),
             },
+        };
+        const prisma = {
+            $transaction: jest.fn(async (callback) => callback(tx)),
         };
         const svc = new ShiftService(prisma);
 
@@ -34,11 +37,13 @@ describe('ShiftService business scoping and atomicity', () => {
                 .rejects.toThrow('Shift not found.');
         });
 
-        expect(prisma.shift.findFirst).toHaveBeenCalledWith({
+        // The target shift is loaded INSIDE the transaction with id + business
+        // scope; no overlap work is added for a non-time update.
+        expect(tx.shift.findFirst).toHaveBeenCalledWith({
             where: { id: 'shift-b', businessProfileId: bpA },
-            select: { id: true },
+            select: { id: true, employeeId: true, startTime: true, endTime: true },
         });
-        expect(prisma.shift.update).not.toHaveBeenCalled();
+        expect(tx.shift.update).not.toHaveBeenCalled();
     });
 
     test('worker cannot clock another employee in the same business', async () => {

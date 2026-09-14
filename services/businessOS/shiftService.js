@@ -36,6 +36,16 @@ class ShiftService {
         }
     }
 
+    // ── Scheduling mutation boundary ────────────────────────────────────────
+    // createShift/updateShift serialize on a transaction-scoped PostgreSQL
+    // advisory lock scoped to ONE employee's schedule, so concurrent create /
+    // update / create-vs-update calls cannot both observe a conflict-free
+    // schedule. Same pattern as businessTaxPresetService / orderTracking
+    // mutation-safe services. Acquired through `tx` only — held until commit.
+    async _lockEmployeeSchedule(tx, employeeId) {
+        await tx.$queryRaw`SELECT pg_advisory_xact_lock(hashtext(${'business_shift_schedule:' + String(employeeId)}))`;
+    }
+
     // ── Create Shift ───────────────────────────────────────────────────────
     async createShift({ businessProfileId, employeeId, shiftDate, startTime, endTime, locationId, breakMinutes = 30, shiftLabel, rotationId, notes }) {
         const employee = await this.prisma.businessEmployee.findUnique({
@@ -48,38 +58,47 @@ class ShiftService {
             throw new Error('Cannot schedule an inactive employee.');
         }
 
-        const existing = await this.prisma.shift.findFirst({
-            where: {
-                employeeId,
-                shiftDate: new Date(shiftDate),
-                status: { in: ['SCHEDULED', 'CLOCKED_IN', 'LATE'] },
-                startTime: { lt: new Date(endTime) },
-                endTime: { gt: new Date(startTime) },
-            },
-        });
-        if (existing) {
-            throw new Error('Employee already has a conflicting shift at this time.');
-        }
+        // Conflict check + insert in ONE serialized transaction. The
+        // read-then-write shape below could race two concurrent createShift
+        // calls into both observing a conflict-free schedule; the advisory
+        // lock plus in-transaction check closes that window.
+        return this.prisma.$transaction(async (tx) => {
+            await this._lockEmployeeSchedule(tx, employeeId);
 
-        return this.prisma.shift.create({
-            data: {
-                businessProfileId,
-                employeeId,
-                userId: employee.userId,
-                locationId,
-                shiftDate: new Date(shiftDate),
-                startTime: new Date(startTime),
-                endTime: new Date(endTime),
-                breakMinutes,
-                shiftLabel,
-                rotationId,
-                notes,
-            },
-            include: {
-                employee: {
-                    include: { user: { select: { username: true } } },
+            const existing = await tx.shift.findFirst({
+                where: {
+                    businessProfileId,
+                    employeeId,
+                    shiftDate: new Date(shiftDate),
+                    status: { in: ['SCHEDULED', 'CLOCKED_IN', 'LATE'] },
+                    startTime: { lt: new Date(endTime) },
+                    endTime: { gt: new Date(startTime) },
                 },
-            },
+            });
+            if (existing) {
+                throw new Error('Employee already has a conflicting shift at this time.');
+            }
+
+            return tx.shift.create({
+                data: {
+                    businessProfileId,
+                    employeeId,
+                    userId: employee.userId,
+                    locationId,
+                    shiftDate: new Date(shiftDate),
+                    startTime: new Date(startTime),
+                    endTime: new Date(endTime),
+                    breakMinutes,
+                    shiftLabel,
+                    rotationId,
+                    notes,
+                },
+                include: {
+                    employee: {
+                        include: { user: { select: { username: true } } },
+                    },
+                },
+            });
         });
     }
 
@@ -326,22 +345,71 @@ class ShiftService {
                     : updates[key];
             }
         }
-        const existing = await this.prisma.shift.findFirst({
-            where: { id: shiftId, businessProfileId: context.businessProfileId },
-            select: { id: true },
+        return this.prisma.$transaction(async (tx) => {
+            const existing = await tx.shift.findFirst({
+                where: { id: shiftId, businessProfileId: context.businessProfileId },
+                select: { id: true, employeeId: true, startTime: true, endTime: true },
+            });
+            if (!existing) throw new Error('Shift not found.');
+
+            const changesTime = 'startTime' in data || 'endTime' in data;
+            if (changesTime) {
+                // Serialize against createShift and other time-changing
+                // updateShift calls for this employee, then check the overlap
+                // INSIDE the transaction — never from a pre-read snapshot.
+                await this._lockEmployeeSchedule(tx, existing.employeeId);
+
+                const candidateStart = data.startTime instanceof Date ? data.startTime : existing.startTime;
+                const candidateEnd   = data.endTime   instanceof Date ? data.endTime   : existing.endTime;
+
+                const conflict = await tx.shift.findFirst({
+                    where: {
+                        id:    { not: shiftId },
+                        businessProfileId: context.businessProfileId,
+                        employeeId: existing.employeeId,
+                        status: { in: ['SCHEDULED', 'CLOCKED_IN', 'LATE'] },
+                        startTime: { lt: candidateEnd },
+                        endTime:   { gt: candidateStart },
+                    },
+                    select: { id: true },
+                });
+                if (conflict) {
+                    throw new Error('Employee already has a conflicting shift at this time.');
+                }
+            }
+
+            return tx.shift.update({ where: { id: shiftId }, data });
         });
-        if (!existing) throw new Error('Shift not found.');
-        return this.prisma.shift.update({ where: { id: shiftId }, data });
     }
 
     async deleteShift(shiftId) {
         const context = this._getBusinessContext();
-        const shift = await this.prisma.shift.findFirst({
-            where: { id: shiftId, businessProfileId: context.businessProfileId },
+        // Guarded delete: the NOT-active status predicate is part of the
+        // DELETE itself, so a stale SCHEDULED read can never authorize
+        // deleting a shift that a concurrent clockIn() activated between the
+        // check and the delete. (No scheduling lock is taken here — clockIn()
+        // does not participate in that lock namespace, so the conditional
+        // delete is the actual authority against it.)
+        return this.prisma.$transaction(async (tx) => {
+            const deleted = await tx.shift.deleteMany({
+                where: {
+                    id: shiftId,
+                    businessProfileId: context.businessProfileId,
+                    status: { notIn: ['CLOCKED_IN', 'LATE'] },
+                },
+            });
+            if (deleted.count !== 1) {
+                const current = await tx.shift.findFirst({
+                    where: { id: shiftId, businessProfileId: context.businessProfileId },
+                    select: { status: true },
+                });
+                if (!current) throw new Error('Shift not found.');
+                throw new Error('Cannot delete an active shift.');
+            }
+            // deleteMany does not return the row; keep the historical response
+            // shape (the deleted shift's data) without re-reading a gone row.
+            return null;
         });
-        if (!shift) throw new Error('Shift not found.');
-        if (shift.status === 'CLOCKED_IN' || shift.status === 'LATE') throw new Error('Cannot delete an active shift.');
-        return this.prisma.shift.delete({ where: { id: shiftId } });
     }
 
     // ── Shift Swaps ────────────────────────────────────────────────────────
