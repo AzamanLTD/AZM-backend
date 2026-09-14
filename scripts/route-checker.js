@@ -19,19 +19,27 @@ const FRONTEND_ROOT = path.resolve(__dirname, '..', '..', 'AZM-businessPortal');
 // ── 1. Parse route mounts from server.js ────────────────────────────────────
 
 function parseRouteMounts() {
-    const serverCode = fs.readFileSync(path.join(BACKEND_ROOT, 'server.js'), 'utf8');
+    // Route mounts now live in the central registry src/routes/index.js
+    // (mountRoutes) as well as server.js; scan both.
+    const sources = ['server.js', path.join('src', 'routes', 'index.js')];
     const mounts = [];
+    const serverCode = sources
+        .map((f) => {
+            const p = path.join(BACKEND_ROOT, f);
+            return fs.existsSync(p) ? fs.readFileSync(p, 'utf8') : '';
+        })
+        .join('\n');
 
     // Map variable → file: const fooRoutes = require('./routes/fooRoutes')
     const requireMap = {};
-    const requireRegex = /(?:const|let|var)\s+(\w+Routes)\s*=\s*require\(['"]\.\/routes\/([^'"]+)['"]\)/g;
+    const requireRegex = /(?:const|let|var)\s+(\w+Routes)\s*=\s*require\(['"](?:\.\.\/)*(?:routes\/)?([^'"]+)['"]\)/g;
     let m;
     while ((m = requireRegex.exec(serverCode)) !== null) {
         requireMap[m[1]] = m[2].replace(/\.js$/, '');
     }
 
     // Collect app.use('/api/prefix', ..., <routes>)
-    const useRegex = /app\.use\(\s*['"]([^'"]+)['"][^)]*?(?:require\(['"]\.\/routes\/([^'"]+)['"]\)\s*\)|(\w+Routes)\s*\))/g;
+    const useRegex = /app\.use\(\s*['"]([^'"]+)['"][^)]*?require\(\s*['"](?:\.\.\/)*(?:routes\/)?([^'"]+)['"]\s*\)/g;
     while ((m = useRegex.exec(serverCode)) !== null) {
         const file = m[2] ? m[2].replace(/\.js$/, '') : requireMap[m[3]];
         if (file) mounts.push({ prefix: m[1], file });
