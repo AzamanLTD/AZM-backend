@@ -638,22 +638,38 @@ describeOrSkip('Admin RBAC — real-DB concurrency (compare-and-swap)', () => {
             ),
         ]);
 
+        // Two legitimate outcomes, both proving no lost update:
+        //  a) the transactions interleaved — one writer wins the
+        //     compare-and-swap, the loser gets a deterministic 409
+        //     APPROVAL_CONFLICT and must refresh + retry;
+        //  b) Postgres serialized the two transactions — both approvals
+        //     land cleanly (the guard was not even needed).
         const statuses = [r1._status, r2._status].sort();
-        expect(statuses).toEqual([200, 409]);
+        expect([statuses[0], statuses[1]]).toContain(200);
 
-        const loser = r1._status === 409 ? r1 : r2;
-        expect(loser._body.code).toBe('APPROVAL_CONFLICT');
+        if (statuses.includes(409)) {
+            const loser = r1._status === 409 ? r1 : r2;
+            expect(loser._body.code).toBe('APPROVAL_CONFLICT');
 
-        // Retry the loser after its refresh — now the total is exactly two,
-        // not one overwritten and not three.
-        const retryUser = r1._status === 409 ? { id: fin.id, role: 'FINANCE_ADMIN' } : { id: comp.id, role: 'SUPER_ADMIN' };
-        const r3 = res();
-        await ctrl.approveRequest({ user: retryUser, params: { id: String(request.id) }, body: {}, app: app() }, r3);
-        expect(r3._status).toBe(200);
-        expect(r3._body.fullyApproved).toBe(true);
+            // Retry the loser after its refresh.
+            const retryUser = r1._status === 409
+                ? { id: fin.id, role: 'FINANCE_ADMIN' }
+                : { id: comp.id, role: 'SUPER_ADMIN' };
+            const r3 = res();
+            await ctrl.approveRequest({ user: retryUser, params: { id: String(request.id) }, body: {}, app: app() }, r3);
+            expect(r3._status).toBe(200);
+            expect(r3._body.fullyApproved).toBe(true);
+        } else {
+            expect(statuses).toEqual([200, 200]);
+        }
 
+        // Either way: exactly two stored approvals — not one overwritten
+        // approval and not three — and APPROVED only because the required
+        // count was truly met.
         const row = await prisma.adminApprovalRequest.findUnique({ where: { id: request.id } });
         expect(row.approvals).toHaveLength(2);
+        const approverIds = row.approvals.map((a) => a.userId).sort();
+        expect(approverIds).toEqual([comp.id, fin.id].sort());
         expect(row.status).toBe('APPROVED');
     });
 
