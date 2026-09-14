@@ -95,6 +95,10 @@ describe('admin control-plane integrity — unit (mocked prisma)', () => {
     expect(res.body.success).toBe(true);
     expect(res.body.permissions.map((row) => row.key).sort()).toEqual(['staff.manage', 'staff.view']);
 
+    // The target read takes a row lock, serializing concurrent replacements of
+    // the same staff member's grants (prevents the interleaved/union race).
+    expect(db.$queryRawUnsafe.mock.calls.some((c) => c[0].includes('FROM "StaffProfile" WHERE id = $1 FOR UPDATE'))).toBe(true);
+
     const sqls = db.$queryRawUnsafe.mock.calls.map((c) => c[0]);
     const del = sqls.findIndex((sql) => sql.includes('DELETE FROM "StaffPermissionGrant"'));
     const inserts = sqls.map((sql, i) => (sql.includes('INSERT INTO "StaffPermissionGrant"') ? i : -1)).filter((i) => i >= 0);

@@ -514,7 +514,13 @@ router.put('/staff/:id/permissions', async (req, res) => {
     // event all use tx. If any step fails, the previous grant set remains
     // intact — no partial authorization state and no unaudited change.
     const outcome = await p.$transaction(async (tx) => {
-      const staff = await tx.$queryRawUnsafe('SELECT id, "userId", "isGlobalSuperAdmin" FROM "StaffProfile" WHERE id = $1', staffId);
+      // Row-level lock on the target: serializes concurrent replacements of the
+      // same staff member's grants. Without it, two parallel transactions both
+      // DELETE-then-INSERT under READ COMMITTED and the second commit produces a
+      // UNION of both grant sets — the target ends up with more access than
+      // either admin intended. With FOR UPDATE, the second transaction waits at
+      // this read, then replaces the first transaction's committed set in full.
+      const staff = await tx.$queryRawUnsafe('SELECT id, "userId", "isGlobalSuperAdmin" FROM "StaffProfile" WHERE id = $1 FOR UPDATE', staffId);
       if (!staff[0]) return { status: 404, body: { success: false, message: 'Staff profile not found.' } };
       if (staff[0].isGlobalSuperAdmin && !actorGlobal) return { status: 403, body: { success: false, message: 'Only a global super admin may modify global-super-admin permissions.' } };
       const permissionRows = keys.length ? await tx.$queryRawUnsafe('SELECT id, "key" FROM "ControlPermission" WHERE "key" = ANY($1::text[]) AND "isActive" = TRUE', keys) : [];
