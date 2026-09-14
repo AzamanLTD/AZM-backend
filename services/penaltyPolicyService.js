@@ -194,7 +194,8 @@ async function processBusinessNoShow(prisma, {
                 // audit all roll back; no committed refund may coexist with a
                 // stuck booking.
                 const err = new Error(
-                    `${type} booking cannot transition to ${terminal} from status ${booking.status}.`
+                    `BOOKING_NOT_TRANSITIONABLE: ${type} booking cannot transition to ` +
+                    `${terminal} from status ${booking.status}.`
                 );
                 err.code = 'BOOKING_NOT_TRANSITIONABLE';
                 throw err;

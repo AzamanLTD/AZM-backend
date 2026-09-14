@@ -267,6 +267,7 @@ describeOrSkip('business no-show settlement (real PostgreSQL)', () => {
         } else {
             booking = await prisma.transitBooking.create({
                 data: {
+                    bookingRef: `TRN-TEST-${escrow.id.slice(0, 8)}`,
                     businessProfileId: biz.id,
                     customerId: payer.id,
                     pickupAddress: 'Test Pickup',
