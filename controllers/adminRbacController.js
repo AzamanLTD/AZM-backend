@@ -6,10 +6,18 @@
 // Multi-step approval workflow for high-value operations (withdrawals > $10k,
 // Susu payouts > $50k, vendor tier changes, user bans).
 // Audit log export (CSV/JSON) for compliance.
+//
+// NOTE (2026-09-14 RBAC hardening):
+//   • No eager PrismaClient here — every handler uses the request-scoped
+//     shared instance via req.app.get('prisma').
+//   • Action-specific permissions are actually enforced (creation, approval,
+//     rejection, listing, audit export, Susu health) — the ADMIN_ROLES catalog
+//     is no longer documentary.
+//   • Non-monetary actions (USER_BAN, VENDOR_TIER_CHANGE) can never
+//     auto-approve — they always require a second authorized admin.
+//   • Approval/rejection writes are compare-and-swap concurrency-safe.
 // =============================================================================
 
-const { PrismaClient } = require('@prisma/client');
-const prisma = new PrismaClient();
 const logger = require('../src/config/logger');
 
 // ── Admin Role Definitions ──────────────────────────────────────────────────
@@ -72,6 +80,30 @@ function checkAdminPermission(user, permission) {
   return roleDef.permissions.includes('*') || roleDef.permissions.includes(permission);
 }
 
+// ── Action-type → permission mapping ─────────────────────────────────────────
+// Single authority for which role may initiate/approve/reject each action
+// type. VENDOR_TIER_CHANGE has no permission in the current catalog, so it
+// stays SUPER_ADMIN/legacy-ADMIN only until the catalog is formally extended.
+const APPROVAL_ACTION_PERMISSIONS = Object.freeze({
+  WITHDRAWAL: 'withdrawals.approve',
+  SUSU_PAYOUT: 'susu.approve_payout',
+  USER_BAN: 'users.ban',
+  FEE_OVERRIDE: 'fees.manage',
+  MANUAL_BALANCE_ADJUST: 'fees.manage',
+});
+
+function hasApprovalActionPermission(user, type) {
+  const normalizedType = String(type || '').trim().toUpperCase();
+
+  if (normalizedType === 'VENDOR_TIER_CHANGE') {
+    const role = String(user?.role || '').trim().toUpperCase();
+    return role === 'ADMIN' || role === 'SUPER_ADMIN';
+  }
+
+  const permission = APPROVAL_ACTION_PERMISSIONS[normalizedType];
+  return Boolean(permission && checkAdminPermission(user, permission));
+}
+
 // ── Middleware: requireAdminPermission ─────────────────────────────────────
 function requireAdminPermission(permission) {
   return (req, res, next) => {
@@ -108,9 +140,75 @@ function getApprovalTier(amount) {
   return APPROVAL_TIERS[APPROVAL_TIERS.length - 1];
 }
 
-// ── POST /api/admin/approvals/create ────────────────────────────────────────
+// Type-aware approval requirement: non-monetary operations are not
+// legitimately represented by a money amount, so they must never fall into
+// the zero-approval auto-approve tier. They always require one approval from
+// a second authorized admin (the requester can never self-approve).
+function getApprovalRequirement(type, amount) {
+  const normalizedType = String(type || '').trim().toUpperCase();
+
+  if (normalizedType === 'USER_BAN' || normalizedType === 'VENDOR_TIER_CHANGE') {
+    return {
+      requiredApprovals: 1,
+      requiredRoles: [],
+    };
+  }
+
+  const tier = getApprovalTier(amount);
+
+  return {
+    requiredApprovals: tier.requiredApprovals,
+    requiredRoles: tier.requiredRoles,
+  };
+}
+
+// Role eligibility for a tier's requiredRoles set. Legacy ADMIN always
+// qualifies; an empty requiredRoles list means any admin role may approve.
+function isApprovalRoleEligible(role, requiredRoles) {
+  const normalizedRole = String(role || '').trim().toUpperCase();
+  if (!requiredRoles || requiredRoles.length === 0) return true;
+  return requiredRoles.includes(normalizedRole) || normalizedRole === 'ADMIN';
+}
+
+// ── Deterministic conflict mapping ─────────────────────────────────────────
+// Never surface raw Prisma errors for expected state conflicts.
+const APPROVAL_ERROR_STATUS = Object.freeze({
+  APPROVAL_NOT_FOUND: 404,
+  APPROVAL_NOT_PENDING: 400,
+  APPROVAL_STATE_CONFLICT: 409,
+  APPROVAL_CONFLICT: 409,
+  APPROVAL_DUPLICATE: 400,
+  APPROVAL_SELF: 400,
+  APPROVAL_FORBIDDEN_TYPE: 403,
+  APPROVAL_FORBIDDEN_ROLE: 403,
+  APPROVAL_FORBIDDEN_FINANCE: 403,
+});
+
+function sendApprovalError(res, err) {
+  const status = APPROVAL_ERROR_STATUS[err.code] || 500;
+  const body = {
+    success: false,
+    message: err.code ? err.message : 'Failed to process approval request.',
+  };
+  // 409 conflict responses carry the deterministic machine code; 403s carry
+  // the caller's role (matching the original API shapes). Never include a
+  // raw Prisma error string.
+  if (status === 409) body.code = err.code;
+  if (status === 403) body.yourRole = err.yourRole;
+  return res.status(status).json(body);
+}
+
+function approvalError(code, message, yourRole) {
+  const err = new Error(message);
+  err.code = code;
+  if (yourRole !== undefined) err.yourRole = yourRole;
+  return err;
+}
+
+// ── POST /api/admin/approvals ────────────────────────────────────────────────
 async function createApprovalRequest(req, res) {
   try {
+    const prisma = req.app.get('prisma');
     const { type, entityId, amount, description, metadata } = req.body;
     const userId = req.user.id;
 
@@ -119,8 +217,17 @@ async function createApprovalRequest(req, res) {
       return res.status(400).json({ success: false, message: 'Invalid approval type.' });
     }
 
+    // The requester must hold the permission for the action being requested.
+    if (!hasApprovalActionPermission(req.user, type)) {
+      return res.status(403).json({
+        success: false,
+        message: 'You are not authorized to create an approval request for this action type.',
+        yourRole: req.user.role,
+      });
+    }
+
     const amt = parseFloat(amount) || 0;
-    const tier = getApprovalTier(amt);
+    const requirement = getApprovalRequirement(type, amt);
 
     const request = await prisma.adminApprovalRequest.create({
       data: {
@@ -130,9 +237,9 @@ async function createApprovalRequest(req, res) {
         description,
         metadata: metadata || {},
         requestedBy: userId,
-        requiredApprovals: tier.requiredApprovals,
-        status: tier.requiredApprovals === 0 ? 'AUTO_APPROVED' : 'PENDING',
-        approvals: tier.requiredApprovals === 0
+        requiredApprovals: requirement.requiredApprovals,
+        status: requirement.requiredApprovals === 0 ? 'AUTO_APPROVED' : 'PENDING',
+        approvals: requirement.requiredApprovals === 0
           ? [{ userId, role: req.user.role, auto: true, at: new Date().toISOString() }]
           : [],
       },
@@ -141,10 +248,10 @@ async function createApprovalRequest(req, res) {
     return res.json({
       success: true,
       request,
-      autoApproved: tier.requiredApprovals === 0,
-      message: tier.requiredApprovals === 0
+      autoApproved: requirement.requiredApprovals === 0,
+      message: requirement.requiredApprovals === 0
         ? 'Auto-approved (below threshold).'
-        : `Approval required from ${tier.requiredApprovals} admin(s).`,
+        : `Approval required from ${requirement.requiredApprovals} admin(s).`,
     });
   } catch (err) {
     logger.error({ err }, '[adminRbac] createApproval error');
@@ -155,68 +262,148 @@ async function createApprovalRequest(req, res) {
 // ── POST /api/admin/approvals/:id/approve ───────────────────────────────────
 async function approveRequest(req, res) {
   try {
+    const prisma = req.app.get('prisma');
     const requestId = parseInt(req.params.id);
     const userId = req.user.id;
 
-    const request = await prisma.adminApprovalRequest.findUnique({
-      where: { id: requestId },
-    });
+    const result = await prisma.$transaction(async (tx) => {
+      const request = await tx.adminApprovalRequest.findUnique({
+        where: { id: requestId },
+      });
 
-    if (!request) return res.status(404).json({ success: false, message: 'Request not found.' });
-    if (request.status !== 'PENDING') {
-      return res.status(400).json({ success: false, message: `Request is ${request.status}.` });
-    }
+      if (!request) {
+        throw approvalError('APPROVAL_NOT_FOUND', 'Request not found.');
+      }
+      if (request.status !== 'PENDING') {
+        throw approvalError('APPROVAL_NOT_PENDING', `Request is ${request.status}.`);
+      }
 
-    // Check if already approved by this admin
-    const approvals = request.approvals || [];
-    if (approvals.some(a => a.userId === userId)) {
-      return res.status(400).json({ success: false, message: 'You have already approved this request.' });
-    }
+      // Approve the action type the STORED request is for, per the requestor's
+      // stored type — never a client-supplied type.
+      if (!hasApprovalActionPermission(req.user, request.type)) {
+        throw approvalError(
+          'APPROVAL_FORBIDDEN_TYPE',
+          'You are not authorized to approve this action type.',
+          req.user.role
+        );
+      }
 
-    // Can't approve your own request (unless auto-approve)
-    if (request.requestedBy === userId) {
-      return res.status(400).json({ success: false, message: 'Cannot approve your own request.' });
-    }
+      const approvals = Array.isArray(request.approvals) ? request.approvals : [];
 
-    // Add approval
-    const newApprovals = [...approvals, {
-      userId,
-      role: req.user.role,
-      at: new Date().toISOString(),
-    }];
+      // Check if already approved by this admin
+      if (approvals.some(a => a.userId === userId)) {
+        throw approvalError('APPROVAL_DUPLICATE', 'You have already approved this request.');
+      }
 
-    const isFullyApproved = newApprovals.length >= request.requiredApprovals;
+      // Can't approve your own request (unless auto-approve)
+      if (request.requestedBy === userId) {
+        throw approvalError('APPROVAL_SELF', 'Cannot approve your own request.');
+      }
 
-    const updated = await prisma.adminApprovalRequest.update({
-      where: { id: requestId },
-      data: {
-        approvals: newApprovals,
-        status: isFullyApproved ? 'APPROVED' : 'PENDING',
-        approvedBy: isFullyApproved ? userId : null,
-        approvedAt: isFullyApproved ? new Date() : null,
-      },
+      // Tier role eligibility for the request's monetary amount.
+      const tier = getApprovalTier(Number(request.amount));
+      if (!isApprovalRoleEligible(req.user.role, tier.requiredRoles)) {
+        throw approvalError(
+          'APPROVAL_FORBIDDEN_ROLE',
+          'Your admin role is not eligible to approve this request.',
+          req.user.role
+        );
+      }
+
+      // >= $50k requires at least one Finance or Compliance admin approval.
+      const normalizedApprovals = approvals.map((approval) =>
+        String(approval?.role || '').trim().toUpperCase()
+      );
+      const normalizedCurrentRole = String(req.user.role || '').trim().toUpperCase();
+
+      if (Number(request.amount) >= 50000) {
+        const financeOrComplianceAlreadyPresent =
+          normalizedApprovals.includes('FINANCE_ADMIN') ||
+          normalizedApprovals.includes('COMPLIANCE_ADMIN');
+
+        const currentIsFinanceOrCompliance =
+          normalizedCurrentRole === 'FINANCE_ADMIN' ||
+          normalizedCurrentRole === 'COMPLIANCE_ADMIN';
+
+        if (!financeOrComplianceAlreadyPresent && !currentIsFinanceOrCompliance) {
+          throw approvalError(
+            'APPROVAL_FORBIDDEN_FINANCE',
+            'At least one Finance or Compliance admin approval is required for requests of $50,000 or more.',
+            req.user.role
+          );
+        }
+      }
+
+      const newApprovals = [
+        ...approvals,
+        {
+          userId,
+          role: req.user.role,
+          at: new Date().toISOString(),
+        },
+      ];
+
+      const isFullyApproved =
+        newApprovals.length >= Number(request.requiredApprovals);
+
+      // Compare-and-swap: if another admin changed the approvals JSON while we
+      // were deciding, this guarded update claims 0 rows instead of
+      // overwriting their approval.
+      const claimed = await tx.adminApprovalRequest.updateMany({
+        where: {
+          id: requestId,
+          status: 'PENDING',
+          approvals: { equals: approvals },
+        },
+        data: {
+          approvals: newApprovals,
+          status: isFullyApproved ? 'APPROVED' : 'PENDING',
+          approvedBy: isFullyApproved ? userId : null,
+          approvedAt: isFullyApproved ? new Date() : null,
+        },
+      });
+
+      if (claimed.count !== 1) {
+        throw approvalError(
+          'APPROVAL_CONFLICT',
+          'This approval request changed while you were approving it. Please refresh and try again.'
+        );
+      }
+
+      const updated = await tx.adminApprovalRequest.findUnique({
+        where: { id: requestId },
+      });
+
+      return { request: updated, isFullyApproved };
     });
 
     // Socket notify other admins
     const io = req.app.get('io');
-    if (io && isFullyApproved) {
+    if (io && result.isFullyApproved) {
       io.to('admin_room').emit('approval_completed', {
         requestId,
-        type: request.type,
-        entityId: request.entityId,
-        amount: parseFloat(request.amount.toString()),
+        type: result.request.type,
+        entityId: result.request.entityId,
+        amount: parseFloat(result.request.amount.toString()),
       });
     }
 
+    const approvalsCount = Array.isArray(result.request.approvals)
+      ? result.request.approvals.length
+      : 0;
+
     return res.json({
       success: true,
-      request: updated,
-      fullyApproved: isFullyApproved,
-      message: isFullyApproved
+      request: result.request,
+      fullyApproved: result.isFullyApproved,
+      message: result.isFullyApproved
         ? 'Request fully approved. Action can now be executed.'
-        : `Approval recorded. ${request.requiredApprovals - newApprovals.length} more needed.`,
+        : `Approval recorded. ${result.request.requiredApprovals - approvalsCount} more needed.`,
     });
   } catch (err) {
+    if (err.code && APPROVAL_ERROR_STATUS[err.code]) {
+      return sendApprovalError(res, err);
+    }
     logger.error({ err }, '[adminRbac] approve error');
     return res.status(500).json({ success: false, message: 'Failed to approve.' });
   }
@@ -225,30 +412,65 @@ async function approveRequest(req, res) {
 // ── POST /api/admin/approvals/:id/reject ────────────────────────────────────
 async function rejectRequest(req, res) {
   try {
+    const prisma = req.app.get('prisma');
     const requestId = parseInt(req.params.id);
     const { reason } = req.body;
 
-    const request = await prisma.adminApprovalRequest.findUnique({
-      where: { id: requestId },
-    });
+    const updated = await prisma.$transaction(async (tx) => {
+      const request = await tx.adminApprovalRequest.findUnique({
+        where: { id: requestId },
+      });
 
-    if (!request) return res.status(404).json({ success: false, message: 'Request not found.' });
-    if (request.status !== 'PENDING') {
-      return res.status(400).json({ success: false, message: `Request is ${request.status}.` });
-    }
+      if (!request) {
+        throw approvalError('APPROVAL_NOT_FOUND', 'Request not found.');
+      }
 
-    const updated = await prisma.adminApprovalRequest.update({
-      where: { id: requestId },
-      data: {
-        status: 'REJECTED',
-        rejectedBy: req.user.id,
-        rejectedAt: new Date(),
-        rejectionReason: reason || 'No reason provided.',
-      },
+      // Rejection authority follows the stored request type, not a
+      // client-supplied type.
+      if (!hasApprovalActionPermission(req.user, request.type)) {
+        throw approvalError(
+          'APPROVAL_FORBIDDEN_TYPE',
+          'You are not authorized to approve this action type.',
+          req.user.role
+        );
+      }
+
+      // Atomic claim: only one transition out of PENDING can ever win.
+      const claim = await tx.adminApprovalRequest.updateMany({
+        where: {
+          id: requestId,
+          status: 'PENDING',
+        },
+        data: {
+          status: 'REJECTED',
+          rejectedBy: req.user.id,
+          rejectedAt: new Date(),
+          rejectionReason: reason || 'No reason provided.',
+        },
+      });
+
+      if (claim.count !== 1) {
+        const current = await tx.adminApprovalRequest.findUnique({
+          where: { id: requestId },
+        });
+
+        if (!current) {
+          throw approvalError('APPROVAL_NOT_FOUND', 'Request not found.');
+        }
+
+        throw approvalError('APPROVAL_STATE_CONFLICT', `Request is ${current.status}.`);
+      }
+
+      return tx.adminApprovalRequest.findUnique({
+        where: { id: requestId },
+      });
     });
 
     return res.json({ success: true, request: updated, message: 'Request rejected.' });
   } catch (err) {
+    if (err.code && APPROVAL_ERROR_STATUS[err.code]) {
+      return sendApprovalError(res, err);
+    }
     logger.error({ err }, '[adminRbac] reject error');
     return res.status(500).json({ success: false, message: 'Failed to reject.' });
   }
@@ -257,6 +479,15 @@ async function rejectRequest(req, res) {
 // ── GET /api/admin/approvals ─────────────────────────────────────────────────
 async function listApprovals(req, res) {
   try {
+    if (!checkAdminPermission(req.user, 'audit.view')) {
+      return res.status(403).json({
+        success: false,
+        message: 'Admin permission required: audit.view',
+        yourRole: req.user.role,
+      });
+    }
+
+    const prisma = req.app.get('prisma');
     const status = req.query.status || 'PENDING';
     const limit = Math.min(parseInt(req.query.limit) || 50, 100);
 
@@ -276,6 +507,15 @@ async function listApprovals(req, res) {
 // ── Audit Log Export ────────────────────────────────────────────────────────
 async function exportAuditLog(req, res) {
   try {
+    if (!checkAdminPermission(req.user, 'audit.export')) {
+      return res.status(403).json({
+        success: false,
+        message: 'Admin permission required: audit.export',
+        yourRole: req.user.role,
+      });
+    }
+
+    const prisma = req.app.get('prisma');
     const format = (req.query.format || 'json').toLowerCase();
     const startDate = req.query.startDate ? new Date(req.query.startDate) : new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
     const endDate = req.query.endDate ? new Date(req.query.endDate) : new Date();
@@ -298,7 +538,6 @@ async function exportAuditLog(req, res) {
         l.id,
         l.actorId,
         l.action,
-        l.targetType,
         l.targetType || '',
         l.targetId || '',
         JSON.stringify(l.metadata || {}),
@@ -323,6 +562,15 @@ async function exportAuditLog(req, res) {
 // ── Susu Health Dashboard ────────────────────────────────────────────────────
 async function getSusuHealthDashboard(req, res) {
   try {
+    if (!checkAdminPermission(req.user, 'susu.health')) {
+      return res.status(403).json({
+        success: false,
+        message: 'Admin permission required: susu.health',
+        yourRole: req.user.role,
+      });
+    }
+
+    const prisma = req.app.get('prisma');
     const now = new Date();
     const thirtyDaysAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
 
@@ -448,4 +696,7 @@ module.exports = {
   getSusuHealthDashboard,
   getAdminRoles,
   getApprovalTier,
+  getApprovalRequirement,
+  hasApprovalActionPermission,
+  isApprovalRoleEligible,
 };
