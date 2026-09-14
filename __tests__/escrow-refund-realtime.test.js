@@ -33,7 +33,7 @@ describe('escrowService _refundEscrow realtime convergence', () => {
                 updateMany: jest.fn().mockResolvedValue({ count: 1 }),
                 findUnique: jest.fn().mockResolvedValue(updated),
             },
-            user: { update: jest.fn().mockResolvedValue({}) },
+            user: { update: jest.fn().mockResolvedValue({}), updateMany: jest.fn().mockResolvedValue({ count: 1 }) },
             transactionHistory: { create: jest.fn().mockResolvedValue({}) },
         };
         const prisma = {

@@ -158,9 +158,17 @@ async function seedEscrowTicket(prisma, escrowStatus = 'FUNDED', overrides = {})
     const feeUsdc = overrides.feeUsdc ?? 0.25;
     const isDraft = escrowStatus === 'DRAFT';
 
+    // A DISPUTED/ADMIN_REVIEW escrow models the POST-raiseDispute state: the
+    // principal has already moved from the payer's escrowLockedBalance into
+    // their disputeEscrowBalance bucket (raiseDispute's balance move). Seeding
+    // it anywhere else would let a resolution "drain" a bucket that was never
+    // funded — or push it negative on a checkless test database.
+    const isDisputed = escrowStatus === 'DISPUTED' || escrowStatus === 'ADMIN_REVIEW';
+
     const payer = await seedUser(prisma, {
         availableBalance: isDraft ? 200 : 0,
-        escrowLockedBalance: isDraft ? 0 : amountUsdc,
+        escrowLockedBalance: isDraft || isDisputed ? 0 : amountUsdc,
+        disputeEscrowBalance: isDisputed ? amountUsdc : undefined,
     });
     const payee = await seedUser(prisma);
 
