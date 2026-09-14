@@ -71,14 +71,16 @@ async function seedVendor(prisma, overrides = {}) {
 }
 
 // Creates a PAID SELL trade ready for p2p.service.completeTrade().
-// On a SELL ad the buyer (user) has escrowed `amountCrypto`; the vendor is the
-// releasing party and receives the net. Returns the ids completeTrade needs.
+// Escrow direction matches the AUTHORITATIVE tradeController accept-flow: on a
+// SELL ad the VENDOR's trading pool is locked into the vendor's
+// escrowLockedBalance; the buyer paid fiat and receives the net on completion;
+// the vendor is the releasing party. Returns the ids completeTrade needs.
 async function seedPaidTrade(prisma, overrides = {}) {
     const amountCrypto = overrides.amountCrypto ?? 100;
     const rate = overrides.rate ?? 15.5;
 
-    const buyer = await seedUser(prisma, { availableBalance: 0, escrowLockedBalance: amountCrypto });
-    const vendor = await seedVendor(prisma, { availableBalance: 0 });
+    const buyer = await seedUser(prisma, { availableBalance: 0 });
+    const vendor = await seedVendor(prisma, { availableBalance: 0, escrowLockedBalance: amountCrypto });
 
     const ad = await prisma.ad.create({
         data: {
