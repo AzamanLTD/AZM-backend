@@ -95,7 +95,7 @@ describeOrSkip('withdrawal reconciliation terminal claim (real PostgreSQL)', () 
             getTransferStatus: jest.fn().mockResolvedValue({
                 status: 'SUCCESSFUL',
                 providerRef: 'MTN-SUCCESS-1',
-                provider: 'MTN'
+                provider: 'MTN_MOMO_DISBURSEMENT'
             })
         };
         const ioA = makeIo();
@@ -125,7 +125,7 @@ describeOrSkip('withdrawal reconciliation terminal claim (real PostgreSQL)', () 
             getTransferStatus: jest.fn().mockResolvedValue({
                 status: 'FAILED',
                 providerRef: 'MTN-FAILED-1',
-                provider: 'MTN',
+                provider: 'MTN_MOMO_DISBURSEMENT',
                 reason: 'INVALID_MSISDN'
             })
         };

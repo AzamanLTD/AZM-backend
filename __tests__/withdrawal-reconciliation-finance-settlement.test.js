@@ -96,7 +96,7 @@ describeOrSkip('withdrawal reconciliation finance settlement (real PostgreSQL)',
             getTransferStatus: jest.fn().mockResolvedValue({
                 status: 'SUCCESSFUL',
                 providerRef: 'MTN-DEFERRED-1',
-                provider: 'MTN'
+                provider: 'MTN_MOMO_DISBURSEMENT'
             })
         };
         const worker = new WithdrawalReconciliationWorker(prisma, io, provider, null, null);
