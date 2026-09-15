@@ -188,141 +188,177 @@ class AzmAuctionService {
      * those ads, write leaderboard snapshot, mark SETTLED.
      */
     async settle(auctionId) {
-        // Pre-flight: only OPEN auctions in their settlement window.
+        // Pre-flight read only — the authoritative claim happens inside
+        // the settlement transaction. A committed SETTLED replay converges
+        // to the existing idempotent skip and can never reburn.
         const auction = await this.prisma.azmAuction.findUnique({ where: { id: auctionId } });
         if (!auction) throw new Error('Auction not found');
-        if (auction.status !== 'OPEN') return { skipped: true, reason: 'not open' };
+        if (auction.status === 'SETTLED') return { skipped: true, reason: 'not open' };
         if (new Date() < auction.windowEnd) return { skipped: true, reason: 'window not closed' };
 
-        // Lock: status SETTLING (idempotent if a parallel tick beat us)
-        const locked = await this.prisma.azmAuction.update({
-            where: { id: auctionId },
-            data: { status: 'SETTLING' },
-        });
-
-        const winnerCount = locked.winnerCount || DEFAULT_WINNER_COUNT;
-
-        // Pull top-K bids by amount, tiebreak by createdAt asc.
-        const top = await this.prisma.azmAuctionBid.findMany({
-            where: { auctionId, status: 'ACTIVE' },
-            orderBy: [{ bidAmountAzm: 'desc' }, { createdAt: 'asc' }],
-            take: winnerCount,
-        });
-
-        const losers = await this.prisma.azmAuctionBid.findMany({
-            where: { auctionId, status: 'ACTIVE', NOT: { id: { in: top.map((b) => b.id) } } },
-        });
-
-        const settledAt = new Date();
-        const boostUntil = new Date(settledAt.getTime() + WINDOW_MS);
-        let totalBurned = new Prisma.Decimal(0);
-
-        for (let i = 0; i < top.length; i++) {
-            const winner = top[i];
-            const rank = i + 1;
-            // Burn AZM via spend service (audit trail, balance update, socket)
-            try {
-                await this.azmSpendService.debitAzm({
-                    userId: winner.vendorId,
-                    amount: Number(winner.bidAmountAzm),
-                    source: 'AD_AUCTION_BID',
-                    reason: `AZM auction win — rank ${rank} (24h boost)`,
-                    metadata: {
-                        auctionId,
-                        adId: winner.adId,
-                        rank,
+        // ONE authoritative settlement transaction: OPEN -> SETTLING ->
+        // SETTLED commit together, so a committed SETTLING cannot exist (a
+        // crash rolls back to the retryable state and the worker retries),
+        // and a concurrent worker loses the claim and converges to the skip.
+        let outcome;
+        try {
+            outcome = await this.prisma.$transaction(async (tx) => {
+                // Atomic claim. OPEN is the normal path; SETTLING is the
+                // legacy-crash recovery path — a committed SETTLING row is
+                // pre-atomic debris and is safe to re-claim (the auction-win
+                // dedup keys make replay burn-free); an in-flight SETTLING
+                // is uncommitted/invisible, so concurrent workers serialize.
+                const claimed = await tx.azmAuction.updateMany({
+                    where: {
+                        id: auctionId,
+                        status: { in: ['OPEN', 'SETTLING'] },
+                        windowEnd: { lte: new Date() },
                     },
-                    dedupKey: `auction-win-${auctionId}-${winner.vendorId}`,
+                    data: { status: 'SETTLING' },
                 });
-            } catch (err) {
-                logger.error({ err: err }, '[azmAuctionService.settle] AZM debit failed');
-            }
+                if (claimed.count === 0) return { skipped: true, reason: 'not open' };
 
-            // Mark bid + boost ad
-            await this.prisma.$transaction([
-                this.prisma.azmAuctionBid.update({
-                    where: { id: winner.id },
-                    data: {
-                        status: 'WON',
-                        rank,
-                        azmBurned: winner.bidAmountAzm,
-                        boostedUntil: boostUntil,
-                    },
-                }),
-                this.prisma.ad.update({
-                    where: { id: winner.adId },
-                    data: {
-                        isBoosted: true,
-                        boostExpiresAt: boostUntil,
-                    },
-                }),
-            ]);
-            totalBurned = totalBurned.plus(winner.bidAmountAzm);
+                const locked = await tx.azmAuction.findUnique({ where: { id: auctionId } });
+                const winnerCount = locked.winnerCount || DEFAULT_WINNER_COUNT;
 
-            this.notificationService
-                ?.sendNotification({
-                    userId: winner.vendorId,
-                    title: `🎯 Auction Won — Rank ${rank}`,
-                    body: `Your ad is BOOSTED for 24h. ${Number(winner.bidAmountAzm).toFixed(2)} AZM burned.`,
-                    category: 'AUCTION',
-                    actionPayload: {
-                        action: 'OPEN_AUCTION',
+                // Authoritative winner selection INSIDE the transaction.
+                const top = await tx.azmAuctionBid.findMany({
+                    where: { auctionId, status: 'ACTIVE' },
+                    orderBy: [{ bidAmountAzm: 'desc' }, { createdAt: 'asc' }],
+                    take: winnerCount,
+                });
+                const losers = await tx.azmAuctionBid.findMany({
+                    where: {
                         auctionId,
-                        adId: winner.adId,
-                        rank,
+                        status: 'ACTIVE',
+                        NOT: { id: { in: top.map((b) => b.id) } },
                     },
-                })
+                });
+
+                const settledAt = new Date();
+                const boostUntil = new Date(settledAt.getTime() + WINDOW_MS);
+                let totalBurned = new Prisma.Decimal(0);
+
+                for (let i = 0; i < top.length; i++) {
+                    const winner = top[i];
+                    const rank = i + 1;
+
+                    // Financial mutation FIRST, via the single AZM spend
+                    // authority, transaction-scoped. The deterministic
+                    // auction-win dedup key is DB-enforced exactly-once by
+                    // PR #254's unique invariant. A debit failure (e.g.
+                    // insufficient balance) aborts the WHOLE settlement —
+                    // fail-closed: no WON bid, no boost, no burn, auction
+                    // left OPEN and retryable.
+                    const debit = await this.azmSpendService._debitAzmWithClient(tx, {
+                        userId: winner.vendorId,
+                        amount: Number(winner.bidAmountAzm),
+                        source: 'AD_AUCTION_BID',
+                        reason: `AZM auction win — rank ${rank} (24h boost)`,
+                        metadata: { auctionId, adId: winner.adId, rank },
+                        dedupKey: `auction-win-${auctionId}-${winner.vendorId}`,
+                    });
+
+                    // Only after the debit succeeds may the bid become
+                    // WON and the ad boosted — same transaction.
+                    await tx.azmAuctionBid.update({
+                        where: { id: winner.id },
+                        data: {
+                            status: 'WON',
+                            rank,
+                            azmBurned: winner.bidAmountAzm,
+                            boostedUntil: boostUntil,
+                        },
+                    });
+                    await tx.ad.update({
+                        where: { id: winner.adId },
+                        data: {
+                            isBoosted: true,
+                            boostExpiresAt: boostUntil,
+                        },
+                    });
+
+                    // Count actual committed debits only (no reburn on replay).
+                    if (debit.debited) {
+                        totalBurned = totalBurned.plus(winner.bidAmountAzm);
+                    }
+                }
+
+                if (losers.length > 0) {
+                    await tx.azmAuctionBid.updateMany({
+                        where: { id: { in: losers.map((b) => b.id) } },
+                        data: { status: 'LOST' },
+                    });
+                }
+
+                const leaderboard = top.map((b, i) => ({
+                    rank: i + 1,
+                    vendorId: b.vendorId,
+                    adId: b.adId,
+                    bidAmountAzm: Number(b.bidAmountAzm),
+                }));
+
+                // Terminal state in the SAME transaction.
+                await tx.azmAuction.update({
+                    where: { id: auctionId },
+                    data: {
+                        status: 'SETTLED',
+                        settledAt,
+                        totalAzmBurned: totalBurned,
+                        leaderboard,
+                    },
+                });
+
+                return {
+                    winners: leaderboard,
+                    losers: losers.map((l) => l.vendorId),
+                    totalBurned,
+                };
+            }, { timeout: 30000 });
+        } catch (err) {
+            // A rolled-back settlement leaves bids, ads and AZM unchanged,
+            // and NO notification has been sent (those are post-commit
+            // only). Durable observability for the operator, then rethrow.
+            logger.error(
+                { err: err, auctionId },
+                '[azmAuctionService.settle] settlement rolled back — auction stays retryable/OPEN'
+            );
+            throw err;
+        }
+        if (outcome.skipped) return outcome;
+
+        // Realtime side effects ONLY after the transaction has committed.
+        const notify = (userId, title, body, actionPayload) =>
+            this.notificationService?.sendNotification({ userId, title, body, category: 'AUCTION', actionPayload })
                 .catch(() => {});
+        for (const w of outcome.winners) {
+            notify(
+                w.vendorId,
+                `🎯 Auction Won — Rank ${w.rank}`,
+                `Your ad is BOOSTED for 24h. ${w.bidAmountAzm.toFixed(2)} AZM burned.`,
+                { action: 'OPEN_AUCTION', auctionId, adId: w.adId, rank: w.rank }
+            );
         }
-
-        // Mark losers
-        if (losers.length > 0) {
-            await this.prisma.azmAuctionBid.updateMany({
-                where: { id: { in: losers.map((b) => b.id) } },
-                data: { status: 'LOST' },
-            });
-            for (const l of losers) {
-                this.notificationService
-                    ?.sendNotification({
-                        userId: l.vendorId,
-                        title: 'Auction — Outbid',
-                        body: 'Your bid did not make the top 3. No AZM was burned. Try again in the next window.',
-                        category: 'AUCTION',
-                        actionPayload: { action: 'OPEN_AUCTION', auctionId },
-                    })
-                    .catch(() => {});
-            }
+        for (const vendorId of outcome.losers) {
+            notify(
+                vendorId,
+                'Auction — Outbid',
+                'Your bid did not make the top 3. No AZM was burned. Try again in the next window.',
+                { action: 'OPEN_AUCTION', auctionId }
+            );
         }
-
-        // Write leaderboard snapshot + mark SETTLED
-        const leaderboard = top.map((b, i) => ({
-            rank: i + 1,
-            vendorId: b.vendorId,
-            adId: b.adId,
-            bidAmountAzm: Number(b.bidAmountAzm),
-        }));
-        await this.prisma.azmAuction.update({
-            where: { id: auctionId },
-            data: {
-                status: 'SETTLED',
-                settledAt,
-                totalAzmBurned: totalBurned,
-                leaderboard,
-            },
-        });
-
         if (this.io) {
             this.io.emit('auction:settled', {
                 auctionId,
-                winners: leaderboard,
-                totalBurned: Number(totalBurned.toFixed(2)),
+                winners: outcome.winners,
+                totalBurned: Number(outcome.totalBurned.toFixed(2)),
             });
         }
 
         return {
             auctionId,
-            winners: leaderboard.length,
-            totalBurned: Number(totalBurned.toFixed(2)),
+            winners: outcome.winners.length,
+            totalBurned: Number(outcome.totalBurned.toFixed(2)),
         };
     }
 }
