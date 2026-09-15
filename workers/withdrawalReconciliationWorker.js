@@ -220,13 +220,23 @@ class WithdrawalReconciliationWorker {
         if (remoteStatus === 'PENDING' || remoteStatus === 'PROCESSING') return;
 
         if (remoteStatus === 'SUCCESSFUL' || remoteStatus === 'COMPLETED') {
-            await this.prisma.transactionHistory.updateMany({
-                where: { id: txRow.id, status: 'PENDING' },
-                data: {
-                    status: 'COMPLETED',
-                    ...(providerRef ? { providerRef: String(providerRef) } : {})
-                }
+            // Provider success must cross the canonical finance settlement
+            // boundary. This is where deferred exit-fee/referral economics are
+            // recognized exactly once; directly flipping TransactionHistory
+            // bypasses that accounting layer.
+            const settlement = await financeService.completeFiatWithdrawal(this.prisma, reference, {
+                providerTxId: providerRef
             });
+            if (settlement.status !== 'COMPLETED') {
+                await this._recordException(
+                    withdrawal,
+                    'FINANCIAL_SETTLEMENT_CONFLICT',
+                    { transactionStatus: settlement.status, providerStatus: remoteStatus },
+                    reference
+                );
+                logger.error(`[WithdrawalReconciliation] ref=${reference} provider SUCCESS conflicts with transaction status ${settlement.status}.`);
+                return;
+            }
 
             // SINGLE-WINNER CLAIM: multiple scheduler instances may poll the
             // same provider result. Only the instance that transitions the
@@ -283,6 +293,16 @@ class WithdrawalReconciliationWorker {
                 const result = await financeService.reverseFiatWithdrawal(this.prisma, reference, {
                     reason: `provider_async_failure: ${statusResp.reason || 'unspecified'}`
                 });
+                if (result.notReversible || result.status === 'COMPLETED') {
+                    await this._recordException(
+                        withdrawal,
+                        'FINANCIAL_REVERSAL_CONFLICT',
+                        { transactionStatus: result.status || 'UNKNOWN', providerStatus: remoteStatus },
+                        reference
+                    );
+                    logger.error(`[WithdrawalReconciliation] ref=${reference} provider FAILURE conflicts with transaction status ${result.status || 'UNKNOWN'}.`);
+                    return;
+                }
 
                 // SINGLE-WINNER CLAIM: reverseFiatWithdrawal protects the
                 // financial mutation; this CAS protects terminal effects on
@@ -303,7 +323,7 @@ class WithdrawalReconciliationWorker {
                 // crashed before updating Withdrawal, this instance can still
                 // claim the terminal Withdrawal row. The canonical refund is
                 // deterministic from the immutable transaction amount + fee,
-                // so terminal notifications never carry an undefined refund.
+                // so terminal failure payloads never carry an undefined refund.
                 const refundedAmount = result.refundedAmount != null
                     ? result.refundedAmount
                     : Number(txRow.amountUsdc) + Number(txRow.feeUsdc);
