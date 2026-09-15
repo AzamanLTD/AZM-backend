@@ -16,6 +16,14 @@
 //   • Non-monetary actions (USER_BAN, VENDOR_TIER_CHANGE) can never
 //     auto-approve — they always require a second authorized admin.
 //   • Approval/rejection writes are compare-and-swap concurrency-safe.
+// NOTE (2026-09-14 catalog extension): COMPLIANCE_ADMIN now holds
+//   `withdrawals.approve`. APPROVAL_TIERS declares it an eligible approver
+//   for the >= $10k tiers and the >= $50k invariant requires Finance-or-
+//   Compliance participation, but the action-permission gate previously
+//   403'd Compliance before the tier logic could ever run — dead letter.
+//   The tier system (requiredRoles + requiredApprovals + the $50k
+//   invariant) remains the sole amount-scoping authority; this extension
+//   only grants the action-type authority the declared policy presupposes.
 // =============================================================================
 
 const logger = require('../src/config/logger');
@@ -51,7 +59,7 @@ const ADMIN_ROLES = {
   COMPLIANCE_ADMIN: {
     name: 'Compliance Admin',
     permissions: [
-      'withdrawals.review', 'withdrawals.export',
+      'withdrawals.approve', 'withdrawals.review', 'withdrawals.export',
       'users.view', 'users.kyc_approve', 'users.kyc_reject',
       'audit.view', 'audit.export', 'audit.delete',
       'reports.view', 'reports.export',
