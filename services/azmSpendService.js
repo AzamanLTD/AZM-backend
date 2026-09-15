@@ -110,14 +110,28 @@ class AzmSpendService {
      * @param {string} [params.dedupKey] - Optional idempotency key
      * @returns {Promise<{debited: boolean, newBalance: number, logId: string}>}
      */
-    async debitAzm({ userId, amount, source, reason, metadata = null, dedupKey = null }) {
+    /**
+     * Transaction-client primitive for an AZM debit. Runs the ENTIRE debit
+     * (validation, dedup lookup, atomic balance claim, AzmSpendLog create)
+     * against an ALREADY-OPEN Prisma transaction client — it never opens a
+     * transaction of its own. This is what lets a caller commit an AZM spend
+     * atomically with its own financial writes.
+     *
+     * IMPORTANT: performs NO socket emission — the outer transaction may
+     * still roll back. Callers emit only after their transaction commits.
+     *
+     * @param {object} tx - open Prisma transaction client
+     * @param {object} params - same shape as debitAzm()
+     * @returns {Promise<{debited: boolean, newBalance: number, logId: string}>}
+     */
+    async _debitAzmWithClient(tx, { userId, amount, source, reason, metadata = null, dedupKey = null }) {
         if (!userId || !amount || amount <= 0 || !source || !reason) {
             throw new Error('Invalid spend parameters.');
         }
 
-        // Idempotency check
+        // Idempotency check (source + dedupKey => this spend already happened)
         if (dedupKey) {
-            const existing = await this.prisma.azmSpendLog.findFirst({
+            const existing = await tx.azmSpendLog.findFirst({
                 where: {
                     userId,
                     source,
@@ -129,44 +143,54 @@ class AzmSpendService {
             }
         }
 
-        // Atomic: check balance + decrement + log in one transaction
-        const result = await this.prisma.$transaction(async (tx) => {
-            const user = await tx.user.findUnique({
-                where: { id: userId },
-                select: { azmBalance: true }
-            });
-
-            if (!user) throw new Error('User not found.');
-            if (user.azmBalance < amount) {
-                throw new Error(
-                    `Insufficient AZM balance. Required: ${amount}, available: ${user.azmBalance.toFixed(1)}`
-                );
-            }
-
-            const updatedUser = await tx.user.update({
-                where: { id: userId },
-                data: { azmBalance: { decrement: amount } },
-                select: { azmBalance: true }
-            });
-
-            const log = await tx.azmSpendLog.create({
-                data: {
-                    userId,
-                    amount,
-                    source,
-                    reason,
-                    metadata: dedupKey ? { ...metadata, dedupKey } : metadata,
-                    balanceAfter: updatedUser.azmBalance
-                }
-            });
-
-            return { newBalance: updatedUser.azmBalance, logId: log.id };
+        const user = await tx.user.findUnique({
+            where: { id: userId },
+            select: { azmBalance: true }
         });
 
-        // Emit socket event for real-time FE update
-        this._emitSpendUpdate(userId, result.newBalance, amount, source, reason);
+        if (!user) throw new Error('User not found.');
+        if (user.azmBalance < amount) {
+            throw new Error(
+                `Insufficient AZM balance. Required: ${amount}, available: ${user.azmBalance.toFixed(1)}`
+            );
+        }
 
-        return { debited: true, ...result };
+        const updatedUser = await tx.user.update({
+            where: { id: userId },
+            data: { azmBalance: { decrement: amount } },
+            select: { azmBalance: true }
+        });
+
+        const log = await tx.azmSpendLog.create({
+            data: {
+                userId,
+                amount,
+                source,
+                reason,
+                metadata: dedupKey ? { ...metadata, dedupKey } : metadata,
+                balanceAfter: updatedUser.azmBalance
+            }
+        });
+
+        return { debited: true, newBalance: updatedUser.azmBalance, logId: log.id };
+    }
+
+    /**
+     * Public standalone debit: same behavior as before (own $transaction,
+     * post-commit socket emission). Now a thin wrapper over the shared
+     * _debitAzmWithClient primitive so all AZM debits share one pipeline.
+     */
+    async debitAzm({ userId, amount, source, reason, metadata = null, dedupKey = null }) {
+        const result = await this.prisma.$transaction(async (tx) =>
+            this._debitAzmWithClient(tx, { userId, amount, source, reason, metadata, dedupKey })
+        );
+
+        // Emit socket event for real-time FE update (post-commit only)
+        if (result.debited) {
+            this._emitSpendUpdate(userId, result.newBalance, amount, source, reason);
+        }
+
+        return result;
     }
 
     // =========================================================================
@@ -201,6 +225,73 @@ class AzmSpendService {
             azmSpent: tier.cost,
             newBalance: result.newBalance
         };
+    }
+
+    // =========================================================================
+    // FEE DISCOUNT (TRANSACTION-AWARE)
+    // =========================================================================
+
+    /**
+     * Apply a fee discount INSIDE a caller-owned Prisma transaction. Used by
+     * the fiat withdrawal flow so the AZM fee-discount debit commits (or
+     * rolls back) atomically with the withdrawal reservation itself.
+     *
+     * Performs NO socket emission — the outer transaction may still roll
+     * back. The caller emits the azm_spend event exactly once AFTER the
+     * outer transaction commits (see emitFeeDiscountSpend below).
+     *
+     * The tier catalog (FEE_DISCOUNT_TIERS) remains the single source of
+     * truth for cost/discount; the deterministic dedup key
+     * `fee_discount_<withdrawalRef>` identifies this exact spend for reversal.
+     *
+     * @param {object} tx - open Prisma transaction client
+     * @param {number} userId
+     * @param {string} tierId - 'tier_25' | 'tier_50' | 'tier_100'
+     * @param {string} withdrawalRef - withdrawal reference (required for dedup)
+     * @returns {Promise<{discount, tierId, azmSpent, newBalance, debited, logId}>}
+     */
+    async applyFeeDiscountInTransaction(tx, userId, tierId, withdrawalRef) {
+        if (!tx) throw new Error('applyFeeDiscountInTransaction requires an open transaction client.');
+        if (!withdrawalRef) throw new Error('applyFeeDiscountInTransaction requires a withdrawal reference.');
+
+        const tier = FEE_DISCOUNT_TIERS.find(t => t.id === tierId);
+        if (!tier) throw new Error(`Invalid fee discount tier: ${tierId}`);
+
+        let result;
+        try {
+            result = await this._debitAzmWithClient(tx, {
+                userId,
+                amount: tier.cost,
+                source: AZM_SPEND_SOURCES.FEE_DISCOUNT,
+                reason: `${tier.label} fee discount on withdrawal (-${tier.cost} AZM)`,
+                metadata: { tierId, discount: tier.discount, withdrawalRef },
+                dedupKey: `fee_discount_${withdrawalRef}`
+            });
+        } catch (err) {
+            // Keep the standalone AZM_SPEND_FAILED contract for the controller.
+            if (err.message.includes('Insufficient AZM balance') || err.message === 'User not found.') {
+                err.code = 'AZM_SPEND_FAILED';
+            }
+            throw err;
+        }
+
+        return {
+            discount: tier.discount,
+            tierId: tier.id,
+            azmSpent: tier.cost,
+            newBalance: result.newBalance,
+            debited: result.debited,
+            logId: result.logId
+        };
+    }
+
+    /**
+     * Small public post-commit wrapper: emits the existing azm_spend realtime
+     * update for a fee-discount debit that has ALREADY committed inside the
+     * caller's transaction. Never call this before the outer commit.
+     */
+    emitFeeDiscountSpend(userId, newBalance, azmSpent, reason) {
+        this._emitSpendUpdate(userId, newBalance, azmSpent, AZM_SPEND_SOURCES.FEE_DISCOUNT, reason);
     }
 
     // =========================================================================

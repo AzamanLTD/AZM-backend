@@ -44,6 +44,10 @@ describe('fiat withdrawal settlement economics', () => {
         createMany: jest.fn().mockResolvedValue({ count: 2 }),
         create: jest.fn().mockResolvedValue({ id: 'log' }),
       },
+      azmSpendLog: {
+        findFirst: jest.fn().mockResolvedValue(null),
+        update: jest.fn(),
+      },
     };
     const prisma = {
       $transaction: jest.fn(async (callback) => callback(tx)),
@@ -152,6 +156,10 @@ describe('fiat withdrawal settlement economics', () => {
       adminProfitLog: {
         create: jest.fn(),
         deleteMany: jest.fn(),
+      },
+      azmSpendLog: {
+        findFirst: jest.fn().mockResolvedValue(null),
+        update: jest.fn(),
       },
     };
     const prisma = {
