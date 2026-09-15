@@ -26,11 +26,16 @@ describeOrSkip('withdrawal reconciliation terminal claim (real PostgreSQL)', () 
         if (prisma) await prisma.$disconnect();
     });
 
-    afterEach(async () => {
+    // The battery shares one database and may run twice (CI retry pass);
+    // other suites leak system-ledger rows. Clean before AND after each test.
+    const cleanupSharedTables = async () => {
         await prisma.$executeRawUnsafe(
-            'TRUNCATE TABLE "User", "Withdrawal", "TransactionHistory", "SystemFiatPool", "SystemMasterCrypto", "GlobalSettings", "ProviderSettlementAttempt", "ReconciliationException" RESTART IDENTITY CASCADE'
+            'TRUNCATE TABLE "User", "Withdrawal", "TransactionHistory", "SystemFiatPool", "SystemMasterCrypto", "SystemProfitFees", "AdminProfitLog", "GlobalSettings", "ProviderSettlementAttempt", "ReconciliationException" RESTART IDENTITY CASCADE'
         );
-    }, 15000);
+    };
+
+    beforeEach(cleanupSharedTables);
+    afterEach(cleanupSharedTables);
 
     const makeIo = () => {
         const emitted = [];
@@ -90,7 +95,7 @@ describeOrSkip('withdrawal reconciliation terminal claim (real PostgreSQL)', () 
     };
 
     test('concurrent SUCCESS polls produce exactly one terminal realtime/notification winner', async () => {
-        const { tx, withdrawal } = await seed();
+        const { user, tx, withdrawal } = await seed();
         const provider = {
             getTransferStatus: jest.fn().mockResolvedValue({
                 status: 'SUCCESSFUL',
@@ -105,7 +110,14 @@ describeOrSkip('withdrawal reconciliation terminal claim (real PostgreSQL)', () 
         const a = new WithdrawalReconciliationWorker(prisma, ioA, provider, emailA, null);
         const b = new WithdrawalReconciliationWorker(prisma, ioB, provider, emailB, null);
 
-        await Promise.all([a._reconcileOne(withdrawal), b._reconcileOne(withdrawal)]);
+        // The worker reads withdrawal.user?.email for the receipt; the bare
+        // prisma row carries no relation, so attach the seeded user.
+        const withdrawalWithUser = { ...withdrawal, user };
+        await Promise.all([a._reconcileOne(withdrawalWithUser), b._reconcileOne(withdrawalWithUser)]);
+
+        // Receipts are dispatched via setImmediate — flush the immediate
+        // queue before counting them.
+        await new Promise((resolve) => setImmediate(resolve));
 
         const currentWithdrawal = await prisma.withdrawal.findUnique({ where: { id: withdrawal.id } });
         const currentTx = await prisma.transactionHistory.findUnique({ where: { id: tx.id } });
