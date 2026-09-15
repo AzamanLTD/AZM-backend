@@ -65,6 +65,9 @@ jobs:
       - name: Install transaction quote overlay
         run: node infra/install-transaction-quote-overlay.js
 
+      - name: Install payout reconciliation infrastructure
+        run: node infra/install-payout-reconciliation-infra.js
+
       - name: Generate Prisma client
         run: npx prisma generate
 

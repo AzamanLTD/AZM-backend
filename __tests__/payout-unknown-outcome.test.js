@@ -29,6 +29,7 @@
 //      path settles that exact row.
 // =============================================================================
 const { PrismaClient } = require('@prisma/client');
+const { installPayoutReconciliationInfra } = require('../infra/install-payout-reconciliation-infra');
 const PayoutBatchWorker = require('../workers/payoutBatchWorker');
 const WithdrawalReconciliationWorker = require('../workers/withdrawalReconciliationWorker');
 
@@ -42,7 +43,16 @@ const REF = `PAYOUT_REF_${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
 describeOrSkip('payout provider unknown-outcome (real PostgreSQL)', () => {
     let prisma;
 
-    beforeAll(() => { prisma = new PrismaClient(); });
+    beforeAll(async () => {
+        prisma = new PrismaClient();
+        // The durable reconciliation structures (ProviderSettlementAttempt,
+        // ReconciliationException, Withdrawal.transactionHistoryId bridge) are
+        // raw-SQL objects outside the Prisma schema; CI provisions the test
+        // database with `prisma db push` only, so the suite installs them
+        // itself (idempotent) before proving the persisted-status contract.
+        const result = await installPayoutReconciliationInfra(prisma);
+        if (result.failed) throw new Error(`reconciliation infra install failed: ${result.errors.join('; ')}`);
+    });
     afterAll(async () => { if (prisma) await prisma.$disconnect(); });
 
     afterEach(async () => {

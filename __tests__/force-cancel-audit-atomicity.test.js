@@ -175,6 +175,21 @@ describeOrSkip('forceCancel audit atomicity (real PostgreSQL)', () => {
         );
     }, 15000);
 
+    // The ADMIN_INTERVENTION message carries senderId = req.user.id; the
+    // acting admin must actually exist (FK: Message_senderId_fkey). Seeded
+    // per test — never rely on User id 1 left behind by another suite.
+    const seedAdmin = async () => {
+        const suffix = `${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
+        return prisma.user.create({
+            data: {
+                username: `admin_fc_${suffix}`,
+                email: `admin_fc_${suffix}@test.com`,
+                password: 'x',
+                azamanId: `AZM-A-${suffix}`
+            }
+        });
+    };
+
     const seedDisputedTrade = async ({ type }) => {
         const suffix = `${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
         const buyer = await prisma.user.create({
@@ -237,14 +252,14 @@ describeOrSkip('forceCancel audit atomicity (real PostgreSQL)', () => {
     };
 
     test('A. successful SELL cancellation commits refund + message + audit atomically', async () => {
-        const { vendor, trade } = await seedDisputedTrade({ type: 'SELL' });
+        const [admin, { vendor, trade }] = await Promise.all([seedAdmin(), seedDisputedTrade({ type: 'SELL' })]);
         const before = await freshBalances(vendor);
 
         const io = { to: jest.fn().mockReturnThis(), emit: jest.fn() };
         const emitBalanceUpdate = jest.fn();
         const res = makeRes();
         await adminController.forceCancel(
-            makeReq(prisma, io, emitBalanceUpdate, { tradeId: trade.id, adminNotes: 'refund buyer' }),
+            makeReq(prisma, io, emitBalanceUpdate, { tradeId: trade.id, userId: admin.id, adminNotes: 'refund buyer' }),
             res
         );
 
@@ -267,12 +282,12 @@ describeOrSkip('forceCancel audit atomicity (real PostgreSQL)', () => {
     });
 
     test('A2. successful BUY cancellation restores buyer escrow to availableBalance', async () => {
-        const { buyer, trade } = await seedDisputedTrade({ type: 'BUY' });
+        const [admin, { buyer, trade }] = await Promise.all([seedAdmin(), seedDisputedTrade({ type: 'BUY' })]);
         const before = await freshBalances(buyer);
 
         const res = makeRes();
         await adminController.forceCancel(
-            makeReq(prisma, { to: jest.fn().mockReturnThis(), emit: jest.fn() }, jest.fn(), { tradeId: trade.id }),
+            makeReq(prisma, { to: jest.fn().mockReturnThis(), emit: jest.fn() }, jest.fn(), { tradeId: trade.id, userId: admin.id }),
             res
         );
 
@@ -285,7 +300,7 @@ describeOrSkip('forceCancel audit atomicity (real PostgreSQL)', () => {
     });
 
     test('B. injected AuditLog failure rolls back the ENTIRE cancellation', async () => {
-        const { vendor, trade } = await seedDisputedTrade({ type: 'SELL' });
+        const [admin, { vendor, trade }] = await Promise.all([seedAdmin(), seedDisputedTrade({ type: 'SELL' })]);
         const beforeVendor = await freshBalances(vendor);
         await injectAuditFailure();
 
@@ -293,7 +308,7 @@ describeOrSkip('forceCancel audit atomicity (real PostgreSQL)', () => {
         const emitBalanceUpdate = jest.fn();
         const res = makeRes();
         await adminController.forceCancel(
-            makeReq(prisma, io, emitBalanceUpdate, { tradeId: trade.id, adminNotes: 'must fail' }),
+            makeReq(prisma, io, emitBalanceUpdate, { tradeId: trade.id, userId: admin.id, adminNotes: 'must fail' }),
             res
         );
 
@@ -319,15 +334,15 @@ describeOrSkip('forceCancel audit atomicity (real PostgreSQL)', () => {
     });
 
     test('C. concurrent forceCancel: one refund, one audit row, deterministic 409 loser', async () => {
-        const { vendor, trade } = await seedDisputedTrade({ type: 'SELL' });
+        const [admin, { vendor, trade }] = await Promise.all([seedAdmin(), seedDisputedTrade({ type: 'SELL' })]);
         const before = await freshBalances(vendor);
 
         const io = { to: jest.fn().mockReturnThis(), emit: jest.fn() };
         const emitBalanceUpdate = jest.fn();
         const [res1, res2] = [makeRes(), makeRes()];
         await Promise.all([
-            adminController.forceCancel(makeReq(prisma, io, emitBalanceUpdate, { tradeId: trade.id }), res1),
-            adminController.forceCancel(makeReq(prisma, io, emitBalanceUpdate, { tradeId: trade.id }), res2)
+            adminController.forceCancel(makeReq(prisma, io, emitBalanceUpdate, { tradeId: trade.id, userId: admin.id }), res1),
+            adminController.forceCancel(makeReq(prisma, io, emitBalanceUpdate, { tradeId: trade.id, userId: admin.id }), res2)
         ]);
 
         const statuses = [res1.status.mock.calls[0][0], res2.status.mock.calls[0][0]].sort();

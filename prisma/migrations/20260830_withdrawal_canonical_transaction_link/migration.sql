@@ -4,7 +4,7 @@
 -- refuse unsafe correlation.
 
 ALTER TABLE "Withdrawal"
-    ADD COLUMN "transactionHistoryId" UUID;
+    ADD COLUMN "transactionHistoryId" TEXT;
 
 CREATE UNIQUE INDEX "Withdrawal_transactionHistoryId_key"
     ON "Withdrawal"("transactionHistoryId")
@@ -48,7 +48,7 @@ RETURNS trigger
 LANGUAGE plpgsql
 AS $$
 DECLARE
-    candidate_id UUID;
+    candidate_id TEXT;
 BEGIN
     IF NEW."transactionHistoryId" IS NOT NULL THEN
         RETURN NEW;
