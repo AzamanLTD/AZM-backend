@@ -60,6 +60,37 @@ const SUPPORTED_CURRENCY       = 'GHS';
 const TOKEN_REFRESH_BUFFER_MS  = 60_000;   // refresh 60 s before expiry
 const DEFAULT_TARGET_ENV       = process.env.MTN_MOMO_TARGET_ENV || 'sandbox';
 
+/**
+ * Explicit provider-outcome classification for disbursement dispatch errors.
+ *
+ * PayoutBatchWorker and the reconciliation worker rely on this to decide what
+ * a thrown initiateTransfer error MEANS financially:
+ *
+ *   NOT_DISPATCHED      — deterministic failure BEFORE the transfer request
+ *                         left this process (validation, OAuth token fetch).
+ *                         The provider was provably never invoked; no money
+ *                         can have moved; flagging/manual handling is safe.
+ *
+ *   DEFINITIVE_REJECTION — the provider responded with an explicit
+ *                         non-5xx rejection (400/401/409/429...). The
+ *                         transfer was NOT accepted; outcome is known.
+ *
+ *   UNKNOWN_OUTCOME     — transport timeout, connection reset, DNS failure,
+ *                         or a 5xx gateway response. The request may already
+ *                         have reached the provider, so the outcome is
+ *                         UNKNOWN: the withdrawal must stay in the durable
+ *                         reconcilable PROCESSING state, never blindly moved
+ *                         to manual review.
+ *
+ * Unclassified errors thrown by other adapters are treated as
+ * UNKNOWN_OUTCOME by the caller — the conservative default.
+ */
+const PROVIDER_OUTCOMES = {
+    NOT_DISPATCHED:       'NOT_DISPATCHED',
+    DEFINITIVE_REJECTION: 'DEFINITIVE_REJECTION',
+    UNKNOWN_OUTCOME:       'UNKNOWN_OUTCOME'
+};
+
 class MtnDisbursementService {
     constructor(opts = {}) {
         this.apiUser           = process.env.MTN_MOMO_API_USER          || null;
@@ -188,14 +219,25 @@ class MtnDisbursementService {
         } = payload || {};
 
         // ── Validation ───────────────────────────────────────────────────────
+        // Validation failures happen before any provider I/O, so they are
+        // deterministic NOT_DISPATCHED outcomes — no money can have moved.
         if (!referenceId || typeof referenceId !== 'string') {
-            throw new Error('[MtnDisbursementService] referenceId (UUID v4) is required for idempotency.');
+            throw this._outcomeError(
+                '[MtnDisbursementService] referenceId (UUID v4) is required for idempotency.',
+                PROVIDER_OUTCOMES.NOT_DISPATCHED
+            );
         }
         if (!amountGhs || Number(amountGhs) <= 0) {
-            throw new Error('[MtnDisbursementService] amountGhs must be positive.');
+            throw this._outcomeError(
+                '[MtnDisbursementService] amountGhs must be positive.',
+                PROVIDER_OUTCOMES.NOT_DISPATCHED
+            );
         }
         if (!recipientPhone) {
-            throw new Error('[MtnDisbursementService] recipientPhone is required.');
+            throw this._outcomeError(
+                '[MtnDisbursementService] recipientPhone is required.',
+                PROVIDER_OUTCOMES.NOT_DISPATCHED
+            );
         }
 
         const finalExternalId   = externalId   || `AZAMAN_${Date.now()}`;
@@ -214,7 +256,15 @@ class MtnDisbursementService {
         }
 
         // ── LIVE path ────────────────────────────────────────────────────────
-        const { accessToken } = await this.getAccessToken();
+        let accessToken;
+        try {
+            ({ accessToken } = await this.getAccessToken());
+        } catch (err) {
+            // Token fetch failed — the transfer request was never sent, so
+            // this is provably NOT_DISPATCHED (no provider I/O occurred).
+            err.providerOutcome = PROVIDER_OUTCOMES.NOT_DISPATCHED;
+            throw err;
+        }
 
         try {
             // 202 Accepted with no body on success.
@@ -255,7 +305,18 @@ class MtnDisbursementService {
             };
         } catch (err) {
             const apiMsg = err.response?.data?.message || err.response?.data?.code || err.message;
-            throw new Error(`[MtnDisbursementService] MTN transfer rejected: ${apiMsg}`);
+            // HTTP-status classification, not message parsing: a provider
+            // RESPONSE with a non-5xx status is an explicit rejection (the
+            // transfer was not accepted). Anything else — connection reset,
+            // client timeout (15s), DNS failure, or a 5xx gateway response —
+            // means the request MAY have reached MTN, so the outcome is UNKNOWN.
+            const outcome = (err.response && err.response.status < 500)
+                ? PROVIDER_OUTCOMES.DEFINITIVE_REJECTION
+                : PROVIDER_OUTCOMES.UNKNOWN_OUTCOME;
+            throw this._outcomeError(
+                `[MtnDisbursementService] MTN transfer rejected: ${apiMsg}`,
+                outcome
+            );
         }
     }
 
@@ -328,6 +389,16 @@ class MtnDisbursementService {
     }
 
     // ── Internals ───────────────────────────────────────────────────────────
+
+    /**
+     * Attach an explicit providerOutcome classification to a thrown Error so
+     * callers can decide financially-safe handling without parsing strings.
+     */
+    _outcomeError(message, providerOutcome) {
+        const err = new Error(message);
+        err.providerOutcome = providerOutcome;
+        return err;
+    }
 
     _sanitizeMsisdn(phone) {
         // Strip "+" and any non-digits — MTN MoMo expects bare MSISDN.
@@ -419,3 +490,4 @@ class MtnDisbursementService {
 }
 
 module.exports = MtnDisbursementService;
+module.exports.PROVIDER_OUTCOMES = PROVIDER_OUTCOMES;

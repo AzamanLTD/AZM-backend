@@ -100,3 +100,112 @@ describe('PayoutBatchWorker canonical withdrawal transaction', () => {
         });
     });
 });
+
+// ── P0: provider unknown-outcome classification ──────────────────────────────
+describe('PayoutBatchWorker provider outcome classification', () => {
+    const settings = {
+        autoPayoutEnabled: true,
+        autoPayoutMaxAmountUsdc: 200,
+        autoPayoutThresholdUsdc: 500,
+        autoPayoutIntervalMs: 120000,
+    };
+
+    const buildPrisma = ({ withdrawal, update, updateMany }) => ({
+        globalSettings: { findUnique: jest.fn().mockResolvedValue({ ...settings, liveRetailRate: 13 }) },
+        systemFiatPool: { findUnique: jest.fn().mockResolvedValue({ balance: 1000 }) },
+        withdrawal: {
+            findMany: jest.fn().mockResolvedValue([withdrawal]),
+            update,
+            updateMany,
+        },
+        transactionHistory: {
+            findMany: jest.fn().mockResolvedValue([{ id: 'tx-1', txHash: 'ref-1', status: 'PENDING', amountUsdc: 50 }]),
+            findUnique: jest.fn(),
+        },
+    });
+
+    const baseWithdrawal = {
+        id: 101, userId: 7, amount: 50, destination: '0240000000', network: 'MTN',
+        payoutMethod: 'MTN_MOMO', createdAt: new Date('2026-08-30T10:00:00.000Z'),
+    };
+
+    test('UNKNOWN_OUTCOME stays PROCESSING for reconciliation — never flagged for manual review', async () => {
+        const dispatchErr = new Error('socket hang up');
+        dispatchErr.providerOutcome = 'UNKNOWN_OUTCOME';
+        const initiateTransfer = jest.fn().mockRejectedValue(dispatchErr);
+        const update = jest.fn();
+        const updateMany = jest.fn().mockResolvedValue({ count: 1 });
+        const prisma = buildPrisma({ withdrawal: baseWithdrawal, update, updateMany });
+        const io = { emit: jest.fn() };
+
+        const worker = new PayoutBatchWorker(prisma, io, { initiateTransfer }, null);
+        const result = await worker._processBatch(settings, { isManualTrigger: true });
+
+        // claim happened before dispatch
+        expect(updateMany).toHaveBeenCalledWith({
+            where: { id: 101, status: 'PENDING' }, data: { status: 'PROCESSING' },
+        });
+        // NOT moved out of the reconciliation pipeline
+        expect(update).not.toHaveBeenCalled();
+        expect(result.flagged).toBe(0);
+        expect(result.details.unknownOutcome).toEqual([{
+            id: 101, amount: 50, reason: 'DISBURSEMENT_OUTCOME_UNKNOWN',
+            providerOutcome: 'UNKNOWN_OUTCOME', error: 'socket hang up',
+        }]);
+        // observability alert for ambiguous dispatches
+        expect(io.emit).toHaveBeenCalledWith('admin_alert', expect.objectContaining({
+            type: 'PAYOUTS_PENDING_PROVIDER_RECONCILIATION', count: 1,
+        }));
+    });
+
+    test('UNCLASSIFIED adapter errors are conservatively treated as unknown outcome', async () => {
+        const initiateTransfer = jest.fn().mockRejectedValue(new Error('provider exploded'));
+        const update = jest.fn();
+        const updateMany = jest.fn().mockResolvedValue({ count: 1 });
+        const prisma = buildPrisma({ withdrawal: baseWithdrawal, update, updateMany });
+
+        const worker = new PayoutBatchWorker(prisma, { emit: jest.fn() }, { initiateTransfer }, null);
+        const result = await worker._processBatch(settings, { isManualTrigger: true });
+
+        expect(update).not.toHaveBeenCalled();
+        expect(result.details.unknownOutcome[0]).toMatchObject({
+            id: 101, providerOutcome: 'UNKNOWN_OUTCOME',
+        });
+    });
+
+    test('DEFINITIVE_REJECTION still flags manual review (explicit provider refusal)', async () => {
+        const dispatchErr = new Error('MTN transfer rejected: INVALID_MSISDN');
+        dispatchErr.providerOutcome = 'DEFINITIVE_REJECTION';
+        const initiateTransfer = jest.fn().mockRejectedValue(dispatchErr);
+        const update = jest.fn().mockResolvedValue({});
+        const updateMany = jest.fn().mockResolvedValue({ count: 1 });
+        const prisma = buildPrisma({ withdrawal: baseWithdrawal, update, updateMany });
+
+        const worker = new PayoutBatchWorker(prisma, { emit: jest.fn() }, { initiateTransfer }, null);
+        const result = await worker._processBatch(settings, { isManualTrigger: true });
+
+        expect(update).toHaveBeenCalledWith({
+            where: { id: 101 }, data: { status: 'NEEDS_MANUAL_REVIEW' },
+        });
+        expect(result.flagged).toBe(1);
+        expect(result.details.unknownOutcome).toEqual([]);
+    });
+
+    test('NOT_DISPATCHED (provably no provider I/O) flags manual review', async () => {
+        const dispatchErr = new Error('[MtnDisbursementService] recipientPhone is required.');
+        dispatchErr.providerOutcome = 'NOT_DISPATCHED';
+        const initiateTransfer = jest.fn().mockRejectedValue(dispatchErr);
+        const update = jest.fn().mockResolvedValue({});
+        const updateMany = jest.fn().mockResolvedValue({ count: 1 });
+        const prisma = buildPrisma({ withdrawal: baseWithdrawal, update, updateMany });
+
+        const worker = new PayoutBatchWorker(prisma, { emit: jest.fn() }, { initiateTransfer }, null);
+        const result = await worker._processBatch(settings, { isManualTrigger: true });
+
+        expect(update).toHaveBeenCalledWith({
+            where: { id: 101 }, data: { status: 'NEEDS_MANUAL_REVIEW' },
+        });
+        expect(result.flagged).toBe(1);
+    });
+});
+

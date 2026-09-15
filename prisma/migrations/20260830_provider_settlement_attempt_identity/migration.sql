@@ -5,7 +5,7 @@
 
 CREATE TABLE "ProviderSettlementAttempt" (
     "id" UUID NOT NULL DEFAULT gen_random_uuid(),
-    "transactionHistoryId" UUID NOT NULL,
+    "transactionHistoryId" TEXT NOT NULL,
     "provider" VARCHAR(64) NOT NULL,
     "providerReference" VARCHAR(255) NOT NULL,
     "providerTransactionId" VARCHAR(255),

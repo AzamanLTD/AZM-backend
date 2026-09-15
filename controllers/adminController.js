@@ -322,6 +322,22 @@ exports.forceCancel = async (req, res) => {
                     content:        `Admin cancelled the trade. Assets refunded. Notes: ${adminNotes ?? 'Resolved by admin.'}`
                 }
             });
+
+            // Control-plane atomicity (issue #252, PR #241 contract): the
+            // FORCE_CANCEL_TRADE audit row is part of the SAME transaction as
+            // the DISPUTED -> CANCELLED claim, the escrow refund and the
+            // ADMIN_INTERVENTION message. Strict mode propagates an
+            // AuditLog.create failure so the whole financial reversal rolls
+            // back — a successful refund can never exist without its audit
+            // evidence, and a rolled-back refund never leaves an audit row.
+            // The conditional claim above stays first so it remains the
+            // concurrency winner.
+            await audit(tx, {
+                actorId: req.user.id, actorName: req.user.username,
+                action: 'FORCE_CANCEL_TRADE', targetType: 'TRADE', targetId: String(tradeId),
+                metadata: { adminNotes: adminNotes || null, previousStatus: 'DISPUTED' },
+                ipAddress: req.ip,
+            }, { throwOnError: true });
         });
 
         if (emitBalanceUpdate) {
@@ -336,15 +352,9 @@ exports.forceCancel = async (req, res) => {
         io.to(`user_${trade.userId}`).emit('new_notification',   { title: 'Trade Cancelled by Admin' });
         io.to(`user_${trade.vendorId}`).emit('new_notification', { title: 'Trade Resolved — Assets Returned' });
 
+        // The mandatory FORCE_CANCEL_TRADE audit row committed atomically with
+        // the financial reversal above — nothing audit-related runs here.
         res.status(200).json({ success: true, message: 'Force Cancel Successful.' });
-
-        // Append-only audit trail (fire-and-forget — never fails the request).
-        await audit(prisma, {
-            actorId: req.user.id, actorName: req.user.username,
-            action: 'FORCE_CANCEL_TRADE', targetType: 'TRADE', targetId: String(tradeId),
-            metadata: { adminNotes: adminNotes || null, previousStatus: 'DISPUTED' },
-            ipAddress: req.ip,
-        });
     } catch (error) {
         // Phase H9: another concurrent admin already finalized this
         // trade. Surface a 409 so the FE can refresh and show the new
