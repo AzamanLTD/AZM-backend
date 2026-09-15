@@ -169,6 +169,19 @@ const acceptPing = async (prisma, { tradeId, vendorId, topUpAmount }) => {
         throw new Error(`Cannot accept ping: trade status is ${trade.status}.`);
 
     const result = await prisma.$transaction(async (tx) => {
+        // Re-validate the trade lifecycle inside the same transaction as the
+        // balance move. The row lock serializes this top-up against a
+        // concurrent terminal transition; whichever transition acquires the
+        // trade lock first becomes the authoritative outcome.
+        const eligible = await tx.$queryRawUnsafe(
+            'SELECT 1 AS locked FROM \"Trade\" WHERE id = $1 AND status = $2 FOR UPDATE',
+            tradeId,
+            'PENDING_PAYMENT'
+        );
+        if (eligible.length !== 1) {
+            throw new Error('Cannot accept ping: trade is no longer pending payment.');
+        }
+
         const updated = await tx.user.updateMany({
             where: {
                 id: vendorId,
