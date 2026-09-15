@@ -15,8 +15,17 @@ const logger = require('../src/config/logger');
 // Failures are caught and logged to console.error — they NEVER cause the
 // surrounding request to fail. AuditLog rows are append-only: this helper only
 // ever creates; nothing in the codebase should update or delete them.
+//
+// STRICT MODE — { throwOnError: true }:
+//   Callers that make the audit row part of a financial transaction's atomic
+//   success boundary (e.g. forceCancel's FORCE_CANCEL_TRADE row) pass the
+//   Prisma TRANSACTION CLIENT as `prisma` and set throwOnError so a failed
+//   AuditLog.create aborts the whole transaction instead of silently
+//   committing the financial mutation without its mandatory audit evidence.
+//   Default fire-and-forget behavior for legacy callers is unchanged.
 // =============================================================================
-async function audit(prisma, payload) {
+async function audit(prisma, payload, opts = {}) {
+  const strict = opts && opts.throwOnError === true;
   try {
     await prisma.auditLog.create({
       data: {
@@ -31,6 +40,7 @@ async function audit(prisma, payload) {
     });
   } catch (err) {
     logger.error('[AuditLog] Failed to write audit row:', err.message, payload);
+    if (strict) throw err; // strict mode: the audit failure must abort the transaction
     // Intentionally swallowed — never break the request over a logging failure.
   }
 }

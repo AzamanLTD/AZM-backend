@@ -222,6 +222,7 @@ class PayoutBatchWorker {
         const results = {
             processed: [],
             flaggedManualReview: [],
+            unknownOutcome: [],
             errors: []
         };
 
@@ -316,20 +317,55 @@ class PayoutBatchWorker {
                 logger.info(`[PayoutBatchWorker] dispatched withdrawal #${withdrawal.id}: $${amount} → GHS ${amountGhs} (network: ${withdrawal.network || 'MTN'}, ref: ${referenceId})`);
             } catch (dispatchErr) {
                 logger.error(`[PayoutBatchWorker] provider dispatch failed for withdrawal #${withdrawal.id}:`, dispatchErr.message);
-                await this._flagForManualReview(withdrawal, 'DISBURSEMENT_DISPATCH_FAILED', {
+
+                // P0 unknown-outcome semantics: once PENDING -> PROCESSING is
+                // claimed and provider I/O has begun, a thrown error is NOT
+                // automatically a rejection. The request may already have
+                // reached MTN (client timeout after transmission, connection
+                // reset, ambiguous 5xx gateway response). Only errors the
+                // adapter classifies as NOT_DISPATCHED (provider provably
+                // never invoked) or DEFINITIVE_REJECTION (provider explicitly
+                // refused) are safe to move out of the pipeline — anything
+                // else, including UNCLASSIFIED errors from other adapters, is
+                // conservatively UNKNOWN and must stay in PROCESSING, the
+                // durable "provider outcome unresolved" state the
+                // WithdrawalReconciliationWorker scans (PENDING+PROCESSING)
+                // and settles or reverses by polling getTransferStatus(ref).
+                // Blindly flagging NEEDS_MANUAL_REVIEW here would strand an
+                // ambiguous live payout outside normal reconciliation.
+                const outcome = dispatchErr && dispatchErr.providerOutcome;
+                if (outcome === 'NOT_DISPATCHED' || outcome === 'DEFINITIVE_REJECTION') {
+                    await this._flagForManualReview(withdrawal, 'DISBURSEMENT_DISPATCH_FAILED', {
+                        amount,
+                        error: dispatchErr.message,
+                        message: `Disbursement dispatch failed: ${dispatchErr.message}`
+                    });
+                    results.flaggedManualReview.push({ id: withdrawal.id, reason: 'DISBURSEMENT_DISPATCH_FAILED', amount, error: dispatchErr.message });
+                    continue;
+                }
+
+                // UNKNOWN provider outcome — leave the withdrawal in PROCESSING
+                // (already claimed above) for the reconciliation worker. The
+                // batch pool gauge treats the funds as in flight, same as a
+                // successful dispatch, so the rest of the batch cannot
+                // over-dispatch the remaining pool headroom.
+                runningPoolBalance -= amount;
+                results.unknownOutcome.push({
+                    id: withdrawal.id,
                     amount,
-                    error: dispatchErr.message,
-                    message: `Disbursement dispatch failed: ${dispatchErr.message}`
+                    reason: 'DISBURSEMENT_OUTCOME_UNKNOWN',
+                    providerOutcome: outcome || 'UNKNOWN_OUTCOME',
+                    error: dispatchErr.message
                 });
-                results.flaggedManualReview.push({ id: withdrawal.id, reason: 'DISBURSEMENT_DISPATCH_FAILED', amount, error: dispatchErr.message });
             }
         }
 
         const summary = {
             success: true,
-            message: `Batch complete: ${results.processed.length} dispatched, ${results.flaggedManualReview.length} flagged for review.`,
+            message: `Batch complete: ${results.processed.length} dispatched, ${results.flaggedManualReview.length} flagged for review, ${results.unknownOutcome.length} pending provider reconciliation.`,
             processed: results.processed.length,
             flagged: results.flaggedManualReview.length,
+            unknownOutcome: results.unknownOutcome.length,
             poolBalance: runningPoolBalance,
             details: isManualTrigger ? results : undefined
         };
@@ -339,6 +375,19 @@ class PayoutBatchWorker {
                 type: 'PAYOUTS_NEED_MANUAL_REVIEW',
                 count: results.flaggedManualReview.length,
                 items: results.flaggedManualReview,
+                timestamp: new Date().toISOString()
+            });
+        }
+
+        // Observability for ambiguous dispatches: the funds may be in flight
+        // at the provider. The withdrawal stays PROCESSING and reconciliation
+        // owns the outcome — this alert only tells admins a payout is being
+        // reconciled, it does NOT request manual state changes.
+        if (results.unknownOutcome.length > 0 && this.io) {
+            this.io.emit('admin_alert', {
+                type: 'PAYOUTS_PENDING_PROVIDER_RECONCILIATION',
+                count: results.unknownOutcome.length,
+                items: results.unknownOutcome,
                 timestamp: new Date().toISOString()
             });
         }
