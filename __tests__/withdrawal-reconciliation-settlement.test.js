@@ -56,7 +56,7 @@ describe('WithdrawalReconciliationWorker settlement lifecycle', () => {
         updateMany: jest.fn().mockResolvedValue({ count: 1 }),
       },
       withdrawal: {
-        update: jest.fn().mockResolvedValue({ ...withdrawal, status: 'COMPLETED' }),
+        updateMany: jest.fn().mockResolvedValue({ count: 1 }),
       },
     };
     const io = { to: jest.fn().mockReturnThis(), emit: jest.fn() };
@@ -67,17 +67,24 @@ describe('WithdrawalReconciliationWorker settlement lifecycle', () => {
       }),
     };
 
+    financeService.completeFiatWithdrawal.mockResolvedValue({
+      reference: 'ref-1',
+      status: 'COMPLETED',
+      providerTxId: 'provider-123',
+    });
+
     const worker = new WithdrawalReconciliationWorker(prisma, io, provider);
     await worker._reconcileOne(withdrawal);
 
     expect(prisma.transactionHistory.findMany).not.toHaveBeenCalled();
     expect(prisma.transactionHistory.findUnique).toHaveBeenCalledWith({ where: { id: 'tx-1' } });
-    expect(prisma.transactionHistory.updateMany).toHaveBeenCalledWith({
-      where: { id: 'tx-1', status: 'PENDING' },
-      data: { status: 'COMPLETED', providerRef: 'provider-123' },
+    // TransactionHistory advancement now happens inside the canonical finance
+    // settlement boundary, not as a direct worker mutation.
+    expect(financeService.completeFiatWithdrawal).toHaveBeenCalledWith(prisma, 'ref-1', {
+      providerTxId: 'provider-123',
     });
-    expect(prisma.withdrawal.update).toHaveBeenCalledWith({
-      where: { id: 42 },
+    expect(prisma.withdrawal.updateMany).toHaveBeenCalledWith({
+      where: { id: 42, status: { in: ['PENDING', 'PROCESSING'] } },
       data: { status: 'COMPLETED' },
     });
     expect(io.to).toHaveBeenCalledWith('user_7');
@@ -104,7 +111,7 @@ describe('WithdrawalReconciliationWorker settlement lifecycle', () => {
         updateMany: jest.fn().mockResolvedValue({ count: 1 }),
       },
       withdrawal: {
-        update: jest.fn().mockResolvedValue({ ...withdrawal, status: 'FAILED' }),
+        updateMany: jest.fn().mockResolvedValue({ count: 1 }),
       },
     };
     const io = { to: jest.fn().mockReturnThis(), emit: jest.fn() };
@@ -136,8 +143,8 @@ describe('WithdrawalReconciliationWorker settlement lifecycle', () => {
       'ref-2',
       { reason: 'provider_async_failure: recipient rejected' },
     );
-    expect(prisma.withdrawal.update).toHaveBeenCalledWith({
-      where: { id: 42 },
+    expect(prisma.withdrawal.updateMany).toHaveBeenCalledWith({
+      where: { id: 42, status: { in: ['PENDING', 'PROCESSING'] } },
       data: { status: 'FAILED' },
     });
   });

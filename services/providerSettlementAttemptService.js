@@ -116,7 +116,7 @@ const recordProviderSettlementAttempt = async (prisma, {
                         ELSE "failureReason"
                     END,
                     "metadata" = COALESCE($4::jsonb, "metadata")
-              WHERE "id" = $5
+              WHERE "id" = $5::uuid
               RETURNING "id", "transactionHistoryId", "provider", "providerReference", "providerTransactionId", "status", "firstSeenAt", "lastSeenAt", "settledAt", "failureReason", "metadata"`,
             providerTransactionId ? String(providerTransactionId) : null,
             normalizedStatus,
