@@ -1983,11 +1983,19 @@ model AzmRewardLog {
   reason       String // Human-readable description
   source       String // Machine key: TRADE_COMPLETE, LOGIN_STREAK, REFERRAL_BONUS, ACHIEVEMENT_UNLOCK, MILESTONE
   metadata     Json? // Optional context (tradeId, streak count, achievement name, etc.)
+  // P0 idempotency (2026-09-15): dedicated dedup identity, mirrored into
+  // metadata.dedupKey for backward compatibility. Nullable by design — legacy
+  // rows and non-idempotent sources have no claim, and Postgres treats NULLs
+  // as distinct so multiple claim-free rows stay valid. The composite unique
+  // below is the REAL concurrency gate: a racing duplicate insert fails here
+  // and the enclosing transaction (balance increment included) rolls back.
+  dedupKey     String?
   balanceAfter Decimal  @default(0.0) @db.Decimal(20, 8) // User's azmBalance after this credit
   createdAt    DateTime @default(now())
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
+  @@unique([userId, source, dedupKey])
   @@index([userId, createdAt(sort: Desc)])
   @@index([source])
   @@index([userId, source])
@@ -2007,11 +2015,17 @@ model AzmSpendLog {
   reason       String // Human-readable description
   source       String // Machine key: FEE_DISCOUNT, AD_BOOST
   metadata     Json? // Optional context (tierId, adId, discount percentage, etc.)
+  // P0 idempotency (2026-09-15): same contract as AzmRewardLog.dedupKey —
+  // the DB-level uniqueness on (userId, source, dedupKey) is what makes the
+  // debit exactly-once under concurrency; the service-layer pre-check is a
+  // fast path, not the gate.
+  dedupKey     String?
   balanceAfter Decimal  @default(0.0) @db.Decimal(20, 8) // User's azmBalance after this debit
   createdAt    DateTime @default(now())
 
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
+  @@unique([userId, source, dedupKey])
   @@index([userId, createdAt(sort: Desc)])
   @@index([source])
   @@index([userId, source])
