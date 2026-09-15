@@ -203,7 +203,7 @@ const updateOrderStatusFromEscrow = async (prisma, escrowId, escrowStatus) => {
 };
 
 const getBusinessStats = async (prisma, { businessProfileId }) => {
-    const [totalOrders, completedOrders, pendingOrders, disputedOrders, cancelledOrders, revenueAgg, recentOrders, revenueByDay] = await Promise.all([
+    const [totalOrders, completedOrders, pendingOrders, disputedOrders, cancelledOrders, revenueAgg, recentOrders, revenueByDay, invoiceSent, invoicePaid, invoiceRevenue] = await Promise.all([
         prisma.businessOrder.count({ where: { businessProfileId } }),
         prisma.businessOrder.count({ where: { businessProfileId, status: 'COMPLETED' } }),
         prisma.businessOrder.count({ where: { businessProfileId, status: { in: ['AWAITING_PAYMENT', 'PAID', 'DELIVERED'] } } }),
@@ -212,9 +212,27 @@ const getBusinessStats = async (prisma, { businessProfileId }) => {
         prisma.businessOrder.aggregate({ where: { businessProfileId, status: 'COMPLETED' }, _sum: { amountUsdc: true } }),
         prisma.businessOrder.findMany({ where: { businessProfileId }, orderBy: [{ createdAt: 'desc' }, { id: 'desc' }], take: 5, include: ORDER_INCLUDE }),
         _getRevenueByDay(prisma, businessProfileId),
+        prisma.businessInvoice.count({ where: { businessProfileId, status: 'SENT' } }),
+        prisma.businessInvoice.count({ where: { businessProfileId, status: 'PAID' } }),
+        prisma.businessInvoice.aggregate({ where: { businessProfileId, status: 'PAID' }, _sum: { billTotalUsdc: true } }),
     ]);
     const totalRevenue = Number(revenueAgg._sum.amountUsdc || 0);
-    return { totalOrders, completedOrders, pendingOrders, disputedOrders, cancelledOrders, totalRevenue, avgOrderValue: completedOrders > 0 ? totalRevenue / completedOrders : 0, recentOrders, revenueByDay };
+    return {
+        totalOrders,
+        completedOrders,
+        pendingOrders,
+        disputedOrders,
+        cancelledOrders,
+        totalRevenue,
+        avgOrderValue: completedOrders > 0 ? totalRevenue / completedOrders : 0,
+        recentOrders,
+        revenueByDay,
+        invoiceStats: {
+            sent: invoiceSent,
+            paid: invoicePaid,
+            paidRevenue: Number(invoiceRevenue._sum.billTotalUsdc || 0),
+        },
+    };
 };
 
 module.exports = { createOrder, getOrder, listOrdersForBusiness, listOrdersForCustomer, markDelivered, updateOrderStatusFromEscrow, getBusinessStats };
