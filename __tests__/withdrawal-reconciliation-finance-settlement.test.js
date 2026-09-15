@@ -24,11 +24,17 @@ describeOrSkip('withdrawal reconciliation finance settlement (real PostgreSQL)',
         if (prisma) await prisma.$disconnect();
     });
 
-    afterEach(async () => {
+    // The battery shares one database: earlier suites can leave system-ledger
+    // rows behind (several never clean SystemProfitFees). Clean BEFORE each
+    // test as well so the suite's seeds never depend on external state.
+    const cleanupSharedTables = async () => {
         await prisma.$executeRawUnsafe(
             'TRUNCATE TABLE "User", "Withdrawal", "TransactionHistory", "SystemFiatPool", "SystemMasterCrypto", "SystemProfitFees", "AdminProfitLog", "ProviderSettlementAttempt", "ReconciliationException" RESTART IDENTITY CASCADE'
         );
-    }, 15000);
+    };
+
+    beforeEach(cleanupSharedTables);
+    afterEach(cleanupSharedTables);
 
     const seed = async ({ transactionStatus = 'PENDING' } = {}) => {
         const suffix = `${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
