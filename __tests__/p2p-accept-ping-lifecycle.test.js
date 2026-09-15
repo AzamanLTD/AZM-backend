@@ -138,7 +138,7 @@ describeOrSkip('P2P accept-ping lifecycle integrity (real PostgreSQL)', () => {
 
         const outcomes = await Promise.all([
             p2pService.acceptPing(prisma, { tradeId: trade.id, vendorId: vendor.id, topUpAmount: 25 })
-                .then(() => ({ ok: true })),
+                .then((result) => ({ ok: true, result })),
             prisma.$transaction(async (tx) => {
                 const claimed = await tx.trade.updateMany({
                     where: { id: trade.id, status: 'PENDING_PAYMENT' },
@@ -150,7 +150,7 @@ describeOrSkip('P2P accept-ping lifecycle integrity (real PostgreSQL)', () => {
 
         const finalVendor = await prisma.user.findUnique({ where: { id: vendor.id } });
         const finalTrade = await prisma.trade.findUnique({ where: { id: trade.id } });
-        const toppedUp = outcomes.some((o) => o.ok === true && 'newAvailableBalance' in o);
+        const toppedUp = outcomes.some((o) => o.ok === true && o.result?.newAvailableBalance !== undefined);
         expect(finalTrade.status === 'CANCELLED' || finalTrade.status === 'PENDING_PAYMENT').toBe(true);
         if (finalTrade.status === 'CANCELLED') {
             expect(Number(finalVendor.availableBalance)).toBeCloseTo(100, 6);
