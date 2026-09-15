@@ -227,10 +227,21 @@ class WithdrawalReconciliationWorker {
                     ...(providerRef ? { providerRef: String(providerRef) } : {})
                 }
             });
-            await this.prisma.withdrawal.update({
-                where: { id: withdrawal.id },
+
+            // SINGLE-WINNER CLAIM: multiple scheduler instances may poll the
+            // same provider result. Only the instance that transitions the
+            // outer Withdrawal row may emit terminal realtime/notifications.
+            const terminalClaim = await this.prisma.withdrawal.updateMany({
+                where: {
+                    id: withdrawal.id,
+                    status: { in: ['PENDING', 'PROCESSING'] }
+                },
                 data: { status: 'COMPLETED' }
             });
+            if (terminalClaim.count !== 1) {
+                logger.info(`[WithdrawalReconciliation] ref=${reference} SUCCESSFUL already terminal; suppressing duplicate effects.`);
+                return;
+            }
 
             logger.info(`[WithdrawalReconciliation] ref=${reference} settled SUCCESSFUL.`);
             if (this.io) {
@@ -272,14 +283,35 @@ class WithdrawalReconciliationWorker {
                 const result = await financeService.reverseFiatWithdrawal(this.prisma, reference, {
                     reason: `provider_async_failure: ${statusResp.reason || 'unspecified'}`
                 });
-                await this.prisma.withdrawal.update({
-                    where: { id: withdrawal.id },
+
+                // SINGLE-WINNER CLAIM: reverseFiatWithdrawal protects the
+                // financial mutation; this CAS protects terminal effects on
+                // the separate Withdrawal aggregate and its realtime fanout.
+                const terminalClaim = await this.prisma.withdrawal.updateMany({
+                    where: {
+                        id: withdrawal.id,
+                        status: { in: ['PENDING', 'PROCESSING'] }
+                    },
                     data: { status: 'FAILED' }
                 });
-                logger.warn(`[WithdrawalReconciliation] ref=${reference} REVERSED. user refund: ${result.refundedAmount} USDC.`);
+                if (terminalClaim.count !== 1) {
+                    logger.info(`[WithdrawalReconciliation] ref=${reference} FAILED already terminal; suppressing duplicate effects.`);
+                    return;
+                }
+
+                // If another reconciler won the TransactionHistory reversal but
+                // crashed before updating Withdrawal, this instance can still
+                // claim the terminal Withdrawal row. The canonical refund is
+                // deterministic from the immutable transaction amount + fee,
+                // so terminal notifications never carry an undefined refund.
+                const refundedAmount = result.refundedAmount != null
+                    ? result.refundedAmount
+                    : Number(txRow.amountUsdc) + Number(txRow.feeUsdc);
+
+                logger.warn(`[WithdrawalReconciliation] ref=${reference} REVERSED. user refund: ${refundedAmount} USDC.`);
                 if (this.io) {
                     this.io.to(`user_${withdrawal.userId}`).emit('withdrawal_settled', {
-                        reference, status: 'FAILED', amount: withdrawal.amount, refunded: result.refundedAmount
+                        reference, status: 'FAILED', amount: withdrawal.amount, refunded: refundedAmount
                     });
                     this.io.emit('admin_alert', {
                         type: 'WITHDRAWAL_AUTO_REVERSED', reference, userId: withdrawal.userId,
@@ -291,7 +323,7 @@ class WithdrawalReconciliationWorker {
                 if (this.email && withdrawal.user?.email) {
                     const recipient = withdrawal.user;
                     const amount = withdrawal.amount;
-                    const refunded = result.refundedAmount;
+                    const refunded = refundedAmount;
                     const reasonStr = statusResp.reason || 'The MoMo gateway rejected the disbursement.';
                     setImmediate(() => this.email.sendWithdrawalReceipt(recipient, {
                         kind: 'fiat_failure', amount, currency: 'USDC', reference,
