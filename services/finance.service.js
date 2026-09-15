@@ -7,6 +7,7 @@
 
 const logger = require('../src/config/logger');
 const { runDoubleCheck } = require('../utils/securityCheck');
+const { AZM_SPEND_SOURCES } = require('./azmSpendService');
 
 const EXIT_FEE_PERCENT        = 0.02;
 const FIAT_POOL_ALERT_THRESH  = 5_000;
@@ -145,6 +146,21 @@ const processFiatWithdrawal = async (prisma, userId, amountFloat, opts = {}) => 
         await _reserveFiatPool(tx, amountFloat);
         await _debitUserBalance(tx, userId, totalDeduct);
 
+        // P0 atomicity: the AZM fee-discount debit runs on the SAME tx as the
+        // fiat pool reservation, USDC debit and the TransactionHistory row, so
+        // a failed reservation can never leave a committed AZM spend behind.
+        let azmFeeDiscount = null;
+        if (typeof opts.reserveFeeDiscountInTransaction === 'function') {
+            const r = await opts.reserveFeeDiscountInTransaction(tx);
+            azmFeeDiscount = {
+                tierId: r?.tierId ?? null,
+                discount: r?.discount ?? null,
+                azmSpent: Number(r?.azmSpent) || 0,
+                newBalance: r?.newBalance ?? null,
+                debited: r?.debited !== false
+            };
+        }
+
         // A PENDING provider payout is a reservation, not realized economics.
         // Keep the principal in master crypto, but defer referral rewards,
         // platform fee recognition and profit logs until provider SUCCESS.
@@ -175,7 +191,15 @@ const processFiatWithdrawal = async (prisma, userId, amountFloat, opts = {}) => 
                     rateAsOf,
                     ratePair: 'USDC/GHS',
                     settlementCurrency: 'USDC',
-                    displayCurrency: 'GHS'
+                    displayCurrency: 'GHS',
+                    azmFeeDiscount: azmFeeDiscount
+                        ? {
+                            tierId: azmFeeDiscount.tierId,
+                            discount: azmFeeDiscount.discount,
+                            azmSpent: azmFeeDiscount.azmSpent,
+                            dedupKey: `fee_discount_${reference}`
+                        }
+                        : null
                 }
             }
         });
@@ -193,7 +217,8 @@ const processFiatWithdrawal = async (prisma, userId, amountFloat, opts = {}) => 
             profitFees,
             fiatPool: updatedFiatPool,
             masterCrypto,
-            newUserBalance: updatedUser.availableBalance
+            newUserBalance: updatedUser.availableBalance,
+            azmFeeDiscount
         };
     });
 
@@ -219,7 +244,8 @@ const processFiatWithdrawal = async (prisma, userId, amountFloat, opts = {}) => 
         arbitrageCapture: amountFloat,
         transaction: result.txRecord,
         fiatPoolLow: result.fiatPool.balance < FIAT_POOL_ALERT_THRESH,
-        fiatPoolBalance: result.fiatPool.balance
+        fiatPoolBalance: result.fiatPool.balance,
+        azmFeeDiscount: result.azmFeeDiscount
     };
 };
 
@@ -392,13 +418,68 @@ const reverseFiatWithdrawal = async (prisma, reference, opts = {}) => {
             data: { balance: { increment: amountFloat } }
         });
 
+        // P0: restore the AZM fee-discount spend INSIDE this same reversal
+        // transaction. The PENDING -> FAILED claim above is the one-winner
+        // gate, so only this transaction may restore AZM. The spend log is
+        // found by its deterministic dedup identity (never a fresh refund
+        // guess), and the metadata.reversedAt marker makes the restore
+        // idempotent. No negative AzmSpendLog rows are ever created.
+        let azmFeeDiscount = null;
+        const feeDiscountSpend = await tx.azmSpendLog.findFirst({
+            where: {
+                userId,
+                source: AZM_SPEND_SOURCES.FEE_DISCOUNT,
+                metadata: { path: ['dedupKey'], equals: `fee_discount_${reference}` }
+            },
+            orderBy: { createdAt: 'asc' }
+        });
+
+        if (feeDiscountSpend) {
+            const spendMeta = feeDiscountSpend.metadata || {};
+            if (!spendMeta.reversedAt) {
+                const restored = await tx.user.update({
+                    where: { id: userId },
+                    data: { azmBalance: { increment: feeDiscountSpend.amount } },
+                    select: { azmBalance: true }
+                });
+                await tx.azmSpendLog.update({
+                    where: { id: feeDiscountSpend.id },
+                    data: {
+                        metadata: {
+                            ...spendMeta,
+                            reversedAt: new Date().toISOString(),
+                            reversalReference: reference
+                        }
+                    }
+                });
+                azmFeeDiscount = {
+                    restored: true,
+                    amount: Number(feeDiscountSpend.amount),
+                    newAzmBalance: restored.azmBalance,
+                    logId: feeDiscountSpend.id
+                };
+            } else {
+                azmFeeDiscount = {
+                    restored: false,
+                    alreadyReversed: true,
+                    amount: Number(feeDiscountSpend.amount),
+                    logId: feeDiscountSpend.id
+                };
+            }
+        } else if (_isDeferredWithdrawal(original) && original.metadata?.azmFeeDiscount) {
+            // The withdrawal claims a fee discount but its AZM spend log is
+            // missing. NEVER fabricate a refund — surface the anomaly so
+            // reconciliation can see it.
+            azmFeeDiscount = { restored: false, missing: true };
+        }
+
         const [profitFees, updatedFiatPool, masterCrypto, user] = await Promise.all([
             tx.systemProfitFees.findUnique({ where: { id: 1 } }),
             tx.systemFiatPool.findUnique({ where: { id: 1 } }),
             tx.systemMasterCrypto.findUnique({ where: { id: 1 } }),
             tx.user.findUnique({ where: { id: userId }, select: { availableBalance: true } })
         ]);
-        return { alreadyReversed: false, profitFees, fiatPool: updatedFiatPool, masterCrypto, user };
+        return { alreadyReversed: false, profitFees, fiatPool: updatedFiatPool, masterCrypto, user, azmFeeDiscount };
     });
 
     if (result.alreadyReversed) return { reference, alreadyReversed: true };
@@ -412,6 +493,7 @@ const reverseFiatWithdrawal = async (prisma, reference, opts = {}) => {
         systemFiatPool: result.fiatPool.balance,
         systemMasterCrypto: result.masterCrypto.balance,
         unwoundCapture: amountFloat,
+        azmFeeDiscount: result.azmFeeDiscount,
         reason: opts.reason || null
     };
 };

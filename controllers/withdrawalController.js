@@ -22,6 +22,7 @@ const { runDoubleCheck }      = require('../utils/securityCheck');
 const axios                   = require('axios');
 const { randomUUID }          = require('crypto');
 const { audit }               = require('../utils/audit');
+const { FEE_DISCOUNT_TIERS } = require('../services/azmSpendService');
 
 const POLYGON_GAS_FEE_MATIC   = 0.05;  // V2 Blueprint: 100% of network gas is borne by user
 const FIAT_POOL_ALERT_THRESH  = financeService.FIAT_POOL_ALERT_THRESH;
@@ -112,28 +113,33 @@ exports.fiatWithdrawal = async (req, res) => {
         } catch (_) { /* non-fatal — receipt simply won't fire */ }
 
         // Step 1 — Debit user + ledger writes (ACID).
-        // Phase E2: If user opts to spend AZM for a fee discount, apply it
-        // BEFORE the withdrawal so the reduced fee is used in settlement.
-        let feeDiscountMultiplier = 0;
+        // P0 financial integrity: if the user opts to spend AZM for a fee
+        // discount, the AZM debit now runs INSIDE the canonical withdrawal
+        // transaction (via the reservation callback below) on the same tx as
+        // the fiat pool reservation, the USDC debit and the TransactionHistory
+        // row. A failed reservation can therefore never leave a committed AZM
+        // spend behind, and a provider reversal restores it exactly once.
+        let feeDiscountTier = null;
         const feeDiscountTierId = req.body.feeDiscountTierId; // optional: 'tier_25' | 'tier_50' | 'tier_100'
+        const azmSpendService = req.app.get('azmSpendService');
         if (feeDiscountTierId) {
-            const azmSpendService = req.app.get('azmSpendService');
-            if (azmSpendService) {
-                try {
-                    const discountResult = await azmSpendService.applyFeeDiscount(
-                        userId,
-                        feeDiscountTierId,
-                        reference
-                    );
-                    feeDiscountMultiplier = discountResult.discount;
-                } catch (azmErr) {
-                    // AZM spend failed (insufficient balance or invalid tier)
-                    return res.status(400).json({
-                        success: false,
-                        code: 'AZM_SPEND_FAILED',
-                        message: azmErr.message
-                    });
-                }
+            if (!azmSpendService) {
+                return res.status(400).json({
+                    success: false,
+                    code: 'AZM_SPEND_FAILED',
+                    message: 'Fee discounts are temporarily unavailable.'
+                });
+            }
+            // Validate the tier against the existing catalog BEFORE entering
+            // the transaction. The catalog stays the single source of truth;
+            // the client-supplied multiplier is never trusted as authority.
+            feeDiscountTier = FEE_DISCOUNT_TIERS.find(t => t.id === feeDiscountTierId) || null;
+            if (!feeDiscountTier) {
+                return res.status(400).json({
+                    success: false,
+                    code: 'AZM_SPEND_FAILED',
+                    message: `Invalid fee discount tier: ${feeDiscountTierId}`
+                });
             }
         }
 
@@ -141,8 +147,28 @@ exports.fiatWithdrawal = async (req, res) => {
             prisma,
             userId,
             parseFloat(amount),
-            { reference, feeDiscountMultiplier }
+            {
+                reference,
+                feeDiscountMultiplier: feeDiscountTier?.discount || 0,
+                reserveFeeDiscountInTransaction: feeDiscountTier && azmSpendService
+                    ? (tx) => azmSpendService.applyFeeDiscountInTransaction(
+                        tx, userId, feeDiscountTierId, reference
+                    )
+                    : null
+            }
         );
+
+        // P0: emit the AZM spend realtime update exactly once, POST-COMMIT.
+        // The debit already committed inside the withdrawal transaction, so
+        // this event can never surface for a rolled-back withdrawal.
+        if (data.azmFeeDiscount?.debited && azmSpendService) {
+            azmSpendService.emitFeeDiscountSpend(
+                userId,
+                data.azmFeeDiscount.newBalance,
+                data.azmFeeDiscount.azmSpent,
+                `${feeDiscountTier.label} fee discount on withdrawal (-${feeDiscountTier.cost} AZM)`
+            );
+        }
 
         // Real-time balance push — user's UI updates while MTN settles async.
         if (emitBalanceUpdate) await emitBalanceUpdate(userId);
@@ -406,6 +432,17 @@ exports.fiatWithdrawal = async (req, res) => {
                 success: false,
                 message: 'Withdrawal frozen: Ledger inconsistency detected. Your request has been flagged for review.',
                 data:    { status: 'FROZEN_DISPUTE' }
+            });
+        }
+
+        // P0: the AZM fee-discount debit now runs inside the withdrawal
+        // transaction — surface insufficient-AZM failures with the same
+        // AZM_SPEND_FAILED contract the FE already handles.
+        if (error.code === 'AZM_SPEND_FAILED') {
+            return res.status(400).json({
+                success: false,
+                code: 'AZM_SPEND_FAILED',
+                message: error.message
             });
         }
 

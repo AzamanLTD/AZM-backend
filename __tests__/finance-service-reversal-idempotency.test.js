@@ -58,6 +58,10 @@ describe('finance reversal and crypto deposit idempotency', () => {
         create: jest.fn(),
         deleteMany: jest.fn(),
       },
+      azmSpendLog: {
+        findFirst: jest.fn().mockResolvedValue(null),
+        update: jest.fn(),
+      },
     };
 
     const prisma = {
