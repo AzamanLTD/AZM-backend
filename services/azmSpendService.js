@@ -129,13 +129,26 @@ class AzmSpendService {
             throw new Error('Invalid spend parameters.');
         }
 
-        // Idempotency check (source + dedupKey => this spend already happened)
+        // Idempotency fast path (source + dedupKey => this spend already
+        // happened). NOTE: this pre-check is an optimization, NOT the
+        // concurrency gate — two racing requests can both miss it. The actual
+        // gate is the DB-level @@unique([userId, source, dedupKey]) on
+        // AzmSpendLog: a racing duplicate log insert fails the unique index and
+        // the WHOLE enclosing transaction (balance decrement included) rolls
+        // back. debitAzm() converges the resulting P2002 to the idempotent
+        // result; inside a caller-owned transaction (e.g.
+        // applyFeeDiscountInTransaction) the P2002 aborts the outer
+        // transaction, which is the safe outcome — the caller's own
+        // idempotency layer decides the retry.
         if (dedupKey) {
             const existing = await tx.azmSpendLog.findFirst({
                 where: {
                     userId,
                     source,
-                    metadata: { path: ['dedupKey'], equals: dedupKey }
+                    OR: [
+                        { dedupKey },
+                        { metadata: { path: ['dedupKey'], equals: dedupKey } }
+                    ]
                 }
             });
             if (existing) {
@@ -167,6 +180,9 @@ class AzmSpendService {
                 amount,
                 source,
                 reason,
+                // Dedicated column claims the dedup identity (DB unique gate);
+                // metadata keeps the legacy mirror for backward compatibility.
+                dedupKey,
                 metadata: dedupKey ? { ...metadata, dedupKey } : metadata,
                 balanceAfter: updatedUser.azmBalance
             }
@@ -181,9 +197,34 @@ class AzmSpendService {
      * _debitAzmWithClient primitive so all AZM debits share one pipeline.
      */
     async debitAzm({ userId, amount, source, reason, metadata = null, dedupKey = null }) {
-        const result = await this.prisma.$transaction(async (tx) =>
-            this._debitAzmWithClient(tx, { userId, amount, source, reason, metadata, dedupKey })
-        );
+        let result;
+        try {
+            result = await this.prisma.$transaction(async (tx) =>
+                this._debitAzmWithClient(tx, { userId, amount, source, reason, metadata, dedupKey })
+            );
+        } catch (err) {
+            // Concurrency gate tripped: this racing request LOST the DB unique
+            // race, so the transaction — balance decrement included — rolled
+            // back. Converge to the exact idempotent result a sequential replay
+            // would have returned; a raw P2002 never surfaces to clients, and
+            // azm_spend is never emitted for a losing/replay call.
+            if (dedupKey && err?.code === 'P2002') {
+                const winner = await this.prisma.azmSpendLog.findFirst({
+                    where: {
+                        userId,
+                        source,
+                        OR: [
+                            { dedupKey },
+                            { metadata: { path: ['dedupKey'], equals: dedupKey } }
+                        ]
+                    }
+                });
+                if (winner) {
+                    return { debited: false, newBalance: winner.balanceAfter, logId: winner.id };
+                }
+            }
+            throw err;
+        }
 
         // Emit socket event for real-time FE update (post-commit only)
         if (result.debited) {

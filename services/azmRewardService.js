@@ -89,13 +89,22 @@ class AzmRewardService {
                 return { credited: false, newBalance: 0, logId: null };
             }
 
-            // Idempotency check: prevent double-crediting for the same event
+            // Idempotency fast path: prevent double-crediting for the same event.
+            // NOTE: this pre-check is an optimization, NOT the concurrency gate —
+            // two racing requests can both miss it. The actual gate is the DB-level
+            // @@unique([userId, source, dedupKey]) on AzmRewardLog: a racing
+            // duplicate log insert fails the unique index and the WHOLE enclosing
+            // transaction (balance increment included) rolls back; the P2002 is
+            // converged to the idempotent result in the catch below.
             if (dedupKey) {
                 const existing = await this.prisma.azmRewardLog.findFirst({
                     where: {
                         userId,
                         source,
-                        metadata: { path: ['dedupKey'], equals: dedupKey }
+                        OR: [
+                            { dedupKey },
+                            { metadata: { path: ['dedupKey'], equals: dedupKey } }
+                        ]
                     }
                 });
                 if (existing) {
@@ -117,6 +126,10 @@ class AzmRewardService {
                         amount,
                         source,
                         reason,
+                        // Dedicated column claims the dedup identity (DB unique
+                        // gate); metadata keeps the legacy mirror for backward
+                        // compatibility with anything still reading metadata.
+                        dedupKey,
                         metadata: dedupKey
                             ? { ...metadata, dedupKey }
                             : metadata,
@@ -132,6 +145,27 @@ class AzmRewardService {
 
             return { credited: true, ...result };
         } catch (err) {
+            // Concurrency gate tripped: this racing request LOST the DB unique
+            // race, so its transaction — balance increment included — rolled
+            // back. Converge to the exact idempotent result a sequential replay
+            // of the same call would have returned; a raw P2002 never surfaces
+            // to clients, and balance_update is never emitted for a
+            // losing/replay call.
+            if (dedupKey && err?.code === 'P2002') {
+                const winner = await this.prisma.azmRewardLog.findFirst({
+                    where: {
+                        userId,
+                        source,
+                        OR: [
+                            { dedupKey },
+                            { metadata: { path: ['dedupKey'], equals: dedupKey } }
+                        ]
+                    }
+                });
+                if (winner) {
+                    return { credited: false, newBalance: winner.balanceAfter, logId: winner.id };
+                }
+            }
             logger.error(`[AzmRewardService.creditAzm] userId=${userId} source=${source} error:`, err.message);
             return { credited: false, newBalance: 0, logId: null };
         }
