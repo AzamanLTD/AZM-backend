@@ -221,27 +221,114 @@ class AzmAuctionService {
                 const locked = await tx.azmAuction.findUnique({ where: { id: auctionId } });
                 const winnerCount = locked.winnerCount || DEFAULT_WINNER_COUNT;
 
+                // Legacy-crash recovery inputs. The pre-#255 implementation
+                // committed per-winner state (spend log + WON bid + boosted
+                // ad) BEFORE the auction itself was marked SETTLED, so a
+                // committed SETTLING row can contain already-committed WON
+                // winners. Those winners keep their committed ranks and are
+                // never reburned; the remaining slots are filled from the
+                // same deterministic ranking an uninterrupted settlement
+                // would have produced.
+                const committedBids = await tx.azmAuctionBid.findMany({
+                    where: { auctionId, status: 'WON' },
+                });
+                if (committedBids.length > winnerCount) {
+                    throw new Error(
+                        `Legacy debris on auction ${auctionId}: ${committedBids.length} committed WON bids exceed winnerCount ${winnerCount} — refusing to invent a settlement`
+                    );
+                }
+                const committed = [];
+                const committedRanks = new Set();
+                for (const bid of committedBids) {
+                    // Robustness rule: a WON legacy bid is a financially
+                    // committed winner ONLY when its deterministic
+                    // AD_AUCTION_BID spend identity exists. If the invariant
+                    // cannot be established safely, fail closed rather than
+                    // inventing a burn or a winner.
+                    const log = await tx.azmSpendLog.findFirst({
+                        where: {
+                            userId: bid.vendorId,
+                            source: 'AD_AUCTION_BID',
+                            OR: [
+                                { dedupKey: `auction-win-${auctionId}-${bid.vendorId}` },
+                                { metadata: { path: ['dedupKey'], equals: `auction-win-${auctionId}-${bid.vendorId}` } },
+                            ],
+                        },
+                    });
+                    if (!log) {
+                        throw new Error(
+                            `Legacy WON bid ${bid.id} on auction ${auctionId} has no committed auction-win spend identity — refusing to invent a burn`
+                        );
+                    }
+                    const rank = Number(bid.rank);
+                    if (!Number.isInteger(rank) || rank < 1 || rank > winnerCount || committedRanks.has(rank)) {
+                        throw new Error(
+                            `Legacy WON bid ${bid.id} on auction ${auctionId} has no establishable rank — refusing to invent a ranking`
+                        );
+                    }
+                    committedRanks.add(rank);
+                    // Exactly-once notifications: the pre-#255 code
+                    // notified each winner at its own commit, so a
+                    // committed winner may already hold its "Auction Won"
+                    // notification; recovery must not duplicate it.
+                    const alreadyNotified = await tx.notification.findFirst({
+                        where: {
+                            userId: bid.vendorId,
+                            category: 'AUCTION',
+                            AND: [
+                                { actionPayload: { path: ['auctionId'], equals: auctionId } },
+                                { actionPayload: { path: ['adId'], equals: bid.adId } },
+                            ],
+                        },
+                    });
+                    committed.push({ bid, log, rank, notified: Boolean(alreadyNotified) });
+                }
+
                 // Authoritative winner selection INSIDE the transaction.
-                const top = await tx.azmAuctionBid.findMany({
+                // Committed winners occupy their original ranks; only the
+                // remaining slots are filled, from the deterministic
+                // original ranking order — a recovery can therefore never
+                // produce more than winnerCount total winners.
+                const candidates = await tx.azmAuctionBid.findMany({
                     where: { auctionId, status: 'ACTIVE' },
                     orderBy: [{ bidAmountAzm: 'desc' }, { createdAt: 'asc' }],
-                    take: winnerCount,
                 });
-                const losers = await tx.azmAuctionBid.findMany({
-                    where: {
-                        auctionId,
-                        status: 'ACTIVE',
-                        NOT: { id: { in: top.map((b) => b.id) } },
-                    },
-                });
+                const freeRanks = [];
+                for (let r = 1; r <= winnerCount; r++) if (!committedRanks.has(r)) freeRanks.push(r);
+                const selected = candidates.slice(0, freeRanks.length);
+                const losers = candidates.slice(freeRanks.length);
+
+                // Fail closed on inconsistent debris: an ACTIVE bid whose
+                // auction-win spend identity already exists but which does
+                // NOT make the recovered winner set would be marked LOST
+                // while its AZM already left the balance — refuse.
+                if (losers.length > 0) {
+                    const loserKeys = losers.map((b) => `auction-win-${auctionId}-${b.vendorId}`);
+                    const burnedLosers = await tx.azmSpendLog.findMany({
+                        where: { source: 'AD_AUCTION_BID', dedupKey: { in: loserKeys } },
+                        select: { dedupKey: true },
+                    });
+                    if (burnedLosers.length > 0) {
+                        throw new Error(
+                            `Legacy auction ${auctionId} has burned non-winner bids (${burnedLosers.map((l) => l.dedupKey).join(', ')}) — refusing to settle inconsistently`
+                        );
+                    }
+                }
 
                 const settledAt = new Date();
                 const boostUntil = new Date(settledAt.getTime() + WINDOW_MS);
                 let totalBurned = new Prisma.Decimal(0);
 
-                for (let i = 0; i < top.length; i++) {
-                    const winner = top[i];
-                    const rank = i + 1;
+                // Already-committed winners: never reburned, never re-ranked,
+                // but their committed burn still counts toward totalAzmBurned.
+                for (const c of committed) {
+                    totalBurned = totalBurned.plus(c.log.amount);
+                }
+
+                const newWinners = [];
+                for (let i = 0; i < selected.length; i++) {
+                    const winner = selected[i];
+                    const rank = freeRanks[i];
 
                     // Financial mutation FIRST, via the single AZM spend
                     // authority, transaction-scoped. The deterministic
@@ -249,8 +336,10 @@ class AzmAuctionService {
                     // PR #254's unique invariant. A debit failure (e.g.
                     // insufficient balance) aborts the WHOLE settlement —
                     // fail-closed: no WON bid, no boost, no burn, auction
-                    // left OPEN and retryable.
-                    const debit = await this.azmSpendService._debitAzmWithClient(tx, {
+                    // left retryable. A replay (the spend identity was
+                    // already committed inside the legacy crash window)
+                    // stays burn-free but still reconciles into WON.
+                    await this.azmSpendService._debitAzmWithClient(tx, {
                         userId: winner.vendorId,
                         amount: Number(winner.bidAmountAzm),
                         source: 'AD_AUCTION_BID',
@@ -278,10 +367,12 @@ class AzmAuctionService {
                         },
                     });
 
-                    // Count actual committed debits only (no reburn on replay).
-                    if (debit.debited) {
-                        totalBurned = totalBurned.plus(winner.bidAmountAzm);
-                    }
+                    // The winner's debit counts toward totalAzmBurned whether
+                    // it just committed (debited) or was already committed by
+                    // the legacy crash window (replay) — exactly-once either
+                    // way via the unique spend identity, never double-counted.
+                    totalBurned = totalBurned.plus(winner.bidAmountAzm);
+                    newWinners.push({ bid: winner, rank });
                 }
 
                 if (losers.length > 0) {
@@ -291,12 +382,20 @@ class AzmAuctionService {
                     });
                 }
 
-                const leaderboard = top.map((b, i) => ({
-                    rank: i + 1,
-                    vendorId: b.vendorId,
-                    adId: b.adId,
-                    bidAmountAzm: Number(b.bidAmountAzm),
-                }));
+                const leaderboard = [
+                    ...committed.map((c) => ({
+                        rank: c.rank,
+                        vendorId: c.bid.vendorId,
+                        adId: c.bid.adId,
+                        bidAmountAzm: Number(c.bid.bidAmountAzm),
+                    })),
+                    ...newWinners.map((w) => ({
+                        rank: w.rank,
+                        vendorId: w.bid.vendorId,
+                        adId: w.bid.adId,
+                        bidAmountAzm: Number(w.bid.bidAmountAzm),
+                    })),
+                ].sort((a, b) => a.rank - b.rank);
 
                 // Terminal state in the SAME transaction.
                 await tx.azmAuction.update({
@@ -311,6 +410,25 @@ class AzmAuctionService {
 
                 return {
                     winners: leaderboard,
+                    // Exactly-once notification set: newly committed winners
+                    // always notify; committed legacy winners only if the
+                    // pre-#255 crash window closed before their notification.
+                    winnersToNotify: [
+                        ...newWinners.map((w) => ({
+                            vendorId: w.bid.vendorId,
+                            adId: w.bid.adId,
+                            rank: w.rank,
+                            bidAmountAzm: Number(w.bid.bidAmountAzm),
+                        })),
+                        ...committed
+                            .filter((c) => !c.notified)
+                            .map((c) => ({
+                                vendorId: c.bid.vendorId,
+                                adId: c.bid.adId,
+                                rank: c.rank,
+                                bidAmountAzm: Number(c.bid.bidAmountAzm),
+                            })),
+                    ],
                     losers: losers.map((l) => l.vendorId),
                     totalBurned,
                 };
@@ -331,7 +449,7 @@ class AzmAuctionService {
         const notify = (userId, title, body, actionPayload) =>
             this.notificationService?.sendNotification({ userId, title, body, category: 'AUCTION', actionPayload })
                 .catch(() => {});
-        for (const w of outcome.winners) {
+        for (const w of outcome.winnersToNotify) {
             notify(
                 w.vendorId,
                 `🎯 Auction Won — Rank ${w.rank}`,
