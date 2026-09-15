@@ -8,6 +8,10 @@
 //   • non-monetary actions (USER_BAN, VENDOR_TIER_CHANGE) can never
 //     auto-approve; genuinely sub-$1k monetary requests still can
 //   • requiredRoles tier enforcement + >= $50k Finance/Compliance invariant
+//   • COMPLIANCE_ADMIN holds withdrawals.approve: it can create, approve
+//     (>= $10k tiers per the catalog + tier gates), open the >= $50k chain
+//     satisfying the Finance-or-Compliance invariant, and reject WITHDRAWAL
+//     requests — the catalog and the declared tier policy now agree
 //   • self-approval and duplicate-approval prohibitions intact
 //   • compare-and-swap approval writes and atomic rejects return
 //     deterministic 409 conflicts instead of losing updates
@@ -168,6 +172,20 @@ describe('Admin RBAC — action-specific permission enforcement', () => {
         expect(db.rows.size).toBe(1);
     });
 
+    test('COMPLIANCE_ADMIN can create a WITHDRAWAL approval (catalog holds withdrawals.approve)', async () => {
+        const db = makeMockDb();
+        const r = makeRes();
+        await ctrl.createApprovalRequest(
+            makeReq({ user: users.compliance, body: { type: 'WITHDRAWAL', entityId: 'w1', amount: 60000 }, db }),
+            r
+        );
+        expect(r._status).toBe(200);
+        expect(r._body.success).toBe(true);
+        expect(db.rows.size).toBe(1);
+        expect(r._body.request.type).toBe('WITHDRAWAL');
+        expect(r._body.request.requiredApprovals).toBe(3);
+    });
+
     test('SUPPORT_ADMIN can create a USER_BAN approval', async () => {
         const db = makeMockDb();
         const r = makeRes();
@@ -189,6 +207,19 @@ describe('Admin RBAC — action-specific permission enforcement', () => {
         expect(r._status).toBe(403);
         expect(r._body.message).toContain('not authorized to approve this action type');
         expect(db.rows.get(10).status).toBe('PENDING');
+    });
+
+    test('COMPLIANCE_ADMIN can reject a WITHDRAWAL request (rejection authority matches approval authority)', async () => {
+        const db = makeMockDb([seedRequest({ type: 'WITHDRAWAL', amount: 20000, requestedBy: users.finance.id })]);
+        const r = makeRes();
+        await ctrl.rejectRequest(
+            makeReq({ user: users.compliance, params: { id: '10' }, body: { reason: 'compliance hold' }, db }),
+            r
+        );
+        expect(r._status).toBe(200);
+        expect(db.rows.get(10).status).toBe('REJECTED');
+        expect(db.rows.get(10).rejectedBy).toBe(users.compliance.id);
+        expect(db.rows.get(10).rejectionReason).toBe('compliance hold');
     });
 
     test('FINANCE_ADMIN cannot approve or reject a USER_BAN request (no users.ban permission)', async () => {
@@ -361,12 +392,16 @@ describe('Admin RBAC — requiredRoles tier enforcement', () => {
     test.each([
         ['FINANCE_ADMIN', users.finance],
         ['SUPER_ADMIN', users.superAdmin],
+        ['COMPLIANCE_ADMIN', users.compliance],
     ])('$10k+ approval accepts %s end-to-end', async (_label, user) => {
         const db = makeMockDb([seedRequest({ amount: 20000, requiredApprovals: 2, requestedBy: users.legacyAdmin.id })]);
         const r = makeRes();
         await ctrl.approveRequest(makeReq({ user, params: { id: '10' }, db }), r);
         expect(r._status).toBe(200);
         expect(db.rows.get(10).status).toBe('PENDING'); // 1 of 2 recorded
+        expect(db.rows.get(10).approvals).toEqual([
+            expect.objectContaining({ userId: user.id, role: user.role }),
+        ]);
     });
 
     test('$50k+ cannot be fully approved by SUPER_ADMINs alone — needs Finance/Compliance', async () => {
@@ -397,15 +432,33 @@ describe('Admin RBAC — requiredRoles tier enforcement', () => {
         expect(a4._body.fullyApproved).toBe(true);
         expect(db.rows.get(10).status).toBe('APPROVED');
         expect(db.rows.get(10).approvals).toHaveLength(3);
-        // NOTE: COMPLIANCE_ADMIN tier acceptance is covered by the
-        // isApprovalRoleEligible unit test above. End-to-end, COMPLIANCE_ADMIN
-        // is additionally governed by the action-permission gate (section 9):
-        // its catalog holds no mapped action permission (e.g. no
-        // withdrawals.approve), so it cannot approve a WITHDRAWAL request as
-        // things stand. That tension between the section-9 gate and the
-        // >= $50k Finance/Compliance participation invariant is flagged for
-        // the primary agent — FINANCE_ADMIN satisfies the invariant in
-        // practice for every current action type.
+    });
+
+    test('$50k+ can be OPENED by COMPLIANCE_ADMIN — the invariant is genuinely satisfiable by Compliance', async () => {
+        const db = makeMockDb([seedRequest({ amount: 60000, requiredApprovals: 3, requestedBy: users.legacyAdmin.id })]);
+
+        // COMPLIANCE_ADMIN holds withdrawals.approve and satisfies the
+        // Finance-or-Compliance participation invariant as the FIRST approver.
+        const a1 = makeRes();
+        await ctrl.approveRequest(makeReq({ user: users.compliance, params: { id: '10' }, db }), a1);
+        expect(a1._status).toBe(200);
+        expect(a1._body.message).toContain('2 more needed');
+        expect(db.rows.get(10).approvals).toEqual([
+            expect.objectContaining({ userId: users.compliance.id, role: 'COMPLIANCE_ADMIN' }),
+        ]);
+
+        // With Compliance present, SUPER_ADMINs can complete the chain.
+        const a2 = makeRes();
+        await ctrl.approveRequest(makeReq({ user: { id: 8, role: 'SUPER_ADMIN' }, params: { id: '10' }, db }), a2);
+        expect(a2._status).toBe(200);
+
+        const a3 = makeRes();
+        await ctrl.approveRequest(makeReq({ user: { id: 9, role: 'SUPER_ADMIN' }, params: { id: '10' }, db }), a3);
+        expect(a3._status).toBe(200);
+        expect(a3._body.fullyApproved).toBe(true);
+        expect(db.rows.get(10).status).toBe('APPROVED');
+        expect(db.rows.get(10).approvals).toHaveLength(3);
+        expect(db.rows.get(10).approvals[0].role).toBe('COMPLIANCE_ADMIN');
     });
 
     test('duplicate approval by the same admin is still rejected', async () => {
@@ -702,6 +755,68 @@ describeOrSkip('Admin RBAC — real-DB concurrency (compare-and-swap)', () => {
             expect(row.status).toBe('REJECTED');
             expect(approveRes._body.code).toBe('APPROVAL_CONFLICT');
         }
+    });
+
+    test('compliance + finance concurrent approvals on a $60k withdrawal complete via CAS (22)', async () => {
+        const requester = await seedUser(prisma);
+        const comp = await seedUser(prisma);
+        const fin = await seedUser(prisma);
+        const sup = await seedUser(prisma);
+
+        const request = await seedPendingRequest(requester.id, { amount: 60000, requiredApprovals: 3 });
+
+        // COMPLIANCE_ADMIN and FINANCE_ADMIN approve the >= $50k request
+        // concurrently. Both hold withdrawals.approve and both satisfy the
+        // Finance-or-Compliance participation invariant, so whichever CAS
+        // interleaving occurs, the stored chain keeps exactly the approvals
+        // that actually won.
+        const [r1, r2] = await Promise.all([
+            ctrl.approveRequest(
+                { user: { id: comp.id, role: 'COMPLIANCE_ADMIN' }, params: { id: String(request.id) }, body: {}, app: app() },
+                res()
+            ),
+            ctrl.approveRequest(
+                { user: { id: fin.id, role: 'FINANCE_ADMIN' }, params: { id: String(request.id) }, body: {}, app: app() },
+                res()
+            ),
+        ]);
+
+        const statuses = [r1._status, r2._status].sort();
+        expect([statuses[0], statuses[1]]).toContain(200);
+
+        if (statuses.includes(409)) {
+            const loser = r1._status === 409 ? r1 : r2;
+            expect(loser._body.code).toBe('APPROVAL_CONFLICT');
+            const retryUser = r1._status === 409
+                ? { id: comp.id, role: 'COMPLIANCE_ADMIN' }
+                : { id: fin.id, role: 'FINANCE_ADMIN' };
+            const r3 = res();
+            await ctrl.approveRequest({ user: retryUser, params: { id: String(request.id) }, body: {}, app: app() }, r3);
+            expect(r3._status).toBe(200);
+            expect(r3._body.fullyApproved).toBe(false);
+        } else {
+            expect(statuses).toEqual([200, 200]);
+        }
+
+        const mid = await prisma.adminApprovalRequest.findUnique({ where: { id: request.id } });
+        expect(mid.approvals).toHaveLength(2);
+        expect(mid.status).toBe('PENDING');
+
+        // With Finance/Compliance participation stored, a SUPER_ADMIN completes
+        // the 3-approval chain.
+        const r4 = res();
+        await ctrl.approveRequest(
+            { user: { id: sup.id, role: 'SUPER_ADMIN' }, params: { id: String(request.id) }, body: {}, app: app() },
+            r4
+        );
+        expect(r4._status).toBe(200);
+        expect(r4._body.fullyApproved).toBe(true);
+
+        const row = await prisma.adminApprovalRequest.findUnique({ where: { id: request.id } });
+        expect(row.status).toBe('APPROVED');
+        expect(row.approvals).toHaveLength(3);
+        const storedRoles = row.approvals.map((a) => a.role).sort();
+        expect(storedRoles).toEqual(['COMPLIANCE_ADMIN', 'FINANCE_ADMIN', 'SUPER_ADMIN']);
     });
 
     test('concurrent rejects produce exactly one REJECTED mutation (21)', async () => {
