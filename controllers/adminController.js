@@ -721,7 +721,8 @@ exports.liquidateProfits = async (req, res) => {
         const data = await financeService.liquidateProfits(
             prisma,
             parseFloat(amountUsdc),
-            req.user.id
+            req.user.id,
+            { actorId: req.user.id, actorName: req.user.username, ipAddress: req.ip }
         );
 
         try {
@@ -735,14 +736,6 @@ exports.liquidateProfits = async (req, res) => {
         } catch (socketErr) {
             logger.error({ err: socketErr }, '[liquidateProfits] Failed to emit socket alert');
         }
-
-        // Append-only audit trail (fire-and-forget — never fails the request).
-        await audit(prisma, {
-            actorId: req.user.id, actorName: req.user.username,
-            action: 'LIQUIDATE_PROFITS', targetType: 'SYSTEM', targetId: null,
-            metadata: { amountUsdc: amountUsdc || null, amountLiquidated: data.amountLiquidated },
-            ipAddress: req.ip,
-        });
 
         return res.status(200).json({
             success: true,
