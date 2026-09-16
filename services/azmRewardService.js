@@ -53,6 +53,11 @@ const AZM_SOURCES = {
     VAULT_INTENSITY:      'VAULT_INTENSITY',
     VAULT_COMPLETION:     'VAULT_COMPLETION',
     SUSU_COMPLETION:      'SUSU_COMPLETION',
+    // Stake economic atomicity (2026-09-16): principal returned to azmBalance
+    // when a completed unstake releases the stake. dedupKey is the stake's
+    // own id — exactly-once release under the (userId, source, dedupKey)
+    // composite unique.
+    STAKE_RELEASE:        'STAKE_RELEASE',
 };
 
 class AzmRewardService {
