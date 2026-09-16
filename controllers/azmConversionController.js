@@ -129,52 +129,63 @@ async function convertAzmToUsdc(req, res) {
       });
     }
 
-    // Execute conversion atomically
+    // Execute conversion atomically.
+    //
+    // Authorization happens at the database boundary, not from pre-reads:
+    //   - the user's AZM debit is a CONDITIONAL mutation gated on
+    //     azmBalance >= amount; 0 affected rows means a concurrent request
+    //     already spent the AZM (or the user cannot afford it) and NOTHING
+    //     is written.
+    //   - the SystemProfitFees debit is a CONDITIONAL mutation gated on
+    //     balance >= usdcAmount; 0 affected rows is a pool shortage and the
+    //     whole transaction (debit included) rolls back — the pool can never
+    //     go negative and AZM is never burned for USDC that was not backed.
+    // The pre-transaction balance checks above are fast-path UX only; the
+    // conditional mutations below are the only authorization.
     const result = await prisma.$transaction(async (tx) => {
-      // 1. Debit AZM from user
-      const user = await tx.user.findUnique({
-        where: { id: userId },
-        select: { azmBalance: true, availableBalance: true, username: true },
-      });
-
-      if (!user) throw new Error('User not found.');
-
-      const azmBal = parseFloat(user.azmBalance.toString());
-      if (azmBal < amount) {
-        throw new Error('Insufficient AZM balance.');
-      }
-
-      const newAzmBalance = azmBal - amount;
-      const newUsdcBalance = parseFloat(user.availableBalance.toString()) + usdcAmount;
-
-      // Update user balances
-      await tx.user.update({
-        where: { id: userId },
+      // 1. Atomically debit AZM and credit USDC in ONE conditional mutation.
+      //    A read-then-decrement here would let two concurrent conversions
+      //    both pass the JS check and drive azmBalance negative.
+      const debited = await tx.user.updateMany({
+        where: { id: userId, azmBalance: { gte: amount } },
         data: {
           azmBalance: { decrement: amount },
           availableBalance: { increment: usdcAmount },
         },
       });
 
-      // 2. Debit SystemProfitFees
-      await tx.systemProfitFees.update({
-        where: { id: 1 },
+      if (debited.count === 0) {
+        const exists = await tx.user.findUnique({ where: { id: userId }, select: { id: true } });
+        if (!exists) throw new Error('User not found.');
+        throw new Error('Insufficient AZM balance.');
+      }
+
+      // 2. Debit SystemProfitFees under the same boundary gate.
+      const drained = await tx.systemProfitFees.updateMany({
+        where: { id: 1, balance: { gte: usdcAmount } },
         data: { balance: { decrement: usdcAmount } },
       });
 
-      // 3. Record AZM spend log
-      const spendLog = await tx.azmSpendLog.create({
-        data: {
-          userId,
-          amount,
-          reason: `Converted ${amount} AZM to ${usdcAmount.toFixed(4)} USDC`,
-          source: AZM_SPEND_SOURCES.AZM_CONVERSION || 'AZM_CONVERSION',
-          metadata: { conversion: true, usdcAmount, rate: rateInfo.rate },
-          balanceAfter: newAzmBalance,
-        },
-      });
+      if (drained.count === 0) {
+        // Typed error so the catch block preserves the existing 503 contract.
+        const err = new Error('Conversion pool temporarily insufficient.');
+        err.isPoolShortage = true;
+        throw err;
+      }
 
-      // 4. Record conversion log
+      // 3. Read the post-mutation state for evidence. This is NOT an
+      //    authorization read — the conditional mutations above already
+      //    committed the effect; these values are only what the logs
+      //    (balanceAfter, newAzmBalance, newUsdcBalance) record.
+      const user = await tx.user.findUnique({
+        where: { id: userId },
+        select: { azmBalance: true, availableBalance: true },
+      });
+      const newAzmBalance = parseFloat(user.azmBalance.toString());
+      const newUsdcBalance = parseFloat(user.availableBalance.toString());
+
+      // 4. Conversion log — created first so its row id is the stable
+      //    identity the spend-log dedup key below is derived from.
       const conversionLog = await tx.azmConversionLog.create({
         data: {
           userId,
@@ -188,7 +199,22 @@ async function convertAzmToUsdc(req, res) {
         },
       });
 
-      // 5. Record transaction history
+      // 5. Record AZM spend log — authoritative, exactly-once via the
+      //    (userId, source, dedupKey) DB uniqueness. A duplicate aborts the
+      //    whole transaction, rolling the debit and credit back with it.
+      const spendLog = await tx.azmSpendLog.create({
+        data: {
+          userId,
+          amount,
+          reason: `Converted ${amount} AZM to ${usdcAmount.toFixed(4)} USDC`,
+          source: AZM_SPEND_SOURCES.AZM_CONVERSION || 'AZM_CONVERSION',
+          metadata: { conversion: true, usdcAmount, rate: rateInfo.rate },
+          balanceAfter: newAzmBalance,
+          dedupKey: `azm_conversion_${conversionLog.id}`,
+        },
+      });
+
+      // 6. Record transaction history
       await tx.transactionHistory.create({
         data: {
           userId,
@@ -232,6 +258,16 @@ async function convertAzmToUsdc(req, res) {
     });
   } catch (err) {
     logger.error({ err: err }, '[azmConvert] error');
+    if (err.isPoolShortage) {
+      // Rolled back — re-read the (unchanged) pool for the response contract.
+      const pool = await prisma.systemProfitFees.findFirst({ where: { id: 1 } });
+      const poolBalance = parseFloat(pool?.balance?.toString() || '0');
+      return res.status(503).json({
+        success: false,
+        message: 'Conversion pool temporarily insufficient. Please try again later.',
+        poolAvailable: poolBalance.toFixed(2),
+      });
+    }
     if (err.message.includes('Insufficient AZM')) {
       return res.status(400).json({ success: false, message: err.message });
     }
