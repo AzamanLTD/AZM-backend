@@ -54,6 +54,11 @@ const AZM_SPEND_SOURCES = {
     CARD_SKIN: 'CARD_SKIN',
     GIFT_TIP: 'GIFT_TIP',
     AZM_CONVERSION: 'AZM_CONVERSION',
+    // Stake economic atomicity (2026-09-16): principal locked into a Nitro
+    // stake. The AZM leaves azmBalance and lives in the AzmStake row until
+    // the completed unstake releases it (source STAKE_RELEASE on the reward
+    // side). dedupKey is the stake's own id.
+    STAKE_LOCK:     'STAKE_LOCK',
 };
 
 // ── Fee discount tiers ───────────────────────────────────────────────────────

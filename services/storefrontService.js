@@ -498,7 +498,7 @@ async function listTemplates(prisma, category) {
  */
 async function checkEligibility(prisma, businessProfileId, userId) {
   const stakes = await prisma.azmStake.findMany({
-    where: { userId, status: 'ACTIVE' },
+    where: { userId, status: { in: ['ACTIVE', 'UNSTAKING'] } }, // UNSTAKING stakes still hold the locked principal until cooldown completes (stake atomicity, 2026-09-16)
   });
   const stakedBalance = stakes.reduce((sum, s) => sum + Number(s.amountAzm), 0);
 
@@ -748,7 +748,7 @@ async function validateNitroEligibility(prisma, businessProfileId, layoutJson, t
 
   // Get staked balance
   const stakes = await prisma.azmStake.findMany({
-    where: { userId: business.userId, status: 'ACTIVE' },
+    where: { userId: business.userId, status: { in: ['ACTIVE', 'UNSTAKING'] } }, // UNSTAKING stakes still hold the locked principal until cooldown completes (stake atomicity, 2026-09-16)
   });
   const stakedBalance = stakes.reduce((sum, s) => sum + Number(s.amountAzm), 0);
   const tier = getTierForStake(stakedBalance);
