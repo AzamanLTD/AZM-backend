@@ -35,9 +35,20 @@ class SusuWorker {
             // pre-Phase-3 GroupChat-keyed flow) keep using this worker.
             const due = await this.prisma.susuCycle.findMany({
                 where: {
-                    status: 'PENDING',
                     collectionDate: { lte: now },
                     susu: { contractVersion: null },
+                    OR: [
+                        // Fresh cycles awaiting their first collection tick.
+                        { status: 'PENDING' },
+                        // Cycles stranded in COLLECTING by a crashed tick —
+                        // processCycle's claim CAS re-claims them after the
+                        // 5-minute stall window, so a mid-flight crash can
+                        // no longer strand a cycle permanently.
+                        {
+                            status: 'COLLECTING',
+                            startedCollectingAt: { lte: new Date(now.getTime() - 5 * 60 * 1000) },
+                        },
+                    ],
                 },
                 take: 25,
                 orderBy: { collectionDate: 'asc' },
