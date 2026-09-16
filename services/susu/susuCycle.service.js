@@ -221,20 +221,21 @@ class SusuCycleService {
           });
           if (existing) return { idempotent: true };
 
-          const u = await tx.user.findUnique({
-            where: { id: member.userId },
-            select: { availableBalance: true },
-          });
-          const balance = new Prisma.Decimal(u.availableBalance);
-
           // ── Happy path — full deduction (Req 10.4). Available on every
           // tick: a member who tops up DURING the grace window funds the
           // cycle and avoids the hard default entirely.
-          if (balance.gte(contribution)) {
-            await tx.user.update({
-              where: { id: member.userId },
-              data: { availableBalance: { decrement: contribution } },
-            });
+          //
+          // Authoritative affordability at the database boundary: the
+          // conditional decrement only lands if the balance still covers
+          // the contribution at mutation time. A wallet spend racing
+          // between any earlier read and this statement loses the CAS and
+          // the member is treated as short — never as a stale-read debit
+          // that relies on a downstream CHECK-constraint abort.
+          const paid = await tx.user.updateMany({
+            where: { id: member.userId, availableBalance: { gte: contribution } },
+            data: { availableBalance: { decrement: contribution } },
+          });
+          if (paid.count === 1) {
             await tx.susuContribution.create({
               data: {
                 cycleId: cycle.id,
@@ -252,7 +253,7 @@ class SusuCycleService {
                 status: 'COMPLETED',
                 metadata: { cycleId: cycle.id, susuGroupId: susu.id },
               },
-            }).catch(() => {});
+            });
             return { paid: true };
           }
 
@@ -266,7 +267,20 @@ class SusuCycleService {
           // ── Grace expired → HARD DEFAULT. Seize available balance, route
           // per Req 11.3 (defaulter IS recipient → treasury), record the
           // contribution, flip to DEFAULTED, apply the 25% Voucher_Slash.
-          const seizable = balance;
+          //
+          // Authoritative seizure: row-lock the defaulter's wallet and
+          // take the balance that exists at seizure time. The lock makes
+          // "seize everything they have" a single atomic decision — a
+          // concurrent wallet spend either commits first (we seize what
+          // remains) or waits until after the seizure.
+          const [wallet] = await tx.$queryRaw`
+            SELECT "availableBalance" FROM "User"
+            WHERE "id" = ${member.userId}::int
+            FOR UPDATE
+          `;
+          const seizable = wallet
+            ? new Prisma.Decimal(wallet.availableBalance)
+            : new Prisma.Decimal(0);
           const shortfall = contribution.minus(seizable);
           const isSelfPayout = cycle.payoutUserId === member.userId;
           const seizureCreditUserId = isSelfPayout
@@ -290,7 +304,7 @@ class SusuCycleService {
                 status: 'COMPLETED',
                 metadata: { cycleId: cycle.id, susuGroupId: susu.id, creditedTo: seizureCreditUserId },
               },
-            }).catch(() => {});
+            });
           }
 
           await tx.susuContribution.create({
@@ -367,8 +381,16 @@ class SusuCycleService {
           }
         }
       } catch (err) {
-        logger.error(`[SusuCycleService] member ${member.id} cycle ${cycle.id} error:`, err.message);
-        continue;
+        // A member whose processing transaction failed is NOT accounted
+        // for on the cycle: no contribution row, no short flag, no
+        // default. Finalizing with an unaccounted member would silently
+        // drop them from the rotation (payout without their contribution
+        // and without a recorded default). Abort the tick instead: the
+        // cycle keeps its transient COLLECTING status, stall-recovery
+        // re-runs it idempotently, and the per-member idempotency guard
+        // makes the retry safe.
+        logger.error(`[SusuCycleService] member ${member.id} cycle ${cycle.id} failed; aborting tick for idempotent retry:`, err.message);
+        throw err;
       }
 
       // ── Circuit Breaker check (Req 11.9, Property 17) ─────────────────
