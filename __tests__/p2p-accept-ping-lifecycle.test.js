@@ -24,10 +24,10 @@ describeOrSkip('P2P accept-ping lifecycle integrity (real PostgreSQL)', () => {
 
     test('acceptPing tops up normally while the trade remains PENDING_PAYMENT', async () => {
         const vendor = await prisma.user.create({
-            data: { username: `ping_vendor_${Date.now()}`, email: `ping_vendor_${Date.now()}@test.local`, role: 'VENDOR', availableBalance: 100 }
+            data: { username: `ping_vendor_${Date.now()}`, email: `ping_vendor_${Date.now()}@test.local`, password: 'test_password', role: 'VENDOR', availableBalance: 100 }
         });
         const buyer = await prisma.user.create({
-            data: { username: `ping_buyer_${Date.now()}`, email: `ping_buyer_${Date.now()}@test.local`, role: 'USER' }
+            data: { username: `ping_buyer_${Date.now()}`, email: `ping_buyer_${Date.now()}@test.local`, password: 'test_password', role: 'USER' }
         });
         const trade = await prisma.trade.create({
             data: {
@@ -62,10 +62,10 @@ describeOrSkip('P2P accept-ping lifecycle integrity (real PostgreSQL)', () => {
 
     test('terminal transition that wins the trade lock prevents a late top-up', async () => {
         const vendor = await prisma.user.create({
-            data: { username: `ping_vendor_${Date.now()}`, email: `ping_vendor_${Date.now()}@test.local`, role: 'VENDOR', availableBalance: 100 }
+            data: { username: `ping_vendor_${Date.now()}`, email: `ping_vendor_${Date.now()}@test.local`, password: 'test_password', role: 'VENDOR', availableBalance: 100 }
         });
         const buyer = await prisma.user.create({
-            data: { username: `ping_buyer_${Date.now()}`, email: `ping_buyer_${Date.now()}@test.local`, role: 'USER' }
+            data: { username: `ping_buyer_${Date.now()}`, email: `ping_buyer_${Date.now()}@test.local`, password: 'test_password', role: 'USER' }
         });
         const trade = await prisma.trade.create({
             data: {
@@ -115,10 +115,10 @@ describeOrSkip('P2P accept-ping lifecycle integrity (real PostgreSQL)', () => {
 
     test('when the top-up wins first, a concurrent terminal claim cannot overwrite the trade', async () => {
         const vendor = await prisma.user.create({
-            data: { username: `ping_vendor_${Date.now()}`, email: `ping_vendor_${Date.now()}@test.local`, role: 'VENDOR', availableBalance: 100 }
+            data: { username: `ping_vendor_${Date.now()}`, email: `ping_vendor_${Date.now()}@test.local`, password: 'test_password', role: 'VENDOR', availableBalance: 100 }
         });
         const buyer = await prisma.user.create({
-            data: { username: `ping_buyer_${Date.now()}`, email: `ping_buyer_${Date.now()}@test.local`, role: 'USER' }
+            data: { username: `ping_buyer_${Date.now()}`, email: `ping_buyer_${Date.now()}@test.local`, password: 'test_password', role: 'USER' }
         });
         const trade = await prisma.trade.create({
             data: {
