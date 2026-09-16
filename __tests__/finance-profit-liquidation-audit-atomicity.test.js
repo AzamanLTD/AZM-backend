@@ -12,7 +12,7 @@ describeOrSkip('profit liquidation audit atomicity (real PostgreSQL)', () => {
         prisma = new PrismaClient();
         financeService = require('../services/finance.service');
         const admin = await prisma.user.create({
-            data: { username: `liq_admin_${Date.now()}`, email: `liq_admin_${Date.now()}@test.local`, role: 'ADMIN' }
+            data: { username: `liq_admin_${Date.now()}`, email: `liq_admin_${Date.now()}@test.local`, password: 'test_password', role: 'ADMIN' }
         });
         adminId = admin.id;
     });
@@ -31,7 +31,7 @@ describeOrSkip('profit liquidation audit atomicity (real PostgreSQL)', () => {
         await prisma.adminProfitLog.deleteMany();
         await prisma.systemProfitFees.deleteMany();
         await prisma.systemFiatPool.deleteMany();
-        await prisma.$executeRawUnsafe('DROP TRIGGER IF EXISTS _azm_fail_liquidation_audit ON "AuditLog"');
+        await prisma.$executeRawUnsafe('DROP TRIGGER IF EXISTS _azm_fail_liquidation_audit ON \"AuditLog\"');
         await prisma.$executeRawUnsafe('DROP FUNCTION IF EXISTS _azm_fail_liquidation_audit()');
     });
 
@@ -84,7 +84,7 @@ describeOrSkip('profit liquidation audit atomicity (real PostgreSQL)', () => {
             $$ BEGIN RAISE EXCEPTION 'forced liquidation audit failure'; END $$ LANGUAGE plpgsql;
         `);
         await prisma.$executeRawUnsafe(
-            'CREATE TRIGGER _azm_fail_liquidation_audit BEFORE INSERT ON "AuditLog" FOR EACH ROW EXECUTE FUNCTION _azm_fail_liquidation_audit()'
+            'CREATE TRIGGER _azm_fail_liquidation_audit BEFORE INSERT ON \"AuditLog\" FOR EACH ROW EXECUTE FUNCTION _azm_fail_liquidation_audit()'
         );
 
         await expect(financeService.liquidateProfits(prisma, 25, adminId, {
