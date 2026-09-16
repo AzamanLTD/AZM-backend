@@ -255,38 +255,80 @@ class SusuService {
             },
         });
         if (!cycle) throw new Error('Cycle not found');
-        if (cycle.status !== 'PENDING') return { skipped: true, reason: 'not pending' };
+        // No status pre-check here: the claim CAS below is the sole
+        // authority — it matches only a fresh PENDING cycle or a
+        // COLLECTING cycle stranded past the stall window, so terminal
+        // cycles, foreign-owned cycles and fresh active ticks all fail
+        // the claim atomically.
 
-        // Mark COLLECTING immediately so concurrent worker ticks don't
-        // double-process the same cycle.
-        await this.prisma.susuCycle.update({
-            where: { id: cycle.id },
-            data: { status: 'COLLECTING' },
+        // Authoritative claim (was: a blind status flip that BOTH workers
+        // of a concurrent tick could win). PENDING → COLLECTING is now a
+        // compare-and-set on the database, and a COLLECTING cycle stranded
+        // by a crashed tick becomes re-claimable after the stall window.
+        // Either way exactly one worker owns the tick; the claim stamp keys
+        // every subsequent mutation of this cycle.
+        const claimStamp = new Date();
+        const STALL_RECOVERY_MS = 5 * 60 * 1000;
+        const claimed = await this.prisma.susuCycle.updateMany({
+            where: {
+                id: cycle.id,
+                OR: [
+                    { status: 'PENDING' },
+                    // Stalled tick past the recovery window.
+                    { status: 'COLLECTING', startedCollectingAt: { lte: new Date(claimStamp.getTime() - STALL_RECOVERY_MS) } },
+                    // Historical legacy strand: the pre-fix code flipped
+                    // COLLECTING without ever stamping
+                    // startedCollectingAt, and its payout could never
+                    // commit (the validation-dead batch). A NULL stamp can
+                    // therefore only denote a pre-fix strand — under this
+                    // code every claim stamps, so no live tick can hold an
+                    // unstamped COLLECTING cycle. Reclaim immediately.
+                    { status: 'COLLECTING', startedCollectingAt: null },
+                ],
+            },
+            data: { status: 'COLLECTING', startedCollectingAt: claimStamp },
         });
+        if (claimed.count !== 1) return { skipped: true, reason: 'cycle already owned or not claimable' };
 
         const contribution = new Prisma.Decimal(cycle.susu.contributionUsdc);
         const paid = [];
         const defaulted = [];
-        let totalCollected = new Prisma.Decimal(0);
 
         for (const member of cycle.susu.members) {
             if (member.status === 'DEFAULTED') {
                 defaulted.push({ memberId: member.id, userId: member.userId, shortfall: contribution });
                 continue;
             }
-            // Atomic deduct from User.availableBalance
+            let result;
             try {
-                await this.prisma.$transaction(async (tx) => {
-                    const u = await tx.user.findUnique({
-                        where: { id: member.userId },
-                        select: { availableBalance: true },
+                result = await this.prisma.$transaction(async (tx) => {
+                    // Claim re-validation: refuse to move any money if this
+                    // tick lost ownership of the cycle (stall-reclaim by
+                    // another worker, or concurrent finalization).
+                    const mine = await tx.susuCycle.updateMany({
+                        where: { id: cycle.id, status: 'COLLECTING', startedCollectingAt: claimStamp },
+                        data: { startedCollectingAt: claimStamp },
                     });
-                    const balance = new Prisma.Decimal(u?.availableBalance || 0);
-                    if (balance.gte(contribution)) {
-                        await tx.user.update({
-                            where: { id: member.userId },
-                            data: { availableBalance: { decrement: contribution } },
-                        });
+                    if (mine.count !== 1) return { lostClaim: true };
+
+                    // Idempotency: a prior (or stall-reclaimed) tick already
+                    // collected this member — never debit twice.
+                    const existing = await tx.susuContribution.findUnique({
+                        where: { cycleId_memberId: { cycleId: cycle.id, memberId: member.id } },
+                    });
+                    if (existing) return { already: true };
+
+                    // Authoritative affordability at the database boundary:
+                    // the conditional decrement only lands if the balance
+                    // still covers the contribution at mutation time. A
+                    // wallet spend racing between any earlier read and
+                    // this statement loses the CAS and the member falls
+                    // through to the seizure branch below.
+                    const paidNow = await tx.user.updateMany({
+                        where: { id: member.userId, availableBalance: { gte: contribution } },
+                        data: { availableBalance: { decrement: contribution } },
+                    });
+                    if (paidNow.count === 1) {
                         await tx.susuContribution.create({
                             data: {
                                 cycleId: cycle.id,
@@ -296,55 +338,101 @@ class SusuService {
                                 status: 'PAID',
                             },
                         });
-                        totalCollected = totalCollected.plus(contribution);
-                        paid.push({ memberId: member.id, userId: member.userId });
-                    } else {
-                        // Partial seize from available + flag default
-                        const seizable = balance;
-                        const shortfall = contribution.minus(seizable);
-                        if (seizable.gt(0)) {
-                            await tx.user.update({
-                                where: { id: member.userId },
-                                data: { availableBalance: { decrement: seizable } },
-                            });
-                            totalCollected = totalCollected.plus(seizable);
-                        }
-                        await tx.susuContribution.create({
+                        await tx.transactionHistory.create({
                             data: {
-                                cycleId: cycle.id,
-                                memberId: member.id,
                                 userId: member.userId,
-                                amountUsdc: contribution,
-                                status: 'SEIZED',
-                                seizedFromAvailable: seizable,
-                                shortfall,
+                                type: 'SUSU_CONTRIBUTION',
+                                amountUsdc: contribution.neg(),
+                                status: 'COMPLETED',
+                                metadata: { cycleId: cycle.id, susuGroupId: cycle.susuGroupId },
                             },
                         });
-                        await tx.susuMember.update({
-                            where: { id: member.id },
+                        return { paid: true };
+                    }
+
+                    // Partial seize from available + flag default. The
+                    // legacy ladder has no grace window: seize whatever
+                    // the row-locked wallet holds at seizure time — a
+                    // concurrent spend either commits first (we take what
+                    // remains) or waits until after the seizure.
+                    const [wallet] = await tx.$queryRaw`
+                        SELECT "availableBalance" FROM "User"
+                        WHERE "id" = ${member.userId}::int
+                        FOR UPDATE`;
+                    const seizable = wallet
+                        ? new Prisma.Decimal(wallet.availableBalance)
+                        : new Prisma.Decimal(0);
+                    const shortfall = contribution.minus(seizable);
+                    if (seizable.gt(0)) {
+                        await tx.user.update({
+                            where: { id: member.userId },
+                            data: { availableBalance: { decrement: seizable } },
+                        });
+                        await tx.transactionHistory.create({
                             data: {
-                                status: 'DEFAULTED',
-                                defaultedAt: new Date(),
-                                totalSeizedUsdc: { increment: seizable },
+                                userId: member.userId,
+                                type: 'SUSU_SEIZURE',
+                                amountUsdc: seizable.neg(),
+                                status: 'COMPLETED',
+                                metadata: { cycleId: cycle.id, susuGroupId: cycle.susuGroupId },
                             },
-                        });
-                        defaulted.push({
-                            memberId: member.id,
-                            userId: member.userId,
-                            shortfall,
-                            seized: seizable,
                         });
                     }
+                    await tx.susuContribution.create({
+                        data: {
+                            cycleId: cycle.id,
+                            memberId: member.id,
+                            userId: member.userId,
+                            amountUsdc: contribution,
+                            status: 'SEIZED',
+                            seizedFromAvailable: seizable,
+                            shortfall,
+                        },
+                    });
+                    await tx.susuMember.update({
+                        where: { id: member.id },
+                        data: {
+                            status: 'DEFAULTED',
+                            defaultedAt: new Date(),
+                            totalSeizedUsdc: { increment: seizable },
+                        },
+                    });
+                    return { defaulted: true, seizable, shortfall };
                 });
             } catch (err) {
-                logger.error({ err: err }, '[susuService.processCycle] transaction error');
-                defaulted.push({
-                    memberId: member.id,
-                    userId: member.userId,
-                    shortfall: contribution,
-                    error: err.message,
-                });
+                // An economic transaction failure must NEVER be
+                // reclassified as a member default (the old behavior:
+                // defaulted.push → account ban + voucher trust penalties
+                // for a member whose money never moved). Release the claim
+                // and abort the tick so the next worker tick retries it
+                // idempotently.
+                logger.error({ err: err }, '[susuService.processCycle] member transaction failed; aborting tick for idempotent retry');
+                try {
+                    await this.prisma.susuCycle.updateMany({
+                        where: { id: cycle.id, status: 'COLLECTING', startedCollectingAt: claimStamp },
+                        data: { status: 'PENDING' },
+                    });
+                } catch (revertErr) {
+                    // Stall-recovery re-claims the cycle after the window
+                    // anyway; the original error must win.
+                    logger.error({ err: revertErr }, '[susuService.processCycle] claim revert failed; stall-recovery will retry');
+                }
+                throw err;
             }
+            if (result.lostClaim) {
+                throw new Error(`[susuService.processCycle] cycle ${cycle.id} claim lost mid-tick; aborting`);
+            }
+            if (result.already) continue;
+            if (result.paid) {
+                paid.push({ memberId: member.id, userId: member.userId });
+                continue;
+            }
+            defaulted.push({
+                memberId: member.id,
+                userId: member.userId,
+                shortfall: result.shortfall,
+                seized: result.seizable,
+            });
         }
 
         // Apply default penalties: freeze accounts + voucher trust hits
@@ -356,63 +444,97 @@ class SusuService {
         // PHASE 5: ADMIN PROFIT ENGINE
         // Skim the platform fee from the pool before payout
         // =====================================================================
-        const settings = await this.prisma.globalSettings.findFirst();
-        const profitPct = new Prisma.Decimal(settings?.susuProfitPct || 0.03);
-        const feeUsdc = totalCollected.mul(profitPct).toDecimalPlaces(2, Prisma.Decimal.ROUND_DOWN);
-        const netPayout = totalCollected.minus(feeUsdc);
+        // One transaction owns the whole finalization: the pool is
+        // computed from the committed susuContribution rows themselves
+        // (never from a JavaScript accumulator spanning separate member
+        // transactions), the single-winner claim guards the payout, and
+        // every ledger write is part of the atomic commit.
+        const payoutOutcome = await this.prisma.$transaction(async (tx) => {
+            const rows = await tx.susuContribution.findMany({
+                where: { cycleId: cycle.id },
+                select: { status: true, amountUsdc: true, seizedFromAvailable: true },
+            });
+            let totalCollected = new Prisma.Decimal(0);
+            for (const r of rows) {
+                totalCollected = totalCollected.plus(
+                    r.status === 'SEIZED' ? r.seizedFromAvailable : r.amountUsdc
+                );
+            }
 
-        // Pay out the net pool to the winner + log the fee
-        await this.prisma.$transaction([
-            this.prisma.user.update({
-                where: { id: cycle.payoutUserId },
-                data: { availableBalance: { increment: netPayout } },
-            }),
-            this.prisma.susuCycle.update({
-                where: { id: cycle.id },
+            const settings = await tx.globalSettings.findFirst();
+            const profitPct = new Prisma.Decimal(settings?.susuProfitPct || 0.03);
+            const feeUsdc = totalCollected.mul(profitPct).toDecimalPlaces(2, Prisma.Decimal.ROUND_DOWN);
+            const netPayout = totalCollected.minus(feeUsdc);
+
+            // Single-winner claim: only this tick's COLLECTING cycle can be
+            // paid out — a concurrent worker (or a stale tick that lost
+            // its claim) aborts before any money moves.
+            const claim = await tx.susuCycle.updateMany({
+                where: { id: cycle.id, status: 'COLLECTING', startedCollectingAt: claimStamp },
                 data: {
-                    status: defaulted.length > 0 ? 'DEFAULTED' : 'PAID_OUT',
+                    status: 'PAID_OUT',
                     paidOutAt: new Date(),
                     defaultsCount: defaulted.length,
                     payoutAmount: netPayout,
                     feeUsdc,
                 },
-            }),
-            this.prisma.transactionHistory.create({
+            });
+            if (claim.count !== 1) return { skippedPayout: true };
+
+            await tx.user.update({
+                where: { id: cycle.payoutUserId },
+                data: { availableBalance: { increment: netPayout } },
+            });
+            if (defaulted.length > 0) {
+                await tx.susuCycle.update({
+                    where: { id: cycle.id },
+                    data: { status: 'DEFAULTED' },
+                });
+            }
+            await tx.transactionHistory.create({
                 data: {
                     userId: cycle.payoutUserId,
                     type: 'SUSU_PAYOUT',
                     amountUsdc: netPayout,
                     status: 'COMPLETED',
+                    metadata: { cycleId: cycle.id, susuGroupId: cycle.susuGroupId },
                 },
-            }),
-            // Log the platform fee to AdminProfitLog
-            this.prisma.adminProfitLog.create({
+            });
+            // Log the platform fee to AdminProfitLog. The model has no
+            // metadata column — the old write passed an unknown `metadata`
+            // argument, a guaranteed Prisma validation error that aborted
+            // the entire payout transaction (a second fatal defect on top
+            // of the userId:null SUSU_PROFIT write). Cycle linkage lives in
+            // relatedTxId, matching the booking_/escrow_/referral_ fee
+            // conventions.
+            await tx.adminProfitLog.create({
                 data: {
                     source: 'SUSU_FEE',
                     amountUsdc: feeUsdc,
-                    metadata: {
-                        cycleId: cycle.id,
-                        susuGroupId: cycle.susuGroupId,
-                        cycleNumber: cycle.cycleNumber,
-                        totalCollected: totalCollected.toFixed(2),
-                        profitPct: profitPct.toFixed(4),
-                    },
+                    relatedTxId: `susu_fee_${cycle.id}`,
                 },
-            }),
-            // Also log as a SUSU_PROFIT transaction for audit trail
-            this.prisma.transactionHistory.create({
+            });
+            // Fee line on the winner's wallet ledger. TransactionHistory
+            // .userId is NOT NULL — the old `userId: null` write was a
+            // guaranteed Prisma validation error that aborted the ENTIRE
+            // payout transaction after the member debits had already
+            // committed (members debited, winner never paid, cycle
+            // stranded in COLLECTING).
+            await tx.transactionHistory.create({
                 data: {
-                    userId: null, // Platform transaction
+                    userId: cycle.payoutUserId,
                     type: 'SUSU_PROFIT',
-                    amountUsdc: feeUsdc,
+                    amountUsdc: feeUsdc.neg(),
                     status: 'COMPLETED',
-                    metadata: {
-                        cycleId: cycle.id,
-                        susuGroupId: cycle.susuGroupId,
-                    },
+                    metadata: { cycleId: cycle.id, susuGroupId: cycle.susuGroupId },
                 },
-            }),
-        ]);
+            });
+            return { totalCollected, feeUsdc, netPayout };
+        });
+        if (payoutOutcome.skippedPayout) {
+            return { skipped: true, reason: 'cycle finalized concurrently' };
+        }
+        const { totalCollected, feeUsdc, netPayout } = payoutOutcome;
 
         // Notifications
         try {
