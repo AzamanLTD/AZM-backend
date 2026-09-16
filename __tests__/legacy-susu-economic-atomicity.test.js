@@ -56,7 +56,7 @@ describeOrSkip('Legacy Susu economic atomicity (real PostgreSQL)', () => {
             await prisma.adminProfitLog.deleteMany({
                 where: {
                     source: 'SUSU_FEE',
-                    OR: created.cycles.map((id) => ({ metadata: { path: ['cycleId'], equals: id } })),
+                    relatedTxId: { in: created.cycles.map((id) => `susu_fee_${id}`) },
                 },
             });
         }
@@ -125,7 +125,7 @@ describeOrSkip('Legacy Susu economic atomicity (real PostgreSQL)', () => {
     }
 
     function makeService(client) {
-        const SusuService = require('../services/susuService');
+        const { SusuService } = require('../services/susuService');
         return new SusuService(client, undefined, undefined, undefined);
     }
 
@@ -260,6 +260,7 @@ describeOrSkip('Legacy Susu economic atomicity (real PostgreSQL)', () => {
         expect(Number(byType.SUSU_PROFIT[0].amountUsdc)).toBeCloseTo(-0.75, 6);
         expect(profitLogs).toHaveLength(1);
         expect(Number(profitLogs[0].amountUsdc)).toBeCloseTo(0.75, 6);
+        expect(profitLogs[0].relatedTxId).toBe(`susu_fee_${cycle.id}`);
 
         // Report and group completion.
         expect(report.paid).toBe(2);

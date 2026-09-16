@@ -491,18 +491,18 @@ class SusuService {
                     metadata: { cycleId: cycle.id, susuGroupId: cycle.susuGroupId },
                 },
             });
-            // Log the platform fee to AdminProfitLog
+            // Log the platform fee to AdminProfitLog. The model has no
+            // metadata column — the old write passed an unknown `metadata`
+            // argument, a guaranteed Prisma validation error that aborted
+            // the entire payout transaction (a second fatal defect on top
+            // of the userId:null SUSU_PROFIT write). Cycle linkage lives in
+            // relatedTxId, matching the booking_/escrow_/referral_ fee
+            // conventions.
             await tx.adminProfitLog.create({
                 data: {
                     source: 'SUSU_FEE',
                     amountUsdc: feeUsdc,
-                    metadata: {
-                        cycleId: cycle.id,
-                        susuGroupId: cycle.susuGroupId,
-                        cycleNumber: cycle.cycleNumber,
-                        totalCollected: totalCollected.toFixed(2),
-                        profitPct: profitPct.toFixed(4),
-                    },
+                    relatedTxId: `susu_fee_${cycle.id}`,
                 },
             });
             // Fee line on the winner's wallet ledger. TransactionHistory
