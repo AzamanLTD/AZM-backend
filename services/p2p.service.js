@@ -211,8 +211,8 @@ const acceptPing = async (prisma, { tradeId, vendorId, topUpAmount }) => {
     });
 
     return {
-        newAvailableBalance:         result.availableBalance,
-        newVendorUnallocatedBalance: result.vendorUnallocatedBalance,
+        newAvailableBalance:         Number(result.availableBalance),
+        newVendorUnallocatedBalance: Number(result.vendorUnallocatedBalance),
         _notifications: [{
             userId:        trade.userId,
             title:         '✅ Vendor Responded to Ping',

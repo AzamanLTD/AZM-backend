@@ -136,29 +136,45 @@ describeOrSkip('P2P accept-ping lifecycle integrity (real PostgreSQL)', () => {
             }
         });
 
+        // Both sides race for real — no sleeps, no ordering hints. Whichever
+        // transaction takes the trade row lock first, the database must
+        // serialize them into exactly one consistent outcome:
+        //   - terminal claim wins: acceptPing observes the terminal status
+        //     under the lock and refuses; vendor balances are untouched.
+        //   - top-up wins: the debit commits under the lock and the terminal
+        //     CAS claim then observes PENDING_PAYMENT and cancels; vendor
+        //     balances reflect the committed top-up.
         const outcomes = await Promise.all([
             p2pService.acceptPing(prisma, { tradeId: trade.id, vendorId: vendor.id, topUpAmount: 25 })
-                .then((result) => ({ ok: true, result })),
+                .then((result) => ({ ok: true, result }))
+                .catch((error) => ({ ok: false, error })),
             prisma.$transaction(async (tx) => {
                 const claimed = await tx.trade.updateMany({
                     where: { id: trade.id, status: 'PENDING_PAYMENT' },
                     data: { status: 'CANCELLED' },
                 });
-                return { ok: claimed.count === 1 };
+                return { claimed: claimed.count === 1 };
             }),
         ]);
+        const toppedUp = outcomes[0].ok === true;
+        const claim = outcomes[1];
 
         const finalVendor = await prisma.user.findUnique({ where: { id: vendor.id } });
         const finalTrade = await prisma.trade.findUnique({ where: { id: trade.id } });
-        const toppedUp = outcomes.some((o) => o.ok === true && o.result?.newAvailableBalance !== undefined);
-        expect(finalTrade.status === 'CANCELLED' || finalTrade.status === 'PENDING_PAYMENT').toBe(true);
-        if (finalTrade.status === 'CANCELLED') {
-            expect(Number(finalVendor.availableBalance)).toBeCloseTo(100, 6);
-            expect(Number(finalVendor.vendorUnallocatedBalance)).toBeCloseTo(0, 6);
-        } else {
+
+        // The CAS claim observes PENDING_PAYMENT in both serializations.
+        expect(claim.claimed).toBe(true);
+        expect(finalTrade.status).toBe('CANCELLED');
+
+        if (toppedUp) {
+            expect(outcomes[0].result.newAvailableBalance).toBeCloseTo(75, 6);
+            expect(outcomes[0].result.newVendorUnallocatedBalance).toBeCloseTo(25, 6);
             expect(Number(finalVendor.availableBalance)).toBeCloseTo(75, 6);
             expect(Number(finalVendor.vendorUnallocatedBalance)).toBeCloseTo(25, 6);
+        } else {
+            expect(outcomes[0].error.message).toContain('no longer pending payment');
+            expect(Number(finalVendor.availableBalance)).toBeCloseTo(100, 6);
+            expect(Number(finalVendor.vendorUnallocatedBalance)).toBeCloseTo(0, 6);
         }
-        expect(toppedUp || finalTrade.status === 'CANCELLED').toBe(true);
     });
 });

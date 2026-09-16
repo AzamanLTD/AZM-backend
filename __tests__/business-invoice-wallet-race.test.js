@@ -48,7 +48,17 @@ describeOrSkip('business invoice wallet race (real PostgreSQL)', () => {
   });
 
   afterAll(async () => {
-    if (prisma) await prisma.$disconnect();
+    if (prisma) {
+      // The battery shares one database and may run twice; remove everything
+      // this suite created so the trailing adapter suites' cleanups (which
+      // sweep by the same "Test Business " / "user_" prefixes) stay reliable.
+      const userIds = [customer.id, businessOne.owner.id, businessTwo.owner.id];
+      await prisma.businessInvoice.deleteMany({ where: { id: { in: [invoiceOne.id, invoiceTwo.id] } } });
+      await prisma.businessProfile.deleteMany({ where: { id: { in: [businessOne.biz.id, businessTwo.biz.id] } } });
+      await prisma.transactionHistory.deleteMany({ where: { userId: { in: userIds } } });
+      await prisma.user.deleteMany({ where: { id: { in: userIds } } });
+      await prisma.$disconnect();
+    }
   });
 
   test('two different invoices cannot overspend one customer wallet', async () => {
