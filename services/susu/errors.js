@@ -34,6 +34,7 @@ const ErrorCodes = Object.freeze({
   SUSU_VALIDATION_FAILED: 'SUSU_VALIDATION_FAILED',
   INVITE_EXPIRED_OR_USED: 'INVITE_EXPIRED_OR_USED',
   INVITE_INVALID: 'INVITE_INVALID',
+  CYCLE_ALREADY_FINALIZED: 'CYCLE_ALREADY_FINALIZED',
 });
 
 // Privacy 404: a uniform envelope returned for both non-existent and

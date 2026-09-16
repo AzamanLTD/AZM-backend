@@ -117,10 +117,23 @@ class SusuCycleService {
       } else if (current.status === 'COLLECTING') {
         // Stalled transient state (crash recovery). Only reclaim if the
         // collection started more than 5 minutes ago, so we never steal a
-        // cycle a sibling worker is actively processing.
+        // cycle a sibling worker is actively processing. The timestamp
+        // CAS below additionally guarantees that only ONE stall-reclaimer
+        // wins when several workers notice the same stalled cycle in the
+        // same tick — and the fresh stamp re-arms the 5-minute window for
+        // the next recovery attempt.
         const startedAt = current.startedCollectingAt
           ? new Date(current.startedCollectingAt).getTime() : 0;
         if (Date.now() - startedAt < 5 * 60 * 1000) return { acquired: false };
+        const stamp = await tx.susuCycle.updateMany({
+          where: {
+            id: cycleId,
+            status: 'COLLECTING',
+            startedCollectingAt: current.startedCollectingAt,
+          },
+          data: { startedCollectingAt: new Date() },
+        });
+        if (stamp.count === 0) return { acquired: false };
         priorStatus = 'COLLECTING';
       } else {
         return { acquired: false };
@@ -413,10 +426,20 @@ class SusuCycleService {
       }
     }
 
-    await this.prisma.susuCycle.update({
-      where: { id: cycle.id },
+    // Conditional re-park: the cycle must still be COLLECTING. A blind
+    // write here could resurrect a cycle another worker has already paid
+    // out (or defaulted), re-queueing it for another payout round.
+    const rePark = await this.prisma.susuCycle.updateMany({
+      where: { id: cycle.id, status: 'COLLECTING' },
       data: { status: 'COLLECTING_GRACE', graceUntil },
     });
+    if (rePark.count !== 1) {
+      throw new SusuError(
+        ErrorCodes.CYCLE_ALREADY_FINALIZED,
+        `Susu cycle ${cycle.id} advanced concurrently; grace re-park refused.`,
+        409,
+      );
+    }
 
     if (this.io) {
       this.io.to(`susu_${susu.id}`).emit('susu:cycle_grace', {
@@ -508,6 +531,34 @@ class SusuCycleService {
   // ── Cycle finalization (payout or escrow divert) ──────────────────────
   async _finalizeCycle(cycle, susu) {
     return this.prisma.$transaction(async (tx) => {
+      // Single-winner claim — the payout authority (exactly-once payout).
+      // The advisory lock in _acquireCycle is transaction-scoped: it expires
+      // the moment that transaction commits, and from then on exclusion
+      // relies on the 5-minute stall-recovery heuristic. Two workers that
+      // both believe they own this cycle must not both credit the pool.
+      // The database decides right here, inside the transaction that moves
+      // the money: only a COLLECTING cycle can be finalized, so the loser
+      // of this conditional update aborts before any balance mutation.
+      // The claim's terminal write (payoutAmount, DEFAULTED disposition)
+      // is completed further below within this same transaction; if the
+      // transaction fails, the claim rolls back and the cycle stays
+      // reclaimable.
+      const claim = await tx.susuCycle.updateMany({
+        where: { id: cycle.id, status: 'COLLECTING' },
+        data: {
+          status: 'PAID_OUT',
+          paidOutAt: new Date(),
+          payoutAmount: new Prisma.Decimal(0),
+        },
+      });
+      if (claim.count !== 1) {
+        throw new SusuError(
+          ErrorCodes.CYCLE_ALREADY_FINALIZED,
+          `Susu cycle ${cycle.id} was finalized by another worker; payout refused.`,
+          409,
+        );
+      }
+
       const contributions = await tx.susuContribution.findMany({
         where: { cycleId: cycle.id, status: 'PAID' },
         select: { amountUsdc: true },
@@ -611,7 +662,7 @@ class SusuCycleService {
             autoRetained: autoRetained.gt(0) ? autoRetained.toString() : null,
           },
         },
-      }).catch(() => {});
+      });
 
       const updateData = {
         status: 'PAID_OUT',
