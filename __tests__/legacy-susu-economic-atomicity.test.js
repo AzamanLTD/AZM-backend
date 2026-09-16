@@ -475,6 +475,53 @@ describeOrSkip('Legacy Susu economic atomicity (real PostgreSQL)', () => {
         expect(Number(member2After.availableBalance)).toBeCloseTo(10, 6);
     });
 
+    test('historical NULL-stamp strand (pre-fix state) is reclaimed and completed with its committed pool', async () => {
+        // Production signature of the pre-fix code: it flipped COLLECTING
+        // without stamping startedCollectingAt, and its payout batch could
+        // never commit. Seed exactly that state: a NULL-stamp COLLECTING
+        // cycle with ONE member already debited by the old member
+        // transaction (committed contribution row, no wallet ledger).
+        const group = await seedGroup(10);
+        const paidEarly = await seedUser(0, 'hist_1');   // debited historically
+        const uncollected = await seedUser(10, 'hist_2'); // never reached
+        const winner = await seedUser(0, 'hist_w');
+        const cycle = await seedCycle(group, winner.id, 'COLLECTING', null); // NULL stamp
+        const m1 = await seedMember(group, paidEarly, 1);
+        await seedMember(group, uncollected, 2);
+        await prisma.susuContribution.create({
+            data: {
+                cycleId: cycle.id,
+                memberId: m1.id,
+                userId: paidEarly.id,
+                amountUsdc: 10,
+                status: 'PAID',
+            },
+        });
+
+        const svc = makeService(prisma);
+        const report = await svc.processCycle(cycle.id);
+
+        const cycleAfter = await prisma.susuCycle.findUnique({ where: { id: cycle.id } });
+        const winnerAfter = await prisma.user.findUnique({ where: { id: winner.id } });
+        const paidEarlyAfter = await prisma.user.findUnique({ where: { id: paidEarly.id } });
+        const uncollectedAfter = await prisma.user.findUnique({ where: { id: uncollected.id } });
+        const contributions = await prisma.susuContribution.findMany({ where: { cycleId: cycle.id } });
+
+        // Immediate reclaim (no 5-minute wait for a NULL-stamp strand),
+        // the already-collected member is skipped — not re-debited —
+        // and the pool is recomputed from BOTH committed rows:
+        // 10 + 10 = 20, fee 0.60, net 19.40.
+        expect(report.skipped).toBeUndefined();
+        expect(report.paid).toBe(1); // only the previously-uncollected member
+        expect(Number(paidEarlyAfter.availableBalance)).toBeCloseTo(0, 6);
+        expect(Number(uncollectedAfter.availableBalance)).toBeCloseTo(0, 6);
+        expect(contributions).toHaveLength(2);
+        expect(Number(winnerAfter.availableBalance)).toBeCloseTo(19.40, 6);
+        expect(cycleAfter.status).toBe('PAID_OUT');
+        expect(Number(cycleAfter.payoutAmount)).toBeCloseTo(19.40, 6);
+        expect(cycleAfter.startedCollectingAt).not.toBeNull();
+    });
+
     test('the legacy worker sweep itself recovers crash-stranded cycles', async () => {
         const group = await seedGroup(10);
         const member = await seedUser(10, 'worker_m');

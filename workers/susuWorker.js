@@ -48,6 +48,12 @@ class SusuWorker {
                             status: 'COLLECTING',
                             startedCollectingAt: { lte: new Date(now.getTime() - 5 * 60 * 1000) },
                         },
+                        // Historical legacy strands: the pre-fix code never
+                        // stamped startedCollectingAt, so an unstamped
+                        // COLLECTING cycle is a pre-fix permanent strand
+                        // (its payout batch could not commit). Reclaimed on
+                        // the first tick after deploy.
+                        { status: 'COLLECTING', startedCollectingAt: null },
                     ],
                 },
                 take: 25,

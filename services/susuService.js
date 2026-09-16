@@ -274,7 +274,16 @@ class SusuService {
                 id: cycle.id,
                 OR: [
                     { status: 'PENDING' },
+                    // Stalled tick past the recovery window.
                     { status: 'COLLECTING', startedCollectingAt: { lte: new Date(claimStamp.getTime() - STALL_RECOVERY_MS) } },
+                    // Historical legacy strand: the pre-fix code flipped
+                    // COLLECTING without ever stamping
+                    // startedCollectingAt, and its payout could never
+                    // commit (the validation-dead batch). A NULL stamp can
+                    // therefore only denote a pre-fix strand — under this
+                    // code every claim stamps, so no live tick can hold an
+                    // unstamped COLLECTING cycle. Reclaim immediately.
+                    { status: 'COLLECTING', startedCollectingAt: null },
                 ],
             },
             data: { status: 'COLLECTING', startedCollectingAt: claimStamp },
