@@ -221,7 +221,7 @@ describeOrSkip('Legacy Susu economic atomicity (real PostgreSQL)', () => {
         const memberRow = await prisma.susuMember.findFirst({ where: { susuGroupId: group.id, userId: short.id } });
         const history = await prisma.transactionHistory.findMany({ where: { userId: { in: [winner.id, m2.id, short.id] } } });
         const profitLogs = await prisma.adminProfitLog.findMany({
-            where: { source: 'SUSU_FEE', metadata: { path: ['cycleId'], equals: cycle.id } },
+            where: { source: 'SUSU_FEE', relatedTxId: `susu_fee_${cycle.id}` },
         });
         const groupAfter = await prisma.susuGroup.findUnique({ where: { id: group.id } });
 
@@ -358,7 +358,7 @@ describeOrSkip('Legacy Susu economic atomicity (real PostgreSQL)', () => {
             where: { userId: winner.id, type: 'SUSU_PAYOUT' },
         });
         const profitLogs = await prisma.adminProfitLog.findMany({
-            where: { source: 'SUSU_FEE', metadata: { path: ['cycleId'], equals: cycle.id } },
+            where: { source: 'SUSU_FEE', relatedTxId: `susu_fee_${cycle.id}` },
         });
 
         // Exactly one tick won the claim; the other skipped.
