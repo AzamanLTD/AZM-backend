@@ -174,7 +174,7 @@ const acceptPing = async (prisma, { tradeId, vendorId, topUpAmount }) => {
         // concurrent terminal transition; whichever transition acquires the
         // trade lock first becomes the authoritative outcome.
         const eligible = await tx.$queryRawUnsafe(
-            'SELECT 1 AS locked FROM \"Trade\" WHERE id = $1 AND status = $2 FOR UPDATE',
+            'SELECT 1 AS locked FROM \"Trade\" WHERE id = $1 AND status = $2::\"TradeStatus\" FOR UPDATE',
             tradeId,
             'PENDING_PAYMENT'
         );

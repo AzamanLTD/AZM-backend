@@ -8,6 +8,9 @@ const { acceptPing } = require('../services/p2p.service');
 describe('acceptPing balance concurrency', () => {
   const buildPrisma = ({ updateCount = 1 } = {}) => {
     const tx = {
+      // acceptPing re-validates the trade lifecycle under the row lock inside
+      // the transaction; the mock contract models that gate.
+      $queryRawUnsafe: jest.fn().mockResolvedValue([{ locked: 1 }]),
       user: {
         updateMany: jest.fn().mockResolvedValue({ count: updateCount }),
         findUnique: jest.fn().mockResolvedValue({
@@ -40,6 +43,11 @@ describe('acceptPing balance concurrency', () => {
       topUpAmount: 10,
     });
 
+    expect(tx.$queryRawUnsafe).toHaveBeenCalledWith(
+      'SELECT 1 AS locked FROM \"Trade\" WHERE id = $1 AND status = $2::\"TradeStatus\" FOR UPDATE',
+      101,
+      'PENDING_PAYMENT'
+    );
     expect(tx.user.updateMany).toHaveBeenCalledWith({
       where: {
         id: 7,

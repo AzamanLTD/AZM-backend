@@ -85,7 +85,7 @@ describeOrSkip('P2P accept-ping lifecycle integrity (real PostgreSQL)', () => {
 
         const terminal = prisma.$transaction(async (tx) => {
             await tx.$queryRawUnsafe(
-                'SELECT 1 AS locked FROM "Trade" WHERE id = $1 AND status = $2 FOR UPDATE',
+                'SELECT 1 AS locked FROM "Trade" WHERE id = $1 AND status = $2::"TradeStatus" FOR UPDATE',
                 trade.id,
                 'PENDING_PAYMENT'
             );
