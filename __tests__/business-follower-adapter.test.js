@@ -68,7 +68,22 @@ async function seedBusiness(userId) {
 
 async function cleanupAll() {
     await prisma.businessFollower.deleteMany();
-    await prisma.businessProfile.deleteMany({ where: { businessName: { startsWith: 'Test Business ' } } });
+
+    const testProfiles = await prisma.businessProfile.findMany({
+        where: { businessName: { startsWith: 'Test Business ' } },
+        select: { id: true },
+    });
+    const profileIds = testProfiles.map(({ id }) => id);
+
+    if (profileIds.length > 0) {
+        await prisma.businessInvoice.deleteMany({
+            where: { businessProfileId: { in: profileIds } },
+        });
+        await prisma.businessProfile.deleteMany({
+            where: { id: { in: profileIds } },
+        });
+    }
+
     await prisma.user.deleteMany({ where: { username: { startsWith: 'user_' } } });
 }
 

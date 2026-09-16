@@ -31,6 +31,9 @@ describe('liquidateProfits concurrency guard', () => {
           return { id: `log-${profitLogCount}`, ...data };
         }),
       },
+      auditLog: {
+        create: jest.fn(async ({ data }) => ({ id: 'audit-1', ...data })),
+      },
     };
 
     const prisma = {
@@ -54,6 +57,7 @@ describe('liquidateProfits concurrency guard', () => {
     expect(tx.systemProfitFees.updateMany).toHaveBeenCalledTimes(2);
     expect(tx.systemFiatPool.update).toHaveBeenCalledTimes(1);
     expect(tx.adminProfitLog.create).toHaveBeenCalledTimes(1);
+    expect(tx.auditLog.create).toHaveBeenCalledTimes(1);
   });
 
   test('rejects an over-sized liquidation without mutating the fiat pool or audit log', async () => {

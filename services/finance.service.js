@@ -8,6 +8,7 @@
 const logger = require('../src/config/logger');
 const { runDoubleCheck } = require('../utils/securityCheck');
 const { AZM_SPEND_SOURCES } = require('./azmSpendService');
+const { audit } = require('../utils/audit');
 
 const EXIT_FEE_PERCENT        = 0.02;
 const FIAT_POOL_ALERT_THRESH  = 5_000;
@@ -498,7 +499,7 @@ const reverseFiatWithdrawal = async (prisma, reference, opts = {}) => {
     };
 };
 
-const liquidateProfits = async (prisma, amountFloat, adminId) => {
+const liquidateProfits = async (prisma, amountFloat, adminId, auditContext = {}) => {
     const result = await prisma.$transaction(async (tx) => {
         await _ensureProfitFeesSingleton(tx);
         await _ensureFiatPoolSingleton(tx);
@@ -519,6 +520,20 @@ const liquidateProfits = async (prisma, amountFloat, adminId) => {
             data: { balance: { increment: amountFloat } }
         });
         const profitLog = await tx.adminProfitLog.create({ data: { amountUsdc: amountFloat, source: 'ARBITRAGE_SPREAD', relatedTxId: `liquidation_admin_${adminId}_${Date.now()}` } });
+
+        await audit(tx, {
+            actorId: auditContext.actorId ?? adminId,
+            actorName: auditContext.actorName || null,
+            action: 'LIQUIDATE_PROFITS',
+            targetType: 'SYSTEM',
+            targetId: null,
+            metadata: {
+                amountUsdc: amountFloat,
+                amountLiquidated: amountFloat,
+                relatedTxId: profitLog.relatedTxId
+            },
+            ipAddress: auditContext.ipAddress || null,
+        }, { throwOnError: true });
         const [updatedProfitFees, updatedFiatPool] = await Promise.all([
             tx.systemProfitFees.findUnique({ where: { id: 1 } }),
             tx.systemFiatPool.findUnique({ where: { id: 1 } })
