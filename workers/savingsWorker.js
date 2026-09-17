@@ -19,6 +19,7 @@ class SavingsWorker {
         this.prisma = prisma;
         this.io = io;
         this.interval = null;
+        this._running = false; // overlap guard — see _checkReminders
     }
 
     start(intervalMs = 60 * 60 * 1000) { // Every hour
@@ -33,6 +34,11 @@ class SavingsWorker {
     }
 
     async _checkReminders() {
+        // Overlap guard: reminders are keyed off nextDueDate reads, so a
+        // slow tick overlapping the next one would re-notify every due goal.
+        // Not an economic risk — this just keeps push/email volume honest.
+        if (this._running) return;
+        this._running = true;
         try {
             const now = new Date();
             const tomorrow = new Date(now.getTime() + 24 * 60 * 60 * 1000);
@@ -92,6 +98,8 @@ class SavingsWorker {
             }
         } catch (error) {
             logger.error({ err: error }, '[SavingsWorker] Error');
+        } finally {
+            this._running = false;
         }
     }
 

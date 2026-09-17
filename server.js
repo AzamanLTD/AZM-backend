@@ -249,6 +249,7 @@ app.set('emitBalanceUpdate', emitBalanceUpdate);
 const storefrontStakeWorker = require('./workers/storefrontStakeWorker');
 const keepAliveWorker = require('./workers/keepAliveWorker');
 const { getScheduler } = require('./src/lib/bullScheduler');
+app.set('scheduler', getScheduler()); // surfaced in /health as `scheduler` (operating mode)
 (async () => {
     const scheduler = getScheduler();
     // Storefront stake: daily tier check + hourly unstake queue
