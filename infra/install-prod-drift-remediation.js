@@ -142,6 +142,15 @@ async function stage1(db) {
     END IF;
   END $$;`);
 
+  // Gift economic atomicity (2026-09-17): AzmGift.dedupKey is the exactly-once
+  // gift-row claim for idempotent gift sends. Production AzmGift is empty — no
+  // backfill. Additive + idempotent; runs in the release chain before the new
+  // gift code can execute.
+  ok &= await run(db, 'AzmGift.dedupKey column',
+    'ALTER TABLE "AzmGift" ADD COLUMN IF NOT EXISTS "dedupKey" TEXT');
+  ok &= await run(db, 'AzmGift dedup unique index',
+    'CREATE UNIQUE INDEX IF NOT EXISTS "AzmGift_dedupKey_key" ON "AzmGift"("dedupKey")');
+
   return !!ok;
 }
 

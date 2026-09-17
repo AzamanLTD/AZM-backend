@@ -6082,11 +6082,17 @@ model AzmGift {
   message     String?
   contextType String?  @db.VarChar(20) // TRADE | CHAT | MARKETPLACE | SUSU | BUSINESS | GENERAL
   contextId   String?
+  // Idempotent operation identity (gift economic atomicity, 2026-09-17):
+  // derived deterministically from the request's Idempotency-Key so a replay
+  // or racing duplicate converges to exactly one gift row. Nullable — legacy
+  // rows have no claim; Postgres unique semantics keep multiple NULLs legal.
+  dedupKey    String?
   createdAt   DateTime @default(now())
 
   sender   User @relation("AzmGiftSender", fields: [senderId], references: [id], onDelete: Cascade)
   receiver User @relation("AzmGiftReceiver", fields: [receiverId], references: [id], onDelete: Cascade)
 
+  @@unique([dedupKey])
   @@index([senderId, createdAt(sort: Desc)])
   @@index([receiverId, createdAt(sort: Desc)])
   @@index([contextType, contextId])
