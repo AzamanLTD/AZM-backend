@@ -36,6 +36,12 @@ describe('oracle routes canonical contract', () => {
         thirdPartyMargin: 2,
         rateSource: 'KOTANI_PAY',
         lastSync: '2026-09-04T10:00:00.000Z',
+        // Truthful rate provenance (issue #271 / PR 271B): the mock row has no
+        // provenance recorded, so the external freshness is honestly NULL —
+        // never a fabricated fresh timestamp.
+        lastExternalSync: null,
+        lastAdminSetAt: null,
+        lastEchoAt: null,
         refreshIntervalSeconds: 600,
       },
     });

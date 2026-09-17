@@ -479,7 +479,11 @@ exports.getDashboard = async (req, res) => {
                     liveRetailRate: true,
                     liveCorporateRate: true,
                     liveRateSource: true,
-                    lastRateSync: true
+                    lastRateSync: true,
+                    // Truthful rate provenance (issue #271 / PR 271B)
+                    lastExternalSync: true,
+                    lastAdminSetAt: true,
+                    lastEchoAt: true
                 }
             }),
 
@@ -545,7 +549,11 @@ exports.getDashboard = async (req, res) => {
                     liveRetailRate: 12.50,
                     liveCorporateRate: 12.30,
                     liveRateSource: 'MOCK',
-                    lastRateSync: null
+                    lastRateSync: null,
+                    // Truthful rate provenance (issue #271 / PR 271B)
+                    lastExternalSync: null,
+                    lastAdminSetAt: null,
+                    lastEchoAt: null
                 },
 
                 // Recent activity

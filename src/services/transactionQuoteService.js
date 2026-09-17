@@ -42,7 +42,7 @@ async function getServerRateGhsPerUsdc({ prisma, marketOracle }) {
 
   const settings = await prisma.globalSettings.findUnique({
     where: { id: 1 },
-    select: { liveRetailRate: true, liveUsdToGhs: true, liveRateSource: true, lastRateSync: true },
+    select: { liveRetailRate: true, liveUsdToGhs: true, liveRateSource: true, lastRateSync: true, lastExternalSync: true },
   });
 
   // `liveRetailRate` is the canonical user-facing USDC/GHS rate. The legacy
@@ -57,10 +57,20 @@ async function getServerRateGhsPerUsdc({ prisma, marketOracle }) {
   }
 
   void marketOracle;
+  // Snapshot the TRUE external observation timestamp (issue #271 / PR 271B):
+  // a newly-created quote's rateAsOf must never inherit a timestamp
+  // fabricated by the MOCK echo or a manual admin update. Post-271B writers
+  // keep lastRateSync === lastExternalSync for the same genuine observation;
+  // the lastExternalSync-preferred read is what guarantees the snapshot stops
+  // inheriting echo/admin stamps even while lastRateSync remains readable for
+  // staged-rollout compatibility. Rows that predate 271B honestly keep
+  // lastExternalSync = NULL and fall back to the legacy field rather than
+  // fabricating a fresh timestamp; the final new Date() guard only covers a
+  // GlobalSettings row with no recorded history at all (rateAsOf is NOT NULL).
   return {
     rateGhsPerUsdc,
     rateSource: settings?.liveRateSource || 'AZM_ADMIN_MOCK',
-    rateAsOf: settings?.lastRateSync || new Date(),
+    rateAsOf: settings?.lastExternalSync || settings?.lastRateSync || new Date(),
   };
 }
 

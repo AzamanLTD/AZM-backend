@@ -1627,7 +1627,11 @@ exports.getSystemHealth = async (req, res) => {
                     liveRetailRate: settings?.liveRetailRate || 0,
                     liveCorporateRate: settings?.liveCorporateRate || 0,
                     rateSource: settings?.liveRateSource || 'UNKNOWN',
-                    lastRateSync: settings?.lastRateSync || null
+                    lastRateSync: settings?.lastRateSync || null,
+                    // Truthful rate provenance (issue #271 / PR 271B)
+                    lastExternalSync: settings?.lastExternalSync || null,
+                    lastAdminSetAt: settings?.lastAdminSetAt || null,
+                    lastEchoAt: settings?.lastEchoAt || null
                 },
 
                 engine: {

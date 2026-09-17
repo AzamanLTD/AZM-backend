@@ -113,7 +113,10 @@ const processFiatWithdrawal = async (prisma, userId, amountFloat, opts = {}) => 
     const rateSource = settings?.liveRetailRate && Number(settings.liveRetailRate) > 0
         ? (settings.liveRateSource || 'KOTANI_PAY')
         : (settings?.liveRateSource || 'LEGACY_COMPATIBILITY');
-    const rateAsOf = settings?.lastRateSync || new Date();
+    // True external observation timestamp for payout metadata (issue #271 /
+    // PR 271B): prefer lastExternalSync so the recorded provenance never
+    // inherits a MOCK-echo or admin-fabricated stamp.
+    const rateAsOf = settings?.lastExternalSync || settings?.lastRateSync || new Date();
 
     if (!(retailRate > 0) || !(payoutGhs > 0)) {
         const err = new Error('Current USDC/GHS retail exchange rate is unavailable. No fiat payout was created.');

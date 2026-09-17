@@ -110,7 +110,12 @@ class OracleService {
 
             if (!usdcToGhsRate) throw new Error('No usable USD/USDC to GHS rate is available.');
 
-            const lastRateSync = new Date();
+            // One observation timestamp for both freshness fields (issue
+            // #271 / PR 271B): the oracle is the canonical success-only
+            // EXTERNAL writer, so lastRateSync and lastExternalSync always
+            // describe the same successful observation. On failure the cached
+            // rate and both timestamps are left untouched (see catch below).
+            const observationTimestamp = new Date();
             await this.prisma.globalSettings.upsert({
                 where: { id: 1 },
                 update: {
@@ -120,7 +125,8 @@ class OracleService {
                     liveUsdcToUsd: usdcPrice,
                     liveDaiToUsd: daiPrice,
                     liveRateSource: rateSource,
-                    lastRateSync,
+                    lastRateSync: observationTimestamp,
+                    lastExternalSync: observationTimestamp,
                 },
                 create: {
                     id: 1,
@@ -130,7 +136,8 @@ class OracleService {
                     liveUsdcToUsd: usdcPrice,
                     liveDaiToUsd: daiPrice,
                     liveRateSource: rateSource,
-                    lastRateSync,
+                    lastRateSync: observationTimestamp,
+                    lastExternalSync: observationTimestamp,
                 }
             });
 

@@ -64,7 +64,9 @@ exports.initiate = async (req, res) => {
       feeGhs: 0,
       rateGhsPerUsdc: rate,
       rateSource: settings.liveRateSource || 'AZM_ADMIN_MOCK',
-      rateAsOf: settings.lastRateSync || new Date(),
+      // True external observation timestamp (issue #271 / PR 271B): the quote
+      // snapshot must never inherit a MOCK-echo or admin-fabricated stamp.
+      rateAsOf: settings.lastExternalSync || settings.lastRateSync || new Date(),
       ttlSeconds: QUOTE_TTL_SECONDS,
     });
 

@@ -73,6 +73,10 @@ exports.getSettings = async (req, res) => {
                 liveCorporateRate: Number(settings.liveCorporateRate),
                 liveRateSource: settings.liveRateSource,
                 lastRateSync: settings.lastRateSync,
+                // Truthful rate provenance (issue #271 / PR 271B)
+                lastExternalSync: settings.lastExternalSync,
+                lastAdminSetAt: settings.lastAdminSetAt,
+                lastEchoAt: settings.lastEchoAt,
 
                 // Version gate
                 minAppVersion: settings.minAppVersion,
@@ -211,11 +215,24 @@ exports.updateSettings = async (req, res) => {
             changes[field] = { old: oldValue, new: newValue };
         }
 
-        // Any admin rate change creates a fresh rate snapshot timestamp. Existing
-        // quotes keep the rate they were issued with until their own expiry.
+        // Manual admin rate changes record their OWN provenance — they never
+        // masquerade as external market observations (issue #271 / PR 271B).
+        // Existing quotes keep the rate they were issued with until their own
+        // expiry.
+        //
+        // Provenance contract (issue #271 / PR 271B): a manual admin rate
+        // entry is NOT an external market observation. It must never refresh
+        // lastRateSync/lastExternalSync (which would fabricate freshness).
+        // Instead the manual provenance is recorded explicitly: lastAdminSetAt
+        // is stamped and liveRateSource is labeled 'AZM_ADMIN_OVERRIDE' unless
+        // the admin supplied an explicit source in the same request.
         if (Object.prototype.hasOwnProperty.call(updateData, 'liveUsdToGhs')) {
-            updateData.lastRateSync = new Date();
-            changes.lastRateSync = { old: current.lastRateSync, new: updateData.lastRateSync };
+            updateData.lastAdminSetAt = new Date();
+            changes.lastAdminSetAt = { old: current.lastAdminSetAt, new: updateData.lastAdminSetAt };
+            if (!Object.prototype.hasOwnProperty.call(updateData, 'liveRateSource')) {
+                updateData.liveRateSource = 'AZM_ADMIN_OVERRIDE';
+                changes.liveRateSource = { old: current.liveRateSource, new: updateData.liveRateSource };
+            }
         }
 
         if (Object.keys(updateData).length === 0) {

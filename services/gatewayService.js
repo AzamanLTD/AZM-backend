@@ -196,36 +196,82 @@ class GatewayService {
     }
 
     /**
-     * Fetch fresh rates and persist them to GlobalSettings (singleton id=1).
+     * Fetch rates and persist them to GlobalSettings (singleton id=1).
      * Driven on a 5-minute interval by .startRateSync().
+     *
+     * Provenance contract (issue #271 / PR 271B):
+     *   LIVE Kotani response → a genuine EXTERNAL observation: may stamp
+     *     lastRateSync + lastExternalSync (same timestamp) and liveRateSource.
+     *   MOCK (default mode, or LIVE falling back to MOCK after a failure) →
+     *     NOT an external observation: it is an echo of cached values. It must
+     *     never rewrite liveRetailRate / liveUsdToGhs / liveRateSource and
+     *     never refresh lastRateSync / lastExternalSync. Only lastEchoAt is
+     *     stamped (plus liveCorporateRate, derived from the canonical current
+     *     retail snapshot rather than the echoed headline rate, so the
+     *     oracle's USDC adjustment can no longer be erased by this loop).
      */
     async syncRatesToGlobalSettings() {
         try {
             const rates = await this.fetchOfframpRates();
+
+            if (rates.source === 'LIVE') {
+                // Genuine external Kotani observation — one timestamp for
+                // both freshness fields (issue #271 contract).
+                const observationTimestamp = new Date();
+                await this.prisma.globalSettings.upsert({
+                    where: { id: 1 },
+                    update: {
+                        liveRetailRate:    rates.retailRate,
+                        liveCorporateRate: rates.corporateRate,
+                        liveRateSource:    rates.source,
+                        lastRateSync:      observationTimestamp,
+                        lastExternalSync: observationTimestamp,
+                        // Keep liveUsdToGhs in sync so legacy code paths
+                        // (oracle, p2p.completeTrade margin math) keep
+                        // returning the same Hologram value.
+                        liveUsdToGhs:      rates.retailRate
+                    },
+                    create: {
+                        id: 1,
+                        liveRetailRate:    rates.retailRate,
+                        liveCorporateRate: rates.corporateRate,
+                        liveRateSource:    rates.source,
+                        lastRateSync:      observationTimestamp,
+                        lastExternalSync: observationTimestamp,
+                        liveUsdToGhs:      rates.retailRate
+                    }
+                });
+                logger.info(
+                    `[GatewayService] Rate sync ✓ retail=${rates.retailRate} ` +
+                    `corporate=${rates.corporateRate} source=${rates.source}`
+                );
+                return rates;
+            }
+
+            // MOCK echo — cached-value copy, NOT an external observation.
+            // Derive the corporate rate from the canonical current retail
+            // snapshot (liveRetailRate), never from the echoed
+            // liveUsdToGhs → liveRetailRate overwrite that previously erased
+            // the oracle's USDC adjustment every 5 minutes.
+            const settings   = await this.prisma.globalSettings.findUnique({ where: { id: 1 } });
+            const retailRate = Number(settings?.liveRetailRate ?? 12.5);
+            const corporate  = parseFloat((retailRate * (1 - MOCK_CORPORATE_DISCOUNT)).toFixed(6));
+            const echoAt     = new Date();
             await this.prisma.globalSettings.upsert({
                 where: { id: 1 },
                 update: {
-                    liveRetailRate:    rates.retailRate,
-                    liveCorporateRate: rates.corporateRate,
-                    liveRateSource:    rates.source,
-                    lastRateSync:      new Date(),
-                    // Keep liveUsdToGhs in sync so legacy code paths (oracle,
-                    // p2p.completeTrade margin math, depositController) keep
-                    // returning the same Hologram value.
-                    liveUsdToGhs:      rates.retailRate
+                    liveCorporateRate: corporate,
+                    lastEchoAt:        echoAt
                 },
                 create: {
                     id: 1,
-                    liveRetailRate:    rates.retailRate,
-                    liveCorporateRate: rates.corporateRate,
-                    liveRateSource:    rates.source,
-                    lastRateSync:      new Date(),
-                    liveUsdToGhs:      rates.retailRate
+                    liveCorporateRate: corporate,
+                    lastEchoAt:        echoAt
                 }
             });
             logger.info(
-                `[GatewayService] Rate sync ✓ retail=${rates.retailRate} ` +
-                `corporate=${rates.corporateRate} source=${rates.source}`
+                `[GatewayService] Rate echo ✓ (cached retail preserved: ${retailRate}) ` +
+                `corporate=${corporate} source=MOCK`
             );
             return rates;
         } catch (err) {
