@@ -24,6 +24,7 @@ class VaultWorker {
         this.vaultService = vaultService;
         this.notificationService = notificationService;
         this.interval = null;
+        this._running = false; // overlap guard — see _tick
     }
 
     start(intervalMs = 60 * 60 * 1000) {
@@ -37,8 +38,19 @@ class VaultWorker {
     }
 
     async _tick() {
-        await this._fireAutoRules().catch((e) => logger.error({ err: e }, '[VaultWorker.autoRules]'));
-        await this._sweepMatured().catch((e) => logger.error({ err: e }, '[VaultWorker.matured]'));
+        // Overlap guard: runAutoRule is a stale-read TOCTOU (the due-list
+        // findMany happens before runAutoRule re-stamps autoRuleNextRun), so
+        // two concurrent ticks would BOTH execute the same due auto-rule and
+        // move money twice. The scheduler never overlaps ticks by design; this
+        // flag makes that guarantee local instead of trusting the scheduler.
+        if (this._running) return;
+        this._running = true;
+        try {
+            await this._fireAutoRules().catch((e) => logger.error({ err: e }, '[VaultWorker.autoRules]'));
+            await this._sweepMatured().catch((e) => logger.error({ err: e }, '[VaultWorker.matured]'));
+        } finally {
+            this._running = false;
+        }
     }
 
     async _fireAutoRules() {

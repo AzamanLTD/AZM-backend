@@ -80,6 +80,12 @@ function mountHealthRoutes(app, { prisma, workerStatus, redisStatusRef, APP_VERS
         uptime: process.uptime(),
         database: 'connected',
         redis: redisStatusRef(),
+        scheduler: (() => {
+          try {
+            const sched = app.get('scheduler');
+            return sched ? sched.getMode() : 'unknown';
+          } catch (_) { return 'unknown'; }
+        })(),
         workers: workerStatus,
         escrowSystem,
         businessSystem,
@@ -105,6 +111,12 @@ function mountHealthRoutes(app, { prisma, workerStatus, redisStatusRef, APP_VERS
         version: APP_VERSION,
         database: 'disconnected',
         redis: redisStatusRef(),
+        scheduler: (() => {
+          try {
+            const sched = app.get('scheduler');
+            return sched ? sched.getMode() : 'unknown';
+          } catch (_) { return 'unknown'; }
+        })(),
         error: IS_PRODUCTION ? 'Service unavailable' : err.message,
       });
     }
