@@ -10,6 +10,11 @@
 //      this suite pins the fixed shape to the real schema)
 //   D. reminderSentAt is stamped, and the sweep reports the booking as sent
 //   E. a second sweep does not resend (reminderSentAt gating)
+//   F. two CONCURRENT sweeps racing one eligible booking converge to exactly
+//      one notification / one claim / one socket emission (the atomic claim
+//      at the DB boundary arbitrates — no in-memory mutex)
+//   G. if Notification creation fails, the claim rolls back (reminderSentAt
+//      stays NULL) and the next sweep retries successfully
 // SKIPS unless TEST_DATABASE_URL is set (same convention as the other
 // DB-backed suites; CI provides a disposable PostgreSQL instance).
 
@@ -161,6 +166,150 @@ describeOrSkip('Transit reminder worker (sweepTransitReminders)', () => {
             expect(notificationsAfter).toHaveLength(1); // no duplicate
             expect(emitted).toHaveLength(1); // no duplicate socket push
         } finally {
+            global._io = originalIo;
+        }
+    });
+
+    // ── Concurrency: two overlapping sweeps, one eligible booking ─────────
+    // The claim is a conditional UPDATE ... WHERE reminderSentAt IS NULL inside
+    // the same transaction as the notification create, so overlapping sweeps
+    // must converge to exactly one delivery. A Proxy around the prisma client
+    // gates transitBooking.findMany on a two-party barrier, forcing BOTH
+    // sweeps to read the booking as eligible BEFORE either attempts the claim
+    // — the classic race window, made deterministic.
+    test('two concurrent sweeps converge to exactly one notification, claim, and socket emission', async () => {
+        const { customer, trip, booking } = await seedConfirmedBookingWithSeats();
+
+        const emitted = [];
+        const originalIo = global._io;
+        global._io = {
+            to: (room) => ({
+                emit: (event, payload) => emitted.push({ room, event, payload }),
+            }),
+        };
+        try {
+            let arrivals = 0;
+            let releaseBarrier;
+            const gate = new Promise((resolve) => { releaseBarrier = resolve; });
+            const twoPartyBarrier = async () => {
+                arrivals++;
+                if (arrivals === 2) { releaseBarrier(); return; }
+                await gate; // first sweep waits until the second one arrives
+            };
+
+            // Proxy: both sweeps share this client; findMany is held on the
+            // barrier so both read eligibility first. Everything else —
+            // including $transaction and the interactive tx delegates —
+            // passes through untouched to the real DB boundary.
+            let findManyCalls = 0;
+            const racingClient = new Proxy(prisma, {
+                get(target, prop, receiver) {
+                    if (prop !== 'transitBooking') return Reflect.get(target, prop, receiver);
+                    return new Proxy(target.transitBooking, {
+                        get(t2, p2, r2) {
+                            if (p2 !== 'findMany') return Reflect.get(t2, p2, r2);
+                            return async (...args) => {
+                                findManyCalls++;
+                                await twoPartyBarrier();
+                                return t2.findMany(...args);
+                            };
+                        }
+                    });
+                }
+            });
+
+            const [sweepA, sweepB] = await Promise.all([
+                sweepTransitReminders(racingClient),
+                sweepTransitReminders(racingClient),
+            ]);
+
+            // Both sweeps saw the booking as eligible before either claimed.
+            expect(findManyCalls).toBe(2);
+
+            // Exactly one successful claim across both sweeps — the loser is
+            // not an error.
+            expect(sweepA.sent + sweepB.sent).toBe(1);
+            expect(sweepA.errors + sweepB.errors).toBe(0);
+            expect(sweepA.processed + sweepB.processed).toBe(2);
+
+            // Exactly one notification row — no duplicate.
+            const notifications = await prisma.notification.findMany({
+                where: { userId: customer.id },
+            });
+            expect(notifications).toHaveLength(1);
+            expect(notifications[0].actionPayload).toMatchObject({
+                bookingId: booking.id,
+                tripId: trip.id,
+            });
+
+            // Exactly one successful reminder claim, durably stamped.
+            const after = await prisma.transitBooking.findUnique({ where: { id: booking.id } });
+            expect(after.reminderSentAt).toBeInstanceOf(Date);
+            expect(after.reminderSentAt).not.toBeNull();
+
+            // Exactly one socket emission — only after commit.
+            expect(emitted).toHaveLength(1);
+            expect(emitted[0].room).toBe(`user_${customer.id}`);
+            expect(emitted[0].event).toBe('transit_reminder');
+            expect(emitted[0].payload).toMatchObject({ bookingId: booking.id });
+
+            // A later sweep finds nothing left to do.
+            const third = await sweepTransitReminders(prisma);
+            expect(third).toEqual({ processed: 0, sent: 0, errors: 0 });
+            expect((await prisma.notification.findMany({ where: { userId: customer.id } })).length).toBe(1);
+            expect(emitted).toHaveLength(1);
+        } finally {
+            global._io = originalIo;
+        }
+    });
+
+    // ── Failure path: notification creation fails inside the claim tx ──────
+    // The claim must roll back WITH the notification failure — a booking is
+    // never permanently marked reminded without its notification — and the
+    // next sweep retries and succeeds normally.
+    test('a notification failure rolls the claim back and the next sweep retries cleanly', async () => {
+        const { customer, booking } = await seedConfirmedBookingWithSeats();
+
+        const emitted = [];
+        const originalIo = global._io;
+        global._io = {
+            to: (room) => ({
+                emit: (event, payload) => emitted.push({ room, event, payload }),
+            }),
+        };
+        try {
+            // Force notification INSERTs to fail at the DB boundary with an
+            // unsatisfiable CHECK constraint (real PostgreSQL, not a mock).
+            await prisma.$executeRawUnsafe(
+                'ALTER TABLE "Notification" ADD CONSTRAINT "transit_rem_test_force_fail" CHECK (false)'
+            );
+
+            const failed = await sweepTransitReminders(prisma);
+            expect(failed).toEqual({ processed: 1, sent: 0, errors: 1 });
+
+            // Claim rolled back: booking still eligible, nothing delivered.
+            const rolledBack = await prisma.transitBooking.findUnique({ where: { id: booking.id } });
+            expect(rolledBack.reminderSentAt).toBeNull();
+            expect(await prisma.notification.count({ where: { userId: customer.id } })).toBe(0);
+            expect(emitted).toHaveLength(0);
+
+            // Lift the forced failure and retry — normal delivery resumes.
+            await prisma.$executeRawUnsafe(
+                'ALTER TABLE "Notification" DROP CONSTRAINT "transit_rem_test_force_fail"'
+            );
+            const retried = await sweepTransitReminders(prisma);
+            expect(retried).toEqual({ processed: 1, sent: 1, errors: 0 });
+
+            const after = await prisma.transitBooking.findUnique({ where: { id: booking.id } });
+            expect(after.reminderSentAt).toBeInstanceOf(Date);
+            expect(await prisma.notification.count({ where: { userId: customer.id } })).toBe(1);
+            expect(emitted).toHaveLength(1);
+        } finally {
+            // Safety: never leave the constraint behind, even on assertion
+            // failure inside the try block.
+            await prisma.$executeRawUnsafe(
+                'ALTER TABLE "Notification" DROP CONSTRAINT IF EXISTS "transit_rem_test_force_fail"'
+            ).catch(() => {});
             global._io = originalIo;
         }
     });
