@@ -111,6 +111,18 @@ async function autoRelease(prisma, opts = {}) {
     }
 
     try {
+      const { installWalletAddressOverlay } = require('./install-wallet-address-overlay');
+      const r = await installWalletAddressOverlay(prisma);
+      releaseStatus.walletAddressInstallerResult = { ok: r.ok, failed: r.failed, backfilled: r.backfilled };
+      releaseStatus.walletAddressOverlayInstalled = r.failed === 0;
+      if (r.errors && r.errors.length) releaseStatus.walletAddressInstallerErrors = r.errors.slice(0, 10);
+      log(`wallet address overlay: ${r.ok} ok, ${r.failed} failed, ${r.backfilled} backfilled`);
+    } catch (e) {
+      log(`wallet address overlay threw (non-fatal): ${e.message}`);
+      releaseStatus.walletAddressInstallerResult = { error: e.message };
+    }
+
+    try {
       const { backfillAzamanIds } = require('./backfill-azaman-ids');
       const r = await backfillAzamanIds(prisma);
       releaseStatus.azamanIdBackfill = r;

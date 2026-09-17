@@ -11,7 +11,9 @@
 // scattered across hundreds of addresses.
 //
 // Strategy:
-//   1. Query all users who have a tatumPolygonAddress
+//   1. Query all canonical ACTIVE Polygon native-USDC WalletAddress rows
+//      (the AUTHORITATIVE address registry — §P.1; User.tatumPolygonAddress is
+//      no longer a discovery source)
 //   2. For each, check on-chain USDC balance via Tatum API
 //   3. If balance > SWEEP_THRESHOLD_USDC, broadcast a sweep transaction
 //      (from user's derived address → treasury master address)
@@ -64,13 +66,19 @@ class OnchainSweepWorker {
         this._running = true;
 
         try {
-            // Find all users with a deposit address
-            const users = await this.prisma.user.findMany({
-                where: { tatumPolygonAddress: { not: null } },
-                select: { id: true, tatumPolygonAddress: true, username: true },
+            // Address DISCOVERY comes from the authoritative WalletAddress
+            // registry (canonical ACTIVE Polygon native-USDC rows only). Real
+            // signing/broadcast belongs to §P.2 and is deliberately absent here.
+            const addresses = await this.prisma.walletAddress.findMany({
+                where: {
+                    status:          'ACTIVE',
+                    network:         'POLYGON',
+                    contractAddress: '0x3c499c542cef5e3811e1192ce70d8cc03d5c3359',
+                },
+                select: { userId: true, address: true },
             });
 
-            if (users.length === 0) {
+            if (addresses.length === 0) {
                 logger.debug('[OnchainSweepWorker] No addresses to sweep');
                 return;
             }
@@ -78,15 +86,15 @@ class OnchainSweepWorker {
             let sweptCount = 0;
             let sweptTotal = 0;
 
-            for (const user of users) {
+            for (const entry of addresses) {
                 try {
-                    const balance = await this._getOnchainBalance(user.tatumPolygonAddress);
+                    const balance = await this._getOnchainBalance(entry.address);
 
                     if (balance < SWEEP_THRESHOLD_USDC) continue;
 
                     if (!this.isLive) {
                         logger.info(
-                            `[OnchainSweepWorker] MOCK: would sweep ${balance} USDC from user ${user.id} (${user.tatumPolygonAddress})`
+                            `[OnchainSweepWorker] MOCK: would sweep ${balance} USDC from user ${entry.userId} (${entry.address})`
                         );
                         sweptCount++;
                         sweptTotal += balance;
@@ -94,11 +102,11 @@ class OnchainSweepWorker {
                     }
 
                     // LIVE mode — broadcast sweep transaction
-                    await this._executeSweep(user, balance);
+                    await this._executeSweep(entry, balance);
                     sweptCount++;
                     sweptTotal += balance;
                 } catch (err) {
-                    logger.warn({ err: err.message, userId: user.id }, '[OnchainSweepWorker] per-user error');
+                    logger.warn({ err: err.message, userId: entry.userId }, '[OnchainSweepWorker] per-address error');
                 }
             }
 
@@ -141,7 +149,7 @@ class OnchainSweepWorker {
      * Execute a sweep transaction from a user's deposit address to the treasury.
      * LIVE mode only — calls Tatum's broadcast endpoint.
      */
-    async _executeSweep(user, amount) {
+    async _executeSweep(entry, amount) {
         if (!this.treasuryAddress) {
             logger.warn('[OnchainSweepWorker] TATUM_TREASURY_ADDRESS not configured, skipping live sweep');
             return;
@@ -150,8 +158,8 @@ class OnchainSweepWorker {
         // Record the sweep for audit trail (before broadcasting)
         await this.prisma.onchainSweep.create({
             data: {
-                userId: user.id,
-                fromAddress: user.tatumPolygonAddress,
+                userId: entry.userId,
+                fromAddress: entry.address,
                 toAddress: this.treasuryAddress,
                 amountUsdc: amount,
                 status: 'BROADCASTING',
@@ -163,9 +171,10 @@ class OnchainSweepWorker {
 
         // Broadcast via Tatum (requires the derived private key)
         // This is a placeholder — actual implementation needs the Tatum
-        // private key derivation flow which is out of scope for mock mode
+        // private key / KMS signing flow, which is §P.2 and deliberately NOT
+        // implemented in the address-governance slice.
         logger.info(
-            `[OnchainSweepWorker] LIVE sweep: ${amount} USDC from ${user.tatumPolygonAddress} → ${this.treasuryAddress}`
+            `[OnchainSweepWorker] LIVE sweep: ${amount} USDC from ${entry.address} → ${this.treasuryAddress}`
         );
     }
 }

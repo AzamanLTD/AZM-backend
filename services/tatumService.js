@@ -220,12 +220,16 @@ class TatumService {
      * @returns {Promise<{ id: number, username: string }|null>}
      */
     async lookupUserByAddress(prisma, address) {
+        // Ownership authority moved to the WalletAddress registry (§P.1).
+        // Kept as a thin compatibility wrapper for existing call shapes.
         if (!address) return null;
-        const user = await prisma.user.findFirst({
-            where:  { tatumPolygonAddress: address.toLowerCase() },
-            select: { id: true, username: true }
+        const { resolveOwner } = require('./walletAddressService');
+        const owner = await resolveOwner(prisma, { address });
+        if (!owner) return null;
+        return prisma.user.findUnique({
+            where:  { id: owner.userId },
+            select: { id: true, username: true },
         });
-        return user || null;
     }
 
     // ── Internals ───────────────────────────────────────────────────────────

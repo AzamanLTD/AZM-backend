@@ -408,59 +408,30 @@ exports.getPolygonDepositAddress = async (req, res) => {
             });
         }
 
-        // ── Check if address already persisted ───────────────────────────────
-        const user = await prisma.user.findUnique({
-            where:  { id: userId },
-            select: { tatumPolygonAddress: true }
-        });
-
-        if (!user) {
-            return res.status(404).json({ success: false, message: 'User not found.' });
-        }
-
-        if (user.tatumPolygonAddress) {
-            return res.status(200).json({
-                success: true,
-                message: 'Polygon deposit address retrieved.',
-                data: {
-                    address:          user.tatumPolygonAddress,
-                    derivationIndex:  userId,
-                    source:           tatumService.providerMode,
-                    isNew:            false,
-                    network:          'Polygon (MATIC)',
-                    token:            'USDC',
-                    warning:          'Only send USDC on the Polygon network to this address. Sending other tokens or using other networks will result in permanent loss.'
-                }
-            });
-        }
-
-        // ── Derive a new address ─────────────────────────────────────────────
-        const derivation = await tatumService.deriveDepositAddress(userId);
-
-        // Persist to User record (lowercase for consistent lookups)
-        const normalizedAddress = derivation.address.toLowerCase();
-        await prisma.user.update({
-            where: { id: userId },
-            data:  { tatumPolygonAddress: normalizedAddress }
-        });
-
-        // Best-effort: subscribe the address to Tatum webhooks
-        let subscription = null;
+        // WalletAddress is the authoritative registry; User.tatumPolygonAddress
+        // is only a compatibility mirror (written solely by the service).
+        const { allocateDepositAddress } = require('../services/walletAddressService');
+        let result;
         try {
-            subscription = await tatumService.subscribeAddress(normalizedAddress);
-        } catch (subErr) {
-            logger.error({ err: subErr }, '[getPolygonDepositAddress] Subscription failed (non-fatal)');
+            result = await allocateDepositAddress(prisma, tatumService, userId);
+        } catch (err) {
+            if (err?.code === 'USER_NOT_FOUND') {
+                return res.status(404).json({ success: false, message: 'User not found.' });
+            }
+            throw err;
         }
 
-        return res.status(201).json({
+        return res.status(result.isNew ? 201 : 200).json({
             success: true,
-            message: 'Polygon deposit address generated and saved.',
+            message: result.isNew
+                ? 'Polygon deposit address generated and saved.'
+                : 'Polygon deposit address retrieved.',
             data: {
-                address:          normalizedAddress,
-                derivationIndex:  derivation.derivationIndex,
-                source:           derivation.source,
-                isNew:            true,
-                subscriptionId:   subscription?.subscriptionId || null,
+                address:          result.address,
+                derivationIndex:  result.derivationIndex,
+                source:           tatumService.providerMode,
+                isNew:            result.isNew,
+                subscriptionId:    result.subscriptionId || null,
                 network:          'Polygon (MATIC)',
                 token:            'USDC',
                 warning:          'Only send USDC on the Polygon network to this address. Sending other tokens or using other networks will result in permanent loss.'
@@ -468,7 +439,9 @@ exports.getPolygonDepositAddress = async (req, res) => {
         });
 
     } catch (error) {
+        const logger = require('../src/config/logger');
         logger.error({ err: error }, '[getPolygonDepositAddress] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };
+
