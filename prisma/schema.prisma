@@ -778,6 +778,11 @@ model User {
   withdrawals  Withdrawal[]
   transactions TransactionHistory[]
 
+  // Financial architecture §P.1 (2026-09-17): WalletAddress is the AUTHORITATIVE
+  // on-chain deposit-address registry. tatumPolygonAddress above remains ONLY as
+  // a compatibility mirror written solely by services/walletAddressService.js.
+  walletAddresses WalletAddress[]
+
   // V2: Trade Queue
   queuedTrades TradeQueue[]
 
@@ -5630,6 +5635,45 @@ model IdempotencyKey {
 
 /// On-chain USDC sweep records — tracks consolidation from user deposit
 /// addresses to the platform treasury wallet on Polygon.
+// ── Wallet address authority (financial architecture §P.1, 2026-09-17) ───────
+// AUTHORITATIVE registry for customer on-chain deposit addresses.
+// Native Polygon USDC (contract 0x3c499c542cef5e3811e1192ce70d8cc03d5c3359) is the
+// canonical deposit asset; bridged USDC.e is a DISTINCT asset and must never be
+// conflated with canonical USDC. Only ONE ACTIVE address may exist per user +
+// network + canonical asset (partial unique index, installed idempotently by
+// prisma/migrations/20260917150000_wallet_address_authority and
+// infra/install-wallet-address-overlay.js because Prisma cannot express partial
+// unique indexes). Retired addresses are never reassigned: (address, network) is
+// globally unique and status never transitions back from RETIRED.
+enum WalletAddressStatus {
+  ACTIVE
+  RETIRED
+}
+
+model WalletAddress {
+  id              String              @id @default(uuid())
+  userId          Int
+  network         String              @default("POLYGON") @db.VarChar(20)
+  asset           String              @default("USDC") @db.VarChar(20)
+  contractAddress String              @db.VarChar(42) // exact token contract, lowercase
+  address         String              @db.VarChar(42) // deposit address, lowercase
+  derivationIndex Int? // persisted derivation index (rule: user.id)
+  status          WalletAddressStatus @default(ACTIVE)
+  subscriptionId  String?             @db.VarChar(100) // Tatum webhook subscription, when one exists
+  firstSeenAt     DateTime            @default(now())
+  lastObservedAt  DateTime?
+  lastSweepAt     DateTime?
+  metadata        Json?
+  createdAt       DateTime            @default(now())
+  updatedAt       DateTime            @updatedAt
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@unique([address, network])
+  @@index([userId, network, contractAddress, status])
+  @@index([status, network])
+}
+
 model OnchainSweep {
   id          String    @id @default(uuid())
   userId      Int

@@ -41,7 +41,19 @@ exports.exportUserData = async (req, res) => {
                 appleId: true,
                 influencerCode: true,
                 referredByCode: true,
-                tatumPolygonAddress: true,
+                tatumPolygonAddress: true, // legacy mirror (§P.1)
+                walletAddresses: {
+                    select: {
+                        network: true,
+                        asset: true,
+                        contractAddress: true,
+                        address: true,
+                        derivationIndex: true,
+                        status: true,
+                        subscriptionId: true,
+                        createdAt: true,
+                    },
+                },
                 moolrePaymentId: true,
                 availableBalance: true,
                 escrowLockedBalance: true,

@@ -78,7 +78,26 @@ exports.tatumCryptoWebhook = async (req, res) => {
         // express.json({ verify: (req, res, buf) => { req.rawBody = buf.toString(); }})
         const rawBody = req.rawBody || JSON.stringify(req.body);
 
-        if (tatumService && signatureHeader) {
+        if (process.env.NODE_ENV === 'production') {
+            // Production is strictly fail-closed (§P.1): a financial webhook may
+            // never reach the ledger unless signature verification ACTUALLY
+            // succeeds. Missing verifier, missing secret (checked above), missing
+            // signature, or an invalid signature all reject before any ledger
+            // read or mutation. This closes the previous edge where an unbound
+            // tatumService together with a present header passed unverified.
+            if (!tatumService) {
+                logger.error('[tatumCryptoWebhook] Tatum service is not bound; refusing to verify or process.');
+                return res.status(503).json({
+                    success: false,
+                    message: 'Tatum webhook endpoint is not configured. Refusing to credit funds.'
+                });
+            }
+            if (!signatureHeader) {
+                return res.status(401).json({
+                    success: false,
+                    message: 'Missing x-payload-hash header.'
+                });
+            }
             const isValid = tatumService.verifyWebhookSignature(rawBody, signatureHeader);
             if (!isValid) {
                 logger.warn('[tatumCryptoWebhook] HMAC verification failed.');
@@ -87,14 +106,19 @@ exports.tatumCryptoWebhook = async (req, res) => {
                     message: 'Invalid webhook signature (HMAC verification failed).'
                 });
             }
-        } else if (!signatureHeader && process.env.NODE_ENV === 'production') {
-            // In production, reject unsigned webhooks
-            return res.status(401).json({
-                success: false,
-                message: 'Missing x-payload-hash header.'
-            });
+        } else if (tatumService && signatureHeader) {
+            // Non-production: verify whenever a verifier + signature are present
+            // (existing behavior preserved), but unsigned test/local webhooks
+            // remain admissible so established test flows are not weakened.
+            const isValid = tatumService.verifyWebhookSignature(rawBody, signatureHeader);
+            if (!isValid) {
+                logger.warn('[tatumCryptoWebhook] HMAC verification failed.');
+                return res.status(401).json({
+                    success: false,
+                    message: 'Invalid webhook signature (HMAC verification failed).'
+                });
+            }
         }
-        // In non-production without signature, allow through (for testing)
 
         // ── Step 2: Extract payload ──────────────────────────────────────────
         // Tatum's ADDRESS_TRANSACTION webhook shape:
@@ -142,21 +166,22 @@ exports.tatumCryptoWebhook = async (req, res) => {
             targetUserId = parseInt(body.userId, 10);
         }
 
-        // Otherwise (Tatum native shape), look up by address
+        // Otherwise (Tatum native shape), resolve ownership through the
+        // AUTHORITATIVE WalletAddress registry (network-scoped, not a bare
+        // address match). The legacy User.tatumPolygonAddress remains the
+        // deterministic migration fallback inside the resolver.
         if (!targetUserId || isNaN(targetUserId)) {
-            const user = await prisma.user.findFirst({
-                where:  { tatumPolygonAddress: address },
-                select: { id: true }
-            });
-            if (!user) {
-                logger.warn(`[tatumCryptoWebhook] No user found for address ${address}. txHash: ${txHash}`);
+            const { resolveOwner } = require('../services/walletAddressService');
+            const owner = await resolveOwner(prisma, { address, network: 'POLYGON' });
+            if (!owner) {
+                logger.warn(`[tatumCryptoWebhook] No owner found for address ${address}. txHash: ${txHash}`);
                 return res.status(200).json({
                     success: true,
                     message: 'Address not associated with any user. Possibly a treasury sweep — acknowledged.',
                     data:    { txHash, address, unmatched: true }
                 });
             }
-            targetUserId = user.id;
+            targetUserId = owner.userId;
         }
 
         // ── Step 4: Idempotency check ────────────────────────────────────────
