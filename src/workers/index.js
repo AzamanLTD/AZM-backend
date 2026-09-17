@@ -188,6 +188,10 @@ async function startWorkers(app, {
         onchainSweepWorker: IS_TEST_ENV ? 'disabled_in_test' : 'running',
         disappearingMessageWorker: IS_TEST_ENV ? 'disabled_in_test' : 'running',
         proofOfReservesWorker: IS_TEST_ENV ? 'disabled_in_test' : 'running',
+        // transit-reminders is registered below on the same scheduler as the
+        // workers above; surfaced here so /health can observe the job at all
+        // (a failing sweep must be visible, not silent).
+        transitReminderWorker: IS_TEST_ENV ? 'disabled_in_test' : 'running',
         tradeWorker: IS_TEST_ENV ? 'disabled_in_test' : 'pending_listen',
     });
 
