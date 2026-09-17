@@ -13,7 +13,7 @@ const logger = require('../../src/config/logger');
 const { z } = require('zod');
 
 // ── Deposit ─────────────────────────────────────────────────────────────────
-// controllers/depositController.initiateLocalFiatDeposit reads { amountGhs, provider }.
+// Consumed by POST /api/deposit/fiat/initiate (quoteFiatDepositController.initiate): { amountGhs, provider }.
 exports.initiateFiatDepositSchema = z.object({
   amountGhs: z.coerce.number().positive('Amount must be positive'),
   provider:  z.enum(['MTN_MOMO', 'TELECEL_CASH', 'VODAFONE_CASH', 'AIRTELTIGO', 'BANK_TRANSFER']),
@@ -81,10 +81,11 @@ exports.forceReleaseSchema = z.object({
 });
 
 // ── Moolre MoMo PIN-push initiation (added 2026-06-24) ───────────────────────
-// controllers/depositController.initiateMoolreFiatDeposit reads
-// { amountGhs, provider, phoneNumber, memo? }. Only MoMo providers are valid on
-// this endpoint (BANK_TRANSFER is not). .passthrough() keeps the optional `memo`
-// (Susu trace) intact; the controller's own checks remain as fallback.
+// Consumed by POST /api/deposit/fiat/initiate/moolre
+// (moolreQuoteDepositController.initiate): { amountGhs, provider, phoneNumber,
+// memo? }. Only MoMo providers are valid on this endpoint (BANK_TRANSFER is
+// not). .passthrough() keeps the optional `memo` (Susu trace) intact; the
+// controller's own checks remain as fallback.
 const MOMO_PROVIDERS = new Set(['MTN_MOMO', 'TELECEL_CASH', 'VODAFONE_CASH', 'AIRTELTIGO']);
 
 exports.initiateMoolreFiatDepositSchema = z.object({
