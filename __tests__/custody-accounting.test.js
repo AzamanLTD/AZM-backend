@@ -336,15 +336,19 @@ describeOrSkip('§P.3 custody accounting (real PostgreSQL)', () => {
         '"SystemMasterCrypto", "SystemFiatPool", "JournalEntry", "ProofOfReservesSnapshot", ' +
         '"ProofOfReservesLeaf" RESTART IDENTITY CASCADE'
     );
+    // 30s hook timeout: TRUNCATE of 14 tables must survive GitHub-hosted
+    // runners with throttled disk (observed 20x fsync slowdown, e.g. CI run
+    // 35272208092) — the default 5s turned a slow host into a full battery
+    // failure cascade. Same rationale as the explicit 15s afterEach below.
     beforeEach(async () => {
         enableGates();
         process.env.CUSTODY_EVIDENCE_MAX_AGE_MINUTES = '15';
         await TRUNCATE_ALL(); // hermetic: never inherit battery leftovers
-    });
+    }, 30000);
     afterEach(async () => {
         custody.__setProviderForTests(null);
         await TRUNCATE_ALL();
-    }, 15000);
+    }, 30000);
 
     async function seedRegistryAddress(userId, { address = CUST, status = 'ACTIVE' } = {}) {
         return prisma.walletAddress.create({
