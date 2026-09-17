@@ -40,6 +40,7 @@ const {
     EVIDENCE_ERRORS,
     CustodyEvidenceError,
     normalizeAddress,
+    TATUM_V4_CHAIN,
 } = require('./custodyEvidenceProvider');
 
 const prisma = new PrismaClient();
@@ -51,14 +52,17 @@ const TIERS = {
 const CONTROL = { PLATFORM_KMS_CUSTODY: 'PLATFORM_KMS_CUSTODY' };
 const MOVEMENT_KINDS = { DEPOSIT_IN: 'DEPOSIT_IN', SWEEP: 'SWEEP', WITHDRAWAL_OUT: 'WITHDRAWAL_OUT' };
 const MOVEMENT_STATUS = { CANDIDATE: 'CANDIDATE', VERIFIED: 'VERIFIED', FAILED: 'FAILED', RECONCILIATION_REQUIRED: 'RECONCILIATION_REQUIRED' };
-const JOURNAL = {
-    DEPOSIT: 'CUSTODY_DEPOSIT',
-    SWEEP: 'CUSTODY_SWEEP',
-    WITHDRAWAL: 'CUSTODY_WITHDRAWAL',
-    custodyDepositAccount: 'custody:deposit:usdc',
-    custodyHotAccount: 'custody:hot:usdc',
-    userLiability: (userId) => `user:${userId}:liability`,
-};
+
+/*
+ * ONE ACCOUNTING TRUTH (§P.3 reconciliation with the existing shadow journal):
+ * every customer economic event — deposit credit, withdrawal debit — is
+ * ALREADY represented exactly once in JournalEntry by journalIntegration
+ * (recordDeposit at webhook-credit time, recordWithdrawal at withdrawal
+ * initiation). Custody movements deliberately post NO JournalEntry rows: a
+ * second representation of the same economic event would double-count the
+ * ledger. The custody truth of the event lives in CustodyMovement itself;
+ * JournalEntry remains the existing shadow ledger, untouched.
+ */
 
 // ── exact arithmetic ───────────────────────────────────────────────────────
 /** BigInt base units → EXACT decimal string ("100123456",6) → "100.123456". */
@@ -75,6 +79,36 @@ function decimalStringFromBaseUnits(baseUnits, decimals = 6) {
 /** BigInt base units → exact Prisma.Decimal (never Number()/1e6). */
 function decimalFromBaseUnits(baseUnits, decimals = 6) {
     return new Prisma.Decimal(decimalStringFromBaseUnits(baseUnits, decimals));
+}
+
+/**
+ * RAW webhook amount string → exact integer base units. Pure string/BigInt
+ * arithmetic — Number(), parseFloat() and float math never touch the value,
+ * so quantities beyond JS safe-integer precision stay exact. Fail closed:
+ * anything not representable exactly within the token's decimals (malformed,
+ * scientific notation, more significant decimals than the token has) throws.
+ * Trailing zeros beyond the token precision are tolerated ("1.5000000" is
+ * exactly 1.5), because they do not change the exact quantity.
+ */
+function exactWebhookAmountToBaseUnits(raw, decimals = 6) {
+    const str = typeof raw === 'string' ? raw.trim() : (raw != null ? String(raw) : '');
+    if (!/^(?:\d+)(?:\.\d+)?$/.test(str)) {
+        throw new Error(`webhook amount is not an exact non-negative decimal string ("${str}")`);
+    }
+    const [intPart, fracRaw = ''] = str.split('.');
+    let frac = fracRaw;
+    if (frac.length > decimals) {
+        const overflow = frac.slice(decimals);
+        if (/^0+$/.test(overflow)) {
+            frac = frac.slice(0, decimals); // trailing zeros — same exact quantity
+        } else {
+            throw new Error(`webhook amount "${str}" has more than ${decimals} significant decimals — not exactly representable`);
+        }
+    }
+    if (intPart === '0' && /^0*$/.test(frac)) {
+        throw new Error(`webhook amount "${str}" is zero — no exact custody quantity`);
+    }
+    return BigInt(intPart + frac.padEnd(decimals, '0'));
 }
 
 // ── custody accounts ───────────────────────────────────────────────────────
@@ -202,79 +236,6 @@ async function syncAndListEligibleAccounts(db, { hotWalletAddress, hotWalletCont
     return eligible;
 }
 
-// ── custody journal (exact, idempotent, double-entry) ──────────────────────
-/**
- * Post the balanced double-entry journal representation of a VERIFIED custody
- * movement, inside the caller's transaction. Exact Prisma.Decimal values are
- * produced from base units — parseFloat never touches the authoritative value.
- * Idempotent: the deterministic transactionId is checked first.
- */
-async function postCustodyJournal(tx, { movement, userId = null }) {
-    const transactionId = `CUSTODY-${movement.id}`;
-    const existing = await tx.journalEntry.findFirst({ where: { transactionId }, select: { id: true } });
-    if (existing) return { transactionId, alreadyPosted: true };
-
-    const amount = decimalFromBaseUnits(BigInt(movement.amountBaseUnits), movement.decimals || 6);
-    if (amount.lte(0)) throw new Error(`Custody journal refused: non-positive exact amount for movement ${movement.id}`);
-
-    let entryType;
-    let lines;
-    let journalUserId = userId;
-    if (movement.kind === MOVEMENT_KINDS.DEPOSIT_IN) {
-        entryType = JOURNAL.DEPOSIT;
-        // D custody:deposit:usdc / C user:{id}:liability
-        journalUserId = journalUserId ?? null;
-        lines = [
-            { account: JOURNAL.custodyDepositAccount, debit: amount, credit: new Prisma.Decimal(0) },
-            { account: JOURNAL.userLiability(journalUserId), debit: new Prisma.Decimal(0), credit: amount },
-        ];
-    } else if (movement.kind === MOVEMENT_KINDS.SWEEP) {
-        entryType = JOURNAL.SWEEP;
-        // D custody:hot:usdc / C custody:deposit:usdc
-        lines = [
-            { account: JOURNAL.custodyHotAccount, debit: amount, credit: new Prisma.Decimal(0) },
-            { account: JOURNAL.custodyDepositAccount, debit: new Prisma.Decimal(0), credit: amount },
-        ];
-    } else if (movement.kind === MOVEMENT_KINDS.WITHDRAWAL_OUT) {
-        entryType = JOURNAL.WITHDRAWAL;
-        // D user:{id}:liability / C custody:hot:usdc
-        journalUserId = journalUserId ?? null;
-        lines = [
-            { account: JOURNAL.userLiability(journalUserId), debit: amount, credit: new Prisma.Decimal(0) },
-            { account: JOURNAL.custodyHotAccount, debit: new Prisma.Decimal(0), credit: amount },
-        ];
-    } else {
-        throw new Error(`postCustodyJournal: unknown movement kind ${movement.kind}`);
-    }
-
-    const description = `§P.3 custody ${movement.kind} (${movement.status}) ${decimalStringFromBaseUnits(BigInt(movement.amountBaseUnits), movement.decimals || 6)} ${movement.asset}`;
-    for (const line of lines) {
-        await tx.journalEntry.create({
-            data: {
-                transactionId,
-                entryType,
-                account: line.account,
-                debit: line.debit,
-                credit: line.credit,
-                description: description.slice(0, 500),
-                reference: (movement.txHash || movement.idempotencyKey || '').slice(0, 100),
-                userId: journalUserId ?? null,
-                relatedEntity: 'custodyMovement',
-                relatedEntityId: movement.id,
-                metadata: {
-                    custodyMovementId: movement.id,
-                    evidenceSource: movement.evidenceSource || null,
-                    network: movement.network,
-                    asset: movement.asset,
-                    contractAddress: movement.contractAddress,
-                    amountBaseUnits: movement.amountBaseUnits.toString(),
-                },
-            },
-        });
-    }
-    return { transactionId, alreadyPosted: false };
-}
-
 // ── deposit movements (webhook candidate → transaction-evidence verified) ───
 /**
  * Record the deposit candidate identified by the (already-credited) webhook
@@ -330,8 +291,10 @@ async function recordDepositCandidate(tx, { walletAddress, txHash, amountBaseUni
  * structurally separated (SOURCE_TX only, here).
  *
  * Outcomes:
- *   verified            → movement CANDIDATE→VERIFIED (atomic with evidence row
- *                         + exact journal posting; concurrency-safe, exactly-once)
+ *   verified            → movement CANDIDATE→VERIFIED (atomic with the
+ *                         transaction-evidence row; concurrency-safe, exactly-once.
+ *                         No JournalEntry is posted — the deposit credit was
+ *                         already journaled exactly once by journalIntegration)
  *   definitive mismatch → movement →FAILED with an explicit failureReason
  *                         (candidate retained; the credit itself becomes an
  *                         ops reconciliation item — it is NOT auto-reversed)
@@ -373,22 +336,34 @@ async function verifyDepositMovement(db, { movementId }, { txProvider } = {}) {
     }
 
     // Validate the transfer semantics against the movement's exact identity.
+    // Every check is on the RETURNED entry — the request merely told the
+    // provider where to look; only the returned record can prove anything.
     const expectedAddress = normalizeAddress(account.address);
     const expectedContract = normalizeAddress(account.contractAddress);
+    const expectedChain = TATUM_V4_CHAIN[String(movement.network || '').toUpperCase()] || null;
+    const expectedHash = String(movement.txHash || '').toLowerCase().trim();
     const failures = [];
     if (!obs.entries || obs.entries.length === 0) failures.push('TX_NOT_FOUND');
-    const incoming = (obs.entries || []).filter((e) => e.transactionSubtype === 'incoming');
-    if (incoming.length === 0) failures.push('NOT_INCOMING');
+    // The returned record must be from the exact chain this custody exists on.
+    const rightChain = (obs.entries || []).filter((e) => e.chain === expectedChain);
+    if (rightChain.length === 0) failures.push('CHAIN_MISMATCH');
+    // The returned record must be an ERC-20 token transfer ("fungible") — a
+    // native-coin transfer or NFT transfer can never prove a USDC deposit.
+    const fungible = rightChain.filter((e) => e.transactionType === 'fungible');
+    if (rightChain.length > 0 && fungible.length === 0) failures.push('WRONG_TRANSACTION_TYPE');
+    const incoming = fungible.filter((e) => e.transactionSubtype === 'incoming');
+    if (fungible.length > 0 && incoming.length === 0) failures.push('NOT_INCOMING');
     const toUs = incoming.filter((e) => e.address === expectedAddress);
-    if (toUs.length === 0) failures.push('ADDRESS_MISMATCH');
+    if (incoming.length > 0 && toUs.length === 0) failures.push('ADDRESS_MISMATCH');
     const canonical = toUs.filter((e) => e.tokenAddress === expectedContract);
-    if (canonical.length === 0) failures.push('WRONG_CONTRACT'); // bridged USDC.e is NEVER native USDC
+    if (toUs.length > 0 && canonical.length === 0) failures.push('WRONG_CONTRACT'); // bridged USDC.e is NEVER native USDC
     // Defense in depth: the evidence must be for the EXACT requested hash —
-    // a provider (or a misbehaving proxy) returning a different transaction's
-    // matching-looking transfer can never verify this movement.
-    const hashBound = canonical.filter((e) => e.hash === movement.txHash);
+    // normalized on both sides, so a mixed-case provider response verifies a
+    // lowercase-stored movement hash (and vice versa) but a different
+    // transaction's matching-looking transfer can never verify it.
+    const hashBound = canonical.filter((e) => (e.hash || '').toLowerCase().trim() === expectedHash);
     if (canonical.length > 0 && hashBound.length === 0) failures.push('HASH_MISMATCH');
-    const entry = hashBound[0] || canonical[0] || null;
+    const entry = hashBound[0] || null;
     if (entry && entry.blockNumber == null) failures.push('NOT_CONFIRMED');
     if (entry && entry.amountBaseUnits !== BigInt(movement.amountBaseUnits)) failures.push('AMOUNT_MISMATCH');
 
@@ -404,7 +379,9 @@ async function verifyDepositMovement(db, { movementId }, { txProvider } = {}) {
         return { verified: false, reason: failures.join('+'), retryable: false };
     }
 
-    // Verified: atomic CANDIDATE→VERIFIED + evidence row + journal posting.
+    // Verified: atomic CANDIDATE→VERIFIED + transaction-evidence row.
+    // (No journal posting — the webhook credit already journaled this
+    // economic event exactly once; a second representation would double-count.)
     const result = await db.$transaction(async (tx) => {
         const updated = await tx.custodyMovement.updateMany({
             where: { id: movement.id, status: MOVEMENT_STATUS.CANDIDATE },
@@ -452,7 +429,7 @@ async function verifyDepositMovement(db, { movementId }, { txProvider } = {}) {
                 },
             },
         });
-        await postCustodyJournal(tx, { movement: fresh, userId: account.userId });
+
         return { concurrent: false, movement: fresh, evidence };
     });
     if (result.concurrent) {
@@ -552,7 +529,6 @@ async function recordExecutionMovement(tx, { execution, hotWalletAddress }) {
             metadata: { executionKind: execution.kind, settlement: 'settleExecution' },
         },
     });
-    await postCustodyJournal(tx, { movement, userId: execution.userId ?? null });
     return { movement, isNew: true };
 }
 
@@ -613,7 +589,7 @@ async function observeAccountBalance(db, { account, provider }) {
     }
     return db.$transaction(async (tx) => {
         const current = await tx.custodyEvidence.findFirst({
-            where: { custodyAccountId: account.id, status: 'ACTIVE' },
+            where: { custodyAccountId: account.id, scope: 'ACCOUNT_BALANCE', status: 'ACTIVE' },
         });
         if (current) {
             if (current.observedAt.getTime() === obs.observedAt.getTime() && current.balanceBaseUnits === obs.balanceBaseUnits) {
@@ -679,7 +655,7 @@ async function observeAccountBalance(db, { account, provider }) {
         // rollback, against the winner's committed row.
         if (err && err.code === 'P2002') {
             const winner = await db.custodyEvidence.findFirst({
-                where: { custodyAccountId: account.id, status: 'ACTIVE' },
+                where: { custodyAccountId: account.id, scope: 'ACCOUNT_BALANCE', status: 'ACTIVE' },
             });
             // The concurrent winner recorded the SAME balance → idempotent
             // with the winner's row; the caller aggregates the identical
@@ -695,8 +671,10 @@ async function observeAccountBalance(db, { account, provider }) {
 
 /** The accepted evidence for an account IF it is still fresh; else null. */
 async function getFreshAcceptedEvidence(db, { custodyAccountId, maxAgeMs }) {
+    // Balance observations ONLY: TRANSACTION-scope evidence is never the
+    // account's current balance and must never feed the reserve numerator.
     const evidence = await db.custodyEvidence.findFirst({
-        where: { custodyAccountId, status: 'ACTIVE' },
+        where: { custodyAccountId, scope: 'ACCOUNT_BALANCE', status: 'ACTIVE' },
     });
     if (!evidence) return null;
     const age = Date.now() - evidence.observedAt.getTime();
@@ -750,7 +728,13 @@ async function classifyUsdcLiabilityFlows(db) {
     // Customer obligation decreased by the FULL debit (net payout + fee).
     const usdcDebits = cryptoDebitNet.plus(cryptoDebitFee).plus(fiatDebitNet).plus(fiatDebitFee);
     const xRaw = usdcCredits.minus(usdcDebits);
-    const x = xRaw.gt(zero) ? xRaw : zero;
+    // NEGATIVE total obligation is an impossible/inconsistent historical flow
+    // state (completed debits exceed completed credits). It is NEVER floored
+    // into a valid zero — that would let an inconsistent ledger attest
+    // COMPLETE with X=0, Z=0. The signed value is kept for diagnostics and
+    // the classification fails closed (X reported as null → UNATTESTABLE).
+    const negativeFlow = xRaw.lt(zero);
+    const x = negativeFlow ? null : xRaw;
 
     // Evidence-linked subset: verified deposits − evidence-gated crypto payouts
     // (net on-chain outflow; the fee never left the chain).
@@ -766,8 +750,9 @@ async function classifyUsdcLiabilityFlows(db) {
     return {
         usdcCredits,
         usdcDebits,
-        usdcLiabilityTotal: x,           // X — exact, floored at zero
-        usdcLiabilityTotalSigned: xRaw,
+        liabilityClassificationStatus: negativeFlow ? 'NEGATIVE_LIABILITY_FLOW' : 'OK',
+        usdcLiabilityTotal: x,           // X — exact; null = classification invalid (fail closed)
+        usdcLiabilityTotalSigned: xRaw,  // diagnostics: signed raw, never reinterpreted as zero
         evidenceLinkedUsdcObligation: yRaw, // Y — exact signed
         verifiedDepositsTotal: verifiedDepositsBase,
         cryptoWithdrawalsNet: cryptoDebitNet,
@@ -827,13 +812,12 @@ module.exports = {
     CONTROL,
     MOVEMENT_KINDS,
     MOVEMENT_STATUS,
-    JOURNAL,
     decimalStringFromBaseUnits,
     decimalFromBaseUnits,
+    exactWebhookAmountToBaseUnits,
     ensureDepositAccount,
     ensureHotWalletAccount,
     syncAndListEligibleAccounts,
-    postCustodyJournal,
     recordDepositCandidate,
     verifyDepositMovement,
     verifyPendingDepositMovements,

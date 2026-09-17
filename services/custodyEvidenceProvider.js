@@ -191,7 +191,7 @@ function createTatumTxByHashProvider(config = {}) {
                 const amountBaseUnits = decimalStringToBaseUnits(e.amount, decimals, { field: 'amount' });
                 return {
                     chain: e.chain,
-                    hash: e.hash,
+                    hash: e.hash != null ? String(e.hash).toLowerCase().trim() : null,
                     address: normalizeAddress(e.address),
                     counterAddress: e.counterAddress ? normalizeAddress(e.counterAddress) : null,
                     tokenAddress: e.tokenAddress ? normalizeAddress(e.tokenAddress) : null,
@@ -217,6 +217,7 @@ function createTatumTxByHashProvider(config = {}) {
 module.exports = {
     SOURCE_BALANCE,
     SOURCE_TX,
+    TATUM_V4_CHAIN,
     EVIDENCE_ERRORS,
     CustodyEvidenceError,
     parseBaseUnitsNonNegative,

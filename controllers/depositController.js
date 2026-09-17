@@ -32,6 +32,7 @@ function _getNotificationService(req) {
 const { audit } = require('../utils/audit');
 const logger = require('../src/config/logger');
 const journal = require('../services/journalIntegration');
+const custodyAccounting = require('../services/custodyAccountingService');
 
 // =============================================================================
 // 1. TATUM CRYPTO WEBHOOK LISTENER   (Phase C: Polygon Web3 Integration)
@@ -129,7 +130,15 @@ exports.tatumCryptoWebhook = async (req, res) => {
         const body    = req.body || {};
         const address = (body.address || '').toLowerCase().trim();
         const txHash  = body.txId || body.txHash || null;
-        const amount  = parseFloat(body.amount) || 0;
+        // §P.3 exact money: the RAW amount string is captured before ANY float
+        // conversion. The legacy balance credit keeps its historical float
+        // behavior during the migration, but the custody candidate is derived
+        // from this raw string through exact decimal parsing — Number(),
+        // parseFloat() and float arithmetic never touch the custody quantity.
+        const rawAmountStr = (body.amount !== undefined && body.amount !== null && typeof body.amount !== 'boolean')
+            ? String(body.amount).trim()
+            : '';
+        const amount  = parseFloat(body.amount) || 0; // LEGACY float path only
         const asset   = (body.asset || body.currency || 'USDC').toUpperCase();
 
         if (!address) {
@@ -205,13 +214,18 @@ exports.tatumCryptoWebhook = async (req, res) => {
         // ── Step 5: ACID ledger credit ───────────────────────────────────────
         const amountUsdc = parseFloat(amount.toFixed(6));
 
-        // §P.3 exact quantity for the custody candidate: the credited amount
-        // expressed as EXACT integer base units (never a float). The webhook's
-        // own amount parsing is not custody evidence — the candidate must be
-        // re-proven by transaction evidence before it counts anywhere.
-        const candidateDecimalString = Number(amount.toFixed(6)).toFixed(6);
-        const [candInt, candFrac = ''] = candidateDecimalString.split('.');
-        const candidateBaseUnits = BigInt(candInt + candFrac.padEnd(6, '0'));
+        // §P.3 exact quantity for the custody candidate: parsed from the RAW
+        // webhook string into integer base units with exact decimal-string
+        // arithmetic. A raw quantity that cannot be represented exactly in
+        // USDC base units (malformed, scientific notation, more than 6
+        // significant decimals) records NO candidate — fail closed, logged,
+        // never silently approximated.
+        let candidateBaseUnits = null;
+        try {
+            candidateBaseUnits = custodyAccounting.exactWebhookAmountToBaseUnits(rawAmountStr, 6);
+        } catch (err) {
+            logger.warn({ txHash, raw: rawAmountStr, err: err.message }, '[depositController] deposit amount not exactly representable — no custody candidate recorded');
+        }
         const ownerWalletAddress = owner.walletAddress || null;
 
         const result = await prisma.$transaction(async (tx) => {
@@ -258,22 +272,24 @@ exports.tatumCryptoWebhook = async (req, res) => {
             // specific chain evidence (Tatum v4 tx-by-hash). Failure here
             // rolls the whole credit back: a credit without its custody
             // candidate would be an untracked deposit.
-            const custodyAccounting = require('../services/custodyAccountingService');
-            if (ownerWalletAddress) {
+            if (ownerWalletAddress && candidateBaseUnits !== null) {
                 await custodyAccounting.recordDepositCandidate(tx, {
                     walletAddress: ownerWalletAddress,
                     txHash,
                     amountBaseUnits: candidateBaseUnits,
                     transactionHistoryId: txRecord.id,
-                    creditedAmountDecimalString: candidateDecimalString,
+                    // exact decimal string derived FROM the base units — the
+                    // float credit is never the source of this value
+                    creditedAmountDecimalString: custodyAccounting.decimalStringFromBaseUnits(candidateBaseUnits, 6),
                 });
             } else {
-                // Legacy-fallback owner (§P.1 migration window): no registry
-                // row, so no custody account can be derived. The credit keeps
+                // Either a legacy-fallback owner (§P.1 migration window: no
+                // registry row, so no custody account can be derived) or a raw
+                // amount that is not exactly representable. The credit keeps
                 // its existing behavior; the deposit stays in the USDC flow
                 // classification (X) but can never reach the evidence-linked
                 // subset (Y) — logged, never silently presented as tracked.
-                logger.warn({ txHash, userId: targetUserId }, '[depositController] deposit at non-registry address — no custody candidate recorded');
+                logger.warn({ txHash, userId: targetUserId, exactParse: candidateBaseUnits !== null }, '[depositController] no custody candidate recorded for this deposit');
             }
 
             // 5f. Phase N: notification moved post-commit for full pipeline delivery.

@@ -112,15 +112,16 @@ function fakeBalanceHttp({ balance, status = 200 } = {}) {
 }
 // Raw Tatum v4 TxData row (OpenAPI shape) — normalized by the REAL adapter.
 function rawTxEntry({ hash = TX1, address = CUST, counterAddress = OTHER, tokenAddress = NATIVE,
+    chain = 'polygon-mainnet', transactionType = 'fungible',
     transactionSubtype = 'incoming', amount = '100.123456', blockNumber = 48219430, timestamp = 1758000000 } = {}) {
     return {
-        chain: 'polygon-mainnet',
+        chain,
         hash,
         address,
         counterAddress,
         tokenAddress,
         blockNumber,
-        transactionType: 'native',
+        transactionType,
         transactionSubtype,
         amount,
         timestamp,
@@ -181,7 +182,10 @@ describe('§P.3 unit: provider response parsing fails closed', () => {
 describe('§P.3 unit: pure liability report composition', () => {
     const compose = integrity.composeLiabilityReport;
 
-    it('fully backed: A >= X, Z == 0, evidence healthy', () => {
+    it('restricted obligations UNMODELED (null): even A >= X, Z == 0, healthy is NOT fully backed — fail closed', () => {
+        // The invariant is REAL ASSETS >= ALL LIABILITIES + RESTRICTED. With
+        // the restricted component unknown, the complete denominator is
+        // unknown — a fully-backed claim is impossible until §P.4+ models it.
         const r = compose({
             usdcLiabilityTotal: D(100),
             evidenceLinkedTotal: D(80),
@@ -191,12 +195,24 @@ describe('§P.3 unit: pure liability report composition', () => {
             evidenceHealthy: true,
             evidenceStatus: 'HEALTHY',
         });
-        expect(r.isFullyBacked).toBe(true);
-        expect(r.liabilityAttestation).toBe('COMPLETE');
-        expect(r.unclassifiedExposure.isZero()).toBe(true);
+        expect(r.isFullyBacked).toBe(false); // never while restricted is unmodeled
+        expect(r.restrictedObligationsAvailable).toBe(false);
+        expect(r.liabilityAttestation).toBe('COMPLETE'); // the classified part is still complete
         expect(r.coverageOfTotalUsdcObligation.toString()).toBe('1.5');
-        expect(r.coverageOfEvidenceLinkedSubset.toString()).toBe('1.875');
         expect(r.reserveRatioPercent.toString()).toBe('150');
+        // Once restricted obligations become authoritative, the same healthy
+        // state IS fully backed — the gate is the unknown boundary itself.
+        const modeled = compose({
+            usdcLiabilityTotal: D(100),
+            evidenceLinkedTotal: D(80),
+            mixedPoolLiabilityTotal: D(100),
+            eligibleReserveTotal: D(150),
+            restrictedObligationsTotal: D(0),
+            evidenceHealthy: true,
+            evidenceStatus: 'HEALTHY',
+        });
+        expect(modeled.restrictedObligationsAvailable).toBe(true);
+        expect(modeled.isFullyBacked).toBe(true);
     });
 
     it('unclassified exposure forces INCOMPLETE and breaks fully-backed even with A >= X', () => {
@@ -238,15 +254,21 @@ describe('§P.3 unit: pure liability report composition', () => {
         expect(r.restrictedObligationsAvailable).toBe(false);
     });
 
-    it('X === 0 with nothing unexplained: ratio 100, fully backed when healthy', () => {
+    it('X === 0 with nothing unexplained: ratio 100, fully backed only once restricted is modeled', () => {
         const r = compose({
             usdcLiabilityTotal: D(0), evidenceLinkedTotal: D(0), mixedPoolLiabilityTotal: D(0),
             eligibleReserveTotal: D(10), restrictedObligationsTotal: null,
             evidenceHealthy: true, evidenceStatus: 'HEALTHY',
         });
         expect(r.reserveRatioPercent.toString()).toBe('100');
-        expect(r.isFullyBacked).toBe(true);
+        expect(r.isFullyBacked).toBe(false); // restricted component still unknown
         expect(r.coverageOfTotalUsdcObligation).toBe(null); // undefined coverage is explicit
+        const modeled = compose({
+            usdcLiabilityTotal: D(0), evidenceLinkedTotal: D(0), mixedPoolLiabilityTotal: D(0),
+            eligibleReserveTotal: D(10), restrictedObligationsTotal: D(0),
+            evidenceHealthy: true, evidenceStatus: 'HEALTHY',
+        });
+        expect(modeled.isFullyBacked).toBe(true);
     });
 
     it('X === 0 but Z > 0: denominator unknown → ratio 0, fail-closed', () => {
@@ -514,7 +536,7 @@ describeOrSkip('§P.3 custody accounting (real PostgreSQL)', () => {
 
     // ── 3. Transaction-evidence verification lifecycle ────────────────────────
     describe('verifyDepositMovement: transaction evidence is the ONLY verification path', () => {
-        it('verifies a genuine inbound native-USDC transfer: VERIFIED + evidence + exact balanced journal', async () => {
+        it('verifies a genuine inbound native-USDC transfer: VERIFIED + evidence + no duplicate journal', async () => {
             const user = await seedUser(prisma);
             const registry = await seedRegistryAddress(user.id);
             const { movement } = await recordCandidate({ registry, txHash: TX1, units: 100123456n });
@@ -538,20 +560,19 @@ describeOrSkip('§P.3 custody accounting (real PostgreSQL)', () => {
             expect(evidence.blockReference).toBe('48219430');
             expect(evidence.amountBaseUnits).toBe(100123456n);
 
-            // Journal: exactly the balanced pair, exact values.
-            const entries = await prisma.journalEntry.findMany({ where: { transactionId: `CUSTODY-${movement.id}` } });
-            expect(entries.length).toBe(2);
-            const debit = entries.find((e) => e.debit.gt(0));
-            const credit = entries.find((e) => e.credit.gt(0));
-            expect(debit.account).toBe('custody:deposit:usdc');
-            expect(debit.debit.toString()).toBe('100.123456');
-            expect(debit.entryType).toBe('CUSTODY_DEPOSIT');
-            expect(credit.account).toBe(`user:${user.id}:liability`);
-            expect(credit.credit.toString()).toBe('100.123456');
-            expect(credit.userId).toBe(user.id);
-            // Trial balance over the whole journal is exact.
-            const sums = await prisma.journalEntry.aggregate({ _sum: { debit: true, credit: true } });
-            expect(sums._sum.debit.minus(sums._sum.credit).isZero()).toBe(true);
+            // JOURNAL RECONCILIATION (§P.3): the deposit's economic journal
+            // representation already exists exactly once (journalIntegration
+            // recorded the customer credit at webhook time). Custody
+            // verification deliberately posts NO JournalEntry — a second
+            // representation of the same economic event would double-count
+            // the ledger. Assert exactly that: zero custody journal rows.
+            expect(await prisma.journalEntry.count({
+                where: { OR: [{ entryType: { in: ['CUSTODY_DEPOSIT', 'CUSTODY_WITHDRAWAL', 'CUSTODY_SWEEP'] } }, { relatedEntity: 'custodyMovement' }] },
+            })).toBe(0);
+            const trialSums = await prisma.journalEntry.aggregate({ _sum: { debit: true, credit: true } });
+            if (trialSums._sum.debit != null) { // empty journal (this test posts none) is trivially balanced
+                expect(trialSums._sum.debit.minus(trialSums._sum.credit).isZero()).toBe(true);
+            }
         });
 
         it('a BALANCE provider can never verify a movement (structural separation)', async () => {
@@ -611,7 +632,7 @@ describeOrSkip('§P.3 custody accounting (real PostgreSQL)', () => {
             expect(after.failureReason).toBe(null);
         });
 
-        it('concurrent double-verify converges: exactly one VERIFIED transition and one journal transaction', async () => {
+        it('concurrent double-verify converges: exactly one VERIFIED transition and one evidence row, no custody journal', async () => {
             const user = await seedUser(prisma);
             const registry = await seedRegistryAddress(user.id);
             const { movement } = await recordCandidate({ registry, txHash: TX1, units: 100123456n });
@@ -621,8 +642,8 @@ describeOrSkip('§P.3 custody accounting (real PostgreSQL)', () => {
                 accounting.verifyDepositMovement(prisma, { movementId: movement.id }, { txProvider: provider }),
             ]);
             expect(a.verified || b.verified).toBe(true);
-            expect(await prisma.journalEntry.count({ where: { transactionId: `CUSTODY-${movement.id}` } })).toBe(2); // one pair, never two
-            expect(await prisma.custodyEvidence.count({ where: { scope: 'TRANSACTION' } })).toBe(1);
+            expect(await prisma.custodyEvidence.count({ where: { scope: 'TRANSACTION' } })).toBe(1); // exactly one evidence, never two
+            expect(await prisma.journalEntry.count({ where: { relatedEntity: 'custodyMovement' } })).toBe(0); // no custody journal at all
         });
 
         it('re-verifying an already-verified movement is a no-op', async () => {
@@ -633,7 +654,8 @@ describeOrSkip('§P.3 custody accounting (real PostgreSQL)', () => {
             await accounting.verifyDepositMovement(prisma, { movementId: movement.id }, { txProvider: provider });
             const again = await accounting.verifyDepositMovement(prisma, { movementId: movement.id }, { txProvider: provider });
             expect(again.alreadyVerified).toBe(true);
-            expect(await prisma.journalEntry.count()).toBe(2);
+            expect(await prisma.custodyEvidence.count({ where: { scope: 'TRANSACTION' } })).toBe(1); // no duplicate evidence
+            expect(await prisma.journalEntry.count({ where: { relatedEntity: 'custodyMovement' } })).toBe(0); // and never any custody journal
         });
 
         it('batch verify processes candidates and reports outcomes', async () => {
@@ -755,7 +777,7 @@ describeOrSkip('§P.3 custody accounting (real PostgreSQL)', () => {
 
     // ── 5. Execution-linked movements ──────────────────────────────────────────
     describe('execution-linked movements: sweeps and withdrawals', () => {
-        it('settleExecution atomically creates the VERIFIED withdrawal movement + journal', async () => {
+        it('settleExecution atomically creates the VERIFIED withdrawal movement; no duplicate journal representation', async () => {
             const user = await seedUser(prisma);
             const ledger = await prisma.transactionHistory.create({
                 data: { userId: user.id, type: 'WITHDRAWAL_CRYPTO', amountUsdc: 1.0, feeUsdc: 0, txHash: null, status: 'PENDING' },
@@ -804,13 +826,11 @@ describeOrSkip('§P.3 custody accounting (real PostgreSQL)', () => {
             expect(hotAccount.tier).toBe('MASTER_HOT_WALLET');
             expect(hotAccount.address).toBe(HOT);
 
-            const entries = await prisma.journalEntry.findMany({ where: { transactionId: `CUSTODY-${movement.id}` } });
-            expect(entries.length).toBe(2);
-            const debit = entries.find((e) => e.debit.gt(0));
-            const credit = entries.find((e) => e.credit.gt(0));
-            expect(debit.account).toBe(`user:${user.id}:liability`);
-            expect(credit.account).toBe('custody:hot:usdc');
-            expect(debit.debit.toString()).toBe('1');
+            // The withdrawal's economic journal representation already exists
+            // exactly once (journalIntegration.recordWithdrawal runs at
+            // withdrawal initiation, referencing the execution). Settlement
+            // must NOT create a second one — assert zero custody journal rows.
+            expect(await prisma.journalEntry.count({ where: { relatedEntity: 'custodyMovement' } })).toBe(0);
         });
 
         it('settlement failure rolls the movement back WITH the settlement (atomicity)', async () => {
@@ -874,13 +894,9 @@ describeOrSkip('§P.3 custody accounting (real PostgreSQL)', () => {
             expect(dup.isNew).toBe(false);
             expect(dup.movement.id).toBe(first.movement.id);
 
-            // SWEEP journal: D custody:hot / C custody:deposit — internal, balanced.
-            const entries = await prisma.journalEntry.findMany({ where: { transactionId: `CUSTODY-${first.movement.id}` } });
-            const debit = entries.find((e) => e.debit.gt(0));
-            const credit = entries.find((e) => e.credit.gt(0));
-            expect(debit.account).toBe('custody:hot:usdc');
-            expect(credit.account).toBe('custody:deposit:usdc');
-            expect(debit.debit.toString()).toBe('5');
+            // No custody journal rows: sweeps are custody-internal, and the
+            // existing JournalEntry has no sweep representation to duplicate.
+            expect(await prisma.journalEntry.count({ where: { relatedEntity: 'custodyMovement' } })).toBe(0);
             // The movement is evidence-branded with the execution's own verification.
             expect(first.movement.evidenceSource).toBe('CUSTODY_EXECUTION_VERIFIED_CHAIN');
             const src = await prisma.custodyAccount.findUnique({ where: { id: first.movement.sourceAccountId } });
@@ -963,11 +979,13 @@ describeOrSkip('§P.3 custody accounting (real PostgreSQL)', () => {
             expect(snapshot.eligibleReserveTotal.toString()).toBe('150.5'); // exact evidence sum
             expect(snapshot.usdcLiabilityTotal.toString()).toBe('100');
             expect(snapshot.unclassifiedExposure.toString()).toBe('0'); // mixed pool == X here
-            // NOT fully backed: A (150.5) >= X (100) BUT the deposit is unverified
-            // only in Y — Z is 0 and A >= X, so fully backed requires healthy
-            // evidence + A >= X + Z == 0 → here it IS satisfied. Assert exact.
-            expect(snapshot.isFullyBacked).toBe(true);
-            expect(snapshot.liabilityAttestation).toBe('COMPLETE');
+            // Evidence healthy + A (150.5) >= X (100) + Z == 0 — the classified
+            // invariant is satisfied. But restricted obligations are UNMODELED
+            // (the §P.4+ boundary), so the complete denominator is unknown:
+            // fully backed is impossible and the snapshot says so explicitly.
+            expect(snapshot.isFullyBacked).toBe(false); // fail-closed on the restricted boundary
+            expect(snapshot.liabilityAttestation).toBe('COMPLETE'); // the classified part is complete
+            expect(snapshot.breakdown.invariant.blockedBy).toBe('RESTRICTED_OBLIGATIONS_UNKNOWN');
             expect(snapshot.custodyAccountCount).toBe(2);
             expect(snapshot.acceptedEvidenceCount).toBe(2);
             expect(snapshot.missingEvidenceCount).toBe(0);
@@ -1106,5 +1124,184 @@ describeOrSkip('§P.3 custody accounting (real PostgreSQL)', () => {
             return movement;
         }
 
+    // ── 7. Audit regressions: scoped evidence uniqueness, returned-record binding,
+    //       fail-closed composition, exact webhook money, non-double-counting ──
+    describe('audit regressions: interaction invariants the isolated tests missed', () => {
+
+        it('balance evidence + TWO verified deposits on one address coexist; exactly one ACTIVE ACCOUNT_BALANCE remains', async () => {
+            const user = await seedUser(prisma);
+            const registry = await seedRegistryAddress(user.id);
+            const account = await prisma.$transaction((tx) => accounting.ensureDepositAccount(tx, { walletAddress: registry }));
+
+            // Balance observation FIRST — under the old unscoped unique index
+            // this would have permanently blocked every transaction evidence row.
+            const bal = await accounting.observeAccountBalance(prisma, { account, provider: stubBalance('250000000', new Date()) });
+            expect(bal.recorded).toBe(true);
+
+            // Two separate verified deposits into the SAME custody address.
+            const { movement: m1 } = await recordCandidate({ registry, txHash: TX1, units: 100000000n });
+            const { movement: m2 } = await recordCandidate({ registry, txHash: TX2, units: 50123456n });
+            const p1 = txProviderWith([rawTxEntry({ hash: TX1, address: CUST.toLowerCase(), amount: '100' })]);
+            const p2 = txProviderWith([rawTxEntry({ hash: TX2, address: CUST.toLowerCase(), amount: '50.123456' })]);
+            const r1 = await accounting.verifyDepositMovement(prisma, { movementId: m1.id }, { txProvider: p1 });
+            const r2 = await accounting.verifyDepositMovement(prisma, { movementId: m2.id }, { txProvider: p2 });
+            expect(r1.verified).toBe(true);
+            expect(r2.verified).toBe(true);
+
+            // Both transaction evidence rows exist and are ACTIVE — the
+            // single-active rule applies ONLY to ACCOUNT_BALANCE evidence.
+            const txEvidence = await prisma.custodyEvidence.findMany({
+                where: { custodyAccountId: account.id, scope: 'TRANSACTION', status: 'ACTIVE' },
+            });
+            expect(txEvidence.length).toBe(2);
+            expect(txEvidence.map((e) => e.txHash).sort()).toEqual([TX1, TX2].sort());
+
+            // Exactly ONE accepted balance observation — transaction evidence
+            // never occupies or displaces the balance slot.
+            const activeBalances = await prisma.custodyEvidence.findMany({
+                where: { custodyAccountId: account.id, scope: 'ACCOUNT_BALANCE', status: 'ACTIVE' },
+            });
+            expect(activeBalances.length).toBe(1);
+            expect(activeBalances[0].balanceBaseUnits).toBe(250000000n);
+
+            // getFreshAcceptedEvidence answers with the BALANCE observation —
+            // never with a transaction evidence row, no matter what exists.
+            const fresh = await accounting.getFreshAcceptedEvidence(prisma, {
+                custodyAccountId: account.id, maxAgeMs: 15 * 60 * 1000,
+            });
+            expect(fresh.id).toBe(activeBalances[0].id);
+            expect(fresh.balanceBaseUnits).toBe(250000000n);
+            expect(fresh.scope).toBe('ACCOUNT_BALANCE');
+        });
+
+        it('a wrong returned CHAIN cannot verify — the request endpoint is not the proof', async () => {
+            const user = await seedUser(prisma);
+            const registry = await seedRegistryAddress(user.id);
+            const { movement } = await recordCandidate({ registry, txHash: TX1, units: 100123456n });
+            // The provider was asked about polygon-mainnet, but the RETURNED
+            // record claims eth-mainnet — a different chain's transfer can
+            // never verify this movement.
+            const provider = txProviderWith([rawTxEntry({ hash: TX1, address: CUST.toLowerCase(), chain: 'eth-mainnet' })]);
+            const result = await accounting.verifyDepositMovement(prisma, { movementId: movement.id }, { txProvider: provider });
+            expect(result.verified).toBe(false);
+            expect(result.reason).toContain('CHAIN_MISMATCH');
+            const after = await prisma.custodyMovement.findUnique({ where: { id: movement.id } });
+            expect(after.status).toBe('FAILED');
+            expect(after.failureReason).toContain('CHAIN_MISMATCH');
+            expect(await prisma.custodyEvidence.count({ where: { scope: 'TRANSACTION' } })).toBe(0);
+        });
+
+        it('a returned NATIVE-coin transfer (transactionType native) cannot verify a fungible USDC deposit', async () => {
+            const user = await seedUser(prisma);
+            const registry = await seedRegistryAddress(user.id);
+            const { movement } = await recordCandidate({ registry, txHash: TX1, units: 100123456n });
+            // Same address/amount/block/hash, but the returned entry is a
+            // native MATIC transfer, not an ERC-20 fungible transfer.
+            const provider = txProviderWith([rawTxEntry({ hash: TX1, address: CUST.toLowerCase(), transactionType: 'native' })]);
+            const result = await accounting.verifyDepositMovement(prisma, { movementId: movement.id }, { txProvider: provider });
+            expect(result.verified).toBe(false);
+            expect(result.reason).toContain('WRONG_TRANSACTION_TYPE');
+            expect(await prisma.custodyMovement.findUnique({ where: { id: movement.id } })).toMatchObject({
+                status: 'FAILED', failureReason: expect.stringContaining('WRONG_TRANSACTION_TYPE'),
+            });
+        });
+
+        it('mixed-case tx hashes verify — normalization on BOTH sides, never case-sensitive luck', async () => {
+            const user = await seedUser(prisma);
+            const registry = await seedRegistryAddress(user.id);
+            // Candidate recorded with the mixed-case hash a webhook may deliver.
+            const mixedHash = '0x' + 'AA'.repeat(32); // uppercase
+            const { movement } = await recordCandidate({ registry, txHash: mixedHash, units: 100123456n });
+            // The provider returns the SAME transaction with the opposite case.
+            const provider = txProviderWith([rawTxEntry({ hash: mixedHash.toLowerCase(), address: CUST.toLowerCase(), amount: '100.123456' })]);
+            const result = await accounting.verifyDepositMovement(prisma, { movementId: movement.id }, { txProvider: provider });
+            expect(result.verified).toBe(true);
+            const after = await prisma.custodyMovement.findUnique({ where: { id: movement.id } });
+            expect(after.status).toBe('VERIFIED');
+            const evidence = await prisma.custodyEvidence.findUnique({ where: { id: after.evidenceId } });
+            expect(evidence.txHash.toLowerCase()).toBe(mixedHash.toLowerCase());
+        });
+
+        it('negative liability flow (completed debits exceed credits) fails closed — never floored to a valid zero', async () => {
+            const user = await seedUser(prisma, { availableBalance: 0 });
+            await seedRegistryAddress(user.id);
+            // Audit's exact scenario: credits = 0, completed USDC withdrawals = 100.
+            await prisma.transactionHistory.create({
+                data: { userId: user.id, type: 'WITHDRAWAL_CRYPTO', amountUsdc: 100, feeUsdc: 0, txHash: TX1, status: 'COMPLETED' },
+            });
+            const flows = await accounting.classifyUsdcLiabilityFlows(prisma);
+            expect(flows.liabilityClassificationStatus).toBe('NEGATIVE_LIABILITY_FLOW');
+            expect(flows.usdcLiabilityTotal).toBe(null); // invalid — not a valid 0
+            expect(flows.usdcLiabilityTotalSigned.toString()).toBe('-100'); // diagnostics keep the signed truth
+
+            // Even with HEALTHY fresh evidence and A >= |raw|, the snapshot
+            // cannot become COMPLETE or fully backed: the classification itself
+            // is untrustworthy and must be exposed as an explicit failure.
+            const { snapshot } = await integrity.createSnapshot({
+                balanceProvider: stubProviderMap({ [CUST]: '150000000', [HOT]: '0' }),
+            });
+            expect(snapshot.liabilityAttestation).toBe('UNATTESTABLE');
+            expect(snapshot.isFullyBacked).toBe(false);
+            expect(snapshot.usdcLiabilityTotal).toBe(null); // never silently 0
+            expect(snapshot.breakdown.usdcObligation.classificationStatus).toBe('NEGATIVE_LIABILITY_FLOW');
+            expect(snapshot.breakdown.usdcObligation.usdcLiabilityTotal).toBe(null);
+            expect(snapshot.breakdown.usdcObligation.components.usdcDebits.toString()).toBe('100'); // signed diagnostics retained
+        });
+
+        it('combined lifecycle: balance evidence + multiple verified deposits + PoR — transaction evidence never pollutes the reserve numerator', async () => {
+            const { user, registry } = await seedAccountWithRegistry({ address: CUST });
+            // Deposit credits journaled in TransactionHistory (X components).
+            await recordCandidateFlow(user, TX1, 100);
+            await recordCandidateFlow(user, TX2, 40);
+            // Verify BOTH deposit candidates against genuine chain evidence.
+            const p1 = txProviderWith([rawTxEntry({ hash: TX1, address: CUST.toLowerCase(), amount: '100' })]);
+            const p2 = txProviderWith([rawTxEntry({ hash: TX2, address: CUST.toLowerCase(), amount: '40' })]);
+            const m1 = await prisma.custodyMovement.findUnique({ where: { idempotencyKey: `deposit:POLYGON:${TX1.toLowerCase()}` } });
+            const m2 = await prisma.custodyMovement.findUnique({ where: { idempotencyKey: `deposit:POLYGON:${TX2.toLowerCase()}` } });
+            expect((await accounting.verifyDepositMovement(prisma, { movementId: m1.id }, { txProvider: p1 })).verified).toBe(true);
+            expect((await accounting.verifyDepositMovement(prisma, { movementId: m2.id }, { txProvider: p2 })).verified).toBe(true);
+
+            // Snapshot with fresh balance observations for both accounts.
+            const { snapshot } = await integrity.createSnapshot({
+                balanceProvider: stubProviderMap({ [CUST]: '140500000', [HOT]: '10000000' }),
+            });
+            // X = 140 (two credits, no debits); Y = 140 (both verified).
+            expect(snapshot.usdcLiabilityTotal.toString()).toBe('140');
+            expect(snapshot.evidenceLinkedLiabilityTotal.toString()).toBe('140');
+            expect(snapshot.unclassifiedExposure.toString()).toBe('0');
+            expect(snapshot.liabilityAttestation).toBe('COMPLETE');
+            // The numerator is EXACTLY the sum of accepted balance evidence
+            // (140.5 + 10) — the 140 of transaction evidence adds nothing.
+            expect(snapshot.eligibleReserveTotal.toString()).toBe('150.5');
+            expect(snapshot.acceptedEvidenceCount).toBe(2);
+            // Two TRANSACTION evidence rows + two ACTIVE balance rows coexist.
+            expect(await prisma.custodyEvidence.count({ where: { scope: 'TRANSACTION', status: 'ACTIVE' } })).toBe(2);
+            expect(await prisma.custodyEvidence.count({ where: { scope: 'ACCOUNT_BALANCE', status: 'ACTIVE' } })).toBe(2);
+            // And the whole lifecycle posted ZERO duplicate journal rows.
+            expect(await prisma.journalEntry.count({ where: { relatedEntity: 'custodyMovement' } })).toBe(0);
+            // Restricted obligations remain unmodeled → fully backed impossible.
+            expect(snapshot.isFullyBacked).toBe(false);
+            expect(snapshot.breakdown.invariant.blockedBy).toBe('RESTRICTED_OBLIGATIONS_UNKNOWN');
+        });
+
+        it('exactWebhookAmountToBaseUnits: beyond safe-integer precision stays exact (raw string → BigInt, no floats)', () => {
+            // 90071992547409.93 USDC — the float round-trip Number(x.toFixed(6))
+            // corrupts this; exact parsing must not.
+            expect(accounting.exactWebhookAmountToBaseUnits('90071992547409.93', 6)).toBe(90071992547409930000n);
+            expect(accounting.exactWebhookAmountToBaseUnits('90071992547409.93', 6)).toBe(90071992547409930000n); // stable, not approximate
+            // Round-trip through the exact decimal string preserves the quantity.
+            expect(accounting.decimalStringFromBaseUnits(90071992547409930000n, 6)).toBe('90071992547409.93');
+            // Trailing zeros beyond token precision are the SAME exact quantity.
+            expect(accounting.exactWebhookAmountToBaseUnits('1.5000000', 6)).toBe(1500000n);
+            // Fail closed: more than 6 significant decimals is not a USDC quantity.
+            expect(() => accounting.exactWebhookAmountToBaseUnits('0.0000001', 6)).toThrow(/not exactly representable/);
+            // Fail closed: malformed, scientific notation, negative, zero.
+            expect(() => accounting.exactWebhookAmountToBaseUnits('1e3', 6)).toThrow();
+            expect(() => accounting.exactWebhookAmountToBaseUnits('-5', 6)).toThrow();
+            expect(() => accounting.exactWebhookAmountToBaseUnits('0', 6)).toThrow();
+            expect(() => accounting.exactWebhookAmountToBaseUnits('', 6)).toThrow();
+            expect(() => accounting.exactWebhookAmountToBaseUnits('12.3.4', 6)).toThrow();
+        });
+    });
     });
 });

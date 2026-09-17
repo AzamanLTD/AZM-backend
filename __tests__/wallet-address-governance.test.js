@@ -77,7 +77,22 @@ describeOrSkip('WalletAddress authority + governance (real PostgreSQL)', () => {
         // The webhook proofs also touch the SystemMasterCrypto / SystemHotWallet
         // singletons (deposit credits) — truncate those too so this suite never
         // leaks absolute-balance state into other real-PG suites.
-        await prisma.$executeRawUnsafe('TRUNCATE TABLE "WalletAddress", "User", "SystemMasterCrypto", "SystemHotWallet" RESTART IDENTITY CASCADE');
+        // The deposit webhook emits its journal entry fire-and-forget (outside
+        // the response path), so an in-flight journal write can hold row locks
+        // when this TRUNCATE lands and PostgreSQL raises 40P01. Retry once —
+        // the journal write has committed (or aborted) long before the retry.
+        for (let attempt = 0; ; attempt++) {
+            try {
+                await prisma.$executeRawUnsafe('TRUNCATE TABLE "WalletAddress", "User", "SystemMasterCrypto", "SystemHotWallet", "JournalEntry", "CustodyMovement", "CustodyAccount", "CustodyEvidence" RESTART IDENTITY CASCADE');
+                break;
+            } catch (err) {
+                if (attempt < 2 && /deadlock/i.test(String(err && err.message))) {
+                    await new Promise(r => setTimeout(r, 250));
+                    continue;
+                }
+                throw err;
+            }
+        }
     }, 15000);
 
     // ── 1 + 2. Migration/overlay backfill preserves addresses exactly, idempotently ──
@@ -431,6 +446,92 @@ describeOrSkip('WalletAddress authority + governance (real PostgreSQL)', () => {
         expect(res.body.success).toBe(true);
         expect(await balanceOf(userA.id)).toBeCloseTo(1003.25);
         expect(await ledgerCount(txHash)).toBe(1);
+    });
+
+    // ── 19-21. Webhook → §P.3 custody candidate: exact money + one journal truth ──
+    const candidateOf = (txHash) => prisma.custodyMovement.findUnique({
+        where: { idempotencyKey: `deposit:POLYGON:${String(txHash).toLowerCase()}` },
+    });
+    const journalRowsFor = async (txHash) => {
+        // journalIntegration.recordDeposit is fire-and-forget — poll briefly.
+        for (let i = 0; i < 40; i++) {
+            const rows = await prisma.journalEntry.findMany({ where: { reference: txHash } });
+            if (rows.length > 0) return rows;
+            await new Promise((r) => setTimeout(r, 25));
+        }
+        return prisma.journalEntry.findMany({ where: { reference: txHash } });
+    };
+
+    it('the custody candidate stays EXACT for a quantity beyond JS safe-integer precision (raw string → BigInt)', async () => {
+        const userA = await seedUser(prisma);
+        const allocated = await allocateDepositAddress(prisma, mockTatumService(), userA.id);
+        const txHash = '0xwebhook-exact-big-1';
+
+        const res = await callWebhook({
+            address: allocated.address, txId: txHash,
+            // raw STRING. Base units = 9007199254740993 — one unit past the
+            // 2^53 safe-integer boundary, where any float→integer conversion
+            // is unreliable. The legacy ledger column (Decimal(20,8)) still
+            // holds the dollar amount, so the credit path itself must pass.
+            amount: '9007199254.740993',
+            asset: 'USDC',
+        });
+
+        expect(res.statusCode).toBe(200);
+        expect(res.body.success).toBe(true);
+        const candidate = await candidateOf(txHash);
+        expect(candidate).not.toBe(null);
+        // EXACT base units — never the float-corrupted Number(x.toFixed(6)) path.
+        expect(candidate.amountBaseUnits).toBe(9007199254740993n);
+        expect(candidate.status).toBe('CANDIDATE'); // webhook records, never verifies
+        // The metadata decimal string is derived FROM the base units — exact.
+        expect(candidate.metadata.creditedAmountDecimalString).toBe('9007199254.740993');
+    });
+
+    it('one deposit lifecycle has EXACTLY ONE journal representation — no custody duplicate', async () => {
+        const userA = await seedUser(prisma);
+        const allocated = await allocateDepositAddress(prisma, mockTatumService(), userA.id);
+        const txHash = '0xwebhook-journal-single-1';
+
+        const res = await callWebhook({
+            address: allocated.address, txId: txHash, amount: 42.5, asset: 'USDC',
+        });
+        expect(res.statusCode).toBe(200);
+
+        // The ONE economic representation: journalIntegration.recordDeposit's
+        // balanced pair (debit user:available / credit external:deposit).
+        const rows = await journalRowsFor(txHash);
+        expect(rows.length).toBe(2);
+        expect(rows.every((r) => r.entryType === 'DEPOSIT')).toBe(true);
+        const sums = rows.reduce((acc, r) => ({ d: acc.d.add(r.debit), c: acc.c.add(r.credit) }), { d: new (require('@prisma/client').Prisma.Decimal)(0), c: new (require('@prisma/client').Prisma.Decimal)(0) });
+        expect(sums.d.toString()).toBe('42.5');
+        // ZERO custody journal rows: §P.3 verification deliberately posts none.
+        expect(await prisma.journalEntry.count({ where: { relatedEntity: 'custodyMovement' } })).toBe(0);
+        expect(await prisma.journalEntry.count({
+            where: { entryType: { in: ['CUSTODY_DEPOSIT', 'CUSTODY_WITHDRAWAL', 'CUSTODY_SWEEP'] } },
+        })).toBe(0);
+        // And the candidate exists alongside — custody truth, journal truth.
+        expect(await candidateOf(txHash)).not.toBe(null);
+    });
+
+    it('a raw amount that is not exactly representable records NO candidate — fail closed, credit proceeds legacy', async () => {
+        const userA = await seedUser(prisma);
+        const allocated = await allocateDepositAddress(prisma, mockTatumService(), userA.id);
+        const txHash = '0xwebhook-inexact-amount-1';
+
+        // 1.0000005 parses to a positive float (legacy credit proceeds via
+        // toFixed(6) rounding) but is NOT exactly representable in 6-decimal
+        // USDC base units — no exact custody quantity exists, so NO candidate
+        // may be recorded (ops reconciliation item; never an approximated
+        // movement).
+        const res = await callWebhook({
+            address: allocated.address, txId: txHash, amount: '1.0000005', asset: 'USDC',
+        });
+
+        expect(res.statusCode).toBe(200);
+        expect(res.body.success).toBe(true);           // the legacy credit path is unchanged
+        expect(await balanceOf(userA.id)).toBeGreaterThan(1000); // credited (legacy float path)
+        expect(await candidateOf(txHash)).toBe(null);   // but NO custody candidate — fail closed
     });
 });
 

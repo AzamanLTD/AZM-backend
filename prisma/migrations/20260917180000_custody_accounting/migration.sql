@@ -165,9 +165,14 @@ CREATE TABLE IF NOT EXISTS "CustodyEvidence" (
 
 -- At most ONE accepted (ACTIVE) observation per custody account: concurrent
 -- observations converge to a single accepted value — no double counting.
-CREATE UNIQUE INDEX IF NOT EXISTS "CustodyEvidence_account_active_key"
+-- ONE accepted (ACTIVE) balance observation per account — ACCOUNT_BALANCE
+-- ONLY. TRANSACTION-scope evidence rows are never balance observations, so
+-- any number of verified deposit evidences (and balance evidence alongside
+-- them) must coexist under this rule.
+DROP INDEX IF EXISTS "CustodyEvidence_account_active_key";
+CREATE UNIQUE INDEX "CustodyEvidence_account_active_key"
     ON "CustodyEvidence"("custodyAccountId")
-    WHERE "status" = 'ACTIVE';
+    WHERE "scope" = 'ACCOUNT_BALANCE' AND "status" = 'ACTIVE';
 
 -- A transaction-scoped evidence row is bound to exactly one (account, hash).
 CREATE UNIQUE INDEX IF NOT EXISTS "CustodyEvidence_account_tx_key"

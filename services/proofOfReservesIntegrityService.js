@@ -118,7 +118,11 @@ function composeLiabilityReport({
     evidenceStatus,
 }) {
     const zero = new Prisma.Decimal(0);
-    const X = usdcLiabilityTotal || zero;
+    // A null X means the classification itself is invalid (e.g. negative flow
+    // state) — it is NEVER reinterpreted as a valid zero; the attestation
+    // goes UNATTESTABLE and X is reported as null, signed raw value aside.
+    const Xvalid = usdcLiabilityTotal != null;
+    const X = Xvalid ? usdcLiabilityTotal : zero; // computation guard only
     const A = eligibleReserveTotal || zero;
     const mixed = mixedPoolLiabilityTotal || zero;
     const Ysigned = evidenceLinkedTotal || zero;
@@ -136,7 +140,15 @@ function composeLiabilityReport({
         : (Z.isZero() ? 'COMPLETE' : 'INCOMPLETE');
 
     const healthy = Boolean(evidenceHealthy);
-    const isFullyBacked = healthy
+    // FAIL CLOSED ON UNMODELED RESTRICTED OBLIGATIONS: the target invariant
+    // is REAL ASSETS >= ALL LIABILITIES + RESTRICTED. While restricted
+    // obligations are not authoritatively modeled (null), the complete
+    // denominator is UNKNOWN — a fully-backed claim is impossible, no matter
+    // how healthy the evidence or complete the classified liability is. The
+    // null/false boundary is preserved; nothing is invented as zero.
+    const restrictedKnown = restrictedObligationsTotal != null;
+    const isFullyBacked = restrictedKnown
+        && healthy
         && liabilityAttestation === 'COMPLETE'
         && (X.isZero() ? A.gte(zero) : A.gte(X));
 
@@ -144,7 +156,13 @@ function composeLiabilityReport({
     // authority). reserveRatioPercent = A/X*100, or 100 when X==0 and nothing
     // unexplained exists, or 0 when the denominator is unknown (Z>0, X==0).
     let reserveRatioPercent;
-    if (X.gt(zero)) {
+    if (!Xvalid) {
+        // Invalid classification — the legacy non-nullable percent column gets
+        // the same "denominator unknown → 0" value it already uses for Z>0,
+        // X==0; the honest state (UNATTESTABLE, null coverage) lives in the
+        // attestation and the §P.3 breakdown fields.
+        reserveRatioPercent = new Prisma.Decimal(0);
+    } else if (X.gt(zero)) {
         reserveRatioPercent = A.div(X).mul(100).toDecimalPlaces(4);
     } else if (Z.isZero()) {
         reserveRatioPercent = new Prisma.Decimal(100);
@@ -153,13 +171,14 @@ function composeLiabilityReport({
     }
 
     return {
-        usdcLiabilityTotal: X,
+        usdcLiabilityTotal: Xvalid ? usdcLiabilityTotal : null,
         evidenceLinkedLiabilityTotal: Ysigned,
         unclassifiedExposure: Z,
         mixedPoolLiabilityTotal: mixed,
         eligibleReserveTotal: A,
         restrictedObligationsTotal: restrictedObligationsTotal ?? null,
         restrictedObligationsAvailable: restrictedObligationsTotal != null,
+        restrictedObligationsKnown: restrictedKnown,
         coverageOfTotalUsdcObligation: coverageOfTotal,
         coverageOfEvidenceLinkedSubset: coverageOfEvidenceLinked,
         liabilityAttestation,
@@ -391,10 +410,11 @@ async function createSnapshot({ balanceProvider } = {}) {
                         mixedPoolDenomination: 'UNQUALIFIED — not USDC by construction',
                     },
                     usdcObligation: {
-                        usdcLiabilityTotal: report.usdcLiabilityTotal.toString(),
-                        evidenceLinkedLiabilityTotal: report.evidenceLinkedLiabilityTotal.toString(),
-                        unclassifiedExposure: report.unclassifiedExposure.toString(),
+                        usdcLiabilityTotal: report.usdcLiabilityTotal ? report.usdcLiabilityTotal.toString() : null,
+                        evidenceLinkedLiabilityTotal: report.evidenceLinkedLiabilityTotal ? report.evidenceLinkedLiabilityTotal.toString() : null,
+                        unclassifiedExposure: report.unclassifiedExposure ? report.unclassifiedExposure.toString() : null,
                         liabilityAttestation: report.liabilityAttestation,
+                        classificationStatus: flows ? flows.liabilityClassificationStatus : null,
                         components: flows ? {
                             usdcCredits: flows.usdcCredits.toString(),
                             usdcDebits: flows.usdcDebits.toString(),
@@ -427,10 +447,13 @@ async function createSnapshot({ balanceProvider } = {}) {
                         target: 'REAL USDC ASSETS >= ALL CUSTOMER USDC LIABILITIES + RESTRICTED OBLIGATIONS',
                         satisfied: report.isFullyBacked,
                         restrictedObligationsModeled: false,
+                        // Why fully-backed is impossible right now: the restricted
+                        // component of the denominator is not modeled (§P.4+).
+                        blockedBy: report.isFullyBacked ? null : (report.restrictedObligationsKnown ? null : 'RESTRICTED_OBLIGATIONS_UNKNOWN'),
                     },
                 },
                 // §P.3 additive columns.
-                usdcLiabilityTotal: report.usdcLiabilityTotal,
+                usdcLiabilityTotal: report.usdcLiabilityTotal, // null = classification invalid, fail closed
                 evidenceLinkedLiabilityTotal: report.evidenceLinkedLiabilityTotal,
                 unclassifiedExposure: report.unclassifiedExposure,
                 eligibleReserveTotal: report.eligibleReserveTotal,
@@ -449,9 +472,9 @@ async function createSnapshot({ balanceProvider } = {}) {
                     decimals: canonical.decimals,
                 },
                 liabilityBreakdown: {
-                    usdcLiabilityTotal: report.usdcLiabilityTotal.toString(),
-                    evidenceLinkedLiabilityTotal: report.evidenceLinkedLiabilityTotal.toString(),
-                    unclassifiedExposure: report.unclassifiedExposure.toString(),
+                    usdcLiabilityTotal: report.usdcLiabilityTotal ? report.usdcLiabilityTotal.toString() : null,
+                    evidenceLinkedLiabilityTotal: report.evidenceLinkedLiabilityTotal ? report.evidenceLinkedLiabilityTotal.toString() : null,
+                    unclassifiedExposure: report.unclassifiedExposure ? report.unclassifiedExposure.toString() : null,
                     mixedPoolLiabilityTotal: state.mixedPoolTotal.toString(),
                     eligibleReserveTotal: report.eligibleReserveTotal.toString(),
                     coverageOfTotalUsdcObligation: report.coverageOfTotalUsdcObligation ? report.coverageOfTotalUsdcObligation.toString() : null,
@@ -483,7 +506,7 @@ async function getLatestSnapshot() {
     // §P.3 additive fields (null for legacy snapshot rows — explicit, never
     // backfilled with invented values).
     if (snapshot.usdcLiabilityTotal != null) {
-        base.usdcLiabilityTotal = snapshot.usdcLiabilityTotal.toString();
+        base.usdcLiabilityTotal = snapshot.usdcLiabilityTotal != null ? snapshot.usdcLiabilityTotal.toString() : null;
         base.evidenceLinkedLiabilityTotal = (snapshot.evidenceLinkedLiabilityTotal ?? null)?.toString?.() ?? null;
         base.unclassifiedExposure = snapshot.unclassifiedExposure?.toString() ?? null;
         base.eligibleReserveTotal = snapshot.eligibleReserveTotal?.toString() ?? null;

@@ -152,9 +152,14 @@ END $$;`,
     "updatedAt" TIMESTAMP(3) NOT NULL,
     CONSTRAINT "CustodyEvidence_pkey" PRIMARY KEY ("id")
 );`,
+  // Drop-then-create: converges ANY pre-existing variant of this index
+  // (e.g. a DB built with an earlier unscoped predicate) onto the scoped
+  // ACCOUNT_BALANCE semantics. Plain CREATE UNIQUE IF NOT EXISTS would keep
+  // a stale unscoped index forever.
+  `DROP INDEX IF EXISTS "CustodyEvidence_account_active_key";`,
   `CREATE UNIQUE INDEX IF NOT EXISTS "CustodyEvidence_account_active_key"
     ON "CustodyEvidence"("custodyAccountId")
-    WHERE "status" = 'ACTIVE';`,
+    WHERE "scope" = 'ACCOUNT_BALANCE' AND "status" = 'ACTIVE';`,
   `CREATE UNIQUE INDEX IF NOT EXISTS "CustodyEvidence_account_tx_key"
     ON "CustodyEvidence"("custodyAccountId", "txHash")
     WHERE "scope" = 'TRANSACTION' AND "txHash" IS NOT NULL AND "status" = 'ACTIVE';`,
