@@ -10,7 +10,12 @@
 //    rejection;
 //  - controller-level proofs (no DB) that the Tatum webhook verification gate
 //    is fail-closed in production and that non-production test behavior is
-//    not weakened.
+//    not weakened;
+//  - §P.1 closure-hardening proofs (real PostgreSQL, full webhook path):
+//    body.userId is not an ownership authority, RETIRED addresses resolve to
+//    no active owner (and the legacy mirror cannot resurrect them), unknown
+//    addresses credit nobody, USDC.E is rejected before mutation, and native
+//    Polygon USDC remains the accepted canonical identity.
 // =============================================================================
 const hasDb = !!process.env.TEST_DATABASE_URL;
 const describeOrSkip = hasDb ? describe : describe.skip;
@@ -22,6 +27,7 @@ const {
     isCanonicalDepositAsset,
     getActiveDepositAddress,
     resolveOwner,
+    lookupWalletAddressHistory,
     allocateDepositAddress,
     retireDepositAddress,
 } = require('../services/walletAddressService');
@@ -57,6 +63,7 @@ describeOrSkip('WalletAddress authority + governance (real PostgreSQL)', () => {
     beforeAll(async () => {
         process.env.DATABASE_URL = process.env.TEST_DATABASE_URL;
         process.env.NODE_ENV = 'test';
+        process.env.TATUM_WEBHOOK_SECRET = process.env.TATUM_WEBHOOK_SECRET || 'test_tatum_webhook_secret';
         const { PrismaClient } = require('@prisma/client');
         prisma = new PrismaClient();
     });
@@ -67,7 +74,10 @@ describeOrSkip('WalletAddress authority + governance (real PostgreSQL)', () => {
         // Established suite-cleanup pattern (cf. shift-scheduling-integrity):
         // truncate the registry and the seeded users (CASCADE clears their
         // TransactionHistory ledger rows and all other FK references).
-        await prisma.$executeRawUnsafe('TRUNCATE TABLE "WalletAddress", "User" RESTART IDENTITY CASCADE');
+        // The webhook proofs also touch the SystemMasterCrypto / SystemHotWallet
+        // singletons (deposit credits) — truncate those too so this suite never
+        // leaks absolute-balance state into other real-PG suites.
+        await prisma.$executeRawUnsafe('TRUNCATE TABLE "WalletAddress", "User", "SystemMasterCrypto", "SystemHotWallet" RESTART IDENTITY CASCADE');
     }, 15000);
 
     // ── 1 + 2. Migration/overlay backfill preserves addresses exactly, idempotently ──
@@ -274,7 +284,9 @@ describeOrSkip('WalletAddress authority + governance (real PostgreSQL)', () => {
         expect(isCanonicalDepositAsset(NATIVE_USDC)).toBe(true);
         expect(isCanonicalDepositAsset(USDC_E)).toBe(false);
         expect(USDC_E.contractAddress).not.toBe(NATIVE_USDC.contractAddress);
+        // Exact official contracts — these identities cannot drift again.
         expect(NATIVE_USDC.contractAddress).toBe('0x3c499c542cef5e3811e1192ce70d8cc03d5c3359');
+        expect(USDC_E.contractAddress).toBe('0x2791bca1f2de4661ed88a30c99a7a9449aa84174');
         expect(NATIVE_USDC.decimals).toBe(6);
 
         const user = await seedUser(prisma);
@@ -293,13 +305,132 @@ describeOrSkip('WalletAddress authority + governance (real PostgreSQL)', () => {
         ).rejects.toMatchObject({ code: 'UNSUPPORTED_ASSET_IDENTITY' });
 
         await expect(
+            // Native-labeled identity pointing at the (real) bridged USDC.e
+            // contract is still a contract-level mismatch and rejected.
             allocateDepositAddress(prisma, mockTatumService(), user.id, {
-                identity: { network: 'POLYGON', asset: 'USDC', contractAddress: '0x2791b9717a737ca894d692502e875a1a8eab1cfa' },
+                identity: { network: 'POLYGON', asset: 'USDC', contractAddress: '0x2791bca1f2de4661ed88a30c99a7a9449aa84174' },
             })
         ).rejects.toMatchObject({ code: 'UNSUPPORTED_ASSET_IDENTITY' });
 
         const rows = await prisma.walletAddress.findMany({ where: { userId: user.id } });
         expect(rows).toHaveLength(0);
+    });
+
+    // ── 14. RETIRED addresses are not active financial owners (registry state wins) ──
+    it('resolveOwner returns NO active owner for a RETIRED address, and the legacy mirror cannot resurrect it', async () => {
+        const user = await seedUser(prisma);
+        const allocated = await allocateDepositAddress(prisma, mockTatumService(), user.id);
+        await retireDepositAddress(prisma, allocated.id);
+
+        // Not an active financial owner anymore.
+        expect(await resolveOwner(prisma, { address: allocated.address })).toBeNull();
+
+        // The legacy mirror still holds the retired address, but a registry
+        // row exists for it — registry state wins, the mirror is NEVER consulted.
+        const mirror = await prisma.user.findUnique({
+            where:  { id: user.id },
+            select: { tatumPolygonAddress: true },
+        });
+        expect(mirror.tatumPolygonAddress).toBe(allocated.address);
+        expect(await resolveOwner(prisma, { address: allocated.address })).toBeNull();
+
+        // History/audit does NOT lose the row.
+        const history = await lookupWalletAddressHistory(prisma, { address: allocated.address });
+        expect(history).not.toBeNull();
+        expect(history.id).toBe(allocated.id);
+        expect(history.status).toBe('RETIRED');
+    });
+
+    // ── 15-18. Webhook ownership authority: the registry decides, never the payload ──
+    const depositController = require('../controllers/depositController');
+    const webhookReq = ({ body }) => ({
+        body,
+        headers: {}, // non-production: unsigned test webhooks remain admissible
+        rawBody: JSON.stringify(body),
+        app: { get: (key) => ({ prisma, tatumService: null, socketio: null, emitBalanceUpdate: null }[key]) },
+    });
+    const webhookRes = () => {
+        const res = { statusCode: 0, body: null };
+        res.status = (c) => { res.statusCode = c; return res; };
+        res.json = (b) => { res.body = b; return res; };
+        return res;
+    };
+    const callWebhook = async (body) => {
+        const res = webhookRes();
+        await depositController.tatumCryptoWebhook(webhookReq({ body }), res);
+        return res;
+    };
+    const balanceOf = async (id) => Number((await prisma.user.findUnique({
+        where: { id }, select: { availableBalance: true },
+    })).availableBalance);
+    const ledgerCount = (txHash) => prisma.transactionHistory.count({ where: { txHash } });
+
+    it('webhook body.userId CANNOT override registry ownership — the address owner is credited, never the payload user', async () => {
+        const [userA, userB] = [await seedUser(prisma), await seedUser(prisma)];
+        const allocated = await allocateDepositAddress(prisma, mockTatumService(), userA.id);
+        const txHash = '0xwebhook-override-attempt-1';
+
+        const res = await callWebhook({
+            address: allocated.address, txId: txHash, amount: 7.5,
+            asset: 'USDC', userId: userB.id, // attacker-chosen userId
+        });
+
+        expect(res.statusCode).toBe(200);
+        expect(res.body.success).toBe(true);
+        expect(res.body.data.userId).toBe(userA.id);      // credited user is A
+        expect(await balanceOf(userA.id)).toBeCloseTo(1007.5);
+        expect(await balanceOf(userB.id)).toBeCloseTo(1000); // B untouched
+        const ledger = await ledgerCount(txHash);
+        expect(ledger).toBe(1);
+        const row = await prisma.transactionHistory.findUnique({ where: { txHash } });
+        expect(row.userId).toBe(userA.id);
+    });
+
+    it('a webhook for an address owned by NOBODY credits no one — even with an arbitrary userId supplied', async () => {
+        const userA = await seedUser(prisma);
+        const txHash = '0xwebhook-unknown-addr-1';
+
+        const res = await callWebhook({
+            address: '0x5555555555555555555555555555555555555555',
+            txId: txHash, amount: 9.9, asset: 'USDC', userId: userA.id,
+        });
+
+        expect(res.statusCode).toBe(200);
+        expect(res.body.data.unmatched).toBe(true);
+        expect(await ledgerCount(txHash)).toBe(0);         // no ledger row
+        expect(await balanceOf(userA.id)).toBeCloseTo(1000); // no credit
+    });
+
+    it('USDC.E is rejected before any financial mutation — no ledger row, no balance change', async () => {
+        const [userA, userB] = [await seedUser(prisma), await seedUser(prisma)];
+        const allocated = await allocateDepositAddress(prisma, mockTatumService(), userA.id);
+        const txHash = '0xwebhook-usdce-1';
+
+        const res = await callWebhook({
+            address: allocated.address, txId: txHash, amount: 5,
+            asset: 'USDC.E', userId: userB.id,
+        });
+
+        expect(res.statusCode).toBe(200);
+        expect(res.body.data.ignored).toBe(true);
+        expect(await ledgerCount(txHash)).toBe(0);          // never reached the ledger
+        expect(await balanceOf(userA.id)).toBeCloseTo(1000); // no mutation at all
+        expect(await balanceOf(userB.id)).toBeCloseTo(1000);
+    });
+
+    it('native Polygon USDC (asset = USDC) remains the accepted canonical deposit identity', async () => {
+        const userA = await seedUser(prisma);
+        const allocated = await allocateDepositAddress(prisma, mockTatumService(), userA.id);
+        const txHash = '0xwebhook-native-1';
+
+        const res = await callWebhook({
+            address: allocated.address, txId: txHash, amount: 3.25, asset: 'USDC',
+        });
+
+        expect(res.statusCode).toBe(200);
+        expect(res.body.success).toBe(true);
+        expect(await balanceOf(userA.id)).toBeCloseTo(1003.25);
+        expect(await ledgerCount(txHash)).toBe(1);
     });
 });
 

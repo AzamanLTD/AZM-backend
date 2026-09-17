@@ -35,7 +35,7 @@ const NATIVE_USDC = {
 const USDC_E = {
     network:      'POLYGON',
     asset:        'USDC_E',
-    contractAddress: '0x2791b9717a737ca894d692502e875a1a8eab1cfa',
+    contractAddress: '0x2791bca1f2de4661ed88a30c99a7a9449aa84174',
     decimals:     6,
 };
 
@@ -76,24 +76,50 @@ async function getActiveDepositAddress(prisma, userId, identity = NATIVE_USDC) {
 }
 
 /**
- * Authoritative ownership lookup for an inbound on-chain event.
- * Resolves (address + network) against WalletAddress first; a legacy
- * User.tatumPolygonAddress match remains the deterministic migration fallback
- * for records that predate the registry.
+ * AUTHORITATIVE financial-ownership lookup for an inbound on-chain event.
+ *
+ * Only an ACTIVE canonical deposit address (network = POLYGON, asset = USDC,
+ * contract = native Polygon USDC) may resolve to a customer for crediting.
+ * A RETIRED (or otherwise non-canonical) registry row resolves to NO active
+ * owner: retirement must remove financial eligibility without erasing the
+ * row (history/audit stays queryable directly against WalletAddress).
+ *
+ * The registry state ALWAYS wins over the legacy User.tatumPolygonAddress
+ * mirror: if ANY WalletAddress row exists for (address, network), the mirror
+ * is never consulted again — a retired address cannot be resurrected through
+ * the unmigrated legacy column. The mirror is used only for addresses that
+ * have no registry row at all (the deterministic migration fallback for
+ * records that predate the registry).
  */
 async function resolveOwner(prisma, { address, network = NATIVE_USDC.network }) {
     if (!address) return null;
     const normalized = String(address).toLowerCase().trim();
     const net = String(network).toUpperCase();
 
-    // ACTIVE rows sort before RETIRED (enum order); newest first within a status.
-    const row = await prisma.walletAddress.findFirst({
-        where:  { address: normalized, network: net },
-        orderBy: [{ status: 'asc' }, { createdAt: 'desc' }],
+    // 1. The only registry state that owns inbound funds: ACTIVE + canonical.
+    const activeRow = await prisma.walletAddress.findFirst({
+        where: {
+            address:         normalized,
+            network:         net,
+            asset:           NATIVE_USDC.asset,
+            contractAddress: NATIVE_USDC.contractAddress,
+            status:          'ACTIVE',
+        },
+        orderBy: { createdAt: 'desc' },
     });
-    if (row) return { userId: row.userId, walletAddress: row, source: 'WALLET_ADDRESS' };
+    if (activeRow) return { userId: activeRow.userId, walletAddress: activeRow, source: 'WALLET_ADDRESS' };
 
-    // Deterministic legacy fallback during migration.
+    // 2. Registry state wins: a row exists but none is ACTIVE-canonical
+    //    (e.g. RETIRED, or a non-canonical asset identity) — no active owner.
+    //    The legacy mirror must NEVER resurrect such an address.
+    const anyRow = await prisma.walletAddress.findFirst({
+        where:  { address: normalized, network: net },
+        select: { id: true, status: true },
+    });
+    if (anyRow) return null;
+
+    // 3. Deterministic legacy fallback during migration: no registry row at
+    //    all — the unmigrated mirror column remains authoritative for these.
     const user = await prisma.user.findFirst({
         where:  { tatumPolygonAddress: normalized },
         select: { id: true },
@@ -101,6 +127,19 @@ async function resolveOwner(prisma, { address, network = NATIVE_USDC.network }) 
     if (user) return { userId: user.id, walletAddress: null, source: 'LEGACY_MIRROR' };
 
     return null;
+}
+
+/**
+ * Historical (non-financial) lookup: any registry row for (address, network),
+ * including RETIRED. For audit/history surfaces only — it must never be used
+ * to resolve active financial ownership (use resolveOwner).
+ */
+async function lookupWalletAddressHistory(prisma, { address, network = NATIVE_USDC.network }) {
+    if (!address) return null;
+    return prisma.walletAddress.findFirst({
+        where:  { address: String(address).toLowerCase().trim(), network: String(network).toUpperCase() },
+        orderBy: [{ status: 'asc' }, { createdAt: 'desc' }],
+    });
 }
 
 // ── Allocation (idempotent; converges under races) ───────────────────────────
@@ -265,6 +304,7 @@ module.exports = {
     isCanonicalDepositAsset,
     getActiveDepositAddress,
     resolveOwner,
+    lookupWalletAddressHistory,
     allocateDepositAddress,
     retireDepositAddress,
 };

@@ -123,7 +123,9 @@ exports.tatumCryptoWebhook = async (req, res) => {
         // ── Step 2: Extract payload ──────────────────────────────────────────
         // Tatum's ADDRESS_TRANSACTION webhook shape:
         // { address, txId, amount, asset, chain, blockNumber, ... }
-        // We also accept the legacy shape: { address, txHash, amount, userId }
+        // A legacy shape may also arrive: { address, txHash, amount, userId }.
+        // The legacy userId field is IGNORED — ownership is resolved ONLY from
+        // the deposit address through the WalletAddress registry (see Step 3).
         const body    = req.body || {};
         const address = (body.address || '').toLowerCase().trim();
         const txHash  = body.txId || body.txHash || null;
@@ -149,40 +151,44 @@ exports.tatumCryptoWebhook = async (req, res) => {
             });
         }
 
-        // Only process USDC deposits (ignore native MATIC transfers etc.)
-        if (asset !== 'USDC' && asset !== 'USDC.E') {
+        // Canonical §P.1 customer deposit identity: native Polygon USDC ONLY.
+        // Bridged USDC.e is a DISTINCT asset (different contract,
+        // 0x2791bca1f2de4661ed88a30c99a7a9449aa84174) and must never be
+        // credited as canonical USDC. Explicit USDC.E is rejected BEFORE any
+        // financial mutation. NOTE: the Tatum ADDRESS_TRANSACTION payload does
+        // not carry the token contract address, so contract-level inbound
+        // verification remains part of the later custody-inbound work; this
+        // gate only enforces the logical asset label the payload does carry.
+        if (asset !== 'USDC') {
+            const isBridged = asset === 'USDC.E' || asset === 'USDC_E';
             return res.status(200).json({
                 success: true,
-                message: `Ignored non-USDC deposit (asset: ${asset}).`,
+                message: isBridged
+                    ? 'Ignored bridged USDC.e deposit — it is a distinct asset, not canonical native Polygon USDC.'
+                    : `Ignored non-USDC deposit (asset: ${asset}).`,
                 data:    { txHash, asset, ignored: true }
             });
         }
 
-        // ── Step 3: Look up user by deposit address ──────────────────────────
-        let targetUserId = null;
-
-        // If the body contains userId (legacy shape), use it directly
-        if (body.userId) {
-            targetUserId = parseInt(body.userId, 10);
+        // ── Step 3: Resolve ownership from the AUTHORITATIVE WalletAddress registry ──
+        // A webhook caller must NEVER be able to choose the credited user by
+        // supplying a userId in the payload — body.userId is NOT an ownership
+        // authority. The legacy payload shape may still carry a userId field,
+        // but it is ignored for ownership: the actual deposit address + network
+        // resolve the owner, full stop. The resolver grants ownership ONLY for
+        // an ACTIVE canonical (native-USDC) registry row (or, during migration,
+        // an address with no registry row that still matches the legacy mirror).
+        const { resolveOwner } = require('../services/walletAddressService');
+        const owner = await resolveOwner(prisma, { address, network: 'POLYGON' });
+        if (!owner) {
+            logger.warn(`[tatumCryptoWebhook] No active canonical owner for address ${address}. txHash: ${txHash}`);
+            return res.status(200).json({
+                success: true,
+                message: 'Address not associated with any user. Possibly a treasury sweep — acknowledged.',
+                data:    { txHash, address, unmatched: true }
+            });
         }
-
-        // Otherwise (Tatum native shape), resolve ownership through the
-        // AUTHORITATIVE WalletAddress registry (network-scoped, not a bare
-        // address match). The legacy User.tatumPolygonAddress remains the
-        // deterministic migration fallback inside the resolver.
-        if (!targetUserId || isNaN(targetUserId)) {
-            const { resolveOwner } = require('../services/walletAddressService');
-            const owner = await resolveOwner(prisma, { address, network: 'POLYGON' });
-            if (!owner) {
-                logger.warn(`[tatumCryptoWebhook] No owner found for address ${address}. txHash: ${txHash}`);
-                return res.status(200).json({
-                    success: true,
-                    message: 'Address not associated with any user. Possibly a treasury sweep — acknowledged.',
-                    data:    { txHash, address, unmatched: true }
-                });
-            }
-            targetUserId = owner.userId;
-        }
+        const targetUserId = owner.userId;
 
         // ── Step 4: Idempotency check ────────────────────────────────────────
         const existingTx = await prisma.transactionHistory.findUnique({
