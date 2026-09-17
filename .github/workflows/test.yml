@@ -62,6 +62,12 @@ jobs:
         # by the repository's established db-push release process.
         run: npx prisma db push --accept-data-loss
 
+      - name: Install wallet address overlay
+        run: node infra/install-wallet-address-overlay.js
+
+      - name: Install custody execution overlay
+        run: node infra/install-custody-execution-overlay.js
+
       - name: Install transaction quote overlay
         run: node infra/install-transaction-quote-overlay.js
 
