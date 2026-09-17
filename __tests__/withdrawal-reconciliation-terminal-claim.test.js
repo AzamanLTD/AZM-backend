@@ -63,6 +63,14 @@ describeOrSkip('withdrawal reconciliation terminal claim (real PostgreSQL)', () 
 
         await prisma.systemFiatPool.create({ data: { id: 1, balance: 1_000 } });
         await prisma.systemMasterCrypto.create({ data: { id: 1, balance: amount } });
+        // Legacy (non-deferred) rows recognized the exit fee at creation time;
+        // mirror that booking so the FAILED-path reversal unwinds real profit
+        // instead of driving SystemProfitFees negative (blocked by
+        // SystemProfitFees_balance_nonneg — the CHECK is correct app semantics).
+        await prisma.systemProfitFees.create({ data: { id: 1, balance: fee } });
+        await prisma.adminProfitLog.create({
+            data: { amountUsdc: fee, source: 'EXIT_FEE', relatedTxId: `full_fee_RECON_${suffix}` }
+        });
         const tx = await prisma.transactionHistory.create({
             data: {
                 userId: user.id,

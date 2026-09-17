@@ -188,18 +188,18 @@ STATEMENTS.push(
   `ALTER TABLE "Vault" ADD COLUMN IF NOT EXISTS "yieldAutoCompound" BOOLEAN NOT NULL DEFAULT true`,
 
   // Seed default DeFi strategies
-  `INSERT INTO "DeFiYieldStrategy" ("name", "displayName", "protocol", "apr", "riskLevel", "minAmountUsdc", "isActive", "description", "logoUrl", "updatedAt")
-   SELECT 'AAVE', 'Aave V3 — Stablecoin Pool', 'AAVE', 0.0450, 'LOW', 10, true,
+  `INSERT INTO "DeFiYieldStrategy" ("id", "name", "displayName", "protocol", "apr", "riskLevel", "minAmountUsdc", "isActive", "description", "logoUrl", "updatedAt")
+   SELECT gen_random_uuid()::text, 'AAVE', 'Aave V3 — Stablecoin Pool', 'AAVE', 0.0450, 'LOW', 10, true,
      'Supply USDC to Aave V3 lending pool. Earns variable APR from borrower interest.',
      'https://cryptologos.cc/logos/aave-aave-logo.png', CURRENT_TIMESTAMP
    WHERE NOT EXISTS (SELECT 1 FROM "DeFiYieldStrategy" WHERE "name" = 'AAVE')`,
-  `INSERT INTO "DeFiYieldStrategy" ("name", "displayName", "protocol", "apr", "riskLevel", "minAmountUsdc", "isActive", "description", "logoUrl", "updatedAt")
-   SELECT 'COMPOUND', 'Compound V3 — USDC Market', 'COMPOUND', 0.0385, 'LOW', 10, true,
+  `INSERT INTO "DeFiYieldStrategy" ("id", "name", "displayName", "protocol", "apr", "riskLevel", "minAmountUsdc", "isActive", "description", "logoUrl", "updatedAt")
+   SELECT gen_random_uuid()::text, 'COMPOUND', 'Compound V3 — USDC Market', 'COMPOUND', 0.0385, 'LOW', 10, true,
      'Supply USDC to Compound V3 market. Earns COMP rewards + interest.',
      'https://cryptologos.cc/logos/compound-comp-logo.png', CURRENT_TIMESTAMP
    WHERE NOT EXISTS (SELECT 1 FROM "DeFiYieldStrategy" WHERE "name" = 'COMPOUND')`,
-  `INSERT INTO "DeFiYieldStrategy" ("name", "displayName", "protocol", "apr", "riskLevel", "minAmountUsdc", "maxAmountUsdc", "isActive", "description", "logoUrl", "updatedAt")
-   SELECT 'INTERNAL_LP', 'AZAMAN Internal LP', 'INTERNAL', 0.0650, 'MEDIUM', 50, 50000, true,
+  `INSERT INTO "DeFiYieldStrategy" ("id", "name", "displayName", "protocol", "apr", "riskLevel", "minAmountUsdc", "maxAmountUsdc", "isActive", "description", "logoUrl", "updatedAt")
+   SELECT gen_random_uuid()::text, 'INTERNAL_LP', 'AZAMAN Internal LP', 'INTERNAL', 0.0650, 'MEDIUM', 50, 50000, true,
      'Provide liquidity to AZAMAN P2P matching pool. Higher APR with platform risk. AZM bonus rewards.',
      NULL, CURRENT_TIMESTAMP
    WHERE NOT EXISTS (SELECT 1 FROM "DeFiYieldStrategy" WHERE "name" = 'INTERNAL_LP')`,
