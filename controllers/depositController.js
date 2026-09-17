@@ -205,6 +205,15 @@ exports.tatumCryptoWebhook = async (req, res) => {
         // ── Step 5: ACID ledger credit ───────────────────────────────────────
         const amountUsdc = parseFloat(amount.toFixed(6));
 
+        // §P.3 exact quantity for the custody candidate: the credited amount
+        // expressed as EXACT integer base units (never a float). The webhook's
+        // own amount parsing is not custody evidence — the candidate must be
+        // re-proven by transaction evidence before it counts anywhere.
+        const candidateDecimalString = Number(amount.toFixed(6)).toFixed(6);
+        const [candInt, candFrac = ''] = candidateDecimalString.split('.');
+        const candidateBaseUnits = BigInt(candInt + candFrac.padEnd(6, '0'));
+        const ownerWalletAddress = owner.walletAddress || null;
+
         const result = await prisma.$transaction(async (tx) => {
             const user = await tx.user.findUnique({ where: { id: targetUserId } });
             if (!user) throw new Error(`User ${targetUserId} not found for crypto deposit.`);
@@ -241,7 +250,33 @@ exports.tatumCryptoWebhook = async (req, res) => {
                 }
             });
 
-            // 5e. Phase N: notification moved post-commit for full pipeline delivery.
+            // 5e. §P.3 custody accounting: record the deposit CANDIDATE movement
+            // atomically with the credit. The webhook is an observation source
+            // ONLY — this candidate is NOT a verified custody movement. It
+            // contributes nothing to the evidence-linked liability subset
+            // until verifyDepositMovement succeeds against transaction-
+            // specific chain evidence (Tatum v4 tx-by-hash). Failure here
+            // rolls the whole credit back: a credit without its custody
+            // candidate would be an untracked deposit.
+            const custodyAccounting = require('../services/custodyAccountingService');
+            if (ownerWalletAddress) {
+                await custodyAccounting.recordDepositCandidate(tx, {
+                    walletAddress: ownerWalletAddress,
+                    txHash,
+                    amountBaseUnits: candidateBaseUnits,
+                    transactionHistoryId: txRecord.id,
+                    creditedAmountDecimalString: candidateDecimalString,
+                });
+            } else {
+                // Legacy-fallback owner (§P.1 migration window): no registry
+                // row, so no custody account can be derived. The credit keeps
+                // its existing behavior; the deposit stays in the USDC flow
+                // classification (X) but can never reach the evidence-linked
+                // subset (Y) — logged, never silently presented as tracked.
+                logger.warn({ txHash, userId: targetUserId }, '[depositController] deposit at non-registry address — no custody candidate recorded');
+            }
+
+            // 5f. Phase N: notification moved post-commit for full pipeline delivery.
 
             return { user, txRecord, newBalance: user.availableBalance + amountUsdc };
         });

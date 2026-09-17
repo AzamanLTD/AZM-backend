@@ -1227,6 +1227,21 @@ async function settleExecution(prisma, { executionId, evidence } = {}) {
                 data:  { status: 'CONFIRMED', confirmedAt: new Date() },
             });
         }
+
+        // §P.3 custody accounting: the verified settlement IS transaction
+        // evidence. The custody movement (and its exact journal posting) is
+        // created in this SAME transaction — atomic with the settlement, or
+        // not at all. A failure rolls the settlement back to its prior state
+        // and the reconciliation lifecycle retries; the movement's
+        // idempotency key converges on retry.
+        const custodyAccounting = require('./custodyAccountingService');
+        const settleCfg = getConfig();
+        if (!settleCfg.hotWalletAddress) {
+            throw new CustodyExecutionError(ERROR_CLASSES.CONFIGURATION_ERROR,
+                'Settlement refused: master hot wallet address is not configured — cannot record custody accounting.');
+        }
+        await custodyAccounting.recordExecutionMovement(tx, { execution, hotWalletAddress: settleCfg.hotWalletAddress });
+
         return { settled: true, alreadySettled: false, status: STATUSES.COMPLETED, txHash: execution.txHash };
     });
 }

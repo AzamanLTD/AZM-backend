@@ -68,6 +68,9 @@ jobs:
       - name: Install custody execution overlay
         run: node infra/install-custody-execution-overlay.js
 
+      - name: Install custody accounting overlay
+        run: node infra/install-custody-accounting-overlay.js
+
       - name: Install transaction quote overlay
         run: node infra/install-transaction-quote-overlay.js
 
