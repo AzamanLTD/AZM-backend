@@ -31,13 +31,17 @@
 // =============================================================================
 
 const { PrismaClient } = require('@prisma/client');
-const logger = require('../src/config/logger');
 
+// Standalone client used only when this file is run as a CLI. When called
+// from autoRelease.js (or any host with its own Prisma client), pass the
+// caller's client as the `client` argument so the app's pooled connection
+// is reused — avoids a second Neon connection (pooler/advisory-lock issues
+// that plague one-off clients on Neon).
 const prisma = new PrismaClient();
 
-async function run(label, sql) {
+async function run(db, label, sql) {
   try {
-    await prisma.$executeRawUnsafe(sql);
+    await db.$executeRawUnsafe(sql);
     console.log(`  ok: ${label}`);
     return true;
   } catch (err) {
@@ -53,19 +57,19 @@ async function run(label, sql) {
 //  20260914120000_business_stake_balance,
 //  20260731020000_add_business_order_item)
 // ---------------------------------------------------------------------------
-async function stage1() {
+async function stage1(db) {
   console.log('[stage 1] Prisma-model objects required by deployed code');
   let ok = true;
 
-  ok &= await run('AzmRewardLog.dedupKey column',
+  ok &= await run(db, 'AzmRewardLog.dedupKey column',
     'ALTER TABLE "AzmRewardLog" ADD COLUMN IF NOT EXISTS "dedupKey" TEXT');
-  ok &= await run('AzmSpendLog.dedupKey column',
+  ok &= await run(db, 'AzmSpendLog.dedupKey column',
     'ALTER TABLE "AzmSpendLog" ADD COLUMN IF NOT EXISTS "dedupKey" TEXT');
 
   // Backfill dedupKey from the legacy metadata location (first row per
   // identity wins; duplicates — none found in production — would stay NULL
   // and remain visible in metadata). Idempotent: WHERE r."dedupKey" IS NULL.
-  ok &= await run('AzmRewardLog.dedupKey backfill',
+  ok &= await run(db, 'AzmRewardLog.dedupKey backfill',
     `WITH ranked AS (
        SELECT id, metadata->>'dedupKey' AS dk,
               ROW_NUMBER() OVER (
@@ -79,7 +83,7 @@ async function stage1() {
      SET "dedupKey" = ranked.dk
      FROM ranked
      WHERE r.id = ranked.id AND ranked.rn = 1 AND r."dedupKey" IS NULL`);
-  ok &= await run('AzmSpendLog.dedupKey backfill',
+  ok &= await run(db, 'AzmSpendLog.dedupKey backfill',
     `WITH ranked AS (
        SELECT id, metadata->>'dedupKey' AS dk,
               ROW_NUMBER() OVER (
@@ -94,18 +98,18 @@ async function stage1() {
      FROM ranked
      WHERE r.id = ranked.id AND ranked.rn = 1 AND r."dedupKey" IS NULL`);
 
-  ok &= await run('AzmRewardLog dedup unique index',
+  ok &= await run(db, 'AzmRewardLog dedup unique index',
     'CREATE UNIQUE INDEX IF NOT EXISTS "AzmRewardLog_userId_source_dedupKey_key" ON "AzmRewardLog"("userId", "source", "dedupKey")');
-  ok &= await run('AzmSpendLog dedup unique index',
+  ok &= await run(db, 'AzmSpendLog dedup unique index',
     'CREATE UNIQUE INDEX IF NOT EXISTS "AzmSpendLog_userId_source_dedupKey_key" ON "AzmSpendLog"("userId", "source", "dedupKey")');
 
-  ok &= await run('TransactionType.OVERPAYMENT_FREEZE enum value',
+  ok &= await run(db, 'TransactionType.OVERPAYMENT_FREEZE enum value',
     'ALTER TYPE "TransactionType" ADD VALUE IF NOT EXISTS \'OVERPAYMENT_FREEZE\'');
 
-  ok &= await run('BusinessProfile.stakeBalance column',
+  ok &= await run(db, 'BusinessProfile.stakeBalance column',
     'ALTER TABLE "BusinessProfile" ADD COLUMN IF NOT EXISTS "stakeBalance" DECIMAL(20,8) NOT NULL DEFAULT 0');
 
-  ok &= await run('BusinessOrderItem table',
+  ok &= await run(db, 'BusinessOrderItem table',
     `CREATE TABLE IF NOT EXISTS "BusinessOrderItem" (
        "id" TEXT NOT NULL,
        "orderId" TEXT NOT NULL,
@@ -119,18 +123,18 @@ async function stage1() {
        "updatedAt" TIMESTAMP(3) NOT NULL,
        CONSTRAINT "BusinessOrderItem_pkey" PRIMARY KEY ("id")
      )`);
-  ok &= await run('BusinessOrderItem.orderId index',
+  ok &= await run(db, 'BusinessOrderItem.orderId index',
     'CREATE INDEX IF NOT EXISTS "BusinessOrderItem_orderId_idx" ON "BusinessOrderItem"("orderId")');
-  ok &= await run('BusinessOrderItem.productId index',
+  ok &= await run(db, 'BusinessOrderItem.productId index',
     'CREATE INDEX IF NOT EXISTS "BusinessOrderItem_productId_idx" ON "BusinessOrderItem"("productId")');
-  ok &= await run('BusinessOrderItem.orderId FK', `DO $$ BEGIN
+  ok &= await run(db, 'BusinessOrderItem.orderId FK', `DO $$ BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'BusinessOrderItem_orderId_fkey') THEN
       ALTER TABLE "BusinessOrderItem"
         ADD CONSTRAINT "BusinessOrderItem_orderId_fkey"
         FOREIGN KEY ("orderId") REFERENCES "BusinessOrder"("id") ON DELETE CASCADE;
     END IF;
   END $$;`);
-  ok &= await run('BusinessOrderItem.productId FK', `DO $$ BEGIN
+  ok &= await run(db, 'BusinessOrderItem.productId FK', `DO $$ BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'BusinessOrderItem_productId_fkey') THEN
       ALTER TABLE "BusinessOrderItem"
         ADD CONSTRAINT "BusinessOrderItem_productId_fkey"
@@ -226,17 +230,18 @@ const CHECK_CONSTRAINTS = [
   { table: "AzmAuctionBid", name: "AzmAuctionBid_bidAmount_check", expr: `"bidAmountAzm" > 0` }
 ];
 
-async function stage2() {
+async function stage2(db) {
   console.log('[stage 2] CHECK constraints (NOT VALID + VALIDATE)');
   let added = 0, alreadyThere = 0, failed = 0;
   const pendingValidation = [];
 
   for (const c of CHECK_CONSTRAINTS) {
-    const exists = await prisma.$queryRawUnsafe(
+    const exists = await db.$queryRawUnsafe(
       `SELECT 1 FROM pg_constraint WHERE conname = '${c.name}' AND connamespace = 'public'::regnamespace`
     );
     if (exists.length > 0) { alreadyThere++; continue; }
     const addedOk = await run(
+      db,
       `${c.table}.${c.name}`,
       `DO $$ BEGIN
          IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = '${c.name}') THEN
@@ -250,14 +255,14 @@ async function stage2() {
     // Validate existing rows; a violation leaves the constraint NOT VALID
     // (still enforced for all NEW writes) and surfaces the offending rows.
     try {
-      const viol = await prisma.$queryRawUnsafe(
+      const viol = await db.$queryRawUnsafe(
         `SELECT count(*)::int AS v FROM "${c.table}" WHERE (${c.expr}) IS NOT TRUE`
       );
       const n = Number(viol[0]?.v ?? 0);
       if (n > 0) {
         pendingValidation.push({ constraint: c.name, table: c.table, violations: n });
       } else {
-        await prisma.$executeRawUnsafe(`ALTER TABLE "${c.table}" VALIDATE CONSTRAINT "${c.name}"`);
+        await db.$executeRawUnsafe(`ALTER TABLE "${c.table}" VALIDATE CONSTRAINT "${c.name}"`);
       }
     } catch (err) {
       pendingValidation.push({ constraint: c.name, table: c.table, error: err.message });
@@ -269,22 +274,44 @@ async function stage2() {
     console.warn(`  PENDING VALIDATION: ${p.constraint} on ${p.table} — ${p.violations ?? p.error}`);
     console.warn(`    (constraint IS enforced for new writes; historical rows need a data-repair decision)`);
   }
-  return failed === 0;
+  return { ok: failed === 0, pendingValidation };
 }
 
-async function main() {
-  const s1 = await stage1();
-  const s2 = await stage2();
-  await prisma.$disconnect();
-  if (!s1 || !s2) {
-    console.error('DRIFT REMEDIATION INCOMPLETE — see failures above.');
-    process.exit(1);
-  }
-  console.log('Drift remediation complete.');
+/**
+ * Run the full drift-remediation (stage 1 + stage 2).
+ * @param {import('@prisma/client').PrismaClient} [client] caller's client;
+ *   omitted only when running standalone as a CLI (own client, own pool).
+ * @returns {Promise<{ok: boolean, stage1: boolean, stage2: boolean, pendingValidation: Array}>}
+ */
+async function install(client) {
+  const db = client || prisma;
+  const s1 = await stage1(db);
+  const s2 = await stage2(db);
+  return {
+    ok: s1 && s2.ok,
+    stage1: s1,
+    stage2: s2.ok,
+    pendingValidation: s2.pendingValidation,
+  };
 }
 
-main().catch(async (e) => {
-  console.error('Fatal:', e.message);
-  await prisma.$disconnect();
-  process.exit(1);
-});
+module.exports = { installProdDriftRemediation: install };
+
+// Allow running standalone: `node infra/install-prod-drift-remediation.js`
+if (require.main === module) {
+  install()
+    .then(async (r) => {
+      await prisma.$disconnect();
+      if (!r.ok) {
+        console.error('DRIFT REMEDIATION INCOMPLETE — see failures above.');
+        process.exit(1);
+      }
+      console.log('Drift remediation complete.');
+      process.exit(0);
+    })
+    .catch(async (e) => {
+      console.error('Fatal:', e.message);
+      await prisma.$disconnect();
+      process.exit(1);
+    });
+}
