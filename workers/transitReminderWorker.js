@@ -6,11 +6,15 @@
 // next 60-75 minutes where no reminder has been sent yet. Sends a push
 // notification to the customer with trip details.
 //
-// Registration in server.js:
-//   const { sweepTransitReminders } = require('./workers/transitReminderWorker');
-const logger = require('../src/config/logger');
-//   cron.schedule('*/15 * * * *', () => sweepTransitReminders(prisma));
+// Seat display note: TransitBookingSeat has no Prisma relation to a seat
+// entity — `seatId` is the stored seat identifier (from the transit seat-map
+// layout), and that is what the reminder shows. Do NOT reintroduce a
+// `seat: { include / select }` clause here; it does not exist on the model.
+//
+// Registered in src/workers/index.js as scheduler job 'transit-reminders'.
 // =============================================================================
+
+const logger = require('../src/config/logger');
 
 const REMINDER_WINDOW_MINS = 60; // send reminder 60 min before departure
 const SWEEP_BUFFER_MINS = 15; // check bookings departing within 60-75 min
@@ -35,7 +39,9 @@ const sweepTransitReminders = async (prisma) => {
                 }
             },
             businessProfile: { select: { businessName: true } },
-            seats: { include: { seat: { select: { label: true } } } },
+            // No `seat` relation exists on TransitBookingSeat — seatId is the
+            // stored seat identifier and is used directly for the reminder text.
+            seats: { select: { seatId: true } },
         }
     });
 
@@ -49,22 +55,30 @@ const sweepTransitReminders = async (prisma) => {
                 hour: '2-digit', minute: '2-digit', day: 'numeric', month: 'short'
             });
 
-            const seatLabels = booking.seats.map(s => s.seat?.label || 'N/A').join(', ');
+            const seatLabels = booking.seats.map(s => s.seatId).join(', ');
 
+            // Notification model has no `type`/`metadata` columns and
+            // `MARKETPLACE` is not a NotificationCategory value — the original
+            // create payload could never validate against the real schema.
+            // `type` rides inside actionPayload (the model's Json column),
+            // matching how notificationService._ensureDeepLink expects extra
+            // fields to travel, and the category falls back to GENERAL —
+            // the same normalization notificationService applies to unknown
+            // categories.
             await prisma.notification.create({
                 data: {
                     userId: booking.customerId,
-                    type: 'TRANSIT_REMINDER',
-                    category: 'MARKETPLACE',
+                    category: 'GENERAL',
                     title: `Trip departing soon: ${booking.trip.routeName}`,
                     body: `Your trip to ${booking.trip.destination} departs at ${departureTime}. Seat(s): ${seatLabels}. Vehicle: ${booking.trip.vehicle?.type || 'N/A'}.`,
-                    metadata: {
+                    actionPayload: {
+                        action: 'TRANSIT_REMINDER',
+                        type: 'TRANSIT_REMINDER',
                         bookingId: booking.id,
                         tripId: booking.tripId,
                         routeName: booking.trip.routeName,
                         departureAt: booking.trip.departureAt,
                     },
-                    isRead: false,
                 }
             });
 

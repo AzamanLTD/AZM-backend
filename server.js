@@ -245,9 +245,8 @@ app.set('vendorStatus', vendorStatus);
 app.set('pushIfOffline', pushIfOffline);
 app.set('emitBalanceUpdate', emitBalanceUpdate);
 
-// ── Storefront Stake + Keep-Alive + Stories cron (registered via scheduler) ──
+// ── Storefront Stake + Stories cron (registered via scheduler) ────────────────
 const storefrontStakeWorker = require('./workers/storefrontStakeWorker');
-const keepAliveWorker = require('./workers/keepAliveWorker');
 const { getScheduler } = require('./src/lib/bullScheduler');
 app.set('scheduler', getScheduler()); // surfaced in /health as `scheduler` (operating mode)
 (async () => {
@@ -255,8 +254,6 @@ app.set('scheduler', getScheduler()); // surfaced in /health as `scheduler` (ope
     // Storefront stake: daily tier check + hourly unstake queue
     await scheduler.register('storefront-stake-daily', String(24 * 60 * 60 * 1000), () => storefrontStakeWorker.dailyStakeCheckTick(prisma));
     await scheduler.register('storefront-stake-unstake', String(60 * 60 * 1000), () => storefrontStakeWorker.processUnstakeQueueTick(prisma));
-    // Keep-alive: ping external services every 5 min
-    await scheduler.register('keep-alive', String(5 * 60 * 1000), () => keepAliveWorker.pingAll());
     // Stories expiration
     await scheduler.register('stories-expire', '*/15 * * * *', () => app.get('storyService')?.expireOldStories().catch(err => logger.error({ err }, 'StoryCron error')));
 })();
