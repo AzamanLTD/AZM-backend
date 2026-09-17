@@ -7,6 +7,7 @@ const journal = require('../services/journalIntegration');
 const {
   createServerTransactionQuote,
   consumeTransactionQuote,
+  RateUnavailableError,
 } = require('../src/services/transactionQuoteService');
 
 const FIAT_REF_PREFIX = 'FIAT_DEPOSIT_';
@@ -54,6 +55,12 @@ exports.initiate = async (req, res) => {
       data: { reference: tx.txHash, quoteId: quote.id, status: 'PENDING', provider, amountGhs: quote.amountGhs, quotedRate: quote.rateGhsPerUsdc, usdcEquivalent: quote.usdcAmount, quoteValidUntil: quote.expiresAt, instructions: [`Send GHS ${quote.amountGhs.toFixed(2)} via ${provider}.`, `Use reference: ${tx.txHash}`, 'Funds will appear in your Azaman wallet after provider confirmation.'], transaction: tx },
     });
   } catch (error) {
+    // 271C fail-closed stale-rate gate: no fresh external observation means
+    // NO quote, NO pending transaction, and NO provider initiation — the
+    // $transaction above never committed anything.
+    if (error instanceof RateUnavailableError) {
+      return res.status(503).json({ success: false, message: error.message, code: error.code });
+    }
     logger.error({ err: error }, '[quoteFiatDeposit] initiation error');
     return res.status(500).json({ success: false, message: 'Unable to create deposit quote.' });
   }

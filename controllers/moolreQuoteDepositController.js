@@ -7,6 +7,8 @@ const journal = require('../services/journalIntegration');
 const {
   createTransactionQuote,
   persistTransactionQuote,
+  getFreshServerRateGhsPerUsdc,
+  RateUnavailableError,
   consumeTransactionQuote,
 } = require('../src/services/transactionQuoteService');
 
@@ -50,10 +52,15 @@ exports.initiate = async (req, res) => {
     if (!phoneNumber || String(phoneNumber).replace(/\D/g, '').length < 9)
       return res.status(400).json({ success: false, message: 'A valid phone number is required.' });
 
-    const settings = await prisma.globalSettings.findUnique({ where: { id: 1 } });
-    const rate = Number(settings?.liveRetailRate ?? settings?.liveUsdToGhs);
-    if (!Number.isFinite(rate) || rate <= 0)
-      return res.status(503).json({ success: false, message: 'Exchange rate unavailable. Please retry shortly.' });
+    // 271C fail-closed stale-rate gate: Moolre initiation shares the SAME
+    // canonical freshness/rate helper as the generic fiat route. A stale or
+    // missing external observation fails HERE — before the quote is persisted,
+    // before any TransactionHistory row exists, and before Moolre is asked to
+    // initiate a payment. No direct GlobalSettings rate read remains.
+    const rate = await getFreshServerRateGhsPerUsdc({
+      prisma,
+      marketOracle: req.app.get('marketOracle'),
+    });
 
     const network = NETWORK_MAP[provider];
     const quote = createTransactionQuote({
@@ -62,11 +69,11 @@ exports.initiate = async (req, res) => {
       purpose: 'deposit',
       amountGhs: ghsFloat,
       feeGhs: 0,
-      rateGhsPerUsdc: rate,
-      rateSource: settings.liveRateSource || 'AZM_ADMIN_MOCK',
-      // True external observation timestamp (issue #271 / PR 271B): the quote
-      // snapshot must never inherit a MOCK-echo or admin-fabricated stamp.
-      rateAsOf: settings.lastExternalSync || settings.lastRateSync || new Date(),
+      rateGhsPerUsdc: rate.rateGhsPerUsdc,
+      rateSource: rate.rateSource,
+      // rateAsOf is the TRUE external observation the gate verified — never a
+      // MOCK-echo or admin-fabricated stamp (issue #271 / PR 271B).
+      rateAsOf: rate.rateAsOf,
       ttlSeconds: QUOTE_TTL_SECONDS,
     });
 
@@ -90,7 +97,7 @@ exports.initiate = async (req, res) => {
             quoteId: quote.id,
             quoteAmountUsdc: quote.usdcAmount,
             quoteExpiresAt: quote.expiresAt,
-            rateAtInitiation: rate,
+            rateAtInitiation: rate.rateGhsPerUsdc,
             rateSource: quote.rateSource,
             rateAsOf: quote.rateAsOf,
             ratePair: 'USDC/GHS',
@@ -141,6 +148,11 @@ exports.initiate = async (req, res) => {
       },
     });
   } catch (err) {
+    // 271C: stale/unavailable external rate — nothing was persisted and the
+    // provider was never contacted.
+    if (err instanceof RateUnavailableError) {
+      return res.status(503).json({ success: false, message: err.message, code: err.code });
+    }
     logger.error({ err }, '[moolreQuoteDeposit] initiation error');
     return res.status(500).json({ success: false, message: 'An unexpected error occurred.' });
   }

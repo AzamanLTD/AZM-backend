@@ -75,13 +75,16 @@ describe('transaction quote service', () => {
     expect(prisma.$executeRaw).toHaveBeenCalledTimes(1);
   });
 
-  test('createServerTransactionQuote snapshots the server rate and persists the result', async () => {
+  test('createServerTransactionQuote snapshots the FRESH server rate and persists the result', async () => {
     const prisma = {
       globalSettings: {
         findUnique: jest.fn().mockResolvedValue({
           liveUsdToGhs: 12.5,
           liveRateSource: 'LIVE',
           lastRateSync: new Date('2026-08-29T04:59:00.000Z'),
+          // 271C: deposit-purpose quotes are gated on the canonical external
+          // observation timestamp. 60 seconds old — fresh.
+          lastExternalSync: new Date('2026-08-29T04:59:00.000Z'),
         }),
       },
       $executeRaw: jest.fn().mockResolvedValue(1),
@@ -99,7 +102,35 @@ describe('transaction quote service', () => {
     expect(quote.rateGhsPerUsdc).toBe(12.5);
     expect(quote.usdcAmount).toBe(10);
     expect(quote.rateSource).toBe('LIVE');
+    // rateAsOf is the verified external observation, not the create time.
+    expect(new Date(quote.rateAsOf).toISOString()).toBe('2026-08-29T04:59:00.000Z');
     expect(prisma.$executeRaw).toHaveBeenCalledTimes(1);
+  });
+
+  test('createServerTransactionQuote refuses a deposit quote with no external observation (271C gate)', async () => {
+    const prisma = {
+      globalSettings: {
+        findUnique: jest.fn().mockResolvedValue({
+          liveUsdToGhs: 12.5,
+          liveRateSource: 'LIVE',
+          lastRateSync: new Date('2026-08-29T04:59:00.000Z'),
+          lastExternalSync: null, // no truthful external provenance
+        }),
+      },
+      $executeRaw: jest.fn().mockResolvedValue(1),
+    };
+
+    await expect(
+      createServerTransactionQuote({
+        prisma,
+        userId: 42,
+        purpose: 'deposit',
+        amountGhs: 125,
+        ttlSeconds: 60,
+        now: new Date('2026-08-29T05:00:00.000Z'),
+      })
+    ).rejects.toMatchObject({ code: 'RATE_UNAVAILABLE', statusCode: 503 });
+    expect(prisma.$executeRaw).not.toHaveBeenCalled();
   });
 
   test('atomically consumes an unconsumed, owned, unexpired quote', async () => {

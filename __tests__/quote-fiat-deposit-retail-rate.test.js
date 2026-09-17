@@ -17,10 +17,22 @@ jest.mock('../src/services/transactionQuoteService', () => ({
   })),
   persistTransactionQuote: jest.fn().mockResolvedValue(undefined),
   consumeTransactionQuote: jest.fn(),
+  // 271C: the mounted Moolre initiation must source its rate through the
+  // canonical fail-closed freshness gate, never a direct GlobalSettings read.
+  getFreshServerRateGhsPerUsdc: jest.fn().mockResolvedValue({
+    rateGhsPerUsdc: 13.42,
+    rateSource: 'KOTANI_PAY',
+    rateAsOf: new Date('2026-09-04T11:30:00.000Z'),
+    externalAgeSeconds: 60,
+    maxAgeSeconds: 1800,
+  }),
+  RateUnavailableError: class RateUnavailableError extends Error {
+    constructor(message, code) { super(message); this.name = 'RateUnavailableError'; this.code = code; this.statusCode = 503; }
+  },
 }));
 
 const { initiate } = require('../controllers/moolreQuoteDepositController');
-const { createTransactionQuote } = require('../src/services/transactionQuoteService');
+const { createTransactionQuote, getFreshServerRateGhsPerUsdc } = require('../src/services/transactionQuoteService');
 
 describe('moolreQuoteDeposit canonical retail FX contract', () => {
   beforeEach(() => jest.clearAllMocks());
@@ -33,14 +45,9 @@ describe('moolreQuoteDeposit canonical retail FX contract', () => {
       },
     };
     const prisma = {
-      globalSettings: {
-        findUnique: jest.fn().mockResolvedValue({
-          liveRetailRate: 13.42,
-          liveUsdToGhs: 13.10,
-          liveRateSource: 'KOTANI_PAY',
-          lastRateSync: '2026-09-04T11:30:00.000Z',
-        }),
-      },
+      // 271C: no direct GlobalSettings rate read is permitted on the mounted
+      // initiation path anymore — the controller must delegate to the gate.
+      globalSettings: { findUnique: jest.fn() },
       $transaction: jest.fn(async (callback) => callback(tx)),
       transactionHistory: {
         update: jest.fn().mockResolvedValue({}),
@@ -71,10 +78,14 @@ describe('moolreQuoteDeposit canonical retail FX contract', () => {
 
     await initiate(req, res);
 
+    // The rate snapshot came from the canonical 271C gate, not a direct read.
+    expect(getFreshServerRateGhsPerUsdc).toHaveBeenCalledWith(expect.objectContaining({ prisma }));
+    expect(prisma.globalSettings.findUnique).not.toHaveBeenCalled();
     expect(createTransactionQuote).toHaveBeenCalledWith(expect.objectContaining({
       amountGhs: 134.2,
       rateGhsPerUsdc: 13.42,
       rateSource: 'KOTANI_PAY',
+      rateAsOf: new Date('2026-09-04T11:30:00.000Z'),
     }));
     expect(tx.transactionHistory.create).toHaveBeenCalledWith({
       data: expect.objectContaining({
