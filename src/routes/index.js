@@ -27,6 +27,8 @@ function mountRoutes(app, {
     // Mounted before the legacy admin router so existing clients immediately
     // receive fiatVolume24h/cryptoVolume24h without a breaking URL change.
     app.use('/api/admin', generalLimiter, require('../../routes/adminStatsRoutes'));
+    // P2: non-destructive custody execution preflight/diagnostics (admin-only).
+    app.use('/api/admin/custody', generalLimiter, require('../../routes/custodyRoutes'));
     // Admin dine-in lifecycle projection: server-computed from the canonical
     // DineInTab/Invoice models; mounted before the legacy admin router.
     app.use('/api/admin', generalLimiter, require('../../routes/adminDineInRoutes'));

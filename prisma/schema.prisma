@@ -5645,6 +5645,60 @@ model IdempotencyKey {
 // infra/install-wallet-address-overlay.js because Prisma cannot express partial
 // unique indexes). Retired addresses are never reassigned: (address, network) is
 // globally unique and status never transitions back from RETIRED.
+// ── Financial architecture §P.2 (2026-09-17): custody execution boundary ────
+// CustodyExecution is the DURABLE EXTERNAL EXECUTION record for real on-chain
+// transfers (customer withdrawals + deposit sweeps). It is NOT a withdrawal
+// ledger and NOT the final custody-account model: the authoritative customer
+// liability stays in TransactionHistory/User; §P.3 will attach these
+// executions to the formal custody-account/movement architecture.
+//
+// Invariants:
+//  • idempotencyKey is unique — the durable execution identity; a duplicate
+//    claim converges on the committed row instead of double-executing.
+//  • txHash may ONLY be set from actual provider/chain evidence (never
+//    generated locally) and is unique once present.
+//  • status transitions are forward-only (enforced in the service; terminal
+//    states COMPLETED / FAILED / RECONCILIATION_REQUIRED never move backward).
+//  • amountBaseUnits is EXACT integer token units (no floating point).
+model CustodyExecution {
+  id                 String    @id @default(uuid())
+  idempotencyKey     String    @unique
+  kind               String    @db.VarChar(30) // CUSTOMER_WITHDRAWAL | DEPOSIT_SWEEP
+  refId              String?   // TransactionHistory id (withdrawals) / OnchainSweep id (sweeps)
+  walletAddressId     String?   // DEPOSIT_SWEEP source WalletAddress id
+  userId             Int?
+  network            String    @default("POLYGON") @db.VarChar(20)
+  asset              String    @default("USDC") @db.VarChar(20)
+  contractAddress    String    @db.VarChar(42)
+  fromAddress        String    @db.VarChar(42)
+  toAddress          String    @db.VarChar(42)
+  amountBaseUnits    BigInt
+  decimals           Int       @default(6)
+  status             String    @default("REQUESTED") // REQUESTED|RESERVING|SUBMITTED|SIGNING|BROADCAST|CONFIRMING|COMPLETED|FAILED|RECONCILIATION_REQUIRED
+  provider           String    @default("TATUM_KMS") @db.VarChar(30)
+  signatureId        String?   @db.VarChar(100)
+  providerRequestId  String?   @db.VarChar(100) // KMS pending signing-request id
+  txHash             String?   @unique // ONLY from provider/chain evidence
+  approvalStatus     String    @default("PENDING") // PENDING | APPROVED | DENIED
+  approvedAt         DateTime?
+  errorClass         String?   @db.VarChar(40)
+  errorMessage       String?   @db.VarChar(500) // redacted — never secrets
+  feeChargeBaseUnits BigInt?   // customer fee/charge (product policy)
+  estimatedNetworkCostBaseUnits BigInt? // estimate only — NOT realized cost
+  realizedNetworkCostBaseUnits  BigInt? // actual network cost, from evidence only
+  submittedAt        DateTime?
+  broadcastAt        DateTime?
+  confirmedAt        DateTime?
+  metadata           Json?
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+
+  @@index([kind, refId])
+  @@index([status])
+  @@index([walletAddressId])
+  @@index([userId])
+}
+
 enum WalletAddressStatus {
   ACTIVE
   RETIRED

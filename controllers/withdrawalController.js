@@ -469,6 +469,13 @@ exports.cryptoWithdrawal = async (req, res) => {
     const emailService       = req.app.get('emailService');
     const smsService         = req.app.get('smsService');
 
+    // §P.2: KMS-capable custody execution boundary. The ONLY external crypto
+    // execution path — no raw Tatum payloads are constructed here, no fake tx
+    // hashes exist, and the withdrawal may only reach COMPLETED on real chain
+    // evidence (verified by the custody execution service, not by an HTTP 200).
+    const custody = require('../services/tatumCustodyExecutionService');
+    const { CustodyExecutionError } = require('../services/custodyExecutionErrors');
+
     try {
         const { amount, destination, network } = req.body;
         const userId = req.user.id;
@@ -479,10 +486,13 @@ exports.cryptoWithdrawal = async (req, res) => {
         if (!destination) {
             return res.status(400).json({ success: false, message: 'Destination wallet address is required.' });
         }
-        if (!destination.startsWith('0x') || destination.length !== 42) {
-            return res.status(400).json({ success: false, message: 'Invalid Polygon address format (must be 0x + 40 hex chars).' });
-        }
+        // Strict destination validation through the custody boundary (also
+        // rejects zero address / token contract / hot wallet as destinations).
+        const destAddress = custody.validateDestination(String(destination));
 
+        // EXACT monetary amounts: authoritative values are integer base units.
+        // Floats below are product-facing display semantics only.
+        const amountBase = custody.toBaseUnits(amount); // throws on >6 decimals/NaN/negative/zero
         const amountFloat = parseFloat(amount);
 
         // Fraud detection check (non-blocking for alerts, blocking for BLOCK severity)
@@ -507,7 +517,10 @@ exports.cryptoWithdrawal = async (req, res) => {
         // Double-Check before touching any balances
         await runDoubleCheck(prisma, userId);
 
-        // ── Fetch live MATIC/USDC rate for gas fee conversion ────────────────
+        // ── Gas fee PRODUCT POLICY (unchanged: 100% user-borne estimate) ─────
+        // This is a customer CHARGE, not a realized network cost. Actual
+        // on-chain gas is recorded from chain evidence only (§P.2); the
+        // estimate below never becomes "realized gas revenue".
         let maticUsdcRate = 0.55; // Safe fallback
         try {
             const oracleRes = await axios.get(
@@ -519,20 +532,48 @@ exports.cryptoWithdrawal = async (req, res) => {
             logger.warn('[cryptoWithdrawal] Oracle unreachable — using fallback MATIC rate 0.55 USD');
         }
 
-        // V2 Blueprint: 100% of gas fee is deducted from user's withdrawal.
-        // POLYGON_GAS_FEE_MATIC is the estimated gas cost in MATIC/POL.
-        // We convert it to USDC equivalent and subtract from the payout.
         const gasFeeUsdc = parseFloat((POLYGON_GAS_FEE_MATIC * maticUsdcRate).toFixed(6));
-        const netPayout  = parseFloat((amountFloat - gasFeeUsdc).toFixed(6));
-
-        if (netPayout <= 0) {
+        const feeBaseUnits  = custody.toBaseUnits(gasFeeUsdc.toFixed(6));
+        const payoutBaseUnits = amountBase - feeBaseUnits;
+        if (payoutBaseUnits <= 0n) {
             return res.status(400).json({
                 success: false,
                 message: `Withdrawal amount (${amountFloat} USDC) is too low to cover the Polygon network gas fee (~${gasFeeUsdc} USDC).`
             });
         }
+        const netPayout = Number(payoutBaseUnits) / 1e6; // exact display value — BigInt division would TRUNCATE
 
-        // ── ACID transaction ─────────────────────────────────────────────────
+        // ── §P.2 EXECUTION GATE — fail closed BEFORE any debit ───────────────
+        // Real broadcasting requires TATUM_PROVIDER=LIVE + TATUM_KMS_ENABLED
+        // + TATUM_CRYPTO_EXECUTION_ENABLED. Absent any flag: no broadcast, no
+        // fake success, no fake tx hash, and NO customer debit.
+        const gate = custody.executionGateStatus();
+        if (!gate.enabled) {
+            return res.status(503).json({
+                success: false,
+                code: 'CRYPTO_EXECUTION_NOT_ENABLED',
+                message: 'On-chain crypto execution is not enabled on this deployment. No funds were debited.'
+            });
+        }
+        // Non-destructive capability preflight (signer identity, master hot
+        // wallet configuration, treasury/hot consistency, canonical asset).
+        const pre = await custody.preflight(prisma);
+        if (!pre.readyForLiveExecution) {
+            return res.status(503).json({
+                success: false,
+                code: 'CRYPTO_EXECUTION_NOT_CONFIGURED',
+                message: 'On-chain crypto execution is misconfigured on this deployment. No funds were debited.',
+                data: { checks: pre.checks }
+            });
+        }
+
+        const hotWalletAddress = custody.getConfig().hotWalletAddress;
+
+        // ── ACID reservation: customer debit EXACTLY ONCE + durable execution ──
+        // The ledger row starts PENDING with NO tx hash (hashes only ever come
+        // from real provider/chain evidence). The CustodyExecution idempotency
+        // key is derived from the ledger row, making the pair durable and
+        // unique — a duplicate request can never double-debit.
         const result = await prisma.$transaction(async (tx) => {
             const user = await tx.user.findUnique({ where: { id: userId } });
             if (!user) throw new Error('User not found.');
@@ -544,84 +585,174 @@ exports.cryptoWithdrawal = async (req, res) => {
                 );
             }
 
-            // Debit the FULL requested amount from user (gas fee is internal)
+            // Debit the FULL requested amount from the user (gas fee is internal)
             await tx.user.update({
                 where: { id: userId },
                 data:  { availableBalance: { decrement: amountFloat } }
             });
 
-            // Debit SystemHotWallet by the net payout only (gas fee stays)
+            // Synthetic treasury bookkeeping is intentionally unchanged (§P.3
+            // will formalize custody accounting). The CustodyExecution record
+            // is what later reconciles this against real chain evidence.
             await tx.systemHotWallet.upsert({
                 where:  { id: 1 },
                 update: { balance: { decrement: netPayout } },
                 create: { id: 1, balance: -netPayout }
             });
-
-            // The gas fee portion goes to SystemProfitFees as operational revenue
             await tx.systemProfitFees.upsert({
                 where:  { id: 1 },
                 update: { balance: { increment: gasFeeUsdc } },
                 create: { id: 1, balance: gasFeeUsdc }
             });
 
-            // Generate a mock txHash (in production Tatum broadcasts the real tx)
-            const txHashHex = '0x' + Array.from({ length: 64 }, () =>
-                Math.floor(Math.random() * 16).toString(16)
-            ).join('');
-
+            // PENDING — NO txHash. COMPLETED happens only on verified chain
+            // evidence via the custody execution service.
             const txRecord = await tx.transactionHistory.create({
                 data: {
                     userId:     userId,
                     type:       'WITHDRAWAL_CRYPTO',
                     amountUsdc: netPayout,
                     feeUsdc:    gasFeeUsdc,
-                    txHash:     txHashHex,
-                    status:     'COMPLETED'
+                    txHash:     null,
+                    status:     'PENDING'
                 }
             });
 
-            // Audit trail for gas fee revenue
+            const execution = await custody.createWithdrawalExecution(tx, {
+                idempotencyKey: `withdrawal:${txRecord.id}`,
+                transactionHistoryId: txRecord.id,
+                userId,
+                fromAddress: hotWalletAddress,
+                toAddress: destAddress,
+                amountBaseUnits: payoutBaseUnits,
+                feeChargeBaseUnits: feeBaseUnits,
+                metadata: {
+                    customerDebitBaseUnits: String(amountBase),
+                    netPayoutBaseUnits: String(payoutBaseUnits),
+                    withdrawalAmountUsdc: amountFloat,
+                    gasFeeUsdc,
+                    netPayoutUsdc: netPayout,
+                },
+            });
+
+            // Estimated gas charge audit trail (customer charge policy, NOT a
+            // realized network cost claim).
             await tx.adminProfitLog.create({
                 data: {
                     amountUsdc:  gasFeeUsdc,
                     source:      'GAS_FEE_REVENUE',
-                    relatedTxId: `crypto_withdraw_gas_${txHashHex}`
+                    relatedTxId: `crypto_withdraw_charge_${txRecord.id}`
                 }
             });
 
-            return { user, txRecord, txHash: txHashHex };
+            return { user, txRecord, execution };
         });
 
-        // ── Live Tatum broadcast — REQUIRED. If this fails the user has
-        // already been debited but no on-chain transfer happened. We must
-        // either succeed the broadcast OR refund and FAIL the request.
-        // ──────────────────────────────────────────────────────────────────
-        try {
-            await axios.post(
-                'https://api.tatum.io/v3/polygon/transaction',
-                {
-                    chain:    'polygon',
-                    to:       destination,
-                    amount:   netPayout.toString(),
-                    currency: 'USDC'
-                },
-                {
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'x-api-key':    process.env.TATUM_API_KEY || 'mock-tatum-api-key'
-                    },
-                    timeout: 10000
-                }
-            );
-            logger.info(`[Tatum] Crypto withdrawal broadcast: ${result.txHash} → ${destination} (${netPayout} USDC)`);
-        } catch (tatumErr) {
-            logger.error(`[Tatum] Broadcast FAILED for ${result.txHash}: ${tatumErr.message} — refunding user.`);
+        // ── Four-eye: durable pre-validation of the EXACT intended transfer ──
+        // Verifies destination, token contract, exact base-unit amount, source
+        // signer, and the customer withdrawal reference against the stored
+        // execution before anything can be submitted to KMS.
+        await custody.approveKmsRequest(prisma, {
+            executionId: result.execution.id,
+            expected: {
+                kind:           'CUSTOMER_WITHDRAWAL',
+                refId:          String(result.txRecord.id),
+                userId,
+                fromAddress:    hotWalletAddress,
+                toAddress:      destAddress,
+                contractAddress: custody.CANONICAL.contractAddress,
+                amountBaseUnits: payoutBaseUnits,
+            },
+        });
 
-            // Refund: re-credit the user, debit back the gas-fee profit row,
-            // re-credit SystemHotWallet, and mark TransactionHistory FAILED.
-            let refundSucceeded = false;
-            try {
-                await prisma.$transaction(async (tx) => {
+        // ── Async external execution via KMS ─────────────────────────────────
+        try {
+            const submission = await custody.submitExecution(prisma, { executionId: result.execution.id });
+
+            if (emitBalanceUpdate) await emitBalanceUpdate(userId);
+
+            // Double-entry journal (non-blocking, fail-safe). The reference is
+            // the durable custody execution identity — a REAL tx hash only
+            // exists after broadcast evidence, so it is never fabricated here.
+            journal.recordWithdrawal(userId, amountFloat, `custody-exec:${result.execution.id}`,
+                { source: 'crypto', netPayout, gasFeeUsdc, status: 'PENDING', executionId: result.execution.id })
+                .catch(e => logger.warn({ err: e.message }, '[withdrawalController] Journal recording failed'));
+
+            await audit(prisma, {
+                userId,
+                action: 'WITHDRAWAL_CRYPTO_INITIATED',
+                targetType: 'USER',
+                targetId: String(userId),
+                ipAddress: req.ip,
+                metadata: {
+                    executionId: result.execution.id,
+                    destination,
+                    network: network || 'Polygon',
+                    amountUsdc: amountFloat,
+                    status: submission.status,
+                },
+            });
+
+            // NO success/completion claim here: the transfer is in flight. No
+            // receipt is sent until settlement produces real chain evidence.
+            return res.status(202).json({
+                success: true,
+                message: 'Withdrawal accepted. The on-chain transfer is being processed and will complete once confirmed on Polygon.',
+                data: {
+                    status:            'PENDING',
+                    executionId:       result.execution.id,
+                    transactionId:     result.txRecord.id,
+                    withdrawalAmount:  amountFloat,
+                    gasFeeMatic:       POLYGON_GAS_FEE_MATIC,
+                    maticUsdcRate,
+                    gasFeeUsdc,
+                    netPayout,
+                    gasFeePolicy:      'USER_BEARS_100_PERCENT',
+                    destination,
+                    network:           network || 'Polygon',
+                    newBalance:        result.user.availableBalance - amountFloat,
+                }
+            });
+        } catch (execErr) {
+            // ── Ambiguous external outcome (timeout/network/5xx/unusable
+            // evidence): the service already marked the execution
+            // RECONCILIATION_REQUIRED. NEVER auto-refund — reconciliation must
+            // first prove no transfer happened. The customer's funds stay
+            // reserved against the PENDING ledger row.
+            if (!(execErr instanceof CustodyExecutionError) || !execErr.definitivePreBroadcast) {
+                logger.error({ err: execErr.message, executionId: result.execution.id },
+                    '[cryptoWithdrawal] AMBIGUOUS execution outcome — reconciliation required, NO auto-refund');
+                if (io) {
+                    io.emit('admin_alert', {
+                        type: 'CRYPTO_WITHDRAWAL_RECONCILIATION_REQUIRED',
+                        userId,
+                        executionId: result.execution.id,
+                        transactionId: result.txRecord.id,
+                        detail: 'Provider outcome unknown — funds stay reserved until reconciliation proves what happened.',
+                        timestamp: new Date().toISOString()
+                    });
+                }
+                if (emitBalanceUpdate) await emitBalanceUpdate(userId);
+                return res.status(202).json({
+                    success: true,
+                    message: 'Withdrawal accepted and is being verified with the network. You will be notified once the transfer is confirmed.',
+                    data: {
+                        status: 'PENDING',
+                        reconciliationRequired: true,
+                        transactionId: result.txRecord.id,
+                        destination
+                    }
+                });
+            }
+
+            // ── DEFINITIVE pre-broadcast failure: exactly-once refund, atomic
+            // with the execution's FAILED transition (conditional transition
+            // guarantees a retry/repeat can never double-refund).
+            const fail = await custody.failWithdrawalExecution(prisma, {
+                executionId: result.execution.id,
+                errorClass: execErr.errorClass,
+                errorMessage: execErr.message,
+                refund: async (tx) => {
                     await tx.user.update({
                         where: { id: userId },
                         data:  { availableBalance: { increment: amountFloat } }
@@ -642,33 +773,16 @@ exports.cryptoWithdrawal = async (req, res) => {
                         data: {
                             amountUsdc:   -gasFeeUsdc,
                             source:       'GAS_FEE_REVENUE',
-                            relatedTxId:  `crypto_withdraw_refund_${result.txHash}`,
+                            relatedTxId:  `crypto_withdraw_refund_${result.txRecord.id}`,
                             isSubsidized: true
                         }
                     });
-                });
-                refundSucceeded = true;
-            } catch (refundErr) {
-                logger.error({ err: refundErr }, '[cryptoWithdrawal] CRITICAL: refund failed after Tatum error');
-                if (io) {
-                    io.emit('admin_alert', {
-                        type:        'CRYPTO_WITHDRAWAL_REFUND_FAILED',
-                        userId,
-                        txHash:      result.txHash,
-                        tatumError:  tatumErr.message,
-                        refundError: refundErr.message,
-                        timestamp:   new Date().toISOString()
-                    });
-                }
-            }
+                },
+            });
 
             if (emitBalanceUpdate) await emitBalanceUpdate(userId);
 
-            // Phase L1: refund-notice receipt (fire-and-forget). Only fired
-            // on the success-of-refund path; if the inner refund itself
-            // failed (caught above) the admin alert takes over because the
-            // system is in an inconsistent state and a human must resolve.
-            if (refundSucceeded && emailService && result.user && result.user.email) {
+            if (fail.failed && emailService && result.user && result.user.email) {
                 const recipient = result.user;
                 setImmediate(() => {
                     emailService.sendWithdrawalReceipt(recipient, {
@@ -677,95 +791,28 @@ exports.cryptoWithdrawal = async (req, res) => {
                         refundedAmount: amountFloat,
                         destination,
                         network:        network || 'Polygon',
-                        reason:         tatumErr.message || 'On-chain broadcast was rejected by the gateway.'
+                        reason:         execErr.message || 'On-chain broadcast was rejected by the gateway.'
                     }).catch(() => { /* swallowed inside service */ });
                 });
             }
-
-            // Phase L2: refund SMS (fire-and-forget, gated on refund success + verified phone + threshold).
-            if (refundSucceeded && smsService && result.user && result.user.phoneNumber && result.user.phoneVerified
+            if (fail.failed && smsService && result.user && result.user.phoneNumber && result.user.phoneVerified
                 && amountFloat >= SMS_LARGE_WITHDRAWAL_THRESHOLD) {
                 const ph = result.user.phoneNumber;
                 setImmediate(() => {
                     smsService.sendWithdrawalConfirmation(ph, {
                         kind:   'crypto_refunded',
                         amount: amountFloat,
-                        reason: tatumErr.message || 'On-chain broadcast was rejected.'
+                        reason: execErr.message || 'On-chain broadcast was rejected.'
                     }).catch(() => {});
                 });
             }
 
             return res.status(502).json({
                 success: false,
-                message: 'On-chain broadcast failed. Your USDC has been refunded.',
-                data:    { gatewayError: tatumErr.message, refunded: amountFloat }
+                message: 'On-chain broadcast was rejected. Your USDC has been refunded.',
+                data:    { gatewayError: execErr.message, refunded: amountFloat }
             });
         }
-
-        await emitBalanceUpdate(userId);
-
-        // Phase L1: transactional receipt (fire-and-forget). Detached via
-        // setImmediate so the response flushes immediately; emailService
-        // catches all errors internally so the request is never disrupted.
-        if (emailService && result.user && result.user.email) {
-            const recipient = result.user;
-            setImmediate(() => {
-                emailService.sendWithdrawalReceipt(recipient, {
-                    kind:        'crypto_success',
-                    amount:      amountFloat,
-                    gasFeeUsdc,
-                    netPayout,
-                    destination,
-                    network:     network || 'Polygon',
-                    txHash:      result.txHash
-                }).catch(() => { /* swallowed inside service */ });
-            });
-        }
-
-        // Phase L2: large-withdrawal SMS (fire-and-forget, verified phone + threshold).
-        if (smsService && result.user && result.user.phoneNumber && result.user.phoneVerified
-            && amountFloat >= SMS_LARGE_WITHDRAWAL_THRESHOLD) {
-            const ph = result.user.phoneNumber;
-            setImmediate(() => {
-                smsService.sendWithdrawalConfirmation(ph, {
-                    kind:        'crypto_sent',
-                    amount:      amountFloat,
-                    destination,
-                    txHash:      result.txHash
-                }).catch(() => {});
-            });
-        }
-
-        await audit(prisma, {
-            actorId: req.user.id, actorName: req.user.username,
-            action: 'WITHDRAWAL_CRYPTO_INITIATED', targetType: 'TRANSACTION',
-            targetId: String(result.txRecord?.id || result.txHash || ''),
-            metadata: { amountUsdc: amount, destination: String(destination || '').slice(0, 8) + '...' },
-            ipAddress: req.ip,
-        });
-
-        // Double-entry journal (non-blocking, fail-safe)
-        journal.recordWithdrawal(userId, amountFloat, result.txHash, { source: 'crypto', netPayout, gasFeeUsdc }).catch(e =>
-            logger.warn({ err: e.message, txHash: result.txHash }, '[withdrawalController] Journal recording failed')
-        );
-
-        return res.status(200).json({
-            success: true,
-            message: `Crypto withdrawal of ${amountFloat} USDC to ${destination} on Polygon. Gas fee: ${gasFeeUsdc} USDC (100% user-borne). Net payout: ${netPayout} USDC.`,
-            data: {
-                withdrawalAmount:  amountFloat,
-                gasFeeMatic:       POLYGON_GAS_FEE_MATIC,
-                maticUsdcRate,
-                gasFeeUsdc,
-                netPayout,
-                gasFeePolicy:      'USER_BEARS_100_PERCENT',
-                destination,
-                network:           network || 'Polygon',
-                txHash:            result.txHash,
-                newBalance:        result.user.availableBalance - amountFloat,
-                transaction:       result.txRecord
-            }
-        });
 
     } catch (error) {
         logger.error({ err: error }, '[cryptoWithdrawal] error');
@@ -790,6 +837,13 @@ exports.cryptoWithdrawal = async (req, res) => {
                 message: 'Withdrawal frozen: Ledger inconsistency detected. Your request has been flagged for review.',
                 data:    { status: 'FROZEN_DISPUTE' }
             });
+        }
+
+        // Custody-boundary validation failures (destination/amount) are client
+        // errors; everything else is a plain rejection.
+        if (error instanceof CustodyExecutionError
+            && (error.errorClass === 'INVALID_DESTINATION' || error.errorClass === 'INVALID_ASSET')) {
+            return res.status(400).json({ success: false, message: error.message });
         }
 
         return res.status(400).json({ success: false, message: error.message });
