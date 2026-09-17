@@ -2,6 +2,11 @@
 
 const crypto = require('crypto');
 
+const {
+    RATE_FRESHNESS_MAX_AGE_SECONDS,
+    RATE_FRESHNESS_CLOCK_SKEW_ALLOWANCE_MS,
+} = require('../config/rateFreshness');
+
 const DEFAULT_QUOTE_TTL_SECONDS = 60;
 const MAX_RATE_GHS_PER_USDC = 1000000;
 const MIN_RATE_GHS_PER_USDC = 0.000001;
@@ -74,6 +79,111 @@ async function getServerRateGhsPerUsdc({ prisma, marketOracle }) {
   };
 }
 
+// =============================================================================
+// 271C fail-closed stale-rate gate (issue #271)
+//
+// A new fiat deposit quote may be created ONLY when the most recent EXTERNAL
+// market-rate observation is fresh:
+//
+//     lastExternalSync IS NOT NULL
+//   AND now - lastExternalSync <= RATE_FRESHNESS_MAX_AGE_SECONDS
+//   AND liveRetailRate is finite and > 0
+//
+// Anything else is stale/untrusted and throws RateUnavailableError (503):
+//   - NULL or invalid lastExternalSync  -> RATE_UNAVAILABLE
+//   - future lastExternalSync (beyond the tiny clock-skew allowance) -> RATE_STALE
+//   - age above the configured maximum -> RATE_STALE
+//   - invalid/non-positive retail rate -> RATE_UNAVAILABLE
+//
+// A manual admin override (lastAdminSetAt) and a MOCK gateway echo
+// (lastEchoAt) never refresh freshness, and the legacy lastRateSync field is
+// deliberately NOT consulted — the gate fails closed on the canonical
+// lastExternalSync timestamp alone.
+// =============================================================================
+
+class RateUnavailableError extends Error {
+    constructor(message, code) {
+        super(message);
+        this.name = 'RateUnavailableError';
+        this.code = code; // 'RATE_STALE' | 'RATE_UNAVAILABLE'
+        this.statusCode = 503;
+    }
+}
+
+async function getFreshServerRateGhsPerUsdc({ prisma, marketOracle, now = new Date(), maxAgeSeconds } = {}) {
+    if (!prisma) throw new Error('Quote service requires Prisma');
+
+    const settings = await prisma.globalSettings.findUnique({
+        where: { id: 1 },
+        select: {
+            liveRetailRate: true,
+            liveUsdToGhs: true,
+            liveRateSource: true,
+            lastExternalSync: true,
+        },
+    });
+
+    // Freshness is evaluated FIRST and exclusively on the canonical external
+    // observation timestamp. lastRateSync / lastAdminSetAt / lastEchoAt are
+    // never consulted here.
+    const observedMs = settings?.lastExternalSync ? new Date(settings.lastExternalSync).getTime() : NaN;
+    if (!Number.isFinite(observedMs)) {
+        // NULL, missing, or an unparseable timestamp — the rate has no
+        // trustworthy external provenance.
+        throw new RateUnavailableError(
+            'Exchange rate is temporarily unavailable. Please retry shortly.',
+            'RATE_UNAVAILABLE'
+        );
+    }
+
+    const nowMs = new Date(now).getTime();
+    if (observedMs > nowMs + RATE_FRESHNESS_CLOCK_SKEW_ALLOWANCE_MS) {
+        // An external observation from the future is untrusted, never
+        // "infinitely fresh".
+        throw new RateUnavailableError(
+            'Exchange rate is temporarily unavailable. Please retry shortly.',
+            'RATE_STALE'
+        );
+    }
+
+    const effectiveMaxAgeSeconds = Number.isFinite(maxAgeSeconds)
+        ? maxAgeSeconds
+        : RATE_FRESHNESS_MAX_AGE_SECONDS;
+
+    // Boundary contract: age <= maxAge is acceptable, age > maxAge is stale.
+    const externalAgeSeconds = (nowMs - observedMs) / 1000;
+    if (externalAgeSeconds > effectiveMaxAgeSeconds) {
+        throw new RateUnavailableError(
+            'Exchange rate is temporarily unavailable. Please retry shortly.',
+            'RATE_STALE'
+        );
+    }
+
+    // Rate resolution is identical to the ungated legacy reader: the canonical
+    // liveRetailRate with the legacy USD/GHS field as a compatibility fallback
+    // for installations that predate the explicit USDC retail-rate field.
+    const retailRate = Number(settings?.liveRetailRate);
+    const legacyRate = Number(settings?.liveUsdToGhs);
+    const rateGhsPerUsdc = Number.isFinite(retailRate) && retailRate > 0 ? retailRate : legacyRate;
+    if (!Number.isFinite(rateGhsPerUsdc) || rateGhsPerUsdc <= 0) {
+        throw new RateUnavailableError(
+            'Exchange rate is temporarily unavailable. Please retry shortly.',
+            'RATE_UNAVAILABLE'
+        );
+    }
+
+    void marketOracle;
+    return {
+        rateGhsPerUsdc,
+        rateSource: settings?.liveRateSource || 'AZM_ADMIN_MOCK',
+        // rateAsOf is the TRUE external observation that freshness was
+        // enforced against — never a fabricated fallback timestamp.
+        rateAsOf: new Date(observedMs),
+        externalAgeSeconds,
+        maxAgeSeconds: effectiveMaxAgeSeconds,
+    };
+}
+
 async function persistTransactionQuote(prisma, quote) {
   if (!prisma?.$executeRaw) throw new Error('Quote service requires Prisma raw SQL support');
 
@@ -90,8 +200,15 @@ async function persistTransactionQuote(prisma, quote) {
   return quote;
 }
 
-async function createServerTransactionQuote({ prisma, marketOracle, userId, purpose, amountGhs, feeGhs = 0, ttlSeconds = DEFAULT_QUOTE_TTL_SECONDS, now = new Date() }) {
-  const rate = await getServerRateGhsPerUsdc({ prisma, marketOracle });
+async function createServerTransactionQuote({ prisma, marketOracle, userId, purpose, amountGhs, feeGhs = 0, ttlSeconds = DEFAULT_QUOTE_TTL_SECONDS, now = new Date(), maxAgeSeconds }) {
+  // 271C fail-closed gate: EVERY fiat DEPOSIT quote created through this
+  // helper must pass the canonical lastExternalSync freshness gate. This
+  // includes the mounted generic fiat initiation route and the /api/quotes
+  // endpoint. Non-deposit quote purposes are deliberately NOT gated in this
+  // stage (issue #271 staging).
+  const rate = purpose === 'deposit'
+    ? await getFreshServerRateGhsPerUsdc({ prisma, marketOracle, now, maxAgeSeconds })
+    : await getServerRateGhsPerUsdc({ prisma, marketOracle });
   const quote = createTransactionQuote({ userId, purpose, amountGhs, rateGhsPerUsdc: rate.rateGhsPerUsdc, rateSource: rate.rateSource, rateAsOf: rate.rateAsOf, feeGhs, ttlSeconds, now });
   return persistTransactionQuote(prisma, quote);
 }
@@ -147,6 +264,8 @@ module.exports = {
   persistTransactionQuote,
   consumeTransactionQuote,
   getServerRateGhsPerUsdc,
+  getFreshServerRateGhsPerUsdc,
+  RateUnavailableError,
   assertQuoteActive,
   roundMoney,
 };

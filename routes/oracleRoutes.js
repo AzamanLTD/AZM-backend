@@ -10,6 +10,11 @@
 
 const logger = require('../src/config/logger');
 const express = require('express');
+const {
+    RATE_FRESHNESS_MAX_AGE_SECONDS,
+    RATE_FRESHNESS_CLOCK_SKEW_ALLOWANCE_MS,
+} = require('../src/config/rateFreshness');
+
 const router = express.Router();
 
 const ORACLE_REFRESH_INTERVAL_SECONDS = 10 * 60;
@@ -91,6 +96,26 @@ router.get('/rates', async (req, res) => {
                 lastExternalSync: settings?.lastExternalSync || null,
                 lastAdminSetAt: settings?.lastAdminSetAt || null,
                 lastEchoAt: settings?.lastEchoAt || null,
+                // Operator observability for the 271C stale-rate gate
+                // (display ONLY — the actual gate lives in
+                // transactionQuoteService.getFreshServerRateGhsPerUsdc and
+                // recomputes freshness at quote time from lastExternalSync
+                // alone; this computed state is never the source of truth).
+                externalRateAgeSeconds: (() => {
+                    const observed = settings?.lastExternalSync ? new Date(settings.lastExternalSync).getTime() : NaN;
+                    if (!Number.isFinite(observed)) return null;
+                    return Math.floor((Date.now() - observed) / 1000);
+                })(),
+                isFresh: (() => {
+                    const observed = settings?.lastExternalSync ? new Date(settings.lastExternalSync).getTime() : NaN;
+                    if (!Number.isFinite(observed)) return false;
+                    const ageSeconds = (Date.now() - observed) / 1000;
+                    return (
+                        ageSeconds <= RATE_FRESHNESS_MAX_AGE_SECONDS &&
+                        observed <= Date.now() + RATE_FRESHNESS_CLOCK_SKEW_ALLOWANCE_MS
+                    );
+                })(),
+                rateFreshnessMaxAgeSeconds: RATE_FRESHNESS_MAX_AGE_SECONDS,
                 refreshIntervalSeconds: ORACLE_REFRESH_INTERVAL_SECONDS,
             }
         });

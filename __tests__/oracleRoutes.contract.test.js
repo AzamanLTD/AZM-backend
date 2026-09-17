@@ -42,6 +42,11 @@ describe('oracle routes canonical contract', () => {
         lastExternalSync: null,
         lastAdminSetAt: null,
         lastEchoAt: null,
+        // 271C operator observability: with no external observation there is
+        // no computable age (null) and the rate is NOT fresh (false).
+        externalRateAgeSeconds: null,
+        isFresh: false,
+        rateFreshnessMaxAgeSeconds: 1800,
         refreshIntervalSeconds: 600,
       },
     });
