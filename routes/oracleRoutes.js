@@ -44,6 +44,12 @@ router.get('/yellowcard-rate', async (req, res) => {
             corporateRate: Number(settings.liveCorporateRate) || 0,
             source: settings.liveRateSource || 'UNKNOWN',
             lastSync: settings.lastRateSync || null,
+            // Truthful provenance (issue #271 / PR 271B): freshness is based on
+            // the last genuine EXTERNAL observation, which is NULL (unknown)
+            // for rows that predate 271B — never faked into a fresh age.
+            lastExternalSync: settings.lastExternalSync || null,
+            lastAdminSetAt: settings.lastAdminSetAt || null,
+            lastEchoAt: settings.lastEchoAt || null,
             refreshIntervalSeconds: ORACLE_REFRESH_INTERVAL_SECONDS,
         });
     } catch (error) {
@@ -78,6 +84,13 @@ router.get('/rates', async (req, res) => {
                 thirdPartyMargin: Number(settings?.thirdPartyMargin) || 2.0,
                 rateSource: settings?.liveRateSource || 'UNKNOWN',
                 lastSync: settings?.lastRateSync || null,
+                // Truthful provenance (issue #271 / PR 271B): the canonical
+                // freshness field for future 271C gating. NULL honestly means
+                // "no genuine external observation recorded since 271B" — it
+                // is never backfilled or converted into a fake fresh age.
+                lastExternalSync: settings?.lastExternalSync || null,
+                lastAdminSetAt: settings?.lastAdminSetAt || null,
+                lastEchoAt: settings?.lastEchoAt || null,
                 refreshIntervalSeconds: ORACLE_REFRESH_INTERVAL_SECONDS,
             }
         });

@@ -1380,11 +1380,37 @@ model GlobalSettings {
   //   liveRetailRate    → user UI Hologram (sell USDC → GHS)
   //   liveCorporateRate → admin spread / OTC buy (USDC ← GHS at discount)
   //   liveRateSource    → 'MOCK' | 'LIVE' | 'ORACLE'  (provenance flag)
-  //   lastRateSync      → wall-clock of the most recent gateway pull
+  //   lastRateSync      → timestamp of the most recent successful EXTERNAL
+  //                      market-rate observation (issue #271 / PR 271B).
+  //                      Echoes, cached copies, and manual admin overrides
+  //                      must NEVER refresh it. Retained for staged-rollout
+  //                      compatibility; freshness consumers should read
+  //                      lastExternalSync (below) instead.
   liveRetailRate    Decimal   @default(12.50) @db.Decimal(18, 8)
   liveCorporateRate Decimal   @default(12.30) @db.Decimal(18, 8)
   liveRateSource    String    @default("MOCK")
   lastRateSync      DateTime?
+
+  // Rate provenance (issue #271 / PR 271B — truthful rate provenance/freshness)
+  //   lastExternalSync → timestamp of the most recent successful EXTERNAL
+  //                      market-rate observation (oracle sync or gateway LIVE
+  //                      Kotani response). CANONICAL freshness field for the
+  //                      future 271C stale-rate gate. Kept identical to
+  //                      lastRateSync for the same observation.
+  //   lastAdminSetAt   → timestamp of the most recent manual admin rate
+  //                      override (never refreshes external freshness; the
+  //                      override is labeled via liveRateSource =
+  //                      'AZM_ADMIN_OVERRIDE' when the admin does not supply
+  //                      an explicit source).
+  //   lastEchoAt       → timestamp of the most recent MOCK gateway echo (a
+  //                      cached-value copy — never refreshes external
+  //                      freshness and never rewrites liveRetailRate).
+  // All three are intentionally NOT backfilled from historical lastRateSync:
+  // a NULL here honestly means "no genuine external observation recorded
+  // since PR 271B" rather than a fabricated fresh timestamp.
+  lastExternalSync DateTime?
+  lastAdminSetAt   DateTime?
+  lastEchoAt       DateTime?
 
   // Phase F2: P2P flat fee (replaces GHS margin math for P2P trades)
   p2pFeePct Decimal @default(0.02) @db.Decimal(10, 4) // 2% default; range [0..1]
