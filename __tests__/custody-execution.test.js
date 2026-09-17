@@ -52,7 +52,7 @@ const SAVED_ENV = {};
 const ENV_KEYS = ['TATUM_PROVIDER', 'TATUM_API_KEY', 'TATUM_KMS_ENABLED', 'TATUM_CRYPTO_EXECUTION_ENABLED',
     'TATUM_KMS_SIGNATURE_ID', 'TATUM_KMS_CHAIN', 'TATUM_KMS_ENVIRONMENT', 'TATUM_KMS_FOUR_EYE_REQUIRED',
     'TATUM_HOT_WALLET_SIGNATURE_ID', 'TATUM_HOT_WALLET_INDEX', 'TATUM_HOT_WALLET_ADDRESS',
-    'TATUM_TREASURY_ADDRESS', 'TATUM_XPUB', 'TATUM_BASE_URL'];
+    'TATUM_TREASURY_ADDRESS', 'TATUM_KMS_SIGNER_REGISTRY', 'TATUM_KMS_VALIDATOR_ALLOWED_IPS', 'TATUM_BASE_URL'];
 beforeAll(() => { for (const k of ENV_KEYS) SAVED_ENV[k] = process.env[k]; });
 afterAll(() => {
     for (const k of ENV_KEYS) {
@@ -69,10 +69,18 @@ function enableGates(overrides = {}) {
     process.env.TATUM_KMS_SIGNATURE_ID = 'test-kms-signature-id';
     process.env.TATUM_KMS_CHAIN = 'POLYGON';
     process.env.TATUM_KMS_ENVIRONMENT = 'TESTNET';
+    process.env.TATUM_KMS_FOUR_EYE_REQUIRED = 'true';
     process.env.TATUM_HOT_WALLET_SIGNATURE_ID = 'test-hot-signature-id';
     process.env.TATUM_HOT_WALLET_ADDRESS = HOT;
     delete process.env.TATUM_TREASURY_ADDRESS;
-    process.env.TATUM_XPUB = 'test-xpub';
+    // KMS signer registry (ops-populated from `tatum-kms getaddress` output):
+    // the deposit mnemonic identity derives CUST at index 5; the hot wallet
+    // identity derives HOT at index 0.
+    process.env.TATUM_KMS_SIGNER_REGISTRY = JSON.stringify([
+        { signatureId: 'test-kms-signature-id', index: 5, address: CUST, model: 'MNEMONIC_INDEXED' },
+        { signatureId: 'test-hot-signature-id', index: 0, address: HOT, model: 'MNEMONIC_INDEXED' },
+    ]);
+    delete process.env.TATUM_KMS_VALIDATOR_ALLOWED_IPS;
     for (const [k, v] of Object.entries(overrides)) {
         if (v === undefined) delete process.env[k]; else process.env[k] = v;
     }
@@ -87,22 +95,28 @@ function fakeProvider(behavior = {}) {
     const p = {
         name: 'FAKE',
         submitted: [],
-        approvals: [],
+        completions: [],
+        deletes: [],
+        // Mirrors the REAL Tatum response semantics: the KMS-signed request
+        // returns ONLY { signatureId } — the internal Tatum ID of the prepared
+        // pending transaction (the SignatureId OpenAPI schema). No txId.
         async submitTokenTransfer(payload) {
             if (behavior.submitError) throw behavior.submitError;
             p.submitted.push(payload);
-            if (behavior.txHash) return { pendingRequestId: behavior.pendingRequestId || null, txHash: behavior.txHash };
-            return { pendingRequestId: behavior.pendingRequestId || 'kms-req-1', txHash: null };
+            if (behavior.txHash) return { pendingId: behavior.pendingId || null, txHash: behavior.txHash };
+            return { pendingId: behavior.pendingId || 'tatum-pending-9', txHash: null };
         },
         async getKmsRequest(id) {
             if (behavior.kmsError) throw behavior.kmsError;
             const r = behavior.kmsRequest || { id, txHash: null, status: null };
             return { ...r };
         },
-        async approvePendingRequest(id) { p.approvals.push(id); if (behavior.approveError) throw behavior.approveError; return true; },
-        async deletePendingRequest() { return true; },
+        // The documented Tatum pending lifecycle endpoints. There is NO approve
+        // method: four-eye is the KMS daemon's externalUrl validation contract.
+        async listPendingRequests() { return []; },
+        async completePendingRequest(pendingId, txId) { p.completions.push({ pendingId, txId }); return true; },
+        async deletePendingRequest(pendingId) { p.deletes.push(pendingId); return true; },
         async getTransaction(hash) { if (behavior.transaction === null) return null; return behavior.transaction ? { ...behavior.transaction } : null; },
-        async deriveAddressForSigner({ index }) { return behavior.derivedAddress || CUST; },
     };
     return p;
 }
@@ -185,16 +199,45 @@ describe('§P.2 unit: destination + asset validation', () => {
         })).toThrow(/No KMS signatureId/);
     });
 
-    it('builds the canonical native-USDC payload with exact minimal-unit amount and 6 digits', () => {
+    it('builds the EXACT Tatum ChainTransferEthErc20KMS request (decimal amount, MATIC chain, no from)', () => {
         const payload = custody.buildTokenTransferPayload({
             from: HOT, to: DEST, amountBaseUnits: 100123456n, contractAddress: NATIVE, signatureId: 'sig-1', index: 7,
         });
-        expect(payload.amount).toBe('100123456');
-        expect(payload.contractAddress).toBe(NATIVE);
-        expect(payload.digits).toBe(6);
-        expect(payload.signatureId).toBe('sig-1');
-        expect(payload.index).toBe(7);
-        expect(payload.fromPrivateKey).toBeUndefined();
+        // Exact provider contract — docs.tatum.io/reference/erc20transfer:
+        expect(payload).toEqual({
+            chain: 'MATIC',                     // Tatum chain identifier
+            to: DEST,
+            contractAddress: NATIVE,            // native USDC (never USDC.e)
+            amount: '100.123456',               // DECIMAL token quantity — exact string
+            digits: 6,
+            signatureId: 'sig-1',
+            index: 7,                           // only for mnemonic-based signature IDs
+        });
+        // The provider request carries NO from address (Tatum derives the
+        // signer from the KMS identity) and NO private-key material ever.
+        expect(payload).not.toHaveProperty('from');
+        expect(payload).not.toHaveProperty('fromPrivateKey');
+        expect(payload).not.toHaveProperty('currency');
+    });
+
+    it('builds the payload WITHOUT index when the signature ID is private-key based (index omitted, not zero)', () => {
+        const payload = custody.buildTokenTransferPayload({
+            from: HOT, to: DEST, amountBaseUnits: 1n, contractAddress: NATIVE, signatureId: 'sig-2', index: null,
+        });
+        expect(payload).not.toHaveProperty('index');
+        expect(payload.amount).toBe('0.000001');
+    });
+
+    it('baseUnitsToDecimalString is EXACT: large values never pass through JS Number (base units are NOT the token quantity)', () => {
+        expect(custody.baseUnitsToDecimalString(100123456n)).toBe('100.123456');
+        expect(custody.baseUnitsToDecimalString(1000000n)).toBe('1');
+        expect(custody.baseUnitsToDecimalString(1n)).toBe('0.000001');
+        expect(custody.baseUnitsToDecimalString(0n)).toBe('0');
+        // 1.23456789012345678e17 base units — beyond float53 precision.
+        expect(custody.baseUnitsToDecimalString(123456789012345678n)).toBe('123456789012.345678');
+        expect(custody.baseUnitsToDecimalString('9007199254740993000000')).toBe('9007199254740993');
+        // Round-trip: toBaseUnits EXACTLY inverts the decimal string.
+        expect(custody.toBaseUnits('123456789012.345678')).toBe(123456789012345678n);
     });
 });
 
@@ -483,6 +526,12 @@ describeOrSkip('§P.2 custody execution (real PostgreSQL)', () => {
             where: { id: execution.id },
             data: { status: 'CONFIRMING', txHash: TX_HASH, confirmedAt: null },
         });
+        // Settlement authority: with no verified-evidence argument supplied,
+        // settleExecution must verify the chain evidence ITSELF (makeWithdrawal
+        // defaults to 1000000 base units HOT -> DEST) before completing.
+        custody.__setProviderForTests(fakeProvider({
+            transaction: { status: '0x1', logs: [usdcTransferLog({ from: HOT, to: DEST, units: 1000000n })] },
+        }));
         const [a, b] = await Promise.all([
             custody.settleExecution(prisma, { executionId: execution.id }),
             custody.settleExecution(prisma, { executionId: execution.id }),
@@ -629,21 +678,45 @@ describeOrSkip('§P.2 custody execution (real PostgreSQL)', () => {
                 metadata: { derivationIndex: 5 },
             },
         });
-        // Provider derives a DIFFERENT address for signatureId@index 5.
-        custody.__setProviderForTests(fakeProvider({ derivedAddress: '0x' + '77'.repeat(20) }));
+        // Registry (tatum-kms getaddress proof) says signatureId@index 5
+        // controls a DIFFERENT address than the one being swept.
+        enableGates({ TATUM_KMS_SIGNER_REGISTRY: JSON.stringify([
+            { signatureId: 'test-kms-signature-id', index: 5, address: '0x' + '77'.repeat(20), model: 'MNEMONIC_INDEXED' },
+        ]) });
         await expect(custody.submitExecution(prisma, { executionId: execution.id }))
             .rejects.toMatchObject({ errorClass: ERROR_CLASSES.SIGNER_MISMATCH });
-        const provider = custody.createHttpProvider; // noop reference
-        expect(provider).toBeDefined();
         expect((await prisma.custodyExecution.findUnique({ where: { id: execution.id } })).status).toBe('RESERVING');
         await custody.failExecution(prisma, { executionId: execution.id, errorMessage: 'signer mismatch' });
         expect((await prisma.custodyExecution.findUnique({ where: { id: execution.id } })).status).toBe('FAILED');
     });
 
+    it('an UNPROVABLE signer configuration is fail-closed: no registry entry => no execution (never a guessed proof)', async () => {
+        const user = await seedFundedUser();
+        const execution = await prisma.custodyExecution.create({
+            data: {
+                idempotencyKey: 'sweep:signer-unprovable:1',
+                kind: 'DEPOSIT_SWEEP', walletAddressId: 'wa-unprovable', userId: user.id,
+                network: 'POLYGON', asset: 'USDC', contractAddress: NATIVE,
+                fromAddress: CUST, toAddress: HOT, amountBaseUnits: 1000000n, decimals: 6,
+                status: 'RESERVING', approvalStatus: 'APPROVED',
+                metadata: { derivationIndex: 5 },
+            },
+        });
+        enableGates({ TATUM_KMS_SIGNER_REGISTRY: JSON.stringify([
+            // Entry exists for a DIFFERENT index — index 5 has no proof.
+            { signatureId: 'test-kms-signature-id', index: 9, address: CUST, model: 'MNEMONIC_INDEXED' },
+        ]) });
+        const provider = fakeProvider();
+        custody.__setProviderForTests(provider);
+        await expect(custody.submitExecution(prisma, { executionId: execution.id }))
+            .rejects.toMatchObject({ errorClass: ERROR_CLASSES.SIGNER_MISMATCH });
+        expect(provider.submitted).toHaveLength(0); // fail-closed BEFORE any provider call
+    });
+
     it('submission without four-eye approval is refused (mainnet four-eye requirement)', async () => {
         const user = await seedFundedUser();
         const execution = await makeWithdrawalExecution({ userId: user.id, txRecordId: 'wd-noapproval' }); // approvalStatus PENDING
-        custody.__setProviderForTests(fakeProvider({ pendingRequestId: 'kms-1' }));
+        custody.__setProviderForTests(fakeProvider({ pendingId: 'kms-1' }));
         await expect(custody.submitExecution(prisma, { executionId: execution.id }))
             .rejects.toMatchObject({ errorClass: ERROR_CLASSES.CONFIGURATION_ERROR });
         expect((await prisma.custodyExecution.findUnique({ where: { id: execution.id } })).status).toBe('RESERVING');
@@ -668,14 +741,25 @@ describeOrSkip('§P.2 custody execution (real PostgreSQL)', () => {
             expected: { kind: 'CUSTOMER_WITHDRAWAL', refId: ledger.id, userId: user.id, fromAddress: HOT, toAddress: DEST, contractAddress: NATIVE, amountBaseUnits: 100000000n },
         });
 
-        // KMS accepts the request; no tx hash yet (asynchronous signing).
-        const pendingProvider = fakeProvider({ pendingRequestId: 'kms-pending-9' });
+        // KMS accepts the request; the response carries ONLY the prepared
+        // pending-transaction id (Tatum SignatureId semantics) — no tx hash.
+        const pendingProvider = fakeProvider({ pendingId: 'tatum-pending-9' });
         custody.__setProviderForTests(pendingProvider);
         const submission = await custody.submitExecution(prisma, { executionId: execution.id });
         expect(submission.status).toBe('SIGNING');
-        expect(pendingProvider.submitted[0]).toMatchObject({
-            from: HOT.toLowerCase(), to: DEST, amount: '100000000', contractAddress: NATIVE, signatureId: 'test-hot-signature-id',
+        expect(submission.pendingId).toBe('tatum-pending-9');
+        expect(submission.txHash).toBeUndefined();
+        // The provider request is the EXACT Tatum contract: decimal amount
+        // "100", MATIC chain, digits 6, hot-wallet signatureId@index 0, no from.
+        expect(pendingProvider.submitted[0]).toEqual({
+            chain: 'MATIC', to: DEST, contractAddress: NATIVE,
+            amount: '100', digits: 6, signatureId: 'test-hot-signature-id', index: 0,
         });
+        // The durable record keeps EXACT base units + the real pending id.
+        const persisted = await prisma.custodyExecution.findUnique({ where: { id: execution.id } });
+        expect(persisted.amountBaseUnits).toBe(100000000n);
+        expect(persisted.tatumPendingId).toBe('tatum-pending-9');
+        expect(persisted.txHash).toBeNull(); // NEVER fabricated from the submission response
 
         // Daemon signs+broadcasts → tx hash observed via the KMS request.
         const broadcastProvider = fakeProvider({
@@ -686,6 +770,8 @@ describeOrSkip('§P.2 custody execution (real PostgreSQL)', () => {
         const afterKms = await custody.advanceExecution(prisma, { executionId: execution.id });
         expect(afterKms.status).toBe('BROADCAST');
         expect((await prisma.custodyExecution.findUnique({ where: { id: execution.id } })).txHash).toBe(TX_HASH);
+        // Tatum's pending record is completed with the REAL blockchain tx id.
+        expect(broadcastProvider.completions[0]).toEqual({ pendingId: 'tatum-pending-9', txId: TX_HASH });
 
         // Not yet confirmed on chain → stays BROADCAST (never COMPLETED early).
         const stillPending = await custody.advanceExecution(prisma, { executionId: execution.id });
@@ -719,7 +805,7 @@ describeOrSkip('§P.2 custody execution (real PostgreSQL)', () => {
             executionId: execution.id,
             expected: { kind: 'CUSTOMER_WITHDRAWAL', refId: ledger.id, userId: user.id, fromAddress: HOT, toAddress: DEST, contractAddress: NATIVE, amountBaseUnits: 100000000n },
         });
-        custody.__setProviderForTests(fakeProvider({ pendingRequestId: 'kms-pending-9' }));
+        custody.__setProviderForTests(fakeProvider({ pendingId: 'tatum-pending-9' }));
         await custody.submitExecution(prisma, { executionId: execution.id });
 
         // Wrong-amount transfer evidence: a successful UNRELATED transaction.
@@ -739,7 +825,7 @@ describeOrSkip('§P.2 custody execution (real PostgreSQL)', () => {
         const e1 = await makeWithdrawalExecution({ userId: user.id, txRecordId: 'wd-rec1' });
         await prisma.custodyExecution.update({
             where: { id: e1.id },
-            data: { status: 'SIGNING', providerRequestId: 'kms-r1', approvalStatus: 'APPROVED' },
+            data: { status: 'SIGNING', tatumPendingId: 'kms-r1', approvalStatus: 'APPROVED' },
         });
         custody.__setProviderForTests(fakeProvider({
             kmsRequest: { id: 'kms-r1', txHash: TX_HASH, status: 'SIGNED' },
@@ -826,7 +912,7 @@ describeOrSkip('§P.2 withdrawalController.cryptoWithdrawal (real PostgreSQL + r
 
     it('gates ON + KMS pending-signing → 202 with NO tx hash, PENDING ledger row, SIGNING execution, exact-once debit', async () => {
         const user = await seededUser(500);
-        const provider = fakeProvider({ pendingRequestId: 'kms-ctrl-1' });
+        const provider = fakeProvider({ pendingId: 'tatum-ctrl-1' });
         custody.__setProviderForTests(provider);
         const { req, res } = makeReqRes({ userId: user.id, body: { amount: '50.000000', destination: DEST } });
         await withdrawalCtrl.cryptoWithdrawal(req, res);
@@ -842,7 +928,7 @@ describeOrSkip('§P.2 withdrawalController.cryptoWithdrawal (real PostgreSQL + r
 
         const execution = await prisma.custodyExecution.findFirst({ where: { kind: 'CUSTOMER_WITHDRAWAL' } });
         expect(execution.status).toBe('SIGNING');
-        expect(execution.providerRequestId).toBe('kms-ctrl-1');
+        expect(execution.tatumPendingId).toBe('tatum-ctrl-1');
         expect(execution.txHash).toBeNull();
         expect(execution.approvalStatus).toBe('APPROVED'); // four-eye durable record pre-validated the transfer
 
@@ -855,14 +941,21 @@ describeOrSkip('§P.2 withdrawalController.cryptoWithdrawal (real PostgreSQL + r
         expect(Number(hot.balance)).toBeCloseTo(-netPayout, 6);
         expect(Number(fees.balance)).toBeCloseTo(Number(ledger.feeUsdc), 6);
 
-        // The submitted provider payload is EXACT integer base units of native
-        // USDC — identical to the durable execution's amountBaseUnits.
-        expect(provider.submitted[0].amount).toBe(String(execution.amountBaseUnits));
-        expect(BigInt(provider.submitted[0].amount)).toBe(execution.amountBaseUnits);
-        // ledger row (decimal string) and execution agree exactly in base units
-        expect(custody.toBaseUnits(String(ledger.amountUsdc))).toBe(execution.amountBaseUnits);
+        // The submitted provider payload is the EXACT Tatum contract: decimal
+        // token quantity (NOT base units), native USDC contract, and the same
+        // exact quantity as the durable execution's amountBaseUnits.
+        expect(provider.submitted[0].chain).toBe('MATIC');
+        expect(provider.submitted[0].digits).toBe(6);
         expect(provider.submitted[0].contractAddress).toBe(NATIVE);
-        expect(provider.submitted[0].from).toBe(HOT.toLowerCase());
+        expect(provider.submitted[0].signatureId).toBe('test-hot-signature-id');
+        expect(custody.toBaseUnits(provider.submitted[0].amount)).toBe(execution.amountBaseUnits);
+        expect(provider.submitted[0]).not.toHaveProperty('from');       // KMS identity derives the sender
+        expect(provider.submitted[0]).not.toHaveProperty('fromPrivateKey'); // KMS-only signing
+        // ledger row (decimal) and execution agree exactly in base units
+        expect(custody.toBaseUnits(String(ledger.amountUsdc))).toBe(execution.amountBaseUnits);
+        // response carries the exact decimal strings, no binary-float amounts
+        expect(res.payload.data.netPayout).toBe(String(ledger.amountUsdc));
+        expect(custody.toBaseUnits(res.payload.data.netPayout)).toBe(execution.amountBaseUnits);
     });
 
     it('definitive provider rejection → 502 + EXACTLY-ONCE refund, ledger FAILED, execution FAILED', async () => {
@@ -922,5 +1015,276 @@ describeOrSkip('§P.2 withdrawalController.cryptoWithdrawal (real PostgreSQL + r
         await withdrawalCtrl.cryptoWithdrawal(req, res);
         expect(res.statusCode).toBe(400);
         expect(Number((await prisma.user.findUnique({ where: { id: user.id } })).availableBalance)).toBe(500);
+    });
+});
+
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AMENDMENT REGRESSION PROOFS — real Tatum contract, four-eye validator,
+// single-winner submission (CAS), settlement evidence authority, registry.
+// ─────────────────────────────────────────────────────────────────────────────
+describe('§P.2 unit: MAINNET four-eye is mandatory (gate + preflight fail closed)', () => {
+    it('MAINNET + four-eye disabled => the execution gate refuses live signing entirely', () => {
+        enableGates({ TATUM_KMS_ENVIRONMENT: 'MAINNET', TATUM_KMS_FOUR_EYE_REQUIRED: 'false' });
+        const gate = custody.executionGateStatus();
+        expect(gate.enabled).toBe(false);
+        expect(gate.flags.mainnetFourEyeOk).toBe(false);
+        expect(() => custody.requireExecutionEnabled()).toThrow(/not enabled/i);
+    });
+
+    it('MAINNET + four-eye required => gate enabled, and preflight reports the check green', async () => {
+        enableGates({ TATUM_KMS_ENVIRONMENT: 'MAINNET', TATUM_KMS_FOUR_EYE_REQUIRED: 'true' });
+        expect(custody.executionGateStatus().enabled).toBe(true);
+        const pre = await custody.preflight(null);
+        const fe = pre.checks.find((c) => c.name === 'kms_four_eye_required');
+        expect(fe.ok).toBe(true);
+        expect(fe.detail).toMatch(/mainnet/i);
+    });
+
+    it('preflight BLOCKS on a hot-wallet signer/address registry mismatch (fail-closed, not skipped)', async () => {
+        enableGates({ TATUM_KMS_SIGNER_REGISTRY: JSON.stringify([
+            // Registry proof says the hot wallet signatureId@index 0 controls a
+            // DIFFERENT address than TATUM_HOT_WALLET_ADDRESS.
+            { signatureId: 'test-hot-signature-id', index: 0, address: '0x' + '77'.repeat(20), model: 'MNEMONIC_INDEXED' },
+        ]) });
+        const pre = await custody.preflight(null);
+        const hot = pre.checks.find((c) => c.name === 'hot_wallet_signer_address_control');
+        expect(hot.ok).toBe(false);
+        expect(hot.detail).toMatch(/MISMATCH/i);
+        expect(pre.readyForLiveExecution).toBe(false);
+    });
+
+    it('preflight honestly reports (not blocks) a missing registry in non-live mode', async () => {
+        disableGates();
+        delete process.env.TATUM_KMS_SIGNER_REGISTRY;
+        const pre = await custody.preflight(null);
+        const hot = pre.checks.find((c) => c.name === 'hot_wallet_signer_address_control');
+        expect(hot.ok).not.toBe(false); // skipped, not a lie
+        expect(hot.detail).toMatch(/NOT verified/i);
+    });
+});
+
+describeOrSkip('§P.2 amendment proofs (real PostgreSQL): four-eye validator + CAS + settlement authority', () => {
+    let prisma;
+    const { seedUser } = require('./helpers/factories');
+
+    beforeAll(async () => {
+        const { PrismaClient } = require('@prisma/client');
+        prisma = new PrismaClient();
+    });
+    afterAll(async () => { if (prisma) await prisma.$disconnect(); });
+    beforeEach(() => { enableGates(); });
+    afterEach(async () => {
+        custody.__setProviderForTests(null);
+        await prisma.$executeRawUnsafe('TRUNCATE TABLE "CustodyExecution", "TransactionHistory", "User" RESTART IDENTITY CASCADE');
+    }, 15000);
+
+    async function approvedSigningExecution({ status = 'SIGNING', pendingId = 'tatum-4eye-1', approvalStatus = 'APPROVED', overrides = {} } = {}) {
+        const user = await seedUser(prisma);
+        return prisma.custodyExecution.create({
+            data: {
+                idempotencyKey: `wd-4eye-${Math.random().toString(36).slice(2)}`,
+                kind: 'CUSTOMER_WITHDRAWAL', refId: 'ledger-1', userId: user.id,
+                network: 'POLYGON', asset: 'USDC', contractAddress: NATIVE,
+                fromAddress: HOT, toAddress: DEST, amountBaseUnits: 1000000n, decimals: 6,
+                status, approvalStatus, tatumPendingId: pendingId,
+                metadata: {},
+                ...overrides,
+            },
+        });
+    }
+
+    // ── Four-eye external validation (the KMS daemon externalUrl contract) ──
+    it('validator returns 2xx ONLY for the durably APPROVED, exact-matching execution', async () => {
+        const execution = await approvedSigningExecution();
+        const result = await custody.validateKmsPendingRequest(prisma, { pendingId: 'tatum-4eye-1' });
+        expect(result.approved).toBe(true);
+        expect(result.httpStatus).toBe(200);
+        expect(result.kind).toBe('CUSTOMER_WITHDRAWAL');
+        // No secrets in the validator response.
+        expect(result.signatureId).toBeUndefined();
+        expect(result.tatumPendingId).toBeUndefined();
+    });
+
+    it('validator REFUSES: unknown id (404), PENDING/DENIED approval (403), terminal/stale (409), reconciliation (409)', async () => {
+        expect((await custody.validateKmsPendingRequest(prisma, { pendingId: 'never-seen' })).httpStatus).toBe(404);
+        expect((await custody.validateKmsPendingRequest(prisma, { pendingId: 'bad!id' })).httpStatus).toBe(404);
+
+        const pendingApproval = await approvedSigningExecution({ pendingId: 'tatum-4eye-2', approvalStatus: 'PENDING' });
+        expect((await custody.validateKmsPendingRequest(prisma, { pendingId: 'tatum-4eye-2' })).httpStatus).toBe(403);
+
+        const denied = await approvedSigningExecution({ pendingId: 'tatum-4eye-3', approvalStatus: 'DENIED' });
+        expect((await custody.validateKmsPendingRequest(prisma, { pendingId: 'tatum-4eye-3' })).httpStatus).toBe(403);
+
+        const settled = await approvedSigningExecution({ pendingId: 'tatum-4eye-4', status: 'COMPLETED' });
+        expect((await custody.validateKmsPendingRequest(prisma, { pendingId: 'tatum-4eye-4' })).httpStatus).toBe(409);
+
+        const reconciling = await approvedSigningExecution({ pendingId: 'tatum-4eye-5', status: 'RECONCILIATION_REQUIRED' });
+        expect((await custody.validateKmsPendingRequest(prisma, { pendingId: 'tatum-4eye-5' })).httpStatus).toBe(409);
+    });
+
+    it('validator REFUSES an execution whose transfer no longer matches its authorized semantics (wrong asset/amount/signer)', async () => {
+        const wrongContract = await approvedSigningExecution({ pendingId: 'tatum-4eye-6', overrides: { contractAddress: USDC_E } });
+        expect((await custody.validateKmsPendingRequest(prisma, { pendingId: 'tatum-4eye-6' })).httpStatus).toBe(403);
+
+        const zeroAmount = await approvedSigningExecution({ pendingId: 'tatum-4eye-7', overrides: { amountBaseUnits: 0n } });
+        expect((await custody.validateKmsPendingRequest(prisma, { pendingId: 'tatum-4eye-7' })).httpStatus).toBe(403);
+
+        // The registry no longer proves the hot wallet signer controls HOT.
+        enableGates({ TATUM_KMS_SIGNER_REGISTRY: JSON.stringify([
+            { signatureId: 'test-kms-signature-id', index: 5, address: CUST, model: 'MNEMONIC_INDEXED' },
+        ]) });
+        const unproven = await approvedSigningExecution({ pendingId: 'tatum-4eye-8' });
+        const refused = await custody.validateKmsPendingRequest(prisma, { pendingId: 'tatum-4eye-8' });
+        expect(refused.approved).toBe(false);
+        expect(refused.httpStatus).toBe(403);
+    });
+
+    it('the four-eye ROUTE is read-only, unauthenticated per the KMS protocol, and honors the optional IP allowlist', async () => {
+        const router = require('../routes/kmsFourEyeRoutes');
+        const routeHandler = router.stack.find((l) => l.route?.path === '/validate/:pendingId').route.stack.at(-1).handle;
+
+        const mkRes = () => ({
+            statusCode: null, payload: null,
+            status(c) { this.statusCode = c; return this; },
+            json(b) { this.payload = b; return this; },
+        });
+        const mkReq = (pendingId, ip) => ({
+            params: { pendingId }, ip,
+            app: { get: (k) => (k === 'prisma' ? prisma : undefined) },
+        });
+
+        const execution = await approvedSigningExecution({ pendingId: 'tatum-route-1' });
+        const ok = mkRes();
+        await routeHandler(mkReq('tatum-route-1', '203.0.113.9'), ok);
+        expect(ok.statusCode).toBe(200);
+        expect(ok.payload.approved).toBe(true);
+
+        const unknown = mkRes();
+        await routeHandler(mkReq('never-seen', '203.0.113.9'), unknown);
+        expect(unknown.statusCode).toBe(404); // non-2xx => KMS must not sign
+
+        // IP allowlist enforced when configured.
+        enableGates({ TATUM_KMS_VALIDATOR_ALLOWED_IPS: '10.0.0.5' });
+        const blocked = mkRes();
+        await routeHandler(mkReq('tatum-route-1', '203.0.113.9'), blocked);
+        expect(blocked.statusCode).toBe(403);
+        const allowed = mkRes();
+        await routeHandler(mkReq('tatum-route-1', '10.0.0.5'), allowed);
+        expect(allowed.statusCode).toBe(200);
+    });
+
+    // ── Single-winner submission (CAS): no second external submission, ever ──
+    it('two CONCURRENT submitExecution calls produce EXACTLY ONE provider submission; the loser converges', async () => {
+        const user = await seedUser(prisma);
+        const ledger = await prisma.transactionHistory.create({
+            data: { userId: user.id, type: 'WITHDRAWAL_CRYPTO', amountUsdc: 1, feeUsdc: 0, txHash: null, status: 'PENDING' },
+        });
+        const execution = await custody.createWithdrawalExecution(prisma, {
+            idempotencyKey: `withdrawal:${ledger.id}`, transactionHistoryId: ledger.id, userId: user.id,
+            fromAddress: HOT, toAddress: DEST, amountBaseUnits: 1000000n,
+        });
+        await custody.approveKmsRequest(prisma, {
+            executionId: execution.id,
+            expected: { kind: 'CUSTOMER_WITHDRAWAL', refId: ledger.id, userId: user.id, fromAddress: HOT, toAddress: DEST, contractAddress: NATIVE, amountBaseUnits: 1000000n },
+        });
+        const provider = fakeProvider({ pendingId: 'tatum-cas-1' });
+        custody.__setProviderForTests(provider);
+        const [a, b] = await Promise.allSettled([
+            custody.submitExecution(prisma, { executionId: execution.id }),
+            custody.submitExecution(prisma, { executionId: execution.id }),
+        ]);
+        // The CAS invariant: EXACTLY ONE external submission, no matter how
+        // the loser observes the winner (converged OR ambiguous).
+        expect(provider.submitted).toHaveLength(1);
+        const outcomes = [a, b];
+        const winner = outcomes.find((r) => r.status === 'fulfilled' && r.value.status === 'SIGNING' && !r.value.converged);
+        expect(winner).toBeDefined();
+        const loser = outcomes.find((r) => r !== winner);
+        expect(
+            (loser.status === 'fulfilled' && loser.value.converged === true) ||
+            (loser.status === 'rejected' && loser.reason.errorClass === ERROR_CLASSES.UNKNOWN_OUTCOME && loser.reason.ambiguous === true)
+        ).toBe(true); // either way: NO second submission
+        const row = await prisma.custodyExecution.findUnique({ where: { id: execution.id } });
+        expect(row.status).toBe('SIGNING');
+        expect(row.tatumPendingId).toBe('tatum-cas-1');
+
+        // A sequential retry AFTER the winner finished CONVERGES on the
+        // existing execution (no error, no second provider call).
+        const retry = await custody.submitExecution(prisma, { executionId: execution.id });
+        expect(retry.converged).toBe(true);
+        expect(retry.pendingId).toBe('tatum-cas-1');
+        expect(provider.submitted).toHaveLength(1); // STILL exactly one submission
+    });
+
+    it('crash-after-claim (SUBMITTED, no pending id): retry throws UNKNOWN_OUTCOME and NEVER resubmits', async () => {
+        const user = await seedUser(prisma);
+        const execution = await prisma.custodyExecution.create({
+            data: {
+                idempotencyKey: 'wd-cas-crash-1', kind: 'CUSTOMER_WITHDRAWAL', refId: 'ledger-x', userId: user.id,
+                network: 'POLYGON', asset: 'USDC', contractAddress: NATIVE,
+                fromAddress: HOT, toAddress: DEST, amountBaseUnits: 1000000n, decimals: 6,
+                status: 'SUBMITTED', approvalStatus: 'APPROVED', // claimed, provider outcome unknown
+                metadata: {},
+            },
+        });
+        const provider = fakeProvider();
+        custody.__setProviderForTests(provider);
+        await expect(custody.submitExecution(prisma, { executionId: execution.id }))
+            .rejects.toMatchObject({ errorClass: ERROR_CLASSES.UNKNOWN_OUTCOME, ambiguous: true });
+        expect(provider.submitted).toHaveLength(0); // no blind double-send — reconciliation owns it
+        expect((await prisma.custodyExecution.findUnique({ where: { id: execution.id } })).status).toBe('SUBMITTED');
+    });
+
+    // ── Settlement authority: COMPLETED requires verified chain evidence ──
+    it('settleExecution WITHOUT verified chain evidence REFUSES to complete (pending/unfound evidence)', async () => {
+        const user = await seedUser(prisma);
+        const ledger = await prisma.transactionHistory.create({
+            data: { userId: user.id, type: 'WITHDRAWAL_CRYPTO', amountUsdc: 1, feeUsdc: 0, txHash: null, status: 'PENDING' },
+        });
+        const execution = await prisma.custodyExecution.create({
+            data: {
+                idempotencyKey: `withdrawal:${ledger.id}`, kind: 'CUSTOMER_WITHDRAWAL', refId: ledger.id, userId: user.id,
+                network: 'POLYGON', asset: 'USDC', contractAddress: NATIVE,
+                fromAddress: HOT, toAddress: DEST, amountBaseUnits: 1000000n, decimals: 6,
+                status: 'BROADCAST', txHash: TX_HASH, approvalStatus: 'APPROVED',
+                metadata: {},
+            },
+        });
+        // Chain evidence not found yet — a tx hash alone is NOT completion proof.
+        custody.__setProviderForTests(fakeProvider({ transaction: null }));
+        const refused = await custody.settleExecution(prisma, { executionId: execution.id });
+        expect(refused.settled).toBe(false);
+        expect(refused.reason).toBe('CHAIN_EVIDENCE_NOT_VERIFIED');
+        expect((await prisma.custodyExecution.findUnique({ where: { id: execution.id } })).status).toBe('BROADCAST');
+        expect((await prisma.transactionHistory.findUnique({ where: { id: ledger.id } })).status).toBe('PENDING');
+
+        // A FORGED bare "evidence" object without the internal verification
+        // brand is rejected — the settlement authority cannot be bypassed.
+        const forged = await custody.settleExecution(prisma, { executionId: execution.id, evidence: { verified: true, detail: 'forged' } });
+        expect(forged.settled).toBe(false);
+        expect((await prisma.custodyExecution.findUnique({ where: { id: execution.id } })).status).toBe('BROADCAST');
+    });
+
+    it('settleExecution on a REVERTED receipt goes to RECONCILIATION_REQUIRED — never COMPLETED', async () => {
+        const user = await seedUser(prisma);
+        const ledger = await prisma.transactionHistory.create({
+            data: { userId: user.id, type: 'WITHDRAWAL_CRYPTO', amountUsdc: 1, feeUsdc: 0, txHash: null, status: 'PENDING' },
+        });
+        const execution = await prisma.custodyExecution.create({
+            data: {
+                idempotencyKey: `withdrawal:${ledger.id}`, kind: 'CUSTOMER_WITHDRAWAL', refId: ledger.id, userId: user.id,
+                network: 'POLYGON', asset: 'USDC', contractAddress: NATIVE,
+                fromAddress: HOT, toAddress: DEST, amountBaseUnits: 1000000n, decimals: 6,
+                status: 'CONFIRMING', txHash: TX_HASH, approvalStatus: 'APPROVED',
+                metadata: {},
+            },
+        });
+        custody.__setProviderForTests(fakeProvider({ transaction: { status: '0x0', logs: [] } }));
+        const result = await custody.settleExecution(prisma, { executionId: execution.id });
+        expect(result.settled).toBe(false);
+        expect(result.reason).toBe(ERROR_CLASSES.CHAIN_REVERTED);
+        expect((await prisma.custodyExecution.findUnique({ where: { id: execution.id } })).status).toBe('RECONCILIATION_REQUIRED');
+        expect((await prisma.transactionHistory.findUnique({ where: { id: ledger.id } })).status).toBe('PENDING');
     });
 });

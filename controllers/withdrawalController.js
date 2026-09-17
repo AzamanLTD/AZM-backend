@@ -23,6 +23,7 @@ const axios                   = require('axios');
 const { randomUUID }          = require('crypto');
 const { audit }               = require('../utils/audit');
 const { FEE_DISCOUNT_TIERS } = require('../services/azmSpendService');
+const { Prisma } = require('@prisma/client');
 
 const POLYGON_GAS_FEE_MATIC   = 0.05;  // V2 Blueprint: 100% of network gas is borne by user
 const FIAT_POOL_ALERT_THRESH  = financeService.FIAT_POOL_ALERT_THRESH;
@@ -490,10 +491,14 @@ exports.cryptoWithdrawal = async (req, res) => {
         // rejects zero address / token contract / hot wallet as destinations).
         const destAddress = custody.validateDestination(String(destination));
 
-        // EXACT monetary amounts: authoritative values are integer base units.
-        // Floats below are product-facing display semantics only.
+        // EXACT monetary amounts: the authoritative representation is integer
+        // base units; every customer-facing Decimal below is derived from the
+        // exact base units via an exact string (never binary floating point).
+        // Floats that remain (fraud heuristics, alert thresholds, messages)
+        // are non-authoritative risk-scoring/display semantics only.
         const amountBase = custody.toBaseUnits(amount); // throws on >6 decimals/NaN/negative/zero
-        const amountFloat = parseFloat(amount);
+        const amountFloat = parseFloat(amount); // NON-AUTHORITATIVE: fraud scoring/alerts only
+        const amountExact = custody.baseUnitsToDecimalString(amountBase); // "100.123456"
 
         // Fraud detection check (non-blocking for alerts, blocking for BLOCK severity)
         const accountAgeMs = Date.now() - new Date(req.user.createdAt || req.user.created_at || Date.now()).getTime();
@@ -538,10 +543,13 @@ exports.cryptoWithdrawal = async (req, res) => {
         if (payoutBaseUnits <= 0n) {
             return res.status(400).json({
                 success: false,
-                message: `Withdrawal amount (${amountFloat} USDC) is too low to cover the Polygon network gas fee (~${gasFeeUsdc} USDC).`
+                message: `Withdrawal amount (${amountExact} USDC) is too low to cover the Polygon network gas fee (~${gasFeeUsdc} USDC).`
             });
         }
-        const netPayout = Number(payoutBaseUnits) / 1e6; // exact display value — BigInt division would TRUNCATE
+        // EXACT net payout derived from base units — no Number()/1e6, no BigInt
+        // division truncation, no binary floating point anywhere authoritative.
+        const netPayoutExact = custody.baseUnitsToDecimalString(payoutBaseUnits);
+        const feeExact = custody.baseUnitsToDecimalString(feeBaseUnits);
 
         // ── §P.2 EXECUTION GATE — fail closed BEFORE any debit ───────────────
         // Real broadcasting requires TATUM_PROVIDER=LIVE + TATUM_KMS_ENABLED
@@ -578,9 +586,12 @@ exports.cryptoWithdrawal = async (req, res) => {
             const user = await tx.user.findUnique({ where: { id: userId } });
             if (!user) throw new Error('User not found.');
 
-            if (user.availableBalance < amountFloat) {
+            // EXACT decimal comparison/decrement — binary floating point is
+            // never the authoritative financial quantity on this path.
+            const requiredExact = new Prisma.Decimal(amountExact);
+            if (user.availableBalance.lt(requiredExact)) {
                 throw new Error(
-                    `Insufficient balance. Required: ${amountFloat} USDC, ` +
+                    `Insufficient balance. Required: ${amountExact} USDC, ` +
                     `available: ${user.availableBalance.toFixed(6)} USDC.`
                 );
             }
@@ -588,7 +599,7 @@ exports.cryptoWithdrawal = async (req, res) => {
             // Debit the FULL requested amount from the user (gas fee is internal)
             await tx.user.update({
                 where: { id: userId },
-                data:  { availableBalance: { decrement: amountFloat } }
+                data:  { availableBalance: { decrement: requiredExact } }
             });
 
             // Synthetic treasury bookkeeping is intentionally unchanged (§P.3
@@ -596,13 +607,13 @@ exports.cryptoWithdrawal = async (req, res) => {
             // is what later reconciles this against real chain evidence.
             await tx.systemHotWallet.upsert({
                 where:  { id: 1 },
-                update: { balance: { decrement: netPayout } },
-                create: { id: 1, balance: -netPayout }
+                update: { balance: { decrement: new Prisma.Decimal(netPayoutExact) } },
+                create: { id: 1, balance: new Prisma.Decimal(netPayoutExact).neg() }
             });
             await tx.systemProfitFees.upsert({
                 where:  { id: 1 },
-                update: { balance: { increment: gasFeeUsdc } },
-                create: { id: 1, balance: gasFeeUsdc }
+                update: { balance: { increment: new Prisma.Decimal(feeExact) } },
+                create: { id: 1, balance: new Prisma.Decimal(feeExact) }
             });
 
             // PENDING — NO txHash. COMPLETED happens only on verified chain
@@ -611,8 +622,8 @@ exports.cryptoWithdrawal = async (req, res) => {
                 data: {
                     userId:     userId,
                     type:       'WITHDRAWAL_CRYPTO',
-                    amountUsdc: netPayout,
-                    feeUsdc:    gasFeeUsdc,
+                    amountUsdc: new Prisma.Decimal(netPayoutExact), // exact, from base units
+                    feeUsdc:    new Prisma.Decimal(feeExact),       // exact, from base units
                     txHash:     null,
                     status:     'PENDING'
                 }
@@ -629,9 +640,9 @@ exports.cryptoWithdrawal = async (req, res) => {
                 metadata: {
                     customerDebitBaseUnits: String(amountBase),
                     netPayoutBaseUnits: String(payoutBaseUnits),
-                    withdrawalAmountUsdc: amountFloat,
-                    gasFeeUsdc,
-                    netPayoutUsdc: netPayout,
+                    withdrawalAmountExact: amountExact,
+                    gasFeeExact: feeExact,
+                    netPayoutExact,
                 },
             });
 
@@ -639,7 +650,7 @@ exports.cryptoWithdrawal = async (req, res) => {
             // realized network cost claim).
             await tx.adminProfitLog.create({
                 data: {
-                    amountUsdc:  gasFeeUsdc,
+                    amountUsdc:  new Prisma.Decimal(feeExact),
                     source:      'GAS_FEE_REVENUE',
                     relatedTxId: `crypto_withdraw_charge_${txRecord.id}`
                 }
@@ -675,7 +686,7 @@ exports.cryptoWithdrawal = async (req, res) => {
             // the durable custody execution identity — a REAL tx hash only
             // exists after broadcast evidence, so it is never fabricated here.
             journal.recordWithdrawal(userId, amountFloat, `custody-exec:${result.execution.id}`,
-                { source: 'crypto', netPayout, gasFeeUsdc, status: 'PENDING', executionId: result.execution.id })
+                { source: 'crypto', netPayout: netPayoutExact, gasFeeExact: feeExact, status: 'PENDING', executionId: result.execution.id })
                 .catch(e => logger.warn({ err: e.message }, '[withdrawalController] Journal recording failed'));
 
             await audit(prisma, {
@@ -702,15 +713,15 @@ exports.cryptoWithdrawal = async (req, res) => {
                     status:            'PENDING',
                     executionId:       result.execution.id,
                     transactionId:     result.txRecord.id,
-                    withdrawalAmount:  amountFloat,
+                    withdrawalAmount:  amountExact,      // exact, from base units
                     gasFeeMatic:       POLYGON_GAS_FEE_MATIC,
                     maticUsdcRate,
                     gasFeeUsdc,
-                    netPayout,
+                    netPayout:         netPayoutExact,   // exact, from base units
                     gasFeePolicy:      'USER_BEARS_100_PERCENT',
                     destination,
                     network:           network || 'Polygon',
-                    newBalance:        result.user.availableBalance - amountFloat,
+                    newBalance:        result.user.availableBalance.minus(new Prisma.Decimal(amountExact)).toFixed(6),
                 }
             });
         } catch (execErr) {
@@ -753,17 +764,19 @@ exports.cryptoWithdrawal = async (req, res) => {
                 errorClass: execErr.errorClass,
                 errorMessage: execErr.message,
                 refund: async (tx) => {
+                    // EXACT refund amounts derived from the same base units
+                    // that produced the debit — no floating-point drift.
                     await tx.user.update({
                         where: { id: userId },
-                        data:  { availableBalance: { increment: amountFloat } }
+                        data:  { availableBalance: { increment: new Prisma.Decimal(amountExact) } }
                     });
                     await tx.systemHotWallet.update({
                         where: { id: 1 },
-                        data:  { balance: { increment: netPayout } }
+                        data:  { balance: { increment: new Prisma.Decimal(netPayoutExact) } }
                     });
                     await tx.systemProfitFees.update({
                         where: { id: 1 },
-                        data:  { balance: { decrement: gasFeeUsdc } }
+                        data:  { balance: { decrement: new Prisma.Decimal(feeExact) } }
                     });
                     await tx.transactionHistory.update({
                         where: { id: result.txRecord.id },
@@ -771,7 +784,7 @@ exports.cryptoWithdrawal = async (req, res) => {
                     });
                     await tx.adminProfitLog.create({
                         data: {
-                            amountUsdc:   -gasFeeUsdc,
+                            amountUsdc:   new Prisma.Decimal(feeExact).neg(),
                             source:       'GAS_FEE_REVENUE',
                             relatedTxId:  `crypto_withdraw_refund_${result.txRecord.id}`,
                             isSubsidized: true
@@ -810,7 +823,7 @@ exports.cryptoWithdrawal = async (req, res) => {
             return res.status(502).json({
                 success: false,
                 message: 'On-chain broadcast was rejected. Your USDC has been refunded.',
-                data:    { gatewayError: execErr.message, refunded: amountFloat }
+                data:    { gatewayError: execErr.message, refunded: amountExact }
             });
         }
 

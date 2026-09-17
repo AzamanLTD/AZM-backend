@@ -101,7 +101,7 @@ class OnchainSweepWorker {
             }
 
             let sweptCount = 0;
-            let sweptTotal = 0;
+            let sweptTotalBase = 0n; // exact base-unit accumulator (display only)
 
             for (const entry of addresses) {
                 try {
@@ -115,7 +115,7 @@ class OnchainSweepWorker {
                             `[OnchainSweepWorker] MOCK: would sweep ${balanceRaw} USDC from user ${entry.userId} (${entry.address})`
                         );
                         sweptCount++;
-                        sweptTotal += parseFloat(balanceRaw);
+                        sweptTotalBase += balanceBase;
                         continue;
                     }
 
@@ -123,7 +123,7 @@ class OnchainSweepWorker {
                     const swept = await this._executeSweep(entry, balanceBase);
                     if (swept) {
                         sweptCount++;
-                        sweptTotal += parseFloat(balanceRaw);
+                        sweptTotalBase += balanceBase;
                     }
                 } catch (err) {
                     if (err instanceof CustodyExecutionError && err.errorClass === 'INVALID_ASSET') continue; // unusable provider amount shape — skip
@@ -133,7 +133,7 @@ class OnchainSweepWorker {
 
             if (sweptCount > 0) {
                 logger.info(
-                    `[OnchainSweepWorker] Swept ${sweptCount} address(es), total ${sweptTotal} USDC (mode: ${this.isLive ? 'LIVE' : 'MOCK'})`
+                    `[OnchainSweepWorker] Swept ${sweptCount} address(es), total ${custody.baseUnitsToDecimalString(sweptTotalBase, 6)} USDC (mode: ${this.isLive ? 'LIVE' : 'MOCK'})`
                 );
             }
         } finally {
@@ -217,7 +217,7 @@ class OnchainSweepWorker {
                 userId:      entry.userId,
                 fromAddress: entry.address,
                 toAddress:   cfg.hotWalletAddress,
-                amountUsdc:  Number(balanceBaseUnits) / 1e6, // exact — BigInt division would TRUNCATE
+                amountUsdc:  custody.baseUnitsToDecimalString(balanceBaseUnits, 6), // exact — no Number()/1e6, no BigInt truncation
                 status:      'BROADCASTING',
                 txHash:      null,
             },

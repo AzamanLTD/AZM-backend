@@ -29,6 +29,10 @@ function mountRoutes(app, {
     app.use('/api/admin', generalLimiter, require('../../routes/adminStatsRoutes'));
     // P2: non-destructive custody execution preflight/diagnostics (admin-only).
     app.use('/api/admin/custody', generalLimiter, require('../../routes/custodyRoutes'));
+    // P2: Tatum KMS four-eye external validation (read-only, intentionally
+    // unauthenticated per the KMS externalUrl protocol; topology/IP-allowlist
+    // protected — see routes/kmsFourEyeRoutes.js).
+    app.use('/api/internal/custody/kms', generalLimiter, require('../../routes/kmsFourEyeRoutes'));
     // Admin dine-in lifecycle projection: server-computed from the canonical
     // DineInTab/Invoice models; mounted before the legacy admin router.
     app.use('/api/admin', generalLimiter, require('../../routes/adminDineInRoutes'));

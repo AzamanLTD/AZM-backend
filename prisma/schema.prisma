@@ -5676,8 +5676,7 @@ model CustodyExecution {
   decimals           Int       @default(6)
   status             String    @default("REQUESTED") // REQUESTED|RESERVING|SUBMITTED|SIGNING|BROADCAST|CONFIRMING|COMPLETED|FAILED|RECONCILIATION_REQUIRED
   provider           String    @default("TATUM_KMS") @db.VarChar(30)
-  signatureId        String?   @db.VarChar(100)
-  providerRequestId  String?   @db.VarChar(100) // KMS pending signing-request id
+  tatumPendingId     String?   @db.VarChar(100) // Tatum internal ID of the prepared KMS pending transaction (POST response signatureId)
   txHash             String?   @unique // ONLY from provider/chain evidence
   approvalStatus     String    @default("PENDING") // PENDING | APPROVED | DENIED
   approvedAt         DateTime?

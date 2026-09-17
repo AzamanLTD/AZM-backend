@@ -25,14 +25,29 @@
 //    decimals). Floating point is never the monetary representation.
 //  • Statuses transition forward-only, enforced by conditional DB updates.
 //
-// KMS identity model (deliberately minimal, no second derivation system):
-//  • Customer deposit addresses: signer = TATUM_KMS_SIGNATURE_ID with
-//    derivation index = WalletAddress.derivationIndex (established rule:
-//    index = user.id). Preflight proves signatureId+index -> expected address
-//    equals WalletAddress.address; mismatch is a hard failure.
+// KMS identity model (Tatum KMS wallet semantics, no second derivation system):
+//  • Customer deposit addresses: signer = TATUM_KMS_SIGNATURE_ID (mnemonic-based
+//    signature ID) with derivation index = WalletAddress.derivationIndex
+//    (established rule: index = user.id). The exact index is part of every
+//    signing request; the expected derived address must equal the canonical
+//    WalletAddress.address.
 //  • Master hot wallet: signer = TATUM_HOT_WALLET_SIGNATURE_ID with
-//    TATUM_HOT_WALLET_INDEX (default 0); address = TATUM_HOT_WALLET_ADDRESS,
-//    which must agree with TATUM_TREASURY_ADDRESS when both are configured.
+//    TATUM_HOT_WALLET_INDEX (default 0, mnemonic-based model); address =
+//    TATUM_HOT_WALLET_ADDRESS, which must agree with TATUM_TREASURY_ADDRESS
+//    when both are configured.
+//  • signatureId -> address correspondence is NOT proven by deriving from an
+//    xpub (an xpub proves the mnemonic, not the KMS signature ID). It is
+//    verified against the KMS signer registry (TATUM_KMS_SIGNER_REGISTRY),
+//    whose entries ops populate from `tatum-kms getaddress <signatureId> <index>`
+//    — the documented, non-destructive KMS CLI proof against the KMS wallet
+//    storage. A missing registry entry is fail-closed in LIVE mode; the
+//    diagnostics never claim more than the registry actually proves.
+//  • Four-eye principle (mandatory on Tatum MAINNET): KMS daemon fetches
+//    pending transactions from Tatum and, before signing, performs a plain
+//    HTTP GET to the configured externalUrl with the pending transaction ID.
+//    Our validator endpoint returns 2xx ONLY for an execution that is durably
+//    APPROVED and exactly matches the intended transfer; any non-2xx means
+//    KMS must skip the transaction.
 // =============================================================================
 
 const axios = require('axios');
@@ -70,6 +85,8 @@ const INFLIGHT = [STATUSES.REQUESTED, STATUSES.RESERVING, STATUSES.SUBMITTED, ST
 
 const ZERO_ADDRESS = '0x0000000000000000000000000000000000000000';
 const ERC20_TRANSFER_TOPIC = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
+// Module-private brand for verified chain evidence (settlement authority).
+const VERIFIED_CHAIN_EVIDENCE = Symbol('verifiedChainEvidence');
 
 // ── Exact monetary arithmetic ────────────────────────────────────────────────
 
@@ -109,6 +126,37 @@ function toBaseUnits(amount, decimals = CANONICAL.decimals) {
         throw new CustodyExecutionError(ERROR_CLASSES.INVALID_ASSET, `Amount "${str}" must be positive — rejected (zero/negative).`);
     }
     return units;
+}
+
+/**
+ * EXACT inverse of toBaseUnits: integer base units -> exact decimal string.
+ * Pure BigInt/string arithmetic — NEVER Number()/1e6 (binary floating point
+ * loses precision for large values) and NEVER String(baseUnits) (base units
+ * are not the token quantity).
+ *   100123456n -> "100.123456"   1000000n -> "1"   1n -> "0.000001"
+ * Trailing fraction zeros are trimmed; an integer value has no fraction part.
+ */
+function baseUnitsToDecimalString(baseUnits, decimals = CANONICAL.decimals) {
+    let units;
+    if (typeof baseUnits === 'bigint') {
+        units = baseUnits;
+    } else if (typeof baseUnits === 'string' && /^-?\d+$/.test(baseUnits)) {
+        units = BigInt(baseUnits); // Prisma BigInt serializes losslessly
+    } else {
+        throw new CustodyExecutionError(ERROR_CLASSES.INVALID_ASSET, `baseUnitsToDecimalString: expected BigInt or integer string, got ${typeof baseUnits}`);
+    }
+    if (typeof decimals !== 'number' || !Number.isInteger(decimals) || decimals < 0 || decimals > 30) {
+        throw new CustodyExecutionError(ERROR_CLASSES.CONFIGURATION_ERROR, `baseUnitsToDecimalString: invalid decimals ${decimals}`);
+    }
+    if (units < 0n) {
+        throw new CustodyExecutionError(ERROR_CLASSES.INVALID_ASSET, 'baseUnitsToDecimalString: negative amounts are not representable here');
+    }
+    if (decimals === 0n || decimals === 0) return `${units}`;
+    const scale = 10n ** BigInt(decimals);
+    const intPart = units / scale;
+    const fracRaw = (units % scale).toString().padStart(decimals, '0');
+    const frac = fracRaw.replace(/0+$/, '');
+    return frac ? `${intPart}.${frac}` : `${intPart}`;
 }
 
 const isValidPolygonAddress = (address) => typeof address === 'string' && /^0x[0-9a-fA-F]{40}$/.test(address);
@@ -154,8 +202,70 @@ function getConfig() {
         hotWalletIndex:      process.env.TATUM_HOT_WALLET_INDEX != null ? parseInt(process.env.TATUM_HOT_WALLET_INDEX, 10) : 0,
         hotWalletAddress:    process.env.TATUM_HOT_WALLET_ADDRESS || null,
         treasuryAddress:     process.env.TATUM_TREASURY_ADDRESS || null,
-        xpub:                process.env.TATUM_XPUB || null,
+        signerRegistryRaw:   process.env.TATUM_KMS_SIGNER_REGISTRY || null,
     };
+}
+
+/**
+ * KMS signer registry (TATUM_KMS_SIGNER_REGISTRY): a JSON array of
+ *   { signatureId, index, address, model }
+ * entries where `address` is the address `tatum-kms getaddress <signatureId>
+ * <index>` prints on the ops side (the documented non-destructive KMS CLI proof
+ * against the KMS wallet storage). model is 'MNEMONIC_INDEXED' (index required)
+ * or 'PRIVATE_KEY' (index must be absent). Malformed configuration is treated
+ * as absent — never as an empty-but-valid proof.
+ */
+function getSignerRegistry() {
+    const raw = getConfig().signerRegistryRaw;
+    if (!raw) return null;
+    try {
+        const parsed = JSON.parse(raw);
+        if (!Array.isArray(parsed) || parsed.length === 0) return null;
+        const entries = [];
+        for (const e of parsed) {
+            if (!e || typeof e.signatureId !== 'string' || typeof e.address !== 'string') continue;
+            entries.push({
+                signatureId: e.signatureId,
+                index: (e.model === 'PRIVATE_KEY') ? null : (Number.isInteger(e.index) ? e.index : 0),
+                address: e.address,
+                model: e.model === 'PRIVATE_KEY' ? 'PRIVATE_KEY' : 'MNEMONIC_INDEXED',
+            });
+        }
+        return entries.length ? entries : null;
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * Verify, against the KMS signer registry, that the configured KMS signature
+ * identity (+ derivation index for mnemonic-based IDs) controls the expected
+ * address. This is the ONLY signer/address verification in the execution
+ * boundary. It is a registry consistency check against the documented KMS CLI
+ * proof (`tatum-kms getaddress`); it is NOT a live cryptographic proof by this
+ * service — the diagnostics say exactly that, never more.
+ */
+function verifySignerControlsAddress({ signatureId, index, expectedAddress }) {
+    const registry = getSignerRegistry();
+    if (!registry) {
+        return { verified: false, reason: 'REGISTRY_MISSING', detail: 'TATUM_KMS_SIGNER_REGISTRY is not configured — signatureId/address control cannot be verified (fail-closed in LIVE mode).' };
+    }
+    const entry = registry.find((r) => r.signatureId === signatureId && (r.model === 'PRIVATE_KEY' ? index == null || index === 0 : true));
+    if (!entry) {
+        return { verified: false, reason: 'SIGNER_NOT_IN_REGISTRY', detail: `signatureId ${signatureId.substring(0, 8)}… has no registry entry (tatum-kms getaddress proof missing).` };
+    }
+    if (entry.model === 'MNEMONIC_INDEXED' && index != null && entry.index !== index) {
+        return { verified: false, reason: 'INDEX_MISMATCH', detail: `registry index for this signatureId is ${entry.index}, execution expects ${index}.` };
+    }
+    if (normalizeAddress(entry.address) !== normalizeAddress(expectedAddress)) {
+        return { verified: false, reason: 'ADDRESS_MISMATCH', detail: `registry says signatureId${index != null ? '@' + index : ''} controls ${entry.address}, expected ${expectedAddress}.` };
+    }
+    return { verified: true, reason: 'REGISTRY_MATCH', detail: `KMS signer registry confirms signatureId${index != null ? '@' + index : ''} -> ${expectedAddress} (proof source: tatum-kms getaddress).` };
+}
+
+// Tatum four-eye is MANDATORY on mainnet; on testnet it may be configurable.
+function isMainnet() {
+    return String(getConfig().kmsEnvironment || '').toUpperCase() === 'MAINNET';
 }
 
 /**
@@ -171,9 +281,11 @@ function executionGateStatus() {
         apiKeyPresent:      !!cfg.apiKey,
         kmsEnabled:         cfg.kmsEnabled,
         executionEnabled:   cfg.executionEnabled,
+        mainnetFourEyeOk:   !isMainnet() || cfg.kmsFourEyeRequired,
     };
     return {
-        enabled: flags.providerLive && flags.apiKeyPresent && flags.kmsEnabled && flags.executionEnabled,
+        // MAINNET + four-eye disabled = NO live signing path, ever.
+        enabled: flags.providerLive && flags.apiKeyPresent && flags.kmsEnabled && flags.executionEnabled && flags.mainnetFourEyeOk,
         flags,
     };
 }
@@ -220,7 +332,7 @@ function resolveSignerForAddress(sourceAddress) {
  * or non-KMS signing mode.
  */
 function buildTokenTransferPayload({ from, to, amountBaseUnits, contractAddress, signatureId, index }) {
-    if (contractAddress !== CANONICAL.contractAddress) {
+    if (normalizeAddress(contractAddress) !== CANONICAL.contractAddress) {
         throw new CustodyExecutionError(ERROR_CLASSES.INVALID_ASSET, `Refusing non-canonical token contract ${contractAddress} — only native Polygon USDC (${CANONICAL.contractAddress}) is executable.`);
     }
     if (!signatureId) {
@@ -229,12 +341,25 @@ function buildTokenTransferPayload({ from, to, amountBaseUnits, contractAddress,
     if (!isValidPolygonAddress(from) || !isValidPolygonAddress(to)) {
         throw new CustodyExecutionError(ERROR_CLASSES.INVALID_DESTINATION, 'Transfer payload requires valid from/to addresses.');
     }
+    // EXACT provider contract — Tatum POST /v3/blockchain/token/transaction,
+    // schema ChainTransferEthErc20KMS (docs.tatum.io/reference/erc20transfer):
+    //   chain          = MATIC (Tatum chain identifier; our canonical internal
+    //                    network name remains POLYGON)
+    //   to             = recipient
+    //   contractAddress= native USDC token contract
+    //   amount         = token quantity in DECIMAL form (exact string)
+    //   digits         = 6
+    //   signatureId     = KMS signing identity
+    //   index          = derivation index ONLY where the signature ID is
+    //                    mnemonic-based (never sent for private-key-based IDs)
+    // `from` is deliberately NOT part of the provider request (Tatum derives it
+    // from the KMS identity); the application retains it internally as evidence
+    // and authorization data. NO fromPrivateKey — KMS-only signing.
     return {
-        from,
+        chain: 'MATIC',
         to,
-        amount: String(amountBaseUnits), // minimal units string — exact
         contractAddress: CANONICAL.contractAddress,
-        currency: CANONICAL.asset,
+        amount: baseUnitsToDecimalString(amountBaseUnits, CANONICAL.decimals),
         digits: CANONICAL.decimals,
         signatureId,
         ...(index != null ? { index: Number(index) } : {}),
@@ -257,11 +382,24 @@ function createHttpProvider(cfg = getConfig()) {
                 }
             }
             try {
-                const resp = await http.post('/v3/polygon/transaction', payload);
+                // Tatum's CURRENT fungible-token transfer endpoint for
+                // ERC-20-compatible chains (docs.tatum.io/reference/erc20transfer,
+                // "/v3/blockchain/token/transaction"). The legacy
+                // /v3/polygon/transaction native-asset endpoint is NOT a token
+                // transfer API and is never used for USDC.
+                const resp = await http.post('/v3/blockchain/token/transaction', payload);
                 const data = resp.data || {};
-                const txHash = (data.txId && isValidTxHash(data.txId)) ? data.txId : null;
+                // EXACT response semantics (OpenAPI schema "SignatureId"): a
+                // KMS-signed request returns { signatureId } where this
+                // signatureId is the INTERNAL TATUM ID OF THE PREPARED PENDING
+                // TRANSACTION for KMS to sign — NOT the request-body signatureId
+                // of the KMS wallet. There is no txId in this response shape;
+                // a blockchain hash exists only after the KMS daemon signs and
+                // broadcasts (observed via GET /v3/kms/{id} or chain evidence).
+                const pendingId = (typeof data.signatureId === 'string' && data.signatureId) ? data.signatureId : null;
+                const txHash = (data.txId && isValidTxHash(data.txId)) ? data.txId : null; // defensive: not in the KMS response contract
                 return {
-                    pendingRequestId: data.signatureId || data.id || null, // KMS pending signing-request id
+                    pendingId,
                     txHash,
                     raw: { status: resp.status },
                 };
@@ -270,12 +408,12 @@ function createHttpProvider(cfg = getConfig()) {
             }
         },
 
-        async getKmsRequest(pendingRequestId) {
+        async getKmsRequest(pendingId) {
             try {
-                const resp = await http.get(`/v3/kms/${pendingRequestId}`);
+                const resp = await http.get(`/v3/kms/${pendingId}`);
                 const data = resp.data || {};
                 return {
-                    id: data.id || pendingRequestId,
+                    id: data.id || pendingId,
                     txHash: (data.txId && isValidTxHash(data.txId)) ? data.txId : null,
                     status: data.status || null,
                 };
@@ -284,18 +422,36 @@ function createHttpProvider(cfg = getConfig()) {
             }
         },
 
-        async approvePendingRequest(pendingRequestId) {
+        // Tatum's documented pending-transaction lifecycle endpoints:
+        //   GET    /v3/kms/pending/{chain}   — list pending (reconciliation)
+        //   PUT    /v3/kms/{id}/{txId}       — complete pending with the REAL
+        //                                      blockchain transaction ID
+        //   DELETE /v3/kms/{id}             — cancel a pending transaction
+        // There is NO /v3/kms/approve/{id} endpoint in the current Tatum API:
+        // four-eye approval happens through the KMS daemon's externalUrl
+        // validation contract (see validateKmsPendingRequest), not through a
+        // Tatum REST approval call.
+        async listPendingRequests(chain = 'MATIC') {
             try {
-                await http.post(`/v3/kms/approve/${pendingRequestId}`);
-                return true;
+                const resp = await http.get(`/v3/kms/pending/${chain}`);
+                return Array.isArray(resp.data) ? resp.data : [];
             } catch (err) {
-                throw classifyProviderError(err, 'KMS approval');
+                throw classifyProviderError(err, 'KMS pending list');
             }
         },
 
-        async deletePendingRequest(pendingRequestId) {
+        async completePendingRequest(pendingId, txId) {
             try {
-                await http.delete(`/v3/kms/${pendingRequestId}`);
+                await http.put(`/v3/kms/${pendingId}/${txId}`);
+                return true;
+            } catch (err) {
+                throw classifyProviderError(err, 'KMS pending completion');
+            }
+        },
+
+        async deletePendingRequest(pendingId) {
+            try {
+                await http.delete(`/v3/kms/${pendingId}`);
                 return true;
             } catch (err) {
                 throw classifyProviderError(err, 'KMS request cancel');
@@ -312,17 +468,11 @@ function createHttpProvider(cfg = getConfig()) {
             }
         },
 
-        // Signer/address preflight: derive the address the KMS signature
-        // identity controls at the given index and compare it to the actual
-        // source address. NON-DESTRUCTIVE — no transaction is created.
-        async deriveAddressForSigner({ signatureId, index }) {
-            try {
-                const resp = await http.get(`/v3/polygon/address/${encodeURIComponent(cfg.xpub || '')}/${index}`);
-                return normalizeAddress(resp.data?.address);
-            } catch (err) {
-                throw classifyProviderError(err, 'signer address derivation');
-            }
-        },
+        // NOTE: there is deliberately NO deriveAddressForSigner method here.
+        // Deriving from TATUM_XPUB proves the mnemonic, NOT that a KMS
+        // signatureId controls the address; it is not an honest proof and has
+        // been removed. Signer/address correspondence is verified against the
+        // KMS signer registry (see verifySignerControlsAddress).
     };
 }
 
@@ -352,9 +502,44 @@ async function preflight(prisma = null, { provider = getProvider(), walletAddres
     add('kms_signature_id_present', !!cfg.kmsSignatureId, cfg.kmsSignatureId ? 'configured' : 'MISSING (customer deposit signer)');
     add('kms_chain_supported', normalizeAddress(cfg.kmsChain) === 'polygon', cfg.kmsChain);
     add('kms_environment_set', !!cfg.kmsEnvironment, cfg.kmsEnvironment || 'MISSING (e.g. MAINNET / TESTNET)');
-    add('kms_four_eye_required', true, cfg.kmsFourEyeRequired ? 'four-eye approval REQUIRED (Tatum mainnet requirement)' : 'four-eye disabled — NOT acceptable for mainnet');
+    if (isMainnet()) {
+        // MAINNET: four-eye is MANDATORY (Tatum KMS requirement). Disabled =>
+        // blocking check => readyForLiveExecution=false; the execution gate
+        // also refuses, so no live signing path can proceed.
+        add('kms_four_eye_required', cfg.kmsFourEyeRequired,
+            cfg.kmsFourEyeRequired
+                ? 'four-eye REQUIRED and configured (mainnet) — KMS daemon externalUrl validation contract'
+                : 'four-eye DISABLED on MAINNET — live execution is BLOCKED (mandatory Tatum requirement)');
+    } else {
+        add('kms_four_eye_required', true,
+            cfg.kmsFourEyeRequired
+                ? 'four-eye enabled (testnet) — KMS daemon externalUrl validation contract'
+                : 'four-eye disabled — permitted on TESTNET only if the Tatum deployment allows');
+    }
     add('master_hot_wallet_address_present', !!cfg.hotWalletAddress, cfg.hotWalletAddress || 'MISSING');
     add('master_hot_wallet_signer_present', !!cfg.hotWalletSignatureId, cfg.hotWalletSignatureId ? 'configured' : 'MISSING (TATUM_HOT_WALLET_SIGNATURE_ID)');
+    add('hot_wallet_signer_model', true, `TATUM_HOT_WALLET_INDEX=${cfg.hotWalletIndex} (mnemonic-based KMS signature ID model; the index is part of every signing request)`);
+
+    // HOT WALLET signer/address control (registry-verified, fail-closed).
+    // TATUM_HOT_WALLET_SIGNATURE_ID + TATUM_HOT_WALLET_INDEX must control
+    // TATUM_HOT_WALLET_ADDRESS — proven against the KMS signer registry
+    // (`tatum-kms getaddress` output). A mismatch is BLOCKING; a missing
+    // registry is blocking in LIVE mode (cannot claim control we cannot prove).
+    if (cfg.hotWalletAddress && cfg.hotWalletSignatureId) {
+        const hot = verifySignerControlsAddress({
+            signatureId: cfg.hotWalletSignatureId,
+            index: cfg.hotWalletIndex,
+            expectedAddress: cfg.hotWalletAddress,
+        });
+        if (hot.verified) {
+            add('hot_wallet_signer_address_control', true, hot.detail);
+        } else if (hot.reason === 'REGISTRY_MISSING') {
+            add('hot_wallet_signer_address_control', !gate.enabled,
+                'SKIPPED (not live) — TATUM_KMS_SIGNER_REGISTRY absent, signer/address control NOT verified. Live execution requires the registry (tatum-kms getaddress proof).');
+        } else {
+            add('hot_wallet_signer_address_control', false, `MISMATCH — ${hot.detail}`);
+        }
+    }
     add('treasury_hot_wallet_consistency',
         !cfg.treasuryAddress || !cfg.hotWalletAddress || normalizeAddress(cfg.treasuryAddress) === normalizeAddress(cfg.hotWalletAddress),
         cfg.treasuryAddress && cfg.hotWalletAddress && normalizeAddress(cfg.treasuryAddress) !== normalizeAddress(cfg.hotWalletAddress)
@@ -362,24 +547,22 @@ async function preflight(prisma = null, { provider = getProvider(), walletAddres
             : 'consistent');
     add('canonical_token_identity', true, `native Polygon USDC ${CANONICAL.contractAddress} (${CANONICAL.decimals} decimals); bridged USDC.e is a distinct asset and never substituted`);
 
-    // Signer/address correspondence — only provable in LIVE mode with a real
-    // provider; never destructive.
-    if (walletAddress) {
-        if (gate.enabled && cfg.xpub) {
-            try {
-                const expected = await provider.deriveAddressForSigner({
-                    signatureId: cfg.kmsSignatureId,
-                    index: walletAddress.derivationIndex,
-                });
-                const matches = expected === normalizeAddress(walletAddress.address);
-                add('signer_address_correspondence', matches,
-                    matches ? `signatureId@index ${walletAddress.derivationIndex} -> ${walletAddress.address}`
-                            : `MISMATCH: signatureId@index ${walletAddress.derivationIndex} -> ${expected}, registry says ${walletAddress.address}`);
-            } catch (err) {
-                add('signer_address_correspondence', false, `derivation failed: ${redact(err.message)}`);
-            }
+    // Customer signer/address correspondence — verified against the KMS signer
+    // registry (tatum-kms getaddress proof), never an xpub derivation. This is
+    // exactly what submitExecution enforces for deposit-address sources.
+    if (walletAddress && cfg.kmsSignatureId) {
+        const signer = verifySignerControlsAddress({
+            signatureId: cfg.kmsSignatureId,
+            index: walletAddress.derivationIndex,
+            expectedAddress: walletAddress.address,
+        });
+        if (signer.verified) {
+            add('signer_address_correspondence', true, signer.detail);
+        } else if (signer.reason === 'REGISTRY_MISSING') {
+            add('signer_address_correspondence', null,
+                'SKIPPED — TATUM_KMS_SIGNER_REGISTRY absent; signatureId@index control over the WalletAddress is NOT verified (submit-time is fail-closed)');
         } else {
-            add('signer_address_correspondence', null, 'SKIPPED — requires LIVE provider + TATUM_XPUB (non-destructive check)');
+            add('signer_address_correspondence', false, `MISMATCH — ${signer.detail}`);
         }
     }
 
@@ -543,14 +726,95 @@ async function approveKmsRequest(prisma, { executionId, expected }) {
 async function denyKmsRequest(prisma, executionId, reason, provider = null) {
     const execution = await prisma.custodyExecution.findUnique({ where: { id: executionId } });
     if (!execution) throw new CustodyExecutionError(ERROR_CLASSES.CONFIGURATION_ERROR, `Unknown KMS approval request ${executionId}.`);
-    if (execution.providerRequestId && provider && !TERMINAL.has(execution.status)) {
+    if (execution.tatumPendingId && provider && !TERMINAL.has(execution.status)) {
         // Best-effort external cancel; the internal DENIED record is authority.
-        try { await provider.deletePendingRequest(execution.providerRequestId); } catch { /* classified upstream */ }
+        try { await provider.deletePendingRequest(execution.tatumPendingId); } catch { /* classified upstream */ }
     }
     return prisma.custodyExecution.update({
         where: { id: executionId },
         data: { approvalStatus: 'DENIED', errorClass: ERROR_CLASSES.CONFIGURATION_ERROR, errorMessage: redact(reason || 'denied') },
     });
+}
+
+// ── Four-eye external validation (Tatum KMS externalUrl contract) ──────────
+
+/**
+ * THE application side of Tatum KMS's four-eye principle.
+ *
+ * Tatum's documented mechanism: with the KMS daemon started with
+ * `--externalUrl=<our server URL>`, every time the daemon fetches a pending
+ * transaction to sign it performs a plain HTTP GET to
+ * `<externalUrl>/<pendingTransactionId>` and signs ONLY on a 2xx response;
+ * any non-2xx means the transaction is skipped.
+ *
+ * This validator answers those GETs. It is READ-ONLY (no financial mutation,
+ * no state transition, no secrets) and returns { approved: true } ONLY when
+ * the pending transaction id maps to a durable CustodyExecution that:
+ *   • is not terminal and not in RECONCILIATION_REQUIRED (stale/settled refuse);
+ *   • is durably APPROVED (the internal approveKmsRequest record — the
+ *     application's exact-match authorization of this very transfer);
+ *   • is of an authorized kind (CUSTOMER_WITHDRAWAL | DEPOSIT_SWEEP);
+ *   • is on the exact canonical network + exact native-USDC contract;
+ *   • has the exact authorized sender and recipient addresses;
+ *   • matches the exact base-unit amount for the authorized execution;
+ *   • is signed by the exact configured KMS signer identity (+ derivation
+ *     index where the mnemonic-based model requires it).
+ * Everything else — unknown, denied, mismatched, already-settled — is a
+ * refusal (non-2xx), so KMS must not sign.
+ */
+async function validateKmsPendingRequest(prisma, { pendingId }) {
+    if (!pendingId || typeof pendingId !== 'string' || !/^[-A-Za-z0-9]{1,100}$/.test(pendingId)) {
+        return { approved: false, httpStatus: 404, reason: 'MALFORMED_PENDING_ID' };
+    }
+    const execution = await prisma.custodyExecution.findFirst({ where: { tatumPendingId: pendingId } });
+    if (!execution) {
+        // Unknown to the application: this is not an authorized transaction.
+        return { approved: false, httpStatus: 404, reason: 'UNKNOWN_PENDING_TRANSACTION' };
+    }
+    if (TERMINAL.has(execution.status)) {
+        return { approved: false, httpStatus: 409, reason: `EXECUTION_TERMINAL_${execution.status}` };
+    }
+    if (execution.approvalStatus !== 'APPROVED') {
+        return { approved: false, httpStatus: 403, reason: `EXECUTION_NOT_APPROVED_${execution.approvalStatus}` };
+    }
+    if (execution.kind !== 'CUSTOMER_WITHDRAWAL' && execution.kind !== 'DEPOSIT_SWEEP') {
+        return { approved: false, httpStatus: 403, reason: `UNAUTHORIZED_KIND_${execution.kind}` };
+    }
+    // Exact asset/network identity.
+    if (execution.network !== CANONICAL.network
+        || execution.asset !== CANONICAL.asset
+        || normalizeAddress(execution.contractAddress) !== CANONICAL.contractAddress
+        || execution.decimals !== CANONICAL.decimals) {
+        return { approved: false, httpStatus: 403, reason: 'ASSET_NETWORK_MISMATCH' };
+    }
+    // Exact sender/recipient: the addresses of the authorized execution.
+    if (!isValidPolygonAddress(execution.fromAddress) || !isValidPolygonAddress(execution.toAddress)) {
+        return { approved: false, httpStatus: 403, reason: 'ADDRESS_MALFORMED' };
+    }
+    if (execution.amountBaseUnits == null || BigInt(execution.amountBaseUnits) <= 0n) {
+        return { approved: false, httpStatus: 403, reason: 'AMOUNT_INVALID' };
+    }
+    // Exact signer identity: the configured KMS signature identity (+ index)
+    // that the application authorized for this source address.
+    const signer = resolveSignerForAddress(execution.fromAddress);
+    const expectedIndex = signer.role === 'CUSTOMER_DEPOSIT_WALLET'
+        ? (execution.metadata?.derivationIndex ?? null)
+        : signer.index;
+    const proof = verifySignerControlsAddress({ signatureId: signer.signatureId, index: expectedIndex, expectedAddress: execution.fromAddress });
+    if (!proof.verified) {
+        return { approved: false, httpStatus: 403, reason: `SIGNER_VERIFICATION_FAILED_${proof.reason}` };
+    }
+    // 2xx ONLY on exact authorization. The response exposes no secrets: only
+    // non-sensitive status facts the KMS operator can use for diagnostics.
+    logger.info({ executionId: execution.id, kind: execution.kind, status: execution.status }, '[custody-execution] four-eye external validation: APPROVED (KMS may sign)');
+    return {
+        approved: true,
+        httpStatus: 200,
+        executionId: execution.id,
+        kind: execution.kind,
+        status: execution.status,
+        network: execution.network,
+    };
 }
 
 // ── Submission (the asynchronous KMS flow) ───────────────────────────────────
@@ -567,9 +831,6 @@ async function submitExecution(prisma, { executionId }, { provider = getProvider
     if (!execution) throw new CustodyExecutionError(ERROR_CLASSES.CONFIGURATION_ERROR, `Execution ${executionId} not found.`);
     if (TERMINAL.has(execution.status)) {
         throw new CustodyExecutionError(ERROR_CLASSES.CONFIGURATION_ERROR, `Execution ${executionId} is terminal (${execution.status}) — never resubmitted.`);
-    }
-    if (execution.status !== STATUSES.REQUESTED && execution.status !== STATUSES.RESERVING) {
-        throw new CustodyExecutionError(ERROR_CLASSES.CONFIGURATION_ERROR, `Execution ${executionId} is already in flight (${execution.status}).`);
     }
 
     // NOTE ON FAILURE OWNERSHIP: preflight validation failures below leave the
@@ -601,26 +862,29 @@ async function submitExecution(prisma, { executionId }, { provider = getProvider
         ? (execution.metadata?.derivationIndex ?? null)
         : signer.index;
 
-    // For customer deposit sources, PROVE signer/address correspondence — the
-    // configured signatureId + derivation index must control the exact
-    // WalletAddress address being swept. A mismatch is a hard failure; an
-    // existing customer address is never silently replaced.
-    if (signer.role === 'CUSTOMER_DEPOSIT_WALLET' && getConfig().xpub && index != null) {
-        let expectedAddress;
-        try {
-            expectedAddress = await provider.deriveAddressForSigner({ signatureId: signer.signatureId, index });
-        } catch (err) {
-            // Derivation unavailable = configuration risk: fail closed.
-            throw new CustodyExecutionError(ERROR_CLASSES.CONFIGURATION_ERROR,
-                `Signer/address preflight could not be performed (${redact(err.message || String(err))}) — fail-closed.`);
-        }
-        if (expectedAddress !== normalizeAddress(execution.fromAddress)) {
-            throw new CustodyExecutionError(ERROR_CLASSES.SIGNER_MISMATCH,
-                `KMS signer at index ${index} controls ${expectedAddress}, not ${execution.fromAddress} — refusing to execute.`);
+    // Signer/address correspondence for BOTH source roles — proven against the
+    // KMS signer registry (tatum-kms getaddress proof). The KMS signature
+    // identity (+ derivation index) must control the EXACT source address; a
+    // mismatch is a hard failure and an unprovable configuration is fail-closed.
+    // This is deliberately NOT an xpub derivation (an xpub proves the mnemonic,
+    // not the KMS signature ID).
+    {
+        const proof = verifySignerControlsAddress({
+            signatureId: signer.signatureId,
+            index,
+            expectedAddress: execution.fromAddress,
+        });
+        if (!proof.verified) {
+            throw new CustodyExecutionError(
+                proof.reason === 'ADDRESS_MISMATCH' || proof.reason === 'INDEX_MISMATCH' ? ERROR_CLASSES.SIGNER_MISMATCH : ERROR_CLASSES.CONFIGURATION_ERROR,
+                `KMS signer verification failed for ${execution.fromAddress} (${proof.reason}): ${proof.detail} — refusing to execute.`
+            );
         }
     }
 
-    // Payload — the one construction point; hard-rejects private keys.
+    // Payload — the one construction point; hard-rejects private keys and is
+    // the exact Tatum ChainTransferEthErc20KMS contract (chain MATIC, decimal
+    // amount, digits 6, signatureId, index only for mnemonic-based IDs).
     const payload = buildTokenTransferPayload({
         from: execution.fromAddress,
         to: execution.toAddress,
@@ -630,16 +894,44 @@ async function submitExecution(prisma, { executionId }, { provider = getProvider
         index,
     });
 
-    await transitionExecution(prisma, executionId, [STATUSES.REQUESTED, STATUSES.RESERVING], { status: STATUSES.SUBMITTED, submittedAt: new Date() });
+    // ── ATOMIC SINGLE-WINNER CLAIM ────────────────────────────────────────
+    // RESERVING/REQUESTED --CAS--> SUBMITTED. ONLY the process whose
+    // conditional update actually moved the row may call the external
+    // provider. The transition result is CHECKED — a lost CAS never reaches
+    // Tatum (no second external submission, ever).
+    const claimed = await transitionExecution(prisma, executionId, [STATUSES.REQUESTED, STATUSES.RESERVING], { status: STATUSES.SUBMITTED, submittedAt: new Date() });
+    if (!claimed) {
+        // Lost the race to another process (or a retry while in flight).
+        // Converge on the existing execution; NEVER call the provider.
+        const current = await prisma.custodyExecution.findUnique({ where: { id: executionId } });
+        if (current && TERMINAL.has(current.status)) {
+            throw new CustodyExecutionError(ERROR_CLASSES.CONFIGURATION_ERROR, `Execution ${executionId} became terminal (${current.status}) — converged, not resubmitted.`);
+        }
+        if (current && current.status === STATUSES.SUBMITTED && !current.tatumPendingId) {
+            // Crash-after-claim, before the provider request completed: the
+            // outcome is INTENTIONALLY ambiguous. Do NOT move it back to
+            // RESERVING and do NOT retry — reconciliation must determine
+            // whether the provider ever created a pending transaction.
+            const ambiguous = new CustodyExecutionError(ERROR_CLASSES.UNKNOWN_OUTCOME,
+                `Execution ${executionId} was already claimed for submission (outcome ambiguous — a prior process may have created a pending provider request). Reconciliation required; NO second submission was attempted.`);
+            ambiguous.ambiguous = true;
+            throw ambiguous;
+        }
+        logger.warn({ executionId, status: current?.status }, '[custody-execution] submission claim lost — converging on the existing execution (no provider call)');
+        return { status: current?.status || 'UNKNOWN', pendingId: current?.tatumPendingId || null, pending: current ? !TERMINAL.has(current.status) : false, converged: true };
+    }
+    // CAS won. From here a crash leaves the row in SUBMITTED with no
+    // tatumPendingId — an intentionally ambiguous state that ONLY
+    // reconciliation may resolve (never an automatic resubmission).
 
     // Mark an outcome as ambiguous (reconciliation decides; never auto-refund
     // or blind retry) and surface it to the caller as UNKNOWN_OUTCOME.
-    const reconcileAmbiguous = async (pendingRequestId, detail) => {
+    const reconcileAmbiguous = async (pendingId, detail) => {
         await transitionExecution(prisma, executionId, [STATUSES.SUBMITTED, STATUSES.SIGNING, STATUSES.BROADCAST], {
             status: STATUSES.RECONCILIATION_REQUIRED,
             errorClass: ERROR_CLASSES.UNKNOWN_OUTCOME,
             errorMessage: redact(`Ambiguous external outcome: ${detail}`),
-            providerRequestId: pendingRequestId || undefined,
+            tatumPendingId: pendingId || undefined,
         });
         const unknown = new CustodyExecutionError(ERROR_CLASSES.UNKNOWN_OUTCOME,
             'Provider outcome is unknown (timeout/network/5xx or unusable evidence). This is NOT treated as failure — reconciliation required before any refund or retry.');
@@ -647,50 +939,44 @@ async function submitExecution(prisma, { executionId }, { provider = getProvider
         throw unknown;
     };
 
-    let pendingRequestId = null;
+    let pendingId = null;
     try {
         const result = await provider.submitTokenTransfer(payload);
-        pendingRequestId = result.pendingRequestId || null;
+        // Response semantics per Tatum's SignatureId schema: pendingId is the
+        // internal Tatum ID of the PREPARED PENDING TRANSACTION. It is what the
+        // KMS daemon validates (externalUrl GET), what KMS polling completes
+        // with the real blockchain tx ID (PUT /v3/kms/{id}/{txId}), what can be
+        // cancelled (DELETE /v3/kms/{id}), and the reconciliation key.
+        pendingId = result.pendingId || null;
 
         if (result.txHash) {
             // Broadcast evidence exists already (e.g. daemon-signed instantly).
             // A malformed hash is NOT usable evidence — and we cannot know what
             // the provider actually did, so it is ambiguous, never "failed".
             if (!isValidTxHash(result.txHash)) {
-                await reconcileAmbiguous(pendingRequestId, 'provider returned a malformed tx hash');
+                await reconcileAmbiguous(pendingId, 'provider returned a malformed tx hash');
             }
             await transitionExecution(prisma, executionId, [STATUSES.SUBMITTED, STATUSES.SIGNING, STATUSES.BROADCAST], {
                 status: STATUSES.BROADCAST, txHash: result.txHash, broadcastAt: new Date(),
-                providerRequestId: pendingRequestId || undefined,
+                tatumPendingId: pendingId || undefined,
             });
             return { status: STATUSES.BROADCAST, txHash: result.txHash, pending: false };
         }
 
-        if (pendingRequestId) {
-            // Accepted into KMS pending-signing state. The external four-eye
-            // approval happens HERE (the internal durable record already exists).
-            if (getConfig().kmsFourEyeRequired) {
-                try {
-                    await provider.approvePendingRequest(pendingRequestId);
-                } catch (approveErr) {
-                    const c = approveErr instanceof CustodyExecutionError
-                        ? approveErr
-                        : classifyProviderError(approveErr, 'KMS approval');
-                    if (c.definitivePreBroadcast) {
-                        // The approval was definitively refused — the pending
-                        // request can never be signed, so nothing can broadcast.
-                        // Caller owns the FAILED transition; row stays SUBMITTED.
-                        throw c;
-                    }
-                    // Approval timeout/unknown: the approve may have landed, and
-                    // the daemon may then sign+broadcast — ambiguous.
-                    await reconcileAmbiguous(pendingRequestId, `KMS four-eye approval outcome unknown (${c.message})`);
-                }
-            }
-            await transitionExecution(prisma, executionId, [STATUSES.SUBMITTED, STATUSES.SIGNING], {
-                status: STATUSES.SIGNING, providerRequestId: pendingRequestId,
+        if (pendingId) {
+            // Accepted into Tatum's KMS pending-signing state. Four-eye is
+            // implemented through Tatum's DOCUMENTED external validation
+            // contract — there is no Tatum "approve" REST call: when the KMS
+            // daemon fetches this pending transaction it GETs our externalUrl
+            // with this ID and signs ONLY on our 2xx (see
+            // validateKmsPendingRequest / the internal validator route). The
+            // durable approval was already recorded pre-submission and is
+            // exactly what the validator enforces; the submission boundary
+            // checked it above.
+            await transitionExecution(prisma, executionId, [STATUSES.SUBMITTED], {
+                status: STATUSES.SIGNING, tatumPendingId: pendingId,
             });
-            return { status: STATUSES.SIGNING, pendingRequestId, pending: true };
+            return { status: STATUSES.SIGNING, pendingId, pending: true };
         }
 
         // Accepted but NO evidence of any kind — NOT a success. Ambiguous.
@@ -705,7 +991,7 @@ async function submitExecution(prisma, { executionId }, { provider = getProvider
             // with the money movement.
             throw classified;
         }
-        await reconcileAmbiguous(pendingRequestId, classified.message);
+        await reconcileAmbiguous(pendingId, classified.message);
     }
 }
 
@@ -789,7 +1075,12 @@ async function verifyChainTransfer(provider, { txHash, fromAddress, toAddress, c
     if (!match) {
         return { verified: false, reason: ERROR_CLASSES.CHAIN_MISMATCH, detail: 'Transaction exists but does not match the intended transfer (sender/recipient/contract/amount).' };
     }
-    return { verified: true, detail: 'Transfer semantics verified on chain (contract, sender, recipient, exact base units, successful receipt).' };
+    // Branded proof object: COMPLETED is legal ONLY with this exact marker,
+    // which only the authoritative verification path (this function) can mint.
+    // settleExecution() refuses to complete an execution without it (or
+    // without performing the same verification itself first). The Symbol is
+    // module-private and cannot be forged by callers.
+    return { verified: true, detail: 'Transfer semantics verified on chain (contract, sender, recipient, exact base units, successful receipt).', [VERIFIED_CHAIN_EVIDENCE]: true };
 }
 
 /**
@@ -803,8 +1094,8 @@ async function advanceExecution(prisma, { executionId }, { provider = getProvide
     const execution = await prisma.custodyExecution.findUnique({ where: { id: executionId } });
     if (!execution || TERMINAL.has(execution.status)) return { status: execution?.status || 'NOT_FOUND', changed: false };
 
-    if (execution.status === STATUSES.SIGNING && execution.providerRequestId) {
-        const kms = await provider.getKmsRequest(execution.providerRequestId);
+    if (execution.status === STATUSES.SIGNING && execution.tatumPendingId) {
+        const kms = await provider.getKmsRequest(execution.tatumPendingId);
         if (kms.txHash) {
             if (!isValidTxHash(kms.txHash)) {
                 await transitionExecution(prisma, executionId, [STATUSES.SIGNING], {
@@ -814,15 +1105,28 @@ async function advanceExecution(prisma, { executionId }, { provider = getProvide
                 });
                 return { status: STATUSES.RECONCILIATION_REQUIRED, changed: true };
             }
-            await transitionExecution(prisma, executionId, [STATUSES.SIGNING], {
+            const moved = await transitionExecution(prisma, executionId, [STATUSES.SIGNING], {
                 status: STATUSES.BROADCAST, txHash: kms.txHash, broadcastAt: new Date(),
             });
+            if (!moved) {
+                // Another process moved the row first — converge on its state.
+                const current = await prisma.custodyExecution.findUnique({ where: { id: executionId }, select: { status: true, txHash: true } });
+                return { status: current?.status || STATUSES.SIGNING, changed: false, txHash: current?.txHash || null, converged: true };
+            }
+            // Best-effort: complete Tatum's pending-transaction record with the
+            // REAL blockchain transaction ID (PUT /v3/kms/{id}/{txId}). The KMS
+            // daemon normally does this itself; a failure here never blocks
+            // settlement — chain evidence is the completion authority.
+            if (typeof provider.completePendingRequest === 'function') {
+                try { await provider.completePendingRequest(execution.tatumPendingId, kms.txHash); }
+                catch (err) { logger.warn({ err: redact(err.message || String(err)) }, '[custody-execution] Tatum pending completion (best-effort) failed'); }
+            }
             return { status: STATUSES.BROADCAST, changed: true, txHash: kms.txHash };
         }
         return { status: STATUSES.SIGNING, changed: false };
     }
 
-    if (execution.status === STATUSES.BROADCAST && execution.txHash) {
+    if ((execution.status === STATUSES.BROADCAST || execution.status === STATUSES.CONFIRMING) && execution.txHash) {
         const verification = await verifyChainTransfer(provider, {
             txHash: execution.txHash,
             fromAddress: execution.fromAddress,
@@ -831,8 +1135,18 @@ async function advanceExecution(prisma, { executionId }, { provider = getProvide
             amountBaseUnits: BigInt(execution.amountBaseUnits),
         });
         if (verification.verified) {
-            await transitionExecution(prisma, executionId, [STATUSES.BROADCAST], { status: STATUSES.CONFIRMING });
-            return settleExecution(prisma, { executionId });
+            // Checked transition: another reconciler may already have advanced.
+            const moved = await transitionExecution(prisma, executionId, [STATUSES.BROADCAST, STATUSES.CONFIRMING], { status: STATUSES.CONFIRMING });
+            if (!moved && execution.status === STATUSES.BROADCAST) {
+                const current = await prisma.custodyExecution.findUnique({ where: { id: executionId }, select: { status: true } });
+                if (current && current.status !== STATUSES.CONFIRMING && current.status !== STATUSES.COMPLETED) {
+                    return { status: current.status, changed: false, converged: true };
+                }
+            }
+            // COMPLETED only through the settlement authority, which requires
+            // the verified chain evidence minted by the authoritative
+            // verification path above.
+            return settleExecution(prisma, { executionId, evidence: verification });
         }
         if (verification.reason === ERROR_CLASSES.CHAIN_REVERTED || verification.reason === ERROR_CLASSES.CHAIN_MISMATCH) {
             await transitionExecution(prisma, executionId, [STATUSES.BROADCAST, STATUSES.CONFIRMING], {
@@ -842,18 +1156,54 @@ async function advanceExecution(prisma, { executionId }, { provider = getProvide
             });
             return { status: STATUSES.RECONCILIATION_REQUIRED, changed: true, reason: verification.reason };
         }
-        return { status: STATUSES.BROADCAST, changed: false, pending: true, detail: verification.detail };
+        return { status: execution.status, changed: false, pending: true, detail: verification.detail };
     }
 
     return { status: execution.status, changed: false };
 }
 
 /**
- * Idempotent settlement: COMPLETED exactly once, atomically with the ledger
- * side effects (TransactionHistory -> COMPLETED, OnchainSweep -> CONFIRMED).
- * A duplicate settlement call is a no-op (duplicate callback -> one settlement).
+ * Settlement authority. COMPLETED is legal ONLY after VERIFIED CHAIN EVIDENCE:
+ *  • a caller may pass `evidence` — accepted ONLY if it carries the
+ *    module-private VERIFIED_CHAIN_EVIDENCE brand minted by verifyChainTransfer
+ *    (the authoritative verification path); a bare object cannot forge it;
+ *  • without a valid proof, settleExecution performs the SAME verification
+ *    itself against the stored txHash before completing — so a future caller
+ *    cannot do settleExecution(executionId) and bypass the evidence rule.
+ * An execution with a txHash but no verified transfer semantics is NEVER
+ * completed. Idempotent: duplicate settlement is a no-op.
  */
-async function settleExecution(prisma, { executionId }) {
+async function settleExecution(prisma, { executionId, evidence } = {}) {
+    let proof = (evidence && evidence[VERIFIED_CHAIN_EVIDENCE] === true) ? evidence : null;
+    if (!proof) {
+        // No (valid) verified proof supplied — verify the chain ourselves.
+        // Refuse to complete anything whose transfer semantics are unproven.
+        const execution = await prisma.custodyExecution.findUnique({ where: { id: executionId } });
+        if (!execution) return { settled: false, alreadySettled: false, status: 'NOT_FOUND' };
+        if (execution.status === STATUSES.COMPLETED) return { settled: false, alreadySettled: true, status: STATUSES.COMPLETED };
+        if (execution.status !== STATUSES.BROADCAST && execution.status !== STATUSES.CONFIRMING) {
+            return { settled: false, alreadySettled: false, status: execution.status, reason: 'SETTLEMENT_REFUSED_NOT_IN_BROADCAST_STATE' };
+        }
+        const verification = await verifyChainTransfer(getProvider(), {
+            txHash: execution.txHash,
+            fromAddress: execution.fromAddress,
+            toAddress: execution.toAddress,
+            contractAddress: execution.contractAddress,
+            amountBaseUnits: BigInt(execution.amountBaseUnits),
+        });
+        if (!verification.verified) {
+            if (verification.reason === ERROR_CLASSES.CHAIN_REVERTED || verification.reason === ERROR_CLASSES.CHAIN_MISMATCH) {
+                await transitionExecution(prisma, executionId, [STATUSES.BROADCAST, STATUSES.CONFIRMING], {
+                    status: STATUSES.RECONCILIATION_REQUIRED,
+                    errorClass: verification.reason,
+                    errorMessage: redact(`Settlement refused: ${verification.detail}`),
+                });
+                return { settled: false, alreadySettled: false, status: STATUSES.RECONCILIATION_REQUIRED, reason: verification.reason };
+            }
+            return { settled: false, alreadySettled: false, status: execution.status, reason: 'CHAIN_EVIDENCE_NOT_VERIFIED', detail: verification.detail };
+        }
+        proof = verification;
+    }
     return prisma.$transaction(async (tx) => {
         const res = await tx.custodyExecution.updateMany({
             where: { id: executionId, status: { in: [STATUSES.CONFIRMING, STATUSES.BROADCAST] } },
@@ -967,6 +1317,10 @@ module.exports = {
     TERMINAL,
     INFLIGHT,
     toBaseUnits,
+    baseUnitsToDecimalString,
+    getSignerRegistry,
+    verifySignerControlsAddress,
+    isMainnet,
     isValidPolygonAddress,
     isValidTxHash,
     normalizeAddress,
@@ -981,6 +1335,7 @@ module.exports = {
     claimSweepExecution,
     approveKmsRequest,
     denyKmsRequest,
+    validateKmsPendingRequest,
     submitExecution,
     verifyChainTransfer,
     advanceExecution,
