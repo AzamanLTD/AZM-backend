@@ -130,8 +130,26 @@ async function allocateDepositAddress(prisma, tatumService, userId, opts = {}) {
 
     // Adoption: a legacy mirror address that has no registry row yet (e.g. the
     // boot backfill has not run) is registered deterministically. The address
-    // itself is never re-derived or changed.
+    // itself is never re-derived or changed. If a registry row already owns the
+    // mirror address (e.g. this user's own RETIRED address), adoption is
+    // skipped and a fresh address is derived instead.
     if (user.tatumPolygonAddress) {
+        const mirrorRow = await prisma.walletAddress.findFirst({
+            where:  { address: user.tatumPolygonAddress.toLowerCase(), network: identity.network },
+            select: { id: true, userId: true, status: true },
+        });
+        if (mirrorRow && mirrorRow.userId === userId && mirrorRow.status === 'ACTIVE') {
+            // Converged: an ACTIVE canonical row exists (e.g. won by a racing call).
+            return { ...await getActiveDepositAddress(prisma, userId, identity), isNew: false, adopted: false };
+        }
+        if (mirrorRow) {
+            // Owned but not adoptable (RETIRED here, or a foreign owner upstream):
+            // derive a fresh address instead of colliding with the existing row.
+            logger.info(
+                '[walletAddressService] mirror address already registered (status %s) — deriving a fresh address',
+                mirrorRow.status
+            );
+        } else {
         try {
             const adopted = await prisma.$transaction(async (tx) => {
                 const created = await tx.walletAddress.create({
@@ -156,6 +174,7 @@ async function allocateDepositAddress(prisma, tatumService, userId, opts = {}) {
             const winner = await getActiveDepositAddress(prisma, userId, identity);
             if (winner) return { ...winner, isNew: false, adopted: false };
             throw err;
+        }
         }
     }
 

@@ -50,10 +50,6 @@ function mockTatumService({ counter = false } = {}) {
     };
 }
 
-const cleanRow = async (prisma, userId) => {
-    await prisma.walletAddress.deleteMany({ where: { userId } });
-    await prisma.user.deleteMany({ where: { id: userId } });
-};
 
 describeOrSkip('WalletAddress authority + governance (real PostgreSQL)', () => {
     let prisma;
@@ -68,13 +64,16 @@ describeOrSkip('WalletAddress authority + governance (real PostgreSQL)', () => {
     afterAll(async () => { if (prisma) await prisma.$disconnect(); });
 
     afterEach(async () => {
-        await prisma.$executeRawUnsafe('TRUNCATE TABLE "WalletAddress" RESTART IDENTITY CASCADE');
+        // Established suite-cleanup pattern (cf. shift-scheduling-integrity):
+        // truncate the registry and the seeded users (CASCADE clears their
+        // TransactionHistory ledger rows and all other FK references).
+        await prisma.$executeRawUnsafe('TRUNCATE TABLE "WalletAddress", "User" RESTART IDENTITY CASCADE');
     }, 15000);
 
     // ── 1 + 2. Migration/overlay backfill preserves addresses exactly, idempotently ──
     it('backfills WalletAddress rows from existing User.tatumPolygonAddress values, preserving the address exactly, and is idempotent', async () => {
         const user = await seedUser(prisma);
-        const legacy = '0xabc0000000000000000000000000000000000f11d'.toLowerCase();
+        const legacy = '0xabc0000000000000000000000000000000000f11'.toLowerCase();
         await prisma.user.update({
             where: { id: user.id },
             data: { tatumPolygonAddress: legacy },
@@ -102,8 +101,6 @@ describeOrSkip('WalletAddress authority + governance (real PostgreSQL)', () => {
         const again = await prisma.walletAddress.findMany({ where: { userId: user.id } });
         expect(again).toHaveLength(1);
         expect(again[0].address).toBe(legacy);
-
-        await cleanRow(prisma, user.id);
     });
 
     // ── 3. Active-address lookup returns the WalletAddress authority ──
@@ -125,8 +122,6 @@ describeOrSkip('WalletAddress authority + governance (real PostgreSQL)', () => {
         const found = await getActiveDepositAddress(prisma, user.id);
         expect(found).not.toBeNull();
         expect(found.id).toBe(row.id);
-
-        await cleanRow(prisma, user.id);
     });
 
     // ── 4 + 10. New allocation creates exactly one address and syncs the mirror ──
@@ -149,8 +144,6 @@ describeOrSkip('WalletAddress authority + governance (real PostgreSQL)', () => {
 
         const count = await prisma.walletAddress.count({ where: { userId: user.id } });
         expect(count).toBe(1);                                    // exactly one address
-
-        await cleanRow(prisma, user.id);
     });
 
     // ── 5. Concurrent allocation converges to ONE ACTIVE row ──
@@ -171,8 +164,6 @@ describeOrSkip('WalletAddress authority + governance (real PostgreSQL)', () => {
 
         const mirror = await prisma.user.findUnique({ where: { id: user.id }, select: { tatumPolygonAddress: true } });
         expect(mirror.tatumPolygonAddress).toBe(rows[0].address);
-
-        await cleanRow(prisma, user.id);
     });
 
     // ── 6. Retired addresses are never reassigned; RETIRED is terminal ──
@@ -202,8 +193,6 @@ describeOrSkip('WalletAddress authority + governance (real PostgreSQL)', () => {
         // The mirror follows the new ACTIVE address.
         const mirror = await prisma.user.findUnique({ where: { id: user.id }, select: { tatumPolygonAddress: true } });
         expect(mirror.tatumPolygonAddress).toBe(second.address);
-
-        await cleanRow(prisma, user.id);
     });
 
     // ── 7 + 8. Canonical address uniqueness is DB-enforced; no cross-user reassignment ──
@@ -242,9 +231,6 @@ describeOrSkip('WalletAddress authority + governance (real PostgreSQL)', () => {
             .rejects.toMatchObject({ code: 'ADDRESS_COLLISION' });
         const bRows = await prisma.walletAddress.findMany({ where: { userId: userB.id } });
         expect(bRows).toHaveLength(0);
-
-        await cleanRow(prisma, userA.id);
-        await cleanRow(prisma, userB.id);
     });
 
     // ── 9. Webhook ownership lookup uses the WalletAddress authority ──
@@ -281,9 +267,6 @@ describeOrSkip('WalletAddress authority + governance (real PostgreSQL)', () => {
 
         // Unknown address resolves to nothing.
         expect(await resolveOwner(prisma, { address: '0x4444444444444444444444444444444444444444' })).toBeNull();
-
-        await cleanRow(prisma, rowUser.id);
-        await cleanRow(prisma, mirrorUser.id);
     });
 
     // ── 11. Native Polygon USDC identity is preserved ──
@@ -299,8 +282,6 @@ describeOrSkip('WalletAddress authority + governance (real PostgreSQL)', () => {
         expect(allocated.network).toBe('POLYGON');
         expect(allocated.asset).toBe('USDC');
         expect(allocated.contractAddress).toBe(NATIVE_USDC.contractAddress);
-
-        await cleanRow(prisma, user.id);
     });
 
     // ── 12. Unsupported asset identity cannot become the canonical deposit address ──
@@ -319,8 +300,6 @@ describeOrSkip('WalletAddress authority + governance (real PostgreSQL)', () => {
 
         const rows = await prisma.walletAddress.findMany({ where: { userId: user.id } });
         expect(rows).toHaveLength(0);
-
-        await cleanRow(prisma, user.id);
     });
 });
 

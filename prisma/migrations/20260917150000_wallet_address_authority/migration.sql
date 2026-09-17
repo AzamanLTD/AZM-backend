@@ -71,7 +71,6 @@ SELECT
     u."tatumPolygonAddress",
     u."id",
     'ACTIVE',
-    COALESCE(u."updatedAt", now()),
     now(),
     now()
 FROM "User" u
