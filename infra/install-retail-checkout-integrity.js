@@ -18,7 +18,7 @@ async function installRetailCheckoutIntegrity(prisma) {
   await run('add immutable variant snapshot column', 'ALTER TABLE "BusinessOrderItem" ADD COLUMN IF NOT EXISTS "variants" JSONB');
   await run('add stock reservation marker', 'ALTER TABLE "BusinessOrderItem" ADD COLUMN IF NOT EXISTS "stockReserved" BOOLEAN NOT NULL DEFAULT FALSE');
 
-  await run('install atomic inventory reservation trigger', `CREATE OR REPLACE FUNCTION azaman_retail_reserve_stock()
+  await run('install atomic inventory reservation function', `CREATE OR REPLACE FUNCTION azaman_retail_reserve_stock()
 RETURNS trigger
 LANGUAGE plpgsql
 AS $$
@@ -32,11 +32,11 @@ BEGIN
   UPDATE "BusinessProduct" SET "stockQty" = "stockQty" - NEW.quantity WHERE id = NEW."productId";
   NEW."stockReserved" := TRUE; RETURN NEW;
 END;
-$$;
-DROP TRIGGER IF EXISTS azaman_retail_reserve_stock ON "BusinessOrderItem";
-CREATE TRIGGER azaman_retail_reserve_stock BEFORE INSERT ON "BusinessOrderItem" FOR EACH ROW EXECUTE FUNCTION azaman_retail_reserve_stock()`,);
+$$`);
 
-  await run('install inventory release trigger', `CREATE OR REPLACE FUNCTION azaman_retail_release_stock()
+  await run('install atomic inventory reservation trigger', `CREATE OR REPLACE TRIGGER azaman_retail_reserve_stock BEFORE INSERT ON "BusinessOrderItem" FOR EACH ROW EXECUTE FUNCTION azaman_retail_reserve_stock()`,);
+
+  await run('install inventory release function', `CREATE OR REPLACE FUNCTION azaman_retail_release_stock()
 RETURNS trigger
 LANGUAGE plpgsql
 AS $$
@@ -54,11 +54,11 @@ BEGIN
   END IF;
   RETURN NEW;
 END;
-$$;
-DROP TRIGGER IF EXISTS azaman_retail_release_stock ON "BusinessOrder";
-CREATE TRIGGER azaman_retail_release_stock AFTER UPDATE OF status ON "BusinessOrder" FOR EACH ROW EXECUTE FUNCTION azaman_retail_release_stock()`,);
+$$`);
 
-  await run('install SmartEscrow funding/state guard', `CREATE OR REPLACE FUNCTION azm_guard_smart_escrow_funding_transition()
+  await run('install inventory release trigger', `CREATE OR REPLACE TRIGGER azaman_retail_release_stock AFTER UPDATE OF status ON "BusinessOrder" FOR EACH ROW EXECUTE FUNCTION azaman_retail_release_stock()`,);
+
+  await run('install SmartEscrow funding/state guard function', `CREATE OR REPLACE FUNCTION azm_guard_smart_escrow_funding_transition()
 RETURNS trigger
 LANGUAGE plpgsql
 AS $$
@@ -67,9 +67,9 @@ BEGIN
   IF NEW.status = 'PENDING_SETTLEMENT' AND OLD.status IN ('SETTLED', 'RELEASED', 'REFUNDED', 'EXPIRED') THEN RAISE EXCEPTION 'ESCROW_STATE_REGRESSION_INVALID: escrow % is already %', OLD.id, OLD.status USING ERRCODE = 'P0001'; END IF;
   RETURN NEW;
 END;
-$$;
-DROP TRIGGER IF EXISTS azm_guard_smart_escrow_funding_transition ON "SmartEscrow";
-CREATE TRIGGER azm_guard_smart_escrow_funding_transition BEFORE UPDATE OF status ON "SmartEscrow" FOR EACH ROW WHEN (NEW.status = 'FUNDED' OR NEW.status = 'PENDING_SETTLEMENT') EXECUTE FUNCTION azm_guard_smart_escrow_funding_transition()`,);
+$$`);
+
+  await run('install SmartEscrow funding/state guard trigger', `CREATE OR REPLACE TRIGGER azm_guard_smart_escrow_funding_transition BEFORE UPDATE OF status ON "SmartEscrow" FOR EACH ROW WHEN (NEW.status = 'FUNDED' OR NEW.status = 'PENDING_SETTLEMENT') EXECUTE FUNCTION azm_guard_smart_escrow_funding_transition()`,);
 
   return { ok: true, steps };
 }

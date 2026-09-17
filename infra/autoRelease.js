@@ -19,6 +19,9 @@ const releaseStatus = {
   overlayInstalled: null,
   quoteOverlayInstalled: null,
   retailCheckoutIntegrityInstalled: null,
+  driftRemediationInstalled: null,
+  driftRemediationResult: null,
+  driftRemediationErrors: null,
   installerResult: null,
   quoteInstallerResult: null,
   retailCheckoutIntegrityResult: null,
@@ -60,6 +63,27 @@ async function autoRelease(prisma, opts = {}) {
       releaseStatus.retailCheckoutIntegrityInstalled = false;
       releaseStatus.retailCheckoutIntegrityErrors = [e.message];
       log(`retail checkout integrity failed (non-fatal): ${e.message}`);
+    }
+
+    // Prod schema-drift remediation (PR #267): converge the Prisma-model
+    // objects (dedupKey, stakeBalance, BusinessOrderItem, OVERPAYMENT_FREEZE)
+    // and the hand-written CHECK constraints (NOT VALID + VALIDATE) that
+    // production never received. Idempotent — a no-op on converged DBs.
+    try {
+      const { installProdDriftRemediation } = require('./install-prod-drift-remediation');
+      const r = await installProdDriftRemediation(prisma);
+      releaseStatus.driftRemediationResult = r;
+      releaseStatus.driftRemediationInstalled = r.ok === true;
+      if (r.pendingValidation && r.pendingValidation.length) {
+        releaseStatus.driftRemediationErrors = r.pendingValidation
+          .map((pv) => `${pv.constraint} on ${pv.table}: ${pv.violations ?? pv.error}`)
+          .slice(0, 10);
+      }
+      log(`prod drift remediation: ok=${r.ok}, pending validation=${(r.pendingValidation || []).length}`);
+    } catch (e) {
+      releaseStatus.driftRemediationInstalled = false;
+      releaseStatus.driftRemediationErrors = [e.message];
+      log(`prod drift remediation failed (non-fatal): ${e.message}`);
     }
 
     try {
