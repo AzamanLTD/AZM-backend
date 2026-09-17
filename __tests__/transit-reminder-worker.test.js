@@ -119,7 +119,11 @@ describeOrSkip('Transit reminder worker (sweepTransitReminders)', () => {
             expect(n.title).toBe(`Trip departing soon: ${trip.routeName}`);
             expect(n.body).toContain('Kumasi');
             // Stored seat identifiers appear verbatim in the reminder body.
-            expect(n.body).toContain('Seat(s): 1A, 2B.');
+            // (Seat row order is not deterministic — Prisma returns them
+            // unordered — so compare the parsed list as a set.)
+            const seatMatch = n.body.match(/Seat\(s\): ([^.]+)\./);
+            expect(seatMatch).not.toBeNull();
+            expect(seatMatch[1].split(', ').sort()).toEqual(['1A', '2B'].sort());
             expect(n.category).toBe('GENERAL');
             expect(n.actionPayload).toMatchObject({
                 action: 'TRANSIT_REMINDER',
@@ -143,8 +147,8 @@ describeOrSkip('Transit reminder worker (sweepTransitReminders)', () => {
                 routeName: trip.routeName,
                 origin: trip.origin,
                 destination: trip.destination,
-                seats: '1A, 2B',
             });
+            expect(String(emitted[0].payload.seats).split(', ').sort()).toEqual(['1A', '2B'].sort());
             expect(new Date(emitted[0].payload.departureAt).toISOString()).toBe(trip.departureAt.toISOString());
 
             // ── Second sweep: reminderSentAt gating must prevent a resend ────
