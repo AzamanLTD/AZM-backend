@@ -161,21 +161,36 @@ class AzmSpendService {
             }
         }
 
-        const user = await tx.user.findUnique({
-            where: { id: userId },
-            select: { azmBalance: true }
+        // DB-boundary CAS authorization (#265 pattern): the conditional
+        // UPDATE is the ONLY authorization — a racing spend between a read and
+        // a write can no longer slip past a stale balance snapshot. Zero
+        // affected rows means the live balance was below the amount at the
+        // moment of the claim (or the user does not exist); the fresh read
+        // below produces the exact historical error contract. The
+        // User_azmBalance_nonneg CHECK remains the belt-and-suspenders floor —
+        // this CAS guarantees a loser NEVER reaches it, so clients get the
+        // clean "Insufficient AZM balance" contract instead of a raw CHECK
+        // violation surfaced as a 500.
+        const claim = await tx.user.updateMany({
+            where: { id: userId, azmBalance: { gte: amount } },
+            data: { azmBalance: { decrement: amount } },
         });
 
-        if (!user) throw new Error('User not found.');
-        if (user.azmBalance < amount) {
+        if (claim.count === 0) {
+            const user = await tx.user.findUnique({
+                where: { id: userId },
+                select: { azmBalance: true }
+            });
+            if (!user) throw new Error('User not found.');
             throw new Error(
                 `Insufficient AZM balance. Required: ${amount}, available: ${user.azmBalance.toFixed(1)}`
             );
         }
 
-        const updatedUser = await tx.user.update({
+        // Authoritative post-debit balance inside this transaction — becomes
+        // the ledger's balanceAfter.
+        const updatedUser = await tx.user.findUnique({
             where: { id: userId },
-            data: { azmBalance: { decrement: amount } },
             select: { azmBalance: true }
         });
 

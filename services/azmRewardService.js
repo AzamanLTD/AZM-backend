@@ -94,61 +94,20 @@ class AzmRewardService {
                 return { credited: false, newBalance: 0, logId: null };
             }
 
-            // Idempotency fast path: prevent double-crediting for the same event.
-            // NOTE: this pre-check is an optimization, NOT the concurrency gate —
-            // two racing requests can both miss it. The actual gate is the DB-level
-            // @@unique([userId, source, dedupKey]) on AzmRewardLog: a racing
-            // duplicate log insert fails the unique index and the WHOLE enclosing
-            // transaction (balance increment included) rolls back; the P2002 is
-            // converged to the idempotent result in the catch below.
-            if (dedupKey) {
-                const existing = await this.prisma.azmRewardLog.findFirst({
-                    where: {
-                        userId,
-                        source,
-                        OR: [
-                            { dedupKey },
-                            { metadata: { path: ['dedupKey'], equals: dedupKey } }
-                        ]
-                    }
-                });
-                if (existing) {
-                    return { credited: false, newBalance: existing.balanceAfter, logId: existing.id };
-                }
+            // Standalone wrapper: own transaction, plus the historical
+            // fire-and-forget contract (errors are logged, never propagated).
+            // Composed atomic transfers must NOT use this method — they call
+            // _creditAzmWithClient inside the caller-owned transaction.
+            const result = await this.prisma.$transaction((tx) =>
+                this._creditAzmWithClient(tx, { userId, amount, source, reason, metadata, dedupKey })
+            );
+
+            // Emit socket event so FE updates in real-time (post-commit only)
+            if (result.credited) {
+                this._emitBalanceUpdate(userId, result.newBalance, amount, source, reason);
             }
 
-            // Atomic: increment balance + create log in one transaction
-            const result = await this.prisma.$transaction(async (tx) => {
-                const updatedUser = await tx.user.update({
-                    where: { id: userId },
-                    data: { azmBalance: { increment: amount } },
-                    select: { azmBalance: true }
-                });
-
-                const log = await tx.azmRewardLog.create({
-                    data: {
-                        userId,
-                        amount,
-                        source,
-                        reason,
-                        // Dedicated column claims the dedup identity (DB unique
-                        // gate); metadata keeps the legacy mirror for backward
-                        // compatibility with anything still reading metadata.
-                        dedupKey,
-                        metadata: dedupKey
-                            ? { ...metadata, dedupKey }
-                            : metadata,
-                        balanceAfter: updatedUser.azmBalance
-                    }
-                });
-
-                return { newBalance: updatedUser.azmBalance, logId: log.id };
-            });
-
-            // Emit socket event so FE updates in real-time
-            this._emitBalanceUpdate(userId, result.newBalance, amount, source, reason);
-
-            return { credited: true, ...result };
+            return result;
         } catch (err) {
             // Concurrency gate tripped: this racing request LOST the DB unique
             // race, so its transaction — balance increment included — rolled
@@ -174,6 +133,83 @@ class AzmRewardService {
             logger.error(`[AzmRewardService.creditAzm] userId=${userId} source=${source} error:`, err.message);
             return { credited: false, newBalance: 0, logId: null };
         }
+    }
+
+    /**
+     * Transaction-client primitive for an AZM credit. Runs the ENTIRE credit
+     * (dedup lookup, atomic balance increment, AzmRewardLog create) against an
+     * ALREADY-OPEN Prisma transaction client — it never opens a transaction of
+     * its own. This is what lets a caller commit an AZM credit atomically with
+     * its own financial writes (e.g. the gift transfer's debit + credit + gift
+     * record in ONE transaction).
+     *
+     * Contract differences vs public creditAzm():
+     *   - PROPAGATES every error (fail-closed). Non-P2002 failures abort the
+     *     caller's transaction — they are NEVER swallowed. A P2002 on the
+     *     (userId, source, dedupKey) unique index also propagates so the caller
+     *     can converge to the winner's committed result AFTER the rollback.
+     *   - Performs NO socket emission — the outer transaction may still roll
+     *     back; callers emit only after their transaction commits.
+     *
+     * @param {object} tx - open Prisma transaction client
+     * @param {object} params - same shape as creditAzm()
+     * @returns {Promise<{credited: boolean, newBalance: number, logId: string|null}>}
+     */
+    async _creditAzmWithClient(tx, { userId, amount, source, reason, metadata = null, dedupKey = null }) {
+        if (!userId || !amount || amount <= 0 || !source || !reason) {
+            throw new Error('Invalid reward parameters.');
+        }
+
+        // Idempotency fast path: prevent double-crediting for the same event.
+        // NOTE: this pre-check is an optimization, NOT the concurrency gate —
+        // two racing transactions can both miss it. The actual gate is the
+        // DB-level @@unique([userId, source, dedupKey]) on AzmRewardLog: a
+        // racing duplicate log insert fails the unique index and the WHOLE
+        // enclosing transaction (balance increment included) rolls back. The
+        // P2002 propagates so the caller converges after its own rollback.
+        if (dedupKey) {
+            const existing = await tx.azmRewardLog.findFirst({
+                where: {
+                    userId,
+                    source,
+                    OR: [
+                        { dedupKey },
+                        { metadata: { path: ['dedupKey'], equals: dedupKey } }
+                    ]
+                }
+            });
+            if (existing) {
+                return { credited: false, newBalance: existing.balanceAfter, logId: existing.id };
+            }
+        }
+
+        // Atomic increment + ledger row on the caller's transaction. The
+        // increment returns the authoritative post-credit balance, which
+        // becomes the ledger's balanceAfter.
+        const updatedUser = await tx.user.update({
+            where: { id: userId },
+            data: { azmBalance: { increment: amount } },
+            select: { azmBalance: true }
+        });
+
+        const log = await tx.azmRewardLog.create({
+            data: {
+                userId,
+                amount,
+                source,
+                reason,
+                // Dedicated column claims the dedup identity (DB unique
+                // gate); metadata keeps the legacy mirror for backward
+                // compatibility with anything still reading metadata.
+                dedupKey,
+                metadata: dedupKey
+                    ? { ...metadata, dedupKey }
+                    : metadata,
+                balanceAfter: updatedUser.azmBalance
+            }
+        });
+
+        return { credited: true, newBalance: updatedUser.azmBalance, logId: log.id };
     }
 
     // =========================================================================
