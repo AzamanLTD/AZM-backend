@@ -128,6 +128,7 @@ const ENTRY_TYPES = new Set([
   'VENDOR_TOPUP', 'VENDOR_ALLOCATE',
   'CUSTODY_VERIFICATION', 'CUSTODY_REJECTION',
   'ASSET_CONVERSION', // §P.5-A: explicit cross-asset exchange identity ONLY
+  'INVENTORY_ACQUISITION', // §P.5-B: USDC lot acquisition (single-asset USDC)
 ]);
 
 // Exact-decimal string: non-negative, ≤ 8 decimal places, no exponent.
