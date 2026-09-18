@@ -5853,6 +5853,45 @@ enum JournalEntryType {
   CUSTODY_VERIFICATION
   CUSTODY_REJECTION
   ASSET_CONVERSION // §P.5-A: the ONLY entry type that may mix asset identities (explicit conversion context required)
+  INVENTORY_ACQUISITION // §P.5-B: USDC inventory lot acquisition (single-asset; consumption economics deferred to P5-E)
+}
+
+// §P.5-B: authoritative USDC inventory lot — the immutable acquisition record.
+// CorporatePurchaseLog remains a read-only audit trail, NEVER lot authority.
+// consumed = quantityOriginal - quantityRemaining (exact, derived, never stored).
+enum InventoryLotStatus {
+  OPEN
+  CONSUMED
+}
+
+model InventoryLot {
+  id                Int                @id @default(autoincrement())
+  acquisitionKey    String             @unique @db.VarChar(140) // durable economic identity
+  sourceType        String             @db.VarChar(40) // e.g. CORPORATE_PURCHASE, GATEWAY_OTC
+  sourceReference   String             @db.VarChar(140) // evidence linkage to the source operation
+  quantityOriginal  Decimal            @db.Decimal(20, 8)
+  quantityRemaining Decimal            @db.Decimal(20, 8)
+  costBasisGhs      Decimal            @db.Decimal(20, 8) // exact GHS paid for the lot
+  acquisitionRate   Decimal?           @db.Decimal(18, 8) // GHS per USDC at acquisition (provenance)
+  ledgerTxnId       String? // LedgerTransaction.id of the inventory:usdc:lots acquisition posting
+  status            InventoryLotStatus @default(OPEN)
+  consumptions      InventoryLotConsumption[]
+  createdAt         DateTime           @default(now())
+}
+
+// §P.5-B: durable allocation/consumption movement — proves exactly which
+// economic operation consumed which lot quantity. Its ledger recognition
+// (COGS/pnl:inventory realization) is P5-E; no quote-only economics here.
+model InventoryLotConsumption {
+  id              Int             @id @default(autoincrement())
+  consumptionKey  String          @unique @db.VarChar(140) // durable idempotency identity
+  lotId           Int
+  lot             InventoryLot    @relation(fields: [lotId], references: [id])
+  quantity        Decimal         @db.Decimal(20, 8)
+  purpose         String          @db.VarChar(40)
+  sourceReference String?          @db.VarChar(140) // future Model B settlement evidence
+  ledgerTxnId     String? // set by P5-E settlement; null until economics are realized
+  createdAt       DateTime        @default(now())
 }
 
 model JournalEntry {
