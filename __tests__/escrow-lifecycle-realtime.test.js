@@ -41,7 +41,7 @@ describe('escrowService fundEscrow realtime convergence', () => {
             transactionHistory: { create: jest.fn().mockResolvedValue({}) },
             // §P.4 ledger posting surface — the authoritative settlement
             // posts inside the same (mocked) transaction.
-            ledgerAccount: { upsert: jest.fn().mockResolvedValue({}) },
+            ledgerAccount: { upsert: jest.fn(({ create }) => ({ ...create })) },
             ledgerTransaction: {
                 findUnique: jest.fn().mockResolvedValue(null),
                 create: jest.fn().mockResolvedValue({ id: 'lt-1', postingHash: 'h' }),
@@ -154,7 +154,7 @@ describe('escrowService markSatisfied realtime convergence (pending settlement)'
             transactionHistory: { create: jest.fn().mockResolvedValue({}) },
             // §P.4 ledger posting surface — the authoritative settlement
             // posts inside the same (mocked) transaction.
-            ledgerAccount: { upsert: jest.fn().mockResolvedValue({}) },
+            ledgerAccount: { upsert: jest.fn(({ create }) => ({ ...create })) },
             ledgerTransaction: {
                 findUnique: jest.fn().mockResolvedValue(null),
                 create: jest.fn().mockResolvedValue({ id: 'lt-1', postingHash: 'h' }),
@@ -216,7 +216,7 @@ describe('escrowService _releaseEscrow realtime convergence (settled)', () => {
             transactionHistory: { create: jest.fn().mockResolvedValue({}) },
             // §P.4 ledger posting surface — the authoritative settlement
             // posts inside the same (mocked) transaction.
-            ledgerAccount: { upsert: jest.fn().mockResolvedValue({}) },
+            ledgerAccount: { upsert: jest.fn(({ create }) => ({ ...create })) },
             ledgerTransaction: {
                 findUnique: jest.fn().mockResolvedValue(null),
                 create: jest.fn().mockResolvedValue({ id: 'lt-1', postingHash: 'h' }),
@@ -263,7 +263,7 @@ describe('escrowService _releaseEscrow realtime convergence (settled)', () => {
             transactionHistory: { create: jest.fn().mockResolvedValue({}) },
             // §P.4 ledger posting surface — the authoritative settlement
             // posts inside the same (mocked) transaction.
-            ledgerAccount: { upsert: jest.fn().mockResolvedValue({}) },
+            ledgerAccount: { upsert: jest.fn(({ create }) => ({ ...create })) },
             ledgerTransaction: {
                 findUnique: jest.fn().mockResolvedValue(null),
                 create: jest.fn().mockResolvedValue({ id: 'lt-1', postingHash: 'h' }),

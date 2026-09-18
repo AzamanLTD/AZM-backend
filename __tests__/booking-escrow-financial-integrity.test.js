@@ -64,7 +64,7 @@ function makeTx(overrides = {}) {
         // §P.4 ledger posting surface — the authoritative settlement now
         // runs inside the same mocked transaction.
         ledgerAccount: {
-            upsert: jest.fn().mockResolvedValue({}),
+            upsert: jest.fn(({ create }) => ({ ...create })),
         },
         ledgerTransaction: {
             findUnique: jest.fn().mockResolvedValue(null),

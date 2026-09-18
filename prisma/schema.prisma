@@ -5852,6 +5852,7 @@ enum JournalEntryType {
   VENDOR_ALLOCATE
   CUSTODY_VERIFICATION
   CUSTODY_REJECTION
+  ASSET_CONVERSION // §P.5-A: the ONLY entry type that may mix asset identities (explicit conversion context required)
 }
 
 model JournalEntry {
