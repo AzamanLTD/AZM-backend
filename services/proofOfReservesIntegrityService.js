@@ -9,29 +9,32 @@
 // ZERO authoritative reserve assets — they are legacy display mirrors and are
 // exposed only as clearly-labeled non-authoritative display values.
 //
-// The liability side is DENOMINATION-HONEST. User.availableBalance is a mixed
-// historical pool and is NEVER reinterpreted wholesale as USDC. The report
-// separates:
-//   X  usdcLiabilityTotal            — USDC-denominated customer obligation
-//                                      net external flows from authoritative
-//                                      TransactionHistory rows (crypto AND
-//                                      fiat-settled-in-USDC credits).
-//   Y  evidenceLinkedLiabilityTotal  — custody-evidence-backed subset
-//                                      (transaction-evidence-verified deposit
-//                                      movements minus evidence-gated crypto
-//                                      payouts).
-//   Z  unclassifiedExposure          — mixed-pool liability total minus X.
-//                                      Z > 0 means the pool contains claims the
-//                                      classification cannot explain; it forces
-//                                      the attestation to INCOMPLETE and the
-//                                      snapshot OUT of fully-backed status. It
-//                                      is NEVER silently dropped.
+// The liability side (§P.4 wave-3 DENOMINATOR AUTHORITY):
+//   customer — the materialized per-user liability projections (available +
+//              escrow + dispute + vendor-unallocated), ledger-reconciled by
+//              the reconciliation read model. CURRENT STATE, never derived
+//              from historical flow totals.
+//   restricted — persisted RestrictedObligation rows for PENDING EXTERNAL
+//              operations (the same reservation that moves the amount OUT of
+//              the customer projection). Counted EXACTLY ONCE.
+//   effective — customer + restricted: THE denominator. Every output field
+//              (isFullyBacked, reserveRatio, coverage, attestation,
+//              totalLiabilities, snapshot columns, breakdown) derives from
+//              this ONE value.
+//   flows     — classifyUsdcLiabilityFlows (X/Y/Z): RECONCILIATION /
+//              DIAGNOSTIC EVIDENCE ONLY. X is compared against the effective
+//              denominator (signed exact difference): X > effective is an
+//              explicit classification failure (UNATTESTABLE, fail closed);
+//              effective > X leaves an exact unclassified exposure (INCOMPLETE);
+//              equal is COMPLETE. Flows are NEVER the liability authority —
+//              a pending withdrawal reservation legitimately drops the
+//              customer projection below the historical flow total.
 //   A  eligibleReserveTotal          — evidence-backed eligible custody assets.
 //
 // Invariant target: REAL USDC ASSETS >= ALL CUSTOMER USDC LIABILITIES +
-// RESTRICTED OBLIGATIONS. Restricted obligations have no authoritative
-// persisted semantics yet — the boundary is explicit (null + available=false),
-// never zero-invented.
+// RESTRICTED OBLIGATIONS. Restricted obligations are persisted and
+// authoritative (§P.4); while ANY source family is not, the boundary is
+// explicit (null + available=false), never zero-invented.
 //
 // Fail-closed: with no accepted fresh evidence the snapshot records
 // EVIDENCE_UNAVAILABLE and is NOT fully backed. The previous reserve value is
@@ -97,115 +100,134 @@ function verifyMerkleProof(leafHash, proof, root) {
 
 // ── Pure coverage/report composition (regression-testable, exact) ───────────
 /**
- * Compose the §P.3 liability/reserve report from exact Decimal components.
+ * Compose the liability/reserve report from exact Decimal components.
  * Pure: no DB, no floats. Every component is a Prisma.Decimal or null.
  *
- * Fully backed requires ALL of:
- *   A >= X            (evidence-backed assets cover the classified obligation)
- *   Z === 0           (no unclassified exposure hiding in the mixed pool)
- *   evidenceHealthy   (every eligible account has fresh accepted evidence)
- * Restricted obligations are an explicit boundary (null = not yet modeled);
- * they are reported, never invented as zero, and do not silently relax the
- * invariant — closing that gap is §P.4+ work.
+ * §P.4-wave-3 DENOMINATOR AUTHORITY (canonical invariant):
+ *
+ *   REAL USDC ASSETS >= CUSTOMER USDC LIABILITIES + RESTRICTED OBLIGATIONS
+ *
+ * The denominator is defined ONCE here and every output field derives from
+ * the SAME value:
+ *   customerLiabilityTotal      — AUTHORITATIVE current customer liability:
+ *     the materialized per-user liability projections (available + escrow +
+ *     dispute + vendor-unallocated), which the reconciliation read model
+ *     enforces against the authoritative ledger for every ledger-active
+ *     user. This is a CURRENT STATE authority — it is never derived from
+ *     historical TransactionHistory flow totals.
+ *   restrictedObligationsTotal — pending EXTERNAL operation reservations
+ *     (provider payout / on-chain withdrawal), persisted as
+ *     RestrictedObligation rows in the same transaction as the ledger
+ *     reservation that moves the amount OUT of the customer's projection.
+ *     Counted here EXACTLY ONCE, as the separately modeled restricted
+ *     component. Internal escrow/dispute/vendor reclassifications stay
+ *     INSIDE customerLiabilityTotal (they are customer liability buckets)
+ *     and are never added here (no double counting).
+ *   effectiveObligationTotal    — customer + restricted: THE denominator,
+ *     null while restricted obligations are not authoritatively modeled
+ *     (fail closed: the unknown part is NEVER invented as zero).
+ *
+ * isFullyBacked requires ALL of:
+ *   effective denominator known (restricted modeled)
+ *   A >= effectiveObligationTotal
+ *   evidence healthy (fresh accepted balance evidence on every eligible account)
+ *   liabilityAttestation COMPLETE (flow reconciliation exact — see below)
+ *
+ * FLOW CLASSIFICATION IS RECONCILIATION/DIAGNOSTIC EVIDENCE ONLY. It is
+ * NEVER the liability authority: after a pending withdrawal reservation
+ * the historical flows legitimately still total the pre-reservation amount
+ * while the customer projection has already dropped. Flow divergence is
+ * therefore compared against the EFFECTIVE denominator, not the bare
+ * customer pool:
+ *   flowReconciliationDifference = X_flows − effectiveObligationTotal (signed)
+ *   difference > 0  → flows claim MORE than the authority covers:
+ *                     LIABILITY_FLOW_EXCEEDS_EFFECTIVE_OBLIGATION —
+ *                     UNATTESTABLE, fail closed (the pre-wave-3 code
+ *                     mis-fired this exact check against the bare mixed
+ *                     pool for every legitimate pending reservation).
+ *   difference < 0  → the authority holds liability the flows do not
+ *                     explain (unclassified exposure Z, exact signed) —
+ *                     INCOMPLETE, never silently dropped.
+ *   difference == 0 → exactly reconciled — COMPLETE.
+ *   flows unavailable (classification invalid) → UNATTESTABLE, fail closed.
  */
 function composeLiabilityReport({
-    usdcLiabilityTotal,        // X (Decimal)
-    evidenceLinkedTotal,       // Y signed (Decimal)
-    mixedPoolLiabilityTotal,   // legacy mixed pool total (Decimal)
+    customerLiabilityTotal,     // Decimal — AUTHORITATIVE customer liability (ledger-reconciled projections)
+    restrictedObligationsTotal, // Decimal | null — pending EXTERNAL operations, counted exactly once
+    flowLiabilityTotal,         // Decimal | null — X_flows (diagnostic evidence only)
+    flowClassificationStatus,   // 'OK' | 'NEGATIVE_LIABILITY_FLOW' | null
     eligibleReserveTotal,       // A (Decimal)
-    restrictedObligationsTotal,// Decimal | null
     evidenceHealthy,
     evidenceStatus,
 }) {
     const zero = new Prisma.Decimal(0);
-    // A null X means the classification itself is invalid (e.g. negative flow
-    // state) — it is NEVER reinterpreted as a valid zero; the attestation
-    // goes UNATTESTABLE and X is reported as null, signed raw value aside.
-    const Xvalid = usdcLiabilityTotal != null;
-    const X = Xvalid ? usdcLiabilityTotal : zero; // computation guard only
     const A = eligibleReserveTotal || zero;
-    const mixed = mixedPoolLiabilityTotal || zero;
-    const Ysigned = evidenceLinkedTotal || zero;
-    // EXACT SIGNED reconciliation difference (mixed pool − X). Never clamped,
-    // never reinterpreted — the diagnostics below keep the signed truth.
-    const Zraw = mixed.minus(X);
-    // FAIL CLOSED ON OVER-CLASSIFICATION: the classified USDC obligation (X)
-    // is drawn FROM the mixed-pool liability population, so it can never
-    // legitimately exceed it. X > mixed is an inconsistent, unreconciled
-    // classification — the old `Z = max(mixed - X, 0)` clamped the deficit to
-    // zero and let this impossible state attest COMPLETE. It must not: the
-    // classification fails closed with an explicit failure code, the
-    // attestation is UNATTESTABLE, fully backed is impossible, and the
-    // deficit is NEVER reinterpreted as a zero Z (Z is null — untrustworthy).
-    const liabilityFlowExceedsMixedPool = Xvalid && Zraw.lt(zero);
-    const Z = liabilityFlowExceedsMixedPool ? null : (Zraw.gt(zero) ? Zraw : zero);
+    const customer = customerLiabilityTotal || zero;
+    const restrictedKnown = restrictedObligationsTotal != null;
+    const R = restrictedObligationsTotal || zero;
+    // THE denominator — defined once, used by every output field below.
+    const effective = restrictedKnown ? customer.plus(R) : null;
+    const effectiveKnown = effective != null;
 
-    const coverageOfTotal = X.gt(zero) ? A.div(X) : null;
-    const coverageOfEvidenceLinked = Ysigned.gt(zero) ? A.div(Ysigned) : null;
+    // Flow reconciliation — DIAGNOSTIC EVIDENCE ONLY (see doc above). When
+    // restricted is unknown the comparison base degrades to the customer
+    // pool alone, but that state already fails closed on the unknown
+    // restricted component.
+    const flowsAvailable = flowLiabilityTotal != null;
+    const flowBase = effectiveKnown ? effective : customer;
+    const flowDifference = flowsAvailable ? flowLiabilityTotal.minus(flowBase) : null;
+    const flowsExceedAuthority = flowsAvailable && flowDifference.gt(zero);
+    // EXACT SIGNED exposure, never clamped, never reinterpreted. null when
+    // the flows are unavailable or over-classified — the exposure is NOT
+    // knowable from an inconsistent classification, never a false zero.
+    const Z = (flowsAvailable && !flowsExceedAuthority)
+        ? (flowDifference.lt(zero) ? flowDifference.neg() : zero)
+        : null;
 
-    // Attestation: COMPLETE only when nothing unexplained remains; INCOMPLETE
-    // when unclassified exposure exists; UNATTESTABLE if the classification
-    // itself could not be produced (caller passes null X) OR is inconsistent
-    // with the population it was drawn from (X > mixed pool — an explicit
-    // reconciliation failure, never a falsely clean zero).
-    const liabilityAttestation = (usdcLiabilityTotal == null || liabilityFlowExceedsMixedPool)
+    const liabilityAttestation = (!flowsAvailable || flowsExceedAuthority)
         ? 'UNATTESTABLE'
         : (Z.isZero() ? 'COMPLETE' : 'INCOMPLETE');
+    const classificationFailure = flowsExceedAuthority
+        ? 'LIABILITY_FLOW_EXCEEDS_EFFECTIVE_OBLIGATION'
+        : null;
 
     const healthy = Boolean(evidenceHealthy);
-    // FAIL CLOSED ON UNMODELED RESTRICTED OBLIGATIONS: the target invariant
-    // is REAL ASSETS >= ALL LIABILITIES + RESTRICTED. While restricted
-    // obligations are not authoritatively modeled (null), the complete
-    // denominator is UNKNOWN — a fully-backed claim is impossible, no matter
-    // how healthy the evidence or complete the classified liability is. The
-    // null/false boundary is preserved; nothing is invented as zero.
-    const restrictedKnown = restrictedObligationsTotal != null;
-    const isFullyBacked = restrictedKnown
-        && !liabilityFlowExceedsMixedPool
+    const isFullyBacked = effectiveKnown
         && healthy
         && liabilityAttestation === 'COMPLETE'
-        && (X.isZero() ? A.gte(zero) : A.gte(X));
+        && (effective.isZero() ? A.gte(zero) : A.gte(effective));
 
-    // Legacy percent fields (display only; exact comparisons above are the
-    // authority). reserveRatioPercent = A/X*100, or 100 when X==0 and nothing
-    // unexplained exists, or 0 when the denominator is unknown (Z>0, X==0).
+    // reserveRatioPercent = A / effectiveObligationTotal * 100 — the SAME
+    // denominator as isFullyBacked/totalLiabilities/coverage. 100 when the
+    // effective denominator is exactly zero, 0 only while the denominator
+    // is unknown (restricted unmodeled). The ratio is display-only; the
+    // exact comparisons above are the authority.
     let reserveRatioPercent;
-    if (!Xvalid || liabilityFlowExceedsMixedPool) {
-        // Invalid OR over-classified (unreconciled) classification — the
-        // legacy non-nullable percent column gets the same
-        // "denominator unknown → 0" value it already uses for Z>0, X==0; the
-        // honest state (UNATTESTABLE, null Z, explicit failure code, exact
-        // signed difference) lives in the attestation and §P.3 breakdown
-        // fields. The legacy ratio is NEVER allowed to look trustworthy on
-        // top of an inconsistent classification.
-        reserveRatioPercent = new Prisma.Decimal(0);
-    } else if (X.gt(zero)) {
-        reserveRatioPercent = A.div(X).mul(100).toDecimalPlaces(4);
-    } else if (Z.isZero()) {
-        reserveRatioPercent = new Prisma.Decimal(100);
+    if (!effectiveKnown) {
+        reserveRatioPercent = new Prisma.Decimal(0); // denominator unknown
+    } else if (effective.gt(zero)) {
+        reserveRatioPercent = A.div(effective).mul(100).toDecimalPlaces(4);
     } else {
-        reserveRatioPercent = new Prisma.Decimal(0);
+        reserveRatioPercent = new Prisma.Decimal(100);
     }
 
     return {
-        usdcLiabilityTotal: Xvalid ? usdcLiabilityTotal : null,
-        evidenceLinkedLiabilityTotal: Ysigned,
-        // null when the classification exceeds the pool — the exposure is NOT
-        // knowable from an inconsistent classification, never a false zero.
-        unclassifiedExposure: Z,
-        mixedPoolLiabilityTotal: mixed,
-        // Explicit reconciliation/classification failure — surfaced so no
-        // consumer has to infer it from sign comparisons. null when the
-        // classification is consistent.
-        classificationFailure: liabilityFlowExceedsMixedPool ? 'LIABILITY_FLOW_EXCEEDS_MIXED_POOL' : null,
-        // Exact signed diagnostic (mixed pool − X), always preserved raw.
-        mixedPoolLiabilityDifference: Zraw,
-        eligibleReserveTotal: A,
+        // Explicit authority statement — consumers never have to guess.
+        liabilityAuthority: 'MATERIALIZED_USER_PROJECTIONS_LEDGER_RECONCILED',
+        // THE denominator (null = restricted unmodeled, fail closed).
+        effectiveObligationTotal: effective,
+        customerLiabilityTotal: customer,
         restrictedObligationsTotal: restrictedObligationsTotal ?? null,
-        restrictedObligationsAvailable: restrictedObligationsTotal != null,
+        restrictedObligationsAvailable: restrictedKnown,
         restrictedObligationsKnown: restrictedKnown,
-        coverageOfTotalUsdcObligation: coverageOfTotal,
-        coverageOfEvidenceLinkedSubset: coverageOfEvidenceLinked,
+        // Diagnostic evidence — NOT the liability authority.
+        flowLiabilityTotal: flowsAvailable ? flowLiabilityTotal : null,
+        flowClassificationStatus: flowClassificationStatus ?? null,
+        flowReconciliationDifference: flowDifference,
+        classificationFailure,
+        unclassifiedExposure: Z,
+        eligibleReserveTotal: A,
+        coverageOfTotalUsdcObligation: (effectiveKnown && effective.gt(zero)) ? A.div(effective) : null,
         liabilityAttestation,
         evidenceStatus,
         isFullyBacked,
@@ -372,7 +394,6 @@ async function createSnapshot({ balanceProvider } = {}) {
         : (missing.length === 0 ? 'HEALTHY' : (accepted.length === 0 ? 'EVIDENCE_UNAVAILABLE' : 'PARTIAL'));
 
     // 5. Compose the honest report (exact Decimals).
-    const X = flows ? flows.usdcLiabilityTotal : null;
     // §P.4 AUTHORITATIVE RESTRICTED OBLIGATIONS: the denominator now has a
     // persisted authoritative source (RestrictedObligation rows created/
     // released in the same transactions as the ledger reservations).
@@ -382,12 +403,16 @@ async function createSnapshot({ balanceProvider } = {}) {
     // null — the fully-backed claim stays impossible (fail closed, the
     // unknown part is NEVER invented as zero).
     const restricted = await require('./restrictedObligationService').authoritativeTotals(prisma, { asset: 'USDC' });
+    // §P.4 wave-3 DENOMINATOR AUTHORITY: the current customer liability is
+    // the materialized projection population (loadLiabilityState), NEVER
+    // the historical TransactionHistory flow totals — flows are passed as
+    // reconciliation/diagnostic evidence only (see composeLiabilityReport).
     const report = composeLiabilityReport({
-        usdcLiabilityTotal: X,
-        evidenceLinkedTotal: flows ? flows.evidenceLinkedUsdcObligation : null,
-        mixedPoolLiabilityTotal: state.mixedPoolTotal,
-        eligibleReserveTotal,
+        customerLiabilityTotal: state.mixedPoolTotal,
         restrictedObligationsTotal: restricted.complete ? restricted.total : null,
+        flowLiabilityTotal: flows ? flows.usdcLiabilityTotal : null,
+        flowClassificationStatus: flows ? flows.liabilityClassificationStatus : null,
+        eligibleReserveTotal,
         evidenceHealthy: evidenceStatus === 'HEALTHY',
         evidenceStatus,
     });
@@ -426,9 +451,13 @@ async function createSnapshot({ balanceProvider } = {}) {
             data: {
                 // Legacy fields keep their historical shape (compatibility
                 // only); their §P.3 semantics are documented in breakdown.
-                totalLiabilities: state.mixedPoolTotal,   // mixed pool — unchanged population
-                totalReserves: report.eligibleReserveTotal, // NEW meaning: evidence-backed custody assets
-                reserveRatio: report.reserveRatioPercent,   // A/X*100 (exact-quantized display)
+                // §P.4 wave-3: totalLiabilities IS THE DENOMINATOR — the
+                // effective obligation (customer + restricted) whenever the
+                // restricted component is modeled; the bare customer pool
+                // only as an explicitly-flagged incomplete fallback.
+                totalLiabilities: report.effectiveObligationTotal ?? state.mixedPoolTotal,
+                totalReserves: report.eligibleReserveTotal, // evidence-backed custody assets
+                reserveRatio: report.reserveRatioPercent,   // A/effective*100 — SAME denominator as totalLiabilities
                 isFullyBacked: report.isFullyBacked,
                 userCount: leaves.length,
                 merkleRoot: root,
@@ -444,15 +473,30 @@ async function createSnapshot({ balanceProvider } = {}) {
                         mixedPoolDenomination: 'UNQUALIFIED — not USDC by construction',
                     },
                     usdcObligation: {
-                        usdcLiabilityTotal: report.usdcLiabilityTotal ? report.usdcLiabilityTotal.toString() : null,
-                        evidenceLinkedLiabilityTotal: report.evidenceLinkedLiabilityTotal ? report.evidenceLinkedLiabilityTotal.toString() : null,
-                        unclassifiedExposure: report.unclassifiedExposure ? report.unclassifiedExposure.toString() : null,
-                        // null Z here means the classification is inconsistent
-                        // (X > mixed pool) — the exposure is untrustworthy,
-                        // never a silently clamped zero.
+                        // §P.4 wave-3: the DENOMINATOR authority is the
+                        // materialized projection population + restricted
+                        // rows. Everything under flowReconciliation is
+                        // DIAGNOSTIC EVIDENCE ONLY — never the authority.
+                        authority: report.liabilityAuthority,
+                        effectiveObligationTotal: report.effectiveObligationTotal != null
+                            ? report.effectiveObligationTotal.toString()
+                            : null,
+                        customerLiabilityTotal: report.customerLiabilityTotal.toString(),
+                        restrictedObligationsTotal: report.restrictedObligationsTotal != null
+                            ? report.restrictedObligationsTotal.toString()
+                            : null,
                         liabilityAttestation: report.liabilityAttestation,
                         classificationFailure: report.classificationFailure,
-                        mixedPoolLiabilityDifference: report.mixedPoolLiabilityDifference.toString(),
+                        unclassifiedExposure: report.unclassifiedExposure != null
+                            ? report.unclassifiedExposure.toString()
+                            : null,
+                        // Flow reconciliation diagnostics (signed exact).
+                        flowLiabilityTotal: report.flowLiabilityTotal != null
+                            ? report.flowLiabilityTotal.toString()
+                            : null,
+                        flowReconciliationDifference: report.flowReconciliationDifference != null
+                            ? report.flowReconciliationDifference.toString()
+                            : null,
                         classificationStatus: flows ? flows.liabilityClassificationStatus : null,
                         components: flows ? {
                             usdcCredits: flows.usdcCredits.toString(),
@@ -472,6 +516,20 @@ async function createSnapshot({ balanceProvider } = {}) {
                             ? report.restrictedObligationsTotal.toString()
                             : null,
                         restrictedObligationsAvailable: report.restrictedObligationsAvailable,
+                        // Per-family observability: EXACTLY the obligation-row
+                        // families join the denominator; internal
+                        // reclassification families are reported for
+                        // observability but counted ONCE inside the customer
+                        // liability, never added again here.
+                        restrictedObligationFamilies: Object.fromEntries(
+                            Object.entries(restricted.families).map(([family, v]) => [family, {
+                                representation: v.representation,
+                                includedInDenominator: v.includedInDenominator,
+                                activeTotal: v.activeTotal.toString(),
+                                ledgerReclassificationTotal: v.ledgerReclassificationTotal != null
+                                    ? v.ledgerReclassificationTotal.toString() : null,
+                            }])
+                        ),
                         byTier: byTierDecimal,
                         legacySynthetic: {
                             note: 'NON-AUTHORITATIVE display mirrors — contribute ZERO reserve assets',
@@ -481,27 +539,47 @@ async function createSnapshot({ balanceProvider } = {}) {
                         },
                     },
                     coverage: {
+                        // Same denominator as the invariant (effective).
                         ofTotalUsdcObligation: report.coverageOfTotalUsdcObligation ? report.coverageOfTotalUsdcObligation.toString() : null,
-                        ofEvidenceLinkedSubset: report.coverageOfEvidenceLinkedSubset ? report.coverageOfEvidenceLinkedSubset.toString() : null,
                     },
                     invariant: {
                         target: 'REAL USDC ASSETS >= ALL CUSTOMER USDC LIABILITIES + RESTRICTED OBLIGATIONS',
                         satisfied: report.isFullyBacked,
                         restrictedObligationsModeled: restricted.complete,
-                        // Why fully-backed is impossible right now: an explicit
-                        // classification failure takes precedence; otherwise the
-                        // restricted component of the denominator is not modeled
-                        // (§P.4+).
+                        // THE denominator — the exact value the invariant
+                        // compares A against (null while restricted is
+                        // unmodeled: fail closed).
+                        effectiveObligationTotal: report.effectiveObligationTotal != null
+                            ? report.effectiveObligationTotal.toString()
+                            : null,
+                        reserveShortfall: (report.effectiveObligationTotal != null
+                            && report.eligibleReserveTotal.lt(report.effectiveObligationTotal))
+                            ? report.effectiveObligationTotal.minus(report.eligibleReserveTotal).toString()
+                            : '0',
+                        // Ordered, mutually exclusive reason the invariant
+                        // is NOT satisfied — one exact code, never a guess.
                         blockedBy: report.isFullyBacked
                             ? null
-                            : (report.classificationFailure
-                                ? report.classificationFailure
-                                : (report.restrictedObligationsKnown ? null : 'RESTRICTED_OBLIGATIONS_UNKNOWN')),
+                            : (!report.restrictedObligationsKnown
+                                ? 'RESTRICTED_OBLIGATIONS_UNKNOWN'
+                                : (report.classificationFailure
+                                    ? report.classificationFailure
+                                    : (report.liabilityAttestation === 'INCOMPLETE'
+                                        ? 'UNCLASSIFIED_FLOW_EXPOSURE'
+                                        : (report.evidenceStatus !== 'HEALTHY'
+                                            ? report.evidenceStatus
+                                            : 'INSUFFICIENT_RESERVES')))),
                     },
                 },
                 // §P.3 additive columns.
-                usdcLiabilityTotal: report.usdcLiabilityTotal, // null = classification invalid, fail closed
-                evidenceLinkedLiabilityTotal: report.evidenceLinkedLiabilityTotal,
+                // §P.4 wave-3: usdcLiabilityTotal IS THE DENOMINATOR — the
+                // effective obligation, consistent with totalLiabilities,
+                // reserveRatio, coverage and the invariant payload. null
+                // only while the restricted component is unmodeled (fail
+                // closed — never a flow total, never a false zero).
+                usdcLiabilityTotal: report.effectiveObligationTotal,
+                // Y — evidence-linked flow subset, DIAGNOSTIC ONLY.
+                evidenceLinkedLiabilityTotal: flows ? flows.evidenceLinkedUsdcObligation : null,
                 unclassifiedExposure: report.unclassifiedExposure,
                 eligibleReserveTotal: report.eligibleReserveTotal,
                 restrictedObligationsTotal: report.restrictedObligationsTotal,
@@ -519,15 +597,22 @@ async function createSnapshot({ balanceProvider } = {}) {
                     decimals: canonical.decimals,
                 },
                 liabilityBreakdown: {
-                    usdcLiabilityTotal: report.usdcLiabilityTotal ? report.usdcLiabilityTotal.toString() : null,
-                    evidenceLinkedLiabilityTotal: report.evidenceLinkedLiabilityTotal ? report.evidenceLinkedLiabilityTotal.toString() : null,
-                    unclassifiedExposure: report.unclassifiedExposure ? report.unclassifiedExposure.toString() : null,
-                    classificationFailure: report.classificationFailure,
-                    mixedPoolLiabilityDifference: report.mixedPoolLiabilityDifference.toString(),
-                    mixedPoolLiabilityTotal: state.mixedPoolTotal.toString(),
+                    authority: report.liabilityAuthority,
+                    effectiveObligationTotal: report.effectiveObligationTotal != null
+                        ? report.effectiveObligationTotal.toString() : null,
+                    customerLiabilityTotal: report.customerLiabilityTotal.toString(),
+                    restrictedObligationsTotal: report.restrictedObligationsTotal != null
+                        ? report.restrictedObligationsTotal.toString() : null,
                     eligibleReserveTotal: report.eligibleReserveTotal.toString(),
-                    coverageOfTotalUsdcObligation: report.coverageOfTotalUsdcObligation ? report.coverageOfTotalUsdcObligation.toString() : null,
-                    coverageOfEvidenceLinkedSubset: report.coverageOfEvidenceLinkedSubset ? report.coverageOfEvidenceLinkedSubset.toString() : null,
+                    coverageOfTotalUsdcObligation: report.coverageOfTotalUsdcObligation
+                        ? report.coverageOfTotalUsdcObligation.toString() : null,
+                    flowLiabilityTotal: report.flowLiabilityTotal != null
+                        ? report.flowLiabilityTotal.toString() : null,
+                    flowReconciliationDifference: report.flowReconciliationDifference != null
+                        ? report.flowReconciliationDifference.toString() : null,
+                    unclassifiedExposure: report.unclassifiedExposure != null
+                        ? report.unclassifiedExposure.toString() : null,
+                    classificationFailure: report.classificationFailure,
                 },
             },
         });

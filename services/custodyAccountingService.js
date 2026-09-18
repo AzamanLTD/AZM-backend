@@ -752,8 +752,12 @@ async function getFreshAcceptedEvidence(db, { custodyAccountId, maxAgeMs }) {
 // ── USDC liability flow classification (denomination-honest) ───────────────
 /**
  * Classify the USDC-denominated customer obligation from authoritative
- * TransactionHistory rows. This is a FLOW classification, NOT a re-interpretation
- * of the mixed balance pool:
+ * TransactionHistory rows. §P.4 wave-3: this is RECONCILIATION /
+ * DIAGNOSTIC EVIDENCE ONLY — it is NEVER the PoR liability authority
+ * (that is the materialized per-user liability projections + the
+ * persisted RestrictedObligation rows; see
+ * proofOfReservesIntegrityService.composeLiabilityReport). This is a FLOW
+ * classification, NOT a re-interpretation of the mixed balance pool:
  *
  *   X (usdcLiabilityTotal) = classified USDC-denominated external credits
  *         (DEPOSIT_CRYPTO + USDC-settled DEPOSIT_FIAT quote paths, COMPLETED)

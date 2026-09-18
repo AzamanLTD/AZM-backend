@@ -101,36 +101,128 @@ async function reconcileUserProjections(db, { limit = 1000 } = {}) {
 }
 
 /**
- * Custody reconciliation: authoritative ledger custody-asset postings against
- * the §P.3 CustodyMovement truth (exact base-unit comparison).
- *   custody:deposit:usdc balance == sum(DEPOSIT_IN movements, any status)
- *   custody:hot:usdc   balance == verified deposits swept in are NOT yet
- *     modelled (sweep accounting is a later wave) — hot balance reflects
- *     withdrawal settlements only, so this check compares
- *     sum(WITHDRAWAL_OUT movements) + fee-economics detail is reported.
- * Any disagreement is an exception with the signed exact difference.
+ * Custody reconciliation (§P.4 wave-3): the ledger custody/clearing accounts
+ * are reconciled against the §P.3 CustodyMovement truth RESPECTING the
+ * evidence boundary:
+ *   CANDIDATE = provisional/unverified observation
+ *   VERIFIED  = authoritative custody
+ *   FAILED    = rejected/unresolved custody exposure
+ *
+ * Ledger accounts and their exact expected populations:
+ *   custody:deposit:usdc          == Σ VERIFIED deposits WITH a provisional
+ *                                     journal (webhook-credited deposits
+ *                                     reclassified on verification)
+ *   clearing:custody:unverified   == Σ CANDIDATE deposits WITH a provisional
+ *                                     journal + Σ provisional journals that
+ *                                     have NO custody movement yet (webhook
+ *                                     credit still awaiting a custody
+ *                                     candidate — e.g. the legacy observation
+ *                                     route; reported explicitly, never
+ *                                     silently normalized)
+ *   clearing:custody:rejected      == Σ FAILED deposits WITH a prior
+ *                                     provisional credit
+ *
+ * Service-direct movements (P3 tests, backfilled historical candidates) have
+ * NO provisional journal and therefore NO ledger presence — the P3 invariant
+ * "transaction evidence alone creates NO custody journal" holds; they are
+ * reported as explicit withoutJournal components, never exceptions.
+ * Any disagreement is an exception with the exact signed difference — never
+ * a silent normalization.
  */
 async function reconcileCustodyPostings(db) {
   const exceptions = [];
-  const decimalFromBaseUnits = (base) => new Prisma.Decimal(String(base)).dividedBy(new Prisma.Decimal('1000000'));
+  const zeroD = zero();
+  const baseToDecimal = (base) => new Prisma.Decimal(String(base)).dividedBy(new Prisma.Decimal('1000000'));
+  const PROVISIONAL_PREFIX = 'ledger:deposit:crypto:';
 
-  const depositLedger = await ledger.accountBalance(db, 'custody:deposit:usdc');
-  const depositMovements = await db.custodyMovement.aggregate({
-    where: { kind: 'DEPOSIT_IN' },
-    _sum: { amountBaseUnits: true },
+  // 1. Provisional journals (webhook credits) keyed by txHash.
+  const provisionalJournals = await db.ledgerTransaction.findMany({
+    where: { idempotencyKey: { startsWith: PROVISIONAL_PREFIX } },
+    select: { id: true, idempotencyKey: true },
   });
-  const depositMovementsDec = depositMovements._sum.amountBaseUnits
-    ? decimalFromBaseUnits(depositMovements._sum.amountBaseUnits) : zero();
-  if (!depositLedger.balance.eq(depositMovementsDec)) {
-    exceptions.push({
-      kind: 'CUSTODY_LEDGER_DISAGREEMENT',
-      account: 'custody:deposit:usdc',
-      ledgerBalance: depositLedger.balance.toFixed(8),
-      custodyMovements: depositMovementsDec.toFixed(8),
-      difference: depositMovementsDec.minus(depositLedger.balance).toFixed(8),
-    });
+  const journalTxHashes = new Set(provisionalJournals.map(j => j.idempotencyKey.slice(PROVISIONAL_PREFIX.length)));
+
+  // 2. The exact provisional amount per journal = its clearing debit line.
+  const debitLines = await db.journalEntry.groupBy({
+    by: ['ledgerTransactionId'],
+    where: { account: 'clearing:custody:unverified:usdc', ledgerTransactionId: { not: null } },
+    _sum: { debit: true },
+  });
+  const debitByJournalId = new Map(debitLines.map(l => [l.ledgerTransactionId, l._sum.debit || zeroD]));
+
+  // 3. Partition DEPOSIT_IN movements by status × journal presence.
+  const movements = await db.custodyMovement.findMany({
+    where: { kind: 'DEPOSIT_IN' },
+    select: { txHash: true, status: true, amountBaseUnits: true },
+  });
+  const buckets = {
+    VERIFIED:  { withJournal: 0n, withoutJournal: 0n, withJournalCount: 0, withoutJournalCount: 0 },
+    CANDIDATE: { withJournal: 0n, withoutJournal: 0n, withJournalCount: 0, withoutJournalCount: 0 },
+    FAILED:    { withJournal: 0n, withoutJournal: 0n, withJournalCount: 0, withoutJournalCount: 0 },
+  };
+  const movementTxHashes = new Set(movements.map(m => m.txHash));
+  for (const m of movements) {
+    const b = buckets[m.status];
+    if (!b) continue; // unknown status — not a deposit population; ignored by this read model
+    const hasJournal = journalTxHashes.has(m.txHash);
+    if (hasJournal) {
+      b.withJournal += BigInt(m.amountBaseUnits);
+      b.withJournalCount += 1;
+    } else {
+      b.withoutJournal += BigInt(m.amountBaseUnits);
+      b.withoutJournalCount += 1;
+    }
   }
-  return { exceptions };
+
+  // 4. Provisional journals with NO movement — untracked provisional credit.
+  let untrackedProvisional = zeroD;
+  let untrackedProvisionalCount = 0;
+  for (const j of provisionalJournals) {
+    const txHash = j.idempotencyKey.slice(PROVISIONAL_PREFIX.length);
+    if (!movementTxHashes.has(txHash)) {
+      untrackedProvisional = untrackedProvisional.plus(debitByJournalId.get(j.id) || zeroD);
+      untrackedProvisionalCount += 1;
+    }
+  }
+
+  // 5. Expected balances (exact Decimal) vs the authoritative ledger.
+  const expected = {
+    'custody:deposit:usdc': baseToDecimal(buckets.VERIFIED.withJournal),
+    'clearing:custody:unverified:usdc': baseToDecimal(buckets.CANDIDATE.withJournal).plus(untrackedProvisional),
+    'clearing:custody:rejected:usdc': baseToDecimal(buckets.FAILED.withJournal),
+  };
+  for (const [account, expectedTotal] of Object.entries(expected)) {
+    const actual = await ledger.accountBalance(db, account);
+    if (!actual.balance.eq(expectedTotal)) {
+      exceptions.push({
+        kind: 'CUSTODY_LEDGER_DISAGREEMENT',
+        account,
+        ledgerBalance: actual.balance.toFixed(8),
+        expectedFromCustodyMovements: expectedTotal.toFixed(8),
+        difference: expectedTotal.minus(actual.balance).toFixed(8), // signed exact
+      });
+    }
+  }
+
+  return {
+    exceptions,
+    custody: {
+      account: 'custody:deposit:usdc',
+      verifiedWithJournal: { count: buckets.VERIFIED.withJournalCount, total: baseToDecimal(buckets.VERIFIED.withJournal).toFixed(8) },
+      verifiedWithoutJournal: { count: buckets.VERIFIED.withoutJournalCount, total: baseToDecimal(buckets.VERIFIED.withoutJournal).toFixed(8) },
+    },
+    unverified: {
+      account: 'clearing:custody:unverified:usdc',
+      candidateWithJournal: { count: buckets.CANDIDATE.withJournalCount, total: baseToDecimal(buckets.CANDIDATE.withJournal).toFixed(8) },
+      candidateWithoutJournal: { count: buckets.CANDIDATE.withoutJournalCount, total: baseToDecimal(buckets.CANDIDATE.withoutJournal).toFixed(8) },
+      untrackedProvisional: { count: untrackedProvisionalCount, total: untrackedProvisional.toFixed(8) },
+    },
+    rejected: {
+      account: 'clearing:custody:rejected:usdc',
+      failedWithJournal: { count: buckets.FAILED.withJournalCount, total: baseToDecimal(buckets.FAILED.withJournal).toFixed(8) },
+      failedWithoutJournal: { count: buckets.FAILED.withoutJournalCount, total: baseToDecimal(buckets.FAILED.withoutJournal).toFixed(8) },
+    },
+  };
 }
 
 /**
@@ -245,6 +337,11 @@ async function runFullReconciliation(db) {
       checkedUsers: projections.checkedUsers,
       restricted: { obligationTotal: restricted.obligationTotal, ledgerReserves: restricted.ledgerReserves },
       clearing: { balance: clearing.balance, explainedBy: clearing.explainedBy },
+      custody: {
+        custodyAsset: custody.custody,
+        unverified: custody.unverified,
+        rejected: custody.rejected,
+      },
     },
     generatedAt: new Date().toISOString(),
   };

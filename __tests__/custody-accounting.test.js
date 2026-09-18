@@ -31,6 +31,9 @@ const { Prisma, PrismaClient } = require('@prisma/client');
 const custody = require('../services/tatumCustodyExecutionService');
 const accounting = require('../services/custodyAccountingService');
 const integrity = require('../services/proofOfReservesIntegrityService');
+const ledger = require('../services/ledgerService');
+const reconciliation = require('../services/ledgerReconciliationService');
+const restrictedObligations = require('../services/restrictedObligationService');
 const {
     createTatumTxByHashProvider,
     createTatumTokenBalanceProvider,
@@ -179,157 +182,165 @@ describe('§P.3 unit: provider response parsing fails closed', () => {
     });
 });
 
-describe('§P.3 unit: pure liability report composition', () => {
+describe('§P.4 wave-3 unit: pure liability report composition — denominator authority', () => {
     const compose = integrity.composeLiabilityReport;
+    // §P.4 wave-3: the denominator is defined ONCE (customer + restricted)
+    // and every field derives from it. Flows are diagnostic evidence ONLY.
 
-    it('restricted obligations UNMODELED (null): even A >= X, Z == 0, healthy is NOT fully backed — fail closed', () => {
-        // The invariant is REAL ASSETS >= ALL LIABILITIES + RESTRICTED. With
-        // the restricted component unknown, the complete denominator is
-        // unknown — a fully-backed claim is impossible until §P.4+ models it.
+    it('A: 100 liability, no restriction → fully backed when 100 real reserve exists', () => {
         const r = compose({
-            usdcLiabilityTotal: D(100),
-            evidenceLinkedTotal: D(80),
-            mixedPoolLiabilityTotal: D(100),
-            eligibleReserveTotal: D(150),
-            restrictedObligationsTotal: null,
-            evidenceHealthy: true,
-            evidenceStatus: 'HEALTHY',
+            customerLiabilityTotal: D(100),
+            restrictedObligationsTotal: D(0),
+            flowLiabilityTotal: D(100),
+            flowClassificationStatus: 'OK',
+            eligibleReserveTotal: D(100),
+            evidenceHealthy: true, evidenceStatus: 'HEALTHY',
         });
-        expect(r.isFullyBacked).toBe(false); // never while restricted is unmodeled
+        expect(r.effectiveObligationTotal.toString()).toBe('100'); // THE denominator
+        expect(r.isFullyBacked).toBe(true);
+        expect(r.liabilityAttestation).toBe('COMPLETE');
+        expect(r.reserveRatioPercent.toString()).toBe('100'); // same denominator
+        expect(r.coverageOfTotalUsdcObligation.toString()).toBe('1');
+        expect(r.flowReconciliationDifference.toString()).toBe('0');
+        expect(r.classificationFailure).toBe(null);
+    });
+
+    it('B: pending external withdrawal — customer 90 + restricted 10 = effective 100, no false flow failure, exactly-once counting', () => {
+        const r = compose({
+            customerLiabilityTotal: D(90),   // reservation moved 10 OUT of available
+            restrictedObligationsTotal: D(10),
+            flowLiabilityTotal: D(100),      // flows legitimately still total the pre-reservation amount
+            flowClassificationStatus: 'OK',
+            eligibleReserveTotal: D(100),
+            evidenceHealthy: true, evidenceStatus: 'HEALTHY',
+        });
+        expect(r.effectiveObligationTotal.toString()).toBe('100'); // counted exactly once
+        // THE pre-wave-3 false failure: flows (100) > mixed pool (90) fired
+        // LIABILITY_FLOW_EXCEEDS_MIXED_POOL. Against the EFFECTIVE
+        // denominator the state is exactly reconciled.
+        expect(r.classificationFailure).toBe(null);
+        expect(r.flowReconciliationDifference.toString()).toBe('0');
+        expect(r.liabilityAttestation).toBe('COMPLETE');
+        expect(r.isFullyBacked).toBe(true); // 100 real reserve satisfies the invariant
+        expect(r.reserveRatioPercent.toString()).toBe('100');
+        // The restricted component is reported separately, never folded into
+        // the customer liability and never double counted.
+        expect(r.customerLiabilityTotal.toString()).toBe('90');
+        expect(r.restrictedObligationsTotal.toString()).toBe('10');
+    });
+
+    it('C: internal reclassification stays inside customer liability — restricted denominator unchanged', () => {
+        // 90 available + 10 escrow-locked (internal bucket move): total
+        // customer obligation unchanged, restricted component unchanged.
+        const before = compose({
+            customerLiabilityTotal: D(90),
+            restrictedObligationsTotal: D(10),
+            flowLiabilityTotal: D(100),
+            flowClassificationStatus: 'OK',
+            eligibleReserveTotal: D(100),
+            evidenceHealthy: true, evidenceStatus: 'HEALTHY',
+        });
+        const after = compose({
+            customerLiabilityTotal: D(90), // same total — bucket composition is internal
+            restrictedObligationsTotal: D(10), // restricted denominator does NOT grow
+            flowLiabilityTotal: D(100),
+            flowClassificationStatus: 'OK',
+            eligibleReserveTotal: D(100),
+            evidenceHealthy: true, evidenceStatus: 'HEALTHY',
+        });
+        expect(after.effectiveObligationTotal.eq(before.effectiveObligationTotal)).toBe(true);
+        expect(after.restrictedObligationsTotal.toString()).toBe('10');
+        expect(after.isFullyBacked).toBe(true);
+    });
+
+    it('D: insufficient reserve fails closed with the EXACT effective denominator', () => {
+        const r = compose({
+            customerLiabilityTotal: D(90),
+            restrictedObligationsTotal: D(10),
+            flowLiabilityTotal: D(100),
+            flowClassificationStatus: 'OK',
+            eligibleReserveTotal: D(99), // 1 short of the effective 100
+            evidenceHealthy: true, evidenceStatus: 'HEALTHY',
+        });
+        expect(r.isFullyBacked).toBe(false);
+        expect(r.effectiveObligationTotal.toString()).toBe('100'); // exact denominator preserved
+        expect(r.reserveRatioPercent.toString()).toBe('99'); // same denominator, honest ratio
+        expect(r.coverageOfTotalUsdcObligation.toString()).toBe('0.99');
+        expect(r.liabilityAttestation).toBe('COMPLETE'); // authority is fine — the RESERVE is short
+    });
+
+    it('restricted obligations UNMODELED (null): denominator unknown — fail closed, never invented as zero', () => {
+        const r = compose({
+            customerLiabilityTotal: D(100),
+            restrictedObligationsTotal: null,
+            flowLiabilityTotal: D(100),
+            flowClassificationStatus: 'OK',
+            eligibleReserveTotal: D(150),
+            evidenceHealthy: true, evidenceStatus: 'HEALTHY',
+        });
+        expect(r.effectiveObligationTotal).toBe(null); // denominator unknown
+        expect(r.isFullyBacked).toBe(false);
         expect(r.restrictedObligationsAvailable).toBe(false);
-        expect(r.liabilityAttestation).toBe('COMPLETE'); // the classified part is still complete
-        expect(r.coverageOfTotalUsdcObligation.toString()).toBe('1.5');
-        expect(r.reserveRatioPercent.toString()).toBe('150');
+        expect(r.reserveRatioPercent.toString()).toBe('0'); // unknown denominator never looks trustworthy
+        // Attestation still classifies the flow evidence honestly.
+        expect(r.liabilityAttestation).toBe('COMPLETE');
         // Once restricted obligations become authoritative, the same healthy
         // state IS fully backed — the gate is the unknown boundary itself.
         const modeled = compose({
-            usdcLiabilityTotal: D(100),
-            evidenceLinkedTotal: D(80),
-            mixedPoolLiabilityTotal: D(100),
-            eligibleReserveTotal: D(150),
+            customerLiabilityTotal: D(100),
             restrictedObligationsTotal: D(0),
-            evidenceHealthy: true,
-            evidenceStatus: 'HEALTHY',
+            flowLiabilityTotal: D(100),
+            flowClassificationStatus: 'OK',
+            eligibleReserveTotal: D(150),
+            evidenceHealthy: true, evidenceStatus: 'HEALTHY',
         });
         expect(modeled.restrictedObligationsAvailable).toBe(true);
         expect(modeled.isFullyBacked).toBe(true);
     });
 
-    it('unclassified exposure forces INCOMPLETE and breaks fully-backed even with A >= X', () => {
+    it('authority holds liability the flows cannot explain → INCOMPLETE (unclassified exposure, exact)', () => {
         const r = compose({
-            usdcLiabilityTotal: D(100),
-            evidenceLinkedTotal: D(80),
-            mixedPoolLiabilityTotal: D(130), // 30 unexplained in the mixed pool
+            customerLiabilityTotal: D(130), // 30 above what the flows explain
+            restrictedObligationsTotal: D(0),
+            flowLiabilityTotal: D(100),
+            flowClassificationStatus: 'OK',
             eligibleReserveTotal: D(150),
-            restrictedObligationsTotal: null,
-            evidenceHealthy: true,
-            evidenceStatus: 'HEALTHY',
+            evidenceHealthy: true, evidenceStatus: 'HEALTHY',
         });
         expect(r.unclassifiedExposure.toString()).toBe('30');
+        expect(r.flowReconciliationDifference.toString()).toBe('-30'); // signed exact
         expect(r.liabilityAttestation).toBe('INCOMPLETE');
-        expect(r.isFullyBacked).toBe(false); // Z is NEVER dropped from the denominator
+        expect(r.isFullyBacked).toBe(false); // never silently dropped from the attestation
     });
 
-    it('A < X is not fully backed even with Z == 0', () => {
+    it('flows exceeding the EFFECTIVE denominator (not the bare pool) → explicit failure, UNATTESTABLE, never a falsely clean zero', () => {
+        // X_flows = 150, customer pool = 100, restricted = 0 → effective 100.
+        // The flows claim more than the authority covers — an inconsistent
+        // history that must fail closed. (Pre-wave-3 this fired against the
+        // bare mixed pool; the comparison base is now the full denominator.)
         const r = compose({
-            usdcLiabilityTotal: D(100),
-            evidenceLinkedTotal: D(80),
-            mixedPoolLiabilityTotal: D(100),
-            eligibleReserveTotal: D(99),
-            restrictedObligationsTotal: null,
-            evidenceHealthy: true,
-            evidenceStatus: 'HEALTHY',
-        });
-        expect(r.isFullyBacked).toBe(false);
-        expect(r.reserveRatioPercent.toString()).toBe('99');
-    });
-
-    it('restricted obligations are an explicit boundary — never invented as zero', () => {
-        const r = compose({
-            usdcLiabilityTotal: D(100), evidenceLinkedTotal: D(80), mixedPoolLiabilityTotal: D(100),
-            eligibleReserveTotal: D(150), restrictedObligationsTotal: null,
+            customerLiabilityTotal: D(100),
+            restrictedObligationsTotal: D(0),
+            flowLiabilityTotal: D(150),
+            flowClassificationStatus: 'OK',
+            eligibleReserveTotal: D(200),
             evidenceHealthy: true, evidenceStatus: 'HEALTHY',
         });
-        expect(r.restrictedObligationsTotal).toBe(null);
-        expect(r.restrictedObligationsAvailable).toBe(false);
-    });
-
-    it('X === 0 with nothing unexplained: ratio 100, fully backed only once restricted is modeled', () => {
-        const r = compose({
-            usdcLiabilityTotal: D(0), evidenceLinkedTotal: D(0), mixedPoolLiabilityTotal: D(0),
-            eligibleReserveTotal: D(10), restrictedObligationsTotal: null,
-            evidenceHealthy: true, evidenceStatus: 'HEALTHY',
-        });
-        expect(r.reserveRatioPercent.toString()).toBe('100');
-        expect(r.isFullyBacked).toBe(false); // restricted component still unknown
-        expect(r.coverageOfTotalUsdcObligation).toBe(null); // undefined coverage is explicit
-        const modeled = compose({
-            usdcLiabilityTotal: D(0), evidenceLinkedTotal: D(0), mixedPoolLiabilityTotal: D(0),
-            eligibleReserveTotal: D(10), restrictedObligationsTotal: D(0),
-            evidenceHealthy: true, evidenceStatus: 'HEALTHY',
-        });
-        expect(modeled.isFullyBacked).toBe(true);
-    });
-
-    it('X === 0 but Z > 0: denominator unknown → ratio 0, fail-closed', () => {
-        const r = compose({
-            usdcLiabilityTotal: D(0), evidenceLinkedTotal: D(0), mixedPoolLiabilityTotal: D(50),
-            eligibleReserveTotal: D(10), restrictedObligationsTotal: null,
-            evidenceHealthy: true, evidenceStatus: 'HEALTHY',
-        });
-        expect(r.unclassifiedExposure.toString()).toBe('50');
-        expect(r.liabilityAttestation).toBe('INCOMPLETE');
-        expect(r.reserveRatioPercent.toString()).toBe('0');
-        expect(r.isFullyBacked).toBe(false);
-    });
-
-    it('unhealthy evidence is not fully backed even with A >= X and Z == 0', () => {
-        const r = compose({
-            usdcLiabilityTotal: D(100), evidenceLinkedTotal: D(80), mixedPoolLiabilityTotal: D(100),
-            eligibleReserveTotal: D(150), restrictedObligationsTotal: null,
-            evidenceHealthy: false, evidenceStatus: 'EVIDENCE_UNAVAILABLE',
-        });
-        expect(r.isFullyBacked).toBe(false);
-    });
-
-    it('classification failure (X unknown) → UNATTESTABLE, fail-closed', () => {
-        const r = compose({
-            usdcLiabilityTotal: null, evidenceLinkedTotal: null, mixedPoolLiabilityTotal: D(100),
-            eligibleReserveTotal: D(150), restrictedObligationsTotal: null,
-            evidenceHealthy: true, evidenceStatus: 'HEALTHY',
-        });
+        expect(r.classificationFailure).toBe('LIABILITY_FLOW_EXCEEDS_EFFECTIVE_OBLIGATION');
         expect(r.liabilityAttestation).toBe('UNATTESTABLE');
         expect(r.isFullyBacked).toBe(false);
-        expect(r.classificationFailure).toBe(null);
-    });
-
-    it('X > mixed pool: over-classified flow is an EXPLICIT failure — UNATTESTABLE, never a falsely clean zero (restricted obligations IRRELEVANT)', () => {
-        // Audit's exact scenario: X = 150 classified USDC obligation, mixed
-        // pool = 100. The old Z = max(mixed − X, 0) clamped the 50-unit
-        // deficit to zero and attested COMPLETE. Restricted obligations are
-        // MODELLED (D(0)) and evidence is healthy with A >= X, so the ONLY
-        // thing preventing a fully-backed claim is the inconsistent
-        // classification itself — and it must.
-        const r = compose({
-            usdcLiabilityTotal: D(150),
-            evidenceLinkedTotal: D(120),
-            mixedPoolLiabilityTotal: D(100),
-            eligibleReserveTotal: D(200), // A >= X — still not attestable
-            restrictedObligationsTotal: D(0), // modeled — irrelevant to this failure
-            evidenceHealthy: true,
-            evidenceStatus: 'HEALTHY',
-        });
-        expect(r.classificationFailure).toBe('LIABILITY_FLOW_EXCEEDS_MIXED_POOL');
-        expect(r.liabilityAttestation).toBe('UNATTESTABLE'); // NOT COMPLETE
-        expect(r.isFullyBacked).toBe(false);                 // never on an unreconciled classification
-        expect(r.unclassifiedExposure).toBe(null);           // the deficit is NOT reinterpreted as zero
-        expect(r.mixedPoolLiabilityDifference.toString()).toBe('-50'); // exact signed diagnostic
-        expect(r.usdcLiabilityTotal.toString()).toBe('150'); // X preserved exactly
-        expect(r.mixedPoolLiabilityTotal.toString()).toBe('100');
-        // The boundary case X == mixed is NOT a failure — exactly reconciled.
+        expect(r.unclassifiedExposure).toBe(null); // NOT reinterpreted as zero
+        expect(r.flowReconciliationDifference.toString()).toBe('50'); // exact signed diagnostic
+        // The denominator fields stay consistent with the authority.
+        expect(r.effectiveObligationTotal.toString()).toBe('100');
+        expect(r.reserveRatioPercent.toString()).toBe('200'); // A/effective*100 — SAME denominator
+        // The boundary case flows == effective is NOT a failure.
         const reconciled = compose({
-            usdcLiabilityTotal: D(150), evidenceLinkedTotal: D(120), mixedPoolLiabilityTotal: D(150),
-            eligibleReserveTotal: D(200), restrictedObligationsTotal: D(0),
+            customerLiabilityTotal: D(100),
+            restrictedObligationsTotal: D(0),
+            flowLiabilityTotal: D(100),
+            flowClassificationStatus: 'OK',
+            eligibleReserveTotal: D(200),
             evidenceHealthy: true, evidenceStatus: 'HEALTHY',
         });
         expect(reconciled.classificationFailure).toBe(null);
@@ -337,8 +348,58 @@ describe('§P.3 unit: pure liability report composition', () => {
         expect(reconciled.liabilityAttestation).toBe('COMPLETE');
         expect(reconciled.isFullyBacked).toBe(true);
     });
-});
 
+    it('flows unavailable (invalid classification) → UNATTESTABLE, fail closed', () => {
+        const r = compose({
+            customerLiabilityTotal: D(100),
+            restrictedObligationsTotal: D(0),
+            flowLiabilityTotal: null,
+            flowClassificationStatus: null,
+            eligibleReserveTotal: D(150),
+            evidenceHealthy: true, evidenceStatus: 'HEALTHY',
+        });
+        expect(r.liabilityAttestation).toBe('UNATTESTABLE');
+        expect(r.isFullyBacked).toBe(false);
+        expect(r.flowReconciliationDifference).toBe(null);
+        expect(r.classificationFailure).toBe(null); // flows are diagnostics — no false authority failure
+        expect(r.effectiveObligationTotal.toString()).toBe('100'); // authority still exact
+    });
+
+    it('unhealthy evidence is not fully backed even when A >= effective', () => {
+        const r = compose({
+            customerLiabilityTotal: D(100),
+            restrictedObligationsTotal: D(0),
+            flowLiabilityTotal: D(100),
+            flowClassificationStatus: 'OK',
+            eligibleReserveTotal: D(150),
+            evidenceHealthy: false, evidenceStatus: 'EVIDENCE_UNAVAILABLE',
+        });
+        expect(r.isFullyBacked).toBe(false);
+    });
+
+    it('zero effective obligation: ratio 100, fully backed only once restricted is modeled', () => {
+        const r = compose({
+            customerLiabilityTotal: D(0),
+            restrictedObligationsTotal: null,
+            flowLiabilityTotal: D(0),
+            flowClassificationStatus: 'OK',
+            eligibleReserveTotal: D(10),
+            evidenceHealthy: true, evidenceStatus: 'HEALTHY',
+        });
+        expect(r.isFullyBacked).toBe(false); // restricted component still unknown
+        expect(r.coverageOfTotalUsdcObligation).toBe(null); // undefined coverage is explicit
+        const modeled = compose({
+            customerLiabilityTotal: D(0),
+            restrictedObligationsTotal: D(0),
+            flowLiabilityTotal: D(0),
+            flowClassificationStatus: 'OK',
+            eligibleReserveTotal: D(10),
+            evidenceHealthy: true, evidenceStatus: 'HEALTHY',
+        });
+        expect(modeled.reserveRatioPercent.toString()).toBe('100');
+        expect(modeled.isFullyBacked).toBe(true);
+    });
+});
 describe('§P.3 unit: legacy synthetic coverage surface is unchanged and labeled', () => {
     it('fiat liquidity is still never counted as reserve backing, and is marked non-authoritative', () => {
         const result = integrity.calculateReserveCoverage({
@@ -1047,31 +1108,38 @@ describeOrSkip('§P.3 custody accounting (real PostgreSQL)', () => {
             expect(snapshot.restrictedObligationsAvailable).toBe(true);
         });
 
-        it('X > mixed pool (over-classified flows) fails closed — LIABILITY_FLOW_EXCEEDS_MIXED_POOL, never a falsely clean COMPLETE', async () => {
+        it('X > EFFECTIVE denominator (over-classified flows) fails closed — LIABILITY_FLOW_EXCEEDS_EFFECTIVE_OBLIGATION, never a falsely clean COMPLETE', async () => {
             const { user } = await seedAccountWithRegistry();
             // 150 classified USDC obligation (completed deposit flow)...
             await recordCandidateFlow(user, TX1, 150);
-            // ...but the mixed-pool liability population holds only 100 (a
-            // partial credit / inconsistent state). The classification
-            // EXCEEDS the population it was drawn from.
+            // ...but the liability AUTHORITY holds only 100 (a partial
+            // credit / inconsistent state). The classification EXCEEDS the
+            // effective denominator (customer 100 + restricted 0) it is
+            // reconciled against. §P.4 wave-3: the comparison base is the
+            // EFFECTIVE denominator, not the bare mixed pool.
             await prisma.user.update({ where: { id: user.id }, data: { availableBalance: 100 } });
 
-            // Fresh evidence is HEALTHY and A (200) >= X (150) — restricted
-            // obligations are irrelevant here: the inconsistent
-            // classification alone must block the attestation.
+            // Fresh evidence is HEALTHY and A (200) >= effective (100) — the
+            // inconsistent flow history alone must block the attestation.
             const { snapshot } = await integrity.createSnapshot({
                 balanceProvider: stubProviderMap({ [CUST]: '200000000', [HOT]: '0' }),
             });
-            expect(snapshot.usdcLiabilityTotal.toString()).toBe('150');   // X preserved exactly
             expect(snapshot.evidenceStatus).toBe('HEALTHY');              // the evidence is NOT the problem
-            expect(snapshot.eligibleReserveTotal.toString()).toBe('200');  // A >= X and still not attestable
+            expect(snapshot.eligibleReserveTotal.toString()).toBe('200');  // A >= effective and still not attestable
             expect(snapshot.liabilityAttestation).toBe('UNATTESTABLE');    // NOT COMPLETE
             expect(snapshot.isFullyBacked).toBe(false);
             expect(snapshot.unclassifiedExposure).toBe(null);              // the 50-unit deficit is NOT zero
-            expect(snapshot.breakdown.usdcObligation.classificationFailure).toBe('LIABILITY_FLOW_EXCEEDS_MIXED_POOL');
-            expect(snapshot.breakdown.usdcObligation.mixedPoolLiabilityDifference).toBe('-50'); // exact signed diagnostic
-            expect(snapshot.breakdown.invariant.blockedBy).toBe('LIABILITY_FLOW_EXCEEDS_MIXED_POOL');
-            expect(snapshot.reserveRatio.toString()).toBe('0');            // legacy mirror never looks trustworthy
+            expect(snapshot.breakdown.usdcObligation.classificationFailure).toBe('LIABILITY_FLOW_EXCEEDS_EFFECTIVE_OBLIGATION');
+            expect(snapshot.breakdown.usdcObligation.flowReconciliationDifference).toBe('50'); // exact signed diagnostic
+            expect(snapshot.breakdown.invariant.blockedBy).toBe('LIABILITY_FLOW_EXCEEDS_EFFECTIVE_OBLIGATION');
+            // §P.4 wave-3: reserveRatio derives from the SAME denominator as
+            // the invariant — it honestly reports A/effective (200/100),
+            // while the failure is carried by the attestation and blockedBy,
+            // never by faking the ratio to a trustworthy-looking zero.
+            expect(snapshot.reserveRatio.toString()).toBe('200');
+            // The authority fields stay exact — the DENOMINATOR is the
+            // projection total (100), never replaced by the failed flows.
+            expect(snapshot.usdcLiabilityTotal.toString()).toBe('100');
         });
 
         it('unclassified exposure (Z > 0) forces INCOMPLETE and not fully backed', async () => {
@@ -1087,6 +1155,56 @@ describeOrSkip('§P.3 custody accounting (real PostgreSQL)', () => {
             expect(snapshot.unclassifiedExposure.toString()).toBe('40');
             expect(snapshot.liabilityAttestation).toBe('INCOMPLETE');
             expect(snapshot.isFullyBacked).toBe(false); // Z is never dropped from the denominator
+        });
+
+        it('audit case B: pending withdrawal reservation — restricted obligations rejoin the denominator, NO false flow failure', async () => {
+            const { user } = await seedAccountWithRegistry();
+            // Deposit credited: X = 100 from the flow history, and the
+            // projection holds the full amount (availableBalance 100).
+            await recordCandidateFlow(user, TX1, 100);
+            await prisma.user.update({ where: { id: user.id }, data: { availableBalance: 100 } });
+            // Pending withdrawal reserves 10: the projection releases it to
+            // the restricted bucket (90) and the obligation row holds 10.
+            // Pre-wave-3 this state fired a FALSE LIABILITY_FLOW_EXCEEDS
+            // failure (X=100 > bare mixed pool 90) — the exact production
+            // regression the audit flagged.
+            await prisma.$transaction(async (tx) => {
+                await tx.user.update({ where: { id: user.id }, data: { availableBalance: { decrement: 10 } } });
+                const reservation = await ledger.post(tx, {
+                    idempotencyKey: `ledger:withdrawal:crypto:test:${TX1}`,
+                    entryType: 'CUSTODY_WITHDRAWAL',
+                    description: 'test pending withdrawal reservation',
+                    reference: `withdrawal:crypto:test:${TX1}`,
+                    userId: user.id,
+                    lines: [
+                        { account: `user:${user.id}:liability`, debit: '10' },
+                        { account: 'restricted:reserves', credit: '10' },
+                    ],
+                });
+                await restrictedObligations.createForPendingWithdrawal(tx, {
+                    sourceType: 'PENDING_CRYPTO_WITHDRAWAL',
+                    reference: `withdrawal:crypto:test:${TX1}`,
+                    userId: user.id, amount: '10', asset: 'USDC', network: 'POLYGON',
+                    ledgerTransactionId: reservation.transaction.id,
+                });
+            });
+
+            // A (100) == effective denominator (90 customer + 10 restricted).
+            const { snapshot } = await integrity.createSnapshot({
+                balanceProvider: stubProviderMap({ [CUST]: '100000000', [HOT]: '0' }),
+            });
+            expect(snapshot.breakdown.usdcObligation.classificationStatus).toBe('OK');
+            expect(snapshot.breakdown.usdcObligation.classificationFailure).toBeNull();
+            expect(snapshot.liabilityAttestation).toBe('COMPLETE'); // NO false failure
+            expect(snapshot.isFullyBacked).toBe(true);
+            // THE denominator: effective 100 — the reserved 10 is still owed.
+            expect(snapshot.usdcLiabilityTotal.toString()).toBe('100');
+            expect(snapshot.breakdown.usdcObligation.customerLiabilityTotal.toString()).toBe('90');
+            expect(snapshot.breakdown.usdcObligation.restrictedObligationsTotal.toString()).toBe('10');
+            expect(snapshot.restrictedObligationsTotal.toString()).toBe('10');
+            expect(snapshot.breakdown.usdcObligation.flowReconciliationDifference.toString()).toBe('0');
+            expect(snapshot.unclassifiedExposure.toString()).toBe('0');
+            expect(snapshot.breakdown.invariant.blockedBy).toBeNull();
         });
 
         it('no accepted fresh evidence → EVIDENCE_UNAVAILABLE and NOT fully backed (fail-closed)', async () => {
@@ -1320,9 +1438,15 @@ describeOrSkip('§P.3 custody accounting (real PostgreSQL)', () => {
             });
             expect(snapshot.liabilityAttestation).toBe('UNATTESTABLE');
             expect(snapshot.isFullyBacked).toBe(false);
-            expect(snapshot.usdcLiabilityTotal).toBe(null); // never silently 0
+            // §P.4 wave-3: the DENOMINATOR is the projection total (user
+            // holds 0), never replaced by the invalid flows — and never
+            // silently 0-by-invention: the projection itself IS 0 here,
+            // and restricted obligations (persisted, §P.4) are modeled.
+            expect(snapshot.usdcLiabilityTotal.toString()).toBe('0');
+            // The invalid flow classification is still exposed as the
+            // explicit reason the attestation is UNATTESTABLE.
             expect(snapshot.breakdown.usdcObligation.classificationStatus).toBe('NEGATIVE_LIABILITY_FLOW');
-            expect(snapshot.breakdown.usdcObligation.usdcLiabilityTotal).toBe(null);
+            expect(snapshot.breakdown.usdcObligation.flowLiabilityTotal).toBe(null); // invalid flows never reach any authority field
             expect(snapshot.breakdown.usdcObligation.components.usdcDebits.toString()).toBe('100'); // signed diagnostics retained
         });
 
@@ -1383,6 +1507,130 @@ describeOrSkip('§P.3 custody accounting (real PostgreSQL)', () => {
             expect(() => accounting.exactWebhookAmountToBaseUnits('0', 6)).toThrow();
             expect(() => accounting.exactWebhookAmountToBaseUnits('', 6)).toThrow();
             expect(() => accounting.exactWebhookAmountToBaseUnits('12.3.4', 6)).toThrow();
+        });
+    });
+
+    // ── 9. Custody clearing reconciliation read model (§P.4 wave-3) ──────────
+    // The ledger must self-describe the custody lifecycle: every webhook
+    // credit is PROVISIONAL (unverified clearing) until independent
+    // transaction evidence reclassifies it (verified custody) or a
+    // definitive rejection quarantines it (rejected suspense). This block
+    // proves the reconciliation read model tracks all three states exactly,
+    // flags tampering, and never invents clearing for service-direct flows.
+    describe('custody clearing reconciliation read model (§P.4 wave-3)', () => {
+
+        // The COMPLETE migrated webhook credit path, exactly as the deposit
+        // controller performs it: TransactionHistory row, provisional journal
+        // linked to that row, custody candidate, projection credit.
+        async function webhookCredit(user, txHash, usdcAmount) {
+            const dec = new Prisma.Decimal(usdcAmount).toFixed(6);
+            const [int, frac = ''] = dec.split('.');
+            const units = BigInt(int + frac.padEnd(6, '0'));
+            const registry = await prisma.walletAddress.findFirst({ where: { userId: user.id } });
+            return prisma.$transaction(async (tx) => {
+                const row = await tx.transactionHistory.create({
+                    data: { userId: user.id, type: 'DEPOSIT_CRYPTO', amountUsdc: usdcAmount, feeUsdc: 0, txHash, status: 'COMPLETED' },
+                });
+                const post = await ledger.post(tx, {
+                    idempotencyKey: `ledger:deposit:crypto:${txHash}`,
+                    entryType: 'CUSTODY_DEPOSIT',
+                    description: 'test provisional webhook credit',
+                    reference: txHash,
+                    userId: user.id, relatedEntity: 'transactionHistory', relatedEntityId: row.id,
+                    lines: [
+                        { account: 'clearing:custody:unverified:usdc', debit: dec },
+                        { account: `user:${user.id}:liability`, credit: dec },
+                    ],
+                });
+                const { movement } = await accounting.recordDepositCandidate(tx, {
+                    walletAddress: registry, txHash, amountBaseUnits: units,
+                    transactionHistoryId: row.id, creditedAmountDecimalString: dec,
+                });
+                await tx.user.update({ where: { id: user.id }, data: { availableBalance: { increment: dec } } });
+                return { row, post, movement };
+            });
+        }
+
+        it('CANDIDATE with provisional journal: unverified clearing holds the full amount, zero authoritative custody, no exceptions', async () => {
+            const { user } = await seedAccountWithRegistry();
+            await webhookCredit(user, TX1, 7.5);
+            const result = await reconciliation.reconcileCustodyPostings(prisma);
+            expect(result.exceptions).toEqual([]);
+            expect(result.custody.verifiedWithJournal).toEqual({ count: 0, total: '0.00000000' });
+            expect(result.unverified.candidateWithJournal).toEqual({ count: 1, total: '7.50000000' });
+            expect(result.rejected.failedWithJournal).toEqual({ count: 0, total: '0.00000000' });
+        });
+
+        it('VERIFIED: independent evidence reclassifies into authoritative custody — the read model follows exactly', async () => {
+            const { user } = await seedAccountWithRegistry();
+            await webhookCredit(user, TX1, 100);
+            // Real verification path with deterministic chain evidence.
+            const movement = await prisma.custodyMovement.findFirst({ where: { txHash: TX1 } });
+            const provider = txProviderWith([rawTxEntry({ hash: TX1, address: CUST.toLowerCase(), amount: '100' })]);
+            const r = await accounting.verifyDepositMovement(prisma, { movementId: movement.id }, { txProvider: provider });
+            expect(r.verified).toBe(true);
+            const result = await reconciliation.reconcileCustodyPostings(prisma);
+            expect(result.exceptions).toEqual([]);
+            expect(result.custody.verifiedWithJournal).toEqual({ count: 1, total: '100.00000000' });
+            expect(result.unverified.candidateWithJournal).toEqual({ count: 0, total: '0.00000000' });
+        });
+
+        it('FAILED: definitive rejection quarantines into rejected suspense — never silently dropped', async () => {
+            const { user } = await seedAccountWithRegistry();
+            await webhookCredit(user, TX1, 50.123456);
+            // Evidence disagrees on amount: definitive rejection.
+            const movement = await prisma.custodyMovement.findFirst({ where: { txHash: TX1 } });
+            const provider = txProviderWith([rawTxEntry({ hash: TX1, address: CUST.toLowerCase(), amount: '12' })]);
+            const r = await accounting.verifyDepositMovement(prisma, { movementId: movement.id }, { txProvider: provider });
+            expect(r.verified).toBe(false);
+            const result = await reconciliation.reconcileCustodyPostings(prisma);
+            expect(result.exceptions).toEqual([]);
+            expect(result.custody.verifiedWithJournal).toEqual({ count: 0, total: '0.00000000' });
+            expect(result.unverified.candidateWithJournal).toEqual({ count: 0, total: '0.00000000' });
+            expect(result.rejected.failedWithJournal).toEqual({ count: 1, total: '50.12345600' });
+        });
+
+        it('service-direct movements (no provisional journal) are reported withoutJournal — clearing is never invented for them', async () => {
+            const { user } = await seedAccountWithRegistry();
+            // Service-direct candidate: no webhook credit, no journal.
+            await recordCandidateFlow(user, TX1, 30);
+            const result = await reconciliation.reconcileCustodyPostings(prisma);
+            expect(result.exceptions).toEqual([]);
+            expect(result.unverified.candidateWithJournal).toEqual({ count: 0, total: '0.00000000' });
+            expect(result.unverified.candidateWithoutJournal).toEqual({ count: 1, total: '30.00000000' });
+        });
+
+        it('a tampered custody asset (posting with no movement behind it) is flagged CUSTODY_LEDGER_DISAGREEMENT with the exact signed difference', async () => {
+            const { user } = await seedAccountWithRegistry();
+            await webhookCredit(user, TX1, 25);
+            // Rogue posting: 5 USDC of "custody" with no movement behind it.
+            await prisma.$transaction(async (tx) => {
+                await ledger.post(tx, {
+                    idempotencyKey: 'test:rogue:custody:1',
+                    entryType: 'ADJUSTMENT',
+                    description: 'rogue custody asset injection (tamper proof)',
+                    lines: [
+                        { account: 'custody:deposit:usdc', debit: '5' },
+                        { account: 'equity:treasury', credit: '5' },
+                    ],
+                });
+            });
+            const result = await reconciliation.reconcileCustodyPostings(prisma);
+            expect(result.exceptions).toHaveLength(1);
+            expect(result.exceptions[0].kind).toBe('CUSTODY_LEDGER_DISAGREEMENT');
+            expect(result.exceptions[0].account).toBe('custody:deposit:usdc');
+            expect(result.exceptions[0].ledgerBalance).toBe('5.00000000');
+            expect(result.exceptions[0].expectedFromCustodyMovements).toBe('0.00000000');
+            expect(result.exceptions[0].difference).toBe('-5.00000000'); // signed exact
+        });
+
+        it('runFullReconciliation carries the custody clearing result alongside the projection checks', async () => {
+            const { user } = await seedAccountWithRegistry();
+            await webhookCredit(user, TX1, 10);
+            const full = await reconciliation.runFullReconciliation(prisma);
+            expect(full.ok).toBe(true);
+            expect(full.exceptions).toEqual([]);
+            expect(full.detail.custody.unverified.candidateWithJournal).toEqual({ count: 1, total: '10.00000000' });
         });
     });
     });

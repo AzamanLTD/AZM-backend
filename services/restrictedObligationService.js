@@ -27,12 +27,17 @@ const { Prisma } = require('@prisma/client');
 // unknown restricted obligations are NEVER treated as zero.
 // Representation semantics (post §P.4 wave-2, every financial writer migrated):
 //   'RESTRICTED_OBLIGATION_ROW' — funds reserved for a PENDING EXTERNAL
-//     operation (provider payout / on-chain withdrawal). The customer's
-//     flow-based liability X (custodyAccounting.classifyUsdcLiabilityFlows)
-//     does NOT decrease until the external debit completes, so the
-//     obligation row is ALSO counted in X; the PoR denominator deliberately
-//     adds it on top (conservative fail-closed double coverage — the
-//     invariant can only under-claim backing, never over-claim it).
+//     operation (provider payout / on-chain withdrawal). The reservation
+//     atomically moves the amount OUT of the customer's materialized
+//     liability projection (available) into restricted:reserves, so the
+//     PoR customer-liability authority (§P.4 wave-3: the materialized
+//     projections, NEVER the historical flow totals) already EXCLUDES it —
+//     the denominator adds it back here EXACTLY ONCE as the separately
+//     modeled restricted component. No double counting in either
+//     direction: the flow-based X (custodyAccounting.classifyUsdcLiabilityFlows)
+//     legitimately still contains the amount until the external debit
+//     completes, which is exactly why flows are reconciliation evidence
+//     only and are compared against customer + restricted.
 //   'LEDGER_RECLASSIFICATION'  — restricted funds that are an INTERNAL
 //     reclassification WITHIN customer liability (available → escrow /
 //     dispute / vendor pool). These remain fully counted inside X (the flow
