@@ -406,7 +406,7 @@ describeOrSkip('§P.2 custody execution (real PostgreSQL)', () => {
         await prisma.$executeRawUnsafe(
             'TRUNCATE TABLE "CustodyExecution", "OnchainSweep", "TransactionHistory", "User", ' +
             '"SystemHotWallet", "SystemProfitFees", "SystemMasterCrypto", "AdminProfitLog", ' +
-            '"AuditLog", "JournalEntry" RESTART IDENTITY CASCADE'
+            '"AuditLog", "JournalEntry", "CustodyAccount", "CustodyMovement", "CustodyEvidence" RESTART IDENTITY CASCADE'
         );
     }, 15000);
 
@@ -870,7 +870,7 @@ describeOrSkip('§P.2 withdrawalController.cryptoWithdrawal (real PostgreSQL + r
         await prisma.$executeRawUnsafe(
             'TRUNCATE TABLE "CustodyExecution", "OnchainSweep", "TransactionHistory", "User", ' +
             '"SystemHotWallet", "SystemProfitFees", "SystemMasterCrypto", "AdminProfitLog", ' +
-            '"AuditLog", "JournalEntry" RESTART IDENTITY CASCADE'
+            '"AuditLog", "JournalEntry", "CustodyAccount", "CustodyMovement", "CustodyEvidence" RESTART IDENTITY CASCADE'
         );
     }, 15000);
 

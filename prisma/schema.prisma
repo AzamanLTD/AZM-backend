@@ -5840,6 +5840,9 @@ enum JournalEntryType {
   REWARD
   ADJUSTMENT
   BUSINESS_PAYMENT
+  CUSTODY_DEPOSIT
+  CUSTODY_SWEEP
+  CUSTODY_WITHDRAWAL
   SHARED_VAULT_DEPOSIT
   SHARED_VAULT_REFUND
 }
@@ -6236,6 +6239,26 @@ model ProofOfReservesSnapshot {
   breakdown        Json
   createdAt        DateTime @default(now())
 
+  // ── §P.3 custody accounting (additive; legacy fields above keep their
+  // historical meaning so existing consumers stay source-compatible) ──────
+  // Liability report — see services/proofOfReservesIntegrityService.js.
+  usdcLiabilityTotal          Decimal? @db.Decimal(20, 8) // X: classified USDC-denominated customer obligation (net external flows)
+  evidenceLinkedLiabilityTotal Decimal? @db.Decimal(20, 8) // Y: custody-evidence-backed subset (verified deposits − evidence-gated withdrawals)
+  unclassifiedExposure        Decimal? @db.Decimal(20, 8) // Z: mixed-pool liability not explained by classified USDC flows (forces INCOMPLETE)
+  // Reserve side — ONLY accepted, fresh custody evidence may contribute.
+  eligibleReserveTotal        Decimal? @db.Decimal(20, 8) // A: evidence-backed eligible custody assets
+  restrictedObligationsTotal  Decimal? @db.Decimal(20, 8) // authoritative restricted obligations; null = not yet modeled (§P.4+)
+  restrictedObligationsAvailable Boolean @default(false)
+  // Attestation / evidence state.
+  liabilityAttestation        String?  @db.VarChar(30) // COMPLETE | INCOMPLETE | UNATTESTABLE
+  evidenceStatus              String?  @db.VarChar(30) // HEALTHY | PARTIAL | EVIDENCE_UNAVAILABLE
+  custodyAccountCount          Int?
+  acceptedEvidenceCount       Int?
+  missingEvidenceCount        Int?
+  evidenceSummary             Json?
+  assetIdentity               Json?   // exact { network, asset, contractAddress, decimals }
+  liabilityBreakdown          Json?   // full per-component report
+
   @@index([createdAt(sort: Desc)])
 }
 
@@ -6467,4 +6490,98 @@ model GovernanceVote {
   @@unique([proposalId, userId])
   @@index([proposalId])
   @@index([userId])
+}
+
+
+// =============================================================================
+// §P.3 CUSTODY ACCOUNTING — formal custody asset accounting (2026-09-17)
+// =============================================================================
+// One accounting truth: WalletAddress remains the §P.1 deposit-address
+// authority; CustodyExecution remains the §P.2 external execution state
+// machine; CustodyAccount/CustodyMovement/CustodyEvidence are the durable
+// custody/evidence layer P4 will later connect to the authoritative customer
+// ledger. Exact base-unit integers ONLY — no JS floating point is ever the
+// authoritative quantity in this layer.
+//
+// Tiers implemented now: USER_DEPOSIT_ADDRESS, MASTER_HOT_WALLET. COLD_LEDGER_
+// RESERVE / EXCHANGE_LIQUIDITY / PROVIDER_BALANCE / TREASURY_BUFFER / IN_TRANSIT
+// are deliberate FUTURE phases — no operational mechanism exists for them in P3.
+
+model CustodyAccount {
+  id              String   @id @default(uuid())
+  tier            String   @db.VarChar(30) // USER_DEPOSIT_ADDRESS | MASTER_HOT_WALLET
+  network         String   @default("POLYGON") @db.VarChar(20)
+  asset           String   @default("USDC") @db.VarChar(20)
+  contractAddress String   @db.VarChar(42) // exact canonical token contract, lowercase
+  address         String   @db.VarChar(42) // custody address, lowercase
+  control         String   @default("PLATFORM_KMS_CUSTODY") @db.VarChar(40) // ownership/control classification
+  status          String   @default("ACTIVE") // ACTIVE | RETIRED
+  userId          Int? // owning user for USER_DEPOSIT_ADDRESS
+  walletAddressId String?  @unique // §P.1 registry linkage for deposit addresses
+  metadata        Json?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@unique([address, network, asset, contractAddress]) // no duplicate authoritative identities
+  @@index([tier, status])
+  @@index([userId])
+}
+
+model CustodyMovement {
+  id                   String   @id @default(uuid())
+  idempotencyKey       String   @unique // durable economic identity
+  kind                 String   @db.VarChar(30) // DEPOSIT_IN | SWEEP | WITHDRAWAL_OUT
+  status               String   @db.VarChar(30) // CANDIDATE | VERIFIED | FAILED | RECONCILIATION_REQUIRED
+  network              String   @default("POLYGON") @db.VarChar(20)
+  asset                String   @default("USDC") @db.VarChar(20)
+  contractAddress      String   @db.VarChar(42)
+  amountBaseUnits      BigInt // exact integer — never float
+  decimals             Int      @default(6)
+  sourceAccountId      String? // CustodyAccount.id (null = external/chain origin)
+  destinationAccountId String? // null = external destination
+  fromAddress          String?  @db.VarChar(42)
+  toAddress            String?  @db.VarChar(42)
+  custodyExecutionId   String?  @unique // §P.2 execution ↔ at most ONE movement
+  transactionHistoryId String?
+  txHash               String? // only from real evidence sources
+  evidenceId           String? // CustodyEvidence accepted for this movement
+  evidenceSource       String?  @db.VarChar(50) // TATUM_WEBHOOK | TATUM_V4_TX_BY_HASH | CUSTODY_EXECUTION_VERIFIED_CHAIN
+  verificationDetail   Json?
+  failureReason        String?  @db.VarChar(60)
+  metadata             Json?
+  verifiedAt           DateTime?
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+
+  @@index([kind, status])
+  @@index([sourceAccountId])
+  @@index([destinationAccountId])
+  @@index([txHash])
+  @@index([status, createdAt(sort: Desc)])
+}
+
+model CustodyEvidence {
+  id               String   @id @default(uuid())
+  custodyAccountId String
+  source           String   @db.VarChar(40) // TATUM_V3_TOKEN_BALANCE | TATUM_V4_TX_BY_HASH
+  scope            String   @default("ACCOUNT_BALANCE") @db.VarChar(30) // ACCOUNT_BALANCE | TRANSACTION
+  network          String   @db.VarChar(20)
+  asset            String   @db.VarChar(20)
+  contractAddress  String   @db.VarChar(42)
+  address          String   @db.VarChar(42)
+  balanceBaseUnits BigInt? // ACCOUNT_BALANCE scope (>= 0, exact)
+  amountBaseUnits  BigInt? // TRANSACTION scope (movement quantity)
+  txHash           String?  @db.VarChar(66)
+  blockReference   String? // block number when the source supplies one (required for TATUM_V4_TX_BY_HASH)
+  observedAt       DateTime // when the provider produced/returned the observation
+  status           String   @default("ACTIVE") // ACTIVE | SUPERSEDED | REJECTED
+  supersededById   String?
+  rejectionReason  String?  @db.VarChar(60)
+  raw              Json? // sanitized provider payload (no secrets)
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  @@index([custodyAccountId, createdAt(sort: Desc)])
+  @@index([status])
+  @@index([scope, status])
 }
