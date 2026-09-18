@@ -11,6 +11,9 @@
 // inside the $transaction.
 // =============================================================================
 'use strict';
+const { Prisma } = require('@prisma/client');
+const ledger = require('./ledgerService');
+const _exact = (n) => (n instanceof Prisma.Decimal ? n.toFixed(8) : Number(n).toFixed(8));
 const { computeLineItems, computeTaxLines } = require('../utils/invoiceMath');
 const { emitWebhookEvent } = require('./webhookEmitter');
 
@@ -202,7 +205,7 @@ const payInvoice = async (prisma, {
         include: { lineItems: true, taxLines: true,
           businessProfile: { select: { userId: true, businessName: true, bizId: true } } },
       });
-      await tx.transactionHistory.create({ data: {
+      const payerHistory = await tx.transactionHistory.create({ data: {
         userId: customerId,
         type: 'BUSINESS_INVOICE_PAYMENT',
         amountUsdc: -customerPays,
@@ -210,6 +213,51 @@ const payInvoice = async (prisma, {
         txHash: `${payTxHash}_PAYER`,
         status: 'COMPLETED',
       }});
+
+      // §P.4 AUTHORITATIVE LEDGER — invoice settlement, same transaction,
+      // idempotent on the invoice's DB-unique payTxHash (the conditional
+      // claim above guarantees exactly one payer wins):
+      //   D user:{customer}:liability — customer pays bill + tip (+ fee
+      //                                 when customer covered it)
+      //   C user:{businessOwner}:liability — business receives its share
+      //   C equity:treasury — invoice fee realized (mirrors the
+      //                       SystemProfitFees increment above)
+      // Any float-rounding residual between the stored legs is absorbed by
+      // revenue:fees so the posting balances EXACTLY without minting value.
+      {
+        const debit = new Prisma.Decimal(_exact(customerPays));
+        const share = new Prisma.Decimal(_exact(businessReceives));
+        const feeExact = new Prisma.Decimal(_exact(fee));
+        const residual = debit.minus(share).minus(feeExact);
+        const lines = [
+          { account: `user:${customerId}:liability`, debit: debit.toFixed(8) },
+          { account: `user:${businessOwnerUserId}:liability`, credit: share.toFixed(8) },
+        ];
+        if (!feeExact.isZero()) {
+          lines.push({ account: 'equity:treasury', credit: feeExact.toFixed(8) });
+        }
+        if (!residual.isZero()) {
+          const residualStr = residual.abs().toFixed(8);
+          if (residual.isPositive()) lines.push({ account: 'revenue:fees', credit: residualStr });
+          else lines.push({ account: 'revenue:fees', debit: residualStr });
+        }
+        await ledger.post(tx, {
+          idempotencyKey: `ledger:invoice:pay:${payTxHash}`,
+          entryType: 'BUSINESS_PAYMENT',
+          description: 'Business invoice paid — liability moved customer→business, fee realized',
+          userId: customerId,
+          relatedEntity: 'businessInvoice',
+          relatedEntityId: invoiceId,
+          metadata: {
+            tipUsdc: _exact(tip),
+            feeUsdc: feeExact.toFixed(8),
+            coveredFee,
+            residual: residual.toFixed(8),
+            payerHistoryId: payerHistory.id,
+          },
+          lines,
+        });
+      }
       await tx.transactionHistory.create({ data: {
         userId: businessOwnerUserId,
         type: 'BUSINESS_INVOICE_RECEIPT',

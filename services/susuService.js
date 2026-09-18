@@ -23,6 +23,7 @@
 
 const logger = require('../src/config/logger');
 const { Prisma } = require('@prisma/client');
+const ledger = require('./ledgerService');
 
 const FREQUENCY_MS = {
     WEEKLY: 7 * 24 * 60 * 60 * 1000,
@@ -326,7 +327,14 @@ class SusuService {
                     // through to the seizure branch below.
                     const paidNow = await tx.user.updateMany({
                         where: { id: member.userId, availableBalance: { gte: contribution } },
-                        data: { availableBalance: { decrement: contribution } },
+                        data: {
+                            availableBalance: { decrement: contribution },
+                            // §P.4: the projection's escrow column moves with
+                            // the same money the ledger escrow sub-account
+                            // locks (see the posting below) — reconcileUserProjections
+                            // requires them to stay equal.
+                            escrowLockedBalance: { increment: contribution },
+                        },
                     });
                     if (paidNow.count === 1) {
                         await tx.susuContribution.create({
@@ -347,6 +355,30 @@ class SusuService {
                                 metadata: { cycleId: cycle.id, susuGroupId: cycle.susuGroupId },
                             },
                         });
+                        // §P.4 AUTHORITATIVE LEDGER — contribution into the
+                        // cycle pool restriction, same transaction, idempotent
+                        // on the (cycle, member) contribution identity the
+                        // SusuContribution unique key already enforces:
+                        //   D user:{member}:liability        — available down
+                        //   C escrow:susu-{compact}:locked — pooled restriction up
+                        // A zero-configured contribution is no economic
+                        // event — nothing posts, the zero-line guard in the
+                        // ledger stays authoritative.
+                        if (contribution.gt(0)) {
+                            await ledger.post(tx, {
+                                idempotencyKey: `ledger:susu:contribution:${cycle.id}:${member.id}`,
+                                entryType: 'SUSU_CONTRIBUTION',
+                                description: 'Susu cycle contribution — pooled into cycle restriction',
+                                userId: member.userId,
+                                relatedEntity: 'susuCycle',
+                                relatedEntityId: cycle.id,
+                                metadata: { memberId: member.id, susuGroupId: cycle.susuGroupId },
+                                lines: [
+                                    { account: `user:${member.userId}:liability`, debit: contribution.toFixed(8) },
+                                    { account: ledger.susuEscrowCode(cycle.id, member.id), credit: contribution.toFixed(8) },
+                                ],
+                            });
+                        }
                         return { paid: true };
                     }
 
@@ -366,7 +398,13 @@ class SusuService {
                     if (seizable.gt(0)) {
                         await tx.user.update({
                             where: { id: member.userId },
-                            data: { availableBalance: { decrement: seizable } },
+                            data: {
+                                availableBalance: { decrement: seizable },
+                                // §P.4: seized funds join the member's own pool
+                                // sub-account — the projection escrow column
+                                // moves with the same money.
+                                escrowLockedBalance: { increment: seizable },
+                            },
                         });
                         await tx.transactionHistory.create({
                             data: {
@@ -376,6 +414,25 @@ class SusuService {
                                 status: 'COMPLETED',
                                 metadata: { cycleId: cycle.id, susuGroupId: cycle.susuGroupId },
                             },
+                        });
+                        // §P.4 AUTHORITATIVE LEDGER — default seizure joins
+                        // the cycle pool (V1 semantics: seized funds are
+                        // pooled and paid out with the cycle), same tx,
+                        // idempotent on the (cycle, member) seizure identity:
+                        //   D user:{member}:liability       — seized balance down
+                        //   C escrow:susu-{compact}:locked — pooled restriction up
+                        await ledger.post(tx, {
+                            idempotencyKey: `ledger:susu:seizure:${cycle.id}:${member.id}`,
+                            entryType: 'SUSU_SEIZURE',
+                            description: 'Susu default seizure — seized balance pooled into cycle restriction',
+                            userId: member.userId,
+                            relatedEntity: 'susuCycle',
+                            relatedEntityId: cycle.id,
+                            metadata: { memberId: member.id, shortfall: shortfall.toFixed(8) },
+                            lines: [
+                                { account: `user:${member.userId}:liability`, debit: seizable.toFixed(8) },
+                                { account: ledger.susuEscrowCode(cycle.id, member.id), credit: seizable.toFixed(8) },
+                            ],
                         });
                     }
                     await tx.susuContribution.create({
@@ -452,13 +509,14 @@ class SusuService {
         const payoutOutcome = await this.prisma.$transaction(async (tx) => {
             const rows = await tx.susuContribution.findMany({
                 where: { cycleId: cycle.id },
-                select: { status: true, amountUsdc: true, seizedFromAvailable: true },
+                select: { status: true, amountUsdc: true, seizedFromAvailable: true, memberId: true },
             });
             let totalCollected = new Prisma.Decimal(0);
+            const lockedByMember = new Map();
             for (const r of rows) {
-                totalCollected = totalCollected.plus(
-                    r.status === 'SEIZED' ? r.seizedFromAvailable : r.amountUsdc
-                );
+                const amount = r.status === 'SEIZED' ? r.seizedFromAvailable : r.amountUsdc;
+                totalCollected = totalCollected.plus(amount);
+                lockedByMember.set(r.memberId, (lockedByMember.get(r.memberId) || new Prisma.Decimal(0)).plus(amount));
             }
 
             const settings = await tx.globalSettings.findFirst();
@@ -485,6 +543,55 @@ class SusuService {
                 where: { id: cycle.payoutUserId },
                 data: { availableBalance: { increment: netPayout } },
             });
+
+            // §P.4 AUTHORITATIVE LEDGER — cycle payout, same transaction,
+            // idempotent on the cycle's payout identity (the COLLECTING
+            // claim above guarantees a single financial winner). The pool is
+            // held in PER-MEMBER sub-accounts (each member's contributed +
+            // seized funds), so the payout drains every member's own
+            // sub-account — each returns to exactly zero and each member's
+            // projection escrow column is released by the same amount:
+            //   D escrow:susu-{compact}:locked (one line per member)
+            //   C user:{payoutUserId}:liability — net payout to recipient
+            //   C revenue:fees                  — susu profit realized now
+            // fee + netPayout === totalCollected exactly (Decimal), so all
+            // sub-accounts return to zero with no rounding dust.
+            for (const [memberId, locked] of lockedByMember.entries()) {
+                if (locked.lte(0)) continue;
+                await tx.susuContribution.findFirst({ where: { cycleId: cycle.id, memberId } })
+                    .then(async (row) => {
+                        if (!row) return;
+                        await tx.user.update({
+                            where: { id: row.userId },
+                            data: { escrowLockedBalance: { decrement: locked } },
+                        });
+                    });
+            }
+            // Zero-value lines are never posted (the ledger rejects them);
+            // an all-zero pool (every member defaulted with nothing to
+            // seize) is no economic event at all and posts nothing.
+            const payoutLines = [
+                ...[...lockedByMember.entries()]
+                    .filter(([, locked]) => locked.gt(0))
+                    .map(([memberId, locked]) => ({
+                        account: ledger.susuEscrowCode(cycle.id, memberId),
+                        debit: locked.toFixed(8),
+                    })),
+                { account: `user:${cycle.payoutUserId}:liability`, credit: netPayout.toFixed(8) },
+                { account: 'revenue:fees', credit: feeUsdc.toFixed(8) },
+            ].filter((l) => !new Prisma.Decimal(String(l.debit ?? l.credit)).isZero());
+            if (payoutLines.length > 0) {
+                await ledger.post(tx, {
+                    idempotencyKey: `ledger:susu:payout:${cycle.id}`,
+                    entryType: 'SUSU_PAYOUT',
+                    description: 'Susu cycle payout — pool restriction released to recipient, profit realized',
+                    userId: cycle.payoutUserId,
+                    relatedEntity: 'susuCycle',
+                    relatedEntityId: cycle.id,
+                    metadata: { totalCollected: totalCollected.toFixed(8), feeUsdc: feeUsdc.toFixed(8) },
+                    lines: payoutLines,
+                });
+            }
             if (defaulted.length > 0) {
                 await tx.susuCycle.update({
                     where: { id: cycle.id },

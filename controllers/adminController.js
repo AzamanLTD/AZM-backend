@@ -4,6 +4,10 @@ const { getReadPrisma } = require('../src/config/readReplica');
 const { sendPushNotification } = require('../utils/firebaseService');
 const { parsePagination, buildPageEnvelope } = require('../utils/pagination');
 const { audit } = require('../utils/audit');
+const { Prisma } = require('@prisma/client');
+const ledger = require('../services/ledgerService');
+const restrictedObligations = require('../services/restrictedObligationService');
+const _exact = (n) => (n instanceof Prisma.Decimal ? n.toFixed(8) : Number(n).toFixed(8));
 
 /**
  * Helper: retrieve the singleton NotificationService from app context.
@@ -298,6 +302,33 @@ exports.forceCancel = async (req, res) => {
                     }
                 });
             }
+
+            // §P.4 AUTHORITATIVE LEDGER — admin force-cancel refund, same
+            // transaction. The DISPUTED → CANCELLED atomic claim above is the
+            // single-winner boundary, so the posting is exactly-once on this
+            // identity. Mirrors the tradeWorker auto-cancel accounting:
+            //   SELL ad → D escrow:trade-{id}:locked  C user:{vendor}:unallocated
+            //   BUY  ad → D escrow:trade-{id}:locked  C user:{user}:liability
+            await ledger.post(tx, {
+                idempotencyKey: `ledger:p2p:force-cancel:${id}`,
+                entryType: isSellAd ? 'VENDOR_ALLOCATE' : 'ESCROW_REFUND',
+                description: isSellAd
+                    ? 'Admin force-cancel — vendor escrow returned to unallocated trading pool'
+                    : 'Admin force-cancel — buyer escrow refunded to available balance',
+                userId: isSellAd ? trade.vendorId : trade.userId,
+                relatedEntity: 'trade',
+                relatedEntityId: id,
+                metadata: { adminId: req.user.id, adminNotes: adminNotes ?? null },
+                lines: isSellAd
+                    ? [
+                        { account: `escrow:trade-${id}:locked`, debit: _exact(trade.amountCrypto) },
+                        { account: `user:${trade.vendorId}:unallocated`, credit: _exact(trade.amountCrypto) },
+                      ]
+                    : [
+                        { account: `escrow:trade-${id}:locked`, debit: _exact(trade.amountCrypto) },
+                        { account: `user:${trade.userId}:liability`, credit: _exact(trade.amountCrypto) },
+                      ],
+            });
 
             // Trade was already stamped CANCELLED at the top of this
             // transaction (atomic conditional flip).
@@ -1528,6 +1559,50 @@ exports.rejectWithdrawal = async (req, res) => {
                 where: { id: withdrawal.userId },
                 data: { availableBalance: { increment: withdrawal.amount } }
             });
+
+            // §P.4 AUTHORITATIVE LEDGER — rejection refund, same transaction.
+            // If the withdrawal reserved funds (wallet/smart-route P4 flows),
+            // the refund drains the restricted reserve and cancels the
+            // obligation (both must move together or reconciliation fails).
+            // Pre-P4 legacy withdrawals never reserved: their refund draws
+            // on platform equity instead — never a mint, and the ledger
+            // records exactly which case happened.
+            const refundExact = new Prisma.Decimal(_exact(withdrawal.amount));
+            const activeObligation = await tx.restrictedObligation.findFirst({
+                where: {
+                    status: 'ACTIVE',
+                    OR: [
+                        { reference: `withdrawal:wallet:${withdrawal.id}` },
+                        { reference: `withdrawal:smartroute:${withdrawal.id}` },
+                    ],
+                },
+            });
+            const refundPost = await ledger.post(tx, {
+                idempotencyKey: `ledger:admin:reject-withdrawal:${withdrawal.id}`,
+                entryType: 'WITHDRAWAL',
+                description: activeObligation
+                    ? 'Withdrawal rejected by admin — reserved funds refunded to customer'
+                    : 'Withdrawal rejected by admin — pre-P4 withdrawal refunded from platform equity',
+                userId: withdrawal.userId,
+                relatedEntity: 'withdrawal',
+                relatedEntityId: String(withdrawal.id),
+                metadata: { status: 'REJECTED', reason: reason || null, reserved: Boolean(activeObligation) },
+                lines: activeObligation
+                    ? [
+                        { account: 'restricted:reserves', debit: refundExact.toFixed(8) },
+                        { account: `user:${withdrawal.userId}:liability`, credit: refundExact.toFixed(8) },
+                    ]
+                    : [
+                        { account: 'equity:treasury', debit: refundExact.toFixed(8) },
+                        { account: `user:${withdrawal.userId}:liability`, credit: refundExact.toFixed(8) },
+                    ],
+            });
+            if (activeObligation) {
+                await restrictedObligations.cancelOnReversal(tx, {
+                    reference: activeObligation.reference,
+                    releaseLedgerTransactionId: refundPost.transaction.id,
+                });
+            }
         });
 
         // Notify user

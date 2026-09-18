@@ -8,6 +8,7 @@
 const logger = require('../src/config/logger');
 const { runDoubleCheck } = require('../utils/securityCheck');
 const { AZM_SPEND_SOURCES } = require('./azmSpendService');
+const { Prisma } = require('@prisma/client'); // §P.4 exact ledger arithmetic
 const { audit } = require('../utils/audit');
 
 const EXIT_FEE_PERCENT        = 0.02;
@@ -81,6 +82,9 @@ const _debitUserBalance = async (tx, userId, amount) => {
         throw err;
     }
 };
+
+const ledger = require('./ledgerService'); // §P.4 authoritative ledger
+const restrictedObligations = require('./restrictedObligationService'); // §P.4 persisted restricted obligations
 
 const processFiatWithdrawal = async (prisma, userId, amountFloat, opts = {}) => {
     await runDoubleCheck(prisma, userId);
@@ -203,9 +207,48 @@ const processFiatWithdrawal = async (prisma, userId, amountFloat, opts = {}) => 
                             azmSpent: azmFeeDiscount.azmSpent,
                             dedupKey: `fee_discount_${reference}`
                         }
-                        : null
+                        : null,
+                    // §P.4 marker: this row reserved customer funds through
+                    // the authoritative ledger (restricted:reserves) — the
+                    // settlement/reversal paths post their ledger legs for
+                    // this row. Legacy rows (false) have NO ledger truth and
+                    // are never given one retroactively (no backfill).
+                    ledgerReserved: true
                 }
             }
+        });
+
+        // §P.4 AUTHORITATIVE ACCOUNTING — inside the SAME reservation
+        // transaction as the USDC debit, the fiat-pool reservation and the
+        // TransactionHistory row:
+        //   D user:{id}:liability  — customer owed less (amount + exit fee)
+        //   C restricted:reserves — funds reserved for the PENDING provider
+        //                           payout; released ONLY on provider SUCCESS,
+        //                           cancelled on definitive reversal
+        const fiatReservation = await ledger.post(tx, {
+            idempotencyKey: `ledger:withdrawal:fiat:${reference}`,
+            entryType: 'WITHDRAWAL',
+            description: 'Fiat (MoMo) withdrawal reservation — provider settlement pending',
+            reference,
+            userId,
+            relatedEntity: 'transactionHistory',
+            relatedEntityId: (await tx.transactionHistory.findUnique({ where: { txHash: reference } }))?.id ?? null,
+            metadata: { status: 'PENDING', provider: 'MTN_MOMO', deferredEconomics: true },
+            lines: [
+                { account: `user:${userId}:liability`, debit: new Prisma.Decimal(String(totalDeduct)) },
+                { account: 'restricted:reserves', credit: new Prisma.Decimal(String(totalDeduct)) },
+            ],
+        });
+        await restrictedObligations.createForPendingWithdrawal(tx, {
+            sourceType: 'PENDING_FIAT_WITHDRAWAL',
+            reference: `withdrawal:fiat:${reference}`,
+            userId,
+            amount: new Prisma.Decimal(String(totalDeduct)),
+            asset: 'USDC',
+            sourceEntity: 'transactionHistory',
+            sourceEntityId: reference,
+            ledgerTransactionId: fiatReservation.transaction.id,
+            domainStateRef: { principalUsdc: amountFloat, exitFeeUsdc: exitFee, payoutGhs },
         });
 
         const [profitFees, updatedFiatPool, masterCrypto, updatedUser] = await Promise.all([
@@ -330,6 +373,52 @@ const completeFiatWithdrawal = async (prisma, reference, { providerTxId = null }
             await tx.adminProfitLog.create({
                 data: { amountUsdc: amountFloat, source: 'ARBITRAGE_SPREAD', relatedTxId: `arbitrage_capture_${reference}` }
             });
+            // §P.4 AUTHORITATIVE SETTLEMENT — inside the SAME settlement
+            // transaction as the PENDING->COMPLETED claim and the deferred
+            // economics realization (only for rows that carry a §P.4 ledger
+            // reservation; legacy rows have no ledger truth to settle):
+            //   D restricted:reserves        — the reservation is released
+            //   C clearing:fiat:offramp:usdc — principal enters the GHS
+            //     off-ramp settlement rail. This rail is a FIAT settlement —
+            //     there is NO represented USDC transfer into provider
+            //     custody here, so custody:provider:usdc is NEVER posted on
+            //     this path (that account is reserved for real provider-held
+            //     USDC). The §P.5 GHS-liquidity wave will reconcile this
+            //     clearing balance against actual fiat asset movements.
+            //   C revenue:fees               — fee realized NOW (system share)
+            //   C user:{referrer}:liability   — referrer reward realized NOW
+            // Provider-dependent economics are NEVER realized before this point.
+            const ledgerReserved = metadata.ledgerReserved === true;
+            if (ledgerReserved) {
+                const principalExact = new Prisma.Decimal(String(amountFloat));
+                const systemFeeExact = new Prisma.Decimal(String(referrerId && referrerShare > 0 ? systemShare : (systemShare > 0 ? systemShare : exitFee)));
+                const referrerShareExact = referrerId && referrerShare > 0 ? new Prisma.Decimal(String(referrerShare)) : null;
+                const totalReservedExact = principalExact.plus(systemFeeExact).plus(referrerShareExact || new Prisma.Decimal(0));
+                const lines = [
+                    { account: 'restricted:reserves', debit: totalReservedExact },
+                    { account: 'clearing:fiat:offramp:usdc', credit: principalExact },
+                ];
+                if (!systemFeeExact.isZero()) lines.push({ account: 'revenue:fees', credit: systemFeeExact });
+                if (referrerShareExact && !referrerShareExact.isZero()) {
+                    lines.push({ account: `user:${referrerId}:liability`, credit: referrerShareExact });
+                }
+                const fiatSettlement = await ledger.post(tx, {
+                    idempotencyKey: `ledger:withdrawal:fiat:settle:${reference}`,
+                    entryType: 'WITHDRAWAL',
+                    description: 'Fiat withdrawal settled on provider SUCCESS — deferred economics realized',
+                    reference,
+                    userId: pending.userId,
+                    relatedEntity: 'transactionHistory',
+                    relatedEntityId: pending.id,
+                    metadata: { status: 'COMPLETED', provider: 'MTN_MOMO', providerTxId: providerTxId || null },
+                    lines,
+                });
+                await restrictedObligations.releaseOnSettlement(tx, {
+                    reference: `withdrawal:fiat:${reference}`,
+                    releaseLedgerTransactionId: fiatSettlement.transaction.id,
+                    settledAmount: totalReservedExact,
+                });
+            }
         }
 
         const transaction = await tx.transactionHistory.findUnique({ where: { txHash: reference } });
@@ -381,6 +470,34 @@ const reverseFiatWithdrawal = async (prisma, reference, opts = {}) => {
             where: { id: userId },
             data: { availableBalance: { increment: totalDeduct } }
         });
+
+        // §P.4 AUTHORITATIVE REVERSAL — inside the SAME reversal transaction
+        // as the FAILED claim and the customer refund projection credit (only
+        // for rows that carry a §P.4 ledger reservation; legacy rows have no
+        // ledger truth to reverse):
+        //   D restricted:reserves — reservation returns
+        //   C user:{id}:liability — customer owed the refund (principal+fee)
+        const ledgerReservedReverse = (original.metadata || {}).ledgerReserved === true;
+        if (ledgerReservedReverse) {
+            const reversalPost = await ledger.post(tx, {
+                idempotencyKey: `ledger:withdrawal:fiat:reverse:${reference}`,
+                entryType: 'WITHDRAWAL',
+                description: 'Fiat withdrawal reversed — provider dispatch definitively failed',
+                reference,
+                userId,
+                relatedEntity: 'transactionHistory',
+                relatedEntityId: original.id,
+                metadata: { status: 'FAILED', provider: 'MTN_MOMO' },
+                lines: [
+                    { account: 'restricted:reserves', debit: new Prisma.Decimal(String(totalDeduct)) },
+                    { account: `user:${userId}:liability`, credit: new Prisma.Decimal(String(totalDeduct)) },
+                ],
+            });
+            await restrictedObligations.cancelOnReversal(tx, {
+                reference: `withdrawal:fiat:${reference}`,
+                releaseLedgerTransactionId: reversalPost.transaction.id,
+            });
+        }
 
         // Legacy rows recognized fees before provider settlement. Unwind those
         // exact economics without inserting negative AdminProfitLog amounts,
@@ -558,6 +675,34 @@ const processCryptoDeposit = async (prisma, { userId, amountUsdc, txHash, addres
             await tx.systemMasterCrypto.upsert({ where: { id: 1 }, update: { balance: { increment: amountUsdc } }, create: { id: 1, balance: amountUsdc } });
             await tx.systemHotWallet.upsert({ where: { id: 1 }, update: { balance: { increment: amountUsdc } }, create: { id: 1, balance: amountUsdc } });
             const txRecord = await tx.transactionHistory.create({ data: { userId, type: 'DEPOSIT_CRYPTO', amountUsdc, feeUsdc: 0, txHash, status: 'COMPLETED' } });
+
+            // §P.4 AUTHORITATIVE LEDGER — same transaction as the credit and
+            // the TransactionHistory row, idempotent on the same txHash
+            // identity the txHash unique constraint already enforces:
+            //   D clearing:custody:unverified:usdc — PROVISIONAL custody:
+            //     the legacy webhook is an observation source with NO
+            //     independent chain evidence; this clearing account is NOT
+            //     a PoR reserve asset. (SystemMasterCrypto/SystemHotWallet
+            //     remain non-authoritative display mirrors only.)
+            //   C user:{id}:liability — customer liability increases.
+            // An unrepresentable float amount (over-precision) is rejected
+            // by toExactDecimal and rolls the whole credit back — the
+            // legacy route can no longer mint value the authoritative books
+            // cannot express.
+            await ledger.post(tx, {
+                idempotencyKey: `ledger:deposit:crypto:${txHash}`,
+                entryType: 'CUSTODY_DEPOSIT',
+                description: 'Crypto deposit observed by legacy finance webhook — provisional custody clearing credit',
+                userId,
+                relatedEntity: 'transactionHistory',
+                relatedEntityId: txRecord.id,
+                metadata: { source: 'legacy-finance-webhook', address: address || null },
+                lines: [
+                    { account: 'clearing:custody:unverified:usdc', debit: amountUsdc },
+                    { account: `user:${userId}:liability`, credit: amountUsdc },
+                ],
+            });
+
             return { alreadyProcessed: false, user, txRecord, newBalance: user.availableBalance + amountUsdc };
         });
 

@@ -39,6 +39,17 @@ describe('escrowService fundEscrow realtime convergence', () => {
             },
             systemProfitFees: { upsert: jest.fn().mockResolvedValue({}), update: jest.fn().mockResolvedValue({}) },
             transactionHistory: { create: jest.fn().mockResolvedValue({}) },
+            // §P.4 ledger posting surface — the authoritative settlement
+            // posts inside the same (mocked) transaction.
+            ledgerAccount: { upsert: jest.fn().mockResolvedValue({}) },
+            ledgerTransaction: {
+                findUnique: jest.fn().mockResolvedValue(null),
+                create: jest.fn().mockResolvedValue({ id: 'lt-1', postingHash: 'h' }),
+            },
+            journalEntry: {
+                findMany: jest.fn().mockResolvedValue([]),
+                create: jest.fn().mockResolvedValue({}),
+            },
             adminProfitLog: { create: jest.fn().mockResolvedValue({}) },
         };
         const prisma = {
@@ -141,6 +152,17 @@ describe('escrowService markSatisfied realtime convergence (pending settlement)'
             },
             user: { update: jest.fn().mockResolvedValue({}), updateMany: jest.fn().mockResolvedValue({ count: 1 }) },
             transactionHistory: { create: jest.fn().mockResolvedValue({}) },
+            // §P.4 ledger posting surface — the authoritative settlement
+            // posts inside the same (mocked) transaction.
+            ledgerAccount: { upsert: jest.fn().mockResolvedValue({}) },
+            ledgerTransaction: {
+                findUnique: jest.fn().mockResolvedValue(null),
+                create: jest.fn().mockResolvedValue({ id: 'lt-1', postingHash: 'h' }),
+            },
+            journalEntry: {
+                findMany: jest.fn().mockResolvedValue([]),
+                create: jest.fn().mockResolvedValue({}),
+            },
         };
         const prisma = {
             smartEscrow: {
@@ -192,6 +214,17 @@ describe('escrowService _releaseEscrow realtime convergence (settled)', () => {
             },
             user: { update: jest.fn().mockResolvedValue({}), updateMany: jest.fn().mockResolvedValue({ count: 1 }) },
             transactionHistory: { create: jest.fn().mockResolvedValue({}) },
+            // §P.4 ledger posting surface — the authoritative settlement
+            // posts inside the same (mocked) transaction.
+            ledgerAccount: { upsert: jest.fn().mockResolvedValue({}) },
+            ledgerTransaction: {
+                findUnique: jest.fn().mockResolvedValue(null),
+                create: jest.fn().mockResolvedValue({ id: 'lt-1', postingHash: 'h' }),
+            },
+            journalEntry: {
+                findMany: jest.fn().mockResolvedValue([]),
+                create: jest.fn().mockResolvedValue({}),
+            },
         };
         const prisma = {
             smartEscrow: { findUnique: jest.fn().mockResolvedValue(escrow) },
@@ -228,6 +261,17 @@ describe('escrowService _releaseEscrow realtime convergence (settled)', () => {
             },
             user: { update: jest.fn().mockResolvedValue({}), updateMany: jest.fn().mockResolvedValue({ count: 1 }) },
             transactionHistory: { create: jest.fn().mockResolvedValue({}) },
+            // §P.4 ledger posting surface — the authoritative settlement
+            // posts inside the same (mocked) transaction.
+            ledgerAccount: { upsert: jest.fn().mockResolvedValue({}) },
+            ledgerTransaction: {
+                findUnique: jest.fn().mockResolvedValue(null),
+                create: jest.fn().mockResolvedValue({ id: 'lt-1', postingHash: 'h' }),
+            },
+            journalEntry: {
+                findMany: jest.fn().mockResolvedValue([]),
+                create: jest.fn().mockResolvedValue({}),
+            },
         };
         const prisma = {
             smartEscrow: { findUnique: jest.fn().mockResolvedValue(escrow) },

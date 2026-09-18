@@ -5661,36 +5661,36 @@ model IdempotencyKey {
 //    states COMPLETED / FAILED / RECONCILIATION_REQUIRED never move backward).
 //  • amountBaseUnits is EXACT integer token units (no floating point).
 model CustodyExecution {
-  id                 String    @id @default(uuid())
-  idempotencyKey     String    @unique
-  kind               String    @db.VarChar(30) // CUSTOMER_WITHDRAWAL | DEPOSIT_SWEEP
-  refId              String?   // TransactionHistory id (withdrawals) / OnchainSweep id (sweeps)
-  walletAddressId     String?   // DEPOSIT_SWEEP source WalletAddress id
-  userId             Int?
-  network            String    @default("POLYGON") @db.VarChar(20)
-  asset              String    @default("USDC") @db.VarChar(20)
-  contractAddress    String    @db.VarChar(42)
-  fromAddress        String    @db.VarChar(42)
-  toAddress          String    @db.VarChar(42)
-  amountBaseUnits    BigInt
-  decimals           Int       @default(6)
-  status             String    @default("REQUESTED") // REQUESTED|RESERVING|SUBMITTED|SIGNING|BROADCAST|CONFIRMING|COMPLETED|FAILED|RECONCILIATION_REQUIRED
-  provider           String    @default("TATUM_KMS") @db.VarChar(30)
-  tatumPendingId     String?   @db.VarChar(100) // Tatum internal ID of the prepared KMS pending transaction (POST response signatureId)
-  txHash             String?   @unique // ONLY from provider/chain evidence
-  approvalStatus     String    @default("PENDING") // PENDING | APPROVED | DENIED
-  approvedAt         DateTime?
-  errorClass         String?   @db.VarChar(40)
-  errorMessage       String?   @db.VarChar(500) // redacted — never secrets
-  feeChargeBaseUnits BigInt?   // customer fee/charge (product policy)
+  id                            String    @id @default(uuid())
+  idempotencyKey                String    @unique
+  kind                          String    @db.VarChar(30) // CUSTOMER_WITHDRAWAL | DEPOSIT_SWEEP
+  refId                         String? // TransactionHistory id (withdrawals) / OnchainSweep id (sweeps)
+  walletAddressId               String? // DEPOSIT_SWEEP source WalletAddress id
+  userId                        Int?
+  network                       String    @default("POLYGON") @db.VarChar(20)
+  asset                         String    @default("USDC") @db.VarChar(20)
+  contractAddress               String    @db.VarChar(42)
+  fromAddress                   String    @db.VarChar(42)
+  toAddress                     String    @db.VarChar(42)
+  amountBaseUnits               BigInt
+  decimals                      Int       @default(6)
+  status                        String    @default("REQUESTED") // REQUESTED|RESERVING|SUBMITTED|SIGNING|BROADCAST|CONFIRMING|COMPLETED|FAILED|RECONCILIATION_REQUIRED
+  provider                      String    @default("TATUM_KMS") @db.VarChar(30)
+  tatumPendingId                String?   @db.VarChar(100) // Tatum internal ID of the prepared KMS pending transaction (POST response signatureId)
+  txHash                        String?   @unique // ONLY from provider/chain evidence
+  approvalStatus                String    @default("PENDING") // PENDING | APPROVED | DENIED
+  approvedAt                    DateTime?
+  errorClass                    String?   @db.VarChar(40)
+  errorMessage                  String?   @db.VarChar(500) // redacted — never secrets
+  feeChargeBaseUnits            BigInt? // customer fee/charge (product policy)
   estimatedNetworkCostBaseUnits BigInt? // estimate only — NOT realized cost
   realizedNetworkCostBaseUnits  BigInt? // actual network cost, from evidence only
-  submittedAt        DateTime?
-  broadcastAt        DateTime?
-  confirmedAt        DateTime?
-  metadata           Json?
-  createdAt          DateTime  @default(now())
-  updatedAt          DateTime  @updatedAt
+  submittedAt                   DateTime?
+  broadcastAt                   DateTime?
+  confirmedAt                   DateTime?
+  metadata                      Json?
+  createdAt                     DateTime  @default(now())
+  updatedAt                     DateTime  @updatedAt
 
   @@index([kind, refId])
   @@index([status])
@@ -5845,22 +5845,34 @@ enum JournalEntryType {
   CUSTODY_WITHDRAWAL
   SHARED_VAULT_DEPOSIT
   SHARED_VAULT_REFUND
+  ESCROW_DISPUTE
+  SUSU_SEIZURE
+  SUSU_REFUND
+  VENDOR_TOPUP
+  VENDOR_ALLOCATE
+  CUSTODY_VERIFICATION
+  CUSTODY_REJECTION
 }
 
 model JournalEntry {
-  id            String           @id @default(uuid())
-  transactionId String // Groups paired debit+credit entries
-  entryType     JournalEntryType
-  account       String           @db.VarChar(80) // e.g. "user:available", "platform:revenue", "escrow:locked"
-  debit         Decimal          @default(0) @db.Decimal(20, 8)
-  credit        Decimal          @default(0) @db.Decimal(20, 8)
-  description   String           @db.VarChar(500)
-  reference     String?          @db.VarChar(100) // Optional human-readable ref
-  metadata      Json?
+  id                  String           @id @default(uuid())
+  transactionId       String // Groups paired debit+credit entries (LEGACY grouping string — §P.4 authoritative postings link via ledgerTransactionId)
+  // ── §P.4 authoritative ledger linkage (additive; historical rows keep null) ──
+  ledgerTransactionId String?          @db.VarChar(36) // LedgerTransaction posting group (null = pre-P4 shadow rows)
+  lineNumber          Int? // deterministic line ordering within the posting group
+  entryType           JournalEntryType
+  account             String           @db.VarChar(80) // e.g. "user:available", "platform:revenue", "escrow:locked"
+  debit               Decimal          @default(0) @db.Decimal(20, 8)
+  credit              Decimal          @default(0) @db.Decimal(20, 8)
+  description         String           @db.VarChar(500)
+  reference           String?          @db.VarChar(100) // Optional human-readable ref
+  metadata            Json?
 
   userId          Int?
   relatedEntity   String? @db.VarChar(50) // "trade", "vault", "susu", etc.
   relatedEntityId String?
+
+  ledgerTransaction LedgerTransaction? @relation(fields: [ledgerTransactionId], references: [id], onDelete: Restrict)
 
   createdAt DateTime @default(now())
 
@@ -5869,6 +5881,106 @@ model JournalEntry {
   @@index([userId, createdAt(sort: Desc)])
   @@index([entryType, createdAt(sort: Desc)])
   @@index([relatedEntity, relatedEntityId])
+  @@index([ledgerTransactionId])
+  @@index([account, ledgerTransactionId])
+}
+
+// ── §P.4 Authoritative Liability Ledger ─────────────────────────────────────
+// The LedgerAccount catalog classifies every authoritative account code; the
+// LedgerTransaction is the ONE durable economic transaction identity (unique
+// idempotencyKey + postingHash replay proof) that groups its JournalEntry
+// lines. JournalEntry remains the posting line model — NO parallel ledger.
+
+enum LedgerAccountClass {
+  ASSET
+  LIABILITY
+  EQUITY
+  REVENUE
+  EXPENSE
+  CLEARING
+  RESTRICTED
+}
+
+enum LedgerNormalSide {
+  DEBIT
+  CREDIT
+}
+
+enum RestrictedObligationStatus {
+  ACTIVE
+  RELEASED
+  CANCELLED
+}
+
+enum ReserveInclusionPolicy {
+  INCLUDED_IN_RESERVE_DENOMINATOR
+  EXCLUDED_FROM_RESERVE_DENOMINATOR
+}
+
+model LedgerAccount {
+  id           String             @id @default(uuid())
+  code         String             @unique @db.VarChar(80) // user:{id}:liability | custody:deposit:usdc | ...
+  accountClass LedgerAccountClass
+  normalSide   LedgerNormalSide // normal balance: ASSET/EXPENSE = DEBIT, LIABILITY/REVENUE/EQUITY = CREDIT
+  asset        String             @default("USDC") @db.VarChar(20)
+  network      String?            @db.VarChar(20)
+  userId       Int? // owning customer for user:{id}:liability / escrow:{id}:locked rows
+  status       String             @default("ACTIVE") @db.VarChar(20) // ACTIVE | RETIRED
+  metadata     Json?
+  createdAt    DateTime           @default(now())
+  updatedAt    DateTime           @updatedAt
+
+  @@index([userId])
+  @@index([accountClass, status])
+}
+
+model LedgerTransaction {
+  id              String           @id @default(uuid())
+  idempotencyKey  String           @unique @db.VarChar(140) // durable exactly-once economic identity
+  entryType       JournalEntryType
+  description     String           @db.VarChar(500)
+  reference       String?          @db.VarChar(100)
+  userId          Int?
+  relatedEntity   String?          @db.VarChar(50)
+  relatedEntityId String?
+  postingHash     String           @db.VarChar(64) // sha-256 of the exact normalized lines — replay consistency proof
+  metadata        Json?
+  postedAt        DateTime         @default(now())
+  createdAt       DateTime         @default(now())
+
+  journalEntries JournalEntry[]
+
+  @@index([relatedEntity, relatedEntityId])
+  @@index([userId, postedAt(sort: Desc)])
+  @@index([entryType, postedAt(sort: Desc)])
+}
+
+// Authoritative persisted restricted obligations — the PoR reserve denominator
+// source. Existing domain states are LINKED (sourceEntity/sourceEntityId +
+// domainStateRef), never duplicated as a drifting balance.
+model RestrictedObligation {
+  id                         String                     @id @default(uuid())
+  reference                  String                     @unique @db.VarChar(140)
+  sourceType                 String                     @db.VarChar(40) // PENDING_FIAT_WITHDRAWAL | PENDING_CRYPTO_WITHDRAWAL | ESCROW_LOCK | ...
+  sourceEntity               String?                    @db.VarChar(50)
+  sourceEntityId             String?                    @db.VarChar(100)
+  userId                     Int?
+  asset                      String                     @default("USDC") @db.VarChar(20)
+  network                    String?                    @db.VarChar(20)
+  amount                     Decimal                    @db.Decimal(20, 8)
+  status                     RestrictedObligationStatus @default(ACTIVE)
+  reserveInclusionPolicy     ReserveInclusionPolicy     @default(INCLUDED_IN_RESERVE_DENOMINATOR)
+  ledgerTransactionId        String?                    @db.VarChar(36) // originating authoritative posting
+  releaseLedgerTransactionId String?                    @db.VarChar(36)
+  domainStateRef             Json?
+  releasedAt                 DateTime?
+  metadata                   Json?
+  createdAt                  DateTime                   @default(now())
+  updatedAt                  DateTime                   @updatedAt
+
+  @@index([sourceType, status])
+  @@index([userId, status])
+  @@index([status, asset])
 }
 
 // ── E2EE (Signal-style Protocol) ─────────────────────────────────────────────
@@ -6242,22 +6354,22 @@ model ProofOfReservesSnapshot {
   // ── §P.3 custody accounting (additive; legacy fields above keep their
   // historical meaning so existing consumers stay source-compatible) ──────
   // Liability report — see services/proofOfReservesIntegrityService.js.
-  usdcLiabilityTotal          Decimal? @db.Decimal(20, 8) // X: classified USDC-denominated customer obligation (net external flows)
-  evidenceLinkedLiabilityTotal Decimal? @db.Decimal(20, 8) // Y: custody-evidence-backed subset (verified deposits − evidence-gated withdrawals)
-  unclassifiedExposure        Decimal? @db.Decimal(20, 8) // Z: mixed-pool liability not explained by classified USDC flows (forces INCOMPLETE)
+  usdcLiabilityTotal             Decimal? @db.Decimal(20, 8) // X: classified USDC-denominated customer obligation (net external flows)
+  evidenceLinkedLiabilityTotal   Decimal? @db.Decimal(20, 8) // Y: custody-evidence-backed subset (verified deposits − evidence-gated withdrawals)
+  unclassifiedExposure           Decimal? @db.Decimal(20, 8) // Z: mixed-pool liability not explained by classified USDC flows (forces INCOMPLETE)
   // Reserve side — ONLY accepted, fresh custody evidence may contribute.
-  eligibleReserveTotal        Decimal? @db.Decimal(20, 8) // A: evidence-backed eligible custody assets
-  restrictedObligationsTotal  Decimal? @db.Decimal(20, 8) // authoritative restricted obligations; null = not yet modeled (§P.4+)
-  restrictedObligationsAvailable Boolean @default(false)
+  eligibleReserveTotal           Decimal? @db.Decimal(20, 8) // A: evidence-backed eligible custody assets
+  restrictedObligationsTotal     Decimal? @db.Decimal(20, 8) // authoritative restricted obligations; null = not yet modeled (§P.4+)
+  restrictedObligationsAvailable Boolean  @default(false)
   // Attestation / evidence state.
-  liabilityAttestation        String?  @db.VarChar(30) // COMPLETE | INCOMPLETE | UNATTESTABLE
-  evidenceStatus              String?  @db.VarChar(30) // HEALTHY | PARTIAL | EVIDENCE_UNAVAILABLE
-  custodyAccountCount          Int?
-  acceptedEvidenceCount       Int?
-  missingEvidenceCount        Int?
-  evidenceSummary             Json?
-  assetIdentity               Json?   // exact { network, asset, contractAddress, decimals }
-  liabilityBreakdown          Json?   // full per-component report
+  liabilityAttestation           String?  @db.VarChar(30) // COMPLETE | INCOMPLETE | UNATTESTABLE
+  evidenceStatus                 String?  @db.VarChar(30) // HEALTHY | PARTIAL | EVIDENCE_UNAVAILABLE
+  custodyAccountCount            Int?
+  acceptedEvidenceCount          Int?
+  missingEvidenceCount           Int?
+  evidenceSummary                Json?
+  assetIdentity                  Json? // exact { network, asset, contractAddress, decimals }
+  liabilityBreakdown             Json? // full per-component report
 
   @@index([createdAt(sort: Desc)])
 }
@@ -6492,7 +6604,6 @@ model GovernanceVote {
   @@index([userId])
 }
 
-
 // =============================================================================
 // §P.3 CUSTODY ACCOUNTING — formal custody asset accounting (2026-09-17)
 // =============================================================================
@@ -6528,30 +6639,30 @@ model CustodyAccount {
 }
 
 model CustodyMovement {
-  id                   String   @id @default(uuid())
-  idempotencyKey       String   @unique // durable economic identity
-  kind                 String   @db.VarChar(30) // DEPOSIT_IN | SWEEP | WITHDRAWAL_OUT
-  status               String   @db.VarChar(30) // CANDIDATE | VERIFIED | FAILED | RECONCILIATION_REQUIRED
-  network              String   @default("POLYGON") @db.VarChar(20)
-  asset                String   @default("USDC") @db.VarChar(20)
-  contractAddress      String   @db.VarChar(42)
+  id                   String    @id @default(uuid())
+  idempotencyKey       String    @unique // durable economic identity
+  kind                 String    @db.VarChar(30) // DEPOSIT_IN | SWEEP | WITHDRAWAL_OUT
+  status               String    @db.VarChar(30) // CANDIDATE | VERIFIED | FAILED | RECONCILIATION_REQUIRED
+  network              String    @default("POLYGON") @db.VarChar(20)
+  asset                String    @default("USDC") @db.VarChar(20)
+  contractAddress      String    @db.VarChar(42)
   amountBaseUnits      BigInt // exact integer — never float
-  decimals             Int      @default(6)
+  decimals             Int       @default(6)
   sourceAccountId      String? // CustodyAccount.id (null = external/chain origin)
   destinationAccountId String? // null = external destination
-  fromAddress          String?  @db.VarChar(42)
-  toAddress            String?  @db.VarChar(42)
-  custodyExecutionId   String?  @unique // §P.2 execution ↔ at most ONE movement
+  fromAddress          String?   @db.VarChar(42)
+  toAddress            String?   @db.VarChar(42)
+  custodyExecutionId   String?   @unique // §P.2 execution ↔ at most ONE movement
   transactionHistoryId String?
   txHash               String? // only from real evidence sources
   evidenceId           String? // CustodyEvidence accepted for this movement
-  evidenceSource       String?  @db.VarChar(50) // TATUM_WEBHOOK | TATUM_V4_TX_BY_HASH | CUSTODY_EXECUTION_VERIFIED_CHAIN
+  evidenceSource       String?   @db.VarChar(50) // TATUM_WEBHOOK | TATUM_V4_TX_BY_HASH | CUSTODY_EXECUTION_VERIFIED_CHAIN
   verificationDetail   Json?
-  failureReason        String?  @db.VarChar(60)
+  failureReason        String?   @db.VarChar(60)
   metadata             Json?
   verifiedAt           DateTime?
-  createdAt            DateTime @default(now())
-  updatedAt            DateTime @updatedAt
+  createdAt            DateTime  @default(now())
+  updatedAt            DateTime  @updatedAt
 
   @@index([kind, status])
   @@index([sourceAccountId])

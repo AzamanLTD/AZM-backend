@@ -24,6 +24,7 @@
 
 const logger = require('../../src/config/logger');
 const { Prisma } = require('@prisma/client');
+const ledger = require('../ledgerService');
 const { SusuError, ErrorCodes } = require('./errors');
 const fieldCipher = require('../crypto/fieldCipher');
 
@@ -363,13 +364,18 @@ class AdminSusuMonitorService {
       if (cycleIds.length > 0) {
         const paid = await tx.susuContribution.findMany({
           where: { cycleId: { in: cycleIds }, status: 'PAID' },
-          select: { id: true, userId: true, amountUsdc: true },
+          select: { id: true, cycleId: true, memberId: true, userId: true, amountUsdc: true },
         });
         for (const c of paid) {
           const amount = new Prisma.Decimal(c.amountUsdc);
           await tx.user.update({
             where: { id: c.userId },
-            data: { availableBalance: { increment: amount } },
+            data: {
+              availableBalance: { increment: amount },
+              // §P.4: refund releases the member's own pool sub-account —
+              // the projection escrow column moves with the same money.
+              escrowLockedBalance: { decrement: amount },
+            },
           });
           await tx.transactionHistory.create({
             data: {
@@ -379,6 +385,26 @@ class AdminSusuMonitorService {
               status: 'COMPLETED',
             },
           }).catch(() => {});
+          // §P.4 AUTHORITATIVE LEDGER — dissolve refund, same transaction,
+          // idempotent on the contribution row's own durable identity:
+          //   D escrow:susu-{cycleId}-{memberId}:locked — member's pool
+          //       sub-account released
+          //   C user:{userId}:liability       — contributor refunded
+          if (amount.gt(0)) {
+            await ledger.post(tx, {
+              idempotencyKey: `ledger:susu:refund:${c.id}`,
+              entryType: 'SUSU_REFUND',
+              description: 'Susu dissolved by admin — pooled contribution refunded to member',
+              userId: c.userId,
+              relatedEntity: 'susuContribution',
+              relatedEntityId: c.id,
+              metadata: { cycleId: c.cycleId, susuGroupId },
+              lines: [
+                { account: ledger.susuEscrowCode(c.cycleId, c.memberId), debit: amount.toFixed(8) },
+                { account: `user:${c.userId}:liability`, credit: amount.toFixed(8) },
+              ],
+            });
+          }
           refundedMembers += 1;
           refundedTotal = refundedTotal.plus(amount);
         }

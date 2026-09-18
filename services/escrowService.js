@@ -61,6 +61,17 @@ const FUNDED_EXPIRY_DAYS = 30; // funded but inactive escrows expire after 30d
 const HOUR_MS = 60 * 60 * 1000;
 const DAY_MS = 24 * HOUR_MS;
 
+const { Prisma } = require('@prisma/client');
+const ledger = require('./ledgerService');
+
+/**
+ * §P.4 helper: exact decimal strings for ledger postings, derived from the
+ * DB-stored SmartEscrow Decimals (amountUsdc/feeUsdc) or the service's
+ * _round6 floats. The float projection increments and the authoritative
+ * ledger lines are computed from the SAME value, so they can never diverge.
+ */
+const _exact = (n) => (n instanceof Prisma.Decimal ? n.toFixed(8) : Number(n).toFixed(8));
+
 /** Lazy-upsert the SystemProfitFees singleton (id = 1). Mirrors finance.service. */
 const _ensureProfitFeesSingleton = async (tx) =>
     tx.systemProfitFees.upsert({
@@ -182,6 +193,26 @@ const fundEscrow = async (prisma, { escrowId, payerId }) => {
         await tx.systemProfitFees.update({
             where: { id: 1 },
             data: { balance: { increment: fee } }
+        });
+
+        // c2. §P.4 AUTHORITATIVE LEDGER — same transaction, fail-closed.
+        //   D user:{payer}:liability  (principal + fee: the customer is owed less)
+        //   C escrow:{escrowId}:locked (principal: restricted liability reclassification)
+        //   C revenue:fees            (fee: platform revenue realized at lock)
+        await ledger.post(tx, {
+            idempotencyKey: `ledger:escrow:fund:${escrowId}`,
+            entryType: 'ESCROW_LOCK',
+            description: 'SmartEscrow funded — principal locked, fee realized',
+            reference,
+            userId: payerId,
+            relatedEntity: 'smartEscrow',
+            relatedEntityId: escrowId,
+            metadata: { ticketId: escrow.ticketId },
+            lines: [
+                { account: `user:${payerId}:liability`, debit: _exact(total) },
+                { account: `escrow:escrow-${escrowId}:locked`, credit: _exact(amount) },
+                { account: 'revenue:fees', credit: _exact(fee) },
+            ],
         });
 
         // d. Flip escrow → FUNDED with the 30d inactivity window.
@@ -443,6 +474,26 @@ const raiseDispute = async (prisma, { escrowId, raisedById, reason, evidenceUrls
             );
         }
 
+        // §P.4 AUTHORITATIVE LEDGER — liability reclassification, same tx:
+        //   D escrow:{escrowId}:locked — released from escrow holding
+        //   C user:{payer}:dispute   — restricted into the dispute bucket
+        // (The DB race guards above stay: they are the domain concurrency
+        // boundaries; the ledger is the accounting truth, not a second
+        // balance engine.)
+        await ledger.post(tx, {
+            idempotencyKey: `ledger:escrow:dispute:${escrowId}`,
+            entryType: 'ESCROW_DISPUTE',
+            description: 'Escrow disputed — principal reclassified from escrow holding into dispute restriction',
+            userId: escrow.payerId,
+            relatedEntity: 'smartEscrow',
+            relatedEntityId: escrowId,
+            metadata: { disputeRaisedById: raisedById ?? null },
+            lines: [
+                { account: `escrow:escrow-${escrowId}:locked`, debit: _exact(amount) },
+                { account: `user:${escrow.payerId}:dispute`, credit: _exact(amount) },
+            ],
+        });
+
         // EscrowDispute.escrowId is UNIQUE in Prisma/Postgres — the final
         // database-level one-dispute-per-escrow backstop. A collision here
         // (theoretically unreachable past the claim above) rolls the whole
@@ -636,6 +687,30 @@ const resolveDispute = async (prisma, { escrowId, adminId, ruling, rulingNotes, 
             });
         }
 
+        // §P.4 AUTHORITATIVE LEDGER — dispute principal settled in one
+        // balanced posting, same tx (idempotent on the escrow's dispute
+        // resolution identity):
+        //   D user:{payer}:dispute          — dispute restriction released
+        //   C user:{payer}:liability        — payer's split share
+        //   C user:{payee}:liability        — payee's split share
+        // The shares sum to the principal exactly (payee gets the remainder),
+        // so the posting balances to zero with no rounding dust.
+        await ledger.post(tx, {
+            idempotencyKey: `ledger:escrow:dispute:settle:${escrowId}`,
+            entryType: 'ESCROW_RELEASE',
+            description: `Dispute resolved SPLIT (${pPct}/${qPct}) — restricted principal released to payer and payee`,
+            reference: releaseRef,
+            userId: escrow.payerId,
+            relatedEntity: 'smartEscrow',
+            relatedEntityId: escrowId,
+            metadata: { ruling: 'SPLIT', payerPct: pPct, payeePct: qPct },
+            lines: [
+                { account: `user:${escrow.payerId}:dispute`, debit: _exact(amount) },
+                { account: `user:${escrow.payerId}:liability`, credit: _exact(payerAmount) },
+                { account: `user:${escrow.payeeId}:liability`, credit: _exact(payeeAmount) },
+            ],
+        });
+
         const updatedDispute = await tx.escrowDispute.update({
             where: { id: escrow.dispute.id, status: { not: 'RESOLVED' } },
             data: {
@@ -826,6 +901,28 @@ const _releaseEscrowTx = async (tx, escrow, finalStatus = 'SETTLED') => {
         data: { availableBalance: { increment: amount } }
     });
 
+    // §P.4 AUTHORITATIVE LEDGER — restricted principal released to the payee,
+    // same tx, idempotent on (escrow, final status):
+    //   D escrow:{id}:locked | user:{payer}:dispute  — restriction released
+    //   C user:{payee}:liability                      — payee liability up
+    const releaseSourceAccount = fromDispute
+        ? `user:${escrow.payerId}:dispute`
+        : `escrow:escrow-${escrow.id}:locked`;
+    await ledger.post(tx, {
+        idempotencyKey: `ledger:escrow:release:${escrow.id}:${finalStatus}`,
+        entryType: 'ESCROW_RELEASE',
+        description: `Escrow principal released to payee (status ${finalStatus})`,
+        reference,
+        userId: escrow.payeeId,
+        relatedEntity: 'smartEscrow',
+        relatedEntityId: escrow.id,
+        metadata: { source: releaseSourceAccount },
+        lines: [
+            { account: releaseSourceAccount, debit: _exact(amount) },
+            { account: `user:${escrow.payeeId}:liability`, credit: _exact(amount) },
+        ],
+    });
+
     await tx.transactionHistory.create({
         data: {
             userId: escrow.payeeId,
@@ -877,6 +974,28 @@ const _refundEscrowTx = async (tx, escrow, finalStatus = 'REFUNDED') => {
             `ESCROW_BUCKET_INSUFFICIENT: payer ${sourceColumn} is short of the ${amount} USDC principal.`
         );
     }
+
+    // §P.4 AUTHORITATIVE LEDGER — restricted principal returned to the payer,
+    // same tx, idempotent on (escrow, final status):
+    //   D escrow:{id}:locked | user:{payer}:dispute  — restriction released
+    //   C user:{payer}:liability                      — payer liability restored
+    const refundSourceAccount = fromDispute
+        ? `user:${escrow.payerId}:dispute`
+        : `escrow:escrow-${escrow.id}:locked`;
+    await ledger.post(tx, {
+        idempotencyKey: `ledger:escrow:refund:${escrow.id}:${finalStatus}`,
+        entryType: 'ESCROW_REFUND',
+        description: `Escrow principal refunded to payer (status ${finalStatus})`,
+        reference,
+        userId: escrow.payerId,
+        relatedEntity: 'smartEscrow',
+        relatedEntityId: escrow.id,
+        metadata: { source: refundSourceAccount },
+        lines: [
+            { account: refundSourceAccount, debit: _exact(amount) },
+            { account: `user:${escrow.payerId}:liability`, credit: _exact(amount) },
+        ],
+    });
 
     await tx.transactionHistory.create({
         data: {

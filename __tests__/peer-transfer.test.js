@@ -30,7 +30,8 @@ describeOrSkip('Peer transfer', () => {
 
   afterEach(async () => {
     await prisma.$executeRawUnsafe(
-      'TRUNCATE TABLE "User", "PeerTransfer", "Friendship", "TransactionHistory" RESTART IDENTITY CASCADE'
+      'TRUNCATE TABLE "User", "PeerTransfer", "Friendship", "TransactionHistory", ' +
+      '"LedgerTransaction", "LedgerAccount", "JournalEntry" RESTART IDENTITY CASCADE'
     );
   }, 15000);
 

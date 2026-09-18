@@ -83,7 +83,7 @@ describeOrSkip('WalletAddress authority + governance (real PostgreSQL)', () => {
         // the journal write has committed (or aborted) long before the retry.
         for (let attempt = 0; ; attempt++) {
             try {
-                await prisma.$executeRawUnsafe('TRUNCATE TABLE "WalletAddress", "User", "SystemMasterCrypto", "SystemHotWallet", "JournalEntry", "CustodyMovement", "CustodyAccount", "CustodyEvidence" RESTART IDENTITY CASCADE');
+                await prisma.$executeRawUnsafe('TRUNCATE TABLE "WalletAddress", "User", "SystemMasterCrypto", "SystemHotWallet", "JournalEntry", "LedgerTransaction", "LedgerAccount", "CustodyMovement", "CustodyAccount", "CustodyEvidence" RESTART IDENTITY CASCADE');
                 break;
             } catch (err) {
                 if (attempt < 2 && /deadlock/i.test(String(err && err.message))) {
@@ -498,18 +498,45 @@ describeOrSkip('WalletAddress authority + governance (real PostgreSQL)', () => {
         });
         expect(res.statusCode).toBe(200);
 
-        // The ONE economic representation: journalIntegration.recordDeposit's
-        // balanced pair (debit user:available / credit external:deposit).
-        const rows = await journalRowsFor(txHash);
+        // §P.4: the ONE economic representation is the AUTHORITATIVE ledger
+        // posting, committed synchronously INSIDE the settlement transaction
+        // (the fire-and-forget journalIntegration shadow helper is retired on
+        // this path). Balanced pair: D clearing:custody:unverified:usdc /
+        // C user:{id}:liability. Wave-2 semantics: the webhook is an
+        // observation source — it records PROVISIONAL custody only, which is
+        // NOT a PoR reserve asset. Independent Tatum transaction evidence
+        // (verifyDepositMovement) is the sole path that reclassifies into the
+        // authoritative custody:deposit:usdc asset; the webhook alone can
+        // NEVER touch it.
+        const rows = await prisma.journalEntry.findMany({
+            where: { reference: txHash, ledgerTransactionId: { not: null } },
+        });
         expect(rows.length).toBe(2);
-        expect(rows.every((r) => r.entryType === 'DEPOSIT')).toBe(true);
-        const sums = rows.reduce((acc, r) => ({ d: acc.d.add(r.debit), c: acc.c.add(r.credit) }), { d: new (require('@prisma/client').Prisma.Decimal)(0), c: new (require('@prisma/client').Prisma.Decimal)(0) });
-        expect(sums.d.toString()).toBe('42.5');
+        expect(rows.every((r) => r.entryType === 'CUSTODY_DEPOSIT')).toBe(true);
+        const debit = rows.find((r) => r.account === 'clearing:custody:unverified:usdc');
+        const credit = rows.find((r) => r.account === `user:${userA.id}:liability`);
+        expect(debit).toBeDefined();
+        expect(credit).toBeDefined();
+        expect(debit.debit.toString()).toBe('42.5');
+        expect(credit.credit.toString()).toBe('42.5');
+        // The authoritative custody asset is untouched by the webhook credit.
+        expect(
+            (await prisma.journalEntry.aggregate({
+                where: { account: 'custody:deposit:usdc' },
+                _sum: { debit: true, credit: true },
+            }))._sum.debit ?? 0
+        ).toBe(0);
+        // EXACTLY ONE authoritative posting per deposit lifecycle (idempotent
+        // ledger transaction — replay of the same webhook cannot duplicate it).
+        expect(await prisma.ledgerTransaction.count({
+            where: { idempotencyKey: `ledger:deposit:crypto:${txHash}` },
+        })).toBe(1);
+        // NO second, legacy shadow representation for the same lifecycle.
+        expect(await prisma.journalEntry.count({
+            where: { reference: txHash, ledgerTransactionId: null },
+        })).toBe(0);
         // ZERO custody journal rows: §P.3 verification deliberately posts none.
         expect(await prisma.journalEntry.count({ where: { relatedEntity: 'custodyMovement' } })).toBe(0);
-        expect(await prisma.journalEntry.count({
-            where: { entryType: { in: ['CUSTODY_DEPOSIT', 'CUSTODY_WITHDRAWAL', 'CUSTODY_SWEEP'] } },
-        })).toBe(0);
         // And the candidate exists alongside — custody truth, journal truth.
         expect(await candidateOf(txHash)).not.toBe(null);
     });

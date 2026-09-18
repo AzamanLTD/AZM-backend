@@ -18,6 +18,19 @@ describe('acceptPing balance concurrency', () => {
           vendorUnallocatedBalance: 60,
         }),
       },
+      // §P.4 ledger posting surface — the top-up posts inside the same
+      // (mocked) transaction.
+      ledgerAccount: {
+        upsert: jest.fn().mockResolvedValue({}),
+      },
+      ledgerTransaction: {
+        findUnique: jest.fn().mockResolvedValue(null),
+        create: jest.fn().mockResolvedValue({ id: 'lt-1', postingHash: 'h' }),
+      },
+      journalEntry: {
+        findMany: jest.fn().mockResolvedValue([]),
+        create: jest.fn().mockResolvedValue({}),
+      },
     };
     const prisma = {
       trade: {

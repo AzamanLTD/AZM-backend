@@ -35,6 +35,17 @@ describe('escrowService _refundEscrow realtime convergence', () => {
             },
             user: { update: jest.fn().mockResolvedValue({}), updateMany: jest.fn().mockResolvedValue({ count: 1 }) },
             transactionHistory: { create: jest.fn().mockResolvedValue({}) },
+            // §P.4 ledger posting surface — the authoritative settlement
+            // posts inside the same (mocked) transaction.
+            ledgerAccount: { upsert: jest.fn().mockResolvedValue({}) },
+            ledgerTransaction: {
+                findUnique: jest.fn().mockResolvedValue(null),
+                create: jest.fn().mockResolvedValue({ id: 'lt-1', postingHash: 'h' }),
+            },
+            journalEntry: {
+                findMany: jest.fn().mockResolvedValue([]),
+                create: jest.fn().mockResolvedValue({}),
+            },
         };
         const prisma = {
             smartEscrow: { findUnique: jest.fn().mockResolvedValue(escrow) },

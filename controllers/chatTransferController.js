@@ -19,6 +19,9 @@
 
 const logger = require('../src/config/logger');
 const crypto = require('crypto');
+const { Prisma } = require('@prisma/client');
+const ledger = require('../services/ledgerService');
+const _exact = (n) => (n instanceof Prisma.Decimal ? n.toFixed(8) : Number(n).toFixed(8));
 
 // ── Internal: deterministic personal room hash ────────────────────────────────
 const _personalRoomHash = (uid1, uid2) => {
@@ -136,7 +139,7 @@ exports.chatTransfer = async (req, res) => {
             });
 
             // 7. TransactionHistory — sender debit (negative = OUT)
-            await tx.transactionHistory.create({
+            const senderHistory = await tx.transactionHistory.create({
                 data: {
                     userId:     senderId,
                     type:       'INTERNAL_TRANSFER',
@@ -144,6 +147,26 @@ exports.chatTransfer = async (req, res) => {
                     feeUsdc:    0,
                     status:     'COMPLETED'
                 }
+            });
+
+            // §P.4 AUTHORITATIVE LEDGER — chat money transfer, same
+            // transaction, idempotent on the durable TransactionHistory row
+            // that represents the sender's leg (its auto id is the stable
+            // identity; the whole posting commits or rolls back with it):
+            //   D user:{sender}:liability   — sender owed less
+            //   C user:{receiver}:liability — receiver owed more
+            await ledger.post(tx, {
+                idempotencyKey: `ledger:transfer:chat:${senderHistory.id}`,
+                entryType: 'TRANSFER',
+                description: 'Chat money transfer — internal liability moved between users',
+                userId: senderId,
+                relatedEntity: 'transactionHistory',
+                relatedEntityId: senderHistory.id,
+                metadata: { receiverId, messageId: message.id },
+                lines: [
+                    { account: `user:${senderId}:liability`, debit: _exact(amount) },
+                    { account: `user:${receiverId}:liability`, credit: _exact(amount) },
+                ],
             });
 
             // 8. TransactionHistory — receiver credit (positive = IN)

@@ -21,6 +21,7 @@
 
 const logger = require('../src/config/logger');
 const { Prisma } = require('@prisma/client');
+const ledger = require('./ledgerService');
 
 const FREQUENCY_MS = {
     DAILY: 24 * 60 * 60 * 1000,
@@ -190,12 +191,12 @@ class VaultService {
         const penalty = balance.mul(penaltyPct);
         const refund = balance.minus(penalty);
 
-        const result = await this.prisma.$transaction([
-            this.prisma.user.update({
+        const result = await this.prisma.$transaction(async (tx) => {
+            const userUpdate = await tx.user.update({
                 where: { id: userId },
                 data: { availableBalance: { increment: refund } },
-            }),
-            this.prisma.vault.update({
+            });
+            const vaultUpdate = await tx.vault.update({
                 where: { id: vault.id },
                 data: {
                     status: 'BROKEN_EARLY',
@@ -208,15 +209,15 @@ class VaultService {
                         penalty,
                     }),
                 },
-            }),
-            this.prisma.adminProfitLog.create({
+            });
+            const profitRow = await tx.adminProfitLog.create({
                 data: {
                     amountUsdc: penalty,
                     source: 'SAVINGS_FEE',
                     relatedTxId: `vault-break-${vault.id}`,
                 },
-            }),
-            this.prisma.transactionHistory.create({
+            });
+            const historyRow = await tx.transactionHistory.create({
                 data: {
                     userId,
                     type: 'VAULT_RELEASE',
@@ -224,8 +225,33 @@ class VaultService {
                     feeUsdc: penalty,
                     status: 'COMPLETED',
                 },
-            }),
-        ]);
+            });
+            // §P.4 AUTHORITATIVE LEDGER — early-break settlement, same
+            // transaction, idempotent on the vault's break identity (a
+            // concurrent double-break collides on the key and the whole
+            // losing transaction rolls back — the ledger key is the ONLY
+            // single-winner guard on this path, so it must be here):
+            //   D escrow:vault-{vaultId}:locked — savings restriction released
+            //   C user:{userId}:liability       — refund share
+            //   C revenue:fees                   — early-break penalty realized
+            // penalty + refund === balance exactly (refund = balance - penalty
+            // in Decimal arithmetic), so the posting balances with no dust.
+            await ledger.post(tx, {
+                idempotencyKey: `ledger:vault:break-early:${vault.id}`,
+                entryType: 'VAULT_RELEASE',
+                description: `Vault "${vault.name}" broken early — refund to wallet, penalty realized`,
+                userId,
+                relatedEntity: 'vault',
+                relatedEntityId: vault.id,
+                metadata: { penaltyPct: vault.earlyBreakPenaltyPct, finalState: 'BROKEN_EARLY' },
+                lines: [
+                    { account: `escrow:vault-${vault.id}:locked`, debit: balance.toFixed(8) },
+                    { account: `user:${userId}:liability`, credit: refund.toFixed(8) },
+                    { account: 'revenue:fees', credit: penalty.toFixed(8) },
+                ],
+            });
+            return [userUpdate, vaultUpdate, profitRow, historyRow];
+        });
 
         // Notify
         try {
@@ -251,12 +277,32 @@ class VaultService {
     async completeMatured(vault) {
         const balance = new Prisma.Decimal(vault.currentAmountUsdc);
 
-        await this.prisma.$transaction([
-            this.prisma.user.update({
+        await this.prisma.$transaction(async (tx) => {
+            await tx.user.update({
                 where: { id: vault.userId },
                 data: { availableBalance: { increment: balance } },
-            }),
-            this.prisma.vault.update({
+            });
+            // §P.4 AUTHORITATIVE LEDGER — maturity settlement, same
+            // transaction, idempotent on the vault's completion identity (a
+            // concurrent double-sweep collides on the key and the whole
+            // losing transaction rolls back — the ledger key is the ONLY
+            // single-winner guard on this path, so it must be here):
+            //   D escrow:vault-{vaultId}:locked — savings restriction released
+            //   C user:{userId}:liability       — full balance returned
+            await ledger.post(tx, {
+                idempotencyKey: `ledger:vault:complete:${vault.id}`,
+                entryType: 'VAULT_RELEASE',
+                description: `Vault "${vault.name}" matured — full balance returned to wallet`,
+                userId: vault.userId,
+                relatedEntity: 'vault',
+                relatedEntityId: vault.id,
+                metadata: { finalState: 'COMPLETED' },
+                lines: [
+                    { account: `escrow:vault-${vault.id}:locked`, debit: balance.toFixed(8) },
+                    { account: `user:${vault.userId}:liability`, credit: balance.toFixed(8) },
+                ],
+            });
+            await tx.vault.update({
                 where: { id: vault.id },
                 data: {
                     status: 'COMPLETED',
@@ -269,16 +315,16 @@ class VaultService {
                         penalty: new Prisma.Decimal(0),
                     }),
                 },
-            }),
-            this.prisma.transactionHistory.create({
+            });
+            await tx.transactionHistory.create({
                 data: {
                     userId: vault.userId,
                     type: 'VAULT_RELEASE',
                     amountUsdc: balance,
                     status: 'COMPLETED',
                 },
-            }),
-        ]);
+            });
+        });
 
         // Completion AZM bonus — flat 25 AZM for every completed vault,
         // plus 5% of total deposits as bonus AZM.
@@ -348,12 +394,12 @@ class VaultService {
         const isOnTime = type === 'AUTO_RULE';
 
         try {
-            const [userRow] = await this.prisma.$transaction([
-                this.prisma.user.update({
+            const [userRow] = await this.prisma.$transaction(async (tx) => {
+                const userUpdate = await tx.user.update({
                     where: { id: vault.userId },
                     data: { availableBalance: { decrement: amount } },
-                }),
-                this.prisma.vault.update({
+                });
+                const vaultUpdate = await tx.vault.update({
                     where: { id: vault.id },
                     data: {
                         currentAmountUsdc: { increment: amount },
@@ -364,8 +410,8 @@ class VaultService {
                         totalAzmEarned: { increment: new Prisma.Decimal(breakdown.totalAzm) },
                         ...extraVaultUpdate,
                     },
-                }),
-                this.prisma.vaultDeposit.create({
+                });
+                const depositRow = await tx.vaultDeposit.create({
                     data: {
                         vaultId: vault.id,
                         userId: vault.userId,
@@ -376,16 +422,35 @@ class VaultService {
                         azmBreakdown: breakdown,
                         scheduledFor,
                     },
-                }),
-                this.prisma.transactionHistory.create({
+                });
+                const historyRow = await tx.transactionHistory.create({
                     data: {
                         userId: vault.userId,
                         type: 'VAULT_DEPOSIT',
                         amountUsdc: amount,
                         status: 'COMPLETED',
                     },
-                }),
-            ]);
+                });
+                // §P.4 AUTHORITATIVE LEDGER — vault savings lock, same
+                // transaction, idempotent on the deposit row's own durable
+                // identity:
+                //   D user:{userId}:liability       — available liability down
+                //   C escrow:vault-{vaultId}:locked — savings restriction up
+                await ledger.post(tx, {
+                    idempotencyKey: `ledger:vault:deposit:${depositRow.id}`,
+                    entryType: 'VAULT_DEPOSIT',
+                    description: `Vault deposit "${vault.name}" — savings locked`,
+                    userId: vault.userId,
+                    relatedEntity: 'vaultDeposit',
+                    relatedEntityId: depositRow.id,
+                    metadata: { vaultId: vault.id, type },
+                    lines: [
+                        { account: `user:${vault.userId}:liability`, debit: amount.toFixed(8) },
+                        { account: `escrow:vault-${vault.id}:locked`, credit: amount.toFixed(8) },
+                    ],
+                });
+                return [userUpdate, vaultUpdate, depositRow, historyRow];
+            });
 
             // Credit AZM via canonical service so the AzmRewardLog audit
             // trail stays consistent with all other reward flows.

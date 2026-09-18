@@ -38,7 +38,8 @@ describeOrSkip('P2P escrow settlement integrity (real PostgreSQL)', () => {
 
     afterEach(async () => {
         await prisma.$executeRawUnsafe(
-            'TRUNCATE TABLE "User", "Trade", "Ad", "TransactionHistory", "AdminProfitLog", "SystemProfitFees", "AuditLog" RESTART IDENTITY CASCADE'
+            'TRUNCATE TABLE "User", "Trade", "Ad", "TransactionHistory", "AdminProfitLog", "SystemProfitFees", "AuditLog", '
+            + '"LedgerTransaction", "JournalEntry", "LedgerAccount", "RestrictedObligation" RESTART IDENTITY CASCADE'
         );
     }, 15000);
 

@@ -18,6 +18,9 @@ const express = require('express');
 const router = express.Router();
 const crypto = require('crypto');
 const logger = require('../src/config/logger');
+const { Prisma } = require('@prisma/client');
+const ledger = require('../services/ledgerService');
+const _exact = (n) => (n instanceof Prisma.Decimal ? n.toFixed(8) : Number(n).toFixed(8));
 const { protect } = require('../middleware/authMiddleware');
 const { protectActive } = require('../middleware/banGuardMiddleware');
 
@@ -188,6 +191,24 @@ router.post('/:conversationId/messages', protectActive, async (req, res) => {
                         include: { sender: { select: { id: true, username: true } } }
                     });
 
+                    // §P.4 AUTHORITATIVE LEDGER — peer transfer, same
+                    // transaction, idempotent on the durable message row
+                    // created above in this same transaction:
+                    //   D user:{sender}:liability / C user:{receiver}:liability
+                    await ledger.post(tx, {
+                        idempotencyKey: `ledger:transfer:conv-send:${msg.id}`,
+                        entryType: 'TRANSFER',
+                        description: 'Chat money transfer — liability moved sender→receiver',
+                        userId,
+                        relatedEntity: 'message',
+                        relatedEntityId: msg.id,
+                        metadata: { transferType: 'CONVERSATION_SEND', receiverId, amount: _exact(amt) },
+                        lines: [
+                            { account: `user:${userId}:liability`, debit: _exact(amt) },
+                            { account: `user:${receiverId}:liability`, credit: _exact(amt) },
+                        ],
+                    });
+
                     await tx.transactionHistory.create({
                         data: { userId, type: 'INTERNAL_TRANSFER', amountUsdc: -amt, feeUsdc: 0, status: 'COMPLETED' }
                     });
@@ -328,6 +349,23 @@ router.post('/:conversationId/messages/:messageId/accept-money', protectActive, 
 
             await tx.user.update({ where: { id: userId }, data: { availableBalance: { decrement: amount } } });
             await tx.user.update({ where: { id: reqMsg.senderId }, data: { availableBalance: { increment: amount } } });
+            // §P.4 AUTHORITATIVE LEDGER — money-request acceptance, same
+            // transaction, idempotent on the durable request message row
+            // (the ACCEPTED status update above):
+            //   D user:{payer}:liability / C user:{payee}:liability
+            await ledger.post(tx, {
+                idempotencyKey: `ledger:transfer:money-request:${messageId}`,
+                entryType: 'TRANSFER',
+                description: 'Money request accepted — liability moved payer→payee',
+                userId,
+                relatedEntity: 'message',
+                relatedEntityId: messageId,
+                metadata: { transferType: 'MONEY_REQUEST_ACCEPT', payeeId: reqMsg.senderId, amount: _exact(amount) },
+                lines: [
+                    { account: `user:${userId}:liability`, debit: _exact(amount) },
+                    { account: `user:${reqMsg.senderId}:liability`, credit: _exact(amount) },
+                ],
+            });
 
             // Update the request message to accepted
             await tx.message.update({
@@ -448,13 +486,40 @@ router.post('/:conversationId/messages/:messageId/fund-escrow', protectActive, a
                 data: { availableBalance: { decrement: amount } }
             });
 
-            await tx.message.update({
-                where: { id: messageId },
+            // Single-winner claim: only one funder can flip this ticket to
+            // ESCROW_FUNDED — a double-fund would debit the funder twice.
+            const fundClaim = await tx.message.updateMany({
+                where: { id: messageId, OR: [{ status: null }, { status: { not: 'ESCROW_FUNDED' } }] },
                 data: { status: 'ESCROW_FUNDED' }
             });
+            if (fundClaim.count !== 1) {
+                throw new Error('ESCROW_ALREADY_FUNDED');
+            }
 
             await tx.transactionHistory.create({
                 data: { userId, type: 'ESCROW_FUNDING', amountUsdc: -amount, feeUsdc: 0, status: 'PENDING' }
+            });
+
+            // §P.4 AUTHORITATIVE LEDGER — chat escrow lock, same transaction,
+            // idempotent on the ticket message's fund identity (the claim
+            // above is single-winner). Deliberately UNATTRIBUTED (no userId):
+            // the legacy chat escrow moves no user escrow projection column,
+            // so the pool must not be counted against any single user's
+            // escrowLockedBalance — the balance stays visible as an explicit
+            // platform liability to the ticket participants until release.
+            //   D user:{funder}:liability — available down
+            //   C escrow:chatmsg-{messageId}:locked — ticket pool up
+            await ledger.post(tx, {
+                idempotencyKey: `ledger:escrow:chat-fund:${messageId}`,
+                entryType: 'ESCROW_LOCK',
+                description: 'Chat escrow ticket funded — funds locked pending release',
+                relatedEntity: 'message',
+                relatedEntityId: messageId,
+                metadata: { funderId: userId, amount: _exact(amount) },
+                lines: [
+                    { account: `user:${userId}:liability`, debit: _exact(amount) },
+                    { account: `escrow:chatmsg-${messageId}:locked`, credit: _exact(amount) },
+                ],
             });
 
             return { funder };
@@ -510,13 +575,37 @@ router.post('/:conversationId/messages/:messageId/release-escrow', protectActive
         if (!recipient) return res.status(400).json({ success: false, message: 'Cannot determine recipient.' });
 
         await prisma.$transaction(async (tx) => {
+            // Single-winner claim: only a FUNDED ticket can be released, and
+            // only once — a double release would credit the recipient twice.
+            const releaseClaim = await tx.message.updateMany({
+                where: { id: messageId, status: 'ESCROW_FUNDED' },
+                data: { status: 'ESCROW_RELEASED' }
+            });
+            if (releaseClaim.count !== 1) {
+                throw new Error('ESCROW_NOT_RELEASABLE');
+            }
+
             await tx.user.update({
                 where: { id: recipient.id },
                 data: { availableBalance: { increment: amount } }
             });
-            await tx.message.update({
-                where: { id: messageId },
-                data: { status: 'ESCROW_RELEASED' }
+
+            // §P.4 AUTHORITATIVE LEDGER — chat escrow release, same
+            // transaction, idempotent on the ticket's release identity (the
+            // claim above is single-winner; unattributed pool, see fund):
+            //   D escrow:chatmsg-{messageId}:locked — pool drained
+            //   C user:{recipient}:liability — recipient paid
+            await ledger.post(tx, {
+                idempotencyKey: `ledger:escrow:chat-release:${messageId}`,
+                entryType: 'ESCROW_RELEASE',
+                description: 'Chat escrow released — ticket pool paid to recipient',
+                relatedEntity: 'message',
+                relatedEntityId: messageId,
+                metadata: { recipientId: recipient.id, amount: _exact(amount) },
+                lines: [
+                    { account: `escrow:chatmsg-${messageId}:locked`, debit: _exact(amount) },
+                    { account: `user:${recipient.id}:liability`, credit: _exact(amount) },
+                ],
             });
             await tx.transactionHistory.create({
                 data: { userId: recipient.id, type: 'ESCROW_RELEASE', amountUsdc: amount, feeUsdc: 0, status: 'COMPLETED' }

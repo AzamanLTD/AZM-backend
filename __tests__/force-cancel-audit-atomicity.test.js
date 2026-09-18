@@ -110,7 +110,15 @@ describe('forceCancel audit wiring (mocked transaction)', () => {
             user: { update: jest.fn().mockResolvedValue({}) },
             conversation: { findUnique: jest.fn().mockResolvedValue({ id: 'conv-1' }) },
             message: { create: jest.fn().mockResolvedValue({}) },
-            auditLog: { create: txAuditCreate }
+            auditLog: { create: txAuditCreate },
+            // §P.4 ledger delegates (wave-2: forceCancel posts the escrow
+            // refund reclassification in the same transaction)
+            ledgerAccount: { upsert: jest.fn().mockResolvedValue({}) },
+            ledgerTransaction: {
+                findUnique: jest.fn().mockResolvedValue(null),
+                create: jest.fn().mockResolvedValue({ id: 1, postingHash: expect.any(String) }),
+            },
+            journalEntry: { create: jest.fn().mockResolvedValue({}) },
         };
         const prisma = {
             trade: { findUnique: jest.fn().mockResolvedValue(trade) },
@@ -136,7 +144,13 @@ describe('forceCancel audit wiring (mocked transaction)', () => {
             user: { update: jest.fn().mockResolvedValue({}) },
             conversation: { findUnique: jest.fn().mockResolvedValue({ id: 'conv-1' }) },
             message: { create: jest.fn().mockResolvedValue({}) },
-            auditLog: { create: jest.fn().mockRejectedValue(new Error('audit unavailable')) }
+            auditLog: { create: jest.fn().mockRejectedValue(new Error('audit unavailable')) },
+            ledgerAccount: { upsert: jest.fn().mockResolvedValue({}) },
+            ledgerTransaction: {
+                findUnique: jest.fn().mockResolvedValue(null),
+                create: jest.fn().mockResolvedValue({ id: 1, postingHash: expect.any(String) }),
+            },
+            journalEntry: { create: jest.fn().mockResolvedValue({}) },
         };
         const io = { to: jest.fn() };
         const emitBalanceUpdate = jest.fn();
@@ -171,7 +185,8 @@ describeOrSkip('forceCancel audit atomicity (real PostgreSQL)', () => {
         await prisma.$executeRawUnsafe('DROP TRIGGER IF EXISTS azm_test_fail_audit ON "AuditLog"');
         await prisma.$executeRawUnsafe('DROP FUNCTION IF EXISTS azm_test_fail_audit()');
         await prisma.$executeRawUnsafe(
-            'TRUNCATE TABLE "User", "Trade", "Conversation", "Message", "AuditLog" RESTART IDENTITY CASCADE'
+            'TRUNCATE TABLE "User", "Trade", "Conversation", "Message", "AuditLog", ' +
+            '"LedgerTransaction", "LedgerAccount", "JournalEntry" RESTART IDENTITY CASCADE'
         );
     }, 15000);
 

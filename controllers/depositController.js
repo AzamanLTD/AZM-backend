@@ -31,8 +31,12 @@ function _getNotificationService(req) {
 }
 const { audit } = require('../utils/audit');
 const logger = require('../src/config/logger');
-const journal = require('../services/journalIntegration');
 const custodyAccounting = require('../services/custodyAccountingService');
+// §P.4 authoritative ledger — the journalIntegration shadow helpers are NO
+// LONGER used on this migrated path; the posting is created INSIDE the
+// financial transaction below.
+const ledger = require('../services/ledgerService');
+const restrictedObligations = require('../services/restrictedObligationService');
 
 // =============================================================================
 // 1. TATUM CRYPTO WEBHOOK LISTENER   (Phase C: Polygon Web3 Integration)
@@ -306,7 +310,7 @@ exports.tatumCryptoWebhook = async (req, res) => {
             // succeeds against transaction-specific chain evidence (Tatum v4
             // tx-by-hash). Failure here rolls the whole credit back: a credit
             // without its custody candidate would be an untracked deposit.
-            await custodyAccounting.recordDepositCandidate(tx, {
+            const candidateResult = await custodyAccounting.recordDepositCandidate(tx, {
                 walletAddress: ownerWalletAddress,
                 txHash,
                 amountBaseUnits: candidateBaseUnits,
@@ -314,6 +318,38 @@ exports.tatumCryptoWebhook = async (req, res) => {
                 // exact decimal string derived FROM the base units — the
                 // float credit is never the source of this value
                 creditedAmountDecimalString: custodyAccounting.decimalStringFromBaseUnits(candidateBaseUnits, 6),
+            });
+
+            // §P.4 AUTHORITATIVE ACCOUNTING — same caller transaction, atomic
+            // with the credit, the TransactionHistory row and the custody
+            // candidate. A posting failure rolls back the ENTIRE financial
+            // mutation (fail-closed, no swallowed exceptions).
+            //   D clearing:custody:unverified:usdc — PROVISIONAL custody:
+            //     the webhook is an observation source; the movement is still
+            //     CANDIDATE. This clearing account is NOT a PoR reserve asset.
+            //   C user:{id}:liability — customer liability increases (credit
+            //     policy allows the customer to spend it).
+            // When independent Tatum transaction evidence verifies the
+            // movement, custodyAccountingService.verifyDepositMovement
+            // reclassifies the provisional amount to the real
+            // custody:deposit:usdc asset exactly once. A rejected/mismatched
+            // deposit is retained in clearing:custody:rejected:usdc suspense.
+            // The exact quantity comes from the same base units as the
+            // custody candidate — never from the float credit.
+            const depositLedgerExact = custodyAccounting.decimalStringFromBaseUnits(candidateBaseUnits, 6);
+            await ledger.post(tx, {
+                idempotencyKey: `ledger:deposit:crypto:${txHash}`,
+                entryType: 'CUSTODY_DEPOSIT',
+                description: 'Crypto deposit credited on webhook settlement — provisional custody clearing pending transaction evidence',
+                reference: txHash,
+                userId: targetUserId,
+                relatedEntity: 'transactionHistory',
+                relatedEntityId: txRecord.id,
+                metadata: { custodyMovementId: candidateResult.movement.id, candidate: candidateResult.isNew, provisional: true },
+                lines: [
+                    { account: 'clearing:custody:unverified:usdc', debit: depositLedgerExact },
+                    { account: `user:${targetUserId}:liability`, credit: depositLedgerExact },
+                ],
             });
 
             // 5f. Phase N: notification moved post-commit for full pipeline delivery.
@@ -324,10 +360,9 @@ exports.tatumCryptoWebhook = async (req, res) => {
         // ── Step 6: Post-commit side effects ─────────────────────────────────
         if (emitBalanceUpdate) await emitBalanceUpdate(targetUserId);
 
-        // Double-entry journal recording (non-blocking, fail-safe)
-        journal.recordDeposit(targetUserId, amountUsdc, txHash, { source: 'crypto', txHash }).catch(e =>
-            logger.warn({ err: e.message, txHash }, '[depositController] Journal recording failed')
-        );
+        // §P.4: the authoritative ledger posting was committed INSIDE the
+        // settlement transaction above — there is NO post-commit accounting
+        // call left on this path.
 
         if (io) {
             io.to(`user_${targetUserId}`).emit('deposit_success', {

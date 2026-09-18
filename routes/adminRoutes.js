@@ -9,6 +9,9 @@
 // =============================================================================
 
 const logger = require('../src/config/logger');
+const { Prisma } = require('@prisma/client');
+const ledger = require('../services/ledgerService');
+const _exact = (n) => (n instanceof Prisma.Decimal ? n.toFixed(8) : Number(n).toFixed(8));
 const express = require('express');
 const router = express.Router();
 const adminController = require('../controllers/adminController');
@@ -270,12 +273,12 @@ router.post('/users/:id/credit', async (req, res) => {
         const user = await prisma.user.findUnique({ where: { id: userId }, select: { id: true, username: true } });
         if (!user) return res.status(404).json({ success: false, message: 'User not found.' });
 
-        await prisma.$transaction([
-            prisma.user.update({
+        await prisma.$transaction(async (tx) => {
+            await tx.user.update({
                 where: { id: userId },
                 data: { availableBalance: { increment: amountFloat } },
-            }),
-            prisma.transactionHistory.create({
+            });
+            const history = await tx.transactionHistory.create({
                 data: {
                     userId,
                     type: 'DEPOSIT_CRYPTO',
@@ -284,8 +287,8 @@ router.post('/users/:id/credit', async (req, res) => {
                     txHash: `ADMIN_CREDIT_${Date.now()}_${userId}`,
                     status: 'COMPLETED',
                 }
-            }),
-            prisma.adminSettingsAuditLog.create({
+            });
+            await tx.adminSettingsAuditLog.create({
                 data: {
                     adminId: req.user.id,
                     adminName: req.user.username,
@@ -294,8 +297,28 @@ router.post('/users/:id/credit', async (req, res) => {
                     targetId: String(userId),
                     changes: { amount: amountFloat, reason: reason || 'Admin credit' },
                 }
-            }),
-        ]);
+            });
+
+            // §P.4 AUTHORITATIVE LEDGER — admin demo credit. This is NOT a
+            // custody deposit: no real USDC arrived. The grant is funded by
+            // platform equity so the books never mint unbacked customer
+            // liability, idempotent on the history row created above:
+            //   D equity:treasury        — platform equity funds the grant
+            //   C user:{userId}:liability — customer credited
+            await ledger.post(tx, {
+                idempotencyKey: `ledger:admin:demo-credit:${history.id}`,
+                entryType: 'ADJUSTMENT',
+                description: 'Admin demo credit — platform equity granted to customer',
+                userId,
+                relatedEntity: 'transactionHistory',
+                relatedEntityId: history.id,
+                metadata: { adminId: req.user.id, reason: reason || 'Admin credit', amount: _exact(amountFloat) },
+                lines: [
+                    { account: 'equity:treasury', debit: _exact(amountFloat) },
+                    { account: `user:${userId}:liability`, credit: _exact(amountFloat) },
+                ],
+            });
+        });
 
         if (emitBalanceUpdate) await emitBalanceUpdate(userId);
 

@@ -2,6 +2,10 @@
 
 /**
 const logger = require('../src/config/logger');
+const { Prisma } = require('@prisma/client');
+const ledger = require('../services/ledgerService');
+const restrictedObligations = require('../services/restrictedObligationService');
+const _exact = (n) => (n instanceof Prisma.Decimal ? n.toFixed(8) : Number(n).toFixed(8));
  * 1. REQUEST WITHDRAWAL (The Address Detective)
  */
 exports.requestWithdrawal = async (req, res) => {
@@ -115,6 +119,59 @@ exports.requestWithdrawal = async (req, res) => {
                     status: "PENDING"
                 }
             });
+
+            // §P.4 AUTHORITATIVE ACCOUNTING — withdrawal request debits the
+            // customer NOW, but the payout is PENDING: the funds are
+            // RESERVED until the provider outcome is observed (none of the
+            // wallet payout paths may ever touch user liability directly).
+            // Idempotent on the Withdrawal row's own durable identity:
+            //   D user:{userId}:liability — customer owed less (full W)
+            //   C restricted:reserves     — net payout held for the PENDING
+            //                               provider operation (W − F)
+            //   C equity:treasury         — platform fee realized at request
+            //                               (mirrors the SystemProfitFees
+            //                               increment above)
+            // reserve + fee === full debit exactly (8dp), and the restricted
+            // obligation total stays equal to the reserves ledger balance.
+            const reserveNet = new Prisma.Decimal(_exact(withdrawAmount))
+                .minus(new Prisma.Decimal(_exact(platformFeeUsdc)));
+            const reservation = await ledger.post(tx, {
+                idempotencyKey: `ledger:wallet:withdrawal:${withdrawal.id}`,
+                entryType: 'WITHDRAWAL',
+                description: 'Wallet withdrawal requested — provider payout pending, funds reserved',
+                userId,
+                relatedEntity: 'withdrawal',
+                relatedEntityId: withdrawal.id,
+                metadata: {
+                    status: 'PENDING',
+                    payoutMethod,
+                    network: detectedNetwork,
+                    platformFeeUsdc: _exact(platformFeeUsdc),
+                    totalGasFee: _exact(totalGasFee),
+                },
+                lines: [
+                    { account: `user:${userId}:liability`, debit: _exact(withdrawAmount) },
+                    { account: 'restricted:reserves', credit: reserveNet.toFixed(8) },
+                    ...(platformFeeUsdc > 0
+                        ? [{ account: 'equity:treasury', credit: _exact(platformFeeUsdc) }]
+                        : []),
+                ],
+            });
+            if (reserveNet.gt(0)) {
+                await restrictedObligations.createForPendingWithdrawal(tx, {
+                    sourceType: payoutMethod === 'MOMO'
+                        ? 'PENDING_FIAT_WITHDRAWAL'
+                        : 'PENDING_CRYPTO_WITHDRAWAL',
+                    reference: `withdrawal:wallet:${withdrawal.id}`,
+                    userId,
+                    amount: reserveNet,
+                    asset: 'USDC',
+                    sourceEntity: 'withdrawal',
+                    sourceEntityId: withdrawal.id,
+                    ledgerTransactionId: reservation.transaction.id,
+                    metadata: { payoutMethod, network: detectedNetwork, destination: cleanDest },
+                });
+            }
 
             return withdrawal;
         });
@@ -440,6 +497,10 @@ exports.getPolygonDepositAddress = async (req, res) => {
 
     } catch (error) {
         const logger = require('../src/config/logger');
+const { Prisma } = require('@prisma/client');
+const ledger = require('../services/ledgerService');
+const restrictedObligations = require('../services/restrictedObligationService');
+const _exact = (n) => (n instanceof Prisma.Decimal ? n.toFixed(8) : Number(n).toFixed(8));
         logger.error({ err: error }, '[getPolygonDepositAddress] error');
         return res.status(500).json({ success: false, message: error.message });
     }

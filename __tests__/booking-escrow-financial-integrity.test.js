@@ -61,6 +61,19 @@ function makeTx(overrides = {}) {
         adminProfitLog: {
             create: jest.fn().mockResolvedValue({}),
         },
+        // §P.4 ledger posting surface — the authoritative settlement now
+        // runs inside the same mocked transaction.
+        ledgerAccount: {
+            upsert: jest.fn().mockResolvedValue({}),
+        },
+        ledgerTransaction: {
+            findUnique: jest.fn().mockResolvedValue(null),
+            create: jest.fn().mockResolvedValue({ id: 'lt-1', postingHash: 'h' }),
+        },
+        journalEntry: {
+            findMany: jest.fn().mockResolvedValue([]),
+            create: jest.fn().mockResolvedValue({}),
+        },
         ...overrides,
     };
 }

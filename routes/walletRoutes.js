@@ -6,6 +6,9 @@
 // =============================================================================
 
 const logger = require('../src/config/logger');
+const { Prisma } = require('@prisma/client');
+const ledger = require('../services/ledgerService');
+const _exact = (n) => (n instanceof Prisma.Decimal ? n.toFixed(8) : Number(n).toFixed(8));
 const express                  = require('express');
 const router                   = express.Router();
 const walletController         = require('../controllers/walletController');
@@ -109,20 +112,40 @@ router.post('/internal-transfer', protectActive, require2FA(), idempotency(), as
         }
 
         if (direction === 'TO_POOL') {
-            // Available → Vendor Unallocated (fund trading pool)
-            if (user.availableBalance < amountFloat) {
-                return res.status(400).json({
-                    success: false,
-                    message: `Insufficient available balance. You have ${user.availableBalance} USDC.`
+            // Available → Vendor Unallocated (fund trading pool).
+            // §P.4: the mutation is a guarded conditional decrement inside the
+            // SAME transaction as the history row and the ledger posting —
+            // a racing wallet spend loses the CAS cleanly instead of driving
+            // the balance negative.
+            await prisma.$transaction(async (tx) => {
+                const claim = await tx.user.updateMany({
+                    where: { id: userId, availableBalance: { gte: amountFloat } },
+                    data: {
+                        availableBalance: { decrement: amountFloat },
+                        vendorUnallocatedBalance: { increment: amountFloat },
+                    },
                 });
-            }
-
-            await prisma.user.update({
-                where: { id: userId },
-                data: {
-                    availableBalance: { decrement: amountFloat },
-                    vendorUnallocatedBalance: { increment: amountFloat },
+                if (claim.count !== 1) {
+                    throw new Error(`Insufficient available balance. You have ${user.availableBalance} USDC.`);
                 }
+                const history = await tx.transactionHistory.create({
+                    data: { userId, type: 'INTERNAL_TRANSFER', amountUsdc: -amountFloat, feeUsdc: 0, status: 'COMPLETED' }
+                });
+                //   D user:{vendor}:liability    — available liability down
+                //   C user:{vendor}:unallocated  — restricted pool liability up
+                await ledger.post(tx, {
+                    idempotencyKey: `ledger:wallet:pool-topup:${history.id}`,
+                    entryType: 'VENDOR_TOPUP',
+                    description: 'Vendor trading-pool top-up from available wallet',
+                    userId,
+                    relatedEntity: 'transactionHistory',
+                    relatedEntityId: history.id,
+                    metadata: { direction, amount: _exact(amountFloat) },
+                    lines: [
+                        { account: `user:${userId}:liability`, debit: _exact(amountFloat) },
+                        { account: `user:${userId}:unallocated`, credit: _exact(amountFloat) },
+                    ],
+                });
             });
         } else {
             // Vendor Unallocated → Available (withdraw from trading pool)
@@ -133,12 +156,35 @@ router.post('/internal-transfer', protectActive, require2FA(), idempotency(), as
                 });
             }
 
-            await prisma.user.update({
-                where: { id: userId },
-                data: {
-                    vendorUnallocatedBalance: { decrement: amountFloat },
-                    availableBalance: { increment: amountFloat },
+            await prisma.$transaction(async (tx) => {
+                const claim = await tx.user.updateMany({
+                    where: { id: userId, vendorUnallocatedBalance: { gte: amountFloat } },
+                    data: {
+                        vendorUnallocatedBalance: { decrement: amountFloat },
+                        availableBalance: { increment: amountFloat },
+                    },
+                });
+                if (claim.count !== 1) {
+                    throw new Error(`Insufficient trading pool balance. You have ${user.vendorUnallocatedBalance} USDC.`);
                 }
+                const history = await tx.transactionHistory.create({
+                    data: { userId, type: 'INTERNAL_TRANSFER', amountUsdc: amountFloat, feeUsdc: 0, status: 'COMPLETED' }
+                });
+                //   D user:{vendor}:unallocated  — restricted pool liability down
+                //   C user:{vendor}:liability    — available liability up
+                await ledger.post(tx, {
+                    idempotencyKey: `ledger:wallet:pool-withdraw:${history.id}`,
+                    entryType: 'VENDOR_ALLOCATE',
+                    description: 'Vendor trading-pool withdrawal to available wallet',
+                    userId,
+                    relatedEntity: 'transactionHistory',
+                    relatedEntityId: history.id,
+                    metadata: { direction, amount: _exact(amountFloat) },
+                    lines: [
+                        { account: `user:${userId}:unallocated`, debit: _exact(amountFloat) },
+                        { account: `user:${userId}:liability`, credit: _exact(amountFloat) },
+                    ],
+                });
             });
 
             // Auto-deactivate ads that exceed the new pool balance
@@ -185,6 +231,9 @@ router.post('/internal-transfer', protectActive, require2FA(), idempotency(), as
             data: { direction, amount: amountFloat }
         });
     } catch (error) {
+        if (String(error.message || '').startsWith('Insufficient')) {
+            return res.status(400).json({ success: false, message: error.message });
+        }
         logger.error({ err: error }, '[wallet.internalTransfer] error');
         return res.status(500).json({ success: false, message: error.message });
     }

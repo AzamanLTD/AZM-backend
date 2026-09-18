@@ -3,7 +3,7 @@
 const crypto = require('crypto');
 const { audit } = require('../utils/audit');
 const logger = require('../src/config/logger');
-const journal = require('../services/journalIntegration');
+const ledger = require('../services/ledgerService'); // §P.4 authoritative ledger (shadow journalIntegration no longer used on this path)
 const {
   createServerTransactionQuote,
   consumeTransactionQuote,
@@ -122,6 +122,28 @@ exports.webhook = async (req, res) => {
       if (!user) throw new Error('User no longer exists for this deposit.');
       const updatedTx = await tx.transactionHistory.update({ where: { id: existing.id }, data: { status: 'COMPLETED', amountUsdc: quote.usdcAmount, payerMsisdn: existing.payerMsisdn || null, metadata: { ...(existing.metadata || {}), providerTxId: providerTxId || null, settledAmountGhs: settledGhs, settledAt: new Date().toISOString(), settlementRate: quote.rateGhsPerUsdc } } });
       await tx.user.update({ where: { id: existing.userId }, data: { availableBalance: { increment: quote.usdcAmount } } });
+
+      // §P.4 AUTHORITATIVE ACCOUNTING — fiat-settled USDC deposit: customer
+      // liability is credited against an EXPLICIT conversion clearing
+      // balance in the SAME transaction as the projection credit and the
+      // TransactionHistory settlement. No USDC inventory is invented (§P.5
+      // economics is NOT realized here); no fake custody asset is posted.
+      //   D clearing:conversion   — explicit temporary clearing balance
+      //   C user:{id}:liability    — customer liability increases
+      await ledger.post(tx, {
+        idempotencyKey: `ledger:deposit:fiat:${reference}`,
+        entryType: 'DEPOSIT',
+        description: 'Fiat-settled USDC deposit credited at quoted rate',
+        reference,
+        userId: existing.userId,
+        relatedEntity: 'transactionHistory',
+        relatedEntityId: existing.id,
+        metadata: { source: 'fiat', quoteId, amountGhs: settledGhs },
+        lines: [
+          { account: 'clearing:conversion', debit: quote.usdcAmount },
+          { account: `user:${existing.userId}:liability`, credit: quote.usdcAmount },
+        ],
+      });
       return { updatedTx, quote, newBalance: Number(user.availableBalance) + Number(quote.usdcAmount) };
     });
 
@@ -129,7 +151,6 @@ exports.webhook = async (req, res) => {
     if (io) io.to(`user_${existing.userId}`).emit('deposit_success', { type: 'DEPOSIT_FIAT', reference, providerTxId: providerTxId || null, amountGhs: settledGhs, usdcEquivalent: result.quote.usdcAmount, rate: result.quote.rateGhsPerUsdc, timestamp: new Date().toISOString() });
     try { await getNotificationService(req).sendNotification({ userId: existing.userId, title: 'Deposit Confirmed', body: `GH₵${settledGhs.toFixed(2)} deposited — ${result.quote.usdcAmount.toFixed(2)} USDC added at your quoted rate.`, category: 'GENERAL', actionPayload: { action: 'OPEN_WALLET', reference } }); } catch (notificationError) { logger.error({ err: notificationError }, '[quoteFiatDepositWebhook] notification non-fatal'); }
     await audit(prisma, { actorId: existing.userId, actorName: '', action: 'DEPOSIT_FIAT_COMPLETED', targetType: 'TRANSACTION', targetId: String(existing.id), metadata: { amountGhs: settledGhs, amountUsdc: result.quote.usdcAmount, rate: result.quote.rateGhsPerUsdc, quoteId, providerTxId: providerTxId || null }, ipAddress: req.ip });
-    journal.recordDeposit(existing.userId, result.quote.usdcAmount, reference, { source: 'fiat', provider: existing.metadata?.provider, amountGhs: settledGhs, quoteId }).catch((e) => logger.warn({ err: e.message, reference }, '[quoteFiatDepositWebhook] Journal recording failed'));
     return res.status(200).json({ success: true, message: 'Deposit confirmed and credited.', data: { reference, userId: existing.userId, amountGhs: settledGhs, usdcEquivalent: result.quote.usdcAmount, rate: result.quote.rateGhsPerUsdc, quoteId, transaction: result.updatedTx } });
   } catch (error) {
     logger.error({ err: error }, '[quoteFiatDepositWebhook] error');

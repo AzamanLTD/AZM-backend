@@ -12,6 +12,9 @@
 
 const logger = require('../src/config/logger');
 const NotificationService = require('../services/notificationService');
+const { Prisma } = require('@prisma/client');
+const ledger = require('../services/ledgerService');
+const _exact = (n) => (n instanceof Prisma.Decimal ? n.toFixed(8) : Number(n).toFixed(8));
 
 class TradeWorker {
     constructor(prisma, io, tradeSocketService) {
@@ -222,6 +225,34 @@ class TradeWorker {
                 if (claimed.count === 0) {
                     throw new Error('TRADE_ALREADY_FINALIZED');
                 }
+
+                // §P.4 AUTHORITATIVE LEDGER — expired-trade escrow release,
+                // same transaction as the single-winner AUTO_CANCELLED claim
+                // above, idempotent on the trade's terminal identity:
+                //   SELL: D escrow:trade-{id}:locked → C user:{vendor}:unallocated
+                //         (restriction returns to the vendor trading pool)
+                //   BUY:  D escrow:trade-{id}:locked → C user:{user}:liability
+                //         (restriction refunds to available)
+                await ledger.post(tx, {
+                    idempotencyKey: `ledger:p2p:auto-cancel:${trade.id}`,
+                    entryType: trade.type === 'SELL' ? 'VENDOR_ALLOCATE' : 'ESCROW_REFUND',
+                    description: trade.type === 'SELL'
+                        ? 'Trade expired — vendor escrow returned to trading pool'
+                        : 'Trade expired — escrowed USDC refunded to buyer',
+                    userId: trade.type === 'SELL' ? trade.vendorId : trade.userId,
+                    relatedEntity: 'trade',
+                    relatedEntityId: trade.id,
+                    metadata: { status: 'AUTO_CANCELLED', amount: _exact(trade.amountCrypto) },
+                    lines: trade.type === 'SELL'
+                        ? [
+                            { account: `escrow:trade-${trade.id}:locked`, debit: _exact(trade.amountCrypto) },
+                            { account: `user:${trade.vendorId}:unallocated`, credit: _exact(trade.amountCrypto) },
+                        ]
+                        : [
+                            { account: `escrow:trade-${trade.id}:locked`, debit: _exact(trade.amountCrypto) },
+                            { account: `user:${trade.userId}:liability`, credit: _exact(trade.amountCrypto) },
+                        ],
+                });
 
                 if (trade.type === 'SELL') {
                     // Vendor's escrow goes back to their unallocated balance.

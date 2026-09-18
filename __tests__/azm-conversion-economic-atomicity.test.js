@@ -100,11 +100,17 @@ const prisma = hasDb
 // The variable must carry the `mock` prefix (jest.mock hoisting rule); the
 // factory executes lazily at require time, after the assignment below.
 let mockPrisma = null;
-jest.mock('@prisma/client', () => ({
-    PrismaClient: function BarrierRoutedClient() {
-        return mockPrisma;
-    },
-}));
+jest.mock('@prisma/client', () => {
+    // ledgerService (wired into the conversion path in §P.4) reads
+    // Prisma.Decimal from this module — the mock must keep it.
+    const actual = jest.requireActual('@prisma/client');
+    return {
+        ...actual,
+        PrismaClient: function BarrierRoutedClient() {
+            return mockPrisma;
+        },
+    };
+});
 mockPrisma = prisma;
 
 const controller = require('../controllers/azmConversionController');

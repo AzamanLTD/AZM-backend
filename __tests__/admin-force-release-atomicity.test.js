@@ -4,6 +4,14 @@ jest.mock('../src/config/logger', () => ({
     info: jest.fn(),
 }));
 jest.mock('../utils/securityCheck', () => ({ runDoubleCheck: jest.fn() }));
+jest.mock('../services/ledgerService', () => {
+    const { Decimal } = require('@prisma/client').Prisma;
+    return {
+        post: jest.fn().mockResolvedValue({ id: 'j1', transaction: { id: 'lt1' } }),
+        exactResidual: (total, parts) => parts.reduce(
+            (acc, part) => acc.minus(part), new Decimal(total)),
+    };
+});
 jest.mock('../services/businessOrderService', () => ({
     updateOrderStatusFromEscrow: jest.fn().mockResolvedValue(undefined),
 }));

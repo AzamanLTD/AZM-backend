@@ -16,7 +16,8 @@
 
 const logger = require('../src/config/logger');
 const fraudService = require('../services/fraudDetectionService');
-const journal = require('../services/journalIntegration');
+const ledger = require('../services/ledgerService'); // §P.4 authoritative ledger (shadow journalIntegration no longer used on this path)
+const restrictedObligations = require('../services/restrictedObligationService');
 const financeService          = require('../services/finance.service');
 const { runDoubleCheck }      = require('../utils/securityCheck');
 const axios                   = require('axios');
@@ -656,6 +657,50 @@ exports.cryptoWithdrawal = async (req, res) => {
                 }
             });
 
+            // §P.4 AUTHORITATIVE ACCOUNTING — inside the SAME reservation
+            // transaction as the customer debit, the PENDING ledger row and
+            // the CustodyExecution:
+            //   D user:{id}:liability  — customer owed less (full amount)
+            //   C restricted:reserves  — funds reserved for the pending
+            //                            external execution
+            // The restricted obligation is persisted and LINKED to the
+            // execution identity. It is released ONLY on verified settlement
+            // (settleExecution) or definitive pre-broadcast failure refund.
+            // AMBIGUOUS outcomes stay RECONCILIATION_REQUIRED — the
+            // obligation is NEVER auto-refunded.
+            const withdrawalReservation = await ledger.post(tx, {
+                idempotencyKey: `ledger:withdrawal:crypto:execution:${execution.id}`,
+                entryType: 'CUSTODY_WITHDRAWAL',
+                description: 'Crypto withdrawal reservation (customer debit; external execution pending)',
+                reference: `custody-exec:${execution.id}`,
+                userId,
+                relatedEntity: 'custodyExecution',
+                relatedEntityId: execution.id,
+                metadata: { status: 'PENDING', transactionHistoryId: txRecord.id },
+                lines: [
+                    { account: `user:${userId}:liability`, debit: amountExact },
+                    { account: 'restricted:reserves', credit: amountExact },
+                ],
+            });
+            await restrictedObligations.createForPendingWithdrawal(tx, {
+                sourceType: 'PENDING_CRYPTO_WITHDRAWAL',
+                reference: `withdrawal:crypto:${execution.id}`,
+                userId,
+                amount: amountExact,
+                asset: 'USDC',
+                network: 'POLYGON',
+                sourceEntity: 'custodyExecution',
+                sourceEntityId: execution.id,
+                ledgerTransactionId: withdrawalReservation.transaction.id,
+                domainStateRef: {
+                    custodyExecutionId: execution.id,
+                    transactionHistoryId: txRecord.id,
+                    customerDebitBaseUnits: String(amountBase),
+                    netPayoutBaseUnits: String(payoutBaseUnits),
+                    feeChargeBaseUnits: String(feeBaseUnits),
+                },
+            });
+
             return { user, txRecord, execution };
         });
 
@@ -681,13 +726,6 @@ exports.cryptoWithdrawal = async (req, res) => {
             const submission = await custody.submitExecution(prisma, { executionId: result.execution.id });
 
             if (emitBalanceUpdate) await emitBalanceUpdate(userId);
-
-            // Double-entry journal (non-blocking, fail-safe). The reference is
-            // the durable custody execution identity — a REAL tx hash only
-            // exists after broadcast evidence, so it is never fabricated here.
-            journal.recordWithdrawal(userId, amountFloat, `custody-exec:${result.execution.id}`,
-                { source: 'crypto', netPayout: netPayoutExact, gasFeeExact: feeExact, status: 'PENDING', executionId: result.execution.id })
-                .catch(e => logger.warn({ err: e.message }, '[withdrawalController] Journal recording failed'));
 
             await audit(prisma, {
                 userId,
@@ -769,6 +807,37 @@ exports.cryptoWithdrawal = async (req, res) => {
                     await tx.user.update({
                         where: { id: userId },
                         data:  { availableBalance: { increment: new Prisma.Decimal(amountExact) } }
+                    });
+                    // §P.4 authoritative reversal — atomic with the refund
+                    // projection credit and the FAILED execution transition.
+                    // Applies ONLY when the §P.4 reservation exists (legacy
+                    // executions have no ledger truth to reverse):
+                    //   D restricted:reserves — reservation returns
+                    //   C user:{id}:liability — customer owed the refund
+                    // Exactly-once: the reservation posting cannot exist
+                    // twice, and the obligation cancel is a conditional
+                    // single-winner claim.
+                    const reservation = await tx.restrictedObligation.findFirst({
+                        where: { reference: `withdrawal:crypto:${result.execution.id}`, status: 'ACTIVE' },
+                    });
+                    if (!reservation) return; // legacy execution — no ledger truth to reverse
+                    const reversal = await ledger.post(tx, {
+                        idempotencyKey: `ledger:withdrawal:crypto:refund:${result.execution.id}`,
+                        entryType: 'CUSTODY_WITHDRAWAL',
+                        description: 'Crypto withdrawal refund — definitive pre-broadcast failure',
+                        reference: `custody-exec:${result.execution.id}`,
+                        userId,
+                        relatedEntity: 'custodyExecution',
+                        relatedEntityId: result.execution.id,
+                        metadata: { status: 'REFUNDED' },
+                        lines: [
+                            { account: 'restricted:reserves', debit: amountExact },
+                            { account: `user:${userId}:liability`, credit: amountExact },
+                        ],
+                    });
+                    await restrictedObligations.cancelOnReversal(tx, {
+                        reference: `withdrawal:crypto:${result.execution.id}`,
+                        releaseLedgerTransactionId: reversal.transaction.id,
                     });
                     await tx.systemHotWallet.update({
                         where: { id: 1 },

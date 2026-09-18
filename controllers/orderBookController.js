@@ -20,9 +20,11 @@
 // Pair: AZM/USDC (price in USDC, quantity in AZM)
 // =============================================================================
 
-const { PrismaClient } = require('@prisma/client');
+const { PrismaClient, Prisma } = require('@prisma/client');
 const prisma = new PrismaClient();
 const logger = require('../src/config/logger');
+const ledger = require('../services/ledgerService');
+const _exact = (n) => (n instanceof Prisma.Decimal ? n.toFixed(8) : Number(n).toFixed(8));
 
 const PAIR = 'AZM/USDC';
 const MAKER_FEE = 0.002; // 0.2%
@@ -93,6 +95,25 @@ async function placeOrder(req, res) {
         await tx.user.update({
           where: { id: userId },
           data: { availableBalance: { decrement: reserveUsdc } },
+        });
+        // §P.4 AUTHORITATIVE LEDGER — BUY reserve enters the matching
+        // engine's clearing pool (the order book never touches user escrow
+        // projection columns), same transaction, idempotent on the freshly
+        // created order identity:
+        //   D user:{userId}:liability — available liability down
+        //   C clearing:orderbook:usdc — reserve held by the matching engine
+        await ledger.post(tx, {
+          idempotencyKey: `ledger:orderbook:reserve:${order.id}`,
+          entryType: 'TRADE',
+          description: 'Order-book BUY placed — USDC reserve withheld by matching engine',
+          userId,
+          relatedEntity: 'orderBookOrder',
+          relatedEntityId: order.id,
+          metadata: { side: 'BUY', type, reserveUsdc: _exact(reserveUsdc) },
+          lines: [
+            { account: `user:${userId}:liability`, debit: _exact(reserveUsdc) },
+            { account: 'clearing:orderbook:usdc', credit: _exact(reserveUsdc) },
+          ],
         });
       }
 
@@ -221,6 +242,45 @@ async function matchOrder(tx, order) {
       data: { balance: { increment: totalFees } },
     });
 
+    // §P.4 AUTHORITATIVE LEDGER — match settlement, same transaction,
+    // idempotent on the durable orderBookTrade row. The clearing pool is
+    // charged EXACTLY what is distributed (seller-side credit + fees), so
+    // every posting balances with no residual and no mint:
+    //   BUY taker:  D clearing:orderbook:usdc → C user:{maker}:liability
+    //               (taker's reserve funds the maker's USDC + both fees;
+    //               taker receives AZM, which is outside the USDC ledger)
+    //   SELL taker: D clearing:orderbook:usdc → C user:{taker}:liability
+    //               (maker's BUY reserve funds the taker's USDC + both fees;
+    //               maker receives AZM, outside the USDC ledger)
+    {
+      const sellerCreditExact = new Prisma.Decimal(
+        _exact(order.side === 'BUY' ? makerUsdcCredit : takerUsdcCredit)
+      );
+      const feesExact = new Prisma.Decimal(_exact(totalFees));
+      const charge = sellerCreditExact.plus(feesExact);
+      await ledger.post(tx, {
+        idempotencyKey: `ledger:orderbook:match:${trade.id}`,
+        entryType: 'TRADE',
+        description: 'Order-book match settled — USDC reserve released to seller side, fees realized',
+        userId: order.userId,
+        relatedEntity: 'orderBookTrade',
+        relatedEntityId: trade.id,
+        metadata: {
+          takerOrderId: order.id,
+          makerOrderId: candidate.id,
+          matchQty, matchPrice,
+          makerFee: _exact(makerFee), takerFee: _exact(takerFee),
+        },
+        lines: [
+          { account: 'clearing:orderbook:usdc', debit: charge.toFixed(8) },
+          ...(order.side === 'BUY'
+            ? [{ account: `user:${candidate.userId}:liability`, credit: sellerCreditExact.toFixed(8) }]
+            : [{ account: `user:${order.userId}:liability`, credit: sellerCreditExact.toFixed(8) }]),
+          { account: 'equity:treasury', credit: feesExact.toFixed(8) },
+        ],
+      });
+    }
+
     // Update remaining quantities
     remainingQty -= matchQty;
     const candidateRemaining = parseFloat(candidate.remainingQuantity.toString()) - matchQty;
@@ -258,6 +318,22 @@ async function matchOrder(tx, order) {
         await tx.user.update({
           where: { id: order.userId },
           data: { availableBalance: { increment: refundAmount } },
+        });
+        // §P.4 AUTHORITATIVE LEDGER — unused market-order reserve refunds
+        // from the clearing pool, same transaction, idempotent on the
+        // order's placement identity (a MARKET order finalizes once).
+        await ledger.post(tx, {
+          idempotencyKey: `ledger:orderbook:place-refund:${order.id}`,
+          entryType: 'TRADE',
+          description: 'Market BUY could not fully fill — unused reserve refunded',
+          userId: order.userId,
+          relatedEntity: 'orderBookOrder',
+          relatedEntityId: order.id,
+          metadata: { refundAmount: _exact(refundAmount) },
+          lines: [
+            { account: 'clearing:orderbook:usdc', debit: _exact(refundAmount) },
+            { account: `user:${order.userId}:liability`, credit: _exact(refundAmount) },
+          ],
         });
       }
     }
@@ -394,6 +470,15 @@ async function cancelOrder(req, res) {
     // Refund remaining balance
     const remaining = parseFloat(order.remainingQuantity.toString());
     await prisma.$transaction(async (tx) => {
+      // Single-winner claim: only one caller can flip this order to
+      // CANCELLED — a double cancel would double-refund real money.
+      const claim = await tx.orderBookOrder.updateMany({
+        where: { id: orderId, status: { in: ['OPEN', 'PARTIALLY_FILLED'] } },
+        data: { status: 'CANCELLED' },
+      });
+      if (claim.count !== 1) {
+        throw new Error('ORDER_ALREADY_FINALIZED');
+      }
       if (order.side === 'SELL') {
         await tx.user.update({
           where: { id: userId },
@@ -403,15 +488,25 @@ async function cancelOrder(req, res) {
         const refundUsdc = remaining * parseFloat(order.price.toString());
         await tx.user.update({
           where: { id: userId },
-          data: { availableBalance: { increment: refundUsdc },
-        },
+          data: { availableBalance: { increment: refundUsdc } },
+        });
+        // §P.4 AUTHORITATIVE LEDGER — cancelled BUY reserve refunds from
+        // the clearing pool, same transaction, idempotent on the order's
+        // terminal identity (the CANCELLED claim above is single-winner).
+        await ledger.post(tx, {
+          idempotencyKey: `ledger:orderbook:cancel:${orderId}`,
+          entryType: 'TRADE',
+          description: 'Order-book BUY cancelled — remaining reserve refunded',
+          userId,
+          relatedEntity: 'orderBookOrder',
+          relatedEntityId: orderId,
+          metadata: { refundUsdc: _exact(refundUsdc) },
+          lines: [
+            { account: 'clearing:orderbook:usdc', debit: _exact(refundUsdc) },
+            { account: `user:${userId}:liability`, credit: _exact(refundUsdc) },
+          ],
         });
       }
-
-      await tx.orderBookOrder.update({
-        where: { id: orderId },
-        data: { status: 'CANCELLED' },
-      });
     });
 
     return res.json({ success: true, message: 'Order cancelled.' });

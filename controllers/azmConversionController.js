@@ -27,6 +27,9 @@
 const { PrismaClient } = require('@prisma/client');
 const prisma = new PrismaClient();
 const logger = require('../src/config/logger');
+const { Prisma } = require('@prisma/client');
+const ledger = require('../services/ledgerService');
+const _exact = (n) => (n instanceof Prisma.Decimal ? n.toFixed(8) : Number(n).toFixed(8));
 const { AzmSpendService, AZM_SPEND_SOURCES } = require('../services/azmSpendService');
 
 const spendService = new AzmSpendService(prisma);
@@ -212,6 +215,30 @@ async function convertAzmToUsdc(req, res) {
           balanceAfter: newAzmBalance,
           dedupKey: `azm_conversion_${conversionLog.id}`,
         },
+      });
+
+      // §P.4 AUTHORITATIVE LEDGER — AZM→USDC redemption, same transaction,
+      // idempotent on the durable AzmConversionLog row created above (its
+      // auto id is the stable identity; the DB-unique spend-log dedupKey
+      // derived from it already aborts duplicate attempts whole):
+      //   D equity:treasury          — platform profit pool drained to back
+      //                                 the redemption (the SystemProfitFees
+      //                                 conditional decrement above)
+      //   C user:{userId}:liability  — customer credited in USDC
+      // Both legs carry the SAME exact 8dp string the projection credited,
+      // so the posting balances exactly.
+      await ledger.post(tx, {
+        idempotencyKey: `ledger:azm:conversion:${conversionLog.id}`,
+        entryType: 'REWARD',
+        description: 'AZM redemption — profit-pool USDC released to customer balance',
+        userId,
+        relatedEntity: 'azmConversionLog',
+        relatedEntityId: conversionLog.id,
+        metadata: { azmAmount: _exact(amount), rate: rateInfo.rate, holderBonus: rateInfo.rate !== rateInfo.baseRate * rateInfo.healthFactor },
+        lines: [
+          { account: 'equity:treasury', debit: _exact(usdcAmount) },
+          { account: `user:${userId}:liability`, credit: _exact(usdcAmount) },
+        ],
       });
 
       // 6. Record transaction history
