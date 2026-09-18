@@ -93,7 +93,7 @@ const makeConcurrentPrisma = ({ synchronizeInitialReads = false } = {}) => {
     // §P.4 ledger posting surface — the authoritative settlement posts
     // inside the same (mocked) transaction.
     ledgerAccount: {
-      upsert: jest.fn(async () => ({})),
+      upsert: jest.fn(({ create }) => ({ ...create })),
     },
     ledgerTransaction: {
       findUnique: jest.fn(async () => null),

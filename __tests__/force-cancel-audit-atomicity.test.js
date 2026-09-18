@@ -113,7 +113,7 @@ describe('forceCancel audit wiring (mocked transaction)', () => {
             auditLog: { create: txAuditCreate },
             // §P.4 ledger delegates (wave-2: forceCancel posts the escrow
             // refund reclassification in the same transaction)
-            ledgerAccount: { upsert: jest.fn().mockResolvedValue({}) },
+            ledgerAccount: { upsert: jest.fn(({ create }) => ({ ...create })) },
             ledgerTransaction: {
                 findUnique: jest.fn().mockResolvedValue(null),
                 create: jest.fn().mockResolvedValue({ id: 1, postingHash: expect.any(String) }),
@@ -145,7 +145,7 @@ describe('forceCancel audit wiring (mocked transaction)', () => {
             conversation: { findUnique: jest.fn().mockResolvedValue({ id: 'conv-1' }) },
             message: { create: jest.fn().mockResolvedValue({}) },
             auditLog: { create: jest.fn().mockRejectedValue(new Error('audit unavailable')) },
-            ledgerAccount: { upsert: jest.fn().mockResolvedValue({}) },
+            ledgerAccount: { upsert: jest.fn(({ create }) => ({ ...create })) },
             ledgerTransaction: {
                 findUnique: jest.fn().mockResolvedValue(null),
                 create: jest.fn().mockResolvedValue({ id: 1, postingHash: expect.any(String) }),

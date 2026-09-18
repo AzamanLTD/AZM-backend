@@ -21,7 +21,7 @@ describe('acceptPing balance concurrency', () => {
       // §P.4 ledger posting surface — the top-up posts inside the same
       // (mocked) transaction.
       ledgerAccount: {
-        upsert: jest.fn().mockResolvedValue({}),
+        upsert: jest.fn(({ create }) => ({ ...create })),
       },
       ledgerTransaction: {
         findUnique: jest.fn().mockResolvedValue(null),
