@@ -373,12 +373,21 @@ async function createSnapshot({ balanceProvider } = {}) {
 
     // 5. Compose the honest report (exact Decimals).
     const X = flows ? flows.usdcLiabilityTotal : null;
+    // §P.4 AUTHORITATIVE RESTRICTED OBLIGATIONS: the denominator now has a
+    // persisted authoritative source (RestrictedObligation rows created/
+    // released in the same transactions as the ledger reservations).
+    // `complete` is true ONLY when every required source family is
+    // authoritative. While ANY family (escrow/dispute/vendor) is still
+    // unmodelled, the denominator is incomplete and the total is reported as
+    // null — the fully-backed claim stays impossible (fail closed, the
+    // unknown part is NEVER invented as zero).
+    const restricted = await require('./restrictedObligationService').authoritativeTotals(prisma, { asset: 'USDC' });
     const report = composeLiabilityReport({
         usdcLiabilityTotal: X,
         evidenceLinkedTotal: flows ? flows.evidenceLinkedUsdcObligation : null,
         mixedPoolLiabilityTotal: state.mixedPoolTotal,
         eligibleReserveTotal,
-        restrictedObligationsTotal: null, // boundary: no authoritative semantics yet (§P.4+)
+        restrictedObligationsTotal: restricted.complete ? restricted.total : null,
         evidenceHealthy: evidenceStatus === 'HEALTHY',
         evidenceStatus,
     });

@@ -369,7 +369,7 @@ describeOrSkip('§P.3 custody accounting (real PostgreSQL)', () => {
     const TRUNCATE_ALL = () => prisma.$executeRawUnsafe(
         'TRUNCATE TABLE "CustodyEvidence", "CustodyMovement", "CustodyAccount", "CustodyExecution", ' +
         '"OnchainSweep", "TransactionHistory", "WalletAddress", "User", "SystemHotWallet", ' +
-        '"SystemMasterCrypto", "SystemFiatPool", "JournalEntry", "ProofOfReservesSnapshot", ' +
+        '"SystemMasterCrypto", "SystemFiatPool", "JournalEntry", "LedgerTransaction", "LedgerAccount", "ProofOfReservesSnapshot", ' +
         '"ProofOfReservesLeaf" RESTART IDENTITY CASCADE'
     );
     // 30s hook timeout: TRUNCATE of 14 tables must survive GitHub-hosted

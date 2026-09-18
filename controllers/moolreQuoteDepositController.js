@@ -3,7 +3,7 @@
 const crypto = require('crypto');
 const { audit } = require('../utils/audit');
 const logger = require('../src/config/logger');
-const journal = require('../services/journalIntegration');
+const ledger = require('../services/ledgerService'); // §P.4 authoritative ledger (shadow journalIntegration no longer used on this path)
 const {
   createTransactionQuote,
   persistTransactionQuote,
@@ -225,6 +225,25 @@ exports.webhook = async (req, res) => {
         data: { availableBalance: { increment: quote.usdcAmount } },
       });
 
+      // §P.4 AUTHORITATIVE ACCOUNTING — same caller transaction as the
+      // projection credit + TransactionHistory settlement:
+      //   D clearing:conversion   — explicit temporary clearing (§P.5 later)
+      //   C user:{id}:liability    — customer liability increases
+      await ledger.post(tx, {
+        idempotencyKey: `ledger:deposit:fiat:${externalRef}`,
+        entryType: 'DEPOSIT',
+        description: 'Fiat-settled USDC deposit credited (Moolre/aggregator settlement)',
+        reference: externalRef,
+        userId: existing.userId,
+        relatedEntity: 'transactionHistory',
+        relatedEntityId: existing.id,
+        metadata: { source: 'moolre', quoteId, amountGhs: settledGhs },
+        lines: [
+          { account: 'clearing:conversion', debit: quote.usdcAmount },
+          { account: `user:${existing.userId}:liability`, credit: quote.usdcAmount },
+        ],
+      });
+
       return { updatedTx, quote, newBalance: Number(user.availableBalance) + Number(quote.usdcAmount) };
     });
 
@@ -259,12 +278,6 @@ exports.webhook = async (req, res) => {
       metadata: { amountGhs: settledGhs, amountUsdc: result.quote.usdcAmount, externalRef, quoteId },
       ipAddress: req.ip,
     });
-
-    journal.recordDeposit(existing.userId, result.quote.usdcAmount, externalRef, {
-      source: 'moolre',
-      amountGhs: settledGhs,
-      quoteId,
-    }).catch((e) => logger.warn({ err: e.message, externalRef }, '[moolreQuoteDeposit] Journal recording failed'));
 
     return res.status(200).json({
       success: true,

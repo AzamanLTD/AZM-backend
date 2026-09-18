@@ -14,7 +14,7 @@
 
 const logger = require('../src/config/logger');
 const fraudService = require('../services/fraudDetectionService');
-const journal = require('../services/journalIntegration');
+const ledger = require('../services/ledgerService'); // §P.4 authoritative ledger (shadow journalIntegration no longer used on this path)
 const NotificationService = require('../services/notificationService');
 
 let notificationService;
@@ -144,12 +144,18 @@ exports.sendFunds = async (req, res) => {
                 throw new Error('INSUFFICIENT_FUNDS');
             }
 
-
-            // Debit sender
-            await tx.user.update({
-                where: { id: senderId },
-                data: { availableBalance: { decrement: transferAmount } }
+            // §P.4: GUARDED conditional claim — the balance predicate is
+            // re-evaluated atomically with the decrement, so two concurrent
+            // transfers can never both pass the pre-check and drive the
+            // customer projection negative. The loser's transaction rolls
+            // back (including its ledger posting — fail-closed together).
+            const debitClaim = await tx.user.updateMany({
+                where: { id: senderId, availableBalance: { gte: transferAmount } },
+                data:  { availableBalance: { decrement: transferAmount } }
             });
+            if (debitClaim.count !== 1) {
+                throw new Error('INSUFFICIENT_FUNDS');
+            }
 
             // Credit receiver
             await tx.user.update({
@@ -196,6 +202,27 @@ exports.sendFunds = async (req, res) => {
                     txHash: receiverTxHash,
                     status: 'COMPLETED'
                 }
+            });
+
+            // §P.4 AUTHORITATIVE ACCOUNTING — internal customer transfer in
+            // the SAME caller transaction: sender liability decreases,
+            // receiver liability increases. NOT revenue, NOT external money.
+            // Exactly-once under concurrent replay via the durable
+            // idempotency key (senderTxHash is already the TransactionHistory
+            // idempotency identity of this operation).
+            await ledger.post(tx, {
+                idempotencyKey: `ledger:transfer:${senderTxHash}`,
+                entryType: 'TRANSFER',
+                description: 'Internal peer transfer',
+                reference: reference || null,
+                userId: senderId,
+                relatedEntity: 'peerTransfer',
+                relatedEntityId: transfer.id,
+                metadata: { senderId, receiverId },
+                lines: [
+                    { account: `user:${senderId}:liability`, debit: transferAmount },
+                    { account: `user:${receiverId}:liability`, credit: transferAmount },
+                ],
             });
 
             // Create DirectMessage to show in chat
@@ -273,11 +300,6 @@ exports.sendFunds = async (req, res) => {
                 transferId: result.transfer.id
             }
         });
-
-        // Double-entry journal (non-blocking, fail-safe)
-        journal.recordTransfer(senderId, receiverId, transferAmount, result.transfer.id, {
-            reference: reference || null
-        }).catch(e => logger.warn({ err: e.message, transferId: result.transfer.id }, '[peerTransfer] Journal failed'));
 
         return res.status(200).json({
             success: true,

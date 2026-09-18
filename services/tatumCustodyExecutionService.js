@@ -1242,6 +1242,59 @@ async function settleExecution(prisma, { executionId, evidence } = {}) {
         }
         await custodyAccounting.recordExecutionMovement(tx, { execution, hotWalletAddress: settleCfg.hotWalletAddress });
 
+        // §P.4 AUTHORITATIVE SETTLEMENT ACCOUNTING — inside the SAME
+        // transaction as the COMPLETED transition, the TransactionHistory
+        // completion and the VERIFIED custody movement. For a customer
+        // withdrawal the reserved funds leave:
+        //   D restricted:reserves     — full reserved amount
+        //   C custody:hot:usdc       — net payout leaves hot custody
+        //   C revenue:fees           — the charged fee is realized only NOW
+        //                             (on verified execution — an estimate
+        //                             is never converted into realized
+        //                             economics)
+        // and the restricted obligation is released (conditional single-
+        // winner claim; idempotent on settlement retry).
+        if (execution.kind === 'CUSTOMER_WITHDRAWAL') {
+            const ledger = require('./ledgerService');
+            const restrictedObligations = require('./restrictedObligationService');
+            // §P.4: the ledger settlement leg applies ONLY to executions that
+            // reserved through the authoritative ledger (the §P.4 reservation
+            // created the linked restricted obligation). Legacy/pre-P4
+            // executions settle with P3 custody semantics only — their
+            // economic history is never retroactively invented.
+            const pendingObligation = await tx.restrictedObligation.findFirst({
+                where: { reference: `withdrawal:crypto:${execution.id}`, status: 'ACTIVE' },
+            });
+            if (!pendingObligation) {
+                return { settled: true, alreadySettled: false, status: STATUSES.COMPLETED, txHash: execution.txHash, ledgerSettlement: 'SKIPPED_NO_LEDGER_RESERVATION' };
+            }
+            const fullDebit = custodyAccounting.decimalStringFromBaseUnits(BigInt(execution.metadata?.customerDebitBaseUnits ?? execution.amountBaseUnits), 6);
+            const netPayout = custodyAccounting.decimalStringFromBaseUnits(BigInt(execution.amountBaseUnits), 6);
+            const feeCharged = custodyAccounting.decimalStringFromBaseUnits(BigInt(execution.feeChargeBaseUnits ?? 0), 6);
+            const lines = [
+                { account: 'restricted:reserves', debit: fullDebit },
+                { account: 'custody:hot:usdc', credit: netPayout },
+            ];
+            if (!(new (require('@prisma/client').Prisma.Decimal)(feeCharged)).isZero()) {
+                lines.push({ account: 'revenue:fees', credit: feeCharged });
+            }
+            const settlementPost = await ledger.post(tx, {
+                idempotencyKey: `ledger:withdrawal:crypto:settle:${execution.id}`,
+                entryType: 'CUSTODY_WITHDRAWAL',
+                description: 'Crypto withdrawal settled on verified chain evidence',
+                reference: `custody-exec:${execution.id}`,
+                userId: execution.userId ?? null,
+                relatedEntity: 'custodyExecution',
+                relatedEntityId: execution.id,
+                metadata: { status: 'COMPLETED', txHash: execution.txHash, kind: 'SETTLEMENT' },
+                lines,
+            });
+            await restrictedObligations.releaseOnSettlement(tx, {
+                reference: `withdrawal:crypto:${execution.id}`,
+                releaseLedgerTransactionId: settlementPost.transaction.id,
+            });
+        }
+
         return { settled: true, alreadySettled: false, status: STATUSES.COMPLETED, txHash: execution.txHash };
     });
 }

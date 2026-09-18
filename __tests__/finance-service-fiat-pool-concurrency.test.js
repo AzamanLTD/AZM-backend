@@ -1,4 +1,10 @@
 jest.mock('../utils/securityCheck', () => ({ runDoubleCheck: jest.fn().mockResolvedValue(undefined) }));
+jest.mock('../services/ledgerService', () => ({ post: jest.fn().mockResolvedValue({ id: 'j1', transaction: { id: 'lt1' } }), accountBalance: jest.fn() }));
+jest.mock('../services/restrictedObligationService', () => ({
+    createForPendingWithdrawal: jest.fn().mockResolvedValue({ id: 'o1' }),
+    releaseOnSettlement: jest.fn().mockResolvedValue(undefined),
+    cancelOnReversal: jest.fn().mockResolvedValue(undefined),
+}));
 
 const { processFiatWithdrawal } = require('../services/finance.service');
 
@@ -31,6 +37,7 @@ describe('processFiatWithdrawal fiat-pool concurrency guard', () => {
       },
       transactionHistory: {
         create: jest.fn().mockResolvedValue({ id: 'tx', status: 'PENDING' }),
+        findUnique: jest.fn().mockResolvedValue({ id: 'tx' }),
       },
     };
 
