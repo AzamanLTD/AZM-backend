@@ -1,14 +1,11 @@
-// §P.5-A multi-asset identity — real PostgreSQL proofs. Cross-asset numeric
-// coincidence fails closed; only explicit ASSET_CONVERSION (DB-enforced
-// identity, exact rate provenance, per-asset balanced legs) is legitimate.
+// §P.5-A multi-asset identity — real PostgreSQL proofs: cross-asset numeric
+// coincidence fails closed; only explicit ASSET_CONVERSION is legitimate.
 const describeOrSkip = process.env.TEST_DATABASE_URL ? describe : describe.skip;
 const { Prisma, PrismaClient } = require('@prisma/client');
 const ledger = require('../services/ledgerService');
 const { seedUser } = require('./helpers/factories');
-
 describeOrSkip('§P.5-A multi-asset accounting identity (real PostgreSQL)', () => {
     let prisma;
-
     beforeAll(async () => {
         process.env.DATABASE_URL = process.env.TEST_DATABASE_URL;
         process.env.NODE_ENV = 'test';
@@ -24,7 +21,6 @@ describeOrSkip('§P.5-A multi-asset accounting identity (real PostgreSQL)', () =
     );
     beforeEach(async () => { await TRUNCATE_ALL(); }, 30000);
     afterEach(async () => { await TRUNCATE_ALL(); }, 30000);
-
     const post = (tx, params) => ledger.post(tx, params);
     const conversionLegs = () => [
         { account: 'fiat:momo:ghs', debit: '1200' },
@@ -32,7 +28,6 @@ describeOrSkip('§P.5-A multi-asset accounting identity (real PostgreSQL)', () =
         { account: 'equity:treasury', debit: '100' },
         { account: 'custody:deposit:usdc', credit: '100' },
     ];
-
     // A + B. Existing P4 USDC posting surface is unchanged
     describe('A/B. USDC postings remain valid (P4 compatibility)', () => {
         it('a normal P4-style USDC posting succeeds exactly as before', async () => {
@@ -52,6 +47,15 @@ describeOrSkip('§P.5-A multi-asset accounting identity (real PostgreSQL)', () =
             expect((await ledger.accountBalance(prisma, `user:${user.id}:liability`)).balance.toFixed(8))
                 .toBe('100.00000000');
         });
+        it('P4 replay: the same USDC posting + key replays (hash surface unchanged)', async () => {
+            const user = await seedUser(prisma);
+            const p = () => prisma.$transaction((tx) => post(tx, {
+                idempotencyKey: 'p5a:usdc:replay', entryType: 'DEPOSIT', userId: user.id, description: 'P4 replay',
+                lines: [{ account: 'custody:deposit:usdc', debit: '5' }, { account: `user:${user.id}:liability`, credit: '5' }],
+            }));
+            expect((await p()).replayed).toBe(false);
+            expect((await p()).replayed).toBe(true);
+        });
     });
     // C. Cross-asset numeric coincidence fails closed
     describe('C. cross-asset numeric coincidence is rejected, fail closed', () => {
@@ -69,8 +73,7 @@ describeOrSkip('§P.5-A multi-asset accounting identity (real PostgreSQL)', () =
                     { account: 'equity:treasury:ghs', credit: '1200' },
                 ],
             })).catch((e) => { err = e; });
-            // Even a NUMERICALLY balanced posting is rejected on IDENTITY
-            // grounds: the assets differ, so equality is meaningless.
+            // Numerically balanced is still an IDENTITY violation: assets differ.
             expect(err).toBeInstanceOf(ledger.LedgerError);
             expect(err.code).toBe('LEDGER_CROSS_ASSET_BALANCE');
             expect(err.details.assets.sort()).toEqual(['GHS', 'USDC']);
@@ -175,8 +178,7 @@ describeOrSkip('§P.5-A multi-asset accounting identity (real PostgreSQL)', () =
             conversion: { identity, rate: '12' },
             lines: conversionLegs(),
         }));
-        // Pre-seed the conversion accounts via one committed exchange so the race
-        // exercises the CONVERSION boundary, not first-use account creation.
+        // Pre-seed accounts via a committed exchange: race the CONVERSION boundary.
         await postConversion('p5a:race:seed', 'conv:test:seed');
         const results = await Promise.allSettled([
             postConversion('p5a:race:tx-a', 'conv:test:race'),
@@ -196,6 +198,8 @@ describeOrSkip('§P.5-A multi-asset accounting identity (real PostgreSQL)', () =
     it.each([
         ['a changed rate', { identity: 'conv:test:prov', rate: '12' }, { identity: 'conv:test:prov', rate: '11.5' }],
         ['a changed quoteReference', { identity: 'conv:test:prov', rate: '12', quoteReference: 'quote-1' }, { identity: 'conv:test:prov', rate: '12', quoteReference: 'quote-OTHER' }],
+        // A delimiter-collision pair (both would serialize identically under a ':'-joined provenance)
+        ['a delimiter-collision provenance pair', { identity: 'a', rate: '12', quoteReference: '3:4' }, { identity: 'a:12', rate: '3', quoteReference: '4' }],
     ])('same idempotency key + same lines + %s fails closed, never replays', async (_l, first, second) => {
         const attempt = (conv) => prisma.$transaction(async (tx) => post(tx, {
             idempotencyKey: 'p5a:provenance:replay',

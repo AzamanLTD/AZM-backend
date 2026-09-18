@@ -33,10 +33,8 @@
 //   • FAIL-CLOSED catalog: an account code that is not canonical nor a
 //     recognized dynamic pattern is rejected — unknown accounts can never
 //     silently absorb value.
-//   • §P.5-A ASSET IDENTITY: every line resolves to its account's canonical
-//     asset — mixing incompatible assets is rejected (1200 GHS ≠ 100 USDC even
-//     when columns sum equal); cross-asset exchange exists ONLY as an explicit
-//     ASSET_CONVERSION; a persisted row disagreeing with the chart fails closed.
+//   • §P.5-A ASSET IDENTITY: mixing assets is rejected (1200 GHS ≠ 100 USDC even
+//     when columns sum equal); cross-asset exchange is ONLY an explicit ASSET_CONVERSION.
 //
 // The legacy journalService.record()/journalIntegration helpers remain ONLY
 // as non-authoritative compatibility for callers not yet migrated (§P.4
@@ -116,8 +114,7 @@ const CANONICAL_ACCOUNTS = {
   'pnl:inventory':          { accountClass: 'REVENUE',    normalSide: 'CREDIT', asset: 'USDC', network: null },
   'pnl:arbitrage':          { accountClass: 'REVENUE',    normalSide: 'CREDIT', asset: 'USDC', network: null },
   'equity:treasury':        { accountClass: 'EQUITY',     normalSide: 'CREDIT', asset: 'USDC', network: null },
-  // §P.5-A: GHS-side equity counterpart of equity:treasury — CATALOG-ONLY
-  // until §P.5-D/E GHS-liquidity semantics; never a GHS liability, spread or P&L.
+  // §P.5-A: GHS-side equity counterpart of equity:treasury — CATALOG-ONLY until §P.5-D/E; never a GHS liability/spread/P&L.
   'equity:treasury:ghs':    { accountClass: 'EQUITY',     normalSide: 'CREDIT', asset: 'GHS',  network: null },
 };
 
@@ -196,7 +193,12 @@ function computePostingHash(entryType, normalizedLines, conversionRecord = null)
   // §P.5-A: conversion provenance is part of the economic identity; P4 hashes stay byte-identical.
   let identity = `${entryType}#${canonical}`;
   if (conversionRecord) {
-    identity += `#conv:${conversionRecord.identity}:${conversionRecord.rate}:${conversionRecord.quoteReference ?? ''}`;
+    // Injective: arbitrary identity/quoteReference strings make ':' unsafe; fixed-key-order JSON is not.
+    identity += `#conv:${JSON.stringify({
+      identity: conversionRecord.identity,
+      rate: conversionRecord.rate, // already the exact toFixed(8) string
+      quoteReference: conversionRecord.quoteReference ?? null,
+    })}`;
   }
   return crypto.createHash('sha256').update(identity).digest('hex');
 }
@@ -255,8 +257,7 @@ async function ensureAccount(tx, code, opts = {}) {
   const spec = cls.spec;
   const userId = (cls.kind === 'USER_LIABILITY' || cls.kind === 'USER_DISPUTE' || cls.kind === 'USER_UNALLOCATED') ? cls.userId : (opts.userId ?? null);
   // Classification is authoritative — never rewritten. Prisma's upsert is not
-  // atomic on Postgres: concurrent FIRST USE can collide on the code unique
-  // index; that P2002 becomes a deterministic retryable error. Fail closed.
+  // atomic: concurrent FIRST USE collides on the code unique index; translated into a retryable error.
   let row;
   try {
     row = await tx.ledgerAccount.upsert({
@@ -397,9 +398,8 @@ async function post(tx, params) {
     };
   }
 
-  // ── §P.5-A asset-identity balancing — BEFORE numeric balancing (identity
-  // precedes arithmetic): a normal posting lives inside ONE asset; only an
-  // ASSET_CONVERSION may touch more, with every asset leg balanced on its own.
+  // ── §P.5-A asset-identity balancing — identity precedes arithmetic: a normal
+  // posting lives in ONE asset; an ASSET_CONVERSION balances every leg on its own.
   const zeroQ = new Prisma.Decimal(0);
   const perAsset = new Map();
   for (const l of normalized) {
@@ -446,15 +446,13 @@ async function post(tx, params) {
   }
 
   // ── Fail-closed account catalog ──────────────────────────────────────────
-  // ensureAccount also verifies the persisted row's identity against the
-  // authoritative chart (§P.5-A LEDGER_ACCOUNT_IDENTITY_CONFLICT).
+  // ensureAccount also verifies the persisted row against the chart (LEDGER_ACCOUNT_IDENTITY_CONFLICT).
   const uniqueAccounts = [...new Set(normalized.map(l => l.account))];
   for (const code of uniqueAccounts) {
     await ensureAccount(tx, code, { userId });
   }
 
-  // ── Durable conversion identity: the DB UNIQUE constraint enforces; the
-  // pre-read turns sequential reuse into a clear error. ──────────────────────
+  // ── Durable conversion identity: DB UNIQUE enforces; pre-read for a clear error. ──
   if (conversionRecord) {
     const priorIdentity = await tx.ledgerTransaction.findFirst({
       where: { conversionIdentity: conversionRecord.identity },
@@ -496,14 +494,13 @@ async function post(tx, params) {
       relatedEntityId: relatedEntityId != null ? String(relatedEntityId) : null,
       postingHash,
       conversionIdentity: conversionRecord ? conversionRecord.identity : null,
-      // metadata.conversion stays the full audit/provenance record;
-      // conversionIdentity is the DB-enforced enforcement key.
+      // metadata.conversion keeps the full audit record; conversionIdentity is the DB-enforced key.
       metadata: conversionRecord
         ? { ...(metadata ?? {}), conversion: conversionRecord }
         : (metadata ?? null),
     },
   }).catch((e) => {
-    const tgt = Array.isArray(e.meta?.target) ? e.meta.target.join(',') : String(e.meta?.target ?? ''); // collided constraint name
+    const tgt = Array.isArray(e.meta?.target) ? e.meta.target.join(',') : String(e.meta?.target ?? '');
     if (e?.code === 'P2002' && tgt.includes('conversionIdentity')) {
       // Concurrent conversion on the SAME identity committed first — fail closed.
       throw new LedgerError('LEDGER_CONVERSION_IDENTITY_CONFLICT',
