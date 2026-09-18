@@ -468,8 +468,10 @@ async function createSnapshot({ balanceProvider } = {}) {
                         network: canonical.network,
                         eligibleReserveTotal: report.eligibleReserveTotal.toString(),
                         evidenceStatus: report.evidenceStatus,
-                        restrictedObligationsTotal: null,
-                        restrictedObligationsAvailable: false,
+                        restrictedObligationsTotal: report.restrictedObligationsTotal != null
+                            ? report.restrictedObligationsTotal.toString()
+                            : null,
+                        restrictedObligationsAvailable: report.restrictedObligationsAvailable,
                         byTier: byTierDecimal,
                         legacySynthetic: {
                             note: 'NON-AUTHORITATIVE display mirrors — contribute ZERO reserve assets',
@@ -485,7 +487,7 @@ async function createSnapshot({ balanceProvider } = {}) {
                     invariant: {
                         target: 'REAL USDC ASSETS >= ALL CUSTOMER USDC LIABILITIES + RESTRICTED OBLIGATIONS',
                         satisfied: report.isFullyBacked,
-                        restrictedObligationsModeled: false,
+                        restrictedObligationsModeled: restricted.complete,
                         // Why fully-backed is impossible right now: an explicit
                         // classification failure takes precedence; otherwise the
                         // restricted component of the denominator is not modeled

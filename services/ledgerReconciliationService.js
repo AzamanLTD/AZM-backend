@@ -71,6 +71,31 @@ async function reconcileUserProjections(db, { limit = 1000 } = {}) {
         difference: escrowProjection.minus(escrowLedgerTotal).toFixed(8),
       });
     }
+    // §P.4 wave-2 buckets — dispute-restricted and vendor-unallocated
+    // reclassifications reconcile against their per-user dynamic accounts,
+    // exactly like escrow above. Both are LIABILITY/CREDIT-normal sums.
+    const disputeLedger = await ledger.accountBalance(db, `user:${userId}:dispute`);
+    const disputeProjection = user.disputeEscrowBalance || zero();
+    if (!disputeLedger.balance.eq(disputeProjection)) {
+      exceptions.push({
+        kind: disputeLedger.balance.isZero() && !disputeProjection.isZero() ? 'UNMIGRATED_BUCKET_ACTIVITY' : 'DISPUTE_PROJECTION_LEDGER_DISAGREEMENT',
+        userId,
+        ledgerDispute: disputeLedger.balance.toFixed(8),
+        projectedDispute: disputeProjection.toFixed(8),
+        difference: disputeProjection.minus(disputeLedger.balance).toFixed(8),
+      });
+    }
+    const unallocatedLedger = await ledger.accountBalance(db, `user:${userId}:unallocated`);
+    const unallocatedProjection = user.vendorUnallocatedBalance || zero();
+    if (!unallocatedLedger.balance.eq(unallocatedProjection)) {
+      exceptions.push({
+        kind: unallocatedLedger.balance.isZero() && !unallocatedProjection.isZero() ? 'UNMIGRATED_BUCKET_ACTIVITY' : 'UNALLOCATED_PROJECTION_LEDGER_DISAGREEMENT',
+        userId,
+        ledgerUnallocated: unallocatedLedger.balance.toFixed(8),
+        projectedUnallocated: unallocatedProjection.toFixed(8),
+        difference: unallocatedProjection.minus(unallocatedLedger.balance).toFixed(8),
+      });
+    }
   }
   return { exceptions, checkedUsers: ledgerUserIds.length };
 }

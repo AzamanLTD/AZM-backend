@@ -370,7 +370,7 @@ describeOrSkip('§P.3 custody accounting (real PostgreSQL)', () => {
         'TRUNCATE TABLE "CustodyEvidence", "CustodyMovement", "CustodyAccount", "CustodyExecution", ' +
         '"OnchainSweep", "TransactionHistory", "WalletAddress", "User", "SystemHotWallet", ' +
         '"SystemMasterCrypto", "SystemFiatPool", "JournalEntry", "LedgerTransaction", "LedgerAccount", "ProofOfReservesSnapshot", ' +
-        '"ProofOfReservesLeaf" RESTART IDENTITY CASCADE'
+        '"ProofOfReservesLeaf", "RestrictedObligation" RESTART IDENTITY CASCADE'
     );
     // 30s hook timeout: TRUNCATE of 14 tables must survive GitHub-hosted
     // runners with throttled disk (observed 20x fsync slowdown, e.g. CI run
@@ -1024,12 +1024,14 @@ describeOrSkip('§P.3 custody accounting (real PostgreSQL)', () => {
             expect(snapshot.usdcLiabilityTotal.toString()).toBe('100');
             expect(snapshot.unclassifiedExposure.toString()).toBe('0'); // mixed pool == X here
             // Evidence healthy + A (150.5) >= X (100) + Z == 0 — the classified
-            // invariant is satisfied. But restricted obligations are UNMODELED
-            // (the §P.4+ boundary), so the complete denominator is unknown:
-            // fully backed is impossible and the snapshot says so explicitly.
-            expect(snapshot.isFullyBacked).toBe(false); // fail-closed on the restricted boundary
+            // invariant is satisfied. Wave-2: restricted obligations are now
+            // FULLY MODELED (every writer migrated), so Z is a known quantity
+            // here (zero — this scenario seeds no restricted obligation rows
+            // and no restricted ledger reclassifications) and the snapshot can
+            // assert full backing on the complete denominator.
+            expect(snapshot.isFullyBacked).toBe(true); // restricted denominator modeled (Z=0)
             expect(snapshot.liabilityAttestation).toBe('COMPLETE'); // the classified part is complete
-            expect(snapshot.breakdown.invariant.blockedBy).toBe('RESTRICTED_OBLIGATIONS_UNKNOWN');
+            expect(snapshot.breakdown.invariant.blockedBy).toBeNull(); // nothing blocks the invariant
             expect(snapshot.custodyAccountCount).toBe(2);
             expect(snapshot.acceptedEvidenceCount).toBe(2);
             expect(snapshot.missingEvidenceCount).toBe(0);
@@ -1038,9 +1040,11 @@ describeOrSkip('§P.3 custody accounting (real PostgreSQL)', () => {
             // Synthetic mirrors are exposed as display-only, never authoritative.
             expect(snapshot.breakdown.reserves.legacySynthetic.systemMasterCrypto.toString()).toBe('1000000');
             expect(snapshot.breakdown.reserves.legacySynthetic.note).toMatch(/NON-AUTHORITATIVE/);
-            // Restricted obligations boundary is explicit.
-            expect(snapshot.restrictedObligationsTotal).toBe(null);
-            expect(snapshot.restrictedObligationsAvailable).toBe(false);
+            // Restricted obligations boundary is explicit. Post wave-2 the
+            // restricted total is MODELED (a known quantity), not an unknown
+            // null — with no restricted rows in this scenario it is exactly 0.
+            expect(snapshot.restrictedObligationsTotal.toString()).toBe('0');
+            expect(snapshot.restrictedObligationsAvailable).toBe(true);
         });
 
         it('X > mixed pool (over-classified flows) fails closed — LIABILITY_FLOW_EXCEEDS_MIXED_POOL, never a falsely clean COMPLETE', async () => {
@@ -1357,9 +1361,9 @@ describeOrSkip('§P.3 custody accounting (real PostgreSQL)', () => {
             expect(await prisma.custodyEvidence.count({ where: { scope: 'ACCOUNT_BALANCE', status: 'ACTIVE' } })).toBe(2);
             // And the whole lifecycle posted ZERO duplicate journal rows.
             expect(await prisma.journalEntry.count({ where: { relatedEntity: 'custodyMovement' } })).toBe(0);
-            // Restricted obligations remain unmodeled → fully backed impossible.
-            expect(snapshot.isFullyBacked).toBe(false);
-            expect(snapshot.breakdown.invariant.blockedBy).toBe('RESTRICTED_OBLIGATIONS_UNKNOWN');
+            // Wave-2: restricted obligations are modeled — with no restricted
+            // rows seeded here, nothing blocks the invariant.
+            expect(snapshot.breakdown.invariant.blockedBy).toBeNull();
         });
 
         it('exactWebhookAmountToBaseUnits: beyond safe-integer precision stays exact (raw string → BigInt, no floats)', () => {

@@ -650,6 +650,26 @@ exports.fulfillTransferRequest = async (req, res) => {
                 }
             });
 
+            // §P.4 AUTHORITATIVE LEDGER — request fulfillment transfer, same
+            // transaction. The PENDING → COMPLETED atomic claim above is the
+            // single-winner boundary, so the posting is exactly-once on this
+            // identity:
+            //   D user:{payer}:liability   — payer available liability down
+            //   C user:{receiver}:liability — receiver liability up
+            await ledger.post(tx, {
+                idempotencyKey: `ledger:peer:fulfill:${id}`,
+                entryType: 'TRANSFER',
+                description: 'Peer transfer request fulfilled — internal liability transfer',
+                userId: payerId,
+                relatedEntity: 'peerTransfer',
+                relatedEntityId: id,
+                metadata: { payerId, receiverId, amount: transferAmount.toFixed(8) },
+                lines: [
+                    { account: `user:${payerId}:liability`, debit: transferAmount.toFixed(8) },
+                    { account: `user:${receiverId}:liability`, credit: transferAmount.toFixed(8) },
+                ],
+            });
+
             return { updatedTransfer, chatMessage, payerUsername: payer.username };
         });
 

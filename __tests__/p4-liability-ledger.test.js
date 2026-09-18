@@ -720,11 +720,14 @@ describeOrSkip('§P.4 authoritative liability ledger (real PostgreSQL)', () => {
 
     // ═════════════════════════════════════════════════════════════════════════
     describe('18-19. restricted denominator: deterministic, fail-closed; synthetic singletons never authoritative', () => {
-        it('authoritativeTotals sums ACTIVE obligations exactly and is INCOMPLETE (fail-closed) until every family is authoritative', async () => {
+        it('authoritativeTotals sums ACTIVE obligations exactly and is COMPLETE once every writer family is migrated', async () => {
             const user = await seedUser(prisma);
             const t = await restrictedObligations.authoritativeTotals(prisma);
             expect(t.total.toFixed(0)).toBe('0');
-            expect(t.complete).toBe(false); // escrow/dispute/vendor families unmodelled -> PoR cannot claim full backing
+            // Wave-2: ALL writer families now post authoritatively (ledger-
+            // reclassification families are represented via their ledger
+            // accounts, so the denominator is fully modelled).
+            expect(t.complete).toBe(true);
 
             await prisma.$transaction(async (tx) => {
                 await restrictedObligations.createForPendingWithdrawal(tx, {
@@ -738,7 +741,7 @@ describeOrSkip('§P.4 authoritative liability ledger (real PostgreSQL)', () => {
             });
             const after = await restrictedObligations.authoritativeTotals(prisma);
             expect(after.total.toFixed(2)).toBe('12.75');
-            expect(after.complete).toBe(false);
+            expect(after.complete).toBe(true);
             // Deterministic read: repeated queries return the identical total.
             const again = await restrictedObligations.authoritativeTotals(prisma);
             expect(again.total.toFixed(2)).toBe('12.75');

@@ -303,6 +303,33 @@ exports.forceCancel = async (req, res) => {
                 });
             }
 
+            // §P.4 AUTHORITATIVE LEDGER — admin force-cancel refund, same
+            // transaction. The DISPUTED → CANCELLED atomic claim above is the
+            // single-winner boundary, so the posting is exactly-once on this
+            // identity. Mirrors the tradeWorker auto-cancel accounting:
+            //   SELL ad → D escrow:trade-{id}:locked  C user:{vendor}:unallocated
+            //   BUY  ad → D escrow:trade-{id}:locked  C user:{user}:liability
+            await ledger.post(tx, {
+                idempotencyKey: `ledger:p2p:force-cancel:${id}`,
+                entryType: isSellAd ? 'VENDOR_ALLOCATE' : 'ESCROW_REFUND',
+                description: isSellAd
+                    ? 'Admin force-cancel — vendor escrow returned to unallocated trading pool'
+                    : 'Admin force-cancel — buyer escrow refunded to available balance',
+                userId: isSellAd ? trade.vendorId : trade.userId,
+                relatedEntity: 'trade',
+                relatedEntityId: id,
+                metadata: { adminId: req.user.id, adminNotes: adminNotes ?? null },
+                lines: isSellAd
+                    ? [
+                        { account: `escrow:trade-${id}:locked`, debit: _exact(trade.amountCrypto) },
+                        { account: `user:${trade.vendorId}:unallocated`, credit: _exact(trade.amountCrypto) },
+                      ]
+                    : [
+                        { account: `escrow:trade-${id}:locked`, debit: _exact(trade.amountCrypto) },
+                        { account: `user:${trade.userId}:liability`, credit: _exact(trade.amountCrypto) },
+                      ],
+            });
+
             // Trade was already stamped CANCELLED at the top of this
             // transaction (atomic conditional flip).
 

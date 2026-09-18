@@ -18,7 +18,11 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # Budget must cover the worst case: one full suite run PLUS the single
+    # retry-on-failure. Measured full run with tuned Postgres: minutes, not
+    # tens of minutes — but keep a wide margin so a transient-failure retry
+    # can never be killed by the job clock mid-suite again.
+    timeout-minutes: 45
 
     services:
       postgres:
@@ -79,6 +83,19 @@ jobs:
 
       - name: Generate Prisma client
         run: npx prisma generate
+
+      - name: Tune disposable Postgres for test workloads
+        # The service container pays a real fsync on every commit; the
+        # TRUNCATE-heavy cleanup hooks make the suite 10x+ slower than the
+        # same run against a local database. This is a THROWAWAY CI database
+        # (no durability requirement), so relax commit durability:
+        # synchronous_commit is applied to existing sessions via SIGHUP —
+        # no container restart needed. Production databases are unaffected.
+        run: |
+          npx prisma db execute --stdin <<'SQL'
+          ALTER SYSTEM SET synchronous_commit = off;
+          SELECT pg_reload_conf();
+          SQL
 
       - name: Run tests
         # DB-backed suites share one disposable database and truncate between

@@ -675,6 +675,34 @@ const processCryptoDeposit = async (prisma, { userId, amountUsdc, txHash, addres
             await tx.systemMasterCrypto.upsert({ where: { id: 1 }, update: { balance: { increment: amountUsdc } }, create: { id: 1, balance: amountUsdc } });
             await tx.systemHotWallet.upsert({ where: { id: 1 }, update: { balance: { increment: amountUsdc } }, create: { id: 1, balance: amountUsdc } });
             const txRecord = await tx.transactionHistory.create({ data: { userId, type: 'DEPOSIT_CRYPTO', amountUsdc, feeUsdc: 0, txHash, status: 'COMPLETED' } });
+
+            // §P.4 AUTHORITATIVE LEDGER — same transaction as the credit and
+            // the TransactionHistory row, idempotent on the same txHash
+            // identity the txHash unique constraint already enforces:
+            //   D clearing:custody:unverified:usdc — PROVISIONAL custody:
+            //     the legacy webhook is an observation source with NO
+            //     independent chain evidence; this clearing account is NOT
+            //     a PoR reserve asset. (SystemMasterCrypto/SystemHotWallet
+            //     remain non-authoritative display mirrors only.)
+            //   C user:{id}:liability — customer liability increases.
+            // An unrepresentable float amount (over-precision) is rejected
+            // by toExactDecimal and rolls the whole credit back — the
+            // legacy route can no longer mint value the authoritative books
+            // cannot express.
+            await ledger.post(tx, {
+                idempotencyKey: `ledger:deposit:crypto:${txHash}`,
+                entryType: 'CUSTODY_DEPOSIT',
+                description: 'Crypto deposit observed by legacy finance webhook — provisional custody clearing credit',
+                userId,
+                relatedEntity: 'transactionHistory',
+                relatedEntityId: txRecord.id,
+                metadata: { source: 'legacy-finance-webhook', address: address || null },
+                lines: [
+                    { account: 'clearing:custody:unverified:usdc', debit: amountUsdc },
+                    { account: `user:${userId}:liability`, credit: amountUsdc },
+                ],
+            });
+
             return { alreadyProcessed: false, user, txRecord, newBalance: user.availableBalance + amountUsdc };
         });
 

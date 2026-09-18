@@ -25,13 +25,53 @@ const { Prisma } = require('@prisma/client');
 // every path. Until ALL families are authoritative, the denominator is
 // INCOMPLETE and PoR must remain fail-closed (cannot claim fully backed) —
 // unknown restricted obligations are NEVER treated as zero.
+// Representation semantics (post §P.4 wave-2, every financial writer migrated):
+//   'RESTRICTED_OBLIGATION_ROW' — funds reserved for a PENDING EXTERNAL
+//     operation (provider payout / on-chain withdrawal). The customer's
+//     flow-based liability X (custodyAccounting.classifyUsdcLiabilityFlows)
+//     does NOT decrease until the external debit completes, so the
+//     obligation row is ALSO counted in X; the PoR denominator deliberately
+//     adds it on top (conservative fail-closed double coverage — the
+//     invariant can only under-claim backing, never over-claim it).
+//   'LEDGER_RECLASSIFICATION'  — restricted funds that are an INTERNAL
+//     reclassification WITHIN customer liability (available → escrow /
+//     dispute / vendor pool). These remain fully counted inside X (the flow
+//     classification is bucket-agnostic: a deposited, never-withdrawn USDC
+//     is owed to the customer regardless of which projection bucket holds
+//     it). They MUST NOT be added to the restricted-obligation denominator
+//     — that would double count them. Authoritative means: EVERY financial
+//     writer of the bucket posts its ledger reclassification in the same
+//     transaction (guaranteed by the §P.4 architectural tests), and the
+//     authoritative totals below report the exact ledger balances for
+//     observability.
 const SOURCE_FAMILIES = {
-  PENDING_FIAT_WITHDRAWAL:   { authoritative: true,  description: 'Customer funds reserved for a PENDING MTN MoMo payout (settled/reversed only on provider outcome).' },
-  PENDING_CRYPTO_WITHDRAWAL: { authoritative: true,  description: 'Customer funds reserved for a PENDING on-chain withdrawal (CustodyExecution).' },
-  ESCROW_LOCK:               { authoritative: false, description: 'P2P/SmartEscrow/booking/vault/susu restricted funds — §P.4 wave-2 migration.' },
-  DISPUTE_ESCROW:             { authoritative: false, description: 'Dispute-locked customer funds — §P.4 wave-2 migration.' },
-  VENDOR_UNALLOCATED:         { authoritative: false, description: 'Vendor pool allocations — §P.4 wave-2 migration.' },
+  PENDING_FIAT_WITHDRAWAL:   { authoritative: true, representation: 'RESTRICTED_OBLIGATION_ROW', description: 'Customer funds reserved for a PENDING MTN MoMo payout (settled/reversed only on provider outcome).' },
+  PENDING_CRYPTO_WITHDRAWAL: { authoritative: true, representation: 'RESTRICTED_OBLIGATION_ROW', description: 'Customer funds reserved for a PENDING on-chain withdrawal (CustodyExecution).' },
+  ESCROW_LOCK:               { authoritative: true, representation: 'LEDGER_RECLASSIFICATION', ledgerAccountPattern: /^escrow:[A-Za-z0-9][A-Za-z0-9_.-]*:locked$/, description: 'P2P/SmartEscrow/booking/vault/savings/susu restricted funds — authoritative via the escrow:{key}:locked ledger reclassification, reconciled against User.escrowLockedBalance.' },
+  DISPUTE_ESCROW:             { authoritative: true, representation: 'LEDGER_RECLASSIFICATION', ledgerAccountPattern: /^user:\d+:dispute$/, description: 'Dispute-locked customer funds — authoritative via the user:{id}:dispute ledger reclassification, reconciled against User.disputeEscrowBalance.' },
+  VENDOR_UNALLOCATED:         { authoritative: true, representation: 'LEDGER_RECLASSIFICATION', ledgerAccountPattern: /^user:\d+:unallocated$/, description: 'Vendor pool allocations — authoritative via the user:{id}:unallocated ledger reclassification, reconciled against User.vendorUnallocatedBalance.' },
 };
+
+// Exact sum of normal-side balances of the authoritative ledger accounts that
+// match a reclassification family's account pattern (positive balances only —
+// an account on the wrong side reports negative and is surfaced, never
+// silently floored to zero).
+async function _ledgerReclassificationTotal(db, pattern) {
+  const zero = new Prisma.Decimal(0);
+  const groups = await db.journalEntry.groupBy({
+    by: ['account'],
+    where: { ledgerTransactionId: { not: null } },
+    _sum: { debit: true, credit: true },
+  });
+  let total = zero;
+  for (const g of groups) {
+    if (!pattern.test(g.account)) continue;
+    const debit = g._sum.debit || zero;
+    const credit = g._sum.credit || zero;
+    total = total.plus(credit.minus(debit)); // LIABILITY/CREDIT normal side
+  }
+  return total;
+}
 
 function assertKnownSource(sourceType) {
   if (!Object.prototype.hasOwnProperty.call(SOURCE_FAMILIES, sourceType)) {
@@ -152,7 +192,30 @@ async function authoritativeTotals(db, { asset = 'USDC' } = {}) {
   const families = {};
   let complete = true;
   for (const [family, def] of Object.entries(SOURCE_FAMILIES)) {
-    families[family] = { authoritative: def.authoritative, activeTotal: byFamily[family] || zero, description: def.description };
+    if (def.representation === 'LEDGER_RECLASSIFICATION') {
+      // Authoritative amount comes from the LEDGER reclassification balances
+      // (observability only — NOT added to `total`, because the flow-based
+      // customer liability X already counts these funds once).
+      const ledgerTotal = def.authoritative
+        ? await _ledgerReclassificationTotal(db, def.ledgerAccountPattern)
+        : null;
+      families[family] = {
+        authoritative: def.authoritative,
+        representation: def.representation,
+        activeTotal: byFamily[family] || zero,
+        ledgerReclassificationTotal: ledgerTotal,
+        includedInDenominator: false,
+        description: def.description,
+      };
+    } else {
+      families[family] = {
+        authoritative: def.authoritative,
+        representation: def.representation,
+        activeTotal: byFamily[family] || zero,
+        includedInDenominator: true,
+        description: def.description,
+      };
+    }
     if (!def.authoritative) complete = false;
   }
   return { total, complete, families };
