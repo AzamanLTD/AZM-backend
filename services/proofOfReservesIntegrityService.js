@@ -126,16 +126,29 @@ function composeLiabilityReport({
     const A = eligibleReserveTotal || zero;
     const mixed = mixedPoolLiabilityTotal || zero;
     const Ysigned = evidenceLinkedTotal || zero;
+    // EXACT SIGNED reconciliation difference (mixed pool − X). Never clamped,
+    // never reinterpreted — the diagnostics below keep the signed truth.
     const Zraw = mixed.minus(X);
-    const Z = Zraw.gt(zero) ? Zraw : zero;
+    // FAIL CLOSED ON OVER-CLASSIFICATION: the classified USDC obligation (X)
+    // is drawn FROM the mixed-pool liability population, so it can never
+    // legitimately exceed it. X > mixed is an inconsistent, unreconciled
+    // classification — the old `Z = max(mixed - X, 0)` clamped the deficit to
+    // zero and let this impossible state attest COMPLETE. It must not: the
+    // classification fails closed with an explicit failure code, the
+    // attestation is UNATTESTABLE, fully backed is impossible, and the
+    // deficit is NEVER reinterpreted as a zero Z (Z is null — untrustworthy).
+    const liabilityFlowExceedsMixedPool = Xvalid && Zraw.lt(zero);
+    const Z = liabilityFlowExceedsMixedPool ? null : (Zraw.gt(zero) ? Zraw : zero);
 
     const coverageOfTotal = X.gt(zero) ? A.div(X) : null;
     const coverageOfEvidenceLinked = Ysigned.gt(zero) ? A.div(Ysigned) : null;
 
     // Attestation: COMPLETE only when nothing unexplained remains; INCOMPLETE
     // when unclassified exposure exists; UNATTESTABLE if the classification
-    // itself could not be produced (caller passes null X).
-    const liabilityAttestation = (usdcLiabilityTotal == null)
+    // itself could not be produced (caller passes null X) OR is inconsistent
+    // with the population it was drawn from (X > mixed pool — an explicit
+    // reconciliation failure, never a falsely clean zero).
+    const liabilityAttestation = (usdcLiabilityTotal == null || liabilityFlowExceedsMixedPool)
         ? 'UNATTESTABLE'
         : (Z.isZero() ? 'COMPLETE' : 'INCOMPLETE');
 
@@ -148,6 +161,7 @@ function composeLiabilityReport({
     // null/false boundary is preserved; nothing is invented as zero.
     const restrictedKnown = restrictedObligationsTotal != null;
     const isFullyBacked = restrictedKnown
+        && !liabilityFlowExceedsMixedPool
         && healthy
         && liabilityAttestation === 'COMPLETE'
         && (X.isZero() ? A.gte(zero) : A.gte(X));
@@ -156,11 +170,14 @@ function composeLiabilityReport({
     // authority). reserveRatioPercent = A/X*100, or 100 when X==0 and nothing
     // unexplained exists, or 0 when the denominator is unknown (Z>0, X==0).
     let reserveRatioPercent;
-    if (!Xvalid) {
-        // Invalid classification — the legacy non-nullable percent column gets
-        // the same "denominator unknown → 0" value it already uses for Z>0,
-        // X==0; the honest state (UNATTESTABLE, null coverage) lives in the
-        // attestation and the §P.3 breakdown fields.
+    if (!Xvalid || liabilityFlowExceedsMixedPool) {
+        // Invalid OR over-classified (unreconciled) classification — the
+        // legacy non-nullable percent column gets the same
+        // "denominator unknown → 0" value it already uses for Z>0, X==0; the
+        // honest state (UNATTESTABLE, null Z, explicit failure code, exact
+        // signed difference) lives in the attestation and §P.3 breakdown
+        // fields. The legacy ratio is NEVER allowed to look trustworthy on
+        // top of an inconsistent classification.
         reserveRatioPercent = new Prisma.Decimal(0);
     } else if (X.gt(zero)) {
         reserveRatioPercent = A.div(X).mul(100).toDecimalPlaces(4);
@@ -173,8 +190,16 @@ function composeLiabilityReport({
     return {
         usdcLiabilityTotal: Xvalid ? usdcLiabilityTotal : null,
         evidenceLinkedLiabilityTotal: Ysigned,
+        // null when the classification exceeds the pool — the exposure is NOT
+        // knowable from an inconsistent classification, never a false zero.
         unclassifiedExposure: Z,
         mixedPoolLiabilityTotal: mixed,
+        // Explicit reconciliation/classification failure — surfaced so no
+        // consumer has to infer it from sign comparisons. null when the
+        // classification is consistent.
+        classificationFailure: liabilityFlowExceedsMixedPool ? 'LIABILITY_FLOW_EXCEEDS_MIXED_POOL' : null,
+        // Exact signed diagnostic (mixed pool − X), always preserved raw.
+        mixedPoolLiabilityDifference: Zraw,
         eligibleReserveTotal: A,
         restrictedObligationsTotal: restrictedObligationsTotal ?? null,
         restrictedObligationsAvailable: restrictedObligationsTotal != null,
@@ -413,7 +438,12 @@ async function createSnapshot({ balanceProvider } = {}) {
                         usdcLiabilityTotal: report.usdcLiabilityTotal ? report.usdcLiabilityTotal.toString() : null,
                         evidenceLinkedLiabilityTotal: report.evidenceLinkedLiabilityTotal ? report.evidenceLinkedLiabilityTotal.toString() : null,
                         unclassifiedExposure: report.unclassifiedExposure ? report.unclassifiedExposure.toString() : null,
+                        // null Z here means the classification is inconsistent
+                        // (X > mixed pool) — the exposure is untrustworthy,
+                        // never a silently clamped zero.
                         liabilityAttestation: report.liabilityAttestation,
+                        classificationFailure: report.classificationFailure,
+                        mixedPoolLiabilityDifference: report.mixedPoolLiabilityDifference.toString(),
                         classificationStatus: flows ? flows.liabilityClassificationStatus : null,
                         components: flows ? {
                             usdcCredits: flows.usdcCredits.toString(),
@@ -447,9 +477,15 @@ async function createSnapshot({ balanceProvider } = {}) {
                         target: 'REAL USDC ASSETS >= ALL CUSTOMER USDC LIABILITIES + RESTRICTED OBLIGATIONS',
                         satisfied: report.isFullyBacked,
                         restrictedObligationsModeled: false,
-                        // Why fully-backed is impossible right now: the restricted
-                        // component of the denominator is not modeled (§P.4+).
-                        blockedBy: report.isFullyBacked ? null : (report.restrictedObligationsKnown ? null : 'RESTRICTED_OBLIGATIONS_UNKNOWN'),
+                        // Why fully-backed is impossible right now: an explicit
+                        // classification failure takes precedence; otherwise the
+                        // restricted component of the denominator is not modeled
+                        // (§P.4+).
+                        blockedBy: report.isFullyBacked
+                            ? null
+                            : (report.classificationFailure
+                                ? report.classificationFailure
+                                : (report.restrictedObligationsKnown ? null : 'RESTRICTED_OBLIGATIONS_UNKNOWN')),
                     },
                 },
                 // §P.3 additive columns.
@@ -475,6 +511,8 @@ async function createSnapshot({ balanceProvider } = {}) {
                     usdcLiabilityTotal: report.usdcLiabilityTotal ? report.usdcLiabilityTotal.toString() : null,
                     evidenceLinkedLiabilityTotal: report.evidenceLinkedLiabilityTotal ? report.evidenceLinkedLiabilityTotal.toString() : null,
                     unclassifiedExposure: report.unclassifiedExposure ? report.unclassifiedExposure.toString() : null,
+                    classificationFailure: report.classificationFailure,
+                    mixedPoolLiabilityDifference: report.mixedPoolLiabilityDifference.toString(),
                     mixedPoolLiabilityTotal: state.mixedPoolTotal.toString(),
                     eligibleReserveTotal: report.eligibleReserveTotal.toString(),
                     coverageOfTotalUsdcObligation: report.coverageOfTotalUsdcObligation ? report.coverageOfTotalUsdcObligation.toString() : null,

@@ -300,6 +300,42 @@ describe('§P.3 unit: pure liability report composition', () => {
         });
         expect(r.liabilityAttestation).toBe('UNATTESTABLE');
         expect(r.isFullyBacked).toBe(false);
+        expect(r.classificationFailure).toBe(null);
+    });
+
+    it('X > mixed pool: over-classified flow is an EXPLICIT failure — UNATTESTABLE, never a falsely clean zero (restricted obligations IRRELEVANT)', () => {
+        // Audit's exact scenario: X = 150 classified USDC obligation, mixed
+        // pool = 100. The old Z = max(mixed − X, 0) clamped the 50-unit
+        // deficit to zero and attested COMPLETE. Restricted obligations are
+        // MODELLED (D(0)) and evidence is healthy with A >= X, so the ONLY
+        // thing preventing a fully-backed claim is the inconsistent
+        // classification itself — and it must.
+        const r = compose({
+            usdcLiabilityTotal: D(150),
+            evidenceLinkedTotal: D(120),
+            mixedPoolLiabilityTotal: D(100),
+            eligibleReserveTotal: D(200), // A >= X — still not attestable
+            restrictedObligationsTotal: D(0), // modeled — irrelevant to this failure
+            evidenceHealthy: true,
+            evidenceStatus: 'HEALTHY',
+        });
+        expect(r.classificationFailure).toBe('LIABILITY_FLOW_EXCEEDS_MIXED_POOL');
+        expect(r.liabilityAttestation).toBe('UNATTESTABLE'); // NOT COMPLETE
+        expect(r.isFullyBacked).toBe(false);                 // never on an unreconciled classification
+        expect(r.unclassifiedExposure).toBe(null);           // the deficit is NOT reinterpreted as zero
+        expect(r.mixedPoolLiabilityDifference.toString()).toBe('-50'); // exact signed diagnostic
+        expect(r.usdcLiabilityTotal.toString()).toBe('150'); // X preserved exactly
+        expect(r.mixedPoolLiabilityTotal.toString()).toBe('100');
+        // The boundary case X == mixed is NOT a failure — exactly reconciled.
+        const reconciled = compose({
+            usdcLiabilityTotal: D(150), evidenceLinkedTotal: D(120), mixedPoolLiabilityTotal: D(150),
+            eligibleReserveTotal: D(200), restrictedObligationsTotal: D(0),
+            evidenceHealthy: true, evidenceStatus: 'HEALTHY',
+        });
+        expect(reconciled.classificationFailure).toBe(null);
+        expect(reconciled.unclassifiedExposure.toString()).toBe('0');
+        expect(reconciled.liabilityAttestation).toBe('COMPLETE');
+        expect(reconciled.isFullyBacked).toBe(true);
     });
 });
 
@@ -970,6 +1006,10 @@ describeOrSkip('§P.3 custody accounting (real PostgreSQL)', () => {
         it('snapshot numerator is exactly the accepted evidence sum — synthetic singletons cannot compensate', async () => {
             const { user, registry } = await seedAccountWithRegistry();
             await recordCandidateFlow(user, TX1, 100); // X = 100 (candidate, unverified)
+            // The webhook credit path would also credit the balance — seed a
+            // RECONCILED pool (mixed == X) so this test exercises the happy
+            // composition, not the X > mixed failure path.
+            await prisma.user.update({ where: { id: user.id }, data: { availableBalance: 100 } });
             // Make the synthetic mirrors huge — they must NOT inflate the numerator.
             await prisma.systemMasterCrypto.upsert({ where: { id: 1 }, update: { balance: 1000000 }, create: { id: 1, balance: 1000000 } });
             await prisma.systemHotWallet.upsert({ where: { id: 1 }, update: { balance: 1000000 }, create: { id: 1, balance: 1000000 } });
@@ -1001,6 +1041,33 @@ describeOrSkip('§P.3 custody accounting (real PostgreSQL)', () => {
             // Restricted obligations boundary is explicit.
             expect(snapshot.restrictedObligationsTotal).toBe(null);
             expect(snapshot.restrictedObligationsAvailable).toBe(false);
+        });
+
+        it('X > mixed pool (over-classified flows) fails closed — LIABILITY_FLOW_EXCEEDS_MIXED_POOL, never a falsely clean COMPLETE', async () => {
+            const { user } = await seedAccountWithRegistry();
+            // 150 classified USDC obligation (completed deposit flow)...
+            await recordCandidateFlow(user, TX1, 150);
+            // ...but the mixed-pool liability population holds only 100 (a
+            // partial credit / inconsistent state). The classification
+            // EXCEEDS the population it was drawn from.
+            await prisma.user.update({ where: { id: user.id }, data: { availableBalance: 100 } });
+
+            // Fresh evidence is HEALTHY and A (200) >= X (150) — restricted
+            // obligations are irrelevant here: the inconsistent
+            // classification alone must block the attestation.
+            const { snapshot } = await integrity.createSnapshot({
+                balanceProvider: stubProviderMap({ [CUST]: '200000000', [HOT]: '0' }),
+            });
+            expect(snapshot.usdcLiabilityTotal.toString()).toBe('150');   // X preserved exactly
+            expect(snapshot.evidenceStatus).toBe('HEALTHY');              // the evidence is NOT the problem
+            expect(snapshot.eligibleReserveTotal.toString()).toBe('200');  // A >= X and still not attestable
+            expect(snapshot.liabilityAttestation).toBe('UNATTESTABLE');    // NOT COMPLETE
+            expect(snapshot.isFullyBacked).toBe(false);
+            expect(snapshot.unclassifiedExposure).toBe(null);              // the 50-unit deficit is NOT zero
+            expect(snapshot.breakdown.usdcObligation.classificationFailure).toBe('LIABILITY_FLOW_EXCEEDS_MIXED_POOL');
+            expect(snapshot.breakdown.usdcObligation.mixedPoolLiabilityDifference).toBe('-50'); // exact signed diagnostic
+            expect(snapshot.breakdown.invariant.blockedBy).toBe('LIABILITY_FLOW_EXCEEDS_MIXED_POOL');
+            expect(snapshot.reserveRatio.toString()).toBe('0');            // legacy mirror never looks trustworthy
         });
 
         it('unclassified exposure (Z > 0) forces INCOMPLETE and not fully backed', async () => {
@@ -1093,6 +1160,9 @@ describeOrSkip('§P.3 custody accounting (real PostgreSQL)', () => {
         it('getLatestSnapshot + integrity report expose the additive §P.3 fields', async () => {
             const { user } = await seedAccountWithRegistry();
             await recordCandidateFlow(user, TX1, 100);
+            // Reconcile the pool with the classified flow (as the webhook
+            // credit path does) — mixed == X == 100.
+            await prisma.user.update({ where: { id: user.id }, data: { availableBalance: 100 } });
             // No provider at all and no TATUM_API_KEY → the whole snapshot is
             // EVIDENCE_UNAVAILABLE and cannot claim full backing.
             const savedKey = process.env.TATUM_API_KEY;
@@ -1257,6 +1327,10 @@ describeOrSkip('§P.3 custody accounting (real PostgreSQL)', () => {
             // Deposit credits journaled in TransactionHistory (X components).
             await recordCandidateFlow(user, TX1, 100);
             await recordCandidateFlow(user, TX2, 40);
+            // Webhook credit path credits the balance too — reconcile the
+            // mixed pool with the classified flows (mixed == X == 140) so the
+            // lifecycle exercises the healthy composition.
+            await prisma.user.update({ where: { id: user.id }, data: { availableBalance: 140 } });
             // Verify BOTH deposit candidates against genuine chain evidence.
             const p1 = txProviderWith([rawTxEntry({ hash: TX1, address: CUST.toLowerCase(), amount: '100' })]);
             const p2 = txProviderWith([rawTxEntry({ hash: TX2, address: CUST.toLowerCase(), amount: '40' })]);

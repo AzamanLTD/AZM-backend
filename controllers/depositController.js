@@ -220,13 +220,44 @@ exports.tatumCryptoWebhook = async (req, res) => {
         // USDC base units (malformed, scientific notation, more than 6
         // significant decimals) records NO candidate — fail closed, logged,
         // never silently approximated.
-        let candidateBaseUnits = null;
+        // §P.3 FAIL-CLOSED GATES — both run BEFORE the financial mutation
+        // below. A completed crypto credit that the custody accounting
+        // boundary cannot represent would be an orphaned financial claim: a
+        // COMPLETED DEPOSIT_CRYPTO row, a balance credit and a journal entry
+        // with NO CustodyMovement. The exact quantity MUST parse from the raw
+        // webhook string (malformed, scientific notation, or over-precision
+        // all reject); the custody identity MUST resolve from the §P.1
+        // registry. If either gate fails, NOTHING is mutated — no credit,
+        // no TransactionHistory row, no journal entry. The legacy float
+        // amount is NEVER a fallback for the custody quantity.
+        let candidateBaseUnits;
         try {
             candidateBaseUnits = custodyAccounting.exactWebhookAmountToBaseUnits(rawAmountStr, 6);
         } catch (err) {
-            logger.warn({ txHash, raw: rawAmountStr, err: err.message }, '[depositController] deposit amount not exactly representable — no custody candidate recorded');
+            logger.error({ txHash, raw: rawAmountStr, err: err.message }, '[depositController] webhook REJECTED — amount is not an exactly representable USDC quantity; no financial mutation performed');
+            return res.status(400).json({
+                success: false,
+                code:   'EXACT_CUSTODY_QUANTITY_UNREPRESENTABLE',
+                message: 'Webhook rejected: the deposit amount is not an exactly representable USDC quantity (integer base units at 6 decimals — malformed, scientific notation, or over-precision). No credit, ledger row, or journal entry was created.',
+                data:   { txHash, address, rejected: true, reason: 'EXACT_CUSTODY_QUANTITY_UNREPRESENTABLE' },
+            });
         }
         const ownerWalletAddress = owner.walletAddress || null;
+        // Same fail-closed rule for custody identity: ownership resolved
+        // through the LEGACY mirror (no §P.1 registry row) has NO custody
+        // account identity, so its deposits cannot be represented by the
+        // custody accounting boundary. Never commit a completed crypto credit
+        // that custody accounting cannot represent — reject, log, let ops
+        // reconcile the address into the registry first.
+        if (!ownerWalletAddress) {
+            logger.error({ txHash, address, userId: targetUserId }, '[depositController] webhook REJECTED — deposit address has no §P.1 registry custody identity; no financial mutation performed');
+            return res.status(400).json({
+                success: false,
+                code:   'CUSTODY_IDENTITY_UNRESOLVABLE',
+                message: 'Webhook rejected: the deposit address has no active canonical registry identity, so the deposit cannot be represented by the custody accounting boundary. No credit, ledger row, or journal entry was created.',
+                data:   { txHash, address, rejected: true, reason: 'CUSTODY_IDENTITY_UNRESOLVABLE' },
+            });
+        }
 
         const result = await prisma.$transaction(async (tx) => {
             const user = await tx.user.findUnique({ where: { id: targetUserId } });
@@ -265,32 +296,25 @@ exports.tatumCryptoWebhook = async (req, res) => {
             });
 
             // 5e. §P.3 custody accounting: record the deposit CANDIDATE movement
-            // atomically with the credit. The webhook is an observation source
-            // ONLY — this candidate is NOT a verified custody movement. It
-            // contributes nothing to the evidence-linked liability subset
-            // until verifyDepositMovement succeeds against transaction-
-            // specific chain evidence (Tatum v4 tx-by-hash). Failure here
-            // rolls the whole credit back: a credit without its custody
-            // candidate would be an untracked deposit.
-            if (ownerWalletAddress && candidateBaseUnits !== null) {
-                await custodyAccounting.recordDepositCandidate(tx, {
-                    walletAddress: ownerWalletAddress,
-                    txHash,
-                    amountBaseUnits: candidateBaseUnits,
-                    transactionHistoryId: txRecord.id,
-                    // exact decimal string derived FROM the base units — the
-                    // float credit is never the source of this value
-                    creditedAmountDecimalString: custodyAccounting.decimalStringFromBaseUnits(candidateBaseUnits, 6),
-                });
-            } else {
-                // Either a legacy-fallback owner (§P.1 migration window: no
-                // registry row, so no custody account can be derived) or a raw
-                // amount that is not exactly representable. The credit keeps
-                // its existing behavior; the deposit stays in the USDC flow
-                // classification (X) but can never reach the evidence-linked
-                // subset (Y) — logged, never silently presented as tracked.
-                logger.warn({ txHash, userId: targetUserId, exactParse: candidateBaseUnits !== null }, '[depositController] no custody candidate recorded for this deposit');
-            }
+            // atomically with the credit. UNCONDITIONAL by construction: the
+            // Step 5 gates above already rejected any webhook whose exact
+            // quantity or custody identity could not be resolved, so a credit
+            // reaching this point ALWAYS carries its custody candidate. The
+            // webhook is an observation source ONLY — this candidate is NOT
+            // a verified custody movement; it contributes nothing to the
+            // evidence-linked liability subset until verifyDepositMovement
+            // succeeds against transaction-specific chain evidence (Tatum v4
+            // tx-by-hash). Failure here rolls the whole credit back: a credit
+            // without its custody candidate would be an untracked deposit.
+            await custodyAccounting.recordDepositCandidate(tx, {
+                walletAddress: ownerWalletAddress,
+                txHash,
+                amountBaseUnits: candidateBaseUnits,
+                transactionHistoryId: txRecord.id,
+                // exact decimal string derived FROM the base units — the
+                // float credit is never the source of this value
+                creditedAmountDecimalString: custodyAccounting.decimalStringFromBaseUnits(candidateBaseUnits, 6),
+            });
 
             // 5f. Phase N: notification moved post-commit for full pipeline delivery.
 

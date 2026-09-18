@@ -514,24 +514,141 @@ describeOrSkip('WalletAddress authority + governance (real PostgreSQL)', () => {
         expect(await candidateOf(txHash)).not.toBe(null);
     });
 
-    it('a raw amount that is not exactly representable records NO candidate — fail closed, credit proceeds legacy', async () => {
+    it('over-precision amount REJECTS the webhook — ZERO completed financial mutation, no orphaned credit', async () => {
         const userA = await seedUser(prisma);
         const allocated = await allocateDepositAddress(prisma, mockTatumService(), userA.id);
         const txHash = '0xwebhook-inexact-amount-1';
+        const depositRowsBefore = await prisma.transactionHistory.count({
+            where: { userId: userA.id, type: 'DEPOSIT_CRYPTO' },
+        });
 
-        // 1.0000005 parses to a positive float (legacy credit proceeds via
-        // toFixed(6) rounding) but is NOT exactly representable in 6-decimal
-        // USDC base units — no exact custody quantity exists, so NO candidate
-        // may be recorded (ops reconciliation item; never an approximated
-        // movement).
+        // 1.0000005 parses to a positive float (the legacy path would credit
+        // it via toFixed(6) rounding) but is NOT exactly representable in
+        // 6-decimal USDC base units. §P.3 fail closed: the webhook is
+        // REJECTED BEFORE any financial mutation — no balance credit, no
+        // TransactionHistory row, no journal entry, no custody movement. A
+        // completed credit that custody accounting cannot represent would be
+        // an orphaned financial claim; it must not exist.
         const res = await callWebhook({
             address: allocated.address, txId: txHash, amount: '1.0000005', asset: 'USDC',
         });
 
+        expect(res.statusCode).toBe(400);
+        expect(res.body.success).toBe(false);
+        expect(res.body.code).toBe('EXACT_CUSTODY_QUANTITY_UNREPRESENTABLE');
+        expect(await balanceOf(userA.id)).toBeCloseTo(1000);   // NO credit
+        expect(await ledgerCount(txHash)).toBe(0);             // NO completed DEPOSIT_CRYPTO row for this webhook
+        // And ZERO new DEPOSIT_CRYPTO rows were created — a rejected webhook
+        // can never leave an orphaned completed credit behind.
+        expect(await prisma.transactionHistory.count({
+            where: { userId: userA.id, type: 'DEPOSIT_CRYPTO' },
+        })).toBe(depositRowsBefore);
+        expect(await candidateOf(txHash)).toBe(null);          // NO custody candidate
+        await new Promise((r) => setTimeout(r, 150));          // let any stray fire-and-forget settle
+        expect(await prisma.journalEntry.count({ where: { reference: txHash } })).toBe(0); // NO journal credit
+    });
+
+    it('scientific-notation amount REJECTS the webhook — zero mutation, even though the value is numerically representable', async () => {
+        const userA = await seedUser(prisma);
+        const allocated = await allocateDepositAddress(prisma, mockTatumService(), userA.id);
+        const txHash = '0xwebhook-scientific-1';
+
+        // '1.5e2' == 150 exactly, but scientific notation is NOT an exact
+        // decimal-string quantity: it admits float re-interpretation and is
+        // rejected on shape, fail closed.
+        const res = await callWebhook({
+            address: allocated.address, txId: txHash, amount: '1.5e2', asset: 'USDC',
+        });
+
+        expect(res.statusCode).toBe(400);
+        expect(res.body.code).toBe('EXACT_CUSTODY_QUANTITY_UNREPRESENTABLE');
+        expect(await balanceOf(userA.id)).toBeCloseTo(1000);
+        expect(await ledgerCount(txHash)).toBe(0);
+        expect(await candidateOf(txHash)).toBe(null);
+        expect(await prisma.journalEntry.count({ where: { reference: txHash } })).toBe(0);
+    });
+
+    it('malformed amount REJECTS the webhook before any financial mutation', async () => {
+        const userA = await seedUser(prisma);
+        const allocated = await allocateDepositAddress(prisma, mockTatumService(), userA.id);
+        const txHash = '0xwebhook-malformed-1';
+
+        const res = await callWebhook({
+            address: allocated.address, txId: txHash, amount: '12.3.4', asset: 'USDC',
+        });
+
+        expect(res.statusCode).toBe(400);
+        expect(res.body.code).toBe('EXACT_CUSTODY_QUANTITY_UNREPRESENTABLE');
+        expect(await balanceOf(userA.id)).toBeCloseTo(1000);
+        expect(await ledgerCount(txHash)).toBe(0);
+        expect(await candidateOf(txHash)).toBe(null);
+    });
+
+    it('an owner resolved ONLY through the legacy mirror (no §P.1 registry row) is REJECTED — no credit outside the custody boundary', async () => {
+        const userA = await seedUser(prisma);
+        // Legacy mirror ONLY: the address is on the User row but has NO
+        // WalletAddress registry row — resolveOwner answers via
+        // LEGACY_MIRROR with walletAddress: null. A completed crypto credit
+        // here could not be represented by custody accounting (no custody
+        // identity), so §P.3 fails closed.
+        await prisma.user.update({
+            where: { id: userA.id },
+            data:  { tatumPolygonAddress: '0xlegacymirror000000000000000000000000001' },
+        });
+        const txHash = '0xwebhook-legacy-mirror-1';
+
+        const res = await callWebhook({
+            address: '0xlegacymirror000000000000000000000000001', txId: txHash, amount: 25, asset: 'USDC',
+        });
+
+        expect(res.statusCode).toBe(400);
+        expect(res.body.code).toBe('CUSTODY_IDENTITY_UNRESOLVABLE');
+        expect(await balanceOf(userA.id)).toBeCloseTo(1000);
+        expect(await ledgerCount(txHash)).toBe(0);
+        expect(await candidateOf(txHash)).toBe(null);
+    });
+
+    it('an EXACT valid raw string completes the credit AND records the exact custody candidate', async () => {
+        const userA = await seedUser(prisma);
+        const allocated = await allocateDepositAddress(prisma, mockTatumService(), userA.id);
+        const txHash = '0xwebhook-exact-valid-1';
+
+        const res = await callWebhook({
+            address: allocated.address, txId: txHash, amount: '0.123456', asset: 'USDC',
+        });
+
         expect(res.statusCode).toBe(200);
-        expect(res.body.success).toBe(true);           // the legacy credit path is unchanged
-        expect(await balanceOf(userA.id)).toBeGreaterThan(1000); // credited (legacy float path)
-        expect(await candidateOf(txHash)).toBe(null);   // but NO custody candidate — fail closed
+        expect(res.body.success).toBe(true);
+        expect(await balanceOf(userA.id)).toBeCloseTo(1000.123456);
+        const row = await prisma.transactionHistory.findUnique({ where: { txHash } });
+        expect(row.status).toBe('COMPLETED');
+        expect(row.type).toBe('DEPOSIT_CRYPTO');
+        const candidate = await candidateOf(txHash);
+        expect(candidate).not.toBe(null);
+        expect(candidate.amountBaseUnits).toBe(123456n);       // EXACT base units
+        expect(candidate.metadata.creditedAmountDecimalString).toBe('0.123456');
+    });
+
+    it('a REPEATED webhook remains idempotent — one credit, one ledger row, one candidate', async () => {
+        const userA = await seedUser(prisma);
+        const allocated = await allocateDepositAddress(prisma, mockTatumService(), userA.id);
+        const txHash = '0xwebhook-repeat-1';
+        const body = { address: allocated.address, txId: txHash, amount: '12.5', asset: 'USDC' };
+
+        const first = await callWebhook(body);
+        expect(first.statusCode).toBe(200);
+        expect(first.body.success).toBe(true);
+
+        const second = await callWebhook(body);
+        expect(second.statusCode).toBe(200);
+        expect(second.body.data.alreadyProcessed).toBe(true);
+
+        expect(await balanceOf(userA.id)).toBeCloseTo(1012.5); // credited ONCE
+        expect(await ledgerCount(txHash)).toBe(1);              // ONE ledger row
+        const candidates = await prisma.custodyMovement.count({
+            where: { idempotencyKey: `deposit:POLYGON:${txHash}` },
+        });
+        expect(candidates).toBe(1);                            // ONE custody candidate
     });
 });
 
