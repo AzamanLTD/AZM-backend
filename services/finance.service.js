@@ -377,8 +377,14 @@ const completeFiatWithdrawal = async (prisma, reference, { providerTxId = null }
             // transaction as the PENDING->COMPLETED claim and the deferred
             // economics realization (only for rows that carry a §P.4 ledger
             // reservation; legacy rows have no ledger truth to settle):
-            //   D restricted:reserves        — the reservation returns
-            //   C custody:provider:usdc      — principal left to the payout provider
+            //   D restricted:reserves        — the reservation is released
+            //   C clearing:fiat:offramp:usdc — principal enters the GHS
+            //     off-ramp settlement rail. This rail is a FIAT settlement —
+            //     there is NO represented USDC transfer into provider
+            //     custody here, so custody:provider:usdc is NEVER posted on
+            //     this path (that account is reserved for real provider-held
+            //     USDC). The §P.5 GHS-liquidity wave will reconcile this
+            //     clearing balance against actual fiat asset movements.
             //   C revenue:fees               — fee realized NOW (system share)
             //   C user:{referrer}:liability   — referrer reward realized NOW
             // Provider-dependent economics are NEVER realized before this point.
@@ -390,7 +396,7 @@ const completeFiatWithdrawal = async (prisma, reference, { providerTxId = null }
                 const totalReservedExact = principalExact.plus(systemFeeExact).plus(referrerShareExact || new Prisma.Decimal(0));
                 const lines = [
                     { account: 'restricted:reserves', debit: totalReservedExact },
-                    { account: 'custody:provider:usdc', credit: principalExact },
+                    { account: 'clearing:fiat:offramp:usdc', credit: principalExact },
                 ];
                 if (!systemFeeExact.isZero()) lines.push({ account: 'revenue:fees', credit: systemFeeExact });
                 if (referrerShareExact && !referrerShareExact.isZero()) {

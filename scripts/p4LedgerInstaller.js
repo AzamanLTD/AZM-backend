@@ -38,6 +38,23 @@ async function installChartOfAccounts(db) {
 async function main() {
   const res = await prisma.$transaction(async (tx) => {
     const seeded = await installChartOfAccounts(tx);
+    // §P.4 wave-2 repair: custody:provider:usdc was catalogued with a wrong
+    // (payable-style LIABILITY) classification earlier in THIS unmerged
+    // branch's history. It has never been posted to in production, so if a
+    // stale row exists with the wrong class AND zero postings, reclassify it
+    // to the canonical ASSET location. If it has any postings, fail loudly —
+    // never silently rewrite the classification of a used account.
+    const provider = await tx.ledgerAccount.findUnique({ where: { code: 'custody:provider:usdc' } });
+    if (provider && provider.accountClass !== 'ASSET') {
+      const posted = await tx.journalEntry.count({ where: { account: 'custody:provider:usdc' } });
+      if (posted > 0) {
+        throw new Error('custody:provider:usdc has existing postings but a stale classification — refusing to silently reclassify; manual reconciliation required');
+      }
+      await tx.ledgerAccount.update({
+        where: { code: 'custody:provider:usdc' },
+        data: { accountClass: 'ASSET', normalSide: 'DEBIT' },
+      });
+    }
     const accountCount = await tx.ledgerAccount.count();
     return { seeded, accountCount };
   });

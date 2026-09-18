@@ -324,22 +324,30 @@ exports.tatumCryptoWebhook = async (req, res) => {
             // with the credit, the TransactionHistory row and the custody
             // candidate. A posting failure rolls back the ENTIRE financial
             // mutation (fail-closed, no swallowed exceptions).
-            //   D custody:deposit:usdc   — deposit-address custody asset
-            //   C user:{id}:liability    — customer liability increases
+            //   D clearing:custody:unverified:usdc — PROVISIONAL custody:
+            //     the webhook is an observation source; the movement is still
+            //     CANDIDATE. This clearing account is NOT a PoR reserve asset.
+            //   C user:{id}:liability — customer liability increases (credit
+            //     policy allows the customer to spend it).
+            // When independent Tatum transaction evidence verifies the
+            // movement, custodyAccountingService.verifyDepositMovement
+            // reclassifies the provisional amount to the real
+            // custody:deposit:usdc asset exactly once. A rejected/mismatched
+            // deposit is retained in clearing:custody:rejected:usdc suspense.
             // The exact quantity comes from the same base units as the
             // custody candidate — never from the float credit.
             const depositLedgerExact = custodyAccounting.decimalStringFromBaseUnits(candidateBaseUnits, 6);
             await ledger.post(tx, {
                 idempotencyKey: `ledger:deposit:crypto:${txHash}`,
                 entryType: 'CUSTODY_DEPOSIT',
-                description: 'Crypto deposit credited on verified webhook settlement',
+                description: 'Crypto deposit credited on webhook settlement — provisional custody clearing pending transaction evidence',
                 reference: txHash,
                 userId: targetUserId,
                 relatedEntity: 'transactionHistory',
                 relatedEntityId: txRecord.id,
-                metadata: { custodyMovementId: candidateResult.movement.id, candidate: candidateResult.isNew },
+                metadata: { custodyMovementId: candidateResult.movement.id, candidate: candidateResult.isNew, provisional: true },
                 lines: [
-                    { account: 'custody:deposit:usdc', debit: depositLedgerExact },
+                    { account: 'clearing:custody:unverified:usdc', debit: depositLedgerExact },
                     { account: `user:${targetUserId}:liability`, credit: depositLedgerExact },
                 ],
             });

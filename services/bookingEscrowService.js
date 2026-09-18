@@ -16,6 +16,10 @@ const DAY_MS = 24 * HOUR_MS;
 
 const _round6 = (n) => parseFloat(Number(n).toFixed(6));
 
+const { Prisma } = require('@prisma/client');
+const ledger = require('./ledgerService');
+const _exact = (n) => (n instanceof Prisma.Decimal ? n.toFixed(8) : Number(n).toFixed(8));
+
 const _ensureProfitFeesSingleton = async (tx) =>
     tx.systemProfitFees.upsert({ where: { id: 1 }, update: {}, create: { id: 1, balance: 0.0 } });
 
@@ -119,6 +123,28 @@ const fundBookingEscrow = async (prisma, { escrowId, payerId, bookingType, booki
         await _ensureProfitFeesSingleton(tx);
         await tx.systemProfitFees.update({ where: { id: 1 }, data: { balance: { increment: fee } } });
 
+        // §P.4 AUTHORITATIVE LEDGER — same transaction, fail-closed, same
+        // economic identity as the ticket escrow fund path (this escrow row
+        // can only ever be funded once):
+        //   D user:{payer}:liability  (principal + fee)
+        //   C escrow:{escrowId}:locked (principal)
+        //   C revenue:fees            (fee realized at lock)
+        await ledger.post(tx, {
+            idempotencyKey: `ledger:escrow:fund:${escrowId}`,
+            entryType: 'ESCROW_LOCK',
+            description: 'Booking escrow funded — principal locked, fee realized',
+            reference,
+            userId: payerId,
+            relatedEntity: 'smartEscrow',
+            relatedEntityId: escrowId,
+            metadata: { bookingType: bookingType || null, bookingId: bookingId ?? null },
+            lines: [
+                { account: `user:${payerId}:liability`, debit: _exact(total) },
+                { account: `escrow:escrow-${escrowId}:locked`, credit: _exact(amount) },
+                { account: 'revenue:fees', credit: _exact(fee) },
+            ],
+        });
+
         const claimed = await tx.smartEscrow.updateMany({
             where: { id: escrowId, status: 'DRAFT', payerId },
             data: {
@@ -215,6 +241,23 @@ const releaseBookingEscrow = async (prisma, { escrowId }) => {
         });
         if (debit.count !== 1) throw new Error('ESCROW_BALANCE_INSUFFICIENT');
         await tx.user.update({ where: { id: escrow.payeeId }, data: { availableBalance: { increment: amount } } });
+
+        // §P.4 AUTHORITATIVE LEDGER — same economic identity as the ticket
+        // escrow release (single status claim guarantees a single winner):
+        //   D escrow:{id}:locked / C user:{payee}:liability
+        await ledger.post(tx, {
+            idempotencyKey: `ledger:escrow:release:${escrowId}:SETTLED`,
+            entryType: 'ESCROW_RELEASE',
+            description: 'Booking escrow released to payee on settlement',
+            reference,
+            userId: escrow.payeeId,
+            relatedEntity: 'smartEscrow',
+            relatedEntityId: escrowId,
+            lines: [
+                { account: `escrow:escrow-${escrowId}:locked`, debit: _exact(amount) },
+                { account: `user:${escrow.payeeId}:liability`, credit: _exact(amount) },
+            ],
+        });
         await tx.transactionHistory.create({
             data: { userId: escrow.payeeId, type: 'TICKET_ESCROW_RELEASE', amountUsdc: amount, feeUsdc: 0, txHash: reference, status: 'COMPLETED' }
         });
@@ -247,6 +290,23 @@ const refundBookingEscrow = async (prisma, { escrowId }) => {
             data: { escrowLockedBalance: { decrement: amount }, availableBalance: { increment: amount } }
         });
         if (debit.count !== 1) throw new Error('ESCROW_BALANCE_INSUFFICIENT');
+
+        // §P.4 AUTHORITATIVE LEDGER — same economic identity as the ticket
+        // escrow refund:
+        //   D escrow:{id}:locked / C user:{payer}:liability
+        await ledger.post(tx, {
+            idempotencyKey: `ledger:escrow:refund:${escrowId}:REFUNDED`,
+            entryType: 'ESCROW_REFUND',
+            description: 'Booking escrow refunded to payer on cancellation',
+            reference,
+            userId: escrow.payerId,
+            relatedEntity: 'smartEscrow',
+            relatedEntityId: escrowId,
+            lines: [
+                { account: `escrow:escrow-${escrowId}:locked`, debit: _exact(amount) },
+                { account: `user:${escrow.payerId}:liability`, credit: _exact(amount) },
+            ],
+        });
         await tx.transactionHistory.create({
             data: { userId: escrow.payerId, type: 'TICKET_ESCROW_REFUND', amountUsdc: amount, feeUsdc: 0, txHash: reference, status: 'COMPLETED' }
         });
@@ -298,6 +358,30 @@ const splitReleaseFundedEscrow = async (prisma, {
             data: { escrowLockedBalance: { decrement: principal } }
         });
         if (debit.count !== 1) throw new Error('ESCROW_BALANCE_INSUFFICIENT');
+
+        // §P.4 AUTHORITATIVE LEDGER — no-show penalty split, one balanced
+        // posting in the same transaction. The penalty and refund shares sum
+        // to the principal exactly, so no rounding dust can remain:
+        //   D escrow:{id}:locked      (full principal leaves escrow holding)
+        //   C user:{payee}:liability  (penalty share)
+        //   C user:{payer}:liability  (refund share)
+        // Zero-share lines are omitted (a zero-value line would be rejected).
+        const splitLines = [
+            { account: `escrow:escrow-${escrowId}:locked`, debit: _exact(principal) },
+        ];
+        if (penaltyAmount > 0) splitLines.push({ account: `user:${escrow.payeeId}:liability`, credit: _exact(penaltyAmount) });
+        if (refundAmount > 0) splitLines.push({ account: `user:${escrow.payerId}:liability`, credit: _exact(refundAmount) });
+        await ledger.post(tx, {
+            idempotencyKey: `ledger:escrow:split-release:${escrowId}`,
+            entryType: 'ESCROW_RELEASE',
+            description: `No-show penalty split — ${_exact(penaltyAmount)} penalty to payee, ${_exact(refundAmount)} refunded to payer`,
+            reference: releaseRef,
+            userId: escrow.payerId,
+            relatedEntity: 'smartEscrow',
+            relatedEntityId: escrowId,
+            metadata: { reason: reason || null, penaltyAmount, refundAmount, bookingType: bookingType || null, bookingId: bookingId ?? null },
+            lines: splitLines,
+        });
 
         if (penaltyAmount > 0) {
             await tx.user.update({ where: { id: escrow.payeeId }, data: { availableBalance: { increment: penaltyAmount } } });

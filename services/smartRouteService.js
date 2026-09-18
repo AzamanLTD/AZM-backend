@@ -17,6 +17,9 @@
 
 const logger = require('../src/config/logger');
 const { Prisma } = require('@prisma/client');
+const ledger = require('./ledgerService');
+const restrictedObligations = require('./restrictedObligationService');
+const _exact = (n) => (n instanceof Prisma.Decimal ? n.toFixed(8) : Number(n).toFixed(8));
 
 const FREQUENCY_MS = {
     DAILY: 24 * 60 * 60 * 1000,
@@ -225,13 +228,44 @@ class SmartRouteService {
                     status: 'PENDING',
                 },
             });
-            await tx.transactionHistory.create({
+            const runHistory = await tx.transactionHistory.create({
                 data: {
                     userId: route.userId,
                     type: 'SMART_ROUTE_RUN',
                     amountUsdc: amount,
                     status: 'COMPLETED',
                 },
+            });
+            // §P.4 AUTHORITATIVE ACCOUNTING — smart-route MoMo payout is a
+            // PENDING provider disbursement: the customer's USDC liability
+            // falls now, but the funds are RESERVED until the provider
+            // outcome is observed. Idempotent on the Withdrawal row's own
+            // identity (created above in this transaction):
+            //   D user:{userId}:liability — customer owed less
+            //   C restricted:reserves     — reserved for the PENDING payout
+            const momoReservation = await ledger.post(tx, {
+                idempotencyKey: `ledger:smartroute:momo:${w.id}`,
+                entryType: 'WITHDRAWAL',
+                description: 'Smart Route MoMo payout — provider settlement pending',
+                userId: route.userId,
+                relatedEntity: 'withdrawal',
+                relatedEntityId: w.id,
+                metadata: { status: 'PENDING', provider: route.destMomoProvider, smartRoute: true, runHistoryId: runHistory.id },
+                lines: [
+                    { account: `user:${route.userId}:liability`, debit: amount.toFixed(8) },
+                    { account: 'restricted:reserves', credit: amount.toFixed(8) },
+                ],
+            });
+            await restrictedObligations.createForPendingWithdrawal(tx, {
+                sourceType: 'PENDING_FIAT_WITHDRAWAL',
+                reference: `withdrawal:smartroute:${w.id}`,
+                userId: route.userId,
+                amount: new Prisma.Decimal(amount.toFixed(8)),
+                asset: 'USDC',
+                sourceEntity: 'withdrawal',
+                sourceEntityId: w.id,
+                ledgerTransactionId: momoReservation.transaction.id,
+                metadata: { smartRoute: true, amountGhs: ghs.toFixed(8), rateUsed: rate.toFixed(8) },
             });
             return w;
         });
@@ -263,19 +297,42 @@ class SmartRouteService {
         await this.prisma.$transaction(async (tx) => {
             await tx.user.update({
                 where: { id: route.userId },
-                data: { availableBalance: { decrement: amount } },
+                data: {
+                    availableBalance: { decrement: amount },
+                    // §P.4: projection escrow column moves with the goal
+                    // restriction the ledger locks below.
+                    escrowLockedBalance: { increment: amount },
+                },
             });
             await tx.user.update({
                 where: { id: route.destFriendUserId },
                 data: { availableBalance: { increment: amount } },
             });
-            await tx.transactionHistory.create({
+            const runHistory = await tx.transactionHistory.create({
                 data: {
                     userId: route.userId,
                     type: 'SMART_ROUTE_RUN',
                     amountUsdc: amount,
                     status: 'COMPLETED',
                 },
+            });
+            // §P.4 AUTHORITATIVE LEDGER — smart-route internal transfer, same
+            // transaction, idempotent on the durable TransactionHistory row's
+            // own identity:
+            //   D user:{sender}:liability    — sender owed less
+            //   C user:{recipient}:liability — recipient owed more
+            await ledger.post(tx, {
+                idempotencyKey: `ledger:smartroute:transfer:${runHistory.id}`,
+                entryType: 'TRANSFER',
+                description: 'Smart Route internal transfer — liability moved between users',
+                userId: route.userId,
+                relatedEntity: 'transactionHistory',
+                relatedEntityId: runHistory.id,
+                metadata: { recipientId: route.destFriendUserId },
+                lines: [
+                    { account: `user:${route.userId}:liability`, debit: amount.toFixed(8) },
+                    { account: `user:${route.destFriendUserId}:liability`, credit: amount.toFixed(8) },
+                ],
             });
         });
         const run = await this._writeRun(route, 'SUCCESS', amount);
@@ -296,19 +353,24 @@ class SmartRouteService {
         const rate = new Prisma.Decimal(settings?.liveRetailRate || 12.5);
         const ghs = amount.mul(rate);
 
-        await this.prisma.$transaction([
-            this.prisma.user.update({
+        await this.prisma.$transaction(async (tx) => {
+            await tx.user.update({
                 where: { id: route.userId },
-                data: { availableBalance: { decrement: amount } },
-            }),
-            this.prisma.savingsGoal.update({
+                data: {
+                    availableBalance: { decrement: amount },
+                    // §P.4: projection escrow column moves with the goal
+                    // restriction the ledger locks below.
+                    escrowLockedBalance: { increment: amount },
+                },
+            });
+            await tx.savingsGoal.update({
                 where: { id: goal.id },
                 data: {
                     currentAmountGhs: { increment: ghs },
                     totalDeposits: { increment: 1 },
                 },
-            }),
-            this.prisma.savingsDeposit.create({
+            });
+            const depositRow = await tx.savingsDeposit.create({
                 data: {
                     goalId: goal.id,
                     userId: route.userId,
@@ -317,8 +379,26 @@ class SmartRouteService {
                     type: 'SCHEDULED',
                     status: 'COMPLETED',
                 },
-            }),
-        ]);
+            });
+            // §P.4 AUTHORITATIVE LEDGER — smart-route savings deposit, same
+            // transaction, idempotent on the SavingsDeposit row's own durable
+            // identity:
+            //   D user:{userId}:liability        — spendable liability down
+            //   C escrow:savings-{goalId}:locked — goal restriction up
+            await ledger.post(tx, {
+                idempotencyKey: `ledger:savings:deposit:${depositRow.id}`,
+                entryType: 'VAULT_DEPOSIT',
+                description: 'Smart Route savings deposit — spendable balance locked into goal restriction',
+                userId: route.userId,
+                relatedEntity: 'savingsDeposit',
+                relatedEntityId: depositRow.id,
+                metadata: { goalId: goal.id, amountGhs: ghs.toFixed(8), rateUsed: rate.toFixed(8), smartRoute: true },
+                lines: [
+                    { account: `user:${route.userId}:liability`, debit: amount.toFixed(8) },
+                    { account: `escrow:savings-${goal.id}:locked`, credit: amount.toFixed(8) },
+                ],
+            });
+        });
         const run = await this._writeRun(route, 'SUCCESS', amount, null, {
             amountGhs: ghs,
             rateUsed: rate,

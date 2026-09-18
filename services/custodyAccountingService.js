@@ -44,6 +44,7 @@ const {
 } = require('./custodyEvidenceProvider');
 
 const prisma = new PrismaClient();
+const ledger = require('./ledgerService');
 
 const TIERS = {
     USER_DEPOSIT_ADDRESS: 'USER_DEPOSIT_ADDRESS',
@@ -368,20 +369,61 @@ async function verifyDepositMovement(db, { movementId }, { txProvider } = {}) {
     if (entry && entry.amountBaseUnits !== BigInt(movement.amountBaseUnits)) failures.push('AMOUNT_MISMATCH');
 
     if (failures.length > 0) {
-        // Definitive mismatch: the candidate is retained as a FAILED record
-        // with the explicit reason. The webhook credit is NOT auto-reversed —
-        // reversing a customer credit is an auditable ops decision.
-        const conditional = await db.custodyMovement.updateMany({
-            where: { id: movement.id, status: MOVEMENT_STATUS.CANDIDATE },
-            data: { status: MOVEMENT_STATUS.FAILED, failureReason: failures.join('+').slice(0, 60) },
+        // Definitive mismatch: the candidate becomes FAILED with the explicit
+        // reason. The webhook credit is NOT auto-reversed — reversing a
+        // customer credit is an auditable ops decision. The §P.4 provisional
+        // clearing amount moves to the rejected SUSPENSE account in the SAME
+        // transaction: the books retain the unresolved exposure explicitly and
+        // can never pretend real custody exists.
+        const rejection = await db.$transaction(async (tx) => {
+            const conditional = await tx.custodyMovement.updateMany({
+                where: { id: movement.id, status: MOVEMENT_STATUS.CANDIDATE },
+                data: { status: MOVEMENT_STATUS.FAILED, failureReason: failures.join('+').slice(0, 60) },
+            });
+            if (conditional.count === 0) return { concurrent: true };
+            // The reclassification exists ONLY when a provisional clearing
+            // balance was actually journaled for this deposit (the deposit
+            // controller's webhook-credit posting). Service-direct flows
+            // (P3 tests, backfills) recorded no provisional amount, so there
+            // is nothing to reclassify — posting unconditionally would invent
+            // a negative clearing balance out of thin air.
+            const provisionalJournal = await tx.ledgerTransaction.findUnique({
+                where: { idempotencyKey: `ledger:deposit:crypto:${movement.txHash}` },
+                select: { id: true },
+            });
+            const amountDecimal = decimalStringFromBaseUnits(BigInt(movement.amountBaseUnits), movement.decimals || 6);
+            if (provisionalJournal) await ledger.post(tx, {
+                idempotencyKey: `ledger:custody:reject:${movement.id}`,
+                entryType: 'CUSTODY_REJECTION',
+                description: 'Deposit evidence definitively rejected — provisional custody retained as unresolved suspense',
+                reference: movement.txHash,
+                userId: null,
+                relatedEntity: 'custodyMovement',
+                relatedEntityId: movement.id,
+                metadata: { failureReasons: failures.slice(0, 8) },
+                lines: [
+                    { account: 'clearing:custody:rejected:usdc', debit: amountDecimal },
+                    { account: 'clearing:custody:unverified:usdc', credit: amountDecimal },
+                ],
+            });
+            return { concurrent: false };
         });
-        logger.warn({ movementId: movement.id, txHash: movement.txHash, failures }, '[custody-accounting] deposit candidate FAILED transaction-evidence validation');
+        if (!rejection.concurrent) {
+            logger.warn({ movementId: movement.id, txHash: movement.txHash, failures }, '[custody-accounting] deposit candidate FAILED transaction-evidence validation — exposure retained in rejected suspense');
+        }
         return { verified: false, reason: failures.join('+'), retryable: false };
     }
 
-    // Verified: atomic CANDIDATE→VERIFIED + transaction-evidence row.
-    // (No journal posting — the webhook credit already journaled this
-    // economic event exactly once; a second representation would double-count.)
+    // Verified: atomic CANDIDATE→VERIFIED + transaction-evidence row +
+    // §P.4 clearing reclassification. The webhook credit journaled the
+    // customer liability exactly once into PROVISIONAL clearing; this
+    // independent verification — and only this — establishes real custody:
+    //   D custody:deposit:usdc            — authoritative custody asset
+    //   C clearing:custody:unverified:usdc — provisional amount reclassified
+    // Exactly-once via the movement-scoped idempotency key: a replay or a
+    // concurrent verifier can never duplicate the reclassification, and the
+    // posting shares the CANDIDATE→VERIFIED claim transaction so the ledger
+    // and the movement status can never diverge.
     const result = await db.$transaction(async (tx) => {
         const updated = await tx.custodyMovement.updateMany({
             where: { id: movement.id, status: MOVEMENT_STATUS.CANDIDATE },
@@ -391,6 +433,31 @@ async function verifyDepositMovement(db, { movementId }, { txProvider } = {}) {
             const current = await tx.custodyMovement.findUnique({ where: { id: movement.id } });
             return { concurrent: true, current };
         }
+        // Same guard as the rejection path: only a webhook-credited deposit
+        // (deposit controller) carries a provisional clearing balance to
+        // reclassify into authoritative custody. Service-direct movements
+        // have no provisional amount — nothing to reclassify, and the P3
+        // invariant "transaction evidence alone creates NO custody journal"
+        // continues to hold.
+        const provisionalJournal = await tx.ledgerTransaction.findUnique({
+            where: { idempotencyKey: `ledger:deposit:crypto:${movement.txHash}` },
+            select: { id: true },
+        });
+        const reclassifyDecimal = decimalStringFromBaseUnits(BigInt(movement.amountBaseUnits), movement.decimals || 6);
+        if (provisionalJournal) await ledger.post(tx, {
+            idempotencyKey: `ledger:custody:verify:${movement.id}`,
+            entryType: 'CUSTODY_VERIFICATION',
+            description: 'Independent transaction evidence verified the deposit — provisional clearing reclassified to authoritative custody',
+            reference: movement.txHash,
+            userId: null,
+            relatedEntity: 'custodyMovement',
+            relatedEntityId: movement.id,
+            metadata: { transactionHistoryId: movement.transactionHistoryId ?? null, blockNumber: String(entry.blockNumber) },
+            lines: [
+                { account: 'custody:deposit:usdc', debit: reclassifyDecimal },
+                { account: 'clearing:custody:unverified:usdc', credit: reclassifyDecimal },
+            ],
+        });
         const evidence = await tx.custodyEvidence.create({
             data: {
                 custodyAccountId: account.id,

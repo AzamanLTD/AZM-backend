@@ -9,6 +9,9 @@
 //   4. Both parties notified, stats updated
 //
 const logger = require('../src/config/logger');
+const { Prisma } = require('@prisma/client');
+const ledger = require('./ledgerService');
+const _exact = (n) => (n instanceof Prisma.Decimal ? n.toFixed(8) : Number(n).toFixed(8));
 // Escrow math:
 //   - BUYER_WINS: full disputeEscrowBalance → buyer's availableBalance
 //   - VENDOR_WINS: full disputeEscrowBalance → vendor's availableBalance
@@ -107,6 +110,44 @@ class DisputeResolutionService {
 
         // Execute atomically
         const resolution = await this.prisma.$transaction(async (tx) => {
+            // §P.4 AUTHORITATIVE LEDGER — dispute escrow settlement, same
+            // transaction, idempotent on the trade's resolution identity (the
+            // disputeResolution UNIQUE(tradeId) row below enforces a single
+            // resolution; a concurrent duplicate collides on the ledger
+            // idempotency key and the whole losing transaction rolls back):
+            //   D user:{holder}:dispute — dispute restriction released
+            //   C user:{buyer}:liability  — buyer share
+            //   C user:{vendor}:liability  — vendor share
+            // Any float-rounding residual between the drained restriction and
+            // the credited shares is absorbed by revenue:fees so the posting
+            // balances EXACTLY without minting or destroying value.
+            {
+                const lines = [
+                    { account: `user:${escrowHolderId}:dispute`, debit: _exact(totalEscrow) },
+                ];
+                if (buyerAmount > 0) lines.push({ account: `user:${trade.userId}:liability`, credit: _exact(buyerAmount) });
+                if (vendorAmount > 0) lines.push({ account: `user:${trade.vendorId}:liability`, credit: _exact(vendorAmount) });
+                const residual = ledger.exactResidual(
+                    _exact(totalEscrow),
+                    [buyerAmount > 0 ? _exact(buyerAmount) : '0', vendorAmount > 0 ? _exact(vendorAmount) : '0'],
+                );
+                if (!residual.isZero()) {
+                    const residualStr = residual.abs().toFixed(8);
+                    if (residual.isPositive()) lines.push({ account: 'revenue:fees', credit: residualStr });
+                    else lines.push({ account: 'revenue:fees', debit: residualStr });
+                }
+                await ledger.post(tx, {
+                    idempotencyKey: `ledger:p2p:dispute-resolve:${tradeId}`,
+                    entryType: 'ESCROW_RELEASE',
+                    description: `Trade dispute resolved ${ruling} — restricted dispute funds released to parties`,
+                    userId: escrowHolderId,
+                    relatedEntity: 'trade',
+                    relatedEntityId: tradeId,
+                    metadata: { ruling, buyerAmount, vendorAmount, residual: residual.toFixed(8) },
+                    lines,
+                });
+            }
+
             // 1. Release escrow from holder
             await tx.user.update({
                 where: { id: escrowHolderId },

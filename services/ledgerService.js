@@ -44,7 +44,16 @@ const crypto = require('crypto');
 const logger = require('../src/config/logger');
 
 // ── Account grammar ─────────────────────────────────────────────────────────
+// Dynamic per-customer restricted-bucket accounts — each is the authoritative
+// counterpart of a User projection column, so reconciliation can prove exact
+// per-user equality for EVERY bucket, not just availableBalance:
+//   user:{id}:liability      ↔ User.availableBalance
+//   escrow:{key}:locked      ↔ User.escrowLockedBalance   (per-escrow holding; LedgerAccount.userId attributes ownership)
+//   user:{id}:dispute        ↔ User.disputeEscrowBalance  (per-user dispute-locked)
+//   user:{id}:unallocated    ↔ User.vendorUnallocatedBalance (per-vendor pool)
 const USER_LIABILITY_RE = /^user:(\d+):liability$/;
+const USER_DISPUTE_RE = /^user:(\d+):dispute$/;
+const USER_UNALLOCATED_RE = /^user:(\d+):unallocated$/;
 const ESCROW_LOCKED_RE = /^escrow:([A-Za-z0-9][A-Za-z0-9_.-]*):locked$/;
 
 // Canonical chart of accounts. accountClass + normalSide + asset identity.
@@ -56,11 +65,46 @@ const CANONICAL_ACCOUNTS = {
   'custody:hot:usdc':       { accountClass: 'ASSET',      normalSide: 'DEBIT',  asset: 'USDC', network: 'POLYGON' },
   'custody:cold:usdc':      { accountClass: 'ASSET',      normalSide: 'DEBIT',  asset: 'USDC', network: 'POLYGON' },
   'custody:exchange:usdc':  { accountClass: 'ASSET',      normalSide: 'DEBIT',  asset: 'USDC', network: 'POLYGON' },
-  'custody:provider:usdc':  { accountClass: 'LIABILITY',  normalSide: 'CREDIT', asset: 'USDC', network: null }, // payable-style: USDC principal handed to payout providers for onward fiat disbursement
+  // canonical architecture: provider custody is a USDC ASSET LOCATION —
+  // real USDC held by a payout/custody provider. The fiat GHS off-ramp rail
+  // is NOT a USDC transfer and must never post here (it settles through
+  // clearing:fiat:offramp:usdc until the GHS-liquidity wave models the
+  // provider relationship).
+  'custody:provider:usdc':  { accountClass: 'ASSET',      normalSide: 'DEBIT',  asset: 'USDC', network: null },
+  // provisional custody clearing — webhook-observed deposits that carry a
+  // customer credit but are NOT yet verified by independent transaction
+  // evidence. NOT a PoR reserve asset (assetClass CLEARING is excluded from
+  // the reserve computation); reclassified to custody:deposit:usdc exactly
+  // once when Tatum evidence verifies the movement, or to the rejected
+  // suspense when evidence definitively fails.
+  'clearing:custody:unverified:usdc': { accountClass: 'CLEARING', normalSide: 'DEBIT', asset: 'USDC', network: 'POLYGON' },
+  // definitive rejected/mismatched deposit exposure — customer credit was
+  // already granted; real custody was never verified. Retained as an explicit
+  // suspense state so the books can never pretend custody exists; reversal is
+  // an auditable ops decision, never automatic.
+  'clearing:custody:rejected:usdc':  { accountClass: 'CLEARING', normalSide: 'DEBIT', asset: 'USDC', network: 'POLYGON' },
+  // GHS off-ramp settlement rail clearing — principal released on provider
+  // SUCCESS pending the §P.5 GHS-liquidity wave, which will reconcile this
+  // balance against actual fiat asset movements. This is NOT provider USDC
+  // custody: no USDC balance at a provider is represented by this rail. The
+  // rail is CREDIT-normal: its positive balance is the OUTSTANDING value
+  // handed to the fiat rail awaiting GHS-side reconciliation (§P.5 debits
+  // it when the fiat asset movement is confirmed). The settlement entry
+  // credits the rail because the USDC-side liability was already released —
+  // nothing in the current accounting perimeter funds a rail DEBIT, and the
+  // GHS asset movements are deliberately unmodelled until §P.5.
+  'clearing:fiat:offramp:usdc':      { accountClass: 'CLEARING', normalSide: 'CREDIT', asset: 'USDC', network: null },
   'fiat:momo:ghs':          { accountClass: 'ASSET',      normalSide: 'DEBIT',  asset: 'GHS',  network: null },
   'inventory:usdc:lots':    { accountClass: 'ASSET',      normalSide: 'DEBIT',  asset: 'USDC', network: null },
   'restricted:reserves':   { accountClass: 'RESTRICTED', normalSide: 'CREDIT', asset: 'USDC', network: null },
   'clearing:conversion':    { accountClass: 'CLEARING',   normalSide: 'DEBIT',  asset: 'USDC', network: null },  // debit-side accumulation of fiat-settled conversions pending §P.5
+  // AZM/USDC order-book reserve pool — USDC withheld by the matching engine
+  // while BUY orders rest (limit/market). Credited at placement, drained at
+  // match settlement and cancellation refunds. The order book does NOT touch
+  // the user-escrow projection columns, so this is a platform clearing pool,
+  // never a user-attributed escrow bucket. Any never-refunded resting-reserve
+  // remainder stays visible here as an explicit balance.
+  'clearing:orderbook:usdc': { accountClass: 'CLEARING',   normalSide: 'DEBIT',  asset: 'USDC', network: null },
   'revenue:fees':           { accountClass: 'REVENUE',    normalSide: 'CREDIT', asset: 'USDC', network: null },
   'revenue:spread':         { accountClass: 'REVENUE',    normalSide: 'CREDIT', asset: 'USDC', network: null },
   'expense:gas':            { accountClass: 'EXPENSE',    normalSide: 'DEBIT',  asset: 'USDC', network: null },
@@ -76,6 +120,9 @@ const ENTRY_TYPES = new Set([
   'SUSU_PAYOUT', 'FEE', 'REWARD', 'ADJUSTMENT', 'BUSINESS_PAYMENT',
   'CUSTODY_DEPOSIT', 'CUSTODY_SWEEP', 'CUSTODY_WITHDRAWAL',
   'SHARED_VAULT_DEPOSIT', 'SHARED_VAULT_REFUND',
+  'ESCROW_DISPUTE', 'SUSU_SEIZURE', 'SUSU_REFUND',
+  'VENDOR_TOPUP', 'VENDOR_ALLOCATE',
+  'CUSTODY_VERIFICATION', 'CUSTODY_REJECTION',
 ]);
 
 // Exact-decimal string: non-negative, ≤ 8 decimal places, no exponent.
@@ -161,11 +208,32 @@ function classifyAccountCode(code) {
   if (escrowMatch) {
     return { kind: 'ESCROW_LOCKED', key: escrowMatch[1], spec: { accountClass: 'LIABILITY', normalSide: 'CREDIT', asset: 'USDC', network: null } };
   }
+  const userDisputeMatch = USER_DISPUTE_RE.exec(code);
+  if (userDisputeMatch) {
+    return { kind: 'USER_DISPUTE', userId: Number(userDisputeMatch[1]), spec: { accountClass: 'LIABILITY', normalSide: 'CREDIT', asset: 'USDC', network: null } };
+  }
+  const userUnallocatedMatch = USER_UNALLOCATED_RE.exec(code);
+  if (userUnallocatedMatch) {
+    return { kind: 'USER_UNALLOCATED', userId: Number(userUnallocatedMatch[1]), spec: { accountClass: 'LIABILITY', normalSide: 'CREDIT', asset: 'USDC', network: null } };
+  }
   if (Object.prototype.hasOwnProperty.call(CANONICAL_ACCOUNTS, code)) {
     return { kind: 'CANONICAL', spec: CANONICAL_ACCOUNTS[code] };
   }
   throw new LedgerError('LEDGER_UNKNOWN_ACCOUNT',
     `account "${code}" is not part of the authoritative chart — refusing to post to an unmodelled account`);
+}
+
+/**
+ * Susu per-member pool sub-account code. LedgerAccount.code (and the
+ * classification gate in classifyAccountCode) cap account codes at 80 chars —
+ * two full UUIDs overflow that, so each id is compacted to 12 hex/alnum
+ * chars. Uniqueness across real cycles is 48 random bits per id pair;
+ * every posting carries the FULL ids in relatedEntityId + metadata for
+ * audit, so the compacted code is a routing key, not the record of truth.
+ */
+function susuEscrowCode(cycleId, memberId) {
+  const compact = (id) => String(id).replace(/-/g, '').slice(0, 12);
+  return `escrow:susu-${compact(cycleId)}-${compact(memberId)}:locked`;
 }
 
 /**
@@ -185,7 +253,7 @@ async function ensureAccount(tx, code, opts = {}) {
       normalSide: spec.normalSide,
       asset: spec.asset,
       network: spec.network,
-      userId: cls.kind === 'USER_LIABILITY' ? cls.userId : (opts.userId ?? null),
+      userId: (cls.kind === 'USER_LIABILITY' || cls.kind === 'USER_DISPUTE' || cls.kind === 'USER_UNALLOCATED') ? cls.userId : (opts.userId ?? null),
       status: 'ACTIVE',
     },
   });
@@ -362,6 +430,25 @@ async function userLiabilityBalance(db, userId) {
   return b.balance;
 }
 
+/**
+ * Exact residual between a stored total and the sum of the share values the
+ * projections actually credited (both as exact decimals). Used by migrated
+ * writers whose float-rounded shares may not re-sum to the stored principal
+ * bit-exactly: the residual is absorbed by the platform revenue line so the
+ * posting balances EXACTLY without minting or destroying value, while the
+ * customer liability lines stay byte-identical to the projections.
+ * Positive = distribution was short (revenue gains the dust);
+ * negative = distribution overshot (revenue absorbs the shortfall).
+ */
+function exactResidual(total, parts) {
+  const t = toExactDecimal(total, 'residual.total');
+  let sum = new Prisma.Decimal(0);
+  for (let i = 0; i < parts.length; i++) {
+    sum = sum.plus(toExactDecimal(parts[i], `residual.part[${i}]`));
+  }
+  return t.minus(sum);
+}
+
 module.exports = {
   LedgerError,
   post,
@@ -370,6 +457,8 @@ module.exports = {
   ensureAccount,
   accountBalance,
   userLiabilityBalance,
+  exactResidual,
   CANONICAL_ACCOUNTS,
   classifyAccountCode,
+  susuEscrowCode,
 };

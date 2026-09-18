@@ -34,6 +34,9 @@ function _getNotificationService(req) {
 
 const { audit } = require('../utils/audit');
 const logger = require('../src/config/logger');
+const { Prisma } = require('@prisma/client');
+const ledger = require('../services/ledgerService');
+const _exact = (n) => (n instanceof Prisma.Decimal ? n.toFixed(8) : Number(n).toFixed(8));
 
 const VALID_FREQUENCIES = ['DAILY', 'WEEKLY', 'BIWEEKLY', 'MONTHLY'];
 
@@ -276,10 +279,15 @@ exports.deposit = async (req, res) => {
                 );
             }
 
-            // Deduct from available balance
+            // Deduct from available balance (§P.4: the projection's escrow
+            // column moves with the same money the ledger goal restriction
+            // locks — reconcileUserProjections requires them to stay equal)
             await tx.user.update({
                 where: { id: userId },
-                data: { availableBalance: { decrement: amountUsdc } }
+                data: {
+                    availableBalance: { decrement: amountUsdc },
+                    escrowLockedBalance: { increment: amountUsdc }
+                }
             });
 
             // Credit the savings goal
@@ -324,7 +332,7 @@ exports.deposit = async (req, res) => {
             // idempotency key (computed at the top of the handler), so
             // a concurrent retry hits the @unique constraint and rolls
             // back the whole deposit — preventing double-debit.
-            await tx.transactionHistory.create({
+            const depositHistory = await tx.transactionHistory.create({
                 data: {
                     userId,
                     type: 'INTERNAL_TRANSFER',
@@ -333,6 +341,25 @@ exports.deposit = async (req, res) => {
                     txHash: depositTxHash,
                     status: 'COMPLETED'
                 }
+            });
+
+            // §P.4 AUTHORITATIVE LEDGER — savings goal lock, same
+            // transaction, idempotent on the client-keyed txHash (the
+            // @unique constraint already aborts duplicate deposits whole):
+            //   D user:{userId}:liability        — spendable liability down
+            //   C escrow:savings-{goalId}:locked — goal restriction up
+            await ledger.post(tx, {
+                idempotencyKey: `ledger:savings:deposit:${depositTxHash}`,
+                entryType: 'VAULT_DEPOSIT',
+                description: 'Savings goal deposit — spendable balance locked into goal restriction',
+                userId,
+                relatedEntity: 'savingsGoal',
+                relatedEntityId: id,
+                metadata: { depositId: deposit ? deposit.id : null, amountGhs: _exact(parseFloat(amountGhs)) },
+                lines: [
+                    { account: `user:${userId}:liability`, debit: _exact(amountUsdc) },
+                    { account: `escrow:savings-${id}:locked`, credit: _exact(amountUsdc) },
+                ],
             });
 
             // Notification for milestone streaks
@@ -442,11 +469,21 @@ exports.withdraw = async (req, res) => {
         const penaltyUsdc = parseFloat((penaltyGhs / liveRate).toFixed(6));
 
         const result = await prisma.$transaction(async (tx) => {
-            // Credit user's available balance (minus penalty)
-            await tx.user.update({
-                where: { id: userId },
-                data: { availableBalance: { increment: netUsdc } }
-            });
+            // Credit user's available balance (minus penalty). §P.4: the
+            // goal restriction is released for the full net+penalty — the
+            // projection escrow column moves with the same money the ledger
+            // escrow account drains.
+            {
+                const releasedExact = new Prisma.Decimal(_exact(netUsdc))
+                    .plus(new Prisma.Decimal(_exact(penaltyUsdc)));
+                await tx.user.update({
+                    where: { id: userId },
+                    data: {
+                        availableBalance: { increment: netUsdc },
+                        escrowLockedBalance: { decrement: releasedExact }
+                    }
+                });
+            }
 
             // If penalty exists, route to system profit
             if (penaltyUsdc > 0) {
@@ -471,7 +508,7 @@ exports.withdraw = async (req, res) => {
             // is logged as the feeUsdc field so the runDoubleCheck audit
             // sees: net inflow = netUsdc, fee = penaltyUsdc, total
             // sum-effect on availableBalance = netUsdc - 0 = +netUsdc.
-            await tx.transactionHistory.create({
+            const withdrawHistory = await tx.transactionHistory.create({
                 data: {
                     userId,
                     type: 'INTERNAL_TRANSFER',
@@ -481,6 +518,40 @@ exports.withdraw = async (req, res) => {
                     status: 'COMPLETED'
                 }
             });
+
+            // §P.4 AUTHORITATIVE LEDGER — savings withdrawal settlement, same
+            // transaction, idempotent on the durable TransactionHistory row's
+            // own identity (its auto id is the stable key):
+            //   D escrow:savings-{goalId}:locked — goal restriction released
+            //       (net + penalty must equal what the goal actually holds;
+            //        any float-rounding residual is absorbed by revenue:fees
+            //        so the posting balances EXACTLY without minting value)
+            //   C user:{userId}:liability       — net refund to spendable
+            //   C revenue:fees                   — early-withdrawal penalty
+            //       realized (mirrors the SystemProfitFees increment above)
+            {
+                const grossDebit = new Prisma.Decimal(_exact(netUsdc)).plus(new Prisma.Decimal(_exact(penaltyUsdc)));
+                const residual = new Prisma.Decimal(_exact(grossDebit));
+                const lines = [
+                    { account: `escrow:savings-${id}:locked`, debit: residual.toFixed(8) },
+                    { account: `user:${userId}:liability`, credit: _exact(netUsdc) },
+                ];
+                if (penaltyUsdc > 0) {
+                    lines.push({ account: 'revenue:fees', credit: _exact(penaltyUsdc) });
+                }
+                await ledger.post(tx, {
+                    idempotencyKey: `ledger:savings:withdraw:${withdrawHistory.id}`,
+                    entryType: 'VAULT_RELEASE',
+                    description: isEarlyWithdrawal
+                        ? 'Savings early withdrawal — restriction released, penalty realized'
+                        : 'Savings withdrawal — restriction released to spendable balance',
+                    userId,
+                    relatedEntity: 'savingsGoal',
+                    relatedEntityId: id,
+                    metadata: { withdrawAmountGhs: _exact(withdrawAmount), penaltyGhs: _exact(penaltyGhs) },
+                    lines,
+                });
+            }
 
             // If a penalty was charged, route a SAVINGS_FEE audit row.
             if (penaltyUsdc > 0) {

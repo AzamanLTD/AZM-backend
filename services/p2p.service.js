@@ -16,9 +16,17 @@
 // =============================================================================
 
 const logger = require('../src/config/logger');
-const journal = require('./journalIntegration');
+
 const gamification = require('./vendorGamificationService');
 const { calculateFeeSplit } = require('../utils/feeMath');
+const { Prisma } = require('@prisma/client');
+const ledger = require('./ledgerService');
+// §P.4 ledger line amounts: EXACTLY what the projections persist.
+// Prisma Decimals pass through at full stored precision; JS floats are
+// rendered as 8dp strings, matching the User.*Decimal(20,8) column the
+// projection increment lands in. Ledger lines and projection mutations can
+// therefore never disagree.
+const _exact = (n) => (n instanceof Prisma.Decimal ? n.toFixed(8) : Number(n).toFixed(8));
 
 // ── Constants ────────────────────────────────────────────────────────────────
 const STRIKE_BAN_THRESHOLD   = 3;          // strikes before auto-ban
@@ -199,6 +207,25 @@ const acceptPing = async (prisma, { tradeId, vendorId, topUpAmount }) => {
             );
         }
 
+        // §P.4 AUTHORITATIVE LEDGER — liability reclassification into the
+        // vendor's unallocated trading pool, same transaction, idempotent on
+        // the trade's ping identity (a trade can only leave PENDING_PAYMENT
+        // acceptance once):
+        //   D user:{vendor}:liability    — available liability down
+        //   C user:{vendor}:unallocated  — restricted pool liability up
+        await ledger.post(tx, {
+            idempotencyKey: `ledger:p2p:pool-topup:${tradeId}`,
+            entryType: 'VENDOR_TOPUP',
+            description: 'Vendor trading-pool top-up on ping acceptance',
+            userId: vendorId,
+            relatedEntity: 'trade',
+            relatedEntityId: tradeId,
+            lines: [
+                { account: `user:${vendorId}:liability`, debit: _exact(topUpAmount) },
+                { account: `user:${vendorId}:unallocated`, credit: _exact(topUpAmount) },
+            ],
+        });
+
         // Read the row after the successful conditional mutation so the response
         // reflects committed balance values rather than a stale snapshot.
         const balances = await tx.user.findUnique({
@@ -366,6 +393,43 @@ const markUnderpaid = async (prisma, { tradeId, callerUserId, paidAmountFiat, in
                     data:  { availableBalance: { increment: unpaidFractionUsdc } }
                 });
             }
+        }
+
+        // §P.4 AUTHORITATIVE LEDGER — underpaid escrow split, same
+        // transaction, idempotent on the trade's cancellation identity:
+        //   D escrow:trade-{id}:locked  — full locked principal released
+        //   C user:{paid-to}:liability  — paid fraction credited
+        //   C user:{holder}:liability   — unpaid fraction returned
+        // Any float-rounding residual between the stored principal and the
+        // credited shares is absorbed by revenue:fees so the posting balances
+        // exactly WITHOUT minting or destroying value (the customer liability
+        // lines stay byte-identical to what the projections credited).
+        {
+            const escrowHolderId = isSellAd ? trade.vendorId : trade.userId;
+            const paidToId = isSellAd ? trade.userId : trade.vendorId;
+            const lines = [
+                { account: `escrow:trade-${tradeId}:locked`, debit: _exact(totalLockedUsdc) },
+                { account: `user:${paidToId}:liability`, credit: _exact(paidFractionUsdc) },
+            ];
+            if (unpaidFractionUsdc > 0) {
+                lines.push({ account: `user:${escrowHolderId}:liability`, credit: _exact(unpaidFractionUsdc) });
+            }
+            const residual = ledger.exactResidual(_exact(totalLockedUsdc), [_exact(paidFractionUsdc), unpaidFractionUsdc > 0 ? _exact(unpaidFractionUsdc) : '0']);
+            if (!residual.isZero()) {
+                const residualStr = residual.abs().toFixed(8);
+                if (residual.isPositive()) lines.push({ account: 'revenue:fees', credit: residualStr });
+                else lines.push({ account: 'revenue:fees', debit: residualStr });
+            }
+            await ledger.post(tx, {
+                idempotencyKey: `ledger:p2p:underpaid-split:${tradeId}`,
+                entryType: 'ESCROW_RELEASE',
+                description: 'Underpaid trade cancelled — paid fraction to payer, remainder returned to escrow holder',
+                userId: escrowHolderId,
+                relatedEntity: 'trade',
+                relatedEntityId: tradeId,
+                metadata: { paidFractionUsdc, unpaidFractionUsdc, residualAbs: residual.abs().toFixed(8) },
+                lines,
+            });
         }
 
         // 3. Trade was already stamped CANCELLED at the top of this
@@ -543,6 +607,30 @@ const flagOverpayment = async (prisma, { tradeId, buyerId, overpaidAmountUsdc })
             where: { id: trade.vendorId },
             data:  { disputeEscrowBalance: { increment: overpaidAmountUsdc } }
         });
+
+        // §P.4 AUTHORITATIVE LEDGER — overpayment freeze as a liability
+        // reclassification into the vendor's dispute restriction, same
+        // transaction, idempotent on the OVERPAYMENT_FREEZE_{tradeId}
+        // identity that the TransactionHistory row below already enforces:
+        //   D user:{vendor}:unallocated (pool portion, if any)
+        //   D user:{vendor}:liability    (available portion, if any)
+        //   C user:{vendor}:dispute      (frozen disputed excess)
+        {
+            const lines = [];
+            if (fromUnallocated > 0) lines.push({ account: `user:${trade.vendorId}:unallocated`, debit: _exact(fromUnallocated) });
+            if (fromAvailable > 0) lines.push({ account: `user:${trade.vendorId}:liability`, debit: _exact(fromAvailable) });
+            lines.push({ account: `user:${trade.vendorId}:dispute`, credit: _exact(overpaidAmountUsdc) });
+            await ledger.post(tx, {
+                idempotencyKey: `ledger:p2p:overpayment-freeze:${tradeId}`,
+                entryType: 'ESCROW_DISPUTE',
+                description: 'Overpayment flagged — disputed excess frozen into dispute restriction',
+                userId: trade.vendorId,
+                relatedEntity: 'trade',
+                relatedEntityId: tradeId,
+                metadata: { buyerId, fromUnallocated, fromAvailable },
+                lines,
+            });
+        }
 
         // Escalate trade to DISPUTED (idempotent — already-disputed trades
         // stay DISPUTED, so this is safe to run inside the transaction
@@ -812,6 +900,46 @@ const completeTrade = async (prisma, { tradeId, releasedByUserId, adminOverride 
             data:  { balance: { increment: adminCutUsdc } }
         });
 
+        // 3b. §P.4 AUTHORITATIVE SETTLEMENT — one balanced posting in the
+        // same transaction, idempotent on the trade's terminal transition
+        // (the PAID/DISPUTED → COMPLETED claim above guarantees a single
+        // financial winner):
+        //   D escrow:trade-{id}:locked — full escrowed principal released
+        //   C user:{fiat-payer-credit}:liability — net + vendor cut
+        //   C revenue:fees — admin cut (platform margin)
+        // Any float-rounding residual between the stored principal and the
+        // credited shares is absorbed by revenue:fees so the posting balances
+        // EXACTLY without minting or destroying value; customer liability
+        // lines stay byte-identical to what the projections credited.
+        {
+            const lines = [{ account: `escrow:trade-${tradeId}:locked`, debit: _exact(trade.amountCrypto) }];
+            if (isSellAd) {
+                lines.push({ account: `user:${trade.userId}:liability`, credit: _exact(netUsdc) });
+                lines.push({ account: `user:${trade.vendorId}:liability`, credit: _exact(vendorCutUsdc) });
+            } else {
+                const vendorTotal = parseFloat((netUsdc + vendorCutUsdc).toFixed(8));
+                lines.push({ account: `user:${trade.vendorId}:liability`, credit: _exact(vendorTotal) });
+            }
+            const credited = isSellAd
+                ? [netUsdc, vendorCutUsdc, adminCutUsdc]
+                : [parseFloat((netUsdc + vendorCutUsdc).toFixed(8)), adminCutUsdc];
+            const residual = ledger.exactResidual(_exact(trade.amountCrypto), credited.map(_exact));
+            const feesCredit = new Prisma.Decimal(String(adminCutUsdc)).plus(residual.isPositive() ? residual : new Prisma.Decimal(0));
+            const feesDebit = residual.isNegative() ? residual.abs() : new Prisma.Decimal(0);
+            if (!feesCredit.isZero()) lines.push({ account: 'revenue:fees', credit: feesCredit.toFixed(8) });
+            if (!feesDebit.isZero()) lines.push({ account: 'revenue:fees', debit: feesDebit.toFixed(8) });
+            await ledger.post(tx, {
+                idempotencyKey: `ledger:p2p:settle:${tradeId}`,
+                entryType: 'TRADE',
+                description: 'P2P trade completed — escrowed principal settled to parties, platform margin realized',
+                userId: trade.userId,
+                relatedEntity: 'trade',
+                relatedEntityId: tradeId,
+                metadata: { isSellAd, netUsdc, vendorCutUsdc, adminCutUsdc, residual: residual.toFixed(8) },
+                lines,
+            });
+        }
+
         // 4. AdminProfitLog
         const profitLog = await tx.adminProfitLog.create({
             data: {
@@ -870,20 +998,10 @@ const completeTrade = async (prisma, { tradeId, releasedByUserId, adminOverride 
         return { profitLog };
     });
 
-    // ── Double-entry journal (non-blocking, fail-safe) ──────────────────────
-    const escrowUserId = isSellAd ? trade.userId : trade.vendorId;
-    const receiverUserId = isSellAd ? trade.vendorId : trade.userId;
-    const tradeAmount = parseFloat(trade.amountCrypto);
-
-    journal.recordEscrowRelease(escrowUserId, receiverUserId, tradeAmount, String(tradeId), {
-        isSellAd, adminCutUsdc, vendorCutUsdc
-    }).catch(e => logger.warn({ err: e.message, tradeId }, '[p2p.service] Journal escrow release failed'));
-
-    if (parseFloat(adminCutUsdc) > 0) {
-        journal.recordFee(receiverUserId, adminCutUsdc, String(tradeId), { adminPct }).catch(e =>
-            logger.warn({ err: e.message, tradeId }, '[p2p.service] Journal fee failed')
-        );
-    }
+    // ── §P.4: the authoritative settlement posting was committed INSIDE the
+    // transaction above (ledger:p2p:settle:{tradeId}). The legacy fire-and-forget
+    // shadow journal calls were removed from this migrated path — a second
+    // representation of the same economic event would be double-counting.
 
     return {
         tradeId,

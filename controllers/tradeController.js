@@ -13,7 +13,9 @@
 // =============================================================================
 
 const logger = require('../src/config/logger');
-const journal = require('../services/journalIntegration');
+const { Prisma } = require('@prisma/client');
+const ledger = require('../services/ledgerService');
+const _exact = (n) => (n instanceof Prisma.Decimal ? n.toFixed(8) : Number(n).toFixed(8));
 const { sendPushNotification } = require('../utils/firebaseService');
 const gamification = require('../services/vendorGamificationService');
 const { parsePagination, buildPageEnvelope } = require('../utils/pagination');
@@ -474,6 +476,33 @@ exports.acceptTrade = async (req, res) => {
                 }
             }
 
+            // §P.4 AUTHORITATIVE LEDGER — trade escrow lock, same transaction,
+            // idempotent on the trade's acceptance identity (a trade can only
+            // leave PENDING once; a concurrent double-accept collides on the
+            // idempotency key and the whole losing transaction rolls back):
+            //   SELL ad: D user:{vendor}:unallocated / C escrow:trade-{id}:locked
+            //   BUY ad:  D user:{user}:liability    / C escrow:trade-{id}:locked
+            await ledger.post(tx, {
+                idempotencyKey: `ledger:p2p:escrow-lock:${tradeIdInt}`,
+                entryType: 'ESCROW_LOCK',
+                description: isSellAd
+                    ? 'Trade accepted — vendor trading pool locked into trade escrow'
+                    : 'Trade accepted — seller available balance locked into trade escrow',
+                userId: isSellAd ? trade.vendorId : trade.userId,
+                relatedEntity: 'trade',
+                relatedEntityId: tradeIdInt,
+                metadata: { adType: trade.type, amountCrypto: _exact(cryptoAmount) },
+                lines: [
+                    {
+                        account: isSellAd
+                            ? `user:${trade.vendorId}:unallocated`
+                            : `user:${trade.userId}:liability`,
+                        debit: _exact(cryptoAmount),
+                    },
+                    { account: `escrow:trade-${tradeIdInt}:locked`, credit: _exact(cryptoAmount) },
+                ],
+            });
+
             // Set timer and transition to PENDING_PAYMENT
             const windowMinutes = trade.selectedTimeframe || 15;
             const now = new Date();
@@ -500,12 +529,6 @@ exports.acceptTrade = async (req, res) => {
             await emitBalanceUpdate(updatedTrade.vendorId);
             await emitBalanceUpdate(updatedTrade.userId);
         }
-
-        // Double-entry journal: escrow lock (non-blocking, fail-safe)
-        const escrowUserId = updatedTrade.adType === 'SELL' ? updatedTrade.userId : updatedTrade.vendorId;
-        journal.recordEscrowLock(escrowUserId, parseFloat(updatedTrade.amountCrypto), String(updatedTrade.id), {
-            adType: updatedTrade.adType
-        }).catch(e => logger.warn({ err: e.message, tradeId: updatedTrade.id }, '[tradeController] Journal escrow lock failed'));
 
         // Emit trade update to the trade room
         const room = `trade_${tradeIdInt}`;

@@ -198,7 +198,17 @@ describeOrSkip('§P.4 authoritative liability ledger (real PostgreSQL)', () => {
             }));
             const results = await Promise.allSettled([postOnce(), postOnce()]);
             const ok = results.filter(r => r.status === 'fulfilled');
-            expect(ok).toHaveLength(1); // one commits; the loser rolls back on the unique constraint
+            // Two legal interleavings, both exactly-once economically:
+            //   (a) both check-then-create collide on the unique key → one
+            //       commits, the loser rolls back and rejects;
+            //   (b) the winner fully commits before the loser's
+            //       findUnique → the loser takes the REPLAY path and also
+            //       fulfills (replayed: true), pointing at the SAME
+            //       committed transaction. In either case exactly ONE
+            //       posting exists afterwards — never two.
+            expect(ok.length).toBeGreaterThanOrEqual(1);
+            expect(new Set(ok.map(r => r.value.transaction.id)).size).toBe(1);
+            expect(ok.some(r => r.value.replayed)).toBe(results.some(r => r.status === 'rejected') === false);
             expect(await prisma.ledgerTransaction.count()).toBe(1);
             expect(await prisma.journalEntry.count()).toBe(2);
             const committed = await bal('clearing:conversion');
@@ -347,7 +357,7 @@ describeOrSkip('§P.4 authoritative liability ledger (real PostgreSQL)', () => {
             }),
         });
 
-        it('webhook settlement posts D custody:deposit:usdc / C user:{id}:liability atomically, and replays are idempotent', async () => {
+        it('webhook settlement posts D clearing:custody:unverified:usdc / C user:{id}:liability atomically (provisional custody), and replays are idempotent', async () => {
             const user = await seedUser(prisma, { availableBalance: 0 });
             const registry = await allocateDepositAddress(prisma, tatumFake(), user.id);
             const txHash = '0x' + 'cc'.repeat(32);
@@ -360,15 +370,21 @@ describeOrSkip('§P.4 authoritative liability ledger (real PostgreSQL)', () => {
             // Projection + authoritative ledger agree exactly.
             expect((await avail(user.id)).toString()).toBe('7.5');
             expect((await userBal(user.id)).toFixed(6)).toBe('7.500000');
+            // Wave-2: the webhook records PROVISIONAL custody only. The
+            // unverified clearing balance is NOT a PoR reserve asset; only
+            // independent transaction evidence (custodyAccounting verify)
+            // reclassifies it into custody:deposit:usdc.
+            const provisional = await bal('clearing:custody:unverified:usdc');
+            expect(provisional.balance.toFixed(6)).toBe('7.500000');
             const custodyAsset = await bal('custody:deposit:usdc');
-            expect(custodyAsset.balance.toFixed(6)).toBe('7.500000');
+            expect(custodyAsset.balance.toFixed(6)).toBe('0.000000');
             // One posting group, two lines, linked to the TransactionHistory row.
             const post = await prisma.ledgerTransaction.findUnique({ where: { idempotencyKey: `ledger:deposit:crypto:${txHash}` } });
             expect(post).not.toBeNull();
             expect(post.relatedEntity).toBe('transactionHistory');
             const lines = await prisma.journalEntry.findMany({ where: { ledgerTransactionId: post.id } });
             expect(lines).toHaveLength(2);
-            expect(new Set(lines.map(l => l.account))).toEqual(new Set(['custody:deposit:usdc', `user:${user.id}:liability`]));
+            expect(new Set(lines.map(l => l.account))).toEqual(new Set(['clearing:custody:unverified:usdc', `user:${user.id}:liability`]));
             // The custody candidate is LINKED to the posting.
             expect(post.metadata.custodyMovementId).toBe((await prisma.custodyMovement.findFirst({ where: { txHash } })).id);
 
@@ -578,7 +594,12 @@ describeOrSkip('§P.4 authoritative liability ledger (real PostgreSQL)', () => {
             const settled = await finance.completeFiatWithdrawal(prisma, 'FW-1', { providerTxId: 'PTX-1' });
             expect(settled.changed).toBe(true);
             expect((await bal('restricted:reserves')).balance.toFixed(6)).toBe('0.000000');
-            expect((await bal('custody:provider:usdc')).balance.toFixed(6)).toBe('10.000000');
+            // Wave-2: fiat settlement is a FIAT rail — the principal enters
+            // clearing:fiat:offramp:usdc, NOT provider custody (that account is
+            // reserved for real provider-held USDC). §P.5 reconciles the rail
+            // against actual GHS liquidity movements.
+            expect((await bal('clearing:fiat:offramp:usdc')).balance.toFixed(6)).toBe('10.000000');
+            expect((await bal('custody:provider:usdc')).balance.toFixed(6)).toBe('0.000000');
             expect((await bal('revenue:fees')).balance.toFixed(6)).toBe(D(exitFee).toFixed(6));
             expect((await prisma.restrictedObligation.findUnique({ where: { reference: 'withdrawal:fiat:FW-1' } })).status).toBe('RELEASED');
 
