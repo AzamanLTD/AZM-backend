@@ -33,14 +33,10 @@
 //   • FAIL-CLOSED catalog: an account code that is not canonical nor a
 //     recognized dynamic pattern is rejected — unknown accounts can never
 //     silently absorb value.
-//   • §P.5-A ACCOUNTING ASSET IDENTITY: every posting line resolves to its
-//     account's canonical asset (USDC, GHS, ...). A posting whose lines mix
-//     incompatible assets is rejected — numeric coincidence (1200 GHS vs
-//     100 USDC) is NOT an accounting equality. Cross-asset exchange exists
-//     ONLY as an explicit ASSET_CONVERSION posting: an exact conversion
-//     identity + rate, and asset-specific legs that EACH balance exactly
-//     within their own asset. The persisted LedgerAccount row must agree
-//     with the chart's classification or the posting fails closed.
+//   • §P.5-A ASSET IDENTITY: every line resolves to its account's canonical
+//     asset — mixing incompatible assets is rejected (1200 GHS ≠ 100 USDC even
+//     when columns sum equal); cross-asset exchange exists ONLY as an explicit
+//     ASSET_CONVERSION; a persisted row disagreeing with the chart fails closed.
 //
 // The legacy journalService.record()/journalIntegration helpers remain ONLY
 // as non-authoritative compatibility for callers not yet migrated (§P.4
@@ -120,13 +116,8 @@ const CANONICAL_ACCOUNTS = {
   'pnl:inventory':          { accountClass: 'REVENUE',    normalSide: 'CREDIT', asset: 'USDC', network: null },
   'pnl:arbitrage':          { accountClass: 'REVENUE',    normalSide: 'CREDIT', asset: 'USDC', network: null },
   'equity:treasury':        { accountClass: 'EQUITY',     normalSide: 'CREDIT', asset: 'USDC', network: null },
-  // §P.5-A: the GHS-side equity counter — the symmetric counterpart of
-  // equity:treasury for the GHS asset perimeter, so an explicit cross-asset
-  // conversion can post two LEGITIMATE asset-balanced legs (GHS received
-  // against GHS equity / USDC delivered against USDC equity) instead of a
-  // fake numeric balance. CATALOG-ONLY: no active economic flow uses this
-  // account until the §P.5-D/E GHS-liquidity and Model B waves define the
-  // real semantics; it is never a GHS liability, spread or P&L account.
+  // §P.5-A: GHS-side equity counterpart of equity:treasury — CATALOG-ONLY
+  // until §P.5-D/E GHS-liquidity semantics; never a GHS liability, spread or P&L.
   'equity:treasury:ghs':    { accountClass: 'EQUITY',     normalSide: 'CREDIT', asset: 'GHS',  network: null },
 };
 
@@ -196,17 +187,18 @@ function toExactDecimal(value, label = 'amount') {
   throw new LedgerError('LEDGER_INEXACT_QUANTITY', `${label}: unsupported quantity type ${typeof value}`);
 }
 
-/**
- * Deterministic posting identity hash over the exact normalized economic
- * content. Line order is canonicalized (sorted) so the same economic posting
- * always hashes identically.
- */
-function computePostingHash(entryType, normalizedLines) {
+/** Deterministic identity hash over exact normalized economic content (line order canonicalized). */
+function computePostingHash(entryType, normalizedLines, conversionRecord = null) {
   const canonical = normalizedLines
     .map(l => `${l.account}:${l.debit.toFixed(8)}:${l.credit.toFixed(8)}`)
     .sort()
     .join('|');
-  return crypto.createHash('sha256').update(`${entryType}#${canonical}`).digest('hex');
+  // §P.5-A: conversion provenance is part of the economic identity; P4 hashes stay byte-identical.
+  let identity = `${entryType}#${canonical}`;
+  if (conversionRecord) {
+    identity += `#conv:${conversionRecord.identity}:${conversionRecord.rate}:${conversionRecord.quoteReference ?? ''}`;
+  }
+  return crypto.createHash('sha256').update(identity).digest('hex');
 }
 
 /**
@@ -261,28 +253,42 @@ function susuEscrowCode(cycleId, memberId) {
 async function ensureAccount(tx, code, opts = {}) {
   const cls = classifyAccountCode(code);
   const spec = cls.spec;
-  const row = await tx.ledgerAccount.upsert({
-    where: { code },
-    update: {}, // classification is authoritative — never rewritten
-    create: {
-      code,
-      accountClass: spec.accountClass,
-      normalSide: spec.normalSide,
-      asset: spec.asset,
-      network: spec.network,
-      userId: (cls.kind === 'USER_LIABILITY' || cls.kind === 'USER_DISPUTE' || cls.kind === 'USER_UNALLOCATED') ? cls.userId : (opts.userId ?? null),
-      status: 'ACTIVE',
-    },
-  });
-  // §P.5-A: the persisted catalog row must AGREE with the authoritative
-  // chart. A tampered/misclassified row fails closed — a posting can never
-  // inherit stale or manipulated asset identity, and classification is
-  // never silently rewritten to make the caller pass.
-  const mismatch = [];
-  if (row.accountClass !== spec.accountClass) mismatch.push(`accountClass ${row.accountClass} != ${spec.accountClass}`);
-  if (row.normalSide !== spec.normalSide) mismatch.push(`normalSide ${row.normalSide} != ${spec.normalSide}`);
-  if (row.asset !== spec.asset) mismatch.push(`asset ${row.asset} != ${spec.asset}`);
-  if ((row.network ?? null) !== (spec.network ?? null)) mismatch.push(`network ${row.network} != ${spec.network}`);
+  const userId = (cls.kind === 'USER_LIABILITY' || cls.kind === 'USER_DISPUTE' || cls.kind === 'USER_UNALLOCATED') ? cls.userId : (opts.userId ?? null);
+  // Classification is authoritative — never rewritten. Prisma's upsert is not
+  // atomic on Postgres: concurrent FIRST USE can collide on the code unique
+  // index; that P2002 becomes a deterministic retryable error. Fail closed.
+  let row;
+  try {
+    row = await tx.ledgerAccount.upsert({
+      where: { code },
+      update: {},
+      create: {
+        code,
+        accountClass: spec.accountClass,
+        normalSide: spec.normalSide,
+        asset: spec.asset,
+        network: spec.network,
+        userId,
+        status: 'ACTIVE',
+      },
+    });
+  } catch (e) {
+    const tgt = Array.isArray(e.meta?.target) ? e.meta.target.join(',') : String(e.meta?.target ?? '');
+    if (e?.code === 'P2002' && tgt.includes('code')) {
+      throw new LedgerError('LEDGER_ACCOUNT_CONTENTION',
+        `account "${code}" is being created concurrently — the enclosing transaction rolled back; retry the posting`,
+        { code });
+    }
+    throw e;
+  }
+  // §P.5-A: the persisted row must AGREE with the chart — a tampered or
+  // misclassified row fails closed; the chart is never rewritten to match.
+  const mismatch = [
+    ['accountClass', row.accountClass, spec.accountClass],
+    ['normalSide', row.normalSide, spec.normalSide],
+    ['asset', row.asset, spec.asset],
+    ['network', row.network ?? null, spec.network ?? null],
+  ].filter(([, a, b]) => a !== b);
   if (mismatch.length) {
     throw new LedgerError('LEDGER_ACCOUNT_IDENTITY_CONFLICT',
       `account "${code}" persisted identity disagrees with the authoritative chart (${mismatch.join('; ')}) — refusing to post; the chart is never rewritten to match the row`,
@@ -353,10 +359,7 @@ async function post(tx, params) {
     normalized.push({ account: line.account, debit, credit });
   }
 
-  // ── §P.5-A conversion context validation ─────────────────────────────────
-  // ASSET_CONVERSION and the conversion context are mutually required: the
-  // explicit exchange mechanism is the ONLY way to mix assets. Validation is
-  // PURE (no DB) so an invalid conversion fails before any catalog touch.
+  // ── §P.5-A conversion context validation (pure — fails before any DB touch) ──
   if (entryType === 'ASSET_CONVERSION' && !conversion) {
     throw new LedgerError('LEDGER_CONVERSION_CONTEXT_REQUIRED',
       'entryType ASSET_CONVERSION requires an explicit conversion context { identity, rate } — cross-asset exchange is never implicit');
@@ -394,14 +397,9 @@ async function post(tx, params) {
     };
   }
 
-  // ── §P.5-A asset-identity balancing ──────────────────────────────────────
-  // Group the exact per-line quantities by the RESOLVED asset identity (pure
-  // chart classification — no DB). A normal posting must live entirely
-  // inside ONE asset; only an explicit ASSET_CONVERSION may touch more than
-  // one, and then EVERY asset leg must balance exactly on its own — GHS and
-  // USDC are never equated numerically. Asset identity is checked BEFORE
-  // numeric balancing: mixing incompatible assets is an IDENTITY violation
-  // first, regardless of whether the columns happen to sum equal.
+  // ── §P.5-A asset-identity balancing — BEFORE numeric balancing (identity
+  // precedes arithmetic): a normal posting lives inside ONE asset; only an
+  // ASSET_CONVERSION may touch more, with every asset leg balanced on its own.
   const zeroQ = new Prisma.Decimal(0);
   const perAsset = new Map();
   for (const l of normalized) {
@@ -455,15 +453,11 @@ async function post(tx, params) {
     await ensureAccount(tx, code, { userId });
   }
 
-  // ── Durable conversion identity (exactly-once across the ledger) ──────────
+  // ── Durable conversion identity: the DB UNIQUE constraint enforces; the
+  // pre-read turns sequential reuse into a clear error. ──────────────────────
   if (conversionRecord) {
-    // A DIFFERENT posting may never reuse a committed conversion identity.
-    // (Two concurrent conversions with the same identity race on this check;
-    // callers performing cross-asset economics must use a serialized
-    // transaction — full Model B serialization arrives with the §P.5-E
-    // settlement wave.)
     const priorIdentity = await tx.ledgerTransaction.findFirst({
-      where: { metadata: { path: ['conversion', 'identity'], equals: conversionRecord.identity } },
+      where: { conversionIdentity: conversionRecord.identity },
       select: { idempotencyKey: true },
     });
     if (priorIdentity && priorIdentity.idempotencyKey !== idempotencyKey) {
@@ -472,7 +466,7 @@ async function post(tx, params) {
     }
   }
 
-  const postingHash = computePostingHash(entryType, normalized);
+  const postingHash = computePostingHash(entryType, normalized, conversionRecord);
 
   // ── Exactly-once economic identity ────────────────────────────────────────
   const existing = await tx.ledgerTransaction.findUnique({ where: { idempotencyKey } });
@@ -481,11 +475,6 @@ async function post(tx, params) {
       throw new LedgerError('LEDGER_IDEMPOTENCY_CONFLICT',
         `idempotencyKey "${idempotencyKey}" already committed a DIFFERENT posting (hash ${existing.postingHash} != ${postingHash}) — refusing to overwrite economic history`,
         { existingHash: existing.postingHash, attemptedHash: postingHash });
-    }
-    if (conversionRecord
-        && existing.metadata?.conversion?.identity !== conversionRecord.identity) {
-      throw new LedgerError('LEDGER_IDEMPOTENCY_CONFLICT',
-        `idempotencyKey "${idempotencyKey}" already committed a DIFFERENT conversion identity (${existing.metadata?.conversion?.identity} != ${conversionRecord.identity}) — refusing to overwrite economic history`);
     }
     const entries = await tx.journalEntry.findMany({
       where: { ledgerTransactionId: existing.id },
@@ -506,12 +495,21 @@ async function post(tx, params) {
       relatedEntity: relatedEntity ?? null,
       relatedEntityId: relatedEntityId != null ? String(relatedEntityId) : null,
       postingHash,
-      // The explicit conversion identity is persisted ON the durable economic
-      // transaction — the authoritative record of the cross-asset exchange.
+      conversionIdentity: conversionRecord ? conversionRecord.identity : null,
+      // metadata.conversion stays the full audit/provenance record;
+      // conversionIdentity is the DB-enforced enforcement key.
       metadata: conversionRecord
         ? { ...(metadata ?? {}), conversion: conversionRecord }
         : (metadata ?? null),
     },
+  }).catch((e) => {
+    const tgt = Array.isArray(e.meta?.target) ? e.meta.target.join(',') : String(e.meta?.target ?? ''); // collided constraint name
+    if (e?.code === 'P2002' && tgt.includes('conversionIdentity')) {
+      // Concurrent conversion on the SAME identity committed first — fail closed.
+      throw new LedgerError('LEDGER_CONVERSION_IDENTITY_CONFLICT',
+        `conversion identity "${conversionRecord.identity}" was committed concurrently — a conversion identity is exactly-once and never reused`);
+    }
+    throw e;
   });
 
   const entries = [];

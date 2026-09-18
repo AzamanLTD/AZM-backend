@@ -5944,7 +5944,8 @@ model LedgerTransaction {
   userId          Int?
   relatedEntity   String?          @db.VarChar(50)
   relatedEntityId String?
-  postingHash     String           @db.VarChar(64) // sha-256 of the exact normalized lines — replay consistency proof
+  postingHash     String           @db.VarChar(64) // sha-256 of the exact normalized economic content — replay consistency proof
+  conversionIdentity String?       @unique // §P.5-A: DB-enforced exactly-once cross-asset exchange identity (null on all P4 rows)
   metadata        Json?
   postedAt        DateTime         @default(now())
   createdAt       DateTime         @default(now())
