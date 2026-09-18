@@ -92,7 +92,7 @@ jobs:
         # synchronous_commit is applied to existing sessions via SIGHUP —
         # no container restart needed. Production databases are unaffected.
         run: |
-          npx prisma db execute --stdin <<'SQL'
+          npx prisma db execute --url "$DATABASE_URL" --stdin <<'SQL'
           ALTER SYSTEM SET synchronous_commit = off;
           SELECT pg_reload_conf();
           SQL
