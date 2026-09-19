@@ -13,7 +13,10 @@ const {
   consumeTransactionQuote,
 } = require('../src/services/transactionQuoteService');
 const fiatLiquidity = require('../src/services/fiatLiquidityService'); // §P.5-D
+const modelBSettlement = require('../services/modelBSettlementService'); // §P.5-E
 const routePolicy = require('../src/services/routePolicyService');
+const { Prisma } = require('@prisma/client');
+const Decimal = Prisma.Decimal;
 
 // §P.5-C: rails are owned by the versioned route policy — this set mirrors
 // MOOLRE_MOMO_COLLECTION rails so controller and policy can never drift.
@@ -140,7 +143,11 @@ exports.initiate = async (req, res) => {
         network,
       });
     } catch (moolreErr) {
-      await prisma.transactionHistory.update({ where: { id: pending.id }, data: { status: 'FAILED' } });
+      // §P.5-E audit r5: the failure transition is a DB-enforced conditional
+      // claim — only a still-PENDING deposit can be failed here. A deposit
+      // that concurrently completed elsewhere can never be resurrected to
+      // FAILED by an unconditional write.
+      await prisma.transactionHistory.updateMany({ where: { id: pending.id, status: 'PENDING' }, data: { status: 'FAILED' } });
       logger.error({ err: moolreErr }, '[moolreQuoteDeposit] provider initiation failed');
       return res.status(502).json({
         success: false,
@@ -251,6 +258,9 @@ exports.webhook = async (req, res) => {
         });
     }
     const liquidityAuthorityOn = await fiatLiquidity.isAuthorityEnabled(prisma);
+    // §P.5-E: OFF (default) keeps the §P.4 clearing:conversion bridge; ON
+    // settles the purchase through authoritative inventory (Model B).
+    const modelBOn = await modelBSettlement.isModelBSettlementEnabled(prisma);
 
     const quoteId = existing.metadata?.quoteId;
     if (!quoteId) return res.status(409).json({ success: false, message: 'Deposit is missing its transaction quote.' });
@@ -281,15 +291,30 @@ exports.webhook = async (req, res) => {
       routePolicy.assertSettlementRouteAllowed({ quote, settlementSurface: 'MOOLRE_WEBHOOK' });
 
       const quotedGhs = Number(quote.amountGhs);
-      if (Math.abs(settledGhs - quotedGhs) > 0.01) {
+      // §P.5-E Model B authority: exact pesewa equality against the quote —
+      // 99.99/100.01 against a 100.00 quote fail closed BEFORE any mutation;
+      // the ±0.01 tolerance is the flag-OFF legacy affordance only (audit r1).
+      if (modelBOn
+        ? new Decimal(settledGhs).toFixed(2) !== new Decimal(quotedGhs).toFixed(2)
+        : Math.abs(settledGhs - quotedGhs) > 0.01) {
         throw new Error('Settled GHS amount does not match the transaction quote');
       }
 
       const user = await tx.user.findUnique({ where: { id: existing.userId } });
       if (!user) throw new Error('User no longer exists for this deposit.');
 
-      const updatedTx = await tx.transactionHistory.update({
-        where: { id: existing.id },
+      // ── §P.5-E audit r5 (state-machine CAS) ──────────────────────────
+      // The PENDING → COMPLETED claim is made by the DATABASE's conditional
+      // update, NOT by the `existing.status === 'PENDING'` pre-read above —
+      // that read happened OUTSIDE this transaction and is stale by the time
+      // we claim. A competing failure callback (PENDING → FAILED) that
+      // committed in between leaves this update matching ZERO rows; we fail
+      // closed and the entire settlement transaction (quote consumption,
+      // customer credit, ledger posting, Model B settlement, liquidity
+      // receipt) rolls back. A terminal FAILED deposit can never be
+      // resurrected to COMPLETED.
+      const claimed = await tx.transactionHistory.updateMany({
+        where: { id: existing.id, status: 'PENDING' },
         data: {
           status: 'COMPLETED',
           amountUsdc: quote.usdcAmount,
@@ -304,6 +329,14 @@ exports.webhook = async (req, res) => {
           },
         },
       });
+      if (claimed.count !== 1) {
+        throw new Error('Deposit is no longer PENDING — a concurrent state transition won; refusing to settle');
+      }
+      // Read AFTER the claim, inside the claiming transaction: the exact
+      // 8dp amount PostgreSQL stored. The conditional update above is the
+      // state-machine claim authority — this read can never observe a
+      // different state.
+      const updatedTx = await tx.transactionHistory.findUnique({ where: { id: existing.id } });
 
       await tx.user.update({
         where: { id: existing.userId },
@@ -314,6 +347,31 @@ exports.webhook = async (req, res) => {
       // projection credit + TransactionHistory settlement:
       //   D clearing:conversion   — explicit temporary clearing (§P.5 later)
       //   C user:{id}:liability    — customer liability increases
+      //
+      // §P.5-E: the flag ON path settles Model B instead — FIFO inventory
+      // lot claim, GHS asset accounting (fiat:momo:ghs / equity:treasury:ghs),
+      // COGS realization, treasury-stake-funded customer liability and the
+      // durable realized-economics record — clearing:conversion is NOT
+      // touched (docs/p5e-model-b-settlement.md §2.4).
+      if (modelBOn) {
+        await modelBSettlement.settleDepositFromInventory(tx, {
+          reference: externalRef,
+          transactionHistoryId: existing.id,
+          userId: existing.userId,
+          quoteId,
+          quotedGhs: quote.amountGhs,
+          quotedRateGhsPerUsdc: quote.rateGhsPerUsdc,
+          quotedUsdc: quote.usdcAmount,
+          settledGhs,
+          settledUsdc: updatedTx.amountUsdc, // exact Decimal(20,8) — the ledger authority
+          selectedRoute: quote.selectedRoute || null,
+          routeProviderRail: quote.routeProviderRail || null,
+          routePolicyVersion: quote.routePolicyVersion || null,
+          provider: 'MOOLRE',
+          providerRef: existing.providerRef || null,
+          evidenceDedupKey: `event:moolre-collection:${externalRef}`,
+        });
+      } else {
       await ledger.post(tx, {
         idempotencyKey: `ledger:deposit:fiat:${externalRef}`,
         entryType: 'DEPOSIT',
@@ -333,6 +391,7 @@ exports.webhook = async (req, res) => {
           { account: `user:${existing.userId}:liability`, credit: updatedTx.amountUsdc },
         ],
       });
+      }
 
       // §P.5-D (flag ON): the settled, quote-matched Moolre collection —
       // rail-gated by the providerRef proof — IS the evidence that creates

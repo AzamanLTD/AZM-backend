@@ -1449,6 +1449,13 @@ model GlobalSettings {
   // settings; only the reservation/settlement authority is gated.
   fiatLiquidityAuthorityEnabled Boolean @default(false)
 
+  // §P.5-E rollout flag: OFF (default) keeps the §P.4 clearing:conversion
+  // bridge posting for fiat deposit settlement; ON settles Model B customer
+  // purchases through the authoritative path — FIFO inventory lot claim,
+  // GHS asset accounting, customer liability from the treasury stake, and
+  // durable realized economics (cost basis + customer spread).
+  modelBSettlementEnabled Boolean @default(false)
+
   // Phase Q15: App Version Gate
   minAppVersion  String @default("1.0.0") // Minimum supported app version (semver)
   forceUpdateUrl String @default("https://play.google.com/store/apps/details?id=com.azaman.app")
@@ -5978,6 +5985,10 @@ model InventoryLot {
   acquisitionRate   Decimal?           @db.Decimal(18, 8) // GHS per USDC at acquisition (provenance)
   ledgerTxnId       String? // LedgerTransaction.id of the inventory:usdc:lots acquisition posting
   status            InventoryLotStatus @default(OPEN)
+  // §P.5-E: false BY DEFAULT and granted by NO production code path — only a
+  // future, evidence-backed acquisition authority may set it. Inventory
+  // quantity alone can never fund a real customer USDC liability (audit r1).
+  eligibleForModelBSettlement Boolean @default(false)
   consumptions      InventoryLotConsumption[]
   createdAt         DateTime           @default(now())
 }
@@ -5995,6 +6006,40 @@ model InventoryLotConsumption {
   sourceReference String?          @db.VarChar(140) // future Model B settlement evidence
   ledgerTxnId     String? // set by P5-E settlement; null until economics are realized
   createdAt       DateTime        @default(now())
+}
+
+// §P.5-E: the durable economic identity of ONE Model B customer settlement —
+// ties the TransactionQuote, the selected route, the durable provider
+// evidence, the inventory consumption(s), the ledger conversion identity, the
+// resulting customer liability and the realized economics together. Existence
+// of a row == the settlement committed; replay returns it; conflicting reuse
+// of the same reference fails closed.
+model ModelBSettlement {
+  id                      Int      @id @default(autoincrement())
+  reference               String   @unique @db.VarChar(140) // TransactionHistory.txHash — the economic identity
+  transactionHistoryId   String   @db.VarChar(36) // TransactionHistory.id — UUID
+  quoteId                 String   @db.Uuid
+  userId                  Int
+  selectedRoute           String?
+  routeProviderRail       String?
+  routePolicyVersion      String?
+  provider                String   @db.VarChar(40)
+  providerRef             String?
+  evidenceDedupKey        String   @db.VarChar(140) // FiatProviderEvent.dedupKey of the verified INBOUND observation
+  quotedGhs               Decimal  @db.Decimal(20, 2)
+  quotedRateGhsPerUsdc    Decimal  @db.Decimal(20, 8)
+  quotedUsdc              Decimal  @db.Decimal(20, 8)
+  settledGhs              Decimal  @db.Decimal(20, 2)
+  settledUsdc             Decimal  @db.Decimal(20, 8)
+  costBasisGhsTotal       Decimal  @db.Decimal(20, 8)
+  costAllocationResidualGhs Decimal @default(0) @db.Decimal(20, 12)
+  marginGhs               Decimal  @db.Decimal(20, 8)
+  providerFeeGhs          Decimal? @db.Decimal(20, 2) // audit r6: P5-E records NULL until a dedicated provider-fee evidence authority exists — the settlement primitive rejects non-null (MODEL_B_PROVIDER_FEE_UNEVIDENCED)
+  conversionIdentity      String   @unique @db.VarChar(140)
+  conversionLedgerTxnId   String   @db.VarChar(36)
+  depositLedgerTxnId      String   @db.VarChar(36)
+  lotAllocations          Json // [{lotId, acquisitionKey, quantity, lotCostBasisGhs, lotQuantityOriginal, costShareGhs, remainingAfter}]
+  createdAt               DateTime @default(now())
 }
 
 model JournalEntry {

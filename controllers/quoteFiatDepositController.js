@@ -11,7 +11,10 @@ const {
   QuoteIdentityConflictError,
 } = require('../src/services/transactionQuoteService');
 const fiatLiquidity = require('../src/services/fiatLiquidityService'); // §P.5-D
+const modelBSettlement = require('../services/modelBSettlementService'); // §P.5-E
 const routePolicy = require('../src/services/routePolicyService');
+const { Prisma } = require('@prisma/client');
+const Decimal = Prisma.Decimal;
 
 const FIAT_REF_PREFIX = 'FIAT_DEPOSIT_';
 // §P.5-C: rails are owned by the versioned route policy — the controller set
@@ -168,6 +171,9 @@ exports.webhook = async (req, res) => {
         });
     }
     const liquidityAuthorityOn = await fiatLiquidity.isAuthorityEnabled(prisma);
+    // §P.5-E: OFF (default) keeps the §P.4 clearing:conversion bridge; ON
+    // settles the purchase through authoritative inventory (Model B).
+    const modelBOn = await modelBSettlement.isModelBSettlementEnabled(prisma);
 
     const quoteId = existing.metadata?.quoteId;
     if (!quoteId) return res.status(409).json({ success: false, message: 'Deposit is missing its transaction quote.' });
@@ -179,10 +185,38 @@ exports.webhook = async (req, res) => {
       // mutation. Historical quotes without a selectedRoute still settle.
       routePolicy.assertSettlementRouteAllowed({ quote, settlementSurface: 'GENERIC_FIAT_WEBHOOK' });
       const quotedGhs = Number(quote.amountGhs);
-      if (Math.abs(settledGhs - quotedGhs) > 0.01) throw new Error('Settled GHS amount does not match the transaction quote');
+      // §P.5-E Model B authority: exact pesewa equality against the quote —
+      // 99.99/100.01 against a 100.00 quote fail closed BEFORE any mutation;
+      // the ±0.01 tolerance is the flag-OFF legacy affordance only (audit r1).
+      if (modelBOn
+        ? new Decimal(settledGhs).toFixed(2) !== new Decimal(quotedGhs).toFixed(2)
+        : Math.abs(settledGhs - quotedGhs) > 0.01) {
+        throw new Error('Settled GHS amount does not match the transaction quote');
+      }
       const user = await tx.user.findUnique({ where: { id: existing.userId } });
       if (!user) throw new Error('User no longer exists for this deposit.');
-      const updatedTx = await tx.transactionHistory.update({ where: { id: existing.id }, data: { status: 'COMPLETED', amountUsdc: quote.usdcAmount, payerMsisdn: existing.payerMsisdn || null, metadata: { ...(existing.metadata || {}), providerTxId: providerTxId || null, settledAmountGhs: settledGhs, settledAt: new Date().toISOString(), settlementRate: quote.rateGhsPerUsdc, settledRoute: quote.selectedRoute || null, settledRoutePolicyVersion: quote.routePolicyVersion || null } } });
+      // ── §P.5-E audit r5 (state-machine CAS) ──────────────────────────
+      // The PENDING → COMPLETED claim is made by the DATABASE's conditional
+      // update, NOT by the `existing.status === 'PENDING'` pre-read above —
+      // that read happened OUTSIDE this transaction and is stale by the time
+      // we claim. A competing failure callback (PENDING → FAILED) that
+      // committed in between leaves this update matching ZERO rows; we fail
+      // closed and the entire settlement transaction (quote consumption,
+      // customer credit, ledger posting, Model B settlement, liquidity
+      // receipt) rolls back. A terminal FAILED deposit can never be
+      // resurrected to COMPLETED.
+      const claimed = await tx.transactionHistory.updateMany({
+        where: { id: existing.id, status: 'PENDING' },
+        data: { status: 'COMPLETED', amountUsdc: quote.usdcAmount, payerMsisdn: existing.payerMsisdn || null, metadata: { ...(existing.metadata || {}), providerTxId: providerTxId || null, settledAmountGhs: settledGhs, settledAt: new Date().toISOString(), settlementRate: quote.rateGhsPerUsdc, settledRoute: quote.selectedRoute || null, settledRoutePolicyVersion: quote.routePolicyVersion || null } },
+      });
+      if (claimed.count !== 1) {
+        throw new Error('Deposit is no longer PENDING — a concurrent state transition won; refusing to settle');
+      }
+      // Read AFTER the claim, inside the claiming transaction: the exact
+      // 8dp amount PostgreSQL stored. The conditional update above is the
+      // state-machine claim authority — this read can never observe a
+      // different state.
+      const updatedTx = await tx.transactionHistory.findUnique({ where: { id: existing.id } });
       await tx.user.update({ where: { id: existing.userId }, data: { availableBalance: { increment: quote.usdcAmount } } });
 
       // §P.4 AUTHORITATIVE ACCOUNTING — fiat-settled USDC deposit: customer
@@ -192,6 +226,31 @@ exports.webhook = async (req, res) => {
       // economics is NOT realized here); no fake custody asset is posted.
       //   D clearing:conversion   — explicit temporary clearing balance
       //   C user:{id}:liability    — customer liability increases
+      //
+      // §P.5-E: the flag ON path settles Model B instead — FIFO inventory
+      // lot claim, GHS asset accounting (fiat:momo:ghs / equity:treasury:ghs),
+      // COGS realization, treasury-stake-funded customer liability and the
+      // durable realized-economics record — clearing:conversion is NOT
+      // touched (docs/p5e-model-b-settlement.md §2.4).
+      if (modelBOn) {
+        await modelBSettlement.settleDepositFromInventory(tx, {
+          reference,
+          transactionHistoryId: existing.id,
+          userId: existing.userId,
+          quoteId,
+          quotedGhs: quote.amountGhs,
+          quotedRateGhsPerUsdc: quote.rateGhsPerUsdc,
+          quotedUsdc: quote.usdcAmount,
+          settledGhs,
+          settledUsdc: updatedTx.amountUsdc, // exact Decimal(20,8) — the ledger authority
+          selectedRoute: quote.selectedRoute || null,
+          routeProviderRail: quote.routeProviderRail || null,
+          routePolicyVersion: quote.routePolicyVersion || null,
+          provider: 'GENERIC_FIAT_WEBHOOK',
+          providerRef: providerTxId || null,
+          evidenceDedupKey: `event:fiat-deposit:${reference}`,
+        });
+      } else {
       await ledger.post(tx, {
         idempotencyKey: `ledger:deposit:fiat:${reference}`,
         entryType: 'DEPOSIT',
@@ -208,6 +267,7 @@ exports.webhook = async (req, res) => {
           { account: `user:${existing.userId}:liability`, credit: updatedTx.amountUsdc },
         ],
       });
+      }
 
       // §P.5-D (flag ON): the settled, quote-matched deposit observation IS
       // the evidence that creates AVAILABLE GHS liquidity — same transaction
