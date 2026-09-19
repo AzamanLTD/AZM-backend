@@ -440,6 +440,17 @@ describeOrSkip('§P.5-E Model B settlement / inventory cost-basis realization (r
             expect((await prisma.transactionHistory.findUnique({ where: { id: pending.id } })).status).toBe('COMPLETED');
         });
 
+        // §P.5-E/r12 SCOPE NOTE: this is the DIRECT-PRIMITIVE inventory
+        // double-allocation proof — two different deposits, manual quote
+        // consumption + TransactionHistory completion OUTSIDE any
+        // controller, then the settlement primitive invoked concurrently.
+        // It proves inventory cannot be double-allocated at the primitive
+        // boundary. It is NOT the mounted duplicate-webhook proof: the
+        // production duplicate-callback surface (real evidence recording,
+        // state checks, quote CAS, state-machine CAS, settlement, ledger,
+        // receipt — all executed by the mounted controllers) is proven under
+        // genuinely concurrent identical SUCCESS callbacks in
+        // __tests__/p5r12-mounted-duplicate-concurrency.test.js.
         test('concurrent settlements cannot double-allocate the same lot quantity', async () => {
             await setModelB(true);
             // one lot holding exactly enough for ONE settlement

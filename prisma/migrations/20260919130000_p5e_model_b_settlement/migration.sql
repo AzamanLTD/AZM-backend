@@ -43,10 +43,28 @@ CREATE INDEX IF NOT EXISTS "ModelBSettlement_transactionHistoryId_idx" ON "Model
 CREATE INDEX IF NOT EXISTS "ModelBSettlement_evidenceDedupKey_idx" ON "ModelBSettlement"("evidenceDedupKey");
 
 -- DB CHECKs Prisma cannot express (mirrored in the boot overlay installer).
-ALTER TABLE "ModelBSettlement" ADD CONSTRAINT "ModelBSettlement_amounts_positive"
-    CHECK ("quotedGhs" > 0 AND "settledGhs" > 0 AND "quotedUsdc" > 0 AND "settledUsdc" > 0);
-ALTER TABLE "ModelBSettlement" ADD CONSTRAINT "ModelBSettlement_quote_consistency"
-    CHECK ("quotedRateGhsPerUsdc" > 0);
+-- Idempotency: Postgres has no ADD CONSTRAINT IF NOT EXISTS, so guard each
+-- named CHECK with a DO block — re-running this migration on a database that
+-- already enforces these checks is a no-op instead of an error.
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'ModelBSettlement_amounts_positive'
+          AND conrelid = '"ModelBSettlement"'::regclass
+    ) THEN
+        ALTER TABLE "ModelBSettlement" ADD CONSTRAINT "ModelBSettlement_amounts_positive"
+            CHECK ("quotedGhs" > 0 AND "settledGhs" > 0 AND "quotedUsdc" > 0 AND "settledUsdc" > 0);
+    END IF;
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint
+        WHERE conname = 'ModelBSettlement_quote_consistency'
+          AND conrelid = '"ModelBSettlement"'::regclass
+    ) THEN
+        ALTER TABLE "ModelBSettlement" ADD CONSTRAINT "ModelBSettlement_quote_consistency"
+            CHECK ("quotedRateGhsPerUsdc" > 0);
+    END IF;
+END$$;
 
 -- §P.5-E audit r1: structural inventory-authority gate. Eligibility is false
 -- by default and granted by no production code path — only a future,
