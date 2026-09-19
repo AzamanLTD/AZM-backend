@@ -209,7 +209,7 @@ async function claimInventoryFifo(tx, { reference, settledUsdc }) {
  *   quoteId              consumed TransactionQuote id (UUID)
  *   quotedGhs            quote.amountGhs (exact pesewas)
  *   quotedRateGhsPerUsdc quote.rateGhsPerUsdc (exact 8dp)
- *   quotedUsdc           quote.usdcAmount rounded to the 8dp ledger authority
+ *   quotedUsdc           quote.usdcAmount EXACT (native 12dp persisted authority)
  *   settledGhs           evidence-backed settled GHS (exact pesewas)
  *   settledUsdc          committed TransactionHistory.amountUsdc (exact 8dp)
  *   selectedRoute / routeProviderRail / routePolicyVersion   quote route identity
@@ -320,10 +320,16 @@ async function settleDepositFromInventory(tx, params = {}) {
   // the quote's authoritative ledger-scale USDC amount: the persisted
   // numeric(30,12) projected ONCE at 8dp HALF_UP — the same projection the
   // committed TransactionHistory.amountUsdc carries.
-  const qUsdc8 = new Decimal(q.usdcAmount).toDecimalPlaces(8, Decimal.ROUND_HALF_UP);
-  if (quotedUsdcD != null && !quotedUsdcD.toDecimalPlaces(8, Decimal.ROUND_HALF_UP).equals(qUsdc8)) {
+  // audit r3: the SUPPLIED quotedUsdc is bound to the persisted quote at its
+  // NATIVE 12dp authority — exact Decimal equality, no projection. A caller
+  // value that differs only at the 9th–12th decimal (same 8dp projection)
+  // fails closed here; the 8dp projection remains only the persisted-quote →
+  // committed-TransactionHistory ledger settlement boundary below.
+  const qUsdc12 = new Decimal(q.usdcAmount).toDecimalPlaces(12, Decimal.ROUND_HALF_UP);
+  const qUsdc8 = qUsdc12.toDecimalPlaces(8, Decimal.ROUND_HALF_UP);
+  if (quotedUsdcD != null && !quotedUsdcD.equals(qUsdc12)) {
     throw new ModelBError('MODEL_B_QUOTE_USDC_MISMATCH',
-      `TransactionQuote ${quoteId} projects to ${qUsdc8.toFixed(8)} USDC at the 8dp ledger authority, settlement was given ${quotedUsdcD.toFixed(12)}`);
+      `TransactionQuote ${quoteId} carries ${qUsdc12.toFixed(12)} USDC at its exact 12dp persisted authority, settlement was given ${quotedUsdcD.toFixed(12)}`);
   }
   if (!qUsdc8.equals(settledUsdcD)) {
     throw new ModelBError('MODEL_B_QUOTE_USDC_MISMATCH',

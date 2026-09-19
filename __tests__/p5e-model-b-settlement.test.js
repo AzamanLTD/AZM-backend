@@ -883,6 +883,23 @@ describeOrSkip('§P.5-E Model B settlement / inventory cost-basis realization (r
             await expectFailClosed(d, { quotedUsdc: new Decimal(d.quote.usdcAmount).plus('0.00000001').toFixed(12) }, 'MODEL_B_QUOTE_USDC_MISMATCH');
         });
 
+        // audit r3: a caller value that differs from the persisted quote ONLY at
+        // the 9th–12th decimal (same 8dp projection) must fail closed at the
+        // EXACT 12dp authority binding — the projection can never authorize it.
+        test('replay with same-8dp/different-12dp quotedUsdc (delta 0.000000000001) fails closed — zero mutation', async () => {
+            const d = await seedReplayed();
+            const nudged = new Decimal(d.quote.usdcAmount).plus('0.000000000001').toFixed(12);
+            expect(new Decimal(nudged).toDecimalPlaces(8, Decimal.ROUND_HALF_UP).toFixed(8))
+                .toBe(new Decimal(d.quote.usdcAmount).toDecimalPlaces(8, Decimal.ROUND_HALF_UP).toFixed(8)); // same 8dp projection
+            await expectFailClosed(d, { quotedUsdc: nudged }, 'MODEL_B_QUOTE_USDC_MISMATCH');
+        });
+
+        test('direct call with same-8dp/different-12dp quotedUsdc (delta 0.000000000001) fails closed — zero mutation', async () => {
+            const d = await seedDirect();
+            const nudged = new Decimal(d.quote.usdcAmount).plus('0.000000000001').toFixed(12);
+            await expectFailClosed(d, { quotedUsdc: nudged }, 'MODEL_B_QUOTE_USDC_MISMATCH');
+        });
+
         test('replay with wrong route identity fails closed — zero mutation', async () => {
             const d = await seedReplayed();
             await expectFailClosed(d, { selectedRoute: 'momo-some-other-route' }, 'MODEL_B_ROUTE_MISMATCH');
