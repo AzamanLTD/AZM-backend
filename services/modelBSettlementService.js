@@ -259,19 +259,6 @@ async function settleDepositFromInventory(tx, params = {}) {
     : toExactDecimals(quotedUsdc, 'quotedUsdc', 12).toDecimalPlaces(12, Decimal.ROUND_HALF_UP); // 12dp — bounded by half of the 8th decimal
   const feeD = providerFeeGhs == null ? null : toExactDecimals(providerFeeGhs, 'providerFeeGhs', 2);
 
-  // ── replay / conflict on the durable economic identity ──────────────────
-  const existing = await tx.modelBSettlement.findUnique({ where: { reference } });
-  if (existing) {
-    const fingerprintOk = new Decimal(existing.settledGhs).eq(settledGhsD)
-      && new Decimal(existing.settledUsdc).eq(settledUsdcD)
-      && existing.quoteId === quoteId;
-    if (!fingerprintOk) {
-      throw new ModelBError('MODEL_B_SETTLEMENT_CONFLICT',
-        `reference ${reference} is already committed with different economics — conflicting reuse fails closed`);
-    }
-    return { settlement: existing, replayed: true };
-  }
-
   // ── service-level authority binding (§P.5-E audit r1) ──────────────────
   // The mounted controllers supply canonical values, but the authoritative
   // primitive NEVER trusts them: every caller-supplied identity, amount and
@@ -367,6 +354,46 @@ async function settleDepositFromInventory(tx, params = {}) {
     evidenceDedupKey, settledGhs: settledGhsD, reference,
     provider, providerRef: providerRef ?? null,
   });
+
+  // ── replay evaluation AFTER the authority binding (§P.5-E audit r2) ──────
+  // The existing-settlement lookup may NEVER bypass authority validation:
+  // the persisted TransactionHistory, the exact persisted TransactionQuote
+  // and the durable provider evidence are verified FIRST (above), and only
+  // then is an existing settlement evaluated. A replay returns the committed
+  // outcome ONLY when EVERY caller-supplied identity/economic field matches
+  // BOTH the persisted authorities (verified above) and the committed
+  // settlement row below — any mismatch fails closed with zero mutation.
+  const existing = await tx.modelBSettlement.findUnique({ where: { reference } });
+  if (existing) {
+    const sameOrNull = (a, b) => (a == null || b == null) ? (a == null && b == null) : new Decimal(a).equals(new Decimal(b));
+    const replayFields = [
+      ['transactionHistoryId', existing.transactionHistoryId === transactionHistoryId],
+      ['userId', existing.userId === userId],
+      ['quoteId', existing.quoteId === quoteId],
+      ['quotedGhs', new Decimal(existing.quotedGhs).equals(quotedGhsD)],
+      ['quotedRateGhsPerUsdc', new Decimal(existing.quotedRateGhsPerUsdc).equals(quotedRateD)],
+      // committed at the 8dp ledger authority; compare the supplied 12dp value
+      // at the same projection the committed row carries
+      ['quotedUsdc', quotedUsdcD == null
+        ? existing.quotedUsdc == null
+        : sameOrNull(existing.quotedUsdc, quotedUsdcD.toDecimalPlaces(8, Decimal.ROUND_HALF_UP))],
+      ['settledGhs', new Decimal(existing.settledGhs).equals(settledGhsD)],
+      ['settledUsdc', new Decimal(existing.settledUsdc).equals(settledUsdcD)],
+      ['selectedRoute', (existing.selectedRoute ?? null) === (selectedRoute ?? null)],
+      ['routeProviderRail', (existing.routeProviderRail ?? null) === (routeProviderRail ?? null)],
+      ['routePolicyVersion', (existing.routePolicyVersion ?? null) === (routePolicyVersion ?? null)],
+      ['provider', existing.provider === provider],
+      ['providerRef', (existing.providerRef ?? null) === (providerRef ?? null)],
+      ['evidenceDedupKey', existing.evidenceDedupKey === evidenceDedupKey],
+    ];
+    for (const [name, ok] of replayFields) {
+      if (!ok) {
+        throw new ModelBError('MODEL_B_SETTLEMENT_CONFLICT',
+          `reference ${reference} is already committed with a different ${name} — replay fails closed (audit r2)`);
+      }
+    }
+    return { settlement: existing, replayed: true };
+  }
 
   // ── FIFO inventory claim (the only USDC source for a customer) ──────────
   const claims = await claimInventoryFifo(tx, { reference, settledUsdc: settledUsdcD });

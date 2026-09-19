@@ -243,13 +243,24 @@ hidden.
 - **Duplicate provider callback / duplicate settlement request:** the deposit's
   `COMPLETED` short-circuit returns the already-committed outcome (existing); a
   mid-transaction failure rolls back atomically and the provider retries.
-- **Conflicting reuse:** the `ModelBSettlement` row is replay-verified on `reference`
-  (any mismatch of the economic fingerprint fails closed
-  `MODEL_B_SETTLEMENT_CONFLICT`); the ledger conversion identity is exactly-once
-  across postings (`LEDGER_CONVERSION_IDENTITY_CONFLICT`); consumption keys are
-  exactly-once with conflict-fail (`P5-B`); the quote is consume-once; the receipt
-  dedup key is exactly-once. A replay never consumes inventory twice or recognizes
-  economics twice.
+- **Conflicting reuse (audit r2 — replay authority binding):** the replay
+  evaluation runs AFTER the full authority binding (persisted
+  `TransactionHistory`, exact persisted `TransactionQuote`, durable provider
+  evidence). The `ModelBSettlement` row is then replay-verified on `reference`
+  across EVERY caller-supplied field — `transactionHistoryId`, `userId`,
+  `quoteId`, `quotedGhs`, `quotedRateGhsPerUsdc`, `quotedUsdc`, `settledGhs`,
+  `settledUsdc`, `selectedRoute`, `routeProviderRail`, `routePolicyVersion`,
+  `provider`, `providerRef`, `evidenceDedupKey` — any mismatch fails closed
+  `MODEL_B_SETTLEMENT_CONFLICT`. The existing-settlement lookup can never bypass
+  authority validation: a wrong-field replay fails at the binding or the
+  committed-row comparison, deterministically, with zero mutation. The ledger
+  conversion identity is exactly-once across postings
+  (`LEDGER_CONVERSION_IDENTITY_CONFLICT`); consumption keys are exactly-once
+  with conflict-fail (`P5-B`); the quote is consume-once; the receipt dedup key
+  is exactly-once. An exact same-authority replay returns the committed
+  settlement with `replayed=true` and no inventory consumption, no duplicate
+  settlement, and no additional ledger rows. A replay never consumes inventory
+  twice or recognizes economics twice.
 
 ## 4. Failure semantics (all proven with zero partial financial mutation)
 

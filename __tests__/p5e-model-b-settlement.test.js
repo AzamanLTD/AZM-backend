@@ -497,7 +497,7 @@ describeOrSkip('§P.5-E Model B settlement / inventory cost-basis realization (r
                 settledGhs: 55, // DIFFERENT economics on the same identity
                 settledUsdc: s0.settledUsdc,
                 provider: 'MOOLRE', evidenceDedupKey: `event:moolre-collection:${pending.txHash}`,
-            }))).rejects.toMatchObject({ code: 'MODEL_B_SETTLEMENT_CONFLICT' });
+            }))).rejects.toMatchObject({ code: 'MODEL_B_SETTLED_GHS_MISMATCH' }); // audit r2: binding runs FIRST, then replay eval
             const s1 = await prisma.modelBSettlement.findUnique({ where: { reference: pending.txHash } });
             expect(new Decimal(s1.settledGhs).toFixed(2)).toBe('100.00'); // untouched
         });
@@ -826,6 +826,86 @@ describeOrSkip('§P.5-E Model B settlement / inventory cost-basis realization (r
         test('settledGhs 100.01 against a 100.00 quote fails closed — MODEL_B_SETTLED_GHS_MISMATCH, zero mutation', async () => {
             const d = await seedDirect();
             await expectFailClosed(d, { settledGhs: 100.01 }, 'MODEL_B_SETTLED_GHS_MISMATCH');
+        });
+
+        // ── audit r2: replay authority binding ──────────────────────────────
+        // After a VALID settlement, a replay of the same reference with ANY
+        // wrong caller-supplied identity/economic field fails closed at the
+        // authority binding or the committed-row comparison — the replay
+        // fast-path can never bypass authority validation. An EXACT
+        // same-authority replay returns the committed settlement with
+        // replayed=true and performs zero additional mutation.
+        async function seedReplayed() {
+            const d = await seedDirect();
+            const { settlement, replayed } = await prisma.$transaction((tx) => modelBSettlement.settleDepositFromInventory(tx, baseParams(d)));
+            expect(replayed).toBe(false); // the initial settlement is real
+            return { ...d, settlement };
+        }
+
+        test('exact same-authority replay returns the committed settlement, replayed=true, ZERO new mutation', async () => {
+            const d = await seedReplayed();
+            const before = await snapshot(d)();
+            const { settlement, replayed } = await prisma.$transaction((tx) => modelBSettlement.settleDepositFromInventory(tx, baseParams(d)));
+            expect(replayed).toBe(true);
+            expect(settlement.id).toBe(d.settlement.id); // same committed identity
+            expect(await prisma.modelBSettlement.count()).toBe(before.settlements); // no duplicate settlement
+            expect(await prisma.inventoryLotConsumption.count()).toBe(before.consumptions); // no additional claim
+            expect(await prisma.journalEntry.count({ where: { ledgerTransactionId: { not: null } } })).toBe(before.ledgerEntries); // no additional ledger rows
+        });
+
+        test('replay with wrong transactionHistoryId fails closed — zero mutation', async () => {
+            const d = await seedReplayed();
+            await expectFailClosed(d, { transactionHistoryId: '00000000-0000-4000-8000-000000000000' }, 'MODEL_B_TX_NOT_FOUND');
+        });
+
+        test('replay with wrong userId fails closed — zero mutation', async () => {
+            const d = await seedReplayed();
+            await expectFailClosed(d, { userId: d.user.id + 1 }, 'MODEL_B_TX_USER_MISMATCH');
+        });
+
+        test('replay with wrong quoteId fails closed — zero mutation', async () => {
+            const d = await seedReplayed();
+            await expectFailClosed(d, { quoteId: '00000000-0000-4000-8000-000000000000' }, 'MODEL_B_QUOTE_NOT_FOUND');
+        });
+
+        test('replay with wrong quotedGhs fails closed — zero mutation', async () => {
+            const d = await seedReplayed();
+            await expectFailClosed(d, { quotedGhs: new Decimal(d.quote.amountGhs).plus(1).toFixed(2) }, 'MODEL_B_QUOTE_AMOUNT_MISMATCH');
+        });
+
+        test('replay with wrong quotedRateGhsPerUsdc fails closed — zero mutation', async () => {
+            const d = await seedReplayed();
+            await expectFailClosed(d, { quotedRateGhsPerUsdc: new Decimal(d.quote.rateGhsPerUsdc).plus(0.01).toFixed(8) }, 'MODEL_B_QUOTE_RATE_MISMATCH');
+        });
+
+        test('replay with wrong quotedUsdc fails closed — zero mutation', async () => {
+            const d = await seedReplayed();
+            await expectFailClosed(d, { quotedUsdc: new Decimal(d.quote.usdcAmount).plus('0.00000001').toFixed(12) }, 'MODEL_B_QUOTE_USDC_MISMATCH');
+        });
+
+        test('replay with wrong route identity fails closed — zero mutation', async () => {
+            const d = await seedReplayed();
+            await expectFailClosed(d, { selectedRoute: 'momo-some-other-route' }, 'MODEL_B_ROUTE_MISMATCH');
+        });
+
+        test('replay with wrong provider fails closed — zero mutation', async () => {
+            const d = await seedReplayed();
+            await expectFailClosed(d, { provider: 'KOTANI' }, 'MODEL_B_EVIDENCE_PROVIDER_MISMATCH');
+        });
+
+        test('replay with wrong providerRef fails closed — zero mutation', async () => {
+            const d = await seedReplayed();
+            await expectFailClosed(d, { providerRef: 'PR-OTHER' }, 'MODEL_B_EVIDENCE_PROVIDER_REF_MISMATCH');
+        });
+
+        test('replay with wrong evidenceDedupKey fails closed — zero mutation', async () => {
+            const d = await seedReplayed();
+            await expectFailClosed(d, { evidenceDedupKey: 'event:moolre-collection:nonexistent' }, 'MODEL_B_EVIDENCE_MISSING');
+        });
+
+        test('replay with a withheld quotedUsdc (null vs committed) fails closed — zero mutation', async () => {
+            const d = await seedReplayed();
+            await expectFailClosed(d, { quotedUsdc: null }, 'MODEL_B_SETTLEMENT_CONFLICT');
         });
     });
 
