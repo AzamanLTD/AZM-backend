@@ -828,6 +828,39 @@ describeOrSkip('§P.5-E Model B settlement / inventory cost-basis realization (r
             await expectFailClosed(d, { settledGhs: 100.01 }, 'MODEL_B_SETTLED_GHS_MISMATCH');
         });
 
+        // ── audit r6: provider-fee authority ────────────────────────────────
+        // providerFeeGhs is NULL-ONLY in this slice: no durable provider-fee
+        // evidence authority exists (FiatProviderEvent carries no fee field),
+        // so a non-null caller-supplied fee is UNEVIDENCED BY CONSTRUCTION.
+        // The typed guard fires before any database read, the inventory claim
+        // and every financial mutation — for fresh settlements AND replays.
+        test('fresh settlement with fabricated providerFeeGhs fails closed — MODEL_B_PROVIDER_FEE_UNEVIDENCED, zero mutation', async () => {
+            const d = await seedDirect();
+            await expectFailClosed(d, { providerFeeGhs: '1.00' }, 'MODEL_B_PROVIDER_FEE_UNEVIDENCED');
+            // nothing was ever persisted with a fee
+            expect((await prisma.modelBSettlement.findFirst({})) == null).toBe(true);
+        });
+
+        test('replay with a DIFFERENT fabricated providerFeeGhs fails closed — MODEL_B_PROVIDER_FEE_UNEVIDENCED, zero mutation', async () => {
+            const d = await seedReplayed();
+            // the r6 attack: settle validly (fee null), then replay the same
+            // reference claiming a fee — the fee can never be manufactured
+            // post-hoc. The typed guard fires BEFORE replay evaluation, so the
+            // committed settlement is untouched and still carries providerFeeGhs null.
+            await expectFailClosed(d, { providerFeeGhs: '2.50' }, 'MODEL_B_PROVIDER_FEE_UNEVIDENCED');
+            const row = await prisma.modelBSettlement.findUnique({ where: { reference: d.pending.txHash } });
+            expect(row.providerFeeGhs).toBeNull();
+        });
+
+        test('valid settlement records providerFeeGhs = null and the replay fingerprint keeps null (never invented)', async () => {
+            const d = await seedDirect();
+            const { settlement } = await prisma.$transaction((tx) => modelBSettlement.settleDepositFromInventory(tx, baseParams(d)));
+            expect(settlement.providerFeeGhs).toBeNull();
+            const { settlement: replayed, replayed: flag } = await prisma.$transaction((tx) => modelBSettlement.settleDepositFromInventory(tx, baseParams(d)));
+            expect(flag).toBe(true);
+            expect(replayed.providerFeeGhs).toBeNull(); // null replays as null — no economic field vanishes
+        });
+
         // ── audit r2: replay authority binding ──────────────────────────────
         // After a VALID settlement, a replay of the same reference with ANY
         // wrong caller-supplied identity/economic field fails closed at the

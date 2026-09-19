@@ -204,6 +204,19 @@ New table `ModelBSettlement` (unique `reference` — the durable economic identi
 - provider evidence: `provider`, `providerRef`, `evidenceDedupKey` (the
   `FiatProviderEvent.dedupKey` of the durable INBOUND observation — verified, not
   caller-asserted)
+- USDC precision contract (audit r6, documented deliberately): the quote row
+  `TransactionQuote.usdcAmount` (numeric(30,12)) is the CANONICAL native-12dp
+  source of truth and is never widened, rounded or restated there; the
+  settlement snapshot `ModelBSettlement.quotedUsdc` (Decimal(20,8)) is the
+  DELIBERATE 8dp ledger-scale projection of that canonical value — the same
+  HALF_UP projection the committed `TransactionHistory.amountUsdc` carries.
+  The settlement primitive binds the SUPPLIED `quotedUsdc` to the persisted
+  quote at its native 12dp authority (exact Decimal equality, audit r3) and
+  separately requires the 8dp projection to equal the committed
+  `settledUsdc`; the 8dp snapshot on the settlement row is therefore an
+  intentional ledger-scale record, not a silent schema narrowing, and must
+  NOT be widened unless the contract itself changes to require the
+  settlement row to preserve 12dp.
 - settled economics: `settledGhs` (2dp exact), `settledUsdc` (8dp exact)
 - inventory cost basis: `lotAllocations` JSON — per consumed lot: `{lotId,
   acquisitionKey, quantity, lotCostBasisGhs, lotQuantityOriginal, costShareGhs`
@@ -223,7 +236,19 @@ New table `ModelBSettlement` (unique `reference` — the durable economic identi
   the ledger's own precision with nothing hidden.
 - customer spread: `marginGhs = settledGhs − costBasisGhsTotal` (exact Decimal
   subtraction, GHS-denominated — never restated in USDC)
-- provider cost/fee: `providerFeeGhs` — NULL unless actually evidenced
+- provider cost/fee: `providerFeeGhs` — **NULL-ONLY in this slice** (audit r6).
+  P5-E has no provider-fee evidence authority: the durable evidence model
+  (`FiatProviderEvent`) carries no fee field, and the mounted settlement paths
+  never supply one. A non-null caller-supplied fee is therefore UNEVIDENCED BY
+  CONSTRUCTION — the primitive rejects it `MODEL_B_PROVIDER_FEE_UNEVIDENCED`
+  before any database read, the inventory claim and every financial mutation.
+  No fee is ever derived from `FiatProviderEvent.raw`, parsed from provider
+  JSON, or inferred from settlement arithmetic — that would manufacture a new
+  authority contract inside P5-E. The field is part of the replay fingerprint
+  (null-only today; a row carrying a non-null fee — which no supported path
+  can create — conflicts on replay instead of silently matching). P5-E records
+  `providerFeeGhs = null` until a dedicated, provider-bound, durable
+  provider-fee evidence authority exists.
 - linkage: `conversionIdentity` (unique), `conversionLedgerTxnId`,
   `depositLedgerTxnId`, `transactionHistoryId`, `userId`
 

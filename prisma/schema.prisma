@@ -6034,7 +6034,7 @@ model ModelBSettlement {
   costBasisGhsTotal       Decimal  @db.Decimal(20, 8)
   costAllocationResidualGhs Decimal @default(0) @db.Decimal(20, 12)
   marginGhs               Decimal  @db.Decimal(20, 8)
-  providerFeeGhs          Decimal? @db.Decimal(20, 2) // NULL unless actually evidenced
+  providerFeeGhs          Decimal? @db.Decimal(20, 2) // audit r6: P5-E records NULL until a dedicated provider-fee evidence authority exists — the settlement primitive rejects non-null (MODEL_B_PROVIDER_FEE_UNEVIDENCED)
   conversionIdentity      String   @unique @db.VarChar(140)
   conversionLedgerTxnId   String   @db.VarChar(36)
   depositLedgerTxnId      String   @db.VarChar(36)

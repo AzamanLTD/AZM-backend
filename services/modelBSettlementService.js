@@ -216,7 +216,9 @@ async function claimInventoryFifo(tx, { reference, settledUsdc }) {
  *   provider             evidence provider (e.g. MOOLRE)
  *   providerRef          provider's own reference, if any
  *   evidenceDedupKey     FiatProviderEvent.dedupKey of the verified observation
- *   providerFeeGhs       exact pesewas, or null when NOT actually evidenced
+ *   providerFeeGhs       MUST be null/undefined in this slice — P5-E has no
+ *                       provider-fee evidence authority; a non-null fee
+ *                       fails closed (MODEL_B_PROVIDER_FEE_UNEVIDENCED)
  * @returns {{ settlement, replayed }} the committed ModelBSettlement + replay flag
  */
 async function settleDepositFromInventory(tx, params = {}) {
@@ -262,7 +264,21 @@ async function settleDepositFromInventory(tx, params = {}) {
       'quotedUsdc is required — it must be the exact persisted TransactionQuote.usdcAmount (native 12dp authority)');
   }
   const quotedUsdcD = toExactDecimals(quotedUsdc, 'quotedUsdc', 12).toDecimalPlaces(12, Decimal.ROUND_HALF_UP); // 12dp — bounded by half of the 8th decimal
-  const feeD = providerFeeGhs == null ? null : toExactDecimals(providerFeeGhs, 'providerFeeGhs', 2);
+
+  // ── §P.5-E audit r6 (provider-fee authority) ───────────────────────────
+  // providerFeeGhs is NULL-ONLY in this slice. The durable evidence model
+  // (FiatProviderEvent) carries no provider-fee field, the mounted
+  // settlement paths never supply one, and this primitive must NEVER trust
+  // a caller-supplied economic value that no persisted authority verifies.
+  // A non-null fee is therefore UNEVIDENCED BY CONSTRUCTION — rejected
+  // here, before any database read, the inventory claim and every financial
+  // mutation. P5-E records providerFeeGhs = null until a dedicated,
+  // provider-bound, durable provider-fee evidence authority exists.
+  if (providerFeeGhs != null) {
+    throw new ModelBError('MODEL_B_PROVIDER_FEE_UNEVIDENCED',
+      `providerFeeGhs is not supported by any durable provider-fee evidence authority in this slice — settlement records null only (received ${providerFeeGhs})`);
+  }
+  const feeD = null;
 
   // ── service-level authority binding (§P.5-E audit r1) ──────────────────
   // The mounted controllers supply canonical values, but the authoritative
@@ -396,6 +412,12 @@ async function settleDepositFromInventory(tx, params = {}) {
       ['provider', existing.provider === provider],
       ['providerRef', (existing.providerRef ?? null) === (providerRef ?? null)],
       ['evidenceDedupKey', existing.evidenceDedupKey === evidenceDedupKey],
+      // audit r6: a caller-supplied economic field never disappears from
+      // replay identity. Null-only in this slice (the guard above refuses
+      // any non-null fee before replay evaluation), so a committed row
+      // carrying a non-null providerFeeGhs — which no supported path can
+      // create — conflicts on replay instead of silently matching.
+      ['providerFeeGhs', existing.providerFeeGhs == null],
     ];
     for (const [name, ok] of replayFields) {
       if (!ok) {
@@ -485,7 +507,7 @@ async function settleDepositFromInventory(tx, params = {}) {
       costBasisGhsTotal: costBasisTotal.toFixed(8),
       costAllocationResidualGhs: costResidual.toDecimalPlaces(12, Decimal.ROUND_HALF_UP).toFixed(12), // residual precision (12dp)
       marginGhs: marginGhs.toFixed(8),
-      providerFeeGhs: feeD ? feeD.toFixed(2) : null,
+      providerFeeGhs: null, // audit r6: null-only — no provider-fee evidence authority exists in this slice
       conversionIdentity: `p5e:modelb:${reference}`,
       conversionLedgerTxnId: conversion.transaction.id,
       depositLedgerTxnId: deposit.transaction.id,
