@@ -37,6 +37,7 @@ function _getNotificationService(req) {
 // =============================================================================
 
 const financeService               = require('../services/finance.service');
+const fiatLiquidity                = require('../src/services/fiatLiquidityService'); // §P.5-D
 const { FIAT_POOL_ALERT_THRESH }   = financeService;
 const crypto                       = require('crypto');
 const logger = require('../src/config/logger');
@@ -146,7 +147,10 @@ exports.fiatWithdrawal = async (req, res) => {
             prisma,
             userId,
             amountFloat,
-            { reference, retailRate: rates.retailRate, payoutGhs }
+            { reference, retailRate: rates.retailRate, payoutGhs,
+              // §P.5-D provider/rail/destination identity for the GHS
+              // liquidity reservation (no-ops while the authority flag is OFF).
+              liquidityRoute: { provider: 'MOOLRE', rail: 'MOMO', destination: recipientPhone } }
         );
 
         // ── Moolre disbursement (outside the DB transaction) ────────────────
@@ -161,6 +165,14 @@ exports.fiatWithdrawal = async (req, res) => {
                 externalId:     `AZAMAN_${userId}_${Date.now()}`,
                 payerMessage:   `Azaman withdrawal ref ${reference}`,
                 payeeNote:      `Azaman MoMo payout (${networkChoice})`
+            });
+
+            // §P.5-D: provider accepted the payout — RESERVED → IN_TRANSIT in
+            // the GHS liquidity authority. Regime follows the recorded
+            // reservation; legacy withdrawals skip.
+            await fiatLiquidity.inTransitIfRecorded(prisma, {
+                reference,
+                providerRef: disbursementResult?.providerRef || null,
             });
         } catch (gatewayErr) {
             logger.error({ err: gatewayErr }, '[fiatWithdrawal] Disbursement dispatch failed');

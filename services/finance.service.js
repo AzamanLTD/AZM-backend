@@ -85,9 +85,11 @@ const _debitUserBalance = async (tx, userId, amount) => {
 
 const ledger = require('./ledgerService'); // §P.4 authoritative ledger
 const restrictedObligations = require('./restrictedObligationService'); // §P.4 persisted restricted obligations
+const fiatLiquidity = require('../src/services/fiatLiquidityService'); // §P.5-D GHS liquidity authority
 
 const processFiatWithdrawal = async (prisma, userId, amountFloat, opts = {}) => {
     await runDoubleCheck(prisma, userId);
+    const liquidityAuthorityOn = await fiatLiquidity.isAuthorityEnabled(prisma);
     const referrer = await _resolveReferrer(prisma, userId);
 
     const settings = await prisma.globalSettings.findUnique({ where: { id: 1 } });
@@ -151,7 +153,15 @@ const processFiatWithdrawal = async (prisma, userId, amountFloat, opts = {}) => 
             throw err;
         }
 
-        await _reserveFiatPool(tx, amountFloat);
+        // §P.5-D: with the liquidity authority flag ON, the withdrawal
+        // reserves claimable GHS through the evidence-backed authority
+        // (exact pesewas; SystemFiatPool becomes its derived projection).
+        // With the flag OFF, the legacy SystemFiatPool conditional decrement
+        // stays byte-identical. A claim loser rolls back this whole
+        // transaction (user debit included) either way.
+        if (!liquidityAuthorityOn) {
+            await _reserveFiatPool(tx, amountFloat);
+        }
         await _debitUserBalance(tx, userId, totalDeduct);
 
         // P0 atomicity: the AZM fee-discount debit runs on the SAME tx as the
@@ -217,6 +227,21 @@ const processFiatWithdrawal = async (prisma, userId, amountFloat, opts = {}) => 
                 }
             }
         });
+
+        // §P.5-D authority reservation (flag ON): linked to the committed
+        // TransactionHistory row. Conflicting reuse of the reference fails
+        // closed; insufficient GHS rolls the whole transaction back.
+        if (liquidityAuthorityOn) {
+            const route = opts.liquidityRoute || {};
+            await fiatLiquidity.reserveForPayout(tx, {
+                reference,
+                amountGhs: payoutGhs,
+                provider: route.provider || 'MTN_MOMO',
+                rail: route.rail || 'MOMO',
+                destination: route.destination || null,
+                relatedTransactionId: txRecord.id,
+            });
+        }
 
         // §P.4 AUTHORITATIVE ACCOUNTING — inside the SAME reservation
         // transaction as the USDC debit, the fiat-pool reservation and the
@@ -421,6 +446,16 @@ const completeFiatWithdrawal = async (prisma, reference, { providerTxId = null }
             }
         }
 
+        // §P.5-D: terminal GHS liquidity outcome for authority reservations
+        // (IN_TRANSIT → PAID_OUT; contradictory or undelivered states
+        // quarantine — never a throw on the mounted settle path, never a
+        // rewrite of terminal history). Legacy withdrawals skip.
+        await fiatLiquidity.settleIfRecorded(tx, {
+            reference,
+            outcome: 'SUCCESSFUL',
+            providerTxId,
+        });
+
         const transaction = await tx.transactionHistory.findUnique({ where: { txHash: reference } });
         return { changed: true, transaction };
     });
@@ -534,10 +569,22 @@ const reverseFiatWithdrawal = async (prisma, reference, opts = {}) => {
             where: { id: 1 },
             data: { balance: { decrement: amountFloat } }
         });
-        await tx.systemFiatPool.update({
-            where: { id: 1 },
-            data: { balance: { increment: amountFloat } }
+        // §P.5-D: the reversal releases GHS through the SAME regime that
+        // reserved it. An authority reservation releases through the
+        // authority (funds return to available; IN_TRANSIT cash positions
+        // are quarantined, never auto-released). A legacy withdrawal (no
+        // reservation row) keeps the legacy SystemFiatPool re-credit.
+        const liquidityRelease = await fiatLiquidity.releaseIfRecorded(tx, {
+            reference,
+            reason: opts.reason || 'reversal',
         });
+        if (liquidityRelease.skipped) {
+            await _ensureFiatPoolSingleton(tx);
+            await tx.systemFiatPool.update({
+                where: { id: 1 },
+                data: { balance: { increment: amountFloat } }
+            });
+        }
 
         // P0: restore the AZM fee-discount spend INSIDE this same reversal
         // transaction. The PENDING -> FAILED claim above is the one-winner
@@ -620,9 +667,31 @@ const reverseFiatWithdrawal = async (prisma, reference, opts = {}) => {
 };
 
 const liquidateProfits = async (prisma, amountFloat, adminId, auditContext = {}) => {
+    const liquidityAuthorityOn = await fiatLiquidity.isAuthorityEnabled(prisma);
+    let treasuryRate = null;
+    let treasuryRateSource = null;
+    let treasuryRateAsOf = null;
+    if (liquidityAuthorityOn) {
+        // §P.5-D: an internal scalar increment can never create authoritative
+        // GHS liquidity. With the authority ON, a liquidation is an AUDITED
+        // TREASURY OPENING — receipt evidence (AdminProfitLog + AuditLog) priced
+        // at the canonical retail rate at liquidation time — explicitly
+        // confirmed AVAILABLE in the same transaction. No external GHS
+        // observation exists for it, so the opening is recorded as internal
+        // treasury evidence (provider AZM_TREASURY), never as provider cash.
+        const settings = await prisma.globalSettings.findUnique({ where: { id: 1 } });
+        treasuryRate = Number(settings?.liveRetailRate);
+        if (!(treasuryRate > 0)) {
+            const err = new Error('Treasury liquidation requires a canonical retail rate (liveRetailRate unavailable).');
+            err.code = 'TREASURY_RATE_UNAVAILABLE';
+            throw err;
+        }
+        treasuryRateSource = settings?.liveRateSource || null;
+        treasuryRateAsOf = settings?.lastExternalSync || settings?.lastRateSync || new Date();
+    }
     const result = await prisma.$transaction(async (tx) => {
         await _ensureProfitFeesSingleton(tx);
-        await _ensureFiatPoolSingleton(tx);
+        if (!liquidityAuthorityOn) await _ensureFiatPoolSingleton(tx);
 
         const claim = await tx.systemProfitFees.updateMany({
             where: { id: 1, balance: { gte: amountFloat } },
@@ -635,11 +704,37 @@ const liquidateProfits = async (prisma, amountFloat, adminId, auditContext = {})
             throw err;
         }
 
-        await tx.systemFiatPool.update({
-            where: { id: 1 },
-            data: { balance: { increment: amountFloat } }
-        });
         const profitLog = await tx.adminProfitLog.create({ data: { amountUsdc: amountFloat, source: 'ARBITRAGE_SPREAD', relatedTxId: `liquidation_admin_${adminId}_${Date.now()}` } });
+        if (liquidityAuthorityOn) {
+            const amountGhs = parseFloat((amountFloat * treasuryRate).toFixed(2));
+            const dedupKey = `treasury:liquidation:${profitLog.relatedTxId}`;
+            await fiatLiquidity.recordReceipt(tx, {
+                provider: 'AZM_TREASURY',
+                rail: 'INTERNAL',
+                dedupKey,
+                amountGhs,
+                treasury: true,
+                evidence: {
+                    kind: 'AUDITED_TREASURY_OPENING',
+                    amountUsdc: amountFloat,
+                    adminId,
+                    adminProfitLogId: profitLog.id,
+                    retailRate: treasuryRate,
+                    rateSource: treasuryRateSource,
+                    rateAsOf: treasuryRateAsOf instanceof Date ? treasuryRateAsOf.toISOString() : treasuryRateAsOf,
+                },
+            });
+            await fiatLiquidity.confirmReceiptAvailable(tx, {
+                dedupKey,
+                confirmedBy: adminId,
+                evidence: { action: 'LIQUIDATE_PROFITS', adminProfitLogId: profitLog.id },
+            });
+        } else {
+            await tx.systemFiatPool.update({
+                where: { id: 1 },
+                data: { balance: { increment: amountFloat } }
+            });
+        }
 
         await audit(tx, {
             actorId: auditContext.actorId ?? adminId,

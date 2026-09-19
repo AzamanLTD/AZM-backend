@@ -37,6 +37,7 @@
 // =============================================================================
 
 const logger = require('../src/config/logger');
+const fiatLiquidity = require('../src/services/fiatLiquidityService'); // §P.5-D
 
 const DEFAULT_INTERVAL_MS = 120_000;  // 2 minutes
 const MAX_BATCH_SIZE      = 25;       // Don't overwhelm the provider in one tick
@@ -302,6 +303,19 @@ class PayoutBatchWorker {
                     payerMessage: 'Azaman withdrawal',
                     payeeNote: `Payout #${withdrawal.id} (${withdrawal.network || 'MTN'})`
                 });
+
+                // §P.5-D: provider accepted the payout — RESERVED → IN_TRANSIT
+                // in the GHS liquidity authority. Regime follows the recorded
+                // reservation; legacy withdrawals skip.
+                try {
+                    await fiatLiquidity.inTransitIfRecorded(this.prisma, {
+                        reference: referenceId,
+                        providerRef: dispatchResult?.data?.reference || dispatchResult?.providerRef || null,
+                    });
+                } catch (liquidityErr) {
+                    logger.error({ err: liquidityErr, referenceId },
+                        '[payoutBatchWorker] §P.5-D liquidity dispatch mark failed');
+                }
 
                 runningPoolBalance -= amount;
 

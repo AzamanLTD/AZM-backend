@@ -1,5 +1,16 @@
 jest.mock('../utils/securityCheck', () => ({ runDoubleCheck: jest.fn().mockResolvedValue(undefined) }));
 
+// §P.5-D: the GHS liquidity authority is not under test here — the regime
+// wrappers report "no reservation row" (legacy regime), so the legacy
+// SystemFiatPool behavior under test is exercised unchanged.
+jest.mock('../src/services/fiatLiquidityService', () => ({
+    isAuthorityEnabled: jest.fn().mockResolvedValue(false),
+    reserveForPayout: jest.fn(),
+    releaseIfRecorded: jest.fn().mockResolvedValue({ skipped: true }),
+    settleIfRecorded: jest.fn().mockResolvedValue({ skipped: true }),
+    inTransitIfRecorded: jest.fn().mockResolvedValue({ skipped: true }),
+}));
+
 const { completeFiatWithdrawal, reverseFiatWithdrawal } = require('../services/finance.service');
 
 describe('fiat withdrawal settlement economics', () => {

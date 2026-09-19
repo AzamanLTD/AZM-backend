@@ -10,6 +10,7 @@ const {
   RateUnavailableError,
   QuoteIdentityConflictError,
 } = require('../src/services/transactionQuoteService');
+const fiatLiquidity = require('../src/services/fiatLiquidityService'); // §P.5-D
 const routePolicy = require('../src/services/routePolicyService');
 
 const FIAT_REF_PREFIX = 'FIAT_DEPOSIT_';
@@ -132,6 +133,27 @@ exports.webhook = async (req, res) => {
       return res.status(200).json({ success: true, message: failed.count > 0 ? 'Deposit marked as FAILED.' : 'Reference not in PENDING state.', data: { reference, status: 'FAILED' } });
     }
 
+    // §P.5-D LIQUIDITY EVIDENCE: append the raw provider observation
+    // OUT-OF-BAND, BEFORE the settle transaction — evidence always survives,
+    // even when the settle fails closed. Append-only; replays converge; an
+    // amount with sub-pesewa precision is skipped (warned) rather than
+    // silently rounded — the authority never guesses a rounding.
+    try {
+        await fiatLiquidity.recordProviderEvent(prisma, {
+            provider: 'GENERIC_FIAT_WEBHOOK',
+            direction: 'INBOUND',
+            status: (status || 'SUCCESS') === 'SUCCESS' ? 'SUCCESSFUL' : String(status).toUpperCase(),
+            providerRef: providerTxId || null,
+            dedupKey: `event:fiat-deposit:${reference}`,
+            amountGhs: settledGhs,
+            relatedReference: reference,
+            raw: req.body || null,
+        });
+    } catch (evidenceErr) {
+        logger.warn({ err: evidenceErr, reference }, '[quoteFiatDepositWebhook] §P.5-D evidence record skipped');
+    }
+    const liquidityAuthorityOn = await fiatLiquidity.isAuthorityEnabled(prisma);
+
     const quoteId = existing.metadata?.quoteId;
     if (!quoteId) return res.status(409).json({ success: false, message: 'Deposit is missing its transaction quote.' });
     const result = await prisma.$transaction(async (tx) => {
@@ -169,6 +191,28 @@ exports.webhook = async (req, res) => {
           { account: `user:${existing.userId}:liability`, credit: quote.usdcAmount },
         ],
       });
+
+      // §P.5-D (flag ON): the settled, quote-matched deposit observation IS
+      // the evidence that creates AVAILABLE GHS liquidity — same transaction
+      // as the deposit CAS claim. Unmatched or unverified evidence NEVER
+      // lands AVAILABLE (docs §3.1, invariant 1).
+      if (liquidityAuthorityOn) {
+        await fiatLiquidity.recordReceipt(tx, {
+          provider: 'GENERIC_FIAT_WEBHOOK',
+          rail: quote.routeProviderRail || null,
+          providerRef: providerTxId || null,
+          dedupKey: `receipt:fiat-deposit:${reference}`,
+          amountGhs: settledGhs,
+          route: quote.selectedRoute || null,
+          relatedTransactionId: existing.id,
+          evidence: {
+            source: 'fiat_webhook',
+            quoteId,
+            providerTxId: providerTxId || null,
+            settledAt: new Date().toISOString(),
+          },
+        });
+      }
       return { updatedTx, quote, newBalance: Number(user.availableBalance) + Number(quote.usdcAmount) };
     });
 

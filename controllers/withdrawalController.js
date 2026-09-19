@@ -20,6 +20,7 @@ const ledger = require('../services/ledgerService'); // §P.4 authoritative ledg
 const restrictedObligations = require('../services/restrictedObligationService');
 const financeService          = require('../services/finance.service');
 const { runDoubleCheck }      = require('../utils/securityCheck');
+const fiatLiquidity           = require('../src/services/fiatLiquidityService'); // §P.5-D
 const axios                   = require('axios');
 const { randomUUID }          = require('crypto');
 const { audit }               = require('../utils/audit');
@@ -156,7 +157,10 @@ exports.fiatWithdrawal = async (req, res) => {
                     ? (tx) => azmSpendService.applyFeeDiscountInTransaction(
                         tx, userId, feeDiscountTierId, reference
                     )
-                    : null
+                    : null,
+                // §P.5-D: provider/rail/destination identity for the GHS
+                // liquidity reservation (no-ops while the authority flag is OFF).
+                liquidityRoute: { provider: 'MTN_MOMO', rail: 'MOMO', destination: phone }
             }
         );
 
@@ -263,6 +267,14 @@ exports.fiatWithdrawal = async (req, res) => {
                 externalId:     reference,
                 payerMessage:   `Azaman withdrawal ref ${reference}`,
                 payeeNote:      `Withdrawal ${reference}`
+            });
+
+            // §P.5-D: the provider accepted the payout — RESERVED → IN_TRANSIT
+            // in the GHS liquidity authority. Regime follows the recorded
+            // reservation; legacy withdrawals skip.
+            await fiatLiquidity.inTransitIfRecorded(prisma, {
+                reference,
+                providerRef: dispatch?.data?.reference || dispatch?.providerRef || null,
             });
 
             // Low-liquidity admin alert (post-dispatch so the user is not blocked).

@@ -12,6 +12,7 @@ const {
   QuoteIdentityConflictError,
   consumeTransactionQuote,
 } = require('../src/services/transactionQuoteService');
+const fiatLiquidity = require('../src/services/fiatLiquidityService'); // §P.5-D
 const routePolicy = require('../src/services/routePolicyService');
 
 // §P.5-C: rails are owned by the versioned route policy — this set mirrors
@@ -216,6 +217,27 @@ exports.webhook = async (req, res) => {
     if (existing.status === 'COMPLETED') return res.status(200).json({ success: true, message: 'Already processed.' });
     if (existing.status !== 'PENDING') return res.status(409).json({ success: false, message: `Deposit is ${existing.status}.` });
 
+    // §P.5-D LIQUIDITY EVIDENCE: append the raw Moolre collection observation
+    // OUT-OF-BAND, BEFORE the settle transaction — evidence always survives,
+    // even when the settle fails closed. Append-only; replays converge; an
+    // amount with sub-pesewa precision is skipped (warned) rather than
+    // silently rounded — the authority never guesses a rounding.
+    try {
+        await fiatLiquidity.recordProviderEvent(prisma, {
+            provider: 'MOOLRE',
+            direction: 'INBOUND',
+            status: 'SUCCESSFUL',
+            providerRef: existing.providerRef,
+            dedupKey: `event:moolre-collection:${externalRef}`,
+            amountGhs: settledGhs,
+            relatedReference: externalRef,
+            raw: req.body || null,
+        });
+    } catch (evidenceErr) {
+        logger.warn({ err: evidenceErr, reference: externalRef }, '[moolreQuoteDepositWebhook] §P.5-D evidence record skipped');
+    }
+    const liquidityAuthorityOn = await fiatLiquidity.isAuthorityEnabled(prisma);
+
     const quoteId = existing.metadata?.quoteId;
     if (!quoteId) return res.status(409).json({ success: false, message: 'Deposit is missing its transaction quote.' });
 
@@ -292,6 +314,30 @@ exports.webhook = async (req, res) => {
           { account: `user:${existing.userId}:liability`, credit: quote.usdcAmount },
         ],
       });
+
+      // §P.5-D (flag ON): the settled, quote-matched Moolre collection —
+      // rail-gated by the providerRef proof — IS the evidence that creates
+      // AVAILABLE GHS liquidity, in the SAME transaction as the deposit CAS
+      // claim. Unmatched or unverified evidence NEVER lands AVAILABLE
+      // (docs §3.1, invariant 1).
+      if (liquidityAuthorityOn) {
+        await fiatLiquidity.recordReceipt(tx, {
+          provider: 'MOOLRE',
+          rail: quote.routeProviderRail || null,
+          providerRef: existing.providerRef,
+          dedupKey: `receipt:moolre-collection:${externalRef}`,
+          amountGhs: settledGhs,
+          route: quote.selectedRoute || null,
+          relatedTransactionId: existing.id,
+          evidence: {
+            source: 'moolre_collection',
+            quoteId,
+            providerRef: existing.providerRef,
+            payer: data?.payer || null,
+            settledAt: new Date().toISOString(),
+          },
+        });
+      }
 
       return { updatedTx, quote, newBalance: Number(user.availableBalance) + Number(quote.usdcAmount) };
     });

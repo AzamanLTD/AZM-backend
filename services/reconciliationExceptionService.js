@@ -7,7 +7,13 @@
 // while the exception remains OPEN.
 // =============================================================================
 
-const VALID_ENTITY_TYPES = new Set(['WITHDRAWAL', 'TRANSACTION', 'PROVIDER_ATTEMPT']);
+// §P.5-D liquidity-authority entities use their own prefixed types so
+// exception rows are distinguishable from withdrawal/transaction entities.
+const VALID_ENTITY_TYPES = new Set([
+    'WITHDRAWAL', 'TRANSACTION', 'PROVIDER_ATTEMPT',
+    'FIAT_LIQUIDITY_RESERVATION', 'FIAT_LIQUIDITY_RECEIPT',
+    'FIAT_PROVIDER_EVENT', 'FIAT_LIQUIDITY_STATE',
+]);
 
 const recordReconciliationException = async (prisma, {
     entityType,

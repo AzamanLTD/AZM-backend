@@ -1443,6 +1443,12 @@ model GlobalSettings {
   autoPayoutMaxAmountUsdc Decimal @default(200.00) @db.Decimal(20, 8) // Max single withdrawal for auto
   autoPayoutIntervalMs    Int     @default(120000) // Worker scan interval (ms)
 
+  // §P.5-D rollout flag: OFF (default) keeps the legacy SystemFiatPool
+  // reservation paths; ON routes fiat reserve/release/settle through the
+  // evidence-backed liquidity authority. The evidence layer records on both
+  // settings; only the reservation/settlement authority is gated.
+  fiatLiquidityAuthorityEnabled Boolean @default(false)
+
   // Phase Q15: App Version Gate
   minAppVersion  String @default("1.0.0") // Minimum supported app version (semver)
   forceUpdateUrl String @default("https://play.google.com/store/apps/details?id=com.azaman.app")
@@ -1663,6 +1669,96 @@ model SystemFiatPool {
   balance Decimal @default(0.0) @db.Decimal(20, 8)
 
   updatedAt DateTime @updatedAt
+}
+
+// =============================================================================
+// §P.5-D — EVIDENCE-BACKED GHS LIQUIDITY AUTHORITY
+// docs/p5d-ghs-liquidity-authority.md — state machine, invariants, audit map.
+// SystemFiatPool becomes a derived projection only (updated deterministically
+// inside the authority's transaction boundary); it is never the source of
+// GHS custody truth after P5-D. GHS amounts are exact Decimal(20,2) (pesewas).
+// =============================================================================
+
+/// Append-only raw provider observations. Never rewritten; contradictory
+/// terminal evidence is preserved here and quarantined via
+/// ReconciliationException, never silently dropped (§P.5-D docs §3.3).
+model FiatProviderEvent {
+  id                String   @id @default(uuid())
+  provider          String // MOOLRE | MTN_MOMO | AZM_WEBHOOK | AZM_TREASURY (audited internal)
+  rail              String? // MOMO | BANK | INTERNAL
+  direction         String // INBOUND (receipt) | OUTBOUND (payout)
+  status            String // provider-reported status, verbatim
+  providerRef       String?
+  dedupKey          String   @unique // durable economic identity of the observation
+  amountGhs         Decimal  @db.Decimal(20, 2)
+  relatedReference  String? // internal TransactionHistory txHash for payout correlation
+  raw               Json?
+  receivedAt        DateTime @default(now())
+
+  @@index([provider, providerRef])
+  @@index([relatedReference])
+  @@index([direction, status])
+}
+
+/// Inbound GHS evidence. RECEIVED is durable evidence only; AVAILABLE arises
+/// ONLY from a settled, quote-matched deposit observation or an explicit
+/// confirmation of an audited treasury opening. UNMATCHED evidence never
+/// becomes available without a reconciliation match (§P.5-D docs §3.1).
+model FiatLiquidityReceipt {
+  id                   String    @id @default(uuid())
+  provider             String
+  rail                 String?
+  providerRef          String?
+  dedupKey             String    @unique // economic identity — replays converge
+  amountGhs            Decimal   @db.Decimal(20, 2)
+  status               String    @default("RECEIVED") // RECEIVED | AVAILABLE | UNMATCHED | RECONCILIATION_REQUIRED | REVERSED
+  route                String? // §P.5-C selectedRoute — evidence-linked, never invented
+  relatedTransactionId String? // settled deposit TransactionHistory id (match evidence)
+  confirmedAt          DateTime?
+  reversedAt           DateTime?
+  evidence             Json?
+  createdAt            DateTime  @default(now())
+  updatedAt            DateTime  @updatedAt
+
+  @@index([status])
+  @@index([provider, providerRef])
+  @@index([relatedTransactionId])
+}
+
+/// Outbound GHS payout reservation. RESERVED is a single-winner conditional
+/// claim against FiatLiquidityState.availableGhs; terminal transitions are
+/// single-winner CAS claims (§P.5-D docs §3.2).
+model FiatLiquidityReservation {
+  id                   String    @id @default(uuid())
+  reference           String    @unique // withdrawal reference (TransactionHistory txHash)
+  amountGhs           Decimal   @db.Decimal(20, 2)
+  status              String    @default("RESERVED") // RESERVED | IN_TRANSIT | PAID_OUT | RELEASED | RECONCILIATION_REQUIRED
+  provider            String
+  rail                String?
+  destination          String? // masked payout destination (MSISDN)
+  relatedTransactionId String?
+  providerRef         String?
+  dispatchedAt        DateTime?
+  settledAt           DateTime?
+  releasedAt          DateTime?
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+
+  @@index([status])
+  @@index([provider, providerRef])
+}
+
+/// Singleton aggregate of claimable GHS liquidity. Every transition is a
+/// guarded conditional update in the same transaction as its evidence/state
+/// row; sums over receipts/reservations are the reconciliation target.
+model FiatLiquidityState {
+  id           Int      @id @default(1)
+  availableGhs Decimal  @default(0) @db.Decimal(20, 2)
+  reservedGhs  Decimal  @default(0) @db.Decimal(20, 2)
+  inTransitGhs Decimal  @default(0) @db.Decimal(20, 2)
+  paidOutGhs   Decimal  @default(0) @db.Decimal(20, 2)
+
+  updatedAt    DateTime @updatedAt
 }
 
 /// Tracks accumulated platform profit (fees, margins, spreads)
