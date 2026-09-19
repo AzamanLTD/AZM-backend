@@ -1677,6 +1677,58 @@ describeOrSkip('§P.5-D evidence-backed GHS liquidity authority (real PostgreSQL
 
         });
 
+        test('r10-C: providerRef null→present for the same observation is ENRICHMENT, not a contradiction — converges to ONE row, the committed row gains the observed ref, nothing else changes', async () => {
+            // The generic deposit webhook's providerTxId has never been a
+            // required field; a first callback without it commits the
+            // observation, and a legitimate retry carrying it must converge
+            // (fail-closed contradiction here would manufacture a false
+            // ReconciliationException out of a provider retry).
+            const first = await fiatLiquidity.recordProviderEvent(prisma, { ...baseObservation, providerRef: null });
+            expect(first.replay).toBe(false);
+            expect(first.event.providerRef).toBeNull();
+            const retry = await fiatLiquidity.recordProviderEvent(prisma, { ...baseObservation, providerRef: 'PTX-ENRICHED' });
+            expect(retry.replay).toBe(true); // converge — NOT contradictory evidence
+            expect(retry.event.id).toBe(first.event.id);
+            expect(retry.event.providerRef).toBe('PTX-ENRICHED'); // strictly additive enrichment
+            const rows = await prisma.fiatProviderEvent.findMany({ where: { relatedReference: 'R-T' } });
+            expect(rows).toHaveLength(1); // still exactly ONE durable observation
+            expect(rows[0].status).toBe('SUCCESSFUL');
+            expect(rows[0].amountGhs.toString()).toBe('100');
+            expect(new Date(rows[0].receivedAt).getTime()).toBe(new Date(first.event.receivedAt).getTime()); // committed claims untouched
+            // an exact retry of the ENRICHED payload also converges (idempotent)
+            const again = await fiatLiquidity.recordProviderEvent(prisma, { ...baseObservation, providerRef: 'PTX-ENRICHED' });
+            expect(again.replay).toBe(true);
+            expect(again.event.id).toBe(first.event.id);
+            expect((await prisma.fiatProviderEvent.findMany({ where: { relatedReference: 'R-T' } })).length).toBe(1);
+        });
+
+        test('r10-D: providerRef present→absent for the same observation converges WITHOUT downgrade — the committed ref stands, the retry carries no claim', async () => {
+            const first = await fiatLiquidity.recordProviderEvent(prisma, baseObservation); // providerRef 'PTX-1'
+            expect(first.event.providerRef).toBe('PTX-1');
+            const retry = await fiatLiquidity.recordProviderEvent(prisma, { ...baseObservation, providerRef: null });
+            expect(retry.replay).toBe(true); // an absent ref is not a contradiction
+            expect(retry.event.id).toBe(first.event.id);
+            expect(retry.event.providerRef).toBe('PTX-1'); // never downgraded to null
+            expect((await prisma.fiatProviderEvent.findMany({ where: { relatedReference: 'R-T' } })).length).toBe(1);
+        });
+
+        test('r10-E: two PRESENT but different refs are still materially different — contradiction retained, committed row untouched (binding is NOT weakened)', async () => {
+            const first = await fiatLiquidity.recordProviderEvent(prisma, baseObservation); // providerRef 'PTX-1'
+            await expect(fiatLiquidity.recordProviderEvent(prisma, { ...baseObservation, providerRef: 'PTX-2' }))
+                .rejects.toMatchObject({
+                    code: 'LIQUIDITY_CONFLICTING_EVIDENCE',
+                    details: { dedupKey: baseObservation.dedupKey, differingFields: ['providerRef'] },
+                });
+            const committed = await prisma.fiatProviderEvent.findUnique({ where: { dedupKey: baseObservation.dedupKey } });
+            expect(committed.providerRef).toBe('PTX-1'); // untouched
+            expect(committed.id).toBe(first.event.id);
+            const conflicts = await prisma.fiatProviderEvent.findMany({
+                where: { dedupKey: { contains: ':CONFLICT:' }, relatedReference: 'R-T' },
+            });
+            expect(conflicts).toHaveLength(1); // the contradictory ref, durably visible
+            expect(conflicts[0].providerRef).toBe('PTX-2');
+        });
+
         test('15: two materially different provider observations can NEVER collapse into one silently — exact retries converge, distinct statuses are distinct rows', async () => {
             // the generic webhook surface identity shape: status-scoped keys
             const ref = 'R-T15';

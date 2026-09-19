@@ -208,7 +208,21 @@ itself — no caller's say-so is trusted:
   retry the same economic observation with byte-different bodies (timestamps,
   ordering, extra fields), and byte comparison would manufacture
   contradictions out of retries. A semantic duplicate converges to the
-  committed row (`replay: true`) — the committed row is never rewritten.
+  committed row (`replay: true`) — the committed row's semantic claims are
+  never rewritten. `providerRef` binds STRICTLY only when PRESENT (audit
+  r10): two non-null refs that differ are materially different observations,
+  but an ABSENT ref carries no claim — it neither contradicts a committed
+  ref nor blocks convergence (the established null-tolerant comparison used
+  by the receipt/event checks, and the same fill-in semantics as
+  `markReservationInTransit`). Convergence may therefore ENRICH a committed
+  null ref with the reference a retry now carries (strictly additive
+  durable evidence; `receivedAt`/`status`/`amountGhs` stay exactly as
+  committed) and never downgrades a committed ref. This is NOT a weakening
+  of provider-reference binding: a PRESENT ref must match exactly —
+  committed `PTX-1` vs incoming `PTX-2` is still contradictory evidence.
+  Producers of optional refs are real: the generic deposit webhook's
+  `providerTxId` has never been a required field, and payout callbacks can
+  legitimately arrive before the provider's durable txid exists.
 - A materially different payload under an already-committed identity is
   CONTRADICTORY EVIDENCE: it is retained as a DISTINCT durable row under a
   deterministic conflict identity (`<dedupKey>:CONFLICT:<fingerprint>`, so
@@ -216,9 +230,30 @@ itself — no caller's say-so is trusted:
   call FAILS CLOSED with a typed `LIQUIDITY_CONFLICTING_EVIDENCE` error —
   the caller can never proceed as though the new payload were the committed
   observation. Both rows stay queryable for ops; nothing collapses silently.
+  The operational flagging is GUARANTEED honest (audit r10): surfaces may
+  only report the contradiction "flagged for reconciliation" after the
+  `ReconciliationException` write actually committed — if that write fails,
+  the retained evidence is NOT rolled back and the surface answers
+  fail-closed (500, `CONTRADICTION_RETAINED_FLAGGING_FAILED`) instead of the
+  flagged 409, so a retry of the same callback re-attempts the flagging.
 - Surfaces derive the identity from fields actually present in the
   callback, never invented. The generic deposit webhook uses a status-scoped
-  identity (`event:fiat-deposit:<reference>:<status>`): a SUCCESS and a
+  identity (`event:fiat-deposit:<reference>:<status>`), where `<status>` is
+  the ONE authoritative interpretation of the callback's raw status field
+  (audit r10): omitted, `SUCCESS` and `SUCCESSFUL` (case-insensitive) are the
+  supported success representations and all normalize to the `SUCCESSFUL`
+  evidence status; `FAILED` (case-insensitive) is the supported failure
+  representation; ANY other token (unknown aliases, whitespace-padded
+  strings) is durably retained as evidence under its own status-scoped
+  identity but is NEVER interpreted as a lifecycle decision — the deposit
+  stays PENDING and the call fails closed with 422. The same interpretation
+  drives evidence identity AND lifecycle, so no raw representation can be
+  durably recorded as one status and then acted on as another. Deposit
+  webhook amounts are parsed through `toExactGhsDecimal` at the boundary —
+  never through JS Number (audit r10): sub-pesewa input is rejected
+  fail-closed instead of silently collapsing through a float, and the
+  ±0.01 flag-OFF legacy tolerance is exact decimal arithmetic (uniformly
+  one-pesewa-inclusive at every magnitude). Example: a SUCCESS and a
   FAILED observation for the same reference are DISTINCT durable rows, and a
   late contradictory callback against a terminal deposit is still recorded
   (evidence first, state second) while the settlement economics stay

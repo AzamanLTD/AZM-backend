@@ -34,10 +34,34 @@ const QUOTE_TTL_SECONDS = 600;
 // contradictory evidence is retained and flagged, never silently absorbed.
 // No provider event id is ever invented — only what the callback carries.
 const GENERIC_EVENT_KEY_PREFIX = 'event:fiat-deposit';
-const normalizeCallbackStatus = (status) =>
-  (status && status !== 'SUCCESS' ? String(status).toUpperCase() : 'SUCCESSFUL');
-const depositEventDedupKey = (reference, normalizedStatus) =>
-  `${GENERIC_EVENT_KEY_PREFIX}:${reference}:${normalizedStatus}`;
+
+// ── §P.5-D/r10: ONE authoritative callback-status interpretation ───────────
+// The SAME interpretation drives the durable evidence identity AND the
+// lifecycle (audit r10): the status durably recorded for evidence is exactly
+// the status the lifecycle acts on — a raw representation can never be
+// recorded as one status and then acted on as another (the r10 bug: a
+// case-variant success was recorded as evidence yet failed the deposit).
+// Supported representations — this surface's payload contract ('SUCCESS' and
+// 'FAILED' in docs/tests), read case-insensitively per the project-wide
+// provider-status vocabulary (cf. fiatSettlementWebhook.controller.js):
+//   • omitted status (null/undefined/'')      → evidence SUCCESSFUL, settles
+//   • 'SUCCESS' or 'SUCCESSFUL', any case     → evidence SUCCESSFUL, settles
+//   • 'FAILED', any case                      → evidence FAILED, terminal CAS claim
+//   • ANYTHING ELSE (unknown aliases, padded
+//     tokens like ' SUCCESS ', 'PENDING', …)  → evidence: the uppercased raw
+//     token under its own status-scoped identity, durably retained;
+//     lifecycle: UNSUPPORTED — NO transition, fail-closed 422. The token is
+//     never silently reinterpreted as success or failure, and no new
+//     lifecycle state is invented: the deposit simply stays PENDING.
+const interpretCallbackStatus = (status) => {
+  if (status == null || status === '') return { evidence: 'SUCCESSFUL', intent: 'SUCCESS' };
+  const token = String(status).toUpperCase();
+  if (token === 'SUCCESS' || token === 'SUCCESSFUL') return { evidence: 'SUCCESSFUL', intent: 'SUCCESS' };
+  if (token === 'FAILED') return { evidence: 'FAILED', intent: 'FAILED' };
+  return { evidence: token, intent: 'UNSUPPORTED' };
+};
+const depositEventDedupKey = (reference, evidenceStatus) =>
+  `${GENERIC_EVENT_KEY_PREFIX}:${reference}:${evidenceStatus}`;
 
 function safeEqual(a, b) {
   if (typeof a !== 'string' || typeof b !== 'string') return false;
@@ -141,14 +165,24 @@ exports.webhook = async (req, res) => {
     if (!safeEqual(req.headers['x-azaman-webhook-secret'], expectedSecret)) return res.status(401).json({ success: false, message: 'Invalid webhook signature.' });
     const { reference, amountGhs, providerTxId, status } = req.body || {};
     if (!reference || amountGhs === undefined || amountGhs === null) return res.status(400).json({ success: false, message: 'reference and amountGhs are required.' });
-    const settledGhs = Number(amountGhs);
-    if (!Number.isFinite(settledGhs) || settledGhs <= 0) return res.status(400).json({ success: false, message: 'amountGhs must be a positive number.' });
-    // §P.5-D: GHS evidence is exact to the pesewa — the authority never
-    // rounds silently, so reject sub-pesewa precision up front (400, not a
-    // mid-settlement failure).
-    if (Math.round(settledGhs * 100) / 100 !== settledGhs) {
-        return res.status(400).json({ success: false, message: 'amountGhs must be exact to the pesewa (2 decimal places).' });
+    // ── §P.5-D/r10: lossless GHS input boundary (audit r10) ──────────────
+    // The webhook amount is parsed through the P5-D exact-decimal authority
+    // (toExactGhsDecimal) — NEVER through JS Number. The previous float
+    // boundary FAILED OPEN: sub-pesewa inputs within half a double-ulp of a
+    // pesewa-exact value (e.g. '100.3000000000000001') silently collapsed to
+    // 100.30 and were accepted — violating "the authority never rounds
+    // silently". Exact parsing rejects them fail-closed (400) BEFORE any
+    // evidence row or mutation; accepted input is never altered on its way to
+    // evidence/settlement comparison.
+    let settledGhs;
+    try {
+        settledGhs = fiatLiquidity.toExactGhsDecimal(amountGhs, { field: 'amountGhs' });
+    } catch (e) {
+        return res.status(400).json({ success: false, message: 'amountGhs must be a positive decimal exact to the pesewa (2 decimal places).' });
     }
+    // ── §P.5-D/r10: ONE authoritative status interpretation drives both
+    // the durable evidence identity and the lifecycle (see above).
+    const { evidence: evidenceStatus, intent: statusIntent } = interpretCallbackStatus(status);
 
     const existing = await prisma.transactionHistory.findUnique({ where: { txHash: reference } });
     if (!existing) return res.status(404).json({ success: false, message: 'Unknown deposit reference.' });
@@ -176,15 +210,14 @@ exports.webhook = async (req, res) => {
     // ReconciliationException; the provider's contradiction is never silently
     // absorbed, and a legitimate later observation is never blocked by it
     // (distinct status ⇒ distinct identity ⇒ its own row).
-    const normalizedStatus = normalizeCallbackStatus(status);
     let providerEvent;
     try {
         const recorded = await fiatLiquidity.recordProviderEvent(prisma, {
             provider: 'GENERIC_FIAT_WEBHOOK',
             direction: 'INBOUND',
-            status: normalizedStatus,
+            status: evidenceStatus,
             providerRef: providerTxId || null,
-            dedupKey: depositEventDedupKey(reference, normalizedStatus),
+            dedupKey: depositEventDedupKey(reference, evidenceStatus),
             amountGhs: settledGhs,
             relatedReference: reference,
             raw: req.body || null,
@@ -192,18 +225,44 @@ exports.webhook = async (req, res) => {
         providerEvent = recorded.event;
     } catch (evidenceErr) {
         if (evidenceErr instanceof fiatLiquidity.ConflictingEvidenceError) {
-            await recordReconciliationException(prisma, {
-                entityType: 'TRANSACTION',
-                entityId: reference,
-                reference: providerTxId || reference,
-                reason: 'CONTRADICTORY_PROVIDER_EVIDENCE',
-                details: {
-                    provider: 'GENERIC_FIAT_WEBHOOK',
-                    dedupKey: evidenceErr.details?.dedupKey ?? depositEventDedupKey(reference, normalizedStatus),
-                    differingFields: evidenceErr.details?.differingFields ?? null,
-                    conflictingDedupKey: evidenceErr.details?.conflictingDedupKey ?? null,
-                },
-            }).catch(() => null);
+            // ── §P.5-D/r10: the flagging claim is HONEST (audit r10) ─────
+            // The contradictory observation is durably retained by the
+            // substrate and settlement is already blocked — but the API must
+            // NEVER claim the contradiction "was flagged" unless the
+            // ReconciliationException write actually committed. If that
+            // operational write fails, respond fail-closed (500) with an
+            // honest message instead of the flagged 409; the retained
+            // evidence is NOT rolled back, and a retry of the same callback
+            // re-attempts the flagging (the contradictory row converges to
+            // its conflict identity, so nothing is lost or duplicated).
+            let flagged = false;
+            let flagErr = null;
+            try {
+                await recordReconciliationException(prisma, {
+                    entityType: 'TRANSACTION',
+                    entityId: reference,
+                    reference: providerTxId || reference,
+                    reason: 'CONTRADICTORY_PROVIDER_EVIDENCE',
+                    details: {
+                        provider: 'GENERIC_FIAT_WEBHOOK',
+                        dedupKey: evidenceErr.details?.dedupKey ?? depositEventDedupKey(reference, evidenceStatus),
+                        differingFields: evidenceErr.details?.differingFields ?? null,
+                        conflictingDedupKey: evidenceErr.details?.conflictingDedupKey ?? null,
+                    },
+                });
+                flagged = true;
+            } catch (err) {
+                flagErr = err;
+                logger.error({ err, reference }, '[quoteFiatDepositWebhook] contradictory evidence retained, but ReconciliationException persistence FAILED');
+            }
+            if (!flagged) {
+                return res.status(500).json({
+                    success: false,
+                    message: 'Contradictory provider evidence was retained, but the reconciliation exception could not be recorded. Settlement has not been processed; operator attention is required — retrying the callback re-attempts the flagging.',
+                    code: 'CONTRADICTION_RETAINED_FLAGGING_FAILED',
+                    error: flagErr && String(flagErr.message || flagErr),
+                });
+            }
             return res.status(409).json({
                 success: false,
                 message: 'Contradictory provider evidence for this reference was retained and flagged for reconciliation. Settlement has not been processed.',
@@ -226,7 +285,15 @@ exports.webhook = async (req, res) => {
     // transition on the generic surface, and none is invented here.
     if (existing.status === 'COMPLETED') return res.status(200).json({ success: true, message: 'Deposit already processed.', data: { reference, alreadyProcessed: true } });
     if (existing.status !== 'PENDING') return res.status(409).json({ success: false, message: `Cannot complete deposit in state ${existing.status}.` });
-    if (status && status !== 'SUCCESS') {
+    if (statusIntent === 'UNSUPPORTED') {
+      // §P.5-D/r10: an unsupported status representation was durably retained
+      // as evidence above (its own status-scoped identity) but is NEVER
+      // interpreted as a lifecycle decision — the deposit stays PENDING
+      // (fail-closed, retryable with a supported representation). No new
+      // lifecycle state is invented.
+      return res.status(422).json({ success: false, message: `Unsupported callback status representation ${JSON.stringify(status)} — recorded as evidence, no lifecycle action taken. Use 'SUCCESS' or 'FAILED'.`, code: 'UNSUPPORTED_CALLBACK_STATUS' });
+    }
+    if (statusIntent === 'FAILED') {
       const failed = await prisma.transactionHistory.updateMany({ where: { id: existing.id, status: 'PENDING' }, data: { status: 'FAILED', metadata: { ...(existing.metadata || {}), providerTxId: providerTxId || null, failedAt: new Date().toISOString() } } });
       return res.status(200).json({ success: true, message: failed.count > 0 ? 'Deposit marked as FAILED.' : 'Reference not in PENDING state.', data: { reference, status: 'FAILED' } });
     }
@@ -244,13 +311,18 @@ exports.webhook = async (req, res) => {
       // MOOLRE_MOMO_COLLECTION) may NOT settle here — fail closed before any
       // mutation. Historical quotes without a selectedRoute still settle.
       routePolicy.assertSettlementRouteAllowed({ quote, settlementSurface: 'GENERIC_FIAT_WEBHOOK' });
-      const quotedGhs = Number(quote.amountGhs);
-      // §P.5-E Model B authority: exact pesewa equality against the quote —
-      // 99.99/100.01 against a 100.00 quote fail closed BEFORE any mutation;
-      // the ±0.01 tolerance is the flag-OFF legacy affordance only (audit r1).
+      // ── §P.5-D/r10: the GHS settlement comparison runs on EXACT decimals —
+      // the webhook amount never touches JS Number. §P.5-E Model B authority:
+      // exact pesewa equality against the quote — 99.99/100.01 against a
+      // 100.00 quote fail closed BEFORE any mutation. The ±0.01 tolerance is
+      // the flag-OFF legacy affordance only (audit r1), now EXACT: uniformly
+      // one-pesewa-inclusive at every magnitude, where the old float boundary
+      // accepted/rejected the same one-pesewa delta depending on binary
+      // rounding accidents.
+      const quotedGhs = quote.amountGhs; // exact Decimal from the quote authority
       if (modelBOn
-        ? new Decimal(settledGhs).toFixed(2) !== new Decimal(quotedGhs).toFixed(2)
-        : Math.abs(settledGhs - quotedGhs) > 0.01) {
+        ? settledGhs.toFixed(2) !== quotedGhs.toFixed(2)
+        : settledGhs.sub(quotedGhs).abs().greaterThan('0.01')) {
         throw new Error('Settled GHS amount does not match the transaction quote');
       }
       const user = await tx.user.findUnique({ where: { id: existing.userId } });
@@ -267,7 +339,7 @@ exports.webhook = async (req, res) => {
       // resurrected to COMPLETED.
       const claimed = await tx.transactionHistory.updateMany({
         where: { id: existing.id, status: 'PENDING' },
-        data: { status: 'COMPLETED', amountUsdc: quote.usdcAmount, payerMsisdn: existing.payerMsisdn || null, metadata: { ...(existing.metadata || {}), providerTxId: providerTxId || null, settledAmountGhs: settledGhs, settledAt: new Date().toISOString(), settlementRate: quote.rateGhsPerUsdc, settledRoute: quote.selectedRoute || null, settledRoutePolicyVersion: quote.routePolicyVersion || null } },
+        data: { status: 'COMPLETED', amountUsdc: quote.usdcAmount, payerMsisdn: existing.payerMsisdn || null, metadata: { ...(existing.metadata || {}), providerTxId: providerTxId || null, settledAmountGhs: settledGhs.toFixed(2), settledAt: new Date().toISOString(), settlementRate: quote.rateGhsPerUsdc, settledRoute: quote.selectedRoute || null, settledRoutePolicyVersion: quote.routePolicyVersion || null } },
       });
       if (claimed.count !== 1) {
         throw new Error('Deposit is no longer PENDING — a concurrent state transition won; refusing to settle');

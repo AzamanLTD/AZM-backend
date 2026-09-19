@@ -144,6 +144,32 @@ const isAuthorityEnabled = async (prisma) => {
 // NEVER silently absorbed, NEVER rewritten over the committed row.
 const OBSERVATION_SEMANTIC_FIELDS = ['provider', 'rail', 'direction', 'status', 'providerRef', 'amountGhs', 'relatedReference'];
 
+// ── providerRef identity binding (audit r10, Finding 3) ─────────────────────
+// A PRESENT provider reference binds STRICTLY: two non-null refs that differ
+// are materially different observations (contradiction). An ABSENT reference
+// carries NO claim: it neither contradicts a committed reference nor blocks
+// convergence. This is the project's established providerRef semantics — the
+// receipt/event checks below compare refs only when BOTH are non-null, and
+// markReservationInTransit explicitly FILLS an absent reservation ref with an
+// incoming one (enrichment, never a conflict). Producers of optional refs are
+// real: the generic deposit webhook's providerTxId has never been a required
+// field (stored as `providerTxId || null` enrichment on both lifecycle
+// paths), and payout callbacks legitimately arrive before the provider's
+// durable txid exists. So:
+//   committed null  + incoming ref    → CONVERGE, and the committed row is
+//                                       ENRICHED with the observed ref
+//                                       (strictly additive durable evidence;
+//                                       committed semantic claims are never
+//                                       changed — receivedAt, status, amount
+//                                       stay exactly as committed)
+//   committed ref   + incoming null   → CONVERGE (the retry simply carries
+//                                       less detail; the committed ref is
+//                                       never downgraded)
+//   committed ref   + different ref   → CONTRADICTION (unchanged — binding is
+//                                       NOT weakened for present refs)
+const providerRefClaimsDiffer = (a, b) =>
+    a.providerRef != null && b.providerRef != null && a.providerRef !== b.providerRef;
+
 const observationSemantics = ({
     provider, rail = null, direction, status, providerRef = null, amountGhs = null, relatedReference = null,
 }) => ({
@@ -157,7 +183,8 @@ const observationSemantics = ({
 });
 
 const observationSemanticsMatch = (a, b) =>
-    OBSERVATION_SEMANTIC_FIELDS.every((f) => (a[f] ?? null) === (b[f] ?? null));
+    OBSERVATION_SEMANTIC_FIELDS.every((f) =>
+        f === 'providerRef' ? !providerRefClaimsDiffer(a, b) : (a[f] ?? null) === (b[f] ?? null));
 
 const observationSemanticDiffs = (a, b) =>
     OBSERVATION_SEMANTIC_FIELDS.filter((f) => (a[f] ?? null) !== (b[f] ?? null));
@@ -244,8 +271,16 @@ async function recordProviderEvent(prisma, {
     const existing = await prisma.fiatProviderEvent.findUnique({ where: { dedupKey } });
     if (existing) {
         if (observationSemanticsMatch(observationSemantics(existing), semantics)) {
-            // Converge: the SAME observation already committed. NEVER rewrite it.
-            return { event: existing, replay: true };
+            // Converge: the SAME observation already committed. NEVER rewrite
+            // its committed semantic claims. The one strictly-additive
+            // exception (audit r10): a committed observation recorded WITHOUT
+            // a provider reference may be ENRICHED with the reference a retry
+            // now carries — mirroring markReservationInTransit's fill-in. A
+            // committed reference is never downgraded or changed.
+            const event = (existing.providerRef == null && semantics.providerRef != null)
+                ? await prisma.fiatProviderEvent.update({ where: { id: existing.id }, data: { providerRef: semantics.providerRef } })
+                : existing;
+            return { event, replay: true };
         }
         // A materially different payload under a committed identity is
         // contradictory evidence — retain it durably and fail closed.
@@ -272,7 +307,10 @@ async function recordProviderEvent(prisma, {
             const raced = await prisma.fiatProviderEvent.findUnique({ where: { dedupKey } });
             if (!raced) throw new Error('[fiatLiquidity] provider event identity lost after race');
             if (observationSemanticsMatch(observationSemantics(raced), semantics)) {
-                return { event: raced, replay: true };
+                const event = (raced.providerRef == null && semantics.providerRef != null)
+                    ? await prisma.fiatProviderEvent.update({ where: { id: raced.id }, data: { providerRef: semantics.providerRef } })
+                    : raced;
+                return { event, replay: true };
             }
             await failClosedOnConflict(raced);
         }

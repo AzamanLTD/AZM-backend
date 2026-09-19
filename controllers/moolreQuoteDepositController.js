@@ -228,13 +228,19 @@ exports.webhook = async (req, res) => {
     if (Number(status) !== 1 || code !== 'P01') return res.status(200).json({ success: true, message: 'Event acknowledged.' });
 
     const externalRef = data?.externalref;
-    const settledGhs = Number(data?.amount);
     if (!externalRef) return res.status(400).json({ success: false, message: 'Missing externalref.' });
-    if (!Number.isFinite(settledGhs) || settledGhs <= 0) return res.status(400).json({ success: false, message: 'Invalid settlement amount.' });
-    // §P.5-D: GHS evidence is exact to the pesewa — the authority never
-    // rounds silently, so reject sub-pesewa precision up front.
-    if (Math.round(settledGhs * 100) / 100 !== settledGhs) {
-        return res.status(400).json({ success: false, message: 'Settlement amount must be exact to the pesewa (2 decimal places).' });
+    // ── §P.5-D/r10: lossless GHS input boundary (audit r10) — the Moolre
+    // settlement amount is parsed through the P5-D exact-decimal authority
+    // (toExactGhsDecimal), never through JS Number: sub-pesewa inputs that
+    // would silently collapse through a float (e.g. '100.3000000000000001' →
+    // 100.30) are rejected fail-closed BEFORE any evidence row or mutation,
+    // and accepted input is never altered on its way to evidence/settlement
+    // comparison.
+    let settledGhs;
+    try {
+        settledGhs = fiatLiquidity.toExactGhsDecimal(data?.amount, { field: 'amount' });
+    } catch (e) {
+        return res.status(400).json({ success: false, message: 'Invalid settlement amount — must be a positive decimal exact to the pesewa (2 decimal places).' });
     }
 
     const existing = await prisma.transactionHistory.findUnique({ where: { txHash: externalRef } });
@@ -301,18 +307,42 @@ exports.webhook = async (req, res) => {
         providerEvent = recorded.event;
     } catch (evidenceErr) {
         if (evidenceErr instanceof fiatLiquidity.ConflictingEvidenceError) {
-            await recordReconciliationException(prisma, {
-                entityType: 'TRANSACTION',
-                entityId: externalRef,
-                reference: existing.providerRef || externalRef,
-                reason: 'CONTRADICTORY_PROVIDER_EVIDENCE',
-                details: {
-                    provider: 'MOOLRE',
-                    dedupKey: evidenceErr.details?.dedupKey ?? moolreEventDedupKey(externalRef),
-                    differingFields: evidenceErr.details?.differingFields ?? null,
-                    conflictingDedupKey: evidenceErr.details?.conflictingDedupKey ?? null,
-                },
-            }).catch(() => null);
+            // ── §P.5-D/r10: the flagging claim is HONEST (audit r10) — the
+            // API never claims the contradiction "was flagged" unless the
+            // ReconciliationException write actually committed. If that
+            // operational write fails, respond fail-closed (500) honestly
+            // instead of the flagged 409; the retained evidence is NOT rolled
+            // back, settlement stays blocked, and a retry of the same callback
+            // re-attempts the flagging (the contradictory row converges to its
+            // conflict identity — nothing is lost or duplicated).
+            let flagged = false;
+            let flagErr = null;
+            try {
+                await recordReconciliationException(prisma, {
+                    entityType: 'TRANSACTION',
+                    entityId: externalRef,
+                    reference: existing.providerRef || externalRef,
+                    reason: 'CONTRADICTORY_PROVIDER_EVIDENCE',
+                    details: {
+                        provider: 'MOOLRE',
+                        dedupKey: evidenceErr.details?.dedupKey ?? moolreEventDedupKey(externalRef),
+                        differingFields: evidenceErr.details?.differingFields ?? null,
+                        conflictingDedupKey: evidenceErr.details?.conflictingDedupKey ?? null,
+                    },
+                });
+                flagged = true;
+            } catch (err) {
+                flagErr = err;
+                logger.error({ err, reference: externalRef }, '[moolreQuoteDepositWebhook] contradictory evidence retained, but ReconciliationException persistence FAILED');
+            }
+            if (!flagged) {
+                return res.status(500).json({
+                    success: false,
+                    message: 'Contradictory provider evidence was retained, but the reconciliation exception could not be recorded. Settlement has not been processed; operator attention is required — retrying the callback re-attempts the flagging.',
+                    code: 'CONTRADICTION_RETAINED_FLAGGING_FAILED',
+                    error: flagErr && String(flagErr.message || flagErr),
+                });
+            }
             return res.status(409).json({
                 success: false,
                 message: 'Contradictory provider evidence for this reference was retained and flagged for reconciliation. Settlement has not been processed.',
@@ -353,13 +383,18 @@ exports.webhook = async (req, res) => {
       // quotes without a selected route also still settle.
       routePolicy.assertSettlementRouteAllowed({ quote, settlementSurface: 'MOOLRE_WEBHOOK' });
 
-      const quotedGhs = Number(quote.amountGhs);
-      // §P.5-E Model B authority: exact pesewa equality against the quote —
-      // 99.99/100.01 against a 100.00 quote fail closed BEFORE any mutation;
-      // the ±0.01 tolerance is the flag-OFF legacy affordance only (audit r1).
+      // ── §P.5-D/r10: the GHS settlement comparison runs on EXACT decimals —
+      // the webhook amount never touches JS Number. §P.5-E Model B authority:
+      // exact pesewa equality against the quote — 99.99/100.01 against a
+      // 100.00 quote fail closed BEFORE any mutation. The ±0.01 tolerance is
+      // the flag-OFF legacy affordance only (audit r1), now EXACT: uniformly
+      // one-pesewa-inclusive at every magnitude, where the old float boundary
+      // accepted/rejected the same delta depending on binary rounding
+      // accidents.
+      const quotedGhs = quote.amountGhs; // exact Decimal from the quote authority
       if (modelBOn
-        ? new Decimal(settledGhs).toFixed(2) !== new Decimal(quotedGhs).toFixed(2)
-        : Math.abs(settledGhs - quotedGhs) > 0.01) {
+        ? settledGhs.toFixed(2) !== quotedGhs.toFixed(2)
+        : settledGhs.sub(quotedGhs).abs().greaterThan('0.01')) {
         throw new Error('Settled GHS amount does not match the transaction quote');
       }
 
@@ -384,7 +419,7 @@ exports.webhook = async (req, res) => {
           payerMsisdn: data?.payer || null,
           metadata: {
             ...(existing.metadata || {}),
-            settledAmountGhs: settledGhs,
+            settledAmountGhs: settledGhs.toFixed(2), // exact decimal string — never a collapsed float
             settledAt: new Date().toISOString(),
             settledRoute: quote.selectedRoute || null,
             settledRoutePolicyVersion: quote.routePolicyVersion || null,
