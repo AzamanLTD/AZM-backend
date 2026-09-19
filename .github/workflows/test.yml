@@ -123,7 +123,25 @@ jobs:
           fi
           exit $code
 
+      - name: Checkout authoritative frontend (AZM-businessPortal)
+        # route-check is a FRONTEND/BACKEND compatibility gate: it must scan
+        # the real frontend API layer, never pass vacuously on a backend-only
+        # workspace. The frontend repository is public, so no cross-repo
+        # credentials are needed; the default GITHUB_TOKEN cannot read other
+        # private repos anyway. Pinned to main: the gate validates the
+        # CURRENT authoritative frontend against this backend.
+        uses: actions/checkout@v7
+        with:
+          repository: AzamanLTD/AZM-businessPortal
+          ref: main
+          path: frontend/AZM-businessPortal
+
       - name: Verify route registry against frontend API usage
+        # Fail-closed: ROUTE_CHECK_REQUIRE_FRONTEND=1 makes an absent or
+        # empty frontend source fail the gate instead of a zero-call PASS.
+        env:
+          ROUTE_CHECK_FRONTEND_ROOT: ${{ github.workspace }}/frontend/AZM-businessPortal
+          ROUTE_CHECK_REQUIRE_FRONTEND: '1'
         run: npm run route-check
 
       - name: Database backup and restore drill
