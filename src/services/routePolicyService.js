@@ -112,18 +112,24 @@ function assertSettlementRouteAllowed({ quote, settlementSurface } = {}) {
     throw new RoutePolicyError('ROUTE_UNKNOWN', `Quoted route "${selectedRoute}" is not a mounted route`);
   }
   const rail = quote?.routeProviderRail || null;
-  if (rail && !definition.rails.includes(rail)) {
+  // A selected §P.5-C route WITHOUT a rail is contradictory partial route
+  // identity — settlement never infers a union of possible surfaces; it
+  // fails closed. (Historical quotes have selectedRoute == null and stay
+  // legacy-compatible via the early return above.)
+  if (!rail) {
+    throw new RoutePolicyError('ROUTE_IDENTITY_INCOMPLETE',
+      `Quote route ${selectedRoute} is missing its routeProviderRail — contradictory partial route identity fails closed`);
+  }
+  if (!definition.rails.includes(rail)) {
     throw new RoutePolicyError('ROUTE_RAIL_UNSUPPORTED',
       `Quoted rail "${rail}" is not mounted on route ${selectedRoute}`);
   }
   // Rail class: every MoMo rail shares one settlement contract.
-  const railClass = rail ? (MOMO_RAILS.includes(rail) ? 'MOMO' : rail) : null;
-  const allowed = railClass
-    ? (definition.settlementSurfaces[railClass] || [])
-    : Object.values(definition.settlementSurfaces).flat(); // route-only (legacy) quotes: the route's union
+  const railClass = MOMO_RAILS.includes(rail) ? 'MOMO' : rail;
+  const allowed = definition.settlementSurfaces[railClass] || [];
   if (!allowed.includes(settlementSurface)) {
     throw new RoutePolicyError('ROUTE_SETTLEMENT_MISMATCH',
-      `Quote route ${selectedRoute} (rail ${rail || 'unspecified'}) cannot settle on ${settlementSurface}`);
+      `Quote route ${selectedRoute} (rail ${rail}) cannot settle on ${settlementSurface}`);
   }
   return true;
 }

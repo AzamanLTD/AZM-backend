@@ -48,9 +48,20 @@ function createTransactionQuote({
   // §P.5-C route-aware identity (all optional — legacy callers keep exact
   // prior behavior; unbound quotes persist candidates without a selection).
   routeIdentity = null, quoteIdentity = null,
+  // §P.5-C Decimal-native rate path: optional authoritative exact rate
+  // (Prisma Decimal / string from the DB). When present, ALL economics and
+  // persistence use it — rateGhsPerUsdc (Number) remains only the
+  // presentation-boundary projection for the legacy API shape.
+  rateGhsPerUsdcExact = null,
 }) {
   if (!Number.isFinite(amountGhs) || amountGhs <= 0) throw new Error('amountGhs must be greater than zero');
   if (!Number.isFinite(rateGhsPerUsdc) || rateGhsPerUsdc < MIN_RATE_GHS_PER_USDC || rateGhsPerUsdc > MAX_RATE_GHS_PER_USDC) throw new Error('rateGhsPerUsdc is outside the permitted range');
+  if (rateGhsPerUsdcExact != null) {
+    const exactRateCheck = new Prisma.Decimal(rateGhsPerUsdcExact);
+    if (!exactRateCheck.isFinite() || exactRateCheck.lessThan(MIN_RATE_GHS_PER_USDC) || exactRateCheck.greaterThan(MAX_RATE_GHS_PER_USDC)) {
+      throw new Error('rateGhsPerUsdc is outside the permitted range');
+    }
+  }
   if (!Number.isFinite(feeGhs) || feeGhs < 0) throw new Error('feeGhs must be zero or greater');
   if (!Number.isInteger(ttlSeconds) || ttlSeconds < 1 || ttlSeconds > 900) throw new Error('ttlSeconds must be between 1 and 900 seconds');
   if (!userId || !Number.isInteger(Number(userId))) throw new Error('userId is required');
@@ -73,7 +84,12 @@ function createTransactionQuote({
   const amountExact = new Prisma.Decimal(String(roundMoney(amountGhs)));
   const feeExact = new Prisma.Decimal(String(roundMoney(feeGhs)));
   const netExact = amountExact.minus(feeExact).isNegative() ? new Prisma.Decimal(0) : amountExact.minus(feeExact);
-  const rateExact = new Prisma.Decimal(String(rateGhsPerUsdc));
+  // §P.5-C Decimal-native rate: the authoritative Decimal representation is
+  // used DIRECTLY — never reconstructed from a JS Number — so the persisted
+  // _rateExact is exactly the DB-authoritative 8dp value.
+  const rateExact = rateGhsPerUsdcExact != null
+    ? new Prisma.Decimal(rateGhsPerUsdcExact)
+    : new Prisma.Decimal(String(rateGhsPerUsdc));
   const usdcExact = netExact.div(rateExact).toDecimalPlaces(12, Prisma.Decimal.ROUND_HALF_UP);
 
   return {
@@ -118,13 +134,23 @@ async function getServerRateGhsPerUsdc({ prisma, marketOracle }) {
   // `liveRetailRate` is the canonical user-facing USDC/GHS rate. The legacy
   // USD/GHS field is retained only as a compatibility fallback for older
   // installations that predate the explicit USDC retail-rate field.
-  const retailRate = Number(settings?.liveRetailRate);
-  const legacyRate = Number(settings?.liveUsdToGhs);
-  const rateGhsPerUsdc = Number.isFinite(retailRate) && retailRate > 0 ? retailRate : legacyRate;
+  // §P.5-C Decimal-native rate path: the rate stays a Prisma Decimal
+  // (DB-native) end-to-end; JS Number is only a presentation-boundary
+  // projection (`rateGhsPerUsdc`), never an input to authoritative
+  // economics or persistence. `liveRetailRate` is canonical; the legacy
+  // USD/GHS field is retained only as a compatibility fallback for older
+  // installations that predate the explicit USDC retail-rate field.
+  const retail = settings?.liveRetailRate != null ? new Prisma.Decimal(settings.liveRetailRate) : null;
+  const legacy = settings?.liveUsdToGhs != null ? new Prisma.Decimal(settings.liveUsdToGhs) : null;
+  const retailUsable = !!(retail && retail.isFinite() && retail.greaterThan(0));
+  const rateExact = retailUsable
+    ? retail
+    : (legacy && legacy.isFinite() && legacy.greaterThan(0) ? legacy : null);
 
-  if (!Number.isFinite(rateGhsPerUsdc) || rateGhsPerUsdc <= 0) {
+  if (!rateExact) {
     throw new Error('A current USDC/GHS rate is not available');
   }
+  const rateGhsPerUsdc = rateExact.toNumber();
 
   void marketOracle;
   // Snapshot the TRUE external observation timestamp (issue #271 / PR 271B):
@@ -139,6 +165,7 @@ async function getServerRateGhsPerUsdc({ prisma, marketOracle }) {
   // GlobalSettings row with no recorded history at all (rateAsOf is NOT NULL).
   return {
     rateGhsPerUsdc,
+    rateGhsPerUsdcExact: rateExact,
     rateSource: settings?.liveRateSource || 'AZM_ADMIN_MOCK',
     rateAsOf: settings?.lastExternalSync || settings?.lastRateSync || new Date(),
   };
@@ -227,19 +254,29 @@ async function getFreshServerRateGhsPerUsdc({ prisma, marketOracle, now = new Da
     // Rate resolution is identical to the ungated legacy reader: the canonical
     // liveRetailRate with the legacy USD/GHS field as a compatibility fallback
     // for installations that predate the explicit USDC retail-rate field.
-    const retailRate = Number(settings?.liveRetailRate);
-    const legacyRate = Number(settings?.liveUsdToGhs);
-    const rateGhsPerUsdc = Number.isFinite(retailRate) && retailRate > 0 ? retailRate : legacyRate;
-    if (!Number.isFinite(rateGhsPerUsdc) || rateGhsPerUsdc <= 0) {
+    // §P.5-C Decimal-native rate path: the authoritative rate stays a Prisma
+    // Decimal (DB-native) end-to-end — JS Number is only a
+    // presentation-boundary projection, never an input to authoritative
+    // economics or persistence. The 271C freshness semantics above
+    // (lastExternalSync as the sole freshness authority) are unchanged.
+    const retail = settings?.liveRetailRate != null ? new Prisma.Decimal(settings.liveRetailRate) : null;
+    const legacy = settings?.liveUsdToGhs != null ? new Prisma.Decimal(settings.liveUsdToGhs) : null;
+    const retailUsable = !!(retail && retail.isFinite() && retail.greaterThan(0));
+    const rateExact = retailUsable
+        ? retail
+        : (legacy && legacy.isFinite() && legacy.greaterThan(0) ? legacy : null);
+    if (!rateExact) {
         throw new RateUnavailableError(
             'Exchange rate is temporarily unavailable. Please retry shortly.',
             'RATE_UNAVAILABLE'
         );
     }
+    const rateGhsPerUsdc = rateExact.toNumber();
 
     void marketOracle;
     return {
         rateGhsPerUsdc,
+        rateGhsPerUsdcExact: rateExact,
         rateSource: settings?.liveRateSource || 'AZM_ADMIN_MOCK',
         // rateAsOf is the TRUE external observation that freshness was
         // enforced against — never a fabricated fallback timestamp.
@@ -361,7 +398,7 @@ async function createServerTransactionQuote({ prisma, marketOracle, userId, purp
   const rate = purpose === 'deposit'
     ? await getFreshServerRateGhsPerUsdc({ prisma, marketOracle, now, maxAgeSeconds })
     : await getServerRateGhsPerUsdc({ prisma, marketOracle });
-  const quote = createTransactionQuote({ userId, purpose, amountGhs, rateGhsPerUsdc: rate.rateGhsPerUsdc, rateSource: rate.rateSource, rateAsOf: rate.rateAsOf, feeGhs, ttlSeconds, now, routeIdentity, quoteIdentity });
+  const quote = createTransactionQuote({ userId, purpose, amountGhs, rateGhsPerUsdc: rate.rateGhsPerUsdc, rateGhsPerUsdcExact: rate.rateGhsPerUsdcExact, rateSource: rate.rateSource, rateAsOf: rate.rateAsOf, feeGhs, ttlSeconds, now, routeIdentity, quoteIdentity });
   return persistTransactionQuote(prisma, quote);
 }
 

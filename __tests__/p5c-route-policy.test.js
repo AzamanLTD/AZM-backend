@@ -240,9 +240,28 @@ describeOrSkip('§P.5-C route-aware quote authority (real PostgreSQL)', () => {
                 .toThrow(expect.objectContaining({ code: 'ROUTE_RAIL_UNSUPPORTED' }));
         });
 
-        test('MOOLRE-route quote without a rail still never settles on the generic webhook (legacy route-only quotes)', () => {
+        test('a selected §P.5-C route WITHOUT a rail is contradictory partial identity — fails closed on EVERY surface (no inferred union)', () => {
             expect(() => routePolicy.assertSettlementRouteAllowed({ quote: { selectedRoute: 'MOOLRE_MOMO_COLLECTION' }, settlementSurface: 'GENERIC_FIAT_WEBHOOK' }))
+                .toThrow(expect.objectContaining({ code: 'ROUTE_IDENTITY_INCOMPLETE', statusCode: 409 }));
+            expect(() => routePolicy.assertSettlementRouteAllowed({ quote: { selectedRoute: 'MOOLRE_MOMO_COLLECTION' }, settlementSurface: 'MOOLRE_WEBHOOK' }))
+                .toThrow(expect.objectContaining({ code: 'ROUTE_IDENTITY_INCOMPLETE', statusCode: 409 }));
+            expect(() => routePolicy.assertSettlementRouteAllowed({ quote: { selectedRoute: 'GENERIC_FIAT_AGGREGATOR' }, settlementSurface: 'GENERIC_FIAT_WEBHOOK' }))
+                .toThrow(expect.objectContaining({ code: 'ROUTE_IDENTITY_INCOMPLETE', statusCode: 409 }));
+        });
+
+        test('a DB-persisted P5-C quote carries BOTH route and rail — settlement binding is provable from the stored row alone', async () => {
+            const user = await seedUser(prisma);
+            await createServerTransactionQuote({
+                prisma, userId: user.id, purpose: 'deposit', amountGhs: 100, ttlSeconds: 600,
+                routeIdentity: routePolicy.resolveDepositRoute({ route: 'GENERIC_FIAT_AGGREGATOR', provider: 'BANK_TRANSFER' }),
+            });
+            const [row] = await rawQuoteRows(user.id);
+            expect(row.selectedRoute).toBe('GENERIC_FIAT_AGGREGATOR');
+            expect(row.routeProviderRail).toBe('BANK_TRANSFER');
+            const storedQuote = { selectedRoute: row.selectedRoute, routeProviderRail: row.routeProviderRail };
+            expect(() => routePolicy.assertSettlementRouteAllowed({ quote: storedQuote, settlementSurface: 'MOOLRE_WEBHOOK' }))
                 .toThrow(expect.objectContaining({ code: 'ROUTE_SETTLEMENT_MISMATCH', statusCode: 409 }));
+            expect(routePolicy.assertSettlementRouteAllowed({ quote: storedQuote, settlementSurface: 'GENERIC_FIAT_WEBHOOK' })).toBe(true);
         });
 
         test('historical quote without a selected route stays settleable everywhere (fail-closed only on contradictions)', () => {
@@ -301,13 +320,18 @@ describeOrSkip('§P.5-C route-aware quote authority (real PostgreSQL)', () => {
             const user = await seedUser(prisma);
             const rate = '13.42123457'; // liveRetailRate column is Decimal(18,8) — the oracle's exact precision
             await seedSettings({ liveRetailRate: rate, lastExternalSync: new Date(Date.now() - second(60)) });
-            await createServerTransactionQuote({
+            const quote = await createServerTransactionQuote({
                 prisma, userId: user.id, purpose: 'deposit', amountGhs: 100.01, ttlSeconds: 600,
             });
             const [row] = await rawQuoteRows(user.id);
             const { Prisma } = require('@prisma/client');
             const P = Prisma.Decimal;
             const expected = new P('100.01').div(new P(rate)).toDecimalPlaces(8, P.ROUND_HALF_UP);
+            // The persisted rate is EXACTLY the DB-authoritative Decimal — asserted
+            // against the ORIGINAL source string, never a Number reconstruction.
+            expect(row.rateGhsPerUsdc.toFixed(8)).toBe('13.42123457'); // original 8dp value, verbatim
+            expect(new P(rate).eq(row.rateGhsPerUsdc)).toBe(true); // exact Decimal equality with the source
+            expect(quote.rateGhsPerUsdc).toBe(Number(rate)); // presentation boundary is the only Number projection
             expect(row.rateGhsPerUsdc.toFixed(8)).toBe(new P(rate).toDecimalPlaces(8, P.ROUND_HALF_UP).toFixed(8)); // column boundary
             expect(row.usdcAmount.toFixed(8)).toBe(expected.toFixed(8)); // economics use the ORIGINAL exact rate
             expect(new P(row.usdcAmount).toDecimalPlaces(8).toFixed(8)).toBe(row.usdcAmount.toFixed(8)); // P4 ledger quantity contract — 8dp is lossless

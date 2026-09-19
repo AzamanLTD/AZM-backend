@@ -81,6 +81,9 @@ exports.initiate = async (req, res) => {
       amountGhs: ghsFloat,
       feeGhs: 0,
       rateGhsPerUsdc: rate.rateGhsPerUsdc,
+      // §P.5-C Decimal-native rate path: pass the EXACT DB Decimal through —
+      // never a JS Number reconstruction of it.
+      rateGhsPerUsdcExact: rate.rateGhsPerUsdcExact,
       rateSource: rate.rateSource,
       // rateAsOf is the TRUE external observation the gate verified — never a
       // MOCK-echo or admin-fabricated stamp (issue #271 / PR 271B).
