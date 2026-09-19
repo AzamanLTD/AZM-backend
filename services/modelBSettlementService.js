@@ -28,6 +28,7 @@ const { Prisma } = require('@prisma/client');
 const logger = require('../src/config/logger');
 const ledger = require('./ledgerService');
 const { consumeLot, InventoryError } = require('./inventoryService');
+const { getPersistedTransactionQuoteExact } = require('../src/services/transactionQuoteService');
 
 const Decimal = Prisma.Decimal;
 
@@ -70,8 +71,11 @@ function toExactDecimals(value, label, maxScale) {
 
 // The durable INBOUND provider observation MUST exist and match the settled
 // amount + reference. The evidence layer is P5-D authority — the settlement
-// never takes the caller's word for a payment.
-async function verifyProviderEvidence(tx, { evidenceDedupKey, settledGhs, reference }) {
+// never takes the caller's word for a payment. §P.5-E binding: the observation
+// must ALSO be the observation this settlement claims (provider +, when
+// supplied, providerRef) — a different provider's or provider-reference's
+// event can never vouch for this settlement.
+async function verifyProviderEvidence(tx, { evidenceDedupKey, settledGhs, reference, provider, providerRef }) {
   const event = await tx.fiatProviderEvent.findUnique({ where: { dedupKey: evidenceDedupKey } });
   if (!event) {
     throw new ModelBError('MODEL_B_EVIDENCE_MISSING',
@@ -89,6 +93,14 @@ async function verifyProviderEvidence(tx, { evidenceDedupKey, settledGhs, refere
     throw new ModelBError('MODEL_B_EVIDENCE_REFERENCE_MISMATCH',
       `provider observation ${evidenceDedupKey} is bound to reference ${event.relatedReference}, not ${reference}`);
   }
+  if (event.provider !== provider) {
+    throw new ModelBError('MODEL_B_EVIDENCE_PROVIDER_MISMATCH',
+      `provider observation ${evidenceDedupKey} was recorded by ${event.provider}, settlement claims ${provider}`);
+  }
+  if (providerRef != null && (event.providerRef ?? null) !== providerRef) {
+    throw new ModelBError('MODEL_B_EVIDENCE_PROVIDER_REF_MISMATCH',
+      `provider observation ${evidenceDedupKey} carries providerRef ${event.providerRef ?? 'none'}, settlement claims ${providerRef}`);
+  }
   const eventAmount = new Decimal(event.amountGhs);
   if (!eventAmount.eq(settledGhs)) {
     throw new ModelBError('MODEL_B_EVIDENCE_AMOUNT_MISMATCH',
@@ -105,15 +117,20 @@ async function verifyProviderEvidence(tx, { evidenceDedupKey, settledGhs, refere
 // (basis × q / original at high precision, HALF_UP to the ledger's 8-decimal
 // authority) with any sub-8dp residual recorded EXPLICITLY on the settlement.
 async function claimInventoryFifo(tx, { reference, settledUsdc }) {
+  // §P.5-E inventory-authority gate: ONLY evidence-granted-eligible lots can
+  // fund a real customer USDC liability. `eligibleForModelBSettlement` is
+  // false BY DEFAULT and no production code path grants it — the (future)
+  // acquisition-evidence authority does. Quantity alone is NEVER sufficient
+  // (docs/p5e-model-b-settlement.md §2.1a).
   const openLots = await tx.inventoryLot.findMany({
-    where: { status: 'OPEN', quantityRemaining: { gt: '0' } },
+    where: { status: 'OPEN', quantityRemaining: { gt: '0' }, eligibleForModelBSettlement: true },
     orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
   });
 
   const available = openLots.reduce((sum, l) => sum.plus(new Decimal(l.quantityRemaining)), new Decimal(0));
   if (available.lt(settledUsdc)) {
     throw new ModelBError('MODEL_B_INVENTORY_INSUFFICIENT',
-      `Model B settlement requires ${settledUsdc.toFixed(8)} USDC of inventory; OPEN lots hold ${available.toFixed(8)} — refusing to credit a customer without authoritative inventory`,
+      `Model B settlement requires ${settledUsdc.toFixed(8)} USDC of inventory; eligible OPEN lots hold ${available.toFixed(8)} — refusing to credit a customer without authoritative inventory`,
       { required: settledUsdc.toFixed(8), available: available.toFixed(8) });
   }
 
@@ -147,7 +164,14 @@ async function claimInventoryFifo(tx, { reference, settledUsdc }) {
       // difference is recorded explicitly in shareResidualGhs.
       shareExact = Decimal.div(basis.times(take), original);
     }
-    const share = shareExact.toDecimalPlaces(12, Decimal.ROUND_HALF_UP); // 12dp — bounded by half of the 8th decimal
+    // §P.5-E exact allocation contract: the recorded cost share is the exact
+    // rational basis share projected ONCE at the ledger's 8-decimal authority
+    // (HALF_UP). The residual is the TRUE remainder shareExact − costShare8 —
+    // never re-rounded to 8dp — persisted at the ModelBSettlement residual
+    // precision (12dp). The auditable identity is exact whenever the residual
+    // is representable at 12dp: costShareGhs + shareResidualGhs == shareExact.
+    const costShare8 = shareExact.toDecimalPlaces(8, Decimal.ROUND_HALF_UP);
+    const residual = shareExact.minus(costShare8);
 
     claims.push({
       consumptionId: consumption.id,
@@ -156,9 +180,9 @@ async function claimInventoryFifo(tx, { reference, settledUsdc }) {
       quantity: take.toFixed(8),
       lotCostBasisGhs: basis.toFixed(8),
       lotQuantityOriginal: original.toFixed(8),
-      costShareGhs: share.toFixed(8),
+      costShareGhs: costShare8.toFixed(8),
       remainingAfter: new Decimal(lot.quantityRemaining).toFixed(8),
-      shareResidualGhs: shareExact.minus(share).toFixed(8),
+      shareResidualGhs: residual.toDecimalPlaces(12, Decimal.ROUND_HALF_UP).toFixed(12),
       replayed,
     });
     needed = needed.minus(take);
@@ -248,15 +272,109 @@ async function settleDepositFromInventory(tx, params = {}) {
     return { settlement: existing, replayed: true };
   }
 
+  // ── service-level authority binding (§P.5-E audit r1) ──────────────────
+  // The mounted controllers supply canonical values, but the authoritative
+  // primitive NEVER trusts them: every caller-supplied identity, amount and
+  // route field is re-verified against the PERSISTED authorities (the settled
+  // TransactionHistory row and the exact persisted TransactionQuote row)
+  // inside this same caller-owned transaction, BEFORE the inventory claim.
+  // Any mismatch fails closed with zero mutation.
+  const th = await tx.transactionHistory.findUnique({ where: { id: transactionHistoryId } });
+  if (!th) {
+    throw new ModelBError('MODEL_B_TX_NOT_FOUND',
+      `TransactionHistory ${transactionHistoryId} does not exist — settlement refuses an uncommitted identity`);
+  }
+  if (th.txHash !== reference) {
+    throw new ModelBError('MODEL_B_TX_REFERENCE_MISMATCH',
+      `TransactionHistory ${transactionHistoryId} is bound to txHash ${th.txHash}, settlement claims ${reference}`);
+  }
+  if (th.type !== 'DEPOSIT_FIAT') {
+    throw new ModelBError('MODEL_B_TX_TYPE',
+      `TransactionHistory ${transactionHistoryId} is type ${th.type}, not DEPOSIT_FIAT`);
+  }
+  if (th.userId !== userId) {
+    throw new ModelBError('MODEL_B_TX_USER_MISMATCH',
+      `TransactionHistory ${transactionHistoryId} belongs to user ${th.userId}, settlement claims user ${userId}`);
+  }
+  if (th.status !== 'COMPLETED') {
+    throw new ModelBError('MODEL_B_TX_STATUS',
+      `TransactionHistory ${transactionHistoryId} is ${th.status}, not COMPLETED`);
+  }
+  if (!new Decimal(th.amountUsdc).equals(settledUsdcD)) {
+    throw new ModelBError('MODEL_B_TX_AMOUNT_MISMATCH',
+      `TransactionHistory ${transactionHistoryId} committed ${new Decimal(th.amountUsdc).toFixed(8)} USDC, settlement claims ${settledUsdcD.toFixed(8)}`);
+  }
+
+  const q = await getPersistedTransactionQuoteExact({ prisma: tx, quoteId });
+  if (!q || q.id !== quoteId) {
+    throw new ModelBError('MODEL_B_QUOTE_NOT_FOUND',
+      `TransactionQuote ${quoteId} does not exist — settlement quotes only what was persisted`);
+  }
+  if (q.userId !== userId) {
+    throw new ModelBError('MODEL_B_QUOTE_USER_MISMATCH',
+      `TransactionQuote ${quoteId} belongs to user ${q.userId}, settlement claims user ${userId}`);
+  }
+  if (q.purpose !== 'deposit') {
+    throw new ModelBError('MODEL_B_QUOTE_PURPOSE',
+      `TransactionQuote ${quoteId} has purpose ${q.purpose}, not deposit`);
+  }
+  if (!q.consumedAt || q.consumedFor !== 'deposit') {
+    throw new ModelBError('MODEL_B_QUOTE_NOT_CONSUMED',
+      `TransactionQuote ${quoteId} is not consumed for a deposit settlement (consumedAt=${q.consumedAt}, consumedFor=${q.consumedFor})`);
+  }
+  if (!new Decimal(q.amountGhs).equals(quotedGhsD)) {
+    throw new ModelBError('MODEL_B_QUOTE_AMOUNT_MISMATCH',
+      `TransactionQuote ${quoteId} persisted GHS ${new Decimal(q.amountGhs).toFixed(2)}, settlement was given ${quotedGhsD.toFixed(2)}`);
+  }
+  if (!new Decimal(q.rateGhsPerUsdc).equals(quotedRateD)) {
+    throw new ModelBError('MODEL_B_QUOTE_RATE_MISMATCH',
+      `TransactionQuote ${quoteId} persisted rate ${new Decimal(q.rateGhsPerUsdc).toFixed(8)}, settlement was given ${quotedRateD.toFixed(8)}`);
+  }
+  // the quote's authoritative ledger-scale USDC amount: the persisted
+  // numeric(30,12) projected ONCE at 8dp HALF_UP — the same projection the
+  // committed TransactionHistory.amountUsdc carries.
+  const qUsdc8 = new Decimal(q.usdcAmount).toDecimalPlaces(8, Decimal.ROUND_HALF_UP);
+  if (quotedUsdcD != null && !quotedUsdcD.toDecimalPlaces(8, Decimal.ROUND_HALF_UP).equals(qUsdc8)) {
+    throw new ModelBError('MODEL_B_QUOTE_USDC_MISMATCH',
+      `TransactionQuote ${quoteId} projects to ${qUsdc8.toFixed(8)} USDC at the 8dp ledger authority, settlement was given ${quotedUsdcD.toFixed(12)}`);
+  }
+  if (!qUsdc8.equals(settledUsdcD)) {
+    throw new ModelBError('MODEL_B_QUOTE_USDC_MISMATCH',
+      `TransactionQuote ${quoteId} projects to ${qUsdc8.toFixed(8)} USDC at the 8dp ledger authority, the committed TransactionHistory carries ${settledUsdcD.toFixed(8)}`);
+  }
+  // §P.5-E Model B authority: the evidenced settled GHS is EXACTLY the quoted
+  // GHS — the ±0.01 surface tolerance is a flag-OFF legacy affordance only;
+  // the settlement authority never rides it (audit r1, blocker 2).
+  if (!settledGhsD.equals(new Decimal(q.amountGhs))) {
+    throw new ModelBError('MODEL_B_SETTLED_GHS_MISMATCH',
+      `quote ${quoteId} is for GHS ${new Decimal(q.amountGhs).toFixed(2)}; the evidenced settlement is GHS ${settledGhsD.toFixed(2)} — Model B requires exact pesewa equality`);
+  }
+  if ((selectedRoute ?? null) !== q.selectedRoute) {
+    throw new ModelBError('MODEL_B_ROUTE_MISMATCH',
+      `TransactionQuote ${quoteId} selected route ${q.selectedRoute ?? 'none'}, settlement claims ${selectedRoute ?? 'none'}`);
+  }
+  if ((routeProviderRail ?? null) !== q.routeProviderRail) {
+    throw new ModelBError('MODEL_B_ROUTE_MISMATCH',
+      `TransactionQuote ${quoteId} selected rail ${q.routeProviderRail ?? 'none'}, settlement claims ${routeProviderRail ?? 'none'}`);
+  }
+  if ((routePolicyVersion ?? null) !== q.routePolicyVersion) {
+    throw new ModelBError('MODEL_B_ROUTE_MISMATCH',
+      `TransactionQuote ${quoteId} was selected under policy ${q.routePolicyVersion ?? 'none'}, settlement claims ${routePolicyVersion ?? 'none'}`);
+  }
+
   // ── evidence before inventory: authority is verified, never assumed ──────
-  await verifyProviderEvidence(tx, { evidenceDedupKey, settledGhs: settledGhsD, reference });
+  await verifyProviderEvidence(tx, {
+    evidenceDedupKey, settledGhs: settledGhsD, reference,
+    provider, providerRef: providerRef ?? null,
+  });
 
   // ── FIFO inventory claim (the only USDC source for a customer) ──────────
   const claims = await claimInventoryFifo(tx, { reference, settledUsdc: settledUsdcD });
 
-  const costBasisTotal = claims.reduce((s, c) => s.plus(new Decimal(c.costShareGhs)), new Decimal(0));
-  const costResidual = claims.reduce((s, c) => s.plus(new Decimal(c.shareResidualGhs)), new Decimal(0))
-    .toDecimalPlaces(12, Decimal.ROUND_HALF_UP); // 12dp — bounded by half of the 8th decimal
+  // costBasisGhsTotal is the EXACT sum of the RECORDED 8dp shares (audit r1,
+  // blocker 3): the durable record and its total can never disagree.
+  const costBasisTotal = claims.reduce((sum, c) => sum.plus(new Decimal(c.costShareGhs)), new Decimal(0));
+  const costResidual = claims.reduce((sum, c) => sum.plus(new Decimal(c.shareResidualGhs)), new Decimal(0));
   // the realized customer spread is GHS-denominated and EXACT — never restated
   // in USDC and never derived from a market quote.
   const marginGhs = settledGhsD.minus(costBasisTotal);
@@ -327,13 +445,13 @@ async function settleDepositFromInventory(tx, params = {}) {
       settledGhs: settledGhsD.toFixed(2),
       settledUsdc: settledUsdcD.toFixed(8),
       costBasisGhsTotal: costBasisTotal.toFixed(8),
-      costAllocationResidualGhs: costResidual.toFixed(8),
+      costAllocationResidualGhs: costResidual.toDecimalPlaces(12, Decimal.ROUND_HALF_UP).toFixed(12), // residual precision (12dp)
       marginGhs: marginGhs.toFixed(8),
       providerFeeGhs: feeD ? feeD.toFixed(2) : null,
       conversionIdentity: `p5e:modelb:${reference}`,
       conversionLedgerTxnId: conversion.transaction.id,
       depositLedgerTxnId: deposit.transaction.id,
-      lotAllocations: claims.map(({ replayed, shareResidualGhs, ...c }) => c),
+      lotAllocations: claims.map(({ replayed, ...c }) => c), // includes costShareGhs (8dp) + shareResidualGhs (12dp) — the durable exact allocation
     },
   });
 

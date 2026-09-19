@@ -56,6 +56,7 @@ describeOrSkip('§P.5-E Model B settlement / inventory cost-basis realization (r
     const fiatLiquidity = require('../src/services/fiatLiquidityService');
     const moolreQuoteDepositController = require('../controllers/moolreQuoteDepositController');
     const quoteFiatDepositController = require('../controllers/quoteFiatDepositController');
+    const { consumeTransactionQuote } = require('../src/services/transactionQuoteService');
     const { Prisma } = require('@prisma/client');
     const Decimal = Prisma.Decimal;
 
@@ -155,6 +156,9 @@ describeOrSkip('§P.5-E Model B settlement / inventory cost-basis realization (r
         return res;
     }
 
+    // acquireLot creates INELIGIBLE lots by default (production truth: no
+    // production code path grants eligibility). Tests grant it explicitly —
+    // simulating ONLY the future evidence-backed acquisition authority.
     const acquireTx = (o = {}) => prisma.$transaction((tx) => inventory.acquireLot(tx, {
         acquisitionKey: o.key ?? `lot:p5e:${Math.random().toString(36).slice(2)}`,
         sourceType: o.sourceType ?? 'CORPORATE_PURCHASE',
@@ -162,7 +166,12 @@ describeOrSkip('§P.5-E Model B settlement / inventory cost-basis realization (r
         quantity: o.quantity ?? '500',
         costBasisGhs: o.cost ?? '6000',
         acquisitionRate: o.rate === undefined ? '12' : o.rate,
-    }).then((r) => r.lot));
+    }).then(async (r) => {
+        if (o.eligible !== false) {
+            await tx.inventoryLot.update({ where: { id: r.lot.id }, data: { eligibleForModelBSettlement: true } });
+        }
+        return r.lot;
+    }));
     const bal = (account) => ledger.accountBalance(prisma, account).then((b) => b.balance);
 
     // TransactionQuote is overlay-managed (raw SQL — no Prisma model client).
@@ -182,7 +191,7 @@ describeOrSkip('§P.5-E Model B settlement / inventory cost-basis realization (r
         const lot = await acquireTx({ quantity: lotQty, cost: lotCost });
         const user = await seedUser(prisma, { availableBalance: 0 });
         const pending = await initiateDeposit(user, amountGhs, surface);
-        return { lot, user, pending };
+        return { lot, user, pending, quoteId: pending.metadata?.quoteId };
     }
 
     // =========================================================================
@@ -516,16 +525,18 @@ describeOrSkip('§P.5-E Model B settlement / inventory cost-basis realization (r
     // =========================================================================
     describe('D. evidence and gate failures (fail closed, zero mutation)', () => {
         test('missing durable provider evidence blocks the settlement entirely', async () => {
-            const { user, pending } = await seedScenario();
+            const { user, pending, quoteId } = await seedScenario();
             // the mounted webhook ALWAYS records the event first; simulate the
             // pathological case directly at the service boundary: no event row.
             await prisma.fiatProviderEvent.deleteMany({ where: { relatedReference: pending.txHash } });
-            const th = await prisma.transactionHistory.update({ where: { id: pending.id }, data: { status: 'COMPLETED', amountUsdc: '7.45156483' } });
+            const quote = await consumeTransactionQuote({ prisma, quoteId, userId: user.id, purpose: 'deposit' });
+            const th = await prisma.transactionHistory.update({ where: { id: pending.id }, data: { status: 'COMPLETED', amountUsdc: quote.usdcAmount } });
 
             await expect(prisma.$transaction((tx) => modelBSettlement.settleDepositFromInventory(tx, {
-                reference: pending.txHash, transactionHistoryId: pending.id, userId: user.id, quoteId: th.metadata.quoteId,
-                quotedGhs: '100', quotedRateGhsPerUsdc: '13.42', quotedUsdc: '7.45156483',
-                settledGhs: 100, settledUsdc: th.amountUsdc,
+                reference: pending.txHash, transactionHistoryId: pending.id, userId: user.id, quoteId,
+                quotedGhs: quote.amountGhs, quotedRateGhsPerUsdc: quote.rateGhsPerUsdc, quotedUsdc: quote.usdcAmount,
+                settledGhs: quote.amountGhs, settledUsdc: th.amountUsdc,
+                selectedRoute: quote.selectedRoute, routeProviderRail: quote.routeProviderRail, routePolicyVersion: quote.routePolicyVersion,
                 provider: 'MOOLRE', evidenceDedupKey: `event:moolre-collection:${pending.txHash}`,
             }))).rejects.toMatchObject({ code: 'MODEL_B_EVIDENCE_MISSING' });
             expect(await prisma.inventoryLotConsumption.count()).toBe(0);
@@ -685,6 +696,291 @@ describeOrSkip('§P.5-E Model B settlement / inventory cost-basis realization (r
             expect((await bal('equity:treasury')).toFixed(8)).toBe('0.00000000'); // stake fully drawn
             const lot = await prisma.inventoryLot.findFirst();
             expect(lot.status).toBe('CONSUMED');
+        });
+    });
+
+    // =========================================================================
+    // G. Service-level authority binding (audit r1) — the DIRECT primitive
+    //    refuses wrong caller-supplied identities with ZERO mutation.
+    // =========================================================================
+    describe('G. service-level authority binding (direct primitive, zero mutation)', () => {
+        // Base scenario: everything the mounted webhook would have done BEFORE
+        // calling the primitive is real — quote consumed for deposit, TH
+        // COMPLETED with the committed 8dp amount, durable provider evidence.
+        async function seedDirect({ amountGhs = 100 } = {}) {
+            await setModelB(true);
+            const lot = await acquireTx({ quantity: '10', cost: '120' });
+            const user = await seedUser(prisma, { availableBalance: 0 });
+            const pending = await initiateDeposit(user, amountGhs, 'moolre');
+            const quote = await consumeTransactionQuote({ prisma, quoteId: pending.metadata.quoteId, userId: user.id, purpose: 'deposit' });
+            const th = await prisma.transactionHistory.update({ where: { id: pending.id }, data: { status: 'COMPLETED', amountUsdc: quote.usdcAmount } });
+            await fiatLiquidity.recordProviderEvent(prisma, {
+                provider: 'MOOLRE', direction: 'INBOUND', status: 'SUCCESSFUL',
+                providerRef: 'PR-G', dedupKey: `event:moolre-collection:${pending.txHash}`,
+                amountGhs, relatedReference: pending.txHash, raw: null,
+            });
+            return { lot, user, pending, quote, th };
+        }
+        const baseParams = (d) => ({
+            reference: d.pending.txHash, transactionHistoryId: d.th.id, userId: d.user.id, quoteId: d.quote.id,
+            quotedGhs: d.quote.amountGhs, quotedRateGhsPerUsdc: d.quote.rateGhsPerUsdc, quotedUsdc: d.quote.usdcAmount,
+            settledGhs: d.quote.amountGhs, settledUsdc: d.th.amountUsdc,
+            selectedRoute: d.quote.selectedRoute, routeProviderRail: d.quote.routeProviderRail, routePolicyVersion: d.quote.routePolicyVersion,
+            provider: 'MOOLRE', providerRef: 'PR-G', evidenceDedupKey: `event:moolre-collection:${d.pending.txHash}`,
+        });
+        const snapshot = (d) => async () => ({
+            settlements: await prisma.modelBSettlement.count(),
+            consumptions: await prisma.inventoryLotConsumption.count(),
+            lotRemaining: new Decimal((await prisma.inventoryLot.findUnique({ where: { id: d.lot.id } })).quantityRemaining).toFixed(8),
+            ledgerEntries: await prisma.journalEntry.count({ where: { ledgerTransactionId: { not: null } } }),
+            balance: new Decimal((await prisma.user.findUnique({ where: { id: d.user.id } })).availableBalance).toFixed(8),
+        });
+        // every negative case: expect the exact fail-closed code AND prove the
+        // service performed ZERO mutation (identical pre/post snapshots).
+        async function expectFailClosed(d, overrides, code) {
+            const before = await snapshot(d)();
+            await expect(prisma.$transaction((tx) => modelBSettlement.settleDepositFromInventory(tx, {
+                ...baseParams(d), ...overrides,
+            }))).rejects.toMatchObject({ code });
+            const after = await snapshot(d)();
+            expect(after).toEqual(before);
+        }
+
+        test('sanity: the unmodified base scenario settles through the primitive', async () => {
+            const d = await seedDirect();
+            const { settlement, replayed } = await prisma.$transaction((tx) => modelBSettlement.settleDepositFromInventory(tx, baseParams(d)));
+            expect(replayed).toBe(false);
+            expect(settlement.transactionHistoryId).toBe(d.th.id);
+            expect(settlement.quoteId).toBe(d.quote.id);
+            expect(settlement.userId).toBe(d.user.id);
+        });
+
+        test('wrong transactionHistoryId fails closed — MODEL_B_TX_NOT_FOUND, zero mutation', async () => {
+            const d = await seedDirect();
+            await expectFailClosed(d, { transactionHistoryId: '00000000-0000-4000-8000-000000000000' }, 'MODEL_B_TX_NOT_FOUND');
+        });
+
+        test('wrong userId fails closed — MODEL_B_TX_USER_MISMATCH, zero mutation', async () => {
+            const d = await seedDirect();
+            await expectFailClosed(d, { userId: d.user.id + 1 }, 'MODEL_B_TX_USER_MISMATCH');
+        });
+
+        test('a quote belonging to another user fails closed — MODEL_B_QUOTE_USER_MISMATCH, zero mutation', async () => {
+            const d = await seedDirect();
+            const stranger = await seedUser(prisma, { availableBalance: 0 });
+            const strangerPending = await initiateDeposit(stranger, 100, 'moolre');
+            const strangerQuote = await consumeTransactionQuote({ prisma, quoteId: strangerPending.metadata.quoteId, userId: stranger.id, purpose: 'deposit' });
+            await expectFailClosed(d, { quoteId: strangerQuote.id }, 'MODEL_B_QUOTE_USER_MISMATCH');
+        });
+
+        test('wrong quote economics (quotedGhs) fail closed — MODEL_B_QUOTE_AMOUNT_MISMATCH, zero mutation', async () => {
+            const d = await seedDirect();
+            await expectFailClosed(d, { quotedGhs: 99.99 }, 'MODEL_B_QUOTE_AMOUNT_MISMATCH');
+        });
+
+        test('wrong quote rate fails closed — MODEL_B_QUOTE_RATE_MISMATCH, zero mutation', async () => {
+            const d = await seedDirect();
+            await expectFailClosed(d, { quotedRateGhsPerUsdc: '13.42000001' }, 'MODEL_B_QUOTE_RATE_MISMATCH');
+        });
+
+        test('wrong settledUsdc vs the committed TransactionHistory fails closed — MODEL_B_TX_AMOUNT_MISMATCH, zero mutation', async () => {
+            const d = await seedDirect();
+            await expectFailClosed(d, { settledUsdc: '1.00000000' }, 'MODEL_B_TX_AMOUNT_MISMATCH');
+        });
+
+        test('settledUsdc diverging from the quote 8dp projection fails closed — MODEL_B_QUOTE_USDC_MISMATCH, zero mutation', async () => {
+            const d = await seedDirect();
+            const q = await prisma.$queryRaw`SELECT "usdcAmount"::text AS "usdcAmount" FROM "TransactionQuote" WHERE "id" = ${d.quote.id}::uuid`;
+            const qUsdc8 = new Decimal(q[0].usdcAmount).toDecimalPlaces(8, Decimal.ROUND_HALF_UP);
+            // a plausible-but-wrong committed amount: the quote rounded DOWN a half pesewa
+            await prisma.transactionHistory.update({ where: { id: d.th.id }, data: { amountUsdc: qUsdc8.plus('0.00000001').toFixed(8) } });
+            const th = await prisma.transactionHistory.findUnique({ where: { id: d.th.id } });
+            await expectFailClosed({ ...d, th }, { settledUsdc: th.amountUsdc }, 'MODEL_B_QUOTE_USDC_MISMATCH');
+        });
+
+        test('provider mismatch vs the durable evidence fails closed — MODEL_B_EVIDENCE_PROVIDER_MISMATCH, zero mutation', async () => {
+            const d = await seedDirect();
+            await expectFailClosed(d, { provider: 'EVIL_AGGREGATOR' }, 'MODEL_B_EVIDENCE_PROVIDER_MISMATCH');
+        });
+
+        test('providerRef mismatch vs the durable evidence fails closed — MODEL_B_EVIDENCE_PROVIDER_REF_MISMATCH, zero mutation', async () => {
+            const d = await seedDirect();
+            await expectFailClosed(d, { providerRef: 'NOT-THE-OBSERVED-REF' }, 'MODEL_B_EVIDENCE_PROVIDER_REF_MISMATCH');
+        });
+
+        test('route mismatch vs the persisted quote fails closed — MODEL_B_ROUTE_MISMATCH, zero mutation', async () => {
+            const d = await seedDirect();
+            await expectFailClosed(d, { selectedRoute: 'GENERIC_FIAT_WEBHOOK' }, 'MODEL_B_ROUTE_MISMATCH');
+        });
+
+        test('rail mismatch vs the persisted quote fails closed — MODEL_B_ROUTE_MISMATCH, zero mutation', async () => {
+            const d = await seedDirect();
+            await expectFailClosed(d, { routeProviderRail: 'TELECEL_CASH' }, 'MODEL_B_ROUTE_MISMATCH');
+        });
+
+        test('settledGhs 99.99 against a 100.00 quote fails closed — MODEL_B_SETTLED_GHS_MISMATCH, zero mutation', async () => {
+            const d = await seedDirect();
+            await expectFailClosed(d, { settledGhs: 99.99 }, 'MODEL_B_SETTLED_GHS_MISMATCH');
+        });
+
+        test('settledGhs 100.01 against a 100.00 quote fails closed — MODEL_B_SETTLED_GHS_MISMATCH, zero mutation', async () => {
+            const d = await seedDirect();
+            await expectFailClosed(d, { settledGhs: 100.01 }, 'MODEL_B_SETTLED_GHS_MISMATCH');
+        });
+    });
+
+    // =========================================================================
+    // H. Exact GHS settlement for Model B (audit r1) — 99.99/100.01 vs a
+    //    100.00 quote: the ±0.01 tolerance is flag-OFF legacy ONLY.
+    // =========================================================================
+    describe('H. exact GHS (99.99/100.01 against a 100.00 quote)', () => {
+        const zeroMutation = async (user, pending) => {
+            expect((await prisma.transactionHistory.findUnique({ where: { id: pending.id } })).status).toBe('PENDING');
+            expect(new Decimal((await prisma.user.findUnique({ where: { id: user.id } })).availableBalance).toFixed(8)).toBe('0.00000000');
+            expect(await prisma.inventoryLotConsumption.count()).toBe(0);
+            expect(await prisma.modelBSettlement.count()).toBe(0);
+            expect(await prisma.journalEntry.count({ where: { account: { in: ['expense:cogs:usdc', `user:${user.id}:liability`] } } })).toBe(0);
+            const quote = await quoteRow(pending.metadata.quoteId);
+            expect(quote.consumedAt).toBeNull(); // the quote was NOT consumed → deposit retryable
+        };
+
+        test('flag ON, moolre surface: 99.99 rejected, zero mutation, deposit retryable', async () => {
+            const { user, pending } = await seedScenario(); // quote is 100.00
+            const res = await moolreWebhook(pending.txHash, 99.99);
+            expect(res.statusCode).toBe(409);
+            expect(res.payload.message).toMatch(/does not match/i);
+            await zeroMutation(user, pending);
+        });
+
+        test('flag ON, moolre surface: 100.01 rejected, zero mutation, deposit retryable', async () => {
+            const { user, pending } = await seedScenario();
+            const res = await moolreWebhook(pending.txHash, 100.01);
+            expect(res.statusCode).toBe(409);
+            expect(res.payload.message).toMatch(/does not match/i);
+            await zeroMutation(user, pending);
+        });
+
+        test('flag ON, generic surface: 99.99 rejected, zero mutation, deposit retryable', async () => {
+            const { user, pending } = await seedScenario({ surface: 'generic' });
+            const res = await genericWebhook(pending.txHash, 99.99);
+            expect(res.statusCode).toBe(409);
+            expect(res.payload.message).toMatch(/does not match/i);
+            await zeroMutation(user, pending);
+        });
+
+        test('flag ON, generic surface: 100.01 rejected, zero mutation, deposit retryable', async () => {
+            const { user, pending } = await seedScenario({ surface: 'generic' });
+            const res = await genericWebhook(pending.txHash, 100.01);
+            expect(res.statusCode).toBe(409);
+            expect(res.payload.message).toMatch(/does not match/i);
+            await zeroMutation(user, pending);
+        });
+
+        test('flag OFF legacy compatibility: a within-±0.01 settled amount still settles via the legacy bridge (byte-identical)', async () => {
+            await setModelB(false); // legacy regime — the ±0.01 affordance stays untouched
+            await acquireTx({ quantity: '10', cost: '120' });
+            const user = await seedUser(prisma, { availableBalance: 0 });
+            const pending = await initiateDeposit(user, 5.5);
+            const res = await moolreWebhook(pending.txHash, 5.51); // 0.01 off quote → legacy bridge accepts
+            expect(res.statusCode).toBe(200);
+            expect(res.payload.success).toBe(true);
+            expect((await prisma.transactionHistory.findUnique({ where: { id: pending.id } })).status).toBe('COMPLETED');
+            expect(await prisma.modelBSettlement.count()).toBe(0); // bridge, not Model B
+            expect(await prisma.inventoryLotConsumption.count()).toBe(0); // inventory untouched
+            expect((await bal('clearing:conversion')).gt(0)).toBe(true); // legacy bridge posted
+        });
+    });
+
+    // =========================================================================
+    // I. Inventory authority audit (audit r1) — eligibility is structural:
+    //    quantity alone can NEVER fund a real customer USDC liability.
+    //    Production truth: acquireLot creates INELIGIBLE lots and NO
+    //    production code path grants eligibility — only the future
+    //    evidence-backed acquisition authority may.
+    // =========================================================================
+    describe('I. inventory eligibility gate (no synthetic inventory funds a customer)', () => {
+        test('acquireLot lots are INELIGIBLE by default — the acquisition substrate never self-grants settlement authority', async () => {
+            const lot = await prisma.$transaction((tx) => inventory.acquireLot(tx, {
+                acquisitionKey: 'lot:p5e:ineligible-by-default', sourceType: 'CORPORATE_PURCHASE', sourceReference: 'purchase-log:p5e',
+                quantity: '500', costBasisGhs: '6000', acquisitionRate: '12',
+            }).then((r) => r.lot));
+            expect(lot.eligibleForModelBSettlement).toBe(false); // the audit's guarantee, structural
+        });
+
+        test('an INELIGIBLE lot with plenty of quantity can NEVER fund a settlement — fails closed, zero mutation', async () => {
+            await setModelB(true);
+            await acquireTx({ quantity: '500', cost: '6000', eligible: false }); // quantity exists, authority does not
+            const user = await seedUser(prisma, { availableBalance: 0 });
+            const pending = await initiateDeposit(user, 100);
+            const res = await moolreWebhook(pending.txHash, 100);
+            expect(res.statusCode).toBe(409);
+            expect(res.payload.message).toMatch(/inventory/i);
+            // zero financial mutation: deposit stays PENDING and retryable
+            expect((await prisma.transactionHistory.findUnique({ where: { id: pending.id } })).status).toBe('PENDING');
+            expect(new Decimal((await prisma.user.findUnique({ where: { id: user.id } })).availableBalance).toFixed(8)).toBe('0.00000000');
+            expect(await prisma.inventoryLotConsumption.count()).toBe(0);
+            expect(await prisma.modelBSettlement.count()).toBe(0);
+            const quote = await quoteRow(pending.metadata.quoteId);
+            expect(quote.consumedAt).toBeNull();
+
+            // only an explicit eligibility grant (the future evidence-backed
+            // acquisition authority) lets the SAME deposit settle
+            await prisma.inventoryLot.updateMany({ data: { eligibleForModelBSettlement: true } });
+            const res2 = await moolreWebhook(pending.txHash, 100);
+            expect(res2.statusCode).toBe(200);
+            expect((await prisma.transactionHistory.findUnique({ where: { id: pending.id } })).status).toBe('COMPLETED');
+        });
+
+        test('insufficient count ignores INELIGIBLE quantity — eligibility, not quantity, is the inventory authority', async () => {
+            await setModelB(true);
+            await acquireTx({ quantity: '500', cost: '6000', eligible: false }); // plenty of ineligible quantity
+            const user = await seedUser(prisma);
+            const pending = await initiateDeposit(user, 100);
+            const res = await moolreWebhook(pending.txHash, 100);
+            expect(res.statusCode).toBe(409);
+            const s = res.payload; expect(s.message).toMatch(/eligible OPEN lots hold 0.00000000/i);
+            expect((await prisma.transactionHistory.findUnique({ where: { id: pending.id } })).status).toBe('PENDING');
+        });
+    });
+
+    // =========================================================================
+    // J. Cost-allocation residual (audit r1) — the TRUE sub-8dp residual is
+    //    durable and exact: partial-lot basis = recorded 8dp cost + residual.
+    // =========================================================================
+    describe('J. exact cost allocation with a non-zero residual', () => {
+        test('partial lot: exact prorated basis = recorded 8dp costShare + durable 12dp residual, EXACTLY', async () => {
+            await setModelB(true);
+            // engineered exact numbers: rate 12.5 → 12.50 GHS quotes exactly 1 USDC.
+            await prisma.globalSettings.update({ where: { id: 1 }, data: { liveRetailRate: 12.5, liveRateSource: 'KOTANI_PAY', lastExternalSync: new Date() } });
+            // lot: 640 USDC at GHS 100.01 → take 1 USDC → shareExact = 100.01/640 = 0.156265625 EXACT (9dp)
+            await acquireTx({ quantity: '640', cost: '100.01', rate: '0.15626563' }); // provenance only (8dp authority)
+            const user = await seedUser(prisma);
+            const pending = await initiateDeposit(user, 12.5); // quotes exactly 1 USDC
+            expect((await moolreWebhook(pending.txHash, 12.5)).statusCode).toBe(200);
+
+            const th = await prisma.transactionHistory.findUnique({ where: { id: pending.id } });
+            expect(new Decimal(th.amountUsdc).toFixed(8)).toBe('1.00000000'); // the engineered take
+            const s = await prisma.modelBSettlement.findUnique({ where: { reference: pending.txHash } });
+            const alloc = s.lotAllocations[0];
+
+            // the exact rational share and its decomposition
+            const shareExact = new Decimal('100.01').times('1').div('640'); // 0.156265625 — exact at 9dp
+            const costShare8 = shareExact.toDecimalPlaces(8, Decimal.ROUND_HALF_UP); // 0.15626563
+            const residual = shareExact.minus(costShare8); // −0.000000005 — EXACT, 9dp, well inside 12dp
+
+            expect(alloc.quantity).toBe('1.00000000');
+            expect(alloc.costShareGhs).toBe(costShare8.toFixed(8));
+            expect(alloc.shareResidualGhs).toBe(residual.toFixed(12)); // the TRUE residual, 12dp, never 8dp-collapsed
+
+            // audit r1 identity, EXACT: partial-lot basis = recorded 8dp cost + durable residual
+            expect(new Decimal(alloc.costShareGhs).plus(new Decimal(alloc.shareResidualGhs)).toFixed(12)).toBe(shareExact.toFixed(12));
+
+            // the settlement-level residual is the exact sum of the recorded residuals
+            expect(new Decimal(s.costAllocationResidualGhs).toFixed(12)).toBe(residual.toFixed(12));
+
+            // costBasisGhsTotal is the EXACT sum of the RECORDED 8dp shares
+            expect(new Decimal(s.costBasisGhsTotal).toFixed(8)).toBe(costShare8.toFixed(8));
+            expect(new Decimal(s.marginGhs).toFixed(8)).toBe(new Decimal('12.50').minus(costShare8).toFixed(8));
         });
     });
 });

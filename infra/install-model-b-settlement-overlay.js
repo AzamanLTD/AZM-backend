@@ -60,6 +60,16 @@ const STATEMENTS = [
          CHECK ("quotedRateGhsPerUsdc" > 0);
      END IF;
    END $$;`,
+
+  // §P.5-E audit r1: structural inventory-authority gate. Eligibility is
+  // false by default and granted by no production code path — only a future,
+  // evidence-backed acquisition authority may set it. Model B settlement
+  // claims ONLY eligible lots; quantity alone can never fund a customer
+  // liability.
+  `ALTER TABLE "InventoryLot"
+     ADD COLUMN IF NOT EXISTS "eligibleForModelBSettlement" BOOLEAN NOT NULL DEFAULT false;`,
+  `CREATE INDEX IF NOT EXISTS "InventoryLot_eligible_status_idx"
+     ON "InventoryLot"("eligibleForModelBSettlement", "status");`,
 ];
 
 async function main() {

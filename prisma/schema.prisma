@@ -5985,6 +5985,10 @@ model InventoryLot {
   acquisitionRate   Decimal?           @db.Decimal(18, 8) // GHS per USDC at acquisition (provenance)
   ledgerTxnId       String? // LedgerTransaction.id of the inventory:usdc:lots acquisition posting
   status            InventoryLotStatus @default(OPEN)
+  // §P.5-E: false BY DEFAULT and granted by NO production code path — only a
+  // future, evidence-backed acquisition authority may set it. Inventory
+  // quantity alone can never fund a real customer USDC liability (audit r1).
+  eligibleForModelBSettlement Boolean @default(false)
   consumptions      InventoryLotConsumption[]
   createdAt         DateTime           @default(now())
 }

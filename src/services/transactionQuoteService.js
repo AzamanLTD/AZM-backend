@@ -428,6 +428,39 @@ async function consumeTransactionQuote({ prisma, quoteId, userId, purpose, now =
   return mapQuoteRow(rows[0]);
 }
 
+// §P.5-E authority binding: read-only exact fetch of a PERSISTED quote.
+// Returns EXACT numeric strings straight from PostgreSQL — never Number()
+// projections — so settlement can require exact Decimal equality against
+// what was actually persisted. The quote row is the ONLY quote authority.
+async function getPersistedTransactionQuoteExact({ prisma, quoteId }) {
+  if (!prisma?.$queryRaw) throw new Error('Quote service requires Prisma raw SQL support');
+  if (typeof quoteId !== 'string' || !/^[0-9a-f-]{36}$/i.test(quoteId)) return null;
+  const rows = await prisma.$queryRaw`
+    SELECT "id"::text AS "id", "userId", "purpose",
+           "amountGhs"::text AS "amountGhs", "feeGhs"::text AS "feeGhs", "netGhs"::text AS "netGhs",
+           "rateGhsPerUsdc"::text AS "rateGhsPerUsdc", "usdcAmount"::text AS "usdcAmount",
+           "consumedAt", "consumedFor",
+           "selectedRoute", "routeProviderRail", "routePolicyVersion"
+    FROM "TransactionQuote" WHERE "id" = ${quoteId}::uuid LIMIT 1`;
+  if (!rows.length) return null;
+  const r = rows[0];
+  return {
+    id: r.id,
+    userId: Number(r.userId),
+    purpose: r.purpose,
+    amountGhs: r.amountGhs,
+    feeGhs: r.feeGhs,
+    netGhs: r.netGhs,
+    rateGhsPerUsdc: r.rateGhsPerUsdc,
+    usdcAmount: r.usdcAmount,
+    consumedAt: r.consumedAt ? new Date(r.consumedAt).toISOString() : null,
+    consumedFor: r.consumedFor || null,
+    selectedRoute: r.selectedRoute || null,
+    routeProviderRail: r.routeProviderRail || null,
+    routePolicyVersion: r.routePolicyVersion || null,
+  };
+}
+
 function assertQuoteActive(quote, now = new Date()) {
   if (!quote || !quote.id || !quote.expiresAt) throw new Error('Invalid transaction quote');
   if (new Date(now).getTime() >= new Date(quote.expiresAt).getTime()) throw new Error('Transaction quote has expired');
@@ -447,4 +480,5 @@ module.exports = {
   QuoteIdentityReplayError,
   assertQuoteActive,
   roundMoney,
+  getPersistedTransactionQuoteExact,
 };

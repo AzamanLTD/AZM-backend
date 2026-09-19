@@ -50,6 +50,35 @@ paid never enters the GHS ledger books; no realized cost basis or spread exists.
 
 ## 2. The P5-E accounting model (Model B settlement, flag ON)
 
+### 2.0 Service-level authority binding (audit r1)
+
+The exported primitive `settleDepositFromInventory` NEVER trusts its caller —
+not even the mounted controllers. Inside the same caller-owned transaction,
+BEFORE the inventory claim, it re-verifies every caller-supplied value against
+the PERSISTED authorities:
+
+- the settled `TransactionHistory` row: `txHash === reference`, `type =
+  DEPOSIT_FIAT`, `userId` match, `status = COMPLETED`, `amountUsdc === settledUsdc`
+  exactly (the committed 8dp amount);
+- the exact persisted `TransactionQuote` (raw-SQL boundary, exact decimal strings —
+  never `Number()` projections): `id`, `userId`, `purpose`, `consumedAt != null`,
+  `consumedFor = 'deposit'`, persisted `amountGhs`/`rateGhsPerUsdc` exactly equal the
+  supplied quote economics, the persisted `usdcAmount` projected once at 8dp HALF_UP
+  equals BOTH the supplied `quotedUsdc` and the committed `settledUsdc`, and the
+  persisted route identity (`selectedRoute`, `routeProviderRail`,
+  `routePolicyVersion`) exactly equals the supplied route;
+- **Model B requires exact pesewa equality** between the evidenced settled GHS and
+  the persisted quote amount (`MODEL_B_SETTLED_GHS_MISMATCH`). The ±0.01 surface
+  tolerance is a flag-OFF legacy affordance ONLY — under the Model B regime both
+  mounted surfaces enforce exact Decimal equality before any mutation;
+- the durable provider evidence: `FiatProviderEvent.provider === provider` and,
+  when supplied, `providerRef` exact match — a different provider's or provider
+  reference's observation can never vouch for this settlement.
+
+Every mismatch fails closed with zero mutation (proven per-case in suite G, direct
+primitive, identical pre/post snapshots). The durable `ModelBSettlement` row
+therefore links ONLY these verified persisted identities.
+
 One caller-owned `$transaction` per settlement on both surfaces. Existing P5-C/P5-D
 steps are preserved verbatim (out-of-band evidence persistence BEFORE settlement;
 quote consume; route-binding assert; exact-pesewa match; CAS claim; projection
@@ -57,8 +86,32 @@ increment; P5-D receipt under its own flag). P5-E replaces ONLY the bridge posti
 
 ### 2.1 Inventory claim (FIFO — the explicit cost-flow policy)
 
+### 2.1a Inventory acquisition authority (the r1 audit — structural darkness)
+
+Audited finding: **no production-callable inventory acquisition path exists.**
+`inventoryService.acquireLot` has zero production callers (tests only); lots can
+enter the system today ONLY through test fixtures or direct DB writes. There is
+consequently no authoritative acquisition-evidence row, and inventing one (e.g.
+caller-attested "corporate purchase" evidence) would be a new financial story —
+forbidden (planning §5, audit r1).
+
+The gate that makes this structural rather than flag-dependent:
+`InventoryLot.eligibleForModelBSettlement` (Boolean, **default `false`**).
+
+- Model B settlement claims **ONLY eligible lots**; ineligible quantity does not
+  even count toward availability. Quantity alone can NEVER fund a real customer
+  USDC liability.
+- No production code path grants eligibility. Only a future, narrowly scoped,
+  evidence-backed acquisition authority (its own wave, its own evidence contract)
+  may set it — until then Model B stays dark **by construction**, not by flag
+  discipline alone.
+- Proven in suite I: acquireLot lots are ineligible by default; an ineligible
+  500-USDC lot cannot fund a 7.45-USDC settlement (fail closed, zero mutation);
+  the same deposit settles ONLY after an explicit eligibility grant.
+
 **Policy contract (documented here per the planning investigation §5):** consumed
-lot quantity is allocated **FIFO by `(createdAt, id)`** across `OPEN` lots. Rationale:
+lot quantity is allocated **FIFO by `(createdAt, id)`** across eligible `OPEN`
+lots. Rationale:
 FIFO realizes the oldest acquisition cost first — the conservative, conventional
 default for currency-like inventory on an immutable-lot substrate (no revaluation,
 no LIFO jurisdiction complications, no average-cost recomputation under concurrency);
@@ -133,12 +186,19 @@ New table `ModelBSettlement` (unique `reference` — the durable economic identi
   caller-asserted)
 - settled economics: `settledGhs` (2dp exact), `settledUsdc` (8dp exact)
 - inventory cost basis: `lotAllocations` JSON — per consumed lot: `{lotId,
-  acquisitionKey, quantity, lotCostBasisGhs, lotQuantityOriginal, costShareGhs,
-  remainingAfter}` — plus `costBasisGhsTotal`
+  acquisitionKey, quantity, lotCostBasisGhs, lotQuantityOriginal, costShareGhs`
+  (the recorded 8dp share), `shareResidualGhs` (the TRUE 12dp residual),
+  `remainingAfter}` — plus `costBasisGhsTotal`, the EXACT sum of the RECORDED 8dp
+  shares (the record and its total can never disagree)
 - allocation exactness: a fully-consumed lot's `costShareGhs` is its `costBasisGhs`
   EXACTLY (no arithmetic); only a partially-consumed tail lot is prorated
-  (`basis × q / original`, Decimal HALF_UP at 8dp) and any sub-8dp residual is
-  recorded explicitly in `costAllocationResidualGhs`. The exact rational inputs
+  (`basis × q / original`, projected ONCE at 8dp HALF_UP) and the TRUE sub-8dp
+  residual (`shareExact − costShare8`, never re-rounded to 8dp) is recorded
+  explicitly in `costAllocationResidualGhs` (Decimal(20,12), the residual precision)
+  and per-allocation `shareResidualGhs`. Auditable identity: `costShareGhs +
+  shareResidualGhs == shareExact` exactly whenever the residual is representable at
+  12dp (proven in suite J with the engineered 9-decimal residual −0.000000005).
+  The exact rational inputs
   (`basis`, `original`, `q`) are all durable, so the allocation is auditable to
   the ledger's own precision with nothing hidden.
 - customer spread: `marginGhs = settledGhs − costBasisGhsTotal` (exact Decimal
@@ -193,9 +253,11 @@ hidden.
 
 ## 4. Failure semantics (all proven with zero partial financial mutation)
 
-Evidence: missing durable provider observation, mismatched GHS amount (beyond the
-existing ±0.01 pesewa gate), wrong quote identity, wrong route/provider surface,
-stale/expired quote, contradictory provider outcome. Inventory: insufficient
+Evidence: missing durable provider observation, mismatched provider identity or
+providerRef, mismatched GHS amount (Model B: ANY pesewa difference; the ±0.01 gate
+survives only flag-OFF), wrong quote identity/economics/route (service-level
+binding), wrong TransactionHistory identity/amount, stale/expired or unconsumed
+quote, contradictory provider outcome. Inventory: insufficient
 remaining. Identity: conflicting settlement reuse. Every failure throws inside the
 caller-owned transaction — nothing commits.
 

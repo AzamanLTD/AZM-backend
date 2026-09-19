@@ -15,6 +15,8 @@ const {
 const fiatLiquidity = require('../src/services/fiatLiquidityService'); // §P.5-D
 const modelBSettlement = require('../services/modelBSettlementService'); // §P.5-E
 const routePolicy = require('../src/services/routePolicyService');
+const { Prisma } = require('@prisma/client');
+const Decimal = Prisma.Decimal;
 
 // §P.5-C: rails are owned by the versioned route policy — this set mirrors
 // MOOLRE_MOMO_COLLECTION rails so controller and policy can never drift.
@@ -285,7 +287,12 @@ exports.webhook = async (req, res) => {
       routePolicy.assertSettlementRouteAllowed({ quote, settlementSurface: 'MOOLRE_WEBHOOK' });
 
       const quotedGhs = Number(quote.amountGhs);
-      if (Math.abs(settledGhs - quotedGhs) > 0.01) {
+      // §P.5-E Model B authority: exact pesewa equality against the quote —
+      // 99.99/100.01 against a 100.00 quote fail closed BEFORE any mutation;
+      // the ±0.01 tolerance is the flag-OFF legacy affordance only (audit r1).
+      if (modelBOn
+        ? new Decimal(settledGhs).toFixed(2) !== new Decimal(quotedGhs).toFixed(2)
+        : Math.abs(settledGhs - quotedGhs) > 0.01) {
         throw new Error('Settled GHS amount does not match the transaction quote');
       }
 

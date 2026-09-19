@@ -13,6 +13,8 @@ const {
 const fiatLiquidity = require('../src/services/fiatLiquidityService'); // §P.5-D
 const modelBSettlement = require('../services/modelBSettlementService'); // §P.5-E
 const routePolicy = require('../src/services/routePolicyService');
+const { Prisma } = require('@prisma/client');
+const Decimal = Prisma.Decimal;
 
 const FIAT_REF_PREFIX = 'FIAT_DEPOSIT_';
 // §P.5-C: rails are owned by the versioned route policy — the controller set
@@ -183,7 +185,14 @@ exports.webhook = async (req, res) => {
       // mutation. Historical quotes without a selectedRoute still settle.
       routePolicy.assertSettlementRouteAllowed({ quote, settlementSurface: 'GENERIC_FIAT_WEBHOOK' });
       const quotedGhs = Number(quote.amountGhs);
-      if (Math.abs(settledGhs - quotedGhs) > 0.01) throw new Error('Settled GHS amount does not match the transaction quote');
+      // §P.5-E Model B authority: exact pesewa equality against the quote —
+      // 99.99/100.01 against a 100.00 quote fail closed BEFORE any mutation;
+      // the ±0.01 tolerance is the flag-OFF legacy affordance only (audit r1).
+      if (modelBOn
+        ? new Decimal(settledGhs).toFixed(2) !== new Decimal(quotedGhs).toFixed(2)
+        : Math.abs(settledGhs - quotedGhs) > 0.01) {
+        throw new Error('Settled GHS amount does not match the transaction quote');
+      }
       const user = await tx.user.findUnique({ where: { id: existing.userId } });
       if (!user) throw new Error('User no longer exists for this deposit.');
       const updatedTx = await tx.transactionHistory.update({ where: { id: existing.id }, data: { status: 'COMPLETED', amountUsdc: quote.usdcAmount, payerMsisdn: existing.payerMsisdn || null, metadata: { ...(existing.metadata || {}), providerTxId: providerTxId || null, settledAmountGhs: settledGhs, settledAt: new Date().toISOString(), settlementRate: quote.rateGhsPerUsdc, settledRoute: quote.selectedRoute || null, settledRoutePolicyVersion: quote.routePolicyVersion || null } } });

@@ -47,3 +47,12 @@ ALTER TABLE "ModelBSettlement" ADD CONSTRAINT "ModelBSettlement_amounts_positive
     CHECK ("quotedGhs" > 0 AND "settledGhs" > 0 AND "quotedUsdc" > 0 AND "settledUsdc" > 0);
 ALTER TABLE "ModelBSettlement" ADD CONSTRAINT "ModelBSettlement_quote_consistency"
     CHECK ("quotedRateGhsPerUsdc" > 0);
+
+-- §P.5-E audit r1: structural inventory-authority gate. Eligibility is false
+-- by default and granted by no production code path — only a future,
+-- evidence-backed acquisition authority may set it. Model B settlement claims
+-- ONLY eligible lots; quantity alone can never fund a customer liability.
+ALTER TABLE "InventoryLot"
+    ADD COLUMN IF NOT EXISTS "eligibleForModelBSettlement" BOOLEAN NOT NULL DEFAULT false;
+CREATE INDEX IF NOT EXISTS "InventoryLot_eligible_status_idx"
+    ON "InventoryLot"("eligibleForModelBSettlement", "status");
