@@ -217,7 +217,14 @@ itself — no caller's say-so is trusted:
   `markReservationInTransit`). Convergence may therefore ENRICH a committed
   null ref with the reference a retry now carries (strictly additive
   durable evidence; `receivedAt`/`status`/`amountGhs` stay exactly as
-  committed) and never downgrades a committed ref. This is NOT a weakening
+  committed) and never downgrades a committed ref. The enrichment claim is a
+  database-enforced COMPARE-AND-SET on the NULL slot (audit r11): under
+  concurrency, exactly ONE different present ref can ever win the slot — a
+  concurrent loser converges only onto the winner's ref, or is rejected as
+  contradictory evidence and retained under its deterministic conflict
+  identity. The enrichment is therefore never last-writer-wins, and the
+  durable provider identity is deterministic under real PostgreSQL
+  concurrency. This is NOT a weakening
   of provider-reference binding: a PRESENT ref must match exactly —
   committed `PTX-1` vs incoming `PTX-2` is still contradictory evidence.
   Producers of optional refs are real: the generic deposit webhook's

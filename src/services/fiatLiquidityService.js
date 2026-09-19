@@ -161,7 +161,14 @@ const OBSERVATION_SEMANTIC_FIELDS = ['provider', 'rail', 'direction', 'status', 
 //                                       (strictly additive durable evidence;
 //                                       committed semantic claims are never
 //                                       changed — receivedAt, status, amount
-//                                       stay exactly as committed)
+//                                       stay exactly as committed). The
+//                                       enrichment claim is a database-
+//                                       enforced compare-and-set on the NULL
+//                                       slot (audit r11): under concurrency,
+//                                       exactly ONE different present ref can
+//                                       ever win — the loser converges only
+//                                       onto the winner's ref, or is rejected
+//                                       as contradictory evidence
 //   committed ref   + incoming null   → CONVERGE (the retry simply carries
 //                                       less detail; the committed ref is
 //                                       never downgraded)
@@ -186,8 +193,14 @@ const observationSemanticsMatch = (a, b) =>
     OBSERVATION_SEMANTIC_FIELDS.every((f) =>
         f === 'providerRef' ? !providerRefClaimsDiffer(a, b) : (a[f] ?? null) === (b[f] ?? null));
 
+// Material-difference reporting follows the adopted contract (audit r10/r11):
+// a null-vs-present providerRef difference is legitimate enrichment, NOT a
+// contradiction — it must never be reported as a differing field alongside a
+// real contradiction. providerRef is listed only when both sides are PRESENT
+// and different. All other semantic fields compare exactly as before.
 const observationSemanticDiffs = (a, b) =>
-    OBSERVATION_SEMANTIC_FIELDS.filter((f) => (a[f] ?? null) !== (b[f] ?? null));
+    OBSERVATION_SEMANTIC_FIELDS.filter((f) =>
+        f === 'providerRef' ? providerRefClaimsDiffer(a, b) : (a[f] ?? null) !== (b[f] ?? null));
 
 // Deterministic conflict identity for a contradictory observation: derived
 // ONLY from the semantic fields of the incoming payload, so the same
@@ -199,6 +212,43 @@ const conflictingObservationDedupKey = (dedupKey, semantics) => {
     const fingerprint = crypto.createHash('sha256').update(canonical).digest('hex').slice(0, 16);
     return `${dedupKey}:CONFLICT:${fingerprint}`;
 };
+
+// ── concurrency-safe null→present enrichment (audit r11) ────────────────────
+// Enrichment is a database-enforced COMPARE-AND-SET on the NULL slot: the
+// WHERE clause `providerRef: null` means exactly ONE concurrent caller can
+// ever claim it. An unconditional update() here would be last-writer-wins —
+// two concurrent retries carrying DIFFERENT present refs would each see NULL,
+// each overwrite, and the durable identity would depend on timing. Instead:
+//   * claim.count === 1 → this caller performed the unique enrichment;
+//   * claim.count === 0 → re-read the AUTHORITATIVE row:
+//       - same ref as ours           → converge (the winner wrote our ref);
+//       - still unexpectedly NULL    → replay untouched — never blindly
+//                                      overwrite (the concurrent claim may
+//                                      have rolled back; a later legitimate
+//                                      retry can still enrich);
+//       - a DIFFERENT present ref    → CONTRADICTION under the strict
+//                                      present→different-present rule — the
+//                                      conflicting observation is retained
+//                                      under its deterministic conflict
+//                                      identity and the call fails closed.
+async function enrichProviderRefObservation(prisma, existing, incomingProviderRef, failClosedOnConflict) {
+    const incomingRef = String(incomingProviderRef);
+    const claimed = await prisma.fiatProviderEvent.updateMany({
+        where: { id: existing.id, providerRef: null },
+        data: { providerRef: incomingRef },
+    });
+    if (claimed.count === 1) {
+        return { event: await prisma.fiatProviderEvent.findUnique({ where: { id: existing.id } }), replay: true };
+    }
+    const authoritative = await prisma.fiatProviderEvent.findUnique({ where: { id: existing.id } });
+    if (!authoritative) {
+        throw new Error('[fiatLiquidity] provider observation identity lost during providerRef enrichment');
+    }
+    if (authoritative.providerRef == null || String(authoritative.providerRef) === incomingRef) {
+        return { event: authoritative, replay: true };
+    }
+    await failClosedOnConflict(authoritative);
+}
 
 // ─── raw provider evidence (append-only, replay only on semantic match) ─────
 //
@@ -276,11 +326,14 @@ async function recordProviderEvent(prisma, {
             // exception (audit r10): a committed observation recorded WITHOUT
             // a provider reference may be ENRICHED with the reference a retry
             // now carries — mirroring markReservationInTransit's fill-in. A
-            // committed reference is never downgraded or changed.
-            const event = (existing.providerRef == null && semantics.providerRef != null)
-                ? await prisma.fiatProviderEvent.update({ where: { id: existing.id }, data: { providerRef: semantics.providerRef } })
-                : existing;
-            return { event, replay: true };
+            // committed reference is never downgraded or changed. The
+            // enrichment itself is a database-enforced compare-and-set (audit
+            // r11): concurrent retries carrying different refs can never
+            // collapse into last-writer-wins.
+            if (existing.providerRef == null && semantics.providerRef != null) {
+                return enrichProviderRefObservation(prisma, existing, semantics.providerRef, failClosedOnConflict);
+            }
+            return { event: existing, replay: true };
         }
         // A materially different payload under a committed identity is
         // contradictory evidence — retain it durably and fail closed.
@@ -307,10 +360,14 @@ async function recordProviderEvent(prisma, {
             const raced = await prisma.fiatProviderEvent.findUnique({ where: { dedupKey } });
             if (!raced) throw new Error('[fiatLiquidity] provider event identity lost after race');
             if (observationSemanticsMatch(observationSemantics(raced), semantics)) {
-                const event = (raced.providerRef == null && semantics.providerRef != null)
-                    ? await prisma.fiatProviderEvent.update({ where: { id: raced.id }, data: { providerRef: semantics.providerRef } })
-                    : raced;
-                return { event, replay: true };
+                // Same enrichment exception as the sequential path — and the
+                // same compare-and-set (audit r11): this branch can race a
+                // concurrent enrichment of the row the winner committed, so
+                // the NULL-slot claim must be database-enforced here too.
+                if (raced.providerRef == null && semantics.providerRef != null) {
+                    return enrichProviderRefObservation(prisma, raced, semantics.providerRef, failClosedOnConflict);
+                }
+                return { event: raced, replay: true };
             }
             await failClosedOnConflict(raced);
         }

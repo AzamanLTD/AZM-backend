@@ -1729,6 +1729,75 @@ describeOrSkip('§P.5-D evidence-backed GHS liquidity authority (real PostgreSQL
             expect(conflicts[0].providerRef).toBe('PTX-2');
         });
 
+        test('r11: concurrent null→present enrichment is a COMPARE-AND-SET — two concurrent different refs can never collapse into last-writer-wins (real PostgreSQL race)', async () => {
+            // Commit the observation with providerRef = NULL (exactly the
+            // state a legitimate generic callback whose providerTxId was
+            // absent leaves behind), then fire TWO CONCURRENT enrichment
+            // retries carrying DIFFERENT present refs. The durable identity
+            // must be deterministic: ONE ref wins, the loser is rejected as
+            // contradictory evidence and durably retained — never a
+            // last-writer-wins overwrite.
+            const committed = await fiatLiquidity.recordProviderEvent(prisma, { ...baseObservation, providerRef: null });
+            expect(committed.replay).toBe(false);
+            expect(committed.event.providerRef).toBeNull();
+
+            const outcomes = await Promise.allSettled([
+                fiatLiquidity.recordProviderEvent(prisma, { ...baseObservation, providerRef: 'PTX-A' }),
+                fiatLiquidity.recordProviderEvent(prisma, { ...baseObservation, providerRef: 'PTX-B' }),
+            ]);
+            const winner = outcomes.find((o) => o.status === 'fulfilled');
+            const loser = outcomes.find((o) => o.status === 'rejected');
+            expect(winner).toBeDefined();
+            expect(loser).toBeDefined(); // the loser is NEVER silently converged
+
+            // exactly ONE durable primary observation row exists under the
+            // original identity — and it carries exactly ONE winning ref
+            const primaries = await prisma.fiatProviderEvent.findMany({ where: { relatedReference: 'R-T', dedupKey: { not: { contains: ':CONFLICT:' } } } });
+            expect(primaries).toHaveLength(1);
+            const primary = primaries[0];
+            expect(primary.id).toBe(committed.event.id); // the committed row, never a new one
+            expect(['PTX-A', 'PTX-B']).toContain(primary.providerRef);
+            const winningRef = primary.providerRef;
+            const losingRef = winningRef === 'PTX-A' ? 'PTX-B' : 'PTX-A';
+
+            // the loser was rejected with the typed contradiction error
+            expect(loser.reason).toMatchObject({
+                code: 'LIQUIDITY_CONFLICTING_EVIDENCE',
+                details: { dedupKey: baseObservation.dedupKey, differingFields: ['providerRef'] },
+            });
+
+            // the contradictory observation is durably retained under its
+            // deterministic conflict identity — carrying the LOSING ref
+            const conflictRows = await prisma.fiatProviderEvent.findMany({ where: { relatedReference: 'R-T', dedupKey: { contains: ':CONFLICT:' } } });
+            expect(conflictRows).toHaveLength(1);
+            expect(conflictRows[0].providerRef).toBe(losingRef);
+
+            // an exact retry of the LOSING ref converges to the SAME conflict
+            // row — no second row, no growth, no overwrite of the winner
+            const losingRetry = await fiatLiquidity.recordProviderEvent(prisma, { ...baseObservation, providerRef: losingRef }).catch((e) => e);
+            expect(losingRetry).toMatchObject({ code: 'LIQUIDITY_CONFLICTING_EVIDENCE' });
+            const conflictRowsAfter = await prisma.fiatProviderEvent.findMany({ where: { relatedReference: 'R-T', dedupKey: { contains: ':CONFLICT:' } } });
+            expect(conflictRowsAfter).toHaveLength(1);
+            expect(conflictRowsAfter[0].id).toBe(conflictRows[0].id);
+            expect(conflictRowsAfter[0].providerRef).toBe(losingRef);
+
+            // the primary committed row remains EXACTLY the winner's claim
+            const primaryAfter = await prisma.fiatProviderEvent.findUnique({ where: { dedupKey: baseObservation.dedupKey } });
+            expect(primaryAfter.providerRef).toBe(winningRef);
+            expect(primaryAfter.status).toBe('SUCCESSFUL');
+            expect(primaryAfter.amountGhs.toString()).toBe('100');
+            expect(new Date(primaryAfter.receivedAt).getTime()).toBe(new Date(committed.event.receivedAt).getTime());
+
+            // an exact retry of the WINNING ref converges as a plain replay
+            const winningRetry = await fiatLiquidity.recordProviderEvent(prisma, { ...baseObservation, providerRef: winningRef });
+            expect(winningRetry.replay).toBe(true);
+            expect(winningRetry.event.id).toBe(primary.id);
+
+            // total durable rows: one primary + one conflict — no generic
+            // financial mutation is involved anywhere in this contract
+            expect(await prisma.fiatProviderEvent.count({ where: { relatedReference: 'R-T' } })).toBe(2);
+        });
+
         test('15: two materially different provider observations can NEVER collapse into one silently — exact retries converge, distinct statuses are distinct rows', async () => {
             // the generic webhook surface identity shape: status-scoped keys
             const ref = 'R-T15';
