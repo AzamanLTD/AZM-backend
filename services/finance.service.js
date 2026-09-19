@@ -130,14 +130,26 @@ const processFiatWithdrawal = async (prisma, userId, amountFloat, opts = {}) => 
         throw err;
     }
 
-    const fiatPool = await prisma.systemFiatPool.findUnique({ where: { id: 1 } });
-    if (!fiatPool || Number(fiatPool.balance) < amountFloat) {
-        const err = new Error(
-            'MoMo payouts are temporarily at capacity. Your USDC has not been deducted. ' +
-            'Please try again in a few minutes or contact support.'
-        );
-        err.code = 'FIAT_POOL_INSUFFICIENT';
-        throw err;
+    // §P.5-D preflight split: with the liquidity authority OFF, the legacy
+    // SystemFiatPool (a USDC-unit scalar in that mode) preflight stays
+    // byte-identical. With the authority ON, SystemFiatPool is only a
+    // derived GHS projection — comparing it against a USDC amount here is
+    // unit-nonsense that could false-reject or false-admit a withdrawal on
+    // stale/legacy data. The authoritative liquidity decision is the atomic
+    // fiatLiquidity.reserveForPayout() claim inside the transaction below,
+    // which fails closed (FIAT_POOL_INSUFFICIENT, identical user-facing
+    // message) and rolls back the user debit when the exact payoutGhs
+    // cannot be claimed from FiatLiquidityState.availableGhs.
+    if (!liquidityAuthorityOn) {
+        const fiatPool = await prisma.systemFiatPool.findUnique({ where: { id: 1 } });
+        if (!fiatPool || Number(fiatPool.balance) < amountFloat) {
+            const err = new Error(
+                'MoMo payouts are temporarily at capacity. Your USDC has not been deducted. ' +
+                'Please try again in a few minutes or contact support.'
+            );
+            err.code = 'FIAT_POOL_INSUFFICIENT';
+            throw err;
+        }
     }
 
     const result = await prisma.$transaction(async (tx) => {

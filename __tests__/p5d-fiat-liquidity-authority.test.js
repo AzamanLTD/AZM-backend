@@ -1045,6 +1045,51 @@ describeOrSkip('§P.5-D evidence-backed GHS liquidity authority (real PostgreSQL
             expect(dec(s.reservedGhs)).toBe(134.20);
             expect(await pool()).toBe(1000 - 134.20); // projection follows the authority now
         });
+
+        test('authority ON: a stale/manipulated SystemFiatPool can neither false-reject nor false-authorize a withdrawal', async () => {
+            const financeService = require('../services/finance.service');
+            await seedFreshRates(); // 13.42
+            await setAuthorityFlag(true);
+            await seedAvailable({ amountGhs: 1000 }); // genuine AVAILABLE liquidity
+
+            // (1) FALSE REJECTION impossible: the compatibility pool reads 0 —
+            // the legacy USDC preflight would reject every withdrawal. Under
+            // the authority the withdrawal must succeed on the GHS claim alone.
+            await prisma.systemFiatPool.update({ where: { id: 1 }, data: { balance: 0 } });
+            const u1 = await seedUser(prisma, { availableBalance: 1000 });
+            const ref1 = `FIAT_OUT_POOL_ZERO_${u1.id}`;
+            const out1 = await financeService.processFiatWithdrawal(prisma, u1.id, 20, {
+                reference: ref1, retailRate: 13.42, liquidityRoute: { provider: 'MTN_MOMO', destination: '0244' },
+            });
+            expect(out1.reference).toBe(ref1);
+            const rz1 = await prisma.fiatLiquidityReservation.findUnique({ where: { reference: ref1 } });
+            expect(rz1).not.toBeNull();
+            expect(rz1.status).toBe('RESERVED');
+            expect(dec(rz1.amountGhs)).toBe(268.40); // 20 USDC × 13.42 — exact pesewas
+            const s1 = await state();
+            expect(dec(s1.availableGhs)).toBeCloseTo(1000 - 268.40, 2);
+            expect(dec(s1.reservedGhs)).toBeCloseTo(268.40, 2);
+
+            // (2) FALSE AUTHORIZATION impossible: the compatibility pool claims
+            // 1,000,000 (the legacy preflight would admit anything) while the
+            // authority has only 10 claimable GHS — the withdrawal must fail
+            // closed with nothing deducted and nothing recorded.
+            await prisma.systemFiatPool.update({ where: { id: 1 }, data: { balance: 1000000 } });
+            await prisma.fiatLiquidityState.update({ where: { id: 1 }, data: { availableGhs: 10 } });
+            const u2 = await seedUser(prisma, { availableBalance: 1000 });
+            const ref2 = `FIAT_OUT_POOL_FAT_${u2.id}`;
+            await expect(
+                financeService.processFiatWithdrawal(prisma, u2.id, 500, {
+                    reference: ref2, retailRate: 13.42, liquidityRoute: { provider: 'MTN_MOMO', destination: '0244' },
+                }),
+            ).rejects.toMatchObject({ code: 'FIAT_POOL_INSUFFICIENT' });
+            const u2After = await prisma.user.findUnique({ where: { id: u2.id } });
+            expect(dec(u2After.availableBalance)).toBe(1000); // nothing deducted
+            expect(await prisma.transactionHistory.count({ where: { txHash: ref2 } })).toBe(0);
+            expect(await prisma.fiatLiquidityReservation.count({ where: { reference: ref2 } })).toBe(0);
+            const s2 = await state();
+            expect(dec(s2.availableGhs)).toBe(10); // untouched — the pool scalar had no say
+        });
     });
 
     // =========================================================================
@@ -1242,7 +1287,7 @@ describeOrSkip('§P.5-D evidence-backed GHS liquidity authority (real PostgreSQL
             const results = await worker._processBatch(settings, { isManualTrigger: true });
             expect(results.flagged).toBe(1);
             expect(results.details.flaggedManualReview).toHaveLength(1);
-            expect(results.details.flaggedManualReview[0].reason).toBe('INSUFFICIENT_AUTHORITATIVE_GHS');
+            expect(results.details.flaggedManualReview[0].reason).toBe('AUTHORITY_HEADROOM_BELOW_THRESHOLD');
             expect(results.processed).toBe(0);
             const flagged = await prisma.withdrawal.findFirst({ where: { userId: user.id } });
             expect(flagged.status).toBe('NEEDS_MANUAL_REVIEW');
@@ -1270,6 +1315,62 @@ describeOrSkip('§P.5-D evidence-backed GHS liquidity authority (real PostgreSQL
             expect(dispatched.referenceId).toBeDefined();
             const ev = await prisma.fiatProviderEvent.findFirst({ where: { direction: 'OUTBOUND', relatedReference: dispatched.referenceId } });
             expect(ev).not.toBeNull();
+        });
+
+        test('authority ON: a P5-D-reserved withdrawal dispatches with exactly ONE reservation and NO second GHS decrement', async () => {
+            const financeService = require('../services/finance.service');
+            await seedFreshRates(); // 13.42
+            await setAuthorityFlag(true);
+            const settings = await workerSettings({ threshold: 100, max: 5000 }); // floor: 100 USDC ≡ 1342 GHS
+            const worker = buildWorker();
+            worker.mtn = { initiateTransfer: jest.fn().mockResolvedValue({ status: 'ACCEPTED', data: { reference: 'MTN-Q5' }, providerRef: 'MTN-Q5' }) };
+
+            await seedAvailable({ amountGhs: 2000 });
+            const user = await seedUser(prisma, { availableBalance: 1000 });
+
+            // 1. the REAL authority path creates the GHS reservation and the
+            //    canonical PENDING TransactionHistory row (same reference).
+            const reference = `FIAT_OUT_WORKER_${user.id}`;
+            await financeService.processFiatWithdrawal(prisma, user.id, 20, { reference, retailRate: 13.42, liquidityRoute: { provider: 'MTN_MOMO', destination: '0241234567' } });
+            const th = await prisma.transactionHistory.findUnique({ where: { txHash: reference } });
+            expect(th).not.toBeNull();
+
+            const rzAfterCreate = await prisma.fiatLiquidityReservation.findUnique({ where: { reference } });
+            expect(rzAfterCreate).not.toBeNull();
+            expect(rzAfterCreate.status).toBe('RESERVED');
+            expect(dec(rzAfterCreate.amountGhs)).toBe(268.40); // 20 USDC × 13.42
+
+            const stateAfterCreate = await state();
+            const availableAfterCreate = dec(stateAfterCreate.availableGhs);
+            expect(availableAfterCreate).toBeCloseTo(2000 - 268.40, 2);
+            expect(dec(stateAfterCreate.reservedGhs)).toBeCloseTo(268.40, 2);
+
+            // 2. the PENDING Withdrawal row the worker scans (fallback
+            //    canonical match: same user/amount/createdAt window).
+            await prisma.withdrawal.create({
+                data: {
+                    userId: user.id, amount: 20, status: 'PENDING',
+                    payoutMethod: 'MTN_MOMO', destination: '0241234567',
+                    network: 'MTN', createdAt: th.createdAt,
+                },
+            });
+
+            // 3. the worker dispatches it — with the reservation ALREADY present.
+            const results = await worker._processBatch(settings, { isManualTrigger: true });
+            expect(results.processed).toBe(1);
+            expect(results.details.flaggedManualReview).toHaveLength(0);
+
+            // 4. exactly one liquidity reservation exists for the payout.
+            const allRz = await prisma.fiatLiquidityReservation.findMany({ where: { reference } });
+            expect(allRz).toHaveLength(1);
+
+            // 5. available GHS was NOT decremented a second time by the
+            //    dispatch: the reservation amount moved reserved → in-transit
+            //    only. GHS is compared with GHS throughout.
+            const s2 = await state();
+            expect(dec(s2.availableGhs)).toBeCloseTo(availableAfterCreate, 2);
+            expect(dec(s2.reservedGhs)).toBeCloseTo(0, 2);
+            expect(dec(s2.inTransitGhs)).toBeCloseTo(268.40, 2);
         });
 
         test('authority OFF: legacy USDC pool comparison is byte-identical (INSUFFICIENT_POOL_LIQUIDITY on a drained pool)', async () => {

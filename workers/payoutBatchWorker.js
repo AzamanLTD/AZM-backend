@@ -262,22 +262,26 @@ class PayoutBatchWorker {
             }
 
             if (liquidityAuthorityOn) {
-                // Authority regime: the withdrawal was ALREADY reserved by
-                // processFiatWithdrawal (its FiatLiquidityReservation claimed
-                // the exact GHS amount) — this is the global remaining-liquidity
-                // policy gate in GHS, never a second reservation.
-                const withdrawalGhs = fiatLiquidity.toExactGhsDecimal(
-                    new Prisma.Decimal(amount).times(liveRate).toFixed(2)
-                );
-                if (remainingLiquidityGhs.lt(thresholdGhs) || remainingLiquidityGhs.lt(withdrawalGhs)) {
-                    await this._flagForManualReview(withdrawal, 'INSUFFICIENT_AUTHORITATIVE_GHS', {
+                // Authority regime: the payout's exact GHS was ALREADY claimed
+                // atomically from FiatLiquidityState.availableGhs by
+                // processFiatWithdrawal (its FiatLiquidityReservation), so
+                // dispatching it consumes NO further available liquidity —
+                // the RESERVED → IN_TRANSIT transition moves reservedGhs to
+                // inTransitGhs and never touches availableGhs. This gate is
+                // therefore purely an OPERATIONAL POLICY (hold back payouts
+                // once remaining headroom drops below the configured
+                // floor). It is NOT a capacity claim for this payout: a
+                // second availableGhs-vs-withdrawalGhs comparison would
+                // double-count the already-reserved amount and could
+                // false-hold a fully reserved, fully backed payout.
+                if (remainingLiquidityGhs.lt(thresholdGhs)) {
+                    await this._flagForManualReview(withdrawal, 'AUTHORITY_HEADROOM_BELOW_THRESHOLD', {
                         amount,
-                        amountGhs: withdrawalGhs.toString(),
                         availableGhs: remainingLiquidityGhs.toString(),
                         thresholdGhs: thresholdGhs.toString(),
-                        message: `Authoritative GHS liquidity (${remainingLiquidityGhs.toFixed(2)}) below threshold (${thresholdGhs.toFixed(2)}) or insufficient for the payout`
+                        message: `Operational hold: remaining authoritative GHS liquidity (${remainingLiquidityGhs.toFixed(2)}) below the configured payout floor (${thresholdGhs.toFixed(2)})`
                     });
-                    results.flaggedManualReview.push({ id: withdrawal.id, reason: 'INSUFFICIENT_AUTHORITATIVE_GHS', amount, availableGhs: remainingLiquidityGhs.toString() });
+                    results.flaggedManualReview.push({ id: withdrawal.id, reason: 'AUTHORITY_HEADROOM_BELOW_THRESHOLD', amount, availableGhs: remainingLiquidityGhs.toString() });
                     continue;
                 }
             } else if (runningPoolBalance < threshold || runningPoolBalance < amount) {
@@ -379,9 +383,13 @@ class PayoutBatchWorker {
                 }
 
                 // Track remaining liquidity in the active regime's unit.
-                if (liquidityAuthorityOn) {
-                    remainingLiquidityGhs = remainingLiquidityGhs.minus(amountGhs);
-                } else {
+                // Authority regime: NO gauge decrement. The dispatched payout's
+                // GHS was already removed from availableGhs at reservation
+                // time; IN_TRANSIT moves reservedGhs → inTransitGhs without
+                // touching availableGhs, so the policy gauge keeps mirroring
+                // FiatLiquidityState.availableGhs for the rest of the batch.
+                // Subtracting amountGhs here would decrement GHS a second time.
+                if (!liquidityAuthorityOn) {
                     runningPoolBalance -= amount;
                 }
 

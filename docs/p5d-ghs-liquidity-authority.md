@@ -84,6 +84,20 @@ economics.
    blanket "positive = credit" recomputation counts settled withdrawals as credits.
    Fixed by interpreting withdrawal types as debits. No historical data is rewritten; no
    other reader changes.
+3. **`processFiatWithdrawal` preflight unit mismatch (GHS vs USDC):** the legacy
+   `SystemFiatPool` preflight also ran with the authority flag ON — comparing the
+   GHS-denominated projection scalar against the USDC withdrawal amount. That is
+   meaningless arithmetic: a stale/manipulated pool could false-reject a fully
+   GHS-backed withdrawal (pool 0) or false-admit one the authority could not cover
+   (pool 1,000,000). Fixed: with the authority ON the scalar preflight is skipped
+   entirely — the liquidity decision is the atomic `reserveForPayout()` claim on the
+   exact `payoutGhs` (identical `FIAT_POOL_INSUFFICIENT` failure surface); with the
+   flag OFF the legacy USDC preflight stays byte-identical. The auto-payout worker's
+   authority gate is now a pure operational headroom policy (threshold converted to
+   GHS at the live rate), and the post-dispatch gauge no longer subtracts an
+   already-reserved payout's GHS a second time (RESERVED → IN_TRANSIT never touches
+   `availableGhs`). Both regimes have real-PG regression proofs with a
+   stale/manipulated pool and an already-reserved payout.
 
 ---
 
