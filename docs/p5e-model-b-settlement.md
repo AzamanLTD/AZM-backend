@@ -203,7 +203,18 @@ New table `ModelBSettlement` (unique `reference` — the durable economic identi
 - route identity: `selectedRoute`, `routeProviderRail`, `routePolicyVersion`
 - provider evidence: `provider`, `providerRef`, `evidenceDedupKey` (the
   `FiatProviderEvent.dedupKey` of the durable INBOUND observation — verified, not
-  caller-asserted)
+  caller-asserted). The deposit surfaces pass the RETURNED committed event
+  row's `dedupKey` (never a re-invented key), and the substrate's
+  observation-identity contract (§P.5-D docs §3.3) guarantees the key
+  resolves to the observation that actually settled: replay converges only
+  on semantic match, a materially different observation under the identity
+  is retained as a distinct conflict row and fails closed
+  (`LIQUIDITY_CONFLICTING_EVIDENCE` → HTTP 409 + open
+  `ReconciliationException`), and the generic webhook's status-scoped
+  identity keeps SUCCESS and FAILED observations for the same reference as
+  DISTINCT durable rows — a prior FAILED observation can never masquerade as
+  SUCCESS evidence, and a legitimate SUCCESS is never handed a FAILED row
+  as its replay
 - USDC precision contract (audit r6, documented deliberately): the quote row
   `TransactionQuote.usdcAmount` (numeric(30,12)) is the CANONICAL native-12dp
   source of truth and is never widened, rounded or restated there; the

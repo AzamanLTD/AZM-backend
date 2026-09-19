@@ -82,6 +82,15 @@
 //   S. Overlay idempotency — the installer converges on re-run (guarded),
 //      including the reconciliationHeldGhs column and the outbound-amount
 //      CHECK on existing deployments.
+//   T. Provider-observation identity — ONE dedupKey names ONE observation:
+//      replay converges ONLY on semantic match (provider, rail, direction,
+//      status, providerRef, amountGhs, relatedReference — never raw); a
+//      materially different payload under a committed identity is
+//      contradictory evidence: retained as a DISTINCT durable conflict row
+//      (deterministic identity, exact retries converge) and surfaced with a
+//      typed fail-closed error. Distinct statuses are distinct durable
+//      observations — SUCCESS and FAILED for the same reference can never
+//      collapse into one silently.
 //
 // Only non-DB boundaries (audit, journal, notifications, logger) and the
 // external Moolre provider are stubbed. Skips cleanly without TEST_DATABASE_URL.
@@ -1602,6 +1611,120 @@ describeOrSkip('§P.5-D evidence-backed GHS liquidity authority (real PostgreSQL
                 SELECT COUNT(*)::int AS n FROM information_schema.columns
                 WHERE "table_name" = 'GlobalSettings' AND "column_name" = 'fiatLiquidityAuthorityEnabled'`;
             expect(flagCol[0].n).toBe(1);
+        });
+    });
+
+    // =========================================================================
+    // T. provider-observation identity (substrate authority, real PostgreSQL)
+    //    proofs 15/A/B of the evidence-identity hardening: exact duplicate
+    //    observations converge idempotently to ONE row; materially different
+    //    observations under a committed identity are retained as DISTINCT
+    //    durable rows and fail closed — nothing ever collapses silently.
+    // =========================================================================
+    describe('T. provider-observation identity (substrate)', () => {
+        const baseObservation = {
+            provider: 'GENERIC_FIAT_WEBHOOK', direction: 'INBOUND', status: 'SUCCESSFUL',
+            providerRef: 'PTX-1', dedupKey: 'event:fiat-deposit:R-T:SUCCESSFUL',
+            amountGhs: 100, relatedReference: 'R-T',
+        };
+
+        test('A: an exact semantic duplicate converges to exactly ONE event row — raw payload differences never manufacture conflicts', async () => {
+            const first = await fiatLiquidity.recordProviderEvent(prisma, { ...baseObservation, raw: { attempt: 1, ts: '2026-09-19T18:00:00Z' } });
+            expect(first.replay).toBe(false);
+            // the SAME economic observation retried with a byte-different raw
+            // payload (timestamps, field ordering, transport noise) — raw is
+            // NOT identity, this must converge, never conflict
+            const retry = await fiatLiquidity.recordProviderEvent(prisma, { ...baseObservation, raw: { attempt: 2, ts: '2026-09-19T18:05:00Z', extra: 'transport noise' } });
+            expect(retry.replay).toBe(true);
+            expect(retry.event.id).toBe(first.event.id);
+            const rows = await prisma.fiatProviderEvent.findMany({ where: { relatedReference: 'R-T' } });
+            expect(rows).toHaveLength(1); // exactly ONE durable row
+            expect(rows[0].status).toBe('SUCCESSFUL');
+            expect(rows[0].amountGhs.toString()).toBe('100');
+        });
+
+        test('B: a materially different observation under a committed identity is retained as a DISTINCT row and fails closed — the committed row is never rewritten', async () => {
+            const first = await fiatLiquidity.recordProviderEvent(prisma, baseObservation);
+            const committedAt = new Date(first.event.receivedAt);
+
+            // same dedupKey, DIFFERENT collected amount — contradictory evidence
+            await expect(fiatLiquidity.recordProviderEvent(prisma, { ...baseObservation, amountGhs: 5 }))
+                .rejects.toMatchObject({
+                    code: 'LIQUIDITY_CONFLICTING_EVIDENCE',
+                    details: { dedupKey: baseObservation.dedupKey, differingFields: ['amountGhs'] },
+                });
+
+            // the committed row is untouched — never rewritten, never absorbed
+            const committed = await prisma.fiatProviderEvent.findUnique({ where: { dedupKey: baseObservation.dedupKey } });
+            expect(committed.id).toBe(first.event.id);
+            expect(committed.amountGhs.toString()).toBe('100');
+            expect(new Date(committed.receivedAt).getTime()).toBe(committedAt.getTime());
+
+            // the contradictory observation IS durably retained, on its own
+            // deterministic conflict identity
+            const conflictRows = await prisma.fiatProviderEvent.findMany({
+                where: { dedupKey: { contains: ':CONFLICT:' }, relatedReference: 'R-T' },
+            });
+            expect(conflictRows).toHaveLength(1);
+            expect(conflictRows[0].amountGhs.toString()).toBe('5'); // the contradictory claim, visible
+
+            // an exact retry of the CONTRADICTORY payload converges to the
+            // conflict row — still exactly 2 durable observations, no growth
+            await expect(fiatLiquidity.recordProviderEvent(prisma, { ...baseObservation, amountGhs: 5 }))
+                .rejects.toMatchObject({ code: 'LIQUIDITY_CONFLICTING_EVIDENCE' });
+            const all = await prisma.fiatProviderEvent.findMany({ where: { relatedReference: 'R-T' } });
+            expect(all).toHaveLength(2);
+
+        });
+
+        test('15: two materially different provider observations can NEVER collapse into one silently — exact retries converge, distinct statuses are distinct rows', async () => {
+            // the generic webhook surface identity shape: status-scoped keys
+            const ref = 'R-T15';
+            const successKey = `event:fiat-deposit:${ref}:SUCCESSFUL`;
+            const failedKey = `event:fiat-deposit:${ref}:FAILED`;
+
+            // SUCCESS observation + an exact webhook retry — converges
+            const s1 = await fiatLiquidity.recordProviderEvent(prisma, {
+                provider: 'GENERIC_FIAT_WEBHOOK', direction: 'INBOUND', status: 'SUCCESSFUL',
+                providerRef: 'PTX-S', dedupKey: successKey, amountGhs: 100, relatedReference: ref,
+            });
+            const s2 = await fiatLiquidity.recordProviderEvent(prisma, {
+                provider: 'GENERIC_FIAT_WEBHOOK', direction: 'INBOUND', status: 'SUCCESSFUL',
+                providerRef: 'PTX-S', dedupKey: successKey, amountGhs: 100, relatedReference: ref,
+            });
+            expect(s2.replay).toBe(true);
+            expect(s2.event.id).toBe(s1.event.id);
+
+            // a FAILED observation for the SAME reference — a materially
+            // different observation, its OWN durable identity, never absorbed
+            const f1 = await fiatLiquidity.recordProviderEvent(prisma, {
+                provider: 'GENERIC_FIAT_WEBHOOK', direction: 'INBOUND', status: 'FAILED',
+                providerRef: 'PTX-S', dedupKey: failedKey, amountGhs: 100, relatedReference: ref,
+            });
+            expect(f1.replay).toBe(false);
+            expect(f1.event.id).not.toBe(s1.event.id);
+
+            // BOTH directions from the persisted rows: two durable
+            // observations for one reference, statuses visible and queryable
+            const rows = await prisma.fiatProviderEvent.findMany({ where: { relatedReference: ref } });
+            expect(rows).toHaveLength(2);
+            expect(rows.filter((r) => r.status === 'SUCCESSFUL')).toHaveLength(1);
+            expect(rows.filter((r) => r.status === 'FAILED')).toHaveLength(1);
+            // each identity resolves to ITS OWN observation — the FAILED row
+            // can never be returned as a replay of the SUCCESS observation or
+            // vice versa
+            expect((await prisma.fiatProviderEvent.findUnique({ where: { dedupKey: successKey } })).status).toBe('SUCCESSFUL');
+            expect((await prisma.fiatProviderEvent.findUnique({ where: { dedupKey: failedKey } })).status).toBe('FAILED');
+
+            // and a materially different SUCCESS payload under the SUCCESS
+            // identity still fails closed with the contradiction retained —
+            // three durable rows, zero silent collapses
+            await expect(fiatLiquidity.recordProviderEvent(prisma, {
+                provider: 'GENERIC_FIAT_WEBHOOK', direction: 'INBOUND', status: 'SUCCESSFUL',
+                providerRef: 'PTX-S', dedupKey: successKey, amountGhs: 55, relatedReference: ref,
+            })).rejects.toMatchObject({ code: 'LIQUIDITY_CONFLICTING_EVIDENCE' });
+            const after = await prisma.fiatProviderEvent.findMany({ where: { relatedReference: ref } });
+            expect(after).toHaveLength(3); // SUCCESS, FAILED, SUCCESS-conflict — all visible
         });
     });
 });

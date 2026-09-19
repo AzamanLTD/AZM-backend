@@ -55,6 +55,7 @@
 // =============================================================================
 
 const { Prisma } = require('@prisma/client');
+const crypto = require('crypto');
 const logger = require('../config/logger');
 const { recordReconciliationException } = require('../../services/reconciliationExceptionService');
 
@@ -127,12 +128,69 @@ const isAuthorityEnabled = async (prisma) => {
     return settings?.fiatLiquidityAuthorityEnabled === true;
 };
 
-// ─── raw provider evidence (append-only, idempotent) ───────────────────────
+// ─── provider-observation identity (docs §3.3) ───────────────────────────────
+//
+// ONE dedupKey names ONE provider observation. The identity of an observation
+// is its SEMANTIC authority fields — never its transport payload:
+//   provider, rail, direction, status, providerRef, amountGhs, relatedReference
+// `raw` is deliberately NOT identity: providers retry the same economic
+// observation with byte-different payloads (timestamps, ordering, extra
+// fields), and byte-comparison would manufacture contradictions out of
+// retries. Replay therefore converges ONLY when the semantic fields match;
+// a materially different observation under an already-committed identity is
+// contradictory evidence — retained as a DISTINCT durable row under a
+// deterministic conflict identity (so exact retries of the contradictory
+// payload converge too) and surfaced with a typed fail-closed error. It is
+// NEVER silently absorbed, NEVER rewritten over the committed row.
+const OBSERVATION_SEMANTIC_FIELDS = ['provider', 'rail', 'direction', 'status', 'providerRef', 'amountGhs', 'relatedReference'];
 
+const observationSemantics = ({
+    provider, rail = null, direction, status, providerRef = null, amountGhs = null, relatedReference = null,
+}) => ({
+    provider: String(provider),
+    rail: rail == null ? null : String(rail),
+    direction: String(direction),
+    status: String(status),
+    providerRef: providerRef == null ? null : String(providerRef),
+    amountGhs: amountGhs == null ? null : new Prisma.Decimal(String(amountGhs)).toFixed(GHS_DP),
+    relatedReference: relatedReference == null ? null : String(relatedReference),
+});
+
+const observationSemanticsMatch = (a, b) =>
+    OBSERVATION_SEMANTIC_FIELDS.every((f) => (a[f] ?? null) === (b[f] ?? null));
+
+const observationSemanticDiffs = (a, b) =>
+    OBSERVATION_SEMANTIC_FIELDS.filter((f) => (a[f] ?? null) !== (b[f] ?? null));
+
+// Deterministic conflict identity for a contradictory observation: derived
+// ONLY from the semantic fields of the incoming payload, so the same
+// contradictory observation retried converges to the same conflict row.
+const conflictingObservationDedupKey = (dedupKey, semantics) => {
+    const canonical = OBSERVATION_SEMANTIC_FIELDS
+        .map((f) => (semantics[f] ?? '\\0'))
+        .join('\\u{1F}');
+    const fingerprint = crypto.createHash('sha256').update(canonical).digest('hex').slice(0, 16);
+    return `${dedupKey}:CONFLICT:${fingerprint}`;
+};
+
+// ─── raw provider evidence (append-only, replay only on semantic match) ─────
+//
 // Records a raw provider observation OUTSIDE any caller transaction. Called
 // BEFORE the settlement transaction so evidence always survives, even when
-// the financial transition fails closed or rolls back. Replays converge to the
-// committed event row (dedupKey is the observation's economic identity).
+// the financial transition fails closed or rolls back.
+//
+// IDENTITY CONTRACT (docs §3.3):
+//   * an exact semantic duplicate of a committed observation converges to
+//     the committed row (replay: true) — webhook retries are idempotent;
+//   * a materially different observation under the same identity is
+//     CONTRADICTORY EVIDENCE: it is retained as a distinct durable row
+//     (deterministic conflict identity; never rewritten over the committed
+//     row) and the call FAILS CLOSED with ConflictingEvidenceError — the
+//     caller can never proceed as though the new payload were the committed
+//     observation, and contradictory evidence stays queryable/auditable;
+//   * genuinely distinct provider observations (different status, reference,
+//     provider) MUST be given distinct dedupKeys by the caller — the surface
+//     derives the identity from fields actually present in its callback.
 //
 // INBOUND observations MUST carry the collected amount (the receipt evidence
 // chain depends on it). OUTBOUND observations may carry none — a disbursement
@@ -156,10 +214,42 @@ async function recordProviderEvent(prisma, {
             `[fiatLiquidity] INBOUND observation ${dedupKey} must carry the collected amount — inbound evidence without an amount cannot back a receipt`
         );
     }
+    const semantics = observationSemantics({
+        provider, rail, direction, status, providerRef,
+        amountGhs: amount, relatedReference,
+    });
+    const failClosedOnConflict = async (committed) => {
+        const conflicting = await retainConflictingObservation(prisma, dedupKey, semantics, {
+            provider, rail, direction, status,
+            providerRef: providerRef == null ? null : String(providerRef),
+            amountGhs: amount,
+            relatedReference: relatedReference == null ? null : String(relatedReference),
+            raw: raw ?? undefined,
+        });
+        const diffs = observationSemanticDiffs(
+            observationSemantics(committed), semantics,
+        );
+        throw new ConflictingEvidenceError(
+            `[fiatLiquidity] provider observation ${dedupKey} contradicts committed evidence — differing fields: ${diffs.join(', ')}; ` +
+            `the contradictory observation is retained under ${conflicting.dedupKey}, never silently converged`,
+            {
+                dedupKey,
+                committedEventId: committed.id,
+                differingFields: diffs,
+                conflictingEventId: conflicting.id,
+                conflictingDedupKey: conflicting.dedupKey,
+            }
+        );
+    };
     const existing = await prisma.fiatProviderEvent.findUnique({ where: { dedupKey } });
     if (existing) {
-        // Converge: same observation already committed. NEVER rewrite it.
-        return { event: existing, replay: true };
+        if (observationSemanticsMatch(observationSemantics(existing), semantics)) {
+            // Converge: the SAME observation already committed. NEVER rewrite it.
+            return { event: existing, replay: true };
+        }
+        // A materially different payload under a committed identity is
+        // contradictory evidence — retain it durably and fail closed.
+        await failClosedOnConflict(existing);
     }
     let event;
     try {
@@ -176,10 +266,36 @@ async function recordProviderEvent(prisma, {
         return { event, replay: false };
     } catch (err) {
         if (err?.code === 'P2002') {
-            // Concurrent duplicate of the same observation — converge.
+            // Concurrent duplicate under the same identity — the winner
+            // committed first. Converge ONLY if it is semantically the same
+            // observation; otherwise it is contradictory evidence.
             const raced = await prisma.fiatProviderEvent.findUnique({ where: { dedupKey } });
             if (!raced) throw new Error('[fiatLiquidity] provider event identity lost after race');
-            return { event: raced, replay: true };
+            if (observationSemanticsMatch(observationSemantics(raced), semantics)) {
+                return { event: raced, replay: true };
+            }
+            await failClosedOnConflict(raced);
+        }
+        throw err;
+    }
+}
+
+// Retain a contradictory observation as its own durable evidence row under
+// the deterministic conflict identity. Exact retries of the contradictory
+// payload converge to this row. If the retention itself cannot be persisted
+// the persistence error propagates — evidence is never silently dropped.
+async function retainConflictingObservation(prisma, dedupKey, semantics, data) {
+    const conflictKey = conflictingObservationDedupKey(dedupKey, semantics);
+    const existing = await prisma.fiatProviderEvent.findUnique({ where: { dedupKey: conflictKey } });
+    if (existing) return existing;
+    try {
+        return await prisma.fiatProviderEvent.create({
+            data: { ...data, dedupKey: conflictKey },
+        });
+    } catch (err) {
+        if (err?.code === 'P2002') {
+            const raced = await prisma.fiatProviderEvent.findUnique({ where: { dedupKey: conflictKey } });
+            if (raced) return raced;
         }
         throw err;
     }

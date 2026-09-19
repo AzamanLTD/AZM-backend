@@ -33,6 +33,17 @@
 //      balance == Σ Model B settled GHS; equity:treasury USDC stake nets to
 //      zero for a fully sold lot; expense:cogs:usdc is catalog-provisioned.
 //
+//   H. Provider-observation identity authority — the substrate's
+//      §P.5-D identity contract, proven against Model B settlement:
+//      exact webhook retries converge idempotently; a contradictory late
+//      FAILED callback never alters a committed settlement (its evidence
+//      stays durable and visible); a prior FAILED observation can NEVER
+//      masquerade as SUCCESS evidence; a legitimate SUCCESS observation
+//      stays usable because materially different observations never collapse
+//      into one identity; a materially different SUCCESS payload under the
+//      committed identity fails closed 409 with the contradiction retained
+//      (conflict row + open ReconciliationException) and never poisons the
+//      committed identity for legitimate retries.
 // Only non-DB boundaries (audit, journal, notifications, logger) and the
 // external Moolre provider are stubbed. Skips cleanly without TEST_DATABASE_URL.
 // =============================================================================
@@ -71,7 +82,17 @@ describeOrSkip('§P.5-E Model B settlement / inventory cost-basis realization (r
     });
 
     afterAll(async () => {
-        if (prisma) await prisma.$disconnect();
+        if (prisma) {
+            // Restore the rollout flags to the production default so any
+            // suite that runs AFTER this one (Jest file order is
+            // filesystem-dependent) inherits a clean slate instead of this
+            // suite's Model B / liquidity authority experiments.
+            await prisma.globalSettings.update({
+                where: { id: 1 },
+                data: { fiatLiquidityAuthorityEnabled: false, modelBSettlementEnabled: false },
+            }).catch(() => null);
+            await prisma.$disconnect();
+        }
     });
 
     // ── isolation: full wipe of every table this suite touches ──────────────
@@ -1280,6 +1301,172 @@ describeOrSkip('§P.5-E Model B settlement / inventory cost-basis realization (r
             expect((await quoteRow(d.quoteId)).consumedAt).not.toBeNull();
             const after = await stateSnapshot(d)();
             expect(JSON.stringify(after)).toBe(JSON.stringify(settled));
+        });
+    });
+
+    // =========================================================================
+    // H. Provider-observation identity authority (substrate §P.5-D identity
+    //    contract over Model B settlement — proofs C/D/E + persisted-row audit)
+    // =========================================================================
+    describe('H. provider-observation identity authority', () => {
+        const successKey = (ref) => `event:fiat-deposit:${ref}:SUCCESSFUL`;
+        const failedKey = (ref) => `event:fiat-deposit:${ref}:FAILED`;
+
+        async function genericWebhookStatus(txHash, amountGhs, status) {
+            const res = mockResponse();
+            await quoteFiatDepositController.webhook({
+                app: makeApp(),
+                headers: { 'x-azaman-webhook-secret': process.env.FIAT_WEBHOOK_SECRET },
+                body: { reference: txHash, amountGhs, providerTxId: 'GEN-1', status },
+            }, res);
+            return res;
+        }
+
+        test('C: a contradictory late FAILED callback NEVER alters a committed settlement — the FAILED observation is durable, distinct and visible', async () => {
+            const { user, pending } = await seedScenario({ surface: 'generic' });
+            const settled = await genericWebhookStatus(pending.txHash, 100, 'SUCCESS');
+            expect(settled.statusCode).toBe(200);
+            const s0 = await prisma.modelBSettlement.findUnique({ where: { reference: pending.txHash } });
+            expect(s0).not.toBeNull();
+            const userBal = new Decimal((await prisma.user.findUnique({ where: { id: user.id } })).availableBalance);
+            const consumptions0 = await prisma.inventoryLotConsumption.count();
+
+            // the provider now contradicts its own SUCCESS with a late FAILED
+            const late = await genericWebhookStatus(pending.txHash, 100, 'FAILED');
+            expect(late.statusCode).toBe(200); // deposit already COMPLETED — already-processed contract
+            expect(late.payload.message).toMatch(/already processed/i);
+
+            // ZERO mutation to the committed economics
+            const s1 = await prisma.modelBSettlement.findUnique({ where: { reference: pending.txHash } });
+            expect(new Decimal(s1.settledGhs).toFixed(2)).toBe(new Decimal(s0.settledGhs).toFixed(2));
+            expect(new Decimal(s1.settledUsdc).toFixed(8)).toBe(new Decimal(s0.settledUsdc).toFixed(8));
+            expect(s1.lotAllocations).toEqual(s0.lotAllocations);
+            expect(new Decimal((await prisma.user.findUnique({ where: { id: user.id } })).availableBalance).toFixed(8)).toBe(userBal.toFixed(8));
+            expect(await prisma.inventoryLotConsumption.count()).toBe(consumptions0);
+
+            // BOTH observations persist as DISTINCT durable rows — the FAILED
+            // contradiction is visible for ops, never silently discarded and
+            // never collapsed into the SUCCESS observation
+            const rows = await prisma.fiatProviderEvent.findMany({ where: { relatedReference: pending.txHash } });
+            expect(rows).toHaveLength(2);
+            expect(rows.filter((r) => r.status === 'SUCCESSFUL')).toHaveLength(1);
+            expect(rows.filter((r) => r.status === 'FAILED')).toHaveLength(1);
+            expect(rows.every((r) => r.direction === 'INBOUND')).toBe(true);
+
+            // an exact retry of the late FAILED callback converges idempotently
+            const retry = await genericWebhookStatus(pending.txHash, 100, 'FAILED');
+            expect(retry.statusCode).toBe(200);
+            expect(await prisma.fiatProviderEvent.count({ where: { relatedReference: pending.txHash } })).toBe(2);
+            expect(await prisma.modelBSettlement.count({ where: { reference: pending.txHash } })).toBe(1);
+        });
+
+        test('D+E: a prior FAILED observation can NEVER masquerade as SUCCESS evidence — and the legitimate SUCCESS observation stays usable because identities do not collapse', async () => {
+            const { user, pending, quoteId } = await seedScenario({ surface: 'generic' });
+
+            // a FAILED provider observation is durably recorded for the
+            // reference (e.g. an intermediate provider status notification)
+            await fiatLiquidity.recordProviderEvent(prisma, {
+                provider: 'GENERIC_FIAT_WEBHOOK', direction: 'INBOUND', status: 'FAILED',
+                providerRef: 'GEN-1', dedupKey: failedKey(pending.txHash),
+                amountGhs: 100, relatedReference: pending.txHash,
+            });
+
+            // the deposit settles at the state level; the evidence-status
+            // gate alone decides whether the FAILED observation can authorize
+            // inventory consumption — it CANNOT
+            const quote = await consumeTransactionQuote({ prisma, quoteId, userId: user.id, purpose: 'deposit' });
+            await prisma.transactionHistory.update({ where: { id: pending.id }, data: { status: 'COMPLETED', amountUsdc: quote.usdcAmount } });
+            const th = await prisma.transactionHistory.findUnique({ where: { id: pending.id } });
+
+            const common = {
+                reference: pending.txHash, transactionHistoryId: pending.id, userId: user.id, quoteId,
+                quotedGhs: quote.amountGhs, quotedRateGhsPerUsdc: quote.rateGhsPerUsdc, quotedUsdc: quote.usdcAmount,
+                settledGhs: '100', settledUsdc: th.amountUsdc,
+                selectedRoute: quote.selectedRoute, routeProviderRail: quote.routeProviderRail, routePolicyVersion: quote.routePolicyVersion,
+                provider: 'GENERIC_FIAT_WEBHOOK',
+            };
+            await expect(prisma.$transaction((tx) => modelBSettlement.settleDepositFromInventory(tx, {
+                ...common, evidenceDedupKey: failedKey(pending.txHash), // the FAILED observation
+            }))).rejects.toMatchObject({ code: 'MODEL_B_EVIDENCE_STATUS' });
+            // ZERO mutation on the masquerade attempt
+            expect(await prisma.modelBSettlement.count()).toBe(0);
+            expect(await prisma.inventoryLotConsumption.count()).toBe(0);
+
+            // the legitimate SUCCESS observation — a DISTINCT later
+            // observation under the surface's status-scoped identity — is
+            // fully usable: Model B binds to the SUCCESS row and commits.
+            // (Under the pre-hardening identity, both observations shared one
+            // key and the SUCCESS callback would have been handed the FAILED
+            // row as a "replay", rejecting the legitimate settlement.)
+            await fiatLiquidity.recordProviderEvent(prisma, {
+                provider: 'GENERIC_FIAT_WEBHOOK', direction: 'INBOUND', status: 'SUCCESSFUL',
+                providerRef: 'GEN-1', dedupKey: successKey(pending.txHash),
+                amountGhs: 100, relatedReference: pending.txHash,
+            });
+            await prisma.$transaction((tx) => modelBSettlement.settleDepositFromInventory(tx, {
+                ...common, evidenceDedupKey: successKey(pending.txHash),
+            }));
+            expect(await prisma.modelBSettlement.count()).toBe(1);
+            const consumptions = await prisma.inventoryLotConsumption.count();
+            expect(consumptions).toBeGreaterThan(0);
+
+            // replay converges — exactly one settlement, no re-consumption
+            await prisma.$transaction((tx) => modelBSettlement.settleDepositFromInventory(tx, {
+                ...common, evidenceDedupKey: successKey(pending.txHash),
+            }));
+            expect(await prisma.modelBSettlement.count()).toBe(1);
+            expect(await prisma.inventoryLotConsumption.count()).toBe(consumptions);
+        });
+
+        test('final audit (persisted rows): exact retries converge, materially different observations are distinct durable rows, and a contradictory SUCCESS payload fails closed 409 without poisoning the identity', async () => {
+            const { user, pending } = await seedScenario({ surface: 'generic' });
+
+            // exact SUCCESS retries converge to ONE row and settle ONCE
+            const first = await genericWebhookStatus(pending.txHash, 100, 'SUCCESS');
+            expect(first.statusCode).toBe(200);
+            const second = await genericWebhookStatus(pending.txHash, 100, 'SUCCESS');
+            expect(second.statusCode).toBe(200);
+            expect(second.payload.message).toMatch(/already processed/i);
+            const successRows = await prisma.fiatProviderEvent.findMany({ where: { dedupKey: successKey(pending.txHash) } });
+            expect(successRows).toHaveLength(1);
+            expect(await prisma.modelBSettlement.count({ where: { reference: pending.txHash } })).toBe(1);
+            const bal = new Decimal((await prisma.user.findUnique({ where: { id: user.id } })).availableBalance);
+
+            // a materially different SUCCESS payload under the committed
+            // identity — the provider now claims a different collected amount
+            // for the SAME successful observation — fails closed, typed,
+            // with the contradiction retained and flagged
+            const contradiction = await genericWebhookStatus(pending.txHash, 55, 'SUCCESS');
+            expect(contradiction.statusCode).toBe(409);
+            expect(contradiction.payload.code).toBe('CONTRADICTORY_PROVIDER_EVIDENCE');
+
+            // committed row UNTOUCHED; contradiction retained as its own row
+            const committed = await prisma.fiatProviderEvent.findUnique({ where: { dedupKey: successKey(pending.txHash) } });
+            expect(committed.amountGhs.toString()).toBe('100');
+            const conflictRows = await prisma.fiatProviderEvent.findMany({ where: { dedupKey: { contains: ':CONFLICT:' }, relatedReference: pending.txHash } });
+            expect(conflictRows).toHaveLength(1);
+            expect(conflictRows[0].amountGhs.toString()).toBe('55');
+
+            // flagged OPEN for ops, idempotently
+            const exceptions = await prisma.$queryRaw`
+                SELECT "reason", "status", COUNT(*)::int AS n FROM "ReconciliationException"
+                WHERE "entityType" = 'TRANSACTION' AND "entityId" = ${pending.txHash}
+                GROUP BY "reason", "status"`;
+            expect(exceptions).toEqual([{ reason: 'CONTRADICTORY_PROVIDER_EVIDENCE', status: 'OPEN', n: 1 }]);
+
+            // ZERO mutation to the committed economics
+            expect(await prisma.modelBSettlement.count({ where: { reference: pending.txHash } })).toBe(1);
+            expect(new Decimal((await prisma.user.findUnique({ where: { id: user.id } })).availableBalance).toFixed(8)).toBe(bal.toFixed(8));
+
+            // the identity is NOT poisoned: the LEGITIMATE retry (same
+            // observation as committed) still converges and the already-
+            // processed contract holds — the contradictory payload never
+            // blocks a genuine provider retry
+            const legit = await genericWebhookStatus(pending.txHash, 100, 'SUCCESS');
+            expect(legit.statusCode).toBe(200);
+            expect(legit.payload.message).toMatch(/already processed/i);
+            expect(await prisma.fiatProviderEvent.count({ where: { dedupKey: successKey(pending.txHash) } })).toBe(1);
+            expect(await prisma.modelBSettlement.count({ where: { reference: pending.txHash } })).toBe(1);
         });
     });
 });

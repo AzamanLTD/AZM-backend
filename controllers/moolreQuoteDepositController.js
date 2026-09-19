@@ -13,6 +13,7 @@ const {
   consumeTransactionQuote,
 } = require('../src/services/transactionQuoteService');
 const fiatLiquidity = require('../src/services/fiatLiquidityService'); // §P.5-D
+const { recordReconciliationException } = require('../services/reconciliationExceptionService');
 const modelBSettlement = require('../services/modelBSettlementService'); // §P.5-E
 const routePolicy = require('../src/services/routePolicyService');
 const { Prisma } = require('@prisma/client');
@@ -28,6 +29,18 @@ const NETWORK_MAP = {
   AIRTELTIGO: 'AIRTELTIGO',
 };
 const QUOTE_TTL_SECONDS = 600;
+
+// ── §P.5-D provider-observation identity (this surface) ─────────────────────
+// Moolre settlement notifications recorded here are ALWAYS successful
+// collections (status 1 / P01; anything else is acknowledged out of the
+// lifecycle above), so the observation identity is provider + reference with
+// a constant status dimension: `event:moolre-collection:${externalRef}`.
+// The substrate's identity contract governs the rest: an exact semantic
+// duplicate replays; a materially different payload under this identity
+// (e.g. a different collected amount) is CONTRADICTORY EVIDENCE — retained
+// as a distinct conflict row and rejected fail-closed below. No provider
+// event id is invented; providerRef comes from the durable initiation record.
+const moolreEventDedupKey = (externalRef) => `event:moolre-collection:${externalRef}`;
 
 function safeEqual(a, b) {
   if (typeof a !== 'string' || typeof b !== 'string') return false;
@@ -226,12 +239,13 @@ exports.webhook = async (req, res) => {
 
     const existing = await prisma.transactionHistory.findUnique({ where: { txHash: externalRef } });
     if (!existing) return res.status(404).json({ success: false, message: 'Unknown reference.' });
-    if (existing.status === 'COMPLETED') return res.status(200).json({ success: true, message: 'Already processed.' });
-    if (existing.status !== 'PENDING') return res.status(409).json({ success: false, message: `Deposit is ${existing.status}.` });
 
     // §P.5-D LIQUIDITY EVIDENCE: append the raw Moolre collection observation
-    // OUT-OF-BAND, BEFORE the settle transaction — evidence always survives,
-    // even when the settle fails closed. Append-only; replays converge.
+    // OUT-OF-BAND, BEFORE ANY state decision — including the state checks
+    // below. EVERY P01 notification is durable evidence, whatever the
+    // deposit's current state: a contradictory late notification against a
+    // terminal row must remain durably visible for reconciliation, not vanish
+    // behind an early return. Append-only; exact retries converge.
     //
     // FAIL-CLOSED: the evidence layer is part of the authority boundary, NOT
     // best-effort logging. If the raw observation cannot be durably persisted,
@@ -239,24 +253,56 @@ exports.webhook = async (req, res) => {
     // customer USDC is credited and no liquidity transition happens while the
     // authoritative record of the provider's claim is missing. The deposit
     // stays PENDING; Moolre retries or ops investigates.
+    //
+    // CONTRADICTORY EVIDENCE (typed): a materially different payload under
+    // the committed observation identity (e.g. a different collected amount
+    // for the same externalref) fails closed with 409 — the substrate
+    // retained the contradictory row under its own conflict identity and
+    // NOTHING is settled on it. Ops sees both rows plus a
+    // ReconciliationException; the contradiction is never silently absorbed.
+    let providerEvent;
     try {
-        await fiatLiquidity.recordProviderEvent(prisma, {
+        const recorded = await fiatLiquidity.recordProviderEvent(prisma, {
             provider: 'MOOLRE',
             direction: 'INBOUND',
             status: 'SUCCESSFUL',
             providerRef: existing.providerRef,
-            dedupKey: `event:moolre-collection:${externalRef}`,
+            dedupKey: moolreEventDedupKey(externalRef),
             amountGhs: settledGhs,
             relatedReference: externalRef,
             raw: req.body || null,
         });
+        providerEvent = recorded.event;
     } catch (evidenceErr) {
+        if (evidenceErr instanceof fiatLiquidity.ConflictingEvidenceError) {
+            await recordReconciliationException(prisma, {
+                entityType: 'TRANSACTION',
+                entityId: externalRef,
+                reference: existing.providerRef || externalRef,
+                reason: 'CONTRADICTORY_PROVIDER_EVIDENCE',
+                details: {
+                    provider: 'MOOLRE',
+                    dedupKey: evidenceErr.details?.dedupKey ?? moolreEventDedupKey(externalRef),
+                    differingFields: evidenceErr.details?.differingFields ?? null,
+                    conflictingDedupKey: evidenceErr.details?.conflictingDedupKey ?? null,
+                },
+            }).catch(() => null);
+            return res.status(409).json({
+                success: false,
+                message: 'Contradictory provider evidence for this reference was retained and flagged for reconciliation. Settlement has not been processed.',
+                code: 'CONTRADICTORY_PROVIDER_EVIDENCE',
+            });
+        }
         logger.error({ err: evidenceErr, reference: externalRef }, '[moolreQuoteDepositWebhook] §P.5-D evidence persistence FAILED — settlement blocked');
         return res.status(503).json({
             success: false,
             message: 'Deposit evidence could not be durably recorded. Settlement has not been processed; please retry.'
         });
     }
+
+    // ── lifecycle (existing contract, unchanged) ───────────────────────────
+    if (existing.status === 'COMPLETED') return res.status(200).json({ success: true, message: 'Already processed.' });
+    if (existing.status !== 'PENDING') return res.status(409).json({ success: false, message: `Deposit is ${existing.status}.` });
     const liquidityAuthorityOn = await fiatLiquidity.isAuthorityEnabled(prisma);
     // §P.5-E: OFF (default) keeps the §P.4 clearing:conversion bridge; ON
     // settles the purchase through authoritative inventory (Model B).
@@ -369,7 +415,11 @@ exports.webhook = async (req, res) => {
           routePolicyVersion: quote.routePolicyVersion || null,
           provider: 'MOOLRE',
           providerRef: existing.providerRef || null,
-          evidenceDedupKey: `event:moolre-collection:${externalRef}`,
+          // §P.5-D/P.5-E: the identity of the observation this settlement is
+          // backed by — the RETURNED committed event row's dedupKey, never a
+          // re-invented key (a materially different later observation lives on
+          // its own row and can never masquerade as this evidence).
+          evidenceDedupKey: providerEvent.dedupKey,
         });
       } else {
       await ledger.post(tx, {
@@ -408,7 +458,7 @@ exports.webhook = async (req, res) => {
           route: quote.selectedRoute || null,
           reference: externalRef,
           relatedTransactionId: existing.id,
-          eventDedupKey: `event:moolre-collection:${externalRef}`,
+          eventDedupKey: providerEvent.dedupKey,
           evidence: {
             source: 'moolre_collection',
             quoteId,

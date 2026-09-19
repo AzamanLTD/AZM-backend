@@ -11,6 +11,7 @@ const {
   QuoteIdentityConflictError,
 } = require('../src/services/transactionQuoteService');
 const fiatLiquidity = require('../src/services/fiatLiquidityService'); // §P.5-D
+const { recordReconciliationException } = require('../services/reconciliationExceptionService');
 const modelBSettlement = require('../services/modelBSettlementService'); // §P.5-E
 const routePolicy = require('../src/services/routePolicyService');
 const { Prisma } = require('@prisma/client');
@@ -21,6 +22,22 @@ const FIAT_REF_PREFIX = 'FIAT_DEPOSIT_';
 // mirrors the policy's GENERIC_FIAT_AGGREGATOR rails so they can never drift.
 const PROVIDERS = new Set(routePolicy.DEPOSIT_ROUTES.GENERIC_FIAT_AGGREGATOR.rails);
 const QUOTE_TTL_SECONDS = 600;
+
+// ── §P.5-D provider-observation identity (this surface) ─────────────────────
+// ONE dedupKey names ONE provider observation, derived STRICTLY from fields
+// actually present in the callback: the deposit reference and the reported
+// status. A SUCCESS and a FAILED observation for the same reference are
+// DISTINCT durable rows — materially different provider observations can
+// never collapse into one; exact retries of the same observation converge
+// idempotently. The evidence layer itself rejects a materially different
+// payload under an already-committed identity (LIQUIDITY_CONFLICTING_EVIDENCE):
+// contradictory evidence is retained and flagged, never silently absorbed.
+// No provider event id is ever invented — only what the callback carries.
+const GENERIC_EVENT_KEY_PREFIX = 'event:fiat-deposit';
+const normalizeCallbackStatus = (status) =>
+  (status && status !== 'SUCCESS' ? String(status).toUpperCase() : 'SUCCESSFUL');
+const depositEventDedupKey = (reference, normalizedStatus) =>
+  `${GENERIC_EVENT_KEY_PREFIX}:${reference}:${normalizedStatus}`;
 
 function safeEqual(a, b) {
   if (typeof a !== 'string' || typeof b !== 'string') return false;
@@ -135,16 +152,15 @@ exports.webhook = async (req, res) => {
 
     const existing = await prisma.transactionHistory.findUnique({ where: { txHash: reference } });
     if (!existing) return res.status(404).json({ success: false, message: 'Unknown deposit reference.' });
-    if (existing.status === 'COMPLETED') return res.status(200).json({ success: true, message: 'Deposit already processed.', data: { reference, alreadyProcessed: true } });
-    if (existing.status !== 'PENDING') return res.status(409).json({ success: false, message: `Cannot complete deposit in state ${existing.status}.` });
-    if (status && status !== 'SUCCESS') {
-      const failed = await prisma.transactionHistory.updateMany({ where: { id: existing.id, status: 'PENDING' }, data: { status: 'FAILED', metadata: { ...(existing.metadata || {}), providerTxId: providerTxId || null, failedAt: new Date().toISOString() } } });
-      return res.status(200).json({ success: true, message: failed.count > 0 ? 'Deposit marked as FAILED.' : 'Reference not in PENDING state.', data: { reference, status: 'FAILED' } });
-    }
 
     // §P.5-D LIQUIDITY EVIDENCE: append the raw provider observation
-    // OUT-OF-BAND, BEFORE the settle transaction — evidence always survives,
-    // even when the settle fails closed. Append-only; replays converge.
+    // OUT-OF-BAND, BEFORE ANY state decision — including the state checks
+    // below. EVERY observation is durable evidence, whatever the deposit's
+    // current state: a contradictory late callback against a terminal row
+    // (COMPLETED/FAILED) must remain durably visible for reconciliation, not
+    // vanish behind an early return. Append-only; exact retries converge;
+    // materially different observations are distinct rows (status-scoped
+    // identity above).
     //
     // FAIL-CLOSED: the evidence layer is part of the authority boundary, NOT
     // best-effort logging. If the raw observation cannot be durably persisted,
@@ -152,23 +168,67 @@ exports.webhook = async (req, res) => {
     // customer USDC is credited and no liquidity transition happens while the
     // authoritative record of the provider's claim is missing. The deposit
     // stays PENDING; the provider retries or ops investigates.
+    //
+    // CONTRADICTORY EVIDENCE (typed): a materially different payload under an
+    // already-committed observation identity fails closed with 409 — the
+    // substrate retained the contradictory row under its own conflict
+    // identity and NOTHING is settled on it. Ops sees both rows plus a
+    // ReconciliationException; the provider's contradiction is never silently
+    // absorbed, and a legitimate later observation is never blocked by it
+    // (distinct status ⇒ distinct identity ⇒ its own row).
+    const normalizedStatus = normalizeCallbackStatus(status);
+    let providerEvent;
     try {
-        await fiatLiquidity.recordProviderEvent(prisma, {
+        const recorded = await fiatLiquidity.recordProviderEvent(prisma, {
             provider: 'GENERIC_FIAT_WEBHOOK',
             direction: 'INBOUND',
-            status: (status || 'SUCCESS') === 'SUCCESS' ? 'SUCCESSFUL' : String(status).toUpperCase(),
+            status: normalizedStatus,
             providerRef: providerTxId || null,
-            dedupKey: `event:fiat-deposit:${reference}`,
+            dedupKey: depositEventDedupKey(reference, normalizedStatus),
             amountGhs: settledGhs,
             relatedReference: reference,
             raw: req.body || null,
         });
+        providerEvent = recorded.event;
     } catch (evidenceErr) {
+        if (evidenceErr instanceof fiatLiquidity.ConflictingEvidenceError) {
+            await recordReconciliationException(prisma, {
+                entityType: 'TRANSACTION',
+                entityId: reference,
+                reference: providerTxId || reference,
+                reason: 'CONTRADICTORY_PROVIDER_EVIDENCE',
+                details: {
+                    provider: 'GENERIC_FIAT_WEBHOOK',
+                    dedupKey: evidenceErr.details?.dedupKey ?? depositEventDedupKey(reference, normalizedStatus),
+                    differingFields: evidenceErr.details?.differingFields ?? null,
+                    conflictingDedupKey: evidenceErr.details?.conflictingDedupKey ?? null,
+                },
+            }).catch(() => null);
+            return res.status(409).json({
+                success: false,
+                message: 'Contradictory provider evidence for this reference was retained and flagged for reconciliation. Settlement has not been processed.',
+                code: 'CONTRADICTORY_PROVIDER_EVIDENCE',
+            });
+        }
         logger.error({ err: evidenceErr, reference }, '[quoteFiatDepositWebhook] §P.5-D evidence persistence FAILED — settlement blocked');
         return res.status(503).json({
             success: false,
             message: 'Deposit evidence could not be durably recorded. Settlement has not been processed; please retry.'
         });
+    }
+
+    // ── lifecycle (existing contract, unchanged) ───────────────────────────
+    // FAILED is TERMINAL on this surface: a FAILED callback CAS-claims
+    // PENDING → FAILED below, and this controller never resurrects a
+    // non-PENDING deposit (409). A later SUCCESS callback after FAILED is
+    // retained as durable evidence above (its own status-scoped row) but does
+    // NOT settle — the project's lifecycle contract has no FAILED → COMPLETED
+    // transition on the generic surface, and none is invented here.
+    if (existing.status === 'COMPLETED') return res.status(200).json({ success: true, message: 'Deposit already processed.', data: { reference, alreadyProcessed: true } });
+    if (existing.status !== 'PENDING') return res.status(409).json({ success: false, message: `Cannot complete deposit in state ${existing.status}.` });
+    if (status && status !== 'SUCCESS') {
+      const failed = await prisma.transactionHistory.updateMany({ where: { id: existing.id, status: 'PENDING' }, data: { status: 'FAILED', metadata: { ...(existing.metadata || {}), providerTxId: providerTxId || null, failedAt: new Date().toISOString() } } });
+      return res.status(200).json({ success: true, message: failed.count > 0 ? 'Deposit marked as FAILED.' : 'Reference not in PENDING state.', data: { reference, status: 'FAILED' } });
     }
     const liquidityAuthorityOn = await fiatLiquidity.isAuthorityEnabled(prisma);
     // §P.5-E: OFF (default) keeps the §P.4 clearing:conversion bridge; ON
@@ -248,7 +308,11 @@ exports.webhook = async (req, res) => {
           routePolicyVersion: quote.routePolicyVersion || null,
           provider: 'GENERIC_FIAT_WEBHOOK',
           providerRef: providerTxId || null,
-          evidenceDedupKey: `event:fiat-deposit:${reference}`,
+          // §P.5-D/P.5-E: the identity of the observation this settlement is
+          // backed by — the RETURNED committed event row's dedupKey, never a
+          // re-invented key (a materially different later observation lives on
+          // its own row and can never masquerade as this evidence).
+          evidenceDedupKey: providerEvent.dedupKey,
         });
       } else {
       await ledger.post(tx, {
@@ -283,7 +347,7 @@ exports.webhook = async (req, res) => {
           route: quote.selectedRoute || null,
           reference,
           relatedTransactionId: existing.id,
-          eventDedupKey: `event:fiat-deposit:${reference}`,
+          eventDedupKey: providerEvent.dedupKey,
           evidence: {
             source: 'fiat_webhook',
             quoteId,

@@ -198,8 +198,44 @@ change — on BOTH directions:
   settlement when evidence cannot be persisted. `ProviderSettlementAttempt`
   stays as operational history; the authority's raw observations live here.
 
-Duplicate economic identities converge; contradictory terminal events are
-retained (never rewritten) and raise `ReconciliationException`. A failure in
+**Observation identity contract.** ONE `dedupKey` names ONE provider
+observation, and the substrate (`recordProviderEvent`) enforces the identity
+itself — no caller's say-so is trusted:
+
+- The identity of an observation is its SEMANTIC authority fields —
+  `provider`, `rail`, `direction`, `status`, `providerRef`, `amountGhs`,
+  `relatedReference`. The raw payload is deliberately NOT identity: providers
+  retry the same economic observation with byte-different bodies (timestamps,
+  ordering, extra fields), and byte comparison would manufacture
+  contradictions out of retries. A semantic duplicate converges to the
+  committed row (`replay: true`) — the committed row is never rewritten.
+- A materially different payload under an already-committed identity is
+  CONTRADICTORY EVIDENCE: it is retained as a DISTINCT durable row under a
+  deterministic conflict identity (`<dedupKey>:CONFLICT:<fingerprint>`, so
+  exact retries of the contradictory payload converge to that row) and the
+  call FAILS CLOSED with a typed `LIQUIDITY_CONFLICTING_EVIDENCE` error —
+  the caller can never proceed as though the new payload were the committed
+  observation. Both rows stay queryable for ops; nothing collapses silently.
+- Surfaces derive the identity from fields actually present in the
+  callback, never invented. The generic deposit webhook uses a status-scoped
+  identity (`event:fiat-deposit:<reference>:<status>`): a SUCCESS and a
+  FAILED observation for the same reference are DISTINCT durable rows, and a
+  late contradictory callback against a terminal deposit is still recorded
+  (evidence first, state second) while the settlement economics stay
+  untouched. Moolre's settlement surface records only successful P01
+  collections, so its identity is `event:moolre-collection:<externalref>`
+  with a constant status dimension. Outbound identities are status-scoped
+  where a reference can legitimately carry more than one observation
+  (`event:payout-outbound:<provider>:<reference>:<status>`); a payout
+  dispatch reference names exactly one dispatch (`event:payout-dispatch:<provider>:<reference>`).
+- Deposit webhooks record the observation BEFORE any state decision — a
+  contradictory late callback against a COMPLETED/FAILED deposit stays
+  durably visible instead of vanishing behind an early return.
+
+Contradictory evidence raised on a deposit surface is additionally flagged
+`ReconciliationException (CONTRADICTORY_PROVIDER_EVIDENCE)` and answered
+HTTP 409; a genuinely distinct later observation (different status ⇒ its
+own identity) is never blocked by an earlier contradictory one. A failure in
 post-dispatch bookkeeping (evidence/IN_TRANSIT after the provider accepted a
 payout) NEVER auto-refunds the dispatched cash — that would double-spend;
 it is flagged for manual review instead.
