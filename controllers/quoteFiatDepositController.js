@@ -195,7 +195,28 @@ exports.webhook = async (req, res) => {
       }
       const user = await tx.user.findUnique({ where: { id: existing.userId } });
       if (!user) throw new Error('User no longer exists for this deposit.');
-      const updatedTx = await tx.transactionHistory.update({ where: { id: existing.id }, data: { status: 'COMPLETED', amountUsdc: quote.usdcAmount, payerMsisdn: existing.payerMsisdn || null, metadata: { ...(existing.metadata || {}), providerTxId: providerTxId || null, settledAmountGhs: settledGhs, settledAt: new Date().toISOString(), settlementRate: quote.rateGhsPerUsdc, settledRoute: quote.selectedRoute || null, settledRoutePolicyVersion: quote.routePolicyVersion || null } } });
+      // ── §P.5-E audit r5 (state-machine CAS) ──────────────────────────
+      // The PENDING → COMPLETED claim is made by the DATABASE's conditional
+      // update, NOT by the `existing.status === 'PENDING'` pre-read above —
+      // that read happened OUTSIDE this transaction and is stale by the time
+      // we claim. A competing failure callback (PENDING → FAILED) that
+      // committed in between leaves this update matching ZERO rows; we fail
+      // closed and the entire settlement transaction (quote consumption,
+      // customer credit, ledger posting, Model B settlement, liquidity
+      // receipt) rolls back. A terminal FAILED deposit can never be
+      // resurrected to COMPLETED.
+      const claimed = await tx.transactionHistory.updateMany({
+        where: { id: existing.id, status: 'PENDING' },
+        data: { status: 'COMPLETED', amountUsdc: quote.usdcAmount, payerMsisdn: existing.payerMsisdn || null, metadata: { ...(existing.metadata || {}), providerTxId: providerTxId || null, settledAmountGhs: settledGhs, settledAt: new Date().toISOString(), settlementRate: quote.rateGhsPerUsdc, settledRoute: quote.selectedRoute || null, settledRoutePolicyVersion: quote.routePolicyVersion || null } },
+      });
+      if (claimed.count !== 1) {
+        throw new Error('Deposit is no longer PENDING — a concurrent state transition won; refusing to settle');
+      }
+      // Read AFTER the claim, inside the claiming transaction: the exact
+      // 8dp amount PostgreSQL stored. The conditional update above is the
+      // state-machine claim authority — this read can never observe a
+      // different state.
+      const updatedTx = await tx.transactionHistory.findUnique({ where: { id: existing.id } });
       await tx.user.update({ where: { id: existing.userId }, data: { availableBalance: { increment: quote.usdcAmount } } });
 
       // §P.4 AUTHORITATIVE ACCOUNTING — fiat-settled USDC deposit: customer

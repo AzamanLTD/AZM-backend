@@ -143,7 +143,11 @@ exports.initiate = async (req, res) => {
         network,
       });
     } catch (moolreErr) {
-      await prisma.transactionHistory.update({ where: { id: pending.id }, data: { status: 'FAILED' } });
+      // §P.5-E audit r5: the failure transition is a DB-enforced conditional
+      // claim — only a still-PENDING deposit can be failed here. A deposit
+      // that concurrently completed elsewhere can never be resurrected to
+      // FAILED by an unconditional write.
+      await prisma.transactionHistory.updateMany({ where: { id: pending.id, status: 'PENDING' }, data: { status: 'FAILED' } });
       logger.error({ err: moolreErr }, '[moolreQuoteDeposit] provider initiation failed');
       return res.status(502).json({
         success: false,
@@ -299,8 +303,18 @@ exports.webhook = async (req, res) => {
       const user = await tx.user.findUnique({ where: { id: existing.userId } });
       if (!user) throw new Error('User no longer exists for this deposit.');
 
-      const updatedTx = await tx.transactionHistory.update({
-        where: { id: existing.id },
+      // ── §P.5-E audit r5 (state-machine CAS) ──────────────────────────
+      // The PENDING → COMPLETED claim is made by the DATABASE's conditional
+      // update, NOT by the `existing.status === 'PENDING'` pre-read above —
+      // that read happened OUTSIDE this transaction and is stale by the time
+      // we claim. A competing failure callback (PENDING → FAILED) that
+      // committed in between leaves this update matching ZERO rows; we fail
+      // closed and the entire settlement transaction (quote consumption,
+      // customer credit, ledger posting, Model B settlement, liquidity
+      // receipt) rolls back. A terminal FAILED deposit can never be
+      // resurrected to COMPLETED.
+      const claimed = await tx.transactionHistory.updateMany({
+        where: { id: existing.id, status: 'PENDING' },
         data: {
           status: 'COMPLETED',
           amountUsdc: quote.usdcAmount,
@@ -315,6 +329,14 @@ exports.webhook = async (req, res) => {
           },
         },
       });
+      if (claimed.count !== 1) {
+        throw new Error('Deposit is no longer PENDING — a concurrent state transition won; refusing to settle');
+      }
+      // Read AFTER the claim, inside the claiming transaction: the exact
+      // 8dp amount PostgreSQL stored. The conditional update above is the
+      // state-machine claim authority — this read can never observe a
+      // different state.
+      const updatedTx = await tx.transactionHistory.findUnique({ where: { id: existing.id } });
 
       await tx.user.update({
         where: { id: existing.userId },

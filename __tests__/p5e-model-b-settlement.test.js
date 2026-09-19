@@ -1095,4 +1095,158 @@ describeOrSkip('§P.5-E Model B settlement / inventory cost-basis realization (r
             expect(new Decimal(s.marginGhs).toFixed(8)).toBe(new Decimal('12.50').minus(costShare8).toFixed(8));
         });
     });
+
+    // =========================================================================
+    // I. State-machine CAS (audit r5) — the PENDING→COMPLETED claim is the
+    //    DATABASE's conditional update, not the controller's earlier read.
+    //    REAL success-vs-failure races on the MOUNTED webhook controllers.
+    // =========================================================================
+    describe('I. state-machine CAS — success-vs-failure race (audit r5)', () => {
+        // Deterministic interleave: wrap prisma.$transaction so the mounted
+        // controller's settlement transaction is observed; immediately
+        // BEFORE the PENDING→COMPLETED CAS (updateMany where status
+        // 'PENDING') executes, the REAL mounted failure callback commits
+        // PENDING→FAILED on a SEPARATE connection. The injection is
+        // sequenced by the claim itself, not by wall-clock timing.
+        function injectCompetingFailureBeforeClaim(competingFailure) {
+            const orig = prisma.$transaction.bind(prisma);
+            return jest.spyOn(prisma, '$transaction').mockImplementation((arg, ...rest) => {
+                if (typeof arg !== 'function') return orig(arg, ...rest);
+                return orig(async (tx) => {
+                    let claimed = false;
+                    const wrappedTx = new Proxy(tx, {
+                        get(target, prop, receiver) {
+                            const value = Reflect.get(target, prop, receiver);
+                            if (prop !== 'transactionHistory' || claimed) return value;
+                            return new Proxy(value, {
+                                get(t2, p2, r2) {
+                                    if (p2 !== 'updateMany') return Reflect.get(t2, p2, r2);
+                                    return async (args) => {
+                                        if (!claimed && args?.where?.status === 'PENDING' && args?.data?.status === 'COMPLETED') {
+                                            claimed = true;
+                                            await competingFailure(); // commits NOW, mid-success-transaction
+                                        }
+                                        return t2.updateMany(args);
+                                    };
+                                },
+                            });
+                        },
+                    });
+                    return arg(wrappedTx);
+                });
+            });
+        }
+
+        // the repo's real competing failure writer: the mounted generic
+        // webhook's failure branch (its own DB-enforced PENDING→FAILED CAS).
+        async function mountedFailureCallback(txHash) {
+            const res = mockResponse();
+            await quoteFiatDepositController.webhook({
+                app: makeApp(),
+                headers: { 'x-azaman-webhook-secret': process.env.FIAT_WEBHOOK_SECRET },
+                body: { reference: txHash, amountGhs: 100, providerTxId: 'GEN-FAIL-1', status: 'FAILED' },
+            }, res);
+            return res;
+        }
+
+        const stateSnapshot = (d) => async () => ({
+            consumptions: await prisma.inventoryLotConsumption.count(),
+            settlements: await prisma.modelBSettlement.count(),
+            ledgerEntries: await prisma.journalEntry.count({ where: { ledgerTransactionId: { not: null } } }),
+            liability: (await bal(`user:${d.user.id}:liability`)).toFixed(8),
+            balance: new Decimal((await prisma.user.findUnique({ where: { id: d.user.id } })).availableBalance).toFixed(8),
+            lotRemaining: new Decimal((await prisma.inventoryLot.findUnique({ where: { id: d.lot.id } })).quantityRemaining).toFixed(8),
+        });
+
+        test('MOOLRE surface: failure commits mid-transaction → the CAS refuses to resurrect FAILED, zero mutation, quote consumption rolled back', async () => {
+            const d = await seedScenario({ surface: 'moolre' });
+            const before = await stateSnapshot(d)();
+            expect((await quoteRow(d.quoteId)).consumedAt).toBeNull();
+
+            const spy = injectCompetingFailureBeforeClaim(() => mountedFailureCallback(d.pending.txHash));
+            let res;
+            try {
+                res = await moolreWebhook(d.pending.txHash, 100);
+            } finally {
+                spy.mockRestore();
+            }
+
+            // the success path failed closed — no longer PENDING at claim time
+            expect(res.statusCode).toBe(409);
+            expect(res.payload.message).toMatch(/no longer PENDING/i);
+
+            // FAILED stays FAILED — never resurrected to COMPLETED
+            expect((await prisma.transactionHistory.findUnique({ where: { id: d.pending.id } })).status).toBe('FAILED');
+
+            // the losing success transaction performed ZERO financial mutation
+            const after = await stateSnapshot(d)();
+            expect(JSON.stringify(after)).toBe(JSON.stringify(before));
+            // quote consumption rolled back with the transaction → still retryable
+            expect((await quoteRow(d.quoteId)).consumedAt).toBeNull();
+        });
+
+        test('GENERIC surface: failure commits mid-transaction → the CAS refuses to resurrect FAILED, zero mutation, quote consumption rolled back', async () => {
+            const d = await seedScenario({ surface: 'generic' });
+            const before = await stateSnapshot(d)();
+            expect((await quoteRow(d.quoteId)).consumedAt).toBeNull();
+
+            const spy = injectCompetingFailureBeforeClaim(() => mountedFailureCallback(d.pending.txHash));
+            let res;
+            try {
+                res = await genericWebhook(d.pending.txHash, 100);
+            } finally {
+                spy.mockRestore();
+            }
+
+            expect(res.statusCode).toBe(409);
+            expect(res.payload.message).toMatch(/no longer PENDING/i);
+            expect((await prisma.transactionHistory.findUnique({ where: { id: d.pending.id } })).status).toBe('FAILED');
+            const after = await stateSnapshot(d)();
+            expect(JSON.stringify(after)).toBe(JSON.stringify(before));
+            expect((await quoteRow(d.quoteId)).consumedAt).toBeNull();
+        });
+
+        test('success commits first → a late failure callback (stale PENDING pre-read) claims ZERO rows and never unwinds the settlement', async () => {
+            const d = await seedScenario({ surface: 'moolre' });
+
+            // the success webhook settles normally — everything mutates once
+            const ok = await moolreWebhook(d.pending.txHash, 100);
+            expect(ok.statusCode).toBe(200);
+            expect(ok.payload.success).toBe(true);
+            expect((await prisma.transactionHistory.findUnique({ where: { id: d.pending.id } })).status).toBe('COMPLETED');
+            expect((await quoteRow(d.quoteId)).consumedAt).not.toBeNull();
+            const settled = await stateSnapshot(d)();
+            expect(settled.settlements).toBe(1);
+            expect(settled.consumptions).toBeGreaterThan(0);
+
+            // the competing failure callback read the row BEFORE the success
+            // committed — hand it that stale PENDING snapshot through its
+            // pre-read so its PENDING→FAILED CAS actually executes.
+            const realRow = await prisma.transactionHistory.findUnique({ where: { id: d.pending.id } });
+            const stale = { ...realRow, status: 'PENDING' };
+            const origFind = prisma.transactionHistory.findUnique.bind(prisma.transactionHistory);
+            const spy = jest.spyOn(prisma.transactionHistory, 'findUnique').mockImplementation(async (args) => {
+                if (args?.where?.txHash === d.pending.txHash) return stale;
+                return origFind(args);
+            });
+            let res;
+            try {
+                res = await mountedFailureCallback(d.pending.txHash);
+            } finally {
+                spy.mockRestore();
+            }
+
+            // the failure CAS matched ZERO rows — the controller reports it
+            expect(res.statusCode).toBe(200);
+            expect(res.payload.message).toMatch(/not in PENDING/i);
+
+            // the committed settlement is intact — nothing unwound
+            const th = await prisma.transactionHistory.findUnique({ where: { id: d.pending.id } });
+            expect(th.status).toBe('COMPLETED');
+            expect(th.metadata.settledAt).toBeTruthy();
+            expect((await quoteRow(d.quoteId)).consumedAt).not.toBeNull();
+            const after = await stateSnapshot(d)();
+            expect(JSON.stringify(after)).toBe(JSON.stringify(settled));
+        });
+    });
 });

@@ -90,6 +90,20 @@ steps are preserved verbatim (out-of-band evidence persistence BEFORE settlement
 quote consume; route-binding assert; exact-pesewa match; CAS claim; projection
 increment; P5-D receipt under its own flag). P5-E replaces ONLY the bridge posting.
 
+The PENDING→COMPLETED claim (audit r5) is a **database-enforced conditional
+update**, not the controller's earlier `status === 'PENDING'` read: the claim is
+`updateMany({ where: { id, status: 'PENDING' }, data: { status: 'COMPLETED', ... } })`
+with an exactly-one-affected-row requirement, inside the caller-owned `$transaction`.
+A competing failure callback (PENDING→FAILED) that commits between the controller's
+pre-read and the claim leaves the conditional update matching zero rows — the
+success path then fails closed and the ENTIRE settlement transaction (quote
+consumption, credit, ledger, Model B settlement, receipt) rolls back. A terminal
+FAILED deposit can never be resurrected to COMPLETED, and a committed settlement
+can never be unwound or re-failed: the failure transition is the same conditional
+claim (`where: { id, status: 'PENDING' }`), so a late failure callback against a
+COMPLETED row affects zero rows. The state-machine authority is the database
+predicate itself.
+
 ### 2.1 Inventory claim (FIFO — the explicit cost-flow policy)
 
 ### 2.1a Inventory acquisition authority (the r1 audit — structural darkness)
