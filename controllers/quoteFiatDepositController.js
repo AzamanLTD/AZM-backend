@@ -8,14 +8,10 @@ const {
   createServerTransactionQuote,
   consumeTransactionQuote,
   RateUnavailableError,
-  QuoteIdentityConflictError,
 } = require('../src/services/transactionQuoteService');
-const routePolicy = require('../src/services/routePolicyService');
 
 const FIAT_REF_PREFIX = 'FIAT_DEPOSIT_';
-// §P.5-C: rails are owned by the versioned route policy — the controller set
-// mirrors the policy's GENERIC_FIAT_AGGREGATOR rails so they can never drift.
-const PROVIDERS = new Set(routePolicy.DEPOSIT_ROUTES.GENERIC_FIAT_AGGREGATOR.rails);
+const PROVIDERS = new Set(['MTN_MOMO', 'TELECEL_CASH', 'VODAFONE_CASH', 'AIRTELTIGO', 'BANK_TRANSFER']);
 const QUOTE_TTL_SECONDS = 600;
 
 function safeEqual(a, b) {
@@ -41,22 +37,13 @@ exports.initiate = async (req, res) => {
     if (!Number.isFinite(amountGhs) || amountGhs <= 0) return res.status(400).json({ success: false, message: 'Invalid deposit amount.' });
     if (!PROVIDERS.has(provider)) return res.status(400).json({ success: false, message: `provider must be one of: ${[...PROVIDERS].join(', ')}.` });
 
-    // §P.5-C route-aware quote: this mounted initiation endpoint deterministically
-    // selects GENERIC_FIAT_AGGREGATOR and validates the requested rail. The
-    // route decision is persisted ON the quote and in the pending transaction.
-    const routeIdentity = routePolicy.resolveDepositRoute({ route: 'GENERIC_FIAT_AGGREGATOR', provider });
-    // Harness-safe header read: mock reqs in mounted-handler tests may omit
-    // headers entirely; a missing header is simply "no idempotency key".
-    const idempotencyHeader = req.headers && typeof req.headers === 'object' ? req.headers['idempotency-key'] : undefined;
-    const quoteIdentity = typeof idempotencyHeader === 'string' && idempotencyHeader.trim() ? idempotencyHeader.trim() : null;
-
     const { quote, tx } = await prisma.$transaction(async (db) => {
-      const quote = await createServerTransactionQuote({ prisma: db, marketOracle: req.app.get('marketOracle'), userId, purpose: 'deposit', amountGhs, ttlSeconds: QUOTE_TTL_SECONDS, routeIdentity, quoteIdentity });
+      const quote = await createServerTransactionQuote({ prisma: db, marketOracle: req.app.get('marketOracle'), userId, purpose: 'deposit', amountGhs, ttlSeconds: QUOTE_TTL_SECONDS });
       const reference = `${FIAT_REF_PREFIX}${userId}_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
       const tx = await db.transactionHistory.create({
         data: {
           userId, type: 'DEPOSIT_FIAT', amountUsdc: quote.usdcAmount, feeUsdc: 0, txHash: reference, status: 'PENDING', initiatedByUserId: userId,
-          metadata: { provider, amountGhs: quote.amountGhs, quoteId: quote.id, quoteAmountUsdc: quote.usdcAmount, quoteExpiresAt: quote.expiresAt, rateAtInitiation: quote.rateGhsPerUsdc, rateSource: quote.rateSource, rateAsOf: quote.rateAsOf, selectedRoute: quote.selectedRoute, routeProviderRail: quote.routeProviderRail, routePolicyVersion: quote.routePolicyVersion },
+          metadata: { provider, amountGhs: quote.amountGhs, quoteId: quote.id, quoteAmountUsdc: quote.usdcAmount, quoteExpiresAt: quote.expiresAt, rateAtInitiation: quote.rateGhsPerUsdc, rateSource: quote.rateSource, rateAsOf: quote.rateAsOf },
         },
       });
       return { quote, tx };
@@ -65,7 +52,7 @@ exports.initiate = async (req, res) => {
     return res.status(201).json({
       success: true,
       message: 'Deposit initiated. Complete the payment with your provider, then await confirmation.',
-      data: { reference: tx.txHash, quoteId: quote.id, status: 'PENDING', provider, amountGhs: quote.amountGhs, quotedRate: quote.rateGhsPerUsdc, usdcEquivalent: quote.usdcAmount, quoteValidUntil: quote.expiresAt, selectedRoute: quote.selectedRoute || null, routeProviderRail: quote.routeProviderRail || null, routePolicyVersion: quote.routePolicyVersion || null, instructions: [`Send GHS ${quote.amountGhs.toFixed(2)} via ${provider}.`, `Use reference: ${tx.txHash}`, 'Funds will appear in your Azaman wallet after provider confirmation.'], transaction: tx },
+      data: { reference: tx.txHash, quoteId: quote.id, status: 'PENDING', provider, amountGhs: quote.amountGhs, quotedRate: quote.rateGhsPerUsdc, usdcEquivalent: quote.usdcAmount, quoteValidUntil: quote.expiresAt, instructions: [`Send GHS ${quote.amountGhs.toFixed(2)} via ${provider}.`, `Use reference: ${tx.txHash}`, 'Funds will appear in your Azaman wallet after provider confirmation.'], transaction: tx },
     });
   } catch (error) {
     // 271C fail-closed stale-rate gate: no fresh external observation means
@@ -73,13 +60,6 @@ exports.initiate = async (req, res) => {
     // $transaction above never committed anything.
     if (error instanceof RateUnavailableError) {
       return res.status(503).json({ success: false, message: error.message, code: error.code });
-    }
-    // §P.5-C: a retried initiation under an existing Idempotency-Key fails
-    // closed — the caller's original initiation stands (no second quote, no
-    // second pending deposit). The middleware response cache normally answers
-    // retries first; this closes its fail-open hole at the database.
-    if (error instanceof QuoteIdentityConflictError) {
-      return res.status(409).json({ success: false, message: 'This idempotency key is already bound to a deposit initiation.', code: 'DEPOSIT_IDEMPOTENCY_CONFLICT' });
     }
     logger.error({ err: error }, '[quoteFiatDeposit] initiation error');
     return res.status(500).json({ success: false, message: 'Unable to create deposit quote.' });
@@ -136,16 +116,11 @@ exports.webhook = async (req, res) => {
     if (!quoteId) return res.status(409).json({ success: false, message: 'Deposit is missing its transaction quote.' });
     const result = await prisma.$transaction(async (tx) => {
       const quote = await consumeTransactionQuote({ prisma: tx, quoteId, userId: existing.userId, purpose: 'deposit' });
-      // §P.5-C settlement binding: this surface's authenticated identity is
-      // the fiat webhook secret. A quote created for a different route (e.g.
-      // MOOLRE_MOMO_COLLECTION) may NOT settle here — fail closed before any
-      // mutation. Historical quotes without a selectedRoute still settle.
-      routePolicy.assertSettlementRouteAllowed({ quote, settlementSurface: 'GENERIC_FIAT_WEBHOOK' });
       const quotedGhs = Number(quote.amountGhs);
       if (Math.abs(settledGhs - quotedGhs) > 0.01) throw new Error('Settled GHS amount does not match the transaction quote');
       const user = await tx.user.findUnique({ where: { id: existing.userId } });
       if (!user) throw new Error('User no longer exists for this deposit.');
-      const updatedTx = await tx.transactionHistory.update({ where: { id: existing.id }, data: { status: 'COMPLETED', amountUsdc: quote.usdcAmount, payerMsisdn: existing.payerMsisdn || null, metadata: { ...(existing.metadata || {}), providerTxId: providerTxId || null, settledAmountGhs: settledGhs, settledAt: new Date().toISOString(), settlementRate: quote.rateGhsPerUsdc, settledRoute: quote.selectedRoute || null, settledRoutePolicyVersion: quote.routePolicyVersion || null } } });
+      const updatedTx = await tx.transactionHistory.update({ where: { id: existing.id }, data: { status: 'COMPLETED', amountUsdc: quote.usdcAmount, payerMsisdn: existing.payerMsisdn || null, metadata: { ...(existing.metadata || {}), providerTxId: providerTxId || null, settledAmountGhs: settledGhs, settledAt: new Date().toISOString(), settlementRate: quote.rateGhsPerUsdc } } });
       await tx.user.update({ where: { id: existing.userId }, data: { availableBalance: { increment: quote.usdcAmount } } });
 
       // §P.4 AUTHORITATIVE ACCOUNTING — fiat-settled USDC deposit: customer
@@ -163,7 +138,7 @@ exports.webhook = async (req, res) => {
         userId: existing.userId,
         relatedEntity: 'transactionHistory',
         relatedEntityId: existing.id,
-        metadata: { source: 'fiat', quoteId, amountGhs: settledGhs, selectedRoute: quote.selectedRoute || null, routeProviderRail: quote.routeProviderRail || null },
+        metadata: { source: 'fiat', quoteId, amountGhs: settledGhs },
         lines: [
           { account: 'clearing:conversion', debit: quote.usdcAmount },
           { account: `user:${existing.userId}:liability`, credit: quote.usdcAmount },

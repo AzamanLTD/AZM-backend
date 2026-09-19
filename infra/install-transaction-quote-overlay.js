@@ -42,25 +42,6 @@ const STATEMENTS = [
         ON DELETE CASCADE ON UPDATE CASCADE;
     END IF;
   END $$;`,
-  // ---------------------------------------------------------------------
-  // §P.5-C route-aware quote authority — additive columns only. Historical
-  // rows keep NULL (missing route data is never fabricated), and the quote
-  // identity is DB-ENFORCED by a unique partial index (NULL = no identity).
-  // ---------------------------------------------------------------------
-  `ALTER TABLE "TransactionQuote" ADD COLUMN IF NOT EXISTS "inputAsset" TEXT;`,
-  `ALTER TABLE "TransactionQuote" ADD COLUMN IF NOT EXISTS "outputAsset" TEXT;`,
-  `ALTER TABLE "TransactionQuote" ADD COLUMN IF NOT EXISTS "selectedRoute" TEXT;`,
-  `ALTER TABLE "TransactionQuote" ADD COLUMN IF NOT EXISTS "routeProviderRail" TEXT;`,
-  `ALTER TABLE "TransactionQuote" ADD COLUMN IF NOT EXISTS "routePolicyVersion" TEXT;`,
-  `ALTER TABLE "TransactionQuote" ADD COLUMN IF NOT EXISTS "routeCandidates" JSONB;`,
-  `ALTER TABLE "TransactionQuote" ADD COLUMN IF NOT EXISTS "selectionProvenance" TEXT;`,
-  `ALTER TABLE "TransactionQuote" ADD COLUMN IF NOT EXISTS "quoteIdentity" TEXT;`,
-  // §P.5-C: idempotency keys are CALLER-generated and scoped per user —
-  // two users colliding on the same key must remain independent. The unique
-  // partial index is therefore on (userId, quoteIdentity), not global.
-  `DROP INDEX IF EXISTS "TransactionQuote_quoteIdentity_key";`,
-  `CREATE UNIQUE INDEX IF NOT EXISTS "TransactionQuote_userId_quoteIdentity_key"
-     ON "TransactionQuote"("userId", "quoteIdentity") WHERE "quoteIdentity" IS NOT NULL;`,
 ];
 
 async function installTransactionQuoteOverlay(client) {
