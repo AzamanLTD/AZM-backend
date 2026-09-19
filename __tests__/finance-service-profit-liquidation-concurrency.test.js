@@ -1,5 +1,16 @@
 const { liquidateProfits } = require('../services/finance.service');
 
+// §P.5-D: the GHS liquidity authority is not under test here — the regime
+// wrappers report "no reservation row" (legacy regime), so the legacy
+// SystemFiatPool behavior under test is exercised unchanged.
+jest.mock('../src/services/fiatLiquidityService', () => ({
+    isAuthorityEnabled: jest.fn().mockResolvedValue(false),
+    reserveForPayout: jest.fn(),
+    releaseIfRecorded: jest.fn().mockResolvedValue({ skipped: true }),
+    settleIfRecorded: jest.fn().mockResolvedValue({ skipped: true }),
+    inTransitIfRecorded: jest.fn().mockResolvedValue({ skipped: true }),
+}));
+
 describe('liquidateProfits concurrency guard', () => {
   test('only one concurrent liquidation can claim the same profit funds', async () => {
     let profitBalance = 10;

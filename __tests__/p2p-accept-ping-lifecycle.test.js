@@ -89,9 +89,34 @@ describeOrSkip('P2P accept-ping lifecycle integrity (real PostgreSQL)', () => {
                 trade.id,
                 'PENDING_PAYMENT'
             );
-            await tx.$executeRawUnsafe('SELECT pg_sleep(0.2)');
+            // Hold the trade lock long enough to PROVE the late top-up
+            // blocks on it. (The entry read may or may not still observe
+            // PENDING_PAYMENT — either way the in-tx guard must refuse.)
+            await tx.$executeRawUnsafe('SELECT pg_sleep(1)');
             await tx.trade.update({ where: { id: trade.id }, data: { status: 'CANCELLED' } });
         });
+
+        // Deterministically lose the lock race: wait until the terminal
+        // transaction is observed INSIDE its sleep (the trade row lock is
+        // provably held) before firing the accept-ping. Without this gate the
+        // accept tx could acquire the lock first and the terminal update
+        // would simply overwrite the topped-up trade — a different race
+        // outcome the test does not describe.
+        const deadline = Date.now() + 5000;
+        for (;;) {
+            const sleeping = await prisma.$queryRawUnsafe(
+                `SELECT 1 FROM pg_stat_activity
+                  WHERE state = 'active'
+                    AND query LIKE '%pg_sleep(1)%'
+                    -- exclude THIS poll's own query text, which also contains
+                    -- the pg_sleep(1) pattern string (it would self-match and
+                    -- break the gate open before the terminal lock is held)
+                    AND query NOT LIKE '%pg_stat_activity%'
+                  LIMIT 1`
+            );
+            if (sleeping.length > 0 || Date.now() > deadline) break;
+            await new Promise((r) => setTimeout(r, 25));
+        }
 
         const accept = p2pService.acceptPing(prisma, {
             tradeId: trade.id,
@@ -172,7 +197,14 @@ describeOrSkip('P2P accept-ping lifecycle integrity (real PostgreSQL)', () => {
             expect(Number(finalVendor.availableBalance)).toBeCloseTo(75, 6);
             expect(Number(finalVendor.vendorUnallocatedBalance)).toBeCloseTo(25, 6);
         } else {
-            expect(outcomes[0].error.message).toContain('no longer pending payment');
+            // The concurrent cancel can commit either before or after the
+            // top-up's entry read — both guards are fail-closed and leave the
+            // vendor's balances untouched, so either message is correct:
+            //   entry guard  → "trade status is CANCELLED."
+            //   in-tx guard → "no longer pending payment."
+            expect(outcomes[0].error.message).toMatch(
+                /no longer pending payment|trade status is CANCELLED/
+            );
             expect(Number(finalVendor.availableBalance)).toBeCloseTo(100, 6);
             expect(Number(finalVendor.vendorUnallocatedBalance)).toBeCloseTo(0, 6);
         }

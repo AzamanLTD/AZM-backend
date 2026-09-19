@@ -30,7 +30,16 @@ if (!hasDb) console.warn('[stale-rate-gate.test] TEST_DATABASE_URL not set — s
 
 describeOrSkip('271C fail-closed stale-rate gate (real PostgreSQL)', () => {
     let prisma;
-    const { seedUser } = require('./helpers/factories');
+    const { seedUser: _seedUser } = require('./helpers/factories');
+    // Battery hygiene: this suite's users (and their TransactionQuote /
+    // TransactionHistory children) must not outlive it — later suites sweep
+    // `user_*` rows and an FK orphan breaks their beforeAll cleanup.
+    const _myUserIds = [];
+    const seedUser = async (prisma, overrides = {}) => {
+        const u = await _seedUser(prisma, overrides);
+        _myUserIds.push(u.id);
+        return u;
+    };
     const {
         getFreshServerRateGhsPerUsdc,
         RateUnavailableError,
@@ -46,9 +55,43 @@ describeOrSkip('271C fail-closed stale-rate gate (real PostgreSQL)', () => {
         process.env.FIAT_WEBHOOK_SECRET = 'test_webhook_secret_271c';
         const { PrismaClient } = require('@prisma/client');
         prisma = new PrismaClient();
+        // This suite deliberately seeds NON-POSITIVE rates to prove the GATE
+        // rejects them before any financial intent forms. On a CHECK-armed
+        // database (drift-remediation armor: GS_liveRetailRate_pos,
+        // GS_liveUsdToGhs_pos) the seed write itself is refused, so relax the
+        // two rate-positivity guards for the lifetime of this suite and
+        // RESTORE them afterwards — exactly the armor-preserved testing
+        // convention used by the §P.5-D suites.
+        rateArmor = (await prisma.$queryRawUnsafe(
+            `SELECT conname FROM pg_constraint WHERE conrelid = '"public"."GlobalSettings"'::regclass AND conname IN ('GS_liveRetailRate_pos','GS_liveUsdToGhs_pos')`
+        )).map((r) => r.conname);
+        for (const name of rateArmor) {
+            await prisma.$executeRawUnsafe(`ALTER TABLE "GlobalSettings" DROP CONSTRAINT "${name}"`);
+        }
     });
 
-    afterAll(async () => { if (prisma) await prisma.$disconnect(); });
+    let rateArmor = [];
+
+    afterAll(async () => {
+        if (prisma && _myUserIds.length > 0) {
+            await prisma.$executeRawUnsafe(
+                'DELETE FROM "TransactionQuote" WHERE "userId" = ANY($1::int[])',
+                _myUserIds
+            );
+            await prisma.$executeRawUnsafe(
+                'DELETE FROM "TransactionHistory" WHERE "userId" = ANY($1::int[])',
+                _myUserIds
+            );
+            await prisma.user.deleteMany({ where: { id: { in: _myUserIds } } });
+        }
+        if (!prisma) return;
+        for (const name of rateArmor) {
+            await prisma.$executeRawUnsafe(
+                `ALTER TABLE "GlobalSettings" ADD CONSTRAINT "${name}" CHECK ("${name === 'GS_liveRetailRate_pos' ? 'liveRetailRate' : 'liveUsdToGhs'}" > 0) NOT VALID`
+            );
+        }
+        await prisma.$disconnect();
+    });
 
     // ---- helpers -------------------------------------------------------------
 

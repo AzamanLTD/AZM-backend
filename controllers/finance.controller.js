@@ -37,6 +37,8 @@ function _getNotificationService(req) {
 // =============================================================================
 
 const financeService               = require('../services/finance.service');
+const fiatLiquidity                = require('../src/services/fiatLiquidityService'); // §P.5-D
+const { recordReconciliationException } = require('../services/reconciliationExceptionService');
 const { FIAT_POOL_ALERT_THRESH }   = financeService;
 const crypto                       = require('crypto');
 const logger = require('../src/config/logger');
@@ -146,12 +148,16 @@ exports.fiatWithdrawal = async (req, res) => {
             prisma,
             userId,
             amountFloat,
-            { reference, retailRate: rates.retailRate, payoutGhs }
+            { reference, retailRate: rates.retailRate, payoutGhs,
+              // §P.5-D provider/rail/destination identity for the GHS
+              // liquidity reservation (no-ops while the authority flag is OFF).
+              liquidityRoute: { provider: 'MOOLRE', rail: 'MOMO', destination: recipientPhone } }
         );
 
         // ── Moolre disbursement (outside the DB transaction) ────────────────
         // Routes ALL networks through Moolre: MTN=ch1, Telecel=ch6, AT=ch7.
         let disbursementResult;
+        let dispatched = false;
         try {
             disbursementResult = await moolreDisbursementService.initiateTransfer({
                 referenceId:    reference,
@@ -162,7 +168,50 @@ exports.fiatWithdrawal = async (req, res) => {
                 payerMessage:   `Azaman withdrawal ref ${reference}`,
                 payeeNote:      `Azaman MoMo payout (${networkChoice})`
             });
+            dispatched = true;
+
+            // §P.5-D POST-DISPATCH BOOKKEEPING: the provider HAS the payout —
+            // durable outbound evidence + the RESERVED → IN_TRANSIT claim. If
+            // either fails, the payout CANNOT be recalled and must NOT be
+            // auto-refunded (the provider still pays it out — a refund would
+            // double-spend). The guard in the catch below fails loudly instead.
+            await fiatLiquidity.recordProviderEvent(prisma, {
+                provider: 'MOOLRE',
+                rail: 'MOMO',
+                direction: 'OUTBOUND',
+                status: String(disbursementResult?.status || 'DISPATCH_ACCEPTED'),
+                providerRef: disbursementResult?.providerRef || null,
+                dedupKey: `event:payout-dispatch:MOOLRE:${reference}`,
+                amountGhs: payoutGhs,
+                relatedReference: reference,
+                raw: { externalId: `AZAMAN_${userId}`, recipientPhone, network: networkChoice },
+            });
+            await fiatLiquidity.inTransitIfRecorded(prisma, {
+                reference,
+                providerRef: disbursementResult?.providerRef || null,
+            });
         } catch (gatewayErr) {
+            if (dispatched) {
+                // §P.5-D double-spend guard: the payout left for the provider.
+                // NEVER auto-refund dispatched cash — flag loudly; the
+                // settlement callback / recon worker still settles the
+                // canonical TransactionHistory row, and the reservation stays
+                // held (RESERVED, not spendable).
+                logger.error({ err: gatewayErr, reference },
+                    '[fiatWithdrawal] CRITICAL: §P.5-D post-dispatch evidence/IN_TRANSIT failed — payout in flight, NOT refunding');
+                await recordReconciliationException(prisma, {
+                    entityType: 'TRANSACTION',
+                    entityId: reference,
+                    reference,
+                    reason: 'POST_DISPATCH_BOOKKEEPING_FAILED',
+                    details: { provider: 'MOOLRE', error: gatewayErr.message },
+                }).catch(() => null);
+                return res.status(503).json({
+                    success: false,
+                    message: 'Withdrawal dispatched but a bookkeeping step failed. The payout is in flight; support has been alerted. Do not retry.',
+                    data: { reference }
+                });
+            }
             logger.error({ err: gatewayErr }, '[fiatWithdrawal] Disbursement dispatch failed');
             // Roll back the debit + the SystemMasterCrypto capture so the
             // user is not stuck and Azaman is not double-credited.

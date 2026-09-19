@@ -249,6 +249,18 @@ async function seedSavingsGoal(prisma, overrides = {}) {
             status:                 g.status ?? 'ACTIVE',
         },
     });
+    // Goal funds are escrow-backed: the deposit path increments the user's
+    // escrowLockedBalance by the GHS amount converted at the canonical
+    // default rate (15.0, mirroring the controller's fallback when no
+    // GlobalSettings row exists). Seeding goal funds without the matching
+    // escrow projection violates User_escrowLockedBalance_nonneg on withdraw.
+    const seededGhs = g.currentAmountGhs ?? 0;
+    if (seededGhs > 0) {
+        await prisma.user.update({
+            where: { id: user.id },
+            data:  { escrowLockedBalance: { increment: parseFloat((seededGhs / 15.0).toFixed(6)) } },
+        });
+    }
     return { user, goal };
 }
 

@@ -20,6 +20,8 @@ const ledger = require('../services/ledgerService'); // §P.4 authoritative ledg
 const restrictedObligations = require('../services/restrictedObligationService');
 const financeService          = require('../services/finance.service');
 const { runDoubleCheck }      = require('../utils/securityCheck');
+const fiatLiquidity           = require('../src/services/fiatLiquidityService'); // §P.5-D
+const { recordReconciliationException } = require('../services/reconciliationExceptionService');
 const axios                   = require('axios');
 const { randomUUID }          = require('crypto');
 const { audit }               = require('../utils/audit');
@@ -156,7 +158,10 @@ exports.fiatWithdrawal = async (req, res) => {
                     ? (tx) => azmSpendService.applyFeeDiscountInTransaction(
                         tx, userId, feeDiscountTierId, reference
                     )
-                    : null
+                    : null,
+                // §P.5-D: provider/rail/destination identity for the GHS
+                // liquidity reservation (no-ops while the authority flag is OFF).
+                liquidityRoute: { provider: 'MTN_MOMO', rail: 'MOMO', destination: phone }
             }
         );
 
@@ -255,8 +260,12 @@ exports.fiatWithdrawal = async (req, res) => {
             });
         }
 
+        let dispatch = null;
         try {
-            const dispatch = await mtnDisbursementService.initiateTransfer({
+            // If initiateTransfer throws, `dispatch` stays null and the catch
+            // below reverses the reservation — cash never left. Any failure
+            // AFTER a successful dispatch hits the double-spend guard there.
+            dispatch = await mtnDisbursementService.initiateTransfer({
                 referenceId:    reference,
                 amountGhs:      data.payoutGhs || data.withdrawalAmount,  // GHS amount derived by service if available
                 recipientPhone: phone,
@@ -264,6 +273,42 @@ exports.fiatWithdrawal = async (req, res) => {
                 payerMessage:   `Azaman withdrawal ref ${reference}`,
                 payeeNote:      `Withdrawal ${reference}`
             });
+
+        // §P.5-D POST-DISPATCH BOOKKEEPING: the provider HAS the payout — cash
+        // is moving. Durable outbound evidence + the RESERVED → IN_TRANSIT
+        // claim must both succeed, but if they fail the payout can NOT be
+        // recalled by the catch below (auto-refunding a dispatched payout
+        // double-spends: the provider still pays it out). Fail loudly instead:
+        // exception row + alert, reservation stays RESERVED (held, not
+        // spendable), and the settlement webhook/recon worker still settles
+        // the canonical TransactionHistory row.
+        try {
+            await fiatLiquidity.recordProviderEvent(prisma, {
+                provider: 'MTN_MOMO',
+                rail: 'MOMO',
+                direction: 'OUTBOUND',
+                status: String(dispatch?.status || 'DISPATCH_ACCEPTED'),
+                providerRef: dispatch?.data?.reference || dispatch?.providerRef || null,
+                dedupKey: `event:payout-dispatch:MTN_MOMO:${reference}`,
+                amountGhs: data.payoutGhs || data.withdrawalAmount || null,
+                relatedReference: reference,
+                raw: { externalId: reference, recipientPhone: phone },
+            });
+            await fiatLiquidity.inTransitIfRecorded(prisma, {
+                reference,
+                providerRef: dispatch?.data?.reference || dispatch?.providerRef || null,
+            });
+        } catch (bookkeepingErr) {
+            logger.error({ err: bookkeepingErr, reference },
+                '[fiatWithdrawal] CRITICAL: §P.5-D post-dispatch evidence/IN_TRANSIT failed — NOT auto-refunding a dispatched payout');
+            await recordReconciliationException(prisma, {
+                entityType: 'TRANSACTION',
+                entityId: reference,
+                reference,
+                reason: 'POST_DISPATCH_BOOKKEEPING_FAILED',
+                details: { provider: 'MTN_MOMO', error: bookkeepingErr.message },
+            }).catch(() => null);
+        }
 
             // Low-liquidity admin alert (post-dispatch so the user is not blocked).
             if (data.fiatPoolLow) {
@@ -334,6 +379,38 @@ exports.fiatWithdrawal = async (req, res) => {
                 }
             });
         } catch (mtnErr) {
+            if (dispatch) {
+                // §P.5-D double-spend guard: the provider ALREADY accepted
+                // this payout — a failure in any post-dispatch step must
+                // NEVER auto-refund it (the provider will still pay it out;
+                // a refund would pay twice). Fail loudly: exception row +
+                // admin alert, reservation stays held, settlement still
+                // arrives via the provider callback / recon worker.
+                logger.error({ err: mtnErr, reference },
+                    '[fiatWithdrawal] CRITICAL: post-dispatch failure — payout in flight, NOT refunding');
+                await recordReconciliationException(prisma, {
+                    entityType: 'TRANSACTION',
+                    entityId: reference,
+                    reference,
+                    reason: 'POST_DISPATCH_FAILURE_NO_REFUND',
+                    details: { provider: 'MTN_MOMO', error: mtnErr.message, dispatched: true },
+                }).catch(() => null);
+                if (io) {
+                    io.emit('admin_alert', {
+                        type: 'WITHDRAWAL_POST_DISPATCH_FAILURE',
+                        reference,
+                        userId,
+                        error: mtnErr.message,
+                        timestamp: new Date().toISOString()
+                    });
+                }
+                return res.status(503).json({
+                    success: false,
+                    message: 'Withdrawal dispatched but a bookkeeping step failed. The payout is in flight; support has been alerted. Do not retry.'
+                });
+            }
+            // Reached only when initiateTransfer itself failed (the dispatch
+            // never happened) — unwinding the ledger is safe.
             logger.error({ err: mtnErr }, '[fiatWithdrawal] MTN dispatch failed — unwinding ledger');
             let reversalSucceeded = false;
             try {
@@ -606,11 +683,24 @@ exports.cryptoWithdrawal = async (req, res) => {
             // Synthetic treasury bookkeeping is intentionally unchanged (§P.3
             // will formalize custody accounting). The CustodyExecution record
             // is what later reconciles this against real chain evidence.
-            await tx.systemHotWallet.upsert({
-                where:  { id: 1 },
-                update: { balance: { decrement: new Prisma.Decimal(netPayoutExact) } },
-                create: { id: 1, balance: new Prisma.Decimal(netPayoutExact).neg() }
+            //
+            // The treasury debit is a CONDITIONAL, CHECK-armor-safe decrement.
+            // Postgres evaluates CHECK constraints on the proposed INSERT row
+            // BEFORE ON CONFLICT arbitration, so an upsert whose create branch
+            // proposes a negative balance fails even when the singleton exists
+            // (SystemHotWallet_balance_nonneg is live drift-remediation
+            // armor). A never-funded or overdrawn synthetic treasury must
+            // refuse the payout — the customer debit rolls back with it —
+            // instead of manufacturing unbacked treasury debt.
+            const treasuryDebit = await tx.systemHotWallet.updateMany({
+                where: { id: 1, balance: { gte: new Prisma.Decimal(netPayoutExact) } },
+                data:  { balance: { decrement: new Prisma.Decimal(netPayoutExact) } },
             });
+            if (treasuryDebit.count !== 1) {
+                throw new Error(
+                    `Treasury hot wallet cannot cover the payout. Required: ${netPayoutExact} USDC.`
+                );
+            }
             await tx.systemProfitFees.upsert({
                 where:  { id: 1 },
                 update: { balance: { increment: new Prisma.Decimal(feeExact) } },

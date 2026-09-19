@@ -85,9 +85,11 @@ const _debitUserBalance = async (tx, userId, amount) => {
 
 const ledger = require('./ledgerService'); // §P.4 authoritative ledger
 const restrictedObligations = require('./restrictedObligationService'); // §P.4 persisted restricted obligations
+const fiatLiquidity = require('../src/services/fiatLiquidityService'); // §P.5-D GHS liquidity authority
 
 const processFiatWithdrawal = async (prisma, userId, amountFloat, opts = {}) => {
     await runDoubleCheck(prisma, userId);
+    const liquidityAuthorityOn = await fiatLiquidity.isAuthorityEnabled(prisma);
     const referrer = await _resolveReferrer(prisma, userId);
 
     const settings = await prisma.globalSettings.findUnique({ where: { id: 1 } });
@@ -128,14 +130,26 @@ const processFiatWithdrawal = async (prisma, userId, amountFloat, opts = {}) => 
         throw err;
     }
 
-    const fiatPool = await prisma.systemFiatPool.findUnique({ where: { id: 1 } });
-    if (!fiatPool || Number(fiatPool.balance) < amountFloat) {
-        const err = new Error(
-            'MoMo payouts are temporarily at capacity. Your USDC has not been deducted. ' +
-            'Please try again in a few minutes or contact support.'
-        );
-        err.code = 'FIAT_POOL_INSUFFICIENT';
-        throw err;
+    // §P.5-D preflight split: with the liquidity authority OFF, the legacy
+    // SystemFiatPool (a USDC-unit scalar in that mode) preflight stays
+    // byte-identical. With the authority ON, SystemFiatPool is only a
+    // derived GHS projection — comparing it against a USDC amount here is
+    // unit-nonsense that could false-reject or false-admit a withdrawal on
+    // stale/legacy data. The authoritative liquidity decision is the atomic
+    // fiatLiquidity.reserveForPayout() claim inside the transaction below,
+    // which fails closed (FIAT_POOL_INSUFFICIENT, identical user-facing
+    // message) and rolls back the user debit when the exact payoutGhs
+    // cannot be claimed from FiatLiquidityState.availableGhs.
+    if (!liquidityAuthorityOn) {
+        const fiatPool = await prisma.systemFiatPool.findUnique({ where: { id: 1 } });
+        if (!fiatPool || Number(fiatPool.balance) < amountFloat) {
+            const err = new Error(
+                'MoMo payouts are temporarily at capacity. Your USDC has not been deducted. ' +
+                'Please try again in a few minutes or contact support.'
+            );
+            err.code = 'FIAT_POOL_INSUFFICIENT';
+            throw err;
+        }
     }
 
     const result = await prisma.$transaction(async (tx) => {
@@ -151,7 +165,15 @@ const processFiatWithdrawal = async (prisma, userId, amountFloat, opts = {}) => 
             throw err;
         }
 
-        await _reserveFiatPool(tx, amountFloat);
+        // §P.5-D: with the liquidity authority flag ON, the withdrawal
+        // reserves claimable GHS through the evidence-backed authority
+        // (exact pesewas; SystemFiatPool becomes its derived projection).
+        // With the flag OFF, the legacy SystemFiatPool conditional decrement
+        // stays byte-identical. A claim loser rolls back this whole
+        // transaction (user debit included) either way.
+        if (!liquidityAuthorityOn) {
+            await _reserveFiatPool(tx, amountFloat);
+        }
         await _debitUserBalance(tx, userId, totalDeduct);
 
         // P0 atomicity: the AZM fee-discount debit runs on the SAME tx as the
@@ -217,6 +239,21 @@ const processFiatWithdrawal = async (prisma, userId, amountFloat, opts = {}) => 
                 }
             }
         });
+
+        // §P.5-D authority reservation (flag ON): linked to the committed
+        // TransactionHistory row. Conflicting reuse of the reference fails
+        // closed; insufficient GHS rolls the whole transaction back.
+        if (liquidityAuthorityOn) {
+            const route = opts.liquidityRoute || {};
+            await fiatLiquidity.reserveForPayout(tx, {
+                reference,
+                amountGhs: payoutGhs,
+                provider: route.provider || 'MTN_MOMO',
+                rail: route.rail || 'MOMO',
+                destination: route.destination || null,
+                relatedTransactionId: txRecord.id,
+            });
+        }
 
         // §P.4 AUTHORITATIVE ACCOUNTING — inside the SAME reservation
         // transaction as the USDC debit, the fiat-pool reservation and the
@@ -421,6 +458,16 @@ const completeFiatWithdrawal = async (prisma, reference, { providerTxId = null }
             }
         }
 
+        // §P.5-D: terminal GHS liquidity outcome for authority reservations
+        // (IN_TRANSIT → PAID_OUT; contradictory or undelivered states
+        // quarantine — never a throw on the mounted settle path, never a
+        // rewrite of terminal history). Legacy withdrawals skip.
+        await fiatLiquidity.settleIfRecorded(tx, {
+            reference,
+            outcome: 'SUCCESSFUL',
+            providerTxId,
+        });
+
         const transaction = await tx.transactionHistory.findUnique({ where: { txHash: reference } });
         return { changed: true, transaction };
     });
@@ -534,10 +581,34 @@ const reverseFiatWithdrawal = async (prisma, reference, opts = {}) => {
             where: { id: 1 },
             data: { balance: { decrement: amountFloat } }
         });
-        await tx.systemFiatPool.update({
-            where: { id: 1 },
-            data: { balance: { increment: amountFloat } }
-        });
+        // §P.5-D: the reversal releases GHS through the SAME regime that
+        // reserved it. A provider-terminal FAILED observation (opts.providerTerminal)
+        // is DURABLE evidence the cash never left custody — the authority
+        // settles the reservation with that evidence (IN_TRANSIT funds
+        // return to available; contradictory terminal observations
+        // quarantine through the same path). An INTERNAL reversal (no
+        // provider evidence) releases conservatively: IN_TRANSIT cash
+        // positions are quarantined, never auto-released. A legacy
+        // withdrawal (no reservation row) keeps the legacy SystemFiatPool
+        // re-credit.
+        const liquidityRelease = opts.providerTerminal
+            ? await fiatLiquidity.settleIfRecorded(tx, {
+                reference,
+                outcome: 'FAILED',
+                providerTxId: opts.providerTxId ?? null,
+                reason: opts.reason || 'provider reported FAILED settlement',
+            })
+            : await fiatLiquidity.releaseIfRecorded(tx, {
+                reference,
+                reason: opts.reason || 'reversal',
+            });
+        if (liquidityRelease.skipped) {
+            await _ensureFiatPoolSingleton(tx);
+            await tx.systemFiatPool.update({
+                where: { id: 1 },
+                data: { balance: { increment: amountFloat } }
+            });
+        }
 
         // P0: restore the AZM fee-discount spend INSIDE this same reversal
         // transaction. The PENDING -> FAILED claim above is the one-winner
@@ -620,9 +691,33 @@ const reverseFiatWithdrawal = async (prisma, reference, opts = {}) => {
 };
 
 const liquidateProfits = async (prisma, amountFloat, adminId, auditContext = {}) => {
+    const liquidityAuthorityOn = await fiatLiquidity.isAuthorityEnabled(prisma);
+    let treasuryRate = null;
+    let treasuryRateSource = null;
+    let treasuryRateAsOf = null;
+    if (liquidityAuthorityOn) {
+        // §P.5-D / NO-SYNTHETIC-GHS: liquidateProfits is an INTERNAL USDC
+        // profit-account operation. It is NOT evidence that GHS cash entered
+        // custody — no bank transfer, no MoMo collection happened. With the
+        // authority ON the liquidation is recorded as an AUDITED, NON-AVAILABLE
+        // treasury opening priced at the canonical retail rate (provider
+        // AZM_TREASURY, status RECEIVED). It CANNOT become AVAILABLE GHS from
+        // here: only fiatLiquidity.confirmTreasuryOpening with a durable
+        // external GHS funding observation (bank/MoMo transfer evidence)
+        // can unlock it — a separate, explicitly human-attested step.
+        const settings = await prisma.globalSettings.findUnique({ where: { id: 1 } });
+        treasuryRate = Number(settings?.liveRetailRate);
+        if (!(treasuryRate > 0)) {
+            const err = new Error('Treasury liquidation requires a canonical retail rate (liveRetailRate unavailable).');
+            err.code = 'TREASURY_RATE_UNAVAILABLE';
+            throw err;
+        }
+        treasuryRateSource = settings?.liveRateSource || null;
+        treasuryRateAsOf = settings?.lastExternalSync || settings?.lastRateSync || new Date();
+    }
     const result = await prisma.$transaction(async (tx) => {
         await _ensureProfitFeesSingleton(tx);
-        await _ensureFiatPoolSingleton(tx);
+        if (!liquidityAuthorityOn) await _ensureFiatPoolSingleton(tx);
 
         const claim = await tx.systemProfitFees.updateMany({
             where: { id: 1, balance: { gte: amountFloat } },
@@ -635,11 +730,34 @@ const liquidateProfits = async (prisma, amountFloat, adminId, auditContext = {})
             throw err;
         }
 
-        await tx.systemFiatPool.update({
-            where: { id: 1 },
-            data: { balance: { increment: amountFloat } }
-        });
         const profitLog = await tx.adminProfitLog.create({ data: { amountUsdc: amountFloat, source: 'ARBITRAGE_SPREAD', relatedTxId: `liquidation_admin_${adminId}_${Date.now()}` } });
+        if (liquidityAuthorityOn) {
+            // Audited, NON-AVAILABLE treasury opening only. The internal USDC
+            // move itself creates NO spendable GHS — see the header comment.
+            const amountGhs = parseFloat((amountFloat * treasuryRate).toFixed(2));
+            await fiatLiquidity.recordReceipt(tx, {
+                provider: 'AZM_TREASURY',
+                rail: 'INTERNAL',
+                dedupKey: `treasury:liquidation:${profitLog.relatedTxId}`,
+                amountGhs,
+                treasury: true,
+                evidence: {
+                    kind: 'AUDITED_TREASURY_OPENING',
+                    amountUsdc: amountFloat,
+                    adminId,
+                    adminProfitLogId: profitLog.id,
+                    retailRate: treasuryRate,
+                    rateSource: treasuryRateSource,
+                    rateAsOf: treasuryRateAsOf instanceof Date ? treasuryRateAsOf.toISOString() : treasuryRateAsOf,
+                    availability: 'NONE — an external GHS funding event is required before this opening can be confirmed',
+                },
+            });
+        } else {
+            await tx.systemFiatPool.update({
+                where: { id: 1 },
+                data: { balance: { increment: amountFloat } }
+            });
+        }
 
         await audit(tx, {
             actorId: auditContext.actorId ?? adminId,
@@ -660,6 +778,21 @@ const liquidateProfits = async (prisma, amountFloat, adminId, auditContext = {})
         ]);
         return { profitLog, updatedProfitFees, updatedFiatPool };
     });
+    if (liquidityAuthorityOn) {
+        // NO-SYNTHETIC-GHS: the response explicitly does NOT report spendable
+        // GHS creation — an internal USDC liquidation created a NON-AVAILABLE
+        // treasury opening only (requires external GHS funding evidence to
+        // become AVAILABLE via the treasury confirmation boundary).
+        return {
+            amountLiquidated: amountFloat,
+            newProfitFees: result.updatedProfitFees.balance,
+            newFiatPool: result.updatedFiatPool.balance,
+            profitLog: result.profitLog,
+            treasuryOpeningRecorded: true,
+            ghsAvailableCreated: '0.00',
+            ghsAvailabilityNote: 'Internal USDC liquidation records a non-available treasury opening only; confirming it requires an external GHS funding event (confirmTreasuryOpening).'
+        };
+    }
     return { amountLiquidated: amountFloat, newProfitFees: result.updatedProfitFees.balance, newFiatPool: result.updatedFiatPool.balance, profitLog: result.profitLog };
 };
 

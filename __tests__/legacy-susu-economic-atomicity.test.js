@@ -497,6 +497,14 @@ describeOrSkip('Legacy Susu economic atomicity (real PostgreSQL)', () => {
                 status: 'PAID',
             },
         });
+        // The historical member debit escrowed the contributor's funds (the
+        // collection path increments escrowLockedBalance) — mirror the
+        // projection so the payout's escrow drain stays non-negative on
+        // CHECK-armed databases.
+        await prisma.user.update({
+            where: { id: paidEarly.id },
+            data: { escrowLockedBalance: { increment: 10 } },
+        });
 
         const svc = makeService(prisma);
         const report = await svc.processCycle(cycle.id);

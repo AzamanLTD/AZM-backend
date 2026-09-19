@@ -368,14 +368,14 @@ describeOrSkip('§P.4 wave-2 writer coverage (real PostgreSQL)', () => {
     describe('projection reconciliation (wave-2 buckets)', () => {
         it('flags dispute and unallocated drift; clean books produce no exceptions', async () => {
             // A user with a ledger liability account (so reconciliation iterates them).
-            const user = await seedUser(prisma, { availableBalance: 5 });
+            const user = await seedUser(prisma, { availableBalance: 15 });
             await prisma.$transaction(async (tx) => {
                 await ledger.post(tx, {
                     idempotencyKey: `test:recon-fund:${user.id}`,
                     entryType: 'DEPOSIT', description: 'funding',
                     lines: [
-                        { account: 'clearing:conversion', debit: '5' },
-                        { account: `user:${user.id}:liability`, credit: '5' },
+                        { account: 'clearing:conversion', debit: '15' },
+                        { account: `user:${user.id}:liability`, credit: '15' },
                     ],
                 });
             });
@@ -408,9 +408,11 @@ describeOrSkip('§P.4 wave-2 writer coverage (real PostgreSQL)', () => {
                     ],
                 });
                 // NOTE: the ledger now also disagrees on the LIABILITY side
-                // (ledger available 5-10=-5 vs projection 5) — align the
+                // (ledger available 15-10=5 vs projection 15) — align the
                 // projection to the books like a migrated writer would.
-                await tx.user.update({ where: { id: user.id }, data: { availableBalance: D(-5) } });
+                // (Funded at 15 so the aligned projection stays >= 0 — the
+                // User_availableBalance_nonneg armor refuses negative ones.)
+                await tx.user.update({ where: { id: user.id }, data: { availableBalance: D(5) } });
             });
             expect(await kindsFor()).toEqual([]);
             // restore for the next scenario
@@ -423,7 +425,7 @@ describeOrSkip('§P.4 wave-2 writer coverage (real PostgreSQL)', () => {
                         { account: `${userKey}:liability`, credit: '10' },
                     ],
                 });
-                await tx.user.update({ where: { id: user.id }, data: { availableBalance: D(5), disputeEscrowBalance: D(0) } });
+                await tx.user.update({ where: { id: user.id }, data: { availableBalance: D(15), disputeEscrowBalance: D(0) } });
             });
             expect(await kindsFor()).toEqual([]);
 

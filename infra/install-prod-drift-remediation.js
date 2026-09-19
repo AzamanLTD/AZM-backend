@@ -204,7 +204,6 @@ const CHECK_CONSTRAINTS = [
   // escrow funding/susu/invoice/refund flows — proven by the full battery
   // against the CHECK-armed rehearsal DB (16 failures, all TH_amountUsdc_nonneg).
   { table: "TransactionHistory", name: "TH_feeUsdc_nonneg", expr: `"feeUsdc" >= 0` },
-  { table: "AdminProfitLog", name: "APL_amountUsdc_nonneg", expr: `"amountUsdc" >= 0` },
   { table: "ColdStorageLog", name: "CSL_amountUsdc_nonneg", expr: `"amountUsdc" >= 0` },
   { table: "ProfitWithdrawalLog", name: "PWL_amountUsdc_nonneg", expr: `"amountUsdc" >= 0` },
   { table: "OperationalExpense", name: "OE_costUsdc_nonneg", expr: `"costUsdc" >= 0` },
@@ -239,10 +238,32 @@ const CHECK_CONSTRAINTS = [
   { table: "AzmAuctionBid", name: "AzmAuctionBid_bidAmount_check", expr: `"bidAmountAzm" > 0` }
 ];
 
+// Signed-ledger CHECKs an earlier revision of this installer shipped by
+// mistake. AdminProfitLog.amountUsdc is SIGNED: the crypto-withdrawal refund
+// path posts a NEGATIVE GAS_FEE_REVENUE reversal row (the fee was never
+// earned on a failed withdrawal) — same lesson as TransactionHistory
+// (TH_amountUsdc_nonneg, removed above). A nonneg CHECK here breaks the
+// exactly-once refund of failed crypto withdrawals.
+const OBSOLETE_CHECKS = [
+  { table: "AdminProfitLog", name: "APL_amountUsdc_nonneg" },
+];
+
 async function stage2(db) {
   console.log('[stage 2] CHECK constraints (NOT VALID + VALIDATE)');
-  let added = 0, alreadyThere = 0, failed = 0;
+  let added = 0, alreadyThere = 0, failed = 0, dropped = 0;
   const pendingValidation = [];
+
+  // Constraints an earlier revision of this installer shipped that are WRONG
+  // and must be dropped wherever they exist (this installer is idempotent and
+  // must also CONVERGE deployments that already carry them).
+  for (const c of OBSOLETE_CHECKS) {
+    const exists = await db.$queryRawUnsafe(
+      `SELECT 1 FROM pg_constraint WHERE conname = '${c.name}' AND connamespace = 'public'::regnamespace`
+    );
+    if (exists.length === 0) continue;
+    const dropOk = await run(db, `DROP ${c.name}`, `ALTER TABLE "${c.table}" DROP CONSTRAINT IF EXISTS "${c.name}"`);
+    if (dropOk) dropped++;
+  }
 
   for (const c of CHECK_CONSTRAINTS) {
     const exists = await db.$queryRawUnsafe(
@@ -278,7 +299,7 @@ async function stage2(db) {
     }
   }
 
-  console.log(`  added: ${added}, already present: ${alreadyThere}, failed: ${failed}, pending validation: ${pendingValidation.length}`);
+  console.log(`  added: ${added}, already present: ${alreadyThere}, dropped obsolete: ${dropped}, failed: ${failed}, pending validation: ${pendingValidation.length}`);
   for (const p of pendingValidation) {
     console.warn(`  PENDING VALIDATION: ${p.constraint} on ${p.table} — ${p.violations ?? p.error}`);
     console.warn(`    (constraint IS enforced for new writes; historical rows need a data-repair decision)`);

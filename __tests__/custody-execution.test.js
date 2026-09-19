@@ -889,6 +889,17 @@ describeOrSkip('§P.2 withdrawalController.cryptoWithdrawal (real PostgreSQL + r
         return { req, res };
     }
 
+    // The synthetic treasury singleton must HOLD the funds it pays out —
+    // SystemHotWallet_balance_nonneg (drift-remediation armor) refuses the
+    // payout debit from an empty wallet. Seed it before each flow.
+    async function seedHotWallet(balance = 1000) {
+        await prisma.systemHotWallet.upsert({
+            where:  { id: 1 },
+            update: { balance },
+            create: { id: 1, balance },
+        });
+    }
+
     async function seededUser(balance = 500) {
         // seedUser backs the starting balance with a matching COMPLETED
         // deposit row, so runDoubleCheck's Sum(ledger) == balance audit passes.
@@ -912,6 +923,7 @@ describeOrSkip('§P.2 withdrawalController.cryptoWithdrawal (real PostgreSQL + r
 
     it('gates ON + KMS pending-signing → 202 with NO tx hash, PENDING ledger row, SIGNING execution, exact-once debit', async () => {
         const user = await seededUser(500);
+        await seedHotWallet(1000);
         const provider = fakeProvider({ pendingId: 'tatum-ctrl-1' });
         custody.__setProviderForTests(provider);
         const { req, res } = makeReqRes({ userId: user.id, body: { amount: '50.000000', destination: DEST } });
@@ -938,7 +950,10 @@ describeOrSkip('§P.2 withdrawalController.cryptoWithdrawal (real PostgreSQL + r
         const hot = await prisma.systemHotWallet.findUnique({ where: { id: 1 } });
         const fees = await prisma.systemProfitFees.findUnique({ where: { id: 1 } });
         const netPayout = Number(ledger.amountUsdc);
-        expect(Number(hot.balance)).toBeCloseTo(-netPayout, 6);
+        // The treasury debit is now conditional and CHECK-armor-safe: it only
+        // succeeds against a FUNDED wallet (deposits credit it), never by
+        // proposing a negative INSERT row the armor would reject pre-arbitration.
+        expect(Number(hot.balance)).toBeCloseTo(1000 - netPayout, 6);
         expect(Number(fees.balance)).toBeCloseTo(Number(ledger.feeUsdc), 6);
 
         // The submitted provider payload is the EXACT Tatum contract: decimal
@@ -960,6 +975,7 @@ describeOrSkip('§P.2 withdrawalController.cryptoWithdrawal (real PostgreSQL + r
 
     it('definitive provider rejection → 502 + EXACTLY-ONCE refund, ledger FAILED, execution FAILED', async () => {
         const user = await seededUser(500);
+        await seedHotWallet(1000);
         const provider = fakeProvider({
             submitError: { response: { status: 400, data: { message: 'insufficient funds' } } },
         });
@@ -979,11 +995,12 @@ describeOrSkip('§P.2 withdrawalController.cryptoWithdrawal (real PostgreSQL + r
         expect(execution.errorClass).toBe('PROVIDER_REJECTED');
 
         const hot = await prisma.systemHotWallet.findUnique({ where: { id: 1 } });
-        expect(Number(hot.balance)).toBe(0); // synthetic treasury write reversed too
+        expect(Number(hot.balance)).toBe(1000); // synthetic treasury write reversed to the seeded amount
     });
 
     it('provider timeout (ambiguous) → 202 pending, NO auto-refund, execution RECONCILIATION_REQUIRED', async () => {
         const user = await seededUser(500);
+        await seedHotWallet(1000);
         const provider = fakeProvider({
             submitError: Object.assign(new Error('timeout'), { code: 'ECONNABORTED' }),
         });

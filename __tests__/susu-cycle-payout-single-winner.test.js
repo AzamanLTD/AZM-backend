@@ -114,6 +114,10 @@ describeOrSkip('Susu cycle payout single-winner (real PostgreSQL)', () => {
                 status: 'PAID',
             },
         });
+        await prisma.user.update({
+            where: { id: user.id },
+            data: { escrowLockedBalance: { increment: amount } },
+        });
         created.contributions.push(c.id);
         return c;
     }

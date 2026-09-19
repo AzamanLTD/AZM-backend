@@ -5,6 +5,10 @@ jest.mock('../services/finance.service', () => ({
     completeFiatWithdrawal: jest.fn(),
     reverseFiatWithdrawal: jest.fn()
 }));
+jest.mock('../src/services/fiatLiquidityService', () => ({
+    recordProviderEvent: jest.fn().mockResolvedValue({ replay: false }),
+    settleIfRecorded: jest.fn().mockResolvedValue({ skipped: false, quarantined: false }),
+}));
 
 describe('fiatSettlementService', () => {
     beforeEach(() => jest.clearAllMocks());
@@ -116,7 +120,11 @@ describe('fiatSettlementService', () => {
         });
 
         expect(financeService.reverseFiatWithdrawal).toHaveBeenCalledWith(
-            prisma, 'ref-3', { reason: 'provider rejected transfer' }
+            prisma, 'ref-3', {
+                reason: 'provider rejected transfer',
+                providerTerminal: true,
+                providerTxId: 'moolre-fail-3'
+            }
         );
         expect(prisma.transactionHistory.update).toHaveBeenCalledWith({
             where: { txHash: 'ref-3' }, data: { providerRef: 'moolre-fail-3' }

@@ -12,6 +12,7 @@
 
 const financeService = require('./finance.service');
 const { recordProviderSettlementAttempt } = require('./providerSettlementAttemptService');
+const fiatLiquidity = require('../src/services/fiatLiquidityService');
 
 // Provider references are mutable only while a withdrawal is still in its
 // reservation lifecycle. Once a terminal state has a provider reference, a
@@ -58,6 +59,25 @@ const settleFiatWithdrawal = async (prisma, {
         throw error;
     }
 
+    // §P.5-D OUTBOUND EVIDENCE (fail-closed): the terminal provider
+    // observation is durably retained BEFORE any authoritative settlement
+    // transition. A duplicate terminal callback converges to the committed
+    // observation; a CONTRADICTORY one (SUCCESS after FAILED / FAILED after
+    // SUCCESS) lands as a distinct durable row — the authority's quarantine
+    // path consumes it, and nothing is silently dropped. If evidence cannot
+    // be persisted the settlement MUST NOT proceed as though it exists: the
+    // caller (webhook/recon worker) fails closed and the provider retries.
+    await fiatLiquidity.recordProviderEvent(prisma, {
+        provider,
+        rail: 'MOMO',
+        direction: 'OUTBOUND',
+        status,
+        providerRef: providerTxId,
+        dedupKey: `event:payout-outbound:${provider}:${reference}:${status}`,
+        relatedReference: reference,
+        raw: { reason: reason ?? null, source: 'provider_callback' },
+    });
+
     await recordProviderSettlementAttempt(prisma, {
         reference,
         provider,
@@ -87,6 +107,30 @@ const settleFiatWithdrawal = async (prisma, {
                 result.transaction,
                 providerTxId
             );
+        }
+        if (original.status === 'FAILED') {
+            // A late SUCCESS contradicts the authoritatively FAILED
+            // withdrawal: the provider may actually have paid cash that the
+            // FAILED path already returned to availability. Push the
+            // terminal observation through the authority's quarantine path
+            // (RELEASED reservation → reconciliation hold, guarded against
+            // the funds having already been consumed).
+            const quarantine = await fiatLiquidity.settleIfRecorded(prisma, {
+                reference,
+                outcome: 'SUCCESSFUL',
+                providerTxId,
+                reason: 'contradictory late SUCCESS after FAILED settlement',
+            });
+            return {
+                reference,
+                userId: original.userId,
+                status: 'FAILED',
+                changed: false,
+                conflictingTerminalCallback: true,
+                quarantined: !quarantine.skipped,
+                providerTxId: providerTxId || original.providerRef || null,
+                transaction
+            };
         }
 
         return {
@@ -146,7 +190,12 @@ const settleFiatWithdrawal = async (prisma, {
     }
 
     const reversal = await financeService.reverseFiatWithdrawal(prisma, reference, {
-        reason: reason || 'Provider reported FAILED settlement.'
+        reason: reason || 'Provider reported FAILED settlement.',
+        // provider-terminal evidence: the FAILED observation was durably
+        // recorded above, so the authority releases (not quarantines) the
+        // IN_TRANSIT reservation through the evidence-backed settle path.
+        providerTerminal: true,
+        providerTxId
     });
 
     const latest = await prisma.transactionHistory.findUnique({

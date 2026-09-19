@@ -49,12 +49,26 @@ const runDoubleCheck = async (prisma, userId) => {
     // PENDING rows haven't settled; FROZEN_DISPUTE rows are quarantined.
     const settledTxs = transactions.filter(tx => tx.status === 'COMPLETED');
 
-    // Recompute balance: principal + fees
-    // amountUsdc is signed: positive for credits, negative for debits.
-    // feeUsdc is always a non-negative cost deducted on top.
+    // Recompute balance: principal + fees.
+    //
+    // §P.5-D correctness fixes (both proven by regression tests):
+    //  1. Prisma Decimal coerces through a STRING valueOf(), so
+    //     `sum + tx.amountUsdc` performed string concatenation — with 2+
+    //     settled rows the reduce produced NaN, and `NaN > TOLERANCE` is
+    //     false, silently DISARMING this audit. All arithmetic goes through
+    //     explicit Number() coercion now. Values are Decimal(20,8) well
+    //     inside the double-integer range, so Number() is exact here;
+    //     TOLERANCE remains the float epsilon.
+    //  2. Withdrawal types store amountUsdc as a POSITIVE debit magnitude
+    //     (the §P.3 custody-accounting attestation reads them exactly that
+    //     way). The blanket "positive = credit" rule counted settled
+    //     withdrawals as credits. No data is rewritten — only this
+    //     recomputation interprets the convention correctly.
+    const WITHDRAWAL_MAGNITUDE_TYPES = new Set(['WITHDRAWAL_FIAT', 'WITHDRAWAL_CRYPTO']);
     const computedBalance = settledTxs.reduce((sum, tx) => {
-        const principal = tx.amountUsdc   || 0;
-        const fee       = tx.feeUsdc      || 0;
+        const rawAmount = Number(tx.amountUsdc || 0);
+        const principal = WITHDRAWAL_MAGNITUDE_TYPES.has(tx.type) ? -Math.abs(rawAmount) : rawAmount;
+        const fee = Number(tx.feeUsdc || 0);
         return sum + principal - fee;
     }, 0);
 

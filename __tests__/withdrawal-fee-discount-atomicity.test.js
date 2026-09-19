@@ -71,6 +71,16 @@ describeOrSkip('AZM fee-discount withdrawal atomicity (real PostgreSQL)', () => 
             update: { balance: 100_000.0 },
             create: { id: 1, balance: 100_000.0 }
         });
+        // Fresh-install posture: processFiatWithdrawal DEFERS the principal
+        // into SystemMasterCrypto, and test A asserts the master balance
+        // against the seeded withdrawal. A prior suite's residue (e.g. the
+        // §P.5-D suite's authority withdrawals) must never leak in, whatever
+        // the jest run order.
+        await prisma.systemMasterCrypto.upsert({
+            where: { id: 1 },
+            update: { balance: 0.0 },
+            create: { id: 1, balance: 0.0 }
+        });
     });
 
     afterEach(async () => {
