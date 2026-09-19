@@ -1690,7 +1690,9 @@ model FiatProviderEvent {
   status            String // provider-reported status, verbatim
   providerRef       String?
   dedupKey          String   @unique // durable economic identity of the observation
-  amountGhs         Decimal  @db.Decimal(20, 2)
+  // INBOUND observations always carry the collected amount (evidence chain);
+  // OUTBOUND terminal callbacks/polls may report no amount (nullable then).
+  amountGhs         Decimal? @db.Decimal(20, 2)
   relatedReference  String? // internal TransactionHistory txHash for payout correlation
   raw               Json?
   receivedAt        DateTime @default(now())
@@ -1757,6 +1759,11 @@ model FiatLiquidityState {
   reservedGhs  Decimal  @default(0) @db.Decimal(20, 2)
   inTransitGhs Decimal  @default(0) @db.Decimal(20, 2)
   paidOutGhs   Decimal  @default(0) @db.Decimal(20, 2)
+  // §P.5-D quarantine bucket: GHS claimed by a quarantined reservation
+  // (RECONCILIATION_REQUIRED). Held funds are counted but NEVER spendable —
+  // a released-then-contradicted payout moves its returned amount here
+  // instead of leaving it claimable (docs §3.4).
+  reconciliationHeldGhs Decimal @default(0) @db.Decimal(20, 2)
 
   updatedAt    DateTime @updatedAt
 }

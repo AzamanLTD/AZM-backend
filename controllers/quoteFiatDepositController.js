@@ -123,6 +123,12 @@ exports.webhook = async (req, res) => {
     if (!reference || amountGhs === undefined || amountGhs === null) return res.status(400).json({ success: false, message: 'reference and amountGhs are required.' });
     const settledGhs = Number(amountGhs);
     if (!Number.isFinite(settledGhs) || settledGhs <= 0) return res.status(400).json({ success: false, message: 'amountGhs must be a positive number.' });
+    // §P.5-D: GHS evidence is exact to the pesewa — the authority never
+    // rounds silently, so reject sub-pesewa precision up front (400, not a
+    // mid-settlement failure).
+    if (Math.round(settledGhs * 100) / 100 !== settledGhs) {
+        return res.status(400).json({ success: false, message: 'amountGhs must be exact to the pesewa (2 decimal places).' });
+    }
 
     const existing = await prisma.transactionHistory.findUnique({ where: { txHash: reference } });
     if (!existing) return res.status(404).json({ success: false, message: 'Unknown deposit reference.' });
@@ -135,9 +141,14 @@ exports.webhook = async (req, res) => {
 
     // §P.5-D LIQUIDITY EVIDENCE: append the raw provider observation
     // OUT-OF-BAND, BEFORE the settle transaction — evidence always survives,
-    // even when the settle fails closed. Append-only; replays converge; an
-    // amount with sub-pesewa precision is skipped (warned) rather than
-    // silently rounded — the authority never guesses a rounding.
+    // even when the settle fails closed. Append-only; replays converge.
+    //
+    // FAIL-CLOSED: the evidence layer is part of the authority boundary, NOT
+    // best-effort logging. If the raw observation cannot be durably persisted,
+    // the deposit settlement MUST NOT proceed as though evidence exists — no
+    // customer USDC is credited and no liquidity transition happens while the
+    // authoritative record of the provider's claim is missing. The deposit
+    // stays PENDING; the provider retries or ops investigates.
     try {
         await fiatLiquidity.recordProviderEvent(prisma, {
             provider: 'GENERIC_FIAT_WEBHOOK',
@@ -150,7 +161,11 @@ exports.webhook = async (req, res) => {
             raw: req.body || null,
         });
     } catch (evidenceErr) {
-        logger.warn({ err: evidenceErr, reference }, '[quoteFiatDepositWebhook] §P.5-D evidence record skipped');
+        logger.error({ err: evidenceErr, reference }, '[quoteFiatDepositWebhook] §P.5-D evidence persistence FAILED — settlement blocked');
+        return res.status(503).json({
+            success: false,
+            message: 'Deposit evidence could not be durably recorded. Settlement has not been processed; please retry.'
+        });
     }
     const liquidityAuthorityOn = await fiatLiquidity.isAuthorityEnabled(prisma);
 
@@ -187,8 +202,10 @@ exports.webhook = async (req, res) => {
         relatedEntityId: existing.id,
         metadata: { source: 'fiat', quoteId, amountGhs: settledGhs, selectedRoute: quote.selectedRoute || null, routeProviderRail: quote.routeProviderRail || null },
         lines: [
-          { account: 'clearing:conversion', debit: quote.usdcAmount },
-          { account: `user:${existing.userId}:liability`, credit: quote.usdcAmount },
+          // Post EXACTLY what the settled TransactionHistory row records
+          // (Decimal(20,8)) — see the Moolre twin for the exactness rationale.
+          { account: 'clearing:conversion', debit: updatedTx.amountUsdc },
+          { account: `user:${existing.userId}:liability`, credit: updatedTx.amountUsdc },
         ],
       });
 
@@ -204,7 +221,9 @@ exports.webhook = async (req, res) => {
           dedupKey: `receipt:fiat-deposit:${reference}`,
           amountGhs: settledGhs,
           route: quote.selectedRoute || null,
+          reference,
           relatedTransactionId: existing.id,
+          eventDedupKey: `event:fiat-deposit:${reference}`,
           evidence: {
             source: 'fiat_webhook',
             quoteId,

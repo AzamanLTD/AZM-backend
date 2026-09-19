@@ -14,7 +14,7 @@ CREATE TABLE "FiatProviderEvent" (
     "status" TEXT NOT NULL,
     "providerRef" TEXT,
     "dedupKey" TEXT NOT NULL,
-    "amountGhs" DECIMAL(20,2) NOT NULL,
+    "amountGhs" DECIMAL(20,2),
     "relatedReference" TEXT,
     "raw" JSONB,
     "receivedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -74,6 +74,7 @@ CREATE TABLE "FiatLiquidityState" (
     "reservedGhs" DECIMAL(20,2) NOT NULL DEFAULT 0,
     "inTransitGhs" DECIMAL(20,2) NOT NULL DEFAULT 0,
     "paidOutGhs" DECIMAL(20,2) NOT NULL DEFAULT 0,
+    "reconciliationHeldGhs" DECIMAL(20,2) NOT NULL DEFAULT 0,
     "updatedAt" TIMESTAMP(3) NOT NULL,
     CONSTRAINT "FiatLiquidityState_pkey" PRIMARY KEY ("id")
 );
@@ -81,6 +82,8 @@ CREATE TABLE "FiatLiquidityState" (
 -- DB CHECKs Prisma cannot express (mirrored in the boot overlay installer).
 ALTER TABLE "FiatProviderEvent" ADD CONSTRAINT "FiatProviderEvent_direction_valid"
     CHECK ("direction" IN ('INBOUND', 'OUTBOUND'));
+ALTER TABLE "FiatProviderEvent" ADD CONSTRAINT "FiatProviderEvent_amount_present"
+    CHECK ("amountGhs" > 0 OR "direction" = 'OUTBOUND');
 ALTER TABLE "FiatLiquidityReceipt" ADD CONSTRAINT "FiatLiquidityReceipt_amount_positive"
     CHECK ("amountGhs" > 0);
 ALTER TABLE "FiatLiquidityReceipt" ADD CONSTRAINT "FiatLiquidityReceipt_status_valid"
@@ -90,8 +93,8 @@ ALTER TABLE "FiatLiquidityReservation" ADD CONSTRAINT "FiatLiquidityReservation_
 ALTER TABLE "FiatLiquidityReservation" ADD CONSTRAINT "FiatLiquidityReservation_status_valid"
     CHECK ("status" IN ('RESERVED', 'IN_TRANSIT', 'PAID_OUT', 'RELEASED', 'RECONCILIATION_REQUIRED'));
 ALTER TABLE "FiatLiquidityState" ADD CONSTRAINT "FiatLiquidityState_totals_nonneg"
-    CHECK ("availableGhs" >= 0 AND "reservedGhs" >= 0 AND "inTransitGhs" >= 0 AND "paidOutGhs" >= 0);
+    CHECK ("availableGhs" >= 0 AND "reservedGhs" >= 0 AND "inTransitGhs" >= 0 AND "paidOutGhs" >= 0 AND "reconciliationHeldGhs" >= 0);
 
-INSERT INTO "FiatLiquidityState" ("id", "availableGhs", "reservedGhs", "inTransitGhs", "paidOutGhs", "updatedAt")
-    VALUES (1, 0, 0, 0, 0, CURRENT_TIMESTAMP)
+INSERT INTO "FiatLiquidityState" ("id", "availableGhs", "reservedGhs", "inTransitGhs", "paidOutGhs", "reconciliationHeldGhs", "updatedAt")
+    VALUES (1, 0, 0, 0, 0, 0, CURRENT_TIMESTAMP)
 ON CONFLICT ("id") DO NOTHING;

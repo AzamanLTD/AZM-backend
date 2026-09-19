@@ -73,6 +73,14 @@ async function cleanupAll() {
         });
     }
 
+    // Battery-order immunity: prior suites may leave user_* rows behind
+    // with TransactionHistory children (e.g. a factory-backed balance). The
+    // sweep deletes those children first so the user sweep cannot hit the
+    // TransactionHistory_userId_fkey foreign key.
+    await prisma.$executeRawUnsafe(
+        'DELETE FROM "TransactionHistory" WHERE "userId" IN '
+        + "(SELECT id FROM \"User\" WHERE username LIKE 'user_%')"
+    );
     await prisma.user.deleteMany({ where: { username: { startsWith: 'user_' } } });
 }
 

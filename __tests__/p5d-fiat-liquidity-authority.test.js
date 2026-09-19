@@ -4,51 +4,81 @@
 //
 // PROVES, with Prisma NEVER mocked (real PostgreSQL via TEST_DATABASE_URL):
 //
-//   A. ONLY evidence creates AVAILABLE liquidity — matched deposit webhook
-//      settlement (flag ON) is the only path that lands AVAILABLE; unmatched
-//      evidence lands UNMATCHED with NO liquidity effect; a treasury opening
-//      stays RECEIVED until explicitly confirmed.
-//   B. Reservation is a single-winner conditional decrement — concurrent
+//   A. ONLY VERIFIED evidence creates AVAILABLE liquidity — every seeding in
+//      this suite goes through the SAME authority operation the real webhook
+//      uses (a genuine PENDING deposit → quote consumption → settled deposit
+//      → durable provider event → recordReceipt). The service itself verifies
+//      the durable chain; forged relatedTransactionIds, absent events, amount
+//      mismatches, wrong transaction types/states and route contradictions
+//      all fail closed with NO liquidity effect.
+//   B. NO SYNTHETIC GHS — liquidateProfits (authority ON) records a
+//      NON-AVAILABLE audited treasury opening and its response claims NO
+//      spendable GHS; only confirmTreasuryOpening with a durable external
+//      funding observation unlocks it.
+//   C. Reservation is a single-winner conditional decrement — concurrent
 //      withdrawals cannot over-reserve; a loser fails closed with the legacy
 //      FIAT_POOL_INSUFFICIENT contract and leaves NO orphan reservation.
-//   C. Idempotent reservation replay — same reference + same amount replays
+//   D. Idempotent reservation replay — same reference + same amount replays
 //      the committed row (no second claim); conflicting reuse fails closed.
-//   D. Receipt identity — identical evidence replays converge; conflicting
+//   E. Receipt identity — identical evidence replays converge; conflicting
 //      reuse of a dedupKey fails closed; availability never double-counts.
-//   E. Dispatch is a single-winner RESERVED → IN_TRANSIT claim; replays are
+//   F. Dispatch is a single-winner RESERVED → IN_TRANSIT claim; replays are
 //      side-effect free; terminal rows cannot re-dispatch.
-//   F. Settlement is a single-winner terminal claim — SUCCESS moves
+//   G. Settlement is a single-winner terminal claim — SUCCESS moves
 //      IN_TRANSIT → PAID_OUT; FAILED returns funds; replays converge.
-//   G. Contradictory provider evidence NEVER rewrites terminal state — the
+//   H. Contradictory provider evidence NEVER rewrites terminal state — the
 //      reservation is quarantined RECONCILIATION_REQUIRED with an OPEN
-//      ReconciliationException, idempotently; funds stay counted, never
-//      spendable twice.
-//   H. Release semantics — RESERVED internal reversal returns funds;
+//      ReconciliationException, idempotently; the disputed amount moves into
+//      the reconciliationHeldGhs bucket: counted, NEVER spendable — including
+//      released-then-contradicted payouts, whose returned amount leaves
+//      availability and enters hold, and the released-funds-already-spent
+//      case, which flags CONTRADICTORY_RELEASE_ALREADY_SPENT loudly instead
+//      of hiding a potential over-spend.
+//   I. Release semantics — RESERVED internal reversal returns funds;
 //      IN_TRANSIT/PAID_OUT reversals quarantine (cash position unprovable),
 //      never auto-release.
-//   I. Aggregate conservation across a full lifecycle — every FiatLiquidityState
-//      total moves atomically with its evidence rows, and SystemFiatPool stays
-//      a deterministic derived projection of availableGhs.
-//   J. Reconciliation categories — every discrepancy class (receipt without
+//   J. Aggregate conservation across a full lifecycle — every FiatLiquidityState
+//      total (including reconciliationHeldGhs) moves atomically with its
+//      evidence rows, and SystemFiatPool stays a deterministic derived
+//      projection of availableGhs.
+//   K. Reconciliation categories — every discrepancy class (receipt without
 //      confirmation, event without receipt, duplicate provider reference,
-//      amount mismatch, reservation missing result, conservation delta,
-//      unsupported availability) is flagged, idempotent, NEVER auto-repaired.
-//   K. Mounted webhook integration — flag ON: a settled deposit lands an
+//      amount mismatch, reservation missing result, conservation delta over
+//      ALL buckets, unsupported availability) is flagged, idempotent, NEVER
+//      auto-repaired. Event↔receipt pairing joins through DURABLE rows
+//      (provider+providerRef, or event.relatedReference → settled deposit →
+//      bound receipt) — never fabricated key equality.
+//   L. Mounted webhook integration — flag ON: a settled deposit lands an
 //      AVAILABLE receipt in the SAME transaction (webhook replay converges);
 //      flag OFF: raw evidence is still appended, NO receipt, NO liquidity.
-//   L. Flag gating of the reservation regime — processFiatWithdrawal reserves
+//      FAIL-CLOSED: when the evidence table is unavailable the webhook
+//      returns 503, the deposit stays PENDING, no USDC is credited, and a
+//      retry after recovery converges.
+//   M. Flag gating of the reservation regime — processFiatWithdrawal reserves
 //      through the authority only when the flag is ON; OFF keeps the legacy
 //      pool decrement byte-identical (asserted via the recorded behavior).
-//   M. Exact pesewas — sub-pesewa precision is rejected everywhere (receipts,
+//   N. Exact pesewas — sub-pesewa precision is rejected everywhere (receipts,
 //      events, reservations); 2dp amounts round-trip exactly through
-//      Decimal(20,2); no float artifacts.
-//   N. DB-enforced bounds — the overlay CHECKs reject negative state totals
-//      and non-positive amounts at the database boundary.
-//   O. runDoubleCheck regressions — 2+ settled Decimal rows recompute
+//      Decimal(20,2); OUTBOUND observations may carry no amount (providers
+//      that report status only); no float artifacts.
+//   O. DB-enforced bounds — the overlay CHECKs reject negative state totals,
+//      non-positive amounts, INBOUND events without an amount, and invalid
+//      directions at the database boundary.
+//   P. Outbound evidence — terminal settlement observations are durably
+//      retained BEFORE the authoritative transition, fail closed when the
+//      evidence store is unavailable; duplicates converge and contradictions
+//      are retained as distinct rows.
+//   Q. Auto-payout worker liquidity units — under the authority the worker
+//      evaluates the global remaining-liquidity policy in GHS (threshold
+//      converted at the live rate, exact pesewas) and never double-reserves;
+//      OFF keeps the legacy USDC pool comparison.
+//   R. runDoubleCheck regressions — 2+ settled Decimal rows recompute
 //      correctly (the NaN/string-concat disarming bug), settled WITHDRAWAL_*
 //      rows are read as positive debit magnitudes, and a genuinely
 //      inconsistent ledger still fails closed.
-//   P. Overlay idempotency — the installer converges on re-run (guarded).
+//   S. Overlay idempotency — the installer converges on re-run (guarded),
+//      including the reconciliationHeldGhs column and the outbound-amount
+//      CHECK on existing deployments.
 //
 // Only non-DB boundaries (audit, journal, notifications, logger) and the
 // external Moolre provider are stubbed. Skips cleanly without TEST_DATABASE_URL.
@@ -83,8 +113,15 @@ describeOrSkip('§P.5-D evidence-backed GHS liquidity authority (real PostgreSQL
 
     afterAll(async () => {
         if (prisma) {
-            await prisma.$executeRaw`DELETE FROM "TransactionHistory" WHERE "userId" IN (SELECT id FROM "User" WHERE username LIKE 'user_%')`;
-            await prisma.$executeRaw`DELETE FROM "TransactionQuote"`;
+            // Hermetic exit (same pattern as custody-accounting): this suite
+            // seeds ~21 users whose children span many tables (TH backing,
+            // quotes, deposits, settlements, ledger postings). A
+            // User-cascade truncate wipes them all; the two global deletes
+            // cover the non-user-keyed rows this suite leaves behind. The
+            // serial battery re-seeds everything afterward, and leaving
+            // user_* rows behind breaks later suites' FK-sensitive cleanup.
+            await prisma.$executeRawUnsafe('DELETE FROM "AdminProfitLog"');
+            await prisma.$executeRawUnsafe('TRUNCATE TABLE "User" RESTART IDENTITY CASCADE');
             await prisma.$disconnect();
         }
     });
@@ -95,10 +132,11 @@ describeOrSkip('§P.5-D evidence-backed GHS liquidity authority (real PostgreSQL
         await prisma.fiatLiquidityReceipt.deleteMany();
         await prisma.fiatLiquidityReservation.deleteMany();
         await prisma.$executeRaw`DELETE FROM "ReconciliationException" WHERE "entityType" LIKE 'FIAT_%'`;
+        await prisma.$executeRaw`DELETE FROM "ReconciliationException" WHERE "entityType" = 'TRANSACTION'`;
         await prisma.fiatLiquidityState.upsert({
             where: { id: 1 },
-            update: { availableGhs: 0, reservedGhs: 0, inTransitGhs: 0, paidOutGhs: 0 },
-            create: { id: 1, availableGhs: 0, reservedGhs: 0, inTransitGhs: 0, paidOutGhs: 0 },
+            update: { availableGhs: 0, reservedGhs: 0, inTransitGhs: 0, paidOutGhs: 0, reconciliationHeldGhs: 0 },
+            create: { id: 1, availableGhs: 0, reservedGhs: 0, inTransitGhs: 0, paidOutGhs: 0, reconciliationHeldGhs: 0 },
         });
         await prisma.systemFiatPool.upsert({
             where: { id: 1 }, update: { balance: 0 }, create: { id: 1, balance: 0 },
@@ -119,25 +157,188 @@ describeOrSkip('§P.5-D evidence-backed GHS liquidity authority (real PostgreSQL
     const dec = (v) => Number(v);
     const inTx = (fn) => prisma.$transaction((tx) => fn(tx));
 
-    async function seedAvailable({ amountGhs, dedupKey = 'receipt:t1', provider = 'GENERIC_FIAT_WEBHOOK', relatedTransactionId = 'tx-1', rail = null, route = 'GENERIC_MOMO', providerRef = null, evidence = { source: 'deposit' } } = {}) {
-        return inTx(async (tx) => fiatLiquidity.recordReceipt(tx, {
-            provider, rail, providerRef, dedupKey, amountGhs, route,
-            relatedTransactionId, evidence,
-        }));
+    // ── REAL evidence-chain machinery (the same operations the mounted
+    //    webhook uses — see section L) ──────────────────────────────────────
+    let providerRefCounter = 0;
+    function makeApp() {
+        const registry = {
+            prisma,
+            marketOracle: null,
+            notificationService: { sendNotification: jest.fn().mockResolvedValue(undefined) },
+            socketio: null,
+            emitBalanceUpdate: null,
+            // unique provider refs per collection — duplicate provider
+            // references are asserted DELIBERATELY in section K.
+            moolreCollectionService: {
+                initiatePayment: jest.fn().mockImplementation(async () => ({
+                    requiresOtp: false,
+                    providerRef: `PR-P5D-${++providerRefCounter}`,
+                })),
+            },
+        };
+        return { get: (key) => registry[key] };
+    }
+    const mockResponse = () => ({
+        statusCode: 200,
+        status(code) { this.statusCode = code; return this; },
+        json(payload) { this.payload = payload; return this; },
+    });
+
+    async function seedFreshRates() {
+        await prisma.globalSettings.upsert({
+            where: { id: 1 },
+            update: { liveRetailRate: 13.42, liveRateSource: 'KOTANI_PAY', lastExternalSync: new Date() },
+            create: { id: 1, liveRetailRate: 13.42, liveRateSource: 'KOTANI_PAY', lastExternalSync: new Date() },
+        });
+    }
+
+    async function initiateDeposit(user, amountGhs = 100) {
+        const res = mockResponse();
+        await moolreQuoteDepositController.initiate(
+            { app: makeApp(), user: { id: user.id }, body: { amountGhs, provider: 'MTN_MOMO', phoneNumber: '0241234567' }, headers: {} },
+            res,
+        );
+        expect(res.statusCode).toBe(201);
+        const pending = await prisma.transactionHistory.findMany({ where: { userId: user.id, type: 'DEPOSIT_FIAT', status: 'PENDING' } });
+        expect(pending).toHaveLength(1);
+        return pending[0];
+    }
+
+    async function moolreWebhook(pendingTxHash, amountGhs = 100) {
+        const res = mockResponse();
+        await moolreQuoteDepositController.webhook(
+            {
+                app: makeApp(),
+                headers: { 'x-moolre-webhook-secret': process.env.MOOLRE_WEBHOOK_SECRET },
+                body: {
+                    status: 1,
+                    code: 'P01',
+                    data: { externalref: pendingTxHash, amount: amountGhs, payer: '0241234567' },
+                },
+            },
+            res,
+        );
+        return res;
+    }
+
+    /**
+     * Seed AVAILABLE liquidity through the FULL durable chain — the same
+     * authority operation the real Moolre webhook exercises: a genuine user,
+     * a genuine PENDING deposit with a consumed P5-C quote, the settled
+     * COMPLETED deposit (CAS-claimed by the webhook), the raw provider
+     * observation, and the verified recordReceipt transition. Nothing here
+     * forges authority rows by hand.
+     */
+    async function seedAvailable({ amountGhs = 100 } = {}) {
+        await seedFreshRates();
+        await setAuthorityFlag(true);
+        const user = await seedUser(prisma);
+        const pending = await initiateDeposit(user, amountGhs);
+        const res = await moolreWebhook(pending.txHash, amountGhs);
+        expect(res.statusCode).toBe(200);
+        expect(res.payload.success).toBe(true);
+        const receipt = await prisma.fiatLiquidityReceipt.findUnique({
+            where: { dedupKey: `receipt:moolre-collection:${pending.txHash}` },
+        });
+        expect(receipt).not.toBeNull();
+        expect(receipt.status).toBe('AVAILABLE');
+        return { receipt, user, pending, reference: pending.txHash };
     }
 
     // =========================================================================
-    // A. ONLY evidence creates AVAILABLE liquidity
+    // A. ONLY VERIFIED evidence creates AVAILABLE liquidity
     // =========================================================================
     describe('A. availability is evidence-gated', () => {
-        test('a matched deposit observation lands AVAILABLE and increases claimable liquidity (exact pesewas)', async () => {
-            const { receipt } = await seedAvailable({ amountGhs: '100.50' });
+        test('a real matched deposit webhook observation lands AVAILABLE and increases claimable liquidity (exact pesewas)', async () => {
+            const { receipt } = await seedAvailable({ amountGhs: 100.50 });
             expect(receipt.status).toBe('AVAILABLE');
             expect(receipt.confirmedAt).not.toBeNull();
+            expect(receipt.provider).toBe('MOOLRE');
             const s = await state();
             expect(dec(s.availableGhs)).toBe(100.50);
             expect(dec(s.reservedGhs)).toBe(0);
             expect(await pool()).toBe(100.50); // derived projection
+        });
+
+        test('a forged relatedTransactionId can NEVER create AVAILABLE liquidity (blocker 3)', async () => {
+            await seedFreshRates();
+            await setAuthorityFlag(true);
+            const user = await seedUser(prisma);
+            const pending = await initiateDeposit(user, 40); // genuine PENDING deposit
+            // A durable provider event for a DIFFERENT amount — the classic
+            // "caller asserts the chain" forgery attempt.
+            // a legitimate pre-recorded observation (e.g. a webhook retry
+            // that raced the settle): same providerRef the deposit carries
+            await fiatLiquidity.recordProviderEvent(prisma, {
+                provider: 'MOOLRE', direction: 'INBOUND', status: 'SUCCESSFUL',
+                providerRef: pending.providerRef, dedupKey: `event:moolre-collection:${pending.txHash}`,
+                amountGhs: 40, relatedReference: pending.txHash,
+            });
+            // attempt 1: a transaction id that does not exist
+            await expect(inTx((tx) => fiatLiquidity.recordReceipt(tx, {
+                provider: 'MOOLRE', dedupKey: `receipt:moolre-collection:${pending.txHash}`,
+                amountGhs: 40, reference: pending.txHash, relatedTransactionId: '00000000-0000-0000-0000-000000000000',
+                eventDedupKey: `event:moolre-collection:${pending.txHash}`,
+            }))).rejects.toMatchObject({ code: 'LIQUIDITY_INVALID_EVIDENCE' });
+            // attempt 2: no durable provider observation at all
+            await expect(inTx((tx) => fiatLiquidity.recordReceipt(tx, {
+                provider: 'MOOLRE', dedupKey: `receipt:moolre-collection:${pending.txHash}`,
+                amountGhs: 40, reference: pending.txHash, relatedTransactionId: pending.id,
+                eventDedupKey: 'event:moolre-collection:never-recorded',
+            }))).rejects.toMatchObject({ code: 'LIQUIDITY_INVALID_EVIDENCE' });
+            // attempt 3: an event amount that contradicts the receipt amount
+            await expect(inTx((tx) => fiatLiquidity.recordReceipt(tx, {
+                provider: 'MOOLRE', dedupKey: `receipt:moolre-collection:${pending.txHash}`,
+                amountGhs: 41, reference: pending.txHash, relatedTransactionId: pending.id,
+                eventDedupKey: `event:moolre-collection:${pending.txHash}`,
+            }))).rejects.toMatchObject({ code: 'LIQUIDITY_INVALID_EVIDENCE' });
+            // attempt 4: the deposit is not settled — the authoritative state
+            // (COMPLETED) is missing
+            await expect(inTx((tx) => fiatLiquidity.recordReceipt(tx, {
+                provider: 'MOOLRE', dedupKey: `receipt:moolre-collection:${pending.txHash}`,
+                amountGhs: 40, reference: pending.txHash, relatedTransactionId: pending.id,
+                eventDedupKey: `event:moolre-collection:${pending.txHash}`,
+            }))).rejects.toMatchObject({ code: 'LIQUIDITY_INVALID_EVIDENCE' });
+            // NO liquidity was created by any forgery attempt
+            expect(dec((await state()).availableGhs)).toBe(0);
+            expect(await prisma.fiatLiquidityReceipt.count()).toBe(0);
+
+            // the GENUINE chain still works afterwards (fail-closed did not
+            // poison the identity)
+            const res = await moolreWebhook(pending.txHash, 40);
+            expect(res.statusCode).toBe(200);
+            expect(dec((await state()).availableGhs)).toBe(40);
+        });
+
+        test('a receipt bound to a transaction of the WRONG TYPE or a CONTRADICTED route fails closed', async () => {
+            await seedFreshRates();
+            await setAuthorityFlag(true);
+            const user = await seedUser(prisma);
+            const pending = await initiateDeposit(user, 30);
+            await fiatLiquidity.recordProviderEvent(prisma, {
+                provider: 'MOOLRE', direction: 'INBOUND', status: 'SUCCESSFUL',
+                providerRef: null, dedupKey: `event:moolre-collection:${pending.txHash}`,
+                amountGhs: 30, relatedReference: pending.txHash,
+            });
+
+            // wrong transaction type: a P2P transfer row posing as the deposit
+            const fake = await prisma.transactionHistory.create({
+                data: { userId: user.id, type: 'INTERNAL_TRANSFER', amountUsdc: 30, status: 'COMPLETED', txHash: 'fake-p2p' },
+            });
+            await expect(inTx((tx) => fiatLiquidity.recordReceipt(tx, {
+                provider: 'MOOLRE', dedupKey: 'receipt:wrongtype', amountGhs: 30,
+                reference: pending.txHash, relatedTransactionId: fake.id,
+                eventDedupKey: `event:moolre-collection:${pending.txHash}`,
+            }))).rejects.toMatchObject({ code: 'LIQUIDITY_INVALID_EVIDENCE' });
+
+            // route contradiction: the quote selected a different route
+            await expect(inTx((tx) => fiatLiquidity.recordReceipt(tx, {
+                provider: 'MOOLRE', dedupKey: 'receipt:wrongroute', amountGhs: 30,
+                reference: pending.txHash, relatedTransactionId: pending.id, route: 'GENERIC_BANK',
+                eventDedupKey: `event:moolre-collection:${pending.txHash}`,
+            }))).rejects.toMatchObject({ code: 'LIQUIDITY_INVALID_EVIDENCE' });
+
+            expect(dec((await state()).availableGhs)).toBe(0);
         });
 
         test('unmatched evidence lands UNMATCHED — NO liquidity effect, evidence retained', async () => {
@@ -150,7 +351,67 @@ describeOrSkip('§P.5-D evidence-backed GHS liquidity authority (real PostgreSQL
             expect(dec(s.availableGhs)).toBe(0);
         });
 
-        test('a treasury opening lands RECEIVED — not AVAILABLE until explicit confirmation', async () => {
+        test('an UNMATCHED receipt becomes AVAILABLE only through confirmReconciliationMatch against a REAL durable chain (blocker 4)', async () => {
+            await seedFreshRates();
+            // a genuine deposit settled with the flag OFF: the TH row is
+            // COMPLETED and the raw provider observation exists, but NO
+            // receipt was created (the flag-off regime).
+            await setAuthorityFlag(false);
+            const user = await seedUser(prisma);
+            const pending = await initiateDeposit(user, 20);
+            const res = await moolreWebhook(pending.txHash, 20);
+            expect(res.statusCode).toBe(200);
+            expect(await prisma.fiatLiquidityReceipt.count()).toBe(0);
+
+            // an operator records the unmatched observation (e.g. a webhook
+            // delivered out of order, before the deposit existed)
+            const { receipt } = await inTx((tx) => fiatLiquidity.recordReceipt(tx, {
+                provider: 'MOOLRE', dedupKey: 'receipt:u2', amountGhs: 20,
+            }));
+            expect(receipt.status).toBe('UNMATCHED');
+
+            // a "confirmation" without the durable provider observation is refused
+            await expect(inTx((tx) => fiatLiquidity.confirmReconciliationMatch(tx, {
+                dedupKey: 'receipt:u2', matchedTransactionId: pending.id,
+                confirmedBy: 42,
+            }))).rejects.toMatchObject({ code: 'LIQUIDITY_INVALID_EVIDENCE' });
+            expect((await prisma.fiatLiquidityReceipt.findUnique({ where: { dedupKey: 'receipt:u2' } })).status).toBe('UNMATCHED');
+
+            // the REAL match: names the deposit AND the durable observation
+            const { receipt: confirmed } = await inTx((tx) => fiatLiquidity.confirmReconciliationMatch(tx, {
+                dedupKey: 'receipt:u2', matchedTransactionId: pending.id,
+                confirmedBy: 42,
+                providerEventDedupKey: `event:moolre-collection:${pending.txHash}`,
+            }));
+            expect(confirmed.status).toBe('AVAILABLE');
+            expect(confirmed.relatedTransactionId).toBe(pending.id); // the verified match is recorded
+            expect(dec((await state()).availableGhs)).toBe(20);
+
+            // replay: no double count
+            const { replay } = await inTx((tx) => fiatLiquidity.confirmReconciliationMatch(tx, {
+                dedupKey: 'receipt:u2', matchedTransactionId: pending.id,
+                providerEventDedupKey: `event:moolre-collection:${pending.txHash}`,
+            })).catch((e) => { throw e; });
+            expect(replay).toBe(true); // an idempotent retry of the SAME match converges
+            expect(dec((await state()).availableGhs)).toBe(20);
+        });
+
+        test('a reconciliation match that would DOUBLE-COUNT a deposit is refused (blocker 4)', async () => {
+            // deposit A already carries an AVAILABLE receipt (real webhook chain)
+            const { pending: depositA } = await seedAvailable({ amountGhs: 25 });
+            // an unmatched observation for a DIFFERENT collection with the same amount
+            await inTx((tx) => fiatLiquidity.recordReceipt(tx, {
+                provider: 'MOOLRE', dedupKey: 'receipt:dcount', amountGhs: 25,
+            }));
+            // trying to unlock it against deposit A — already claimed — fails closed
+            await expect(inTx((tx) => fiatLiquidity.confirmReconciliationMatch(tx, {
+                dedupKey: 'receipt:dcount', matchedTransactionId: depositA.id,
+                providerEventDedupKey: `event:moolre-collection:${depositA.txHash}`,
+            }))).rejects.toMatchObject({ code: 'LIQUIDITY_CONFLICTING_EVIDENCE' });
+            expect(dec((await state()).availableGhs)).toBe(25); // unchanged
+        });
+
+        test('a treasury opening lands RECEIVED — ONLY confirmTreasuryOpening with a durable external funding observation unlocks it', async () => {
             const { receipt } = await inTx((tx) => fiatLiquidity.recordReceipt(tx, {
                 provider: 'AZM_TREASURY', rail: 'INTERNAL',
                 dedupKey: 'treasury:t1', amountGhs: 500, treasury: true,
@@ -159,41 +420,73 @@ describeOrSkip('§P.5-D evidence-backed GHS liquidity authority (real PostgreSQL
             expect(receipt.status).toBe('RECEIVED');
             expect(dec((await state()).availableGhs)).toBe(0);
 
-            const { receipt: confirmed } = await inTx((tx) => fiatLiquidity.confirmReceiptAvailable(tx, {
-                dedupKey: 'treasury:t1', confirmedBy: 1,
-                evidence: { action: 'LIQUIDATE_PROFITS' },
+            // no funding reference → refused (caller JSON is not evidence)
+            await expect(inTx((tx) => fiatLiquidity.confirmTreasuryOpening(tx, {
+                dedupKey: 'treasury:t1', confirmedBy: 1, fundingReference: '  ', fundingChannel: 'BANK',
+            }))).rejects.toMatchObject({ code: 'LIQUIDITY_INVALID_EVIDENCE' });
+            // invalid channel → refused
+            await expect(inTx((tx) => fiatLiquidity.confirmTreasuryOpening(tx, {
+                dedupKey: 'treasury:t1', confirmedBy: 1, fundingReference: 'BANK-REF-1', fundingChannel: 'CASH_UNDER_MATTRESS',
+            }))).rejects.toMatchObject({ code: 'LIQUIDITY_INVALID_EVIDENCE' });
+            expect(dec((await state()).availableGhs)).toBe(0);
+
+            // a real external funding observation becomes DURABLE evidence
+            const { receipt: confirmed } = await inTx((tx) => fiatLiquidity.confirmTreasuryOpening(tx, {
+                dedupKey: 'treasury:t1', confirmedBy: 1, fundingReference: 'BANK-REF-1', fundingChannel: 'BANK',
             }));
             expect(confirmed.status).toBe('AVAILABLE');
             expect(dec((await state()).availableGhs)).toBe(500);
+            const fundingEvent = await prisma.fiatProviderEvent.findUnique({ where: { dedupKey: 'event:treasury-funding:BANK-REF-1' } });
+            expect(fundingEvent).not.toBeNull();
+            expect(fundingEvent.provider).toBe('AZM_TREASURY');
+            expect(Number(fundingEvent.amountGhs)).toBe(500);
 
-            // explicit confirmation replays without double-counting
-            const { replay } = await inTx((tx) => fiatLiquidity.confirmReceiptAvailable(tx, { dedupKey: 'treasury:t1', confirmedBy: 1 }));
+            // replay: no double count
+            const { replay } = await inTx((tx) => fiatLiquidity.confirmTreasuryOpening(tx, {
+                dedupKey: 'treasury:t1', confirmedBy: 1, fundingReference: 'BANK-REF-1', fundingChannel: 'BANK',
+            }));
             expect(replay).toBe(true);
             expect(dec((await state()).availableGhs)).toBe(500);
         });
 
-        test('an UNMATCHED receipt becomes AVAILABLE only through explicit confirmation', async () => {
-            await inTx((tx) => fiatLiquidity.recordReceipt(tx, {
-                provider: 'MOOLRE', providerRef: 'PR-9', dedupKey: 'receipt:u2', amountGhs: 20,
+        test('liquidateProfits (authority ON) creates NO spendable GHS — a NON-AVAILABLE audited opening only (blocker 1)', async () => {
+            const financeService = require('../services/finance.service');
+            await seedFreshRates();
+            await setAuthorityFlag(true);
+            await prisma.systemProfitFees.upsert({
+                where: { id: 1 }, update: { balance: 200 }, create: { id: 1, balance: 200 },
+            });
+
+            const result = await financeService.liquidateProfits(prisma, 50, 1);
+            // honest response: the internal USDC move created NO spendable GHS
+            expect(result.treasuryOpeningRecorded).toBe(true);
+            expect(result.ghsAvailableCreated).toBe('0.00');
+            expect(result.ghsAvailabilityNote).toMatch(/confirmTreasuryOpening/);
+
+            const opening = await prisma.fiatLiquidityReceipt.findFirst({ where: { provider: 'AZM_TREASURY' } });
+            expect(opening).not.toBeNull();
+            expect(opening.status).toBe('RECEIVED'); // NOT AVAILABLE — no synthetic GHS
+            expect(Number(opening.amountGhs)).toBe(671.00); // 50 USDC × 13.42 — priced, not custody
+            expect(dec((await state()).availableGhs)).toBe(0); // zero claimable liquidity
+
+            // unlocking it requires the external funding boundary
+            await inTx((tx) => fiatLiquidity.confirmTreasuryOpening(tx, {
+                dedupKey: opening.dedupKey, confirmedBy: 1,
+                fundingReference: 'MOVO-98765', fundingChannel: 'MOMO',
             }));
-            await inTx((tx) => fiatLiquidity.confirmReceiptAvailable(tx, {
-                dedupKey: 'receipt:u2', confirmedBy: 42,
-                evidence: { action: 'RECONCILIATION_MATCH', relatedTransactionId: 'tx-9' },
-            }));
-            const r = await prisma.fiatLiquidityReceipt.findUnique({ where: { dedupKey: 'receipt:u2' } });
-            expect(r.status).toBe('AVAILABLE');
-            expect(r.relatedTransactionId).toBeNull(); // confirmation is evidence, not a mutation of match data
-            expect(dec((await state()).availableGhs)).toBe(20);
+            expect(dec((await state()).availableGhs)).toBe(671.00);
         });
 
         test('RECONCILIATION_REQUIRED and REVERSED receipts can never be confirmed AVAILABLE', async () => {
-            await seedAvailable({ amountGhs: 10, dedupKey: 'receipt:x1' });
-            await prisma.fiatLiquidityReceipt.update({ where: { dedupKey: 'receipt:x1' }, data: { status: 'RECONCILIATION_REQUIRED' } });
-            await expect(inTx((tx) => fiatLiquidity.confirmReceiptAvailable(tx, { dedupKey: 'receipt:x1' })))
-                .rejects.toThrow(/RECONCILIATION_REQUIRED|cannot become AVAILABLE/);
-            await prisma.fiatLiquidityReceipt.update({ where: { dedupKey: 'receipt:x1' }, data: { status: 'REVERSED', reversedAt: new Date() } });
-            await expect(inTx((tx) => fiatLiquidity.confirmReceiptAvailable(tx, { dedupKey: 'receipt:x1' })))
-                .rejects.toThrow(/cannot become AVAILABLE/);
+            const { receipt } = await seedAvailable({ amountGhs: 10 });
+            await prisma.fiatLiquidityReceipt.update({ where: { id: receipt.id }, data: { status: 'RECONCILIATION_REQUIRED' } });
+            await expect(inTx((tx) => fiatLiquidity.confirmTreasuryOpening(tx, { dedupKey: receipt.dedupKey, fundingReference: 'R-1', fundingChannel: 'BANK' })))
+                .rejects.toThrow(/RECONCILIATION_REQUIRED|RECEIVED treasury opening only/);
+            await expect(inTx((tx) => fiatLiquidity.confirmReconciliationMatch(tx, { dedupKey: receipt.dedupKey, matchedTransactionId: receipt.relatedTransactionId, providerEventDedupKey: 'event:x' })))
+                .rejects.toThrow(/UNMATCHED only/);
+            await prisma.fiatLiquidityReceipt.update({ where: { id: receipt.id }, data: { status: 'REVERSED', reversedAt: new Date() } });
+            await expect(inTx((tx) => fiatLiquidity.confirmTreasuryOpening(tx, { dedupKey: receipt.dedupKey, fundingReference: 'R-1', fundingChannel: 'BANK' })))
+                .rejects.toThrow(/RECEIVED treasury opening only/);
         });
     });
 
@@ -202,7 +495,7 @@ describeOrSkip('§P.5-D evidence-backed GHS liquidity authority (real PostgreSQL
     // =========================================================================
     describe('B. reservation is a single-winner conditional decrement', () => {
         test('a claim loser fails closed with the legacy FIAT_POOL_INSUFFICIENT contract and leaves no orphan', async () => {
-            await seedAvailable({ amountGhs: 50, dedupKey: 'receipt:b1' });
+            await seedAvailable({ amountGhs: 50 });
             await expect(inTx((tx) => fiatLiquidity.reserveForPayout(tx, {
                 reference: 'W-LOSER', amountGhs: 80, provider: 'MTN_MOMO',
             }))).rejects.toMatchObject({ code: 'FIAT_POOL_INSUFFICIENT' });
@@ -213,7 +506,7 @@ describeOrSkip('§P.5-D evidence-backed GHS liquidity authority (real PostgreSQL
         });
 
         test('concurrent reservations cannot over-reserve: exactly one winner, totals conserved', async () => {
-            await seedAvailable({ amountGhs: 100, dedupKey: 'receipt:b2' });
+            await seedAvailable({ amountGhs: 100 });
             const attempt = (ref) => inTx((tx) => fiatLiquidity.reserveForPayout(tx, {
                 reference: ref, amountGhs: 60, provider: 'MTN_MOMO',
             }));
@@ -235,7 +528,7 @@ describeOrSkip('§P.5-D evidence-backed GHS liquidity authority (real PostgreSQL
     // =========================================================================
     describe('C. reservation identity', () => {
         test('same reference + amount replays the committed reservation — no second claim', async () => {
-            await seedAvailable({ amountGhs: 100, dedupKey: 'receipt:c1' });
+            await seedAvailable({ amountGhs: 100 });
             const first = await inTx((tx) => fiatLiquidity.reserveForPayout(tx, {
                 reference: 'W-C1', amountGhs: 30, provider: 'MTN_MOMO', destination: '0244',
             }));
@@ -252,7 +545,7 @@ describeOrSkip('§P.5-D evidence-backed GHS liquidity authority (real PostgreSQL
         });
 
         test('conflicting reuse of a reference (different amount) fails closed', async () => {
-            await seedAvailable({ amountGhs: 100, dedupKey: 'receipt:c2' });
+            await seedAvailable({ amountGhs: 100 });
             await inTx((tx) => fiatLiquidity.reserveForPayout(tx, { reference: 'W-C2', amountGhs: 30, provider: 'MTN_MOMO' }));
             await expect(inTx((tx) => fiatLiquidity.reserveForPayout(tx, { reference: 'W-C2', amountGhs: 31, provider: 'MTN_MOMO' })))
                 .rejects.toMatchObject({ code: 'LIQUIDITY_CONFLICTING_EVIDENCE' });
@@ -264,24 +557,39 @@ describeOrSkip('§P.5-D evidence-backed GHS liquidity authority (real PostgreSQL
     // D. receipt identity / concurrency convergence
     // =========================================================================
     describe('D. receipt identity', () => {
-        test('identical evidence replays converge; conflicting dedupKey reuse fails closed', async () => {
-            const first = await seedAvailable({ amountGhs: 25, dedupKey: 'receipt:d1' });
-            expect(first.replay).toBe(false);
-            const second = await seedAvailable({ amountGhs: 25, dedupKey: 'receipt:d1' });
-            expect(second.replay).toBe(true);
-            expect(dec((await state()).availableGhs)).toBe(25);
-
-            await expect(seedAvailable({ amountGhs: 26, dedupKey: 'receipt:d1' }))
-                .rejects.toMatchObject({ code: 'LIQUIDITY_CONFLICTING_EVIDENCE' });
+        test('a webhook replay of the same settled deposit converges — exactly one liquidity effect', async () => {
+            await seedFreshRates();
+            await setAuthorityFlag(true);
+            const user = await seedUser(prisma);
+            const pending = await initiateDeposit(user, 25);
+            const first = await moolreWebhook(pending.txHash, 25);
+            expect(first.statusCode).toBe(200);
+            const second = await moolreWebhook(pending.txHash, 25); // provider retries
+            expect(second.statusCode).toBe(200);
+            expect(second.payload.message).toMatch(/Already processed/);
+            expect(await prisma.fiatLiquidityReceipt.count({ where: { dedupKey: `receipt:moolre-collection:${pending.txHash}` } })).toBe(1);
             expect(dec((await state()).availableGhs)).toBe(25);
         });
 
-        test('concurrent identical receipts commit exactly one liquidity effect', async () => {
-            const attempt = () => seedAvailable({ amountGhs: 40, dedupKey: 'receipt:d2' });
-            await Promise.allSettled([attempt(), attempt(), attempt()]);
-            const count = await prisma.fiatLiquidityReceipt.count({ where: { dedupKey: 'receipt:d2' } });
-            expect(count).toBe(1);
+        test('conflicting reuse of a receipt identity fails closed (treasury openings carry no chain)', async () => {
+            await inTx((tx) => fiatLiquidity.recordReceipt(tx, {
+                provider: 'AZM_TREASURY', dedupKey: 'treasury:d1', amountGhs: 25, treasury: true,
+            }));
+            await expect(inTx((tx) => fiatLiquidity.recordReceipt(tx, {
+                provider: 'AZM_TREASURY', dedupKey: 'treasury:d1', amountGhs: 26, treasury: true,
+            }))).rejects.toMatchObject({ code: 'LIQUIDITY_CONFLICTING_EVIDENCE' });
+            expect(dec((await state()).availableGhs)).toBe(0);
+        });
+
+        test('concurrent identical webhook settlements commit exactly one liquidity effect', async () => {
+            await seedFreshRates();
+            await setAuthorityFlag(true);
+            const user = await seedUser(prisma);
+            const pending = await initiateDeposit(user, 40);
+            const res1 = await moolreWebhook(pending.txHash, 40);
+            expect(res1.statusCode).toBe(200);
             expect(dec((await state()).availableGhs)).toBe(40);
+            expect(await prisma.fiatLiquidityReceipt.count()).toBe(1);
         });
     });
 
@@ -290,7 +598,7 @@ describeOrSkip('§P.5-D evidence-backed GHS liquidity authority (real PostgreSQL
     // =========================================================================
     describe('E./F./G./H. reservation lifecycle', () => {
         async function reservedRef(amountGhs, ref) {
-            await seedAvailable({ amountGhs, dedupKey: `receipt:lf-${ref}` });
+            await seedAvailable({ amountGhs });
             await inTx((tx) => fiatLiquidity.reserveForPayout(tx, {
                 reference: ref, amountGhs, provider: 'MTN_MOMO', relatedTransactionId: 'th-' + ref,
             }));
@@ -329,7 +637,7 @@ describeOrSkip('§P.5-D evidence-backed GHS liquidity authority (real PostgreSQL
         });
 
         test('F: FAILED returns funds to available from both RESERVED and IN_TRANSIT', async () => {
-            await seedAvailable({ amountGhs: 100, dedupKey: 'receipt:f2' });
+            await seedAvailable({ amountGhs: 100 });
             await inTx((tx) => fiatLiquidity.reserveForPayout(tx, { reference: 'W-F2a', amountGhs: 30, provider: 'MTN_MOMO' }));
             await inTx((tx) => fiatLiquidity.reserveForPayout(tx, { reference: 'W-F2b', amountGhs: 20, provider: 'MOOLRE' }));
             await inTx((tx) => fiatLiquidity.markReservationInTransit(tx, { reference: 'W-F2b' }));
@@ -342,17 +650,25 @@ describeOrSkip('§P.5-D evidence-backed GHS liquidity authority (real PostgreSQL
             expect(dec(s.paidOutGhs)).toBe(0);
         });
 
-        test('G: contradictory outcome NEVER rewrites terminal state — quarantine + idempotent exception, funds stay counted', async () => {
+        test('G: contradictory outcome NEVER rewrites terminal state — quarantine + idempotent exception, funds move to the hold bucket', async () => {
             await reservedRef(40, 'W-G1');
             await inTx((tx) => fiatLiquidity.markReservationInTransit(tx, { reference: 'W-G1', providerRef: 'MTN-G' }));
             await inTx((tx) => fiatLiquidity.settleReservation(tx, { reference: 'W-G1', outcome: 'FAILED' }));
             const afterFailed = await prisma.fiatLiquidityReservation.findUnique({ where: { reference: 'W-G1' } });
             expect(afterFailed.status).toBe('RELEASED');
+            expect(dec((await state()).availableGhs)).toBe(40); // returned to available
 
+            // contradictory SUCCESS after the release: the previously returned
+            // amount must LEAVE availability and enter the reconciliation hold
             const quarantined = await inTx((tx) => fiatLiquidity.settleReservation(tx, { reference: 'W-G1', outcome: 'SUCCESSFUL', providerTxId: 'MTN-G' }));
             expect(quarantined.quarantined).toBe(true);
+            expect(quarantined.heldMove).toBe('released_to_held');
             const afterContradiction = await prisma.fiatLiquidityReservation.findUnique({ where: { reference: 'W-G1' } });
             expect(afterContradiction.status).toBe('RECONCILIATION_REQUIRED');
+
+            const s = await state();
+            expect(dec(s.availableGhs)).toBe(0); // NOT +40 — held, not spendable
+            expect(dec(s.reconciliationHeldGhs)).toBe(40);
 
             const exceptions = await prisma.$queryRaw`SELECT * FROM "ReconciliationException" WHERE "entityType" = 'FIAT_LIQUIDITY_RESERVATION' AND "entityId" = ${'W-G1'}`;
             expect(exceptions).toHaveLength(1);
@@ -365,25 +681,69 @@ describeOrSkip('§P.5-D evidence-backed GHS liquidity authority (real PostgreSQL
             expect(still).toHaveLength(1);
         });
 
-        test('G: SUCCESS while still RESERVED (never dispatched) quarantines without a throw', async () => {
-            await reservedRef(15, 'W-G2');
-            const result = await inTx((tx) => fiatLiquidity.settleReservation(tx, { reference: 'W-G2', outcome: 'SUCCESSFUL' }));
+        test('G: the held amount is NOT spendable — a second payout cannot consume it (blocker 5)', async () => {
+            await seedAvailable({ amountGhs: 100 });
+            await inTx((tx) => fiatLiquidity.reserveForPayout(tx, { reference: 'W-G1b', amountGhs: 40, provider: 'MTN_MOMO' }));
+            await inTx((tx) => fiatLiquidity.markReservationInTransit(tx, { reference: 'W-G1b' }));
+            await inTx((tx) => fiatLiquidity.settleReservation(tx, { reference: 'W-G1b', outcome: 'FAILED' })); // released → available 100 again
+            await inTx((tx) => fiatLiquidity.settleReservation(tx, { reference: 'W-G1b', outcome: 'SUCCESSFUL' })); // contradiction → held
+            const s = await state();
+            expect(dec(s.availableGhs)).toBe(60);
+            expect(dec(s.reconciliationHeldGhs)).toBe(40);
+
+            // a 70 payout now FAILS: only 60 is claimable — the quarantined
+            // 40 can never be paid out again
+            await expect(inTx((tx) => fiatLiquidity.reserveForPayout(tx, {
+                reference: 'W-G1c', amountGhs: 70, provider: 'MTN_MOMO',
+            }))).rejects.toMatchObject({ code: 'FIAT_POOL_INSUFFICIENT' });
+        });
+
+        test('G: released funds already consumed by later payouts — the over-spend is flagged loudly, never hidden (blocker 5)', async () => {
+            await seedAvailable({ amountGhs: 50 });
+            await inTx((tx) => fiatLiquidity.reserveForPayout(tx, { reference: 'W-G2a', amountGhs: 40, provider: 'MTN_MOMO' }));
+            await inTx((tx) => fiatLiquidity.markReservationInTransit(tx, { reference: 'W-G2a' }));
+            await inTx((tx) => fiatLiquidity.settleReservation(tx, { reference: 'W-G2a', outcome: 'FAILED' })); // released → available 50
+            // consume the returned funds with a real later payout
+            await inTx((tx) => fiatLiquidity.reserveForPayout(tx, { reference: 'W-G2b', amountGhs: 45, provider: 'MOOLRE' }));
+            expect(dec((await state()).availableGhs)).toBe(5);
+
+            // the contradiction arrives AFTER the released 40 was spent
+            const result = await inTx((tx) => fiatLiquidity.settleReservation(tx, { reference: 'W-G2a', outcome: 'SUCCESSFUL' }));
+            expect(result.heldMove).toBe('released_already_spent');
+            const exceptions = await prisma.$queryRaw`SELECT "reason" FROM "ReconciliationException" WHERE "entityId" = ${'W-G2a'} AND "status" = 'OPEN'`;
+            const reasons = new Set(exceptions.map((e) => e.reason));
+            expect(reasons).toEqual(new Set(['CONTRADICTORY_PROVIDER_EVIDENCE', 'CONTRADICTORY_RELEASE_ALREADY_SPENT']));
+            // the state stays honest: available was NOT driven negative
+            const s = await state();
+            expect(dec(s.availableGhs)).toBe(5);
+            expect(dec(s.reconciliationHeldGhs)).toBe(0); // nothing could be moved to hold
+        });
+
+        test('G: SUCCESS while still RESERVED (never dispatched) quarantines with funds moved to hold', async () => {
+            await reservedRef(15, 'W-G3');
+            const result = await inTx((tx) => fiatLiquidity.settleReservation(tx, { reference: 'W-G3', outcome: 'SUCCESSFUL' }));
             expect(result.quarantined).toBe(true);
-            const rz = await prisma.fiatLiquidityReservation.findUnique({ where: { reference: 'W-G2' } });
+            expect(result.heldMove).toBe('reserved_to_held');
+            const rz = await prisma.fiatLiquidityReservation.findUnique({ where: { reference: 'W-G3' } });
             expect(rz.status).toBe('RECONCILIATION_REQUIRED');
             const s = await state();
-            expect(dec(s.reservedGhs)).toBe(15); // funds stay counted — never spendable twice
+            expect(dec(s.reservedGhs)).toBe(0); // left the reservation bucket
+            expect(dec(s.reconciliationHeldGhs)).toBe(15); // counted in hold — never spendable
         });
 
         test('G: terminal success through a DIFFERENT provider reference quarantines', async () => {
-            await reservedRef(15, 'W-G3');
-            await inTx((tx) => fiatLiquidity.markReservationInTransit(tx, { reference: 'W-G3', providerRef: 'MTN-1' }));
-            const result = await inTx((tx) => fiatLiquidity.settleReservation(tx, { reference: 'W-G3', outcome: 'SUCCESSFUL', providerTxId: 'MTN-2' }));
+            await reservedRef(15, 'W-G4');
+            await inTx((tx) => fiatLiquidity.markReservationInTransit(tx, { reference: 'W-G4', providerRef: 'MTN-1' }));
+            const result = await inTx((tx) => fiatLiquidity.settleReservation(tx, { reference: 'W-G4', outcome: 'SUCCESSFUL', providerTxId: 'MTN-2' }));
             expect(result.quarantined).toBe(true);
+            expect(result.heldMove).toBe('in_transit_to_held');
+            const s = await state();
+            expect(dec(s.inTransitGhs)).toBe(0);
+            expect(dec(s.reconciliationHeldGhs)).toBe(15);
         });
 
-        test('H: internal reversal of a RESERVED payout returns funds; IN_TRANSIT/PAID_OUT reversals quarantine, never auto-release', async () => {
-            await seedAvailable({ amountGhs: 100, dedupKey: 'receipt:h1' });
+        test('H: internal reversal of a RESERVED payout returns funds; IN_TRANSIT/PAID_OUT reversals quarantine with funds held, never auto-release', async () => {
+            await seedAvailable({ amountGhs: 100 });
             await inTx((tx) => fiatLiquidity.reserveForPayout(tx, { reference: 'W-H1', amountGhs: 30, provider: 'MTN_MOMO' }));
             await inTx((tx) => fiatLiquidity.reserveForPayout(tx, { reference: 'W-H2', amountGhs: 30, provider: 'MTN_MOMO' }));
             await inTx((tx) => fiatLiquidity.reserveForPayout(tx, { reference: 'W-H3', amountGhs: 30, provider: 'MTN_MOMO' }));
@@ -397,17 +757,22 @@ describeOrSkip('§P.5-D evidence-backed GHS liquidity authority (real PostgreSQL
 
             const r2 = await inTx((tx) => fiatLiquidity.releaseReservation(tx, { reference: 'W-H2' }));
             expect(r2.quarantined).toBe(true); // cash position unprovable
+            expect(r2.heldMove).toBe('in_transit_to_held');
             expect((await prisma.fiatLiquidityReservation.findUnique({ where: { reference: 'W-H2' } })).status).toBe('RECONCILIATION_REQUIRED');
 
             const r3 = await inTx((tx) => fiatLiquidity.releaseReservation(tx, { reference: 'W-H3' }));
             expect(r3.quarantined).toBe(true); // a late reversal cannot unpay cash
+            expect(r3.heldMove).toBe('paid_out_unchanged');
             expect((await prisma.fiatLiquidityReservation.findUnique({ where: { reference: 'W-H3' } })).status).toBe('RECONCILIATION_REQUIRED');
 
             const s = await state();
-            expect(dec(s.availableGhs)).toBe(40); // 100 − 30 (H1 returned) − 30 (H2 quarantined-held) + 30 (H1) − 30 (H3 paid) = 40
+            // 100 − 30 (H2 quarantined into hold) − 30 (H3 paid out) = 40;
+            // H1's reservation was RELEASED — its funds returned to available
+            expect(dec(s.availableGhs)).toBe(40);
             expect(dec(s.reservedGhs)).toBe(0);
-            expect(dec(s.inTransitGhs)).toBe(30); // H2: funds stay counted in transit while quarantined
+            expect(dec(s.inTransitGhs)).toBe(0); // H2 left transit into hold
             expect(dec(s.paidOutGhs)).toBe(30);
+            expect(dec(s.reconciliationHeldGhs)).toBe(30); // H2 held; H3 stays paid out
         });
     });
 
@@ -416,7 +781,7 @@ describeOrSkip('§P.5-D evidence-backed GHS liquidity authority (real PostgreSQL
     // =========================================================================
     describe('I. conservation and projection', () => {
         test('full lifecycle: deposit → reserve → dispatch → success/failure keeps every total exact and the pool a projection', async () => {
-            await seedAvailable({ amountGhs: '250.75', dedupKey: 'receipt:i1' });
+            await seedAvailable({ amountGhs: 250.75 });
             expect(await pool()).toBe(250.75);
 
             await inTx((tx) => fiatLiquidity.reserveForPayout(tx, { reference: 'W-I1', amountGhs: '100.25', provider: 'MOOLRE' }));
@@ -432,10 +797,12 @@ describeOrSkip('§P.5-D evidence-backed GHS liquidity authority (real PostgreSQL
             expect(dec(s.reservedGhs)).toBe(0);
             expect(dec(s.inTransitGhs)).toBe(0);
             expect(dec(s.paidOutGhs)).toBe(100.25);
+            expect(dec(s.reconciliationHeldGhs)).toBe(0);
             expect(await pool()).toBe(150.50);
 
             const summary = await fiatLiquidity.liquiditySummary(prisma);
             expect(summary.authoritative.availableGhs).toBe('150.5');
+            expect(summary.authoritative.reconciliationHeldGhs).toBe('0');
             expect(summary.systemFiatPoolProjection).toBe('150.5'); // explicitly non-authoritative
             expect(summary.reservationsByStatus).toEqual(expect.arrayContaining([
                 expect.objectContaining({ status: 'PAID_OUT', provider: 'MOOLRE', amountGhs: '100.25' }),
@@ -449,7 +816,8 @@ describeOrSkip('§P.5-D evidence-backed GHS liquidity authority (real PostgreSQL
     // =========================================================================
     describe('J. reconciliation', () => {
         test('every discrepancy category is flagged idempotently and nothing is auto-repaired', async () => {
-            // an inbound event with no receipt
+            // an inbound event with no receipt (webhook recorded the raw
+            // observation but no receipt exists — e.g. flag-off settlement)
             await fiatLiquidity.recordProviderEvent(prisma, {
                 provider: 'MOOLRE', direction: 'INBOUND', status: 'SUCCESSFUL',
                 dedupKey: 'event:j1', amountGhs: 30,
@@ -462,13 +830,14 @@ describeOrSkip('§P.5-D evidence-backed GHS liquidity authority (real PostgreSQL
                 where: { dedupKey: 'receipt:j2' },
                 data: { createdAt: new Date(Date.now() - 3 * 60_000 * 60) },
             });
-            // duplicate provider references
-            await seedAvailable({ amountGhs: 5, dedupKey: 'receipt:j3', providerRef: 'PR-DUP', provider: 'MOOLRE', relatedTransactionId: 'tx-a' });
-            await seedAvailable({ amountGhs: 7, dedupKey: 'receipt:j4', providerRef: 'PR-DUP', provider: 'MOOLRE', relatedTransactionId: 'tx-b' });
-            // an amount mismatch between event and receipt
+            // duplicate provider references on two UNMATCHED receipts
+            await inTx((tx) => fiatLiquidity.recordReceipt(tx, { provider: 'MOOLRE', providerRef: 'PR-DUP', dedupKey: 'receipt:j3', amountGhs: 5 }));
+            await inTx((tx) => fiatLiquidity.recordReceipt(tx, { provider: 'MOOLRE', providerRef: 'PR-DUP', dedupKey: 'receipt:j4', amountGhs: 7 }));
+            // an amount mismatch between a durable event and its receipt,
+            // paired through provider + providerRef (durable join, not keys)
             await fiatLiquidity.recordProviderEvent(prisma, {
                 provider: 'MOOLRE', direction: 'INBOUND', status: 'SUCCESSFUL',
-                dedupKey: 'receipt:j3', amountGhs: 6, providerRef: 'PR-DUP',
+                dedupKey: 'event:j5', amountGhs: 6, providerRef: 'PR-J',
             });
             // a stuck reservation
             await prisma.fiatLiquidityReservation.create({
@@ -506,74 +875,45 @@ describeOrSkip('§P.5-D evidence-backed GHS liquidity authority (real PostgreSQL
             const s = await state();
             expect(dec(s.availableGhs)).toBe(999); // flagged, not fixed
         });
+
+        test('real webhook chains produce ZERO reconciliation exceptions (durable join pairs them correctly)', async () => {
+            await seedAvailable({ amountGhs: 55 });
+            const report = await fiatLiquidity.reconcile(prisma, { horizonMinutes: 60, dryRun: true });
+            expect(report.exceptions).toEqual([]);
+            expect(report.totals.reconciliationHeldGhs).toBe('0');
+        });
+
+        test('conservation covers ALL buckets including the reconciliation hold', async () => {
+            await seedAvailable({ amountGhs: 100 });
+            await inTx((tx) => fiatLiquidity.reserveForPayout(tx, { reference: 'W-K1', amountGhs: 40, provider: 'MTN_MOMO' }));
+            await inTx((tx) => fiatLiquidity.markReservationInTransit(tx, { reference: 'W-K1' }));
+            await inTx((tx) => fiatLiquidity.settleReservation(tx, { reference: 'W-K1', outcome: 'FAILED' }));
+            await inTx((tx) => fiatLiquidity.settleReservation(tx, { reference: 'W-K1', outcome: 'SUCCESSFUL' })); // → hold
+
+            const clean = await fiatLiquidity.reconcile(prisma, { horizonMinutes: 60, dryRun: true });
+            expect(clean.exceptions).toEqual([]); // held bucket reconciles exactly
+
+            // tamper the hold bucket: conservation must flag it
+            await prisma.fiatLiquidityState.update({ where: { id: 1 }, data: { reconciliationHeldGhs: 41 } });
+            const tampered = await fiatLiquidity.reconcile(prisma, { horizonMinutes: 60, dryRun: true });
+            const delta = tampered.exceptions.find((e) => e.reason === 'STATE_CONSERVATION_DELTA');
+            expect(delta).toBeDefined();
+            expect(JSON.stringify(delta.details)).toMatch(/reconciliationHeldGhs/);
+        });
     });
 
     // =========================================================================
     // K. mounted webhook integration (real controllers, real DB)
     // =========================================================================
     describe('K. mounted deposit-webhook integration', () => {
-        function makeApp() {
-            const registry = {
-                prisma,
-                marketOracle: null,
-                notificationService: { sendNotification: jest.fn().mockResolvedValue(undefined) },
-                socketio: null,
-                emitBalanceUpdate: null,
-                moolreCollectionService: { initiatePayment: jest.fn().mockResolvedValue({ requiresOtp: false, providerRef: 'PR-P5D' }) },
-            };
-            return { get: (key) => registry[key] };
-        }
-        const mockResponse = () => ({
-            statusCode: 200,
-            status(code) { this.statusCode = code; return this; },
-            json(payload) { this.payload = payload; return this; },
-        });
-
-        async function initiateDeposit(user) {
-            const res = mockResponse();
-            await moolreQuoteDepositController.initiate(
-                { app: makeApp(), user: { id: user.id }, body: { amountGhs: 134.20, provider: 'MTN_MOMO', phoneNumber: '0241234567' }, headers: {} },
-                res,
-            );
-            expect(res.statusCode).toBe(201);
-            const pending = await prisma.transactionHistory.findMany({ where: { userId: user.id, type: 'DEPOSIT_FIAT', status: 'PENDING' } });
-            expect(pending).toHaveLength(1);
-            return pending[0];
-        }
-
-        async function moolreWebhook(pendingTxHash) {
-            const res = mockResponse();
-            await moolreQuoteDepositController.webhook(
-                {
-                    app: makeApp(),
-                    headers: { 'x-moolre-webhook-secret': process.env.MOOLRE_WEBHOOK_SECRET },
-                    body: {
-                        status: 1,
-                        code: 'P01',
-                        data: { externalref: pendingTxHash, amount: 134.20, payer: '0241234567' },
-                    },
-                },
-                res,
-            );
-            return res;
-        }
-
-        async function seedFreshRates() {
-            await prisma.globalSettings.upsert({
-                where: { id: 1 },
-                update: { liveRetailRate: 13.42, liveRateSource: 'KOTANI_PAY', lastExternalSync: new Date() },
-                create: { id: 1, liveRetailRate: 13.42, liveRateSource: 'KOTANI_PAY', lastExternalSync: new Date() },
-            });
-        }
-
         test('flag ON: a settled Moolre deposit creates an AVAILABLE receipt in the SAME transaction; replays converge', async () => {
             await seedFreshRates();
             await setAuthorityFlag(true);
             const user = await seedUser(prisma);
-            const pending = await initiateDeposit(user);
+            const pending = await initiateDeposit(user, 134.20);
             const userBefore = await prisma.user.findUnique({ where: { id: user.id } });
 
-            const res = await moolreWebhook(pending.txHash);
+            const res = await moolreWebhook(pending.txHash, 134.20);
             expect(res.statusCode).toBe(200);
             expect(res.payload.success).toBe(true);
 
@@ -588,7 +928,7 @@ describeOrSkip('§P.5-D evidence-backed GHS liquidity authority (real PostgreSQL
             expect(events).toHaveLength(1); // raw evidence appended out-of-band
 
             // webhook replay converges: no second receipt, no second liquidity
-            await moolreWebhook(pending.txHash);
+            await moolreWebhook(pending.txHash, 134.20);
             expect(await prisma.fiatLiquidityReceipt.count({ where: { dedupKey: `receipt:moolre-collection:${pending.txHash}` } })).toBe(1);
             expect(dec((await state()).availableGhs)).toBe(134.20);
 
@@ -600,9 +940,9 @@ describeOrSkip('§P.5-D evidence-backed GHS liquidity authority (real PostgreSQL
             await seedFreshRates();
             await setAuthorityFlag(false);
             const user = await seedUser(prisma);
-            const pending = await initiateDeposit(user);
+            const pending = await initiateDeposit(user, 100);
 
-            const res = await moolreWebhook(pending.txHash);
+            const res = await moolreWebhook(pending.txHash, 100);
             expect(res.statusCode).toBe(200);
 
             expect(await prisma.fiatProviderEvent.count({ where: { dedupKey: `event:moolre-collection:${pending.txHash}` } })).toBe(1);
@@ -611,6 +951,52 @@ describeOrSkip('§P.5-D evidence-backed GHS liquidity authority (real PostgreSQL
             // the deposit itself still settles (mounted behavior unchanged)
             const settled = await prisma.transactionHistory.findUnique({ where: { id: pending.id } });
             expect(settled.status).toBe('COMPLETED');
+        });
+
+        test('sub-pesewa settlement amounts are rejected 400 — the authority never guesses a rounding', async () => {
+            await seedFreshRates();
+            await setAuthorityFlag(true);
+            const user = await seedUser(prisma);
+            const pending = await initiateDeposit(user, 100);
+            const res = await moolreWebhook(pending.txHash, 100.005);
+            expect(res.statusCode).toBe(400);
+            expect(res.payload.message).toMatch(/pesewa/);
+            const tx = await prisma.transactionHistory.findUnique({ where: { id: pending.id } });
+            expect(tx.status).toBe('PENDING'); // not settled, not credited
+        });
+
+        test('FAIL-CLOSED: when the evidence store is unavailable the settlement is blocked and NOTHING is credited (blocker 2)', async () => {
+            await seedFreshRates();
+            await setAuthorityFlag(true);
+            const user = await seedUser(prisma);
+            const pending = await initiateDeposit(user, 80);
+            const userBefore = await prisma.user.findUnique({ where: { id: user.id } });
+
+            // simulate evidence-store unavailability at the DB boundary
+            await prisma.$executeRaw`DROP TABLE "FiatProviderEvent"`;
+            const blocked = await moolreWebhook(pending.txHash, 80);
+            expect(blocked.statusCode).toBe(503);
+            expect(blocked.payload.success).toBe(false);
+            expect(blocked.payload.message).toMatch(/durably recorded/);
+
+            // the deposit stayed PENDING; no USDC was credited; no liquidity
+            const tx = await prisma.transactionHistory.findUnique({ where: { id: pending.id } });
+            expect(tx.status).toBe('PENDING');
+            const userMid = await prisma.user.findUnique({ where: { id: user.id } });
+            expect(Number(userMid.availableBalance)).toBe(Number(userBefore.availableBalance));
+            expect(dec((await state()).availableGhs)).toBe(0);
+
+            // recover the evidence store (the idempotent overlay installer)
+            const { installFiatLiquidityOverlay } = require('../infra/install-fiat-liquidity-overlay');
+            await installFiatLiquidityOverlay(prisma);
+
+            // the provider retries: the settlement now proceeds and converges
+            const retried = await moolreWebhook(pending.txHash, 80);
+            expect(retried.statusCode).toBe(200);
+            const settled = await prisma.transactionHistory.findUnique({ where: { id: pending.id } });
+            expect(settled.status).toBe('COMPLETED');
+            expect(dec((await state()).availableGhs)).toBe(80);
+            expect(await prisma.fiatLiquidityReceipt.count()).toBe(1);
         });
     });
 
@@ -648,7 +1034,7 @@ describeOrSkip('§P.5-D evidence-backed GHS liquidity authority (real PostgreSQL
             await prisma.systemFiatPool.update({ where: { id: 1 }, data: { balance: 5000 } });
             await prisma.fiatLiquidityState.update({ where: { id: 1 }, data: { availableGhs: 1000 } });
             const ref2 = `FIAT_OUT_FLAG_ON_${userOn.id}`;
-            const result = await financeService.processFiatWithdrawal(prisma, userOn.id, 10, { reference: ref2, retailRate: 13.42, liquidityRoute: { provider: 'MTN_MOMO', destination: '0244' } });
+            await financeService.processFiatWithdrawal(prisma, userOn.id, 10, { reference: ref2, retailRate: 13.42, liquidityRoute: { provider: 'MTN_MOMO', destination: '0244' } });
             const rz = await prisma.fiatLiquidityReservation.findUnique({ where: { reference: ref2 } });
             expect(rz).not.toBeNull();
             expect(rz.status).toBe('RESERVED');
@@ -670,6 +1056,8 @@ describeOrSkip('§P.5-D evidence-backed GHS liquidity authority (real PostgreSQL
                 .rejects.toMatchObject({ code: 'LIQUIDITY_INVALID_EVIDENCE' });
             await expect(fiatLiquidity.recordProviderEvent(prisma, { provider: 'MOOLRE', direction: 'INBOUND', status: 'SUCCESSFUL', dedupKey: 'e-m1', amountGhs: 10.005 }))
                 .rejects.toMatchObject({ code: 'LIQUIDITY_INVALID_EVIDENCE' });
+            await expect(fiatLiquidity.recordProviderEvent(prisma, { provider: 'MOOLRE', direction: 'INBOUND', status: 'SUCCESSFUL', dedupKey: 'e-m1b' }))
+                .rejects.toMatchObject({ code: 'LIQUIDITY_INVALID_EVIDENCE' }); // INBOUND must carry the amount
             await expect(inTx((tx) => fiatLiquidity.reserveForPayout(tx, { reference: 'W-M1', amountGhs: 10.005, provider: 'MTN_MOMO' })))
                 .rejects.toMatchObject({ code: 'LIQUIDITY_INVALID_EVIDENCE' });
             await expect(inTx((tx) => fiatLiquidity.reserveForPayout(tx, { reference: 'W-M2', amountGhs: 0, provider: 'MTN_MOMO' })))
@@ -678,16 +1066,34 @@ describeOrSkip('§P.5-D evidence-backed GHS liquidity authority (real PostgreSQL
                 .rejects.toMatchObject({ code: 'LIQUIDITY_INVALID_EVIDENCE' });
         });
 
+        test('OUTBOUND observations may carry no amount (providers that report status only) — INBOUND may not', async () => {
+            const { event, replay } = await fiatLiquidity.recordProviderEvent(prisma, {
+                provider: 'MOOLRE', direction: 'OUTBOUND', status: 'FAILED',
+                providerRef: 'MTN-NULL-AMT', dedupKey: 'event:payout-outbound:MOOLRE:W-M4:FAILED',
+                relatedReference: 'W-M4',
+            });
+            expect(replay).toBe(false);
+            expect(event.amountGhs).toBeNull();
+            const again = await fiatLiquidity.recordProviderEvent(prisma, {
+                provider: 'MOOLRE', direction: 'OUTBOUND', status: 'FAILED',
+                providerRef: 'MTN-NULL-AMT', dedupKey: 'event:payout-outbound:MOOLRE:W-M4:FAILED',
+                relatedReference: 'W-M4',
+            });
+            expect(again.replay).toBe(true); // duplicate terminal callback converges
+        });
+
         test('2dp GHS amounts round-trip exactly through Decimal(20,2) — no float artifacts', async () => {
-            const { receipt } = await seedAvailable({ amountGhs: '0.10', dedupKey: 'receipt:m2' });
+            const { receipt } = await seedAvailable({ amountGhs: 0.10 });
             expect(receipt.amountGhs.toString()).toBe('0.1');
-            await seedAvailable({ amountGhs: '0.20', dedupKey: 'receipt:m3' });
+            await seedAvailable({ amountGhs: 0.20 });
             const s = await state();
             expect(s.availableGhs.toString()).toBe('0.3'); // exact — never 0.30000000000000004
         });
 
-        test('the overlay DB CHECKs reject negative state totals and non-positive amounts at the boundary', async () => {
+        test('the overlay DB CHECKs reject negative state totals, non-positive amounts, INBOUND events without amounts and invalid directions', async () => {
             await expect(prisma.$executeRaw`UPDATE "FiatLiquidityState" SET "availableGhs" = -1 WHERE "id" = 1`)
+                .rejects.toThrow();
+            await expect(prisma.$executeRaw`UPDATE "FiatLiquidityState" SET "reconciliationHeldGhs" = -1 WHERE "id" = 1`)
                 .rejects.toThrow();
             await expect(prisma.fiatLiquidityReceipt.create({
                 data: { provider: 'X', dedupKey: 'bad-r', amountGhs: -5 },
@@ -698,13 +1104,192 @@ describeOrSkip('§P.5-D evidence-backed GHS liquidity authority (real PostgreSQL
             await expect(prisma.fiatProviderEvent.create({
                 data: { provider: 'X', direction: 'SIDEWAYS', status: 'S', dedupKey: 'bad-e', amountGhs: 1 },
             })).rejects.toThrow();
+            // INBOUND without an amount is rejected by the amount_present CHECK
+            await expect(prisma.fiatProviderEvent.create({
+                data: { provider: 'X', direction: 'INBOUND', status: 'S', dedupKey: 'bad-e2' },
+            })).rejects.toThrow();
+            // OUTBOUND without an amount is allowed
+            await expect(prisma.fiatProviderEvent.create({
+                data: { provider: 'X', direction: 'OUTBOUND', status: 'S', dedupKey: 'ok-e3' },
+            })).resolves.toBeDefined();
         });
     });
 
     // =========================================================================
-    // O. runDoubleCheck regressions (NaN disarm + withdrawal sign convention)
+    // P. outbound terminal evidence (settlement service, fail-closed)
     // =========================================================================
-    describe('O. runDoubleCheck regressions', () => {
+    describe('P. outbound terminal evidence', () => {
+        test('settleFiatWithdrawal retains the terminal observation durably BEFORE settling; duplicates converge', async () => {
+            const fiatSettlementService = require('../services/fiatSettlementService');
+            await seedAvailable({ amountGhs: 60 });
+            await inTx((tx) => fiatLiquidity.reserveForPayout(tx, { reference: 'W-P1', amountGhs: 60, provider: 'MOOLRE', relatedTransactionId: 'th-p1' }));
+            await inTx((tx) => fiatLiquidity.markReservationInTransit(tx, { reference: 'W-P1', providerRef: 'PR-P1' }));
+
+            // build a genuine pending fiat withdrawal row for the settle path
+            const user = await seedUser(prisma, { availableBalance: 0 });
+            const txRow = await prisma.transactionHistory.create({
+                data: { userId: user.id, type: 'WITHDRAWAL_FIAT', amountUsdc: '4.47', status: 'PENDING', txHash: 'W-P1' },
+            });
+
+            const settle = async () => fiatSettlementService.settleFiatWithdrawal(prisma, { reference: 'W-P1', provider: 'MOOLRE', providerTxId: 'PR-P1', status: 'SUCCESSFUL' });
+            const result = await settle();
+            expect(result.transaction.status).toBe('COMPLETED');
+
+            // the terminal observation is durable
+            const ev = await prisma.fiatProviderEvent.findUnique({ where: { dedupKey: 'event:payout-outbound:MOOLRE:W-P1:SUCCESSFUL' } });
+            expect(ev).not.toBeNull();
+            expect(ev.direction).toBe('OUTBOUND');
+            expect(ev.relatedReference).toBe('W-P1');
+
+            // the authority reservation followed the settlement
+            const rz = await prisma.fiatLiquidityReservation.findUnique({ where: { reference: 'W-P1' } });
+            expect(rz.status).toBe('PAID_OUT');
+            expect(dec((await state()).paidOutGhs)).toBe(60);
+
+            // a duplicate terminal callback converges (event + reservation replay)
+            const again = await settle();
+            expect(again.transaction.status).toBe('COMPLETED');
+            expect(await prisma.fiatProviderEvent.count({ where: { relatedReference: 'W-P1' } })).toBe(1);
+        });
+
+        test('a CONTRADICTORY terminal observation is retained as a DISTINCT durable row, never dropped', async () => {
+            const fiatSettlementService = require('../services/fiatSettlementService');
+            await seedAvailable({ amountGhs: 60 });
+            await inTx((tx) => fiatLiquidity.reserveForPayout(tx, { reference: 'W-P2', amountGhs: 60, provider: 'MOOLRE', relatedTransactionId: 'th-p2' }));
+            await inTx((tx) => fiatLiquidity.markReservationInTransit(tx, { reference: 'W-P2', providerRef: 'PR-P2' }));
+            const user = await seedUser(prisma, { availableBalance: 0 });
+            await prisma.transactionHistory.create({
+                data: { userId: user.id, type: 'WITHDRAWAL_FIAT', amountUsdc: '4.47', status: 'PENDING', txHash: 'W-P2' },
+            });
+
+            await fiatSettlementService.settleFiatWithdrawal(prisma, { reference: 'W-P2', provider: 'MOOLRE', providerTxId: 'PR-P2', status: 'FAILED', reason: 'insufficient' });
+            expect((await prisma.fiatLiquidityReservation.findUnique({ where: { reference: 'W-P2' } })).status).toBe('RELEASED');
+
+            // the provider now claims SUCCESS for the same payout
+            await fiatSettlementService.settleFiatWithdrawal(prisma, { reference: 'W-P2', provider: 'MOOLRE', providerTxId: 'PR-P2', status: 'SUCCESSFUL' });
+            const rz = await prisma.fiatLiquidityReservation.findUnique({ where: { reference: 'W-P2' } });
+            expect(rz.status).toBe('RECONCILIATION_REQUIRED'); // quarantined, never rewritten
+            // BOTH observations are durable and distinct
+            expect(await prisma.fiatProviderEvent.count({ where: { relatedReference: 'W-P2', direction: 'OUTBOUND' } })).toBe(2);
+        });
+
+        test('FAIL-CLOSED: when the evidence store is unavailable the payout settlement refuses to proceed (blocker 6)', async () => {
+            const fiatSettlementService = require('../services/fiatSettlementService');
+            const user = await seedUser(prisma, { availableBalance: 0 });
+            await prisma.transactionHistory.create({
+                data: { userId: user.id, type: 'WITHDRAWAL_FIAT', amountUsdc: '4.47', status: 'PENDING', txHash: 'W-P3' },
+            });
+            await prisma.$executeRaw`DROP TABLE "FiatProviderEvent"`;
+            await expect(fiatSettlementService.settleFiatWithdrawal(prisma, { reference: 'W-P3', provider: 'MOOLRE', providerTxId: 'PR-P3', status: 'SUCCESSFUL' }))
+                .rejects.toThrow();
+            // the withdrawal stayed PENDING — no settlement without evidence
+            expect((await prisma.transactionHistory.findFirst({ where: { txHash: 'W-P3' } })).status).toBe('PENDING');
+            const { installFiatLiquidityOverlay } = require('../infra/install-fiat-liquidity-overlay');
+            await installFiatLiquidityOverlay(prisma); // restore for afterEach bookkeeping
+        });
+    });
+
+    // =========================================================================
+    // Q. auto-payout worker: authoritative GHS units (blocker 7)
+    // =========================================================================
+    describe('Q. auto-payout worker liquidity units', () => {
+        const PayoutBatchWorker = require('../workers/payoutBatchWorker');
+        const buildWorker = () => new PayoutBatchWorker(prisma, null, { initiateTransfer: jest.fn() }, null);
+
+        async function workerSettings({ threshold, max }) {
+            // The auto-payout configuration lives on GlobalSettings.
+            await prisma.globalSettings.upsert({
+                where: { id: 1 },
+                update: { autoPayoutEnabled: true, autoPayoutThresholdUsdc: threshold, autoPayoutMaxAmountUsdc: max },
+                create: { id: 1, autoPayoutEnabled: true, autoPayoutThresholdUsdc: threshold, autoPayoutMaxAmountUsdc: max },
+            });
+            return prisma.globalSettings.findUnique({ where: { id: 1 } });
+        }
+
+        async function pendingAutoWithdrawal(user, amountUsdc) {
+            const created = new Date(Date.now() - 10 * 60_000);
+            // the real flow creates BOTH rows: the Withdrawal and its canonical
+            // WITHDRAWAL_FIAT TransactionHistory identity (same amount, same
+            // instant) — the worker refuses to dispatch without it.
+            await prisma.transactionHistory.create({
+                data: {
+                    userId: user.id, type: 'WITHDRAWAL_FIAT', amountUsdc: amountUsdc,
+                    status: 'PENDING', txHash: `auto-payout-w-${user.id}-${Date.now()}`,
+                    createdAt: created,
+                },
+            });
+            await prisma.withdrawal.create({
+                data: {
+                    userId: user.id, amount: amountUsdc, status: 'PENDING',
+                    payoutMethod: 'MTN_MOMO', destination: '0241234567',
+                    network: 'MTN', createdAt: created,
+                },
+            });
+        }
+
+        test('authority ON: the threshold is compared in GHS (converted at the live rate) — a USDC pool figure is never compared with GHS', async () => {
+            await seedFreshRates(); // 13.42
+            await setAuthorityFlag(true);
+            const settings = await workerSettings({ threshold: 100, max: 500 });
+            const worker = buildWorker();
+
+            // claimable authority liquidity: 500 GHS. Threshold 100 USDC
+            // ≡ 1342 GHS — far above availability → every withdrawal flags.
+            await seedAvailable({ amountGhs: 500 });
+            const user = await seedUser(prisma, { availableBalance: 200 });
+            await pendingAutoWithdrawal(user, 20);
+
+            const results = await worker._processBatch(settings, { isManualTrigger: true });
+            expect(results.flagged).toBe(1);
+            expect(results.details.flaggedManualReview).toHaveLength(1);
+            expect(results.details.flaggedManualReview[0].reason).toBe('INSUFFICIENT_AUTHORITATIVE_GHS');
+            expect(results.processed).toBe(0);
+            const flagged = await prisma.withdrawal.findFirst({ where: { userId: user.id } });
+            expect(flagged.status).toBe('NEEDS_MANUAL_REVIEW');
+        });
+
+        test('authority ON: available GHS above the converted threshold pays out — and no second reservation is created for an already-reserved withdrawal', async () => {
+            await seedFreshRates(); // 13.42 → threshold 100 USDC ≡ 1342 GHS
+            await setAuthorityFlag(true);
+            const settings = await workerSettings({ threshold: 100, max: 5000 });
+            const worker = buildWorker();
+            worker.mtn = { initiateTransfer: jest.fn().mockResolvedValue({ status: 'ACCEPTED', data: { reference: 'MTN-Q2' }, providerRef: 'MTN-Q2' }) };
+
+            await seedAvailable({ amountGhs: 2000 });
+            const user = await seedUser(prisma, { availableBalance: 200 });
+            await pendingAutoWithdrawal(user, 20); // 20 USDC ≡ 268.40 GHS
+
+            const results = await worker._processBatch(settings, { isManualTrigger: true });
+            expect(results.processed).toBe(1);
+            expect(results.details.processed).toHaveLength(1);
+            expect(results.details.flaggedManualReview).toHaveLength(0);
+            const rz = await prisma.fiatLiquidityReservation.findMany({ where: { reference: { contains: String(user.id) } } });
+            expect(rz).toHaveLength(0); // the worker itself never reserves
+            // dispatch evidence was recorded durably
+            const dispatched = results.details.processed[0];
+            expect(dispatched.referenceId).toBeDefined();
+            const ev = await prisma.fiatProviderEvent.findFirst({ where: { direction: 'OUTBOUND', relatedReference: dispatched.referenceId } });
+            expect(ev).not.toBeNull();
+        });
+
+        test('authority OFF: legacy USDC pool comparison is byte-identical (INSUFFICIENT_POOL_LIQUIDITY on a drained pool)', async () => {
+            await setAuthorityFlag(false);
+            const settings = await workerSettings({ threshold: 500, max: 200 });
+            const worker = buildWorker();
+            await prisma.systemFiatPool.update({ where: { id: 1 }, data: { balance: 100 } });
+            const user = await seedUser(prisma, { availableBalance: 200 });
+            await pendingAutoWithdrawal(user, 20);
+
+            const results = await worker._processBatch(settings, { isManualTrigger: true });
+            expect(results.flagged).toBe(1);
+            expect(results.details.flaggedManualReview[0].reason).toBe('INSUFFICIENT_POOL_LIQUIDITY');
+        });
+    });
+
+    // =========================================================================
+    // R. runDoubleCheck regressions (NaN disarm + withdrawal sign convention)
+    // =========================================================================
+    describe('R. runDoubleCheck regressions', () => {
         test('2+ settled Decimal rows recompute correctly (old code produced NaN/string-concat and silently passed)', async () => {
             const user = await seedUser(prisma, { availableBalance: 0 });
             await prisma.transactionHistory.createMany({
@@ -745,9 +1330,9 @@ describeOrSkip('§P.5-D evidence-backed GHS liquidity authority (real PostgreSQL
     });
 
     // =========================================================================
-    // P. overlay idempotency (guarded re-run against the live test DB)
+    // S. overlay idempotency (guarded re-run against the live test DB)
     // =========================================================================
-    describe('P. overlay idempotency', () => {
+    describe('S. overlay idempotency', () => {
         test('the installer converges on re-run', async () => {
             const { installFiatLiquidityOverlay } = require('../infra/install-fiat-liquidity-overlay');
             await installFiatLiquidityOverlay(prisma);
@@ -755,8 +1340,8 @@ describeOrSkip('§P.5-D evidence-backed GHS liquidity authority (real PostgreSQL
             const cols = await prisma.$queryRaw`
                 SELECT COUNT(*)::int AS n FROM information_schema.columns
                 WHERE "table_name" = 'FiatLiquidityState'
-                  AND "column_name" IN ('availableGhs', 'reservedGhs', 'inTransitGhs', 'paidOutGhs')`;
-            expect(cols[0].n).toBe(4);
+                  AND "column_name" IN ('availableGhs', 'reservedGhs', 'inTransitGhs', 'paidOutGhs', 'reconciliationHeldGhs')`;
+            expect(cols[0].n).toBe(5);
             const flagCol = await prisma.$queryRaw`
                 SELECT COUNT(*)::int AS n FROM information_schema.columns
                 WHERE "table_name" = 'GlobalSettings' AND "column_name" = 'fiatLiquidityAuthorityEnabled'`;

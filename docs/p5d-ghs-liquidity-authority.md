@@ -92,19 +92,36 @@ economics.
 ### 3.1 `FiatLiquidityReceipt` (inbound GHS evidence)
 
 ```
-RECEIVED ──confirm──▶ AVAILABLE
-RECEIVED ──unmatched──▶ UNMATCHED ──reconcile/match──▶ AVAILABLE | REVERSED
+(matched deposit webhook settle tx) ──verified chain──▶ AVAILABLE
+(no internal deposit)          ──▶ UNMATCHED ──confirmReconciliationMatch──▶ AVAILABLE
+(internal audited USDC liquidation) ──▶ RECEIVED ──confirmTreasuryOpening──▶ AVAILABLE
 AVAILABLE ──reverse──▶ REVERSED            (contradictory evidence / clawback, evidence kept)
 any ──contradiction──▶ RECONCILIATION_REQUIRED
 ```
 
+- `AVAILABLE` is created ONLY by a transition the SERVICE itself verifies
+  against durable evidence — a caller's say-so is never sufficient:
+  - **Matched deposit** (`recordReceipt` with a relatedTransactionId): the
+    service verifies the full durable chain inside the caller transaction —
+    a durable INBOUND `FiatProviderEvent` exists, reports a successful
+    collection, matches the receipt's provider and amount EXACTLY, and is
+    about the deposit's txHash; the `TransactionHistory` row exists, IS a
+    `DEPOSIT_FIAT`, IS `COMPLETED` (authoritative settled state, CAS-claimed
+    in the same tx), and its P5-C quote is consumed, user-consistent and
+    route-consistent. Any gap or contradiction fails closed.
+  - **UNMATCHED → AVAILABLE** (`confirmReconciliationMatch`): the match must
+    name the matched deposit AND the durable provider observation; the
+    service re-verifies the whole chain (event ↔ receipt ↔ deposit) and
+    rejects a second receipt claiming the same deposit. Caller-asserted JSON
+    never unlocks liquidity.
+  - **Treasury opening** (`RECEIVED`, e.g. from `liquidateProfits`): an
+    internal USDC liquidation records a NON-AVAILABLE, audited opening only
+    — it CANNOT become AVAILABLE from the liquidation itself. ONLY
+    `confirmTreasuryOpening` with a durable external GHS funding
+    observation (bank/MoMo transfer reference) unlocks it. NO SYNTHETIC GHS.
 - `RECEIVED`: durable evidence recorded; **not** spendable.
-- `AVAILABLE`: only via (a) a settled, quote-matched deposit webhook observation
-  (Moolre collection success / secret-signed deposit webhook, both of which already
-  CAS-claimed the deposit inside the same tx), or (b) explicit confirmation of an
-  audited treasury opening (`liquidateProfits` / manual evidence entry).
-- `UNMATCHED`: evidence without a matched internal deposit — never available until a
-  human/system reconciliation match.
+- `UNMATCHED`: evidence without a matched internal deposit — never available
+  until a verified reconciliation match.
 - `REVERSED` / `RECONCILIATION_REQUIRED`: terminal-with-evidence; raw provider events
   are always retained.
 
@@ -123,18 +140,65 @@ RESERVED │ IN_TRANSIT ──lost terminal evidence──▶ RECONCILIATION_REQ
 - `PAID_OUT` / `RELEASED`: terminal single-winner claims.
 - `RECONCILIATION_REQUIRED`: no terminal provider result or contradictory evidence.
 
-### 3.3 `FiatProviderEvent` (append-only raw evidence)
+### 3.3 `FiatProviderEvent` (append-only raw evidence, INBOUND and OUTBOUND)
 
 Every provider observation is appended with its raw payload before/with any state
-change. Duplicate economic identities converge; contradictory terminal events are
-retained (never rewritten) and raise `ReconciliationException`.
+change — on BOTH directions:
 
-### 3.4 `FiatLiquidityState` (singleton aggregate)
+- **INBOUND** (collections/deposits): always carries the collected amount; the
+  receipt evidence chain consumes it. Both deposit webhooks record the raw
+  observation BEFORE the settle transaction, and a persistence failure is
+  FAIL-CLOSED: no customer USDC is credited and no liquidity transition happens
+  while the authoritative record of the provider's claim is missing (HTTP 503,
+  deposit stays PENDING, provider retries).
+- **OUTBOUND** (disbursements): dispatch acceptance (all three dispatch sites:
+  manual MTN, manual Moolre, auto-payout worker), provider reference/transaction
+  id, intermediate PENDING, terminal SUCCESS/FAILED, and contradictory
+  callbacks/polls are ALL retained (a nullable amount models providers that
+  report status only). `settleFiatWithdrawal` records the terminal observation
+  durably BEFORE any authoritative settlement transition — persistence failure
+  fails closed; the reconciliation worker records its poll answers and defers
+  settlement when evidence cannot be persisted. `ProviderSettlementAttempt`
+  stays as operational history; the authority's raw observations live here.
 
-`availableGhs`, `reservedGhs`, `inTransitGhs`, `paidOutGhs` — each transition is a
-guarded conditional update in the same transaction as its evidence/state row. The
-aggregate is the claimable authority; sums over receipts/reservations are the
-reconciliation target.
+Duplicate economic identities converge; contradictory terminal events are
+retained (never rewritten) and raise `ReconciliationException`. A failure in
+post-dispatch bookkeeping (evidence/IN_TRANSIT after the provider accepted a
+payout) NEVER auto-refunds the dispatched cash — that would double-spend;
+it is flagged for manual review instead.
+
+### 3.4 `FiatLiquidityState` (singleton aggregate) + the reconciliation hold
+
+`availableGhs`, `reservedGhs`, `inTransitGhs`, `paidOutGhs`,
+`reconciliationHeldGhs` — each transition is a guarded conditional update in the
+same transaction as its evidence/state row. The aggregate is the claimable
+authority; sums over receipts/reservations are the reconciliation target.
+
+`reconciliationHeldGhs` is the quarantine bucket. When contradictory provider
+evidence quarantines a reservation, its disputed amount moves to hold so it is
+counted but NEVER spendable:
+
+- prior `RESERVED` → `reservedGhs −→ reconciliationHeldGhs`
+- prior `IN_TRANSIT` → `inTransitGhs −→ reconciliationHeldGhs`
+- prior `RELEASED` + contradictory SUCCESS → `availableGhs −→ reconciliationHeldGhs`
+  (guarded: if the released funds were already consumed by later payouts, the move
+  is impossible; `CONTRADICTORY_RELEASE_ALREADY_SPENT` flags the potential
+  over-spend loudly instead of hiding it)
+- prior `PAID_OUT` + contradictory FAILED → no move (already non-spendable); the
+  contradiction is quarantined and flagged.
+
+Conservation identity (all buckets, each checked against evidence sums by
+`reconcile()`):
+
+```
+evidence-backed AVAILABLE receipts
+  = available + reserved + inTransit + reconciliationHeld + paidOut
+```
+
+Under the authority, `payoutBatchWorker` reads `availableGhs` for the global
+remaining-liquidity policy — GHS compared with GHS, its USDC-configured threshold
+converted at the authoritative live rate with exact pesewa arithmetic — and NEVER
+treats the withdrawal's existing reservation as needing a second claim.
 
 ## 4. SystemFiatPool after P5-D (compatibility boundary)
 
@@ -151,16 +215,32 @@ reconciliation target.
 
 ## 5. Invariants (each has a real-PG proof)
 
-1. Only evidence creates AVAILABLE liquidity (deposit webhook settlement or audited
-   treasury confirmation). No webhook, quote, client request or scalar increment can.
-2. Reservation is a single-winner conditional decrement; concurrent withdrawals cannot
-   over-reserve; losers fail closed.
-3. Every receipt/reservation/settlement has a durable economic identity; replays
+1. Only VERIFIED evidence creates AVAILABLE liquidity. The service itself verifies
+   the durable chain (provider event ↔ receipt ↔ settled deposit ↔ consumed quote);
+   a forged or mismatched relatedTransactionId, a caller-asserted "reconciliation
+   match", an absent provider event, an amount mismatch, or a wrong transaction
+   type/state all fail closed with no liquidity effect. No webhook, quote, client
+   request or scalar increment can create availability.
+2. NO SYNTHETIC GHS: an internal USDC liquidation (`liquidateProfits`) never creates
+   spendable GHS — it records a NON-AVAILABLE audited treasury opening that requires
+   a durable external GHS funding observation (`confirmTreasuryOpening`) to unlock.
+3. Reservation is a single-winner conditional decrement; concurrent withdrawals cannot
+   over-reserve; losers fail closed. The auto-payout worker never double-reserves a
+   withdrawal already reserved by `processFiatWithdrawal`.
+4. Every receipt/reservation/settlement has a durable economic identity; replays
    converge to the same result; conflicting reuse fails closed.
-4. Contradictory provider evidence is preserved and quarantined, never rewritten.
-5. `availableGhs + reservedGhs + inTransitGhs` movement is atomic with state rows.
-6. GHS amounts are exact `Decimal(20,2)` (pesewas); no float money in the authority.
-7. Reconciliation categories compare the aggregate against evidence sums and write
+5. Contradictory provider evidence is preserved and quarantined, never rewritten —
+   and the disputed amount moves into the reconciliation hold so it is counted but
+   never spendable again (including released-then-contradicted payouts: the returned
+   amount leaves availability and enters hold; a second payout cannot consume it).
+6. Evidence persistence is part of the authority boundary, not best-effort logging:
+   an inbound observation that cannot be durably recorded blocks the deposit
+   settlement (fail closed); an outbound terminal observation that cannot be durably
+   recorded blocks the payout settlement transition.
+7. `availableGhs + reservedGhs + inTransitGhs + reconciliationHeldGhs` movement is
+   atomic with state rows, and reconciliation conservation covers ALL buckets.
+8. GHS amounts are exact `Decimal(20,2)` (pesewas); no float money in the authority.
+9. Reconciliation categories compare the aggregate against evidence sums and write
    `ReconciliationException` rows (existing infra), fail-closed, never auto-repair.
-8. P4 liability/restricted-obligation semantics are untouched; P5-D never posts
+10. P4 liability/restricted-obligation semantics are untouched; P5-D never posts
    customer economics; no quote-only spread/P&L; `pnl:inventory` untouched.

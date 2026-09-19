@@ -29,7 +29,7 @@ const STATEMENTS = [
     "status" TEXT NOT NULL,
     "providerRef" TEXT,
     "dedupKey" TEXT NOT NULL,
-    "amountGhs" DECIMAL(20,2) NOT NULL,
+    "amountGhs" DECIMAL(20,2),
     "relatedReference" TEXT,
     "raw" JSONB,
     "receivedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -46,6 +46,9 @@ const STATEMENTS = [
   `ALTER TABLE "FiatProviderEvent" DROP CONSTRAINT IF EXISTS "FiatProviderEvent_direction_valid";`,
   `ALTER TABLE "FiatProviderEvent" ADD CONSTRAINT "FiatProviderEvent_direction_valid"
      CHECK ("direction" IN ('INBOUND', 'OUTBOUND'));`,
+  `ALTER TABLE "FiatProviderEvent" DROP CONSTRAINT IF EXISTS "FiatProviderEvent_amount_present";`,
+  `ALTER TABLE "FiatProviderEvent" ADD CONSTRAINT "FiatProviderEvent_amount_present"
+     CHECK (("amountGhs" IS NOT NULL AND "amountGhs" > 0) OR "direction" = 'OUTBOUND');`,
 
   `CREATE TABLE IF NOT EXISTS "FiatLiquidityReceipt" (
     "id" TEXT NOT NULL,
@@ -114,16 +117,21 @@ const STATEMENTS = [
     "reservedGhs" DECIMAL(20,2) NOT NULL DEFAULT 0,
     "inTransitGhs" DECIMAL(20,2) NOT NULL DEFAULT 0,
     "paidOutGhs" DECIMAL(20,2) NOT NULL DEFAULT 0,
+    "reconciliationHeldGhs" DECIMAL(20,2) NOT NULL DEFAULT 0,
     "updatedAt" TIMESTAMP(3) NOT NULL,
     CONSTRAINT "FiatLiquidityState_pkey" PRIMARY KEY ("id")
   );`,
   `ALTER TABLE "FiatLiquidityState" DROP CONSTRAINT IF EXISTS "FiatLiquidityState_totals_nonneg";`,
   `ALTER TABLE "FiatLiquidityState" ADD CONSTRAINT "FiatLiquidityState_totals_nonneg"
-     CHECK ("availableGhs" >= 0 AND "reservedGhs" >= 0 AND "inTransitGhs" >= 0 AND "paidOutGhs" >= 0);`,
+     CHECK ("availableGhs" >= 0 AND "reservedGhs" >= 0 AND "inTransitGhs" >= 0 AND "paidOutGhs" >= 0 AND "reconciliationHeldGhs" >= 0);`,
+
+  // Existing deployments (pre-blocker-5 DBs) gain the new bucket column.
+  `ALTER TABLE "FiatLiquidityState"
+     ADD COLUMN IF NOT EXISTS "reconciliationHeldGhs" DECIMAL(20,2) NOT NULL DEFAULT 0;`,
 
   // Singleton zero-state row (deterministic id=1). No financial data.
-  `INSERT INTO "FiatLiquidityState" ("id", "availableGhs", "reservedGhs", "inTransitGhs", "paidOutGhs", "updatedAt")
-     VALUES (1, 0, 0, 0, 0, CURRENT_TIMESTAMP)
+  `INSERT INTO "FiatLiquidityState" ("id", "availableGhs", "reservedGhs", "inTransitGhs", "paidOutGhs", "reconciliationHeldGhs", "updatedAt")
+     VALUES (1, 0, 0, 0, 0, 0, CURRENT_TIMESTAMP)
    ON CONFLICT ("id") DO NOTHING;`,
 ];
 

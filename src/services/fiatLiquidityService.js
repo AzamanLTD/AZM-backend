@@ -16,12 +16,18 @@
 // Core rules (all fail-closed, all real-PG proven in
 // __tests__/p5d-fiat-liquidity-authority.test.js):
 //
-//   1. ONLY evidence creates AVAILABLE liquidity: a settled, quote-matched
-//      deposit observation (the two mounted deposit webhooks, each of which
-//      CAS-claims the deposit inside the same transaction) or an explicit
-//      confirmation of an audited treasury opening. A client request, a
-//      quote, an unverified webhook or a scalar increment can NEVER create
-//      availability.
+//   1. ONLY evidence creates AVAILABLE liquidity — and the service VERIFIES
+//      the evidence chain itself; it never trusts a caller's say-so:
+//        recordReceipt (matched deposit) requires a durable INBOUND
+//        FiatProviderEvent whose provider/status/amount/reference identity
+//        matches the settled TransactionHistory deposit row and its consumed
+//        P5-C quote exactly (docs §3.1).
+//        An UNMATCHED receipt becomes AVAILABLE only through
+//        confirmReconciliationMatch — which verifies the same durable chain.
+//        An audited treasury opening (RECEIVED) becomes AVAILABLE only through
+//        confirmTreasuryOpening — which requires a durable external GHS
+//        funding observation. An internal USDC operation (liquidateProfits)
+//        can NEVER unlock spendable GHS by itself.
 //   2. Reservation is a single-winner conditional decrement
 //      (availableGhs >= amount); losers fail closed with the legacy
 //      FIAT_POOL_INSUFFICIENT contract preserved for API compatibility.
@@ -30,12 +36,15 @@
 //      fails closed with the evidence retained.
 //   4. Contradictory provider evidence is preserved and quarantined
 //      (RECONCILIATION_REQUIRED + ReconciliationException), never rewritten,
-//      never auto-repaired, never auto-released.
+//      never auto-repaired, never auto-released. Quarantined funds move into
+//      the reconciliationHeldGhs bucket: counted, NEVER spendable — including
+//      the released-then-contradicted case, where the previously returned
+//      amount is removed from spendable availability and held.
 //   5. GHS amounts are exact Decimal(20,2) (pesewas). Amounts with sub-pesewa
 //      precision are rejected — the authority never guesses a rounding.
-//   6. SystemFiatPool becomes a derived projection: every authority
-//      transition syncs pool.balance := state.availableGhs inside the same
-//      transaction. No other writer may mutate it.
+//   6. SystemFiatPool is a derived projection: every authority transition
+//      syncs pool.balance := state.availableGhs inside the same transaction.
+//      No other writer may mutate it.
 //
 // P4 boundary: this service records GHS liquidity truth only. It never posts
 // customer liability, never touches restricted obligations, never realizes
@@ -78,6 +87,15 @@ class InvalidEvidenceError extends Error {
     }
 }
 
+// The authority refuses to manufacture GHS availability from a non-GHS event.
+class GhsEvidenceRequiredError extends Error {
+    constructor(message, details = {}) {
+        super(message);
+        this.code = 'FIAT_LIQUIDITY_REQUIRES_GHS_EVIDENCE';
+        this.details = details;
+    }
+}
+
 // ─── exact GHS decimals ─────────────────────────────────────────────────────
 
 // GHS has exactly 2 fractional digits (pesewas). Evidence or amounts carrying
@@ -115,9 +133,14 @@ const isAuthorityEnabled = async (prisma) => {
 // BEFORE the settlement transaction so evidence always survives, even when
 // the financial transition fails closed or rolls back. Replays converge to the
 // committed event row (dedupKey is the observation's economic identity).
+//
+// INBOUND observations MUST carry the collected amount (the receipt evidence
+// chain depends on it). OUTBOUND observations may carry none — a disbursement
+// callback/poll often reports only status and reference; the amount stays
+// whatever the reservation already recorded.
 async function recordProviderEvent(prisma, {
     provider, rail = null, direction, status, providerRef = null, dedupKey,
-    amountGhs, relatedReference = null, raw = null,
+    amountGhs = null, relatedReference = null, raw = null,
 }) {
     if (!['INBOUND', 'OUTBOUND'].includes(direction)) {
         throw new InvalidEvidenceError(`[fiatLiquidity] invalid direction: ${direction}`);
@@ -125,7 +148,14 @@ async function recordProviderEvent(prisma, {
     if (!provider || !status || !dedupKey) {
         throw new InvalidEvidenceError('[fiatLiquidity] provider, status and dedupKey are required evidence');
     }
-    const amount = toExactGhsDecimal(amountGhs);
+    const amount = amountGhs == null
+        ? null
+        : toExactGhsDecimal(amountGhs);
+    if (direction === 'INBOUND' && amount == null) {
+        throw new InvalidEvidenceError(
+            `[fiatLiquidity] INBOUND observation ${dedupKey} must carry the collected amount — inbound evidence without an amount cannot back a receipt`
+        );
+    }
     const existing = await prisma.fiatProviderEvent.findUnique({ where: { dedupKey } });
     if (existing) {
         // Converge: same observation already committed. NEVER rewrite it.
@@ -161,7 +191,7 @@ const ensureStateRow = (tx) =>
     tx.fiatLiquidityState.upsert({
         where: { id: 1 },
         update: {},
-        create: { id: 1, availableGhs: 0, reservedGhs: 0, inTransitGhs: 0, paidOutGhs: 0 },
+        create: { id: 1, availableGhs: 0, reservedGhs: 0, inTransitGhs: 0, paidOutGhs: 0, reconciliationHeldGhs: 0 },
     });
 
 // Guarded conditional decrement: the single-winner reservation claim. The
@@ -186,25 +216,97 @@ const syncPoolProjection = async (tx) => {
     return state;
 };
 
+// ─── evidence-chain verification (docs §3.1) ────────────────────────────────
+
+/**
+ * Verify the FULL durable evidence chain a matched deposit receipt claims:
+ *
+ *   1. the INBOUND FiatProviderEvent exists (caller cannot invent it);
+ *   2. its provider identity matches the receipt's;
+ *   3. its collected amount matches the receipt amount EXACTLY;
+ *   4. the event reports a successful collection;
+ *   5. the event's relatedReference is the internal deposit txHash;
+ *   6. the referenced TransactionHistory row exists (by id);
+ *   7. it IS the fiat deposit the event is about (txHash binding, type);
+ *   8. it is in the AUTHORITATIVE settled state (COMPLETED — the deposit
+ *      webhooks CAS-claim it inside the caller transaction);
+ *   9. its P5-C quote exists, is consumed, belongs to the same user, and its
+ *      selected route is not contradicted.
+ *
+ * Any gap or contradiction fails closed — a caller-asserted
+ * relatedTransactionId is never sufficient to create AVAILABLE GHS.
+ */
+async function verifyDepositEvidenceChain(tx, {
+    eventDedupKey, provider, amount, providerRef, reference, relatedTransactionId, route,
+}) {
+    const fail = (msg) => {
+        throw new InvalidEvidenceError(`[fiatLiquidity] matched-deposit evidence chain rejected: ${msg}`);
+    };
+
+    if (!eventDedupKey) fail('the durable provider observation backing the deposit is required');
+    const event = await tx.fiatProviderEvent.findUnique({ where: { dedupKey: eventDedupKey } });
+    if (!event) fail(`unknown provider observation ${eventDedupKey}`);
+    if (event.direction !== 'INBOUND') fail(`event for ${reference} is ${event.direction}, not INBOUND`);
+    if (event.provider !== provider) fail(`event provider ${event.provider} ≠ receipt provider ${provider}`);
+    if (!event.amountGhs || !event.amountGhs.equals(amount)) {
+        fail(`event amount ${event.amountGhs?.toString()} ≠ receipt amount ${amount.toString()}`);
+    }
+    if (event.status !== 'SUCCESSFUL') fail(`event status ${event.status} is not a successful collection`);
+    if (event.relatedReference !== reference) {
+        fail(`event reference ${event.relatedReference} ≠ deposit reference ${reference}`);
+    }
+    if (providerRef != null && event.providerRef != null && String(providerRef) !== String(event.providerRef)) {
+        fail(`event providerRef ${event.providerRef} ≠ receipt providerRef ${providerRef}`);
+    }
+
+    const deposit = await tx.transactionHistory.findUnique({ where: { id: relatedTransactionId } });
+    if (!deposit) fail(`unknown TransactionHistory ${relatedTransactionId}`);
+    if (deposit.txHash !== reference) fail(`deposit txHash ${deposit.txHash} ≠ evidence reference ${reference}`);
+    if (deposit.type !== 'DEPOSIT_FIAT') fail(`transaction ${reference} is ${deposit.type}, not DEPOSIT_FIAT`);
+    if (deposit.status !== 'COMPLETED') fail(`deposit ${reference} is ${deposit.status}, not the authoritative settled state`);
+
+    const quoteId = deposit.metadata?.quoteId;
+    if (!quoteId) fail(`deposit ${reference} has no transaction quote`);
+    // TransactionQuote is an overlay-managed table with NO Prisma model —
+    // it is addressed through raw SQL everywhere (transactionQuoteService
+    // uses $queryRaw for the same reason). Read the durable P5-C evidence
+    // row through the same boundary.
+    const quoteRows = await tx.$queryRaw`
+        SELECT "id", "userId", "consumedAt", "consumedFor", "selectedRoute"
+        FROM "TransactionQuote" WHERE "id" = ${quoteId}::uuid`;
+    const quote = quoteRows[0];
+    if (!quote) fail(`unknown transaction quote ${quoteId}`);
+    if (quote.consumedAt == null) fail(`quote ${quoteId} is not consumed — deposit ${reference} is not authoritatively settled`);
+    if (String(quote.userId) !== String(deposit.userId)) fail(`quote user ${quote.userId} ≠ deposit user ${deposit.userId}`);
+    if (route != null && quote.selectedRoute != null && quote.selectedRoute !== route) {
+        fail(`quote selectedRoute ${quote.selectedRoute} ≠ receipt route ${route}`);
+    }
+    return { event, deposit, quote };
+}
+
 // ─── inbound: receipts ──────────────────────────────────────────────────────
 
 /**
  * Record an inbound GHS receipt from provider evidence.
  *
- *  - matched (relatedTransactionId set — a deposit that already CAS-claimed
- *    its TransactionHistory PENDING→COMPLETED inside the caller transaction):
- *    lands AVAILABLE immediately and increases claimable liquidity.
+ *  - matched (relatedTransactionId + reference set — a deposit that already
+ *    CAS-claimed its TransactionHistory PENDING→COMPLETED inside the caller
+ *    transaction): the FULL durable evidence chain is verified
+ *    (verifyDepositEvidenceChain) and only then lands AVAILABLE.
  *  - unmatched (no internal deposit): lands UNMATCHED — evidence retained,
- *    NO liquidity effect until an explicit reconciliation match.
- *  - treasury opening (audited internal liquidation): lands RECEIVED; ONLY
- *    confirmReceipt may make it AVAILABLE.
+ *    NO liquidity effect until confirmReconciliationMatch verifies a real
+ *    chain against durable evidence.
+ *  - treasury opening (audited internal record, e.g. liquidateProfits):
+ *    lands RECEIVED; ONLY confirmTreasuryOpening — which requires a durable
+ *    external GHS funding observation — can make it AVAILABLE.
  *
  * Idempotent by dedupKey: a replay returns the committed receipt unchanged.
  * Conflicting reuse (same dedupKey, different amount/provider) fails closed.
  */
 async function recordReceipt(tx, {
     provider, rail = null, providerRef = null, dedupKey, amountGhs,
-    route = null, relatedTransactionId = null, evidence = null, treasury = false,
+    route = null, reference = null, relatedTransactionId = null, evidence = null, treasury = false,
+    eventDedupKey = null,
 }) {
     if (!provider || !dedupKey) {
         throw new InvalidEvidenceError('[fiatLiquidity] provider and dedupKey are required receipt evidence');
@@ -226,9 +328,24 @@ async function recordReceipt(tx, {
         return { receipt: existing, replay: true };
     }
 
-    const status = treasury
-        ? 'RECEIVED'
-        : (relatedTransactionId ? 'AVAILABLE' : 'UNMATCHED');
+    let status;
+    if (treasury) {
+        status = 'RECEIVED';
+    } else if (relatedTransactionId != null) {
+        // Matched deposit: the service verifies the evidence chain itself —
+        // a caller-asserted relatedTransactionId is never sufficient.
+        if (!reference) {
+            throw new InvalidEvidenceError(
+                '[fiatLiquidity] a matched deposit receipt requires the deposit reference (txHash) to bind its evidence chain'
+            );
+        }
+        await verifyDepositEvidenceChain(tx, {
+            eventDedupKey, provider, amount, providerRef, reference, relatedTransactionId, route,
+        });
+        status = 'AVAILABLE';
+    } else {
+        status = 'UNMATCHED';
+    }
 
     const receipt = await tx.fiatLiquidityReceipt.create({
         data: {
@@ -266,31 +383,200 @@ async function recordReceipt(tx, {
 }
 
 /**
- * Explicit RECEIVED/UNMATCHED → AVAILABLE transition (audited treasury
- * confirmation or reconciliation match). Single-winner conditional claim;
- * replays are side-effect free.
+ * UNMATCHED → AVAILABLE via a REAL reconciliation match. This transition
+ * verifies the durable evidence chain — the operator names the deposit and
+ * the durable provider observation, and the authority checks:
+ *
+ *   - the receipt exists and is UNMATCHED;
+ *   - a durable INBOUND FiatProviderEvent exists whose provider, status,
+ *     amount and reference identity match the receipt exactly;
+ *   - the matched TransactionHistory deposit exists, is DEPOSIT_FIAT,
+ *     COMPLETED, and is the transaction the event is about;
+ *   - no OTHER receipt already claims the same deposit (no double count).
+ *
+ * Caller-asserted JSON is never sufficient.
  */
-async function confirmReceiptAvailable(tx, { dedupKey, confirmedBy = null, evidence = null }) {
+async function confirmReconciliationMatch(tx, {
+    dedupKey, matchedTransactionId, confirmedBy = null, providerEventDedupKey = null,
+}) {
+    await ensureStateRow(tx);
+    const receipt = await tx.fiatLiquidityReceipt.findUnique({ where: { dedupKey } });
+    if (!receipt) throw new InvalidEvidenceError(`[fiatLiquidity] unknown receipt identity ${dedupKey}`);
+    if (receipt.status !== 'UNMATCHED') {
+        // An idempotent retry of the SAME confirmation converges instead of
+        // erroring: an operator re-clicking "confirm match" (or a retried
+        // request) must not be told the reconciliation failed.
+        if (receipt.status === 'AVAILABLE'
+            && String(receipt.relatedTransactionId) === String(matchedTransactionId)) {
+            return { receipt, replay: true };
+        }
+        throw new ConflictingEvidenceError(
+            `[fiatLiquidity] receipt ${dedupKey} in state ${receipt.status} cannot be reconciliation-matched (UNMATCHED only)`
+        );
+    }
+    if (!matchedTransactionId) {
+        throw new InvalidEvidenceError('[fiatLiquidity] a reconciliation match requires the matched deposit transaction');
+    }
+    if (!providerEventDedupKey) {
+        throw new InvalidEvidenceError(
+            '[fiatLiquidity] a reconciliation match requires the durable provider observation backing the receipt'
+        );
+    }
+
+    // Durable evidence chain: the raw observation must exist and match the
+    // receipt's economics exactly.
+    const event = await tx.fiatProviderEvent.findUnique({ where: { dedupKey: providerEventDedupKey } });
+    if (!event) {
+        throw new InvalidEvidenceError(`[fiatLiquidity] unknown provider observation ${providerEventDedupKey}`);
+    }
+    if (event.direction !== 'INBOUND') {
+        throw new InvalidEvidenceError(`[fiatLiquidity] observation ${providerEventDedupKey} is ${event.direction}, not INBOUND`);
+    }
+    if (event.provider !== receipt.provider) {
+        throw new InvalidEvidenceError(
+            `[fiatLiquidity] observation provider ${event.provider} ≠ receipt provider ${receipt.provider}`
+        );
+    }
+    if (event.status !== 'SUCCESSFUL') {
+        throw new InvalidEvidenceError(`[fiatLiquidity] observation ${providerEventDedupKey} status ${event.status} is not a successful collection`);
+    }
+    if (!event.amountGhs || !event.amountGhs.equals(receipt.amountGhs)) {
+        throw new InvalidEvidenceError(
+            `[fiatLiquidity] observation amount ${event.amountGhs?.toString()} ≠ receipt amount ${receipt.amountGhs.toString()}`
+        );
+    }
+
+    const deposit = await tx.transactionHistory.findUnique({ where: { id: matchedTransactionId } });
+    if (!deposit) throw new InvalidEvidenceError(`[fiatLiquidity] unknown matched deposit ${matchedTransactionId}`);
+    if (deposit.type !== 'DEPOSIT_FIAT') {
+        throw new InvalidEvidenceError(`[fiatLiquidity] matched transaction ${matchedTransactionId} is ${deposit.type}, not DEPOSIT_FIAT`);
+    }
+    if (deposit.status !== 'COMPLETED') {
+        throw new InvalidEvidenceError(
+            `[fiatLiquidity] matched deposit ${matchedTransactionId} is ${deposit.status}, not the authoritative settled state`
+        );
+    }
+    if (event.relatedReference !== deposit.txHash) {
+        throw new InvalidEvidenceError(
+            `[fiatLiquidity] observation reference ${event.relatedReference} ≠ matched deposit txHash ${deposit.txHash}`
+        );
+    }
+    if (receipt.providerRef != null && event.providerRef != null && String(receipt.providerRef) !== String(event.providerRef)) {
+        throw new InvalidEvidenceError('[fiatLiquidity] observation providerRef contradicts the receipt providerRef');
+    }
+
+    // No double count: the deposit must not already carry an AVAILABLE receipt.
+    const existingClaim = await tx.fiatLiquidityReceipt.findFirst({
+        where: { relatedTransactionId: String(matchedTransactionId), status: 'AVAILABLE' },
+    });
+    if (existingClaim) {
+        throw new ConflictingEvidenceError(
+            `[fiatLiquidity] deposit ${matchedTransactionId} already has an AVAILABLE receipt ${existingClaim.dedupKey}`,
+            { committedDedupKey: existingClaim.dedupKey }
+        );
+    }
+
+    const claim = await tx.fiatLiquidityReceipt.updateMany({
+        where: { id: receipt.id, status: 'UNMATCHED' },
+        data: {
+            status: 'AVAILABLE',
+            confirmedAt: new Date(),
+            relatedTransactionId: String(matchedTransactionId),
+        },
+    });
+    if (claim.count !== 1) throw new ConflictingEvidenceError('[fiatLiquidity] reconciliation match raced');
+
+    const updated = await tx.fiatLiquidityReceipt.update({
+        where: { id: receipt.id },
+        data: {
+            evidence: {
+                ...(receipt.evidence ?? {}),
+                confirmedBy,
+                reconciliationMatch: {
+                    matchedTransactionId: String(matchedTransactionId),
+                    providerEventDedupKey,
+                },
+            },
+        },
+    });
+    await tx.fiatLiquidityState.update({
+        where: { id: 1 },
+        data: { availableGhs: { increment: receipt.amountGhs } },
+    });
+    await syncPoolProjection(tx);
+    return { receipt: updated, replay: false };
+}
+
+/**
+ * RECEIVED (treasury opening) → AVAILABLE — a SEPARATE explicit contract.
+ *
+ * A treasury opening records that an internal, audited operation moved USDC
+ * profit aside and PRICED a GHS opening at the canonical rate. That pricing is
+ * NOT GHS custody evidence: this transition is available only when a REAL
+ * external GHS funding event is attested — a durable FiatProviderEvent for
+ * the funding observation (bank/MoMo transfer reference), which this function
+ * records and binds to the receipt.
+ *
+ * The generic "confirm anything" behavior is deliberately absent: an internal
+ * USDC liquidation can never unlock spendable GHS by itself.
+ */
+async function confirmTreasuryOpening(tx, {
+    dedupKey, confirmedBy = null, fundingReference, fundingChannel,
+}) {
     await ensureStateRow(tx);
     const receipt = await tx.fiatLiquidityReceipt.findUnique({ where: { dedupKey } });
     if (!receipt) throw new InvalidEvidenceError(`[fiatLiquidity] unknown receipt identity ${dedupKey}`);
     if (receipt.status === 'AVAILABLE') return { receipt, replay: true };
-    if (receipt.status !== 'RECEIVED' && receipt.status !== 'UNMATCHED') {
+    if (receipt.status !== 'RECEIVED') {
         throw new ConflictingEvidenceError(
-            `[fiatLiquidity] receipt ${dedupKey} in state ${receipt.status} cannot become AVAILABLE`
+            `[fiatLiquidity] receipt ${dedupKey} in state ${receipt.status} cannot be confirmed (RECEIVED treasury opening only)`
         );
     }
+    if (!fundingReference || typeof fundingReference !== 'string' || fundingReference.trim().length < 3) {
+        throw new InvalidEvidenceError(
+            '[fiatLiquidity] confirming a treasury opening requires an external funding reference (e.g. bank/MoMo transfer id)'
+        );
+    }
+    if (!['BANK', 'MOMO', 'OTHER'].includes(fundingChannel)) {
+        throw new InvalidEvidenceError('[fiatLiquidity] fundingChannel must be BANK, MOMO or OTHER');
+    }
+
+    // The funding observation becomes DURABLE evidence, not caller JSON.
+    const fundingEventDedupKey = `event:treasury-funding:${fundingReference.trim()}`;
+    const { event: fundingEvent } = await recordProviderEvent(tx, {
+        provider: 'AZM_TREASURY',
+        rail: fundingChannel === 'BANK' ? 'BANK' : fundingChannel === 'MOMO' ? 'MOMO' : 'INTERNAL',
+        direction: 'INBOUND',
+        status: 'FUNDED',
+        providerRef: fundingReference.trim(),
+        dedupKey: fundingEventDedupKey,
+        amountGhs: receipt.amountGhs,
+        relatedReference: dedupKey,
+        raw: { fundingChannel, confirmedBy },
+    });
+    if (fundingEvent.amountGhs == null || !fundingEvent.amountGhs.equals(receipt.amountGhs)) {
+        throw new ConflictingEvidenceError(
+            '[fiatLiquidity] funding observation amount contradicts the treasury opening'
+        );
+    }
+
     const claim = await tx.fiatLiquidityReceipt.updateMany({
-        where: { id: receipt.id, status: receipt.status },
+        where: { id: receipt.id, status: 'RECEIVED' },
         data: { status: 'AVAILABLE', confirmedAt: new Date() },
     });
-    if (claim.count !== 1) throw new ConflictingEvidenceError('[fiatLiquidity] receipt confirmation raced');
+    if (claim.count !== 1) throw new ConflictingEvidenceError('[fiatLiquidity] treasury confirmation raced');
     const updated = await tx.fiatLiquidityReceipt.update({
         where: { id: receipt.id },
         data: {
-            evidence: evidence
-                ? { ...(receipt.evidence ?? {}), confirmedBy, confirmation: evidence }
-                : (receipt.evidence ?? {}),
+            evidence: {
+                ...(receipt.evidence ?? {}),
+                confirmedBy,
+                treasuryFunding: {
+                    fundingReference: fundingReference.trim(),
+                    fundingChannel,
+                    providerEventDedupKey: fundingEventDedupKey,
+                },
+            },
         },
     });
     await tx.fiatLiquidityState.update({
@@ -414,7 +700,9 @@ async function markReservationInTransit(tx, { reference, providerRef = null }) {
  * Replays of the same outcome are side-effect free. A CONTRADICTORY outcome
  * (SUCCESS after FAILED or vice versa, or a different provider reference)
  * never rewrites the terminal state: evidence is retained and the reservation
- * is quarantined RECONCILIATION_REQUIRED with a ReconciliationException.
+ * is quarantined RECONCILIATION_REQUIRED with a ReconciliationException, and
+ * the disputed amount moves into the reconciliationHeldGhs bucket — counted,
+ * never spendable again without an explicit resolution.
  */
 async function settleReservation(tx, { reference, outcome, providerTxId = null, reason = null }) {
     if (!['SUCCESSFUL', 'FAILED'].includes(outcome)) {
@@ -447,8 +735,8 @@ async function settleReservation(tx, { reference, outcome, providerTxId = null, 
         // SUCCESS evidence while the reservation was never dispatched: the
         // provider outcome contradicts our recorded lifecycle. Never
         // auto-repair and never throw on the mounted settle path — quarantine
-        // with the evidence retained (ops resolves; funds stay counted in
-        // reservedGhs, so nothing is spendable twice).
+        // with the evidence retained (ops resolves; funds move to the
+        // reconciliation hold, so nothing is spendable twice).
         return quarantineContradictoryOutcome(tx, reservation, { outcome, providerTxId: successRef, reason });
     }
     if (reservation.status === 'IN_TRANSIT' && outcome === 'SUCCESSFUL') {
@@ -504,7 +792,7 @@ async function settleReservation(tx, { reference, outcome, providerTxId = null, 
  * Internal reversal while still RESERVED (provider dispatch never happened —
  * synchronous failure/unavailable gateway). Funds return to available. If the
  * payout already went IN_TRANSIT, the cash position is unprovable from here:
- * the reservation is quarantined, NEVER auto-released.
+ * the reservation is quarantined (funds held, never auto-released).
  */
 async function releaseReservation(tx, { reference, reason = null }) {
     await ensureStateRow(tx);
@@ -536,12 +824,57 @@ async function releaseReservation(tx, { reference, reason = null }) {
 }
 
 // Quarantine: preserve the contradictory evidence, never rewrite terminal
-// state, never auto-repair. Idempotent via the OPEN-exception unique index.
+// state, never auto-repair. The disputed amount moves into the
+// reconciliationHeldGhs bucket so it is counted but NEVER spendable:
+//
+//   prior RESERVED     → reservedGhs      −→ reconciliationHeldGhs
+//   prior IN_TRANSIT   → inTransitGhs     −→ reconciliationHeldGhs
+//   prior RELEASED     → availableGhs     −→ reconciliationHeldGhs (guarded:
+//                          if the released funds were already consumed by
+//                          later payouts, the un-spendable move fails and a
+//                          separate exception flags the over-spend loudly)
+//   prior PAID_OUT     → no move (already non-spendable)
+//
+// Idempotent via the OPEN-exception unique index.
 async function quarantineContradictoryOutcome(tx, reservation, { outcome, providerTxId, reason }) {
-    const updated = await tx.fiatLiquidityReservation.updateMany({
-        where: { id: reservation.id, status: { not: 'RECONCILIATION_REQUIRED' } },
+    const amount = reservation.amountGhs;
+
+    // Single-winner quarantine claim on the row's CURRENT state.
+    const claim = await tx.fiatLiquidityReservation.updateMany({
+        where: { id: reservation.id, status: reservation.status },
         data: { status: 'RECONCILIATION_REQUIRED' },
     });
+
+    let heldMove = 'not_claimed';
+    if (claim.count === 1) {
+        if (reservation.status === 'RESERVED') {
+            await tx.fiatLiquidityState.update({
+                where: { id: 1 },
+                data: { reservedGhs: { decrement: amount }, reconciliationHeldGhs: { increment: amount } },
+            });
+            heldMove = 'reserved_to_held';
+        } else if (reservation.status === 'IN_TRANSIT') {
+            await tx.fiatLiquidityState.update({
+                where: { id: 1 },
+                data: { inTransitGhs: { decrement: amount }, reconciliationHeldGhs: { increment: amount } },
+            });
+            heldMove = 'in_transit_to_held';
+        } else if (reservation.status === 'RELEASED') {
+            // The provider may actually have paid cash that we already handed
+            // back to availability. Remove the disputed amount from spendable
+            // availability — guarded, because a fungible pool may have already
+            // consumed it with later payouts.
+            const move = await tx.fiatLiquidityState.updateMany({
+                where: { id: 1, availableGhs: { gte: amount } },
+                data: { availableGhs: { decrement: amount }, reconciliationHeldGhs: { increment: amount } },
+            });
+            heldMove = move.count === 1 ? 'released_to_held' : 'released_already_spent';
+        }
+        // prior PAID_OUT: funds are already non-spendable in paidOutGhs —
+        // the contradiction is flagged, no fund movement needed.
+        if (reservation.status === 'PAID_OUT') heldMove = 'paid_out_unchanged';
+    }
+
     // Exception infra is the operational queue (evidence, non-authoritative);
     // the reservation state above is the financial truth.
     await recordReconciliationException(tx, {
@@ -554,13 +887,33 @@ async function quarantineContradictoryOutcome(tx, reservation, { outcome, provid
             contradictoryOutcome: outcome,
             contradictoryProviderTxId: providerTxId,
             reason: reason ?? null,
-            amountGhs: reservation.amountGhs.toString(),
+            amountGhs: amount.toString(),
+            heldMove,
         },
     }).catch(() => null);
+
+    if (heldMove === 'released_already_spent') {
+        // Fungibility honesty: the returned funds were consumed by later
+        // payouts before the contradiction arrived. This may be a REAL
+        // over-spend of GHS cash — flag it separately and loudly.
+        await recordReconciliationException(tx, {
+            entityType: 'FIAT_LIQUIDITY_STATE',
+            entityId: reservation.reference,
+            reference: reservation.providerRef,
+            reason: 'CONTRADICTORY_RELEASE_ALREADY_SPENT',
+            details: {
+                reservationReference: reservation.reference,
+                amountGhs: amount.toString(),
+                contradictoryOutcome: outcome,
+            },
+        }).catch(() => null);
+    }
+
     return {
         reservation: await tx.fiatLiquidityReservation.findUnique({ where: { id: reservation.id } }),
         replay: false,
         quarantined: true,
+        heldMove,
     };
 }
 
@@ -603,7 +956,10 @@ const releaseIfRecorded = async (tx, args) => {
  *   AMOUNT_MISMATCH               event vs receipt amounts for a reference
  *   RESERVATION_MISSING_RESULT    RESERVED/IN_TRANSIT older than the horizon
  *   STATE_CONSERVATION_DELTA      aggregate vs receipts/reservations sums
+ *                                 (EVERY bucket: available/reserved/
+ *                                 inTransit/reconciliationHeld/paidOut)
  *   AVAILABLE_UNSUPPORTED        available exceeds matched AVAILABLE evidence
+ *   CONTRADICTORY_RELEASE_ALREADY_SPENT  (written at quarantine time)
  */
 async function reconcile(prisma, { horizonMinutes = 60, dryRun = false } = {}) {
     const horizon = new Date(Date.now() - horizonMinutes * 60_000);
@@ -619,6 +975,23 @@ async function reconcile(prisma, { horizonMinutes = 60, dryRun = false } = {}) {
         prisma.fiatProviderEvent.findMany({ where: { direction: 'INBOUND' } }),
     ]);
 
+    // Durable join for event ↔ receipt pairing: real chains record the event
+    // under an event:… dedupKey and the receipt under a receipt:… dedupKey, so
+    // key equality NEVER pairs them. The durable join is: (a) shared dedupKey
+    // (legacy/manual), (b) provider + providerRef, or (c) event.relatedReference
+    // (the deposit txHash) → the settled TransactionHistory row → the receipt
+    // bound to that deposit.
+    const receiptThIds = [...new Set(receipts.map((r) => r.relatedTransactionId).filter(Boolean))];
+    const depositRows = receiptThIds.length
+        ? await prisma.transactionHistory.findMany({ where: { id: { in: receiptThIds } }, select: { id: true, txHash: true } })
+        : [];
+    const thIdByHash = new Map(depositRows.map((t) => [t.txHash, t.id]));
+    const receiptForEvent = (ev) => receipts.find((r) => r.dedupKey === ev.dedupKey)
+        ?? receipts.find((r) => r.provider === ev.provider && r.providerRef != null && ev.providerRef != null && String(r.providerRef) === String(ev.providerRef))
+        ?? (ev.relatedReference != null
+            ? receipts.find((r) => r.relatedTransactionId === thIdByHash.get(ev.relatedReference))
+            : undefined);
+
     for (const r of receipts) {
         if (['RECEIVED', 'UNMATCHED'].includes(r.status) && r.createdAt < horizon) {
             push('FIAT_LIQUIDITY_RECEIPT', r.dedupKey, r.providerRef, 'RECEIPT_WITHOUT_CONFIRMATION',
@@ -626,11 +999,10 @@ async function reconcile(prisma, { horizonMinutes = 60, dryRun = false } = {}) {
         }
     }
 
-    const receiptKeys = new Set(receipts.map((r) => r.dedupKey));
     for (const ev of inboundEvents) {
-        if (!receiptKeys.has(ev.dedupKey)) {
+        if (!receiptForEvent(ev)) {
             push('FIAT_PROVIDER_EVENT', ev.dedupKey, ev.providerRef, 'EVENT_WITHOUT_RECEIPT',
-                { provider: ev.provider, amountGhs: ev.amountGhs.toString(), status: ev.status });
+                { provider: ev.provider, amountGhs: ev.amountGhs?.toString() ?? null, status: ev.status });
         }
     }
 
@@ -648,8 +1020,8 @@ async function reconcile(prisma, { horizonMinutes = 60, dryRun = false } = {}) {
     }
 
     for (const ev of inboundEvents) {
-        const receipt = receipts.find((r) => r.dedupKey === ev.dedupKey);
-        if (receipt && !receipt.amountGhs.equals(ev.amountGhs)) {
+        const receipt = receiptForEvent(ev);
+        if (receipt && ev.amountGhs != null && !receipt.amountGhs.equals(ev.amountGhs)) {
             push('FIAT_LIQUIDITY_RECEIPT', receipt.dedupKey, receipt.providerRef, 'AMOUNT_MISMATCH',
                 { receiptGhs: receipt.amountGhs.toString(), eventGhs: ev.amountGhs.toString() });
         }
@@ -662,20 +1034,30 @@ async function reconcile(prisma, { horizonMinutes = 60, dryRun = false } = {}) {
         }
     }
 
-    // Conservation: every reservation claim removes its amount from
-    // available; a release returns it. So the evidence-supported figure is
-    //   AVAILABLE receipts − active reservations − paid-out reservations,
-    // with RELEASED contributing net zero (claimed then returned).
+    // Conservation (docs §5): every bucket is derived from durable evidence.
+    //   AVAILABLE receipts − claims (active, paid out, quarantined-held)
+    //     = expected available   (RELEASED contributes net zero)
+    //   sums over reservations per state = expected bucket totals.
     const zero = new Prisma.Decimal(0);
     const sum = (rows) => rows.reduce((acc, r) => acc.plus(r.amountGhs ?? zero), zero);
     const availableEvidence = sum(receipts.filter((r) => r.status === 'AVAILABLE'));
     const activeHeld = sum(reservations.filter((r) => ['RESERVED', 'IN_TRANSIT'].includes(r.status)));
     const paidOutHeld = sum(reservations.filter((r) => r.status === 'PAID_OUT'));
-    const expectedAvailable = availableEvidence.minus(activeHeld).minus(paidOutHeld);
-    const conservationDelta = state.availableGhs.minus(expectedAvailable);
-    if (!conservationDelta.isZero()) {
-        push('FIAT_LIQUIDITY_STATE', '1', null, 'STATE_CONSERVATION_DELTA',
-            { availableGhs: state.availableGhs.toString(), expectedAvailableGhs: expectedAvailable.toString() });
+    const quarantinedHeld = sum(reservations.filter((r) => r.status === 'RECONCILIATION_REQUIRED'));
+
+    const expectedAvailable = availableEvidence.minus(activeHeld).minus(paidOutHeld).minus(quarantinedHeld);
+    const expected = {
+        availableGhs: expectedAvailable,
+        reservedGhs: sum(reservations.filter((r) => r.status === 'RESERVED')),
+        inTransitGhs: sum(reservations.filter((r) => r.status === 'IN_TRANSIT')),
+        paidOutGhs: paidOutHeld,
+        reconciliationHeldGhs: quarantinedHeld,
+    };
+    const mismatches = Object.entries(expected)
+        .filter(([bucket, value]) => !state[bucket].minus(value).isZero())
+        .map(([bucket, value]) => ({ bucket, stateGhs: state[bucket].toString(), evidenceGhs: value.toString() }));
+    if (mismatches.length > 0) {
+        push('FIAT_LIQUIDITY_STATE', '1', null, 'STATE_CONSERVATION_DELTA', { mismatches });
     }
     // AVAILABLE liquidity is supported ONLY by AVAILABLE receipt evidence
     // (releases came from that evidence already — no double counting).
@@ -705,6 +1087,7 @@ async function reconcile(prisma, { horizonMinutes = 60, dryRun = false } = {}) {
             reservedGhs: state.reservedGhs.toString(),
             inTransitGhs: state.inTransitGhs.toString(),
             paidOutGhs: state.paidOutGhs.toString(),
+            reconciliationHeldGhs: state.reconciliationHeldGhs.toString(),
         },
     };
 }
@@ -724,6 +1107,7 @@ async function liquiditySummary(prisma) {
             reservedGhs: state.reservedGhs.toString(),
             inTransitGhs: state.inTransitGhs.toString(),
             paidOutGhs: state.paidOutGhs.toString(),
+            reconciliationHeldGhs: state.reconciliationHeldGhs.toString(),
         },
         receiptsByStatus: receipts.map((g) => ({
             status: g.status, count: g._count, amountGhs: (g._sum.amountGhs ?? new Prisma.Decimal(0)).toString(),
@@ -742,10 +1126,12 @@ module.exports = {
     LiquidityInsufficientError,
     ConflictingEvidenceError,
     InvalidEvidenceError,
+    GhsEvidenceRequiredError,
     isAuthorityEnabled,
     recordProviderEvent,
     recordReceipt,
-    confirmReceiptAvailable,
+    confirmReconciliationMatch,
+    confirmTreasuryOpening,
     reserveForPayout,
     markReservationInTransit,
     settleReservation,

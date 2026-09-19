@@ -3,6 +3,15 @@ const financeService = require('../services/finance.service');
 
 jest.mock('../services/finance.service');
 
+// §P.5-D: the reconciliation worker retains every provider status answer as
+// durable outbound evidence through the liquidity authority — stub the
+// collaborator boundary (its real persistence is covered by the real-PG
+// P.5-D suites).
+jest.mock('../src/services/fiatLiquidityService', () => ({
+    recordProviderEvent: jest.fn().mockResolvedValue({ replay: false }),
+    settleIfRecorded: jest.fn().mockResolvedValue({ skipped: true }),
+}));
+
 describe('WithdrawalReconciliationWorker settlement lifecycle', () => {
   const withdrawal = {
     id: 42,

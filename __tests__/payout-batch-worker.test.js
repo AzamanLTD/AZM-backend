@@ -1,5 +1,15 @@
 const PayoutBatchWorker = require('../workers/payoutBatchWorker');
 
+// §P.5-D: the worker records dispatch evidence through the liquidity
+// authority collaborator before/around every dispatch — stub the boundary.
+jest.mock('../src/services/fiatLiquidityService', () => ({
+    isAuthorityEnabled: jest.fn().mockResolvedValue(false),
+    toExactGhsDecimal: jest.fn((v) => v),
+    recordProviderEvent: jest.fn().mockResolvedValue({ replay: false }),
+    inTransitIfRecorded: jest.fn().mockResolvedValue({ skipped: true }),
+    settleIfRecorded: jest.fn().mockResolvedValue({ skipped: true }),
+}));
+
 describe('PayoutBatchWorker canonical withdrawal transaction', () => {
     const settings = {
         autoPayoutEnabled: true,

@@ -12,6 +12,7 @@
 const logger = require('../src/config/logger');
 const financeService = require('../services/finance.service');
 const { recordProviderSettlementAttempt } = require('../services/providerSettlementAttemptService');
+const fiatLiquidity = require('../src/services/fiatLiquidityService'); // §P.5-D
 const { recordReconciliationException } = require('../services/reconciliationExceptionService');
 
 const RECONCILE_INTERVAL_MS = 30_000;
@@ -203,6 +204,36 @@ class WithdrawalReconciliationWorker {
 
         const remoteStatus = String((statusResp && statusResp.status) || 'PENDING').toUpperCase();
         const providerRef = statusResp?.providerRef || statusResp?.referenceId || statusResp?.transactionId || statusResp?.txId || null;
+
+        // §P.5-D OUTBOUND EVIDENCE: the provider's own status answer is a raw
+        // provider observation — retained durably like every other, including
+        // intermediate PENDING answers, terminal SUCCESS/FAILED answers, and
+        // answers that CONTRADICT an earlier callback (distinct dedupKey per
+        // observation status; replays converge). If the evidence cannot be
+        // persisted, fail closed: no authoritative settlement transition is
+        // made this tick; the exception is recorded and the next poll retries.
+        try {
+            await fiatLiquidity.recordProviderEvent(this.prisma, {
+                provider: statusResp?.provider || 'DISBURSEMENT_POLL',
+                rail: 'MOMO',
+                direction: 'OUTBOUND',
+                status: remoteStatus,
+                providerRef,
+                dedupKey: `event:payout-outbound:${statusResp?.provider || 'DISBURSEMENT_POLL'}:${reference}:${remoteStatus}`,
+                relatedReference: reference,
+                raw: { source: 'provider_status_poll', reason: statusResp?.reason || null },
+            });
+        } catch (evidenceErr) {
+            logger.error({ err: evidenceErr, reference },
+                '[WithdrawalReconciliation] §P.5-D outbound evidence persistence failed — settlement deferred');
+            await this._recordException(
+                withdrawal,
+                'OUTBOUND_EVIDENCE_PERSISTENCE_FAILED',
+                { provider: statusResp?.provider || 'DISBURSEMENT_POLL', observedStatus: remoteStatus, error: evidenceErr.message },
+                reference
+            );
+            return;
+        }
 
         await recordProviderSettlementAttempt(this.prisma, {
             reference,

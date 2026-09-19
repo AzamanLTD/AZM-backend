@@ -570,14 +570,26 @@ const reverseFiatWithdrawal = async (prisma, reference, opts = {}) => {
             data: { balance: { decrement: amountFloat } }
         });
         // §P.5-D: the reversal releases GHS through the SAME regime that
-        // reserved it. An authority reservation releases through the
-        // authority (funds return to available; IN_TRANSIT cash positions
-        // are quarantined, never auto-released). A legacy withdrawal (no
-        // reservation row) keeps the legacy SystemFiatPool re-credit.
-        const liquidityRelease = await fiatLiquidity.releaseIfRecorded(tx, {
-            reference,
-            reason: opts.reason || 'reversal',
-        });
+        // reserved it. A provider-terminal FAILED observation (opts.providerTerminal)
+        // is DURABLE evidence the cash never left custody — the authority
+        // settles the reservation with that evidence (IN_TRANSIT funds
+        // return to available; contradictory terminal observations
+        // quarantine through the same path). An INTERNAL reversal (no
+        // provider evidence) releases conservatively: IN_TRANSIT cash
+        // positions are quarantined, never auto-released. A legacy
+        // withdrawal (no reservation row) keeps the legacy SystemFiatPool
+        // re-credit.
+        const liquidityRelease = opts.providerTerminal
+            ? await fiatLiquidity.settleIfRecorded(tx, {
+                reference,
+                outcome: 'FAILED',
+                providerTxId: opts.providerTxId ?? null,
+                reason: opts.reason || 'provider reported FAILED settlement',
+            })
+            : await fiatLiquidity.releaseIfRecorded(tx, {
+                reference,
+                reason: opts.reason || 'reversal',
+            });
         if (liquidityRelease.skipped) {
             await _ensureFiatPoolSingleton(tx);
             await tx.systemFiatPool.update({
@@ -672,13 +684,15 @@ const liquidateProfits = async (prisma, amountFloat, adminId, auditContext = {})
     let treasuryRateSource = null;
     let treasuryRateAsOf = null;
     if (liquidityAuthorityOn) {
-        // §P.5-D: an internal scalar increment can never create authoritative
-        // GHS liquidity. With the authority ON, a liquidation is an AUDITED
-        // TREASURY OPENING — receipt evidence (AdminProfitLog + AuditLog) priced
-        // at the canonical retail rate at liquidation time — explicitly
-        // confirmed AVAILABLE in the same transaction. No external GHS
-        // observation exists for it, so the opening is recorded as internal
-        // treasury evidence (provider AZM_TREASURY), never as provider cash.
+        // §P.5-D / NO-SYNTHETIC-GHS: liquidateProfits is an INTERNAL USDC
+        // profit-account operation. It is NOT evidence that GHS cash entered
+        // custody — no bank transfer, no MoMo collection happened. With the
+        // authority ON the liquidation is recorded as an AUDITED, NON-AVAILABLE
+        // treasury opening priced at the canonical retail rate (provider
+        // AZM_TREASURY, status RECEIVED). It CANNOT become AVAILABLE GHS from
+        // here: only fiatLiquidity.confirmTreasuryOpening with a durable
+        // external GHS funding observation (bank/MoMo transfer evidence)
+        // can unlock it — a separate, explicitly human-attested step.
         const settings = await prisma.globalSettings.findUnique({ where: { id: 1 } });
         treasuryRate = Number(settings?.liveRetailRate);
         if (!(treasuryRate > 0)) {
@@ -706,12 +720,13 @@ const liquidateProfits = async (prisma, amountFloat, adminId, auditContext = {})
 
         const profitLog = await tx.adminProfitLog.create({ data: { amountUsdc: amountFloat, source: 'ARBITRAGE_SPREAD', relatedTxId: `liquidation_admin_${adminId}_${Date.now()}` } });
         if (liquidityAuthorityOn) {
+            // Audited, NON-AVAILABLE treasury opening only. The internal USDC
+            // move itself creates NO spendable GHS — see the header comment.
             const amountGhs = parseFloat((amountFloat * treasuryRate).toFixed(2));
-            const dedupKey = `treasury:liquidation:${profitLog.relatedTxId}`;
             await fiatLiquidity.recordReceipt(tx, {
                 provider: 'AZM_TREASURY',
                 rail: 'INTERNAL',
-                dedupKey,
+                dedupKey: `treasury:liquidation:${profitLog.relatedTxId}`,
                 amountGhs,
                 treasury: true,
                 evidence: {
@@ -722,12 +737,8 @@ const liquidateProfits = async (prisma, amountFloat, adminId, auditContext = {})
                     retailRate: treasuryRate,
                     rateSource: treasuryRateSource,
                     rateAsOf: treasuryRateAsOf instanceof Date ? treasuryRateAsOf.toISOString() : treasuryRateAsOf,
+                    availability: 'NONE — an external GHS funding event is required before this opening can be confirmed',
                 },
-            });
-            await fiatLiquidity.confirmReceiptAvailable(tx, {
-                dedupKey,
-                confirmedBy: adminId,
-                evidence: { action: 'LIQUIDATE_PROFITS', adminProfitLogId: profitLog.id },
             });
         } else {
             await tx.systemFiatPool.update({
@@ -755,6 +766,21 @@ const liquidateProfits = async (prisma, amountFloat, adminId, auditContext = {})
         ]);
         return { profitLog, updatedProfitFees, updatedFiatPool };
     });
+    if (liquidityAuthorityOn) {
+        // NO-SYNTHETIC-GHS: the response explicitly does NOT report spendable
+        // GHS creation — an internal USDC liquidation created a NON-AVAILABLE
+        // treasury opening only (requires external GHS funding evidence to
+        // become AVAILABLE via the treasury confirmation boundary).
+        return {
+            amountLiquidated: amountFloat,
+            newProfitFees: result.updatedProfitFees.balance,
+            newFiatPool: result.updatedFiatPool.balance,
+            profitLog: result.profitLog,
+            treasuryOpeningRecorded: true,
+            ghsAvailableCreated: '0.00',
+            ghsAvailabilityNote: 'Internal USDC liquidation records a non-available treasury opening only; confirming it requires an external GHS funding event (confirmTreasuryOpening).'
+        };
+    }
     return { amountLiquidated: amountFloat, newProfitFees: result.updatedProfitFees.balance, newFiatPool: result.updatedFiatPool.balance, profitLog: result.profitLog };
 };
 

@@ -11,6 +11,8 @@ const crypto = require('crypto');
 const logger = require('../src/config/logger');
 const { settleFiatWithdrawal } = require('../services/fiatSettlementService');
 const { recordProviderSettlementAttempt } = require('../services/providerSettlementAttemptService');
+const { recordReconciliationException } = require('../services/reconciliationExceptionService');
+const fiatLiquidity = require('../src/services/fiatLiquidityService');
 
 const notificationService = (req) => {
     const existing = req.app.get('notificationService');
@@ -110,6 +112,33 @@ const handleSettlement = (provider, authenticate, normalize) => async (req, res)
         const io = req.app.get('socketio');
         const row = await prisma.transactionHistory.findUnique({ where: { txHash: normalized.reference } });
         if (row) {
+            // §P.5-D OUTBOUND EVIDENCE: the intermediate PENDING observation is
+            // durable too (append-only; replays converge). No ledger mutation
+            // happens on PENDING, so a persistence failure is logged loudly as
+            // an exception row rather than failing an acknowledgement that
+            // mutated nothing.
+            try {
+                await fiatLiquidity.recordProviderEvent(prisma, {
+                    provider,
+                    rail: 'MOMO',
+                    direction: 'OUTBOUND',
+                    status: 'PENDING',
+                    providerRef: normalized.providerTxId,
+                    dedupKey: `event:payout-outbound:${provider}:${normalized.reference}:PENDING`,
+                    relatedReference: normalized.reference,
+                    raw: { source: 'provider_callback' },
+                });
+            } catch (evidenceErr) {
+                logger.error({ err: evidenceErr, reference: normalized.reference, provider },
+                    '[fiatSettlementWebhook] §P.5-D PENDING observation persistence failed');
+                await recordReconciliationException(prisma, {
+                    entityType: 'TRANSACTION',
+                    entityId: normalized.reference,
+                    reference: normalized.providerTxId,
+                    reason: 'OUTBOUND_EVIDENCE_PERSISTENCE_FAILED',
+                    details: { provider, observedStatus: 'PENDING' },
+                }).catch(() => null);
+            }
             await recordProviderSettlementAttempt(prisma, {
                 reference: normalized.reference,
                 provider,

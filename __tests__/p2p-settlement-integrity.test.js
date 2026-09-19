@@ -34,6 +34,16 @@ describeOrSkip('P2P escrow settlement integrity (real PostgreSQL)', () => {
             update: { p2pFeePct: 0.01, tierThreshold: 1000, vendorShareUnder1k: 0.4, vendorShareOver1k: 0.5 },
             create: { id: 1, p2pFeePct: 0.01, tierThreshold: 1000, vendorShareUnder1k: 0.4, vendorShareOver1k: 0.5 },
         });
+        // Hermetic entry: SystemProfitFees is a global singleton whose
+        // balance accumulates across suites — an earlier suite's leftover
+        // fees would make the conservation assertions below (0.4 + 0.6 ==
+        // 100) read a polluted pool. Zero it for THIS suite like the
+        // afterEach truncate does for the next one.
+        await prisma.systemProfitFees.upsert({
+            where:  { id: 1 },
+            update: { balance: 0 },
+            create: { id: 1, balance: 0 },
+        });
     });
 
     afterEach(async () => {

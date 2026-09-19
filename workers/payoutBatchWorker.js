@@ -36,6 +36,7 @@
 // doing so can make reconciliation ambiguous and can double-refund failures.
 // =============================================================================
 
+const { Prisma } = require('@prisma/client');
 const logger = require('../src/config/logger');
 const fiatLiquidity = require('../src/services/fiatLiquidityService'); // §P.5-D
 
@@ -184,11 +185,29 @@ class PayoutBatchWorker {
         const maxAmount = Number(settings.autoPayoutMaxAmountUsdc) || 200;
         const threshold = Number(settings.autoPayoutThresholdUsdc) || 500;
 
-        const fiatPool = await this.prisma.systemFiatPool.findUnique({ where: { id: 1 } });
-        const poolBalance = fiatPool ? Number(fiatPool.balance) : 0;
-
         const globalSettings = await this.prisma.globalSettings.findUnique({ where: { id: 1 } });
         const liveRate = globalSettings ? Number(globalSettings.liveRetailRate) : 12.5;
+
+        // §P.5-D: under the GHS liquidity authority the remaining-liquidity
+        // policy reads FiatLiquidityState.availableGhs (GHS), NEVER the legacy
+        // USDC-denominated SystemFiatPool scalar — the two are different units
+        // and must never be compared directly. The USDC-configured threshold is
+        // converted at the authoritative live rate with exact pesewa Decimal
+        // arithmetic. With the authority OFF the legacy pool/threshold behavior
+        // is byte-identical.
+        const liquidityAuthorityOn = await fiatLiquidity.isAuthorityEnabled(this.prisma);
+        const fiatPool = await this.prisma.systemFiatPool.findUnique({ where: { id: 1 } });
+        const poolBalance = fiatPool ? Number(fiatPool.balance) : 0;
+        let remainingLiquidityGhs = null; // authority regime (GHS); null = legacy regime
+        let thresholdGhs = null;
+        if (liquidityAuthorityOn) {
+            const state = await this.prisma.fiatLiquidityState.findUnique({ where: { id: 1 } });
+            remainingLiquidityGhs = state ? new Prisma.Decimal(state.availableGhs) : new Prisma.Decimal(0);
+            // Exact pesewa conversion of the USDC-configured threshold.
+            thresholdGhs = fiatLiquidity.toExactGhsDecimal(
+                new Prisma.Decimal(threshold).times(liveRate).toFixed(2)
+            );
+        }
 
         const pendingWithdrawals = await this.prisma.withdrawal.findMany({
             where: {
@@ -242,7 +261,26 @@ class PayoutBatchWorker {
                 continue;
             }
 
-            if (runningPoolBalance < threshold || runningPoolBalance < amount) {
+            if (liquidityAuthorityOn) {
+                // Authority regime: the withdrawal was ALREADY reserved by
+                // processFiatWithdrawal (its FiatLiquidityReservation claimed
+                // the exact GHS amount) — this is the global remaining-liquidity
+                // policy gate in GHS, never a second reservation.
+                const withdrawalGhs = fiatLiquidity.toExactGhsDecimal(
+                    new Prisma.Decimal(amount).times(liveRate).toFixed(2)
+                );
+                if (remainingLiquidityGhs.lt(thresholdGhs) || remainingLiquidityGhs.lt(withdrawalGhs)) {
+                    await this._flagForManualReview(withdrawal, 'INSUFFICIENT_AUTHORITATIVE_GHS', {
+                        amount,
+                        amountGhs: withdrawalGhs.toString(),
+                        availableGhs: remainingLiquidityGhs.toString(),
+                        thresholdGhs: thresholdGhs.toString(),
+                        message: `Authoritative GHS liquidity (${remainingLiquidityGhs.toFixed(2)}) below threshold (${thresholdGhs.toFixed(2)}) or insufficient for the payout`
+                    });
+                    results.flaggedManualReview.push({ id: withdrawal.id, reason: 'INSUFFICIENT_AUTHORITATIVE_GHS', amount, availableGhs: remainingLiquidityGhs.toString() });
+                    continue;
+                }
+            } else if (runningPoolBalance < threshold || runningPoolBalance < amount) {
                 await this._flagForManualReview(withdrawal, 'INSUFFICIENT_POOL_LIQUIDITY', {
                     amount,
                     poolBalance: runningPoolBalance,
@@ -304,20 +342,48 @@ class PayoutBatchWorker {
                     payeeNote: `Payout #${withdrawal.id} (${withdrawal.network || 'MTN'})`
                 });
 
-                // §P.5-D: provider accepted the payout — RESERVED → IN_TRANSIT
-                // in the GHS liquidity authority. Regime follows the recorded
-                // reservation; legacy withdrawals skip.
+                // §P.5-D OUTBOUND EVIDENCE + dispatch claim. The provider has
+                // ACCEPTED the payout — cash is already moving. If the durable
+                // evidence or the IN_TRANSIT claim fails here, the money CANNOT
+                // be recalled by silently swallowing the failure, and it also
+                // must NOT be auto-refunded (the provider will still pay it out
+                // — a refund would double-spend). The withdrawal is flagged for
+                // manual review with the failure retained as an exception row;
+                // the reservation stays RESERVED (funds held, not spendable).
                 try {
+                    await fiatLiquidity.recordProviderEvent(this.prisma, {
+                        provider: 'MTN_MOMO',
+                        rail: 'MOMO',
+                        direction: 'OUTBOUND',
+                        status: String(dispatchResult?.status || 'DISPATCH_ACCEPTED'),
+                        providerRef: dispatchResult?.data?.reference || dispatchResult?.providerRef || null,
+                        dedupKey: `event:payout-dispatch:MTN_MOMO:${referenceId}`,
+                        amountGhs,
+                        relatedReference: referenceId,
+                        raw: { externalId: `auto_payout_${withdrawal.id}`, recipientPhone, network: withdrawal.network || 'MTN' },
+                    });
                     await fiatLiquidity.inTransitIfRecorded(this.prisma, {
                         reference: referenceId,
                         providerRef: dispatchResult?.data?.reference || dispatchResult?.providerRef || null,
                     });
-                } catch (liquidityErr) {
-                    logger.error({ err: liquidityErr, referenceId },
-                        '[payoutBatchWorker] §P.5-D liquidity dispatch mark failed');
+                } catch (bookkeepingErr) {
+                    logger.error({ err: bookkeepingErr, referenceId },
+                        '[payoutBatchWorker] §P.5-D post-dispatch bookkeeping failed — flagging for manual review (NO auto-refund after a real dispatch)');
+                    await this._flagForManualReview(withdrawal, 'POST_DISPATCH_BOOKKEEPING_FAILED', {
+                        amount,
+                        referenceId,
+                        error: bookkeepingErr.message
+                    });
+                    results.errors.push({ id: withdrawal.id, reason: 'POST_DISPATCH_BOOKKEEPING_FAILED', referenceId });
+                    continue;
                 }
 
-                runningPoolBalance -= amount;
+                // Track remaining liquidity in the active regime's unit.
+                if (liquidityAuthorityOn) {
+                    remainingLiquidityGhs = remainingLiquidityGhs.minus(amountGhs);
+                } else {
+                    runningPoolBalance -= amount;
+                }
 
                 results.processed.push({
                     id: withdrawal.id,
