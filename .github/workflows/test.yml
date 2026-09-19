@@ -84,6 +84,9 @@ jobs:
       - name: Install fiat liquidity authority overlay
         run: node infra/install-fiat-liquidity-overlay.js
 
+      - name: Install Model B settlement overlay
+        run: node infra/install-model-b-settlement-overlay.js
+
       - name: Generate Prisma client
         run: npx prisma generate
 

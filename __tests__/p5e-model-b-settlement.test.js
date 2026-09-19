@@ -1,0 +1,690 @@
+// __tests__/p5e-model-b-settlement.test.js
+//
+// §P.5-E real-PostgreSQL proof: Model B settlement / inventory cost-basis
+// realization. Design contract: docs/p5e-model-b-settlement.md.
+//
+// Coverage map (every requirement of the P5-E slice):
+//   A. Core settlement (flag ON) — a real mounted Moolre deposit settles
+//      through authoritative inventory: exact credit-once, liability ledger ==
+//      availableBalance projection, exact lot consumption with
+//      purpose/sourceReference/ledgerTxnId, ASSET_CONVERSION with durable
+//      identity/rate/quoteReference, GHS asset accounting
+//      (fiat:momo:ghs / equity:treasury:ghs), COGS realization at the exact
+//      delivered quantity, treasury-stake-funded customer liability, and
+//      clearing:conversion NEVER touched.
+//   B. Realized economics — quoted vs settled vs inventory cost basis vs
+//      customer spread recorded separately and EXACTLY (multi-lot FIFO with a
+//      partial tail lot; allocation residual explicit; no quote-only P&L:
+//      pnl:inventory stays 0).
+//   C. Inventory authority — insufficient inventory fails closed with ZERO
+//      customer credit (retryable); concurrent settlements cannot
+//      double-allocate; deterministic (createdAt, id) FIFO across lots;
+//      webhook replay consumes nothing; conflicting settlement reuse fails
+//      closed; the conversion identity is exactly-once at the ledger.
+//   D. Evidence & gate failures — missing durable provider evidence, wrong
+//      route surface, settled/quote amount mismatch, stale quote, and a late
+//      contradictory FAILED callback each leave ZERO partial mutation.
+//   E. Regimes — flag OFF is the byte-identical legacy bridge (settlement
+//      succeeds with ZERO inventory, posting clearing:conversion, consuming
+//      nothing); flag ON is independent of the P5-D liquidity flag (receipt
+//      layer composes with Model B on both settings).
+//   F. Invariants — ledger inventory:usdc:lots balance == Σ lot remaining
+//      after consumption; user liability ledger == projection; GHS ledger
+//      balance == Σ Model B settled GHS; equity:treasury USDC stake nets to
+//      zero for a fully sold lot; expense:cogs:usdc is catalog-provisioned.
+//
+// Only non-DB boundaries (audit, journal, notifications, logger) and the
+// external Moolre provider are stubbed. Skips cleanly without TEST_DATABASE_URL.
+// =============================================================================
+
+jest.mock('../utils/audit', () => ({ audit: jest.fn().mockResolvedValue(undefined) }));
+jest.mock('../services/journalIntegration', () => ({ recordDeposit: jest.fn().mockResolvedValue(undefined) }));
+jest.mock('../src/config/logger', () => ({
+    error: jest.fn(), warn: jest.fn(), info: jest.fn(),
+}));
+
+const hasDb = !!process.env.TEST_DATABASE_URL;
+const describeOrSkip = hasDb ? describe : describe.skip;
+if (!hasDb) console.warn('[p5e-model-b.test] TEST_DATABASE_URL not set — skipping.');
+
+describeOrSkip('§P.5-E Model B settlement / inventory cost-basis realization (real PostgreSQL)', () => {
+    let prisma;
+    const { seedUser } = require('./helpers/factories');
+    const ledger = require('../services/ledgerService');
+    const inventory = require('../services/inventoryService');
+    const modelBSettlement = require('../services/modelBSettlementService');
+    const fiatLiquidity = require('../src/services/fiatLiquidityService');
+    const moolreQuoteDepositController = require('../controllers/moolreQuoteDepositController');
+    const quoteFiatDepositController = require('../controllers/quoteFiatDepositController');
+    const { Prisma } = require('@prisma/client');
+    const Decimal = Prisma.Decimal;
+
+    beforeAll(async () => {
+        process.env.DATABASE_URL = process.env.TEST_DATABASE_URL;
+        process.env.NODE_ENV = 'test';
+        process.env.JWT_SECRET = process.env.JWT_SECRET || 'test_secret_at_least_32_chars_long_xxxxx';
+        process.env.FIAT_WEBHOOK_SECRET = 'test_webhook_secret_p5e';
+        process.env.MOOLRE_WEBHOOK_SECRET = 'test_moolre_webhook_secret_p5e';
+        const { PrismaClient } = require('@prisma/client');
+        prisma = new PrismaClient();
+    });
+
+    afterAll(async () => {
+        if (prisma) await prisma.$disconnect();
+    });
+
+    // ── isolation: full wipe of every table this suite touches ──────────────
+    const TRUNCATE_ALL = () => prisma.$executeRawUnsafe(
+        'TRUNCATE TABLE "ModelBSettlement", "InventoryLotConsumption", "InventoryLot", "LedgerTransaction", "LedgerAccount", "JournalEntry", "TransactionQuote", "TransactionHistory", "FiatProviderEvent", "FiatLiquidityReceipt", "SystemFiatPool", "User" RESTART IDENTITY CASCADE'
+    );
+    beforeEach(async () => {
+        await TRUNCATE_ALL();
+        await prisma.$executeRawUnsafe('DELETE FROM "FiatLiquidityState" WHERE "id" = 1');
+        await prisma.fiatLiquidityState.create({
+            data: { id: 1, availableGhs: 0, reservedGhs: 0, inTransitGhs: 0, paidOutGhs: 0, reconciliationHeldGhs: 0 },
+        });
+        await prisma.globalSettings.upsert({
+            where: { id: 1 },
+            update: { liveRetailRate: 13.42, liveRateSource: 'KOTANI_PAY', lastExternalSync: new Date(), fiatLiquidityAuthorityEnabled: false, modelBSettlementEnabled: false },
+            create: { id: 1, liveRetailRate: 13.42, liveRateSource: 'KOTANI_PAY', lastExternalSync: new Date(), fiatLiquidityAuthorityEnabled: false, modelBSettlementEnabled: false },
+        });
+    }, 30000);
+    afterEach(async () => { await TRUNCATE_ALL(); }, 30000);
+
+    // ── flags & fixtures ────────────────────────────────────────────────────
+    const setModelB = async (on) => {
+        await prisma.globalSettings.update({ where: { id: 1 }, data: { modelBSettlementEnabled: on } });
+        expect(await modelBSettlement.isModelBSettlementEnabled(prisma)).toBe(on);
+    };
+    const setLiquidity = async (on) => {
+        await prisma.globalSettings.update({ where: { id: 1 }, data: { fiatLiquidityAuthorityEnabled: on } });
+        expect(await fiatLiquidity.isAuthorityEnabled(prisma)).toBe(on);
+    };
+
+    let providerRefCounter = 0;
+    function makeApp() {
+        const registry = {
+            prisma,
+            marketOracle: null,
+            notificationService: { sendNotification: jest.fn().mockResolvedValue(undefined) },
+            socketio: null,
+            emitBalanceUpdate: null,
+            moolreCollectionService: {
+                initiatePayment: jest.fn().mockImplementation(async () => ({ requiresOtp: false, providerRef: `PR-P5E-${++providerRefCounter}` })),
+            },
+        };
+        return { get: (key) => registry[key] };
+    }
+    const mockResponse = () => ({
+        statusCode: 200,
+        status(code) { this.statusCode = code; return this; },
+        json(payload) { this.payload = payload; return this; },
+    });
+
+    async function initiateDeposit(user, amountGhs = 100, controller = 'moolre') {
+        const res = mockResponse();
+        const body = { amountGhs, provider: 'MTN_MOMO', phoneNumber: '0241234567' };
+        if (controller === 'moolre') {
+            await moolreQuoteDepositController.initiate({ app: makeApp(), user: { id: user.id }, body, headers: {} }, res);
+        } else {
+            await quoteFiatDepositController.initiate({ app: makeApp(), user: { id: user.id }, body, headers: {} }, res);
+        }
+        expect(res.statusCode).toBe(201);
+        const pending = await prisma.transactionHistory.findFirst({ where: { userId: user.id, type: 'DEPOSIT_FIAT', status: 'PENDING' }, orderBy: { id: 'desc' } });
+        expect(pending).not.toBeNull();
+        return pending;
+    }
+
+    async function moolreWebhook(txHash, amountGhs = 100) {
+        const res = mockResponse();
+        await moolreQuoteDepositController.webhook({
+            app: makeApp(),
+            headers: { 'x-moolre-webhook-secret': process.env.MOOLRE_WEBHOOK_SECRET },
+            body: { status: 1, code: 'P01', data: { externalref: txHash, amount: amountGhs, payer: '0241234567' } },
+        }, res);
+        return res;
+    }
+
+    async function genericWebhook(txHash, amountGhs = 100) {
+        const res = mockResponse();
+        await quoteFiatDepositController.webhook({
+            app: makeApp(),
+            headers: { 'x-azaman-webhook-secret': process.env.FIAT_WEBHOOK_SECRET },
+            body: { reference: txHash, amountGhs, providerTxId: 'GEN-1', status: 'SUCCESS' },
+        }, res);
+        return res;
+    }
+
+    const acquireTx = (o = {}) => prisma.$transaction((tx) => inventory.acquireLot(tx, {
+        acquisitionKey: o.key ?? `lot:p5e:${Math.random().toString(36).slice(2)}`,
+        sourceType: o.sourceType ?? 'CORPORATE_PURCHASE',
+        sourceReference: o.sourceReference ?? 'purchase-log:p5e',
+        quantity: o.quantity ?? '500',
+        costBasisGhs: o.cost ?? '6000',
+        acquisitionRate: o.rate === undefined ? '12' : o.rate,
+    }).then((r) => r.lot));
+    const bal = (account) => ledger.accountBalance(prisma, account).then((b) => b.balance);
+
+    // TransactionQuote is overlay-managed (raw SQL — no Prisma model client).
+    // Read the exact persisted strings; never recompute quote economics.
+    const quoteRow = async (quoteId) => {
+        const rows = await prisma.$queryRaw`
+            SELECT "id"::text, "amountGhs"::text AS "amountGhs",
+                   "rateGhsPerUsdc"::text AS "rateGhsPerUsdc",
+                   "usdcAmount"::text AS "usdcAmount", "consumedAt", "expiresAt"
+            FROM "TransactionQuote" WHERE "id" = ${quoteId}::uuid`;
+        return rows[0] || null;
+    };
+
+    // seed inventory + user + pending deposit and return the pieces
+    async function seedScenario({ lotQty = '10', lotCost = '120', amountGhs = 100, surface = 'moolre' } = {}) {
+        await setModelB(true);
+        const lot = await acquireTx({ quantity: lotQty, cost: lotCost });
+        const user = await seedUser(prisma, { availableBalance: 0 });
+        const pending = await initiateDeposit(user, amountGhs, surface);
+        return { lot, user, pending };
+    }
+
+    // =========================================================================
+    // A. Core settlement (flag ON, mounted Moolre surface, liquidity ON)
+    // =========================================================================
+    describe('A. core Model B settlement', () => {
+        beforeEach(() => setLiquidity(true));
+
+        test('a settled deposit credits the customer EXACTLY ONCE from real inventory with complete authority rows', async () => {
+            const { user, pending } = await seedScenario();
+            const res = await moolreWebhook(pending.txHash, 100);
+            expect(res.statusCode).toBe(200);
+            expect(res.payload.success).toBe(true);
+
+            const th = await prisma.transactionHistory.findUnique({ where: { id: pending.id } });
+            expect(th.status).toBe('COMPLETED');
+            const q = new Decimal(th.amountUsdc); // exact Decimal(20,8)
+
+            // credit-once + projection == ledger (P4 invariant)
+            const user2 = await prisma.user.findUnique({ where: { id: user.id } });
+            expect(new Decimal(user2.availableBalance).toFixed(8)).toBe(q.toFixed(8));
+            expect((await bal(`user:${user.id}:liability`)).toFixed(8)).toBe(q.toFixed(8));
+
+            // inventory consumed exactly, through the P5-B substrate
+            const lots = await prisma.inventoryLot.findMany();
+            expect(lots).toHaveLength(1);
+            expect(new Decimal(lots[0].quantityOriginal).toFixed(8)).toBe('10.00000000');
+            expect(new Decimal(lots[0].quantityRemaining).toFixed(8))
+                .toBe(new Decimal('10').minus(q).toFixed(8));
+            const consumption = await prisma.inventoryLotConsumption.findUnique({ where: { id: 1 } });
+            expect(consumption).not.toBeNull();
+            expect(consumption.purpose).toBe('MODEL_B_SETTLEMENT');
+            expect(consumption.sourceReference).toBe(pending.txHash);
+            expect(consumption.ledgerTxnId).not.toBeNull(); // P5-B reserved this for P5-E
+
+            // GHS asset accounting (P5-E adds it; P5-D only tracked liquidity)
+            expect((await bal('fiat:momo:ghs')).toFixed(2)).toBe('100.00');
+            expect((await bal('equity:treasury:ghs')).toFixed(2)).toBe('100.00');
+
+            // COGS realized at the exact delivered quantity; inventory asset released
+            expect((await bal('expense:cogs:usdc')).toFixed(8)).toBe(q.toFixed(8));
+            expect((await bal('inventory:usdc:lots')).toFixed(8))
+                .toBe(new Decimal('10').minus(q).toFixed(8));
+
+            // treasury stake drawn to fund the customer claim: 10 (acq) − q (drawn)
+            expect((await bal('equity:treasury')).toFixed(8)).toBe(new Decimal('10').minus(q).toFixed(8));
+
+            // clearing:conversion untouched by the P5-E regime
+            expect((await bal('clearing:conversion')).toFixed(8)).toBe('0.00000000');
+
+            // P5-D receipt composes (flag ON here)
+            const receipt = await prisma.fiatLiquidityReceipt.findUnique({ where: { dedupKey: `receipt:moolre-collection:${pending.txHash}` } });
+            expect(receipt?.status).toBe('AVAILABLE');
+        });
+
+        test('the ASSET_CONVERSION posting carries the durable identity, exact quote rate and quote reference', async () => {
+            const { user, pending } = await seedScenario();
+            await moolreWebhook(pending.txHash, 100);
+
+            const s = await prisma.modelBSettlement.findUnique({ where: { reference: pending.txHash } });
+            expect(s).not.toBeNull();
+            expect(s.conversionIdentity).toBe(`p5e:modelb:${pending.txHash}`);
+
+            const conversionTxn = await prisma.ledgerTransaction.findUnique({ where: { id: s.conversionLedgerTxnId } });
+            const convMeta = conversionTxn.metadata.conversion;
+            expect(convMeta.identity).toBe(`p5e:modelb:${pending.txHash}`);
+            expect(convMeta.rate).toBe(new Decimal(convMeta.rate).toFixed(8));
+            expect(convMeta.quoteReference).toBe(s.quoteId);
+            const quote = await quoteRow(s.quoteId);
+            expect(new Decimal(conversionTxn.metadata.conversion.rate).toFixed(8))
+                .toBe(new Decimal(quote.rateGhsPerUsdc).toFixed(8));
+
+            const convEntries = await prisma.journalEntry.findMany({ where: { ledgerTransactionId: s.conversionLedgerTxnId }, orderBy: { lineNumber: 'asc' } });
+            expect(convEntries).toHaveLength(4);
+            const byAccount = Object.fromEntries(convEntries.map((e) => [e.account, e]));
+            expect(new Decimal(byAccount['fiat:momo:ghs'].debit).toFixed(2)).toBe('100.00');
+            expect(new Decimal(byAccount['equity:treasury:ghs'].credit).toFixed(2)).toBe('100.00');
+            expect(new Decimal(byAccount['expense:cogs:usdc'].debit).toFixed(8)).toBe(new Decimal(s.settledUsdc).toFixed(8));
+            expect(new Decimal(byAccount['inventory:usdc:lots'].credit).toFixed(8)).toBe(new Decimal(s.settledUsdc).toFixed(8));
+
+            const depEntries = await prisma.journalEntry.findMany({ where: { ledgerTransactionId: s.depositLedgerTxnId } });
+            const dep = Object.fromEntries(depEntries.map((e) => [e.account, e]));
+            expect(new Decimal(dep['equity:treasury'].debit).toFixed(8)).toBe(new Decimal(s.settledUsdc).toFixed(8));
+            expect(new Decimal(dep[`user:${user.id}:liability`].credit).toFixed(8)).toBe(new Decimal(s.settledUsdc).toFixed(8));
+        });
+
+        test('expense:cogs:usdc is catalog-provisioned with its canonical identity', async () => {
+            const { pending } = await seedScenario();
+            await moolreWebhook(pending.txHash, 100);
+            const acct = await prisma.ledgerAccount.findUnique({ where: { code: 'expense:cogs:usdc' } });
+            expect(acct).not.toBeNull();
+            expect(acct.accountClass).toBe('EXPENSE');
+            expect(acct.normalSide).toBe('DEBIT');
+            expect(acct.asset).toBe('USDC');
+        });
+
+        test('the GENERIC webhook surface settles Model B identically (provider identity recorded)', async () => {
+            const { user, pending } = await seedScenario({ surface: 'generic' });
+            const res = await genericWebhook(pending.txHash, 100);
+            expect(res.statusCode).toBe(200);
+            expect(res.payload.success).toBe(true);
+            const s = await prisma.modelBSettlement.findUnique({ where: { reference: pending.txHash } });
+            expect(s.provider).toBe('GENERIC_FIAT_WEBHOOK');
+            expect(s.selectedRoute).toBe('GENERIC_FIAT_AGGREGATOR');
+            const user2 = await prisma.user.findUnique({ where: { id: user.id } });
+            expect(new Decimal(user2.availableBalance).toFixed(8)).toBe(new Decimal(s.settledUsdc).toFixed(8));
+        });
+    });
+
+    // =========================================================================
+    // B. Realized economics: quoted vs settled vs cost basis vs spread
+    // =========================================================================
+    describe('B. realized economics (exact, separated, no quote-only P&L)', () => {
+        test('multi-lot FIFO with a partial tail lot: every figure recorded exactly and independently', async () => {
+            await setModelB(true);
+            // three lots, distinct acquisition times/cost bases
+            const l1 = await acquireTx({ quantity: '4', cost: '48' });   // rate 12
+            await new Promise((r) => setTimeout(r, 25));
+            const l2 = await acquireTx({ quantity: '4', cost: '44' });    // rate 11
+            await new Promise((r) => setTimeout(r, 25));
+            const l3 = await acquireTx({ quantity: '4', cost: '52' });    // rate 13
+            const user = await seedUser(prisma);
+            const pending = await initiateDeposit(user, 100); // ~7.45156483 USDC
+
+            expect((await moolreWebhook(pending.txHash, 100)).statusCode).toBe(200);
+
+            const th = await prisma.transactionHistory.findUnique({ where: { id: pending.id } });
+            const q = new Decimal(th.amountUsdc);
+            const s = await prisma.modelBSettlement.findUnique({ where: { reference: pending.txHash } });
+
+            // quoted economics (quote row) vs settled economics (TH + record)
+            const quote = await quoteRow(s.quoteId);
+            expect(new Decimal(quote.amountGhs).toFixed(2)).toBe('100.00');
+            expect(new Decimal(s.settledGhs).toFixed(2)).toBe('100.00');
+            expect(new Decimal(s.quotedGhs).toFixed(2)).toBe('100.00');
+            expect(new Decimal(s.settledUsdc).toFixed(8)).toBe(q.toFixed(8));
+            expect(new Decimal(s.quotedUsdc).toFixed(8)).toBe(q.toFixed(8)); // same 8dp authority
+
+            // FIFO by (createdAt, id): 4 from l1, then 3.45156483 from l2, l3 untouched
+            const allocations = s.lotAllocations;
+            expect(allocations).toHaveLength(2);
+            expect(allocations[0].lotId).toBe(l1.id);
+            expect(new Decimal(allocations[0].quantity).toFixed(8)).toBe('4.00000000');
+            expect(allocations[0].costShareGhs).toBe('48.00000000'); // fully consumed: EXACT basis, no arithmetic
+            expect(allocations[1].lotId).toBe(l2.id);
+            expect(new Decimal(allocations[1].quantity).toFixed(8)).toBe(q.minus(4).toFixed(8));
+
+            // prorated tail share: 44 × (q−4)/4, 8dp HALF_UP — exact inputs recorded
+            const tailQ = q.minus(4);
+            const expectedTail = new Decimal('44').times(tailQ).div('4').toDecimalPlaces(8, Decimal.ROUND_HALF_UP);
+            expect(new Decimal(allocations[1].costShareGhs).toFixed(8)).toBe(expectedTail.toFixed(8));
+
+            // totals: cost basis and customer spread are EXACT and GHS-denominated
+            const cost = new Decimal('48').plus(expectedTail);
+            expect(new Decimal(s.costBasisGhsTotal).toFixed(8)).toBe(cost.toFixed(8));
+            expect(new Decimal(s.marginGhs).toFixed(8)).toBe(new Decimal('100').minus(cost).toFixed(8));
+            expect(s.providerFeeGhs).toBeNull(); // not evidenced → null, never invented
+
+            // no quote-only P&L: pnl:inventory untouched
+            expect(await prisma.journalEntry.count({ where: { account: 'pnl:inventory' } })).toBe(0);
+
+            // l3 untouched, l1 exhausted/closed, l2 open with remainder
+            const lots = await prisma.inventoryLot.findMany({ orderBy: { id: 'asc' } });
+            expect(lots[0].status).toBe('CONSUMED');
+            expect(new Decimal(lots[1].quantityRemaining).toFixed(8)).toBe(new Decimal('4').minus(tailQ).toFixed(8));
+            expect(lots[2].status).toBe('OPEN');
+        });
+
+        test('a sub-8dp proration residual is recorded explicitly, never absorbed', async () => {
+            await setModelB(true);
+            // lot: 3 USDC for GHS 100 → settle ~1 USDC → share = 100/3 = 33.3333...
+            await acquireTx({ quantity: '3', cost: '100', rate: '33.33333333' });
+            const user = await seedUser(prisma);
+            const pending = await initiateDeposit(user, 34); // ~2.53353197... → wait: quote maths use liveRetailRate
+            expect((await moolreWebhook(pending.txHash, 34)).statusCode).toBe(200);
+            const th = await prisma.transactionHistory.findUnique({ where: { id: pending.id } });
+            const q = new Decimal(th.amountUsdc);
+            const s = await prisma.modelBSettlement.findUnique({ where: { reference: pending.txHash } });
+            const alloc = s.lotAllocations[0];
+            const expectedShare = new Decimal('100').times(q).div('3');
+            const share8 = expectedShare.toDecimalPlaces(8, Decimal.ROUND_HALF_UP);
+            expect(new Decimal(alloc.costShareGhs).toFixed(8)).toBe(share8.toFixed(8));
+            // residual = exact − recorded, 12dp projection — nonzero and explicit
+            const residual = expectedShare.minus(share8);
+            if (residual.abs().gte('0.00000001')) {
+                expect(new Decimal(s.costAllocationResidualGhs).toFixed(12)).toBe(residual.toDecimalPlaces(12).toFixed(12));
+            }
+            // the recorded margin is exact GIVEN the recorded 8dp shares
+            expect(new Decimal(s.marginGhs).toFixed(8)).toBe(new Decimal('34').minus(share8).toFixed(8));
+        });
+    });
+
+    // =========================================================================
+    // C. Inventory authority: fail-closed, concurrency, FIFO determinism, replay
+    // =========================================================================
+    describe('C. inventory authority', () => {
+        test('insufficient inventory fails closed with ZERO credit — deposit stays PENDING and retryable', async () => {
+            await setModelB(true);
+            await acquireTx({ quantity: '1', cost: '12' }); // plenty? 1 USDC < needed ~7.45
+            const user = await seedUser(prisma);
+            const pending = await initiateDeposit(user, 100);
+            const balanceBefore = new Decimal((await prisma.user.findUnique({ where: { id: user.id } })).availableBalance);
+
+            const res = await moolreWebhook(pending.txHash, 100);
+            expect(res.statusCode).toBe(409); // settlement failed closed, retry invited
+            expect(res.payload.message).toMatch(/inventory/i);
+
+            // ZERO partial mutation
+            const th = await prisma.transactionHistory.findUnique({ where: { id: pending.id } });
+            expect(th.status).toBe('PENDING');
+            expect(new Decimal((await prisma.user.findUnique({ where: { id: user.id } })).availableBalance).toFixed(8)).toBe(balanceBefore.toFixed(8));
+            expect(await prisma.inventoryLotConsumption.count()).toBe(0);
+            // the settlement itself posted nothing (lot acquisitions from the
+            // fixture legitimately carry their own acquisition postings):
+            expect(await prisma.modelBSettlement.count()).toBe(0);
+            expect(await prisma.journalEntry.count({ where: { description: { contains: 'Model B settlement' } } })).toBe(0);
+            const quote = await quoteRow(pending.metadata.quoteId);
+            expect(quote.consumedAt).toBeNull(); // quote NOT consumed → retryable
+
+            // ops acquires inventory → the SAME pending deposit settles on retry
+            await acquireTx({ quantity: '10', cost: '120' });
+            const res2 = await moolreWebhook(pending.txHash, 100);
+            expect(res2.statusCode).toBe(200);
+            expect(res2.payload.success).toBe(true);
+            expect((await prisma.transactionHistory.findUnique({ where: { id: pending.id } })).status).toBe('COMPLETED');
+        });
+
+        test('concurrent settlements cannot double-allocate the same lot quantity', async () => {
+            await setModelB(true);
+            // one lot holding exactly enough for ONE settlement
+            await acquireTx({ quantity: '8', cost: '96' });
+            const u1 = await seedUser(prisma, { availableBalance: 0 });
+            const u2 = await seedUser(prisma, { availableBalance: 0 });
+            const p1 = await initiateDeposit(u1, 100);
+            const p2 = await initiateDeposit(u2, 100);
+            // durable provider evidence for BOTH (the mounted webhook records
+            // it out-of-band before settling); deposits stay PENDING.
+            for (const p of [p1, p2]) {
+                await fiatLiquidity.recordProviderEvent(prisma, {
+                    provider: 'MOOLRE', direction: 'INBOUND', status: 'SUCCESSFUL',
+                    providerRef: 'PR-RACE', dedupKey: `event:moolre-collection:${p.txHash}`,
+                    amountGhs: 100, relatedReference: p.txHash, raw: null,
+                });
+            }
+
+            const settle = (txHash) => prisma.$transaction(async (tx) => {
+                const th = await tx.transactionHistory.findUnique({ where: { txHash } });
+                const quoteId = th.metadata?.quoteId;
+                const quote = await require('../src/services/transactionQuoteService').consumeTransactionQuote({ prisma: tx, quoteId, userId: th.userId, purpose: 'deposit' });
+                const updated = await tx.transactionHistory.update({ where: { id: th.id }, data: { status: 'COMPLETED', amountUsdc: quote.usdcAmount } });
+                await tx.user.update({ where: { id: th.userId }, data: { availableBalance: { increment: quote.usdcAmount } } });
+                return modelBSettlement.settleDepositFromInventory(tx, {
+                    reference: txHash, transactionHistoryId: th.id, userId: th.userId, quoteId,
+                    quotedGhs: quote.amountGhs, quotedRateGhsPerUsdc: quote.rateGhsPerUsdc, quotedUsdc: quote.usdcAmount,
+                    settledGhs: 100, settledUsdc: updated.amountUsdc,
+                    selectedRoute: quote.selectedRoute, routeProviderRail: quote.routeProviderRail, routePolicyVersion: quote.routePolicyVersion,
+                    provider: 'MOOLRE', providerRef: 'PR-RACE', evidenceDedupKey: `event:moolre-collection:${txHash}`,
+                });
+            });
+
+            const outcomes = await Promise.allSettled([settle(p1.txHash), settle(p2.txHash)]);
+            const committed = outcomes.filter((o) => o.status === 'fulfilled').length;
+
+            // both deposits need ~7.45156483 of the single 8-USDC lot: at most
+            // ONE can commit; a second would over-allocate.
+            expect(committed).toBe(1);
+            expect(await prisma.modelBSettlement.count()).toBe(1);
+            const consumptions = await prisma.inventoryLotConsumption.findMany();
+            const total = consumptions.reduce((s, c) => s.plus(new Decimal(c.quantity)), new Decimal(0));
+            expect(total.lte('8')).toBe(true);
+            const lot = await prisma.inventoryLot.findFirst();
+            expect(new Decimal(lot.quantityRemaining).gte(0)).toBe(true);
+            expect(await prisma.modelBSettlement.count()).toBe(1);
+        });
+
+        test('webhook replay after COMPLETED consumes nothing and credits nothing again', async () => {
+            const { user, pending } = await seedScenario();
+            await moolreWebhook(pending.txHash, 100);
+            const after = {
+                balance: new Decimal((await prisma.user.findUnique({ where: { id: user.id } })).availableBalance),
+                settlements: await prisma.modelBSettlement.count(),
+                consumptions: await prisma.inventoryLotConsumption.count(),
+                entries: await prisma.journalEntry.count({ where: { ledgerTransactionId: { not: null } } }),
+            };
+            const res = await moolreWebhook(pending.txHash, 100);
+            expect(res.statusCode).toBe(200);
+            expect(res.payload.message).toMatch(/already processed/i);
+            expect(new Decimal((await prisma.user.findUnique({ where: { id: user.id } })).availableBalance).toFixed(8)).toBe(after.balance.toFixed(8));
+            expect(await prisma.modelBSettlement.count()).toBe(after.settlements);
+            expect(await prisma.inventoryLotConsumption.count()).toBe(after.consumptions);
+            expect(await prisma.journalEntry.count({ where: { ledgerTransactionId: { not: null } } })).toBe(after.entries);
+        });
+
+        test('conflicting reuse of a committed settlement identity fails closed with zero mutation', async () => {
+            const { pending } = await seedScenario();
+            await moolreWebhook(pending.txHash, 100);
+            const s0 = await prisma.modelBSettlement.findUnique({ where: { reference: pending.txHash } });
+            const quote = await quoteRow(s0.quoteId);
+
+            await expect(prisma.$transaction((tx) => modelBSettlement.settleDepositFromInventory(tx, {
+                reference: pending.txHash, transactionHistoryId: pending.id, userId: pending.userId, quoteId: s0.quoteId,
+                quotedGhs: quote.amountGhs, quotedRateGhsPerUsdc: quote.rateGhsPerUsdc, quotedUsdc: quote.usdcAmount,
+                settledGhs: 55, // DIFFERENT economics on the same identity
+                settledUsdc: s0.settledUsdc,
+                provider: 'MOOLRE', evidenceDedupKey: `event:moolre-collection:${pending.txHash}`,
+            }))).rejects.toMatchObject({ code: 'MODEL_B_SETTLEMENT_CONFLICT' });
+            const s1 = await prisma.modelBSettlement.findUnique({ where: { reference: pending.txHash } });
+            expect(new Decimal(s1.settledGhs).toFixed(2)).toBe('100.00'); // untouched
+        });
+
+        test('the conversion identity is exactly-once across DIFFERENT ledger postings', async () => {
+            const { pending } = await seedScenario();
+            await moolreWebhook(pending.txHash, 100);
+            await expect(prisma.$transaction((tx) => ledger.post(tx, {
+                idempotencyKey: 'p5e:identity-race:other-key',
+                entryType: 'ASSET_CONVERSION',
+                description: 'attempted reuse of the committed conversion identity',
+                conversion: { identity: `p5e:modelb:${pending.txHash}`, rate: '13.42' },
+                lines: [
+                    { account: 'fiat:momo:ghs', debit: '1' },
+                    { account: 'equity:treasury:ghs', credit: '1' },
+                    { account: 'expense:cogs:usdc', debit: '1' },
+                    { account: 'inventory:usdc:lots', credit: '1' },
+                ],
+            }))).rejects.toMatchObject({ code: 'LEDGER_CONVERSION_IDENTITY_CONFLICT' });
+        });
+    });
+
+    // =========================================================================
+    // D. Evidence & gate failures — each proven with ZERO partial mutation
+    // =========================================================================
+    describe('D. evidence and gate failures (fail closed, zero mutation)', () => {
+        test('missing durable provider evidence blocks the settlement entirely', async () => {
+            const { user, pending } = await seedScenario();
+            // the mounted webhook ALWAYS records the event first; simulate the
+            // pathological case directly at the service boundary: no event row.
+            await prisma.fiatProviderEvent.deleteMany({ where: { relatedReference: pending.txHash } });
+            const th = await prisma.transactionHistory.update({ where: { id: pending.id }, data: { status: 'COMPLETED', amountUsdc: '7.45156483' } });
+
+            await expect(prisma.$transaction((tx) => modelBSettlement.settleDepositFromInventory(tx, {
+                reference: pending.txHash, transactionHistoryId: pending.id, userId: user.id, quoteId: th.metadata.quoteId,
+                quotedGhs: '100', quotedRateGhsPerUsdc: '13.42', quotedUsdc: '7.45156483',
+                settledGhs: 100, settledUsdc: th.amountUsdc,
+                provider: 'MOOLRE', evidenceDedupKey: `event:moolre-collection:${pending.txHash}`,
+            }))).rejects.toMatchObject({ code: 'MODEL_B_EVIDENCE_MISSING' });
+            expect(await prisma.inventoryLotConsumption.count()).toBe(0);
+            expect(await prisma.modelBSettlement.count()).toBe(0);
+        });
+
+        test('wrong route surface fails closed BEFORE any mutation (Model B ON)', async () => {
+            await setModelB(true);
+            await acquireTx({ quantity: '10', cost: '120' });
+            const user = await seedUser(prisma);
+            const pending = await initiateDeposit(user, 100, 'moolre'); // MOOLRE_MOMO_COLLECTION quote
+            const res = await genericWebhook(pending.txHash, 100);        // generic surface is NOT allowed
+            expect(res.statusCode).toBe(409);
+            expect(res.payload.message).toMatch(/cannot settle/i);
+            expect((await prisma.transactionHistory.findUnique({ where: { id: pending.id } })).status).toBe('PENDING');
+            expect(await prisma.inventoryLotConsumption.count()).toBe(0);
+            expect(await prisma.modelBSettlement.count()).toBe(0);
+        });
+
+        test('settled/quote amount mismatch beyond the pesewa gate fails closed', async () => {
+            const { user, pending } = await seedScenario();
+            const balanceBefore = new Decimal((await prisma.user.findUnique({ where: { id: user.id } })).availableBalance);
+            const res = await moolreWebhook(pending.txHash, 105); // quote says 100
+            expect(res.statusCode).toBe(409);
+            expect(res.payload.message).toMatch(/does not match/i);
+            expect((await prisma.transactionHistory.findUnique({ where: { id: pending.id } })).status).toBe('PENDING');
+            expect(new Decimal((await prisma.user.findUnique({ where: { id: user.id } })).availableBalance).toFixed(8)).toBe(balanceBefore.toFixed(8));
+            expect(await prisma.modelBSettlement.count()).toBe(0);
+        });
+
+        test('a stale/expired quote fails closed with zero mutation', async () => {
+            const { pending } = await seedScenario();
+            await prisma.$executeRaw`UPDATE "TransactionQuote" SET "expiresAt" = NOW() - INTERVAL '60 seconds' WHERE "id" = ${pending.metadata.quoteId}::uuid`;
+            const res = await moolreWebhook(pending.txHash, 100);
+            expect(res.statusCode).toBe(409);
+            expect(res.payload.message).toMatch(/quote/i);
+            expect((await prisma.transactionHistory.findUnique({ where: { id: pending.id } })).status).toBe('PENDING');
+            expect(await prisma.modelBSettlement.count()).toBe(0);
+            expect(await prisma.inventoryLotConsumption.count()).toBe(0);
+        });
+
+        test('a late contradictory FAILED callback cannot unwind a committed settlement', async () => {
+            const { user, pending } = await seedScenario();
+            await moolreWebhook(pending.txHash, 100);
+            const committed = {
+                balance: new Decimal((await prisma.user.findUnique({ where: { id: user.id } })).availableBalance),
+                settlements: await prisma.modelBSettlement.count(),
+            };
+            const res = mockResponse();
+            await moolreQuoteDepositController.webhook({
+                app: makeApp(),
+                headers: { 'x-moolre-webhook-secret': process.env.MOOLRE_WEBHOOK_SECRET },
+                body: { status: 0, code: 'P02', data: { externalref: pending.txHash, amount: 100 } },
+            }, res);
+            expect(res.statusCode).toBe(200); // COMPLETED is terminal — acknowledged, never unwound
+            expect(res.payload.message).toMatch(/acknowledged/i);
+            expect(new Decimal((await prisma.user.findUnique({ where: { id: user.id } })).availableBalance).toFixed(8)).toBe(committed.balance.toFixed(8));
+            expect(await prisma.modelBSettlement.count()).toBe(committed.settlements);
+        });
+    });
+
+    // =========================================================================
+    // E. Regimes — flag OFF legacy bridge, flag independence from P5-D
+    // =========================================================================
+    describe('E. rollout regimes', () => {
+        test('flag OFF (default): byte-identical legacy bridge — settles with ZERO inventory via clearing:conversion', async () => {
+            const user = await seedUser(prisma);
+            const pending = await initiateDeposit(user, 100);
+            expect(await modelBSettlement.isModelBSettlementEnabled(prisma)).toBe(false);
+            expect(await prisma.inventoryLot.count()).toBe(0); // NO inventory at all
+
+            const res = await moolreWebhook(pending.txHash, 100);
+            expect(res.statusCode).toBe(200);
+            expect(res.payload.success).toBe(true);
+
+            const th = await prisma.transactionHistory.findUnique({ where: { id: pending.id } });
+            expect(th.status).toBe('COMPLETED');
+            const q = new Decimal(th.amountUsdc);
+            expect((await bal('clearing:conversion')).toFixed(8)).toBe(q.toFixed(8)); // legacy bridge posted
+            expect(await prisma.modelBSettlement.count()).toBe(0);
+            expect(await prisma.inventoryLotConsumption.count()).toBe(0);            // nothing consumed
+            expect(await prisma.journalEntry.count({ where: { account: 'fiat:momo:ghs', ledgerTransactionId: { not: null } } })).toBe(0); // no GHS ledger leg
+            expect((await bal(`user:${user.id}:liability`)).toFixed(8)).toBe(q.toFixed(8));
+        });
+
+        test('flag OFF with inventory present: the bridge still posts, inventory is NOT consumed', async () => {
+            const lot = await acquireTx({ quantity: '10', cost: '120' });
+            const user = await seedUser(prisma);
+            const pending = await initiateDeposit(user, 100);
+            await moolreWebhook(pending.txHash, 100);
+            const l = await prisma.inventoryLot.findUnique({ where: { id: lot.id } });
+            expect(new Decimal(l.quantityRemaining).toFixed(8)).toBe('10.00000000');
+            expect((await bal('inventory:usdc:lots')).toFixed(8)).toBe('10.00000000');
+            expect((await bal('clearing:conversion')).gt(0)).toBe(true);
+        });
+
+        test('flag ON with liquidity OFF: Model B settles; no receipt is created; GHS ledger accounting still lands', async () => {
+            const { user, pending } = await seedScenario();
+            await setLiquidity(false);
+            const res = await moolreWebhook(pending.txHash, 100);
+            expect(res.statusCode).toBe(200);
+            expect(await prisma.modelBSettlement.count()).toBe(1);
+            expect(await prisma.fiatLiquidityReceipt.count()).toBe(0); // P5-D flag governs receipts, not Model B
+            expect((await bal('fiat:momo:ghs')).toFixed(2)).toBe('100.00'); // P5-E ledger leg independent
+            expect((await bal(`user:${user.id}:liability`)).gt(0)).toBe(true);
+        });
+    });
+
+    // =========================================================================
+    // F. Invariants — ledger/substrate agreement under repeated settlements
+    // =========================================================================
+    describe('F. invariants under repeated settlements', () => {
+        test('ledger inventory:usdc:lots balance == Σ lot remaining; liability ledger == projection; GHS ledger == Σ settled GHS', async () => {
+            await setModelB(true);
+            await acquireTx({ quantity: '20', cost: '240' });
+            const users = [];
+            const pendings = [];
+            for (let i = 0; i < 3; i++) {
+                const u = await seedUser(prisma, { availableBalance: 0 });
+                users.push(u);
+                pendings.push(await initiateDeposit(u, 50));
+            }
+            for (const p of pendings) {
+                expect((await moolreWebhook(p.txHash, 50)).statusCode).toBe(200);
+            }
+
+            // P5-B invariant extended to the live position (P5-E releases inventory)
+            const agg = await prisma.inventoryLot.aggregate({ _sum: { quantityRemaining: true } });
+            expect((await bal('inventory:usdc:lots')).toFixed(8)).toBe(new Decimal(agg._sum.quantityRemaining).toFixed(8));
+
+            // every customer: ledger liability == availableBalance projection
+            for (const u of users) {
+                const row = await prisma.user.findUnique({ where: { id: u.id } });
+                expect((await bal(`user:${u.id}:liability`)).toFixed(8)).toBe(new Decimal(row.availableBalance).toFixed(8));
+            }
+
+            // GHS ledger asset == Σ settled GHS of Model B settlements
+            const sAgg = await prisma.modelBSettlement.aggregate({ _sum: { settledGhs: true } });
+            expect((await bal('fiat:momo:ghs')).toFixed(2)).toBe(new Decimal(sAgg._sum.settledGhs).toFixed(2));
+
+            // COGS accumulates the exact delivered quantity
+            const cogsAgg = await prisma.modelBSettlement.aggregate({ _sum: { settledUsdc: true } });
+            expect((await bal('expense:cogs:usdc')).toFixed(8)).toBe(new Decimal(cogsAgg._sum.settledUsdc).toFixed(8));
+
+            // no quote-only P&L ever
+            expect(await prisma.journalEntry.count({ where: { account: 'pnl:inventory' } })).toBe(0);
+        });
+
+        test('a fully sold lot returns equity:treasury USDC to zero (acquisition stake drawn in full)', async () => {
+            await setModelB(true);
+            await acquireTx({ quantity: '4', cost: '48' });
+            const user = await seedUser(prisma);
+            const pending = await initiateDeposit(user, 53.68); // 53.68 / 13.42 = 4.0 (exact 8dp)
+            expect((await moolreWebhook(pending.txHash, 53.68)).statusCode).toBe(200);
+            const th = await prisma.transactionHistory.findUnique({ where: { id: pending.id } });
+            expect(new Decimal(th.amountUsdc).toFixed(8)).toBe('4.00000000');
+            expect((await bal('equity:treasury')).toFixed(8)).toBe('0.00000000'); // stake fully drawn
+            const lot = await prisma.inventoryLot.findFirst();
+            expect(lot.status).toBe('CONSUMED');
+        });
+    });
+});

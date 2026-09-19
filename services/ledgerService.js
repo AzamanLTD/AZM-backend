@@ -112,6 +112,12 @@ const CANONICAL_ACCOUNTS = {
   'expense:gas':            { accountClass: 'EXPENSE',    normalSide: 'DEBIT',  asset: 'USDC', network: null },
   'expense:provider':       { accountClass: 'EXPENSE',    normalSide: 'DEBIT',  asset: 'USDC', network: null },
   'pnl:inventory':          { accountClass: 'REVENUE',    normalSide: 'CREDIT', asset: 'USDC', network: null },
+  // §P.5-E: realized cost of inventory DELIVERED at Model B settlement —
+  // debited with the exact USDC quantity of the consumed inventory lots at
+  // the moment the customer settlement commits. Quantity-exact, never
+  // rate-restated: the GHS-denominated margin lives in the durable
+  // ModelBSettlement record (cost basis + customer spread), not here.
+  'expense:cogs:usdc':      { accountClass: 'EXPENSE',    normalSide: 'DEBIT',  asset: 'USDC', network: null },
   'pnl:arbitrage':          { accountClass: 'REVENUE',    normalSide: 'CREDIT', asset: 'USDC', network: null },
   'equity:treasury':        { accountClass: 'EQUITY',     normalSide: 'CREDIT', asset: 'USDC', network: null },
   // §P.5-A: GHS-side equity counterpart of equity:treasury — CATALOG-ONLY until §P.5-D/E; never a GHS liability/spread/P&L.

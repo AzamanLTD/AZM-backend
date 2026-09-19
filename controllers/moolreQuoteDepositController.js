@@ -13,6 +13,7 @@ const {
   consumeTransactionQuote,
 } = require('../src/services/transactionQuoteService');
 const fiatLiquidity = require('../src/services/fiatLiquidityService'); // §P.5-D
+const modelBSettlement = require('../services/modelBSettlementService'); // §P.5-E
 const routePolicy = require('../src/services/routePolicyService');
 
 // §P.5-C: rails are owned by the versioned route policy — this set mirrors
@@ -251,6 +252,9 @@ exports.webhook = async (req, res) => {
         });
     }
     const liquidityAuthorityOn = await fiatLiquidity.isAuthorityEnabled(prisma);
+    // §P.5-E: OFF (default) keeps the §P.4 clearing:conversion bridge; ON
+    // settles the purchase through authoritative inventory (Model B).
+    const modelBOn = await modelBSettlement.isModelBSettlementEnabled(prisma);
 
     const quoteId = existing.metadata?.quoteId;
     if (!quoteId) return res.status(409).json({ success: false, message: 'Deposit is missing its transaction quote.' });
@@ -314,6 +318,31 @@ exports.webhook = async (req, res) => {
       // projection credit + TransactionHistory settlement:
       //   D clearing:conversion   — explicit temporary clearing (§P.5 later)
       //   C user:{id}:liability    — customer liability increases
+      //
+      // §P.5-E: the flag ON path settles Model B instead — FIFO inventory
+      // lot claim, GHS asset accounting (fiat:momo:ghs / equity:treasury:ghs),
+      // COGS realization, treasury-stake-funded customer liability and the
+      // durable realized-economics record — clearing:conversion is NOT
+      // touched (docs/p5e-model-b-settlement.md §2.4).
+      if (modelBOn) {
+        await modelBSettlement.settleDepositFromInventory(tx, {
+          reference: externalRef,
+          transactionHistoryId: existing.id,
+          userId: existing.userId,
+          quoteId,
+          quotedGhs: quote.amountGhs,
+          quotedRateGhsPerUsdc: quote.rateGhsPerUsdc,
+          quotedUsdc: quote.usdcAmount,
+          settledGhs,
+          settledUsdc: updatedTx.amountUsdc, // exact Decimal(20,8) — the ledger authority
+          selectedRoute: quote.selectedRoute || null,
+          routeProviderRail: quote.routeProviderRail || null,
+          routePolicyVersion: quote.routePolicyVersion || null,
+          provider: 'MOOLRE',
+          providerRef: existing.providerRef || null,
+          evidenceDedupKey: `event:moolre-collection:${externalRef}`,
+        });
+      } else {
       await ledger.post(tx, {
         idempotencyKey: `ledger:deposit:fiat:${externalRef}`,
         entryType: 'DEPOSIT',
@@ -333,6 +362,7 @@ exports.webhook = async (req, res) => {
           { account: `user:${existing.userId}:liability`, credit: updatedTx.amountUsdc },
         ],
       });
+      }
 
       // §P.5-D (flag ON): the settled, quote-matched Moolre collection —
       // rail-gated by the providerRef proof — IS the evidence that creates
