@@ -1469,4 +1469,182 @@ describeOrSkip('§P.5-E Model B settlement / inventory cost-basis realization (r
             expect(await prisma.modelBSettlement.count({ where: { reference: pending.txHash } })).toBe(1);
         });
     });
+
+    // =========================================================================
+    // I. Moolre early-webhook race — observation-identity prerequisite
+    //
+    // Moolre's P01 callback payload does NOT carry the initiation response's
+    // durable providerRef; this surface's authoritative provider identity is
+    // stamped on TransactionHistory by the initiate/OTP path. r8 moved the
+    // providerRef prerequisite BEFORE evidence construction: an early P01
+    // callback must fail closed with NO provider event (recording it with
+    // providerRef = NULL would commit the observation identity first and make
+    // the provider's legitimate later retry — same dedupKey, now carrying the
+    // stamped reference — fail as contradictory evidence, permanently
+    // blocking settlement). Once the reference exists, evidence precedes all
+    // state checks exactly as in r7.
+    // =========================================================================
+    describe('I. Moolre early-webhook race (observation-identity prerequisite)', () => {
+        const moolreKey = (ref) => `event:moolre-collection:${ref}`;
+
+        async function genericWebhookStatus(txHash, amountGhs, status) {
+            const res = mockResponse();
+            await quoteFiatDepositController.webhook({
+                app: makeApp(),
+                headers: { 'x-azaman-webhook-secret': process.env.FIAT_WEBHOOK_SECRET },
+                body: { reference: txHash, amountGhs, providerTxId: 'GEN-1', status },
+            }, res);
+            return res;
+        }
+
+        async function stampProviderRef(pendingId, providerRef) {
+            // EXACTLY the mechanism the initiation path uses (see
+            // moolreQuoteDepositController.initiate: transactionHistory.update
+            // data.providerRef from the initiation response).
+            await prisma.transactionHistory.update({ where: { id: pendingId }, data: { providerRef } });
+        }
+
+        test('A. early P01 callback BEFORE the initiation response stamps providerRef → 409, NO observation constructed, deposit fully untouched', async () => {
+            const { pending, quoteId } = await seedScenario();
+
+            // Simulate the race window: the provider's P01 callback arrives
+            // while the initiation transaction has not yet committed its
+            // providerRef to the durable record.
+            await stampProviderRef(pending.id, null);
+
+            const early = await moolreWebhook(pending.txHash, 100);
+            expect(early.statusCode).toBe(409);
+            expect(early.payload.message).toContain('no Moolre collection confirmation');
+
+            // NO provider observation was durably constructed for the callback
+            expect(await prisma.fiatProviderEvent.count({ where: { relatedReference: pending.txHash } })).toBe(0);
+            expect(await prisma.fiatProviderEvent.count({ where: { dedupKey: moolreKey(pending.txHash) } })).toBe(0);
+
+            // Deposit remains PENDING; the quote remains unconsumed
+            const tx = await prisma.transactionHistory.findUnique({ where: { id: pending.id } });
+            expect(tx.status).toBe('PENDING');
+            expect(tx.providerRef).toBeNull();
+            expect((await quoteRow(quoteId)).consumedAt).toBeNull();
+
+            // ZERO financial mutation: no Model B settlement, no inventory
+            // consumption, no customer balance change
+            expect(await prisma.modelBSettlement.count()).toBe(0);
+            expect(await prisma.inventoryLotConsumption.count()).toBe(0);
+            const user = await prisma.user.findUnique({ where: { id: pending.userId } });
+            expect(Number(user.availableBalance)).toBe(0);
+        });
+
+        test('B. the SAME P01 payload retried AFTER providerRef is stamped settles — ONE observation, ONE settlement, exact retries converge', async () => {
+            const { pending, quoteId } = await seedScenario();
+
+            // The initiation response's durable provider reference — what the
+            // initiate path would have stamped on TransactionHistory.
+            const initiationProviderRef = `PR-P5E-RACE-${pending.id}`;
+
+            // The early callback arrives in the race window and fails closed
+            // (mirrors test A) with NO observation constructed.
+            await stampProviderRef(pending.id, null);
+            const early = await moolreWebhook(pending.txHash, 100);
+            expect(early.statusCode).toBe(409);
+            expect(await prisma.fiatProviderEvent.count({ where: { relatedReference: pending.txHash } })).toBe(0);
+
+            // The initiation response commits its providerRef.
+            await stampProviderRef(pending.id, initiationProviderRef);
+
+            // The provider retries the SAME P01 callback — it must settle.
+            const retry = await moolreWebhook(pending.txHash, 100);
+            expect(retry.statusCode).toBe(200);
+
+            // Exactly ONE durable Moolre provider event, carrying the REAL
+            // initiation-derived providerRef (never NULL).
+            const events = await prisma.fiatProviderEvent.findMany({ where: { relatedReference: pending.txHash } });
+            expect(events).toHaveLength(1);
+            expect(events[0].dedupKey).toBe(moolreKey(pending.txHash));
+            expect(events[0].providerRef).toBe(initiationProviderRef);
+
+            // Exactly one settlement and one inventory consumption path
+            expect(await prisma.modelBSettlement.count()).toBe(1);
+            const consumptions = await prisma.inventoryLotConsumption.count();
+            expect(consumptions).toBeGreaterThan(0);
+            const txAfter = await prisma.transactionHistory.findUnique({ where: { id: pending.id } });
+            expect(txAfter.status).toBe('COMPLETED');
+            expect((await quoteRow(quoteId)).consumedAt).not.toBeNull();
+
+            // An exact third retry converges idempotently — no second
+            // observation, settlement or consumption.
+            const third = await moolreWebhook(pending.txHash, 100);
+            expect(third.statusCode).toBe(200);
+            expect(await prisma.fiatProviderEvent.count({ where: { relatedReference: pending.txHash } })).toBe(1);
+            expect(await prisma.modelBSettlement.count()).toBe(1);
+            expect(await prisma.inventoryLotConsumption.count()).toBe(consumptions);
+        });
+
+        test('C. settled deposit: an exact P01 retry converges; a materially different SUCCESS payload → 409 CONTRADICTORY_PROVIDER_EVIDENCE with the contradiction retained and NOTHING unwound', async () => {
+            // Normal flow: initiation stamps providerRef, one P01 settles.
+            const { pending } = await seedScenario();
+            const settled = await moolreWebhook(pending.txHash, 100);
+            expect(settled.statusCode).toBe(200);
+            expect(await prisma.modelBSettlement.count()).toBe(1);
+
+            // Exact retry against the COMPLETED deposit converges to the
+            // committed observation — already-processed, still ONE row.
+            const retry = await moolreWebhook(pending.txHash, 100);
+            expect(retry.statusCode).toBe(200);
+            expect(retry.payload.message).toMatch(/already processed/i);
+            expect(await prisma.fiatProviderEvent.count({ where: { relatedReference: pending.txHash } })).toBe(1);
+
+            // A materially different SUCCESS payload (different collected
+            // amount) under the SAME observation identity fails closed.
+            const conflicting = await moolreWebhook(pending.txHash, 100.01);
+            expect(conflicting.statusCode).toBe(409);
+            expect(conflicting.payload.code).toBe('CONTRADICTORY_PROVIDER_EVIDENCE');
+
+            // The contradictory observation is retained as its OWN durable
+            // row; the committed row is untouched; settlement is unchanged.
+            const rows = await prisma.fiatProviderEvent.findMany({ where: { relatedReference: pending.txHash } });
+            const committed = rows.find((e) => e.dedupKey === moolreKey(pending.txHash));
+            const conflict = rows.find((e) => e.dedupKey.startsWith(`${moolreKey(pending.txHash)}:CONFLICT:`));
+            expect(rows).toHaveLength(2);
+            expect(Number(committed.amountGhs)).toBe(100);
+            expect(Number(conflict.amountGhs)).toBe(100.01);
+            expect(await prisma.modelBSettlement.count()).toBe(1);
+            const tx = await prisma.transactionHistory.findUnique({ where: { id: pending.id } });
+            expect(tx.status).toBe('COMPLETED');
+        });
+
+        test('D. r7 status-scoped identity remains intact: FAILED and SUCCESS are DISTINCT durable identities; a late FAILED NEVER unwinds a committed settlement', async () => {
+            // Guard proving the Moolre prerequisite reorder changed nothing
+            // about the generic status-scoped surface.
+            const { pending } = await seedScenario({ surface: 'generic' });
+
+            // A FAILED provider observation under its OWN status-scoped identity
+            await fiatLiquidity.recordProviderEvent(prisma, {
+                provider: 'GENERIC_FIAT_WEBHOOK', direction: 'INBOUND', status: 'FAILED',
+                providerRef: 'GEN-1', dedupKey: `event:fiat-deposit:${pending.txHash}:FAILED`,
+                amountGhs: 100, relatedReference: pending.txHash, raw: { source: 'test' },
+            });
+
+            // The legitimate SUCCESS observation settles under its OWN
+            // identity — never blocked by the FAILED row.
+            const settled = await genericWebhook(pending.txHash, 100);
+            expect(settled.statusCode).toBe(200);
+            expect(await prisma.modelBSettlement.count()).toBe(1);
+
+            // Both observations are durable and DISTINCT.
+            const keys = (await prisma.fiatProviderEvent.findMany({ where: { relatedReference: pending.txHash } }))
+                .map((e) => e.dedupKey);
+            expect(keys).toContain(`event:fiat-deposit:${pending.txHash}:FAILED`);
+            expect(keys).toContain(`event:fiat-deposit:${pending.txHash}:SUCCESSFUL`);
+
+            // A late FAILED against the committed settlement is durable and
+            // visible but NEVER unwinds it — no FAILED→COMPLETED lifecycle
+            // semantics are introduced.
+            const late = await genericWebhookStatus(pending.txHash, 100, 'FAILED');
+            expect(late.statusCode).toBe(200);
+            expect(await prisma.fiatProviderEvent.count({ where: { dedupKey: `event:fiat-deposit:${pending.txHash}:FAILED` } })).toBe(1);
+            const tx = await prisma.transactionHistory.findUnique({ where: { id: pending.id } });
+            expect(tx.status).toBe('COMPLETED');
+            expect(await prisma.modelBSettlement.count()).toBe(1);
+        });
+    });
 });

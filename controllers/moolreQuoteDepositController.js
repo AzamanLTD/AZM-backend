@@ -240,12 +240,38 @@ exports.webhook = async (req, res) => {
     const existing = await prisma.transactionHistory.findUnique({ where: { txHash: externalRef } });
     if (!existing) return res.status(404).json({ success: false, message: 'Unknown reference.' });
 
+    // §P.5-D OBSERVATION-IDENTITY PREREQUISITE (NOT a generic state check):
+    // Moolre's callback payload ({ txstatus, payer, amount, externalref, ... })
+    // does NOT carry the initiation response's durable providerRef — this
+    // surface's authoritative provider identity lives on the initiation
+    // record (TransactionHistory.providerRef, stamped by the initiate/OTP
+    // confirmation path). Until that reference exists there is not enough
+    // authoritative identity to CONSTRUCT this provider observation: an
+    // early P01 callback recorded with providerRef = NULL would commit the
+    // observation identity first, and the provider's later legitimate retry
+    // — same dedupKey, now carrying the stamped providerRef — would be
+    // correctly rejected by the substrate as contradictory evidence under
+    // the §3.3 identity contract, permanently blocking settlement. So the
+    // durable providerRef is a PREREQUISITE for the observation: while it is
+    // absent the callback fails closed exactly as before (409, retryable,
+    // NO provider event created) and once it exists "evidence before state
+    // checks" applies in full. This also preserves the §P.5-C rail-aware
+    // contract: a generic-webhook deposit that never passed through Moolre
+    // (and so has no Moolre providerRef) can never be re-interpreted as a
+    // Moolre settlement.
+    if (!existing.providerRef) {
+      return res.status(409).json({ success: false, message: 'Deposit has no Moolre collection confirmation — cannot settle on the Moolre webhook.' });
+    }
+
     // §P.5-D LIQUIDITY EVIDENCE: append the raw Moolre collection observation
     // OUT-OF-BAND, BEFORE ANY state decision — including the state checks
-    // below. EVERY P01 notification is durable evidence, whatever the
-    // deposit's current state: a contradictory late notification against a
-    // terminal row must remain durably visible for reconciliation, not vanish
-    // behind an early return. Append-only; exact retries converge.
+    // below. "Evidence before state checks" begins once the surface has
+    // enough authoritative identity to construct the observation (see the
+    // providerRef prerequisite above). EVERY identifiable P01 notification
+    // is durable evidence, whatever the deposit's current state: a
+    // contradictory late notification against a terminal row must remain
+    // durably visible for reconciliation, not vanish behind an early
+    // return. Append-only; exact retries converge.
     //
     // FAIL-CLOSED: the evidence layer is part of the authority boundary, NOT
     // best-effort logging. If the raw observation cannot be durably persisted,
@@ -310,15 +336,6 @@ exports.webhook = async (req, res) => {
 
     const quoteId = existing.metadata?.quoteId;
     if (!quoteId) return res.status(409).json({ success: false, message: 'Deposit is missing its transaction quote.' });
-
-    // §P.5-C rail-aware fail-closed: settlement on the Moolre webhook requires
-    // PROOF of a legitimate Moolre collection (providerRef, stamped by the
-    // Moolre initiate / OTP confirmation). A generic webhook deposit that
-    // never passed through Moolre cannot be re-interpreted as a Moolre
-    // settlement — 409 before any mutation.
-    if (!existing.providerRef) {
-      return res.status(409).json({ success: false, message: 'Deposit has no Moolre collection confirmation — cannot settle on the Moolre webhook.' });
-    }
 
     const result = await prisma.$transaction(async (tx) => {
       const quote = await consumeTransactionQuote({

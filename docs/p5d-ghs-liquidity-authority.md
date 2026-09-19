@@ -230,7 +230,24 @@ itself — no caller's say-so is trusted:
   dispatch reference names exactly one dispatch (`event:payout-dispatch:<provider>:<reference>`).
 - Deposit webhooks record the observation BEFORE any state decision — a
   contradictory late callback against a COMPLETED/FAILED deposit stays
-  durably visible instead of vanishing behind an early return.
+  durably visible instead of vanishing behind an early return. This
+  "evidence before state checks" begins once the surface has enough
+  authoritative identity to CONSTRUCT the observation.
+- Generic callbacks can derive a status-scoped observation identity
+  directly from the callback's own fields. Moolre's callback cannot: its
+  payload ({ txstatus, payer, amount, externalref, ... }) does not carry
+  the initiation response's durable providerRef, so a Moolre observation is
+  only identifiable once that reference exists on the initiation record.
+  The durable Moolre providerRef is therefore an observation-identity
+  PREREQUISITE, not a generic state check: an early P01 callback that
+  arrives before the initiation path has stamped
+  `TransactionHistory.providerRef` fails closed with 409 and creates NO
+  provider event (recording it with providerRef = NULL would commit the
+  identity first and make the provider's later legitimate retry — same
+  dedupKey, now carrying the stamped reference — fail as contradictory
+  evidence, permanently blocking settlement). Once the reference exists,
+  the observation is recorded before any state decision and settlement
+  proceeds; the deposit stays PENDING and retryable until then.
 
 Contradictory evidence raised on a deposit surface is additionally flagged
 `ReconciliationException (CONTRADICTORY_PROVIDER_EVIDENCE)` and answered
