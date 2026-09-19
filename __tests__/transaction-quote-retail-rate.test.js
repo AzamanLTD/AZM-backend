@@ -15,11 +15,15 @@ describe('transaction quote canonical FX source', () => {
       },
     };
 
-    await expect(getServerRateGhsPerUsdc({ prisma })).resolves.toEqual({
-      rateGhsPerUsdc: 13.18,
-      rateSource: 'KOTANI_PAY',
-      rateAsOf: new Date('2026-09-04T10:00:00.000Z'),
-    });
+    const result = await getServerRateGhsPerUsdc({ prisma });
+    // §P.5-C Decimal-native rate path: the reader returns the authoritative
+    // Decimal alongside the presentation Number.
+    expect(result.rateGhsPerUsdc).toBe(13.18);
+    expect(result.rateSource).toBe('KOTANI_PAY');
+    expect(result.rateAsOf).toEqual(new Date('2026-09-04T10:00:00.000Z'));
+    expect(String(result.rateGhsPerUsdcExact)).toBe('13.18'); // the DB-authoritative Decimal, exact
+    expect(Number(result.rateGhsPerUsdcExact)).toBe(13.18); // and its presentation projection agrees
+    expect(Object.keys(result).sort()).toEqual(['rateAsOf', 'rateGhsPerUsdc', 'rateGhsPerUsdcExact', 'rateSource']);
   });
 
   test('falls back to legacy USD/GHS only when retail rate is unavailable', async () => {
