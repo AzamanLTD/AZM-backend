@@ -68,10 +68,13 @@
 //      retained BEFORE the authoritative transition, fail closed when the
 //      evidence store is unavailable; duplicates converge and contradictions
 //      are retained as distinct rows.
-//   Q. Auto-payout worker liquidity units — under the authority the worker
-//      evaluates the global remaining-liquidity policy in GHS (threshold
-//      converted at the live rate, exact pesewas) and never double-reserves;
-//      OFF keeps the legacy USDC pool comparison.
+//   Q. Auto-payout worker — the liquidity regime follows the RECORDED row,
+//      never the current global flag: a FiatLiquidityReservation for the
+//      canonical reference means the §P.5-D authority regime (the exact
+//      reserved GHS is dispatched — rate drift can never mutate it, the
+//      operational headroom floor is compared in GHS, and SystemFiatPool is
+//      never an input), while an unreserved row keeps the LEGACY USDC pool
+//      policy even when the flag is ON. The worker never reserves.
 //   R. runDoubleCheck regressions — 2+ settled Decimal rows recompute
 //      correctly (the NaN/string-concat disarming bug), settled WITHDRAWAL_*
 //      rows are read as positive debit magnitudes, and a genuinely
@@ -122,6 +125,17 @@ describeOrSkip('§P.5-D evidence-backed GHS liquidity authority (real PostgreSQL
             // user_* rows behind breaks later suites' FK-sensitive cleanup.
             await prisma.$executeRawUnsafe('DELETE FROM "AdminProfitLog"');
             await prisma.$executeRawUnsafe('TRUNCATE TABLE "User" RESTART IDENTITY CASCADE');
+            // The suite's processFiatWithdrawal calls ensure/increment the
+            // global money singletons (SystemMasterCrypto principal deferral,
+            // SystemFiatPool legacy projection mirror, SystemProfitFees
+            // ensure-only). Leave them in the fresh-install posture so
+            // order-independent suites that assume a clean slate (e.g.
+            // withdrawal-fee-discount-atomicity, whose FIRST test compares
+            // the master crypto balance against a seeded withdrawal) are
+            // never contaminated by residue, whatever the jest run order.
+            await prisma.$executeRawUnsafe('DELETE FROM "SystemMasterCrypto"');
+            await prisma.$executeRawUnsafe('DELETE FROM "SystemFiatPool"');
+            await prisma.$executeRawUnsafe('DELETE FROM "SystemProfitFees"');
             await prisma.$disconnect();
         }
     });
@@ -1272,34 +1286,77 @@ describeOrSkip('§P.5-D evidence-backed GHS liquidity authority (real PostgreSQL
             });
         }
 
-        test('authority ON: the threshold is compared in GHS (converted at the live rate) — a USDC pool figure is never compared with GHS', async () => {
+        test('a LEGACY withdrawal (no reservation) under authority flag ON keeps the LEGACY recorded-row regime — the flag never converts it', async () => {
             await seedFreshRates(); // 13.42
             await setAuthorityFlag(true);
             const settings = await workerSettings({ threshold: 100, max: 500 });
             const worker = buildWorker();
+            worker.mtn = { initiateTransfer: jest.fn().mockResolvedValue({ status: 'ACCEPTED', data: { reference: 'MTN-Q1L' }, providerRef: 'MTN-Q1L' }) };
 
-            // claimable authority liquidity: 500 GHS. Threshold 100 USDC
-            // ≡ 1342 GHS — far above availability → every withdrawal flags.
+            // authority headroom is DRAINED (500 GHS available << the 100 USDC
+            // ≡ 1342 GHS authority floor) while the LEGACY pool projection is
+            // healthy (500). The old flag-global code flagged this row with
+            // AUTHORITY_HEADROOM_BELOW_THRESHOLD; the per-row regime code MUST
+            // dispatch it — this recorded row predates §P.5-D and the flag
+            // must not rewrite its meaning.
             await seedAvailable({ amountGhs: 500 });
             const user = await seedUser(prisma, { availableBalance: 200 });
             await pendingAutoWithdrawal(user, 20);
 
             const results = await worker._processBatch(settings, { isManualTrigger: true });
+            expect(results.flagged).toBe(0);
+            expect(results.processed).toBe(1);
+            expect(results.details.flaggedManualReview).toHaveLength(0);
+            // no liquidity history was invented for the legacy row
+            expect(await prisma.fiatLiquidityReservation.count({ where: { reference: { contains: String(user.id) } } })).toBe(0);
+            // the legacy USDC pool projection gauge was used and decremented
+            expect(results.poolBalance).toBe(500 - 20);
+            expect(worker.mtn.initiateTransfer).toHaveBeenCalledWith(expect.objectContaining({ amountGhs: parseFloat((20 * 13.42).toFixed(2)) }));
+        });
+
+        test('an authority-RECORDED withdrawal hits the operational headroom floor (threshold converted to GHS at the live rate) and stays RESERVED', async () => {
+            const financeService = require('../services/finance.service');
+            await seedFreshRates(); // 13.42
+            await setAuthorityFlag(true);
+            const settings = await workerSettings({ threshold: 100, max: 5000 }); // floor: 100 USDC ≡ 1342 GHS
+            const worker = buildWorker();
+            worker.mtn = { initiateTransfer: jest.fn().mockResolvedValue({ status: 'ACCEPTED' }) };
+
+            // claimable authority liquidity: 500 GHS. After reserving 268.40
+            // only 231.60 remains — far below the 1342 GHS floor.
+            await seedAvailable({ amountGhs: 500 });
+            const user = await seedUser(prisma, { availableBalance: 1000 });
+            const reference = `FIAT_OUT_HEADROOM_${user.id}`;
+            await financeService.processFiatWithdrawal(prisma, user.id, 20, { reference, retailRate: 13.42, liquidityRoute: { provider: 'MTN_MOMO', destination: '0241234567' } });
+            const th = await prisma.transactionHistory.findUnique({ where: { txHash: reference } });
+            await prisma.withdrawal.create({
+                data: { userId: user.id, amount: 20, status: 'PENDING', payoutMethod: 'MTN_MOMO', destination: '0241234567', network: 'MTN', createdAt: th.createdAt },
+            });
+
+            const results = await worker._processBatch(settings, { isManualTrigger: true });
             expect(results.flagged).toBe(1);
-            expect(results.details.flaggedManualReview).toHaveLength(1);
             expect(results.details.flaggedManualReview[0].reason).toBe('AUTHORITY_HEADROOM_BELOW_THRESHOLD');
             expect(results.processed).toBe(0);
+            expect(worker.mtn.initiateTransfer).not.toHaveBeenCalled();
+            // the reservation is untouched — funds held, not spendable, not dispatched
+            const rz = await prisma.fiatLiquidityReservation.findUnique({ where: { reference } });
+            expect(rz.status).toBe('RESERVED');
+            const st = await state();
+            expect(dec(st.availableGhs)).toBeCloseTo(500 - 268.40, 2);
+            expect(dec(st.reservedGhs)).toBeCloseTo(268.40, 2);
             const flagged = await prisma.withdrawal.findFirst({ where: { userId: user.id } });
             expect(flagged.status).toBe('NEEDS_MANUAL_REVIEW');
         });
 
-        test('authority ON: available GHS above the converted threshold pays out — and no second reservation is created for an already-reserved withdrawal', async () => {
+        test('a LEGACY withdrawal pays out through the LEGACY pool policy (authority flag ON) — the worker itself never reserves', async () => {
             await seedFreshRates(); // 13.42 → threshold 100 USDC ≡ 1342 GHS
             await setAuthorityFlag(true);
             const settings = await workerSettings({ threshold: 100, max: 5000 });
             const worker = buildWorker();
             worker.mtn = { initiateTransfer: jest.fn().mockResolvedValue({ status: 'ACCEPTED', data: { reference: 'MTN-Q2' }, providerRef: 'MTN-Q2' }) };
 
+            // seeding 2000 GHS of claimable availability ALSO mirrors the
+            // legacy pool projection to 2000 — healthy for the legacy gate.
             await seedAvailable({ amountGhs: 2000 });
             const user = await seedUser(prisma, { availableBalance: 200 });
             await pendingAutoWithdrawal(user, 20); // 20 USDC ≡ 268.40 GHS
@@ -1310,6 +1367,8 @@ describeOrSkip('§P.5-D evidence-backed GHS liquidity authority (real PostgreSQL
             expect(results.details.flaggedManualReview).toHaveLength(0);
             const rz = await prisma.fiatLiquidityReservation.findMany({ where: { reference: { contains: String(user.id) } } });
             expect(rz).toHaveLength(0); // the worker itself never reserves
+            // the legacy USDC pool projection gauge decremented — legacy regime
+            expect(results.poolBalance).toBe(2000 - 20);
             // dispatch evidence was recorded durably
             const dispatched = results.details.processed[0];
             expect(dispatched.referenceId).toBeDefined();
@@ -1371,6 +1430,102 @@ describeOrSkip('§P.5-D evidence-backed GHS liquidity authority (real PostgreSQL
             expect(dec(s2.availableGhs)).toBeCloseTo(availableAfterCreate, 2);
             expect(dec(s2.reservedGhs)).toBeCloseTo(0, 2);
             expect(dec(s2.inTransitGhs)).toBeCloseTo(268.40, 2);
+        });
+
+        test('RATE DRIFT never mutates a reserved payout: the provider receives EXACTLY the originally reserved GHS', async () => {
+            const financeService = require('../services/finance.service');
+            await seedFreshRates(); // 13.42 GHS/USDC at reservation time
+            await setAuthorityFlag(true);
+            const settings = await workerSettings({ threshold: 10, max: 5000 }); // floor: 10 USDC ≡ 134.20 GHS
+            const worker = buildWorker();
+            worker.mtn = { initiateTransfer: jest.fn().mockResolvedValue({ status: 'ACCEPTED', data: { reference: 'MTN-DRIFT' }, providerRef: 'MTN-DRIFT' }) };
+
+            await seedAvailable({ amountGhs: 2000 });
+            const user = await seedUser(prisma, { availableBalance: 1000 });
+
+            // 1. authority-on withdrawal at 13.42 → exactly 268.40 GHS reserved
+            const reference = `FIAT_OUT_DRIFT_${user.id}`;
+            await financeService.processFiatWithdrawal(prisma, user.id, 20, { reference, retailRate: 13.42, liquidityRoute: { provider: 'MTN_MOMO', destination: '0241234567' } });
+            const rzBefore = await prisma.fiatLiquidityReservation.findUnique({ where: { reference } });
+            expect(dec(rzBefore.amountGhs)).toBe(268.40); // 20 USDC × 13.42
+            const availableBefore = dec((await state()).availableGhs); // 2000 − 268.40
+
+            const th = await prisma.transactionHistory.findUnique({ where: { txHash: reference } });
+            await prisma.withdrawal.create({
+                data: { userId: user.id, amount: 20, status: 'PENDING', payoutMethod: 'MTN_MOMO', destination: '0241234567', network: 'MTN', createdAt: th.createdAt },
+            });
+
+            // 2. the live rate drifts MATERIALLY before the worker runs —
+            //    a naive recomputation would pay 20 × 15.75 = 315.00 GHS.
+            await prisma.globalSettings.update({ where: { id: 1 }, data: { liveRetailRate: 15.75 } });
+
+            // 3. the payout worker dispatches
+            const results = await worker._processBatch(settings, { isManualTrigger: true });
+            expect(results.processed).toBe(1);
+            expect(results.details.flaggedManualReview).toHaveLength(0);
+
+            // 4. the provider received EXACTLY the reserved 268.40 — not the
+            //    recalculated 315.00
+            expect(worker.mtn.initiateTransfer).toHaveBeenCalledWith(expect.objectContaining({
+                referenceId: reference, amountGhs: 268.40,
+            }));
+            expect(results.details.processed[0].amountGhs).toBe(268.40);
+
+            // 5. the reservation row itself still carries exactly 268.40
+            const rzAfter = await prisma.fiatLiquidityReservation.findUnique({ where: { reference } });
+            expect(dec(rzAfter.amountGhs)).toBe(268.40);
+
+            // 6. the durable outbound evidence carries the same exact amount
+            const ev = await prisma.fiatProviderEvent.findFirst({ where: { direction: 'OUTBOUND', relatedReference: reference } });
+            expect(ev).not.toBeNull();
+            expect(dec(ev.amountGhs)).toBe(268.40);
+
+            // 7. state moved reservedGhs → inTransitGhs for EXACTLY 268.40,
+            //    and availableGhs was NOT decremented a second time during
+            //    dispatch
+            const st = await state();
+            expect(dec(st.availableGhs)).toBeCloseTo(availableBefore, 2);
+            expect(dec(st.reservedGhs)).toBeCloseTo(0, 2);
+            expect(dec(st.inTransitGhs)).toBeCloseTo(268.40, 2);
+
+            // 8. exactly one reservation exists for the payout
+            expect(await prisma.fiatLiquidityReservation.count({ where: { reference } })).toBe(1);
+        });
+
+        test('an authority-reserved withdrawal cannot be controlled by a manipulated SystemFiatPool — the pool is never an authority input', async () => {
+            const financeService = require('../services/finance.service');
+            await seedFreshRates(); // 13.42
+            await setAuthorityFlag(true);
+            const settings = await workerSettings({ threshold: 10, max: 5000 }); // floor: 10 USDC ≡ 134.20 GHS
+            const worker = buildWorker();
+            worker.mtn = { initiateTransfer: jest.fn().mockResolvedValue({ status: 'ACCEPTED', data: { reference: 'MTN-POOL0' }, providerRef: 'MTN-POOL0' }) };
+
+            await seedAvailable({ amountGhs: 2000 });
+            const user = await seedUser(prisma, { availableBalance: 1000 });
+            const reference = `FIAT_OUT_POOL0_${user.id}`;
+            await financeService.processFiatWithdrawal(prisma, user.id, 20, { reference, retailRate: 13.42, liquidityRoute: { provider: 'MTN_MOMO', destination: '0241234567' } });
+            const th = await prisma.transactionHistory.findUnique({ where: { txHash: reference } });
+            await prisma.withdrawal.create({
+                data: { userId: user.id, amount: 20, status: 'PENDING', payoutMethod: 'MTN_MOMO', destination: '0241234567', network: 'MTN', createdAt: th.createdAt },
+            });
+
+            // an attacker (or operator) drains the LEGACY pool projection to
+            // zero — under the legacy regime this would hold the payout; for
+            // a RESERVED authority withdrawal it must change nothing.
+            await prisma.systemFiatPool.update({ where: { id: 1 }, data: { balance: 0 } });
+
+            const results = await worker._processBatch(settings, { isManualTrigger: true });
+            expect(results.processed).toBe(1);
+            expect(results.details.flaggedManualReview).toHaveLength(0);
+            expect(worker.mtn.initiateTransfer).toHaveBeenCalledWith(expect.objectContaining({ referenceId: reference, amountGhs: 268.40 }));
+            // reserved → IN_TRANSIT for exactly the reserved amount; the
+            // authority figures never touched the legacy pool
+            const st = await state();
+            expect(dec(st.inTransitGhs)).toBeCloseTo(268.40, 2);
+            expect(dec(st.reservedGhs)).toBeCloseTo(0, 2);
+            // the legacy projection is still zero — authority processing did
+            // not read or mutate it
+            expect(await pool()).toBe(0);
         });
 
         test('authority OFF: legacy USDC pool comparison is byte-identical (INSUFFICIENT_POOL_LIQUIDITY on a drained pool)', async () => {

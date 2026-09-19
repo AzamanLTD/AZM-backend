@@ -29,6 +29,9 @@ describe('PayoutBatchWorker canonical withdrawal transaction', () => {
         const prisma = {
             globalSettings: { findUnique: jest.fn().mockResolvedValue(settings) },
             systemFiatPool: { findUnique: jest.fn().mockResolvedValue({ balance: 1000 }) },
+        // §P.5-D per-row regime: no reservation row → this is a LEGACY
+        // withdrawal; the legacy SystemFiatPool policy applies.
+        fiatLiquidityReservation: { findUnique: jest.fn().mockResolvedValue(null) },
             withdrawal: {
                 findMany: jest.fn().mockResolvedValue([{
                     id: 91, userId: 7, amount: 50, destination: '0240000000', network: 'TELECEL',
@@ -58,6 +61,9 @@ describe('PayoutBatchWorker canonical withdrawal transaction', () => {
         const prisma = {
             globalSettings: { findUnique: jest.fn().mockResolvedValue(settings) },
             systemFiatPool: { findUnique: jest.fn().mockResolvedValue({ balance: 1000 }) },
+        // §P.5-D per-row regime: no reservation row → this is a LEGACY
+        // withdrawal; the legacy SystemFiatPool policy applies.
+        fiatLiquidityReservation: { findUnique: jest.fn().mockResolvedValue(null) },
             withdrawal: {
                 findMany: jest.fn().mockResolvedValue([{
                     id: 93, userId: 7, amount: 50, destination: '0240000000', network: 'MTN',
@@ -84,6 +90,9 @@ describe('PayoutBatchWorker canonical withdrawal transaction', () => {
         const prisma = {
             globalSettings: { findUnique: jest.fn().mockResolvedValue(settings) },
             systemFiatPool: { findUnique: jest.fn().mockResolvedValue({ balance: 1000 }) },
+        // §P.5-D per-row regime: no reservation row → this is a LEGACY
+        // withdrawal; the legacy SystemFiatPool policy applies.
+        fiatLiquidityReservation: { findUnique: jest.fn().mockResolvedValue(null) },
             withdrawal: {
                 findMany: jest.fn().mockResolvedValue([{
                     id: 92, userId: 7, amount: 50, destination: '0240000000', network: 'AIRTELTIGO',
@@ -123,6 +132,9 @@ describe('PayoutBatchWorker provider outcome classification', () => {
     const buildPrisma = ({ withdrawal, update, updateMany }) => ({
         globalSettings: { findUnique: jest.fn().mockResolvedValue({ ...settings, liveRetailRate: 13 }) },
         systemFiatPool: { findUnique: jest.fn().mockResolvedValue({ balance: 1000 }) },
+        // §P.5-D per-row regime: no reservation row → this is a LEGACY
+        // withdrawal; the legacy SystemFiatPool policy applies.
+        fiatLiquidityReservation: { findUnique: jest.fn().mockResolvedValue(null) },
         withdrawal: {
             findMany: jest.fn().mockResolvedValue([withdrawal]),
             update,

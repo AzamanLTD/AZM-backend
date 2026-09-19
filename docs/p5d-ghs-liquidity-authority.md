@@ -99,6 +99,29 @@ economics.
    `availableGhs`). Both regimes have real-PG regression proofs with a
    stale/manipulated pool and an already-reserved payout.
 
+4. **`payoutBatchWorker` recomputed the provider payout at the CURRENT rate and
+   applied the regime globally by flag:** a later rate change silently mutated the
+   GHS amount the provider was instructed to pay for an already-reserved
+   withdrawal, and every pending row was treated as authority-regime whenever the
+   flag was ON. Fixed with the per-row contract: the regime follows the RECORDED
+   row — a `FiatLiquidityReservation` for the withdrawal's canonical reference IS
+   the authority record, and its exact `amountGhs` (Decimal 2dp, string-derived) is
+   the amount passed to `initiateTransfer` and persisted on the outbound
+   `FiatProviderEvent`; the live rate is used ONLY for the operational threshold
+   conversion and never mutates the economics of an existing reservation. A row
+   WITHOUT a reservation predates P5-D and keeps the legacy `SystemFiatPool`
+   pool/threshold policy even when the flag is ON — the flag governs only whether
+   NEW withdrawals create reservations and never rewrites the meaning of historical
+   rows. Authority-reserved processing does not read `SystemFiatPool` at all (the
+   legacy pool is read lazily, only for legacy rows, and the batch summary's
+   `poolBalance` is documented as the legacy projection gauge, never authoritative
+   GHS liquidity). Real-PG regressions prove the rate-drift case (provider receives
+   exactly the originally reserved GHS; RESERVED → IN_TRANSIT moves exactly the
+   reserved amount; `availableGhs` untouched), the per-row legacy-vs-authority
+   split (a drained authority headroom cannot hold a legacy row; a drained legacy
+   pool cannot hold a reserved row), and single-reservation / no-second-decrement
+   semantics.
+
 ---
 
 ## 3. The P5-D state machine
@@ -209,10 +232,16 @@ evidence-backed AVAILABLE receipts
   = available + reserved + inTransit + reconciliationHeld + paidOut
 ```
 
-Under the authority, `payoutBatchWorker` reads `availableGhs` for the global
-remaining-liquidity policy — GHS compared with GHS, its USDC-configured threshold
-converted at the authoritative live rate with exact pesewa arithmetic — and NEVER
-treats the withdrawal's existing reservation as needing a second claim.
+`payoutBatchWorker`'s liquidity regime follows the RECORDED row, never the
+current flag. A reservation-backed row dispatches EXACTLY the reserved
+`amountGhs` (a later rate change can never mutate the provider payout) and its
+gate is the operational headroom policy — GHS compared with GHS, its
+USDC-configured threshold converted at the live rate with exact pesewa
+arithmetic — while `SystemFiatPool` is never read for it and the reservation is
+never re-claimed (RESERVED → IN_TRANSIT moves exactly the reserved amount).
+A row without a reservation keeps the legacy USDC pool/threshold policy even
+when the flag is ON; the flag only decides whether NEW withdrawals create
+reservations.
 
 ## 4. SystemFiatPool after P5-D (compatibility boundary)
 

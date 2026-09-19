@@ -19,16 +19,23 @@
 // Flow per tick:
 //   1. Read GlobalSettings for auto-payout config
 //   2. If disabled, skip (log once per disable→enable transition)
-//   3. Read SystemFiatPool balance
-//   4. Scan PENDING withdrawals (payoutMethod containing 'MOMO' or fiat)
-//   5. For each:
+//   3. Scan PENDING withdrawals (payoutMethod containing 'MOMO' or fiat)
+//   4. For each:
 //      a. If amount > autoPayoutMaxAmountUsdc → mark NEEDS_MANUAL_REVIEW
-//      b. If pool < amount → mark NEEDS_MANUAL_REVIEW (pool exhausted)
-//      c. Resolve the canonical PENDING TransactionHistory row first.
+//      b. Resolve the canonical PENDING TransactionHistory row first.
+//      c. §P.5-D PER-ROW REGIME: the recorded row decides the liquidity
+//         regime — NOT the current global flag. A withdrawal with a
+//         FiatLiquidityReservation for its canonical reference is an
+//         authority payout (exact reserved GHS, authority headroom gate);
+//         a withdrawal with NO reservation row is a legacy payout (legacy
+//         SystemFiatPool projection gate) even when the flag is ON.
 //      d. Atomically claim the withdrawal as PROCESSING before provider I/O.
-//      e. Dispatch using that row's existing txHash as the provider reference.
+//      e. Dispatch using that row's existing txHash as the provider
+//         reference — with the EXACT GHS reserved at creation time for
+//         authority rows (a later rate change must never mutate the
+//         provider payout amount of an existing reservation).
 //      f. Reconciliation owns the final transition.
-//   6. Emit admin_alert socket events for flagged withdrawals
+//   5. Emit admin_alert socket events for flagged withdrawals
 //
 // IMPORTANT: The finance withdrawal flow already creates the canonical
 // TransactionHistory row and reserves the user's funds. Auto-payout must never
@@ -188,26 +195,28 @@ class PayoutBatchWorker {
         const globalSettings = await this.prisma.globalSettings.findUnique({ where: { id: 1 } });
         const liveRate = globalSettings ? Number(globalSettings.liveRetailRate) : 12.5;
 
-        // §P.5-D: under the GHS liquidity authority the remaining-liquidity
-        // policy reads FiatLiquidityState.availableGhs (GHS), NEVER the legacy
-        // USDC-denominated SystemFiatPool scalar — the two are different units
-        // and must never be compared directly. The USDC-configured threshold is
-        // converted at the authoritative live rate with exact pesewa Decimal
-        // arithmetic. With the authority OFF the legacy pool/threshold behavior
-        // is byte-identical.
-        const liquidityAuthorityOn = await fiatLiquidity.isAuthorityEnabled(this.prisma);
-        const fiatPool = await this.prisma.systemFiatPool.findUnique({ where: { id: 1 } });
-        const poolBalance = fiatPool ? Number(fiatPool.balance) : 0;
-        let remainingLiquidityGhs = null; // authority regime (GHS); null = legacy regime
-        let thresholdGhs = null;
-        if (liquidityAuthorityOn) {
-            const state = await this.prisma.fiatLiquidityState.findUnique({ where: { id: 1 } });
-            remainingLiquidityGhs = state ? new Prisma.Decimal(state.availableGhs) : new Prisma.Decimal(0);
-            // Exact pesewa conversion of the USDC-configured threshold.
-            thresholdGhs = fiatLiquidity.toExactGhsDecimal(
-                new Prisma.Decimal(threshold).times(liveRate).toFixed(2)
-            );
-        }
+        // §P.5-D PER-ROW REGIME: the liquidity regime follows the RECORDED
+        // row, never the current global flag. A FiatLiquidityReservation for
+        // the withdrawal's canonical reference IS the authority regime for
+        // that row; its exact reserved amountGhs is the authoritative payout
+        // amount and a later rate change must not mutate it. A row without a
+        // reservation predates §P.5-D and keeps the legacy SystemFiatPool
+        // regime (compatibility/legacy projection ONLY — never an authority
+        // input) even when the flag is ON. The flag only governs whether NEW
+        // withdrawals create reservations; it never rewrites the meaning of
+        // historical rows.
+        //
+        // The legacy pool is read LAZILY — only when the first legacy row of
+        // the batch actually needs it. Authority-reserved processing never
+        // reads SystemFiatPool at all.
+        let runningPoolBalance = null; // legacy regime gauge (USDC projection); null = no legacy row read it yet
+        const ensureLegacyPool = async () => {
+            if (runningPoolBalance === null) {
+                const fiatPool = await this.prisma.systemFiatPool.findUnique({ where: { id: 1 } });
+                runningPoolBalance = fiatPool ? Number(fiatPool.balance) : 0;
+            }
+            return runningPoolBalance;
+        };
 
         const pendingWithdrawals = await this.prisma.withdrawal.findMany({
             where: {
@@ -235,7 +244,7 @@ class PayoutBatchWorker {
                 message: 'No pending fiat withdrawals to process.',
                 processed: 0,
                 flagged: 0,
-                poolBalance
+                poolBalance: null // legacy projection unread — no rows processed
             };
         }
 
@@ -245,8 +254,6 @@ class PayoutBatchWorker {
             unknownOutcome: [],
             errors: []
         };
-
-        let runningPoolBalance = poolBalance;
 
         for (const withdrawal of pendingWithdrawals) {
             const amount = Number(withdrawal.amount);
@@ -258,40 +265,6 @@ class PayoutBatchWorker {
                     message: `Withdrawal $${amount} exceeds auto-approve max ($${maxAmount})`
                 });
                 results.flaggedManualReview.push({ id: withdrawal.id, reason: 'AMOUNT_EXCEEDS_THRESHOLD', amount });
-                continue;
-            }
-
-            if (liquidityAuthorityOn) {
-                // Authority regime: the payout's exact GHS was ALREADY claimed
-                // atomically from FiatLiquidityState.availableGhs by
-                // processFiatWithdrawal (its FiatLiquidityReservation), so
-                // dispatching it consumes NO further available liquidity —
-                // the RESERVED → IN_TRANSIT transition moves reservedGhs to
-                // inTransitGhs and never touches availableGhs. This gate is
-                // therefore purely an OPERATIONAL POLICY (hold back payouts
-                // once remaining headroom drops below the configured
-                // floor). It is NOT a capacity claim for this payout: a
-                // second availableGhs-vs-withdrawalGhs comparison would
-                // double-count the already-reserved amount and could
-                // false-hold a fully reserved, fully backed payout.
-                if (remainingLiquidityGhs.lt(thresholdGhs)) {
-                    await this._flagForManualReview(withdrawal, 'AUTHORITY_HEADROOM_BELOW_THRESHOLD', {
-                        amount,
-                        availableGhs: remainingLiquidityGhs.toString(),
-                        thresholdGhs: thresholdGhs.toString(),
-                        message: `Operational hold: remaining authoritative GHS liquidity (${remainingLiquidityGhs.toFixed(2)}) below the configured payout floor (${thresholdGhs.toFixed(2)})`
-                    });
-                    results.flaggedManualReview.push({ id: withdrawal.id, reason: 'AUTHORITY_HEADROOM_BELOW_THRESHOLD', amount, availableGhs: remainingLiquidityGhs.toString() });
-                    continue;
-                }
-            } else if (runningPoolBalance < threshold || runningPoolBalance < amount) {
-                await this._flagForManualReview(withdrawal, 'INSUFFICIENT_POOL_LIQUIDITY', {
-                    amount,
-                    poolBalance: runningPoolBalance,
-                    threshold,
-                    message: `Fiat pool ($${runningPoolBalance.toFixed(2)}) below threshold ($${threshold}) or insufficient for $${amount}`
-                });
-                results.flaggedManualReview.push({ id: withdrawal.id, reason: 'INSUFFICIENT_POOL_LIQUIDITY', amount, poolBalance: runningPoolBalance });
                 continue;
             }
 
@@ -318,6 +291,72 @@ class PayoutBatchWorker {
                 continue;
             }
 
+            // §P.5-D PER-ROW REGIME: the recorded row decides the regime.
+            // The reservation committed by processFiatWithdrawal at
+            // withdrawal-creation time IS the authority record; a row
+            // without one is a genuine legacy payout and keeps the legacy
+            // pool policy even when the flag is ON. The flag never
+            // converts a historical row into an authority reservation and
+            // the worker NEVER creates a reservation itself.
+            const referenceId = String(canonical.row.txHash);
+            const reservation = await this.prisma.fiatLiquidityReservation.findUnique({
+                where: { reference: referenceId }
+            });
+            const authorityRecorded = reservation != null;
+
+            if (authorityRecorded) {
+                // Authority regime: the payout's exact GHS was ALREADY
+                // claimed atomically from FiatLiquidityState.availableGhs at
+                // reservation time, so dispatching it consumes NO further
+                // available liquidity — the RESERVED → IN_TRANSIT transition
+                // moves reservedGhs to inTransitGhs and never touches
+                // availableGhs. This gate is therefore purely an OPERATIONAL
+                // POLICY (hold back payouts once remaining headroom drops
+                // below the configured floor), evaluated in GHS against
+                // FiatLiquidityState — never against the legacy USDC pool.
+                // It is NOT a capacity claim for this payout: a second
+                // availableGhs-vs-withdrawalGhs comparison would double-count
+                // the already-reserved amount and could false-hold a fully
+                // reserved, fully backed payout.
+                const liqState = await this.prisma.fiatLiquidityState.findUnique({ where: { id: 1 } });
+                const remainingLiquidityGhs = liqState
+                    ? new Prisma.Decimal(liqState.availableGhs)
+                    : new Prisma.Decimal(0);
+                // Exact pesewa conversion of the USDC-configured threshold.
+                // The live rate is used ONLY for this operational threshold
+                // comparison — it never mutates the economic amount of an
+                // existing reservation.
+                const thresholdGhs = fiatLiquidity.toExactGhsDecimal(
+                    new Prisma.Decimal(threshold).times(liveRate).toFixed(2)
+                );
+                if (remainingLiquidityGhs.lt(thresholdGhs)) {
+                    await this._flagForManualReview(withdrawal, 'AUTHORITY_HEADROOM_BELOW_THRESHOLD', {
+                        amount,
+                        availableGhs: remainingLiquidityGhs.toString(),
+                        thresholdGhs: thresholdGhs.toString(),
+                        message: `Operational hold: remaining authoritative GHS liquidity (${remainingLiquidityGhs.toFixed(2)}) below the configured payout floor (${thresholdGhs.toFixed(2)})`
+                    });
+                    results.flaggedManualReview.push({ id: withdrawal.id, reason: 'AUTHORITY_HEADROOM_BELOW_THRESHOLD', amount, availableGhs: remainingLiquidityGhs.toString() });
+                    continue;
+                }
+            } else {
+                // Legacy regime (recorded row predates §P.5-D — no
+                // reservation row): preserve the historical SystemFiatPool
+                // pool/threshold policy. SystemFiatPool is a compatibility /
+                // legacy projection ONLY and is never an authority input.
+                const poolBalanceNow = await ensureLegacyPool();
+                if (poolBalanceNow < threshold || poolBalanceNow < amount) {
+                    await this._flagForManualReview(withdrawal, 'INSUFFICIENT_POOL_LIQUIDITY', {
+                        amount,
+                        poolBalance: poolBalanceNow,
+                        threshold,
+                        message: `Fiat pool ($${poolBalanceNow.toFixed(2)}) below threshold ($${threshold}) or insufficient for $${amount}`
+                    });
+                    results.flaggedManualReview.push({ id: withdrawal.id, reason: 'INSUFFICIENT_POOL_LIQUIDITY', amount, poolBalance: poolBalanceNow });
+                    continue;
+                }
+            }
+
             // Claim the withdrawal before any provider I/O. Multiple worker
             // instances may read the same PENDING row; only one can transition
             // it to PROCESSING. If the process dies after this point, the
@@ -333,8 +372,15 @@ class PayoutBatchWorker {
             }
 
             try {
-                const amountGhs = parseFloat((amount * liveRate).toFixed(2));
-                const referenceId = String(canonical.row.txHash);
+                // §P.5-D EXACT RESERVED AMOUNT: for an authority-recorded
+                // withdrawal the provider is paid EXACTLY what
+                // processFiatWithdrawal durably reserved at creation time —
+                // the current live rate must NEVER mutate the GHS amount of
+                // an existing reservation. Only genuine legacy rows convert
+                // USDC → GHS at the current live rate, as they always did.
+                const amountGhs = authorityRecorded
+                    ? parseFloat(new Prisma.Decimal(reservation.amountGhs).toFixed(2))
+                    : parseFloat((amount * liveRate).toFixed(2));
 
                 const dispatchResult = await this.mtn.initiateTransfer({
                     referenceId,
@@ -382,14 +428,13 @@ class PayoutBatchWorker {
                     continue;
                 }
 
-                // Track remaining liquidity in the active regime's unit.
-                // Authority regime: NO gauge decrement. The dispatched payout's
-                // GHS was already removed from availableGhs at reservation
-                // time; IN_TRANSIT moves reservedGhs → inTransitGhs without
-                // touching availableGhs, so the policy gauge keeps mirroring
-                // FiatLiquidityState.availableGhs for the rest of the batch.
-                // Subtracting amountGhs here would decrement GHS a second time.
-                if (!liquidityAuthorityOn) {
+                // Track remaining liquidity in the row's regime unit.
+                // Authority-recorded rows: NO gauge decrement — the GHS was
+                // already removed from availableGhs at reservation time and
+                // IN_TRANSIT moves reservedGhs → inTransitGhs without
+                // touching availableGhs. Legacy rows keep the historical
+                // USDC pool projection gauge.
+                if (!authorityRecorded) {
                     runningPoolBalance -= amount;
                 }
 
@@ -434,10 +479,13 @@ class PayoutBatchWorker {
 
                 // UNKNOWN provider outcome — leave the withdrawal in PROCESSING
                 // (already claimed above) for the reconciliation worker. The
-                // batch pool gauge treats the funds as in flight, same as a
-                // successful dispatch, so the rest of the batch cannot
-                // over-dispatch the remaining pool headroom.
-                runningPoolBalance -= amount;
+                // batch legacy pool gauge treats the funds as in flight, same
+                // as a successful dispatch, so the rest of the batch cannot
+                // over-dispatch the remaining pool headroom. Authority-
+                // recorded rows have no batch gauge to decrement.
+                if (!authorityRecorded) {
+                    runningPoolBalance -= amount;
+                }
                 results.unknownOutcome.push({
                     id: withdrawal.id,
                     amount,
@@ -454,6 +502,11 @@ class PayoutBatchWorker {
             processed: results.processed.length,
             flagged: results.flaggedManualReview.length,
             unknownOutcome: results.unknownOutcome.length,
+            // poolBalance is the LEGACY SystemFiatPool projection gauge
+            // (USDC), null when no legacy row was processed. It is NOT
+            // authoritative GHS liquidity — under §P.5-D the authority
+            // figure lives in FiatLiquidityState and is never projected
+            // here.
             poolBalance: runningPoolBalance,
             details: isManualTrigger ? results : undefined
         };
