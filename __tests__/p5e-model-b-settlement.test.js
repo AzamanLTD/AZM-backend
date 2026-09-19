@@ -900,6 +900,18 @@ describeOrSkip('§P.5-E Model B settlement / inventory cost-basis realization (r
             await expectFailClosed(d, { quotedUsdc: nudged }, 'MODEL_B_QUOTE_USDC_MISMATCH');
         });
 
+        // audit r4: quotedUsdc is REQUIRED — a fresh settlement can never
+        // omit it and settle on the projected 8dp settledUsdc alone.
+        test('fresh settlement with quotedUsdc: null fails closed — MODEL_B_QUOTE_USDC_MISSING, zero mutation', async () => {
+            const d = await seedDirect();
+            await expectFailClosed(d, { quotedUsdc: null }, 'MODEL_B_QUOTE_USDC_MISSING');
+        });
+
+        test('fresh settlement with quotedUsdc omitted (undefined) fails closed — MODEL_B_QUOTE_USDC_MISSING, zero mutation', async () => {
+            const d = await seedDirect();
+            await expectFailClosed(d, { quotedUsdc: undefined }, 'MODEL_B_QUOTE_USDC_MISSING');
+        });
+
         test('replay with wrong route identity fails closed — zero mutation', async () => {
             const d = await seedReplayed();
             await expectFailClosed(d, { selectedRoute: 'momo-some-other-route' }, 'MODEL_B_ROUTE_MISMATCH');
@@ -920,9 +932,12 @@ describeOrSkip('§P.5-E Model B settlement / inventory cost-basis realization (r
             await expectFailClosed(d, { evidenceDedupKey: 'event:moolre-collection:nonexistent' }, 'MODEL_B_EVIDENCE_MISSING');
         });
 
-        test('replay with a withheld quotedUsdc (null vs committed) fails closed — zero mutation', async () => {
+        test('replay with a withheld quotedUsdc fails closed — MODEL_B_QUOTE_USDC_MISSING, zero mutation', async () => {
+            // audit r4: quotedUsdc is a required authority input for EVERY call —
+            // the missing-argument rejection fires before replay evaluation, so a
+            // withheld value can no longer ride the committed row's fingerprint.
             const d = await seedReplayed();
-            await expectFailClosed(d, { quotedUsdc: null }, 'MODEL_B_SETTLEMENT_CONFLICT');
+            await expectFailClosed(d, { quotedUsdc: null }, 'MODEL_B_QUOTE_USDC_MISSING');
         });
     });
 

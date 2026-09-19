@@ -209,7 +209,7 @@ async function claimInventoryFifo(tx, { reference, settledUsdc }) {
  *   quoteId              consumed TransactionQuote id (UUID)
  *   quotedGhs            quote.amountGhs (exact pesewas)
  *   quotedRateGhsPerUsdc quote.rateGhsPerUsdc (exact 8dp)
- *   quotedUsdc           quote.usdcAmount EXACT (native 12dp persisted authority)
+ *   quotedUsdc           REQUIRED — quote.usdcAmount EXACT (native 12dp authority)
  *   settledGhs           evidence-backed settled GHS (exact pesewas)
  *   settledUsdc          committed TransactionHistory.amountUsdc (exact 8dp)
  *   selectedRoute / routeProviderRail / routePolicyVersion   quote route identity
@@ -254,9 +254,14 @@ async function settleDepositFromInventory(tx, params = {}) {
   // precision stays on the TransactionQuote row; the settlement records it
   // projected at the ledger's 8-decimal authority (HALF_UP, the same
   // rounding PostgreSQL applies storing TransactionHistory.amountUsdc).
-  const quotedUsdcD = quotedUsdc == null
-    ? null
-    : toExactDecimals(quotedUsdc, 'quotedUsdc', 12).toDecimalPlaces(12, Decimal.ROUND_HALF_UP); // 12dp — bounded by half of the 8th decimal
+  // audit r4: quotedUsdc is a REQUIRED authority input for this primitive —
+  // a fresh settlement could otherwise omit it and settle on the projected
+  // 8dp settledUsdc alone. Rejected before any database read or mutation.
+  if (quotedUsdc == null) {
+    throw new ModelBError('MODEL_B_QUOTE_USDC_MISSING',
+      'quotedUsdc is required — it must be the exact persisted TransactionQuote.usdcAmount (native 12dp authority)');
+  }
+  const quotedUsdcD = toExactDecimals(quotedUsdc, 'quotedUsdc', 12).toDecimalPlaces(12, Decimal.ROUND_HALF_UP); // 12dp — bounded by half of the 8th decimal
   const feeD = providerFeeGhs == null ? null : toExactDecimals(providerFeeGhs, 'providerFeeGhs', 2);
 
   // ── service-level authority binding (§P.5-E audit r1) ──────────────────
@@ -327,7 +332,7 @@ async function settleDepositFromInventory(tx, params = {}) {
   // committed-TransactionHistory ledger settlement boundary below.
   const qUsdc12 = new Decimal(q.usdcAmount).toDecimalPlaces(12, Decimal.ROUND_HALF_UP);
   const qUsdc8 = qUsdc12.toDecimalPlaces(8, Decimal.ROUND_HALF_UP);
-  if (quotedUsdcD != null && !quotedUsdcD.equals(qUsdc12)) {
+  if (!quotedUsdcD.equals(qUsdc12)) {
     throw new ModelBError('MODEL_B_QUOTE_USDC_MISMATCH',
       `TransactionQuote ${quoteId} carries ${qUsdc12.toFixed(12)} USDC at its exact 12dp persisted authority, settlement was given ${quotedUsdcD.toFixed(12)}`);
   }

@@ -63,10 +63,13 @@ the PERSISTED authorities:
 - the exact persisted `TransactionQuote` (raw-SQL boundary, exact decimal strings —
   never `Number()` projections): `id`, `userId`, `purpose`, `consumedAt != null`,
   `consumedFor = 'deposit'`, persisted `amountGhs`/`rateGhsPerUsdc` exactly equal the
-  supplied quote economics, the persisted `usdcAmount` equals the supplied
-  `quotedUsdc` EXACTLY at its native 12dp authority (audit r3 — a value that
-  differs only at the 9th–12th decimal fails closed even when its 8dp projection
-  is unchanged), the persisted `usdcAmount` projected once at 8dp HALF_UP equals
+  supplied quote economics, the supplied `quotedUsdc` is REQUIRED (audit r4 —
+  `null`/omitted fails closed `MODEL_B_QUOTE_USDC_MISSING` before any database
+  read or mutation, for fresh calls AND replays alike), the persisted
+  `usdcAmount` equals the supplied `quotedUsdc` EXACTLY at its native 12dp
+  authority (audit r3 — a value that differs only at the 9th–12th decimal
+  fails closed even when its 8dp projection is unchanged), the persisted
+  `usdcAmount` projected once at 8dp HALF_UP equals
   the committed `settledUsdc` (the ledger settlement boundary), and the
   persisted route identity (`selectedRoute`, `routeProviderRail`,
   `routePolicyVersion`) exactly equals the supplied route;
