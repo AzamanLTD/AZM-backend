@@ -9,14 +9,10 @@ const {
   persistTransactionQuote,
   getFreshServerRateGhsPerUsdc,
   RateUnavailableError,
-  QuoteIdentityConflictError,
   consumeTransactionQuote,
 } = require('../src/services/transactionQuoteService');
-const routePolicy = require('../src/services/routePolicyService');
 
-// §P.5-C: rails are owned by the versioned route policy — this set mirrors
-// MOOLRE_MOMO_COLLECTION rails so controller and policy can never drift.
-const MOMO = new Set(routePolicy.DEPOSIT_ROUTES.MOOLRE_MOMO_COLLECTION.rails);
+const MOMO = new Set(['MTN_MOMO', 'TELECEL_CASH', 'VODAFONE_CASH', 'AIRTELTIGO']);
 const NETWORK_MAP = {
   MTN_MOMO: 'MTN',
   TELECEL_CASH: 'TELECEL',
@@ -67,13 +63,6 @@ exports.initiate = async (req, res) => {
     });
 
     const network = NETWORK_MAP[provider];
-    // §P.5-C route-aware quote: this mounted endpoint deterministically
-    // selects MOOLRE_MOMO_COLLECTION and validates the requested rail.
-    const routeIdentity = routePolicy.resolveDepositRoute({ route: 'MOOLRE_MOMO_COLLECTION', provider });
-    // Harness-safe header read: mock reqs in mounted-handler tests may omit
-    // headers entirely; a missing header is simply "no idempotency key".
-    const idempotencyHeader = req.headers && typeof req.headers === 'object' ? req.headers['idempotency-key'] : undefined;
-    const quoteIdentity = typeof idempotencyHeader === 'string' && idempotencyHeader.trim() ? idempotencyHeader.trim() : null;
     const quote = createTransactionQuote({
       id: crypto.randomUUID(),
       userId,
@@ -86,8 +75,6 @@ exports.initiate = async (req, res) => {
       // MOCK-echo or admin-fabricated stamp (issue #271 / PR 271B).
       rateAsOf: rate.rateAsOf,
       ttlSeconds: QUOTE_TTL_SECONDS,
-      routeIdentity,
-      quoteIdentity,
     });
 
     // Return the transaction created in the same transaction that persists the
@@ -116,9 +103,6 @@ exports.initiate = async (req, res) => {
             ratePair: 'USDC/GHS',
             settlementCurrency: 'USDC',
             displayCurrency: 'GHS',
-            selectedRoute: quote.selectedRoute,
-            routeProviderRail: quote.routeProviderRail,
-            routePolicyVersion: quote.routePolicyVersion,
             payerPhone: phoneNumber,
             channel: 'APP',
             ...(memo ? { memo: String(memo) } : {}),
@@ -161,11 +145,6 @@ exports.initiate = async (req, res) => {
         quoteValidUntil: quote.expiresAt,
         provider,
         phoneNumber,
-        // §P.5-C route decision — the response tells the caller exactly which
-        // route + rail their deposit is bound to, and under which policy.
-        selectedRoute: quote.selectedRoute || null,
-        routeProviderRail: quote.routeProviderRail || null,
-        routePolicyVersion: quote.routePolicyVersion || null,
       },
     });
   } catch (err) {
@@ -173,12 +152,6 @@ exports.initiate = async (req, res) => {
     // provider was never contacted.
     if (err instanceof RateUnavailableError) {
       return res.status(503).json({ success: false, message: err.message, code: err.code });
-    }
-    // §P.5-C: a retried initiation under an existing Idempotency-Key fails
-    // closed — the original initiation stands (no second quote or pending
-    // deposit). Closes the middleware response-cache fail-open hole at the DB.
-    if (err instanceof QuoteIdentityConflictError) {
-      return res.status(409).json({ success: false, message: 'This idempotency key is already bound to a deposit initiation.', code: 'DEPOSIT_IDEMPOTENCY_CONFLICT' });
     }
     logger.error({ err }, '[moolreQuoteDeposit] initiation error');
     return res.status(500).json({ success: false, message: 'An unexpected error occurred.' });
@@ -224,14 +197,6 @@ exports.webhook = async (req, res) => {
         purpose: 'deposit',
       });
 
-      // §P.5-C settlement binding: this surface's authenticated provider
-      // identity is the Moolre HMAC. A quote whose selected route may not
-      // settle via Moolre fails closed BEFORE any mutation. Quotes from the
-      // generic aggregator's OTP-confirmed MoMo rails legitimately settle
-      // here (their settlementSurfaces include MOOLRE_WEBHOOK); historical
-      // quotes without a selected route also still settle.
-      routePolicy.assertSettlementRouteAllowed({ quote, settlementSurface: 'MOOLRE_WEBHOOK' });
-
       const quotedGhs = Number(quote.amountGhs);
       if (Math.abs(settledGhs - quotedGhs) > 0.01) {
         throw new Error('Settled GHS amount does not match the transaction quote');
@@ -250,8 +215,6 @@ exports.webhook = async (req, res) => {
             ...(existing.metadata || {}),
             settledAmountGhs: settledGhs,
             settledAt: new Date().toISOString(),
-            settledRoute: quote.selectedRoute || null,
-            settledRoutePolicyVersion: quote.routePolicyVersion || null,
             providerData: data,
           },
         },
@@ -274,7 +237,7 @@ exports.webhook = async (req, res) => {
         userId: existing.userId,
         relatedEntity: 'transactionHistory',
         relatedEntityId: existing.id,
-        metadata: { source: 'moolre', quoteId, amountGhs: settledGhs, selectedRoute: quote.selectedRoute || null, routeProviderRail: quote.routeProviderRail || null },
+        metadata: { source: 'moolre', quoteId, amountGhs: settledGhs },
         lines: [
           { account: 'clearing:conversion', debit: quote.usdcAmount },
           { account: `user:${existing.userId}:liability`, credit: quote.usdcAmount },
