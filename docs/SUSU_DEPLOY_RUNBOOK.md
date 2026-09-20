@@ -102,7 +102,10 @@ Run the Phase-2 API checks against the live host (read-mostly; uses fresh
 fixture accounts):
 
 ```bash
-node test_phase2_apis.js https://azm-backend.onrender.com
+# The ad-hoc root probe (test_phase2_apis.js) was removed in the r15 repo
+# hygiene pass — the authoritative verification is the CI battery plus the
+# real production URL's /health and storefront endpoints.
+curl -fsS https://azm-backend-9o0b.onrender.com/health
 ```
 
 ## Rollback

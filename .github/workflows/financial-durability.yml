@@ -1,0 +1,166 @@
+# Financial-integrity durability lane (r15 audit item 10)
+# =============================================================================
+# The main test battery (test.yml) deliberately tunes its THROWAWAY Postgres
+# with synchronous_commit=off: the TRUNCATE-heavy cleanup hooks make the
+# 236-suite run ~10x slower otherwise, and a disposable CI database has no
+# durability requirement. That is the right call for the fast lane.
+#
+# But it means the main lane does NOT rehearse the commit-durability behavior
+# production PostgreSQL provides (fsync per commit, synchronous_commit=on) on
+# the critical settlement/reconciliation/reversal paths. A settlement that
+# only passes against a relaxed commit mode is not proven against the mode
+# production actually runs.
+#
+# This lane is the focused rehearsal: the SAME suites that prove financial
+# integrity, against a database in the PRODUCTION commit mode. The two lanes
+# serve different purposes and must not be conflated:
+#   - test.yml            → full battery, speed-optimized, relaxed commits
+#   - financial-durability.yml → financial-integrity suites, production commits
+#
+# Lane invariants (guarded below, not just documented):
+#   1. NO synchronous_commit tuning step in this lane.
+#   2. An explicit guard step asserts synchronous_commit=on and FAILS the lane
+#      if the setting has drifted — tuning added "temporarily" is caught here.
+#   3. The suite list is explicit and financial-only; nothing else is run.
+# =============================================================================
+name: financial-durability
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: financial-durability-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  financial-durability:
+    runs-on: ubuntu-latest
+    # The focused financial battery is far smaller than the full one; a slow
+    # runner still only needs a fraction of the main lane's 90-minute budget.
+    timeout-minutes: 45
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: azm_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d azm_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/azm_test?schema=public
+      TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/azm_test?schema=public
+      JWT_SECRET: test_secret_exactly_32_characters_long
+      NODE_ENV: test
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: 'Guard: Postgres must be in production commit mode'
+        # THE lane invariant. The main battery tunes synchronous_commit=off for
+        # speed on its disposable database — that tuning must NEVER leak here.
+        # If this step fails, someone tuned this lane's database: revert it.
+        run: |
+          CONTAINER=$(docker ps --filter "ancestor=postgres:16" --format "{{ .ID }}" | head -1)
+          MODE=$(docker exec "$CONTAINER" psql -U postgres -d azm_test -tAc "SHOW synchronous_commit")
+          echo "synchronous_commit = ${MODE}"
+          if [ "${MODE}" != "on" ]; then
+            echo "::error::This lane must run with synchronous_commit=on (production commit mode). Found: ${MODE}."
+            exit 1
+          fi
+
+      - name: Apply database schema
+        run: npx prisma db push --accept-data-loss
+
+      - name: Install wallet address overlay
+        run: node infra/install-wallet-address-overlay.js
+
+      - name: Install custody execution overlay
+        run: node infra/install-custody-execution-overlay.js
+
+      - name: Install custody accounting overlay
+        run: node infra/install-custody-accounting-overlay.js
+
+      - name: Install transaction quote overlay
+        run: node infra/install-transaction-quote-overlay.js
+
+      - name: Install payout reconciliation infrastructure
+        run: node infra/install-payout-reconciliation-infra.js
+
+      - name: Install fiat liquidity authority overlay
+        run: node infra/install-fiat-liquidity-overlay.js
+
+      - name: Install Model B settlement overlay
+        run: node infra/install-model-b-settlement-overlay.js
+
+      - name: Generate Prisma client
+        run: npx prisma generate
+
+      - name: Financial-integrity suites (production commit mode)
+        # The explicit settlement/reconciliation/reversal set. Every suite here
+        # proves a money-movement invariant that must hold under real commit
+        # durability. Adding a suite to this lane is a deliberate decision —
+        # do not bulk-paste the whole battery here; that is the OTHER lane.
+        # Serial (shared disposable DB, TRUNCATE cleanup) + forceExit (app
+        # bootstrap holds handles open), mirroring the main battery's contract.
+        run: npx jest --runInBand --forceExit \
+          __tests__/p2p-settlement-integrity.test.js \
+          __tests__/azm-auction-settlement-integrity.test.js \
+          __tests__/dine-in-customer-order-settlement.test.js \
+          __tests__/p5e-model-b-settlement.test.js \
+          __tests__/withdrawal-reconciliation-settlement.test.js \
+          __tests__/withdrawal-reconciliation-finance-settlement.test.js \
+          __tests__/withdrawal-reconciliation-terminal-claim.test.js \
+          __tests__/r15a-reconciliation-single-claim.test.js \
+          __tests__/r15h-reconciliation-resolves-through-status-contract.test.js \
+          __tests__/r15c-disbursement-outcome-classification.test.js \
+          __tests__/r15d-withdrawal-outcome-honesty.test.js \
+          __tests__/r15e-providerref-cas.test.js \
+          __tests__/r15f2-evidence-write-transaction-safety.test.js \
+          __tests__/r15g-moolre-status-contract.test.js \
+          __tests__/r15b-moolre-collection-outcomes.test.js \
+          __tests__/payout-unknown-outcome.test.js \
+          __tests__/admin-reconciliation-claims.test.js \
+          __tests__/payment-failover.test.js \
+          __tests__/escrow-flow.test.js \
+          __tests__/escrow-refund-realtime.test.js \
+          __tests__/escrow-dispute-integrity.test.js \
+          __tests__/escrow-convergence.test.js \
+          __tests__/booking-escrow-financial-integrity.test.js \
+          __tests__/azm-conversion-economic-atomicity.test.js \
+          __tests__/azm-stake-economic-atomicity.test.js \
+          __tests__/azm-gift-economic-atomicity.test.js \
+          __tests__/susu-cycle-payout-single-winner.test.js \
+          __tests__/susu-cycle-contribution-atomicity.test.js \
+          __tests__/legacy-susu-economic-atomicity.test.js \
+          __tests__/withdrawal-fee-discount-atomicity.test.js \
+          __tests__/business-invoice-payment-concurrency.test.js
+
+      - name: 'Guard: re-verify commit mode was never relaxed mid-run'
+        run: |
+          CONTAINER=$(docker ps --filter "ancestor=postgres:16" --format "{{ .ID }}" | head -1)
+          MODE=$(docker exec "$CONTAINER" psql -U postgres -d azm_test -tAc "SHOW synchronous_commit")
+          if [ "${MODE}" != "on" ]; then
+            echo "::error::synchronous_commit was relaxed during the run (now: ${MODE}). The durability rehearsal is invalid."
+            exit 1
+          fi
+          echo "Durability rehearsal completed in production commit mode (synchronous_commit=on)."
