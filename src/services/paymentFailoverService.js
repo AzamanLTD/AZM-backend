@@ -75,6 +75,29 @@ class PaymentFailoverService {
     }
 
     async _recordFailure(provider, error) {
+        // ── r15 follow-up (audit P1): health must mean PROVIDER degradation.
+        // A DEFINITIVE_REJECTION or DUPLICATE_REFERENCE proves the provider
+        // is reachable, authenticated and answering authoritatively — the
+        // REQUEST was bad (bad beneficiary number, wrong rail, already-held
+        // reference). Counting those as provider failures lets a few
+        // legitimate customer-level rejections mark a HEALTHY provider
+        // unhealthy and reroute unrelated customers' money. Provider health
+        // counters only accumulate outcomes that indicate the provider
+        // itself failed or degraded: transport errors, 5xx/ambiguous
+        // (UNKNOWN_OUTCOME), NOT_DISPATCHED unreachability, or unclassified
+        // errors (conservatively treated as provider-side).
+        const outcome = error?.providerOutcome || null;
+        const PROVIDER_IS_ANSWERING_WELL
+            = outcome === 'DEFINITIVE_REJECTION' || outcome === 'DUPLICATE_REFERENCE';
+        if (PROVIDER_IS_ANSWERING_WELL) {
+            logger.info({
+                provider,
+                outcome,
+                error: error?.message || 'Unknown error'
+            }, '[PaymentFailover] Request-level rejection — provider answered authoritatively; NOT counted against provider health');
+            return;
+        }
+
         const key = `payment:health:${provider}`;
         const health = await this._getHealthKey(provider);
         health.failures++;
@@ -90,6 +113,7 @@ class PaymentFailoverService {
         logger.warn({
             provider,
             failures: health.failures,
+            outcome,
             error: health.lastError
         }, '[PaymentFailover] Provider failure recorded');
     }

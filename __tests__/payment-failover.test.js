@@ -3,10 +3,11 @@
 
 const { PaymentFailoverService } = require('../src/services/paymentFailoverService');
 
-function makeMockProvider(name, { fail = false, delay = 0 } = {}) {
+function makeMockProvider(name, { fail = false, delay = 0, outcome = 'DEFINITIVE_REJECTION' } = {}) {
     return {
         name,
         _fail: fail,
+        _failOutcome: outcome,
         _delay: delay,
         _calls: [],
         newReferenceId() {
@@ -17,8 +18,14 @@ function makeMockProvider(name, { fail = false, delay = 0 } = {}) {
             if (this._delay) await new Promise(r => setTimeout(r, this._delay));
             if (this._fail) {
                 // r15 R15-C: mock provider failures carry a typed outcome.
+                // DEFAULT is DEFINITIVE_REJECTION (a request-level refusal —
+                // safe to fail over, and since the r15 health fix, NOT
+                // counted against provider health). Provider-level outages
+                // are modeled with NOT_DISPATCHED (nothing reached the
+                // provider), which both fails over safely AND degrades
+                // health — mirroring real transport failures.
                 const err = new Error(`${name} disbursement failed`);
-                err.providerOutcome = 'DEFINITIVE_REJECTION';
+                err.providerOutcome = this._failOutcome;
                 throw err;
             }
             return { referenceId: payload.referenceId, status: 'PENDING', amount: payload.amountGhs };
@@ -173,7 +180,10 @@ describe('PaymentFailoverService', () => {
     });
 
     test('skips unhealthy provider after threshold failures', async () => {
-        const primary = makeMockProvider('moolre', { fail: true });
+        // r15 follow-up: a provider becomes unhealthy through PROVIDER-level
+        // failures (NOT_DISPATCHED — unreachable), NOT through customer-level
+        // DEFINITIVE_REJECTIONs (which no longer count against health).
+        const primary = makeMockProvider('moolre', { fail: true, outcome: 'NOT_DISPATCHED' });
         const secondary = makeMockProvider('mtn');
         const svc = new PaymentFailoverService({ primary, secondary });
 
@@ -232,6 +242,47 @@ describe('PaymentFailoverService', () => {
 
         expect(primaryProbed).toBe(10);
         expect(secondaryUsed).toBe(20);
+    });
+
+    test('r15 follow-up: customer-level DEFINITIVE_REJECTIONs never mark a healthy provider unhealthy', async () => {
+        // A provider answering authoritatively (bad beneficiary number,
+        // wrong rail, insufficient float) is REACHABLE and HEALTHY — three
+        // rejected withdrawals must not reroute other customers' money.
+        const primary = makeMockProvider('moolre', { fail: true }); // DEFINITIVE_REJECTION (default)
+        const secondary = makeMockProvider('mtn');
+        const svc = new PaymentFailoverService({ primary, secondary });
+
+        for (let i = 0; i < 5; i++) {
+            await svc.initiateTransfer({
+                referenceId: `rej-${i}`,
+                amountGhs: 10,
+                recipientPhone: '0244556677',
+            }).catch(() => {}); // all-providers-failed aggregate is fine
+        }
+
+        // Health never degraded: provider is still healthy and still FIRST in
+        // the chain — every subsequent attempt tries it before the secondary.
+        expect(await svc._isHealthy('moolre')).toBe(true);
+        primary._calls = [];
+        await svc.initiateTransfer({ referenceId: 'after', amountGhs: 10, recipientPhone: '0244556677' }).catch(() => {});
+        expect(primary._calls.length).toBe(1); // still tried first — not skipped as unhealthy
+    });
+
+    test('r15 follow-up: UNKNOWN_OUTCOME failures DO degrade provider health (ambiguous provider behavior is degradation)', async () => {
+        const primary = makeMockProvider('moolre', { fail: true, outcome: 'UNKNOWN_OUTCOME' });
+        const secondary = makeMockProvider('mtn');
+        const svc = new PaymentFailoverService({ primary, secondary });
+
+        for (let i = 0; i < 3; i++) {
+            await svc.initiateTransfer({
+                referenceId: `unk-${i}`,
+                amountGhs: 10,
+                recipientPhone: '0244556677',
+            }).catch(() => {}); // blocking outcome — chain stops at primary
+        }
+
+        // 3 ambiguous outcomes → provider marked unhealthy (conservative).
+        expect(await svc._isHealthy('moolre')).toBe(false);
     });
 
     test('health resets after success', async () => {
