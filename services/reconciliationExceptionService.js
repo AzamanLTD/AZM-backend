@@ -58,10 +58,61 @@ const recordReconciliationException = async (prisma, {
 // all. This wrapper NEVER throws (the user-facing response must still be
 // honest and calm), but it ALWAYS escalates the evidence failure loudly
 // and optionally through the caller's admin channel.
-const recordReconciliationExceptionLoud = async (prisma, args, { escalate = null } = {}) => {
+//
+// ── r15 follow-up (audit P0): transaction safety of the swallow ──────────
+// Several call sites pass an INTERACTIVE-TRANSACTION client (tx). A failed
+// SQL statement does not merely throw in JavaScript — PostgreSQL puts the
+// WHOLE transaction into the aborted state, and every subsequent statement
+// fails with 25P02 until rollback. Catching the JS error while the caller's
+// transaction is poisoned would corrupt the financial path that is still
+// running. The evidence write is therefore wrapped in a SAVEPOINT when (and
+// only when) the client is inside a transaction: a failed insert rolls back
+// to the savepoint, restoring the transaction to a usable state, and the
+// financial path continues to its own commit/rollback decision. Outside a
+// transaction (root client, autocommit) each statement is its own implicit
+// transaction — SAVEPOINT would error with 25P01, so we detect that and
+// fall back to a direct attempt whose failure is safe to swallow.
+const EVIDENCE_SAVEPOINT = 'r15_evidence_write';
+const _savepointState = async (prisma) => {
+    // Returns true when a SAVEPOINT was established (client is inside a
+    // transaction); false when the client is autocommit (statement-local).
     try {
-        return await recordReconciliationException(prisma, args);
+        await prisma.$executeRawUnsafe(`SAVEPOINT "${EVIDENCE_SAVEPOINT}"`);
+        return true;
+    } catch (_) {
+        // 25P01 "SAVEPOINT can only be used in transaction blocks" — the
+        // root client runs each statement in its own implicit transaction.
+        return false;
+    }
+};
+const recordReconciliationExceptionLoud = async (prisma, args, { escalate = null } = {}) => {
+    const inTransaction = await _savepointState(prisma);
+    try {
+        const result = await recordReconciliationException(prisma, args);
+        if (inTransaction) {
+            await prisma.$executeRawUnsafe(`RELEASE SAVEPOINT "${EVIDENCE_SAVEPOINT}"`);
+        }
+        return result;
     } catch (err) {
+        if (inTransaction) {
+            // Roll the transaction back to the savepoint so the caller's
+            // (possibly still-in-progress) financial transaction is usable.
+            // The savepoint is then released: the surrounding transaction
+            // continues WITHOUT the aborted evidence write.
+            try {
+                await prisma.$executeRawUnsafe(`ROLLBACK TO SAVEPOINT "${EVIDENCE_SAVEPOINT}"`);
+                await prisma.$executeRawUnsafe(`RELEASE SAVEPOINT "${EVIDENCE_SAVEPOINT}"`);
+            } catch (rollbackErr) {
+                // The surrounding transaction is unusable for reasons beyond
+                // the evidence write (e.g. it was ALREADY aborted upstream).
+                // Escalate the rollback failure too — the caller will fail
+                // on its next statement and its own error path takes over.
+                logger.error({
+                    err: rollbackErr,
+                    marker: 'RECONCILIATION_EVIDENCE_SAVEPOINT_ROLLBACK_FAILED',
+                }, '[reconciliationException] CRITICAL: the evidence-write savepoint rollback failed — the surrounding transaction may be aborted');
+            }
+        }
         logger.error({
             err,
             entityType: args?.entityType ?? null,
