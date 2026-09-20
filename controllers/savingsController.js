@@ -432,43 +432,58 @@ exports.withdraw = async (req, res) => {
     try {
         const userId = req.user.id;
         const { id } = req.params;
-        const { amountGhs } = req.body;
+        const { amountGhs, requestId } = req.body;
 
-        const goal = await prisma.savingsGoal.findFirst({
-            where: { id, userId }
-        });
-
-        if (!goal) {
-            return res.status(404).json({ success: false, message: 'Savings goal not found.' });
-        }
-
-        if (goal.status === 'CANCELLED') {
-            return res.status(400).json({ success: false, message: 'This savings goal has been cancelled.' });
-        }
-
-        const withdrawAmount = amountGhs ? parseFloat(amountGhs) : goal.currentAmountGhs;
-
-        if (withdrawAmount <= 0 || withdrawAmount > goal.currentAmountGhs) {
-            return res.status(400).json({
-                success: false,
-                message: `Cannot withdraw GHS ${withdrawAmount}. Available: GHS ${goal.currentAmountGhs.toFixed(2)}.`
-            });
-        }
-
-        // Check if early withdrawal (penalty applies)
-        const isMatured = goal.endDate ? new Date(goal.endDate) <= new Date() : false;
-        const isEarlyWithdrawal = goal.isLocked && !isMatured;
-        const penaltyRate = isEarlyWithdrawal ? goal.earlyWithdrawalPenalty : 0;
-        const penaltyGhs = parseFloat((withdrawAmount * penaltyRate).toFixed(2));
-        const netWithdrawGhs = withdrawAmount - penaltyGhs;
-
-        // Convert to USDC
-        const settings = await prisma.globalSettings.findUnique({ where: { id: 1 } });
-        const liveRate = settings ? settings.liveUsdToGhs : 15.0;
-        const netUsdc = parseFloat((netWithdrawGhs / liveRate).toFixed(6));
-        const penaltyUsdc = parseFloat((penaltyGhs / liveRate).toFixed(6));
-
+        // r16 P0-E: the goal row is locked FOR UPDATE INSIDE the money
+        // transaction and every amount is derived from that locked
+        // authoritative state. The old code read the goal before the
+        // transaction and computed the withdrawal from that stale snapshot
+        // — two concurrent partial withdrawals could both be validated
+        // against the same currentAmountGhs and both release the same
+        // savings money.
         const result = await prisma.$transaction(async (tx) => {
+            // Durable replay identity: a retried request carrying the same
+            // requestId converges to the already-committed withdrawal
+            // instead of executing twice.
+            const replayHash = requestId
+                ? `SAVINGS_WD_${id}_${String(requestId).slice(0, 64)}`
+                : null;
+            if (replayHash) {
+                const existing = await tx.transactionHistory.findFirst({
+                    where: { txHash: replayHash, userId },
+                });
+                if (existing) {
+                    return { replay: true, txHash: replayHash };
+                }
+            }
+
+            const rows = await tx.$queryRaw`SELECT * FROM "SavingsGoal" WHERE "id" = ${id} AND "userId" = ${userId} FOR UPDATE`;
+            const goal = rows[0];
+            if (!goal) throw new Error('Savings goal not found.');
+
+            if (goal.status === 'CANCELLED') throw new Error('This savings goal has been cancelled.');
+
+            const goalAmount = new Prisma.Decimal(goal.currentAmountGhs);
+            const withdrawAmount = amountGhs ? new Prisma.Decimal(String(amountGhs)) : goalAmount;
+            if (withdrawAmount.lte(0) || withdrawAmount.gt(goalAmount)) {
+                throw new Error(
+                    `Cannot withdraw GHS ${withdrawAmount.toFixed(2)}. Available: GHS ${goalAmount.toFixed(2)}.`
+                );
+            }
+
+            // Check if early withdrawal (penalty applies) — derived from the
+            // locked authoritative row, not the stale pre-transaction read.
+            const isMatured = goal.endDate ? new Date(goal.endDate) <= new Date() : false;
+            const isEarlyWithdrawal = goal.isLocked && !isMatured;
+            const penaltyRate = isEarlyWithdrawal ? Number(goal.earlyWithdrawalPenalty) : 0;
+            const penaltyGhs = withdrawAmount.mul(penaltyRate).toFixed(2);
+            const netWithdrawGhs = withdrawAmount.minus(new Prisma.Decimal(penaltyGhs));
+
+            const settings = await tx.globalSettings.findUnique({ where: { id: 1 } });
+            const liveRate = settings ? Number(settings.liveUsdToGhs) : 15.0;
+            const netUsdc = Number(netWithdrawGhs.div(liveRate).toFixed(6));
+            const penaltyUsdc = Number(new Prisma.Decimal(penaltyGhs).div(liveRate).toFixed(6));
+
             // Credit user's available balance (minus penalty). §P.4: the
             // goal restriction is released for the full net+penalty — the
             // projection escrow column moves with the same money the ledger
@@ -494,27 +509,23 @@ exports.withdraw = async (req, res) => {
                 });
             }
 
-            // Update goal
-            const newAmount = goal.currentAmountGhs - withdrawAmount;
+            // Update goal — computed from the locked row's own amount
+            const newAmount = goalAmount.minus(withdrawAmount);
             const updatedGoal = await tx.savingsGoal.update({
                 where: { id },
                 data: {
-                    currentAmountGhs: Math.max(0, newAmount),
-                    status: newAmount <= 0 ? 'CANCELLED' : goal.status
+                    currentAmountGhs: newAmount.lt(0) ? new Prisma.Decimal(0) : newAmount,
+                    status: newAmount.lte(0) ? 'CANCELLED' : goal.status
                 }
             });
 
-            // Ledger row for the user — credit side. The penalty (if any)
-            // is logged as the feeUsdc field so the runDoubleCheck audit
-            // sees: net inflow = netUsdc, fee = penaltyUsdc, total
-            // sum-effect on availableBalance = netUsdc - 0 = +netUsdc.
             const withdrawHistory = await tx.transactionHistory.create({
                 data: {
                     userId,
                     type: 'INTERNAL_TRANSFER',
                     amountUsdc: netUsdc, // signed: inflow into spendable balance
                     feeUsdc: 0,          // penalty already deducted before crediting
-                    txHash: `SAVINGS_WD_${id}_${Date.now()}`,
+                    txHash: replayHash || `SAVINGS_WD_${id}_${Date.now()}`,
                     status: 'COMPLETED'
                 }
             });
@@ -523,17 +534,13 @@ exports.withdraw = async (req, res) => {
             // transaction, idempotent on the durable TransactionHistory row's
             // own identity (its auto id is the stable key):
             //   D escrow:savings-{goalId}:locked — goal restriction released
-            //       (net + penalty must equal what the goal actually holds;
-            //        any float-rounding residual is absorbed by revenue:fees
-            //        so the posting balances EXACTLY without minting value)
             //   C user:{userId}:liability       — net refund to spendable
             //   C revenue:fees                   — early-withdrawal penalty
             //       realized (mirrors the SystemProfitFees increment above)
             {
                 const grossDebit = new Prisma.Decimal(_exact(netUsdc)).plus(new Prisma.Decimal(_exact(penaltyUsdc)));
-                const residual = new Prisma.Decimal(_exact(grossDebit));
                 const lines = [
-                    { account: `escrow:savings-${id}:locked`, debit: residual.toFixed(8) },
+                    { account: `escrow:savings-${id}:locked`, debit: grossDebit.toFixed(8) },
                     { account: `user:${userId}:liability`, credit: _exact(netUsdc) },
                 ];
                 if (penaltyUsdc > 0) {
@@ -564,30 +571,48 @@ exports.withdraw = async (req, res) => {
                 });
             }
 
-            return { updatedGoal };
+            return {
+                replay: false,
+                updatedGoal,
+                goalName: goal.name,
+                withdrawAmount: Number(withdrawAmount.toFixed(2)),
+                penaltyGhs: Number(penaltyGhs),
+                netWithdrawGhs: Number(netWithdrawGhs.toFixed(2)),
+                netUsdc,
+                isEarlyWithdrawal,
+                penaltyRate
+            };
         });
+
+        if (result.replay) {
+            return res.status(200).json({
+                success: true,
+                message: 'Withdrawal already processed (replay converged).',
+                data: { replay: true, txHash: result.txHash }
+            });
+        }
 
         if (emitBalanceUpdate) await emitBalanceUpdate(userId);
 
         await audit(prisma, {
             actorId: req.user.id, actorName: req.user.username,
-            action: isEarlyWithdrawal ? 'SAVINGS_EARLY_WITHDRAWAL' : 'SAVINGS_WITHDRAWAL',
-            targetType: 'SAVINGSGOAL', targetId: String(goal.id),
-            metadata: { withdrawAmountGhs: withdrawAmount, penaltyGhs }, ipAddress: req.ip,
+            action: result.isEarlyWithdrawal ? 'SAVINGS_EARLY_WITHDRAWAL' : 'SAVINGS_WITHDRAWAL',
+            targetType: 'SAVINGSGOAL', targetId: String(id),
+            metadata: { withdrawAmountGhs: result.withdrawAmount, penaltyGhs: result.penaltyGhs }, ipAddress: req.ip,
         });
 
         return res.status(200).json({
             success: true,
-            message: isEarlyWithdrawal
-                ? `Early withdrawal: GHS ${netWithdrawGhs.toFixed(2)} returned (${(penaltyRate * 100).toFixed(0)}% penalty: GHS ${penaltyGhs.toFixed(2)}).`
-                : `Withdrawn GHS ${netWithdrawGhs.toFixed(2)} from "${goal.name}".`,
+            message: result.isEarlyWithdrawal
+                ? `Early withdrawal: GHS ${result.netWithdrawGhs.toFixed(2)} returned (${(result.penaltyRate * 100).toFixed(0)}% penalty: GHS ${result.penaltyGhs.toFixed(2)}).`
+                : `Withdrawn GHS ${result.netWithdrawGhs.toFixed(2)} from "${result.goalName}".`,
             data: {
-                withdrawnGhs: withdrawAmount,
-                penaltyGhs,
-                netReceivedGhs: netWithdrawGhs,
-                netReceivedUsdc: netUsdc,
-                isEarlyWithdrawal,
-                penaltyRate,
+                withdrawnGhs: result.withdrawAmount,
+                penaltyGhs: result.penaltyGhs,
+                netReceivedGhs: result.netWithdrawGhs,
+                netReceivedUsdc: result.netUsdc,
+                isEarlyWithdrawal: result.isEarlyWithdrawal,
+                penaltyRate: result.penaltyRate,
                 goal: result.updatedGoal
             }
         });
