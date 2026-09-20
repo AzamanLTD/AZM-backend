@@ -1321,6 +1321,13 @@ model Withdrawal {
   payoutMethod   String   @default("BINANCE_ID")
   network        String?
   destination    String   @default("OLD_RECORD")
+  // r15 hardening (audit P0, 2026-09-20): durable link from the
+  // reconciliation record to the canonical TransactionHistory row. Written
+  // by the raw-SQL bridge inside processFiatWithdrawal's reservation
+  // transaction (the column is provisioned by the payout-reconciliation
+  // infra overlay) — a Withdrawal row can never exist without its
+  // canonical row.
+  transactionHistoryId String? @db.VarChar(36)
   totalGasFee    Decimal  @default(0.0) @db.Decimal(20, 8)
   vendorGasShare Decimal  @default(0.0) @db.Decimal(20, 8)
   adminGasShare  Decimal  @default(0.0) @db.Decimal(20, 8)

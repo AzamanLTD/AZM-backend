@@ -168,7 +168,31 @@ exports.fiatWithdrawal = async (req, res) => {
                 // canonical TransactionHistory metadata (payoutProvider) and
                 // the dispatch evidence — the two identities must never be
                 // conflated (r15 follow-up, audit P0).
-                liquidityRoute: { provider: 'MOOLRE_DISBURSEMENT', rail: 'MOMO', destination: phone }
+                liquidityRoute: { provider: 'MOOLRE_DISBURSEMENT', rail: 'MOMO', destination: phone },
+                // r15 hardening (audit P0, 2026-09-20): the Withdrawal
+                // reconciliation record is created INSIDE the authoritative
+                // reservation transaction, durably linked to the canonical
+                // TransactionHistory row via the raw-SQL transactionHistoryId
+                // bridge. Failure rolls back the ENTIRE reservation (no
+                // debit, no canonical row) — the controller can never reach
+                // provider I/O with a committed withdrawal that has no
+                // reconciliation record for the worker to discover.
+                createWithdrawalRecordInTransaction: async (tx, txRecord) => {
+                    const rows = await tx.$queryRawUnsafe(
+                        'INSERT INTO "Withdrawal" ' +
+                        '("userId", "amount", "payoutMethod", "network", "destination", "status", "transactionHistoryId", "createdAt", "updatedAt") ' +
+                        'VALUES ($1, $2, $3, $4, $5, $6, $7, now(), now()) ' +
+                        'RETURNING "id", "userId", "amount", "payoutMethod", "network", "destination", "status"',
+                        userId,
+                        parseFloat(amount),
+                        payoutMethod || 'MTN_MOMO',
+                        'MOMO',
+                        phone,
+                        'PENDING',
+                        txRecord.id
+                    );
+                    return rows?.[0] || null;
+                }
             }
         );
 
@@ -187,26 +211,16 @@ exports.fiatWithdrawal = async (req, res) => {
         // Real-time balance push — user's UI updates while MTN settles async.
         if (emitBalanceUpdate) await emitBalanceUpdate(userId);
 
-        // Step 2 — Persist Withdrawal row for admin visibility / reconciliation.
-        // The Withdrawal model does NOT have a unique idempotency column;
-        // the TransactionHistory.txHash IS the idempotency key. The Withdrawal
-        // row mirrors that for the admin UI.
-        let withdrawalRow = null;
-        try {
-            withdrawalRow = await prisma.withdrawal.create({
-                data: {
-                    userId,
-                    amount:        parseFloat(amount),
-                    payoutMethod:  payoutMethod || 'MTN_MOMO',
-                    network:       'MOMO',
-                    destination:   phone,
-                    status:        'PENDING'
-                }
-            });
-        } catch (rowErr) {
-            // Non-fatal: the canonical record is the TransactionHistory row.
-            logger.warn('[fiatWithdrawal] Withdrawal mirror row insert failed:', rowErr.message);
-        }
+        // Step 2 — the Withdrawal reconciliation record was created INSIDE
+        // the reservation transaction above (r15 hardening, audit P0
+        // 2026-09-20). It is no longer a post-commit best-effort mirror:
+        // a committed withdrawal without a reconciliation worker record is
+        // now structurally impossible — if the record could not be created,
+        // the whole reservation rolled back and provider dispatch never
+        // started. The TransactionHistory.txHash remains the idempotency
+        // key; the row is durably linked to the canonical row through the
+        // transactionHistoryId bridge (no timestamp/amount matching).
+        const withdrawalRow = data.withdrawalRecord || null;
 
         // B-11: notify admins of a large pending withdrawal (fire-and-forget,
         // never blocks the payout). Guarded by the service's own threshold.
@@ -268,6 +282,13 @@ exports.fiatWithdrawal = async (req, res) => {
         }
 
         let dispatch = null;
+        // r15 hardening: the ACTUAL accepting-provider identity is derived
+        // from dispatch facts ONLY (failover tag, then the adapter's own
+        // self-identification) — declared here so the post-dispatch failure
+        // paths in the catch below can name the rail honestly instead of a
+        // hardcoded one.
+        let actualProviderTag = null;
+        let actualProviderName = null;
         try {
             // If initiateTransfer throws, `dispatch` stays null and the catch
             // below reverses the reservation — cash never left. Any failure
@@ -300,17 +321,91 @@ exports.fiatWithdrawal = async (req, res) => {
         // (the observation names the provider that really holds the payout,
         // never a hardcoded rail). Direct (non-failover) adapters without a
         // _provider tag keep their historical evidence identity.
-        const actualProviderTag = dispatch?._provider || null;
-        const actualProviderName = canonicalProviderName(actualProviderTag) || 'MTN_MOMO';
-        try {
-            if (actualProviderTag) {
-                await persistPayoutOwnership(prisma, {
-                    reference,
+        // r15 hardening (audit P0, 2026-09-20): derive the ACTUAL accepting
+        // provider's identity from dispatch facts ONLY — never a hardcoded
+        // rail fallback.
+        //   - the failover tag (dispatch._provider) is the authority,
+        //     mapped to the canonical adapter identity
+        //   - the accepting adapter's own self-identification
+        //     (dispatch.provider — both adapters report it and the failover
+        //     spreads it) is the direct-adapter identity
+        //   - NO tag and NO adapter identity is FAIL-CLOSED: writing
+        //     evidence or ownership under an invented rail would defeat the
+        //     ownership system, so the payout is parked loudly instead.
+        actualProviderTag = dispatch?._provider || null;
+        const tagCanonicalName = actualProviderTag ? canonicalProviderName(actualProviderTag) : null;
+        actualProviderName = tagCanonicalName
+            || (dispatch?.provider ? String(dispatch.provider).toUpperCase() : null);
+
+        if (!actualProviderName) {
+            logger.error({ reference },
+                '[fiatWithdrawal] CRITICAL: accepted dispatch carries NO provider identity — parking, never guessing a rail');
+            await recordReconciliationExceptionLoud(prisma, {
+                entityType: 'TRANSACTION',
+                entityId: reference,
+                reference,
+                reason: 'DISPATCH_IDENTITY_UNKNOWN',
+                details: { dispatched: true, error: 'no failover tag and no adapter identity on an accepted dispatch' },
+            }, {
+                escalate: async () => {
+                    if (io) io.emit('admin_alert', {
+                        type: 'WITHDRAWAL_DISPATCH_IDENTITY_UNKNOWN',
+                        reference,
+                        timestamp: new Date().toISOString(),
+                    });
+                }
+            });
+            return res.status(503).json({
+                success: false,
+                message: 'Withdrawal dispatched but the accepting provider could not be identified. The payout is in flight; support has been alerted. Do not retry.'
+            });
+        }
+
+        if (tagCanonicalName && dispatch?.provider
+                && String(dispatch.provider).toUpperCase() !== tagCanonicalName) {
+            // The failover tag and the adapter's self-identification
+            // disagree about who holds the money. Never guess which one is
+            // right — park for operator review (no refund: the payout is
+            // in flight on ONE of them).
+            logger.error({ reference, tagCanonicalName, selfIdentified: dispatch.provider },
+                '[fiatWithdrawal] CRITICAL: dispatch identity contradiction — parking, never guessing a rail');
+            await recordReconciliationExceptionLoud(prisma, {
+                entityType: 'TRANSACTION',
+                entityId: reference,
+                reference,
+                reason: 'DISPATCH_IDENTITY_CONTRADICTION',
+                details: {
+                    dispatched: true,
                     failoverTag: actualProviderTag,
-                    intendedProvider: 'MOOLRE_DISBURSEMENT',
-                    providerRef: dispatch?.data?.reference || dispatch?.providerRef || null,
-                });
-            }
+                    tagCanonicalName,
+                    selfIdentifiedProvider: String(dispatch.provider),
+                },
+            }, {
+                escalate: async () => {
+                    if (io) io.emit('admin_alert', {
+                        type: 'WITHDRAWAL_DISPATCH_IDENTITY_CONTRADICTION',
+                        reference,
+                        timestamp: new Date().toISOString(),
+                    });
+                }
+            });
+            return res.status(503).json({
+                success: false,
+                message: 'Withdrawal dispatched but the accepting provider identity is contradictory. The payout is in flight; support has been alerted. Do not retry.'
+            });
+        }
+
+        // r15 hardening (audit P0, 2026-09-20): ORDERED post-dispatch
+        // bookkeeping. The durable dispatch observation is written FIRST —
+        // it is the fallback authority reconciliation uses to recover the
+        // owner when the canonical ownership write fails AFTER the provider
+        // already accepted the money. The ownership write is fail-closed
+        // (missing canonical row / conflicting durable owner both throw)
+        // but its failure no longer erases the identity evidence: the
+        // dispatch observation names the owner, reconciliation resolves
+        // the identity from that evidence, and the failure stays loudly
+        // visible as an exception row.
+        try {
             await fiatLiquidity.recordProviderEvent(prisma, {
                 provider: actualProviderName,
                 rail: 'MOMO',
@@ -322,19 +417,20 @@ exports.fiatWithdrawal = async (req, res) => {
                 relatedReference: reference,
                 raw: { externalId: reference, recipientPhone: phone, actualProvider: actualProviderTag },
             });
-            await fiatLiquidity.inTransitIfRecorded(prisma, {
-                reference,
-                providerRef: dispatch?.data?.reference || dispatch?.providerRef || null,
-            });
-        } catch (bookkeepingErr) {
-            logger.error({ err: bookkeepingErr, reference },
-                '[fiatWithdrawal] CRITICAL: §P.5-D post-dispatch evidence/IN_TRANSIT failed — NOT auto-refunding a dispatched payout');
+        } catch (evidenceErr) {
+            // The dispatch observation IS the fallback owner authority. Its
+            // failure is a hard park: no refund (the provider has the
+            // money), the reservation stays held, and the DURABLE exception
+            // below is what stops reconciliation from cross-rail guessing
+            // on a dispatch whose owner bookkeeping failed entirely.
+            logger.error({ err: evidenceErr, reference },
+                '[fiatWithdrawal] CRITICAL: §P.5-D post-dispatch dispatch evidence failed — NOT auto-refunding a dispatched payout');
             await recordReconciliationExceptionLoud(prisma, {
                 entityType: 'TRANSACTION',
                 entityId: reference,
                 reference,
                 reason: 'POST_DISPATCH_BOOKKEEPING_FAILED',
-                details: { provider: actualProviderName, error: bookkeepingErr.message },
+                details: { stage: 'DISPATCH_EVIDENCE', provider: actualProviderName, error: evidenceErr.message },
             }, {
                 escalate: async () => {
                     if (io) io.emit('admin_alert', {
@@ -342,6 +438,82 @@ exports.fiatWithdrawal = async (req, res) => {
                         timestamp: new Date().toISOString(),
                     });
                 }
+            });
+            return res.status(503).json({
+                success: false,
+                message: 'Withdrawal dispatched but a bookkeeping step failed. The payout is in flight; support has been alerted. Do not retry.'
+            });
+        }
+
+        if (actualProviderTag) {
+            try {
+                await persistPayoutOwnership(prisma, {
+                    reference,
+                    failoverTag: actualProviderTag,
+                    intendedProvider: 'MOOLRE_DISBURSEMENT',
+                    providerRef: dispatch?.data?.reference || dispatch?.providerRef || null,
+                });
+            } catch (ownershipErr) {
+                // The canonical ownership write failed AFTER acceptance.
+                // The dispatch observation above durably names the owner,
+                // so reconciliation recovers the identity from evidence
+                // (resolvePayoutOwner) and the payout stays protected —
+                // no refund, lifecycle continues, and the failure stays
+                // loudly visible as an exception row + admin alert.
+                logger.error({ err: ownershipErr, reference, code: ownershipErr.code },
+                    '[fiatWithdrawal] CRITICAL: canonical payout ownership write failed after dispatch acceptance — evidence retains the owner, NOT refunding');
+                await recordReconciliationExceptionLoud(prisma, {
+                    entityType: 'TRANSACTION',
+                    entityId: reference,
+                    reference,
+                    reason: 'POST_DISPATCH_OWNERSHIP_WRITE_FAILED',
+                    details: {
+                        provider: actualProviderName,
+                        failoverTag: actualProviderTag,
+                        code: ownershipErr.code || null,
+                        error: ownershipErr.message,
+                    },
+                }, {
+                    escalate: async () => {
+                        if (io) io.emit('admin_alert', {
+                            type: 'WITHDRAWAL_OWNERSHIP_WRITE_FAILED',
+                            reference,
+                            provider: actualProviderName,
+                            timestamp: new Date().toISOString(),
+                        });
+                    }
+                });
+            }
+        }
+
+        try {
+            await fiatLiquidity.inTransitIfRecorded(prisma, {
+                reference,
+                providerRef: dispatch?.data?.reference || dispatch?.providerRef || null,
+            });
+        } catch (inTransitErr) {
+            // The reservation must be moved to IN_TRANSIT for the §P.5-D
+            // settlement state machine; failure leaves it RESERVED (held,
+            // not spendable) — park loudly, never refund an in-flight payout.
+            logger.error({ err: inTransitErr, reference },
+                '[fiatWithdrawal] CRITICAL: §P.5-D post-dispatch IN_TRANSIT transition failed — NOT auto-refunding a dispatched payout');
+            await recordReconciliationExceptionLoud(prisma, {
+                entityType: 'TRANSACTION',
+                entityId: reference,
+                reference,
+                reason: 'POST_DISPATCH_BOOKKEEPING_FAILED',
+                details: { stage: 'IN_TRANSIT', provider: actualProviderName, error: inTransitErr.message },
+            }, {
+                escalate: async () => {
+                    if (io) io.emit('admin_alert', {
+                        type: 'RECONCILIATION_EVIDENCE_WRITE_FAILED',
+                        timestamp: new Date().toISOString(),
+                    });
+                }
+            });
+            return res.status(503).json({
+                success: false,
+                message: 'Withdrawal dispatched but a bookkeeping step failed. The payout is in flight; support has been alerted. Do not retry.'
             });
         }
 
@@ -428,7 +600,7 @@ exports.fiatWithdrawal = async (req, res) => {
                     entityId: reference,
                     reference,
                     reason: 'POST_DISPATCH_FAILURE_NO_REFUND',
-                    details: { provider: 'MTN_MOMO', error: mtnErr.message, dispatched: true },
+                    details: { provider: actualProviderName || null, error: mtnErr.message, dispatched: true },
                 }, {
                 escalate: async () => {
                     if (io) io.emit('admin_alert', {
@@ -470,7 +642,11 @@ exports.fiatWithdrawal = async (req, res) => {
                     entityId: reference,
                     reference,
                     reason: 'DISPATCH_OUTCOME_UNKNOWN_NO_REFUND',
-                    details: { provider: 'MTN_MOMO', outcome: dispatchOutcome || 'UNCLASSIFIED', error: mtnErr.message },
+                    // The throwing rail is the failover chain as a whole —
+                    // WHICH rail took the request is exactly what is unknown
+                    // here, so the label is honest about that (r15 hardening:
+                    // never assert a rail identity the system does not have).
+                    details: { provider: 'DISBURSEMENT_FAILOVER', outcome: dispatchOutcome || 'UNCLASSIFIED', error: mtnErr.message },
                 }, {
                 escalate: async () => {
                     if (io) io.emit('admin_alert', {
@@ -598,6 +774,18 @@ exports.fiatWithdrawal = async (req, res) => {
                 success: false,
                 message: 'Withdrawal frozen: Ledger inconsistency detected. Your request has been flagged for review.',
                 data:    { status: 'FROZEN_DISPUTE' }
+            });
+        }
+
+        // r15 hardening (audit P0, 2026-09-20): the reconciliation record
+        // could not be established — the ENTIRE reservation rolled back
+        // BEFORE any provider I/O (no debit, no canonical row). A
+        // server-side failure must not masquerade as a client error.
+        if (error.code === 'WITHDRAWAL_RECORD_CREATION_FAILED') {
+            return res.status(503).json({
+                success: false,
+                code:   'WITHDRAWAL_RECORD_CREATION_FAILED',
+                message: 'The withdrawal could not be recorded. Nothing was deducted and no payout was sent. Please try again or contact support.'
             });
         }
 

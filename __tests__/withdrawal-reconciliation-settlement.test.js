@@ -29,13 +29,22 @@ describe('WithdrawalReconciliationWorker settlement lifecycle', () => {
   };
 
   const attemptDb = (transactionHistoryId = 'tx-1') => ({
-    $queryRawUnsafe: jest.fn().mockResolvedValue([{
-      id: transactionHistoryId,
-      transactionHistoryId,
-      provider: 'MTN_MOMO_DISBURSEMENT',
-      providerReference: transactionHistoryId === 'tx-2' ? 'ref-2' : 'ref-1',
-      status: 'PENDING',
-    }]),
+    // r15 hardening: the worker now also consults the durable exception
+    // queue (ReconciliationException) before a legacy no-hint search —
+    // route the raw mocks by SQL text so the attempt queries keep their
+    // fixtures while the guard query sees an empty exception queue.
+    $queryRawUnsafe: jest.fn().mockImplementation(async (sql) => {
+      if (typeof sql === 'string' && sql.includes('ReconciliationException')) {
+        return [];
+      }
+      return [{
+        id: transactionHistoryId,
+        transactionHistoryId,
+        provider: 'MTN_MOMO_DISBURSEMENT',
+        providerReference: transactionHistoryId === 'tx-2' ? 'ref-2' : 'ref-1',
+        status: 'PENDING',
+      }];
+    }),
     $executeRawUnsafe: jest.fn().mockResolvedValue(1),
   });
 
@@ -63,6 +72,9 @@ describe('WithdrawalReconciliationWorker settlement lifecycle', () => {
         }),
         findMany: jest.fn(),
         updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+      },
+      fiatProviderEvent: {
+        findMany: jest.fn().mockResolvedValue([]),
       },
       withdrawal: {
         updateMany: jest.fn().mockResolvedValue({ count: 1 }),
@@ -118,6 +130,9 @@ describe('WithdrawalReconciliationWorker settlement lifecycle', () => {
         }),
         findMany: jest.fn(),
         updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+      },
+      fiatProviderEvent: {
+        findMany: jest.fn().mockResolvedValue([]),
       },
       withdrawal: {
         updateMany: jest.fn().mockResolvedValue({ count: 1 }),

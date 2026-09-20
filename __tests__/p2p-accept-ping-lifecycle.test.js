@@ -16,7 +16,7 @@ describeOrSkip('P2P accept-ping lifecycle integrity (real PostgreSQL)', () => {
 
     afterEach(async () => {
         await prisma.$executeRawUnsafe(
-            'TRUNCATE TABLE "User", "Trade", "Ad", "TransactionHistory", "AdminProfitLog", "SystemProfitFees", "AuditLog" RESTART IDENTITY CASCADE'
+            'TRUNCATE TABLE "User", "Trade", "Ad", "TransactionHistory", "AdminProfitLog", "SystemProfitFees", "AuditLog", "LedgerTransaction", "LedgerAccount", "JournalEntry" RESTART IDENTITY CASCADE'
         );
     }, 15000);
 

@@ -12,7 +12,7 @@
 const logger = require('../src/config/logger');
 const financeService = require('../services/finance.service');
 const { recordProviderSettlementAttempt } = require('../services/providerSettlementAttemptService');
-const { readPayoutOwner } = require('../services/payoutProviderOwnership');
+const { resolvePayoutOwner } = require('../services/payoutProviderOwnership');
 const fiatLiquidity = require('../src/services/fiatLiquidityService'); // §P.5-D
 const { recordReconciliationException } = require('../services/reconciliationExceptionService');
 
@@ -190,17 +190,68 @@ class WithdrawalReconciliationWorker {
 
         const reference = txRow.txHash;
 
-        // r15 follow-up (audit P0): the canonical row carries the ACTUAL
-        // provider that accepted this dispatch (metadata.payoutProvider,
-        // written at dispatch acceptance). A known owner is authoritative for
-        // this payout: the status query goes to the OWNER ONLY — the
+        // r15 follow-up (audit P0) + hardening (2026-09-20): resolve the
+        // durable owner from ALL authoritative evidence, most-authoritative
+        // first: canonical metadata (payoutProvider), then the unique durable
+        // dispatch observation (FiatProviderEvent) — the recovery path for a
+        // dispatch whose canonical ownership write failed AFTER the provider
+        // accepted the money. A known owner is authoritative for this
+        // payout: the status query goes to the OWNER ONLY — the
         // PaymentFailoverService honors the hint and never falls through to
         // another rail (a healthy secondary cannot know what the owner did,
         // so its answer may never settle or reverse this provider's payout).
-        // Legacy rows without persisted ownership (owner === null) keep the
-        // no-hint cross-provider status search, which is correct for
-        // genuinely-unknown ownership.
-        const payoutOwner = readPayoutOwner(txRow);
+        const ownership = await resolvePayoutOwner(this.prisma, txRow);
+
+        if (ownership.status === 'CONFLICT') {
+            // Two different providers hold durable owner evidence for one
+            // reference — NEVER pick one. Park for operator review.
+            logger.error({ reference, owners: ownership.owners },
+                '[WithdrawalReconciliation] OWNERSHIP CONFLICT: multiple durable owner records — parking for operator review');
+            await this._recordException(
+                withdrawal,
+                'PAYOUT_OWNERSHIP_CONFLICT',
+                { reference, owners: ownership.owners },
+                reference
+            );
+            return;
+        }
+
+        const payoutOwner = ownership.owner || null;
+
+        if (ownership.status === 'UNKNOWN') {
+            // No owner evidence at all. Before falling back to the legacy
+            // no-hint cross-provider search (correct for GENUINELY-unknown
+            // ownership — e.g. pre-r15 legacy rows that never dispatched
+            // through evidence-tagged bookkeeping), check the durable
+            // exception queue: if this dispatch was ACCEPTED but its owner
+            // bookkeeping failed (evidence + ownership writes) or its
+            // accepting identity could never be determined (identity
+            // unknown / contradictory), the owner exists but is not
+            // durably recoverable — cross-rail guessing is
+            // exactly what the ownership system forbids. Park instead.
+            // ReconciliationException is a raw-SQL entity (no Prisma model).
+            const bookkeepingFailures = await this.prisma.$queryRawUnsafe(
+                'SELECT "reason" FROM "ReconciliationException" ' +
+                'WHERE "reference" = $1 AND "reason" IN (\'POST_DISPATCH_BOOKKEEPING_FAILED\', \'POST_DISPATCH_OWNERSHIP_WRITE_FAILED\', \'DISPATCH_IDENTITY_UNKNOWN\', \'DISPATCH_IDENTITY_CONTRADICTION\') ' +
+                'ORDER BY "firstSeenAt" DESC LIMIT 1',
+                reference
+            );
+            const bookkeepingFailure = bookkeepingFailures?.[0] || null;
+            if (bookkeepingFailure) {
+                logger.error({ reference, exceptionReason: bookkeepingFailure.reason },
+                    '[WithdrawalReconciliation] dispatch was accepted but its owner bookkeeping failed durably — NEVER cross-rail guessing, parking');
+                await this._recordException(
+                    withdrawal,
+                    'DISPATCHED_OWNERSHIP_NOT_DURABLE',
+                    { reference, bookkeepingFailureReason: bookkeepingFailure.reason },
+                    reference
+                );
+                return;
+            }
+            // Genuinely unknown ownership (legacy row, no dispatch evidence,
+            // no bookkeeping failure): the no-hint cross-provider status
+            // search below remains correct.
+        }
 
         let statusResp;
         try {
@@ -219,11 +270,31 @@ class WithdrawalReconciliationWorker {
         const remoteStatus = String((statusResp && statusResp.status) || 'PENDING').toUpperCase();
         const providerRef = statusResp?.providerRef || statusResp?.referenceId || statusResp?.transactionId || statusResp?.txId || null;
 
-        // The provider identity carried into durable evidence: the status
-        // answer's own provider field first, then the persisted owner
-        // identity, then the legacy poll default. This is the ACTUAL
-        // provider for this payout — never a hardcoded rail name.
-        const evidenceProvider = statusResp?.provider || payoutOwner?.canonicalName || 'DISBURSEMENT_POLL';
+        // r15 hardening: a KNOWN owner is authoritative — the status
+        // answer's own self-identification may never override it. If the
+        // answering adapter names a DIFFERENT provider than the durable
+        // owner, that is a contradiction, not new information: park for
+        // operator review (never settle or reverse on a self-identified
+        // identity that disputes the owner record).
+        const statusSelfIdentified = statusResp?.provider ? String(statusResp.provider).toUpperCase() : null;
+        const ownerCanonicalName = payoutOwner?.canonicalName || null;
+        if (statusSelfIdentified && ownerCanonicalName && statusSelfIdentified !== ownerCanonicalName) {
+            logger.error({ reference, ownerCanonicalName, statusSelfIdentified },
+                '[WithdrawalReconciliation] provider self-identification CONTRADICTS the durable owner — parking for operator review');
+            await this._recordException(
+                withdrawal,
+                'OWNER_SELF_IDENTIFICATION_CONTRADICTION',
+                { reference, ownerCanonicalName, statusSelfIdentified, observedStatus: remoteStatus },
+                reference
+            );
+            return;
+        }
+
+        // The provider identity carried into durable evidence: the durable
+        // owner identity first (authoritative), then the status answer's own
+        // provider field (ownerless legacy search — the answering adapter
+        // identifies itself), then the legacy poll default.
+        const evidenceProvider = ownerCanonicalName || statusSelfIdentified || 'DISBURSEMENT_POLL';
 
         // §P.5-D OUTBOUND EVIDENCE: the provider's own status answer is a raw
         // provider observation — retained durably like every other, including
@@ -282,7 +353,7 @@ class WithdrawalReconciliationWorker {
 
         await recordProviderSettlementAttempt(this.prisma, {
             reference,
-            provider: statusResp?.provider || payoutOwner?.canonicalName || 'DISBURSEMENT',
+            provider: payoutOwner?.canonicalName || statusResp?.provider || 'DISBURSEMENT',
             providerReference: reference,
             providerTransactionId: providerRef,
             status: ['SUCCESSFUL', 'COMPLETED'].includes(remoteStatus)

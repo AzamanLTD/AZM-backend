@@ -29,6 +29,7 @@ const {
     failoverTagFromCanonical,
     readPayoutOwner,
     persistPayoutOwnership,
+    resolvePayoutOwner,
     TAG_TO_CANONICAL,
     CANONICAL_TO_TAG,
 } = require('../services/payoutProviderOwnership');
@@ -131,10 +132,142 @@ describe('r15 follow-up P0: payout provider ownership — identity mapping and c
             .rejects.toThrow(/failoverTag is required/);
     });
 
-    test('persistPayoutOwnership: zero rows updated is a warned no-op, not an exception (post-dispatch bookkeeping must not throw as if the dispatch failed)', async () => {
-        const prisma = { $executeRawUnsafe: async () => 0 };
-        const res = await persistPayoutOwnership(prisma, { reference: 'GONE-REF', failoverTag: 'moolre' });
+    // r15 hardening (audit P0 2026-09-20): on an ACCEPTED dispatch, zero rows
+    // updated is NEVER a harmless warn — every zero-row case fails closed or
+    // resolves as a provable idempotent replay.
+    test('persistPayoutOwnership: FAILS CLOSED when no canonical row carries the reference (never a warn)', async () => {
+        const prisma = {
+            $executeRawUnsafe: async () => 0,
+            $queryRawUnsafe: async () => [],
+        };
+        await expect(persistPayoutOwnership(prisma, { reference: 'GONE-REF', failoverTag: 'moolre' }))
+            .rejects.toMatchObject({ code: 'OWNERSHIP_PERSIST_FAILED' });
+    });
+
+    test('persistPayoutOwnership: FAILS CLOSED when the canonical row is terminal without recorded ownership', async () => {
+        const prisma = {
+            $executeRawUnsafe: async () => 0,
+            $queryRawUnsafe: async () => [{ id: 'tx-1', status: 'COMPLETED', owner: null }],
+        };
+        await expect(persistPayoutOwnership(prisma, { reference: 'DONE-REF', failoverTag: 'mtn' }))
+            .rejects.toMatchObject({ code: 'OWNERSHIP_PERSIST_FAILED' });
+    });
+
+    test('persistPayoutOwnership: same-owner replay is an idempotent success (settlement raced the bookkeeping)', async () => {
+        const prisma = {
+            $executeRawUnsafe: async () => 0,
+            $queryRawUnsafe: async () => [{ id: 'tx-1', status: 'COMPLETED', owner: 'mtn' }],
+        };
+        const res = await persistPayoutOwnership(prisma, { reference: 'REPLAY-REF', failoverTag: 'mtn' });
         expect(res.rowsUpdated).toBe(0);
+        expect(res.idempotent).toBe(true);
+        expect(res.owner).toEqual({ tag: 'mtn', canonicalName: 'MTN_MOMO_DISBURSEMENT' });
+    });
+
+    test('persistPayoutOwnership: a DIFFERENT durable owner FAILS CLOSED first-writer-wins — the first owner survives, a conflict record is appended, and OwnershipConflictError is thrown', async () => {
+        const statements = [];
+        const prisma = {
+            $executeRawUnsafe: async (sql, ...args) => {
+                statements.push({ sql, args });
+                return 0; // guarded write refused: a different owner is present
+            },
+            $queryRawUnsafe: async () => [{ id: 'tx-1', status: 'PENDING', owner: 'moolre' }],
+        };
+        const promise = persistPayoutOwnership(prisma, {
+            reference: 'CLASH-REF',
+            failoverTag: 'mtn',
+            providerRef: '77',
+        });
+        await expect(promise).rejects.toMatchObject({ code: 'OWNERSHIP_CONFLICT' });
+
+        // The ONLY write attempt after the refusal is the conflict-record
+        // append — the ownership keys were never overwritten.
+        expect(statements).toHaveLength(2);
+        expect(statements[0].sql).toContain(`'payoutProvider' = $3`);
+        expect(statements[1].sql).toContain('payoutProviderConflicts');
+        const conflictEntries = JSON.parse(statements[1].args[0]);
+        expect(conflictEntries[0]).toMatchObject({
+            requestedTag: 'mtn',
+            requestedProvider: 'MTN_MOMO_DISBURSEMENT',
+            recordedOwner: 'moolre',
+        });
+    });
+
+    test('persistPayoutOwnership: the guarded first write is single-statement and conflict-safe (unowned or same-owner only)', async () => {
+        const statements = [];
+        const prisma = {
+            $executeRawUnsafe: async (sql, ...args) => {
+                statements.push({ sql, args });
+                return 1;
+            },
+        };
+        await persistPayoutOwnership(prisma, { reference: 'FIRST-REF', failoverTag: 'moolre' });
+        expect(statements).toHaveLength(1);
+        // The ownership patch may ONLY land on an unowned row or a row owned
+        // by the SAME provider — never last-writer-wins.
+        expect(statements[0].sql).toContain(`->>'payoutProvider' IS NULL`);
+        expect(statements[0].sql).toContain(`->>'payoutProvider' = $3`);
+        expect(statements[0].args[2]).toBe('moolre');
+    });
+
+    // ── resolvePayoutOwner: ownership resolution with evidence recovery ────
+    test('resolvePayoutOwner: canonical metadata wins (OWNED); no evidence query needed', async () => {
+        const prisma = { fiatProviderEvent: { findMany: jest.fn() } };
+        const res = await resolvePayoutOwner(prisma, { txHash: 'R1', metadata: { payoutProvider: 'mtn' } });
+        expect(res).toEqual({ status: 'OWNED', owner: { tag: 'mtn', canonicalName: 'MTN_MOMO_DISBURSEMENT' } });
+        expect(prisma.fiatProviderEvent.findMany).not.toHaveBeenCalled();
+    });
+
+    test('resolvePayoutOwner: RECOVERED from a single unique durable dispatch observation (canonical write failed)', async () => {
+        const prisma = {
+            fiatProviderEvent: {
+                findMany: async () => [
+                    { provider: 'MTN_MOMO_DISBURSEMENT', dedupKey: 'event:payout-dispatch:MTN_MOMO_DISBURSEMENT:R2' },
+                ],
+            },
+        };
+        const res = await resolvePayoutOwner(prisma, { txHash: 'R2', metadata: {} });
+        expect(res).toEqual({ status: 'RECOVERED', owner: { tag: 'mtn', canonicalName: 'MTN_MOMO_DISBURSEMENT' } });
+    });
+
+    test('resolvePayoutOwner: CONFLICT — two different providers hold dispatch evidence for one reference; NEVER guess', async () => {
+        const prisma = {
+            fiatProviderEvent: {
+                findMany: async () => [
+                    { provider: 'MOOLRE_DISBURSEMENT', dedupKey: 'event:payout-dispatch:MOOLRE_DISBURSEMENT:R3' },
+                    { provider: 'MTN_MOMO_DISBURSEMENT', dedupKey: 'event:payout-dispatch:MTN_MOMO_DISBURSEMENT:R3' },
+                ],
+            },
+        };
+        const res = await resolvePayoutOwner(prisma, { txHash: 'R3', metadata: null });
+        expect(res.status).toBe('CONFLICT');
+        expect(res.owners.map(o => o.canonicalName).sort()).toEqual(['MOOLRE_DISBURSEMENT', 'MTN_MOMO_DISBURSEMENT']);
+    });
+
+    test('resolvePayoutOwner: UNKNOWN when neither metadata nor admissible evidence exists (legacy cross-rail search)', async () => {
+        const queries = [];
+        const prisma = {
+            fiatProviderEvent: {
+                // The DB filter is what excludes non-dispatch observations
+                // (status polls, treasury events) and non-canonical provider
+                // names; this mock records the filter and models its result.
+                findMany: async (args) => {
+                    queries.push(args);
+                    return [];
+                },
+            },
+        };
+        const res = await resolvePayoutOwner(prisma, { txHash: 'R4' });
+        expect(res).toEqual({ status: 'UNKNOWN' });
+        expect(queries).toHaveLength(1);
+        expect(queries[0].where.dedupKey.startsWith).toBe('event:payout-dispatch:');
+        expect(queries[0].where.direction).toBe('OUTBOUND');
+        expect([...queries[0].where.provider.in]).toEqual(['MOOLRE_DISBURSEMENT', 'MTN_MOMO_DISBURSEMENT']);
+    });
+
+    test('resolvePayoutOwner: no reference — UNKNOWN', async () => {
+        const prisma = { fiatProviderEvent: { findMany: jest.fn() } };
+        expect(await resolvePayoutOwner(prisma, {})).toEqual({ status: 'UNKNOWN' });
     });
 });
 

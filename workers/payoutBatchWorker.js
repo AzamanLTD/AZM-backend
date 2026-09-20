@@ -47,6 +47,7 @@ const { Prisma } = require('@prisma/client');
 const logger = require('../src/config/logger');
 const fiatLiquidity = require('../src/services/fiatLiquidityService'); // §P.5-D
 const { canonicalProviderName, persistPayoutOwnership } = require('../services/payoutProviderOwnership');
+const { recordReconciliationException } = require('../services/reconciliationExceptionService');
 
 const DEFAULT_INTERVAL_MS = 120_000;  // 2 minutes
 const MAX_BATCH_SIZE      = 25;       // Don't overwhelm the provider in one tick
@@ -408,17 +409,58 @@ class PayoutBatchWorker {
                 // (payoutProvider) so the reconciliation worker queries the
                 // OWNER rail only, and the evidence records name the real
                 // provider, never a hardcoded rail.
+                // r15 hardening (audit P0, 2026-09-20): derive the ACTUAL
+                // accepting provider's identity from dispatch facts ONLY —
+                // never a hardcoded rail fallback. The failover tag is the
+                // authority; the accepting adapter's own self-identification
+                // (dispatchResult.provider — both adapters report it) is the
+                // direct-adapter identity. NO identity at all is FAIL-CLOSED.
                 const actualProviderTag = dispatchResult?._provider || null;
-                const actualProviderName = canonicalProviderName(actualProviderTag) || 'MTN_MOMO';
+                const tagCanonicalName = actualProviderTag ? canonicalProviderName(actualProviderTag) : null;
+                const actualProviderName = tagCanonicalName
+                    || (dispatchResult?.provider ? String(dispatchResult.provider).toUpperCase() : null);
+
+                if (!actualProviderName) {
+                    logger.error({ referenceId, withdrawalId: withdrawal.id },
+                        '[payoutBatchWorker] CRITICAL: accepted dispatch carries NO provider identity — parking, never guessing a rail');
+                    await this._flagForManualReview(withdrawal, 'DISPATCH_IDENTITY_UNKNOWN', {
+                        amount, referenceId,
+                        message: 'Auto-payout dispatched but the accepting provider identity could not be determined — manual review required.'
+                    });
+                    await this._recordDurableException(withdrawal, 'DISPATCH_IDENTITY_UNKNOWN', {
+                        dispatched: true,
+                        referenceId,
+                        message: 'accepted dispatch carries no provider identity',
+                    });
+                    results.errors.push({ id: withdrawal.id, reason: 'DISPATCH_IDENTITY_UNKNOWN', referenceId });
+                    continue;
+                }
+
+                if (tagCanonicalName && dispatchResult?.provider
+                        && String(dispatchResult.provider).toUpperCase() !== tagCanonicalName) {
+                    logger.error({ referenceId, withdrawalId: withdrawal.id, tagCanonicalName, selfIdentified: dispatchResult.provider },
+                        '[payoutBatchWorker] CRITICAL: dispatch identity contradiction — parking, never guessing a rail');
+                    await this._flagForManualReview(withdrawal, 'DISPATCH_IDENTITY_CONTRADICTION', {
+                        amount, referenceId,
+                        message: 'Auto-payout dispatched but the accepting provider identity is contradictory — manual review required.'
+                    });
+                    await this._recordDurableException(withdrawal, 'DISPATCH_IDENTITY_CONTRADICTION', {
+                        dispatched: true,
+                        referenceId,
+                        failoverTag: actualProviderTag,
+                        tagCanonicalName,
+                        selfIdentifiedProvider: dispatchResult?.provider ? String(dispatchResult.provider) : null,
+                    });
+                    results.errors.push({ id: withdrawal.id, reason: 'DISPATCH_IDENTITY_CONTRADICTION', referenceId });
+                    continue;
+                }
+
+                // r15 hardening (audit P0, 2026-09-20): ORDERED post-dispatch
+                // bookkeeping. The durable dispatch observation is written
+                // FIRST — it is the fallback authority reconciliation uses to
+                // recover the owner when the canonical ownership write fails
+                // after the provider already accepted the money.
                 try {
-                    if (actualProviderTag) {
-                        await persistPayoutOwnership(this.prisma, {
-                            reference: referenceId,
-                            failoverTag: actualProviderTag,
-                            intendedProvider: 'MOOLRE_DISBURSEMENT',
-                            providerRef: dispatchResult?.data?.reference || dispatchResult?.providerRef || null,
-                        });
-                    }
                     await fiatLiquidity.recordProviderEvent(this.prisma, {
                         provider: actualProviderName,
                         rail: 'MOMO',
@@ -430,17 +472,85 @@ class PayoutBatchWorker {
                         relatedReference: referenceId,
                         raw: { externalId: `auto_payout_${withdrawal.id}`, recipientPhone, network: withdrawal.network || 'MTN', actualProvider: actualProviderTag },
                     });
+                } catch (evidenceErr) {
+                    // The dispatch observation IS the fallback owner
+                    // authority; its failure leaves no durable owner
+                    // knowledge. Park for manual review — the payout is in
+                    // flight, so NEVER auto-refund.
+                    logger.error({ err: evidenceErr, referenceId },
+                        '[payoutBatchWorker] §P.5-D post-dispatch dispatch evidence failed — flagging for manual review (NO auto-refund after a real dispatch)');
+                    await this._flagForManualReview(withdrawal, 'POST_DISPATCH_BOOKKEEPING_FAILED', {
+                        amount,
+                        referenceId,
+                        error: evidenceErr.message
+                    });
+                    await this._recordDurableException(withdrawal, 'POST_DISPATCH_BOOKKEEPING_FAILED', {
+                        stage: 'DISPATCH_EVIDENCE',
+                        provider: actualProviderName,
+                        referenceId,
+                        error: evidenceErr.message,
+                    });
+                    results.errors.push({ id: withdrawal.id, reason: 'POST_DISPATCH_BOOKKEEPING_FAILED', referenceId });
+                    continue;
+                }
+
+                if (actualProviderTag) {
+                    try {
+                        await persistPayoutOwnership(this.prisma, {
+                            reference: referenceId,
+                            failoverTag: actualProviderTag,
+                            intendedProvider: 'MOOLRE_DISBURSEMENT',
+                            providerRef: dispatchResult?.data?.reference || dispatchResult?.providerRef || null,
+                        });
+                    } catch (ownershipErr) {
+                        // The canonical ownership write failed AFTER the
+                        // provider accepted. The dispatch observation above
+                        // durably names the owner, so reconciliation recovers
+                        // the identity from evidence and the payout stays
+                        // protected. Keep the withdrawal scannable (NO
+                        // NEEDS_MANUAL_REVIEW flag — that would strand it
+                        // from auto-recovery); record the failure loudly as
+                        // a durable exception row instead.
+                        logger.error({ err: ownershipErr, referenceId, code: ownershipErr.code },
+                            '[payoutBatchWorker] canonical payout ownership write failed after dispatch acceptance — evidence retains the owner, NOT flagging out of auto-recovery');
+                        try {
+                            await recordReconciliationException(this.prisma, {
+                                entityType: 'WITHDRAWAL',
+                                entityId: String(withdrawal.id),
+                                reference: referenceId,
+                                reason: 'POST_DISPATCH_OWNERSHIP_WRITE_FAILED',
+                                details: {
+                                    provider: actualProviderName,
+                                    failoverTag: actualProviderTag,
+                                    code: ownershipErr.code || null,
+                                    error: ownershipErr.message,
+                                },
+                            });
+                        } catch (excErr) {
+                            logger.error({ err: excErr, referenceId },
+                                '[payoutBatchWorker] failed to record the ownership-write-failure exception');
+                        }
+                    }
+                }
+
+                try {
                     await fiatLiquidity.inTransitIfRecorded(this.prisma, {
                         reference: referenceId,
                         providerRef: dispatchResult?.data?.reference || dispatchResult?.providerRef || null,
                     });
-                } catch (bookkeepingErr) {
-                    logger.error({ err: bookkeepingErr, referenceId },
-                        '[payoutBatchWorker] §P.5-D post-dispatch bookkeeping failed — flagging for manual review (NO auto-refund after a real dispatch)');
+                } catch (inTransitErr) {
+                    logger.error({ err: inTransitErr, referenceId },
+                        '[payoutBatchWorker] §P.5-D post-dispatch IN_TRANSIT transition failed — flagging for manual review (NO auto-refund after a real dispatch)');
                     await this._flagForManualReview(withdrawal, 'POST_DISPATCH_BOOKKEEPING_FAILED', {
                         amount,
                         referenceId,
-                        error: bookkeepingErr.message
+                        error: inTransitErr.message
+                    });
+                    await this._recordDurableException(withdrawal, 'POST_DISPATCH_BOOKKEEPING_FAILED', {
+                        stage: 'IN_TRANSIT',
+                        provider: actualProviderName,
+                        referenceId,
+                        error: inTransitErr.message,
                     });
                     results.errors.push({ id: withdrawal.id, reason: 'POST_DISPATCH_BOOKKEEPING_FAILED', referenceId });
                     continue;
@@ -554,6 +664,26 @@ class PayoutBatchWorker {
         }
 
         return summary;
+    }
+
+    // r15 hardening: record the durable exception row that the
+    // reconciliation worker's ownership guard reads to refuse cross-rail
+    // guessing on a dispatched payout whose owner bookkeeping failed.
+    // Best effort — the NEEDS_MANUAL_REVIEW flag from _flagForManualReview
+    // keeps the payout parked even if this write fails.
+    async _recordDurableException(withdrawal, reason, details = {}) {
+        try {
+            await recordReconciliationException(this.prisma, {
+                entityType: 'WITHDRAWAL',
+                entityId: String(withdrawal.id),
+                reference: details.referenceId || null,
+                reason,
+                details,
+            });
+        } catch (excErr) {
+            logger.error({ err: excErr, reason },
+                '[payoutBatchWorker] failed to record the durable reconciliation exception');
+        }
     }
 
     async _flagForManualReview(withdrawal, reason, metadata = {}) {

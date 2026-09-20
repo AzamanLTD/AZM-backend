@@ -19,7 +19,7 @@ describe('PayoutBatchWorker canonical withdrawal transaction', () => {
     };
 
     test('atomically claims before dispatching with canonical reference and network', async () => {
-        const initiateTransfer = jest.fn().mockResolvedValue({ status: 'ACCEPTED' });
+        const initiateTransfer = jest.fn().mockResolvedValue({ _provider: 'mtn', provider: 'MTN_MOMO_DISBURSEMENT', status: 'ACCEPTED' });
         const withdrawalUpdate = jest.fn().mockResolvedValue({});
         const withdrawalUpdateMany = jest.fn().mockResolvedValue({ count: 1 });
         const txCreate = jest.fn();

@@ -240,6 +240,30 @@ const processFiatWithdrawal = async (prisma, userId, amountFloat, opts = {}) => 
             }
         });
 
+        // r15 hardening (audit P0, 2026-09-20): the Withdrawal reconciliation
+        // record is created INSIDE the same authoritative transaction as the
+        // customer debit, the fiat-pool reservation and the canonical
+        // TransactionHistory row — a committed fiat withdrawal can never
+        // exist without a reconciliation worker record to discover it. If the
+        // callback throws, the WHOLE reservation rolls back: no debit, no
+        // canonical row, no provider I/O. The controller therefore cannot
+        // reach provider dispatch with a financially-committed withdrawal
+        // that has no reconciliation record.
+        let withdrawalRecord = null;
+        if (typeof opts.createWithdrawalRecordInTransaction === 'function') {
+            try {
+                withdrawalRecord = await opts.createWithdrawalRecordInTransaction(tx, txRecord);
+            } catch (recordErr) {
+                // r15 hardening: surface the reservation-record failure
+                // distinctly — the ENTIRE reservation rolled back (no
+                // debit, no canonical row, no provider I/O) and the client
+                // must be told this is a server-side failure, not a
+                // bad-request.
+                recordErr.code = 'WITHDRAWAL_RECORD_CREATION_FAILED';
+                throw recordErr;
+            }
+        }
+
         // §P.5-D authority reservation (flag ON): linked to the committed
         // TransactionHistory row. Conflicting reuse of the reference fails
         // closed; insufficient GHS rolls the whole transaction back.
@@ -298,6 +322,7 @@ const processFiatWithdrawal = async (prisma, userId, amountFloat, opts = {}) => 
         return {
             user: updatedUser,
             txRecord,
+            withdrawalRecord,
             profitFees,
             fiatPool: updatedFiatPool,
             masterCrypto,
@@ -327,6 +352,7 @@ const processFiatWithdrawal = async (prisma, userId, amountFloat, opts = {}) => 
         systemMasterCrypto: result.masterCrypto.balance,
         arbitrageCapture: amountFloat,
         transaction: result.txRecord,
+        withdrawalRecord: result.withdrawalRecord,
         fiatPoolLow: result.fiatPool.balance < FIAT_POOL_ALERT_THRESH,
         fiatPoolBalance: result.fiatPool.balance,
         azmFeeDiscount: result.azmFeeDiscount
