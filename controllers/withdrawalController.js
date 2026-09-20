@@ -281,6 +281,37 @@ exports.fiatWithdrawal = async (req, res) => {
             });
         }
 
+        // r16 P0-C: durable DISPATCH_INTENT evidence written BEFORE any
+        // provider I/O. Admin rejection (and any future reversal path) treats
+        // ANY outbound evidence for this reference — intent included — as
+        // "dispatch may be in flight" and fails closed: cash position unknown
+        // means no auto-refund, ever. If this intent write fails, we do NOT
+        // start the provider I/O (a dispatch that cannot be proven would be
+        // exactly the unprovable state the reject path must refuse).
+        try {
+            await fiatLiquidity.recordProviderEvent(prisma, {
+                provider: 'AZM_DISPATCHER',
+                rail: 'MOMO',
+                direction: 'OUTBOUND',
+                status: 'DISPATCH_INTENT',
+                dedupKey: `event:payout-dispatch-intent:${reference}`,
+                amountGhs: data.payoutGhs || data.withdrawalAmount || null,
+                relatedReference: reference,
+                raw: { externalId: reference, recipientPhone: phone, stage: 'PRE_PROVIDER_IO' },
+            });
+        } catch (intentErr) {
+            logger.error({ err: intentErr, reference },
+                '[fiatWithdrawal] dispatch-intent evidence failed — NOT starting provider I/O');
+            await financeService.reverseFiatWithdrawal(prisma, reference, {
+                reason: 'dispatch_intent_evidence_failed'
+            });
+            if (emitBalanceUpdate) await emitBalanceUpdate(userId);
+            return res.status(503).json({
+                success: false,
+                message: 'Payout gateway could not be engaged safely. Your balance has been restored.'
+            });
+        }
+
         let dispatch = null;
         // r15 hardening: the ACTUAL accepting-provider identity is derived
         // from dispatch facts ONLY (failover tag, then the adapter's own
