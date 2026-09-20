@@ -30,7 +30,11 @@
 //     explicitly-manual operation identity, allowed to coexist with the
 //     scheduled occurrence it did NOT consume;
 //   • crash recovery (r16c): a run left PENDING longer than STALE_PENDING_MS
-//     is re-driven by recoverStalePendingRuns(). TRANSFER / SAVINGS / VAULT
+//     is re-driven by recoverStalePendingRuns(). Before ANY of that, the
+//     MoMo executor claims a single-winner EXECUTION lease on the run row
+//     (PENDING -> EXECUTING): a concurrent recovery of the same run loses
+//     the lease and defers to the owner; a crashed owner is re-leased by
+//     the stale sweep. TRANSFER / SAVINGS / VAULT
 //     runs finalize INSIDE the money transaction — a stale PENDING row of
 //     those kinds guarantees nothing committed, so re-driving is exactly-once
 //     safe. MoMo runs commit the canonical fiat reservation in its OWN
@@ -230,7 +234,16 @@ class SmartRouteService {
     async recoverStalePendingRuns({ staleMs = STALE_PENDING_MS, take = 20 } = {}) {
         const cutoff = new Date(Date.now() - staleMs);
         const stale = await this.prisma.smartRouteRun.findMany({
-            where: { status: 'PENDING', createdAt: { lt: cutoff } },
+            where: {
+                OR: [
+                    // Never dispatched (or dispatched by a legacy run).
+                    { status: 'PENDING', createdAt: { lt: cutoff } },
+                    // r16c: claimed by an execution lease whose owner crashed
+                    // mid-flight — the lease is re-acquired below and the
+                    // canonical re-entry converges (resume / park).
+                    { status: 'EXECUTING', updatedAt: { lt: cutoff } },
+                ],
+            },
             orderBy: { createdAt: 'asc' },
             take,
         });
@@ -406,6 +419,19 @@ class SmartRouteService {
         // txHash instead of reserving the money twice.
         const reference = `SRWD_${run.id}`;
 
+        // ── r16c P0-B: single-winner EXECUTION lease ─────────────────────
+        // Claim the run row BEFORE any reservation or provider-relevant
+        // state. A concurrent recovery of the same run loses the lease and
+        // defers — the lease owner alone drives the payout and finalizes
+        // honestly. Without this, two recoveries could race the canonical
+        // reservation (unique-violation chaos) or the dispatch claim.
+        const leased = await this._claimRunExecutionLease(run, new Date(Date.now() - STALE_PENDING_MS));
+        if (!leased) {
+            logger.info({ runId: run.id, routeId: route.id },
+                '[SmartRoute] run execution lease held elsewhere — deferring to the lease owner');
+            return await this.prisma.smartRouteRun.findUnique({ where: { id: run.id } });
+        }
+
         // ── r16c P0-B: idempotent re-entry / crash convergence ────────────
         // A stale-PENDING recovery re-drive must converge on the existing
         // canonical state instead of re-reserving the money.
@@ -504,6 +530,31 @@ class SmartRouteService {
             await this._notifySuccess(route, amount, `Routed $${amount.toFixed(2)} to MoMo ${route.destMomoNumber}`);
         }
         return refreshed;
+    }
+
+    /**
+     * r16c P0-B: single-winner execution lease on the run row.
+     * PENDING -> EXECUTING for a fresh drive; an EXECUTING row past the
+     * stale cutoff is re-leased (its owner crashed mid-flight) by refreshing
+     * updatedAt — two re-leases cannot both see the row as stale. Anything
+     * else (terminal / parked) is never touched.
+     */
+    async _claimRunExecutionLease(run, staleCutoff) {
+        if (run.status === 'PENDING') {
+            const claim = await this.prisma.smartRouteRun.updateMany({
+                where: { id: run.id, status: 'PENDING' },
+                data: { status: 'EXECUTING' },
+            });
+            return claim.count === 1;
+        }
+        if (run.status === 'EXECUTING') {
+            const claim = await this.prisma.smartRouteRun.updateMany({
+                where: { id: run.id, status: 'EXECUTING', updatedAt: { lt: staleCutoff } },
+                data: { updatedAt: new Date() },
+            });
+            return claim.count === 1;
+        }
+        return false;
     }
 
     /**
@@ -951,7 +1002,9 @@ class SmartRouteService {
      */
     async _finalizeRunInTx(tx, run, route, occurrenceBased, occurrenceBase, status, failureReason, extras = {}) {
         const finalize = await tx.smartRouteRun.updateMany({
-            where: { id: run.id, status: 'PENDING' },
+            // PENDING: non-MoMo executors and pre-lease failure paths.
+            // EXECUTING: the r16c execution-lease owner finalizing its run.
+            where: { id: run.id, status: { in: ['PENDING', 'EXECUTING'] } },
             data: {
                 status,
                 amountGhs: extras.amountGhs != null ? new Prisma.Decimal(extras.amountGhs) : null,

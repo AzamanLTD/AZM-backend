@@ -582,6 +582,13 @@ enum SmartRouteFrequency {
 
 enum SmartRouteRunStatus {
   PENDING
+  // r16c P0-B: single-winner EXECUTION lease. MoMo runs claim the run row
+  // (PENDING -> EXECUTING) before the canonical reservation; a concurrent
+  // recovery of the same run loses the lease and defers — the lease owner
+  // alone finalizes honestly. A crashed lease owner is re-leased by the
+  // stale sweep (updatedAt past the stale cutoff) and converges through
+  // the idempotent canonical re-entry.
+  EXECUTING
   SUCCESS
   FAILED_INSUFFICIENT
   FAILED_GATEWAY
