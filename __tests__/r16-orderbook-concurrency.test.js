@@ -171,14 +171,20 @@ describeOrSkip('r16 P0-F: Order Book concurrency', () => {
         const totalTraded = trades.reduce((s, t) => s + parseFloat(t.quantity.toString()), 0);
         expect(totalTraded).toBeLessThanOrEqual(100);
 
-        // AZM conservation: seller's AZM (decremented at placement) must
-        // equal traded quantity + cancelled refund, NEVER more.
+        // AZM conservation: every resting unit settles EXACTLY once — it
+        // is either traded (delivered to the buyer) or refunded to the
+        // seller at cancel. Never both, never neither.
         const freshSeller = await prisma.user.findUnique({ where: { id: seller.id } });
+        const freshBuyer = await prisma.user.findUnique({ where: { id: buyer.id } });
         const resting = await prisma.orderBookOrder.findUnique({ where: { id: orderId } });
         const remaining = parseFloat(resting.remainingQuantity.toString());
-        expect(Number(freshSeller.azmBalance)).toBeCloseTo(remaining, 5);
+        const refunded = Number(freshSeller.azmBalance); // seller started at 0 post-placement
 
-        // Terminal states are mutually consistent.
+        expect(totalTraded + refunded).toBeCloseTo(100, 5);
+        expect(Number(freshBuyer.azmBalance)).toBeCloseTo(totalTraded, 5);
+
+        // Terminal states are mutually consistent: a CANCELLED order must
+        // have zero quantity still attached.
         expect(['FILLED', 'PARTIALLY_FILLED', 'CANCELLED']).toContain(resting.status);
         if (resting.status === 'CANCELLED') expect(remaining).toBe(0);
         expect(cancelOutcome.status).toBe('fulfilled');

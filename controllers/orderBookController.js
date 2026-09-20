@@ -609,10 +609,16 @@ async function cancelOrder(req, res) {
       // the row to CANCELLED with the taker's quantity still attached:
       // both the taker and the canceller were paid for the same quantity.
       // UPDATE ... RETURNING captures the exact remaining at claim time.
+      // The locked CTE captures the pre-cancel remaining (RETURNING a
+      // subselect column, not the post-update row) so the refund and the
+      // terminal state stay one atomic statement — a CANCELLED order must
+      // never leave quantity attached (the old claim left
+      // remainingQuantity dangling on the cancelled row).
       const rows = await tx.$queryRawUnsafe(
-        'UPDATE "OrderBookOrder" SET "status" = \'CANCELLED\', "updatedAt" = now() ' +
-        'WHERE "id" = $1 AND "status" IN (\'OPEN\', \'PARTIALLY_FILLED\') ' +
-        'RETURNING "remainingQuantity", "price"',
+        'UPDATE "OrderBookOrder" o SET "status" = \'CANCELLED\', "remainingQuantity" = 0, "updatedAt" = now() ' +
+        'FROM (SELECT "remainingQuantity" AS rem, "price" FROM "OrderBookOrder" ' +
+        'WHERE "id" = $1 AND "status" IN (\'OPEN\', \'PARTIALLY_FILLED\') FOR UPDATE) prev ' +
+        'WHERE o."id" = $1 RETURNING prev.rem AS "remainingQuantity", prev."price"',
         orderId
       );
       const claimed = rows?.[0];
