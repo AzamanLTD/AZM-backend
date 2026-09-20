@@ -46,7 +46,9 @@ describeOrSkip('r16 P0-F: Order Book concurrency', () => {
     const mkRes = () => {
         const res = {};
         res.status = (code) => { res.statusCode = code; return res; };
-        res.json = (payload) => { res.payload = payload; return res; };
+        // Express defaults to 200 when a handler responds via res.json alone
+        // (the order-book success path does exactly that).
+        res.json = (payload) => { res.statusCode = res.statusCode || 200; res.payload = payload; return res; };
         return res;
     };
 
@@ -157,13 +159,11 @@ describeOrSkip('r16 P0-F: Order Book concurrency', () => {
 
         const buyer = await seedUser(prisma, { availableBalance: 500, azmBalance: 0 });
         // Match and cancel race against the same resting row.
-        const [, cancelRes] = await Promise.allSettled([
+        const cancelRes = mkRes();
+        cancelRes.params = { id: orderId };
+        const [, cancelOutcome] = await Promise.allSettled([
             place(buyer, { side: 'BUY', type: 'LIMIT', price: 2, quantity: 50 }),
-            (async () => {
-                const res = mkRes();
-                await controller.cancelOrder(mkReq(seller, {}), { ...res, params: { id: orderId } });
-                return res;
-            })(),
+            controller.cancelOrder(mkReq(seller, {}), cancelRes),
         ]);
 
         const trades = await prisma.orderBookTrade.findMany();
@@ -180,6 +180,6 @@ describeOrSkip('r16 P0-F: Order Book concurrency', () => {
         // Terminal states are mutually consistent.
         expect(['FILLED', 'PARTIALLY_FILLED', 'CANCELLED']).toContain(resting.status);
         if (resting.status === 'CANCELLED') expect(remaining).toBe(0);
-        expect(cancelRes.status).toBe('fulfilled');
+        expect(cancelOutcome.status).toBe('fulfilled');
     });
 });

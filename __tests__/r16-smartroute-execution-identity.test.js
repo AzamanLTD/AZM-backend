@@ -152,7 +152,6 @@ describeOrSkip('r16 P0-A: Smart Route execution identity', () => {
                 amountUsdc: 10,
                 executionKey: `${route.id}:occ:${route.nextRunAt.toISOString()}`,
                 createdAt: staleCreatedAt,
-                updatedAt: staleCreatedAt,
             },
         });
 

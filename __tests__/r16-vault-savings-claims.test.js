@@ -47,14 +47,23 @@ describeOrSkip('r16 P0-D: Vault terminal claims', () => {
     }, 15000);
 
     async function seedVaultWithBalance(userId, balance) {
+        // createVault validates that maturityDate is in the FUTURE — seed a
+        // future maturity, then flip the row to already-matured (mimicking
+        // time passing) so completeMatured sees a due vault.
         const vault = await vaultSvc.createVault({
             userId,
             name: 'Race Vault',
             targetAmountUsdc: 1000,
-            maturityDate: new Date(Date.now() - 1000).toISOString(), // ALREADY matured
+            maturityDate: new Date(Date.now() + 90 * 86400000).toISOString(),
             earlyBreakPenaltyPct: 0.05,
         });
-        await prisma.vault.update({ where: { id: vault.id }, data: { currentAmountUsdc: balance } });
+        await prisma.vault.update({
+            where: { id: vault.id },
+            data: {
+                currentAmountUsdc: balance,
+                maturityDate: new Date(Date.now() - 1000),
+            },
+        });
         return prisma.vault.findUnique({ where: { id: vault.id } });
     }
 
@@ -222,6 +231,6 @@ describeOrSkip('r16 P0-E: Savings withdrawal atomic claim', () => {
 
         const freshUser = await prisma.user.findUnique({ where: { id: user.id } });
         expect(Number(freshUser.availableBalance)).toBeCloseTo(50 / 15, 5);
-        expect(freshUser.availableBalance.toString()).not.toBeCloseTo(2 * (50 / 15));
+        expect(Number(freshUser.availableBalance)).not.toBeCloseTo(2 * (50 / 15), 5);
     });
 });

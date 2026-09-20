@@ -99,7 +99,7 @@ describeOrSkip('r16 P0-C: Admin rejection canonical-state safety', () => {
     }
 
     test('1: pre-dispatch rejection refunds once through the canonical reversal', async () => {
-        const admin = await seedUser(prisma, { role: 'admin' });
+        const admin = await seedUser(prisma, { role: 'ADMIN' });
         const user = await seedUser(prisma, { availableBalance: 200 });
         const { withdrawal, reference } = await seedCanonicalWithdrawal(user, 50);
 
@@ -128,7 +128,7 @@ describeOrSkip('r16 P0-C: Admin rejection canonical-state safety', () => {
     });
 
     test('2: rejection after dispatch-intent evidence fails closed (409)', async () => {
-        const admin = await seedUser(prisma, { role: 'admin' });
+        const admin = await seedUser(prisma, { role: 'ADMIN' });
         const user = await seedUser(prisma, { availableBalance: 200 });
         const { withdrawal, reference } = await seedCanonicalWithdrawal(user, 50);
 
@@ -155,7 +155,7 @@ describeOrSkip('r16 P0-C: Admin rejection canonical-state safety', () => {
     });
 
     test('3: rejection after canonical settlement fails closed (409)', async () => {
-        const admin = await seedUser(prisma, { role: 'admin' });
+        const admin = await seedUser(prisma, { role: 'ADMIN' });
         const user = await seedUser(prisma, { availableBalance: 200 });
         const { withdrawal, reference } = await seedCanonicalWithdrawal(user, 50);
 
@@ -174,8 +174,8 @@ describeOrSkip('r16 P0-C: Admin rejection canonical-state safety', () => {
     });
 
     test('4: concurrent rejections refund exactly once', async () => {
-        const admin1 = await seedUser(prisma, { role: 'admin' });
-        const admin2 = await seedUser(prisma, { role: 'admin' });
+        const admin1 = await seedUser(prisma, { role: 'ADMIN' });
+        const admin2 = await seedUser(prisma, { role: 'ADMIN' });
         const user = await seedUser(prisma, { availableBalance: 200 });
         const { withdrawal } = await seedCanonicalWithdrawal(user, 50);
 

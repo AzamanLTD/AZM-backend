@@ -241,6 +241,37 @@ class SmartRouteService {
      * { skipped, reason } when no new execution may start.
      */
     async _claimExecution(routeId, manual) {
+        // r16 P0-A: the claim is one transaction, but a unique-key collision
+        // ABORTS that transaction (Postgres 25P02) — the collision outcome is
+        // resolved OUTSIDE it on a fresh connection, never by querying the
+        // poisoned transaction.
+        try {
+            return await this._claimExecutionTransaction(routeId, manual);
+        } catch (e) {
+            const uniqueViolation = e?.code === 'P2002'
+                || /unique constraint|duplicate key/i.test(String(e?.message || ''));
+            if (!uniqueViolation) throw e;
+
+            const route = await this.prisma.smartRoute.findUnique({ where: { id: routeId } });
+            if (!route) throw new Error('Route not found');
+            const now = new Date();
+            const due = route.nextRunAt <= now;
+            if (!due) {
+                // The winner already consumed the occurrence (it advanced
+                // nextRunAt) — nothing is due from this caller's view.
+                return { skipped: true, reason: 'Execution already claimed' };
+            }
+            const executionKey = `${route.id}:occ:${route.nextRunAt.toISOString()}`;
+            const existing = await this.prisma.smartRouteRun.findUnique({ where: { executionKey } });
+            const staleAt = new Date(Date.now() - STALE_PENDING_MS);
+            if (existing && existing.status === 'PENDING' && existing.createdAt < staleAt) {
+                return { run: existing, route, occurrenceBased: true, occurrenceBase: route.nextRunAt, recovery: true };
+            }
+            return { skipped: true, reason: 'Execution already claimed', run: existing || undefined };
+        }
+    }
+
+    async _claimExecutionTransaction(routeId, manual) {
         return this.prisma.$transaction(async (tx) => {
             const route = await tx.smartRoute.findUnique({ where: { id: routeId } });
             if (!route) throw new Error('Route not found');
@@ -275,35 +306,18 @@ class SmartRouteService {
                 return { skipped: true, reason: 'Not due' };
             }
 
-            try {
-                const run = await tx.smartRouteRun.create({
-                    data: {
-                        routeId: route.id,
-                        userId: route.userId,
-                        status: 'PENDING',
-                        amountUsdc: route.amountUsdc,
-                        executionKey,
-                    },
-                });
-                return { run, route, occurrenceBased, occurrenceBase: route.nextRunAt };
-            } catch (e) {
-                const uniqueViolation = e?.code === 'P2002'
-                    || /unique constraint|duplicate key/i.test(String(e?.message || ''));
-                if (!uniqueViolation) throw e;
-
-                // r16 P0-A crash recovery: the occurrence was already
-                // claimed. If the earlier claimant died before committing
-                // its financial transaction (run still PENDING and stale),
-                // THIS claimant takes over the same execution identity —
-                // exactly-once is preserved because the original finalize
-                // was in-transaction with the money that never committed.
-                const existing = await tx.smartRouteRun.findUnique({ where: { executionKey } });
-                const staleAt = new Date(Date.now() - STALE_PENDING_MS);
-                if (existing && existing.status === 'PENDING' && existing.createdAt < staleAt) {
-                    return { run: existing, route, occurrenceBased, occurrenceBase: route.nextRunAt, recovery: true };
-                }
-                return { skipped: true, reason: 'Execution already claimed', run: existing || undefined };
-            }
+            // A unique-key violation here rejects the WHOLE transaction —
+            // the collision is resolved by the caller on a fresh connection.
+            const run = await tx.smartRouteRun.create({
+                data: {
+                    routeId: route.id,
+                    userId: route.userId,
+                    status: 'PENDING',
+                    amountUsdc: route.amountUsdc,
+                    executionKey,
+                },
+            });
+            return { run, route, occurrenceBased, occurrenceBase: route.nextRunAt };
         });
     }
 

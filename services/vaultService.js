@@ -534,7 +534,13 @@ class VaultService {
                         { account: `escrow:vault-${vault.id}:locked`, credit: amount.toFixed(8) },
                     ],
                 });
-                return [userUpdate, vaultUpdate, depositRow, historyRow];
+                const freshUser = await tx.user.findUnique({
+                    where: { id: vault.userId },
+                });
+                const freshVault = await tx.vault.findUnique({
+                    where: { id: vault.id },
+                });
+                return [freshUser, freshVault, depositRow, historyRow];
             });
 
             // Credit AZM via canonical service so the AzmRewardLog audit
