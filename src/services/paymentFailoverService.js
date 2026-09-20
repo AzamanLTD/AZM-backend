@@ -156,22 +156,59 @@ class PaymentFailoverService {
                 };
             } catch (err) {
                 await this._recordFailure(provider.name, err);
-                errors.push({ provider: provider.name, error: err.message });
+                errors.push({ provider: provider.name, error: err.message, providerOutcome: err.providerOutcome || null });
+
+                // ── r15 R15-C: failover is ONLY safe on provably-unmoved money.
+                // A thrown error is NOT proof the provider refused. A timeout
+                // or reset can occur AFTER the provider accepted the same
+                // reference — issuing the SAME payload to the next provider
+                // would disburse TWICE. Only outcomes that PROVABLY left the
+                // money unmoved (NOT_DISPATCHED — no bytes reached the
+                // provider; DEFINITIVE_REJECTION — the provider explicitly
+                // refused) may continue down the chain. UNKNOWN_OUTCOME,
+                // DUPLICATE_REFERENCE and any UNCLASSIFIED error stop the
+                // chain: the transfer stays pending under its reference and
+                // resolves by status/callback — never a second instruction.
+                const outcome = err.providerOutcome || null;
+                const SAFE_TO_FAILOVER = outcome === 'NOT_DISPATCHED' || outcome === 'DEFINITIVE_REJECTION';
+
+                if (!SAFE_TO_FAILOVER) {
+                    const blocking = new Error(
+                        `[PaymentFailover] ${provider.name} returned ${outcome || 'UNCLASSIFIED'} for reference ${payload.referenceId} — the outcome is not provably safe, refusing failover (the transfer stays pending under its reference)`
+                    );
+                    blocking.providerOutcome = outcome || 'UNKNOWN_OUTCOME';
+                    blocking.provider = provider.name;
+                    blocking.referenceId = payload.referenceId;
+                    blocking.triedProviders = triedProviders;
+                    blocking.providerErrors = errors;
+                    blocking.cause = err;
+                    logger.error({
+                        provider: provider.name,
+                        outcome,
+                        referenceId: payload.referenceId,
+                        triedProviders
+                    }, '[PaymentFailover] NOT failing over — outcome not provably safe');
+                    throw blocking;
+                }
 
                 logger.warn({
                     provider: provider.name,
                     error: err.message,
                     nextProvider: this.providers[this.providers.indexOf(provider) + 1]?.name || 'none'
-                }, '[PaymentFailover] Provider failed, trying next');
+                }, '[PaymentFailover] Provider failed (provably safe outcome), trying next');
 
                 continue;
             }
         }
 
-        // All providers failed
+        // All providers failed — every one with a PROVABLY safe outcome
+        // (NOT_DISPATCHED / DEFINITIVE_REJECTION; anything else threw the
+        // r15 R15-C blocking error above). The aggregate is therefore safely
+        // classifiable: no provider can have accepted the transfer.
         const allFailed = new Error(
             `All payment providers failed: ${JSON.stringify(errors)}`
         );
+        allFailed.providerOutcome = 'DEFINITIVE_REJECTION';
         allFailed.providerErrors = errors;
         allFailed.triedProviders = triedProviders;
         throw allFailed;

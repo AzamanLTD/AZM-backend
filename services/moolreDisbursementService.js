@@ -83,6 +83,20 @@ const BODY_KEYS = {
 // ── ✅ CONFIRMED: type=1 is required on every transfer request. ──
 const TRANSFER_TYPE_CODE     = 1;
 
+// ── r15 R15-C: provider OUTCOME classification ────────────────────────────────
+// A thrown error is NOT proof that Moolre refused the payout. A timeout/reset
+// can occur AFTER Moolre accepted the same externalref — the failover layer and
+// the withdrawal controller MUST NOT auto-fail-over (double disbursement) or
+// auto-refund (double spend) on anything but a provably-safe outcome.
+const PROVIDER_OUTCOMES = Object.freeze({
+    NOT_DISPATCHED:       'NOT_DISPATCHED',       // no bytes reached Moolre
+    DEFINITIVE_REJECTION: 'DEFINITIVE_REJECTION', // Moolre explicitly refused
+    UNKNOWN_OUTCOME:      'UNKNOWN_OUTCOME',      // may have been accepted
+    DUPLICATE_REFERENCE:  'DUPLICATE_REFERENCE',  // Moolre already holds this externalref
+});
+// Transport error codes that PROVABLY occur before any bytes leave the machine.
+const PROVABLY_PRE_DISPATCH = new Set(['ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN']);
+
 // ── ✅ CONFIRMED numeric channel codes (docs.moolre.com/ai/initiate-transfer.md) ──
 // AZM passes network ∈ {MTN, TELECEL, AIRTELTIGO} (VODAFONE accepted as legacy alias → Telecel).
 const NETWORK_TO_CHANNEL = {
@@ -190,13 +204,13 @@ class MoolreDisbursementService {
 
         // ── Validation (identical guards to the MTN adapter) ──────────────────
         if (!referenceId || typeof referenceId !== 'string') {
-            throw new Error('[MoolreDisbursementService] referenceId is required for idempotency.');
+            throw this._outcomeError('referenceId is required for idempotency.', PROVIDER_OUTCOMES.NOT_DISPATCHED, { stage: 'VALIDATE' });
         }
         if (!amountGhs || Number(amountGhs) <= 0) {
-            throw new Error('[MoolreDisbursementService] amountGhs must be positive.');
+            throw this._outcomeError('amountGhs must be positive.', PROVIDER_OUTCOMES.NOT_DISPATCHED, { stage: 'VALIDATE' });
         }
         if (!recipientPhone) {
-            throw new Error('[MoolreDisbursementService] recipientPhone is required.');
+            throw this._outcomeError('recipientPhone is required.', PROVIDER_OUTCOMES.NOT_DISPATCHED, { stage: 'VALIDATE' });
         }
 
         const finalExternalId   = externalId   || `AZAMAN_${referenceId}`;
@@ -269,8 +283,7 @@ class MoolreDisbursementService {
                 source:         'LIVE'
             };
         } catch (err) {
-            const apiMsg = this._extractError(err);
-            throw new Error(`[MoolreDisbursementService] Moolre transfer rejected: ${apiMsg}`);
+            this._throwInitiationOutcome(err, referenceId);
         }
     }
 
@@ -280,7 +293,7 @@ class MoolreDisbursementService {
      */
     async getTransferStatus(referenceId) {
         if (!referenceId) {
-            throw new Error('[MoolreDisbursementService] referenceId is required.');
+            throw this._outcomeError('referenceId is required.', PROVIDER_OUTCOMES.NOT_DISPATCHED, { stage: 'VALIDATE' });
         }
 
         if (this.providerMode === 'MOCK') {
@@ -323,8 +336,11 @@ class MoolreDisbursementService {
                 source:      'LIVE'
             };
         } catch (err) {
-            const apiMsg = this._extractError(err);
-            throw new Error(`[MoolreDisbursementService] Moolre status lookup failed: ${apiMsg}`);
+            // r15 R15-C: a status-lookup failure is UNRESOLVED, never a
+            // provider failure — callers must keep the payout pending.
+            const outcomeErr = this._classifyTransportError(err, { referenceId, stage: 'STATUS' });
+            outcomeErr.message = `[MoolreDisbursementService] Moolre status lookup failed: ${this._extractError(err)}`;
+            throw outcomeErr;
         }
     }
 
@@ -354,7 +370,57 @@ class MoolreDisbursementService {
     }
 
     // ── Internals ─────────────────────────────────────────────────────────────
+    /**
+     * Build a typed provider-outcome error. The classification travels ON the
+     * error so the failover layer and the withdrawal controller can orchestrate
+     * safely without parsing message strings.
+     */
+    _outcomeError(message, providerOutcome, { referenceId = null, stage = null, code = null, isDuplicate = false, cause = null } = {}) {
+        const err = new Error(`[MoolreDisbursementService] ${message}`);
+        err.providerOutcome = providerOutcome;
+        err.provider = 'MOOLRE';
+        err.referenceId = referenceId;
+        err.stage = stage;
+        if (code) err.code = code;
+        if (isDuplicate) err.isDuplicate = true;
+        if (cause) err.cause = cause;
+        return err;
+    }
 
+    /** Classify a transport-level axios failure (no envelope reached us). */
+    _classifyTransportError(err, { referenceId = null, stage = null } = {}) {
+        const outcome = PROVABLY_PRE_DISPATCH.has(err?.code)
+            ? PROVIDER_OUTCOMES.NOT_DISPATCHED
+            : PROVIDER_OUTCOMES.UNKNOWN_OUTCOME;
+        return this._outcomeError(this._extractError(err), outcome, { referenceId, stage, cause: err });
+    }
+
+    /**
+     * r15 R15-C: classify a LIVE initiateTransfer failure.
+     * Envelope answer → TP13 duplicate / definitive rejection; anything else
+     * is transport-level (may have been accepted).
+     */
+    _initiationOutcomeError(err, { referenceId = null } = {}) {
+        const env = err.response?.data;
+        if (env && typeof env === 'object' && (env.code || env.message)) {
+            const envCode = String(env.code || '');
+            if (envCode === 'TP13' || /duplicate/i.test(String(env.message || ''))) {
+                // Moolre ALREADY holds this externalref — a transfer may already
+                // be in flight under our reference. NEVER re-instruct; the
+                // reference resolves by status/callback.
+                return this._outcomeError(env.message || envCode, PROVIDER_OUTCOMES.DUPLICATE_REFERENCE,
+                    { referenceId, stage: 'TRANSFER', code: envCode, isDuplicate: true, cause: err });
+            }
+            return this._outcomeError(env.message || envCode, PROVIDER_OUTCOMES.DEFINITIVE_REJECTION,
+                { referenceId, stage: 'TRANSFER', code: envCode, cause: err });
+        }
+        return this._classifyTransportError(err, { referenceId, stage: 'TRANSFER' });
+    }
+
+    /** r15 R15-C: initiateTransfer LIVE catch — every failure is classified. */
+    _throwInitiationOutcome(err, referenceId) {
+        throw this._initiationOutcomeError(err, { referenceId });
+    }
     _authHeaders() {
         // Moolre uses STATIC header credentials — no OAuth, no token exchange.
         return {
@@ -477,3 +543,4 @@ class MoolreDisbursementService {
 }
 
 module.exports = MoolreDisbursementService;
+module.exports.PROVIDER_OUTCOMES = PROVIDER_OUTCOMES;

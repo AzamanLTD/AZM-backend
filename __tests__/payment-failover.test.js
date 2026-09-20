@@ -15,7 +15,12 @@ function makeMockProvider(name, { fail = false, delay = 0 } = {}) {
         async initiateTransfer(payload) {
             this._calls.push({ method: 'initiateTransfer', payload });
             if (this._delay) await new Promise(r => setTimeout(r, this._delay));
-            if (this._fail) throw new Error(`${name} disbursement failed`);
+            if (this._fail) {
+                // r15 R15-C: mock provider failures carry a typed outcome.
+                const err = new Error(`${name} disbursement failed`);
+                err.providerOutcome = 'DEFINITIVE_REJECTION';
+                throw err;
+            }
             return { referenceId: payload.referenceId, status: 'PENDING', amount: payload.amountGhs };
         },
         async getTransferStatus(referenceId) {
@@ -81,6 +86,90 @@ describe('PaymentFailoverService', () => {
         expect(err.providerErrors).toHaveLength(2);
         expect(err.triedProviders).toContain('moolre');
         expect(err.triedProviders).toContain('mtn');
+    });
+
+    // ── r15 R15-C: failover is gated on PROVABLY SAFE outcomes ──────────────
+    function makeOutcomeProvider(name, outcome) {
+        return {
+            name,
+            _calls: [],
+            newReferenceId: () => `ref-${name}`,
+            async initiateTransfer(payload) {
+                this._calls.push(payload);
+                const err = new Error(`${name} failed (${outcome})`);
+                err.providerOutcome = outcome;
+                throw err;
+            },
+            async getTransferStatus() { return { status: 'PENDING' }; },
+        };
+    }
+
+    test('R15-C: UNKNOWN_OUTCOME on the primary NEVER re-instructs the secondary (no double disbursement)', async () => {
+        const primary   = makeOutcomeProvider('moolre', 'UNKNOWN_OUTCOME');
+        const secondary = makeOutcomeProvider('mtn', null);
+        secondary.initiateTransfer = async function (payload) { this._calls.push(payload); return { status: 'PENDING', _ok: true }; };
+        const svc = new PaymentFailoverService({ primary, secondary });
+
+        const err = await svc.initiateTransfer({
+            referenceId: 'r15c-1', amountGhs: 100, recipientPhone: '0244556677',
+        }).catch(e => e);
+
+        expect(err).toBeInstanceOf(Error);
+        expect(err.providerOutcome).toBe('UNKNOWN_OUTCOME');
+        expect(err.message).toMatch(/refusing failover/);
+        // THE invariant: the secondary provider was never instructed.
+        expect(secondary._calls).toHaveLength(0);
+        expect(primary._calls).toHaveLength(1);
+    });
+
+    test('R15-C: DUPLICATE_REFERENCE blocks the chain — the reference is already held by the provider', async () => {
+        const primary   = makeOutcomeProvider('moolre', 'DUPLICATE_REFERENCE');
+        const secondary = makeOutcomeProvider('mtn', null);
+        secondary.initiateTransfer = async function (payload) { this._calls.push(payload); return { status: 'PENDING' }; };
+        const svc = new PaymentFailoverService({ primary, secondary });
+
+        const err = await svc.initiateTransfer({
+            referenceId: 'r15c-2', amountGhs: 100, recipientPhone: '0244556677',
+        }).catch(e => e);
+
+        expect(err.providerOutcome).toBe('DUPLICATE_REFERENCE');
+        expect(secondary._calls).toHaveLength(0);
+    });
+
+    test('R15-C: an UNCLASSIFIED provider error is conservatively treated as UNKNOWN — no failover', async () => {
+        const primary = {
+            name: 'legacy',
+            _calls: [],
+            newReferenceId: () => 'x',
+            async initiateTransfer(payload) {
+                this._calls.push(payload);
+                throw new Error('boom'); // no providerOutcome tag at all
+            },
+            async getTransferStatus() { return { status: 'PENDING' }; },
+        };
+        const secondary = makeOutcomeProvider('mtn', null);
+        secondary.initiateTransfer = async function (payload) { this._calls.push(payload); return { status: 'PENDING' }; };
+        const svc = new PaymentFailoverService({ primary, secondary });
+
+        const err = await svc.initiateTransfer({
+            referenceId: 'r15c-3', amountGhs: 100, recipientPhone: '0244556677',
+        }).catch(e => e);
+
+        expect(err.providerOutcome).toBe('UNKNOWN_OUTCOME');
+        expect(secondary._calls).toHaveLength(0);
+    });
+
+    test('R15-C: all providers PROVABLY refuse → aggregate is safely classifiable DEFINITIVE_REJECTION', async () => {
+        const primary   = makeOutcomeProvider('moolre', 'DEFINITIVE_REJECTION');
+        const secondary = makeOutcomeProvider('mtn', 'NOT_DISPATCHED');
+        const svc = new PaymentFailoverService({ primary, secondary });
+
+        const err = await svc.initiateTransfer({
+            referenceId: 'r15c-6', amountGhs: 100, recipientPhone: '0244556677',
+        }).catch(e => e);
+
+        expect(err.message).toMatch(/All payment providers failed/);
+        expect(err.providerOutcome).toBe('DEFINITIVE_REJECTION');
     });
 
     test('skips unhealthy provider after threshold failures', async () => {

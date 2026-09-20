@@ -409,9 +409,47 @@ exports.fiatWithdrawal = async (req, res) => {
                     message: 'Withdrawal dispatched but a bookkeeping step failed. The payout is in flight; support has been alerted. Do not retry.'
                 });
             }
-            // Reached only when initiateTransfer itself failed (the dispatch
-            // never happened) — unwinding the ledger is safe.
-            logger.error({ err: mtnErr }, '[fiatWithdrawal] MTN dispatch failed — unwinding ledger');
+            // ── r15 R15-D: outcome-classified dispatch failure.
+            // A thrown error is NOT proof the provider refused. On
+            // UNKNOWN_OUTCOME / DUPLICATE_REFERENCE the payout may STILL be
+            // in flight — auto-refunding here double-spends (the provider
+            // pays out AND the user's balance is restored). The ledger is
+            // unwound ONLY on provably-safe outcomes; anything ambiguous
+            // keeps the withdrawal PENDING under its reference and resolves
+            // by the settlement callback / recon worker.
+            const dispatchOutcome = mtnErr.providerOutcome || null;
+            const SAFE_TO_UNWIND = dispatchOutcome === 'NOT_DISPATCHED' || dispatchOutcome === 'DEFINITIVE_REJECTION';
+
+            if (!SAFE_TO_UNWIND) {
+                logger.error({ err: mtnErr, outcome: dispatchOutcome, reference },
+                    '[fiatWithdrawal] dispatch outcome UNKNOWN — NOT refunding; payout may be in flight');
+                await recordReconciliationException(prisma, {
+                    entityType: 'TRANSACTION',
+                    entityId: reference,
+                    reference,
+                    reason: 'DISPATCH_OUTCOME_UNKNOWN_NO_REFUND',
+                    details: { provider: 'MTN_MOMO', outcome: dispatchOutcome || 'UNCLASSIFIED', error: mtnErr.message },
+                }).catch(() => null);
+                if (io) {
+                    io.emit('admin_alert', {
+                        type: 'WITHDRAWAL_DISPATCH_OUTCOME_UNKNOWN',
+                        reference,
+                        userId,
+                        error: mtnErr.message,
+                        timestamp: new Date().toISOString()
+                    });
+                }
+                return res.status(202).json({
+                    success: false,
+                    code: dispatchOutcome === 'DUPLICATE_REFERENCE' ? 'MOOLRE_DUPLICATE_REFERENCE' : 'DISPATCH_OUTCOME_UNKNOWN',
+                    retryable: false,
+                    message: 'The payout provider has not confirmed the outcome yet. Your withdrawal stays pending and will be resolved automatically — do NOT retry it.',
+                    reference,
+                });
+            }
+
+            // Provably no disbursement happened — unwinding the ledger is safe.
+            logger.error({ err: mtnErr, outcome: dispatchOutcome }, '[fiatWithdrawal] MTN dispatch failed (provably safe) — unwinding ledger');
             let reversalSucceeded = false;
             try {
                 await financeService.reverseFiatWithdrawal(prisma, reference, {
