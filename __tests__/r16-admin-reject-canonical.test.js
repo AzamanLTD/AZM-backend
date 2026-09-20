@@ -22,6 +22,16 @@
 //   8. A legacy pre-P4 mirror-only withdrawal rejects through the
 //      documented legacy path without fabricating a modern authority
 //      obligation (r16b P0-B).
+//   9. r16c P0-A Scenario A — the REAL direct fiatWithdrawal controller
+//      held between its reservation and its DB dispatch claim loses to
+//      admin rejection: provider NEVER called, exactly one reversal
+//      (10 rounds).
+//   10. r16c P0-A Scenario B — the dispatch claim (PENDING -> DISPATCHING)
+//      wins first: admin rejection is protected (400/409), the user is not
+//      refunded, and the payout continues through the Moolre lifecycle
+//      (10 rounds).
+//   11. r16c — a legacy mirror-only rejection can NEVER consume an
+//      unrelated active fiat obligation (the old startsWith lookup).
 //
 // SKIPS unless TEST_DATABASE_URL is set.
 // =============================================================================
@@ -46,7 +56,7 @@ describeOrSkip('r16 P0-C: Admin rejection canonical-state safety', () => {
 
     afterEach(async () => {
         await prisma.$executeRawUnsafe(
-            'TRUNCATE TABLE "User", "Withdrawal", "TransactionHistory", "GlobalSettings", "SystemProfitFees", "SystemFiatPool", "SystemMasterCrypto", "AdminProfitLog", "FiatProviderEvent", "ReconciliationException" RESTART IDENTITY CASCADE'
+            'TRUNCATE TABLE "User", "Withdrawal", "TransactionHistory", "GlobalSettings", "SystemProfitFees", "SystemFiatPool", "SystemMasterCrypto", "AdminProfitLog", "FiatProviderEvent", "ReconciliationException", "FiatLiquidityReceipt" RESTART IDENTITY CASCADE'
         );
         await prisma.$executeRawUnsafe('TRUNCATE TABLE "LedgerTransaction", "JournalEntry", "LedgerAccount", "RestrictedObligation" RESTART IDENTITY CASCADE');
     }, 15000);
@@ -347,4 +357,258 @@ describeOrSkip('r16 P0-C: Admin rejection canonical-state safety', () => {
         const fresh = await prisma.user.findUnique({ where: { id: user.id } });
         expect(Number(fresh.availableBalance)).toBeCloseTo(230, 5); // 200 + 30
     });
+
+    // ── r16c P0-A: real direct-controller dispatch-claim races ────────────
+
+    /**
+     * Real fiatWithdrawal harness — the same injection surface the r16b
+     * topology suite uses (controller reads the dispatcher from req.app).
+     */
+    function makeFiatHarness(dispatcher) {
+        const appMap = new Map([
+            ['prisma', prisma],
+            ['paymentFailoverService', dispatcher],
+            ['emitBalanceUpdate', async () => {}],
+            ['emailService', null],
+            ['smsService', null],
+            ['adminAlertService', null],
+            ['socketio', null],
+            ['azmSpendService', null],
+        ]);
+        const app = { get: (k) => (appMap.has(k) ? appMap.get(k) : null) };
+        const mkRes = () => {
+            const r = {};
+            r.status = (c) => { r.statusCode = c; return r; };
+            r.json = (b) => { r.payload = b; return r; };
+            return r;
+        };
+        return { app, mkRes };
+    }
+
+    async function seedFiatEnv() {
+        await prisma.globalSettings.upsert({
+            where: { id: 1 },
+            update: { liveRetailRate: 15, liveUsdToGhs: 15 },
+            create: { id: 1, liveRetailRate: 15, liveUsdToGhs: 15 }
+        });
+        await prisma.systemFiatPool.upsert({ where: { id: 1 }, update: { balance: 100000 }, create: { id: 1, balance: 100000 } });
+        await prisma.systemMasterCrypto.upsert({ where: { id: 1 }, update: { balance: 0 }, create: { id: 1, balance: 0 } });
+        await prisma.systemProfitFees.upsert({ where: { id: 1 }, update: { balance: 0 }, create: { id: 1, balance: 0 } });
+    }
+
+    async function callFiatWithdrawal(userId, dispatcher) {
+        const { fiatWithdrawal } = require('../controllers/withdrawalController');
+        const { app, mkRes } = makeFiatHarness(dispatcher);
+        const res = mkRes();
+        const req = {
+            app, ip: '127.0.0.1', headers: {},
+            body: { amount: '50', payoutMethod: 'MTN_MOMO', recipientPhone: '0204556677', network: 'TELECEL' },
+            user: { id: userId, username: 'r16c', createdAt: new Date(Date.now() - 90 * 86400000) },
+        };
+        await fiatWithdrawal(req, res);
+        return res;
+    }
+
+    test('9: Scenario A — admin rejection wins the real dispatch boundary → provider NEVER called, exactly one reversal (10 rounds)', async () => {
+        await seedFiatEnv();
+        const financeService = require('../services/finance.service');
+        const origReserve = financeService.processFiatWithdrawal;
+
+        let adminWon = 0;
+        let dispatchWon = 0;
+        try {
+        for (let round = 0; round < 10; round++) {
+            const user = await seedUser(prisma, { availableBalance: 500 });
+            const before = Number((await prisma.user.findUnique({ where: { id: user.id } })).availableBalance);
+
+            // Latch between the reservation commit and the dispatch claim:
+            // wrap processFiatWithdrawal and hold the controller there. This
+            // is the exact window admin rejection must be able to win.
+            let release = null;
+            const entered = new Promise((resolveEnter) => {
+                financeService.processFiatWithdrawal = async (...args) => {
+                    const r = await origReserve.apply(financeService, args);
+                    resolveEnter();
+                    await new Promise((r2) => { release = r2; });
+                    return r;
+                };
+            });
+
+            const captured = [];
+            const dispatcher = {
+                async initiateTransfer(payload) {
+                    captured.push(payload);
+                    return { status: 'PENDING', provider: 'MOOLRE_DISBURSEMENT', data: { reference: payload.referenceId } };
+                },
+            };
+            const controllerDone = callFiatWithdrawal(user.id, dispatcher);
+            await entered;
+
+            // Mirror exists (reservation committed) and is still PENDING —
+            // admin rejection contends at the same DB authority.
+            const mirror = await prisma.withdrawal.findFirst({ where: { userId: user.id } });
+            expect(mirror.status).toBe('PENDING');
+
+            const admin = await seedUser(prisma, { role: 'ADMIN' });
+            const res = await reject(admin, mirror.id);
+
+            release();
+            const ctrlRes = await controllerDone;
+            financeService.processFiatWithdrawal = origReserve;
+
+            if (res.statusCode === 200) {
+                adminWon++;
+                // The controller lost the claim → 409, provider NEVER called.
+                expect(ctrlRes.statusCode).toBe(409);
+                expect(captured.length).toBe(0);
+                expect(ctrlRes.payload.code).toBe('WITHDRAWAL_CLAIMED_CONCURRENTLY');
+
+                // Admin's reversal is the ONLY money movement: canonical
+                // FAILED, mirror REJECTED, user restored exactly once.
+                const rows = await prisma.$queryRawUnsafe(
+                    'SELECT "txHash" FROM "TransactionHistory" WHERE "userId" = $1 AND "type" = \'WITHDRAWAL_FIAT\'', user.id
+                );
+                const canonicalRow = await prisma.transactionHistory.findUnique({ where: { txHash: rows[0].txHash } });
+                expect(canonicalRow.status).toBe('FAILED');
+                const finalMirror = await prisma.withdrawal.findUnique({ where: { id: mirror.id } });
+                expect(finalMirror.status).toBe('REJECTED');
+
+                const after = await prisma.user.findUnique({ where: { id: user.id } });
+                expect(Number(after.availableBalance)).toBeCloseTo(before, 5); // restored exactly once
+
+                const reversals = await prisma.ledgerTransaction.findMany({
+                    where: { idempotencyKey: `ledger:withdrawal:fiat:reverse:${rows[0].txHash}` },
+                });
+                expect(reversals.length).toBe(1);
+            } else {
+                dispatchWon++;
+                // The dispatch claim won the row first — rejection is
+                // protected and the user was NOT refunded by the admin path.
+                expect([400, 409]).toContain(res.statusCode);
+                const afterAdmin = await prisma.user.findUnique({ where: { id: user.id } });
+                expect(Number(afterAdmin.availableBalance)).toBeLessThan(before); // still debited
+            }
+        }
+        } finally {
+            financeService.processFiatWithdrawal = origReserve;
+        }
+        // With the latch, admin rejection completes while the controller is
+        // held BEFORE the claim — every round must be an admin win.
+        expect(adminWon).toBe(10);
+        expect(dispatchWon).toBe(0);
+    });
+
+    test('10: Scenario B — dispatch claim wins → rejection protected, payout continues through the Moolre lifecycle (10 rounds)', async () => {
+        await seedFiatEnv();
+
+        let dispatchWon = 0;
+        for (let round = 0; round < 10; round++) {
+            const user = await seedUser(prisma, { availableBalance: 500 });
+            const before = Number((await prisma.user.findUnique({ where: { id: user.id } })).availableBalance);
+
+            // Latch INSIDE the provider call: the dispatch claim and intent
+            // evidence are already durable when the dispatcher is invoked.
+            const captured = [];
+            let release = null;
+            const dispatcher = {
+                async initiateTransfer(payload) {
+                    captured.push(payload);
+                    await new Promise((r2) => { release = r2; });
+                    return { status: 'PENDING', provider: 'MOOLRE_DISBURSEMENT', _provider: 'moolre', data: { reference: 'moolre_ref' } };
+                },
+            };
+            const controllerDone = callFiatWithdrawal(user.id, dispatcher);
+
+            // Wait until the provider call is latched — claim + evidence are durable.
+            while (captured.length === 0) await new Promise((r) => setTimeout(r, 5));
+            const reference = captured[0].referenceId;
+            const mirror = await prisma.withdrawal.findFirst({ where: { userId: user.id } });
+            expect(mirror.status).toBe('DISPATCHING'); // the durable claim
+
+            const admin = await seedUser(prisma, { role: 'ADMIN' });
+            const res = await reject(admin, mirror.id);
+            expect([400, 409]).toContain(res.statusCode); // protected — never a refund
+            expect(res.statusCode).not.toBe(200);
+
+            // User NOT refunded, canonical protected.
+            const afterAdmin = await prisma.user.findUnique({ where: { id: user.id } });
+            expect(Number(afterAdmin.availableBalance)).toBeLessThan(before);
+            const canonical = await prisma.transactionHistory.findUnique({ where: { txHash: reference } });
+            expect(canonical.status).toBe('PENDING');
+
+            release();
+            const ctrlRes = await controllerDone;
+            expect(ctrlRes.statusCode).toBe(200);
+
+            // The payout continued through the normal Moolre lifecycle:
+            // exactly one provider call, acceptance evidence recorded.
+            expect(captured.length).toBe(1);
+            const acceptance = await prisma.fiatProviderEvent.findFirst({
+                where: { relatedReference: reference, status: 'PENDING' },
+            });
+            expect(acceptance).toBeTruthy();
+            expect(acceptance.provider).toBe('MOOLRE_DISBURSEMENT');
+
+            // Ownership persisted on the canonical row to the accepting
+            // provider (metadata.payoutProvider — r16b ownership surface).
+            const owned = await prisma.transactionHistory.findUnique({ where: { txHash: reference } });
+            expect(owned.metadata.payoutProvider).toBe('moolre');
+            expect(owned.metadata.payoutProviderName).toBe('MOOLRE_DISBURSEMENT');
+            dispatchWon++;
+        }
+        expect(dispatchWon).toBe(10);
+    });
+
+    test('11: r16c — a legacy mirror-only rejection can NEVER consume an unrelated active fiat obligation', async () => {
+        await seedFiatEnv();
+        const admin = await seedUser(prisma, { role: 'ADMIN' });
+        const legacyUser = await seedUser(prisma, { availableBalance: 100 });
+
+        // An UNRELATED user holds an active direct-fiat obligation (exactly
+        // the shape the old startsWith('withdrawal:fiat:') lookup consumed).
+        const otherUser = await seedUser(prisma, { availableBalance: 200 });
+        const { reference: otherRef } = await seedCanonicalWithdrawal(otherUser, 50);
+        const otherObligationBefore = await prisma.restrictedObligation.findFirst({
+            where: { reference: `withdrawal:fiat:${otherRef}`, status: 'ACTIVE' },
+        });
+        expect(otherObligationBefore).not.toBeNull();
+
+        // A pre-P4 mirror-only legacy withdrawal for the legacy user.
+        const legacyRow = await prisma.withdrawal.create({
+            data: {
+                userId: legacyUser.id,
+                amount: 30,
+                payoutMethod: 'BINANCE_ID',
+                destination: 'OLD_RECORD',
+                status: 'PENDING',
+            },
+        });
+        await prisma.user.update({
+            where: { id: legacyUser.id },
+            data: { availableBalance: { decrement: 30 } },
+        });
+        const legacyDebited = Number((await prisma.user.findUnique({ where: { id: legacyUser.id } })).availableBalance);
+
+        const res = await reject(admin, legacyRow.id);
+        expect(res.statusCode).toBe(200);
+
+        // The legacy user is restored exactly once — from platform equity.
+        const legacyAfter = await prisma.user.findUnique({ where: { id: legacyUser.id } });
+        expect(Number(legacyAfter.availableBalance)).toBeCloseTo(legacyDebited + 30, 5);
+
+        // The UNRELATED obligation is untouched: still ACTIVE, still held for
+        // the other user's payout. Never guess a financial obligation.
+        const otherObligationAfter = await prisma.restrictedObligation.findFirst({
+            where: { reference: `withdrawal:fiat:${otherRef}`, status: 'ACTIVE' },
+        });
+        expect(otherObligationAfter).not.toBeNull();
+        expect(otherObligationAfter.id).toBe(otherObligationBefore.id);
+
+        // The other user's canonical payout is still protected.
+        const otherCanonical = await prisma.transactionHistory.findUnique({ where: { txHash: otherRef } });
+        expect(otherCanonical.status).toBe('PENDING');
+        const otherMirror = await prisma.withdrawal.findFirst({ where: { userId: otherUser.id } });
+        expect(otherMirror.status).toBe('PENDING');
+    });
+
 });

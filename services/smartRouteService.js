@@ -29,16 +29,25 @@
 //   • manual while nothing is due: `${routeId}:manual:${uuid}` — a distinct
 //     explicitly-manual operation identity, allowed to coexist with the
 //     scheduled occurrence it did NOT consume;
-//   • crash recovery: a run left PENDING longer than STALE_PENDING_MS had its
-//     whole financial transaction rolled back (run finalization is INSIDE
-//     the money transaction — see below), so re-executing it is exactly-once
-//     safe. recoverStalePendingRuns() re-drives those rows; concurrent
-//     recoveries converge through the same guarded finalization.
+//   • crash recovery (r16c): a run left PENDING longer than STALE_PENDING_MS
+//     is re-driven by recoverStalePendingRuns(). TRANSFER / SAVINGS / VAULT
+//     runs finalize INSIDE the money transaction — a stale PENDING row of
+//     those kinds guarantees nothing committed, so re-driving is exactly-once
+//     safe. MoMo runs commit the canonical fiat reservation in its OWN
+//     transaction before dispatch (the provider cannot be called inside a
+//     DB transaction), so a stale PENDING MoMo run is converged by
+//     _executeMomo's idempotent re-entry: no canonical row → reserve now;
+//     canonical PENDING with NO outbound evidence → resume dispatch with the
+//     originally reserved GHS; canonical PENDING WITH evidence → provider
+//     I/O may have happened, park AWAITING_RECONCILIATION (never re-dispatch
+//     blindly); canonical COMPLETED/FAILED → converge to the honest outcome.
 //
-// Run finalization (PENDING → terminal) happens INSIDE the same transaction
-// as the financial mutation for TRANSFER / SAVINGS / MOMO-reservation, so a
-// crash can only leave either "nothing happened" (run still PENDING → safe
-// to retry) or "everything happened" (run terminal → never re-executed). The
+// Run finalization (PENDING → terminal) for TRANSFER / SAVINGS happens
+// INSIDE the same transaction as the financial mutation, so a crash can only
+// leave either "nothing happened" (run still PENDING → safe to retry) or
+// "everything happened" (run terminal → never re-executed). MoMo runs
+// finalize AFTER the provider outcome (r16c P0-B: SUCCESS means the provider
+// accepted the dispatch, never merely that a reservation existed). The
 // guarded finalization (updateMany WHERE status='PENDING') is the
 // single-winner claim that makes retries and concurrent recoveries
 // exactly-once.
@@ -209,11 +218,14 @@ class SmartRouteService {
 
     /**
      * Recovery sweep for runs interrupted by a process crash between claim
-     * and execution. Because run finalization commits in the same
-     * transaction as the financial mutation, a PENDING run this old
-     * guarantees its money transaction never committed — re-driving it is
-     * exactly-once safe (concurrent recoveries converge through the same
-     * guarded finalization).
+     * and execution. TRANSFER / SAVINGS / VAULT runs finalize in the same
+     * transaction as their money movement, so a stale PENDING row of those
+     * kinds guarantees nothing committed. MoMo runs commit the canonical
+     * fiat reservation in its own transaction before dispatch, so their
+     * re-drive converges through _executeMomo's idempotent re-entry (r16c):
+     * reserve / resume / park — never re-reserving and never blindly
+     * re-dispatching. Concurrent recoveries converge through the guarded
+     * finalization either way.
      */
     async recoverStalePendingRuns({ staleMs = STALE_PENDING_MS, take = 20 } = {}) {
         const cutoff = new Date(Date.now() - staleMs);
@@ -376,11 +388,16 @@ class SmartRouteService {
     // =========================================================================
 
     /**
-     * r16 P0-B: Smart Route MoMo payouts ride the canonical fiat-withdrawal
-     * state machine. The canonical TransactionHistory row is PENDING until
-     * the provider outcome is observed; the Withdrawal reconciliation row
-     * is durably linked via transactionHistoryId; the reconciler settles or
-     * reverses it exactly like a direct fiat withdrawal.
+     * r16c P0-B: Smart Route MoMo payouts ride the canonical fiat-withdrawal
+     * state machine, and the run lifecycle is HONEST: SUCCESS means the
+     * provider accepted the dispatch — never merely that a reservation
+     * existed. Ordering: reservation (or crash-resume of an existing one) →
+     * DB dispatch claim (mutually exclusive with admin rejection) → durable
+     * DISPATCH_INTENT evidence → provider I/O → durable outcome evidence /
+     * ownership → run finalization. The canonical TransactionHistory stays
+     * PENDING until the provider settlement webhook / reconciler resolves
+     * it; a run whose dispatch outcome is unprovable parks in
+     * AWAITING_RECONCILIATION instead of guessing.
      */
     async _executeMomo(run, route, occurrenceBased, occurrenceBase) {
         const amount = new Prisma.Decimal(route.amountUsdc);
@@ -389,76 +406,182 @@ class SmartRouteService {
         // txHash instead of reserving the money twice.
         const reference = `SRWD_${run.id}`;
 
-        const result = await financeService.processFiatWithdrawal(
-            this.prisma,
-            route.userId,
-            Number(route.amountUsdc),
-            {
-                reference,
-                // §P.5-D intended route identity (mirrors the direct fiat
-                // controller: intent is the failover chain's primary rail;
-                // the actual accepting provider is recorded post-dispatch).
-                liquidityRoute: { provider: 'MOOLRE_DISBURSEMENT', rail: 'MOMO', destination: route.destMomoNumber },
-                // r15 hardening contract: the Withdrawal reconciliation
-                // record is created INSIDE the authoritative reservation
-                // transaction, durably linked to the canonical row.
-                createWithdrawalRecordInTransaction: async (tx, txRecord) => {
-                    const rows = await tx.$queryRawUnsafe(
-                        'INSERT INTO "Withdrawal" ' +
-                        '("userId", "amount", "payoutMethod", "network", "destination", "status", "transactionHistoryId", "createdAt", "updatedAt") ' +
-                        'VALUES ($1, $2, $3, $4, $5, $6, $7, now(), now()) ' +
-                        'RETURNING "id", "userId", "amount", "payoutMethod", "network", "destination", "status"',
-                        route.userId,
-                        Number(route.amountUsdc),
-                        route.destMomoProvider || 'MTN_MOMO',
-                        'MOMO',
-                        route.destMomoNumber,
-                        'PENDING',
-                        txRecord.id
-                    );
-                    return rows?.[0] || null;
-                },
+        // ── r16c P0-B: idempotent re-entry / crash convergence ────────────
+        // A stale-PENDING recovery re-drive must converge on the existing
+        // canonical state instead of re-reserving the money.
+        const existing = await this.prisma.transactionHistory.findUnique({ where: { txHash: reference } });
+        let result;
+        if (existing) {
+            if (existing.status === 'COMPLETED') {
+                // Settlement happened in an earlier attempt; only the run
+                // finalization crashed. The guarded finalize converges once.
+                return await this._finalizeGuardedRun(run, route, occurrenceBased, occurrenceBase, 'SUCCESS', 'recovered: canonical settlement confirmed');
             }
-        );
-
-        // Finalize the run inside its own transaction AFTER the reservation
-        // committed. The guarded PENDING claim makes concurrent recoveries
-        // of this run converge (loser rolls back without duplicating).
-        await this.prisma.$transaction(async (tx) => {
-            await this._finalizeRunInTx(tx, run, route, occurrenceBased, occurrenceBase, 'SUCCESS', null, {
-                withdrawalId: result.withdrawalRecord?.id ?? null,
-                amountGhs: result.payoutGhs,
-                rateUsed: result.retailRate,
+            if (existing.status !== 'PENDING') {
+                // Definitively reversed in an earlier attempt (admin
+                // rejection or provably-safe dispatch failure).
+                return await this._finalizeGuardedRun(run, route, occurrenceBased, occurrenceBase, 'FAILED_GATEWAY', 'recovered: reservation already reversed');
+            }
+            // Reservation is durable from an earlier attempt — resume at the
+            // dispatch boundary with the ORIGINALLY reserved GHS amount
+            // (§P.5-D: never recompute the payout after rate drift).
+            const mirror = existing.id
+                ? await this.prisma.withdrawal.findFirst({ where: { transactionHistoryId: existing.id } })
+                : null;
+            const meta = (existing.metadata && typeof existing.metadata === 'object') ? existing.metadata : {};
+            result = {
+                reference,
+                withdrawalRecord: mirror,
+                payoutGhs: meta.payoutGhs != null ? Number(meta.payoutGhs) : null,
+                retailRate: meta.retailRate != null ? Number(meta.retailRate) : null,
+                resumed: true,
+            };
+            // Durable dispatch evidence (intent or later) means provider I/O
+            // may already have happened — a re-drive must NEVER blindly issue
+            // a second provider call. Park for reconciliation (r16c rule).
+            const priorEvidence = await this.prisma.fiatProviderEvent.findFirst({
+                where: { relatedReference: reference, direction: 'OUTBOUND' },
             });
-        });
+            if (priorEvidence) {
+                await recordReconciliationExceptionLoud(this.prisma, {
+                    entityType: 'TRANSACTION',
+                    entityId: reference,
+                    reference,
+                    reason: 'SMART_ROUTE_RESUME_AFTER_DISPATCH_EVIDENCE',
+                    details: { evidence: priorEvidence.status, source: 'smart_route', rule: 'park, never re-dispatch on recovery' },
+                }).catch(() => {});
+                return await this._finalizeGuardedRun(run, route, occurrenceBased, occurrenceBase, 'AWAITING_RECONCILIATION', 'recovered after durable dispatch evidence — reconciliation owns the payout');
+            }
+            if (!mirror) {
+                await recordReconciliationExceptionLoud(this.prisma, {
+                    entityType: 'TRANSACTION',
+                    entityId: reference,
+                    reference,
+                    reason: 'SMART_ROUTE_RESUME_MIRROR_MISSING',
+                    details: { source: 'smart_route' },
+                }).catch(() => {});
+                return await this._finalizeGuardedRun(run, route, occurrenceBased, occurrenceBase, 'AWAITING_RECONCILIATION', 'recovered reservation has no withdrawal mirror — parked');
+            }
+        } else {
+            result = await financeService.processFiatWithdrawal(
+                this.prisma,
+                route.userId,
+                Number(route.amountUsdc),
+                {
+                    reference,
+                    // §P.5-D intended route identity (mirrors the direct fiat
+                    // controller: intent is the failover chain's primary rail;
+                    // the actual accepting provider is recorded post-dispatch).
+                    liquidityRoute: { provider: 'MOOLRE_DISBURSEMENT', rail: 'MOMO', destination: route.destMomoNumber },
+                    // r15 hardening contract: the Withdrawal reconciliation
+                    // record is created INSIDE the authoritative reservation
+                    // transaction, durably linked to the canonical row.
+                    createWithdrawalRecordInTransaction: async (tx, txRecord) => {
+                        const rows = await tx.$queryRawUnsafe(
+                            'INSERT INTO "Withdrawal" ' +
+                            '("userId", "amount", "payoutMethod", "network", "destination", "status", "transactionHistoryId", "createdAt", "updatedAt") ' +
+                            'VALUES ($1, $2, $3, $4, $5, $6, $7, now(), now()) ' +
+                            'RETURNING "id", "userId", "amount", "payoutMethod", "network", "destination", "status"',
+                            route.userId,
+                            Number(route.amountUsdc),
+                            route.destMomoProvider || 'MTN_MOMO',
+                            'MOMO',
+                            route.destMomoNumber,
+                            'PENDING',
+                            txRecord.id
+                        );
+                        return rows?.[0] || null;
+                    },
+                }
+            );
+            result.resumed = false;
+        }
 
-        // Provider dispatch through the failover service (r15 contract —
-        // the obsolete .dispatch() invocation is gone). Mirrors the direct
-        // controller's ordered bookkeeping: durable dispatch evidence
-        // first, then the canonical ownership write, parking loudly on
-        // failure — never auto-refunding a dispatched payout.
-        await this._dispatchMomoPayout(run, route, result);
+        const outcome = await this._dispatchMomoPayout(run, route, result, { occurrenceBased, occurrenceBase });
 
         const refreshed = await this.prisma.smartRouteRun.findUnique({ where: { id: run.id } });
-        await this._notifySuccess(route, amount, `Routed $${amount.toFixed(2)} to MoMo ${route.destMomoNumber}`);
+        if (outcome === 'ACCEPTED') {
+            await this._notifySuccess(route, amount, `Routed $${amount.toFixed(2)} to MoMo ${route.destMomoNumber}`);
+        }
         return refreshed;
     }
 
-    async _dispatchMomoPayout(run, route, reservation) {
+    /**
+     * r16c P0-B: dispatch stage — claim, evidence, provider I/O, and honest
+     * run finalization. Returns the dispatch outcome classification
+     * ('ACCEPTED' | 'REVERSED' | 'PARKED'). Never throws past the claim: the
+     * run reaches a durable terminal or parked state on every path.
+     */
+    async _dispatchMomoPayout(run, route, reservation, { occurrenceBased, occurrenceBase }) {
         const reference = reservation.reference;
         const phone = route.destMomoNumber;
         const payoutGhs = reservation.payoutGhs || reservation.withdrawalAmount;
 
+        // Dispatcher availability BEFORE any durable dispatch intent (r16c
+        // P0-B: deterministic pre-I/O failure). A missing dispatcher must
+        // never leave a SUCCESS run over an undispatched reservation — the
+        // reservation is reversed through the canonical state machine and
+        // the run fails definitively.
         if (!this.mtnDisbursementService || typeof this.mtnDisbursementService.initiateTransfer !== 'function') {
-            logger.error({ reference, runId: run.id }, '[SmartRoute] disbursement service unavailable — reconciler will surface the PENDING withdrawal');
-            return;
+            logger.error({ reference, runId: run.id }, '[SmartRoute] disbursement service unavailable — reversing reservation, run fails definitively');
+            try {
+                await financeService.reverseFiatWithdrawal(this.prisma, reference, {
+                    reason: 'smart_route_dispatcher_unavailable'
+                });
+                await this._markMirrorFailed(reservation, 'DISPATCHER_UNAVAILABLE');
+            } catch (revErr) {
+                logger.error({ err: revErr, reference, runId: run.id },
+                    '[SmartRoute] CRITICAL: dispatcher-unavailable reversal failed — parking for reconciliation');
+                await recordReconciliationExceptionLoud(this.prisma, {
+                    entityType: 'TRANSACTION',
+                    entityId: reference,
+                    reference,
+                    reason: 'SMART_ROUTE_DISPATCHER_UNAVAILABLE_REVERSAL_FAILED',
+                    details: { reversalError: revErr.message },
+                }).catch(() => {});
+                await this._finalizeGuardedRun(run, route, occurrenceBased, occurrenceBase, 'AWAITING_RECONCILIATION', 'dispatcher unavailable and reversal failed — parked, never refunded by guess');
+                return 'PARKED';
+            }
+            await this._finalizeGuardedRun(run, route, occurrenceBased, occurrenceBase, 'FAILED_OTHER', 'dispatcher unavailable — reservation reversed');
+            return 'REVERSED';
         }
 
-        // r16 P0-C: durable DISPATCH_INTENT evidence BEFORE provider I/O —
-        // admin rejection fails closed on ANY outbound evidence for the
-        // reference (intent included), so a dispatch in flight can never be
-        // auto-refunded. If the intent write fails we do not start I/O; the
-        // canonical reservation is reversed through the state machine.
+        // ── r16c P0-A: DB-AUTHORITATIVE DISPATCH CLAIM ─────────────────────
+        // Mutually exclusive with admin rejection (conditional PENDING →
+        // REJECTED inside the reversal transaction) and the payout worker
+        // (PENDING → PROCESSING). Exactly one winner; only the winner may
+        // touch the provider or the money.
+        if (reservation.withdrawalRecord?.id) {
+            const claim = await this.prisma.withdrawal.updateMany({
+                where: { id: reservation.withdrawalRecord.id, status: 'PENDING' },
+                data: { status: 'DISPATCHING' },
+            });
+            if (claim.count !== 1) {
+                const canonical = await this.prisma.transactionHistory.findUnique({ where: { txHash: reference } });
+                if (canonical && canonical.status === 'FAILED') {
+                    // Admin rejection won and already reversed + restored the
+                    // user — converge, never reverse again.
+                    await this._finalizeGuardedRun(run, route, occurrenceBased, occurrenceBase, 'FAILED_OTHER', 'mirror claimed concurrently (admin rejection) — canonical already reversed');
+                    return 'REVERSED';
+                }
+                // Payout worker claimed the mirror — it owns the dispatch;
+                // never double-dispatch the same payout.
+                await recordReconciliationExceptionLoud(this.prisma, {
+                    entityType: 'TRANSACTION',
+                    entityId: reference,
+                    reference,
+                    reason: 'SMART_ROUTE_MIRROR_CLAIMED_CONCURRENTLY',
+                    details: { rule: 'park, never double-dispatch' },
+                }).catch(() => {});
+                await this._finalizeGuardedRun(run, route, occurrenceBased, occurrenceBase, 'AWAITING_RECONCILIATION', 'mirror claimed concurrently — parked, never double-dispatched');
+                return 'PARKED';
+            }
+        }
+
+        // r16 P0-C: durable DISPATCH_INTENT evidence BEFORE any provider I/O.
+        // If the intent write fails we do not start I/O; the canonical
+        // reservation is reversed through the state machine and the run
+        // fails definitively (no SUCCESS without dispatch).
         try {
             await fiatLiquidity.recordProviderEvent(this.prisma, {
                 provider: 'AZM_DISPATCHER',
@@ -473,17 +596,26 @@ class SmartRouteService {
         } catch (intentErr) {
             logger.error({ err: intentErr, reference, runId: run.id },
                 '[SmartRoute] dispatch-intent evidence failed — NOT starting provider I/O');
-            await financeService.reverseFiatWithdrawal(this.prisma, reference, {
-                reason: 'smart_route_dispatch_intent_evidence_failed'
-            }).catch(() => {});
-            await recordReconciliationExceptionLoud(this.prisma, {
-                entityType: 'TRANSACTION',
-                entityId: reference,
-                reference,
-                reason: 'SMART_ROUTE_DISPATCH_INTENT_FAILED',
-                details: { error: intentErr.message },
-            }).catch(() => {});
-            return;
+            try {
+                await financeService.reverseFiatWithdrawal(this.prisma, reference, {
+                    reason: 'smart_route_dispatch_intent_evidence_failed'
+                });
+                await this._markMirrorFailed(reservation, 'INTENT_EVIDENCE_FAILED');
+                await this._finalizeGuardedRun(run, route, occurrenceBased, occurrenceBase, 'FAILED_OTHER', 'dispatch intent evidence failed — reservation reversed');
+                return 'REVERSED';
+            } catch (revErr) {
+                logger.error({ err: revErr, reference, runId: run.id },
+                    '[SmartRoute] CRITICAL: intent-failure reversal failed — parking for reconciliation');
+                await recordReconciliationExceptionLoud(this.prisma, {
+                    entityType: 'WITHDRAWAL',
+                    entityId: String(reservation.withdrawalRecord?.id || reference),
+                    reference,
+                    reason: 'SMART_ROUTE_DISPATCH_INTENT_FAILED',
+                    details: { intentError: intentErr.message, reversalError: revErr.message },
+                }).catch(() => {});
+                await this._finalizeGuardedRun(run, route, occurrenceBased, occurrenceBase, 'AWAITING_RECONCILIATION', 'dispatch intent evidence failed and reversal failed — parked');
+                return 'PARKED';
+            }
         }
 
         let dispatch = null;
@@ -497,16 +629,39 @@ class SmartRouteService {
                 payeeNote: `Smart Route ${route.name} ${reference}`,
             });
         } catch (dispatchErr) {
-            // Synchronous dispatch failure: the provider never received the
-            // payout — reverse the canonical reservation through the
-            // canonical reversal state machine (same as the direct
-            // controller). The user is refunded atomically.
-            logger.error({ err: dispatchErr, reference, runId: run.id },
+            // ── r15 R15-D outcome honesty (ported from the direct controller) ──
+            // A thrown error is NOT proof the provider refused. Only
+            // NOT_DISPATCHED / DEFINITIVE_REJECTION are provably safe to
+            // unwind; anything ambiguous (UNKNOWN_OUTCOME,
+            // DUPLICATE_REFERENCE, unclassified) may still be in flight —
+            // auto-refunding double-spends, so park for reconciliation.
+            const dispatchOutcome = dispatchErr?.providerOutcome || null;
+            const SAFE_TO_UNWIND = dispatchOutcome === 'NOT_DISPATCHED' || dispatchOutcome === 'DEFINITIVE_REJECTION';
+
+            if (!SAFE_TO_UNWIND) {
+                logger.error({ err: dispatchErr, outcome: dispatchOutcome, reference, runId: run.id },
+                    '[SmartRoute] MoMo dispatch outcome UNKNOWN — NOT refunding; payout may be in flight');
+                await recordReconciliationExceptionLoud(this.prisma, {
+                    entityType: 'TRANSACTION',
+                    entityId: reference,
+                    reference,
+                    reason: 'SMART_ROUTE_DISPATCH_OUTCOME_UNKNOWN_NO_REFUND',
+                    details: { outcome: dispatchOutcome || 'UNCLASSIFIED', error: dispatchErr.message, source: 'smart_route' },
+                }).catch(() => {});
+                await this._finalizeGuardedRun(run, route, occurrenceBased, occurrenceBase, 'AWAITING_RECONCILIATION', 'dispatch outcome unknown — parked, never refunded by guess');
+                return 'PARKED';
+            }
+
+            // Provably no disbursement happened — unwind exactly once.
+            logger.error({ err: dispatchErr, outcome: dispatchOutcome, reference, runId: run.id },
                 '[SmartRoute] MoMo dispatch failed synchronously — reversing canonical reservation');
             try {
                 await financeService.reverseFiatWithdrawal(this.prisma, reference, {
                     reason: `smart_route_dispatch_failure:${dispatchErr.message}`
                 });
+                await this._markMirrorFailed(reservation, 'DISPATCH_FAILED');
+                await this._finalizeGuardedRun(run, route, occurrenceBased, occurrenceBase, 'FAILED_GATEWAY', `provider rejected: ${dispatchErr.message}`);
+                return 'REVERSED';
             } catch (revErr) {
                 logger.error({ err: revErr, reference, runId: run.id },
                     '[SmartRoute] CRITICAL: dispatch-failure reversal failed — reconciler must resolve the PENDING withdrawal');
@@ -517,8 +672,9 @@ class SmartRouteService {
                     reason: 'SMART_ROUTE_DISPATCH_REVERSAL_FAILED',
                     details: { dispatchError: dispatchErr.message, reversalError: revErr.message },
                 }).catch(() => {});
+                await this._finalizeGuardedRun(run, route, occurrenceBased, occurrenceBase, 'AWAITING_RECONCILIATION', 'dispatch failed and reversal failed — parked, never refunded by guess');
+                return 'PARKED';
             }
-            return;
         }
 
         // Actual accepting provider identity from dispatch facts ONLY
@@ -539,7 +695,8 @@ class SmartRouteService {
                 reason: 'DISPATCH_IDENTITY_UNKNOWN',
                 details: { dispatched: true, source: 'smart_route', error: 'no failover tag and no adapter identity on an accepted dispatch' },
             }).catch(() => {});
-            return;
+            await this._finalizeGuardedRun(run, route, occurrenceBased, occurrenceBase, 'AWAITING_RECONCILIATION', 'accepted dispatch has no provider identity — parked');
+            return 'PARKED';
         }
 
         // Durable dispatch observation FIRST (the fallback owner authority),
@@ -567,7 +724,15 @@ class SmartRouteService {
                 reason: 'POST_DISPATCH_BOOKKEEPING_FAILED',
                 details: { stage: 'DISPATCH_EVIDENCE', provider: actualProviderName, source: 'smart_route', error: evidenceErr.message },
             }).catch(() => {});
-            return;
+            // The provider DID accept the dispatch — the run honestly
+            // reached the successful dispatch state; the open exception
+            // tracks the bookkeeping failure for the reconciliation worker.
+            await this._finalizeGuardedRun(run, route, occurrenceBased, occurrenceBase, 'SUCCESS', 'dispatch accepted — evidence write failed, exception parked', {
+                withdrawalId: reservation.withdrawalRecord?.id ?? null,
+                amountGhs: reservation.payoutGhs,
+                rateUsed: reservation.retailRate,
+            });
+            return 'ACCEPTED';
         }
 
         if (actualProviderTag) {
@@ -590,7 +755,30 @@ class SmartRouteService {
                 }).catch(() => {});
             }
         }
+
+        // Provider accepted: the scheduled execution genuinely reached the
+        // intended successful dispatch state. The canonical fiat
+        // TransactionHistory stays PENDING until the settlement webhook /
+        // reconciler resolves it — the run never pretended to own settlement.
+        await this._finalizeGuardedRun(run, route, occurrenceBased, occurrenceBase, 'SUCCESS', null, {
+            withdrawalId: reservation.withdrawalRecord?.id ?? null,
+            amountGhs: reservation.payoutGhs,
+            rateUsed: reservation.retailRate,
+        });
+        return 'ACCEPTED';
     }
+
+    /** r16c: best-effort mirror failure mark (non-fatal — reversal owns truth). */
+    async _markMirrorFailed(reservation, stage) {
+        if (!reservation?.withdrawalRecord?.id) return;
+        try {
+            await this.prisma.withdrawal.update({
+                where: { id: reservation.withdrawalRecord.id },
+                data: { status: 'FAILED' },
+            });
+        } catch (_) { /* non-fatal */ }
+    }
+
 
     async _executeTransfer(run, route, occurrenceBased, occurrenceBase) {
         const amount = new Prisma.Decimal(route.amountUsdc);

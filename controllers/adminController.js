@@ -1621,11 +1621,14 @@ exports.rejectWithdrawal = async (req, res) => {
 
         // ── LEGACY PATH (no canonical TransactionHistory at all) ───────────
         // Pre-P4 mirror-only rows: the refund draws on the restricted reserve
-        // when a P4 obligation exists, otherwise on platform equity. The
-        // obligation lookup now covers ALL three obligation prefixes,
-        // including the direct-fi `withdrawal:fiat:{reference}` obligations
-        // created by processFiatWithdrawal (the old lookup only checked
-        // withdrawal:wallet:* and withdrawal:smartroute:*).
+        // when a deterministic, identity-derived P4 obligation exists
+        // (withdrawal:wallet:{id} / withdrawal:smartroute:{id}), otherwise on
+        // platform equity. r16c: the previous lookup also matched ANY active
+        // `withdrawal:fiat:*` obligation with a startsWith prefix — an
+        // arbitrary, unrelated obligation (any user, any payout) could be
+        // consumed here. A mirror-only legacy row has NO canonical reference
+        // to derive a fiat obligation from, so no fiat obligation is ever
+        // guessed for it. Never guess a financial obligation identity.
         await prisma.$transaction(async (tx) => {
             const claimed = await tx.withdrawal.updateMany({
                 where: { id: withdrawalId, status: 'PENDING' },
@@ -1646,10 +1649,10 @@ exports.rejectWithdrawal = async (req, res) => {
             const activeObligation = await tx.restrictedObligation.findFirst({
                 where: {
                     status: 'ACTIVE',
+                    userId: withdrawal.userId,
                     OR: [
                         { reference: `withdrawal:wallet:${withdrawal.id}` },
                         { reference: `withdrawal:smartroute:${withdrawal.id}` },
-                        { reference: { startsWith: 'withdrawal:fiat:' } },
                     ],
                 },
             });

@@ -587,6 +587,12 @@ enum SmartRouteRunStatus {
   FAILED_GATEWAY
   FAILED_OTHER
   SKIPPED
+  // r16c P0-B: dispatch reached a durable state whose outcome the run
+  // itself must NOT guess (intent written, outcome unknown, or provider
+  // accepted but finalization crashed). The canonical fiat Transaction-
+  // History owns settlement; recovery never re-drives this run, the
+  // reconciliation worker owns resolution.
+  AWAITING_RECONCILIATION
 }
 
 // ── PHASE 4: AZM AUCTION ────────────────────────────────────────────
