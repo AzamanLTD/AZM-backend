@@ -17,11 +17,12 @@
 //     themselves until the backfill re-writes them.
 //   • Idempotent — `encrypt()` returns an already-encrypted value as-is,
 //     so re-running the backfill or double-wrapping is safe.
-//   • Fail-soft on missing key — if ENCRYPTION_KEY is not set, encrypt()
-//     passes the plaintext through (with a one-time warning) rather than
-//     throwing, so KYC writes never break. Set the key in prod to turn
-//     encryption on. decrypt() of a real ciphertext WITHOUT a key throws
-//     (we must not silently return garbage).
+//   • PRODUCTION FAIL-CLOSED — in NODE_ENV=production a missing or invalid
+//     ENCRYPTION_KEY makes encrypt() THROW (the KYC write is refused; the
+//     user stays PENDING; no government identifier ever lands plaintext).
+//     Local/test ergonomics are preserved: outside production a missing key
+//     passes the plaintext through with a one-time warning. decrypt() of a
+//     real ciphertext WITHOUT a key always throws (never silent garbage).
 //
 // Key: ENCRYPTION_KEY env var — 32 bytes, provided as 64-hex-char or
 // base64 (44-char). Generate with:
@@ -61,23 +62,59 @@ function isEncrypted(value) {
 }
 
 /**
+ * True when a valid 32-byte ENCRYPTION_KEY is configured. Boot paths and
+ * KYC preflight guards use this to fail closed BEFORE accepting sensitive
+ * input in production.
+ */
+function isKeyAvailable() {
+  try {
+    return _resolveKey() !== null;
+  } catch {
+    return false; // present but INVALID (wrong length/format) — also fail closed
+  }
+}
+
+/**
  * Encrypt a plaintext string. Returns the `enc:v1:…` envelope. Idempotent
  * (already-encrypted input is returned unchanged). Null/empty passes through.
+ *
+ * PRODUCTION CONTRACT: in NODE_ENV=production a missing or invalid
+ * ENCRYPTION_KEY THROWS — live KYC must never write a government
+ * identifier plaintext because of server misconfiguration. The KYC service
+ * refuses the verification and the user stays PENDING; the write simply does
+ * not happen. Outside production the historical fail-soft passthrough is
+ * preserved for local/test ergonomics.
  */
 function encrypt(plaintext) {
   if (plaintext == null || plaintext === '') return plaintext;
-  if (isEncrypted(plaintext)) return plaintext; // idempotent
+  if (isEncrypted(plaintext)) return plaintext; // idempotent — never throws: no NEW plaintext is written
 
-  const key = _resolveKey();
+  let key = null;
+  let keyError = null;
+  try {
+    key = _resolveKey();
+  } catch (e) {
+    keyError = e; // invalid key format — production must fail closed on this too
+  }
+
   if (!key) {
+    if (process.env.NODE_ENV === 'production') {
+      throw new Error(
+        '[fieldCipher] SENSITIVE-FIELD WRITE REFUSED: ENCRYPTION_KEY is ' +
+        (keyError ? `invalid (${keyError.message})` : 'not set') +
+        '. Live KYC cannot store government identifiers in plaintext — ' +
+        'fix the production configuration. The write did not happen.',
+      );
+    }
     if (!_warned) {
       logger.warn(
         '[fieldCipher] ENCRYPTION_KEY not set — sensitive fields are stored ' +
-        'in PLAINTEXT. Set ENCRYPTION_KEY to enable at-rest encryption.',
+        'in PLAINTEXT (non-production fail-soft). Set ENCRYPTION_KEY to ' +
+        'enable at-rest encryption.',
       );
       _warned = true;
     }
-    return plaintext; // fail-soft so KYC writes never break
+    return plaintext;
   }
 
   const iv = crypto.randomBytes(IV_BYTES);
@@ -146,4 +183,5 @@ function isConfigured() {
   }
 }
 
-module.exports = { encrypt, decrypt, tryDecrypt, isEncrypted, isConfigured };
+module.exports = {
+  isKeyAvailable, encrypt, decrypt, tryDecrypt, isEncrypted, isConfigured };

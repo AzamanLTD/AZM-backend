@@ -154,6 +154,22 @@ class DojahKYCService {
             return { success: false, message: 'Invalid userId.' };
         }
 
+        // ── r15 follow-up (production fail-closed contract): live KYC must
+        // never accept — let alone persist — a government identifier when
+        // at-rest encryption is not correctly configured. Refuse BEFORE any
+        // provider I/O and before the PENDING stamp; the user's existing
+        // status is untouched and no document is collected.
+        if (process.env.NODE_ENV === 'production' && !fieldCipher.isKeyAvailable()) {
+            logger.error(
+                '[KYC/Dojah] VERIFICATION REFUSED — ENCRYPTION_KEY missing or invalid in production. ' +
+                'Live KYC is disabled until at-rest encryption (fieldCipher) is configured.',
+            );
+            return {
+                success: false,
+                message: 'KYC is temporarily unavailable. Please try again later.',
+            };
+        }
+
         // Prevent re-verification if already verified.
         const user = await this.prisma.user.findUnique({
             where: { id: userIdInt },
@@ -263,6 +279,14 @@ class DojahKYCService {
      * Identical contract to kycService.processWebhook.
      */
     async processWebhook(payload, signature, rawBody) {
+        // ── r15 follow-up (production fail-closed contract): same guard as
+        // initializeSession — the webhook persists idNumber too.
+        if (process.env.NODE_ENV === 'production' && !fieldCipher.isKeyAvailable()) {
+            logger.error(
+                '[KYC/Dojah] WEBHOOK REFUSED — ENCRYPTION_KEY missing or invalid in production.',
+            );
+            return { success: false, message: 'KYC is temporarily unavailable.' };
+        }
         if (!this._verifyWebhookSignature(payload, signature, rawBody)) {
             logger.error('❌ [KYC/Dojah] Webhook signature verification FAILED');
             return { success: false, message: 'Invalid webhook signature.' };

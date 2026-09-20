@@ -23,6 +23,17 @@ it. (The `20260920060000_r15_receipt_available_unique` migration file was
 removed for exactly this reason — the fiat-liquidity overlay creates that
 unique index.)
 
+## Production-required environment variables (fail-closed contracts)
+
+- `ENCRYPTION_KEY` - 32-byte key (64 hex chars or 44-char base64) for the
+  field-level AES-256-GCM encryption of KYC government identifiers
+  (`services/crypto/fieldCipher.js`). With `NODE_ENV=production` and this key
+  missing or invalid, live KYC REFUSES every verification and webhook before
+  any provider I/O - a government ID number can never be persisted plaintext
+  because of a misconfigured deploy. Local/test environments keep the
+  fail-soft plaintext passthrough explicitly, and only outside production.
+  Generate: `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"`
+
 ## New environment variables to add on Render BEFORE deploying:
 
   SMART_ESCROW_FEE_PCT=0.005
