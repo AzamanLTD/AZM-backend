@@ -254,10 +254,20 @@ class MoolreDisbursementService {
             // Moolre wraps EVERY response in { status, code, message, data, go }.
             const { ok, data, message, code } = this._unwrap(envelope);
             if (!ok) {
-                // A synchronous rejection (status: 0). Surface the provider
-                // message so finance.controller's catch can reverse + return 502,
-                // exactly as it does for an MTN rejection.
-                throw new Error(message || code || 'Moolre rejected the payout.');
+                // A synchronous rejection (status: 0) inside an HTTP-200 body.
+                // Surface the provider message so finance.controller's catch can
+                // reverse + return 502, exactly as it does for an MTN rejection.
+                //
+                // r15 follow-up (audit P0): PRESERVE the raw envelope on the
+                // thrown error. A bare Error here reached
+                // _initiationOutcomeError() with no err.response — so an
+                // EXPLICIT Moolre rejection was misclassified as
+                // UNKNOWN_OUTCOME (payout "may be in flight"), blocking the
+                // safe unwind and parking the withdrawal instead of failing
+                // closed. The envelope is the classification authority.
+                const rejection = new Error(message || code || 'Moolre rejected the payout.');
+                rejection.moolreEnvelope = envelope;
+                throw rejection;
             }
 
             // Moolre may settle synchronously OR return a PENDING that settles via
@@ -401,8 +411,18 @@ class MoolreDisbursementService {
      * is transport-level (may have been accepted).
      */
     _initiationOutcomeError(err, { referenceId = null } = {}) {
-        const env = err.response?.data;
-        if (env && typeof env === 'object' && (env.code || env.message)) {
+        // r15 follow-up (audit P0): an HTTP-200 { status: 0 } rejection is
+        // rethrown by initiateTransfer with the raw envelope attached
+        // (err.moolreEnvelope) — a normal axios failure carries the envelope
+        // on err.response.data. Both are authoritative envelope answers.
+        const env = err.moolreEnvelope || err.response?.data;
+        // Moolre's envelope carries status as an INTEGER (1 = success,
+        // 0 = failure). status: 0 IS an explicit application-level refusal
+        // even when code/message are empty — never classify a provider
+        // ANSWER as "may have been accepted".
+        const isEnvelopeAnswer = env && typeof env === 'object'
+            && (Number(env.status) === 0 || env.code || env.message);
+        if (isEnvelopeAnswer) {
             const envCode = String(env.code || '');
             if (envCode === 'TP13' || /duplicate/i.test(String(env.message || ''))) {
                 // Moolre ALREADY holds this externalref — a transfer may already

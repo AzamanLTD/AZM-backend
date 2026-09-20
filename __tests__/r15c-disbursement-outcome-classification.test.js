@@ -111,6 +111,45 @@ describe('r15 R15-C: disbursement adapter outcome classification', () => {
             .rejects.toMatchObject({ providerOutcome: PROVIDER_OUTCOMES.DEFINITIVE_REJECTION, code: 'TP99' });
     });
 
+    // ── r15 follow-up (audit P0): HTTP-200 + { status: 0 } rejections ──────
+    // Moolre's contract (docs.moolre.com/ai/guides/errors-and-status-codes):
+    // the envelope { status, code, message, data } rides INSIDE an HTTP 200.
+    // A status: 0 answer is an explicit application-level rejection even
+    // though axios resolves normally. The adapter unwraps it and rethrows —
+    // the envelope MUST survive so _initiationOutcomeError() classifies it
+    // as a definitive answer, not UNKNOWN_OUTCOME. The original suite only
+    // mocked axios REJECTING (err.response.data) and never exercised this —
+    // the far more important production path.
+    test('HTTP 200 + { status: 0, code } → DEFINITIVE_REJECTION (envelope must survive the rethrow)', async () => {
+        axiosSpy.mockResolvedValueOnce({ data: { status: 0, code: 'TP99', message: 'Insufficient float', data: null, go: null } });
+        const err = await service.initiateTransfer(PAYLOAD).catch(e => e);
+        expect(err.providerOutcome).toBe(PROVIDER_OUTCOMES.DEFINITIVE_REJECTION);
+        expect(err.code).toBe('TP99');
+        expect(err.message).toMatch(/Insufficient float/);
+    });
+
+    test('HTTP 200 + { status: 0, code: TP13 } → DUPLICATE_REFERENCE, isDuplicate — never re-instruct', async () => {
+        axiosSpy.mockResolvedValueOnce({ data: { status: 0, code: 'TP13', message: 'Duplicate reference supplied', data: null, go: null } });
+        const err = await service.initiateTransfer(PAYLOAD).catch(e => e);
+        expect(err.providerOutcome).toBe(PROVIDER_OUTCOMES.DUPLICATE_REFERENCE);
+        expect(err.isDuplicate).toBe(true);
+    });
+
+    test('HTTP 200 + { status: 0, duplicate message, no code } → DUPLICATE_REFERENCE', async () => {
+        axiosSpy.mockResolvedValueOnce({ data: { status: 0, code: null, message: 'Duplicate externalref supplied', data: null, go: null } });
+        const err = await service.initiateTransfer(PAYLOAD).catch(e => e);
+        expect(err.providerOutcome).toBe(PROVIDER_OUTCOMES.DUPLICATE_REFERENCE);
+        expect(err.isDuplicate).toBe(true);
+    });
+
+    test('HTTP 200 + empty envelope ({ status: 0, no code, no message }) → DEFINITIVE_REJECTION, not UNKNOWN (Moolre answered)', async () => {
+        axiosSpy.mockResolvedValueOnce({ data: { status: 0, code: null, message: null, data: null, go: null } });
+        const err = await service.initiateTransfer(PAYLOAD).catch(e => e);
+        // status: 0 IS an explicit refusal — a provider that answered with a
+        // failure envelope must never be treated as "may have been accepted".
+        expect(err.providerOutcome).toBe(PROVIDER_OUTCOMES.DEFINITIVE_REJECTION);
+    });
+
     test('validation guards → NOT_DISPATCHED (no provider I/O ever occurred)', async () => {
         await expect(service.initiateTransfer({ referenceId: 'x', amountGhs: 0 }))
             .rejects.toMatchObject({ providerOutcome: PROVIDER_OUTCOMES.NOT_DISPATCHED });
