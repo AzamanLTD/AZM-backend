@@ -110,7 +110,10 @@ describeOrSkip('§P.5-E r13: early-callback race matrix + providerRef canonicali
             res,
         );
         expect(res.statusCode).toBe(201);
-        return prisma.transactionHistory.findFirst({ where: { userId, type: 'DEPOSIT_FIAT', status: 'PENDING' }, orderBy: { id: 'desc' } });
+        // r14 §S: TH ids are UUIDs — lexical ordering is a coin-flip; bind to the
+        // 201 payload's reference instead of guessing the newest PENDING row.
+        expect(res.payload?.data?.reference).toBeTruthy();
+        return await prisma.transactionHistory.findUnique({ where: { txHash: res.payload.data.reference } });
     };
     const initiateGeneric = async (userId, amountGhs = 100) => {
         const res = mockResponse();
@@ -119,7 +122,10 @@ describeOrSkip('§P.5-E r13: early-callback race matrix + providerRef canonicali
             res,
         );
         expect(res.statusCode).toBe(201);
-        return prisma.transactionHistory.findFirst({ where: { userId, type: 'DEPOSIT_FIAT', status: 'PENDING' }, orderBy: { id: 'desc' } });
+        // r14 §S: TH ids are UUIDs — lexical ordering is a coin-flip; bind to the
+        // 201 payload's reference instead of guessing the newest PENDING row.
+        expect(res.payload?.data?.reference).toBeTruthy();
+        return await prisma.transactionHistory.findUnique({ where: { txHash: res.payload.data.reference } });
     };
     const moolreWebhook = async (txHash, amount = 100) => {
         const res = mockResponse();

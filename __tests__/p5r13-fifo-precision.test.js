@@ -121,7 +121,12 @@ describeOrSkip('§P.5-E r13: FIFO cost-basis proration precision (real PostgreSQ
             res,
         );
         expect(res.statusCode).toBe(201);
-        const pending = await prisma.transactionHistory.findFirst({ where: { userId: user.id, type: 'DEPOSIT_FIAT', status: 'PENDING' }, orderBy: { id: 'desc' } });
+                // r14 §S harness integrity: TransactionHistory ids are UUIDs — ordering by
+        // them is a lexical coin-flip. Bind to the 201 body's reference instead of
+        // guessing the newest PENDING row (two same-user pending deposits made the
+        // old findFirst(id desc) return the wrong/same row ~50% of runs).
+        expect(res.payload?.data?.reference).toBeTruthy();
+        const pending = await prisma.transactionHistory.findUnique({ where: { txHash: res.payload.data.reference } });
         const quote = await consumeTransactionQuote({ prisma, quoteId: pending.metadata.quoteId, userId: user.id, purpose: 'deposit' });
         // the mounted webhook's committed amount: the EXACT 8dp projection
         const th = await prisma.transactionHistory.update({

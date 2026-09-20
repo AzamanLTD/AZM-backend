@@ -649,6 +649,9 @@ exports.webhook = async (req, res) => {
           reference: externalRef,
           relatedTransactionId: existing.id,
           eventDedupKey: providerEvent.dedupKey,
+          // §L (r14): the receipt names the deposit's OWN quote — the
+          // evidence chain re-proves the r13 metadata binding.
+          quoteId,
           evidence: {
             source: 'moolre_collection',
             quoteId,

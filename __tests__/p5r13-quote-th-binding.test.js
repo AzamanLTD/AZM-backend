@@ -108,7 +108,14 @@ describeOrSkip('§P.5-E r13: TransactionHistory ↔ TransactionQuote binding (re
             res,
         );
         expect(res.statusCode).toBe(201);
-        return prisma.transactionHistory.findFirst({ where: { userId: user.id, type: 'DEPOSIT_FIAT', status: 'PENDING' }, orderBy: { id: 'desc' } });
+        // r14 §S harness integrity: TransactionHistory ids are UUIDs — ordering
+        // by them is lexical coin-flip, and this helper used findFirst(id desc)
+        // to guess "the deposit I just created". With two PENDING deposits the
+        // guess silently returned the WRONG (or the same) row ~50% of runs.
+        // The 201 body names the exact row — bind to it deterministically.
+        const reference = res.payload?.data?.reference;
+        expect(reference).toBeTruthy();
+        return await prisma.transactionHistory.findUnique({ where: { txHash: reference } });
     }
 
     async function acquireEligibleLot(quantity = '500', cost = '6000') {

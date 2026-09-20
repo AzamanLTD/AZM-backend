@@ -382,3 +382,69 @@ reservations.
    `ReconciliationException` rows (existing infra), fail-closed, never auto-repair.
 10. P4 liability/restricted-obligation semantics are untouched; P5-D never posts
    customer economics; no quote-only spread/P&L; `pnl:inventory` untouched.
+
+## 6. Receipt ownership & replay identity (audit r14)
+
+The r14 audit hardened the authority's idempotency boundary under GENUINE
+PostgreSQL concurrency. All of it is proven by
+`__tests__/p5r14-receipt-race-identity.test.js` (real PG, Prisma never mocked,
+deliberate interlocked transactions that hold the winner open past its write so
+the loser genuinely blocks on the uncommitted row/index entry).
+
+### 6.1 §A — the ownership claim is ONE atomic guarded INSERT
+
+`recordReceipt` owns its dedupKey with
+`INSERT ... ON CONFLICT (dedupKey) DO NOTHING RETURNING ...`:
+
+- The creator branch runs ONLY on `RETURNING` non-empty; it is the ONLY code
+  that performs the liquidity increment. Exactly one increment per identity,
+  by construction, under any interleaving.
+- A concurrent duplicate NEVER surfaces Prisma P2002 (which would abort the
+  loser's whole PostgreSQL transaction): `ON CONFLICT DO NOTHING` blocks until
+  the concurrent winner commits or rolls back, then returns zero rows. The
+  loser re-reads the authoritative row INSIDE the same still-valid
+  transaction and converges with `{ replay: true, raced: true }` and ZERO
+  mutation.
+
+### 6.2 §B — ONE dedupKey names ONE receipt (full replay identity)
+
+A replay must match the FULL semantic economics, not just the key. The
+identity is asserted from DURABLE receipt columns — provider, rail,
+amountGhs (compared as exact `Decimal(20,2)`-canonical strings, never Prisma
+Decimal object identity), route, reference, eventDedupKey, relatedTransactionId
+— PLUS the economic class (matched vs unmatched vs treasury). Any differing
+replay throws `LIQUIDITY_CONFLICTING_EVIDENCE` with the differing fields named,
+and mutates nothing. `providerRef` is enrichment-only: NULL→present is a
+database-enforced compare-and-set (a racing pair of DIFFERENT present refs has
+exactly one winner; the loser fails closed), a present ref is immutable and is
+never downgraded.
+
+### 6.3 §L — quote substitution is closed (with the r13 audit)
+
+`verifyDepositEvidenceChain` requires the receipt to name the deposit's OWN
+quote (the `TransactionHistory.metadata.quoteId` binding), and a matched
+receipt cannot be recorded — or REPLAYED — under a different quote id. A
+same-user TWIN quote with identical economics can never satisfy the chain:
+existence/consumption/user/route checks alone prove nothing about WHICH quote
+the deposit was initiated with.
+
+### 6.4 §M — payout identity is never last-writer-wins
+
+`markReservationInTransit` and `settleReservation` write the payout
+providerRef only through a compare-and-set on the NULL slot: a racing pair
+with different refs has exactly one winner; the loser fails closed (or, on a
+terminal row, is quarantined `RECONCILIATION_REQUIRED`). Same-ref replays
+converge side-effect free.
+
+### 6.5 Migration & harness notes
+
+- The P5-D migration is replay-safe (guarded `IF NOT EXISTS` /
+  `IF NOT EXISTS (SELECT ... FROM pg_constraint)` everywhere), matching the
+  overlay installer's convergent style.
+- Harness integrity (§S of the audit): deposit-initiation helpers in the
+  p5d/p5e/r10/r12/r13 suites used to "find the just-created deposit" via
+  `findFirst(orderBy: { id: 'desc' })` — but `TransactionHistory.id` is a
+  UUID, so that ordering is a lexical coin-flip that returned the WRONG row
+  ~50% of runs when a user had two PENDING deposits (it made the r13
+  binding suite's two-deposit test flaky). All helpers now bind to the 201
+  body's `data.reference` (`findUnique` by txHash) — deterministic.

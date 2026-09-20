@@ -74,6 +74,14 @@ const STATEMENTS = [
      ON "FiatLiquidityReceipt"("provider", "providerRef");`,
   `CREATE INDEX IF NOT EXISTS "FiatLiquidityReceipt_relatedTransactionId_idx"
      ON "FiatLiquidityReceipt"("relatedTransactionId");`,
+
+  // §P.5-D audit r14 (§B): durable receipt replay identity — the deposit
+  // txHash binding and the backing provider observation become columns so
+  // the replay identity NEVER depends on arbitrary raw JSON evidence.
+  `ALTER TABLE "FiatLiquidityReceipt" ADD COLUMN IF NOT EXISTS "reference" TEXT;`,
+  `ALTER TABLE "FiatLiquidityReceipt" ADD COLUMN IF NOT EXISTS "eventDedupKey" TEXT;`,
+  `CREATE INDEX IF NOT EXISTS "FiatLiquidityReceipt_eventDedupKey_idx"
+     ON "FiatLiquidityReceipt"("eventDedupKey");`,
   `ALTER TABLE "FiatLiquidityReceipt" DROP CONSTRAINT IF EXISTS "FiatLiquidityReceipt_amount_positive";`,
   `ALTER TABLE "FiatLiquidityReceipt" ADD CONSTRAINT "FiatLiquidityReceipt_amount_positive"
      CHECK ("amountGhs" > 0);`,

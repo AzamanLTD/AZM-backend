@@ -106,7 +106,10 @@ describeOrSkip('§P.5-E r13: exact quote-authority propagation (real PostgreSQL)
             res,
         );
         expect(res.statusCode).toBe(201);
-        const pending = await prisma.transactionHistory.findFirst({ where: { userId, type: 'DEPOSIT_FIAT', status: 'PENDING' }, orderBy: { id: 'desc' } });
+        // r14 §S: TH ids are UUIDs — lexical ordering is a coin-flip; bind to the
+        // 201 body's reference instead of guessing the newest PENDING row.
+        expect(res.payload?.data?.reference).toBeTruthy();
+        const pending = await prisma.transactionHistory.findUnique({ where: { txHash: res.payload.data.reference } });
         expect(pending).not.toBeNull();
         return pending;
     };
