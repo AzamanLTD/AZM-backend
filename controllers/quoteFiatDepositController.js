@@ -100,8 +100,12 @@ exports.initiate = async (req, res) => {
       const reference = `${FIAT_REF_PREFIX}${userId}_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
       const tx = await db.transactionHistory.create({
         data: {
-          userId, type: 'DEPOSIT_FIAT', amountUsdc: quote.usdcAmount, feeUsdc: 0, txHash: reference, status: 'PENDING', initiatedByUserId: userId,
-          metadata: { provider, amountGhs: quote.amountGhs, quoteId: quote.id, quoteAmountUsdc: quote.usdcAmount, quoteExpiresAt: quote.expiresAt, rateAtInitiation: quote.rateGhsPerUsdc, rateSource: quote.rateSource, rateAsOf: quote.rateAsOf, selectedRoute: quote.selectedRoute, routeProviderRail: quote.routeProviderRail, routePolicyVersion: quote.routePolicyVersion },
+          // §P.5-E audit r13 (§2): the pending row's projection derives from
+          // the EXACT persisted 12dp quote string — never the lossy Number
+          // projection (PostgreSQL applies the same 8dp HALF_UP the Model B
+          // binding re-derives, so the row and the quote can never disagree).
+          userId, type: 'DEPOSIT_FIAT', amountUsdc: quote._usdcAmountExact ?? quote.usdcAmount, feeUsdc: 0, txHash: reference, status: 'PENDING', initiatedByUserId: userId,
+          metadata: { provider, amountGhs: quote.amountGhs, amountGhsExact: quote._amountGhsExact ?? null, quoteId: quote.id, quoteAmountUsdc: quote.usdcAmount, quoteAmountUsdcExact: quote._usdcAmountExact ?? null, quoteExpiresAt: quote.expiresAt, rateAtInitiation: quote.rateGhsPerUsdc, rateSource: quote.rateSource, rateAsOf: quote.rateAsOf, selectedRoute: quote.selectedRoute, routeProviderRail: quote.routeProviderRail, routePolicyVersion: quote.routePolicyVersion },
         },
       });
       return { quote, tx };
@@ -145,9 +149,36 @@ exports.confirmMoolreOtp = async (req, res) => {
     const meta = pending.metadata || {};
     if (!meta.quoteId || !meta.amountGhs || !meta.payerPhone || !meta.network) return res.status(409).json({ success: false, message: 'Deposit is missing its transaction quote.' });
 
-    const moolreResult = await moolre.initiatePayment({ externalRef: reference, amountGhs: meta.amountGhs, payerPhone: meta.payerPhone, network: meta.network, otpCode });
+    // §P.5-E audit r13 (§5): the provider request amount is the CANONICAL
+    // quoted GHS (exact 2dp) — never the raw unnormalized input float. The
+    // quote authority already normalized the amount at initiation; provider
+    // request, TransactionHistory metadata and the persisted quote agree
+    // exactly at the GHS 2dp authority.
+    const canonicalAmountGhs = meta.amountGhsExact ?? meta.amountGhs;
+    const moolreResult = await moolre.initiatePayment({ externalRef: reference, amountGhs: canonicalAmountGhs, payerPhone: meta.payerPhone, network: meta.network, otpCode });
     if (moolreResult.requiresOtp) return res.status(400).json({ success: false, message: 'OTP verification failed. Check the code and retry.' });
-    if (moolreResult.providerRef) await prisma.transactionHistory.update({ where: { id: pending.id }, data: { providerRef: moolreResult.providerRef } });
+    if (moolreResult.providerRef) {
+      // §P.5-E audit r13 (§4): the durable stamp is a compare-and-set on the
+      // NULL slot (a lost CAS means a different ref is already committed —
+      // surfaced below as a contradiction), and the SAME authoritative
+      // reference is enriched onto the durable Moolre observation whenever
+      // the early P01 callback already committed it with providerRef = NULL.
+      const stamped = await prisma.transactionHistory.updateMany({ where: { id: pending.id, providerRef: null }, data: { providerRef: moolreResult.providerRef } });
+      if (stamped.count === 0) {
+        const nowRef = (await prisma.transactionHistory.findUnique({ where: { id: pending.id }, select: { providerRef: true } }))?.providerRef ?? null;
+        if (nowRef !== moolreResult.providerRef) {
+          return res.status(409).json({ success: false, message: 'A different provider reference is already bound to this deposit — confirmation blocked for reconciliation.', code: 'PROVIDER_REF_CONTRADICTION' });
+        }
+      }
+      try {
+        await fiatLiquidity.enrichProviderEventRefByDedupKey(prisma, `event:moolre-collection:${reference}`, moolreResult.providerRef);
+      } catch (enrichErr) {
+        if (enrichErr instanceof fiatLiquidity.ConflictingEvidenceError) {
+          return res.status(409).json({ success: false, message: enrichErr.message, code: 'CONTRADICTORY_PROVIDER_EVIDENCE' });
+        }
+        throw enrichErr;
+      }
+    }
     return res.status(200).json({ success: true, requiresOtp: false, data: { reference, quoteId: meta.quoteId } });
   } catch (err) {
     logger.error({ err }, '[quoteMoolreDeposit] OTP confirmation error');
@@ -319,7 +350,16 @@ exports.webhook = async (req, res) => {
       // one-pesewa-inclusive at every magnitude, where the old float boundary
       // accepted/rejected the same one-pesewa delta depending on binary
       // rounding accidents.
-      const quotedGhs = quote.amountGhs; // exact Decimal from the quote authority
+      // §P.5-E audit r13 (§2): the GHS comparison and EVERY authoritative
+      // write below consume the quote's EXACT persisted strings — the legacy
+      // Number fields stay presentation-only. Number() silently destroys the
+      // 12dp USDC tail at magnitude and made the Model B exact-quote binding
+      // fail closed on VALID quotes.
+      const quotedGhs = new Prisma.Decimal(quote.amountGhsExact ?? quote.amountGhs); // exact 2dp persisted quote amount
+      const quotedUsdcExact = quote.usdcAmountExact ?? String(quote.usdcAmount); // exact 12dp persisted quote amount
+      // the committed ledger authority: the persisted 12dp quote projected ONCE
+      // at 8dp HALF_UP — exactly the projection Model B re-derives
+      const settledUsdcLedger = new Prisma.Decimal(quotedUsdcExact).toDecimalPlaces(8, Prisma.Decimal.ROUND_HALF_UP);
       if (modelBOn
         ? settledGhs.toFixed(2) !== quotedGhs.toFixed(2)
         : settledGhs.sub(quotedGhs).abs().greaterThan('0.01')) {
@@ -339,7 +379,7 @@ exports.webhook = async (req, res) => {
       // resurrected to COMPLETED.
       const claimed = await tx.transactionHistory.updateMany({
         where: { id: existing.id, status: 'PENDING' },
-        data: { status: 'COMPLETED', amountUsdc: quote.usdcAmount, payerMsisdn: existing.payerMsisdn || null, metadata: { ...(existing.metadata || {}), providerTxId: providerTxId || null, settledAmountGhs: settledGhs.toFixed(2), settledAt: new Date().toISOString(), settlementRate: quote.rateGhsPerUsdc, settledRoute: quote.selectedRoute || null, settledRoutePolicyVersion: quote.routePolicyVersion || null } },
+        data: { status: 'COMPLETED', amountUsdc: settledUsdcLedger, payerMsisdn: existing.payerMsisdn || null, metadata: { ...(existing.metadata || {}), providerTxId: providerTxId || null, settledAmountGhs: settledGhs.toFixed(2), settledAt: new Date().toISOString(), settlementRate: quote.rateGhsPerUsdc, settledRoute: quote.selectedRoute || null, settledRoutePolicyVersion: quote.routePolicyVersion || null } },
       });
       if (claimed.count !== 1) {
         throw new Error('Deposit is no longer PENDING — a concurrent state transition won; refusing to settle');
@@ -349,7 +389,10 @@ exports.webhook = async (req, res) => {
       // state-machine claim authority — this read can never observe a
       // different state.
       const updatedTx = await tx.transactionHistory.findUnique({ where: { id: existing.id } });
-      await tx.user.update({ where: { id: existing.userId }, data: { availableBalance: { increment: quote.usdcAmount } } });
+      // §P.5-E audit r13 (§2): the balance increment is the EXACT 8dp ledger
+      // projection of the persisted 12dp quote — never a lossy JS Number
+      // that PostgreSQL would have to re-round.
+      await tx.user.update({ where: { id: existing.userId }, data: { availableBalance: { increment: settledUsdcLedger } } });
 
       // §P.4 AUTHORITATIVE ACCOUNTING — fiat-settled USDC deposit: customer
       // liability is credited against an EXPLICIT conversion clearing
@@ -370,9 +413,13 @@ exports.webhook = async (req, res) => {
           transactionHistoryId: existing.id,
           userId: existing.userId,
           quoteId,
-          quotedGhs: quote.amountGhs,
-          quotedRateGhsPerUsdc: quote.rateGhsPerUsdc,
-          quotedUsdc: quote.usdcAmount,
+          // §P.5-E audit r13 (§2): the Model B quote binding receives the
+          // EXACT persisted 12dp authority — the primitive re-verifies it
+          // against the persisted quote row and fails closed on ANY lossy
+          // caller projection.
+          quotedGhs: quote.amountGhsExact ?? quote.amountGhs,
+          quotedRateGhsPerUsdc: quote.rateGhsPerUsdcExact ?? quote.rateGhsPerUsdc,
+          quotedUsdc: quotedUsdcExact,
           settledGhs,
           settledUsdc: updatedTx.amountUsdc, // exact Decimal(20,8) — the ledger authority
           selectedRoute: quote.selectedRoute || null,

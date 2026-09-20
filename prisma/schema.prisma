@@ -6040,6 +6040,22 @@ model ModelBSettlement {
   depositLedgerTxnId      String   @db.VarChar(36)
   lotAllocations          Json // [{lotId, acquisitionKey, quantity, lotCostBasisGhs, lotQuantityOriginal, costShareGhs, remainingAfter}]
   createdAt               DateTime @default(now())
+
+  // §P.5-E audit r13 (§8): DB-enforced exactly-once identity. TransactionQuote
+  // is consume-once and one quote corresponds to exactly one deposit
+  // settlement; TransactionHistory.txHash is UNIQUE, so one settled deposit
+  // (reference) maps to exactly one TransactionHistory row. Both unique
+  // constraints are structurally implied by the service-level bindings
+  // (consume-once CAS + the TH↔quote persisted binding + reference UNIQUE) —
+  // the DB indexes make them un-bypassable by any future code path. FKs to
+  // TransactionHistory / TransactionQuote / FiatProviderEvent are deliberately
+  // NOT added: those tables are raw-SQL managed (no Prisma models), so
+  // schema-level FKs would be flagged as drift by prisma db push (production
+  // is db-push managed) — a real migration/release-order hazard, not a
+  // decorative one. The service-level bindings + these unique indexes are the
+  // enforced layers in this slice.
+  @@unique([quoteId], map: "ModelBSettlement_quoteId_key")
+  @@unique([transactionHistoryId], map: "ModelBSettlement_transactionHistoryId_key")
 }
 
 model JournalEntry {

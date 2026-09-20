@@ -104,6 +104,59 @@ claim (`where: { id, status: 'PENDING' }`), so a late failure callback against a
 COMPLETED row affects zero rows. The state-machine authority is the database
 predicate itself.
 
+### 2.0a TransactionHistory ↔ TransactionQuote binding (audit r13, blocker 1)
+
+Every quote-level check (existence, user, purpose, consumed state, GHS, rate,
+12dp USDC, route identity) proves the SUPPLIED quote matches the deposit's
+economics — none of them proves it is THE quote this deposit was initiated
+with. The mounted initiation stamps the quote it created into the deposit's
+own persisted `TransactionHistory.metadata.quoteId` in the SAME transaction
+that creates both; that persisted binding is the deposit's quote authority. A
+second quote with byte-identical economics for the same user can therefore
+NEVER stand in for the deposit's own quote: `th.metadata.quoteId !== quoteId`
+fails closed `MODEL_B_TX_QUOTE_BINDING_MISMATCH` BEFORE any mutation. No new
+authority is invented — the existing persisted metadata field IS the
+authority. The binding is database-reinforced (audit r13 §8):
+`ModelBSettlement.quoteId` and `ModelBSettlement.transactionHistoryId` are
+UNIQUE keys — one settlement row per quote and per deposit, so a second
+settlement on a twin quote can never commit even under a future surface
+regression.
+
+### 2.0b Exact quote-authority propagation (audit r13 §2/§5/§6)
+
+The authoritative decimal ladder — every level explicit, no silent conversion:
+
+| authority | scale | holder | rule |
+|---|---|---|---|
+| persisted quote native | 12dp | `TransactionQuote.usdcAmount` numeric(30,12) | canonical, never widened/rounded/restated |
+| quote economics | 2dp GHS / 8dp rate / 12dp USDC | `TransactionQuote` exact-string fields | computed in exact Decimal arithmetic (`_amountGhsExact`, `_feeGhsExact`, `_netGhsExact`, `_rateExact`, `_usdcAmountExact`) and persisted losslessly; the legacy Number fields are presentation-only projections |
+| committed ledger | 8dp | `TransactionHistory.amountUsdc`, ledger lines, `ModelBSettlement.settledUsdc` | the persisted 12dp quote projected ONCE at 8dp HALF_UP — never a JS Number re-float (Number() silently destroys the 9th–12th decimal tail at magnitude, which previously made the exact binding fail closed on VALID quotes) |
+| cost share | 8dp | `lotAllocations[].costShareGhs`, `costBasisGhsTotal` | 60-digit proration projected ONCE at 8dp HALF_UP |
+| residual | 12dp | `shareResidualGhs`, `costAllocationResidualGhs` | the TRUE sub-8dp remainder, never re-rounded; closes `costShareGhs + shareResidualGhs == shareExact` at 12dp |
+
+The 2dp money normalization on the quote path (`roundMoney`) is EXACT decimal
+HALF_UP through Prisma's decimal.js (`roundMoneyExact`) — never a binary
+float multiply: `Math.round((v + EPSILON) × 100) / 100` provably rounds
+valid sub-pesewa inputs the wrong way at rounding ties (8.575 → 8.57) and
+loses whole cents where `v × 100` crosses binary representation limits.
+Callers may still supply numeric strings; garbage normalizes to NaN exactly
+as before. The Moolre initiation and OTP confirmation send the CANONICAL
+quoted 2dp GHS string to the provider — never the raw float.
+
+### 2.0c Early provider-callback window (audit r13 §4)
+
+For MOOLRE_MOMO_COLLECTION deposits the route is true by construction (the
+initiation endpoint always initiates the Moolre payment), so an early P01 in
+the pre-stamp race window is a legitimate collection observation: it is
+recorded DURABLY with `providerRef = NULL` and settles; the initiation stamp
+enriches the SAME row (r11 CAS) and retries converge. For
+GENERIC_FIAT_AGGREGATOR deposits the r8 rail-aware contract is preserved:
+Moolre involvement is proven only by the OTP-confirmation stamp, so an
+unstamped P01 fails closed 409 with NO observation constructed.
+Reconciliation runs before the lifecycle early-returns, so every
+authenticated P01 converges the ref authorities (event ↔ TransactionHistory)
+even when the deposit is already terminal.
+
 ### 2.1 Inventory claim (FIFO — the explicit cost-flow policy)
 
 ### 2.1a Inventory acquisition authority (the r1 audit — structural darkness)
@@ -215,6 +268,18 @@ New table `ModelBSettlement` (unique `reference` — the durable economic identi
   DISTINCT durable rows — a prior FAILED observation can never masquerade as
   SUCCESS evidence, and a legitimate SUCCESS is never handed a FAILED row
   as its replay
+- canonical providerRef (audit r13 §7): `ModelBSettlement.providerRef`
+  records EXACTLY the durable observation's ref — a caller-supplied ref that
+  DISAGREES with the observation fails closed, and a caller supplying NONE
+  records the observation's ref rather than null, so the realized-economics
+  record can never lose — or invent — the authoritative provider identity.
+  On the Moolre surface the durable observation and the initiation-stamped
+  `TransactionHistory.providerRef` are RECONCILED to the same value before
+  any settlement mutation: observation-null + TH-ref is an additive
+  enrichment (the r11 database CAS), observation-ref + TH-null is a
+  conditional stamp FROM the evidence, and two PRESENT but different refs
+  fail closed 409 with nothing settled. Replay with a different ref can never
+  hide behind replay convergence.
 - USDC precision contract (audit r6, documented deliberately): the quote row
   `TransactionQuote.usdcAmount` (numeric(30,12)) is the CANONICAL native-12dp
   source of truth and is never widened, rounded or restated there; the
@@ -234,9 +299,16 @@ New table `ModelBSettlement` (unique `reference` — the durable economic identi
   (the recorded 8dp share), `shareResidualGhs` (the TRUE 12dp residual),
   `remainingAfter}` — plus `costBasisGhsTotal`, the EXACT sum of the RECORDED 8dp
   shares (the record and its total can never disagree)
-- allocation exactness: a fully-consumed lot's `costShareGhs` is its `costBasisGhs`
-  EXACTLY (no arithmetic); only a partially-consumed tail lot is prorated
-  (`basis × q / original`, projected ONCE at 8dp HALF_UP) and the TRUE sub-8dp
+- allocation exactness (audit r13 §3 — high-precision proration): the
+  proration `basis × q / original` is computed in a 60-significant-digit
+  decimal context and projected ONCE at the 8dp ledger authority (HALF_UP).
+  The default 20-significant-digit decimal.js context truncated the
+  intermediate `basis × q` product (up to ~24 significant digits at permitted
+  DECIMAL(20,8) magnitudes) BEFORE the division, and the resulting sub-8dp
+  error could flip the recorded share to the WRONG pesewa — in either
+  rounding direction — at schema-valid magnitudes. A fully-consumed lot's
+  `costShareGhs` is its `costBasisGhs` EXACTLY (no arithmetic); only a
+  partially-consumed tail lot is prorated and the TRUE sub-8dp
   residual (`shareExact − costShare8`, never re-rounded to 8dp) is recorded
   explicitly in `costAllocationResidualGhs` (Decimal(20,12), the residual precision)
   and per-allocation `shareResidualGhs`. Auditable identity: `costShareGhs +
@@ -245,6 +317,12 @@ New table `ModelBSettlement` (unique `reference` — the durable economic identi
   The exact rational inputs
   (`basis`, `original`, `q`) are all durable, so the allocation is auditable to
   the ledger's own precision with nothing hidden.
+- aggregate overflow guards (audit r13 §3): the EXACT sums of the recorded
+  8dp shares and 12dp residuals are computed in the 60-digit context and fail
+  closed with the TYPED error `MODEL_B_AGGREGATE_OVERFLOW` when either total
+  would exceed its durable DECIMAL(20,8)/(20,12) bound — a multi-lot take
+  whose recorded totals overflow is never committed under a raw driver-level
+  numeric-overflow mid-transaction.
 - customer spread: `marginGhs = settledGhs − costBasisGhsTotal` (exact Decimal
   subtraction, GHS-denominated — never restated in USDC)
 - provider cost/fee: `providerFeeGhs` — **NULL-ONLY in this slice** (audit r6).

@@ -44,9 +44,16 @@ const STATEMENTS = [
   );`,
   `CREATE UNIQUE INDEX IF NOT EXISTS "ModelBSettlement_reference_key" ON "ModelBSettlement"("reference");`,
   `CREATE UNIQUE INDEX IF NOT EXISTS "ModelBSettlement_conversionIdentity_key" ON "ModelBSettlement"("conversionIdentity");`,
-  `CREATE INDEX IF NOT EXISTS "ModelBSettlement_quoteId_idx" ON "ModelBSettlement"("quoteId");`,
+  // §P.5-E audit r13 (§8): exactly-once identity, DB-enforced — consume-once
+  // quote and UNIQUE txHash each map to exactly one settlement (names match
+  // the prisma @@unique map names so db push and this overlay converge).
+  `CREATE UNIQUE INDEX IF NOT EXISTS "ModelBSettlement_quoteId_key" ON "ModelBSettlement"("quoteId");`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS "ModelBSettlement_transactionHistoryId_key" ON "ModelBSettlement"("transactionHistoryId");`,
   `CREATE INDEX IF NOT EXISTS "ModelBSettlement_userId_idx" ON "ModelBSettlement"("userId");`,
-  `CREATE INDEX IF NOT EXISTS "ModelBSettlement_transactionHistoryId_idx" ON "ModelBSettlement"("transactionHistoryId");`,
+  // the superseded plain indexes from earlier overlay versions are dropped
+  // AFTER the unique replacements exist — redundant, never data.
+  `DROP INDEX IF EXISTS "ModelBSettlement_quoteId_idx";`,
+  `DROP INDEX IF EXISTS "ModelBSettlement_transactionHistoryId_idx";`,
   `CREATE INDEX IF NOT EXISTS "ModelBSettlement_evidenceDedupKey_idx" ON "ModelBSettlement"("evidenceDedupKey");`,
   `DO $$ BEGIN
      IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ModelBSettlement_amounts_positive') THEN

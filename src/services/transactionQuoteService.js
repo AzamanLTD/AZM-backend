@@ -38,7 +38,30 @@ const MAX_RATE_GHS_PER_USDC = 1000000;
 const MIN_RATE_GHS_PER_USDC = 0.000001;
 
 function roundMoney(value) {
-  return Math.round((value + Number.EPSILON) * 100) / 100;
+  // §P.5-C audit r13 (§6): the 2dp money normalization is EXACT decimal
+  // HALF_UP — never a binary float multiply. Math.round((v + EPSILON) * 100)
+  // silently changed valid sub-pesewa inputs at rounding ties (e.g. 41958.285
+  // → 41958.28 instead of the exact HALF_UP 41958.29) and lost whole cents at
+  // magnitudes where v * 100 exceeds the double-integer range. The public
+  // shape stays a JS Number (presentation boundary); the EXACT 2dp decimal is
+  // roundMoneyExact below — authoritative callers MUST use it.
+  // accepts a number, numeric string or Decimal (the old formula coerced all
+  // three); non-numeric garbage normalizes to NaN exactly like Math.round did.
+  if (typeof value === 'number' && !Number.isFinite(value)) return value;
+  try {
+    return Number(roundMoneyExact(value));
+  } catch (err) {
+    return NaN;
+  }
+}
+
+function roundMoneyExact(value) {
+  // String(value) is the lossless shortest round-trip repr of the input
+  // (double, string or Decimal) — parsed by Prisma's decimal.js with no
+  // intermediate binary-float arithmetic, then projected ONCE at the 2dp
+  // money authority with HALF_UP. The persisted quote can never silently
+  // become a different Decimal than the contract rounded it to.
+  return new Prisma.Decimal(String(value)).toDecimalPlaces(2, Prisma.Decimal.ROUND_HALF_UP);
 }
 
 function createTransactionQuote({
@@ -81,8 +104,12 @@ function createTransactionQuote({
   // arithmetic (2dp GHS money, ≤8dp rate, exact 12dp HALF_UP USDC quotient)
   // instead of JS floating-point division. The public shape keeps JS
   // numbers; the exact 12dp string is carried for lossless persistence.
-  const amountExact = new Prisma.Decimal(String(roundMoney(amountGhs)));
-  const feeExact = new Prisma.Decimal(String(roundMoney(feeGhs)));
+  // §P.5-C audit r13 (§6): the exact economics derive DIRECTLY from the
+  // exact 2dp projection — the public Number fields below are projections OF
+  // it, so the persisted _amountGhsExact and the returned amountGhs can never
+  // disagree (the old String(roundMoney(v)) path re-floated the value).
+  const amountExact = roundMoneyExact(amountGhs);
+  const feeExact = roundMoneyExact(feeGhs);
   const netExact = amountExact.minus(feeExact).isNegative() ? new Prisma.Decimal(0) : amountExact.minus(feeExact);
   // §P.5-C Decimal-native rate: the authoritative Decimal representation is
   // used DIRECTLY — never reconstructed from a JS Number — so the persisted
@@ -96,8 +123,8 @@ function createTransactionQuote({
     id,
     userId: Number(userId),
     purpose,
-    amountGhs: roundMoney(amountGhs),
-    feeGhs: roundMoney(feeGhs),
+    amountGhs: Number(amountExact),
+    feeGhs: Number(feeExact),
     netGhs: Number(netExact),
     rateGhsPerUsdc,
     usdcAmount: Number(usdcExact),
@@ -297,6 +324,18 @@ function mapQuoteRow(row) {
     netGhs: Number(row.netGhs),
     rateGhsPerUsdc: Number(row.rateGhsPerUsdc),
     usdcAmount: Number(row.usdcAmount),
+    // §P.5-E audit r13 (§2): EXACT persisted-authority strings — additive to
+    // the legacy Number projection. The Number fields are presentation only:
+    // the quote's native usdcAmount is numeric(30,12) and Number() SILENTLY
+    // destroys the 9th–12th decimals at magnitude (verified:
+    // Number('67890123.123456789012') === 67890123.12345679). Authoritative
+    // financial callers — TransactionHistory.amountUsdc, the balance credit,
+    // the Model B quote binding — MUST consume these exact fields.
+    amountGhsExact: new Prisma.Decimal(row.amountGhs).toFixed(2),
+    feeGhsExact: new Prisma.Decimal(row.feeGhs).toFixed(2),
+    netGhsExact: new Prisma.Decimal(row.netGhs).toFixed(2),
+    rateGhsPerUsdcExact: new Prisma.Decimal(row.rateGhsPerUsdc).toFixed(8),
+    usdcAmountExact: new Prisma.Decimal(row.usdcAmount).toFixed(12),
     rateSource: row.rateSource,
     rateAsOf: new Date(row.rateAsOf).toISOString(),
     createdAt: new Date(row.createdAt).toISOString(),
@@ -480,5 +519,6 @@ module.exports = {
   QuoteIdentityReplayError,
   assertQuoteActive,
   roundMoney,
+  roundMoneyExact,
   getPersistedTransactionQuoteExact,
 };

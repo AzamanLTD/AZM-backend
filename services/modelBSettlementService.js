@@ -32,6 +32,27 @@ const { getPersistedTransactionQuoteExact } = require('../src/services/transacti
 
 const Decimal = Prisma.Decimal;
 
+// ── §P.5-E audit r13 (§3): dedicated high-precision proration context ──────
+// decimal.js's DEFAULT 20 significant digits are NOT exact for
+// schema-permitted magnitudes. Concrete DECIMAL(20,8)-valid counterexample:
+//   basis 572551832185.79420572, take 603655684782.03640547,
+//   original 919552834605.01252389
+//   exact rational share = 375861130893.8932612660736495…
+//   20-sig-digit intermediate = 375861130893.89326126 → 8dp projection …26
+//   the exact HALF_UP 8dp projection is …27 — a one-pesewa-hundredth silent
+//   economic change with NO binary floating point involved, purely from the
+//   configured intermediate precision. 60 significant digits hold every
+//   20-digit input with >30 digits of quotient, so the explicit 8dp HALF_UP
+//   projection boundary is exact at every schema-permitted magnitude. All
+//   proration (and only proration) runs in this context — no JS Number, no
+//   binary float, no silent rounding before the single explicit projection.
+const HP = Decimal.clone({ precision: 60 });
+// DECIMAL(20,8) bound: 12 integer digits (< 1e12). Computed aggregates that
+// would exceed the durable column bounds fail closed with a typed error
+// instead of a raw PostgreSQL numeric-overflow mid-transaction.
+const MAX_20_8 = new Decimal('999999999999.99999999');
+const MAX_20_12 = new Decimal('99999999.999999999999');
+
 class ModelBError extends Error {
   constructor(code, message, details = undefined) {
     super(message);
@@ -154,15 +175,17 @@ async function claimInventoryFifo(tx, { reference, settledUsdc }) {
 
     const basis = new Decimal(lot.costBasisGhs);
     const original = new Decimal(lot.quantityOriginal);
-    let shareExact;
+    let shareExact; // high-precision context (audit r13 §3) — see HP above
     if (original.eq(take)) {
       // fully consumed — the lot's cost basis realizes EXACTLY, no arithmetic
-      shareExact = basis;
+      shareExact = new HP(lot.costBasisGhs.toFixed(8));
     } else {
-      // proration at decimal.js default precision (20 significant digits) —
+      // proration basis × take / original in the 60-significant-digit context —
       // exact far beyond the 8-decimal authority applied below; any sub-8dp
       // difference is recorded explicitly in shareResidualGhs.
-      shareExact = Decimal.div(basis.times(take), original);
+      shareExact = new HP(lot.costBasisGhs.toFixed(8))
+        .times(new HP(take.toFixed(8)))
+        .div(new HP(lot.quantityOriginal.toFixed(8)));
     }
     // §P.5-E exact allocation contract: the recorded cost share is the exact
     // rational basis share projected ONCE at the ledger's 8-decimal authority
@@ -170,8 +193,16 @@ async function claimInventoryFifo(tx, { reference, settledUsdc }) {
     // never re-rounded to 8dp — persisted at the ModelBSettlement residual
     // precision (12dp). The auditable identity is exact whenever the residual
     // is representable at 12dp: costShareGhs + shareResidualGhs == shareExact.
-    const costShare8 = shareExact.toDecimalPlaces(8, Decimal.ROUND_HALF_UP);
+    const costShare8 = shareExact.toDecimalPlaces(8, HP.ROUND_HALF_UP);
     const residual = shareExact.minus(costShare8);
+    // fail closed when the recorded share exceeds the DECIMAL(20,8) durable
+    // bound (structurally impossible for schema-valid lots since take ≤
+    // original ⇒ share ≤ basis — this guards hand-corrupted/oversized rows
+    // with a typed error instead of a raw numeric-overflow)
+    if (costShare8.greaterThan(MAX_20_8)) {
+      throw new ModelBError('MODEL_B_AMOUNT_OVERFLOW',
+        `lot ${lot.id} cost share ${costShare8.toFixed(8)} GHS exceeds the DECIMAL(20,8) durable bound — refusing to commit an overflowed economic record`);
+    }
 
     claims.push({
       consumptionId: consumption.id,
@@ -182,7 +213,7 @@ async function claimInventoryFifo(tx, { reference, settledUsdc }) {
       lotQuantityOriginal: original.toFixed(8),
       costShareGhs: costShare8.toFixed(8),
       remainingAfter: new Decimal(lot.quantityRemaining).toFixed(8),
-      shareResidualGhs: residual.toDecimalPlaces(12, Decimal.ROUND_HALF_UP).toFixed(12),
+      shareResidualGhs: residual.toDecimalPlaces(12, HP.ROUND_HALF_UP).toFixed(12),
       replayed,
     });
     needed = needed.minus(take);
@@ -312,7 +343,6 @@ async function settleDepositFromInventory(tx, params = {}) {
     throw new ModelBError('MODEL_B_TX_AMOUNT_MISMATCH',
       `TransactionHistory ${transactionHistoryId} committed ${new Decimal(th.amountUsdc).toFixed(8)} USDC, settlement claims ${settledUsdcD.toFixed(8)}`);
   }
-
   const q = await getPersistedTransactionQuoteExact({ prisma: tx, quoteId });
   if (!q || q.id !== quoteId) {
     throw new ModelBError('MODEL_B_QUOTE_NOT_FOUND',
@@ -376,11 +406,40 @@ async function settleDepositFromInventory(tx, params = {}) {
       `TransactionQuote ${quoteId} was selected under policy ${q.routePolicyVersion ?? 'none'}, settlement claims ${routePolicyVersion ?? 'none'}`);
   }
 
+  // ── §P.5-E audit r13 (blocker 1): TransactionHistory ↔ TransactionQuote
+  // binding. Every quote check above proves the SUPPLIED quote belongs to the
+  // user and matches the deposit's economics — none of them proves it is THE
+  // quote this deposit was initiated with. The mounted initiation stamps the
+  // quote it created into the deposit's own persisted metadata
+  // (TransactionHistory.metadata.quoteId) in the SAME transaction that
+  // creates both — that persisted binding is the deposit's quote authority.
+  // A SECOND quote with byte-identical economics for the same user can
+  // therefore NEVER stand in for the deposit's own quote: fail closed BEFORE
+  // any mutation (no inventory claim, no settlement, no ledger row, no
+  // customer credit). No second quote authority is invented — the existing
+  // persisted metadata field IS the authority.
+  const thQuoteId = th.metadata?.quoteId ?? null;
+  if (thQuoteId !== quoteId) {
+    throw new ModelBError('MODEL_B_TX_QUOTE_BINDING_MISMATCH',
+      `TransactionHistory ${transactionHistoryId} is bound to quote ${thQuoteId ?? 'none'}, settlement claims quote ${quoteId} — a deposit settles only on the quote it was initiated with (audit r13)`);
+  }
+
   // ── evidence before inventory: authority is verified, never assumed ──────
-  await verifyProviderEvidence(tx, {
+  const evidence = await verifyProviderEvidence(tx, {
     evidenceDedupKey, settledGhs: settledGhsD, reference,
     provider, providerRef: providerRef ?? null,
   });
+  // ── §P.5-E audit r13 (§7): canonical provider identity. The durable
+  // settlement records EXACTLY the durable observation's providerRef — never a
+  // caller-claimed value and never null while the evidence carries one.
+  // verifyProviderEvidence already fails closed when a SUPPLIED ref disagrees
+  // with the observation (including observation-null + ref-supplied: an
+  // unverifiable claim); canonicalizing here closes the mirror case — a
+  // caller supplying null against an observation that HAS a ref would
+  // otherwise silently DROP the authoritative provider identity from the
+  // durable realized-economics record. The settlement row can never lose it,
+  // and can never record one the evidence does not vouch for.
+  const canonicalProviderRef = evidence.providerRef ?? null;
 
   // ── replay evaluation AFTER the authority binding (§P.5-E audit r2) ──────
   // The existing-settlement lookup may NEVER bypass authority validation:
@@ -410,7 +469,10 @@ async function settleDepositFromInventory(tx, params = {}) {
       ['routeProviderRail', (existing.routeProviderRail ?? null) === (routeProviderRail ?? null)],
       ['routePolicyVersion', (existing.routePolicyVersion ?? null) === (routePolicyVersion ?? null)],
       ['provider', existing.provider === provider],
-      ['providerRef', (existing.providerRef ?? null) === (providerRef ?? null)],
+      // §P.5-E audit r13 (§7): replay identity is the CANONICAL provider
+      // identity (the durable observation's ref), not the caller's claim —
+      // replays converge on what was durably recorded.
+      ['providerRef', (existing.providerRef ?? null) === canonicalProviderRef],
       ['evidenceDedupKey', existing.evidenceDedupKey === evidenceDedupKey],
       // audit r6: a caller-supplied economic field never disappears from
       // replay identity. Null-only in this slice (the guard above refuses
@@ -432,12 +494,29 @@ async function settleDepositFromInventory(tx, params = {}) {
   const claims = await claimInventoryFifo(tx, { reference, settledUsdc: settledUsdcD });
 
   // costBasisGhsTotal is the EXACT sum of the RECORDED 8dp shares (audit r1,
-  // blocker 3): the durable record and its total can never disagree.
-  const costBasisTotal = claims.reduce((sum, c) => sum.plus(new Decimal(c.costShareGhs)), new Decimal(0));
-  const costResidual = claims.reduce((sum, c) => sum.plus(new Decimal(c.shareResidualGhs)), new Decimal(0));
+  // blocker 3): the durable record and its total can never disagree. The sum
+  // runs in the high-precision context (audit r13 §3) — additions are exact
+  // at any precision, and the aggregate guards below fail closed with a
+  // TYPED error if the durable DECIMAL(20,8)/(20,12) bounds would be exceeded
+  // (a raw PostgreSQL numeric-overflow would also roll back, but with an
+  // unattributable driver error mid-transaction).
+  const costBasisTotal = claims.reduce((sum, c) => sum.plus(new HP(c.costShareGhs)), new HP(0));
+  const costResidual = claims.reduce((sum, c) => sum.plus(new HP(c.shareResidualGhs)), new HP(0));
+  if (costBasisTotal.greaterThan(MAX_20_8)) {
+    throw new ModelBError('MODEL_B_AGGREGATE_OVERFLOW',
+      `cost basis total ${costBasisTotal.toFixed(8)} GHS exceeds the DECIMAL(20,8) durable bound — refusing to commit an overflowed economic record`);
+  }
+  if (costResidual.greaterThan(MAX_20_12)) {
+    throw new ModelBError('MODEL_B_AGGREGATE_OVERFLOW',
+      `allocation residual total ${costResidual.toFixed(12)} GHS exceeds the DECIMAL(20,12) durable bound — refusing to commit an overflowed economic record`);
+  }
   // the realized customer spread is GHS-denominated and EXACT — never restated
   // in USDC and never derived from a market quote.
-  const marginGhs = settledGhsD.minus(costBasisTotal);
+  const marginGhs = new HP(settledGhsD.toFixed(2)).minus(costBasisTotal);
+  if (marginGhs.abs().greaterThan(MAX_20_8)) {
+    throw new ModelBError('MODEL_B_AGGREGATE_OVERFLOW',
+      `realized margin ${marginGhs.toFixed(8)} GHS exceeds the DECIMAL(20,8) durable bound — refusing to commit an overflowed economic record`);
+  }
 
   // ── posting 1: the exchange (explicit ASSET_CONVERSION, P5-A contract) ───
   // GHS leg: the customer's evidenced GHS lands as a platform asset held for
@@ -497,7 +576,9 @@ async function settleDepositFromInventory(tx, params = {}) {
       routeProviderRail: routeProviderRail ?? null,
       routePolicyVersion: routePolicyVersion ?? null,
       provider,
-      providerRef: providerRef ?? null,
+      // audit r13 (§7): the durable settlement records the CANONICAL
+      // event-derived provider identity — never the caller's unverified claim
+      providerRef: canonicalProviderRef,
       evidenceDedupKey,
       quotedGhs: quotedGhsD.toFixed(2),
       quotedRateGhsPerUsdc: quotedRateD.toFixed(8),
@@ -505,7 +586,7 @@ async function settleDepositFromInventory(tx, params = {}) {
       settledGhs: settledGhsD.toFixed(2),
       settledUsdc: settledUsdcD.toFixed(8),
       costBasisGhsTotal: costBasisTotal.toFixed(8),
-      costAllocationResidualGhs: costResidual.toDecimalPlaces(12, Decimal.ROUND_HALF_UP).toFixed(12), // residual precision (12dp)
+      costAllocationResidualGhs: costResidual.toDecimalPlaces(12, HP.ROUND_HALF_UP).toFixed(12), // residual precision (12dp)
       marginGhs: marginGhs.toFixed(8),
       providerFeeGhs: null, // audit r6: null-only — no provider-fee evidence authority exists in this slice
       conversionIdentity: `p5e:modelb:${reference}`,

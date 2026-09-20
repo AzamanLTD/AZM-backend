@@ -14,6 +14,10 @@ jest.mock('../src/services/transactionQuoteService', () => ({
     ttlSeconds,
     usdcAmount: Number((amountGhs / rateGhsPerUsdc).toFixed(8)),
     expiresAt: '2026-09-04T12:00:00.000Z',
+    // §r13 (§2/§5): the real service returns exact persisted strings; the
+    // mounted controller derives the canonical provider amount from them.
+    _amountGhsExact: '134.20',
+    _usdcAmountExact: (amountGhs / rateGhsPerUsdc).toFixed(12),
   })),
   persistTransactionQuote: jest.fn().mockResolvedValue(undefined),
   consumeTransactionQuote: jest.fn(),
@@ -51,7 +55,12 @@ describe('moolreQuoteDeposit canonical retail FX contract', () => {
       $transaction: jest.fn(async (callback) => callback(tx)),
       transactionHistory: {
         update: jest.fn().mockResolvedValue({}),
+        // §r13 (§4): the providerRef stamp is a compare-and-set on NULL
+        updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+        findUnique: jest.fn().mockResolvedValue({ providerRef: 'provider-1' }),
       },
+      // §r13 (§4): stamp-path enrichment of the durable Moolre observation
+      fiatProviderEvent: { findUnique: jest.fn().mockResolvedValue(null) },
     };
     const moolre = {
       initiatePayment: jest.fn().mockResolvedValue({ requiresOtp: true, providerRef: 'provider-1' }),
@@ -100,7 +109,9 @@ describe('moolreQuoteDeposit canonical retail FX contract', () => {
     });
     expect(moolre.initiatePayment).toHaveBeenCalledWith({
       externalRef: 'MOOLRE-1',
-      amountGhs: 134.2,
+      // §r13 (§5): the provider request amount is the CANONICAL quoted GHS
+      // (exact 2dp string the quote persisted) — never the raw input float.
+      amountGhs: '134.20',
       payerPhone: '0241234567',
       network: 'MTN',
     });

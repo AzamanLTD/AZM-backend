@@ -37,9 +37,11 @@ CREATE TABLE IF NOT EXISTS "ModelBSettlement" (
 );
 CREATE UNIQUE INDEX IF NOT EXISTS "ModelBSettlement_reference_key" ON "ModelBSettlement"("reference");
 CREATE UNIQUE INDEX IF NOT EXISTS "ModelBSettlement_conversionIdentity_key" ON "ModelBSettlement"("conversionIdentity");
-CREATE INDEX IF NOT EXISTS "ModelBSettlement_quoteId_idx" ON "ModelBSettlement"("quoteId");
+-- §P.5-E audit r13 (§8): consume-once quote + UNIQUE txHash ⇒ exactly-once
+-- identity, DB-enforced (names match the prisma @@unique map names).
+CREATE UNIQUE INDEX IF NOT EXISTS "ModelBSettlement_quoteId_key" ON "ModelBSettlement"("quoteId");
 CREATE INDEX IF NOT EXISTS "ModelBSettlement_userId_idx" ON "ModelBSettlement"("userId");
-CREATE INDEX IF NOT EXISTS "ModelBSettlement_transactionHistoryId_idx" ON "ModelBSettlement"("transactionHistoryId");
+CREATE UNIQUE INDEX IF NOT EXISTS "ModelBSettlement_transactionHistoryId_key" ON "ModelBSettlement"("transactionHistoryId");
 CREATE INDEX IF NOT EXISTS "ModelBSettlement_evidenceDedupKey_idx" ON "ModelBSettlement"("evidenceDedupKey");
 
 -- DB CHECKs Prisma cannot express (mirrored in the boot overlay installer).

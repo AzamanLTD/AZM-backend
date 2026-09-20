@@ -250,6 +250,41 @@ async function enrichProviderRefObservation(prisma, existing, incomingProviderRe
     await failClosedOnConflict(authoritative);
 }
 
+// ── §P.5-D/r13: enrich a durable observation's NULL providerRef slot by
+// dedupKey. Used by the initiation/OTP stamp paths: once the initiation
+// response's providerRef is durably stamped on TransactionHistory, the SAME
+// authoritative reference must land on the provider observation whenever the
+// early P01 callback already committed it with providerRef = NULL (audit r13
+// §4 — the r10/r11 enrichment semantics make the early record safe).
+//   * observation not committed yet → no-op (the callback creates it later
+//     carrying the stamped ref, or a subsequent retry enriches it);
+//   * slot already carries the SAME ref → converge (idempotent);
+//   * slot is NULL → the same database-enforced compare-and-set as r11 —
+//     exactly one concurrent stamp wins, the loser re-reads and converges;
+//   * slot carries a DIFFERENT present ref → CONTRADICTION — both claims are
+//     already durably visible (the event row and the initiation record), so
+//     nothing needs retaining: fail closed with the typed error and let the
+//     surface block settlement for reconciliation.
+async function enrichProviderEventRefByDedupKey(prisma, dedupKey, providerRef) {
+    if (providerRef == null) return { enriched: false, event: null };
+    const incomingRef = String(providerRef);
+    const existing = await prisma.fiatProviderEvent.findUnique({ where: { dedupKey } });
+    if (!existing) return { enriched: false, event: null };
+    if (existing.providerRef != null && String(existing.providerRef) !== incomingRef) {
+        throw new ConflictingEvidenceError(
+            `[fiatLiquidity] observation ${dedupKey} already carries providerRef ${existing.providerRef}; refusing to stamp ${incomingRef} — contradictory provider identity, settlement must fail closed for reconciliation`,
+            { dedupKey, committedEventId: existing.id, differingFields: ['providerRef'] }
+        );
+    }
+    if (existing.providerRef != null) return { enriched: false, event: existing };
+    return enrichProviderRefObservation(prisma, existing, incomingRef, async () => {
+        throw new ConflictingEvidenceError(
+            `[fiatLiquidity] observation ${dedupKey} carries a different present providerRef; refusing to stamp ${incomingRef} — contradictory provider identity`,
+            { dedupKey, differingFields: ['providerRef'] }
+        );
+    });
+}
+
 // ─── raw provider evidence (append-only, replay only on semantic match) ─────
 //
 // Records a raw provider observation OUTSIDE any caller transaction. Called
@@ -1336,6 +1371,7 @@ module.exports = {
     LIQUIDITY_INSUFFICIENT_CODE,
     LiquidityInsufficientError,
     ConflictingEvidenceError,
+    enrichProviderEventRefByDedupKey,
     InvalidEvidenceError,
     GhsEvidenceRequiredError,
     isAuthorityEnabled,
