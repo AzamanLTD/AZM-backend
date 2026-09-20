@@ -198,8 +198,103 @@ change — on BOTH directions:
   settlement when evidence cannot be persisted. `ProviderSettlementAttempt`
   stays as operational history; the authority's raw observations live here.
 
-Duplicate economic identities converge; contradictory terminal events are
-retained (never rewritten) and raise `ReconciliationException`. A failure in
+**Observation identity contract.** ONE `dedupKey` names ONE provider
+observation, and the substrate (`recordProviderEvent`) enforces the identity
+itself — no caller's say-so is trusted:
+
+- The identity of an observation is its SEMANTIC authority fields —
+  `provider`, `rail`, `direction`, `status`, `providerRef`, `amountGhs`,
+  `relatedReference`. The raw payload is deliberately NOT identity: providers
+  retry the same economic observation with byte-different bodies (timestamps,
+  ordering, extra fields), and byte comparison would manufacture
+  contradictions out of retries. A semantic duplicate converges to the
+  committed row (`replay: true`) — the committed row's semantic claims are
+  never rewritten. `providerRef` binds STRICTLY only when PRESENT (audit
+  r10): two non-null refs that differ are materially different observations,
+  but an ABSENT ref carries no claim — it neither contradicts a committed
+  ref nor blocks convergence (the established null-tolerant comparison used
+  by the receipt/event checks, and the same fill-in semantics as
+  `markReservationInTransit`). Convergence may therefore ENRICH a committed
+  null ref with the reference a retry now carries (strictly additive
+  durable evidence; `receivedAt`/`status`/`amountGhs` stay exactly as
+  committed) and never downgrades a committed ref. The enrichment claim is a
+  database-enforced COMPARE-AND-SET on the NULL slot (audit r11): under
+  concurrency, exactly ONE different present ref can ever win the slot — a
+  concurrent loser converges only onto the winner's ref, or is rejected as
+  contradictory evidence and retained under its deterministic conflict
+  identity. The enrichment is therefore never last-writer-wins, and the
+  durable provider identity is deterministic under real PostgreSQL
+  concurrency. This is NOT a weakening
+  of provider-reference binding: a PRESENT ref must match exactly —
+  committed `PTX-1` vs incoming `PTX-2` is still contradictory evidence.
+  Producers of optional refs are real: the generic deposit webhook's
+  `providerTxId` has never been a required field, and payout callbacks can
+  legitimately arrive before the provider's durable txid exists.
+- A materially different payload under an already-committed identity is
+  CONTRADICTORY EVIDENCE: it is retained as a DISTINCT durable row under a
+  deterministic conflict identity (`<dedupKey>:CONFLICT:<fingerprint>`, so
+  exact retries of the contradictory payload converge to that row) and the
+  call FAILS CLOSED with a typed `LIQUIDITY_CONFLICTING_EVIDENCE` error —
+  the caller can never proceed as though the new payload were the committed
+  observation. Both rows stay queryable for ops; nothing collapses silently.
+  The operational flagging is GUARANTEED honest (audit r10): surfaces may
+  only report the contradiction "flagged for reconciliation" after the
+  `ReconciliationException` write actually committed — if that write fails,
+  the retained evidence is NOT rolled back and the surface answers
+  fail-closed (500, `CONTRADICTION_RETAINED_FLAGGING_FAILED`) instead of the
+  flagged 409, so a retry of the same callback re-attempts the flagging.
+- Surfaces derive the identity from fields actually present in the
+  callback, never invented. The generic deposit webhook uses a status-scoped
+  identity (`event:fiat-deposit:<reference>:<status>`), where `<status>` is
+  the ONE authoritative interpretation of the callback's raw status field
+  (audit r10): omitted, `SUCCESS` and `SUCCESSFUL` (case-insensitive) are the
+  supported success representations and all normalize to the `SUCCESSFUL`
+  evidence status; `FAILED` (case-insensitive) is the supported failure
+  representation; ANY other token (unknown aliases, whitespace-padded
+  strings) is durably retained as evidence under its own status-scoped
+  identity but is NEVER interpreted as a lifecycle decision — the deposit
+  stays PENDING and the call fails closed with 422. The same interpretation
+  drives evidence identity AND lifecycle, so no raw representation can be
+  durably recorded as one status and then acted on as another. Deposit
+  webhook amounts are parsed through `toExactGhsDecimal` at the boundary —
+  never through JS Number (audit r10): sub-pesewa input is rejected
+  fail-closed instead of silently collapsing through a float, and the
+  ±0.01 flag-OFF legacy tolerance is exact decimal arithmetic (uniformly
+  one-pesewa-inclusive at every magnitude). Example: a SUCCESS and a
+  FAILED observation for the same reference are DISTINCT durable rows, and a
+  late contradictory callback against a terminal deposit is still recorded
+  (evidence first, state second) while the settlement economics stay
+  untouched. Moolre's settlement surface records only successful P01
+  collections, so its identity is `event:moolre-collection:<externalref>`
+  with a constant status dimension. Outbound identities are status-scoped
+  where a reference can legitimately carry more than one observation
+  (`event:payout-outbound:<provider>:<reference>:<status>`); a payout
+  dispatch reference names exactly one dispatch (`event:payout-dispatch:<provider>:<reference>`).
+- Deposit webhooks record the observation BEFORE any state decision — a
+  contradictory late callback against a COMPLETED/FAILED deposit stays
+  durably visible instead of vanishing behind an early return. This
+  "evidence before state checks" begins once the surface has enough
+  authoritative identity to CONSTRUCT the observation.
+- Generic callbacks can derive a status-scoped observation identity
+  directly from the callback's own fields. Moolre's callback cannot: its
+  payload ({ txstatus, payer, amount, externalref, ... }) does not carry
+  the initiation response's durable providerRef, so a Moolre observation is
+  only identifiable once that reference exists on the initiation record.
+  The durable Moolre providerRef is therefore an observation-identity
+  PREREQUISITE, not a generic state check: an early P01 callback that
+  arrives before the initiation path has stamped
+  `TransactionHistory.providerRef` fails closed with 409 and creates NO
+  provider event (recording it with providerRef = NULL would commit the
+  identity first and make the provider's later legitimate retry — same
+  dedupKey, now carrying the stamped reference — fail as contradictory
+  evidence, permanently blocking settlement). Once the reference exists,
+  the observation is recorded before any state decision and settlement
+  proceeds; the deposit stays PENDING and retryable until then.
+
+Contradictory evidence raised on a deposit surface is additionally flagged
+`ReconciliationException (CONTRADICTORY_PROVIDER_EVIDENCE)` and answered
+HTTP 409; a genuinely distinct later observation (different status ⇒ its
+own identity) is never blocked by an earlier contradictory one. A failure in
 post-dispatch bookkeeping (evidence/IN_TRANSIT after the provider accepted a
 payout) NEVER auto-refunds the dispatched cash — that would double-spend;
 it is flagged for manual review instead.
@@ -287,3 +382,69 @@ reservations.
    `ReconciliationException` rows (existing infra), fail-closed, never auto-repair.
 10. P4 liability/restricted-obligation semantics are untouched; P5-D never posts
    customer economics; no quote-only spread/P&L; `pnl:inventory` untouched.
+
+## 6. Receipt ownership & replay identity (audit r14)
+
+The r14 audit hardened the authority's idempotency boundary under GENUINE
+PostgreSQL concurrency. All of it is proven by
+`__tests__/p5r14-receipt-race-identity.test.js` (real PG, Prisma never mocked,
+deliberate interlocked transactions that hold the winner open past its write so
+the loser genuinely blocks on the uncommitted row/index entry).
+
+### 6.1 §A — the ownership claim is ONE atomic guarded INSERT
+
+`recordReceipt` owns its dedupKey with
+`INSERT ... ON CONFLICT (dedupKey) DO NOTHING RETURNING ...`:
+
+- The creator branch runs ONLY on `RETURNING` non-empty; it is the ONLY code
+  that performs the liquidity increment. Exactly one increment per identity,
+  by construction, under any interleaving.
+- A concurrent duplicate NEVER surfaces Prisma P2002 (which would abort the
+  loser's whole PostgreSQL transaction): `ON CONFLICT DO NOTHING` blocks until
+  the concurrent winner commits or rolls back, then returns zero rows. The
+  loser re-reads the authoritative row INSIDE the same still-valid
+  transaction and converges with `{ replay: true, raced: true }` and ZERO
+  mutation.
+
+### 6.2 §B — ONE dedupKey names ONE receipt (full replay identity)
+
+A replay must match the FULL semantic economics, not just the key. The
+identity is asserted from DURABLE receipt columns — provider, rail,
+amountGhs (compared as exact `Decimal(20,2)`-canonical strings, never Prisma
+Decimal object identity), route, reference, eventDedupKey, relatedTransactionId
+— PLUS the economic class (matched vs unmatched vs treasury). Any differing
+replay throws `LIQUIDITY_CONFLICTING_EVIDENCE` with the differing fields named,
+and mutates nothing. `providerRef` is enrichment-only: NULL→present is a
+database-enforced compare-and-set (a racing pair of DIFFERENT present refs has
+exactly one winner; the loser fails closed), a present ref is immutable and is
+never downgraded.
+
+### 6.3 §L — quote substitution is closed (with the r13 audit)
+
+`verifyDepositEvidenceChain` requires the receipt to name the deposit's OWN
+quote (the `TransactionHistory.metadata.quoteId` binding), and a matched
+receipt cannot be recorded — or REPLAYED — under a different quote id. A
+same-user TWIN quote with identical economics can never satisfy the chain:
+existence/consumption/user/route checks alone prove nothing about WHICH quote
+the deposit was initiated with.
+
+### 6.4 §M — payout identity is never last-writer-wins
+
+`markReservationInTransit` and `settleReservation` write the payout
+providerRef only through a compare-and-set on the NULL slot: a racing pair
+with different refs has exactly one winner; the loser fails closed (or, on a
+terminal row, is quarantined `RECONCILIATION_REQUIRED`). Same-ref replays
+converge side-effect free.
+
+### 6.5 Migration & harness notes
+
+- The P5-D migration is replay-safe (guarded `IF NOT EXISTS` /
+  `IF NOT EXISTS (SELECT ... FROM pg_constraint)` everywhere), matching the
+  overlay installer's convergent style.
+- Harness integrity (§S of the audit): deposit-initiation helpers in the
+  p5d/p5e/r10/r12/r13 suites used to "find the just-created deposit" via
+  `findFirst(orderBy: { id: 'desc' })` — but `TransactionHistory.id` is a
+  UUID, so that ordering is a lexical coin-flip that returned the WRONG row
+  ~50% of runs when a user had two PENDING deposits (it made the r13
+  binding suite's two-deposit test flaky). All helpers now bind to the 201
+  body's `data.reference` (`findUnique` by txHash) — deterministic.

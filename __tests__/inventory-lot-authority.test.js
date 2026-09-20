@@ -179,6 +179,9 @@ describeOrSkip('§P.5-B inventory lot authority (real PostgreSQL)', () => {
             // consumption is substrate allocation; ledger economics are realized in P5-E
             expect((await bal('inventory:usdc:lots')).toFixed(8)).toBe('80.00000000');
         });
+        // Real-Postgres ledger posts inside one $transaction — this test can
+        // legitimately exceed Jest's 5s default under CI load (observed flake
+        // during the r8 battery), so it declares its own budget.
         it('P4/P5-A USDC ledger behavior is unchanged alongside lot authority', async () => {
             const user = await seedUser(prisma);
             const r = await prisma.$transaction((tx) => ledger.post(tx, {
@@ -192,6 +195,6 @@ describeOrSkip('§P.5-B inventory lot authority (real PostgreSQL)', () => {
                 idempotencyKey: 'p5b:p5a-compat', entryType: 'DEPOSIT', description: 'mixed',
                 lines: [{ account: 'fiat:momo:ghs', debit: '120' }, { account: `user:${user.id}:liability`, credit: '10' }],
             }))).rejects.toMatchObject({ code: 'LEDGER_CROSS_ASSET_BALANCE' });
-        });
+        }, 20000);
     });
 });

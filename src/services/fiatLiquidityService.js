@@ -55,6 +55,7 @@
 // =============================================================================
 
 const { Prisma } = require('@prisma/client');
+const crypto = require('crypto');
 const logger = require('../config/logger');
 const { recordReconciliationException } = require('../../services/reconciliationExceptionService');
 
@@ -127,12 +128,292 @@ const isAuthorityEnabled = async (prisma) => {
     return settings?.fiatLiquidityAuthorityEnabled === true;
 };
 
-// ─── raw provider evidence (append-only, idempotent) ───────────────────────
+// ─── provider-observation identity (docs §3.3) ───────────────────────────────
+//
+// ONE dedupKey names ONE provider observation. The identity of an observation
+// is its SEMANTIC authority fields — never its transport payload:
+//   provider, rail, direction, status, providerRef, amountGhs, relatedReference
+// `raw` is deliberately NOT identity: providers retry the same economic
+// observation with byte-different payloads (timestamps, ordering, extra
+// fields), and byte-comparison would manufacture contradictions out of
+// retries. Replay therefore converges ONLY when the semantic fields match;
+// a materially different observation under an already-committed identity is
+// contradictory evidence — retained as a DISTINCT durable row under a
+// deterministic conflict identity (so exact retries of the contradictory
+// payload converge too) and surfaced with a typed fail-closed error. It is
+// NEVER silently absorbed, NEVER rewritten over the committed row.
+const OBSERVATION_SEMANTIC_FIELDS = ['provider', 'rail', 'direction', 'status', 'providerRef', 'amountGhs', 'relatedReference'];
 
+// ── providerRef identity binding (audit r10, Finding 3) ─────────────────────
+// A PRESENT provider reference binds STRICTLY: two non-null refs that differ
+// are materially different observations (contradiction). An ABSENT reference
+// carries NO claim: it neither contradicts a committed reference nor blocks
+// convergence. This is the project's established providerRef semantics — the
+// receipt/event checks below compare refs only when BOTH are non-null, and
+// markReservationInTransit explicitly FILLS an absent reservation ref with an
+// incoming one (enrichment, never a conflict). Producers of optional refs are
+// real: the generic deposit webhook's providerTxId has never been a required
+// field (stored as `providerTxId || null` enrichment on both lifecycle
+// paths), and payout callbacks legitimately arrive before the provider's
+// durable txid exists. So:
+//   committed null  + incoming ref    → CONVERGE, and the committed row is
+//                                       ENRICHED with the observed ref
+//                                       (strictly additive durable evidence;
+//                                       committed semantic claims are never
+//                                       changed — receivedAt, status, amount
+//                                       stay exactly as committed). The
+//                                       enrichment claim is a database-
+//                                       enforced compare-and-set on the NULL
+//                                       slot (audit r11): under concurrency,
+//                                       exactly ONE different present ref can
+//                                       ever win — the loser converges only
+//                                       onto the winner's ref, or is rejected
+//                                       as contradictory evidence
+//   committed ref   + incoming null   → CONVERGE (the retry simply carries
+//                                       less detail; the committed ref is
+//                                       never downgraded)
+//   committed ref   + different ref   → CONTRADICTION (unchanged — binding is
+//                                       NOT weakened for present refs)
+const providerRefClaimsDiffer = (a, b) =>
+    a.providerRef != null && b.providerRef != null && a.providerRef !== b.providerRef;
+
+const observationSemantics = ({
+    provider, rail = null, direction, status, providerRef = null, amountGhs = null, relatedReference = null,
+}) => ({
+    provider: String(provider),
+    rail: rail == null ? null : String(rail),
+    direction: String(direction),
+    status: String(status),
+    providerRef: providerRef == null ? null : String(providerRef),
+    amountGhs: amountGhs == null ? null : new Prisma.Decimal(String(amountGhs)).toFixed(GHS_DP),
+    relatedReference: relatedReference == null ? null : String(relatedReference),
+});
+
+const observationSemanticsMatch = (a, b) =>
+    OBSERVATION_SEMANTIC_FIELDS.every((f) =>
+        f === 'providerRef' ? !providerRefClaimsDiffer(a, b) : (a[f] ?? null) === (b[f] ?? null));
+
+// Material-difference reporting follows the adopted contract (audit r10/r11):
+// a null-vs-present providerRef difference is legitimate enrichment, NOT a
+// contradiction — it must never be reported as a differing field alongside a
+// real contradiction. providerRef is listed only when both sides are PRESENT
+// and different. All other semantic fields compare exactly as before.
+const observationSemanticDiffs = (a, b) =>
+    OBSERVATION_SEMANTIC_FIELDS.filter((f) =>
+        f === 'providerRef' ? providerRefClaimsDiffer(a, b) : (a[f] ?? null) !== (b[f] ?? null));
+
+// Deterministic conflict identity for a contradictory observation: derived
+// ONLY from the semantic fields of the incoming payload, so the same
+// contradictory observation retried converges to the same conflict row.
+const conflictingObservationDedupKey = (dedupKey, semantics) => {
+    const canonical = OBSERVATION_SEMANTIC_FIELDS
+        .map((f) => (semantics[f] ?? '\\0'))
+        .join('\\u{1F}');
+    const fingerprint = crypto.createHash('sha256').update(canonical).digest('hex').slice(0, 16);
+    return `${dedupKey}:CONFLICT:${fingerprint}`;
+};
+
+// ── concurrency-safe null→present enrichment (audit r11) ────────────────────
+// Enrichment is a database-enforced COMPARE-AND-SET on the NULL slot: the
+// WHERE clause `providerRef: null` means exactly ONE concurrent caller can
+// ever claim it. An unconditional update() here would be last-writer-wins —
+// two concurrent retries carrying DIFFERENT present refs would each see NULL,
+// each overwrite, and the durable identity would depend on timing. Instead:
+//   * claim.count === 1 → this caller performed the unique enrichment;
+//   * claim.count === 0 → re-read the AUTHORITATIVE row:
+//       - same ref as ours           → converge (the winner wrote our ref);
+//       - still unexpectedly NULL    → replay untouched — never blindly
+//                                      overwrite (the concurrent claim may
+//                                      have rolled back; a later legitimate
+//                                      retry can still enrich);
+//       - a DIFFERENT present ref    → CONTRADICTION under the strict
+//                                      present→different-present rule — the
+//                                      conflicting observation is retained
+//                                      under its deterministic conflict
+//                                      identity and the call fails closed.
+async function enrichProviderRefObservation(prisma, existing, incomingProviderRef, failClosedOnConflict) {
+    const incomingRef = String(incomingProviderRef);
+    const claimed = await prisma.fiatProviderEvent.updateMany({
+        where: { id: existing.id, providerRef: null },
+        data: { providerRef: incomingRef },
+    });
+    if (claimed.count === 1) {
+        return { event: await prisma.fiatProviderEvent.findUnique({ where: { id: existing.id } }), replay: true };
+    }
+    const authoritative = await prisma.fiatProviderEvent.findUnique({ where: { id: existing.id } });
+    if (!authoritative) {
+        throw new Error('[fiatLiquidity] provider observation identity lost during providerRef enrichment');
+    }
+    if (authoritative.providerRef == null || String(authoritative.providerRef) === incomingRef) {
+        return { event: authoritative, replay: true };
+    }
+    await failClosedOnConflict(authoritative);
+}
+
+// ── §P.5-D/r13: enrich a durable observation's NULL providerRef slot by
+// dedupKey. Used by the initiation/OTP stamp paths: once the initiation
+// response's providerRef is durably stamped on TransactionHistory, the SAME
+// authoritative reference must land on the provider observation whenever the
+// early P01 callback already committed it with providerRef = NULL (audit r13
+// §4 — the r10/r11 enrichment semantics make the early record safe).
+//   * observation not committed yet → no-op (the callback creates it later
+//     carrying the stamped ref, or a subsequent retry enriches it);
+//   * slot already carries the SAME ref → converge (idempotent);
+//   * slot is NULL → the same database-enforced compare-and-set as r11 —
+//     exactly one concurrent stamp wins, the loser re-reads and converges;
+//   * slot carries a DIFFERENT present ref → CONTRADICTION — both claims are
+//     already durably visible (the event row and the initiation record), so
+//     nothing needs retaining: fail closed with the typed error and let the
+//     surface block settlement for reconciliation.
+async function enrichProviderEventRefByDedupKey(prisma, dedupKey, providerRef) {
+    if (providerRef == null) return { enriched: false, event: null };
+    const incomingRef = String(providerRef);
+    const existing = await prisma.fiatProviderEvent.findUnique({ where: { dedupKey } });
+    if (!existing) return { enriched: false, event: null };
+    if (existing.providerRef != null && String(existing.providerRef) !== incomingRef) {
+        throw new ConflictingEvidenceError(
+            `[fiatLiquidity] observation ${dedupKey} already carries providerRef ${existing.providerRef}; refusing to stamp ${incomingRef} — contradictory provider identity, settlement must fail closed for reconciliation`,
+            { dedupKey, committedEventId: existing.id, differingFields: ['providerRef'] }
+        );
+    }
+    if (existing.providerRef != null) return { enriched: false, event: existing };
+    return enrichProviderRefObservation(prisma, existing, incomingRef, async () => {
+        throw new ConflictingEvidenceError(
+            `[fiatLiquidity] observation ${dedupKey} carries a different present providerRef; refusing to stamp ${incomingRef} — contradictory provider identity`,
+            { dedupKey, differingFields: ['providerRef'] }
+        );
+    });
+}
+
+// ─── receipt replay identity (audit r14 §B) ──────────────────────────────────
+//
+// ONE dedupKey names ONE inbound GHS receipt. The receipt's replay identity is
+// its SEMANTIC authority fields — NEVER arbitrary raw JSON:
+//   provider, rail, amountGhs, route, reference, eventDedupKey,
+//   relatedTransactionId and the receipt's ECONOMIC CLASS.
+//
+//   * provider/rail/amountGhs/route/reference/eventDedupKey/relatedTransactionId
+//     compare EXACTLY. reference and eventDedupKey are durable COLUMNS
+//     (r14 §B) — the identity never depends on the evidence JSON.
+//   * providerRef follows the project's established semantics (r10/r11): refs
+//     compare ONLY when BOTH sides are PRESENT. null-vs-present is legitimate
+//     ENRICHMENT — the NULL slot is filled by a database-enforced
+//     compare-and-set (exactly one concurrent present ref can win), never
+//     last-writer-wins. A committed ref is never downgraded.
+//   * ECONOMIC CLASS is identity: a treasury opening must replay against
+//     RECEIVED, a verified matched deposit against AVAILABLE, an unmatched
+//     observation against UNMATCHED. A same-dedupKey replay claiming a
+//     DIFFERENT class is a materially different economic claim and fails
+//     closed — e.g. an UNMATCHED receipt that reconciliation has since
+//     matched (AVAILABLE) must be re-observed through
+//     confirmReconciliationMatch's idempotent path, never through
+//     recordReceipt. RECONCILIATION_REQUIRED/REVERSED rows replay against
+//     nothing: they fail closed too.
+//   * `evidence` raw JSON is DELIBERATELY NOT identity: the same economic
+//     receipt is legitimately retried with byte-different payloads
+//     (timestamps, payer details, presentation). It is audit context only.
+//     `confirmedAt`/`reversedAt` are transition artifacts, not identity.
+const RECEIPT_IDENTITY_FIELDS = [
+    'provider', 'rail', 'amountGhs', 'route', 'reference', 'eventDedupKey', 'relatedTransactionId',
+];
+
+const receiptSemantics = ({
+    provider, rail = null, providerRef = null, amountGhs, route = null,
+    reference = null, eventDedupKey = null, relatedTransactionId = null, treasury = false,
+}) => ({
+    provider: String(provider),
+    rail: rail == null ? null : String(rail),
+    providerRef: providerRef == null ? null : String(providerRef),
+    amountGhs: new Prisma.Decimal(String(amountGhs)).toFixed(GHS_DP),
+    route: route == null ? null : String(route),
+    reference: reference == null ? null : String(reference),
+    eventDedupKey: eventDedupKey == null ? null : String(eventDedupKey),
+    relatedTransactionId: relatedTransactionId == null ? null : String(relatedTransactionId),
+    // The economic class the CALLER claims for this dedupKey — the ONLY status
+    // that class may ever be replayed against.
+    requiredStatus: treasury ? 'RECEIVED' : (relatedTransactionId != null ? 'AVAILABLE' : 'UNMATCHED'),
+});
+
+const receiptIdentityDiffs = (committed, requested) => {
+    // Normalize BOTH sides through the same exact-decimal projection: the
+    // committed row carries Prisma Decimal objects (scale-preserved), the
+    // request carries normalized 2dp strings — compare GHS_DP-canonical
+    // strings, never object identity.
+    const committedAmount = committed.amountGhs == null
+        ? null : new Prisma.Decimal(committed.amountGhs).toFixed(GHS_DP);
+    return RECEIPT_IDENTITY_FIELDS.filter((f) => {
+        const c = f === 'amountGhs' ? committedAmount : (committed[f] ?? null);
+        return c !== (requested[f] ?? null);
+    });
+};
+
+// Fail-closed receipt identity: the committed row must be the SAME economic
+// claim as the replay, or the replay is contradictory evidence. ZERO liquidity
+// mutation ever reaches this path's callers (see recordReceipt).
+function assertReceiptIdentity(existing, requested) {
+    if (existing.status !== requested.requiredStatus) {
+        throw new ConflictingEvidenceError(
+            `[fiatLiquidity] receipt identity ${existing.dedupKey} committed as economic class ${existing.status}; refusing to replay it as ${requested.requiredStatus} — materially different economic claim`,
+            { committedDedupKey: existing.dedupKey, committedStatus: existing.status, requestedClass: requested.requiredStatus, differingFields: ['status'] }
+        );
+    }
+    const diffs = receiptIdentityDiffs(existing, requested);
+    if (diffs.length > 0) {
+        throw new ConflictingEvidenceError(
+            `[fiatLiquidity] receipt identity ${existing.dedupKey} contradicts committed economics — differing fields: ${diffs.join(', ')}`,
+            { committedDedupKey: existing.dedupKey, differingFields: diffs }
+        );
+    }
+    if (providerRefClaimsDiffer(existing, requested)) {
+        throw new ConflictingEvidenceError(
+            `[fiatLiquidity] receipt identity ${existing.dedupKey} carries providerRef ${existing.providerRef}; refusing ${requested.providerRef} — contradictory provider identity`,
+            { committedDedupKey: existing.dedupKey, differingFields: ['providerRef'] }
+        );
+    }
+    return true;
+}
+
+// Strictly-additive null→present providerRef enrichment for receipts — the
+// same database-enforced COMPARE-AND-SET as r11: exactly one concurrent
+// present ref can ever win; a loser converges only onto the winner's ref
+// (or a rolled-back claim leaves the slot for a later retry) and a DIFFERENT
+// present ref is contradictory evidence.
+async function enrichReceiptProviderRef(tx, existing, incomingProviderRef) {
+    if (incomingProviderRef == null) return existing;
+    const incomingRef = String(incomingProviderRef);
+    if (existing.providerRef != null) return existing; // present ref is immutable; contradictions fail in assertReceiptIdentity
+    const claimed = await tx.fiatLiquidityReceipt.updateMany({
+        where: { id: existing.id, providerRef: null },
+        data: { providerRef: incomingRef },
+    });
+    const authoritative = await tx.fiatLiquidityReceipt.findUnique({ where: { id: existing.id } });
+    if (!authoritative) throw new Error('[fiatLiquidity] receipt identity lost during providerRef enrichment');
+    if (claimed.count === 1 || String(authoritative.providerRef) === incomingRef) return authoritative;
+    if (authoritative.providerRef == null) return authoritative;
+    throw new ConflictingEvidenceError(
+        `[fiatLiquidity] receipt ${existing.dedupKey} providerRef enrichment lost the race to a different present ref — contradictory provider identity`,
+        { committedDedupKey: existing.dedupKey, differingFields: ['providerRef'] }
+    );
+}
+
+// ─── raw provider evidence (append-only, replay only on semantic match) ─────
+//
 // Records a raw provider observation OUTSIDE any caller transaction. Called
 // BEFORE the settlement transaction so evidence always survives, even when
-// the financial transition fails closed or rolls back. Replays converge to the
-// committed event row (dedupKey is the observation's economic identity).
+// the financial transition fails closed or rolls back.
+//
+// IDENTITY CONTRACT (docs §3.3):
+//   * an exact semantic duplicate of a committed observation converges to
+//     the committed row (replay: true) — webhook retries are idempotent;
+//   * a materially different observation under the same identity is
+//     CONTRADICTORY EVIDENCE: it is retained as a distinct durable row
+//     (deterministic conflict identity; never rewritten over the committed
+//     row) and the call FAILS CLOSED with ConflictingEvidenceError — the
+//     caller can never proceed as though the new payload were the committed
+//     observation, and contradictory evidence stays queryable/auditable;
+//   * genuinely distinct provider observations (different status, reference,
+//     provider) MUST be given distinct dedupKeys by the caller — the surface
+//     derives the identity from fields actually present in its callback.
 //
 // INBOUND observations MUST carry the collected amount (the receipt evidence
 // chain depends on it). OUTBOUND observations may carry none — a disbursement
@@ -156,10 +437,53 @@ async function recordProviderEvent(prisma, {
             `[fiatLiquidity] INBOUND observation ${dedupKey} must carry the collected amount — inbound evidence without an amount cannot back a receipt`
         );
     }
+    const semantics = observationSemantics({
+        provider, rail, direction, status, providerRef,
+        amountGhs: amount, relatedReference,
+    });
+    const failClosedOnConflict = async (committed) => {
+        const conflicting = await retainConflictingObservation(prisma, dedupKey, semantics, {
+            provider, rail, direction, status,
+            providerRef: providerRef == null ? null : String(providerRef),
+            amountGhs: amount,
+            relatedReference: relatedReference == null ? null : String(relatedReference),
+            raw: raw ?? undefined,
+        });
+        const diffs = observationSemanticDiffs(
+            observationSemantics(committed), semantics,
+        );
+        throw new ConflictingEvidenceError(
+            `[fiatLiquidity] provider observation ${dedupKey} contradicts committed evidence — differing fields: ${diffs.join(', ')}; ` +
+            `the contradictory observation is retained under ${conflicting.dedupKey}, never silently converged`,
+            {
+                dedupKey,
+                committedEventId: committed.id,
+                differingFields: diffs,
+                conflictingEventId: conflicting.id,
+                conflictingDedupKey: conflicting.dedupKey,
+            }
+        );
+    };
     const existing = await prisma.fiatProviderEvent.findUnique({ where: { dedupKey } });
     if (existing) {
-        // Converge: same observation already committed. NEVER rewrite it.
-        return { event: existing, replay: true };
+        if (observationSemanticsMatch(observationSemantics(existing), semantics)) {
+            // Converge: the SAME observation already committed. NEVER rewrite
+            // its committed semantic claims. The one strictly-additive
+            // exception (audit r10): a committed observation recorded WITHOUT
+            // a provider reference may be ENRICHED with the reference a retry
+            // now carries — mirroring markReservationInTransit's fill-in. A
+            // committed reference is never downgraded or changed. The
+            // enrichment itself is a database-enforced compare-and-set (audit
+            // r11): concurrent retries carrying different refs can never
+            // collapse into last-writer-wins.
+            if (existing.providerRef == null && semantics.providerRef != null) {
+                return enrichProviderRefObservation(prisma, existing, semantics.providerRef, failClosedOnConflict);
+            }
+            return { event: existing, replay: true };
+        }
+        // A materially different payload under a committed identity is
+        // contradictory evidence — retain it durably and fail closed.
+        await failClosedOnConflict(existing);
     }
     let event;
     try {
@@ -176,10 +500,43 @@ async function recordProviderEvent(prisma, {
         return { event, replay: false };
     } catch (err) {
         if (err?.code === 'P2002') {
-            // Concurrent duplicate of the same observation — converge.
+            // Concurrent duplicate under the same identity — the winner
+            // committed first. Converge ONLY if it is semantically the same
+            // observation; otherwise it is contradictory evidence.
             const raced = await prisma.fiatProviderEvent.findUnique({ where: { dedupKey } });
             if (!raced) throw new Error('[fiatLiquidity] provider event identity lost after race');
-            return { event: raced, replay: true };
+            if (observationSemanticsMatch(observationSemantics(raced), semantics)) {
+                // Same enrichment exception as the sequential path — and the
+                // same compare-and-set (audit r11): this branch can race a
+                // concurrent enrichment of the row the winner committed, so
+                // the NULL-slot claim must be database-enforced here too.
+                if (raced.providerRef == null && semantics.providerRef != null) {
+                    return enrichProviderRefObservation(prisma, raced, semantics.providerRef, failClosedOnConflict);
+                }
+                return { event: raced, replay: true };
+            }
+            await failClosedOnConflict(raced);
+        }
+        throw err;
+    }
+}
+
+// Retain a contradictory observation as its own durable evidence row under
+// the deterministic conflict identity. Exact retries of the contradictory
+// payload converge to this row. If the retention itself cannot be persisted
+// the persistence error propagates — evidence is never silently dropped.
+async function retainConflictingObservation(prisma, dedupKey, semantics, data) {
+    const conflictKey = conflictingObservationDedupKey(dedupKey, semantics);
+    const existing = await prisma.fiatProviderEvent.findUnique({ where: { dedupKey: conflictKey } });
+    if (existing) return existing;
+    try {
+        return await prisma.fiatProviderEvent.create({
+            data: { ...data, dedupKey: conflictKey },
+        });
+    } catch (err) {
+        if (err?.code === 'P2002') {
+            const raced = await prisma.fiatProviderEvent.findUnique({ where: { dedupKey: conflictKey } });
+            if (raced) return raced;
         }
         throw err;
     }
@@ -237,7 +594,7 @@ const syncPoolProjection = async (tx) => {
  * relatedTransactionId is never sufficient to create AVAILABLE GHS.
  */
 async function verifyDepositEvidenceChain(tx, {
-    eventDedupKey, provider, amount, providerRef, reference, relatedTransactionId, route,
+    eventDedupKey, provider, amount, providerRef, reference, relatedTransactionId, route, quoteId = null,
 }) {
     const fail = (msg) => {
         throw new InvalidEvidenceError(`[fiatLiquidity] matched-deposit evidence chain rejected: ${msg}`);
@@ -265,18 +622,29 @@ async function verifyDepositEvidenceChain(tx, {
     if (deposit.type !== 'DEPOSIT_FIAT') fail(`transaction ${reference} is ${deposit.type}, not DEPOSIT_FIAT`);
     if (deposit.status !== 'COMPLETED') fail(`deposit ${reference} is ${deposit.status}, not the authoritative settled state`);
 
-    const quoteId = deposit.metadata?.quoteId;
-    if (!quoteId) fail(`deposit ${reference} has no transaction quote`);
+    const boundQuoteId = deposit.metadata?.quoteId;
+    if (!boundQuoteId) fail(`deposit ${reference} has no transaction quote`);
+    // §L (r14): the quote-binding authority from the r13 audit — the receipt
+    // must name the deposit's OWN quote. Every quote-level check (existence,
+    // consumption, user, route) can otherwise be satisfied by a same-user
+    // TWIN quote with identical economics; the persisted metadata binding is
+    // the only proof of WHICH quote the deposit was initiated with.
+    if (quoteId == null) {
+        fail(`the receipt for ${reference} does not name its transaction quote (r14 §L)`);
+    }
+    if (String(boundQuoteId) !== String(quoteId)) {
+        fail(`receipt quote ${quoteId} is not the deposit's own bound quote ${boundQuoteId} (r14 §L quote substitution)`);
+    }
     // TransactionQuote is an overlay-managed table with NO Prisma model —
     // it is addressed through raw SQL everywhere (transactionQuoteService
     // uses $queryRaw for the same reason). Read the durable P5-C evidence
     // row through the same boundary.
     const quoteRows = await tx.$queryRaw`
         SELECT "id", "userId", "consumedAt", "consumedFor", "selectedRoute"
-        FROM "TransactionQuote" WHERE "id" = ${quoteId}::uuid`;
+        FROM "TransactionQuote" WHERE "id" = ${boundQuoteId}::uuid`;
     const quote = quoteRows[0];
-    if (!quote) fail(`unknown transaction quote ${quoteId}`);
-    if (quote.consumedAt == null) fail(`quote ${quoteId} is not consumed — deposit ${reference} is not authoritatively settled`);
+    if (!quote) fail(`unknown transaction quote ${boundQuoteId}`);
+    if (quote.consumedAt == null) fail(`quote ${boundQuoteId} is not consumed — deposit ${reference} is not authoritatively settled`);
     if (String(quote.userId) !== String(deposit.userId)) fail(`quote user ${quote.userId} ≠ deposit user ${deposit.userId}`);
     if (route != null && quote.selectedRoute != null && quote.selectedRoute !== route) {
         fail(`quote selectedRoute ${quote.selectedRoute} ≠ receipt route ${route}`);
@@ -306,26 +674,42 @@ async function verifyDepositEvidenceChain(tx, {
 async function recordReceipt(tx, {
     provider, rail = null, providerRef = null, dedupKey, amountGhs,
     route = null, reference = null, relatedTransactionId = null, evidence = null, treasury = false,
-    eventDedupKey = null,
+    eventDedupKey = null, quoteId = null,
 }) {
     if (!provider || !dedupKey) {
         throw new InvalidEvidenceError('[fiatLiquidity] provider and dedupKey are required receipt evidence');
     }
     const amount = toExactGhsDecimal(amountGhs);
 
-    await ensureStateRow(tx);
+    // §B (r14): the FULL semantic identity the caller claims for this key —
+    // provider, rail, amount, route, reference, event observation, deposit
+    // linkage, providerRef and the economic class. Never raw JSON.
+    const requested = receiptSemantics({
+        provider, rail, providerRef, amountGhs: amount, route,
+        reference, eventDedupKey, relatedTransactionId, treasury,
+    });
 
     const existing = await tx.fiatLiquidityReceipt.findUnique({ where: { dedupKey } });
     if (existing) {
-        if (!existing.amountGhs.equals(amount) || existing.provider !== provider) {
-            // Conflicting reuse of an economic identity — fail closed. The
-            // raw evidence rows for both observations are already durable.
-            throw new ConflictingEvidenceError(
-                `[fiatLiquidity] receipt identity ${dedupKey} already committed with different economics`,
-                { committedAmountGhs: existing.amountGhs.toString(), committedProvider: existing.provider }
-            );
+        // Sequential replay: validate the FULL identity, converge with ZERO
+        // mutation. The only strictly-additive exception is providerRef
+        // null→present enrichment (compare-and-set, never last-writer-wins).
+        assertReceiptIdentity(existing, requested);
+        // §L (r14): a matched-deposit receipt replay must still name the
+        // deposit's OWN quote — quote substitution fails closed even when the
+        // receipt itself already exists (the economics were verified against
+        // THIS binding at creation; a different quote is a different claim).
+        if (!treasury && relatedTransactionId != null && quoteId != null) {
+            const deposit = await tx.transactionHistory.findUnique({ where: { id: String(relatedTransactionId) } });
+            if (!deposit || String(deposit.metadata?.quoteId ?? '') !== String(quoteId)) {
+                throw new ConflictingEvidenceError(
+                    `[fiatLiquidity] receipt identity ${dedupKey} replay names quote ${quoteId}, which is not the deposit's own bound quote — quote substitution`,
+                    { committedDedupKey: dedupKey, differingFields: ['quoteId'] }
+                );
+            }
         }
-        return { receipt: existing, replay: true };
+        const receipt = await enrichReceiptProviderRef(tx, existing, providerRef);
+        return { receipt, replay: true };
     }
 
     let status;
@@ -340,44 +724,67 @@ async function recordReceipt(tx, {
             );
         }
         await verifyDepositEvidenceChain(tx, {
-            eventDedupKey, provider, amount, providerRef, reference, relatedTransactionId, route,
+            eventDedupKey, provider, amount, providerRef, reference, relatedTransactionId, route, quoteId,
         });
         status = 'AVAILABLE';
     } else {
         status = 'UNMATCHED';
     }
 
-    const receipt = await tx.fiatLiquidityReceipt.create({
-        data: {
-            provider, rail, providerRef: providerRef == null ? null : String(providerRef),
-            dedupKey, amountGhs: amount, status, route,
-            relatedTransactionId: relatedTransactionId == null ? null : String(relatedTransactionId),
-            confirmedAt: status === 'AVAILABLE' ? new Date() : null,
-            evidence,
-        },
-    }).catch((err) => {
-        if (err?.code === 'P2002') {
-            // Concurrent duplicate of the same economic receipt — converge to
-            // the committed row; never create a second liquidity result.
-            return tx.fiatLiquidityReceipt.findUnique({ where: { dedupKey } });
-        }
-        throw err;
-    });
-    if (!receipt) throw new Error('[fiatLiquidity] receipt identity lost after race');
-    if (receipt.dedupKey !== dedupKey || !receipt.amountGhs.equals(amount)) {
-        // The row we converged to is not ours — conflicting identity.
-        throw new ConflictingEvidenceError(
-            `[fiatLiquidity] receipt identity ${dedupKey} conflicted under concurrency`
-        );
+    // §A (r14): the ownership claim is ONE ATOMIC guarded INSERT. A concurrent
+    // duplicate of the same dedupKey does NOT raise P2002 — inside a Prisma
+    // interactive transaction a unique-violation ABORTS the whole underlying
+    // PostgreSQL transaction (verified empirically), so the previous
+    // P2002-catch-and-re-read design could never converge and, had it
+    // survived the abort, would have double-incremented. ON CONFLICT DO
+    // NOTHING blocks until the concurrent winner commits or rolls back,
+    // returns zero rows for the loser, and leaves the caller transaction
+    // VALID — the loser re-reads the authoritative row in the SAME
+    // transaction, validates the full identity and converges with ZERO
+    // liquidity mutation.
+    const id = crypto.randomUUID();
+    const claimed = await tx.$executeRaw`
+        INSERT INTO "FiatLiquidityReceipt" (
+            "id", "provider", "rail", "providerRef", "dedupKey", "amountGhs", "status",
+            "route", "reference", "eventDedupKey", "relatedTransactionId", "confirmedAt",
+            "evidence", "createdAt", "updatedAt"
+        ) VALUES (
+            ${id}, ${String(provider)}, ${rail == null ? null : String(rail)},
+            ${providerRef == null ? null : String(providerRef)}, ${String(dedupKey)},
+            ${amount.toFixed(2)}::numeric(20,2), ${status},
+            ${route == null ? null : String(route)},
+            ${reference == null ? null : String(reference)},
+            ${eventDedupKey == null ? null : String(eventDedupKey)},
+            ${relatedTransactionId == null ? null : String(relatedTransactionId)},
+            ${status === 'AVAILABLE' ? new Date() : null},
+            ${evidence == null ? null : JSON.stringify(evidence)}::jsonb,
+            CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+        )
+        ON CONFLICT ("dedupKey") DO NOTHING`;
+
+    if (claimed === 0) {
+        // The winner committed this identity concurrently. Validate the FULL
+        // identity against the authoritative row and converge — replay, ZERO
+        // increment, ZERO projection write (§A).
+        const winner = await tx.fiatLiquidityReceipt.findUnique({ where: { dedupKey } });
+        if (!winner) throw new Error('[fiatLiquidity] receipt identity lost after race');
+        assertReceiptIdentity(winner, requested);
+        const receipt = await enrichReceiptProviderRef(tx, winner, providerRef);
+        return { receipt, replay: true, raced: true };
     }
 
+    // ONLY the successful creator of the receipt row performs the liquidity
+    // increment (§A) — exactly one AVAILABLE increment per economic identity,
+    // by construction, under any concurrency.
+    const receipt = await tx.fiatLiquidityReceipt.findUnique({ where: { dedupKey } });
+    if (!receipt) throw new Error('[fiatLiquidity] receipt identity lost after claim');
     if (receipt.status === 'AVAILABLE') {
+        await ensureStateRow(tx);
         await tx.fiatLiquidityState.update({
             where: { id: 1 },
             data: { availableGhs: { increment: amount } },
         });
         await syncPoolProjection(tx);
-        return { receipt, replay: false };
     }
     return { receipt, replay: false };
 }
@@ -653,6 +1060,43 @@ async function reserveForPayout(tx, {
     return { reservation: created, replay: false, state };
 }
 
+// ── §P.5-D r14 (§M): reservation providerRef enrichment is a COMPARE-AND-SET ──
+// markReservationInTransit/settleReservation previously wrote the incoming
+// provider reference UNCONDITIONALLY: two concurrent callbacks carrying
+// DIFFERENT refs would each see a NULL/present slot and overwrite each other
+// — the durable payout identity would depend on timing (last-writer-wins).
+// The r11/r13 contract instead:
+//   * present ref + same incoming ref   → converge (idempotent);
+//   * present ref + DIFFERENT ref        → CONTRADICTORY payout identity —
+//     fail closed, never overwrite (settlement/reconciliation can act on the
+//     typed error; the evidence rows for both claims are already durable);
+//   * NULL slot + incoming ref           → database-enforced CAS: exactly one
+//     concurrent claim wins; a loser re-reads and converges onto the winner's
+//     ref (or the claim rolled back and the slot stays open for a retry).
+async function enrichReservationProviderRef(tx, reservation, incomingProviderRef) {
+    if (incomingProviderRef == null) return reservation;
+    const incomingRef = String(incomingProviderRef);
+    if (reservation.providerRef === incomingRef) return reservation;
+    if (reservation.providerRef != null) {
+        throw new ConflictingEvidenceError(
+            `[fiatLiquidity] reservation ${reservation.reference} carries providerRef ${reservation.providerRef}; refusing ${incomingRef} — ambiguous payout identity`,
+            { reservationReference: reservation.reference, differingFields: ['providerRef'] }
+        );
+    }
+    const claimed = await tx.fiatLiquidityReservation.updateMany({
+        where: { id: reservation.id, providerRef: null },
+        data: { providerRef: incomingRef },
+    });
+    const authoritative = await tx.fiatLiquidityReservation.findUnique({ where: { id: reservation.id } });
+    if (!authoritative) throw new Error('[fiatLiquidity] reservation identity lost during providerRef enrichment');
+    if (claimed.count === 1 || String(authoritative.providerRef) === incomingRef) return authoritative;
+    if (authoritative.providerRef == null) return authoritative; // the concurrent claim rolled back — slot stays open
+    throw new ConflictingEvidenceError(
+        `[fiatLiquidity] reservation ${reservation.reference} providerRef enrichment lost the race to a different present ref — ambiguous payout identity`,
+        { reservationReference: reservation.reference, differingFields: ['providerRef'] }
+    );
+}
+
 /**
  * RESERVED → IN_TRANSIT (provider accepted the payout). Single-winner CAS;
  * replays are side-effect free; terminal rows fail closed.
@@ -661,13 +1105,10 @@ async function markReservationInTransit(tx, { reference, providerRef = null }) {
     const reservation = await tx.fiatLiquidityReservation.findUnique({ where: { reference } });
     if (!reservation) throw new InvalidEvidenceError(`[fiatLiquidity] unknown reservation ${reference}`);
     if (reservation.status === 'IN_TRANSIT') {
-        if (providerRef && !reservation.providerRef) {
-            await tx.fiatLiquidityReservation.update({
-                where: { id: reservation.id },
-                data: { providerRef: String(providerRef) },
-            });
-        }
-        return { reservation, replay: true };
+        // §M (r14): null→present providerRef enrichment is a database-enforced
+        // COMPARE-AND-SET — never an unconditional last-writer-wins update.
+        const updated = await enrichReservationProviderRef(tx, reservation, providerRef);
+        return { reservation: updated, replay: true };
     }
     if (reservation.status !== 'RESERVED') {
         throw new ConflictingEvidenceError(
@@ -683,11 +1124,10 @@ async function markReservationInTransit(tx, { reference, providerRef = null }) {
         where: { id: 1 },
         data: { reservedGhs: { decrement: reservation.amountGhs }, inTransitGhs: { increment: reservation.amountGhs } },
     });
-    const updated = providerRef
-        ? await tx.fiatLiquidityReservation.update({
-            where: { id: reservation.id }, data: { providerRef: String(providerRef) },
-        })
-        : reservation;
+    // §M (r14): the dispatch reference claim is the same compare-and-set —
+    // exactly one concurrent present ref can win the NULL slot; a loser
+    // converges or is rejected as a contradictory payout identity.
+    const updated = await enrichReservationProviderRef(tx, reservation, providerRef);
     return { reservation: updated, replay: false };
 }
 
@@ -754,10 +1194,11 @@ async function settleReservation(tx, { reference, outcome, providerTxId = null, 
             where: { id: 1 },
             data: { inTransitGhs: { decrement: reservation.amountGhs }, paidOutGhs: { increment: reservation.amountGhs } },
         });
+        // §M (r14): the terminal providerRef claim is the same compare-and-set.
+        // A present ref never changes (contradictions quarantine above); a
+        // NULL slot is enriched by exactly one concurrent winner.
         const updated = successRef
-            ? await tx.fiatLiquidityReservation.update({
-                where: { id: reservation.id }, data: { providerRef: successRef },
-            })
+            ? await enrichReservationProviderRef(tx, reservation, successRef)
             : await tx.fiatLiquidityReservation.findUnique({ where: { id: reservation.id } });
         await syncPoolProjection(tx);
         return { reservation: updated, replay: false };
@@ -1125,6 +1566,7 @@ module.exports = {
     LIQUIDITY_INSUFFICIENT_CODE,
     LiquidityInsufficientError,
     ConflictingEvidenceError,
+    enrichProviderEventRefByDedupKey,
     InvalidEvidenceError,
     GhsEvidenceRequiredError,
     isAuthorityEnabled,

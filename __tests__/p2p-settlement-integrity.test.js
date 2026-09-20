@@ -34,6 +34,13 @@ describeOrSkip('P2P escrow settlement integrity (real PostgreSQL)', () => {
             update: { p2pFeePct: 0.01, tierThreshold: 1000, vendorShareUnder1k: 0.4, vendorShareOver1k: 0.5 },
             create: { id: 1, p2pFeePct: 0.01, tierThreshold: 1000, vendorShareUnder1k: 0.4, vendorShareOver1k: 0.5 },
         });
+        // Hermetic entry: AdminFeeProfile rows (e.g. a migration-seeded
+        // 'default-fee-profile' at 2%) OVERRIDE the GlobalSettings fee
+        // fallback via resolveFeeProfile — any leftover active profile would
+        // change every fee assertion below. Clear the table so this suite
+        // computes fees from the GlobalSettings it just upserted, exactly
+        // like a fresh CI database (db push, no migration seed).
+        await prisma.adminFeeProfile.deleteMany();
         // Hermetic entry: SystemProfitFees is a global singleton whose
         // balance accumulates across suites — an earlier suite's leftover
         // fees would make the conservation assertions below (0.4 + 0.6 ==

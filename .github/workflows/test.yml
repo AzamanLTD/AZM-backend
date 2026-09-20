@@ -20,9 +20,14 @@ jobs:
     runs-on: ubuntu-latest
     # Budget must cover the worst case: one full suite run PLUS the single
     # retry-on-failure. Measured full run with tuned Postgres: minutes, not
-    # tens of minutes — but keep a wide margin so a transient-failure retry
-    # can never be killed by the job clock mid-suite again.
-    timeout-minutes: 45
+    # tens of minutes on a healthy runner. But observed 2026-09-20: a noisy
+    # GitHub runner executed the same 236-suite battery ~4x slower (32.5 min
+    # for attempt one) — a retry on such a runner needs ~70 min, which the
+    # previous 45-min budget cut off mid-suite, converting a transient
+    # slow-runner retry into a hard job timeout. 90 min covers the observed
+    # slow-runner full+retry case with margin; on healthy runners the job
+    # finishes in ~10 min regardless.
+    timeout-minutes: 90
 
     services:
       postgres:
@@ -84,6 +89,9 @@ jobs:
       - name: Install fiat liquidity authority overlay
         run: node infra/install-fiat-liquidity-overlay.js
 
+      - name: Install Model B settlement overlay
+        run: node infra/install-model-b-settlement-overlay.js
+
       - name: Generate Prisma client
         run: npx prisma generate
 
@@ -120,7 +128,25 @@ jobs:
           fi
           exit $code
 
+      - name: Checkout authoritative frontend (AZM-businessPortal)
+        # route-check is a FRONTEND/BACKEND compatibility gate: it must scan
+        # the real frontend API layer, never pass vacuously on a backend-only
+        # workspace. The frontend repository is public, so no cross-repo
+        # credentials are needed; the default GITHUB_TOKEN cannot read other
+        # private repos anyway. Pinned to main: the gate validates the
+        # CURRENT authoritative frontend against this backend.
+        uses: actions/checkout@v7
+        with:
+          repository: AzamanLTD/AZM-businessPortal
+          ref: main
+          path: frontend/AZM-businessPortal
+
       - name: Verify route registry against frontend API usage
+        # Fail-closed: ROUTE_CHECK_REQUIRE_FRONTEND=1 makes an absent or
+        # empty frontend source fail the gate instead of a zero-call PASS.
+        env:
+          ROUTE_CHECK_FRONTEND_ROOT: ${{ github.workspace }}/frontend/AZM-businessPortal
+          ROUTE_CHECK_REQUIRE_FRONTEND: '1'
         run: npm run route-check
 
       - name: Database backup and restore drill

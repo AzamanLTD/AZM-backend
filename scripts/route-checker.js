@@ -14,7 +14,30 @@ const fs = require('fs');
 const path = require('path');
 
 const BACKEND_ROOT = path.resolve(__dirname, '..');
-const FRONTEND_ROOT = path.resolve(__dirname, '..', '..', 'AZM-businessPortal');
+
+// The authoritative frontend source (AZM-businessPortal) is supplied
+// EXPLICITLY. CI checks that repository out and points
+// ROUTE_CHECK_FRONTEND_ROOT at it; the historical default (a sibling clone
+// named AZM-businessPortal) is kept for local development. The frontend
+// repository is never inferred from the backend workspace — a backend-only
+// checkout must never be mistaken for "no frontend calls".
+const FRONTEND_ROOT = process.env.ROUTE_CHECK_FRONTEND_ROOT
+    ? path.resolve(process.env.ROUTE_CHECK_FRONTEND_ROOT)
+    : path.resolve(__dirname, '..', '..', 'AZM-businessPortal');
+
+// GATE MODE (fail-closed): when route-check is used as a frontend/backend
+// compatibility gate (CI sets ROUTE_CHECK_REQUIRE_FRONTEND=1), the
+// authoritative frontend sources MUST be present and MUST yield a nonzero
+// call set. A vacuous scan (0 frontend calls because the files are absent)
+// must FAIL LOUDLY — "PASS" must always mean the frontend was actually
+// scanned, never "there was nothing in this workspace to check".
+const REQUIRE_FRONTEND = process.env.ROUTE_CHECK_REQUIRE_FRONTEND === '1';
+
+// The authoritative frontend API layer scanned by this gate.
+const FRONTEND_API_FILES = [
+    path.join(FRONTEND_ROOT, 'src', 'lib', 'api.js'),
+    path.join(FRONTEND_ROOT, 'src', 'lib', 'marketplaceApi.js'),
+];
 
 // ── 1. Parse route mounts from server.js ────────────────────────────────────
 
@@ -115,12 +138,8 @@ function extractCallArgs(code, startIndex) {
 function extractFrontendCalls() {
     const calls = [];
     const seen = new Set();
-    const files = [
-        path.join(FRONTEND_ROOT, 'src', 'lib', 'api.js'),
-        path.join(FRONTEND_ROOT, 'src', 'lib', 'marketplaceApi.js'),
-    ];
 
-    for (const filePath of files) {
+    for (const filePath of FRONTEND_API_FILES) {
         if (!fs.existsSync(filePath)) continue;
         const code = fs.readFileSync(filePath, 'utf8');
         const relFile = path.relative(FRONTEND_ROOT, filePath);
@@ -213,8 +232,36 @@ function main() {
     const backendRoutes = extractBackendRoutes(mounts);
     console.log(`  ${backendRoutes.size} backend route handlers`);
 
+    // Gate integrity: the expected frontend sources must actually be present.
+    const missingFiles = FRONTEND_API_FILES.filter((f) => !fs.existsSync(f));
+    if (missingFiles.length > 0) {
+        if (REQUIRE_FRONTEND) {
+            console.error('FAIL: route-check is running as a frontend/backend compatibility gate,');
+            console.error('but the expected authoritative frontend sources are ABSENT:');
+            for (const f of missingFiles) console.error(`  ${f}`);
+            console.error(`FRONTEND_ROOT resolved to: ${FRONTEND_ROOT}`);
+            console.error('Supply the AZM-businessPortal checkout via ROUTE_CHECK_FRONTEND_ROOT');
+            console.error('(CI checks the repository out explicitly for this step).');
+            console.error('This failure is deliberate: an absent frontend must never yield a vacuous PASS.');
+            process.exit(1);
+        }
+        console.log('  WARNING: expected frontend sources are ABSENT — 0 frontend calls scanned.');
+        console.log(`  FRONTEND_ROOT resolved to: ${FRONTEND_ROOT}`);
+        console.log('  This run verified backend route extraction only. It is NOT a');
+        console.log('  frontend/backend compatibility proof. Set ROUTE_CHECK_REQUIRE_FRONTEND=1');
+        console.log('  in CI to make absent frontend sources fail the gate.');
+    }
+
     const frontendCalls = extractFrontendCalls();
     console.log(`  ${frontendCalls.length} frontend API calls\n`);
+
+    if (REQUIRE_FRONTEND && frontendCalls.length === 0) {
+        console.error('FAIL: gate mode requires a NONZERO frontend call set, but 0 frontend API');
+        console.error('calls were extracted from the supplied frontend sources. A vacuous scan');
+        console.error('must never report PASS — check that the frontend checkout contains');
+        console.error('src/lib/api.js and src/lib/marketplaceApi.js with request(...) calls.');
+        process.exit(1);
+    }
 
     const unmatched = [];
     for (const call of frontendCalls) {

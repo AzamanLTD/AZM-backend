@@ -56,8 +56,14 @@ describeOrSkip('payout provider unknown-outcome (real PostgreSQL)', () => {
     afterAll(async () => { if (prisma) await prisma.$disconnect(); });
 
     afterEach(async () => {
+        // Every test in this suite settles the SAME module-level REF, and the
+        // §P.5-D observation-identity contract makes a materially different
+        // observation under a committed dedupKey a CONFLICT (fail closed,
+        // settlement deferred) rather than a silent replay. Durable provider
+        // observations, reservations and receipts for REF therefore MUST NOT
+        // leak between tests — wipe the fiat authority tables with the rest.
         await prisma.$executeRawUnsafe(
-            'TRUNCATE TABLE "User", "Withdrawal", "TransactionHistory", "GlobalSettings", "SystemFiatPool", "ProviderSettlementAttempt", "ReconciliationException" RESTART IDENTITY CASCADE'
+            'TRUNCATE TABLE "User", "Withdrawal", "TransactionHistory", "GlobalSettings", "SystemFiatPool", "ProviderSettlementAttempt", "ReconciliationException", "FiatProviderEvent", "FiatLiquidityReceipt", "FiatLiquidityReservation", "FiatLiquidityState" RESTART IDENTITY CASCADE'
         );
     }, 15000);
 
