@@ -63,5 +63,12 @@ exports.runNow = wrap(async function runNow(req, res) {
         return res.status(404).json({ success: false, message: 'Route not found' });
     }
     const run = await svc.runOnce(route.id, { manual: true });
+    // r16 P0-A: a skipped claim means the database refused a duplicate
+    // execution (the due occurrence is already claimed/running, or the
+    // route is inactive) — report it honestly instead of fabricating a run.
+    if (run && run.skipped) {
+        const code = run.reason === 'Execution already claimed' ? 409 : 400;
+        return res.status(code).json({ success: false, message: run.reason, run: run.run || null });
+    }
     res.json({ success: true, run });
 });
