@@ -272,7 +272,7 @@ const processFiatWithdrawal = async (prisma, userId, amountFloat, opts = {}) => 
             await fiatLiquidity.reserveForPayout(tx, {
                 reference,
                 amountGhs: payoutGhs,
-                provider: route.provider || 'MTN_MOMO',
+                provider: route.provider || 'MOOLRE_DISBURSEMENT',
                 rail: route.rail || 'MOMO',
                 destination: route.destination || null,
                 relatedTransactionId: txRecord.id,
@@ -294,7 +294,7 @@ const processFiatWithdrawal = async (prisma, userId, amountFloat, opts = {}) => 
             userId,
             relatedEntity: 'transactionHistory',
             relatedEntityId: (await tx.transactionHistory.findUnique({ where: { txHash: reference } }))?.id ?? null,
-            metadata: { status: 'PENDING', provider: 'MTN_MOMO', deferredEconomics: true },
+            metadata: { status: 'PENDING', provider: 'MOOLRE_DISBURSEMENT', deferredEconomics: true },
             lines: [
                 { account: `user:${userId}:liability`, debit: new Prisma.Decimal(String(totalDeduct)) },
                 { account: 'restricted:reserves', credit: new Prisma.Decimal(String(totalDeduct)) },
@@ -473,7 +473,7 @@ const completeFiatWithdrawal = async (prisma, reference, { providerTxId = null }
                     userId: pending.userId,
                     relatedEntity: 'transactionHistory',
                     relatedEntityId: pending.id,
-                    metadata: { status: 'COMPLETED', provider: 'MTN_MOMO', providerTxId: providerTxId || null },
+                    metadata: { status: 'COMPLETED', provider: 'MOOLRE_DISBURSEMENT', providerTxId: providerTxId || null },
                     lines,
                 });
                 await restrictedObligations.releaseOnSettlement(tx, {
@@ -564,7 +564,7 @@ const reverseFiatWithdrawal = async (prisma, reference, opts = {}) => {
                 userId,
                 relatedEntity: 'transactionHistory',
                 relatedEntityId: original.id,
-                metadata: { status: 'FAILED', provider: 'MTN_MOMO' },
+                metadata: { status: 'FAILED', provider: 'MOOLRE_DISBURSEMENT' },
                 lines: [
                     { account: 'restricted:reserves', debit: new Prisma.Decimal(String(totalDeduct)) },
                     { account: `user:${userId}:liability`, credit: new Prisma.Decimal(String(totalDeduct)) },

@@ -10,6 +10,18 @@
 //      fails CLOSED (409) — the cash position is unknown.
 //   3. Rejection after canonical settlement (COMPLETED) fails closed (409).
 //   4. Concurrent rejections of one mirror refund exactly once.
+//   5. An OPEN reconciliation exception (e.g. POST_DISPATCH_BOOKKEEPING_
+//      FAILED) attached to the payout fails closed — recovery belongs to
+//      the reconciliation worker, never to an admin refund guess (r16b
+//      P0-B).
+//   6. Admin rejection racing the payout worker's PENDING -> PROCESSING
+//      claim has exactly one winner — a worker-claimed payout is never
+//      refunded, a rejected payout is never dispatched (r16b P0-B).
+//   7. Terminal mirror statuses (COMPLETED / FAILED / CANCELLED /
+//      NEEDS_MANUAL_REVIEW / PROCESSING) never refund.
+//   8. A legacy pre-P4 mirror-only withdrawal rejects through the
+//      documented legacy path without fabricating a modern authority
+//      obligation (r16b P0-B).
 //
 // SKIPS unless TEST_DATABASE_URL is set.
 // =============================================================================
@@ -34,7 +46,7 @@ describeOrSkip('r16 P0-C: Admin rejection canonical-state safety', () => {
 
     afterEach(async () => {
         await prisma.$executeRawUnsafe(
-            'TRUNCATE TABLE "User", "Withdrawal", "TransactionHistory", "GlobalSettings", "SystemProfitFees", "SystemFiatPool", "SystemMasterCrypto", "AdminProfitLog", "FiatProviderEvent" RESTART IDENTITY CASCADE'
+            'TRUNCATE TABLE "User", "Withdrawal", "TransactionHistory", "GlobalSettings", "SystemProfitFees", "SystemFiatPool", "SystemMasterCrypto", "AdminProfitLog", "FiatProviderEvent", "ReconciliationException" RESTART IDENTITY CASCADE'
         );
         await prisma.$executeRawUnsafe('TRUNCATE TABLE "LedgerTransaction", "JournalEntry", "LedgerAccount", "RestrictedObligation" RESTART IDENTITY CASCADE');
     }, 15000);
@@ -189,5 +201,154 @@ describeOrSkip('r16 P0-C: Admin rejection canonical-state safety', () => {
 
         const fresh = await prisma.user.findUnique({ where: { id: user.id } });
         expect(Number(fresh.availableBalance)).toBeCloseTo(200, 5); // refunded ONCE
+    });
+
+    test('5: an OPEN reconciliation exception attached to the payout fails closed (409)', async () => {
+        const admin = await seedUser(prisma, { role: 'ADMIN' });
+        const user = await seedUser(prisma, { availableBalance: 200 });
+        const { withdrawal, reference } = await seedCanonicalWithdrawal(user, 50);
+
+        // The provider accepted the payout but post-dispatch bookkeeping
+        // failed — the payoutBatchWorker parks exactly this durable state.
+        await prisma.$executeRawUnsafe(
+            'INSERT INTO "ReconciliationException" ("entityType", "entityId", "reference", "reason", "status") ' +
+            'VALUES ($1, $2, $3, $4, \'OPEN\')',
+            'WITHDRAWAL', String(withdrawal.id), reference, 'POST_DISPATCH_BOOKKEEPING_FAILED'
+        );
+
+        const before = await prisma.user.findUnique({ where: { id: user.id } });
+        const res = await reject(admin, withdrawal.id);
+        expect(res.statusCode).toBe(409);
+        expect(res.payload.data.evidence).toBe('OPEN_RECONCILIATION_EXCEPTION');
+
+        // NOTHING moved: no refund, canonical still PENDING, obligation
+        // still ACTIVE — the reconciliation worker owns recovery.
+        const after = await prisma.user.findUnique({ where: { id: user.id } });
+        expect(Number(after.availableBalance)).toBe(Number(before.availableBalance));
+        const canonical = await prisma.transactionHistory.findUnique({ where: { txHash: reference } });
+        expect(canonical.status).toBe('PENDING');
+        const obligations = await prisma.restrictedObligation.findMany({
+            where: { reference: `withdrawal:fiat:${reference}`, status: 'ACTIVE' },
+        });
+        expect(obligations.length).toBe(1);
+        const mirror = await prisma.withdrawal.findUnique({ where: { id: withdrawal.id } });
+        expect(mirror.status).toBe('PENDING');
+    });
+
+    test('5b: a TRANSACTION-entity exception on the reference also fails closed (409)', async () => {
+        const admin = await seedUser(prisma, { role: 'ADMIN' });
+        const user = await seedUser(prisma, { availableBalance: 200 });
+        const { withdrawal, reference } = await seedCanonicalWithdrawal(user, 50);
+
+        // Smart Route / evidence-write failure shape: entityType TRANSACTION,
+        // entityId = the canonical reference.
+        await prisma.$executeRawUnsafe(
+            'INSERT INTO "ReconciliationException" ("entityType", "entityId", "reference", "reason", "status") ' +
+            'VALUES ($1, $2, $3, $4, \'OPEN\')',
+            'TRANSACTION', String(reference), reference, 'POST_DISPATCH_OWNERSHIP_WRITE_FAILED'
+        );
+
+        const before = await prisma.user.findUnique({ where: { id: user.id } });
+        const res = await reject(admin, withdrawal.id);
+        expect(res.statusCode).toBe(409);
+        expect(res.payload.data.evidence).toBe('OPEN_RECONCILIATION_EXCEPTION');
+
+        const after = await prisma.user.findUnique({ where: { id: user.id } });
+        expect(Number(after.availableBalance)).toBe(Number(before.availableBalance));
+    });
+
+    test('6: admin rejection racing the payout worker claim has exactly one winner', async () => {
+        const admin = await seedUser(prisma, { role: 'ADMIN' });
+        const user = await seedUser(prisma, { availableBalance: 200 });
+        const { withdrawal, reference } = await seedCanonicalWithdrawal(user, 50);
+
+        // The payoutBatchWorker's guarded claim, exactly as production
+        // writes it: updateMany PENDING -> PROCESSING, zero rows = lost.
+        const workerClaim = () => prisma.withdrawal.updateMany({
+            where: { id: withdrawal.id, status: 'PENDING' },
+            data: { status: 'PROCESSING' },
+        });
+
+        // Run both concurrently, several rounds — the DB must serialize
+        // them into exactly one winner each round.
+        for (let round = 0; round < 5; round++) {
+            // Re-seed a fresh PENDING withdrawal for each round.
+            const fresh = await seedCanonicalWithdrawal(user, 50);
+
+            const [rejectRes, claimRes] = await Promise.all([
+                reject(admin, fresh.withdrawal.id),
+                prisma.withdrawal.updateMany({
+                    where: { id: fresh.withdrawal.id, status: 'PENDING' },
+                    data: { status: 'PROCESSING' },
+                }),
+            ]);
+
+            const mirror = await prisma.withdrawal.findUnique({ where: { id: fresh.withdrawal.id } });
+            const canonical = await prisma.transactionHistory.findUnique({ where: { txHash: fresh.reference } });
+            const winnerCount = (rejectRes.statusCode === 200 ? 1 : 0) + (claimRes.count === 1 ? 1 : 0);
+            expect(winnerCount).toBe(1); // never both, never neither
+
+            if (mirror.status === 'REJECTED') {
+                // Admin won: full canonical reversal, exactly one refund.
+                expect(canonical.status).toBe('FAILED');
+            } else {
+                // Worker won: payout protected, provider payout claimable by
+                // the worker — and NO refund happened.
+                expect(mirror.status).toBe('PROCESSING');
+                expect(canonical.status).toBe('PENDING');
+                expect(rejectRes.statusCode).toBe(409);
+            }
+        }
+        void reference;
+    });
+
+    test('7: terminal mirror statuses never refund', async () => {
+        const admin = await seedUser(prisma, { role: 'ADMIN' });
+
+        for (const status of ['COMPLETED', 'FAILED', 'CANCELLED', 'NEEDS_MANUAL_REVIEW', 'PROCESSING']) {
+            const user = await seedUser(prisma, { availableBalance: 200 });
+            const { withdrawal } = await seedCanonicalWithdrawal(user, 50);
+            await prisma.withdrawal.update({ where: { id: withdrawal.id }, data: { status } });
+
+            const before = await prisma.user.findUnique({ where: { id: user.id } });
+            const res = await reject(admin, withdrawal.id);
+            expect(res.statusCode).toBe(400); // status guard refuses before any financial mutation
+
+            const after = await prisma.user.findUnique({ where: { id: user.id } });
+            expect(Number(after.availableBalance)).toBe(Number(before.availableBalance));
+            const mirror = await prisma.withdrawal.findUnique({ where: { id: withdrawal.id } });
+            expect(mirror.status).toBe(status); // untouched
+        }
+    });
+
+    test('8: a legacy mirror-only withdrawal rejects through the documented legacy path', async () => {
+        const admin = await seedUser(prisma, { role: 'ADMIN' });
+        const user = await seedUser(prisma, { availableBalance: 200 });
+
+        // Pre-P4 shape: NO canonical TransactionHistory link at all.
+        const rows = await prisma.$queryRawUnsafe(
+            'INSERT INTO "Withdrawal" ("userId", "amount", "payoutMethod", "network", "destination", "status", "createdAt", "updatedAt") ' +
+            'VALUES ($1, $2, $3, $4, $5, \'PENDING\', now(), now()) RETURNING "id"',
+            user.id, 30, 'MTN_MOMO', 'MOMO', '0240000000'
+        );
+        const legacyId = rows[0].id;
+
+        const res = await reject(admin, legacyId);
+        expect(res.statusCode).toBe(200);
+
+        // Mirror rejected, legacy amount refunded.
+        const mirror = await prisma.withdrawal.findUnique({ where: { id: legacyId } });
+        expect(mirror.status).toBe('REJECTED');
+
+        // NO modern authority obligation was fabricated for the legacy row.
+        const obligations = await prisma.restrictedObligation.findMany({
+            where: { userId: user.id },
+        });
+        expect(obligations.length).toBe(0);
+
+        // Legacy path refunds `Withdrawal.amount` from equity (documented
+        // pre-P4 behavior — the row predates canonical reservations).
+        const fresh = await prisma.user.findUnique({ where: { id: user.id } });
+        expect(Number(fresh.availableBalance)).toBeCloseTo(230, 5); // 200 + 30
     });
 });

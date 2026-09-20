@@ -65,17 +65,25 @@ if (!process.env.MOOLRE_WEBHOOK_SECRET) {
     logger.warn('MOOLRE_WEBHOOK_SECRET is not set — webhook endpoint is disabled');
 }
 
-// MTN remains the secondary provider for automatic off-ramp failover.
-const MtnDisbursementService = require('../../services/mtnDisbursementService');
-const mtnFallbackService = new MtnDisbursementService();
-
+// MOOLRE IS THE ONLY CURRENT EXTERNAL FIAT PROVIDER (r16b P0-A,
+// product contract 2026-09-20). MTN / Telecel / AirtelTigo are destination
+// NETWORKS under Moolre (channel mapping lives in the Moolre adapter) —
+// they are NOT separate Azaman provider contracts. A direct
+// MtnDisbursementService is therefore NOT instantiated as a production
+// payout provider, and customer money can never fail over onto a direct
+// MTN rail. The mtn adapter module and its ownership identity remain
+// available for HISTORICAL reconciliation of legacy rows only (see
+// services/payoutProviderOwnership.js) — no production dispatch path can
+// ever select them.
+//
 // Unlike the legacy I/O adapters above, failover orchestration is a src-level
-// domain service and therefore lives under src/services.
+// domain service and therefore lives under src/services. The abstraction is
+// kept so a future legitimately contracted provider can be added without
+// rearchitecting — today the production registry is Moolre-only:
 const { PaymentFailoverService } = require('../services/paymentFailoverService');
 const paymentFailoverService = new PaymentFailoverService({
     providers: [
         { name: 'moolre', instance: moolreDisbursementService, priority: 1 },
-        { name: 'mtn', instance: mtnFallbackService, priority: 2 },
     ],
 });
 
@@ -92,6 +100,9 @@ module.exports = {
     prisma,
     marketOracle,
     gatewayService,
+    // Historical app-key alias kept for compatibility — it deliberately
+    // points at the CANONICAL Moolre instance. Moolre is the current fiat
+    // provider; no production code path receives a direct MTN adapter.
     mtnDisbursementService: moolreDisbursementService,
     moolreCollectionService,
     paymentFailoverService,

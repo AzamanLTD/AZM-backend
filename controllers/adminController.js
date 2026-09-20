@@ -1551,7 +1551,7 @@ exports.rejectWithdrawal = async (req, res) => {
         const canonical = await _resolveCanonicalWithdrawalTx(prisma, withdrawal);
 
         if (canonical) {
-            const gate = await _rejectionSafetyGate(prisma, canonical);
+            const gate = await _rejectionSafetyGate(prisma, withdrawal, canonical);
             if (!gate.safe) {
                 return res.status(409).json({
                     success: false,
@@ -1772,7 +1772,7 @@ async function _resolveCanonicalWithdrawalTx(prisma, withdrawal) {
  * once provider money may have left Azaman control. Fail-closed checks on
  * the canonical state and every durable dispatch evidence source.
  */
-async function _rejectionSafetyGate(prisma, canonical) {
+async function _rejectionSafetyGate(prisma, withdrawal, canonical) {
     const reference = canonical.txHash;
     if (!reference) {
         return { safe: false, message: 'The linked transaction has no provider reference — refusing blind rejection. Escalate to reconciliation.', evidence: 'NO_REFERENCE' };
@@ -1808,8 +1808,35 @@ async function _rejectionSafetyGate(prisma, canonical) {
         return { safe: false, message: 'A provider has accepted/owns this payout — rejection would double-spend. Reconcile the payout instead.', evidence: 'OWNER_KNOWN' };
     }
 
-    // Canonical PENDING, zero dispatch evidence, unknown owner: the cash
-    // never left — safe to reject through the canonical reversal.
+    // Durable reconciliation exceptions (r16b P0-B): an OPEN
+    // ReconciliationException attached to this withdrawal or its canonical
+    // reference — POST_DISPATCH_BOOKKEEPING_FAILED,
+    // POST_DISPATCH_OWNERSHIP_WRITE_FAILED, DISPATCH_IDENTITY_UNKNOWN /
+    // _CONTRADICTION, or any other operational failure — means the payout
+    // may have reached the provider and the bookkeeping could not prove
+    // the state. The payout stays protected for the reconciliation worker;
+    // admin rejection must never guess past durable anomaly evidence.
+    // Raw SQL — the exception queue is a migration-backed table without a
+    // Prisma model (same pattern as the control-plane tables).
+    const openExceptions = await prisma.$queryRawUnsafe(
+        'SELECT COUNT(*)::int AS n FROM "ReconciliationException" ' +
+        'WHERE "status" = \'OPEN\' AND (' +
+        '("entityType" = $1 AND "entityId" = $2) OR ' +
+        '("entityType" = $3 AND "entityId" = $4))',
+        'WITHDRAWAL', String(withdrawal.id),
+        'TRANSACTION', String(canonical.txHash || reference)
+    );
+    if ((openExceptions?.[0]?.n || 0) > 0) {
+        return {
+            safe: false,
+            message: 'An OPEN reconciliation exception is attached to this payout — the cash position may be unproven. Refusing rejection; the reconciliation worker owns recovery.',
+            evidence: 'OPEN_RECONCILIATION_EXCEPTION',
+        };
+    }
+
+    // Canonical PENDING, zero dispatch evidence, unknown owner, no open
+    // exceptions: the cash never left — safe to reject through the
+    // canonical reversal.
     return { safe: true };
 }
 

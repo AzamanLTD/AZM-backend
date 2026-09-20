@@ -46,26 +46,51 @@ const SMS_LARGE_WITHDRAWAL_THRESHOLD = parseFloat(
 //   1. financeService.processFiatWithdrawal — debits the user, captures the
 //      arbitrage spread, splits the exit fee, debits SystemFiatPool, writes
 //      a TransactionHistory row stamped with `reference` (UUID v4 used as
-//      the MTN MoMo X-Reference-Id idempotency key).
-//   2. mtnDisbursementService.initiateTransfer — dispatches the GHS payout to
-//      the user's MoMo wallet using the same `reference`. The call is async
-//      from MTN's side (202 Accepted; settlement webhook arrives later).
-//   3. On synchronous rejection from MTN, financeService.reverseFiatWithdrawal
+//      the Moolre transfer idempotency key).
+//   2. payoutDispatcher.initiateTransfer (Moolre, the only current fiat
+//      provider) — dispatches the GHS payout to the user's MoMo wallet using
+//      the same `reference` plus the selected destination network (MTN /
+//      TELECEL / AIRTELTIGO channels under Moolre). Settlement is async;
+//      the Moolre settlement webhook arrives later.
+//   3. On synchronous rejection from Moolre, financeService.reverseFiatWithdrawal
 //      atomically refunds the user, unwinds SystemMasterCrypto / SystemFiatPool,
 //      and marks the TransactionHistory row FAILED.
+//
+// r16b P0-A topology note: the dispatcher resolved below is Moolre-only
+// (PaymentFailoverService production registry). MTN/Telecel/AirtelTigo are
+// destination networks under Moolre, passed as `network` data — never as
+// provider choices.
 // =============================================================================
 exports.fiatWithdrawal = async (req, res) => {
     const prisma                  = req.app.get('prisma');
     const io                      = req.app.get('socketio');
     const emitBalanceUpdate       = req.app.get('emitBalanceUpdate');
     const paymentFailoverService  = req.app.get("paymentFailoverService");
-    const mtnDisbursementService  = paymentFailoverService || req.app.get("mtnDisbursementService"); // failover-aware
+    // r16b P0-A: Moolre is the ONLY production fiat provider — this is the
+    // canonical Moolre-backed payout dispatcher (the historical
+    // `mtnDisbursementService` app key deliberately aliases the Moolre
+    // instance in baseServices). Network selection is destination data
+    // under Moolre, not a provider choice.
+    const payoutDispatcher = paymentFailoverService || req.app.get("mtnDisbursementService"); // failover-aware
     const emailService            = req.app.get('emailService');
     const smsService              = req.app.get('smsService');
 
     try {
         const { amount, payoutMethod, recipientPhone, destination } = req.body;
         const userId = req.user.id;
+
+        // r16b P0-A: the destination MoMo network is DATA under the single
+        // Moolre provider contract — never a provider choice. VODAFONE is a
+        // legacy compatibility alias for Telecel; Moolre's NETWORK_TO_CHANNEL
+        // mapping (MTN=1, TELECEL=6, AIRTELTIGO=7) remains the authority.
+        let networkChoice = (req.body.network || 'MTN').toString().toUpperCase();
+        if (!['MTN', 'TELECEL', 'VODAFONE', 'AIRTELTIGO'].includes(networkChoice)) {
+            return res.status(400).json({
+                success: false,
+                message: 'network must be one of: MTN, TELECEL, or AIRTELTIGO.'
+            });
+        }
+        if (networkChoice === 'VODAFONE') networkChoice = 'TELECEL';
 
         if (!amount || Number(amount) <= 0) {
             return res.status(400).json({ success: false, message: 'Invalid withdrawal amount.' });
@@ -90,7 +115,7 @@ exports.fiatWithdrawal = async (req, res) => {
             });
         }
 
-        // recipientPhone is required for MTN MoMo dispatch — fall back to the
+        // recipientPhone is required for Moolre MoMo dispatch — fall back to the
         // legacy `destination` field if older clients are still sending it.
         const phone = recipientPhone || destination;
         if (!phone || typeof phone !== 'string' || phone.length < 9) {
@@ -101,8 +126,8 @@ exports.fiatWithdrawal = async (req, res) => {
         }
 
         // Pre-allocate a UUID that will serve as the canonical idempotency
-        // key across (a) the TransactionHistory row, (b) the MTN MoMo
-        // X-Reference-Id, and (c) any reversal lookups.
+        // key across (a) the TransactionHistory row, (b) the Moolre transfer
+        // reference, and (c) any reversal lookups.
         const reference = randomUUID();
 
         // Phase L1: pre-fetch recipient identity once so any synchronous
@@ -185,8 +210,12 @@ exports.fiatWithdrawal = async (req, res) => {
                         'RETURNING "id", "userId", "amount", "payoutMethod", "network", "destination", "status"',
                         userId,
                         parseFloat(amount),
+                        // Legacy payout-method discriminator kept for worker
+                        // discovery compatibility — NOT provider identity.
                         payoutMethod || 'MTN_MOMO',
-                        'MOMO',
+                        // Destination network (MTN|TELECEL|AIRTELTIGO) under
+                        // Moolre; the rail is MoMo, the provider is Moolre.
+                        networkChoice,
                         phone,
                         'PENDING',
                         txRecord.id
@@ -236,10 +265,10 @@ exports.fiatWithdrawal = async (req, res) => {
             }
         }
 
-        // Step 3 — Dispatch payout to MTN MoMo. On synchronous failure, fully
+        // Step 3 — Dispatch payout through Moolre. On synchronous failure, fully
         // reverse the ledger so the user is not silently debited.
-        if (!mtnDisbursementService) {
-            logger.error('[fiatWithdrawal] mtnDisbursementService is not bound to the app context.');
+        if (!payoutDispatcher) {
+            logger.error('[fiatWithdrawal] payout dispatcher is not bound to the app context.');
             await financeService.reverseFiatWithdrawal(prisma, reference, {
                 reason: 'mtn_service_unavailable'
             });
@@ -297,7 +326,7 @@ exports.fiatWithdrawal = async (req, res) => {
                 dedupKey: `event:payout-dispatch-intent:${reference}`,
                 amountGhs: data.payoutGhs || data.withdrawalAmount || null,
                 relatedReference: reference,
-                raw: { externalId: reference, recipientPhone: phone, stage: 'PRE_PROVIDER_IO' },
+                raw: { externalId: reference, recipientPhone: phone, network: networkChoice, stage: 'PRE_PROVIDER_IO' },
             });
         } catch (intentErr) {
             logger.error({ err: intentErr, reference },
@@ -324,11 +353,15 @@ exports.fiatWithdrawal = async (req, res) => {
             // If initiateTransfer throws, `dispatch` stays null and the catch
             // below reverses the reservation — cash never left. Any failure
             // AFTER a successful dispatch hits the double-spend guard there.
-            dispatch = await mtnDisbursementService.initiateTransfer({
+            dispatch = await payoutDispatcher.initiateTransfer({
                 referenceId:    reference,
                 amountGhs:      data.payoutGhs || data.withdrawalAmount,  // GHS amount derived by service if available
                 recipientPhone: phone,
                 externalId:     reference,
+                // r16b P0-A: destination network propagated into the canonical
+                // Moolre dispatch payload — Telecel/AirtelTigo payouts must
+                // ride the correct Moolre channel, not default to MTN.
+                network:        networkChoice,
                 payerMessage:   `Azaman withdrawal ref ${reference}`,
                 payeeNote:      `Withdrawal ${reference}`
             });
@@ -604,7 +637,7 @@ exports.fiatWithdrawal = async (req, res) => {
 
             return res.status(200).json({
                 success: true,
-                message: `Withdrawal dispatched to ${actualProviderName === 'MOOLRE_DISBURSEMENT' ? 'Moolre' : 'MTN MoMo'}. Reference: ${reference}`,
+                message: `Withdrawal dispatched to ${actualProviderName === 'MOOLRE_DISBURSEMENT' ? 'Moolre' : 'the payout provider'}. Reference: ${reference}`,
                 // Top-level `reference` so the Flutter WithdrawalProgressSheet can
                 // open immediately and subscribe to withdrawal_progress / poll
                 // GET /api/withdraw/status/:reference without parsing the message.
