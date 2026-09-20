@@ -117,20 +117,29 @@ const authLimiter = _failOpen(rateLimit(_opts({
 })));
 
 // ── FINANCIAL: 10 requests per minute per USER (trade/withdraw/deposit) ───────
-// keyGenerator runs BEFORE `protect` sets req.user, so we decode the JWT here
-// directly (no signature verification needed — we only need a stable per-user
-// bucket; a forged token is rejected downstream by `protect`). Falls back to the
-// IPv6-safe IP key when there is no Authorization header.
+// keyGenerator runs BEFORE `protect` sets req.user, so we inspect the JWT here
+// directly. r15 follow-up (bucket-poisoning fix): the claim is now VERIFIED
+// (signature + expiry, same JWT_SECRET `protect` enforces). The previous
+// unverified `jwt.decode` let ANY client forge an Authorization header naming
+// a victim's id and exhaust the victim's 10/min financial bucket — a targeted
+// denial-of-service on someone's withdrawals/trades/savings/escrow. A forged
+// or expired token now falls back to the attacker's own IP bucket, never the
+// claimed victim's.
+const jwt = require('jsonwebtoken');
 const _financialKey = (req, res) => {
     if (req.user?.id) return `user_${req.user.id}`;
     const auth = req.headers.authorization || '';
     if (auth.startsWith('Bearer ')) {
         try {
-            const decoded = require('jsonwebtoken').decode(auth.slice(7));
+            const decoded = jwt.verify(auth.slice(7), process.env.JWT_SECRET);
             if (decoded?.id) return `user_${decoded.id}`;
-        } catch (_) { /* fall through to IP */ }
+        } catch (_) { /* unverified/invalid claim — fall through to the IP key */ }
     }
-    return ipKeyGenerator(req, res);
+    // r15 follow-up (v8 API fix): express-rate-limit v8's ipKeyGenerator takes
+    // the IP STRING (ipKeyGenerator(ip, ipv6Subnet)), not (req, res). The old
+    // call passed the request object, which the function returned unchanged —
+    // a fresh unique bucket key per request, so this fallback NEVER limited.
+    return ipKeyGenerator(req.ip || req.socket?.remoteAddress || 'unknown');
 };
 
 const financialLimiter = _failOpen(rateLimit(_opts({
