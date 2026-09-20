@@ -122,38 +122,44 @@ jobs:
         # do not bulk-paste the whole battery here; that is the OTHER lane.
         # Serial (shared disposable DB, TRUNCATE cleanup) + forceExit (app
         # bootstrap holds handles open), mirroring the main battery's contract.
-        run: npx jest --runInBand --forceExit \
-          __tests__/p2p-settlement-integrity.test.js \
-          __tests__/azm-auction-settlement-integrity.test.js \
-          __tests__/dine-in-customer-order-settlement.test.js \
-          __tests__/p5e-model-b-settlement.test.js \
-          __tests__/withdrawal-reconciliation-settlement.test.js \
-          __tests__/withdrawal-reconciliation-finance-settlement.test.js \
-          __tests__/withdrawal-reconciliation-terminal-claim.test.js \
-          __tests__/r15a-reconciliation-single-claim.test.js \
-          __tests__/r15h-reconciliation-resolves-through-status-contract.test.js \
-          __tests__/r15c-disbursement-outcome-classification.test.js \
-          __tests__/r15d-withdrawal-outcome-honesty.test.js \
-          __tests__/r15e-providerref-cas.test.js \
-          __tests__/r15f2-evidence-write-transaction-safety.test.js \
-          __tests__/r15g-moolre-status-contract.test.js \
-          __tests__/r15b-moolre-collection-outcomes.test.js \
-          __tests__/payout-unknown-outcome.test.js \
-          __tests__/admin-reconciliation-claims.test.js \
-          __tests__/payment-failover.test.js \
-          __tests__/escrow-flow.test.js \
-          __tests__/escrow-refund-realtime.test.js \
-          __tests__/escrow-dispute-integrity.test.js \
-          __tests__/escrow-convergence.test.js \
-          __tests__/booking-escrow-financial-integrity.test.js \
-          __tests__/azm-conversion-economic-atomicity.test.js \
-          __tests__/azm-stake-economic-atomicity.test.js \
-          __tests__/azm-gift-economic-atomicity.test.js \
-          __tests__/susu-cycle-payout-single-winner.test.js \
-          __tests__/susu-cycle-contribution-atomicity.test.js \
-          __tests__/legacy-susu-economic-atomicity.test.js \
-          __tests__/withdrawal-fee-discount-atomicity.test.js \
-          __tests__/business-invoice-payment-concurrency.test.js
+        run: |
+          # Bash array keeps each path an EXACT positional argument:
+          # a plain-scalar multi-line run folds newlines to spaces and
+          # jest receives one broken regex matching nothing (run 35512019320).
+          SUITES=(
+            "__tests__/p2p-settlement-integrity.test.js"
+            "__tests__/azm-auction-settlement-integrity.test.js"
+            "__tests__/dine-in-customer-order-settlement.test.js"
+            "__tests__/p5e-model-b-settlement.test.js"
+            "__tests__/withdrawal-reconciliation-settlement.test.js"
+            "__tests__/withdrawal-reconciliation-finance-settlement.test.js"
+            "__tests__/withdrawal-reconciliation-terminal-claim.test.js"
+            "__tests__/r15a-reconciliation-single-claim.test.js"
+            "__tests__/r15h-reconciliation-resolves-through-status-contract.test.js"
+            "__tests__/r15c-disbursement-outcome-classification.test.js"
+            "__tests__/r15d-withdrawal-outcome-honesty.test.js"
+            "__tests__/r15e-providerref-cas.test.js"
+            "__tests__/r15f2-evidence-write-transaction-safety.test.js"
+            "__tests__/r15g-moolre-status-contract.test.js"
+            "__tests__/r15b-moolre-collection-outcomes.test.js"
+            "__tests__/payout-unknown-outcome.test.js"
+            "__tests__/admin-reconciliation-claims.test.js"
+            "__tests__/payment-failover.test.js"
+            "__tests__/escrow-flow.test.js"
+            "__tests__/escrow-refund-realtime.test.js"
+            "__tests__/escrow-dispute-integrity.test.js"
+            "__tests__/escrow-convergence.test.js"
+            "__tests__/booking-escrow-financial-integrity.test.js"
+            "__tests__/azm-conversion-economic-atomicity.test.js"
+            "__tests__/azm-stake-economic-atomicity.test.js"
+            "__tests__/azm-gift-economic-atomicity.test.js"
+            "__tests__/susu-cycle-payout-single-winner.test.js"
+            "__tests__/susu-cycle-contribution-atomicity.test.js"
+            "__tests__/legacy-susu-economic-atomicity.test.js"
+            "__tests__/withdrawal-fee-discount-atomicity.test.js"
+            "__tests__/business-invoice-payment-concurrency.test.js"
+          )
+          npx jest --runInBand --forceExit "${SUITES[@]}"
 
       - name: 'Guard: re-verify commit mode was never relaxed mid-run'
         run: |
