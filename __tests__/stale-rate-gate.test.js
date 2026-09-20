@@ -107,6 +107,17 @@ describeOrSkip('271C fail-closed stale-rate gate (real PostgreSQL)', () => {
             lastExternalSync: new Date(Date.now() - second(60)),
             lastAdminSetAt: null,
             lastEchoAt: null,
+            // Hermeticity (audit r14 follow-up): this suite's contract is the
+            // 271C rate gate and the GENERIC webhook's fixed-price settlement
+            // at its persisted quote — the flag-OFF legacy clearing bridge.
+            // Without pinning, the seed's UPDATE preserves flags left TRUE by
+            // a preceding suite (observed: p5r14 in CI's execution order), and
+            // the webhook then settles through Model B with no OPEN inventory
+            // lots and correctly fail-closes with 409, failing test 12/13.
+            // Pinning restores the suite's historical, order-independent
+            // contract; suites that want Model B seed their own flags.
+            fiatLiquidityAuthorityEnabled: false,
+            modelBSettlementEnabled: false,
         };
         const data = { ...base, ...overrides };
         await prisma.globalSettings.upsert({ where: { id: 1 }, update: data, create: { id: 1, ...data } });

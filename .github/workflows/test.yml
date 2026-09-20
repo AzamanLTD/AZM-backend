@@ -20,9 +20,14 @@ jobs:
     runs-on: ubuntu-latest
     # Budget must cover the worst case: one full suite run PLUS the single
     # retry-on-failure. Measured full run with tuned Postgres: minutes, not
-    # tens of minutes — but keep a wide margin so a transient-failure retry
-    # can never be killed by the job clock mid-suite again.
-    timeout-minutes: 45
+    # tens of minutes on a healthy runner. But observed 2026-09-20: a noisy
+    # GitHub runner executed the same 236-suite battery ~4x slower (32.5 min
+    # for attempt one) — a retry on such a runner needs ~70 min, which the
+    # previous 45-min budget cut off mid-suite, converting a transient
+    # slow-runner retry into a hard job timeout. 90 min covers the observed
+    # slow-runner full+retry case with margin; on healthy runners the job
+    # finishes in ~10 min regardless.
+    timeout-minutes: 90
 
     services:
       postgres:

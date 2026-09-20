@@ -18,11 +18,18 @@ module.exports = {
     testEnvironment: 'node',
     testPathIgnorePatterns: ['/node_modules/', '/__tests__/helpers/'],
     setupFiles: ['./jest.setup.js'],
-    setupFilesAfterEnv: ['./test-support/setup-shift-business-context.js'],
+    setupFilesAfterEnv: [
+        './test-support/setup-shift-business-context.js',
+        './test-support/hook-timeout.js',
+    ],
     // CI-hosted Postgres (service container) pays an fsync per commit, so
     // TRUNCATE-heavy beforeEach/afterEach cleanup hooks can exceed the 5s
-    // default on a loaded runner while the test itself is healthy. Hooks get
-    // a 30s budget; individual TEST timeouts stay at their defaults (tests
-    // that need longer declare their own).
-    hookTimeout: 30000,
+    // default on a loaded runner while the test itself is healthy. Jest 29
+    // has no `hookTimeout` config option (that key was silently ignored with
+    // a validation warning, leaving hooks on the 5s testTimeout default —
+    // the cause of the 2026-09-20 withdrawal-reconciliation CI flake), so
+    // the 30s hook budget is applied by wrapping the hook globals in
+    // test-support/hook-timeout.js via setupFilesAfterEnv. Individual TEST
+    // timeouts stay at their defaults (tests that need longer declare their
+    // own); per-hook overrides keep working.
 };

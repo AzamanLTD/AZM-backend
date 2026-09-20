@@ -75,6 +75,16 @@ describeOrSkip('§P.5-D r14: receipt ownership races + identity contract (real P
             await prisma.$executeRawUnsafe('DELETE FROM "SystemMasterCrypto"');
             await prisma.$executeRawUnsafe('DELETE FROM "SystemFiatPool"');
             await prisma.$executeRawUnsafe('DELETE FROM "SystemProfitFees"');
+            // Hermetic exit (p5e pattern): this suite seeds the liquidity
+            // authority + Model B flags TRUE in its beforeEach; a later
+            // suite whose GlobalSettings seed only writes rate columns
+            // (e.g. stale-rate-gate) would otherwise inherit them and take
+            // the Model B settlement path with no OPEN inventory lots,
+            // fail-closing a healthy deposit webhook (CI 2026-09-20 409).
+            await prisma.globalSettings.update({
+                where: { id: 1 },
+                data: { fiatLiquidityAuthorityEnabled: false, modelBSettlementEnabled: false },
+            }).catch(() => null);
             await prisma.$disconnect();
         }
     });
