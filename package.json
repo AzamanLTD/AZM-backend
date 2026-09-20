@@ -72,5 +72,8 @@
     "teeny-request": {
       "uuid": "^11.1.1"
     }
+  },
+  "engines": {
+    "node": "24.x"
   }
 }

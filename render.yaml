@@ -40,6 +40,12 @@ services:
     healthCheckPath: /health
     autoDeploy: true
     envVars:
+      # Runtime contract (r15 follow-up): CI (.github/workflows/test.yml),
+      # this blueprint, .nvmrc and package.json engines all pin Node 24 — the
+      # only major version the full serial test battery has been verified
+      # against. Future AWS deployment should use the same contract.
+      - key: NODE_VERSION
+        value: "24"
       - key: NODE_ENV
         value: production
       # CORS allow-list — update when new frontend origins are added
