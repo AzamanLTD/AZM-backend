@@ -224,9 +224,9 @@ describeOrSkip('§P.5-D r14: receipt ownership races + identity contract (real P
                 await holdGate.then(() => sleep(250)); // loser INSERTs INTO the blocked window
                 return out;
             });
-            await sleep(60); // let the winner reach (and hold) its INSERT
+            await sleep(300); // let the winner reach (and hold) its INSERT (300ms: a loaded CI runner needs several DB roundtrips)
             const loser = prisma.$transaction((tx) => fiatLiquidity.recordReceipt(tx, matchedReceiptArgs(chain)));
-            await sleep(80);
+            await sleep(300); // the loser must reach its BLOCKED INSERT before the winner commits
             winnerHoldOpen(); // winner proceeds to commit; the loser unblocks
             const [w, l] = await Promise.all([winner, loser]);
 
@@ -266,14 +266,28 @@ describeOrSkip('§P.5-D r14: receipt ownership races + identity contract (real P
             const loser = inTx((tx) => fiatLiquidity.recordReceipt(tx, matchedReceiptArgs(chain, { rail: 'BANK' })));
             const results = await Promise.allSettled([winner, loser]);
 
-            expect(results[0].status).toBe('fulfilled');
-            expect(results[1].status).toBe('rejected');
-            expect(results[1].reason).toMatchObject({ code: 'LIQUIDITY_CONFLICTING_EVIDENCE' });
+            // ORDER-INDEPENDENT: which racer physically commits first is a
+            // genuine coin-flip on a loaded CI runner (observed 2026-09-20:
+            // the "loser" won the INSERT race and the "winner" correctly
+            // failed closed — the old assertions hard-coded [winner, loser]
+            // ordering and flaked). The spec's invariants hold EITHER way:
+            // the FIRST COMMITTER owns the dedupKey identity; the other
+            // racer, arriving with materially different economics (§B), is
+            // rejected as LIQUIDITY_CONFLICTING_EVIDENCE; exactly ONE
+            // receipt and ONE increment persist, carrying the fulfilled
+            // side's economics.
+            const fulfilled = results.filter((r) => r.status === 'fulfilled');
+            const rejected = results.filter((r) => r.status === 'rejected');
+            expect(fulfilled).toHaveLength(1);
+            expect(rejected).toHaveLength(1);
+            expect(rejected[0].reason).toMatchObject({ code: 'LIQUIDITY_CONFLICTING_EVIDENCE' });
+            const firstCommitter = fulfilled[0].value;
 
             const receipts = await prisma.fiatLiquidityReceipt.findMany();
             expect(receipts).toHaveLength(1);
+            expect(receipts[0].id).toBe(firstCommitter.receipt.id);
             expect(Number(receipts[0].amountGhs)).toBe(40);
-            expect(dec((await state()).availableGhs)).toBe(40); // only the winner's economics
+            expect(dec((await state()).availableGhs)).toBe(40); // only the first committer's economics
         });
 
         test('the same atomicity holds for treasury openings (RECEIVED class)', async () => {

@@ -18,18 +18,21 @@ module.exports = {
     testEnvironment: 'node',
     testPathIgnorePatterns: ['/node_modules/', '/__tests__/helpers/'],
     setupFiles: ['./jest.setup.js'],
-    setupFilesAfterEnv: [
-        './test-support/setup-shift-business-context.js',
-        './test-support/hook-timeout.js',
-    ],
-    // CI-hosted Postgres (service container) pays an fsync per commit, so
-    // TRUNCATE-heavy beforeEach/afterEach cleanup hooks can exceed the 5s
-    // default on a loaded runner while the test itself is healthy. Jest 29
-    // has no `hookTimeout` config option (that key was silently ignored with
-    // a validation warning, leaving hooks on the 5s testTimeout default —
-    // the cause of the 2026-09-20 withdrawal-reconciliation CI flake), so
-    // the 30s hook budget is applied by wrapping the hook globals in
-    // test-support/hook-timeout.js via setupFilesAfterEnv. Individual TEST
-    // timeouts stay at their defaults (tests that need longer declare their
-    // own); per-hook overrides keep working.
+    setupFilesAfterEnv: ['./test-support/setup-shift-business-context.js'],
+    // Jest 29 has no `hookTimeout` config option — the repo's old
+    // `hookTimeout: 30000` key was silently ignored (validation warning),
+    // leaving TRUNCATE-heavy cleanup hooks on the 5s default. On a loaded
+    // CI runner this manufactured false flakes: healthy suites' beforeEach/
+    // afterAll cleanup exceeded 5s while every test inside was correct
+    // (observed 2026-09-20: p5d afterAll timing out, whose residue then
+    // failed the business-ad/follower-adapter cleanups with FK violations).
+    // jest-circus 29 resolves hook timeouts as `hook.timeout ||
+    // state.testTimeout` (node_modules/jest-circus/build/run.js), so raising
+    // testTimeout raises both hooks AND tests. An earlier attempt wrapped
+    // the hook globals from setupFilesAfterEnv — it does NOT work: jest
+    // re-injects the framework's own globals per test file, discarding the
+    // wrapper (verified by experiment: an 8s afterAll still died at 5000ms).
+    // 30s is the default for both; slower CI runners are covered, and any
+    // genuinely hung test merely takes 30s instead of 5s to surface.
+    testTimeout: 30000,
 };
