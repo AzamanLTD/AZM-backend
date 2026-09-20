@@ -12,7 +12,13 @@
 // of truth; this table is durable provider evidence and correlation metadata.
 // =============================================================================
 
-const PROVIDER_VALUES = new Set(['MTN_MOMO_DISBURSEMENT', 'MOOLRE']);
+// 'MOOLRE_DISBURSEMENT' is the exact provider name the Moolre disbursement
+// adapter reports on transfer-status responses (PROVIDER_NAME). Without it in
+// the allowlist, the reconciliation worker could poll Moolre successfully and
+// then ABORT the resolution with UNSUPPORTED_PROVIDER — the payout stayed
+// parked forever behind its own evidence layer. Found by the r15h real-PG
+// end-to-end reconciliation suite (audit P0, 2026-09-20).
+const PROVIDER_VALUES = new Set(['MTN_MOMO_DISBURSEMENT', 'MOOLRE', 'MOOLRE_DISBURSEMENT']);
 const ATTEMPT_STATUSES = new Set(['PENDING', 'COMPLETED', 'FAILED']);
 
 const normalizeProvider = (provider) => {

@@ -83,6 +83,18 @@ const BODY_KEYS = {
 // ── ✅ CONFIRMED: type=1 is required on every transfer request. ──
 const TRANSFER_TYPE_CODE     = 1;
 
+// ── ✅ CONFIRMED: current official Transfer Status API request body ──
+// (docs.moolre.com/ai/live/transfer-status.html, verified 2026-09-20)
+//   type: 1        (required, fixed)
+//   idtype: 1|2     (1 = unique externalref, 2 = Moolre-generated ID)
+//   id: <reference> (required)
+//   accountnumber: (required — the Moolre payout account)
+const STATUS_TYPE_CODE              = 1;
+const STATUS_IDTYPE_EXTERNALREF    = 1;
+const BODY_KEY_STATUS_TYPE          = 'type';
+const BODY_KEY_STATUS_IDTYPE       = 'idtype';
+const BODY_KEY_STATUS_ID           = 'id';
+
 // ── r15 R15-C: provider OUTCOME classification ────────────────────────────────
 // A thrown error is NOT proof that Moolre refused the payout. A timeout/reset
 // can occur AFTER Moolre accepted the same externalref — the failover layer and
@@ -229,6 +241,13 @@ class MoolreDisbursementService {
         }
 
         // ── LIVE path ─────────────────────────────────────────────────────────
+        // r15 follow-up (audit P0): the current official Initiate Transfer API
+        // (docs.moolre.com — /open/transact/transfer) REQUIRES accountnumber.
+        // A LIVE deployment without MOOLRE_ACCOUNT_NUMBER is misconfigured and
+        // must fail CLOSED before any provider I/O — an incomplete request
+        // must never go out over the wire with real money behind it.
+        this._assertLiveConfig('TRANSFER');
+
         const body = {
             [BODY_KEYS.currency]:      SUPPORTED_CURRENCY,
             [BODY_KEYS.amount]:        String(Number(amountGhs)),   // Moolre requires amount as string
@@ -236,12 +255,10 @@ class MoolreDisbursementService {
             [BODY_KEYS.reference]:     referenceId,         // strict idempotency key
             [BODY_KEYS.channel]:       channel,
             [BODY_KEYS.narration]:     finalNote,
+            [BODY_KEYS.accountNumber]: this.accountNumber,  // REQUIRED — verified live contract
         };
         if (TRANSFER_TYPE_CODE !== null && TRANSFER_TYPE_CODE !== undefined) {
             body[BODY_KEYS.type] = TRANSFER_TYPE_CODE;
-        }
-        if (this.accountNumber) {
-            body[BODY_KEYS.accountNumber] = this.accountNumber;
         }
 
         try {
@@ -310,8 +327,30 @@ class MoolreDisbursementService {
             return this._mockGetTransferStatus(referenceId);
         }
 
-        const body = { [BODY_KEYS.reference]: referenceId };
-        if (this.accountNumber) body[BODY_KEYS.accountNumber] = this.accountNumber;
+        // r15 follow-up (audit P0): the CURRENT official Moolre Transfer Status
+        // API (docs.moolre.com — /open/transact/status) does NOT accept the
+        // initiation body shape. The old request sent { externalref,
+        // accountnumber? } and was a STALE contract — Moolre ignores unknown
+        // fields and answers an application error, so the reconciliation
+        // worker could never resolve a previously-ambiguous payout through
+        // this path. The current contract (verified 2026-09-20) is:
+        //   type: 1        (fixed — "transact")
+        //   idtype: 1      (1 = unique externalref, 2 = Moolre-generated ID)
+        //   id: <referenceId>
+        //   accountnumber: <Moolre payout account>   (REQUIRED)
+        // — mirroring moolreCollectionService.getPaymentStatus, which already
+        // uses this exact shape.
+        // r15 follow-up (audit P0): accountnumber is REQUIRED by the current
+        // live Transfer Status contract — a missing live config must fail
+        // CLOSED before any provider I/O, never send an incomplete request.
+        this._assertLiveConfig('STATUS');
+
+        const body = {
+            [BODY_KEY_STATUS_TYPE]:    STATUS_TYPE_CODE,
+            [BODY_KEY_STATUS_IDTYPE]:  STATUS_IDTYPE_EXTERNALREF,
+            [BODY_KEY_STATUS_ID]:      referenceId,
+            [BODY_KEYS.accountNumber]: this.accountNumber,
+        };
 
         try {
             const { data: envelope } = await axios.post(
@@ -441,6 +480,30 @@ class MoolreDisbursementService {
     _throwInitiationOutcome(err, referenceId) {
         throw this._initiationOutcomeError(err, { referenceId });
     }
+    /**
+     * r15 follow-up (audit P0): LIVE-mode configuration gate. The current
+     * official Moolre contracts REQUIRE accountnumber on BOTH the transfer
+     * initiation and the transfer-status endpoints. Failing closed here —
+     * BEFORE any provider I/O — is classified NOT_DISPATCHED: provably
+     * nothing was sent, the failover layer never sees a provider answer,
+     * and the withdrawal unwinds immediately instead of parking for
+     * reconciliation behind a request Moolre would refuse anyway.
+     * Credentials are already guaranteed by providerMode ('LIVE' requires
+     * apiUser + apiKey), so only the account number is re-checked here.
+     */
+    _assertLiveConfig(stage) {
+        if (this.providerMode !== 'LIVE') return;
+        if (!this.accountNumber) {
+            throw this._outcomeError(
+                'LIVE Moolre configuration is incomplete: MOOLRE_ACCOUNT_NUMBER is required '
+                + 'by the current Moolre transfer and transfer-status contracts. '
+                + 'Refusing to send an incomplete request.',
+                PROVIDER_OUTCOMES.NOT_DISPATCHED,
+                { stage }
+            );
+        }
+    }
+
     _authHeaders() {
         // Moolre uses STATIC header credentials — no OAuth, no token exchange.
         return {

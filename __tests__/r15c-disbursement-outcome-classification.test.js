@@ -32,6 +32,10 @@ describe('r15 R15-C: disbursement adapter outcome classification', () => {
         process.env.MOOLRE_API_USER = 'test-user';
         process.env.MOOLRE_API_KEY = 'test-key';
         process.env.MOOLRE_BASE_URL = 'https://moolre.test.local';
+        // r15 follow-up: the corrected Moolre contract requires the payout
+        // accountnumber for every LIVE call — without it the adapter now
+        // fails CLOSED (NOT_DISPATCHED) before any provider I/O.
+        process.env.MOOLRE_ACCOUNT_NUMBER = '100000100002';
     };
 
     beforeEach(() => {
@@ -54,6 +58,7 @@ describe('r15 R15-C: disbursement adapter outcome classification', () => {
         delete process.env.MOOLRE_API_USER;
         delete process.env.MOOLRE_API_KEY;
         delete process.env.MOOLRE_BASE_URL;
+        delete process.env.MOOLRE_ACCOUNT_NUMBER;
     });
 
     const PAYLOAD = { referenceId: 'R15C-REF-1', amountGhs: 100, recipientPhone: '0244556677' };
