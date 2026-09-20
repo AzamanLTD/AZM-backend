@@ -883,15 +883,56 @@ async function confirmReconciliationMatch(tx, {
         );
     }
 
-    const claim = await tx.fiatLiquidityReceipt.updateMany({
-        where: { id: receipt.id, status: 'UNMATCHED' },
-        data: {
-            status: 'AVAILABLE',
-            confirmedAt: new Date(),
-            relatedTransactionId: String(matchedTransactionId),
-        },
-    });
-    if (claim.count !== 1) throw new ConflictingEvidenceError('[fiatLiquidity] reconciliation match raced');
+    // DB-enforced single-claim invariant: the partial unique index
+    // FiatLiquidityReceipt_availableRelatedTx_unique (one AVAILABLE receipt
+    // per non-null relatedTransactionId, r15) is the RACE AUTHORITY. Two
+    // concurrent confirmations of DIFFERENT receipts against the SAME deposit
+    // can both pass the read-only check above under READ COMMITTED; only the
+    // index makes the loser's claim fail. The claim runs BEFORE the liquidity
+    // increment so a losing transaction never mints GHS.
+    let claim;
+    try {
+        claim = await tx.fiatLiquidityReceipt.updateMany({
+            where: { id: receipt.id, status: 'UNMATCHED' },
+            data: {
+                status: 'AVAILABLE',
+                confirmedAt: new Date(),
+                relatedTransactionId: String(matchedTransactionId),
+            },
+        });
+    } catch (err) {
+        if (err?.code === 'P2002') {
+            // The partial unique index says another receipt (committed or
+            // committed concurrently while this transaction's reads were in
+            // flight) now holds the AVAILABLE claim for this deposit. NEVER
+            // re-read, retry or converge inside this transaction: a unique
+            // violation ABORTS the underlying PostgreSQL transaction (the
+            // r14 §B empirical finding — the statement-abort recovery
+            // Prisma interactive transactions rely on is NOT available for
+            // this error), so any further statement would fail with
+            // 25P02. The only safe deterministic outcome is fail-closed:
+            // this typed error aborts the caller's transaction with ZERO
+            // liquidity mutation. A same-dedup retry afterwards takes the
+            // idempotent early replay path above; a different receipt can
+            // never win the deposit.
+            throw new ConflictingEvidenceError(
+                `[fiatLiquidity] deposit ${matchedTransactionId} is already claimed AVAILABLE by another receipt (single-claim invariant, r15-A)`,
+                { racedDepositId: String(matchedTransactionId), lostReceiptDedupKey: dedupKey }
+            );
+        }
+        throw err;
+    }
+    if (claim.count !== 1) {
+        // The receipt's own UNMATCHED claim was raced away (same receipt,
+        // concurrent confirmation). Classify from the committed row instead
+        // of guessing: same deposit → replay; different deposit → conflict.
+        const reread = await tx.fiatLiquidityReceipt.findUnique({ where: { id: receipt.id } });
+        if (reread?.status === 'AVAILABLE'
+            && String(reread.relatedTransactionId) === String(matchedTransactionId)) {
+            return { receipt: reread, replay: true };
+        }
+        throw new ConflictingEvidenceError('[fiatLiquidity] reconciliation match raced');
+    }
 
     const updated = await tx.fiatLiquidityReceipt.update({
         where: { id: receipt.id },

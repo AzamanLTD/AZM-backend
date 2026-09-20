@@ -35,6 +35,40 @@ const PAYMENT_CHANNEL_MAP  = { MTN: 13, TELECEL: 6, VODAFONE: 6, AIRTELTIGO: 7 }
 // Source: docs.moolre.com/ai/validate-name.md (same as initiate-transfer.md)
 const VALIDATE_CHANNEL_MAP = { MTN: 1,  TELECEL: 6, VODAFONE: 6, AIRTELTIGO: 7 }; // VODAFONE = legacy alias for Telecel
 
+// ── r15 R15-B: explicit provider OUTCOME classification ─────────────────────
+// Moolre guidance: ONE durable external reference per business action; after
+// an ambiguous response the SAME reference is reused and the operation stays
+// pending until status/callback resolves the outcome. Never a second
+// instruction with a new reference.
+//
+//   NOT_DISPATCHED        — provably no bytes reached Moolre (TCP connect
+//                           refused / DNS unresolvable): safe to retry the
+//                           SAME business action.
+//   DEFINITIVE_REJECTION  — Moolre answered explicitly (envelope status=0,
+//                           non-duplicate code): the instruction was NOT
+//                           accepted. Safe to treat as terminal for the
+//                           attempt.
+//   UNKNOWN_OUTCOME        — timeout, connection reset mid-flight, 5xx
+//                           without an envelope: Moolre may have ACCEPTED the
+//                           instruction. NEVER fail the deposit, NEVER issue
+//                           another instruction; resolve via status/callback
+//                           under the SAME externalRef.
+//   DUPLICATE_REFERENCE    — TP13: Moolre already holds this externalRef.
+//                           Reconciliation-required, not a local terminal
+//                           failure — a previous (possibly accepted) attempt
+//                           exists under the same reference.
+const PROVIDER_OUTCOMES = {
+    NOT_DISPATCHED:       'NOT_DISPATCHED',
+    DEFINITIVE_REJECTION: 'DEFINITIVE_REJECTION',
+    UNKNOWN_OUTCOME:       'UNKNOWN_OUTCOME',
+    DUPLICATE_REFERENCE:  'DUPLICATE_REFERENCE',
+};
+
+// Node system errors that provably happen BEFORE any byte is sent to the
+// provider (connection refused, DNS lookup failure). Everything else —
+// timeouts, mid-flight resets, 5xx gateways — conservatively UNKNOWN.
+const PROVABLY_PRE_DISPATCH = new Set(['ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN']);
+
 class MoolreCollectionService {
     constructor(opts = {}) {
         this.accountNumber = opts.accountNumber || process.env.MOOLRE_ACCOUNT_NUMBER || null;
@@ -92,20 +126,54 @@ class MoolreCollectionService {
     }
 
     /**
+     * Build a typed provider-outcome error. The classification travels ON the
+     * error (providerOutcome + provider + referenceId + stage) so callers can
+     * orchestrate safely without parsing message strings.
+     */
+    _outcomeError(message, providerOutcome, { referenceId = null, stage = null, cause = null, code = null } = {}) {
+        const err = new Error(`[MoolreCollectionService] ${message}`);
+        err.providerOutcome = providerOutcome;
+        err.provider = 'MOOLRE';
+        err.referenceId = referenceId;
+        err.stage = stage;
+        if (code) err.code = code;
+        if (cause) err.cause = cause;
+        return err;
+    }
+
+    /**
+     * Classify a transport-level axios failure. A non-2xx response that still
+     * carries a Moolre envelope is a provider ANSW (handed back by _post); this
+     * only classifies failures where no envelope exists. Conservative default:
+     * UNKNOWN_OUTCOME — the request may have reached Moolre and been accepted.
+     */
+    _classifyTransportError(err, { referenceId = null, stage = null } = {}) {
+        const outcome = PROVABLY_PRE_DISPATCH.has(err?.code)
+            ? PROVIDER_OUTCOMES.NOT_DISPATCHED
+            : PROVIDER_OUTCOMES.UNKNOWN_OUTCOME;
+        return this._outcomeError(this._extractError(err), outcome, {
+            referenceId, stage, cause: err,
+        });
+    }
+
+    /**
      * POST and return Moolre's raw envelope ({ status, code, message, data }).
      * Moolre signals business errors (e.g. TP13 duplicate, TP14 OTP-required)
      * inside the envelope with an integer `status` of 0 — so if a non-2xx
      * response still carries an envelope object, hand it back unchanged and let
-     * the caller's status/code logic run. Only a transport-level failure throws.
+     * the caller's status/code logic run. Only a transport-level failure throws
+     * — now as a TYPED outcome error (r15 R15-B): a bare Error gave callers no
+     * way to distinguish "Moolre never heard from us" from "Moolre may have
+     * accepted this".
      */
-    async _post(path, body, headers, timeout = 15000) {
+    async _post(path, body, headers, timeout = 15000, { referenceId = null, stage = null } = {}) {
         try {
             const { data: envelope } = await axios.post(`${this.baseUrl}${path}`, body, { headers, timeout });
             return envelope;
         } catch (err) {
             const env = err.response?.data;
             if (env && typeof env === 'object') return env;
-            throw new Error(`[MoolreCollectionService] ${this._extractError(err)}`);
+            throw this._classifyTransportError(err, { referenceId, stage });
         }
     }
 
@@ -118,7 +186,8 @@ class MoolreCollectionService {
      * Throws (err.isDuplicate=true) on TP13.
      */
     async initiatePayment({ externalRef, amountGhs, payerPhone, network = 'MTN', otpCode } = {}) {
-        if (!externalRef) throw new Error('[MoolreCollectionService] externalRef is required.');
+        // Pre-I/O validation: provably NOT_DISPATCHED (nothing was sent).
+        if (!externalRef) throw this._outcomeError('externalRef is required.', PROVIDER_OUTCOMES.NOT_DISPATCHED, { stage: 'INITIATE' });
 
         if (this.providerMode === 'MOCK') {
             const ref = `mock-prov-${Date.now()}`;
@@ -139,12 +208,34 @@ class MoolreCollectionService {
         };
         if (otpCode) body.otpcode = otpCode;
 
-        const data = await this._post('/open/transact/payment', body, this._publicHeaders());
+        const data = await this._post('/open/transact/payment', body, this._publicHeaders(), 15000, {
+            referenceId: externalRef, stage: 'INITIATE',
+        });
 
         if (Number(data.status) === 0) {
-            const err = new Error(data.message || 'Payment initiation failed.');
-            err.code        = data.code;
-            err.isDuplicate = data.code === 'TP13';
+            // TP13 = this externalRef ALREADY exists at Moolre: a previous
+            // attempt under the SAME durable reference was (possibly)
+            // accepted. This is a reconciliation-required outcome, never a
+            // local terminal failure — the caller must keep the operation
+            // pending and resolve by status/callback under the SAME ref.
+            if (data.code === 'TP13') {
+                const err = this._outcomeError(
+                    data.message || 'Duplicate external reference — this payment already exists at Moolre.',
+                    PROVIDER_OUTCOMES.DUPLICATE_REFERENCE,
+                    { referenceId: externalRef, stage: 'INITIATE', code: 'TP13' },
+                );
+                err.isDuplicate = true;
+                throw err;
+            }
+            // Any other explicit envelope rejection is DEFINITIVE: Moolre
+            // answered and did not accept the instruction. (TP14 OTP-required
+            // is NOT an error return — handled below.)
+            const err = this._outcomeError(
+                data.message || 'Payment initiation failed.',
+                PROVIDER_OUTCOMES.DEFINITIVE_REJECTION,
+                { referenceId: externalRef, stage: 'INITIATE', code: data.code },
+            );
+            err.isDuplicate = false;
             throw err;
         }
         if (data.code === 'TP14') return { requiresOtp: true };
@@ -181,9 +272,17 @@ class MoolreCollectionService {
 
         const data = await this._post('/open/transact/status', {
             type: 1, idtype: 1, id: externalRef, accountnumber: this.accountNumber,
-        }, this._publicHeaders(), 10000);
+        }, this._publicHeaders(), 10000, { referenceId: externalRef, stage: 'STATUS_QUERY' });
 
-        if (Number(data.status) === 0) throw new Error(data.message || 'Status lookup failed.');
+        // A status endpoint that cannot answer leaves the outcome UNRESOLVED
+        // (r15 R15-B/R15-P): the operation stays pending — never failed.
+        if (Number(data.status) === 0) {
+            throw this._outcomeError(
+                data.message || 'Status lookup failed.',
+                PROVIDER_OUTCOMES.UNKNOWN_OUTCOME,
+                { referenceId: externalRef, stage: 'STATUS_QUERY', code: data.code },
+            );
+        }
         return data.data;
     }
 
@@ -207,3 +306,4 @@ class MoolreCollectionService {
 }
 
 module.exports = MoolreCollectionService;
+module.exports.PROVIDER_OUTCOMES = PROVIDER_OUTCOMES;
