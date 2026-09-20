@@ -8,7 +8,15 @@
 //
 // Health tracking: successes/failures stored in Redis with a 10-minute TTL.
 // If a provider has 3+ failures in the window, it is marked unhealthy and
-// skipped until it recovers (probed on every call).
+// skipped until it recovers. An unhealthy provider may only be probed with
+// a live payout when its recorded degradation is provably money-safe; a
+// provider whose window contains an AMBIGUOUS outcome is never probed
+// (recovery is passive: window expiry or a recorded success).
+//
+// Redis health counters are mutated with MULTI/EXEC pipelines — the old
+// GET→JSON.parse→SET read-modify-write lost updates between concurrent
+// dispatches (and between instances sharing the same Redis), which could
+// keep a degraded provider "healthy" or a recovered one "unhealthy".
 //
 // Reference: Wise (payment routing with automatic failover),
 //            Stripe (Smart Retries), Revolut (multi-provider routing)
@@ -51,25 +59,62 @@ class PaymentFailoverService {
 
     // ── Health tracking ─────────────────────────────────────────────────────
 
+    _emptyHealth() {
+        return {
+            successes: 0,
+            failures: 0,
+            lastSuccessAt: null,
+            lastFailureAt: null,
+            lastError: null,
+            lastAmbiguousFailureAt: null,
+        };
+    }
+
     async _getHealthKey(provider) {
         const key = `payment:health:${provider}`;
         if (this.redis) {
-            const raw = await this.redis.get(key);
-            return raw ? JSON.parse(raw) : { successes: 0, failures: 0 };
+            const h = await this.redis.hgetall(key);
+            if (!h || Object.keys(h).length === 0) return this._emptyHealth();
+            return {
+                successes:               Number(h.successes || 0),
+                failures:                Number(h.failures || 0),
+                lastSuccessAt:           h.lastSuccessAt || null,
+                lastFailureAt:           h.lastFailureAt || null,
+                lastError:               h.lastError || null,
+                lastAmbiguousFailureAt:  h.lastAmbiguousFailureAt || null,
+            };
         }
-        return this._memoryHealth.get(key) || { successes: 0, failures: 0 };
+        return this._memoryHealth.get(key) || this._emptyHealth();
     }
 
     async _recordSuccess(provider) {
         const key = `payment:health:${provider}`;
-        const health = await this._getHealthKey(provider);
-        health.successes++;
-        health.failures = 0; // reset failures on success
-        health.lastSuccessAt = new Date().toISOString();
+        const now = new Date().toISOString();
 
         if (this.redis) {
-            await this.redis.set(key, JSON.stringify(health), 'EX', HEALTH_WINDOW_SECONDS);
+            // MULTI/EXEC: ONE atomic round. With the old GET→mutate→SET, a
+            // concurrent failure recorded between the read and the write was
+            // silently erased by the success reset (lost update) — and two
+            // dispatches could each clobber the other's counter entirely.
+            // The pipeline is serialized by Redis: either order is a valid
+            // serial history, and no update is ever lost.
+            await this.redis.multi()
+                .hincrby(key, 'successes', 1)
+                .hset(key, 'failures', 0)
+                .hset(key, 'lastSuccessAt', now)
+                .hdel(key, 'lastError')
+                // A success is an authoritative provider answer — the rail
+                // demonstrably works again, so live-payout probing is safe.
+                .hdel(key, 'lastAmbiguousFailureAt')
+                .expire(key, HEALTH_WINDOW_SECONDS)
+                .exec();
         } else {
+            const health = this._memoryHealth.get(key) || this._emptyHealth();
+            health.successes++;
+            health.failures = 0; // reset failures on success
+            health.lastSuccessAt = now;
+            health.lastError = null;
+            health.lastAmbiguousFailureAt = null;
             this._memoryHealth.set(key, health);
         }
     }
@@ -99,22 +144,44 @@ class PaymentFailoverService {
         }
 
         const key = `payment:health:${provider}`;
-        const health = await this._getHealthKey(provider);
-        health.failures++;
-        health.lastFailureAt = new Date().toISOString();
-        health.lastError = error?.message || 'Unknown error';
+        const now = new Date().toISOString();
+        const lastError = error?.message || 'Unknown error';
+        // AMBIGUOUS degradation: the provider may be ACCEPTING payouts and
+        // losing the answers (UNKNOWN_OUTCOME, or an unclassified error,
+        // conservatively treated the same). Stamped on the health record so
+        // _shouldProbeUnhealthy can refuse to route fresh live money into a
+        // rail that may be silently swallowing payouts.
+        const AMBIGUOUS = outcome === 'UNKNOWN_OUTCOME' || !outcome;
 
+        let failures;
         if (this.redis) {
-            await this.redis.set(key, JSON.stringify(health), 'EX', HEALTH_WINDOW_SECONDS);
+            // MULTI/EXEC — same lost-update reasoning as _recordSuccess.
+            // Failure counting and the ambiguity stamp land in ONE atomic
+            // round: a concurrent success reset can interleave before or
+            // after, but can never erase the failure mid-write.
+            const chain = this.redis.multi()
+                .hincrby(key, 'failures', 1)
+                .hset(key, 'lastFailureAt', now)
+                .hset(key, 'lastError', lastError);
+            if (AMBIGUOUS) chain.hset(key, 'lastAmbiguousFailureAt', now);
+            await chain.expire(key, HEALTH_WINDOW_SECONDS).exec();
+            failures = (await this._getHealthKey(provider)).failures;
         } else {
+            const health = this._memoryHealth.get(key) || this._emptyHealth();
+            health.failures++;
+            health.lastFailureAt = now;
+            health.lastError = lastError;
+            if (AMBIGUOUS) health.lastAmbiguousFailureAt = now;
             this._memoryHealth.set(key, health);
+            failures = health.failures;
         }
 
         logger.warn({
             provider,
-            failures: health.failures,
+            failures,
             outcome,
-            error: health.lastError
+            ambiguous: AMBIGUOUS,
+            error: lastError
         }, '[PaymentFailover] Provider failure recorded');
     }
 
@@ -124,7 +191,24 @@ class PaymentFailoverService {
     }
 
     async _shouldProbeUnhealthy(provider) {
-        // Probe unhealthy providers 50% of the time to detect recovery
+        // A "probe" of an unhealthy DISBURSEMENT provider is a REAL customer
+        // payout, not a health-check ping. Probing is only allowed when the
+        // provider's recorded degradation is PROVABLY money-safe: if any
+        // failure in the current window was AMBIGUOUS (UNKNOWN_OUTCOME /
+        // unclassified — the provider may be accepting payouts and losing the
+        // answers), routing fresh live money into it multiplies parked
+        // payouts and operator reconciliation load. Such a provider recovers
+        // PASSIVELY: the 10-minute health window expires, or a success is
+        // recorded on a rail we still route to for other reasons. Never by
+        // handing it new customer money to test with.
+        const health = await this._getHealthKey(provider);
+        if (health.lastAmbiguousFailureAt) {
+            logger.info({
+                provider,
+                lastAmbiguousFailureAt: health.lastAmbiguousFailureAt,
+            }, '[PaymentFailover] Not probing unhealthy provider — window contains an ambiguous outcome; recovery must be passive (window expiry or a recorded success)');
+            return false;
+        }
         return Math.random() < RECOVERY_PROBE_RATIO;
     }
 
@@ -287,6 +371,7 @@ class PaymentFailoverService {
                 lastSuccessAt: health.lastSuccessAt,
                 lastFailureAt: health.lastFailureAt,
                 lastError: health.lastError,
+                lastAmbiguousFailureAt: health.lastAmbiguousFailureAt,
             };
         }
         return statuses;

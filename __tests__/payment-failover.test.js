@@ -285,6 +285,189 @@ describe('PaymentFailoverService', () => {
         expect(await svc._isHealthy('moolre')).toBe(false);
     });
 
+    // ── r15 follow-up: probe safety ──────────────────────────────────────────
+    test('r15 follow-up: an AMBIGUOUSLY-degraded provider is NEVER probed with live money (recovery is passive)', async () => {
+        const primary   = makeMockProvider('moolre', { fail: true, outcome: 'UNKNOWN_OUTCOME' });
+        const secondary = makeMockProvider('mtn');
+        const svc = new PaymentFailoverService({ primary, secondary });
+
+        // 3 ambiguous outcomes degrade the provider's health...
+        for (let i = 0; i < 3; i++) {
+            await svc.initiateTransfer({
+                referenceId: `amb-${i}`, amountGhs: 10, recipientPhone: '0244556677',
+            }).catch(() => {}); // UNKNOWN_OUTCOME blocks the chain — expected
+        }
+        expect(await svc._isHealthy('moolre')).toBe(false);
+
+        // ...and the ambiguous stamp suppresses probing ENTIRELY — even with
+        // Math.random() begging to probe on every call. The unhealthy rail
+        // never receives a fresh customer payout to "test" with; the healthy
+        // secondary handles everything.
+        const randomSpy = jest.spyOn(Math, 'random').mockReturnValue(0.01);
+        const primaryCallsBefore = primary._calls.length;
+        secondary._calls = [];
+        try {
+            for (let i = 0; i < 8; i++) {
+                await svc.initiateTransfer({
+                    referenceId: `amb-probe-${i}`, amountGhs: 10, recipientPhone: '0244556677',
+                });
+            }
+        } finally {
+            randomSpy.mockRestore();
+        }
+        expect(primary._calls.length).toBe(primaryCallsBefore); // zero probes
+        expect(secondary._calls.length).toBe(8);                // all routed to the healthy rail
+        expect((await svc._getHealthKey('moolre')).lastAmbiguousFailureAt).toBeTruthy();
+    });
+
+    test('r15 follow-up: a provably-safe degradation (NOT_DISPATCHED) remains probe-eligible', async () => {
+        const primary   = makeMockProvider('moolre', { fail: true, outcome: 'NOT_DISPATCHED' });
+        const secondary = makeMockProvider('mtn');
+        const svc = new PaymentFailoverService({ primary, secondary });
+
+        for (let i = 0; i < 3; i++) {
+            await svc.initiateTransfer({
+                referenceId: `nd-${i}`, amountGhs: 10, recipientPhone: '0244556677',
+            }).catch(() => {});
+        }
+        expect(await svc._isHealthy('moolre')).toBe(false);
+        expect((await svc._getHealthKey('moolre')).lastAmbiguousFailureAt).toBeNull();
+
+        // NOT_DISPATCHED means no bytes ever reached the provider — probing
+        // with live money cannot create a swallowed payout. Random says probe.
+        const randomSpy = jest.spyOn(Math, 'random').mockReturnValue(0.01);
+        const primaryCallsBefore = primary._calls.length;
+        try {
+            await svc.initiateTransfer({
+                referenceId: `nd-probe`, amountGhs: 10, recipientPhone: '0244556677',
+            });
+        } finally {
+            randomSpy.mockRestore();
+        }
+        expect(primary._calls.length).toBe(primaryCallsBefore + 1); // probed
+    });
+
+    test('r15 follow-up: a recorded success clears the ambiguity stamp (authoritative answer → probes safe again)', async () => {
+        const primary = {
+            name: 'moolre',
+            _calls: [],
+            newReferenceId: () => 'ref-moolre',
+            async initiateTransfer(payload) {
+                this._calls.push(payload);
+                if (this._calls.length <= 3) {
+                    const err = new Error('ambiguous');
+                    err.providerOutcome = 'UNKNOWN_OUTCOME';
+                    throw err;
+                }
+                return { status: 'PENDING', referenceId: payload.referenceId };
+            },
+            async getTransferStatus() { return { status: 'PENDING' }; },
+        };
+        const secondary = makeMockProvider('mtn');
+        const svc = new PaymentFailoverService({ primary, secondary });
+
+        for (let i = 0; i < 3; i++) {
+            await svc.initiateTransfer({
+                referenceId: `cl-${i}`, amountGhs: 10, recipientPhone: '0244556677',
+            }).catch(() => {});
+        }
+        expect((await svc._getHealthKey('moolre')).lastAmbiguousFailureAt).toBeTruthy();
+
+        // A success on the primary clears both the failure count and the
+        // ambiguity stamp — the rail demonstrably answers authoritatively
+        // again, so probe-with-live-money is back to being safe.
+        await svc._recordSuccess('moolre');
+        expect((await svc._getHealthKey('moolre')).lastAmbiguousFailureAt).toBeNull();
+        expect(await svc._isHealthy('moolre')).toBe(true);
+    });
+
+    // ── r15 follow-up: Redis health-counter atomicity ──────────────────────
+    function makeMockRedis() {
+        const hashes = new Map();
+        const execBatches = [];
+        const forbidden = () => { throw new Error('non-atomic GET/SET must never be used for health counters'); };
+        return {
+            hashes, execBatches,
+            get: forbidden, set: forbidden,
+            async hgetall(k) { return { ...(hashes.get(k) || {}) }; },
+            multi() {
+                const cmds = [];
+                const chain = {
+                    hincrby: (k, f, n) => { cmds.push(['hincrby', k, f, n]); return chain; },
+                    hset:    (k, f, v) => { cmds.push(['hset', k, f, v]);    return chain; },
+                    hdel:    (k, f)    => { cmds.push(['hdel', k, f]);       return chain; },
+                    expire:  (k, t)    => { cmds.push(['expire', k, t]);    return chain; },
+                    exec: async () => {
+                        // Applied with NO await inside — a serial history,
+                        // exactly as Redis serializes MULTI/EXEC batches.
+                        execBatches.push(cmds.slice());
+                        for (const [c, k, f, v] of cmds) {
+                            const h = hashes.get(k) || {};
+                            if (c === 'hincrby') h[f] = String((Number(h[f] || 0)) + v);
+                            else if (c === 'hset') h[f] = String(v);
+                            else if (c === 'hdel') delete h[f];
+                            else if (c === 'expire') { /* TTL tracked elsewhere */ }
+                            hashes.set(k, h);
+                        }
+                        return cmds.map(() => [null, 1]);
+                    },
+                };
+                return chain;
+            },
+        };
+    }
+
+    test('r15 follow-up: Redis health mutations are atomic pipelines — never a read-modify-write GET/SET', async () => {
+        const redis = makeMockRedis();
+        const primary = makeMockProvider('moolre', { fail: true, outcome: 'NOT_DISPATCHED' });
+        const svc = new PaymentFailoverService({ primary, secondary: makeMockProvider('mtn'), redis });
+
+        await svc.initiateTransfer({ referenceId: 'atomic-1', amountGhs: 10, recipientPhone: '0244556677' });
+
+        // The GET/SET spies threw on any use — reaching here proves the
+        // whole path went through MULTI/EXEC batches.
+        expect(redis.execBatches.length).toBeGreaterThanOrEqual(1);
+        const everyBatch = redis.execBatches.flat();
+        expect(everyBatch.some(c => c[0] === 'hincrby' && c[2] === 'failures')).toBe(true);
+        expect(everyBatch.some(c => c[0] === 'hset' && c[2] === 'lastError')).toBe(true);
+        expect(everyBatch.every(c => ['hincrby', 'hset', 'hdel', 'expire'].includes(c[0]))).toBe(true);
+        expect(Number(redis.hashes.get('payment:health:moolre').failures)).toBe(1);
+    });
+
+    test('r15 follow-up: concurrent failure and success records lose no updates (serializable batches)', async () => {
+        const redis = makeMockRedis();
+        const primary = makeMockProvider('moolre');
+        const svc = new PaymentFailoverService({ primary, secondary: makeMockProvider('mtn'), redis });
+
+        // Fire 5 failures and 5 successes at once. With the old GET→SET
+        // read-modify-write this interleaving lost updates wholesale; with
+        // serialized MULTI/EXEC batches EVERY increment survives — the final
+        // counters are exactly (successes=5, failures=0): each success resets
+        // failures, and the last batch in any serial order ends failures=0.
+        await Promise.all([
+            ...Array.from({ length: 5 }, () =>
+                svc._recordFailure('moolre', (() => { const e = new Error('transport'); e.providerOutcome = 'NOT_DISPATCHED'; return e; })())),
+            ...Array.from({ length: 5 }, () => svc._recordSuccess('moolre')),
+        ]);
+
+        const health = await svc._getHealthKey('moolre');
+        expect(health.successes).toBe(5);
+        expect(health.failures).toBe(0); // every success batch resets failures — no lost reset survives
+        expect(redis.execBatches.length).toBe(10); // all ten batches landed
+    });
+
+    test('r15 follow-up: Redis path stamps ambiguous failures and success clears them', async () => {
+        const redis = makeMockRedis();
+        const primary = makeMockProvider('moolre', { fail: true, outcome: 'UNKNOWN_OUTCOME' });
+        const svc = new PaymentFailoverService({ primary, secondary: makeMockProvider('mtn'), redis });
+
+        await svc.initiateTransfer({ referenceId: 'amb-redis-1', amountGhs: 10, recipientPhone: '0244556677' }).catch(() => {});
+        expect((await svc._getHealthKey('moolre')).lastAmbiguousFailureAt).toBeTruthy();
+
+        await svc._recordSuccess('moolre');
+        expect((await svc._getHealthKey('moolre')).lastAmbiguousFailureAt).toBeNull();
+    });
+
     test('health resets after success', async () => {
         const primary = makeMockProvider('moolre');
         const svc = new PaymentFailoverService({
