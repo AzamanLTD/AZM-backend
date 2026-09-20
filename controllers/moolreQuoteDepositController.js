@@ -4,6 +4,7 @@ const crypto = require('crypto');
 const { audit } = require('../utils/audit');
 const logger = require('../src/config/logger');
 const ledger = require('../services/ledgerService'); // §P.4 authoritative ledger (shadow journalIntegration no longer used on this path)
+const settlementCore = require('../src/services/moolreDepositSettlement'); // r15 R15-B shared ONCE-settlement core
 const {
   createTransactionQuote,
   persistTransactionQuote,
@@ -174,15 +175,74 @@ exports.initiate = async (req, res) => {
         network,
       });
     } catch (moolreErr) {
-      // §P.5-E audit r5: the failure transition is a DB-enforced conditional
-      // claim — only a still-PENDING deposit can be failed here. A deposit
-      // that concurrently completed elsewhere can never be resurrected to
-      // FAILED by an unconditional write.
-      await prisma.transactionHistory.updateMany({ where: { id: pending.id, status: 'PENDING' }, data: { status: 'FAILED' } });
-      logger.error({ err: moolreErr }, '[moolreQuoteDeposit] provider initiation failed');
-      return res.status(502).json({
+      // ── r15 R15-B: explicit provider OUTCOME classification drives the
+      // lifecycle — a thrown error is NOT proof that Moolre refused. A
+      // timeout/reset/5xx can occur AFTER Moolre accepted the same
+      // externalRef; marking the deposit FAILED then would orphan collected
+      // money and invite a second instruction under a new reference.
+      const outcome = moolreErr.providerOutcome || 'UNKNOWN_OUTCOME';
+      if (outcome === 'NOT_DISPATCHED' || outcome === 'DEFINITIVE_REJECTION') {
+        // Provably no instruction exists — the terminal failure transition is
+        // safe. §P.5-E audit r5: a DB-enforced conditional claim — only a
+        // still-PENDING deposit can be failed here. A deposit that
+        // concurrently completed elsewhere can never be resurrected to FAILED
+        // by an unconditional write.
+        await prisma.transactionHistory.updateMany({ where: { id: pending.id, status: 'PENDING' }, data: { status: 'FAILED' } });
+        logger.error({ err: moolreErr, outcome }, '[moolreQuoteDeposit] provider initiation definitively refused');
+        return res.status(502).json({
+          success: false,
+          code: outcome,
+          message: moolreErr.message?.replace(/^\[MoolreCollectionService\]\s*/, '') || 'Payment provider error. Please retry.',
+        });
+      }
+      // UNKNOWN_OUTCOME / DUPLICATE_REFERENCE (TP13): Moolre remains the
+      // authoritative owner of the SAME durable externalRef — the deposit
+      // STAYS PENDING, NEVER becomes FAILED, and NO second instruction may
+      // be issued. The attempt is durable evidence; the outcome resolves by
+      // callback or status query under the SAME reference.
+      const attempt = {
+        outcome,
+        error: String(moolreErr.message || moolreErr).slice(0, 500),
+        providerCode: moolreErr.code ?? null,
+        at: new Date().toISOString(),
+      };
+      const marked = await prisma.transactionHistory.updateMany({
+        where: { id: pending.id, status: 'PENDING' },
+        data: { metadata: { ...(pending.metadata || {}), providerAttempt: attempt } },
+      });
+      if (marked.count === 1) {
+        // Durable evidence of the ambiguous initiation (INBOUND observation,
+        // append-only; retries converge on the same identity).
+        try {
+          await fiatLiquidity.recordProviderEvent(prisma, {
+            provider: 'MOOLRE',
+            direction: 'INBOUND',
+            status: outcome === 'DUPLICATE_REFERENCE' ? 'DUPLICATE_REFERENCE' : 'AMBIGUOUS',
+            providerRef: null,
+            dedupKey: `event:moolre-initiation:${pending.txHash}`,
+            amountGhs: amountGhsCanonical,
+            relatedReference: pending.txHash,
+            raw: { stage: 'INITIATE', ...attempt },
+          });
+        } catch (evidenceErr) {
+          if (!(evidenceErr instanceof fiatLiquidity.ConflictingEvidenceError)) throw evidenceErr;
+          // A materially identical re-record of the SAME ambiguous attempt
+          // converges on the committed observation — the attempt evidence
+          // already exists. Materially DIFFERENT observations fail closed
+          // above (the substrate retains the contradiction).
+          logger.warn({ reference: pending.txHash, outcome },
+            '[moolreQuoteDeposit] ambiguous-initiation evidence already recorded — converging');
+        }
+      }
+      logger.error({ err: moolreErr, outcome }, '[moolreQuoteDeposit] provider initiation outcome UNKNOWN — deposit stays PENDING');
+      return res.status(202).json({
         success: false,
-        message: moolreErr.message?.replace(/^\[MoolreCollectionService\]\s*/, '') || 'Payment provider error. Please retry.',
+        code: outcome === 'DUPLICATE_REFERENCE' ? 'MOOLRE_DUPLICATE_REFERENCE' : 'MOOLRE_OUTCOME_UNKNOWN',
+        retryable: false,
+        message: outcome === 'DUPLICATE_REFERENCE'
+          ? 'Moolre already holds this payment reference. The deposit stays pending and will be resolved by provider status or callback under the same reference — do NOT initiate a new deposit for this payment.'
+          : 'The provider outcome is not yet known. The deposit stays pending and will be resolved by provider callback or status lookup under the same reference — do NOT initiate a new deposit for this payment.',
+        data: { reference: pending.txHash, status: 'PENDING' },
       });
     }
 
@@ -443,37 +503,14 @@ exports.webhook = async (req, res) => {
     //   * event ref + TH NULL   → stamp TransactionHistory (CAS on NULL)
     //   * both present, differ  → CONTRADICTION — fail closed, NOTHING settles
     //   * equal (or both NULL) → converged — settle on the shared identity
-    const eventRef = providerEvent.providerRef ?? null;
-    const thRefNow = (await prisma.transactionHistory.findUnique({
-        where: { id: existing.id },
-        select: { providerRef: true },
-    }))?.providerRef ?? null;
     let settlementProviderRef;
-    if (eventRef != null && thRefNow != null && eventRef !== thRefNow) {
-        return res.status(409).json({
-            success: false,
-            message: 'Durable provider evidence and the initiation record carry different provider references for this deposit — settlement blocked for reconciliation.',
-            code: 'PROVIDER_REF_CONTRADICTION',
-        });
-    }
-    if (eventRef == null && thRefNow != null) {
-        try {
-            await fiatLiquidity.enrichProviderEventRefByDedupKey(prisma, providerEvent.dedupKey, thRefNow);
-        } catch (reconcileErr) {
-            if (reconcileErr instanceof fiatLiquidity.ConflictingEvidenceError) {
-                return res.status(409).json({ success: false, message: reconcileErr.message, code: 'CONTRADICTORY_PROVIDER_EVIDENCE' });
-            }
-            throw reconcileErr;
+    try {
+        settlementProviderRef = await settlementCore.reconcileSettlementProviderRef(prisma, { deposit: existing, providerEvent });
+    } catch (refErr) {
+        if (refErr instanceof settlementCore.ProviderRefContradictionError) {
+            return res.status(409).json({ success: false, message: refErr.message, code: refErr.code });
         }
-        settlementProviderRef = thRefNow;
-    } else if (eventRef != null && thRefNow == null) {
-        await prisma.transactionHistory.updateMany({
-            where: { id: existing.id, providerRef: null },
-            data: { providerRef: eventRef },
-        });
-        settlementProviderRef = eventRef;
-    } else {
-        settlementProviderRef = eventRef;
+        throw refErr;
     }
 
 
@@ -487,182 +524,15 @@ exports.webhook = async (req, res) => {
 
     if (!quoteId) return res.status(409).json({ success: false, message: 'Deposit is missing its transaction quote.' });
 
-    const result = await prisma.$transaction(async (tx) => {
-      const quote = await consumeTransactionQuote({
-        prisma: tx,
+    const result = await settlementCore.settleMoolreDeposit(prisma, {
+        deposit: existing,
         quoteId,
-        userId: existing.userId,
-        purpose: 'deposit',
-      });
-
-      // §P.5-C settlement binding: this surface's authenticated provider
-      // identity is the Moolre HMAC. A quote whose selected route may not
-      // settle via Moolre fails closed BEFORE any mutation. Quotes from the
-      // generic aggregator's OTP-confirmed MoMo rails legitimately settle
-      // here (their settlementSurfaces include MOOLRE_WEBHOOK); historical
-      // quotes without a selected route also still settle.
-      routePolicy.assertSettlementRouteAllowed({ quote, settlementSurface: 'MOOLRE_WEBHOOK' });
-
-      // ── §P.5-D/r10: the GHS settlement comparison runs on EXACT decimals —
-      // the webhook amount never touches JS Number. §P.5-E Model B authority:
-      // exact pesewa equality against the quote — 99.99/100.01 against a
-      // 100.00 quote fail closed BEFORE any mutation. The ±0.01 tolerance is
-      // the flag-OFF legacy affordance only (audit r1), now EXACT: uniformly
-      // one-pesewa-inclusive at every magnitude, where the old float boundary
-      // accepted/rejected the same delta depending on binary rounding
-      // accidents.
-      // §P.5-E audit r13 (§2): the GHS comparison and EVERY authoritative
-      // write below consume the quote's EXACT persisted strings — the legacy
-      // Number fields stay presentation-only. Number() silently destroys the
-      // 12dp USDC tail at magnitude and made the Model B exact-quote binding
-      // fail closed on VALID quotes.
-      const quotedGhs = new Prisma.Decimal(quote.amountGhsExact ?? quote.amountGhs); // exact 2dp persisted quote amount
-      const quotedUsdcExact = quote.usdcAmountExact ?? String(quote.usdcAmount); // exact 12dp persisted quote amount
-      // the committed ledger authority: the persisted 12dp quote projected ONCE
-      // at 8dp HALF_UP — exactly the projection Model B re-derives
-      const settledUsdcLedger = new Prisma.Decimal(quotedUsdcExact).toDecimalPlaces(8, Prisma.Decimal.ROUND_HALF_UP);
-      if (modelBOn
-        ? settledGhs.toFixed(2) !== quotedGhs.toFixed(2)
-        : settledGhs.sub(quotedGhs).abs().greaterThan('0.01')) {
-        throw new Error('Settled GHS amount does not match the transaction quote');
-      }
-
-      const user = await tx.user.findUnique({ where: { id: existing.userId } });
-      if (!user) throw new Error('User no longer exists for this deposit.');
-
-      // ── §P.5-E audit r5 (state-machine CAS) ──────────────────────────
-      // The PENDING → COMPLETED claim is made by the DATABASE's conditional
-      // update, NOT by the `existing.status === 'PENDING'` pre-read above —
-      // that read happened OUTSIDE this transaction and is stale by the time
-      // we claim. A competing failure callback (PENDING → FAILED) that
-      // committed in between leaves this update matching ZERO rows; we fail
-      // closed and the entire settlement transaction (quote consumption,
-      // customer credit, ledger posting, Model B settlement, liquidity
-      // receipt) rolls back. A terminal FAILED deposit can never be
-      // resurrected to COMPLETED.
-      const claimed = await tx.transactionHistory.updateMany({
-        where: { id: existing.id, status: 'PENDING' },
-        data: {
-          status: 'COMPLETED',
-          amountUsdc: settledUsdcLedger,
-          payerMsisdn: data?.payer || null,
-          metadata: {
-            ...(existing.metadata || {}),
-            settledAmountGhs: settledGhs.toFixed(2), // exact decimal string — never a collapsed float
-            settledAt: new Date().toISOString(),
-            settledRoute: quote.selectedRoute || null,
-            settledRoutePolicyVersion: quote.routePolicyVersion || null,
-            providerData: data,
-          },
-        },
-      });
-      if (claimed.count !== 1) {
-        throw new Error('Deposit is no longer PENDING — a concurrent state transition won; refusing to settle');
-      }
-      // Read AFTER the claim, inside the claiming transaction: the exact
-      // 8dp amount PostgreSQL stored. The conditional update above is the
-      // state-machine claim authority — this read can never observe a
-      // different state.
-      const updatedTx = await tx.transactionHistory.findUnique({ where: { id: existing.id } });
-
-      // §P.5-E audit r13 (§2): the balance increment is the EXACT 8dp ledger
-      // projection of the persisted 12dp quote — never a lossy JS Number
-      // that PostgreSQL would have to re-round.
-      await tx.user.update({
-        where: { id: existing.userId },
-        data: { availableBalance: { increment: settledUsdcLedger } },
-      });
-
-      // §P.4 AUTHORITATIVE ACCOUNTING — same caller transaction as the
-      // projection credit + TransactionHistory settlement:
-      //   D clearing:conversion   — explicit temporary clearing (§P.5 later)
-      //   C user:{id}:liability    — customer liability increases
-      //
-      // §P.5-E: the flag ON path settles Model B instead — FIFO inventory
-      // lot claim, GHS asset accounting (fiat:momo:ghs / equity:treasury:ghs),
-      // COGS realization, treasury-stake-funded customer liability and the
-      // durable realized-economics record — clearing:conversion is NOT
-      // touched (docs/p5e-model-b-settlement.md §2.4).
-      if (modelBOn) {
-        await modelBSettlement.settleDepositFromInventory(tx, {
-          reference: externalRef,
-          transactionHistoryId: existing.id,
-          userId: existing.userId,
-          quoteId,
-          // §P.5-E audit r13 (§2): the Model B quote binding receives the
-          // EXACT persisted 12dp authority — the primitive re-verifies it
-          // against the persisted quote row and fails closed on ANY lossy
-          // caller projection.
-          quotedGhs: quote.amountGhsExact ?? quote.amountGhs,
-          quotedRateGhsPerUsdc: quote.rateGhsPerUsdcExact ?? quote.rateGhsPerUsdc,
-          quotedUsdc: quotedUsdcExact,
-          settledGhs,
-          settledUsdc: updatedTx.amountUsdc, // exact Decimal(20,8) — the ledger authority
-          selectedRoute: quote.selectedRoute || null,
-          routeProviderRail: quote.routeProviderRail || null,
-          routePolicyVersion: quote.routePolicyVersion || null,
-          provider: 'MOOLRE',
-          // §r13 (§4/§7): the reconciled provider identity — never a stale
-          // pre-evidence read
-          providerRef: settlementProviderRef,
-          // §P.5-D/P.5-E: the identity of the observation this settlement is
-          // backed by — the RETURNED committed event row's dedupKey, never a
-          // re-invented key (a materially different later observation lives on
-          // its own row and can never masquerade as this evidence).
-          evidenceDedupKey: providerEvent.dedupKey,
-        });
-      } else {
-      await ledger.post(tx, {
-        idempotencyKey: `ledger:deposit:fiat:${externalRef}`,
-        entryType: 'DEPOSIT',
-        description: 'Fiat-settled USDC deposit credited (Moolre/aggregator settlement)',
-        reference: externalRef,
-        userId: existing.userId,
-        relatedEntity: 'transactionHistory',
-        relatedEntityId: existing.id,
-        metadata: { source: 'moolre', quoteId, amountGhs: settledGhs, selectedRoute: quote.selectedRoute || null, routeProviderRail: quote.routeProviderRail || null },
-        // Post EXACTLY what the settled TransactionHistory row records
-        // (Decimal(20,8)) — quote.usdcAmount is numeric(30,12) and its JS
-        // float form can carry >8 decimals, which the ledger's exactness
-        // guard correctly refuses. The ledger and the canonical row can
-        // never disagree.
-        lines: [
-          { account: 'clearing:conversion', debit: updatedTx.amountUsdc },
-          { account: `user:${existing.userId}:liability`, credit: updatedTx.amountUsdc },
-        ],
-      });
-      }
-
-      // §P.5-D (flag ON): the settled, quote-matched Moolre collection —
-      // rail-gated by the providerRef proof — IS the evidence that creates
-      // AVAILABLE GHS liquidity, in the SAME transaction as the deposit CAS
-      // claim. Unmatched or unverified evidence NEVER lands AVAILABLE
-      // (docs §3.1, invariant 1).
-      if (liquidityAuthorityOn) {
-        await fiatLiquidity.recordReceipt(tx, {
-          provider: 'MOOLRE',
-          rail: quote.routeProviderRail || null,
-          providerRef: settlementProviderRef ?? null,
-          dedupKey: `receipt:moolre-collection:${externalRef}`,
-          amountGhs: settledGhs,
-          route: quote.selectedRoute || null,
-          reference: externalRef,
-          relatedTransactionId: existing.id,
-          eventDedupKey: providerEvent.dedupKey,
-          // §L (r14): the receipt names the deposit's OWN quote — the
-          // evidence chain re-proves the r13 metadata binding.
-          quoteId,
-          evidence: {
-            source: 'moolre_collection',
-            quoteId,
-            providerRef: existing.providerRef,
-            payer: data?.payer || null,
-            settledAt: new Date().toISOString(),
-          },
-        });
-      }
-
-      return { updatedTx, quote, newBalance: Number(user.availableBalance) + Number(quote.usdcAmount) };
+        settledGhs,
+        providerEvent,
+        settlementProviderRef,
+        payerMsisdn: data?.payer || null,
+        providerData: data,
+        evidenceSource: 'moolre_webhook',
     });
 
     const io = req.app.get('socketio');

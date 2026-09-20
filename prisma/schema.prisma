@@ -1321,6 +1321,13 @@ model Withdrawal {
   payoutMethod   String   @default("BINANCE_ID")
   network        String?
   destination    String   @default("OLD_RECORD")
+  // r15 hardening (audit P0, 2026-09-20): durable link from the
+  // reconciliation record to the canonical TransactionHistory row. Written
+  // by the raw-SQL bridge inside processFiatWithdrawal's reservation
+  // transaction (the column is provisioned by the payout-reconciliation
+  // infra overlay) — a Withdrawal row can never exist without its
+  // canonical row.
+  transactionHistoryId String? @db.VarChar(36)
   totalGasFee    Decimal  @default(0.0) @db.Decimal(20, 8)
   vendorGasShare Decimal  @default(0.0) @db.Decimal(20, 8)
   adminGasShare  Decimal  @default(0.0) @db.Decimal(20, 8)
@@ -1690,19 +1697,19 @@ model SystemFiatPool {
 /// terminal evidence is preserved here and quarantined via
 /// ReconciliationException, never silently dropped (§P.5-D docs §3.3).
 model FiatProviderEvent {
-  id                String   @id @default(uuid())
-  provider          String // MOOLRE | MTN_MOMO | AZM_WEBHOOK | AZM_TREASURY (audited internal)
-  rail              String? // MOMO | BANK | INTERNAL
-  direction         String // INBOUND (receipt) | OUTBOUND (payout)
-  status            String // provider-reported status, verbatim
-  providerRef       String?
-  dedupKey          String   @unique // durable economic identity of the observation
+  id               String   @id @default(uuid())
+  provider         String // MOOLRE | MTN_MOMO | AZM_WEBHOOK | AZM_TREASURY (audited internal)
+  rail             String? // MOMO | BANK | INTERNAL
+  direction        String // INBOUND (receipt) | OUTBOUND (payout)
+  status           String // provider-reported status, verbatim
+  providerRef      String?
+  dedupKey         String   @unique // durable economic identity of the observation
   // INBOUND observations always carry the collected amount (evidence chain);
   // OUTBOUND terminal callbacks/polls may report no amount (nullable then).
-  amountGhs         Decimal? @db.Decimal(20, 2)
-  relatedReference  String? // internal TransactionHistory txHash for payout correlation
-  raw               Json?
-  receivedAt        DateTime @default(now())
+  amountGhs        Decimal? @db.Decimal(20, 2)
+  relatedReference String? // internal TransactionHistory txHash for payout correlation
+  raw              Json?
+  receivedAt       DateTime @default(now())
 
   @@index([provider, providerRef])
   @@index([relatedReference])
@@ -1741,19 +1748,19 @@ model FiatLiquidityReceipt {
 /// single-winner CAS claims (§P.5-D docs §3.2).
 model FiatLiquidityReservation {
   id                   String    @id @default(uuid())
-  reference           String    @unique // withdrawal reference (TransactionHistory txHash)
-  amountGhs           Decimal   @db.Decimal(20, 2)
-  status              String    @default("RESERVED") // RESERVED | IN_TRANSIT | PAID_OUT | RELEASED | RECONCILIATION_REQUIRED
-  provider            String
-  rail                String?
+  reference            String    @unique // withdrawal reference (TransactionHistory txHash)
+  amountGhs            Decimal   @db.Decimal(20, 2)
+  status               String    @default("RESERVED") // RESERVED | IN_TRANSIT | PAID_OUT | RELEASED | RECONCILIATION_REQUIRED
+  provider             String
+  rail                 String?
   destination          String? // masked payout destination (MSISDN)
   relatedTransactionId String?
-  providerRef         String?
-  dispatchedAt        DateTime?
-  settledAt           DateTime?
-  releasedAt          DateTime?
-  createdAt           DateTime  @default(now())
-  updatedAt           DateTime  @updatedAt
+  providerRef          String?
+  dispatchedAt         DateTime?
+  settledAt            DateTime?
+  releasedAt           DateTime?
+  createdAt            DateTime  @default(now())
+  updatedAt            DateTime  @updatedAt
 
   @@index([status])
   @@index([provider, providerRef])
@@ -1763,18 +1770,18 @@ model FiatLiquidityReservation {
 /// guarded conditional update in the same transaction as its evidence/state
 /// row; sums over receipts/reservations are the reconciliation target.
 model FiatLiquidityState {
-  id           Int      @id @default(1)
-  availableGhs Decimal  @default(0) @db.Decimal(20, 2)
-  reservedGhs  Decimal  @default(0) @db.Decimal(20, 2)
-  inTransitGhs Decimal  @default(0) @db.Decimal(20, 2)
-  paidOutGhs   Decimal  @default(0) @db.Decimal(20, 2)
+  id                    Int     @id @default(1)
+  availableGhs          Decimal @default(0) @db.Decimal(20, 2)
+  reservedGhs           Decimal @default(0) @db.Decimal(20, 2)
+  inTransitGhs          Decimal @default(0) @db.Decimal(20, 2)
+  paidOutGhs            Decimal @default(0) @db.Decimal(20, 2)
   // §P.5-D quarantine bucket: GHS claimed by a quarantined reservation
   // (RECONCILIATION_REQUIRED). Held funds are counted but NEVER spendable —
   // a released-then-contradicted payout moves its returned amount here
   // instead of leaving it claimable (docs §3.4).
   reconciliationHeldGhs Decimal @default(0) @db.Decimal(20, 2)
 
-  updatedAt    DateTime @updatedAt
+  updatedAt DateTime @updatedAt
 }
 
 /// Tracks accumulated platform profit (fees, margins, spreads)
@@ -5977,37 +5984,37 @@ enum InventoryLotStatus {
 }
 
 model InventoryLot {
-  id                Int                @id @default(autoincrement())
-  acquisitionKey    String             @unique @db.VarChar(140) // durable economic identity
-  sourceType        String             @db.VarChar(40) // e.g. CORPORATE_PURCHASE, GATEWAY_OTC
-  sourceReference   String             @db.VarChar(140) // evidence linkage to the source operation
-  quantityOriginal  Decimal            @db.Decimal(20, 8)
-  quantityRemaining Decimal            @db.Decimal(20, 8)
-  costBasisGhs      Decimal            @db.Decimal(20, 8) // exact GHS paid for the lot
-  acquisitionRate   Decimal?           @db.Decimal(18, 8) // GHS per USDC at acquisition (provenance)
-  ledgerTxnId       String? // LedgerTransaction.id of the inventory:usdc:lots acquisition posting
-  status            InventoryLotStatus @default(OPEN)
+  id                          Int                       @id @default(autoincrement())
+  acquisitionKey              String                    @unique @db.VarChar(140) // durable economic identity
+  sourceType                  String                    @db.VarChar(40) // e.g. CORPORATE_PURCHASE, GATEWAY_OTC
+  sourceReference             String                    @db.VarChar(140) // evidence linkage to the source operation
+  quantityOriginal            Decimal                   @db.Decimal(20, 8)
+  quantityRemaining           Decimal                   @db.Decimal(20, 8)
+  costBasisGhs                Decimal                   @db.Decimal(20, 8) // exact GHS paid for the lot
+  acquisitionRate             Decimal?                  @db.Decimal(18, 8) // GHS per USDC at acquisition (provenance)
+  ledgerTxnId                 String? // LedgerTransaction.id of the inventory:usdc:lots acquisition posting
+  status                      InventoryLotStatus        @default(OPEN)
   // §P.5-E: false BY DEFAULT and granted by NO production code path — only a
   // future, evidence-backed acquisition authority may set it. Inventory
   // quantity alone can never fund a real customer USDC liability (audit r1).
-  eligibleForModelBSettlement Boolean @default(false)
-  consumptions      InventoryLotConsumption[]
-  createdAt         DateTime           @default(now())
+  eligibleForModelBSettlement Boolean                   @default(false)
+  consumptions                InventoryLotConsumption[]
+  createdAt                   DateTime                  @default(now())
 }
 
 // §P.5-B: durable allocation/consumption movement — proves exactly which
 // economic operation consumed which lot quantity. Its ledger recognition
 // (COGS/pnl:inventory realization) is P5-E; no quote-only economics here.
 model InventoryLotConsumption {
-  id              Int             @id @default(autoincrement())
-  consumptionKey  String          @unique @db.VarChar(140) // durable idempotency identity
+  id              Int          @id @default(autoincrement())
+  consumptionKey  String       @unique @db.VarChar(140) // durable idempotency identity
   lotId           Int
-  lot             InventoryLot    @relation(fields: [lotId], references: [id])
-  quantity        Decimal         @db.Decimal(20, 8)
-  purpose         String          @db.VarChar(40)
-  sourceReference String?          @db.VarChar(140) // future Model B settlement evidence
+  lot             InventoryLot @relation(fields: [lotId], references: [id])
+  quantity        Decimal      @db.Decimal(20, 8)
+  purpose         String       @db.VarChar(40)
+  sourceReference String?      @db.VarChar(140) // future Model B settlement evidence
   ledgerTxnId     String? // set by P5-E settlement; null until economics are realized
-  createdAt       DateTime        @default(now())
+  createdAt       DateTime     @default(now())
 }
 
 // §P.5-E: the durable economic identity of ONE Model B customer settlement —
@@ -6017,31 +6024,31 @@ model InventoryLotConsumption {
 // of a row == the settlement committed; replay returns it; conflicting reuse
 // of the same reference fails closed.
 model ModelBSettlement {
-  id                      Int      @id @default(autoincrement())
-  reference               String   @unique @db.VarChar(140) // TransactionHistory.txHash — the economic identity
-  transactionHistoryId   String   @db.VarChar(36) // TransactionHistory.id — UUID
-  quoteId                 String   @db.Uuid
-  userId                  Int
-  selectedRoute           String?
-  routeProviderRail       String?
-  routePolicyVersion      String?
-  provider                String   @db.VarChar(40)
-  providerRef             String?
-  evidenceDedupKey        String   @db.VarChar(140) // FiatProviderEvent.dedupKey of the verified INBOUND observation
-  quotedGhs               Decimal  @db.Decimal(20, 2)
-  quotedRateGhsPerUsdc    Decimal  @db.Decimal(20, 8)
-  quotedUsdc              Decimal  @db.Decimal(20, 8)
-  settledGhs              Decimal  @db.Decimal(20, 2)
-  settledUsdc             Decimal  @db.Decimal(20, 8)
-  costBasisGhsTotal       Decimal  @db.Decimal(20, 8)
-  costAllocationResidualGhs Decimal @default(0) @db.Decimal(20, 12)
-  marginGhs               Decimal  @db.Decimal(20, 8)
-  providerFeeGhs          Decimal? @db.Decimal(20, 2) // audit r6: P5-E records NULL until a dedicated provider-fee evidence authority exists — the settlement primitive rejects non-null (MODEL_B_PROVIDER_FEE_UNEVIDENCED)
-  conversionIdentity      String   @unique @db.VarChar(140)
-  conversionLedgerTxnId   String   @db.VarChar(36)
-  depositLedgerTxnId      String   @db.VarChar(36)
-  lotAllocations          Json // [{lotId, acquisitionKey, quantity, lotCostBasisGhs, lotQuantityOriginal, costShareGhs, remainingAfter}]
-  createdAt               DateTime @default(now())
+  id                        Int      @id @default(autoincrement())
+  reference                 String   @unique @db.VarChar(140) // TransactionHistory.txHash — the economic identity
+  transactionHistoryId      String   @db.VarChar(36) // TransactionHistory.id — UUID
+  quoteId                   String   @db.Uuid
+  userId                    Int
+  selectedRoute             String?
+  routeProviderRail         String?
+  routePolicyVersion        String?
+  provider                  String   @db.VarChar(40)
+  providerRef               String?
+  evidenceDedupKey          String   @db.VarChar(140) // FiatProviderEvent.dedupKey of the verified INBOUND observation
+  quotedGhs                 Decimal  @db.Decimal(20, 2)
+  quotedRateGhsPerUsdc      Decimal  @db.Decimal(20, 8)
+  quotedUsdc                Decimal  @db.Decimal(20, 8)
+  settledGhs                Decimal  @db.Decimal(20, 2)
+  settledUsdc               Decimal  @db.Decimal(20, 8)
+  costBasisGhsTotal         Decimal  @db.Decimal(20, 8)
+  costAllocationResidualGhs Decimal  @default(0) @db.Decimal(20, 12)
+  marginGhs                 Decimal  @db.Decimal(20, 8)
+  providerFeeGhs            Decimal? @db.Decimal(20, 2) // audit r6: P5-E records NULL until a dedicated provider-fee evidence authority exists — the settlement primitive rejects non-null (MODEL_B_PROVIDER_FEE_UNEVIDENCED)
+  conversionIdentity        String   @unique @db.VarChar(140)
+  conversionLedgerTxnId     String   @db.VarChar(36)
+  depositLedgerTxnId        String   @db.VarChar(36)
+  lotAllocations            Json // [{lotId, acquisitionKey, quantity, lotCostBasisGhs, lotQuantityOriginal, costShareGhs, remainingAfter}]
+  createdAt                 DateTime @default(now())
 
   // §P.5-E audit r13 (§8): DB-enforced exactly-once identity. TransactionQuote
   // is consume-once and one quote corresponds to exactly one deposit
@@ -6141,19 +6148,19 @@ model LedgerAccount {
 }
 
 model LedgerTransaction {
-  id              String           @id @default(uuid())
-  idempotencyKey  String           @unique @db.VarChar(140) // durable exactly-once economic identity
-  entryType       JournalEntryType
-  description     String           @db.VarChar(500)
-  reference       String?          @db.VarChar(100)
-  userId          Int?
-  relatedEntity   String?          @db.VarChar(50)
-  relatedEntityId String?
-  postingHash     String           @db.VarChar(64) // sha-256 of the exact normalized economic content — replay consistency proof
-  conversionIdentity String?       @unique // §P.5-A: DB-enforced exactly-once cross-asset exchange identity (null on all P4 rows)
-  metadata        Json?
-  postedAt        DateTime         @default(now())
-  createdAt       DateTime         @default(now())
+  id                 String           @id @default(uuid())
+  idempotencyKey     String           @unique @db.VarChar(140) // durable exactly-once economic identity
+  entryType          JournalEntryType
+  description        String           @db.VarChar(500)
+  reference          String?          @db.VarChar(100)
+  userId             Int?
+  relatedEntity      String?          @db.VarChar(50)
+  relatedEntityId    String?
+  postingHash        String           @db.VarChar(64) // sha-256 of the exact normalized economic content — replay consistency proof
+  conversionIdentity String?          @unique // §P.5-A: DB-enforced exactly-once cross-asset exchange identity (null on all P4 rows)
+  metadata           Json?
+  postedAt           DateTime         @default(now())
+  createdAt          DateTime         @default(now())
 
   journalEntries JournalEntry[]
 

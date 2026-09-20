@@ -45,6 +45,16 @@ async function startWorkers(app, {
     const cfoWorker = new CfoWorker(prisma, io);
     const SavingsWorker = require('../../workers/savingsWorker');
     const savingsWorker = new SavingsWorker(prisma, io);
+    const DepositReconciliationWorker = require('../../workers/depositReconciliationWorker');
+    // r15 R15-B: durable status-query recovery for Moolre collections —
+    // settles/fails stale pending deposits exactly once under the SAME
+    // external reference (the P01 webhook remains the primary surface).
+    const depositReconciliationWorker = new DepositReconciliationWorker(
+        prisma,
+        app.get('moolreCollectionService') || null,
+        notificationService
+    );
+
     const WithdrawalReconciliationWorker = require('../../workers/withdrawalReconciliationWorker');
     const withdrawalReconciliationWorker = new WithdrawalReconciliationWorker(
         prisma,
@@ -85,6 +95,7 @@ async function startWorkers(app, {
     // cadence short enough that a missed provider webhook is repaired quickly.
     await register('withdrawal-recon', String(30 * 1000), () => withdrawalReconciliationWorker._tick());
     await register('payout-batch', String(2 * 60 * 1000), () => payoutBatchWorker._tick());
+    await register('deposit-recon', String(60 * 1000), () => depositReconciliationWorker._tick());
     await register('escrow-expiry', String(30 * 60 * 1000), () => escrowExpiryWorker._tick());
     await register('vault', String(60 * 60 * 1000), () => vaultWorker._tick());
     await register('susu', String(60 * 1000), () => susuWorker._tick());

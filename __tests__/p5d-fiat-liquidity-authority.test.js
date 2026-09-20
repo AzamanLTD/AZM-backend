@@ -1300,7 +1300,7 @@ describeOrSkip('§P.5-D evidence-backed GHS liquidity authority (real PostgreSQL
             await setAuthorityFlag(true);
             const settings = await workerSettings({ threshold: 100, max: 500 });
             const worker = buildWorker();
-            worker.mtn = { initiateTransfer: jest.fn().mockResolvedValue({ status: 'ACCEPTED', data: { reference: 'MTN-Q1L' }, providerRef: 'MTN-Q1L' }) };
+            worker.mtn = { initiateTransfer: jest.fn().mockResolvedValue({ _provider: 'mtn', provider: 'MTN_MOMO_DISBURSEMENT', status: 'ACCEPTED', data: { reference: 'MTN-Q1L' }, providerRef: 'MTN-Q1L' }) };
 
             // authority headroom is DRAINED (500 GHS available << the 100 USDC
             // ≡ 1342 GHS authority floor) while the LEGACY pool projection is
@@ -1329,7 +1329,7 @@ describeOrSkip('§P.5-D evidence-backed GHS liquidity authority (real PostgreSQL
             await setAuthorityFlag(true);
             const settings = await workerSettings({ threshold: 100, max: 5000 }); // floor: 100 USDC ≡ 1342 GHS
             const worker = buildWorker();
-            worker.mtn = { initiateTransfer: jest.fn().mockResolvedValue({ status: 'ACCEPTED' }) };
+            worker.mtn = { initiateTransfer: jest.fn().mockResolvedValue({ _provider: 'mtn', provider: 'MTN_MOMO_DISBURSEMENT', status: 'ACCEPTED' }) };
 
             // claimable authority liquidity: 500 GHS. After reserving 268.40
             // only 231.60 remains — far below the 1342 GHS floor.
@@ -1362,7 +1362,7 @@ describeOrSkip('§P.5-D evidence-backed GHS liquidity authority (real PostgreSQL
             await setAuthorityFlag(true);
             const settings = await workerSettings({ threshold: 100, max: 5000 });
             const worker = buildWorker();
-            worker.mtn = { initiateTransfer: jest.fn().mockResolvedValue({ status: 'ACCEPTED', data: { reference: 'MTN-Q2' }, providerRef: 'MTN-Q2' }) };
+            worker.mtn = { initiateTransfer: jest.fn().mockResolvedValue({ _provider: 'mtn', provider: 'MTN_MOMO_DISBURSEMENT', status: 'ACCEPTED', data: { reference: 'MTN-Q2' }, providerRef: 'MTN-Q2' }) };
 
             // seeding 2000 GHS of claimable availability ALSO mirrors the
             // legacy pool projection to 2000 — healthy for the legacy gate.
@@ -1391,7 +1391,7 @@ describeOrSkip('§P.5-D evidence-backed GHS liquidity authority (real PostgreSQL
             await setAuthorityFlag(true);
             const settings = await workerSettings({ threshold: 100, max: 5000 }); // floor: 100 USDC ≡ 1342 GHS
             const worker = buildWorker();
-            worker.mtn = { initiateTransfer: jest.fn().mockResolvedValue({ status: 'ACCEPTED', data: { reference: 'MTN-Q5' }, providerRef: 'MTN-Q5' }) };
+            worker.mtn = { initiateTransfer: jest.fn().mockResolvedValue({ _provider: 'mtn', provider: 'MTN_MOMO_DISBURSEMENT', status: 'ACCEPTED', data: { reference: 'MTN-Q5' }, providerRef: 'MTN-Q5' }) };
 
             await seedAvailable({ amountGhs: 2000 });
             const user = await seedUser(prisma, { availableBalance: 1000 });
@@ -1447,7 +1447,7 @@ describeOrSkip('§P.5-D evidence-backed GHS liquidity authority (real PostgreSQL
             await setAuthorityFlag(true);
             const settings = await workerSettings({ threshold: 10, max: 5000 }); // floor: 10 USDC ≡ 134.20 GHS
             const worker = buildWorker();
-            worker.mtn = { initiateTransfer: jest.fn().mockResolvedValue({ status: 'ACCEPTED', data: { reference: 'MTN-DRIFT' }, providerRef: 'MTN-DRIFT' }) };
+            worker.mtn = { initiateTransfer: jest.fn().mockResolvedValue({ _provider: 'mtn', provider: 'MTN_MOMO_DISBURSEMENT', status: 'ACCEPTED', data: { reference: 'MTN-DRIFT' }, providerRef: 'MTN-DRIFT' }) };
 
             await seedAvailable({ amountGhs: 2000 });
             const user = await seedUser(prisma, { availableBalance: 1000 });
@@ -1507,7 +1507,7 @@ describeOrSkip('§P.5-D evidence-backed GHS liquidity authority (real PostgreSQL
             await setAuthorityFlag(true);
             const settings = await workerSettings({ threshold: 10, max: 5000 }); // floor: 10 USDC ≡ 134.20 GHS
             const worker = buildWorker();
-            worker.mtn = { initiateTransfer: jest.fn().mockResolvedValue({ status: 'ACCEPTED', data: { reference: 'MTN-POOL0' }, providerRef: 'MTN-POOL0' }) };
+            worker.mtn = { initiateTransfer: jest.fn().mockResolvedValue({ _provider: 'mtn', provider: 'MTN_MOMO_DISBURSEMENT', status: 'ACCEPTED', data: { reference: 'MTN-POOL0' }, providerRef: 'MTN-POOL0' }) };
 
             await seedAvailable({ amountGhs: 2000 });
             const user = await seedUser(prisma, { availableBalance: 1000 });

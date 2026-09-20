@@ -75,7 +75,7 @@ if (!_storeFactory) {
     logger.warn('[RateLimit] REDIS_URL not set — using in-memory store. OK for dev, NOT for multi-instance production.');
 }
 
-// ── Fail-open wrapper ─────────────────────────────────────────────────────────
+// ── Fail-open wrapper (non-financial tiers) ──────────────────────────────────
 // Wraps an express-rate-limit middleware so that if the underlying store
 // throws (Redis down, Upstash quota exhausted, etc.), we log and let the
 // request through instead of returning a 500. Rate limiting is a protection
@@ -91,6 +91,56 @@ const _failOpen = (limiter) => (req, res, next) => {
             _redisErroring = true;
             logger.warn({ err: err.message }, '[RateLimit] Store error — failing open');
             return next();
+        }
+        next();
+    });
+};
+
+// ── Fail-SAFE wrapper (financial tier only) ─────────────────────────────────
+// r15 follow-up: the financial tier previously shared the fail-open posture,
+// which DISABLED financial rate limiting entirely for as long as Redis was
+// unavailable (quota exhaustion lasted days in practice) — trade/withdraw/
+// escrow endpoints became unlimited for attackers. Protection of financial
+// endpoints must not be given up merely to keep availability: when the shared
+// store is unavailable, the financial limiter degrades to an IN-PROCESS memory
+// limiter with the same thresholds. That restores the per-instance bound
+// (N instances → N× the cap — the documented no-Redis posture) instead of an
+// unbounded window with NO protection at all.
+const _memoryFinancialLimiter = () => {
+    let cached = null;
+    return (opts) => {
+        if (!cached) {
+            // Same thresholds; explicitly memory store, no Redis store.
+            const { store, ...rest } = opts;
+            cached = rateLimit(rest);
+        }
+        return cached;
+    };
+};
+const _financialMemory = _memoryFinancialLimiter();
+const _failSafeFinancial = (limiter, opts) => (req, res, next) => {
+    const fallback = () => {
+        logger.warn('[RateLimit] Financial tier degrading to in-process memory limiter (Redis unavailable)');
+        _financialMemory(opts)(req, res, (err) => {
+            // The memory store cannot fail; any error here is a bug — fail open
+            // rather than 500 a financial request over our own protection bug.
+            if (err) {
+                logger.error({ err: err.message }, '[RateLimit] Financial memory limiter error — failing open');
+                return next();
+            }
+            next();
+        });
+    };
+    // Fast path: Redis already known erroring → memory limiter directly.
+    // (No _storeFactory guard: _redisErroring only becomes true through a
+    // real store error or the test hook, and when no Redis is configured at
+    // all the limiter is already memory-based — the fallback is equivalent.)
+    if (_redisErroring) return fallback();
+    limiter(req, res, (err) => {
+        if (err) {
+            _redisErroring = true;
+            logger.warn({ err: err.message }, '[RateLimit] Store error — financial tier degrading to memory limiter');
+            return fallback();
         }
         next();
     });
@@ -117,29 +167,39 @@ const authLimiter = _failOpen(rateLimit(_opts({
 })));
 
 // ── FINANCIAL: 10 requests per minute per USER (trade/withdraw/deposit) ───────
-// keyGenerator runs BEFORE `protect` sets req.user, so we decode the JWT here
-// directly (no signature verification needed — we only need a stable per-user
-// bucket; a forged token is rejected downstream by `protect`). Falls back to the
-// IPv6-safe IP key when there is no Authorization header.
+// keyGenerator runs BEFORE `protect` sets req.user, so we inspect the JWT here
+// directly. r15 follow-up (bucket-poisoning fix): the claim is now VERIFIED
+// (signature + expiry, same JWT_SECRET `protect` enforces). The previous
+// unverified `jwt.decode` let ANY client forge an Authorization header naming
+// a victim's id and exhaust the victim's 10/min financial bucket — a targeted
+// denial-of-service on someone's withdrawals/trades/savings/escrow. A forged
+// or expired token now falls back to the attacker's own IP bucket, never the
+// claimed victim's.
+const jwt = require('jsonwebtoken');
 const _financialKey = (req, res) => {
     if (req.user?.id) return `user_${req.user.id}`;
     const auth = req.headers.authorization || '';
     if (auth.startsWith('Bearer ')) {
         try {
-            const decoded = require('jsonwebtoken').decode(auth.slice(7));
+            const decoded = jwt.verify(auth.slice(7), process.env.JWT_SECRET);
             if (decoded?.id) return `user_${decoded.id}`;
-        } catch (_) { /* fall through to IP */ }
+        } catch (_) { /* unverified/invalid claim — fall through to the IP key */ }
     }
-    return ipKeyGenerator(req, res);
+    // r15 follow-up (v8 API fix): express-rate-limit v8's ipKeyGenerator takes
+    // the IP STRING (ipKeyGenerator(ip, ipv6Subnet)), not (req, res). The old
+    // call passed the request object, which the function returned unchanged —
+    // a fresh unique bucket key per request, so this fallback NEVER limited.
+    return ipKeyGenerator(req.ip || req.socket?.remoteAddress || 'unknown');
 };
 
-const financialLimiter = _failOpen(rateLimit(_opts({
+const financialOpts = _opts({
     windowMs: 60_000,
     max: 10,
     prefix: 'rl:fin:',
     keyGenerator: _financialKey,
     message: 'Too many financial requests. Please slow down.',
-})));
+});
+const financialLimiter = _failSafeFinancial(rateLimit(financialOpts), financialOpts);
 
 // ── GENERAL API: 60 requests per minute per IP ───────────────────────────────
 const generalLimiter = _failOpen(rateLimit(_opts({
@@ -165,7 +225,12 @@ const strictLimiter = _failOpen(rateLimit(_opts({
     message: 'This action is rate-limited for security. Please wait.',
 })));
 
+// Test hook: force the Redis-erroring state to prove the financial tier's
+// degraded (memory-limiter) behavior without needing a real failing Redis.
+const __setRedisErroringForTest = (v) => { _redisErroring = v === true; };
+
 module.exports = {
+    __setRedisErroringForTest,
     authLimiter,
     financialLimiter,
     generalLimiter,

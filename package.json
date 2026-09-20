@@ -8,7 +8,6 @@
     "test:coverage": "jest --testEnvironment=node --coverage --runInBand --forceExit",
     "start": "node server.js",
     "build": "prisma generate",
-    "migrate:deploy": "prisma migrate deploy",
     "install:susu": "node infra/install-susu-overlay.js",
     "install:fiat-liquidity": "node infra/install-fiat-liquidity-overlay.js",
     "install:model-b-settlement": "node infra/install-model-b-settlement-overlay.js",
@@ -59,7 +58,6 @@
   "devDependencies": {
     "@electric-sql/pglite": "^0.5.4",
     "@types/pg": "^8.16.0",
-    "embedded-postgres": "^18.4.0-beta.17",
     "jest": "^29.7.0",
     "pg-mem": "^3.0.14",
     "prisma": "^6.19.2",
@@ -73,5 +71,8 @@
     "teeny-request": {
       "uuid": "^11.1.1"
     }
+  },
+  "engines": {
+    "node": "24.x"
   }
 }

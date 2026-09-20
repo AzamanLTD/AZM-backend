@@ -38,7 +38,7 @@ function _getNotificationService(req) {
 
 const financeService               = require('../services/finance.service');
 const fiatLiquidity                = require('../src/services/fiatLiquidityService'); // §P.5-D
-const { recordReconciliationException } = require('../services/reconciliationExceptionService');
+const { recordReconciliationExceptionLoud } = require('../services/reconciliationExceptionService');
 const { FIAT_POOL_ALERT_THRESH }   = financeService;
 const crypto                       = require('crypto');
 const logger = require('../src/config/logger');
@@ -199,20 +199,66 @@ exports.fiatWithdrawal = async (req, res) => {
                 // held (RESERVED, not spendable).
                 logger.error({ err: gatewayErr, reference },
                     '[fiatWithdrawal] CRITICAL: §P.5-D post-dispatch evidence/IN_TRANSIT failed — payout in flight, NOT refunding');
-                await recordReconciliationException(prisma, {
+                await recordReconciliationExceptionLoud(prisma, {
                     entityType: 'TRANSACTION',
                     entityId: reference,
                     reference,
                     reason: 'POST_DISPATCH_BOOKKEEPING_FAILED',
                     details: { provider: 'MOOLRE', error: gatewayErr.message },
-                }).catch(() => null);
+                }, {
+                    escalate: () => io && io.emit('admin_alert', {
+                        type: 'RECONCILIATION_EVIDENCE_WRITE_FAILED',
+                        timestamp: new Date().toISOString(),
+                    }),
+                });
                 return res.status(503).json({
                     success: false,
                     message: 'Withdrawal dispatched but a bookkeeping step failed. The payout is in flight; support has been alerted. Do not retry.',
                     data: { reference }
                 });
             }
-            logger.error({ err: gatewayErr }, '[fiatWithdrawal] Disbursement dispatch failed');
+            // ── r15 R15-D: outcome-classified dispatch failure.
+            // UNKNOWN_OUTCOME / DUPLICATE_REFERENCE mean the payout may STILL
+            // be in flight under this reference — auto-refunding here
+            // double-spends. The ledger is unwound ONLY on provably-safe
+            // outcomes; anything ambiguous stays pending and resolves by the
+            // settlement callback / recon worker.
+            const gatewayOutcome = gatewayErr.providerOutcome || null;
+            const GATEWAY_SAFE_TO_UNWIND = gatewayOutcome === 'NOT_DISPATCHED' || gatewayOutcome === 'DEFINITIVE_REJECTION';
+
+            if (!GATEWAY_SAFE_TO_UNWIND) {
+                logger.error({ err: gatewayErr, outcome: gatewayOutcome, reference },
+                    '[fiatWithdrawal] dispatch outcome UNKNOWN — NOT refunding; payout may be in flight');
+                await recordReconciliationExceptionLoud(prisma, {
+                    entityType: 'TRANSACTION',
+                    entityId: reference,
+                    reference,
+                    reason: 'DISPATCH_OUTCOME_UNKNOWN_NO_REFUND',
+                    details: { provider: 'MOOLRE', outcome: gatewayOutcome || 'UNCLASSIFIED', error: gatewayErr.message },
+                }, {
+                    escalate: () => io && io.emit('admin_alert', {
+                        type: 'RECONCILIATION_EVIDENCE_WRITE_FAILED',
+                        timestamp: new Date().toISOString(),
+                    }),
+                });
+                if (io) {
+                    io.emit('admin_alert', {
+                        type: 'WITHDRAWAL_DISPATCH_OUTCOME_UNKNOWN',
+                        reference, userId,
+                        error: gatewayErr.message,
+                        timestamp: new Date().toISOString()
+                    });
+                }
+                return res.status(202).json({
+                    success: false,
+                    code: gatewayOutcome === 'DUPLICATE_REFERENCE' ? 'MOOLRE_DUPLICATE_REFERENCE' : 'DISPATCH_OUTCOME_UNKNOWN',
+                    retryable: false,
+                    message: 'The payout provider has not confirmed the outcome yet. Your withdrawal stays pending and will be resolved automatically — do NOT retry it.',
+                    data: { reference }
+                });
+            }
+
+            logger.error({ err: gatewayErr, outcome: gatewayOutcome }, '[fiatWithdrawal] Disbursement dispatch failed (provably safe)');
             // Roll back the debit + the SystemMasterCrypto capture so the
             // user is not stuck and Azaman is not double-credited.
             try {

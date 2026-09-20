@@ -75,6 +75,13 @@ const STATEMENTS = [
   `CREATE INDEX IF NOT EXISTS "FiatLiquidityReceipt_relatedTransactionId_idx"
      ON "FiatLiquidityReceipt"("relatedTransactionId");`,
 
+  // r15 R15-A: at most ONE AVAILABLE receipt may exist for a non-null
+  // relatedTransactionId. The DB — not application reads — is the race
+  // authority for concurrent confirmReconciliationMatch claims.
+  `CREATE UNIQUE INDEX IF NOT EXISTS "FiatLiquidityReceipt_availableRelatedTx_unique"
+     ON "FiatLiquidityReceipt"("relatedTransactionId")
+     WHERE "status" = 'AVAILABLE' AND "relatedTransactionId" IS NOT NULL;`,
+
   // §P.5-D audit r14 (§B): durable receipt replay identity — the deposit
   // txHash binding and the backing provider observation become columns so
   // the replay identity NEVER depends on arbitrary raw JSON evidence.
@@ -144,6 +151,32 @@ const STATEMENTS = [
 ];
 
 async function installFiatLiquidityOverlay() {
+  // r15 R15-A duplicate preflight (READ-ONLY): the partial unique index
+  // enforcing "at most one AVAILABLE receipt per relatedTransactionId"
+  // cannot be applied over contradictory historical rows without PostgreSQL
+  // failing the CREATE INDEX. We surface the offending rows FIRST, loudly,
+  // with their identities — and NEVER auto-select a "winner": choosing among
+  // historical double-claims requires human evidence review.
+  const conflicting = await prisma.$queryRawUnsafe(`
+    SELECT "relatedTransactionId", "dedupKey", "amountGhs", "confirmedAt"
+    FROM "FiatLiquidityReceipt"
+    WHERE "status" = 'AVAILABLE' AND "relatedTransactionId" IS NOT NULL
+      AND "relatedTransactionId" IN (
+        SELECT "relatedTransactionId" FROM "FiatLiquidityReceipt"
+        WHERE "status" = 'AVAILABLE' AND "relatedTransactionId" IS NOT NULL
+        GROUP BY "relatedTransactionId" HAVING COUNT(*) > 1
+      )
+    ORDER BY "relatedTransactionId", "confirmedAt"`);
+  if (conflicting.length > 0) {
+    logger.error({ conflicts: conflicting },
+      '[install-fiat-liquidity-overlay] PRE-FLIGHT FAILURE: historical duplicate AVAILABLE receipts exist for the same deposit. '
+      + 'The single-claim unique index will NOT be applied. Resolve the contradictory rows by evidence review (do NOT delete or reassign them blindly), then re-run.');
+    const err = new Error('R15-A duplicate AVAILABLE receipt pre-flight failed: ' + conflicting.length + ' contradictory receipt rows across '
+      + new Set(conflicting.map((r) => r.relatedTransactionId)).size + ' deposit(s). See log for identities.');
+    err.code = 'R15A_DUPLICATE_AVAILABLE_RECEIPTS';
+    throw err;
+  }
+
   for (const statement of STATEMENTS) {
     try {
       await prisma.$executeRawUnsafe(statement);

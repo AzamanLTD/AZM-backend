@@ -83,6 +83,48 @@ const BODY_KEYS = {
 // ── ✅ CONFIRMED: type=1 is required on every transfer request. ──
 const TRANSFER_TYPE_CODE     = 1;
 
+// ── ✅ CONFIRMED: current official Transfer Status API request body ──
+// (docs.moolre.com/ai/live/transfer-status.html, verified 2026-09-20)
+//   type: 1        (required, fixed)
+//   idtype: 1|2     (1 = unique externalref, 2 = Moolre-generated ID)
+//   id: <reference> (required)
+//   accountnumber: (required — the Moolre payout account)
+const STATUS_TYPE_CODE              = 1;
+const STATUS_IDTYPE_EXTERNALREF    = 1;
+const BODY_KEY_STATUS_TYPE          = 'type';
+const BODY_KEY_STATUS_IDTYPE       = 'idtype';
+const BODY_KEY_STATUS_ID           = 'id';
+
+// ── r15 R15-C: provider OUTCOME classification ────────────────────────────────
+// A thrown error is NOT proof that Moolre refused the payout. A timeout/reset
+// can occur AFTER Moolre accepted the same externalref — the failover layer and
+// the withdrawal controller MUST NOT auto-fail-over (double disbursement) or
+// auto-refund (double spend) on anything but a provably-safe outcome.
+const PROVIDER_OUTCOMES = Object.freeze({
+    NOT_DISPATCHED:       'NOT_DISPATCHED',       // no bytes reached Moolre
+    DEFINITIVE_REJECTION: 'DEFINITIVE_REJECTION', // Moolre explicitly refused
+    UNKNOWN_OUTCOME:      'UNKNOWN_OUTCOME',      // may have been accepted
+    DUPLICATE_REFERENCE:  'DUPLICATE_REFERENCE',  // Moolre already holds this externalref
+});
+// Transport error codes that PROVABLY occur before any bytes leave the machine.
+const PROVABLY_PRE_DISPATCH = new Set(['ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN']);
+
+// Definitive rejections that describe the PROVIDER's own capacity/operational
+// state rather than the request's validity. Codes/phrases confirmed against
+// docs.moolre.com/ai/guides/errors-and-status-codes (TP99 = insufficient
+// float); kept deliberately narrow — anything unclassifiable is REQUEST_LEVEL.
+const PROVIDER_CAPACITY_REJECTION = new RegExp(
+    [
+        'insufficient\\s*(float|balance|fund)', // TP99 insufficient float
+        'limit\\s*(exceeded|reached)',
+        'service\\s*unavailable',
+        'maintenance',
+        'system\\s*(busy|overload)',
+        'capacity',
+    ].join('|'),
+    'i'
+);
+
 // ── ✅ CONFIRMED numeric channel codes (docs.moolre.com/ai/initiate-transfer.md) ──
 // AZM passes network ∈ {MTN, TELECEL, AIRTELTIGO} (VODAFONE accepted as legacy alias → Telecel).
 const NETWORK_TO_CHANNEL = {
@@ -190,13 +232,13 @@ class MoolreDisbursementService {
 
         // ── Validation (identical guards to the MTN adapter) ──────────────────
         if (!referenceId || typeof referenceId !== 'string') {
-            throw new Error('[MoolreDisbursementService] referenceId is required for idempotency.');
+            throw this._outcomeError('referenceId is required for idempotency.', PROVIDER_OUTCOMES.NOT_DISPATCHED, { stage: 'VALIDATE' });
         }
         if (!amountGhs || Number(amountGhs) <= 0) {
-            throw new Error('[MoolreDisbursementService] amountGhs must be positive.');
+            throw this._outcomeError('amountGhs must be positive.', PROVIDER_OUTCOMES.NOT_DISPATCHED, { stage: 'VALIDATE' });
         }
         if (!recipientPhone) {
-            throw new Error('[MoolreDisbursementService] recipientPhone is required.');
+            throw this._outcomeError('recipientPhone is required.', PROVIDER_OUTCOMES.NOT_DISPATCHED, { stage: 'VALIDATE' });
         }
 
         const finalExternalId   = externalId   || `AZAMAN_${referenceId}`;
@@ -215,6 +257,13 @@ class MoolreDisbursementService {
         }
 
         // ── LIVE path ─────────────────────────────────────────────────────────
+        // r15 follow-up (audit P0): the current official Initiate Transfer API
+        // (docs.moolre.com — /open/transact/transfer) REQUIRES accountnumber.
+        // A LIVE deployment without MOOLRE_ACCOUNT_NUMBER is misconfigured and
+        // must fail CLOSED before any provider I/O — an incomplete request
+        // must never go out over the wire with real money behind it.
+        this._assertLiveConfig('TRANSFER');
+
         const body = {
             [BODY_KEYS.currency]:      SUPPORTED_CURRENCY,
             [BODY_KEYS.amount]:        String(Number(amountGhs)),   // Moolre requires amount as string
@@ -222,12 +271,10 @@ class MoolreDisbursementService {
             [BODY_KEYS.reference]:     referenceId,         // strict idempotency key
             [BODY_KEYS.channel]:       channel,
             [BODY_KEYS.narration]:     finalNote,
+            [BODY_KEYS.accountNumber]: this.accountNumber,  // REQUIRED — verified live contract
         };
         if (TRANSFER_TYPE_CODE !== null && TRANSFER_TYPE_CODE !== undefined) {
             body[BODY_KEYS.type] = TRANSFER_TYPE_CODE;
-        }
-        if (this.accountNumber) {
-            body[BODY_KEYS.accountNumber] = this.accountNumber;
         }
 
         try {
@@ -240,10 +287,20 @@ class MoolreDisbursementService {
             // Moolre wraps EVERY response in { status, code, message, data, go }.
             const { ok, data, message, code } = this._unwrap(envelope);
             if (!ok) {
-                // A synchronous rejection (status: 0). Surface the provider
-                // message so finance.controller's catch can reverse + return 502,
-                // exactly as it does for an MTN rejection.
-                throw new Error(message || code || 'Moolre rejected the payout.');
+                // A synchronous rejection (status: 0) inside an HTTP-200 body.
+                // Surface the provider message so finance.controller's catch can
+                // reverse + return 502, exactly as it does for an MTN rejection.
+                //
+                // r15 follow-up (audit P0): PRESERVE the raw envelope on the
+                // thrown error. A bare Error here reached
+                // _initiationOutcomeError() with no err.response — so an
+                // EXPLICIT Moolre rejection was misclassified as
+                // UNKNOWN_OUTCOME (payout "may be in flight"), blocking the
+                // safe unwind and parking the withdrawal instead of failing
+                // closed. The envelope is the classification authority.
+                const rejection = new Error(message || code || 'Moolre rejected the payout.');
+                rejection.moolreEnvelope = envelope;
+                throw rejection;
             }
 
             // Moolre may settle synchronously OR return a PENDING that settles via
@@ -269,8 +326,7 @@ class MoolreDisbursementService {
                 source:         'LIVE'
             };
         } catch (err) {
-            const apiMsg = this._extractError(err);
-            throw new Error(`[MoolreDisbursementService] Moolre transfer rejected: ${apiMsg}`);
+            this._throwInitiationOutcome(err, referenceId);
         }
     }
 
@@ -280,15 +336,37 @@ class MoolreDisbursementService {
      */
     async getTransferStatus(referenceId) {
         if (!referenceId) {
-            throw new Error('[MoolreDisbursementService] referenceId is required.');
+            throw this._outcomeError('referenceId is required.', PROVIDER_OUTCOMES.NOT_DISPATCHED, { stage: 'VALIDATE' });
         }
 
         if (this.providerMode === 'MOCK') {
             return this._mockGetTransferStatus(referenceId);
         }
 
-        const body = { [BODY_KEYS.reference]: referenceId };
-        if (this.accountNumber) body[BODY_KEYS.accountNumber] = this.accountNumber;
+        // r15 follow-up (audit P0): the CURRENT official Moolre Transfer Status
+        // API (docs.moolre.com — /open/transact/status) does NOT accept the
+        // initiation body shape. The old request sent { externalref,
+        // accountnumber? } and was a STALE contract — Moolre ignores unknown
+        // fields and answers an application error, so the reconciliation
+        // worker could never resolve a previously-ambiguous payout through
+        // this path. The current contract (verified 2026-09-20) is:
+        //   type: 1        (fixed — "transact")
+        //   idtype: 1      (1 = unique externalref, 2 = Moolre-generated ID)
+        //   id: <referenceId>
+        //   accountnumber: <Moolre payout account>   (REQUIRED)
+        // — mirroring moolreCollectionService.getPaymentStatus, which already
+        // uses this exact shape.
+        // r15 follow-up (audit P0): accountnumber is REQUIRED by the current
+        // live Transfer Status contract — a missing live config must fail
+        // CLOSED before any provider I/O, never send an incomplete request.
+        this._assertLiveConfig('STATUS');
+
+        const body = {
+            [BODY_KEY_STATUS_TYPE]:    STATUS_TYPE_CODE,
+            [BODY_KEY_STATUS_IDTYPE]:  STATUS_IDTYPE_EXTERNALREF,
+            [BODY_KEY_STATUS_ID]:      referenceId,
+            [BODY_KEYS.accountNumber]: this.accountNumber,
+        };
 
         try {
             const { data: envelope } = await axios.post(
@@ -296,19 +374,52 @@ class MoolreDisbursementService {
                 body,
                 { headers: this._authHeaders(), timeout: 10000 }
             );
-            const { ok, data, message } = this._unwrap(envelope);
+            const { ok, data, message, code } = this._unwrap(envelope);
             if (!ok) {
-                // Treat an unknown reference as PENDING rather than throwing, so
-                // the reconciliation worker simply retries on the next tick.
-                return {
-                    provider:    PROVIDER_NAME,
-                    referenceId,
-                    externalId:  null,
-                    status:      'PENDING',
-                    amountGhs:   null,
-                    reason:      message || null,
-                    source:      'LIVE'
-                };
+                // r15 follow-up (audit P0): the status answer must distinguish
+                // three DIFFERENT states that the old contract collapsed into
+                // one PENDING:
+                //
+                //   1. AUTHORITATIVE ABSENCE — Moolre explicitly answers that
+                //      the external reference does not exist on its rail.
+                //      Return NOT_FOUND so a no-hint status search continues
+                //      to the next provider, and a KNOWN owner is surfaced as
+                //      an ownership conflict instead of a fake "still
+                //      pending" that can never resolve.
+                //
+                //   2. GENUINE ANSWER — only a txstatus=0 INSIDE an ok
+                //      envelope (handled below) is a valid PENDING.
+                //
+                //   3. UNRESOLVED — every other application-level failure
+                //      (auth/config/limits/malformed body) can prove NEITHER a
+                //      transaction state NOR absence. Masquerading those as
+                //      PENDING made reconciliation trust a rail that never
+                //      saw the payout: with Moolre primary and MTN secondary,
+                //      Moolre's "reference not found" → PENDING meant MTN was
+                //      NEVER asked, and a genuinely-dispatched MTN payout
+                //      stayed unresolved indefinitely. Such failures now
+                //      throw a classified STATUS_UNRESOLVED error so callers
+                //      keep the payout parked with durable evidence.
+                if (this._isReferenceNotFoundAnswer(message, code)) {
+                    return {
+                        provider:    PROVIDER_NAME,
+                        referenceId,
+                        externalId:  null,
+                        status:      'NOT_FOUND',
+                        amountGhs:   null,
+                        reason:      message || null,
+                        code:        code || null,
+                        source:      'LIVE'
+                    };
+                }
+                const unresolved = this._outcomeError(
+                    `Moolre status lookup could not resolve ${referenceId}: ${message || code || 'application-level failure'}`,
+                    PROVIDER_OUTCOMES.UNKNOWN_OUTCOME,
+                    { stage: 'STATUS', code: code || null, referenceId }
+                );
+                unresolved.statusUnresolved = true;
+                unresolved.message = `[MoolreDisbursementService] ${unresolved.message}`;
+                throw unresolved;
             }
             const rawStatus = (data && data.txstatus !== undefined && data.txstatus !== null)
                 ? data.txstatus
@@ -323,9 +434,26 @@ class MoolreDisbursementService {
                 source:      'LIVE'
             };
         } catch (err) {
-            const apiMsg = this._extractError(err);
-            throw new Error(`[MoolreDisbursementService] Moolre status lookup failed: ${apiMsg}`);
+            // r15 R15-C: a status-lookup failure is UNRESOLVED, never a
+            // provider failure — callers must keep the payout pending.
+            if (err.statusUnresolved) throw err; // already classified above
+            const outcomeErr = this._classifyTransportError(err, { referenceId, stage: 'STATUS' });
+            outcomeErr.message = `[MoolreDisbursementService] Moolre status lookup failed: ${this._extractError(err)}`;
+            throw outcomeErr;
         }
+    }
+
+    /**
+     * r15 follow-up (audit P0): does this application-level failure envelope
+     * explicitly answer "this reference does not exist on this rail"?
+     * Moolre does not pin a single machine-readable not-found code across
+     * environments, so the classification is deliberately conservative: it
+     * matches only unambiguous not-found wording in the envelope message or
+     * code. Everything else stays UNRESOLVED (never a fake PENDING).
+     */
+    _isReferenceNotFoundAnswer(message, code) {
+        const haystack = `${message || ''} ${code || ''}`.toLowerCase();
+        return /not\s*found|no\s+(matching\s+)?(transaction|record|reference|external\s*ref)|unknown\s+(external\s*)?ref(erence)?|invalid\s+(external\s*)?ref(erence)?/.test(haystack);
     }
 
     /**
@@ -354,6 +482,102 @@ class MoolreDisbursementService {
     }
 
     // ── Internals ─────────────────────────────────────────────────────────────
+    /**
+     * Build a typed provider-outcome error. The classification travels ON the
+     * error so the failover layer and the withdrawal controller can orchestrate
+     * safely without parsing message strings.
+     */
+    _outcomeError(message, providerOutcome, { referenceId = null, stage = null, code = null, isDuplicate = false, cause = null } = {}) {
+        const err = new Error(`[MoolreDisbursementService] ${message}`);
+        err.providerOutcome = providerOutcome;
+        err.provider = 'MOOLRE';
+        err.referenceId = referenceId;
+        err.stage = stage;
+        if (code) err.code = code;
+        if (isDuplicate) err.isDuplicate = true;
+        if (cause) err.cause = cause;
+        return err;
+    }
+
+    /** Classify a transport-level axios failure (no envelope reached us). */
+    _classifyTransportError(err, { referenceId = null, stage = null } = {}) {
+        const outcome = PROVABLY_PRE_DISPATCH.has(err?.code)
+            ? PROVIDER_OUTCOMES.NOT_DISPATCHED
+            : PROVIDER_OUTCOMES.UNKNOWN_OUTCOME;
+        return this._outcomeError(this._extractError(err), outcome, { referenceId, stage, cause: err });
+    }
+
+    /**
+     * r15 R15-C: classify a LIVE initiateTransfer failure.
+     * Envelope answer → TP13 duplicate / definitive rejection; anything else
+     * is transport-level (may have been accepted).
+     */
+    _initiationOutcomeError(err, { referenceId = null } = {}) {
+        // r15 follow-up (audit P0): an HTTP-200 { status: 0 } rejection is
+        // rethrown by initiateTransfer with the raw envelope attached
+        // (err.moolreEnvelope) — a normal axios failure carries the envelope
+        // on err.response.data. Both are authoritative envelope answers.
+        const env = err.moolreEnvelope || err.response?.data;
+        // Moolre's envelope carries status as an INTEGER (1 = success,
+        // 0 = failure). status: 0 IS an explicit application-level refusal
+        // even when code/message are empty — never classify a provider
+        // ANSWER as "may have been accepted".
+        const isEnvelopeAnswer = env && typeof env === 'object'
+            && (Number(env.status) === 0 || env.code || env.message);
+        if (isEnvelopeAnswer) {
+            const envCode = String(env.code || '');
+            if (envCode === 'TP13' || /duplicate/i.test(String(env.message || ''))) {
+                // Moolre ALREADY holds this externalref — a transfer may already
+                // be in flight under our reference. NEVER re-instruct; the
+                // reference resolves by status/callback.
+                return this._outcomeError(env.message || envCode, PROVIDER_OUTCOMES.DUPLICATE_REFERENCE,
+                    { referenceId, stage: 'TRANSFER', code: envCode, isDuplicate: true, cause: err });
+            }
+            // r15 follow-up: split definitive rejections into REQUEST_LEVEL
+            // (bad beneficiary, invalid rail — OUR request was wrong; the
+            // provider is healthy) and PROVIDER_CAPACITY (insufficient float,
+            // limits, operational/maintenance refusal — the provider itself
+            // cannot serve). The failover health counters use this class:
+            // capacity answers legitimately degrade provider health, request
+            // rejections never do. Failover ELIGIBILITY is unchanged — every
+            // DEFINITIVE_REJECTION proves the transfer was not accepted.
+            const rejection = this._outcomeError(env.message || envCode, PROVIDER_OUTCOMES.DEFINITIVE_REJECTION,
+                { referenceId, stage: 'TRANSFER', code: envCode, cause: err });
+            rejection.providerRejectionClass = PROVIDER_CAPACITY_REJECTION.test(
+                `${envCode} ${env.message || ''}`
+            ) ? 'PROVIDER_CAPACITY' : 'REQUEST_LEVEL';
+            return rejection;
+        }
+        return this._classifyTransportError(err, { referenceId, stage: 'TRANSFER' });
+    }
+
+    /** r15 R15-C: initiateTransfer LIVE catch — every failure is classified. */
+    _throwInitiationOutcome(err, referenceId) {
+        throw this._initiationOutcomeError(err, { referenceId });
+    }
+    /**
+     * r15 follow-up (audit P0): LIVE-mode configuration gate. The current
+     * official Moolre contracts REQUIRE accountnumber on BOTH the transfer
+     * initiation and the transfer-status endpoints. Failing closed here —
+     * BEFORE any provider I/O — is classified NOT_DISPATCHED: provably
+     * nothing was sent, the failover layer never sees a provider answer,
+     * and the withdrawal unwinds immediately instead of parking for
+     * reconciliation behind a request Moolre would refuse anyway.
+     * Credentials are already guaranteed by providerMode ('LIVE' requires
+     * apiUser + apiKey), so only the account number is re-checked here.
+     */
+    _assertLiveConfig(stage) {
+        if (this.providerMode !== 'LIVE') return;
+        if (!this.accountNumber) {
+            throw this._outcomeError(
+                'LIVE Moolre configuration is incomplete: MOOLRE_ACCOUNT_NUMBER is required '
+                + 'by the current Moolre transfer and transfer-status contracts. '
+                + 'Refusing to send an incomplete request.',
+                PROVIDER_OUTCOMES.NOT_DISPATCHED,
+                { stage }
+            );
+        }
+    }
 
     _authHeaders() {
         // Moolre uses STATIC header credentials — no OAuth, no token exchange.
@@ -477,3 +701,4 @@ class MoolreDisbursementService {
 }
 
 module.exports = MoolreDisbursementService;
+module.exports.PROVIDER_OUTCOMES = PROVIDER_OUTCOMES;

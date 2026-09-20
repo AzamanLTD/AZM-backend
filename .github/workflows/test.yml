@@ -66,6 +66,13 @@ jobs:
       - name: Audit production dependencies
         run: npm audit --omit=dev --audit-level=low
 
+      - name: Prisma schema validation gate
+        # Explicit, named validation of prisma/schema.prisma — do not rely on
+        # `db push`/`generate` failing indirectly on a broken schema. A schema
+        # that does not validate must stop CI at its own gate with a clear
+        # name in the summary.
+        run: npx prisma validate
+
       - name: Apply database schema
         # CI uses a disposable PostgreSQL instance. Production remains managed
         # by the repository's established db-push release process.
@@ -102,6 +109,9 @@ jobs:
         # (no durability requirement), so relax commit durability:
         # synchronous_commit is applied to existing sessions via SIGHUP —
         # no container restart needed. Production databases are unaffected.
+        # This tuning is FORBIDDEN in the financial-durability lane
+        # (financial-durability.yml), which rehearses the critical financial
+        # suites in the production commit mode and fails if it finds it.
         # prisma db execute wraps statements in a transaction and
         # ALTER SYSTEM cannot run inside one (run 35367906505), so run
         # psql inside the service container directly.

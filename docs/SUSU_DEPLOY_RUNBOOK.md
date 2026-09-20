@@ -27,9 +27,11 @@ redeploy.
 
 As of 2026-06-01 the backend self-prepares the DB on boot via
 `infra/autoRelease.js`. On startup, if the `azaman-treasury` row is absent,
-it runs `prisma migrate deploy` then the seed — both idempotent, both in the
-background, neither able to crash the process. This is what makes the feature
+it runs the additive overlay installers then the seed — all idempotent, all in
+the background, none able to crash the process. This is what makes the feature
 work on Render's **free tier**, which has no Shell and no Pre-Deploy hook.
+(Schema authority today: overlay installers only — `prisma migrate deploy`
+is not part of any deploy path; see DEPLOY_RUNBOOK.md.)
 
 `prisma` and `tsx` are in `dependencies` (not just devDependencies) so the
 CLI and the TypeScript `prisma.config.ts` loader are available at runtime.
@@ -37,8 +39,8 @@ CLI and the TypeScript `prisma.config.ts` loader are available at runtime.
 Nothing to do: just deploy. Watch the logs for:
 
 ```
-[autoRelease] Treasury missing — running one-time migrate + seed…
-[autoRelease] prisma migrate deploy completed.
+[autoRelease] Treasury missing — running one-time installer pass + seed…
+[autoRelease] overlay installer: N ok, 0 failed
 [autoRelease] susu-foundation seed completed.
 [Susu] Treasury wallet cached (userId=...)
 ```
@@ -50,10 +52,11 @@ The Options below remain valid for paid tiers or manual control.
 
 Even so, the correct release sequence prepares the DB *before* traffic:
 
-1. `prisma migrate deploy` — apply the two pending migrations
+1. `node infra/install-susu-overlay.js` — converge the susu schema
 2. `node infra/seed-susu-foundation.js` — seed treasury + v1.0 contract
 
-Both are idempotent. `npm run release` runs them in order.
+Both are idempotent. `npm run release` runs the full overlay + seed chain in
+order. (`prisma migrate deploy` is NOT a deploy path — see DEPLOY_RUNBOOK.md.)
 
 ## Option A — Render Pre-Deploy Command (recommended, automated)
 
@@ -76,7 +79,7 @@ service and run:
 ```bash
 npm run release
 # equivalently:
-#   npx prisma migrate deploy
+#   node infra/install-susu-overlay.js
 #   node infra/seed-susu-foundation.js
 ```
 
@@ -99,7 +102,10 @@ Run the Phase-2 API checks against the live host (read-mostly; uses fresh
 fixture accounts):
 
 ```bash
-node test_phase2_apis.js https://azm-backend.onrender.com
+# The ad-hoc root probe (test_phase2_apis.js) was removed in the r15 repo
+# hygiene pass — the authoritative verification is the CI battery plus the
+# real production URL's /health and storefront endpoints.
+curl -fsS https://azm-backend-9o0b.onrender.com/health
 ```
 
 ## Rollback

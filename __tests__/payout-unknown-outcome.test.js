@@ -127,7 +127,7 @@ describeOrSkip('payout provider unknown-outcome (real PostgreSQL)', () => {
     // ── A + E + F: success, replay, canonical reference ────────────────────────
     test('A/E/F. dispatch claims PROCESSING, settles via reconciliation, replay never re-dispatches', async () => {
         const { withdrawal, tx } = await seedScenario();
-        const initiateTransfer = jest.fn().mockResolvedValue({ status: 'PENDING', referenceId: REF });
+        const initiateTransfer = jest.fn().mockResolvedValue({ _provider: 'mtn', provider: 'MTN_MOMO_DISBURSEMENT', status: 'PENDING', referenceId: REF });
         const io = makeIo();
         const worker = new PayoutBatchWorker(prisma, io, { initiateTransfer }, null);
 

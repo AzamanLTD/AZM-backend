@@ -181,8 +181,37 @@ exports.confirmMoolreOtp = async (req, res) => {
     }
     return res.status(200).json({ success: true, requiresOtp: false, data: { reference, quoteId: meta.quoteId } });
   } catch (err) {
-    logger.error({ err }, '[quoteMoolreDeposit] OTP confirmation error');
-    return res.status(502).json({ success: false, message: err.message?.replace(/^\[MoolreCollectionService\]\s*/, '') || 'Payment provider error. Please retry.' });
+    // ── r15 R15-B: classify the provider outcome. The OTP confirmation is
+    // NOT allowed to terminate the deposit: an UNKNOWN_OUTCOME or
+    // DUPLICATE_REFERENCE after the OTP submission means Moolre may have
+    // accepted the collection under the SAME durable externalRef — the
+    // deposit stays PENDING and resolves by callback/status. Only a provably
+    // not-dispatched / definitive rejection leaves the pending deposit
+    // untouched-but-retryable; nothing is ever marked FAILED here (the
+    // initiation reference stays the single authority either way).
+    const outcome = err.providerOutcome || 'UNKNOWN_OUTCOME';
+    logger.error({ err, outcome }, '[quoteMoolreDeposit] OTP confirmation error');
+    if (outcome === 'NOT_DISPATCHED' || outcome === 'DEFINITIVE_REJECTION') {
+      return res.status(502).json({
+        success: false,
+        code: outcome,
+        message: err.message?.replace(/^\[MoolreCollectionService\]\s*/, '') || 'Payment provider error. You may retry the same deposit confirmation.',
+      });
+    }
+    if (outcome === 'DUPLICATE_REFERENCE') {
+      return res.status(202).json({
+        success: false,
+        code: 'MOOLRE_DUPLICATE_REFERENCE',
+        retryable: false,
+        message: 'Moolre already holds this payment reference. The deposit stays pending and resolves by provider status or callback under the same reference.',
+      });
+    }
+    return res.status(202).json({
+      success: false,
+      code: 'MOOLRE_OUTCOME_UNKNOWN',
+      retryable: false,
+      message: 'The provider outcome is not yet known. The deposit stays pending and resolves by provider callback or status lookup under the same reference — do NOT initiate a new deposit.',
+    });
   }
 };
 

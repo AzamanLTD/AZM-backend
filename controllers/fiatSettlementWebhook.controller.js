@@ -11,7 +11,7 @@ const crypto = require('crypto');
 const logger = require('../src/config/logger');
 const { settleFiatWithdrawal } = require('../services/fiatSettlementService');
 const { recordProviderSettlementAttempt } = require('../services/providerSettlementAttemptService');
-const { recordReconciliationException } = require('../services/reconciliationExceptionService');
+const { recordReconciliationExceptionLoud } = require('../services/reconciliationExceptionService');
 const fiatLiquidity = require('../src/services/fiatLiquidityService');
 
 const notificationService = (req) => {
@@ -131,13 +131,18 @@ const handleSettlement = (provider, authenticate, normalize) => async (req, res)
             } catch (evidenceErr) {
                 logger.error({ err: evidenceErr, reference: normalized.reference, provider },
                     '[fiatSettlementWebhook] §P.5-D PENDING observation persistence failed');
-                await recordReconciliationException(prisma, {
+                await recordReconciliationExceptionLoud(prisma, {
                     entityType: 'TRANSACTION',
                     entityId: normalized.reference,
                     reference: normalized.providerTxId,
                     reason: 'OUTBOUND_EVIDENCE_PERSISTENCE_FAILED',
                     details: { provider, observedStatus: 'PENDING' },
-                }).catch(() => null);
+                }, {
+                    escalate: () => io && io.emit('admin_alert', {
+                        type: 'RECONCILIATION_EVIDENCE_WRITE_FAILED',
+                        timestamp: new Date().toISOString(),
+                    }),
+                });
             }
             await recordProviderSettlementAttempt(prisma, {
                 reference: normalized.reference,

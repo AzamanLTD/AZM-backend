@@ -84,15 +84,20 @@ describe('fiatSettlementService', () => {
         });
         const prisma = {
             ...attemptDb(),
-            transactionHistory: { findUnique: jest.fn().mockResolvedValue(completed), update: jest.fn().mockResolvedValue(enriched) }
+            transactionHistory: {
+                findUnique: jest.fn().mockResolvedValue(enriched),
+                updateMany: jest.fn().mockResolvedValue({ count: 1 })
+            }
         };
 
         const result = await settleFiatWithdrawal(prisma, {
             reference: 'ref-dup', provider: 'MOOLRE', status: 'SUCCESSFUL', providerTxId: 'provider-dup'
         });
 
-        expect(prisma.transactionHistory.update).toHaveBeenCalledWith({
-            where: { txHash: 'ref-dup' }, data: { providerRef: 'provider-dup' }
+        // r15 R15-E: the claim is a conditional updateMany (providerRef: null),
+        // never an unconditional overwrite.
+        expect(prisma.transactionHistory.updateMany).toHaveBeenCalledWith({
+            where: { txHash: 'ref-dup', providerRef: null }, data: { providerRef: 'provider-dup' }
         });
         expect(result).toMatchObject({ status: 'COMPLETED', changed: false, providerTxId: 'provider-dup' });
     });
@@ -109,8 +114,8 @@ describe('fiatSettlementService', () => {
         const prisma = {
             ...attemptDb(),
             transactionHistory: {
-                findUnique: jest.fn().mockResolvedValueOnce(pending).mockResolvedValueOnce(failedWithProviderRef),
-                update: jest.fn().mockResolvedValue(failedWithProviderRef)
+                findUnique: jest.fn().mockResolvedValueOnce(pending).mockResolvedValue(failedWithProviderRef),
+                updateMany: jest.fn().mockResolvedValue({ count: 1 })
             }
         };
 
@@ -126,8 +131,8 @@ describe('fiatSettlementService', () => {
                 providerTxId: 'moolre-fail-3'
             }
         );
-        expect(prisma.transactionHistory.update).toHaveBeenCalledWith({
-            where: { txHash: 'ref-3' }, data: { providerRef: 'moolre-fail-3' }
+        expect(prisma.transactionHistory.updateMany).toHaveBeenCalledWith({
+            where: { txHash: 'ref-3', providerRef: null }, data: { providerRef: 'moolre-fail-3' }
         });
         expect(result).toMatchObject({ status: 'FAILED', changed: true, providerTxId: 'moolre-fail-3' });
     });

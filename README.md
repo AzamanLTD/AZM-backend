@@ -4,7 +4,12 @@ Node.js / Express 5 API server for the Azaman P2P crypto exchange platform.
 
 ## Stack
 
-- **Runtime**: Node.js 20, Express 5
+- **Runtime**: Node.js 24, Express 5
+
+  Runtime contract: Node 24 is pinned in `.nvmrc`, `package.json` (`engines.node:
+  24.x`), `render.yaml` (`NODE_VERSION`) and CI. The full serial test battery
+  is verified against Node 24 only; do not bump major Node versions casually —
+  verify the entire suite and dependencies first.
 - **Database**: PostgreSQL via Prisma 6 + `@prisma/adapter-pg`
 - **Real-time**: Socket.IO 4.8 (optional Redis pub/sub adapter for multi-instance)
 - **Auth**: JWT (15-min access + 30-day opaque refresh tokens, `tokenVersion` cascade)
@@ -23,8 +28,15 @@ cp .env.example .env
 # Generate Prisma client
 npx prisma generate
 
-# Run migrations
-npx prisma migrate deploy
+# Apply the schema (dev/test databases)
+npx prisma db push
+npm run release
+
+# NOTE — schema authority: disposable dev/test databases use `db push` + the
+# additive overlay installers above (exactly what CI runs). `prisma migrate
+# deploy` is NOT a deploy path anywhere in this project: production DDL is
+# owned exclusively by the `infra/install-*-overlay.js` installers, and the
+# historical `prisma/migrations` chain is development history only.
 
 # Start server
 npm start

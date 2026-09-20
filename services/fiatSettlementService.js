@@ -18,18 +18,25 @@ const fiatLiquidity = require('../src/services/fiatLiquidityService');
 // reservation lifecycle. Once a terminal state has a provider reference, a
 // later callback must never overwrite it: contradictory callbacks are evidence
 // to retain, not an instruction to rewrite the authoritative settlement record.
+// r15 R15-E: enrichment is an atomic CAS claim. The previous
+// read-check-write raced: two concurrent callbacks both observing
+// providerRef null both passed the check and the last write silently
+// replaced contradictory provider evidence. The conditional updateMany
+// makes the FIRST provider identity authoritative; losers converge by
+// re-reading the committed row and NEVER overwrite it.
 const enrichProviderReference = async (prisma, reference, currentTransaction, providerTxId) => {
     if (!providerTxId || currentTransaction?.providerRef) return currentTransaction;
 
+    await prisma.transactionHistory.updateMany({
+        where: { txHash: reference, providerRef: null },
+        data: { providerRef: String(providerTxId) },
+    });
+
+    // Winner or loser: always return the authoritative committed row.
     const latest = await prisma.transactionHistory.findUnique({
         where: { txHash: reference }
     });
-    if (!latest || latest.providerRef) return latest || currentTransaction;
-
-    return prisma.transactionHistory.update({
-        where: { txHash: reference },
-        data: { providerRef: String(providerTxId) }
-    });
+    return latest || currentTransaction;
 };
 
 const settleFiatWithdrawal = async (prisma, {
@@ -183,10 +190,17 @@ const settleFiatWithdrawal = async (prisma, {
     // or real reversal path re-reads the transaction after changing status.
     let transaction = original;
     if (providerTxId && !original.providerRef) {
-        transaction = await prisma.transactionHistory.update({
-            where: { txHash: reference },
-            data: { providerRef: String(providerTxId) }
+        // r15 R15-E: same CAS discipline — a concurrent callback may have
+        // enriched the reference between our read and this write; the
+        // conditional claim keeps the FIRST provider identity and never
+        // silently replaces contradictory evidence.
+        await prisma.transactionHistory.updateMany({
+            where: { txHash: reference, providerRef: null },
+            data: { providerRef: String(providerTxId) },
         });
+        transaction = await prisma.transactionHistory.findUnique({
+            where: { txHash: reference }
+        }) || original;
     }
 
     const reversal = await financeService.reverseFiatWithdrawal(prisma, reference, {
@@ -215,4 +229,4 @@ const settleFiatWithdrawal = async (prisma, {
     };
 };
 
-module.exports = { settleFiatWithdrawal };
+module.exports = { settleFiatWithdrawal, enrichProviderReference };

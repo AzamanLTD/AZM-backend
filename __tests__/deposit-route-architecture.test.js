@@ -66,10 +66,14 @@ describe('Deposit route architecture — fiat settlement is quote-backed only', 
     });
 
     test('every quote-backed settlement handler is wired to consume a persisted TransactionQuote', () => {
-        // Static contract check: the mounted settlement paths must reference
-        // consumeTransactionQuote (the exactly-once, fixed-price claim).
-        for (const handler of [quoteFiatDepositController.webhook, moolreQuoteDepositController.webhook]) {
-            expect(handler.toString()).toMatch(/consumeTransactionQuote/);
-        }
+        // Static contract check: the mounted settlement paths must consume the
+        // exactly-once, fixed-price quote claim — either directly or through
+        // the shared once-settlement core (r15 R15-B extracted the Moolre
+        // webhook's settlement transaction into src/services/
+        // moolreDepositSettlement.js, which itself calls consumeTransactionQuote).
+        const moolreDepositSettlement = require('../src/services/moolreDepositSettlement');
+        expect(moolreDepositSettlement.settleMoolreDeposit.toString()).toMatch(/consumeTransactionQuote/);
+        expect(moolreQuoteDepositController.webhook.toString()).toMatch(/settleMoolreDeposit/);
+        expect(quoteFiatDepositController.webhook.toString()).toMatch(/consumeTransactionQuote/);
     });
 });

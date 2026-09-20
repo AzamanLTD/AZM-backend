@@ -313,10 +313,21 @@ class MtnDisbursementService {
             const outcome = (err.response && err.response.status < 500)
                 ? PROVIDER_OUTCOMES.DEFINITIVE_REJECTION
                 : PROVIDER_OUTCOMES.UNKNOWN_OUTCOME;
-            throw this._outcomeError(
+            const rejection = this._outcomeError(
                 `[MtnDisbursementService] MTN transfer rejected: ${apiMsg}`,
                 outcome
             );
+            // r15 follow-up: same request-level vs provider-capacity split as
+            // the Moolre adapter. MTN's definitive answers are HTTP-status
+            // classified; only explicit capacity/operational wording (e.g.
+            // insufficient balance, service unavailable) describes the provider
+            // itself. Everything else is conservatively REQUEST_LEVEL.
+            if (outcome === PROVIDER_OUTCOMES.DEFINITIVE_REJECTION) {
+                rejection.providerRejectionClass = /insufficient\s*(float|balance|fund)|limit\s*(exceeded|reached)|service\s*unavailable|maintenance|system\s*(busy|overload)|capacity/i.test(apiMsg)
+                    ? 'PROVIDER_CAPACITY'
+                    : 'REQUEST_LEVEL';
+            }
+            throw rejection;
         }
     }
 
@@ -360,6 +371,24 @@ class MtnDisbursementService {
             };
         } catch (err) {
             const apiMsg = err.response?.data?.message || err.message;
+            // r15 follow-up (audit P0): MTN answers an unknown referenceId with
+            // 404 / RESOURCE_NOT_FOUND. That is an AUTHORITATIVE ABSENCE on
+            // THIS rail — not an unresolved error — so a no-hint status search
+            // can continue to the next provider and a KNOWN owner surfaces as
+            // an ownership conflict instead of an unresolvable "rail down".
+            const httpStatus = err.response?.status;
+            const apiCode = err.response?.data?.code || err.code;
+            if (httpStatus === 404 || /RESOURCE_NOT_FOUND|NOT_FOUND|NOTFOUND/i.test(String(apiCode || ''))) {
+                return {
+                    provider:    PROVIDER_NAME,
+                    referenceId,
+                    externalId:  null,
+                    status:      'NOT_FOUND',
+                    amountGhs:   null,
+                    reason:      apiMsg || 'RESOURCE_NOT_FOUND',
+                    source:      'LIVE'
+                };
+            }
             throw new Error(`[MtnDisbursementService] MTN status lookup failed: ${apiMsg}`);
         }
     }
