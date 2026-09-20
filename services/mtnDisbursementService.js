@@ -313,10 +313,21 @@ class MtnDisbursementService {
             const outcome = (err.response && err.response.status < 500)
                 ? PROVIDER_OUTCOMES.DEFINITIVE_REJECTION
                 : PROVIDER_OUTCOMES.UNKNOWN_OUTCOME;
-            throw this._outcomeError(
+            const rejection = this._outcomeError(
                 `[MtnDisbursementService] MTN transfer rejected: ${apiMsg}`,
                 outcome
             );
+            // r15 follow-up: same request-level vs provider-capacity split as
+            // the Moolre adapter. MTN's definitive answers are HTTP-status
+            // classified; only explicit capacity/operational wording (e.g.
+            // insufficient balance, service unavailable) describes the provider
+            // itself. Everything else is conservatively REQUEST_LEVEL.
+            if (outcome === PROVIDER_OUTCOMES.DEFINITIVE_REJECTION) {
+                rejection.providerRejectionClass = /insufficient\s*(float|balance|fund)|limit\s*(exceeded|reached)|service\s*unavailable|maintenance|system\s*(busy|overload)|capacity/i.test(apiMsg)
+                    ? 'PROVIDER_CAPACITY'
+                    : 'REQUEST_LEVEL';
+            }
+            throw rejection;
         }
     }
 

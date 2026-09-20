@@ -109,6 +109,22 @@ const PROVIDER_OUTCOMES = Object.freeze({
 // Transport error codes that PROVABLY occur before any bytes leave the machine.
 const PROVABLY_PRE_DISPATCH = new Set(['ECONNREFUSED', 'ENOTFOUND', 'EAI_AGAIN']);
 
+// Definitive rejections that describe the PROVIDER's own capacity/operational
+// state rather than the request's validity. Codes/phrases confirmed against
+// docs.moolre.com/ai/guides/errors-and-status-codes (TP99 = insufficient
+// float); kept deliberately narrow — anything unclassifiable is REQUEST_LEVEL.
+const PROVIDER_CAPACITY_REJECTION = new RegExp(
+    [
+        'insufficient\\s*(float|balance|fund)', // TP99 insufficient float
+        'limit\\s*(exceeded|reached)',
+        'service\\s*unavailable',
+        'maintenance',
+        'system\\s*(busy|overload)',
+        'capacity',
+    ].join('|'),
+    'i'
+);
+
 // ── ✅ CONFIRMED numeric channel codes (docs.moolre.com/ai/initiate-transfer.md) ──
 // AZM passes network ∈ {MTN, TELECEL, AIRTELTIGO} (VODAFONE accepted as legacy alias → Telecel).
 const NETWORK_TO_CHANNEL = {
@@ -470,8 +486,20 @@ class MoolreDisbursementService {
                 return this._outcomeError(env.message || envCode, PROVIDER_OUTCOMES.DUPLICATE_REFERENCE,
                     { referenceId, stage: 'TRANSFER', code: envCode, isDuplicate: true, cause: err });
             }
-            return this._outcomeError(env.message || envCode, PROVIDER_OUTCOMES.DEFINITIVE_REJECTION,
+            // r15 follow-up: split definitive rejections into REQUEST_LEVEL
+            // (bad beneficiary, invalid rail — OUR request was wrong; the
+            // provider is healthy) and PROVIDER_CAPACITY (insufficient float,
+            // limits, operational/maintenance refusal — the provider itself
+            // cannot serve). The failover health counters use this class:
+            // capacity answers legitimately degrade provider health, request
+            // rejections never do. Failover ELIGIBILITY is unchanged — every
+            // DEFINITIVE_REJECTION proves the transfer was not accepted.
+            const rejection = this._outcomeError(env.message || envCode, PROVIDER_OUTCOMES.DEFINITIVE_REJECTION,
                 { referenceId, stage: 'TRANSFER', code: envCode, cause: err });
+            rejection.providerRejectionClass = PROVIDER_CAPACITY_REJECTION.test(
+                `${envCode} ${env.message || ''}`
+            ) ? 'PROVIDER_CAPACITY' : 'REQUEST_LEVEL';
+            return rejection;
         }
         return this._classifyTransportError(err, { referenceId, stage: 'TRANSFER' });
     }

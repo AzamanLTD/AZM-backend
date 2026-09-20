@@ -30,9 +30,15 @@ function makeMockProvider(name, { fail = false, delay = 0, outcome = 'DEFINITIVE
             }
             return { referenceId: payload.referenceId, status: 'PENDING', amount: payload.amountGhs };
         },
+        _statusFail: false,
+        _statusOutcome: 'NOT_DISPATCHED',
         async getTransferStatus(referenceId) {
             this._calls.push({ method: 'getTransferStatus', referenceId });
-            if (this._fail) throw new Error(`${name} status check failed`);
+            if (this._fail || this._statusFail) {
+                const err = new Error(`${name} status check failed`);
+                err.providerOutcome = this._statusOutcome;
+                throw err;
+            }
             return { status: 'PENDING', referenceId };
         },
     };
@@ -179,69 +185,176 @@ describe('PaymentFailoverService', () => {
         expect(err.providerOutcome).toBe('DEFINITIVE_REJECTION');
     });
 
-    test('skips unhealthy provider after threshold failures', async () => {
-        // r15 follow-up: a provider becomes unhealthy through PROVIDER-level
-        // failures (NOT_DISPATCHED — unreachable), NOT through customer-level
-        // DEFINITIVE_REJECTIONs (which no longer count against health).
-        const primary = makeMockProvider('moolre', { fail: true, outcome: 'NOT_DISPATCHED' });
+    // ── r15 follow-up: non-economic recovery probes ───────────────────────
+    function countStatusCalls(provider) {
+        return provider._calls.filter(c => c.method === 'getTransferStatus').length;
+    }
+    function countInitiateCalls(provider) {
+        return provider._calls.filter(c => c.method === 'initiateTransfer').length;
+    }
+
+    test('r15 follow-up: an unhealthy provider NEVER receives customer payout traffic; recovery is a rate-limited non-economic status probe', async () => {
+        const primary   = makeMockProvider('moolre', { fail: true, outcome: 'NOT_DISPATCHED' });
+        const secondary = makeMockProvider('mtn');
+        const svc = new PaymentFailoverService({ primary, secondary }); // default 60s probe interval
+
+        // Degrade: 3 NOT_DISPATCHED failures → unhealthy.
+        for (let i = 0; i < 3; i++) {
+            await svc.initiateTransfer({ referenceId: `d-${i}`, amountGhs: 10, recipientPhone: '0244556677' }).catch(() => {});
+        }
+        expect(await svc._isHealthy('moolre')).toBe(false);
+
+        // The rail is still down: the status probe also fails (transport).
+        primary._statusFail = true;
+
+        const initBefore = countInitiateCalls(primary);
+        const statusBefore = countStatusCalls(primary);
+        secondary._calls = [];
+        for (let i = 0; i < 20; i++) {
+            await svc.initiateTransfer({ referenceId: `q-${i}`, amountGhs: 10, recipientPhone: '0244556677' }).catch(() => {});
+        }
+
+        // THE invariant: zero customer payout traffic to the degraded rail.
+        expect(countInitiateCalls(primary)).toBe(initBefore);
+        // The ONLY provider I/O it received: at most ONE read-only status
+        // probe (rate-limited — 20 transfers inside the interval window).
+        expect(countStatusCalls(primary) - statusBefore).toBeLessThanOrEqual(1);
+        // The healthy secondary handled everything.
+        expect(secondary._calls.filter(c => c.method === 'initiateTransfer').length).toBe(20);
+    });
+
+    test('r15 follow-up: a successful non-economic probe re-admits the provider to normal routing', async () => {
+        const primary   = makeMockProvider('moolre', { fail: true, outcome: 'NOT_DISPATCHED' });
+        const secondary = makeMockProvider('mtn');
+        const svc = new PaymentFailoverService({ primary, secondary, probeMinIntervalMs: 0 });
+
+        for (let i = 0; i < 3; i++) {
+            await svc.initiateTransfer({ referenceId: `r-${i}`, amountGhs: 10, recipientPhone: '0244556677' }).catch(() => {});
+        }
+        expect(await svc._isHealthy('moolre')).toBe(false);
+
+        // The rail recovers: the payout AND the status probe both work now.
+        primary._fail = false;
+        primary._statusFail = false;
+
+        // First transfer after recovery: the probe succeeds → the provider is
+        // re-admitted → THIS transfer routes to it again (it is priority 1).
+        primary._calls = [];
+        const result = await svc.initiateTransfer({ referenceId: `recovered`, amountGhs: 10, recipientPhone: '0244556677' });
+        expect(result._provider).toBe('moolre');
+        expect(countInitiateCalls(primary)).toBe(1);
+        expect(countStatusCalls(primary)).toBe(1); // the non-economic probe
+    });
+
+    test('r15 follow-up: a definitive rejection answering the probe counts as recovery (the rail is alive)', async () => {
+        const primary   = makeMockProvider('moolre', { fail: true, outcome: 'NOT_DISPATCHED' });
+        const secondary = makeMockProvider('mtn');
+        const svc = new PaymentFailoverService({ primary, secondary, probeMinIntervalMs: 0 });
+
+        for (let i = 0; i < 3; i++) {
+            await svc.initiateTransfer({ referenceId: `dr-${i}`, amountGhs: 10, recipientPhone: '0244556677' }).catch(() => {});
+        }
+        expect(await svc._isHealthy('moolre')).toBe(false);
+
+        // Probe answers "unknown reference" — a DEFINITIVE_REJECTION envelope.
+        // That is an authoritative answer from a live rail → recovery.
+        primary._statusFail = true;
+        primary._statusOutcome = 'DEFINITIVE_REJECTION';
+        primary._fail = false; // and payouts work again
+
+        primary._calls = [];
+        const result = await svc.initiateTransfer({ referenceId: `dr-ok`, amountGhs: 10, recipientPhone: '0244556677' });
+        expect(result._provider).toBe('moolre');
+        expect(await svc._isHealthy('moolre')).toBe(true);
+    });
+
+    test('r15 follow-up: an AMBIGUOUSLY-degraded provider is probed non-economically and never with live money', async () => {
+        const primary   = makeMockProvider('moolre', { fail: true, outcome: 'UNKNOWN_OUTCOME' });
         const secondary = makeMockProvider('mtn');
         const svc = new PaymentFailoverService({ primary, secondary });
 
         for (let i = 0; i < 3; i++) {
-            await svc.initiateTransfer({
-                referenceId: `test-${i}`,
-                amountGhs: 50,
-                recipientPhone: '0244556677',
-            }).catch(() => {});
+            await svc.initiateTransfer({ referenceId: `amb-${i}`, amountGhs: 10, recipientPhone: '0244556677' }).catch(() => {});
         }
+        expect(await svc._isHealthy('moolre')).toBe(false);
+        expect((await svc._getHealthKey('moolre')).lastAmbiguousFailureAt).toBeTruthy();
 
-        // This test previously depended on Math.random(), making CI flaky.
-        // Force an exact alternating probe/skip pattern so the routing policy
-        // is exercised deterministically while keeping production behavior
-        // unchanged.
-        const randomSpy = jest.spyOn(Math, 'random');
-        randomSpy
-            .mockReturnValueOnce(0.25)
-            .mockReturnValueOnce(0.75)
-            .mockReturnValueOnce(0.25)
-            .mockReturnValueOnce(0.75)
-            .mockReturnValueOnce(0.25)
-            .mockReturnValueOnce(0.75)
-            .mockReturnValueOnce(0.25)
-            .mockReturnValueOnce(0.75)
-            .mockReturnValueOnce(0.25)
-            .mockReturnValueOnce(0.75)
-            .mockReturnValueOnce(0.25)
-            .mockReturnValueOnce(0.75)
-            .mockReturnValueOnce(0.25)
-            .mockReturnValueOnce(0.75)
-            .mockReturnValueOnce(0.25)
-            .mockReturnValueOnce(0.75)
-            .mockReturnValueOnce(0.25)
-            .mockReturnValueOnce(0.75)
-            .mockReturnValueOnce(0.25)
-            .mockReturnValueOnce(0.75);
+        // Still degraded: probe (status lookup) times out → stays unhealthy.
+        primary._statusFail = true;
+        primary._statusOutcome = 'UNKNOWN_OUTCOME';
 
-        let primaryProbed = 0;
-        let secondaryUsed = 0;
-        try {
-            for (let i = 0; i < 20; i++) {
-                primary._calls = [];
-                secondary._calls = [];
-                await svc.initiateTransfer({
-                    referenceId: `probe-${i}`,
-                    amountGhs: 10,
-                    recipientPhone: '0244556677',
-                });
-                if (primary._calls.length > 0) primaryProbed++;
-                if (secondary._calls.length > 0) secondaryUsed++;
-            }
-        } finally {
-            randomSpy.mockRestore();
+        const initBefore = countInitiateCalls(primary);
+        secondary._calls = [];
+        for (let i = 0; i < 10; i++) {
+            await svc.initiateTransfer({ referenceId: `amb-q-${i}`, amountGhs: 10, recipientPhone: '0244556677' }).catch(() => {});
         }
+        expect(countInitiateCalls(primary)).toBe(initBefore); // never live money
+        expect(secondary._calls.filter(c => c.method === 'initiateTransfer').length).toBe(10);
+        // The ambiguity stamp stays visible for operators.
+        expect((await svc._getHealthKey('moolre')).lastAmbiguousFailureAt).toBeTruthy();
+    });
 
-        expect(primaryProbed).toBe(10);
-        expect(secondaryUsed).toBe(20);
+    // ── r15 follow-up: provider-capacity vs request-level rejection split ──
+    test('r15 follow-up: PROVIDER_CAPACITY rejections degrade health — request-level rejections never do', async () => {
+        const capacity = {
+            name: 'moolre', _calls: [],
+            newReferenceId: () => 'ref-cap',
+            async initiateTransfer(payload) {
+                this._calls.push({ method: 'initiateTransfer', payload });
+                const err = new Error('Insufficient float');
+                err.providerOutcome = 'DEFINITIVE_REJECTION';
+                err.providerRejectionClass = 'PROVIDER_CAPACITY';
+                throw err;
+            },
+            async getTransferStatus(referenceId) { return { status: 'PENDING', referenceId }; },
+        };
+        const requestLevel = {
+            name: 'moolre', _calls: [],
+            newReferenceId: () => 'ref-req',
+            async initiateTransfer(payload) {
+                this._calls.push({ method: 'initiateTransfer', payload });
+                const err = new Error('Invalid beneficiary number');
+                err.providerOutcome = 'DEFINITIVE_REJECTION';
+                err.providerRejectionClass = 'REQUEST_LEVEL';
+                throw err;
+            },
+            async getTransferStatus(referenceId) { return { status: 'PENDING', referenceId }; },
+        };
+        const secondary = makeMockProvider('mtn');
+
+        const svcCap = new PaymentFailoverService({ primary: capacity, secondary });
+        for (let i = 0; i < 3; i++) {
+            await svcCap.initiateTransfer({ referenceId: `cap-${i}`, amountGhs: 10, recipientPhone: '0244556677' }).catch(() => {});
+        }
+        // The provider itself cannot serve (insufficient float) → unhealthy.
+        expect(await svcCap._isHealthy('moolre')).toBe(false);
+
+        const svcReq = new PaymentFailoverService({ primary: requestLevel, secondary });
+        for (let i = 0; i < 5; i++) {
+            await svcReq.initiateTransfer({ referenceId: `req-${i}`, amountGhs: 10, recipientPhone: '0244556677' }).catch(() => {});
+        }
+        // Customer-level rejections → the provider is answering and healthy.
+        expect(await svcReq._isHealthy('moolre')).toBe(true);
+    });
+
+    test('r15 follow-up: PROVIDER_CAPACITY rejections remain failover-ELIGIBLE (the transfer was provably not accepted)', async () => {
+        const primary = {
+            name: 'moolre', _calls: [],
+            newReferenceId: () => 'ref-cap2',
+            async initiateTransfer(payload) {
+                this._calls.push({ method: 'initiateTransfer', payload });
+                const err = new Error('Insufficient float');
+                err.providerOutcome = 'DEFINITIVE_REJECTION';
+                err.providerRejectionClass = 'PROVIDER_CAPACITY';
+                throw err;
+            },
+            async getTransferStatus(referenceId) { return { status: 'PENDING', referenceId }; },
+        };
+        const secondary = makeMockProvider('mtn');
+        const svc = new PaymentFailoverService({ primary, secondary });
+
+        const result = await svc.initiateTransfer({ referenceId: 'cap-fo', amountGhs: 10, recipientPhone: '0244556677' });
+        expect(result._provider).toBe('mtn'); // failed over safely
     });
 
     test('r15 follow-up: customer-level DEFINITIVE_REJECTIONs never mark a healthy provider unhealthy', async () => {
@@ -286,67 +399,6 @@ describe('PaymentFailoverService', () => {
     });
 
     // ── r15 follow-up: probe safety ──────────────────────────────────────────
-    test('r15 follow-up: an AMBIGUOUSLY-degraded provider is NEVER probed with live money (recovery is passive)', async () => {
-        const primary   = makeMockProvider('moolre', { fail: true, outcome: 'UNKNOWN_OUTCOME' });
-        const secondary = makeMockProvider('mtn');
-        const svc = new PaymentFailoverService({ primary, secondary });
-
-        // 3 ambiguous outcomes degrade the provider's health...
-        for (let i = 0; i < 3; i++) {
-            await svc.initiateTransfer({
-                referenceId: `amb-${i}`, amountGhs: 10, recipientPhone: '0244556677',
-            }).catch(() => {}); // UNKNOWN_OUTCOME blocks the chain — expected
-        }
-        expect(await svc._isHealthy('moolre')).toBe(false);
-
-        // ...and the ambiguous stamp suppresses probing ENTIRELY — even with
-        // Math.random() begging to probe on every call. The unhealthy rail
-        // never receives a fresh customer payout to "test" with; the healthy
-        // secondary handles everything.
-        const randomSpy = jest.spyOn(Math, 'random').mockReturnValue(0.01);
-        const primaryCallsBefore = primary._calls.length;
-        secondary._calls = [];
-        try {
-            for (let i = 0; i < 8; i++) {
-                await svc.initiateTransfer({
-                    referenceId: `amb-probe-${i}`, amountGhs: 10, recipientPhone: '0244556677',
-                });
-            }
-        } finally {
-            randomSpy.mockRestore();
-        }
-        expect(primary._calls.length).toBe(primaryCallsBefore); // zero probes
-        expect(secondary._calls.length).toBe(8);                // all routed to the healthy rail
-        expect((await svc._getHealthKey('moolre')).lastAmbiguousFailureAt).toBeTruthy();
-    });
-
-    test('r15 follow-up: a provably-safe degradation (NOT_DISPATCHED) remains probe-eligible', async () => {
-        const primary   = makeMockProvider('moolre', { fail: true, outcome: 'NOT_DISPATCHED' });
-        const secondary = makeMockProvider('mtn');
-        const svc = new PaymentFailoverService({ primary, secondary });
-
-        for (let i = 0; i < 3; i++) {
-            await svc.initiateTransfer({
-                referenceId: `nd-${i}`, amountGhs: 10, recipientPhone: '0244556677',
-            }).catch(() => {});
-        }
-        expect(await svc._isHealthy('moolre')).toBe(false);
-        expect((await svc._getHealthKey('moolre')).lastAmbiguousFailureAt).toBeNull();
-
-        // NOT_DISPATCHED means no bytes ever reached the provider — probing
-        // with live money cannot create a swallowed payout. Random says probe.
-        const randomSpy = jest.spyOn(Math, 'random').mockReturnValue(0.01);
-        const primaryCallsBefore = primary._calls.length;
-        try {
-            await svc.initiateTransfer({
-                referenceId: `nd-probe`, amountGhs: 10, recipientPhone: '0244556677',
-            });
-        } finally {
-            randomSpy.mockRestore();
-        }
-        expect(primary._calls.length).toBe(primaryCallsBefore + 1); // probed
-    });
-
     test('r15 follow-up: a recorded success clears the ambiguity stamp (authoritative answer → probes safe again)', async () => {
         const primary = {
             name: 'moolre',

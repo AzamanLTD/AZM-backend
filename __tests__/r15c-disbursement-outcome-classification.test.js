@@ -131,9 +131,21 @@ describe('r15 R15-C: disbursement adapter outcome classification', () => {
         expect(err.providerOutcome).toBe(PROVIDER_OUTCOMES.DEFINITIVE_REJECTION);
         expect(err.code).toBe('TP99');
         expect(err.message).toMatch(/Insufficient float/);
+        // r15 follow-up: TP99 (insufficient float) is a PROVIDER_CAPACITY
+        // refusal — the provider itself cannot serve, so the failover health
+        // tier counts it against provider health (unlike request-level
+        // rejections, e.g. a bad beneficiary number).
+        expect(err.providerRejectionClass).toBe('PROVIDER_CAPACITY');
     });
 
-    test('HTTP 200 + { status: 0, code: TP13 } → DUPLICATE_REFERENCE, isDuplicate — never re-instruct', async () => {
+        test('HTTP 200 + { status: 0 } beneficiary/rail refusal → DEFINITIVE_REJECTION classified REQUEST_LEVEL', async () => {
+        axiosSpy.mockResolvedValueOnce({ data: { status: 0, code: 'TP07', message: 'Invalid beneficiary account', data: null, go: null } });
+        const err = await service.initiateTransfer(PAYLOAD).catch(e => e);
+        expect(err.providerOutcome).toBe(PROVIDER_OUTCOMES.DEFINITIVE_REJECTION);
+        expect(err.providerRejectionClass).toBe('REQUEST_LEVEL');
+    });
+
+test('HTTP 200 + { status: 0, code: TP13 } → DUPLICATE_REFERENCE, isDuplicate — never re-instruct', async () => {
         axiosSpy.mockResolvedValueOnce({ data: { status: 0, code: 'TP13', message: 'Duplicate reference supplied', data: null, go: null } });
         const err = await service.initiateTransfer(PAYLOAD).catch(e => e);
         expect(err.providerOutcome).toBe(PROVIDER_OUTCOMES.DUPLICATE_REFERENCE);

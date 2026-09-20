@@ -8,10 +8,10 @@
 //
 // Health tracking: successes/failures stored in Redis with a 10-minute TTL.
 // If a provider has 3+ failures in the window, it is marked unhealthy and
-// skipped until it recovers. An unhealthy provider may only be probed with
-// a live payout when its recorded degradation is provably money-safe; a
-// provider whose window contains an AMBIGUOUS outcome is never probed
-// (recovery is passive: window expiry or a recorded success).
+// skipped until it recovers. Recovery is detected by a NON-ECONOMIC probe:
+// a rate-limited transfer-STATUS lookup (read-only provider I/O), never
+// real customer payout traffic. A definitive answer to a probe — even a
+// rejection — proves the rail is alive and re-admits the provider.
 //
 // Redis health counters are mutated with MULTI/EXEC pipelines — the old
 // GET→JSON.parse→SET read-modify-write lost updates between concurrent
@@ -26,7 +26,10 @@ const logger = require('../config/logger');
 
 const HEALTH_WINDOW_SECONDS = 600;  // 10 minutes
 const FAILURE_THRESHOLD     = 3;    // 3 failures in window → unhealthy
-const RECOVERY_PROBE_RATIO  = 0.5;  // try unhealthy provider on 50% of calls
+// Minimum spacing between non-economic recovery probes of the same provider.
+// An unhealthy provider can receive at most one read-only status probe per
+// interval per instance — never ordinary customer payout traffic.
+const DEFAULT_PROBE_INTERVAL_MS = 60 * 1000;
 
 class PaymentFailoverService {
     /**
@@ -47,6 +50,10 @@ class PaymentFailoverService {
 
         this.redis = opts.redis || null;
         this._memoryHealth = new Map(); // fallback if no Redis
+        this._probeIntervalMs = Number.isFinite(opts.probeMinIntervalMs)
+            ? Math.max(0, opts.probeMinIntervalMs)
+            : DEFAULT_PROBE_INTERVAL_MS;
+        this._lastProbeAt = new Map(); // provider → last probe timestamp (ms)
 
         if (this.providers.length === 0) {
             throw new Error('PaymentFailoverService requires at least one provider');
@@ -121,23 +128,30 @@ class PaymentFailoverService {
 
     async _recordFailure(provider, error) {
         // ── r15 follow-up (audit P1): health must mean PROVIDER degradation.
-        // A DEFINITIVE_REJECTION or DUPLICATE_REFERENCE proves the provider
-        // is reachable, authenticated and answering authoritatively — the
-        // REQUEST was bad (bad beneficiary number, wrong rail, already-held
-        // reference). Counting those as provider failures lets a few
-        // legitimate customer-level rejections mark a HEALTHY provider
-        // unhealthy and reroute unrelated customers' money. Provider health
-        // counters only accumulate outcomes that indicate the provider
-        // itself failed or degraded: transport errors, 5xx/ambiguous
-        // (UNKNOWN_OUTCOME), NOT_DISPATCHED unreachability, or unclassified
-        // errors (conservatively treated as provider-side).
+        // The adapter carries a rejection CLASS on every DEFINITIVE_REJECTION:
+        //   REQUEST_LEVEL     — bad beneficiary number, wrong rail, already-
+        //                       held reference. OUR request was wrong; the
+        //                       provider is reachable and healthy. Never
+        //                       counted: a few legitimate customer-level
+        //                       rejections must not reroute other customers'
+        //                       money away from a healthy provider.
+        //   PROVIDER_CAPACITY — insufficient float, limits, operational or
+        //                       maintenance refusal. The provider itself
+        //                       cannot serve right now. Counted: the routing
+        //                       tier SHOULD prefer the other rail until it
+        //                       recovers.
+        // DUPLICATE_REFERENCE is always request-level. Transport errors,
+        // NOT_DISPATCHED unreachability, UNKNOWN_OUTCOME and unclassified
+        // errors are conservatively provider-side and always counted.
         const outcome = error?.providerOutcome || null;
-        const PROVIDER_IS_ANSWERING_WELL
-            = outcome === 'DEFINITIVE_REJECTION' || outcome === 'DUPLICATE_REFERENCE';
-        if (PROVIDER_IS_ANSWERING_WELL) {
+        const rejectionClass = error?.providerRejectionClass || null;
+        const REQUEST_LEVEL = outcome === 'DUPLICATE_REFERENCE'
+            || (outcome === 'DEFINITIVE_REJECTION' && rejectionClass !== 'PROVIDER_CAPACITY');
+        if (REQUEST_LEVEL) {
             logger.info({
                 provider,
                 outcome,
+                rejectionClass,
                 error: error?.message || 'Unknown error'
             }, '[PaymentFailover] Request-level rejection — provider answered authoritatively; NOT counted against provider health');
             return;
@@ -148,9 +162,10 @@ class PaymentFailoverService {
         const lastError = error?.message || 'Unknown error';
         // AMBIGUOUS degradation: the provider may be ACCEPTING payouts and
         // losing the answers (UNKNOWN_OUTCOME, or an unclassified error,
-        // conservatively treated the same). Stamped on the health record so
-        // _shouldProbeUnhealthy can refuse to route fresh live money into a
-        // rail that may be silently swallowing payouts.
+        // conservatively treated the same). Stamped on the health record for
+        // operator visibility (getHealthStatus) — with NON-ECONOMIC recovery
+        // probes an ambiguous provider is safely probeable (the probe is a
+        // read-only status lookup, not a payout).
         const AMBIGUOUS = outcome === 'UNKNOWN_OUTCOME' || !outcome;
 
         let failures;
@@ -190,26 +205,58 @@ class PaymentFailoverService {
         return health.failures < FAILURE_THRESHOLD;
     }
 
-    async _shouldProbeUnhealthy(provider) {
-        // A "probe" of an unhealthy DISBURSEMENT provider is a REAL customer
-        // payout, not a health-check ping. Probing is only allowed when the
-        // provider's recorded degradation is PROVABLY money-safe: if any
-        // failure in the current window was AMBIGUOUS (UNKNOWN_OUTCOME /
-        // unclassified — the provider may be accepting payouts and losing the
-        // answers), routing fresh live money into it multiplies parked
-        // payouts and operator reconciliation load. Such a provider recovers
-        // PASSIVELY: the 10-minute health window expires, or a success is
-        // recorded on a rail we still route to for other reasons. Never by
-        // handing it new customer money to test with.
-        const health = await this._getHealthKey(provider);
-        if (health.lastAmbiguousFailureAt) {
+    /**
+     * NON-ECONOMIC recovery probe. Called only for an UNHEALTHY provider
+     * before routing decides to skip it. Never sends money: it performs a
+     * read-only transfer-STATUS lookup against a synthetic reference. Any
+     * definitive answer — including a rejection for the unknown reference —
+     * proves the rail is alive, records a success (restoring health), and
+     * re-admits the provider to normal routing. A transport-level failure
+     * keeps it unhealthy and records further degradation evidence.
+     *
+     * Rate-limited per provider (min interval per instance), so a downed
+     * provider receives at most a couple of read-only probes per minute
+     * across instances — never uncontrolled or random CUSTOMER traffic.
+     */
+    async _attemptRecoveryProbe(provider) {
+        const now = Date.now();
+        const last = this._lastProbeAt.get(provider.name) || 0;
+        if (now - last < this._probeIntervalMs) return false;
+        this._lastProbeAt.set(provider.name, now);
+
+        const probeReference = (() => {
+            try { return provider.instance.newReferenceId(); } catch { return `probe-${provider.name}-${now}`; }
+        })();
+
+        try {
+            await provider.instance.getTransferStatus(probeReference);
+            await this._recordSuccess(provider.name);
             logger.info({
-                provider,
-                lastAmbiguousFailureAt: health.lastAmbiguousFailureAt,
-            }, '[PaymentFailover] Not probing unhealthy provider — window contains an ambiguous outcome; recovery must be passive (window expiry or a recorded success)');
+                provider: provider.name,
+                probeReference,
+            }, '[PaymentFailover] Non-economic recovery probe SUCCEEDED — provider re-admitted to routing');
+            return true;
+        } catch (err) {
+            const outcome = err?.providerOutcome || null;
+            // A definitive rejection (e.g. "unknown reference") is still an
+            // authoritative answer from a LIVE rail — the provider recovered.
+            if (outcome === 'DEFINITIVE_REJECTION' || outcome === 'DUPLICATE_REFERENCE') {
+                await this._recordSuccess(provider.name);
+                logger.info({
+                    provider: provider.name,
+                    probeReference,
+                    outcome,
+                }, '[PaymentFailover] Recovery probe answered authoritatively — provider re-admitted to routing');
+                return true;
+            }
+            await this._recordFailure(provider.name, err);
+            logger.info({
+                provider: provider.name,
+                probeReference,
+                outcome,
+            }, '[PaymentFailover] Recovery probe failed — provider stays unhealthy (skipped)');
             return false;
         }
-        return Math.random() < RECOVERY_PROBE_RATIO;
     }
 
     // ── Public API (mirrors MoolreDisbursementService shape) ──────────────────
@@ -230,15 +277,21 @@ class PaymentFailoverService {
         const errors = [];
 
         for (const provider of this.providers) {
-            const isHealthy = await this._isHealthy(provider.name);
+            let isHealthy = await this._isHealthy(provider.name);
 
-            if (!isHealthy && !await this._shouldProbeUnhealthy(provider.name)) {
-                logger.info({
-                    provider: provider.name,
-                    reason: 'unhealthy (skipped)'
-                }, '[PaymentFailover] Skipping unhealthy provider');
-                triedProviders.push(provider.name);
-                continue;
+            if (!isHealthy) {
+                // Recovery is detected by a rate-limited NON-ECONOMIC status
+                // probe (never real customer money). If the probe succeeds the
+                // provider is re-admitted and this transfer routes to it.
+                isHealthy = await this._attemptRecoveryProbe(provider);
+                if (!isHealthy) {
+                    logger.info({
+                        provider: provider.name,
+                        reason: 'unhealthy (skipped)'
+                    }, '[PaymentFailover] Skipping unhealthy provider');
+                    triedProviders.push(provider.name);
+                    continue;
+                }
             }
 
             triedProviders.push(provider.name);
