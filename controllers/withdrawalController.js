@@ -21,7 +21,7 @@ const restrictedObligations = require('../services/restrictedObligationService')
 const financeService          = require('../services/finance.service');
 const { runDoubleCheck }      = require('../utils/securityCheck');
 const fiatLiquidity           = require('../src/services/fiatLiquidityService'); // §P.5-D
-const { recordReconciliationException } = require('../services/reconciliationExceptionService');
+const { recordReconciliationExceptionLoud } = require('../services/reconciliationExceptionService');
 const axios                   = require('axios');
 const { randomUUID }          = require('crypto');
 const { audit }               = require('../utils/audit');
@@ -301,13 +301,20 @@ exports.fiatWithdrawal = async (req, res) => {
         } catch (bookkeepingErr) {
             logger.error({ err: bookkeepingErr, reference },
                 '[fiatWithdrawal] CRITICAL: §P.5-D post-dispatch evidence/IN_TRANSIT failed — NOT auto-refunding a dispatched payout');
-            await recordReconciliationException(prisma, {
+            await recordReconciliationExceptionLoud(prisma, {
                 entityType: 'TRANSACTION',
                 entityId: reference,
                 reference,
                 reason: 'POST_DISPATCH_BOOKKEEPING_FAILED',
                 details: { provider: 'MTN_MOMO', error: bookkeepingErr.message },
-            }).catch(() => null);
+            }, {
+                escalate: async () => {
+                    if (io) io.emit('admin_alert', {
+                        type: 'RECONCILIATION_EVIDENCE_WRITE_FAILED',
+                        timestamp: new Date().toISOString(),
+                    });
+                }
+            });
         }
 
             // Low-liquidity admin alert (post-dispatch so the user is not blocked).
@@ -388,13 +395,20 @@ exports.fiatWithdrawal = async (req, res) => {
                 // arrives via the provider callback / recon worker.
                 logger.error({ err: mtnErr, reference },
                     '[fiatWithdrawal] CRITICAL: post-dispatch failure — payout in flight, NOT refunding');
-                await recordReconciliationException(prisma, {
+                await recordReconciliationExceptionLoud(prisma, {
                     entityType: 'TRANSACTION',
                     entityId: reference,
                     reference,
                     reason: 'POST_DISPATCH_FAILURE_NO_REFUND',
                     details: { provider: 'MTN_MOMO', error: mtnErr.message, dispatched: true },
-                }).catch(() => null);
+                }, {
+                escalate: async () => {
+                    if (io) io.emit('admin_alert', {
+                        type: 'RECONCILIATION_EVIDENCE_WRITE_FAILED',
+                        timestamp: new Date().toISOString(),
+                    });
+                }
+            });
                 if (io) {
                     io.emit('admin_alert', {
                         type: 'WITHDRAWAL_POST_DISPATCH_FAILURE',
@@ -423,13 +437,20 @@ exports.fiatWithdrawal = async (req, res) => {
             if (!SAFE_TO_UNWIND) {
                 logger.error({ err: mtnErr, outcome: dispatchOutcome, reference },
                     '[fiatWithdrawal] dispatch outcome UNKNOWN — NOT refunding; payout may be in flight');
-                await recordReconciliationException(prisma, {
+                await recordReconciliationExceptionLoud(prisma, {
                     entityType: 'TRANSACTION',
                     entityId: reference,
                     reference,
                     reason: 'DISPATCH_OUTCOME_UNKNOWN_NO_REFUND',
                     details: { provider: 'MTN_MOMO', outcome: dispatchOutcome || 'UNCLASSIFIED', error: mtnErr.message },
-                }).catch(() => null);
+                }, {
+                escalate: async () => {
+                    if (io) io.emit('admin_alert', {
+                        type: 'RECONCILIATION_EVIDENCE_WRITE_FAILED',
+                        timestamp: new Date().toISOString(),
+                    });
+                }
+            });
                 if (io) {
                     io.emit('admin_alert', {
                         type: 'WITHDRAWAL_DISPATCH_OUTCOME_UNKNOWN',

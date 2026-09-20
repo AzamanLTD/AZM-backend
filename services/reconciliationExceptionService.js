@@ -9,6 +9,8 @@
 
 // §P.5-D liquidity-authority entities use their own prefixed types so
 // exception rows are distinguishable from withdrawal/transaction entities.
+const logger = require('../src/config/logger');
+
 const VALID_ENTITY_TYPES = new Set([
     'WITHDRAWAL', 'TRANSACTION', 'PROVIDER_ATTEMPT',
     'FIAT_LIQUIDITY_RESERVATION', 'FIAT_LIQUIDITY_RECEIPT',
@@ -48,4 +50,34 @@ const recordReconciliationException = async (prisma, {
     return rows[0] || null;
 };
 
-module.exports = { recordReconciliationException };
+// ── r15 R15-F: honest evidence writes ─────────────────────────────────────
+// The exception record is the durable breadcrumb for the recon team. The
+// historical call sites swallowed evidence-write failures with
+// .catch(() => null) INSIDE already-failing paths — when the write itself
+// failed, the financial anomaly it was flagging left NO durable record at
+// all. This wrapper NEVER throws (the user-facing response must still be
+// honest and calm), but it ALWAYS escalates the evidence failure loudly
+// and optionally through the caller's admin channel.
+const recordReconciliationExceptionLoud = async (prisma, args, { escalate = null } = {}) => {
+    try {
+        return await recordReconciliationException(prisma, args);
+    } catch (err) {
+        logger.error({
+            err,
+            entityType: args?.entityType ?? null,
+            entityId: args?.entityId ?? null,
+            reason: args?.reason ?? null,
+            marker: 'RECONCILIATION_EVIDENCE_WRITE_FAILED',
+        }, '[reconciliationException] CRITICAL: the evidence write itself failed — the anomaly being flagged has NO durable record');
+        if (typeof escalate === 'function') {
+            try {
+                await escalate(err);
+            } catch (_) {
+                // Escalation is best-effort; the error log above is the floor.
+            }
+        }
+        return null;
+    }
+};
+
+module.exports = { recordReconciliationException, recordReconciliationExceptionLoud };

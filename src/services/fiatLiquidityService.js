@@ -57,7 +57,7 @@
 const { Prisma } = require('@prisma/client');
 const crypto = require('crypto');
 const logger = require('../config/logger');
-const { recordReconciliationException } = require('../../services/reconciliationExceptionService');
+const { recordReconciliationExceptionLoud } = require('../../services/reconciliationExceptionService');
 
 const LIQUIDITY_INSUFFICIENT_CODE = 'FIAT_POOL_INSUFFICIENT';
 
@@ -1359,7 +1359,7 @@ async function quarantineContradictoryOutcome(tx, reservation, { outcome, provid
 
     // Exception infra is the operational queue (evidence, non-authoritative);
     // the reservation state above is the financial truth.
-    await recordReconciliationException(tx, {
+    await recordReconciliationExceptionLoud(tx, {
         entityType: 'FIAT_LIQUIDITY_RESERVATION',
         entityId: reservation.reference,
         reference: reservation.providerRef,
@@ -1372,13 +1372,13 @@ async function quarantineContradictoryOutcome(tx, reservation, { outcome, provid
             amountGhs: amount.toString(),
             heldMove,
         },
-    }).catch(() => null);
+    });
 
     if (heldMove === 'released_already_spent') {
         // Fungibility honesty: the returned funds were consumed by later
         // payouts before the contradiction arrived. This may be a REAL
         // over-spend of GHS cash — flag it separately and loudly.
-        await recordReconciliationException(tx, {
+        await recordReconciliationExceptionLoud(tx, {
             entityType: 'FIAT_LIQUIDITY_STATE',
             entityId: reservation.reference,
             reference: reservation.providerRef,
@@ -1388,7 +1388,7 @@ async function quarantineContradictoryOutcome(tx, reservation, { outcome, provid
                 amountGhs: amount.toString(),
                 contradictoryOutcome: outcome,
             },
-        }).catch(() => null);
+        });
     }
 
     return {
@@ -1550,14 +1550,12 @@ async function reconcile(prisma, { horizonMinutes = 60, dryRun = false } = {}) {
 
     if (!dryRun) {
         for (const ex of exceptions) {
-            await recordReconciliationException(prisma, {
+            await recordReconciliationExceptionLoud(prisma, {
                 entityType: ex.entityType,
                 entityId: ex.entityId,
                 reference: ex.reference,
                 reason: ex.reason,
                 details: ex.details,
-            }).catch((err) => {
-                logger.warn({ err: err.message, reason: ex.reason }, '[fiatLiquidity] exception record failed');
             });
         }
     }
