@@ -66,6 +66,13 @@ jobs:
       - name: Audit production dependencies
         run: npm audit --omit=dev --audit-level=low
 
+      - name: Prisma schema validation gate
+        # Explicit, named validation of prisma/schema.prisma — do not rely on
+        # `db push`/`generate` failing indirectly on a broken schema. A schema
+        # that does not validate must stop CI at its own gate with a clear
+        # name in the summary.
+        run: npx prisma validate
+
       - name: Apply database schema
         # CI uses a disposable PostgreSQL instance. Production remains managed
         # by the repository's established db-push release process.

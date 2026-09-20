@@ -23,8 +23,15 @@ cp .env.example .env
 # Generate Prisma client
 npx prisma generate
 
-# Run migrations
-npx prisma migrate deploy
+# Apply the schema (dev/test databases)
+npx prisma db push
+npm run release
+
+# NOTE — schema authority: disposable dev/test databases use `db push` + the
+# additive overlay installers above (exactly what CI runs). `prisma migrate
+# deploy` is NOT a deploy path anywhere in this project: production DDL is
+# owned exclusively by the `infra/install-*-overlay.js` installers, and the
+# historical `prisma/migrations` chain is development history only.
 
 # Start server
 npm start

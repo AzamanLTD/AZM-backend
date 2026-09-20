@@ -8,7 +8,6 @@
     "test:coverage": "jest --testEnvironment=node --coverage --runInBand --forceExit",
     "start": "node server.js",
     "build": "prisma generate",
-    "migrate:deploy": "prisma migrate deploy",
     "install:susu": "node infra/install-susu-overlay.js",
     "install:fiat-liquidity": "node infra/install-fiat-liquidity-overlay.js",
     "install:model-b-settlement": "node infra/install-model-b-settlement-overlay.js",

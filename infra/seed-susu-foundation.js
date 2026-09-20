@@ -17,8 +17,8 @@
  *   node infra/seed-susu-foundation.js
  *
  * Run automatically:
- *   - At local-dev migration time (call from package.json postmigrate)
- *   - On Render via release-phase command after `prisma migrate deploy`
+ *   - By `npm run release` (the overlay-installer release phase)
+ *   - At boot via `infra/autoRelease.js` when the treasury row is absent
  */
 
 const logger = require('../src/config/logger');
