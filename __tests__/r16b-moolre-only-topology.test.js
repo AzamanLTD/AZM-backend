@@ -302,9 +302,12 @@ describeOrSkip('r16b P0-A: fiat withdrawal network propagation (real PostgreSQL)
         expect(canonical).toBeTruthy();
 
         // The fiat-reservation ledger entry names the provider explicitly.
-        const ledgerEntry = await prisma.ledgerTransaction.findFirst({
-            where: { reference: canonical.txHash, metadata: { path: ['provider'] } },
+        // (JSON-path where-filters need a scalar filter in this Prisma
+        // version, so the metadata key is checked application-side.)
+        const ledgerEntries = await prisma.ledgerTransaction.findMany({
+            where: { reference: canonical.txHash },
         });
+        const ledgerEntry = ledgerEntries.find(e => e.metadata && e.metadata.provider);
         expect(ledgerEntry).toBeTruthy();
         expect(ledgerEntry.metadata.provider).toBe('MOOLRE_DISBURSEMENT');
         expect(ledgerEntry.metadata.provider).not.toBe('MTN_MOMO');

@@ -259,22 +259,19 @@ describeOrSkip('r16 P0-C: Admin rejection canonical-state safety', () => {
 
     test('6: admin rejection racing the payout worker claim has exactly one winner', async () => {
         const admin = await seedUser(prisma, { role: 'ADMIN' });
-        const user = await seedUser(prisma, { availableBalance: 200 });
-        const { withdrawal, reference } = await seedCanonicalWithdrawal(user, 50);
-
-        // The payoutBatchWorker's guarded claim, exactly as production
-        // writes it: updateMany PENDING -> PROCESSING, zero rows = lost.
-        const workerClaim = () => prisma.withdrawal.updateMany({
-            where: { id: withdrawal.id, status: 'PENDING' },
-            data: { status: 'PROCESSING' },
-        });
 
         // Run both concurrently, several rounds — the DB must serialize
-        // them into exactly one winner each round.
+        // them into exactly one winner each round. Every round uses a
+        // FRESH user so processFiatWithdrawal's pre-debit ledger audit
+        // (securityCheck.runDoubleCheck) sees a consistent settled
+        // balance; repeated debits on one user would legitimately freeze
+        // the second withdrawal.
         for (let round = 0; round < 5; round++) {
-            // Re-seed a fresh PENDING withdrawal for each round.
+            const user = await seedUser(prisma, { availableBalance: 200 });
             const fresh = await seedCanonicalWithdrawal(user, 50);
 
+            // The payoutBatchWorker's guarded claim, exactly as production
+            // writes it: updateMany PENDING -> PROCESSING, zero rows = lost.
             const [rejectRes, claimRes] = await Promise.all([
                 reject(admin, fresh.withdrawal.id),
                 prisma.withdrawal.updateMany({
@@ -299,7 +296,6 @@ describeOrSkip('r16 P0-C: Admin rejection canonical-state safety', () => {
                 expect(rejectRes.statusCode).toBe(409);
             }
         }
-        void reference;
     });
 
     test('7: terminal mirror statuses never refund', async () => {
