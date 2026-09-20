@@ -199,7 +199,7 @@ class VaultService {
      * concurrent operation rolls back without touching money.
      */
     async breakEarly({ userId, vaultId }) {
-        const { result } = await this.prisma.$transaction(async (tx) => {
+        const outcome = await this.prisma.$transaction(async (tx) => {
             // r16 P0-D: DB-authoritative terminal claim. SELECT ... FOR
             // UPDATE locks the row; every concurrent mutation of this vault
             // (deposit claim, competing break/complete) blocks behind it
@@ -286,7 +286,7 @@ class VaultService {
             await this.notificationService.sendNotification({
                 userId,
                 title: 'Vault Broken',
-                body: `You broke "${result.name}" early. Penalty: $${result.penalty.toFixed(2)}. $${result.refund.toFixed(2)} returned to your wallet.`,
+                body: `You broke "${outcome.name}" early. Penalty: $${outcome.penalty.toFixed(2)}. $${outcome.refund.toFixed(2)} returned to your wallet.`,
                 category: 'VAULT',
                 actionPayload: { action: 'VIEW_VAULT', vaultId, finalState: 'BROKEN_EARLY' },
             });
@@ -294,7 +294,7 @@ class VaultService {
 
         this._emitBalanceUpdate(userId);
         this._emitVaultEvent(userId, 'vault:update', vaultId);
-        return result.result[1]; // updated vault
+        return outcome.result[1]; // updated vault
     }
 
     /**

@@ -143,7 +143,7 @@ describeOrSkip('r16 P0-F: Order Book concurrency', () => {
 
         // A second taker MUST be able to fill the remaining quantity —
         // the old candidate filter (status OPEN only) stranded it.
-        const b2 = await seedUser(prisma, { availableBalance: 100, azmBalance: 0 });
+        const b2 = await seedUser(prisma, { availableBalance: 200, azmBalance: 0 });
         const res2 = await place(b2, { side: 'BUY', type: 'LIMIT', price: 2, quantity: 60 });
         expect(res2.statusCode).toBe(200);
 
@@ -159,11 +159,12 @@ describeOrSkip('r16 P0-F: Order Book concurrency', () => {
 
         const buyer = await seedUser(prisma, { availableBalance: 500, azmBalance: 0 });
         // Match and cancel race against the same resting row.
+        const cancelReq = mkReq(seller, {});
+        cancelReq.params = { id: orderId };
         const cancelRes = mkRes();
-        cancelRes.params = { id: orderId };
         const [, cancelOutcome] = await Promise.allSettled([
             place(buyer, { side: 'BUY', type: 'LIMIT', price: 2, quantity: 50 }),
-            controller.cancelOrder(mkReq(seller, {}), cancelRes),
+            controller.cancelOrder(cancelReq, cancelRes),
         ]);
 
         const trades = await prisma.orderBookTrade.findMany();
