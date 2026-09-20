@@ -581,6 +581,7 @@ enum SmartRouteFrequency {
 }
 
 enum SmartRouteRunStatus {
+  PENDING
   SUCCESS
   FAILED_INSUFFICIENT
   FAILED_GATEWAY
@@ -3667,6 +3668,11 @@ model VaultDeposit {
   attemptedAt   DateTime  @default(now())
   failureReason String?
 
+  // r16 P0-A: retry convergence for smart-route vault deposits — a crashed
+  // execution re-driven by the recovery sweep converges on the committed
+  // deposit instead of moving money twice.
+  idempotencyKey String? @unique
+
   vault Vault @relation(fields: [vaultId], references: [id], onDelete: Cascade)
   user  User  @relation(fields: [userId], references: [id], onDelete: Cascade)
 
@@ -4221,6 +4227,14 @@ model SmartRouteRun {
 
   withdrawalId  Int? // loose FK — no @relation to keep Withdrawal untouched
   failureReason String?
+
+  // r16 P0-A: durable economic execution identity. One unique key per due
+  // scheduled occurrence (`{routeId}:occ:{nextRunAt ISO}`) — the database
+  // decides the single winner between the scheduler, /run-now and any
+  // concurrent workers. Explicitly-manual runs (nothing due) use
+  // `{routeId}:manual:{uuid}`. PENDING rows older than the stale window had
+  // their financial transaction rolled back and are safe to re-drive.
+  executionKey String? @unique
 
   route SmartRoute @relation(fields: [routeId], references: [id], onDelete: Cascade)
   user  User       @relation("SmartRouteRunUser", fields: [userId], references: [id])
