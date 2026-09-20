@@ -152,13 +152,24 @@ describe('r15 follow-up P0: Moolre disbursement transfer-status contract (axios 
         expect(res.status).toBe('FAILED');
     });
 
-    test('application error envelope (status:0, unknown reference) → stays PENDING with the provider reason — worker retries next tick, never invents a terminal state', async () => {
+    test('application error envelope (status:0, "reference not found") → AUTHORITATIVE ABSENCE: NOT_FOUND (r15 follow-up P0) — the no-hint status search continues to the next rail instead of parking forever', async () => {
         axiosSpy.mockResolvedValueOnce({
             data: { status: 0, code: 'RD01', message: 'Reference not found', data: null },
         });
         const res = await service.getTransferStatus('R15G-REF-UNKNOWN');
-        expect(res.status).toBe('PENDING');
+        expect(res.status).toBe('NOT_FOUND');
         expect(res.reason).toContain('Reference not found');
+        expect(res.provider).toBe('MOOLRE_DISBURSEMENT');
+    });
+
+    test('application error envelope (status:0, non-not-found failure) → UNRESOLVED throw (r15 follow-up P0) — never masquerades as a valid PENDING transaction', async () => {
+        axiosSpy.mockResolvedValueOnce({
+            data: { status: 0, code: 'AUTH01', message: 'Authentication failed', data: null },
+        });
+        const err = await service.getTransferStatus('R15G-REF-AUTH').catch(e => e);
+        expect(err).toBeInstanceOf(Error);
+        expect(err.providerOutcome).toBe(PROVIDER_OUTCOMES.UNKNOWN_OUTCOME);
+        expect(err.statusUnresolved).toBe(true);
     });
 
     test('timeout on status lookup → UNKNOWN_OUTCOME thrown (unresolved — payout stays parked, never terminal)', async () => {

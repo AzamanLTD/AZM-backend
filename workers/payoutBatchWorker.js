@@ -46,6 +46,7 @@
 const { Prisma } = require('@prisma/client');
 const logger = require('../src/config/logger');
 const fiatLiquidity = require('../src/services/fiatLiquidityService'); // §P.5-D
+const { canonicalProviderName, persistPayoutOwnership } = require('../services/payoutProviderOwnership');
 
 const DEFAULT_INTERVAL_MS = 120_000;  // 2 minutes
 const MAX_BATCH_SIZE      = 25;       // Don't overwhelm the provider in one tick
@@ -400,17 +401,34 @@ class PayoutBatchWorker {
                 // — a refund would double-spend). The withdrawal is flagged for
                 // manual review with the failure retained as an exception row;
                 // the reservation stays RESERVED (funds held, not spendable).
+                // r15 follow-up (audit P0): the ACTUAL provider that accepted
+                // this payout (dispatchResult._provider — the PaymentFailover
+                // tag, e.g. 'mtn' after a moolre → mtn failover) is persisted
+                // durably into the canonical TransactionHistory metadata
+                // (payoutProvider) so the reconciliation worker queries the
+                // OWNER rail only, and the evidence records name the real
+                // provider, never a hardcoded rail.
+                const actualProviderTag = dispatchResult?._provider || null;
+                const actualProviderName = canonicalProviderName(actualProviderTag) || 'MTN_MOMO';
                 try {
+                    if (actualProviderTag) {
+                        await persistPayoutOwnership(this.prisma, {
+                            reference: referenceId,
+                            failoverTag: actualProviderTag,
+                            intendedProvider: 'MOOLRE_DISBURSEMENT',
+                            providerRef: dispatchResult?.data?.reference || dispatchResult?.providerRef || null,
+                        });
+                    }
                     await fiatLiquidity.recordProviderEvent(this.prisma, {
-                        provider: 'MTN_MOMO',
+                        provider: actualProviderName,
                         rail: 'MOMO',
                         direction: 'OUTBOUND',
                         status: String(dispatchResult?.status || 'DISPATCH_ACCEPTED'),
                         providerRef: dispatchResult?.data?.reference || dispatchResult?.providerRef || null,
-                        dedupKey: `event:payout-dispatch:MTN_MOMO:${referenceId}`,
+                        dedupKey: `event:payout-dispatch:${actualProviderName}:${referenceId}`,
                         amountGhs,
                         relatedReference: referenceId,
-                        raw: { externalId: `auto_payout_${withdrawal.id}`, recipientPhone, network: withdrawal.network || 'MTN' },
+                        raw: { externalId: `auto_payout_${withdrawal.id}`, recipientPhone, network: withdrawal.network || 'MTN', actualProvider: actualProviderTag },
                     });
                     await fiatLiquidity.inTransitIfRecorded(this.prisma, {
                         reference: referenceId,
@@ -444,7 +462,9 @@ class PayoutBatchWorker {
                     amountGhs,
                     referenceId,
                     network: withdrawal.network || 'MTN',
-                    mtnStatus: dispatchResult.status
+                    mtnStatus: dispatchResult.status,
+                    provider: actualProviderName,
+                    providerFailoverTag: actualProviderTag
                 });
 
                 logger.info(`[PayoutBatchWorker] dispatched withdrawal #${withdrawal.id}: $${amount} → GHS ${amountGhs} (network: ${withdrawal.network || 'MTN'}, ref: ${referenceId})`);

@@ -12,6 +12,7 @@
 const logger = require('../src/config/logger');
 const financeService = require('../services/finance.service');
 const { recordProviderSettlementAttempt } = require('../services/providerSettlementAttemptService');
+const { readPayoutOwner } = require('../services/payoutProviderOwnership');
 const fiatLiquidity = require('../src/services/fiatLiquidityService'); // §P.5-D
 const { recordReconciliationException } = require('../services/reconciliationExceptionService');
 
@@ -188,14 +189,27 @@ class WithdrawalReconciliationWorker {
         }
 
         const reference = txRow.txHash;
+
+        // r15 follow-up (audit P0): the canonical row carries the ACTUAL
+        // provider that accepted this dispatch (metadata.payoutProvider,
+        // written at dispatch acceptance). A known owner is authoritative for
+        // this payout: the status query goes to the OWNER ONLY — the
+        // PaymentFailoverService honors the hint and never falls through to
+        // another rail (a healthy secondary cannot know what the owner did,
+        // so its answer may never settle or reverse this provider's payout).
+        // Legacy rows without persisted ownership (owner === null) keep the
+        // no-hint cross-provider status search, which is correct for
+        // genuinely-unknown ownership.
+        const payoutOwner = readPayoutOwner(txRow);
+
         let statusResp;
         try {
-            statusResp = await this.mtn.getTransferStatus(reference);
+            statusResp = await this.mtn.getTransferStatus(reference, payoutOwner?.tag);
         } catch (err) {
             await this._recordException(
                 withdrawal,
                 'PROVIDER_STATUS_UNAVAILABLE',
-                { provider: 'DISBURSEMENT', error: err.message },
+                { provider: payoutOwner?.canonicalName || 'DISBURSEMENT', error: err.message },
                 reference
             );
             logger.warn(`[WithdrawalReconciliation] provider status query failed for ${reference}: ${err.message}`);
@@ -204,6 +218,12 @@ class WithdrawalReconciliationWorker {
 
         const remoteStatus = String((statusResp && statusResp.status) || 'PENDING').toUpperCase();
         const providerRef = statusResp?.providerRef || statusResp?.referenceId || statusResp?.transactionId || statusResp?.txId || null;
+
+        // The provider identity carried into durable evidence: the status
+        // answer's own provider field first, then the persisted owner
+        // identity, then the legacy poll default. This is the ACTUAL
+        // provider for this payout — never a hardcoded rail name.
+        const evidenceProvider = statusResp?.provider || payoutOwner?.canonicalName || 'DISBURSEMENT_POLL';
 
         // §P.5-D OUTBOUND EVIDENCE: the provider's own status answer is a raw
         // provider observation — retained durably like every other, including
@@ -214,12 +234,12 @@ class WithdrawalReconciliationWorker {
         // made this tick; the exception is recorded and the next poll retries.
         try {
             await fiatLiquidity.recordProviderEvent(this.prisma, {
-                provider: statusResp?.provider || 'DISBURSEMENT_POLL',
+                provider: evidenceProvider,
                 rail: 'MOMO',
                 direction: 'OUTBOUND',
                 status: remoteStatus,
                 providerRef,
-                dedupKey: `event:payout-outbound:${statusResp?.provider || 'DISBURSEMENT_POLL'}:${reference}:${remoteStatus}`,
+                dedupKey: `event:payout-outbound:${evidenceProvider}:${reference}:${remoteStatus}`,
                 relatedReference: reference,
                 raw: { source: 'provider_status_poll', reason: statusResp?.reason || null },
             });
@@ -229,15 +249,40 @@ class WithdrawalReconciliationWorker {
             await this._recordException(
                 withdrawal,
                 'OUTBOUND_EVIDENCE_PERSISTENCE_FAILED',
-                { provider: statusResp?.provider || 'DISBURSEMENT_POLL', observedStatus: remoteStatus, error: evidenceErr.message },
+                { provider: evidenceProvider, observedStatus: remoteStatus, error: evidenceErr.message },
                 reference
             );
             return;
         }
 
+        // r15 follow-up (audit P0): an authoritative ABSENCE is not a
+        // settlement attempt — the provider never saw this reference on its
+        // rail. The observation above IS the durable evidence; record the
+        // ownership/presence conflict for an operator and park. With a known
+        // owner this answer contradicts the dispatch acceptance evidence;
+        // with unknown ownership every configured rail answered absence, so
+        // the dispatch evidence itself is contradicted. NEVER resolve it by
+        // inventing a terminal state.
+        if (remoteStatus === 'NOT_FOUND') {
+            await this._recordException(
+                withdrawal,
+                'PROVIDER_REFERENCE_NOT_FOUND',
+                {
+                    provider: evidenceProvider,
+                    owner: payoutOwner?.tag || null,
+                    ownerCanonicalName: payoutOwner?.canonicalName || null,
+                    observedStatus: remoteStatus,
+                    response: statusResp,
+                },
+                reference
+            );
+            logger.warn(`[WithdrawalReconciliation] ref=${reference} provider ${evidenceProvider} authoritatively reports the reference ABSENT — parked for operator review.`);
+            return;
+        }
+
         await recordProviderSettlementAttempt(this.prisma, {
             reference,
-            provider: statusResp?.provider || 'DISBURSEMENT',
+            provider: statusResp?.provider || payoutOwner?.canonicalName || 'DISBURSEMENT',
             providerReference: reference,
             providerTransactionId: providerRef,
             status: ['SUCCESSFUL', 'COMPLETED'].includes(remoteStatus)
@@ -249,6 +294,28 @@ class WithdrawalReconciliationWorker {
         });
 
         if (remoteStatus === 'PENDING' || remoteStatus === 'PROCESSING') return;
+
+        // r15 follow-up (audit P0): UNRESOLVED is an honest "cannot answer"
+        // (transport failure or application-level uncertainty on a known
+        // owner's rail, or every rail ambiguous with unknown ownership). The
+        // payout stays parked with durable evidence — it is never a state to
+        // settle or reverse on.
+        if (remoteStatus === 'UNKNOWN') {
+            await this._recordException(
+                withdrawal,
+                'PROVIDER_STATUS_UNRESOLVED',
+                {
+                    provider: evidenceProvider,
+                    owner: payoutOwner?.tag || null,
+                    ownerCanonicalName: payoutOwner?.canonicalName || null,
+                    unresolvedReason: statusResp?.unresolvedReason || null,
+                    response: statusResp,
+                },
+                reference
+            );
+            logger.warn(`[WithdrawalReconciliation] ref=${reference} status UNRESOLVED (owner=${payoutOwner?.tag || 'unknown'}) — parked with durable evidence.`);
+            return;
+        }
 
         if (remoteStatus === 'SUCCESSFUL' || remoteStatus === 'COMPLETED') {
             // Provider success must cross the canonical finance settlement
@@ -414,7 +481,7 @@ class WithdrawalReconciliationWorker {
         await this._recordException(
             withdrawal,
             'UNEXPECTED_PROVIDER_STATUS',
-            { provider: statusResp?.provider || 'DISBURSEMENT', status: remoteStatus, response: statusResp },
+            { provider: evidenceProvider, status: remoteStatus, response: statusResp },
             reference
         );
         logger.warn(`[WithdrawalReconciliation] ref=${reference} unexpected provider status: ${remoteStatus}.`);

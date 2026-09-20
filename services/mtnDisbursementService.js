@@ -371,6 +371,24 @@ class MtnDisbursementService {
             };
         } catch (err) {
             const apiMsg = err.response?.data?.message || err.message;
+            // r15 follow-up (audit P0): MTN answers an unknown referenceId with
+            // 404 / RESOURCE_NOT_FOUND. That is an AUTHORITATIVE ABSENCE on
+            // THIS rail — not an unresolved error — so a no-hint status search
+            // can continue to the next provider and a KNOWN owner surfaces as
+            // an ownership conflict instead of an unresolvable "rail down".
+            const httpStatus = err.response?.status;
+            const apiCode = err.response?.data?.code || err.code;
+            if (httpStatus === 404 || /RESOURCE_NOT_FOUND|NOT_FOUND|NOTFOUND/i.test(String(apiCode || ''))) {
+                return {
+                    provider:    PROVIDER_NAME,
+                    referenceId,
+                    externalId:  null,
+                    status:      'NOT_FOUND',
+                    amountGhs:   null,
+                    reason:      apiMsg || 'RESOURCE_NOT_FOUND',
+                    source:      'LIVE'
+                };
+            }
             throw new Error(`[MtnDisbursementService] MTN status lookup failed: ${apiMsg}`);
         }
     }

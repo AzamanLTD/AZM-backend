@@ -21,6 +21,7 @@ const restrictedObligations = require('../services/restrictedObligationService')
 const financeService          = require('../services/finance.service');
 const { runDoubleCheck }      = require('../utils/securityCheck');
 const fiatLiquidity           = require('../src/services/fiatLiquidityService'); // §P.5-D
+const { canonicalProviderName, persistPayoutOwnership } = require('../services/payoutProviderOwnership');
 const { recordReconciliationExceptionLoud } = require('../services/reconciliationExceptionService');
 const axios                   = require('axios');
 const { randomUUID }          = require('crypto');
@@ -159,9 +160,15 @@ exports.fiatWithdrawal = async (req, res) => {
                         tx, userId, feeDiscountTierId, reference
                     )
                     : null,
-                // §P.5-D: provider/rail/destination identity for the GHS
-                // liquidity reservation (no-ops while the authority flag is OFF).
-                liquidityRoute: { provider: 'MTN_MOMO', rail: 'MOMO', destination: phone }
+                // §P.5-D: INTENDED route identity for the GHS liquidity
+                // reservation (no-ops while the authority flag is OFF). The
+                // intent is the primary rail of the disbursement failover
+                // chain (Moolre primary since r15); the ACTUAL accepting
+                // provider is recorded separately, post-dispatch, in the
+                // canonical TransactionHistory metadata (payoutProvider) and
+                // the dispatch evidence — the two identities must never be
+                // conflated (r15 follow-up, audit P0).
+                liquidityRoute: { provider: 'MOOLRE_DISBURSEMENT', rail: 'MOMO', destination: phone }
             }
         );
 
@@ -276,23 +283,44 @@ exports.fiatWithdrawal = async (req, res) => {
 
         // §P.5-D POST-DISPATCH BOOKKEEPING: the provider HAS the payout — cash
         // is moving. Durable outbound evidence + the RESERVED → IN_TRANSIT
-        // claim must both succeed, but if they fail the payout can NOT be
-        // recalled by the catch below (auto-refunding a dispatched payout
-        // double-spends: the provider still pays it out). Fail loudly instead:
-        // exception row + alert, reservation stays RESERVED (held, not
-        // spendable), and the settlement webhook/recon worker still settles
-        // the canonical TransactionHistory row.
+        // claim + the ACTUAL provider ownership write must all succeed, but if
+        // they fail the payout can NOT be recalled by the catch below
+        // (auto-refunding a dispatched payout double-spends: the provider
+        // still pays it out). Fail loudly instead: exception row + alert,
+        // reservation stays RESERVED (held, not spendable), and the
+        // settlement webhook/recon worker still settles the canonical
+        // TransactionHistory row.
+        //
+        // r15 follow-up (audit P0): the dispatch result carries the ACTUAL
+        // provider that accepted the payout (dispatch._provider — the
+        // PaymentFailoverService tag, e.g. 'moolre' or 'mtn' after a
+        // failover). That identity is now BOTH durable (canonical
+        // TransactionHistory.metadata.payoutProvider — reconciliation reads
+        // it to query the owner rail ONLY) and used in the evidence records
+        // (the observation names the provider that really holds the payout,
+        // never a hardcoded rail). Direct (non-failover) adapters without a
+        // _provider tag keep their historical evidence identity.
+        const actualProviderTag = dispatch?._provider || null;
+        const actualProviderName = canonicalProviderName(actualProviderTag) || 'MTN_MOMO';
         try {
+            if (actualProviderTag) {
+                await persistPayoutOwnership(prisma, {
+                    reference,
+                    failoverTag: actualProviderTag,
+                    intendedProvider: 'MOOLRE_DISBURSEMENT',
+                    providerRef: dispatch?.data?.reference || dispatch?.providerRef || null,
+                });
+            }
             await fiatLiquidity.recordProviderEvent(prisma, {
-                provider: 'MTN_MOMO',
+                provider: actualProviderName,
                 rail: 'MOMO',
                 direction: 'OUTBOUND',
                 status: String(dispatch?.status || 'DISPATCH_ACCEPTED'),
                 providerRef: dispatch?.data?.reference || dispatch?.providerRef || null,
-                dedupKey: `event:payout-dispatch:MTN_MOMO:${reference}`,
+                dedupKey: `event:payout-dispatch:${actualProviderName}:${reference}`,
                 amountGhs: data.payoutGhs || data.withdrawalAmount || null,
                 relatedReference: reference,
-                raw: { externalId: reference, recipientPhone: phone },
+                raw: { externalId: reference, recipientPhone: phone, actualProvider: actualProviderTag },
             });
             await fiatLiquidity.inTransitIfRecorded(prisma, {
                 reference,
@@ -306,7 +334,7 @@ exports.fiatWithdrawal = async (req, res) => {
                 entityId: reference,
                 reference,
                 reason: 'POST_DISPATCH_BOOKKEEPING_FAILED',
-                details: { provider: 'MTN_MOMO', error: bookkeepingErr.message },
+                details: { provider: actualProviderName, error: bookkeepingErr.message },
             }, {
                 escalate: async () => {
                     if (io) io.emit('admin_alert', {
@@ -373,7 +401,7 @@ exports.fiatWithdrawal = async (req, res) => {
 
             return res.status(200).json({
                 success: true,
-                message: `Withdrawal dispatched to MTN MoMo. Reference: ${reference}`,
+                message: `Withdrawal dispatched to ${actualProviderName === 'MOOLRE_DISBURSEMENT' ? 'Moolre' : 'MTN MoMo'}. Reference: ${reference}`,
                 // Top-level `reference` so the Flutter WithdrawalProgressSheet can
                 // open immediately and subscribe to withdrawal_progress / poll
                 // GET /api/withdraw/status/:reference without parsing the message.

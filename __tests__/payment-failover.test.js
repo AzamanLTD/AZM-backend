@@ -559,13 +559,21 @@ describe('PaymentFailoverService', () => {
         expect(secondary._calls).toHaveLength(1);
     });
 
-    test('getTransferStatus polls all providers when hint fails', async () => {
+    test('r15 ownership contract: a KNOWN owner that fails answers UNRESOLVED — never cross-rail fallthrough', async () => {
+        // The owner is authoritative for this payout. A healthy secondary
+        // cannot know what the owner did, so its answer may never settle or
+        // reverse the owner's payout. (The old behavior — hint fails → poll
+        // the secondary — is exactly the audit-P0 mis-settlement guard.)
         const primary = makeMockProvider('moolre', { fail: true });
         const secondary = makeMockProvider('mtn');
         const svc = new PaymentFailoverService({ primary, secondary });
 
-        await svc.getTransferStatus('ref-456', 'moolre');
-        expect(secondary._calls).toHaveLength(1);
+        const resp = await svc.getTransferStatus('ref-456', 'moolre');
+        expect(resp.status).toBe('UNKNOWN');
+        expect(resp.unresolved).toBe(true);
+        expect(resp.unresolvedReason).toBe('PROVIDER_STATUS_ERROR');
+        expect(primary._calls).toHaveLength(1);
+        expect(secondary._calls).toHaveLength(0);
     });
 
     test('getHealthStatus returns health for all providers', async () => {

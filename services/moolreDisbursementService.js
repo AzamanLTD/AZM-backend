@@ -374,19 +374,52 @@ class MoolreDisbursementService {
                 body,
                 { headers: this._authHeaders(), timeout: 10000 }
             );
-            const { ok, data, message } = this._unwrap(envelope);
+            const { ok, data, message, code } = this._unwrap(envelope);
             if (!ok) {
-                // Treat an unknown reference as PENDING rather than throwing, so
-                // the reconciliation worker simply retries on the next tick.
-                return {
-                    provider:    PROVIDER_NAME,
-                    referenceId,
-                    externalId:  null,
-                    status:      'PENDING',
-                    amountGhs:   null,
-                    reason:      message || null,
-                    source:      'LIVE'
-                };
+                // r15 follow-up (audit P0): the status answer must distinguish
+                // three DIFFERENT states that the old contract collapsed into
+                // one PENDING:
+                //
+                //   1. AUTHORITATIVE ABSENCE — Moolre explicitly answers that
+                //      the external reference does not exist on its rail.
+                //      Return NOT_FOUND so a no-hint status search continues
+                //      to the next provider, and a KNOWN owner is surfaced as
+                //      an ownership conflict instead of a fake "still
+                //      pending" that can never resolve.
+                //
+                //   2. GENUINE ANSWER — only a txstatus=0 INSIDE an ok
+                //      envelope (handled below) is a valid PENDING.
+                //
+                //   3. UNRESOLVED — every other application-level failure
+                //      (auth/config/limits/malformed body) can prove NEITHER a
+                //      transaction state NOR absence. Masquerading those as
+                //      PENDING made reconciliation trust a rail that never
+                //      saw the payout: with Moolre primary and MTN secondary,
+                //      Moolre's "reference not found" → PENDING meant MTN was
+                //      NEVER asked, and a genuinely-dispatched MTN payout
+                //      stayed unresolved indefinitely. Such failures now
+                //      throw a classified STATUS_UNRESOLVED error so callers
+                //      keep the payout parked with durable evidence.
+                if (this._isReferenceNotFoundAnswer(message, code)) {
+                    return {
+                        provider:    PROVIDER_NAME,
+                        referenceId,
+                        externalId:  null,
+                        status:      'NOT_FOUND',
+                        amountGhs:   null,
+                        reason:      message || null,
+                        code:        code || null,
+                        source:      'LIVE'
+                    };
+                }
+                const unresolved = this._outcomeError(
+                    `Moolre status lookup could not resolve ${referenceId}: ${message || code || 'application-level failure'}`,
+                    PROVIDER_OUTCOMES.UNKNOWN_OUTCOME,
+                    { stage: 'STATUS', code: code || null, referenceId }
+                );
+                unresolved.statusUnresolved = true;
+                unresolved.message = `[MoolreDisbursementService] ${unresolved.message}`;
+                throw unresolved;
             }
             const rawStatus = (data && data.txstatus !== undefined && data.txstatus !== null)
                 ? data.txstatus
@@ -403,10 +436,24 @@ class MoolreDisbursementService {
         } catch (err) {
             // r15 R15-C: a status-lookup failure is UNRESOLVED, never a
             // provider failure — callers must keep the payout pending.
+            if (err.statusUnresolved) throw err; // already classified above
             const outcomeErr = this._classifyTransportError(err, { referenceId, stage: 'STATUS' });
             outcomeErr.message = `[MoolreDisbursementService] Moolre status lookup failed: ${this._extractError(err)}`;
             throw outcomeErr;
         }
+    }
+
+    /**
+     * r15 follow-up (audit P0): does this application-level failure envelope
+     * explicitly answer "this reference does not exist on this rail"?
+     * Moolre does not pin a single machine-readable not-found code across
+     * environments, so the classification is deliberately conservative: it
+     * matches only unambiguous not-found wording in the envelope message or
+     * code. Everything else stays UNRESOLVED (never a fake PENDING).
+     */
+    _isReferenceNotFoundAnswer(message, code) {
+        const haystack = `${message || ''} ${code || ''}`.toLowerCase();
+        return /not\s*found|no\s+(matching\s+)?(transaction|record|reference|external\s*ref)|unknown\s+(external\s*)?ref(erence)?|invalid\s+(external\s*)?ref(erence)?/.test(haystack);
     }
 
     /**

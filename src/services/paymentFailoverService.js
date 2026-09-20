@@ -229,7 +229,27 @@ class PaymentFailoverService {
         })();
 
         try {
-            await provider.instance.getTransferStatus(probeReference);
+            const answer = await provider.instance.getTransferStatus(probeReference);
+            // r15 follow-up (audit P1): a non-throwing response is only proof
+            // of a LIVE rail if it is an AUTHORITATIVE status answer. A rail
+            // that answers UNKNOWN/malformed for a synthetic reference proves
+            // its status contract is broken — re-admitting it on that answer
+            // would route customer payouts to a provider whose settlements we
+            // cannot query. NOT_FOUND (and any concrete status) IS
+            // authoritative: it proves the rail looked the reference up.
+            const answerStatus = answer ? String(answer.status || '').toUpperCase() : '';
+            if (!answerStatus || answerStatus === 'UNKNOWN') {
+                await this._recordFailure(provider.name, {
+                    message: `recovery probe returned non-authoritative status: ${answerStatus || 'EMPTY'}`,
+                    code: 'PROBE_NON_AUTHORITATIVE',
+                });
+                logger.info({
+                    provider: provider.name,
+                    probeReference,
+                    answerStatus: answerStatus || 'EMPTY',
+                }, '[PaymentFailover] Recovery probe answered non-authoritatively — provider stays unhealthy (skipped)');
+                return false;
+            }
             await this._recordSuccess(provider.name);
             logger.info({
                 provider: provider.name,
@@ -376,38 +396,97 @@ class PaymentFailoverService {
     }
 
     /**
-     * Get transfer status — tries the provider that handled the reference first.
-     * Falls back to polling all providers if the tag is missing.
+     * Get transfer status — the ownership contract (r15 follow-up, audit P0).
+     *
+     * KNOWN OWNER (providerHint, from the persisted actual-provider
+     * metadata written at dispatch acceptance):
+     *   The owner is AUTHORITATIVE for this payout. Query ONLY the owner:
+     *   - a concrete answer (PENDING/SUCCESSFUL/FAILED/...) is returned with
+     *     the owner's identity, including NOT_FOUND — an authoritative
+     *     absence that the caller records as an ownership conflict, never
+     *     resolves by asking another rail;
+     *   - a transport failure or an application-level unresolved answer is
+     *     UNRESOLVED ({ status: 'UNKNOWN', unresolved: true }) — the payout
+     *     stays parked. The owner rail being down is NEVER permission to
+     *     let ANOTHER provider's answer settle or reverse this provider's
+     *     payout (a healthy secondary cannot know what the owner did).
+     *
+     * UNKNOWN OWNER (no hint — legacy rows without persisted ownership):
+     *   Poll providers in priority order. A concrete answer is
+     *   authoritative and returns immediately; NOT_FOUND (authoritative
+     *   absence on one rail) CONTINUES the search — the dispatch may have
+     *   landed on any rail. An unresolved/UNKNOWN answer or an error on one
+     *   rail also continues (ownership is genuinely unknown, so other rails
+     *   remain legitimate candidates). If EVERY polled rail authoritatively
+     *   answers absence, the aggregate is NOT_FOUND; otherwise UNKNOWN.
      */
     async getTransferStatus(referenceId, providerHint) {
-        // If we know which provider handled it, check that one first
         if (providerHint) {
             const provider = this.providers.find(p => p.name === providerHint);
             if (provider) {
                 try {
-                    return await provider.instance.getTransferStatus(referenceId);
+                    const status = await provider.instance.getTransferStatus(referenceId);
+                    const answerStatus = status ? String(status.status || '').toUpperCase() : '';
+                    if (!answerStatus || answerStatus === 'UNKNOWN') {
+                        return {
+                            status: 'UNKNOWN',
+                            referenceId,
+                            _provider: provider.name,
+                            unresolved: true,
+                            unresolvedReason: 'PROVIDER_RETURNED_UNKNOWN',
+                        };
+                    }
+                    return { ...status, _provider: provider.name };
                 } catch (err) {
-                    logger.warn({
-                        provider: provider.name,
+                    return {
+                        status: 'UNKNOWN',
                         referenceId,
-                        error: err.message
-                    }, '[PaymentFailover] Status check failed on hint provider, polling all');
+                        _provider: provider.name,
+                        unresolved: true,
+                        unresolvedReason: 'PROVIDER_STATUS_ERROR',
+                        error: err.message,
+                    };
                 }
             }
+            // A hint that maps to no configured provider is still a recorded
+            // owner: NEVER fall through to cross-provider polling (the owner
+            // identity came from this reference's dispatch evidence).
+            return {
+                status: 'UNKNOWN',
+                referenceId,
+                _provider: providerHint,
+                unresolved: true,
+                unresolvedReason: 'UNKNOWN_PROVIDER_HINT',
+            };
         }
 
-        // Poll all providers
+        // No hint: genuinely-unknown ownership — poll in priority order.
+        let authoritativeAbsenceCount = 0;
         for (const provider of this.providers) {
             try {
                 const status = await provider.instance.getTransferStatus(referenceId);
-                if (status && status.status !== 'NOT_FOUND') {
-                    return { ...status, _provider: provider.name };
+                if (!status) continue;
+                const answerStatus = String(status.status || '').toUpperCase();
+                if (answerStatus === 'NOT_FOUND') {
+                    authoritativeAbsenceCount += 1;
+                    continue; // absent on THIS rail — the dispatch may have landed on another
                 }
+                if (!answerStatus || answerStatus === 'UNKNOWN') {
+                    continue; // unresolved on this rail — not absence, keep searching
+                }
+                return { ...status, _provider: provider.name };
             } catch {
                 continue;
             }
         }
-
+        if (this.providers.length > 0 && authoritativeAbsenceCount === this.providers.length) {
+            // Every configured rail authoritatively answers absence.
+            return {
+                status: 'NOT_FOUND',
+                referenceId,
+                allProvidersPolled: true,
+            };
+        }
         return { status: 'UNKNOWN', referenceId };
     }
 
