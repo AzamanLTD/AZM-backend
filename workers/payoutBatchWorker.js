@@ -201,6 +201,13 @@ class PayoutBatchWorker {
         const txRows = await this._excludeBridgeLinked(txRowsRaw);
 
         if (txRows.length !== 1 || !txRows[0]?.txHash) {
+            // r24-CI: candidates EXISTED but every one is durably owned by
+            // another withdrawal via the bridge — the same outcome as losing
+            // the claim race. Surface it as a lost claim (deterministic,
+            // honest) instead of the misleading MISSING_TRANSACTION_REFERENCE.
+            if (txRows.length === 0 && txRowsRaw.length > 0) {
+                return { row: null, ambiguous: false, claimLost: true };
+            }
             return { row: null, ambiguous: txRows.length > 1 };
         }
 
@@ -220,7 +227,7 @@ class PayoutBatchWorker {
                 owner: claim.owner,
                 reason: claim.reason,
             }, '[PayoutBatchWorker] orphan canonical claim lost — refusing canonical adoption');
-            return { row: null, ambiguous: true };
+            return { row: null, ambiguous: true, claimLost: true };
         }
 
         return { row: candidate, ambiguous: false };
@@ -325,9 +332,11 @@ class PayoutBatchWorker {
 
             const canonical = await this._findCanonicalTransaction(withdrawal);
             if (!canonical.row) {
-                const reason = canonical.ambiguous
-                    ? 'AMBIGUOUS_TRANSACTION_REFERENCE'
-                    : 'MISSING_TRANSACTION_REFERENCE';
+                const reason = canonical.claimLost
+                    ? 'ORPHAN_ADOPTION_CLAIM_LOST'
+                    : canonical.ambiguous
+                        ? 'AMBIGUOUS_TRANSACTION_REFERENCE'
+                        : 'MISSING_TRANSACTION_REFERENCE';
                 await this._flagForManualReview(withdrawal, reason, {
                     amount,
                     message: 'Auto-payout refused because the canonical pending withdrawal transaction could not be identified uniquely.'

@@ -760,14 +760,36 @@ async function recordReceipt(tx, {
             ${evidence == null ? null : JSON.stringify(evidence)}::jsonb,
             CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
         )
-        ON CONFLICT ("dedupKey") DO NOTHING`;
+        ON CONFLICT DO NOTHING`;
 
     if (claimed === 0) {
         // The winner committed this identity concurrently. Validate the FULL
         // identity against the authoritative row and converge — replay, ZERO
         // increment, ZERO projection write (§A).
+        //
+        // r24-CI: ON CONFLICT DO NOTHING (no named arbiter) suppresses ALL
+        // unique violations — including the R15-A partial unique index
+        // ("at most one AVAILABLE receipt per settled deposit"). A bare
+        // ON CONFLICT ("dedupKey") left that second arbiter live: depending
+        // on which index the database checks first, an identical-race loser
+        // could abort with a raw 23505 on relatedTransactionId instead of
+        // converging (environment-dependent flake, seen in CI).
         const winner = await tx.fiatLiquidityReceipt.findUnique({ where: { dedupKey } });
-        if (!winner) throw new Error('[fiatLiquidity] receipt identity lost after race');
+        if (!winner) {
+            // Not a same-identity race: the suppressed conflict was the
+            // deposit-level AVAILABLE uniqueness — this deposit is already
+            // settled under a DIFFERENT receipt identity. That is a genuine
+            // evidence conflict (never a silent success and never a
+            // confusing internal error): refuse and let the caller surface
+            // it for reconciliation.
+            const settledBy = relatedTransactionId == null ? null : await tx.fiatLiquidityReceipt.findFirst({
+                where: { relatedTransactionId: String(relatedTransactionId), status: 'AVAILABLE' },
+            });
+            throw new ConflictingEvidenceError(
+                `[fiatLiquidity] receipt identity ${dedupKey} conflicts with an already-settled deposit ${relatedTransactionId}${settledBy ? ` (AVAILABLE receipt ${settledBy.dedupKey})` : ''} — at most one AVAILABLE receipt may exist per deposit`,
+                { committedDedupKey: dedupKey, conflictingAvailableReceipt: settledBy?.dedupKey ?? null, differingFields: ['relatedTransactionId'] }
+            );
+        }
         assertReceiptIdentity(winner, requested);
         const receipt = await enrichReceiptProviderRef(tx, winner, providerRef);
         return { receipt, replay: true, raced: true };
