@@ -139,10 +139,15 @@ describeOrSkip('r15 R15-D: withdrawal dispatch outcome honesty (real PostgreSQL)
         const u = await freshUser(user.id);
         expect(Number(u.availableBalance)).toBeCloseTo(START_USDC - WITHDRAWAL - 1.0, 6); // debit + 2% exit fee held, NOT refunded
 
-        // The withdrawal mirror row is NOT marked FAILED.
+        // The withdrawal mirror row is NOT marked FAILED. r16c: the
+        // dispatch claim moved it to DISPATCHING before provider I/O —
+        // the honest state for an attempted-but-unresolved payout. A
+        // PENDING mirror here would mean the claim never happened (the
+        // race r16c closes); it stays protected from admin rejection and
+        // worker claims until reconciliation resolves it.
         const mirror = await prisma.withdrawal.findFirst({ where: { userId: user.id } });
         expect(mirror).not.toBeNull();
-        expect(mirror.status).toBe('PENDING');
+        expect(mirror.status).toBe('DISPATCHING');
 
         // Durable exception evidence for the recon team.
         // ReconciliationException has no Prisma model (raw-SQL service).

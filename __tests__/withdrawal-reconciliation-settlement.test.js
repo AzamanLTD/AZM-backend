@@ -105,7 +105,7 @@ describe('WithdrawalReconciliationWorker settlement lifecycle', () => {
       providerTxId: 'provider-123',
     });
     expect(prisma.withdrawal.updateMany).toHaveBeenCalledWith({
-      where: { id: 42, status: { in: ['PENDING', 'PROCESSING'] } },
+      where: { id: 42, status: { in: ['PENDING', 'PROCESSING', 'DISPATCHING'] } },
       data: { status: 'COMPLETED' },
     });
     expect(io.to).toHaveBeenCalledWith('user_7');
@@ -168,7 +168,7 @@ describe('WithdrawalReconciliationWorker settlement lifecycle', () => {
       { reason: 'provider_async_failure: recipient rejected' },
     );
     expect(prisma.withdrawal.updateMany).toHaveBeenCalledWith({
-      where: { id: 42, status: { in: ['PENDING', 'PROCESSING'] } },
+      where: { id: 42, status: { in: ['PENDING', 'PROCESSING', 'DISPATCHING'] } },
       data: { status: 'FAILED' },
     });
   });

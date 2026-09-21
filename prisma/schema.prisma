@@ -582,11 +582,24 @@ enum SmartRouteFrequency {
 
 enum SmartRouteRunStatus {
   PENDING
+  // r16c P0-B: single-winner EXECUTION lease. MoMo runs claim the run row
+  // (PENDING -> EXECUTING) before the canonical reservation; a concurrent
+  // recovery of the same run loses the lease and defers — the lease owner
+  // alone finalizes honestly. A crashed lease owner is re-leased by the
+  // stale sweep (updatedAt past the stale cutoff) and converges through
+  // the idempotent canonical re-entry.
+  EXECUTING
   SUCCESS
   FAILED_INSUFFICIENT
   FAILED_GATEWAY
   FAILED_OTHER
   SKIPPED
+  // r16c P0-B: dispatch reached a durable state whose outcome the run
+  // itself must NOT guess (intent written, outcome unknown, or provider
+  // accepted but finalization crashed). The canonical fiat Transaction-
+  // History owns settlement; recovery never re-drives this run, the
+  // reconciliation worker owns resolution.
+  AWAITING_RECONCILIATION
 }
 
 // ── PHASE 4: AZM AUCTION ────────────────────────────────────────────
@@ -1317,26 +1330,26 @@ model Contact {
 // =============================================================================
 
 model Withdrawal {
-  id             Int      @id @default(autoincrement())
-  amount         Decimal  @db.Decimal(20, 8)
-  payoutMethod   String   @default("BINANCE_ID")
-  network        String?
-  destination    String   @default("OLD_RECORD")
+  id                   Int      @id @default(autoincrement())
+  amount               Decimal  @db.Decimal(20, 8)
+  payoutMethod         String   @default("BINANCE_ID")
+  network              String?
+  destination          String   @default("OLD_RECORD")
   // r15 hardening (audit P0, 2026-09-20): durable link from the
   // reconciliation record to the canonical TransactionHistory row. Written
   // by the raw-SQL bridge inside processFiatWithdrawal's reservation
   // transaction (the column is provisioned by the payout-reconciliation
   // infra overlay) — a Withdrawal row can never exist without its
   // canonical row.
-  transactionHistoryId String? @db.VarChar(36)
-  totalGasFee    Decimal  @default(0.0) @db.Decimal(20, 8)
-  vendorGasShare Decimal  @default(0.0) @db.Decimal(20, 8)
-  adminGasShare  Decimal  @default(0.0) @db.Decimal(20, 8)
-  status         String   @default("PENDING")
-  userId         Int
-  user           User     @relation(fields: [userId], references: [id])
-  createdAt      DateTime @default(now())
-  updatedAt      DateTime @updatedAt
+  transactionHistoryId String?  @db.VarChar(36)
+  totalGasFee          Decimal  @default(0.0) @db.Decimal(20, 8)
+  vendorGasShare       Decimal  @default(0.0) @db.Decimal(20, 8)
+  adminGasShare        Decimal  @default(0.0) @db.Decimal(20, 8)
+  status               String   @default("PENDING")
+  userId               Int
+  user                 User     @relation(fields: [userId], references: [id])
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
 
   @@index([userId, createdAt(sort: Desc)])
   @@index([status, createdAt(sort: Desc)])
@@ -4240,6 +4253,7 @@ model SmartRouteRun {
   user  User       @relation("SmartRouteRunUser", fields: [userId], references: [id])
 
   createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
   @@index([routeId, createdAt(sort: Desc)])
   @@index([userId, createdAt(sort: Desc)])

@@ -61,11 +61,13 @@ class WithdrawalReconciliationWorker {
             const cutoff = new Date(Date.now() - STALE_AFTER_MS);
             // PENDING covers manual/legacy withdrawals that have not yet been
             // dispatched. PROCESSING covers auto-payout rows claimed before
-            // provider I/O. Without both states, an auto-payout crash after the
-            // claim would leave the customer's funds permanently stranded.
+            // provider I/O. DISPATCHING covers rows claimed by the r16c direct
+            // dispatch boundary (Withdrawal PENDING -> DISPATCHING before
+            // provider I/O). Without all three states, a crash after any claim
+            // would leave the customer's funds permanently stranded.
             const stuck = await this.prisma.withdrawal.findMany({
                 where: {
-                    status: { in: ['PENDING', 'PROCESSING'] },
+                    status: { in: ['PENDING', 'PROCESSING', 'DISPATCHING'] },
                     createdAt: { lt: cutoff }
                 },
                 include: {
@@ -413,7 +415,7 @@ class WithdrawalReconciliationWorker {
             const terminalClaim = await this.prisma.withdrawal.updateMany({
                 where: {
                     id: withdrawal.id,
-                    status: { in: ['PENDING', 'PROCESSING'] }
+                    status: { in: ['PENDING', 'PROCESSING', 'DISPATCHING'] }
                 },
                 data: { status: 'COMPLETED' }
             });
@@ -479,7 +481,7 @@ class WithdrawalReconciliationWorker {
                 const terminalClaim = await this.prisma.withdrawal.updateMany({
                     where: {
                         id: withdrawal.id,
-                        status: { in: ['PENDING', 'PROCESSING'] }
+                        status: { in: ['PENDING', 'PROCESSING', 'DISPATCHING'] }
                     },
                     data: { status: 'FAILED' }
                 });

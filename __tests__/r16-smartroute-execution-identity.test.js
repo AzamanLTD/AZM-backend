@@ -9,6 +9,26 @@
 //   4. crash/recovery after execution claim  → stale PENDING run re-driven exactly once
 //   5. successful execution increments totalRuns EXACTLY once
 //   6. failed execution consumes the occurrence exactly once (no double retry)
+//   7. Smart Route MoMo enters the canonical withdrawal pipeline (r16 P0-B)
+//
+// r16c P0-B — honest MoMo execution-identity state machine, real PostgreSQL:
+//   8.  crash after execution claim, before financial reservation → reserve
+//       exactly once on recovery
+//   9.  crash after canonical reservation, before dispatch → resume dispatch
+//       with the ORIGINALLY reserved GHS, provider called exactly once
+//   10. crash after DISPATCH_INTENT, before provider I/O → park
+//       AWAITING_RECONCILIATION, provider NEVER called, no refund
+//   11. provider accepted, process died before finalization → park, never
+//       re-dispatch blindly
+//   12. synchronous provider rejection (NOT_DISPATCHED) → reversal exactly
+//       once, run FAILED_GATEWAY, occurrence consumed once
+//   13. dispatcher unavailable → reservation reversed, run FAILED_OTHER —
+//       never SUCCESS over an undispatched payout
+//   14. concurrent recovery of the same stale run → exactly one execution
+//   15. concurrent scheduled executions of a MoMo route → one SUCCESS run,
+//       one canonical reservation, one provider call, totalRuns = 1
+//   16. canonical fiat TransactionHistory stays PENDING until the actual
+//       provider outcome (SUCCESS never means "reservation exists")
 //
 // SKIPS unless TEST_DATABASE_URL is set (CI runs a disposable postgres).
 // =============================================================================
@@ -37,12 +57,101 @@ describeOrSkip('r16 P0-A: Smart Route execution identity', () => {
         });
     });
 
+    /** r16c: service with an injected dispatcher for MoMo dispatch tests. */
+    function makeSvc(dispatcher) {
+        const { SmartRouteService } = require('../services/smartRouteService');
+        return new SmartRouteService({
+            prisma,
+            io: null,
+            notificationService: notifStub,
+            mtnDisbursementService: dispatcher,
+            vaultService: null,
+        });
+    }
+
+    /** Accepting fake dispatcher with a call recorder. */
+    function acceptingDispatcher() {
+        const calls = [];
+        return {
+            calls,
+            async initiateTransfer(payload) {
+                calls.push(payload);
+                return {
+                    status: 'PENDING',
+                    provider: 'MOOLRE_DISBURSEMENT',
+                    _provider: 'moolre',
+                    data: { reference: `moolre_${payload.referenceId}` },
+                };
+            },
+        };
+    }
+
+    /** Fake dispatcher whose provider call throws the given outcome. */
+    function rejectingDispatcher(outcome) {
+        const calls = [];
+        return {
+            calls,
+            async initiateTransfer(payload) {
+                calls.push(payload);
+                const err = new Error(`fake ${outcome}`);
+                err.providerOutcome = outcome;
+                throw err;
+            },
+        };
+    }
+
+    async function seedFiatEnv() {
+        await prisma.globalSettings.upsert({
+            where: { id: 1 },
+            update: { liveRetailRate: 15, liveUsdToGhs: 15 },
+            create: { id: 1, liveRetailRate: 15, liveUsdToGhs: 15 }
+        });
+        await prisma.systemFiatPool.upsert({ where: { id: 1 }, update: { balance: 100000 }, create: { id: 1, balance: 100000 } });
+        await prisma.systemMasterCrypto.upsert({ where: { id: 1 }, update: { balance: 0 }, create: { id: 1, balance: 0 } });
+        await prisma.systemProfitFees.upsert({ where: { id: 1 }, update: { balance: 0 }, create: { id: 1, balance: 0 } });
+    }
+
+    async function seedMomoRoute(userId, overrides = {}) {
+        const past = new Date(Date.now() - 60 * 60 * 1000);
+        return prisma.smartRoute.create({
+            data: {
+                userId,
+                name: 'MoMo payout',
+                action: 'WITHDRAW_MOMO',
+                amountUsdc: 50,
+                frequency: 'WEEKLY',
+                startDate: new Date(Date.now() - 7 * 86400000),
+                nextRunAt: past,
+                status: 'ACTIVE',
+                destMomoNumber: '0240000000',
+                destMomoProvider: 'MTN_MOMO',
+                ...overrides,
+            },
+        });
+    }
+
+    /** Seed a stale PENDING run exactly like a crashed execution leaves it. */
+    async function seedStaleRun(routeId, userId, opts = {}) {
+        const created = new Date(Date.now() - (opts.staleMs || (6 * 60 * 60 * 1000)) - 1000);
+        return prisma.smartRouteRun.create({
+            data: {
+                routeId,
+                userId,
+                status: 'PENDING',
+                amountUsdc: 50,
+                executionKey: opts.executionKey || `${routeId}:occ:${new Date(Date.now() - 60 * 60 * 1000).toISOString()}`,
+                createdAt: created,
+            },
+        });
+    }
+
     afterAll(async () => { if (prisma) await prisma.$disconnect(); });
 
     afterEach(async () => {
         await prisma.$executeRawUnsafe(
-            'TRUNCATE TABLE "User", "SmartRoute", "SmartRouteRun", "TransactionHistory", "SavingsGoal", "SavingsDeposit", "Vault", "VaultDeposit", "GlobalSettings", "SystemFiatPool", "SystemMasterCrypto", "SystemProfitFees", "Withdrawal", "FiatProviderEvent" RESTART IDENTITY CASCADE'
+            'TRUNCATE TABLE "User", "SmartRoute", "SmartRouteRun", "TransactionHistory", "SavingsGoal", "SavingsDeposit", "Vault", "VaultDeposit", "GlobalSettings", "SystemFiatPool", "SystemMasterCrypto", "SystemProfitFees", "Withdrawal", "FiatProviderEvent", "ReconciliationException", "FiatLiquidityReceipt" RESTART IDENTITY CASCADE'
         );
+        await prisma.$executeRawUnsafe('TRUNCATE TABLE "LedgerTransaction", "JournalEntry", "LedgerAccount", "RestrictedObligation" RESTART IDENTITY CASCADE');
     }, 15000);
 
     async function seedRoute(userId, overrides = {}) {
@@ -198,13 +307,12 @@ describeOrSkip('r16 P0-A: Smart Route execution identity', () => {
     });
 
     test('7: P0-B — Smart Route MoMo enters the canonical withdrawal pipeline', async () => {
-        await prisma.globalSettings.create({
-            data: { id: 1, liveRetailRate: 15, liveUsdToGhs: 15 }
-        }).catch(() => {});
-        await prisma.systemFiatPool.create({ data: { id: 1, balance: 100000 } }).catch(() => {});
-        await prisma.systemMasterCrypto.create({ data: { id: 1, balance: 0 } }).catch(() => {});
-        await prisma.systemProfitFees.create({ data: { id: 1, balance: 0 } }).catch(() => {});
+        await seedFiatEnv();
 
+        // r16c: a null dispatcher would now reverse the reservation and fail
+        // the run (test 13). Use an accepting fake so SUCCESS is honest.
+        const fake = acceptingDispatcher();
+        const momoSvc = makeSvc(fake);
         const user = await seedUser(prisma, { availableBalance: 200 });
         const past = new Date(Date.now() - 60 * 60 * 1000);
         const route = await prisma.smartRoute.create({
@@ -222,8 +330,9 @@ describeOrSkip('r16 P0-A: Smart Route execution identity', () => {
             },
         });
 
-        const run = await svc.runOnce(route.id);
+        const run = await momoSvc.runOnce(route.id);
         expect(run.status).toBe('SUCCESS');
+        expect(fake.calls.length).toBe(1);
 
         // Canonical TransactionHistory: WITHDRAWAL_FIAT, PENDING until provider outcome.
         const canonical = await prisma.transactionHistory.findFirst({
@@ -259,4 +368,341 @@ describeOrSkip('r16 P0-A: Smart Route execution identity', () => {
         expect(Number(fresh.availableBalance)).toBeLessThan(150);
         expect(Number(fresh.availableBalance)).toBeGreaterThan(140);
     });
+
+    // ── r16c P0-B: honest dispatch-state / crash-recovery matrix ────────────
+
+    test('8: crash after execution claim, before financial reservation → recovery reserves exactly once', async () => {
+        await seedFiatEnv();
+        const user = await seedUser(prisma, { availableBalance: 500 });
+        const route = await seedMomoRoute(user.id);
+        const run = await seedStaleRun(route.id, user.id);
+
+        const fake = acceptingDispatcher();
+        const momoSvc = makeSvc(fake);
+        const outcomes = await momoSvc.recoverStalePendingRuns();
+        expect(outcomes.length).toBe(1);
+
+        const refreshed = await prisma.smartRouteRun.findUnique({ where: { id: run.id } });
+        expect(refreshed.status).toBe('SUCCESS');
+
+        const canonical = await prisma.transactionHistory.findUnique({ where: { txHash: `SRWD_${run.id}` } });
+        expect(canonical).not.toBeNull();
+        expect(canonical.status).toBe('PENDING'); // settlement still owned by the provider
+
+        const count = await prisma.transactionHistory.count({ where: { type: 'WITHDRAWAL_FIAT', userId: user.id } });
+        expect(count).toBe(1);
+        expect(fake.calls.length).toBe(1);
+
+        const freshRoute = await prisma.smartRoute.findUnique({ where: { id: route.id } });
+        expect(freshRoute.totalRuns).toBe(1);
+    });
+
+    test('9: crash after canonical reservation, before dispatch → resume dispatch with the originally reserved GHS', async () => {
+        await seedFiatEnv();
+        const user = await seedUser(prisma, { availableBalance: 500 });
+        const route = await seedMomoRoute(user.id);
+        const run = await seedStaleRun(route.id, user.id);
+
+        // Simulate the crashed execution: canonical reservation committed,
+        // dispatch never started. Same in-transaction mirror bridge as the
+        // real executor.
+        const financeService = require('../services/finance.service');
+        const reference = `SRWD_${run.id}`;
+        await financeService.processFiatWithdrawal(prisma, user.id, 50, {
+            reference,
+            createWithdrawalRecordInTransaction: async (tx, txRecord) => {
+                const rows = await tx.$queryRawUnsafe(
+                    'INSERT INTO "Withdrawal" ' +
+                    '("userId", "amount", "payoutMethod", "network", "destination", "status", "transactionHistoryId", "createdAt", "updatedAt") ' +
+                    'VALUES ($1, $2, $3, $4, $5, $6, $7, now(), now()) ' +
+                    'RETURNING "id", "userId", "amount", "status"',
+                    user.id, 50, 'MTN_MOMO', 'MOMO', '0240000000', 'PENDING', txRecord.id
+                );
+                return rows?.[0] || null;
+            },
+        });
+        const afterCrash = await prisma.user.findUnique({ where: { id: user.id } });
+        const debitedOnce = Number(afterCrash.availableBalance);
+
+        // Rate drift AFTER the crash — the resume must send the ORIGINALLY
+        // reserved GHS (P5-D), never recompute the payout.
+        await prisma.globalSettings.update({ where: { id: 1 }, data: { liveRetailRate: 99, liveUsdToGhs: 99 } });
+
+        const fake = acceptingDispatcher();
+        const momoSvc = makeSvc(fake);
+        await momoSvc.recoverStalePendingRuns();
+
+        const refreshed = await prisma.smartRouteRun.findUnique({ where: { id: run.id } });
+        expect(refreshed.status).toBe('SUCCESS');
+        expect(fake.calls.length).toBe(1);
+        expect(Number(fake.calls[0].amountGhs)).toBeCloseTo(750, 1); // 50 USDC @ 15 — the reserved rate
+
+        // No re-reservation: exactly one debit.
+        const fresh = await prisma.user.findUnique({ where: { id: user.id } });
+        expect(Number(fresh.availableBalance)).toBeCloseTo(debitedOnce, 5);
+        const canonical = await prisma.transactionHistory.findUnique({ where: { txHash: reference } });
+        expect(canonical.status).toBe('PENDING');
+    });
+
+    test('10: crash after DISPATCH_INTENT, before provider I/O → park, never call the provider, never refund', async () => {
+        await seedFiatEnv();
+        const user = await seedUser(prisma, { availableBalance: 500 });
+        const route = await seedMomoRoute(user.id);
+        const run = await seedStaleRun(route.id, user.id);
+
+        const financeService = require('../services/finance.service');
+        const fiatLiquidity = require('../src/services/fiatLiquidityService');
+        const reference = `SRWD_${run.id}`;
+        await financeService.processFiatWithdrawal(prisma, user.id, 50, {
+            reference,
+            createWithdrawalRecordInTransaction: async (tx, txRecord) => {
+                const rows = await tx.$queryRawUnsafe(
+                    'INSERT INTO "Withdrawal" ' +
+                    '("userId", "amount", "payoutMethod", "network", "destination", "status", "transactionHistoryId", "createdAt", "updatedAt") ' +
+                    'VALUES ($1, $2, $3, $4, $5, $6, $7, now(), now()) ' +
+                    'RETURNING "id", "userId", "amount", "status"',
+                    user.id, 50, 'MTN_MOMO', 'MOMO', '0240000000', 'PENDING', txRecord.id
+                );
+                return rows?.[0] || null;
+            },
+        });
+        await fiatLiquidity.recordProviderEvent(prisma, {
+            provider: 'AZM_DISPATCHER',
+            rail: 'MOMO',
+            direction: 'OUTBOUND',
+            status: 'DISPATCH_INTENT',
+            dedupKey: `event:payout-dispatch-intent:${reference}`,
+            relatedReference: reference,
+            raw: { externalId: reference, stage: 'PRE_PROVIDER_IO', source: 'smart_route' },
+        });
+        const afterCrash = await prisma.user.findUnique({ where: { id: user.id } });
+        const debited = Number(afterCrash.availableBalance);
+
+        const fake = acceptingDispatcher();
+        const momoSvc = makeSvc(fake);
+        await momoSvc.recoverStalePendingRuns();
+
+        // Parked — the payout may be in flight, recovery must not guess.
+        const refreshed = await prisma.smartRouteRun.findUnique({ where: { id: run.id } });
+        expect(refreshed.status).toBe('AWAITING_RECONCILIATION');
+        expect(fake.calls.length).toBe(0); // NEVER a second provider call
+
+        // Protected: not refunded, canonical stays PENDING.
+        const canonical = await prisma.transactionHistory.findUnique({ where: { txHash: reference } });
+        expect(canonical.status).toBe('PENDING');
+        const fresh = await prisma.user.findUnique({ where: { id: user.id } });
+        expect(Number(fresh.availableBalance)).toBeCloseTo(debited, 5);
+
+        // A loud reconciliation exception is open for the payout (raw-SQL
+        // table — no Prisma model).
+        const exc = await prisma.$queryRawUnsafe(
+            'SELECT "status" FROM "ReconciliationException" WHERE "reference" = $1 ORDER BY "id" DESC LIMIT 1', reference
+        );
+        expect(exc.length).toBe(1);
+        expect(exc[0].status).toBe('OPEN');
+
+        // The occurrence is consumed — no infinite recovery loop.
+        const freshRoute = await prisma.smartRoute.findUnique({ where: { id: route.id } });
+        expect(freshRoute.totalRuns).toBe(0); // SUCCESS-only counter
+    });
+
+    test('11: provider accepted, process died before finalization → park, never re-dispatch blindly', async () => {
+        await seedFiatEnv();
+        const user = await seedUser(prisma, { availableBalance: 500 });
+        const route = await seedMomoRoute(user.id);
+        const run = await seedStaleRun(route.id, user.id);
+
+        // Crashed state: reservation + intent + ACCEPTED dispatch evidence.
+        const financeService = require('../services/finance.service');
+        const fiatLiquidity = require('../src/services/fiatLiquidityService');
+        const reference = `SRWD_${run.id}`;
+        await financeService.processFiatWithdrawal(prisma, user.id, 50, {
+            reference,
+            createWithdrawalRecordInTransaction: async (tx, txRecord) => {
+                const rows = await tx.$queryRawUnsafe(
+                    'INSERT INTO "Withdrawal" ' +
+                    '("userId", "amount", "payoutMethod", "network", "destination", "status", "transactionHistoryId", "createdAt", "updatedAt") ' +
+                    'VALUES ($1, $2, $3, $4, $5, $6, $7, now(), now()) ' +
+                    'RETURNING "id", "userId", "amount", "status"',
+                    user.id, 50, 'MTN_MOMO', 'MOMO', '0240000000', 'PENDING', txRecord.id
+                );
+                return rows?.[0] || null;
+            },
+        });
+        for (const ev of [
+            { status: 'DISPATCH_INTENT', dedupKey: `event:payout-dispatch-intent:${reference}` },
+            { status: 'PENDING', dedupKey: `event:payout-dispatch:MOOLRE_DISBURSEMENT:${reference}`, provider: 'MOOLRE_DISBURSEMENT' },
+        ]) {
+            await fiatLiquidity.recordProviderEvent(prisma, {
+                provider: ev.provider || 'AZM_DISPATCHER',
+                rail: 'MOMO',
+                direction: 'OUTBOUND',
+                status: ev.status,
+                dedupKey: ev.dedupKey,
+                relatedReference: reference,
+                raw: { externalId: reference, source: 'smart_route' },
+            });
+        }
+
+        const fake = acceptingDispatcher();
+        const momoSvc = makeSvc(fake);
+        await momoSvc.recoverStalePendingRuns();
+
+        const refreshed = await prisma.smartRouteRun.findUnique({ where: { id: run.id } });
+        expect(refreshed.status).toBe('AWAITING_RECONCILIATION');
+        expect(fake.calls.length).toBe(0); // the payout was already dispatched — never again
+
+        const canonical = await prisma.transactionHistory.findUnique({ where: { txHash: reference } });
+        expect(canonical.status).toBe('PENDING'); // reconciliation owns settlement
+        const exc = await prisma.$queryRawUnsafe(
+            'SELECT "status" FROM "ReconciliationException" WHERE "reference" = $1 ORDER BY "id" DESC LIMIT 1', reference
+        );
+        expect(exc.length).toBe(1);
+        expect(exc[0].status).toBe('OPEN');
+    });
+
+    test('12: synchronous provider rejection (NOT_DISPATCHED) → reversal exactly once, FAILED_GATEWAY, occurrence consumed once', async () => {
+        await seedFiatEnv();
+        const user = await seedUser(prisma, { availableBalance: 500 });
+        const route = await seedMomoRoute(user.id);
+        const run = await seedStaleRun(route.id, user.id);
+        const before = Number((await prisma.user.findUnique({ where: { id: user.id } })).availableBalance);
+
+        const fake = rejectingDispatcher('NOT_DISPATCHED');
+        const momoSvc = makeSvc(fake);
+        await momoSvc.recoverStalePendingRuns();
+
+        const refreshed = await prisma.smartRouteRun.findUnique({ where: { id: run.id } });
+        expect(refreshed.status).toBe('FAILED_GATEWAY');
+        expect(fake.calls.length).toBe(1);
+
+        const reference = `SRWD_${run.id}`;
+        const canonical = await prisma.transactionHistory.findUnique({ where: { txHash: reference } });
+        expect(canonical.status).toBe('FAILED'); // reversed exactly once
+
+        // User restored exactly once: amount + exit fee.
+        const after = await prisma.user.findUnique({ where: { id: user.id } });
+        expect(Number(after.availableBalance)).toBeCloseTo(before, 5);
+
+        // Exactly one reversal ledger post for the reference.
+        const reversals = await prisma.ledgerTransaction.findMany({
+            where: { idempotencyKey: `ledger:withdrawal:fiat:reverse:${reference}` },
+        });
+        expect(reversals.length).toBe(1);
+
+        // Occurrence consumed exactly once — no duplicate retry.
+        const freshRoute = await prisma.smartRoute.findUnique({ where: { id: route.id } });
+        expect(freshRoute.nextRunAt.getTime()).toBeGreaterThan(Date.now());
+        expect(freshRoute.totalRuns).toBe(0);
+    });
+
+    test('13: dispatcher unavailable → reservation reversed, run FAILED_OTHER — never SUCCESS over an undispatched payout', async () => {
+        await seedFiatEnv();
+        const user = await seedUser(prisma, { availableBalance: 500 });
+        const route = await seedMomoRoute(user.id);
+        const run = await seedStaleRun(route.id, user.id);
+        const before = Number((await prisma.user.findUnique({ where: { id: user.id } })).availableBalance);
+
+        // No dispatcher bound — deterministic pre-I/O failure.
+        await svc.recoverStalePendingRuns();
+
+        const refreshed = await prisma.smartRouteRun.findUnique({ where: { id: run.id } });
+        expect(refreshed.status).toBe('FAILED_OTHER');
+        expect(refreshed.failureReason).toContain('dispatcher unavailable');
+
+        const reference = `SRWD_${run.id}`;
+        const canonical = await prisma.transactionHistory.findUnique({ where: { txHash: reference } });
+        expect(canonical.status).toBe('FAILED'); // reservation unwound, not parked
+
+        const after = await prisma.user.findUnique({ where: { id: user.id } });
+        expect(Number(after.availableBalance)).toBeCloseTo(before, 5); // fully restored
+        const freshRoute = await prisma.smartRoute.findUnique({ where: { id: route.id } });
+        expect(freshRoute.totalRuns).toBe(0);
+    });
+
+    test('14: concurrent recovery of the same stale run → exactly one execution', async () => {
+        await seedFiatEnv();
+        const user = await seedUser(prisma, { availableBalance: 500 });
+        const route = await seedMomoRoute(user.id);
+        await seedStaleRun(route.id, user.id);
+
+        const fake = acceptingDispatcher();
+        const a = makeSvc(fake);
+        const b = makeSvc(fake);
+        const [, ra, rb] = await Promise.allSettled([
+            Promise.resolve(),
+            a.recoverStalePendingRuns(),
+            b.recoverStalePendingRuns(),
+        ]);
+        expect(ra.status).toBe('fulfilled');
+        expect(rb.status).toBe('fulfilled');
+
+        const runs = await prisma.smartRouteRun.findMany({ where: { routeId: route.id } });
+        expect(runs.filter((r) => r.status === 'SUCCESS').length).toBe(1);
+        expect(fake.calls.length).toBe(1); // one dispatch, not two
+
+        const canonicalCount = await prisma.transactionHistory.count({ where: { type: 'WITHDRAWAL_FIAT', userId: user.id } });
+        expect(canonicalCount).toBe(1);
+        const freshRoute = await prisma.smartRoute.findUnique({ where: { id: route.id } });
+        expect(freshRoute.totalRuns).toBe(1);
+    });
+
+    test('15: concurrent scheduled executions of a MoMo route → one SUCCESS run, one reservation, one provider call, totalRuns = 1', async () => {
+        await seedFiatEnv();
+        const user = await seedUser(prisma, { availableBalance: 500 });
+        const route = await seedMomoRoute(user.id);
+
+        const fake = acceptingDispatcher();
+        const a = makeSvc(fake);
+        const b = makeSvc(fake);
+        const [, ra, rb] = await Promise.allSettled([
+            Promise.resolve(),
+            a.runOnce(route.id),
+            b.runOnce(route.id),
+        ]);
+        expect(ra.status).toBe('fulfilled');
+        expect(rb.status).toBe('fulfilled');
+
+        const runs = await prisma.smartRouteRun.findMany({ where: { routeId: route.id } });
+        const successRuns = runs.filter((r) => r.status === 'SUCCESS');
+        expect(successRuns.length).toBe(1);
+        expect(fake.calls.length).toBe(1);
+
+        // Money reserved exactly once: one canonical row, one mirror.
+        const canonicalCount = await prisma.transactionHistory.count({ where: { type: 'WITHDRAWAL_FIAT', userId: user.id } });
+        expect(canonicalCount).toBe(1);
+        const mirrorCount = await prisma.withdrawal.count({ where: { userId: user.id } });
+        expect(mirrorCount).toBe(1);
+
+        const freshRoute = await prisma.smartRoute.findUnique({ where: { id: route.id } });
+        expect(freshRoute.totalRuns).toBe(1);
+    });
+
+    test('16: canonical fiat stays PENDING until the provider outcome — SUCCESS never means "reservation exists"', async () => {
+        await seedFiatEnv();
+        const user = await seedUser(prisma, { availableBalance: 500 });
+        const route = await seedMomoRoute(user.id);
+        const run = await seedStaleRun(route.id, user.id);
+
+        // Provider accepted, but settlement has NOT been observed yet.
+        const fake = acceptingDispatcher();
+        const momoSvc = makeSvc(fake);
+        await momoSvc.recoverStalePendingRuns();
+
+        const reference = `SRWD_${run.id}`;
+        const canonical = await prisma.transactionHistory.findUnique({ where: { txHash: reference } });
+        expect(canonical.status).toBe('PENDING');
+
+        const refreshed = await prisma.smartRouteRun.findUnique({ where: { id: run.id } });
+        expect(refreshed.status).toBe('SUCCESS'); // provider ACCEPTED — the honest success
+        expect(refreshed.withdrawalId).not.toBeNull();
+        expect(Number(refreshed.amountGhs)).toBeCloseTo(750, 1);
+        expect(Number(refreshed.rateUsed)).toBeCloseTo(15, 5);
+
+        // The run never consumed the occurrence twice, and the mirror is
+        // claimed by the dispatch (protected from admin rejection).
+        const mirror = await prisma.withdrawal.findFirst({ where: { userId: user.id } });
+        expect(mirror.status).toBe('DISPATCHING');
+    });
+
 });

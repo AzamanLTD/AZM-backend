@@ -47,12 +47,17 @@ const SMS_LARGE_WITHDRAWAL_THRESHOLD = parseFloat(
 //      arbitrage spread, splits the exit fee, debits SystemFiatPool, writes
 //      a TransactionHistory row stamped with `reference` (UUID v4 used as
 //      the Moolre transfer idempotency key).
-//   2. payoutDispatcher.initiateTransfer (Moolre, the only current fiat
+//   2. DB dispatch claim — the Withdrawal mirror atomically moves
+//      PENDING -> DISPATCHING. This conditional transition is the single
+//      authority that decides between admin rejection and dispatch:
+//      both paths claim the same PENDING row, the database serializes
+//      them, and the loser NEVER touches the provider or the money.
+//   3. payoutDispatcher.initiateTransfer (Moolre, the only current fiat
 //      provider) — dispatches the GHS payout to the user's MoMo wallet using
 //      the same `reference` plus the selected destination network (MTN /
 //      TELECEL / AIRTELTIGO channels under Moolre). Settlement is async;
 //      the Moolre settlement webhook arrives later.
-//   3. On synchronous rejection from Moolre, financeService.reverseFiatWithdrawal
+//   4. On synchronous rejection from Moolre, financeService.reverseFiatWithdrawal
 //      atomically refunds the user, unwinds SystemMasterCrypto / SystemFiatPool,
 //      and marks the TransactionHistory row FAILED.
 //
@@ -310,6 +315,49 @@ exports.fiatWithdrawal = async (req, res) => {
             });
         }
 
+        // ── r16c P0-A: DB-AUTHORITATIVE DISPATCH CLAIM ─────────────────────
+        // The reservation transaction above created the Withdrawal mirror
+        // PENDING. Admin rejection (adminController.rejectWithdrawal) claims
+        // that same row with a conditional PENDING -> REJECTED transition
+        // inside its reversal transaction, and the payout worker claims it
+        // with PENDING -> PROCESSING. This conditional PENDING -> DISPATCHING
+        // claim is therefore mutually exclusive with BOTH: the database
+        // serializes the contenders, exactly one wins, and only the winner
+        // may touch the provider or the money.
+        //
+        // If the claim loses, the winner (admin rejection) has ALREADY
+        // reversed the reservation and restored the user — this request
+        // must not call the provider and must not reverse anything again.
+        if (!withdrawalRow) {
+            // No reconciliation row was created for this reservation — a
+            // payout without a DB claim surface cannot be protected, so
+            // fail closed before any provider I/O.
+            logger.error({ reference, userId }, '[fiatWithdrawal] no Withdrawal mirror row — refusing unclaimable dispatch');
+            await financeService.reverseFiatWithdrawal(prisma, reference, { reason: 'no_withdrawal_mirror_row' });
+            if (emitBalanceUpdate) await emitBalanceUpdate(userId);
+            return res.status(503).json({
+                success: false,
+                message: 'Payout could not be recorded safely. Your balance has been restored.'
+            });
+        }
+        const dispatchClaim = await prisma.withdrawal.updateMany({
+            where: { id: withdrawalRow.id, status: 'PENDING' },
+            data:  { status: 'DISPATCHING' },
+        });
+        if (dispatchClaim.count !== 1) {
+            // Admin rejection or the payout worker won the race; the mirror
+            // is already finalized/claimed and the reservation was reversed
+            // by the winner. Protected response, no provider I/O.
+            logger.warn({ reference, withdrawalId: withdrawalRow.id },
+                '[fiatWithdrawal] dispatch claim lost — withdrawal claimed concurrently, payout NOT dispatched');
+            return res.status(409).json({
+                success: false,
+                code: 'WITHDRAWAL_CLAIMED_CONCURRENTLY',
+                message: 'Withdrawal was claimed concurrently (admin action or payout worker). It is protected and was not dispatched. Refresh to see its final state.',
+                data: { withdrawalId: withdrawalRow.id, protected: true },
+            });
+        }
+
         // r16 P0-C: durable DISPATCH_INTENT evidence written BEFORE any
         // provider I/O. Admin rejection (and any future reversal path) treats
         // ANY outbound evidence for this reference — intent included — as
@@ -334,6 +382,11 @@ exports.fiatWithdrawal = async (req, res) => {
             await financeService.reverseFiatWithdrawal(prisma, reference, {
                 reason: 'dispatch_intent_evidence_failed'
             });
+            // The dispatch claim above moved the mirror to DISPATCHING; the
+            // reservation is now reversed, so the mirror must follow.
+            try {
+                await prisma.withdrawal.update({ where: { id: withdrawalRow.id }, data: { status: 'FAILED' } });
+            } catch (_) {/* non-fatal */}
             if (emitBalanceUpdate) await emitBalanceUpdate(userId);
             return res.status(503).json({
                 success: false,

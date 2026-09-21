@@ -739,7 +739,11 @@ describeOrSkip('r15 hardening G–I: controller path — tracked, fail-closed, r
 
         const wRow = await prisma.withdrawal.findFirst({ where: { userId: user.id } });
         expect(wRow).not.toBeNull();
-        expect(wRow.status).toBe('PENDING');
+        // r16c: the dispatch claim moved the mirror to DISPATCHING before
+        // provider I/O — the honest tracked state for an attempted payout.
+        // It stays protected from admin rejection and payout-worker claims
+        // until reconciliation settles it.
+        expect(wRow.status).toBe('DISPATCHING');
         expect(wRow.transactionHistoryId).toBe(txRow.id); // the J-item link: no orphaned bookkeeping
 
         // The durable dispatch observation names the actual provider.
@@ -884,7 +888,9 @@ describeOrSkip('r15 hardening G–I: controller path — tracked, fail-closed, r
         });
         expect(txRow.status).toBe('PENDING');
         const wRow = await prisma.withdrawal.findFirst({ where: { userId: user.id } });
-        expect(wRow.status).toBe('PENDING');
+        // r16c: dispatch attempted — the mirror holds the claimed DISPATCHING
+        // state, fail-closed and tracked.
+        expect(wRow.status).toBe('DISPATCHING');
         expect(wRow.transactionHistoryId).toBe(txRow.id);
 
         // NO dispatch evidence exists — no rail identity was invented.
@@ -913,6 +919,8 @@ describeOrSkip('r15 hardening G–I: controller path — tracked, fail-closed, r
         expect(excAfter.map(e => e.reason)).toContain('DISPATCHED_OWNERSHIP_NOT_DURABLE');
 
         const wAfter = await prisma.withdrawal.findUnique({ where: { id: wRow.id } });
-        expect(wAfter.status).toBe('PENDING');
+        // r16c: the mirror holds the dispatch claim (DISPATCHING) — parked for
+        // human reconciliation, never rolled back to PENDING.
+        expect(wAfter.status).toBe('DISPATCHING');
     });
 });
