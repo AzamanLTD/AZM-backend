@@ -44,6 +44,9 @@ async function setupFixtures() {
             password: hashedPw,
             azamanId: `AZM-BOSS-${Date.now()}`,
             role: 'VENDOR',
+            // P0 settlement repair: EWA/payroll settlement now debits the
+            // business treasury, so the owner needs spendable USDC to fund it
+            availableBalance: 1000.0,
         },
     });
 

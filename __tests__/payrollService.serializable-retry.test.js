@@ -1,4 +1,7 @@
 const { PayrollService } = require('../services/businessOS/payrollService');
+const ledger = require('../services/ledgerService');
+
+jest.spyOn(ledger, 'post').mockResolvedValue({ id: 'ledger-tx-1' });
 
 describe('PayrollService serializable retry', () => {
     test('retries transient P2034 conflicts and returns the committed payroll result', async () => {
@@ -20,11 +23,13 @@ describe('PayrollService serializable retry', () => {
             breakdown: { shifts: 1, regularHours: 8, overtimeHours: 2, ewaWithdrawn: 0 },
             employee: {
                 businessProfileId: 'business-1',
+                userId: 42,
                 payrollType: 'HOURLY',
                 hourlyRate: 10,
                 salaryAmount: null,
                 withdrawnEarly: 0,
                 smartRouteId: null,
+                paymentPreference: 'AZAMAN_BALANCE',
             },
         };
         const updated = { ...payroll, status: 'PROCESSED' };
@@ -32,12 +37,18 @@ describe('PayrollService serializable retry', () => {
         const tx = {
             payrollRecord: {
                 findFirst: jest.fn().mockResolvedValue(payroll),
+                findUnique: jest.fn().mockResolvedValue(updated),
+                updateMany: jest.fn().mockResolvedValue({ count: 1 }),
                 update: jest.fn().mockResolvedValue(updated),
             },
             shift: {
                 findMany: jest.fn().mockResolvedValue([{ actualMinutes: 600, breakMinutes: 0 }]),
             },
-            user: { update: jest.fn().mockResolvedValue({}) },
+            businessProfile: { findUnique: jest.fn().mockResolvedValue({ userId: 7 }) },
+            user: {
+                updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+                update: jest.fn().mockResolvedValue({}),
+            },
             transactionHistory: { create: jest.fn().mockResolvedValue({}) },
             businessLedgerEntry: { create: jest.fn().mockResolvedValue({}) },
             businessEmployee: { update: jest.fn().mockResolvedValue({}) },
@@ -58,10 +69,11 @@ describe('PayrollService serializable retry', () => {
         await expect(service.disbursePayroll('payroll-1', 'business-1')).resolves.toEqual(updated);
         expect(prisma.$transaction).toHaveBeenCalledTimes(2);
         expect(tx.user.update).toHaveBeenCalledTimes(1);
-        expect(tx.transactionHistory.create).toHaveBeenCalledTimes(1);
+        // both signed economic sides survive the retry with exactly one payout
+        expect(tx.transactionHistory.create).toHaveBeenCalledTimes(2);
         expect(tx.businessLedgerEntry.create).toHaveBeenCalledTimes(1);
         expect(tx.businessEmployee.update).toHaveBeenCalledTimes(1);
-        expect(tx.payrollRecord.update).toHaveBeenCalledTimes(1);
+        expect(ledger.post).toHaveBeenCalledTimes(1);
     });
 
     test('does not retry non-serialization failures', async () => {

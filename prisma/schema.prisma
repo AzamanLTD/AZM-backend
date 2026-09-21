@@ -141,6 +141,8 @@ enum ProfitSource {
   SMART_ESCROW_FEE
   // Discovery Sprint (2026-06-20): platform fee from invoice payments
   BUSINESS_INVOICE_FEE
+  // Business OS P0 settlement repair (2026-09-21): 1% EWA withdrawal fee
+  EWA_FEE
 }
 
 enum ConversationType {

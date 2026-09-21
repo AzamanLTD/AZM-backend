@@ -300,11 +300,12 @@ class EmployeeService {
     // ── EWA: Earned Wage Access ────────────────────────────────────────────
     // Keep the legacy service method as a compatibility boundary for worker
     // callers, but route every money mutation through the canonical EWA engine.
-    async requestEWA(employeeId, amount) {
+    async requestEWA(employeeId, amount, idempotencyKey) {
         const result = await new EwaService(this.prisma).requestWithdrawal({
             employeeId,
             amount,
-            destination: 'AZM_BALANCE',
+            destination: 'AZAMAN_BALANCE',
+            idempotencyKey,
         });
 
         // Preserve the legacy response fields consumed by the worker endpoint

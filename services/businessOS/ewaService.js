@@ -9,15 +9,47 @@
 // Rules:
 // - Max withdrawal: 30% of accrued wages
 // - Min withdrawal: 1 AZM
-// - Fee: 1% of withdrawal (deducted from employee's share, not the business)
+// - Fee: 1% of withdrawal (deducted from the employee's share, not the business)
 // - The withdrawn amount is tracked as `withdrawnEarly` on the employee record
 //   and deducted from their net pay on payroll day
+//
+// P0 settlement repair (2026-09-21):
+// - The business treasury (BusinessProfile.userId's User.availableBalance) is
+//   DEBITED the gross amount — previously the withdrawal was recorded without
+//   ever funding it from the business.
+// - The employee receives spendable USDC on User.availableBalance — NEVER
+//   azmBalance (loyalty points).
+// - All amounts are exact Prisma.Decimal end-to-end; JS numbers only appear in
+//   non-authoritative response presentation.
+// - The 1% fee is realized through the established platform fee mechanism
+//   (SystemProfitFees + AdminProfitLog + the authoritative ledger line).
+// - An optional caller-supplied idempotencyKey claims a DB-unique economic
+//   identity BEFORE any mutation: a duplicate request cannot mint another
+//   payout (r14 guarded-insert pattern).
+// - External destinations (MOMO/WALLET/SPLIT) FAIL CLOSED — no authoritative
+//   payout path exists, so the withdrawal is never recorded as sent.
 // =============================================================================
 
+const { Prisma } = require('@prisma/client');
 const { getBusinessRequestContext } = require('../../src/lib/businessRequestContext');
+const ledger = require('../ledgerService');
 
 const SERIALIZABLE_RETRY_LIMIT = 3;
 const SERIALIZABLE_BACKOFF_MS = 10;
+
+const ZERO = new Prisma.Decimal(0);
+const EWA_FEE_RATE = new Prisma.Decimal('0.01');
+const EWA_CAP_RATE = new Prisma.Decimal('0.30');
+const EWA_MIN_WITHDRAWAL = new Prisma.Decimal(1);
+
+// Typed settlement errors (fail-closed): every one aborts the whole
+// transaction — the employee's capacity, the treasury and every accounting
+// write roll back together.
+const settlementError = (code, message) => {
+    const err = new Error(message);
+    err.code = code;
+    return err;
+};
 
 const isSerializableConflict = (error) => error?.code === 'P2034';
 
@@ -70,34 +102,68 @@ class EwaService {
             return { eligible: false, reason: 'Employee is not active.' };
         }
 
-        const accrued = parseFloat(employee.accruedWages);
-        const alreadyWithdrawn = parseFloat(employee.withdrawnEarly);
-        const maxAvailable = accrued * 0.30;
-        const remaining = Math.max(0, maxAvailable - alreadyWithdrawn);
+        // exact cap math (presentation numbers in the response)
+        const accrued = new Prisma.Decimal(employee.accruedWages);
+        const alreadyWithdrawn = new Prisma.Decimal(employee.withdrawnEarly);
+        const maxAvailable = accrued.mul(EWA_CAP_RATE);
+        const remaining = Prisma.Decimal.max(ZERO, maxAvailable.minus(alreadyWithdrawn));
 
         return {
-            eligible: remaining >= 1,
-            accruedWages: accrued,
-            alreadyWithdrawn,
-            maxWithdrawable: maxAvailable,
-            remainingWithdrawable: remaining,
+            eligible: remaining.gte(EWA_MIN_WITHDRAWAL),
+            accruedWages: Number(accrued),
+            alreadyWithdrawn: Number(alreadyWithdrawn),
+            maxWithdrawable: Number(maxAvailable),
+            remainingWithdrawable: Number(remaining),
             limitPercent: 30,
         };
     }
 
     // ── Request EWA Withdrawal ─────────────────────────────────────────────
-    // The employee read, cap check, withdrawnEarly claim, balance credit, and
-    // both ledger records are one serializable transaction. This prevents a
-    // successful claim from becoming a permanent balance deduction when a later
-    // ledger/balance write fails, and makes concurrent withdrawals serialize.
-    async requestWithdrawal({ employeeId, amount, destination, businessProfileId }) {
+    // The employee read, cap check, withdrawnEarly claim, guarded treasury
+    // debit, employee credit, platform fee, and every ledger/history record are
+    // one serializable transaction. A failure in ANY later write rolls back
+    // the complete movement; concurrent withdrawals serialize on the guarded
+    // claim; a duplicate idempotencyKey claim collides on a unique index and
+    // rolls back instead of minting a second payout.
+    async requestWithdrawal({ employeeId, amount, destination, businessProfileId, idempotencyKey }) {
         const scopedBusinessProfileId = this._resolveBusinessProfileId(businessProfileId);
-        const withdrawAmount = Number(amount);
-        if (!Number.isFinite(withdrawAmount)) {
+
+        // §5 DESTINATION SAFETY: only the internal AZAMAN_BALANCE credit has
+        // an authoritative settlement path. 'AZM_BALANCE' is the legacy alias
+        // used by the employee self-service route. Every external destination
+        // (MOMO/WALLET/SPLIT) FAILS CLOSED — a payout is never recorded as
+        // sent externally when it was not.
+        const INTERNAL_DESTINATIONS = ['AZAMAN_BALANCE', 'AZM_BALANCE'];
+        const requestedDestination = destination === undefined || destination === null
+            ? 'AZAMAN_BALANCE'
+            : String(destination);
+        if (!INTERNAL_DESTINATIONS.includes(requestedDestination)) {
+            throw settlementError(
+                'EWA_EXTERNAL_DESTINATION_UNSUPPORTED',
+                `EWA destination ${requestedDestination} has no authoritative payout path; the withdrawal was not executed.`,
+            );
+        }
+
+        // §6 EXACT MONEY: the gross is an exact decimal end-to-end — never a
+        // JS float in any authoritative calculation.
+        let withdrawAmount;
+        try {
+            withdrawAmount = new Prisma.Decimal(String(amount));
+        } catch (e) {
             throw new Error('Amount must be a valid number.');
         }
-        if (withdrawAmount < 1) {
+        if (!withdrawAmount.isFinite() || !withdrawAmount.isPositive()) {
+            throw new Error('Amount must be a valid number.');
+        }
+        if (withdrawAmount.dp() > 8) {
+            throw new Error('Amount supports at most 8 decimal places.');
+        }
+        if (withdrawAmount.lt(EWA_MIN_WITHDRAWAL)) {
             throw new Error('Minimum withdrawal is 1 AZM.');
+        }
+        if (idempotencyKey !== undefined && idempotencyKey !== null
+            && (typeof idempotencyKey !== 'string' || idempotencyKey.length === 0 || idempotencyKey.length > 140)) {
+            throw new Error('idempotencyKey must be a string of 1-140 characters.');
         }
 
         for (let attempt = 0; attempt < SERIALIZABLE_RETRY_LIMIT; attempt += 1) {
@@ -115,25 +181,51 @@ class EwaService {
                     if (!employee.ewaEligible) throw new Error('EWA is not available for this employee.');
                     if (employee.status !== 'ACTIVE') throw new Error('Only active employees can request EWA.');
 
-                    const accrued = parseFloat(employee.accruedWages);
-                    const alreadyWithdrawn = parseFloat(employee.withdrawnEarly);
-                    const maxAvailable = accrued * 0.30;
-                    const remaining = maxAvailable - alreadyWithdrawn;
+                    // §7 exact cap math on the Decimal columns
+                    const accrued = new Prisma.Decimal(employee.accruedWages);
+                    const alreadyWithdrawn = new Prisma.Decimal(employee.withdrawnEarly);
+                    const maxAvailable = accrued.mul(EWA_CAP_RATE);
+                    const remaining = maxAvailable.minus(alreadyWithdrawn);
 
-                    if (withdrawAmount > remaining) {
+                    if (withdrawAmount.gt(remaining)) {
                         throw new Error(
-                            `Amount exceeds available EWA balance. Max: ${Math.max(0, remaining).toFixed(2)} AZM`,
+                            `Amount exceeds available EWA balance. Max: ${Prisma.Decimal.max(ZERO, remaining).toFixed(2)} AZM`,
                         );
                     }
 
-                    const fee = withdrawAmount * 0.01;
-                    const netToEmployee = withdrawAmount - fee;
+                    const fee = withdrawAmount.mul(EWA_FEE_RATE).toDecimalPlaces(8, Prisma.Decimal.ROUND_HALF_UP);
+                    const netToEmployee = withdrawAmount.minus(fee);
+
+                    // §1 treasury source: the business owner's spendable balance
+                    const business = await tx.businessProfile.findUnique({
+                        where: { id: employee.businessProfileId },
+                        select: { userId: true },
+                    });
+                    if (!business) throw new Error('Business profile not found.');
+
+                    // ECONOMIC IDENTITY (r14 guarded-insert pattern): a caller-
+                    // supplied idempotencyKey claims a DB-unique TransactionHistory
+                    // txHash BEFORE any mutation. A retry or duplicate collides on
+                    // the unique index and the WHOLE transaction rolls back — a
+                    // duplicate economic request cannot mint another payout.
+                    const txHash = idempotencyKey
+                        ? `EWA_${employeeId}_${idempotencyKey}`.slice(0, 200)
+                        : null;
+                    if (txHash) {
+                        const clash = await tx.transactionHistory.findFirst({ where: { txHash }, select: { id: true } });
+                        if (clash) {
+                            throw settlementError(
+                                'EWA_DUPLICATE_REQUEST',
+                                'An EWA withdrawal with this idempotency key was already processed.',
+                            );
+                        }
+                    }
 
                     const guardWhere = {
                         id: employeeId,
                         status: 'ACTIVE',
                         ewaEligible: true,
-                        withdrawnEarly: { lte: maxAvailable - withdrawAmount },
+                        withdrawnEarly: { lte: maxAvailable.minus(withdrawAmount) },
                     };
                     if (scopedBusinessProfileId) guardWhere.businessProfileId = scopedBusinessProfileId;
 
@@ -150,28 +242,68 @@ class EwaService {
                         );
                     }
 
+                    // §1 the treasury debit that was missing: guarded so the
+                    // business cannot overdraw (invoice balanceClaim pattern).
+                    const debit = await tx.user.updateMany({
+                        where: { id: business.userId, availableBalance: { gte: withdrawAmount } },
+                        data: { availableBalance: { decrement: withdrawAmount } },
+                    });
+                    if (debit.count !== 1) {
+                        throw settlementError(
+                            'EWA_INSUFFICIENT_BUSINESS_FUNDS',
+                            'Business treasury has insufficient spendable balance for this EWA withdrawal; it was not executed.',
+                        );
+                    }
+
+                    // Employee spendable credit — User.availableBalance ONLY.
+                    // azmBalance is a loyalty-points ledger and must never
+                    // receive EWA money.
                     await tx.user.update({
                         where: { id: employee.userId },
                         data: {
-                            azmBalance: { increment: netToEmployee },
+                            availableBalance: { increment: netToEmployee },
                         },
                     });
 
-                    await tx.transactionHistory.create({
+                    // §4 platform fee realized through the established platform
+                    // fee mechanism (invoice pattern): SystemProfitFees +
+                    // AdminProfitLog + the authoritative ledger line below.
+                    if (fee.gt(ZERO)) {
+                        await tx.systemProfitFees.upsert({
+                            where: { id: 1 },
+                            update: { balance: { increment: fee } },
+                            create: { id: 1, balance: fee },
+                        });
+                    }
+
+                    const historyRow = await tx.transactionHistory.create({
                         data: {
                             userId: employee.userId,
                             type: 'EWA_WITHDRAWAL',
                             amountUsdc: netToEmployee,
                             feeUsdc: fee,
+                            txHash,
                             status: 'COMPLETED',
                             metadata: {
                                 employeeId,
-                                grossAmount: withdrawAmount,
-                                destination: destination || 'AZM_BALANCE',
+                                grossAmount: withdrawAmount.toFixed(8),
+                                fee: fee.toFixed(8),
+                                netToEmployee: netToEmployee.toFixed(8),
+                                destination: 'AZAMAN_BALANCE',
                                 source: 'BUSINESS_OS_EWA',
                             },
                         },
                     });
+
+                    if (fee.gt(ZERO)) {
+                        await tx.adminProfitLog.create({
+                            data: {
+                                source: 'EWA_FEE',
+                                amountUsdc: fee,
+                                relatedTxId: txHash || `EWA_HISTORY_${historyRow.id}`,
+                            },
+                        });
+                    }
 
                     await tx.businessLedgerEntry.create({
                         data: {
@@ -179,17 +311,48 @@ class EwaService {
                             type: 'PAYROLL',
                             category: 'EWA Withdrawal',
                             description: `EWA withdrawal by employee ${employeeId}`,
-                            amount: -withdrawAmount,
+                            amount: withdrawAmount.negated(),
                             sourceType: 'EWA',
                             sourceId: employeeId,
                             metadata: {
                                 employeeId,
-                                grossAmount: withdrawAmount,
-                                fee,
-                                netToEmployee,
-                                destination: destination || 'AZM_BALANCE',
+                                grossAmount: withdrawAmount.toFixed(8),
+                                fee: fee.toFixed(8),
+                                netToEmployee: netToEmployee.toFixed(8),
+                                destination: 'AZAMAN_BALANCE',
                             },
                         },
+                    });
+
+                    // §P.4 AUTHORITATIVE LEDGER — same transaction, durable
+                    // economic identity (unique idempotencyKey):
+                    //   D user:{businessOwner}:liability — treasury fronts gross X
+                    //   C user:{employee}:liability   — employee receives X - F
+                    //   C equity:treasury              — 1% fee realized
+                    // X = (X - F) + F balances EXACTLY in Decimal arithmetic.
+                    const ledgerLines = [
+                        { account: `user:${business.userId}:liability`, debit: withdrawAmount.toFixed(8) },
+                        { account: `user:${employee.userId}:liability`, credit: netToEmployee.toFixed(8) },
+                    ];
+                    if (fee.gt(ZERO)) {
+                        ledgerLines.push({ account: 'equity:treasury', credit: fee.toFixed(8) });
+                    }
+                    await ledger.post(tx, {
+                        idempotencyKey: txHash
+                            ? `ledger:ewa:${txHash}`
+                            : `ledger:ewa:withdraw:${historyRow.id}`,
+                        entryType: 'BUSINESS_PAYMENT',
+                        description: 'EWA withdrawal — liability moved business owner to employee, fee realized',
+                        userId: employee.userId,
+                        relatedEntity: 'businessEmployee',
+                        relatedEntityId: employeeId,
+                        metadata: {
+                            grossAmount: withdrawAmount.toFixed(8),
+                            fee: fee.toFixed(8),
+                            netToEmployee: netToEmployee.toFixed(8),
+                            destination: 'AZAMAN_BALANCE',
+                        },
+                        lines: ledgerLines,
                     });
 
                     const finalEmployee = scopedBusinessProfileId
@@ -198,12 +361,13 @@ class EwaService {
                         })
                         : await tx.businessEmployee.findUnique({ where: { id: employeeId } });
 
+                    // Response values are non-authoritative presentation (§6).
                     return {
                         success: true,
-                        grossAmount: withdrawAmount,
-                        fee,
-                        netToEmployee,
-                        remainingWithdrawable: Math.max(0, remaining - withdrawAmount),
+                        grossAmount: Number(withdrawAmount),
+                        fee: Number(fee),
+                        netToEmployee: Number(netToEmployee),
+                        remainingWithdrawable: Number(Prisma.Decimal.max(ZERO, remaining.minus(withdrawAmount))),
                         employee: finalEmployee,
                     };
                 }, { isolationLevel: 'Serializable' });
@@ -218,7 +382,7 @@ class EwaService {
         throw new Error('EWA withdrawal failed after retries.');
     }
 
-    // ── Get EWA History for Employee ───────────────────────────────────────
+    // ── Get EWA History ─────────────────────────────────────────────────────
     async getEwaHistory(employeeId, businessProfileId) {
         const scopedBusinessProfileId = this._resolveBusinessProfileId(businessProfileId);
         const where = { sourceType: 'EWA', sourceId: employeeId };
@@ -243,21 +407,29 @@ class EwaService {
             },
         });
 
-        const totalAccrued = employees.reduce((s, e) => s + parseFloat(e.accruedWages), 0);
-        const totalWithdrawn = employees.reduce((s, e) => s + parseFloat(e.withdrawnEarly), 0);
+        let totalAccrued = new Prisma.Decimal(0);
+        let totalWithdrawn = new Prisma.Decimal(0);
+        for (const e of employees) {
+            totalAccrued = totalAccrued.plus(new Prisma.Decimal(e.accruedWages));
+            totalWithdrawn = totalWithdrawn.plus(new Prisma.Decimal(e.withdrawnEarly));
+        }
 
         return {
             totalEmployees: employees.length,
-            totalAccrued,
-            totalWithdrawn,
-            totalOutstanding: totalAccrued - totalWithdrawn,
-            employees: employees.map(e => ({
-                id: e.id,
-                username: e.user.username,
-                accrued: parseFloat(e.accruedWages),
-                withdrawn: parseFloat(e.withdrawnEarly),
-                available: Math.max(0, parseFloat(e.accruedWages) * 0.30 - parseFloat(e.withdrawnEarly)),
-            })),
+            totalAccrued: Number(totalAccrued),
+            totalWithdrawn: Number(totalWithdrawn),
+            totalOutstanding: Number(totalAccrued.minus(totalWithdrawn)),
+            employees: employees.map(e => {
+                const accrued = new Prisma.Decimal(e.accruedWages);
+                const withdrawn = new Prisma.Decimal(e.withdrawnEarly);
+                return {
+                    id: e.id,
+                    username: e.user.username,
+                    accrued: Number(accrued),
+                    withdrawn: Number(withdrawn),
+                    available: Number(Prisma.Decimal.max(ZERO, accrued.mul(EWA_CAP_RATE).minus(withdrawn))),
+                };
+            }),
         };
     }
 }
