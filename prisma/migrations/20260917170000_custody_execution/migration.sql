@@ -71,3 +71,13 @@ CREATE UNIQUE INDEX IF NOT EXISTS "CustodyExecution_one_inflight_sweep_per_walle
       AND "status" IN ('REQUESTED','RESERVING','SUBMITTED','SIGNING','BROADCAST','CONFIRMING','RECONCILIATION_REQUIRED');
 
 -- No financial records are backfilled or rewritten by this migration.
+
+-- r23 D5 — recovery attempt scheduling (additive, idempotent; mirrors
+-- infra/install-custody-execution-overlay.js and prisma/schema.prisma):
+-- due-time backoff for the bounded recovery scans. NULL nextRecoveryAttemptAt
+-- means "due immediately"; the composite index serves the due-now scans.
+ALTER TABLE "CustodyExecution" ADD COLUMN IF NOT EXISTS "lastRecoveryAttemptAt" TIMESTAMP(3);
+ALTER TABLE "CustodyExecution" ADD COLUMN IF NOT EXISTS "nextRecoveryAttemptAt" TIMESTAMP(3);
+ALTER TABLE "CustodyExecution" ADD COLUMN IF NOT EXISTS "recoveryAttemptCount" INTEGER NOT NULL DEFAULT 0;
+CREATE INDEX IF NOT EXISTS "CustodyExecution_status_nextRecoveryAttemptAt_idx"
+    ON "CustodyExecution"("status", "nextRecoveryAttemptAt");

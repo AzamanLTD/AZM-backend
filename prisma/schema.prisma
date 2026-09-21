@@ -5856,6 +5856,11 @@ model CustodyExecution {
   submittedAt                   DateTime?
   broadcastAt                   DateTime?
   confirmedAt                   DateTime?
+  // r23 D5 — recovery attempt scheduling: due-time backoff for the bounded
+  // recovery scans (NULL nextRecoveryAttemptAt = due immediately).
+  lastRecoveryAttemptAt         DateTime?
+  nextRecoveryAttemptAt         DateTime?
+  recoveryAttemptCount          Int       @default(0)
   metadata                      Json?
   createdAt                     DateTime  @default(now())
   updatedAt                     DateTime  @updatedAt
@@ -5864,6 +5869,7 @@ model CustodyExecution {
   @@index([status])
   @@index([walletAddressId])
   @@index([userId])
+  @@index([status, nextRecoveryAttemptAt])
 }
 
 enum WalletAddressStatus {

@@ -122,30 +122,27 @@ function decodeErc20TransferCalldata(dataHex) {
 function decodePendingTransferSemantics(serializedTransaction) {
     if (typeof serializedTransaction !== 'string' || serializedTransaction.length === 0) return null;
 
-    // 1. JSON representation (the KMS EVM flow).
+    // r23 D4 — FAIL-CLOSED DECODING. The ONLY admissible representation is
+    // the KMS EVM JSON tx object carrying BOTH the ERC-20 transfer calldata
+    // AND an explicit `to` (the token contract). The previous bare-hex
+    // "selector-located-inside-a-larger-payload" fallback produced a decoded
+    // recipient/amount WITHOUT a contract — which matchesExecution then
+    // treated as a match against ANY token contract. A shape the decoder
+    // cannot strongly parse is UNUSABLE EVIDENCE (null): never a match,
+    // never a definitive mismatch — the row stays quarantined for a human.
+    // If Tatum ever ships a serialized-RLP EVM shape, a REAL decoder may be
+    // added here; substring search is permanently prohibited.
     try {
         const tx = JSON.parse(serializedTransaction);
-        if (tx && typeof tx === 'object') {
-            const calldata = decodeErc20TransferCalldata(String(tx.data || ''));
-            if (!calldata) return null;
-            const contract = custody.normalizeAddress(tx.to || '');
-            if (!custody.isValidPolygonAddress(contract)) return null;
-            return { contract, recipient: calldata.recipient, amountBaseUnits: calldata.amountBaseUnits };
-        }
-        return null;
-    } catch { /* not JSON — try hex */ }
-
-    // 2. Hex representation: locate the ERC-20 transfer selector.
-    const hex = serializedTransaction.toLowerCase().startsWith('0x')
-        ? serializedTransaction.slice(2)
-        : serializedTransaction;
-    if (!/^[0-9a-f]+$/.test(hex)) return null;
-    const at = hex.indexOf(ERC20_TRANSFER_SELECTOR);
-    if (at < 0 || hex.length < at + 8 + 128) return null;
-    const recipient = '0x' + hex.slice(at + 8 + 24, at + 8 + 64);
-    const amountHex = hex.slice(at + 8 + 64, at + 8 + 128);
-    if (!custody.isValidPolygonAddress(recipient)) return null;
-    return { contract: null, recipient: custody.normalizeAddress(recipient), amountBaseUnits: BigInt('0x' + amountHex) };
+        if (!tx || typeof tx !== 'object' || Array.isArray(tx)) return null;
+        const calldata = decodeErc20TransferCalldata(String(tx.data || ''));
+        if (!calldata) return null;
+        const contract = custody.normalizeAddress(String(tx.to || ''));
+        if (!custody.isValidPolygonAddress(contract)) return null; // no explicit contract → unusable
+        return { contract, recipient: calldata.recipient, amountBaseUnits: calldata.amountBaseUnits };
+    } catch {
+        return null; // not strongly parseable JSON → unusable evidence
+    }
 }
 
 /**
@@ -176,8 +173,15 @@ function matchesExecution(pending, execution, { expectedSignatureId, expectedInd
     const decoded = decodePendingTransferSemantics(pending.serializedTransaction);
     if (!decoded) return { usable: false, match: false };
 
-    if (decoded.contract != null
-        && custody.normalizeAddress(decoded.contract) !== custody.normalizeAddress(execution.contractAddress)) {
+    // r23 D4: the token contract must be EXPLICITLY established by the
+    // payload. A decode without a contract is unusable evidence — a
+    // recipient/amount collision is not a binding for a different token.
+    // (decodePendingTransferSemantics now enforces this; the check is kept
+    // as the belt to the decoder's braces.)
+    if (decoded.contract == null) {
+        return { usable: false, match: false, reason: 'CONTRACT_NOT_ESTABLISHED' };
+    }
+    if (custody.normalizeAddress(decoded.contract) !== custody.normalizeAddress(execution.contractAddress)) {
         return { usable: true, match: false, reason: 'CONTRACT_DIFFERS' };
     }
     if (decoded.recipient !== custody.normalizeAddress(execution.toAddress)) {
@@ -224,6 +228,31 @@ async function refundWithdrawalFromExecution(tx, { execution, reason }) {
     const userId = execution.userId;
     if (userId == null) throw new CustodyExecutionError(ERROR_CLASSES.CONFIGURATION_ERROR,
         `Refund refused: execution ${execution.id} has no customer identity.`);
+
+    // r23 D3 — LINKED-RECORD IDENTITY PRE-FLIGHT (before ANY money movement).
+    // refId is an unvalidated TEXT column: a corrupted/misbound linkage must
+    // surface BEFORE the balance/ledger legs execute, so the caller's
+    // quarantine conversion commits ZERO money movement. Errors thrown here
+    // are marked so failWithRefund / convergeRevertedExecution convert them
+    // into a RECONCILIATION_REQUIRED quarantine with the refund withheld.
+    if (execution.refId && execution.kind === 'CUSTOMER_WITHDRAWAL') {
+        const linked = await tx.transactionHistory.findUnique({
+            where: { id: execution.refId },
+            select: { status: true, userId: true, type: true },
+        });
+        if (linked && (Number(linked.userId) !== Number(execution.userId) || linked.type !== 'WITHDRAWAL_CRYPTO')) {
+            const err = new CustodyExecutionError(ERROR_CLASSES.CHAIN_MISMATCH,
+                `Refund refused: linked TransactionHistory ${execution.refId} is bound to a different customer/type (userId ${linked.userId}, type ${linked.type}) — refund withheld; human reconciliation required.`);
+            err.refundMisbound = true;
+            throw err;
+        }
+        if (linked && linked.status === 'COMPLETED') {
+            const err = new CustodyExecutionError(ERROR_CLASSES.CONFIGURATION_ERROR,
+                `Refund refused: linked TransactionHistory ${execution.refId} is already COMPLETED — human reconciliation required.`);
+            err.refundContradiction = true;
+            throw err;
+        }
+    }
 
     const fullDebit = BigInt(execution.metadata?.customerDebitBaseUnits ?? execution.amountBaseUnits);
     const netPayout = BigInt(execution.amountBaseUnits);
@@ -278,7 +307,12 @@ async function refundWithdrawalFromExecution(tx, { execution, reason }) {
     }
 
     // Linked customer-facing record: FAILED exactly once (conditional).
-    if (execution.refId) {
+    // The identity pre-flight above already verified owner+type, so this CAS
+    // cannot touch ANOTHER customer's record; a missing row (the pre-flight
+    // found nothing) is an integrity incident — the refund still proceeds on
+    // durable execution truth, the customer's debit is not hostage to a lost
+    // linkage.
+    if (execution.refId && execution.kind === 'CUSTOMER_WITHDRAWAL') {
         const hist = await tx.transactionHistory.updateMany({
             where: { id: execution.refId, status: 'PENDING' },
             data: { status: 'FAILED' },
@@ -286,13 +320,67 @@ async function refundWithdrawalFromExecution(tx, { execution, reason }) {
         if (hist.count === 0) {
             const current = await tx.transactionHistory.findUnique({ where: { id: execution.refId }, select: { status: true } });
             if (current && current.status === 'COMPLETED') {
-                // Genuine contradiction: the linked record says the withdrawal
-                // completed. Refusing to refund keeps money safe.
-                throw new CustodyExecutionError(ERROR_CLASSES.CONFIGURATION_ERROR,
-                    `Refund refused: linked TransactionHistory ${execution.refId} is already COMPLETED — human reconciliation required.`);
+                // The pre-flight raced a concurrent completion: the record now
+                // says the withdrawal completed. Throwing rolls back the
+                // whole refund transaction (money untouched) and the caller
+                // quarantines on refundContradiction.
+                const err = new CustodyExecutionError(ERROR_CLASSES.CONFIGURATION_ERROR,
+                    `Refund refused: linked TransactionHistory ${execution.refId} was completed concurrently — human reconciliation required.`);
+                err.refundContradiction = true;
+                throw err;
             }
+            logger.warn({ executionId: execution.id, refId: execution.refId },
+                '[custody-recovery] linked TransactionHistory missing at refund time — refund proceeds on execution truth; integrity incident recorded');
         }
     }
+}
+
+// ── r23 D5 — RECOVERY ATTEMPT SCHEDULING (fairness under load) ─────────────
+// Every examined-but-unresolved row is stamped with an exponential backoff so
+// a permanently-unresolvable row (or a provider outage) consumes
+// progressively fewer scan slots. A NEW row is always due immediately
+// (nextRecoveryAttemptAt NULL) and can therefore never be starved by a page of
+// older unresolved rows: after one examination the backlog moves into its
+// backoff window and the fresh row is visible on the next bounded pass.
+const RECOVERY_BACKOFF_SCHEDULE_MS = [
+    60 * 1000,  60 * 1000,  60 * 1000,   // first three retries: worker cadence
+    300 * 1000, 300 * 1000, 300 * 1000,  // then every 5 minutes
+];
+const RECOVERY_BACKOFF_CAP_MS = 15 * 60 * 1000; // cap: 15 minutes
+
+function recoveryBackoffMs(attemptCount) {
+    const idx = Math.max(0, Number(attemptCount) || 0);
+    return idx < RECOVERY_BACKOFF_SCHEDULE_MS.length ? RECOVERY_BACKOFF_SCHEDULE_MS[idx] : RECOVERY_BACKOFF_CAP_MS;
+}
+
+/**
+ * Stamp an examined-but-unresolved row with its next due time. Conditional on
+ * the row still being in a recovery-owned non-terminal state — if a racing
+ * worker already moved it on, this is a harmless no-op (the scans filter on
+ * status + due time). Two concurrent workers stamping the same row converge
+ * to compatible values; the attempt counter drives the backoff growth.
+ */
+async function scheduleNextRecoveryAttempt(prismaOrTx, execution, now = Date.now()) {
+    await prismaOrTx.custodyExecution.updateMany({
+        where: {
+            id: execution.id,
+            status: { in: [STATUSES.REQUESTED, STATUSES.RESERVING, STATUSES.SUBMITTED, STATUSES.SIGNING, STATUSES.RECONCILIATION_REQUIRED] },
+        },
+        data: {
+            lastRecoveryAttemptAt: new Date(now),
+            nextRecoveryAttemptAt: new Date(now + recoveryBackoffMs(execution.recoveryAttemptCount ?? 0)),
+            recoveryAttemptCount: { increment: 1 },
+        },
+    });
+}
+
+/**
+ * The due-now Prisma filter: never attempted (NULL) or past its scheduled
+ * backoff window. Shared by every category scan so the semantics are
+ * identical everywhere.
+ */
+function dueNowFilter(now) {
+    return { OR: [{ nextRecoveryAttemptAt: null }, { nextRecoveryAttemptAt: { lte: new Date(now) } }] };
 }
 
 // ── B. RESERVING recovery ────────────────────────────────────────────────────
@@ -315,9 +403,18 @@ async function refundWithdrawalFromExecution(tx, { execution, reason }) {
 async function recoverReservingExecutions(prisma, { provider = null, limit = 25, now = Date.now() } = {}) {
     custody.requireExecutionEnabled();
     const staleBefore = new Date(now - reservingStaleMs());
+    // r23 D5: due-scheduled bounded selection — rows in a backoff window are
+    // invisible, so a permanently-unresolvable row can never starve newer
+    // ones. r23 D6: REQUESTED rows are owned here too (today's creators start
+    // at RESERVING, but REQUESTED is a legal transient entry state and the
+    // state machine refuses unowned states).
     const rows = await prisma.custodyExecution.findMany({
-        where: { status: STATUSES.RESERVING, createdAt: { lt: staleBefore } },
-        orderBy: { createdAt: 'asc' },
+        where: {
+            status: { in: [STATUSES.REQUESTED, STATUSES.RESERVING] },
+            createdAt: { lt: staleBefore },
+            ...dueNowFilter(now),
+        },
+        orderBy: [{ nextRecoveryAttemptAt: { sort: 'asc', nulls: 'first' } }, { createdAt: 'asc' }],
         take: limit,
     });
     const results = [];
@@ -339,12 +436,21 @@ async function recoverReservingExecutions(prisma, { provider = null, limit = 25,
                         ? 'Recovery: withdrawal was denied before submission — refunded (no provider I/O possible).'
                         : 'Recovery: withdrawal request stranded before KMS approval (crash window) — refunded; no provider I/O occurred.',
                 });
-                results.push({ executionId: execution.id, action: outcome.failed ? 'FAILED_REFUNDED' : 'SKIPPED', status: outcome.failed ? STATUSES.FAILED : STATUSES.RESERVING });
+                if (outcome.quarantined) {
+                    results.push({ executionId: execution.id, action: 'QUARANTINED_REFUND_WITHHELD', status: STATUSES.RECONCILIATION_REQUIRED, detail: outcome.reason });
+                } else {
+                    results.push({ executionId: execution.id, action: outcome.failed ? 'FAILED_REFUNDED' : 'SKIPPED', status: outcome.failed ? STATUSES.FAILED : STATUSES.RESERVING });
+                }
             } else {
+                // Unrecognized approval status: unresolved — reschedule with
+                // backoff so it cannot monopolize the scan page (r23 D5).
+                await scheduleNextRecoveryAttempt(prisma, execution, now);
                 results.push({ executionId: execution.id, action: 'SKIPPED', status: STATUSES.RESERVING });
             }
         } catch (err) {
             logger.warn({ err: redact(err.message), executionId: execution.id }, '[custody-recovery] RESERVING recovery failed');
+            // The row stays in its state: reschedule with backoff (r23 D5).
+            await scheduleNextRecoveryAttempt(prisma, execution, now);
             results.push({ executionId: execution.id, action: 'ERROR', detail: redact(err.message) });
         }
     }
@@ -353,21 +459,68 @@ async function recoverReservingExecutions(prisma, { provider = null, limit = 25,
 
 /**
  * Exactly-once terminal failure WITH the customer refund, from
- * pre-broadcast states only (REQUESTED/RESERVING/SUBMITTED/SIGNING). The
- * conditional transition IS the single-winner claim: a concurrent duplicate
- * converges without a second refund. The ledger idempotency key converges on
- * retry even if the transaction is interrupted after commit.
+ * PRE-SUBMISSION states only (REQUESTED/RESERVING). r23 D1: SUBMITTED/SIGNING
+ * were removed — from those states NO caller can prove "no broadcast
+ * possible" from DB state alone (the submission CAS means a provider call
+ * may be or have been in flight; a provider cancel success is not broadcast
+ * proof). Post-CAS failures route to quarantine, never here.
+ *
+ * The conditional transition IS the single-winner claim: a concurrent
+ * duplicate converges without a second refund. The ledger idempotency key
+ * converges on retry even if the transaction is interrupted after commit.
+ *
+ * `transitionData` merges additional CAS-transition fields (e.g. the denial
+ * path's approvalStatus: 'DENIED') so the caller never needs a second,
+ * unconditional write after the money move.
+ *
+ * If the refund itself discovers a MISBOUND linked history row (refId
+ * pointing at another customer's record), the refund is WITHHELD and the
+ * row is quarantined in the SAME transaction — { quarantined: true }.
  */
-async function failWithRefund(prisma, { execution, errorClass, errorMessage, reason = 'definitive failure' }) {
+async function failWithRefund(prisma, { execution, errorClass, errorMessage, reason = 'definitive failure', transitionData = {} }) {
     return prisma.$transaction(async (tx) => {
         const res = await tx.custodyExecution.updateMany({
-            where: { id: execution.id, status: { in: [STATUSES.REQUESTED, STATUSES.RESERVING, STATUSES.SUBMITTED, STATUSES.SIGNING] } },
-            data: { status: STATUSES.FAILED, errorClass: errorClass || ERROR_CLASSES.PROVIDER_REJECTED, errorMessage: redact(errorMessage) },
+            where: { id: execution.id, status: { in: [STATUSES.REQUESTED, STATUSES.RESERVING] } },
+            data: { status: STATUSES.FAILED, errorClass: errorClass || ERROR_CLASSES.PROVIDER_REJECTED, errorMessage: redact(errorMessage), ...transitionData },
         });
-        if (res.count !== 1) return { failed: false, reason: 'EXECUTION_NOT_IN_PRE_BROADCAST_STATE' };
+        if (res.count !== 1) return { failed: false, reason: 'EXECUTION_NOT_IN_PRE_SUBMISSION_STATE' };
 
         if (execution.kind === 'CUSTOMER_WITHDRAWAL') {
-            await refundWithdrawalFromExecution(tx, { execution, reason });
+            try {
+                await refundWithdrawalFromExecution(tx, { execution, reason });
+            } catch (err) {
+                if (err && err.refundMisbound) {
+                    // Convert the definitive failure into a quarantine in the
+                    // SAME transaction: the refund was withheld, no money
+                    // moved, and the misbound linkage needs a human.
+                    await tx.custodyExecution.updateMany({
+                        where: { id: execution.id, status: STATUSES.FAILED },
+                        data: {
+                            status: STATUSES.RECONCILIATION_REQUIRED,
+                            errorClass: ERROR_CLASSES.CHAIN_MISMATCH,
+                            errorMessage: redact(`${err.message} [refund withheld — failWithRefund converted the failure into a quarantine]`).slice(0, 500),
+                            ...transitionData,
+                        },
+                    });
+                    return { failed: false, quarantined: true, reason: 'REFUND_MISBOUND_HISTORY_QUARANTINED' };
+                }
+                if (err && err.refundContradiction) {
+                    // Linked record claims the withdrawal COMPLETED — the
+                    // money state is genuinely contradictory. Quarantine
+                    // atomically; a human decides.
+                    await tx.custodyExecution.updateMany({
+                        where: { id: execution.id, status: STATUSES.FAILED },
+                        data: {
+                            status: STATUSES.RECONCILIATION_REQUIRED,
+                            errorClass: ERROR_CLASSES.CHAIN_MISMATCH,
+                            errorMessage: redact(`${err.message} [refund withheld — human reconciliation required]`).slice(0, 500),
+                            ...transitionData,
+                        },
+                    });
+                    return { failed: false, quarantined: true, reason: 'REFUND_CONTRADICTION_QUARANTINED' };
+                }
+                throw err;
+            }
         }
         if (execution.kind === 'DEPOSIT_SWEEP' && execution.refId) {
             // Audit-row convergence (never blocks the money path).
@@ -403,18 +556,30 @@ async function recoverSubmittedExecutions(prisma, { provider = null, limit = 25,
     custody.requireExecutionEnabled();
     const prov = provider || custody.__getProviderForRecovery();
     const graceBefore = new Date(now - submittedGraceMs());
+    // r23 D5: due-scheduled bounded selection (see recoverReservingExecutions).
     const rows = await prisma.custodyExecution.findMany({
-        where: { status: STATUSES.SUBMITTED, OR: [{ submittedAt: { lt: graceBefore } }, { submittedAt: null }] },
-        orderBy: { createdAt: 'asc' },
+        where: {
+            status: STATUSES.SUBMITTED,
+            OR: [{ submittedAt: { lt: graceBefore } }, { submittedAt: null }],
+            ...dueNowFilter(now),
+        },
+        orderBy: [{ nextRecoveryAttemptAt: { sort: 'asc', nulls: 'first' } }, { createdAt: 'asc' }],
         take: limit,
     });
     const results = [];
     for (const execution of rows) {
         try {
             const outcome = await resolveSubmittedExecution(prisma, { execution, provider: prov, now });
+            // Unresolved outcomes keep the row SUBMITTED — reschedule with
+            // backoff so a provider outage (or any permanently-unresolvable
+            // row) cannot monopolize the scan page (r23 D5).
+            if (outcome.action === 'PROVIDER_UNAVAILABLE' || outcome.action === 'ERROR') {
+                await scheduleNextRecoveryAttempt(prisma, execution, now);
+            }
             results.push({ executionId: execution.id, ...outcome });
         } catch (err) {
             logger.warn({ err: redact(err.message), executionId: execution.id }, '[custody-recovery] SUBMITTED recovery failed');
+            await scheduleNextRecoveryAttempt(prisma, execution, now);
             results.push({ executionId: execution.id, action: 'ERROR', detail: redact(err.message) });
         }
     }
@@ -422,6 +587,19 @@ async function recoverSubmittedExecutions(prisma, { provider = null, limit = 25,
 }
 
 async function resolveSubmittedExecution(prisma, { execution, provider, now = Date.now() }) {
+    // r23 D1: a DENIED execution must never return to life. The four-eye
+    // validator refuses to sign DENIED rows, so no future broadcast can
+    // follow — but a denial observed after the submission CAS could not
+    // prove none happened. Fail closed: quarantine as HUMAN-owned (the
+    // automatic reconciliation pass skips DENIED rows).
+    if (execution.approvalStatus === 'DENIED') {
+        await custody.transitionExecutionForRecovery(prisma, execution.id, [STATUSES.SUBMITTED], {
+            status: STATUSES.RECONCILIATION_REQUIRED,
+            errorClass: ERROR_CLASSES.CONFIGURATION_ERROR,
+            errorMessage: redact('Execution was denied after the submission claim — human reconciliation required (automatic recovery refuses DENIED executions).').slice(0, 500),
+        });
+        return { action: 'QUARANTINED_DENIED', status: STATUSES.RECONCILIATION_REQUIRED };
+    }
     // Crash after the provider returned a pending id but before the SIGNING
     // transition committed: converge directly on the pending's real state.
     if (execution.tatumPendingId) {
@@ -533,9 +711,24 @@ async function resolveSubmittedExecution(prisma, { execution, provider, now = Da
 async function convergeReconciliationRequired(prisma, { provider = null, limit = 25, now = Date.now() } = {}) {
     custody.requireExecutionEnabled();
     const prov = provider || custody.__getProviderForRecovery();
+    // r23 D5: the automatic pass processes ONLY the automatically-actionable
+    // classes (UNKNOWN_OUTCOME pending-scan resolution, CHAIN_REVERTED
+    // exactly-once refund convergence). Genuinely contradictory rows
+    // (CHAIN_MISMATCH, CONFIGURATION_ERROR, DENIED post-submission denials,
+    // …) are HUMAN-OWNED: they are excluded from the bounded page entirely so
+    // a permanent human case can never consume the scan slots that
+    // actionable unknown-outcome cases need. Human-owned rows remain fully
+    // visible to admin tooling — this is a scan-scope decision, not a
+    // data-visibility decision.
+    // r23 D5: due-scheduled bounded selection (see recoverReservingExecutions).
     const rows = await prisma.custodyExecution.findMany({
-        where: { status: STATUSES.RECONCILIATION_REQUIRED },
-        orderBy: { createdAt: 'asc' },
+        where: {
+            status: STATUSES.RECONCILIATION_REQUIRED,
+            errorClass: { in: [ERROR_CLASSES.UNKNOWN_OUTCOME, ERROR_CLASSES.CHAIN_REVERTED] },
+            approvalStatus: { not: 'DENIED' },
+            ...dueNowFilter(now),
+        },
+        orderBy: [{ nextRecoveryAttemptAt: { sort: 'asc', nulls: 'first' } }, { createdAt: 'asc' }],
         take: limit,
     });
     const results = [];
@@ -548,6 +741,11 @@ async function convergeReconciliationRequired(prisma, { provider = null, limit =
                 const fresh = await prisma.custodyExecution.findUnique({ where: { id: execution.id } });
                 if (fresh && fresh.status === STATUSES.RECONCILIATION_REQUIRED && !fresh.tatumPendingId) {
                     const outcome = await resolveQuarantinedSubmission(prisma, { execution: fresh, provider: prov, now });
+                    // STILL_QUARANTINED_* / PROVIDER_UNAVAILABLE keep the row
+                    // quarantined — reschedule with backoff (r23 D5).
+                    if (String(outcome.action).startsWith('STILL_QUARANTINED') || outcome.action === 'PROVIDER_UNAVAILABLE' || outcome.action === 'ERROR') {
+                        await scheduleNextRecoveryAttempt(prisma, fresh, now);
+                    }
                     results.push({ executionId: execution.id, ...outcome });
                     continue;
                 }
@@ -563,6 +761,7 @@ async function convergeReconciliationRequired(prisma, { provider = null, limit =
             results.push({ executionId: execution.id, action: 'HUMAN_RECONCILIATION', errorClass: execution.errorClass });
         } catch (err) {
             logger.warn({ err: redact(err.message), executionId: execution.id }, '[custody-recovery] reconciliation convergence failed');
+            await scheduleNextRecoveryAttempt(prisma, execution, now);
             results.push({ executionId: execution.id, action: 'ERROR', detail: redact(err.message) });
         }
     }
@@ -572,6 +771,11 @@ async function convergeReconciliationRequired(prisma, { provider = null, limit =
 /** Quarantined ambiguous submission: same pending-scan resolution as C, but a
  *  no-match outcome leaves the quarantine in place (idempotent). */
 async function resolveQuarantinedSubmission(prisma, { execution, provider, now = Date.now() }) {
+    // r23 D1: a DENIED execution must never return to life — never bind a
+    // provider pending to it, never resurrect it into SIGNING/BROADCAST.
+    if (execution.approvalStatus === 'DENIED') {
+        return { action: 'HUMAN_RECONCILIATION', errorClass: execution.errorClass, detail: 'DENIED — a human must verify whether the unavoidable external race broadcast before the denial' };
+    }
     const signer = signerIdentityFor(prisma, execution);
     if (!signer || !signer.signatureId) {
         return { action: 'HUMAN_RECONCILIATION', errorClass: execution.errorClass };
@@ -640,10 +844,30 @@ async function convergeRevertedExecution(prisma, { execution, now = Date.now() }
         }
 
         if (execution.kind === 'CUSTOMER_WITHDRAWAL') {
-            await refundWithdrawalFromExecution(tx, {
-                execution,
-                reason: 'verified chain revert',
-            });
+            try {
+                await refundWithdrawalFromExecution(tx, {
+                    execution,
+                    reason: 'verified chain revert',
+                });
+            } catch (err) {
+                if (err && (err.refundMisbound || err.refundContradiction)) {
+                    // The revert is definitive but the refund's linkage is
+                    // misbound/contradictory: the refund is WITHHELD and the
+                    // row is re-classified as human-owned (CHAIN_MISMATCH) in
+                    // the same transaction — no money moved, no silent
+                    // divergence, and the automatic pass stops touching it.
+                    await tx.custodyExecution.updateMany({
+                        where: { id: execution.id, status: STATUSES.FAILED },
+                        data: {
+                            status: STATUSES.RECONCILIATION_REQUIRED,
+                            errorClass: ERROR_CLASSES.CHAIN_MISMATCH,
+                            errorMessage: redact(`${err.message} [chain revert was verified; refund withheld — human reconciliation required]`).slice(0, 500),
+                        },
+                    });
+                    return { action: 'REVERT_REFUND_WITHHELD_QUARANTINED', status: STATUSES.RECONCILIATION_REQUIRED };
+                }
+                throw err;
+            }
         }
         if (execution.kind === 'DEPOSIT_SWEEP' && execution.refId) {
             await tx.onchainSweep.updateMany({
@@ -698,6 +922,8 @@ module.exports = {
     signerIdentityFor,
     reservingStaleMs,
     submittedGraceMs,
+    recoveryBackoffMs,
+    scheduleNextRecoveryAttempt,
     // recovery owners
     recoverReservingExecutions,
     recoverSubmittedExecutions,

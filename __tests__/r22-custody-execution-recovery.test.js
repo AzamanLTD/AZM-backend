@@ -166,17 +166,28 @@ describe('r22 unit — ERC-20 calldata decoding (no DB)', () => {
         expect(recovery.decodeErc20TransferCalldata('0x095ea7b3' + 'ff'.repeat(128))).toBeNull();
     });
 
-    it('decodes the JSON serialized representation and the bare-hex fallback', () => {
+    it('decodes the JSON serialized representation (the ONLY admissible shape)', () => {
         const json = recovery.decodePendingTransferSemantics(
             JSON.stringify({ data: transferCalldata(DEST, 2500000n), to: NATIVE })
         );
         expect(json).toMatchObject({ contract: NATIVE, recipient: DEST, amountBaseUnits: 2500000n });
+    });
 
-        // Bare hex: the transfer selector located inside a larger payload.
+    it('r23 D4: a bare-hex payload is UNUSABLE evidence — no selector-substring binding', () => {
+        // The bare-hex fallback was removed (r23 D4): decoding a transfer
+        // selector located inside an arbitrary hex blob produced semantics
+        // WITHOUT an established token contract — a recipient/amount
+        // collision could then bind ANY contract's transfer. Fail closed.
         const hex = '0x' + 'ee'.repeat(6) + transferCalldata(DEST, 700000n).slice(2);
-        const decodedHex = recovery.decodePendingTransferSemantics(hex);
-        expect(decodedHex.recipient).toBe(DEST);
-        expect(decodedHex.amountBaseUnits).toBe(700000n);
+        expect(recovery.decodePendingTransferSemantics(hex)).toBeNull();
+        // JSON without an explicit `to` (the token contract) is unusable.
+        expect(recovery.decodePendingTransferSemantics(
+            JSON.stringify({ data: transferCalldata(DEST, 700000n) })
+        )).toBeNull();
+        // JSON with an invalid contract address is unusable.
+        expect(recovery.decodePendingTransferSemantics(
+            JSON.stringify({ data: transferCalldata(DEST, 700000n), to: '0x123' })
+        )).toBeNull();
     });
 
     it('treats an unparseable serialized transaction as UNUSABLE evidence — never a mismatch, never a match', () => {
@@ -694,7 +705,10 @@ describeOrSkip('r22 recovery (real PostgreSQL)', () => {
             custody.__setProviderForTests(fakeProvider({
                 pendings: [makePending({ id: 'pend-late', to: DEST, amount: execution.amountBaseUnits })],
             }));
-            results = await recovery.convergeReconciliationRequired(prisma);
+            // r23 D5: the first pass rescheduled the row into a 60s backoff
+            // window — advance the pass clock past it (a real worker's next
+            // 60s tick does this naturally).
+            results = await recovery.convergeReconciliationRequired(prisma, { now: Date.now() + 61 * 1000 });
             expect(results[0].action).toBe('BOUND_SIGNING');
             const after = await currentExec(execution.id);
             expect(after.status).toBe(STATUSES.SIGNING);
@@ -741,8 +755,11 @@ describeOrSkip('r22 recovery (real PostgreSQL)', () => {
             const before = await balanceOf(user.id);
             const { execution } = await seedQuarantined({ user, errorClass: ERROR_CLASSES.CHAIN_MISMATCH, pendingId: 'pend-mm' });
 
+            // r23 D5: CHAIN_MISMATCH is a HUMAN-OWNED class — excluded from
+            // the bounded automatic scan entirely (it used to be returned as
+            // a HUMAN_RECONCILIATION action each pass).
             const results = await recovery.convergeReconciliationRequired(prisma);
-            expect(results[0].action).toBe('HUMAN_RECONCILIATION');
+            expect(results).toHaveLength(0);
 
             const after = await currentExec(execution.id);
             expect(after.status).toBe(STATUSES.RECONCILIATION_REQUIRED);
@@ -897,7 +914,7 @@ describeOrSkip('r22 recovery (real PostgreSQL)', () => {
     // ── H. approval / denial races ───────────────────────────────────────────
 
     describe('H — approval/denial race hardening', () => {
-        it('DENY with a successful provider cancel → definitive FAILED + exactly-once refund (no broadcast possible)', async () => {
+        it('r23 D1: DENY from SIGNING with a successful provider cancel → QUARANTINED (cancel is NOT broadcast proof)', async () => {
             const user = await seedUser(500);
             const before = await balanceOf(user.id);
             const { execution } = await seedReservedWithdrawal({ user });
@@ -914,9 +931,14 @@ describeOrSkip('r22 recovery (real PostgreSQL)', () => {
 
             const denied = await custody.denyKmsRequest(prisma, execution.id, 'operator denied', provider);
             expect(denied.approvalStatus).toBe('DENIED');
-            expect(provider.deletes).toContain('pend-deny-1');
-            expect((await currentExec(execution.id)).status).toBe(STATUSES.FAILED);
-            expect((await balanceOf(user.id)).toString()).toBe(before.plus('1').toString());
+            expect(provider.deletes).toContain('pend-deny-1'); // best-effort cancel still happens
+            expect(denied.denialLimitation).toBe('QUARANTINED_POST_SUBMISSION_PENDING_CANCELLED');
+            const after = await currentExec(execution.id);
+            // Past the submission CAS a cancel success is not broadcast proof
+            // (a daemon fetch already in flight is an unavoidable external
+            // race): fail closed — quarantine, NEVER refund on denial.
+            expect(after.status).toBe(STATUSES.RECONCILIATION_REQUIRED);
+            expect((await balanceOf(user.id)).toString()).toBe(before.toString());
         });
 
         it('DENY whose provider cancel FAILS → quarantined (an in-flight KMS fetch is an unavoidable external race)', async () => {

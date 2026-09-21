@@ -57,6 +57,13 @@ const STATEMENTS = [
     ON "CustodyExecution"("status");`,
   `CREATE INDEX IF NOT EXISTS "CustodyExecution_walletAddressId_idx"
     ON "CustodyExecution"("walletAddressId");`,
+  // r23 D5 — recovery attempt scheduling columns (idempotent; mirrored by
+  // prisma/schema.prisma and the recovery scans' due-time filter).
+  `ALTER TABLE "CustodyExecution" ADD COLUMN IF NOT EXISTS "lastRecoveryAttemptAt" TIMESTAMP(3)`,
+  `ALTER TABLE "CustodyExecution" ADD COLUMN IF NOT EXISTS "nextRecoveryAttemptAt" TIMESTAMP(3)`,
+  `ALTER TABLE "CustodyExecution" ADD COLUMN IF NOT EXISTS "recoveryAttemptCount" INTEGER NOT NULL DEFAULT 0`,
+  `CREATE INDEX IF NOT EXISTS "CustodyExecution_status_nextRecoveryAttemptAt_idx"
+    ON "CustodyExecution"("status", "nextRecoveryAttemptAt")`,
   `CREATE INDEX IF NOT EXISTS "CustodyExecution_userId_idx"
     ON "CustodyExecution"("userId");`,
   // DB-enforced sweep-claim authority: exactly one in-flight sweep per source

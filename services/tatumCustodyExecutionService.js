@@ -666,7 +666,14 @@ async function claimSweepExecution(prisma, {
 // r22 A — THE EXECUTION STATE MACHINE (enforced by FORWARD_TRANSITIONS below;
 // each entry documents owner / resumability / evidence source / crash window).
 const STATE_MACHINE = Object.freeze({
-    [STATUSES.REQUESTED]:            { recoveryOwner: 'creator flow',      providerIo: false, resumable: true,  evidence: 'internal' },
+    // REQUESTED is a legal transient entry state: today's creators
+    // (createWithdrawalExecution / claimSweepExecution) create rows directly
+    // in RESERVING, so no production row is currently left in REQUESTED —
+    // but a two-phase creator may use it, and the state machine refuses
+    // unowned states. It therefore shares the RESERVING recovery owner and
+    // the same policy (stale PENDING/DENIED → fail+refund; APPROVED →
+    // canonical resubmission). (r23 D6)
+    [STATUSES.REQUESTED]:            { recoveryOwner: 'custodyRecoveryService.recoverReservingExecutions', providerIo: false, resumable: true, evidence: 'internal' },
     [STATUSES.RESERVING]:            { recoveryOwner: 'custodyRecoveryService.recoverReservingExecutions', providerIo: false, resumable: true,  evidence: 'internal (approval) + provider (post-CAS)' },
     [STATUSES.SUBMITTED]:            { recoveryOwner: 'custodyRecoveryService.recoverSubmittedExecutions',   providerIo: 'ambiguous (CAS won; response maybe lost)', resumable: true, evidence: 'GET /v3/kms/pending/{chain} + GET /v3/kms/{id}' },
     [STATUSES.SIGNING]:              { recoveryOwner: 'reconcilePendingExecutions (advanceExecution)',       providerIo: true,  resumable: true,  evidence: 'GET /v3/kms/{id}' },
@@ -749,100 +756,176 @@ async function approveKmsRequest(prisma, { executionId, expected }) {
     if (expected.refId && String(expected.refId) !== String(execution.refId)) throw mismatch('customer withdrawal reference does not match');
     if (expected.userId != null && execution.userId != null && Number(expected.userId) !== Number(execution.userId)) throw mismatch('user reference does not match');
 
-    const updated = await prisma.custodyExecution.update({
-        where: { id: executionId },
+    // ── r23 D2 — APPROVAL IS A CONDITIONAL (CAS) WRITE ─────────────────────
+    // The earlier reads above are only a fast path; this conditional update
+    // is the durable authority. It wins ONLY when the row is still:
+    //   • awaiting approval (approvalStatus PENDING — a denial that already
+    //     landed can never be overwritten),
+    //   • in an approval-eligible lifecycle state (REQUESTED/RESERVING — the
+    //     durable authorization happens pre-submission by construction; an
+    //     approval recorded after the submission CAS could never legitimize
+    //     anything and would only diverge the record from the money),
+    //   • carrying no broadcast evidence (txHash null).
+    // A lost CAS means a concurrent denial/failure/submission made this
+    // authorization stale: re-read and fail CLOSED with the exact reason —
+    // never restore APPROVED after a denial.
+    const res = await prisma.custodyExecution.updateMany({
+        where: {
+            id: executionId,
+            approvalStatus: 'PENDING',
+            status: { in: [STATUSES.REQUESTED, STATUSES.RESERVING] },
+            txHash: null,
+        },
         data: { approvalStatus: 'APPROVED', approvedAt: new Date() },
     });
+    if (res.count !== 1) {
+        const fresh = await prisma.custodyExecution.findUnique({ where: { id: executionId } });
+        if (fresh && fresh.approvalStatus === 'APPROVED') {
+            // Legitimate repeat of a durable approval (idempotent).
+            return { execution: fresh, approved: true, alreadyApproved: true };
+        }
+        throw new CustodyExecutionError(ERROR_CLASSES.CONFIGURATION_ERROR,
+            `KMS approval request ${executionId} is stale (approvalStatus ${fresh?.approvalStatus ?? '?'}, status ${fresh?.status ?? '?'}) — rejected; APPROVED was not restored.`);
+    }
+    const updated = await prisma.custodyExecution.findUnique({ where: { id: executionId } });
     return { execution: updated, approved: true, alreadyApproved: false };
 }
 
 async function denyKmsRequest(prisma, executionId, reason, provider = null) {
-    const execution = await prisma.custodyExecution.findUnique({ where: { id: executionId } });
-    if (!execution) throw new CustodyExecutionError(ERROR_CLASSES.CONFIGURATION_ERROR, `Unknown KMS approval request ${executionId}.`);
-    if (TERMINAL.has(execution.status)) {
-        // Already terminal (settled/failed/quarantined): a denial cannot
-        // change money that already moved. Record the refusal fact only.
-        return prisma.custodyExecution.update({
-            where: { id: executionId },
-            data: { approvalStatus: 'DENIED', errorClass: ERROR_CLASSES.CONFIGURATION_ERROR, errorMessage: redact(reason || 'denied (terminal — recorded only)') },
-        });
-    }
-
-    // ── H (r22): APPROVAL/SUBMISSION RACE — an external cancel is attempted
-    // FIRST so the provider's pending operation dies before any local
-    // terminal decision. The cancel result determines what is provably safe:
+    // ── r23 D1 — DENIAL EVIDENCE CONTRACT ──────────────────────────────────
+    // A denial is issued by an operator who has NO knowledge of an in-flight
+    // provider call. The ONLY proof available to the denier is the durable
+    // DB state:
     //
-    //   cancel SUCCEEDED (or no pendingId) → the KMS daemon can never sign
-    //     this transaction: no broadcast can follow. The execution is failed
-    //     definitively FROM PRE-BROADCAST STATES ONLY (conditional CAS —
-    //     a racing submitter that already claimed SUBMITTED/SIGNING keeps its
-    //     own in-flight state; its own ambiguous handling owns it).
+    //   REQUESTED/RESERVING — the submission CAS was never claimed, so no
+    //     provider I/O can have happened FOR THIS EXECUTION. The denial is
+    //     definitive: FAILED + exactly-once refund (failWithRefund's own CAS
+    //     is the single-winner claim; a racing submitter that claims
+    //     SUBMITTED keeps its in-flight state and the loop re-classifies).
     //
-    //   cancel FAILED → the pending may still be alive: the daemon could
-    //     already have fetched it. The four-eye validator will REFUSE to sign
-    //     (approvalStatus DENIED ≠ APPROVED), which stops future signing, but
-    //     a fetch in flight at the exact moment of the denial is an
-    //     UNAVOIDABLE external race. Fail-closed representation: the
-    //     execution is quarantined for human reconciliation — never refunded,
-    //     never retried, and never reported as failed.
+    //   SUBMITTED/SIGNING (no txHash) — the provider MAY have been contacted
+    //     (the claim exists). A successful provider cancel is NOT broadcast
+    //     proof: Tatum's documented lifecycle lets a KMS daemon fetch that
+    //     was already in flight sign and broadcast the transaction. So the
+    //     cancel is attempted FIRST (best-effort: it stops future fetches)
+    //     and its result is RECORDED, but the row is ALWAYS quarantined —
+    //     never refunded on the denial path, never reported as failed.
+    //     approvalStatus=DENIED also stops the four-eye validator from ever
+    //     authorizing a signature for this execution again.
     //
-    //   BROADCAST/CONFIRMING with txHash → the transfer is already on chain;
-    //     a denial cannot un-broadcast. The DENIED fact is recorded, the
-    //     chain evidence remains the settlement authority, and the exact
+    //   BROADCAST/CONFIRMING with txHash — the transfer is already on chain;
+    //     a denial cannot un-broadcast. The DENIED fact is recorded, chain
+    //     evidence remains the settlement authority, and the exact
     //     limitation is returned to the caller.
-    if (execution.txHash && (execution.status === STATUSES.BROADCAST || execution.status === STATUSES.CONFIRMING)) {
-        const updated = await prisma.custodyExecution.update({
-            where: { id: executionId },
-            data: { approvalStatus: 'DENIED', errorClass: ERROR_CLASSES.CONFIGURATION_ERROR, errorMessage: redact(`${reason || 'denied'} [limitation: transaction already broadcast — chain evidence remains the settlement authority]`) },
-        });
-        return { ...updated, denialLimitation: 'ALREADY_BROADCAST' };
-    }
-
-    let cancelOk = true;
-    if (execution.tatumPendingId) {
-        if (provider) {
-            try { await provider.deletePendingRequest(execution.tatumPendingId); }
-            catch (err) { cancelOk = false; logger.warn({ err: redact(err.message || String(err)), executionId }, '[custody-execution] KMS pending cancel failed during denial — quarantining'); }
-        } else {
-            cancelOk = false; // no provider available: cannot PROVE the pending is dead
+    //
+    //   Terminal (COMPLETED/FAILED/RECONCILIATION_REQUIRED) — record the
+    //     refusal fact only. This is also the idempotency boundary: a
+    //     REPEATED denial can never move money a second time (proof: the
+    //     first denial already moved the row out of the CAS sets; the
+    //     second denial hits this branch and writes only the DENIED fact).
+    //
+    // The loop re-reads on every iteration so a lost CAS (a racing submitter
+    // claiming SUBMITTED between read and transition) is re-classified
+    // against the CURRENT row — never against the stale snapshot.
+    const MAX_DENY_ITERATIONS = 5;
+    for (let i = 0; i < MAX_DENY_ITERATIONS; i++) {
+        const execution = await prisma.custodyExecution.findUnique({ where: { id: executionId } });
+        if (!execution) throw new CustodyExecutionError(ERROR_CLASSES.CONFIGURATION_ERROR, `Unknown KMS approval request ${executionId}.`);
+        if (TERMINAL.has(execution.status)) {
+            // Already terminal (settled/failed/quarantined): a denial cannot
+            // change money that already moved. Record the refusal fact only.
+            const updated = await prisma.custodyExecution.update({
+                where: { id: executionId },
+                data: { approvalStatus: 'DENIED', errorClass: execution.errorClass || ERROR_CLASSES.CONFIGURATION_ERROR, errorMessage: redact(`${reason || 'denied'} [limitation: already ${execution.status} — fact recorded only]`) },
+            });
+            return { ...updated, denialLimitation: 'ALREADY_TERMINAL' };
         }
-    }
 
-    if (!cancelOk) {
-        await transitionExecution(prisma, executionId, INFLIGHT, {
-            status: STATUSES.RECONCILIATION_REQUIRED,
-            approvalStatus: 'DENIED',
-            errorClass: ERROR_CLASSES.UNKNOWN_OUTCOME,
-            errorMessage: redact(`Denial could not cancel the provider pending transaction — human reconciliation required. ${reason || ''}`),
-        });
-        const updated = await prisma.custodyExecution.findUnique({ where: { id: executionId } });
-        return { ...updated, denialLimitation: 'PENDING_CANCEL_FAILED_QUARANTINED' };
-    }
+        if (execution.txHash && (execution.status === STATUSES.BROADCAST || execution.status === STATUSES.CONFIRMING)) {
+            const updated = await prisma.custodyExecution.update({
+                where: { id: executionId },
+                data: { approvalStatus: 'DENIED', errorClass: ERROR_CLASSES.CONFIGURATION_ERROR, errorMessage: redact(`${reason || 'denied'} [limitation: transaction already broadcast — chain evidence remains the settlement authority]`) },
+            });
+            return { ...updated, denialLimitation: 'ALREADY_BROADCAST' };
+        }
 
-    // Cancel proven (or never existed): no broadcast can follow. Fail from
-    // pre-broadcast states ONLY, and converge the money side in the SAME
-    // conditional transaction: a customer withdrawal refund is exactly-once
-    // and atomic with the FAILED transition (the recovery service's shared
-    // refund is the single economic implementation for both paths).
-    if (execution.kind === 'CUSTOMER_WITHDRAWAL') {
-        const recovery = require('./custodyRecoveryService'); // lazy: no import cycle
-        await recovery.failWithRefund(prisma, {
-            execution,
-            errorClass: ERROR_CLASSES.CONFIGURATION_ERROR,
-            errorMessage: redact(`${reason || 'denied'} [provider pending cancelled — no broadcast possible]`),
-            reason: 'KMS denial (pending cancelled)',
-        });
-    } else {
-        await transitionExecution(prisma, executionId, [STATUSES.REQUESTED, STATUSES.RESERVING, STATUSES.SUBMITTED, STATUSES.SIGNING], {
-            status: STATUSES.FAILED,
-            errorClass: ERROR_CLASSES.CONFIGURATION_ERROR,
-            errorMessage: redact(`${reason || 'denied'} [provider pending cancelled — no broadcast possible]`),
-        });
+        // Best-effort provider cancel (kills the pending so future daemon
+        // fetches stop seeing it). The result is recorded as evidence — it
+        // is NEVER used as no-broadcast proof (r23 D1).
+        let cancelAttempted = false;
+        let cancelOk = null;
+        if (execution.tatumPendingId && provider) {
+            cancelAttempted = true;
+            try {
+                await provider.deletePendingRequest(execution.tatumPendingId);
+                cancelOk = true;
+            } catch (err) {
+                cancelOk = false;
+                logger.warn({ err: redact(err.message || String(err)), executionId }, '[custody-execution] KMS pending cancel failed during denial — quarantining');
+            }
+        }
+
+        if (execution.status === STATUSES.REQUESTED || execution.status === STATUSES.RESERVING) {
+            // Definitive: the submission CAS was never claimed — no provider
+            // I/O can have happened. Fail + refund through the shared
+            // exactly-once primitive (its CAS is the single-winner claim).
+            const recovery = require('./custodyRecoveryService'); // lazy: no import cycle
+            const outcome = await recovery.failWithRefund(prisma, {
+                execution,
+                errorClass: ERROR_CLASSES.CONFIGURATION_ERROR,
+                errorMessage: redact(`${reason || 'denied'} [denied before submission — no provider I/O possible]`),
+                reason: 'KMS denial (pre-submission)',
+                transitionData: { approvalStatus: 'DENIED' },
+            });
+            if (outcome.failed) {
+                const updated = await prisma.custodyExecution.findUnique({ where: { id: executionId } });
+                return { ...updated, denialLimitation: 'FAILED_REFUNDED_PRE_SUBMISSION' };
+            }
+            if (outcome.quarantined) {
+                // The refund itself discovered misbound history linkage —
+                // the money was withheld and the row is quarantined.
+                const updated = await prisma.custodyExecution.findUnique({ where: { id: executionId } });
+                return { ...updated, denialLimitation: 'REFUND_WITHHELD_MISBOUND_HISTORY_QUARANTINED' };
+            }
+            // Lost the CAS to a racing submitter (row moved to SUBMITTED) —
+            // loop and re-classify against the fresh state.
+            continue;
+        }
+
+        if (execution.status === STATUSES.SUBMITTED || execution.status === STATUSES.SIGNING) {
+            // Past the submission CAS: a provider call may be (or have been)
+            // in flight and a cancel success is NOT broadcast proof. Fail
+            // closed: quarantine + record DENIED (the validator refuses to
+            // sign DENIED, so no future signing can resurrect this
+            // execution), NEVER refund on the denial path.
+            const cancelNote = !cancelAttempted
+                ? ''
+                : (cancelOk
+                    ? ' [provider pending cancelled — cancel is NOT broadcast proof: a daemon fetch already in flight is an unavoidable external race]'
+                    : ' [provider pending cancel FAILED — the pending may still be alive]');
+            const moved = await transitionExecution(prisma, executionId, [STATUSES.SUBMITTED, STATUSES.SIGNING], {
+                status: STATUSES.RECONCILIATION_REQUIRED,
+                approvalStatus: 'DENIED',
+                errorClass: ERROR_CLASSES.UNKNOWN_OUTCOME,
+                errorMessage: redact(`Denial of an already-submitted request — human reconciliation required before any refund or retry. ${reason || ''}${cancelNote}`).slice(0, 500),
+            });
+            if (!moved) {
+                // A racing submitter/advancer moved the row — loop and
+                // re-classify against the fresh state.
+                continue;
+            }
+            const updated = await prisma.custodyExecution.findUnique({ where: { id: executionId } });
+            return { ...updated, denialLimitation: cancelAttempted && cancelOk ? 'QUARANTINED_POST_SUBMISSION_PENDING_CANCELLED' : (cancelAttempted ? 'PENDING_CANCEL_FAILED_QUARANTINED' : 'QUARANTINED_POST_SUBMISSION') };
+        }
+
+        // BROADCAST/CONFIRMING without txHash cannot exist by construction;
+        // any other state is unexpected — loop once more, then fail closed.
     }
-    return prisma.custodyExecution.update({
-        where: { id: executionId },
-        data: { approvalStatus: 'DENIED' },
-    });
+    // Could not converge within the iteration bound (sustained concurrent
+    // mutation). Refuse to claim anything — the row keeps its current state
+    // and the caller is told the denial did not converge.
+    throw new CustodyExecutionError(ERROR_CLASSES.CONFIGURATION_ERROR,
+        `Denial of ${executionId} could not converge against concurrent state changes — no money moved; retry the denial.`);
 }
 
 // ── Four-eye external validation (Tatum KMS externalUrl contract) ──────────
@@ -1065,10 +1148,19 @@ async function submitExecution(prisma, { executionId }, { provider = getProvider
             if (!isValidTxHash(result.txHash)) {
                 await reconcileAmbiguous(pendingId, 'provider returned a malformed tx hash');
             }
-            await transitionExecution(prisma, executionId, [STATUSES.SUBMITTED, STATUSES.SIGNING, STATUSES.BROADCAST], {
+            const movedToBroadcast = await transitionExecution(prisma, executionId, [STATUSES.SUBMITTED, STATUSES.SIGNING, STATUSES.BROADCAST], {
                 status: STATUSES.BROADCAST, txHash: result.txHash, broadcastAt: new Date(),
                 tatumPendingId: pendingId || undefined,
             });
+            if (!movedToBroadcast) {
+                // r23 D1: a concurrent denial quarantined (or an advancer
+                // moved) the row while the provider call was in flight. The
+                // provider response is real but the durable row belongs to
+                // the winner — converge on the actual state; never claim
+                // BROADCAST that is not durably ours.
+                const current = await prisma.custodyExecution.findUnique({ where: { id: executionId } });
+                return { status: current?.status || 'UNKNOWN', txHash: current?.txHash || null, pending: current ? !TERMINAL.has(current.status) : false, converged: true, pendingId };
+            }
             return { status: STATUSES.BROADCAST, txHash: result.txHash, pending: false };
         }
 
@@ -1082,9 +1174,18 @@ async function submitExecution(prisma, { executionId }, { provider = getProvider
             // durable approval was already recorded pre-submission and is
             // exactly what the validator enforces; the submission boundary
             // checked it above.
-            await transitionExecution(prisma, executionId, [STATUSES.SUBMITTED], {
+            const movedToSigning = await transitionExecution(prisma, executionId, [STATUSES.SUBMITTED], {
                 status: STATUSES.SIGNING, tatumPendingId: pendingId,
             });
+            if (!movedToSigning) {
+                // r23 D1: a concurrent denial quarantined the row while the
+                // provider call was in flight. The pending exists at the
+                // provider, but approvalStatus=DENIED (recorded by the
+                // denial) makes the four-eye validator refuse to sign it —
+                // the durable row stays with the denial's winner.
+                const current = await prisma.custodyExecution.findUnique({ where: { id: executionId } });
+                return { status: current?.status || 'UNKNOWN', pendingId, pending: current ? !TERMINAL.has(current.status) : false, converged: true };
+            }
             return { status: STATUSES.SIGNING, pendingId, pending: true };
         }
 
@@ -1340,12 +1441,56 @@ async function settleExecution(prisma, { executionId, evidence } = {}) {
             //    (rolls back) and the execution is quarantined for human
             //    reconciliation — money state and record state can never
             //    silently disagree.
-            const hist = await tx.transactionHistory.findUnique({ where: { id: execution.refId }, select: { status: true } });
+            const hist = await tx.transactionHistory.findUnique({ where: { id: execution.refId }, select: { status: true, userId: true, type: true, txHash: true, amountUsdc: true, feeUsdc: true } });
             // NOTE: we are INSIDE the settle transaction whose earlier CAS
             // already moved this row to COMPLETED (uncommitted). The guards
             // below therefore cannot re-filter on status — this transaction's
             // atomicity IS the single-winner claim; overriding the row here
             // either commits the quarantine or rolls everything back.
+            const QuarantineSettlement = (reason, message) => tx.custodyExecution.updateMany({
+                where: { id: executionId },
+                data: {
+                    status: STATUSES.RECONCILIATION_REQUIRED,
+                    errorClass: ERROR_CLASSES.CHAIN_MISMATCH,
+                    errorMessage: redact(message).slice(0, 500),
+                },
+            }).then(() => ({ settled: false, alreadySettled: false, status: STATUSES.RECONCILIATION_REQUIRED, reason }));
+            // ── r23 D3 — LINKED-RECORD IDENTITY GUARDS ──────────────────────
+            // refId is an unvalidated TEXT column. Settlement must never
+            // complete an execution whose linked customer-facing record is
+            // bound to a DIFFERENT customer, a different record type, or a
+            // conflicting economic identity — a corrupted/misbound refId must
+            // surface as a human reconciliation, never as a silent success.
+            if (hist && execution.userId != null && hist.userId != null && Number(hist.userId) !== Number(execution.userId)) {
+                return QuarantineSettlement('LINKED_HISTORY_WRONG_OWNER',
+                    `Settlement refused: linked TransactionHistory ${execution.refId} belongs to user ${hist.userId}, but the execution belongs to user ${execution.userId} — human reconciliation required.`);
+            }
+            if (hist && hist.type !== 'WITHDRAWAL_CRYPTO') {
+                return QuarantineSettlement('LINKED_HISTORY_WRONG_TYPE',
+                    `Settlement refused: linked TransactionHistory ${execution.refId} has type ${hist.type}, not WITHDRAWAL_CRYPTO — human reconciliation required.`);
+            }
+            if (hist) {
+                // Economic identity: the linked record's NET payout must
+                // EXACTLY equal the execution's base-unit economics (6
+                // decimals) — compared as exact decimals, floating point is
+                // never the authority. The fee is compared ONLY when the
+                // execution carries a feeChargeBaseUnits authority: the
+                // column is nullable and legacy executions legitimately keep
+                // the fee on the history side alone; an absent execution
+                // authority cannot "disagree".
+                const expectedNet = require('./custodyAccountingService').decimalStringFromBaseUnits(BigInt(execution.amountBaseUnits), 6);
+                const PrismaDecimal = require('@prisma/client').Prisma.Decimal;
+                const netOk = new PrismaDecimal(hist.amountUsdc ?? 0).equals(new PrismaDecimal(expectedNet));
+                let feeOk = true;
+                if (execution.feeChargeBaseUnits != null) {
+                    const expectedFee = require('./custodyAccountingService').decimalStringFromBaseUnits(BigInt(execution.feeChargeBaseUnits), 6);
+                    feeOk = new PrismaDecimal(hist.feeUsdc ?? 0).equals(new PrismaDecimal(expectedFee));
+                }
+                if (!netOk || !feeOk) {
+                    return QuarantineSettlement('LINKED_HISTORY_ECONOMIC_MISMATCH',
+                        `Settlement refused: linked TransactionHistory ${execution.refId} economics (net ${hist.amountUsdc}, fee ${hist.feeUsdc ?? 'absent'}) do not match the execution (net ${expectedNet}) — human reconciliation required.`);
+                }
+            }
             if (!hist) {
                 await tx.custodyExecution.updateMany({
                     where: { id: executionId },
@@ -1379,6 +1524,14 @@ async function settleExecution(prisma, { executionId, evidence } = {}) {
                     `Settlement refused: linked TransactionHistory ${execution.refId} changed concurrently — settlement will retry.`);
             }
             if (hist.status === 'COMPLETED' && execution.txHash) {
+                if (hist.txHash && hist.txHash !== execution.txHash) {
+                    // r23 D3: TWO competing transaction-hash authorities that
+                    // DISAGREE is a genuine contradiction — never silently
+                    // overwrite one with the other and never settle over
+                    // it. Quarantine for human reconciliation.
+                    return QuarantineSettlement('LINKED_HISTORY_TXHASH_CONFLICT',
+                        `Settlement refused: linked TransactionHistory ${execution.refId} already carries txHash ${hist.txHash} while verified chain evidence for the execution is ${execution.txHash} — human reconciliation required.`);
+                }
                 // Idempotent re-settle: converge the real hash if a prior
                 // settlement completed the record before this pass recorded it.
                 await tx.transactionHistory.updateMany({
@@ -1486,8 +1639,13 @@ async function settleExecution(prisma, { executionId, evidence } = {}) {
  */
 async function failWithdrawalExecution(prisma, { executionId, errorClass, errorMessage, refund }) {
     return prisma.$transaction(async (tx) => {
+        // r23 D1: SUBMITTED remains permitted (the submitter owns the
+        // provider's definitive pre-broadcast rejection for its own claim),
+        // but SIGNING does not: a SIGNING row carries a provider pendingId —
+        // accepted, possibly already fetched by the KMS daemon — so no
+        // caller can prove "no broadcast possible" from that state.
         const res = await tx.custodyExecution.updateMany({
-            where: { id: executionId, status: { in: [STATUSES.REQUESTED, STATUSES.RESERVING, STATUSES.SUBMITTED, STATUSES.SIGNING] } },
+            where: { id: executionId, status: { in: [STATUSES.REQUESTED, STATUSES.RESERVING, STATUSES.SUBMITTED] } },
             data:  { status: STATUSES.FAILED, errorClass: errorClass || ERROR_CLASSES.PROVIDER_REJECTED, errorMessage: redact(errorMessage) },
         });
         if (res.count !== 1) {
