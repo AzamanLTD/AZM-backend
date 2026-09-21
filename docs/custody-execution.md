@@ -251,3 +251,48 @@ passes and concurrent workers converge on exactly one refund.
 Ops tunables: `TATUM_CUSTODY_RESERVING_STALE_MINUTES` (default 10),
 `TATUM_CUSTODY_SUBMITTED_GRACE_MINUTES` (default 2).
 
+
+## r23 — Denial/approval races + submission under concurrency (2026-09-21)
+
+**The P0 double-spend window (D1-P0):** the four-eye denial path and the
+submission path could both win the same execution. The repair is structural,
+not a lock: the exactly-once refund closure executes only BEFORE any
+submission claim is taken. Once a row has claimed the submission CAS, no
+refund path can run against it — both interleavings (denial-first and
+submitter-first) converge to exactly one winner, proven with released-pause
+concurrency against real PostgreSQL. The refund closure derives ONLY from the
+durable execution identity (never re-priced, never rebuilt from mutable
+request data).
+
+**Approval is a conditional write (D2):** approval after a denial is refused,
+after a FAILED row is refused as stale, and can never land on a quarantined
+row. An approval racing a denial yields exactly one durable outcome;
+APPROVED-after-DENIED is unreachable.
+
+**Linked-record identity (D3):** settlement and refund refuse a linked
+TransactionHistory row that belongs to another customer, is of the wrong
+type, disagrees on economics, or carries a conflicting txHash while already
+COMPLETED. Refusals quarantine with the victim row untouched; a control proof
+confirms correctly-linked settlement still completes. The fee is compared
+only when the execution carries `feeChargeBaseUnits` authority — the column
+is nullable and legacy rows legitimately keep the fee on the history side.
+The NET payout is always compared, as exact decimals.
+
+**REQUESTED recovery ownership (D6):** `REQUESTED` has a real recovery owner
+in the exported state machine. Stale PENDING/DENIED rows fail with the
+exactly-once refund; stale APPROVED rows re-enter the canonical submission
+boundary.
+
+**Recovery fairness + backoff (D5):** recovery scans are due-time scheduled —
+`nextRecoveryAttemptAt` (NULL = due immediately), `lastRecoveryAttemptAt`,
+`recoveryAttemptCount`, with backoff 60s → 300s → 900s cap per row. A large
+unresolvable backlog cannot starve fresh rows from the bounded scan, and
+pendings already claimed by another execution are excluded from binding.
+Human-owned quarantine classes (CHAIN_MISMATCH and contradictions) are
+excluded from the automatic scan — they converge only by human decision.
+
+Ops tunables are unchanged; the scheduling columns are additive and
+idempotent across schema, migration, and the overlay installer.
+
+Proofs: `__tests__/r23-custody-denial-approval-races.test.js` (29) — full
+report in `docs/r23-p2-final-report.md`.
