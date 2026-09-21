@@ -14,6 +14,8 @@
 // alterations. Safe to run repeatedly.
 //
 // Schema additions installed:
+//   • ProfitSource enum value EWA_FEE  (Business OS P0 settlement repair,
+//     2026-09-21: 1% EWA withdrawal fee realized in AdminProfitLog/SystemProfitFees)
 //   • BusinessProfile.isPausedByOwner  (boolean, default false)
 //   • BusinessLocationHoursException    table + indexes + FK
 //   • BusinessNotificationPreference   table + indexes + FK
@@ -695,3 +697,15 @@ STATEMENTS.push('ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "isDeleted" BOOLEAN
 STATEMENTS.push('ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "failedLoginAttempts" INTEGER NOT NULL DEFAULT 0;');
 STATEMENTS.push('ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "lockedUntil" TIMESTAMP(3);');
 STATEMENTS.push('ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "tokenVersion" INTEGER NOT NULL DEFAULT 0;');
+
+// ── Business OS P0 settlement repair (PR #292, 2026-09-21) ─────────────────
+// EWA withdrawal fee revenue: EwaService.requestWithdrawal records the 1%
+// platform fee as an AdminProfitLog row with source 'EWA_FEE' (ProfitSource
+// enum) plus a SystemProfitFees increment and an authoritative ledger line.
+// Production schema authority is these raw-SQL overlays (NOT prisma migrate
+// deploy / db push — production has no _prisma_migrations table), so the
+// enum value must be added here for the real production database. `ADD VALUE
+// IF NOT EXISTS` makes the statement safely rerunnable: first run adds the
+// value, subsequent runs are a clean no-op. (Same convention as susu
+// overlay's 'ALTER TYPE "ProfitSource" ADD VALUE IF NOT EXISTS 'SUSU_FEE';'.)
+STATEMENTS.push(`ALTER TYPE "ProfitSource" ADD VALUE IF NOT EXISTS 'EWA_FEE';`);

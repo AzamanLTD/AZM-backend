@@ -194,7 +194,31 @@ router.post('/employees/my-ewa-request', wrap(async (req, res) => {
     });
     if (!employee) throw new Error('You are not an active employee.');
     const svc = getServices(req);
-    const result = await svc.employeeService.requestEWA(employee.id, req.body.amount);
+
+    // ECONOMIC IDENTITY (PR #292 follow-up): a withdrawal is a money-minting
+    // mutation, so the worker path now REQUIRES a stable client-generated
+    // request identity — the repo's Phase H12 `clientRequestId` convention
+    // (peer transfers / savings deposits), also accepted via body
+    // `idempotencyKey` or the `X-Idempotency-Key` header. The key derives a
+    // DB-unique TransactionHistory txHash inside EwaService.requestWithdrawal:
+    // an exact retry replays the committed outcome, a same-key-different-amount
+    // retry fails closed as EWA_IDEMPOTENCY_CONFLICT, and a concurrent
+    // duplicate collides on the unique index. A lost-response retry can never
+    // mint a second payout.
+    const idempotencyKey = String(
+        req.body.clientRequestId
+        || req.body.idempotencyKey
+        || req.headers['x-idempotency-key']
+        || '',
+    ).trim();
+    if (!idempotencyKey) {
+        return res.status(400).json({
+            success: false,
+            code: 'EWA_IDEMPOTENCY_KEY_REQUIRED',
+            message: 'clientRequestId is required for EWA withdrawals (send a stable UUID per withdrawal action).',
+        });
+    }
+    const result = await svc.employeeService.requestEWA(employee.id, req.body.amount, idempotencyKey);
     res.json({ success: true, ...result });
 }));
 
@@ -570,7 +594,16 @@ router.get('/ewa/eligibility/:employeeId', requirePermission('ewa.manage'), wrap
 
 router.post('/ewa/withdraw', requirePermission('ewa.manage'), wrap(async (req, res) => {
     const svc = getServices(req);
-    const result = await svc.ewaService.requestWithdrawal(req.body);
+    // Same Phase H12 identity convention as the worker path: accept
+    // clientRequestId / X-Idempotency-Key and forward as the service's
+    // idempotencyKey. Optional here for compatibility with the owner portal;
+    // supplying it gives the caller exactly-once semantics.
+    const body = { ...req.body };
+    if (!body.idempotencyKey) {
+        const key = String(body.clientRequestId || req.headers['x-idempotency-key'] || '').trim();
+        if (key) body.idempotencyKey = key;
+    }
+    const result = await svc.ewaService.requestWithdrawal(body);
     res.json({ success: true, result });
 }));
 

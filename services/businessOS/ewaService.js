@@ -178,6 +178,74 @@ class EwaService {
                     if (scopedBusinessProfileId) {
                         await this._assertWithdrawalAuthorization(tx, employee, scopedBusinessProfileId);
                     }
+
+                    // REQUEST IDENTITY FIRST (before any new-withdrawal gate):
+                    // a retry of a committed request replays the committed
+                    // outcome even if capacity is now consumed or eligibility
+                    // changed afterwards — a replay moves no money, so the
+                    // new-withdrawal rules must not block it. A materially
+                    // different reuse of the same key fails closed here.
+                    // ECONOMIC IDENTITY (Phase H12 clientRequestId pattern, same
+                    // architecture as peerTransfer/savings): a caller-supplied
+                    // idempotencyKey derives a DB-unique TransactionHistory txHash
+                    // BEFORE any mutation. txHash is @unique, so a concurrent or
+                    // retried request with the same key either finds the committed
+                    // row here or collides on the unique index and rolls the WHOLE
+                    // transaction back — a duplicate economic request cannot mint
+                    // another payout.
+                    const txHash = idempotencyKey
+                        ? `EWA_${employeeId}_${idempotencyKey}`.slice(0, 200)
+                        : null;
+                    if (txHash) {
+                        const prior = await tx.transactionHistory.findFirst({
+                            where: { txHash },
+                            select: { id: true, metadata: true },
+                        });
+                        if (prior) {
+                            const priorMeta = (prior.metadata && typeof prior.metadata === 'object')
+                                ? prior.metadata
+                                : {};
+                            const priorEmployeeId = String(priorMeta.employeeId ?? '');
+                            const priorGross = priorMeta.grossAmount != null ? String(priorMeta.grossAmount) : null;
+                            // EXACT REPLAY of the committed withdrawal (same
+                            // employee, same exact gross): return the committed
+                            // outcome and move no money. No row was ever created
+                            // for a failed attempt, so a retried failed request
+                            // evaluates fresh — never replaying a failure.
+                            if (priorEmployeeId === String(employeeId)
+                                && priorGross !== null
+                                && priorGross === withdrawAmount.toFixed(8)) {
+                                const priorFee = priorMeta.fee != null
+                                    ? new Prisma.Decimal(String(priorMeta.fee))
+                                    : withdrawAmount.mul(EWA_FEE_RATE).toDecimalPlaces(8, Prisma.Decimal.ROUND_HALF_UP);
+                                const priorNet = priorMeta.netToEmployee != null
+                                    ? new Prisma.Decimal(String(priorMeta.netToEmployee))
+                                    : withdrawAmount.minus(priorFee);
+                                return {
+                                    success: true,
+                                    replayed: true,
+                                    idempotencyKey,
+                                    grossAmount: Number(withdrawAmount),
+                                    fee: Number(priorFee),
+                                    netToEmployee: Number(priorNet),
+                                    remainingWithdrawable: Number(Prisma.Decimal.max(ZERO,
+                                        new Prisma.Decimal(employee.accruedWages).mul(EWA_CAP_RATE)
+                                            .minus(new Prisma.Decimal(employee.withdrawnEarly)))),
+                                    employee,
+                                };
+                            }
+                            // Same economic identity reused with materially
+                            // different parameters is a contradiction — fail
+                            // closed and name the differing field(s).
+                            const differing = [];
+                            if (priorEmployeeId !== String(employeeId)) differing.push('employeeId');
+                            if (priorGross !== withdrawAmount.toFixed(8)) differing.push('amount');
+                            throw settlementError(
+                                'EWA_IDEMPOTENCY_CONFLICT',
+                                `Idempotency key was already used with different parameters (differing: ${differing.join(', ')}); the withdrawal was not executed.`,
+                            );
+                        }
+                    }
                     if (!employee.ewaEligible) throw new Error('EWA is not available for this employee.');
                     if (employee.status !== 'ACTIVE') throw new Error('Only active employees can request EWA.');
 
@@ -203,23 +271,6 @@ class EwaService {
                     });
                     if (!business) throw new Error('Business profile not found.');
 
-                    // ECONOMIC IDENTITY (r14 guarded-insert pattern): a caller-
-                    // supplied idempotencyKey claims a DB-unique TransactionHistory
-                    // txHash BEFORE any mutation. A retry or duplicate collides on
-                    // the unique index and the WHOLE transaction rolls back — a
-                    // duplicate economic request cannot mint another payout.
-                    const txHash = idempotencyKey
-                        ? `EWA_${employeeId}_${idempotencyKey}`.slice(0, 200)
-                        : null;
-                    if (txHash) {
-                        const clash = await tx.transactionHistory.findFirst({ where: { txHash }, select: { id: true } });
-                        if (clash) {
-                            throw settlementError(
-                                'EWA_DUPLICATE_REQUEST',
-                                'An EWA withdrawal with this idempotency key was already processed.',
-                            );
-                        }
-                    }
 
                     const guardWhere = {
                         id: employeeId,

@@ -99,6 +99,15 @@ jobs:
       - name: Install Model B settlement overlay
         run: node infra/install-model-b-settlement-overlay.js
 
+      # PR #292 follow-up: the release chain (npm run release) executes the
+      # business-os overlay in production (it is the schema authority for
+      # Business OS DDL, including the ProfitSource EWA_FEE enum value that
+      # the EWA fee realization writes to AdminProfitLog). CI previously
+      # never executed it, so a broken business-os overlay would only be
+      # discovered at deploy time. CI now exercises the exact same installer.
+      - name: Install business OS overlay
+        run: node infra/install-business-os-overlay.js
+
       - name: Generate Prisma client
         run: npx prisma generate
 

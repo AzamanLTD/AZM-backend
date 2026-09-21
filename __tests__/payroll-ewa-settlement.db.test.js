@@ -287,16 +287,23 @@ describeOrSkip('Business Payroll + EWA settlement (real Postgres)', () => {
             const first = await svc.requestWithdrawal({ employeeId: world.employee.id, amount: 20, idempotencyKey: key });
             expect(first.success).toBe(true);
 
-            // sequential duplicate: typed rejection
-            await expect(svc.requestWithdrawal({ employeeId: world.employee.id, amount: 20, idempotencyKey: key }))
-                .rejects.toMatchObject({ code: 'EWA_DUPLICATE_REQUEST' });
+            // sequential exact duplicate: REPLAYS the committed outcome, moves
+            // nothing (PR #292 follow-up: exact retry must return the prior
+            // result, not a rejection — a lost response is not a new action)
+            const dup = await svc.requestWithdrawal({ employeeId: world.employee.id, amount: 20, idempotencyKey: key });
+            expect(dup.success).toBe(true);
+            expect(dup.replayed).toBe(true);
 
-            // concurrent duplicates: exactly one of the pair wins; both total payouts stay 1+1
+            // concurrent duplicates: EXACTLY ONE payout of 30 is minted
+            // regardless of interleave — the loser either replays the winner's
+            // committed row after the serialization retry or fails safely on
+            // the unique txHash. Economic totals, not outcome counts, are the
+            // proof (the audit forbids collapsing new/retry/conflict cases).
             const outcomes = await Promise.allSettled([
                 svc.requestWithdrawal({ employeeId: world.employee.id, amount: 30, idempotencyKey: 'race-1' }),
                 svc.requestWithdrawal({ employeeId: world.employee.id, amount: 30, idempotencyKey: 'race-1' }),
             ]);
-            expect(outcomes.filter(o => o.status === 'fulfilled')).toHaveLength(1);
+            expect(outcomes.filter(o => o.status === 'rejected')).toHaveLength(0); // replay or safe conflict, never a throw-through
 
             const [owner, employeeUser, emp] = await Promise.all([
                 prisma.user.findUnique({ where: { id: world.owner.id } }),

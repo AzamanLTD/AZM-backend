@@ -38,7 +38,19 @@ function buildTx({ accruedWages = new Prisma.Decimal('100'), withdrawnEarly = ne
             },
             systemProfitFees: { upsert: jest.fn().mockImplementation(async () => { if (failureAt === 'fees') throw new Error('fees write failed'); return { id: 1, balance: 0 }; }) },
             transactionHistory: {
-                findFirst: jest.fn().mockResolvedValue(duplicateExists ? { id: 'prior' } : null),
+                // Prior committed EWA row for the identity check: metadata
+                // carries the committed employeeId + exact gross (as the real
+                // service writes them), so an exact-key/different-amount
+                // request is distinguishable from an exact replay.
+                findFirst: jest.fn().mockResolvedValue(duplicateExists ? {
+                    id: 'prior',
+                    metadata: {
+                        employeeId: 'employee-a',
+                        grossAmount: '20.00000000',
+                        fee: '0.20000000',
+                        netToEmployee: '19.80000000',
+                    },
+                } : null),
                 create: jest.fn().mockImplementation(async () => { if (failureAt === 'history') throw new Error('history write failed'); return { id: 'history-a' }; }),
             },
             adminProfitLog: { create: jest.fn().mockImplementation(async () => { if (failureAt === 'profitLog') throw new Error('profit log write failed'); return { id: 'log-a' }; }) },
@@ -133,10 +145,25 @@ describe('EwaService withdrawal integrity (P0 settlement repair)', () => {
         expect(prisma.tx.user.updateMany).toHaveBeenCalledTimes(1);
     });
 
-    test('a duplicate idempotencyKey claim fails closed and mints nothing', async () => {
-        const prisma = buildPrisma({ duplicateExists: true });
+    test('an exact-key exact-amount retry REPLAYS the committed outcome and mints nothing', async () => {
+        const prisma = buildPrisma({ duplicateExists: true }); // committed gross was 20.00000000
+        const result = await new EwaService(prisma).requestWithdrawal({ employeeId: 'employee-a', amount: 20, idempotencyKey: 'k-1' });
+        expect(result.success).toBe(true);
+        expect(result.replayed).toBe(true);
+        expect(result.grossAmount).toBe(20);
+        expect(result.fee).toBeCloseTo(0.2, 8);
+        expect(result.netToEmployee).toBeCloseTo(19.8, 8);
+        // a replay moves no money and writes nothing new
+        expect(prisma.tx.businessEmployee.updateMany).not.toHaveBeenCalled();
+        expect(prisma.tx.user.updateMany).not.toHaveBeenCalled();
+        expect(prisma.tx.transactionHistory.create).not.toHaveBeenCalled();
+        expect(ledger.post).not.toHaveBeenCalled();
+    });
+
+    test('the same key reused with a different amount fails closed as an identity conflict and mints nothing', async () => {
+        const prisma = buildPrisma({ duplicateExists: true }); // committed gross was 20.00000000
         await expect(new EwaService(prisma).requestWithdrawal({ employeeId: 'employee-a', amount: 10, idempotencyKey: 'k-1' }))
-            .rejects.toMatchObject({ code: 'EWA_DUPLICATE_REQUEST' });
+            .rejects.toMatchObject({ code: 'EWA_IDEMPOTENCY_CONFLICT' });
         expect(prisma.tx.businessEmployee.updateMany).not.toHaveBeenCalled();
         expect(prisma.tx.user.updateMany).not.toHaveBeenCalled();
         expect(ledger.post).not.toHaveBeenCalled();
