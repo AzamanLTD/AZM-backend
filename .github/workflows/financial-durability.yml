@@ -112,6 +112,10 @@ jobs:
       - name: Install Model B settlement overlay
         run: node infra/install-model-b-settlement-overlay.js
 
+      # PR #292 follow-up: match the test lane + the production release chain
+      - name: Install business OS overlay
+        run: node infra/install-business-os-overlay.js
+
       - name: Generate Prisma client
         run: npx prisma generate
 
@@ -158,6 +162,7 @@ jobs:
             "__tests__/legacy-susu-economic-atomicity.test.js"
             "__tests__/withdrawal-fee-discount-atomicity.test.js"
             "__tests__/business-invoice-payment-concurrency.test.js"
+            "__tests__/payroll-ewa-settlement.db.test.js"
           )
           npx jest --runInBand --forceExit "${SUITES[@]}"
 

@@ -1,5 +1,23 @@
 const { EwaService } = require('../services/businessOS/ewaService');
 const { runWithBusinessRequestContext } = require('../src/lib/businessRequestContext');
+const ledger = require('../services/ledgerService');
+
+jest.spyOn(ledger, 'post').mockResolvedValue({ id: 'ledger-tx-1' });
+
+// new-contract tx extensions (P0 settlement repair): guarded treasury debit,
+// platform fee realization, and the duplicate-claim probe
+const withSettlementSurface = (tx) => {
+    tx.businessProfile = { findUnique: jest.fn().mockResolvedValue({ userId: 7 }) };
+    tx.user.updateMany = jest.fn().mockResolvedValue({ count: 1 });
+    tx.systemProfitFees = { upsert: jest.fn().mockResolvedValue({ id: 1, balance: 0.1 }) };
+    tx.adminProfitLog = { create: jest.fn().mockResolvedValue({}) };
+    if (tx.transactionHistory) {
+        tx.transactionHistory.findFirst = jest.fn().mockResolvedValue(null);
+    } else {
+        tx.transactionHistory = { findFirst: jest.fn().mockResolvedValue(null), create: jest.fn().mockResolvedValue({}) };
+    }
+    return tx;
+};
 
 describe('EwaService business scoping', () => {
     test('requestWithdrawal scopes the employee read to the supplied business', async () => {
@@ -44,6 +62,7 @@ describe('EwaService business scoping', () => {
             transactionHistory: { create: jest.fn().mockResolvedValue({}) },
             businessLedgerEntry: { create: jest.fn().mockResolvedValue({}) },
         };
+        withSettlementSurface(tx);
         const prisma = {
             $transaction: jest.fn().mockImplementation(async (callback, options) => {
                 expect(options).toEqual({ isolationLevel: 'Serializable' });
@@ -113,6 +132,7 @@ describe('EwaService business scoping', () => {
             transactionHistory: { create: jest.fn().mockResolvedValue({}) },
             businessLedgerEntry: { create: jest.fn().mockResolvedValue({}) },
         };
+        withSettlementSurface(tx);
         const prisma = {
             $transaction: jest.fn().mockImplementation(async (callback) => callback(tx)),
         };

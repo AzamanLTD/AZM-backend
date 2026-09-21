@@ -1,4 +1,7 @@
 const { EwaService } = require('../services/businessOS/ewaService');
+const ledger = require('../services/ledgerService');
+
+jest.spyOn(ledger, 'post').mockResolvedValue({ id: 'ledger-tx-1' });
 
 describe('EwaService Serializable retry', () => {
     const employee = {
@@ -19,8 +22,17 @@ describe('EwaService Serializable retry', () => {
                     .mockResolvedValueOnce({ ...employee, withdrawnEarly: 10 }),
                 updateMany: jest.fn().mockResolvedValue({ count: 1 }),
             },
-            user: { update: jest.fn().mockResolvedValue({}) },
-            transactionHistory: { create: jest.fn().mockResolvedValue({}) },
+            businessProfile: { findUnique: jest.fn().mockResolvedValue({ userId: 7 }) },
+            user: {
+                updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+                update: jest.fn().mockResolvedValue({}),
+            },
+            systemProfitFees: { upsert: jest.fn().mockResolvedValue({ id: 1, balance: 0.1 }) },
+            transactionHistory: {
+                findFirst: jest.fn().mockResolvedValue(null),
+                create: jest.fn().mockResolvedValue({ id: 'history-1' }),
+            },
+            adminProfitLog: { create: jest.fn().mockResolvedValue({}) },
             businessLedgerEntry: { create: jest.fn().mockResolvedValue({}) },
         };
     }

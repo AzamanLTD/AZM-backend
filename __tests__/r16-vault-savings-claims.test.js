@@ -172,9 +172,14 @@ describeOrSkip('r16 P0-E: Savings withdrawal atomic claim', () => {
 
     test('E1: two concurrent partial withdrawals cannot double-release the same savings money', async () => {
         const user = await seedUser(prisma, { availableBalance: 0, escrowLockedBalance: 100 });
-        await prisma.globalSettings.create({
-            data: { id: 1, liveUsdToGhs: 15, liveRetailRate: 15 } // USDC→GHS 1:15 for readability
-        }).catch(() => {});
+        // Order-proof seed: a leftover GlobalSettings row (id 1) from an
+        // earlier suite would make create() fail silently and the withdrawal
+        // would read a stale rate. Upsert pins BOTH rates explicitly.
+        await prisma.globalSettings.upsert({
+            where: { id: 1 },
+            update: { liveUsdToGhs: 15, liveRetailRate: 15 }, // USDC→GHS 1:15 for readability
+            create: { id: 1, liveUsdToGhs: 15, liveRetailRate: 15 },
+        });
         const goal = await prisma.savingsGoal.create({
             data: {
                 userId: user.id,
@@ -207,9 +212,11 @@ describeOrSkip('r16 P0-E: Savings withdrawal atomic claim', () => {
 
     test('E2: replayed requestId converges to one execution', async () => {
         const user = await seedUser(prisma, { availableBalance: 0, escrowLockedBalance: 100 });
-        await prisma.globalSettings.create({
-            data: { id: 1, liveUsdToGhs: 15, liveRetailRate: 15 }
-        }).catch(() => {});
+        await prisma.globalSettings.upsert({
+            where: { id: 1 },
+            update: { liveUsdToGhs: 15, liveRetailRate: 15 },
+            create: { id: 1, liveUsdToGhs: 15, liveRetailRate: 15 },
+        });
         const goal = await prisma.savingsGoal.create({
             data: {
                 userId: user.id,

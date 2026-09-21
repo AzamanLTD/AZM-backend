@@ -1,14 +1,23 @@
 const { PayrollService } = require('../services/businessOS/payrollService');
 const { runWithRequestContext } = require('../utils/requestContext');
+const ledger = require('../services/ledgerService');
+
+jest.spyOn(ledger, 'post').mockResolvedValue({ id: 'ledger-tx-1' });
 
 describe('PayrollService disbursement snapshot consistency', () => {
     const makeTx = ({ shifts = [] } = {}) => ({
         payrollRecord: {
             findFirst: jest.fn(),
-            update: jest.fn().mockResolvedValue({ status: 'PROCESSED' }),
+            findUnique: jest.fn().mockResolvedValue({ status: 'PROCESSED' }),
+            updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+            update: jest.fn().mockImplementation(async (args) => args.data),
         },
         shift: { findMany: jest.fn().mockResolvedValue(shifts) },
-        user: { update: jest.fn().mockResolvedValue({}) },
+        businessProfile: { findUnique: jest.fn().mockResolvedValue({ userId: 7 }) },
+        user: {
+            updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+            update: jest.fn().mockResolvedValue({}),
+        },
         transactionHistory: { create: jest.fn().mockResolvedValue({}) },
         businessLedgerEntry: { create: jest.fn().mockResolvedValue({}) },
         businessEmployee: { update: jest.fn().mockResolvedValue({}) },
@@ -31,12 +40,15 @@ describe('PayrollService disbursement snapshot consistency', () => {
         overtimeHours: 0,
         breakdown: { shifts: 1, regularHours: 8, overtimeHours: 0, ewaWithdrawn: 0 },
         employee: {
+            id: 'employee-1',
             businessProfileId: 'business-a',
+            userId: 101,
             payrollType: 'HOURLY',
             hourlyRate: 10,
             salaryAmount: null,
             withdrawnEarly: 0,
             smartRouteId: null,
+            paymentPreference: 'AZAMAN_BALANCE',
         },
         ...overrides,
     });
@@ -82,11 +94,15 @@ describe('PayrollService disbursement snapshot consistency', () => {
             await expect(service.disbursePayroll('payroll-1')).resolves.toMatchObject({ status: 'PROCESSED' });
         });
 
+        // full new-contract settlement surface: guarded debit, employee credit,
+        // both signed history sides, business expense, ledger, counter reset
+        expect(tx.user.updateMany).toHaveBeenCalledTimes(1);
         expect(tx.user.update).toHaveBeenCalledTimes(1);
-        expect(tx.transactionHistory.create).toHaveBeenCalledTimes(1);
+        expect(tx.transactionHistory.create).toHaveBeenCalledTimes(2);
         expect(tx.businessLedgerEntry.create).toHaveBeenCalledTimes(1);
         expect(tx.businessEmployee.update).toHaveBeenCalledTimes(1);
-        expect(tx.payrollRecord.update).toHaveBeenCalledTimes(1);
+        expect(tx.payrollRecord.updateMany).toHaveBeenCalledTimes(1);
+        expect(ledger.post).toHaveBeenCalledTimes(1);
     });
 
     test('rejects an EWA change even when shift hours are unchanged', async () => {

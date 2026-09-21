@@ -25,7 +25,8 @@ describe('EmployeeService.requestEWA', () => {
         expect(requestWithdrawal).toHaveBeenCalledWith({
             employeeId: 'employee-1',
             amount: 50,
-            destination: 'AZM_BALANCE',
+            destination: 'AZAMAN_BALANCE',
+            idempotencyKey: undefined,
         });
         expect(result).toEqual({
             success: true,

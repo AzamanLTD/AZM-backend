@@ -303,7 +303,17 @@ describeOrSkip('r16 P0-C: Admin rejection canonical-state safety', () => {
                 // the worker — and NO refund happened.
                 expect(mirror.status).toBe('PROCESSING');
                 expect(canonical.status).toBe('PENDING');
-                expect(rejectRes.statusCode).toBe(409);
+                // Two honest interleavings exist for the reject's loss, and
+                // which one occurs is pure commit-order timing (see test 7,
+                // which pins the direct-set mirror guard):
+                //  (a) reject read the mirror PENDING, entered the guarded
+                //      transaction, and lost the in-transaction claim → 409.
+                //  (b) the worker's updateMany committed before reject's
+                //      first read, so the status guard refused it → 400.
+                // Both are safe single-winner outcomes: no refund, mirror
+                // PROCESSING, canonical PENDING. Assert the invariants, not
+                // the interleaving (same lesson as the p5r14 race fix).
+                expect([400, 409]).toContain(rejectRes.statusCode);
             }
         }
     });

@@ -5,7 +5,17 @@
 // for automatic disbursement, and track payroll history.
 // =============================================================================
 
+const { Prisma } = require('@prisma/client');
 const { getRequestContext } = require('../../utils/requestContext');
+const ledger = require('../ledgerService');
+
+// Typed settlement errors (fail-closed): callers can branch on .code; every
+// one leaves the payroll record PENDING — money never moves half-way.
+const settlementError = (code, message) => {
+    const err = new Error(message);
+    err.code = code;
+    return err;
+};
 
 const SERIALIZABLE_RETRY_LIMIT = 3;
 const SERIALIZABLE_BACKOFF_MS = 10;
@@ -214,17 +224,165 @@ class PayrollService {
 
                     if (payroll.employee.smartRouteId) throw new Error('Payroll with Smart Route requires the payroll settlement worker; it was not marked as paid.');
 
-                    const netAmount = parseFloat(payroll.netAmount);
-                    if (!Number.isFinite(netAmount)) throw new Error('Payroll net amount is invalid.');
-                    if (netAmount <= 0) {
-                        return tx.payrollRecord.update({ where: { id: payrollId }, data: { status: 'PROCESSED', paidAt: new Date(), failureReason: 'Net amount was zero or negative after deductions.' } });
+                    // §3 EXTERNAL PREFERENCES FAIL CLOSED: the enum exists, but
+                    // only AZAMAN_BALANCE has an authoritative internal
+                    // settlement path. MOMO/WALLET/SPLIT must be carried by a
+                    // complete, crash-safe payout worker — never claimed here.
+                    const paymentPreference = payroll.employee.paymentPreference || 'AZAMAN_BALANCE';
+                    if (paymentPreference !== 'AZAMAN_BALANCE') {
+                        throw settlementError(
+                            'PAYROLL_EXTERNAL_PREFERENCE_UNSUPPORTED',
+                            `Payroll payment preference ${paymentPreference} has no authoritative settlement path; it was not settled.`,
+                        );
                     }
 
-                    await tx.user.update({ where: { id: payroll.userId }, data: { azmBalance: { increment: netAmount } } });
-                    await tx.transactionHistory.create({ data: { userId: payroll.userId, type: 'PAYROLL_DISBURSEMENT', amountUsdc: netAmount, feeUsdc: 0, status: 'COMPLETED', metadata: { employeeId: payroll.employeeId, period: payroll.period, payrollId, source: 'BUSINESS_OS_PAYROLL' } } });
-                    await tx.businessLedgerEntry.create({ data: { businessProfileId: payroll.businessProfileId, type: 'PAYROLL', category: 'Salary Payment', description: `Payroll for ${payroll.period}`, amount: -netAmount, sourceType: 'PAYROLL', sourceId: payrollId, metadata: { employeeId: payroll.employeeId, period: payroll.period } } });
-                    await tx.businessEmployee.update({ where: { id: payroll.employeeId }, data: { accruedWages: 0.0, withdrawnEarly: 0.0 } });
-                    return tx.payrollRecord.update({ where: { id: payrollId }, data: { status: 'PROCESSED', paidAt: new Date(), failureReason: null } });
+                    // §6 EXACT MONEY: the settlement amount is read from the
+                    // Decimal column and carried as Prisma.Decimal end-to-end —
+                    // never parseFloat'd. Floats are only used upstream in the
+                    // (unchanged) payroll PREPARATION math; the persisted net and
+                    // every financial write below are numerically identical.
+                    const netExact = new Prisma.Decimal(payroll.netAmount);
+                    if (!netExact.isFinite()) throw new Error('Payroll net amount is invalid.');
+
+                    // §2 a negative net is an overpayment/debt state — it must
+                    // STOP for reconciliation, never be erased as "processed".
+                    if (netExact.isNegative()) {
+                        throw settlementError(
+                            'PAYROLL_NEGATIVE_NET',
+                            `Payroll net for period ${payroll.period} is negative after deductions — regenerate the payroll record; it was not settled.`,
+                        );
+                    }
+
+                    // §9 destination identity: the payroll's user must be the employee's user
+                    if (payroll.userId !== payroll.employee.userId) {
+                        throw new Error('Payroll destination does not match the employee user.');
+                    }
+
+                    // §1 treasury source: the business owner's spendable balance
+                    // (same owner-balance model as the hardened invoice path).
+                    const business = await tx.businessProfile.findUnique({
+                        where: { id: payroll.businessProfileId },
+                        select: { userId: true },
+                    });
+                    if (!business) throw new Error('Business profile not found.');
+
+                    // Ownership claim FIRST (invoice payTxHash CAS pattern): the
+                    // conditional PENDING→PROCESSED flip serializes concurrent
+                    // disbursers on the row — exactly one disbursement can pay.
+                    // The whole transaction rolls back (back to PENDING) if any
+                    // later financial/accounting write fails.
+                    const claim = await tx.payrollRecord.updateMany({
+                        where: { id: payrollId, businessProfileId: scopedBusinessProfileId, status: 'PENDING' },
+                        data: { status: 'PROCESSED', paidAt: new Date(), failureReason: null, transactionHash: `PAYROLL_${payrollId}` },
+                    });
+                    if (claim.count !== 1) throw new Error('Payroll already disbursed or not pending.');
+
+                    if (netExact.isZero()) {
+                        // §2 zero net: the gross was completely satisfied by prior
+                        // EWA (or nothing was earned). Finalize with an explicit
+                        // non-financial settlement reason — NO fabricated
+                        // zero-value ledger posting (the ledger rejects zero
+                        // lines) and NO balance movement.
+                        const grossExact = new Prisma.Decimal(payroll.grossAmount);
+                        const settlementReason = grossExact.isPositive()
+                            ? 'ZERO_NET_SATISFIED_BY_EWA'
+                            : 'ZERO_NET_NO_EARNINGS';
+                        await tx.payrollRecord.update({
+                            where: { id: payrollId },
+                            data: { breakdown: { ...((payroll.breakdown && typeof payroll.breakdown === 'object') ? payroll.breakdown : {}), settlementReason } },
+                        });
+                        // §8 accrued/withdrawn state resets exactly once, only on
+                        // successful final settlement (zero-net included).
+                        await tx.businessEmployee.update({ where: { id: payroll.employeeId }, data: { accruedWages: new Prisma.Decimal(0), withdrawnEarly: new Prisma.Decimal(0) } });
+                        return tx.payrollRecord.findUnique({ where: { id: payrollId }, include: { employee: true } });
+                    }
+
+                    // Guarded treasury debit — the business cannot overdraw:
+                    // the conditional UPDATE serializes concurrent business
+                    // spending on the owner row (invoice balanceClaim pattern).
+                    const debit = await tx.user.updateMany({
+                        where: { id: business.userId, availableBalance: { gte: netExact } },
+                        data: { availableBalance: { decrement: netExact } },
+                    });
+                    if (debit.count !== 1) {
+                        throw settlementError(
+                            'PAYROLL_INSUFFICIENT_BUSINESS_FUNDS',
+                            'Business treasury has insufficient spendable balance for this payroll; it was not settled.',
+                        );
+                    }
+
+                    // Employee spendable credit — User.availableBalance ONLY.
+                    // azmBalance is a loyalty-points ledger and must never
+                    // receive payroll money.
+                    await tx.user.update({
+                        where: { id: payroll.userId },
+                        data: { availableBalance: { increment: netExact } },
+                    });
+
+                    // Signed economic history — BOTH sides (invoice convention).
+                    await tx.transactionHistory.create({
+                        data: {
+                            userId: business.userId,
+                            type: 'PAYROLL_DISBURSEMENT',
+                            amountUsdc: netExact.negated(),
+                            feeUsdc: new Prisma.Decimal(0),
+                            txHash: `PAYROLL_${payrollId}_OWNER`,
+                            status: 'COMPLETED',
+                            metadata: { role: 'business_treasury', employeeId: payroll.employeeId, period: payroll.period, payrollId, source: 'BUSINESS_OS_PAYROLL' },
+                        },
+                    });
+                    await tx.transactionHistory.create({
+                        data: {
+                            userId: payroll.userId,
+                            type: 'PAYROLL_DISBURSEMENT',
+                            amountUsdc: netExact,
+                            feeUsdc: new Prisma.Decimal(0),
+                            txHash: `PAYROLL_${payrollId}_EMPLOYEE`,
+                            status: 'COMPLETED',
+                            metadata: { role: 'employee', employeeId: payroll.employeeId, period: payroll.period, payrollId, source: 'BUSINESS_OS_PAYROLL' },
+                        },
+                    });
+
+                    await tx.businessLedgerEntry.create({
+                        data: {
+                            businessProfileId: payroll.businessProfileId,
+                            type: 'PAYROLL',
+                            category: 'Salary Payment',
+                            description: `Payroll for ${payroll.period}`,
+                            amount: netExact.negated(),
+                            sourceType: 'PAYROLL',
+                            sourceId: payrollId,
+                            metadata: { employeeId: payroll.employeeId, period: payroll.period, netUsdc: netExact.toFixed(8) },
+                        },
+                    });
+
+                    // §P.4 AUTHORITATIVE LEDGER — same transaction, durable
+                    // economic identity (unique idempotencyKey; the claim above
+                    // guarantees exactly one posting can ever exist):
+                    //   D user:{businessOwner}:liability — treasury pays the wage
+                    //   C user:{employee}:liability   — employee receives spendable
+                    await ledger.post(tx, {
+                        idempotencyKey: `ledger:payroll:disburse:${payrollId}`,
+                        entryType: 'BUSINESS_PAYMENT',
+                        description: 'Business payroll settlement — liability moved business owner to employee',
+                        userId: business.userId,
+                        relatedEntity: 'payrollRecord',
+                        relatedEntityId: payrollId,
+                        metadata: {
+                            period: payroll.period,
+                            employeeId: payroll.employeeId,
+                            netUsdc: netExact.toFixed(8),
+                        },
+                        lines: [
+                            { account: `user:${business.userId}:liability`, debit: netExact.toFixed(8) },
+                            { account: `user:${payroll.userId}:liability`, credit: netExact.toFixed(8) },
+                        ],
+                    });
+
+                    // §8 accrued/withdrawn state resets exactly once, only after
+                    // every financial and accounting write above succeeded.
+                    await tx.businessEmployee.update({ where: { id: payroll.employeeId }, data: { accruedWages: new Prisma.Decimal(0), withdrawnEarly: new Prisma.Decimal(0) } });
+                    return tx.payrollRecord.findUnique({ where: { id: payrollId }, include: { employee: true } });
                 }, { isolationLevel: 'Serializable' });
             } catch (error) {
                 if (!isSerializableConflict(error) || attempt === SERIALIZABLE_RETRY_LIMIT - 1) {
