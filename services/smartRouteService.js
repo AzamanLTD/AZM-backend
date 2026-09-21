@@ -81,13 +81,17 @@ const financeService = require('./finance.service');
 const fiatLiquidity = require('../src/services/fiatLiquidityService');
 const { canonicalProviderName, persistPayoutOwnership } = require('./payoutProviderOwnership');
 const { recordReconciliationExceptionLoud } = require('./reconciliationExceptionService');
+// r19: the shared occurrence cadence + settlement-convergence module (a
+// LEAF — finance.service also requires it for canonical convergence).
+const {
+    FREQUENCY_MS,
+    VALID_FREQUENCIES,
+    computeNextRun,
+    SR_REFERENCE_PREFIX,
+    convergeRunOnFiatSettlement,
+    convergeRunOnFiatReversal,
+} = require('./smartRouteOccurrence');
 const _exact = (n) => (n instanceof Prisma.Decimal ? n.toFixed(8) : Number(n).toFixed(8));
-
-const FREQUENCY_MS = {
-    DAILY: 24 * 60 * 60 * 1000,
-    WEEKLY: 7 * 24 * 60 * 60 * 1000,
-    MONTHLY: 30 * 24 * 60 * 60 * 1000,
-};
 
 // A PENDING run older than this had its financial transaction rolled back
 // (finalization is in-transaction with the money) — recovery re-drives it.
@@ -178,7 +182,21 @@ class SmartRouteService {
         const data = {};
         if (patch.name) data.name = String(patch.name).slice(0, 60);
         if (patch.amountUsdc) data.amountUsdc = new Prisma.Decimal(patch.amountUsdc);
-        if (patch.frequency && FREQUENCY_MS[patch.frequency]) data.frequency = patch.frequency;
+        // r19 P0-7: validate against the CANONICAL cadence set — the old
+        // FREQUENCY_MS[patch.frequency] gate silently rejected
+        // ON_DAY_OF_MONTH patches. An invalid cadence fails loudly.
+        if (patch.frequency) {
+            if (!VALID_FREQUENCIES.includes(patch.frequency)) {
+                throw new Error(`Invalid frequency: ${patch.frequency}`);
+            }
+            data.frequency = patch.frequency;
+        }
+        if (data.frequency === 'ON_DAY_OF_MONTH' && (patch.dayOfMonth !== undefined)) {
+            const dom = Number(patch.dayOfMonth);
+            if (!(dom >= 1 && dom <= 28)) {
+                throw new Error('dayOfMonth must be between 1 and 28');
+            }
+        }
         if (patch.dayOfMonth !== undefined) data.dayOfMonth = Number(patch.dayOfMonth) || null;
         if (patch.endDate !== undefined) data.endDate = patch.endDate ? new Date(patch.endDate) : null;
         if (patch.destination) {
@@ -272,9 +290,86 @@ class SmartRouteService {
                 continue;
             }
             const occurrenceBased = Boolean(run.executionKey && run.executionKey.includes(':occ:'));
-            outcomes.push(await this._executeClaim({ run, route, occurrenceBased, occurrenceBase: route.nextRunAt, recovery: true }));
+            // r19 P0-3: recovery advances the occurrence that was ACTUALLY
+            // claimed (the run's durable snapshot), never the CURRENT route
+            // schedule — an edit/pause/resume between claim and recovery can
+            // no longer change which occurrence this run belongs to. Legacy
+            // rows claimed before the snapshot column fall back to the
+            // pre-r19 behavior.
+            const occurrenceBase = run.claimedOccurrenceAt || route.nextRunAt;
+            outcomes.push(await this._executeClaim({ run, route, occurrenceBased, occurrenceBase, recovery: true }));
+        }
+        // r19 P0-2: AWAITING_RECONCILIATION runs converge through the
+        // canonical terminal transitions (settlement webhook / reconciler
+        // reversal — see finance.service convergence hooks). This sweep is
+        // the durable backstop for runs whose canonical ALREADY reached a
+        // terminal state through a path that could not converge the run
+        // (e.g. a run parked before the r19 convergence shipped): a parked
+        // run is checked against its canonical TransactionHistory and
+        // converges deterministically, so AWAITING_RECONCILIATION can never
+        // be a permanent dead-end.
+        // No action filter: a parked run is only ever a MoMo run, and legacy
+        // parked rows (claimed before the r19 snapshot columns) have
+        // action = NULL — this sweep exists precisely to rescue them.
+        const parked = await this.prisma.smartRouteRun.findMany({
+            where: { status: 'AWAITING_RECONCILIATION' },
+            orderBy: { createdAt: 'asc' },
+            take,
+        });
+        for (const run of parked) {
+            const outcome = await this._convergeParkedRun(run);
+            if (outcome) outcomes.push(outcome);
         }
         return outcomes;
+    }
+
+    /**
+     * r19 P0-2: converge one AWAITING_RECONCILIATION run against its
+     * canonical fiat TransactionHistory (`SRWD_{runId}`). Returns null when
+     * the canonical is not terminal yet (the reconciler still owns the
+     * payout) or the run was already converged by a concurrent actor.
+     */
+    async _convergeParkedRun(run) {
+        const reference = `${SR_REFERENCE_PREFIX}${run.id}`;
+        const canonical = await this.prisma.transactionHistory.findUnique({ where: { txHash: reference } });
+        if (!canonical) {
+            // Parked without a durable canonical row (should be impossible —
+            // parking only happens with dispatch evidence over a
+            // reservation). Surface loudly; never guess a refund.
+            await recordReconciliationExceptionLoud(this.prisma, {
+                entityType: 'TRANSACTION',
+                entityId: reference,
+                reference,
+                reason: 'SMART_ROUTE_PARKED_WITHOUT_CANONICAL',
+                details: { runId: run.id, routeId: run.routeId, source: 'smart_route_recovery' },
+            }).catch(() => {});
+            return null;
+        }
+        if (canonical.status === 'COMPLETED') {
+            const result = await this.prisma.$transaction((tx) =>
+                convergeRunOnFiatSettlement(tx, reference, {
+                    payoutGhs: canonical.metadata?.payoutGhs ?? null,
+                    retailRate: canonical.metadata?.retailRate ?? null,
+                }));
+            if (result.converged) {
+                logger.info({ runId: run.id, reference }, '[SmartRoute] parked run converged to SUCCESS (canonical COMPLETED)');
+                return { runId: run.id, status: 'SUCCESS' };
+            }
+            return null;
+        }
+        if (canonical.status === 'FAILED') {
+            const result = await this.prisma.$transaction((tx) =>
+                convergeRunOnFiatReversal(tx, reference, { reason: 'recovery sweep — canonical already FAILED' }));
+            if (result.converged) {
+                logger.info({ runId: run.id, reference }, '[SmartRoute] parked run converged to FAILED_GATEWAY (canonical FAILED)');
+                return { runId: run.id, status: 'FAILED_GATEWAY' };
+            }
+            return null;
+        }
+        // Canonical still PENDING — the withdrawal reconciler owns the
+        // payout; its terminal transition converges the run through the
+        // finance.service hooks.
+        return null;
     }
 
     /**
@@ -306,7 +401,9 @@ class SmartRouteService {
             const existing = await this.prisma.smartRouteRun.findUnique({ where: { executionKey } });
             const staleAt = new Date(Date.now() - STALE_PENDING_MS);
             if (existing && existing.status === 'PENDING' && existing.createdAt < staleAt) {
-                return { run: existing, route, occurrenceBased: true, occurrenceBase: route.nextRunAt, recovery: true };
+                // r19: re-drive the CLAIMED occurrence (snapshot), not the
+                // current route schedule.
+                return { run: existing, route, occurrenceBased: true, occurrenceBase: existing.claimedOccurrenceAt || route.nextRunAt, recovery: true };
             }
             return { skipped: true, reason: 'Execution already claimed', run: existing || undefined };
         }
@@ -349,6 +446,14 @@ class SmartRouteService {
 
             // A unique-key violation here rejects the WHOLE transaction —
             // the collision is resolved by the caller on a fresh connection.
+            //
+            // r19 P0: the claim captures the FULL immutable execution
+            // snapshot. From this moment the run's economic identity is
+            // FROZEN: executors, crash recovery and settlement convergence
+            // read the run's own columns, so a route edit between claim and
+            // execution can no longer change the amount, action,
+            // destination, cadence or claimed occurrence of an
+            // already-claimed economic operation.
             const run = await tx.smartRouteRun.create({
                 data: {
                     routeId: route.id,
@@ -356,6 +461,15 @@ class SmartRouteService {
                     status: 'PENDING',
                     amountUsdc: route.amountUsdc,
                     executionKey,
+                    action: route.action,
+                    destMomoNumber: route.destMomoNumber,
+                    destMomoProvider: route.destMomoProvider,
+                    destFriendUserId: route.destFriendUserId,
+                    destSavingsGoalId: route.destSavingsGoalId,
+                    destVaultId: route.destVaultId,
+                    frequency: route.frequency,
+                    dayOfMonth: route.dayOfMonth,
+                    claimedOccurrenceAt: occurrenceBased ? route.nextRunAt : null,
                 },
             });
             return { run, route, occurrenceBased, occurrenceBase: route.nextRunAt };
@@ -369,7 +483,11 @@ class SmartRouteService {
      */
     async _executeClaim(claim) {
         const { run, route, occurrenceBased, occurrenceBase } = claim;
-        const amount = new Prisma.Decimal(route.amountUsdc);
+        // r19 P0: the run's own snapshot is the execution truth. Legacy rows
+        // (claimed before the snapshot columns existed) fall back to the
+        // route values exactly like the pre-r19 executors did.
+        const action = run.action || route.action;
+        const amount = new Prisma.Decimal(run.amountUsdc);
 
         try {
             const user = await this.prisma.user.findUnique({
@@ -388,7 +506,7 @@ class SmartRouteService {
                 return await this._finalizeGuardedRun(run, route, occurrenceBased, occurrenceBase, 'FAILED_INSUFFICIENT', `Balance ${bal.toFixed(2)} < ${amount.toFixed(2)}`);
             }
 
-            switch (route.action) {
+            switch (action) {
                 case 'WITHDRAW_MOMO':
                     return await this._executeMomo(run, route, occurrenceBased, occurrenceBase);
                 case 'INTERNAL_TRANSFER':
@@ -398,7 +516,7 @@ class SmartRouteService {
                 case 'VAULT_DEPOSIT':
                     return await this._executeVault(run, route, occurrenceBased, occurrenceBase);
                 default:
-                    return await this._finalizeGuardedRun(run, route, occurrenceBased, occurrenceBase, 'FAILED_OTHER', 'Unknown action');
+                    return await this._finalizeGuardedRun(run, route, occurrenceBased, occurrenceBase, 'FAILED_OTHER', `Unknown action: ${action}`);
             }
         } catch (err) {
             // The guarded executor claims fail closed on concurrent spend:
@@ -429,11 +547,14 @@ class SmartRouteService {
      * AWAITING_RECONCILIATION instead of guessing.
      */
     async _executeMomo(run, route, occurrenceBased, occurrenceBase) {
-        const amount = new Prisma.Decimal(route.amountUsdc);
+        // r19 P0: amount and destination from the run's immutable snapshot.
+        const amount = new Prisma.Decimal(run.amountUsdc);
         // Reference derived from the run identity: a crashed-execution retry
         // or a concurrent recovery collides on the unique TransactionHistory
         // txHash instead of reserving the money twice.
-        const reference = `SRWD_${run.id}`;
+        const reference = `${SR_REFERENCE_PREFIX}${run.id}`;
+        const destMomoNumber = run.destMomoNumber || route.destMomoNumber;
+        const destMomoNetwork = run.destMomoProvider || route.destMomoProvider;
 
         // ── r16d P0: canonical destination network, fail-closed BEFORE any
         // lease claim, reservation or provider I/O. A legacy/invalid route
@@ -441,9 +562,9 @@ class SmartRouteService {
         // cannot be dispatched honestly.
         let canonicalNetwork;
         try {
-            canonicalNetwork = this._normalizeMomoNetwork(route.destMomoProvider);
+            canonicalNetwork = this._normalizeMomoNetwork(destMomoNetwork);
         } catch (netErr) {
-            logger.error({ err: netErr, runId: run.id, routeId: route.id, network: route.destMomoProvider },
+            logger.error({ err: netErr, runId: run.id, routeId: route.id, network: destMomoNetwork },
                 '[SmartRoute] invalid destination network — failing run before reservation');
             await recordReconciliationExceptionLoud(this.prisma, {
                 // NOTE: the exception queue accepts a fixed entity-type set;
@@ -454,7 +575,7 @@ class SmartRouteService {
                 entityId: reference,
                 reference,
                 reason: 'SMART_ROUTE_INVALID_MOMO_NETWORK',
-                details: { routeId: route.id, network: route.destMomoProvider ?? null, source: 'smart_route' },
+                details: { routeId: route.id, network: destMomoNetwork ?? null, source: 'smart_route' },
             }).catch(() => {});
             return await this._finalizeGuardedRun(run, route, occurrenceBased, occurrenceBase, 'FAILED_OTHER', 'invalid destination momo network — failed closed before reservation');
         }
@@ -532,13 +653,14 @@ class SmartRouteService {
             result = await financeService.processFiatWithdrawal(
                 this.prisma,
                 route.userId,
-                Number(route.amountUsdc),
+                Number(run.amountUsdc),
                 {
                     reference,
                     // §P.5-D intended route identity (mirrors the direct fiat
                     // controller: intent is the failover chain's primary rail;
                     // the actual accepting provider is recorded post-dispatch).
-                    liquidityRoute: { provider: 'MOOLRE_DISBURSEMENT', rail: 'MOMO', destination: route.destMomoNumber },
+                    // r19 P0: destination from the run's immutable snapshot.
+                    liquidityRoute: { provider: 'MOOLRE_DISBURSEMENT', rail: 'MOMO', destination: destMomoNumber },
                     // r15 hardening contract: the Withdrawal reconciliation
                     // record is created INSIDE the authoritative reservation
                     // transaction, durably linked to the canonical row.
@@ -549,7 +671,7 @@ class SmartRouteService {
                             'VALUES ($1, $2, $3, $4, $5, $6, $7, now(), now()) ' +
                             'RETURNING "id", "userId", "amount", "payoutMethod", "network", "destination", "status"',
                             route.userId,
-                            Number(route.amountUsdc),
+                            Number(run.amountUsdc),
                             // Legacy payout-method discriminator kept for
                             // worker discovery compatibility (direct-path
                             // convention) — NOT provider identity.
@@ -558,7 +680,7 @@ class SmartRouteService {
                             // is MoMo, the provider is Moolre, the network is
                             // the user's chosen MTN/TELECEL/AIRTELTIGO.
                             canonicalNetwork,
-                            route.destMomoNumber,
+                            destMomoNumber,
                             'PENDING',
                             txRecord.id
                         );
@@ -573,7 +695,7 @@ class SmartRouteService {
 
         const refreshed = await this.prisma.smartRouteRun.findUnique({ where: { id: run.id } });
         if (outcome === 'ACCEPTED') {
-            await this._notifySuccess(route, amount, `Routed $${amount.toFixed(2)} to MoMo ${route.destMomoNumber}`);
+            await this._notifySuccess(route, amount, `Routed $${amount.toFixed(2)} to MoMo ${destMomoNumber}`);
         }
         return refreshed;
     }
@@ -627,7 +749,9 @@ class SmartRouteService {
      */
     async _dispatchMomoPayout(run, route, reservation, { occurrenceBased, occurrenceBase }) {
         const reference = reservation.reference;
-        const phone = route.destMomoNumber;
+        // r19 P0: dispatch reads the run's immutable snapshot destination.
+        const phone = run.destMomoNumber || route.destMomoNumber;
+        const destNetworkSnapshot = run.destMomoProvider || route.destMomoProvider;
         const payoutGhs = reservation.payoutGhs || reservation.withdrawalAmount;
 
         // ── r16d P0: re-normalize the persisted network at the dispatch
@@ -637,13 +761,16 @@ class SmartRouteService {
         // state machine exactly like a dispatcher-unavailable failure.
         let canonicalNetwork;
         try {
-            canonicalNetwork = this._normalizeMomoNetwork(route.destMomoProvider);
+            canonicalNetwork = this._normalizeMomoNetwork(destNetworkSnapshot);
         } catch (netErr) {
-            logger.error({ err: netErr, reference, runId: run.id, network: route.destMomoProvider },
+            logger.error({ err: netErr, reference, runId: run.id, network: destNetworkSnapshot },
                 '[SmartRoute] invalid destination network at dispatch — reversing reservation, failing run');
             try {
                 await financeService.reverseFiatWithdrawal(this.prisma, reference, {
-                    reason: 'smart_route_invalid_momo_network'
+                    reason: 'smart_route_invalid_momo_network',
+                    // r19: the reversal converges the run inside the money
+                    // transaction — classify it exactly as this path did.
+                    runFailureStatus: 'FAILED_OTHER',
                 });
                 await this._markMirrorFailed(reservation, 'INVALID_MOMO_NETWORK');
             } catch (revErr) {
@@ -672,7 +799,9 @@ class SmartRouteService {
             logger.error({ reference, runId: run.id }, '[SmartRoute] disbursement service unavailable — reversing reservation, run fails definitively');
             try {
                 await financeService.reverseFiatWithdrawal(this.prisma, reference, {
-                    reason: 'smart_route_dispatcher_unavailable'
+                    reason: 'smart_route_dispatcher_unavailable',
+                    // r19: converge + classify exactly as this path did.
+                    runFailureStatus: 'FAILED_OTHER',
                 });
                 await this._markMirrorFailed(reservation, 'DISPATCHER_UNAVAILABLE');
             } catch (revErr) {
@@ -744,7 +873,9 @@ class SmartRouteService {
                 '[SmartRoute] dispatch-intent evidence failed — NOT starting provider I/O');
             try {
                 await financeService.reverseFiatWithdrawal(this.prisma, reference, {
-                    reason: 'smart_route_dispatch_intent_evidence_failed'
+                    reason: 'smart_route_dispatch_intent_evidence_failed',
+                    // r19: converge + classify exactly as this path did.
+                    runFailureStatus: 'FAILED_OTHER',
                 });
                 await this._markMirrorFailed(reservation, 'INTENT_EVIDENCE_FAILED');
                 await this._finalizeGuardedRun(run, route, occurrenceBased, occurrenceBase, 'FAILED_OTHER', 'dispatch intent evidence failed — reservation reversed');
@@ -807,7 +938,9 @@ class SmartRouteService {
                 '[SmartRoute] MoMo dispatch failed synchronously — reversing canonical reservation');
             try {
                 await financeService.reverseFiatWithdrawal(this.prisma, reference, {
-                    reason: `smart_route_dispatch_failure:${dispatchErr.message}`
+                    reason: `smart_route_dispatch_failure:${dispatchErr.message}`,
+                    // r19: converge + classify exactly as this path did.
+                    runFailureStatus: 'FAILED_GATEWAY',
                 });
                 await this._markMirrorFailed(reservation, 'DISPATCH_FAILED');
                 await this._finalizeGuardedRun(run, route, occurrenceBased, occurrenceBase, 'FAILED_GATEWAY', `provider rejected: ${dispatchErr.message}`);
@@ -931,9 +1064,59 @@ class SmartRouteService {
 
 
     async _executeTransfer(run, route, occurrenceBased, occurrenceBase) {
-        const amount = new Prisma.Decimal(route.amountUsdc);
+        // r19 P0: amount and recipient from the run's immutable snapshot.
+        const amount = new Prisma.Decimal(run.amountUsdc);
+        const recipientId = run.destFriendUserId || route.destFriendUserId;
 
         await this.prisma.$transaction(async (tx) => {
+            // ── r19 P0-4: CANONICAL RECIPIENT AUTHORIZATION ──────────────
+            // The direct peer-transfer contract (peerTransferController
+            // .sendFunds) requires an ACCEPTED Friendship between the two
+            // parties, and the receiving party must be an existing, ACTIVE
+            // user. The frontend friend picker is NOT authorization — this
+            // boundary independently enforces the same relationship, INSIDE
+            // the money transaction, against live rows:
+            //   • recipient must exist and not be banned;
+            //   • sender cannot transfer to themselves;
+            //   • an ACCEPTED friendship between the two parties must exist
+            //     (either direction).
+            // A recipient that stops satisfying the contract (unfriended,
+            // banned, deleted) fails CLOSED before any money moves.
+            if (recipientId === route.userId) {
+                const err = new Error('Smart Route internal transfer destination is the sender.');
+                err.code = 'SMART_ROUTE_RECIPIENT_UNAUTHORIZED';
+                throw err;
+            }
+            const recipient = await tx.user.findUnique({
+                where: { id: recipientId },
+                select: { id: true, banStatus: true },
+            });
+            if (!recipient) {
+                const err = new Error('Smart Route internal transfer recipient not found.');
+                err.code = 'SMART_ROUTE_RECIPIENT_UNAUTHORIZED';
+                throw err;
+            }
+            if (recipient.banStatus !== 'ACTIVE') {
+                const err = new Error(`Smart Route internal transfer recipient is not active (${recipient.banStatus}).`);
+                err.code = 'SMART_ROUTE_RECIPIENT_UNAUTHORIZED';
+                throw err;
+            }
+            const friendship = await tx.friendship.findFirst({
+                where: {
+                    status: 'ACCEPTED',
+                    OR: [
+                        { requesterId: route.userId, addresseeId: recipientId },
+                        { requesterId: recipientId, addresseeId: route.userId },
+                    ],
+                },
+                select: { id: true },
+            });
+            if (!friendship) {
+                const err = new Error('Smart Route internal transfer requires an accepted friendship with the recipient.');
+                err.code = 'SMART_ROUTE_RECIPIENT_UNAUTHORIZED';
+                throw err;
+            }
+
             // Guarded debit — the conditional claim fails closed on a
             // concurrent spend instead of driving the balance negative.
             const debit = await tx.user.updateMany({
@@ -946,7 +1129,7 @@ class SmartRouteService {
                 throw err;
             }
             await tx.user.update({
-                where: { id: route.destFriendUserId },
+                where: { id: recipientId },
                 data: { availableBalance: { increment: amount } },
             });
             const runHistory = await tx.transactionHistory.create({
@@ -970,10 +1153,10 @@ class SmartRouteService {
                 userId: route.userId,
                 relatedEntity: 'transactionHistory',
                 relatedEntityId: runHistory.id,
-                metadata: { recipientId: route.destFriendUserId, smartRouteRunId: run.id },
+                metadata: { recipientId, smartRouteRunId: run.id },
                 lines: [
                     { account: `user:${route.userId}:liability`, debit: amount.toFixed(8) },
-                    { account: `user:${route.destFriendUserId}:liability`, credit: amount.toFixed(8) },
+                    { account: `user:${recipientId}:liability`, credit: amount.toFixed(8) },
                 ],
             });
             // Run finalization INSIDE the money transaction: either the
@@ -987,20 +1170,32 @@ class SmartRouteService {
     }
 
     async _executeSavings(run, route, occurrenceBased, occurrenceBase) {
-        const amount = new Prisma.Decimal(route.amountUsdc);
+        // r19 P0: amount and goal from the run's immutable snapshot.
+        const amount = new Prisma.Decimal(run.amountUsdc);
+        const goalId = run.destSavingsGoalId || route.destSavingsGoalId;
 
         await this.prisma.$transaction(async (tx) => {
             // Goal validation INSIDE the money transaction (the old
             // pre-transaction read was a TOCTOU on goal ownership/state).
             const goal = await tx.savingsGoal.findUnique({
-                where: { id: route.destSavingsGoalId },
+                where: { id: goalId },
             });
             if (!goal || goal.userId !== route.userId) {
                 throw new Error('Savings goal not found');
             }
-            // Live rate for usdc → ghs translation
+            // r19 P0-5: SAVINGS-CANONICAL DENOMINATION. The savings subsystem
+            // defines GHS valuation through GlobalSettings.liveUsdToGhs — the
+            // manual deposit path (savingsController.deposit converts
+            // amountGhs/liveUsdToGhs into USDC) and the withdrawal path
+            // (withdraw converts GHS back at liveUsdToGhs) BOTH use it. This
+            // executor previously used liveRetailRate (a DIFFERENT field with
+            // a different fallback), which could create GHS at the deposit
+            // boundary that the withdrawal boundary released as more USDC
+            // than was locked — value creation at a denomination seam. One
+            // denomination authority for savings: liveUsdToGhs (same fallback
+            // as the manual paths).
             const settings = await tx.globalSettings.findUnique({ where: { id: 1 } });
-            const rate = new Prisma.Decimal(settings?.liveRetailRate || 12.5);
+            const rate = new Prisma.Decimal(settings?.liveUsdToGhs || 15.0);
             const ghs = amount.mul(rate);
 
             const debit = await tx.user.updateMany({
@@ -1053,7 +1248,12 @@ class SmartRouteService {
                     { account: `escrow:savings-${goal.id}:locked`, credit: amount.toFixed(8) },
                 ],
             });
-            await this._finalizeRunInTx(tx, run, route, occurrenceBased, occurrenceBase, 'SUCCESS');
+            // r19: record the deposit economics on the run (amountGhs +
+            // rateUsed were previously left null for savings runs).
+            await this._finalizeRunInTx(tx, run, route, occurrenceBased, occurrenceBase, 'SUCCESS', null, {
+                amountGhs: ghs,
+                rateUsed: rate,
+            });
         });
 
         const refreshed = await this.prisma.smartRouteRun.findUnique({ where: { id: run.id } });
@@ -1062,7 +1262,9 @@ class SmartRouteService {
     }
 
     async _executeVault(run, route, occurrenceBased, occurrenceBase) {
-        const amount = new Prisma.Decimal(route.amountUsdc);
+        // r19 P0: amount and vault from the run's immutable snapshot.
+        const amount = new Prisma.Decimal(run.amountUsdc);
+        const vaultId = run.destVaultId || route.destVaultId;
 
         // Vault deposits commit through vaultService's own transaction (a
         // guarded ACTIVE claim + guarded user debit inside it). The run's
@@ -1070,7 +1272,7 @@ class SmartRouteService {
         // to the committed deposit instead of moving money twice.
         await this.vaultService.depositManual({
             userId: route.userId,
-            vaultId: route.destVaultId,
+            vaultId,
             amountUsdc: amount,
             idempotencyKey: `smartroute-run-${run.id}`,
         });
@@ -1127,13 +1329,21 @@ class SmartRouteService {
             });
         }
         if (occurrenceBased) {
-            // Advance the cadence from the CLAIMED occurrence base (not
-            // wall-clock now) so the schedule never drifts, and so a failed
-            // occurrence still consumes itself exactly once.
+            // r19 P0-3: advance the cadence from the CLAIMED occurrence
+            // base AND the claimed cadence snapshot (run.frequency /
+            // run.dayOfMonth captured at claim time) — never the CURRENT
+            // route schedule. A frequency/dayOfMonth edit landing between
+            // claim and finalization takes effect from the NEXT claimed
+            // occurrence onward; the already-claimed occurrence can never
+            // silently change identity, replay a prior occurrence, or
+            // advance twice. Legacy rows (no snapshot) fall back to the
+            // route values like the pre-r19 code did.
+            const frequency = run.frequency || route.frequency;
+            const dayOfMonth = run.dayOfMonth != null ? run.dayOfMonth : route.dayOfMonth;
             await tx.smartRoute.update({
                 where: { id: route.id },
                 data: {
-                    nextRunAt: this._computeNextRun(occurrenceBase, route.frequency, route.dayOfMonth),
+                    nextRunAt: computeNextRun(occurrenceBase, frequency, dayOfMonth),
                     lastRunAt: new Date(),
                 },
             });
@@ -1175,18 +1385,11 @@ class SmartRouteService {
     // INTERNAL
     // =========================================================================
 
+    // r19: cadence semantics live in the shared smartRouteOccurrence module
+    // (also used by the settlement convergence in finance.service — one
+    // implementation, no drift between the two callers).
     _computeNextRun(from, frequency, dayOfMonth) {
-        const base = new Date(from);
-        if (frequency === 'DAILY') return new Date(base.getTime() + FREQUENCY_MS.DAILY);
-        if (frequency === 'WEEKLY') return new Date(base.getTime() + FREQUENCY_MS.WEEKLY);
-        if (frequency === 'MONTHLY') return new Date(base.getTime() + FREQUENCY_MS.MONTHLY);
-        if (frequency === 'ON_DAY_OF_MONTH') {
-            const target = Math.min(Math.max(Number(dayOfMonth) || 1, 1), 28);
-            const next = new Date(base.getFullYear(), base.getMonth() + 1, target, 9, 0, 0);
-            return next;
-        }
-        // Fallback
-        return new Date(base.getTime() + FREQUENCY_MS.WEEKLY);
+        return computeNextRun(from, frequency, dayOfMonth);
     }
 
     _notifyInsufficient(route, balance, required) {

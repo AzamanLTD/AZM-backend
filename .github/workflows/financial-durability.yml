@@ -103,6 +103,11 @@ jobs:
       - name: Install transaction quote overlay
         run: node infra/install-transaction-quote-overlay.js
 
+      - name: Install r19 smart-route execution snapshot overlay
+        # r19: the snapshot columns the Smart Route executors/recovery read.
+        # Mirrors the release chain (npm run release) and the migration.
+        run: node infra/install-r19-smartroute-execution-snapshot-overlay.js
+
       - name: Install payout reconciliation infrastructure
         run: node infra/install-payout-reconciliation-infra.js
 

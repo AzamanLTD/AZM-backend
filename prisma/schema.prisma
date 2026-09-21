@@ -4243,6 +4243,25 @@ model SmartRouteRun {
   withdrawalId  Int? // loose FK — no @relation to keep Withdrawal untouched
   failureReason String?
 
+  // r19 P0 (audit 2026-09-21): immutable execution snapshot. Once a run is
+  // claimed its economic identity is FROZEN: executors, crash recovery and
+  // settlement convergence read THESE columns, never the mutable parent
+  // SmartRoute. A route edit between claim and execution can no longer
+  // change the amount, destination, action or claimed occurrence of an
+  // already-claimed economic operation. Nullable columns are a legacy-row
+  // migration affordance only — every run claimed after r19 carries the
+  // full snapshot, and the (now narrow) legacy fallback paths read them
+  // exactly like the pre-r19 executors did.
+  action            SmartRouteAction?
+  destMomoNumber    String?
+  destMomoProvider  String?
+  destFriendUserId  Int?
+  destSavingsGoalId String?
+  destVaultId       String?
+  frequency         SmartRouteFrequency?
+  dayOfMonth        Int?
+  claimedOccurrenceAt DateTime?
+
   // r16 P0-A: durable economic execution identity. One unique key per due
   // scheduled occurrence (`{routeId}:occ:{nextRunAt ISO}`) — the database
   // decides the single winner between the scheduler, /run-now and any

@@ -32,7 +32,7 @@
 //
 // SKIPS unless TEST_DATABASE_URL is set (CI runs a disposable postgres).
 // =============================================================================
-const { seedUser } = require('./helpers/factories');
+const { seedUser, seedFriendship } = require('./helpers/factories');
 const hasDb = !!process.env.TEST_DATABASE_URL;
 const describeOrSkip = hasDb ? describe : describe.skip;
 if (!hasDb) console.warn('[r16-smartroute] TEST_DATABASE_URL not set — skipping.');
@@ -175,6 +175,7 @@ describeOrSkip('r16 P0-A: Smart Route execution identity', () => {
     test('1: two concurrent scheduled executions of one due occurrence → exactly one SUCCESS run, one debit', async () => {
         const user = await seedUser(prisma, { availableBalance: 500 });
         const friend = await seedUser(prisma, { availableBalance: 0 });
+        await seedFriendship(prisma, user.id, friend.id);
         const route = await seedRoute(user.id, { destFriendUserId: friend.id });
 
         const [, r1, r2] = await Promise.allSettled([
@@ -202,6 +203,7 @@ describeOrSkip('r16 P0-A: Smart Route execution identity', () => {
     test('2: scheduled worker + concurrent manual run-now consume the same due occurrence exactly once', async () => {
         const user = await seedUser(prisma, { availableBalance: 500 });
         const friend = await seedUser(prisma, { availableBalance: 0 });
+        await seedFriendship(prisma, user.id, friend.id);
         const route = await seedRoute(user.id, { destFriendUserId: friend.id });
 
         const [m1, m2] = await Promise.all([
@@ -223,6 +225,7 @@ describeOrSkip('r16 P0-A: Smart Route execution identity', () => {
     test('3: two manual run-now calls with NOTHING due → two distinct manual identities, both execute', async () => {
         const user = await seedUser(prisma, { availableBalance: 500 });
         const friend = await seedUser(prisma, { availableBalance: 0 });
+        await seedFriendship(prisma, user.id, friend.id);
         const future = new Date(Date.now() + 7 * 86400000); // not due
         const route = await seedRoute(user.id, { destFriendUserId: friend.id, nextRunAt: future });
 
@@ -248,6 +251,7 @@ describeOrSkip('r16 P0-A: Smart Route execution identity', () => {
     test('4: crash after execution claim → stale PENDING run is recovered exactly once', async () => {
         const user = await seedUser(prisma, { availableBalance: 500 });
         const friend = await seedUser(prisma, { availableBalance: 0 });
+        await seedFriendship(prisma, user.id, friend.id);
         const route = await seedRoute(user.id, { destFriendUserId: friend.id });
 
         // Simulate a crash between claim and execution: a PENDING run older
@@ -281,6 +285,7 @@ describeOrSkip('r16 P0-A: Smart Route execution identity', () => {
         const rich = await seedUser(prisma, { availableBalance: 500 });
         const poor = await seedUser(prisma, { availableBalance: 1 }); // < route amount
         const friend = await seedUser(prisma, { availableBalance: 0 });
+        await seedFriendship(prisma, poor.id, friend.id);
         const route = await seedRoute(poor.id, { destFriendUserId: friend.id });
 
         // Failed execution (insufficient balance)
@@ -608,7 +613,10 @@ describeOrSkip('r16 P0-A: Smart Route execution identity', () => {
 
         const refreshed = await prisma.smartRouteRun.findUnique({ where: { id: run.id } });
         expect(refreshed.status).toBe('FAILED_OTHER');
-        expect(refreshed.failureReason).toContain('dispatcher unavailable');
+        // r19: the reversal's convergence finalizes the run FIRST (inside
+        // the money transaction) with the reason token; the executor's own
+        // FAILED_OTHER finalize converges to a no-op.
+        expect(refreshed.failureReason).toContain('smart_route_dispatcher_unavailable');
 
         const reference = `SRWD_${run.id}`;
         const canonical = await prisma.transactionHistory.findUnique({ where: { txHash: reference } });

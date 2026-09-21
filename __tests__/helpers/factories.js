@@ -152,6 +152,15 @@ async function seedBusiness(prisma, overrides = {}) {
     return { owner, biz, product };
 }
 
+// r19: an ACCEPTED friendship between two seeded users — the canonical
+// relationship the peer-transfer contract (peerTransferController.sendFunds
+// and the Smart Route INTERNAL_TRANSFER executor) requires.
+async function seedFriendship(prisma, requesterId, addresseeId, status = 'ACCEPTED') {
+    return prisma.friendship.create({
+        data: { requesterId, addresseeId, status },
+    });
+}
+
 // Creates a Friendship → ESCROW Ticket → SmartEscrow in the requested status.
 // For a FUNDED-ish escrow the payer's principal sits in escrowLockedBalance
 // (the fee is NOT locked); for DRAFT no money has moved so the payer simply
@@ -294,6 +303,7 @@ async function seedAzmBalance(prisma, azmBalance = 100, overrides = {}) {
 }
 
 module.exports = {
+    seedFriendship,
     TEST_PASSWORD,
     seedUser,
     seedVendor,

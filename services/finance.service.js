@@ -86,6 +86,10 @@ const _debitUserBalance = async (tx, userId, amount) => {
 const ledger = require('./ledgerService'); // §P.4 authoritative ledger
 const restrictedObligations = require('./restrictedObligationService'); // §P.4 persisted restricted obligations
 const fiatLiquidity = require('../src/services/fiatLiquidityService'); // §P.5-D GHS liquidity authority
+// r19: Smart Route settlement convergence — a LEAF module (no service
+// cycles). Converges the SmartRouteRun projection onto the canonical
+// fiat outcome INSIDE the settlement/reversal transaction.
+const smartRouteOccurrence = require('./smartRouteOccurrence');
 
 const processFiatWithdrawal = async (prisma, userId, amountFloat, opts = {}) => {
     await runDoubleCheck(prisma, userId);
@@ -395,6 +399,16 @@ const completeFiatWithdrawal = async (prisma, reference, { providerTxId = null }
             return { changed: false, transaction: current };
         }
 
+        // r19 P0: converge the SmartRouteRun projection (if this payout was
+        // fired by a smart route) onto the SUCCESS settlement — inside the
+        // SAME transaction as the canonical money claim, so the projection
+        // can never permanently claim a misleading state and an
+        // AWAITING_RECONCILIATION run can never dead-end.
+        await smartRouteOccurrence.convergeRunOnFiatSettlement(tx, reference, {
+            payoutGhs: pending.metadata?.payoutGhs ?? null,
+            retailRate: pending.metadata?.retailRate ?? null,
+        });
+
         if (_isDeferredWithdrawal(pending)) {
             const amountFloat = Number(pending.amountUsdc);
             const exitFee = Number(pending.feeUsdc);
@@ -538,6 +552,18 @@ const reverseFiatWithdrawal = async (prisma, reference, opts = {}) => {
             data: { status: 'FAILED' }
         });
         if (claim.count === 0) return { alreadyReversed: true };
+
+        // r19 P0: converge the SmartRouteRun projection (if this payout was
+        // fired by a smart route) onto the reversal — inside the SAME
+        // transaction as the refund. A run that had claimed SUCCESS can no
+        // longer remain "successful money movement" after the money came
+        // back. The caller's honest classification (opts.runFailureStatus)
+        // is honored; provider-async-failure reversals default to
+        // FAILED_GATEWAY.
+        await smartRouteOccurrence.convergeRunOnFiatReversal(tx, reference, {
+            reason: opts.reason || null,
+            runFailureStatus: opts.runFailureStatus,
+        });
 
         await _ensureProfitFeesSingleton(tx);
         await _ensureFiatPoolSingleton(tx);
