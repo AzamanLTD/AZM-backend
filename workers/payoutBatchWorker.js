@@ -48,6 +48,7 @@ const logger = require('../src/config/logger');
 const fiatLiquidity = require('../src/services/fiatLiquidityService'); // §P.5-D
 const { canonicalProviderName, persistPayoutOwnership } = require('../services/payoutProviderOwnership');
 const { recordReconciliationException } = require('../services/reconciliationExceptionService');
+const restrictedObligations = require('../services/restrictedObligationService'); // r17 P0 durable identity
 
 const DEFAULT_INTERVAL_MS = 120_000;  // 2 minutes
 const MAX_BATCH_SIZE      = 25;       // Don't overwhelm the provider in one tick
@@ -168,7 +169,17 @@ class PayoutBatchWorker {
             return { row: null, ambiguous: false };
         }
 
-        const txRows = await this.prisma.transactionHistory.findMany({
+        // r17 P0 identity guard: a withdrawal that OWNS its own obligation
+        // (durable relation sourceEntity='withdrawal', e.g. the wallet
+        // reservation path) has its own economic identity and must never
+        // adopt — let alone dispatch — a fiat canonical reservation that
+        // belongs to a different withdrawal. Refuse the guess.
+        const ownObligation = await restrictedObligations.findActiveForSource(this.prisma, 'withdrawal', withdrawal.id);
+        if (ownObligation) {
+            return { row: null, ambiguous: false };
+        }
+
+        const txRowsRaw = await this.prisma.transactionHistory.findMany({
             where: {
                 userId: withdrawal.userId,
                 type: 'WITHDRAWAL_FIAT',
@@ -180,14 +191,36 @@ class PayoutBatchWorker {
                 }
             },
             orderBy: { createdAt: 'desc' },
-            take: 2
+            take: 10
         });
+        // r17 P0: the guessed match may only adopt a GENUINELY ORPHAN
+        // canonical — not one durably linked to another Withdrawal row via
+        // the bridge. Dispatching a linked canonical here would pay one
+        // withdrawal's reservation under another withdrawal's mirror.
+        const txRows = await this._excludeBridgeLinked(txRowsRaw);
 
         if (txRows.length !== 1 || !txRows[0]?.txHash) {
             return { row: null, ambiguous: txRows.length > 1 };
         }
 
         return { row: txRows[0], ambiguous: false };
+    }
+
+    /**
+     * r17 P0 — drop candidate canonical rows durably linked to ANY Withdrawal
+     * row via the transactionHistoryId bridge. The guessed amount±5s
+     * fallback may only ever adopt an ORPHAN (pre-bridge legacy) row.
+     */
+    async _excludeBridgeLinked(candidates) {
+        if (!Array.isArray(candidates) || candidates.length === 0) return [];
+        if (typeof this.prisma.$queryRawUnsafe !== 'function') return candidates;
+        const ids = candidates.map((c) => c.id);
+        const linked = await this.prisma.$queryRawUnsafe(
+            'SELECT "transactionHistoryId" FROM "Withdrawal" WHERE "transactionHistoryId" = ANY($1::text[])',
+            ids
+        );
+        const linkedSet = new Set((linked || []).map((r) => r.transactionHistoryId));
+        return candidates.filter((c) => !linkedSet.has(c.id));
     }
 
     async _processBatch(settings, { isManualTrigger = false } = {}) {

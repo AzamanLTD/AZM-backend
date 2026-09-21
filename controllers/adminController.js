@@ -1646,16 +1646,16 @@ exports.rejectWithdrawal = async (req, res) => {
 
             // §P.4 AUTHORITATIVE LEDGER — rejection refund, same transaction.
             const refundExact = new Prisma.Decimal(_exact(withdrawal.amount));
-            const activeObligation = await tx.restrictedObligation.findFirst({
-                where: {
-                    status: 'ACTIVE',
-                    userId: withdrawal.userId,
-                    OR: [
-                        { reference: `withdrawal:wallet:${withdrawal.id}` },
-                        { reference: `withdrawal:smartroute:${withdrawal.id}` },
-                    ],
-                },
-            });
+            // r17 P0: resolve the withdrawal's own obligation through the
+            // DURABLE RELATION (sourceEntity='withdrawal' +
+            // sourceEntityId=withdrawal.id — the columns every
+            // createForPendingWithdrawal call populates), with the
+            // identity-derived legacy wallet reference kept as a
+            // compatibility alias for pre-sourceEntity rows. The phantom
+            // `withdrawal:smartroute:` family (never written by any creation
+            // path in the repository's history) is gone, and no
+            // prefix/startsWith guessing remains anywhere on this path.
+            const activeObligation = await restrictedObligations.findActiveForSource(tx, 'withdrawal', withdrawal.id);
             const refundPost = await ledger.post(tx, {
                 idempotencyKey: `ledger:admin:reject-withdrawal:${withdrawal.id}`,
                 entryType: 'WITHDRAWAL',
@@ -1722,6 +1722,23 @@ exports.rejectWithdrawal = async (req, res) => {
  * conservative legacy match (WITHDRAWAL_FIAT, amount ±, createdAt window),
  * backfilled onto the bridge. Returns null for mirror-only legacy rows.
  */
+/**
+ * r17 P0 — drop candidate canonical rows that are durably linked to ANY
+ * Withdrawal row via the transactionHistoryId bridge. A linked canonical
+ * belongs to that withdrawal's economic identity; the guessed amount±5s
+ * fallback may only ever adopt an ORPHAN (pre-bridge legacy) row.
+ */
+async function _excludeBridgeLinked(prisma, candidates) {
+    if (!Array.isArray(candidates) || candidates.length === 0) return [];
+    const ids = candidates.map((c) => c.id);
+    const linked = await prisma.$queryRawUnsafe(
+        'SELECT "transactionHistoryId" FROM "Withdrawal" WHERE "transactionHistoryId" = ANY($1::text[])',
+        ids
+    );
+    const linkedSet = new Set((linked || []).map((r) => r.transactionHistoryId));
+    return candidates.filter((c) => !linkedSet.has(c.id));
+}
+
 async function _resolveCanonicalWithdrawalTx(prisma, withdrawal) {
     let linkedId = null;
     if (typeof prisma.$queryRawUnsafe === 'function') {
@@ -1739,9 +1756,29 @@ async function _resolveCanonicalWithdrawalTx(prisma, withdrawal) {
         return null;
     }
 
+    // r17 P0 identity guard: a withdrawal that OWNS its own obligation
+    // (sourceEntity='withdrawal', e.g. the wallet reservation path) has its
+    // own economic identity. It must NEVER adopt a fiat canonical through
+    // the guessed fallback below — that would reverse one withdrawal's
+    // canonical reservation while leaving the adopted row's own obligation
+    // active (refund/obligation divergence). Its refund economics belong to
+    // the durable relation alone.
+    const ownObligation = await restrictedObligations.findActiveForSource(prisma, 'withdrawal', withdrawal.id);
+    if (ownObligation) {
+        return null;
+    }
+
     // Legacy fallback match (mirrors the reconciliation worker's contract):
     // a single WITHDRAWAL_FIAT row for this user, this amount, within ±5s.
-    const txRows = await prisma.transactionHistory.findMany({
+    // r17 P0: the guessed match may only adopt a GENUINELY ORPHAN canonical
+    // — a TransactionHistory row that is not durably linked to ANY
+    // Withdrawal row via the bridge. A linked canonical belongs to another
+    // withdrawal's economic identity; adopting it here would reject THIS
+    // row while reversing ANOTHER row's reservation (cross-identity
+    // hijack). Post-bridge fiat rows are always linked, so this constraint
+    // confines adoption to the pre-bridge legacy rows the fallback was
+    // built for.
+    const txRowsRaw = await prisma.transactionHistory.findMany({
         where: {
             userId: withdrawal.userId,
             type: 'WITHDRAWAL_FIAT',
@@ -1752,8 +1789,9 @@ async function _resolveCanonicalWithdrawalTx(prisma, withdrawal) {
             }
         },
         orderBy: { createdAt: 'desc' },
-        take: 2
+        take: 10
     });
+    const txRows = await _excludeBridgeLinked(prisma, txRowsRaw);
 
     if (txRows.length === 1) {
         const txRow = txRows[0];

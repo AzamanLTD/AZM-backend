@@ -211,6 +211,8 @@ describe('WithdrawalReconciliationWorker settlement lifecycle', () => {
     expect(provider.getTransferStatus).not.toHaveBeenCalled();
     expect(prisma.transactionHistory.updateMany).not.toHaveBeenCalled();
     expect(prisma.withdrawal.update).not.toHaveBeenCalled();
-    expect(prisma.$queryRawUnsafe).toHaveBeenCalledTimes(2);
+    // r17: the third raw read is the bridge-linked exclusion check (a
+    // read-only SELECT) before the ambiguity verdict — still zero writes.
+    expect(prisma.$queryRawUnsafe).toHaveBeenCalledTimes(3);
   });
 });

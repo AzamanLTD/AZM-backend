@@ -226,9 +226,53 @@ async function authoritativeTotals(db, { asset = 'USDC' } = {}) {
   return { total, complete, families };
 }
 
+
+/**
+ * r17 P0 — resolve the ACTIVE obligation durably owned by a source entity.
+ *
+ * This is the DURABLE-RELATION identity lookup (sourceEntity + sourceEntityId,
+ * the columns createForPendingWithdrawal populates on every row) — the
+ * canonical mechanism for finding "this withdrawal's obligation" WITHOUT
+ * guessing reference-string families. A reference built from an
+ * identity-derived key (withdrawal:wallet:{withdrawal.id}) is kept as a
+ * legacy compatibility alias ONLY for rows written before sourceEntity
+ * existed; no prefix/startsWith matching is ever performed.
+ *
+ * Fiat-payout obligations are deliberately NOT reachable through this
+ * lookup: they are created with sourceEntity 'transactionHistory' and are
+ * resolved through the canonical TransactionHistory reference
+ * (withdrawal:fiat:{txHash}) by the settlement/reversal state machines —
+ * a mirror-only row can never guess its way into a fiat obligation.
+ */
+async function findActiveForSource(db, sourceEntity, sourceEntityId) {
+  const id = sourceEntityId != null ? String(sourceEntityId) : null;
+  if (id == null) return null;
+  // Mock prisma objects in unit suites may omit the delegate; a real
+  // Prisma client ALWAYS has it. Treat the absence as "no durable
+  // obligation recorded" (null) — the same conservative outcome as an
+  // absent obligation, never an exception.
+  if (!db || !db.restrictedObligation || typeof db.restrictedObligation.findFirst !== 'function') {
+    return null;
+  }
+  const legacyReferenceAliases = sourceEntity === 'withdrawal'
+    ? [{ reference: `withdrawal:wallet:${id}` }]
+    : [];
+  return db.restrictedObligation.findFirst({
+    where: {
+      status: 'ACTIVE',
+      OR: [
+        { sourceEntity, sourceEntityId: id },
+        ...legacyReferenceAliases,
+      ],
+    },
+    orderBy: { createdAt: 'asc' },
+  });
+}
+
 module.exports = {
   SOURCE_FAMILIES,
   createForPendingWithdrawal,
+  findActiveForSource,
   releaseOnSettlement,
   cancelOnReversal,
   authoritativeTotals,
