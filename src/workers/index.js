@@ -102,6 +102,15 @@ async function startWorkers(app, {
     await register('smart-route', String(60 * 1000), () => smartRouteWorker._tick());
     await register('azm-auction', String(5 * 60 * 1000), () => azmAuctionWorker._tick());
     await register('onchain-sweep', String(60 * 60 * 1000), () => onchainSweepWorker._tick());
+
+    // r22: dedicated custody recovery cadence. Customer withdrawals may not
+    // wait for the hourly sweep worker to repair a crash window. Every pass
+    // is idempotent + concurrency-safe (conditional CAS transitions), so a
+    // 60s cadence — in BullMQ distributed mode OR the Redis-off single-
+    // instance fallback — is safe.
+    const CustodyRecoveryWorker = require('../../workers/custodyRecoveryWorker');
+    const custodyRecoveryWorker = new CustodyRecoveryWorker(prisma, io);
+    await register('custody-recovery', String(60 * 1000), () => custodyRecoveryWorker._tick());
     await register('disappearing-msg', String(60 * 1000), () => disappearingMessageWorker._tick());
 
     const proofOfReservesWorker = require('../../workers/proofOfReservesWorker');

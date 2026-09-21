@@ -822,7 +822,16 @@ describeOrSkip('§P.2 custody execution (real PostgreSQL)', () => {
 
     it('reconcilePendingExecutions advances in-flight executions idempotently and never touches terminal ones', async () => {
         const user = await seedFundedUser();
-        const e1 = await makeWithdrawalExecution({ userId: user.id, txRecordId: 'wd-rec1' });
+        // r22 F: settlement requires the REAL linked customer-facing record —
+        // a fabricated refId with no TransactionHistory row is (correctly)
+        // refused now (see the dedicated r22 proofs for that refusal).
+        const txRecord = await prisma.transactionHistory.create({
+            data: {
+                userId: user.id, type: 'WITHDRAWAL_CRYPTO',
+                amountUsdc: 1, feeUsdc: 0.0275, txHash: null, status: 'PENDING',
+            },
+        });
+        const e1 = await makeWithdrawalExecution({ userId: user.id, txRecordId: txRecord.id });
         await prisma.custodyExecution.update({
             where: { id: e1.id },
             data: { status: 'SIGNING', tatumPendingId: 'kms-r1', approvalStatus: 'APPROVED' },

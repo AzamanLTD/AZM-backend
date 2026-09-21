@@ -199,3 +199,55 @@ it disabled. The formal custody-account/movement accounting model
 (CustodyAccount / CustodyMovement / inventory lots / Proof-of-Reserves
 redesign) is deliberately deferred to §P.3, which will attach these execution
 records to that model.
+## r22 — Custody execution recovery + terminal convergence (2026-09-21)
+
+Every economically meaningful `CustodyExecution` state now has an explicit,
+durable recovery owner (exported as `STATE_MACHINE` in
+`tatumCustodyExecutionService.js`). A crash between two durable steps can
+never silently strand customer funds:
+
+| State | Recovery owner | What it does |
+|---|---|---|
+| `RESERVING` (stale, PENDING/DENIED) | `custodyRecoveryService.recoverReservingExecutions` | no submission CAS was claimed → no provider I/O can have happened: FAILED + exactly-once refund (withdrawals) / FAILED (sweeps) |
+| `RESERVING` (stale, APPROVED) | same | RE-ENTERS the canonical `submitExecution()` boundary on the durable identity — single-winner CAS means exactly one submission |
+| `SUBMITTED` (crash-after-claim) | `custodyRecoveryService.recoverSubmittedExecutions` | resolves with Tatum's pending-KMS contract (`GET /v3/kms/pending/MATIC` → `{id, chain, hashes[], serializedTransaction, index?, txId?}`); binds ONLY on exact chain + KMS signature identity + decoded ERC-20 transfer semantics; NEVER a blind retry |
+| `SUBMITTED` + pendingId | same | `GET /v3/kms/{id}` → converge to SIGNING or BROADCAST |
+| `RECONCILIATION_REQUIRED` (UNKNOWN_OUTCOME) | `custodyRecoveryService.convergeReconciliationRequired` | recurring pending-scan: binds when evidence appears, stays quarantined while it does not |
+| `RECONCILIATION_REQUIRED` (CHAIN_REVERTED) | same | definitive revert: FAILED + exactly-once refund, atomic; revert txHash preserved as evidence |
+| `RECONCILIATION_REQUIRED` (CHAIN_MISMATCH / contradictory) | human | durable evidence on the row; the four-eye validator refuses to sign; no retry, no refund |
+| `SIGNING` / `BROADCAST` | `reconcilePendingExecutions` (unchanged) | KMS poll → chain-receipt verification → branded-proof settlement |
+
+**Honest limits, documented rather than guessed:**
+
+- Absence from the KMS pending list does NOT prove no broadcast — completed
+  pendings leave the list. A crash-after-claim with no admissible match is
+  quarantined with evidence, never auto-refunded.
+- A pending whose serialized payload does not decode is UNUSABLE evidence —
+  never treated as a match or a mismatch.
+- `realizedNetworkCostBaseUnits` is never fabricated from the estimate; the
+  reverted-receipt gas (MATIC, paid by the hot wallet operator) is an operating
+  cost (P1 follow-up recorded in the r22 report).
+
+**Settlement convergence guards (`settleExecution`):** the linked
+`TransactionHistory` completion is an exact-one CAS that atomically converges
+the REAL chain tx hash into the customer-facing record; a missing or FAILED
+linked record quarantines the settlement (COMPLETED-without-record divergence
+is impossible). The `OnchainSweep` audit row is checked-CAS but audit-only — it
+can never block the money path.
+
+**Denial race hardening (`denyKmsRequest`):** cancel-first; a proven cancel
+fails the execution from pre-broadcast states with the exactly-once refund; an
+unprovable cancel quarantines; a denial after BROADCAST is recorded but cannot
+un-broadcast — chain evidence remains the settlement authority.
+`approveKmsRequest` refuses executions that already carry broadcast evidence.
+
+**Cadence:** the dedicated `custodyRecoveryWorker` runs every 60s through the
+existing BullMQ scheduler abstraction (distributed mode or Redis-off
+single-instance fallback). Every recovery transition is a conditional
+single-winner CAS; the refund paths share the controller's ledger idempotency
+key family (`ledger:withdrawal:crypto:refund:<executionId>`), so duplicate
+passes and concurrent workers converge on exactly one refund.
+
+Ops tunables: `TATUM_CUSTODY_RESERVING_STALE_MINUTES` (default 10),
+`TATUM_CUSTODY_SUBMITTED_GRACE_MINUTES` (default 2).
+
