@@ -50,7 +50,7 @@ const { Prisma } = require('@prisma/client');
 //     authoritative totals below report the exact ledger balances for
 //     observability.
 const SOURCE_FAMILIES = {
-  PENDING_FIAT_WITHDRAWAL:   { authoritative: true, representation: 'RESTRICTED_OBLIGATION_ROW', description: 'Customer funds reserved for a PENDING MTN MoMo payout (settled/reversed only on provider outcome).' },
+  PENDING_FIAT_WITHDRAWAL:   { authoritative: true, representation: 'RESTRICTED_OBLIGATION_ROW', description: 'Customer funds reserved for a PENDING Moolre MoMo payout (settled/reversed only on provider outcome).' },
   PENDING_CRYPTO_WITHDRAWAL: { authoritative: true, representation: 'RESTRICTED_OBLIGATION_ROW', description: 'Customer funds reserved for a PENDING on-chain withdrawal (CustodyExecution).' },
   ESCROW_LOCK:               { authoritative: true, representation: 'LEDGER_RECLASSIFICATION', ledgerAccountPattern: /^escrow:[A-Za-z0-9][A-Za-z0-9_.-]*:locked$/, description: 'P2P/SmartEscrow/booking/vault/savings/susu restricted funds — authoritative via the escrow:{key}:locked ledger reclassification, reconciled against User.escrowLockedBalance.' },
   DISPUTE_ESCROW:             { authoritative: true, representation: 'LEDGER_RECLASSIFICATION', ledgerAccountPattern: /^user:\d+:dispute$/, description: 'Dispute-locked customer funds — authoritative via the user:{id}:dispute ledger reclassification, reconciled against User.disputeEscrowBalance.' },

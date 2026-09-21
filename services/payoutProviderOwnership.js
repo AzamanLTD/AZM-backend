@@ -2,9 +2,15 @@
 // =============================================================================
 // AZAMAN — PAYOUT PROVIDER OWNERSHIP (canonical actual-provider authority)
 //
-// Production disbursement runs through PaymentFailoverService
-// (moolre -> mtn, priority order). initiateTransfer() tags the ACCEPTING
-// provider on its result ({ _provider: 'moolre' | 'mtn' }), but ownership
+// Production disbursement runs through PaymentFailoverService. Since r16b
+// P0-A the production registry is MOOLRE-ONLY (product contract 2026-09-20):
+// MTN/Telecel/AirtelTigo are destination networks under Moolre, not provider
+// contracts. The `mtn` tag below is retained as a LEGACY/HISTORICAL provider
+// identity ONLY — historical rows may carry MTN ownership evidence that
+// reconciliation must still resolve. Production dispatch can never select
+// it (no MTN provider instance exists in the registry). initiateTransfer()
+// tags the ACCEPTING provider on its result ({ _provider: 'moolre' } today;
+// legacy rows may carry 'mtn'), but ownership
 // must be DURABLE: reconciliation may run minutes/hours later, on another
 // instance, after a crash. This module is the single authority for:
 //
@@ -33,8 +39,9 @@
 //                                  actually ACCEPTED the dispatch
 //                                  ('moolre' | 'mtn')
 //   metadata.payoutProviderName  - the canonical adapter identity
-//                                  ('MOOLRE_DISBURSEMENT' |
-//                                   'MTN_MOMO_DISBURSEMENT') for evidence
+//                                  ('MOOLRE_DISBURSEMENT' for current rows;
+//                                   'MTN_MOMO_DISBURSEMENT' appears only on
+//                                   historical rows) for evidence
 //                                  and settlement-attempt bookkeeping
 //                                  without a status poll
 //
