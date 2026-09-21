@@ -16,6 +16,7 @@ const { resolvePayoutOwner } = require('../services/payoutProviderOwnership');
 const fiatLiquidity = require('../src/services/fiatLiquidityService'); // §P.5-D
 const { recordReconciliationException } = require('../services/reconciliationExceptionService');
 const restrictedObligations = require('../services/restrictedObligationService'); // r17 P0 durable identity
+const withdrawalBridge = require('../services/withdrawalBridgeService'); // r18 durable orphan-adoption claim
 
 const RECONCILE_INTERVAL_MS = 30_000;
 const STALE_AFTER_MS        = 30_000;
@@ -187,12 +188,30 @@ class WithdrawalReconciliationWorker {
             return { row: null, linked: false };
         }
 
-        if (typeof this.prisma.$executeRawUnsafe === 'function') {
-            await this.prisma.$executeRawUnsafe(
-                'UPDATE "Withdrawal" SET "transactionHistoryId" = $1 WHERE "id" = $2 AND "transactionHistoryId" IS NULL',
-                txRow.id,
-                withdrawal.id
+        // r18: adopting the orphan is a DURABLE OWNERSHIP CLAIM, not a
+        // fire-and-forget backfill. A caller that loses the claim to a
+        // concurrent mirror NEVER receives the canonical row — the miss is
+        // recorded for operator attention and this row converges on the
+        // durable bridge state (the winner's) on the next pass.
+        const claim = await withdrawalBridge.claimOrphanCanonical(this.prisma, withdrawal.id, txRow.id);
+        if (!claim.won) {
+            logger.warn({
+                withdrawalId: withdrawal.id,
+                canonicalId: txRow.id,
+                owner: claim.owner,
+                reason: claim.reason,
+            }, '[WithdrawalReconciliation] orphan canonical claim lost — refusing canonical adoption');
+            await this._recordException(
+                withdrawal,
+                'ORPHAN_ADOPTION_CLAIM_LOST',
+                {
+                    candidateTransactionId: txRow.id,
+                    candidateReference: txRow.txHash,
+                    ownerWithdrawalId: claim.owner ?? null,
+                    claimReason: claim.reason,
+                }
             );
+            return { row: null, linked: false };
         }
 
         return { row: txRow, linked: false };

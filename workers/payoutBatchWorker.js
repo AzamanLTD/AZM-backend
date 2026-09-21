@@ -49,6 +49,7 @@ const fiatLiquidity = require('../src/services/fiatLiquidityService'); // §P.5-
 const { canonicalProviderName, persistPayoutOwnership } = require('../services/payoutProviderOwnership');
 const { recordReconciliationException } = require('../services/reconciliationExceptionService');
 const restrictedObligations = require('../services/restrictedObligationService'); // r17 P0 durable identity
+const withdrawalBridge = require('../services/withdrawalBridgeService'); // r18 durable orphan-adoption claim
 
 const DEFAULT_INTERVAL_MS = 120_000;  // 2 minutes
 const MAX_BATCH_SIZE      = 25;       // Don't overwhelm the provider in one tick
@@ -203,7 +204,26 @@ class PayoutBatchWorker {
             return { row: null, ambiguous: txRows.length > 1 };
         }
 
-        return { row: txRows[0], ambiguous: false };
+        // r18: adopting the orphan is a DURABLE OWNERSHIP CLAIM. Two
+        // concurrent mirror-only withdrawals can both observe the same
+        // orphan canonical; the unique bridge index makes the claim
+        // exclusive. A caller that loses the claim NEVER receives the
+        // canonical row — it is flagged for manual review instead of
+        // proceeding toward provider dispatch under a canonical another
+        // withdrawal durably owns.
+        const candidate = txRows[0];
+        const claim = await withdrawalBridge.claimOrphanCanonical(this.prisma, withdrawal.id, candidate.id);
+        if (!claim.won) {
+            logger.warn({
+                withdrawalId: withdrawal.id,
+                canonicalId: candidate.id,
+                owner: claim.owner,
+                reason: claim.reason,
+            }, '[PayoutBatchWorker] orphan canonical claim lost — refusing canonical adoption');
+            return { row: null, ambiguous: true };
+        }
+
+        return { row: candidate, ambiguous: false };
     }
 
     /**

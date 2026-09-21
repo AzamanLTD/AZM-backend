@@ -7,6 +7,7 @@ const { audit } = require('../utils/audit');
 const { Prisma } = require('@prisma/client');
 const ledger = require('../services/ledgerService');
 const restrictedObligations = require('../services/restrictedObligationService');
+const withdrawalBridge = require('../services/withdrawalBridgeService'); // r18 durable orphan-adoption claim
 const _exact = (n) => (n instanceof Prisma.Decimal ? n.toFixed(8) : Number(n).toFixed(8));
 const financeService = require('../services/finance.service');
 const { resolvePayoutOwner } = require('../services/payoutProviderOwnership');
@@ -1795,12 +1796,21 @@ async function _resolveCanonicalWithdrawalTx(prisma, withdrawal) {
 
     if (txRows.length === 1) {
         const txRow = txRows[0];
-        if (typeof prisma.$executeRawUnsafe === 'function') {
-            await prisma.$executeRawUnsafe(
-                'UPDATE "Withdrawal" SET "transactionHistoryId" = $1 WHERE "id" = $2 AND "transactionHistoryId" IS NULL',
-                txRow.id,
-                withdrawal.id
-            );
+        // r18: adopting the orphan is a DURABLE OWNERSHIP CLAIM, not a
+        // fire-and-forget backfill. Exactly one concurrent caller can win
+        // the unique bridge per canonical; a loser (another mirror claimed
+        // the canonical first) never receives the canonical row — it falls
+        // through to the mirror-only legacy path instead of reversing
+        // another withdrawal's reservation.
+        const claim = await withdrawalBridge.claimOrphanCanonical(prisma, withdrawal.id, txRow.id);
+        if (!claim.won) {
+            logger.warn({
+                withdrawalId: withdrawal.id,
+                canonicalId: txRow.id,
+                owner: claim.owner,
+                reason: claim.reason,
+            }, '[rejectWithdrawal] orphan canonical claim lost — refusing canonical adoption');
+            return null;
         }
         return txRow;
     }

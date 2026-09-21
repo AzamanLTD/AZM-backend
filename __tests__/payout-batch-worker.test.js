@@ -41,6 +41,8 @@ describe('PayoutBatchWorker canonical withdrawal transaction', () => {
                 updateMany: withdrawalUpdateMany,
             },
             transactionHistory: { findMany: txFindMany, findUnique: jest.fn(), create: txCreate },
+            $queryRawUnsafe: jest.fn().mockResolvedValue([]), // r18: no bridge link, no bridge-linked exclusions
+            $executeRawUnsafe: jest.fn().mockResolvedValue(1), // r18: bridge claim wins (one affected row)
         };
         const worker = new PayoutBatchWorker(prisma, null, { initiateTransfer }, null);
         const result = await worker._processBatch(settings, { isManualTrigger: true });
@@ -75,6 +77,8 @@ describe('PayoutBatchWorker canonical withdrawal transaction', () => {
                 findMany: jest.fn().mockResolvedValue([{ id: 'tx-3', txHash: 'ref-3', status: 'PENDING', amountUsdc: 50 }]),
                 findUnique: jest.fn(),
             },
+            $queryRawUnsafe: jest.fn().mockResolvedValue([]), // r18: no bridge link, no bridge-linked exclusions
+            $executeRawUnsafe: jest.fn().mockResolvedValue(1), // r18: bridge claim wins (one affected row)
         };
         const worker = new PayoutBatchWorker(prisma, null, { initiateTransfer }, null);
         const result = await worker._processBatch(settings, { isManualTrigger: true });
@@ -107,6 +111,8 @@ describe('PayoutBatchWorker canonical withdrawal transaction', () => {
                 ]),
                 findUnique: jest.fn(),
             },
+            $queryRawUnsafe: jest.fn().mockResolvedValue([]), // r18: no bridge link, no bridge-linked exclusions
+            $executeRawUnsafe: jest.fn().mockResolvedValue(1), // r18: bridge claim wins (one affected row)
         };
         const worker = new PayoutBatchWorker(prisma, null, { initiateTransfer }, null);
         const result = await worker._processBatch(settings, { isManualTrigger: true });
@@ -144,6 +150,8 @@ describe('PayoutBatchWorker provider outcome classification', () => {
             findMany: jest.fn().mockResolvedValue([{ id: 'tx-1', txHash: 'ref-1', status: 'PENDING', amountUsdc: 50 }]),
             findUnique: jest.fn(),
         },
+        $queryRawUnsafe: jest.fn().mockResolvedValue([]), // r18: no bridge link, no bridge-linked exclusions
+        $executeRawUnsafe: jest.fn().mockResolvedValue(1), // r18: bridge claim wins (one affected row)
     });
 
     const baseWithdrawal = {
