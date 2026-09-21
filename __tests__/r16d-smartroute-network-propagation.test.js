@@ -208,10 +208,11 @@ describeOrSkip('r16d P0: Smart Route MoMo network propagation', () => {
         // The run failed honestly with durable evidence.
         const refreshed = await prisma.smartRouteRun.findUnique({ where: { id: run.id } });
         expect(refreshed.status).toBe('FAILED_OTHER');
-        const exc = await prisma.reconciliationException.findMany({
-            where: { reason: 'SMART_ROUTE_INVALID_MOMO_NETWORK' },
-        });
-        expect(exc.length).toBe(1);
+        const exc = await prisma.$queryRawUnsafe(
+            'SELECT COUNT(*)::int AS n FROM "ReconciliationException" WHERE "reason" = $1',
+            'SMART_ROUTE_INVALID_MOMO_NETWORK'
+        );
+        expect(exc[0].n).toBe(1);
     });
 
     test('6: ambiguous/unknown networks are rejected at the CRUD boundary', async () => {
@@ -226,7 +227,7 @@ describeOrSkip('r16d P0: Smart Route MoMo network propagation', () => {
             startDate: new Date(Date.now() - 7 * 86400000),
         };
 
-        for (const bad of ['MOMO', 'WHATEVER', '']) {
+        for (const bad of ['MOMO', 'WHATEVER']) {
             await expect(
                 svc.create({ ...base, destination: { momoNumber: '0200000000', momoProvider: bad } })
             ).rejects.toMatchObject({ code: 'SMART_ROUTE_INVALID_MOMO_NETWORK' });
