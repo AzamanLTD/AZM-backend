@@ -15,6 +15,8 @@ const { recordProviderSettlementAttempt } = require('../services/providerSettlem
 const { resolvePayoutOwner } = require('../services/payoutProviderOwnership');
 const fiatLiquidity = require('../src/services/fiatLiquidityService'); // §P.5-D
 const { recordReconciliationException } = require('../services/reconciliationExceptionService');
+const restrictedObligations = require('../services/restrictedObligationService'); // r17 P0 durable identity
+const withdrawalBridge = require('../services/withdrawalBridgeService'); // r18 durable orphan-adoption claim
 
 const RECONCILE_INTERVAL_MS = 30_000;
 const STALE_AFTER_MS        = 30_000;
@@ -123,7 +125,23 @@ class WithdrawalReconciliationWorker {
             }
         }
 
-        const txRows = await this.prisma.transactionHistory.findMany({
+        // r17 P0 identity guard: a withdrawal that OWNS its own obligation
+        // (durable relation sourceEntity='withdrawal', e.g. the wallet
+        // reservation path) must never adopt a fiat canonical through this
+        // guessed fallback — settlement/reversal would act on another
+        // withdrawal's reservation under this row's mirror. Record the
+        // miss and let an operator reconcile.
+        const ownObligation = await restrictedObligations.findActiveForSource(this.prisma, 'withdrawal', withdrawal.id);
+        if (ownObligation) {
+            await this._recordException(
+                withdrawal,
+                'MISSING_TRANSACTION_REFERENCE',
+                { userId: withdrawal.userId, amount: String(withdrawal.amount), reason: 'WITHDRAWAL_OWNS_OWN_OBLIGATION_NO_BRIDGE' }
+            );
+            return { row: null, linked: false };
+        }
+
+        const txRowsRaw = await this.prisma.transactionHistory.findMany({
             where: {
                 userId: withdrawal.userId,
                 type: 'WITHDRAWAL_FIAT',
@@ -134,8 +152,13 @@ class WithdrawalReconciliationWorker {
                 }
             },
             orderBy: { createdAt: 'desc' },
-            take: 2
+            take: 10
         });
+        // r17 P0: the guessed match may only adopt a GENUINELY ORPHAN
+        // canonical — not one durably linked to another Withdrawal row via
+        // the bridge (that would settle/reverse another withdrawal's
+        // reservation under this row).
+        const txRows = await this._excludeBridgeLinked(txRowsRaw);
 
         if (txRows.length === 0) {
             await this._recordException(
@@ -165,15 +188,50 @@ class WithdrawalReconciliationWorker {
             return { row: null, linked: false };
         }
 
-        if (typeof this.prisma.$executeRawUnsafe === 'function') {
-            await this.prisma.$executeRawUnsafe(
-                'UPDATE "Withdrawal" SET "transactionHistoryId" = $1 WHERE "id" = $2 AND "transactionHistoryId" IS NULL',
-                txRow.id,
-                withdrawal.id
+        // r18: adopting the orphan is a DURABLE OWNERSHIP CLAIM, not a
+        // fire-and-forget backfill. A caller that loses the claim to a
+        // concurrent mirror NEVER receives the canonical row — the miss is
+        // recorded for operator attention and this row converges on the
+        // durable bridge state (the winner's) on the next pass.
+        const claim = await withdrawalBridge.claimOrphanCanonical(this.prisma, withdrawal.id, txRow.id);
+        if (!claim.won) {
+            logger.warn({
+                withdrawalId: withdrawal.id,
+                canonicalId: txRow.id,
+                owner: claim.owner,
+                reason: claim.reason,
+            }, '[WithdrawalReconciliation] orphan canonical claim lost — refusing canonical adoption');
+            await this._recordException(
+                withdrawal,
+                'ORPHAN_ADOPTION_CLAIM_LOST',
+                {
+                    candidateTransactionId: txRow.id,
+                    candidateReference: txRow.txHash,
+                    ownerWithdrawalId: claim.owner ?? null,
+                    claimReason: claim.reason,
+                }
             );
+            return { row: null, linked: false };
         }
 
         return { row: txRow, linked: false };
+    }
+
+    /**
+     * r17 P0 — drop candidate canonical rows durably linked to ANY Withdrawal
+     * row via the transactionHistoryId bridge. The guessed amount±5s
+     * fallback may only ever adopt an ORPHAN (pre-bridge legacy) row.
+     */
+    async _excludeBridgeLinked(candidates) {
+        if (!Array.isArray(candidates) || candidates.length === 0) return [];
+        if (typeof this.prisma.$queryRawUnsafe !== 'function') return candidates;
+        const ids = candidates.map((c) => c.id);
+        const linked = await this.prisma.$queryRawUnsafe(
+            'SELECT "transactionHistoryId" FROM "Withdrawal" WHERE "transactionHistoryId" = ANY($1::text[])',
+            ids
+        );
+        const linkedSet = new Set((linked || []).map((r) => r.transactionHistoryId));
+        return candidates.filter((c) => !linkedSet.has(c.id));
     }
 
     async _reconcileOne(withdrawal) {
