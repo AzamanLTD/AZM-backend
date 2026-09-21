@@ -446,11 +446,15 @@ class SmartRouteService {
             logger.error({ err: netErr, runId: run.id, routeId: route.id, network: route.destMomoProvider },
                 '[SmartRoute] invalid destination network — failing run before reservation');
             await recordReconciliationExceptionLoud(this.prisma, {
-                entityType: 'SMART_ROUTE',
-                entityId: route.id,
+                // NOTE: the exception queue accepts a fixed entity-type set;
+                // SMART_ROUTE is not one of them. Use TRANSACTION + the run's
+                // canonical reference (the same convention as every other
+                // smart-route evidence write) with the route id in details.
+                entityType: 'TRANSACTION',
+                entityId: reference,
                 reference,
                 reason: 'SMART_ROUTE_INVALID_MOMO_NETWORK',
-                details: { network: route.destMomoProvider ?? null, source: 'smart_route' },
+                details: { routeId: route.id, network: route.destMomoProvider ?? null, source: 'smart_route' },
             }).catch(() => {});
             return await this._finalizeGuardedRun(run, route, occurrenceBased, occurrenceBase, 'FAILED_OTHER', 'invalid destination momo network — failed closed before reservation');
         }
