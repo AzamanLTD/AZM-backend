@@ -93,6 +93,20 @@ const FREQUENCY_MS = {
 // (finalization is in-transaction with the money) — recovery re-drives it.
 const STALE_PENDING_MS = 10 * 60 * 1000;
 
+// ── r16d P0: canonical destination-network authority ──────────────────────
+// SmartRoute.destMomoProvider is a LEGACY-MISNAMED destination-network field
+// (MTN | TELECEL | AIRTELTIGO). The Flutter UI sends MTN/VODAFONE/TELECEL and
+// older rows carry *_MOMO/*_CASH discriminators. Every value is canonicalized
+// server-side BEFORE persistence and again BEFORE provider I/O — a scheduled
+// Telecel route must never silently ride Moolre's MTN default.
+const MOMO_NETWORK_ALIASES = {
+    MTN: 'MTN', MTN_MOMO: 'MTN', MTN_CASH: 'MTN',
+    TELECEL: 'TELECEL', TELECEL_CASH: 'TELECEL', TELECEL_MOMO: 'TELECEL',
+    VODAFONE: 'TELECEL', VODAFONE_CASH: 'TELECEL', VODAFONE_MOMO: 'TELECEL',
+    AIRTELTIGO: 'AIRTELTIGO', AIRTEL_TIGO: 'AIRTELTIGO',
+    AIRTELTIGO_MOMO: 'AIRTELTIGO', AIRTELTIGO_CASH: 'AIRTELTIGO',
+};
+
 class SmartRouteService {
     constructor({ prisma, io, notificationService, mtnDisbursementService, vaultService }) {
         this.prisma = prisma;
@@ -134,7 +148,9 @@ class SmartRouteService {
                     throw new Error('WITHDRAW_MOMO requires momoNumber + momoProvider');
                 }
                 data.destMomoNumber = destination.momoNumber;
-                data.destMomoProvider = destination.momoProvider;
+                // Canonical destination network (r16d) — persisted canonical,
+                // legacy aliases accepted at the boundary.
+                data.destMomoProvider = this._normalizeMomoNetwork(destination.momoProvider);
                 break;
             case 'INTERNAL_TRANSFER':
                 if (!destination?.friendUserId) throw new Error('INTERNAL_TRANSFER requires friendUserId');
@@ -168,7 +184,7 @@ class SmartRouteService {
         if (patch.destination) {
             const dest = patch.destination;
             if ('momoNumber' in dest) data.destMomoNumber = dest.momoNumber;
-            if ('momoProvider' in dest) data.destMomoProvider = dest.momoProvider;
+            if ('momoProvider' in dest) data.destMomoProvider = this._normalizeMomoNetwork(dest.momoProvider);
             if ('friendUserId' in dest) data.destFriendUserId = dest.friendUserId;
             if ('savingsGoalId' in dest) data.destSavingsGoalId = dest.savingsGoalId;
             if ('vaultId' in dest) data.destVaultId = dest.vaultId;
@@ -419,6 +435,30 @@ class SmartRouteService {
         // txHash instead of reserving the money twice.
         const reference = `SRWD_${run.id}`;
 
+        // ── r16d P0: canonical destination network, fail-closed BEFORE any
+        // lease claim, reservation or provider I/O. A legacy/invalid route
+        // fails definitively; money is never reserved for a payout that
+        // cannot be dispatched honestly.
+        let canonicalNetwork;
+        try {
+            canonicalNetwork = this._normalizeMomoNetwork(route.destMomoProvider);
+        } catch (netErr) {
+            logger.error({ err: netErr, runId: run.id, routeId: route.id, network: route.destMomoProvider },
+                '[SmartRoute] invalid destination network — failing run before reservation');
+            await recordReconciliationExceptionLoud(this.prisma, {
+                // NOTE: the exception queue accepts a fixed entity-type set;
+                // SMART_ROUTE is not one of them. Use TRANSACTION + the run's
+                // canonical reference (the same convention as every other
+                // smart-route evidence write) with the route id in details.
+                entityType: 'TRANSACTION',
+                entityId: reference,
+                reference,
+                reason: 'SMART_ROUTE_INVALID_MOMO_NETWORK',
+                details: { routeId: route.id, network: route.destMomoProvider ?? null, source: 'smart_route' },
+            }).catch(() => {});
+            return await this._finalizeGuardedRun(run, route, occurrenceBased, occurrenceBase, 'FAILED_OTHER', 'invalid destination momo network — failed closed before reservation');
+        }
+
         // ── r16c P0-B: single-winner EXECUTION lease ─────────────────────
         // Claim the run row BEFORE any reservation or provider-relevant
         // state. A concurrent recovery of the same run loses the lease and
@@ -510,8 +550,14 @@ class SmartRouteService {
                             'RETURNING "id", "userId", "amount", "payoutMethod", "network", "destination", "status"',
                             route.userId,
                             Number(route.amountUsdc),
-                            route.destMomoProvider || 'MTN_MOMO',
-                            'MOMO',
+                            // Legacy payout-method discriminator kept for
+                            // worker discovery compatibility (direct-path
+                            // convention) — NOT provider identity.
+                            'MTN_MOMO',
+                            // Canonical destination network (r16d): the rail
+                            // is MoMo, the provider is Moolre, the network is
+                            // the user's chosen MTN/TELECEL/AIRTELTIGO.
+                            canonicalNetwork,
                             route.destMomoNumber,
                             'PENDING',
                             txRecord.id
@@ -530,6 +576,22 @@ class SmartRouteService {
             await this._notifySuccess(route, amount, `Routed $${amount.toFixed(2)} to MoMo ${route.destMomoNumber}`);
         }
         return refreshed;
+    }
+
+    /**
+     * r16d P0: canonicalize a destination MoMo network. Ambiguous values
+     * (plain MOMO, unknown strings, missing) fail closed with a typed error —
+     * never silently fall back to MTN.
+     */
+    _normalizeMomoNetwork(value) {
+        const key = (value === null || value === undefined) ? '' : String(value).trim().toUpperCase();
+        const canonical = MOMO_NETWORK_ALIASES[key];
+        if (!canonical) {
+            const err = new Error(`Smart Route MoMo destination network is not recognized: ${value ?? '(missing)'}`);
+            err.code = 'SMART_ROUTE_INVALID_MOMO_NETWORK';
+            throw err;
+        }
+        return canonical;
     }
 
     /**
@@ -567,6 +629,39 @@ class SmartRouteService {
         const reference = reservation.reference;
         const phone = route.destMomoNumber;
         const payoutGhs = reservation.payoutGhs || reservation.withdrawalAmount;
+
+        // ── r16d P0: re-normalize the persisted network at the dispatch
+        // boundary — never assume the row is already canonical, never let a
+        // non-MTN payout ride Moolre's MTN default. Fail closed BEFORE
+        // provider I/O; the reservation is reversed through the canonical
+        // state machine exactly like a dispatcher-unavailable failure.
+        let canonicalNetwork;
+        try {
+            canonicalNetwork = this._normalizeMomoNetwork(route.destMomoProvider);
+        } catch (netErr) {
+            logger.error({ err: netErr, reference, runId: run.id, network: route.destMomoProvider },
+                '[SmartRoute] invalid destination network at dispatch — reversing reservation, failing run');
+            try {
+                await financeService.reverseFiatWithdrawal(this.prisma, reference, {
+                    reason: 'smart_route_invalid_momo_network'
+                });
+                await this._markMirrorFailed(reservation, 'INVALID_MOMO_NETWORK');
+            } catch (revErr) {
+                logger.error({ err: revErr, reference, runId: run.id },
+                    '[SmartRoute] CRITICAL: invalid-network reversal failed — parking for reconciliation');
+                await recordReconciliationExceptionLoud(this.prisma, {
+                    entityType: 'TRANSACTION',
+                    entityId: reference,
+                    reference,
+                    reason: 'SMART_ROUTE_INVALID_NETWORK_REVERSAL_FAILED',
+                    details: { reversalError: revErr.message },
+                }).catch(() => {});
+                await this._finalizeGuardedRun(run, route, occurrenceBased, occurrenceBase, 'AWAITING_RECONCILIATION', 'invalid destination network and reversal failed — parked');
+                return 'PARKED';
+            }
+            await this._finalizeGuardedRun(run, route, occurrenceBased, occurrenceBase, 'FAILED_OTHER', 'invalid destination momo network — reservation reversed');
+            return 'REVERSED';
+        }
 
         // Dispatcher availability BEFORE any durable dispatch intent (r16c
         // P0-B: deterministic pre-I/O failure). A missing dispatcher must
@@ -676,6 +771,10 @@ class SmartRouteService {
                 amountGhs: payoutGhs,
                 recipientPhone: phone,
                 externalId: reference,
+                // r16d P0: destination network propagated into the canonical
+                // Moolre dispatch payload — Telecel/AirtelTigo payouts ride
+                // the correct channel, never the MTN default.
+                network: canonicalNetwork,
                 payerMessage: `Azaman smart-route payout ref ${reference}`,
                 payeeNote: `Smart Route ${route.name} ${reference}`,
             });
