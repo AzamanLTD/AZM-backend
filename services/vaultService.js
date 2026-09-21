@@ -93,7 +93,7 @@ class VaultService {
         return vault;
     }
 
-    async depositManual({ userId, vaultId, amountUsdc }) {
+    async depositManual({ userId, vaultId, amountUsdc, idempotencyKey = null }) {
         const amt = new Prisma.Decimal(amountUsdc);
         if (amt.lte(0)) throw new Error('amountUsdc must be > 0');
 
@@ -108,6 +108,7 @@ class VaultService {
             amount: amt,
             type: 'MANUAL',
             scheduledFor: null,
+            idempotencyKey,
         });
     }
 
@@ -167,43 +168,70 @@ class VaultService {
             };
         }
 
-        await this._executeDeposit({
-            vault,
-            amount: required,
-            type: 'AUTO_RULE',
-            scheduledFor: vault.autoRuleNextRun,
-            extraVaultUpdate: { autoRuleNextRun: nextRun },
-        });
+        try {
+            await this._executeDeposit({
+                vault,
+                amount: required,
+                type: 'AUTO_RULE',
+                scheduledFor: vault.autoRuleNextRun,
+                extraVaultUpdate: { autoRuleNextRun: nextRun },
+            });
+        } catch (err) {
+            // r16 P0-D: the guarded ACTIVE claim inside _executeDeposit is
+            // the authority — a vault terminalized (broken/completed) between
+            // the worker's stale read and the deposit claim must NOT commit
+            // money into a terminal vault.
+            if (err.code === 'VAULT_TERMINALIZED') return { ok: false, status: 'INACTIVE' };
+            throw err;
+        }
         return { ok: true, status: 'COMPLETED' };
     }
 
     /**
      * Early break: penalty applied, remainder returned to availableBalance.
      * AZM already credited stays credited (feature, not bug).
+     *
+     * r16 P0-D: one atomic terminal claim. The vault row is locked FOR
+     * UPDATE inside the transaction and the ACTIVE status is re-proved
+     * under that lock before any money moves — breakEarly vs
+     * completeMatured (and breakEarly vs breakEarly) converge through the
+     * same row lock, and exactly one terminal identity can win. The losing
+     * concurrent operation rolls back without touching money.
      */
     async breakEarly({ userId, vaultId }) {
-        const vault = await this.prisma.vault.findUnique({ where: { id: vaultId } });
-        if (!vault || vault.userId !== userId) throw new Error('Vault not found');
-        if (vault.status !== 'ACTIVE') throw new Error('Vault is not active');
+        const outcome = await this.prisma.$transaction(async (tx) => {
+            // r16 P0-D: DB-authoritative terminal claim. SELECT ... FOR
+            // UPDATE locks the row; every concurrent mutation of this vault
+            // (deposit claim, competing break/complete) blocks behind it
+            // and then re-proves status against the committed terminal
+            // state. The stale pre-transaction read is no longer economic
+            // authority.
+            const rows = await tx.$queryRaw`SELECT * FROM "Vault" WHERE "id" = ${vaultId} FOR UPDATE`;
+            const fresh = rows[0];
+            if (!fresh || fresh.userId !== userId) throw new Error('Vault not found');
+            if (fresh.status !== 'ACTIVE') {
+                const err = new Error('Vault is no longer active.');
+                err.code = 'VAULT_ALREADY_TERMINALIZED';
+                throw err;
+            }
 
-        const balance = new Prisma.Decimal(vault.currentAmountUsdc);
-        const penaltyPct = new Prisma.Decimal(vault.earlyBreakPenaltyPct);
-        const penalty = balance.mul(penaltyPct);
-        const refund = balance.minus(penalty);
+            const balance = new Prisma.Decimal(fresh.currentAmountUsdc);
+            const penaltyPct = new Prisma.Decimal(fresh.earlyBreakPenaltyPct);
+            const penalty = balance.mul(penaltyPct);
+            const refund = balance.minus(penalty);
 
-        const result = await this.prisma.$transaction(async (tx) => {
             const userUpdate = await tx.user.update({
                 where: { id: userId },
                 data: { availableBalance: { increment: refund } },
             });
             const vaultUpdate = await tx.vault.update({
-                where: { id: vault.id },
+                where: { id: vaultId },
                 data: {
                     status: 'BROKEN_EARLY',
                     brokenAt: new Date(),
                     currentAmountUsdc: 0,
                     completedAt: new Date(),
-                    receiptSnapshot: this._buildReceipt(vault, {
+                    receiptSnapshot: this._buildReceipt(fresh, {
                         finalState: 'BROKEN_EARLY',
                         refund,
                         penalty,
@@ -214,7 +242,7 @@ class VaultService {
                 data: {
                     amountUsdc: penalty,
                     source: 'SAVINGS_FEE',
-                    relatedTxId: `vault-break-${vault.id}`,
+                    relatedTxId: `vault-break-${vaultId}`,
                 },
             });
             const historyRow = await tx.transactionHistory.create({
@@ -227,30 +255,30 @@ class VaultService {
                 },
             });
             // §P.4 AUTHORITATIVE LEDGER — early-break settlement, same
-            // transaction, idempotent on the vault's break identity (a
-            // concurrent double-break collides on the key and the whole
-            // losing transaction rolls back — the ledger key is the ONLY
-            // single-winner guard on this path, so it must be here):
+            // transaction, idempotent on the vault's break identity. With
+            // the FOR UPDATE claim as the primary single-winner guard, the
+            // ledger key is now the second line of defense, not the only
+            // one:
             //   D escrow:vault-{vaultId}:locked — savings restriction released
             //   C user:{userId}:liability       — refund share
             //   C revenue:fees                   — early-break penalty realized
-            // penalty + refund === balance exactly (refund = balance - penalty
-            // in Decimal arithmetic), so the posting balances with no dust.
+            // penalty + refund === balance exactly, so the posting balances
+            // with no dust.
             await ledger.post(tx, {
-                idempotencyKey: `ledger:vault:break-early:${vault.id}`,
+                idempotencyKey: `ledger:vault:break-early:${vaultId}`,
                 entryType: 'VAULT_RELEASE',
-                description: `Vault "${vault.name}" broken early — refund to wallet, penalty realized`,
+                description: `Vault "${fresh.name}" broken early — refund to wallet, penalty realized`,
                 userId,
                 relatedEntity: 'vault',
-                relatedEntityId: vault.id,
-                metadata: { penaltyPct: vault.earlyBreakPenaltyPct, finalState: 'BROKEN_EARLY' },
+                relatedEntityId: vaultId,
+                metadata: { penaltyPct: fresh.earlyBreakPenaltyPct, finalState: 'BROKEN_EARLY' },
                 lines: [
-                    { account: `escrow:vault-${vault.id}:locked`, debit: balance.toFixed(8) },
+                    { account: `escrow:vault-${vaultId}:locked`, debit: balance.toFixed(8) },
                     { account: `user:${userId}:liability`, credit: refund.toFixed(8) },
                     { account: 'revenue:fees', credit: penalty.toFixed(8) },
                 ],
             });
-            return [userUpdate, vaultUpdate, profitRow, historyRow];
+            return { result: [userUpdate, vaultUpdate, profitRow, historyRow], refund, penalty, name: fresh.name };
         });
 
         // Notify
@@ -258,58 +286,73 @@ class VaultService {
             await this.notificationService.sendNotification({
                 userId,
                 title: 'Vault Broken',
-                body: `You broke "${vault.name}" early. Penalty: $${penalty.toFixed(2)}. $${refund.toFixed(2)} returned to your wallet.`,
+                body: `You broke "${outcome.name}" early. Penalty: $${outcome.penalty.toFixed(2)}. $${outcome.refund.toFixed(2)} returned to your wallet.`,
                 category: 'VAULT',
-                actionPayload: { action: 'VIEW_VAULT', vaultId: vault.id, finalState: 'BROKEN_EARLY' },
+                actionPayload: { action: 'VIEW_VAULT', vaultId, finalState: 'BROKEN_EARLY' },
             });
         } catch (_) { /* swallow */ }
 
         this._emitBalanceUpdate(userId);
-        this._emitVaultEvent(userId, 'vault:update', vault.id);
-        return result[1]; // updated vault
+        this._emitVaultEvent(userId, 'vault:update', vaultId);
+        return outcome.result[1]; // updated vault
     }
 
     /**
      * Sweep matured vaults: full balance returns to availableBalance,
      * vault marked COMPLETED, receipt snapshot written, AZM completion
      * bonus credited.
+     *
+     * r16 P0-D: the same FOR UPDATE + ACTIVE re-proof as breakEarly — a
+     * maturity sweep racing an early break (or another sweep) can no
+     * longer release the same vault twice.
      */
     async completeMatured(vault) {
-        const balance = new Prisma.Decimal(vault.currentAmountUsdc);
+        const vaultId = typeof vault === 'string' ? vault : vault.id;
+        let releaseInfo = null;
 
         await this.prisma.$transaction(async (tx) => {
+            const rows = await tx.$queryRaw`SELECT * FROM "Vault" WHERE "id" = ${vaultId} FOR UPDATE`;
+            const fresh = rows[0];
+            if (!fresh) throw new Error('Vault not found');
+            if (fresh.status !== 'ACTIVE') {
+                const err = new Error('Vault is no longer active.');
+                err.code = 'VAULT_ALREADY_TERMINALIZED';
+                throw err;
+            }
+
+            const balance = new Prisma.Decimal(fresh.currentAmountUsdc);
+            releaseInfo = { balance, name: fresh.name, userId: fresh.userId };
+
             await tx.user.update({
-                where: { id: vault.userId },
+                where: { id: fresh.userId },
                 data: { availableBalance: { increment: balance } },
             });
             // §P.4 AUTHORITATIVE LEDGER — maturity settlement, same
-            // transaction, idempotent on the vault's completion identity (a
-            // concurrent double-sweep collides on the key and the whole
-            // losing transaction rolls back — the ledger key is the ONLY
-            // single-winner guard on this path, so it must be here):
+            // transaction, idempotent on the vault's completion identity,
+            // second line of defense behind the FOR UPDATE terminal claim:
             //   D escrow:vault-{vaultId}:locked — savings restriction released
             //   C user:{userId}:liability       — full balance returned
             await ledger.post(tx, {
-                idempotencyKey: `ledger:vault:complete:${vault.id}`,
+                idempotencyKey: `ledger:vault:complete:${vaultId}`,
                 entryType: 'VAULT_RELEASE',
-                description: `Vault "${vault.name}" matured — full balance returned to wallet`,
-                userId: vault.userId,
+                description: `Vault "${fresh.name}" matured — full balance returned to wallet`,
+                userId: fresh.userId,
                 relatedEntity: 'vault',
-                relatedEntityId: vault.id,
+                relatedEntityId: vaultId,
                 metadata: { finalState: 'COMPLETED' },
                 lines: [
-                    { account: `escrow:vault-${vault.id}:locked`, debit: balance.toFixed(8) },
-                    { account: `user:${vault.userId}:liability`, credit: balance.toFixed(8) },
+                    { account: `escrow:vault-${vaultId}:locked`, debit: balance.toFixed(8) },
+                    { account: `user:${fresh.userId}:liability`, credit: balance.toFixed(8) },
                 ],
             });
             await tx.vault.update({
-                where: { id: vault.id },
+                where: { id: vaultId },
                 data: {
                     status: 'COMPLETED',
                     completedAt: new Date(),
                     currentAmountUsdc: 0,
-                    consistencyScore: this._computeConsistencyScore(vault),
-                    receiptSnapshot: this._buildReceipt(vault, {
+                    consistencyScore: this._computeConsistencyScore(fresh),
+                    receiptSnapshot: this._buildReceipt(fresh, {
                         finalState: 'COMPLETED',
                         refund: balance,
                         penalty: new Prisma.Decimal(0),
@@ -318,7 +361,7 @@ class VaultService {
             });
             await tx.transactionHistory.create({
                 data: {
-                    userId: vault.userId,
+                    userId: fresh.userId,
                     type: 'VAULT_RELEASE',
                     amountUsdc: balance,
                     status: 'COMPLETED',
@@ -328,32 +371,32 @@ class VaultService {
 
         // Completion AZM bonus — flat 25 AZM for every completed vault,
         // plus 5% of total deposits as bonus AZM.
-        const completionBonus = balance.mul(0.0125).plus(25); // ~1.25% + 25 base
+        const completionBonus = releaseInfo.balance.mul(0.0125).plus(25); // ~1.25% + 25 base
         if (this.azmRewardService) {
             try {
                 await this.azmRewardService.creditAzm({
-                    userId: vault.userId,
+                    userId: releaseInfo.userId,
                     amount: Number(completionBonus.toFixed(2)),
                     source: 'VAULT_COMPLETION',
-                    reason: `Vault "${vault.name}" matured (+${completionBonus.toFixed(2)} AZM)`,
-                    metadata: { vaultId: vault.id, deposited: balance.toString() },
-                    dedupKey: `vault-completion-${vault.id}`,
+                    reason: `Vault "${releaseInfo.name}" matured (+${completionBonus.toFixed(2)} AZM)`,
+                    metadata: { vaultId, deposited: releaseInfo.balance.toString() },
+                    dedupKey: `vault-completion-${vaultId}`,
                 });
             } catch (_) { /* swallow */ }
         }
 
         try {
             await this.notificationService.sendNotification({
-                userId: vault.userId,
+                userId: releaseInfo.userId,
                 title: '🎉 Vault Matured!',
-                body: `"${vault.name}" complete. $${balance.toFixed(2)} returned to your wallet. Tap to view your stats and start a new goal.`,
+                body: `"${releaseInfo.name}" complete. $${releaseInfo.balance.toFixed(2)} returned to your wallet. Tap to view your stats and start a new goal.`,
                 category: 'VAULT',
-                actionPayload: { action: 'VIEW_VAULT_RECEIPT', vaultId: vault.id },
+                actionPayload: { action: 'VIEW_VAULT_RECEIPT', vaultId },
             });
         } catch (_) { /* swallow */ }
 
-        this._emitBalanceUpdate(vault.userId);
-        this._emitVaultEvent(vault.userId, 'vault:completed', vault.id);
+        this._emitBalanceUpdate(releaseInfo.userId);
+        this._emitVaultEvent(releaseInfo.userId, 'vault:completed', vaultId);
     }
 
     async listForUser(userId) {
@@ -381,7 +424,7 @@ class VaultService {
     // INTERNAL
     // =========================================================================
 
-    async _executeDeposit({ vault, amount, type, scheduledFor, extraVaultUpdate = {} }) {
+    async _executeDeposit({ vault, amount, type, scheduledFor, extraVaultUpdate = {}, idempotencyKey = null }) {
         // Compute AZM reward up-front so the breakdown can be embedded in
         // the deposit row + the FE notification verbatim.
         const breakdown = this.computeAzmIntensity({
@@ -394,23 +437,64 @@ class VaultService {
         const isOnTime = type === 'AUTO_RULE';
 
         try {
+            // r16 P0-A crash-recovery convergence: a caller retrying a
+            // crashed smart-route execution passes the run's durable
+            // idempotency key. If a deposit already committed under that
+            // key, the unique violation below converges the retry to the
+            // committed deposit instead of moving money twice.
+            if (idempotencyKey) {
+                const existing = await this.prisma.vaultDeposit.findUnique({
+                    where: { idempotencyKey },
+                });
+                if (existing) return existing;
+            }
+
             const [userRow] = await this.prisma.$transaction(async (tx) => {
-                const userUpdate = await tx.user.update({
-                    where: { id: vault.userId },
+                // r16 P0-D: guarded user claim — the conditional decrement
+                // fails closed on a concurrent spend instead of relying on
+                // the CHECK constraint as the only guard.
+                const userClaim = await tx.user.updateMany({
+                    where: { id: vault.userId, availableBalance: { gte: amount } },
                     data: { availableBalance: { decrement: amount } },
                 });
-                const vaultUpdate = await tx.vault.update({
-                    where: { id: vault.id },
+                if (userClaim.count !== 1) {
+                    const err = new Error('Insufficient available balance for vault deposit.');
+                    err.code = 'INSUFFICIENT_BALANCE';
+                    throw err;
+                }
+                // r16 P0-D: guarded vault claim — a vault terminalized
+                // (broken early / completed) between the caller's stale
+                // read and this deposit can NEVER receive money: the
+                // conditional ACTIVE claim is the single-winner guard.
+                const vaultClaim = await tx.vault.updateMany({
+                    where: { id: vault.id, status: 'ACTIVE' },
                     data: {
                         currentAmountUsdc: { increment: amount },
-                        streakCount: isOnTime ? { increment: 1 } : vault.streakCount,
-                        longestStreak: isOnTime
-                            ? Math.max(vault.longestStreak, vault.streakCount + 1)
-                            : vault.longestStreak,
+                        ...(isOnTime ? { streakCount: { increment: 1 } } : {}),
                         totalAzmEarned: { increment: new Prisma.Decimal(breakdown.totalAzm) },
                         ...extraVaultUpdate,
                     },
                 });
+                if (vaultClaim.count !== 1) {
+                    const err = new Error('Vault is no longer active.');
+                    err.code = 'VAULT_TERMINALIZED';
+                    throw err;
+                }
+                // We hold the vault row lock from the claim inside this
+                // transaction — the longest-streak read/compute/write below
+                // cannot interleave with another deposit.
+                if (isOnTime) {
+                    const freshVault = await tx.vault.findUnique({
+                        where: { id: vault.id },
+                        select: { streakCount: true, longestStreak: true },
+                    });
+                    if (freshVault && freshVault.streakCount > freshVault.longestStreak) {
+                        await tx.vault.update({
+                            where: { id: vault.id },
+                            data: { longestStreak: freshVault.streakCount },
+                        });
+                    }
+                }
                 const depositRow = await tx.vaultDeposit.create({
                     data: {
                         vaultId: vault.id,
@@ -421,6 +505,7 @@ class VaultService {
                         azmAwarded: new Prisma.Decimal(breakdown.totalAzm),
                         azmBreakdown: breakdown,
                         scheduledFor,
+                        ...(idempotencyKey ? { idempotencyKey } : {}),
                     },
                 });
                 const historyRow = await tx.transactionHistory.create({
@@ -449,7 +534,13 @@ class VaultService {
                         { account: `escrow:vault-${vault.id}:locked`, credit: amount.toFixed(8) },
                     ],
                 });
-                return [userUpdate, vaultUpdate, depositRow, historyRow];
+                const freshUser = await tx.user.findUnique({
+                    where: { id: vault.userId },
+                });
+                const freshVault = await tx.vault.findUnique({
+                    where: { id: vault.id },
+                });
+                return [freshUser, freshVault, depositRow, historyRow];
             });
 
             // Credit AZM via canonical service so the AzmRewardLog audit

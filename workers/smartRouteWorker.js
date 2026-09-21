@@ -40,6 +40,16 @@ class SmartRouteWorker {
                     logger.error(`[SmartRouteWorker] route ${route.id} failed:`, err.message);
                 }
             }
+            // r16 P0-A: crash recovery — re-drive runs whose financial
+            // transaction rolled back with the process (finalization is
+            // in-transaction with the money, so a stale PENDING run never
+            // moved funds and re-driving it is exactly-once safe).
+            if (typeof this.smartRouteService.recoverStalePendingRuns === 'function') {
+                const recovered = await this.smartRouteService.recoverStalePendingRuns();
+                if (recovered.length > 0) {
+                    logger.info(`[SmartRouteWorker] recovered ${recovered.length} interrupted run(s)`);
+                }
+            }
         } catch (err) {
             logger.error({ err: err }, '[SmartRouteWorker.tick]');
         }

@@ -8,6 +8,8 @@ const { Prisma } = require('@prisma/client');
 const ledger = require('../services/ledgerService');
 const restrictedObligations = require('../services/restrictedObligationService');
 const _exact = (n) => (n instanceof Prisma.Decimal ? n.toFixed(8) : Number(n).toFixed(8));
+const financeService = require('../services/finance.service');
+const { resolvePayoutOwner } = require('../services/payoutProviderOwnership');
 
 /**
  * Helper: retrieve the singleton NotificationService from app context.
@@ -1537,14 +1539,93 @@ exports.rejectWithdrawal = async (req, res) => {
             return res.status(400).json({ success: false, message: `Cannot reject: status is ${withdrawal.status}.` });
         }
 
-        // Refund the user's balance
-        // Phase H12 BUGFIX (2026-05-27): atomic conditional flip on
-        // the withdrawal status BEFORE the refund. Without this guard,
-        // two admins both clicking reject on the same row would both
-        // refund the user — the user receives their withdrawal amount
-        // credited back TWICE. Real money loss. The conditional
-        // `updateMany({ where: { id, status: 'PENDING' } })` rejects
-        // the second concurrent caller cleanly inside the transaction.
+        // ── r16 P0-C: canonical-state-safe rejection ────────────────────────
+        // The old path refunded purely on the PENDING mirror status, without
+        // checking the linked canonical TransactionHistory — an admin could
+        // refund a payout the provider had already accepted or settled (a
+        // real double-credit/double-spend). The refund must now go through
+        // the canonical fiat reversal state machine (finance.service), and
+        // the mirror transition + canonical reversal commit in ONE
+        // transaction so no state exists where the mirror says REJECTED but
+        // the canonical reservation is still PENDING (or vice versa).
+        const canonical = await _resolveCanonicalWithdrawalTx(prisma, withdrawal);
+
+        if (canonical) {
+            const gate = await _rejectionSafetyGate(prisma, canonical);
+            if (!gate.safe) {
+                return res.status(409).json({
+                    success: false,
+                    message: gate.message,
+                    data: { withdrawalId, canonicalStatus: canonical.status, evidence: gate.evidence || null }
+                });
+            }
+
+            // Mirror claim + canonical reversal in ONE transaction. The
+            // canonical claim inside reverseFiatWithdrawal (PENDING → FAILED)
+            // is the single-winner guard: a concurrent settlement or reversal
+            // rolls the whole rejection back.
+            let reversed;
+            try {
+                reversed = await prisma.$transaction(async (tx) => {
+                    const claimed = await tx.withdrawal.updateMany({
+                        where: { id: withdrawalId, status: 'PENDING' },
+                        data: { status: 'REJECTED' }
+                    });
+                    if (claimed.count === 0) {
+                        throw new Error('WITHDRAWAL_ALREADY_FINALIZED');
+                    }
+                    const result = await financeService.reverseFiatWithdrawal(prisma, canonical.txHash, {
+                        tx,
+                        reason: `admin_rejection:${reason}`
+                    });
+                    if (!result || result.alreadyReversed) {
+                        // The canonical row moved under us (settled or
+                        // already reversed) — the mirror claim must roll back.
+                        throw new Error('WITHDRAWAL_CANONICAL_ALREADY_FINALIZED');
+                    }
+                    return result;
+                });
+            } catch (err) {
+                if (err.message === 'WITHDRAWAL_ALREADY_FINALIZED') throw err;
+                if (err.message === 'WITHDRAWAL_CANONICAL_ALREADY_FINALIZED') {
+                    return res.status(409).json({
+                        success: false,
+                        message: 'The linked withdrawal transaction was finalized concurrently. Refusing to refund twice — please refresh.'
+                    });
+                }
+                throw err;
+            }
+
+            await _notifyRejection(req, { withdrawal, withdrawalId, reason, io, emitBalanceUpdate, refundedAmount: reversed.refundedAmount });
+
+            await audit(prisma, {
+                actorId: req.user.id, actorName: req.user.username,
+                action: 'REJECT_WITHDRAWAL', targetType: 'WITHDRAWAL', targetId: String(withdrawalId),
+                metadata: {
+                    previousStatus: 'PENDING', userId: withdrawal.userId, amount: withdrawal.amount,
+                    reason: reason || null, canonicalReference: canonical.txHash,
+                    refundedAmount: reversed.refundedAmount
+                },
+                ipAddress: req.ip,
+            });
+
+            return res.status(200).json({
+                success: true,
+                message: `Withdrawal #${withdrawalId} rejected. Funds refunded through the canonical reversal state machine.`,
+                data: {
+                    withdrawalId, userId: withdrawal.userId, amount: withdrawal.amount, reason,
+                    canonicalReference: canonical.txHash, refundedAmount: reversed.refundedAmount
+                }
+            });
+        }
+
+        // ── LEGACY PATH (no canonical TransactionHistory at all) ───────────
+        // Pre-P4 mirror-only rows: the refund draws on the restricted reserve
+        // when a P4 obligation exists, otherwise on platform equity. The
+        // obligation lookup now covers ALL three obligation prefixes,
+        // including the direct-fi `withdrawal:fiat:{reference}` obligations
+        // created by processFiatWithdrawal (the old lookup only checked
+        // withdrawal:wallet:* and withdrawal:smartroute:*).
         await prisma.$transaction(async (tx) => {
             const claimed = await tx.withdrawal.updateMany({
                 where: { id: withdrawalId, status: 'PENDING' },
@@ -1561,12 +1642,6 @@ exports.rejectWithdrawal = async (req, res) => {
             });
 
             // §P.4 AUTHORITATIVE LEDGER — rejection refund, same transaction.
-            // If the withdrawal reserved funds (wallet/smart-route P4 flows),
-            // the refund drains the restricted reserve and cancels the
-            // obligation (both must move together or reconciliation fails).
-            // Pre-P4 legacy withdrawals never reserved: their refund draws
-            // on platform equity instead — never a mint, and the ledger
-            // records exactly which case happened.
             const refundExact = new Prisma.Decimal(_exact(withdrawal.amount));
             const activeObligation = await tx.restrictedObligation.findFirst({
                 where: {
@@ -1574,6 +1649,7 @@ exports.rejectWithdrawal = async (req, res) => {
                     OR: [
                         { reference: `withdrawal:wallet:${withdrawal.id}` },
                         { reference: `withdrawal:smartroute:${withdrawal.id}` },
+                        { reference: { startsWith: 'withdrawal:fiat:' } },
                     ],
                 },
             });
@@ -1605,29 +1681,13 @@ exports.rejectWithdrawal = async (req, res) => {
             }
         });
 
-        // Notify user
-        await _getNotificationService(req).sendNotification({
-            userId: withdrawal.userId,
-            title: 'Withdrawal Rejected',
-            body: `Your withdrawal of ${withdrawal.amount} was rejected: ${reason}. Funds have been returned to your wallet.`,
-            category: 'GENERAL',
-            actionPayload: { action: 'WITHDRAWAL_STATUS', withdrawalId: String(withdrawalId), status: 'REJECTED' }
-        });
-
-        if (emitBalanceUpdate) await emitBalanceUpdate(withdrawal.userId);
-
-        io.to(`user_${withdrawal.userId}`).emit('withdrawal_update', {
-            withdrawalId,
-            status: 'REJECTED',
-            reason,
-            message: 'Your withdrawal was rejected. Funds returned.'
-        });
+        await _notifyRejection(req, { withdrawal, withdrawalId, reason, io, emitBalanceUpdate, refundedAmount: withdrawal.amount });
 
         // Append-only audit trail (fire-and-forget — never fails the request).
         await audit(prisma, {
             actorId: req.user.id, actorName: req.user.username,
             action: 'REJECT_WITHDRAWAL', targetType: 'WITHDRAWAL', targetId: String(withdrawalId),
-            metadata: { previousStatus: 'PENDING', userId: withdrawal.userId, amount: withdrawal.amount, reason: reason || null },
+            metadata: { previousStatus: 'PENDING', userId: withdrawal.userId, amount: withdrawal.amount, reason: reason || null, path: 'LEGACY_MIRROR_ONLY' },
             ipAddress: req.ip,
         });
 
@@ -1651,6 +1711,129 @@ exports.rejectWithdrawal = async (req, res) => {
     }
 };
 
+// ── r16 P0-C helpers ───────────────────────────────────────────────────────
+
+/**
+ * Resolve the canonical TransactionHistory row behind a Withdrawal mirror:
+ * the durable transactionHistoryId bridge first; if absent, the reconciler's
+ * conservative legacy match (WITHDRAWAL_FIAT, amount ±, createdAt window),
+ * backfilled onto the bridge. Returns null for mirror-only legacy rows.
+ */
+async function _resolveCanonicalWithdrawalTx(prisma, withdrawal) {
+    let linkedId = null;
+    if (typeof prisma.$queryRawUnsafe === 'function') {
+        const rows = await prisma.$queryRawUnsafe(
+            'SELECT "transactionHistoryId" FROM "Withdrawal" WHERE "id" = $1 LIMIT 1',
+            withdrawal.id
+        );
+        linkedId = rows?.[0]?.transactionHistoryId || null;
+    }
+
+    if (linkedId) {
+        const linked = await prisma.transactionHistory.findUnique({ where: { id: linkedId } });
+        if (linked) return linked;
+        // Dangling bridge — treat as unresolved rather than guessing.
+        return null;
+    }
+
+    // Legacy fallback match (mirrors the reconciliation worker's contract):
+    // a single WITHDRAWAL_FIAT row for this user, this amount, within ±5s.
+    const txRows = await prisma.transactionHistory.findMany({
+        where: {
+            userId: withdrawal.userId,
+            type: 'WITHDRAWAL_FIAT',
+            amountUsdc: withdrawal.amount,
+            createdAt: {
+                gte: new Date(withdrawal.createdAt.getTime() - 5_000),
+                lte: new Date(withdrawal.createdAt.getTime() + 5_000)
+            }
+        },
+        orderBy: { createdAt: 'desc' },
+        take: 2
+    });
+
+    if (txRows.length === 1) {
+        const txRow = txRows[0];
+        if (typeof prisma.$executeRawUnsafe === 'function') {
+            await prisma.$executeRawUnsafe(
+                'UPDATE "Withdrawal" SET "transactionHistoryId" = $1 WHERE "id" = $2 AND "transactionHistoryId" IS NULL',
+                txRow.id,
+                withdrawal.id
+            );
+        }
+        return txRow;
+    }
+    // Zero or ambiguous — the mirror-only legacy path handles it.
+    return null;
+}
+
+/**
+ * The rejection safety gate: NO admin action may restore spendable balance
+ * once provider money may have left Azaman control. Fail-closed checks on
+ * the canonical state and every durable dispatch evidence source.
+ */
+async function _rejectionSafetyGate(prisma, canonical) {
+    const reference = canonical.txHash;
+    if (!reference) {
+        return { safe: false, message: 'The linked transaction has no provider reference — refusing blind rejection. Escalate to reconciliation.', evidence: 'NO_REFERENCE' };
+    }
+    if (canonical.status === 'COMPLETED') {
+        return { safe: false, message: 'The linked withdrawal has SETTLED at the provider — the customer already has the cash. Rejection would double-spend.', evidence: 'SETTLED' };
+    }
+    if (canonical.status === 'FAILED') {
+        return { safe: false, message: 'The linked withdrawal was already reversed/refunded through the canonical state machine.', evidence: 'ALREADY_REVERSED' };
+    }
+    if (canonical.status !== 'PENDING') {
+        return { safe: false, message: `The linked transaction is in non-reversible state ${canonical.status}.`, evidence: String(canonical.status) };
+    }
+
+    // Any durable outbound evidence for this reference — the r16
+    // DISPATCH_INTENT row (written before ANY provider I/O), the dispatch
+    // acceptance observation, or a provider callback — means the cash
+    // position is unknown: never auto-refund.
+    const outboundEvidence = await prisma.fiatProviderEvent.count({
+        where: { relatedReference: reference, direction: 'OUTBOUND' }
+    });
+    if (outboundEvidence > 0) {
+        return { safe: false, message: 'Provider dispatch evidence exists for this payout — cash may be in flight. Rejection is refused; reconcile the payout instead.', evidence: 'DISPATCH_EVIDENCE' };
+    }
+
+    // Durable owner evidence (canonical metadata or recovered from the
+    // dispatch observation) — the provider owns this payout.
+    const ownership = await resolvePayoutOwner(prisma, canonical);
+    if (ownership.status === 'CONFLICT') {
+        return { safe: false, message: 'Multiple providers hold owner evidence for this payout — parked for operator review. Rejection refused.', evidence: 'OWNERSHIP_CONFLICT' };
+    }
+    if (ownership.status !== 'UNKNOWN') {
+        return { safe: false, message: 'A provider has accepted/owns this payout — rejection would double-spend. Reconcile the payout instead.', evidence: 'OWNER_KNOWN' };
+    }
+
+    // Canonical PENDING, zero dispatch evidence, unknown owner: the cash
+    // never left — safe to reject through the canonical reversal.
+    return { safe: true };
+}
+
+async function _notifyRejection(req, { withdrawal, withdrawalId, reason, io, emitBalanceUpdate, refundedAmount }) {
+    const prisma = req.app.get('prisma');
+    await _getNotificationService(req).sendNotification({
+        userId: withdrawal.userId,
+        title: 'Withdrawal Rejected',
+        body: `Your withdrawal of ${withdrawal.amount} was rejected: ${reason}. Funds have been returned to your wallet.`,
+        category: 'GENERAL',
+        actionPayload: { action: 'WITHDRAWAL_STATUS', withdrawalId: String(withdrawalId), status: 'REJECTED' }
+    });
+
+    if (emitBalanceUpdate) await emitBalanceUpdate(withdrawal.userId);
+
+    if (io) {
+        io.to(`user_${withdrawal.userId}`).emit('withdrawal_update', {
+            withdrawalId,
+            status: 'REJECTED',
+            reason,
+            message: 'Your withdrawal was rejected. Funds returned.'
+        });
+    }
+}
 
 /**
  * 19. SYSTEM HEALTH

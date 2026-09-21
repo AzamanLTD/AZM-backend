@@ -511,7 +511,11 @@ const completeFiatWithdrawal = async (prisma, reference, { providerTxId = null }
 const reverseFiatWithdrawal = async (prisma, reference, opts = {}) => {
     if (!reference) throw new Error('[reverseFiatWithdrawal] reference is required.');
 
-    const original = await prisma.transactionHistory.findUnique({ where: { txHash: reference } });
+    // r16 P0-C: callers that must coordinate the canonical reversal with
+    // their own claims (admin rejection: mirror claim + canonical reversal
+    // in ONE transaction) pass their open transaction via opts.tx.
+    const db = opts.tx || prisma;
+    const original = await db.transactionHistory.findUnique({ where: { txHash: reference } });
     if (!original) throw new Error(`[reverseFiatWithdrawal] No row with reference ${reference}.`);
     if (original.type !== 'WITHDRAWAL_FIAT') throw new Error(`[reverseFiatWithdrawal] Reference ${reference} is not a fiat withdrawal.`);
     if (original.status === 'FAILED') return { reference, alreadyReversed: true };
@@ -528,7 +532,7 @@ const reverseFiatWithdrawal = async (prisma, reference, opts = {}) => {
     const economicsDeferred = _isDeferredWithdrawal(original);
     const referrer = economicsDeferred ? null : await _resolveReferrer(prisma, userId);
 
-    const result = await prisma.$transaction(async (tx) => {
+    const runReversal = async (tx) => {
         const claim = await tx.transactionHistory.updateMany({
             where: { txHash: reference, status: 'PENDING' },
             data: { status: 'FAILED' }
@@ -698,7 +702,11 @@ const reverseFiatWithdrawal = async (prisma, reference, opts = {}) => {
             tx.user.findUnique({ where: { id: userId }, select: { availableBalance: true } })
         ]);
         return { alreadyReversed: false, profitFees, fiatPool: updatedFiatPool, masterCrypto, user, azmFeeDiscount };
-    });
+    };
+
+    // r16 P0-C: run inside the caller's transaction when coordinated claims
+    // are required (admin rejection), otherwise in a fresh one.
+    const result = opts.tx ? await runReversal(opts.tx) : await prisma.$transaction(runReversal);
 
     if (result.alreadyReversed) return { reference, alreadyReversed: true };
     return {

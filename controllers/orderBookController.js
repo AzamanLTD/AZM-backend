@@ -17,6 +17,33 @@
 //   - 0.2% maker fee (limit orders that rest on the book)
 //   - Fees paid in USDC, credited to SystemProfitFees
 //
+// r16 P0-F hardening (audit P0, 2026-09-20):
+//   1. BUY placement no longer references the order id before the order row
+//      exists (the old code posted `ledger:orderbook:reserve:${order.id}`
+//      BEFORE `tx.orderBookOrder.create(...)` — a temporal-dead-zone crash on
+//      every BUY placement).
+//   2. Matching is guarded by a DB-authoritative candidate claim: a
+//      conditional decrement (status still resting AND remainingQuantity >=
+//      matchQty) must win before any balance moves. Two concurrent takers can
+//      no longer settle against the same stale remainingQuantity, and
+//      cancellation vs matching converges through the same row claim.
+//   3. Partially-filled resting orders stay matchable (the old candidate
+//      filter only matched status OPEN, stranding every partially-filled
+//      resting order's remaining quantity).
+//   4. Fee funding: every ledger charge to clearing:orderbook:usdc is now
+//      exactly funded by a reserve. The old settlement charged the maker fee
+//      and taker fee to the clearing pool even though no reserve ever
+//      included them — every match overdrawed the clearing account by the fee
+//      amount (unfunded value minted into equity:treasury). Both fees are now
+//      deducted from the USDC recipient's credit, so each match charges the
+//      clearing pool exactly matchQty * matchPrice.
+//   5. Trades execute at the RESTING order's price (standard price-time
+//      priority). BUY takers filling below their limit get an immediate
+//      price-improvement refund of (limit - matchPrice) * matchQty, so no
+//      reserve dust strands in the clearing pool; the matching condition for
+//      MARKET BUY is bounded by the reservation price, so a concurrent book
+//      move upward can never make charges exceed the reserve.
+//
 // Pair: AZM/USDC (price in USDC, quantity in AZM)
 // =============================================================================
 
@@ -30,6 +57,8 @@ const PAIR = 'AZM/USDC';
 const MAKER_FEE = 0.002; // 0.2%
 const TAKER_FEE = 0.005; // 0.5%
 const MIN_ORDER_SIZE = 1;   // min 1 AZM
+
+const RESTING_STATUSES = ['OPEN', 'PARTIALLY_FILLED'];
 
 // ── POST /api/order-book/orders ──────────────────────────────────────────────
 async function placeOrder(req, res) {
@@ -55,7 +84,10 @@ async function placeOrder(req, res) {
       return res.status(400).json({ success: false, message: 'Limit orders require a positive price.' });
     }
 
-    // Check user has sufficient balance
+    // Friendly preflight against a possibly-stale snapshot. The authoritative
+    // guards are the conditional balance claims INSIDE the placement
+    // transaction below — a concurrent spend between this read and the claim
+    // fails the claim and rolls the whole placement back.
     const user = await prisma.user.findUnique({
       where: { id: userId },
       select: { azmBalance: true, availableBalance: true },
@@ -81,21 +113,62 @@ async function placeOrder(req, res) {
 
     // Create order and attempt matching
     const result = await prisma.$transaction(async (tx) => {
-      // Lock user balance
+      // r16 P0-F: guarded balance claims. SELL reserves AZM; BUY reserves
+      // USDC at the limit price (MARKET BUY: at the best-ask estimate).
+      // The conditional decrement fails closed when a concurrent placement
+      // spent the balance first — the CHECK constraints on User are the
+      // last-resort backstop, these claims are the primary guard.
+      let reserveUsdc = null;
       if (side === 'SELL') {
-        await tx.user.update({
-          where: { id: userId },
+        const azmClaim = await tx.user.updateMany({
+          where: { id: userId, azmBalance: { gte: qty } },
           data: { azmBalance: { decrement: qty } },
         });
+        if (azmClaim.count !== 1) {
+          const err = new Error('Insufficient AZM balance.');
+          err.status = 400;
+          throw err;
+        }
       } else {
-        // For BUY, reserve USDC = qty * price (or best ask for market)
-        const reserveUsdc = type === 'MARKET'
+        reserveUsdc = type === 'MARKET'
           ? qty * (await getBestAskPriceTx(tx))
           : qty * orderPrice;
-        await tx.user.update({
-          where: { id: userId },
-          data: { availableBalance: { decrement: reserveUsdc } },
-        });
+        // No asks at all for a MARKET BUY: nothing to reserve (the refund
+        // path at the end of matching handles the zero-reserve case).
+        if (!Number.isFinite(reserveUsdc)) reserveUsdc = 0;
+        if (reserveUsdc < 0) reserveUsdc = 0;
+
+        if (reserveUsdc > 0) {
+          const usdcClaim = await tx.user.updateMany({
+            where: { id: userId, availableBalance: { gte: reserveUsdc } },
+            data: { availableBalance: { decrement: reserveUsdc } },
+          });
+          if (usdcClaim.count !== 1) {
+            const err = new Error('Insufficient USDC balance.');
+            err.status = 400;
+            throw err;
+          }
+        }
+      }
+
+      // r16 P0-F (defect 1): create the order FIRST — the ledger reserve
+      // identity must reference an order id that already exists. The old
+      // code posted `ledger:orderbook:reserve:${order.id}` before creating
+      // `order`, a temporal-dead-zone crash on every BUY placement.
+      const order = await tx.orderBookOrder.create({
+        data: {
+          userId,
+          pair: PAIR,
+          side,
+          type,
+          price: orderPrice,
+          quantity: qty,
+          remainingQuantity: qty,
+          status: 'OPEN',
+        },
+      });
+
+      if (side === 'BUY' && reserveUsdc > 0) {
         // §P.4 AUTHORITATIVE LEDGER — BUY reserve enters the matching
         // engine's clearing pool (the order book never touches user escrow
         // projection columns), same transaction, idempotent on the freshly
@@ -117,22 +190,8 @@ async function placeOrder(req, res) {
         });
       }
 
-      // Create the order
-      const order = await tx.orderBookOrder.create({
-        data: {
-          userId,
-          pair: PAIR,
-          side,
-          type,
-          price: orderPrice,
-          quantity: qty,
-          remainingQuantity: qty,
-          status: 'OPEN',
-        },
-      });
-
       // Match the order
-      const matches = await matchOrder(tx, order);
+      const matches = await matchOrder(tx, order, { reserveUsdc });
 
       return { order, matches };
     });
@@ -144,14 +203,27 @@ async function placeOrder(req, res) {
       trades: result.matches,
     });
   } catch (err) {
+    if (err && err.status === 400) {
+      return res.status(400).json({ success: false, message: err.message });
+    }
     logger.error({ err: err }, '[orderBook] place error');
     return res.status(500).json({ success: false, message: 'Failed to place order.' });
   }
 }
 
 // ── Matching engine ─────────────────────────────────────────────────────────
-async function matchOrder(tx, order) {
+async function matchOrder(tx, order, opts = {}) {
   const matches = [];
+
+  const reserveUsdc = opts.reserveUsdc ?? null;
+  // Reservation unit price: the per-AZM price the reserve actually covers.
+  // For LIMIT BUY it is the limit price; for MARKET BUY the best-ask
+  // estimate captured at reservation time. A MARKET BUY may never fill
+  // above this price — a concurrent upward book move cannot make charges
+  // exceed the reserve.
+  const reservedUnitPrice = order.side === 'BUY' && reserveUsdc !== null && reserveUsdc > 0
+    ? reserveUsdc / parseFloat(order.quantity.toString())
+    : null;
 
   // Find opposite-side orders to match against
   const oppositeSide = order.side === 'BUY' ? 'SELL' : 'BUY';
@@ -163,9 +235,16 @@ async function matchOrder(tx, order) {
     where: {
       pair: PAIR,
       side: oppositeSide,
-      status: 'OPEN',
+      // r16 P0-F (defect 3): partially-filled resting orders stay on the
+      // book — the old `status: 'OPEN'` filter stranded their remaining
+      // quantity (and the AZM/USDC already reserved against it).
+      status: { in: RESTING_STATUSES },
       type: 'LIMIT',
-      price: order.type === 'MARKET' ? undefined : matchingCondition,
+      price: order.type === 'MARKET'
+        ? (order.side === 'BUY' && reservedUnitPrice !== null
+            ? { lte: reservedUnitPrice } // MARKET BUY: bounded by the reservation
+            : undefined)
+        : matchingCondition,
       remainingQuantity: { gt: 0 },
       userId: { not: order.userId }, // don't match self
     },
@@ -179,17 +258,41 @@ async function matchOrder(tx, order) {
   for (const candidate of candidates) {
     if (remainingQty <= 0) break;
 
-    // For market orders, match at candidate's price
-    const matchPrice = order.type === 'MARKET'
-      ? parseFloat(candidate.price.toString())
-      : parseFloat(order.price.toString());
+    // r16 P0-F (defect 2): DB-authoritative candidate claim. The guarded
+    // conditional decrement must win before any money moves; a concurrent
+    // taker (or a cancellation) that changed the candidate's state between
+    // our read and this write makes the claim fail and we re-read/skip
+    // instead of settling more quantity than the order contains.
+    let matchQty = Math.min(remainingQty, parseFloat(candidate.remainingQuantity.toString()));
+    let claim = await claimCandidateQuantity(tx, candidate.id, matchQty);
+    if (claim.count !== 1) {
+      const fresh = await tx.orderBookOrder.findUnique({
+        where: { id: candidate.id },
+        select: { status: true, remainingQuantity: true },
+      });
+      if (!fresh || !RESTING_STATUSES.includes(fresh.status)) continue;
+      const freshRemaining = parseFloat(fresh.remainingQuantity.toString());
+      if (!(freshRemaining > 0)) continue;
+      matchQty = Math.min(remainingQty, freshRemaining);
+      claim = await claimCandidateQuantity(tx, candidate.id, matchQty);
+      if (claim.count !== 1) continue;
+    }
 
-    const matchQty = Math.min(remainingQty, parseFloat(candidate.remainingQuantity.toString()));
+    // Trades execute at the RESTING order's price (price-time priority):
+    // a BUY taker matching a cheaper ask fills at the ask (improvement
+    // refunded below); a SELL taker matching a higher resting bid fills
+    // at the bid — exactly what the resting BUY reserved.
+    const matchPrice = parseFloat(candidate.price.toString());
 
-    // Determine maker/taker
-    // The resting order (candidate) is the maker; the incoming order is the taker
+    // Both fees are deducted from the USDC recipient's credit, so the
+    // clearing pool is charged EXACTLY matchQty * matchPrice — fully
+    // funded by the BUY-side reserve on either taker direction. The old
+    // code charged fees to clearing without any reserve including them
+    // (unfunded overdraw on every match).
     const makerFee = matchQty * matchPrice * MAKER_FEE;
     const takerFee = matchQty * matchPrice * TAKER_FEE;
+    const totalFees = makerFee + takerFee;
+    const usdcToRecipient = matchQty * matchPrice - totalFees;
 
     // Create trade record
     const trade = await tx.orderBookTrade.create({
@@ -207,28 +310,25 @@ async function matchOrder(tx, order) {
     });
 
     // Settle balances
-    // BUY (taker) receives AZM, pays USDC
-    // SELL (taker) receives USDC, pays AZM
+    // BUY (taker) receives AZM, pays USDC from its reserve
+    // SELL (taker) receives USDC (minus both fees), pays AZM
+    // The USDC recipient absorbs both fees; the AZM recipient pays none.
     if (order.side === 'BUY') {
-      // Taker is buyer: credit AZM, USDC already reserved
+      // Taker is buyer: credit AZM; USDC (minus fees) to the maker (seller)
       await tx.user.update({
         where: { id: order.userId },
         data: { azmBalance: { increment: matchQty } },
       });
-      // Maker is seller: credit USDC (minus maker fee), AZM already reserved
-      const makerUsdcCredit = matchQty * matchPrice - makerFee;
       await tx.user.update({
         where: { id: candidate.userId },
-        data: { availableBalance: { increment: makerUsdcCredit } },
+        data: { availableBalance: { increment: usdcToRecipient } },
       });
     } else {
-      // Taker is seller: credit USDC (minus taker fee), AZM already reserved
-      const takerUsdcCredit = matchQty * matchPrice - takerFee;
+      // Taker is seller: USDC (minus fees) to the taker; AZM to the maker (buyer)
       await tx.user.update({
         where: { id: order.userId },
-        data: { availableBalance: { increment: takerUsdcCredit } },
+        data: { availableBalance: { increment: usdcToRecipient } },
       });
-      // Maker is buyer: credit AZM, USDC already reserved
       await tx.user.update({
         where: { id: candidate.userId },
         data: { azmBalance: { increment: matchQty } },
@@ -236,67 +336,84 @@ async function matchOrder(tx, order) {
     }
 
     // Credit fees to platform
-    const totalFees = makerFee + takerFee;
-    await tx.systemProfitFees.update({
+    await tx.systemProfitFees.upsert({
       where: { id: 1 },
-      data: { balance: { increment: totalFees } },
+      update: { balance: { increment: totalFees } },
+      create: { id: 1, balance: totalFees },
     });
 
     // §P.4 AUTHORITATIVE LEDGER — match settlement, same transaction,
     // idempotent on the durable orderBookTrade row. The clearing pool is
-    // charged EXACTLY what is distributed (seller-side credit + fees), so
-    // every posting balances with no residual and no mint:
-    //   BUY taker:  D clearing:orderbook:usdc → C user:{maker}:liability
-    //               (taker's reserve funds the maker's USDC + both fees;
-    //               taker receives AZM, which is outside the USDC ledger)
-    //   SELL taker: D clearing:orderbook:usdc → C user:{taker}:liability
-    //               (maker's BUY reserve funds the taker's USDC + both fees;
-    //               maker receives AZM, outside the USDC ledger)
-    {
-      const sellerCreditExact = new Prisma.Decimal(
-        _exact(order.side === 'BUY' ? makerUsdcCredit : takerUsdcCredit)
-      );
-      const feesExact = new Prisma.Decimal(_exact(totalFees));
-      const charge = sellerCreditExact.plus(feesExact);
-      await ledger.post(tx, {
-        idempotencyKey: `ledger:orderbook:match:${trade.id}`,
-        entryType: 'TRADE',
-        description: 'Order-book match settled — USDC reserve released to seller side, fees realized',
-        userId: order.userId,
-        relatedEntity: 'orderBookTrade',
-        relatedEntityId: trade.id,
-        metadata: {
-          takerOrderId: order.id,
-          makerOrderId: candidate.id,
-          matchQty, matchPrice,
-          makerFee: _exact(makerFee), takerFee: _exact(takerFee),
-        },
-        lines: [
-          { account: 'clearing:orderbook:usdc', debit: charge.toFixed(8) },
-          ...(order.side === 'BUY'
-            ? [{ account: `user:${candidate.userId}:liability`, credit: sellerCreditExact.toFixed(8) }]
-            : [{ account: `user:${order.userId}:liability`, credit: sellerCreditExact.toFixed(8) }]),
-          { account: 'equity:treasury', credit: feesExact.toFixed(8) },
-        ],
-      });
+    // charged EXACTLY what is distributed (recipient credit + fees), and
+    // that charge is exactly what a BUY-side reserve funded:
+    //   D clearing:orderbook:usdc → C user:{recipient}:liability + fees
+    await ledger.post(tx, {
+      idempotencyKey: `ledger:orderbook:match:${trade.id}`,
+      entryType: 'TRADE',
+      description: 'Order-book match settled — USDC reserve released to seller side, fees realized',
+      userId: order.userId,
+      relatedEntity: 'orderBookTrade',
+      relatedEntityId: trade.id,
+      metadata: {
+        takerOrderId: order.id,
+        makerOrderId: candidate.id,
+        matchQty, matchPrice,
+        makerFee: _exact(makerFee), takerFee: _exact(takerFee),
+      },
+      lines: [
+        { account: 'clearing:orderbook:usdc', debit: _exact(matchQty * matchPrice) },
+        { account: `user:${order.side === 'BUY' ? candidate.userId : order.userId}:liability`, credit: _exact(usdcToRecipient) },
+        { account: 'equity:treasury', credit: _exact(totalFees) },
+      ],
+    });
+
+    // BUY-taker price improvement: the taker reserved at its limit price
+    // (or the MARKET estimate) but filled at the cheaper resting ask —
+    // refund the difference immediately so no reserve dust strands in the
+    // clearing pool when the order fully fills.
+    if (order.side === 'BUY' && reservedUnitPrice !== null && reservedUnitPrice > matchPrice) {
+      const improvement = (reservedUnitPrice - matchPrice) * matchQty;
+      if (improvement > 0) {
+        await tx.user.update({
+          where: { id: order.userId },
+          data: { availableBalance: { increment: improvement } },
+        });
+        await ledger.post(tx, {
+          idempotencyKey: `ledger:orderbook:improvement:${trade.id}`,
+          entryType: 'TRADE',
+          description: 'Order-book BUY filled below the reserved price — price-improvement refund',
+          userId: order.userId,
+          relatedEntity: 'orderBookTrade',
+          relatedEntityId: trade.id,
+          metadata: { matchPrice: _exact(matchPrice), reservedUnitPrice: _exact(reservedUnitPrice), improvement: _exact(improvement) },
+          lines: [
+            { account: 'clearing:orderbook:usdc', debit: _exact(improvement) },
+            { account: `user:${order.userId}:liability`, credit: _exact(improvement) },
+          ],
+        });
+      }
     }
 
-    // Update remaining quantities
-    remainingQty -= matchQty;
-    const candidateRemaining = parseFloat(candidate.remainingQuantity.toString()) - matchQty;
-
+    // Candidate terminal status (we hold the row lock from the claim inside
+    // this transaction — the read-compute-write below cannot interleave).
+    const afterClaim = await tx.orderBookOrder.findUnique({
+      where: { id: candidate.id },
+      select: { remainingQuantity: true },
+    });
+    const candidateRemaining = parseFloat(afterClaim.remainingQuantity.toString());
     await tx.orderBookOrder.update({
       where: { id: candidate.id },
       data: {
-        remainingQuantity: candidateRemaining,
         status: candidateRemaining <= 0 ? 'FILLED' : 'PARTIALLY_FILLED',
       },
     });
 
+    remainingQty -= matchQty;
     matches.push(trade);
   }
 
-  // Update the incoming order
+  // Update the incoming order (created in this transaction — only this
+  // transaction can touch it).
   const filledQty = order.remainingQuantity - remainingQty;
   const newStatus = remainingQty <= 0 ? 'FILLED' : (filledQty > 0 ? 'PARTIALLY_FILLED' : 'OPEN');
 
@@ -308,43 +425,60 @@ async function matchOrder(tx, order) {
     },
   });
 
-  // If BUY market order has remaining qty but no asks, refund unused USDC
-  if (order.type === 'MARKET' && order.side === 'BUY' && remainingQty > 0) {
-    const bestAsk = await getBestAskPriceTx(tx);
-    if (bestAsk === null) {
-      // No asks available, refund remaining
-      const refundAmount = remainingQty * (order.price || bestAsk || 0);
-      if (refundAmount > 0) {
-        await tx.user.update({
-          where: { id: order.userId },
-          data: { availableBalance: { increment: refundAmount } },
-        });
-        // §P.4 AUTHORITATIVE LEDGER — unused market-order reserve refunds
-        // from the clearing pool, same transaction, idempotent on the
-        // order's placement identity (a MARKET order finalizes once).
-        await ledger.post(tx, {
-          idempotencyKey: `ledger:orderbook:place-refund:${order.id}`,
-          entryType: 'TRADE',
-          description: 'Market BUY could not fully fill — unused reserve refunded',
-          userId: order.userId,
-          relatedEntity: 'orderBookOrder',
-          relatedEntityId: order.id,
-          metadata: { refundAmount: _exact(refundAmount) },
-          lines: [
-            { account: 'clearing:orderbook:usdc', debit: _exact(refundAmount) },
-            { account: `user:${order.userId}:liability`, credit: _exact(refundAmount) },
-          ],
-        });
-      }
+  // MARKET BUY leftover reserve: the unreserved portion of the estimate
+  // (fills consumed exactly matchQty * matchPrice at candidate prices, the
+  // improvement block already refunded per-unit estimate differences) is
+  // refunded at the reservation rate. The old code multiplied the leftover
+  // quantity by `order.price || bestAsk || 0` — both null for MARKET BUY —
+  // so a book that lost its asks between reservation and matching silently
+  // kept the user's reserve.
+  if (order.type === 'MARKET' && order.side === 'BUY' && remainingQty > 0 && reservedUnitPrice !== null) {
+    const refundAmount = remainingQty * reservedUnitPrice;
+    if (refundAmount > 0) {
+      await tx.user.update({
+        where: { id: order.userId },
+        data: { availableBalance: { increment: refundAmount } },
+      });
+      // §P.4 AUTHORITATIVE LEDGER — unused market-order reserve refunds
+      // from the clearing pool, same transaction, idempotent on the
+      // order's placement identity (a MARKET order finalizes once).
+      await ledger.post(tx, {
+        idempotencyKey: `ledger:orderbook:place-refund:${order.id}`,
+        entryType: 'TRADE',
+        description: 'Market BUY could not fully fill — unused reserve refunded',
+        userId: order.userId,
+        relatedEntity: 'orderBookOrder',
+        relatedEntityId: order.id,
+        metadata: { refundAmount: _exact(refundAmount) },
+        lines: [
+          { account: 'clearing:orderbook:usdc', debit: _exact(refundAmount) },
+          { account: `user:${order.userId}:liability`, credit: _exact(refundAmount) },
+        ],
+      });
     }
   }
 
   return matches;
 }
 
+// Guarded conditional decrement on a resting order: wins only if the order
+// is still resting AND still holds the requested quantity. This is the
+// single-winner claim that prevents two takers (or a taker and a
+// cancellation) from consuming the same resting quantity.
+async function claimCandidateQuantity(tx, candidateId, matchQty) {
+  return tx.orderBookOrder.updateMany({
+    where: {
+      id: candidateId,
+      status: { in: RESTING_STATUSES },
+      remainingQuantity: { gte: matchQty },
+    },
+    data: { remainingQuantity: { decrement: matchQty } },
+  });
+}
+
 async function getBestAskPrice() {
   const best = await prisma.orderBookOrder.findFirst({
-    where: { pair: PAIR, side: 'SELL', status: 'OPEN', type: 'LIMIT', remainingQuantity: { gt: 0 } },
+    where: { pair: PAIR, side: 'SELL', status: { in: RESTING_STATUSES }, type: 'LIMIT', remainingQuantity: { gt: 0 } },
     orderBy: [{ price: 'asc' }, { createdAt: 'asc' }],
     select: { price: true },
   });
@@ -353,7 +487,7 @@ async function getBestAskPrice() {
 
 async function getBestAskPriceTx(tx) {
   const best = await tx.orderBookOrder.findFirst({
-    where: { pair: PAIR, side: 'SELL', status: 'OPEN', type: 'LIMIT', remainingQuantity: { gt: 0 } },
+    where: { pair: PAIR, side: 'SELL', status: { in: RESTING_STATUSES }, type: 'LIMIT', remainingQuantity: { gt: 0 } },
     orderBy: [{ price: 'asc' }, { createdAt: 'asc' }],
     select: { price: true },
   });
@@ -467,25 +601,41 @@ async function cancelOrder(req, res) {
       return res.status(400).json({ success: false, message: 'Order cannot be cancelled.' });
     }
 
-    // Refund remaining balance
-    const remaining = parseFloat(order.remainingQuantity.toString());
     await prisma.$transaction(async (tx) => {
-      // Single-winner claim: only one caller can flip this order to
-      // CANCELLED — a double cancel would double-refund real money.
-      const claim = await tx.orderBookOrder.updateMany({
-        where: { id: orderId, status: { in: ['OPEN', 'PARTIALLY_FILLED'] } },
-        data: { status: 'CANCELLED' },
-      });
-      if (claim.count !== 1) {
+      // r16 P0-F: the CANCELLED claim and the refunded quantity are now ONE
+      // atomic statement. The old code claimed by status and then refunded
+      // `remainingQuantity` from the stale pre-transaction read — a match
+      // decrementing the same row between the read and the claim flipped
+      // the row to CANCELLED with the taker's quantity still attached:
+      // both the taker and the canceller were paid for the same quantity.
+      // UPDATE ... RETURNING captures the exact remaining at claim time.
+      // The locked CTE captures the pre-cancel remaining (RETURNING a
+      // subselect column, not the post-update row) so the refund and the
+      // terminal state stay one atomic statement — a CANCELLED order must
+      // never leave quantity attached (the old claim left
+      // remainingQuantity dangling on the cancelled row).
+      const rows = await tx.$queryRawUnsafe(
+        'UPDATE "OrderBookOrder" o SET "status" = \'CANCELLED\', "remainingQuantity" = 0, "updatedAt" = now() ' +
+        'FROM (SELECT "remainingQuantity" AS rem, "price" FROM "OrderBookOrder" ' +
+        'WHERE "id" = $1 AND "status" IN (\'OPEN\', \'PARTIALLY_FILLED\') FOR UPDATE) prev ' +
+        'WHERE o."id" = $1 RETURNING prev.rem AS "remainingQuantity", prev."price"',
+        orderId
+      );
+      const claimed = rows?.[0];
+      if (!claimed) {
         throw new Error('ORDER_ALREADY_FINALIZED');
       }
+      const remaining = parseFloat(claimed.remainingQuantity.toString());
+
       if (order.side === 'SELL') {
-        await tx.user.update({
-          where: { id: userId },
-          data: { azmBalance: { increment: remaining } },
-        });
-      } else {
-        const refundUsdc = remaining * parseFloat(order.price.toString());
+        if (remaining > 0) {
+          await tx.user.update({
+            where: { id: userId },
+            data: { azmBalance: { increment: remaining } },
+          });
+        }
+      } else if (remaining > 0) {
+        const refundUsdc = remaining * parseFloat(claimed.price.toString());
         await tx.user.update({
           where: { id: userId },
           data: { availableBalance: { increment: refundUsdc } },
@@ -511,6 +661,9 @@ async function cancelOrder(req, res) {
 
     return res.json({ success: true, message: 'Order cancelled.' });
   } catch (err) {
+    if (err && err.message === 'ORDER_ALREADY_FINALIZED') {
+      return res.status(409).json({ success: false, message: 'Order already finalized.' });
+    }
     logger.error({ err: err }, '[orderBook] cancel error');
     return res.status(500).json({ success: false, message: 'Failed to cancel order.' });
   }
