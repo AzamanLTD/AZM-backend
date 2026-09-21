@@ -919,6 +919,8 @@ describeOrSkip('r15 hardening G–I: controller path — tracked, fail-closed, r
         expect(excAfter.map(e => e.reason)).toContain('DISPATCHED_OWNERSHIP_NOT_DURABLE');
 
         const wAfter = await prisma.withdrawal.findUnique({ where: { id: wRow.id } });
-        expect(wAfter.status).toBe('PENDING');
+        // r16c: the mirror holds the dispatch claim (DISPATCHING) — parked for
+        // human reconciliation, never rolled back to PENDING.
+        expect(wAfter.status).toBe('DISPATCHING');
     });
 });
