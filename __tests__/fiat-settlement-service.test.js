@@ -24,9 +24,18 @@ describe('fiatSettlementService', () => {
         $executeRawUnsafe: jest.fn().mockResolvedValue(1)
     });
 
+    // r20: the settlement binding boundary (no §P.5-D reservation, no
+    // dispatch evidence — the callback settles on the residual binding:
+    // authenticated provider identity + provider-named reference).
+    const bindingDb = () => ({
+        fiatLiquidityReservation: { findUnique: jest.fn().mockResolvedValue(null) },
+        fiatProviderEvent: { findMany: jest.fn().mockResolvedValue([]), findFirst: jest.fn().mockResolvedValue(null) },
+    });
+
     test('delegates provider SUCCESS to the atomic finance settlement boundary', async () => {
         const pending = {
-            txHash: 'ref-1', userId: 11, type: 'WITHDRAWAL_FIAT', status: 'PENDING', providerRef: null
+            txHash: 'ref-1', userId: 11, type: 'WITHDRAWAL_FIAT', status: 'PENDING', providerRef: null,
+            metadata: { payoutGhs: 750 }
         };
         const completed = { ...pending, status: 'COMPLETED', providerRef: 'moolre-991' };
         financeService.completeFiatWithdrawal.mockResolvedValue({
@@ -35,11 +44,12 @@ describe('fiatSettlementService', () => {
         });
         const prisma = {
             ...attemptDb(),
+            ...bindingDb(),
             transactionHistory: { findUnique: jest.fn().mockResolvedValue(pending), update: jest.fn() }
         };
 
         const result = await settleFiatWithdrawal(prisma, {
-            reference: 'ref-1', provider: 'MOOLRE', status: 'SUCCESSFUL', providerTxId: 'moolre-991'
+            reference: 'ref-1', provider: 'MOOLRE_DISBURSEMENT', status: 'SUCCESSFUL', providerTxId: 'moolre-991'
         });
 
         expect(financeService.completeFiatWithdrawal).toHaveBeenCalledWith(
@@ -61,11 +71,12 @@ describe('fiatSettlementService', () => {
         });
         const prisma = {
             ...attemptDb(),
+            ...bindingDb(),
             transactionHistory: { findUnique: jest.fn().mockResolvedValue(failed), update: jest.fn() }
         };
 
         const result = await settleFiatWithdrawal(prisma, {
-            reference: 'ref-2', provider: 'MOOLRE', status: 'SUCCESSFUL', providerTxId: 'late-success'
+            reference: 'ref-2', provider: 'MOOLRE_DISBURSEMENT', status: 'SUCCESSFUL', providerTxId: 'late-success'
         });
 
         expect(result).toMatchObject({ status: 'FAILED', changed: false });
@@ -84,6 +95,7 @@ describe('fiatSettlementService', () => {
         });
         const prisma = {
             ...attemptDb(),
+            ...bindingDb(),
             transactionHistory: {
                 findUnique: jest.fn().mockResolvedValue(enriched),
                 updateMany: jest.fn().mockResolvedValue({ count: 1 })
@@ -91,7 +103,7 @@ describe('fiatSettlementService', () => {
         };
 
         const result = await settleFiatWithdrawal(prisma, {
-            reference: 'ref-dup', provider: 'MOOLRE', status: 'SUCCESSFUL', providerTxId: 'provider-dup'
+            reference: 'ref-dup', provider: 'MOOLRE_DISBURSEMENT', status: 'SUCCESSFUL', providerTxId: 'provider-dup'
         });
 
         // r15 R15-E: the claim is a conditional updateMany (providerRef: null),
@@ -113,6 +125,7 @@ describe('fiatSettlementService', () => {
 
         const prisma = {
             ...attemptDb(),
+            ...bindingDb(),
             transactionHistory: {
                 findUnique: jest.fn().mockResolvedValueOnce(pending).mockResolvedValue(failedWithProviderRef),
                 updateMany: jest.fn().mockResolvedValue({ count: 1 })
@@ -120,7 +133,7 @@ describe('fiatSettlementService', () => {
         };
 
         const result = await settleFiatWithdrawal(prisma, {
-            reference: 'ref-3', provider: 'MOOLRE', status: 'FAILED', providerTxId: 'moolre-fail-3',
+            reference: 'ref-3', provider: 'MOOLRE_DISBURSEMENT', status: 'FAILED', providerTxId: 'moolre-fail-3',
             reason: 'provider rejected transfer'
         });
 
@@ -140,10 +153,11 @@ describe('fiatSettlementService', () => {
     test('rejects an unknown provider reference before recording or mutating ledger state', async () => {
         const prisma = {
             ...attemptDb(),
+            ...bindingDb(),
             transactionHistory: { findUnique: jest.fn().mockResolvedValue(null), update: jest.fn() }
         };
         await expect(settleFiatWithdrawal(prisma, {
-            reference: 'unknown-ref', provider: 'MOOLRE', status: 'SUCCESSFUL', providerTxId: 'moolre-404'
+            reference: 'unknown-ref', provider: 'MOOLRE_DISBURSEMENT', status: 'SUCCESSFUL', providerTxId: 'moolre-404'
         })).rejects.toMatchObject({ code: 'UNKNOWN_REFERENCE' });
         expect(prisma.$queryRawUnsafe).not.toHaveBeenCalled();
         expect(prisma.$executeRawUnsafe).not.toHaveBeenCalled();
@@ -157,10 +171,11 @@ describe('fiatSettlementService', () => {
         };
         const prisma = {
             ...attemptDb(),
+            ...bindingDb(),
             transactionHistory: { findUnique: jest.fn().mockResolvedValue(trade), update: jest.fn() }
         };
         await expect(settleFiatWithdrawal(prisma, {
-            reference: 'trade-ref-1', provider: 'MOOLRE', status: 'SUCCESSFUL', providerTxId: 'moolre-trade-1'
+            reference: 'trade-ref-1', provider: 'MOOLRE_DISBURSEMENT', status: 'SUCCESSFUL', providerTxId: 'moolre-trade-1'
         })).rejects.toMatchObject({ code: 'WRONG_TRANSACTION_TYPE' });
         expect(financeService.completeFiatWithdrawal).not.toHaveBeenCalled();
         expect(financeService.reverseFiatWithdrawal).not.toHaveBeenCalled();

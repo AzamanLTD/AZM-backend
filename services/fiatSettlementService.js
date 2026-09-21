@@ -13,6 +13,10 @@
 const financeService = require('./finance.service');
 const { recordProviderSettlementAttempt } = require('./providerSettlementAttemptService');
 const fiatLiquidity = require('../src/services/fiatLiquidityService');
+const { bindOutboundSettlementEvidence } = require('./outboundSettlementEvidence'); // r20 P0
+const {
+    recordReconciliationExceptionLoud,
+} = require('./reconciliationExceptionService'); // r20 P0 durable park
 
 // Provider references are mutable only while a withdrawal is still in its
 // reservation lifecycle. Once a terminal state has a provider reference, a
@@ -44,7 +48,11 @@ const settleFiatWithdrawal = async (prisma, {
     status,
     provider = 'MTN_MOMO_DISBURSEMENT',
     providerTxId = null,
-    reason = null
+    reason = null,
+    // r20 P0: the provider-reported payout amount when the settlement
+    // callback carries one (captured by the webhook normalizer). Validated
+    // against the durable committed economics — never against the current rate.
+    amountGhs = null,
 }) => {
     if (!reference) throw new Error('[fiatSettlement] reference is required.');
     if (!['SUCCESSFUL', 'FAILED'].includes(status)) {
@@ -84,6 +92,44 @@ const settleFiatWithdrawal = async (prisma, {
         relatedReference: reference,
         raw: { reason: reason ?? null, source: 'provider_callback' },
     });
+
+    // r20 P0 — OUTBOUND SETTLEMENT EVIDENCE BINDING: the observation is now
+    // durably recorded above (contradictions are evidence, never dropped),
+    // but it may move customer money ONLY when bound to the EXACT payout:
+    // a known canonical provider identity, agreement with the durable owner
+    // when one exists, the provider-named reference (inherent for an
+    // authenticated callback — the reference IS the echoed externalref),
+    // and the exact amount when the callback contract carries one. A
+    // rejected binding parks the payout (durable exception, no completion,
+    // no refund) and surfaces a classified error to the caller.
+    const binding = await bindOutboundSettlementEvidence(prisma, {
+        reference,
+        provider,
+        externalId: reference, // the callback reference IS the provider-named externalref
+        amountGhs,
+        status,
+        source: 'provider_callback',
+    });
+    if (!binding.bound) {
+        await recordReconciliationExceptionLoud(prisma, {
+            entityType: 'TRANSACTION',
+            entityId: reference,
+            reference,
+            reason: 'SETTLEMENT_EVIDENCE_REJECTED',
+            details: {
+                bindingReason: binding.reason,
+                bindingDetails: binding.details || null,
+                provider,
+                observedStatus: status,
+                observedAmountGhs: amountGhs ?? null,
+            },
+        });
+        const rejected = new Error(
+            `[fiatSettlement] terminal ${status} observation for ${reference} is NOT bound to this payout (${binding.reason}) — parked for operator review.`
+        );
+        rejected.code = 'SETTLEMENT_EVIDENCE_REJECTED';
+        throw rejected;
+    }
 
     await recordProviderSettlementAttempt(prisma, {
         reference,

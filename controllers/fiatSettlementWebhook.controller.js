@@ -73,7 +73,13 @@ const normalizeMoolre = (body) => {
         reference: payload.externalref || payload.reference || payload.externalId || null,
         status,
         providerTxId: payload.transactionid || payload.txid || payload.id || null,
-        reason: payload.reason || body?.message || null
+        reason: payload.reason || body?.message || null,
+        // r20 P0: the provider-reported payout amount when the callback carries
+        // one. Validated against the durable committed economics (never the
+        // current rate) by bindOutboundSettlementEvidence; when the callback
+        // contract omits it, the residual binding is the authenticated
+        // provider identity + the provider-named externalref (documented).
+        amountGhs: payload.amount != null && payload.amount !== '' ? Number(payload.amount) : null
     };
 };
 
@@ -89,7 +95,10 @@ const normalizeMtn = (body) => {
         reference: payload.reference || payload.referenceId || null,
         status,
         providerTxId: payload.providerTxId || payload.financialTransactionId || null,
-        reason: payload.message || payload.reason || null
+        reason: payload.message || payload.reason || null,
+        // r20 P0: enforced against the durable economics when the callback
+        // carries an amount; a documented residual otherwise.
+        amountGhs: payload.amount != null && payload.amount !== '' ? Number(payload.amount) : null
     };
 };
 
@@ -236,12 +245,19 @@ const handleSettlement = (provider, authenticate, normalize) => async (req, res)
         });
     } catch (error) {
         logger.error({ err: error, provider, reference: normalized.reference }, '[fiatSettlementWebhook] processing failed');
-        const status = error.code === 'UNKNOWN_REFERENCE' ? 404 : error.code === 'WRONG_TRANSACTION_TYPE' ? 409 : 500;
+        const status = error.code === 'UNKNOWN_REFERENCE' ? 404
+            : (error.code === 'WRONG_TRANSACTION_TYPE' || error.code === 'SETTLEMENT_EVIDENCE_REJECTED') ? 409
+            : 500;
         return res.status(status).json({ success: false, message: error.message });
     }
 };
 
 module.exports = {
-    moolreDisbursementWebhook: handleSettlement('MOOLRE', authenticateMoolre, normalizeMoolre),
+    // r20 P0: canonical provider identity, matching the adapters'
+    // PROVIDER_NAME so one rail = one identity across dispatch, poll and
+    // callback evidence (the previous 'MOOLRE' label is a legacy alias —
+    // existing evidence rows are durable history and are never rewritten;
+    // new observations converge under the canonical key).
+    moolreDisbursementWebhook: handleSettlement('MOOLRE_DISBURSEMENT', authenticateMoolre, normalizeMoolre),
     mtnDisbursementWebhook: handleSettlement('MTN_MOMO_DISBURSEMENT', authenticateMtn, normalizeMtn)
 };

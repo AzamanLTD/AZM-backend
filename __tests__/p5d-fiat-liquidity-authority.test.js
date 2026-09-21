@@ -1199,12 +1199,12 @@ describeOrSkip('§P.5-D evidence-backed GHS liquidity authority (real PostgreSQL
                 data: { userId: user.id, type: 'WITHDRAWAL_FIAT', amountUsdc: '4.47', status: 'PENDING', txHash: 'W-P1' },
             });
 
-            const settle = async () => fiatSettlementService.settleFiatWithdrawal(prisma, { reference: 'W-P1', provider: 'MOOLRE', providerTxId: 'PR-P1', status: 'SUCCESSFUL' });
+            const settle = async () => fiatSettlementService.settleFiatWithdrawal(prisma, { reference: 'W-P1', provider: 'MOOLRE_DISBURSEMENT', providerTxId: 'PR-P1', status: 'SUCCESSFUL' });
             const result = await settle();
             expect(result.transaction.status).toBe('COMPLETED');
 
             // the terminal observation is durable
-            const ev = await prisma.fiatProviderEvent.findUnique({ where: { dedupKey: 'event:payout-outbound:MOOLRE:W-P1:SUCCESSFUL' } });
+            const ev = await prisma.fiatProviderEvent.findUnique({ where: { dedupKey: 'event:payout-outbound:MOOLRE_DISBURSEMENT:W-P1:SUCCESSFUL' } });
             expect(ev).not.toBeNull();
             expect(ev.direction).toBe('OUTBOUND');
             expect(ev.relatedReference).toBe('W-P1');
@@ -1230,11 +1230,11 @@ describeOrSkip('§P.5-D evidence-backed GHS liquidity authority (real PostgreSQL
                 data: { userId: user.id, type: 'WITHDRAWAL_FIAT', amountUsdc: '4.47', status: 'PENDING', txHash: 'W-P2' },
             });
 
-            await fiatSettlementService.settleFiatWithdrawal(prisma, { reference: 'W-P2', provider: 'MOOLRE', providerTxId: 'PR-P2', status: 'FAILED', reason: 'insufficient' });
+            await fiatSettlementService.settleFiatWithdrawal(prisma, { reference: 'W-P2', provider: 'MOOLRE_DISBURSEMENT', providerTxId: 'PR-P2', status: 'FAILED', reason: 'insufficient' });
             expect((await prisma.fiatLiquidityReservation.findUnique({ where: { reference: 'W-P2' } })).status).toBe('RELEASED');
 
             // the provider now claims SUCCESS for the same payout
-            await fiatSettlementService.settleFiatWithdrawal(prisma, { reference: 'W-P2', provider: 'MOOLRE', providerTxId: 'PR-P2', status: 'SUCCESSFUL' });
+            await fiatSettlementService.settleFiatWithdrawal(prisma, { reference: 'W-P2', provider: 'MOOLRE_DISBURSEMENT', providerTxId: 'PR-P2', status: 'SUCCESSFUL' });
             const rz = await prisma.fiatLiquidityReservation.findUnique({ where: { reference: 'W-P2' } });
             expect(rz.status).toBe('RECONCILIATION_REQUIRED'); // quarantined, never rewritten
             // BOTH observations are durable and distinct
@@ -1248,7 +1248,7 @@ describeOrSkip('§P.5-D evidence-backed GHS liquidity authority (real PostgreSQL
                 data: { userId: user.id, type: 'WITHDRAWAL_FIAT', amountUsdc: '4.47', status: 'PENDING', txHash: 'W-P3' },
             });
             await prisma.$executeRaw`DROP TABLE "FiatProviderEvent"`;
-            await expect(fiatSettlementService.settleFiatWithdrawal(prisma, { reference: 'W-P3', provider: 'MOOLRE', providerTxId: 'PR-P3', status: 'SUCCESSFUL' }))
+            await expect(fiatSettlementService.settleFiatWithdrawal(prisma, { reference: 'W-P3', provider: 'MOOLRE_DISBURSEMENT', providerTxId: 'PR-P3', status: 'SUCCESSFUL' }))
                 .rejects.toThrow();
             // the withdrawal stayed PENDING — no settlement without evidence
             expect((await prisma.transactionHistory.findFirst({ where: { txHash: 'W-P3' } })).status).toBe('PENDING');

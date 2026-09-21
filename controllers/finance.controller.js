@@ -38,6 +38,7 @@ function _getNotificationService(req) {
 
 const financeService               = require('../services/finance.service');
 const fiatLiquidity                = require('../src/services/fiatLiquidityService'); // §P.5-D
+const { canonicalProviderName, persistPayoutOwnership } = require('../services/payoutProviderOwnership'); // r20 P0
 const { recordReconciliationExceptionLoud } = require('../services/reconciliationExceptionService');
 const { FIAT_POOL_ALERT_THRESH }   = financeService;
 const crypto                       = require('crypto');
@@ -175,17 +176,95 @@ exports.fiatWithdrawal = async (req, res) => {
             // either fails, the payout CANNOT be recalled and must NOT be
             // auto-refunded (the provider still pays it out — a refund would
             // double-spend). The guard in the catch below fails loudly instead.
+            //
+            // r20 P0: the accepting provider identity is derived from the
+            // dispatch ANSWER (failover tag, else the adapter's own
+            // self-identification) and recorded under its CANONICAL name —
+            // the previous hard-coded 'MOOLRE' alias was not an admissible
+            // owner identity for resolvePayoutOwner, so this path silently
+            // bypassed the durable payout-owner system.
+            const dispatchTag = disbursementResult?._provider || null;
+            const dispatchCanonicalFromTag = dispatchTag ? canonicalProviderName(dispatchTag) : null;
+            const actualProviderName = dispatchCanonicalFromTag
+                || (disbursementResult?.provider ? String(disbursementResult.provider).toUpperCase() : null);
+            if (!actualProviderName) {
+                // An accepted dispatch with NO provider identity must never be
+                // recorded under an invented rail — park loudly.
+                logger.error({ reference },
+                    '[fiatWithdrawal] CRITICAL: accepted dispatch carries NO provider identity — parking, never guessing a rail');
+                await recordReconciliationExceptionLoud(prisma, {
+                    entityType: 'TRANSACTION',
+                    entityId: reference,
+                    reference,
+                    reason: 'DISPATCH_IDENTITY_UNKNOWN',
+                    details: { dispatched: true, error: 'no failover tag and no adapter identity on an accepted dispatch' },
+                }, {
+                    escalate: () => io && io.emit('admin_alert', {
+                        type: 'WITHDRAWAL_DISPATCH_IDENTITY_UNKNOWN',
+                        reference,
+                        timestamp: new Date().toISOString(),
+                    }),
+                });
+                return res.status(503).json({
+                    success: false,
+                    message: 'Withdrawal dispatched but the accepting provider could not be identified. The payout is in flight; support has been alerted. Do not retry.',
+                    data: { reference }
+                });
+            }
+            if (dispatchCanonicalFromTag && disbursementResult?.provider
+                    && String(disbursementResult.provider).toUpperCase() !== dispatchCanonicalFromTag) {
+                // The failover tag and the adapter's self-identification
+                // disagree about who holds the money — park, never guess.
+                logger.error({ reference, tagCanonicalName: dispatchCanonicalFromTag, selfIdentified: disbursementResult.provider },
+                    '[fiatWithdrawal] CRITICAL: dispatch identity contradiction — parking, never guessing a rail');
+                await recordReconciliationExceptionLoud(prisma, {
+                    entityType: 'TRANSACTION',
+                    entityId: reference,
+                    reference,
+                    reason: 'DISPATCH_IDENTITY_CONTRADICTION',
+                    details: {
+                        dispatched: true,
+                        failoverTag: dispatchTag,
+                        tagCanonicalName: dispatchCanonicalFromTag,
+                        selfIdentifiedProvider: String(disbursementResult.provider),
+                    },
+                }, {
+                    escalate: () => io && io.emit('admin_alert', {
+                        type: 'WITHDRAWAL_DISPATCH_IDENTITY_CONTRADICTION',
+                        reference,
+                        timestamp: new Date().toISOString(),
+                    }),
+                });
+                return res.status(503).json({
+                    success: false,
+                    message: 'Withdrawal dispatched but the accepting provider identity is contradictory. The payout is in flight; support has been alerted. Do not retry.',
+                    data: { reference }
+                });
+            }
             await fiatLiquidity.recordProviderEvent(prisma, {
-                provider: 'MOOLRE',
+                provider: actualProviderName,
                 rail: 'MOMO',
                 direction: 'OUTBOUND',
                 status: String(disbursementResult?.status || 'DISPATCH_ACCEPTED'),
                 providerRef: disbursementResult?.providerRef || null,
-                dedupKey: `event:payout-dispatch:MOOLRE:${reference}`,
+                dedupKey: `event:payout-dispatch:${actualProviderName}:${reference}`,
                 amountGhs: payoutGhs,
                 relatedReference: reference,
                 raw: { externalId: `AZAMAN_${userId}`, recipientPhone, network: networkChoice },
             });
+            // r20 P0: persist the durable canonical ownership (metadata
+            // payoutProvider) exactly like the other dispatch paths — the
+            // reconciliation worker then polls the OWNER ONLY for this
+            // payout. A missing canonical row / a conflicting durable owner
+            // throws and lands in the same no-refund guard below.
+            if (dispatchTag) {
+                await persistPayoutOwnership(prisma, {
+                    reference,
+                    failoverTag: dispatchTag,
+                    intendedProvider: dispatchTag,
+                    providerRef: disbursementResult?.providerTxId || disbursementResult?.providerRef || null,
+                });
+            }
             await fiatLiquidity.inTransitIfRecorded(prisma, {
                 reference,
                 providerRef: disbursementResult?.providerRef || null,

@@ -298,9 +298,13 @@ describe('financial realtime event contracts', () => {
             stage: 'PROCESSING',
             pct: 60,
         }));
+        // r20: the webhook evidence identity is the CANONICAL provider name
+        // (MOOLRE_DISBURSEMENT — the same identity the poll evidence uses),
+        // so poll and callback observations dedupe against each other.
         expect(recordProviderSettlementAttempt).toHaveBeenCalledWith(prisma, expect.objectContaining({
             reference: 'withdrawal-contract-1',
-            provider: 'MOOLRE',
+            provider: 'MOOLRE_DISBURSEMENT',
+            providerReference: 'withdrawal-contract-1',
             status: 'PENDING',
         }));
     });

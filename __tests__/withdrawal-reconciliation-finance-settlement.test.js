@@ -60,14 +60,17 @@ describeOrSkip('withdrawal reconciliation finance settlement (real PostgreSQL)',
                 feeUsdc: 1,
                 status: transactionStatus,
                 txHash: `FIN_RECON_${suffix}`,
+                // r20: creation-time GHS payout economics — the durable
+                // amount authority the settlement binding compares against.
                 metadata: transactionStatus === 'PENDING'
                     ? {
                         economicsDeferred: true,
                         referrerId: null,
                         referrerShareUsdc: 0,
                         systemFeeShareUsdc: 1,
+                        payoutGhs: 750,
                     }
-                    : undefined,
+                    : { payoutGhs: 750 },
                 createdAt,
             }
         });
@@ -99,11 +102,18 @@ describeOrSkip('withdrawal reconciliation finance settlement (real PostgreSQL)',
         const { tx, withdrawal } = await seed();
         const io = makeIo();
         const provider = {
-            getTransferStatus: jest.fn().mockResolvedValue({
+            // r20: REAL adapter contract shape — the status answer echoes the
+            // queried reference and reports the provider payout amount.
+            getTransferStatus: jest.fn().mockImplementation(async (referenceId) => ({
+                provider: 'MTN_MOMO_DISBURSEMENT',
+                referenceId,
+                externalId: referenceId,
                 status: 'SUCCESSFUL',
+                amountGhs: 750,
+                reason: null,
+                source: 'MOCK',
                 providerRef: 'MTN-DEFERRED-1',
-                provider: 'MTN_MOMO_DISBURSEMENT'
-            })
+            }))
         };
         const worker = new WithdrawalReconciliationWorker(prisma, io, provider, null, null);
 
@@ -133,7 +143,16 @@ describeOrSkip('withdrawal reconciliation finance settlement (real PostgreSQL)',
         const { tx, withdrawal } = await seed({ transactionStatus: 'FAILED' });
         const io = makeIo();
         const provider = {
-            getTransferStatus: jest.fn().mockResolvedValue({ status: 'SUCCESSFUL', providerRef: 'MTN-LATE-SUCCESS' })
+            getTransferStatus: jest.fn().mockImplementation(async (referenceId) => ({
+                provider: 'MTN_MOMO_DISBURSEMENT',
+                referenceId,
+                externalId: referenceId,
+                status: 'SUCCESSFUL',
+                amountGhs: 750,
+                reason: null,
+                source: 'MOCK',
+                providerRef: 'MTN-LATE-SUCCESS',
+            }))
         };
         const worker = new WithdrawalReconciliationWorker(prisma, io, provider, null, null);
 

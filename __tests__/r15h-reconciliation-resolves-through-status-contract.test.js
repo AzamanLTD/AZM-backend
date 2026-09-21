@@ -77,7 +77,7 @@ describeOrSkip('r15 follow-up P0: reconciliation resolves an ambiguous payout th
     afterEach(async () => {
         await new Promise(r => setTimeout(r, 150));
         await prisma.$executeRawUnsafe(
-            'TRUNCATE TABLE "User", "TransactionHistory", "Withdrawal", "ReconciliationException", "AzmSpendLog", "AdminProfitLog", "GlobalSettings", "SystemFiatPool", "SystemProfitFees", "SystemMasterCrypto", "FiatLiquidityReceipt" RESTART IDENTITY CASCADE'
+            'TRUNCATE TABLE "User", "TransactionHistory", "Withdrawal", "ReconciliationException", "AzmSpendLog", "AdminProfitLog", "GlobalSettings", "SystemFiatPool", "SystemProfitFees", "SystemMasterCrypto", "FiatLiquidityReceipt", "FiatProviderEvent", "ProviderSettlementAttempt" RESTART IDENTITY CASCADE'
         );
     }, 15000);
 
@@ -113,7 +113,7 @@ describeOrSkip('r15 follow-up P0: reconciliation resolves an ambiguous payout th
                 feeUsdc: FEE,
                 status: 'PENDING',
                 txHash: reference,
-                metadata: { provider: 'MOOLRE', outcome: 'UNKNOWN_OUTCOME', amountGhs: -671.00, economicsDeferred: true, dispatchedAt: new Date().toISOString() }
+                metadata: { provider: 'MOOLRE', outcome: 'UNKNOWN_OUTCOME', payoutGhs: 671.00, economicsDeferred: true, dispatchedAt: new Date().toISOString() }
             }
         });
         const withdrawal = await prisma.withdrawal.create({
@@ -147,7 +147,7 @@ describeOrSkip('r15 follow-up P0: reconciliation resolves an ambiguous payout th
         const worker = new WithdrawalReconciliationWorker(prisma, null, adapter);
 
         axiosSpy.mockResolvedValueOnce({
-            data: { status: 1, code: 'SS02', message: 'Transaction Failed', data: { txstatus: 2, transactionid: '31830714', externalref: reference } }
+            data: { status: 1, code: 'SS02', message: 'Transaction Failed', data: { txstatus: 2, transactionid: '31830714', externalref: reference, amount: '671.00' } }
         });
 
         await worker._reconcileOne(await loadWithdrawal(
@@ -175,7 +175,7 @@ describeOrSkip('r15 follow-up P0: reconciliation resolves an ambiguous payout th
         // Re-reconcile the resolved row: the provider still answers FAILED, but
         // the canonical reversal is claimed-once — NO double refund.
         axiosSpy.mockResolvedValueOnce({
-            data: { status: 1, code: 'SS02', message: 'Transaction Failed', data: { txstatus: 2, transactionid: '31830714' } }
+            data: { status: 1, code: 'SS02', message: 'Transaction Failed', data: { txstatus: 2, transactionid: '31830714', externalref: reference, amount: '671.00' } }
         });
         await worker._reconcileOne(await loadWithdrawal(
             (await prisma.withdrawal.findFirst({ where: { userId: user.id } })).id

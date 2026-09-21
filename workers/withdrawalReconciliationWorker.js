@@ -17,6 +17,7 @@ const fiatLiquidity = require('../src/services/fiatLiquidityService'); // §P.5-
 const { recordReconciliationException } = require('../services/reconciliationExceptionService');
 const restrictedObligations = require('../services/restrictedObligationService'); // r17 P0 durable identity
 const withdrawalBridge = require('../services/withdrawalBridgeService'); // r18 durable orphan-adoption claim
+const { bindOutboundSettlementEvidence } = require('../services/outboundSettlementEvidence'); // r20 P0 evidence binding
 
 const RECONCILE_INTERVAL_MS = 30_000;
 const STALE_AFTER_MS        = 30_000;
@@ -370,9 +371,18 @@ class WithdrawalReconciliationWorker {
                 direction: 'OUTBOUND',
                 status: remoteStatus,
                 providerRef,
+                // r20 P0: the provider-reported payout economics and the
+                // echoed business reference are durable evidence too. The
+                // semantics layer fails closed on a materially-different
+                // payload replaying under the same observation identity.
+                amountGhs: statusResp?.amountGhs ?? null,
                 dedupKey: `event:payout-outbound:${evidenceProvider}:${reference}:${remoteStatus}`,
                 relatedReference: reference,
-                raw: { source: 'provider_status_poll', reason: statusResp?.reason || null },
+                raw: {
+                    source: 'provider_status_poll',
+                    reason: statusResp?.reason || null,
+                    externalId: statusResp?.externalId ?? null,
+                },
             });
         } catch (evidenceErr) {
             logger.error({ err: evidenceErr, reference },
@@ -409,6 +419,44 @@ class WithdrawalReconciliationWorker {
             );
             logger.warn(`[WithdrawalReconciliation] ref=${reference} provider ${evidenceProvider} authoritatively reports the reference ABSENT — parked for operator review.`);
             return;
+        }
+
+        // r20 P0 — OUTBOUND SETTLEMENT EVIDENCE BINDING: the observation is
+        // durably recorded above, but a terminal provider answer may move
+        // customer money ONLY when it is bound to the EXACT canonical payout:
+        // known provider identity, durable-owner agreement, the echoed
+        // business reference, and the exact provider-reported payout amount
+        // versus the durable committed economics (reservation amountGhs /
+        // creation-time payoutGhs — never the current rate). Any
+        // contradiction parks the payout for operator review: no completion,
+        // no reversal/refund, no canonical state motion.
+        if (['SUCCESSFUL', 'COMPLETED', 'FAILED', 'REJECTED'].includes(remoteStatus)) {
+            const binding = await bindOutboundSettlementEvidence(this.prisma, {
+                reference,
+                provider: evidenceProvider,
+                externalId: statusResp?.externalId ?? null,
+                amountGhs: statusResp?.amountGhs ?? null,
+                status: remoteStatus,
+                source: 'provider_status_poll',
+                payoutOwner,
+            });
+            if (!binding.bound) {
+                await this._recordException(
+                    withdrawal,
+                    'SETTLEMENT_EVIDENCE_REJECTED',
+                    {
+                        reference,
+                        bindingReason: binding.reason,
+                        bindingDetails: binding.details || null,
+                        provider: evidenceProvider,
+                        observedStatus: remoteStatus,
+                    },
+                    reference
+                );
+                logger.error({ reference, reason: binding.reason, details: binding.details },
+                    '[WithdrawalReconciliation] terminal observation NOT bound to this payout — settlement refused, parked for operator review');
+                return;
+            }
         }
 
         await recordProviderSettlementAttempt(this.prisma, {

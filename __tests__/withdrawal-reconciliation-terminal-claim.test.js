@@ -104,11 +104,15 @@ describeOrSkip('withdrawal reconciliation terminal claim (real PostgreSQL)', () 
 
     test('concurrent SUCCESS polls produce exactly one terminal realtime/notification winner', async () => {
         const { user, tx, withdrawal } = await seed();
+        // r20 binding contract: a terminal poll must echo the queried
+        // business reference and carry the provider-reported payout amount.
         const provider = {
             getTransferStatus: jest.fn().mockResolvedValue({
                 status: 'SUCCESSFUL',
                 providerRef: 'MTN-SUCCESS-1',
-                provider: 'MTN_MOMO_DISBURSEMENT'
+                provider: 'MTN_MOMO_DISBURSEMENT',
+                externalId: tx.txHash,
+                amountGhs: '671.00'
             })
         };
         const ioA = makeIo();
@@ -141,12 +145,16 @@ describeOrSkip('withdrawal reconciliation terminal claim (real PostgreSQL)', () 
 
     test('concurrent FAILED polls produce exactly one refund notification with a defined refund amount', async () => {
         const { tx, withdrawal } = await seed({ amount: 50, fee: 1 });
+        // r20 binding contract: a terminal poll must echo the queried
+        // business reference and carry the provider-reported payout amount.
         const provider = {
             getTransferStatus: jest.fn().mockResolvedValue({
                 status: 'FAILED',
                 providerRef: 'MTN-FAILED-1',
                 provider: 'MTN_MOMO_DISBURSEMENT',
-                reason: 'INVALID_MSISDN'
+                reason: 'INVALID_MSISDN',
+                externalId: tx.txHash,
+                amountGhs: '671.00'
             })
         };
         const ioA = makeIo();

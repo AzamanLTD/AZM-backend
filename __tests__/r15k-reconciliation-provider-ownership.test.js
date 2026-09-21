@@ -262,7 +262,7 @@ describeOrSkip('r15 follow-up P0: payout provider ownership end-to-end (real Pos
         // ── RECONCILIATION ── fresh spies: moolre must NEVER be asked.
         axiosPostSpy.mockClear();
         axiosGetSpy.mockClear();
-        mockMtnStatus('SUCCESSFUL', { externalId: reference });
+        mockMtnStatus('SUCCESSFUL', { externalId: reference, amount: '671.00' });
 
         const recon = new WithdrawalReconciliationWorker(prisma, null, failover);
         await recon._reconcileOne(await loadWithdrawal(withdrawal.id));
@@ -280,7 +280,7 @@ describeOrSkip('r15 follow-up P0: payout provider ownership end-to-end (real Pos
 
         // Re-reconcile: idempotent, no duplicate settlement effects.
         axiosGetSpy.mockClear();
-        mockMtnStatus('SUCCESSFUL', { externalId: reference });
+        mockMtnStatus('SUCCESSFUL', { externalId: reference, amount: '671.00' });
         await recon._reconcileOne(await loadWithdrawal(withdrawal.id));
         const attempts = await prisma.$queryRawUnsafe(
             'SELECT COUNT(*)::int AS n FROM "ProviderSettlementAttempt" WHERE "providerReference" = $1 AND "status" = $2',
@@ -334,7 +334,7 @@ describeOrSkip('r15 follow-up P0: payout provider ownership end-to-end (real Pos
 
         // Owner recovers → the SAME payout resolves on the next tick.
         axiosGetSpy.mockClear();
-        mockMtnStatus('SUCCESSFUL', { externalId: reference });
+        mockMtnStatus('SUCCESSFUL', { externalId: reference, amount: '671.00' });
         await recon._reconcileOne(await loadWithdrawal(withdrawal.id));
         const wFinal = await prisma.withdrawal.findUnique({ where: { id: withdrawal.id } });
         expect(wFinal.status).toBe('COMPLETED');
@@ -353,7 +353,7 @@ describeOrSkip('r15 follow-up P0: payout provider ownership end-to-end (real Pos
             return { data: { status: 0, code: 'RD01', message: 'Reference not found', data: null } };
         });
         mockMtnToken();
-        mockMtnStatus('SUCCESSFUL', { externalId: reference });
+        mockMtnStatus('SUCCESSFUL', { externalId: reference, amount: '671.00' });
 
         const recon = new WithdrawalReconciliationWorker(prisma, null, failover);
         await recon._reconcileOne(await loadWithdrawal(withdrawal.id));
@@ -431,7 +431,7 @@ describeOrSkip('r15 follow-up P0: payout provider ownership end-to-end (real Pos
         axiosGetSpy.mockClear();
         axiosPostSpy.mockImplementationOnce(async (url) => {
             if (url !== `${MOOLRE_BASE}/open/transact/status`) throw new Error(`r15k: unexpected POST ${url}`);
-            return { data: { status: 1, code: 'SS01', message: 'Transaction Successful', data: { txstatus: 1, transactionid: 'MOOL-888', externalref: reference } } };
+            return { data: { status: 1, code: 'SS01', message: 'Transaction Successful', data: { txstatus: 1, transactionid: 'MOOL-888', externalref: reference, amount: '671.00' } } };
         });
 
         const recon = new WithdrawalReconciliationWorker(prisma, null, failover);

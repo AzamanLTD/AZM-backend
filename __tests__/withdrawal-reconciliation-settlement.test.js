@@ -69,12 +69,16 @@ describe('WithdrawalReconciliationWorker settlement lifecycle', () => {
           type: 'WITHDRAWAL_FIAT',
           amountUsdc: 100,
           status: 'PENDING',
+          metadata: { payoutGhs: 1500 }, // r20: creation-time GHS economics
         }),
         findMany: jest.fn(),
         updateMany: jest.fn().mockResolvedValue({ count: 1 }),
       },
       fiatProviderEvent: {
         findMany: jest.fn().mockResolvedValue([]),
+      },
+      fiatLiquidityReservation: {
+        findUnique: jest.fn().mockResolvedValue(null),
       },
       withdrawal: {
         updateMany: jest.fn().mockResolvedValue({ count: 1 }),
@@ -83,7 +87,15 @@ describe('WithdrawalReconciliationWorker settlement lifecycle', () => {
     const io = { to: jest.fn().mockReturnThis(), emit: jest.fn() };
     const provider = {
       getTransferStatus: jest.fn().mockResolvedValue({
+        // r20: REAL adapter contract shape — provider identity, the echoed
+        // queried reference, and the provider-reported payout amount.
+        provider: 'MOOLRE_DISBURSEMENT',
+        referenceId: 'ref-1',
+        externalId: 'ref-1',
         status: 'SUCCESSFUL',
+        amountGhs: 1500,
+        reason: null,
+        source: 'MOCK',
         providerRef: 'provider-123',
       }),
     };
@@ -127,12 +139,16 @@ describe('WithdrawalReconciliationWorker settlement lifecycle', () => {
           type: 'WITHDRAWAL_FIAT',
           amountUsdc: 100,
           status: 'PENDING',
+          metadata: { payoutGhs: 1500 }, // r20: creation-time GHS economics
         }),
         findMany: jest.fn(),
         updateMany: jest.fn().mockResolvedValue({ count: 1 }),
       },
       fiatProviderEvent: {
         findMany: jest.fn().mockResolvedValue([]),
+      },
+      fiatLiquidityReservation: {
+        findUnique: jest.fn().mockResolvedValue(null),
       },
       withdrawal: {
         updateMany: jest.fn().mockResolvedValue({ count: 1 }),
@@ -141,9 +157,15 @@ describe('WithdrawalReconciliationWorker settlement lifecycle', () => {
     const io = { to: jest.fn().mockReturnThis(), emit: jest.fn() };
     const provider = {
       getTransferStatus: jest.fn().mockResolvedValue({
+        // r20: REAL adapter contract shape — echoes the QUERIED reference
+        provider: 'MOOLRE_DISBURSEMENT',
+        referenceId: 'ref-2',
+        externalId: 'ref-2',
         status: 'FAILED',
-        providerRef: 'provider-456',
+        amountGhs: 1500,
         reason: 'recipient rejected',
+        source: 'MOCK',
+        providerRef: 'provider-456',
       }),
     };
     financeService.reverseFiatWithdrawal.mockResolvedValue({

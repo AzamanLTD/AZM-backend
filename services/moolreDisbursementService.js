@@ -691,7 +691,13 @@ class MoolreDisbursementService {
         return Promise.resolve({
             provider:    PROVIDER_NAME,
             referenceId,
-            externalId:  entry.externalId,
+            // r20 P0: mirror the LIVE status contract. The initiation sends the
+            // canonical reference as `externalref` (the strict idempotency
+            // key), so the live status answer's data.externalref echoes the
+            // QUERIED REFERENCE — not the initiation-time narration id
+            // (entry.externalId, e.g. AZAMAN_<user>_<ts>). The old mock echoed
+            // the narration id, which no live status response returns.
+            externalId:  entry.referenceId,
             status:      entry.status,
             amountGhs:   entry.amountGhs,
             reason:      null,

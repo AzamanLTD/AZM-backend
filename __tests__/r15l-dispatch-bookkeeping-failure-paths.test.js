@@ -241,10 +241,10 @@ describeOrSkip('r15 hardening A–F: dispatch-acceptance bookkeeping failure pat
         });
     }
 
-    function mockMoolreStatus(txstatus, transactionid = 'MOOL-888') {
+    function mockMoolreStatus(txstatus, transactionid = 'MOOL-888', externalref = null, amount = '671.00') {
         axiosPostSpy.mockImplementationOnce(async (url) => {
             if (url !== `${MOOLRE_BASE}/open/transact/status`) throw new Error(`r15l: unexpected POST ${url}`);
-            return { data: { status: 1, code: 'SS01', message: 'Transaction Successful', data: { txstatus, transactionid, externalref: 'R15L-EXT' } } };
+            return { data: { status: 1, code: 'SS01', message: 'Transaction Successful', data: { txstatus, transactionid, externalref, amount } } };
         });
     }
 
@@ -292,7 +292,7 @@ describeOrSkip('r15 hardening A–F: dispatch-acceptance bookkeeping failure pat
         // ── RECONCILIATION: owner recovered from evidence → moolre ONLY. ──
         axiosPostSpy.mockClear();
         axiosGetSpy.mockClear();
-        mockMoolreStatus(1); // txstatus 1 = success
+        mockMoolreStatus(1, 'MOOL-888', 'R15L-A-OWNERSHIP-FAIL-MOOLRE'); // txstatus 1 = success
 
         const recon = new WithdrawalReconciliationWorker(prisma, null, failover);
         await recon._reconcileOne(await loadWithdrawal(withdrawal.id));
@@ -309,7 +309,7 @@ describeOrSkip('r15 hardening A–F: dispatch-acceptance bookkeeping failure pat
 
         // Idempotent: a second reconcile changes nothing.
         axiosPostSpy.mockClear();
-        mockMoolreStatus(1);
+        mockMoolreStatus(1, 'MOOL-888', 'R15L-B-OWNERSHIP-FAIL-MTN');
         await recon._reconcileOne(await loadWithdrawal(withdrawal.id));
         const attempts = await prisma.$queryRawUnsafe(
             'SELECT COUNT(*)::int AS n FROM "ProviderSettlementAttempt" WHERE "providerReference" = $1 AND "status" = $2',
@@ -345,7 +345,7 @@ describeOrSkip('r15 hardening A–F: dispatch-acceptance bookkeeping failure pat
         // ── RECONCILIATION: owner recovered from evidence → mtn ONLY. ──
         axiosPostSpy.mockClear();
         axiosGetSpy.mockClear();
-        mockMtnStatus('SUCCESSFUL', { externalId: reference });
+        mockMtnStatus('SUCCESSFUL', { externalId: reference, amount: '671.00' });
 
         const recon = new WithdrawalReconciliationWorker(prisma, null, failover);
         await recon._reconcileOne(await loadWithdrawal(withdrawal.id));
@@ -364,7 +364,7 @@ describeOrSkip('r15 hardening A–F: dispatch-acceptance bookkeeping failure pat
 
         // Settled exactly once.
         mockMtnToken();
-        mockMtnStatus('SUCCESSFUL', { externalId: reference });
+        mockMtnStatus('SUCCESSFUL', { externalId: reference, amount: '671.00' });
         await recon._reconcileOne(await loadWithdrawal(withdrawal.id));
         const attempts = await prisma.$queryRawUnsafe(
             'SELECT COUNT(*)::int AS n FROM "ProviderSettlementAttempt" WHERE "providerReference" = $1 AND "status" = $2',
@@ -699,10 +699,10 @@ describeOrSkip('r15 hardening G–I: controller path — tracked, fail-closed, r
         };
     }
 
-    function mockMoolreStatus(txstatus, transactionid = 'MOOL-888') {
+    function mockMoolreStatus(txstatus, transactionid = 'MOOL-888', externalref = null, amount = '671.00') {
         axiosPostSpy.mockImplementationOnce(async (url) => {
             if (url !== `${MOOLRE_BASE}/open/transact/status`) throw new Error(`r15l: unexpected POST ${url}`);
-            return { data: { status: 1, code: 'SS01', message: 'Transaction Successful', data: { txstatus, transactionid, externalref: 'R15L-EXT' } } };
+            return { data: { status: 1, code: 'SS01', message: 'Transaction Successful', data: { txstatus, transactionid, externalref, amount } } };
         });
     }
 
@@ -761,7 +761,7 @@ describeOrSkip('r15 hardening G–I: controller path — tracked, fail-closed, r
         expect(exc.map(e => e.reason)).toContain('POST_DISPATCH_OWNERSHIP_WRITE_FAILED');
 
         // ── Reconciliation recovers the owner FROM EVIDENCE: moolre only. ──
-        mockMoolreStatus(1); // txstatus 1 = success
+        mockMoolreStatus(1, 'MOOL-888', txRow.txHash); // txstatus 1 = success
         const recon = new WithdrawalReconciliationWorker(prisma, null, failover);
         await recon._reconcileOne(await loadWithdrawal(wRow.id));
 
@@ -775,7 +775,7 @@ describeOrSkip('r15 hardening G–I: controller path — tracked, fail-closed, r
         expect(wAfter.status).toBe('COMPLETED');
 
         // Settled EXACTLY once.
-        mockMoolreStatus(1);
+        mockMoolreStatus(1, 'MOOL-888', txRow.txHash);
         await recon._reconcileOne(await loadWithdrawal(wRow.id));
         const attempts = await prisma.$queryRawUnsafe(
             'SELECT COUNT(*)::int AS n FROM "ProviderSettlementAttempt" WHERE "providerReference" = $1 AND "status" = $2',
@@ -800,7 +800,7 @@ describeOrSkip('r15 hardening G–I: controller path — tracked, fail-closed, r
         expect(txRow.metadata.payoutProvider).toBe('moolre'); // ownership write succeeded
 
         // Provider async failure.
-        mockMoolreStatus(2); // txstatus 2 = failed
+        mockMoolreStatus(2, 'MOOL-888', txRow.txHash); // txstatus 2 = failed
         const recon = new WithdrawalReconciliationWorker(prisma, null, failover);
         await recon._reconcileOne(await loadWithdrawal(wRow.id));
 
@@ -813,7 +813,7 @@ describeOrSkip('r15 hardening G–I: controller path — tracked, fail-closed, r
         expect(wAfter.status).toBe('FAILED');
 
         // Re-reconcile: the reversal is idempotent — balance restored ONCE.
-        mockMoolreStatus(2);
+        mockMoolreStatus(2, 'MOOL-888', txRow.txHash);
         await recon._reconcileOne(await loadWithdrawal(wRow.id));
         const u2 = await freshUser(user.id);
         expect(Number(u2.availableBalance)).toBeCloseTo(START_USDC, 6);

@@ -145,7 +145,7 @@ describeOrSkip('payout provider unknown-outcome (real PostgreSQL)', () => {
         expect(await withdrawalStatus(withdrawal.id)).toBe('PROCESSING');
 
         // A. reconciliation settles the durable state to the final COMPLETED state
-        const getTransferStatus = jest.fn().mockResolvedValue({ status: 'SUCCESSFUL', providerRef: 'MTN-123' });
+        const getTransferStatus = jest.fn().mockResolvedValue({ provider: 'MTN_MOMO_DISBURSEMENT', status: 'SUCCESSFUL', providerRef: 'MTN-123', externalId: REF, amountGhs: 650, source: 'LIVE' });
         const recon = new WithdrawalReconciliationWorker(prisma, makeIo(), { getTransferStatus }, null, null);
         await recon._tick();
 
@@ -208,7 +208,7 @@ describeOrSkip('payout provider unknown-outcome (real PostgreSQL)', () => {
 
         // provider answers — the SAME durable state settles
         const upRecon = new WithdrawalReconciliationWorker(prisma, makeIo(), {
-            getTransferStatus: jest.fn().mockResolvedValue({ status: 'SUCCESSFUL', providerRef: 'MTN-456' })
+            getTransferStatus: jest.fn().mockResolvedValue({ provider: 'MTN_MOMO_DISBURSEMENT', status: 'SUCCESSFUL', providerRef: 'MTN-456', externalId: REF, amountGhs: 650, source: 'LIVE' })
         }, null, null);
         await upRecon._tick();
         expect(await withdrawalStatus(withdrawal.id)).toBe('COMPLETED');
