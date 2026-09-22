@@ -1214,6 +1214,44 @@ function _extractTransferUnits(hexData) {
     try { return BigInt('0x' + clean); } catch { return null; }
 }
 
+// ── r24 P1: realized network cost from receipt evidence only ──────────────────
+// The ONLY authority for the realized network cost of a reverted execution is
+// the chain receipt itself: gasUsed × gasPrice (MATIC wei, paid by the
+// hot-wallet operator). NEVER fabricated from the estimate; absent or
+// unparseable evidence leaves the recorded cost untouched (null). Deliberate
+// limit: a receipt without an explicit gasPrice records NOTHING — using an
+// EIP-1559 maxFeePerGas cap as if it were the price paid would be a
+// fabrication, not evidence.
+function _parseReceiptGasWei(value) {
+    if (value == null) return null;
+    const raw = String(value).trim();
+    if (raw === '') return null;
+    if (/^0x[0-9a-fA-F]+$/.test(raw)) {
+        try { const parsed = BigInt(raw); return parsed > 0n ? parsed : null; } catch { return null; }
+    }
+    if (/^[0-9]+$/.test(raw)) {
+        try { const parsed = BigInt(raw); return parsed > 0n ? parsed : null; } catch { return null; }
+    }
+    return null; // unparseable → no evidence
+}
+
+// The durable column is PostgreSQL BIGINT (signed 64-bit). A receipt whose
+// exact cost exceeds that range cannot be durably represented — recording a
+// clamped value would fabricate evidence, and letting the raw BigInt through
+// would throw at write time and BLOCK the quarantine transition itself. The
+// honest outcome is absence (null): the row still quarantines with its txHash,
+// and an operator can compute the exact cost from the receipt.
+const INT64_MAX = 2n ** 63n - 1n;
+
+function parseRealizedNetworkCostWei(receipt) {
+    if (!receipt || typeof receipt !== 'object') return null;
+    const gasUsed = _parseReceiptGasWei(receipt.gasUsed);
+    const gasPrice = _parseReceiptGasWei(receipt.gasPrice);
+    if (gasUsed == null || gasPrice == null) return null;
+    const wei = gasUsed * gasPrice; // exact BigInt — no floating point
+    return wei > INT64_MAX ? null : wei; // out of durable range → honest absence
+}
+
 /**
  * Given a REAL tx hash, independently verify the actual transfer semantics:
  * transaction exists, expected sender, expected recipient, expected token
@@ -1229,7 +1267,15 @@ async function verifyChainTransfer(provider, { txHash, fromAddress, toAddress, c
 
     const statusRaw = String(tx.status ?? tx.txStatus ?? 'unknown').toLowerCase();
     if (['0x0', 'failed', 'reverted', 'false'].includes(statusRaw)) {
-        return { verified: false, reason: ERROR_CLASSES.CHAIN_REVERTED, detail: 'Chain receipt shows the transaction failed/reverted.' };
+        // r24 P1: the receipt is the ONLY gas-cost authority — recorded with
+        // the revert evidence (or honestly absent when the receipt carries
+        // no parseable gasUsed × gasPrice).
+        const realizedNetworkCostBaseUnits = parseRealizedNetworkCostWei(tx);
+        return {
+            verified: false, reason: ERROR_CLASSES.CHAIN_REVERTED,
+            detail: 'Chain receipt shows the transaction failed/reverted.',
+            realizedNetworkCostBaseUnits: realizedNetworkCostBaseUnits,
+        };
     }
 
     const from = normalizeAddress(fromAddress);
@@ -1359,11 +1405,21 @@ async function advanceExecution(prisma, { executionId }, { provider = getProvide
             return settleExecution(prisma, { executionId, evidence: verification });
         }
         if (verification.reason === ERROR_CLASSES.CHAIN_REVERTED || verification.reason === ERROR_CLASSES.CHAIN_MISMATCH) {
-            await transitionExecution(prisma, executionId, [STATUSES.BROADCAST, STATUSES.CONFIRMING], {
+            // r24: the quarantine-with-cost is ONE atomic CAS. A racing
+            // advancer that loses the CAS converges on the winner's state —
+            // it reports changed:false, never a phantom second transition.
+            const moved = await transitionExecution(prisma, executionId, [STATUSES.BROADCAST, STATUSES.CONFIRMING], {
                 status: STATUSES.RECONCILIATION_REQUIRED,
                 errorClass: verification.reason,
                 errorMessage: redact(verification.detail),
+                // r24 P1: realized gas cost (wei) from the receipt evidence,
+                // recorded only when the receipt proves it — never fabricated.
+                ...(verification.realizedNetworkCostBaseUnits != null ? { realizedNetworkCostBaseUnits: verification.realizedNetworkCostBaseUnits } : {}),
             });
+            if (!moved) {
+                const current = await prisma.custodyExecution.findUnique({ where: { id: executionId }, select: { status: true } });
+                return { status: current?.status || STATUSES.RECONCILIATION_REQUIRED, changed: false, converged: true, reason: verification.reason };
+            }
             return { status: STATUSES.RECONCILIATION_REQUIRED, changed: true, reason: verification.reason };
         }
         return { status: execution.status, changed: false, pending: true, detail: verification.detail };
@@ -1403,11 +1459,21 @@ async function settleExecution(prisma, { executionId, evidence } = {}) {
         });
         if (!verification.verified) {
             if (verification.reason === ERROR_CLASSES.CHAIN_REVERTED || verification.reason === ERROR_CLASSES.CHAIN_MISMATCH) {
-                await transitionExecution(prisma, executionId, [STATUSES.BROADCAST, STATUSES.CONFIRMING], {
+                // r24: same atomic CAS semantics — a racing settle/advancer
+                // that loses converges on the winner's state (changed:false),
+                // never a phantom second quarantine transition.
+                const moved = await transitionExecution(prisma, executionId, [STATUSES.BROADCAST, STATUSES.CONFIRMING], {
                     status: STATUSES.RECONCILIATION_REQUIRED,
                     errorClass: verification.reason,
                     errorMessage: redact(`Settlement refused: ${verification.detail}`),
+                    // r24 P1: same receipt-evidence recording on the
+                    // settlement-authority's own verification path.
+                    ...(verification.realizedNetworkCostBaseUnits != null ? { realizedNetworkCostBaseUnits: verification.realizedNetworkCostBaseUnits } : {}),
                 });
+                if (!moved) {
+                    const current = await prisma.custodyExecution.findUnique({ where: { id: executionId }, select: { status: true } });
+                    return { settled: false, alreadySettled: false, status: current?.status || STATUSES.RECONCILIATION_REQUIRED, converged: true, reason: verification.reason };
+                }
                 return { settled: false, alreadySettled: false, status: STATUSES.RECONCILIATION_REQUIRED, reason: verification.reason };
             }
             return { settled: false, alreadySettled: false, status: execution.status, reason: 'CHAIN_EVIDENCE_NOT_VERIFIED', detail: verification.detail };
@@ -1744,6 +1810,7 @@ module.exports = {
     validateKmsPendingRequest,
     submitExecution,
     verifyChainTransfer,
+    parseRealizedNetworkCostWei,
     advanceExecution,
     settleExecution,
     failWithdrawalExecution,
