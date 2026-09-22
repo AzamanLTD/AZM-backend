@@ -207,9 +207,14 @@ const fundBookingEscrow = async (prisma, { escrowId, payerId, bookingType, booki
             _messagingChannelsService.notifyBookingConfirmed(res.businessProfileId, res.user.phoneNumber, res.id, res.reservationTime).catch(err => logger.error('[MessagingChannels] Error:', err));
         }
     } else if (bookingType === 'TRANSIT' && bookingId) {
-        const tb = await prisma.transitBooking.findUnique({ where: { id: bookingId }, include: { user: true, trip: true } });
-        if (tb?.status === 'CONFIRMED' && tb.user?.phoneNumber) {
-            _messagingChannelsService.notifyBookingConfirmed(tb.trip?.businessProfileId || tb.businessProfileId, tb.user.phoneNumber, tb.id, tb.trip?.scheduledDeparture || new Date()).catch(err => logger.error('[MessagingChannels] Error:', err));
+        // r27: TransitBooking has no `user` relation (it is `customer`) and
+        // TransitTrip has no `scheduledDeparture` (it is `departureAt`) — the
+        // old include threw PrismaClientValidationError AFTER the funding
+        // transaction had committed, 500ing the route with money already
+        // moved. Post-commit lookups must match the real schema.
+        const tb = await prisma.transitBooking.findUnique({ where: { id: bookingId }, include: { customer: true, trip: true } });
+        if (tb?.status === 'CONFIRMED' && tb.customer?.phoneNumber) {
+            _messagingChannelsService.notifyBookingConfirmed(tb.trip?.businessProfileId || tb.businessProfileId, tb.customer.phoneNumber, tb.id, tb.trip?.departureAt || tb.scheduledAt || new Date()).catch(err => logger.error('[MessagingChannels] Error:', err));
         }
     }
 
@@ -267,11 +272,17 @@ const releaseBookingEscrow = async (prisma, { escrowId }) => {
 };
 
 // 4. REFUND BOOKING ESCROW — Full refund to customer on cancellation.
-const refundBookingEscrow = async (prisma, { escrowId }) => {
-    const claimable = ['FUNDED', 'IN_PROGRESS', 'PENDING_SETTLEMENT'];
-    const reference = randomUUID();
+//
+// r27: the economic core is exposed as a transaction-aware primitive
+// (_refundBookingEscrowTx) so cancellation orchestrations can compose the
+// refund atomically with their own booking/state mutations. The public
+// refundBookingEscrow keeps its historical standalone contract (opens its own
+// transaction, same return shape).
+const REFUND_CLAIMABLE = ['FUNDED', 'IN_PROGRESS', 'PENDING_SETTLEMENT'];
 
-    const updated = await prisma.$transaction(async (tx) => {
+const _refundBookingEscrowTx = async (tx, { escrowId, reference }) => {
+    const claimable = REFUND_CLAIMABLE;
+
         const escrow = await tx.smartEscrow.findUnique({ where: { id: escrowId } });
         if (!escrow) throw new Error('Escrow not found.');
         const amount = Number(escrow.amountUsdc);
@@ -311,7 +322,11 @@ const refundBookingEscrow = async (prisma, { escrowId }) => {
             data: { userId: escrow.payerId, type: 'TICKET_ESCROW_REFUND', amountUsdc: amount, feeUsdc: 0, txHash: reference, status: 'COMPLETED' }
         });
         return await tx.smartEscrow.findUnique({ where: { id: escrowId } });
-    });
+};
+
+const refundBookingEscrow = async (prisma, { escrowId }) => {
+    const reference = randomUUID();
+    const updated = await prisma.$transaction((tx) => _refundBookingEscrowTx(tx, { escrowId, reference }));
     return { success: true, escrow: updated, reference };
 };
 
@@ -433,5 +448,6 @@ const processBusinessNoShow = async (prisma, {
 module.exports = {
     createBookingEscrow, fundBookingEscrow, releaseBookingEscrow,
     refundBookingEscrow, splitReleaseFundedEscrow, processBusinessNoShow,
+    _refundBookingEscrowTx, REFUND_CLAIMABLE,
     MAX_PENALTY_PCT, BOOKING_ESCROW_FEE_PCT
 };
