@@ -39,19 +39,22 @@ function getPrisma(req) {
 }
 
 // Helper: get business profile ID from auth user
-// Checks req.businessProfileId first — this is set by adminBusinessScope
-// middleware when an admin impersonates a business via x-admin-business-id header.
+// r26/P0-1 — AUTHORITATIVE context resolution for BOTH owners and ordinary
+// employees, shared with requirePermission (single implementation). Owner
+// resolves to their own business; an ACTIVE employee resolves through their
+// BusinessEmployee.businessProfileId; suspended/terminated employees and
+// unknown users resolve to NOTHING. Admin impersonation is honored only when
+// adminBusinessScope validated it (req.adminBusinessScope is set there ONLY
+// for a genuine ADMIN + a real business id).
+const { resolveBusinessContext } = require('../middleware/requirePermission');
 async function getBusinessProfileId(req) {
     if (!req.user?.id) throw new Error('Authentication required.');
-    // Admin impersonation: if adminBusinessScope set req.businessProfileId, use it
-    if (req.businessProfileId) return req.businessProfileId;
-    // Normal flow: look up the user's own business profile
     const prisma = getPrisma(req);
-    const bp = await prisma.businessProfile.findFirst({
-        where: { userId: req.user.id },
+    const context = await resolveBusinessContext(prisma, req.user, {
+        adminScoped: Boolean(req.adminBusinessScope),
+        adminScopedBusinessId: req.adminBusinessScope ? req.businessProfileId : null,
     });
-    if (!bp) return null;
-    return bp.id;
+    return context ? context.businessProfileId : null;
 }
 
 // Helper: instantiate all services with the request-scoped Prisma client
@@ -108,7 +111,25 @@ router.get('/employees/me', wrap(async (req, res) => {
         },
     });
     if (!employee) return res.json({ success: true, employee: null });
-    res.json({ success: true, employee });
+    // r26/P0-6 — the response carries the AUTHORITATIVE permission
+    // representation, not the raw stored strings:
+    //   • permissions           — the stored set, normalized into dotted-key
+    //                              space so legacy snake_case rows read the
+    //                              same way the resolver checks them;
+    //   • effectivePermissions  — the exact set requirePermission() enforces
+    //                              for this user/business (same resolver, so
+    //                              the portal's authorization state and the
+    //                              backend's can never disagree).
+    const { resolvePermissions } = require('../middleware/requirePermission');
+    const effectivePermissions = await resolvePermissions(prisma, req.user.id, employee.businessProfileId);
+    res.json({
+        success: true,
+        employee: {
+            ...employee,
+            permissions: effectivePermissions.includes('*') ? ['*'] : effectivePermissions,
+            effectivePermissions,
+        },
+    });
 }));
 
 // GET /api/business-os/employees/my-dashboard — full worker dashboard (aggregated)
@@ -323,7 +344,7 @@ router.post('/employees/time-off', wrap(async (req, res) => {
 // ═══════════════════════════════════════════════════════════════════════════
 
 // GET /api/business-os/employees
-router.get('/employees', wrap(async (req, res) => {
+router.get('/employees', requirePermission('employees.view'), wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
     const { role, status, search } = req.query;
@@ -336,13 +357,17 @@ router.post('/employees', requirePermission('employees.create'), wrap(async (req
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
     const { logBusinessAudit } = require('../utils/businessAudit');
-    const employee = await svc.employeeService.addEmployee({ ...req.body, businessProfileId: bpId });
+    // r26/P0-A — pass the authenticated actor context: the service enforces
+    // the creation delegation ceiling against the actor's EFFECTIVE set
+    // (server-derived; never req.body).
+    const creationActor = { id: req.user.id, permissions: req.resolvedPermissions || [] };
+    const employee = await svc.employeeService.addEmployee({ ...req.body, businessProfileId: bpId }, { actor: creationActor });
     await logBusinessAudit(svc.prisma, { businessProfileId: bpId, actorId: req.user.id, actorName: req.user.username, action: 'EMPLOYEE_CREATED', targetType: 'Employee', targetId: employee.id, metadata: { name: employee.fullName, email: employee.email, role: employee.role }, ipAddress: req.ip });
     res.status(201).json({ success: true, employee });
 }));
 
 // GET /api/business-os/employees/:id
-router.get('/employees/:id', wrap(async (req, res) => {
+router.get('/employees/:id', requirePermission('employees.view'), wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
     const employee = await svc.employeeService.getEmployee(req.params.id, bpId);
@@ -350,7 +375,7 @@ router.get('/employees/:id', wrap(async (req, res) => {
 }));
 
 // PATCH /api/business-os/employees/:id
-router.patch('/employees/:id', requirePermission('employees.manage'), wrap(async (req, res) => {
+router.patch('/employees/:id', requirePermission('employees.update'), wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
     const employee = await svc.employeeService.updateEmployee(req.params.id, bpId, req.body);
@@ -358,7 +383,7 @@ router.patch('/employees/:id', requirePermission('employees.manage'), wrap(async
 }));
 
 // DELETE /api/business-os/employees/:id
-router.delete('/employees/:id', requirePermission('employees.manage'), wrap(async (req, res) => {
+router.delete('/employees/:id', requirePermission('employees.terminate'), wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
     const { logBusinessAudit } = require('../utils/businessAudit');
@@ -367,12 +392,49 @@ router.delete('/employees/:id', requirePermission('employees.manage'), wrap(asyn
     res.status(200).json({ success: true });
 }));
 
+// PATCH /api/business-os/employees/:id/status — r26/P0-3
+// ACTIVE <-> SUSPENDED transitions are authority-bearing state changes, so
+// they live behind the TERMINATION authority on a DEDICATED route. They can
+// no longer be smuggled through the generic employees.update PATCH (the
+// service refuses status there), and TERMINATED itself remains on the
+// dedicated DELETE route.
+router.patch('/employees/:id/status', requirePermission('employees.terminate'), wrap(async (req, res) => {
+    const svc = getServices(req);
+    const bpId = await getBusinessProfileId(req);
+    const employee = await svc.employeeService.updateStatus(req.params.id, bpId, req.body.status);
+    const { logBusinessAudit } = require('../utils/businessAudit');
+    await logBusinessAudit(svc.prisma, { businessProfileId: bpId, actorId: req.user.id, actorName: req.user.username, action: 'EMPLOYEE_STATUS_CHANGED', targetType: 'Employee', targetId: req.params.id, metadata: { status: req.body.status }, ipAddress: req.ip });
+
+// PATCH /api/business-os/employees/:id/role — r26/P0-B (follow-up review)
+// Role changes are AUTHORITY-BEARING: they reseed the target's permission set
+// from the role template. They live behind the permission authority
+// (employees.permissions) on a DEDICATED route, with a service-enforced
+// delegation ceiling on the resulting template. The generic employees.update
+// PATCH refuses `role` outright — a role change can no longer ride an
+// ordinary profile update.
+router.patch('/employees/:id/role', requirePermission('employees.permissions'), wrap(async (req, res) => {
+    const svc = getServices(req);
+    const bpId = await getBusinessProfileId(req);
+    const { logBusinessAudit } = require('../utils/businessAudit');
+    const roleActor = { id: req.user.id, permissions: req.resolvedPermissions || [] };
+    const employee = await svc.employeeService.updateRole(req.params.id, bpId, req.body.role, { actor: roleActor });
+    await logBusinessAudit(svc.prisma, { businessProfileId: bpId, actorId: req.user.id, actorName: req.user.username, action: 'EMPLOYEE_ROLE_CHANGED', targetType: 'Employee', targetId: employee.id, metadata: { role: employee.role }, ipAddress: req.ip });
+    res.json({ success: true, employee });
+}));
+    res.status(200).json({ success: true, employee });
+}));
+
 // POST /api/business-os/employees/:id/permissions
 router.post('/employees/:id/permissions', requirePermission('employees.permissions'), wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
     const { logBusinessAudit } = require('../utils/businessAudit');
-    const employee = await svc.employeeService.updatePermissions(req.params.id, bpId, req.body.permissions);
+    // r26/P0-4: the DELEGATION CEILING needs the authenticated actor's
+    // effective permissions. requirePermission resolved them for THIS
+    // business (owners/admins hold ['*']); the actor context is derived from
+    // the server-side resolution — never from the request body.
+    const actor = { id: req.user.id, permissions: req.resolvedPermissions || [] };
+    const employee = await svc.employeeService.updatePermissions(req.params.id, bpId, req.body.permissions, { actor });
     await logBusinessAudit(svc.prisma, { businessProfileId: bpId, actorId: req.user.id, actorName: req.user.username, action: 'PERMISSION_CHANGED', targetType: 'Employee', targetId: req.params.id, metadata: { permissions: req.body.permissions }, ipAddress: req.ip });
     res.json({ success: true, employee });
 }));
@@ -382,7 +444,7 @@ router.post('/employees/:id/permissions', requirePermission('employees.permissio
 // ═══════════════════════════════════════════════════════════════════════════
 
 // GET /api/business-os/shifts
-router.get('/shifts', wrap(async (req, res) => {
+router.get('/shifts', requirePermission('shifts.view'), wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
     const shifts = await svc.shiftService.getShifts(bpId, req.query);
@@ -441,7 +503,7 @@ router.post('/shifts/:id/no-show', requirePermission('shifts.update'), wrap(asyn
 }));
 
 // GET /api/business-os/shifts/team/on-duty
-router.get('/shifts/team/on-duty', wrap(async (req, res) => {
+router.get('/shifts/team/on-duty', requirePermission('shifts.view'), wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
     const team = await svc.shiftService.getTeamOnDuty(bpId);
@@ -449,7 +511,7 @@ router.get('/shifts/team/on-duty', wrap(async (req, res) => {
 }));
 
 // GET /api/business-os/shifts/team/upcoming
-router.get('/shifts/team/upcoming', wrap(async (req, res) => {
+router.get('/shifts/team/upcoming', requirePermission('shifts.view'), wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
     const team = await svc.shiftService.getUpcomingTeam(bpId);
@@ -500,7 +562,7 @@ router.get('/shifts/swaps', wrap(async (req, res) => {
 // TIME OFF
 // ═══════════════════════════════════════════════════════════════════════════
 
-router.get('/time-off', wrap(async (req, res) => {
+router.get('/time-off', requirePermission('shifts.view'), wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
     const requests = await svc.timeOffService.getTimeOffRequests(bpId, req.query);
@@ -536,7 +598,7 @@ router.get('/time-off/my-requests', wrap(async (req, res) => {
 // PAYROLL
 // ═══════════════════════════════════════════════════════════════════════════
 
-router.get('/payroll', wrap(async (req, res) => {
+router.get('/payroll', requirePermission('payroll.view'), wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
     const records = await svc.payrollService.getPayrollRecords(bpId, req.query);
@@ -575,7 +637,7 @@ router.post('/payroll/disburse', requirePermission('payroll.disburse'), wrap(asy
     await _auditPay(svc.prisma, { businessProfileId: bpId, actorId: req.user.id, actorName: req.user.username, action: 'PAYROLL_DISBURSED', targetType: 'Payroll', targetId: null, metadata: { payrollId, period }, ipAddress: req.ip });
 }));
 
-router.get('/payroll/summary', wrap(async (req, res) => {
+router.get('/payroll/summary', requirePermission('payroll.view'), wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
     const summary = await svc.payrollService.getPayrollSummary(bpId, req.query.period);
@@ -624,7 +686,7 @@ router.get('/ewa/summary', requirePermission('ewa.manage'), wrap(async (req, res
 // BUSINESS LEDGER
 // ═══════════════════════════════════════════════════════════════════════════
 
-router.get('/ledger', wrap(async (req, res) => {
+router.get('/ledger', requirePermission('finance.view'), wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
     const result = await svc.ledgerService.getEntries(bpId, req.query);
@@ -645,28 +707,28 @@ router.delete('/ledger/:id', requirePermission('finance.ledger.manage'), wrap(as
     res.status(200).json({ success: true });
 }));
 
-router.get('/ledger/profit-loss', wrap(async (req, res) => {
+router.get('/ledger/profit-loss', requirePermission('finance.view'), wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
     const pl = await svc.ledgerService.getProfitLoss(bpId, req.query);
     res.json({ success: true, pl });
 }));
 
-router.get('/ledger/cash-flow', wrap(async (req, res) => {
+router.get('/ledger/cash-flow', requirePermission('finance.view'), wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
     const cf = await svc.ledgerService.getCashFlow(bpId, req.query);
     res.json({ success: true, cf });
 }));
 
-router.get('/ledger/expenses', wrap(async (req, res) => {
+router.get('/ledger/expenses', requirePermission('finance.view'), wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
     const expenses = await svc.ledgerService.getExpenseBreakdown(bpId, req.query);
     res.json({ success: true, expenses });
 }));
 
-router.get('/ledger/dashboard', wrap(async (req, res) => {
+router.get('/ledger/dashboard', requirePermission('finance.view'), wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
     const stats = await svc.ledgerService.getDashboardStats(bpId);
@@ -677,28 +739,28 @@ router.get('/ledger/dashboard', wrap(async (req, res) => {
 // HOTEL OPS
 // ═══════════════════════════════════════════════════════════════════════════
 
-router.get('/hotel/rooms', wrap(async (req, res) => {
+router.get('/hotel/rooms', requirePermission('hotel.rooms.view'), wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
     const rooms = await svc.hotelOpsService.getRooms(bpId, req.query);
     res.json({ success: true, rooms });
 }));
 
-router.post('/hotel/rooms', wrap(async (req, res) => {
+router.post('/hotel/rooms', requirePermission('hotel.rooms.manage'), wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
     const room = await svc.hotelOpsService.createRoom({ ...req.body, businessProfileId: bpId });
     res.status(201).json({ success: true, room });
 }));
 
-router.patch('/hotel/rooms/:id/status', wrap(async (req, res) => {
+router.patch('/hotel/rooms/:id/status', requirePermission('hotel.rooms.manage'), wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
     const room = await svc.hotelOpsService.updateRoomStatus(req.params.id, req.body.status, req.body.notes, bpId);
     res.json({ success: true, room });
 }));
 
-router.get('/hotel/room-rack', wrap(async (req, res) => {
+router.get('/hotel/room-rack', requirePermission('hotel.rooms.view'), wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
     const date = req.query.date || new Date().toISOString().split('T')[0];
@@ -707,35 +769,35 @@ router.get('/hotel/room-rack', wrap(async (req, res) => {
 }));
 
 // Housekeeping
-router.get('/hotel/housekeeping', wrap(async (req, res) => {
+router.get('/hotel/housekeeping', requirePermission('hotel.housekeeping.manage'), wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
     const board = await svc.hotelOpsService.getHousekeepingBoard(bpId);
     res.json({ success: true, board });
 }));
 
-router.post('/hotel/housekeeping/:id/assign', wrap(async (req, res) => {
+router.post('/hotel/housekeeping/:id/assign', requirePermission('hotel.housekeeping.manage'), wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
     const task = await svc.hotelOpsService.assignHousekeepingTask(req.params.id, req.body.employeeId, bpId);
     res.json({ success: true, task });
 }));
 
-router.patch('/hotel/housekeeping/:id/checklist', wrap(async (req, res) => {
+router.patch('/hotel/housekeeping/:id/checklist', requirePermission('hotel.housekeeping.manage'), wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
     const task = await svc.hotelOpsService.updateChecklist(req.params.id, req.body.itemIndex, req.body.done, bpId);
     res.json({ success: true, task });
 }));
 
-router.post('/hotel/housekeeping/:id/complete', wrap(async (req, res) => {
+router.post('/hotel/housekeeping/:id/complete', requirePermission('hotel.housekeeping.manage'), wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
     const task = await svc.hotelOpsService.completeHousekeeping(req.params.id, req.body, bpId);
     res.json({ success: true, task });
 }));
 
-router.post('/hotel/housekeeping/:id/inspect', wrap(async (req, res) => {
+router.post('/hotel/housekeeping/:id/inspect', requirePermission('hotel.housekeeping.inspect'), wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
     const task = await svc.hotelOpsService.inspectHousekeeping(req.params.id, req.body, bpId);
@@ -743,7 +805,7 @@ router.post('/hotel/housekeeping/:id/inspect', wrap(async (req, res) => {
 }));
 
 // Front Desk
-router.get('/hotel/front-desk', wrap(async (req, res) => {
+router.get('/hotel/front-desk', requirePermission('hotel.front_desk.manage'), wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
     const overview = await svc.hotelOpsService.getFrontDeskOverview(bpId, req.query.date);
@@ -756,7 +818,7 @@ router.get('/hotel/front-desk', wrap(async (req, res) => {
 
 // KDS
 // ── Hotel: Rate Calendar ──────────────────────────────────────────────────────
-router.get('/hotel/rate-calendar', wrap(async (req, res) => {
+router.get('/hotel/rate-calendar', requirePermission('hotel.rates.manage'), wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
     const days = parseInt(req.query.days) || 14;
@@ -764,14 +826,14 @@ router.get('/hotel/rate-calendar', wrap(async (req, res) => {
     res.json({ data });
 }));
 
-router.post('/hotel/rate-calendar', wrap(async (req, res) => {
+router.post('/hotel/rate-calendar', requirePermission('hotel.rates.manage'), wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
     const override = await svc.hotelOpsService.upsertRateOverride(bpId, req.body);
     res.json({ data: override });
 }));
 
-router.delete('/hotel/rate-calendar/:id', wrap(async (req, res) => {
+router.delete('/hotel/rate-calendar/:id', requirePermission('hotel.rates.manage'), wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
     await svc.hotelOpsService.deleteRateOverride(req.params.id, bpId);
@@ -779,14 +841,14 @@ router.delete('/hotel/rate-calendar/:id', wrap(async (req, res) => {
 }));
 
 // ── Hotel: Room Block ─────────────────────────────────────────────────────────
-router.post('/hotel/rooms/:id/block', wrap(async (req, res) => {
+router.post('/hotel/rooms/:id/block', requirePermission('hotel.rooms.manage'), wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
     const block = await svc.hotelOpsService.blockRoom(req.params.id, req.body, bpId);
     res.json({ data: block });
 }));
 
-router.delete('/hotel/rooms/block/:blockId', wrap(async (req, res) => {
+router.delete('/hotel/rooms/block/:blockId', requirePermission('hotel.rooms.manage'), wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
     await svc.hotelOpsService.deleteRoomBlock(req.params.blockId, bpId);
@@ -794,7 +856,7 @@ router.delete('/hotel/rooms/block/:blockId', wrap(async (req, res) => {
 }));
 
 // ── Hotel: Room Update (full) ─────────────────────────────────────────────────
-router.patch('/hotel/rooms/:id', wrap(async (req, res) => {
+router.patch('/hotel/rooms/:id', requirePermission('hotel.rooms.manage'), wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
     const room = await svc.hotelOpsService.updateRoom(req.params.id, req.body, bpId);
@@ -802,7 +864,7 @@ router.patch('/hotel/rooms/:id', wrap(async (req, res) => {
 }));
 
 // ── Hotel: Bulk Room Creation ─────────────────────────────────────────────────
-router.post('/hotel/rooms/bulk', wrap(async (req, res) => {
+router.post('/hotel/rooms/bulk', requirePermission('hotel.rooms.manage'), wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
     const result = await svc.hotelOpsService.bulkCreateRooms(bpId, req.body);
@@ -810,7 +872,7 @@ router.post('/hotel/rooms/bulk', wrap(async (req, res) => {
 }));
 
 // ── Hotel: Walk-In Booking ────────────────────────────────────────────────────
-router.post('/hotel/front-desk/walk-in', wrap(async (req, res) => {
+router.post('/hotel/front-desk/walk-in', requirePermission('hotel.front_desk.manage'), wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
     const reservation = await svc.hotelOpsService.createWalkIn(bpId, req.body);
@@ -818,7 +880,7 @@ router.post('/hotel/front-desk/walk-in', wrap(async (req, res) => {
 }));
 
 // ── Hotel: Room Move ──────────────────────────────────────────────────────────
-router.post('/hotel/front-desk/:reservationId/move-room', wrap(async (req, res) => {
+router.post('/hotel/front-desk/:reservationId/move-room', requirePermission('hotel.front_desk.manage'), wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
     const result = await svc.hotelOpsService.moveRoom(req.params.reservationId, req.body, bpId);
@@ -827,7 +889,7 @@ router.post('/hotel/front-desk/:reservationId/move-room', wrap(async (req, res) 
 
 // ── Hotel: Create Housekeeping Task (manual) ──────────────────────────────────
 // GET /api/business-os/hotel/housekeeping/templates — list checklist templates
-router.get('/hotel/housekeeping/templates', wrap(async (req, res) => {
+router.get('/hotel/housekeeping/templates', requirePermission('hotel.housekeeping.manage'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
     const templates = await prisma.hotelHousekeepingTemplate.findMany({
@@ -846,7 +908,7 @@ router.get('/hotel/housekeeping/templates', wrap(async (req, res) => {
 }));
 
 // POST /api/business-os/hotel/housekeeping/templates — create or update a template
-router.post('/hotel/housekeeping/templates', wrap(async (req, res) => {
+router.post('/hotel/housekeeping/templates', requirePermission('hotel.housekeeping.manage'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
     const { taskType, name, checklistItems } = req.body;
@@ -864,7 +926,7 @@ router.post('/hotel/housekeeping/templates', wrap(async (req, res) => {
     res.status(201).json({ success: true, template });
 }));
 
-router.post('/hotel/housekeeping', wrap(async (req, res) => {
+router.post('/hotel/housekeeping', requirePermission('hotel.housekeeping.manage'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
     const { roomId, taskType, priority, notes, checklistItems } = req.body;
@@ -885,28 +947,28 @@ router.post('/hotel/housekeeping', wrap(async (req, res) => {
 }));
 
 
-router.get('/restaurant/kds', wrap(async (req, res) => {
+router.get('/restaurant/kds', requirePermission('restaurant.kitchen.view'), wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
     const board = await svc.restaurantOpsService.getKDSBoard(bpId, req.query);
     res.json({ success: true, board });
 }));
 
-router.post('/restaurant/kds', wrap(async (req, res) => {
+router.post('/restaurant/kds', requirePermission('restaurant.kitchen.manage'), wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
     const order = await svc.restaurantOpsService.createKitchenOrder({ ...req.body, businessProfileId: bpId });
     res.status(201).json({ success: true, order });
 }));
 
-router.patch('/restaurant/kds/:id/status', wrap(async (req, res) => {
+router.patch('/restaurant/kds/:id/status', requirePermission('restaurant.kitchen.manage'), wrap(async (req, res) => {
     const svc = getServices(req);
     const order = await svc.restaurantOpsService.updateOrderStatus(req.params.id, req.body.status);
     res.json({ success: true, order });
 }));
 
 // Bump (advance to next status): NEW → PREPARING → READY → SERVED
-router.post('/restaurant/kds/:id/bump', wrap(async (req, res) => {
+router.post('/restaurant/kds/:id/bump', requirePermission('restaurant.kitchen.manage'), wrap(async (req, res) => {
     const svc = getServices(req);
     const FLOW = ['NEW', 'PREPARING', 'READY', 'SERVED'];
     const order = await svc.prisma.kitchenOrder.findUnique({ where: { id: req.params.id } });
@@ -917,19 +979,19 @@ router.post('/restaurant/kds/:id/bump', wrap(async (req, res) => {
     res.json({ success: true, order: updated });
 }));
 
-router.patch('/restaurant/kds/:id/item-status', wrap(async (req, res) => {
+router.patch('/restaurant/kds/:id/item-status', requirePermission('restaurant.kitchen.manage'), wrap(async (req, res) => {
     const svc = getServices(req);
     const order = await svc.restaurantOpsService.updateItemStatus(req.params.id, req.body.itemIndex, req.body.status);
     res.json({ success: true, order });
 }));
 
-router.post('/restaurant/kds/:id/assign-chef', wrap(async (req, res) => {
+router.post('/restaurant/kds/:id/assign-chef', requirePermission('restaurant.kitchen.manage'), wrap(async (req, res) => {
     const svc = getServices(req);
     const order = await svc.restaurantOpsService.assignChef(req.params.id, req.body.employeeId);
     res.json({ success: true, order });
 }));
 
-router.get('/restaurant/kds/stats', wrap(async (req, res) => {
+router.get('/restaurant/kds/stats', requirePermission('restaurant.kitchen.view'), wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
     const stats = await svc.restaurantOpsService.getKDSStats(bpId, req.query);
@@ -937,7 +999,7 @@ router.get('/restaurant/kds/stats', wrap(async (req, res) => {
 }));
 
 // Tables
-router.get('/restaurant/tables', wrap(async (req, res) => {
+router.get('/restaurant/tables', requirePermission('restaurant.tables.manage'), wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
     const tables = await svc.restaurantOpsService.getTableFloor(bpId, req.query);
@@ -946,7 +1008,7 @@ router.get('/restaurant/tables', wrap(async (req, res) => {
 
 // PATCH /api/business-os/restaurant/tables/:id/status — update table status
 // Updates the active DineInTab status on the BusinessTable, or creates one if needed.
-router.patch('/restaurant/tables/:id/status', wrap(async (req, res) => {
+router.patch('/restaurant/tables/:id/status', requirePermission('restaurant.tables.manage'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
     const { status } = req.body;
@@ -1009,14 +1071,14 @@ router.patch('/restaurant/tables/:id/status', wrap(async (req, res) => {
 }));
 
 // Menu Engineering (86'd items)
-router.get('/restaurant/86ed-items', wrap(async (req, res) => {
+router.get('/restaurant/86ed-items', requirePermission('restaurant.menu.view'), wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
     const items = await svc.restaurantOpsService.get86edItems(bpId);
     res.json({ success: true, items });
 }));
 
-router.post('/restaurant/toggle-86', wrap(async (req, res) => {
+router.post('/restaurant/toggle-86', requirePermission('restaurant.menu.manage'), wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
     const product = await svc.restaurantOpsService.toggleItem86({ ...req.body, businessProfileId: bpId });
@@ -1026,7 +1088,7 @@ router.post('/restaurant/toggle-86', wrap(async (req, res) => {
 // ── Restaurant Waitlist (Module 04) ──────────────────────────────────────────
 
 // GET /api/business-os/restaurant/waitlist — list waitlist entries
-router.get('/restaurant/waitlist', wrap(async (req, res) => {
+router.get('/restaurant/waitlist', requirePermission('restaurant.tables.manage'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
     const entries = await prisma.restaurantWaitlistEntry.findMany({
@@ -1038,7 +1100,7 @@ router.get('/restaurant/waitlist', wrap(async (req, res) => {
 }));
 
 // POST /api/business-os/restaurant/waitlist — add to waitlist
-router.post('/restaurant/waitlist', wrap(async (req, res) => {
+router.post('/restaurant/waitlist', requirePermission('restaurant.tables.manage'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
     const { partyName, phone, partySize, quotedWaitMinutes, locationId } = req.body;
@@ -1050,7 +1112,7 @@ router.post('/restaurant/waitlist', wrap(async (req, res) => {
 }));
 
 // PATCH /api/business-os/restaurant/waitlist/:id — update waitlist entry
-router.patch('/restaurant/waitlist/:id', wrap(async (req, res) => {
+router.patch('/restaurant/waitlist/:id', requirePermission('restaurant.tables.manage'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
     const { status, tableId } = req.body;
@@ -1069,7 +1131,7 @@ router.patch('/restaurant/waitlist/:id', wrap(async (req, res) => {
 }));
 
 // DELETE /api/business-os/restaurant/waitlist/:id — remove from waitlist
-router.delete('/restaurant/waitlist/:id', wrap(async (req, res) => {
+router.delete('/restaurant/waitlist/:id', requirePermission('restaurant.tables.manage'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
     await prisma.restaurantWaitlistEntry.deleteMany({
@@ -1081,7 +1143,7 @@ router.delete('/restaurant/waitlist/:id', wrap(async (req, res) => {
 // ── Table metadata / floor plan (Module 04) ───────────────────────────────────
 
 // PATCH /api/business-os/restaurant/tables/:id/metadata — update table floor-plan metadata
-router.patch('/restaurant/tables/:id/metadata', wrap(async (req, res) => {
+router.patch('/restaurant/tables/:id/metadata', requirePermission('restaurant.tables.manage'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
     const { metadata } = req.body;
@@ -1099,7 +1161,7 @@ router.patch('/restaurant/tables/:id/metadata', wrap(async (req, res) => {
 // ── Catalog section reorder (Module 04) ───────────────────────────────────────
 
 // PATCH /api/business-os/restaurant/sections/reorder — reorder catalog sections
-router.patch('/restaurant/sections/reorder', wrap(async (req, res) => {
+router.patch('/restaurant/sections/reorder', requirePermission('restaurant.tables.manage'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
     const { orderedIds } = req.body;
@@ -1120,21 +1182,21 @@ router.patch('/restaurant/sections/reorder', wrap(async (req, res) => {
 // ═══════════════════════════════════════════════════════════════════════════
 
 // Driver Rostering
-router.get('/transit/drivers', wrap(async (req, res) => {
+router.get('/transit/drivers', requirePermission('transit.drivers.manage'), wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
     const roster = await svc.transitOpsService.getDriverRoster(bpId, req.query);
     res.json({ success: true, roster });
 }));
 
-router.post('/transit/drivers/assign', wrap(async (req, res) => {
+router.post('/transit/drivers/assign', requirePermission('transit.drivers.manage'), wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
     const assignment = await svc.transitOpsService.assignDriver({ ...req.body, businessProfileId: bpId });
     res.status(201).json({ success: true, assignment });
 }));
 
-router.patch('/transit/drivers/:id/status', wrap(async (req, res) => {
+router.patch('/transit/drivers/:id/status', requirePermission('transit.drivers.manage'), wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
     const assignment = await svc.transitOpsService.updateAssignmentStatus(req.params.id, req.body.status, bpId);
@@ -1148,35 +1210,35 @@ router.get('/transit/drivers/my-schedule', wrap(async (req, res) => {
 }));
 
 // Fleet Management
-router.get('/transit/fleet', wrap(async (req, res) => {
+router.get('/transit/fleet', requirePermission('transit.fleet.view'), wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
     const fleet = await svc.transitOpsService.getFleetOverview(bpId);
     res.json({ success: true, fleet });
 }));
 
-router.post('/transit/fleet', wrap(async (req, res) => {
+router.post('/transit/fleet', requirePermission('transit.fleet.manage'), wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
     const vehicle = await svc.transitOpsService.createVehicle({ ...req.body, businessProfileId: bpId });
     res.status(201).json({ success: true, vehicle });
 }));
 
-router.get('/transit/fleet/maintenance', wrap(async (req, res) => {
+router.get('/transit/fleet/maintenance', requirePermission('transit.maintenance.manage'), wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
     const records = await svc.transitOpsService.getMaintenanceRecords(bpId, req.query);
     res.json({ success: true, records });
 }));
 
-router.post('/transit/fleet/maintenance', wrap(async (req, res) => {
+router.post('/transit/fleet/maintenance', requirePermission('transit.maintenance.manage'), wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
     const record = await svc.transitOpsService.createMaintenanceRecord({ ...req.body, businessProfileId: bpId });
     res.status(201).json({ success: true, record });
 }));
 
-router.patch('/transit/fleet/maintenance/:id', wrap(async (req, res) => {
+router.patch('/transit/fleet/maintenance/:id', requirePermission('transit.maintenance.manage'), wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
     const record = await svc.transitOpsService.updateMaintenanceStatus(req.params.id, req.body, bpId);
@@ -1184,14 +1246,14 @@ router.patch('/transit/fleet/maintenance/:id', wrap(async (req, res) => {
 }));
 
 // Manifests
-router.get('/transit/manifests/:tripId', wrap(async (req, res) => {
+router.get('/transit/manifests/:tripId', requirePermission('transit.manifests.view'), wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
     const manifest = await svc.transitOpsService.getTripManifest(req.params.tripId, bpId);
     res.json({ success: true, manifest });
 }));
 
-router.get('/transit/manifests', wrap(async (req, res) => {
+router.get('/transit/manifests', requirePermission('transit.manifests.view'), wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
     const date = req.query.date || new Date().toISOString().split('T')[0];
@@ -1199,7 +1261,7 @@ router.get('/transit/manifests', wrap(async (req, res) => {
     res.json({ success: true, manifests });
 }));
 
-router.post('/transit/manifests/board', wrap(async (req, res) => {
+router.post('/transit/manifests/board', requirePermission('transit.manifests.manage'), wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
     const result = await svc.transitOpsService.boardPassenger(req.body.reservationId, bpId);
@@ -1210,27 +1272,27 @@ router.post('/transit/manifests/board', wrap(async (req, res) => {
 // EMPLOYEE FEEDBACK
 // ═══════════════════════════════════════════════════════════════════════════
 
-router.get('/feedback', wrap(async (req, res) => {
+router.get('/feedback', requirePermission('feedback.view'), wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
     const summary = await svc.feedbackService.getBusinessFeedbackSummary(bpId);
     res.json({ success: true, summary });
 }));
 
-router.post('/feedback', wrap(async (req, res) => {
+router.post('/feedback', requirePermission('feedback.give'), wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
     const feedback = await svc.feedbackService.createFeedback({ ...req.body, businessProfileId: bpId });
     res.status(201).json({ success: true, feedback });
 }));
 
-router.get('/feedback/for/:employeeId', wrap(async (req, res) => {
+router.get('/feedback/for/:employeeId', requirePermission('feedback.view'), wrap(async (req, res) => {
     const svc = getServices(req);
     const feedback = await svc.feedbackService.getFeedbackForEmployee(req.params.employeeId);
     res.json({ success: true, feedback });
 }));
 
-router.get('/feedback/by/:employeeId', wrap(async (req, res) => {
+router.get('/feedback/by/:employeeId', requirePermission('feedback.view'), wrap(async (req, res) => {
     const svc = getServices(req);
     const feedback = await svc.feedbackService.getFeedbackByEmployee(req.params.employeeId);
     res.json({ success: true, feedback });
@@ -1244,7 +1306,7 @@ router.get('/feedback/by/:employeeId', wrap(async (req, res) => {
 // ── TRANSIT: CARGO MANAGEMENT ─────────────────────────────────────────────────
 
 // GET /api/business-os/transit/cargo — list cargo for a trip
-router.get('/transit/cargo', protect, protectActive, wrap(async (req, res) => {
+router.get('/transit/cargo', requirePermission('transit.cargo.view'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
     const { tripId, status } = req.query;
@@ -1262,7 +1324,7 @@ router.get('/transit/cargo', protect, protectActive, wrap(async (req, res) => {
 }));
 
 // POST /api/business-os/transit/cargo — create cargo parcel
-router.post('/transit/cargo', protect, protectActive, wrap(async (req, res) => {
+router.post('/transit/cargo', requirePermission('transit.cargo.manage'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
     const {
@@ -1286,7 +1348,7 @@ router.post('/transit/cargo', protect, protectActive, wrap(async (req, res) => {
 }));
 
 // PATCH /api/business-os/transit/cargo/:id/status — update cargo status
-router.patch('/transit/cargo/:id/status', protect, protectActive, wrap(async (req, res) => {
+router.patch('/transit/cargo/:id/status', requirePermission('transit.cargo.manage'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
     const { status } = req.body;
@@ -1306,7 +1368,7 @@ router.patch('/transit/cargo/:id/status', protect, protectActive, wrap(async (re
 }));
 
 // DELETE /api/business-os/transit/cargo/:id — remove cargo parcel
-router.delete('/transit/cargo/:id', protect, protectActive, wrap(async (req, res) => {
+router.delete('/transit/cargo/:id', requirePermission('transit.cargo.manage'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
     const result = await prisma.cargoParcel.deleteMany({
@@ -1317,7 +1379,7 @@ router.delete('/transit/cargo/:id', protect, protectActive, wrap(async (req, res
 }));
 
 // POST /api/business-os/transit/irops/reassign — vehicle breakdown reassignment
-router.post('/transit/irops/reassign', protect, protectActive, wrap(async (req, res) => {
+router.post('/transit/irops/reassign', requirePermission('transit.trips.manage'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
     const { sourceTripId, targetVehicleId, reason } = req.body;
@@ -1383,7 +1445,7 @@ router.post('/transit/irops/reassign', protect, protectActive, wrap(async (req, 
 // ── MODULE 05: TRANSIT ROUTE TEMPLATES ────────────────────────────────────────
 
 // GET /api/business-os/transit/routes — list route templates
-router.get('/transit/routes', protect, protectActive, wrap(async (req, res) => {
+router.get('/transit/routes', requirePermission('transit.trips.view'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
     const templates = await prisma.transitRouteTemplate.findMany({
@@ -1395,7 +1457,7 @@ router.get('/transit/routes', protect, protectActive, wrap(async (req, res) => {
 }));
 
 // POST /api/business-os/transit/routes — create route template
-router.post('/transit/routes', protect, protectActive, wrap(async (req, res) => {
+router.post('/transit/routes', requirePermission('transit.trips.manage'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
     const tpl = await prisma.transitRouteTemplate.create({
@@ -1417,7 +1479,7 @@ router.post('/transit/routes', protect, protectActive, wrap(async (req, res) => 
 }));
 
 // DELETE /api/business-os/transit/routes/:id — delete route template
-router.delete('/transit/routes/:id', protect, protectActive, wrap(async (req, res) => {
+router.delete('/transit/routes/:id', requirePermission('transit.trips.manage'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
     const tpl = await prisma.transitRouteTemplate.findFirst({
@@ -1429,7 +1491,7 @@ router.delete('/transit/routes/:id', protect, protectActive, wrap(async (req, re
 }));
 
 // POST /api/business-os/transit/routes/generate-trips — generate trips from template
-router.post('/transit/routes/generate-trips', protect, protectActive, wrap(async (req, res) => {
+router.post('/transit/routes/generate-trips', requirePermission('transit.trips.manage'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
     const { templateId, startDate, daysAhead } = req.body;
@@ -1469,7 +1531,7 @@ router.post('/transit/routes/generate-trips', protect, protectActive, wrap(async
 }));
 
 // POST /api/business-os/transit/trips/:id/cancel — cancel trip with refund handling
-router.post('/transit/trips/:id/cancel', protect, protectActive, wrap(async (req, res) => {
+router.post('/transit/trips/:id/cancel', requirePermission('transit.trips.manage'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
     const trip = await prisma.transitTrip.findFirst({
@@ -1495,7 +1557,7 @@ router.post('/transit/trips/:id/cancel', protect, protectActive, wrap(async (req
 }));
 
 // GET /api/business-os/transit/maintenance/overdue — get vehicles with overdue maintenance
-router.get('/transit/maintenance/overdue', protect, protectActive, wrap(async (req, res) => {
+router.get('/transit/maintenance/overdue', requirePermission('transit.maintenance.manage'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
     const vehicles = await prisma.transitVehicle.findMany({
@@ -1510,7 +1572,7 @@ router.get('/transit/maintenance/overdue', protect, protectActive, wrap(async (r
 }));
 
 // PATCH /api/business-os/transit/cargo/:id/proof — attach proof of delivery
-router.patch('/transit/cargo/:id/proof', protect, protectActive, wrap(async (req, res) => {
+router.patch('/transit/cargo/:id/proof', requirePermission('transit.cargo.manage'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
     const cargo = await prisma.cargoParcel.findFirst({ where: { id: req.params.id, businessProfileId: bpId } });
@@ -1528,7 +1590,7 @@ router.patch('/transit/cargo/:id/proof', protect, protectActive, wrap(async (req
 
 
 // GET /api/business-os/restaurant/inventory — list inventory items
-router.get('/restaurant/inventory', protect, protectActive, wrap(async (req, res) => {
+router.get('/restaurant/inventory', requirePermission('restaurant.inventory.view'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
     const items = await prisma.inventoryItem.findMany({
@@ -1548,7 +1610,7 @@ router.get('/restaurant/inventory', protect, protectActive, wrap(async (req, res
 }));
 
 // POST /api/business-os/restaurant/inventory — create inventory item
-router.post('/restaurant/inventory', protect, protectActive, wrap(async (req, res) => {
+router.post('/restaurant/inventory', requirePermission('restaurant.inventory.manage'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
     const { name, unit, currentStock, minimumStock, costPerUnit, category, supplier } = req.body;
@@ -1570,7 +1632,7 @@ router.post('/restaurant/inventory', protect, protectActive, wrap(async (req, re
 }));
 
 // PATCH /api/business-os/restaurant/inventory/:id — update stock or details
-router.patch('/restaurant/inventory/:id', protect, protectActive, wrap(async (req, res) => {
+router.patch('/restaurant/inventory/:id', requirePermission('restaurant.inventory.manage'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
     const { currentStock, minimumStock, costPerUnit, category, supplier, adjustment } = req.body;
@@ -1592,7 +1654,7 @@ router.patch('/restaurant/inventory/:id', protect, protectActive, wrap(async (re
 }));
 
 // POST /api/business-os/restaurant/inventory/:id/restock — quick restock (writes ledger expense)
-router.post('/restaurant/inventory/:id/restock', protect, protectActive, wrap(async (req, res) => {
+router.post('/restaurant/inventory/:id/restock', requirePermission('restaurant.inventory.manage'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
     const { quantity, costPerUnit } = req.body;
@@ -1631,7 +1693,7 @@ router.post('/restaurant/inventory/:id/restock', protect, protectActive, wrap(as
 }));
 
 // GET /api/business-os/restaurant/recipes — get recipe costs per product
-router.get('/restaurant/recipes', protect, protectActive, wrap(async (req, res) => {
+router.get('/restaurant/recipes', requirePermission('restaurant.inventory.view'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
     const products = await prisma.businessProduct.findMany({
@@ -1652,7 +1714,7 @@ router.get('/restaurant/recipes', protect, protectActive, wrap(async (req, res) 
 }));
 
 // POST /api/business-os/restaurant/recipes/:productId/link — link ingredient to product
-router.post('/restaurant/recipes/:productId/link', protect, protectActive, wrap(async (req, res) => {
+router.post('/restaurant/recipes/:productId/link', requirePermission('restaurant.inventory.manage'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const { inventoryItemId, quantityRequired } = req.body;
     const link = await prisma.recipeIngredient.upsert({
@@ -1664,7 +1726,7 @@ router.post('/restaurant/recipes/:productId/link', protect, protectActive, wrap(
 }));
 
 // DELETE /api/business-os/restaurant/recipes/:productId/link/:itemId — remove link
-router.delete('/restaurant/recipes/:productId/link/:itemId', protect, protectActive, wrap(async (req, res) => {
+router.delete('/restaurant/recipes/:productId/link/:itemId', requirePermission('restaurant.inventory.manage'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     await prisma.recipeIngredient.deleteMany({
         where: { productId: req.params.productId, inventoryItemId: req.params.itemId },
@@ -1673,7 +1735,7 @@ router.delete('/restaurant/recipes/:productId/link/:itemId', protect, protectAct
 }));
 
 // POST /api/business-os/restaurant/inventory/deduct/:orderId — deduct inventory when order completes
-router.post('/restaurant/inventory/deduct/:orderId', protect, protectActive, wrap(async (req, res) => {
+router.post('/restaurant/inventory/deduct/:orderId', requirePermission('restaurant.inventory.manage'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
     const order = await prisma.businessOrder.findFirst({
@@ -1708,10 +1770,17 @@ router.post('/restaurant/inventory/deduct/:orderId', protect, protectActive, wra
 
 // GET /api/business-os/permission-templates — list all available templates + keys
 router.get('/permission-templates', wrap(async (req, res) => {
-    const { PERMISSION_KEYS, ALL_KEYS, ROLE_TEMPLATES } = require('../config/permissionTemplates');
+    const { PERMISSION_KEYS, ALL_KEYS, ROLE_TEMPLATES, EMPLOYEE_ROLE_TEMPLATES, ASSIGNABLE_EMPLOYEE_ROLES } = require('../config/permissionTemplates');
     res.json({
         success: true,
         templates: ROLE_TEMPLATES,
+        // r26/P0-B portal alignment — the backend-authoritative per-role
+        // default permission sets, so the UI can offer ONLY the roles the
+        // actor may actually assign (template within their ceiling). OWNER
+        // is excluded — it is never assignable to an employee row.
+        employeeTemplates: Object.fromEntries(
+            ASSIGNABLE_EMPLOYEE_ROLES.map((role) => [role, EMPLOYEE_ROLE_TEMPLATES[role].permissions]),
+        ),
         permissionKeys: PERMISSION_KEYS,
         allKeys: ALL_KEYS,
     });
@@ -1747,7 +1816,7 @@ router.post('/permission-templates', requirePermission('settings.manage'), wrap(
 // ── Audit Log ───────────────────────────────────────────────────────────────
 
 // GET /api/business-os/audit-log — paginated, filterable business audit log
-router.get('/audit-log', wrap(async (req, res) => {
+router.get('/audit-log', requirePermission('audit.view'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
     const { actorId, action, targetType, startDate, endDate, page = 1, limit = 50 } = req.query;
@@ -1802,7 +1871,7 @@ router.get('/audit-log', wrap(async (req, res) => {
 // ── Notification Preferences ─────────────────────────────────────────────────
 
 // GET /api/business-os/notification-preferences
-router.get('/notification-preferences', wrap(async (req, res) => {
+router.get('/notification-preferences', requirePermission('notifications.view'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
     const pref = await prisma.businessNotificationPreference.findUnique({
@@ -1841,7 +1910,7 @@ router.patch('/notification-preferences', requirePermission('settings.manage'), 
 // ── Location Hours Exceptions ───────────────────────────────────────────────
 
 // GET /api/business-os/locations/:locationId/hours-exceptions
-router.get('/locations/:locationId/hours-exceptions', wrap(async (req, res) => {
+router.get('/locations/:locationId/hours-exceptions', requirePermission('locations.manage'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
     // Verify the location belongs to this business
@@ -1928,7 +1997,7 @@ router.patch('/pause', requirePermission('settings.manage'), wrap(async (req, re
 // ── Tax Presets ──────────────────────────────────────────────────────────────
 
 // GET /api/business-os/tax-presets — list tax presets for the business
-router.get('/tax-presets', wrap(async (req, res) => {
+router.get('/tax-presets', requirePermission('settings.manage'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
     const presets = await prisma.businessTaxPreset.findMany({
@@ -2098,7 +2167,7 @@ router.post('/reservations/:id/respond-reschedule', requirePermission('reservati
 // ── Slot Preview ─────────────────────────────────────────────────────────────
 
 // GET /api/business-os/availability/slots-preview?days=7 — show available slots
-router.get('/availability/slots-preview', wrap(async (req, res) => {
+router.get('/availability/slots-preview', requirePermission('reservations.view'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
     const days = parseInt(req.query.days) || 7;
@@ -2242,7 +2311,7 @@ router.post('/orders/:id/refund', requirePermission('orders.refund'), wrap(async
 // ── Invoice Stats ────────────────────────────────────────────────────────────
 
 // GET /api/business-os/invoices/stats — invoice dashboard stats
-router.get('/invoices/stats', wrap(async (req, res) => {
+router.get('/invoices/stats', requirePermission('invoices.view'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
     if (!bpId) return res.json({ success: true, stats: { draft: 0, sent: 0, paid: 0, voided: 0, totalRevenueUsdc: '0' } });
@@ -2269,7 +2338,7 @@ router.get('/invoices/stats', wrap(async (req, res) => {
 // ── Recurring Invoice Endpoints (Phase 3) ────────────────────────────────────
 
 // GET /api/business-os/invoices/recurring — list recurring invoice templates
-router.get('/invoices/recurring', wrap(async (req, res) => {
+router.get('/invoices/recurring', requirePermission('invoices.view'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
     if (!bpId) return res.json({ success: true, invoices: [] });
@@ -2283,7 +2352,7 @@ router.get('/invoices/recurring', wrap(async (req, res) => {
 }));
 
 // POST /api/business-os/invoices/:id/enable-recurring — enable recurring on an invoice
-router.post('/invoices/:id/enable-recurring', wrap(async (req, res) => {
+router.post('/invoices/:id/enable-recurring', requirePermission('invoices.manage'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
     const { id } = req.params;
@@ -2312,7 +2381,7 @@ router.post('/invoices/:id/enable-recurring', wrap(async (req, res) => {
 }));
 
 // POST /api/business-os/invoices/:id/disable-recurring — disable recurring
-router.post('/invoices/:id/disable-recurring', wrap(async (req, res) => {
+router.post('/invoices/:id/disable-recurring', requirePermission('invoices.manage'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
     const { id } = req.params;
@@ -2325,10 +2394,10 @@ router.post('/invoices/:id/disable-recurring', wrap(async (req, res) => {
 }));
 
 // GET /api/business-os/invoices/:id/pdf — download invoice as PDF (Phase G.4)
-router.get('/invoices/:id/pdf', downloadInvoicePdf);
+router.get('/invoices/:id/pdf', requirePermission('invoices.view'), downloadInvoicePdf);
 
 // POST /api/business-os/invoices/process-recurring — auto-generate due recurring invoices
-router.post('/invoices/process-recurring', wrap(async (req, res) => {
+router.post('/invoices/process-recurring', requirePermission('invoices.manage'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
     const now = new Date();
@@ -2404,7 +2473,7 @@ router.post('/invoices/process-recurring', wrap(async (req, res) => {
 // ── Booking Dashboard ────────────────────────────────────────────────────────
 
 // GET /api/business-os/booking/dashboard — unified booking stats
-router.get('/booking/dashboard', wrap(async (req, res) => {
+router.get('/booking/dashboard', requirePermission('reservations.view'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
     if (!bpId) return res.json({ success: true, stats: { totalOrders: 0, pending: 0, confirmed: 0, completed: 0, cancelled: 0, revenueUsdc: '0' }, overbookingAllowed: false });
@@ -2430,7 +2499,7 @@ router.get('/booking/dashboard', wrap(async (req, res) => {
 }));
 
 // GET /api/business-os/dashboard/at-risk — aggregates urgent items across all verticals
-router.get('/dashboard/at-risk', wrap(async (req, res) => {
+router.get('/dashboard/at-risk', requirePermission('analytics.view'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
     if (!bpId) return res.json({ success: true, items: [] });
@@ -2605,7 +2674,7 @@ router.get('/dashboard/at-risk', wrap(async (req, res) => {
 }));
 
 // GET /api/business-os/dashboard/employee-stats — aggregated employee KPIs for the dashboard
-router.get('/dashboard/employee-stats', wrap(async (req, res) => {
+router.get('/dashboard/employee-stats', requirePermission('analytics.view'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
     if (!bpId) return res.json({ success: true, stats: { totalEmployees: 0, activeShifts: 0, pendingTimeOff: 0, monthlyPayroll: 0 } });
@@ -2686,7 +2755,7 @@ router.post('/kiosk/pin-auth', wrap(async (req, res) => {
 }));
 
 // GET /api/business-os/reservation-stats — reservation + order summary
-router.get('/reservation-stats', wrap(async (req, res) => {
+router.get('/reservation-stats', requirePermission('reservations.view'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
     if (!bpId) return res.json({ success: true, stats: { pendingRes: 0, confirmedRes: 0, checkedInRes: 0, todayCheckins: 0, activeOrders: 0, pendingOrders: 0 } });
@@ -2825,7 +2894,7 @@ router.post('/kiosk/clock-out', wrap(async (req, res) => {
 // POST /api/business-os/pos/order — unified POS order (CASH, AZM balance, SPLIT)
 // Replaces the old pos/cash-sale with support for all payment methods.
 // Server-side total re-derivation — never trusts client totals.
-router.post('/pos/order', protect, protectActive, wrap(async (req, res) => {
+router.post('/pos/order', requirePermission('orders.manage'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
     const {
@@ -2963,7 +3032,7 @@ router.post('/pos/order', protect, protectActive, wrap(async (req, res) => {
     });
 }));
 
-router.post('/pos/cash-sale', protect, protectActive, wrap(async (req, res) => {
+router.post('/pos/cash-sale', requirePermission('orders.manage'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
     const { items, locationId, tableId, customerId, subtotal, taxTotal, tipAmount, idempotencyKey, cashReceived } = req.body;
@@ -3050,7 +3119,7 @@ router.post('/pos/cash-sale', protect, protectActive, wrap(async (req, res) => {
 }));
 
 // POST /api/business-os/pos/cash-close-tab — close a dine-in tab with cash
-router.post('/pos/cash-close-tab', protect, protectActive, wrap(async (req, res) => {
+router.post('/pos/cash-close-tab', requirePermission('orders.manage'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
     const { tabId, cashReceived, tipAmount, idempotencyKey } = req.body;
@@ -3128,7 +3197,7 @@ router.post('/pos/cash-close-tab', protect, protectActive, wrap(async (req, res)
 
 // ── Phase 2: Employee PIN Management (Section 2.4) ──────────────────────────
 // POST /api/business-os/employees/:id/set-pin — set or update kiosk PIN
-router.post('/employees/:id/set-pin', protect, protectActive, requirePermission('employees.manage'), wrap(async (req, res) => {
+router.post('/employees/:id/set-pin', protect, protectActive, requirePermission('employees.update'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
     const { pinCode } = req.body;
@@ -3153,7 +3222,7 @@ router.post('/employees/:id/set-pin', protect, protectActive, requirePermission(
 }));
 
 // DELETE /api/business-os/employees/:id/pin — remove kiosk PIN
-router.delete('/employees/:id/pin', protect, protectActive, requirePermission('employees.manage'), wrap(async (req, res) => {
+router.delete('/employees/:id/pin', protect, protectActive, requirePermission('employees.update'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
 
@@ -3327,14 +3396,14 @@ router.post('/messages/:conversationId/send', wrap(async (req, res) => {
 
 // ── Ledger: dashboard stats ──────────────────────────────────────────────────
 // Alias that matches what FinanceV2 calls
-router.get('/finance/dashboard', wrap(async (req, res) => {
+router.get('/finance/dashboard', requirePermission('finance.view'), wrap(async (req, res) => {
     const bpId = req.businessProfileId;
     const stats = await svc.ledgerService.getDashboardStats(bpId);
     res.json({ data: stats });
 }));
 
 // ── Ledger: P&L with prior-period comparison ─────────────────────────────────
-router.get('/finance/pl', wrap(async (req, res) => {
+router.get('/finance/pl', requirePermission('finance.view'), wrap(async (req, res) => {
     const bpId = req.businessProfileId;
     const { startDate, endDate } = req.query;
     const [current, prior] = await Promise.all([
@@ -3350,21 +3419,21 @@ router.get('/finance/pl', wrap(async (req, res) => {
 }));
 
 // ── Ledger: cash flow ─────────────────────────────────────────────────────────
-router.get('/finance/cashflow', wrap(async (req, res) => {
+router.get('/finance/cashflow', requirePermission('finance.view'), wrap(async (req, res) => {
     const bpId = req.businessProfileId;
     const cf = await svc.ledgerService.getCashFlow(bpId, req.query);
     res.json({ data: cf });
 }));
 
 // ── Ledger: expense list ──────────────────────────────────────────────────────
-router.get('/finance/expenses', wrap(async (req, res) => {
+router.get('/finance/expenses', requirePermission('finance.view'), wrap(async (req, res) => {
     const bpId = req.businessProfileId;
     const exp = await svc.ledgerService.getExpenseBreakdown(bpId, req.query);
     res.json({ data: exp });
 }));
 
 // ── Escrow: held funds total ──────────────────────────────────────────────────
-router.get('/finance/escrow-held', wrap(async (req, res) => {
+router.get('/finance/escrow-held', requirePermission('finance.view'), wrap(async (req, res) => {
     const bpId = req.businessProfileId;
     // Sum all open escrow balances for this business
     const escrows = await svc.prisma.escrow.findMany({
@@ -3379,7 +3448,7 @@ router.get('/finance/escrow-held', wrap(async (req, res) => {
 }));
 
 // ── Recurring Expense Templates ────────────────────────────────────────────────
-router.get('/finance/recurring', wrap(async (req, res) => {
+router.get('/finance/recurring', requirePermission('finance.view'), wrap(async (req, res) => {
     const bpId = req.businessProfileId;
     const templates = await svc.prisma.recurringExpenseTemplate.findMany({
         where: { businessProfileId: bpId },
@@ -3418,7 +3487,7 @@ router.delete('/finance/recurring/:id', requirePermission('finance.ledger.manage
 }));
 
 // ── Payroll liability summary ─────────────────────────────────────────────────
-router.get('/finance/payroll-position', wrap(async (req, res) => {
+router.get('/finance/payroll-position', requirePermission('finance.view'), wrap(async (req, res) => {
     const bpId = req.businessProfileId;
     const [payrolls, ewaRequests] = await Promise.all([
         svc.prisma.payrollRecord.findMany({
@@ -3441,7 +3510,7 @@ router.get('/finance/payroll-position', wrap(async (req, res) => {
 // ═══════════════════════════════════════════════════════════════════════════════
 
 // ── Promotions CRUD ───────────────────────────────────────────────────────────
-router.get('/marketing/promotions', wrap(async (req, res) => {
+router.get('/marketing/promotions', requirePermission('marketing.view'), wrap(async (req, res) => {
     const bpId = req.businessProfileId;
     const promos = await svc.prisma.businessPromotion.findMany({
         where: { businessProfileId: bpId },
@@ -3506,7 +3575,7 @@ router.post('/marketing/reviews/:id/flag', requirePermission('marketing.publish'
 
 // ── Followers broadcast ────────────────────────────────────────────────────────
 // GET /api/business-os/marketing/broadcast/history — list past broadcasts
-router.get('/marketing/broadcast/history', wrap(async (req, res) => {
+router.get('/marketing/broadcast/history', requirePermission('marketing.view'), wrap(async (req, res) => {
     const bpId = req.businessProfileId;
     const page = parseInt(req.query.page) || 1;
     const limit = parseInt(req.query.limit) || 20;
@@ -3585,7 +3654,7 @@ router.post('/marketing/broadcast', requirePermission('marketing.publish'), wrap
 }));
 
 // ── Follower stats ─────────────────────────────────────────────────────────────
-router.get('/marketing/followers', wrap(async (req, res) => {
+router.get('/marketing/followers', requirePermission('marketing.view'), wrap(async (req, res) => {
     const bpId = req.businessProfileId;
     const [total, recent] = await Promise.all([
         svc.prisma.businessFollower.count({ where: { businessProfileId: bpId } }),
@@ -3595,7 +3664,7 @@ router.get('/marketing/followers', wrap(async (req, res) => {
 }));
 
 // ── Analytics: customer + operational ─────────────────────────────────────────
-router.get('/analytics/customer', wrap(async (req, res) => {
+router.get('/analytics/customer', requirePermission('analytics.view'), wrap(async (req, res) => {
     const bpId = req.businessProfileId;
     const { startDate, endDate } = req.query;
     const dateFilter = startDate && endDate ? { gte: new Date(startDate), lte: new Date(endDate) } : undefined;
@@ -3615,7 +3684,7 @@ router.get('/analytics/customer', wrap(async (req, res) => {
     res.json({ data: { totalOrders: orders.length, uniqueCustomers: Object.keys(customerMap).length, repeatRate, avgOrderValue, avgRating, reviewCount: reviews.length } });
 }));
 
-router.get('/analytics/operational', wrap(async (req, res) => {
+router.get('/analytics/operational', requirePermission('analytics.view'), wrap(async (req, res) => {
     const bpId = req.businessProfileId;
     const [kitchenOrders, housekeepingTasks, trips] = await Promise.all([
         svc.prisma.kitchenOrder.findMany({ where: { businessProfileId: bpId }, select: { sentAt: true, servedAt: true, status: true }, take: 500, orderBy: { sentAt: 'desc' } }),
@@ -3636,7 +3705,7 @@ router.get('/analytics/operational', wrap(async (req, res) => {
     res.json({ data: { avgKitchenMins: Math.round(avgKitchenMins), avgHousekeepingMins: Math.round(avgHkMins), onTimeTripRate: Math.round(onTimeRate), kitchenOrderCount: kitchenCompleted.length, housekeepingTaskCount: hkCompleted.length, tripCount: tripsWithDep.length } });
 }));
 
-router.get('/analytics/predictive', wrap(async (req, res) => {
+router.get('/analytics/predictive', requirePermission('analytics.view'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
     
@@ -3715,7 +3784,7 @@ router.get('/analytics/predictive', wrap(async (req, res) => {
 // POS OFFLINE SYNC (SECTION 2)
 // ═══════════════════════════════════════════════════════════════════════════════
 
-router.post('/sync-outbox', protect, protectActive, wrap(async (req, res) => {
+router.post('/sync-outbox', requirePermission('orders.manage'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
     const { actions } = req.body;
@@ -3792,27 +3861,11 @@ router.post('/sync-outbox', protect, protectActive, wrap(async (req, res) => {
     res.json({ success: true, results });
 }));
 
-router.post('/kiosk/clock-in', wrap(async (req, res) => {
-    // Unauthenticated endpoint for shared iPad
-    const prisma = getPrisma(req);
-    const { businessId, pinCode, type } = req.body; // type: 'CLOCK_IN' | 'CLOCK_OUT'
-    
-    if (!businessId || !pinCode) {
-        return res.status(400).json({ success: false, message: 'Business ID and PIN code required' });
-    }
-    
-    // Find employee by PIN
-    const employee = await prisma.businessEmployee.findFirst({
-        where: { businessProfileId: businessId, pinCode }
-    });
-    
-    if (!employee) {
-        return res.status(401).json({ success: false, message: 'Invalid PIN' });
-    }
-    
-    // In a full implementation, create a shift punch record here
-    res.json({ success: true, employee: { id: employee.id, name: employee.role }, message: `Successfully ${type === 'CLOCK_IN' ? 'clocked in' : 'clocked out'}` });
-}));
+// r26/P1: a dead duplicate registration of POST /kiosk/clock-in (a PIN-based
+// stub) was removed here — Express only ever dispatched the first
+// registration (the real PIN-auth handler above), so the stub was unreachable
+// route-level drift. The executable route-coverage inventory now rejects
+// duplicate/ambiguous registrations.
 
 // ═══════════════════════════════════════════════════════════════════════════
 // BUSINESS GROUPS — multi-brand / multi-location ownership stats
@@ -4155,7 +4208,7 @@ router.post('/finance/payout', requirePermission('settings.manage'), wrap(async 
 }));
 
 // PATCH /api/business-os/transit/vehicles/:id/status — update vehicle status
-router.patch('/transit/vehicles/:id/status', requirePermission('transit.manage'), wrap(async (req, res) => {
+router.patch('/transit/vehicles/:id/status', requirePermission('transit.fleet.manage'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = getBizProfileId(req);
     const { id } = req.params;
@@ -4179,7 +4232,7 @@ router.patch('/transit/vehicles/:id/status', requirePermission('transit.manage')
 }));
 
 // GET /api/business-os/transit/trips — list business transit trips
-router.get('/transit/trips', wrap(async (req, res) => {
+router.get('/transit/trips', requirePermission('transit.trips.view'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = getBizProfileId(req);
 
@@ -4201,7 +4254,7 @@ router.get('/transit/trips', wrap(async (req, res) => {
 // ── Suppliers ─────────────────────────────────────────────────────────────────
 
 // GET /api/business-os/retail/suppliers
-router.get('/retail/suppliers', wrap(async (req, res) => {
+router.get('/retail/suppliers', requirePermission('retail.view'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
     if (!bpId) return res.status(404).json({ success: false, message: 'No business profile found.' });
@@ -4214,7 +4267,7 @@ router.get('/retail/suppliers', wrap(async (req, res) => {
 }));
 
 // POST /api/business-os/retail/suppliers
-router.post('/retail/suppliers', wrap(async (req, res) => {
+router.post('/retail/suppliers', requirePermission('retail.manage'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
     if (!bpId) return res.status(404).json({ success: false, message: 'No business profile found.' });
@@ -4229,7 +4282,7 @@ router.post('/retail/suppliers', wrap(async (req, res) => {
 }));
 
 // PATCH /api/business-os/retail/suppliers/:id
-router.patch('/retail/suppliers/:id', wrap(async (req, res) => {
+router.patch('/retail/suppliers/:id', requirePermission('retail.manage'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
     const { id } = req.params;
@@ -4242,7 +4295,7 @@ router.patch('/retail/suppliers/:id', wrap(async (req, res) => {
 }));
 
 // DELETE /api/business-os/retail/suppliers/:id
-router.delete('/retail/suppliers/:id', wrap(async (req, res) => {
+router.delete('/retail/suppliers/:id', requirePermission('retail.manage'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
     const { id } = req.params;
@@ -4254,7 +4307,7 @@ router.delete('/retail/suppliers/:id', wrap(async (req, res) => {
 // ── Purchase Orders ──────────────────────────────────────────────────────────
 
 // GET /api/business-os/retail/purchase-orders
-router.get('/retail/purchase-orders', wrap(async (req, res) => {
+router.get('/retail/purchase-orders', requirePermission('retail.view'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
     if (!bpId) return res.status(404).json({ success: false, message: 'No business profile found.' });
@@ -4269,7 +4322,7 @@ router.get('/retail/purchase-orders', wrap(async (req, res) => {
 }));
 
 // POST /api/business-os/retail/purchase-orders
-router.post('/retail/purchase-orders', wrap(async (req, res) => {
+router.post('/retail/purchase-orders', requirePermission('retail.manage'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
     if (!bpId) return res.status(404).json({ success: false, message: 'No business profile found.' });
@@ -4312,7 +4365,7 @@ router.post('/retail/purchase-orders', wrap(async (req, res) => {
 }));
 
 // PATCH /api/business-os/retail/purchase-orders/:id (status update)
-router.patch('/retail/purchase-orders/:id', wrap(async (req, res) => {
+router.patch('/retail/purchase-orders/:id', requirePermission('retail.manage'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
     const { id } = req.params;
@@ -4353,7 +4406,7 @@ router.patch('/retail/purchase-orders/:id', wrap(async (req, res) => {
 // ── Stock Counts ─────────────────────────────────────────────────────────────
 
 // GET /api/business-os/retail/stock-counts
-router.get('/retail/stock-counts', wrap(async (req, res) => {
+router.get('/retail/stock-counts', requirePermission('retail.view'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
     if (!bpId) return res.status(404).json({ success: false, message: 'No business profile found.' });
@@ -4368,7 +4421,7 @@ router.get('/retail/stock-counts', wrap(async (req, res) => {
 }));
 
 // POST /api/business-os/retail/stock-counts — create a new count with all products
-router.post('/retail/stock-counts', wrap(async (req, res) => {
+router.post('/retail/stock-counts', requirePermission('retail.manage'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
     if (!bpId) return res.status(404).json({ success: false, message: 'No business profile found.' });
@@ -4405,7 +4458,7 @@ router.post('/retail/stock-counts', wrap(async (req, res) => {
 }));
 
 // PATCH /api/business-os/retail/stock-counts/:id/items/:itemId — record counted qty
-router.patch('/retail/stock-counts/:id/items/:itemId', wrap(async (req, res) => {
+router.patch('/retail/stock-counts/:id/items/:itemId', requirePermission('retail.manage'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
     const { id, itemId } = req.params;
@@ -4429,7 +4482,7 @@ router.patch('/retail/stock-counts/:id/items/:itemId', wrap(async (req, res) => 
 }));
 
 // POST /api/business-os/retail/stock-counts/:id/reconcile — apply adjustments to product stock
-router.post('/retail/stock-counts/:id/reconcile', wrap(async (req, res) => {
+router.post('/retail/stock-counts/:id/reconcile', requirePermission('retail.manage'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
     const { id } = req.params;
@@ -4462,7 +4515,7 @@ router.post('/retail/stock-counts/:id/reconcile', wrap(async (req, res) => {
 // ── Low Stock Alert ──────────────────────────────────────────────────────────
 
 // GET /api/business-os/retail/low-stock
-router.get('/retail/low-stock', wrap(async (req, res) => {
+router.get('/retail/low-stock', requirePermission('retail.view'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
     if (!bpId) return res.status(404).json({ success: false, message: 'No business profile found.' });
@@ -4483,7 +4536,7 @@ router.get('/retail/low-stock', wrap(async (req, res) => {
 // ── Product Barcode/SKU Update ────────────────────────────────────────────────
 
 // PATCH /api/business-os/retail/products/:id/barcode
-router.patch('/retail/products/:id/barcode', wrap(async (req, res) => {
+router.patch('/retail/products/:id/barcode', requirePermission('retail.manage'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
     const { id } = req.params;
@@ -4508,7 +4561,7 @@ router.patch('/retail/products/:id/barcode', wrap(async (req, res) => {
 
 // GET /api/business-os/retail/products/lookup?barcode=XXX or ?sku=XXX
 // Quick lookup product by barcode or SKU — used by barcode scanner
-router.get('/retail/products/lookup', wrap(async (req, res) => {
+router.get('/retail/products/lookup', requirePermission('orders.view'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
     const { barcode, sku } = req.query;

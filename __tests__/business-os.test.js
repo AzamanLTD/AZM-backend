@@ -99,6 +99,7 @@ async function setupFixtures() {
     const { EmployeeService } = require('../services/businessOS/employeeService');
     const employeeService = new EmployeeService(prisma);
 
+    const ownerActor = { id: businessOwner.id, permissions: ['*'] };
     testEmployee = await employeeService.addEmployee({
         businessProfileId: businessProfile.id,
         userId: empUser.id,
@@ -107,7 +108,7 @@ async function setupFixtures() {
         hourlyRate: 15.00,
         title: 'Head Housekeeper',
         department: 'Housekeeping',
-    });
+    }, { actor: ownerActor });
 
     secondEmployee = await employeeService.addEmployee({
         businessProfileId: businessProfile.id,
@@ -117,7 +118,7 @@ async function setupFixtures() {
         salaryAmount: 1200.00,
         title: 'Senior Driver',
         department: 'Transit',
-    });
+    }, { actor: ownerActor });
 
     // Create a hotel room
     testRoom = await prisma.hotelRoom.create({
@@ -258,24 +259,40 @@ describeIf('Business OS — Employee Management', () => {
         expect(emp.businessProfileId).toBeTruthy();
     });
 
-    test('should update employee status', async () => {
+    test('should update employee status via the dedicated termination authority path', async () => {
         const { EmployeeService } = require('../services/businessOS/employeeService');
         const svc = new EmployeeService(prisma);
 
-        const updated = await svc.updateEmployee(testEmployee.id, businessProfile.id, { status: 'SUSPENDED' });
+        // r26 hardening: the generic update path must refuse the `status`
+        // field — termination/suspension goes through employees.terminate.
+        await expect(
+            svc.updateEmployee(testEmployee.id, businessProfile.id, { status: 'SUSPENDED' })
+        ).rejects.toThrow(/termination authority/);
+
+        const updated = await svc.updateStatus(testEmployee.id, businessProfile.id, 'SUSPENDED');
         expect(updated.status).toBe('SUSPENDED');
 
         // Restore
-        await svc.updateEmployee(testEmployee.id, businessProfile.id, { status: 'ACTIVE' });
+        await svc.updateStatus(testEmployee.id, businessProfile.id, 'ACTIVE');
     });
 
-    test('should update employee permissions', async () => {
+    test('should update employee permissions via the dedicated permission authority path', async () => {
         const { EmployeeService } = require('../services/businessOS/employeeService');
         const svc = new EmployeeService(prisma);
 
-        const newPerms = ['manage_products', 'view_finance'];
-        const updated = await svc.updateEmployee(testEmployee.id, businessProfile.id, { permissions: newPerms });
-        expect(updated.permissions).toEqual(expect.arrayContaining(newPerms));
+        // r26 hardening: the generic update path must refuse the
+        // `permissions` field — that is the employees.permissions authority.
+        await expect(
+            svc.updateEmployee(testEmployee.id, businessProfile.id, { permissions: ['employees.create'] })
+        ).rejects.toThrow(/dedicated permission authority/);
+
+        const newPerms = ['shifts.view', 'view_finance'];
+        const updated = await svc.updatePermissions(testEmployee.id, businessProfile.id, newPerms, {
+            actor: { id: testEmployee.userId, permissions: ['*'] },
+        });
+        // Legacy strings normalize into dotted-key space on the way in
+        // ("view_finance" -> "finance.view"); canonical keys pass unchanged.
+        expect(updated.permissions).toEqual(expect.arrayContaining(['shifts.view', 'finance.view']));
     });
 
     test('should not add employee from another business', async () => {
@@ -299,7 +316,7 @@ describeIf('Business OS — Employee Management', () => {
                 businessProfileId: otherBp.id,
                 userId: testEmployee.userId,
                 role: 'STAFF',
-            })
+            }, { actor: { id: businessOwner.id, permissions: ['*'] } })
         ).rejects.toThrow();
 
         // Cleanup

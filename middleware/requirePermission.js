@@ -21,19 +21,89 @@
 // =============================================================================
 
 const logger = require('../src/config/logger');
-const { ROLE_TEMPLATES, ALL_KEYS } = require('../config/permissionTemplates');
+const { ROLE_TEMPLATES, EMPLOYEE_ROLE_TEMPLATES, normalizePermissions } = require('../config/permissionTemplates');
 const { runWithRequestContext } = require('../utils/requestContext');
 const { runWithBusinessRequestContext } = require('../src/lib/businessRequestContext');
 
 /**
+ * r26/P0-1 — AUTHORITATIVE BUSINESS CONTEXT RESOLUTION.
+ *
+ * The single source of truth for "which business is this user acting on?".
+ * Resolution order (the first hit wins, and every branch is derived from the
+ * USER's own durable relationships — never from a caller-supplied value):
+ *
+ *   1. ADMIN IMPERSONATION — only when adminBusinessScope already validated
+ *      the user as ADMIN and resolved a real business from the
+ *      x-admin-business-id header (req.adminBusinessScope is set ONLY there).
+ *      An ordinary user sending the header gets NOTHING from it.
+ *   2. OWNER — the user owns the BusinessProfile (bp.userId === user.id).
+ *   3. ACTIVE EMPLOYEE — the user has an ACTIVE BusinessEmployee row; the
+ *      employment's businessProfileId is the authoritative context. A
+ *      suspended/terminated employment resolves to NO context (no
+ *      permissions, no business access).
+ *
+ * An employee of business A therefore cannot manufacture a context for
+ * business B: their resolution is derived from their own employment row,
+ * and any caller-supplied businessProfileId from a non-admin is ignored.
+ * (Multiple simultaneous employments are structurally prevented by
+ * addEmployee's cross-business guard; if a legacy user somehow holds two
+ * ACTIVE rows the resolution is deterministic: ownership first, then the
+ * oldest employment — and requirePermission still enforces the permission
+ * key against THAT business only.)
+ *
+ * Returns { businessProfileId, isBusinessOwner, isEmployee } or null.
+ */
+async function resolveBusinessContext(prisma, user, { adminScopedBusinessId = null, adminScoped = false } = {}) {
+    if (!user?.id) return null;
+
+    // 1. Admin impersonation — the explicitly authorized, validated scope.
+    if (adminScoped && user.role === 'ADMIN' && adminScopedBusinessId) {
+        const business = await prisma.businessProfile.findFirst({
+            where: { id: adminScopedBusinessId },
+            select: { id: true, userId: true },
+        });
+        if (business) {
+            return { businessProfileId: business.id, isBusinessOwner: business.userId === user.id, isEmployee: false, isAdminImpersonation: true };
+        }
+        return null;
+    }
+
+    // 2. Owner — the user's own business.
+    const owned = await prisma.businessProfile.findFirst({
+        where: { userId: user.id },
+        select: { id: true, userId: true },
+    });
+    if (owned) {
+        return { businessProfileId: owned.id, isBusinessOwner: true, isEmployee: false, isAdminImpersonation: false };
+    }
+
+    // 3. Active employee — resolution through their own employment.
+    const employment = await prisma.businessEmployee.findFirst({
+        where: { userId: user.id, status: 'ACTIVE' },
+        orderBy: { hireDate: 'asc' },
+        select: { businessProfileId: true, businessProfile: { select: { id: true } } },
+    });
+    if (employment && employment.businessProfile) {
+        return { businessProfileId: employment.businessProfileId, isBusinessOwner: false, isEmployee: true, isAdminImpersonation: false };
+    }
+    return null;
+}
+
+/**
  * Resolve a user's effective permission set for a given business.
  * Returns an array of permission strings. ['*'] means all permissions.
+ *
+ * r26/P0-5 — CANONICAL REVOCATION MODEL (stored set is authoritative):
+ *   • The business OWNER holds ['*'] (authority derives from ownership).
+ *   • An employee's STORED permissions[] is the effective set — normalized
+ *     for legacy snake_case rows on read. It is seeded from the role
+ *     template at creation (and re-seeded on role change), but the resolver
+ *     NEVER silently re-adds template permissions after that: unchecking a
+ *     permission in the stored set is a real revocation.
+ *   • A row with permissions [] means explicitly NO permissions.
+ *   • Suspended/terminated employees hold nothing.
  */
 async function resolvePermissions(prisma, userId, businessProfileId) {
-    // Admin impersonation: if req.businessProfileId is set by adminBusinessScope,
-    // the user is an admin — they get all permissions.
-    // This is checked by the caller before invoking this function (see middleware below).
-
     // Check if user is the business owner
     const bp = await prisma.businessProfile.findFirst({
         where: { id: businessProfileId },
@@ -55,19 +125,14 @@ async function resolvePermissions(prisma, userId, businessProfileId) {
     // Suspended or terminated employees have no permissions
     if (employee.status === 'SUSPENDED' || employee.status === 'TERMINATED') return [];
 
-    // If they have '*' in their permissions, they have everything
+    // Wildcard held by the employee row itself
     if (employee.permissions.includes('*')) return ['*'];
 
-    // Resolve: merge template defaults with explicit overrides
-    const template = ROLE_TEMPLATES[employee.role];
-    const templatePerms = template ? template.permissions : [];
-    const explicitPerms = employee.permissions || [];
-
-    // Merge: template perms + any explicit perms that aren't already covered
-    // (explicit perms may add or override; for removal, the frontend stores
-    // only the final resolved set, so no need for subtraction logic here)
-    const merged = new Set([...templatePerms, ...explicitPerms]);
-    return Array.from(merged);
+    // The STORED set is authoritative (role templates are defaults, applied
+    // only at creation/role-change time by EmployeeService — never re-added
+    // here, so explicit removals actually revoke). Legacy snake_case strings
+    // are normalized into dotted-key space on read.
+    return normalizePermissions(employee.permissions || []);
 }
 
 /**
@@ -83,31 +148,25 @@ function requirePermission(key) {
 
             const prisma = req.app.get('prisma');
 
-            // Resolve business profile ID (same logic as getBusinessProfileId in routes)
-            let businessProfileId = req.businessProfileId; // admin impersonation
-            let businessProfile;
-            if (!businessProfileId) {
-                businessProfile = await prisma.businessProfile.findFirst({
-                    where: { userId: req.user.id },
-                    select: { id: true, userId: true },
-                });
-                if (!businessProfile) {
-                    return res.status(403).json({ success: false, message: 'No business profile found.' });
-                }
-                businessProfileId = businessProfile.id;
-            } else {
-                businessProfile = await prisma.businessProfile.findFirst({
-                    where: { id: businessProfileId },
-                    select: { userId: true },
-                });
-                if (!businessProfile) {
-                    return res.status(403).json({ success: false, message: 'Business profile not found.' });
-                }
+            // r26/P0-1 — AUTHORITATIVE context resolution for BOTH owners and
+            // ordinary employees. A caller-supplied businessProfileId is NEVER
+            // trusted here: req.businessProfileId is honored only when it was
+            // set by adminBusinessScope for a genuine ADMIN (req.adminBusinessScope),
+            // which is the documented, validated impersonation path.
+            const context = await resolveBusinessContext(prisma, req.user, {
+                adminScoped: Boolean(req.adminBusinessScope),
+                adminScopedBusinessId: req.adminBusinessScope ? req.businessProfileId : null,
+            });
+            if (!context) {
+                return res.status(403).json({ success: false, message: 'No business context found for this account.' });
             }
+            const businessProfileId = context.businessProfileId;
+            const businessProfile = { userId: context.isBusinessOwner ? req.user.id : null };
 
             // Make the effective business explicit for downstream controllers.
             // Controllers must never trust a caller-supplied businessProfileId.
             req.businessProfileId = businessProfileId;
+            req.businessContext = context;
 
             // Resource-level tenant guard for the legacy tax-preset PATCH route.
             // The route updates by bare id, so verify the target belongs to the
@@ -126,7 +185,7 @@ function requirePermission(key) {
                 businessProfileId,
                 user: req.user,
                 isAdmin: Boolean(req.businessProfileId && req.user.role === 'ADMIN'),
-                isBusinessOwner: businessProfile.userId === req.user.id,
+                isBusinessOwner: context.isBusinessOwner || businessProfile.userId === req.user.id,
             };
 
             // Payroll still consumes the legacy request context while the
@@ -137,12 +196,18 @@ function requirePermission(key) {
                 () => runWithBusinessRequestContext(requestContext, next),
             );
 
-            // Admin users (impersonating) get all permissions
-            if (req.adminBusinessScope && req.user.role === 'ADMIN') {
+            // r26 follow-up: downstream authority paths (addEmployee,
+            // updateRole, updatePermissions) derive the actor's effective
+            // permission set from req.resolvedPermissions — it is now set on
+            // EVERY branch, so a handler never has to guess whether the
+            // caller is an owner/admin.
+            if (context.isAdminImpersonation) {
+                req.resolvedPermissions = ['*'];
                 return runAuthorized();
             }
 
             const perms = await resolvePermissions(prisma, req.user.id, businessProfileId);
+            req.resolvedPermissions = perms;
 
             if (perms.includes('*')) {
                 return runAuthorized();
@@ -166,4 +231,4 @@ function requirePermission(key) {
     };
 }
 
-module.exports = { requirePermission, resolvePermissions };
+module.exports = { requirePermission, resolvePermissions, resolveBusinessContext };
