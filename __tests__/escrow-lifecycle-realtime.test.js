@@ -35,6 +35,10 @@ describe('escrowService fundEscrow realtime convergence', () => {
                 updateMany: jest.fn().mockResolvedValue({ count: 1 }),
             },
             smartEscrow: {
+                // r25: fundEscrow claims DRAFT→FUNDED via an exact-lifecycle
+                // updateMany CAS before reading the ledger surfaces.
+                updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+                findUnique: jest.fn().mockResolvedValue(updatedEscrow),
                 update: jest.fn().mockResolvedValue(updatedEscrow),
             },
             systemProfitFees: { upsert: jest.fn().mockResolvedValue({}), update: jest.fn().mockResolvedValue({}) },

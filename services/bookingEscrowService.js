@@ -99,26 +99,10 @@ const fundBookingEscrow = async (prisma, { escrowId, payerId, bookingType, booki
         if (escrow.payerId !== payerId) throw new Error('Only the payer can fund this escrow.');
         if (escrow.status !== 'DRAFT') throw new Error(`Escrow cannot be funded from status ${escrow.status}.`);
 
-        // r25 P0 — ATOMIC FUNDING CLAIM FIRST (authority before money): the
-        // DRAFT→FUNDED transition is claimed by an exact-lifecycle CAS before
-        // any financial mutation. A racing fund/cancel that loses NEVER moves
-        // money. (The stale-read checks above are fast-fail conveniences.)
-        const claim = await tx.smartEscrow.updateMany({
-            where: { id: escrowId, status: 'DRAFT', payerId },
-            data: {
-                status: 'FUNDED',
-                fundedAt: new Date(),
-                expiresAt: new Date(Date.now() + fundedExpiryDays * DAY_MS),
-                fundTxHash: reference
-            }
-        });
-        if (claim.count !== 1) {
-            const current = await tx.smartEscrow.findUnique({ where: { id: escrowId }, select: { status: true } });
-            const err = new Error(`Escrow cannot be funded from status ${current?.status || 'UNKNOWN'}.`);
-            err.code = current?.status === 'FUNDED' ? 'ESCROW_ALREADY_FUNDED' : 'ESCROW_STATE_CHANGED';
-            throw err;
-        }
-
+        // r25 P0 — ATOMIC BALANCE CLAIM FIRST (module contract: the
+        // conditional money decrement comes before the funding CAS; a
+        // racing fund that loses the money claim NEVER touches the escrow
+        // lifecycle — and the loser of the CAS rolls its debit back).
         const amount = Number(escrow.amountUsdc);
         const fee = Number(escrow.feeUsdc);
         const total = _round6(amount + fee);
@@ -136,6 +120,26 @@ const fundBookingEscrow = async (prisma, { escrowId, payerId, bookingType, booki
                 `available: ${Number(payer.availableBalance).toFixed(6)} USDC.`
             );
             err.code = 'INSUFFICIENT_BALANCE';
+            throw err;
+        }
+
+        // r25 P0 — ATOMIC FUNDING CLAIM (single-winner boundary): the
+        // DRAFT→FUNDED transition is claimed by an exact-lifecycle CAS. A
+        // racing fund that loses this claim rolls its balance debit back —
+        // money moves exactly once, for exactly one winner.
+        const claim = await tx.smartEscrow.updateMany({
+            where: { id: escrowId, status: 'DRAFT', payerId },
+            data: {
+                status: 'FUNDED',
+                fundedAt: new Date(),
+                expiresAt: new Date(Date.now() + fundedExpiryDays * DAY_MS),
+                fundTxHash: reference
+            }
+        });
+        if (claim.count !== 1) {
+            const current = await tx.smartEscrow.findUnique({ where: { id: escrowId }, select: { status: true } });
+            const err = new Error(`Escrow cannot be funded from status ${current?.status || 'UNKNOWN'}.`);
+            err.code = current?.status === 'FUNDED' ? 'ESCROW_ALREADY_FUNDED' : 'ESCROW_STATE_CHANGED';
             throw err;
         }
 
