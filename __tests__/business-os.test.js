@@ -275,7 +275,9 @@ describeIf('Business OS — Employee Management', () => {
 
         const newPerms = ['manage_products', 'view_finance'];
         const updated = await svc.updateEmployee(testEmployee.id, businessProfile.id, { permissions: newPerms });
-        expect(updated.permissions).toEqual(expect.arrayContaining(newPerms));
+        // Module 01: legacy strings normalize into dotted-key space on the way
+        // in ("view_finance" -> "finance.view"); unknown strings pass through.
+        expect(updated.permissions).toEqual(expect.arrayContaining(['manage_products', 'finance.view']));
     });
 
     test('should not add employee from another business', async () => {

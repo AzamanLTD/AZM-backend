@@ -350,7 +350,7 @@ router.get('/employees/:id', wrap(async (req, res) => {
 }));
 
 // PATCH /api/business-os/employees/:id
-router.patch('/employees/:id', requirePermission('employees.manage'), wrap(async (req, res) => {
+router.patch('/employees/:id', requirePermission('employees.update'), wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
     const employee = await svc.employeeService.updateEmployee(req.params.id, bpId, req.body);
@@ -358,7 +358,7 @@ router.patch('/employees/:id', requirePermission('employees.manage'), wrap(async
 }));
 
 // DELETE /api/business-os/employees/:id
-router.delete('/employees/:id', requirePermission('employees.manage'), wrap(async (req, res) => {
+router.delete('/employees/:id', requirePermission('employees.terminate'), wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
     const { logBusinessAudit } = require('../utils/businessAudit');
@@ -3128,7 +3128,7 @@ router.post('/pos/cash-close-tab', protect, protectActive, wrap(async (req, res)
 
 // ── Phase 2: Employee PIN Management (Section 2.4) ──────────────────────────
 // POST /api/business-os/employees/:id/set-pin — set or update kiosk PIN
-router.post('/employees/:id/set-pin', protect, protectActive, requirePermission('employees.manage'), wrap(async (req, res) => {
+router.post('/employees/:id/set-pin', protect, protectActive, requirePermission('employees.update'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
     const { pinCode } = req.body;
@@ -3153,7 +3153,7 @@ router.post('/employees/:id/set-pin', protect, protectActive, requirePermission(
 }));
 
 // DELETE /api/business-os/employees/:id/pin — remove kiosk PIN
-router.delete('/employees/:id/pin', protect, protectActive, requirePermission('employees.manage'), wrap(async (req, res) => {
+router.delete('/employees/:id/pin', protect, protectActive, requirePermission('employees.update'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
 
@@ -4155,7 +4155,7 @@ router.post('/finance/payout', requirePermission('settings.manage'), wrap(async 
 }));
 
 // PATCH /api/business-os/transit/vehicles/:id/status — update vehicle status
-router.patch('/transit/vehicles/:id/status', requirePermission('transit.manage'), wrap(async (req, res) => {
+router.patch('/transit/vehicles/:id/status', requirePermission('transit.fleet.manage'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = getBizProfileId(req);
     const { id } = req.params;

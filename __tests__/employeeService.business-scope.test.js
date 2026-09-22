@@ -33,13 +33,16 @@ describe('EmployeeService business scoping', () => {
         const prisma = {
             businessEmployee: {
                 findFirst: jest.fn().mockResolvedValue({ id: 'employee-a' }),
-                update: jest.fn().mockResolvedValue({ id: 'employee-a', permissions: ['view_own_shifts'] }),
+                update: jest.fn().mockResolvedValue({ id: 'employee-a', permissions: ['shifts.view'] }),
             },
         };
         const service = new EmployeeService(prisma);
 
+        // Module 01: legacy snake_case grants are normalized into dotted-key
+        // space before storage, so stored rows speak the same vocabulary
+        // requirePermission() checks against.
         await expect(service.updatePermissions('employee-a', 'business-a', ['view_own_shifts']))
-            .resolves.toEqual({ id: 'employee-a', permissions: ['view_own_shifts'] });
+            .resolves.toEqual({ id: 'employee-a', permissions: ['shifts.view'] });
 
         expect(prisma.businessEmployee.findFirst).toHaveBeenCalledWith({
             where: { id: 'employee-a', businessProfileId: 'business-a' },
@@ -47,7 +50,7 @@ describe('EmployeeService business scoping', () => {
         });
         expect(prisma.businessEmployee.update).toHaveBeenCalledWith(expect.objectContaining({
             where: { id: 'employee-a' },
-            data: { permissions: ['view_own_shifts'] },
+            data: { permissions: ['shifts.view'] },
         }));
     });
 

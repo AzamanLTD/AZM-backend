@@ -21,7 +21,7 @@
 // =============================================================================
 
 const logger = require('../src/config/logger');
-const { ROLE_TEMPLATES, ALL_KEYS } = require('../config/permissionTemplates');
+const { ROLE_TEMPLATES, EMPLOYEE_ROLE_TEMPLATES, normalizePermissions } = require('../config/permissionTemplates');
 const { runWithRequestContext } = require('../utils/requestContext');
 const { runWithBusinessRequestContext } = require('../src/lib/businessRequestContext');
 
@@ -58,10 +58,21 @@ async function resolvePermissions(prisma, userId, businessProfileId) {
     // If they have '*' in their permissions, they have everything
     if (employee.permissions.includes('*')) return ['*'];
 
-    // Resolve: merge template defaults with explicit overrides
-    const template = ROLE_TEMPLATES[employee.role];
+    // Resolve: merge template defaults with explicit overrides.
+    //
+    // Module 01 fix: BusinessEmployee.role is the EmployeeRole enum
+    // (MANAGER, SUPERVISOR, STAFF, ...), while ROLE_TEMPLATES is keyed by
+    // portal roles (GENERAL_MANAGER, BRANCH_MANAGER, ...). Looking templates
+    // up in ROLE_TEMPLATES by employee role returned undefined for every real
+    // role, so template defaults NEVER applied and employees only ever held
+    // their explicit DB strings. EMPLOYEE_ROLE_TEMPLATES is keyed by the enum.
+    const template = EMPLOYEE_ROLE_TEMPLATES[employee.role] || ROLE_TEMPLATES[employee.role];
     const templatePerms = template ? template.permissions : [];
-    const explicitPerms = employee.permissions || [];
+
+    // Normalize explicit grants into dotted-key space: legacy snake_case
+    // strings ("manage_employees") expand to their dotted equivalents
+    // ("employees.manage", ...), deduped. Unknown strings pass through.
+    const explicitPerms = normalizePermissions(employee.permissions || []);
 
     // Merge: template perms + any explicit perms that aren't already covered
     // (explicit perms may add or override; for removal, the frontend stores

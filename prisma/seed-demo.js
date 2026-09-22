@@ -437,7 +437,9 @@ async function main() {
                 payrollType: r.type,
                 salaryAmount: r.type === 'SALARY' ? r.salary : null,
                 hourlyRate: r.type === 'HOURLY' ? r.rate : null,
-                permissions: r.role === 'MANAGER' ? ['view_dashboard', 'manage_employees', 'view_finance', 'process_payroll'] : ['view_dashboard'],
+                permissions: r.role === 'MANAGER'
+                    ? ['employees.view', 'employees.create', 'employees.update', 'employees.terminate', 'finance.view', 'payroll.process']
+                    : ['shifts.view'],
                 totalShifts: 10 + i * 3,
                 totalHours: 80 + i * 10,
             },

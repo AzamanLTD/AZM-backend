@@ -267,8 +267,122 @@ const ROLE_TEMPLATES = {
   },
 };
 
+// ── Legacy alias normalization (Module 01) ───────────────────────────────────
+// EmployeeService historically seeded BusinessEmployee.permissions[] with a
+// legacy snake_case vocabulary ("manage_employees", "view_finance", ...) while
+// every requirePermission(...) route checks dotted keys ("employees.manage",
+// "finance.view", ...). Rows written before Module 01 keep working: each
+// legacy string is resolved to its dotted equivalent(s). Unknown strings are
+// preserved as-is (harmless — they simply never match a route key).
+const LEGACY_ALIASES = {
+  '*': ['*'],
+  manage_employees: ['employees.view', 'employees.create', 'employees.update', 'employees.terminate'],
+  view_finance: ['finance.view'],
+  process_payroll: ['payroll.process'],
+  manage_shifts: ['shifts.view', 'shifts.create', 'shifts.update'],
+  manage_operations: ['storefront.manage'],
+  approve_swaps: ['shifts.approve_swap'],
+  approve_timeoff: ['shifts.approve_timeoff'],
+  view_ledger: ['finance.view'],
+  create_ledger_entry: ['finance.ledger.manage'],
+  view_own_shifts: ['shifts.view'],
+  scan_boarding: ['transit.manifests.manage'],
+  update_housekeeping: ['hotel.housekeeping.manage'],
+  take_orders: ['orders.manage'],
+  send_kitchen_order: ['orders.manage'],
+  update_kitchen_order: ['restaurant.kitchen.manage'],
+  manage_reservations: ['reservations.manage'],
+  check_in_guest: ['hotel.front_desk.manage'],
+  assist_guest: ['hotel.guests.view'],
+  // legacy worker self-service keys ("request_swap", "request_timeoff",
+  // "clock_in_out") gate no requirePermission route and intentionally map to
+  // nothing — worker self-service routes are authenticated, not permissioned.
+};
+
+// Normalize one permission string into dotted-key space. Returns an array
+// (aliases expand; unknown strings pass through unchanged).
+const expandPermission = (p) => (LEGACY_ALIASES[p] ? [...LEGACY_ALIASES[p]] : [p]);
+
+// Normalize a whole permissions[] set: expand legacy aliases, dedupe, keep '*'.
+const normalizePermissions = (perms) => {
+  if (!Array.isArray(perms)) return [];
+  const out = new Set();
+  for (const p of perms) {
+    for (const dotted of expandPermission(String(p))) out.add(dotted);
+  }
+  if (out.has('*')) return ['*'];
+  return Array.from(out);
+};
+
+// ── Employee-role templates (Module 01) ──────────────────────────────────────
+// ROLE_TEMPLATES above describes PORTAL ROLES (General Manager, Branch
+// Manager, Front Desk, ...) used by the permission-templates API. But
+// BusinessEmployee.role is the EmployeeRole enum (MANAGER, SUPERVISOR, STAFF,
+// DRIVER, HOUSEKEEPER, WAITER, CHEF, RECEPTIONIST, CONCIERGE, SECURITY).
+// resolvePermissions() looks templates up BY EMPLOYEE ROLE, so every enum
+// value needs a real template here — otherwise only OWNER and wildcard
+// employees ever pass a permission check.
+const EMPLOYEE_ROLE_TEMPLATES = {
+  OWNER: ROLE_TEMPLATES.OWNER,
+  MANAGER: { ...ROLE_TEMPLATES.GENERAL_MANAGER },
+  SUPERVISOR: { ...ROLE_TEMPLATES.BRANCH_MANAGER },
+  STAFF: {
+    label: 'Staff',
+    description: 'Self-service worker surfaces.',
+    permissions: ['shifts.view', 'feedback.give', 'feedback.view', 'notifications.view'],
+    system: true,
+  },
+  DRIVER: {
+    label: 'Driver',
+    description: 'Transit crew: view trips and manifests, scan boarding.',
+    permissions: ['shifts.view', 'transit.trips.view', 'transit.manifests.view', 'transit.manifests.manage', 'feedback.give', 'feedback.view'],
+    system: true,
+  },
+  HOUSEKEEPER: {
+    label: 'Housekeeper',
+    description: 'Hotel housekeeping execution surface.',
+    permissions: ['shifts.view', 'hotel.rooms.view', 'hotel.housekeeping.manage', 'feedback.give', 'feedback.view'],
+    system: true,
+  },
+  WAITER: {
+    label: 'Waiter',
+    description: 'Restaurant floor: tables, menu, order entry.',
+    permissions: ['shifts.view', 'restaurant.menu.view', 'orders.view', 'orders.manage', 'feedback.give', 'feedback.view'],
+    system: true,
+  },
+  CHEF: {
+    label: 'Chef',
+    description: 'Kitchen display and kitchen order management.',
+    permissions: ['shifts.view', 'restaurant.kitchen.view', 'restaurant.kitchen.manage', 'restaurant.inventory.view', 'feedback.give', 'feedback.view'],
+    system: true,
+  },
+  RECEPTIONIST: {
+    label: 'Receptionist',
+    description: 'Front desk: reservations, check-in, guest view.',
+    permissions: ['shifts.view', 'reservations.view', 'reservations.manage', 'hotel.front_desk.manage', 'hotel.guests.view', 'feedback.give', 'feedback.view'],
+    system: true,
+  },
+  CONCIERGE: {
+    label: 'Concierge',
+    description: 'Guest assistance surface.',
+    permissions: ['shifts.view', 'hotel.guests.view', 'hotel.front_desk.manage', 'feedback.give', 'feedback.view'],
+    system: true,
+  },
+  SECURITY: {
+    label: 'Security',
+    description: 'Self-service worker surfaces.',
+    permissions: ['shifts.view', 'feedback.give', 'feedback.view'],
+    system: true,
+  },
+};
+
 module.exports = {
   PERMISSION_KEYS,
   ALL_KEYS,
   ROLE_TEMPLATES,
+  EMPLOYEE_ROLE_TEMPLATES,
+  LEGACY_ALIASES,
+  expandPermission,
+  normalizePermissions,
 };
+

@@ -11,21 +11,18 @@
 const logger = require('../../src/config/logger');
 const { PrismaClient } = require('@prisma/client');
 const { EwaService } = require('./ewaService');
+const { EMPLOYEE_ROLE_TEMPLATES, normalizePermissions } = require('../../config/permissionTemplates');
 
 // Default permissions by role
-const ROLE_PERMISSIONS = {
-    OWNER:     ['*'], // all permissions
-    MANAGER:   ['manage_employees', 'view_finance', 'process_payroll', 'manage_shifts', 'manage_operations', 'approve_swaps', 'approve_timeoff', 'view_ledger', 'create_ledger_entry'],
-    SUPERVISOR:['manage_shifts', 'approve_swaps', 'view_finance', 'manage_operations'],
-    STAFF:     ['view_own_shifts', 'request_swap', 'request_timeoff', 'clock_in_out'],
-    DRIVER:    ['view_own_shifts', 'request_swap', 'request_timeoff', 'clock_in_out', 'scan_boarding'],
-    HOUSEKEEPER:['view_own_shifts', 'request_swap', 'request_timeoff', 'clock_in_out', 'update_housekeeping'],
-    WAITER:    ['view_own_shifts', 'request_swap', 'request_timeoff', 'clock_in_out', 'take_orders', 'send_kitchen_order'],
-    CHEF:      ['view_own_shifts', 'request_swap', 'request_timeoff', 'clock_in_out', 'update_kitchen_order'],
-    RECEPTIONIST:['view_own_shifts', 'request_swap', 'request_timeoff', 'clock_in_out', 'manage_reservations', 'check_in_guest'],
-    CONCIERGE: ['view_own_shifts', 'request_swap', 'request_timeoff', 'clock_in_out', 'assist_guest'],
-    SECURITY:  ['view_own_shifts', 'request_swap', 'request_timeoff', 'clock_in_out'],
-};
+// ── Role defaults (Module 01) ─────────────────────────────────────────────────
+// Dotted-key permission defaults sourced from the canonical catalog
+// (config/permissionTemplates.js). The previous legacy snake_case vocabulary
+// ("manage_employees", "view_finance", ...) never matched any
+// requirePermission('employees.manage') route key, so seeded defaults were
+// inert — employees created with them could not pass any permission check.
+const ROLE_PERMISSIONS = Object.fromEntries(
+    Object.entries(EMPLOYEE_ROLE_TEMPLATES).map(([role, tpl]) => [role, tpl.permissions]),
+);
 
 class EmployeeService {
     constructor(prisma) {
@@ -35,7 +32,24 @@ class EmployeeService {
     // ── Create / Add Employee ──────────────────────────────────────────────
     // The business owner adds an employee by their Azaman user ID (or AZM-ID).
     // This links the user's consumer account to the business as an employee.
-    async addEmployee({ businessProfileId, userId, role = 'STAFF', title, department, payrollType = 'SALARY', salaryAmount, hourlyRate, paymentPreference = 'AZAMAN_BALANCE', permissions, emergencyContact, notes }) {
+    async addEmployee({ businessProfileId, userId, azmId, role = 'STAFF', title, department, payrollType = 'SALARY', salaryAmount, hourlyRate, paymentPreference = 'AZAMAN_BALANCE', permissions, emergencyContact, notes }) {
+        // ── Module 01: resolve the worker's identity ─────────────────────────
+        // The portal's "AZM-ID" field is the worker's Azaman @username (or
+        // email). Accept a numeric userId as before, and additionally resolve
+        // a string handle (username first, then email) to the real user row.
+        let resolvedUserId = userId;
+        if (typeof userId !== 'number') {
+            const handle = String(azmId ?? userId ?? '').trim().replace(/^@/, '');
+            if (!handle) throw new Error('User not found. Provide the employee\'s Azaman username, email, or user ID.');
+            let user = await this.prisma.user.findUnique({ where: { username: handle } });
+            if (!user && handle.includes('@')) {
+                user = await this.prisma.user.findUnique({ where: { email: handle } });
+            }
+            if (!user) throw new Error(`No Azaman account found for "${handle}".`);
+            resolvedUserId = user.id;
+        }
+        userId = resolvedUserId;
+
         // Check if user is already an employee of this business
         const existing = await this.prisma.businessEmployee.findUnique({
             where: { businessProfileId_userId: { businessProfileId, userId } },
@@ -57,7 +71,10 @@ class EmployeeService {
         if (!user) throw new Error('User not found.');
 
         // Set default permissions based on role
-        const finalPermissions = permissions || ROLE_PERMISSIONS[role] || ROLE_PERMISSIONS.STAFF;
+        // Normalize into dotted-key space: legacy strings expand, dedupe applies.
+        const finalPermissions = normalizePermissions(
+            permissions || ROLE_PERMISSIONS[role] || ROLE_PERMISSIONS.STAFF,
+        );
 
         // Convert salaryAmount/hourlyRate to Decimal
         const salaryDecimal = salaryAmount ? parseFloat(salaryAmount) : null;
@@ -137,6 +154,9 @@ class EmployeeService {
             if (key in updates) {
                 if (key === 'salaryAmount' || key === 'hourlyRate') {
                     data[key] = updates[key] !== null ? parseFloat(updates[key]) : null;
+                } else if (key === 'permissions') {
+                    // Module 01: normalize into dotted-key space on the way in.
+                    data[key] = normalizePermissions(updates[key]);
                 } else {
                     data[key] = updates[key];
                 }
@@ -221,9 +241,12 @@ class EmployeeService {
         });
         if (!existing) throw new Error('Employee not found.');
 
+        // Module 01: store the normalized dotted-key set so every stored row
+        // speaks the same vocabulary requirePermission() checks against.
+        const normalized = normalizePermissions(permissions);
         return this.prisma.businessEmployee.update({
             where: { id: existing.id },
-            data: { permissions },
+            data: { permissions: normalized },
             include: {
                 user: { select: { id: true, username: true, email: true } },
             },
@@ -232,9 +255,10 @@ class EmployeeService {
 
     // ── Check Permission ───────────────────────────────────────────────────
     hasPermission(employee, permission) {
-        if (!employee) return false;
+        if (!employee || !Array.isArray(employee.permissions)) return false;
         if (employee.permissions.includes('*')) return true;
-        return employee.permissions.includes(permission);
+        // Module 01: also honor legacy snake_case grants stored on the row.
+        return normalizePermissions(employee.permissions).includes(permission);
     }
 
     // ── Get Employees by Role ──────────────────────────────────────────────
