@@ -244,7 +244,13 @@ describeOrSkip('r18: durable orphan-adoption ownership claim', () => {
         // The loser never dispatched: it is flagged for manual review.
         expect(result.flagged).toBe(1);
         expect(result.processed).toBe(1);
-        expect(result.details?.flaggedManualReview?.[0]?.reason).toBe('MISSING_TRANSACTION_REFERENCE');
+        // r24-CI (deliberate update): the loser's ONLY candidate was the
+        // canonical the winner adopted (bridge-committed before the loser's
+        // scan). That is a lost ownership race with deterministic evidence —
+        // it must record ORPHAN_ADOPTION_CLAIM_LOST, not the misleading
+        // MISSING_TRANSACTION_REFERENCE (the reference is not missing; it is
+        // owned by the winning mirror).
+        expect(result.details?.flaggedManualReview?.[0]?.reason).toBe('ORPHAN_ADOPTION_CLAIM_LOST');
         // Exactly one mirror holds the durable bridge.
         expect(await bridgedCount(canonical.id)).toBe(1);
         const statuses = await prisma.withdrawal.findMany({ select: { status: true } });

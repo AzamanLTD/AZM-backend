@@ -162,6 +162,27 @@ class WithdrawalReconciliationWorker {
         const txRows = await this._excludeBridgeLinked(txRowsRaw);
 
         if (txRows.length === 0) {
+            // r24-CI: candidates EXISTED but every one is durably linked to
+            // another Withdrawal via the bridge. This is the same outcome as
+            // losing the claim race — the canonical went to (or already
+            // belonged to) another withdrawal — so it must record the SAME
+            // durable reason, never MISSING_TRANSACTION_REFERENCE (the
+            // reference is not missing; it is owned elsewhere). This also
+            // makes the loser's record deterministic regardless of whether
+            // the winner's bridge commit lands before or during the loser's
+            // candidate scan (the S4 interleaving).
+            if (txRowsRaw.length > 0) {
+                await this._recordException(
+                    withdrawal,
+                    'ORPHAN_ADOPTION_CLAIM_LOST',
+                    {
+                        candidateTransactionIds: txRowsRaw.map((row) => row.id),
+                        candidateReferences: txRowsRaw.map((row) => row.txHash).filter(Boolean),
+                        claimReason: 'CANONICAL_BRIDGED_ELSEWHERE',
+                    }
+                );
+                return { row: null, linked: false };
+            }
             await this._recordException(
                 withdrawal,
                 'MISSING_TRANSACTION_REFERENCE',
