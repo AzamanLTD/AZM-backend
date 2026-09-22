@@ -12,8 +12,12 @@
 //   - cancelTransitBooking: cancel + refund escrow + free seats
 // =============================================================================
 
-const logger = require('../src/config/logger');
 const crypto = require('crypto');
+const { randomUUID } = require('crypto');
+const logger = require('../src/config/logger');
+// r28: the canonical escrow refund economic identity (same idempotency key,
+// ledger entry and TransactionHistory row as every other escrow refund).
+const { _refundBookingEscrowTx, REFUND_CLAIMABLE } = require('./bookingEscrowService');
 
 const _genRef = () => 'TRN-' + crypto.randomBytes(4).toString('hex').toUpperCase();
 
@@ -177,63 +181,167 @@ const getTripSeatAvailability = async (prisma, { tripId }) => {
 };
 
 // =============================================================================
-// 3. CANCEL TRANSIT BOOKING — cancel + refund escrow + free seats.
+// 3. CANCEL TRANSIT BOOKING — the canonical, transactionally authoritative
+//    transit booking cancellation (r28 / P0-C).
+//
+// Every legacy cancellation entry point now funnels here:
+//   • DELETE /api/marketplace/transit/bookings/:id
+//   • PATCH /api/transit/bookings/:id/status (status=CANCELLED)
+//
+// In ONE database transaction it atomically:
+//   1. CAS-claims the booking out of the authoritative cancellable set
+//      (PENDING | CONFIRMED) — a racing cancellation/no-show that moved the
+//      booking first makes this claim lose, deterministically.
+//   2. Releases the booking's seat assignments and restores the trip's
+//      availableSeats.
+//   3. Resolves the booking's escrow through the canonical r27 refund
+//      economic identity (_refundBookingEscrowTx): escrow → REFUNDED, payer's
+//      escrowLockedBalance drained back into availableBalance, ledger entry +
+//      TransactionHistory posted, all in the same transaction.
+//
+// Failure honesty (the old implementation cancelled the booking + freed the
+// seats in one transaction, then ran the refund AFTERWARDS and swallowed its
+// errors — a textbook stranded-funds/false-success pattern): any refund or
+// ledger failure now rolls back the ENTIRE operation. The booking stays in its
+// prior state, seats and capacity are untouched, the escrow keeps its money,
+// and the caller gets an explicit error.
+//
+// Disputed escrows stay in the dispute channel's custody (never economically
+// mutated here); already-finalized escrows (REFUNDED/RELEASED/EXPIRED)
+// receive no second economic mutation.
 // =============================================================================
-const cancelTransitBooking = async (prisma, { bookingId, cancelledBy }) => {
+
+// The single authoritative cancellable set. NOTE: this intentionally unifies
+// two contradictory contracts that previously coexisted — the controller's
+// transition table admitted IN_PROGRESS -> CANCELLED while this service only
+// cancelled PENDING/CONFIRMED. IN_PROGRESS rides are NOT cancellable (the
+// ride already started); a funded IN_PROGRESS escrow resolves through the
+// driver-completion or dispute path, never through cancellation.
+const CANCELLABLE_STATUSES = ['PENDING', 'CONFIRMED'];
+const ALREADY_FINALIZED_ESCROWS = ['REFUNDED', 'RELEASED', 'EXPIRED'];
+
+class TransitCancellationError extends Error {
+    constructor(code, message, httpStatus) {
+        super(message);
+        this.name = 'TransitCancellationError';
+        this.code = code;
+        this.httpStatus = httpStatus;
+    }
+}
+
+const cancelTransitBooking = async (prisma, { bookingId, cancelledBy, note } = {}) => {
+    if (!bookingId) throw new TransitCancellationError('BAD_REQUEST', 'bookingId is required.', 400);
+
     const booking = await prisma.transitBooking.findUnique({
         where: { id: bookingId },
-        include: { seats: true, trip: true, businessProfile: { select: { userId: true } } }
+        include: {
+            seats: true,
+            businessProfile: { select: { userId: true } },
+        },
     });
-    if (!booking) throw new Error('Booking not found.');
+    if (!booking) {
+        throw new TransitCancellationError('NOT_FOUND', 'Booking not found.', 404);
+    }
 
-    // Authorization: only the booking customer or the business owner can cancel
+    // Authorization: only the booking customer or the business owner can cancel.
     const isOwner = booking.businessProfile?.userId === cancelledBy;
     const isCustomer = booking.customerId === cancelledBy;
     if (!isOwner && !isCustomer) {
-        throw new Error('Not authorized to cancel this booking.');
+        throw new TransitCancellationError('FORBIDDEN', 'Not authorized to cancel this booking.', 403);
     }
 
-    const cancellable = ['PENDING', 'CONFIRMED'];
-    if (!cancellable.includes(booking.status)) {
-        throw new Error(`Cannot cancel a booking with status ${booking.status}.`);
-    }
+    return prisma.$transaction(async (tx) => {
+        // 1. CAS claim from the authoritative cancellable set. count 0 means a
+        //    racing actor already moved the booking — re-read and converge.
+        const claim = await tx.transitBooking.updateMany({
+            where: { id: bookingId, status: { in: CANCELLABLE_STATUSES } },
+            data: {
+                status: 'CANCELLED',
+                ...(note != null ? { driverNote: note } : {}),
+            },
+        });
 
-    // Free the seats + cancel the booking atomically
-    await prisma.$transaction(async (tx) => {
-        // Delete seat assignments (frees them for others)
+        if (claim.count === 0) {
+            const current = await tx.transitBooking.findUnique({
+                where: { id: bookingId },
+                select: { status: true },
+            });
+            if (current?.status === 'CANCELLED') {
+                // Idempotent convergence: another cancellation already won.
+                // Observe the resolved state — ZERO economic mutations here.
+                return {
+                    success: true,
+                    alreadyCancelled: true,
+                    bookingId,
+                    refund: null,
+                    booking: await tx.transitBooking.findUnique({
+                        where: { id: bookingId },
+                        include: {
+                            vehicle: { select: { id: true, type: true, make: true, model: true, licensePlate: true, driverName: true } },
+                            businessProfile: { select: { id: true, businessName: true } },
+                        },
+                    }),
+                };
+            }
+            throw new TransitCancellationError(
+                'NOT_CANCELLABLE',
+                `Cannot cancel a booking with status ${current?.status}.`,
+                409
+            );
+        }
+
+        // 2. Seat release + capacity restore — only the claim winner reaches
+        //    here, in the same transaction as the booking claim.
         if (booking.seats.length > 0) {
             await tx.transitBookingSeat.deleteMany({ where: { bookingId } });
+            if (booking.tripId) {
+                await tx.transitTrip.update({
+                    where: { id: booking.tripId },
+                    data: { availableSeats: { increment: booking.seats.length } },
+                });
+            }
         }
 
-        // Increment available seats on the trip
-        if (booking.tripId && booking.seats.length > 0) {
-            await tx.transitTrip.update({
-                where: { id: booking.tripId },
-                data: { availableSeats: { increment: booking.seats.length } }
-            });
+        // 3. Escrow resolution through the canonical refund economic identity
+        //    (same tx). Any refund/ledger failure rolls back EVERYTHING above.
+        let refund = null;
+        if (booking.escrowId) {
+            const escrow = await tx.smartEscrow.findUnique({ where: { id: booking.escrowId } });
+            if (escrow && REFUND_CLAIMABLE.includes(escrow.status)) {
+                const reference = randomUUID();
+                await _refundBookingEscrowTx(tx, { escrowId: escrow.id, reference });
+                refund = { outcome: 'REFUNDED', reference, amountUsdc: Number(escrow.amountUsdc) };
+            } else if (escrow && escrow.status === 'DISPUTED') {
+                // The dispute channel owns the money — never mutate it here.
+                // Cancelling still removes the booking from the no-show
+                // worker's CONFIRMED candidate set.
+                refund = { outcome: 'ESCROW_DISPUTED' };
+            } else if (escrow && ALREADY_FINALIZED_ESCROWS.includes(escrow.status)) {
+                // Already resolved through the canonical contract — no second
+                // economic mutation, honestly reported.
+                refund = { outcome: 'ESCROW_ALREADY_FINALIZED', escrowStatus: escrow.status };
+            } else if (escrow) {
+                // DRAFT — escrow created but never funded; nothing is locked.
+                refund = { outcome: 'NO_FUNDS', escrowStatus: escrow.status };
+            }
         }
 
-        // Cancel the booking
-        await tx.transitBooking.update({
-            where: { id: bookingId },
-            data: { status: 'CANCELLED' }
-        });
+        return {
+            success: true,
+            alreadyCancelled: false,
+            bookingId,
+            refund,
+            booking: await tx.transitBooking.findUnique({
+                where: { id: bookingId },
+                include: {
+                    vehicle: { select: { id: true, type: true, make: true, model: true, licensePlate: true, driverName: true } },
+                    businessProfile: { select: { id: true, businessName: true } },
+                },
+            }),
+        };
     });
-
-    // Refund escrow if one exists
-    let refundResult = null;
-    if (booking.escrowId) {
-        try {
-            const { refundBookingEscrow } = require('./bookingEscrowService');
-            refundResult = await refundBookingEscrow(prisma, { escrowId: booking.escrowId });
-        } catch (err) {
-            logger.error({ err: err }, '[transitBookingService.cancel] escrow refund failed');
-        }
-    }
-
-    return { success: true, bookingId, refund: refundResult };
 };
 
 const _round6 = (n) => parseFloat(Number(n).toFixed(6));
 
-module.exports = { bookSeats, getTripSeatAvailability, cancelTransitBooking };
+module.exports = { bookSeats, getTripSeatAvailability, cancelTransitBooking, CANCELLABLE_STATUSES, TransitCancellationError };

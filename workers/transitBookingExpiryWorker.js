@@ -63,17 +63,21 @@ class TransitBookingExpiryWorker {
 
             logger.info({ count: staleBookings.length }, '[TransitBookingExpiryWorker] expiring stale bookings');
 
+            const { cancelTransitBooking } = require('../services/transitBookingService');
             for (const booking of staleBookings) {
                 try {
-                    // Delete seat reservations first (cascade handles this but be explicit)
-                    await this.prisma.transitBookingSeat.deleteMany({
-                        where: { bookingId: booking.id },
-                    });
-
-                    // Mark booking as CANCELLED
-                    await this.prisma.transitBooking.update({
-                        where: { id: booking.id },
-                        data: { status: 'CANCELLED' },
+                    // r28: route expiry through the canonical cancellation
+                    // service — one transaction claims the booking, releases
+                    // its seat assignments AND restores trip.availableSeats
+                    // (the old inline code deleted seat rows but never
+                    // restored capacity, permanently leaking seats), and
+                    // resolves any escrow through the canonical economics.
+                    // PENDING bookings are unpaid, so no money can move; a
+                    // racing confirmation simply makes the claim lose.
+                    await cancelTransitBooking(this.prisma, {
+                        bookingId: booking.id,
+                        cancelledBy: booking.customerId,
+                        note: 'Payment not completed within 15 minutes',
                     });
 
                     logger.info({ bookingId: booking.id, bookingRef: booking.bookingRef },

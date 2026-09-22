@@ -19,7 +19,13 @@ const VALID_TRANSITIONS = {
     // authority gate above rejects customers before this table is consulted);
     // a funded escrow is split through the canonical worker economics.
     CONFIRMED:    ['IN_PROGRESS', 'CANCELLED', 'NO_SHOW'],
-    IN_PROGRESS:  ['COMPLETED', 'CANCELLED'],
+    // r28: IN_PROGRESS is NOT cancellable — this unifies the two
+    // contradictory contracts (this table admitted IN_PROGRESS -> CANCELLED
+    // while the canonical service only cancels PENDING/CONFIRMED). A ride
+    // that already started resolves through completion or dispute, never
+    // through cancellation, so a funded escrow can never be dropped out
+    // of its real settlement path by a late cancel.
+    IN_PROGRESS:  ['COMPLETED'],
     COMPLETED:    [],
     CANCELLED:    [],
     NO_SHOW:      [],
@@ -224,6 +230,43 @@ exports.updateBookingStatus = async (req, res) => {
             });
         }
 
+        // r28 / P0-C: CANCELLED is delegated to the canonical transactional
+        // cancellation service — booking claim, seat release, capacity
+        // restore, escrow refund, ledger and TransactionHistory all commit
+        // together, or nothing does. This controller never mutates a booking
+        // to CANCELLED directly (the old direct update refunded nothing,
+        // freed no seats and restored no capacity while reporting success).
+        if (nextStatus === 'CANCELLED') {
+            const { cancelTransitBooking } = require('../services/transitBookingService');
+            try {
+                const result = await cancelTransitBooking(prisma, {
+                    bookingId: booking.id,
+                    cancelledBy: userId,
+                    note: driverNote,
+                });
+                if (io) {
+                    io.to(`user_${booking.customerId}`).emit('transit_booking_update', result.booking);
+                    if (booking.businessProfile.userId !== booking.customerId) {
+                        io.to(`user_${booking.businessProfile.userId}`).emit('transit_booking_update', result.booking);
+                    }
+                }
+                return res.status(200).json({
+                    success: true,
+                    booking: result.booking,
+                    refund: result.refund,
+                    alreadyCancelled: result.alreadyCancelled,
+                });
+            } catch (err) {
+                if (err.httpStatus) {
+                    return res.status(err.httpStatus).json({ success: false, message: err.message });
+                }
+                // Refund/ledger failure: the whole operation rolled back —
+                // never a false success. Surface the honest error.
+                logger.error({ err: err.message }, '[transit.updateBookingStatus] canonical cancellation failed');
+                return res.status(500).json({ success: false, message: 'Cancellation failed and was fully rolled back; no state changed. Retry is safe.' });
+            }
+        }
+
         // r27: business-initiated NO_SHOW must not diverge economically from
         // the worker's canonical path — a plain status flip here would leave a
         // funded escrow stranded outside every sweep's candidate set. Route
@@ -271,7 +314,7 @@ exports.updateBookingStatus = async (req, res) => {
         if (nextStatus === 'COMPLETED') {
             updateData.dropoffTime = new Date();
         }
-        if (nextStatus === 'CANCELLED' || nextStatus === 'NO_SHOW') {
+        if (nextStatus === 'NO_SHOW') {
             updateData.driverNote = driverNote || null;
         }
 

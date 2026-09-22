@@ -417,10 +417,20 @@ const splitReleaseFundedEscrow = async (prisma, {
                 data: { status: 'NO_SHOW', penaltyChargedAt: new Date(), penaltyAmountUsdc: penaltyAmount }
             });
         } else if (bookingType === 'TRANSIT' && bookingId) {
-            await tx.transitBooking.updateMany({
-                where: { id: bookingId },
+            // r28 / P0-B race hardening: this used to be an unguarded
+            // updateMany on the booking id — a racing cancellation that won
+            // the booking's economic claim could be silently overwritten to
+            // NO_SHOW here. The CAS below claims ONLY the authoritative
+            // no-show pre-state (CONFIRMED): if a cancellation won, this
+            // whole split rolls back (escrow restored, no penalty/refund,
+            // no ledger posting) and the cancellation's economics stand.
+            const bookingClaim = await tx.transitBooking.updateMany({
+                where: { id: bookingId, status: 'CONFIRMED' },
                 data: { status: 'NO_SHOW', penaltyChargedAt: new Date(), penaltyAmountUsdc: penaltyAmount }
             });
+            if (bookingClaim.count === 0) {
+                throw new Error('BOOKING_NO_LONGER_CONFIRMED');
+            }
         }
 
         return {
