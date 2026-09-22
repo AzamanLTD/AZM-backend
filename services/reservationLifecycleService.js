@@ -29,9 +29,9 @@ const loadAggregate = (tx, reservationId) => tx.reservation.findUnique({
     include: { escrow: true, businessProfile: true },
 });
 
-const claimReservation = async (tx, { reservationId, from, data }) => {
+const claimReservation = async (tx, { reservationId, from, where = {}, data }) => {
     const claimed = await tx.reservation.updateMany({
-        where: { id: reservationId, status: { in: from } },
+        where: { id: reservationId, status: { in: from }, ...where },
         data,
     });
     if (claimed.count !== 1) throw fail('RESERVATION_STATE_CONFLICT');
@@ -61,6 +61,38 @@ const runConvergent = async (prisma, reservationId, targetStatus, work) => {
         }
         throw err;
     }
+};
+
+
+const confirmReservation = async (prisma, { reservationId, businessProfileId, businessNotes = null }) => {
+    const confirmedAt = new Date();
+    return prisma.$transaction(async (tx) => {
+        const claimed = await tx.reservation.updateMany({
+            where: {
+                id: reservationId,
+                businessProfileId,
+                status: 'PENDING',
+            },
+            data: {
+                status: 'CONFIRMED',
+                confirmedAt,
+                businessNotes,
+            },
+        });
+
+        if (claimed.count !== 1) {
+            const current = await tx.reservation.findUnique({
+                where: { id: reservationId },
+                select: { businessProfileId: true, status: true },
+            });
+            if (!current || current.businessProfileId !== businessProfileId) {
+                throw fail('RESERVATION_NOT_FOUND', 'Reservation not found.');
+            }
+            throw fail('RESERVATION_CONFIRM_CONFLICT', `Reservation is already ${current.status}.`);
+        }
+
+        return tx.reservation.findUnique({ where: { id: reservationId } });
+    });
 };
 
 const cancelReservation = async (prisma, { reservationId, customerId }) =>
@@ -134,6 +166,9 @@ const markNoShowReservation = async (prisma, { reservationId, businessUserId = n
         if (reservation.status !== 'CONFIRMED') {
             throw fail('RESERVATION_NOT_NO_SHOW_READY', `Reservation is ${reservation.status}, cannot mark no-show.`);
         }
+        if (reservation.checkedInAt || reservation.endDatetime >= new Date()) {
+            throw fail('RESERVATION_NOT_NO_SHOW_READY', 'Reservation cannot be marked no-show before its end time.');
+        }
 
         const escrow = reservation.escrow;
         if (escrow && CUSTODY_STATES.has(escrow.status)) {
@@ -155,6 +190,10 @@ const markNoShowReservation = async (prisma, { reservationId, businessUserId = n
                     bookingId: reservation.id,
                     releaseRef: randomUUID(),
                     refundRef: randomUUID(),
+                    reservationClaimWhere: {
+                        checkedInAt: null,
+                        endDatetime: { lt: new Date() },
+                    },
                 });
                 return tx.reservation.findUnique({ where: { id: reservationId } });
             }
@@ -168,6 +207,10 @@ const markNoShowReservation = async (prisma, { reservationId, businessUserId = n
         return claimReservation(tx, {
             reservationId,
             from: ['CONFIRMED'],
+            where: {
+                checkedInAt: null,
+                endDatetime: { lt: new Date() },
+            },
             data: {
                 status: 'NO_SHOW',
                 penaltyChargedAt: hasPenalty ? new Date() : null,
@@ -176,4 +219,27 @@ const markNoShowReservation = async (prisma, { reservationId, businessUserId = n
         });
     });
 
-module.exports = { cancelReservation, checkInReservation, markNoShowReservation };
+const checkOutReservation = async (prisma, { reservationId, businessUserId }) =>
+    runConvergent(prisma, reservationId, 'CHECKED_OUT', async (tx) => {
+        const reservation = await loadAggregate(tx, reservationId);
+        if (!reservation || reservation.businessProfile?.userId !== businessUserId) {
+            throw fail('RESERVATION_NOT_FOUND', 'Reservation not found.');
+        }
+        if (reservation.status === 'CHECKED_OUT') return reservation;
+        if (reservation.status !== 'CHECKED_IN') {
+            throw fail('RESERVATION_NOT_CHECKOUT_READY', `Reservation is ${reservation.status}, cannot check out.`);
+        }
+        return claimReservation(tx, {
+            reservationId,
+            from: ['CHECKED_IN'],
+            data: { status: 'CHECKED_OUT', checkedOutAt: new Date() },
+        });
+    });
+
+module.exports = {
+    confirmReservation,
+    cancelReservation,
+    checkInReservation,
+    checkOutReservation,
+    markNoShowReservation,
+};

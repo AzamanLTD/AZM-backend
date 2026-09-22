@@ -1,18 +1,20 @@
 # r29 Reservation Lifecycle Economic Authority
 
 Date: 2026-09-22
-Scope: reservation cancellation, check-in, no-show, escrow custody, and races.
+Scope: reservation confirmation, cancellation, check-in, check-out, no-show, escrow custody, and races.
 
 ## Authority model
 
 `services/reservationLifecycleService.js` is the single transactional boundary
-for the three competing facts:
+for the lifecycle facts that carry state or economic authority:
 
+- business confirmation: `PENDING -> CONFIRMED` through an atomic tenant-scoped CAS
 - customer cancellation: `PENDING|CONFIRMED -> CANCELLED_CUSTOMER`
 - business check-in: `CONFIRMED -> CHECKED_IN`
-- business/worker no-show: `CONFIRMED -> NO_SHOW`
+- business/worker no-show: overdue, unchecked-in `CONFIRMED -> NO_SHOW`
+- business check-out: `CHECKED_IN -> CHECKED_OUT` through an atomic CAS
 
-Every funded path claims escrow custody first and the reservation state second
+Every funded terminal path claims escrow custody first and the reservation state second
 inside one PostgreSQL transaction. All three operations use that same order.
 A losing state CAS aborts the escrow claim, balances, ledger posting, and
 TransactionHistory together. No caller may commit status first and settle later.
@@ -39,9 +41,11 @@ not invent a cancellation charge. It therefore preserves the existing canonical
 
 ## Entry points unified
 
+- `reservationController.confirmReservation`
 - `reservationController.cancelReservation`
 - `reservationController.checkInReservation`
 - `reservationController.markNoShowReservation`
+- `reservationController.checkOutReservation`
 - `qrCheckInService.verifyAndCheckIn`
 - marketplace direct check-in compatibility path
 - `reservationNoShowWorker.sweepNoShowReservations`
@@ -61,6 +65,8 @@ from acquiring a new DRAFT escrow.
 
 ## Intentional lifecycle boundaries
 
+- Manual and worker NO_SHOW both require `endDatetime < now` and no prior check-in. The same predicate is repeated in the terminal CAS, so a concurrent reschedule cannot trigger premature economics.
+- Confirmation is a tenant-scoped `PENDING -> CONFIRMED` CAS. A stale business request cannot resurrect a cancelled or otherwise advanced reservation, and only the CAS winner emits `reservation.confirmed`.
 - NO_SHOW competes with check-in from CONFIRMED. A CHECKED_IN reservation cannot
   later be rewritten to NO_SHOW. This matches the worker's business fact and
   makes check-in-vs-no-show a single-winner race.
@@ -75,7 +81,7 @@ from acquiring a new DRAFT escrow.
 
 ## Proofs
 
-`__tests__/r29-reservation-lifecycle-authority.test.js` contains 19 real
+`__tests__/r29-reservation-lifecycle-authority.test.js` contains 29 real
 PostgreSQL proofs covering exact balances, escrow terminal states, exactly-once
 ledger/history, retries, injected history/ledger rollback, tenant boundaries,
 QR convergence, disputed custody, terminal escrow linkage, and these races:
@@ -85,6 +91,13 @@ QR convergence, disputed custody, terminal escrow linkage, and these races:
 - cancellation vs no-show
 - check-in vs no-show
 - no-show vs no-show
+- confirmation vs cancellation
+- confirmation vs escrow creation/funding
+- confirmation vs confirmation
+
+It also proves premature owner NO_SHOW rejection with zero state/economic mutation,
+post-window owner penalty/refund behavior exactly once, later worker eligibility after
+an early rejection, stale confirmation rejection, and cross-business zero mutation.
 
 The suite is included in `.github/workflows/financial-durability.yml`, where it
 runs with `synchronous_commit=on`.

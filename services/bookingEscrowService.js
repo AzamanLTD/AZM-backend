@@ -342,7 +342,7 @@ const refundBookingEscrow = async (prisma, { escrowId }) => {
 // 5. SPLIT-RELEASE FUNDED ESCROW — The no-show penalty primitive.
 const _splitReleaseFundedEscrowTx = async (tx, {
     escrowId, penaltyPct, penaltyFlatUsdc, reason, bookingType, bookingId,
-    releaseRef, refundRef
+    releaseRef, refundRef, reservationClaimWhere = {}
 }) => {
     const claimable = ['FUNDED', 'IN_PROGRESS', 'PENDING_SETTLEMENT'];
 
@@ -422,7 +422,7 @@ const _splitReleaseFundedEscrowTx = async (tx, {
         // cancellation or check-in that wins CONFIRMED first makes this CAS
         // fail, rolling back escrow, balances, ledger and history together.
         const bookingClaim = await tx.reservation.updateMany({
-            where: { id: bookingId, status: 'CONFIRMED' },
+            where: { ...reservationClaimWhere, id: bookingId, status: 'CONFIRMED' },
             data: { status: 'NO_SHOW', penaltyChargedAt: new Date(), penaltyAmountUsdc: penaltyAmount }
         });
         if (bookingClaim.count === 0) throw new Error('BOOKING_NO_LONGER_CONFIRMED');

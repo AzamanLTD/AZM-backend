@@ -202,15 +202,10 @@ exports.confirmReservation = async (req, res) => {
         if (!profile) return res.status(404).json({ success: false, message: 'Business profile not found.' });
 
         const { reservationId } = req.params;
-        const existing = await prisma.reservation.findUnique({ where: { id: reservationId } });
-        if (!existing || existing.businessProfileId !== profile.id)
-            return res.status(404).json({ success: false, message: 'Reservation not found.' });
-        if (existing.status !== 'PENDING')
-            return res.status(409).json({ success: false, message: `Reservation is already ${existing.status}.` });
-
-        const updated = await prisma.reservation.update({
-            where: { id: reservationId },
-            data:  { status: 'CONFIRMED', confirmedAt: new Date(), businessNotes: req.body.businessNotes || null },
+        const updated = await reservationLifecycle.confirmReservation(prisma, {
+            reservationId,
+            businessProfileId: profile.id,
+            businessNotes: req.body.businessNotes || null,
         });
 
         // Fire-and-forget webhook for reservation confirmation
@@ -224,6 +219,9 @@ exports.confirmReservation = async (req, res) => {
 
         return res.status(200).json({ success: true, reservation: updated });
     } catch (err) {
+        if (err.code === 'RESERVATION_NOT_FOUND') return res.status(404).json({ success: false, message: err.message });
+        if (err.code === 'RESERVATION_CONFIRM_CONFLICT') return res.status(409).json({ success: false, message: err.message });
+        logger.error({ err }, '[reservation.confirm] atomic lifecycle failure');
         return res.status(500).json({ success: false, message: err.message });
     }
 };
@@ -271,23 +269,17 @@ exports.markNoShowReservation = async (req, res) => {
 exports.checkOutReservation = async (req, res) => {
     const prisma = req.app.get('prisma');
     try {
-        const userId  = req.user.id;
-        const profile = await prisma.businessProfile.findFirst({ where: { userId } });
-        if (!profile) return res.status(403).json({ success: false, message: 'Business profile required.' });
-
-        const { reservationId } = req.params;
-        const existing = await prisma.reservation.findUnique({ where: { id: reservationId } });
-        if (!existing || existing.businessProfileId !== profile.id)
-            return res.status(404).json({ success: false, message: 'Reservation not found.' });
-        if (existing.status !== 'CHECKED_IN')
-            return res.status(409).json({ success: false, message: 'Can only check-out a CHECKED_IN reservation.' });
-
-        const updated = await prisma.reservation.update({
-            where: { id: reservationId },
-            data:  { status: 'CHECKED_OUT', checkedOutAt: new Date() },
+        const updated = await reservationLifecycle.checkOutReservation(prisma, {
+            reservationId: req.params.reservationId,
+            businessUserId: req.user.id,
         });
         return res.status(200).json({ success: true, reservation: updated });
     } catch (err) {
+        if (err.code === 'RESERVATION_NOT_FOUND') return res.status(404).json({ success: false, message: err.message });
+        if (['RESERVATION_NOT_CHECKOUT_READY', 'RESERVATION_STATE_CONFLICT'].includes(err.code)) {
+            return res.status(409).json({ success: false, message: err.message });
+        }
+        logger.error({ err }, '[reservation.checkout] atomic lifecycle failure');
         return res.status(500).json({ success: false, message: err.message });
     }
 };

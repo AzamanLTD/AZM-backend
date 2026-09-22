@@ -226,7 +226,7 @@ describeOrSkip('r29 reservation lifecycle economic authority (real PostgreSQL)',
     });
 
     test('C1 configured no-show penalty performs one canonical split', async () => {
-        const ctx = await seedReservation({ penaltyPct: 0.25 });
+        const ctx = await seedReservation({ penaltyPct: 0.25, endPast: true });
         const escrowId = await fund(ctx);
         const before = await balances(ctx);
         const result = await lifecycle.markNoShowReservation(prisma, { reservationId: ctx.reservation.id, businessUserId: ctx.owner.id });
@@ -240,7 +240,7 @@ describeOrSkip('r29 reservation lifecycle economic authority (real PostgreSQL)',
     });
 
     test('C2 no-penalty funded no-show fully refunds instead of stranding custody', async () => {
-        const ctx = await seedReservation();
+        const ctx = await seedReservation({ endPast: true });
         const escrowId = await fund(ctx);
         const result = await lifecycle.markNoShowReservation(prisma, { reservationId: ctx.reservation.id, worker: true });
         expect(result.status).toBe('NO_SHOW');
@@ -250,7 +250,7 @@ describeOrSkip('r29 reservation lifecycle economic authority (real PostgreSQL)',
     });
 
     test('C3 no-escrow no-show is a legitimate state-only transition', async () => {
-        const ctx = await seedReservation();
+        const ctx = await seedReservation({ endPast: true });
         const result = await lifecycle.markNoShowReservation(prisma, { reservationId: ctx.reservation.id, worker: true });
         expect(result.status).toBe('NO_SHOW');
         expect(await prisma.transactionHistory.count({ where: { type: { in: ['TICKET_ESCROW_REFUND', 'TICKET_ESCROW_RELEASE'] } } })).toBe(0);
@@ -268,7 +268,7 @@ describeOrSkip('r29 reservation lifecycle economic authority (real PostgreSQL)',
     });
 
     test('C5 disputed escrow remains in custody and reservation stays CONFIRMED', async () => {
-        const ctx = await seedReservation({ penaltyPct: 0.25 });
+        const ctx = await seedReservation({ penaltyPct: 0.25, endPast: true });
         const escrowId = await fund(ctx);
         await prisma.smartEscrow.update({ where: { id: escrowId }, data: { status: 'DISPUTED' } });
         await expect(lifecycle.markNoShowReservation(prisma, { reservationId: ctx.reservation.id, worker: true })).rejects.toMatchObject({ code: 'ESCROW_IN_DISPUTE' });
@@ -277,7 +277,7 @@ describeOrSkip('r29 reservation lifecycle economic authority (real PostgreSQL)',
     });
 
     test('D1 cancellation vs no-show admits exactly one matching terminal economy', async () => {
-        const ctx = await seedReservation({ penaltyPct: 0.25 });
+        const ctx = await seedReservation({ penaltyPct: 0.25, endPast: true });
         const escrowId = await fund(ctx);
         await Promise.allSettled([
             lifecycle.cancelReservation(prisma, { reservationId: ctx.reservation.id, customerId: ctx.customer.id }),
@@ -293,7 +293,7 @@ describeOrSkip('r29 reservation lifecycle economic authority (real PostgreSQL)',
     });
 
     test('D2 check-in vs no-show admits exactly one matching terminal economy', async () => {
-        const ctx = await seedReservation({ penaltyPct: 0.25 });
+        const ctx = await seedReservation({ penaltyPct: 0.25, endPast: true });
         const escrowId = await fund(ctx);
         await Promise.allSettled([
             lifecycle.checkInReservation(prisma, { reservationId: ctx.reservation.id, businessUserId: ctx.owner.id }),
@@ -309,11 +309,197 @@ describeOrSkip('r29 reservation lifecycle economic authority (real PostgreSQL)',
     });
 
     test('D3 two concurrent no-shows produce one split and one terminal state', async () => {
-        const ctx = await seedReservation({ penaltyPct: 0.25 });
+        const ctx = await seedReservation({ penaltyPct: 0.25, endPast: true });
         const escrowId = await fund(ctx);
         const outcomes = await Promise.allSettled([1, 2].map(() => lifecycle.markNoShowReservation(prisma, { reservationId: ctx.reservation.id, worker: true })));
         expect(outcomes.every(x => x.status === 'fulfilled')).toBe(true);
         expect((await prisma.reservation.findUnique({ where: { id: ctx.reservation.id } })).status).toBe('NO_SHOW');
         expect(await economicCounts(escrowId)).toMatchObject({ splitLedgers: 1, refunds: 1, releases: 1 });
     });
+
+    test('C6 owner cannot mark no-show before end time and the failed attempt has zero mutation', async () => {
+        const ctx = await seedReservation({ penaltyPct: 0.25 });
+        const escrowId = await fund(ctx);
+        const before = {
+            reservation: await prisma.reservation.findUnique({ where: { id: ctx.reservation.id } }),
+            escrow: await prisma.smartEscrow.findUnique({ where: { id: escrowId } }),
+            balances: await balances(ctx),
+            counts: await economicCounts(escrowId),
+        };
+
+        await expect(lifecycle.markNoShowReservation(prisma, {
+            reservationId: ctx.reservation.id,
+            businessUserId: ctx.owner.id,
+        })).rejects.toMatchObject({ code: 'RESERVATION_NOT_NO_SHOW_READY' });
+
+        const after = {
+            reservation: await prisma.reservation.findUnique({ where: { id: ctx.reservation.id } }),
+            escrow: await prisma.smartEscrow.findUnique({ where: { id: escrowId } }),
+            balances: await balances(ctx),
+            counts: await economicCounts(escrowId),
+        };
+        expect(after.reservation.status).toBe('CONFIRMED');
+        expect(after.reservation.updatedAt).toEqual(before.reservation.updatedAt);
+        expect(after.escrow.status).toBe(before.escrow.status);
+        expect(after.balances).toEqual(before.balances);
+        expect(after.counts).toEqual(before.counts);
+    });
+
+    test('C7 owner no-show after end time with configured penalty splits exactly once', async () => {
+        const ctx = await seedReservation({ penaltyPct: 0.25, endPast: true });
+        const escrowId = await fund(ctx);
+        const outcomes = await Promise.allSettled([1, 2].map(() => lifecycle.markNoShowReservation(prisma, {
+            reservationId: ctx.reservation.id,
+            businessUserId: ctx.owner.id,
+        })));
+        expect(outcomes.every(result => result.status === 'fulfilled')).toBe(true);
+        expect((await prisma.reservation.findUnique({ where: { id: ctx.reservation.id } })).status).toBe('NO_SHOW');
+        expect(await economicCounts(escrowId)).toMatchObject({ refunds: 1, releases: 1, splitLedgers: 1 });
+    });
+
+    test('C8 owner no-show after end time without penalty refunds exactly once', async () => {
+        const ctx = await seedReservation({ endPast: true });
+        const escrowId = await fund(ctx);
+        const outcomes = await Promise.allSettled([1, 2].map(() => lifecycle.markNoShowReservation(prisma, {
+            reservationId: ctx.reservation.id,
+            businessUserId: ctx.owner.id,
+        })));
+        expect(outcomes.every(result => result.status === 'fulfilled')).toBe(true);
+        expect((await prisma.reservation.findUnique({ where: { id: ctx.reservation.id } })).status).toBe('NO_SHOW');
+        expect((await prisma.smartEscrow.findUnique({ where: { id: escrowId } })).status).toBe('REFUNDED');
+        expect(await economicCounts(escrowId)).toMatchObject({ refunds: 1, refundLedgers: 1 });
+    });
+
+    test('C9 rejected early no-show remains eligible for the later worker sweep', async () => {
+        const ctx = await seedReservation({ penaltyPct: 0.25 });
+        const escrowId = await fund(ctx);
+        await expect(lifecycle.markNoShowReservation(prisma, {
+            reservationId: ctx.reservation.id,
+            businessUserId: ctx.owner.id,
+        })).rejects.toMatchObject({ code: 'RESERVATION_NOT_NO_SHOW_READY' });
+
+        await prisma.reservation.update({
+            where: { id: ctx.reservation.id },
+            data: { endDatetime: new Date(Date.now() - 1000) },
+        });
+        const { sweepNoShowReservations } = require('../workers/reservationNoShowWorker');
+        const sweep = await sweepNoShowReservations(prisma);
+        expect(sweep).toMatchObject({ processed: 1, penalized: 1, errors: 0 });
+        expect((await prisma.reservation.findUnique({ where: { id: ctx.reservation.id } })).status).toBe('NO_SHOW');
+        expect(await economicCounts(escrowId)).toMatchObject({ splitLedgers: 1 });
+    });
+
+    test('E1 confirmation racing customer cancellation cannot resurrect the cancelled reservation', async () => {
+        const ctx = await seedReservation({ status: 'PENDING' });
+        await Promise.allSettled([
+            lifecycle.confirmReservation(prisma, {
+                reservationId: ctx.reservation.id,
+                businessProfileId: ctx.biz.id,
+            }),
+            lifecycle.cancelReservation(prisma, {
+                reservationId: ctx.reservation.id,
+                customerId: ctx.customer.id,
+            }),
+        ]);
+        const reservation = await prisma.reservation.findUnique({ where: { id: ctx.reservation.id } });
+        expect(reservation.status).toBe('CANCELLED_CUSTOMER');
+    });
+
+    test('E2 confirmation is compatible with concurrent escrow creation and funding', async () => {
+        const creationCtx = await seedReservation({ status: 'PENDING' });
+        const creation = await Promise.all([
+            lifecycle.confirmReservation(prisma, {
+                reservationId: creationCtx.reservation.id,
+                businessProfileId: creationCtx.biz.id,
+            }),
+            escrowSvc.createBookingEscrow(prisma, {
+                bookingType: 'RESERVATION', bookingId: creationCtx.reservation.id,
+                payerId: creationCtx.customer.id, payeeId: creationCtx.owner.id,
+                amountUsdc: 40, businessProfileId: creationCtx.biz.id,
+            }),
+        ]);
+        expect(creation[0].status).toBe('CONFIRMED');
+        expect(creation[1].escrow.status).toBe('DRAFT');
+
+        const fundingCtx = await seedReservation({ status: 'PENDING' });
+        const { escrow } = await escrowSvc.createBookingEscrow(prisma, {
+            bookingType: 'RESERVATION', bookingId: fundingCtx.reservation.id,
+            payerId: fundingCtx.customer.id, payeeId: fundingCtx.owner.id,
+            amountUsdc: 40, businessProfileId: fundingCtx.biz.id,
+        });
+        const funding = await Promise.all([
+            lifecycle.confirmReservation(prisma, {
+                reservationId: fundingCtx.reservation.id,
+                businessProfileId: fundingCtx.biz.id,
+            }),
+            escrowSvc.fundBookingEscrow(prisma, {
+                escrowId: escrow.id, payerId: fundingCtx.customer.id,
+                bookingType: 'RESERVATION', bookingId: fundingCtx.reservation.id,
+            }),
+        ]);
+        expect(funding[0].status).toBe('CONFIRMED');
+        expect(funding[1].escrow.status).toBe('FUNDED');
+    });
+
+    test('E3 repeated concurrent confirmations admit one CAS winner', async () => {
+        const ctx = await seedReservation({ status: 'PENDING' });
+        const outcomes = await Promise.allSettled([1, 2].map(() => lifecycle.confirmReservation(prisma, {
+            reservationId: ctx.reservation.id,
+            businessProfileId: ctx.biz.id,
+        })));
+        expect(outcomes.filter(result => result.status === 'fulfilled')).toHaveLength(1);
+        expect(outcomes.filter(result => result.status === 'rejected')).toHaveLength(1);
+        expect(outcomes.find(result => result.status === 'rejected').reason).toMatchObject({ code: 'RESERVATION_CONFIRM_CONFLICT' });
+        expect((await prisma.reservation.findUnique({ where: { id: ctx.reservation.id } })).status).toBe('CONFIRMED');
+    });
+
+    test('E4 stale confirmation after cancellation is rejected without mutation', async () => {
+        const ctx = await seedReservation({ status: 'PENDING' });
+        await lifecycle.cancelReservation(prisma, {
+            reservationId: ctx.reservation.id,
+            customerId: ctx.customer.id,
+        });
+        const before = await prisma.reservation.findUnique({ where: { id: ctx.reservation.id } });
+        await expect(lifecycle.confirmReservation(prisma, {
+            reservationId: ctx.reservation.id,
+            businessProfileId: ctx.biz.id,
+        })).rejects.toMatchObject({ code: 'RESERVATION_CONFIRM_CONFLICT' });
+        const after = await prisma.reservation.findUnique({ where: { id: ctx.reservation.id } });
+        expect(after.status).toBe('CANCELLED_CUSTOMER');
+        expect(after.updatedAt).toEqual(before.updatedAt);
+    });
+
+    test('E5 stale confirmation after a later lifecycle transition cannot resurrect state', async () => {
+        const ctx = await seedReservation({ status: 'PENDING' });
+        await lifecycle.confirmReservation(prisma, {
+            reservationId: ctx.reservation.id,
+            businessProfileId: ctx.biz.id,
+        });
+        await lifecycle.checkInReservation(prisma, {
+            reservationId: ctx.reservation.id,
+            businessUserId: ctx.owner.id,
+        });
+        await expect(lifecycle.confirmReservation(prisma, {
+            reservationId: ctx.reservation.id,
+            businessProfileId: ctx.biz.id,
+        })).rejects.toMatchObject({ code: 'RESERVATION_CONFIRM_CONFLICT' });
+        expect((await prisma.reservation.findUnique({ where: { id: ctx.reservation.id } })).status).toBe('CHECKED_IN');
+    });
+
+    test('E6 cross-business confirmation has zero mutation', async () => {
+        const ctx = await seedReservation({ status: 'PENDING' });
+        const other = await seedBusiness(prisma);
+        const before = await prisma.reservation.findUnique({ where: { id: ctx.reservation.id } });
+        await expect(lifecycle.confirmReservation(prisma, {
+            reservationId: ctx.reservation.id,
+            businessProfileId: other.biz.id,
+            businessNotes: 'must not persist',
+        })).rejects.toMatchObject({ code: 'RESERVATION_NOT_FOUND' });
+        const after = await prisma.reservation.findUnique({ where: { id: ctx.reservation.id } });
+        expect(after.status).toBe('PENDING');
+        expect(after.businessNotes).toBe(before.businessNotes);
+        expect(after.confirmedAt).toBeNull();
+        expect(after.updatedAt).toEqual(before.updatedAt);
+    });
+
 });
