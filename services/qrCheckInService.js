@@ -116,31 +116,27 @@ const verifyAndCheckIn = async (prisma, { token, businessUserId }) => {
         throw new Error(`Reservation is ${reservation.status}, cannot check in.`);
     }
 
-    // Perform check-in
-    const updated = await prisma.reservation.update({
+    if (reservation.customerId !== payload.cid) {
+        throw new Error('Token customer does not match reservation.');
+    }
+
+    // r29: QR and direct check-in share the same atomic lifecycle boundary.
+    // A failed escrow release can no longer leave CHECKED_IN committed or be
+    // swallowed as a successful scan.
+    const { checkInReservation } = require('./reservationLifecycleService');
+    await checkInReservation(prisma, {
+        reservationId: reservation.id,
+        businessUserId,
+    });
+    const updated = await prisma.reservation.findUnique({
         where: { id: reservation.id },
-        data: { status: 'CHECKED_IN', checkedInAt: new Date() },
         include: {
             customer: { select: { id: true, username: true, azamanId: true, profilePictureUrl: true } },
             businessProfile: { select: { id: true, businessName: true } }
         }
     });
 
-    // Release escrow to the business if one exists
-    if (reservation.escrowId) {
-        try {
-            const { releaseBookingEscrow } = require('./bookingEscrowService');
-            await releaseBookingEscrow(prisma, { escrowId: reservation.escrowId });
-        } catch (err) {
-            logger.error({ err: err }, '[qrCheckIn] escrow release failed');
-        }
-    }
-
-    return {
-        success: true,
-        reservation: updated,
-        customerAzamanId: payload.azm,
-    };
+    return { success: true, reservation: updated, customerAzamanId: payload.azm };
 };
 
 // =============================================================================

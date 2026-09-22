@@ -20,76 +20,48 @@ const GRACE_PERIOD_MINS = 30; // grace after departure before marking transit no
 // =============================================================================
 const sweepNoShowReservations = async (prisma) => {
     const now = new Date();
-
-    // Find CONFIRMED reservations where endDatetime has passed and no check-in
+    // Include both escrow-backed and unescrowed bookings. The lifecycle
+    // authority decides whether to refund/split/expire or transition only.
     const overdue = await prisma.reservation.findMany({
-        where: {
-            status: 'CONFIRMED',
-            checkedInAt: null,
-            endDatetime: { lt: now },
-            escrowId: { not: null },
-        },
+        where: { status: 'CONFIRMED', checkedInAt: null, endDatetime: { lt: now } },
         include: { escrow: true }
     });
 
     const results = { processed: 0, penalized: 0, errors: 0, details: [] };
+    const { markNoShowReservation } = require('../services/reservationLifecycleService');
 
     for (const reservation of overdue) {
         try {
             results.processed++;
-
-            // Determine penalty amount
-            const penaltyPct = reservation.noShowPenaltyPct
-                ? Number(reservation.noShowPenaltyPct) : null;
-            const penaltyFlat = reservation.noShowPenaltyUsdc
-                ? Number(reservation.noShowPenaltyUsdc) : null;
-
-            // If no penalty is configured, just mark as no-show without charging
-            if (!penaltyPct && !penaltyFlat) {
-                await prisma.reservation.update({
-                    where: { id: reservation.id },
-                    data: { status: 'NO_SHOW' }
-                });
-                results.details.push({ id: reservation.id, action: 'NO_SHOW_NO_PENALTY' });
-                continue;
-            }
-
-            // Charge penalty via split-release
-            const { splitReleaseFundedEscrow } = require('../services/bookingEscrowService');
-            const result = await splitReleaseFundedEscrow(prisma, {
-                escrowId: reservation.escrowId,
-                penaltyPct: penaltyPct,
-                penaltyFlatUsdc: penaltyFlat,
-                reason: 'Reservation no-show sweep',
-                bookingType: 'RESERVATION',
-                bookingId: reservation.id,
+            const updated = await markNoShowReservation(prisma, {
+                reservationId: reservation.id,
+                worker: true,
             });
-
-            results.penalized++;
+            const penaltyAmount = Number(updated.penaltyAmountUsdc || 0);
+            if (penaltyAmount > 0) results.penalized++;
             results.details.push({
                 id: reservation.id,
-                action: 'PENALTY_CHARGED',
-                penaltyAmount: result.penaltyAmount,
-                refundAmount: result.refundAmount,
+                action: penaltyAmount > 0 ? 'PENALTY_CHARGED' : 'NO_SHOW_NO_PENALTY',
+                penaltyAmount,
+                refundAmount: reservation.escrow
+                    ? Number(reservation.escrow.amountUsdc) - penaltyAmount
+                    : 0,
             });
 
-            // MARKETPLACE v2: Update customer trust score
+            // Trust scoring is post-commit/non-authoritative. A scoring outage
+            // cannot roll back or misreport the financial lifecycle outcome.
             try {
                 const { recordBookingOutcome } = require('../services/customerTrustScoreService');
-                await recordBookingOutcome(prisma, {
-                    customerId: reservation.customerId || (await prisma.reservation.findUnique({ where: { id: reservation.id }, select: { customerId: true } })).customerId,
-                    outcome: 'NO_SHOW'
-                });
+                await recordBookingOutcome(prisma, { customerId: reservation.customerId, outcome: 'NO_SHOW' });
             } catch (e) {
                 logger.error(`[noShowWorker] Trust score update failed for reservation ${reservation.id}:`, e.message);
             }
         } catch (err) {
             results.errors++;
-            results.details.push({ id: reservation.id, error: err.message });
+            results.details.push({ id: reservation.id, error: err.message, code: err.code || null });
             logger.error(`[noShowWorker] Reservation ${reservation.id}:`, err.message);
         }
     }
-
     return results;
 };
 
