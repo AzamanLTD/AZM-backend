@@ -47,3 +47,14 @@ The old transit trip-cancel route's invalid `CHECKED_IN` enum filter plus a
 non-existent `transitTripId` column made POST /api/business/transit/trips/:id/cancel
 throw on every call (PrismaClientValidationError / P2022) while stranding any
 funded escrows. Fixed in r27 via `services/transitTripCancellationService.js`.
+
+## Existing trip-cancellation test coverage (brief item: tautology check)
+Searched the full battery for any test exercising the trip-cancel route or the
+transit NO_SHOW path. Result: **no pre-existing test touches either path.**
+`transit-trip-crud.test.js` and `transitOpsService.business-scope.test.js`
+have no cancel coverage; `phase2` asserts only that route files are mounted;
+`penalty-policy-outcome.test.js` uses "trip cancelled" as a reason string
+only. So there were no tautological tests to fix — the defect class shipped
+because the route had **zero** test coverage, which is also why the
+PrismaClientValidationError on every call was never caught. The two r27 suites
+close that gap with real-PostgreSQL proofs.
