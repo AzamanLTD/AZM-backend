@@ -357,7 +357,11 @@ router.post('/employees', requirePermission('employees.create'), wrap(async (req
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
     const { logBusinessAudit } = require('../utils/businessAudit');
-    const employee = await svc.employeeService.addEmployee({ ...req.body, businessProfileId: bpId });
+    // r26/P0-A — pass the authenticated actor context: the service enforces
+    // the creation delegation ceiling against the actor's EFFECTIVE set
+    // (server-derived; never req.body).
+    const creationActor = { id: req.user.id, permissions: req.resolvedPermissions || [] };
+    const employee = await svc.employeeService.addEmployee({ ...req.body, businessProfileId: bpId }, { actor: creationActor });
     await logBusinessAudit(svc.prisma, { businessProfileId: bpId, actorId: req.user.id, actorName: req.user.username, action: 'EMPLOYEE_CREATED', targetType: 'Employee', targetId: employee.id, metadata: { name: employee.fullName, email: employee.email, role: employee.role }, ipAddress: req.ip });
     res.status(201).json({ success: true, employee });
 }));
@@ -400,6 +404,23 @@ router.patch('/employees/:id/status', requirePermission('employees.terminate'), 
     const employee = await svc.employeeService.updateStatus(req.params.id, bpId, req.body.status);
     const { logBusinessAudit } = require('../utils/businessAudit');
     await logBusinessAudit(svc.prisma, { businessProfileId: bpId, actorId: req.user.id, actorName: req.user.username, action: 'EMPLOYEE_STATUS_CHANGED', targetType: 'Employee', targetId: req.params.id, metadata: { status: req.body.status }, ipAddress: req.ip });
+
+// PATCH /api/business-os/employees/:id/role — r26/P0-B (follow-up review)
+// Role changes are AUTHORITY-BEARING: they reseed the target's permission set
+// from the role template. They live behind the permission authority
+// (employees.permissions) on a DEDICATED route, with a service-enforced
+// delegation ceiling on the resulting template. The generic employees.update
+// PATCH refuses `role` outright — a role change can no longer ride an
+// ordinary profile update.
+router.patch('/employees/:id/role', requirePermission('employees.permissions'), wrap(async (req, res) => {
+    const svc = getServices(req);
+    const bpId = await getBusinessProfileId(req);
+    const { logBusinessAudit } = require('../utils/businessAudit');
+    const roleActor = { id: req.user.id, permissions: req.resolvedPermissions || [] };
+    const employee = await svc.employeeService.updateRole(req.params.id, bpId, req.body.role, { actor: roleActor });
+    await logBusinessAudit(svc.prisma, { businessProfileId: bpId, actorId: req.user.id, actorName: req.user.username, action: 'EMPLOYEE_ROLE_CHANGED', targetType: 'Employee', targetId: employee.id, metadata: { role: employee.role }, ipAddress: req.ip });
+    res.json({ success: true, employee });
+}));
     res.status(200).json({ success: true, employee });
 }));
 
@@ -412,7 +433,7 @@ router.post('/employees/:id/permissions', requirePermission('employees.permissio
     // effective permissions. requirePermission resolved them for THIS
     // business (owners/admins hold ['*']); the actor context is derived from
     // the server-side resolution — never from the request body.
-    const actor = { id: req.user.id, permissions: req.resolvedPermissions || ['*'] };
+    const actor = { id: req.user.id, permissions: req.resolvedPermissions || [] };
     const employee = await svc.employeeService.updatePermissions(req.params.id, bpId, req.body.permissions, { actor });
     await logBusinessAudit(svc.prisma, { businessProfileId: bpId, actorId: req.user.id, actorName: req.user.username, action: 'PERMISSION_CHANGED', targetType: 'Employee', targetId: req.params.id, metadata: { permissions: req.body.permissions }, ipAddress: req.ip });
     res.json({ success: true, employee });
@@ -1749,10 +1770,17 @@ router.post('/restaurant/inventory/deduct/:orderId', requirePermission('restaura
 
 // GET /api/business-os/permission-templates — list all available templates + keys
 router.get('/permission-templates', wrap(async (req, res) => {
-    const { PERMISSION_KEYS, ALL_KEYS, ROLE_TEMPLATES } = require('../config/permissionTemplates');
+    const { PERMISSION_KEYS, ALL_KEYS, ROLE_TEMPLATES, EMPLOYEE_ROLE_TEMPLATES, ASSIGNABLE_EMPLOYEE_ROLES } = require('../config/permissionTemplates');
     res.json({
         success: true,
         templates: ROLE_TEMPLATES,
+        // r26/P0-B portal alignment — the backend-authoritative per-role
+        // default permission sets, so the UI can offer ONLY the roles the
+        // actor may actually assign (template within their ceiling). OWNER
+        // is excluded — it is never assignable to an employee row.
+        employeeTemplates: Object.fromEntries(
+            ASSIGNABLE_EMPLOYEE_ROLES.map((role) => [role, EMPLOYEE_ROLE_TEMPLATES[role].permissions]),
+        ),
         permissionKeys: PERMISSION_KEYS,
         allKeys: ALL_KEYS,
     });

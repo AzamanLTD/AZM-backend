@@ -99,6 +99,7 @@ async function setupFixtures() {
     const { EmployeeService } = require('../services/businessOS/employeeService');
     const employeeService = new EmployeeService(prisma);
 
+    const ownerActor = { id: businessOwner.id, permissions: ['*'] };
     testEmployee = await employeeService.addEmployee({
         businessProfileId: businessProfile.id,
         userId: empUser.id,
@@ -107,7 +108,7 @@ async function setupFixtures() {
         hourlyRate: 15.00,
         title: 'Head Housekeeper',
         department: 'Housekeeping',
-    });
+    }, { actor: ownerActor });
 
     secondEmployee = await employeeService.addEmployee({
         businessProfileId: businessProfile.id,
@@ -117,7 +118,7 @@ async function setupFixtures() {
         salaryAmount: 1200.00,
         title: 'Senior Driver',
         department: 'Transit',
-    });
+    }, { actor: ownerActor });
 
     // Create a hotel room
     testRoom = await prisma.hotelRoom.create({
@@ -315,7 +316,7 @@ describeIf('Business OS — Employee Management', () => {
                 businessProfileId: otherBp.id,
                 userId: testEmployee.userId,
                 role: 'STAFF',
-            })
+            }, { actor: { id: businessOwner.id, permissions: ['*'] } })
         ).rejects.toThrow();
 
         // Cleanup

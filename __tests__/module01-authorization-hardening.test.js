@@ -17,6 +17,11 @@ const { PrismaClient } = require('@prisma/client');
 const bcrypt = require('bcryptjs');
 const { resolveBusinessContext, resolvePermissions } = require('../middleware/requirePermission');
 const { EmployeeService } = require('../services/businessOS/employeeService');
+const { normalizePermissions, EMPLOYEE_ROLE_TEMPLATES } = require('../config/permissionTemplates');
+// ROLE_PERMISSIONS as used by the service (role -> template permissions):
+const ROLE_PERMISSIONS = Object.fromEntries(
+    Object.entries(EMPLOYEE_ROLE_TEMPLATES).map(([role, tpl]) => [role, tpl.permissions]),
+);
 
 const hasDb = !!process.env.TEST_DATABASE_URL;
 if (!hasDb) console.warn('[module01-hardening] TEST_DATABASE_URL not set — skipping.');
@@ -178,12 +183,16 @@ describeIf('P0-2 — OWNER role escalation refusal', () => {
         })).rejects.toThrow(/OWNER is not an assignable employee role/);
     });
 
-    test('updateEmployee refuses promotion into OWNER (update path)', async () => {
+    test('the generic update refuses role changes outright; updateRole refuses OWNER (update path)', async () => {
         const emp = await prisma.businessEmployee.create({
             data: { businessProfileId: businessA.id, userId: employeeUser.id, role: 'STAFF', permissions: [] },
         });
         try {
+            // r26/P0-B: role no longer rides the generic profile update.
             await expect(service.updateEmployee(emp.id, businessA.id, { role: 'OWNER' }))
+                .rejects.toThrow(/Role changes are authority-bearing/);
+            // And the dedicated role authority refuses OWNER before anything else.
+            await expect(service.updateRole(emp.id, businessA.id, 'OWNER', { actor: { id: ownerUser.id, permissions: ['*'] } }))
                 .rejects.toThrow(/OWNER is not an assignable employee role/);
             const after = await prisma.businessEmployee.findUnique({ where: { id: emp.id } });
             expect(after.role).toBe('STAFF'); // unchanged — fail closed, no partial mutation
@@ -203,7 +212,8 @@ describeIf('P0-2 — OWNER role escalation refusal', () => {
             userId: employeeUser.id,
             role: 'MANAGER',
             permissions: ['*'],
-        })).rejects.toThrow(/Wildcard permissions are not assignable/);
+        }, { actor: { id: ownerUser.id, permissions: ['*'] } }))
+            .rejects.toThrow(/Wildcard/);
     });
 });
 
@@ -247,8 +257,16 @@ describeIf('P0-3 — profile mutation vs. permission/termination authority', () 
         expect(updated.status).toBe('ACTIVE');
     });
 
-    test('role changes reseed role defaults but never escalate', async () => {
-        const updated = await service.updateEmployee(emp.id, businessA.id, { role: 'MANAGER' });
+    test('role changes are refused on the generic PATCH and reseeded only via the dedicated role authority', async () => {
+        // r26/P0-B: the generic employees.update path refuses role outright.
+        await expect(service.updateEmployee(emp.id, businessA.id, { role: 'MANAGER' }))
+            .rejects.toThrow(/Role changes are authority-bearing/);
+        let after = await prisma.businessEmployee.findUnique({ where: { id: emp.id } });
+        expect(after.role).toBe('STAFF');
+        expect(after.permissions).toEqual(['shifts.view']); // unchanged
+
+        // The owner, through the dedicated authority, reseeds role defaults:
+        const updated = await service.updateRole(emp.id, businessA.id, 'MANAGER', { actor: { id: ownerUser.id, permissions: ['*'] } });
         expect(updated.role).toBe('MANAGER');
         // MANAGER template default (GENERAL_MANAGER) — includes employees.view:
         expect(updated.permissions).toContain('employees.view');
@@ -465,5 +483,263 @@ describeIf('P0-6 — legacy rows and effective permissions agree', () => {
         } finally {
             await prisma.businessEmployee.delete({ where: { id: emp.id } }).catch(() => {});
         }
+    });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// P0-A (follow-up review) — CREATION DELEGATION CEILING (addEmployee)
+//
+// The create route requires employees.create, but that alone must not let an
+// actor mint authority they do not hold. Every permission granted at creation
+// (explicit OR role-default) must sit inside the creator's effective ceiling.
+// ═══════════════════════════════════════════════════════════════════════════
+describeIf('P0-A — creation delegation ceiling', () => {
+    const ownerActor = () => ({ id: ownerUser.id, permissions: ['*'] });
+    // A realistic limited creator: can create employees, holds the STAFF-level
+    // working set, but NOT the full MANAGER template (no finance.*, no
+    // employees.terminate, no employees.permissions ...).
+    const limitedManagerActor = () => ({
+        id: employeeUser.id,
+        permissions: ['employees.view', 'employees.create', 'employees.update',
+            'shifts.view', 'feedback.give', 'feedback.view', 'notifications.view'],
+    });
+
+    // Fresh target user per creation test (with cleanup).
+    let targetCounter = 0;
+    async function mkTarget() {
+        targetCounter += 1;
+        const user = await mkUser(`m01target${targetCounter}`, 'USER');
+        return user;
+    }
+    async function cleanupTarget(user, employeeId) {
+        if (employeeId) await prisma.businessEmployee.delete({ where: { id: employeeId } }).catch(() => {});
+        if (user) await prisma.user.delete({ where: { id: user.id } }).catch(() => {});
+    }
+
+    test('the owner creates a STAFF employee with role defaults', async () => {
+        const target = await mkTarget();
+        let employeeId;
+        try {
+            const emp = await service.addEmployee(
+                { businessProfileId: businessA.id, userId: target.id, role: 'STAFF' },
+                { actor: ownerActor() },
+            );
+            employeeId = emp.id;
+            expect(emp.role).toBe('STAFF');
+            expect(emp.permissions).toContain('shifts.view');
+            expect(emp.permissions).not.toContain('*');
+        } finally {
+            await cleanupTarget(target, employeeId);
+        }
+    });
+
+    test('the owner creates a MANAGER employee with the full manager template', async () => {
+        const target = await mkTarget();
+        let employeeId;
+        try {
+            const emp = await service.addEmployee(
+                { businessProfileId: businessA.id, userId: target.id, role: 'MANAGER' },
+                { actor: ownerActor() },
+            );
+            employeeId = emp.id;
+            expect(emp.role).toBe('MANAGER');
+            expect(emp.permissions).toContain('employees.create');
+            expect(emp.permissions).toContain('finance.view');
+        } finally {
+            await cleanupTarget(target, employeeId);
+        }
+    });
+
+    test('a limited creator may create a STAFF employee with allowed defaults', async () => {
+        const target = await mkTarget();
+        let employeeId;
+        try {
+            const emp = await service.addEmployee(
+                { businessProfileId: businessA.id, userId: target.id, role: 'STAFF' },
+                { actor: limitedManagerActor() },
+            );
+            employeeId = emp.id;
+            // STAFF template defaults sit inside the limited creator's ceiling.
+            expect(emp.permissions).toEqual(
+                expect.arrayContaining(['shifts.view', 'feedback.give', 'feedback.view', 'notifications.view']),
+            );
+        } finally {
+            await cleanupTarget(target, employeeId);
+        }
+    });
+
+    test('a limited creator cannot grant an out-of-ceiling permission at creation', async () => {
+        const target = await mkTarget();
+        try {
+            await expect(service.addEmployee(
+                { businessProfileId: businessA.id, userId: target.id, role: 'STAFF', permissions: ['shifts.view', 'finance.ledger.manage'] },
+                { actor: limitedManagerActor() },
+            )).rejects.toThrow(/delegation ceiling exceeded.*finance\.ledger\.manage/);
+        } finally {
+            await cleanupTarget(target);
+        }
+    });
+
+    test('a limited creator cannot select a role whose template exceeds their ceiling (MANAGER)', async () => {
+        const target = await mkTarget();
+        try {
+            await expect(service.addEmployee(
+                { businessProfileId: businessA.id, userId: target.id, role: 'MANAGER' },
+                { actor: limitedManagerActor() },
+            )).rejects.toThrow(/delegation ceiling exceeded/);
+        } finally {
+            await cleanupTarget(target);
+        }
+    });
+
+    test("a limited creator cannot create an employee with permissions: ['*']", async () => {
+        const target = await mkTarget();
+        try {
+            await expect(service.addEmployee(
+                { businessProfileId: businessA.id, userId: target.id, role: 'STAFF', permissions: ['*'] },
+                { actor: limitedManagerActor() },
+            )).rejects.toThrow(/Wildcard/);
+        } finally {
+            await cleanupTarget(target);
+        }
+    });
+
+    test('an unknown permission key is refused at creation (canonical vocabulary only)', async () => {
+        const target = await mkTarget();
+        try {
+            await expect(service.addEmployee(
+                { businessProfileId: businessA.id, userId: target.id, role: 'STAFF', permissions: ['shifts.view', 'not.a.real.key'] },
+                { actor: ownerActor() },
+            )).rejects.toThrow(/Unknown permission key\(s\): not\.a\.real\.key/);
+        } finally {
+            await cleanupTarget(target);
+        }
+    });
+
+    test('no actor context fails closed at creation', async () => {
+        const target = await mkTarget();
+        try {
+            await expect(service.addEmployee(
+                { businessProfileId: businessA.id, userId: target.id, role: 'STAFF' },
+            )).rejects.toThrow(/Employee creation requires the authenticated actor context/);
+        } finally {
+            await cleanupTarget(target);
+        }
+    });
+
+    test('cross-business targets remain impossible (user already employed elsewhere)', async () => {
+        const target = await mkTarget();
+        let employeeId;
+        try {
+            // The target already works for business B.
+            const bEmp = await prisma.businessEmployee.create({
+                data: { businessProfileId: businessB.id, userId: target.id, role: 'STAFF', permissions: ['shifts.view'] },
+            });
+            employeeId = bEmp.id;
+            await expect(service.addEmployee(
+                { businessProfileId: businessA.id, userId: target.id, role: 'STAFF' },
+                { actor: ownerActor() },
+            )).rejects.toThrow(/already employed at another business/);
+        } finally {
+            await cleanupTarget(target, employeeId);
+        }
+    });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// P0-B (follow-up review) — ROLE CHANGES ARE AUTHORITY-BEARING (updateRole)
+//
+// A role change reseeds the target's permission set, so it lives behind the
+// permission authority (employees.permissions) with a delegation ceiling on
+// the RESULTING template. The generic employees.update refuses `role`.
+// ═══════════════════════════════════════════════════════════════════════════
+describeIf('P0-B — role-change authority', () => {
+    const ownerActor = () => ({ id: ownerUser.id, permissions: ['*'] });
+    // Holds employees.update but NOT the role-change authority.
+    const plainUpdaterActor = () => ({
+        id: employeeUser.id,
+        permissions: ['employees.view', 'employees.update', 'shifts.view'],
+    });
+    // Holds the role-change authority and a STAFF-covering ceiling.
+    const shiftLeadActor = () => ({
+        id: employeeUser.id,
+        permissions: ['employees.view', 'employees.update', 'employees.permissions',
+            'shifts.view', 'feedback.give', 'feedback.view', 'notifications.view'],
+    });
+
+    let target, targetUser;
+    beforeEach(async () => {
+        targetUser = await mkUser('m01roletarget', 'USER');
+        target = await prisma.businessEmployee.create({
+            data: { businessProfileId: businessA.id, userId: targetUser.id, role: 'STAFF', permissions: ['shifts.view', 'feedback.give'] },
+        });
+    });
+    afterEach(async () => {
+        await prisma.businessEmployee.delete({ where: { id: target.id } }).catch(() => {});
+        await prisma.user.delete({ where: { id: targetUser.id } }).catch(() => {});
+    });
+
+    test('the owner changes a role and the stored set reseeds exactly', async () => {
+        const updated = await service.updateRole(target.id, businessA.id, 'HOUSEKEEPER', { actor: ownerActor() });
+        expect(updated.role).toBe('HOUSEKEEPER');
+        const template = normalizePermissions(ROLE_PERMISSIONS.HOUSEKEEPER);
+        expect(updated.permissions.sort()).toEqual(template.sort());
+    });
+
+    test('a ceiling-limited actor with role authority may demote within their ceiling', async () => {
+        // The shift lead reseeds the target to STAFF — the STAFF template sits
+        // inside their own ceiling, so the change is legal.
+        const updated = await service.updateRole(target.id, businessA.id, 'STAFF', { actor: shiftLeadActor() });
+        expect(updated.role).toBe('STAFF');
+        expect(updated.permissions).toContain('shifts.view');
+    });
+
+    test('a promotion whose role template exceeds the actor ceiling is refused', async () => {
+        await expect(service.updateRole(target.id, businessA.id, 'MANAGER', { actor: shiftLeadActor() }))
+            .rejects.toThrow(/delegation ceiling exceeded/);
+        const after = await prisma.businessEmployee.findUnique({ where: { id: target.id } });
+        expect(after.role).toBe('STAFF'); // unchanged
+    });
+
+    test('an actor with employees.update but no role authority is refused', async () => {
+        await expect(service.updateRole(target.id, businessA.id, 'SUPERVISOR', { actor: plainUpdaterActor() }))
+            .rejects.toThrow(/Role changes require the "employees\.permissions" authority/);
+        const after = await prisma.businessEmployee.findUnique({ where: { id: target.id } });
+        expect(after.role).toBe('STAFF'); // unchanged
+    });
+
+    test('promotion into OWNER is impossible through the role authority', async () => {
+        await expect(service.updateRole(target.id, businessA.id, 'OWNER', { actor: ownerActor() }))
+            .rejects.toThrow(/OWNER is not an assignable employee role/);
+        const after = await prisma.businessEmployee.findUnique({ where: { id: target.id } });
+        expect(after.role).toBe('STAFF');
+    });
+
+    test('a failed role change leaves BOTH role and permissions unchanged', async () => {
+        await expect(service.updateRole(target.id, businessA.id, 'MANAGER', { actor: shiftLeadActor() }))
+            .rejects.toThrow();
+        const after = await prisma.businessEmployee.findUnique({ where: { id: target.id } });
+        expect(after.role).toBe('STAFF');
+        expect(after.permissions).toEqual(['shifts.view', 'feedback.give']); // exactly the pre-change set
+    });
+
+    test('a successful role change produces exactly the intended resulting set', async () => {
+        const template = normalizePermissions(ROLE_PERMISSIONS.WAITER);
+        const updated = await service.updateRole(target.id, businessA.id, 'WAITER', { actor: ownerActor() });
+        expect(updated.role).toBe('WAITER');
+        expect(updated.permissions.sort()).toEqual(template.sort());
+        // The previous set is fully replaced, not merged:
+        const stored = await prisma.businessEmployee.findUnique({ where: { id: target.id } });
+        expect(stored.permissions.sort()).toEqual(template.sort());
+    });
+
+    test('no actor context fails closed on the role authority', async () => {
+        await expect(service.updateRole(target.id, businessA.id, 'STAFF'))
+            .rejects.toThrow(/Role change requires the authenticated actor context/);
+    });
+
+    test('cross-business role changes remain impossible (tenant scope)', async () => {
+        await expect(service.updateRole(target.id, businessB.id, 'STAFF', { actor: ownerActor() }))
+            .rejects.toThrow(/Employee not found/);
     });
 });

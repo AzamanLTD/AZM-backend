@@ -196,12 +196,18 @@ function requirePermission(key) {
                 () => runWithBusinessRequestContext(requestContext, next),
             );
 
-            // Admin users (impersonating) get all permissions
+            // r26 follow-up: downstream authority paths (addEmployee,
+            // updateRole, updatePermissions) derive the actor's effective
+            // permission set from req.resolvedPermissions — it is now set on
+            // EVERY branch, so a handler never has to guess whether the
+            // caller is an owner/admin.
             if (context.isAdminImpersonation) {
+                req.resolvedPermissions = ['*'];
                 return runAuthorized();
             }
 
             const perms = await resolvePermissions(prisma, req.user.id, businessProfileId);
+            req.resolvedPermissions = perms;
 
             if (perms.includes('*')) {
                 return runAuthorized();

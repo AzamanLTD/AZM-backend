@@ -35,8 +35,46 @@ const assertAssignableRole = (role) => {
 // termination transitions belong to the terminate authority
 // (employees.terminate). Smuggling any of these through the generic update is
 // a hard, explicit failure — never a silent ignore.
-const EMPLOYEE_UPDATE_FORBIDDEN_FIELDS = ['permissions', 'status', 'terminationDate'];
-const EMPLOYEE_UPDATE_ALLOWED_FIELDS = ['role', 'title', 'department', 'payrollType', 'salaryAmount', 'hourlyRate', 'paymentPreference', 'emergencyContact', 'notes', 'ewaEligible'];
+const EMPLOYEE_UPDATE_FORBIDDEN_FIELDS = ['role', 'permissions', 'status', 'terminationDate'];
+// r26/P0-B (follow-up review): `role` is FORBIDDEN on the generic update —
+// a role change reseeds the permission set, which is an authority-bearing
+// mutation. It lives on the dedicated role authority (updateRole) behind
+// employees.permissions, with its own delegation ceiling.
+const EMPLOYEE_UPDATE_ALLOWED_FIELDS = ['title', 'department', 'payrollType', 'salaryAmount', 'hourlyRate', 'paymentPreference', 'emergencyContact', 'notes', 'ewaEligible'];
+
+// r26/P0-B (follow-up review) — ROLE CHANGES ARE AUTHORITY-BEARING. Changing
+// an employee's role reseeds their permission set from the role template, so
+// it can never ride the ordinary profile-update authority (employees.update).
+// The existing canonical permission-authority key (employees.permissions,
+// "Change permissions") serves as the role-management authority: a role
+// reseed IS a permission mutation. No new catalog key is needed.
+const ROLE_CHANGE_AUTHORITY = 'employees.permissions';
+
+// r26/P0-A (follow-up review) — shared delegation-ceiling assertion. A
+// non-unlimited actor may only mint a set that is a subset of their own
+// effective permissions. Used by BOTH creation (addEmployee — fresh set,
+// every key must be held by the actor) and role changes (updateRole — the
+// resulting template must sit inside the actor's ceiling).
+const assertWithinCeiling = (granted, actor, contextLabel) => {
+    const actorPerms = Array.isArray(actor.permissions) ? actor.permissions : [];
+    if (actorPerms.includes('*')) return; // owner/admin: unlimited
+    const ceiling = new Set(normalizePermissions(actorPerms));
+    const beyond = granted.filter((perm) => !ceiling.has(perm));
+    if (beyond.length > 0) {
+        throw new Error(
+            `${contextLabel}: delegation ceiling exceeded — you cannot grant permission(s) you do not hold (${beyond.join(', ')}).`
+        );
+    }
+};
+
+// r26/P0-A — the actor context is REQUIRED for any authority-bearing
+// mutation (creation, role change, permission change). Fail closed when absent.
+const requireActor = (actor, contextLabel) => {
+    if (!actor || actor.id == null) {
+        throw new Error(`${contextLabel} requires the authenticated actor context. Refusing.`);
+    }
+    return actor;
+};
 
 // Default permissions by role
 // ── Role defaults (Module 01) ─────────────────────────────────────────────────
@@ -57,12 +95,29 @@ class EmployeeService {
     // ── Create / Add Employee ──────────────────────────────────────────────
     // The business owner adds an employee by their Azaman user ID (or AZM-ID).
     // This links the user's consumer account to the business as an employee.
-    async addEmployee({ businessProfileId, userId, azmId, role = 'STAFF', title, department, payrollType = 'SALARY', salaryAmount, hourlyRate, paymentPreference = 'AZAMAN_BALANCE', permissions, emergencyContact, notes }) {
+    async addEmployee({ businessProfileId, userId, azmId, role = 'STAFF', title, department, payrollType = 'SALARY', salaryAmount, hourlyRate, paymentPreference = 'AZAMAN_BALANCE', permissions, emergencyContact, notes }, { actor } = {}) {
         // r26/P0-2: an employee row may never carry OWNER (fail closed).
         assertAssignableRole(role);
-        if (Array.isArray(permissions) && permissions.includes('*')) {
-            throw new Error('Wildcard permissions are not assignable to employees. Refusing.');
+        // r26/P0-A (follow-up review) — CREATION DELEGATION CEILING.
+        // The caller-supplied (or role-default) permission set is the set
+        // this employee will hold: every key must be canonical, never
+        // wildcard, and — unless the actor is the owner/admin — within the
+        // actor's own effective ceiling. A creator can never mint authority
+        // they do not hold.
+        requireActor(actor, 'Employee creation');
+        const candidatePermissions = normalizePermissions(
+            permissions || ROLE_PERMISSIONS[role] || ROLE_PERMISSIONS.STAFF,
+        );
+        if (candidatePermissions.includes('*')) {
+            throw new Error("Wildcard ('*') is reserved for business owners and admins — it cannot be granted to an employee. Refusing.");
         }
+        const unknownKeys = candidatePermissions.filter((perm) => !ALL_PERMISSION_KEYS.includes(perm));
+        if (unknownKeys.length > 0) {
+            throw new Error(`Unknown permission key(s): ${unknownKeys.join(', ')}. Grants must use the canonical catalog.`);
+        }
+        // Role defaults count too: a lower-authority actor cannot select a
+        // role whose template grants permissions beyond their own authority.
+        assertWithinCeiling(candidatePermissions, actor, 'Employee creation');
         // ── Module 01: resolve the worker's identity ─────────────────────────
         // The portal's "AZM-ID" field is the worker's Azaman @username (or
         // email). Accept a numeric userId as before, and additionally resolve
@@ -100,11 +155,8 @@ class EmployeeService {
         const user = await this.prisma.user.findUnique({ where: { id: userId } });
         if (!user) throw new Error('User not found.');
 
-        // Set default permissions based on role
-        // Normalize into dotted-key space: legacy strings expand, dedupe applies.
-        const finalPermissions = normalizePermissions(
-            permissions || ROLE_PERMISSIONS[role] || ROLE_PERMISSIONS.STAFF,
-        );
+        // The validated candidate set (canonical keys, within ceiling).
+        const finalPermissions = candidatePermissions;
 
         // Convert salaryAmount/hourlyRate to Decimal
         const salaryDecimal = salaryAmount ? parseFloat(salaryAmount) : null;
@@ -184,15 +236,14 @@ class EmployeeService {
         // route-level permission split cannot be bypassed through the body.
         for (const forbidden of EMPLOYEE_UPDATE_FORBIDDEN_FIELDS) {
             if (forbidden in updates && updates[forbidden] !== undefined) {
+                if (forbidden === 'role') {
+                    throw new Error('Role changes are authority-bearing (they reseed the permission set). Use the dedicated role authority (employees.permissions — PATCH /employees/:id/role).');
+                }
                 if (forbidden === 'permissions') {
                     throw new Error('Permission changes require the dedicated permission authority (employees.permissions).');
                 }
                 throw new Error(`Employee status/termination changes require the termination authority (employees.terminate). Refusing field "${forbidden}".`);
             }
-        }
-        if (updates.role !== undefined) {
-            // r26/P0-2: promotion into OWNER is impossible through any path.
-            assertAssignableRole(updates.role);
         }
 
         const data = {};
@@ -204,12 +255,6 @@ class EmployeeService {
                     data[key] = updates[key];
                 }
             }
-        }
-
-        // Role changes reseed the role defaults into the stored set (the
-        // stored set remains authoritative for everything after that).
-        if (updates.role && !('permissions' in data)) {
-            data.permissions = normalizePermissions(ROLE_PERMISSIONS[updates.role] || ROLE_PERMISSIONS.STAFF);
         }
 
         const existing = await this.prisma.businessEmployee.findFirst({
@@ -270,6 +315,60 @@ class EmployeeService {
     }
 
     // ── Permission Management ──────────────────────────────────────────────
+    // ── r26/P0-B — DEDICATED ROLE AUTHORITY (authority-bearing mutations) ──
+    // A role change reseeds the target's permission set from the role
+    // template, so it is a permission mutation and lives behind the same
+    // canonical authority as permission changes (employees.permissions).
+    // Invariants:
+    //   • fail closed without an authenticated actor context;
+    //   • the actor must hold the role-change authority themselves;
+    //   • the resulting template must sit inside the actor's delegation
+    //     ceiling (a Manager cannot promote anyone to a role granting
+    //     authority the Manager lacks);
+    //   • OWNER is never assignable (assertAssignableRole);
+    //   • tenant-scoped; a failed change leaves role AND permissions
+    //     untouched (all validation happens before the single atomic write).
+    async updateRole(employeeId, businessProfileId, role, { actor } = {}) {
+        if (!businessProfileId) throw new Error('Business context required.');
+        if (!role || typeof role !== 'string') throw new Error('A target role is required.');
+
+        // r26/P0-2: OWNER is unreachable through any role-change path.
+        assertAssignableRole(role);
+
+        // Fail closed: the authority path must prove who is acting.
+        requireActor(actor, 'Role change');
+
+        // The actor must themselves hold the role-change authority.
+        const actorPerms = Array.isArray(actor.permissions) ? actor.permissions : [];
+        const actorIsUnlimited = actorPerms.includes('*');
+        if (!actorIsUnlimited && !normalizePermissions(actorPerms).includes(ROLE_CHANGE_AUTHORITY)) {
+            throw new Error(`Role changes require the "${ROLE_CHANGE_AUTHORITY}" authority. Refusing.`);
+        }
+
+        // The resulting authority (role template) must sit within the
+        // actor's own ceiling — promotion beyond the actor is impossible.
+        const resultingPermissions = normalizePermissions(ROLE_PERMISSIONS[role] || ROLE_PERMISSIONS.STAFF);
+        if (resultingPermissions.includes('*')) {
+            throw new Error("Wildcard ('*') is reserved for business owners and admins — a role template may not grant it.");
+        }
+        assertWithinCeiling(resultingPermissions, actor, 'Role change');
+
+        const existing = await this.prisma.businessEmployee.findFirst({
+            where: { id: employeeId, businessProfileId },
+            select: { id: true },
+        });
+        if (!existing) throw new Error('Employee not found.');
+
+        // Single atomic write: exactly the intended role + reseeded set.
+        return this.prisma.businessEmployee.update({
+            where: { id: existing.id },
+            data: { role, permissions: resultingPermissions },
+            include: {
+                user: { select: { id: true, username: true, email: true } },
+            },
+        });
+    }
+
     // ── r26/P0-4 — DEDICATED PERMISSION AUTHORITY (with delegation ceiling) ──
     //
     // Actor semantics (passed by the route from the server-resolved context —

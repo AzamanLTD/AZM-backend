@@ -238,7 +238,7 @@ describe('Module 01 — EmployeeService permission storage', () => {
     test('addEmployee stores dotted defaults for MANAGER', async () => {
         const prisma = makePrisma();
         const svc = new EmployeeService(prisma);
-        await svc.addEmployee({ businessProfileId: 'b1', userId: 42, role: 'MANAGER' });
+        await svc.addEmployee({ businessProfileId: 'b1', userId: 42, role: 'MANAGER' }, { actor: { id: 1, permissions: ['*'] } });
         const stored = prisma.businessEmployee.create.mock.calls[0][0].data.permissions;
         expect(stored).toContain('employees.create');
         expect(stored).toContain('payroll.process');
@@ -250,7 +250,7 @@ describe('Module 01 — EmployeeService permission storage', () => {
         await svc.addEmployee({
             businessProfileId: 'b1', userId: 42, role: 'STAFF',
             permissions: ['manage_reservations'],
-        });
+        }, { actor: { id: 1, permissions: ['*'] } });
         const stored = prisma.businessEmployee.create.mock.calls[0][0].data.permissions;
         expect(stored).toEqual(['reservations.manage']);
     });
@@ -272,7 +272,7 @@ describe('Module 01 — EmployeeService permission storage', () => {
         prisma.businessEmployee.findUnique.mockResolvedValue(null);
         prisma.businessEmployee.findFirst.mockResolvedValue(null);
         const svc = new EmployeeService(prisma);
-        await svc.addEmployee({ businessProfileId: 'b1', azmId: '@ama', role: 'STAFF' });
+        await svc.addEmployee({ businessProfileId: 'b1', azmId: '@ama', role: 'STAFF' }, { actor: { id: 1, permissions: ['*'] } });
         expect(prisma.user.findUnique).toHaveBeenCalledWith({ where: { username: 'ama' } });
         const data = prisma.businessEmployee.create.mock.calls[0][0].data;
         expect(data.userId).toBe(77);
@@ -282,7 +282,7 @@ describe('Module 01 — EmployeeService permission storage', () => {
         const prisma = makePrisma();
         prisma.user.findUnique.mockResolvedValue(null);
         const svc = new EmployeeService(prisma);
-        await expect(svc.addEmployee({ businessProfileId: 'b1', azmId: 'nobody' }))
+        await expect(svc.addEmployee({ businessProfileId: 'b1', azmId: 'nobody' }, { actor: { id: 1, permissions: ['*'] } }))
             .rejects.toThrow('No Azaman account found for "nobody".');
     });
 
