@@ -5,6 +5,9 @@
 // and front desk (arrivals, departures, in-house guests).
 // =============================================================================
 
+const { Prisma } = require('@prisma/client');
+const { randomBytes } = require('crypto');
+
 class HotelOpsService {
     constructor(prisma) {
         this.prisma = prisma;
@@ -473,15 +476,16 @@ HotelOpsService.prototype.createWalkIn = async function(businessProfileId, { cus
     return this.prisma.$transaction(async (tx) => {
         const reservation = await tx.reservation.create({
             data: {
+                reservationRef: `RES-${randomBytes(8).toString('hex').toUpperCase()}`,
                 businessProfileId,
                 serviceItemId: roomId,
                 customerId,
-                notes: `Phone: ${phone || 'N/A'}. ${notes || ''}`.trim(),
+                customerNotes: `Phone: ${phone || 'N/A'}. ${notes || ''}`.trim(),
                 status: 'CHECKED_IN',
                 startDatetime,
                 endDatetime,
-                depositUsdc: depositUsdc ? parseFloat(depositUsdc) : null,
-                amountUsdc: Number(room.basePriceUsdc) * Math.max(1, parseInt(nights) || 1),
+                depositUsdc: depositUsdc ? new Prisma.Decimal(depositUsdc) : new Prisma.Decimal(0),
+                amountUsdc: new Prisma.Decimal(room.basePriceUsdc).mul(Math.max(1, parseInt(nights, 10) || 1)),
                 metadata: { channel: 'FRONT_DESK', phone },
             },
         });

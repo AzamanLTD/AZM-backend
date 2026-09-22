@@ -9,6 +9,7 @@
 const logger = require('../src/config/logger');
 const { emitWebhookEvent } = require('../services/webhookEmitter');
 const crypto = require('crypto');
+const { Prisma } = require('@prisma/client');
 const reservationLifecycle = require('../services/reservationLifecycleService');
 
 function genRef() {
@@ -24,6 +25,7 @@ async function _getBiz(prisma, bizId) {
 // ── POST /api/reservations — customer creates reservation ────────────────────
 exports.createReservation = async (req, res) => {
     const prisma = req.app.get('prisma');
+    let requestIdentity = null;
     try {
         const customerId = req.user.id;
         const {
@@ -36,8 +38,16 @@ exports.createReservation = async (req, res) => {
         if (!bizId)          return res.status(400).json({ success: false, message: 'bizId is required.' });
         if (!startDatetime)  return res.status(400).json({ success: false, message: 'startDatetime is required.' });
         if (!endDatetime)    return res.status(400).json({ success: false, message: 'endDatetime is required.' });
-        if (!amountUsdc || parseFloat(amountUsdc) <= 0)
-            return res.status(400).json({ success: false, message: 'amountUsdc must be positive.' });
+        let amount, deposit;
+        try {
+            amount = new Prisma.Decimal(amountUsdc);
+            deposit = new Prisma.Decimal(depositUsdc == null ? 0 : depositUsdc);
+        } catch (_) {
+            return res.status(400).json({ success: false, message: 'Invalid monetary amount.' });
+        }
+        if (!amount.isFinite() || amount.lte(0) || amount.decimalPlaces() > 8 ||
+            !deposit.isFinite() || deposit.lt(0) || deposit.decimalPlaces() > 8)
+            return res.status(400).json({ success: false, message: 'Amounts must be nonnegative with at most 8 decimal places; amountUsdc must be positive.' });
 
         const start = new Date(startDatetime);
         const end   = new Date(endDatetime);
@@ -45,6 +55,29 @@ exports.createReservation = async (req, res) => {
             return res.status(400).json({ success: false, message: 'endDatetime must be after startDatetime.' });
 
         const biz = await _getBiz(prisma, bizId);
+
+        // Canonical payload identity is durable across request timeouts and restarts.
+        // Legacy clients without a key deduplicate identical requests. To intentionally
+        // rebook after cancelling an identical slot, send a fresh Idempotency-Key.
+        const fingerprint = crypto.createHash('sha256').update(JSON.stringify({
+            businessProfileId: biz.id, customerId, locationId: locationId || null,
+            serviceItemId: serviceItemId || null, start: start.toISOString(), end: end.toISOString(),
+            partySize: parseInt(partySize, 10) || 1, amount: amount.toFixed(8), deposit: deposit.toFixed(8),
+            cancellationPolicy: cancellationPolicy || null, customerNotes: customerNotes || null,
+        })).digest('hex');
+        const suppliedKey = req.headers?.['idempotency-key'] || req.get?.('Idempotency-Key');
+        if (suppliedKey && (typeof suppliedKey !== 'string' || suppliedKey.length > 128))
+            return res.status(400).json({ success: false, message: 'Idempotency-Key must be at most 128 characters.' });
+        const clientRequestKey = suppliedKey || `auto:${fingerprint}`;
+        requestIdentity = { businessProfileId: biz.id, customerId, clientRequestKey, fingerprint };
+        const existing = await prisma.reservation.findUnique({ where: {
+            businessProfileId_customerId_clientRequestKey: { businessProfileId: biz.id, customerId, clientRequestKey },
+        } });
+        if (existing) {
+            if (existing.requestFingerprint !== fingerprint)
+                return res.status(409).json({ success: false, message: 'Idempotency-Key was already used for a different reservation.' });
+            return res.status(200).json({ success: true, reservation: existing, replayed: true });
+        }
 
         // ── Availability conflict check (Phase 2.3) ──────────────────────────
         // Prevent double-booking: reject if an overlapping PENDING/CONFIRMED/
@@ -61,6 +94,10 @@ exports.createReservation = async (req, res) => {
         if (serviceItemId) conflictWhere.serviceItemId = serviceItemId;
 
         const conflict = await prisma.reservation.findFirst({ where: conflictWhere });
+        if (conflict?.clientRequestKey === clientRequestKey && conflict.requestFingerprint === fingerprint &&
+            conflict.customerId === customerId) {
+            return res.status(200).json({ success: true, reservation: conflict, replayed: true });
+        }
         if (conflict) {
             return res.status(409).json({
                 success: false,
@@ -72,6 +109,8 @@ exports.createReservation = async (req, res) => {
         const reservation = await prisma.reservation.create({
             data: {
                 reservationRef:    genRef(),
+                clientRequestKey,
+                requestFingerprint: fingerprint,
                 businessProfileId: biz.id,
                 locationId:        locationId   || null,
                 customerId,
@@ -79,8 +118,8 @@ exports.createReservation = async (req, res) => {
                 startDatetime:     start,
                 endDatetime:       end,
                 partySize:         parseInt(partySize, 10) || 1,
-                amountUsdc:        parseFloat(amountUsdc),
-                depositUsdc:       parseFloat(depositUsdc || 0),
+                amountUsdc:        amount,
+                depositUsdc:       deposit,
                 cancellationPolicy: cancellationPolicy || null,
                 customerNotes:     customerNotes || null,
                 status:            'PENDING',
@@ -100,6 +139,20 @@ exports.createReservation = async (req, res) => {
 
         return res.status(201).json({ success: true, reservation });
     } catch (err) {
+        if (err.code === 'P2002' && requestIdentity) {
+            const { businessProfileId, customerId, clientRequestKey, fingerprint } = requestIdentity;
+            const existing = await prisma.reservation.findUnique({ where: {
+                businessProfileId_customerId_clientRequestKey: { businessProfileId, customerId, clientRequestKey },
+            } });
+            if (existing) {
+                if (existing.requestFingerprint !== fingerprint)
+                    return res.status(409).json({ success: false, message: 'Idempotency-Key was already used for a different reservation.' });
+                return res.status(200).json({ success: true, reservation: existing, replayed: true });
+            }
+        }
+        if (err.code === 'P2002' || (err.code === 'P2004' && String(err.message).includes('reservation_'))) {
+            return res.status(409).json({ success: false, message: 'This time slot is already booked. Please choose another time.' });
+        }
         const code = err.status || 500;
         return res.status(code).json({ success: false, message: err.message });
     }
@@ -458,6 +511,8 @@ exports.acceptCounterProposal = async (req, res) => {
         res.json({ success: true, reservation: updated });
     } catch (err) {
         logger.error({ err: err }, '[acceptCounterProposal]');
+        if (err.code === 'P2002' && err.meta?.target === null)
+            return res.status(409).json({ success: false, message: 'The proposed time is no longer available.' });
         res.status(500).json({ success: false, message: err.message });
     }
 };
