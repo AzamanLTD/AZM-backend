@@ -41,12 +41,14 @@ describe('EmployeeService business scoping', () => {
         // Module 01: legacy snake_case grants are normalized into dotted-key
         // space before storage, so stored rows speak the same vocabulary
         // requirePermission() checks against.
-        await expect(service.updatePermissions('employee-a', 'business-a', ['view_own_shifts']))
+        // r26: permission grants require the authenticated actor context;
+        // the owner (['*']) is an unlimited delegator.
+        await expect(service.updatePermissions('employee-a', 'business-a', ['view_own_shifts'], { actor: { id: 999, permissions: ['*'] } }))
             .resolves.toEqual({ id: 'employee-a', permissions: ['shifts.view'] });
 
         expect(prisma.businessEmployee.findFirst).toHaveBeenCalledWith({
             where: { id: 'employee-a', businessProfileId: 'business-a' },
-            select: { id: true },
+            select: { id: true, userId: true, permissions: true },
         });
         expect(prisma.businessEmployee.update).toHaveBeenCalledWith(expect.objectContaining({
             where: { id: 'employee-a' },

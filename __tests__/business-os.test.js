@@ -258,26 +258,40 @@ describeIf('Business OS — Employee Management', () => {
         expect(emp.businessProfileId).toBeTruthy();
     });
 
-    test('should update employee status', async () => {
+    test('should update employee status via the dedicated termination authority path', async () => {
         const { EmployeeService } = require('../services/businessOS/employeeService');
         const svc = new EmployeeService(prisma);
 
-        const updated = await svc.updateEmployee(testEmployee.id, businessProfile.id, { status: 'SUSPENDED' });
+        // r26 hardening: the generic update path must refuse the `status`
+        // field — termination/suspension goes through employees.terminate.
+        await expect(
+            svc.updateEmployee(testEmployee.id, businessProfile.id, { status: 'SUSPENDED' })
+        ).rejects.toThrow(/termination authority/);
+
+        const updated = await svc.updateStatus(testEmployee.id, businessProfile.id, 'SUSPENDED');
         expect(updated.status).toBe('SUSPENDED');
 
         // Restore
-        await svc.updateEmployee(testEmployee.id, businessProfile.id, { status: 'ACTIVE' });
+        await svc.updateStatus(testEmployee.id, businessProfile.id, 'ACTIVE');
     });
 
-    test('should update employee permissions', async () => {
+    test('should update employee permissions via the dedicated permission authority path', async () => {
         const { EmployeeService } = require('../services/businessOS/employeeService');
         const svc = new EmployeeService(prisma);
 
-        const newPerms = ['manage_products', 'view_finance'];
-        const updated = await svc.updateEmployee(testEmployee.id, businessProfile.id, { permissions: newPerms });
-        // Module 01: legacy strings normalize into dotted-key space on the way
-        // in ("view_finance" -> "finance.view"); unknown strings pass through.
-        expect(updated.permissions).toEqual(expect.arrayContaining(['manage_products', 'finance.view']));
+        // r26 hardening: the generic update path must refuse the
+        // `permissions` field — that is the employees.permissions authority.
+        await expect(
+            svc.updateEmployee(testEmployee.id, businessProfile.id, { permissions: ['employees.create'] })
+        ).rejects.toThrow(/dedicated permission authority/);
+
+        const newPerms = ['shifts.view', 'view_finance'];
+        const updated = await svc.updatePermissions(testEmployee.id, businessProfile.id, newPerms, {
+            actor: { id: testEmployee.userId, permissions: ['*'] },
+        });
+        // Legacy strings normalize into dotted-key space on the way in
+        // ("view_finance" -> "finance.view"); canonical keys pass unchanged.
+        expect(updated.permissions).toEqual(expect.arrayContaining(['shifts.view', 'finance.view']));
     });
 
     test('should not add employee from another business', async () => {

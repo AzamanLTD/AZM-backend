@@ -108,6 +108,13 @@ const PERMISSION_KEYS = {
     { key: 'notifications.view',     label: 'View notifications',       module: 'System' },
     { key: 'analytics.view',         label: 'View analytics',           module: 'System' },
   ],
+  // r26/P1: the retail section of Business OS routes is business data
+  // (suppliers, purchase orders, stock counts) — it needs real permission
+  // keys, not a silent owner-only default.
+  retail: [
+    { key: 'retail.view',           label: 'View retail (suppliers, POs, stock)', module: 'Retail' },
+    { key: 'retail.manage',         label: 'Manage retail (suppliers, POs, stock)', module: 'Retail' },
+  ],
 };
 
 // Flatten for quick lookups
@@ -384,5 +391,10 @@ module.exports = {
   LEGACY_ALIASES,
   expandPermission,
   normalizePermissions,
+  // r26: assignable employee roles — the EmployeeRole enum minus OWNER
+  // (owner authority derives from business ownership, never from a row).
+  ASSIGNABLE_EMPLOYEE_ROLES: Object.keys(EMPLOYEE_ROLE_TEMPLATES).filter((r) => r !== 'OWNER'),
+  // r26: the full canonical catalog, for delegation validation.
+  ALL_PERMISSION_KEYS: ALL_KEYS,
 };
 

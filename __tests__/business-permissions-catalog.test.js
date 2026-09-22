@@ -137,11 +137,23 @@ describe('Module 01 — permissions catalog', () => {
 describe('Module 01 — resolvePermissions behavior (unit, mocked prisma)', () => {
     const { requirePermission } = require('../middleware/requirePermission');
 
+    // r26: the middleware now resolves the business context AUTHORITATIVELY:
+    // a non-owner user resolves through their ACTIVE employment row
+    // (businessEmployee.findFirst), then permissions resolve from the same
+    // row via findUnique. The mocks mirror a real employee of business-a
+    // whose BusinessProfile is owned by user 999.
     const makePrismaWithEmployee = (employee) => ({
         businessProfile: {
-            findFirst: jest.fn().mockResolvedValue({ id: 'business-a', userId: 999 }),
+            findFirst: jest.fn().mockImplementation(({ where }) => {
+                if (where.userId) return Promise.resolve(null); // not an owner
+                return Promise.resolve({ id: where.id, userId: 999 });
+            }),
         },
         businessEmployee: {
+            findFirst: jest.fn().mockResolvedValue({
+                businessProfileId: 'business-a',
+                businessProfile: { id: 'business-a' },
+            }),
             findUnique: jest.fn().mockResolvedValue(employee),
         },
     });
@@ -158,11 +170,19 @@ describe('Module 01 — resolvePermissions behavior (unit, mocked prisma)', () =
         void settle;
     });
 
-    test('a MANAGER role employee passes employees.create via template defaults', async () => {
-        const prisma = makePrismaWithEmployee({ permissions: [], status: 'ACTIVE', role: 'MANAGER' });
+    test('a MANAGER row SEEDED with template defaults passes employees.create (creation-time seeding)', async () => {
+        const seeded = EMPLOYEE_ROLE_TEMPLATES.MANAGER.permissions;
+        const prisma = makePrismaWithEmployee({ permissions: seeded, status: 'ACTIVE', role: 'MANAGER' });
         const { allowed, res } = await invoke('employees.create', prisma);
         expect(allowed).toBe(true);
         expect(res.status).not.toHaveBeenCalled();
+    });
+
+    test('r26: an EXPLICIT empty set on a MANAGER row has no permissions (stored set is authoritative)', async () => {
+        const prisma = makePrismaWithEmployee({ permissions: [], status: 'ACTIVE', role: 'MANAGER' });
+        const { allowed, res } = await invoke('employees.create', prisma);
+        expect(allowed).toBe(false);
+        expect(res.status).toHaveBeenCalledWith(403);
     });
 
     test('a STAFF role employee is denied employees.create', async () => {
@@ -189,13 +209,15 @@ describe('Module 01 — resolvePermissions behavior (unit, mocked prisma)', () =
         expect(res.status).toHaveBeenCalledWith(403);
     });
 
-    test('explicit grant merges with (not replaces) role-template defaults', async () => {
+    test('r26: the explicit stored set REPLACES template defaults (revocation is real)', async () => {
         const prisma = makePrismaWithEmployee({
             permissions: ['finance.ledger.manage'], status: 'ACTIVE', role: 'SUPERVISOR',
         });
+        // SUPERVISOR's template default shifts.approve_swap was explicitly
+        // removed from the stored set — the resolver must NOT re-add it:
         const a = await invoke('shifts.approve_swap', prisma);
         const b = await invoke('finance.ledger.manage', prisma);
-        expect(a.allowed).toBe(true);
+        expect(a.allowed).toBe(false);
         expect(b.allowed).toBe(true);
     });
 });
@@ -233,13 +255,13 @@ describe('Module 01 — EmployeeService permission storage', () => {
         expect(stored).toEqual(['reservations.manage']);
     });
 
-    test('updateEmployee normalizes a permissions PATCH', async () => {
+    test('r26: updateEmployee REFUSES a permissions PATCH (dedicated authority)', async () => {
         const prisma = makePrisma();
         prisma.businessEmployee.findFirst.mockResolvedValue({ id: 'emp-1' });
         const svc = new EmployeeService(prisma);
-        await svc.updateEmployee('emp-1', 'b1', { permissions: ['approve_swaps', 'approve_swaps'] });
-        const stored = prisma.businessEmployee.update.mock.calls[0][0].data.permissions;
-        expect(stored).toEqual(['shifts.approve_swap']);
+        await expect(svc.updateEmployee('emp-1', 'b1', { permissions: ['approve_swaps', 'approve_swaps'] }))
+            .rejects.toThrow(/dedicated permission authority/);
+        expect(prisma.businessEmployee.update).not.toHaveBeenCalled();
     });
 
     test('addEmployee resolves an AZM-ID handle (@username) to the real user', async () => {
