@@ -9,6 +9,7 @@
 const logger = require('../src/config/logger');
 const { emitWebhookEvent } = require('../services/webhookEmitter');
 const crypto = require('crypto');
+const reservationLifecycle = require('../services/reservationLifecycleService');
 
 function genRef() {
     return 'RES-' + crypto.randomBytes(4).toString('hex').toUpperCase();
@@ -142,23 +143,17 @@ exports.listMyReservations = async (req, res) => {
 exports.cancelReservation = async (req, res) => {
     const prisma = req.app.get('prisma');
     try {
-        const customerId = req.user.id;
-        const { reservationId } = req.params;
-
-        const res_ = await prisma.reservation.findUnique({ where: { id: reservationId } });
-        if (!res_ || res_.customerId !== customerId)
-            return res.status(404).json({ success: false, message: 'Reservation not found.' });
-
-        const cancellable = ['PENDING', 'CONFIRMED'];
-        if (!cancellable.includes(res_.status))
-            return res.status(409).json({ success: false, message: `Cannot cancel a reservation with status ${res_.status}.` });
-
-        const updated = await prisma.reservation.update({
-            where: { id: reservationId },
-            data:  { status: 'CANCELLED_CUSTOMER', cancelledAt: new Date() },
+        const reservation = await reservationLifecycle.cancelReservation(prisma, {
+            reservationId: req.params.reservationId,
+            customerId: req.user.id,
         });
-        return res.status(200).json({ success: true, reservation: updated });
+        return res.status(200).json({ success: true, reservation });
     } catch (err) {
+        if (err.code === 'RESERVATION_NOT_FOUND') return res.status(404).json({ success: false, message: err.message });
+        if (['RESERVATION_NOT_CANCELLABLE', 'RESERVATION_STATE_CONFLICT', 'ESCROW_IN_DISPUTE', 'ESCROW_ECONOMIC_CONFLICT', 'ESCROW_ALREADY_FINALIZED'].includes(err.code)) {
+            return res.status(409).json({ success: false, message: err.message });
+        }
+        logger.error({ err }, '[reservation.cancel] atomic lifecycle failure');
         return res.status(500).json({ success: false, message: err.message });
     }
 };
@@ -237,23 +232,17 @@ exports.confirmReservation = async (req, res) => {
 exports.checkInReservation = async (req, res) => {
     const prisma = req.app.get('prisma');
     try {
-        const userId  = req.user.id;
-        const profile = await prisma.businessProfile.findFirst({ where: { userId } });
-        if (!profile) return res.status(403).json({ success: false, message: 'Business profile required.' });
-
-        const { reservationId } = req.params;
-        const existing = await prisma.reservation.findUnique({ where: { id: reservationId } });
-        if (!existing || existing.businessProfileId !== profile.id)
-            return res.status(404).json({ success: false, message: 'Reservation not found.' });
-        if (existing.status !== 'CONFIRMED')
-            return res.status(409).json({ success: false, message: 'Can only check-in a CONFIRMED reservation.' });
-
-        const updated = await prisma.reservation.update({
-            where: { id: reservationId },
-            data:  { status: 'CHECKED_IN', checkedInAt: new Date() },
+        const reservation = await reservationLifecycle.checkInReservation(prisma, {
+            reservationId: req.params.reservationId,
+            businessUserId: req.user.id,
         });
-        return res.status(200).json({ success: true, reservation: updated });
+        return res.status(200).json({ success: true, reservation });
     } catch (err) {
+        if (err.code === 'RESERVATION_NOT_FOUND') return res.status(404).json({ success: false, message: err.message });
+        if (['RESERVATION_NOT_CHECKIN_READY', 'RESERVATION_STATE_CONFLICT', 'ESCROW_IN_DISPUTE', 'ESCROW_ECONOMIC_CONFLICT', 'ESCROW_ALREADY_FINALIZED'].includes(err.code)) {
+            return res.status(409).json({ success: false, message: err.message });
+        }
+        logger.error({ err }, '[reservation.checkin] atomic lifecycle failure');
         return res.status(500).json({ success: false, message: err.message });
     }
 };
@@ -264,23 +253,17 @@ exports.checkInReservation = async (req, res) => {
 exports.markNoShowReservation = async (req, res) => {
     const prisma = req.app.get('prisma');
     try {
-        const userId  = req.user.id;
-        const profile = await prisma.businessProfile.findFirst({ where: { userId } });
-        if (!profile) return res.status(403).json({ success: false, message: 'Business profile required.' });
-
-        const { reservationId } = req.params;
-        const existing = await prisma.reservation.findUnique({ where: { id: reservationId } });
-        if (!existing || existing.businessProfileId !== profile.id)
-            return res.status(404).json({ success: false, message: 'Reservation not found.' });
-        if (!['CONFIRMED', 'CHECKED_IN'].includes(existing.status))
-            return res.status(409).json({ success: false, message: 'Can only no-show a CONFIRMED or CHECKED_IN reservation.' });
-
-        const updated = await prisma.reservation.update({
-            where: { id: reservationId },
-            data:  { status: 'NO_SHOW' },
+        const reservation = await reservationLifecycle.markNoShowReservation(prisma, {
+            reservationId: req.params.reservationId,
+            businessUserId: req.user.id,
         });
-        return res.status(200).json({ success: true, reservation: updated });
+        return res.status(200).json({ success: true, reservation });
     } catch (err) {
+        if (err.code === 'RESERVATION_NOT_FOUND') return res.status(404).json({ success: false, message: err.message });
+        if (['RESERVATION_NOT_NO_SHOW_READY', 'RESERVATION_STATE_CONFLICT', 'BOOKING_NO_LONGER_CONFIRMED', 'ESCROW_IN_DISPUTE', 'ESCROW_ECONOMIC_CONFLICT', 'ESCROW_ALREADY_FINALIZED'].includes(err.code)) {
+            return res.status(409).json({ success: false, message: err.message });
+        }
+        logger.error({ err }, '[reservation.no-show] atomic lifecycle failure');
         return res.status(500).json({ success: false, message: err.message });
     }
 };

@@ -54,36 +54,14 @@ exports.businessCheckIn = async (req, res) => {
             });
             return res.status(200).json({ success: true, ...result });
         } else if (reservationId) {
-            // Direct reservation check-in (from search results)
-            const result = await qrSvc.verifyAndCheckIn(prisma, {
-                token: null, businessUserId: req.user.id,
-            }).catch(() => null);
-
-            // Direct check-in without token
-            const reservation = await prisma.reservation.findUnique({
-                where: { id: reservationId },
-                include: { businessProfile: true }
+            // Direct compatibility path delegates to the exact same atomic
+            // authority as QR and /api/reservations/:id/checkin.
+            const { checkInReservation } = require('../services/reservationLifecycleService');
+            const reservation = await checkInReservation(prisma, {
+                reservationId,
+                businessUserId: req.user.id,
             });
-            if (!reservation) return res.status(404).json({ success: false, message: 'Reservation not found.' });
-            if (reservation.businessProfile.userId !== req.user.id)
-                return res.status(403).json({ success: false, message: 'Not your business.' });
-            if (reservation.status !== 'CONFIRMED')
-                return res.status(409).json({ success: false, message: `Reservation is ${reservation.status}.` });
-
-            const updated = await prisma.reservation.update({
-                where: { id: reservationId },
-                data: { status: 'CHECKED_IN', checkedInAt: new Date() }
-            });
-
-            // Release escrow if exists
-            if (reservation.escrowId) {
-                try {
-                    const { releaseBookingEscrow } = require('../services/bookingEscrowService');
-                    await releaseBookingEscrow(prisma, { escrowId: reservation.escrowId });
-                } catch (e) { logger.error({ err: e }, '[checkIn] escrow release'); }
-            }
-
-            return res.status(200).json({ success: true, reservation: updated });
+            return res.status(200).json({ success: true, reservation });
         }
         return res.status(400).json({ success: false, message: 'Provide token, azamanId, or reservationId.' });
     } catch (err) {

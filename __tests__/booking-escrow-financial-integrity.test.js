@@ -117,7 +117,7 @@ describe('booking escrow financial integrity', () => {
         expect(tx.ticket.create).toHaveBeenCalledTimes(1);
         expect(tx.smartEscrow.create).toHaveBeenCalledTimes(1);
         expect(tx.reservation.updateMany).toHaveBeenCalledWith({
-            where: { id: 'booking-1', escrowId: null },
+            where: { id: 'booking-1', escrowId: null, status: { in: ['PENDING', 'CONFIRMED'] } },
             data: expect.objectContaining({ escrowId: 'escrow-1', ticketId: 'ticket-1' }),
         });
         expect(result.escrow.id).toBe('escrow-1');
@@ -213,7 +213,7 @@ describe('booking escrow financial integrity', () => {
 
         expect(result.penaltyAmount).toBe(10);
         expect(tx.reservation.updateMany).toHaveBeenCalledWith({
-            where: { id: 'booking-1' },
+            where: { id: 'booking-1', status: 'CONFIRMED' },
             data: expect.objectContaining({ status: 'NO_SHOW', penaltyAmountUsdc: 10 }),
         });
         expect(tx.transactionHistory.create).toHaveBeenCalledTimes(2);
