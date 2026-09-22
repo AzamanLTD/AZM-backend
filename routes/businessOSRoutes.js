@@ -1532,27 +1532,28 @@ router.post('/transit/routes/generate-trips', requirePermission('transit.trips.m
 
 // POST /api/business-os/transit/trips/:id/cancel — cancel trip with refund handling
 router.post('/transit/trips/:id/cancel', requirePermission('transit.trips.manage'), wrap(async (req, res) => {
+    // r27/P0-A: the cancellation orchestration (booking claims + canonical
+    // escrow refunds, exactly-once, recoverable) lives in
+    // services/transitTripCancellationService.js — the route holds no
+    // refund/ledger logic of its own.
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
-    const trip = await prisma.transitTrip.findFirst({
-        where: { id: req.params.id, businessProfileId: bpId },
-        include: { bookings: { where: { status: { in: ['PENDING', 'CONFIRMED', 'CHECKED_IN'] } } } },
-    });
-    if (!trip) return res.status(404).json({ success: false, message: 'Trip not found' });
-    if (trip.status === 'CANCELLED') return res.status(400).json({ success: false, message: 'Trip already cancelled' });
-    const affectedBookings = trip.bookings;
-    await prisma.transitTrip.update({ where: { id: req.params.id }, data: { status: 'CANCELLED' } });
-    if (affectedBookings.length > 0) {
-        await prisma.transitBooking.updateMany({
-            where: { transitTripId: req.params.id, status: { in: ['PENDING', 'CONFIRMED', 'CHECKED_IN'] } },
-            data: { status: 'CANCELLED' },
+    const { cancelTripWithRefunds } = require('../services/transitTripCancellationService');
+    const result = await cancelTripWithRefunds(prisma, { tripId: req.params.id, businessProfileId: bpId });
+    if (result.notFound) return res.status(404).json({ success: false, message: 'Trip not found' });
+    if (result.summary.failed > 0) {
+        // Explicit partial failure: the trip stays active, failed bookings
+        // remain in their prior state, and nothing was silently stranded.
+        return res.status(502).json({
+            success: false,
+            message: 'Trip cancellation partially failed — retry to resolve the remaining bookings. No booking was cancelled without its escrow being resolved.',
+            ...result,
         });
     }
     res.json({
         success: true,
-        message: `Trip cancelled. ${affectedBookings.length} booking(s) marked for refund.`,
-        cancelledBookings: affectedBookings.length,
-        bookings: affectedBookings.map(b => ({ id: b.id, userId: b.userId, amountUsdc: b.amountUsdc })),
+        message: `Trip ${result.cancelled ? 'cancelled' : 'already cancelled'}. ${result.summary.refunded} booking(s) refunded, ${result.summary.cancelledWithoutEscrow} cancelled without escrow.`,
+        ...result,
     });
 }));
 
