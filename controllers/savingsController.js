@@ -270,31 +270,55 @@ exports.deposit = async (req, res) => {
         const amountUsdc = parseFloat((parseFloat(amountGhs) / liveRate).toFixed(6));
 
         const result = await prisma.$transaction(async (tx) => {
-            // Check user has sufficient balance
-            const user = await tx.user.findUnique({ where: { id: userId } });
-            if (!user || user.availableBalance < amountUsdc) {
-                throw new Error(
-                    `Insufficient balance. Need ${amountUsdc.toFixed(4)} USDC ` +
-                    `(GHS ${amountGhs}), have ${user ? user.availableBalance.toFixed(4) : 0} USDC.`
-                );
-            }
+            // r25 P1 — the goal row is locked FOR UPDATE INSIDE the money
+            // transaction (same rigor as the withdrawal path, r16 P0-E).
+            // The old code read the goal before the transaction and computed
+            // streak/cadence/completion from that stale snapshot: two
+            // concurrent deposits could both read streakCount=N and both
+            // write streakCount=N+1 (one increment silently lost), and both
+            // evaluate target completion against the same stale
+            // currentAmountGhs. Every deposit-dependent value is now derived
+            // from this locked authoritative row.
+            const lockedRows = await tx.$queryRaw`
+                SELECT * FROM "SavingsGoal" WHERE "id" = ${id} AND "userId" = ${userId} FOR UPDATE`;
+            const lockedGoal = lockedRows[0];
+            if (!lockedGoal) throw new Error('Savings goal not found.');
+            if (lockedGoal.status === 'CANCELLED') throw new Error('This savings goal has been cancelled.');
+            if (lockedGoal.status === 'COMPLETED') throw new Error('This savings goal is already completed.');
 
-            // Deduct from available balance (§P.4: the projection's escrow
-            // column moves with the same money the ledger goal restriction
-            // locks — reconcileUserProjections requires them to stay equal)
-            await tx.user.update({
-                where: { id: userId },
+            // r25 — ATOMIC BALANCE CLAIM: conditional decrement instead of a
+            // stale read-then-verify. Losing the claim throws INSUFFICIENT_FUNDS
+            // (rolls back everything); the DB nonneg CHECK is a secondary
+            // invariant, never the guard. The projection's escrow column
+            // moves with the same money the ledger goal restriction locks
+            // (§P.4 — reconcileUserProjections requires them to stay equal).
+            const debit = await tx.user.updateMany({
+                where: {
+                    id: userId,
+                    availableBalance: { gte: amountUsdc }
+                },
                 data: {
                     availableBalance: { decrement: amountUsdc },
                     escrowLockedBalance: { increment: amountUsdc }
                 }
             });
+            if (debit.count !== 1) {
+                const err = new Error(
+                    `Insufficient balance. Need ${amountUsdc.toFixed(4)} USDC ` +
+                    `(GHS ${amountGhs}).`
+                );
+                err.code = 'INSUFFICIENT_FUNDS';
+                throw err;
+            }
 
-            // Credit the savings goal
-            const isOnTime = goal.nextDueDate && new Date() <= new Date(goal.nextDueDate);
-            const newStreak = isOnTime ? goal.streakCount + 1 : 0; // Reset streak if late
-            const newLongest = Math.max(newStreak, goal.longestStreak);
-            const newMissed = isOnTime ? goal.missedCount : goal.missedCount + 1;
+            // Credit the savings goal — derived from the LOCKED row.
+            const lockedCurrent = new Prisma.Decimal(lockedGoal.currentAmountGhs);
+            const lockedTarget = new Prisma.Decimal(lockedGoal.targetAmountGhs);
+            const depositGhs = new Prisma.Decimal(String(amountGhs));
+            const isOnTime = lockedGoal.nextDueDate && new Date() <= new Date(lockedGoal.nextDueDate);
+            const newStreak = isOnTime ? lockedGoal.streakCount + 1 : 0; // Reset streak if late
+            const newLongest = Math.max(newStreak, lockedGoal.longestStreak);
+            const newMissed = isOnTime ? lockedGoal.missedCount : lockedGoal.missedCount + 1;
 
             const updatedGoal = await tx.savingsGoal.update({
                 where: { id },
@@ -304,9 +328,10 @@ exports.deposit = async (req, res) => {
                     streakCount: newStreak,
                     longestStreak: newLongest,
                     missedCount: newMissed,
-                    nextDueDate: _calculateNextDueDate(new Date(), goal.frequency),
-                    // Auto-complete if target reached
-                    status: (goal.currentAmountGhs + parseFloat(amountGhs)) >= goal.targetAmountGhs
+                    nextDueDate: _calculateNextDueDate(new Date(), lockedGoal.frequency),
+                    // Auto-complete if target reached — evaluated against the
+                    // locked current amount plus THIS deposit, exactly once.
+                    status: lockedCurrent.plus(depositGhs).gte(lockedTarget)
                         ? 'COMPLETED' : 'ACTIVE'
                 }
             });
@@ -377,7 +402,7 @@ exports.deposit = async (req, res) => {
                     await _getNotificationService(req).sendNotification({
                         userId,
                         title: `${result.newStreak}-Deposit Streak!`,
-                        body: `You've been consistent for ${result.newStreak} deposits in a row on "${goal.name}". Keep it up!`,
+                        body: `You've been consistent for ${result.newStreak} deposits in a row on "${result.updatedGoal.name}". Keep it up!`,
                         category: 'GENERAL',
                         actionPayload: { action: 'VIEW_SAVINGS', goalId: id }
                     });

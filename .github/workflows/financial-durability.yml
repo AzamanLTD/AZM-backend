@@ -160,6 +160,7 @@ jobs:
             "__tests__/escrow-convergence.test.js"
             "__tests__/booking-escrow-financial-integrity.test.js"
             "__tests__/r29-reservation-lifecycle-authority.test.js"
+            "__tests__/r30-r25-r29-funding-lifecycle-integration.test.js"
             "__tests__/azm-conversion-economic-atomicity.test.js"
             "__tests__/azm-stake-economic-atomicity.test.js"
             "__tests__/azm-gift-economic-atomicity.test.js"

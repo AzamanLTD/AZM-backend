@@ -1059,18 +1059,27 @@ exports.cryptoWithdrawal = async (req, res) => {
             // EXACT decimal comparison/decrement — binary floating point is
             // never the authoritative financial quantity on this path.
             const requiredExact = new Prisma.Decimal(amountExact);
-            if (user.availableBalance.lt(requiredExact)) {
-                throw new Error(
+
+            // r25 — ATOMIC BALANCE CLAIM: the exact-Decimal pre-read above is
+            // a fast-fail convenience, NOT the authority. A conditional
+            // decrement on the SAME exact quantity makes the race against a
+            // concurrent debit from any other financial endpoint deterministic:
+            // exactly one winner per available USDC, and the loser rolls back
+            // the ENTIRE transaction — no ledger row, no execution, no
+            // history, no obligation, and never two custody executions that
+            // together exceed the customer's available projection.
+            const debit = await tx.user.updateMany({
+                where: { id: userId, availableBalance: { gte: requiredExact } },
+                data:  { availableBalance: { decrement: requiredExact } }
+            });
+            if (debit.count !== 1) {
+                const err = new Error(
                     `Insufficient balance. Required: ${amountExact} USDC, ` +
                     `available: ${user.availableBalance.toFixed(6)} USDC.`
                 );
+                err.code = 'INSUFFICIENT_BALANCE';
+                throw err;
             }
-
-            // Debit the FULL requested amount from the user (gas fee is internal)
-            await tx.user.update({
-                where: { id: userId },
-                data:  { availableBalance: { decrement: requiredExact } }
-            });
 
             // Synthetic treasury bookkeeping is intentionally unchanged (§P.3
             // will formalize custody accounting). The CustodyExecution record

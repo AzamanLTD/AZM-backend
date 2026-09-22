@@ -11,7 +11,7 @@
 // to the same service so there is exactly one crypto-deposit code path.
 //
 // The legacy POST /api/deposit/transfer route was removed — internal transfers
-// happen via POST /api/chat/transfer (chatTransferController.chatTransfer).
+// happen via the canonical peer-transfer rail (POST /api/friends/transfer/...).
 // =============================================================================
 
 const express = require('express');
