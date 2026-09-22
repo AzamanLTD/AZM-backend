@@ -11,7 +11,6 @@ const router                   = express.Router();
 const multer                   = require('multer');
 const path                     = require('path');
 const chatController           = require('../controllers/chatController');
-const ChatTransferController   = require('../controllers/chatTransferController');
 const { protect }              = require('../middleware/authMiddleware');
 const { protectActive }        = require('../middleware/banGuardMiddleware');
 
@@ -45,19 +44,14 @@ router.post('/send',     protectActive, chatController.sendMessage);
 // 3. Upload screenshot / payment proof (write — gated)
 router.post('/upload',   protectActive, upload.single('screenshot'), chatController.sendImageMessage);
 
-// 4. In-Chat Crypto Transfer (write — gated). Lazy-init the controller so we
-//    pick up the live prisma + io instances per request.
-let chatTransferController;
-router.post('/transfer', protectActive, (req, res, next) => {
-    if (!chatTransferController) {
-        const prisma = req.app.get('prisma');
-        const io     = req.app.get('socketio');
-        chatTransferController = new ChatTransferController(prisma, io);
-    }
-    req.chatTransferController = chatTransferController;
-    next();
-}, (req, res) => {
-    req.chatTransferController.executeTransfer(req, res);
-});
+// 4. In-Chat Crypto Transfer — REMOVED (r25 §6, Option A).
+//    The route mounted `new ChatTransferController(prisma, io)` while the
+//    controller module exports a plain object (exports.chatTransfer) — every
+//    live call failed with `ChatTransferController is not a constructor`
+//    before reaching any financial code. The live product's canonical
+//    internal-transfer flow is the peer-transfer rail
+//    (POST /api/friends/transfer/... — peerTransferController), which is
+//    what the Flutter client actually calls. The broken legacy duplicate
+//    is unmounted rather than left as an active 500-ing financial endpoint.
 
 module.exports = router;

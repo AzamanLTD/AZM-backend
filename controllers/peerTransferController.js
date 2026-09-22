@@ -579,18 +579,19 @@ exports.fulfillTransferRequest = async (req, res) => {
             });
 
             if (!payer) throw new Error('User not found.');
-            // NOTE: both operands are Prisma Decimal objects; a bare `<` would
-            // compare them lexicographically as strings (e.g. "300" < "75" is
-            // true), falsely rejecting valid requests. Compare numerically.
-            if (Number(payer.availableBalance) < Number(transferAmount)) {
-                throw new Error('INSUFFICIENT_FUNDS');
-            }
-
-            // Debit payer
-            await tx.user.update({
-                where: { id: payerId },
+            // r25 — ATOMIC BALANCE CLAIM: a conditional decrement makes the
+            // insufficient-balance race deterministic (a racing debit from
+            // another endpoint can consume funds between the read above and
+            // a blind decrement). Losing the claim throws INSUFFICIENT_FUNDS,
+            // which rolls the PENDING→COMPLETED status claim back too — the
+            // request stays PENDING and is correctly retryable.
+            const debit = await tx.user.updateMany({
+                where: { id: payerId, availableBalance: { gte: transferAmount } },
                 data: { availableBalance: { decrement: transferAmount } }
             });
+            if (debit.count !== 1) {
+                throw new Error('INSUFFICIENT_FUNDS');
+            }
 
             // Credit receiver
             await tx.user.update({

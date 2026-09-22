@@ -15,7 +15,7 @@
 //   • validateMomoName    — MoMo account name lookup (Moolre adapter)
 //
 // NOTE: The legacy `internalTransfer` handler has been removed. The canonical
-// internal-transfer flow is POST /api/chat/transfer (chatTransferController).
+// internal-transfer flow is the peer-transfer rail (POST /api/friends/transfer/...).
 // =============================================================================
 
 /**

@@ -99,6 +99,26 @@ const fundBookingEscrow = async (prisma, { escrowId, payerId, bookingType, booki
         if (escrow.payerId !== payerId) throw new Error('Only the payer can fund this escrow.');
         if (escrow.status !== 'DRAFT') throw new Error(`Escrow cannot be funded from status ${escrow.status}.`);
 
+        // r25 P0 — ATOMIC FUNDING CLAIM FIRST (authority before money): the
+        // DRAFT→FUNDED transition is claimed by an exact-lifecycle CAS before
+        // any financial mutation. A racing fund/cancel that loses NEVER moves
+        // money. (The stale-read checks above are fast-fail conveniences.)
+        const claim = await tx.smartEscrow.updateMany({
+            where: { id: escrowId, status: 'DRAFT', payerId },
+            data: {
+                status: 'FUNDED',
+                fundedAt: new Date(),
+                expiresAt: new Date(Date.now() + fundedExpiryDays * DAY_MS),
+                fundTxHash: reference
+            }
+        });
+        if (claim.count !== 1) {
+            const current = await tx.smartEscrow.findUnique({ where: { id: escrowId }, select: { status: true } });
+            const err = new Error(`Escrow cannot be funded from status ${current?.status || 'UNKNOWN'}.`);
+            err.code = current?.status === 'FUNDED' ? 'ESCROW_ALREADY_FUNDED' : 'ESCROW_STATE_CHANGED';
+            throw err;
+        }
+
         const amount = Number(escrow.amountUsdc);
         const fee = Number(escrow.feeUsdc);
         const total = _round6(amount + fee);
@@ -129,7 +149,7 @@ const fundBookingEscrow = async (prisma, { escrowId, payerId, bookingType, booki
         //   D user:{payer}:liability  (principal + fee)
         //   C escrow:{escrowId}:locked (principal)
         //   C revenue:fees            (fee realized at lock)
-        await ledger.post(tx, {
+        const posting = await ledger.post(tx, {
             idempotencyKey: `ledger:escrow:fund:${escrowId}`,
             entryType: 'ESCROW_LOCK',
             description: 'Booking escrow funded — principal locked, fee realized',
@@ -145,18 +165,14 @@ const fundBookingEscrow = async (prisma, { escrowId, payerId, bookingType, booki
             ],
         });
 
-        const claimed = await tx.smartEscrow.updateMany({
-            where: { id: escrowId, status: 'DRAFT', payerId },
-            data: {
-                status: 'FUNDED',
-                fundedAt: new Date(),
-                expiresAt: new Date(Date.now() + fundedExpiryDays * DAY_MS),
-                fundTxHash: reference
-            }
-        });
-        if (claimed.count !== 1) {
-            const err = new Error('Escrow funding state changed; please retry.');
-            err.code = 'ESCROW_FUNDING_CONFLICT';
+        // r25 P0: an exact ledger replay inside an operation that JUST won
+        // its own durable state claim is contradictory evidence — abort.
+        // NEVER let a replayed ledger identity permit a second economic
+        // mutation (the claim above would already have refused the double
+        // fund; this makes the invariant explicit and fail-closed).
+        if (posting.replayed) {
+            const err = new Error('Ledger funding identity already committed — refusing a second economic mutation.');
+            err.code = 'LEDGER_REPLAY_IN_CLAIMED_OPERATION';
             throw err;
         }
 
