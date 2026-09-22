@@ -68,6 +68,24 @@ const hasDb = !!process.env.TEST_DATABASE_URL;
     expect(one.body.reservation.id).toBe(two.body.reservation.id);
     expect(await db.reservation.count()).toBe(1);
   });
+  test('replayed booking cannot acquire a second fundable escrow or orphan ticket', async () => {
+    await setup(); const b = payload();
+    const first = await call(b, 'escrow-link-1');
+    expect(first.statusCode).toBe(201);
+    const { createBookingEscrow } = require('../services/bookingEscrowService');
+    const input = { bookingType: 'RESERVATION', bookingId: first.body.reservation.id,
+      payerId: customer.id, payeeId: biz.userId, amountUsdc: '10', businessProfileId: biz.id };
+    const linked = await createBookingEscrow(db, input);
+    const replay = await call(b, 'escrow-link-1');
+    expect(replay.statusCode).toBe(200);
+    expect(replay.body.reservation.id).toBe(first.body.reservation.id);
+    expect(replay.body.reservation.escrowId).toBe(linked.escrow.id);
+    expect(replay.body.reservation.ticketId).toBe(linked.ticket.id);
+    await expect(createBookingEscrow(db, input)).rejects.toMatchObject({ code: 'BOOKING_ESCROW_LINK_CONFLICT' });
+    expect(await db.reservation.count()).toBe(1);
+    expect(await db.smartEscrow.count()).toBe(1);
+    expect(await db.ticket.count()).toBe(1);
+  });
   test('different keys for overlapping slots yield one success and a real 409', async () => {
     await setup(); const b = payload();
     const [one, two] = await Promise.all([call(b, 'request-5'), call(b, 'request-6')]);
