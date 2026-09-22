@@ -38,9 +38,24 @@ const setSocketIO = (io) => {
 
 // Lazy-require to avoid circular dependency: escrowService <-> businessOrderService.
 // Do NOT change this to a top-level require().
+//
+// r25 hardening: these getters feed ONLY post-commit (setImmediate) side
+// effects. A load failure must degrade the hook to a no-op — never throw
+// synchronously inside an Immediate, where the escape hatches up to an
+// uncaughtException that can kill the financial process over a notification.
 let _bizOrderService = null;
 const _getBizOrderService = () => {
-    if (!_bizOrderService) _bizOrderService = require('./businessOrderService');
+    if (!_bizOrderService) {
+        try {
+            _bizOrderService = require('./businessOrderService');
+        } catch (err) {
+            // Nested swallow: if the logger itself is unavailable (e.g. the
+            // module registry is gone), the hook STILL degrades to a no-op —
+            // never a second throw.
+            try { logger.error({ err }, '[escrowService] businessOrderService unavailable — order status hook degraded to no-op'); } catch (_) { /* never rethrow from a degraded hook */ }
+            _bizOrderService = { updateOrderStatusFromEscrow: async () => ({}) };
+        }
+    }
     return _bizOrderService;
 };
 
@@ -49,7 +64,14 @@ const _getBizOrderService = () => {
 // notifyOrderEvent is a no-op for peer-to-peer (non-business) escrows.
 let _bizNotificationService = null;
 const _getBizNotificationService = () => {
-    if (!_bizNotificationService) _bizNotificationService = require('./bizNotificationService');
+    if (!_bizNotificationService) {
+        try {
+            _bizNotificationService = require('./bizNotificationService');
+        } catch (err) {
+            try { logger.error({ err }, '[escrowService] bizNotificationService unavailable — owner feed hook degraded to no-op'); } catch (_) { /* never rethrow from a degraded hook */ }
+            _bizNotificationService = { notifyOrderEvent: async () => ({}) };
+        }
+    }
     return _bizNotificationService;
 };
 
@@ -152,9 +174,14 @@ const fundEscrow = async (prisma, { escrowId, payerId }) => {
     // Pre-flight ledger audit (read-only, outside the tx) — same as withdrawal.
     await runDoubleCheck(prisma, payerId);
 
-    const amount = Number(escrow.amountUsdc);
-    const fee = Number(escrow.feeUsdc);
-    const total = _round6(amount + fee);
+    // r25 P0: exact quantity authority — the debit/lock/fee amounts are
+    // Prisma.Decimal (decimal.js, scale 8), never binary floats. Number(...)
+    // remains only for display strings.
+    const amount = escrow.amountUsdc instanceof Prisma.Decimal
+        ? escrow.amountUsdc : new Prisma.Decimal(escrow.amountUsdc);
+    const fee = escrow.feeUsdc instanceof Prisma.Decimal
+        ? escrow.feeUsdc : new Prisma.Decimal(escrow.feeUsdc);
+    const total = amount.add(fee);     // exact Decimal — the debit quantity
 
     const settings = await prisma.globalSettings.findUnique({ where: { id: 1 } });
     const fundedExpiryDays = settings && settings.escrowFundedExpiryDays != null
@@ -164,23 +191,52 @@ const fundEscrow = async (prisma, { escrowId, payerId }) => {
     const reference = randomUUID();
 
     const updatedEscrow = await prisma.$transaction(async (tx) => {
-        const payer = await tx.user.findUnique({
-            where: { id: payerId },
-            select: { availableBalance: true }
+        // r25 P0 — ATOMIC FUNDING CLAIM (the single-winner boundary for the
+        // ENTIRE economic operation): the DRAFT→FUNDED transition is claimed
+        // by an exact-lifecycle CAS on the durable escrow identity. The
+        // stale DRAFT read above is a fast-fail convenience, NOT authority.
+        // A racing fund (or cancel/expiry) that loses this claim NEVER moves
+        // money: no debit, no lock increment, no fee, no history row.
+        const claim = await tx.smartEscrow.updateMany({
+            where: { id: escrowId, status: 'DRAFT', payerId },
+            data: {
+                status: 'FUNDED',
+                fundedAt: new Date(),
+                expiresAt: new Date(Date.now() + fundedExpiryDays * DAY_MS),
+                fundTxHash: reference
+            }
         });
-        if (!payer) throw new Error('Payer not found.');
-        if (Number(payer.availableBalance) < total) {
-            throw new Error(
-                `Insufficient balance. Required: ${total} USDC (amount + fee), ` +
-                `available: ${Number(payer.availableBalance).toFixed(6)} USDC.`
-            );
+        if (claim.count !== 1) {
+            const current = await tx.smartEscrow.findUnique({
+                where: { id: escrowId },
+                select: { status: true }
+            });
+            const err = new Error(`Escrow cannot be funded from status ${current?.status || 'UNKNOWN'}.`);
+            err.code = current?.status === 'FUNDED' ? 'ESCROW_ALREADY_FUNDED' : 'ESCROW_STATE_CHANGED';
+            throw err;
         }
 
-        // a. Debit payer available balance (principal + fee).
-        await tx.user.update({
-            where: { id: payerId },
+        // r25 — ATOMIC BALANCE CLAIM: a conditional decrement on the payer
+        // row makes the insufficient-balance race deterministic (the DB
+        // nonneg CHECK is a secondary invariant, never the guard). Losing
+        // this claim throws INSUFFICIENT_BALANCE and rolls the funding
+        // claim back — the escrow stays DRAFT and the attempt is retryable.
+        const debit = await tx.user.updateMany({
+            where: { id: payerId, availableBalance: { gte: total } },
             data: { availableBalance: { decrement: total } }
         });
+        if (debit.count !== 1) {
+            const payer = await tx.user.findUnique({
+                where: { id: payerId },
+                select: { availableBalance: true }
+            });
+            const err = new Error(
+                `Insufficient balance. Required: ${total.toFixed(6)} USDC (amount + fee), ` +
+                `available: ${Number(payer?.availableBalance ?? 0).toFixed(6)} USDC.`
+            );
+            err.code = 'INSUFFICIENT_BALANCE';
+            throw err;
+        }
 
         // b. Lock the principal (fee is NOT locked — it is platform revenue).
         await tx.user.update({
@@ -199,7 +255,7 @@ const fundEscrow = async (prisma, { escrowId, payerId }) => {
         //   D user:{payer}:liability  (principal + fee: the customer is owed less)
         //   C escrow:{escrowId}:locked (principal: restricted liability reclassification)
         //   C revenue:fees            (fee: platform revenue realized at lock)
-        await ledger.post(tx, {
+        const posting = await ledger.post(tx, {
             idempotencyKey: `ledger:escrow:fund:${escrowId}`,
             entryType: 'ESCROW_LOCK',
             description: 'SmartEscrow funded — principal locked, fee realized',
@@ -214,17 +270,19 @@ const fundEscrow = async (prisma, { escrowId, payerId }) => {
                 { account: 'revenue:fees', credit: _exact(fee) },
             ],
         });
+        // r25 P0: an exact ledger replay inside an operation that JUST won
+        // its own durable state claim is contradictory evidence — the posting
+        // exists while the lifecycle says it cannot. NEVER let a replayed
+        // ledger identity permit the rest of the economic operation to
+        // proceed a second time: abort (rollback of the whole transaction).
+        if (posting.replayed) {
+            const err = new Error('Ledger funding identity already committed — refusing a second economic mutation.');
+            err.code = 'LEDGER_REPLAY_IN_CLAIMED_OPERATION';
+            throw err;
+        }
 
-        // d. Flip escrow → FUNDED with the 30d inactivity window.
-        const updated = await tx.smartEscrow.update({
-            where: { id: escrowId },
-            data: {
-                status: 'FUNDED',
-                fundedAt: new Date(),
-                expiresAt: new Date(Date.now() + fundedExpiryDays * DAY_MS),
-                fundTxHash: reference
-            }
-        });
+        // d. The escrow is FUNDED (claimed atomically above) — read the row.
+        const updated = await tx.smartEscrow.findUnique({ where: { id: escrowId } });
 
         // e. Canonical TransactionHistory row (payer debit).
         await tx.transactionHistory.create({
@@ -232,8 +290,8 @@ const fundEscrow = async (prisma, { escrowId, payerId }) => {
                 userId: payerId,
                 type: 'TICKET_ESCROW_FUND',
                 // amountUsdc is NEGATIVE: debit (OUT) convention per runDoubleCheck.
-                // feeUsdc is always POSITIVE (a cost).
-                amountUsdc: -amount,
+                // feeUsdc is always POSITIVE (a cost). Exact Decimal.
+                amountUsdc: amount.negated(),
                 feeUsdc: fee,
                 txHash: reference,
                 status: 'COMPLETED'
@@ -241,7 +299,7 @@ const fundEscrow = async (prisma, { escrowId, payerId }) => {
         });
 
         // f. AdminProfitLog audit row for the fee (relatedTxId, not notes).
-        if (fee > 0) {
+        if (Number(fee) > 0) {
             await tx.adminProfitLog.create({
                 data: {
                     amountUsdc: fee,

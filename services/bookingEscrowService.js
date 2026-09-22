@@ -24,6 +24,25 @@ const _exact = (n) => (n instanceof Prisma.Decimal ? n.toFixed(8) : Number(n).to
 const _ensureProfitFeesSingleton = async (tx) =>
     tx.systemProfitFees.upsert({ where: { id: 1 }, update: {}, create: { id: 1, balance: 0.0 } });
 
+// r25+r29 integration authority. The caller already owns the escrow-row claim,
+// which is the shared first lock for funding and terminal lifecycle operations.
+// PENDING may be confirmed by funding; CONFIRMED is valid convergence. Every
+// other state is terminal/incompatible and aborts the whole financial tx.
+const _claimReservationForFundingTx = async (tx, { bookingId, escrowId }) => {
+    const claimed = await tx.reservation.updateMany({
+        where: { id: bookingId, escrowId, status: 'PENDING' },
+        data: { status: 'CONFIRMED', confirmedAt: new Date() },
+    });
+    if (claimed.count === 1) return;
+
+    const current = await tx.reservation.findUnique({
+        where: { id: bookingId },
+        select: { status: true, escrowId: true },
+    });
+    if (current?.status === 'CONFIRMED' && current.escrowId === escrowId) return;
+    throw _escrowError('RESERVATION_FUNDING_CONFLICT');
+};
+
 // 1. CREATE BOOKING ESCROW — DRAFT state, no money moves.
 const createBookingEscrow = async (prisma, {
     bookingType, bookingId, payerId, payeeId,
@@ -106,20 +125,47 @@ const fundBookingEscrow = async (prisma, { escrowId, payerId, bookingType, booki
         if (escrow.payerId !== payerId) throw new Error('Only the payer can fund this escrow.');
         if (escrow.status !== 'DRAFT') throw new Error(`Escrow cannot be funded from status ${escrow.status}.`);
 
+        // r25+r29 P0 — SHARED AUTHORITATIVE CLAIM ORDER. Funding and every
+        // reservation terminal operation serialize on the escrow row first.
+        // A loser cannot debit money, confirm a terminal reservation, or leave
+        // a partial economic mutation. Any later failure rolls the claim back.
         const amount = Number(escrow.amountUsdc);
         const fee = Number(escrow.feeUsdc);
         const total = _round6(amount + fee);
 
+        const claim = await tx.smartEscrow.updateMany({
+            where: { id: escrowId, status: 'DRAFT', payerId },
+            data: {
+                status: 'FUNDED',
+                fundedAt: new Date(),
+                expiresAt: new Date(Date.now() + fundedExpiryDays * DAY_MS),
+                fundTxHash: reference
+            }
+        });
+        if (claim.count !== 1) {
+            const current = await tx.smartEscrow.findUnique({ where: { id: escrowId }, select: { status: true } });
+            const err = new Error(`Escrow cannot be funded from status ${current?.status || 'UNKNOWN'}.`);
+            err.code = current?.status === 'FUNDED' ? 'ESCROW_ALREADY_FUNDED' : 'ESCROW_STATE_CHANGED';
+            throw err;
+        }
+
+        // Reservation confirmation is authoritative, not a best-effort tail
+        // update. Holding the escrow claim blocks cancellation/check-in/no-show
+        // on this aggregate while PENDING converges to CONFIRMED. A terminal or
+        // mismatched reservation aborts and rolls back the escrow claim.
+        if (bookingType === 'RESERVATION' && bookingId) {
+            await _claimReservationForFundingTx(tx, { bookingId, escrowId });
+        }
+
         const payer = await tx.user.findUnique({ where: { id: payerId }, select: { availableBalance: true } });
         if (!payer) throw new Error('Payer not found.');
-
         const debit = await tx.user.updateMany({
             where: { id: payerId, availableBalance: { gte: total } },
             data: { availableBalance: { decrement: total } }
         });
         if (debit.count !== 1) {
             const err = new Error(
-                `Insufficient balance. Required: ${total} USDC (amount + fee), ` +
+                `Insufficient balance. Required: ${total.toFixed(6)} USDC (amount + fee), ` +
                 `available: ${Number(payer.availableBalance).toFixed(6)} USDC.`
             );
             err.code = 'INSUFFICIENT_BALANCE';
@@ -136,7 +182,7 @@ const fundBookingEscrow = async (prisma, { escrowId, payerId, bookingType, booki
         //   D user:{payer}:liability  (principal + fee)
         //   C escrow:{escrowId}:locked (principal)
         //   C revenue:fees            (fee realized at lock)
-        await ledger.post(tx, {
+        const posting = await ledger.post(tx, {
             idempotencyKey: `ledger:escrow:fund:${escrowId}`,
             entryType: 'ESCROW_LOCK',
             description: 'Booking escrow funded — principal locked, fee realized',
@@ -152,18 +198,14 @@ const fundBookingEscrow = async (prisma, { escrowId, payerId, bookingType, booki
             ],
         });
 
-        const claimed = await tx.smartEscrow.updateMany({
-            where: { id: escrowId, status: 'DRAFT', payerId },
-            data: {
-                status: 'FUNDED',
-                fundedAt: new Date(),
-                expiresAt: new Date(Date.now() + fundedExpiryDays * DAY_MS),
-                fundTxHash: reference
-            }
-        });
-        if (claimed.count !== 1) {
-            const err = new Error('Escrow funding state changed; please retry.');
-            err.code = 'ESCROW_FUNDING_CONFLICT';
+        // r25 P0: an exact ledger replay inside an operation that JUST won
+        // its own durable state claim is contradictory evidence — abort.
+        // NEVER let a replayed ledger identity permit a second economic
+        // mutation (the claim above would already have refused the double
+        // fund; this makes the invariant explicit and fail-closed).
+        if (posting.replayed) {
+            const err = new Error('Ledger funding identity already committed — refusing a second economic mutation.');
+            err.code = 'LEDGER_REPLAY_IN_CLAIMED_OPERATION';
             throw err;
         }
 
@@ -182,14 +224,9 @@ const fundBookingEscrow = async (prisma, { escrowId, payerId, bookingType, booki
             });
         }
 
-        // Booking confirmation is part of the same business transaction. We use
-        // updateMany so an already-confirmed booking is a harmless convergence no-op.
-        if (bookingType === 'RESERVATION' && bookingId) {
-            await tx.reservation.updateMany({
-                where: { id: bookingId, status: 'PENDING' },
-                data: { status: 'CONFIRMED', confirmedAt: new Date() }
-            });
-        } else if (bookingType === 'TRANSIT' && bookingId) {
+        // Reservation confirmation was claimed before money. Transit keeps its
+        // existing convergence contract and is outside the r29 state machine.
+        if (bookingType === 'TRANSIT' && bookingId) {
             await tx.transitBooking.updateMany({
                 where: { id: bookingId, status: 'PENDING' },
                 data: { status: 'CONFIRMED' }

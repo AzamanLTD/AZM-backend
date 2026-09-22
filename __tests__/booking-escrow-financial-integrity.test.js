@@ -137,7 +137,7 @@ describe('booking escrow financial integrity', () => {
         expect(prisma.$transaction).toHaveBeenCalledTimes(1);
     });
 
-    test('uses a conditional balance claim before funding the escrow', async () => {
+    test('claims escrow and reservation authority before the conditional balance mutation', async () => {
         const tx = makeTx();
         const prisma = makePrisma(tx);
 
@@ -154,9 +154,13 @@ describe('booking escrow financial integrity', () => {
             data: expect.objectContaining({ status: 'FUNDED' }),
         }));
         expect(tx.reservation.updateMany).toHaveBeenCalledTimes(1);
+        expect(tx.smartEscrow.updateMany.mock.invocationCallOrder[0])
+            .toBeLessThan(tx.user.updateMany.mock.invocationCallOrder[0]);
+        expect(tx.reservation.updateMany.mock.invocationCallOrder[0])
+            .toBeLessThan(tx.user.updateMany.mock.invocationCallOrder[0]);
     });
 
-    test('does not mutate funds when the conditional balance claim loses the race', async () => {
+    test('does not execute economic side effects when the conditional balance claim loses', async () => {
         const tx = makeTx({
             user: {
                 findUnique: jest.fn().mockResolvedValue({ availableBalance: 1000 }),
@@ -173,7 +177,11 @@ describe('booking escrow financial integrity', () => {
 
         expect(tx.user.update).not.toHaveBeenCalled();
         expect(tx.systemProfitFees.update).not.toHaveBeenCalled();
-        expect(tx.smartEscrow.updateMany).not.toHaveBeenCalled();
+        // The escrow/reservation authority is attempted first. The thrown
+        // balance conflict rolls both claims back in the real PostgreSQL
+        // transaction (covered by the r25+r29 integration proofs).
+        expect(tx.smartEscrow.updateMany).toHaveBeenCalledTimes(1);
+        expect(tx.reservation.updateMany).toHaveBeenCalledTimes(1);
         expect(tx.transactionHistory.create).not.toHaveBeenCalled();
     });
 

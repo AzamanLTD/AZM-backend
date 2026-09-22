@@ -1,11 +1,18 @@
 // controllers/walletController.js
 
-/**
+// r25 P0 REPAIR: an earlier automated edit had spliced these requires INSIDE
+// the file's opening doc comment (they were comment text, not code), so Prisma,
+// logger, ledger, restrictedObligations and _exact were ALL undefined at
+// runtime — every handler that touched them (requestWithdrawal first among
+// them) threw "Prisma is not defined" before responding. No test covered this
+// controller, so CI stayed green while the endpoint was broken in production.
 const logger = require('../src/config/logger');
 const { Prisma } = require('@prisma/client');
 const ledger = require('../services/ledgerService');
 const restrictedObligations = require('../services/restrictedObligationService');
 const _exact = (n) => (n instanceof Prisma.Decimal ? n.toFixed(8) : Number(n).toFixed(8));
+
+/**
  * 1. REQUEST WITHDRAWAL (The Address Detective)
  */
 exports.requestWithdrawal = async (req, res) => {
@@ -74,19 +81,23 @@ exports.requestWithdrawal = async (req, res) => {
 
         // 3. Execute the Transaction
         const result = await prisma.$transaction(async (tx) => {
-            const user = await tx.user.findUnique({ where: { id: userId } });
-            
-            // Note: We deduct the requested amount. The gas fee is subtracted from 
-            // what they actually receive on the blockchain side later.
-            if (user.availableBalance < withdrawAmount) {
-                throw new Error("Insufficient balance.");
-            }
-
-            // Deduct from available balance (Phase D-2: AZM eliminated)
-            await tx.user.update({
-                where: { id: userId },
+            // r25 — ATOMIC BALANCE CLAIM: a conditional decrement makes the
+            // insufficient-balance race deterministic (a concurrent debit from
+            // another financial endpoint can consume funds between the read
+            // and a blind decrement). Losing the claim throws INSUFFICIENT_BALANCE
+            // and rolls back the ENTIRE transaction — no Withdrawal row, no
+            // ledger reservation, no restricted obligation, no fee realization.
+            // Two racing withdrawal requests: exactly one consumes the funds;
+            // the other fails cleanly and orphans nothing.
+            const debit = await tx.user.updateMany({
+                where: { id: userId, availableBalance: { gte: withdrawAmount } },
                 data: { availableBalance: { decrement: withdrawAmount } }
             });
+            if (debit.count !== 1) {
+                const err = new Error("Insufficient balance.");
+                err.code = "INSUFFICIENT_BALANCE";
+                throw err;
+            }
 
             // --- Phase ADMIN-CONTROL-2 FIX 2: Credit platform fee ---
             if (platformFeeUsdc > 0) {
@@ -115,10 +126,16 @@ exports.requestWithdrawal = async (req, res) => {
                     totalGasFee: totalGasFee,
                     vendorGasShare: vendorGasShare,
                     adminGasShare: adminGasShare,
-                    platformFeeUsdc: platformFeeUsdc,
                     status: "PENDING"
                 }
             });
+            // r25 P0 FIX (found by the concurrency suite): the Withdrawal model
+            // has no platformFeeUsdc column — passing it made tx.withdrawal.create
+            // throw "Unknown argument platformFeeUsdc" on EVERY request, rolling
+            // back the whole transaction after the balance claim had already
+            // succeeded (the endpoint never created a single row). The platform
+            // fee is durably recorded in SystemProfitFees + AdminProfitLog
+            // (relatedTxId crypto_pfee_*) and the equity:treasury ledger line.
 
             // §P.4 AUTHORITATIVE ACCOUNTING — withdrawal request debits the
             // customer NOW, but the payout is PENDING: the funds are
@@ -496,11 +513,6 @@ exports.getPolygonDepositAddress = async (req, res) => {
         });
 
     } catch (error) {
-        const logger = require('../src/config/logger');
-const { Prisma } = require('@prisma/client');
-const ledger = require('../services/ledgerService');
-const restrictedObligations = require('../services/restrictedObligationService');
-const _exact = (n) => (n instanceof Prisma.Decimal ? n.toFixed(8) : Number(n).toFixed(8));
         logger.error({ err: error }, '[getPolygonDepositAddress] error');
         return res.status(500).json({ success: false, message: error.message });
     }
