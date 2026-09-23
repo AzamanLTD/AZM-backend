@@ -238,7 +238,7 @@ describeOrSkip('business no-show settlement (real PostgreSQL)', () => {
 
     afterEach(async () => {
         await prisma.$executeRawUnsafe(
-            'TRUNCATE TABLE "User", "SystemProfitFees", "AdminProfitLog", "AuditLog" RESTART IDENTITY CASCADE'
+            'TRUNCATE TABLE "User", "SystemProfitFees", "AdminProfitLog", "AuditLog", "RestrictedObligation" RESTART IDENTITY CASCADE'
         );
     }, 15000);
 

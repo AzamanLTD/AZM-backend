@@ -20,7 +20,7 @@ async function getBusinessProfileId(req) {
 function wrap(handler) {
     return async (req, res) => {
         try { await handler(req, res); }
-        catch (err) { res.status(err.statusCode || 400).json({ success: false, message: err.message }); }
+        catch (err) { res.status(err.statusCode || 400).json({ success: false, code: err.code, message: err.message }); }
     };
 }
 
@@ -33,6 +33,7 @@ router.post('/restaurant/inventory/:id/restock', requirePermission('restaurant.i
         itemId: req.params.id,
         quantity: req.body.quantity,
         costPerUnit: req.body.costPerUnit,
+        idempotencyKey: req.headers['idempotency-key'] ?? req.headers['x-idempotency-key'] ?? req.body.clientRequestId ?? req.body.idempotencyKey,
     });
     res.json({ success: true, ...result });
 }));

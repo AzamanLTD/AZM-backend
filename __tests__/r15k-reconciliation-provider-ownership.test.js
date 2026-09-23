@@ -87,7 +87,32 @@ describeOrSkip('r15 follow-up P0: payout provider ownership end-to-end (real Pos
         await prisma.$disconnect();
     });
 
+    // The observed CI poison: an ACTIVE wallet obligation bound to the next
+    // reseeded withdrawal serial id. Producers now truncate the table, but
+    // this suite's contract must not depend on every producer's hygiene.
+    const neutralizeObligationLeftovers = async () => {
+        await prisma.$executeRawUnsafe(
+            'TRUNCATE TABLE "RestrictedObligation" RESTART IDENTITY CASCADE'
+        );
+    };
+
     beforeEach(async () => {
+        // ISOLATION BOUNDARY (CI run 35812381059 regression): this suite seeds
+        // the first Withdrawal of each test at serial id 1 (the predecessors'
+        // cleanup RESTARTs the identity), but RestrictedObligation is not
+        // FK-linked to User, so TRUNCATE ... CASCADE from earlier suites never
+        // reaches it and a leftover ACTIVE obligation for withdrawal id 1
+        // (e.g. from r25-financial-concurrency-authority's wallet-proof)
+        // alias-claims OUR seeded withdrawal through
+        // restrictedObligations.findActiveForSource('withdrawal', '1'):
+        // _findCanonicalTransaction's own-obligation guard then refuses
+        // canonical adoption, the payout is flagged and every proof in this
+        // suite sees processed=0 / zero provider calls. This suite must
+        // establish its OWN ground truth, never inherit a predecessor's
+        // obligation rows. neutralizeObligationLeftovers is the durable fix;
+        // test F proves the boundary.
+        await neutralizeObligationLeftovers();
+
         // Fresh adapters + failover per test: provider health and the mtn
         // OAuth token cache are instance state — sharing them across tests
         // couples test order (a capacity-class rejection in one test
@@ -130,7 +155,7 @@ describeOrSkip('r15 follow-up P0: payout provider ownership end-to-end (real Pos
     afterEach(async () => {
         await new Promise(r => setTimeout(r, 150));
         await prisma.$executeRawUnsafe(
-            'TRUNCATE TABLE "User", "TransactionHistory", "Withdrawal", "ReconciliationException", "AzmSpendLog", "AdminProfitLog", "GlobalSettings", "SystemFiatPool", "SystemProfitFees", "SystemMasterCrypto", "FiatLiquidityReceipt", "FiatProviderEvent", "ProviderSettlementAttempt" RESTART IDENTITY CASCADE'
+            'TRUNCATE TABLE "User", "TransactionHistory", "Withdrawal", "ReconciliationException", "AzmSpendLog", "AdminProfitLog", "GlobalSettings", "SystemFiatPool", "SystemProfitFees", "SystemMasterCrypto", "FiatLiquidityReceipt", "FiatProviderEvent", "ProviderSettlementAttempt", "RestrictedObligation" RESTART IDENTITY CASCADE'
         );
     }, 15000);
 
@@ -169,7 +194,11 @@ describeOrSkip('r15 follow-up P0: payout provider ownership end-to-end (real Pos
                 payoutMethod: 'MTN_MOMO',
                 network: 'MTN',
                 status: 'PENDING',
-                createdAt: new Date()
+                // This is a pre-bridge legacy mirror. Preserve its original
+                // canonical timestamp rather than measuring CI runner latency
+                // between two independent INSERTs: recovery intentionally
+                // matches only a narrow +/-5s window.
+                createdAt: tx.createdAt
             }
         });
         return { user, tx, withdrawal };
@@ -441,5 +470,62 @@ describeOrSkip('r15 follow-up P0: payout provider ownership end-to-end (real Pos
         expect(axiosGetSpy).not.toHaveBeenCalled();
         const wAfter = await prisma.withdrawal.findUnique({ where: { id: withdrawal.id } });
         expect(wAfter.status).toBe('COMPLETED');
+    });
+
+    test('F. ISOLATION REGRESSION (CI run 35812381059): a predecessor-suite leftover ACTIVE wallet obligation is neutralized before the payout proofs run', async () => {
+        // Reproduce the exact poison observed on the CI first attempt: a
+        // prior suite (r25-financial-concurrency-authority /
+        // penalty-policy-integrity) leaves an ACTIVE RestrictedObligation
+        // bound to sourceEntity='withdrawal', sourceEntityId='1' — the serial
+        // id this suite's freshly-reseeded withdrawal claims. The leftover
+        // survives every User-cascade TRUNCATE because RestrictedObligation
+        // has no FK to User.
+
+        // (1) THE GUARD ITSELF IS CORRECT: while the poison is bound to this
+        // withdrawal's id, the own-obligation guard must refuse canonical
+        // adoption — a withdrawal that owns a wallet obligation must never
+        // dispatch a fiat canonical. No provider call, nothing processed.
+        const reference = 'R15K-POISON-1';
+        const { withdrawal } = await seedAutoPayoutCandidate(reference);
+        await prisma.restrictedObligation.create({
+            data: {
+                reference: `withdrawal:wallet:${withdrawal.id}`,
+                sourceType: 'PENDING_CRYPTO_WITHDRAWAL',
+                sourceEntity: 'withdrawal',
+                sourceEntityId: String(withdrawal.id),
+                userId: withdrawal.userId,
+                amount: AMOUNT,
+                status: 'ACTIVE'
+            }
+        });
+        const poisonBatch = new PayoutBatchWorker(prisma, { emit: jest.fn() }, failover, null);
+        const poisoned = await poisonBatch._processBatch(settings, { isManualTrigger: true });
+        expect(poisoned.processed).toBe(0);
+        expect(axiosPostSpy).not.toHaveBeenCalled();
+        const poisonedRow = await prisma.withdrawal.findUnique({ where: { id: withdrawal.id } });
+        expect(poisonedRow.status).toBe('NEEDS_MANUAL_REVIEW');
+
+        // (2) THE ISOLATION BOUNDARY: this suite's beforeEach neutralization
+        // is exactly the cleanup that makes the CI failure impossible —
+        // poison present, neutralized, then the SAME payout path processes.
+        await neutralizeObligationLeftovers();
+        const leftovers = await prisma.restrictedObligation.count({
+            where: { sourceEntity: 'withdrawal', sourceEntityId: String(withdrawal.id), status: 'ACTIVE' }
+        });
+        expect(leftovers).toBe(0);
+
+        // (3) With the boundary restored, the payout chain is live again.
+        // A FRESH candidate (fresh reference, fresh timestamps — never a
+        // re-armed poisoned row) is found, canonically adopted and dispatched:
+        // exactly what the CI first attempt could not do.
+        const reference2 = 'R15K-POISON-2';
+        await seedAutoPayoutCandidate(reference2);
+        mockMoolreTransferAccept();
+        const batch = new PayoutBatchWorker(prisma, { emit: jest.fn() }, failover, null);
+        const result = await batch._processBatch(settings, { isManualTrigger: true });
+        expect(result.processed).toBe(1);
+        expect(axiosPostSpy).toHaveBeenCalledTimes(1);
+        const txAfterDispatch = await prisma.transactionHistory.findUnique({ where: { txHash: reference2 } });
+        expect(txAfterDispatch.metadata.payoutProvider).toBe('moolre');
     });
 });
