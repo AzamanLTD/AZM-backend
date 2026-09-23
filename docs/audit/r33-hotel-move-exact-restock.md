@@ -54,4 +54,4 @@ Proofs: `__tests__/r33-inventory-restock-exact-economics.test.js` (21 proofs inc
 
 ## PR
 
-Branch `fix/r33-hotel-move-exact-restock` → `main`, opened from this tree after the full gate.
+PR #303 (`fix/r32-business-os-tenant-authority` → `main`), retitled to cover the r32 + r33 waves: business-scoped tenant authority, room-move concurrency, exact restock economics.
