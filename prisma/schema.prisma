@@ -2787,6 +2787,7 @@ model BusinessProfile {
   cargoParcelsSent        CargoParcel[]
   routeTemplates          TransitRouteTemplate[]
   inventoryItems          InventoryItem[]
+  inventoryRestockOperations InventoryRestockOperation[]
   notificationPreferences BusinessNotificationPreference?
   apiKeys                 BusinessApiKey[]
   webhooks                BusinessWebhook[]
@@ -5444,9 +5445,29 @@ model InventoryItem {
 
   businessProfile   BusinessProfile    @relation(fields: [businessProfileId], references: [id])
   recipeIngredients RecipeIngredient[]
+  restockOperations InventoryRestockOperation[]
 
   @@unique([businessProfileId, name])
   @@index([businessProfileId])
+}
+
+// A durable business-scoped request claim: no expiry, because reusing an old
+// restock key must never execute an additional stock/expense mutation.
+model InventoryRestockOperation {
+  id                 String   @id @default(uuid())
+  businessProfileId  String
+  itemId             String
+  idempotencyKey     String   @db.VarChar(128)
+  requestFingerprint String   @db.VarChar(64)
+  result             Json?
+  ledgerId           String?
+  createdAt          DateTime @default(now())
+
+  businessProfile BusinessProfile @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+  item            InventoryItem   @relation(fields: [itemId], references: [id], onDelete: Cascade)
+
+  @@unique([businessProfileId, idempotencyKey])
+  @@index([itemId])
 }
 
 model RecipeIngredient {

@@ -121,6 +121,9 @@ jobs:
       - name: Install business OS overlay
         run: node infra/install-business-os-overlay.js
 
+      - name: Install inventory restock authority
+        run: node infra/install-inventory-restock-overlay.js
+
       - name: Install reservation capacity authority
         run: node infra/install-reservation-capacity-overlay.js
 
@@ -148,6 +151,7 @@ jobs:
             "__tests__/withdrawal-reconciliation-terminal-claim.test.js"
             "__tests__/r15a-reconciliation-single-claim.test.js"
             "__tests__/r15h-reconciliation-resolves-through-status-contract.test.js"
+            "__tests__/r15k-reconciliation-provider-ownership.test.js"
             "__tests__/r15c-disbursement-outcome-classification.test.js"
             "__tests__/r15d-withdrawal-outcome-honesty.test.js"
             "__tests__/r15e-providerref-cas.test.js"
@@ -165,6 +169,7 @@ jobs:
             "__tests__/r29-reservation-lifecycle-authority.test.js"
             "__tests__/r30-r25-r29-funding-lifecycle-integration.test.js"
             "__tests__/r31-reservation-capacity-authority.test.js"
+            "__tests__/inventory-restock-idempotency.test.js"
             "__tests__/azm-conversion-economic-atomicity.test.js"
             "__tests__/azm-stake-economic-atomicity.test.js"
             "__tests__/azm-gift-economic-atomicity.test.js"

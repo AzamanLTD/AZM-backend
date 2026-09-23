@@ -1,46 +1,30 @@
 const { InventoryRestockService } = require('../services/businessOS/inventoryRestockService');
 
-describe('InventoryRestockService', () => {
-    test('updates stock and records expense in the same transaction', async () => {
-        const tx = {
-            inventoryItem: { update: jest.fn().mockResolvedValue({ id: 'item-1', currentStock: 15, costPerUnit: 4 }) },
-            businessLedgerEntry: { create: jest.fn().mockResolvedValue({ id: 'ledger-1' }) },
-        };
-        const prisma = {
-            inventoryItem: { findFirst: jest.fn().mockResolvedValue({ id: 'item-1', name: 'Rice', unit: 'kg', costPerUnit: 4, isActive: true }) },
-            $transaction: jest.fn(async (fn) => fn(tx)),
-        };
-
-        const result = await new InventoryRestockService(prisma).restock({ businessProfileId: 'biz-1', itemId: 'item-1', quantity: 5 });
-
-        expect(tx.inventoryItem.update).toHaveBeenCalledWith({ where: { id: 'item-1' }, data: { currentStock: { increment: 5 }, costPerUnit: 4 } });
-        expect(tx.businessLedgerEntry.create).toHaveBeenCalledWith(expect.objectContaining({
-            data: expect.objectContaining({ businessProfileId: 'biz-1', type: 'EXPENSE', amount: -20 }),
-        }));
-        expect(result.ledgerWritten).toBe(true);
-    });
-
-    test('rolls the transaction boundary back when ledger creation fails', async () => {
-        const ledgerError = new Error('ledger unavailable');
-        const tx = {
-            inventoryItem: { update: jest.fn().mockResolvedValue({ id: 'item-1', currentStock: 15, costPerUnit: 4 }) },
-            businessLedgerEntry: { create: jest.fn().mockRejectedValue(ledgerError) },
-        };
-        const prisma = {
-            inventoryItem: { findFirst: jest.fn().mockResolvedValue({ id: 'item-1', name: 'Rice', unit: 'kg', costPerUnit: 4, isActive: true }) },
-            $transaction: jest.fn(async (fn) => fn(tx)),
-        };
-
-        await expect(new InventoryRestockService(prisma).restock({ businessProfileId: 'biz-1', itemId: 'item-1', quantity: 5 }))
-            .rejects.toThrow('ledger unavailable');
-        expect(tx.inventoryItem.update).toHaveBeenCalledTimes(1);
-        expect(tx.businessLedgerEntry.create).toHaveBeenCalledTimes(1);
-    });
-
-    test('rejects invalid quantity before mutation', async () => {
-        const prisma = { inventoryItem: { findFirst: jest.fn() }, $transaction: jest.fn() };
-        await expect(new InventoryRestockService(prisma).restock({ businessProfileId: 'biz-1', itemId: 'item-1', quantity: 0 }))
-            .rejects.toThrow('quantity must be a positive number.');
+describe('InventoryRestockService input boundary', () => {
+    const prisma = { inventoryRestockOperation: { findUnique: jest.fn() }, $transaction: jest.fn() };
+    const svc = new InventoryRestockService(prisma);
+    const input = { businessProfileId: 'biz-1', itemId: 'item-1', quantity: 5, idempotencyKey: 'new-restock-1' };
+    test.each([
+        [undefined, 'missing'], ['', 'empty'], ['  ', 'blank'], [' a ', 'padded'],
+        ['x'.repeat(129), 'oversized'], [7, 'non-string'], ['x\n', 'control char'],
+    ])('rejects %s key (%s) without touching the database', async (key) => {
+        await expect(svc.restock({ ...input, idempotencyKey: key })).rejects.toMatchObject({ code: 'RESTOCK_IDEMPOTENCY_KEY_REQUIRED' });
         expect(prisma.$transaction).not.toHaveBeenCalled();
+        expect(prisma.inventoryRestockOperation.findUnique).not.toHaveBeenCalled();
+    });
+    test.each([0, -1, '', 'NaN', null, Infinity])('rejects invalid quantity %s', async (quantity) => {
+        await expect(svc.restock({ ...input, quantity })).rejects.toMatchObject({ code: 'RESTOCK_INVALID_QUANTITY' });
+        expect(prisma.$transaction).not.toHaveBeenCalled();
+    });
+    test('only one router implements the restock POST', () => {
+        const authoritative = require('../routes/businessOSInventoryRoutes');
+        const legacy = require('../routes/businessOSRoutes');
+        const path = '/restaurant/inventory/:id/restock';
+        const match = (router) => router.stack.filter(layer => layer.route?.path === path && layer.route?.methods.post).length;
+        expect(match(authoritative)).toBe(1);
+        expect(match(legacy)).toBe(0);
+        const routes = require('fs').readFileSync(require.resolve('../src/routes/index.js'), 'utf8');
+        expect(routes.indexOf("require('../../routes/businessOSInventoryRoutes')"))
+            .toBeLessThan(routes.indexOf("require('../../routes/businessOSRoutes')"));
     });
 });

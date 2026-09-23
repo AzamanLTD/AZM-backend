@@ -1657,45 +1657,6 @@ router.patch('/restaurant/inventory/:id', requirePermission('restaurant.inventor
     res.json({ success: true, item });
 }));
 
-// POST /api/business-os/restaurant/inventory/:id/restock — quick restock (writes ledger expense)
-router.post('/restaurant/inventory/:id/restock', requirePermission('restaurant.inventory.manage'), wrap(async (req, res) => {
-    const prisma = getPrisma(req);
-    const bpId = await getBusinessProfileId(req);
-    const { quantity, costPerUnit } = req.body;
-    const item = await prisma.inventoryItem.findFirst({
-        where: { id: req.params.id, businessProfileId: bpId },
-    });
-    if (!item) return res.status(404).json({ success: false, message: 'Item not found' });
-
-    const updated = await prisma.inventoryItem.update({
-        where: { id: item.id },
-        data: { currentStock: { increment: parseFloat(quantity) } },
-    });
-
-    // Auto-write a BusinessLedgerEntry expense for the restock cost
-    const unitCost = costPerUnit != null ? parseFloat(costPerUnit) : item.costPerUnit;
-    const totalCostGhs = unitCost * parseFloat(quantity);
-    try {
-        await prisma.businessLedgerEntry.create({
-            data: {
-                businessProfileId: bpId,
-                type: 'EXPENSE',
-                category: 'SUPPLIES',
-                description: 'Restock: ' + item.name + ' (x' + quantity + ' ' + item.unit + ')',
-                amount: -totalCostGhs,
-                amountGhs: -totalCostGhs,
-                sourceType: 'INVENTORY_RESTOCK',
-                sourceId: item.id,
-                metadata: { inventoryItemId: item.id, quantity: parseFloat(quantity), unitCost },
-            },
-        });
-    } catch (e) {
-        logger.warn('[restock] Failed to write ledger entry:', e.message);
-    }
-
-    res.json({ success: true, item: updated, ledgerWritten: true });
-}));
-
 // GET /api/business-os/restaurant/recipes — get recipe costs per product
 router.get('/restaurant/recipes', requirePermission('restaurant.inventory.view'), wrap(async (req, res) => {
     const prisma = getPrisma(req);

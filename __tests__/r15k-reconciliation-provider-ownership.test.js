@@ -169,7 +169,11 @@ describeOrSkip('r15 follow-up P0: payout provider ownership end-to-end (real Pos
                 payoutMethod: 'MTN_MOMO',
                 network: 'MTN',
                 status: 'PENDING',
-                createdAt: new Date()
+                // This is a pre-bridge legacy mirror. Preserve its original
+                // canonical timestamp rather than measuring CI runner latency
+                // between two independent INSERTs: recovery intentionally
+                // matches only a narrow +/-5s window.
+                createdAt: tx.createdAt
             }
         });
         return { user, tx, withdrawal };
