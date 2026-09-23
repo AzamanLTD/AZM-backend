@@ -1,30 +1,132 @@
-// 📁 services/businessOS/businessLedgerService.js
 // services/businessOS/businessLedgerService.js
 // =============================================================================
 // Business Ledger Service — universal financial tracking for businesses.
 // Every financial event (income, expense, payroll, tax, refund, penalty,
 // ad spend, maintenance, supplies) is recorded in the ledger.
+//
+// r35/P2 — CANONICAL ACCOUNTING CONTRACT (now enforced, not just implied):
+//   • SIGNED AMOUNTS: the schema documents "positive for income, negative
+//     for expense". The settlement writers (POS, dine-in, payroll, EWA,
+//     inventory) already follow it, but the manual POST /ledger route let
+//     any client store a POSITIVE expense — which inverted cash-flow math
+//     (expenses raised the running balance). createEntry now NORMALIZES
+//     the sign from the entry TYPE: INCOME is stored positive, every other
+//     type (EXPENSE, PAYROLL, TAX, REFUND, PENALTY, AD_SPEND) is stored
+//     negative. The type, not the client's sign, is authoritative.
+//   • APPEND-ONLY: ledger rows are never hard-deleted or mutated. The old
+//     deleteEntry() hard-deleted ANY row — including settlement income —
+//     silently corrupting P&L history. DELETE /ledger/:id now creates an
+//     exact NEGATING REVERSAL entry that references the original
+//     (metadata.reversalOf); the original row stays untouched and the net
+//     economic effect is zero.
+//   • ONE REVERSAL PER ENTRY: a second reversal attempt is refused (409)
+//     with zero mutation.
+//   • CROSS-TENANT: entries can only be read/reversed within the caller's
+//     own business.
 // =============================================================================
+// The full Prisma LedgerEntryType enum (keep in sync with schema.prisma).
+const LEDGER_ENTRY_TYPES = ['INCOME', 'EXPENSE', 'PAYROLL', 'TAX', 'REFUND', 'PENALTY', 'AD_SPEND', 'MAINTENANCE', 'SUPPLIES', 'UTILITIES', 'RENT', 'OTHER'];
+const INCOME_TYPES = new Set(['INCOME']);
+const MAX_ABS_AMOUNT = 1e9;
 
 class BusinessLedgerService {
     constructor(prisma) {
         this.prisma = prisma;
     }
 
+    // Canonical signed amount for a type. The magnitude comes from the
+    // caller; the SIGN comes from the type (r35 contract).
+    _canonicalAmount(type, amount) {
+        const n = typeof amount === 'number' ? amount : Number(amount);
+        if (!Number.isFinite(n)) throw this._fail(400, 'INVALID_AMOUNT', 'Ledger amount must be a finite number.');
+        const magnitude = Math.abs(n);
+        if (magnitude === 0) throw this._fail(400, 'INVALID_AMOUNT', 'Ledger amount cannot be zero.');
+        if (magnitude > MAX_ABS_AMOUNT) throw this._fail(400, 'INVALID_AMOUNT', 'Ledger amount is unreasonably large.');
+        const signed = INCOME_TYPES.has(type) ? magnitude : -magnitude;
+        return Math.round(signed * 1e6) / 1e6;
+    }
+
+    _fail(status, code, message) {
+        const err = new Error(message);
+        err.status = status;
+        err.code = code;
+        return err;
+    }
+
     // ── Create Ledger Entry ────────────────────────────────────────────────
     async createEntry({ businessProfileId, type, category, description, amount, sourceType, sourceId, metadata, entryDate }) {
+        if (!businessProfileId) throw this._fail(400, 'INVALID_INPUT', 'Business context required.');
+        if (!LEDGER_ENTRY_TYPES.includes(type)) {
+            throw this._fail(400, 'INVALID_TYPE', `Invalid ledger entry type '${type}'.`);
+        }
+        if (!category || !String(category).trim()) throw this._fail(400, 'INVALID_INPUT', 'Category required.');
+        if (!description || !String(description).trim()) throw this._fail(400, 'INVALID_INPUT', 'Description required.');
+
+        const signedAmount = this._canonicalAmount(type, amount);
+
         return this.prisma.businessLedgerEntry.create({
             data: {
                 businessProfileId,
                 type,
-                category,
-                description,
-                amount: parseFloat(amount),
-                sourceType: sourceType || null,
+                category: String(category).trim().slice(0, 100),
+                description: String(description).trim().slice(0, 500),
+                amount: signedAmount,
+                amountGhs: metadata?.amountGhs != null ? this._canonicalAmount(type, metadata.amountGhs) : undefined,
+                sourceType: sourceType || 'MANUAL',
                 sourceId: sourceId || null,
                 metadata: metadata || {},
                 createdAt: entryDate ? new Date(entryDate) : undefined,
             },
+        });
+    }
+
+    // ── Reversal (append-only correction) ──────────────────────────────────
+    // Writes the exact negation of an existing entry and references the
+    // original. The original row is never mutated or deleted. A second
+    // reversal of the same entry is refused with zero mutation.
+    async createReversalEntry({ businessProfileId, entryId, reason }) {
+        if (!businessProfileId) throw this._fail(400, 'INVALID_INPUT', 'Business context required.');
+        if (!entryId) throw this._fail(400, 'INVALID_INPUT', 'Entry ID required.');
+
+        return this.prisma.$transaction(async (tx) => {
+            const original = await tx.businessLedgerEntry.findUnique({ where: { id: entryId } });
+            if (!original || original.businessProfileId !== businessProfileId) {
+                throw this._fail(404, 'ENTRY_NOT_FOUND', 'Ledger entry not found.');
+            }
+
+            // One reversal per entry — idempotent refusal, never a second
+            // economic mutation.
+            const existingReversal = await tx.businessLedgerEntry.findFirst({
+                where: { businessProfileId, metadata: { path: ['reversalOf'], equals: entryId } },
+                select: { id: true },
+            });
+            if (existingReversal) {
+                throw this._fail(409, 'ALREADY_REVERSED', 'Ledger entry has already been reversed.');
+            }
+
+            const originalAmount = Number(original.amount);
+            if (!Number.isFinite(originalAmount) || originalAmount === 0) {
+                throw this._fail(409, 'NOT_REVERSIBLE', 'Entry cannot be reversed.');
+            }
+
+            const reversal = await tx.businessLedgerEntry.create({
+                data: {
+                    businessProfileId,
+                    type: original.type,
+                    category: original.category,
+                    description: `Reversal: ${original.description}`.slice(0, 500),
+                    amount: Math.round(-originalAmount * 1e6) / 1e6, // exact negation
+                    sourceType: original.sourceType,
+                    sourceId: original.sourceId,
+                    metadata: {
+                        reversalOf: original.id,
+                        reversal: true,
+                        reversedAmount: Number(original.amount),
+                        ...(reason ? { reversalReason: String(reason).slice(0, 500) } : {}),
+                    },
+                },
+            });
+            return { reversal, original };
         });
     }
 
@@ -54,6 +156,8 @@ class BusinessLedgerService {
 
         const entries = await this.prisma.businessLedgerEntry.findMany({ where });
 
+        // r35: netProfit is now computed from the SIGNED amounts directly —
+        // the canonical contract guarantees INCOME > 0 and other types < 0.
         const income = entries.filter(e => e.type === 'INCOME').reduce((s, e) => s + parseFloat(e.amount), 0);
         const expenses = entries.filter(e => e.type !== 'INCOME').reduce((s, e) => s + Math.abs(parseFloat(e.amount)), 0);
 
@@ -140,7 +244,7 @@ class BusinessLedgerService {
         };
     }
 
-    // ── Get Dashboard Stats ────────────────────────────────────────────────
+    // ── Get Dashboard Stats ─────────────────────────────────────────────────
     async getDashboardStats(businessProfileId) {
         const now = new Date();
         const thirtyDaysAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
@@ -162,13 +266,15 @@ class BusinessLedgerService {
         };
     }
 
-    // ── Delete Entry ───────────────────────────────────────────────────────
-    async deleteEntry(entryId, businessProfileId) {
-        const entry = await this.prisma.businessLedgerEntry.findUnique({ where: { id: entryId } });
-        if (!entry) throw new Error('Entry not found.');
-        if (entry.businessProfileId !== businessProfileId) throw new Error('Entry does not belong to this business.');
-        return this.prisma.businessLedgerEntry.delete({ where: { id: entryId } });
+    // ── Delete Entry — r35: APPEND-ONLY REVERSAL, never a hard delete ──────
+    // The public route contract (DELETE /ledger/:id -> { success }) is
+    // preserved, but the implementation now writes an exact negating
+    // reversal entry. The original row remains; the net economic effect is
+    // zero; P&L history stays honest.
+    async deleteEntry(entryId, businessProfileId, reason) {
+        const { reversal } = await this.createReversalEntry({ businessProfileId, entryId, reason });
+        return reversal;
     }
 }
 
-module.exports = { BusinessLedgerService };
+module.exports = { BusinessLedgerService, LEDGER_ENTRY_TYPES };
