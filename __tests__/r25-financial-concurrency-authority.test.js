@@ -60,8 +60,18 @@ describeOrSkip('r25 financial concurrency authority (real PostgreSQL)', () => {
         // CASCADE from User clears Friendship/Ticket/SmartEscrow/PeerTransfer/
         // SavingsGoal/SavingsDeposit/Withdrawal/TransactionHistory; reset the
         // profit-fee singleton too (same convention as escrow-flow.test.js).
+        //
+        // RestrictedObligation is NOT user-scoped (no FK to User), so CASCADE
+        // never reaches it. This suite's withdrawal proofs leave the wallet
+        // obligation of withdrawal id 1 durably ACTIVE on purpose — a
+        // leftover that alias-claims the NEXT suite's reseeded withdrawal id 1
+        // through restrictedObligations.findActiveForSource('withdrawal', '1')
+        // (observed live in CI run 35812381059: r15k's five payout proofs all
+        // saw processed=0 / zero provider calls because the own-obligation
+        // guard refused canonical adoption). Jest's suite order is not
+        // alphabetical, so ANY later suite may inherit this row.
         await prisma.$executeRawUnsafe(
-            'TRUNCATE TABLE "User", "SystemProfitFees", "AdminProfitLog" RESTART IDENTITY CASCADE'
+            'TRUNCATE TABLE "User", "SystemProfitFees", "AdminProfitLog", "RestrictedObligation" RESTART IDENTITY CASCADE'
         );
     }, 15000);
 
