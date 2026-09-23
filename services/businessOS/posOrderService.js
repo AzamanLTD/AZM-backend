@@ -9,7 +9,7 @@ const SERIALIZABLE_BACKOFF_MS = 10;
 const isSerializableConflict = (error) => error?.code === 'P2034';
 const waitForRetry = (attempt) => new Promise((resolve) => setTimeout(resolve, SERIALIZABLE_BACKOFF_MS * (2 ** attempt)));
 
-function buildIdempotencyFingerprint({ businessProfileId, actorId, normalizedItems, paymentMethod, cash, requestedAzm, source, locationId, tableId, requestedCustomerId }) {
+function buildIdempotencyFingerprint({ businessProfileId, actorId, normalizedItems, paymentMethod, cash, requestedAzm, source, locationId, tableId, requestedCustomerId, tipAmount }) {
     const canonical = {
         businessProfileId: String(businessProfileId),
         actorId: Number(actorId),
@@ -23,6 +23,7 @@ function buildIdempotencyFingerprint({ businessProfileId, actorId, normalizedIte
         locationId: locationId ?? null,
         tableId: tableId ?? null,
         customerId: requestedCustomerId ?? null,
+        tipAmount: tipAmount ?? 0,
     };
     return crypto.createHash('sha256').update(JSON.stringify(canonical)).digest('hex');
 }
@@ -34,6 +35,7 @@ class PosOrderService {
         const {
             businessProfileId, actorId, items, paymentMethod = 'CASH', cashGiven,
             azmAmount, idempotencyKey, source, locationId, tableId, customerId,
+            tipAmount,
         } = args;
         if (!businessProfileId) throw new Error('Business context required.');
         if (!actorId) throw new Error('Authentication required.');
@@ -49,13 +51,18 @@ class PosOrderService {
         const requestedAzm = Number(azmAmount || 0);
         if (!Number.isFinite(cash) || cash < 0) throw new Error('Invalid cash amount.');
         if (!Number.isFinite(requestedAzm) || requestedAzm < 0) throw new Error('Invalid AZM amount.');
+        // r32/I: tips are accepted ONLY through this validated path — a
+        // non-negative, bounded amount that joins the fingerprint so one
+        // idempotency key can never be replayed with a different tip.
+        const tip = Number(tipAmount || 0);
+        if (!Number.isFinite(tip) || tip < 0 || tip > 10000) throw new Error('Invalid tip amount.');
 
         const requestedCustomerId = customerId == null ? null : Number(customerId);
         if (requestedCustomerId != null && (!Number.isInteger(requestedCustomerId) || requestedCustomerId < 1)) throw new Error('Invalid customerId.');
         const idempotencyFingerprint = idempotencyKey
             ? buildIdempotencyFingerprint({
                 businessProfileId, actorId, normalizedItems, paymentMethod: pm,
-                cash, requestedAzm, source, locationId, tableId, requestedCustomerId,
+                cash, requestedAzm, source, locationId, tableId, requestedCustomerId, tipAmount: tip,
             })
             : null;
         const existing = await this._findIdempotentOrder(businessProfileId, idempotencyKey, idempotencyFingerprint);
@@ -73,7 +80,7 @@ class PosOrderService {
                     const computed = await this._priceItems(tx, businessProfileId, normalizedItems, locationId);
                     const taxResult = await this._computeTax(tx, businessProfileId, computed.subtotal);
                     const computedTax = taxResult.taxTotal;
-                    const computedGrand = computed.subtotal + computedTax;
+                    const computedGrand = computed.subtotal + computedTax + tip;
 
                     let azmPortion = 0;
                     let cashChange = 0;
@@ -112,7 +119,7 @@ class PosOrderService {
                         businessProfileId, type: 'INCOME', category: 'SALES', description: `POS Sale (${orderRef} - ${pm})`, amount: computedGrand,
                         sourceType: 'POS_SALE', sourceId: order.id,
                         metadata: {
-                            orderRef, paymentMethod: pm, subtotal: computed.subtotal, tax: computedTax,
+                            orderRef, paymentMethod: pm, subtotal: computed.subtotal, tax: computedTax, tipAmount: tip,
                             taxLines: taxResult.taxLines, items: normalizedItems.length, locationId, tableId, azmPortion,
                             ...(idempotencyFingerprint ? { posIdempotencyFingerprint: idempotencyFingerprint } : {}),
                         },

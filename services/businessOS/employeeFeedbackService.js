@@ -91,9 +91,19 @@ class EmployeeFeedbackService {
         throw new Error('Feedback transaction failed after retries.');
     }
 
-    async getFeedbackForEmployee(employeeId) {
+    // r32 audit item C — read tenancy. Feedback reads resolve the target
+    // employee INSIDE the effective business and scope the query to that
+    // business. A foreign employee id can never leak another tenant's
+    // feedback: the target is refused before the read.
+    async getFeedbackForEmployee(employeeId, businessProfileId) {
+        if (!businessProfileId) throw new Error('Business profile context is required.');
+        const employee = await this.prisma.businessEmployee.findFirst({
+            where: { id: employeeId, businessProfileId },
+            select: { id: true },
+        });
+        if (!employee) throw new Error('Employee not found.');
         return this.prisma.employeeFeedback.findMany({
-            where: { receiverEmployeeId: employeeId },
+            where: { receiverEmployeeId: employeeId, businessProfileId },
             include: {
                 giverEmployee: {
                     include: { user: { select: { username: true } } },
@@ -103,9 +113,15 @@ class EmployeeFeedbackService {
         });
     }
 
-    async getFeedbackByEmployee(employeeId) {
+    async getFeedbackByEmployee(employeeId, businessProfileId) {
+        if (!businessProfileId) throw new Error('Business profile context is required.');
+        const employee = await this.prisma.businessEmployee.findFirst({
+            where: { id: employeeId, businessProfileId },
+            select: { id: true },
+        });
+        if (!employee) throw new Error('Employee not found.');
         return this.prisma.employeeFeedback.findMany({
-            where: { giverEmployeeId: employeeId },
+            where: { giverEmployeeId: employeeId, businessProfileId },
             include: {
                 receiverEmployee: {
                     include: { user: { select: { username: true } } },

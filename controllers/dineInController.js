@@ -1,5 +1,5 @@
 const dineInTabService = require('../services/dineInTabService');
-const { resolvePermissions } = require('../middleware/requirePermission');
+const { resolvePermissions, resolveBusinessContext } = require('../middleware/requirePermission');
 
 const serviceOptions = (req, extra = {}) => ({
     ...extra,
@@ -8,17 +8,21 @@ const serviceOptions = (req, extra = {}) => ({
         : undefined,
 });
 
-// Business-side controllers derive the effective business from trusted admin
-// scope or the authenticated user's owned profile. Never trust a body/query
-// businessProfileId because the service accepts that identifier directly.
+// Business-side controllers derive the effective business through the ONE
+// canonical context resolver (r32 item A): owner resolves to their owned
+// profile, an active employee to their employment, and ADMIN impersonation is
+// honored only through the validated req.adminBusinessScope. Never trust a
+// body/query businessProfileId — the service accepts that identifier directly.
+// NOTE: the legacy `req.adminScopedBusiness` property was pre-r32 dead code
+// (the scope middleware never set it), so admin impersonation silently fell
+// through to the owner lookup and 403'd.
 const getEffectiveBusinessProfileId = async (req, prisma) => {
-    if (req.adminScopedBusiness?.id) return req.adminScopedBusiness.id;
-    if (req.user?.role === 'ADMIN' && req.businessProfileId) return req.businessProfileId;
-    const profile = await prisma.businessProfile.findFirst({
-        where: { userId: req.user.id },
-        select: { id: true },
+    if (!req.user?.id) return null;
+    const context = await resolveBusinessContext(prisma, req.user, {
+        adminScoped: Boolean(req.adminBusinessScope),
+        adminScopedBusinessId: req.adminBusinessScope?.businessProfileId ?? null,
     });
-    return profile?.id || null;
+    return context ? context.businessProfileId : null;
 };
 
 exports.openTab = async (req, res) => {
@@ -39,7 +43,13 @@ exports.openTab = async (req, res) => {
 exports.addItem = async (req, res) => {
     try {
         const prisma = req.prisma || req.app.get('prisma');
+        // r32 item F: the tab must belong to the caller's effective business —
+        // the route permission alone proves the CALLER is staff, not that the
+        // TAB is theirs.
+        const businessProfileId = await getEffectiveBusinessProfileId(req, prisma);
+        if (!businessProfileId) return res.status(403).json({ success: false, message: 'No business profile.' });
         const result = await dineInTabService.addItem(prisma, serviceOptions(req, {
+            businessProfileId,
             tabId: req.params.tabId,
             userId: req.user.id,
             productId: req.body.productId,
@@ -67,8 +77,15 @@ exports.addCustomerItem = async (req, res) => {
 
 exports.finalizeTab = async (req, res) => {
     try {
+        // r32: an empty-body finalize (no JSON content-type) must not crash.
+        req.body = req.body || {};
         const prisma = req.prisma || req.app.get('prisma');
+        // r32 item F: finalization is a state-changing settlement boundary —
+        // the tab must belong to the caller's effective business.
+        const businessProfileId = await getEffectiveBusinessProfileId(req, prisma);
+        if (!businessProfileId) return res.status(403).json({ success: false, message: 'No business profile.' });
         const result = await dineInTabService.finalizeTab(prisma, serviceOptions(req, {
+            businessProfileId,
             tabId: req.params.tabId,
             userId: req.user.id,
             taxRatePct: req.body.taxRatePct,
@@ -144,7 +161,12 @@ exports.getOpenTabs = async (req, res) => {
 exports.reportDefault = async (req, res) => {
     try {
         const prisma = req.prisma || req.app.get('prisma');
+        // r32 item F: default reporting cancels the tab — the tab must belong
+        // to the caller's effective business.
+        const businessProfileId = await getEffectiveBusinessProfileId(req, prisma);
+        if (!businessProfileId) return res.status(403).json({ success: false, message: 'No business profile.' });
         const result = await dineInTabService.reportDefault(prisma, serviceOptions(req, {
+            businessProfileId,
             tabId: req.params.tabId,
             userId: req.user.id,
             reason: req.body.reason,

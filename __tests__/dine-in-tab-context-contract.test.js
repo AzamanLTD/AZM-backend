@@ -46,6 +46,9 @@ describe('dine-in customer tab context contract', () => {
             isActive: true,
           }),
         },
+        // r32: getEffectiveBusinessProfileId now resolves through the
+        // canonical resolver — the employment leg is also read, so mock it.
+        businessEmployee: { findFirst: jest.fn().mockResolvedValue(null) },
         businessProfile: {
           findFirst: jest.fn().mockResolvedValue(null),
           findUnique: jest.fn().mockResolvedValue({

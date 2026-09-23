@@ -155,7 +155,7 @@ function requirePermission(key) {
             // which is the documented, validated impersonation path.
             const context = await resolveBusinessContext(prisma, req.user, {
                 adminScoped: Boolean(req.adminBusinessScope),
-                adminScopedBusinessId: req.adminBusinessScope ? req.businessProfileId : null,
+                adminScopedBusinessId: req.adminBusinessScope?.businessProfileId ?? null,
             });
             if (!context) {
                 return res.status(403).json({ success: false, message: 'No business context found for this account.' });

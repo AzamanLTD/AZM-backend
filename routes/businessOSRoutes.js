@@ -52,7 +52,7 @@ async function getBusinessProfileId(req) {
     const prisma = getPrisma(req);
     const context = await resolveBusinessContext(prisma, req.user, {
         adminScoped: Boolean(req.adminBusinessScope),
-        adminScopedBusinessId: req.adminBusinessScope ? req.businessProfileId : null,
+        adminScopedBusinessId: req.adminBusinessScope?.businessProfileId ?? null,
     });
     return context ? context.businessProfileId : null;
 }
@@ -255,7 +255,7 @@ router.get('/employees/my-feedback', wrap(async (req, res) => {
     });
     if (!employee) return res.json({ success: true, feedback: [] });
     const svc = getServices(req);
-    const feedback = await svc.feedbackService.getFeedbackForEmployee(employee.id);
+    const feedback = await svc.feedbackService.getFeedbackForEmployee(employee.id, employee.businessProfileId);
     res.json({ success: true, feedback });
 }));
 
@@ -966,31 +966,36 @@ router.post('/restaurant/kds', requirePermission('restaurant.kitchen.manage'), w
 
 router.patch('/restaurant/kds/:id/status', requirePermission('restaurant.kitchen.manage'), wrap(async (req, res) => {
     const svc = getServices(req);
-    const order = await svc.restaurantOpsService.updateOrderStatus(req.params.id, req.body.status);
+    const bpId = await getBusinessProfileId(req);
+    const order = await svc.restaurantOpsService.updateOrderStatus(req.params.id, req.body.status, bpId);
     res.json({ success: true, order });
 }));
 
-// Bump (advance to next status): NEW → PREPARING → READY → SERVED
+// Bump (advance to next status): NEW → PREPARING → READY → SERVED.
+// r32: the pre-read is tenant-scoped — a foreign order id is answered
+// "not found" without ever leaking its state.
 router.post('/restaurant/kds/:id/bump', requirePermission('restaurant.kitchen.manage'), wrap(async (req, res) => {
     const svc = getServices(req);
-    const FLOW = ['NEW', 'PREPARING', 'READY', 'SERVED'];
-    const order = await svc.prisma.kitchenOrder.findUnique({ where: { id: req.params.id } });
-    if (!order) throw new Error('Kitchen order not found.');
-    const currentIdx = FLOW.indexOf(order.status);
-    const nextStatus = currentIdx >= 0 && currentIdx < FLOW.length - 1 ? FLOW[currentIdx + 1] : 'SERVED';
-    const updated = await svc.restaurantOpsService.updateOrderStatus(req.params.id, nextStatus);
+    const bpId = await getBusinessProfileId(req);
+    const updated = await svc.restaurantOpsService.bumpOrderStatus(req.params.id, bpId);
     res.json({ success: true, order: updated });
 }));
 
+// r32: canonical item identifier is `itemId` (a KitchenOrderItem row id) —
+// the contract the live Business Portal already speaks.
 router.patch('/restaurant/kds/:id/item-status', requirePermission('restaurant.kitchen.manage'), wrap(async (req, res) => {
     const svc = getServices(req);
-    const order = await svc.restaurantOpsService.updateItemStatus(req.params.id, req.body.itemIndex, req.body.status);
+    const bpId = await getBusinessProfileId(req);
+    const order = await svc.restaurantOpsService.updateItemStatus(req.params.id, req.body.itemId, req.body.status, bpId);
     res.json({ success: true, order });
 }));
 
+// r32: canonical chef identifier is `employeeId` (a BusinessEmployee id) —
+// matching the KitchenOrder.employeeId column and the service contract.
 router.post('/restaurant/kds/:id/assign-chef', requirePermission('restaurant.kitchen.manage'), wrap(async (req, res) => {
     const svc = getServices(req);
-    const order = await svc.restaurantOpsService.assignChef(req.params.id, req.body.employeeId);
+    const bpId = await getBusinessProfileId(req);
+    const order = await svc.restaurantOpsService.assignChef(req.params.id, req.body.employeeId, bpId);
     res.json({ success: true, order });
 }));
 
@@ -1102,29 +1107,56 @@ router.get('/restaurant/waitlist', requirePermission('restaurant.tables.manage')
     res.json({ success: true, data: entries });
 }));
 
+// r32 audit item E — WAITLIST MUTATION SURFACE. Every mutation resolves the
+// entry (and any referenced location/table) against the server-derived
+// effective business id; the primary id alone is never sufficient. Foreign
+// references are refused, statuses are validated, and removal revokes every
+// further use of the entry id in this business.
+
 // POST /api/business-os/restaurant/waitlist — add to waitlist
 router.post('/restaurant/waitlist', requirePermission('restaurant.tables.manage'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
     const { partyName, phone, partySize, quotedWaitMinutes, locationId } = req.body;
     if (!partyName) return res.status(400).json({ success: false, message: 'Party name is required' });
+    // The entry may only reference a location of the SAME business.
+    if (locationId) {
+        const location = await prisma.businessLocation.findFirst({
+            where: { id: locationId, businessProfileId: bpId },
+            select: { id: true },
+        });
+        if (!location) return res.status(404).json({ success: false, message: 'Location not found' });
+    }
     const entry = await prisma.restaurantWaitlistEntry.create({
         data: { businessProfileId: bpId, partyName, phone, partySize: partySize || 2, quotedWaitMinutes, locationId },
     });
     res.status(201).json({ success: true, data: entry });
 }));
 
-// PATCH /api/business-os/restaurant/waitlist/:id — update waitlist entry
+// PATCH /api/business-os/restaurant/waitlist/:id — update / notify / seat a waitlist entry
 router.patch('/restaurant/waitlist/:id', requirePermission('restaurant.tables.manage'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
     const { status, tableId } = req.body;
+    const WAITLIST_STATUSES = ['WAITING', 'NOTIFIED', 'SEATED', 'LEFT', 'CANCELLED'];
+    if (status && !WAITLIST_STATUSES.includes(status)) {
+        return res.status(400).json({ success: false, message: 'Invalid waitlist status' });
+    }
+    // Seating may only reference a table of the SAME business.
+    if (tableId) {
+        const table = await prisma.businessTable.findFirst({
+            where: { id: tableId, location: { businessProfileId: bpId } },
+            select: { id: true },
+        });
+        if (!table) return res.status(404).json({ success: false, message: 'Table not found' });
+    }
     const updateData = {};
     if (status) updateData.status = status;
     if (tableId) updateData.tableId = tableId;
     if (status === 'SEATED') updateData.seatedAt = new Date();
     if (status === 'NOTIFIED') updateData.notifiedAt = new Date();
 
+    // Tenant-scoped mutation: the entry resolves by { id, businessProfileId }.
     const entry = await prisma.restaurantWaitlistEntry.updateMany({
         where: { id: req.params.id, businessProfileId: bpId },
         data: updateData,
@@ -1137,6 +1169,9 @@ router.patch('/restaurant/waitlist/:id', requirePermission('restaurant.tables.ma
 router.delete('/restaurant/waitlist/:id', requirePermission('restaurant.tables.manage'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
+    // Tenant-scoped removal. A foreign/unknown id removes nothing and reports
+    // the same outcome as a success (existence is not leaked); after removal,
+    // every further mutation on this entry id in this business is refused.
     await prisma.restaurantWaitlistEntry.deleteMany({
         where: { id: req.params.id, businessProfileId: bpId },
     });
@@ -1291,13 +1326,15 @@ router.post('/feedback', requirePermission('feedback.give'), wrap(async (req, re
 
 router.get('/feedback/for/:employeeId', requirePermission('feedback.view'), wrap(async (req, res) => {
     const svc = getServices(req);
-    const feedback = await svc.feedbackService.getFeedbackForEmployee(req.params.employeeId);
+    const bpId = await getBusinessProfileId(req);
+    const feedback = await svc.feedbackService.getFeedbackForEmployee(req.params.employeeId, bpId);
     res.json({ success: true, feedback });
 }));
 
 router.get('/feedback/by/:employeeId', requirePermission('feedback.view'), wrap(async (req, res) => {
     const svc = getServices(req);
-    const feedback = await svc.feedbackService.getFeedbackByEmployee(req.params.employeeId);
+    const bpId = await getBusinessProfileId(req);
+    const feedback = await svc.feedbackService.getFeedbackByEmployee(req.params.employeeId, bpId);
     res.json({ success: true, feedback });
 }));
 
@@ -2855,232 +2892,51 @@ router.post('/kiosk/clock-out', wrap(async (req, res) => {
 }));
 
 // ── Phase 2: Cash Payment + Idempotency (Section 2.4) ────────────────────────
-// POST /api/business-os/pos/cash-sale — ring up a cash order (bypasses escrow)
-// POST /api/business-os/pos/order — unified POS order (CASH, AZM balance, SPLIT)
-// Replaces the old pos/cash-sale with support for all payment methods.
-// Server-side total re-derivation — never trusts client totals.
-router.post('/pos/order', requirePermission('orders.manage'), wrap(async (req, res) => {
-    const prisma = getPrisma(req);
-    const bpId = await getBusinessProfileId(req);
-    const {
-        items, paymentMethod = 'CASH', totalAmount,
-        cashGiven, azmAmount, idempotencyKey, source,
-        locationId, tableId, customerId,
-    } = req.body;
-
-    if (!items || !Array.isArray(items) || items.length === 0) {
-        return res.status(400).json({ success: false, message: 'Items are required.' });
-    }
-
-    // Idempotency check
-    if (idempotencyKey) {
-        const existing = await prisma.businessOrder.findFirst({ where: { idempotencyKey } });
-        if (existing) return res.json({ success: true, order: existing, message: 'Duplicate (idempotent)' });
-    }
-
-    // Re-derive totals from product prices (never trust client)
-    let computedSubtotal = 0;
-    for (const item of items) {
-        const product = await prisma.businessProduct.findFirst({
-            where: { id: item.productId, businessProfileId: bpId },
-            select: { priceUsdc: true, name: true, isActive: true, isAvailable: true },
-        });
-        if (!product) return res.status(400).json({ success: false, message: 'Invalid product: ' + item.productId });
-        if (product.isActive === false || product.isAvailable === false) {
-            return res.status(400).json({ success: false, message: 'Product unavailable: ' + product.name });
-        }
-        computedSubtotal += parseFloat(product.priceUsdc) * (item.qty || item.quantity || 1);
-    }
-
-    const computedTax = computedSubtotal * 0.025; // 2.5% tax
-    const computedGrand = computedSubtotal + computedTax;
-
-    // Validate payment
-    const pm = (paymentMethod || 'CASH').toUpperCase();
-    let cashReceived = null;
-    let cashChange = null;
-    let azmPortion = 0;
-
-    if (pm === 'CASH') {
-        cashReceived = parseFloat(cashGiven || 0);
-        if (cashReceived < computedGrand) {
-            return res.status(400).json({ success: false, message: 'Insufficient cash received.' });
-        }
-        cashChange = cashReceived - computedGrand;
-    } else if (pm === 'AZM') {
-        // Deduct from customer AZM balance
-        azmPortion = computedGrand;
-    } else if (pm === 'SPLIT') {
-        azmPortion = parseFloat(azmAmount || 0);
-        cashReceived = parseFloat(cashGiven || 0);
-        if (cashReceived + azmPortion < computedGrand) {
-            return res.status(400).json({ success: false, message: 'Insufficient payment (cash + AZM).' });
-        }
-        cashChange = Math.max(0, cashReceived - (computedGrand - azmPortion));
-    } else {
-        return res.status(400).json({ success: false, message: 'Invalid payment method: ' + pm });
-    }
-
-    // Generate order reference first (needed for AZM spend log)
-    const orderRef = 'POS-' + Date.now().toString(36).toUpperCase() + Math.random().toString(36).substring(2, 6).toUpperCase();
-
-    // For AZM/SPLIT: verify and deduct from customer azmBalance
-    if (azmPortion > 0) {
-        const user = await prisma.user.findUnique({
-            where: { id: req.user.id },
-            select: { azmBalance: true },
-        });
-        if (!user || parseFloat(user.azmBalance) < azmPortion) {
-            return res.status(400).json({ success: false, message: 'Insufficient AZM balance.' });
-        }
-        const newBalance = parseFloat(user.azmBalance) - azmPortion;
-        await prisma.user.update({
-            where: { id: req.user.id },
-            data: { azmBalance: newBalance },
-        });
-
-        // Record AZM spend log
-        await prisma.azmSpendLog.create({
-            data: {
-                userId: req.user.id,
-                amount: azmPortion,
-                reason: 'POS order (' + (source || 'POS') + ')',
-                source: 'POS_SALE',
-                balanceAfter: newBalance,
-                metadata: { orderRef },
-            },
-        });
-    }
-
-    const order = await prisma.businessOrder.create({
-        data: {
-            businessProfileId: bpId,
-            customerId: customerId || req.user.id,
-            status: 'COMPLETED',
-            orderRef,
-            title: 'POS Sale (' + pm + ')',
-            amountUsdc: computedGrand,
-            paymentMethod: pm,
-            idempotencyKey,
-            cashReceived: cashReceived || null,
-            cashChange: cashChange || null,
-            completedAt: new Date(),
-        },
-    });
-
-    // Write ledger entry
-    try {
-        await prisma.businessLedgerEntry.create({
-            data: {
-                businessProfileId: bpId,
-                type: 'INCOME',
-                category: 'SALES',
-                description: 'POS Sale (' + orderRef + ' - ' + pm + ')',
-                amount: computedGrand,
-                amountGhs: computedGrand,
-                sourceType: 'POS_SALE',
-                sourceId: order.id,
-                metadata: { orderRef, paymentMethod: pm, items: items.length, locationId, tableId },
-            },
-        });
-    } catch (e) {
-        logger.warn('[pos/order] Ledger entry failed:', e.message);
-    }
-
-    res.status(201).json({
-        success: true,
-        order,
-        computedSubtotal,
-        computedTax,
-        computedGrand,
-        change: cashChange || 0,
-    });
-}));
-
+// POST /api/business-os/pos/order is served by routes/businessOSPosRoutes.js
+// (mounted FIRST, so it shadows this file). The duplicated inline
+// implementation below was dead code drifting from the canonical
+// PosOrderService — r32/I removed it: it accepted ANY business's
+// idempotency key (unscoped findFirst), debited AZM balance with a
+// non-atomic read-modify-write, and wrote the order and its ledger entry
+// outside a transaction.
 router.post('/pos/cash-sale', requirePermission('orders.manage'), wrap(async (req, res) => {
+    // r32/I — LEGACY CASH-SALE DELEGATION: this route previously re-implemented
+    // POS settlement inline with three defects the unified PosOrderService does
+    // not have: (1) the idempotency lookup was not scoped to the business, so
+    // ANY business's idempotency key returned that business's order; (2) the
+    // tax was taken from the client-supplied taxTotal ratio; (3) order + ledger
+    // were written outside a transaction, with the ledger failure swallowed.
+    // It now delegates to the canonical service (CASH path), keeping the
+    // legacy request/response envelope for existing clients.
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
-    const { items, locationId, tableId, customerId, subtotal, taxTotal, tipAmount, idempotencyKey, cashReceived } = req.body;
+    const { items, idempotencyKey, cashReceived, tipAmount, source, locationId, tableId, customerId } = req.body;
 
-    // Idempotency check — if a record with this key exists, return the cached result
-    if (idempotencyKey) {
-        const existing = await prisma.businessOrder.findFirst({
-            where: { idempotencyKey },
-        });
-        if (existing) {
-            return res.json({ success: true, order: existing, message: 'Duplicate (idempotent)' });
-        }
-    }
-
-    // Validate: frontend must NOT compute totals — re-derive from items
-    let computedSubtotal = 0;
-    for (const item of items || []) {
-        const product = await prisma.businessProduct.findFirst({
-            where: { id: item.productId, businessProfileId: bpId },
-            select: { priceUsdc: true, name: true },
-        });
-        if (!product) return res.status(400).json({ success: false, message: 'Invalid product: ' + item.productId });
-
-        const lineTotal = parseFloat(product.priceUsdc) * item.quantity;
-        computedSubtotal += lineTotal;
-    }
-
-    const computedTax = computedSubtotal * (parseFloat(taxTotal || 0) > 0 ? parseFloat(taxTotal) / computedSubtotal : 0);
-    const computedGrand = computedSubtotal + computedTax + parseFloat(tipAmount || 0);
-
-    // Generate order reference
-    const orderRef = 'CSH-' + Date.now().toString(36).toUpperCase() + Math.random().toString(36).substring(2, 6).toUpperCase();
-
-    // Create the order with CASH payment method
-    const order = await prisma.businessOrder.create({
-        data: {
-            businessProfileId: bpId,
-            customerId: customerId || req.user.id,
-            status: 'COMPLETED',
-            orderRef,
-            title: 'POS Cash Sale',
-            amountUsdc: computedGrand,
-            paymentMethod: 'CASH',
-            idempotencyKey,
-            cashReceived: cashReceived ? parseFloat(cashReceived) : null,
-            cashChange: cashReceived ? parseFloat(cashReceived) - computedGrand : null,
-            completedAt: new Date(),
-        },
+    const { PosOrderService } = require('../services/businessOS/posOrderService');
+    const result = await new PosOrderService(prisma).createOrder({
+        businessProfileId: bpId,
+        actorId: req.user.id,
+        items,
+        paymentMethod: 'CASH',
+        cashGiven: cashReceived,
+        idempotencyKey,
+        tipAmount,
+        source: source || 'POS_CASH_SALE',
+        locationId,
+        tableId,
+        customerId,
     });
 
-    // Write a BusinessLedgerEntry for the cash sale (so it shows in Finance/P&L)
-    try {
-        await prisma.businessLedgerEntry.create({
-            data: {
-                businessProfileId: bpId,
-                type: 'INCOME',
-                category: 'SALES',
-                description: 'POS Cash Sale (' + orderRef + ')',
-                amount: computedGrand,
-                amountGhs: computedGrand, // adjust if FX rate needed
-                sourceType: 'POS_CASH_SALE',
-                sourceId: order.id,
-                metadata: { orderRef, items: items?.length || 0, locationId, tableId },
-            },
-        });
-    } catch (e) {
-        logger.warn('[pos/cash-sale] Failed to write ledger entry:', e.message);
-    }
-
-    // Fire webhook event
-    webhookDispatcher.dispatch(bpId, 'order.created', {
-        orderId: order.id, orderRef, amount: computedGrand,
-        paymentMethod: 'CASH', items: items?.length || 0,
-    }).catch(() => {});
-
-    res.status(201).json({
+    const payload = {
         success: true,
-        order,
-        computedSubtotal,
-        computedTax,
-        computedGrand,
-        change: cashReceived ? parseFloat(cashReceived) - computedGrand : 0,
-    });
+        order: result.order,
+        computedSubtotal: result.computedSubtotal,
+        computedTax: result.computedTax,
+        computedGrand: result.computedGrand,
+        change: result.change ?? Number(result.order.cashChange || 0),
+    };
+    if (result.duplicate) payload.message = 'Duplicate (idempotent)';
+    res.status(result.duplicate ? 200 : 201).json(payload);
 }));
 
 // POST /api/business-os/pos/cash-close-tab — close a dine-in tab with cash
@@ -4297,6 +4153,27 @@ router.post('/retail/purchase-orders', requirePermission('retail.manage'), wrap(
     if (!items || !Array.isArray(items) || items.length === 0)
         return res.status(400).json({ success: false, message: 'At least one item is required.' });
 
+    // r32/G: the supplier must belong to the effective business — otherwise a
+    // foreign supplier id could be attached to this business's PO.
+    const supplier = await prisma.supplier.findFirst({
+        where: { id: supplierId, businessProfileId: bpId },
+        select: { id: true },
+    });
+    if (!supplier) return res.status(400).json({ success: false, message: 'Supplier not found.' });
+
+    // r32/G: every referenced product (if any) must belong to the effective
+    // business — the receive step increments that product's stock.
+    const productIds = [...new Set(items.map(i => i.productId).filter(Boolean))];
+    if (productIds.length) {
+        const owned = await prisma.businessProduct.findMany({
+            where: { id: { in: productIds }, businessProfileId: bpId },
+            select: { id: true },
+        });
+        if (owned.length !== productIds.length) {
+            return res.status(400).json({ success: false, message: 'One or more products do not belong to this business.' });
+        }
+    }
+
     // Generate PO number
     const count = await prisma.purchaseOrder.count({ where: { businessProfileId: bpId } });
     const poNumber = `PO-${String(count + 1).padStart(5, '0')}`;
@@ -4330,40 +4207,80 @@ router.post('/retail/purchase-orders', requirePermission('retail.manage'), wrap(
 }));
 
 // PATCH /api/business-os/retail/purchase-orders/:id (status update)
+// r32/G — RECEIVE-ONCE AUTHORITY:
+//   • status must be a known value and follow the transition table
+//     (DRAFT/SUBMITTED → SUBMITTED/RECEIVED/CANCELLED; RECEIVED/CANCELLED
+//     are TERMINAL — a PO can never leave them);
+//   • the stock increment runs EXACTLY ONCE: it lives in the same
+//     transaction as the status flip, and the flip is a CAS on the
+//     pre-RECEIVED status, so concurrent or repeated PATCHes cannot
+//     double-apply stock;
+//   • the PO is resolved by { id, businessProfileId } — a foreign id is a
+//     plain 404, never a Prisma error.
 router.patch('/retail/purchase-orders/:id', requirePermission('retail.manage'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
     const { id } = req.params;
     const { status, notes, expectedDate } = req.body;
 
+    const PO_STATUS_TRANSITIONS = {
+        DRAFT: ['SUBMITTED', 'RECEIVED', 'CANCELLED'],
+        SUBMITTED: ['RECEIVED', 'CANCELLED'],
+        RECEIVED: [],
+        CANCELLED: [],
+    };
+    if (status !== undefined && !Object.prototype.hasOwnProperty.call(PO_STATUS_TRANSITIONS, status)) {
+        return res.status(400).json({ success: false, message: `Unknown purchase order status: ${status}` });
+    }
+
+    const existing = await prisma.purchaseOrder.findFirst({
+        where: { id, businessProfileId: bpId },
+        select: { id: true, status: true },
+    });
+    if (!existing) return res.status(404).json({ success: false, message: 'Purchase order not found.' });
+
+    if (status !== undefined && status !== existing.status) {
+        const allowed = PO_STATUS_TRANSITIONS[existing.status] || [];
+        if (!allowed.includes(status)) {
+            return res.status(400).json({
+                success: false,
+                message: `Cannot move purchase order from ${existing.status} to ${status}.`,
+            });
+        }
+    }
+
     const updateData = {};
-    if (status) updateData.status = status;
+    if (status !== undefined) updateData.status = status;
     if (notes !== undefined) updateData.notes = notes;
     if (expectedDate !== undefined) updateData.expectedDate = expectedDate ? new Date(expectedDate) : null;
     if (status === 'RECEIVED') updateData.receivedDate = new Date();
 
-    const po = await prisma.purchaseOrder.update({
-        where: { id, businessProfileId: bpId },
-        data: updateData,
-        include: { supplier: true, items: true },
-    });
-
-    // On RECEIVED, update product stock quantities
-    if (status === 'RECEIVED' && po.items) {
-        for (const item of po.items) {
-            if (item.productId) {
-                const product = await prisma.businessProduct.findUnique({ where: { id: item.productId } });
-                if (product) {
-                    const currentQty = product.stockQty || 0;
-                    const receivedQty = item.quantity;
-                    await prisma.businessProduct.update({
-                        where: { id: item.productId },
-                        data: { stockQty: currentQty + receivedQty },
+    const po = await prisma.$transaction(async (tx) => {
+        if (status === 'RECEIVED') {
+            // CAS: only the first receiver flips a non-RECEIVED PO to RECEIVED.
+            const claimed = await tx.purchaseOrder.updateMany({
+                where: { id, businessProfileId: bpId, status: { not: 'RECEIVED' } },
+                data: updateData,
+            });
+            if (claimed.count !== 1) {
+                throw new Error('Purchase order already received.');
+            }
+            const items = await tx.purchaseOrderItem.findMany({ where: { purchaseOrderId: id } });
+            for (const item of items) {
+                if (item.productId) {
+                    // Increment atomically, scoped to the effective business.
+                    await tx.businessProduct.updateMany({
+                        where: { id: item.productId, businessProfileId: bpId },
+                        data: { stockQty: { increment: item.quantity } },
                     });
                 }
             }
+        } else {
+            await tx.purchaseOrder.update({ where: { id }, data: updateData });
         }
-    }
+
+        return tx.purchaseOrder.findUnique({ where: { id }, include: { supplier: true, items: true } });
+    });
 
     res.json({ success: true, purchaseOrder: po });
 }));
@@ -4435,6 +4352,12 @@ router.patch('/retail/stock-counts/:id/items/:itemId', requirePermission('retail
     });
     if (!item) return res.status(404).json({ success: false, message: 'Stock count item not found.' });
 
+    // r32/H: a reconciled count is a settled financial record — counting into
+    // it afterwards silently diverges from the stock that was applied.
+    if (item.stockCount.status === 'RECONCILED') {
+        return res.status(400).json({ success: false, message: 'This stock count has already been reconciled.' });
+    }
+
     const discrepancy = countedQty !== null && countedQty !== undefined
         ? parseInt(countedQty, 10) - item.systemQty
         : null;
@@ -4459,21 +4382,30 @@ router.post('/retail/stock-counts/:id/reconcile', requirePermission('retail.mana
     if (!stockCount) return res.status(404).json({ success: false, message: 'Stock count not found.' });
     if (stockCount.status === 'RECONCILED') return res.status(400).json({ success: false, message: 'Already reconciled.' });
 
-    // Apply counted quantities to products
-    for (const item of stockCount.items) {
-        if (item.countedQty !== null && item.countedQty !== undefined) {
-            await prisma.businessProduct.update({
-                where: { id: item.productId },
-                data: { stockQty: item.countedQty },
-            });
+    // r32/H — RECONCILE-ONCE: the status flip is a CAS on a non-RECONCILED
+    // count and the product writes live in the SAME transaction, so two
+    // concurrent reconciles converge on one application, and items cannot be
+    // re-counted between the product writes and the flip.
+    await prisma.$transaction(async (tx) => {
+        // Fresh items read INSIDE the transaction.
+        const items = await tx.stockCountItem.findMany({ where: { stockCountId: id } });
+        for (const item of items) {
+            if (item.countedQty !== null && item.countedQty !== undefined) {
+                // Scoped to the effective business (defense in depth).
+                await tx.businessProduct.updateMany({
+                    where: { id: item.productId, businessProfileId: bpId },
+                    data: { stockQty: item.countedQty },
+                });
+            }
         }
-    }
-
-    const updated = await prisma.stockCount.update({
-        where: { id },
-        data: { status: 'RECONCILED', reconciledAt: new Date() },
-        include: { items: true },
+        const claimed = await tx.stockCount.updateMany({
+            where: { id, businessProfileId: bpId, status: { not: 'RECONCILED' } },
+            data: { status: 'RECONCILED', reconciledAt: new Date() },
+        });
+        if (claimed.count !== 1) throw new Error('Already reconciled.');
     });
+
+    const updated = await prisma.stockCount.findUnique({ where: { id }, include: { items: true } });
     res.json({ success: true, stockCount: updated });
 }));
 

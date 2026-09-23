@@ -64,6 +64,7 @@ exports.openTab = async (prisma, opts) => {
 
 exports.addItem = async (prisma, opts) => addItemAtomically(prisma, {
     tabId: opts.tabId,
+    businessProfileId: opts.businessProfileId,
     productId: opts.productId,
     name: opts.name,
     price: opts.price ?? opts.unitPriceUsdc,
@@ -83,7 +84,7 @@ exports.addCustomerItem = async (prisma, opts) => addCustomerItemAtomically(pris
 });
 
 exports.finalizeTab = async (prisma, opts) => {
-    const result = await service(prisma, opts).finalizeTab(opts.tabId);
+    const result = await service(prisma, opts).finalizeTab(opts.tabId, opts.businessProfileId);
     await notify(prisma, opts, result, 'DINE_IN_TAB_FINALIZED', { tabId: opts.tabId, totalAmount: result?.grandTotalUsdc ?? result?.subtotalUsdc });
     return result;
 };
@@ -141,7 +142,7 @@ exports.confirmAndPay = async (prisma, { tabId, customerId, tipUsdc, io }) => {
     }
 };
 
-exports.cancelTab = async (prisma, opts) => service(prisma, opts).cancelTab(opts.tabId);
+exports.cancelTab = async (prisma, opts) => service(prisma, opts).cancelTab(opts.tabId, opts.businessProfileId);
 exports.reportDefault = exports.cancelTab;
 
 // Kept as an internal adapter export for callers that historically invoked item

@@ -562,8 +562,23 @@ HotelOpsService.prototype.bulkCreateRooms = async function(businessProfileId, { 
     return this.prisma.hotelRoom.createMany({ data: rooms, skipDuplicates: true });
 };
 
-HotelOpsService.prototype.updateRoom = async function(roomId, data) {
-    const allowed = ['roomNumber', 'roomType', 'floor', 'capacity', 'bedConfig', 'basePriceUsdc', 'weekendPriceUsdc', 'amenities', 'notes', 'status'];
+HotelOpsService.prototype.updateRoom = async function(roomId, data, businessProfileId) {
+    // r32 audit item B — tenant-scoped room metadata authority.
+    // The room is resolved by { id, businessProfileId } at the mutation
+    // boundary; a foreign room is refused BEFORE any write. Lifecycle state
+    // (status) is deliberately NOT patchable here: room state transitions
+    // belong exclusively to the dedicated updateRoomStatus authority.
+    if (!businessProfileId) throw new Error('Business profile context is required.');
+    if (data.status !== undefined) {
+        throw new Error('Room status cannot be set through generic room updates; use the room status authority.');
+    }
+    const room = await this.prisma.hotelRoom.findFirst({
+        where: { id: roomId, businessProfileId },
+        select: { id: true },
+    });
+    if (!room) throw new Error('Room not found.');
+
+    const allowed = ['roomNumber', 'roomType', 'floor', 'capacity', 'bedConfig', 'basePriceUsdc', 'weekendPriceUsdc', 'amenities', 'notes'];
     const update = {};
     allowed.forEach(k => { if (data[k] !== undefined) update[k] = data[k]; });
     if (data.basePrice) update.basePriceUsdc = parseFloat(data.basePrice);

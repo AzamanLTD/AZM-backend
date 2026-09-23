@@ -26,16 +26,58 @@ describe('RestaurantOpsService business scoping', () => {
                 findFirst: jest.fn().mockResolvedValue(null),
                 update: jest.fn(),
             },
+            kitchenOrderItem: {
+                findFirst: jest.fn(),
+                update: jest.fn(),
+            },
+            $transaction: jest.fn(),
         };
         const svc = new RestaurantOpsService(prisma);
 
-        await expect(svc.updateItemStatus('order-b', 0, 'READY', bpA))
+        // r32 canonical contract: mutation key is the KitchenOrderItem row id.
+        await expect(svc.updateItemStatus('order-b', 'item-b', 'READY', bpA))
             .rejects.toThrow('Order not found.');
         expect(prisma.kitchenOrder.findFirst).toHaveBeenCalledWith({
             where: { id: 'order-b', businessProfileId: bpA },
-            include: { orderItems: true },
+            select: { id: true, status: true },
         });
+        expect(prisma.kitchenOrderItem.findFirst).not.toHaveBeenCalled();
         expect(prisma.kitchenOrder.update).not.toHaveBeenCalled();
+    });
+
+    test('rejects KDS item status updates when the item is not addressed through its parent order', async () => {
+        const prisma = {
+            kitchenOrder: {
+                findFirst: jest.fn().mockResolvedValue({ id: 'order-a', status: 'NEW' }),
+                update: jest.fn(),
+            },
+            kitchenOrderItem: {
+                findFirst: jest.fn().mockResolvedValue(null),
+                update: jest.fn(),
+            },
+            $transaction: jest.fn(),
+        };
+        const svc = new RestaurantOpsService(prisma);
+
+        await expect(svc.updateItemStatus('order-a', 'item-foreign', 'READY', bpA))
+            .rejects.toThrow('Kitchen item not found.');
+        // The item is resolved THROUGH the tenant-scoped parent order.
+        expect(prisma.kitchenOrderItem.findFirst).toHaveBeenCalledWith({
+            where: { id: 'item-foreign', kitchenOrderId: 'order-a' },
+            select: { id: true, status: true },
+        });
+        expect(prisma.$transaction).not.toHaveBeenCalled();
+    });
+
+    test('rejects positional-index and missing item identifiers', async () => {
+        const prisma = { kitchenOrder: { findFirst: jest.fn() } };
+        const svc = new RestaurantOpsService(prisma);
+
+        await expect(svc.updateItemStatus('order-a', 0, 'READY', bpA))
+            .rejects.toThrow('A kitchen item id is required.');
+        await expect(svc.updateItemStatus('order-a', null, 'READY', bpA))
+            .rejects.toThrow('A kitchen item id is required.');
+        expect(prisma.kitchenOrder.findFirst).not.toHaveBeenCalled();
     });
 
     test('rejects chef assignment when the employee belongs to another business', async () => {

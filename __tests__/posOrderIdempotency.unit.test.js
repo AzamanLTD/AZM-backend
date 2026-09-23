@@ -15,6 +15,7 @@ function fingerprint(intent) {
         locationId: intent.locationId ?? null,
         tableId: intent.tableId ?? null,
         customerId: intent.customerId == null ? null : Number(intent.customerId),
+        tipAmount: Number(intent.tipAmount || 0), // r32/I: tips join the fingerprint
     };
     return crypto.createHash('sha256').update(JSON.stringify(canonical)).digest('hex');
 }
@@ -99,6 +100,7 @@ describe('PosOrderService idempotency intent binding', () => {
                 amount: 20.5,
                 metadata: expect.objectContaining({
                     tax: 0.5,
+                    tipAmount: 0, // r32/I: tip is ledgered alongside the fingerprint
                     taxLines: [{ name: 'VAT', type: 'PERCENTAGE', value: 2.5, computedAmount: 0.5 }],
                     posIdempotencyFingerprint: fingerprint(intent),
                 }),

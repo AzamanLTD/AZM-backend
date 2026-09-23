@@ -5,7 +5,7 @@ describe('dineInController.searchGuests', () => {
         jest.mock('../services/dineInTabService', () => ({}));
         const controller = require('../controllers/dineInController');
         const prisma = {
-            businessProfile: { findFirst: jest.fn().mockResolvedValue({ id: 'business-a' }) },
+            businessProfile: { findFirst: jest.fn().mockResolvedValue({ id: 'business-a', userId: 99 }) },
             dineInTab: {
                 findMany: jest.fn().mockResolvedValue([
                     { customer: { id: 1, username: 'alice', azamanId: 'AZM-1' } },
@@ -18,9 +18,11 @@ describe('dineInController.searchGuests', () => {
 
         await controller.searchGuests(req, res);
 
+        // r32: scope resolution goes through the canonical resolver
+        // (select includes userId for the ownership derivation).
         expect(prisma.businessProfile.findFirst).toHaveBeenCalledWith({
             where: { userId: 99 },
-            select: { id: true },
+            select: { id: true, userId: true },
         });
         expect(prisma.dineInTab.findMany).toHaveBeenCalledWith({
             where: {
