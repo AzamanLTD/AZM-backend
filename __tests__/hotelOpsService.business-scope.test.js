@@ -114,22 +114,41 @@ describe('HotelOpsService business scoping', () => {
             checkedInAt: new Date('2026-09-02T10:00:00Z'), endDatetime: new Date('2026-09-03T10:00:00Z'),
             metadata: { channel: 'FRONT_DESK' },
         };
-        const txRoomFindFirst = jest.fn().mockResolvedValue({ id: 'room-old' });
-        const txReservationUpdate = jest.fn().mockResolvedValue({ ...reservation, serviceItemId: 'room-new' });
-        const txRoomUpdate = jest.fn().mockResolvedValue({});
+        const txRoomFindFirst = jest.fn().mockResolvedValue({ id: 'room-new', status: 'AVAILABLE' });
+        const moved = { ...reservation, serviceItemId: 'room-new' };
+        const txReservationCas = jest.fn().mockResolvedValue({ count: 1 });
+        const txReservationFindUnique = jest.fn().mockResolvedValue(moved);
+        const txClaimRoom = jest.fn().mockResolvedValue({ count: 1 });    // target claim
+        const txReleaseOldRoom = jest.fn().mockResolvedValue({ count: 1 }); // old-room cleanup
         const prisma = {
             reservation: { findFirst: jest.fn().mockResolvedValue(reservation) },
             hotelRoom: { findFirst: jest.fn().mockResolvedValue({ id: 'room-new', status: 'AVAILABLE', businessProfileId: bpA }) },
             $transaction: jest.fn(async (callback) => callback({
-                reservation: { update: txReservationUpdate },
-                hotelRoom: { findFirst: txRoomFindFirst, update: txRoomUpdate },
+                reservation: {
+                    findFirst: jest.fn().mockResolvedValue(reservation),
+                    updateMany: txReservationCas,
+                    findUnique: txReservationFindUnique,
+                },
+                hotelRoom: {
+                    findFirst: txRoomFindFirst,
+                    updateMany: jest.fn().mockImplementation(({ where }) =>
+                        where && where.currentReservationId ? txReleaseOldRoom({ where }) : txClaimRoom({ where })),
+                },
             })),
         };
         const svc = new HotelOpsService(prisma);
 
         await expect(svc.moveRoom('reservation-a', { newRoomId: 'room-new', reason: 'guest request' }, bpA))
-            .resolves.toEqual(expect.objectContaining({ ok: true }));
+            .resolves.toEqual(expect.objectContaining({ ok: true, reservation: expect.objectContaining({ serviceItemId: 'room-new' }) }));
         expect(prisma.$transaction).toHaveBeenCalledTimes(1);
         expect(txRoomFindFirst).toHaveBeenCalled();
+        // The reservation move was a CAS conditioned on the origin room, and
+        // the target-room claim was conditional on AVAILABILITY at claim time.
+        expect(txReservationCas).toHaveBeenCalledWith(
+            expect.objectContaining({ where: expect.objectContaining({ id: 'reservation-a', serviceItemId: 'room-old' }) }),
+        );
+        expect(txClaimRoom).toHaveBeenCalledWith(
+            expect.objectContaining({ where: expect.objectContaining({ id: 'room-new', status: 'AVAILABLE' }) }),
+        );
     });
 });
