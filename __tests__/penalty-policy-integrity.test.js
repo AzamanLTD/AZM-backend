@@ -382,9 +382,15 @@ describeOrSkip('business no-show settlement (real PostgreSQL)', () => {
         const s2 = await seedNoShowScenario({ amount: 100, stake: 0 });
         // Re-point s2's escrow at the same business via its own booking.
         s2.biz = s1.biz;
+        // The capacity authority forbids two active bookings on the same
+        // business/interval. This stake-concurrency proof only needs two
+        // different reservations sharing a business, not the same slot.
+        const secondStart = new Date(s1.booking.endDatetime.getTime() + 60_000);
+        const secondEnd = new Date(secondStart.getTime() +
+            (s2.booking.endDatetime.getTime() - s2.booking.startDatetime.getTime()));
         await prisma.reservation.update({
             where: { id: s2.booking.id },
-            data: { businessProfileId: s1.biz.id },
+            data: { businessProfileId: s1.biz.id, startDatetime: secondStart, endDatetime: secondEnd },
         });
 
         await Promise.allSettled([call(s1), call(s2)]);

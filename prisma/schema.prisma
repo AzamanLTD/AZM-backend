@@ -3442,6 +3442,8 @@ model AvailabilityRule {
 model Reservation {
   id                 String            @id @default(uuid())
   reservationRef     String            @unique // RES-XXXXXXXX
+  clientRequestKey   String?           @db.VarChar(128)
+  requestFingerprint String?           @db.VarChar(64)
   businessProfileId  String
   locationId         String?
   customerId         Int
@@ -3481,6 +3483,7 @@ model Reservation {
   counterProposeMessage String?   @db.VarChar(500)
   counterProposedAt     DateTime?
 
+  @@unique([businessProfileId, customerId, clientRequestKey])
   @@index([businessProfileId, startDatetime])
   @@index([customerId])
   @@index([businessProfileId, status])

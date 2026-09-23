@@ -113,6 +113,9 @@ jobs:
       - name: Install business OS overlay
         run: node infra/install-business-os-overlay.js
 
+      - name: Install reservation capacity authority
+        run: node infra/install-reservation-capacity-overlay.js
+
       - name: Generate Prisma client
         run: npx prisma generate
 

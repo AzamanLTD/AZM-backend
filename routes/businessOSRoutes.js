@@ -82,6 +82,9 @@ function wrap(handler) {
             await handler(req, res);
         } catch (err) {
             logger.error({ err: err }, '[BusinessOS]');
+            if (err.code === 'P2002' && err.meta?.target === null) {
+                return res.status(409).json({ success: false, message: 'The requested reservation or room interval is no longer available.' });
+            }
             res.status(400).json({ success: false, message: err.message });
         }
     };
