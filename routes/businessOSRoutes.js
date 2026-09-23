@@ -712,10 +712,19 @@ router.post('/ledger', requirePermission('finance.ledger.manage'), wrap(async (r
     res.status(201).json({ success: true, entry });
 }));
 
+// r35/P2 — the ledger is APPEND-ONLY. "Deleting" an entry now writes an
+// exact negating REVERSAL that references the original (the original row is
+// never removed or mutated), so P&L/cash-flow history stays honest. The
+// legacy response envelope { success: true } is preserved for the portal.
 router.delete('/ledger/:id', requirePermission('finance.ledger.manage'), wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
-    await svc.ledgerService.deleteEntry(req.params.id, bpId);
+    try {
+        await svc.ledgerService.deleteEntry(req.params.id, bpId, req.body?.reason);
+    } catch (err) {
+        const status = Number.isInteger(err.status) ? err.status : 400;
+        return res.status(status).json({ success: false, message: err.message });
+    }
     res.status(200).json({ success: true });
 }));
 
@@ -3205,80 +3214,55 @@ router.post('/pos/cash-sale', requirePermission('orders.manage'), wrap(async (re
 }));
 
 // POST /api/business-os/pos/cash-close-tab — close a dine-in tab with cash
+// r35/P0 — ATOMIC CASH CLOSE. The legacy inline implementation ran its
+// idempotency lookup without business scope, closed the tab with an unguarded
+// update (concurrent closes double-posted the ledger), wrote the ledger
+// entry outside the transaction, and swallowed ledger failures (PAID tab,
+// missing financial record). The route now delegates to the canonical
+// DineInCashCloseService: one serializable transaction covers the
+// idempotency claim, the OPEN -> PAID CAS transition, and the ledger entry.
+// Totals are re-derived from durable tab items; tax comes from the business's
+// default tax preset (the invoice/POS machinery) instead of a hardcoded 5%.
+// The legacy response envelope is preserved.
 router.post('/pos/cash-close-tab', requirePermission('orders.manage'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
     const { tabId, cashReceived, tipAmount, idempotencyKey } = req.body;
     if (!tabId) return res.status(400).json({ success: false, message: 'Tab ID required' });
 
-    // Idempotency check
-    if (idempotencyKey) {
-        const existing = await prisma.dineInTab.findFirst({
-            where: { idempotencyKey },
-        });
-        if (existing) {
-            return res.json({ success: true, tab: existing, message: 'Duplicate (idempotent)' });
-        }
-    }
-
-    const tab = await prisma.dineInTab.findFirst({
-        where: { id: tabId, businessProfileId: bpId, status: 'OPEN' },
-        include: { items: true },
-    });
-    if (!tab) return res.status(404).json({ success: false, message: 'Open tab not found' });
-
-    // Re-compute totals from items (never trust client totals)
-    let subtotal = 0;
-    for (const item of tab.items) {
-        subtotal += parseFloat(item.lineTotalUsdc);
-    }
-    const taxTotal = subtotal * 0.05; // default 5% tax — configurable
-    const tip = parseFloat(tipAmount || 0);
-    const grandTotal = subtotal + taxTotal + tip;
-
-    // Close the tab with cash
-    const updated = await prisma.dineInTab.update({
-        where: { id: tabId },
-        data: {
-            status: 'PAID',
-            closedAt: new Date(),
-            subtotalUsdc: subtotal,
-            taxTotalUsdc: taxTotal,
-            tipUsdc: tip,
-            grandTotalUsdc: grandTotal,
-            paymentMethod: 'CASH',
-            idempotencyKey,
-            cashReceived: cashReceived ? parseFloat(cashReceived) : null,
-        },
-    });
-
-    // Write ledger entry
+    const { DineInCashCloseService } = require('../services/businessOS/dineInCashCloseService');
     try {
-        await prisma.businessLedgerEntry.create({
-            data: {
-                businessProfileId: bpId,
-                type: 'INCOME',
-                category: 'DINE_IN',
-                description: 'Dine-in cash close (' + tabId.substring(0, 8) + ')',
-                amount: grandTotal,
-                amountGhs: grandTotal,
-                sourceType: 'DINE_IN_CASH',
-                sourceId: tabId,
-                metadata: { tabId, tip, subtotal, taxTotal },
-            },
+        const result = await new DineInCashCloseService(prisma).closeTab({
+            businessProfileId: bpId,
+            actorId: req.user.id,
+            tabId,
+            cashReceived,
+            tipAmount,
+            idempotencyKey,
         });
-    } catch (e) {
-        logger.warn('[pos/cash-close-tab] Failed to write ledger entry:', e.message);
+        const payload = {
+            success: true,
+            tab: result.tab,
+            subtotal: result.subtotal,
+            taxTotal: result.taxTotal,
+            grandTotal: result.grandTotal,
+            change: result.change,
+        };
+        if (result.duplicate) payload.message = 'Duplicate (idempotent)';
+        res.json(payload);
+    } catch (err) {
+        const statusByCode = {
+            INVALID_INPUT: 400,
+            INSUFFICIENT_CASH: 400,
+            TAB_NOT_FOUND: 404,
+            TAB_ALREADY_CLOSED: 409,
+            IDEMPOTENCY_KEY_FOREIGN: 409,
+            IDEMPOTENCY_KEY_CONFLICT: 409,
+        };
+        const status = statusByCode[err.code] || 400;
+        if (status >= 500) logger.error({ err }, '[pos/cash-close-tab]');
+        res.status(status).json({ success: false, message: err.message });
     }
-
-    res.json({
-        success: true,
-        tab: updated,
-        subtotal,
-        taxTotal,
-        grandTotal,
-        change: cashReceived ? parseFloat(cashReceived) - grandTotal : 0,
-    });
 }));
 
 // ── Phase 2: Employee PIN Management (Section 2.4) ──────────────────────────
@@ -3342,8 +3326,8 @@ router.get('/messages/conversations', wrap(async (req, res) => {
             OR: [{ participantAId: userId }, { participantBId: userId }],
         },
         include: {
-            participantA: { select: { id: true, username: true, avatarUrl: true } },
-            participantB: { select: { id: true, username: true, avatarUrl: true } },
+            participantA: { select: { id: true, username: true, profilePictureUrl: true } },
+            participantB: { select: { id: true, username: true, profilePictureUrl: true } },
         },
         orderBy: { lastMessageAt: 'desc' },
     });
@@ -3392,8 +3376,8 @@ router.post('/messages/conversations', wrap(async (req, res) => {
             createdBy: req.user.id,
         },
         include: {
-            participantA: { select: { id: true, username: true, avatarUrl: true } },
-            participantB: { select: { id: true, username: true, avatarUrl: true } },
+            participantA: { select: { id: true, username: true, profilePictureUrl: true } },
+            participantB: { select: { id: true, username: true, profilePictureUrl: true } },
         },
     });
 
