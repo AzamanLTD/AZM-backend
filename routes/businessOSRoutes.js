@@ -61,6 +61,13 @@ async function getBusinessProfileId(req) {
 function getServices(req) {
     const prisma = getPrisma(req);
     return {
+        // r34 fix — the returned bundle historically omitted the raw client,
+        // so every `svc.prisma.*` consumer in this router (recurring expense
+        // templates, promotions, reviews, the audit logger, the escrow list)
+        // crashed with "Cannot read properties of undefined" the moment the
+        // route was reached. The tenant predicates added in r34 assume this
+        // client is exposed; expose it.
+        prisma,
         employeeService: new EmployeeService(prisma),
         shiftService: new ShiftService(prisma),
         payrollService: new PayrollService(prisma),
@@ -85,7 +92,9 @@ function wrap(handler) {
             if (err.code === 'P2002' && err.meta?.target === null) {
                 return res.status(409).json({ success: false, message: 'The requested reservation or room interval is no longer available.' });
             }
-            res.status(400).json({ success: false, message: err.message });
+            // Handlers may attach a specific statusCode (e.g. kiosk 404/409);
+            // the default remains a conservative 400.
+            res.status(err.statusCode || 400).json({ success: false, message: err.message });
         }
     };
 }
@@ -407,6 +416,8 @@ router.patch('/employees/:id/status', requirePermission('employees.terminate'), 
     const employee = await svc.employeeService.updateStatus(req.params.id, bpId, req.body.status);
     const { logBusinessAudit } = require('../utils/businessAudit');
     await logBusinessAudit(svc.prisma, { businessProfileId: bpId, actorId: req.user.id, actorName: req.user.username, action: 'EMPLOYEE_STATUS_CHANGED', targetType: 'Employee', targetId: req.params.id, metadata: { status: req.body.status }, ipAddress: req.ip });
+    res.status(200).json({ success: true, employee });
+}));
 
 // PATCH /api/business-os/employees/:id/role — r26/P0-B (follow-up review)
 // Role changes are AUTHORITY-BEARING: they reseed the target's permission set
@@ -423,8 +434,6 @@ router.patch('/employees/:id/role', requirePermission('employees.permissions'), 
     const employee = await svc.employeeService.updateRole(req.params.id, bpId, req.body.role, { actor: roleActor });
     await logBusinessAudit(svc.prisma, { businessProfileId: bpId, actorId: req.user.id, actorName: req.user.username, action: 'EMPLOYEE_ROLE_CHANGED', targetType: 'Employee', targetId: employee.id, metadata: { role: employee.role }, ipAddress: req.ip });
     res.json({ success: true, employee });
-}));
-    res.status(200).json({ success: true, employee });
 }));
 
 // POST /api/business-os/employees/:id/permissions
@@ -1717,22 +1726,89 @@ router.get('/restaurant/recipes', requirePermission('restaurant.inventory.view')
 
 // POST /api/business-os/restaurant/recipes/:productId/link — link ingredient to product
 router.post('/restaurant/recipes/:productId/link', requirePermission('restaurant.inventory.manage'), wrap(async (req, res) => {
+    // r34/C — a recipe ingredient joins a business product to a business
+    // inventory item; the downstream deduction path follows exactly this
+    // relationship, so BOTH objects must provably belong to the caller's
+    // effective business before the upsert. A foreign product or item is
+    // indistinguishable from a nonexistent one (404) and can never poison
+    // the deduction chain. Quantity is validated explicitly: finite,
+    // strictly positive, at most 8 decimal places.
     const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
     const { inventoryItemId, quantityRequired } = req.body;
-    const link = await prisma.recipeIngredient.upsert({
-        where: { productId_inventoryItemId: { productId: req.params.productId, inventoryItemId } },
-        create: { productId: req.params.productId, inventoryItemId, quantityRequired: parseFloat(quantityRequired) },
-        update: { quantityRequired: parseFloat(quantityRequired) },
+    if (!inventoryItemId || typeof inventoryItemId !== 'string') {
+        return res.status(400).json({ success: false, message: 'inventoryItemId is required' });
+    }
+    const qty = Number(quantityRequired);
+    if (!Number.isFinite(qty) || qty <= 0 || Math.abs(qty * 1e8 - Math.round(qty * 1e8)) > 1e-6) {
+        return res.status(400).json({ success: false, message: 'quantityRequired must be a positive number with at most 8 decimal places' });
+    }
+    const product = await prisma.businessProduct.findFirst({
+        where: { id: req.params.productId, businessProfileId: bpId },
+        select: { id: true },
     });
-    res.json({ success: true, link });
+    if (!product) return res.status(404).json({ success: false, message: 'Product not found' });
+    const invItem = await prisma.inventoryItem.findFirst({
+        where: { id: inventoryItemId, businessProfileId: bpId },
+        select: { id: true },
+    });
+    if (!invItem) return res.status(404).json({ success: false, message: 'Inventory item not found' });
+
+    // Mutation boundary: the upsert selector is the composite
+    // {productId, inventoryItemId} of two verified same-business objects.
+    // Concurrent duplicate links converge: the losing racer hits P2002 and
+    // falls back to a tenant-predicated updateMany (count 0 → 404).
+    try {
+        const link = await prisma.recipeIngredient.upsert({
+            where: { productId_inventoryItemId: { productId: req.params.productId, inventoryItemId } },
+            create: { productId: req.params.productId, inventoryItemId, quantityRequired: qty },
+            update: { quantityRequired: qty },
+        });
+        return res.json({ success: true, link });
+    } catch (e) {
+        if (e?.code !== 'P2002') throw e;
+        const converged = await prisma.recipeIngredient.updateMany({
+            where: {
+                productId: req.params.productId, inventoryItemId,
+                product: { businessProfileId: bpId },
+                inventoryItem: { businessProfileId: bpId },
+            },
+            data: { quantityRequired: qty },
+        });
+        if (converged.count === 0) return res.status(404).json({ success: false, message: 'Recipe link not found' });
+        const link = await prisma.recipeIngredient.findUnique({
+            where: { productId_inventoryItemId: { productId: req.params.productId, inventoryItemId } },
+        });
+        return res.json({ success: true, link });
+    }
 }));
 
 // DELETE /api/business-os/restaurant/recipes/:productId/link/:itemId — remove link
 router.delete('/restaurant/recipes/:productId/link/:itemId', requirePermission('restaurant.inventory.manage'), wrap(async (req, res) => {
+    // r34/C — deleting a link requires the same ownership proof as creating
+    // one: both endpoints of the relationship must belong to the effective
+    // business, and the delete itself carries the tenant predicate. A
+    // foreign business's link can never be removed (or revealed).
     const prisma = getPrisma(req);
-    await prisma.recipeIngredient.deleteMany({
-        where: { productId: req.params.productId, inventoryItemId: req.params.itemId },
+    const bpId = await getBusinessProfileId(req);
+    const product = await prisma.businessProduct.findFirst({
+        where: { id: req.params.productId, businessProfileId: bpId },
+        select: { id: true },
     });
+    if (!product) return res.status(404).json({ success: false, message: 'Product not found' });
+    const invItem = await prisma.inventoryItem.findFirst({
+        where: { id: req.params.itemId, businessProfileId: bpId },
+        select: { id: true },
+    });
+    if (!invItem) return res.status(404).json({ success: false, message: 'Inventory item not found' });
+    const deleted = await prisma.recipeIngredient.deleteMany({
+        where: {
+            productId: req.params.productId, inventoryItemId: req.params.itemId,
+            product: { businessProfileId: bpId },
+            inventoryItem: { businessProfileId: bpId },
+        },
+    });
+    if (deleted.count === 0) return res.status(404).json({ success: false, message: 'Recipe link not found' });
     res.json({ success: true });
 }));
 
@@ -1749,14 +1825,33 @@ router.post('/restaurant/inventory/deduct/:orderId', requirePermission('restaura
         return res.json({ success: true, message: 'No recipe configured — nothing deducted', deductions: [] });
     }
     const qty = order.quantity || 1;
+    // r34/D — poisoned-recipe guard: a recipe ingredient may only ever join
+    // objects of one business (the link route now enforces that), but the
+    // deduction path must defend ITSELF against any historical/foreign
+    // relationship: if any referenced inventory item does not belong to the
+    // effective business, the whole deduction fails closed BEFORE mutating.
+    const foreignIngredient = order.product.recipeIngredients.find(
+        (ri) => ri.inventoryItem.businessProfileId !== bpId,
+    );
+    if (foreignIngredient) {
+        return res.status(409).json({ success: false, message: 'Recipe configuration is invalid for this business — deduction aborted' });
+    }
     const deductions = [];
     await prisma.$transaction(async (tx) => {
         for (const ri of order.product.recipeIngredients) {
             const deductQty = ri.quantityRequired * qty;
-            await tx.inventoryItem.update({
-                where: { id: ri.inventoryItemId },
+            // r34/D — mutation-level tenant predicate: the decrement only
+            // applies to this business's item. If the ingredient somehow
+            // points outside the business, count === 0, the throw rolls the
+            // ENTIRE deduction (including already-decremented ingredients)
+            // back, and no foreign stock is ever touched.
+            const claim = await tx.inventoryItem.updateMany({
+                where: { id: ri.inventoryItemId, businessProfileId: bpId },
                 data: { currentStock: { decrement: deductQty } },
             });
+            if (claim.count === 0) {
+                throw new Error(`Inventory item ${ri.inventoryItemId} does not belong to this business — deduction aborted`);
+            }
             deductions.push({ ingredient: ri.inventoryItem.name, deducted: deductQty, unit: ri.inventoryItem.unit });
         }
     });
@@ -2713,17 +2808,45 @@ router.get('/dashboard/employee-stats', requirePermission('analytics.view'), wra
 
 // ── Phase 2: Kiosk PIN Auth (Section 2.4) ────────────────────────────────────
 // POST /api/business-os/kiosk/pin-auth — scoped PIN auth for clock-in/out only
+// r34/E — KIOSK AUTHORITY. The kiosk credential is the employee PIN, never
+// the employeeId. This endpoint now:
+//   • resolves the business from the CALLER's authenticated context
+//     (owner/employee/admin-impersonation) — the body's businessProfileId is
+//     only accepted if it MATCHES that resolution, so one business can never
+//     probe another business's PIN space;
+//   • enforces a failed-PIN attempt ceiling (per business, see
+//     utils/kioskPinGuard.js);
+//   • issues the REAL scoped capability (services/businessOS/
+//     kioskCapability.js — a 5-minute JWT bound to employeeId/userId/
+//     businessProfileId). The frontend previously had to "enforce the
+//     scope" itself against a plain payload; the scope is now a signed,
+//     server-verifiable token that clock-in/out verify server-side.
 router.post('/kiosk/pin-auth', wrap(async (req, res) => {
     const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+    if (!bpId) return res.status(403).json({ success: false, message: 'No business context for this account' });
     const { pinCode, businessProfileId, locationId } = req.body;
-    if (!pinCode || !businessProfileId) {
-        return res.status(400).json({ success: false, message: 'PIN and business ID required' });
+    if (!pinCode) {
+        return res.status(400).json({ success: false, message: 'PIN required' });
+    }
+    // A caller-supplied business id may never WIDEN the scope: if present it
+    // must agree with the authenticated context, otherwise the request is
+    // rejected without revealing whether the business exists.
+    if (businessProfileId !== undefined && businessProfileId !== null && String(businessProfileId) !== String(bpId)) {
+        return res.status(403).json({ success: false, message: 'Kiosk PIN auth is only valid for your own business' });
     }
 
-    // Find employees with this PIN for this business
+    const kioskPinGuard = require('../utils/kioskPinGuard');
+    try {
+        kioskPinGuard.assertNotLocked(bpId, 'pin-auth');
+    } catch (err) {
+        return res.status(err.statusCode || 429).json({ success: false, message: err.message });
+    }
+
+    // Find employees with a PIN for THIS business only.
     const bcrypt = require('bcryptjs');
     const employees = await prisma.businessEmployee.findMany({
-        where: { businessProfileId, status: 'ACTIVE', pinCode: { not: null } },
+        where: { businessProfileId: bpId, status: 'ACTIVE', pinCode: { not: null } },
         select: { id: true, pinCode: true, userId: true, role: true, title: true, department: true },
     });
 
@@ -2736,11 +2859,23 @@ router.post('/kiosk/pin-auth', wrap(async (req, res) => {
     }
 
     if (!matched) {
+        kioskPinGuard.recordFailure(bpId, 'pin-auth');
         return res.status(401).json({ success: false, message: 'Invalid PIN' });
     }
+    kioskPinGuard.recordSuccess(bpId, 'pin-auth');
 
-    // Return a SCOPED token — only valid for clock-in/out, not full session
-    // The frontend uses this to identify the employee for kiosk actions
+    // The real scoped credential: a short-lived server-signed capability
+    // bound to this employee + business, verifiable by clock-in/out.
+    const { signCapability } = require('../services/businessOS/kioskCapability');
+    const kioskToken = signCapability({
+        employeeId: matched.id,
+        userId: matched.userId,
+        businessProfileId: bpId,
+        locationId: locationId || null,
+    });
+
+    // Legacy fields kept for wire compatibility; the kioskToken is the
+    // authoritative credential for the subsequent clock-in/out calls.
     res.json({
         success: true,
         employee: {
@@ -2750,8 +2885,9 @@ router.post('/kiosk/pin-auth', wrap(async (req, res) => {
             title: matched.title,
             department: matched.department,
         },
-        scope: 'kiosk_clock_only', // frontend must enforce this scope
-        businessProfileId,
+        kioskToken,
+        scope: 'kiosk_clock_only',
+        businessProfileId: bpId,
         locationId: locationId || null,
     });
 }));
@@ -2789,106 +2925,235 @@ router.get('/reservation-stats', requirePermission('reservations.view'), wrap(as
 }));
 
 // POST /api/business-os/kiosk/clock-in — clock in using PIN auth
+// r34/E — AUTHORITY CONTRACT. Previously this route accepted a bare
+// employeeId from any authenticated caller: any user could clock in ANY
+// employee of ANY business. Now:
+//   • employeeId is NOT a credential — the request must carry the PIN proof
+//     itself (pinCode verified against THAT employee) or the scoped
+//     kioskToken issued by /kiosk/pin-auth (a 5-minute server-signed
+//     capability bound to employeeId/userId/businessProfileId);
+//   • the target employee must be an ACTIVE employee of the CALLER's
+//     effective business (foreign business employees are 404s);
+//   • the mutation is serialized per-employee by locking the
+//     BusinessEmployee row inside the transaction, so two concurrent
+//     clock-ins converge on ONE open shift instead of duplicating state;
+//   • every shift read/write carries the businessProfileId predicate.
 router.post('/kiosk/clock-in', wrap(async (req, res) => {
     const prisma = getPrisma(req);
-    const { employeeId, locationId } = req.body;
+    const bpId = await getBusinessProfileId(req);
+    if (!bpId) return res.status(403).json({ success: false, message: 'No business context for this account' });
+    const { employeeId, locationId, pinCode, kioskToken } = req.body;
     if (!employeeId) return res.status(400).json({ success: false, message: 'Employee ID required' });
 
-    // Find today's scheduled shift for this employee
+    // ── Credential proof: PIN or scoped capability token ──
+    const { verifyCapability } = require('../services/businessOS/kioskCapability');
+    const kioskPinGuard = require('../utils/kioskPinGuard');
+    let capability = null;
+    if (kioskToken) {
+        try {
+            capability = verifyCapability(kioskToken);
+        } catch (err) {
+            return res.status(401).json({ success: false, message: err.message });
+        }
+        if (String(capability.employeeId) !== String(employeeId)) {
+            return res.status(401).json({ success: false, message: 'Kiosk authorization does not belong to this employee' });
+        }
+        if (String(capability.businessProfileId) !== String(bpId)) {
+            return res.status(401).json({ success: false, message: 'Kiosk authorization does not belong to this business' });
+        }
+    }
+    if (!capability && !pinCode) {
+        return res.status(401).json({ success: false, message: 'PIN required — employeeId alone is not a credential' });
+    }
+
+    // ── Tenant scope + PIN verification (outside the lock: bcrypt is slow) ──
+    const emp = await prisma.businessEmployee.findFirst({
+        where: { id: employeeId, businessProfileId: bpId, status: 'ACTIVE' },
+        select: { id: true, userId: true, pinCode: true },
+    });
+    if (!emp) return res.status(404).json({ success: false, message: 'Employee not found' });
+
+    if (capability) {
+        if (String(emp.userId) !== String(capability.userId)) {
+            return res.status(401).json({ success: false, message: 'Kiosk authorization does not belong to this employee' });
+        }
+    } else {
+        try {
+            kioskPinGuard.assertNotLocked(bpId, employeeId);
+        } catch (err) {
+            return res.status(err.statusCode || 429).json({ success: false, message: err.message });
+        }
+        const bcrypt = require('bcryptjs');
+        if (!emp.pinCode || !(await bcrypt.compare(String(pinCode), emp.pinCode))) {
+            kioskPinGuard.recordFailure(bpId, employeeId);
+            return res.status(401).json({ success: false, message: 'Invalid PIN' });
+        }
+        kioskPinGuard.recordSuccess(bpId, employeeId);
+    }
+
+    // ── Serialized mutation: employee row lock, then claim checks ──
+    const now = new Date();
     const today = new Date();
     today.setHours(0, 0, 0, 0);
     const tomorrow = new Date(today);
     tomorrow.setDate(tomorrow.getDate() + 1);
 
-    const shift = await prisma.shift.findFirst({
-        where: {
-            employeeId,
-            shiftDate: { gte: today, lt: tomorrow },
-            status: { in: ['SCHEDULED', 'OPEN'] },
-        },
-    });
+    const result = await prisma.$transaction(async (tx) => {
+        // Per-employee serialization: concurrent kiosk clock-ins for this
+        // employee queue here; the predicate carries the tenant scope, so a
+        // foreign employee never even locks.
+        const locked = await tx.$queryRaw`SELECT id FROM "BusinessEmployee" WHERE id = ${employeeId} AND "businessProfileId" = ${bpId} FOR UPDATE`;
+        if (locked.length === 0) throw new Error('Employee not found');
 
-    if (shift) {
-        // Clock into scheduled shift
-        const now = new Date();
-        const isLate = now > new Date(shift.startTime.getTime() + 5 * 60 * 1000);
-        const lateMinutes = isLate ? Math.floor((now - shift.startTime) / 60000) : 0;
-
-        const updated = await prisma.shift.update({
-            where: { id: shift.id },
-            data: {
-                status: 'OPEN',
-                clockInTime: now,
-                isLate,
-                lateMinutes,
-            },
+        // One active shift per employee, ever — not just today. (r34: the
+        // ShiftStatus enum is SCHEDULED/CLOCKED_IN/LATE/CLOCKED_OUT/NO_SHOW —
+        // the pre-r34 'OPEN'/'COMPLETED' literals never existed in the enum,
+        // so those handlers failed Prisma validation on every call.)
+        const existing = await tx.shift.findFirst({
+            where: { employeeId, businessProfileId: bpId, status: { in: ['CLOCKED_IN', 'LATE'] }, clockInTime: { not: null }, clockOutTime: null },
         });
-        res.json({ success: true, shift: updated, message: isLate ? 'Clocked in (late)' : 'Clocked in' });
-    } else {
-        // No scheduled shift — create an ad-hoc clock-in
-        const emp = await prisma.businessEmployee.findUnique({
-            where: { id: employeeId },
-            select: { businessProfileId: true, userId: true },
-        });
-        if (!emp) return res.status(404).json({ success: false, message: 'Employee not found' });
+        if (existing) return { shift: existing, message: 'Already clocked in — one open shift per employee', duplicate: true };
 
-        const now = new Date();
+        // Claim today's SCHEDULED shift with a conditional updateMany: only
+        // one racer can turn the SCHEDULED→OPEN transition.
+        const scheduled = await tx.shift.findFirst({
+            where: { employeeId, businessProfileId: bpId, shiftDate: { gte: today, lt: tomorrow }, status: 'SCHEDULED' },
+        });
+        if (scheduled) {
+            const isLate = now > new Date(scheduled.startTime.getTime() + 5 * 60 * 1000);
+            const lateMinutes = isLate ? Math.floor((now - scheduled.startTime) / 60000) : 0;
+            const claim = await tx.shift.updateMany({
+                where: { id: scheduled.id, businessProfileId: bpId, status: 'SCHEDULED' },
+                data: { status: isLate ? 'LATE' : 'CLOCKED_IN', clockInTime: now, isLate, lateMinutes },
+            });
+            if (claim.count === 1) {
+                const shift = await tx.shift.findUnique({ where: { id: scheduled.id } });
+                return { shift, message: isLate ? 'Clocked in (late)' : 'Clocked in' };
+            }
+            // Lost the claim race (impossible under the row lock, kept as a
+            // defense in depth): fall through to the open-shift re-read above.
+        }
+
+        // No scheduled shift — ad-hoc clock-in, still under the lock.
         const endTime = new Date(now);
         endTime.setHours(endTime.getHours() + 8); // default 8hr shift
-
-        const adHocShift = await prisma.shift.create({
+        const adHocShift = await tx.shift.create({
             data: {
-                businessProfileId: emp.businessProfileId,
+                businessProfileId: bpId,
                 employeeId,
                 userId: emp.userId,
                 locationId: locationId || null,
                 shiftDate: now,
                 startTime: now,
                 endTime,
-                status: 'OPEN',
+                status: 'CLOCKED_IN',
                 clockInTime: now,
                 notes: 'Ad-hoc kiosk clock-in',
             },
         });
-        res.json({ success: true, shift: adHocShift, message: 'Clocked in (ad-hoc)' });
-    }
+        return { shift: adHocShift, message: 'Clocked in (ad-hoc)' };
+    }, { timeout: 10000 });
+
+    res.json({ success: true, shift: result.shift, message: result.message });
 }));
 
 // POST /api/business-os/kiosk/clock-out — clock out using PIN auth
+// r34/E — same credential contract as clock-in (PIN or scoped capability;
+// employeeId alone is never a credential), plus:
+//   • the shift claim is a conditional updateMany on { id, OPEN,
+//     clockOutTime: null } under the employee row lock — two concurrent
+//     clock-outs can never double-complete a shift or double-increment the
+//     employee's statistics (the stat update only runs for the claim
+//     winner, inside the same transaction);
+//   • the shift search carries the businessProfileId predicate, so only
+//     THIS business's employee's own open shift can ever be targeted.
 router.post('/kiosk/clock-out', wrap(async (req, res) => {
     const prisma = getPrisma(req);
-    const { employeeId } = req.body;
+    const bpId = await getBusinessProfileId(req);
+    if (!bpId) return res.status(403).json({ success: false, message: 'No business context for this account' });
+    const { employeeId, pinCode, kioskToken } = req.body;
     if (!employeeId) return res.status(400).json({ success: false, message: 'Employee ID required' });
 
-    const shift = await prisma.shift.findFirst({
-        where: { employeeId, status: 'OPEN', clockInTime: { not: null }, clockOutTime: null },
-        orderBy: { clockInTime: 'desc' },
-    });
+    const { verifyCapability } = require('../services/businessOS/kioskCapability');
+    const kioskPinGuard = require('../utils/kioskPinGuard');
+    let capability = null;
+    if (kioskToken) {
+        try {
+            capability = verifyCapability(kioskToken);
+        } catch (err) {
+            return res.status(401).json({ success: false, message: err.message });
+        }
+        if (String(capability.employeeId) !== String(employeeId)) {
+            return res.status(401).json({ success: false, message: 'Kiosk authorization does not belong to this employee' });
+        }
+        if (String(capability.businessProfileId) !== String(bpId)) {
+            return res.status(401).json({ success: false, message: 'Kiosk authorization does not belong to this business' });
+        }
+    }
+    if (!capability && !pinCode) {
+        return res.status(401).json({ success: false, message: 'PIN required — employeeId alone is not a credential' });
+    }
 
-    if (!shift) return res.status(404).json({ success: false, message: 'No open shift to clock out from' });
+    const emp = await prisma.businessEmployee.findFirst({
+        where: { id: employeeId, businessProfileId: bpId, status: 'ACTIVE' },
+        select: { id: true, userId: true, pinCode: true },
+    });
+    if (!emp) return res.status(404).json({ success: false, message: 'Employee not found' });
+
+    if (capability) {
+        if (String(emp.userId) !== String(capability.userId)) {
+            return res.status(401).json({ success: false, message: 'Kiosk authorization does not belong to this employee' });
+        }
+    } else {
+        try {
+            kioskPinGuard.assertNotLocked(bpId, employeeId);
+        } catch (err) {
+            return res.status(err.statusCode || 429).json({ success: false, message: err.message });
+        }
+        const bcrypt = require('bcryptjs');
+        if (!emp.pinCode || !(await bcrypt.compare(String(pinCode), emp.pinCode))) {
+            kioskPinGuard.recordFailure(bpId, employeeId);
+            return res.status(401).json({ success: false, message: 'Invalid PIN' });
+        }
+        kioskPinGuard.recordSuccess(bpId, employeeId);
+    }
 
     const now = new Date();
-    const actualMinutes = Math.floor((now - shift.clockInTime) / 60000);
+    const updated = await prisma.$transaction(async (tx) => {
+        // Serialize against concurrent clock-out/clock-in for this employee.
+        const locked = await tx.$queryRaw`SELECT id FROM "BusinessEmployee" WHERE id = ${employeeId} AND "businessProfileId" = ${bpId} FOR UPDATE`;
+        if (locked.length === 0) throw new Error('Employee not found');
 
-    const updated = await prisma.shift.update({
-        where: { id: shift.id },
-        data: {
-            status: 'COMPLETED',
-            clockOutTime: now,
-            actualMinutes,
-        },
-    });
+        const shift = await tx.shift.findFirst({
+            where: { employeeId, businessProfileId: bpId, status: { in: ['CLOCKED_IN', 'LATE'] }, clockInTime: { not: null }, clockOutTime: null },
+            orderBy: { clockInTime: 'desc' },
+        });
+        if (!shift) throw Object.assign(new Error('No open shift to clock out from'), { statusCode: 404 });
 
-    // Update employee stats
-    await prisma.businessEmployee.update({
-        where: { id: employeeId },
-        data: {
-            totalShifts: { increment: 1 },
-            totalHours: { increment: actualMinutes / 60 },
-        },
-    });
+        const actualMinutes = Math.floor((now - shift.clockInTime) / 60000);
 
-    res.json({ success: true, shift: updated, actualMinutes, message: 'Clocked out' });
+        // Conditional claim: only one racer can complete the shift. A loss
+        // (count 0) throws and rolls back — the stats below never run twice.
+        const claim = await tx.shift.updateMany({
+            where: { id: shift.id, businessProfileId: bpId, status: { in: ['CLOCKED_IN', 'LATE'] }, clockOutTime: null },
+            data: { status: 'CLOCKED_OUT', clockOutTime: now, actualMinutes },
+        });
+        if (claim.count === 0) throw Object.assign(new Error('Shift was already clocked out'), { statusCode: 409 });
+
+        // Employee stats increment ONLY for the claim winner, in the SAME
+        // transaction: a rolled-back claim never inflates the counters.
+        await tx.businessEmployee.update({
+            where: { id: employeeId },
+            data: {
+                totalShifts: { increment: 1 },
+                totalHours: { increment: actualMinutes / 60 },
+            },
+        });
+
+        return { shift: await tx.shift.findUnique({ where: { id: shift.id } }), actualMinutes };
+    }, { timeout: 10000 });
+
+    res.json({ success: true, shift: updated.shift, actualMinutes: updated.actualMinutes, message: 'Clocked out' });
 }));
 
 // ── Phase 2: Cash Payment + Idempotency (Section 2.4) ────────────────────────
@@ -3218,6 +3483,7 @@ router.post('/messages/:conversationId/send', wrap(async (req, res) => {
 // ── Ledger: dashboard stats ──────────────────────────────────────────────────
 // Alias that matches what FinanceV2 calls
 router.get('/finance/dashboard', requirePermission('finance.view'), wrap(async (req, res) => {
+    const svc = getServices(req); // r34 fix — handler used svc without declaring it (ReferenceError on every call)
     const bpId = req.businessProfileId;
     const stats = await svc.ledgerService.getDashboardStats(bpId);
     res.json({ data: stats });
@@ -3225,6 +3491,7 @@ router.get('/finance/dashboard', requirePermission('finance.view'), wrap(async (
 
 // ── Ledger: P&L with prior-period comparison ─────────────────────────────────
 router.get('/finance/pl', requirePermission('finance.view'), wrap(async (req, res) => {
+    const svc = getServices(req); // r34 fix — handler used svc without declaring it (ReferenceError on every call)
     const bpId = req.businessProfileId;
     const { startDate, endDate } = req.query;
     const [current, prior] = await Promise.all([
@@ -3241,6 +3508,7 @@ router.get('/finance/pl', requirePermission('finance.view'), wrap(async (req, re
 
 // ── Ledger: cash flow ─────────────────────────────────────────────────────────
 router.get('/finance/cashflow', requirePermission('finance.view'), wrap(async (req, res) => {
+    const svc = getServices(req); // r34 fix — handler used svc without declaring it (ReferenceError on every call)
     const bpId = req.businessProfileId;
     const cf = await svc.ledgerService.getCashFlow(bpId, req.query);
     res.json({ data: cf });
@@ -3248,6 +3516,7 @@ router.get('/finance/cashflow', requirePermission('finance.view'), wrap(async (r
 
 // ── Ledger: expense list ──────────────────────────────────────────────────────
 router.get('/finance/expenses', requirePermission('finance.view'), wrap(async (req, res) => {
+    const svc = getServices(req); // r34 fix — handler used svc without declaring it (ReferenceError on every call)
     const bpId = req.businessProfileId;
     const exp = await svc.ledgerService.getExpenseBreakdown(bpId, req.query);
     res.json({ data: exp });
@@ -3255,6 +3524,7 @@ router.get('/finance/expenses', requirePermission('finance.view'), wrap(async (r
 
 // ── Escrow: held funds total ──────────────────────────────────────────────────
 router.get('/finance/escrow-held', requirePermission('finance.view'), wrap(async (req, res) => {
+    const svc = getServices(req); // r34 fix — handler used svc without declaring it (ReferenceError on every call)
     const bpId = req.businessProfileId;
     // Sum all open escrow balances for this business
     const escrows = await svc.prisma.escrow.findMany({
@@ -3270,6 +3540,7 @@ router.get('/finance/escrow-held', requirePermission('finance.view'), wrap(async
 
 // ── Recurring Expense Templates ────────────────────────────────────────────────
 router.get('/finance/recurring', requirePermission('finance.view'), wrap(async (req, res) => {
+    const svc = getServices(req); // r34 fix — handler used svc without declaring it (ReferenceError on every call)
     const bpId = req.businessProfileId;
     const templates = await svc.prisma.recurringExpenseTemplate.findMany({
         where: { businessProfileId: bpId },
@@ -3279,6 +3550,7 @@ router.get('/finance/recurring', requirePermission('finance.view'), wrap(async (
 }));
 
 router.post('/finance/recurring', requirePermission('finance.ledger.manage'), wrap(async (req, res) => {
+    const svc = getServices(req); // r34 fix — handler used svc without declaring it (ReferenceError on every call)
     const bpId = req.businessProfileId;
     const { name, category, amount, description, frequency, dayOfMonth, dayOfWeek } = req.body;
     // Compute nextDueAt
@@ -3294,21 +3566,38 @@ router.post('/finance/recurring', requirePermission('finance.ledger.manage'), wr
 }));
 
 router.patch('/finance/recurring/:id', requirePermission('finance.ledger.manage'), wrap(async (req, res) => {
+    const svc = getServices(req); // r34 fix — handler used svc without declaring it (ReferenceError on every call)
+    // r34/A — mutation-level tenant predicate: the template must belong to
+    // the caller's effective business at the UPDATE boundary itself, not
+    // merely via a prior authorization read. A foreign or unknown id is
+    // indistinguishable from a nonexistent one and fails closed as 404.
+    const bpId = req.businessProfileId;
     const { name, category, amount, description, frequency, dayOfMonth, dayOfWeek, isActive } = req.body;
-    const template = await svc.prisma.recurringExpenseTemplate.update({
-        where: { id: req.params.id },
+    const updated = await svc.prisma.recurringExpenseTemplate.updateMany({
+        where: { id: req.params.id, businessProfileId: bpId },
         data: { name, category, amount: amount ? parseFloat(amount) : undefined, description, frequency, dayOfMonth, dayOfWeek, isActive },
+    });
+    if (updated.count === 0) return res.status(404).json({ message: 'Recurring expense template not found' });
+    const template = await svc.prisma.recurringExpenseTemplate.findFirst({
+        where: { id: req.params.id, businessProfileId: bpId },
     });
     res.json({ data: template });
 }));
 
 router.delete('/finance/recurring/:id', requirePermission('finance.ledger.manage'), wrap(async (req, res) => {
-    await svc.prisma.recurringExpenseTemplate.delete({ where: { id: req.params.id } });
+    const svc = getServices(req); // r34 fix — handler used svc without declaring it (ReferenceError on every call)
+    // r34/A — same mutation-level tenant predicate on the delete boundary.
+    const bpId = req.businessProfileId;
+    const deleted = await svc.prisma.recurringExpenseTemplate.deleteMany({
+        where: { id: req.params.id, businessProfileId: bpId },
+    });
+    if (deleted.count === 0) return res.status(404).json({ message: 'Recurring expense template not found' });
     res.json({ ok: true });
 }));
 
 // ── Payroll liability summary ─────────────────────────────────────────────────
 router.get('/finance/payroll-position', requirePermission('finance.view'), wrap(async (req, res) => {
+    const svc = getServices(req); // r34 fix — handler used svc without declaring it (ReferenceError on every call)
     const bpId = req.businessProfileId;
     const [payrolls, ewaRequests] = await Promise.all([
         svc.prisma.payrollRecord.findMany({
@@ -3332,6 +3621,7 @@ router.get('/finance/payroll-position', requirePermission('finance.view'), wrap(
 
 // ── Promotions CRUD ───────────────────────────────────────────────────────────
 router.get('/marketing/promotions', requirePermission('marketing.view'), wrap(async (req, res) => {
+    const svc = getServices(req); // r34 fix — handler used svc without declaring it (ReferenceError on every call)
     const bpId = req.businessProfileId;
     const promos = await svc.prisma.businessPromotion.findMany({
         where: { businessProfileId: bpId },
@@ -3341,6 +3631,7 @@ router.get('/marketing/promotions', requirePermission('marketing.view'), wrap(as
 }));
 
 router.post('/marketing/promotions', requirePermission('marketing.publish'), wrap(async (req, res) => {
+    const svc = getServices(req); // r34 fix — handler used svc without declaring it (ReferenceError on every call)
     const bpId = req.businessProfileId;
     const promo = await svc.prisma.businessPromotion.create({
         data: { ...req.body, businessProfileId: bpId, discountValue: parseFloat(req.body.discountValue) },
@@ -3349,35 +3640,78 @@ router.post('/marketing/promotions', requirePermission('marketing.publish'), wra
 }));
 
 router.patch('/marketing/promotions/:id', requirePermission('marketing.publish'), wrap(async (req, res) => {
-    const promo = await svc.prisma.businessPromotion.update({
-        where: { id: req.params.id },
-        data: { ...req.body, ...(req.body.discountValue ? { discountValue: parseFloat(req.body.discountValue) } : {}) },
+    const svc = getServices(req); // r34 fix — handler used svc without declaring it (ReferenceError on every call)
+    // r34/B — the permission proves the caller may manage promotions in their
+    // effective business; the RESOURCE boundary must still hold. The update
+    // is a conditional mutation on { id, businessProfileId } and, unlike the
+    // previous { ...req.body } spread, only whitelisted fields can change —
+    // a caller-supplied businessProfileId can no longer ride the patch.
+    const bpId = req.businessProfileId;
+    const b = req.body;
+    const data = {};
+    if (b.name !== undefined) data.name = b.name;
+    if (b.code !== undefined) data.code = b.code;
+    if (b.discountType !== undefined) data.discountType = b.discountType;
+    if (b.discountValue !== undefined) data.discountValue = parseFloat(b.discountValue);
+    if (b.buyQuantity !== undefined) data.buyQuantity = b.buyQuantity;
+    if (b.getQuantity !== undefined) data.getQuantity = b.getQuantity;
+    if (b.scope !== undefined) data.scope = b.scope;
+    if (b.minSpendUsdc !== undefined) data.minSpendUsdc = b.minSpendUsdc;
+    if (b.applicableProductIds !== undefined) data.applicableProductIds = b.applicableProductIds;
+    if (b.startDate !== undefined) data.startDate = b.startDate;
+    if (b.endDate !== undefined) data.endDate = b.endDate;
+    if (b.usageLimit !== undefined) data.usageLimit = b.usageLimit;
+    if (b.perCustomerLimit !== undefined) data.perCustomerLimit = b.perCustomerLimit;
+    if (b.isActive !== undefined) data.isActive = b.isActive;
+    if (b.notes !== undefined) data.notes = b.notes;
+    const updated = await svc.prisma.businessPromotion.updateMany({
+        where: { id: req.params.id, businessProfileId: bpId },
+        data,
+    });
+    if (updated.count === 0) return res.status(404).json({ message: 'Promotion not found' });
+    const promo = await svc.prisma.businessPromotion.findFirst({
+        where: { id: req.params.id, businessProfileId: bpId },
     });
     res.json({ data: promo });
 }));
 
 router.delete('/marketing/promotions/:id', requirePermission('marketing.publish'), wrap(async (req, res) => {
-    // Soft-delete: deactivate instead of hard delete to preserve audit trail
-    await svc.prisma.businessPromotion.update({
-        where: { id: req.params.id },
+    const svc = getServices(req); // r34 fix — handler used svc without declaring it (ReferenceError on every call)
+    // Soft-delete: deactivate instead of hard delete to preserve audit trail.
+    // r34/B — the deactivation itself carries the tenant predicate; a
+    // foreign business's promotion is never readable or mutable here.
+    const bpId = req.businessProfileId;
+    const deactivated = await svc.prisma.businessPromotion.updateMany({
+        where: { id: req.params.id, businessProfileId: bpId },
         data: { isActive: false, endDate: new Date() },
     });
+    if (deactivated.count === 0) return res.status(404).json({ message: 'Promotion not found' });
     res.json({ ok: true });
 }));
 
 // ── Reviews: owner respond ─────────────────────────────────────────────────────
 router.post('/marketing/reviews/:id/respond', requirePermission('marketing.publish'), wrap(async (req, res) => {
+    const svc = getServices(req); // r34 fix — handler used svc without declaring it (ReferenceError on every call)
+    // r34/B — the response write is a conditional mutation on
+    // { id, businessProfileId }: a business can only ever answer reviews OF
+    // ITS OWN PROFILE. A foreign review id is not found and not revealed.
+    const bpId = req.businessProfileId;
     const { response } = req.body;
     if (!response?.trim()) return res.status(400).json({ message: 'Response text required' });
-    const review = await svc.prisma.businessReview.update({
-        where: { id: req.params.id },
+    const updated = await svc.prisma.businessReview.updateMany({
+        where: { id: req.params.id, businessProfileId: bpId },
         data: { businessResponse: response.trim(), businessResponseAt: new Date() },
+    });
+    if (updated.count === 0) return res.status(404).json({ message: 'Review not found' });
+    const review = await svc.prisma.businessReview.findFirst({
+        where: { id: req.params.id, businessProfileId: bpId },
     });
     res.json({ data: review });
 }));
 
 // ── Reviews: flag/dispute ──────────────────────────────────────────────────────
 router.post('/marketing/reviews/:id/flag', requirePermission('marketing.publish'), wrap(async (req, res) => {
+    const svc = getServices(req); // r34 fix — handler used svc without declaring it (ReferenceError on every call)
     const { reason } = req.body;
     const bpId = req.businessProfileId;
     // Write an audit log entry for admin review
@@ -3397,6 +3731,7 @@ router.post('/marketing/reviews/:id/flag', requirePermission('marketing.publish'
 // ── Followers broadcast ────────────────────────────────────────────────────────
 // GET /api/business-os/marketing/broadcast/history — list past broadcasts
 router.get('/marketing/broadcast/history', requirePermission('marketing.view'), wrap(async (req, res) => {
+    const svc = getServices(req); // r34 fix — handler used svc without declaring it (ReferenceError on every call)
     const bpId = req.businessProfileId;
     const page = parseInt(req.query.page) || 1;
     const limit = parseInt(req.query.limit) || 20;
@@ -3437,6 +3772,7 @@ router.get('/marketing/broadcast/history', requirePermission('marketing.view'), 
 }));
 
 router.post('/marketing/broadcast', requirePermission('marketing.publish'), wrap(async (req, res) => {
+    const svc = getServices(req); // r34 fix — handler used svc without declaring it (ReferenceError on every call)
     const bpId = req.businessProfileId;
     const { message, title } = req.body;
     if (!message?.trim()) return res.status(400).json({ message: 'Message required' });
@@ -3476,6 +3812,7 @@ router.post('/marketing/broadcast', requirePermission('marketing.publish'), wrap
 
 // ── Follower stats ─────────────────────────────────────────────────────────────
 router.get('/marketing/followers', requirePermission('marketing.view'), wrap(async (req, res) => {
+    const svc = getServices(req); // r34 fix — handler used svc without declaring it (ReferenceError on every call)
     const bpId = req.businessProfileId;
     const [total, recent] = await Promise.all([
         svc.prisma.businessFollower.count({ where: { businessProfileId: bpId } }),
@@ -3486,6 +3823,7 @@ router.get('/marketing/followers', requirePermission('marketing.view'), wrap(asy
 
 // ── Analytics: customer + operational ─────────────────────────────────────────
 router.get('/analytics/customer', requirePermission('analytics.view'), wrap(async (req, res) => {
+    const svc = getServices(req); // r34 fix — handler used svc without declaring it (ReferenceError on every call)
     const bpId = req.businessProfileId;
     const { startDate, endDate } = req.query;
     const dateFilter = startDate && endDate ? { gte: new Date(startDate), lte: new Date(endDate) } : undefined;
@@ -3506,6 +3844,7 @@ router.get('/analytics/customer', requirePermission('analytics.view'), wrap(asyn
 }));
 
 router.get('/analytics/operational', requirePermission('analytics.view'), wrap(async (req, res) => {
+    const svc = getServices(req); // r34 fix — handler used svc without declaring it (ReferenceError on every call)
     const bpId = req.businessProfileId;
     const [kitchenOrders, housekeepingTasks, trips] = await Promise.all([
         svc.prisma.kitchenOrder.findMany({ where: { businessProfileId: bpId }, select: { sentAt: true, servedAt: true, status: true }, take: 500, orderBy: { sentAt: 'desc' } }),

@@ -63,7 +63,9 @@ describe('HotelOpsService business scoping', () => {
             user: { findUnique: jest.fn().mockResolvedValue({ id: 42, azamanId: 'AZM-123456789' }) },
             $transaction: jest.fn(async (callback) => callback({
                 reservation: { create: jest.fn().mockResolvedValue({ id: 'reservation-a' }) },
-                hotelRoom: { update: jest.fn().mockResolvedValue({}) },
+                // r34: the occupancy claim is a conditional updateMany
+                // (AVAILABLE -> OCCUPIED); the loser's claim matches 0 rows.
+                hotelRoom: { updateMany: jest.fn().mockResolvedValue({ count: 1 }) },
             })),
         };
         const svc = new HotelOpsService(prisma);
@@ -88,7 +90,8 @@ describe('HotelOpsService business scoping', () => {
     test('rolls back a walk-in reservation when room occupancy update fails', async () => {
         const tx = {
             reservation: { create: jest.fn().mockResolvedValue({ id: 'reservation-a' }) },
-            hotelRoom: { update: jest.fn().mockRejectedValue(new Error('room update failed')) },
+            // r34: the conditional claim fails -> the whole booking rolls back.
+            hotelRoom: { updateMany: jest.fn().mockRejectedValue(new Error('room update failed')) },
         };
         const prisma = {
             hotelRoom: { findFirst: jest.fn().mockResolvedValue({ id: 'room-a', status: 'AVAILABLE', basePriceUsdc: 100 }) },

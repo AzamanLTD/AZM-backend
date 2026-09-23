@@ -21,6 +21,25 @@ const MAX_ECONOMIC_MAGNITUDE = new Prisma.Decimal('1000000000000'); // 1e12
 const MAX_ECONOMIC_DP = 8;
 const DECIMAL_STRING = /^-?\d+(?:\.\d+)?$/;
 
+// §r34 — POSTING-UNIT CONTRACT. The ledger (BusinessLedgerEntry.amount /
+// amountGhs) is Decimal(20, 8): its smallest representable unit is
+// GHS 0.00000001. The exact product of two ≤8dp operands can carry up to 16
+// decimal places, so the ledger CAN silently round a non-zero total to zero
+// (e.g. 0.00000001 × 0.00000001 = 0.0000000000000001). That would record a
+// real economic event as a zero posting — unacceptable. The documented
+// contract is therefore:
+//   • an exact total of EXACTLY ZERO (zero-cost restock) is fine — the
+//     zero posting is the truth;
+//   • a NON-ZERO exact total smaller than LEDGER_UNIT is REJECTED
+//     (RESTOCK_TOTAL_UNREPRESENTABLE) — fail closed instead of rounding
+//     real economics away to zero;
+//   • a non-zero total ≥ LEDGER_UNIT is accepted and posted as the exact
+//     product rounded half-away-from-zero to 8dp (the database's NUMERIC
+//     semantics); the FULL exact product is preserved in the ledger row's
+//     metadata (totalCostGhs exact string + postedAmountGhs) and in the
+//     response, so the rounding is always explicit, never silent.
+const LEDGER_UNIT = new Prisma.Decimal('0.00000001');
+
 // Fixed-notation exact string for durable evidence (decimal.js falls back
 // to exponential notation for very small magnitudes, which is unreadable in
 // an audit trail).
@@ -121,6 +140,21 @@ class InventoryRestockService {
                 const totalCostGhs = unitCost.mul(qty); // exact decimal product
                 if (totalCostGhs.greaterThan(MAX_ECONOMIC_MAGNITUDE))
                     throw restockError('RESTOCK_INVALID_COST', 'Restock cost is invalid.');
+                // §r34 posting-unit contract (see LEDGER_UNIT above): a
+                // non-zero exact total below the ledger's representable unit
+                // is rejected outright — it must never become a silent
+                // zero-amount financial posting.
+                if (!totalCostGhs.isZero() && totalCostGhs.lessThan(LEDGER_UNIT)) {
+                    throw restockError(
+                        'RESTOCK_TOTAL_UNREPRESENTABLE',
+                        'Exact restock total (' + exactString(totalCostGhs) + ' GHS) is smaller than the ledger\u2019s smallest representable unit (GHS 0.00000001); it would round to a zero financial posting. Increase quantity or unit cost.',
+                    );
+                }
+                // The ledger column stores the exact product rounded to 8dp
+                // (NUMERIC half-away-from-zero); metadata keeps BOTH the
+                // exact product and the 8dp posted amount so the rounding is
+                // explicit, durable evidence rather than silent data loss.
+                const postedAmountGhs = totalCostGhs.toDecimalPlaces(MAX_ECONOMIC_DP);
                 const updated = await tx.inventoryItem.update({
                     where: { id: item.id },
                     data: { currentStock: { increment: qty }, costPerUnit: unitCost },
@@ -138,6 +172,7 @@ class InventoryRestockService {
                             inventoryItemId: item.id, operationId: operation.id,
                             quantity: exactString(qty), unitCost: exactString(unitCost),
                             totalCostGhs: exactString(totalCostGhs),
+                            postedAmountGhs: exactString(postedAmountGhs),
                         },
                     },
                 });

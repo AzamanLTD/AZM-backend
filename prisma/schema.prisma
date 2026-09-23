@@ -5464,6 +5464,17 @@ model InventoryRestockOperation {
   createdAt          DateTime @default(now())
 
   businessProfile BusinessProfile @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+  // r34 — DURABILITY CONTRACT: this operation is a PERMANENT idempotency
+  // claim ("an old idempotency key must never execute again"). It CASCADES
+  // on item deletion purely as a referential-integrity backstop; the
+  // application lifecycle NEVER hard-deletes inventory items — they are
+  // soft-retired via isActive=false (no delete route exists for
+  // InventoryItem anywhere in routes/, services/, controllers/, workers/),
+  // and a soft-retired item's committed restock claims remain replayable.
+  // Any future feature that introduces a hard-delete path for inventory
+  // items MUST first sever this cascade (e.g. SetNull + nullable itemId, or
+  // an archival table) — silently cascading away idempotency claims would
+  // resurrect settled restocks as re-executable mutations.
   item            InventoryItem   @relation(fields: [itemId], references: [id], onDelete: Cascade)
 
   @@unique([businessProfileId, idempotencyKey])

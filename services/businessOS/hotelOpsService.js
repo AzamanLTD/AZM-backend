@@ -45,15 +45,60 @@ class HotelOpsService {
         });
     }
 
+    // r34/F — ROOM-STATUS AUTHORITY. The status mutation is a competing
+    // authority against moveRoom / createWalkIn / housekeeping, so it must
+    // never corrupt the occupancy projection ({ currentReservationId,
+    // status, checkedInAt, checkoutDueAt }) under concurrency:
+    //   • the mutation carries the tenant predicate itself (conditional
+    //     updateMany on { id, businessProfileId }) — a pre-read no longer
+    //     doubles as authorization;
+    //   • a room currently held by a reservation (currentReservationId set)
+    //     can never be flipped to AVAILABLE by a bare status edit —
+    //     availability is the checkout/move flows' exclusive transition,
+    //     and OCCUPIED without a holding reservation cannot be fabricated
+    //     here either (both would desync the occupancy projection);
+    //   • the update is CAS'd on the occupancy state observed by the read
+    //     (currentReservationId): if a concurrent check-in/move/checkout
+    //     changed it between read and write, count === 0, the loop re-reads
+    //     committed truth and re-validates instead of overwriting blindly.
     async updateRoomStatus(roomId, status, notes, businessProfileId) {
         if (!businessProfileId) throw new Error('Business profile context is required.');
-        const room = await this.prisma.hotelRoom.findFirst({ where: { id: roomId, businessProfileId }, select: { id: true } });
-        if (!room) throw new Error('Room not found.');
+        const VALID_STATUSES = ['AVAILABLE', 'OCCUPIED', 'DIRTY', 'CLEANING', 'MAINTENANCE', 'RESERVED'];
+        if (!VALID_STATUSES.includes(status)) throw new Error('Invalid room status.');
 
-        return this.prisma.hotelRoom.update({
-            where: { id: roomId },
-            data: { status, notes },
-        });
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+            const room = await this.prisma.hotelRoom.findFirst({
+                where: { id: roomId, businessProfileId },
+                select: { id: true, status: true, currentReservationId: true },
+            });
+            if (!room) throw new Error('Room not found.');
+
+            // Occupancy integrity: while a reservation holds the room, the
+            // status authority may not claim it is AVAILABLE; when no
+            // reservation holds it, it may not claim OCCUPIED.
+            if (room.currentReservationId && status === 'AVAILABLE') {
+                throw new Error('Room is held by a checked-in reservation — release it through checkout or a room move before marking it available.');
+            }
+            if (!room.currentReservationId && status === 'OCCUPIED') {
+                throw new Error('Room has no checked-in reservation — OCCUPIED is set exclusively by check-in, walk-in, and room moves.');
+            }
+
+            const claimed = await this.prisma.hotelRoom.updateMany({
+                where: {
+                    id: roomId,
+                    businessProfileId,
+                    currentReservationId: room.currentReservationId,
+                },
+                data: { status, notes },
+            });
+            if (claimed.count === 1) {
+                return this.prisma.hotelRoom.findFirst({ where: { id: roomId, businessProfileId } });
+            }
+            // count === 0: the occupancy state changed under us — retry
+            // against committed truth; the loop's re-read re-validates the
+            // integrity rules on the fresh state.
+        }
+        throw new Error('Room state changed concurrently; retry the status update.');
     }
 
     async getRoomRack(businessProfileId, date) {
@@ -139,9 +184,13 @@ class HotelOpsService {
             },
         });
 
-        // Set room to CLEANING
-        await this.prisma.hotelRoom.update({
-            where: { id: room.id },
+        // r34/F — set the room to CLEANING only when it is genuinely free
+        // (no holding reservation): a blind update here could clobber an
+        // OCCUPIED room if a guest re-checked-in/was moved into it while the
+        // checkout clean was being generated. The task is created either way;
+        // only the room projection stays truthful.
+        await this.prisma.hotelRoom.updateMany({
+            where: { id: room.id, businessProfileId, currentReservationId: null },
             data: { status: 'CLEANING' },
         });
 
@@ -218,9 +267,13 @@ class HotelOpsService {
             },
         });
 
-        // Set room back to AVAILABLE
-        await this.prisma.hotelRoom.update({
-            where: { id: room.id },
+        // r34/F — CLEANING→AVAILABLE is a CONDITIONAL transition: if the
+        // room was re-occupied (walk-in/move) or re-blocked while housekeeping
+        // ran, the task completes but the room is NOT forced AVAILABLE — a
+        // bare update here used to be able to mark a currently-occupied room
+        // as available, silently desyncing the occupancy projection.
+        await this.prisma.hotelRoom.updateMany({
+            where: { id: room.id, businessProfileId, status: 'CLEANING', currentReservationId: null },
             data: { status: 'AVAILABLE' },
         });
 
@@ -468,6 +521,11 @@ HotelOpsService.prototype.createWalkIn = async function(businessProfileId, { cus
     if (!room) throw new Error('Room not found');
     if (!customer) throw new Error('Customer not found.');
     if (room.status !== 'AVAILABLE') throw new Error('Room is not available');
+    // r34/F — the availability check above is only a friendly pre-read. The
+    // authoritative claim is the CONDITIONAL updateMany inside the
+    // transaction below ({ status: 'AVAILABLE' }): a concurrent walk-in or
+    // room move cannot double-book the room, because the loser's claim
+    // matches zero rows and rolls the whole booking back.
 
     const startDatetime = new Date();
     const endDatetime = new Date(startDatetime);
@@ -490,8 +548,11 @@ HotelOpsService.prototype.createWalkIn = async function(businessProfileId, { cus
             },
         });
 
-        await tx.hotelRoom.update({
-            where: { id: roomId },
+        // r34/F — the claim (not the pre-read) is the availability
+        // authority: exactly one racer can turn AVAILABLE→OCCUPIED; the
+        // loser rolls back its reservation with the claim.
+        const claim = await tx.hotelRoom.updateMany({
+            where: { id: roomId, businessProfileId, status: 'AVAILABLE' },
             data: {
                 status: 'OCCUPIED',
                 currentReservationId: reservation.id,
@@ -499,6 +560,7 @@ HotelOpsService.prototype.createWalkIn = async function(businessProfileId, { cus
                 checkoutDueAt: endDatetime,
             },
         });
+        if (claim.count === 0) throw new Error('Room is not available');
 
         return reservation;
     });
