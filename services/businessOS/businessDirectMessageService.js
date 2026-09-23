@@ -123,15 +123,39 @@ class BusinessDirectMessageService {
         };
     }
 
-    // Locate the exact BusinessConversation between a business and a
-    // participant user id.
+    // Locate the canonical BusinessConversation between a business and a
+    // customer. r36/P0: CUSTOMER_SUPPORT threads (created by this service)
+    // store the customer durably in participantB — the partial unique index
+    // on (businessProfileId, participantBId) WHERE channel='CUSTOMER_SUPPORT'
+    // makes one-thread-per-(business, customer) a DATABASE invariant. Legacy
+    // rows (channel NULL) are located without the discriminator.
     async _findConversation(businessProfileId, participantUserId) {
+        const canonical = await this.prisma.businessConversation.findFirst({
+            where: {
+                businessProfileId,
+                channel: 'CUSTOMER_SUPPORT',
+                participantBId: participantUserId,
+            },
+            orderBy: { createdAt: 'asc' },
+        });
+        if (canonical) return canonical;
         return this.prisma.businessConversation.findFirst({
             where: {
                 businessProfileId,
+                channel: null,
                 OR: [{ participantAId: participantUserId }, { participantBId: participantUserId }],
             },
+            orderBy: { createdAt: 'asc' },
         });
+    }
+
+    // Access rule for a support thread. r36/P0: business-side authority is
+    // STAFF-ONLY — a suspended/terminated employee is a former participantA
+    // without a staff context and loses all business-side access; the
+    // customer (participantB) is the only non-staff reader/writer.
+    _supportThreadAccess(conv, user, staff) {
+        if (staff) return true;
+        return conv.participantBId === user.id;
     }
 
     // GET /thread — two authority paths:
@@ -147,10 +171,13 @@ class BusinessDirectMessageService {
         if (!conv) return { messages: [] };
 
         const staff = await this._isStaffOf(user, bizId);
-        const isParticipant = conv.participantAId === user.id || conv.participantBId === user.id;
-        if (!staff && !isParticipant) {
-            // No authority over this business and not a participant: the
-            // thread simply does not exist for this caller.
+        const isSupportThread = conv.channel === 'CUSTOMER_SUPPORT';
+        const allowed = isSupportThread
+            ? this._supportThreadAccess(conv, user, staff)
+            : (staff || conv.participantAId === user.id || conv.participantBId === user.id);
+        if (!allowed) {
+            // No authority over this business and no durable participant slot:
+            // the thread simply does not exist for this caller.
             throw fail(403, 'FORBIDDEN', 'Not authorized to read this conversation.');
         }
 
@@ -179,10 +206,13 @@ class BusinessDirectMessageService {
 
         const staff = await this._isStaffOf(user, bizId);
         if (!staff) {
-            // Customer path: may only message inside an exact conversation
-            // they participate in. Cannot CREATE a BusinessConversation.
+            // Customer path: may only message inside the exact support
+            // conversation where the caller IS the durable customer
+            // (participantB). Cannot CREATE a BusinessConversation, cannot
+            // substitute another customer's id, and a former staff member
+            // (suspended/terminated) has no path back in.
             const conv = await this._findConversation(bizId, targetUserId);
-            if (!conv || (conv.participantAId !== user.id && conv.participantBId !== user.id)) {
+            if (!conv || !this._supportThreadAccess(conv, user, false)) {
                 throw fail(403, 'FORBIDDEN', 'Not authorized to message this business conversation.');
             }
             return this._appendMessage({ conv, senderId: user.id, content, viewerIsStaff: false });
@@ -207,15 +237,37 @@ class BusinessDirectMessageService {
                 const customer = await tx.user.findUnique({ where: { id: targetUserId }, select: { id: true } });
                 if (!customer) throw fail(404, 'USER_NOT_FOUND', 'Recipient not found.');
                 const conversation = await tx.conversation.create({ data: { type: 'BUSINESS' } });
-                existing = await tx.businessConversation.create({
-                    data: {
-                        businessProfileId: bizId,
-                        conversationId: conversation.id,
-                        participantAId: user.id, // the authenticated staff member
-                        participantBId: targetUserId, // the customer
-                        createdBy: user.id,
-                    },
-                });
+                try {
+                    existing = await tx.businessConversation.create({
+                        data: {
+                            businessProfileId: bizId,
+                            conversationId: conversation.id,
+                            participantAId: user.id, // the authenticated staff member
+                            participantBId: targetUserId, // the customer (durable slot)
+                            createdBy: user.id,
+                            // Canonical channel — the partial unique index on
+                            // (businessProfileId, participantBId) makes the
+                            // one-thread-per-(business, customer) invariant a
+                            // database constraint, not just a code path.
+                            channel: 'CUSTOMER_SUPPORT',
+                        },
+                    });
+                } catch (e) {
+                    if (e.code === 'P2002') {
+                        // Lost the create race: converge on the winner.
+                        existing = await tx.businessConversation.findFirst({
+                            where: {
+                                businessProfileId: bizId,
+                                channel: 'CUSTOMER_SUPPORT',
+                                participantBId: targetUserId,
+                            },
+                            orderBy: { createdAt: 'asc' },
+                        });
+                        if (!existing) throw e;
+                    } else {
+                        throw e;
+                    }
+                }
             }
             return existing;
         });

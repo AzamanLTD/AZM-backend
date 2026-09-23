@@ -118,6 +118,11 @@ enum TransactionType {
   // P2P overpayment freeze (Phase H11 idempotency lock — was missing from the
   // enum, which made every flagOverpayment insert fail on real Postgres)
   OVERPAYMENT_FREEZE
+  // r36: chat escrow ticket flows. The legacy conversation handlers wrote
+  // these TransactionType values but they were never part of the enum — every
+  // fund/release history insert failed on real Postgres (dead surface).
+  ESCROW_FUNDING
+  ESCROW_RELEASE
 }
 
 enum TransactionStatus {
@@ -167,6 +172,11 @@ enum MessageType {
   TICKET_LINK
   // B-1 (2026-06-28): sticker message support
   STICKER
+  // r36: money-in-chat message cards. The legacy handlers wrote these
+  // message types but they were never part of the enum — every attempt threw
+  // at Prisma validation (part of why the money surface was dead).
+  MONEY_REQUEST
+  ESCROW_TICKET
 }
 
 enum ColdStorageDirection {
@@ -1229,6 +1239,11 @@ model BusinessConversation {
   participantAId     Int // business owner or staff userId
   participantBId     Int // the other party's userId
   createdBy          Int // who initiated
+  // r36/P0: thread-kind discriminator. CUSTOMER_SUPPORT = the canonical
+  // one-thread-per-(business, customer) support rail (durable partial unique
+  // index in the business OS overlay); INTERNAL = staff↔staff conversations.
+  // NULL = legacy rows created before the discriminator existed.
+  channel            String?
   lastMessageAt      DateTime @default(now())
   lastMessagePreview String?  @db.VarChar(200)
 
@@ -2750,49 +2765,50 @@ model BusinessProfile {
 
   updatedAt DateTime @updatedAt
 
-  stories                 Story[]
-  storyAnalytics          StoryAnalytics[]
-  loyaltyPrograms         LoyaltyProgram[]
-  transitTrips            TransitTrip[]
-  followers               BusinessFollower[]
-  adPosts                 BusinessAdPost[]
-  taxPresets              BusinessTaxPreset[]
-  dineInTabs              DineInTab[]
-  penaltyPolicy           PenaltyPolicy?
-  showcase                BusinessShowcase[]
-  storefrontVersions      StorefrontVersion[]
+  stories                    Story[]
+  storyAnalytics             StoryAnalytics[]
+  loyaltyPrograms            LoyaltyProgram[]
+  transitTrips               TransitTrip[]
+  followers                  BusinessFollower[]
+  adPosts                    BusinessAdPost[]
+  taxPresets                 BusinessTaxPreset[]
+  dineInTabs                 DineInTab[]
+  penaltyPolicy              PenaltyPolicy?
+  showcase                   BusinessShowcase[]
+  storefrontVersions         StorefrontVersion[]
   // Business OS relations
-  employees               BusinessEmployee[]
-  businessConversations   BusinessConversation[]
-  suppliers               Supplier[]
-  purchaseOrders          PurchaseOrder[]
-  stockCounts             StockCount[]
-  shifts                  Shift[]
-  shiftSwaps              ShiftSwap[]
-  timeOffRequests         TimeOffRequest[]
-  payrollRecords          PayrollRecord[]
-  ledgerEntries           BusinessLedgerEntry[]
-  employeeFeedbacks       EmployeeFeedback[]
-  hotelRooms              HotelRoom[]
-  housekeepingTasks       HotelHousekeepingTask[]
-  housekeepingTemplates   HotelHousekeepingTemplate[]
-  hotelRateOverrides      HotelRateOverride[]
-  promotions              BusinessPromotion[]
-  recurringExpenses       RecurringExpenseTemplate[]
-  waitlistEntries         RestaurantWaitlistEntry[]
-  kitchenOrders           KitchenOrder[]
-  driverAssignments       DriverAssignment[]
-  orderTracking           OrderTracking[]
-  vehicleMaintenances     VehicleMaintenance[]
-  cargoParcelsSent        CargoParcel[]
-  routeTemplates          TransitRouteTemplate[]
-  inventoryItems          InventoryItem[]
+  employees                  BusinessEmployee[]
+  businessConversations      BusinessConversation[]
+  suppliers                  Supplier[]
+  purchaseOrders             PurchaseOrder[]
+  stockCounts                StockCount[]
+  payoutRequests             BusinessPayoutRequest[]
+  shifts                     Shift[]
+  shiftSwaps                 ShiftSwap[]
+  timeOffRequests            TimeOffRequest[]
+  payrollRecords             PayrollRecord[]
+  ledgerEntries              BusinessLedgerEntry[]
+  employeeFeedbacks          EmployeeFeedback[]
+  hotelRooms                 HotelRoom[]
+  housekeepingTasks          HotelHousekeepingTask[]
+  housekeepingTemplates      HotelHousekeepingTemplate[]
+  hotelRateOverrides         HotelRateOverride[]
+  promotions                 BusinessPromotion[]
+  recurringExpenses          RecurringExpenseTemplate[]
+  waitlistEntries            RestaurantWaitlistEntry[]
+  kitchenOrders              KitchenOrder[]
+  driverAssignments          DriverAssignment[]
+  orderTracking              OrderTracking[]
+  vehicleMaintenances        VehicleMaintenance[]
+  cargoParcelsSent           CargoParcel[]
+  routeTemplates             TransitRouteTemplate[]
+  inventoryItems             InventoryItem[]
   inventoryRestockOperations InventoryRestockOperation[]
-  notificationPreferences BusinessNotificationPreference?
-  apiKeys                 BusinessApiKey[]
-  webhooks                BusinessWebhook[]
-  messagingConfig         BusinessMessagingConfig?
-  messageLogs             BusinessMessageLog[]
+  notificationPreferences    BusinessNotificationPreference?
+  apiKeys                    BusinessApiKey[]
+  webhooks                   BusinessWebhook[]
+  messagingConfig            BusinessMessagingConfig?
+  messageLogs                BusinessMessageLog[]
 
   // Storefront SDUI
   storefrontLayouts         BusinessStorefrontLayout[]
@@ -3215,7 +3231,11 @@ model Supplier {
 model PurchaseOrder {
   id                String              @id @default(uuid())
   businessProfileId String
-  poNumber          String              @unique @db.VarChar(50)
+  // r36/P1: poNumber is a BUSINESS-LOCAL identifier (PO-00001, PO-00002...).
+  // Global uniqueness made two businesses collide on their first PO; the
+  // durable invariant is now uniqueness per business. Generation is a durable
+  // monotonic sequence (DocumentNumberSequence) — numbers are never reused.
+  poNumber          String              @db.VarChar(50)
   supplierId        String
   status            String              @default("DRAFT") // DRAFT, SUBMITTED, RECEIVED, CANCELLED
   totalCost         Decimal             @default(0) @db.Decimal(20, 8)
@@ -3229,6 +3249,7 @@ model PurchaseOrder {
   createdAt         DateTime            @default(now())
   updatedAt         DateTime            @updatedAt
 
+  @@unique([businessProfileId, poNumber])
   @@index([businessProfileId])
   @@index([supplierId])
   @@index([status])
@@ -3253,7 +3274,8 @@ model PurchaseOrderItem {
 model StockCount {
   id                String           @id @default(uuid())
   businessProfileId String
-  countNumber       String           @unique @db.VarChar(50)
+  // r36/P1: countNumber is a BUSINESS-LOCAL identifier; see PurchaseOrder.
+  countNumber       String           @db.VarChar(50)
   status            String           @default("OPEN") // OPEN, COUNTED, RECONCILED
   notes             String?          @db.VarChar(1000)
   createdById       Int
@@ -3263,6 +3285,7 @@ model StockCount {
   createdAt         DateTime         @default(now())
   updatedAt         DateTime         @updatedAt
 
+  @@unique([businessProfileId, countNumber])
   @@index([businessProfileId])
   @@index([status])
 }
@@ -3280,6 +3303,74 @@ model StockCountItem {
 
   @@index([stockCountId])
   @@index([productId])
+}
+
+// r36 — Durable document-number sequence for business-local identifiers.
+// One row per (business, docType). The increment is a single atomic
+// INSERT..ON CONFLICT DO UPDATE..RETURNING statement, so concurrent document
+// creation serializes on the row and numbers are monotonically increasing
+// without reuse (deleting a document never frees its number).
+model DocumentNumberSequence {
+  id                String @id @default(uuid())
+  businessProfileId String
+  docType           String // PURCHASE_ORDER | STOCK_COUNT
+  lastNumber        Int    @default(0)
+
+  @@unique([businessProfileId, docType])
+}
+
+// r36 — Honest payout contract: POST /finance/payout records a durable
+// PAYOUT REQUEST (status REQUESTED). No balance, ledger, settlement, or
+// external transfer mutation occurs merely because the endpoint was called.
+model BusinessPayoutRequest {
+  id                String          @id @default(uuid())
+  businessProfileId String
+  destinationId     String
+  amount            Decimal         @db.Decimal(20, 8)
+  status            String          @default("REQUESTED") // REQUESTED, PROCESSING, COMPLETED, FAILED
+  requestLogId      String? // the AuditLog row that recorded the request
+  requestedById     Int
+  businessProfile   BusinessProfile @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([businessProfileId])
+  @@index([status])
+}
+
+// r36/P0 — Canonical durable representation for conversation financial
+// messages. The amount used by acceptance/funding/release comes from this
+// structured record, NEVER from parsing message text. Counterparty identity
+// is derived from durable conversation membership at creation and stored
+// here; action handlers enforce authority with CAS predicates that include
+// the expected counterparty, conversation, kind, and state.
+//
+// State machine (status on this record is the authority; Message.status is
+// kept in lockstep for the client UI):
+//   MONEY_REQUEST:   sent → ACCEPTED | DECLINED          (terminal)
+//   ESCROW_TICKET:   sent → ESCROW_FUNDED → ESCROW_RELEASED   (terminal)
+//   ESCROW dispute:  sent | ESCROW_FUNDED → ESCROW_DISPUTED   (terminal)
+//   MONEY_SEND:      ACCEPTED immediately (generic peer transfer)
+model ConversationMoneyTicket {
+  id              String  @id @default(uuid())
+  messageId       String  @unique
+  conversationId  String
+  kind            String // MONEY_REQUEST | ESCROW_TICKET | MONEY_SEND
+  amount          Decimal @db.Decimal(20, 8)
+  currency        String  @default("GHS")
+  requesterId     Int // the financial message's sender
+  counterpartyId  Int // derived other participant (MONEY_SEND: the explicit recipient)
+  status          String  @default("sent")
+  resultMessageId String? // the outcome message (acceptance/release/etc.) — replay identity
+  clientRequestId String? @unique // durable idempotency for money-bearing sends
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([conversationId])
+  @@index([requesterId])
+  @@index([counterpartyId])
 }
 
 model BusinessOrder {
@@ -3306,6 +3397,10 @@ model BusinessOrder {
   idempotencyKey String?  @unique // client-supplied dedup key for offline sync
   cashReceived   Decimal? @db.Decimal(20, 8) // for CASH payments — actual cash tendered
   cashChange     Decimal? @db.Decimal(20, 8) // change given back
+  // r36/P1: durable marker that recipe inventory was deducted for this order.
+  // The deduction route claims it atomically; a retry or concurrent duplicate
+  // can never double-reduce stock.
+  inventoryDeductedAt DateTime?
 
   updatedAt DateTime @updatedAt
 
@@ -4256,14 +4351,14 @@ model SmartRouteRun {
   // migration affordance only — every run claimed after r19 carries the
   // full snapshot, and the (now narrow) legacy fallback paths read them
   // exactly like the pre-r19 executors did.
-  action            SmartRouteAction?
-  destMomoNumber    String?
-  destMomoProvider  String?
-  destFriendUserId  Int?
-  destSavingsGoalId String?
-  destVaultId       String?
-  frequency         SmartRouteFrequency?
-  dayOfMonth        Int?
+  action              SmartRouteAction?
+  destMomoNumber      String?
+  destMomoProvider    String?
+  destFriendUserId    Int?
+  destSavingsGoalId   String?
+  destVaultId         String?
+  frequency           SmartRouteFrequency?
+  dayOfMonth          Int?
   claimedOccurrenceAt DateTime?
 
   // r16 P0-A: durable economic execution identity. One unique key per due
@@ -5443,7 +5538,7 @@ model InventoryItem {
   createdAt         DateTime @default(now())
   updatedAt         DateTime @updatedAt
 
-  businessProfile   BusinessProfile    @relation(fields: [businessProfileId], references: [id])
+  businessProfile   BusinessProfile             @relation(fields: [businessProfileId], references: [id])
   recipeIngredients RecipeIngredient[]
   restockOperations InventoryRestockOperation[]
 

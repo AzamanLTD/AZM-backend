@@ -47,6 +47,8 @@ function getPrisma(req) {
 // adminBusinessScope validated it (req.adminBusinessScope is set there ONLY
 // for a genuine ADMIN + a real business id).
 const { resolveBusinessContext } = require('../middleware/requirePermission');
+const { nextDocumentNumber } = require('../services/businessOS/documentNumberService');
+const { audit } = require('../utils/audit');
 async function getBusinessProfileId(req) {
     if (!req.user?.id) throw new Error('Authentication required.');
     const prisma = getPrisma(req);
@@ -1052,48 +1054,75 @@ router.patch('/restaurant/tables/:id/status', requirePermission('restaurant.tabl
         return res.status(404).json({ success: false, message: 'Table not found' });
     }
 
-    // Find active (non-CLOSED) tab on this table
-    const activeTab = await prisma.dineInTab.findFirst({
-        where: { tableId: table.id, status: { not: 'CLOSED' } },
-        orderBy: { openedAt: 'desc' },
-    });
+    // r36/P1 — ONE AUTHORITATIVE TRANSACTION. The legacy read-modify-write
+    // (find active tab → update/create) had no transaction and no convergence
+    // rule: two concurrent PATCHes both saw "no active tab" and created two
+    // tabs on one table, and a racing close could interleave with an update.
+    // Now every status change is serialized per table by a row lock on
+    // BusinessTable, the active-tab lookup happens INSIDE the transaction,
+    // and the partial unique index (one non-CLOSED tab per table) is the
+    // database backstop: the losing creator converges on the winner's tab.
+    const finalStatus = await prisma.$transaction(async (tx) => {
+        await tx.$queryRawUnsafe('SELECT "id" FROM "BusinessTable" WHERE "id" = $1 FOR UPDATE', table.id);
 
-    if (status === 'OPEN') {
-        // If going back to OPEN, close any active tab
-        if (activeTab) {
-            await prisma.dineInTab.update({
-                where: { id: activeTab.id },
-                data: { status: 'CLOSED', closedAt: new Date() },
-            });
-        }
-    } else if (activeTab) {
-        // Update existing tab status
-        await prisma.dineInTab.update({
-            where: { id: activeTab.id },
-            data: { status },
+        const activeTab = await tx.dineInTab.findFirst({
+            where: { tableId: table.id, status: { not: 'CLOSED' } },
+            orderBy: { openedAt: 'desc' },
         });
-    } else {
-        // No active tab — create one with this status
-        // Find a guest customer or create a walk-in placeholder
-        const guestUser = await prisma.user.findFirst({
+
+        if (status === 'OPEN') {
+            // Going back to OPEN: close any active tab exactly once (idempotent
+            // for a racing duplicate — the second close finds no active tab).
+            if (activeTab) {
+                const closed = await tx.dineInTab.updateMany({
+                    where: { id: activeTab.id, status: { not: 'CLOSED' } },
+                    data: { status: 'CLOSED', closedAt: new Date() },
+                });
+                if (closed.count !== 1) throw new Error('Tab close lost the race — retry.');
+            }
+            return 'OPEN';
+        }
+        if (activeTab) {
+            await tx.dineInTab.update({ where: { id: activeTab.id }, data: { status } });
+            return status;
+        }
+        // No active tab — create one with this status. The guest walk-in
+        // customer must exist; it is resolved INSIDE the transaction.
+        const guestUser = await tx.user.findFirst({
             where: { email: 'guest-walkin@azaman.azm' },
             select: { id: true },
         });
         if (!guestUser) {
-            return res.status(400).json({ success: false, message: 'No active tab found and no guest user available. Open a tab first.' });
+            throw Object.assign(
+                new Error('No active tab found and no guest user available. Open a tab first.'),
+                { status: 400 }
+            );
         }
-        await prisma.dineInTab.create({
-            data: {
-                businessProfileId: bpId,
-                locationId: table.locationId,
-                tableId: table.id,
-                customerId: guestUser.id,
-                status,
-            },
-        });
-    }
+        try {
+            await tx.dineInTab.create({
+                data: {
+                    businessProfileId: bpId,
+                    locationId: table.locationId,
+                    tableId: table.id,
+                    customerId: guestUser.id,
+                    status,
+                },
+            });
+        } catch (e) {
+            if (e?.code !== 'P2002') throw e;
+            // Lost the create race to a concurrent writer that just opened a
+            // tab: converge on THEIR tab instead of forcing a second one.
+            const winner = await tx.dineInTab.findFirst({
+                where: { tableId: table.id, status: { not: 'CLOSED' } },
+                orderBy: { openedAt: 'desc' },
+            });
+            if (!winner) throw e;
+            await tx.dineInTab.update({ where: { id: winner.id }, data: { status } });
+        }
+        return status;
+    });
 
-    res.json({ success: true, tableId: table.id, status });
+    res.json({ success: true, tableId: table.id, status: finalStatus });
 }));
 
 // Menu Engineering (86'd items)
@@ -1846,7 +1875,18 @@ router.post('/restaurant/inventory/deduct/:orderId', requirePermission('restaura
         return res.status(409).json({ success: false, message: 'Recipe configuration is invalid for this business — deduction aborted' });
     }
     const deductions = [];
-    await prisma.$transaction(async (tx) => {
+    const result = await prisma.$transaction(async (tx) => {
+        // r36/P1 — DEDUCT-ONCE: the per-order claim is a conditional update on
+        // {id, businessProfileId, inventoryDeductedAt: null}. The winner is the
+        // sole deductor; a retry (claim lost) replays the ORIGINAL outcome
+        // without touching stock again, and concurrent duplicates converge.
+        const claim = await tx.businessOrder.updateMany({
+            where: { id: order.id, businessProfileId: bpId, inventoryDeductedAt: null },
+            data: { inventoryDeductedAt: new Date() },
+        });
+        if (claim.count !== 1) {
+            return { replay: true };
+        }
         for (const ri of order.product.recipeIngredients) {
             const deductQty = ri.quantityRequired * qty;
             // r34/D — mutation-level tenant predicate: the decrement only
@@ -1863,7 +1903,23 @@ router.post('/restaurant/inventory/deduct/:orderId', requirePermission('restaura
             }
             deductions.push({ ingredient: ri.inventoryItem.name, deducted: deductQty, unit: ri.inventoryItem.unit });
         }
+        return { replay: false };
     });
+    if (result.replay) {
+        // Honest replay: stock was already deducted for this order; report
+        // the SAME shape with the quantities the recipe implies — without
+        // reducing stock a second time.
+        return res.json({
+            success: true,
+            message: 'Inventory already deducted for this order',
+            deductions: order.product.recipeIngredients.map((ri) => ({
+                ingredient: ri.inventoryItem.name,
+                deducted: ri.quantityRequired * qty,
+                unit: ri.inventoryItem.unit,
+            })),
+            replay: true,
+        });
+    }
     res.json({ success: true, message: 'Inventory deducted', deductions });
 }));
 
@@ -3350,38 +3406,54 @@ router.post('/messages/conversations', wrap(async (req, res) => {
         return res.status(403).json({ success: false, message: 'Recipient must be an active employee' });
     }
 
-    // Check if conversation already exists
-    const existing = await prisma.businessConversation.findFirst({
-        where: {
-            businessProfileId: bpId,
-            OR: [
-                { participantAId: req.user.id, participantBId: parseInt(recipientUserId) },
-                { participantAId: parseInt(recipientUserId), participantBId: req.user.id },
-            ],
-        },
-    });
-    if (existing) return res.json({ success: true, conversation: existing, message: 'Already exists' });
+    // r36: canonical thread lookup + race-safe creation. The read/create pair
+    // is serialized per business with the same BusinessProfile row lock the
+    // direct-message rail uses, so two concurrent creates converge on one
+    // conversation. Staff↔staff threads are tagged channel=INTERNAL (the
+    // customer-support partial unique index does not apply to them).
+    const recipientId = parseInt(recipientUserId);
+    const outcome = await prisma.$transaction(async (tx) => {
+        await tx.$queryRawUnsafe('SELECT "id" FROM "BusinessProfile" WHERE "id" = $1 FOR UPDATE', bpId);
 
-    // Create Conversation + BusinessConversation
-    const conversation = await prisma.conversation.create({
-        data: { type: 'BUSINESS' },
+        const existing = await tx.businessConversation.findFirst({
+            where: {
+                businessProfileId: bpId,
+                channel: 'INTERNAL',
+                OR: [
+                    { participantAId: req.user.id, participantBId: recipientId },
+                    { participantAId: recipientId, participantBId: req.user.id },
+                ],
+            },
+            orderBy: { createdAt: 'asc' },
+            include: {
+                participantA: { select: { id: true, username: true, profilePictureUrl: true } },
+                participantB: { select: { id: true, username: true, profilePictureUrl: true } },
+            },
+        });
+        if (existing) return { conv: existing, created: false };
+
+        const conversation = await tx.conversation.create({ data: { type: 'BUSINESS' } });
+        return {
+            conv: await tx.businessConversation.create({
+                data: {
+                    businessProfileId: bpId,
+                    conversationId: conversation.id,
+                    participantAId: req.user.id,
+                    participantBId: recipientId,
+                    createdBy: req.user.id,
+                    channel: 'INTERNAL',
+                },
+                include: {
+                    participantA: { select: { id: true, username: true, profilePictureUrl: true } },
+                    participantB: { select: { id: true, username: true, profilePictureUrl: true } },
+                },
+            }),
+            created: true,
+        };
     });
 
-    const bizConv = await prisma.businessConversation.create({
-        data: {
-            businessProfileId: bpId,
-            conversationId: conversation.id,
-            participantAId: req.user.id,
-            participantBId: parseInt(recipientUserId),
-            createdBy: req.user.id,
-        },
-        include: {
-            participantA: { select: { id: true, username: true, profilePictureUrl: true } },
-            participantB: { select: { id: true, username: true, profilePictureUrl: true } },
-        },
-    });
-
-    res.status(201).json({ success: true, conversation: bizConv });
+    if (!outcome.created) return res.json({ success: true, conversation: outcome.conv, message: 'Already exists' });
+    res.status(201).json({ success: true, conversation: outcome.conv });
 }));
 
 // GET /api/business-os/messages/:conversationId — get messages for a conversation
@@ -4322,39 +4394,74 @@ router.get('/export', requirePermission('settings.manage'), wrap(async (req, res
 
 // ── Missing routes found by route-checker ──────────────────────────────────
 
-// GET /api/business-os/finance/payout — process a payout to a destination
+// POST /api/business-os/finance/payout — record a payout request
+// r36/P1 — HONEST CONTRACT: this endpoint previously called itself a payout
+// processor while only writing an audit log ("for now"). It now records a
+// DURABLE BusinessPayoutRequest (status REQUESTED) in one transaction with
+// the audit log, and the response says exactly what happened: a request was
+// recorded. No balance, ledger, settlement, or external transfer is mutated
+// merely because the endpoint was called.
 router.post('/finance/payout', requirePermission('settings.manage'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
-    const bpId = getBizProfileId(req);
+    const bpId = await getBusinessProfileId(req); // r36: the helper is async — getBizProfileId never existed
+    if (!bpId) return res.status(404).json({ success: false, message: 'No business profile found.' });
+
     const { amount, destination } = req.body;
+    const amt = typeof amount === 'string' ? Number(amount) : amount;
+    if (!amt || !Number.isFinite(amt) || amt <= 0 || amt > 1e9) {
+        return res.status(400).json({ success: false, message: 'Amount must be positive' });
+    }
+    if (!destination || typeof destination !== 'string') {
+        return res.status(400).json({ success: false, message: 'Destination required' });
+    }
 
-    if (!amount || amount <= 0) return res.status(400).json({ success: false, message: 'Amount must be positive' });
-    if (!destination) return res.status(400).json({ success: false, message: 'Destination required' });
-
-    // Look up the payout destination
+    // Look up the payout destination (user-scoped)
     const dest = await prisma.payoutDestination.findFirst({
         where: { id: destination, userId: req.user.id },
     });
     if (!dest) return res.status(404).json({ success: false, message: 'Payout destination not found' });
 
-    // For now, just log the payout request — actual transfer requires payment API integration
-    const log = await prisma.auditLog.create({
-        data: {
-            businessProfileId: bpId,
+    const request = await prisma.$transaction(async (tx) => {
+        // STRICT audit: the evidence row is part of the atomic request boundary
+        // (a failed audit write aborts the request record too).
+        const logId = await audit(tx, {
+            actorId: req.user.id,
+            actorName: req.user.username || null,
             action: 'PAYOUT_REQUESTED',
-            entity: 'Finance',
-            details: `Payout of ${amount} USDC to ${dest.nickname} (${dest.destinationType})`,
-            performedBy: req.user.id,
-        },
+            targetType: 'BUSINESS_PAYOUT_REQUEST',
+            targetId: bpId,
+            metadata: {
+                businessProfileId: bpId,
+                amountUsdc: amt,
+                destinationNickname: dest.nickname,
+                destinationType: dest.destinationType,
+            },
+        }, { throwOnError: true });
+        return tx.businessPayoutRequest.create({
+            data: {
+                businessProfileId: bpId,
+                destinationId: dest.id,
+                amount: amt,
+                status: 'REQUESTED',
+                requestLogId: logId,
+                requestedById: req.user.id,
+            },
+        });
     });
 
-    res.json({ success: true, message: 'Payout request submitted', payoutId: log.id });
+    res.json({
+        success: true,
+        message: 'Payout request recorded — no transfer has been made',
+        payoutId: request.id,
+        status: request.status,
+    });
 }));
 
 // PATCH /api/business-os/transit/vehicles/:id/status — update vehicle status
 router.patch('/transit/vehicles/:id/status', requirePermission('transit.fleet.manage'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
-    const bpId = getBizProfileId(req);
+    const bpId = await getBusinessProfileId(req); // r36: async helper — getBizProfileId never existed
+    if (!bpId) return res.status(404).json({ success: false, message: 'No business profile found.' });
     const { id } = req.params;
     const { status } = req.body;
 
@@ -4378,7 +4485,8 @@ router.patch('/transit/vehicles/:id/status', requirePermission('transit.fleet.ma
 // GET /api/business-os/transit/trips — list business transit trips
 router.get('/transit/trips', requirePermission('transit.trips.view'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
-    const bpId = getBizProfileId(req);
+    const bpId = await getBusinessProfileId(req); // r36: async helper — getBizProfileId never existed
+    if (!bpId) return res.status(404).json({ success: false, message: 'No business profile found.' });
 
     const trips = await prisma.transitTrip.findMany({
         where: { businessProfileId: bpId },
@@ -4497,9 +4605,6 @@ router.post('/retail/purchase-orders', requirePermission('retail.manage'), wrap(
         }
     }
 
-    // Generate PO number
-    const count = await prisma.purchaseOrder.count({ where: { businessProfileId: bpId } });
-    const poNumber = `PO-${String(count + 1).padStart(5, '0')}`;
 
     // Calculate totals
     const processedItems = items.map(item => ({
@@ -4512,19 +4617,26 @@ router.post('/retail/purchase-orders', requirePermission('retail.manage'), wrap(
     }));
     const totalCost = processedItems.reduce((sum, item) => sum + item.lineTotal, 0);
 
-    const po = await prisma.purchaseOrder.create({
-        data: {
-            businessProfileId: bpId,
-            poNumber,
-            supplierId,
-            status: 'SUBMITTED',
-            totalCost,
-            notes,
-            expectedDate: expectedDate ? new Date(expectedDate) : null,
-            createdById: req.user.id,
-            items: { create: processedItems },
-        },
-        include: { supplier: true, items: true },
+    // r36/P1: poNumber comes from the durable per-(business, docType)
+    // sequence INSIDE the creation transaction — concurrent creations get
+    // distinct numbers, numbers are never reused after deletion, and the
+    // composite unique index (businessProfileId, poNumber) is the backstop.
+    const po = await prisma.$transaction(async (tx) => {
+        const poNumber = await nextDocumentNumber(tx, bpId, 'PURCHASE_ORDER');
+        return tx.purchaseOrder.create({
+            data: {
+                businessProfileId: bpId,
+                poNumber,
+                supplierId,
+                status: 'SUBMITTED',
+                totalCost,
+                notes,
+                expectedDate: expectedDate ? new Date(expectedDate) : null,
+                createdById: req.user.id,
+                items: { create: processedItems },
+            },
+            include: { supplier: true, items: true },
+        });
     });
     res.json({ success: true, purchaseOrder: po });
 }));
@@ -4633,31 +4745,32 @@ router.post('/retail/stock-counts', requirePermission('retail.manage'), wrap(asy
 
     const { notes } = req.body;
 
-    // Generate count number
-    const count = await prisma.stockCount.count({ where: { businessProfileId: bpId } });
-    const countNumber = `SC-${String(count + 1).padStart(5, '0')}`;
-
     // Get all products that have stock tracking enabled
     const products = await prisma.businessProduct.findMany({
         where: { businessProfileId: bpId, isActive: true, stockQty: { not: null } },
         select: { id: true, stockQty: true, name: true, sku: true },
     });
 
-    const stockCount = await prisma.stockCount.create({
-        data: {
-            businessProfileId: bpId,
-            countNumber,
-            status: 'OPEN',
-            notes,
-            createdById: req.user.id,
-            items: {
-                create: products.map(p => ({
-                    productId: p.id,
-                    systemQty: p.stockQty || 0,
-                })),
+    // r36/P1: countNumber comes from the durable per-(business, docType)
+    // sequence INSIDE the creation transaction (see PurchaseOrder).
+    const stockCount = await prisma.$transaction(async (tx) => {
+        const countNumber = await nextDocumentNumber(tx, bpId, 'STOCK_COUNT');
+        return tx.stockCount.create({
+            data: {
+                businessProfileId: bpId,
+                countNumber,
+                status: 'OPEN',
+                notes,
+                createdById: req.user.id,
+                items: {
+                    create: products.map(p => ({
+                        productId: p.id,
+                        systemQty: p.stockQty || 0,
+                    })),
+                },
             },
-        },
-        include: { items: true },
+            include: { items: true },
+        });
     });
     res.json({ success: true, stockCount });
 }));
@@ -4712,13 +4825,25 @@ router.post('/retail/stock-counts/:id/reconcile', requirePermission('retail.mana
     await prisma.$transaction(async (tx) => {
         // Fresh items read INSIDE the transaction.
         const items = await tx.stockCountItem.findMany({ where: { stockCountId: id } });
+        // r36/P1: ALL-OR-NOTHING reconciliation. A product deleted after the
+        // count was opened previously made updateMany silently match 0 rows —
+        // the count then closed with PARTIAL stock application. Now every
+        // counted item must resolve to EXACTLY one business-scoped product
+        // write; a single mismatch throws and the whole transaction (and the
+        // status flip) rolls back — the count stays OPEN, stock stays intact.
         for (const item of items) {
             if (item.countedQty !== null && item.countedQty !== undefined) {
                 // Scoped to the effective business (defense in depth).
-                await tx.businessProduct.updateMany({
+                const applied = await tx.businessProduct.updateMany({
                     where: { id: item.productId, businessProfileId: bpId },
                     data: { stockQty: item.countedQty },
                 });
+                if (applied.count !== 1) {
+                    throw Object.assign(
+                        new Error('Product ' + item.productId + ' no longer belongs to this business — reconciliation aborted with no stock changes applied.'),
+                        { status: 400, code: 'PRODUCT_MISSING' }
+                    );
+                }
             }
         }
         const claimed = await tx.stockCount.updateMany({

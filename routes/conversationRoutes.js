@@ -12,6 +12,14 @@
 //   POST /:conversationId/messages/:messageId/fund-escrow
 //   POST /:conversationId/messages/:messageId/release-escrow
 //   POST /:conversationId/messages/:messageId/dispute-escrow
+//
+// r36/P0 — ALL financial behavior is delegated to the canonical
+// ConversationMoneyService: amounts come from a durable structured ticket
+// (never parsed from message text), the financial counterparty is derived
+// from durable conversation membership, and every transition is an atomic
+// conditional claim binding messageId to the URL conversationId. This file
+// is a thin adapter: participant verification, envelope preservation, and
+// broadcast wiring only.
 // =============================================================================
 
 const express = require('express');
@@ -19,10 +27,9 @@ const router = express.Router();
 const crypto = require('crypto');
 const logger = require('../src/config/logger');
 const { Prisma } = require('@prisma/client');
-const ledger = require('../services/ledgerService');
-const _exact = (n) => (n instanceof Prisma.Decimal ? n.toFixed(8) : Number(n).toFixed(8));
 const { protect } = require('../middleware/authMiddleware');
 const { protectActive } = require('../middleware/banGuardMiddleware');
+const { ConversationMoneyService } = require('../services/conversationMoneyService');
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -43,8 +50,10 @@ async function _verifyParticipant(prisma, conversationId, userId) {
     return { ok: true, conv };
 }
 
-// Format a message for the API response
-function _formatMessage(msg) {
+// Format a message for the API response. Financial messages are enriched with
+// their durable structured ticket — the fields the client contract pretends
+// existed are now backed by real data (additive: they were always null before).
+function _formatMessage(msg, ticket) {
     return {
         id: msg.id,
         conversationId: msg.conversationId,
@@ -52,14 +61,23 @@ function _formatMessage(msg) {
         senderName: msg.sender?.username || 'Unknown',
         text: msg.content,
         type: msg.messageType,
-        status: msg.status || 'sent',
+        status: ticket?.status || msg.status || 'sent',
         createdAt: msg.createdAt,
-        moneyAmount: msg.moneyAmount || null,
-        moneyDirection: msg.moneyDirection || null,
-        moneyStatus: msg.moneyStatus || null,
-        escrowTicket: msg.escrowTicket || null,
+        moneyAmount: ticket ? new Prisma.Decimal(ticket.amount).toFixed(2) : null,
+        moneyDirection: null,
+        moneyStatus: ticket ? ticket.status : null,
+        escrowTicket: ticket && ticket.kind === 'ESCROW_TICKET'
+            ? { amount: new Prisma.Decimal(ticket.amount).toFixed(2), currency: ticket.currency, status: ticket.status }
+            : null,
     };
 }
+
+const _getService = (req) => new ConversationMoneyService({
+    prisma: req.app.get('prisma'),
+    io: req.app.get('socketio'),
+    emitBalanceUpdate: req.app.get('emitBalanceUpdate'),
+    pushIfOffline: req.app.get('pushIfOffline'),
+});
 
 // ── Routes ───────────────────────────────────────────────────────────────────
 
@@ -87,9 +105,15 @@ router.get('/:conversationId/messages', protect, async (req, res) => {
             prisma.message.count({ where: { conversationId } })
         ]);
 
+        // Enrich financial messages with their durable structured tickets.
+        const tickets = await prisma.conversationMoneyTicket.findMany({
+            where: { messageId: { in: messages.map(m => m.id) } },
+        });
+        const ticketByMessage = new Map(tickets.map(t => [t.messageId, t]));
+
         res.json({
             success: true,
-            data: messages.map(_formatMessage),
+            data: messages.map(m => _formatMessage(m, ticketByMessage.get(m.id))),
             pagination: { page, limit, total, pages: Math.ceil(total / limit) }
         });
     } catch (err) {
@@ -102,38 +126,32 @@ router.get('/:conversationId/messages', protect, async (req, res) => {
 router.post('/:conversationId/messages', protectActive, async (req, res) => {
     try {
         const prisma = req.app.get('prisma');
-        const io = req.app.get('socketio');
-        const emitBalanceUpdate = req.app.get('emitBalanceUpdate');
-        const pushIfOffline = req.app.get('pushIfOffline');
         const { conversationId } = req.params;
         const userId = req.user.id;
-        const { type, text, moneyAmount, recipientId, fromUserId, currency, note, itemName, amount, counterpartyId, replyTo } = req.body;
+        const { type, text, replyTo } = req.body;
 
         const check = await _verifyParticipant(prisma, conversationId, userId);
         if (!check.ok) return res.status(check.status).json({ success: false, message: check.message });
         const { conv } = check;
 
-        let message;
+        // ── TEXT message ── (legacy behavior preserved)
+        if (type === 'TEXT' || type === undefined) {
+            if (!text || !text.trim()) {
+                return res.status(400).json({ success: false, message: 'Message text is required.' });
+            }
+            const message = await prisma.message.create({
+                data: {
+                    conversationId,
+                    senderId: userId,
+                    messageType: 'TEXT',
+                    content: text.trim(),
+                    replyToId: replyTo || null,
+                },
+                include: { sender: { select: { id: true, username: true } } }
+            });
 
-        switch (type) {
-            // ── TEXT message ──
-            case 'TEXT':
-            case undefined: {
-                if (!text || !text.trim()) {
-                    return res.status(400).json({ success: false, message: 'Message text is required.' });
-                }
-                message = await prisma.message.create({
-                    data: {
-                        conversationId,
-                        senderId: userId,
-                        messageType: 'TEXT',
-                        content: text.trim(),
-                        replyToId: replyTo || null,
-                    },
-                    include: { sender: { select: { id: true, username: true } } }
-                });
-
-                // Broadcast via Socket.IO
+            const io = req.app.get('socketio');
+            if (io) {
                 if (conv.type === 'PERSONAL') {
                     const other = conv.participants.find(p => p.id !== userId);
                     if (other) {
@@ -143,537 +161,82 @@ router.post('/:conversationId/messages', protectActive, async (req, res) => {
                 } else if (conv.type === 'GROUP') {
                     io.to(`group_${conversationId}`).emit('new_group_message', _formatMessage(message));
                 }
-                break;
             }
-
-            // ── MONEY_SEND ──
-            case 'MONEY_SEND': {
-                const receiverId = parseInt(recipientId);
-                const amt = parseFloat(moneyAmount);
-                if (!receiverId || isNaN(amt) || amt <= 0) {
-                    return res.status(400).json({ success: false, message: 'Valid recipientId and moneyAmount required.' });
-                }
-                if (userId === receiverId) {
-                    return res.status(400).json({ success: false, message: 'Cannot send money to yourself.' });
-                }
-
-                // Atomic transfer
-                const result = await prisma.$transaction(async (tx) => {
-                    const sender = await tx.user.findUnique({ where: { id: userId } });
-                    if (!sender) throw new Error('Sender not found.');
-                    if (sender.availableBalance < amt) {
-                        throw new Error(`Insufficient balance. Required: ${amt}, available: ${sender.availableBalance.toFixed(6)}.`);
-                    }
-                    const receiver = await tx.user.findUnique({ where: { id: receiverId } });
-                    if (!receiver) throw new Error('Receiver not found.');
-
-                    await tx.user.update({ where: { id: userId }, data: { availableBalance: { decrement: amt } } });
-                    await tx.user.update({ where: { id: receiverId }, data: { availableBalance: { increment: amt } } });
-
-                    // Upsert contacts
-                    await tx.contact.upsert({
-                        where: { userId_savedUserId: { userId, savedUserId: receiverId } },
-                        update: {}, create: { userId, savedUserId: receiverId }
-                    });
-                    await tx.contact.upsert({
-                        where: { userId_savedUserId: { userId: receiverId, savedUserId: userId } },
-                        update: {}, create: { userId: receiverId, savedUserId: userId }
-                    });
-
-                    const content = note ? `💸 Sent ${amt} ${currency || 'GHS'} — "${note}"` : `💸 Sent ${amt} ${currency || 'GHS'}`;
-                    const msg = await tx.message.create({
-                        data: {
-                            conversationId,
-                            senderId: userId,
-                            messageType: 'PAYMENT_TRANSFER',
-                            content,
-                        },
-                        include: { sender: { select: { id: true, username: true } } }
-                    });
-
-                    // §P.4 AUTHORITATIVE LEDGER — peer transfer, same
-                    // transaction, idempotent on the durable message row
-                    // created above in this same transaction:
-                    //   D user:{sender}:liability / C user:{receiver}:liability
-                    await ledger.post(tx, {
-                        idempotencyKey: `ledger:transfer:conv-send:${msg.id}`,
-                        entryType: 'TRANSFER',
-                        description: 'Chat money transfer — liability moved sender→receiver',
-                        userId,
-                        relatedEntity: 'message',
-                        relatedEntityId: msg.id,
-                        metadata: { transferType: 'CONVERSATION_SEND', receiverId, amount: _exact(amt) },
-                        lines: [
-                            { account: `user:${userId}:liability`, debit: _exact(amt) },
-                            { account: `user:${receiverId}:liability`, credit: _exact(amt) },
-                        ],
-                    });
-
-                    await tx.transactionHistory.create({
-                        data: { userId, type: 'INTERNAL_TRANSFER', amountUsdc: -amt, feeUsdc: 0, status: 'COMPLETED' }
-                    });
-                    await tx.transactionHistory.create({
-                        data: { userId: receiverId, type: 'INTERNAL_TRANSFER', amountUsdc: amt, feeUsdc: 0, status: 'COMPLETED' }
-                    });
-
-                    return { msg, sender, receiver };
-                });
-
-                message = result.msg;
-
-                // Post-commit: balance + socket + push
-                await emitBalanceUpdate(userId);
-                await emitBalanceUpdate(receiverId);
-                const hash = _personalRoomHash(userId, receiverId);
-                io.to(`personal_${hash}`).emit('new_personal_message', _formatMessage(message));
-                io.to(`user_${receiverId}`).emit('payment_received', {
-                    from: userId, amountUsdc: amt, conversationId, messageId: message.id
-                });
-                await pushIfOffline(receiverId, `💸 ${result.sender.username} sent you ${amt}`, note || `${amt} transferred to your account.`, {
-                    type: 'PAYMENT_TRANSFER', conversationId, route: `/chat/${conversationId}`
-                });
-                break;
-            }
-
-            // ── MONEY_REQUEST ──
-            case 'MONEY_REQUEST': {
-                const requesterId = userId;
-                const fromId = parseInt(fromUserId);
-                const amt = parseFloat(moneyAmount);
-                if (!fromId || isNaN(amt) || amt <= 0) {
-                    return res.status(400).json({ success: false, message: 'Valid fromUserId and moneyAmount required.' });
-                }
-
-                const content = `🤑 Requested ${amt} ${currency || 'GHS'}${note ? ` — "${note}"` : ''}`;
-                message = await prisma.message.create({
-                    data: {
-                        conversationId,
-                        senderId: requesterId,
-                        messageType: 'MONEY_REQUEST',
-                        content,
-                    },
-                    include: { sender: { select: { id: true, username: true } } }
-                });
-
-                // Broadcast
-                const other = conv.participants.find(p => p.id !== userId);
-                if (other) {
-                    const hash = _personalRoomHash(userId, other.id);
-                    io.to(`personal_${hash}`).emit('new_personal_message', _formatMessage(message));
-                    await pushIfOffline(other.id, `🤑 ${message.sender.username} requested ${amt}`, note || '', {
-                        type: 'MONEY_REQUEST', conversationId, messageId: message.id
-                    });
-                }
-                break;
-            }
-
-            // ── ESCROW_TICKET ──
-            case 'ESCROW_TICKET': {
-                const itemNameStr = itemName || 'Item';
-                const amt = parseFloat(amount);
-                if (!counterpartyId || isNaN(amt) || amt <= 0) {
-                    return res.status(400).json({ success: false, message: 'Valid itemName, amount, and counterpartyId required.' });
-                }
-
-                const content = `🛡️ Escrow: ${itemNameStr} — ${amt} ${currency || 'GHS'}`;
-                message = await prisma.message.create({
-                    data: {
-                        conversationId,
-                        senderId: userId,
-                        messageType: 'ESCROW_TICKET',
-                        content,
-                    },
-                    include: { sender: { select: { id: true, username: true } } }
-                });
-
-                // Broadcast
-                if (conv.type === 'PERSONAL') {
-                    const other = conv.participants.find(p => p.id !== userId);
-                    if (other) {
-                        const hash = _personalRoomHash(userId, other.id);
-                        io.to(`personal_${hash}`).emit('new_personal_message', _formatMessage(message));
-                    }
-                }
-                break;
-            }
-
-            default:
-                return res.status(400).json({ success: false, message: `Unknown message type: ${type}` });
+            return res.status(201).json({ success: true, data: _formatMessage(message) });
         }
 
-        res.status(201).json({ success: true, data: _formatMessage(message) });
+        // ── MONEY flows — canonical service authority ──
+        const service = _getService(req);
+        const result = await service.sendMoney({
+            user: req.user,
+            conv,
+            type,
+            moneyAmount: req.body.moneyAmount,
+            amount: req.body.amount,
+            recipientId: req.body.recipientId,
+            fromUserId: req.body.fromUserId,
+            currency: req.body.currency,
+            note: req.body.note,
+            itemName: req.body.itemName,
+            counterpartyId: req.body.counterpartyId,
+            clientRequestId: req.body.clientRequestId,
+        });
+
+        res.status(201).json({ success: true, data: _formatMessage(result.message, result.ticket) });
     } catch (err) {
         logger.error({ err }, '[conversationRoutes] POST message error');
-        res.status(400).json({ success: false, message: err.message || 'Server error.' });
+        const status = Number.isInteger(err.status) ? err.status : 400;
+        res.status(status).json({ success: false, message: err.message || 'Server error.' });
     }
 });
+
+// ── Financial actions — thin adapters over ConversationMoneyService ─────────
+// Every handler re-verifies participation, then delegates; the service binds
+// messageId to the URL conversationId in the claim predicate itself.
+
+const _action = (fn) => async (req, res) => {
+    try {
+        const prisma = req.app.get('prisma');
+        const { conversationId, messageId } = req.params;
+        const userId = req.user.id;
+
+        const check = await _verifyParticipant(prisma, conversationId, userId);
+        if (!check.ok) return res.status(check.status).json({ success: false, message: check.message });
+
+        const service = _getService(req);
+        const result = await fn(service, {
+            user: req.user,
+            conversationId,
+            messageId,
+            reason: req.body?.reason,
+        });
+
+        res.json({ success: true, data: _formatMessage(result.message, result.ticket) });
+    } catch (err) {
+        logger.error({ err }, `[conversationRoutes] ${fn.name} error`);
+        const status = Number.isInteger(err.status) ? err.status : 400;
+        res.status(status).json({ success: false, message: err.message || 'Server error.' });
+    }
+};
 
 // 3. Accept a money request
-router.post('/:conversationId/messages/:messageId/accept-money', protectActive, async (req, res) => {
-    try {
-        const prisma = req.app.get('prisma');
-        const io = req.app.get('socketio');
-        const emitBalanceUpdate = req.app.get('emitBalanceUpdate');
-        const { conversationId, messageId } = req.params;
-        const userId = req.user.id;
-
-        const check = await _verifyParticipant(prisma, conversationId, userId);
-        if (!check.ok) return res.status(check.status).json({ success: false, message: check.message });
-
-        // Find the money request message
-        const reqMsg = await prisma.message.findUnique({
-            where: { id: messageId },
-            include: { sender: { select: { id: true, username: true } } }
-        });
-        if (!reqMsg || reqMsg.messageType !== 'MONEY_REQUEST') {
-            return res.status(404).json({ success: false, message: 'Money request not found.' });
-        }
-        if (reqMsg.senderId === userId) {
-            return res.status(400).json({ success: false, message: 'Cannot accept your own request.' });
-        }
-
-        // Parse amount from content
-        const amountMatch = reqMsg.content.match(/(\d+(?:\.\d+)?)/);
-        if (!amountMatch) return res.status(400).json({ success: false, message: 'Could not parse request amount.' });
-        const amount = parseFloat(amountMatch[1]);
-
-        // Execute the transfer (accepter pays the requester)
-        const result = await prisma.$transaction(async (tx) => {
-            const payer = await tx.user.findUnique({ where: { id: userId } });
-            if (!payer) throw new Error('Payer not found.');
-            if (payer.availableBalance < amount) {
-                throw new Error(`Insufficient balance. Required: ${amount}, available: ${payer.availableBalance.toFixed(6)}.`);
-            }
-            const payee = await tx.user.findUnique({ where: { id: reqMsg.senderId } });
-            if (!payee) throw new Error('Requester not found.');
-
-            await tx.user.update({ where: { id: userId }, data: { availableBalance: { decrement: amount } } });
-            await tx.user.update({ where: { id: reqMsg.senderId }, data: { availableBalance: { increment: amount } } });
-            // §P.4 AUTHORITATIVE LEDGER — money-request acceptance, same
-            // transaction, idempotent on the durable request message row
-            // (the ACCEPTED status update above):
-            //   D user:{payer}:liability / C user:{payee}:liability
-            await ledger.post(tx, {
-                idempotencyKey: `ledger:transfer:money-request:${messageId}`,
-                entryType: 'TRANSFER',
-                description: 'Money request accepted — liability moved payer→payee',
-                userId,
-                relatedEntity: 'message',
-                relatedEntityId: messageId,
-                metadata: { transferType: 'MONEY_REQUEST_ACCEPT', payeeId: reqMsg.senderId, amount: _exact(amount) },
-                lines: [
-                    { account: `user:${userId}:liability`, debit: _exact(amount) },
-                    { account: `user:${reqMsg.senderId}:liability`, credit: _exact(amount) },
-                ],
-            });
-
-            // Update the request message to accepted
-            await tx.message.update({
-                where: { id: messageId },
-                data: { status: 'ACCEPTED' }
-            });
-
-            // Create acceptance message
-            const content = `✅ Accepted: ${amount} sent to ${reqMsg.sender.username}`;
-            const msg = await tx.message.create({
-                data: {
-                    conversationId,
-                    senderId: userId,
-                    messageType: 'PAYMENT_TRANSFER',
-                    content,
-                },
-                include: { sender: { select: { id: true, username: true } } }
-            });
-
-            await tx.transactionHistory.create({
-                data: { userId, type: 'INTERNAL_TRANSFER', amountUsdc: -amount, feeUsdc: 0, status: 'COMPLETED' }
-            });
-            await tx.transactionHistory.create({
-                data: { userId: reqMsg.senderId, type: 'INTERNAL_TRANSFER', amountUsdc: amount, feeUsdc: 0, status: 'COMPLETED' }
-            });
-
-            return { msg, payer, payee };
-        });
-
-        await emitBalanceUpdate(userId);
-        await emitBalanceUpdate(reqMsg.senderId);
-
-        const hash = _personalRoomHash(userId, reqMsg.senderId);
-        io.to(`personal_${hash}`).emit('new_personal_message', _formatMessage(result.msg));
-        io.to(`user_${reqMsg.senderId}`).emit('payment_received', {
-            from: userId, amountUsdc: amount, conversationId, messageId: result.msg.id
-        });
-
-        res.json({ success: true, data: _formatMessage(result.msg) });
-    } catch (err) {
-        logger.error({ err }, '[conversationRoutes] accept-money error');
-        res.status(400).json({ success: false, message: err.message });
-    }
-});
+router.post('/:conversationId/messages/:messageId/accept-money', protectActive,
+    _action((s, a) => s.acceptMoney(a)));
 
 // 4. Decline a money request
-router.post('/:conversationId/messages/:messageId/decline-money', protectActive, async (req, res) => {
-    try {
-        const prisma = req.app.get('prisma');
-        const io = req.app.get('socketio');
-        const { conversationId, messageId } = req.params;
-        const userId = req.user.id;
-
-        const check = await _verifyParticipant(prisma, conversationId, userId);
-        if (!check.ok) return res.status(check.status).json({ success: false, message: check.message });
-
-        const reqMsg = await prisma.message.findUnique({ where: { id: messageId } });
-        if (!reqMsg || reqMsg.messageType !== 'MONEY_REQUEST') {
-            return res.status(404).json({ success: false, message: 'Money request not found.' });
-        }
-        if (reqMsg.senderId === userId) {
-            return res.status(400).json({ success: false, message: 'Cannot decline your own request.' });
-        }
-
-        await prisma.message.update({
-            where: { id: messageId },
-            data: { status: 'DECLINED' }
-        });
-
-        const content = '❌ Money request declined';
-        const msg = await prisma.message.create({
-            data: { conversationId, senderId: userId, messageType: 'TEXT', content },
-            include: { sender: { select: { id: true, username: true } } }
-        });
-
-        const hash = _personalRoomHash(userId, reqMsg.senderId);
-        io.to(`personal_${hash}`).emit('new_personal_message', _formatMessage(msg));
-
-        res.json({ success: true, data: _formatMessage(msg) });
-    } catch (err) {
-        logger.error({ err }, '[conversationRoutes] decline-money error');
-        res.status(400).json({ success: false, message: err.message });
-    }
-});
+router.post('/:conversationId/messages/:messageId/decline-money', protectActive,
+    _action((s, a) => s.declineMoney(a)));
 
 // 5. Fund an escrow ticket
-router.post('/:conversationId/messages/:messageId/fund-escrow', protectActive, async (req, res) => {
-    try {
-        const prisma = req.app.get('prisma');
-        const io = req.app.get('socketio');
-        const emitBalanceUpdate = req.app.get('emitBalanceUpdate');
-        const { conversationId, messageId } = req.params;
-        const userId = req.user.id;
-
-        const check = await _verifyParticipant(prisma, conversationId, userId);
-        if (!check.ok) return res.status(check.status).json({ success: false, message: check.message });
-
-        const escrowMsg = await prisma.message.findUnique({ where: { id: messageId } });
-        if (!escrowMsg || escrowMsg.messageType !== 'ESCROW_TICKET') {
-            return res.status(404).json({ success: false, message: 'Escrow ticket not found.' });
-        }
-
-        // Parse amount from the escrow message
-        const amountMatch = escrowMsg.content.match(/(\d+(?:\.\d+)?)/);
-        if (!amountMatch) return res.status(400).json({ success: false, message: 'Could not parse escrow amount.' });
-        const amount = parseFloat(amountMatch[1]);
-
-        // Deduct from funder's balance and lock in escrow
-        const result = await prisma.$transaction(async (tx) => {
-            const funder = await tx.user.findUnique({ where: { id: userId } });
-            if (!funder) throw new Error('Funder not found.');
-            if (funder.availableBalance < amount) {
-                throw new Error(`Insufficient balance. Required: ${amount}, available: ${funder.availableBalance.toFixed(6)}.`);
-            }
-
-            await tx.user.update({
-                where: { id: userId },
-                data: { availableBalance: { decrement: amount } }
-            });
-
-            // Single-winner claim: only one funder can flip this ticket to
-            // ESCROW_FUNDED — a double-fund would debit the funder twice.
-            const fundClaim = await tx.message.updateMany({
-                where: { id: messageId, OR: [{ status: null }, { status: { not: 'ESCROW_FUNDED' } }] },
-                data: { status: 'ESCROW_FUNDED' }
-            });
-            if (fundClaim.count !== 1) {
-                throw new Error('ESCROW_ALREADY_FUNDED');
-            }
-
-            await tx.transactionHistory.create({
-                data: { userId, type: 'ESCROW_FUNDING', amountUsdc: -amount, feeUsdc: 0, status: 'PENDING' }
-            });
-
-            // §P.4 AUTHORITATIVE LEDGER — chat escrow lock, same transaction,
-            // idempotent on the ticket message's fund identity (the claim
-            // above is single-winner). Deliberately UNATTRIBUTED (no userId):
-            // the legacy chat escrow moves no user escrow projection column,
-            // so the pool must not be counted against any single user's
-            // escrowLockedBalance — the balance stays visible as an explicit
-            // platform liability to the ticket participants until release.
-            //   D user:{funder}:liability — available down
-            //   C escrow:chatmsg-{messageId}:locked — ticket pool up
-            await ledger.post(tx, {
-                idempotencyKey: `ledger:escrow:chat-fund:${messageId}`,
-                entryType: 'ESCROW_LOCK',
-                description: 'Chat escrow ticket funded — funds locked pending release',
-                relatedEntity: 'message',
-                relatedEntityId: messageId,
-                metadata: { funderId: userId, amount: _exact(amount) },
-                lines: [
-                    { account: `user:${userId}:liability`, debit: _exact(amount) },
-                    { account: `escrow:chatmsg-${messageId}:locked`, credit: _exact(amount) },
-                ],
-            });
-
-            return { funder };
-        });
-
-        await emitBalanceUpdate(userId);
-
-        const content = `🔒 Escrow funded: ${amount}`;
-        const msg = await prisma.message.create({
-            data: { conversationId, senderId: userId, messageType: 'TEXT', content },
-            include: { sender: { select: { id: true, username: true } } }
-        });
-
-        const other = check.conv.participants.find(p => p.id !== userId);
-        if (other) {
-            const hash = _personalRoomHash(userId, other.id);
-            io.to(`personal_${hash}`).emit('new_personal_message', _formatMessage(msg));
-        }
-
-        res.json({ success: true, data: _formatMessage(msg) });
-    } catch (err) {
-        logger.error({ err }, '[conversationRoutes] fund-escrow error');
-        res.status(400).json({ success: false, message: err.message });
-    }
-});
+router.post('/:conversationId/messages/:messageId/fund-escrow', protectActive,
+    _action((s, a) => s.fundEscrow(a)));
 
 // 6. Release escrow funds
-router.post('/:conversationId/messages/:messageId/release-escrow', protectActive, async (req, res) => {
-    try {
-        const prisma = req.app.get('prisma');
-        const io = req.app.get('socketio');
-        const emitBalanceUpdate = req.app.get('emitBalanceUpdate');
-        const { conversationId, messageId } = req.params;
-        const userId = req.user.id;
-
-        const check = await _verifyParticipant(prisma, conversationId, userId);
-        if (!check.ok) return res.status(check.status).json({ success: false, message: check.message });
-
-        const escrowMsg = await prisma.message.findUnique({ where: { id: messageId } });
-        if (!escrowMsg || escrowMsg.messageType !== 'ESCROW_TICKET') {
-            return res.status(404).json({ success: false, message: 'Escrow ticket not found.' });
-        }
-        if (escrowMsg.status !== 'ESCROW_FUNDED') {
-            return res.status(400).json({ success: false, message: 'Escrow is not funded.' });
-        }
-
-        // The original escrow creator's counterparty receives the funds
-        const amountMatch = escrowMsg.content.match(/(\d+(?:\.\d+)?)/);
-        if (!amountMatch) return res.status(400).json({ success: false, message: 'Could not parse escrow amount.' });
-        const amount = parseFloat(amountMatch[1]);
-
-        const recipient = check.conv.participants.find(p => p.id !== escrowMsg.senderId);
-        if (!recipient) return res.status(400).json({ success: false, message: 'Cannot determine recipient.' });
-
-        await prisma.$transaction(async (tx) => {
-            // Single-winner claim: only a FUNDED ticket can be released, and
-            // only once — a double release would credit the recipient twice.
-            const releaseClaim = await tx.message.updateMany({
-                where: { id: messageId, status: 'ESCROW_FUNDED' },
-                data: { status: 'ESCROW_RELEASED' }
-            });
-            if (releaseClaim.count !== 1) {
-                throw new Error('ESCROW_NOT_RELEASABLE');
-            }
-
-            await tx.user.update({
-                where: { id: recipient.id },
-                data: { availableBalance: { increment: amount } }
-            });
-
-            // §P.4 AUTHORITATIVE LEDGER — chat escrow release, same
-            // transaction, idempotent on the ticket's release identity (the
-            // claim above is single-winner; unattributed pool, see fund):
-            //   D escrow:chatmsg-{messageId}:locked — pool drained
-            //   C user:{recipient}:liability — recipient paid
-            await ledger.post(tx, {
-                idempotencyKey: `ledger:escrow:chat-release:${messageId}`,
-                entryType: 'ESCROW_RELEASE',
-                description: 'Chat escrow released — ticket pool paid to recipient',
-                relatedEntity: 'message',
-                relatedEntityId: messageId,
-                metadata: { recipientId: recipient.id, amount: _exact(amount) },
-                lines: [
-                    { account: `escrow:chatmsg-${messageId}:locked`, debit: _exact(amount) },
-                    { account: `user:${recipient.id}:liability`, credit: _exact(amount) },
-                ],
-            });
-            await tx.transactionHistory.create({
-                data: { userId: recipient.id, type: 'ESCROW_RELEASE', amountUsdc: amount, feeUsdc: 0, status: 'COMPLETED' }
-            });
-        });
-
-        await emitBalanceUpdate(recipient.id);
-
-        const content = `✅ Escrow released: ${amount} sent to ${recipient.username}`;
-        const msg = await prisma.message.create({
-            data: { conversationId, senderId: userId, messageType: 'TEXT', content },
-            include: { sender: { select: { id: true, username: true } } }
-        });
-
-        const hash = _personalRoomHash(userId, recipient.id);
-        io.to(`personal_${hash}`).emit('new_personal_message', _formatMessage(msg));
-
-        res.json({ success: true, data: _formatMessage(msg) });
-    } catch (err) {
-        logger.error({ err }, '[conversationRoutes] release-escrow error');
-        res.status(400).json({ success: false, message: err.message });
-    }
-});
+router.post('/:conversationId/messages/:messageId/release-escrow', protectActive,
+    _action((s, a) => s.releaseEscrow(a)));
 
 // 7. Dispute an escrow ticket
-router.post('/:conversationId/messages/:messageId/dispute-escrow', protectActive, async (req, res) => {
-    try {
-        const prisma = req.app.get('prisma');
-        const io = req.app.get('socketio');
-        const { conversationId, messageId } = req.params;
-        const userId = req.user.id;
-        const { reason } = req.body;
-
-        const check = await _verifyParticipant(prisma, conversationId, userId);
-        if (!check.ok) return res.status(check.status).json({ success: false, message: check.message });
-
-        const escrowMsg = await prisma.message.findUnique({ where: { id: messageId } });
-        if (!escrowMsg || escrowMsg.messageType !== 'ESCROW_TICKET') {
-            return res.status(404).json({ success: false, message: 'Escrow ticket not found.' });
-        }
-
-        await prisma.message.update({
-            where: { id: messageId },
-            data: { status: 'ESCROW_DISPUTED' }
-        });
-
-        const content = `⚠️ Escrow disputed: ${reason || 'No reason provided'}`;
-        const msg = await prisma.message.create({
-            data: { conversationId, senderId: userId, messageType: 'TEXT', content },
-            include: { sender: { select: { id: true, username: true } } }
-        });
-
-        const other = check.conv.participants.find(p => p.id !== userId);
-        if (other) {
-            const hash = _personalRoomHash(userId, other.id);
-            io.to(`personal_${hash}`).emit('new_personal_message', _formatMessage(msg));
-        }
-
-        // Notify admins
-        io.to('admin_spy_room').emit('escrow_disputed', {
-            conversationId, messageId, userId, reason: reason || 'No reason provided'
-        });
-
-        res.json({ success: true, data: _formatMessage(msg) });
-    } catch (err) {
-        logger.error({ err }, '[conversationRoutes] dispute-escrow error');
-        res.status(400).json({ success: false, message: err.message });
-    }
-});
+router.post('/:conversationId/messages/:messageId/dispute-escrow', protectActive,
+    _action((s, a) => s.disputeEscrow(a)));
 
 module.exports = router;

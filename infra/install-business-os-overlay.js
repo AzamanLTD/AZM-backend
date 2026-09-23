@@ -218,9 +218,17 @@ STATEMENTS.push('ALTER TABLE "BusinessOrder" ADD COLUMN IF NOT EXISTS "paymentMe
 STATEMENTS.push('ALTER TABLE "BusinessOrder" ADD COLUMN IF NOT EXISTS "idempotencyKey" TEXT;');
 STATEMENTS.push('ALTER TABLE "BusinessOrder" ADD COLUMN IF NOT EXISTS "cashReceived" DECIMAL(20,8);');
 STATEMENTS.push('ALTER TABLE "BusinessOrder" ADD COLUMN IF NOT EXISTS "cashChange" DECIMAL(20,8);');
+// r36/P1: durable per-order inventory-deduction claim marker.
+STATEMENTS.push('ALTER TABLE "BusinessOrder" ADD COLUMN IF NOT EXISTS "inventoryDeductedAt" TIMESTAMP(3);');
 STATEMENTS.push('CREATE UNIQUE INDEX IF NOT EXISTS "BusinessOrder_idempotencyKey_key" ON "BusinessOrder"("idempotencyKey") WHERE "idempotencyKey" IS NOT NULL;');
 
 // DineInTab payment method + idempotency
+// r36/P1: ONE ACTIVE TAB PER TABLE (durable invariant). A non-CLOSED tab
+// pins the table; concurrent status writers converge instead of creating a
+// second active tab. If legacy duplicate active tabs exist in production, this
+// creation is reported as an error line (deploy continues; the invariant is
+// then enforced at the transaction boundary instead).
+STATEMENTS.push('CREATE UNIQUE INDEX IF NOT EXISTS "DineInTab_active_tab_per_table_key" ON "DineInTab"("tableId") WHERE "status" <> $q$CLOSED$q$ AND "tableId" IS NOT NULL;');
 STATEMENTS.push('ALTER TABLE "DineInTab" ADD COLUMN IF NOT EXISTS "paymentMethod" VARCHAR(20);');
 STATEMENTS.push('ALTER TABLE "DineInTab" ADD COLUMN IF NOT EXISTS "idempotencyKey" TEXT;');
 STATEMENTS.push('ALTER TABLE "DineInTab" ADD COLUMN IF NOT EXISTS "cashReceived" DECIMAL(20,8);');
@@ -251,6 +259,13 @@ STATEMENTS.push(`CREATE TABLE IF NOT EXISTS "BusinessConversation" (
 STATEMENTS.push('CREATE INDEX IF NOT EXISTS "BusinessConversation_businessProfileId_idx" ON "BusinessConversation"("businessProfileId");');
 STATEMENTS.push('CREATE INDEX IF NOT EXISTS "BusinessConversation_participantAId_idx" ON "BusinessConversation"("participantAId");');
 STATEMENTS.push('CREATE INDEX IF NOT EXISTS "BusinessConversation_participantBId_idx" ON "BusinessConversation"("participantBId");');
+// r36/P0: thread-kind discriminator. Legacy rows keep NULL (unconstrained);
+// the canonical customer-support rail enforces ONE thread per
+// (business, customer) through a partial unique index — participantB is the
+// durable customer slot for CUSTOMER_SUPPORT threads (participantA is the
+// staff identity that created the thread).
+STATEMENTS.push('ALTER TABLE "BusinessConversation" ADD COLUMN IF NOT EXISTS "channel" VARCHAR(40);');
+STATEMENTS.push('CREATE UNIQUE INDEX IF NOT EXISTS "BusinessConversation_customer_support_key" ON "BusinessConversation"("businessProfileId", "participantBId") WHERE "channel" = $q$CUSTOMER_SUPPORT$q$;');
 
 // =============================================================================
 //  Execute all statements sequentially (autocommit — can't use $transaction
@@ -294,6 +309,35 @@ STATEMENTS.push(`DO $$ BEGIN
     END IF;
   END $$;`);
 
+
+// ── r36: Honest payout request record ────────────────────────────────────────
+STATEMENTS.push(`CREATE TABLE IF NOT EXISTS "BusinessPayoutRequest" (
+    "id" VARCHAR(36) NOT NULL,
+    "businessProfileId" VARCHAR(36) NOT NULL REFERENCES "BusinessProfile"("id") ON DELETE CASCADE,
+    "destinationId" VARCHAR(36) NOT NULL,
+    "amount" DECIMAL(20,8) NOT NULL,
+    "status" VARCHAR(20) NOT NULL DEFAULT 'REQUESTED',
+    "requestLogId" VARCHAR(36),
+    "requestedById" INTEGER NOT NULL,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT "BusinessPayoutRequest_pkey" PRIMARY KEY ("id")
+);`);
+STATEMENTS.push('CREATE INDEX IF NOT EXISTS "BusinessPayoutRequest_businessProfileId_idx" ON "BusinessPayoutRequest"("businessProfileId");');
+STATEMENTS.push('CREATE INDEX IF NOT EXISTS "BusinessPayoutRequest_status_idx" ON "BusinessPayoutRequest"("status");');
+
+// ── r36: Durable document-number sequence (business-local doc numbers) ──────
+STATEMENTS.push(`CREATE TABLE IF NOT EXISTS "DocumentNumberSequence" (
+    "id" VARCHAR(36) NOT NULL,
+    "businessProfileId" VARCHAR(36) NOT NULL,
+    "docType" VARCHAR(40) NOT NULL,
+    "lastNumber" INTEGER NOT NULL DEFAULT 0,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT "DocumentNumberSequence_pkey" PRIMARY KEY ("id")
+);`);
+STATEMENTS.push('CREATE UNIQUE INDEX IF NOT EXISTS "DocumentNumberSequence_businessProfileId_docType_key" ON "DocumentNumberSequence"("businessProfileId", "docType");');
+
 // ── Phase 3 Retail: PurchaseOrder ────────────────────────────────────────────
 STATEMENTS.push(`CREATE TABLE IF NOT EXISTS "PurchaseOrder" (
     "id" VARCHAR(36) NOT NULL,
@@ -310,7 +354,11 @@ STATEMENTS.push(`CREATE TABLE IF NOT EXISTS "PurchaseOrder" (
     "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT "PurchaseOrder_pkey" PRIMARY KEY ("id")
 );`);
-STATEMENTS.push('CREATE UNIQUE INDEX IF NOT EXISTS "PurchaseOrder_poNumber_key" ON "PurchaseOrder"("poNumber");');
+// r36/P1: poNumber is a business-local identifier — replace the global
+// unique index with a business-scoped one. The drop is idempotent; on a fresh
+// CI database db push has already created the composite index.
+STATEMENTS.push('DROP INDEX IF EXISTS "PurchaseOrder_poNumber_key";');
+STATEMENTS.push('CREATE UNIQUE INDEX IF NOT EXISTS "PurchaseOrder_businessProfileId_poNumber_key" ON "PurchaseOrder"("businessProfileId", "poNumber");');
 STATEMENTS.push('CREATE INDEX IF NOT EXISTS "PurchaseOrder_businessProfileId_idx" ON "PurchaseOrder"("businessProfileId");');
 STATEMENTS.push('CREATE INDEX IF NOT EXISTS "PurchaseOrder_supplierId_idx" ON "PurchaseOrder"("supplierId");');
 STATEMENTS.push('CREATE INDEX IF NOT EXISTS "PurchaseOrder_status_idx" ON "PurchaseOrder"("status");');
@@ -359,7 +407,9 @@ STATEMENTS.push(`CREATE TABLE IF NOT EXISTS "StockCount" (
     "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT "StockCount_pkey" PRIMARY KEY ("id")
 );`);
-STATEMENTS.push('CREATE UNIQUE INDEX IF NOT EXISTS "StockCount_countNumber_key" ON "StockCount"("countNumber");');
+// r36/P1: countNumber is a business-local identifier — business-scoped uniqueness.
+STATEMENTS.push('DROP INDEX IF EXISTS "StockCount_countNumber_key";');
+STATEMENTS.push('CREATE UNIQUE INDEX IF NOT EXISTS "StockCount_businessProfileId_countNumber_key" ON "StockCount"("businessProfileId", "countNumber");');
 STATEMENTS.push('CREATE INDEX IF NOT EXISTS "StockCount_businessProfileId_idx" ON "StockCount"("businessProfileId");');
 STATEMENTS.push('CREATE INDEX IF NOT EXISTS "StockCount_status_idx" ON "StockCount"("status");');
 STATEMENTS.push(`DO $$ BEGIN

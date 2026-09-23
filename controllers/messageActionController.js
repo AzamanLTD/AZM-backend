@@ -53,12 +53,24 @@ async function authorizeGroup(prisma, messageId, userId) {
 async function authorizeTrade(prisma, messageId, userId) {
     const msg = await prisma.message.findUnique({ where: { id: messageId } });
     if (!msg) return null;
-    // Check via trade participation
+    // r36 — the message must ALWAYS resolve through its owning context:
+    //   • tradeId set → the caller must be a participant in that trade;
+    //   • tradeId unset → the message lives in a conversation, and the caller
+    //     must be a participant in THAT conversation.
+    // The legacy code passed any tradeId-less message through to ANY caller —
+    // a message id was enough authority to pin/star it.
     if (msg.tradeId) {
         const trade = await prisma.trade.findUnique({ where: { id: msg.tradeId } });
         if (!trade) return null;
         if (trade.userId !== userId && trade.vendorId !== userId) return null;
+        return msg;
     }
+    const conv = await prisma.conversation.findUnique({
+        where: { id: msg.conversationId },
+        include: { participants: { select: { id: true } } },
+    });
+    if (!conv) return null;
+    if (!conv.participants.some((p) => p.id === userId)) return null;
     return msg;
 }
 
@@ -359,6 +371,48 @@ exports.getStarredMessages = async (req, res) => {
             }
         }
 
+        // r36 — Starred trade-context Messages. The star action could set
+        // isStarred on Message rows, but this list never queried them: a
+        // starred trade message silently vanished. Additive fix — rows are
+        // visible only to callers whose authority matches the r36
+        // authorizeTrade contract: a participant of the message's trade, or
+        // (for tradeId-less messages) a participant of its conversation.
+        const tradeStarred = await prisma.message.findMany({
+            where: {
+                AND: [
+                    { isStarred: true },
+                    { deletedAt: null },
+                    {
+                        OR: [
+                            { trade: { OR: [{ userId }, { vendorId: userId }] } },
+                            { conversation: { participants: { some: { id: userId } } } },
+                        ],
+                    },
+                ],
+            },
+            include: {
+                sender: { select: { id: true, username: true, displayName: true, profilePictureUrl: true } },
+            },
+            orderBy: { createdAt: 'desc' },
+            take: 100,
+        });
+
+        for (const msg of tradeStarred) {
+            results.push({
+                id: msg.id,
+                context: 'trade',
+                content: msg.editedContent || msg.content,
+                messageType: msg.messageType,
+                createdAt: msg.createdAt,
+                senderId: msg.senderId,
+                senderName: msg.sender?.displayName || msg.sender?.username || 'Unknown',
+                senderAvatar: msg.sender?.profilePictureUrl,
+                conversationId: msg.conversationId,
+                tradeId: msg.tradeId,
+                mediaUrl: msg.mediaUrl,
+            });
+        }
+
         // Sort by date desc
         results.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
 
@@ -490,10 +544,14 @@ exports.forwardMessage = async (req, res) => {
                 io.to(`group:${toConversationId}`).emit('group:message', forwardedMessage);
             }
         } else if (toContext === 'trade') {
-            // Verify trade participation
+            // r36 — EVERY destination requires participation. The legacy code
+            // only checked trade participation when the conversation had a
+            // trade; a conversation WITHOUT one (e.g. a personal
+            // conversation id) skipped the check entirely and let the caller
+            // write a message into ANY conversation by id.
             const conversation = await prisma.conversation.findUnique({
                 where: { id: toConversationId },
-                include: { trade: true },
+                include: { trade: true, participants: { select: { id: true } } },
             });
             if (!conversation) {
                 return res.status(404).json({ success: false, message: 'Target conversation not found' });
@@ -502,6 +560,11 @@ exports.forwardMessage = async (req, res) => {
             if (conversation.trade) {
                 if (conversation.trade.userId !== userId && conversation.trade.vendorId !== userId) {
                     return res.status(403).json({ success: false, message: 'Not a participant in target trade' });
+                }
+            } else {
+                const isParticipant = conversation.participants.some((p) => p.id === userId);
+                if (!isParticipant) {
+                    return res.status(403).json({ success: false, message: 'Not a participant in target conversation' });
                 }
             }
 

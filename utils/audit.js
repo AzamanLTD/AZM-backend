@@ -27,7 +27,7 @@ const logger = require('../src/config/logger');
 async function audit(prisma, payload, opts = {}) {
   const strict = opts && opts.throwOnError === true;
   try {
-    await prisma.auditLog.create({
+    const row = await prisma.auditLog.create({
       data: {
         actorId:    payload.actorId   ? Number(payload.actorId)   : null,
         actorName:  payload.actorName  || null,
@@ -38,6 +38,7 @@ async function audit(prisma, payload, opts = {}) {
         ipAddress:  payload.ipAddress  || null,
       },
     });
+    return row ? row.id : null;
   } catch (err) {
     logger.error('[AuditLog] Failed to write audit row:', err.message, payload);
     if (strict) throw err; // strict mode: the audit failure must abort the transaction
