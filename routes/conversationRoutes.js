@@ -147,6 +147,10 @@ router.post('/:conversationId/messages', protectActive, async (req, res) => {
         // ── E2EE message (r40): the server relays an opaque ciphertext
         // envelope and persists NO plaintext (docs/e2ee-protocol.md §8).
         if (req.body.e2ee) {
+            if (String(process.env.AZM_E2EE_ENABLED || '').toLowerCase() !== 'true') {
+                return res.status(503).json({ success: false, code: 'E2EE_NOT_AVAILABLE',
+                    message: 'E2EE is not yet available on this deployment.' });
+            }
             const envelope = req.body.e2ee;
             const INVALID = { success: false, message: 'Invalid E2EE envelope.' };
             if (!envelope || typeof envelope !== 'object'
@@ -157,6 +161,31 @@ router.post('/:conversationId/messages', protectActive, async (req, res) => {
                 || !envelope.h || typeof envelope.h !== 'object'
                 || typeof envelope.h.dh !== 'string') {
                 return res.status(400).json(INVALID);
+            }
+            // P1-E: the r40 protocol is PAIRWISE (one ratchet session per
+            // device pair). Only PERSONAL conversations — exactly two
+            // device-owning humans — can have a single envelope decryptable
+            // by the peer. TRADE/BUSINESS conversations involve additional
+            // parties or service identities with no registered devices, so
+            // an envelope cannot be end-to-end for every reader. Reject
+            // explicitly instead of advertising a capability that does not
+            // exist.
+            if (conv.type !== 'PERSONAL') {
+                return res.status(400).json({ success: false, code: 'E2EE_NOT_PAIRWISE',
+                    message: 'E2EE is only supported for personal (pairwise) conversations.' });
+            }
+            // P1-F: the authenticated API caller must OWN the cryptographic
+            // sender identity in the envelope. The server stays blind to
+            // plaintext, but the deviceId + identity key must belong to one
+            // of the caller's ACTIVE registered devices — a forged deviceId
+            // or mismatched identity key is rejected before persistence.
+            const senderDevice = await prisma.e2eeDevice.findFirst({
+                where: { userId, isActive: true, deviceId: envelope.deviceId },
+                orderBy: { updatedAt: 'desc' },
+            });
+            if (!senderDevice || senderDevice.identityPublicKey !== envelope.ik) {
+                return res.status(403).json({ success: false, code: 'E2EE_SENDER_IDENTITY_MISMATCH',
+                    message: 'E2EE envelope sender identity does not match an active registered device.' });
             }
             // Shape/size bounds only — the server cannot and must not inspect
             // the encrypted content.

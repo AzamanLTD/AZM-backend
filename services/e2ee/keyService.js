@@ -73,33 +73,82 @@ class E2EEKeyService {
             throw e2eeError('Signed prekey signature verification failed.', 400, 'E2EE_SPK_SIGNATURE_INVALID');
         }
 
-        return this.prisma.$transaction(async (tx) => {
-            const device = await tx.e2eeDevice.upsert({
-                where: { userId_deviceId: { userId, deviceId } },
-                create: {
-                    userId, deviceId, signingPublicKey, identityPublicKey,
-                    bindingSignature: identityBindingSignature,
-                    signedPreKeyId: signedPreKey.keyId,
-                    signedPreKeyPublicKey: signedPreKey.publicKey,
-                    signedPreKeySignature: signedPreKey.signature,
-                },
-                update: {
-                    signingPublicKey, identityPublicKey,
-                    bindingSignature: identityBindingSignature,
-                    signedPreKeyId: signedPreKey.keyId,
-                    signedPreKeyPublicKey: signedPreKey.publicKey,
-                    signedPreKeySignature: signedPreKey.signature,
-                },
-            });
-            // Re-registration replaces the device's pending one-time prekeys.
-            await tx.e2eeOneTimePreKey.deleteMany({ where: { userId, keyId: { in: otpks.map(k => k.keyId) } } });
-            if (otpks.length) {
-                await tx.e2eeOneTimePreKey.createMany({
-                    data: otpks.map(k => ({ userId, keyId: k.keyId, publicKey: k.publicKey })),
+        // Model A (P0-C): ONE ACTIVE DEVICE PER USER. Registration of a new
+        // deviceId atomically retires the previous active device AND consumes
+        // its pending one-time prekeys — a bundle can never mix material from
+        // two devices. The partial unique index (overlay) enforces the
+        // active-device invariant at the storage layer; a concurrent
+        // registration that loses the race is retried against the winner.
+        for (let attempt = 0; ; attempt++) {
+            try {
+                return await this.prisma.$transaction(async (tx) => {
+                    // 1. Retire every currently active device of this user.
+                    await tx.e2eeDevice.updateMany({
+                        where: { userId, isActive: true },
+                        data: { isActive: false },
+                    });
+                    // 2. Retire the old device's pending one-time prekeys:
+                    // their private halves live on the retired device.
+                    await tx.e2eeOneTimePreKey.updateMany({
+                        where: { userId, isUsed: false },
+                        data: { isUsed: true, usedAt: new Date() },
+                    });
+                    // 3. Activate (upsert) the registered device.
+                    const device = await tx.e2eeDevice.upsert({
+                        where: { userId_deviceId: { userId, deviceId } },
+                        create: {
+                            userId, deviceId, signingPublicKey, identityPublicKey,
+                            bindingSignature: identityBindingSignature,
+                            signedPreKeyId: signedPreKey.keyId,
+                            signedPreKeyPublicKey: signedPreKey.publicKey,
+                            signedPreKeySignature: signedPreKey.signature,
+                            isActive: true,
+                        },
+                        update: {
+                            signingPublicKey, identityPublicKey,
+                            bindingSignature: identityBindingSignature,
+                            signedPreKeyId: signedPreKey.keyId,
+                            signedPreKeyPublicKey: signedPreKey.publicKey,
+                            signedPreKeySignature: signedPreKey.signature,
+                            isActive: true,
+                        },
+                    });
+                    // 4. Seed the new device's one-time prekeys (immutable-
+                    // ID semantics: same key+same pubkey = idempotent skip,
+                    // different pubkey = conflict — never silent replacement).
+                    await this._upsertPreKeys(tx, userId, deviceId, otpks);
+                    return { deviceId: device.deviceId, registeredAt: device.updatedAt };
                 });
+            } catch (err) {
+                // Unique-index race on the one-active-device invariant: a
+                // concurrent registration committed first. Retry cleanly.
+                if ((err.code === 'P2002') && attempt < 3) continue;
+                throw err;
             }
-            return { deviceId: device.deviceId, registeredAt: device.updatedAt };
-        });
+        }
+    }
+
+    // P1-D: prekey IDs identify STABLE key material. Inserting a keyId that
+    // already exists with the same public key is idempotent (skip); the same
+    // keyId with a DIFFERENT public key is a typed conflict. Used/pending
+    // rows are never silently replaced.
+    async _upsertPreKeys(tx, userId, deviceId, otpks) {
+        for (const k of otpks) {
+            const existing = await tx.e2eeOneTimePreKey.findUnique({
+                where: { userId_keyId: { userId, keyId: k.keyId } },
+            });
+            if (!existing) {
+                await tx.e2eeOneTimePreKey.create({
+                    data: { userId, deviceId, keyId: k.keyId, publicKey: k.publicKey },
+                });
+            } else if (existing.publicKey !== k.publicKey) {
+                throw e2eeError(
+                    `One-time prekey ${k.keyId} already exists with different key material.`,
+                    409, 'E2EE_PREKEY_CONFLICT');
+            }
+            // Same publicKey for an existing keyId: idempotent no-op (the key
+            // may be claimed already; replacement is never allowed).
+        }
     }
 
     // Fetch a user's prekey bundle. Atomically claims one unused one-time
@@ -112,11 +161,15 @@ class E2EEKeyService {
         });
         if (!device) return null;
 
+        // P0-C: the one-time prekey is claimed from the SELECTED device only
+        // (deviceId binding). A user's bundle can never contain another
+        // device's prekey — the private half of the claimed key is guaranteed
+        // to live on the exact device whose bundle is returned.
         const claimed = await this.prisma.$queryRaw`
             UPDATE "E2EEOneTimePreKey" SET "isUsed" = true, "usedAt" = now()
             WHERE "id" = (
                 SELECT "id" FROM "E2EEOneTimePreKey"
-                WHERE "userId" = ${userId} AND "isUsed" = false
+                WHERE "userId" = ${userId} AND "deviceId" = ${device.deviceId} AND "isUsed" = false
                 ORDER BY "createdAt" ASC
                 FOR UPDATE SKIP LOCKED
                 LIMIT 1
@@ -137,13 +190,35 @@ class E2EEKeyService {
     }
 
     // Replenish one-time prekeys (public keys only, strictly bounded).
+    // P1-D: a keyId identifies stable material — same key + same public key is
+    // idempotent; the same keyId with a different public key is a 409
+    // conflict. Keys are device-scoped to the ACTIVE device. Concurrent
+    // replenishment cannot become last-writer-wins (no delete/recreate).
     async replenishOneTimePreKeys({ userId, oneTimePreKeys }) {
         const otpks = assertKeyIds(oneTimePreKeys, 'oneTimePreKeys');
-        await this.prisma.$transaction(async (tx) => {
-            await tx.e2eeOneTimePreKey.deleteMany({ where: { userId, keyId: { in: otpks.map(k => k.keyId) } } });
-            await tx.e2eeOneTimePreKey.createMany({ data: otpks.map(k => ({ userId, keyId: k.keyId, publicKey: k.publicKey })) });
+        const device = await this.prisma.e2eeDevice.findFirst({
+            where: { userId, isActive: true }, orderBy: { updatedAt: 'desc' },
         });
-        return { count: otpks.length };
+        if (!device) throw e2eeError('No active device. Register a device first.', 409, 'E2EE_NO_ACTIVE_DEVICE');
+        let inserted = 0;
+        await this.prisma.$transaction(async (tx) => {
+            for (const k of otpks) {
+                const existing = await tx.e2eeOneTimePreKey.findUnique({
+                    where: { userId_keyId: { userId, keyId: k.keyId } },
+                });
+                if (!existing) {
+                    await tx.e2eeOneTimePreKey.create({
+                        data: { userId, deviceId: device.deviceId, keyId: k.keyId, publicKey: k.publicKey },
+                    });
+                    inserted += 1;
+                } else if (existing.publicKey !== k.publicKey) {
+                    throw e2eeError(
+                        `One-time prekey ${k.keyId} already exists with different key material.`,
+                        409, 'E2EE_PREKEY_CONFLICT');
+                }
+            }
+        });
+        return { count: otpks.length, inserted };
     }
 
     async deactivateDevice({ userId, deviceId }) {

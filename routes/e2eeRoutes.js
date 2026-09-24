@@ -28,6 +28,24 @@ const logger = require('../src/config/logger');
 
 const service = (req) => new E2EEKeyService(req.app.get('prisma'));
 
+// P0-A (r40.1): the E2EE API surface is EXPLICITLY DISABLED until a real
+// client implementation exists (the backend protocol is complete and proven,
+// but no shipped client speaks it yet). Production must not advertise a
+// capability the product does not provide. Enable with AZM_E2EE_ENABLED=true
+// when the Flutter client (packages/e2ee_protocol) lands and passes shared
+// byte-level vectors against this backend.
+function e2eeEnabled() {
+    return String(process.env.AZM_E2EE_ENABLED || '').toLowerCase() === 'true';
+}
+
+function gate(req, res, next) {
+    if (!e2eeEnabled()) {
+        return res.status(503).json({ success: false, code: 'E2EE_NOT_AVAILABLE',
+            message: 'E2EE is not yet available on this deployment.' });
+    }
+    next();
+}
+
 function wrap(handler) {
     return async (req, res) => {
         try { await handler(req, res); }
@@ -40,6 +58,7 @@ function wrap(handler) {
 }
 
 router.use(protect);
+router.use(gate);
 
 // Register / rotate a device's public keys. Idempotent per deviceId.
 router.post('/devices', wrap(async (req, res) => {

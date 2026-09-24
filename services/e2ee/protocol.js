@@ -28,6 +28,17 @@ const AD_PREFIX = 'azaman-e2ee-v1';
 const BIND_PREFIX = 'azaman-e2ee-v1-device-bind';
 const SPK_PREFIX = 'azaman-e2ee-v1-spk';
 const MAX_SKIP = 1000;
+// P1-H: total skipped-message-key cache bound across ALL chains. Signal bounds
+// skipped key material globally, not just the per-chain skip distance: without
+// a total bound, an attacker can force unbounded retained key state by sending
+// many sparse headers. FIFO eviction once the cache is full.
+const MAX_SKIPPED_CACHE = 2000;
+// P0-B: canonical authenticated-header encoding. Every byte of the Double
+// Ratchet header { dh, pn, n } is bound into the AEAD associated data exactly
+// as the Signal specification requires (AD' = AD || header). The encoding is
+// ASCII, length-delimited by '|', and MUST be byte-identical in every client
+// implementation: `azaman-dr-v1|<dhB64>|<pn>|<n>`.
+const HEADER_PREFIX = 'azaman-dr-v1';
 
 let sodium = null;
 async function init() {
@@ -167,7 +178,16 @@ function aeadDecrypt(messageKey, nonce, ciphertext, associatedData) {
 
 // Session state (client-owned; JSON-serializable via serialize/parse).
 class DoubleRatchetSession {
-    constructor(state) { Object.assign(this, state); }
+    constructor(state) {
+        Object.assign(this, state);
+        // P1-H: skipped-message-key cache is an insertion-ordered Map (FIFO
+        // eviction at MAX_SKIPPED_CACHE entries). Plain objects preserve
+        // string-key insertion order too, but a Map makes the bound explicit
+        // and survives key deletion orderings cleanly.
+        if (!(this.skipped instanceof Map)) {
+            this.skipped = new Map(Object.entries(this.skipped || {}).map(([k, v]) => [k, v]));
+        }
+    }
 
     static async initiator(sharedKey, theirSignedPreKeyPublicKeyB64) {
         // RatchetInitAlice: a FRESH ratchet pair seeds the first sending chain
@@ -197,9 +217,9 @@ class DoubleRatchetSession {
 
     _trySkipped(headerKey, counter) {
         const key = `${headerKey.toString('base64')}:${counter}`;
-        if (Object.prototype.hasOwnProperty.call(this.skipped, key)) {
-            const mk = this.skipped[key];
-            delete this.skipped[key];
+        if (this.skipped.has(key)) {
+            const mk = this.skipped.get(key);
+            this.skipped.delete(key);
             return mk;
         }
         return null;
@@ -210,35 +230,51 @@ class DoubleRatchetSession {
         if (until + 1 - this.recvCount > MAX_SKIP) throw new Error('E2EE_TOO_MANY_SKIPPED');
         while (this.recvCount < until) {
             const { messageKey, chainKey } = kdfCk(this.receivingChainKey);
-            this.skipped[`${dhRemote.toString('base64')}:${this.recvCount}`] = messageKey;
+            const cacheKey = `${dhRemote.toString('base64')}:${this.recvCount}`;
+            if (this.skipped.size >= MAX_SKIPPED_CACHE) {
+                // FIFO eviction: the oldest retained key is dropped. Old
+                // messages beyond the cache bound become undecryptable —
+                // the documented cost of bounding untrusted state.
+                this.skipped.delete(this.skipped.keys().next().value);
+            }
+            this.skipped.set(cacheKey, messageKey);
             this.receivingChainKey = chainKey;
             this.recvCount += 1;
         }
     }
 
-    encrypt(plaintext, associatedData) {
+    encrypt(plaintext, context) {
+        // Transactional like decrypt() (P1-G): all state mutation happens on a
+        // TRIAL clone and commits only after the AEAD succeeds. An encryption
+        // failure therefore cannot consume ratchet state without producing a
+        // message — the same state-safety property decrypt() already has.
+        const trial = DoubleRatchetSession.parse(JSON.parse(JSON.stringify(this.serialize())));
+
         // First reply after receiving (sending chain not yet created): perform
         // the sending DH-step with a FRESH ratchet pair. The peer mirrors this
         // exact DH when it next receives a new header.dh from us — the two
         // KDF_RK applications (ours for CKs, theirs for CKr) consume the same
         // DH output and the same root key, so the chains are identical.
-        if (this.sendingChainKey === null) {
-            if (this.dhRemote === null) throw new Error('E2EE_CANNOT_SEND_BEFORE_RECEIVE');
+        if (trial.sendingChainKey === null) {
+            if (trial.dhRemote === null) throw new Error('E2EE_CANNOT_SEND_BEFORE_RECEIVE');
             const s = sodium || _sodium;
             const fresh = s.crypto_box_keypair();
-            const { rootKey, chainKey } = kdfRk(this.rootKey, dh(Buffer.from(fresh.privateKey), this.dhRemote));
-            this.rootKey = rootKey;
-            this.sendingChainKey = chainKey;
-            this.prevSendCount = this.sendCount;
-            this.sendCount = 0;
-            this.dhSelf = { publicKey: Buffer.from(fresh.publicKey), privateKey: Buffer.from(fresh.privateKey) };
+            const { rootKey, chainKey } = kdfRk(trial.rootKey, dh(Buffer.from(fresh.privateKey), trial.dhRemote));
+            trial.rootKey = rootKey;
+            trial.sendingChainKey = chainKey;
+            trial.prevSendCount = trial.sendCount;
+            trial.sendCount = 0;
+            trial.dhSelf = { publicKey: Buffer.from(fresh.publicKey), privateKey: Buffer.from(fresh.privateKey) };
         }
-        const { messageKey, chainKey } = kdfCk(this.sendingChainKey);
-        this.sendingChainKey = chainKey;
+        const header = { dh: trial.dhSelf.publicKey.toString('base64'), pn: trial.prevSendCount, n: trial.sendCount };
+        const { messageKey, chainKey } = kdfCk(trial.sendingChainKey);
+        trial.sendingChainKey = chainKey;
         const nonce = messageNonce(messageKey);
-        const ciphertext = aeadEncrypt(messageKey, nonce, Buffer.from(plaintext, 'utf8'), associatedData);
-        const header = { dh: this.dhSelf.publicKey.toString('base64'), pn: this.prevSendCount, n: this.sendCount };
-        this.sendCount += 1;
+        // P0-B: the AEAD authenticates the context binding AND every byte of
+        // the canonical header — dh, pn, n cannot be altered undetected.
+        const ciphertext = aeadEncrypt(messageKey, nonce, Buffer.from(plaintext, 'utf8'), messageAssociatedData(context, header));
+        trial.sendCount += 1;
+        Object.assign(this, trial);
         return { header, nonce, ciphertext };
     }
 
@@ -247,19 +283,22 @@ class DoubleRatchetSession {
     // session untouched — an AEAD failure that had already advanced the chain
     // would permanently corrupt the session (derived message keys are
     // single-use, so a wrong-position key is unfixable later).
-    decrypt(envelope, associatedData) {
+    decrypt(envelope, context) {
         const { header, nonce, ciphertext } = envelope;
         const trial = DoubleRatchetSession.parse(JSON.parse(JSON.stringify(this.serialize())));
-        const plaintext = trial._decryptInPlace({ header, nonce, ciphertext }, associatedData);
+        const plaintext = trial._decryptInPlace({ header, nonce, ciphertext }, context);
         // Commit the trial state only after successful authentication.
         Object.assign(this, trial);
         return plaintext;
     }
 
-    _decryptInPlace({ header, nonce, ciphertext }, associatedData) {
+    _decryptInPlace({ header, nonce, ciphertext }, context) {
+        // P0-B: rebuilt with the SAME canonical-header binding the sender
+        // used. Any dh/pn/n mutation makes authentication fail.
+        const ad = messageAssociatedData(context, header);
         const dhRemote = unb64(header.dh);
         const skipped = this._trySkipped(dhRemote, header.n);
-        if (skipped) return aeadDecrypt(skipped, nonce, ciphertext, associatedData).toString('utf8');
+        if (skipped) return aeadDecrypt(skipped, nonce, ciphertext, ad).toString('utf8');
 
         // New remote ratchet key: finish the old chain, then DH-step.
         if (!this.dhRemote || !dhRemote.equals(this.dhRemote)) {
@@ -276,7 +315,7 @@ class DoubleRatchetSession {
         this.receivingChainKey = chainKey;
         const mk = messageKey;
         this.recvCount = header.n + 1;
-        return aeadDecrypt(mk, nonce, ciphertext, associatedData).toString('utf8');
+        return aeadDecrypt(mk, nonce, ciphertext, ad).toString('utf8');
     }
 
     serialize() {
@@ -287,7 +326,7 @@ class DoubleRatchetSession {
             dhSelf: { publicKey: b64(this.dhSelf.publicKey), privateKey: b64(this.dhSelf.privateKey) },
             dhRemote: this.dhRemote ? b64(this.dhRemote) : null,
             sendCount: this.sendCount, recvCount: this.recvCount, prevSendCount: this.prevSendCount,
-            skipped: Object.fromEntries(Object.entries(this.skipped).map(([k, v]) => [k, b64(v)])),
+            skipped: [...this.skipped.entries()].map(([k, v]) => [k, b64(v)]),
         };
     }
 
@@ -299,21 +338,43 @@ class DoubleRatchetSession {
             dhSelf: { publicKey: unb64(data.dhSelf.publicKey), privateKey: unb64(data.dhSelf.privateKey) },
             dhRemote: data.dhRemote ? unb64(data.dhRemote) : null,
             sendCount: data.sendCount, recvCount: data.recvCount, prevSendCount: data.prevSendCount,
-            skipped: Object.fromEntries(Object.entries(data.skipped || {}).map(([k, v]) => [k, unb64(v)])),
+            skipped: new Map((data.skipped || []).map(([k, v]) => [k, unb64(v)])),
         });
     }
 }
 
-// Associated data binding (§7 of the contract).
-function associatedData(senderIdentityPublicKeyB64, recipientIdentityPublicKeyB64) {
-    return Buffer.from(`${AD_PREFIX}|${senderIdentityPublicKeyB64}|${recipientIdentityPublicKeyB64}`, 'utf8');
+// Canonical authenticated-header encoding (P0-B). Fixed field order and
+// delimiter; no JSON, no whitespace ambiguity — byte-identical across
+// implementations.
+function canonicalHeader(header) {
+    if (!header || typeof header.dh !== 'string' || !Number.isInteger(header.pn) || !Number.isInteger(header.n)) {
+        throw new Error('E2EE_INVALID_HEADER');
+    }
+    return `${HEADER_PREFIX}|${header.dh}|${header.pn}|${header.n}`;
+}
+
+// AEAD associated data: context binding || canonical header (Signal: AD' =
+// AD || header). A ciphertext is bound to protocol version, conversation,
+// sender device, sender identity AND recipient identity, so a valid
+// ciphertext cannot be transplanted to another conversation or context and
+// remain authentic. Every header byte (dh, pn, n) is authenticated.
+function messageAssociatedData(context, header) {
+    if (!context || typeof context.conversationId !== 'string'
+        || typeof context.senderDeviceId !== 'string'
+        || typeof context.senderIdentityKey !== 'string'
+        || typeof context.recipientIdentityKey !== 'string') {
+        throw new Error('E2EE_INVALID_CONTEXT');
+    }
+    const ad = `${AD_PREFIX}|${context.conversationId}|${context.senderDeviceId}|${context.senderIdentityKey}|${context.recipientIdentityKey}`;
+    return Buffer.concat([Buffer.from(ad, 'utf8'), Buffer.from(canonicalHeader(header), 'utf8')]);
 }
 
 module.exports = {
-    init, PROTOCOL_VERSION, MAX_SKIP,
+    init, PROTOCOL_VERSION, MAX_SKIP, MAX_SKIPPED_CACHE,
+    canonicalHeader, messageAssociatedData,
     hmacSha256, hkdfSha256, b64, unb64, dh,
     verifyDeviceBinding, verifySignedPreKeySignature,
     initiateX3DH, acceptX3DH,
     kdfRk, kdfCk, messageNonce, aeadEncrypt, aeadDecrypt,
-    DoubleRatchetSession, associatedData,
+    DoubleRatchetSession,
 };

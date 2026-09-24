@@ -842,7 +842,7 @@ model User {
 
   // E2EE (r40): public-key directory only — see docs/e2ee-protocol.md
   e2eeDevices           E2eeDevice[]        @relation("UserE2EEDevices")
-  e2eeOneTimePreKeys    E2eeOneTimePreKey[]  @relation("UserE2EEOneTimePreKeys")
+  e2eeOneTimePreKeys    E2eeOneTimePreKey[] @relation("UserE2EEOneTimePreKeys")
   fraudAssessments      FraudAssessment[]
   sentPeerTransfers     PeerTransfer[]      @relation("PeerTransferSender")
   receivedPeerTransfers PeerTransfer[]      @relation("PeerTransferReceiver")
@@ -3401,10 +3401,10 @@ model BusinessOrder {
 
   createdAt DateTime @default(now())
 
-  paymentMethod  String?  @db.VarChar(20) // "AZAMAN_BALANCE" | "CASH" | "SPLIT"
-  idempotencyKey String?  @unique // client-supplied dedup key for offline sync
-  cashReceived   Decimal? @db.Decimal(20, 8) // for CASH payments — actual cash tendered
-  cashChange     Decimal? @db.Decimal(20, 8) // change given back
+  paymentMethod       String?   @db.VarChar(20) // "AZAMAN_BALANCE" | "CASH" | "SPLIT"
+  idempotencyKey      String?   @unique // client-supplied dedup key for offline sync
+  cashReceived        Decimal?  @db.Decimal(20, 8) // for CASH payments — actual cash tendered
+  cashChange          Decimal?  @db.Decimal(20, 8) // change given back
   // r36/P1: durable marker that recipe inventory was deducted for this order.
   // The deduction route claims it atomically; a retry or concurrent duplicate
   // can never double-reduce stock.
@@ -6410,42 +6410,44 @@ model RestrictedObligation {
 // E2EEOneTimePreKey / E2EESession models, which stored server-side private
 // identity/session material and made the server a decryption authority.
 model E2eeDevice {
-  id                 String   @id @default(uuid())
-  userId             Int
-  deviceId           String   @db.VarChar(128)
-  signingPublicKey   String   @db.VarChar(100) // Ed25519 pub (b64) — identity anchor
-  identityPublicKey  String   @db.VarChar(100) // X25519 DH identity pub (b64)
-  bindingSignature   String   @db.VarChar(200) // Ed25519 sig binding the two keys
-  signedPreKeyId     Int
-  signedPreKeyPublicKey  String @db.VarChar(100) // X25519 pub (b64)
-  signedPreKeySignature   String @db.VarChar(200) // Ed25519 sig over the SPK pub
-  isActive           Boolean  @default(true)
-  createdAt          DateTime @default(now())
-  updatedAt          DateTime @updatedAt
+  id                    String   @id @default(uuid())
+  userId                Int
+  deviceId              String   @db.VarChar(128)
+  signingPublicKey      String   @db.VarChar(100) // Ed25519 pub (b64) — identity anchor
+  identityPublicKey     String   @db.VarChar(100) // X25519 DH identity pub (b64)
+  bindingSignature      String   @db.VarChar(200) // Ed25519 sig binding the two keys
+  signedPreKeyId        Int
+  signedPreKeyPublicKey String   @db.VarChar(100) // X25519 pub (b64)
+  signedPreKeySignature String   @db.VarChar(200) // Ed25519 sig over the SPK pub
+  isActive              Boolean  @default(true)
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
 
   user User @relation("UserE2EEDevices", fields: [userId], references: [id], onDelete: Cascade)
 
-  @@map("E2EEDevice")
-
   @@unique([userId, deviceId])
   @@index([userId, isActive])
+  @@map("E2EEDevice")
 }
 
 model E2eeOneTimePreKey {
-  id        String   @id @default(uuid())
+  id        String    @id @default(uuid())
   userId    Int
+  // r40.1 (P0-C): one-time prekeys are DEVICE-scoped. A claimed bundle can
+  // only contain keys belonging to the selected active device — Device B can
+  // never receive Device A's prekey.
+  deviceId  String    @db.VarChar(128)
   keyId     Int
-  publicKey String   @db.VarChar(100) // X25519 pub (b64) — PRIVATE KEY NEVER UPLOADED
-  isUsed    Boolean  @default(false)
-  createdAt DateTime @default(now())
+  publicKey String    @db.VarChar(100) // X25519 pub (b64) — PRIVATE KEY NEVER UPLOADED
+  isUsed    Boolean   @default(false)
+  createdAt DateTime  @default(now())
   usedAt    DateTime?
 
-  user   User       @relation("UserE2EEOneTimePreKeys", fields: [userId], references: [id], onDelete: Cascade)
-
-  @@map("E2EEOneTimePreKey")
+  user User @relation("UserE2EEOneTimePreKeys", fields: [userId], references: [id], onDelete: Cascade)
 
   @@unique([userId, keyId])
-  @@index([userId, isUsed])
+  @@index([userId, deviceId, isUsed])
+  @@map("E2EEOneTimePreKey")
 }
 
 model FraudAssessment {

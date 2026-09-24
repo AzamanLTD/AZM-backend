@@ -53,6 +53,7 @@ run('E2EE server-blind authority (real PostgreSQL)', () => {
     let aliceKeys, bobKeys;
 
     beforeAll(async () => {
+        process.env.AZM_E2EE_ENABLED = 'true'; // P0-A gate: tests run with the surface enabled
         db = new PrismaClient();
         app = express();
         app.use(express.json({ limit: '1mb' }));
@@ -76,7 +77,7 @@ run('E2EE server-blind authority (real PostgreSQL)', () => {
         app.locals.convId = conv.id;
     });
 
-    const register = async (userId, keys, { otpkCount = 5, spkId = 1, forged = false } = {}) => {
+    const register = async (userId, keys, { otpkCount = 5, spkId = 1, forged = false, otpkOffset = 0 } = {}) => {
         const sodium = await protocol.init();
         const signingPublicKey = b64(keys.signing.publicKey);
         const identityPublicKey = b64(keys.identity.publicKey);
@@ -91,10 +92,13 @@ run('E2EE server-blind authority (real PostgreSQL)', () => {
         ]);
         const otpkKeys = [];
         const otpkPrivateBy = {}; // test-only: the device's local secret
+        // otpkOffset makes each payload's one-time prekey material UNIQUE
+        // (P1-D: a keyId is immutable — reusing ids+material across devices
+        // would make the second registration idempotent-skip, not insert).
         for (let i = 0; i < otpkCount; i++) {
-            const kp = sodium.crypto_box_seed_keypair(sodium.randombytes_buf_deterministic(32, Buffer.alloc(32, 200 + i)));
-            otpkKeys.push({ keyId: 1000 + i, publicKey: b64(kp.publicKey) });
-            otpkPrivateBy[1000 + i] = b64(kp.privateKey);
+            const kp = sodium.crypto_box_seed_keypair(sodium.randombytes_buf_deterministic(32, Buffer.alloc(32, 200 + otpkOffset + i)));
+            otpkKeys.push({ keyId: 1000 + otpkOffset + i, publicKey: b64(kp.publicKey) });
+            otpkPrivateBy[1000 + otpkOffset + i] = b64(kp.privateKey);
         }
         return {
             otpkPrivateBy,
@@ -157,6 +161,9 @@ run('E2EE server-blind authority (real PostgreSQL)', () => {
 
     test('F. prekey replenishment input is strictly bounded and validated', async () => {
         const svc = new E2EEKeyService(db);
+        aliceKeys = await deviceKeys(7);
+        const devPayload = await register(alice.id, aliceKeys);
+        await svc.registerDevice({ userId: alice.id, ...devPayload });
         const mk = (i) => ({ keyId: i, publicKey: b64(Buffer.alloc(32, i)) });
         await expect(svc.replenishOneTimePreKeys({ userId: alice.id, oneTimePreKeys: 'nope' })).rejects.toThrow();
         await expect(svc.replenishOneTimePreKeys({ userId: alice.id, oneTimePreKeys: [] })).rejects.toThrow();
@@ -168,6 +175,17 @@ run('E2EE server-blind authority (real PostgreSQL)', () => {
         await expect(svc.replenishOneTimePreKeys({ userId: alice.id, oneTimePreKeys: [{ keyId: 1, publicKey: b64(Buffer.alloc(31)) }] })).rejects.toThrow();
         const ok = await svc.replenishOneTimePreKeys({ userId: alice.id, oneTimePreKeys: [mk(50), mk(51)] });
         expect(ok.count).toBe(2);
+        expect(ok.inserted).toBe(2);
+        // replenishing the SAME keys with the SAME material is idempotent (P1-D)
+        const again = await svc.replenishOneTimePreKeys({ userId: alice.id, oneTimePreKeys: [mk(50), mk(51)] });
+        expect(again.inserted).toBe(0);
+        // the same keyId with DIFFERENT material is a typed conflict (P1-D):
+        // stable IDs must never silently swap key material.
+        await expect(svc.replenishOneTimePreKeys({ userId: alice.id, oneTimePreKeys: [{ keyId: 50, publicKey: b64(Buffer.alloc(32, 99)) }] }))
+            .rejects.toMatchObject({ code: 'E2EE_PREKEY_CONFLICT' });
+        // the original material is INTACT after the refused replacement
+        const row = await db.e2eeOneTimePreKey.findUnique({ where: { userId_keyId: { userId: alice.id, keyId: 50 } } });
+        expect(row.publicKey).toBe(b64(Buffer.alloc(32, 50)));
     });
 
     test('9. concurrent one-time prekey claims return DISTINCT keys (atomic SKIP LOCKED)', async () => {
@@ -214,10 +232,16 @@ run('E2EE server-blind authority (real PostgreSQL)', () => {
             theirSignedPreKeyPublicKeyB64: bundle.signedPreKey.publicKey,
             theirOneTimePreKeyPublicKeyB64: bundle.oneTimePreKey && bundle.oneTimePreKey.publicKey,
         });
-        const AD = protocol.associatedData(b64(aliceKeys.identity.publicKey), bundle.identityPublicKey);
+        // P1-F context binding: conversation + sender device + both identity keys
+        const aliceCtx = {
+            conversationId: app.locals.convId,
+            senderDeviceId: alicePayload.deviceId,
+            senderIdentityKey: b64(aliceKeys.identity.publicKey),
+            recipientIdentityKey: bundle.identityPublicKey,
+        };
         const aliceSession = await protocol.DoubleRatchetSession.initiator(init.sharedKey, bundle.signedPreKey.publicKey);
         const plaintext = 'bank details: not the server business';
-        const m = aliceSession.encrypt(plaintext, AD);
+        const m = aliceSession.encrypt(plaintext, aliceCtx);
         const envelope = {
             v: 1,
             deviceId: alicePayload.deviceId,
@@ -293,7 +317,7 @@ run('E2EE server-blind authority (real PostgreSQL)', () => {
         const fakeSession = await protocol.DoubleRatchetSession.responder(fakeResp.sharedKey, bobKeys.spk);
         expect(() => fakeSession.decrypt(
             { header: { dh: envelope.h.dh, pn: envelope.h.pn, n: envelope.h.n }, nonce: Buffer.from(envelope.nonce, 'base64'), ciphertext: Buffer.from(envelope.ct, 'base64') },
-            AD,
+            aliceCtx,
         )).toThrow(); // ciphertext does NOT authenticate under any server-visible material
         // the honest recipient path DOES decrypt (session key exists only on Bob's device)
         const respShared = await protocol.acceptX3DH({
@@ -308,7 +332,7 @@ run('E2EE server-blind authority (real PostgreSQL)', () => {
         const bobSession = await protocol.DoubleRatchetSession.responder(respShared.sharedKey, bobKeys.spk);
         expect(bobSession.decrypt(
             { header: { dh: envelope.h.dh, pn: envelope.h.pn, n: envelope.h.n }, nonce: Buffer.from(envelope.nonce, 'base64'), ciphertext: Buffer.from(envelope.ct, 'base64') },
-            AD,
+            aliceCtx,
         )).toBe(plaintext);
     });
 
@@ -320,5 +344,132 @@ run('E2EE server-blind authority (real PostgreSQL)', () => {
         expect(post.status).toBe(201);
         expect(post.body.data.text).toBe('plain hello');
         expect(post.body.data.isE2EE).toBe(false);
+    });
+
+    test('P0-C. one active device per user: a second registration retires the first and rebinds prekeys', async () => {
+        const svc = new E2EEKeyService(db);
+        aliceKeys = await deviceKeys(21);
+        const payloadA = await register(alice.id, aliceKeys, { otpkCount: 3, otpkOffset: 0 });
+        payloadA.deviceId = 'device-rotation-aaa';
+        await svc.registerDevice({ userId: alice.id, ...payloadA });
+
+        const bob2 = await deviceKeys(22);
+        const payloadB = await register(alice.id, bob2, { otpkCount: 3, otpkOffset: 100 });
+        payloadB.deviceId = 'device-rotation-bbb';
+        await svc.registerDevice({ userId: alice.id, ...payloadB });
+
+        // invariant: exactly ONE active device
+        const active = await db.e2eeDevice.findMany({ where: { userId: alice.id, isActive: true } });
+        expect(active.length).toBe(1);
+        expect(active[0].deviceId).toBe('device-rotation-bbb');
+
+        // the old device's pending prekeys are consumed, not handed out
+        const stale = await db.e2eeOneTimePreKey.findMany({
+            where: { userId: alice.id, isUsed: true, deviceId: 'device-rotation-aaa' } });
+        expect(stale.length).toBe(3);
+
+        // every bundle + claimed OTP belongs to the ACTIVE device only
+        const bundle = await svc.fetchBundle(alice.id);
+        expect(bundle.deviceId).toBe('device-rotation-bbb');
+        const otpRow = await db.e2eeOneTimePreKey.findFirst({
+            where: { userId: alice.id, keyId: bundle.oneTimePreKey.keyId } });
+        expect(otpRow.deviceId).toBe('device-rotation-bbb');
+    });
+
+    test('P0-C. concurrent device registrations converge to EXACTLY ONE active device', async () => {
+        const svc = new E2EEKeyService(db);
+        const keysA = await deviceKeys(23);
+        const payloadA = await register(alice.id, keysA, { otpkCount: 5, otpkOffset: 0 });
+        payloadA.deviceId = 'device-race-one';
+        const keysB = await deviceKeys(24);
+        const payloadB = await register(alice.id, keysB, { otpkCount: 5, otpkOffset: 200 });
+        payloadB.deviceId = 'device-race-two';
+
+        await Promise.all([
+            svc.registerDevice({ userId: alice.id, ...payloadA }),
+            svc.registerDevice({ userId: alice.id, ...payloadB }),
+        ]);
+
+        const active = await db.e2eeDevice.findMany({ where: { userId: alice.id, isActive: true } });
+        expect(active.length).toBe(1);
+        const bundle = await svc.fetchBundle(alice.id);
+        expect(bundle.deviceId).toBe(active[0].deviceId);
+        // the surviving device's bundle only ever contains ITS OWN prekeys
+        if (bundle.oneTimePreKey) {
+            const row = await db.e2eeOneTimePreKey.findFirst({ where: { userId: alice.id, keyId: bundle.oneTimePreKey.keyId } });
+            expect(row.deviceId).toBe(active[0].deviceId);
+        }
+    });
+
+    test('P1-E. non-pairwise (TRADE/BUSINESS) conversations reject E2EE envelopes', async () => {
+        const svc = new E2EEKeyService(db);
+        aliceKeys = await deviceKeys(25);
+        const payload = await register(alice.id, aliceKeys);
+        await svc.registerDevice({ userId: alice.id, ...payload });
+        const trade = await db.conversation.create({
+            data: { type: 'TRADE', participants: { connect: [{ id: alice.id }, { id: bob.id }] } },
+        });
+        const post = await request(app)
+            .post(`/api/conversation/${trade.id}/messages`)
+            .set('x-test-user', String(alice.id))
+            .send({ type: 'TEXT', e2ee: { v: 1, deviceId: payload.deviceId, ik: payload.identityPublicKey, ct: 'AAAA', nonce: 'AAAA', h: { dh: 'AAAA' } } });
+        expect(post.status).toBe(400);
+        expect(post.body.code).toBe('E2EE_NOT_PAIRWISE');
+    });
+
+    test('P1-F. envelope sender must be an ACTIVE device OWNED by the authenticated caller', async () => {
+        const svc = new E2EEKeyService(db);
+        aliceKeys = await deviceKeys(26);
+        bobKeys = await deviceKeys(27);
+        const payload = await register(alice.id, aliceKeys);
+        const bobPayload = await register(bob.id, bobKeys);
+        await svc.registerDevice({ userId: alice.id, ...payload });
+        await svc.registerDevice({ userId: bob.id, ...bobPayload });
+
+        const envelope = {
+            v: 1, deviceId: payload.deviceId, ik: payload.identityPublicKey,
+            ct: 'AAAA', nonce: 'AAAA', h: { dh: 'AAAA' },
+        };
+        // a forged deviceId not registered to the caller
+        const forged = await request(app)
+            .post(`/api/conversation/${app.locals.convId}/messages`)
+            .set('x-test-user', String(alice.id))
+            .send({ type: 'TEXT', e2ee: { ...envelope, deviceId: 'not-my-device-1' } });
+        expect(forged.status).toBe(403);
+        expect(forged.body.code).toBe('E2EE_SENDER_IDENTITY_MISMATCH');
+
+        // right deviceId but a mismatched identity key (another user's IK)
+        const stolenIk = await request(app)
+            .post(`/api/conversation/${app.locals.convId}/messages`)
+            .set('x-test-user', String(alice.id))
+            .send({ type: 'TEXT', e2ee: { ...envelope, ik: bobPayload.identityPublicKey } });
+        expect(stolenIk.status).toBe(403);
+
+        // an inactive (retired) device cannot sign envelopes
+        await svc.registerDevice({ userId: alice.id, ...(await (async () => {
+            const k = await deviceKeys(28);
+            const p = await register(alice.id, k);
+            p.deviceId = 'device-newer-0001';
+            return p;
+        })()) });
+        const retired = await request(app)
+            .post(`/api/conversation/${app.locals.convId}/messages`)
+            .set('x-test-user', String(alice.id))
+            .send({ type: 'TEXT', e2ee: { ...envelope } });
+        expect(retired.status).toBe(403);
+    });
+
+    test('P0-A. the E2EE surface is DISABLED (503) unless AZM_E2EE_ENABLED=true', async () => {
+        const prev = process.env.AZM_E2EE_ENABLED;
+        process.env.AZM_E2EE_ENABLED = '';
+        const gate1 = await request(app).post('/api/e2ee/devices').set('x-test-user', String(alice.id)).send({});
+        expect(gate1.status).toBe(503);
+        expect(gate1.body.code).toBe('E2EE_NOT_AVAILABLE');
+        const gate2 = await request(app)
+            .post(`/api/conversation/${app.locals.convId}/messages`)
+            .set('x-test-user', String(alice.id))
+            .send({ type: 'TEXT', e2ee: { v: 1, deviceId: 'x', ik: 'y', ct: 'z', nonce: 'n', h: { dh: 'd' } } });
+        expect(gate2.status).toBe(503);
+        process.env.AZM_E2EE_ENABLED = prev || 'true';
     });
 });

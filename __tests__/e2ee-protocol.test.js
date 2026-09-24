@@ -55,13 +55,21 @@ async function makePeers(seedA, seedB) {
 
 async function makeSession(seedA, seedB) {
     const { A, B, aliceIdentity, bobIdentity, init, resp } = await makePeers(seedA, seedB);
-    const AD = protocol.associatedData(aliceIdentity.pub, bobIdentity.pub);
     const alice = await protocol.DoubleRatchetSession.initiator(init.sharedKey, b64(B.spk.publicKey));
     const bob = await protocol.DoubleRatchetSession.responder(resp.sharedKey, B.spk);
-    return { alice, bob, AD, aliceIdentity, bobIdentity, A, B, init, resp };
+    const aliceDev = { deviceId: 'device-alice-0001', ik: aliceIdentity.pub };
+    const bobDev = { deviceId: 'device-bob-0001', ik: bobIdentity.pub };
+    return { alice, bob, aliceDev, bobDev, aliceIdentity, bobIdentity, A, B, init, resp };
 }
 
-const D = (sess, m, AD) => sess.decrypt({ header: m.header, nonce: m.nonce, ciphertext: m.ciphertext }, AD);
+// Context binding (P1-F): each direction binds conversation + sender device +
+// both identity keys. The recipient rebuilds the SAME context the sender used.
+const ctx = (from, to, conversationId = 'conv-0001') => ({
+    conversationId, senderDeviceId: from.deviceId,
+    senderIdentityKey: from.ik, recipientIdentityKey: to.ik,
+});
+const E = (sess, text, c) => sess.encrypt(text, c);
+const D = (sess, m, c) => sess.decrypt({ header: m.header, nonce: m.nonce, ciphertext: m.ciphertext }, c);
 
 describe('E2EE protocol v1 (deterministic real crypto)', () => {
     beforeAll(async () => { await protocol.init(); });
@@ -113,40 +121,41 @@ describe('E2EE protocol v1 (deterministic real crypto)', () => {
     });
 
     test('double ratchet: bidirectional conversation, both chains in lockstep', async () => {
-        const { alice, bob, AD } = await makeSession(7, 8);
-        expect(D(bob, alice.encrypt('a1', AD), AD)).toBe('a1');
-        expect(D(alice, bob.encrypt('b1', AD), AD)).toBe('b1');
-        expect(D(bob, alice.encrypt('a2', AD), AD)).toBe('a2');
-        expect(D(alice, bob.encrypt('b2', AD), AD)).toBe('b2');
-        expect(D(bob, alice.encrypt('a3', AD), AD)).toBe('a3');
-        expect(D(alice, bob.encrypt('b3', AD), AD)).toBe('b3');
+        const { alice, bob, aliceDev, bobDev } = await makeSession(7, 8);
+        expect(D(bob, alice.encrypt('a1', ctx(aliceDev, bobDev)), ctx(aliceDev, bobDev))).toBe('a1');
+        expect(D(alice, bob.encrypt('b1', ctx(bobDev, aliceDev)), ctx(bobDev, aliceDev))).toBe('b1');
+        expect(D(bob, alice.encrypt('a2', ctx(aliceDev, bobDev)), ctx(aliceDev, bobDev))).toBe('a2');
+        expect(D(alice, bob.encrypt('b2', ctx(bobDev, aliceDev)), ctx(bobDev, aliceDev))).toBe('b2');
+        expect(D(bob, alice.encrypt('a3', ctx(aliceDev, bobDev)), ctx(aliceDev, bobDev))).toBe('a3');
+        expect(D(alice, bob.encrypt('b3', ctx(bobDev, aliceDev)), ctx(bobDev, aliceDev))).toBe('b3');
     });
 
     test('2. tampered ciphertext fails authentication; wrong peer cannot decrypt', async () => {
-        const { alice, bob, AD } = await makeSession(9, 10);
-        const good = alice.encrypt('integrity', AD);
-        expect(D(bob, good, AD)).toBe('integrity');
+        const { alice, bob, aliceDev, bobDev } = await makeSession(9, 10);
+        const good = alice.encrypt('integrity', ctx(aliceDev, bobDev));
+        expect(D(bob, good, ctx(aliceDev, bobDev))).toBe('integrity');
         const bad = { header: { ...good.header }, nonce: good.nonce, ciphertext: Buffer.from(good.ciphertext) };
         bad.ciphertext[0] ^= 0x01;
-        expect(() => D(bob, bad, AD)).toThrow();
+        expect(() => D(bob, bad, ctx(aliceDev, bobDev))).toThrow();
         // wrong associated data (mis-bound identities) fails
-        const wrongAD = protocol.associatedData(b64(Buffer.alloc(32, 1)), b64(Buffer.alloc(32, 2)));
-        const w = alice.encrypt('misbound', wrongAD);
-        expect(() => D(bob, w, AD)).toThrow();
+        // P1-F: a context binding the WRONG identities must fail auth.
+        const wrongCtx = { ...ctx(aliceDev, bobDev), senderIdentityKey: b64(Buffer.alloc(32, 1)) };
+        const w = alice.encrypt('misbound', wrongCtx);
+        expect(() => D(bob, w, ctx(aliceDev, bobDev))).toThrow();
         // a session established with the WRONG peer's SPK is unreadable by Bob
         const other = await makeSession(9, 11);
-        const m = other.alice.encrypt('not for you', other.AD);
-        expect(() => D(bob, { header: m.header, nonce: m.nonce, ciphertext: m.ciphertext }, AD)).toThrow();
+        const m = other.alice.encrypt('not for you', ctx(other.aliceDev, other.bobDev));
+        expect(() => D(bob, { header: m.header, nonce: m.nonce, ciphertext: m.ciphertext }, ctx(aliceDev, bobDev))).toThrow();
         // and the honest session's messages are unreadable by the third party
-        const mine = alice.encrypt('for bob', AD);
-        expect(() => D(other.bob, { header: mine.header, nonce: mine.nonce, ciphertext: mine.ciphertext }, other.AD)).toThrow();
+        const mine = alice.encrypt('for bob', ctx(aliceDev, bobDev));
+        expect(() => D(other.bob, { header: mine.header, nonce: mine.nonce, ciphertext: mine.ciphertext }, ctx(other.aliceDev, other.bobDev))).toThrow();
     });
 
     test('4. nonce reuse is impossible under the message API contract', async () => {
-        const { alice, AD } = await makeSession(12, 13);
+        const { alice, aliceDev, bobDev } = await makeSession(12, 13);
         const nonces = new Set();
         for (let i = 0; i < 50; i++) {
-            const m = alice.encrypt('n' + i, AD);
+            const m = alice.encrypt('n' + i, ctx(aliceDev, bobDev));
             nonces.add(m.nonce.toString('base64'));
         }
         expect(nonces.size).toBe(50); // every message a distinct nonce
@@ -157,54 +166,54 @@ describe('E2EE protocol v1 (deterministic real crypto)', () => {
     });
 
     test('5. replayed envelope is rejected and does NOT advance the session', async () => {
-        const { alice, bob, AD } = await makeSession(14, 15);
-        const m1 = alice.encrypt('once', AD);
-        expect(D(bob, m1, AD)).toBe('once');
+        const { alice, bob, aliceDev, bobDev } = await makeSession(14, 15);
+        const m1 = alice.encrypt('once', ctx(aliceDev, bobDev));
+        expect(D(bob, m1, ctx(aliceDev, bobDev))).toBe('once');
         const stateBefore = JSON.stringify(bob.serialize());
-        expect(() => D(bob, m1, AD)).toThrow();
+        expect(() => D(bob, m1, ctx(aliceDev, bobDev))).toThrow();
         expect(JSON.stringify(bob.serialize())).toBe(stateBefore);
-        expect(D(bob, alice.encrypt('next', AD), AD)).toBe('next');
+        expect(D(bob, alice.encrypt('next', ctx(aliceDev, bobDev)), ctx(aliceDev, bobDev))).toBe('next');
     });
 
     test('6. out-of-order delivery: skipped message keys follow the documented state machine', async () => {
-        const { alice, bob, AD } = await makeSession(16, 17);
-        const m1 = alice.encrypt('o1', AD);
-        const m2 = alice.encrypt('o2', AD);
-        const m3 = alice.encrypt('o3', AD);
-        expect(D(bob, m3, AD)).toBe('o3');
-        expect(D(bob, m1, AD)).toBe('o1');
-        expect(D(bob, m2, AD)).toBe('o2');
-        const far = alice.encrypt('far', AD);
+        const { alice, bob, aliceDev, bobDev } = await makeSession(16, 17);
+        const m1 = alice.encrypt('o1', ctx(aliceDev, bobDev));
+        const m2 = alice.encrypt('o2', ctx(aliceDev, bobDev));
+        const m3 = alice.encrypt('o3', ctx(aliceDev, bobDev));
+        expect(D(bob, m3, ctx(aliceDev, bobDev))).toBe('o3');
+        expect(D(bob, m1, ctx(aliceDev, bobDev))).toBe('o1');
+        expect(D(bob, m2, ctx(aliceDev, bobDev))).toBe('o2');
+        const far = alice.encrypt('far', ctx(aliceDev, bobDev));
         far.header.n = protocol.MAX_SKIP + 10;
-        expect(() => D(bob, far, AD)).toThrow('E2EE_TOO_MANY_SKIPPED');
+        expect(() => D(bob, far, ctx(aliceDev, bobDev))).toThrow('E2EE_TOO_MANY_SKIPPED');
     });
 
     test('7/8. key rotation: a new device ends the old session cleanly; old key material is not trusted', async () => {
-        const { alice, bob, AD } = await makeSession(18, 19);
-        expect(D(bob, alice.encrypt('old device', AD), AD)).toBe('old device');
-        expect(D(alice, bob.encrypt('reply', AD), AD)).toBe('reply');
+        const { alice, bob, aliceDev, bobDev } = await makeSession(18, 19);
+        expect(D(bob, alice.encrypt('old device', ctx(aliceDev, bobDev)), ctx(aliceDev, bobDev))).toBe('old device');
+        expect(D(alice, bob.encrypt('reply', ctx(bobDev, aliceDev)), ctx(bobDev, aliceDev))).toBe('reply');
         // Bob rotates to a NEW device: fresh keys, fresh session.
         const fresh = await makeSession(18, 20);
-        const newAD = protocol.associatedData(fresh.aliceIdentity.pub, fresh.bobIdentity.pub);
+        const freshCtx = ctx(fresh.aliceDev, fresh.bobDev);
         const newAlice = await protocol.DoubleRatchetSession.initiator(fresh.init.sharedKey, b64(fresh.B.spk.publicKey));
         const newBob = await protocol.DoubleRatchetSession.responder(fresh.resp.sharedKey, fresh.B.spk);
-        expect(D(newBob, newAlice.encrypt('new device', newAD), newAD)).toBe('new device');
+        expect(D(newBob, newAlice.encrypt('new device', freshCtx), freshCtx)).toBe('new device');
         // messages from the OLD session are NOT accepted by the new device
-        const stale = alice.encrypt('stale', AD);
-        expect(() => D(newBob, { header: stale.header, nonce: stale.nonce, ciphertext: stale.ciphertext }, newAD)).toThrow();
+        const stale = alice.encrypt('stale', ctx(aliceDev, bobDev));
+        expect(() => D(newBob, { header: stale.header, nonce: stale.nonce, ciphertext: stale.ciphertext }, freshCtx)).toThrow();
     });
 
     test('session state serializes/restores exactly (client persistence contract)', async () => {
-        const { alice, bob, AD } = await makeSession(21, 22);
-        expect(D(bob, alice.encrypt('persist', AD), AD)).toBe('persist');
+        const { alice, bob, aliceDev, bobDev } = await makeSession(21, 22);
+        expect(D(bob, alice.encrypt('persist', ctx(aliceDev, bobDev)), ctx(aliceDev, bobDev))).toBe('persist');
         const restored = protocol.DoubleRatchetSession.parse(JSON.parse(JSON.stringify(bob.serialize())));
-        expect(D(restored, alice.encrypt('after restore', AD), AD)).toBe('after restore');
-        expect(D(alice, restored.encrypt('reply after restore', AD), AD)).toBe('reply after restore');
+        expect(D(restored, alice.encrypt('after restore', ctx(aliceDev, bobDev)), ctx(aliceDev, bobDev))).toBe('after restore');
+        expect(D(alice, restored.encrypt('reply after restore', ctx(bobDev, aliceDev)), ctx(bobDev, aliceDev))).toBe('reply after restore');
     });
 
     test('13. plaintext is bound: envelope carries bounded, authenticated bytes only', async () => {
-        const { alice, bob, AD } = await makeSession(23, 24);
-        const m = alice.encrypt('x'.repeat(1000), AD);
+        const { alice, bob, aliceDev, bobDev } = await makeSession(23, 24);
+        const m = alice.encrypt('x'.repeat(1000), ctx(aliceDev, bobDev));
         expect(m.ciphertext.length).toBeGreaterThanOrEqual(1000 + 16);
         expect(Number.isInteger(m.header.n)).toBe(true);
         expect(m.header.pn).toBeGreaterThanOrEqual(0);
@@ -242,5 +251,96 @@ describe('E2EE protocol v1 (deterministic real crypto)', () => {
         expect(okm32.length).toBe(32);
         expect(okm64.subarray(0, 32).equals(okm32)).toBe(true);
         expect(okm64.subarray(32).equals(okm32)).toBe(false);
+    });
+
+    // ── r40.1 audit proofs (P0-B, P1-F, P1-G, P1-H) ──────────────────────────
+
+    test('P0-B. tampering header.dh alone is DETECTED (header is authenticated)', async () => {
+        const { alice, bob, aliceDev, bobDev } = await makeSession(30, 31);
+        const good = alice.encrypt('hdr-auth', ctx(aliceDev, bobDev));
+        const tamperedDh = b64(Buffer.concat([Buffer.from(good.header.dh, 'base64').subarray(0, 31), Buffer.from([1])]));
+        const bad = { header: { dh: tamperedDh, pn: good.header.pn, n: good.header.n }, nonce: good.nonce, ciphertext: good.ciphertext };
+        expect(() => D(bob, bad, ctx(aliceDev, bobDev))).toThrow();
+    });
+
+    test('P0-B. tampering header.pn alone is DETECTED', async () => {
+        const { alice, bob, aliceDev, bobDev } = await makeSession(32, 33);
+        // establish two chains so pn is meaningful and non-zero
+        D(bob, alice.encrypt('first chain', ctx(aliceDev, bobDev)), ctx(aliceDev, bobDev));
+        const second = bob.encrypt('bob replies', ctx(bobDev, aliceDev));
+        D(alice, second, ctx(bobDev, aliceDev)); // alice ratchets, pn=1
+        const good = alice.encrypt('pn-auth', ctx(aliceDev, bobDev));
+        const bad = { header: { dh: good.header.dh, pn: good.header.pn + 1, n: good.header.n }, nonce: good.nonce, ciphertext: good.ciphertext };
+        expect(() => D(bob, bad, ctx(aliceDev, bobDev))).toThrow();
+        // and the untouched message still decrypts
+        expect(D(bob, good, ctx(aliceDev, bobDev))).toBe('pn-auth');
+    });
+
+    test('P0-B. tampering header.n alone is DETECTED', async () => {
+        const { alice, bob, aliceDev, bobDev } = await makeSession(34, 35);
+        const good = alice.encrypt('n-auth', ctx(aliceDev, bobDev));
+        const bad = { header: { dh: good.header.dh, pn: good.header.pn, n: good.header.n + 1 }, nonce: good.nonce, ciphertext: good.ciphertext };
+        expect(() => D(bob, bad, ctx(aliceDev, bobDev))).toThrow();
+        expect(D(bob, good, ctx(aliceDev, bobDev))).toBe('n-auth');
+    });
+
+    test('P1-F. cross-conversation transplant is REJECTED (conversation bound in AD)', async () => {
+        const { alice, bob, aliceDev, bobDev } = await makeSession(36, 37);
+        const c1 = ctx(aliceDev, bobDev, 'conv-one');
+        const c2 = ctx(aliceDev, bobDev, 'conv-two');
+        const m = alice.encrypt('secret for conv one only', c1);
+        expect(() => D(bob, m, c2)).toThrow();
+        expect(D(bob, m, c1)).toBe('secret for conv one only');
+    });
+
+    test('P1-G. an encrypt() failure consumes NO ratchet state (transactional)', async () => {
+        const { alice, bob, aliceDev, bobDev } = await makeSession(38, 39);
+        D(bob, alice.encrypt('warm', ctx(aliceDev, bobDev)), ctx(aliceDev, bobDev));
+        const before = JSON.stringify(alice.serialize());
+        // invalid context (missing recipient identity) throws AFTER the trial
+        // clone has already advanced its sending chain — the committed session
+        // must remain untouched.
+        const badCtx = { conversationId: 'x', senderDeviceId: 'd', senderIdentityKey: 'k' };
+        expect(() => alice.encrypt('doomed', badCtx)).toThrow('E2EE_INVALID_CONTEXT');
+        expect(JSON.stringify(alice.serialize())).toBe(before);
+        // the session still works and the message stream has NO gap: the
+        // failed attempt consumed no chain step (counter unchanged).
+        const m1 = alice.encrypt('survivor', ctx(aliceDev, bobDev));
+        expect(m1.header.n).toBe(1);
+        expect(D(bob, m1, ctx(aliceDev, bobDev))).toBe('survivor');
+    });
+
+    test('P1-H. skipped-key cache is globally bounded (FIFO eviction, no unbounded state)', async () => {
+        const { alice, bob, aliceDev, bobDev } = await makeSession(40, 41);
+        // Chain 1: alice sends 900 messages, bob reads none yet.
+        const chain1 = [];
+        for (let i = 0; i < 900; i++) chain1.push(alice.encrypt('c1-' + i, ctx(aliceDev, bobDev)));
+        // Bob reads the last message of chain 1 (forcing ~899 skipped keys),
+        // then replies — Bob is the responder and must receive before sending,
+        // and Alice's reply ratchets her into a fresh sending chain.
+        D(bob, chain1[899], ctx(aliceDev, bobDev)); // ~899 skipped keys
+        D(alice, bob.encrypt('reply-1', ctx(bobDev, aliceDev)), ctx(bobDev, aliceDev));
+        const chain2 = [];
+        for (let i = 0; i < 900; i++) chain2.push(alice.encrypt('c2-' + i, ctx(aliceDev, bobDev)));
+        D(bob, chain2[899], ctx(aliceDev, bobDev)); // +899 -> 1798 retained
+        D(alice, bob.encrypt('reply-2', ctx(bobDev, aliceDev)), ctx(bobDev, aliceDev));
+        const chain3 = [];
+        for (let i = 0; i < 900; i++) chain3.push(alice.encrypt('c3-' + i, ctx(aliceDev, bobDev)));
+        D(bob, chain3[899], ctx(aliceDev, bobDev)); // +899 -> bound enforced, eviction
+
+        expect(bob.skipped.size).toBeLessThanOrEqual(protocol.MAX_SKIPPED_CACHE);
+        // The cache bound has a real cost: the OLDEST skipped keys are gone.
+        const oldest = chain1[0];
+        expect(() => D(bob, oldest, ctx(aliceDev, bobDev))).toThrow();
+        // but recent material still decrypts
+        expect(D(bob, chain3[0], ctx(aliceDev, bobDev))).toBe('c3-0');
+    });
+
+    test('P0-B. canonicalHeader is deterministic and field-order stable', () => {
+        expect(protocol.canonicalHeader({ dh: 'AAA', pn: 1, n: 2 }))
+            .toBe('azaman-dr-v1|AAA|1|2');
+        expect(protocol.canonicalHeader({ n: 2, dh: 'AAA', pn: 1 }))
+            .toBe(protocol.canonicalHeader({ dh: 'AAA', pn: 1, n: 2 }));
+        expect(() => protocol.canonicalHeader({ dh: 'AAA', pn: 'x', n: 2 })).toThrow('E2EE_INVALID_HEADER');
     });
 });

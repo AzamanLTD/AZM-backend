@@ -122,6 +122,12 @@ jobs:
       - name: Install E2EE server-blind authority
         run: node infra/install-e2ee-server-blind-overlay.js
 
+      # §r40.1 P1-L — static invariant audit, companion to the behavioral
+      # proof suites: no private-key columns can enter the E2EE schema, the
+      # feature stays disabled by default, restock fingerprints stay exact.
+      - name: E2EE server-blind invariant audit
+        run: node infra/audit-e2ee-invariants.js
+
       - name: Generate Prisma client
         run: npx prisma generate
 
