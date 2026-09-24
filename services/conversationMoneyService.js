@@ -107,6 +107,23 @@ class ConversationMoneyService {
         }
     }
 
+    // r37/P1 — the two-party assumption is ENFORCED, not assumed. `type ===
+    // 'PERSONAL'` alone is not authority: a malformed PERSONAL conversation
+    // with three participants would otherwise hand `participants.find(...)` an
+    // ARBITRARY counterparty for a money-bearing flow. The caller must be one
+    // of EXACTLY two participants; the counterparty is derived from that
+    // exact set. Anything else fails closed with zero mutation.
+    _requireTwoParty(conv, userId, feature) {
+        this._requirePersonal(conv, feature);
+        const parts = Array.isArray(conv.participants) ? conv.participants : [];
+        const others = parts.filter((p) => p.id !== userId);
+        if (parts.length !== 2 || others.length !== 1) {
+            throw fail(400, 'NOT_TWO_PARTY',
+                `${feature} requires an exact two-party personal conversation.`);
+        }
+        return others[0];
+    }
+
     // Generic peer transfer. The recipient is explicit (may be any user); the
     // conversation is where the transfer message lands, not the authority for
     // the recipient.
@@ -135,6 +152,7 @@ class ConversationMoneyService {
                 || existing.conversationId !== conv.id
                 || existing.requesterId !== userId
                 || existing.counterpartyId !== receiverId
+                || existing.currency !== (currency || 'GHS')
                 || new Prisma.Decimal(existing.amount).toFixed(8) !== amt.toFixed(8)) {
                 throw fail(409, 'IDEMPOTENCY_CONFLICT',
                     'This clientRequestId was already used with different transfer parameters.');
@@ -249,8 +267,7 @@ class ConversationMoneyService {
 
     async _createMoneyRequest({ user, conv, moneyAmount, fromUserId, currency, note, clientRequestId }) {
         const userId = user.id;
-        this._requirePersonal(conv, 'Money requests');
-        const other = conv.participants.find((p) => p.id !== userId);
+        const other = this._requireTwoParty(conv, userId, 'Money requests');
         const amt = parsePositiveAmount(moneyAmount, 'moneyAmount');
 
         // fromUserId is client-supplied: it must AGREE with the durable
@@ -263,7 +280,7 @@ class ConversationMoneyService {
         }
 
         const result = await this._createTicketedMessage({
-            conv, userId, kind: 'MONEY_REQUEST', amt, currency, clientRequestId,
+            conv, userId, kind: 'MONEY_REQUEST', amt, currency, clientRequestId, counterparty: other,
             messageType: 'MONEY_REQUEST',
             content: `🤑 Requested ${amt.toFixed(2)} ${currency || 'GHS'}${note ? ` — "${note}"` : ''}`,
         });
@@ -280,8 +297,7 @@ class ConversationMoneyService {
 
     async _createEscrowTicket({ user, conv, amount, currency, note, itemName, counterpartyId, clientRequestId }) {
         const userId = user.id;
-        this._requirePersonal(conv, 'Escrow tickets');
-        const other = conv.participants.find((p) => p.id !== userId);
+        const other = this._requireTwoParty(conv, userId, 'Escrow tickets');
         const amt = parsePositiveAmount(amount, 'amount');
 
         if (counterpartyId !== undefined && counterpartyId !== null) {
@@ -295,36 +311,44 @@ class ConversationMoneyService {
         }
 
         return this._createTicketedMessage({
-            conv, userId, kind: 'ESCROW_TICKET', amt, currency, clientRequestId,
+            conv, userId, kind: 'ESCROW_TICKET', amt, currency, clientRequestId, counterparty: other,
             messageType: 'ESCROW_TICKET',
             content: `🛡️ Escrow: ${itemName.trim().slice(0, 120)} — ${amt.toFixed(2)} ${currency || 'GHS'}${note ? ` — "${note}"` : ''}`,
         });
     }
 
-    async _createTicketedMessage({ conv, userId, kind, amt, currency, clientRequestId, messageType, content }) {
-        let requestId = null;
-        if (clientRequestId !== undefined && clientRequestId !== null) {
-            if (typeof clientRequestId !== 'string' || !clientRequestId.trim()) {
-                throw fail(400, 'INVALID_INPUT', 'clientRequestId must be a non-empty string.');
+    async _createTicketedMessage({ conv, userId, kind, amt, currency, clientRequestId, counterparty, messageType, content }) {
+        // r37/P1 — the idempotency key is MANDATORY for every money-bearing
+        // creation (requests and escrow tickets join money sends). A creation
+        // without a durable request identity has no replay contract.
+        if (clientRequestId === undefined || clientRequestId === null
+            || typeof clientRequestId !== 'string' || !clientRequestId.trim()) {
+            throw fail(400, 'IDEMPOTENCY_REQUIRED',
+                'clientRequestId is required for money-bearing messages (durable request identity).');
+        }
+        const requestId = clientRequestId.trim().slice(0, 200);
+        const existing = await this.prisma.conversationMoneyTicket.findUnique({
+            where: { clientRequestId: requestId },
+        });
+        if (existing) {
+            // r37/P1 — the conflict identity binds EVERY economically
+            // relevant field: kind, conversation, requester, counterparty,
+            // amount AND currency. A replay with a different currency must
+            // fail closed, not silently replay the original economics.
+            if (existing.kind !== kind
+                || existing.conversationId !== conv.id
+                || existing.requesterId !== userId
+                || existing.counterpartyId !== counterparty.id
+                || existing.currency !== (currency || 'GHS')
+                || new Prisma.Decimal(existing.amount).toFixed(8) !== amt.toFixed(8)) {
+                throw fail(409, 'IDEMPOTENCY_CONFLICT',
+                    'This clientRequestId was already used with different parameters.');
             }
-            requestId = clientRequestId.trim().slice(0, 200);
-            const existing = await this.prisma.conversationMoneyTicket.findUnique({
-                where: { clientRequestId: requestId },
+            const message = await this.prisma.message.findUnique({
+                where: { id: existing.messageId },
+                include: { sender: { select: { id: true, username: true } } },
             });
-            if (existing) {
-                if (existing.kind !== kind
-                    || existing.conversationId !== conv.id
-                    || existing.requesterId !== userId
-                    || new Prisma.Decimal(existing.amount).toFixed(8) !== amt.toFixed(8)) {
-                    throw fail(409, 'IDEMPOTENCY_CONFLICT',
-                        'This clientRequestId was already used with different parameters.');
-                }
-                const message = await this.prisma.message.findUnique({
-                    where: { id: existing.messageId },
-                    include: { sender: { select: { id: true, username: true } } },
-                });
-                return { message, ticket: existing, replay: true };
-            }
+            return { message, ticket: existing, replay: true };
         }
 
         return this.prisma.$transaction(async (tx) => {
@@ -348,9 +372,9 @@ class ConversationMoneyService {
                         amount: amt,
                         currency: (currency || 'GHS').slice(0, 10),
                         requesterId: userId,
-                        counterpartyId: conv.participants.find((p) => p.id !== userId).id,
+                        counterpartyId: counterparty.id,
                         status: 'sent',
-                        ...(requestId ? { clientRequestId: requestId } : {}),
+                        clientRequestId: requestId,
                     },
                 });
             } catch (e) {
@@ -594,29 +618,32 @@ class ConversationMoneyService {
             });
 
             await tx.message.update({ where: { id: messageId }, data: { status: 'ESCROW_FUNDED' } });
-            return { ticket };
+
+            // r37/P1 — the durable outcome identity commits WITH the financial
+            // mutation: claim, balance move, outcome message and resultMessageId
+            // are ONE transaction. A process crash can no longer leave a funded
+            // ticket whose exact outcome message is unrecoverable — every retry
+            // deterministically replays the durable result.
+            const msg = await tx.message.create({
+                data: { conversationId, senderId: userId, messageType: 'TEXT', content: `🔒 Escrow funded: ${amount.toFixed(2)}` },
+                include: { sender: { select: { id: true, username: true } } },
+            });
+            const finalTicket = await tx.conversationMoneyTicket.update({
+                where: { id: ticket.id },
+                data: { status: 'ESCROW_FUNDED', resultMessageId: msg.id },
+            });
+            return { ticket: finalTicket, message: msg };
         });
 
         if (outcome.replayTicket) return this._outcomeMessage(outcome.replayTicket.id, 'funded');
 
         await this.emitBalanceUpdate(userId);
 
-        // Outcome message (legacy behavior preserved) + replay identity.
-        const amount = new Prisma.Decimal(outcome.ticket.amount);
-        const msg = await this.prisma.message.create({
-            data: { conversationId, senderId: userId, messageType: 'TEXT', content: `🔒 Escrow funded: ${amount.toFixed(2)}` },
-            include: { sender: { select: { id: true, username: true } } },
-        });
-        const ticket = await this.prisma.conversationMoneyTicket.update({
-            where: { id: outcome.ticket.id },
-            data: { resultMessageId: msg.id },
-        });
-
         if (this.io) {
-            this.io.to(`personal_${_roomHash(userId, ticket.counterpartyId)}`)
-                .emit('new_personal_message', this._formatMessage(msg, ticket));
+            this.io.to(`personal_${_roomHash(userId, outcome.ticket.counterpartyId)}`)
+                .emit('new_personal_message', this._formatMessage(outcome.message, outcome.ticket));
         }
-        return { message: msg, ticket };
+        return { message: outcome.message, ticket: outcome.ticket };
     }
 
     // ── release-escrow ───────────────────────────────────────────────────────
@@ -668,34 +695,36 @@ class ConversationMoneyService {
             });
 
             await tx.message.update({ where: { id: messageId }, data: { status: 'ESCROW_RELEASED' } });
-            return { ticket };
+
+            // r37/P1 — outcome message + resultMessageId commit WITH the
+            // payment (one transaction): the durable outcome identity can
+            // never be stranded by a crash between commit and message write.
+            const recipient = await tx.user.findUnique({ where: { id: ticket.counterpartyId } });
+            const msg = await tx.message.create({
+                data: {
+                    conversationId,
+                    senderId: userId,
+                    messageType: 'TEXT',
+                    content: `✅ Escrow released: ${amount.toFixed(2)} sent to ${recipient?.username || 'recipient'}`,
+                },
+                include: { sender: { select: { id: true, username: true } } },
+            });
+            const finalTicket = await tx.conversationMoneyTicket.update({
+                where: { id: ticket.id },
+                data: { status: 'ESCROW_RELEASED', resultMessageId: msg.id },
+            });
+            return { ticket: finalTicket, message: msg };
         });
 
         if (outcome.replayTicket) return this._outcomeMessage(outcome.replayTicket.id, 'released');
 
         await this.emitBalanceUpdate(outcome.ticket.counterpartyId);
 
-        const amount = new Prisma.Decimal(outcome.ticket.amount);
-        const recipient = await this.prisma.user.findUnique({ where: { id: outcome.ticket.counterpartyId } });
-        const msg = await this.prisma.message.create({
-            data: {
-                conversationId,
-                senderId: userId,
-                messageType: 'TEXT',
-                content: `✅ Escrow released: ${amount.toFixed(2)} sent to ${recipient?.username || 'recipient'}`,
-            },
-            include: { sender: { select: { id: true, username: true } } },
-        });
-        const ticket = await this.prisma.conversationMoneyTicket.update({
-            where: { id: outcome.ticket.id },
-            data: { resultMessageId: msg.id },
-        });
-
         if (this.io) {
-            this.io.to(`personal_${_roomHash(userId, ticket.counterpartyId)}`)
-                .emit('new_personal_message', this._formatMessage(msg, ticket));
+            this.io.to(`personal_${_roomHash(userId, outcome.ticket.counterpartyId)}`)
+                .emit('new_personal_message', this._formatMessage(outcome.message, outcome.ticket));
         }
-        return { message: msg, ticket };
+        return { message: outcome.message, ticket: outcome.ticket };
     }
 
     // ── dispute-escrow ───────────────────────────────────────────────────────
@@ -732,34 +761,36 @@ class ConversationMoneyService {
             if (claim.count !== 1) throw fail(409, 'CLAIM_LOST', 'This escrow ticket was just disputed or released.');
 
             await tx.message.update({ where: { id: messageId }, data: { status: 'ESCROW_DISPUTED' } });
-            return { ticket };
+
+            // r37/P1 — outcome message + resultMessageId commit WITH the
+            // state transition (one transaction; see releaseEscrow).
+            const msg = await tx.message.create({
+                data: {
+                    conversationId,
+                    senderId: userId,
+                    messageType: 'TEXT',
+                    content: `⚠️ Escrow disputed: ${reason || 'No reason provided'}`,
+                },
+                include: { sender: { select: { id: true, username: true } } },
+            });
+            const finalTicket = await tx.conversationMoneyTicket.update({
+                where: { id: ticket.id },
+                data: { status: 'ESCROW_DISPUTED', resultMessageId: msg.id },
+            });
+            return { ticket: finalTicket, message: msg };
         });
 
         if (outcome.replayTicket) return this._outcomeMessage(outcome.replayTicket.id, 'disputed');
 
-        const msg = await this.prisma.message.create({
-            data: {
-                conversationId,
-                senderId: userId,
-                messageType: 'TEXT',
-                content: `⚠️ Escrow disputed: ${reason || 'No reason provided'}`,
-            },
-            include: { sender: { select: { id: true, username: true } } },
-        });
-        const ticket = await this.prisma.conversationMoneyTicket.update({
-            where: { id: outcome.ticket.id },
-            data: { resultMessageId: msg.id },
-        });
-
         if (this.io) {
-            const otherId = ticket.requesterId === userId ? ticket.counterpartyId : ticket.requesterId;
+            const otherId = outcome.ticket.requesterId === userId ? outcome.ticket.counterpartyId : outcome.ticket.requesterId;
             this.io.to(`personal_${_roomHash(userId, otherId)}`)
-                .emit('new_personal_message', this._formatMessage(msg, ticket));
+                .emit('new_personal_message', this._formatMessage(outcome.message, outcome.ticket));
             this.io.to('admin_spy_room').emit('escrow_disputed', {
                 conversationId, messageId, userId, reason: reason || 'No reason provided',
             });
         }
-        return { message: msg, ticket };
+        return { message: outcome.message, ticket: outcome.ticket };
     }
 
     // ── Formatting (legacy envelope, now backed by real structured data) ──────

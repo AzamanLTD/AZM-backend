@@ -748,6 +748,87 @@ STATEMENTS.push('ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "failedLoginAttempt
 STATEMENTS.push('ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "lockedUntil" TIMESTAMP(3);');
 STATEMENTS.push('ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "tokenVersion" INTEGER NOT NULL DEFAULT 0;');
 
+// ── r37/P0 — production schema authority for r35/r36 runtime tables ────────
+// CI builds its test database with `prisma db push`, but PRODUCTION is
+// maintained through these raw overlays (no _prisma_migrations baseline, no
+// db push). Two tables added by the r35/r36 waves existed only in
+// schema.prisma — green CI could not see that a real release would deploy
+// application code whose runtime tables do not exist. This section closes
+// that deployment-drift gap; the shapes match the Prisma models exactly
+// (columns, types, indexes, unique constraints, FKs).
+
+// BusinessLedgerEntry (r35 append-only business ledger). The Prisma model
+// types `type` as the LedgerEntryType enum, so the enum TYPE must exist
+// before the table.
+STATEMENTS.push(`DO $$ BEGIN
+    CREATE TYPE "LedgerEntryType" AS ENUM (
+        'INCOME', 'EXPENSE', 'PAYROLL', 'TAX', 'REFUND', 'PENALTY',
+        'AD_SPEND', 'MAINTENANCE', 'SUPPLIES', 'UTILITIES', 'RENT', 'OTHER'
+    );
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;`);
+
+STATEMENTS.push(`CREATE TABLE IF NOT EXISTS "BusinessLedgerEntry" (
+    "id" TEXT NOT NULL,
+    "businessProfileId" TEXT NOT NULL,
+    "type" "LedgerEntryType" NOT NULL,
+    "category" VARCHAR(100) NOT NULL,
+    "description" VARCHAR(500) NOT NULL,
+    "amount" DECIMAL(20,8) NOT NULL,
+    "amountGhs" DECIMAL(20,8),
+    "sourceType" VARCHAR(50),
+    "sourceId" TEXT,
+    "metadata" JSONB,
+    "reversalOfId" TEXT,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT "BusinessLedgerEntry_pkey" PRIMARY KEY ("id")
+);`);
+
+STATEMENTS.push('CREATE INDEX IF NOT EXISTS "BusinessLedgerEntry_businessProfileId_type_idx" ON "BusinessLedgerEntry"("businessProfileId", "type");');
+STATEMENTS.push('CREATE INDEX IF NOT EXISTS "BusinessLedgerEntry_businessProfileId_createdAt_idx" ON "BusinessLedgerEntry"("businessProfileId", "createdAt" DESC);');
+STATEMENTS.push('CREATE INDEX IF NOT EXISTS "BusinessLedgerEntry_businessProfileId_type_createdAt_idx" ON "BusinessLedgerEntry"("businessProfileId", "type", "createdAt" DESC);');
+STATEMENTS.push('CREATE INDEX IF NOT EXISTS "BusinessLedgerEntry_sourceType_sourceId_idx" ON "BusinessLedgerEntry"("sourceType", "sourceId");');
+// r37/P1: durable one-reversal-per-entry invariant (nullable unique —
+// Postgres allows multiple NULLs, so only real reversals are constrained).
+STATEMENTS.push('CREATE UNIQUE INDEX IF NOT EXISTS "BusinessLedgerEntry_reversalOfId_key" ON "BusinessLedgerEntry"("reversalOfId");');
+// The column predates nothing in production (the whole table is new), but
+// ADD COLUMN IF NOT EXISTS keeps the installer rerunnable against a
+// database where a partial backfill may already have run.
+STATEMENTS.push('ALTER TABLE "BusinessLedgerEntry" ADD COLUMN IF NOT EXISTS "reversalOfId" TEXT;');
+
+STATEMENTS.push(`DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.table_constraints WHERE constraint_name = 'BusinessLedgerEntry_businessProfileId_fkey') THEN
+      ALTER TABLE "BusinessLedgerEntry" ADD CONSTRAINT "BusinessLedgerEntry_businessProfileId_fkey" FOREIGN KEY ("businessProfileId") REFERENCES "BusinessProfile"("id") ON DELETE CASCADE;
+    END IF;
+  END $$;`);
+
+// ConversationMoneyTicket (r36 canonical money-in-chat authority). The
+// Prisma model declares NO relation fields (messageId/conversationId are
+// plain strings by design — ticket resolution is authority-checked by
+// predicate, not by FK), so this table carries no foreign keys.
+STATEMENTS.push(`CREATE TABLE IF NOT EXISTS "ConversationMoneyTicket" (
+    "id" TEXT NOT NULL,
+    "messageId" TEXT NOT NULL,
+    "conversationId" TEXT NOT NULL,
+    "kind" TEXT NOT NULL,
+    "amount" DECIMAL(20,8) NOT NULL,
+    "currency" TEXT NOT NULL DEFAULT 'GHS',
+    "requesterId" INTEGER NOT NULL,
+    "counterpartyId" INTEGER NOT NULL,
+    "status" TEXT NOT NULL DEFAULT 'sent',
+    "resultMessageId" TEXT,
+    "clientRequestId" TEXT,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT "ConversationMoneyTicket_pkey" PRIMARY KEY ("id")
+);`);
+
+STATEMENTS.push('CREATE UNIQUE INDEX IF NOT EXISTS "ConversationMoneyTicket_messageId_key" ON "ConversationMoneyTicket"("messageId");');
+STATEMENTS.push('CREATE UNIQUE INDEX IF NOT EXISTS "ConversationMoneyTicket_clientRequestId_key" ON "ConversationMoneyTicket"("clientRequestId");');
+STATEMENTS.push('CREATE INDEX IF NOT EXISTS "ConversationMoneyTicket_conversationId_idx" ON "ConversationMoneyTicket"("conversationId");');
+STATEMENTS.push('CREATE INDEX IF NOT EXISTS "ConversationMoneyTicket_requesterId_idx" ON "ConversationMoneyTicket"("requesterId");');
+STATEMENTS.push('CREATE INDEX IF NOT EXISTS "ConversationMoneyTicket_counterpartyId_idx" ON "ConversationMoneyTicket"("counterpartyId");');
+
 // ── Business OS P0 settlement repair (PR #292, 2026-09-21) ─────────────────
 // EWA withdrawal fee revenue: EwaService.requestWithdrawal records the 1%
 // platform fee as an AdminProfitLog row with source 'EWA_FEE' (ProfitSource

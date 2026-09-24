@@ -46,6 +46,11 @@ const url = process.env.TEST_DATABASE_URL;
 const run = url ? describe : describe.skip;
 
 run('r36/P0 — conversation money state machine', () => {
+    // r37 contract: every money-bearing creation needs a durable
+    // idempotency key. Unique per call so lifecycle tests that create
+    // several requests in one millisecond never accidentally replay.
+    let _legacySeq = 0;
+    const _legacyKey = () => 'r36-legacy-' + Date.now() + '-' + (++_legacySeq);
     let db;
     let app;
     let A, B, C;
@@ -211,7 +216,7 @@ run('r36/P0 — conversation money state machine', () => {
     describe('MONEY_REQUEST lifecycle', () => {
         test('happy path: request is a ticket, no money moves at creation', async () => {
             asUser(A);
-            const res = await post(convAB.id, { type: 'MONEY_REQUEST', moneyAmount: '30', fromUserId: B.id, note: 'wifi bill' });
+            const res = await post(convAB.id, { type: 'MONEY_REQUEST', moneyAmount: '30', fromUserId: B.id, note: 'wifi bill' , clientRequestId: _legacyKey() });
             expect(res.status).toBe(201);
             expect(res.body.data.type).toBe('MONEY_REQUEST');
             expect(res.body.data.moneyAmount).toBe('30.00');
@@ -227,20 +232,20 @@ run('r36/P0 — conversation money state machine', () => {
             const bizConv = await db.conversation.create({ data: { type: 'BUSINESS' } });
             await db.$executeRawUnsafe('INSERT INTO "_ConversationParticipants" ("A", "B") VALUES ($1, $2), ($1, $3)', bizConv.id, A.id, B.id);
             asUser(A);
-            const res = await post(bizConv.id, { type: 'MONEY_REQUEST', moneyAmount: '5' });
+            const res = await post(bizConv.id, { type: 'MONEY_REQUEST', moneyAmount: '5' , clientRequestId: _legacyKey() });
             expect(res.status).toBe(400);
             expect(res.body.message).toMatch(/personal/i);
         });
 
         test('client-supplied fromUserId that disagrees with membership → 400', async () => {
             asUser(A);
-            const res = await post(convAB.id, { type: 'MONEY_REQUEST', moneyAmount: '5', fromUserId: C.id });
+            const res = await post(convAB.id, { type: 'MONEY_REQUEST', moneyAmount: '5', fromUserId: C.id , clientRequestId: _legacyKey() });
             expect(res.status).toBe(400);
         });
 
         test('accept moves money exactly once and records the outcome', async () => {
             asUser(A);
-            const req = await post(convAB.id, { type: 'MONEY_REQUEST', moneyAmount: '30' });
+            const req = await post(convAB.id, { type: 'MONEY_REQUEST', moneyAmount: '30' , clientRequestId: _legacyKey() });
             const msgId = req.body.data.id;
 
             asUser(B);
@@ -261,7 +266,7 @@ run('r36/P0 — conversation money state machine', () => {
 
         test('requester cannot accept their own request', async () => {
             asUser(A);
-            const req = await post(convAB.id, { type: 'MONEY_REQUEST', moneyAmount: '30' });
+            const req = await post(convAB.id, { type: 'MONEY_REQUEST', moneyAmount: '30' , clientRequestId: _legacyKey() });
             const res = await accept(convAB.id, req.body.data.id);
             expect(res.status).toBe(400);
             expect(res.body.message).toMatch(/own request/i);
@@ -269,7 +274,7 @@ run('r36/P0 — conversation money state machine', () => {
 
         test('a stranger (non-participant) cannot accept — 403 at the route', async () => {
             asUser(A);
-            const req = await post(convAB.id, { type: 'MONEY_REQUEST', moneyAmount: '30' });
+            const req = await post(convAB.id, { type: 'MONEY_REQUEST', moneyAmount: '30' , clientRequestId: _legacyKey() });
             asUser(C);
             const res = await accept(convAB.id, req.body.data.id);
             expect(res.status).toBe(403);
@@ -277,12 +282,12 @@ run('r36/P0 — conversation money state machine', () => {
 
         test('foreign messageId from ANOTHER conversation → 404, original untouched', async () => {
             asUser(B);
-            const bcReq = await post(convBC.id, { type: 'MONEY_REQUEST', moneyAmount: '15' });
+            const bcReq = await post(convBC.id, { type: 'MONEY_REQUEST', moneyAmount: '15' , clientRequestId: _legacyKey() });
             const bcMsgId = bcReq.body.data.id;
 
             // A requests money from B inside convAB.
             asUser(A);
-            const abReq = await post(convAB.id, { type: 'MONEY_REQUEST', moneyAmount: '30' });
+            const abReq = await post(convAB.id, { type: 'MONEY_REQUEST', moneyAmount: '30' , clientRequestId: _legacyKey() });
             const abMsgId = abReq.body.data.id;
 
             // B tries to act on the convBC message THROUGH convAB's URL.
@@ -300,7 +305,7 @@ run('r36/P0 — conversation money state machine', () => {
 
         test('concurrent accepts converge on ONE transfer', async () => {
             asUser(A);
-            const req = await post(convAB.id, { type: 'MONEY_REQUEST', moneyAmount: '30' });
+            const req = await post(convAB.id, { type: 'MONEY_REQUEST', moneyAmount: '30' , clientRequestId: _legacyKey() });
             const msgId = req.body.data.id;
 
             asUser(B);
@@ -319,7 +324,7 @@ run('r36/P0 — conversation money state machine', () => {
             asUser(B);
             await db.user.update({ where: { id: B.id }, data: { availableBalance: 5 } });
             asUser(A);
-            const req = await post(convAB.id, { type: 'MONEY_REQUEST', moneyAmount: '30' });
+            const req = await post(convAB.id, { type: 'MONEY_REQUEST', moneyAmount: '30' , clientRequestId: _legacyKey() });
             asUser(B);
             const res = await accept(convAB.id, req.body.data.id);
             expect(res.status).toBe(400);
@@ -332,7 +337,7 @@ run('r36/P0 — conversation money state machine', () => {
 
         test('decline moves no money; replay of decline returns the outcome; cross-state flips rejected', async () => {
             asUser(A);
-            const req = await post(convAB.id, { type: 'MONEY_REQUEST', moneyAmount: '30' });
+            const req = await post(convAB.id, { type: 'MONEY_REQUEST', moneyAmount: '30' , clientRequestId: _legacyKey() });
             const msgId = req.body.data.id;
 
             asUser(B);
@@ -350,7 +355,7 @@ run('r36/P0 — conversation money state machine', () => {
 
         test('accept after decline → 400 ALREADY_DECLINED', async () => {
             asUser(A);
-            const req = await post(convAB.id, { type: 'MONEY_REQUEST', moneyAmount: '30' });
+            const req = await post(convAB.id, { type: 'MONEY_REQUEST', moneyAmount: '30' , clientRequestId: _legacyKey() });
             asUser(B);
             await decline(convAB.id, req.body.data.id);
             const res = await accept(convAB.id, req.body.data.id);
@@ -360,7 +365,7 @@ run('r36/P0 — conversation money state machine', () => {
 
         test('accept replay after accept returns the original outcome, no double payment', async () => {
             asUser(A);
-            const req = await post(convAB.id, { type: 'MONEY_REQUEST', moneyAmount: '30' });
+            const req = await post(convAB.id, { type: 'MONEY_REQUEST', moneyAmount: '30' , clientRequestId: _legacyKey() });
             asUser(B);
             const first = await accept(convAB.id, req.body.data.id);
             const replay = await accept(convAB.id, req.body.data.id);
@@ -376,17 +381,17 @@ run('r36/P0 — conversation money state machine', () => {
     describe('ESCROW_TICKET lifecycle', () => {
         const mkTicket = async (amount = '40') => {
             asUser(A);
-            const res = await post(convAB.id, { type: 'ESCROW_TICKET', amount, itemName: 'Sneakers', counterpartyId: B.id });
+            const res = await post(convAB.id, { type: 'ESCROW_TICKET', amount, itemName: 'Sneakers', counterpartyId: B.id , clientRequestId: _legacyKey() });
             expect(res.status).toBe(201);
             return res.body.data.id;
         };
 
         test('creation requires a real itemName; ticket is unfunded at birth', async () => {
             asUser(A);
-            const noItem = await post(convAB.id, { type: 'ESCROW_TICKET', amount: '40' });
+            const noItem = await post(convAB.id, { type: 'ESCROW_TICKET', amount: '40' , clientRequestId: _legacyKey() });
             expect(noItem.status).toBe(400);
 
-            const ok = await post(convAB.id, { type: 'ESCROW_TICKET', amount: '40', itemName: 'Sneakers' });
+            const ok = await post(convAB.id, { type: 'ESCROW_TICKET', amount: '40', itemName: 'Sneakers' , clientRequestId: _legacyKey() });
             expect(ok.status).toBe(201);
             expect(ok.body.data.moneyAmount).toBe('40.00');
             const ticket = await db.conversationMoneyTicket.findUnique({ where: { messageId: ok.body.data.id } });
@@ -398,7 +403,7 @@ run('r36/P0 — conversation money state machine', () => {
 
         test('client-supplied counterpartyId that disagrees with membership → 400', async () => {
             asUser(A);
-            const res = await post(convAB.id, { type: 'ESCROW_TICKET', amount: '40', itemName: 'X', counterpartyId: C.id });
+            const res = await post(convAB.id, { type: 'ESCROW_TICKET', amount: '40', itemName: 'X', counterpartyId: C.id , clientRequestId: _legacyKey() });
             expect(res.status).toBe(400);
         });
 
@@ -583,7 +588,7 @@ run('r36/P0 — conversation money state machine', () => {
         test('financial messages carry moneyAmount/moneyStatus/escrowTicket; TEXT stays null', async () => {
             asUser(A);
             await post(convAB.id, { type: 'MONEY_SEND', recipientId: B.id, moneyAmount: '12.5', clientRequestId: 'hist-1' });
-            const ticketMsg = await post(convAB.id, { type: 'ESCROW_TICKET', amount: '40', itemName: 'Sneakers' });
+            const ticketMsg = await post(convAB.id, { type: 'ESCROW_TICKET', amount: '40', itemName: 'Sneakers' , clientRequestId: _legacyKey() });
             await post(convAB.id, { type: 'TEXT', text: 'hello' });
 
             asUser(B);

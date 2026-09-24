@@ -5111,6 +5111,13 @@ model BusinessLedgerEntry {
   // Metadata
   metadata Json?
 
+  // r37/P1 — durable one-reversal-per-entry invariant: a unique index on
+  // this column is the concurrency authority (two simultaneous reversal
+  // requests can never both write; the loser fails on the unique index).
+  // metadata.reversalOf is kept for compatibility, but THIS column is the
+  // primary identity — JSON path lookups are not a durable constraint.
+  reversalOfId String? @unique
+
   businessProfile BusinessProfile @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
 
   createdAt DateTime @default(now())

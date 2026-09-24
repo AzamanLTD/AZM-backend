@@ -28,7 +28,9 @@
 'use strict';
 
 const crypto = require('crypto');
+const { Prisma } = require('@prisma/client');
 const { computeTaxLines } = require('../../utils/invoiceMath');
+const ledger = require('../ledgerService');
 
 const SERIALIZABLE_RETRY_LIMIT = 3;
 const SERIALIZABLE_BACKOFF_MS = 10;
@@ -41,27 +43,49 @@ const fail = (code, message = code) => {
     return err;
 };
 
-// Exact money parsing: finite, non-negative, 6-decimal canonical rounding.
-// NaN/Infinity/negative/oversized inputs fail closed.
+// r37/P1 — STRICT EXACT-DECIMAL money parsing on the platform's ONE
+// canonical parser (ledger.toExactDecimal — the same authority as every
+// other financial path). This deliberately REJECTS what JS Number()
+// accepted before:
+//   • exponent notation        ('1e3' — the regex has no exponent form)
+//   • whitespace padding       (' 5.50 ' — rejected before the canonical
+//                              trim, so padded input can never slip through)
+//   • >8 decimal places        ('0.123456789' — was silently rounded to 6dp,
+//                              losing precision against Decimal(20,8) storage)
+//   • NaN / Infinity / negative / oversized values
+// The result is a Prisma.Decimal — Decimal(20,8) authority is preserved
+// end-to-end through the transaction instead of a lossy JS float.
 const parseMoney = (value, field, { required = false } = {}) => {
     if (value === null || value === undefined || value === '') {
         if (required) throw fail('INVALID_INPUT', `${field} is required.`);
-        return 0;
+        return new Prisma.Decimal(0);
     }
-    const n = typeof value === 'number' ? value : Number(String(value).trim());
-    if (!Number.isFinite(n)) throw fail('INVALID_INPUT', `${field} must be a finite number.`);
-    if (n < 0) throw fail('INVALID_INPUT', `${field} cannot be negative.`);
-    if (Math.abs(n) > 1e9) throw fail('INVALID_INPUT', `${field} is unreasonably large.`);
-    return Math.round(n * 1e6) / 1e6;
+    if (typeof value === 'string' && value !== value.trim()) {
+        throw fail('INVALID_INPUT', `${field}: whitespace-padded values are rejected.`);
+    }
+    let dec;
+    try {
+        dec = ledger.toExactDecimal(value, field);
+    } catch (e) {
+        throw fail('INVALID_INPUT',
+            `${field} must be a finite non-negative exact decimal (<= 8 decimals, no exponent, no padding).`);
+    }
+    if (dec.gte(new Prisma.Decimal('1000000000'))) {
+        throw fail('INVALID_INPUT', `${field} is unreasonably large.`);
+    }
+    return dec;
 };
 
+// Replay fingerprint over the EXACT 8-decimal canonical forms — tip/cash are
+// now Prisma.Decimal, so the fingerprint pins the precise stored value rather
+// than a lossy float rounding.
 const fingerprintOf = ({ businessProfileId, actorId, tabId, tip, cash }) =>
     crypto.createHash('sha256').update(JSON.stringify({
         businessProfileId: String(businessProfileId),
         actorId: Number(actorId),
         tabId: String(tabId),
-        tip,
-        cash,
+        tip: tip.toFixed(8),
+        cash: cash == null ? null : cash.toFixed(8),
     })).digest('hex');
 
 class DineInCashCloseService {
@@ -144,7 +168,14 @@ class DineInCashCloseService {
                     if (tab.items.length === 0) throw fail('INVALID_INPUT', 'Cannot close an empty tab.');
 
                     // Totals from durable items only — never client input.
-                    const subtotal = Math.round(tab.items.reduce((sum, item) => sum + Number(item.lineTotalUsdc), 0) * 1e6) / 1e6;
+                    // r37: Decimal(20,8) authority end-to-end — no lossy
+                    // JS-float rounding anywhere between parse, arithmetic,
+                    // storage and the ledger row.
+                    const subtotalDec = tab.items.reduce(
+                        (sum, item) => sum.plus(new Prisma.Decimal(item.lineTotalUsdc)),
+                        new Prisma.Decimal(0)
+                    );
+                    const subtotal = Number(subtotalDec.toFixed(8));
 
                     // Tax via the business's default preset — the same
                     // machinery as the invoice/POS settlement boundary.
@@ -156,13 +187,15 @@ class DineInCashCloseService {
                         })
                         : null;
                     const taxResult = computeTaxLines(preset ? [preset] : [], subtotal);
-                    const taxTotal = taxResult.taxTotal;
-                    const grandTotal = Math.round((subtotal + taxTotal + tip) * 1e6) / 1e6;
+                    const taxTotalDec = new Prisma.Decimal(String(taxResult.taxTotal));
+                    const grandTotalDec = subtotalDec.plus(taxTotalDec).plus(tip);
+                    const grandTotal = Number(grandTotalDec.toFixed(8));
 
-                    if (cash != null && cash < grandTotal) {
+                    if (cash != null && cash.lt(grandTotalDec)) {
                         throw fail('INSUFFICIENT_CASH', 'Insufficient cash received.');
                     }
-                    const change = cash == null ? 0 : Math.round((cash - grandTotal) * 1e6) / 1e6;
+                    const changeDec = cash == null ? new Prisma.Decimal(0) : cash.minus(grandTotalDec);
+                    const change = Number(changeDec.toFixed(8));
 
                     // CAS: exactly one OPEN -> PAID transition can win.
                     const claimed = await tx.dineInTab.updateMany({
@@ -170,10 +203,10 @@ class DineInCashCloseService {
                         data: {
                             status: 'PAID',
                             closedAt: new Date(),
-                            subtotalUsdc: subtotal,
-                            taxTotalUsdc: taxTotal,
+                            subtotalUsdc: subtotalDec,
+                            taxTotalUsdc: taxTotalDec,
                             tipUsdc: tip,
-                            grandTotalUsdc: grandTotal,
+                            grandTotalUsdc: grandTotalDec,
                             paymentMethod: 'CASH',
                             idempotencyKey: key,
                             cashReceived: cash,
@@ -194,25 +227,30 @@ class DineInCashCloseService {
                             type: 'INCOME',
                             category: 'DINE_IN',
                             description: `Dine-in cash close (${tab.id.substring(0, 8)})`,
-                            amount: grandTotal,
-                            amountGhs: grandTotal,
+                            amount: grandTotalDec, // Decimal — no float round-trip
+                            amountGhs: grandTotalDec,
                             sourceType: 'DINE_IN_CASH',
                             sourceId: tab.id,
                             metadata: {
                                 tabId: tab.id,
-                                tip,
-                                subtotal,
-                                taxTotal,
+                                tip: tip.toFixed(8),
+                                subtotal: subtotalDec.toFixed(8),
+                                taxTotal: taxTotalDec.toFixed(8),
                                 taxLines: taxResult.taxLines,
                                 paymentMethod: 'CASH',
-                                ...(cash != null ? { cashReceived: cash, cashChange: change } : {}),
+                                ...(cash != null ? { cashReceived: cash.toFixed(8), cashChange: changeDec.toFixed(8) } : {}),
                                 ...(fingerprint ? { dineInCashCloseFingerprint: fingerprint } : {}),
                             },
                         },
                     });
 
                     const closed = await tx.dineInTab.findUnique({ where: { id: tabId } });
-                    return { tab: closed, duplicate: false, subtotal, taxTotal, tip, grandTotal, change };
+                    return {
+                        tab: closed, duplicate: false, subtotal,
+                        taxTotal: Number(taxTotalDec.toFixed(8)),
+                        tip: Number(tip.toFixed(8)),
+                        grandTotal, change,
+                    };
                 }, { isolationLevel: 'Serializable' });
                 return result;
             } catch (error) {

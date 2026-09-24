@@ -25,7 +25,13 @@
 //     own business.
 // =============================================================================
 // The full Prisma LedgerEntryType enum (keep in sync with schema.prisma).
+const { Prisma } = require('@prisma/client');
+
 const LEDGER_ENTRY_TYPES = ['INCOME', 'EXPENSE', 'PAYROLL', 'TAX', 'REFUND', 'PENALTY', 'AD_SPEND', 'MAINTENANCE', 'SUPPLIES', 'UTILITIES', 'RENT', 'OTHER'];
+
+// Exact 8-decimal string of a stored Decimal — used in metadata so reversal
+// payloads never lose precision through JS number coercion.
+const _fixed = (d) => new Prisma.Decimal(d).toFixed(8);
 const INCOME_TYPES = new Set(['INCOME']);
 const MAX_ABS_AMOUNT = 1e9;
 
@@ -44,6 +50,25 @@ class BusinessLedgerService {
         if (magnitude > MAX_ABS_AMOUNT) throw this._fail(400, 'INVALID_AMOUNT', 'Ledger amount is unreasonably large.');
         const signed = INCOME_TYPES.has(type) ? magnitude : -magnitude;
         return Math.round(signed * 1e6) / 1e6;
+    }
+
+    // r37/P1 — CANONICAL AGGREGATION FORMULA (signed semantics preserved).
+    // Entries are SIGNED by type (INCOME > 0, everything else < 0) and a
+    // reversal is the exact NEGATION of its original with the SAME type.
+    // Aggregating Math.abs(amount) per row breaks that contract for expense
+    // reversals: an EXPENSE of -50 plus its reversal of +50 would report
+    // 100 of expense instead of 0. The canonical rule:
+    //   • income bucket  = signed sum of INCOME rows
+    //   • expense bucket = abs(signed sum of non-INCOME rows)
+    //                     (reversals net to zero INSIDE the sum)
+    // Per-type and per-category buckets follow the same rule. Decimal
+    // accumulation keeps the arithmetic exact to the stored precision.
+    _sumSigned(entries) {
+        return entries.reduce((acc, e) => acc.plus(new Prisma.Decimal(e.amount)), new Prisma.Decimal(0));
+    }
+
+    _num(dec) {
+        return Number(dec.toFixed(8));
     }
 
     _fail(status, code, message) {
@@ -94,38 +119,50 @@ class BusinessLedgerService {
                 throw this._fail(404, 'ENTRY_NOT_FOUND', 'Ledger entry not found.');
             }
 
-            // One reversal per entry — idempotent refusal, never a second
-            // economic mutation.
-            const existingReversal = await tx.businessLedgerEntry.findFirst({
-                where: { businessProfileId, metadata: { path: ['reversalOf'], equals: entryId } },
-                select: { id: true },
-            });
-            if (existingReversal) {
-                throw this._fail(409, 'ALREADY_REVERSED', 'Ledger entry has already been reversed.');
+            // r37/P1: a reversal row may never itself be reversed — chains
+            // would double-apply economics. The durable reversalOfId column
+            // (and the legacy metadata flag) identify reversal rows.
+            if (original.reversalOfId != null || original.metadata?.reversal === true) {
+                throw this._fail(409, 'NOT_REVERSIBLE', 'Reversal entries cannot be reversed.');
             }
 
-            const originalAmount = Number(original.amount);
-            if (!Number.isFinite(originalAmount) || originalAmount === 0) {
+            const originalAmount = new Prisma.Decimal(original.amount);
+            if (!originalAmount.isFinite() || originalAmount.isZero()) {
                 throw this._fail(409, 'NOT_REVERSIBLE', 'Entry cannot be reversed.');
             }
 
-            const reversal = await tx.businessLedgerEntry.create({
-                data: {
-                    businessProfileId,
-                    type: original.type,
-                    category: original.category,
-                    description: `Reversal: ${original.description}`.slice(0, 500),
-                    amount: Math.round(-originalAmount * 1e6) / 1e6, // exact negation
-                    sourceType: original.sourceType,
-                    sourceId: original.sourceId,
-                    metadata: {
-                        reversalOf: original.id,
-                        reversal: true,
-                        reversedAmount: Number(original.amount),
-                        ...(reason ? { reversalReason: String(reason).slice(0, 500) } : {}),
+            let reversal;
+            try {
+                // r37/P1 — THE INVARIANT: reversalOfId carries a database
+                // UNIQUE index. Two simultaneous reversal requests both pass
+                // any serial pre-check; exactly one INSERT wins — the loser
+                // fails on the unique index (P2002) and fails closed with
+                // zero mutation. The original row is never mutated; one
+                // entry gets exactly one reversal, durably.
+                reversal = await tx.businessLedgerEntry.create({
+                    data: {
+                        businessProfileId,
+                        type: original.type,
+                        category: original.category,
+                        description: `Reversal: ${original.description}`.slice(0, 500),
+                        amount: originalAmount.neg(), // exact negation, full Decimal precision
+                        sourceType: original.sourceType,
+                        sourceId: original.sourceId,
+                        reversalOfId: original.id,
+                        metadata: {
+                            reversalOf: original.id,
+                            reversal: true,
+                            reversedAmount: _fixed(original.amount),
+                            ...(reason ? { reversalReason: String(reason).slice(0, 500) } : {}),
+                        },
                     },
-                },
-            });
+                });
+            } catch (e) {
+                if (e.code === 'P2002' && String(e.meta?.target || '').includes('reversalOfId')) {
+                    throw this._fail(409, 'ALREADY_REVERSED', 'Ledger entry has already been reversed.');
+                }
+                throw e;
+            }
             return { reversal, original };
         });
     }
@@ -156,38 +193,50 @@ class BusinessLedgerService {
 
         const entries = await this.prisma.businessLedgerEntry.findMany({ where });
 
-        // r35: netProfit is now computed from the SIGNED amounts directly —
-        // the canonical contract guarantees INCOME > 0 and other types < 0.
-        const income = entries.filter(e => e.type === 'INCOME').reduce((s, e) => s + parseFloat(e.amount), 0);
-        const expenses = entries.filter(e => e.type !== 'INCOME').reduce((s, e) => s + Math.abs(parseFloat(e.amount)), 0);
+        // r37: canonical SIGNED aggregation — reversals net to zero inside
+        // their bucket instead of inflating gross amounts (see _sumSigned).
+        const income = this._num(this._sumSigned(entries.filter(e => e.type === 'INCOME')));
+        const expenses = this._num(this._sumSigned(entries.filter(e => e.type !== 'INCOME')).abs());
 
-        const byType = {};
-        const byCategory = {};
-        const incomeByCategory = {};
-        const expenseByCategory = {};
+        const byTypeDec = {};
+        const byCategoryDec = {};
+        const incomeByCategoryDec = {};
+        const expenseByCategoryDec = {};
 
         entries.forEach(e => {
-            const amount = Math.abs(parseFloat(e.amount));
+            const amount = new Prisma.Decimal(e.amount);
             const typeKey = e.type;
             const categoryKey = e.category || 'Uncategorized';
-            byType[typeKey] = (byType[typeKey] || 0) + amount;
-            byCategory[categoryKey] = (byCategory[categoryKey] || 0) + amount;
+            byTypeDec[typeKey] = (byTypeDec[typeKey] || new Prisma.Decimal(0)).plus(amount);
+            byCategoryDec[categoryKey] = (byCategoryDec[categoryKey] || new Prisma.Decimal(0)).plus(amount);
             if (e.type === 'INCOME') {
-                incomeByCategory[categoryKey] = (incomeByCategory[categoryKey] || 0) + amount;
+                incomeByCategoryDec[categoryKey] = (incomeByCategoryDec[categoryKey] || new Prisma.Decimal(0)).plus(amount);
             } else {
-                expenseByCategory[categoryKey] = (expenseByCategory[categoryKey] || 0) + amount;
+                expenseByCategoryDec[categoryKey] = (expenseByCategoryDec[categoryKey] || new Prisma.Decimal(0)).plus(amount);
             }
         });
+
+        // INCOME buckets report the signed sum as-is; every other bucket
+        // reports the abs of its signed NET (a reversal of EXPENSE -50 is
+        // +50, so the bucket nets to 0 — never double-counted as gross).
+        const report = (map, absNet) => {
+            const out = {};
+            for (const k of Object.keys(map)) out[k] = this._num(absNet ? map[k].abs() : map[k]);
+            return out;
+        };
 
         return {
             totalIncome: income,
             totalExpenses: expenses,
-            netProfit: income - expenses,
+            netProfit: this._num(new Prisma.Decimal(income).minus(new Prisma.Decimal(expenses))),
             margin: income > 0 ? ((income - expenses) / income) * 100 : 0,
-            byType,
-            byCategory,
-            incomeByCategory,
-            expenseByCategory,
+            byType: Object.keys(byTypeDec).reduce((o, k) => {
+                o[k] = this._num(k === 'INCOME' ? byTypeDec[k] : byTypeDec[k].abs());
+                return o;
+            }, {}),
+            byCategory: report(byCategoryDec, true), // magnitude, reversal-netted
+            incomeByCategory: report(incomeByCategoryDec, false),
+            expenseByCategory: report(expenseByCategoryDec, true),
             entryCount: entries.length,
         };
     }
@@ -232,11 +281,15 @@ class BusinessLedgerService {
         const byCategory = {};
         entries.forEach(e => {
             const key = e.category || 'Uncategorized';
-            if (!byCategory[key]) byCategory[key] = { category: key, amount: 0, count: 0 };
-            byCategory[key].amount += Math.abs(parseFloat(e.amount));
+            if (!byCategory[key]) byCategory[key] = { category: key, sum: new Prisma.Decimal(0), count: 0 };
+            // r37: signed net per category — an expense reversal cancels its
+            // original instead of adding another gross expense.
+            byCategory[key].sum = byCategory[key].sum.plus(new Prisma.Decimal(e.amount));
             byCategory[key].count += 1;
         });
-        const breakdown = Object.values(byCategory).sort((a, b) => b.amount - a.amount);
+        const breakdown = Object.values(byCategory)
+            .map(({ category, sum, count }) => ({ category, amount: this._num(sum.abs()), count }))
+            .sort((a, b) => b.amount - a.amount);
         const total = breakdown.reduce((s, e) => s + e.amount, 0);
         return {
             totalExpenses: total,
@@ -254,10 +307,11 @@ class BusinessLedgerService {
             this.prisma.businessLedgerEntry.findMany({ where: { businessProfileId, createdAt: { gte: sixtyDaysAgo, lt: thirtyDaysAgo } } }),
             this.prisma.businessLedgerEntry.findMany({ where: { businessProfileId } }),
         ]);
-        const currentIncome = currentEntries.filter(e => e.type === 'INCOME').reduce((s, e) => s + parseFloat(e.amount), 0);
-        const previousIncome = previousEntries.filter(e => e.type === 'INCOME').reduce((s, e) => s + parseFloat(e.amount), 0);
-        const currentExpenses = currentEntries.filter(e => e.type !== 'INCOME').reduce((s, e) => s + Math.abs(parseFloat(e.amount)), 0);
-        const previousExpenses = previousEntries.filter(e => e.type !== 'INCOME').reduce((s, e) => s + Math.abs(parseFloat(e.amount)), 0);
+        // r37: canonical signed aggregation (reversals net inside the sum).
+        const currentIncome = this._num(this._sumSigned(currentEntries.filter(e => e.type === 'INCOME')));
+        const previousIncome = this._num(this._sumSigned(previousEntries.filter(e => e.type === 'INCOME')));
+        const currentExpenses = this._num(this._sumSigned(currentEntries.filter(e => e.type !== 'INCOME')).abs());
+        const previousExpenses = this._num(this._sumSigned(previousEntries.filter(e => e.type !== 'INCOME')).abs());
         return {
             revenue: { current: currentIncome, previous: previousIncome, change: previousIncome > 0 ? ((currentIncome - previousIncome) / previousIncome) * 100 : 0 },
             expenses: { current: currentExpenses, previous: previousExpenses, change: previousExpenses > 0 ? ((currentExpenses - previousExpenses) / previousExpenses) * 100 : 0 },
