@@ -57,6 +57,73 @@ function toFixed8(dec) {
     return quantize8(dec).toFixed(8);
 }
 
+// r39/P1 — STRICT QUANTITY CONTRACT (the financial-count authority).
+// parseInt()/Number() silently turn malformed input into a DIFFERENT economic
+// request; this parser refuses everything that is not an unambiguous,
+// positive, safe integer. It is the ONE quantity authority shared by the
+// execution path (computeLineItemsExact) and the idempotency fingerprint
+// (businessInvoiceCreationBoundary), so replay identity and computation can
+// never disagree.
+//
+// Rejected: 0, negatives, fractional numbers (1.5), fractional strings
+// ("1.5"), exponent strings ("1e2"), empty/null/undefined, booleans,
+// objects/arrays/Decimals, non-numeric strings, non-safe integers, and
+// quantities above MAX_REASONABLE_QUANTITY (rejected BEFORE multiplication,
+// never silently defaulted).
+const MAX_REASONABLE_QUANTITY = 1_000_000_000; // 1e9 units on one line is not a legitimate invoice
+
+function parseStrictQuantity(value, label = 'quantity') {
+    if (value === null || value === undefined) {
+        throw new Error(`${label}: quantity is required (positive integer).`);
+    }
+    if (typeof value === 'boolean' || (typeof value === 'object' && value !== null)) {
+        throw new Error(`${label}: quantity must be a positive integer, not ${typeof value}.`);
+    }
+    if (typeof value === 'number') {
+        if (!Number.isFinite(value)) {
+            throw new Error(`${label}: non-finite quantity.`);
+        }
+        if (!Number.isSafeInteger(value)) {
+            throw new Error(`${label}: quantity must be an integer (fractional or unsafe-magnitude values are rejected).`);
+        }
+        if (value < 1) {
+            throw new Error(`${label}: quantity must be at least 1.`);
+        }
+    } else if (typeof value === 'string') {
+        const s = value.trim();
+        if (!/^\d+$/.test(s)) {
+            // Rejects "", "1.5", "1e2", "-1", "0x10", "1_000", "NaN", "Infinity".
+            throw new Error(`${label}: "${value}" is not a canonical non-negative integer string.`);
+        }
+        const n = Number(s);
+        if (!Number.isSafeInteger(n)) {
+            throw new Error(`${label}: quantity exceeds the safe integer range.`);
+        }
+        if (n < 1) {
+            throw new Error(`${label}: quantity must be at least 1.`);
+        }
+    } else {
+        throw new Error(`${label}: unsupported quantity type ${typeof value}.`);
+    }
+    if (value > MAX_REASONABLE_QUANTITY) {
+        throw new Error(`${label}: quantity ${value} is unreasonably large (max ${MAX_REASONABLE_QUANTITY}).`);
+    }
+    return Number(value);
+}
+
+// r39/P1 — PERSISTENCE ENVELOPE: every Decimal(20,8) column holds at most
+// 999999999999.99999999. A legal unit price times a huge quantity must be
+// refused HERE, at the exact-math boundary, BEFORE persistence — never left
+// to a database overflow error (or a silent engine clamp) at write time.
+const MAX_PERSISTABLE = new Prisma.Decimal('999999999999.99999999');
+
+function assertPersistableExact(dec, label = 'amount') {
+    if (dec.gt(MAX_PERSISTABLE)) {
+        throw new Error(`${label} exceeds the Decimal(20,8) persistence envelope (max 999999999999.99999999).`);
+    }
+    return dec;
+}
+
 /**
  * Compute invoice/POS line items with exact decimal arithmetic.
  * Each item: { description, quantity (integer 1..N), unitPrice }
@@ -75,22 +142,28 @@ function computeLineItemsExact(lineItems) {
 
     let subtotal = new Prisma.Decimal(0);
     const clean = lineItems.map((item) => {
-        const qty = Math.max(1, parseInt(item.quantity, 10) || 1);
-        if (!Number.isInteger(qty) || qty < 1) throw new Error('Invalid line item quantity.');
-        const unit = parseExactDecimal(item.unitPrice, 'unitPrice'); // non-negative, <= 8dp
+        const description = String(item.description || '').trim().slice(0, 200);
+        // r39/P1 — STRICT quantity: malformed input is REJECTED, never
+        // silently defaulted to 1 (parseInt would have reshaped the economy).
+        const qty = parseStrictQuantity(item.quantity, `line item '${description}' quantity`);
+        const unit = parseExactDecimal(item.unitPrice, `line item '${description}' unitPrice`); // non-negative, <= 8dp
         // Exact decimal multiplication — 8dp × integer is representable at 8dp.
         const lineTotal = unit.times(qty);
         if (lineTotal.decimalPlaces() > 8) {
             throw new Error('Line total exceeds 8 decimal places.');
         }
+        // Magnitude invariant BEFORE persistence: a legal price times a huge
+        // quantity cannot overflow the Decimal(20,8) column at write time.
+        assertPersistableExact(lineTotal, `line item '${description}' total`);
         subtotal = subtotal.plus(lineTotal);
         return {
-            description: String(item.description || '').trim().slice(0, 200),
+            description,
             quantity: qty,
             unitPrice: unit,
             lineTotal,
         };
     });
+    assertPersistableExact(subtotal, 'invoice subtotal');
 
     return { subtotal, lineItems: clean };
 }
@@ -120,11 +193,13 @@ function computeTaxLinesExact(taxSpecs, subtotalDec) {
             : value;
         // Deliberate storage quantization (HALF_UP, 8dp) — the tested rule.
         const computedAmount = quantize8(computed);
+        assertPersistableExact(computedAmount, `tax line '${name}' amount`);
         taxTotal = taxTotal.plus(computedAmount);
         return { name, type, value, computedAmount };
     });
 
     // taxTotal is the exact sum of 8dp-quantized lines — always <= 8dp.
+    assertPersistableExact(taxTotal, 'tax total');
     return { taxTotal, taxLines: clean };
 }
 
@@ -137,11 +212,16 @@ function computeInvoiceTotalsExact(lineItems, taxSpecs) {
     const { subtotal, lineItems: clean } = computeLineItemsExact(lineItems);
     const { taxTotal, taxLines: cleanTax } = computeTaxLinesExact(taxSpecs, subtotal);
     const billTotal = subtotal.plus(taxTotal);
+    assertPersistableExact(billTotal, 'bill total');
     return { subtotal, taxTotal, billTotal, lineItems: clean, taxLines: cleanTax };
 }
 
 module.exports = {
     parseExactDecimal,
+    parseStrictQuantity,
+    assertPersistableExact,
+    MAX_PERSISTABLE,
+    MAX_REASONABLE_QUANTITY,
     quantize8,
     toWire,
     toFixed8,

@@ -1,6 +1,10 @@
 'use strict';
 
 const invoiceService = require('./businessInvoiceService');
+const {
+  parseExactDecimal,
+  parseStrictQuantity,
+} = require('../utils/exactInvoiceMath');
 
 const MAX_IDEMPOTENCY_KEY_LENGTH = 255;
 
@@ -14,14 +18,74 @@ function normalizeIdempotencyKey(value) {
   return key;
 }
 
+// r39/P1 — EXACT FINGERPRINT CANONICALIZATION.
+// The replay identity uses the SAME authorities as the execution path
+// (exactInvoiceMath.parseStrictQuantity / parseExactDecimal) and represents
+// every monetary value by its exact canonical decimal string. NO JS Number
+// conversion anywhere: float64 collapses large-magnitude 8dp values
+// (999999999999.99999999 vs 999999999999.99999998 are indistinguishable as
+// float64 but are DIFFERENT economic intents), so a Number()-based fingerprint
+// could accept a materially different replay.
+const canonicalUnitPrice = (value, label) => parseExactDecimal(value, label).toFixed(8);
+const canonicalQuantity = (value, label) => String(parseStrictQuantity(value, label));
+
+function canonicalRequestItem(item, index) {
+  const label = `lineItems[${index}]`;
+  return {
+    description: String(item.description || '').trim().slice(0, 200),
+    quantity: canonicalQuantity(item.quantity, `${label}.quantity`),
+    unitPrice: canonicalUnitPrice(item.unitPrice, `${label}.unitPrice`),
+  };
+}
+
+// Stored rows come back as Prisma.Decimal (or plain values in narrow unit
+// mocks); both normalize through the same exact parser to the identical
+// canonical 8dp string the row was persisted with.
+function canonicalStoredItem(item, index) {
+  const label = `stored lineItems[${index}]`;
+  return {
+    description: String(item.description || ''),
+    quantity: canonicalQuantity(item.quantity, `${label}.quantity`),
+    unitPrice: canonicalUnitPrice(item.unitPrice, `${label}.unitPrice`),
+  };
+}
+
+// Tax value column is Decimal(10,4) — the same 4dp ceiling the execution path
+// enforces up-front is applied here so a >4dp replay intent is refused rather
+// than silently rounded into a false match.
+const canonicalTaxValue = (value, name) => {
+  const dec = parseExactDecimal(value, `tax value for '${name}'`);
+  if (dec.decimalPlaces() > 4) {
+    throw Object.assign(
+      new Error(`Tax value for '${name}' supports at most 4 decimal places (Decimal(10,4) column).`),
+      { status: 400 },
+    );
+  }
+  return dec.toFixed(4);
+};
+
 function normalizeTaxIntent(taxLines) {
   if (taxLines === undefined) return null; // undefined means "use current business default"
   if (!Array.isArray(taxLines)) return [];
-  return taxLines.map((tax) => ({
-    name: String(tax.name || '').trim(),
-    type: String(tax.type || '').toUpperCase(),
-    value: Number(tax.value),
-  }));
+  return taxLines.map((tax) => {
+    const name = String(tax.name || '').trim();
+    return {
+      name,
+      type: String(tax.type || '').toUpperCase(),
+      value: canonicalTaxValue(tax.value, name || 'unnamed'),
+    };
+  });
+}
+
+function storedTaxIntent(taxLines) {
+  return (taxLines || []).map((tax) => {
+    const name = String(tax.name || '').trim();
+    return {
+      name,
+      type: String(tax.type || '').toUpperCase(),
+      value: canonicalTaxValue(tax.value, name || 'unnamed'),
+    };
+  });
 }
 
 function assertReplayBelongsToIntent(invoice, args) {
@@ -29,22 +93,15 @@ function assertReplayBelongsToIntent(invoice, args) {
 
   const mismatches = [];
   if (String(invoice.businessProfileId) !== String(args.businessProfileId)) mismatches.push('businessProfileId');
-  if (Number(invoice.customerId) !== Number(args.customerId)) mismatches.push('customerId');
+  if (String(invoice.customerId) !== String(args.customerId)) mismatches.push('customerId');
   if ((invoice.locationId || null) !== (args.locationId || null)) mismatches.push('locationId');
   if ((invoice.tableId || null) !== (args.tableId || null)) mismatches.push('tableId');
 
+  // Exact canonical decimal strings on BOTH sides — never JS Number coercion.
   const cleanItems = Array.isArray(args.lineItems)
-    ? args.lineItems.map((item) => ({
-        description: String(item.description || '').trim().slice(0, 200),
-        quantity: Number.isFinite(Number(item.quantity)) && Number(item.quantity) > 0 ? Number(item.quantity) : 1,
-        unitPrice: Number(item.unitPrice),
-      }))
+    ? args.lineItems.map((item, i) => canonicalRequestItem(item, i))
     : [];
-  const storedItems = (invoice.lineItems || []).map((item) => ({
-    description: String(item.description || ''),
-    quantity: Number(item.quantity),
-    unitPrice: Number(item.unitPrice),
-  }));
+  const storedItems = (invoice.lineItems || []).map((item, i) => canonicalStoredItem(item, i));
   if (JSON.stringify(storedItems) !== JSON.stringify(cleanItems)) mismatches.push('lineItems');
 
   const requestedNote = args.businessNote ? String(args.businessNote).slice(0, 500) : null;
@@ -52,12 +109,7 @@ function assertReplayBelongsToIntent(invoice, args) {
 
   const requestedTax = normalizeTaxIntent(args.taxLines);
   if (requestedTax !== null) {
-    const storedTax = (invoice.taxLines || []).map((tax) => ({
-      name: String(tax.name || '').trim(),
-      type: String(tax.type || '').toUpperCase(),
-      value: Number(tax.value),
-    }));
-    if (JSON.stringify(storedTax) !== JSON.stringify(requestedTax)) mismatches.push('taxLines');
+    if (JSON.stringify(storedTaxIntent(invoice.taxLines)) !== JSON.stringify(requestedTax)) mismatches.push('taxLines');
   }
 
   if (mismatches.length) {
