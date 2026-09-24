@@ -6,69 +6,95 @@
 //
 // Supports SALARY and HOURLY payroll types. Overtime is 1.5x for hours
 // beyond 8 per shift. EWA deductions subtract from net pay.
+//
+// r39/P1 (repo-wide financial arithmetic sweep) — EXACT MONEY CONTRACT:
+// every monetary field (base, overtime, gross, net, EWA deduction) is
+// computed with Prisma.Decimal from the exact persisted inputs — never
+// parseFloat, never binary-float multiply/add. Rounding happens ONCE, at
+// the 8dp ledger authority (HALF_UP), matching the DECIMAL(20,8) columns.
+// Hours are informational quantities and are reported at 2dp.
+//
+// The integer-minute core makes the math exact by construction: base pay
+// is rate × (total worked minutes)/60 rounded once; the overtime bonus is
+// rate × (total overtime minutes)/120 rounded once.
 // =============================================================================
+const { Prisma } = require('@prisma/client');
+
+const ZERO = new Prisma.Decimal(0);
+const MONEY_SCALE = 8;
+const HOURS_SCALE = 2;
+const OVERTIME_THRESHOLD_MINUTES = 480; // 8h
+
+// Exact Decimal from any persisted representation (Decimal | string | number).
+const toDecimal = (value) => {
+    if (value == null || value === '') return ZERO;
+    if (value instanceof Prisma.Decimal) return value;
+    return new Prisma.Decimal(String(value));
+};
+
+const money = (d) => d.toDecimalPlaces(MONEY_SCALE, Prisma.Decimal.ROUND_HALF_UP);
+const hours = (d) => d.toDecimalPlaces(HOURS_SCALE, Prisma.Decimal.ROUND_HALF_UP);
 
 /**
  * Calculate payroll for a single employee from their shift records.
  *
  * @param {object} employee - { payrollType, salaryAmount, hourlyRate, withdrawnEarly }
  * @param {Array} shifts - Array of { actualMinutes, breakMinutes }
- * @returns {object} - { grossAmount, netAmount, baseAmount, overtimeAmount, ewaDeduction, totalHours, overtimeHours, regularHours }
+ * @returns {object} Decimal money fields ({ grossAmount, netAmount, baseAmount,
+ *   overtimeAmount, ewaDeduction, taxAmount, deductionAmount }) and Decimal
+ *   2dp hour quantities ({ totalHours, overtimeHours, regularHours }) plus
+ *   shiftCount. Money fields are exact at 8dp — persist and compare as-is.
  */
 function calculatePayroll(employee, shifts = []) {
-  const payrollType = employee.payrollType;
-  let baseAmount = 0;
-  let totalHours = 0;
-  let overtimeHours = 0;
+  const workedMinutesOf = (s) => Math.max(0, (s.actualMinutes || 0) - (s.breakMinutes || 0));
+  const sumWorkedMinutes = shifts.reduce((sum, s) => sum + workedMinutesOf(s), 0);
+  const overtimeMinutes = shifts.reduce(
+    (sum, s) => sum + Math.max(0, workedMinutesOf(s) - OVERTIME_THRESHOLD_MINUTES),
+    0
+  );
 
+  const payrollType = employee && employee.payrollType;
+  const ewaDeduction = toDecimal(employee && employee.withdrawnEarly);
+  const taxAmount = ZERO;
+  const deductionAmount = ZERO;
+
+  let baseAmount = ZERO;
   if (payrollType === 'SALARY') {
-    baseAmount = parseFloat(employee.salaryAmount) || 0;
-    // Hours are informational for salary employees
-    totalHours = shifts.reduce((sum, s) => {
-      if (s.actualMinutes) {
-        return sum + Math.max(0, (s.actualMinutes - (s.breakMinutes || 0)) / 60);
-      }
-      return sum;
-    }, 0);
+    baseAmount = money(toDecimal(employee && employee.salaryAmount));
   } else if (payrollType === 'HOURLY') {
-    const rate = parseFloat(employee.hourlyRate) || 0;
-    shifts.forEach(s => {
-      if (s.actualMinutes) {
-        const workedHours = Math.max(0, (s.actualMinutes - (s.breakMinutes || 0)) / 60);
-        totalHours += workedHours;
-        const dailyOvertime = Math.max(0, workedHours - 8);
-        overtimeHours += dailyOvertime;
-        baseAmount += workedHours * rate;
-      }
-    });
+    const rate = toDecimal(employee && employee.hourlyRate);
+    // Full rate for every worked minute; ONE division, ONE 8dp rounding.
+    baseAmount = money(rate.times(sumWorkedMinutes).div(60));
   }
 
-  // Overtime bonus: 0.5x on top of the regular rate already in baseAmount
-  const hourlyRate = parseFloat(employee.hourlyRate) || 0;
-  const overtimeAmount = overtimeHours * hourlyRate * 0.5;
+  // Overtime bonus: 0.5x on top of the regular rate already in baseAmount.
+  // HOURLY only — salary employees have no hourly rate.
+  let overtimeAmount = ZERO;
+  if (payrollType === 'HOURLY') {
+    const rate = toDecimal(employee && employee.hourlyRate);
+    overtimeAmount = money(rate.times(overtimeMinutes).div(120));
+  }
 
-  // EWA deduction
-  const ewaDeduction = parseFloat(employee.withdrawnEarly) || 0;
+  const grossAmount = baseAmount.plus(overtimeAmount);
+  const netAmount = grossAmount.minus(ewaDeduction).minus(taxAmount).minus(deductionAmount);
 
-  // Tax and other deductions (placeholders — currently 0)
-  const taxAmount = 0;
-  const deductionAmount = 0;
-
-  const grossAmount = parseFloat((baseAmount + overtimeAmount).toFixed(6));
-  const netAmount = parseFloat((grossAmount - ewaDeduction - taxAmount - deductionAmount).toFixed(6));
+  const totalHours = hours(new Prisma.Decimal(sumWorkedMinutes).div(60));
+  const overtimeHours = hours(new Prisma.Decimal(overtimeMinutes).div(60));
+  const regularHours = totalHours.minus(overtimeHours);
 
   return {
     grossAmount,
     netAmount,
-    baseAmount: parseFloat(baseAmount.toFixed(6)),
-    overtimeAmount: parseFloat(overtimeAmount.toFixed(6)),
-    ewaDeduction: parseFloat(ewaDeduction.toFixed(6)),
+    baseAmount,
+    overtimeAmount,
+    ewaDeduction,
     taxAmount,
     deductionAmount,
-    totalHours: Math.round(totalHours * 100) / 100,
-    overtimeHours: Math.round(overtimeHours * 100) / 100,
-    regularHours: Math.round((totalHours - overtimeHours) * 100) / 100,
+    totalHours,
+    overtimeHours,
+    regularHours,
+    shiftCount: shifts.length,
   };
 }
 
-module.exports = { calculatePayroll };
+module.exports = { calculatePayroll, toDecimal, money, hours };

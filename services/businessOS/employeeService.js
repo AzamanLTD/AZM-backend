@@ -8,6 +8,7 @@
 // from both route controllers and test suites.
 // =============================================================================
 
+const ledger = require('../ledgerService');
 const logger = require('../../src/config/logger');
 const { PrismaClient } = require('@prisma/client');
 const { EwaService } = require('./ewaService');
@@ -95,6 +96,17 @@ class EmployeeService {
     // ── Create / Add Employee ──────────────────────────────────────────────
     // The business owner adds an employee by their Azaman user ID (or AZM-ID).
     // This links the user's consumer account to the business as an employee.
+    // r39/P1 — exact pay-field parsing with a clean 400 for bad input.
+    _parsePayField(value, field) {
+        try {
+            return ledger.toExactDecimal(String(value), field);
+        } catch (e) {
+            const err = new Error(`${field} must be a non-negative exact decimal (<= 8 decimals).`);
+            err.status = 400;
+            throw err;
+        }
+    }
+
     async addEmployee({ businessProfileId, userId, azmId, role = 'STAFF', title, department, payrollType = 'SALARY', salaryAmount, hourlyRate, paymentPreference = 'AZAMAN_BALANCE', permissions, emergencyContact, notes }, { actor } = {}) {
         // r26/P0-2: an employee row may never carry OWNER (fail closed).
         assertAssignableRole(role);
@@ -158,9 +170,12 @@ class EmployeeService {
         // The validated candidate set (canonical keys, within ceiling).
         const finalPermissions = candidatePermissions;
 
-        // Convert salaryAmount/hourlyRate to Decimal
-        const salaryDecimal = salaryAmount ? parseFloat(salaryAmount) : null;
-        const hourlyDecimal = hourlyRate ? parseFloat(hourlyRate) : null;
+        // r39/P1 — Convert salaryAmount/hourlyRate to EXACT Decimals via the
+        // canonical parser (never parseFloat into a DECIMAL(20,8) column:
+        // floats lose the 8dp authority and can serialize as exponents).
+        // Over-precision and negative pay inputs are rejected explicitly.
+        const salaryDecimal = salaryAmount ? this._parsePayField(salaryAmount, 'salaryAmount') : null;
+        const hourlyDecimal = hourlyRate ? this._parsePayField(hourlyRate, 'hourlyRate') : null;
 
         const employee = await this.prisma.businessEmployee.create({
             data: {
@@ -250,7 +265,9 @@ class EmployeeService {
         for (const key of EMPLOYEE_UPDATE_ALLOWED_FIELDS) {
             if (key in updates) {
                 if (key === 'salaryAmount' || key === 'hourlyRate') {
-                    data[key] = updates[key] !== null ? parseFloat(updates[key]) : null;
+                    data[key] = updates[key] !== null
+                        ? this._parsePayField(updates[key], key)
+                        : null;
                 } else {
                     data[key] = updates[key];
                 }

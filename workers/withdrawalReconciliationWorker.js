@@ -10,6 +10,7 @@
 // =============================================================================
 
 const logger = require('../src/config/logger');
+const { Prisma } = require('@prisma/client'); // r39 exact decimals in refund derivation
 const financeService = require('../services/finance.service');
 const { recordProviderSettlementAttempt } = require('../services/providerSettlementAttemptService');
 const { resolvePayoutOwner } = require('../services/payoutProviderOwnership');
@@ -622,9 +623,12 @@ class WithdrawalReconciliationWorker {
                 // claim the terminal Withdrawal row. The canonical refund is
                 // deterministic from the immutable transaction amount + fee,
                 // so terminal failure payloads never carry an undefined refund.
-                const refundedAmount = result.refundedAmount != null
-                    ? result.refundedAmount
-                    : Number(txRow.amountUsdc) + Number(txRow.feeUsdc);
+                // r39/P1 — exact refund derivation (Decimal-native), with
+                // a Number() display mirror ONLY for notification payloads.
+                const refundedExact = result.refundedAmount != null
+                    ? new Prisma.Decimal(result.refundedAmount)
+                    : new Prisma.Decimal(txRow.amountUsdc).plus(txRow.feeUsdc);
+                const refundedAmount = Number(refundedExact.toFixed(8));
 
                 logger.warn(`[WithdrawalReconciliation] ref=${reference} REVERSED. user refund: ${refundedAmount} USDC.`);
                 if (this.io) {

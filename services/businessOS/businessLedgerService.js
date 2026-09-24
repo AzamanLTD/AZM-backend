@@ -26,6 +26,7 @@
 // =============================================================================
 // The full Prisma LedgerEntryType enum (keep in sync with schema.prisma).
 const { Prisma } = require('@prisma/client');
+const ledger = require('../ledgerService'); // r39/P1: canonical toExactDecimal authority
 
 const LEDGER_ENTRY_TYPES = ['INCOME', 'EXPENSE', 'PAYROLL', 'TAX', 'REFUND', 'PENALTY', 'AD_SPEND', 'MAINTENANCE', 'SUPPLIES', 'UTILITIES', 'RENT', 'OTHER'];
 
@@ -43,32 +44,29 @@ class BusinessLedgerService {
     // Canonical signed amount for a type. The magnitude comes from the
     // caller; the SIGN comes from the type (r35 contract).
     //
-    // r38/P1 — EXACT MONEY: BusinessLedgerEntry.amount is Decimal(20,8); the
-    // old Number()/Math.round(x*1e6) path silently quantized to 6dp and lost
-    // binary-exactness vs the stored decimal. Parsing now goes through the
-    // SAME exact-decimal authority as the canonical platform ledger: Decimal
-    // end-to-end, <= 8 decimal places, finite, nonzero, magnitude-capped.
+    // r39/P1 — ONE CANONICAL EXACT-MONEY CONTRACT: parsing is DELEGATED to
+    // ledger.toExactDecimal, the same authority as every financial rail
+    // (chat money, POS, dine-in, escrow, the platform ledger). There are no
+    // longer two subtly different "exact decimal" validators in the repo.
+    //
+    // Documented, tested INTENTIONAL differences from the raw parser, both
+    // imposed by THIS service's contract rather than by parsing:
+    //   • magnitude semantics: the caller supplies a NON-NEGATIVE magnitude
+    //     and the SIGN comes from the entry type — so a negative input is
+    //     ambiguous and is REJECTED (the old code silently took abs(); a
+    //     caller who means -50 as a magnitude is now told, explicitly);
+    //   • nonzero rule: a ledger entry of zero has no economic meaning and
+    //     is rejected here (toExactDecimal itself accepts zero).
+    // Everything else — exponent-string rejection, >8dp fractional float
+    // rejection, padding trim, NaN/Infinity rejection, Decimal pass-through,
+    // the 1e9 magnitude cap — is exactly the canonical parser's behavior.
     _canonicalAmount(type, amount) {
-        let dec;
+        let magnitude;
         try {
-            if (typeof amount === 'string') {
-                // r38/P1 — SAME exactness authority as the canonical ledger:
-                // exponent-notation strings are REJECTED, never reinterpreted
-                // (Decimal('1e-8') would parse fine — the canonical ledger
-                // rejects the string form, so the manual ledger does too).
-                if (/e/i.test(amount.trim())) {
-                    throw new Error('exponent notation is not an exact decimal string');
-                }
-                dec = new Prisma.Decimal(amount.trim());
-            } else {
-                dec = amount instanceof Prisma.Decimal ? amount : new Prisma.Decimal(String(amount));
-            }
+            magnitude = ledger.toExactDecimal(amount, 'amount');
         } catch (e) {
-            throw this._fail(400, 'INVALID_AMOUNT', 'Ledger amount must be a finite exact decimal.');
+            throw this._fail(400, 'INVALID_AMOUNT', 'Ledger amount must be a non-negative exact decimal (<= 8 decimals, no exponent).');
         }
-        if (!dec.isFinite()) throw this._fail(400, 'INVALID_AMOUNT', 'Ledger amount must be a finite number.');
-        if (dec.decimalPlaces() > 8) throw this._fail(400, 'INVALID_AMOUNT', 'Ledger amount supports at most 8 decimal places.');
-        const magnitude = dec.abs();
         if (magnitude.isZero()) throw this._fail(400, 'INVALID_AMOUNT', 'Ledger amount cannot be zero.');
         if (magnitude.gt(new Prisma.Decimal(String(MAX_ABS_AMOUNT)))) {
             throw this._fail(400, 'INVALID_AMOUNT', 'Ledger amount is unreasonably large.');
@@ -77,19 +75,33 @@ class BusinessLedgerService {
         return signed; // Prisma.Decimal — exact, no JS-number round-trip
     }
 
-    // r37/P1 — CANONICAL AGGREGATION FORMULA (signed semantics preserved).
-    // Entries are SIGNED by type (INCOME > 0, everything else < 0) and a
-    // reversal is the exact NEGATION of its original with the SAME type.
-    // Aggregating Math.abs(amount) per row breaks that contract for expense
-    // reversals: an EXPENSE of -50 plus its reversal of +50 would report
-    // 100 of expense instead of 0. The canonical rule:
-    //   • income bucket  = signed sum of INCOME rows
-    //   • expense bucket = abs(signed sum of non-INCOME rows)
-    //                     (reversals net to zero INSIDE the sum)
-    // Per-type and per-category buckets follow the same rule. Decimal
-    // accumulation keeps the arithmetic exact to the stored precision.
+    // r39/P1 — CROSS-PERIOD REVERSAL ACCOUNTING RULE (one rule, every
+    // bucket). Entries are SIGNED by type (INCOME > 0, everything else < 0)
+    // and a reversal is the exact NEGATION of its original with the SAME
+    // type. The reporting contract is deliberately SIGNED-NET, not abs():
+    //
+    //   bucket value = Σ(INCOME rows' amount) − Σ(non-INCOME rows' amount)
+    //
+    // Consequences (the tested contract):
+    //   • an ordinary EXPENSE row (-50) reports +50 of expense;
+    //   • its SAME-PERIOD reversal (+50) nets the bucket to 0;
+    //   • a CROSS-PERIOD reversal (Jan expense -50, Feb reversal +50)
+    //     reports January expenses +50 (history retained) and February
+    //     expenses -50 — a NEGATIVE expense, i.e. an explicit correction
+    //     that INCREASES February's profit — never a fabricated +50
+    //     February expense the old abs(sum) produced;
+    //   • cumulative reporting nets to exactly zero;
+    //   • P&L, byType, byCategory, expenseBreakdown and the dashboard all
+    //     follow this one rule; cash-flow stays literal signed flow.
+    // INCOME reversals already followed the rule (income buckets report
+    // the signed sum as-is, so a -50 income reversal reports -50).
     _sumSigned(entries) {
         return entries.reduce((acc, e) => acc.plus(new Prisma.Decimal(e.amount)), new Prisma.Decimal(0));
+    }
+
+    // bucket value = Σ income − Σ non-income, per the cross-period rule.
+    _expenseBucketValue(entries) {
+        return this._sumSigned(entries.filter(e => e.type !== 'INCOME')).negated();
     }
 
     _num(dec) {
@@ -218,50 +230,61 @@ class BusinessLedgerService {
 
         const entries = await this.prisma.businessLedgerEntry.findMany({ where });
 
-        // r37: canonical SIGNED aggregation — reversals net to zero inside
-        // their bucket instead of inflating gross amounts (see _sumSigned).
-        const income = this._num(this._sumSigned(entries.filter(e => e.type === 'INCOME')));
-        const expenses = this._num(this._sumSigned(entries.filter(e => e.type !== 'INCOME')).abs());
+        // r39: the ONE cross-period reversal rule — income buckets are the
+        // signed sum of INCOME rows; expense buckets are the NEGATED signed
+        // net of non-INCOME rows (an ordinary expense is -50 → +50; a
+        // cross-period reversal is +50 → -50, an explicit correction that
+        // increases the reversal period's profit). Never abs().
+        const incomeDec = this._sumSigned(entries.filter(e => e.type === 'INCOME'));
+        const expensesDec = this._expenseBucketValue(entries);
+        const income = this._num(incomeDec);
+        const expenses = this._num(expensesDec);
 
         const byTypeDec = {};
-        const byCategoryDec = {};
-        const incomeByCategoryDec = {};
-        const expenseByCategoryDec = {};
+        const byCategoryIncomeDec = {};
+        const byCategoryExpenseDec = {};
 
         entries.forEach(e => {
             const amount = new Prisma.Decimal(e.amount);
             const typeKey = e.type;
             const categoryKey = e.category || 'Uncategorized';
-            byTypeDec[typeKey] = (byTypeDec[typeKey] || new Prisma.Decimal(0)).plus(amount);
-            byCategoryDec[categoryKey] = (byCategoryDec[categoryKey] || new Prisma.Decimal(0)).plus(amount);
-            if (e.type === 'INCOME') {
-                incomeByCategoryDec[categoryKey] = (incomeByCategoryDec[categoryKey] || new Prisma.Decimal(0)).plus(amount);
+            if (typeKey === 'INCOME') {
+                byTypeDec[typeKey] = (byTypeDec[typeKey] || new Prisma.Decimal(0)).plus(amount);
+                byCategoryIncomeDec[categoryKey] = (byCategoryIncomeDec[categoryKey] || new Prisma.Decimal(0)).plus(amount);
             } else {
-                expenseByCategoryDec[categoryKey] = (expenseByCategoryDec[categoryKey] || new Prisma.Decimal(0)).plus(amount);
+                byTypeDec[typeKey] = (byTypeDec[typeKey] || new Prisma.Decimal(0)).minus(amount);
+                byCategoryExpenseDec[categoryKey] = (byCategoryExpenseDec[categoryKey] || new Prisma.Decimal(0)).minus(amount);
             }
         });
 
-        // INCOME buckets report the signed sum as-is; every other bucket
-        // reports the abs of its signed NET (a reversal of EXPENSE -50 is
-        // +50, so the bucket nets to 0 — never double-counted as gross).
-        const report = (map, absNet) => {
-            const out = {};
-            for (const k of Object.keys(map)) out[k] = this._num(absNet ? map[k].abs() : map[k]);
-            return out;
-        };
-
+        // The margin percentage keeps its historical meaning when income is
+        // positive; a negative expense (cross-period correction) correctly
+        // raises profit and margin.
         return {
             totalIncome: income,
             totalExpenses: expenses,
-            netProfit: this._num(new Prisma.Decimal(income).minus(new Prisma.Decimal(expenses))),
+            netProfit: this._num(incomeDec.minus(expensesDec)),
             margin: income > 0 ? ((income - expenses) / income) * 100 : 0,
             byType: Object.keys(byTypeDec).reduce((o, k) => {
-                o[k] = this._num(k === 'INCOME' ? byTypeDec[k] : byTypeDec[k].abs());
+                o[k] = this._num(byTypeDec[k]);
                 return o;
             }, {}),
-            byCategory: report(byCategoryDec, true), // magnitude, reversal-netted
-            incomeByCategory: report(incomeByCategoryDec, false),
-            expenseByCategory: report(expenseByCategoryDec, true),
+            byCategory: (() => {
+                // One merged category view: income categories signed,
+                // expense categories negated signed net.
+                const out = {};
+                for (const k of Object.keys(byCategoryIncomeDec)) out[k] = this._num(byCategoryIncomeDec[k]);
+                for (const k of Object.keys(byCategoryExpenseDec)) out[k] = this._num(byCategoryExpenseDec[k]);
+                return out;
+            })(),
+            incomeByCategory: Object.keys(byCategoryIncomeDec).reduce((o, k) => {
+                o[k] = this._num(byCategoryIncomeDec[k]);
+                return o;
+            }, {}),
+            expenseByCategory: Object.keys(byCategoryExpenseDec).reduce((o, k) => {
+                o[k] = this._num(byCategoryExpenseDec[k]);
+                return o;
+            }, {}),
             entryCount: entries.length,
         };
     }
@@ -324,15 +347,19 @@ class BusinessLedgerService {
         entries.forEach(e => {
             const key = e.category || 'Uncategorized';
             if (!byCategory[key]) byCategory[key] = { category: key, sum: new Prisma.Decimal(0), count: 0 };
-            // r37: signed net per category — an expense reversal cancels its
-            // original instead of adding another gross expense.
-            byCategory[key].sum = byCategory[key].sum.plus(new Prisma.Decimal(e.amount));
+            // r39: the negated signed net per category — a same-period
+            // reversal nets to 0; a cross-period reversal reports a NEGATIVE
+            // expense (an explicit correction), never a fabricated expense.
+            byCategory[key].sum = byCategory[key].sum.minus(new Prisma.Decimal(e.amount));
             byCategory[key].count += 1;
         });
         const breakdown = Object.values(byCategory)
-            .map(({ category, sum, count }) => ({ category, amount: this._num(sum.abs()), count }))
+            .map(({ category, sum, count }) => ({ category, amount: this._num(sum), count }))
             .sort((a, b) => b.amount - a.amount);
         const total = breakdown.reduce((s, e) => s + e.amount, 0);
+        // Percentage shares are only meaningful over a POSITIVE total; a
+        // net-negative period (corrections exceeding new expenses) reports
+        // no percentages rather than nonsense ones.
         return {
             totalExpenses: total,
             categories: breakdown.map(e => ({ ...e, percentage: total > 0 ? (e.amount / total) * 100 : 0 })),
@@ -349,11 +376,14 @@ class BusinessLedgerService {
             this.prisma.businessLedgerEntry.findMany({ where: { businessProfileId, createdAt: { gte: sixtyDaysAgo, lt: thirtyDaysAgo } } }),
             this.prisma.businessLedgerEntry.findMany({ where: { businessProfileId } }),
         ]);
-        // r37: canonical signed aggregation (reversals net inside the sum).
+        // r39: the cross-period reversal rule in the dashboard too — a
+        // reversal landing in the current window reports as a NEGATIVE
+        // expense (correction), not a fabricated one. Change percentages
+        // are only computed against a positive comparison base.
         const currentIncome = this._num(this._sumSigned(currentEntries.filter(e => e.type === 'INCOME')));
         const previousIncome = this._num(this._sumSigned(previousEntries.filter(e => e.type === 'INCOME')));
-        const currentExpenses = this._num(this._sumSigned(currentEntries.filter(e => e.type !== 'INCOME')).abs());
-        const previousExpenses = this._num(this._sumSigned(previousEntries.filter(e => e.type !== 'INCOME')).abs());
+        const currentExpenses = this._num(this._expenseBucketValue(currentEntries));
+        const previousExpenses = this._num(this._expenseBucketValue(previousEntries));
         return {
             revenue: { current: currentIncome, previous: previousIncome, change: previousIncome > 0 ? ((currentIncome - previousIncome) / previousIncome) * 100 : 0 },
             expenses: { current: currentExpenses, previous: previousExpenses, change: previousExpenses > 0 ? ((currentExpenses - previousExpenses) / previousExpenses) * 100 : 0 },

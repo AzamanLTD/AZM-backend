@@ -823,13 +823,17 @@ STATEMENTS.push(`DO $$ BEGIN
 // Prisma model declares NO relation fields (messageId/conversationId are
 // plain strings by design — ticket resolution is authority-checked by
 // predicate, not by FK), so this table carries no foreign keys.
+// r39/P1 — currency default contract: the money-in-chat rails are
+// USDC-denominated (normalizeAsset rejects every other asset), so the DDL
+// default must say USDC. 'GHS' was a copy-forward from an unrelated table
+// and contradicted every code path that writes a ticket.
 STATEMENTS.push(`CREATE TABLE IF NOT EXISTS "ConversationMoneyTicket" (
     "id" TEXT NOT NULL,
     "messageId" TEXT NOT NULL,
     "conversationId" TEXT NOT NULL,
     "kind" TEXT NOT NULL,
     "amount" DECIMAL(20,8) NOT NULL,
-    "currency" TEXT NOT NULL DEFAULT 'GHS',
+    "currency" TEXT NOT NULL DEFAULT 'USDC',
     "requesterId" INTEGER NOT NULL,
     "counterpartyId" INTEGER NOT NULL,
     "status" TEXT NOT NULL DEFAULT 'sent',
@@ -845,6 +849,96 @@ STATEMENTS.push('CREATE UNIQUE INDEX IF NOT EXISTS "ConversationMoneyTicket_clie
 STATEMENTS.push('CREATE INDEX IF NOT EXISTS "ConversationMoneyTicket_conversationId_idx" ON "ConversationMoneyTicket"("conversationId");');
 STATEMENTS.push('CREATE INDEX IF NOT EXISTS "ConversationMoneyTicket_requesterId_idx" ON "ConversationMoneyTicket"("requesterId");');
 STATEMENTS.push('CREATE INDEX IF NOT EXISTS "ConversationMoneyTicket_counterpartyId_idx" ON "ConversationMoneyTicket"("counterpartyId");');
+
+// r39/P1 — existing deployments keep the old 'GHS' default: migrate the
+// column default to the true contract. Rerunnable: setting the default is
+// idempotent.
+STATEMENTS.push(`ALTER TABLE "ConversationMoneyTicket" ALTER COLUMN "currency" SET DEFAULT 'USDC';`);
+
+// r39/P1 — DURABLE LIFECYCLE CONTRACT. A ConversationMoneyTicket is an
+// immutable financial record (resolution is authority-checked by predicate).
+// Its reference edges may no longer be soft pointers that silently orphan
+// when the referenced row is hard-deleted:
+//   • messageId      -> Message(id)          ON DELETE RESTRICT
+//   • conversationId -> Conversation(id)    ON DELETE RESTRICT
+//   • requesterId    -> User(id)             ON DELETE RESTRICT
+//   • counterpartyId -> User(id)             ON DELETE RESTRICT
+// RESTRICT means: a hard delete of a financial message (or its conversation
+// or participants) FAILS CLOSED instead of leaving an orphaned financial
+// record whose resolution can never be traced. The disappearing-message
+// sweep additionally excludes money-bearing messages by predicate (belt),
+// and the database constraints are the suspenders.
+// Deployment guard: the overlay runs on production data that predates the
+// FK. Orphaned tickets (created by the legacy soft-pointer era, e.g. a
+// message already hard-deleted by the old sweep) are moved VERBATIM into
+// "ConversationMoneyTicketOrphanArchive" — financial records are never
+// deleted — with the missing-edge reason recorded, BEFORE the constraint is
+// created. The archive is an explicit immutable financial-record model that
+// owns the orphaned relationship.
+STATEMENTS.push(`CREATE TABLE IF NOT EXISTS "ConversationMoneyTicketOrphanArchive" (
+    "id" TEXT NOT NULL,
+    "messageId" TEXT NOT NULL,
+    "conversationId" TEXT NOT NULL,
+    "kind" TEXT NOT NULL,
+    "amount" DECIMAL(20,8) NOT NULL,
+    "currency" TEXT NOT NULL,
+    "requesterId" INTEGER NOT NULL,
+    "counterpartyId" INTEGER NOT NULL,
+    "status" TEXT NOT NULL,
+    "resultMessageId" TEXT,
+    "clientRequestId" TEXT,
+    "orphanReason" TEXT NOT NULL,
+    "archivedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT "ConversationMoneyTicketOrphanArchive_pkey" PRIMARY KEY ("id")
+);`);
+STATEMENTS.push(`DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.table_constraints WHERE constraint_name = 'ConversationMoneyTicket_messageId_fkey') THEN
+        IF EXISTS (SELECT 1 FROM "ConversationMoneyTicket" t LEFT JOIN "Message" m ON m."id" = t."messageId" WHERE m."id" IS NULL) THEN
+            INSERT INTO "ConversationMoneyTicketOrphanArchive"
+                ("id", "messageId", "conversationId", "kind", "amount", "currency", "requesterId", "counterpartyId", "status", "resultMessageId", "clientRequestId", "orphanReason")
+            SELECT t."id", t."messageId", t."conversationId", t."kind", t."amount", t."currency", t."requesterId", t."counterpartyId", t."status", t."resultMessageId", t."clientRequestId", 'missing_message'
+            FROM "ConversationMoneyTicket" t LEFT JOIN "Message" m ON m."id" = t."messageId" WHERE m."id" IS NULL;
+            DELETE FROM "ConversationMoneyTicket" t WHERE NOT EXISTS (SELECT 1 FROM "Message" m WHERE m."id" = t."messageId");
+        END IF;
+        ALTER TABLE "ConversationMoneyTicket" ADD CONSTRAINT "ConversationMoneyTicket_messageId_fkey" FOREIGN KEY ("messageId") REFERENCES "Message"("id") ON DELETE RESTRICT;
+    END IF;
+END $$;`);
+STATEMENTS.push(`DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.table_constraints WHERE constraint_name = 'ConversationMoneyTicket_conversationId_fkey') THEN
+        IF EXISTS (SELECT 1 FROM "ConversationMoneyTicket" t LEFT JOIN "Conversation" c ON c."id" = t."conversationId" WHERE c."id" IS NULL) THEN
+            INSERT INTO "ConversationMoneyTicketOrphanArchive"
+                ("id", "messageId", "conversationId", "kind", "amount", "currency", "requesterId", "counterpartyId", "status", "resultMessageId", "clientRequestId", "orphanReason")
+            SELECT t."id", t."messageId", t."conversationId", t."kind", t."amount", t."currency", t."requesterId", t."counterpartyId", t."status", t."resultMessageId", t."clientRequestId", 'missing_conversation'
+            FROM "ConversationMoneyTicket" t LEFT JOIN "Conversation" c ON c."id" = t."conversationId" WHERE c."id" IS NULL;
+            DELETE FROM "ConversationMoneyTicket" t WHERE NOT EXISTS (SELECT 1 FROM "Conversation" c WHERE c."id" = t."conversationId");
+        END IF;
+        ALTER TABLE "ConversationMoneyTicket" ADD CONSTRAINT "ConversationMoneyTicket_conversationId_fkey" FOREIGN KEY ("conversationId") REFERENCES "Conversation"("id") ON DELETE RESTRICT;
+    END IF;
+END $$;`);
+STATEMENTS.push(`DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.table_constraints WHERE constraint_name = 'ConversationMoneyTicket_requesterId_fkey') THEN
+        IF EXISTS (SELECT 1 FROM "ConversationMoneyTicket" t LEFT JOIN "User" u ON u."id" = t."requesterId" WHERE u."id" IS NULL) THEN
+            INSERT INTO "ConversationMoneyTicketOrphanArchive"
+                ("id", "messageId", "conversationId", "kind", "amount", "currency", "requesterId", "counterpartyId", "status", "resultMessageId", "clientRequestId", "orphanReason")
+            SELECT t."id", t."messageId", t."conversationId", t."kind", t."amount", t."currency", t."requesterId", t."counterpartyId", t."status", t."resultMessageId", t."clientRequestId", 'missing_requester'
+            FROM "ConversationMoneyTicket" t LEFT JOIN "User" u ON u."id" = t."requesterId" WHERE u."id" IS NULL;
+            DELETE FROM "ConversationMoneyTicket" t WHERE NOT EXISTS (SELECT 1 FROM "User" u WHERE u."id" = t."requesterId");
+        END IF;
+        ALTER TABLE "ConversationMoneyTicket" ADD CONSTRAINT "ConversationMoneyTicket_requesterId_fkey" FOREIGN KEY ("requesterId") REFERENCES "User"("id") ON DELETE RESTRICT;
+    END IF;
+END $$;`);
+STATEMENTS.push(`DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.table_constraints WHERE constraint_name = 'ConversationMoneyTicket_counterpartyId_fkey') THEN
+        IF EXISTS (SELECT 1 FROM "ConversationMoneyTicket" t LEFT JOIN "User" u ON u."id" = t."counterpartyId" WHERE u."id" IS NULL) THEN
+            INSERT INTO "ConversationMoneyTicketOrphanArchive"
+                ("id", "messageId", "conversationId", "kind", "amount", "currency", "requesterId", "counterpartyId", "status", "resultMessageId", "clientRequestId", "orphanReason")
+            SELECT t."id", t."messageId", t."conversationId", t."kind", t."amount", t."currency", t."requesterId", t."counterpartyId", t."status", t."resultMessageId", t."clientRequestId", 'missing_counterparty'
+            FROM "ConversationMoneyTicket" t LEFT JOIN "User" u ON u."id" = t."counterpartyId" WHERE u."id" IS NULL;
+            DELETE FROM "ConversationMoneyTicket" t WHERE NOT EXISTS (SELECT 1 FROM "User" u WHERE u."id" = t."counterpartyId");
+        END IF;
+        ALTER TABLE "ConversationMoneyTicket" ADD CONSTRAINT "ConversationMoneyTicket_counterpartyId_fkey" FOREIGN KEY ("counterpartyId") REFERENCES "User"("id") ON DELETE RESTRICT;
+    END IF;
+END $$;`);
 
 // ── Business OS P0 settlement repair (PR #292, 2026-09-21) ─────────────────
 // EWA withdrawal fee revenue: EwaService.requestWithdrawal records the 1%

@@ -50,10 +50,22 @@ class BusinessDirectMessageService {
 
     // Server-derived staff context for the authenticated caller. This is the
     // ONLY source of business authority — never req.body/req.query.
-    async _resolveStaffContext(user, advisoryBusinessId = null) {
+    //
+    // r39/P1 — ADMIN IMPERSONATION HANDOFF (the intended, explicit contract).
+    // A genuine ADMIN may act on a business's support inbox, exactly as the
+    // platform's other Business OS surfaces already allow. The authority is
+    // the VALIDATED adminBusinessScope produced by the global
+    // adminBusinessScope middleware ({ businessProfileId, business } — set
+    // only for a JWT-verified ADMIN whose x-admin-business-id resolves to a
+    // real BusinessProfile). The service consumes that validated object;
+    // it NEVER re-trusts the raw header. Participant authority rules are
+    // unchanged: an impersonated admin is business-side staff (via
+    // resolveBusinessContext's isAdminImpersonation path), never a
+    // customer participant.
+    async _resolveStaffContext(user, advisoryBusinessId = null, adminScope = null) {
         const context = await resolveBusinessContext(this.prisma, user, {
-            adminScoped: false,
-            adminScopedBusinessId: null,
+            adminScoped: Boolean(adminScope),
+            adminScopedBusinessId: adminScope?.businessProfileId ?? null,
         });
         if (!context) return null;
         // An advisory businessId supplied by the caller must match the
@@ -64,12 +76,12 @@ class BusinessDirectMessageService {
         return context;
     }
 
-    // Is the caller a business-side actor (owner / active employee) of the
-    // exact businessProfileId?
-    async _isStaffOf(user, businessProfileId) {
+    // Is the caller a business-side actor (owner / active employee / scoped
+    // ADMIN impersonation) of the exact businessProfileId?
+    async _isStaffOf(user, businessProfileId, adminScope = null) {
         const context = await resolveBusinessContext(this.prisma, user, {
-            adminScoped: false,
-            adminScopedBusinessId: null,
+            adminScoped: Boolean(adminScope),
+            adminScopedBusinessId: adminScope?.businessProfileId ?? null,
         });
         return Boolean(context && context.businessProfileId === businessProfileId);
     }
@@ -102,8 +114,8 @@ class BusinessDirectMessageService {
 
     // GET /business-inbox — the business the caller is STAFF of. Never the
     // caller's claim about which business they want to read.
-    async businessInbox({ user, advisoryBusinessId }) {
-        const context = await this._resolveStaffContext(user, advisoryBusinessId ?? null);
+    async businessInbox({ user, advisoryBusinessId, adminScope = null }) {
+        const context = await this._resolveStaffContext(user, advisoryBusinessId ?? null, adminScope);
         if (!context) {
             throw fail(403, 'NO_BUSINESS_CONTEXT', 'No business context found for this account.');
         }
@@ -161,7 +173,7 @@ class BusinessDirectMessageService {
     // GET /thread — two authority paths:
     //   staff: the caller's server-derived context covers this business;
     //   customer: the caller PARTICIPATES in the exact conversation.
-    async thread({ user, businessId, userId }) {
+    async thread({ user, businessId, userId, adminScope = null }) {
         const targetUserId = parseUserId(userId);
         if (!businessId || typeof businessId !== 'string' || !businessId.trim()) {
             throw fail(400, 'INVALID_INPUT', 'businessId required');
@@ -170,7 +182,7 @@ class BusinessDirectMessageService {
         const conv = await this._findConversation(bizId, targetUserId);
         if (!conv) return { messages: [] };
 
-        const staff = await this._isStaffOf(user, bizId);
+        const staff = await this._isStaffOf(user, bizId, adminScope);
         const isSupportThread = conv.channel === 'CUSTOMER_SUPPORT';
         const allowed = isSupportThread
             ? this._supportThreadAccess(conv, user, staff)
@@ -193,7 +205,7 @@ class BusinessDirectMessageService {
     // POST /send — staff may open a conversation with a customer of THEIR
     // business; everyone else may only write into a conversation they
     // PARTICIPATE in. Duplicate conversation creation converges.
-    async send({ user, businessId, userId, text }) {
+    async send({ user, businessId, userId, text, adminScope = null }) {
         const targetUserId = parseUserId(userId);
         if (!businessId || typeof businessId !== 'string' || !businessId.trim()) {
             throw fail(400, 'INVALID_INPUT', 'businessId required');
@@ -204,7 +216,7 @@ class BusinessDirectMessageService {
         }
         const content = text.trim().slice(0, 4000);
 
-        const staff = await this._isStaffOf(user, bizId);
+        const staff = await this._isStaffOf(user, bizId, adminScope);
         if (!staff) {
             // Customer path: may only message inside the exact support
             // conversation where the caller IS the durable customer

@@ -39,6 +39,8 @@ router.get('/business-inbox', protect, protectActive, wrap(async (req, res) => {
     const result = await getService(req).businessInbox({
         user: req.user,
         advisoryBusinessId: req.query.businessId ? String(req.query.businessId) : null,
+        // r39/P1 — the VALIDATED admin scope (never the raw header).
+        adminScope: req.adminBusinessScope ?? null,
     });
     res.json({ success: true, conversations: result.conversations });
 }));
@@ -48,6 +50,7 @@ router.get('/business-inbox', protect, protectActive, wrap(async (req, res) => {
 // BusinessConversation. Caller-supplied ids are locators, never authority.
 router.get('/thread', protect, protectActive, wrap(async (req, res) => {
     const result = await getService(req).thread({
+        adminScope: req.adminBusinessScope ?? null,
         user: req.user,
         businessId: req.query.businessId,
         userId: req.query.userId,
@@ -62,6 +65,7 @@ router.get('/thread', protect, protectActive, wrap(async (req, res) => {
 router.post('/send', protect, protectActive, wrap(async (req, res) => {
     const { businessId, userId, text } = req.body;
     const result = await getService(req).send({
+        adminScope: req.adminBusinessScope ?? null,
         user: req.user,
         businessId,
         userId,

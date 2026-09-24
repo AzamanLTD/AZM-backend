@@ -539,7 +539,9 @@ describeIf('Business OS — Business Ledger', () => {
             type: 'MAINTENANCE',
             category: 'Room Repair',
             description: 'AC repair room 101',
-            amount: -50.00,
+            // r39 magnitude contract: caller supplies a NON-NEGATIVE
+            // magnitude; the sign comes from the entry type.
+            amount: 50.00,
         });
 
         const pl = await svc.getProfitLoss(businessProfile.id);

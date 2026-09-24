@@ -70,23 +70,22 @@ describe('fiat withdrawal settlement economics', () => {
       where: { txHash: 'SETTLE-1', status: 'PENDING' },
       data: { status: 'COMPLETED', providerRef: 'provider-1' },
     });
-    expect(tx.user.update).toHaveBeenCalledWith({
-      where: { id: 99 },
-      data: { availableBalance: { increment: 0.1 } },
-    });
-    expect(tx.systemProfitFees.update).toHaveBeenCalledWith({
-      where: { id: 1 },
-      data: { balance: { increment: 0.1 } },
-    });
-    expect(tx.adminProfitLog.createMany).toHaveBeenCalledWith({
-      data: [
-        { amountUsdc: 0.1, source: 'EXIT_FEE', relatedTxId: 'referral_split_system_SETTLE-1' },
-        { amountUsdc: 0.1, source: 'EXIT_FEE', relatedTxId: 'referral_split_referrer_99_SETTLE-1' },
-      ],
-    });
-    expect(tx.adminProfitLog.create).toHaveBeenCalledWith({
-      data: { amountUsdc: 10, source: 'ARBITRAGE_SPREAD', relatedTxId: 'arbitrage_capture_SETTLE-1' },
-    });
+    // r39: settlement economics carry EXACT Decimals.
+    expect(tx.user.update.mock.calls[0][0].where).toEqual({ id: 99 });
+    expect(tx.user.update.mock.calls[0][0].data.availableBalance.increment.toFixed(8)).toBe('0.10000000');
+    expect(tx.systemProfitFees.update.mock.calls[0][0].where).toEqual({ id: 1 });
+    expect(tx.systemProfitFees.update.mock.calls[0][0].data.balance.increment.toFixed(8)).toBe('0.10000000');
+    const split = tx.adminProfitLog.createMany.mock.calls[0][0].data;
+    expect(split[0].amountUsdc.toFixed(8)).toBe('0.10000000');
+    expect(split[0].source).toBe('EXIT_FEE');
+    expect(split[0].relatedTxId).toBe('referral_split_system_SETTLE-1');
+    expect(split[1].amountUsdc.toFixed(8)).toBe('0.10000000');
+    expect(split[1].source).toBe('EXIT_FEE');
+    expect(split[1].relatedTxId).toBe('referral_split_referrer_99_SETTLE-1');
+    const capture = tx.adminProfitLog.create.mock.calls[0][0].data;
+    expect(capture.amountUsdc.toFixed(8)).toBe('10.00000000');
+    expect(capture.source).toBe('ARBITRAGE_SPREAD');
+    expect(capture.relatedTxId).toBe('arbitrage_capture_SETTLE-1');
     expect(result).toMatchObject({ status: 'COMPLETED', changed: true, providerTxId: 'provider-1' });
   });
 
@@ -181,22 +180,21 @@ describe('fiat withdrawal settlement economics', () => {
 
     const result = await reverseFiatWithdrawal(prisma, 'FAIL-1');
 
-    expect(tx.user.update).toHaveBeenCalledWith({
-      where: { id: 7 },
-      data: { availableBalance: { increment: 10.2 } },
-    });
-    expect(tx.systemFiatPool.update).toHaveBeenCalledWith({
-      where: { id: 1 },
-      data: { balance: { increment: 10 } },
-    });
-    expect(tx.systemMasterCrypto.update).toHaveBeenCalledWith({
-      where: { id: 1 },
-      data: { balance: { decrement: 10 } },
-    });
+    // r39: the unwind carries EXACT Decimals.
+    const refund = tx.user.update.mock.calls[0][0];
+    expect(refund.where).toEqual({ id: 7 });
+    expect(refund.data.availableBalance.increment.toFixed(8)).toBe('10.20000000');
+    const pool = tx.systemFiatPool.update.mock.calls[0][0];
+    expect(pool.where).toEqual({ id: 1 });
+    expect(pool.data.balance.increment.toFixed(8)).toBe('10.00000000');
+    const master = tx.systemMasterCrypto.update.mock.calls[0][0];
+    expect(master.where).toEqual({ id: 1 });
+    expect(master.data.balance.decrement.toFixed(8)).toBe('10.00000000');
     expect(tx.systemProfitFees.update).not.toHaveBeenCalled();
     expect(tx.user.updateMany).not.toHaveBeenCalled();
     expect(tx.adminProfitLog.create).not.toHaveBeenCalled();
     expect(tx.adminProfitLog.deleteMany).not.toHaveBeenCalled();
-    expect(result).toMatchObject({ alreadyReversed: false, refundedAmount: 10.2, userId: 7 });
+    expect(result).toMatchObject({ alreadyReversed: false, userId: 7 });
+    expect(result.refundedAmount.toFixed(8)).toBe('10.20000000'); // r39: exact Decimal refund
   });
 });

@@ -1,5 +1,6 @@
 jest.mock('../utils/securityCheck', () => ({ runDoubleCheck: jest.fn().mockResolvedValue(undefined) }));
-jest.mock('../services/ledgerService', () => ({ post: jest.fn().mockResolvedValue({ id: 'j1', transaction: { id: 'lt1' } }), accountBalance: jest.fn() }));
+jest.mock('../services/ledgerService', () => ({ post: jest.fn().mockResolvedValue({ id: 'j1', transaction: { id: 'lt1' } }), accountBalance: jest.fn(), // r39/P1: real exact-decimal parser surface kept in the mock.
+toExactDecimal: (v) => new (require('@prisma/client').Prisma).Decimal(String(v)) }));
 jest.mock('../services/restrictedObligationService', () => ({
     createForPendingWithdrawal: jest.fn().mockResolvedValue({ id: 'o1' }),
     releaseOnSettlement: jest.fn().mockResolvedValue(undefined),
@@ -71,14 +72,15 @@ describe('processFiatWithdrawal fiat-pool concurrency guard', () => {
       retailRate: 13,
     });
 
-    expect(tx.systemFiatPool.updateMany).toHaveBeenCalledWith({
-      where: { id: 1, balance: { gte: 10 } },
-      data: { balance: { decrement: 10 } },
-    });
-    expect(tx.user.updateMany).toHaveBeenCalledWith({
-      where: { id: 7, availableBalance: { gte: 10.2 } },
-      data: { availableBalance: { decrement: 10.2 } },
-    });
+    // r39: conditional claims carry EXACT Decimals (serialized "10"/"10.2").
+    const poolClaim = tx.systemFiatPool.updateMany.mock.calls[0][0];
+    expect(poolClaim.where.id).toBe(1);
+    expect(poolClaim.where.balance.gte.toFixed(8)).toBe('10.00000000');
+    expect(poolClaim.data.balance.decrement.toFixed(8)).toBe('10.00000000');
+    const debit = tx.user.updateMany.mock.calls[0][0];
+    expect(debit.where.id).toBe(7);
+    expect(debit.where.availableBalance.gte.toFixed(8)).toBe('10.20000000');
+    expect(debit.data.availableBalance.decrement.toFixed(8)).toBe('10.20000000');
     expect(result.reference).toBe('REF-1');
   });
 

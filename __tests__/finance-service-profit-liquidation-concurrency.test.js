@@ -21,7 +21,9 @@ describe('liquidateProfits concurrency guard', () => {
       systemProfitFees: {
         upsert: jest.fn().mockResolvedValue({}),
         updateMany: jest.fn(async ({ where, data }) => {
-          expect(where).toEqual({ id: 1, balance: { gte: 10 } });
+          // r39: the claim predicate carries an EXACT Decimal.
+          expect(where.id).toBe(1);
+          expect(Number(where.balance.gte)).toBe(10);
           if (profitBalance < 10) return { count: 0 };
           profitBalance -= Number(data.balance.decrement);
           return { count: 1 };

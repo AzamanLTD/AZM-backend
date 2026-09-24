@@ -174,13 +174,12 @@ describe('business invoice payment concurrency', () => {
 
     await payInvoice(prisma, { invoiceId: 'invoice-1', customerId: 7 });
 
-    expect(prisma.user.updateMany).toHaveBeenCalledWith({
-      where: { id: 7, availableBalance: { gte: 100 } },
-      data: { availableBalance: { decrement: 100 } },
-    });
-    expect(prisma.user.update).toHaveBeenCalledWith({
-      where: { id: 8 },
-      data: { availableBalance: { increment: 98.5 } },
-    });
+    const [claimArgs] = prisma.user.updateMany.mock.calls;
+    const [creditArgs] = prisma.user.update.mock.calls;
+    expect(claimArgs[0].where.id).toBe(7);
+    expect(claimArgs[0].where.availableBalance.gte.toFixed(8)).toBe('100.00000000');
+    expect(claimArgs[0].data.availableBalance.decrement.toFixed(8)).toBe('100.00000000');
+    expect(creditArgs[0].where.id).toBe(8);
+    expect(creditArgs[0].data.availableBalance.increment.toFixed(8)).toBe('98.50000000');
   });
 });

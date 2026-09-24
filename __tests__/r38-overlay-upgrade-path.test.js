@@ -38,6 +38,28 @@ run('r38/P0 — overlay upgrade path + fail-closed installer', () => {
         encoding: 'utf8',
     });
 
+    // r39/P0 — battery-hermetic restore helper. `prisma db push
+    // --accept-data-loss` synchronizes the database to schema.prisma and
+    // therefore DROPS every raw-SQL-managed overlay table (TransactionQuote,
+    // ProofOfReservesLeaf, ReconciliationException, …) that has no Prisma
+    // model. The restore step below uses it, so the restore must re-run the
+    // FULL CI overlay set — re-running only the businessOS overlay (the old
+    // restore) silently poisoned every later suite that touches a
+    // raw-SQL-managed table. All installers are idempotent.
+    const runAllOverlays = () => {
+        const fs = require('fs');
+        const infraDir = path.join(__dirname, '..', 'infra');
+        let worst = 0;
+        for (const f of fs.readdirSync(infraDir).filter((n) => n.startsWith('install-') && n.endsWith('.js')).sort()) {
+            const r = spawnSync('node', [path.join(infraDir, f)], {
+                env: { ...process.env, DATABASE_URL: url },
+                encoding: 'utf8',
+            });
+            if (r.status !== 0 && worst === 0) worst = r.status;
+        }
+        return { status: worst };
+    };
+
     const indexesOn = async (table) =>
         (await db.$queryRawUnsafe(
             `SELECT indexname FROM pg_indexes WHERE tablename = $1 ORDER BY indexname`, table
@@ -149,7 +171,10 @@ run('r38/P0 — overlay upgrade path + fail-closed installer', () => {
                 console.error('RESTORE PUSH FAILED:\n' + (push.stdout || '') + (push.stderr || ''));
             }
             expect(push.status).toBe(0);
-            // Overlay objects are part of the battery baseline.
+            // Overlay objects are part of the battery baseline — ALL of
+            // them: the db push above dropped every raw-SQL-managed table
+            // (r39/P0 battery-hermetic restore, see runAllOverlays).
+            expect(runAllOverlays().status).toBe(0);
             expect(runOverlay().status).toBe(0);
             expect(await columnsOf('BusinessLedgerEntry')).toEqual(beforeColumns);
         }

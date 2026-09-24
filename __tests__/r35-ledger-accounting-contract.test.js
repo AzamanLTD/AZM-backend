@@ -82,14 +82,19 @@ run('r35/P2 — business ledger accounting contract', () => {
         const expense = await postEntry({ type: 'EXPENSE', category: 'Fuel', description: 'diesel', amount: 50 });
         expect(expense.status).toBe(201);
         expect(Number(expense.body.entry.amount)).toBe(-50);
-        // Even a client-signed negative expense normalizes to the same row.
+        // r39/P1 — the amount is a NON-NEGATIVE magnitude and the SIGN comes
+        // from the type. A client-signed negative is now AMBIGUOUS input and
+        // is refused (fail-closed) instead of silently abs()'d — the same
+        // contract as every other canonical money parser.
         const expense2 = await postEntry({ type: 'EXPENSE', category: 'Fuel', description: 'diesel2', amount: -30 });
-        expect(Number(expense2.body.entry.amount)).toBe(-30);
-        // Income positive regardless of client sign.
+        expect(expense2.status).toBe(400);
+        expect(expense2.body.entry).toBeUndefined();
+        // Income positive; negative income is equally refused.
         const income = await postEntry({ type: 'INCOME', category: 'Sales', description: 'sale', amount: 100 });
         expect(Number(income.body.entry.amount)).toBe(100);
         const income2 = await postEntry({ type: 'INCOME', category: 'Sales', description: 'sale2', amount: -25 });
-        expect(Number(income2.body.entry.amount)).toBe(25);
+        expect(income2.status).toBe(400);
+        expect(income2.body.entry).toBeUndefined();
         // All other debit types normalize negative too.
         for (const t of ['PAYROLL', 'TAX', 'REFUND', 'PENALTY', 'AD_SPEND']) {
             const res = await postEntry({ type: t, category: 'c', description: 'd', amount: 10 });

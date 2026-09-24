@@ -214,7 +214,7 @@ describeOrSkip('AZM fee-discount withdrawal atomicity (real PostgreSQL)', () => 
         });
 
         expect(reversal.azmFeeDiscount).toMatchObject({ restored: true, amount: tier.cost });
-        expect(reversal.refundedAmount).toBeCloseTo(WITHDRAWAL + exitFee, 6);
+        expect(Number(reversal.refundedAmount)).toBeCloseTo(WITHDRAWAL + exitFee, 6); // r39: service returns Decimal
 
         const txRow = await prisma.transactionHistory.findUnique({ where: { txHash: reference } });
         expect(txRow.status).toBe('FAILED');
@@ -300,14 +300,14 @@ describeOrSkip('AZM fee-discount withdrawal atomicity (real PostgreSQL)', () => 
         });
 
         expect(data.azmFeeDiscount).toBeNull();
-        expect(data.exitFee).toBeCloseTo(WITHDRAWAL * EXIT_FEE_PCT, 6);
+        expect(Number(data.exitFee)).toBeCloseTo(WITHDRAWAL * EXIT_FEE_PCT, 6); // r39: service returns Decimal
 
         const u = await freshUser(user.id);
         expect(Number(u.azmBalance)).toBe(START_AZM);
 
         const reversal = await financeService.reverseFiatWithdrawal(prisma, reference, { reason: 'x' });
         expect(reversal.azmFeeDiscount).toBeNull();
-        expect(reversal.refundedAmount).toBeCloseTo(WITHDRAWAL * (1 + EXIT_FEE_PCT), 6);
+        expect(Number(reversal.refundedAmount)).toBeCloseTo(WITHDRAWAL * (1 + EXIT_FEE_PCT), 6); // r39: service returns Decimal
 
         const u2 = await freshUser(user.id);
         expect(Number(u2.azmBalance)).toBe(START_AZM);

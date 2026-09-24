@@ -13,9 +13,27 @@
 'use strict';
 const { Prisma } = require('@prisma/client');
 const ledger = require('./ledgerService');
-const _exact = (n) => (n instanceof Prisma.Decimal ? n.toFixed(8) : Number(n).toFixed(8));
-const { computeLineItems, computeTaxLines } = require('../utils/invoiceMath');
+// r39/P0 — EXACT MONEY: invoice creation now runs on the exact-decimal
+// business tax/line authority (Prisma.Decimal end-to-end, deliberate HALF_UP
+// 8dp storage quantization). The legacy float/6dp invoiceMath path is
+// retired from this financial rail.
+const { computeLineItemsExact, computeTaxLinesExact, parseExactDecimal, quantize8 } = require('../utils/exactInvoiceMath');
 const { emitWebhookEvent } = require('./webhookEmitter');
+
+// r39/P0 — strict exact-decimal parse for client-supplied payment money.
+// Same canonical entry contract as POS/dine-in: no exponent strings, no
+// padding, no NaN/Infinity, no >8dp fractional floats.
+const _parseMoneyStrict = (value, label) => {
+  if (value === null || value === undefined || value === '') return new Prisma.Decimal(0);
+  if (typeof value === 'string' && value !== value.trim()) {
+    throw new Error(`${label}: whitespace-padded values are rejected.`);
+  }
+  try {
+    return parseExactDecimal(value, label);
+  } catch (e) {
+    throw new Error(`${label} must be a finite non-negative exact decimal (<= 8 decimals, no exponent, no padding).`);
+  }
+};
 
 // Generates: INV-YYMMDD-XXXX (e.g. INV-260620-A3F2)
 const _invoiceRef = () => {
@@ -46,9 +64,19 @@ const createInvoice = async (prisma, {
     effectiveTaxLines = defaultPreset ? [defaultPreset] : [];
   }
 
-  const { subtotal: subtotalUsdc, lineItems: cleanLineItems } = computeLineItems(lineItems);
-  const { taxTotal: taxTotalUsdc, taxLines: cleanTaxLines } = computeTaxLines(effectiveTaxLines, subtotalUsdc);
-  const billTotalUsdc = subtotalUsdc + taxTotalUsdc;
+  // r39/P0 — exact-decimal computation: every stored monetary field is a
+  // Prisma.Decimal produced by exact arithmetic. The tax line `value` column
+  // is Decimal(10,4), so a client-supplied spec with more than 4 decimals
+  // is refused up-front rather than silently quantized by the column.
+  for (const t of (effectiveTaxLines || [])) {
+    const v = parseExactDecimal(t.value, `tax value for '${t.name}'`);
+    if (v.decimalPlaces() > 4) {
+      throw new Error(`Tax value for '${t.name}' supports at most 4 decimal places (Decimal(10,4) column).`);
+    }
+  }
+  const { subtotal: subtotalUsdc, lineItems: cleanLineItems } = computeLineItemsExact(lineItems);
+  const { taxTotal: taxTotalUsdc, taxLines: cleanTaxLines } = computeTaxLinesExact(effectiveTaxLines, subtotalUsdc);
+  const billTotalUsdc = subtotalUsdc.plus(taxTotalUsdc);
 
   const customer = await prisma.user.findUnique({
     where: { id: customerId },
@@ -123,7 +151,10 @@ const voidInvoice = async (prisma, { invoiceId, businessProfileId }) => {
 const payInvoice = async (prisma, {
   invoiceId, customerId, tipUsdc, customerNote, customerCoveredFee,
 }) => {
-  const tip = Math.max(0, parseFloat(tipUsdc) || 0);
+  // r39/P0 — exact-decimal payment arithmetic. The bill, tip, fee, customer
+  // total and business share are Prisma.Decimal end-to-end; the fee is the
+  // DELIBERATE HALF_UP 8dp quantization of an exact percentage product.
+  const tip = _parseMoneyStrict(tipUsdc, 'tipUsdc');
   const coveredFee = !!customerCoveredFee;
 
   const invoice = await prisma.businessInvoice.findUnique({
@@ -134,22 +165,25 @@ const payInvoice = async (prisma, {
   if (invoice.customerId !== customerId) throw new Error('Not authorized to pay this invoice.');
 
   if (invoice.payTxHash) {
-    return { invoice, customerPays: Number(invoice.customerPaidUsdc), alreadyPaid: true };
+    return { invoice, customerPays: Number(invoice.customerPaidUsdc.toFixed(8)), alreadyPaid: true };
   }
   if (invoice.status !== 'SENT') throw new Error(`Invoice cannot be paid from status ${invoice.status}.`);
 
+  // r39/P0 — Decimal(6,4) fee percentage parsed exactly (never Number()).
   const settings = await prisma.globalSettings.findUnique({ where: { id: 1 } });
-  const feePct = Number(settings?.businessInvoiceFeePct ?? 0.015);
-  const billPlusTip = Number(invoice.billTotalUsdc) + tip;
-  const fee = parseFloat((billPlusTip * feePct).toFixed(8));
+  const feePct = new Prisma.Decimal(settings?.businessInvoiceFeePct ?? '0.015');
+  const billPlusTip = new Prisma.Decimal(invoice.billTotalUsdc).plus(tip);
+  // Exact percentage product, then the deliberate 8dp storage quantization.
+  const fee = quantize8(billPlusTip.times(feePct));
 
+  // All three are exact 8dp decimals — no further rounding is possible.
   let customerPays, businessReceives;
   if (coveredFee) {
-    customerPays = parseFloat((billPlusTip + fee).toFixed(8));
+    customerPays = billPlusTip.plus(fee);
     businessReceives = billPlusTip;
   } else {
     customerPays = billPlusTip;
-    businessReceives = parseFloat((billPlusTip - fee).toFixed(8));
+    businessReceives = billPlusTip.minus(fee);
   }
 
   const businessOwnerUserId = invoice.businessProfile.userId;
@@ -182,7 +216,7 @@ const payInvoice = async (prisma, {
         where: { id: businessOwnerUserId },
         data: { availableBalance: { increment: businessReceives } },
       });
-      if (fee > 0) {
+      if (fee.gt(new Prisma.Decimal(0))) {
         await tx.systemProfitFees.upsert({
           where: { id: 1 },
           update: { balance: { increment: fee } },
@@ -208,8 +242,8 @@ const payInvoice = async (prisma, {
       const payerHistory = await tx.transactionHistory.create({ data: {
         userId: customerId,
         type: 'BUSINESS_INVOICE_PAYMENT',
-        amountUsdc: -customerPays,
-        feeUsdc: coveredFee ? fee : 0,
+        amountUsdc: customerPays.neg(),
+        feeUsdc: coveredFee ? fee : new Prisma.Decimal(0),
         txHash: `${payTxHash}_PAYER`,
         status: 'COMPLETED',
       }});
@@ -225,9 +259,13 @@ const payInvoice = async (prisma, {
       // Any float-rounding residual between the stored legs is absorbed by
       // revenue:fees so the posting balances EXACTLY without minting value.
       {
-        const debit = new Prisma.Decimal(_exact(customerPays));
-        const share = new Prisma.Decimal(_exact(businessReceives));
-        const feeExact = new Prisma.Decimal(_exact(fee));
+        // r39/P0 — all three legs are already exact Prisma.Decimal values
+        // straight from the payment arithmetic; the posting is exact by
+        // construction and the residual check below is now a pure invariant
+        // (it must always be zero — 8dp − 8dp − 8dp).
+        const debit = customerPays;
+        const share = businessReceives;
+        const feeExact = fee;
         const residual = debit.minus(share).minus(feeExact);
         const lines = [
           { account: `user:${customerId}:liability`, debit: debit.toFixed(8) },
@@ -249,7 +287,7 @@ const payInvoice = async (prisma, {
           relatedEntity: 'businessInvoice',
           relatedEntityId: invoiceId,
           metadata: {
-            tipUsdc: _exact(tip),
+            tipUsdc: tip.toFixed(8),
             feeUsdc: feeExact.toFixed(8),
             coveredFee,
             residual: residual.toFixed(8),
@@ -262,14 +300,21 @@ const payInvoice = async (prisma, {
         userId: businessOwnerUserId,
         type: 'BUSINESS_INVOICE_RECEIPT',
         amountUsdc: businessReceives,
-        feeUsdc: coveredFee ? 0 : fee,
+        feeUsdc: coveredFee ? new Prisma.Decimal(0) : fee,
         txHash: `${payTxHash}_PAYEE`,
         status: 'COMPLETED',
       }});
       return updated;
     });
 
-    return { invoice: result, customerPays, businessReceives, fee };
+    // Wire serialization at the response boundary only — the internal
+    // authority stayed Decimal through the entire settlement.
+    return {
+      invoice: result,
+      customerPays: Number(customerPays.toFixed(8)),
+      businessReceives: Number(businessReceives.toFixed(8)),
+      fee: Number(fee.toFixed(8)),
+    };
   } catch (err) {
     if (err.message === 'INVOICE_ALREADY_PAID') {
       const paidInvoice = await prisma.businessInvoice.findUnique({
@@ -279,7 +324,7 @@ const payInvoice = async (prisma, {
       if (paidInvoice?.payTxHash) {
         return {
           invoice: paidInvoice,
-          customerPays: Number(paidInvoice.customerPaidUsdc),
+          customerPays: Number(paidInvoice.customerPaidUsdc.toFixed(8)),
           alreadyPaid: true,
         };
       }

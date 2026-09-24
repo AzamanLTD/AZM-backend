@@ -29,7 +29,11 @@
 
 const crypto = require('crypto');
 const { Prisma } = require('@prisma/client');
-const { computeTaxLines } = require('../../utils/invoiceMath');
+// r39/P1 — tax authority migrated from the legacy float/6dp invoiceMath to
+// the exact-decimal business tax authority: the subtotal enters as a
+// Prisma.Decimal and the tax is computed exactly (HALF_UP quantized to 8dp
+// per line), matching the Decimal(20,8) storage contract.
+const { computeTaxLinesExact, toFixed8 } = require('../../utils/exactInvoiceMath');
 const ledger = require('../ledgerService');
 
 const SERIALIZABLE_RETRY_LIMIT = 3;
@@ -183,7 +187,6 @@ class DineInCashCloseService {
                         (sum, item) => sum.plus(new Prisma.Decimal(item.lineTotalUsdc)),
                         new Prisma.Decimal(0)
                     );
-                    const subtotal = Number(subtotalDec.toFixed(8));
 
                     // Tax via the business's default preset — the same
                     // machinery as the invoice/POS settlement boundary.
@@ -194,16 +197,17 @@ class DineInCashCloseService {
                             select: { name: true, type: true, value: true },
                         })
                         : null;
-                    const taxResult = computeTaxLines(preset ? [preset] : [], subtotal);
-                    const taxTotalDec = new Prisma.Decimal(String(taxResult.taxTotal));
+                    // r39/P1 — the Decimal subtotal feeds the exact tax
+                    // authority directly; no JS Number round-trip (the old
+                    // path computed 6dp float tax and re-parsed it).
+                    const taxResult = computeTaxLinesExact(preset ? [preset] : [], subtotalDec);
+                    const taxTotalDec = taxResult.taxTotal;
                     const grandTotalDec = subtotalDec.plus(taxTotalDec).plus(tip);
-                    const grandTotal = Number(grandTotalDec.toFixed(8));
 
                     if (cash != null && cash.lt(grandTotalDec)) {
                         throw fail('INSUFFICIENT_CASH', 'Insufficient cash received.');
                     }
                     const changeDec = cash == null ? new Prisma.Decimal(0) : cash.minus(grandTotalDec);
-                    const change = Number(changeDec.toFixed(8));
 
                     // CAS: exactly one OPEN -> PAID transition can win.
                     const claimed = await tx.dineInTab.updateMany({
@@ -244,7 +248,7 @@ class DineInCashCloseService {
                                 tip: tip.toFixed(8),
                                 subtotal: subtotalDec.toFixed(8),
                                 taxTotal: taxTotalDec.toFixed(8),
-                                taxLines: taxResult.taxLines,
+                                taxLines: taxResult.taxLines.map((l) => ({ name: l.name, type: l.type, value: l.value.toString(), computedAmount: toFixed8(l.computedAmount) })),
                                 paymentMethod: 'CASH',
                                 ...(cash != null ? { cashReceived: cash.toFixed(8), cashChange: changeDec.toFixed(8) } : {}),
                                 ...(fingerprint ? { dineInCashCloseFingerprint: fingerprint } : {}),
@@ -254,10 +258,12 @@ class DineInCashCloseService {
 
                     const closed = await tx.dineInTab.findUnique({ where: { id: tabId } });
                     return {
-                        tab: closed, duplicate: false, subtotal,
+                        tab: closed, duplicate: false,
+                        subtotal: Number(subtotalDec.toFixed(8)),
                         taxTotal: Number(taxTotalDec.toFixed(8)),
                         tip: Number(tip.toFixed(8)),
-                        grandTotal, change,
+                        grandTotal: Number(grandTotalDec.toFixed(8)),
+                        change: Number(changeDec.toFixed(8)),
                     };
                 }, { isolationLevel: 'Serializable' });
                 return result;

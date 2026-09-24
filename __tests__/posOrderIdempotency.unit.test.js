@@ -1,6 +1,11 @@
 const crypto = require('crypto');
+const { Prisma } = require('@prisma/client');
 const { PosOrderService } = require('../services/businessOS/posOrderService');
 
+// Mirrors buildIdempotencyFingerprint in posOrderService — r39/P0: money
+// fields join the fingerprint as their EXACT 8dp decimal string forms, so a
+// key can never be replayed against a value that differs beyond float64
+// precision.
 function fingerprint(intent) {
     const canonical = {
         businessProfileId: String(intent.businessProfileId),
@@ -9,13 +14,13 @@ function fingerprint(intent) {
             .map(({ productId, quantity }) => ({ productId: String(productId), quantity: Number(quantity) }))
             .sort((a, b) => a.productId.localeCompare(b.productId) || a.quantity - b.quantity),
         paymentMethod: String(intent.paymentMethod || 'CASH').toUpperCase(),
-        cash: Number(intent.cashGiven || 0),
-        requestedAzm: Number(intent.azmAmount || 0),
+        cash: new Prisma.Decimal(intent.cashGiven || 0).toFixed(8),
+        requestedAzm: new Prisma.Decimal(intent.azmAmount || 0).toFixed(8),
         source: intent.source ?? null,
         locationId: intent.locationId ?? null,
         tableId: intent.tableId ?? null,
-        customerId: intent.customerId == null ? null : Number(intent.customerId),
-        tipAmount: Number(intent.tipAmount || 0), // r32/I: tips join the fingerprint
+        customerId: intent.customerId ?? null,
+        tipAmount: new Prisma.Decimal(intent.tipAmount || 0).toFixed(8), // r32/I: tips join the fingerprint
     };
     return crypto.createHash('sha256').update(JSON.stringify(canonical)).digest('hex');
 }
@@ -95,17 +100,14 @@ describe('PosOrderService idempotency intent binding', () => {
 
         await new PosOrderService(prisma).createOrder(intent);
 
-        expect(tx.businessLedgerEntry.create).toHaveBeenCalledWith(expect.objectContaining({
-            data: expect.objectContaining({
-                amount: 20.5,
-                metadata: expect.objectContaining({
-                    tax: 0.5,
-                    tipAmount: 0, // r32/I: tip is ledgered alongside the fingerprint
-                    taxLines: [{ name: 'VAT', type: 'PERCENTAGE', value: 2.5, computedAmount: 0.5 }],
-                    posIdempotencyFingerprint: fingerprint(intent),
-                }),
-            }),
-        }));
+        // r39/P1 exact-money contract: Decimals round-trip as exact
+        // strings — never float mirrors.
+        const ledgerArgs = tx.businessLedgerEntry.create.mock.calls[0][0];
+        expect(String(ledgerArgs.data.amount)).toBe('20.5');
+        expect(ledgerArgs.data.metadata.tax).toBe('0.50000000');
+        expect(ledgerArgs.data.metadata.tipAmount).toBe('0.00000000'); // r32/I: tip is ledgered alongside the fingerprint
+        expect(ledgerArgs.data.metadata.taxLines).toEqual([{ name: 'VAT', type: 'PERCENTAGE', value: '2.5', computedAmount: '0.50000000' }]);
+        expect(ledgerArgs.data.metadata.posIdempotencyFingerprint).toBe(fingerprint(intent));
     });
 
     test('uses flat business tax preset instead of a hard-coded percentage', async () => {

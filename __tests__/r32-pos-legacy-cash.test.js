@@ -117,7 +117,9 @@ run('r32 I — legacy POS cash routes over the canonical service', () => {
         });
         expect(ledger).toBeTruthy();
         expect(Number(ledger.amount)).toBeCloseTo(103.5, 6);
-        expect(ledger.metadata.tipAmount).toBe(1);
+        // r39/P1 exact-money contract: Decimal metadata round-trips as an
+        // exact fixed-8 string — never a float mirror of the pesewas.
+        expect(ledger.metadata.tipAmount).toBe('1.00000000');
     });
 
     test('2. idempotency: the same key replays the same order exactly once', async () => {

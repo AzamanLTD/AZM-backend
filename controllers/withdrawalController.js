@@ -178,10 +178,14 @@ exports.fiatWithdrawal = async (req, res) => {
             }
         }
 
+        // r39/P1 — the AUTHORITATIVE amount is the raw client value parsed
+        // by the service through the canonical exact-decimal parser (never a
+        // binary float). parseFloat mirrors below are NON-authoritative
+        // (fraud scoring, SMS/alert thresholds, receipt display).
         const data = await financeService.processFiatWithdrawal(
             prisma,
             userId,
-            parseFloat(amount),
+            amount,
             {
                 reference,
                 feeDiscountMultiplier: feeDiscountTier?.discount || 0,
@@ -211,10 +215,18 @@ exports.fiatWithdrawal = async (req, res) => {
                     const rows = await tx.$queryRawUnsafe(
                         'INSERT INTO "Withdrawal" ' +
                         '("userId", "amount", "payoutMethod", "network", "destination", "status", "transactionHistoryId", "createdAt", "updatedAt") ' +
-                        'VALUES ($1, $2, $3, $4, $5, $6, $7, now(), now()) ' +
+                        'VALUES ($1, $2::numeric, $3, $4, $5, $6, $7, now(), now()) ' +
                         'RETURNING "id", "userId", "amount", "payoutMethod", "network", "destination", "status"',
                         userId,
-                        parseFloat(amount),
+                        // r39/P1: exact money — the reconciliation record
+                        // mirrors the committed TransactionHistory amount
+                        // (the txRecord the service hands this callback),
+                        // never a float of it. Raw parameters cannot carry a
+                        // Prisma.Decimal reliably (the engine rejects the
+                        // nested decimal JSON value), so the exact value is
+                        // serialized here as a fixed-8 string; Postgres casts
+                        // it to the numeric column with no float mirror.
+                        String(txRecord.amountUsdc.toFixed ? txRecord.amountUsdc.toFixed(8) : txRecord.amountUsdc),
                         // Legacy payout-method discriminator kept for worker
                         // discovery compatibility — NOT provider identity.
                         payoutMethod || 'MTN_MOMO',

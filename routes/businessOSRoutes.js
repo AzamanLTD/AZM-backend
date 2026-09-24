@@ -9,6 +9,7 @@
 
 const logger = require('../src/config/logger');
 const { downloadInvoicePdf } = require('../controllers/invoiceController');
+const { Prisma } = require('@prisma/client'); // r39 exact-decimal aggregation
 const express = require('express');
 const router = express.Router();
 
@@ -1755,9 +1756,14 @@ router.get('/restaurant/recipes', requirePermission('restaurant.inventory.view')
             id: ri.id, inventoryItemId: ri.inventoryItemId,
             inventoryItemName: ri.inventoryItem.name, unit: ri.inventoryItem.unit,
             quantityRequired: ri.quantityRequired,
-            costGhs: ri.quantityRequired * ri.inventoryItem.costPerUnit,
+            // r39/P1 — exact Decimal costing (no float coercion via *).
+            costGhs: new Prisma.Decimal(ri.quantityRequired).mul(new Prisma.Decimal(ri.inventoryItem.costPerUnit)),
         })),
-        totalCostGhs: p.recipeIngredients.reduce((sum, ri) => sum + ri.quantityRequired * ri.inventoryItem.costPerUnit, 0),
+        // r39/P1 — exact Decimal aggregation for the recipe cost total.
+        totalCostGhs: p.recipeIngredients.reduce(
+            (sum, ri) => sum.plus(new Prisma.Decimal(ri.quantityRequired).mul(new Prisma.Decimal(ri.inventoryItem.costPerUnit))),
+            new Prisma.Decimal(0)
+        ),
     }));
     res.json({ success: true, products: withCost });
 }));
@@ -2857,7 +2863,12 @@ router.get('/dashboard/employee-stats', requirePermission('analytics.view'), wra
         }).catch(() => []),
     ]);
 
-    const monthlyPayroll = payrollRecords.reduce((sum, r) => sum + (Number(r.netAmountUsdc) || 0), 0);
+    // r39/P1 — exact Decimal aggregation (no float accumulate), with a
+    // Number() display mirror for the toFixed(2) report string only.
+    const monthlyPayroll = payrollRecords.reduce(
+        (sum, r) => sum.plus(new Prisma.Decimal(r.netAmountUsdc ?? 0)),
+        new Prisma.Decimal(0)
+    );
 
     res.json({
         success: true,
@@ -3590,7 +3601,8 @@ router.get('/finance/escrow-held', requirePermission('finance.view'), wrap(async
         },
         select: { amountUsdc: true, status: true },
     });
-    const totalHeld = escrows.reduce((s, e) => s + parseFloat(e.amountUsdc || 0), 0);
+    // r39/P1 — exact Decimal sum over DB decimals (parseFloat never here).
+    const totalHeld = escrows.reduce((s, e) => s.plus(new Prisma.Decimal(e.amountUsdc ?? 0)), new Prisma.Decimal(0));
     res.json({ data: { totalHeld, escrowCount: escrows.length, escrows } });
 }));
 
@@ -3616,7 +3628,9 @@ router.post('/finance/recurring', requirePermission('finance.ledger.manage'), wr
     else if (frequency === 'WEEKLY') { const dow = dayOfWeek || 1; const diff = (dow + 7 - now.getDay()) % 7 || 7; nextDueAt.setDate(now.getDate() + diff); }
 
     const template = await svc.prisma.recurringExpenseTemplate.create({
-        data: { businessProfileId: bpId, name, category, amount: parseFloat(amount), description, frequency, dayOfMonth, dayOfWeek, nextDueAt },
+        // r39/P1 — exact Decimal write (parseFloat would truncate beyond
+        // 2^53 and binary-round the template amount).
+        data: { businessProfileId: bpId, name, category, amount: amount != null ? new Prisma.Decimal(String(amount)) : undefined, description, frequency, dayOfMonth, dayOfWeek, nextDueAt },
     });
     res.json({ data: template });
 }));
@@ -3631,7 +3645,7 @@ router.patch('/finance/recurring/:id', requirePermission('finance.ledger.manage'
     const { name, category, amount, description, frequency, dayOfMonth, dayOfWeek, isActive } = req.body;
     const updated = await svc.prisma.recurringExpenseTemplate.updateMany({
         where: { id: req.params.id, businessProfileId: bpId },
-        data: { name, category, amount: amount ? parseFloat(amount) : undefined, description, frequency, dayOfMonth, dayOfWeek, isActive },
+        data: { name, category, amount: amount != null ? new Prisma.Decimal(String(amount)) : undefined, description, frequency, dayOfMonth, dayOfWeek, isActive },
     });
     if (updated.count === 0) return res.status(404).json({ message: 'Recurring expense template not found' });
     const template = await svc.prisma.recurringExpenseTemplate.findFirst({
@@ -3665,10 +3679,15 @@ router.get('/finance/payroll-position', requirePermission('finance.view'), wrap(
             select: { requestedAmountUsdc: true },
         }),
     ]);
-    const pendingPayroll = payrolls.filter(p => p.status === 'PENDING').reduce((s, p) => s + parseFloat(p.netPayUsdc || 0), 0);
-    const approvedPayroll = payrolls.filter(p => p.status === 'APPROVED').reduce((s, p) => s + parseFloat(p.netPayUsdc || 0), 0);
-    const ewaFloat = ewaRequests.reduce((s, e) => s + parseFloat(e.requestedAmountUsdc || 0), 0);
-    res.json({ data: { pendingPayroll, approvedPayroll, ewaFloat, totalLiability: pendingPayroll + approvedPayroll + ewaFloat } });
+    // r39/P1 — exact Decimal liability aggregation (parseFloat never here).
+    const pendingPayroll = payrolls.filter(p => p.status === 'PENDING')
+        .reduce((s, p) => s.plus(new Prisma.Decimal(p.netPayUsdc ?? 0)), new Prisma.Decimal(0));
+    const approvedPayroll = payrolls.filter(p => p.status === 'APPROVED')
+        .reduce((s, p) => s.plus(new Prisma.Decimal(p.netPayUsdc ?? 0)), new Prisma.Decimal(0));
+    const ewaFloat = ewaRequests
+        .reduce((s, e) => s.plus(new Prisma.Decimal(e.requestedAmountUsdc ?? 0)), new Prisma.Decimal(0));
+    const totalLiability = pendingPayroll.plus(approvedPayroll).plus(ewaFloat);
+    res.json({ data: { pendingPayroll, approvedPayroll, ewaFloat, totalLiability } });
 }));
 
 // ═══════════════════════════════════════════════════════════════════════════════

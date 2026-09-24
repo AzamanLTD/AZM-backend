@@ -3358,7 +3358,11 @@ model ConversationMoneyTicket {
   conversationId  String
   kind            String // MONEY_REQUEST | ESCROW_TICKET | MONEY_SEND
   amount          Decimal @db.Decimal(20, 8)
-  currency        String  @default("GHS")
+  // r39/P1 — the money-in-chat rails are USDC-denominated: the ticket always
+  // stores a USDC amount and the DDL default now says so. 'GHS' was a
+  // copy-forward of an unrelated table's default and contradicted every
+  // code path (transfer ledger, escrow, send all move USDC).
+  currency        String  @default("USDC")
   requesterId     Int // the financial message's sender
   counterpartyId  Int // derived other participant (MONEY_SEND: the explicit recipient)
   status          String  @default("sent")

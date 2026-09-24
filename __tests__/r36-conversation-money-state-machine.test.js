@@ -164,16 +164,23 @@ run('r36/P0 — conversation money state machine', () => {
             expect(await bal(A.id)).toBeCloseTo(1000, 6);
         });
 
+        // r39/P1 contract update: the reviewer-mandated convergence rule. A
+        // same-key concurrent loser no longer surfaces a transient 409 — it
+        // converges to the winner's exact committed outcome (same message,
+        // same ticket). The economic invariant is unchanged: exactly ONE
+        // transfer. See __tests__/r39-money-send-convergence.test.js.
         test('concurrent duplicates with the same key converge on ONE transfer', async () => {
             asUser(A);
             const results = await Promise.all(Array.from({ length: 5 }, () =>
                 post(convAB.id, { type: 'MONEY_SEND', recipientId: B.id, moneyAmount: '10', clientRequestId: 'send-race' })));
-            const created = results.filter((r) => r.status === 201 && r.body.data);
-            expect(created.length).toBe(1);
+            // Every same-key caller — winner and losers alike — receives the
+            // exact committed outcome, not a duplicate and not a 409.
+            const ok = results.filter((r) => r.status === 201 && r.body.data);
+            expect(ok.length).toBe(5);
             expect(await bal(A.id)).toBeCloseTo(990, 6);
             expect(await bal(B.id)).toBeCloseTo(1010, 6);
             expect(await db.conversationMoneyTicket.count({ where: { kind: 'MONEY_SEND' } })).toBe(1);
-            const msgIds = new Set(created.map((r) => r.body.data.id));
+            const msgIds = new Set(ok.map((r) => r.body.data.id));
             expect(msgIds.size).toBe(1);
         });
 

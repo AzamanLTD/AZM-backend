@@ -32,6 +32,10 @@ async function bootTreasury(app, prisma) {
     // the database ready. This is set synchronously before the first await so
     // requests racing startup cannot enter the checkout transaction early.
     app.set('retailCheckoutIntegrityReady', false);
+    // r39/P1 — the Business OS gate follows the identical contract: set
+    // synchronously BEFORE any await so a startup-racing request can never
+    // enter a money-bearing Business OS route before convergence.
+    app.set('businessOSReady', false);
 
     const cacheTreasury = async () => {
         const treasury = await prisma.user.findUnique({
@@ -58,16 +62,16 @@ async function bootTreasury(app, prisma) {
             }
 
             // Apply business OS schema additions (Modules 01+03) idempotently.
-            try {
-                const { execSync } = require('child_process');
-                execSync('node infra/install-business-os-overlay.js', { stdio: 'inherit', timeout: 30000 });
-            } catch (e) {
-                logger.warn({ err: e }, 'business-os-overlay: boot-time install skipped');
-            }
+            // r39/P1 — the failure is no longer swallowed: a non-converged
+            // overlay leaves businessOSReady false and the production gate
+            // fails the /api/business-os surface closed (retryable 503).
+            const { bootBusinessOSOverlay } = require('./businessOS');
+            await bootBusinessOSOverlay(app);
         } else {
             // Unit/integration tests mount route modules directly and do not run
             // production boot. They must not be blocked by the production gate.
             app.set('retailCheckoutIntegrityReady', true);
+            app.set('businessOSReady', true);
         }
 
         const id = await cacheTreasury();

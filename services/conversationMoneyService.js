@@ -204,100 +204,21 @@ class ConversationMoneyService {
             return { message, replay: true, ticket: existing };
         }
 
-        const result = await this.prisma.$transaction(async (tx) => {
-            const sender = await tx.user.findUnique({ where: { id: userId } });
-            if (!sender) throw fail(400, 'SENDER_NOT_FOUND', 'Sender not found.');
-            const receiver = await tx.user.findUnique({ where: { id: receiverId } });
-            if (!receiver) throw fail(400, 'RECEIVER_NOT_FOUND', 'Receiver not found.');
-
-            // r38/P1 — ATOMIC BALANCE CLAIM (the same claim-before-money
-            // standard as escrowService): the conditional decrement IS the
-            // authority; the DB nonneg CHECK is a secondary invariant, never
-            // the guard. The concurrency loser gets a deterministic
-            // INSUFFICIENT_BALANCE (not a CHECK violation) and the whole tx
-            // rolls back — zero residual side effects.
-            const balanceClaim = await tx.user.updateMany({
-                where: { id: userId, availableBalance: { gte: amt } },
-                data: { availableBalance: { decrement: amt } },
-            });
-            if (balanceClaim.count !== 1) {
-                throw fail(400, 'INSUFFICIENT_BALANCE', this._insufficientMsg(userId, await tx.user.findUnique({
-                    where: { id: userId }, select: { availableBalance: true },
-                }), amt));
-            }
-            await tx.user.update({ where: { id: receiverId }, data: { availableBalance: { increment: amt } } });
-
-            await tx.contact.upsert({
-                where: { userId_savedUserId: { userId, savedUserId: receiverId } },
-                update: {}, create: { userId, savedUserId: receiverId },
-            });
-            await tx.contact.upsert({
-                where: { userId_savedUserId: { userId: receiverId, savedUserId: userId } },
-                update: {}, create: { userId: receiverId, savedUserId: userId },
-            });
-
-            const content = note
-                ? `💸 Sent ${amt.toFixed(2)} ${asset} — "${note}"`
-                : `💸 Sent ${amt.toFixed(2)} ${asset}`;
-            const message = await tx.message.create({
-                data: {
-                    conversationId: conv.id,
-                    senderId: userId,
-                    messageType: 'PAYMENT_TRANSFER',
-                    content,
-                    status: 'ACCEPTED',
-                },
-                include: { sender: { select: { id: true, username: true } } },
-            });
-
-            let ticket;
-            try {
-                ticket = await tx.conversationMoneyTicket.create({
-                    data: {
-                        messageId: message.id,
-                        conversationId: conv.id,
-                        kind: 'MONEY_SEND',
-                        amount: amt,
-                        currency: asset,
-                        requesterId: userId,
-                        counterpartyId: receiverId,
-                        status: 'ACCEPTED',
-                        clientRequestId: requestId,
-                    },
+        // r39/P1 — the concurrent same-key loser converges to the committed
+        // winner's exact outcome instead of surfacing a transient 409.
+        let result;
+        try {
+            result = await this._sendMoneyTransaction({ userId, conv, amt, receiverId, asset, note, requestId });
+        } catch (e) {
+            if (e.code === 'DUPLICATE_REQUEST') {
+                return this._convergeToCommittedOutcome({
+                    requestId, kind: 'MONEY_SEND', conversationId: conv.id,
+                    requesterId: userId, counterpartyId: receiverId,
+                    currency: asset, amount: amt, conflictLabel: 'transfer parameters',
                 });
-            } catch (e) {
-                // A concurrent duplicate with the same key slipped past the
-                // pre-check: the unique clientRequestId index makes exactly one
-                // writer win. The loser fails closed (whole tx rolls back,
-                // including the balance moves) and retries into a replay.
-                if (e.code === 'P2002') throw fail(409, 'DUPLICATE_REQUEST', 'A request with this clientRequestId is already in flight.');
-                throw e;
             }
-
-            await ledger.post(tx, {
-                idempotencyKey: `ledger:transfer:conv-send:${message.id}`,
-                entryType: 'TRANSFER',
-                description: 'Chat money transfer — liability moved sender→receiver',
-                userId,
-                relatedEntity: 'message',
-                relatedEntityId: message.id,
-                metadata: { transferType: 'CONVERSATION_SEND', receiverId, amount: _exact(amt) },
-                lines: [
-                    { account: `user:${userId}:liability`, debit: _exact(amt) },
-                    { account: `user:${receiverId}:liability`, credit: _exact(amt) },
-                ],
-            });
-
-            await tx.transactionHistory.create({
-                data: { userId, type: 'INTERNAL_TRANSFER', amountUsdc: amt.neg(), feeUsdc: 0, status: 'COMPLETED' },
-            });
-            await tx.transactionHistory.create({
-                data: { userId: receiverId, type: 'INTERNAL_TRANSFER', amountUsdc: amt, feeUsdc: 0, status: 'COMPLETED' },
-            });
-
-            return { message, ticket, sender };
-        });
-
+            throw e;
+        }
         await this.emitBalanceUpdate(userId);
         await this.emitBalanceUpdate(receiverId);
 
@@ -313,6 +234,106 @@ class ConversationMoneyService {
             { type: 'PAYMENT_TRANSFER', conversationId: conv.id, route: `/chat/${conv.id}` });
 
         return { message: result.message, replay: false, ticket: result.ticket };
+    }
+
+    // r39/P1 — the economic transaction extracted verbatim: one atomic
+    // claim → message → ticket → ledger → history sequence. The concurrent
+    // same-key loser surfaces P2002 (translated to DUPLICATE_REQUEST) here;
+    // _sendMoney converges it to the committed winner's exact outcome.
+    async _sendMoneyTransaction({ userId, conv, amt, receiverId, asset, note, requestId }) {
+        return this.prisma.$transaction(async (tx) => {
+            const sender = await tx.user.findUnique({ where: { id: userId } });
+            if (!sender) throw fail(400, 'SENDER_NOT_FOUND', 'Sender not found.');
+        const receiver = await tx.user.findUnique({ where: { id: receiverId } });
+        if (!receiver) throw fail(400, 'RECEIVER_NOT_FOUND', 'Receiver not found.');
+
+        // r38/P1 — ATOMIC BALANCE CLAIM (the same claim-before-money
+        // standard as escrowService): the conditional decrement IS the
+        // authority; the DB nonneg CHECK is a secondary invariant, never
+        // the guard. The concurrency loser gets a deterministic
+        // INSUFFICIENT_BALANCE (not a CHECK violation) and the whole tx
+        // rolls back — zero residual side effects.
+        const balanceClaim = await tx.user.updateMany({
+            where: { id: userId, availableBalance: { gte: amt } },
+            data: { availableBalance: { decrement: amt } },
+        });
+        if (balanceClaim.count !== 1) {
+            throw fail(400, 'INSUFFICIENT_BALANCE', this._insufficientMsg(userId, await tx.user.findUnique({
+                where: { id: userId }, select: { availableBalance: true },
+            }), amt));
+        }
+        await tx.user.update({ where: { id: receiverId }, data: { availableBalance: { increment: amt } } });
+
+        await tx.contact.upsert({
+            where: { userId_savedUserId: { userId, savedUserId: receiverId } },
+            update: {}, create: { userId, savedUserId: receiverId },
+        });
+        await tx.contact.upsert({
+            where: { userId_savedUserId: { userId: receiverId, savedUserId: userId } },
+            update: {}, create: { userId: receiverId, savedUserId: userId },
+        });
+
+        const content = note
+            ? `💸 Sent ${amt.toFixed(2)} ${asset} — "${note}"`
+            : `💸 Sent ${amt.toFixed(2)} ${asset}`;
+        const message = await tx.message.create({
+            data: {
+                conversationId: conv.id,
+                senderId: userId,
+                messageType: 'PAYMENT_TRANSFER',
+                content,
+                status: 'ACCEPTED',
+            },
+            include: { sender: { select: { id: true, username: true } } },
+        });
+
+        let ticket;
+        try {
+            ticket = await tx.conversationMoneyTicket.create({
+                data: {
+                    messageId: message.id,
+                    conversationId: conv.id,
+                    kind: 'MONEY_SEND',
+                    amount: amt,
+                    currency: asset,
+                    requesterId: userId,
+                    counterpartyId: receiverId,
+                    status: 'ACCEPTED',
+                    clientRequestId: requestId,
+                },
+            });
+        } catch (e) {
+            // A concurrent duplicate with the same key slipped past the
+            // pre-check: the unique clientRequestId index makes exactly one
+            // writer win. The loser fails closed (whole tx rolls back,
+            // including the balance moves) and retries into a replay.
+            if (e.code === 'P2002') throw fail(409, 'DUPLICATE_REQUEST', 'A request with this clientRequestId is already in flight.');
+            throw e;
+        }
+
+        await ledger.post(tx, {
+            idempotencyKey: `ledger:transfer:conv-send:${message.id}`,
+            entryType: 'TRANSFER',
+            description: 'Chat money transfer — liability moved sender→receiver',
+            userId,
+            relatedEntity: 'message',
+            relatedEntityId: message.id,
+            metadata: { transferType: 'CONVERSATION_SEND', receiverId, amount: _exact(amt) },
+            lines: [
+                { account: `user:${userId}:liability`, debit: _exact(amt) },
+                { account: `user:${receiverId}:liability`, credit: _exact(amt) },
+            ],
+        });
+
+        await tx.transactionHistory.create({
+            data: { userId, type: 'INTERNAL_TRANSFER', amountUsdc: amt.neg(), feeUsdc: 0, status: 'COMPLETED' },
+        });
+        await tx.transactionHistory.create({
+            data: { userId: receiverId, type: 'INTERNAL_TRANSFER', amountUsdc: amt, feeUsdc: 0, status: 'COMPLETED' },
+        });
+
+        return { message, ticket, sender };
+        });
     }
 
     async _createMoneyRequest({ user, conv, moneyAmount, fromUserId, asset, note, clientRequestId }) {
@@ -401,7 +422,10 @@ class ConversationMoneyService {
             return { message, ticket: existing, replay: true };
         }
 
-        return this.prisma.$transaction(async (tx) => {
+        // r39/P1 — same convergence contract as _sendMoney: the concurrent
+        // same-key loser returns the committed winner's exact outcome.
+        try {
+            return await this.prisma.$transaction(async (tx) => {
             const message = await tx.message.create({
                 data: {
                     conversationId: conv.id,
@@ -432,7 +456,17 @@ class ConversationMoneyService {
                 throw e;
             }
             return { message, ticket, replay: false };
-        });
+            });
+        } catch (e) {
+            if (e.code === 'DUPLICATE_REQUEST') {
+                return this._convergeToCommittedOutcome({
+                    requestId, kind, conversationId: conv.id,
+                    requesterId: userId, counterpartyId: counterparty.id,
+                    currency: asset, amount: amt, conflictLabel: 'parameters',
+                });
+            }
+            throw e;
+        }
     }
 
     // ── Ticket resolution: messageId is ALWAYS bound to the URL conversationId ─
@@ -451,6 +485,42 @@ class ConversationMoneyService {
     }
 
     // Idempotent replay: return the durable outcome recorded on the ticket.
+    // r39/P1 — MONEY-SEND SAME-KEY CONCURRENT RESPONSE CONVERGENCE.
+    // When two same-key requests race, Postgres serializes them on the
+    // clientRequestId unique index: by the time the loser observes P2002,
+    // the winner's row is COMMITTED (a rolled-back winner would have let
+    // the loser's insert proceed). The loser therefore never returns a
+    // transient DUPLICATE_REQUEST — it converges to the exact committed
+    // outcome, the SAME replay contract a post-commit retry gets, after
+    // verifying the identical conflict identity the pre-check uses.
+    // Proven invariants: exactly one economic effect (winner), loser
+    // leaves zero residue (its tx rolled back), and a same-key retry
+    // always returns the exact committed result.
+    async _convergeToCommittedOutcome({ requestId, kind, conversationId, requesterId, counterpartyId, currency, amount, conflictLabel }) {
+        const committed = await this.prisma.conversationMoneyTicket.findUnique({
+            where: { clientRequestId: requestId },
+        });
+        if (!committed) {
+            // Defensive only: unreachable under Postgres unique-index
+            // semantics, but fail closed rather than invent an outcome.
+            throw fail(409, 'DUPLICATE_REQUEST', 'A request with this clientRequestId is already in flight.');
+        }
+        if (committed.kind !== kind
+            || committed.conversationId !== conversationId
+            || committed.requesterId !== requesterId
+            || committed.counterpartyId !== counterpartyId
+            || committed.currency !== currency
+            || new Prisma.Decimal(committed.amount).toFixed(8) !== amount.toFixed(8)) {
+            throw fail(409, 'IDEMPOTENCY_CONFLICT',
+                `This clientRequestId was already used with different ${conflictLabel || 'parameters'}.`);
+        }
+        const message = await this.prisma.message.findUnique({
+            where: { id: committed.messageId },
+            include: { sender: { select: { id: true, username: true } } },
+        });
+        return { message, ticket: committed, replay: true };
+    }
+
     async _outcomeMessage(ticketId, fallbackStatus) {
         const t = await this.prisma.conversationMoneyTicket.findUnique({ where: { id: ticketId } });
         if (t?.resultMessageId) {

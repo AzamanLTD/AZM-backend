@@ -49,10 +49,10 @@ const _resolveFiatRetailRate = (settings, opts = {}) => {
  * concurrency guard; a preflight read alone is not sufficient because two
  * withdrawals can observe the same available balance before either commits.
  */
-const _reserveFiatPool = async (tx, amountFloat) => {
+const _reserveFiatPool = async (tx, amount) => {
     const claim = await tx.systemFiatPool.updateMany({
-        where: { id: 1, balance: { gte: amountFloat } },
-        data: { balance: { decrement: amountFloat } },
+        where: { id: 1, balance: { gte: amount } },
+        data: { balance: { decrement: amount } },
     });
 
     if (claim.count !== 1) {
@@ -91,7 +91,13 @@ const fiatLiquidity = require('../src/services/fiatLiquidityService'); // §P.5-
 // fiat outcome INSIDE the settlement/reversal transaction.
 const smartRouteOccurrence = require('./smartRouteOccurrence');
 
-const processFiatWithdrawal = async (prisma, userId, amountFloat, opts = {}) => {
+const processFiatWithdrawal = async (prisma, userId, amountIn, opts = {}) => {
+    // r39/P1 — EXACT WITHDRAWAL CORE. The amount enters through the canonical
+    // exact-decimal parser (Decimal | exact string | safe number) — never a
+    // binary float — and every derived quantity (exit fee, half fee, total
+    // deduction, GHS payout) is Decimal-native, rounded ONCE at its authority
+    // (8dp USDC, 2dp pesewas GHS, HALF_UP).
+    const amount = ledger.toExactDecimal(amountIn, 'amount');
     await runDoubleCheck(prisma, userId);
     const liquidityAuthorityOn = await fiatLiquidity.isAuthorityEnabled(prisma);
     const referrer = await _resolveReferrer(prisma, userId);
@@ -99,27 +105,35 @@ const processFiatWithdrawal = async (prisma, userId, amountFloat, opts = {}) => 
     const settings = await prisma.globalSettings.findUnique({ where: { id: 1 } });
     const user = await prisma.user.findUnique({ where: { id: userId }, select: { withdrawalRiskTier: true } });
 
-    let effectiveExitFeePct = EXIT_FEE_PERCENT;
+    // Fee percent enters as an EXACT Decimal from the settings authority.
+    const pctOf = (v) => new Prisma.Decimal(String(v));
+    let effectiveExitFeePct = pctOf(EXIT_FEE_PERCENT);
     if (settings) {
         const riskTier = user?.withdrawalRiskTier || 'STANDARD';
         const riskMap = settings.withdrawalFeeByRiskTier || {};
         const parsedRiskMap = typeof riskMap === 'string' ? JSON.parse(riskMap) : riskMap;
         if (parsedRiskMap[riskTier] !== undefined) {
-            effectiveExitFeePct = Number(parsedRiskMap[riskTier]);
+            effectiveExitFeePct = pctOf(parsedRiskMap[riskTier]);
         } else {
-            effectiveExitFeePct = Number(settings.fiatWithdrawalFeePct ?? settings.baseExitFeePct ?? EXIT_FEE_PERCENT);
+            effectiveExitFeePct = pctOf(settings.fiatWithdrawalFeePct ?? settings.baseExitFeePct ?? EXIT_FEE_PERCENT);
         }
     }
 
-    const discountMult = Math.min(1.0, Math.max(0, Number(opts.feeDiscountMultiplier) || 0));
-    const rawExitFee  = amountFloat * effectiveExitFeePct;
-    const exitFee     = parseFloat((rawExitFee * (1 - discountMult)).toFixed(6));
-    const halfFee     = parseFloat((exitFee / 2).toFixed(6));
-    const totalDeduct = parseFloat((amountFloat + exitFee).toFixed(6));
+    // The discount multiplier is a policy fraction (tier-configured, not a
+    // persisted money quantity) — clamped to [0, 1] and parsed exactly.
+    const discountMult = pctOf(Math.min(1.0, Math.max(0, Number(opts.feeDiscountMultiplier) || 0)));
+    const exitFee     = amount.times(effectiveExitFeePct).times(new Prisma.Decimal(1).minus(discountMult))
+        .toDecimalPlaces(8, Prisma.Decimal.ROUND_HALF_UP);
+    const halfFee     = exitFee.div(2).toDecimalPlaces(8, Prisma.Decimal.ROUND_HALF_UP);
+    const totalDeduct = amount.plus(exitFee);
 
     const reference = opts.reference || `FIAT_OUT_${userId}_${Date.now()}`;
     const retailRate = _resolveFiatRetailRate(settings, opts);
-    const payoutGhs  = retailRate > 0 ? parseFloat((amountFloat * retailRate).toFixed(2)) : 0;
+    // Exact pesewa authority: the GHS payout is rounded ONCE at 2dp (HALF_UP).
+    const retailRateExact = pctOf(retailRate);
+    const payoutGhs  = retailRateExact.gt(0)
+        ? amount.times(retailRateExact).toDecimalPlaces(2, Prisma.Decimal.ROUND_HALF_UP)
+        : new Prisma.Decimal(0);
     const rateSource = settings?.liveRetailRate && Number(settings.liveRetailRate) > 0
         ? (settings.liveRateSource || 'KOTANI_PAY')
         : (settings?.liveRateSource || 'LEGACY_COMPATIBILITY');
@@ -128,7 +142,7 @@ const processFiatWithdrawal = async (prisma, userId, amountFloat, opts = {}) => 
     // inherits a MOCK-echo or admin-fabricated stamp.
     const rateAsOf = settings?.lastExternalSync || settings?.lastRateSync || new Date();
 
-    if (!(retailRate > 0) || !(payoutGhs > 0)) {
+    if (!(retailRateExact.gt(0)) || !(payoutGhs.gt(0))) {
         const err = new Error('Current USDC/GHS retail exchange rate is unavailable. No fiat payout was created.');
         err.code = 'FIAT_RATE_UNAVAILABLE';
         throw err;
@@ -146,7 +160,7 @@ const processFiatWithdrawal = async (prisma, userId, amountFloat, opts = {}) => 
     // cannot be claimed from FiatLiquidityState.availableGhs.
     if (!liquidityAuthorityOn) {
         const fiatPool = await prisma.systemFiatPool.findUnique({ where: { id: 1 } });
-        if (!fiatPool || Number(fiatPool.balance) < amountFloat) {
+        if (!fiatPool || new Prisma.Decimal(fiatPool.balance).lessThan(amount)) {
             const err = new Error(
                 'MoMo payouts are temporarily at capacity. Your USDC has not been deducted. ' +
                 'Please try again in a few minutes or contact support.'
@@ -160,9 +174,9 @@ const processFiatWithdrawal = async (prisma, userId, amountFloat, opts = {}) => 
         const liveUser = await tx.user.findUnique({ where: { id: userId } });
         if (!liveUser) throw new Error('User not found.');
 
-        if (liveUser.availableBalance < totalDeduct) {
+        if (new Prisma.Decimal(liveUser.availableBalance).lessThan(totalDeduct)) {
             const err = new Error(
-                `Insufficient balance. Required: ${totalDeduct} USDC ` +
+                `Insufficient balance. Required: ${totalDeduct.toFixed(8)} USDC ` +
                 `(amount + exit fee), available: ${liveUser.availableBalance.toFixed(6)} USDC.`
             );
             err.code = 'INSUFFICIENT_BALANCE';
@@ -176,7 +190,7 @@ const processFiatWithdrawal = async (prisma, userId, amountFloat, opts = {}) => 
         // stays byte-identical. A claim loser rolls back this whole
         // transaction (user debit included) either way.
         if (!liquidityAuthorityOn) {
-            await _reserveFiatPool(tx, amountFloat);
+            await _reserveFiatPool(tx, amount);
         }
         await _debitUserBalance(tx, userId, totalDeduct);
 
@@ -202,14 +216,14 @@ const processFiatWithdrawal = async (prisma, userId, amountFloat, opts = {}) => 
         await _ensureMasterCryptoSingleton(tx);
         await tx.systemMasterCrypto.update({
             where: { id: 1 },
-            data: { balance: { increment: amountFloat } }
+            data: { balance: { increment: amount } }
         });
 
         const txRecord = await tx.transactionHistory.create({
             data: {
                 userId,
                 type: 'WITHDRAWAL_FIAT',
-                amountUsdc: amountFloat,
+                amountUsdc: amount,
                 feeUsdc: exitFee,
                 txHash: reference,
                 status: 'PENDING',
@@ -217,10 +231,12 @@ const processFiatWithdrawal = async (prisma, userId, amountFloat, opts = {}) => 
                     economicsDeferred: true,
                     referrerId: referrer?.id ?? null,
                     referrerUsername: referrer?.username ?? null,
-                    referrerShareUsdc: referrer ? halfFee : 0,
-                    systemFeeShareUsdc: referrer ? halfFee : exitFee,
+                    // r39/P1: exact-string money in metadata (Decimal
+                    // JSON round-trips as a string — never a float mirror).
+                    referrerShareUsdc: referrer ? halfFee.toFixed(8) : '0',
+                    systemFeeShareUsdc: referrer ? halfFee.toFixed(8) : exitFee.toFixed(8),
                     retailRate,
-                    payoutGhs,
+                    payoutGhs: payoutGhs.toFixed(2),
                     rateSource,
                     rateAsOf,
                     ratePair: 'USDC/GHS',
@@ -300,20 +316,20 @@ const processFiatWithdrawal = async (prisma, userId, amountFloat, opts = {}) => 
             relatedEntityId: (await tx.transactionHistory.findUnique({ where: { txHash: reference } }))?.id ?? null,
             metadata: { status: 'PENDING', provider: 'MOOLRE_DISBURSEMENT', deferredEconomics: true },
             lines: [
-                { account: `user:${userId}:liability`, debit: new Prisma.Decimal(String(totalDeduct)) },
-                { account: 'restricted:reserves', credit: new Prisma.Decimal(String(totalDeduct)) },
+                { account: `user:${userId}:liability`, debit: totalDeduct },
+                { account: 'restricted:reserves', credit: totalDeduct },
             ],
         });
         await restrictedObligations.createForPendingWithdrawal(tx, {
             sourceType: 'PENDING_FIAT_WITHDRAWAL',
             reference: `withdrawal:fiat:${reference}`,
             userId,
-            amount: new Prisma.Decimal(String(totalDeduct)),
+            amount: totalDeduct,
             asset: 'USDC',
             sourceEntity: 'transactionHistory',
             sourceEntityId: reference,
             ledgerTransactionId: fiatReservation.transaction.id,
-            domainStateRef: { principalUsdc: amountFloat, exitFeeUsdc: exitFee, payoutGhs },
+            domainStateRef: { principalUsdc: amount.toFixed(8), exitFeeUsdc: exitFee.toFixed(8), payoutGhs: payoutGhs.toFixed(2) },
         });
 
         const [profitFees, updatedFiatPool, masterCrypto, updatedUser] = await Promise.all([
@@ -337,7 +353,7 @@ const processFiatWithdrawal = async (prisma, userId, amountFloat, opts = {}) => 
 
     return {
         reference,
-        withdrawalAmount: amountFloat,
+        withdrawalAmount: amount,
         exitFee,
         totalDeducted: totalDeduct,
         retailRate,
@@ -349,12 +365,12 @@ const processFiatWithdrawal = async (prisma, userId, amountFloat, opts = {}) => 
         displayCurrency: 'GHS',
         feeSplit: referrer
             ? { referrerId: referrer.id, referrerUsername: referrer.username, referrerShare: halfFee, systemShare: halfFee }
-            : { referrerId: null, referrerUsername: null, referrerShare: 0, systemShare: exitFee },
+            : { referrerId: null, referrerUsername: null, referrerShare: new Prisma.Decimal(0), systemShare: exitFee },
         newBalance: result.newUserBalance,
         systemFiatPool: result.fiatPool.balance,
         systemProfitFees: result.profitFees.balance,
         systemMasterCrypto: result.masterCrypto.balance,
-        arbitrageCapture: amountFloat,
+        arbitrageCapture: amount,
         transaction: result.txRecord,
         withdrawalRecord: result.withdrawalRecord,
         fiatPoolLow: result.fiatPool.balance < FIAT_POOL_ALERT_THRESH,
@@ -410,16 +426,20 @@ const completeFiatWithdrawal = async (prisma, reference, { providerTxId = null }
         });
 
         if (_isDeferredWithdrawal(pending)) {
-            const amountFloat = Number(pending.amountUsdc);
-            const exitFee = Number(pending.feeUsdc);
+            // r39/P1 — deferred economics realize EXACTLY what was reserved:
+            // the persisted DECIMAL(20,8) columns and exact-string metadata
+            // feed Decimal-native increments — no float mirror anywhere.
+            const ZERO = new Prisma.Decimal(0);
+            const amountUsdc = new Prisma.Decimal(pending.amountUsdc);
+            const exitFee = new Prisma.Decimal(pending.feeUsdc);
             const metadata = pending.metadata || {};
             const referrerId = Number(metadata.referrerId) > 0 ? Number(metadata.referrerId) : null;
-            const referrerShare = Math.max(0, Number(metadata.referrerShareUsdc) || 0);
-            const systemShare = Math.max(0, Number(metadata.systemFeeShareUsdc) || 0);
+            const referrerShare = Prisma.Decimal.max(ZERO, new Prisma.Decimal(String(metadata.referrerShareUsdc ?? '0')));
+            const systemShare = Prisma.Decimal.max(ZERO, new Prisma.Decimal(String(metadata.systemFeeShareUsdc ?? '0')));
 
             await _ensureProfitFeesSingleton(tx);
 
-            if (referrerId && referrerShare > 0) {
+            if (referrerId && referrerShare.gt(0)) {
                 await tx.user.update({
                     where: { id: referrerId },
                     data: { availableBalance: { increment: referrerShare } }
@@ -435,12 +455,12 @@ const completeFiatWithdrawal = async (prisma, reference, { providerTxId = null }
                     ]
                 });
             } else {
-                const realizedFee = systemShare > 0 ? systemShare : exitFee;
+                const realizedFee = systemShare.gt(0) ? systemShare : exitFee;
                 await tx.systemProfitFees.update({
                     where: { id: 1 },
                     data: { balance: { increment: realizedFee } }
                 });
-                if (realizedFee > 0) {
+                if (realizedFee.gt(0)) {
                     await tx.adminProfitLog.create({
                         data: { amountUsdc: realizedFee, source: 'EXIT_FEE', relatedTxId: `full_fee_${reference}` }
                     });
@@ -448,7 +468,7 @@ const completeFiatWithdrawal = async (prisma, reference, { providerTxId = null }
             }
 
             await tx.adminProfitLog.create({
-                data: { amountUsdc: amountFloat, source: 'ARBITRAGE_SPREAD', relatedTxId: `arbitrage_capture_${reference}` }
+                data: { amountUsdc: amountUsdc, source: 'ARBITRAGE_SPREAD', relatedTxId: `arbitrage_capture_${reference}` }
             });
             // §P.4 AUTHORITATIVE SETTLEMENT — inside the SAME settlement
             // transaction as the PENDING->COMPLETED claim and the deferred
@@ -467,9 +487,11 @@ const completeFiatWithdrawal = async (prisma, reference, { providerTxId = null }
             // Provider-dependent economics are NEVER realized before this point.
             const ledgerReserved = metadata.ledgerReserved === true;
             if (ledgerReserved) {
-                const principalExact = new Prisma.Decimal(String(amountFloat));
-                const systemFeeExact = new Prisma.Decimal(String(referrerId && referrerShare > 0 ? systemShare : (systemShare > 0 ? systemShare : exitFee)));
-                const referrerShareExact = referrerId && referrerShare > 0 ? new Prisma.Decimal(String(referrerShare)) : null;
+                const principalExact = amountUsdc;
+                const systemFeeExact = referrerId && referrerShare.gt(0)
+                    ? systemShare
+                    : (systemShare.gt(0) ? systemShare : exitFee);
+                const referrerShareExact = referrerId && referrerShare.gt(0) ? referrerShare : null;
                 const totalReservedExact = principalExact.plus(systemFeeExact).plus(referrerShareExact || new Prisma.Decimal(0));
                 const lines = [
                     { account: 'restricted:reserves', debit: totalReservedExact },
@@ -539,10 +561,13 @@ const reverseFiatWithdrawal = async (prisma, reference, opts = {}) => {
     }
 
     const userId = original.userId;
-    const amountFloat = Number(original.amountUsdc);
-    const exitFee = Number(original.feeUsdc);
-    const halfFee = parseFloat((exitFee / 2).toFixed(6));
-    const totalDeduct = parseFloat((amountFloat + exitFee).toFixed(6));
+    // r39/P1 — the reversal refunds EXACTLY what the reservation took: the
+    // persisted DECIMAL(20,8) columns feed Decimal-native math (never a
+    // float mirror of committed money).
+    const amountUsdc = new Prisma.Decimal(original.amountUsdc);
+    const exitFee = new Prisma.Decimal(original.feeUsdc);
+    const halfFee = exitFee.div(2).toDecimalPlaces(8, Prisma.Decimal.ROUND_HALF_UP);
+    const totalDeduct = amountUsdc.plus(exitFee);
     const economicsDeferred = _isDeferredWithdrawal(original);
     const referrer = economicsDeferred ? null : await _resolveReferrer(prisma, userId);
 
@@ -592,8 +617,8 @@ const reverseFiatWithdrawal = async (prisma, reference, opts = {}) => {
                 relatedEntityId: original.id,
                 metadata: { status: 'FAILED', provider: 'MOOLRE_DISBURSEMENT' },
                 lines: [
-                    { account: 'restricted:reserves', debit: new Prisma.Decimal(String(totalDeduct)) },
-                    { account: `user:${userId}:liability`, credit: new Prisma.Decimal(String(totalDeduct)) },
+                    { account: 'restricted:reserves', debit: totalDeduct },
+                    { account: `user:${userId}:liability`, credit: totalDeduct },
                 ],
             });
             await restrictedObligations.cancelOnReversal(tx, {
@@ -607,7 +632,7 @@ const reverseFiatWithdrawal = async (prisma, reference, opts = {}) => {
         // which are prohibited by the database. New deferred rows skip this
         // block entirely because no fee/referral economics exist yet.
         if (!economicsDeferred) {
-            if (referrer && halfFee > 0) {
+            if (referrer && halfFee.gt(0)) {
                 const referralDebit = await tx.user.updateMany({
                     where: { id: referrer.id, availableBalance: { gte: halfFee } },
                     data: { availableBalance: { decrement: halfFee } }
@@ -635,7 +660,7 @@ const reverseFiatWithdrawal = async (prisma, reference, opts = {}) => {
 
         await tx.systemMasterCrypto.update({
             where: { id: 1 },
-            data: { balance: { decrement: amountFloat } }
+            data: { balance: { decrement: amountUsdc } }
         });
         // §P.5-D: the reversal releases GHS through the SAME regime that
         // reserved it. A provider-terminal FAILED observation (opts.providerTerminal)
@@ -662,7 +687,7 @@ const reverseFiatWithdrawal = async (prisma, reference, opts = {}) => {
             await _ensureFiatPoolSingleton(tx);
             await tx.systemFiatPool.update({
                 where: { id: 1 },
-                data: { balance: { increment: amountFloat } }
+                data: { balance: { increment: amountUsdc } }
             });
         }
 
@@ -744,13 +769,16 @@ const reverseFiatWithdrawal = async (prisma, reference, opts = {}) => {
         systemProfitFees: result.profitFees.balance,
         systemFiatPool: result.fiatPool.balance,
         systemMasterCrypto: result.masterCrypto.balance,
-        unwoundCapture: amountFloat,
+        unwoundCapture: amountUsdc,
         azmFeeDiscount: result.azmFeeDiscount,
         reason: opts.reason || null
     };
 };
 
-const liquidateProfits = async (prisma, amountFloat, adminId, auditContext = {}) => {
+const liquidateProfits = async (prisma, amountIn, adminId, auditContext = {}) => {
+    // r39/P1 — EXACT LIQUIDATION CORE: the admin-requested amount passes the
+    // canonical exact parser; the GHS treasury opening prices at 2dp pesewas.
+    const amount = ledger.toExactDecimal(amountIn, 'amount');
     const liquidityAuthorityOn = await fiatLiquidity.isAuthorityEnabled(prisma);
     let treasuryRate = null;
     let treasuryRateSource = null;
@@ -780,21 +808,22 @@ const liquidateProfits = async (prisma, amountFloat, adminId, auditContext = {})
         if (!liquidityAuthorityOn) await _ensureFiatPoolSingleton(tx);
 
         const claim = await tx.systemProfitFees.updateMany({
-            where: { id: 1, balance: { gte: amountFloat } },
-            data: { balance: { decrement: amountFloat } }
+            where: { id: 1, balance: { gte: amount } },
+            data: { balance: { decrement: amount } }
         });
 
         if (claim.count !== 1) {
-            const err = new Error(`Insufficient profit balance. Requested: ${amountFloat.toFixed(6)} USDC.`);
+            const err = new Error(`Insufficient profit balance. Requested: ${amount.toFixed(8)} USDC.`);
             err.code = 'INSUFFICIENT_PROFIT_BALANCE';
             throw err;
         }
 
-        const profitLog = await tx.adminProfitLog.create({ data: { amountUsdc: amountFloat, source: 'ARBITRAGE_SPREAD', relatedTxId: `liquidation_admin_${adminId}_${Date.now()}` } });
+        const profitLog = await tx.adminProfitLog.create({ data: { amountUsdc: amount, source: 'ARBITRAGE_SPREAD', relatedTxId: `liquidation_admin_${adminId}_${Date.now()}` } });
         if (liquidityAuthorityOn) {
             // Audited, NON-AVAILABLE treasury opening only. The internal USDC
             // move itself creates NO spendable GHS — see the header comment.
-            const amountGhs = parseFloat((amountFloat * treasuryRate).toFixed(2));
+            const amountGhs = amount.times(new Prisma.Decimal(String(treasuryRate)))
+                .toDecimalPlaces(2, Prisma.Decimal.ROUND_HALF_UP);
             await fiatLiquidity.recordReceipt(tx, {
                 provider: 'AZM_TREASURY',
                 rail: 'INTERNAL',
@@ -803,7 +832,7 @@ const liquidateProfits = async (prisma, amountFloat, adminId, auditContext = {})
                 treasury: true,
                 evidence: {
                     kind: 'AUDITED_TREASURY_OPENING',
-                    amountUsdc: amountFloat,
+                    amountUsdc: amount,
                     adminId,
                     adminProfitLogId: profitLog.id,
                     retailRate: treasuryRate,
@@ -815,7 +844,7 @@ const liquidateProfits = async (prisma, amountFloat, adminId, auditContext = {})
         } else {
             await tx.systemFiatPool.update({
                 where: { id: 1 },
-                data: { balance: { increment: amountFloat } }
+                data: { balance: { increment: amount } }
             });
         }
 
@@ -826,8 +855,8 @@ const liquidateProfits = async (prisma, amountFloat, adminId, auditContext = {})
             targetType: 'SYSTEM',
             targetId: null,
             metadata: {
-                amountUsdc: amountFloat,
-                amountLiquidated: amountFloat,
+                amountUsdc: amount,
+                amountLiquidated: amount,
                 relatedTxId: profitLog.relatedTxId
             },
             ipAddress: auditContext.ipAddress || null,
@@ -844,7 +873,7 @@ const liquidateProfits = async (prisma, amountFloat, adminId, auditContext = {})
         // treasury opening only (requires external GHS funding evidence to
         // become AVAILABLE via the treasury confirmation boundary).
         return {
-            amountLiquidated: amountFloat,
+            amountLiquidated: amount,
             newProfitFees: result.updatedProfitFees.balance,
             newFiatPool: result.updatedFiatPool.balance,
             profitLog: result.profitLog,
@@ -853,7 +882,7 @@ const liquidateProfits = async (prisma, amountFloat, adminId, auditContext = {})
             ghsAvailabilityNote: 'Internal USDC liquidation records a non-available treasury opening only; confirming it requires an external GHS funding event (confirmTreasuryOpening).'
         };
     }
-    return { amountLiquidated: amountFloat, newProfitFees: result.updatedProfitFees.balance, newFiatPool: result.updatedFiatPool.balance, profitLog: result.profitLog };
+    return { amountLiquidated: amount, newProfitFees: result.updatedProfitFees.balance, newFiatPool: result.updatedFiatPool.balance, profitLog: result.profitLog };
 };
 
 const processCryptoDeposit = async (prisma, { userId, amountUsdc, txHash, address }) => {

@@ -65,7 +65,8 @@ describeOrSkip('profit liquidation audit atomicity (real PostgreSQL)', () => {
         const state = await balances();
         expect(state.profit).toBeCloseTo(75, 6);
         expect(state.fiat).toBeCloseTo(35, 6);
-        expect(result.amountLiquidated).toBe(25);
+        // r39: the service returns an EXACT Decimal.
+        expect(result.amountLiquidated.toFixed(8)).toBe('25.00000000');
 
         const logs = await prisma.adminProfitLog.findMany({ where: { source: 'ARBITRAGE_SPREAD' } });
         const audits = await prisma.auditLog.findMany({ where: { action: 'LIQUIDATE_PROFITS', actorId: adminId } });
@@ -74,7 +75,7 @@ describeOrSkip('profit liquidation audit atomicity (real PostgreSQL)', () => {
         expect(audits).toHaveLength(1);
         expect(audits[0].actorName).toBe('Liquidation Admin');
         expect(audits[0].targetType).toBe('SYSTEM');
-        expect(audits[0].metadata).toEqual(expect.objectContaining({ amountUsdc: 25, amountLiquidated: 25, relatedTxId: logs[0].relatedTxId }));
+        expect(audits[0].metadata).toEqual(expect.objectContaining({ amountUsdc: 25, amountLiquidated: 25, relatedTxId: logs[0].relatedTxId })); // r39: audit JSON round-trips the number
         expect(audits[0].ipAddress).toBe('127.0.0.1');
     });
 
