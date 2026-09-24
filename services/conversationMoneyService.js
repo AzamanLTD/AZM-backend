@@ -72,6 +72,43 @@ const _exact = (d) => (d instanceof Prisma.Decimal ? d.toFixed(8) : new Prisma.D
 const _roomHash = (uid1, uid2) =>
     crypto.createHash('sha256').update([String(uid1), String(uid2)].sort().join('_')).digest('hex').slice(0, 32);
 
+// r38/P0 — CANONICAL ASSET CONTRACT. The chat-money rail debits
+// User.availableBalance, which is the authoritative ledger's user liability
+// mirror (ledgerService: user:{id}:liability, asset USDC) and is recorded in
+// TransactionHistory.amountUsdc. The rail therefore moves exactly ONE asset:
+// USDC. A free-form currency label can never mislabel it — any other value
+// is rejected fail-closed instead of silently recorded.
+const CHAT_MONEY_ASSET = 'USDC';
+
+// r38/P1 — idempotency identity is client-generated and must be persisted
+// COMPLETE. Normalization is trim-only; an overlong key is rejected, never
+// silently truncated into a DIFFERENT identity (two keys sharing a 200-char
+// prefix must never collapse into one database row).
+const MAX_CLIENT_REQUEST_ID = 199;
+
+function normalizeAsset(currency) {
+    if (currency === undefined || currency === null || String(currency).trim() === '') {
+        return CHAT_MONEY_ASSET;
+    }
+    const c = String(currency).trim();
+    if (c.toUpperCase() === CHAT_MONEY_ASSET) return CHAT_MONEY_ASSET;
+    throw fail(400, 'UNSUPPORTED_CURRENCY',
+        `Chat money moves exactly one asset (${CHAT_MONEY_ASSET}); currency "${c}" is not supported on this rail.`);
+}
+
+function normalizeClientRequestId(raw) {
+    if (typeof raw !== 'string' || !raw.trim()) {
+        throw fail(400, 'IDEMPOTENCY_REQUIRED',
+            'clientRequestId is required for money-bearing messages (durable request identity).');
+    }
+    const key = raw.trim();
+    if (key.length > MAX_CLIENT_REQUEST_ID) {
+        throw fail(400, 'IDEMPOTENCY_KEY_TOO_LONG',
+            `clientRequestId must be at most ${MAX_CLIENT_REQUEST_ID} characters after trim (got ${key.length}).`);
+    }
+    return key;
+}
+
 class ConversationMoneyService {
     constructor({ prisma, io = null, emitBalanceUpdate = null, pushIfOffline = null }) {
         this.prisma = prisma;
@@ -85,14 +122,17 @@ class ConversationMoneyService {
     // POST /:conversationId/messages — money branches.
     // Caller MUST already be a verified participant of conversationId.
     async sendMoney({ user, conv, type, moneyAmount, amount, recipientId, fromUserId, currency, note, itemName, counterpartyId, clientRequestId }) {
+        // r38/P0 — asset validation happens BEFORE any dispatch/replay path:
+        // a mislabeled currency can never reach a ticket, message or ledger row.
+        const asset = normalizeAsset(currency);
         if (type === 'MONEY_SEND') {
-            return this._sendMoney({ user, conv, moneyAmount, recipientId, currency, note, clientRequestId });
+            return this._sendMoney({ user, conv, moneyAmount, recipientId, asset, note, clientRequestId });
         }
         if (type === 'MONEY_REQUEST') {
-            return this._createMoneyRequest({ user, conv, moneyAmount, fromUserId, currency, note, clientRequestId });
+            return this._createMoneyRequest({ user, conv, moneyAmount, fromUserId, asset, note, clientRequestId });
         }
         if (type === 'ESCROW_TICKET') {
-            return this._createEscrowTicket({ user, conv, amount, currency, note, itemName, counterpartyId, clientRequestId });
+            return this._createEscrowTicket({ user, conv, amount, asset, note, itemName, counterpartyId, clientRequestId });
         }
         throw fail(400, 'UNKNOWN_TYPE', `Unknown message type: ${type}`);
     }
@@ -127,7 +167,7 @@ class ConversationMoneyService {
     // Generic peer transfer. The recipient is explicit (may be any user); the
     // conversation is where the transfer message lands, not the authority for
     // the recipient.
-    async _sendMoney({ user, conv, moneyAmount, recipientId, currency, note, clientRequestId }) {
+    async _sendMoney({ user, conv, moneyAmount, recipientId, asset, note, clientRequestId }) {
         const userId = user.id;
         const amt = parsePositiveAmount(moneyAmount, 'moneyAmount');
         const receiverId = Number.parseInt(recipientId, 10);
@@ -140,7 +180,7 @@ class ConversationMoneyService {
             throw fail(400, 'IDEMPOTENCY_REQUIRED',
                 'clientRequestId is required for money sends (durable request identity).');
         }
-        const requestId = clientRequestId.trim().slice(0, 200);
+        const requestId = normalizeClientRequestId(clientRequestId);
 
         // Idempotency: same key returns the original outcome; a conflicting
         // replay (different amount/recipient/conversation/sender) fails closed.
@@ -152,7 +192,7 @@ class ConversationMoneyService {
                 || existing.conversationId !== conv.id
                 || existing.requesterId !== userId
                 || existing.counterpartyId !== receiverId
-                || existing.currency !== (currency || 'GHS')
+                || existing.currency !== asset
                 || new Prisma.Decimal(existing.amount).toFixed(8) !== amt.toFixed(8)) {
                 throw fail(409, 'IDEMPOTENCY_CONFLICT',
                     'This clientRequestId was already used with different transfer parameters.');
@@ -167,14 +207,24 @@ class ConversationMoneyService {
         const result = await this.prisma.$transaction(async (tx) => {
             const sender = await tx.user.findUnique({ where: { id: userId } });
             if (!sender) throw fail(400, 'SENDER_NOT_FOUND', 'Sender not found.');
-            if (new Prisma.Decimal(sender.availableBalance).lt(amt)) {
-                throw fail(400, 'INSUFFICIENT_BALANCE',
-                    `Insufficient balance. Required: ${amt.toFixed(8)}, available: ${Number(sender.availableBalance).toFixed(6)}.`);
-            }
             const receiver = await tx.user.findUnique({ where: { id: receiverId } });
             if (!receiver) throw fail(400, 'RECEIVER_NOT_FOUND', 'Receiver not found.');
 
-            await tx.user.update({ where: { id: userId }, data: { availableBalance: { decrement: amt } } });
+            // r38/P1 — ATOMIC BALANCE CLAIM (the same claim-before-money
+            // standard as escrowService): the conditional decrement IS the
+            // authority; the DB nonneg CHECK is a secondary invariant, never
+            // the guard. The concurrency loser gets a deterministic
+            // INSUFFICIENT_BALANCE (not a CHECK violation) and the whole tx
+            // rolls back — zero residual side effects.
+            const balanceClaim = await tx.user.updateMany({
+                where: { id: userId, availableBalance: { gte: amt } },
+                data: { availableBalance: { decrement: amt } },
+            });
+            if (balanceClaim.count !== 1) {
+                throw fail(400, 'INSUFFICIENT_BALANCE', this._insufficientMsg(userId, await tx.user.findUnique({
+                    where: { id: userId }, select: { availableBalance: true },
+                }), amt));
+            }
             await tx.user.update({ where: { id: receiverId }, data: { availableBalance: { increment: amt } } });
 
             await tx.contact.upsert({
@@ -187,8 +237,8 @@ class ConversationMoneyService {
             });
 
             const content = note
-                ? `💸 Sent ${amt.toFixed(2)} ${currency || 'GHS'} — "${note}"`
-                : `💸 Sent ${amt.toFixed(2)} ${currency || 'GHS'}`;
+                ? `💸 Sent ${amt.toFixed(2)} ${asset} — "${note}"`
+                : `💸 Sent ${amt.toFixed(2)} ${asset}`;
             const message = await tx.message.create({
                 data: {
                     conversationId: conv.id,
@@ -208,7 +258,7 @@ class ConversationMoneyService {
                         conversationId: conv.id,
                         kind: 'MONEY_SEND',
                         amount: amt,
-                        currency: (currency || 'GHS').slice(0, 10),
+                        currency: asset,
                         requesterId: userId,
                         counterpartyId: receiverId,
                         status: 'ACCEPTED',
@@ -265,7 +315,7 @@ class ConversationMoneyService {
         return { message: result.message, replay: false, ticket: result.ticket };
     }
 
-    async _createMoneyRequest({ user, conv, moneyAmount, fromUserId, currency, note, clientRequestId }) {
+    async _createMoneyRequest({ user, conv, moneyAmount, fromUserId, asset, note, clientRequestId }) {
         const userId = user.id;
         const other = this._requireTwoParty(conv, userId, 'Money requests');
         const amt = parsePositiveAmount(moneyAmount, 'moneyAmount');
@@ -280,9 +330,9 @@ class ConversationMoneyService {
         }
 
         const result = await this._createTicketedMessage({
-            conv, userId, kind: 'MONEY_REQUEST', amt, currency, clientRequestId, counterparty: other,
+            conv, userId, kind: 'MONEY_REQUEST', amt, asset, clientRequestId, counterparty: other,
             messageType: 'MONEY_REQUEST',
-            content: `🤑 Requested ${amt.toFixed(2)} ${currency || 'GHS'}${note ? ` — "${note}"` : ''}`,
+            content: `🤑 Requested ${amt.toFixed(2)} ${asset}${note ? ` — "${note}"` : ''}`,
         });
 
         if (this.io) {
@@ -295,7 +345,7 @@ class ConversationMoneyService {
         return result;
     }
 
-    async _createEscrowTicket({ user, conv, amount, currency, note, itemName, counterpartyId, clientRequestId }) {
+    async _createEscrowTicket({ user, conv, amount, asset, note, itemName, counterpartyId, clientRequestId }) {
         const userId = user.id;
         const other = this._requireTwoParty(conv, userId, 'Escrow tickets');
         const amt = parsePositiveAmount(amount, 'amount');
@@ -311,13 +361,13 @@ class ConversationMoneyService {
         }
 
         return this._createTicketedMessage({
-            conv, userId, kind: 'ESCROW_TICKET', amt, currency, clientRequestId, counterparty: other,
+            conv, userId, kind: 'ESCROW_TICKET', amt, asset, clientRequestId, counterparty: other,
             messageType: 'ESCROW_TICKET',
-            content: `🛡️ Escrow: ${itemName.trim().slice(0, 120)} — ${amt.toFixed(2)} ${currency || 'GHS'}${note ? ` — "${note}"` : ''}`,
+            content: `🛡️ Escrow: ${itemName.trim().slice(0, 120)} — ${amt.toFixed(2)} ${asset}${note ? ` — "${note}"` : ''}`,
         });
     }
 
-    async _createTicketedMessage({ conv, userId, kind, amt, currency, clientRequestId, counterparty, messageType, content }) {
+    async _createTicketedMessage({ conv, userId, kind, amt, asset, clientRequestId, counterparty, messageType, content }) {
         // r37/P1 — the idempotency key is MANDATORY for every money-bearing
         // creation (requests and escrow tickets join money sends). A creation
         // without a durable request identity has no replay contract.
@@ -326,7 +376,7 @@ class ConversationMoneyService {
             throw fail(400, 'IDEMPOTENCY_REQUIRED',
                 'clientRequestId is required for money-bearing messages (durable request identity).');
         }
-        const requestId = clientRequestId.trim().slice(0, 200);
+        const requestId = normalizeClientRequestId(clientRequestId);
         const existing = await this.prisma.conversationMoneyTicket.findUnique({
             where: { clientRequestId: requestId },
         });
@@ -339,7 +389,7 @@ class ConversationMoneyService {
                 || existing.conversationId !== conv.id
                 || existing.requesterId !== userId
                 || existing.counterpartyId !== counterparty.id
-                || existing.currency !== (currency || 'GHS')
+                || existing.currency !== asset
                 || new Prisma.Decimal(existing.amount).toFixed(8) !== amt.toFixed(8)) {
                 throw fail(409, 'IDEMPOTENCY_CONFLICT',
                     'This clientRequestId was already used with different parameters.');
@@ -370,7 +420,7 @@ class ConversationMoneyService {
                         conversationId: conv.id,
                         kind,
                         amount: amt,
-                        currency: (currency || 'GHS').slice(0, 10),
+                        currency: asset,
                         requesterId: userId,
                         counterpartyId: counterparty.id,
                         status: 'sent',
@@ -446,11 +496,16 @@ class ConversationMoneyService {
             const amount = new Prisma.Decimal(ticket.amount);
             const payer = await tx.user.findUnique({ where: { id: userId } });
             if (!payer) throw fail(400, 'PAYER_NOT_FOUND', 'Payer not found.');
-            if (new Prisma.Decimal(payer.availableBalance).lt(amount)) {
-                throw fail(400, 'INSUFFICIENT_BALANCE',
-                    `Insufficient balance. Required: ${amount.toFixed(8)}, available: ${Number(payer.availableBalance).toFixed(6)}.`);
+            // r38/P1 — atomic balance claim (see _sendMoney).
+            const balanceClaim = await tx.user.updateMany({
+                where: { id: userId, availableBalance: { gte: amount } },
+                data: { availableBalance: { decrement: amount } },
+            });
+            if (balanceClaim.count !== 1) {
+                throw fail(400, 'INSUFFICIENT_BALANCE', this._insufficientMsg(userId, await tx.user.findUnique({
+                    where: { id: userId }, select: { availableBalance: true },
+                }), amount));
             }
-            await tx.user.update({ where: { id: userId }, data: { availableBalance: { decrement: amount } } });
             await tx.user.update({ where: { id: ticket.requesterId }, data: { availableBalance: { increment: amount } } });
 
             await ledger.post(tx, {
@@ -594,11 +649,16 @@ class ConversationMoneyService {
             const amount = new Prisma.Decimal(ticket.amount);
             const funder = await tx.user.findUnique({ where: { id: userId } });
             if (!funder) throw fail(400, 'FUNDER_NOT_FOUND', 'Funder not found.');
-            if (new Prisma.Decimal(funder.availableBalance).lt(amount)) {
-                throw fail(400, 'INSUFFICIENT_BALANCE',
-                    `Insufficient balance. Required: ${amount.toFixed(8)}, available: ${Number(funder.availableBalance).toFixed(6)}.`);
+            // r38/P1 — atomic balance claim (see _sendMoney).
+            const balanceClaim = await tx.user.updateMany({
+                where: { id: userId, availableBalance: { gte: amount } },
+                data: { availableBalance: { decrement: amount } },
+            });
+            if (balanceClaim.count !== 1) {
+                throw fail(400, 'INSUFFICIENT_BALANCE', this._insufficientMsg(userId, await tx.user.findUnique({
+                    where: { id: userId }, select: { availableBalance: true },
+                }), amount));
             }
-            await tx.user.update({ where: { id: userId }, data: { availableBalance: { decrement: amount } } });
 
             await tx.transactionHistory.create({
                 data: { userId, type: 'ESCROW_FUNDING', amountUsdc: amount.neg(), feeUsdc: 0, status: 'PENDING' },
@@ -795,6 +855,12 @@ class ConversationMoneyService {
 
     // ── Formatting (legacy envelope, now backed by real structured data) ──────
 
+    // r38/P1 — exact-decimal insufficient-balance message (no Number() rounding).
+    _insufficientMsg(userId, fresh, required) {
+        const available = fresh ? new Prisma.Decimal(fresh.availableBalance).toFixed(8) : '0.00000000';
+        return `Insufficient balance. Required: ${required.toFixed(8)}, available: ${available}.`;
+    }
+
     _formatMessage(msg, ticket) {
         return {
             id: msg.id,
@@ -805,11 +871,17 @@ class ConversationMoneyService {
             type: msg.messageType,
             status: ticket?.status || msg.status || 'sent',
             createdAt: msg.createdAt,
-            moneyAmount: ticket ? new Prisma.Decimal(ticket.amount).toFixed(2) : null,
+            moneyAmount: ticket ? new Prisma.Decimal(ticket.amount).toFixed(2) : null, // display string (legacy envelope)
+            moneyAmountExact: ticket ? new Prisma.Decimal(ticket.amount).toFixed(8) : null, // r38/P1 — machine value, exact Decimal(20,8)
             moneyDirection: null,
             moneyStatus: ticket ? ticket.status : null,
             escrowTicket: ticket && ticket.kind === 'ESCROW_TICKET'
-                ? { amount: new Prisma.Decimal(ticket.amount).toFixed(2), currency: ticket.currency, status: ticket.status }
+                ? {
+                    amount: new Prisma.Decimal(ticket.amount).toFixed(2), // display
+                    amountExact: new Prisma.Decimal(ticket.amount).toFixed(8), // r38/P1 — machine value
+                    currency: ticket.currency,
+                    status: ticket.status,
+                }
                 : null,
         };
     }

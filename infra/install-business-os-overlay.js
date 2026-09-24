@@ -490,7 +490,13 @@ async function main() {
 
   logger.info(`[business-os-overlay] Done: ${ok} applied, ${skipped} skipped, ${errors.length} errors.`);
   if (errors.length) {
-    logger.error('[business-os-overlay] ⚠ Errors occurred — review above.');
+    // r38/P0 — a production financial schema installer must FAIL the release
+    // when unexpected DDL fails. Swallowing the error lets `npm run release`
+    // exit successfully with a missing invariant (exactly how the r37
+    // reversal uniqueness could have been silently skipped in production).
+    const e = new Error(`[business-os-overlay] ${errors.length} DDL statement(s) failed — deployment is NOT healthy.`);
+    e.details = errors;
+    throw e;
   }
 }
 
@@ -559,8 +565,15 @@ STATEMENTS.push('ALTER TABLE "BusinessProfile" ADD COLUMN IF NOT EXISTS "allowOv
 
 main()
   .catch((e) => {
-    logger.error('[business-os-overlay] Fatal:', e);
-    // Never crash the server — this is a best-effort installer.
+    logger.error('[business-os-overlay] Fatal:', e.message || e);
+    if (Array.isArray(e.details)) {
+      for (const d of e.details) logger.error(`  failed: ${d.stmt}… -> ${String(d.error).slice(0, 160)}`);
+    }
+    // r38/P0 — non-zero exit so `npm run release` (a `&&` chain) and CI
+    // both abort instead of shipping a schema that is not what the code
+    // expects. Boot-time invocation (src/boot/treasury.js) already catches
+    // the failure and logs it without blocking app boot.
+    process.exitCode = 1;
   })
   .finally(async () => {
     await prisma.$disconnect();
@@ -788,13 +801,17 @@ STATEMENTS.push('CREATE INDEX IF NOT EXISTS "BusinessLedgerEntry_businessProfile
 STATEMENTS.push('CREATE INDEX IF NOT EXISTS "BusinessLedgerEntry_businessProfileId_createdAt_idx" ON "BusinessLedgerEntry"("businessProfileId", "createdAt" DESC);');
 STATEMENTS.push('CREATE INDEX IF NOT EXISTS "BusinessLedgerEntry_businessProfileId_type_createdAt_idx" ON "BusinessLedgerEntry"("businessProfileId", "type", "createdAt" DESC);');
 STATEMENTS.push('CREATE INDEX IF NOT EXISTS "BusinessLedgerEntry_sourceType_sourceId_idx" ON "BusinessLedgerEntry"("sourceType", "sourceId");');
+// r38/P0 — ORDERING FIX: the column is added BEFORE the unique index that
+// depends on it. On a database holding a PRE-r37 BusinessLedgerEntry table
+// (e.g. from an earlier overlay run whose index creation was swallowed),
+// creating the index first fails, the failure was previously swallowed, and
+// production could run WITHOUT the DB uniqueness invariant the r37 code
+// relies on. ADD COLUMN IF NOT EXISTS is a clean no-op when the column is
+// already present (fresh installs).
+STATEMENTS.push('ALTER TABLE "BusinessLedgerEntry" ADD COLUMN IF NOT EXISTS "reversalOfId" TEXT;');
 // r37/P1: durable one-reversal-per-entry invariant (nullable unique —
 // Postgres allows multiple NULLs, so only real reversals are constrained).
-STATEMENTS.push('CREATE UNIQUE INDEX IF NOT EXISTS "BusinessLedgerEntry_reversalOfId_key" ON "BusinessLedgerEntry"("reversalOfId");');
-// The column predates nothing in production (the whole table is new), but
-// ADD COLUMN IF NOT EXISTS keeps the installer rerunnable against a
-// database where a partial backfill may already have run.
-STATEMENTS.push('ALTER TABLE "BusinessLedgerEntry" ADD COLUMN IF NOT EXISTS "reversalOfId" TEXT;');
+STATEMENTS.push('CREATE UNIQUE INDEX IF NOT EXISTS "BusinessLedgerEntry_reversalOfId_key" ON "BusinessLedgerEntry"("reversalOfId")');
 
 STATEMENTS.push(`DO $$ BEGIN
     IF NOT EXISTS (SELECT 1 FROM information_schema.table_constraints WHERE constraint_name = 'BusinessLedgerEntry_businessProfileId_fkey') THEN

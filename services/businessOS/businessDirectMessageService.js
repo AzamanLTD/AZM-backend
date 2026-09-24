@@ -227,12 +227,33 @@ class BusinessDirectMessageService {
             );
             if (!locked || locked.length === 0) throw fail(404, 'BUSINESS_NOT_FOUND', 'Business not found.');
 
+            // r38/P1 — CANONICAL-FIRST THREAD ROUTING. The old lookup
+            // matched the target in EITHER participant slot of ANY channel:
+            // a customer who happens to sit in participantA of an unrelated
+            // legacy/business conversation made staff sends attach to that
+            // wrong thread. The canonical CUSTOMER_SUPPORT thread (durable
+            // customer slot = participantB) is located FIRST; the legacy
+            // fallback only applies under the explicit legacy semantic that
+            // the target occupies the CUSTOMER slot (participantB). A
+            // participantA match is NEVER treated as the customer.
             let existing = await tx.businessConversation.findFirst({
                 where: {
                     businessProfileId: bizId,
-                    OR: [{ participantAId: targetUserId }, { participantBId: targetUserId }],
+                    channel: 'CUSTOMER_SUPPORT',
+                    participantBId: targetUserId,
                 },
+                orderBy: { createdAt: 'asc' },
             });
+            if (!existing) {
+                existing = await tx.businessConversation.findFirst({
+                    where: {
+                        businessProfileId: bizId,
+                        channel: null,
+                        participantBId: targetUserId,
+                    },
+                    orderBy: { createdAt: 'asc' },
+                });
+            }
             if (!existing) {
                 const customer = await tx.user.findUnique({ where: { id: targetUserId }, select: { id: true } });
                 if (!customer) throw fail(404, 'USER_NOT_FOUND', 'Recipient not found.');

@@ -63,11 +63,17 @@ function _formatMessage(msg, ticket) {
         type: msg.messageType,
         status: ticket?.status || msg.status || 'sent',
         createdAt: msg.createdAt,
-        moneyAmount: ticket ? new Prisma.Decimal(ticket.amount).toFixed(2) : null,
+        moneyAmount: ticket ? new Prisma.Decimal(ticket.amount).toFixed(2) : null, // display string (legacy envelope)
+        moneyAmountExact: ticket ? new Prisma.Decimal(ticket.amount).toFixed(8) : null, // r38/P1 — exact machine value
         moneyDirection: null,
         moneyStatus: ticket ? ticket.status : null,
         escrowTicket: ticket && ticket.kind === 'ESCROW_TICKET'
-            ? { amount: new Prisma.Decimal(ticket.amount).toFixed(2), currency: ticket.currency, status: ticket.status }
+            ? {
+                amount: new Prisma.Decimal(ticket.amount).toFixed(2), // display
+                amountExact: new Prisma.Decimal(ticket.amount).toFixed(8), // r38/P1 — exact machine value
+                currency: ticket.currency,
+                status: ticket.status,
+            }
             : null,
     };
 }

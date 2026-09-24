@@ -116,20 +116,28 @@ class DineInCashCloseService {
     }
 
     // Rebuild the exact durable response for a committed close.
+    // r38/P1 — EXACT REPLAY: the replay must reproduce the committed
+    // economic result bit-for-bit, including 7th/8th decimals. Change is
+    // recomputed on Prisma.Decimal (the stored Decimal(20,8) authority) and
+    // serialized EXACTLY like the original response (Number of the 8dp
+    // fixed string), so a committed change of 0.00000001 replays as
+    // 0.00000001 — never rounded to 0 through 6dp JS math.
     _replayResult(tab) {
-        const subtotal = Number(tab.subtotalUsdc || 0);
-        const taxTotal = Number(tab.taxTotalUsdc || 0);
-        const tip = Number(tab.tipUsdc || 0);
-        const grandTotal = Number(tab.grandTotalUsdc || 0);
-        const cash = tab.cashReceived == null ? null : Number(tab.cashReceived);
+        const dec = (v) => (v == null ? new Prisma.Decimal(0) : new Prisma.Decimal(v));
+        const subtotalDec = dec(tab.subtotalUsdc);
+        const taxTotalDec = dec(tab.taxTotalUsdc);
+        const tipDec = dec(tab.tipUsdc);
+        const grandTotalDec = dec(tab.grandTotalUsdc);
+        const cashDec = tab.cashReceived == null ? null : dec(tab.cashReceived);
+        const changeDec = cashDec == null ? new Prisma.Decimal(0) : cashDec.minus(grandTotalDec);
         return {
             tab,
             duplicate: true,
-            subtotal,
-            taxTotal,
-            tip,
-            grandTotal,
-            change: cash == null ? 0 : Math.round((cash - grandTotal) * 1e6) / 1e6,
+            subtotal: Number(subtotalDec.toFixed(8)),
+            taxTotal: Number(taxTotalDec.toFixed(8)),
+            tip: Number(tipDec.toFixed(8)),
+            grandTotal: Number(grandTotalDec.toFixed(8)),
+            change: Number(changeDec.toFixed(8)),
         };
     }
 

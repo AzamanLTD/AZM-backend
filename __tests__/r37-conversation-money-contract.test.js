@@ -97,7 +97,6 @@ run('r37/P1 — conversation money contract', () => {
 
     test.each([
         ['different amount', { type: 'MONEY_REQUEST', moneyAmount: '31', clientRequestId: 'req-key-2' }],
-        ['different currency', { type: 'MONEY_REQUEST', moneyAmount: '30', currency: 'USD', clientRequestId: 'req-key-2' }],
     ])('same key, %s → 409, zero mutation', async (_label, secondBody) => {
         await send(A, convAB, { type: 'MONEY_REQUEST', moneyAmount: '30', clientRequestId: 'req-key-2' });
         const before = await counts();
@@ -105,6 +104,18 @@ run('r37/P1 — conversation money contract', () => {
             .rejects.toMatchObject({ status: 409, code: 'IDEMPOTENCY_CONFLICT' });
         expect(await counts()).toEqual(before);
         expect(await db.message.count()).toBe(1);
+    });
+
+    // r38/P0 — the rail moves exactly ONE asset (USDC, the wallet's canonical
+    // asset). A replay carrying a foreign currency label is rejected at
+    // validation (400 UNSUPPORTED_CURRENCY) — it can neither replay the
+    // original economics nor mislabel a USDC balance. Zero mutation.
+    test('replay with unsupported currency → 400 UNSUPPORTED_CURRENCY, zero mutation', async () => {
+        await send(A, convAB, { type: 'MONEY_REQUEST', moneyAmount: '30', clientRequestId: 'req-key-cur' });
+        const before = await counts();
+        await expect(send(A, convAB, { type: 'MONEY_REQUEST', moneyAmount: '30', currency: 'USD', clientRequestId: 'req-key-cur' }))
+            .rejects.toMatchObject({ status: 400, code: 'UNSUPPORTED_CURRENCY' });
+        expect(await counts()).toEqual(before);
     });
 
     test('same key, different conversation → 409', async () => {

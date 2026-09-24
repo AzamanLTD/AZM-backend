@@ -603,7 +603,9 @@ run('r36/P0 — conversation money state machine', () => {
 
             const esc = msgs.find((m) => m.type === 'ESCROW_TICKET');
             expect(esc.moneyAmount).toBe('40.00');
-            expect(esc.escrowTicket).toMatchObject({ status: 'sent', currency: 'GHS' });
+            // r38/P0 — the chat-money rail's canonical asset is USDC (the wallet
+            // it debits is the ledger's user-liability mirror, asset USDC).
+            expect(esc.escrowTicket).toMatchObject({ status: 'sent', currency: 'USDC' });
 
             const text = msgs.find((m) => m.type === 'TEXT');
             expect(text.moneyAmount).toBeNull();

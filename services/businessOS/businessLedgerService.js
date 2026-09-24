@@ -42,14 +42,39 @@ class BusinessLedgerService {
 
     // Canonical signed amount for a type. The magnitude comes from the
     // caller; the SIGN comes from the type (r35 contract).
+    //
+    // r38/P1 — EXACT MONEY: BusinessLedgerEntry.amount is Decimal(20,8); the
+    // old Number()/Math.round(x*1e6) path silently quantized to 6dp and lost
+    // binary-exactness vs the stored decimal. Parsing now goes through the
+    // SAME exact-decimal authority as the canonical platform ledger: Decimal
+    // end-to-end, <= 8 decimal places, finite, nonzero, magnitude-capped.
     _canonicalAmount(type, amount) {
-        const n = typeof amount === 'number' ? amount : Number(amount);
-        if (!Number.isFinite(n)) throw this._fail(400, 'INVALID_AMOUNT', 'Ledger amount must be a finite number.');
-        const magnitude = Math.abs(n);
-        if (magnitude === 0) throw this._fail(400, 'INVALID_AMOUNT', 'Ledger amount cannot be zero.');
-        if (magnitude > MAX_ABS_AMOUNT) throw this._fail(400, 'INVALID_AMOUNT', 'Ledger amount is unreasonably large.');
-        const signed = INCOME_TYPES.has(type) ? magnitude : -magnitude;
-        return Math.round(signed * 1e6) / 1e6;
+        let dec;
+        try {
+            if (typeof amount === 'string') {
+                // r38/P1 — SAME exactness authority as the canonical ledger:
+                // exponent-notation strings are REJECTED, never reinterpreted
+                // (Decimal('1e-8') would parse fine — the canonical ledger
+                // rejects the string form, so the manual ledger does too).
+                if (/e/i.test(amount.trim())) {
+                    throw new Error('exponent notation is not an exact decimal string');
+                }
+                dec = new Prisma.Decimal(amount.trim());
+            } else {
+                dec = amount instanceof Prisma.Decimal ? amount : new Prisma.Decimal(String(amount));
+            }
+        } catch (e) {
+            throw this._fail(400, 'INVALID_AMOUNT', 'Ledger amount must be a finite exact decimal.');
+        }
+        if (!dec.isFinite()) throw this._fail(400, 'INVALID_AMOUNT', 'Ledger amount must be a finite number.');
+        if (dec.decimalPlaces() > 8) throw this._fail(400, 'INVALID_AMOUNT', 'Ledger amount supports at most 8 decimal places.');
+        const magnitude = dec.abs();
+        if (magnitude.isZero()) throw this._fail(400, 'INVALID_AMOUNT', 'Ledger amount cannot be zero.');
+        if (magnitude.gt(new Prisma.Decimal(String(MAX_ABS_AMOUNT)))) {
+            throw this._fail(400, 'INVALID_AMOUNT', 'Ledger amount is unreasonably large.');
+        }
+        const signed = INCOME_TYPES.has(type) ? magnitude : magnitude.negated();
+        return signed; // Prisma.Decimal — exact, no JS-number round-trip
     }
 
     // r37/P1 — CANONICAL AGGREGATION FORMULA (signed semantics preserved).
@@ -249,27 +274,44 @@ class BusinessLedgerService {
         }
 
         const entries = await this.prisma.businessLedgerEntry.findMany({ where, orderBy: { createdAt: 'asc' } });
-        let runningBalance = 0;
+        // r38/P1 — EXACT ARITHMETIC: accumulation runs on Prisma.Decimal
+        // (matching the stored Decimal(20,8) precision) so 0.1 + 0.2
+        // reports exactly 0.3 and reversal pairs net to exactly zero —
+        // no binary floating-point artifacts in the reporting layer.
+        // Serialization is deliberate: each exact decimal is emitted via
+        // _num() (8dp string -> number), keeping the legacy JSON envelope
+        // while the underlying computation is exact.
+        let runningBalance = new Prisma.Decimal(0);
         const dailyFlow = {};
         const flow = entries.map(e => {
-            const amount = parseFloat(e.amount);
-            runningBalance += amount;
+            const amount = new Prisma.Decimal(e.amount);
+            runningBalance = runningBalance.plus(amount);
             const dateKey = new Date(e.createdAt).toISOString().split('T')[0];
-            if (!dailyFlow[dateKey]) dailyFlow[dateKey] = { date: dateKey, inflow: 0, outflow: 0, net: 0 };
-            if (amount > 0) dailyFlow[dateKey].inflow += amount;
-            else dailyFlow[dateKey].outflow += Math.abs(amount);
-            dailyFlow[dateKey].net += amount;
-            return { id: e.id, date: e.createdAt, type: e.type, category: e.category, description: e.description, amount, runningBalance };
+            if (!dailyFlow[dateKey]) {
+                dailyFlow[dateKey] = { date: dateKey, inflow: new Prisma.Decimal(0), outflow: new Prisma.Decimal(0), net: new Prisma.Decimal(0) };
+            }
+            if (amount.isPositive()) dailyFlow[dateKey].inflow = dailyFlow[dateKey].inflow.plus(amount);
+            else dailyFlow[dateKey].outflow = dailyFlow[dateKey].outflow.plus(amount.abs());
+            dailyFlow[dateKey].net = dailyFlow[dateKey].net.plus(amount);
+            return {
+                id: e.id, date: e.createdAt, type: e.type, category: e.category, description: e.description,
+                amount: this._num(amount), runningBalance: this._num(runningBalance),
+            };
         });
+
+        const totalInflow = this._sumSigned(entries.filter(e => new Prisma.Decimal(e.amount).isPositive()));
+        const totalOutflow = this._sumSigned(entries.filter(e => new Prisma.Decimal(e.amount).isNegative())).abs();
 
         return {
             entries: flow,
-            dailyFlow: Object.values(dailyFlow),
-            totalInflow: entries.filter(e => parseFloat(e.amount) > 0).reduce((s, e) => s + parseFloat(e.amount), 0),
-            totalOutflow: entries.filter(e => parseFloat(e.amount) < 0).reduce((s, e) => s + Math.abs(parseFloat(e.amount)), 0),
-            netFlow: runningBalance,
+            dailyFlow: Object.values(dailyFlow).map(d => ({
+                date: d.date, inflow: this._num(d.inflow), outflow: this._num(d.outflow), net: this._num(d.net),
+            })),
+            totalInflow: this._num(totalInflow),
+            totalOutflow: this._num(totalOutflow),
+            netFlow: this._num(runningBalance),
             startingBalance: 0,
-            endingBalance: runningBalance,
+            endingBalance: this._num(runningBalance),
         };
     }
 
