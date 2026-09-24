@@ -77,7 +77,7 @@ run('E2EE server-blind authority (real PostgreSQL)', () => {
         app.locals.convId = conv.id;
     });
 
-    const register = async (userId, keys, { otpkCount = 5, spkId = 1, forged = false, otpkOffset = 0 } = {}) => {
+    const register = async (userId, keys, { otpkCount = 5, spkId = 1, forged = false, otpkOffset = 0, materialOffset = null } = {}) => {
         const sodium = await protocol.init();
         const signingPublicKey = b64(keys.signing.publicKey);
         const identityPublicKey = b64(keys.identity.publicKey);
@@ -92,11 +92,14 @@ run('E2EE server-blind authority (real PostgreSQL)', () => {
         ]);
         const otpkKeys = [];
         const otpkPrivateBy = {}; // test-only: the device's local secret
-        // otpkOffset makes each payload's one-time prekey material UNIQUE
-        // (P1-D: a keyId is immutable — reusing ids+material across devices
-        // would make the second registration idempotent-skip, not insert).
+        // otpkOffset shifts the keyId RANGE; materialOffset (default: same
+        // as otpkOffset) shifts the key MATERIAL. Decoupled in r40.2: keyIds
+        // are DEVICE-scoped, so a second device can legitimately reuse the
+        // SAME keyId range with its OWN material — the tests below prove
+        // exactly that rotation contract.
+        const mat = materialOffset === null ? otpkOffset : materialOffset;
         for (let i = 0; i < otpkCount; i++) {
-            const kp = sodium.crypto_box_seed_keypair(sodium.randombytes_buf_deterministic(32, Buffer.alloc(32, 200 + otpkOffset + i)));
+            const kp = sodium.crypto_box_seed_keypair(sodium.randombytes_buf_deterministic(32, Buffer.alloc(32, 200 + mat + i)));
             otpkKeys.push({ keyId: 1000 + otpkOffset + i, publicKey: b64(kp.publicKey) });
             otpkPrivateBy[1000 + otpkOffset + i] = b64(kp.privateKey);
         }
@@ -184,7 +187,7 @@ run('E2EE server-blind authority (real PostgreSQL)', () => {
         await expect(svc.replenishOneTimePreKeys({ userId: alice.id, oneTimePreKeys: [{ keyId: 50, publicKey: b64(Buffer.alloc(32, 99)) }] }))
             .rejects.toMatchObject({ code: 'E2EE_PREKEY_CONFLICT' });
         // the original material is INTACT after the refused replacement
-        const row = await db.e2eeOneTimePreKey.findUnique({ where: { userId_keyId: { userId: alice.id, keyId: 50 } } });
+        const row = await db.e2eeOneTimePreKey.findUnique({ where: { userId_deviceId_keyId: { userId: alice.id, deviceId: devPayload.deviceId, keyId: 50 } } });
         expect(row.publicKey).toBe(b64(Buffer.alloc(32, 50)));
     });
 
@@ -349,14 +352,21 @@ run('E2EE server-blind authority (real PostgreSQL)', () => {
     test('P0-C. one active device per user: a second registration retires the first and rebinds prekeys', async () => {
         const svc = new E2EEKeyService(db);
         aliceKeys = await deviceKeys(21);
-        const payloadA = await register(alice.id, aliceKeys, { otpkCount: 3, otpkOffset: 0 });
+        // r40.2: Device B deliberately reuses the SAME keyId range (1000..1002)
+        // as Device A — with its OWN material. KeyIds are device-scoped, so
+        // this must be accepted, not a conflict.
+        const payloadA = await register(alice.id, aliceKeys, { otpkCount: 3, otpkOffset: 0, materialOffset: 0 });
         payloadA.deviceId = 'device-rotation-aaa';
         await svc.registerDevice({ userId: alice.id, ...payloadA });
 
         const bob2 = await deviceKeys(22);
-        const payloadB = await register(alice.id, bob2, { otpkCount: 3, otpkOffset: 100 });
+        const payloadB = await register(alice.id, bob2, { otpkCount: 3, otpkOffset: 0, materialOffset: 300 });
         payloadB.deviceId = 'device-rotation-bbb';
         await svc.registerDevice({ userId: alice.id, ...payloadB });
+        // Device B's keyIds COEXIST with retired Device A's keyIds
+        const bRows = await db.e2eeOneTimePreKey.findMany({
+            where: { userId: alice.id, deviceId: 'device-rotation-bbb', isUsed: false } });
+        expect(bRows.map((r) => r.keyId).sort()).toEqual([1000, 1001, 1002]);
 
         // invariant: exactly ONE active device
         const active = await db.e2eeDevice.findMany({ where: { userId: alice.id, isActive: true } });
@@ -372,17 +382,91 @@ run('E2EE server-blind authority (real PostgreSQL)', () => {
         const bundle = await svc.fetchBundle(alice.id);
         expect(bundle.deviceId).toBe('device-rotation-bbb');
         const otpRow = await db.e2eeOneTimePreKey.findFirst({
-            where: { userId: alice.id, keyId: bundle.oneTimePreKey.keyId } });
+            where: { userId: alice.id, deviceId: bundle.deviceId, keyId: bundle.oneTimePreKey.keyId } });
         expect(otpRow.deviceId).toBe('device-rotation-bbb');
+    });
+
+    test('r40.2. OTP keyIds are DEVICE-scoped: rotation reuses keyIds across devices with own material', async () => {
+        const svc = new E2EEKeyService(db);
+        const keysA = await deviceKeys(31);
+        // Device A registers with keyId 1000 (its own material)
+        const payloadA = await register(alice.id, keysA, { otpkCount: 1, otpkOffset: 0, materialOffset: 600 });
+        payloadA.deviceId = 'device-scope-aaa';
+        await svc.registerDevice({ userId: alice.id, ...payloadA });
+
+        // (1) Device A keyId=1000 accepted; re-registering the same device with
+        // the SAME material stays idempotent (no conflict, no duplicate row)
+        await svc.registerDevice({ userId: alice.id, ...payloadA });
+        expect(await db.e2eeOneTimePreKey.count({ where: { userId: alice.id, deviceId: 'device-scope-aaa', keyId: 1000 } })).toBe(1);
+
+        // (2) replenishing keyId=1000 with the same material: idempotent
+        const same = await svc.replenishOneTimePreKeys({ userId: alice.id, oneTimePreKeys: [payloadA.oneTimePreKeys[0]] });
+        expect(same.inserted).toBe(0);
+
+        // (3) replenishing keyId=1000 with DIFFERENT material on the SAME
+        // device: typed conflict (stable IDs never swap material)
+        await expect(svc.replenishOneTimePreKeys({ userId: alice.id, oneTimePreKeys: [{ keyId: 1000, publicKey: b64(Buffer.alloc(32, 77)) }] }))
+            .rejects.toMatchObject({ code: 'E2EE_PREKEY_CONFLICT' });
+
+        // (4) Device B rotates in reusing keyId=1000 with ITS OWN material —
+        // accepted: retired Device A's keyId=1000 does NOT block Device B
+        const keysB = await deviceKeys(32);
+        const payloadB = await register(alice.id, keysB, { otpkCount: 1, otpkOffset: 0, materialOffset: 700 });
+        payloadB.deviceId = 'device-scope-bbb';
+        await svc.registerDevice({ userId: alice.id, ...payloadB });
+
+        // both rows coexist: identity is (userId, deviceId, keyId)
+        const rows = await db.e2eeOneTimePreKey.findMany({ where: { userId: alice.id, keyId: 1000 } });
+        expect(rows.length).toBe(2);
+        expect(new Set(rows.map((r) => r.deviceId))).toEqual(new Set(['device-scope-aaa', 'device-scope-bbb']));
+
+        // (5) the bundle claims DEVICE B's keyId=1000 — never A's
+        const bundle = await svc.fetchBundle(alice.id);
+        expect(bundle.deviceId).toBe('device-scope-bbb');
+        expect(bundle.oneTimePreKey.keyId).toBe(1000);
+        const claimedRow = await db.e2eeOneTimePreKey.findUnique({
+            where: { userId_deviceId_keyId: { userId: alice.id, deviceId: 'device-scope-bbb', keyId: 1000 } } });
+        expect(claimedRow.isUsed).toBe(true);
+        // Device A's row was consumed at rotation, never re-handed-out
+        const aRow = await db.e2eeOneTimePreKey.findUnique({
+            where: { userId_deviceId_keyId: { userId: alice.id, deviceId: 'device-scope-aaa', keyId: 1000 } } });
+        expect(aRow.isUsed).toBe(true);
+
+        // (6) rotation still leaves EXACTLY ONE active device
+        const active = await db.e2eeDevice.findMany({ where: { userId: alice.id, isActive: true } });
+        expect(active.length).toBe(1);
+        expect(active[0].deviceId).toBe('device-scope-bbb');
+
+        // (7) concurrent replenishment stays first-material-wins per
+        // (device, keyId): two different materials race for keyId=2000 on
+        // the active device — exactly one wins, the DB holds ONE row.
+        const mat1 = b64(Buffer.alloc(32, 201));
+        const mat2 = b64(Buffer.alloc(32, 202));
+        const results = await Promise.allSettled([
+            svc.replenishOneTimePreKeys({ userId: alice.id, oneTimePreKeys: [{ keyId: 2000, publicKey: mat1 }] }),
+            svc.replenishOneTimePreKeys({ userId: alice.id, oneTimePreKeys: [{ keyId: 2000, publicKey: mat2 }] }),
+        ]);
+        const settled = results.map((r) => r.status);
+        expect(settled).toContain('fulfilled');
+        const row2000 = await db.e2eeOneTimePreKey.findMany({
+            where: { userId: alice.id, deviceId: 'device-scope-bbb', keyId: 2000 } });
+        expect(row2000.length).toBe(1);
+        expect([mat1, mat2]).toContain(row2000[0].publicKey);
+        // If the loser reached the DB race it MUST have failed loudly (409
+        // or unique violation), never silently replaced the winner.
+        if (settled.includes('rejected')) {
+            const rejected = results.find((r) => r.status === 'rejected');
+            expect(['E2EE_PREKEY_CONFLICT', 'P2002']).toContain(rejected.reason.code || rejected.reason.message);
+        }
     });
 
     test('P0-C. concurrent device registrations converge to EXACTLY ONE active device', async () => {
         const svc = new E2EEKeyService(db);
         const keysA = await deviceKeys(23);
-        const payloadA = await register(alice.id, keysA, { otpkCount: 5, otpkOffset: 0 });
+        const payloadA = await register(alice.id, keysA, { otpkCount: 5, otpkOffset: 0, materialOffset: 400 });
         payloadA.deviceId = 'device-race-one';
         const keysB = await deviceKeys(24);
-        const payloadB = await register(alice.id, keysB, { otpkCount: 5, otpkOffset: 200 });
+        const payloadB = await register(alice.id, keysB, { otpkCount: 5, otpkOffset: 0, materialOffset: 500 });
         payloadB.deviceId = 'device-race-two';
 
         await Promise.all([
@@ -396,7 +480,7 @@ run('E2EE server-blind authority (real PostgreSQL)', () => {
         expect(bundle.deviceId).toBe(active[0].deviceId);
         // the surviving device's bundle only ever contains ITS OWN prekeys
         if (bundle.oneTimePreKey) {
-            const row = await db.e2eeOneTimePreKey.findFirst({ where: { userId: alice.id, keyId: bundle.oneTimePreKey.keyId } });
+            const row = await db.e2eeOneTimePreKey.findFirst({ where: { userId: alice.id, deviceId: active[0].deviceId, keyId: bundle.oneTimePreKey.keyId } });
             expect(row.deviceId).toBe(active[0].deviceId);
         }
     });

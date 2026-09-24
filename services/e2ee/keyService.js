@@ -134,8 +134,11 @@ class E2EEKeyService {
     // rows are never silently replaced.
     async _upsertPreKeys(tx, userId, deviceId, otpks) {
         for (const k of otpks) {
+            // r40.2: identity is DEVICE-scoped (userId, deviceId, keyId) —
+            // the same keyId on a DIFFERENT device is distinct material,
+            // never a conflict and never a silent replacement.
             const existing = await tx.e2eeOneTimePreKey.findUnique({
-                where: { userId_keyId: { userId, keyId: k.keyId } },
+                where: { userId_deviceId_keyId: { userId, deviceId, keyId: k.keyId } },
             });
             if (!existing) {
                 await tx.e2eeOneTimePreKey.create({
@@ -190,10 +193,13 @@ class E2EEKeyService {
     }
 
     // Replenish one-time prekeys (public keys only, strictly bounded).
-    // P1-D: a keyId identifies stable material — same key + same public key is
-    // idempotent; the same keyId with a different public key is a 409
-    // conflict. Keys are device-scoped to the ACTIVE device. Concurrent
-    // replenishment cannot become last-writer-wins (no delete/recreate).
+    // P1-D: a keyId identifies stable material WITHIN a device — same key +
+    // same public key is idempotent; the same keyId with a different public
+    // key on the SAME device is a 409 conflict. Keys are device-scoped to
+    // the ACTIVE device (r40.2: the unique index is (userId, deviceId,
+    // keyId), so a fresh device may reuse keyIds of retired devices).
+    // Concurrent replenishment cannot become last-writer-wins (no
+    // delete/recreate).
     async replenishOneTimePreKeys({ userId, oneTimePreKeys }) {
         const otpks = assertKeyIds(oneTimePreKeys, 'oneTimePreKeys');
         const device = await this.prisma.e2eeDevice.findFirst({
@@ -203,8 +209,10 @@ class E2EEKeyService {
         let inserted = 0;
         await this.prisma.$transaction(async (tx) => {
             for (const k of otpks) {
+                // r40.2: identity is DEVICE-scoped — a retired device's
+                // same keyId never conflicts with the active device's.
                 const existing = await tx.e2eeOneTimePreKey.findUnique({
-                    where: { userId_keyId: { userId, keyId: k.keyId } },
+                    where: { userId_deviceId_keyId: { userId, deviceId: device.deviceId, keyId: k.keyId } },
                 });
                 if (!existing) {
                     await tx.e2eeOneTimePreKey.create({

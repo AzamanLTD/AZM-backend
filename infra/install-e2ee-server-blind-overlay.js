@@ -90,8 +90,14 @@ const STATEMENTS = [
     // the CREATE TABLE above; this is a no-op there.
     `ALTER TABLE "E2EEOneTimePreKey" ADD COLUMN IF NOT EXISTS "deviceId" VARCHAR(128) NOT NULL DEFAULT ''`,
 
-    `CREATE UNIQUE INDEX IF NOT EXISTS "E2EEOneTimePreKey_userId_keyId_key"
-       ON "E2EEOneTimePreKey"("userId", "keyId")`,
+    // r40.2 (audit finding 3): keyId uniqueness is DEVICE-scoped —
+    // (userId, deviceId, keyId). A fresh device starts its own key-id
+    // sequence: Device B's keyId=1 must not collide with retired Device A's
+    // keyId=1. The r40.1 user-scoped index is dropped first; deployments
+    // that already have it are migrated in place (idempotent).
+    `DROP INDEX IF EXISTS "E2EEOneTimePreKey_userId_keyId_key"`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS "E2EEOneTimePreKey_userId_deviceId_keyId_key"
+       ON "E2EEOneTimePreKey"("userId", "deviceId", "keyId")`,
     `CREATE INDEX IF NOT EXISTS "E2EEOneTimePreKey_userId_deviceId_isUsed_idx"
        ON "E2EEOneTimePreKey"("userId", "deviceId", "isUsed")`,
     // r40.1 (P0-C): one-time prekeys are device-scoped. Existing deployments
@@ -147,6 +153,10 @@ async function install(client) {
              WHERE table_name = 'E2EEOneTimePreKey' AND column_name = 'deviceId') AS otp_device_binding,
             (SELECT COUNT(*) FROM pg_indexes
              WHERE indexname = 'E2EEDevice_one_active_per_user') AS one_active_idx,
+            (SELECT COUNT(*) FROM pg_indexes
+             WHERE indexname = 'E2EEOneTimePreKey_userId_deviceId_keyId_key') AS otp_device_scoped_uniq,
+            (SELECT COUNT(*) FROM pg_indexes
+             WHERE indexname = 'E2EEOneTimePreKey_userId_keyId_key') AS legacy_user_scoped_uniq,
             (SELECT COUNT(*) FROM information_schema.columns
              WHERE column_name IN ('privateKey','activeRootKey','activeChainKey','identityPrivateKey',
                                    'signedPreKeyPrivateKey','sendingChainKey','receivingChainKey')) AS private_columns,
@@ -158,10 +168,12 @@ async function install(client) {
     if (Number(c.dropped_tables) !== 0) problems.push('legacy private-key tables still present');
     if (Number(c.otp_device_binding) !== 1) problems.push('OTP deviceId binding missing');
     if (Number(c.one_active_idx) !== 1) problems.push('one-active-device index missing');
+    if (Number(c.otp_device_scoped_uniq) !== 1) problems.push('device-scoped OTP keyId uniqueness index missing (r40.2)');
+    if (Number(c.legacy_user_scoped_uniq) !== 0) problems.push('legacy user-scoped OTP keyId unique index still present (r40.2)');
     if (Number(c.private_columns) !== 0) problems.push('private-key columns remain in schema');
     if (Number(c.envelope_col) !== 1) problems.push('Message.e2eeEnvelope missing');
     if (problems.length) throw new Error('E2EE overlay verification FAILED: ' + problems.join('; '));
-    console.log(`E2EE server-blind overlay installed: ${applied} statements applied, all 6 post-install checks passed.`);
+    console.log(`E2EE server-blind overlay installed: ${applied} statements applied, all 8 post-install checks passed.`);
 }
 
 if (require.main === module) {

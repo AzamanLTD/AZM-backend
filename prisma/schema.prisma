@@ -6436,6 +6436,11 @@ model E2eeOneTimePreKey {
   // r40.1 (P0-C): one-time prekeys are DEVICE-scoped. A claimed bundle can
   // only contain keys belonging to the selected active device — Device B can
   // never receive Device A's prekey.
+  // r40.2 (audit finding 3): keyId uniqueness is DEVICE-scoped too:
+  // (userId, deviceId, keyId). A fresh device starts its own key-id
+  // sequence — Device B's keyId=1 is distinct material from retired Device
+  // A's keyId=1, and must not collide with it. Identity/immutability
+  // conflicts are per-device only.
   deviceId  String    @db.VarChar(128)
   keyId     Int
   publicKey String    @db.VarChar(100) // X25519 pub (b64) — PRIVATE KEY NEVER UPLOADED
@@ -6445,7 +6450,7 @@ model E2eeOneTimePreKey {
 
   user User @relation("UserE2EEOneTimePreKeys", fields: [userId], references: [id], onDelete: Cascade)
 
-  @@unique([userId, keyId])
+  @@unique([userId, deviceId, keyId])
   @@index([userId, deviceId, isUsed])
   @@map("E2EEOneTimePreKey")
 }
