@@ -2808,6 +2808,7 @@ model BusinessProfile {
   routeTemplates             TransitRouteTemplate[]
   inventoryItems             InventoryItem[]
   inventoryRestockOperations InventoryRestockOperation[]
+  inventoryRestockIntents    InventoryRestockIntent[]
   notificationPreferences    BusinessNotificationPreference?
   apiKeys                    BusinessApiKey[]
   webhooks                   BusinessWebhook[]
@@ -5559,6 +5560,52 @@ model InventoryItem {
 
   @@unique([businessProfileId, name])
   @@index([businessProfileId])
+}
+
+// §r40.4 — SERVER-OWNED RESTOCK INTENT (final-audit P1 redesign).
+// Browser storage can never be the ultimate authority for exactly-once
+// semantics: a lost response + closed browser destroyed the client's retry
+// identity, so a later attempt minted a NEW key and the backend executed a
+// duplicate restock. The server now owns the operation identity:
+//   • every restock operation is REGISTERED here BEFORE its request is
+//     sent; the intent's id is the idempotency key of the restock;
+//   • the record is DURABLE (no TTL, no expiry) and survives browser
+//     termination, storage loss and cross-tab confusion by construction —
+//     the client can always recover the exact prior operation from the
+//     unresolved list;
+//   • identity is OPERATION-level, not quantity-derived: two genuinely
+//     distinct restocks of the same item and quantity are two intents;
+//   • resolution is keyed by intent id — a late success can never clear a
+//     NEWER intent for the same item/quantity.
+// Lifecycle (guarded state machine):
+//   PENDING   → EXECUTED    by the restock service itself (execution or
+//                            replay) — the authoritative outcome is stored
+//                            in executionResult so a browser that lost the
+//                            response can recover it;
+//   CANCELLED → EXECUTED    allowed: the operator cancelled on a guess, but
+//                            the request had already committed — truth wins,
+//                            the recovery list must surface it;
+//   EXECUTED  → ACKNOWLEDGED by the client after the outcome is OBSERVED;
+//   PENDING   → CANCELLED   by an explicit operator cancel (only while no
+//                            execution has been observed);
+//   EXECUTED  → CANCELLED   FORBIDDEN: an executed financial operation can
+//                            never be cancelled, only acknowledged.
+model InventoryRestockIntent {
+  id               String    @id @default(uuid())
+  businessProfileId String
+  itemId           String
+  quantity         String    @db.VarChar(64)
+  status           String    @default("PENDING")
+  executionResult  Json?
+  executedAt       DateTime?
+  acknowledgedAt   DateTime?
+  createdBy        Int
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  businessProfile BusinessProfile @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+
+  @@index([businessProfileId, status])
 }
 
 // A durable business-scoped request claim: no expiry, because reusing an old

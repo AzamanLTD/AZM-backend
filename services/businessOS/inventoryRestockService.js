@@ -129,7 +129,16 @@ class InventoryRestockService {
 
         // A replay is checked before reading the mutable inventory catalog.
         const committed = await replay();
-        if (committed) return committed;
+        if (committed) {
+            // §r40.4: a replay IS the authoritative evidence that the
+            // operation executed (this is exactly the committed-but-
+            // unobserved recovery path). Mark the server-owned intent
+            // EXECUTED with the stored result so a browser that lost the
+            // original response can recover the outcome. Fire-and-forget
+            // semantics, never a failure of the restock itself.
+            await this._markIntentExecuted(idempotencyKey, committed, businessProfileId).catch(() => {});
+            return committed;
+        }
 
         try {
             return await this.prisma.$transaction(async (tx) => {
@@ -198,16 +207,37 @@ class InventoryRestockService {
                 await tx.inventoryRestockOperation.update({
                     where: { id: operation.id }, data: { ledgerId: ledger.id, result },
                 });
+                // §r40.4: the server-owned intent (whose id IS the
+                // idempotency key) is marked EXECUTED in the SAME
+                // transaction as the economic mutation — execution
+                // evidence and outcome are committed atomically.
+                await tx.inventoryRestockIntent.updateMany({
+                    where: { id: idempotencyKey, businessProfileId, status: { in: ['PENDING', 'CANCELLED'] } },
+                    data: { status: 'EXECUTED', executionResult: result, executedAt: new Date() },
+                });
                 return result;
             });
         } catch (error) {
             if (error.code === 'P2002') {
                 const winner = await replay();
-                if (winner) return winner;
+                if (winner) {
+                    await this._markIntentExecuted(idempotencyKey, winner, businessProfileId).catch(() => {});
+                    return winner;
+                }
                 throw restockError('RESTOCK_CLAIM_CONFLICT', 'Restock claim did not complete; retry with the same key.', 409);
             }
             throw error;
         }
+    }
+    // §r40.4 — mark the server-owned restock intent EXECUTED (replay path;
+    // the transaction path marks it inline with tx). Keys outside the intent
+    // namespace simply match no row and are a no-op, so legacy/other-client
+    // keys are unaffected.
+    async _markIntentExecuted(idempotencyKey, result, businessProfileId) {
+        await this.prisma.inventoryRestockIntent.updateMany({
+            where: { id: idempotencyKey, businessProfileId, status: { in: ['PENDING', 'CANCELLED'] } },
+            data: { status: 'EXECUTED', executionResult: result, executedAt: new Date() },
+        });
     }
 }
 

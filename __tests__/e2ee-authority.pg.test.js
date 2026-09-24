@@ -196,14 +196,14 @@ run('E2EE server-blind authority (real PostgreSQL)', () => {
         const payload = await register(bob.id, bobKeys || (bobKeys = await deviceKeys(2)), { otpkCount: 20 });
         await svc.registerDevice({ userId: bob.id, ...payload });
 
-        const bundles = await Promise.all(Array.from({ length: 20 }, () => svc.fetchBundle(bob.id)));
+        const bundles = await Promise.all(Array.from({ length: 20 }, () => svc.fetchBundle(bob.id, { claimantId: alice.id })));
         const claimedIds = bundles.map((b) => b.oneTimePreKey && b.oneTimePreKey.keyId).filter(Boolean);
         expect(claimedIds.length).toBe(20);
         expect(new Set(claimedIds).size).toBe(20); // every concurrent caller got a DIFFERENT key
         const remaining = await db.e2eeOneTimePreKey.count({ where: { userId: bob.id, isUsed: false } });
         expect(remaining).toBe(0);
         // subsequent fetches degrade to no one-time prekey (no crash)
-        const drained = await svc.fetchBundle(bob.id);
+        const drained = await svc.fetchBundle(bob.id, { claimantId: alice.id });
         expect(drained.oneTimePreKey).toBeNull();
         expect(drained.signedPreKey.publicKey).toBe(payload.signedPreKey.publicKey);
     });
@@ -219,7 +219,7 @@ run('E2EE server-blind authority (real PostgreSQL)', () => {
         await svc.registerDevice({ userId: bob.id, ...bobPayload });
 
         // Full client-side session: Alice fetches Bob's bundle, X3DH, ratchet.
-        const bundle = await svc.fetchBundle(bob.id);
+        const bundle = await svc.fetchBundle(bob.id, { claimantId: alice.id });
         const sodium = await protocol.init();
         // verify bundle signatures client-side before use (contract §4)
         expect(protocol.verifySignedPreKeySignature({
@@ -379,7 +379,7 @@ run('E2EE server-blind authority (real PostgreSQL)', () => {
         expect(stale.length).toBe(3);
 
         // every bundle + claimed OTP belongs to the ACTIVE device only
-        const bundle = await svc.fetchBundle(alice.id);
+        const bundle = await svc.fetchBundle(alice.id, { claimantId: bob.id });
         expect(bundle.deviceId).toBe('device-rotation-bbb');
         const otpRow = await db.e2eeOneTimePreKey.findFirst({
             where: { userId: alice.id, deviceId: bundle.deviceId, keyId: bundle.oneTimePreKey.keyId } });
@@ -421,7 +421,7 @@ run('E2EE server-blind authority (real PostgreSQL)', () => {
         expect(new Set(rows.map((r) => r.deviceId))).toEqual(new Set(['device-scope-aaa', 'device-scope-bbb']));
 
         // (5) the bundle claims DEVICE B's keyId=1000 — never A's
-        const bundle = await svc.fetchBundle(alice.id);
+        const bundle = await svc.fetchBundle(alice.id, { claimantId: bob.id });
         expect(bundle.deviceId).toBe('device-scope-bbb');
         expect(bundle.oneTimePreKey.keyId).toBe(1000);
         const claimedRow = await db.e2eeOneTimePreKey.findUnique({
@@ -540,6 +540,175 @@ run('E2EE server-blind authority (real PostgreSQL)', () => {
         expect(r.body.data.oneTimePreKey).toBeTruthy();
     });
 
+    test('r40.4. fetchBundle FAILS CLOSED without a claimant — anonymous claims are refused', async () => {
+        const svc = new E2EEKeyService(db);
+        const payload = await register(bob.id, bobKeys || (bobKeys = await deviceKeys(2)), { otpkCount: 3 });
+        await svc.registerDevice({ userId: bob.id, ...payload });
+        // no claimant → the consumptive call is refused before ANY state changes
+        await expect(svc.fetchBundle(bob.id)).rejects.toMatchObject({ code: 'E2EE_CLAIMANT_REQUIRED' });
+        await expect(svc.fetchBundle(bob.id, {})).rejects.toMatchObject({ code: 'E2EE_CLAIMANT_REQUIRED' });
+        await expect(svc.fetchBundle(bob.id, { claimantId: 'bogus' })).rejects.toMatchObject({ code: 'E2EE_CLAIMANT_REQUIRED' });
+        expect(await db.e2eeOneTimePreKey.count({ where: { userId: bob.id, isUsed: false } })).toBe(3);
+    });
+
+    test('r40.4. bundle claim vs device ROTATION is serialized by the device row lock (deterministic)', async () => {
+        const svc = new E2EEKeyService(db);
+        const aPayload = await register(alice.id, aliceKeys, { otpkCount: 10, otpkOffset: 0, materialOffset: 900 });
+        await svc.registerDevice({ userId: alice.id, ...aPayload });
+
+        // A claim holds the active device row lock mid-flight (the exact
+        // window where the pre-r40.4 two-step claim could return a device
+        // that rotation retired underneath it).
+        let release;
+        const gate = new Promise((resolve) => { release = resolve; });
+        const heldClaim = db.$transaction(async (tx) => {
+            await tx.$queryRaw`SELECT "id" FROM "E2EEDevice" WHERE "userId" = ${alice.id} AND "isActive" = true FOR UPDATE`;
+            await gate; // hold the device row lock — claim in flight
+            return 'held';
+        }, { timeout: 15000 });
+
+        // Rotation (A → B) and a concurrent service-level claim both fire
+        // while the lock is held: both MUST block on the device row.
+        const bKeys = await deviceKeys(42);
+        const bPayload = await register(alice.id, bKeys, { otpkCount: 10, otpkOffset: 0, materialOffset: 910 });
+        bPayload.deviceId = 'device-race-bbb';
+        const rotationP = svc.registerDevice({ userId: alice.id, ...bPayload });
+        const claimP = svc.fetchBundle(alice.id, { claimantId: bob.id });
+        let rotationDone = false, claimDone = false;
+        rotationP.then(() => { rotationDone = true; });
+        claimP.then(() => { claimDone = true; });
+
+        await new Promise((r) => setTimeout(r, 500));
+        expect(rotationDone).toBe(false); // rotation CANNOT retire the claimed device mid-claim
+        expect(claimDone).toBe(false); // the concurrent claim waits for the lock
+
+        release();
+        await heldClaim;
+        await rotationP;
+        const bundle = await claimP;
+        // The row lock SERIALIZED claim and rotation — two safe outcomes only:
+        //   • the claim won the lock first: it serves device A, which was
+        //     STILL ACTIVE in its locked snapshot (rotation commits after);
+        //   • the rotation won: the claim's locked re-check sees A retired and
+        //     its statement snapshot predates B, so it FAILS CLOSED (null →
+        //     404 "no device") instead of ever serving a retired device. The
+        //     pre-r40.4 two-step claim had a THIRD outcome here — returning
+        //     the already-retired A — which is now impossible.
+        if (bundle === null) {
+            const active0 = await db.e2eeDevice.findMany({ where: { userId: alice.id, isActive: true } });
+            expect(active0[0].deviceId).toBe('device-race-bbb'); // rotation won
+        } else {
+            expect(bundle.deviceId).toBe(aPayload.deviceId); // claim won: A, active at snapshot
+        }
+        const active = await db.e2eeDevice.findMany({ where: { userId: alice.id, isActive: true } });
+        expect(active.length).toBe(1);
+        expect(active[0].deviceId).toBe('device-race-bbb');
+        // after rotation committed, EVERY claim returns the new device only
+        const after = await svc.fetchBundle(alice.id, { claimantId: bob.id });
+        expect(after.deviceId).toBe('device-race-bbb');
+    });
+
+    test('r40.4. a claim blocked mid-rotation RE-CHECKS the device row and never serves the retired device', async () => {
+        const svc = new E2EEKeyService(db);
+        const aPayload = await register(alice.id, aliceKeys, { otpkCount: 5, otpkOffset: 0, materialOffset: 940 });
+        aPayload.deviceId = 'device-recheck-aaa';
+        await svc.registerDevice({ userId: alice.id, ...aPayload });
+
+        // Material for device B (rotation target), created but not yet active.
+        const bKeys = await deviceKeys(44);
+        const bPayload = await register(alice.id, bKeys, { otpkCount: 5, otpkOffset: 0, materialOffset: 950 });
+        bPayload.deviceId = 'device-recheck-bbb';
+
+        // A rotation-in-flight holds device A's row lock: it retires A and
+        // activates B in ONE transaction (exactly the two statements
+        // registerDevice performs), then pauses before commit.
+        let release;
+        const gate = new Promise((resolve) => { release = resolve; });
+        const heldRotation = db.$transaction(async (tx) => {
+            await tx.e2eeDevice.updateMany({ where: { userId: alice.id, isActive: true }, data: { isActive: false } });
+            await tx.e2eeDevice.create({
+                data: { userId: alice.id, deviceId: 'device-recheck-bbb',
+                    signingPublicKey: bPayload.signingPublicKey,
+                    identityPublicKey: bPayload.identityPublicKey,
+                    bindingSignature: bPayload.identityBindingSignature,
+                    signedPreKeyId: bPayload.signedPreKey.keyId,
+                    signedPreKeyPublicKey: bPayload.signedPreKey.publicKey,
+                    signedPreKeySignature: bPayload.signedPreKey.signature,
+                    isActive: true },
+            });
+            await tx.e2eeOneTimePreKey.createMany({
+                data: bPayload.oneTimePreKeys.map((k) => ({ userId: alice.id, deviceId: 'device-recheck-bbb', keyId: k.keyId, publicKey: k.publicKey })),
+            });
+            await gate; // rotation transaction held open past its retirement
+            return 'rotated';
+        }, { timeout: 15000 });
+
+        // The claim arrives WHILE the rotation transaction holds A's row
+        // lock mid-flight. It must block on the lock, then RE-CHECK the row
+        // under READ COMMITTED: A is retired, and the claim's statement
+        // snapshot predates B — so the claim FAILS CLOSED (null → 404), the
+        // only safe answer. It can NEVER serve the retired device A, and a
+        // retried claim sees the new device.
+        const claimP = svc.fetchBundle(alice.id, { claimantId: bob.id });
+        let claimDone = false;
+        claimP.then(() => { claimDone = true; });
+        await new Promise((r) => setTimeout(r, 400));
+        expect(claimDone).toBe(false); // blocked on the device row lock
+
+        release();
+        await heldRotation;
+        const bundle = await claimP;
+        expect(bundle).toBeNull(); // FAILS CLOSED — never the retired device
+        // no OPK was consumed by the refused claim
+        expect(await db.e2eeOneTimePreKey.count({ where: { userId: alice.id, deviceId: 'device-recheck-bbb', isUsed: true } })).toBe(0);
+        // the retry (fresh statement, post-rotation snapshot) serves the NEW
+        // device with ITS OWN prekey — never mixed with A's material
+        const retry = await svc.fetchBundle(alice.id, { claimantId: bob.id });
+        expect(retry.deviceId).toBe('device-recheck-bbb');
+        expect(retry.oneTimePreKey).toBeTruthy();
+        const otpRow = await db.e2eeOneTimePreKey.findFirst({
+            where: { userId: alice.id, deviceId: 'device-recheck-bbb', keyId: retry.oneTimePreKey.keyId, isUsed: true } });
+        expect(otpRow).toBeTruthy();
+        expect(otpRow.claimedBy).toBe(bob.id);
+    });
+
+    test('r40.4. concurrent claims under rotation NEVER mix devices or target a retired device (fuzz)', async () => {
+        const svc = new E2EEKeyService(db);
+        const aPayload = await register(alice.id, aliceKeys, { otpkCount: 30, otpkOffset: 0, materialOffset: 920 });
+        aPayload.deviceId = 'device-fuzz-aaa';
+        await svc.registerDevice({ userId: alice.id, ...aPayload });
+
+        const bKeys = await deviceKeys(43);
+        const bPayload = await register(alice.id, bKeys, { otpkCount: 30, otpkOffset: 0, materialOffset: 930 });
+        bPayload.deviceId = 'device-fuzz-bbb';
+
+        // rotation races 15 concurrent bundle claims
+        const rotationP = svc.registerDevice({ userId: alice.id, ...bPayload });
+        const claimPs = Array.from({ length: 15 }, () => svc.fetchBundle(alice.id, { claimantId: bob.id }).catch(() => null));
+        await rotationP;
+        const bundles = (await Promise.all(claimPs)).filter(Boolean);
+
+        for (const b of bundles) {
+            expect(['device-fuzz-aaa', 'device-fuzz-bbb']).toContain(b.deviceId);
+            if (b.oneTimePreKey) {
+                // P0-C under race: the claimed OTPK is the row bound to the
+                // SAME device as the bundle that served it — never mixed
+                // (keyIds are device-scoped, so the pair (deviceId, keyId)
+                // identifies the exact consumed row)
+                const row = await db.e2eeOneTimePreKey.findFirst({
+                    where: { userId: alice.id, deviceId: b.deviceId, keyId: b.oneTimePreKey.keyId, isUsed: true } });
+                expect(row).toBeTruthy();
+                expect(row.claimedBy).toBe(bob.id);
+            }
+        }
+        // every claim that completed after the rotation returns ONLY the new
+        // active device — no session may target a retired device
+        for (let i = 0; i < 5; i++) {
+            const late = await svc.fetchBundle(alice.id, { claimantId: bob.id });
+            expect(late.deviceId).toBe('device-fuzz-bbb');
+        }
+    });
+
     test('P0-C. concurrent device registrations converge to EXACTLY ONE active device', async () => {
         const svc = new E2EEKeyService(db);
         const keysA = await deviceKeys(23);
@@ -556,7 +725,7 @@ run('E2EE server-blind authority (real PostgreSQL)', () => {
 
         const active = await db.e2eeDevice.findMany({ where: { userId: alice.id, isActive: true } });
         expect(active.length).toBe(1);
-        const bundle = await svc.fetchBundle(alice.id);
+        const bundle = await svc.fetchBundle(alice.id, { claimantId: bob.id });
         expect(bundle.deviceId).toBe(active[0].deviceId);
         // the surviving device's bundle only ever contains ITS OWN prekeys
         if (bundle.oneTimePreKey) {

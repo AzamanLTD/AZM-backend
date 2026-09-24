@@ -124,6 +124,9 @@ if (require.main === module) {
     if (!/E2EE_NO_RELATIONSHIP/.test(read('services/e2ee/keyService.js'))) {
         fail('services/e2ee/keyService.js lost the E2EE_NO_RELATIONSHIP claim gate — an authenticated stranger must not consume an arbitrary user\'s one-time prekeys (r40.3)');
     }
+    if (!/E2EE_CLAIMANT_REQUIRED/.test(read('services/e2ee/keyService.js'))) {
+        fail('services/e2ee/keyService.js must fail closed on anonymous bundle claims (E2EE_CLAIMANT_REQUIRED, r40.4)');
+    }
 
     if (failures.length) {
         console.error('E2EE invariant audit FAILED:');

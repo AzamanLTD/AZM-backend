@@ -105,8 +105,12 @@ authorization-gated AND rate-limited (r40.3):
    15 minutes per (claimant, target) pair** — a user who DOES share a
    conversation with the victim cannot hammer the endpoint to drain their
    pool either; the limit is per pair, so one abusive relationship never
-   throttles a claimant's sessions with other peers. Fail-open tier
-   (consistent with all non-financial limiters).
+   throttles a claimant's sessions with other peers. Fail-safe tier (the
+   same posture as the financial tier): a Redis outage degrades the limiter
+   to an in-process memory limiter with identical thresholds, never to
+   unlimited claims. The claimant is MANDATORY at the service boundary too
+   (`fetchBundle` refuses an anonymous claim with `E2EE_CLAIMANT_REQUIRED`) —
+   the security parameter is not something a caller may omit.
 3. **Claim audit trail.** Each claim records `claimedBy` (the claimant's
    user id) on the consumed OPK row, so OPK-drain abuse is forensically
    attributable.

@@ -157,74 +157,115 @@ class E2EEKeyService {
     // Fetch a user's prekey bundle. Atomically claims one unused one-time
     // prekey: a single statement, row-lock + SKIP LOCKED — concurrent
     // fetches receive DISTINCT keys (proven by a PostgreSQL concurrency test).
-    // r40.3 (audit P1 — OPK exhaustion): a bundle fetch CONSUMES one of the
-    // target's one-time prekeys, so it is not a free public-key read: it is
-    // a resource claim against the target's session-freshness pool. An
-    // arbitrary authenticated caller therefore must not be able to drain any
-    // user's OPKs. Authorization: the claimant must share an existing
-    // PERSONAL conversation with the target — the same pairwise contract
-    // the message path already enforces (E2EE_NOT_PAIRWISE): an E2EE session
-    // is only ever established inside an existing personal conversation, so
-    // a bundle for a non-conversation peer is by definition unusable. This
-    // is a DELIBERATE consumption gate, not a removal of OPKs from the
-    // protocol; unauthenticated fetches were already impossible (protect).
-    // The route additionally rate-limits claims per (claimant, target) —
-    // see e2eeBundleLimiter in middleware/rateLimitMiddleware.js.
+    // r40.3/r40.4 (audit P1 — OPK exhaustion + fail-closed boundary): a
+    // bundle fetch CONSUMES one of the target's one-time prekeys, so it is
+    // not a free public-key read: it is a resource claim against the
+    // target's session-freshness pool. The claimant is MANDATORY and must
+    // share an existing PERSONAL conversation with the target — the same
+    // pairwise contract the message path already enforces
+    // (E2EE_NOT_PAIRWISE): an E2EE session is only ever established inside
+    // an existing personal conversation, so a bundle for a non-conversation
+    // peer is by definition unusable. This is a DELIBERATE consumption
+    // gate, not a removal of OPKs from the protocol; unauthenticated
+    // fetches were already impossible (protect). The route additionally
+    // rate-limits claims per (claimant, target) — see e2eeBundleLimiter in
+    // middleware/rateLimitMiddleware.js (r40.4: fail-safe tier — a Redis
+    // outage degrades to in-process limiting instead of unlimited claims).
     async fetchBundle(userId, { claimantId } = {}) {
-        if (claimantId !== undefined) {
-            if (claimantId === userId) {
-                const self = new Error('E2EE bundles are fetched by a conversation peer, never by the key owner.');
-                self.statusCode = 403; self.code = 'E2EE_NO_RELATIONSHIP';
-                throw self;
-            }
-            const shared = await this.prisma.conversation.findFirst({
-                where: {
-                    type: 'PERSONAL',
-                    AND: [
-                        { participants: { some: { id: claimantId } } },
-                        { participants: { some: { id: userId } } },
-                    ],
-                },
-            });
-            if (!shared) {
-                const err = new Error('No personal conversation with this user — E2EE sessions can only be established with an existing conversation peer.');
-                err.statusCode = 403; err.code = 'E2EE_NO_RELATIONSHIP';
-                throw err;
-            }
+        // r40.4 (audit: fail-closed service boundary): a bundle fetch CONSUMES
+        // a target resource, so the claimant is MANDATORY at the service
+        // boundary — the security parameter is not something a caller may
+        // forget to pass. There is deliberately NO unrestricted internal
+        // variant; every claim must name who it is for.
+        if (!Number.isInteger(claimantId) || claimantId <= 0) {
+            const err = new Error('fetchBundle requires a claimantId — bundle claims are not anonymous.');
+            err.statusCode = 500; err.code = 'E2EE_CLAIMANT_REQUIRED';
+            throw err;
+        }
+        if (claimantId === userId) {
+            const self = new Error('E2EE bundles are fetched by a conversation peer, never by the key owner.');
+            self.statusCode = 403; self.code = 'E2EE_NO_RELATIONSHIP';
+            throw self;
+        }
+        const shared = await this.prisma.conversation.findFirst({
+            where: {
+                type: 'PERSONAL',
+                AND: [
+                    { participants: { some: { id: claimantId } } },
+                    { participants: { some: { id: userId } } },
+                ],
+            },
+        });
+        if (!shared) {
+            const err = new Error('No personal conversation with this user — E2EE sessions can only be established with an existing conversation peer.');
+            err.statusCode = 403; err.code = 'E2EE_NO_RELATIONSHIP';
+            throw err;
         }
 
-        const device = await this.prisma.e2eeDevice.findFirst({
-            where: { userId, isActive: true },
-            orderBy: { updatedAt: 'desc' },
-        });
-        if (!device) return null;
-
-        // P0-C: the one-time prekey is claimed from the SELECTED device only
-        // (deviceId binding). A user's bundle can never contain another
-        // device's prekey — the private half of the claimed key is guaranteed
-        // to live on the exact device whose bundle is returned.
-        // r40.3: claimedBy records WHO consumed the key (abuse forensics).
-        const claimed = await this.prisma.$queryRaw`
-            UPDATE "E2EEOneTimePreKey" SET "isUsed" = true, "usedAt" = now(), "claimedBy" = ${claimantId ?? null}
-            WHERE "id" = (
-                SELECT "id" FROM "E2EEOneTimePreKey"
-                WHERE "userId" = ${userId} AND "deviceId" = ${device.deviceId} AND "isUsed" = false
-                ORDER BY "createdAt" ASC
-                FOR UPDATE SKIP LOCKED
+        // r40.4 (audit: bundle/device-rotation race). The device snapshot and
+        // the one-time-prekey claim are now ONE ATOMIC STATEMENT: the CTE
+        // locks the selected active device row FOR UPDATE and claims the OPK
+        // inside the same snapshot. Device rotation (registerDevice) retires
+        // the active device by UPDATING that same row inside its own
+        // transaction, so the two are serialized by the row lock:
+        //   • a claim that selects device A holds A's row lock — rotation
+        //     cannot retire A until the claim has committed, so the returned
+        //     bundle can never be for a device already retired;
+        //   • a rotation that commits first marks A inactive — the claim's
+        //     locked read re-evaluates the row (READ COMMITTED re-check
+        //     semantics) and refuses to serve the retired device. Because the
+        //     claim's statement snapshot predates the new device row, the
+        //     claim FAILS CLOSED (no bundle → 404) when it loses the race;
+        //     the client retries and is served the new active device. Never a
+        //     retired device, never mixed material — the only safe answers.
+        // P0-C is preserved: the claimed OPK is bound to the selected device
+        // (the claim joins the locked device snapshot). r40.3: claimedBy
+        // records WHO consumed the key (abuse forensics).
+        const bundle = await this.prisma.$queryRaw`
+            WITH active_device AS (
+                SELECT "deviceId", "signingPublicKey", "identityPublicKey",
+                       "signedPreKeyId", "signedPreKeyPublicKey", "signedPreKeySignature"
+                FROM "E2EEDevice"
+                WHERE "userId" = ${userId} AND "isActive" = true
+                ORDER BY "updatedAt" DESC
                 LIMIT 1
+                FOR UPDATE
+            ), claim AS (
+                UPDATE "E2EEOneTimePreKey"
+                SET "isUsed" = true, "usedAt" = now(), "claimedBy" = ${claimantId}
+                WHERE "id" = (
+                    SELECT opk."id" FROM "E2EEOneTimePreKey" opk
+                    WHERE opk."userId" = ${userId}
+                      AND opk."deviceId" = (SELECT "deviceId" FROM active_device)
+                      AND opk."isUsed" = false
+                    ORDER BY opk."createdAt" ASC
+                    FOR UPDATE SKIP LOCKED
+                    LIMIT 1
+                )
+                RETURNING "keyId", "publicKey"
             )
-            RETURNING "keyId", "publicKey"`;
-
+            SELECT ad."deviceId" AS "deviceId",
+                   ad."signingPublicKey" AS "signingPublicKey",
+                   ad."identityPublicKey" AS "identityPublicKey",
+                   ad."signedPreKeyId" AS "signedPreKeyId",
+                   ad."signedPreKeyPublicKey" AS "signedPreKeyPublicKey",
+                   ad."signedPreKeySignature" AS "signedPreKeySignature",
+                   c."keyId" AS "otpkKeyId",
+                   c."publicKey" AS "otpkPublicKey"
+            FROM active_device ad
+            LEFT JOIN claim c ON true`;
+        if (!bundle.length) return null;
+        const b = bundle[0];
         return {
-            deviceId: device.deviceId,
-            signingPublicKey: device.signingPublicKey,
-            identityPublicKey: device.identityPublicKey,
+            deviceId: b.deviceId,
+            signingPublicKey: b.signingPublicKey,
+            identityPublicKey: b.identityPublicKey,
             signedPreKey: {
-                keyId: device.signedPreKeyId,
-                publicKey: device.signedPreKeyPublicKey,
-                signature: device.signedPreKeySignature,
+                keyId: b.signedPreKeyId,
+                publicKey: b.signedPreKeyPublicKey,
+                signature: b.signedPreKeySignature,
             },
-            oneTimePreKey: claimed.length ? { keyId: claimed[0].keyId, publicKey: claimed[0].publicKey } : null,
+            oneTimePreKey: b.otpkKeyId !== null ? { keyId: b.otpkKeyId, publicKey: b.otpkPublicKey } : null,
         };
     }
 
