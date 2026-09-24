@@ -6447,6 +6447,12 @@ model E2eeOneTimePreKey {
   isUsed    Boolean   @default(false)
   createdAt DateTime  @default(now())
   usedAt    DateTime?
+  // r40.3 (audit P1): who CLAIMED this key at bundle fetch — the audit
+  // trail for OPK-consumption abuse. Nullable: legacy rows claimed before
+  // the column existed, and replenish-inserted rows are unclaimed until a
+  // peer fetches them. Never a foreign key: a claimant's account deletion
+  // must not delete key-directory forensics.
+  claimedBy Int?
 
   user User @relation("UserE2EEOneTimePreKeys", fields: [userId], references: [id], onDelete: Cascade)
 

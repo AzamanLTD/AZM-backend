@@ -85,10 +85,37 @@ Both sides derive the **same** SK — proven by an explicit per-term test.
 
 ## 5. One-time prekey claim (GET /api/e2ee/keys/:userId)
 
-The server atomically claims one unused OPK with a single
+A bundle fetch CONSUMES one of the target's one-time prekeys, so it is a
+resource claim, not a free public-key read. It is therefore
+authorization-gated AND rate-limited (r40.3):
+
+1. **Relationship gate.** The authenticated caller must share an existing
+   `PERSONAL` conversation with the target user; otherwise the claim is
+   refused with `403 E2EE_NO_RELATIONSHIP` and NOTHING is consumed. This is
+   the same pairwise contract the message path enforces
+   (`E2EE_NOT_PAIRWISE`, §8): an E2EE session can only be established inside
+   an existing personal conversation, so a bundle for a non-conversation peer
+   is by definition unusable — strangers can never drain a victim's OPK
+   pool, no matter how many times they probe. Self-fetch is refused the same
+   way (an E2EE session with yourself is meaningless; the device already
+   holds its own keys). The fingerprint endpoints (`GET /fingerprint/:userId`)
+   stay open by design: safety numbers are made to be shared and consume no
+   resources.
+2. **Per-pair rate limit.** `e2eeBundleLimiter`: at most **10 claims per
+   15 minutes per (claimant, target) pair** — a user who DOES share a
+   conversation with the victim cannot hammer the endpoint to drain their
+   pool either; the limit is per pair, so one abusive relationship never
+   throttles a claimant's sessions with other peers. Fail-open tier
+   (consistent with all non-financial limiters).
+3. **Claim audit trail.** Each claim records `claimedBy` (the claimant's
+   user id) on the consumed OPK row, so OPK-drain abuse is forensically
+   attributable.
+
+The claim itself is atomic: one unused OPK with a single
 `UPDATE ... WHERE id = (SELECT ... FOR UPDATE SKIP LOCKED LIMIT 1) RETURNING`
 statement. Concurrent bundle fetches receive distinct OPKs — proven by a
-concurrent PostgreSQL test.
+concurrent PostgreSQL test, and a hostile-probe test proves an
+unrelated/abusive caller cannot exhaust an arbitrary user's pool.
 
 ## 6. Double Ratchet (message state)
 
@@ -104,7 +131,16 @@ Signal Double Ratchet spec, per session (one session per pair of devices):
   spec's DH-step (`(RK, CKr) = KDF_RK(RK, X25519(DHs_priv, header.dh))` before
   deriving sending chains). Header: `{ dh (ratchet pub), pn, n }`.
 - Out-of-order delivery: skipped message keys cached per
-  `(header.dh, n)` up to MAX_SKIP = 1000 per chain (spec's SKIP cap).
+  `(header.dh, n)`. TWO bounds (both must be implemented by every client):
+  - **MAX_SKIP = 1000** per chain — a message may jump at most 1000
+    positions ahead of the receiving chain head (`until + 1 - recvCount >
+    MAX_SKIP` throws `E2EE_TOO_MANY_SKIPPED`). This is the Signal spec's
+    SKIP cap.
+  - **MAX_SKIPPED_CACHE = 2000** globally across ALL chains — total
+    retained skipped-key state is capped; the cache evicts FIFO
+    (oldest-insert first) once full. Signal bounds skipped key material
+    globally, not just per-chain: without this second bound an attacker can
+    force unbounded retained key state via many sparse headers.
 - Replay: an accepted `(dh, n)` is consumed; the skipped-key cache rejects
   duplicates; message keys are single-use.
 
@@ -114,9 +150,37 @@ Signal Double Ratchet spec, per session (one session per pair of devices):
   ChaCha20-Poly1305 (IETF). **Nonce** = first 12 bytes of
   HMAC-SHA256(`mk`, `"AZAMAN-DR-v1-nonce"`). Because `mk` is single-use
   (chain advance), nonce reuse is impossible by construction.
-- **Associated data (AD)** authenticated by the AEAD:
-  `"azaman-e2ee-v1|" + b64(senderIK_pub) + "|" + b64(recipientIK_pub)"`.
-  This binds every ciphertext to both conversation identities.
+- **Canonical header encoding** (byte-identical in every implementation —
+  no JSON, no whitespace ambiguity; UTF-8 ASCII, `|`-delimited):
+  `"azaman-dr-v1|" + header.dh + "|" + header.pn + "|" + header.n"`
+  where `dh` is the b64 ratchet public key string exactly as it appears in
+  the envelope, and `pn`/`n` are plain decimal integers. A header is valid
+  only if `dh` is a string and `pn`/`n` are integers — anything else throws
+  `E2EE_INVALID_HEADER` before any crypto runs.
+- **Associated data (AD)** authenticated by the AEAD. Following the Signal
+  spec (AD' = AD || header), the AEAD associated data is the exact
+  byte concatenation of two UTF-8 strings:
+
+  1. Context binding:
+     `"azaman-e2ee-v1|" + conversationId + "|" + senderDeviceId + "|"
+      + senderIdentityKey + "|" + recipientIdentityKey"`
+     where `conversationId` and `senderDeviceId` are the plain strings from
+     the message transport (§8), and `senderIdentityKey` /
+     `recipientIdentityKey` are the b64 X25519 identity public keys of the
+     sender and recipient as stored in the key directory.
+  2. Canonical header encoding (above), including its own
+     `"azaman-dr-v1|"` prefix.
+
+  So the full AD is:
+  `"azaman-e2ee-v1|" + conversationId + "|" + senderDeviceId + "|"
+   + senderIdentityKey + "|" + recipientIdentityKey
+   + "azaman-dr-v1|" + dh + "|" + pn + "|" + n`
+
+  This binds every ciphertext to the conversation, the sender's DEVICE and
+  identity, the recipient's identity, AND every header byte (`dh`, `pn`,
+  `n`) — a valid ciphertext cannot be transplanted to another conversation,
+  another sender device, or another header and remain authentic (proven by
+  cross-conversation / bad-context tests).
 
 Wire/persistence envelope (JSON, stored verbatim in `Message.e2eeEnvelope`):
 
@@ -137,10 +201,18 @@ Wire/persistence envelope (JSON, stored verbatim in `Message.e2eeEnvelope`):
 ## 8. Message transport (conversation API)
 
 - `POST /:conversationId/messages` with `body.e2ee` (envelope): the server
-  validates shape/size only, stores `content = ''`, `e2eeEnvelope = envelope`,
-  and returns/emits the envelope. If `text` and `e2ee` are both present the
-  request is rejected (no silent plaintext leak). Plaintext `text` remains
-  available for non-E2EE clients (explicit legacy mode).
+  validates shape/ownership/size only, stores `content = ''`,
+  `e2eeEnvelope = envelope`, and returns/emits the envelope. Specifically:
+  - `E2EE_NOT_PAIRWISE` (400): E2EE is only accepted for `PERSONAL`
+    conversations (§5 uses the same pairwise contract at bundle claim).
+  - `E2EE_SENDER_IDENTITY_MISMATCH` (403): `envelope.deviceId` and
+    `envelope.ik` must match one of the caller's OWN active registered
+    devices — the API caller must own the cryptographic sender identity.
+  - The serialized envelope must be ≤ **131072 bytes** (`E2EE envelope too
+    large.`, 400).
+  - If `text` and `e2ee` are both present the request is rejected (no
+    silent plaintext leak). Plaintext `text` remains available for non-E2EE
+    clients (explicit legacy mode).
 - `GET /:conversationId/messages` returns `e2eeEnvelope` and `isE2EE: true`
   for envelope messages (`text` is empty). The server cannot decrypt them.
 

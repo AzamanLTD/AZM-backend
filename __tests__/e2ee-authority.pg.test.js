@@ -68,7 +68,7 @@ run('E2EE server-blind authority (real PostgreSQL)', () => {
         await db.conversation.deleteMany({});
         await db.e2eeOneTimePreKey.deleteMany({});
         await db.e2eeDevice.deleteMany({});
-        await db.user.deleteMany({ where: { username: { in: ['e2ee-alice', 'e2ee-bob'] } } });
+        await db.user.deleteMany({ where: { username: { in: ['e2ee-alice', 'e2ee-bob', 'e2ee-charlie', 'e2ee-dora'] } } });
         alice = await db.user.create({ data: { username: 'e2ee-alice', email: 'e2ee-alice@t.test', password: 'x' } });
         bob = await db.user.create({ data: { username: 'e2ee-bob', email: 'e2ee-bob@t.test', password: 'x' } });
         const conv = await db.conversation.create({
@@ -458,6 +458,86 @@ run('E2EE server-blind authority (real PostgreSQL)', () => {
             const rejected = results.find((r) => r.status === 'rejected');
             expect(['E2EE_PREKEY_CONFLICT', 'P2002']).toContain(rejected.reason.code || rejected.reason.message);
         }
+    });
+
+    test('r40.3. an UNRELATED authenticated caller cannot claim a bundle — OPKs are never consumed by strangers', async () => {
+        const svc = new E2EEKeyService(db);
+        // alice registers 8 one-time prekeys
+        const payload = await register(alice.id, aliceKeys, { otpkCount: 8, otpkOffset: 0, materialOffset: 800 });
+        await svc.registerDevice({ userId: alice.id, ...payload });
+        // charlie is authenticated on the platform but shares NO conversation with alice
+        const charlie = await db.user.create({ data: { username: 'e2ee-charlie', email: 'e2ee-charlie@t.test', password: 'x' } });
+
+        // 30 hostile probes through the REAL route: every one is refused
+        // (403 relationship gate, then 429 once the per-pair limiter trips),
+        // and NOT A SINGLE one-time prekey is ever consumed.
+        const responses = [];
+        for (let i = 0; i < 30; i++) {
+            responses.push(await request(app).get(`/api/e2ee/keys/${alice.id}`).set('x-test-user', String(charlie.id)));
+        }
+        const allRefused = responses.every((r) => r.status === 403 || r.status === 429);
+        expect(allRefused).toBe(true);
+        const refused403 = responses.filter((r) => r.status === 403);
+        expect(refused403.length).toBeGreaterThan(0);
+        expect(refused403[0].body.code).toBe('E2EE_NO_RELATIONSHIP');
+        // ...and the direct service call is refused identically
+        await expect(svc.fetchBundle(alice.id, { claimantId: charlie.id })).rejects.toMatchObject({ code: 'E2EE_NO_RELATIONSHIP' });
+        // the victim's OPK pool is COMPLETE after unlimited hostile probing
+        expect(await db.e2eeOneTimePreKey.count({ where: { userId: alice.id, isUsed: false } })).toBe(8);
+    });
+
+    test('r40.3. self-fetch is refused — a bundle is for a conversation peer', async () => {
+        const svc = new E2EEKeyService(db);
+        const payload = await register(alice.id, aliceKeys, { otpkCount: 3, otpkOffset: 0, materialOffset: 810 });
+        await svc.registerDevice({ userId: alice.id, ...payload });
+        const r = await request(app).get(`/api/e2ee/keys/${alice.id}`).set('x-test-user', String(alice.id));
+        expect(r.status).toBe(403);
+        expect(r.body.code).toBe('E2EE_NO_RELATIONSHIP');
+        expect(await db.e2eeOneTimePreKey.count({ where: { userId: alice.id, isUsed: false } })).toBe(3);
+    });
+
+    test('r40.3. a conversation peer claims legitimately: bundle served, exactly ONE OPK consumed, claimedBy recorded', async () => {
+        const svc = new E2EEKeyService(db);
+        const payload = await register(alice.id, aliceKeys, { otpkCount: 6, otpkOffset: 0, materialOffset: 820 });
+        await svc.registerDevice({ userId: alice.id, ...payload });
+
+        const r = await request(app).get(`/api/e2ee/keys/${alice.id}`).set('x-test-user', String(bob.id));
+        expect(r.status).toBe(200);
+        expect(r.body.data.deviceId).toBe(payload.deviceId);
+        expect(r.body.data.oneTimePreKey).toBeTruthy();
+        expect(r.body.data.oneTimePreKey.publicKey).toBeTruthy();
+        // exactly ONE key consumed, and the claim is attributed to bob
+        expect(await db.e2eeOneTimePreKey.count({ where: { userId: alice.id, isUsed: false } })).toBe(5);
+        const claimedRow = await db.e2eeOneTimePreKey.findFirst({ where: { userId: alice.id, isUsed: true } });
+        expect(claimedRow.claimedBy).toBe(bob.id);
+        expect(claimedRow.usedAt).toBeTruthy();
+    });
+
+    test('r40.3. an ABUSIVE peer is bounded: the per-pair limiter caps OPK drain, the pool survives', async () => {
+        const svc = new E2EEKeyService(db);
+        const payload = await register(alice.id, aliceKeys, { otpkCount: 20, otpkOffset: 0, materialOffset: 830 });
+        await svc.registerDevice({ userId: alice.id, ...payload });
+
+        // bob shares a conversation with alice — every claim below passes the
+        // relationship gate. He hammers the endpoint to drain her pool.
+        const statuses = [];
+        for (let i = 0; i < 15; i++) {
+            const r = await request(app).get(`/api/e2ee/keys/${alice.id}`).set('x-test-user', String(bob.id));
+            statuses.push(r.status);
+        }
+        // first 10 claims are served (limiter max), then 429
+        expect(statuses.slice(0, 10).every((st) => st === 200)).toBe(true);
+        expect(statuses.slice(10).every((st) => st === 429)).toBe(true);
+        // the drain is BOUNDED: exactly 10 keys consumed, 10 remain — the
+        // victim can still establish sessions and replenish
+        expect(await db.e2eeOneTimePreKey.count({ where: { userId: alice.id, isUsed: false } })).toBe(10);
+        expect(await db.e2eeOneTimePreKey.count({ where: { userId: alice.id, claimedBy: bob.id } })).toBe(10);
+        // a DIFFERENT peer is unaffected by bob's abuse (per-PAIR limiting)
+        const dora = await db.user.create({ data: { username: 'e2ee-dora', email: 'e2ee-dora@t.test', password: 'x' } });
+        await db.conversation.create({ data: { type: 'PERSONAL', participants: { connect: [{ id: dora.id }, { id: alice.id }] } } });
+        const r = await request(app).get(`/api/e2ee/keys/${alice.id}`).set('x-test-user', String(dora.id));
+        expect(r.status).toBe(200);
+        expect(r.body.data.oneTimePreKey).toBeTruthy();
     });
 
     test('P0-C. concurrent device registrations converge to EXACTLY ONE active device', async () => {

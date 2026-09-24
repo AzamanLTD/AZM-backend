@@ -157,7 +157,42 @@ class E2EEKeyService {
     // Fetch a user's prekey bundle. Atomically claims one unused one-time
     // prekey: a single statement, row-lock + SKIP LOCKED — concurrent
     // fetches receive DISTINCT keys (proven by a PostgreSQL concurrency test).
-    async fetchBundle(userId) {
+    // r40.3 (audit P1 — OPK exhaustion): a bundle fetch CONSUMES one of the
+    // target's one-time prekeys, so it is not a free public-key read: it is
+    // a resource claim against the target's session-freshness pool. An
+    // arbitrary authenticated caller therefore must not be able to drain any
+    // user's OPKs. Authorization: the claimant must share an existing
+    // PERSONAL conversation with the target — the same pairwise contract
+    // the message path already enforces (E2EE_NOT_PAIRWISE): an E2EE session
+    // is only ever established inside an existing personal conversation, so
+    // a bundle for a non-conversation peer is by definition unusable. This
+    // is a DELIBERATE consumption gate, not a removal of OPKs from the
+    // protocol; unauthenticated fetches were already impossible (protect).
+    // The route additionally rate-limits claims per (claimant, target) —
+    // see e2eeBundleLimiter in middleware/rateLimitMiddleware.js.
+    async fetchBundle(userId, { claimantId } = {}) {
+        if (claimantId !== undefined) {
+            if (claimantId === userId) {
+                const self = new Error('E2EE bundles are fetched by a conversation peer, never by the key owner.');
+                self.statusCode = 403; self.code = 'E2EE_NO_RELATIONSHIP';
+                throw self;
+            }
+            const shared = await this.prisma.conversation.findFirst({
+                where: {
+                    type: 'PERSONAL',
+                    AND: [
+                        { participants: { some: { id: claimantId } } },
+                        { participants: { some: { id: userId } } },
+                    ],
+                },
+            });
+            if (!shared) {
+                const err = new Error('No personal conversation with this user — E2EE sessions can only be established with an existing conversation peer.');
+                err.statusCode = 403; err.code = 'E2EE_NO_RELATIONSHIP';
+                throw err;
+            }
+        }
+
         const device = await this.prisma.e2eeDevice.findFirst({
             where: { userId, isActive: true },
             orderBy: { updatedAt: 'desc' },
@@ -168,8 +203,9 @@ class E2EEKeyService {
         // (deviceId binding). A user's bundle can never contain another
         // device's prekey — the private half of the claimed key is guaranteed
         // to live on the exact device whose bundle is returned.
+        // r40.3: claimedBy records WHO consumed the key (abuse forensics).
         const claimed = await this.prisma.$queryRaw`
-            UPDATE "E2EEOneTimePreKey" SET "isUsed" = true, "usedAt" = now()
+            UPDATE "E2EEOneTimePreKey" SET "isUsed" = true, "usedAt" = now(), "claimedBy" = ${claimantId ?? null}
             WHERE "id" = (
                 SELECT "id" FROM "E2EEOneTimePreKey"
                 WHERE "userId" = ${userId} AND "deviceId" = ${device.deviceId} AND "isUsed" = false

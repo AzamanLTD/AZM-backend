@@ -89,6 +89,8 @@ const STATEMENTS = [
     // overlay (table exists without deviceId). Fresh installs create it in
     // the CREATE TABLE above; this is a no-op there.
     `ALTER TABLE "E2EEOneTimePreKey" ADD COLUMN IF NOT EXISTS "deviceId" VARCHAR(128) NOT NULL DEFAULT ''`,
+    // r40.3 (audit P1): OPK claim audit trail — who consumed each key.
+    `ALTER TABLE "E2EEOneTimePreKey" ADD COLUMN IF NOT EXISTS "claimedBy" INTEGER`,
 
     // r40.2 (audit finding 3): keyId uniqueness is DEVICE-scoped —
     // (userId, deviceId, keyId). A fresh device starts its own key-id
@@ -158,6 +160,8 @@ async function install(client) {
             (SELECT COUNT(*) FROM pg_indexes
              WHERE indexname = 'E2EEOneTimePreKey_userId_keyId_key') AS legacy_user_scoped_uniq,
             (SELECT COUNT(*) FROM information_schema.columns
+             WHERE table_name = 'E2EEOneTimePreKey' AND column_name = 'claimedBy') AS otp_claimed_by,
+            (SELECT COUNT(*) FROM information_schema.columns
              WHERE column_name IN ('privateKey','activeRootKey','activeChainKey','identityPrivateKey',
                                    'signedPreKeyPrivateKey','sendingChainKey','receivingChainKey')) AS private_columns,
             (SELECT COUNT(*) FROM information_schema.columns
@@ -170,10 +174,11 @@ async function install(client) {
     if (Number(c.one_active_idx) !== 1) problems.push('one-active-device index missing');
     if (Number(c.otp_device_scoped_uniq) !== 1) problems.push('device-scoped OTP keyId uniqueness index missing (r40.2)');
     if (Number(c.legacy_user_scoped_uniq) !== 0) problems.push('legacy user-scoped OTP keyId unique index still present (r40.2)');
+    if (Number(c.otp_claimed_by) !== 1) problems.push('OTP claimedBy audit column missing (r40.3)');
     if (Number(c.private_columns) !== 0) problems.push('private-key columns remain in schema');
     if (Number(c.envelope_col) !== 1) problems.push('Message.e2eeEnvelope missing');
     if (problems.length) throw new Error('E2EE overlay verification FAILED: ' + problems.join('; '));
-    console.log(`E2EE server-blind overlay installed: ${applied} statements applied, all 8 post-install checks passed.`);
+    console.log(`E2EE server-blind overlay installed: ${applied} statements applied, all 9 post-install checks passed.`);
 }
 
 if (require.main === module) {

@@ -209,6 +209,22 @@ const generalLimiter = _failOpen(rateLimit(_opts({
     message: 'Rate limit exceeded. Please try again shortly.',
 })));
 
+// ── E2EE BUNDLE CLAIM: 10 claims per 15 min per (claimant, target) pair ──────
+// r40.3 (audit P1 — OPK exhaustion): every successful GET /api/e2ee/keys/:userId
+// consumes one of the target's one-time prekeys. The relationship gate in
+// keyService.fetchBundle blocks strangers entirely; this limiter bounds a
+// MALICIOUS PEER — a user who does share a personal conversation with the
+// victim cannot hammer the endpoint to drain their OPK pool. Keyed per pair
+// so one abusive relationship never limits a claimant's sessions with OTHER
+// peers. Fail-open tier: rate limiting is protection, not a critical path.
+const e2eeBundleLimiter = _failOpen(rateLimit(_opts({
+    windowMs: 15 * 60_000,
+    max: 10,
+    prefix: 'rl:e2ee-bundle:',
+    keyGenerator: (req) => `pair_${req.user?.id ?? 'anon'}_${req.params?.userId ?? 'x'}`,
+    message: 'Too many key bundle requests for this user. Please wait before retrying.',
+})));
+
 // ── WEBHOOK: 30 requests per minute per IP (payment provider callbacks) ───────
 const webhookLimiter = _failOpen(rateLimit(_opts({
     windowMs: 60_000,
@@ -236,4 +252,5 @@ module.exports = {
     generalLimiter,
     webhookLimiter,
     strictLimiter,
+    e2eeBundleLimiter,
 };

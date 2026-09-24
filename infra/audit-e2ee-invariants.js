@@ -115,6 +115,16 @@ if (require.main === module) {
         fail("routes/conversationRoutes.js must reject E2EE envelopes for non-PERSONAL conversations with code E2EE_NOT_PAIRWISE — the r40 protocol has no group/group-key mechanism (P1-E)");
     }
 
+    // 5. r40.3 (audit P1 — OPK exhaustion): bundle fetch CONSUMES a target
+    //    resource, so it must stay authorization-gated and rate-limited. A
+    //    refactor that drops either re-opens arbitrary OPK drainage.
+    if (!/e2eeBundleLimiter/.test(routes)) {
+        fail('routes/e2eeRoutes.js lost e2eeBundleLimiter on the bundle route — OPK claims must stay rate-limited per (claimant, target) pair (r40.3)');
+    }
+    if (!/E2EE_NO_RELATIONSHIP/.test(read('services/e2ee/keyService.js'))) {
+        fail('services/e2ee/keyService.js lost the E2EE_NO_RELATIONSHIP claim gate — an authenticated stranger must not consume an arbitrary user\'s one-time prekeys (r40.3)');
+    }
+
     if (failures.length) {
         console.error('E2EE invariant audit FAILED:');
         for (const f of failures) console.error('  ✕ ' + f);

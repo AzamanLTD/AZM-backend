@@ -23,6 +23,7 @@
 const express = require('express');
 const router = express.Router();
 const { protect } = require('../middleware/authMiddleware');
+const { e2eeBundleLimiter } = require('../middleware/rateLimitMiddleware');
 const { E2EEKeyService } = require('../services/e2ee/keyService');
 const logger = require('../src/config/logger');
 
@@ -67,10 +68,22 @@ router.post('/devices', wrap(async (req, res) => {
 }));
 
 // Prekey bundle for starting a session with a user.
-router.get('/keys/:userId', wrap(async (req, res) => {
+// r40.3 (audit P1 — OPK exhaustion): a bundle fetch CONSUMES one of the
+// target's one-time prekeys, so it is a resource claim, not a free read.
+// Two deliberate protections, layered:
+//   1. e2eeBundleLimiter — ≤10 claims per 15 min per (claimant, target)
+//      pair: even a conversation peer cannot hammer-drain a victim's pool.
+//   2. fetchBundle(userId, { claimantId }) — the claimant must share an
+//      existing PERSONAL conversation with the target (the same pairwise
+//      contract the message path enforces with E2EE_NOT_PAIRWISE). A
+//      stranger authenticated anywhere on the platform gets 403 and
+//      consumes NOTHING. The OPK pool survives unlimited hostile probing.
+// The fingerprint routes remain open: safety numbers are designed to be
+// shareable and consume no resources.
+router.get('/keys/:userId', e2eeBundleLimiter, wrap(async (req, res) => {
     const targetUserId = parseInt(req.params.userId, 10);
     if (!Number.isInteger(targetUserId)) return res.status(400).json({ success: false, message: 'Invalid user id.' });
-    const bundle = await service(req).fetchBundle(targetUserId);
+    const bundle = await service(req).fetchBundle(targetUserId, { claimantId: req.user.id });
     if (!bundle) return res.status(404).json({ success: false, message: 'No active E2EE device for this user.' });
     res.json({ success: true, data: bundle });
 }));
