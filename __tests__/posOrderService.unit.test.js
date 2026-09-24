@@ -51,27 +51,31 @@ describe('PosOrderService atomic settlement', () => {
         expect(tx.businessProduct.findFirst).toHaveBeenCalledWith(expect.objectContaining({
             where: { id: 'prod-1', businessProfileId: 'biz-1', isActive: true, isAvailable: true, locationId: null },
         }));
-        expect(tx.user.updateMany).toHaveBeenCalledWith({
-            where: { id: 7, azmBalance: { gte: 41 } },
-            data: { azmBalance: { decrement: 41 } },
-        });
-        expect(tx.azmSpendLog.create).toHaveBeenCalledWith(expect.objectContaining({
-            data: expect.objectContaining({ userId: 7, amount: 41, balanceAfter: 59 }),
-        }));
-        expect(tx.businessOrderItem.createMany).toHaveBeenCalledWith({
-            data: [{ orderId: 'order-1', productId: 'prod-1', name: 'Meal', unitPrice: 20, quantity: 2, lineTotal: 40 }],
-        });
+        // r39/P1 exact-money contract: money values flow as exact Decimals
+        // (compared via their exact string forms), never float mirrors.
+        const debitCall = tx.user.updateMany.mock.calls.find((c) => c[0]?.where?.azmBalance);
+        expect(debitCall[0].where.id).toBe(7);
+        expect(String(debitCall[0].where.azmBalance.gte)).toBe('41');
+        expect(String(debitCall[0].data.azmBalance.decrement)).toBe('41');
+        const spendArgs = tx.azmSpendLog.create.mock.calls[0][0];
+        expect(spendArgs.data.userId).toBe(7);
+        expect(String(spendArgs.data.amount)).toBe('41');
+        expect(String(spendArgs.data.balanceAfter)).toBe('59');
+        const itemArgs = tx.businessOrderItem.createMany.mock.calls[0][0];
+        expect(itemArgs.data.length).toBe(1);
+        const item = itemArgs.data[0];
+        expect(item.orderId).toBe('order-1');
+        expect(item.productId).toBe('prod-1');
+        expect(item.name).toBe('Meal');
+        expect(item.quantity).toBe(2);
+        expect(String(item.unitPrice)).toBe('20');
+        expect(String(item.lineTotal)).toBe('40');
         expect(tx.businessOrder.create).toHaveBeenCalled();
-        expect(tx.businessLedgerEntry.create).toHaveBeenCalledWith(expect.objectContaining({
-            data: expect.objectContaining({
-                amount: 41,
-                metadata: expect.objectContaining({
-                    subtotal: 40,
-                    tax: 1,
-                    taxLines: [{ name: 'POS Tax', type: 'PERCENTAGE', value: 2.5, computedAmount: 1 }],
-                }),
-            }),
-        }));
+        const ledgerArgs = tx.businessLedgerEntry.create.mock.calls[0][0];
+        expect(String(ledgerArgs.data.amount)).toBe('41');
+        expect(ledgerArgs.data.metadata.subtotal).toBe('40.00000000');
+        expect(ledgerArgs.data.metadata.tax).toBe('1.00000000');
+        expect(ledgerArgs.data.metadata.taxLines).toEqual([{ name: 'POS Tax', type: 'PERCENTAGE', value: '2.5', computedAmount: '1.00000000' }]);
     });
 
     test('uses transaction-time catalog state for availability and pricing', async () => {
@@ -117,9 +121,10 @@ describe('PosOrderService atomic settlement', () => {
             orderBy: { createdAt: 'asc' },
             select: { name: true, type: true, value: true },
         });
-        expect(tx.businessOrder.create).toHaveBeenCalledWith(expect.objectContaining({
-            data: expect.objectContaining({ paymentMethod: 'CASH', cashReceived: 25, cashChange: 4.5 }),
-        }));
+        const orderArgs = tx.businessOrder.create.mock.calls[0][0];
+        expect(orderArgs.data.paymentMethod).toBe('CASH');
+        expect(String(orderArgs.data.cashReceived)).toBe('25');
+        expect(String(orderArgs.data.cashChange)).toBe('4.5');
     });
 
     test('decrements tracked retail stock in the same transaction as the sale', async () => {

@@ -1,5 +1,6 @@
 jest.mock('../utils/securityCheck', () => ({ runDoubleCheck: jest.fn().mockResolvedValue(undefined) }));
-jest.mock('../services/ledgerService', () => ({ post: jest.fn().mockResolvedValue({ id: 'j1', transaction: { id: 'lt1' } }), accountBalance: jest.fn() }));
+jest.mock('../services/ledgerService', () => ({ post: jest.fn().mockResolvedValue({ id: 'j1', transaction: { id: 'lt1' } }), accountBalance: jest.fn(), // r39/P1: real exact-decimal parser surface kept in the mock.
+toExactDecimal: (v) => new (require('@prisma/client').Prisma).Decimal(String(v)) }));
 jest.mock('../services/restrictedObligationService', () => ({
     createForPendingWithdrawal: jest.fn().mockResolvedValue({ id: 'o1' }),
     releaseOnSettlement: jest.fn().mockResolvedValue(undefined),
@@ -70,10 +71,12 @@ describe('processFiatWithdrawal customer balance concurrency guard', () => {
 
     await processFiatWithdrawal(prisma, 7, 20, { reference: 'BAL-1' });
 
-    expect(tx.user.updateMany).toHaveBeenCalledWith({
-      where: { id: 7, availableBalance: { gte: 20.4 } },
-      data: { availableBalance: { decrement: 20.4 } },
-    });
+    // r39: the service decrements with an EXACT Decimal (serialized "20.4"),
+    // never a binary float.
+    const D = require('@prisma/client').Prisma.Decimal;
+    const debit = tx.user.updateMany.mock.calls[0][0];
+    expect(debit.where).toEqual({ id: 7, availableBalance: { gte: new D('20.4') } });
+    expect(debit.data.availableBalance.decrement.toFixed(8)).toBe('20.40000000');
     expect(tx.transactionHistory.create).toHaveBeenCalled();
   });
 
@@ -82,18 +85,18 @@ describe('processFiatWithdrawal customer balance concurrency guard', () => {
 
     await processFiatWithdrawal(prisma, 7, 20, { reference: 'RATE-1' });
 
-    expect(tx.transactionHistory.create).toHaveBeenCalledWith({
-      data: expect.objectContaining({
-        amountUsdc: 20,
-        metadata: expect.objectContaining({
-          retailRate: 13.25,
-          payoutGhs: 265,
-          rateSource: 'KOTANI_PAY',
-          ratePair: 'USDC/GHS',
-          settlementCurrency: 'USDC',
-          displayCurrency: 'GHS',
-        }),
-      }),
+    // r39: the canonical row carries EXACT Decimals for the money columns
+    // (serialized as exact decimal strings, never binary floats).
+    const create = tx.transactionHistory.create.mock.calls[0][0];
+    expect(create.data.amountUsdc.toFixed(8)).toBe('20.00000000');
+    expect(create.data.feeUsdc.toFixed(8)).toBe('0.40000000');
+    expect(create.data.metadata).toMatchObject({
+      retailRate: 13.25,
+      payoutGhs: '265.00',
+      rateSource: 'KOTANI_PAY',
+      ratePair: 'USDC/GHS',
+      settlementCurrency: 'USDC',
+      displayCurrency: 'GHS',
     });
   });
 
@@ -114,10 +117,10 @@ describe('processFiatWithdrawal customer balance concurrency guard', () => {
         metadata: expect.objectContaining({
           economicsDeferred: true,
           referrerId: 99,
-          referrerShareUsdc: 0.2,
-          systemFeeShareUsdc: 0.2,
+          referrerShareUsdc: '0.20000000', // r39: exact strings in metadata
+          systemFeeShareUsdc: '0.20000000',
           retailRate: 13.25,
-          payoutGhs: 265,
+          payoutGhs: '265.00',
         }),
       }),
     });

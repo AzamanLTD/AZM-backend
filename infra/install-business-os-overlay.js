@@ -218,9 +218,17 @@ STATEMENTS.push('ALTER TABLE "BusinessOrder" ADD COLUMN IF NOT EXISTS "paymentMe
 STATEMENTS.push('ALTER TABLE "BusinessOrder" ADD COLUMN IF NOT EXISTS "idempotencyKey" TEXT;');
 STATEMENTS.push('ALTER TABLE "BusinessOrder" ADD COLUMN IF NOT EXISTS "cashReceived" DECIMAL(20,8);');
 STATEMENTS.push('ALTER TABLE "BusinessOrder" ADD COLUMN IF NOT EXISTS "cashChange" DECIMAL(20,8);');
+// r36/P1: durable per-order inventory-deduction claim marker.
+STATEMENTS.push('ALTER TABLE "BusinessOrder" ADD COLUMN IF NOT EXISTS "inventoryDeductedAt" TIMESTAMP(3);');
 STATEMENTS.push('CREATE UNIQUE INDEX IF NOT EXISTS "BusinessOrder_idempotencyKey_key" ON "BusinessOrder"("idempotencyKey") WHERE "idempotencyKey" IS NOT NULL;');
 
 // DineInTab payment method + idempotency
+// r36/P1: ONE ACTIVE TAB PER TABLE (durable invariant). A non-CLOSED tab
+// pins the table; concurrent status writers converge instead of creating a
+// second active tab. If legacy duplicate active tabs exist in production, this
+// creation is reported as an error line (deploy continues; the invariant is
+// then enforced at the transaction boundary instead).
+STATEMENTS.push('CREATE UNIQUE INDEX IF NOT EXISTS "DineInTab_active_tab_per_table_key" ON "DineInTab"("tableId") WHERE "status" <> $q$CLOSED$q$ AND "tableId" IS NOT NULL;');
 STATEMENTS.push('ALTER TABLE "DineInTab" ADD COLUMN IF NOT EXISTS "paymentMethod" VARCHAR(20);');
 STATEMENTS.push('ALTER TABLE "DineInTab" ADD COLUMN IF NOT EXISTS "idempotencyKey" TEXT;');
 STATEMENTS.push('ALTER TABLE "DineInTab" ADD COLUMN IF NOT EXISTS "cashReceived" DECIMAL(20,8);');
@@ -251,6 +259,13 @@ STATEMENTS.push(`CREATE TABLE IF NOT EXISTS "BusinessConversation" (
 STATEMENTS.push('CREATE INDEX IF NOT EXISTS "BusinessConversation_businessProfileId_idx" ON "BusinessConversation"("businessProfileId");');
 STATEMENTS.push('CREATE INDEX IF NOT EXISTS "BusinessConversation_participantAId_idx" ON "BusinessConversation"("participantAId");');
 STATEMENTS.push('CREATE INDEX IF NOT EXISTS "BusinessConversation_participantBId_idx" ON "BusinessConversation"("participantBId");');
+// r36/P0: thread-kind discriminator. Legacy rows keep NULL (unconstrained);
+// the canonical customer-support rail enforces ONE thread per
+// (business, customer) through a partial unique index — participantB is the
+// durable customer slot for CUSTOMER_SUPPORT threads (participantA is the
+// staff identity that created the thread).
+STATEMENTS.push('ALTER TABLE "BusinessConversation" ADD COLUMN IF NOT EXISTS "channel" VARCHAR(40);');
+STATEMENTS.push('CREATE UNIQUE INDEX IF NOT EXISTS "BusinessConversation_customer_support_key" ON "BusinessConversation"("businessProfileId", "participantBId") WHERE "channel" = $q$CUSTOMER_SUPPORT$q$;');
 
 // =============================================================================
 //  Execute all statements sequentially (autocommit — can't use $transaction
@@ -294,6 +309,35 @@ STATEMENTS.push(`DO $$ BEGIN
     END IF;
   END $$;`);
 
+
+// ── r36: Honest payout request record ────────────────────────────────────────
+STATEMENTS.push(`CREATE TABLE IF NOT EXISTS "BusinessPayoutRequest" (
+    "id" VARCHAR(36) NOT NULL,
+    "businessProfileId" VARCHAR(36) NOT NULL REFERENCES "BusinessProfile"("id") ON DELETE CASCADE,
+    "destinationId" VARCHAR(36) NOT NULL,
+    "amount" DECIMAL(20,8) NOT NULL,
+    "status" VARCHAR(20) NOT NULL DEFAULT 'REQUESTED',
+    "requestLogId" VARCHAR(36),
+    "requestedById" INTEGER NOT NULL,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT "BusinessPayoutRequest_pkey" PRIMARY KEY ("id")
+);`);
+STATEMENTS.push('CREATE INDEX IF NOT EXISTS "BusinessPayoutRequest_businessProfileId_idx" ON "BusinessPayoutRequest"("businessProfileId");');
+STATEMENTS.push('CREATE INDEX IF NOT EXISTS "BusinessPayoutRequest_status_idx" ON "BusinessPayoutRequest"("status");');
+
+// ── r36: Durable document-number sequence (business-local doc numbers) ──────
+STATEMENTS.push(`CREATE TABLE IF NOT EXISTS "DocumentNumberSequence" (
+    "id" VARCHAR(36) NOT NULL,
+    "businessProfileId" VARCHAR(36) NOT NULL,
+    "docType" VARCHAR(40) NOT NULL,
+    "lastNumber" INTEGER NOT NULL DEFAULT 0,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT "DocumentNumberSequence_pkey" PRIMARY KEY ("id")
+);`);
+STATEMENTS.push('CREATE UNIQUE INDEX IF NOT EXISTS "DocumentNumberSequence_businessProfileId_docType_key" ON "DocumentNumberSequence"("businessProfileId", "docType");');
+
 // ── Phase 3 Retail: PurchaseOrder ────────────────────────────────────────────
 STATEMENTS.push(`CREATE TABLE IF NOT EXISTS "PurchaseOrder" (
     "id" VARCHAR(36) NOT NULL,
@@ -310,7 +354,11 @@ STATEMENTS.push(`CREATE TABLE IF NOT EXISTS "PurchaseOrder" (
     "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT "PurchaseOrder_pkey" PRIMARY KEY ("id")
 );`);
-STATEMENTS.push('CREATE UNIQUE INDEX IF NOT EXISTS "PurchaseOrder_poNumber_key" ON "PurchaseOrder"("poNumber");');
+// r36/P1: poNumber is a business-local identifier — replace the global
+// unique index with a business-scoped one. The drop is idempotent; on a fresh
+// CI database db push has already created the composite index.
+STATEMENTS.push('DROP INDEX IF EXISTS "PurchaseOrder_poNumber_key";');
+STATEMENTS.push('CREATE UNIQUE INDEX IF NOT EXISTS "PurchaseOrder_businessProfileId_poNumber_key" ON "PurchaseOrder"("businessProfileId", "poNumber");');
 STATEMENTS.push('CREATE INDEX IF NOT EXISTS "PurchaseOrder_businessProfileId_idx" ON "PurchaseOrder"("businessProfileId");');
 STATEMENTS.push('CREATE INDEX IF NOT EXISTS "PurchaseOrder_supplierId_idx" ON "PurchaseOrder"("supplierId");');
 STATEMENTS.push('CREATE INDEX IF NOT EXISTS "PurchaseOrder_status_idx" ON "PurchaseOrder"("status");');
@@ -359,7 +407,9 @@ STATEMENTS.push(`CREATE TABLE IF NOT EXISTS "StockCount" (
     "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT "StockCount_pkey" PRIMARY KEY ("id")
 );`);
-STATEMENTS.push('CREATE UNIQUE INDEX IF NOT EXISTS "StockCount_countNumber_key" ON "StockCount"("countNumber");');
+// r36/P1: countNumber is a business-local identifier — business-scoped uniqueness.
+STATEMENTS.push('DROP INDEX IF EXISTS "StockCount_countNumber_key";');
+STATEMENTS.push('CREATE UNIQUE INDEX IF NOT EXISTS "StockCount_businessProfileId_countNumber_key" ON "StockCount"("businessProfileId", "countNumber");');
 STATEMENTS.push('CREATE INDEX IF NOT EXISTS "StockCount_businessProfileId_idx" ON "StockCount"("businessProfileId");');
 STATEMENTS.push('CREATE INDEX IF NOT EXISTS "StockCount_status_idx" ON "StockCount"("status");');
 STATEMENTS.push(`DO $$ BEGIN
@@ -440,7 +490,13 @@ async function main() {
 
   logger.info(`[business-os-overlay] Done: ${ok} applied, ${skipped} skipped, ${errors.length} errors.`);
   if (errors.length) {
-    logger.error('[business-os-overlay] ⚠ Errors occurred — review above.');
+    // r38/P0 — a production financial schema installer must FAIL the release
+    // when unexpected DDL fails. Swallowing the error lets `npm run release`
+    // exit successfully with a missing invariant (exactly how the r37
+    // reversal uniqueness could have been silently skipped in production).
+    const e = new Error(`[business-os-overlay] ${errors.length} DDL statement(s) failed — deployment is NOT healthy.`);
+    e.details = errors;
+    throw e;
   }
 }
 
@@ -509,8 +565,15 @@ STATEMENTS.push('ALTER TABLE "BusinessProfile" ADD COLUMN IF NOT EXISTS "allowOv
 
 main()
   .catch((e) => {
-    logger.error('[business-os-overlay] Fatal:', e);
-    // Never crash the server — this is a best-effort installer.
+    logger.error('[business-os-overlay] Fatal:', e.message || e);
+    if (Array.isArray(e.details)) {
+      for (const d of e.details) logger.error(`  failed: ${d.stmt}… -> ${String(d.error).slice(0, 160)}`);
+    }
+    // r38/P0 — non-zero exit so `npm run release` (a `&&` chain) and CI
+    // both abort instead of shipping a schema that is not what the code
+    // expects. Boot-time invocation (src/boot/treasury.js) already catches
+    // the failure and logs it without blocking app boot.
+    process.exitCode = 1;
   })
   .finally(async () => {
     await prisma.$disconnect();
@@ -697,6 +760,185 @@ STATEMENTS.push('ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "isDeleted" BOOLEAN
 STATEMENTS.push('ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "failedLoginAttempts" INTEGER NOT NULL DEFAULT 0;');
 STATEMENTS.push('ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "lockedUntil" TIMESTAMP(3);');
 STATEMENTS.push('ALTER TABLE "User" ADD COLUMN IF NOT EXISTS "tokenVersion" INTEGER NOT NULL DEFAULT 0;');
+
+// ── r37/P0 — production schema authority for r35/r36 runtime tables ────────
+// CI builds its test database with `prisma db push`, but PRODUCTION is
+// maintained through these raw overlays (no _prisma_migrations baseline, no
+// db push). Two tables added by the r35/r36 waves existed only in
+// schema.prisma — green CI could not see that a real release would deploy
+// application code whose runtime tables do not exist. This section closes
+// that deployment-drift gap; the shapes match the Prisma models exactly
+// (columns, types, indexes, unique constraints, FKs).
+
+// BusinessLedgerEntry (r35 append-only business ledger). The Prisma model
+// types `type` as the LedgerEntryType enum, so the enum TYPE must exist
+// before the table.
+STATEMENTS.push(`DO $$ BEGIN
+    CREATE TYPE "LedgerEntryType" AS ENUM (
+        'INCOME', 'EXPENSE', 'PAYROLL', 'TAX', 'REFUND', 'PENALTY',
+        'AD_SPEND', 'MAINTENANCE', 'SUPPLIES', 'UTILITIES', 'RENT', 'OTHER'
+    );
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;`);
+
+STATEMENTS.push(`CREATE TABLE IF NOT EXISTS "BusinessLedgerEntry" (
+    "id" TEXT NOT NULL,
+    "businessProfileId" TEXT NOT NULL,
+    "type" "LedgerEntryType" NOT NULL,
+    "category" VARCHAR(100) NOT NULL,
+    "description" VARCHAR(500) NOT NULL,
+    "amount" DECIMAL(20,8) NOT NULL,
+    "amountGhs" DECIMAL(20,8),
+    "sourceType" VARCHAR(50),
+    "sourceId" TEXT,
+    "metadata" JSONB,
+    "reversalOfId" TEXT,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT "BusinessLedgerEntry_pkey" PRIMARY KEY ("id")
+);`);
+
+STATEMENTS.push('CREATE INDEX IF NOT EXISTS "BusinessLedgerEntry_businessProfileId_type_idx" ON "BusinessLedgerEntry"("businessProfileId", "type");');
+STATEMENTS.push('CREATE INDEX IF NOT EXISTS "BusinessLedgerEntry_businessProfileId_createdAt_idx" ON "BusinessLedgerEntry"("businessProfileId", "createdAt" DESC);');
+STATEMENTS.push('CREATE INDEX IF NOT EXISTS "BusinessLedgerEntry_businessProfileId_type_createdAt_idx" ON "BusinessLedgerEntry"("businessProfileId", "type", "createdAt" DESC);');
+STATEMENTS.push('CREATE INDEX IF NOT EXISTS "BusinessLedgerEntry_sourceType_sourceId_idx" ON "BusinessLedgerEntry"("sourceType", "sourceId");');
+// r38/P0 — ORDERING FIX: the column is added BEFORE the unique index that
+// depends on it. On a database holding a PRE-r37 BusinessLedgerEntry table
+// (e.g. from an earlier overlay run whose index creation was swallowed),
+// creating the index first fails, the failure was previously swallowed, and
+// production could run WITHOUT the DB uniqueness invariant the r37 code
+// relies on. ADD COLUMN IF NOT EXISTS is a clean no-op when the column is
+// already present (fresh installs).
+STATEMENTS.push('ALTER TABLE "BusinessLedgerEntry" ADD COLUMN IF NOT EXISTS "reversalOfId" TEXT;');
+// r37/P1: durable one-reversal-per-entry invariant (nullable unique —
+// Postgres allows multiple NULLs, so only real reversals are constrained).
+STATEMENTS.push('CREATE UNIQUE INDEX IF NOT EXISTS "BusinessLedgerEntry_reversalOfId_key" ON "BusinessLedgerEntry"("reversalOfId")');
+
+STATEMENTS.push(`DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.table_constraints WHERE constraint_name = 'BusinessLedgerEntry_businessProfileId_fkey') THEN
+      ALTER TABLE "BusinessLedgerEntry" ADD CONSTRAINT "BusinessLedgerEntry_businessProfileId_fkey" FOREIGN KEY ("businessProfileId") REFERENCES "BusinessProfile"("id") ON DELETE CASCADE;
+    END IF;
+  END $$;`);
+
+// ConversationMoneyTicket (r36 canonical money-in-chat authority). The
+// Prisma model declares NO relation fields (messageId/conversationId are
+// plain strings by design — ticket resolution is authority-checked by
+// predicate, not by FK), so this table carries no foreign keys.
+// r39/P1 — currency default contract: the money-in-chat rails are
+// USDC-denominated (normalizeAsset rejects every other asset), so the DDL
+// default must say USDC. 'GHS' was a copy-forward from an unrelated table
+// and contradicted every code path that writes a ticket.
+STATEMENTS.push(`CREATE TABLE IF NOT EXISTS "ConversationMoneyTicket" (
+    "id" TEXT NOT NULL,
+    "messageId" TEXT NOT NULL,
+    "conversationId" TEXT NOT NULL,
+    "kind" TEXT NOT NULL,
+    "amount" DECIMAL(20,8) NOT NULL,
+    "currency" TEXT NOT NULL DEFAULT 'USDC',
+    "requesterId" INTEGER NOT NULL,
+    "counterpartyId" INTEGER NOT NULL,
+    "status" TEXT NOT NULL DEFAULT 'sent',
+    "resultMessageId" TEXT,
+    "clientRequestId" TEXT,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT "ConversationMoneyTicket_pkey" PRIMARY KEY ("id")
+);`);
+
+STATEMENTS.push('CREATE UNIQUE INDEX IF NOT EXISTS "ConversationMoneyTicket_messageId_key" ON "ConversationMoneyTicket"("messageId");');
+STATEMENTS.push('CREATE UNIQUE INDEX IF NOT EXISTS "ConversationMoneyTicket_clientRequestId_key" ON "ConversationMoneyTicket"("clientRequestId");');
+STATEMENTS.push('CREATE INDEX IF NOT EXISTS "ConversationMoneyTicket_conversationId_idx" ON "ConversationMoneyTicket"("conversationId");');
+STATEMENTS.push('CREATE INDEX IF NOT EXISTS "ConversationMoneyTicket_requesterId_idx" ON "ConversationMoneyTicket"("requesterId");');
+STATEMENTS.push('CREATE INDEX IF NOT EXISTS "ConversationMoneyTicket_counterpartyId_idx" ON "ConversationMoneyTicket"("counterpartyId");');
+
+// r39/P1 — existing deployments keep the old 'GHS' default: migrate the
+// column default to the true contract. Rerunnable: setting the default is
+// idempotent.
+STATEMENTS.push(`ALTER TABLE "ConversationMoneyTicket" ALTER COLUMN "currency" SET DEFAULT 'USDC';`);
+
+// r39/P1 — DURABLE LIFECYCLE CONTRACT. A ConversationMoneyTicket is an
+// immutable financial record (resolution is authority-checked by predicate).
+// Its reference edges may no longer be soft pointers that silently orphan
+// when the referenced row is hard-deleted:
+//   • messageId      -> Message(id)          ON DELETE RESTRICT
+//   • conversationId -> Conversation(id)    ON DELETE RESTRICT
+//   • requesterId    -> User(id)             ON DELETE RESTRICT
+//   • counterpartyId -> User(id)             ON DELETE RESTRICT
+// RESTRICT means: a hard delete of a financial message (or its conversation
+// or participants) FAILS CLOSED instead of leaving an orphaned financial
+// record whose resolution can never be traced. The disappearing-message
+// sweep additionally excludes money-bearing messages by predicate (belt),
+// and the database constraints are the suspenders.
+// Deployment guard: the overlay runs on production data that predates the
+// FK. Orphaned tickets (created by the legacy soft-pointer era, e.g. a
+// message already hard-deleted by the old sweep) are moved VERBATIM into
+// "ConversationMoneyTicketOrphanArchive" — financial records are never
+// deleted — with the missing-edge reason recorded, BEFORE the constraint is
+// created. The archive is an explicit immutable financial-record model that
+// owns the orphaned relationship.
+STATEMENTS.push(`CREATE TABLE IF NOT EXISTS "ConversationMoneyTicketOrphanArchive" (
+    "id" TEXT NOT NULL,
+    "messageId" TEXT NOT NULL,
+    "conversationId" TEXT NOT NULL,
+    "kind" TEXT NOT NULL,
+    "amount" DECIMAL(20,8) NOT NULL,
+    "currency" TEXT NOT NULL,
+    "requesterId" INTEGER NOT NULL,
+    "counterpartyId" INTEGER NOT NULL,
+    "status" TEXT NOT NULL,
+    "resultMessageId" TEXT,
+    "clientRequestId" TEXT,
+    "orphanReason" TEXT NOT NULL,
+    "archivedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT "ConversationMoneyTicketOrphanArchive_pkey" PRIMARY KEY ("id")
+);`);
+STATEMENTS.push(`DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.table_constraints WHERE constraint_name = 'ConversationMoneyTicket_messageId_fkey') THEN
+        IF EXISTS (SELECT 1 FROM "ConversationMoneyTicket" t LEFT JOIN "Message" m ON m."id" = t."messageId" WHERE m."id" IS NULL) THEN
+            INSERT INTO "ConversationMoneyTicketOrphanArchive"
+                ("id", "messageId", "conversationId", "kind", "amount", "currency", "requesterId", "counterpartyId", "status", "resultMessageId", "clientRequestId", "orphanReason")
+            SELECT t."id", t."messageId", t."conversationId", t."kind", t."amount", t."currency", t."requesterId", t."counterpartyId", t."status", t."resultMessageId", t."clientRequestId", 'missing_message'
+            FROM "ConversationMoneyTicket" t LEFT JOIN "Message" m ON m."id" = t."messageId" WHERE m."id" IS NULL;
+            DELETE FROM "ConversationMoneyTicket" t WHERE NOT EXISTS (SELECT 1 FROM "Message" m WHERE m."id" = t."messageId");
+        END IF;
+        ALTER TABLE "ConversationMoneyTicket" ADD CONSTRAINT "ConversationMoneyTicket_messageId_fkey" FOREIGN KEY ("messageId") REFERENCES "Message"("id") ON DELETE RESTRICT;
+    END IF;
+END $$;`);
+STATEMENTS.push(`DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.table_constraints WHERE constraint_name = 'ConversationMoneyTicket_conversationId_fkey') THEN
+        IF EXISTS (SELECT 1 FROM "ConversationMoneyTicket" t LEFT JOIN "Conversation" c ON c."id" = t."conversationId" WHERE c."id" IS NULL) THEN
+            INSERT INTO "ConversationMoneyTicketOrphanArchive"
+                ("id", "messageId", "conversationId", "kind", "amount", "currency", "requesterId", "counterpartyId", "status", "resultMessageId", "clientRequestId", "orphanReason")
+            SELECT t."id", t."messageId", t."conversationId", t."kind", t."amount", t."currency", t."requesterId", t."counterpartyId", t."status", t."resultMessageId", t."clientRequestId", 'missing_conversation'
+            FROM "ConversationMoneyTicket" t LEFT JOIN "Conversation" c ON c."id" = t."conversationId" WHERE c."id" IS NULL;
+            DELETE FROM "ConversationMoneyTicket" t WHERE NOT EXISTS (SELECT 1 FROM "Conversation" c WHERE c."id" = t."conversationId");
+        END IF;
+        ALTER TABLE "ConversationMoneyTicket" ADD CONSTRAINT "ConversationMoneyTicket_conversationId_fkey" FOREIGN KEY ("conversationId") REFERENCES "Conversation"("id") ON DELETE RESTRICT;
+    END IF;
+END $$;`);
+STATEMENTS.push(`DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.table_constraints WHERE constraint_name = 'ConversationMoneyTicket_requesterId_fkey') THEN
+        IF EXISTS (SELECT 1 FROM "ConversationMoneyTicket" t LEFT JOIN "User" u ON u."id" = t."requesterId" WHERE u."id" IS NULL) THEN
+            INSERT INTO "ConversationMoneyTicketOrphanArchive"
+                ("id", "messageId", "conversationId", "kind", "amount", "currency", "requesterId", "counterpartyId", "status", "resultMessageId", "clientRequestId", "orphanReason")
+            SELECT t."id", t."messageId", t."conversationId", t."kind", t."amount", t."currency", t."requesterId", t."counterpartyId", t."status", t."resultMessageId", t."clientRequestId", 'missing_requester'
+            FROM "ConversationMoneyTicket" t LEFT JOIN "User" u ON u."id" = t."requesterId" WHERE u."id" IS NULL;
+            DELETE FROM "ConversationMoneyTicket" t WHERE NOT EXISTS (SELECT 1 FROM "User" u WHERE u."id" = t."requesterId");
+        END IF;
+        ALTER TABLE "ConversationMoneyTicket" ADD CONSTRAINT "ConversationMoneyTicket_requesterId_fkey" FOREIGN KEY ("requesterId") REFERENCES "User"("id") ON DELETE RESTRICT;
+    END IF;
+END $$;`);
+STATEMENTS.push(`DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.table_constraints WHERE constraint_name = 'ConversationMoneyTicket_counterpartyId_fkey') THEN
+        IF EXISTS (SELECT 1 FROM "ConversationMoneyTicket" t LEFT JOIN "User" u ON u."id" = t."counterpartyId" WHERE u."id" IS NULL) THEN
+            INSERT INTO "ConversationMoneyTicketOrphanArchive"
+                ("id", "messageId", "conversationId", "kind", "amount", "currency", "requesterId", "counterpartyId", "status", "resultMessageId", "clientRequestId", "orphanReason")
+            SELECT t."id", t."messageId", t."conversationId", t."kind", t."amount", t."currency", t."requesterId", t."counterpartyId", t."status", t."resultMessageId", t."clientRequestId", 'missing_counterparty'
+            FROM "ConversationMoneyTicket" t LEFT JOIN "User" u ON u."id" = t."counterpartyId" WHERE u."id" IS NULL;
+            DELETE FROM "ConversationMoneyTicket" t WHERE NOT EXISTS (SELECT 1 FROM "User" u WHERE u."id" = t."counterpartyId");
+        END IF;
+        ALTER TABLE "ConversationMoneyTicket" ADD CONSTRAINT "ConversationMoneyTicket_counterpartyId_fkey" FOREIGN KEY ("counterpartyId") REFERENCES "User"("id") ON DELETE RESTRICT;
+    END IF;
+END $$;`);
 
 // ── Business OS P0 settlement repair (PR #292, 2026-09-21) ─────────────────
 // EWA withdrawal fee revenue: EwaService.requestWithdrawal records the 1%

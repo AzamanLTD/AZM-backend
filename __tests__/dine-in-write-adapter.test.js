@@ -114,7 +114,9 @@ describe('dine-in tab service adapter', () => {
     await adapter.finalizeTab({}, { tabId: 'tab-1', userId: 42, taxRatePct: 5, tipUsdc: 1 });
     await adapter.getOpenTabs({}, { businessProfileId: 'biz-1', status: 'OPEN' });
 
-    expect(finalizeTab).toHaveBeenCalledWith('tab-1');
+    // r32 item F: finalize carries the effective business id (tenant proof).
+    expect(finalizeTab).toHaveBeenCalledWith('tab-1', undefined);
+    expect(adapter.finalizeTab({}, { tabId: 'tab-1', businessProfileId: 'biz-9', userId: 42 })).resolves;
     expect(getBusinessTabs).toHaveBeenCalledWith('biz-1', 'OPEN');
   });
 

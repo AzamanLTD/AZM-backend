@@ -13,6 +13,7 @@
 // =============================================================================
 
 const logger = require('../src/config/logger');
+const { Prisma } = require('@prisma/client'); // r39 exact decimals
 const fraudService = require('../services/fraudDetectionService');
 const ledger = require('../services/ledgerService'); // §P.4 authoritative ledger (shadow journalIntegration no longer used on this path)
 const NotificationService = require('../services/notificationService');
@@ -65,13 +66,20 @@ exports.sendFunds = async (req, res) => {
             });
         }
 
-        const transferAmount = parseFloat(amount);
-        if (isNaN(transferAmount) || transferAmount <= 0) {
+        // r39/P1 — EXACT TRANSFER AMOUNT: the raw client value parses
+        // through the canonical exact-decimal parser; the economic path
+        // (debit, credit, TransactionHistory, ledger) never touches a
+        // binary float. Display mirrors use Decimal.toFixed.
+        let transferAmount;
+        try {
+            transferAmount = ledger.toExactDecimal(String(amount), 'amount');
+        } catch (e) {
             return res.status(400).json({
                 success: false,
                 message: 'Amount must be a positive number.'
             });
         }
+        const transferAmountNum = Number(transferAmount); // NON-AUTHORITATIVE: fraud scoring only
 
         // Fraud detection check
         const accountAgeMs = Date.now() - new Date(req.user.createdAt || req.user.created_at || Date.now()).getTime();
@@ -79,7 +87,7 @@ exports.sendFunds = async (req, res) => {
         const fraudResult = await fraudService.evaluate({
             userId: req.user.id,
             type: 'TRANSFER',
-            amount: transferAmount,
+            amount: transferAmountNum, // NON-AUTHORITATIVE mirror
             accountAgeHours,
         });
         if (!fraudResult.allowed) {
@@ -140,7 +148,9 @@ exports.sendFunds = async (req, res) => {
             });
 
             if (!sender) throw new Error('Sender not found.');
-            if (sender.availableBalance < transferAmount) {
+            // r39: exact Decimal comparison — never a JS relational on
+            // mixed Decimal/float operands.
+            if (new Prisma.Decimal(sender.availableBalance).lessThan(transferAmount)) {
                 throw new Error('INSUFFICIENT_FUNDS');
             }
 
@@ -220,8 +230,8 @@ exports.sendFunds = async (req, res) => {
                 relatedEntityId: transfer.id,
                 metadata: { senderId, receiverId },
                 lines: [
-                    { account: `user:${senderId}:liability`, debit: transferAmount },
-                    { account: `user:${receiverId}:liability`, credit: transferAmount },
+                    { account: `user:${senderId}:liability`, debit: transferAmount.toFixed(8) },
+                    { account: `user:${receiverId}:liability`, credit: transferAmount.toFixed(8) },
                 ],
             });
 
@@ -235,7 +245,7 @@ exports.sendFunds = async (req, res) => {
                     messageType: 'TRANSFER_SENT',
                     metadata: {
                         transferId: transfer.id,
-                        amount: transferAmount,
+                        amount: transferAmount.toFixed(8), // r39: exact string
                         currency: 'USDC',
                         reference: reference || null,
                         status: 'COMPLETED',

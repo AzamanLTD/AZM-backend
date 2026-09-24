@@ -19,7 +19,16 @@ const settlementError = (code, message) => {
 
 const SERIALIZABLE_RETRY_LIMIT = 3;
 const SERIALIZABLE_BACKOFF_MS = 10;
-const PAYROLL_SNAPSHOT_TOLERANCE = 0.000001;
+// r39/P1 — the snapshot authority is now EXACT money. Both sides are
+// computed by the same Decimal-native function from the same DB inputs,
+// so float tolerance is gone: an 8dp-exact mismatch means the inputs
+// really changed and the record must be regenerated.
+const MONEY_SCALE = 8;
+const HOURS_SCALE = 2;
+const exactMoneyEq = (left, right) => toDecimal(left).toDecimalPlaces(MONEY_SCALE).toFixed(MONEY_SCALE)
+    === toDecimal(right).toDecimalPlaces(MONEY_SCALE).toFixed(MONEY_SCALE);
+const exactHoursEq = (left, right) => toDecimal(left).toDecimalPlaces(HOURS_SCALE).toFixed(HOURS_SCALE)
+    === toDecimal(right).toDecimalPlaces(HOURS_SCALE).toFixed(HOURS_SCALE);
 
 const isSerializableConflict = (error) => error?.code === 'P2034';
 
@@ -27,7 +36,9 @@ const waitForSerializableRetry = (attempt) => new Promise((resolve) => {
     setTimeout(resolve, SERIALIZABLE_BACKOFF_MS * (2 ** attempt));
 });
 
-const nearlyEqual = (left, right) => Math.abs(Number(left) - Number(right)) <= PAYROLL_SNAPSHOT_TOLERANCE;
+// r39/P1: replaced by exactMoneyEq / exactHoursEq — see above.
+
+const { calculatePayroll, toDecimal } = require('../../utils/payrollMath');
 
 class PayrollService {
     constructor(prisma) { this.prisma = prisma; }
@@ -69,44 +80,20 @@ class PayrollService {
 
         const employee = payroll.employee || {};
         const payrollType = employee.payrollType || payroll.payrollType;
-        let baseAmount = 0;
-        let totalHours = 0;
-        let overtimeHours = 0;
-
-        if (payrollType === 'SALARY') {
-            baseAmount = parseFloat(employee.salaryAmount) || 0;
-            totalHours = shifts.reduce((sum, shift) => sum + (
-                shift.actualMinutes
-                    ? Math.max(0, (shift.actualMinutes - shift.breakMinutes) / 60)
-                    : 0
-            ), 0);
-        } else if (payrollType === 'HOURLY') {
-            const rate = parseFloat(employee.hourlyRate) || 0;
-            shifts.forEach((shift) => {
-                if (!shift.actualMinutes) return;
-                const workedHours = Math.max(0, (shift.actualMinutes - shift.breakMinutes) / 60);
-                totalHours += workedHours;
-                overtimeHours += Math.max(0, workedHours - 8);
-                baseAmount += workedHours * rate;
-            });
-        }
-
-        const overtimeAmount = overtimeHours * (parseFloat(employee.hourlyRate) || 0) * 0.5;
-        const ewaDeduction = parseFloat(employee.withdrawnEarly) || 0;
-        const taxAmount = 0;
-        const deductionAmount = 0;
-        const grossAmount = baseAmount + overtimeAmount;
-        const netAmount = grossAmount - ewaDeduction - taxAmount - deductionAmount;
+        // r39/P1 — exact-money computation via the shared Decimal-native
+        // util (single implementation with processEmployeePayroll). Never
+        // parseFloat a Decimal column; round once at the 8dp authority.
+        const exact = calculatePayroll({ ...employee, payrollType }, shifts);
 
         return {
-            baseAmount,
-            overtimeAmount,
-            grossAmount,
-            ewaDeduction,
-            netAmount,
-            totalHours: Math.round(totalHours * 100) / 100,
-            overtimeHours: Math.round(overtimeHours * 100) / 100,
-            shiftCount: shifts.length,
+            baseAmount: exact.baseAmount,
+            overtimeAmount: exact.overtimeAmount,
+            grossAmount: exact.grossAmount,
+            ewaDeduction: exact.ewaDeduction,
+            netAmount: exact.netAmount,
+            totalHours: exact.totalHours,
+            overtimeHours: exact.overtimeHours,
+            shiftCount: exact.shiftCount,
         };
     }
 
@@ -117,13 +104,13 @@ class PayrollService {
         const recordedShiftCount = Number(recordedBreakdown.shifts);
 
         const matches = (
-            nearlyEqual(payroll.baseAmount, current.baseAmount)
-            && nearlyEqual(payroll.overtimeAmount, current.overtimeAmount)
-            && nearlyEqual(payroll.grossAmount, current.grossAmount)
-            && nearlyEqual(payroll.ewaDeduction, current.ewaDeduction)
-            && nearlyEqual(payroll.netAmount, current.netAmount)
-            && nearlyEqual(payroll.totalHours, current.totalHours)
-            && nearlyEqual(payroll.overtimeHours, current.overtimeHours)
+            exactMoneyEq(payroll.baseAmount, current.baseAmount)
+            && exactMoneyEq(payroll.overtimeAmount, current.overtimeAmount)
+            && exactMoneyEq(payroll.grossAmount, current.grossAmount)
+            && exactMoneyEq(payroll.ewaDeduction, current.ewaDeduction)
+            && exactMoneyEq(payroll.netAmount, current.netAmount)
+            && exactHoursEq(payroll.totalHours, current.totalHours)
+            && exactHoursEq(payroll.overtimeHours, current.overtimeHours)
             && (!Number.isFinite(recordedShiftCount) || recordedShiftCount === current.shiftCount)
         );
 
@@ -147,43 +134,38 @@ class PayrollService {
         const periodEnd = new Date(year, month, 0, 23, 59, 59);
         const shifts = await this.prisma.shift.findMany({ where: { employeeId, shiftDate: { gte: periodStart, lte: periodEnd }, status: 'CLOCKED_OUT' } });
 
-        let baseAmount = 0;
-        let totalHours = 0;
-        let overtimeHours = 0;
-        if (employee.payrollType === 'SALARY') {
-            baseAmount = parseFloat(employee.salaryAmount) || 0;
-            totalHours = shifts.reduce((sum, s) => sum + (s.actualMinutes ? Math.max(0, (s.actualMinutes - s.breakMinutes) / 60) : 0), 0);
-        } else if (employee.payrollType === 'HOURLY') {
-            const rate = parseFloat(employee.hourlyRate) || 0;
-            shifts.forEach(s => {
-                if (s.actualMinutes) {
-                    const workedHours = Math.max(0, (s.actualMinutes - s.breakMinutes) / 60);
-                    totalHours += workedHours;
-                    overtimeHours += Math.max(0, workedHours - 8);
-                    baseAmount += workedHours * rate;
-                }
-            });
-        }
-        const overtimeAmount = overtimeHours * (parseFloat(employee.hourlyRate) || 0) * 0.5;
-        const ewaDeduction = parseFloat(employee.withdrawnEarly);
-        const taxAmount = 0;
-        const deductionAmount = 0;
-        const grossAmount = baseAmount + overtimeAmount;
-        const netAmount = grossAmount - ewaDeduction - taxAmount - deductionAmount;
+        // r39/P1 — exact-money computation via the shared Decimal-native
+        // util (single implementation with _calculatePayrollBreakdown).
+        // Money fields are exact 8dp Decimals; persisted directly into the
+        // DECIMAL(20,8) columns. Hours are informational 2dp quantities.
+        const exact = calculatePayroll(employee, shifts);
+        const {
+            grossAmount, netAmount, baseAmount, overtimeAmount, ewaDeduction,
+            taxAmount, deductionAmount, totalHours, overtimeHours, regularHours, shiftCount,
+        } = exact;
+        // Breakdown carries the informational hour quantities as plain
+        // numbers (2dp-exact display values) and the EWA deduction as its
+        // exact 8dp string — never a float mirror of money authority.
+        const breakdown = {
+            shifts: shiftCount,
+            regularHours: Number(regularHours.toFixed(2)),
+            overtimeHours: Number(overtimeHours.toFixed(2)),
+            ewaWithdrawn: ewaDeduction.toFixed(8),
+        };
 
         return this.prisma.payrollRecord.upsert({
             where: { employeeId_period: { employeeId, period } },
             create: {
                 businessProfileId, employeeId, userId: employee.userId, period, payrollType: employee.payrollType,
                 grossAmount, netAmount, baseAmount, overtimeAmount, ewaDeduction, taxAmount, deductionAmount,
-                totalHours: Math.round(totalHours * 100) / 100, overtimeHours: Math.round(overtimeHours * 100) / 100,
+                totalHours, overtimeHours,
                 status: 'PENDING',
-                breakdown: { shifts: shifts.length, regularHours: Math.round((totalHours - overtimeHours) * 100) / 100, overtimeHours: Math.round(overtimeHours * 100) / 100, ewaWithdrawn: ewaDeduction },
+                breakdown,
             },
             update: {
                 grossAmount, netAmount, baseAmount, overtimeAmount, ewaDeduction, taxAmount, deductionAmount,
-                totalHours: Math.round(totalHours * 100) / 100, overtimeHours: Math.round(overtimeHours * 100) / 100,
-                breakdown: { shifts: shifts.length, regularHours: Math.round((totalHours - overtimeHours) * 100) / 100, overtimeHours: Math.round(overtimeHours * 100) / 100, ewaWithdrawn: ewaDeduction },
+                totalHours, overtimeHours,
+                breakdown,
             },
         });
     }
@@ -422,10 +404,12 @@ class PayrollService {
         return {
             period,
             totalEmployees: records.length,
-            totalGross: records.reduce((s, r) => s + parseFloat(r.grossAmount), 0),
-            totalNet: records.reduce((s, r) => s + parseFloat(r.netAmount), 0),
-            totalEwa: records.reduce((s, r) => s + parseFloat(r.ewaDeduction), 0),
-            totalOvertime: records.reduce((s, r) => s + parseFloat(r.overtimeAmount), 0),
+            // r39/P1 — aggregate sums are exact Decimal reductions at the
+            // 8dp authority, never float accumulation.
+            totalGross: records.reduce((s, r) => s.plus(toDecimal(r.grossAmount)), new Prisma.Decimal(0)),
+            totalNet: records.reduce((s, r) => s.plus(toDecimal(r.netAmount)), new Prisma.Decimal(0)),
+            totalEwa: records.reduce((s, r) => s.plus(toDecimal(r.ewaDeduction)), new Prisma.Decimal(0)),
+            totalOvertime: records.reduce((s, r) => s.plus(toDecimal(r.overtimeAmount)), new Prisma.Decimal(0)),
             pending: records.filter(r => r.status === 'PENDING').length,
             processed: records.filter(r => r.status === 'PROCESSED').length,
             failed: records.filter(r => r.status === 'FAILED').length,

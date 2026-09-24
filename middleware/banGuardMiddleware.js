@@ -23,7 +23,8 @@ const APPEAL_EMAIL = process.env.APPEAL_EMAIL || 'support@azaman.me';
  * Establish the tenant/user context used by Business OS mutation services.
  *
  * Business OS routes already run `adminBusinessScope` before this middleware,
- * so an admin's selected business is available as req.businessProfileId.
+ * so a genuine admin's selected business is available as the canonical
+ * req.adminBusinessScope property (r32: one canonical scope property).
  * Normal business owners are resolved by their owned BusinessProfile; worker
  * accounts are resolved by their active BusinessEmployee record.
  *
@@ -39,7 +40,9 @@ const establishBusinessRequestContext = async (req, res, next) => {
     const userId = req.user.id;
 
     try {
-        let businessProfileId = req.businessProfileId || null;
+        // r32: impersonation scope comes from the canonical adminBusinessScope
+        // property only — never a caller-influenced req.businessProfileId.
+        let businessProfileId = req.adminBusinessScope?.businessProfileId || null;
         let isBusinessOwner = false;
 
         if (businessProfileId) {
@@ -72,7 +75,7 @@ const establishBusinessRequestContext = async (req, res, next) => {
             businessProfileId,
             isBusinessOwner,
             isAdmin: req.user.role?.toUpperCase?.() === 'ADMIN',
-            adminScopedBusinessId: req.businessProfileId || null,
+            adminScopedBusinessId: req.adminBusinessScope?.businessProfileId || null,
         }, next);
     } catch (err) {
         logger.error({ err }, '[businessRequestContext] error');

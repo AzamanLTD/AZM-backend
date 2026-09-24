@@ -37,9 +37,15 @@ const productWhereForTab = (tab, productId) => {
     return where;
 };
 
-const addItem = async (prisma, { tabId, productId, name, price, quantity, addedBy, io }) => {
+const addItem = async (prisma, { tabId, businessProfileId, productId, name, price, quantity, addedBy, io }) => {
     return prisma.$transaction(async (tx) => {
         const tab = await lockOpenTab(tx, tabId);
+        // r32 item F: a business-side mutation may only touch a tab of the
+        // caller's effective business. Refusal is indistinguishable from an
+        // unknown tab id (no state leak).
+        if (businessProfileId && tab.businessProfileId !== businessProfileId) {
+            throw new Error('Tab not found.');
+        }
         let itemName = name;
         let authoritativePrice = productId ? null : Number(price);
 

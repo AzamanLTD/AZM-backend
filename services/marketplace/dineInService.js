@@ -185,12 +185,17 @@ class DineInService {
         return { success: true };
     }
 
-    async finalizeTab(tabId) {
+    async finalizeTab(tabId, expectedBusinessProfileId = null) {
         for (let attempt = 0; attempt < SERIALIZABLE_RETRY_LIMIT; attempt += 1) {
             try {
                 const finalized = await this.prisma.$transaction(async (tx) => {
                     const tab = await tx.dineInTab.findUnique({ where: { id: tabId }, include: { items: true } });
                     if (!tab) throw new Error('Tab not found.');
+                    // r32 item F: business-side finalization requires the tab
+                    // to belong to the caller's effective business.
+                    if (expectedBusinessProfileId && tab.businessProfileId !== expectedBusinessProfileId) {
+                        throw new Error('Tab not found.');
+                    }
                     if (tab.status !== 'OPEN') throw new Error('Tab is not OPEN.');
                     const total = tab.items.reduce((sum, item) => sum + Number(item.unitPriceUsdc) * item.quantity, 0);
                     const claimed = await tx.dineInTab.updateMany({
@@ -287,9 +292,14 @@ class DineInService {
         return this.prisma.dineInTab.update({ where: { id: tabId }, data: { status: 'CLOSED', closedAt: new Date() }, include: { items: true } });
     }
 
-    async cancelTab(tabId) {
-        const tab = await this.prisma.dineInTab.findUnique({ where: { id: tabId }, select: { status: true, customerId: true } });
+    async cancelTab(tabId, expectedBusinessProfileId = null) {
+        const tab = await this.prisma.dineInTab.findUnique({ where: { id: tabId }, select: { businessProfileId: true, status: true, customerId: true } });
         if (!tab) throw new Error('Tab not found.');
+        // r32 item F: business-side cancellation requires the tab to belong
+        // to the caller's effective business.
+        if (expectedBusinessProfileId && tab.businessProfileId !== expectedBusinessProfileId) {
+            throw new Error('Tab not found.');
+        }
         if (tab.status === 'CLOSED') throw new Error('Cannot cancel a closed tab.');
         await this.prisma.dineInTab.update({ where: { id: tabId }, data: { status: 'CANCELLED' } });
         this.io?.to(`user_${tab.customerId}`).emit('dine_in_tab_cancelled', { tabId });

@@ -13,7 +13,10 @@ describe('POS global/branch product boundary', () => {
 
     const priced = await service._priceItems(tx, 'biz-1', [{ productId: 'global-1', quantity: 2 }], null);
 
-    expect(priced.subtotal).toBe(24);
+    // r39/P0: _priceItems now returns an exact Prisma.Decimal subtotal
+    // (no float path); the priced line total is exact at 8dp too.
+    expect(priced.subtotal.toFixed(8)).toBe('24.00000000');
+    expect(priced.items[0].lineTotal.toFixed(8)).toBe('24.00000000');
     expect(tx.businessProduct.findFirst).toHaveBeenCalledWith({
       where: {
         id: 'global-1',

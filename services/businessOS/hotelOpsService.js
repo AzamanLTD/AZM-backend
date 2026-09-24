@@ -45,15 +45,60 @@ class HotelOpsService {
         });
     }
 
+    // r34/F — ROOM-STATUS AUTHORITY. The status mutation is a competing
+    // authority against moveRoom / createWalkIn / housekeeping, so it must
+    // never corrupt the occupancy projection ({ currentReservationId,
+    // status, checkedInAt, checkoutDueAt }) under concurrency:
+    //   • the mutation carries the tenant predicate itself (conditional
+    //     updateMany on { id, businessProfileId }) — a pre-read no longer
+    //     doubles as authorization;
+    //   • a room currently held by a reservation (currentReservationId set)
+    //     can never be flipped to AVAILABLE by a bare status edit —
+    //     availability is the checkout/move flows' exclusive transition,
+    //     and OCCUPIED without a holding reservation cannot be fabricated
+    //     here either (both would desync the occupancy projection);
+    //   • the update is CAS'd on the occupancy state observed by the read
+    //     (currentReservationId): if a concurrent check-in/move/checkout
+    //     changed it between read and write, count === 0, the loop re-reads
+    //     committed truth and re-validates instead of overwriting blindly.
     async updateRoomStatus(roomId, status, notes, businessProfileId) {
         if (!businessProfileId) throw new Error('Business profile context is required.');
-        const room = await this.prisma.hotelRoom.findFirst({ where: { id: roomId, businessProfileId }, select: { id: true } });
-        if (!room) throw new Error('Room not found.');
+        const VALID_STATUSES = ['AVAILABLE', 'OCCUPIED', 'DIRTY', 'CLEANING', 'MAINTENANCE', 'RESERVED'];
+        if (!VALID_STATUSES.includes(status)) throw new Error('Invalid room status.');
 
-        return this.prisma.hotelRoom.update({
-            where: { id: roomId },
-            data: { status, notes },
-        });
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+            const room = await this.prisma.hotelRoom.findFirst({
+                where: { id: roomId, businessProfileId },
+                select: { id: true, status: true, currentReservationId: true },
+            });
+            if (!room) throw new Error('Room not found.');
+
+            // Occupancy integrity: while a reservation holds the room, the
+            // status authority may not claim it is AVAILABLE; when no
+            // reservation holds it, it may not claim OCCUPIED.
+            if (room.currentReservationId && status === 'AVAILABLE') {
+                throw new Error('Room is held by a checked-in reservation — release it through checkout or a room move before marking it available.');
+            }
+            if (!room.currentReservationId && status === 'OCCUPIED') {
+                throw new Error('Room has no checked-in reservation — OCCUPIED is set exclusively by check-in, walk-in, and room moves.');
+            }
+
+            const claimed = await this.prisma.hotelRoom.updateMany({
+                where: {
+                    id: roomId,
+                    businessProfileId,
+                    currentReservationId: room.currentReservationId,
+                },
+                data: { status, notes },
+            });
+            if (claimed.count === 1) {
+                return this.prisma.hotelRoom.findFirst({ where: { id: roomId, businessProfileId } });
+            }
+            // count === 0: the occupancy state changed under us — retry
+            // against committed truth; the loop's re-read re-validates the
+            // integrity rules on the fresh state.
+        }
+        throw new Error('Room state changed concurrently; retry the status update.');
     }
 
     async getRoomRack(businessProfileId, date) {
@@ -139,9 +184,13 @@ class HotelOpsService {
             },
         });
 
-        // Set room to CLEANING
-        await this.prisma.hotelRoom.update({
-            where: { id: room.id },
+        // r34/F — set the room to CLEANING only when it is genuinely free
+        // (no holding reservation): a blind update here could clobber an
+        // OCCUPIED room if a guest re-checked-in/was moved into it while the
+        // checkout clean was being generated. The task is created either way;
+        // only the room projection stays truthful.
+        await this.prisma.hotelRoom.updateMany({
+            where: { id: room.id, businessProfileId, currentReservationId: null },
             data: { status: 'CLEANING' },
         });
 
@@ -218,9 +267,13 @@ class HotelOpsService {
             },
         });
 
-        // Set room back to AVAILABLE
-        await this.prisma.hotelRoom.update({
-            where: { id: room.id },
+        // r34/F — CLEANING→AVAILABLE is a CONDITIONAL transition: if the
+        // room was re-occupied (walk-in/move) or re-blocked while housekeeping
+        // ran, the task completes but the room is NOT forced AVAILABLE — a
+        // bare update here used to be able to mark a currently-occupied room
+        // as available, silently desyncing the occupancy projection.
+        await this.prisma.hotelRoom.updateMany({
+            where: { id: room.id, businessProfileId, status: 'CLEANING', currentReservationId: null },
             data: { status: 'AVAILABLE' },
         });
 
@@ -468,6 +521,11 @@ HotelOpsService.prototype.createWalkIn = async function(businessProfileId, { cus
     if (!room) throw new Error('Room not found');
     if (!customer) throw new Error('Customer not found.');
     if (room.status !== 'AVAILABLE') throw new Error('Room is not available');
+    // r34/F — the availability check above is only a friendly pre-read. The
+    // authoritative claim is the CONDITIONAL updateMany inside the
+    // transaction below ({ status: 'AVAILABLE' }): a concurrent walk-in or
+    // room move cannot double-book the room, because the loser's claim
+    // matches zero rows and rolls the whole booking back.
 
     const startDatetime = new Date();
     const endDatetime = new Date(startDatetime);
@@ -490,8 +548,11 @@ HotelOpsService.prototype.createWalkIn = async function(businessProfileId, { cus
             },
         });
 
-        await tx.hotelRoom.update({
-            where: { id: roomId },
+        // r34/F — the claim (not the pre-read) is the availability
+        // authority: exactly one racer can turn AVAILABLE→OCCUPIED; the
+        // loser rolls back its reservation with the claim.
+        const claim = await tx.hotelRoom.updateMany({
+            where: { id: roomId, businessProfileId, status: 'AVAILABLE' },
             data: {
                 status: 'OCCUPIED',
                 currentReservationId: reservation.id,
@@ -499,33 +560,152 @@ HotelOpsService.prototype.createWalkIn = async function(businessProfileId, { cus
                 checkoutDueAt: endDatetime,
             },
         });
+        if (claim.count === 0) throw new Error('Room is not available');
 
         return reservation;
     });
 };
 
-HotelOpsService.prototype.moveRoom = async function(reservationId, { newRoomId, reason }, businessProfileId) {
-    if (!businessProfileId) throw new Error('Business profile context is required.');
-    const reservation = await this.prisma.reservation.findFirst({ where: { id: reservationId, businessProfileId } });
-    if (!reservation) throw new Error('Reservation not found');
-    const oldRoomId = reservation.serviceItemId;
-    const newRoom = await this.prisma.hotelRoom.findFirst({ where: { id: newRoomId, businessProfileId } });
-    if (!newRoom) throw new Error('New room not found');
-    if (newRoom.status !== 'AVAILABLE') throw new Error('New room is not available');
+const MOVE_ROOM_RETRY_LIMIT = 3;
+const isPgConflict = (error) => error?.code === 'P2034' || error?.code === 'P2028';
 
-    return this.prisma.$transaction(async (tx) => {
-        const updatedReservation = await tx.reservation.update({
-            where: { id: reservationId },
-            data: { serviceItemId: newRoomId, metadata: { ...(reservation.metadata || {}), movedFrom: oldRoomId, moveReason: reason } },
-        });
-        if (oldRoomId) {
-            const oldRoom = await tx.hotelRoom.findFirst({ where: { id: oldRoomId, businessProfileId }, select: { id: true } });
-            if (!oldRoom) throw new Error('Current room not found for this business.');
-            await tx.hotelRoom.update({ where: { id: oldRoom.id }, data: { status: 'DIRTY', currentReservationId: null } });
-        }
-        await tx.hotelRoom.update({ where: { id: newRoom.id }, data: { status: 'OCCUPIED', currentReservationId: reservationId, checkedInAt: reservation.checkedInAt || new Date(), checkoutDueAt: reservation.endDatetime } });
-        return { ok: true, reservation: updatedReservation };
+HotelOpsService.prototype.moveRoom = async function(reservationId, { newRoomId, reason }, businessProfileId) {
+    // r33/Wave1.2 — room-move concurrency authority.
+    //
+    // The previous implementation read the reservation, its current room, and
+    // the target-room availability OUTSIDE the transaction, then wrote inside
+    // it. Two concurrent moves of the same reservation (A→B and A→C) could
+    // both capture the same stale oldRoomId and both "succeed": the
+    // reservation ended pointing at C while B stayed OCCUPIED with
+    // currentReservationId pointing at a reservation that no longer owned it.
+    //
+    // The database is now the authority, inside one transaction at the
+    // default (READ COMMITTED) isolation — deliberately NOT Serializable:
+    // the r31 capacity trigger evaluates availability against COMMITTED data
+    // behind a transaction-scoped business advisory lock, and a Serializable
+    // snapshot would make that evaluation read stale pre-race state (SSI does
+    // not reliably abort such trigger/ advisory-lock patterns). Under READ
+    // COMMITTED every statement below re-reads committed truth:
+    //   1. The reservation is read inside the transaction (authoritative
+    //      current room + business scope).
+    //   2. The reservation move is a CAS FIRST: updateMany on
+    //      { id, businessProfileId, serviceItemId: oldRoomId } — if a
+    //      concurrent mover already changed the room, this returns 0 and the
+    //      whole move rolls back. The r31 capacity trigger evaluates the move
+    //      at this instant: the target room must still be AVAILABLE and the
+    //      interval unclaimed, or the trigger refuses the move itself.
+    //   3. The target room is then CLAIMED with a conditional updateMany on
+    //      { id, businessProfileId, status: 'AVAILABLE' } — only one racer can
+    //      turn the claim; the loser gets count 0 and rolls back completely
+    //      (including its reservation CAS).
+    //   4. The old-room cleanup is conditional on the room actually being
+    //      held by THIS reservation ({ currentReservationId: reservationId }),
+    //      so it can never release a room some other reservation has claimed.
+    // Every losing or failing path rolls back to the exact prior state.
+    if (!businessProfileId) throw new Error('Business profile context is required.');
+    if (!newRoomId || typeof newRoomId !== 'string') throw new Error('A target room id is required.');
+
+    // Fail-fast scope guard before opening the transaction: a reservation in
+    // another business is indistinguishable from a nonexistent one and is
+    // rejected here without holding a connection. The authoritative read
+    // below (inside the transaction) re-verifies this against committed truth,
+    // so this pre-read can never widen authority — it only short-circuits.
+    const reservationExists = await this.prisma.reservation.findFirst({
+        where: { id: reservationId, businessProfileId },
+        select: { id: true },
     });
+    if (!reservationExists) throw new Error('Reservation not found');
+
+    // The origin room observed on the FIRST attempt is pinned across
+    // serialization retries. A retry may only proceed while the reservation
+    // still holds that same room; if a concurrent mover already relocated it,
+    // the retry's CAS matches nothing and the move fails with an explicit
+    // conflict instead of silently re-targeting the guest (A→C must never
+    // degrade into B→C after losing a race to A→B).
+    let pinnedOriginRoomId;
+
+    for (let attempt = 0; attempt < MOVE_ROOM_RETRY_LIMIT; attempt += 1) {
+        try {
+            return await this.prisma.$transaction(async (tx) => {
+                // 1. Authoritative reservation read — inside the transaction.
+                const reservation = await tx.reservation.findFirst({
+                    where: { id: reservationId, businessProfileId },
+                });
+                if (!reservation) throw new Error('Reservation not found');
+                const originRoomId = pinnedOriginRoomId ?? reservation.serviceItemId;
+                if (originRoomId === newRoomId) {
+                    throw new Error('Reservation is already assigned to this room.');
+                }
+                if (pinnedOriginRoomId !== undefined && reservation.serviceItemId !== pinnedOriginRoomId) {
+                    // A concurrent mover relocated the reservation between
+                    // attempts; this request's origin assumption is stale.
+                    throw new Error('Reservation was moved concurrently; retry the move.');
+                }
+                pinnedOriginRoomId = originRoomId;
+
+                // Friendly pre-validation of the target room inside the
+                // transaction. The r31 capacity trigger on the CAS below
+                // remains the authoritative availability check — this read
+                // only produces an accurate error message.
+                const targetRoom = await tx.hotelRoom.findFirst({
+                    where: { id: newRoomId, businessProfileId },
+                    select: { status: true },
+                });
+                if (!targetRoom) throw new Error('New room not found');
+                if (targetRoom.status !== 'AVAILABLE') throw new Error('New room is not available');
+
+                // 2. CAS the reservation move FIRST: it must still own
+                //    originRoomId. This statement is what the r31 capacity
+                //    trigger evaluates — the target room must still be
+                //    AVAILABLE and interval-unclaimed at this instant, which
+                //    is exactly the availability contract the trigger owns.
+                const moved = await tx.reservation.updateMany({
+                    where: { id: reservationId, businessProfileId, serviceItemId: originRoomId },
+                    data: {
+                        serviceItemId: newRoomId,
+                        metadata: { ...(reservation.metadata || {}), movedFrom: originRoomId, moveReason: reason },
+                    },
+                });
+                if (moved.count === 0) {
+                    throw new Error('Reservation was moved concurrently; retry the move.');
+                }
+
+                // 3. Race-safe target-room claim: this business's room, and
+                //    still AVAILABLE, or the claim fails and rolls back (the
+                //    reservation CAS above rolls back with it).
+                const claim = await tx.hotelRoom.updateMany({
+                    where: { id: newRoomId, businessProfileId, status: 'AVAILABLE' },
+                    data: {
+                        status: 'OCCUPIED',
+                        currentReservationId: reservationId,
+                        checkedInAt: reservation.checkedInAt || new Date(),
+                        checkoutDueAt: reservation.endDatetime,
+                    },
+                });
+                if (claim.count === 0) throw new Error('New room is not available');
+
+                // 4. Old-room cleanup — only if this reservation actually
+                //    holds it (authoritative currentReservationId).
+                if (originRoomId) {
+                    await tx.hotelRoom.updateMany({
+                        where: { id: originRoomId, businessProfileId, currentReservationId: reservationId },
+                        data: { status: 'DIRTY', currentReservationId: null },
+                    });
+                }
+
+                const updatedReservation = await tx.reservation.findUnique({
+                    where: { id: reservationId },
+                });
+                return { ok: true, reservation: updatedReservation };
+            });
+        } catch (error) {
+            if (!isPgConflict(error) || attempt === MOVE_ROOM_RETRY_LIMIT - 1) {
+                throw error;
+            }
+            // Serialization conflict — the database asked us to look again.
+        }
+    }
+    throw new Error('Room move failed after retries.');
 };
 
 HotelOpsService.prototype.bulkCreateRooms = async function(businessProfileId, { startNumber, endNumber, roomType, floor, basePrice, weekendPrice, capacity, locationId }) {
@@ -562,12 +742,43 @@ HotelOpsService.prototype.bulkCreateRooms = async function(businessProfileId, { 
     return this.prisma.hotelRoom.createMany({ data: rooms, skipDuplicates: true });
 };
 
-HotelOpsService.prototype.updateRoom = async function(roomId, data) {
-    const allowed = ['roomNumber', 'roomType', 'floor', 'capacity', 'bedConfig', 'basePriceUsdc', 'weekendPriceUsdc', 'amenities', 'notes', 'status'];
+HotelOpsService.prototype.updateRoom = async function(roomId, data, businessProfileId) {
+    // r32 audit item B + r33/Wave1.1 — tenant-scoped room metadata authority.
+    // Lifecycle state (status) is deliberately NOT patchable here: room state
+    // transitions belong exclusively to the dedicated updateRoomStatus
+    // authority.
+    //
+    // r33/Wave1.1: the AUTHORITY is the mutation itself. The update is
+    // tenant-constrained via updateMany on { id, businessProfileId } — a
+    // concurrent business-context swap between the pre-check read and the
+    // write, or any caller-supplied business id, cannot make this statement
+    // touch another business's room. The pre-check read remains only to
+    // produce an accurate "not found" error.
+    if (!businessProfileId) throw new Error('Business profile context is required.');
+    if (data.status !== undefined) {
+        throw new Error('Room status cannot be set through generic room updates; use the room status authority.');
+    }
+    const room = await this.prisma.hotelRoom.findFirst({
+        where: { id: roomId, businessProfileId },
+        select: { id: true },
+    });
+    if (!room) throw new Error('Room not found.');
+
+    const allowed = ['roomNumber', 'roomType', 'floor', 'capacity', 'bedConfig', 'basePriceUsdc', 'weekendPriceUsdc', 'amenities', 'notes'];
     const update = {};
     allowed.forEach(k => { if (data[k] !== undefined) update[k] = data[k]; });
     if (data.basePrice) update.basePriceUsdc = parseFloat(data.basePrice);
     if (data.weekendPrice) update.weekendPriceUsdc = parseFloat(data.weekendPrice);
-    return this.prisma.hotelRoom.update({ where: { id: roomId }, data: update });
+
+    // Tenant-constrained mutation: exactly this business's room or nothing.
+    const result = await this.prisma.hotelRoom.updateMany({
+        where: { id: roomId, businessProfileId },
+        data: update,
+    });
+    if (result.count === 0) throw new Error('Room not found.');
+
+    return this.prisma.hotelRoom.findFirst({
+        where: { id: roomId, businessProfileId },
+    });
 };
 

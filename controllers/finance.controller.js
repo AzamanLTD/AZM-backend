@@ -43,6 +43,8 @@ const { recordReconciliationExceptionLoud } = require('../services/reconciliatio
 const { FIAT_POOL_ALERT_THRESH }   = financeService;
 const crypto                       = require('crypto');
 const logger = require('../src/config/logger');
+const { Prisma } = require('@prisma/client'); // r39 exact decimals
+const ledger = require('../services/ledgerService'); // r39 exact-decimal parser
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -435,7 +437,12 @@ exports.fiatWithdrawal = async (req, res) => {
                     data: {
                         userId:     req.user.id,
                         type:       'WITHDRAWAL_FIAT',
-                        amountUsdc: parseFloat(req.body.amount) || 0,
+                        // r39/P1 — exact Decimal: never a binary float of the
+                        // client's amount on a TransactionHistory row.
+                        amountUsdc: (() => {
+                            try { return ledger.toExactDecimal(String(req.body.amount), 'amount'); }
+                            catch { return new Prisma.Decimal(0); }
+                        })(),
                         feeUsdc:    0,
                         status:     'FROZEN_DISPUTE'
                     }

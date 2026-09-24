@@ -126,11 +126,16 @@ function mountRoutes(app, {
     app.use('/api/marketplace', generalLimiter, require('../../routes/marketplaceRoutes'));
     // Canonical scoped Business OS financial/operational mutation handlers are
     // mounted before the legacy monolithic router during the cleanup migration.
-    app.use('/api/business-os', financialLimiter, require('../../routes/businessOSFinanceRoutes'));
-    app.use('/api/business-os', generalLimiter, require('../../routes/businessOSInventoryRoutes'));
-    app.use('/api/business-os', financialLimiter, require('../../routes/businessOSPosRoutes'));
-    app.use('/api/business-os', generalLimiter, require('../../routes/businessOSKioskRoutes'));
-    app.use('/api/business-os', generalLimiter, require('../../routes/businessOSRoutes'));
+    // r39/P1 — BOOT READINESS GATE: in production the whole money-bearing
+    // /api/business-os surface fails closed (retryable 503) until the boot
+    // overlay convergence flips businessOSReady. Never serve a request
+    // against an unverified schema; the rest of the platform keeps serving.
+    const { businessOSReadiness } = require('../../src/boot/businessOS');
+    app.use('/api/business-os', financialLimiter, businessOSReadiness, require('../../routes/businessOSFinanceRoutes'));
+    app.use('/api/business-os', generalLimiter, businessOSReadiness, require('../../routes/businessOSInventoryRoutes'));
+    app.use('/api/business-os', financialLimiter, businessOSReadiness, require('../../routes/businessOSPosRoutes'));
+    app.use('/api/business-os', generalLimiter, businessOSReadiness, require('../../routes/businessOSKioskRoutes'));
+    app.use('/api/business-os', generalLimiter, businessOSReadiness, require('../../routes/businessOSRoutes'));
     app.use('/api/developer', generalLimiter, require('../../routes/developerRoutes'));
     app.use('/api/qr', generalLimiter, require('../../routes/qrRoutes'));
     app.use('/api/storefront', generalLimiter, require('../../routes/storefrontCheckoutReadinessRoutes'));

@@ -175,10 +175,10 @@ describe('Payroll: salary employee', () => {
       { actualMinutes: 500, breakMinutes: 60 }, // 7.33h worked
     ];
     const result = calculatePayroll(employee, shifts);
-    expect(result.grossAmount).toBe(2000);
-    expect(result.netAmount).toBe(2000);
-    expect(result.overtimeAmount).toBe(0);
-    expect(result.totalHours).toBe(14.33);
+    expect(result.grossAmount.toFixed(8)).toBe('2000.00000000');
+    expect(result.netAmount.toFixed(8)).toBe('2000.00000000');
+    expect(result.overtimeAmount.toFixed(8)).toBe('0.00000000');
+    expect(result.totalHours.toFixed(2)).toBe('14.33');
   });
 
   test('salary with EWA deduction reduces net', () => {
@@ -186,9 +186,9 @@ describe('Payroll: salary employee', () => {
       { payrollType: 'SALARY', salaryAmount: 1500, hourlyRate: 0, withdrawnEarly: 200 },
       []
     );
-    expect(result.grossAmount).toBe(1500);
-    expect(result.ewaDeduction).toBe(200);
-    expect(result.netAmount).toBe(1300);
+    expect(result.grossAmount.toFixed(8)).toBe('1500.00000000');
+    expect(result.ewaDeduction.toFixed(8)).toBe('200.00000000');
+    expect(result.netAmount.toFixed(8)).toBe('1300.00000000');
   });
 });
 
@@ -205,12 +205,12 @@ describe('Payroll: hourly employee', () => {
       { actualMinutes: 480, breakMinutes: 60 }, // 7h worked, no OT
     ];
     const result = calculatePayroll(hourlyEmployee, shifts);
-    expect(result.totalHours).toBe(7);
-    expect(result.overtimeHours).toBe(0);
-    expect(result.baseAmount).toBe(105); // 7 * 15
-    expect(result.overtimeAmount).toBe(0);
-    expect(result.grossAmount).toBe(105);
-    expect(result.netAmount).toBe(105);
+    expect(result.totalHours.toFixed(2)).toBe('7.00');
+    expect(result.overtimeHours.toFixed(2)).toBe('0.00');
+    expect(result.baseAmount.toFixed(8)).toBe('105.00000000'); // 7 * 15
+    expect(result.overtimeAmount.toFixed(8)).toBe('0.00000000');
+    expect(result.grossAmount.toFixed(8)).toBe('105.00000000');
+    expect(result.netAmount.toFixed(8)).toBe('105.00000000');
   });
 
   test('overtime at 1.5x for hours beyond 8 per shift', () => {
@@ -218,14 +218,14 @@ describe('Payroll: hourly employee', () => {
       { actualMinutes: 600, breakMinutes: 60 }, // 9h worked → 1h OT
     ];
     const result = calculatePayroll(hourlyEmployee, shifts);
-    expect(result.totalHours).toBe(9);
-    expect(result.overtimeHours).toBe(1);
+    expect(result.totalHours.toFixed(2)).toBe('9.00');
+    expect(result.overtimeHours.toFixed(2)).toBe('1.00');
     // Base = 9 * 15 = 135 (at regular rate)
     // OT bonus = 1 * 15 * 0.5 = 7.5
-    expect(result.baseAmount).toBe(135);
-    expect(result.overtimeAmount).toBe(7.5);
-    expect(result.grossAmount).toBe(142.5);
-    expect(result.netAmount).toBe(142.5);
+    expect(result.baseAmount.toFixed(8)).toBe('135.00000000');
+    expect(result.overtimeAmount.toFixed(8)).toBe('7.50000000');
+    expect(result.grossAmount.toFixed(8)).toBe('142.50000000');
+    expect(result.netAmount.toFixed(8)).toBe('142.50000000');
   });
 
   test('multiple shifts with mixed overtime', () => {
@@ -235,13 +235,13 @@ describe('Payroll: hourly employee', () => {
       { actualMinutes: 720, breakMinutes: 60 },  // 11h → 3 OT
     ];
     const result = calculatePayroll(hourlyEmployee, shifts);
-    expect(result.totalHours).toBe(27);
-    expect(result.overtimeHours).toBe(4);
+    expect(result.totalHours.toFixed(2)).toBe('27.00');
+    expect(result.overtimeHours.toFixed(2)).toBe('4.00');
     // Base = 27 * 15 = 405
     // OT bonus = 4 * 15 * 0.5 = 30
-    expect(result.baseAmount).toBe(405);
-    expect(result.overtimeAmount).toBe(30);
-    expect(result.grossAmount).toBe(435);
+    expect(result.baseAmount.toFixed(8)).toBe('405.00000000');
+    expect(result.overtimeAmount.toFixed(8)).toBe('30.00000000');
+    expect(result.grossAmount.toFixed(8)).toBe('435.00000000');
   });
 
   test('hourly with EWA deduction', () => {
@@ -249,9 +249,9 @@ describe('Payroll: hourly employee', () => {
       { ...hourlyEmployee, withdrawnEarly: 50 },
       [{ actualMinutes: 480, breakMinutes: 60 }] // 7h → 105 gross
     );
-    expect(result.grossAmount).toBe(105);
-    expect(result.ewaDeduction).toBe(50);
-    expect(result.netAmount).toBe(55);
+    expect(result.grossAmount.toFixed(8)).toBe('105.00000000');
+    expect(result.ewaDeduction.toFixed(8)).toBe('50.00000000');
+    expect(result.netAmount.toFixed(8)).toBe('55.00000000');
   });
 
   test('shift with no actualMinutes contributes 0 hours', () => {
@@ -260,16 +260,16 @@ describe('Payroll: hourly employee', () => {
       { actualMinutes: null, breakMinutes: 0 },
     ];
     const result = calculatePayroll(hourlyEmployee, shifts);
-    expect(result.totalHours).toBe(7);
-    expect(result.grossAmount).toBe(105);
+    expect(result.totalHours.toFixed(2)).toBe('7.00');
+    expect(result.grossAmount.toFixed(8)).toBe('105.00000000');
   });
 
   test('break minutes reduce worked hours', () => {
     const result = calculatePayroll(hourlyEmployee, [
       { actualMinutes: 600, breakMinutes: 120 }, // (600-120)/60 = 8h → 0 OT
     ]);
-    expect(result.totalHours).toBe(8);
-    expect(result.overtimeHours).toBe(0);
+    expect(result.totalHours.toFixed(2)).toBe('8.00');
+    expect(result.overtimeHours.toFixed(2)).toBe('0.00');
   });
 });
 
@@ -288,7 +288,8 @@ describe('Payroll: conservation invariants', () => {
     for (const emp of cases) {
       for (const shifts of shiftSets) {
         const r = calculatePayroll(emp, shifts);
-        expect(Math.abs(r.baseAmount + r.overtimeAmount - r.grossAmount)).toBeLessThan(EPSILON);
+        // EXACT: Decimal-native conservation, no tolerance.
+        expect(r.baseAmount.plus(r.overtimeAmount).toFixed(8)).toBe(r.grossAmount.toFixed(8));
       }
     }
   });
@@ -296,7 +297,8 @@ describe('Payroll: conservation invariants', () => {
   test('net = gross − EWA deduction (always)', () => {
     const emp = { payrollType: 'HOURLY', salaryAmount: 0, hourlyRate: 15, withdrawnEarly: 75 };
     const r = calculatePayroll(emp, [{ actualMinutes: 480, breakMinutes: 60 }]);
-    expect(Math.abs(r.grossAmount - r.ewaDeduction - r.netAmount)).toBeLessThan(EPSILON);
+    // EXACT: Decimal-native conservation, no tolerance.
+    expect(r.grossAmount.minus(r.ewaDeduction).toFixed(8)).toBe(r.netAmount.toFixed(8));
   });
 });
 

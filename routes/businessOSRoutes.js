@@ -9,6 +9,7 @@
 
 const logger = require('../src/config/logger');
 const { downloadInvoicePdf } = require('../controllers/invoiceController');
+const { Prisma } = require('@prisma/client'); // r39 exact-decimal aggregation
 const express = require('express');
 const router = express.Router();
 
@@ -47,12 +48,14 @@ function getPrisma(req) {
 // adminBusinessScope validated it (req.adminBusinessScope is set there ONLY
 // for a genuine ADMIN + a real business id).
 const { resolveBusinessContext } = require('../middleware/requirePermission');
+const { nextDocumentNumber } = require('../services/businessOS/documentNumberService');
+const { audit } = require('../utils/audit');
 async function getBusinessProfileId(req) {
     if (!req.user?.id) throw new Error('Authentication required.');
     const prisma = getPrisma(req);
     const context = await resolveBusinessContext(prisma, req.user, {
         adminScoped: Boolean(req.adminBusinessScope),
-        adminScopedBusinessId: req.adminBusinessScope ? req.businessProfileId : null,
+        adminScopedBusinessId: req.adminBusinessScope?.businessProfileId ?? null,
     });
     return context ? context.businessProfileId : null;
 }
@@ -61,6 +64,13 @@ async function getBusinessProfileId(req) {
 function getServices(req) {
     const prisma = getPrisma(req);
     return {
+        // r34 fix — the returned bundle historically omitted the raw client,
+        // so every `svc.prisma.*` consumer in this router (recurring expense
+        // templates, promotions, reviews, the audit logger, the escrow list)
+        // crashed with "Cannot read properties of undefined" the moment the
+        // route was reached. The tenant predicates added in r34 assume this
+        // client is exposed; expose it.
+        prisma,
         employeeService: new EmployeeService(prisma),
         shiftService: new ShiftService(prisma),
         payrollService: new PayrollService(prisma),
@@ -85,7 +95,9 @@ function wrap(handler) {
             if (err.code === 'P2002' && err.meta?.target === null) {
                 return res.status(409).json({ success: false, message: 'The requested reservation or room interval is no longer available.' });
             }
-            res.status(400).json({ success: false, message: err.message });
+            // Handlers may attach a specific statusCode (e.g. kiosk 404/409);
+            // the default remains a conservative 400.
+            res.status(err.statusCode || 400).json({ success: false, message: err.message });
         }
     };
 }
@@ -255,7 +267,7 @@ router.get('/employees/my-feedback', wrap(async (req, res) => {
     });
     if (!employee) return res.json({ success: true, feedback: [] });
     const svc = getServices(req);
-    const feedback = await svc.feedbackService.getFeedbackForEmployee(employee.id);
+    const feedback = await svc.feedbackService.getFeedbackForEmployee(employee.id, employee.businessProfileId);
     res.json({ success: true, feedback });
 }));
 
@@ -407,6 +419,8 @@ router.patch('/employees/:id/status', requirePermission('employees.terminate'), 
     const employee = await svc.employeeService.updateStatus(req.params.id, bpId, req.body.status);
     const { logBusinessAudit } = require('../utils/businessAudit');
     await logBusinessAudit(svc.prisma, { businessProfileId: bpId, actorId: req.user.id, actorName: req.user.username, action: 'EMPLOYEE_STATUS_CHANGED', targetType: 'Employee', targetId: req.params.id, metadata: { status: req.body.status }, ipAddress: req.ip });
+    res.status(200).json({ success: true, employee });
+}));
 
 // PATCH /api/business-os/employees/:id/role — r26/P0-B (follow-up review)
 // Role changes are AUTHORITY-BEARING: they reseed the target's permission set
@@ -423,8 +437,6 @@ router.patch('/employees/:id/role', requirePermission('employees.permissions'), 
     const employee = await svc.employeeService.updateRole(req.params.id, bpId, req.body.role, { actor: roleActor });
     await logBusinessAudit(svc.prisma, { businessProfileId: bpId, actorId: req.user.id, actorName: req.user.username, action: 'EMPLOYEE_ROLE_CHANGED', targetType: 'Employee', targetId: employee.id, metadata: { role: employee.role }, ipAddress: req.ip });
     res.json({ success: true, employee });
-}));
-    res.status(200).json({ success: true, employee });
 }));
 
 // POST /api/business-os/employees/:id/permissions
@@ -703,10 +715,19 @@ router.post('/ledger', requirePermission('finance.ledger.manage'), wrap(async (r
     res.status(201).json({ success: true, entry });
 }));
 
+// r35/P2 — the ledger is APPEND-ONLY. "Deleting" an entry now writes an
+// exact negating REVERSAL that references the original (the original row is
+// never removed or mutated), so P&L/cash-flow history stays honest. The
+// legacy response envelope { success: true } is preserved for the portal.
 router.delete('/ledger/:id', requirePermission('finance.ledger.manage'), wrap(async (req, res) => {
     const svc = getServices(req);
     const bpId = await getBusinessProfileId(req);
-    await svc.ledgerService.deleteEntry(req.params.id, bpId);
+    try {
+        await svc.ledgerService.deleteEntry(req.params.id, bpId, req.body?.reason);
+    } catch (err) {
+        const status = Number.isInteger(err.status) ? err.status : 400;
+        return res.status(status).json({ success: false, message: err.message });
+    }
     res.status(200).json({ success: true });
 }));
 
@@ -966,31 +987,36 @@ router.post('/restaurant/kds', requirePermission('restaurant.kitchen.manage'), w
 
 router.patch('/restaurant/kds/:id/status', requirePermission('restaurant.kitchen.manage'), wrap(async (req, res) => {
     const svc = getServices(req);
-    const order = await svc.restaurantOpsService.updateOrderStatus(req.params.id, req.body.status);
+    const bpId = await getBusinessProfileId(req);
+    const order = await svc.restaurantOpsService.updateOrderStatus(req.params.id, req.body.status, bpId);
     res.json({ success: true, order });
 }));
 
-// Bump (advance to next status): NEW → PREPARING → READY → SERVED
+// Bump (advance to next status): NEW → PREPARING → READY → SERVED.
+// r32: the pre-read is tenant-scoped — a foreign order id is answered
+// "not found" without ever leaking its state.
 router.post('/restaurant/kds/:id/bump', requirePermission('restaurant.kitchen.manage'), wrap(async (req, res) => {
     const svc = getServices(req);
-    const FLOW = ['NEW', 'PREPARING', 'READY', 'SERVED'];
-    const order = await svc.prisma.kitchenOrder.findUnique({ where: { id: req.params.id } });
-    if (!order) throw new Error('Kitchen order not found.');
-    const currentIdx = FLOW.indexOf(order.status);
-    const nextStatus = currentIdx >= 0 && currentIdx < FLOW.length - 1 ? FLOW[currentIdx + 1] : 'SERVED';
-    const updated = await svc.restaurantOpsService.updateOrderStatus(req.params.id, nextStatus);
+    const bpId = await getBusinessProfileId(req);
+    const updated = await svc.restaurantOpsService.bumpOrderStatus(req.params.id, bpId);
     res.json({ success: true, order: updated });
 }));
 
+// r32: canonical item identifier is `itemId` (a KitchenOrderItem row id) —
+// the contract the live Business Portal already speaks.
 router.patch('/restaurant/kds/:id/item-status', requirePermission('restaurant.kitchen.manage'), wrap(async (req, res) => {
     const svc = getServices(req);
-    const order = await svc.restaurantOpsService.updateItemStatus(req.params.id, req.body.itemIndex, req.body.status);
+    const bpId = await getBusinessProfileId(req);
+    const order = await svc.restaurantOpsService.updateItemStatus(req.params.id, req.body.itemId, req.body.status, bpId);
     res.json({ success: true, order });
 }));
 
+// r32: canonical chef identifier is `employeeId` (a BusinessEmployee id) —
+// matching the KitchenOrder.employeeId column and the service contract.
 router.post('/restaurant/kds/:id/assign-chef', requirePermission('restaurant.kitchen.manage'), wrap(async (req, res) => {
     const svc = getServices(req);
-    const order = await svc.restaurantOpsService.assignChef(req.params.id, req.body.employeeId);
+    const bpId = await getBusinessProfileId(req);
+    const order = await svc.restaurantOpsService.assignChef(req.params.id, req.body.employeeId, bpId);
     res.json({ success: true, order });
 }));
 
@@ -1029,48 +1055,75 @@ router.patch('/restaurant/tables/:id/status', requirePermission('restaurant.tabl
         return res.status(404).json({ success: false, message: 'Table not found' });
     }
 
-    // Find active (non-CLOSED) tab on this table
-    const activeTab = await prisma.dineInTab.findFirst({
-        where: { tableId: table.id, status: { not: 'CLOSED' } },
-        orderBy: { openedAt: 'desc' },
-    });
+    // r36/P1 — ONE AUTHORITATIVE TRANSACTION. The legacy read-modify-write
+    // (find active tab → update/create) had no transaction and no convergence
+    // rule: two concurrent PATCHes both saw "no active tab" and created two
+    // tabs on one table, and a racing close could interleave with an update.
+    // Now every status change is serialized per table by a row lock on
+    // BusinessTable, the active-tab lookup happens INSIDE the transaction,
+    // and the partial unique index (one non-CLOSED tab per table) is the
+    // database backstop: the losing creator converges on the winner's tab.
+    const finalStatus = await prisma.$transaction(async (tx) => {
+        await tx.$queryRawUnsafe('SELECT "id" FROM "BusinessTable" WHERE "id" = $1 FOR UPDATE', table.id);
 
-    if (status === 'OPEN') {
-        // If going back to OPEN, close any active tab
-        if (activeTab) {
-            await prisma.dineInTab.update({
-                where: { id: activeTab.id },
-                data: { status: 'CLOSED', closedAt: new Date() },
-            });
-        }
-    } else if (activeTab) {
-        // Update existing tab status
-        await prisma.dineInTab.update({
-            where: { id: activeTab.id },
-            data: { status },
+        const activeTab = await tx.dineInTab.findFirst({
+            where: { tableId: table.id, status: { not: 'CLOSED' } },
+            orderBy: { openedAt: 'desc' },
         });
-    } else {
-        // No active tab — create one with this status
-        // Find a guest customer or create a walk-in placeholder
-        const guestUser = await prisma.user.findFirst({
+
+        if (status === 'OPEN') {
+            // Going back to OPEN: close any active tab exactly once (idempotent
+            // for a racing duplicate — the second close finds no active tab).
+            if (activeTab) {
+                const closed = await tx.dineInTab.updateMany({
+                    where: { id: activeTab.id, status: { not: 'CLOSED' } },
+                    data: { status: 'CLOSED', closedAt: new Date() },
+                });
+                if (closed.count !== 1) throw new Error('Tab close lost the race — retry.');
+            }
+            return 'OPEN';
+        }
+        if (activeTab) {
+            await tx.dineInTab.update({ where: { id: activeTab.id }, data: { status } });
+            return status;
+        }
+        // No active tab — create one with this status. The guest walk-in
+        // customer must exist; it is resolved INSIDE the transaction.
+        const guestUser = await tx.user.findFirst({
             where: { email: 'guest-walkin@azaman.azm' },
             select: { id: true },
         });
         if (!guestUser) {
-            return res.status(400).json({ success: false, message: 'No active tab found and no guest user available. Open a tab first.' });
+            throw Object.assign(
+                new Error('No active tab found and no guest user available. Open a tab first.'),
+                { status: 400 }
+            );
         }
-        await prisma.dineInTab.create({
-            data: {
-                businessProfileId: bpId,
-                locationId: table.locationId,
-                tableId: table.id,
-                customerId: guestUser.id,
-                status,
-            },
-        });
-    }
+        try {
+            await tx.dineInTab.create({
+                data: {
+                    businessProfileId: bpId,
+                    locationId: table.locationId,
+                    tableId: table.id,
+                    customerId: guestUser.id,
+                    status,
+                },
+            });
+        } catch (e) {
+            if (e?.code !== 'P2002') throw e;
+            // Lost the create race to a concurrent writer that just opened a
+            // tab: converge on THEIR tab instead of forcing a second one.
+            const winner = await tx.dineInTab.findFirst({
+                where: { tableId: table.id, status: { not: 'CLOSED' } },
+                orderBy: { openedAt: 'desc' },
+            });
+            if (!winner) throw e;
+            await tx.dineInTab.update({ where: { id: winner.id }, data: { status } });
+        }
+        return status;
+    });
 
-    res.json({ success: true, tableId: table.id, status });
+    res.json({ success: true, tableId: table.id, status: finalStatus });
 }));
 
 // Menu Engineering (86'd items)
@@ -1102,29 +1155,56 @@ router.get('/restaurant/waitlist', requirePermission('restaurant.tables.manage')
     res.json({ success: true, data: entries });
 }));
 
+// r32 audit item E — WAITLIST MUTATION SURFACE. Every mutation resolves the
+// entry (and any referenced location/table) against the server-derived
+// effective business id; the primary id alone is never sufficient. Foreign
+// references are refused, statuses are validated, and removal revokes every
+// further use of the entry id in this business.
+
 // POST /api/business-os/restaurant/waitlist — add to waitlist
 router.post('/restaurant/waitlist', requirePermission('restaurant.tables.manage'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
     const { partyName, phone, partySize, quotedWaitMinutes, locationId } = req.body;
     if (!partyName) return res.status(400).json({ success: false, message: 'Party name is required' });
+    // The entry may only reference a location of the SAME business.
+    if (locationId) {
+        const location = await prisma.businessLocation.findFirst({
+            where: { id: locationId, businessProfileId: bpId },
+            select: { id: true },
+        });
+        if (!location) return res.status(404).json({ success: false, message: 'Location not found' });
+    }
     const entry = await prisma.restaurantWaitlistEntry.create({
         data: { businessProfileId: bpId, partyName, phone, partySize: partySize || 2, quotedWaitMinutes, locationId },
     });
     res.status(201).json({ success: true, data: entry });
 }));
 
-// PATCH /api/business-os/restaurant/waitlist/:id — update waitlist entry
+// PATCH /api/business-os/restaurant/waitlist/:id — update / notify / seat a waitlist entry
 router.patch('/restaurant/waitlist/:id', requirePermission('restaurant.tables.manage'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
     const { status, tableId } = req.body;
+    const WAITLIST_STATUSES = ['WAITING', 'NOTIFIED', 'SEATED', 'LEFT', 'CANCELLED'];
+    if (status && !WAITLIST_STATUSES.includes(status)) {
+        return res.status(400).json({ success: false, message: 'Invalid waitlist status' });
+    }
+    // Seating may only reference a table of the SAME business.
+    if (tableId) {
+        const table = await prisma.businessTable.findFirst({
+            where: { id: tableId, location: { businessProfileId: bpId } },
+            select: { id: true },
+        });
+        if (!table) return res.status(404).json({ success: false, message: 'Table not found' });
+    }
     const updateData = {};
     if (status) updateData.status = status;
     if (tableId) updateData.tableId = tableId;
     if (status === 'SEATED') updateData.seatedAt = new Date();
     if (status === 'NOTIFIED') updateData.notifiedAt = new Date();
 
+    // Tenant-scoped mutation: the entry resolves by { id, businessProfileId }.
     const entry = await prisma.restaurantWaitlistEntry.updateMany({
         where: { id: req.params.id, businessProfileId: bpId },
         data: updateData,
@@ -1137,6 +1217,9 @@ router.patch('/restaurant/waitlist/:id', requirePermission('restaurant.tables.ma
 router.delete('/restaurant/waitlist/:id', requirePermission('restaurant.tables.manage'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
+    // Tenant-scoped removal. A foreign/unknown id removes nothing and reports
+    // the same outcome as a success (existence is not leaked); after removal,
+    // every further mutation on this entry id in this business is refused.
     await prisma.restaurantWaitlistEntry.deleteMany({
         where: { id: req.params.id, businessProfileId: bpId },
     });
@@ -1291,13 +1374,15 @@ router.post('/feedback', requirePermission('feedback.give'), wrap(async (req, re
 
 router.get('/feedback/for/:employeeId', requirePermission('feedback.view'), wrap(async (req, res) => {
     const svc = getServices(req);
-    const feedback = await svc.feedbackService.getFeedbackForEmployee(req.params.employeeId);
+    const bpId = await getBusinessProfileId(req);
+    const feedback = await svc.feedbackService.getFeedbackForEmployee(req.params.employeeId, bpId);
     res.json({ success: true, feedback });
 }));
 
 router.get('/feedback/by/:employeeId', requirePermission('feedback.view'), wrap(async (req, res) => {
     const svc = getServices(req);
-    const feedback = await svc.feedbackService.getFeedbackByEmployee(req.params.employeeId);
+    const bpId = await getBusinessProfileId(req);
+    const feedback = await svc.feedbackService.getFeedbackByEmployee(req.params.employeeId, bpId);
     res.json({ success: true, feedback });
 }));
 
@@ -1671,31 +1756,103 @@ router.get('/restaurant/recipes', requirePermission('restaurant.inventory.view')
             id: ri.id, inventoryItemId: ri.inventoryItemId,
             inventoryItemName: ri.inventoryItem.name, unit: ri.inventoryItem.unit,
             quantityRequired: ri.quantityRequired,
-            costGhs: ri.quantityRequired * ri.inventoryItem.costPerUnit,
+            // r39/P1 — exact Decimal costing (no float coercion via *).
+            costGhs: new Prisma.Decimal(ri.quantityRequired).mul(new Prisma.Decimal(ri.inventoryItem.costPerUnit)),
         })),
-        totalCostGhs: p.recipeIngredients.reduce((sum, ri) => sum + ri.quantityRequired * ri.inventoryItem.costPerUnit, 0),
+        // r39/P1 — exact Decimal aggregation for the recipe cost total.
+        totalCostGhs: p.recipeIngredients.reduce(
+            (sum, ri) => sum.plus(new Prisma.Decimal(ri.quantityRequired).mul(new Prisma.Decimal(ri.inventoryItem.costPerUnit))),
+            new Prisma.Decimal(0)
+        ),
     }));
     res.json({ success: true, products: withCost });
 }));
 
 // POST /api/business-os/restaurant/recipes/:productId/link — link ingredient to product
 router.post('/restaurant/recipes/:productId/link', requirePermission('restaurant.inventory.manage'), wrap(async (req, res) => {
+    // r34/C — a recipe ingredient joins a business product to a business
+    // inventory item; the downstream deduction path follows exactly this
+    // relationship, so BOTH objects must provably belong to the caller's
+    // effective business before the upsert. A foreign product or item is
+    // indistinguishable from a nonexistent one (404) and can never poison
+    // the deduction chain. Quantity is validated explicitly: finite,
+    // strictly positive, at most 8 decimal places.
     const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
     const { inventoryItemId, quantityRequired } = req.body;
-    const link = await prisma.recipeIngredient.upsert({
-        where: { productId_inventoryItemId: { productId: req.params.productId, inventoryItemId } },
-        create: { productId: req.params.productId, inventoryItemId, quantityRequired: parseFloat(quantityRequired) },
-        update: { quantityRequired: parseFloat(quantityRequired) },
+    if (!inventoryItemId || typeof inventoryItemId !== 'string') {
+        return res.status(400).json({ success: false, message: 'inventoryItemId is required' });
+    }
+    const qty = Number(quantityRequired);
+    if (!Number.isFinite(qty) || qty <= 0 || Math.abs(qty * 1e8 - Math.round(qty * 1e8)) > 1e-6) {
+        return res.status(400).json({ success: false, message: 'quantityRequired must be a positive number with at most 8 decimal places' });
+    }
+    const product = await prisma.businessProduct.findFirst({
+        where: { id: req.params.productId, businessProfileId: bpId },
+        select: { id: true },
     });
-    res.json({ success: true, link });
+    if (!product) return res.status(404).json({ success: false, message: 'Product not found' });
+    const invItem = await prisma.inventoryItem.findFirst({
+        where: { id: inventoryItemId, businessProfileId: bpId },
+        select: { id: true },
+    });
+    if (!invItem) return res.status(404).json({ success: false, message: 'Inventory item not found' });
+
+    // Mutation boundary: the upsert selector is the composite
+    // {productId, inventoryItemId} of two verified same-business objects.
+    // Concurrent duplicate links converge: the losing racer hits P2002 and
+    // falls back to a tenant-predicated updateMany (count 0 → 404).
+    try {
+        const link = await prisma.recipeIngredient.upsert({
+            where: { productId_inventoryItemId: { productId: req.params.productId, inventoryItemId } },
+            create: { productId: req.params.productId, inventoryItemId, quantityRequired: qty },
+            update: { quantityRequired: qty },
+        });
+        return res.json({ success: true, link });
+    } catch (e) {
+        if (e?.code !== 'P2002') throw e;
+        const converged = await prisma.recipeIngredient.updateMany({
+            where: {
+                productId: req.params.productId, inventoryItemId,
+                product: { businessProfileId: bpId },
+                inventoryItem: { businessProfileId: bpId },
+            },
+            data: { quantityRequired: qty },
+        });
+        if (converged.count === 0) return res.status(404).json({ success: false, message: 'Recipe link not found' });
+        const link = await prisma.recipeIngredient.findUnique({
+            where: { productId_inventoryItemId: { productId: req.params.productId, inventoryItemId } },
+        });
+        return res.json({ success: true, link });
+    }
 }));
 
 // DELETE /api/business-os/restaurant/recipes/:productId/link/:itemId — remove link
 router.delete('/restaurant/recipes/:productId/link/:itemId', requirePermission('restaurant.inventory.manage'), wrap(async (req, res) => {
+    // r34/C — deleting a link requires the same ownership proof as creating
+    // one: both endpoints of the relationship must belong to the effective
+    // business, and the delete itself carries the tenant predicate. A
+    // foreign business's link can never be removed (or revealed).
     const prisma = getPrisma(req);
-    await prisma.recipeIngredient.deleteMany({
-        where: { productId: req.params.productId, inventoryItemId: req.params.itemId },
+    const bpId = await getBusinessProfileId(req);
+    const product = await prisma.businessProduct.findFirst({
+        where: { id: req.params.productId, businessProfileId: bpId },
+        select: { id: true },
     });
+    if (!product) return res.status(404).json({ success: false, message: 'Product not found' });
+    const invItem = await prisma.inventoryItem.findFirst({
+        where: { id: req.params.itemId, businessProfileId: bpId },
+        select: { id: true },
+    });
+    if (!invItem) return res.status(404).json({ success: false, message: 'Inventory item not found' });
+    const deleted = await prisma.recipeIngredient.deleteMany({
+        where: {
+            productId: req.params.productId, inventoryItemId: req.params.itemId,
+            product: { businessProfileId: bpId },
+            inventoryItem: { businessProfileId: bpId },
+        },
+    });
+    if (deleted.count === 0) return res.status(404).json({ success: false, message: 'Recipe link not found' });
     res.json({ success: true });
 }));
 
@@ -1712,17 +1869,63 @@ router.post('/restaurant/inventory/deduct/:orderId', requirePermission('restaura
         return res.json({ success: true, message: 'No recipe configured — nothing deducted', deductions: [] });
     }
     const qty = order.quantity || 1;
+    // r34/D — poisoned-recipe guard: a recipe ingredient may only ever join
+    // objects of one business (the link route now enforces that), but the
+    // deduction path must defend ITSELF against any historical/foreign
+    // relationship: if any referenced inventory item does not belong to the
+    // effective business, the whole deduction fails closed BEFORE mutating.
+    const foreignIngredient = order.product.recipeIngredients.find(
+        (ri) => ri.inventoryItem.businessProfileId !== bpId,
+    );
+    if (foreignIngredient) {
+        return res.status(409).json({ success: false, message: 'Recipe configuration is invalid for this business — deduction aborted' });
+    }
     const deductions = [];
-    await prisma.$transaction(async (tx) => {
+    const result = await prisma.$transaction(async (tx) => {
+        // r36/P1 — DEDUCT-ONCE: the per-order claim is a conditional update on
+        // {id, businessProfileId, inventoryDeductedAt: null}. The winner is the
+        // sole deductor; a retry (claim lost) replays the ORIGINAL outcome
+        // without touching stock again, and concurrent duplicates converge.
+        const claim = await tx.businessOrder.updateMany({
+            where: { id: order.id, businessProfileId: bpId, inventoryDeductedAt: null },
+            data: { inventoryDeductedAt: new Date() },
+        });
+        if (claim.count !== 1) {
+            return { replay: true };
+        }
         for (const ri of order.product.recipeIngredients) {
             const deductQty = ri.quantityRequired * qty;
-            await tx.inventoryItem.update({
-                where: { id: ri.inventoryItemId },
+            // r34/D — mutation-level tenant predicate: the decrement only
+            // applies to this business's item. If the ingredient somehow
+            // points outside the business, count === 0, the throw rolls the
+            // ENTIRE deduction (including already-decremented ingredients)
+            // back, and no foreign stock is ever touched.
+            const claim = await tx.inventoryItem.updateMany({
+                where: { id: ri.inventoryItemId, businessProfileId: bpId },
                 data: { currentStock: { decrement: deductQty } },
             });
+            if (claim.count === 0) {
+                throw new Error(`Inventory item ${ri.inventoryItemId} does not belong to this business — deduction aborted`);
+            }
             deductions.push({ ingredient: ri.inventoryItem.name, deducted: deductQty, unit: ri.inventoryItem.unit });
         }
+        return { replay: false };
     });
+    if (result.replay) {
+        // Honest replay: stock was already deducted for this order; report
+        // the SAME shape with the quantities the recipe implies — without
+        // reducing stock a second time.
+        return res.json({
+            success: true,
+            message: 'Inventory already deducted for this order',
+            deductions: order.product.recipeIngredients.map((ri) => ({
+                ingredient: ri.inventoryItem.name,
+                deducted: ri.quantityRequired * qty,
+                unit: ri.inventoryItem.unit,
+            })),
+            replay: true,
+        });
+    }
     res.json({ success: true, message: 'Inventory deducted', deductions });
 }));
 
@@ -2660,7 +2863,12 @@ router.get('/dashboard/employee-stats', requirePermission('analytics.view'), wra
         }).catch(() => []),
     ]);
 
-    const monthlyPayroll = payrollRecords.reduce((sum, r) => sum + (Number(r.netAmountUsdc) || 0), 0);
+    // r39/P1 — exact Decimal aggregation (no float accumulate), with a
+    // Number() display mirror for the toFixed(2) report string only.
+    const monthlyPayroll = payrollRecords.reduce(
+        (sum, r) => sum.plus(new Prisma.Decimal(r.netAmountUsdc ?? 0)),
+        new Prisma.Decimal(0)
+    );
 
     res.json({
         success: true,
@@ -2676,17 +2884,45 @@ router.get('/dashboard/employee-stats', requirePermission('analytics.view'), wra
 
 // ── Phase 2: Kiosk PIN Auth (Section 2.4) ────────────────────────────────────
 // POST /api/business-os/kiosk/pin-auth — scoped PIN auth for clock-in/out only
+// r34/E — KIOSK AUTHORITY. The kiosk credential is the employee PIN, never
+// the employeeId. This endpoint now:
+//   • resolves the business from the CALLER's authenticated context
+//     (owner/employee/admin-impersonation) — the body's businessProfileId is
+//     only accepted if it MATCHES that resolution, so one business can never
+//     probe another business's PIN space;
+//   • enforces a failed-PIN attempt ceiling (per business, see
+//     utils/kioskPinGuard.js);
+//   • issues the REAL scoped capability (services/businessOS/
+//     kioskCapability.js — a 5-minute JWT bound to employeeId/userId/
+//     businessProfileId). The frontend previously had to "enforce the
+//     scope" itself against a plain payload; the scope is now a signed,
+//     server-verifiable token that clock-in/out verify server-side.
 router.post('/kiosk/pin-auth', wrap(async (req, res) => {
     const prisma = getPrisma(req);
+    const bpId = await getBusinessProfileId(req);
+    if (!bpId) return res.status(403).json({ success: false, message: 'No business context for this account' });
     const { pinCode, businessProfileId, locationId } = req.body;
-    if (!pinCode || !businessProfileId) {
-        return res.status(400).json({ success: false, message: 'PIN and business ID required' });
+    if (!pinCode) {
+        return res.status(400).json({ success: false, message: 'PIN required' });
+    }
+    // A caller-supplied business id may never WIDEN the scope: if present it
+    // must agree with the authenticated context, otherwise the request is
+    // rejected without revealing whether the business exists.
+    if (businessProfileId !== undefined && businessProfileId !== null && String(businessProfileId) !== String(bpId)) {
+        return res.status(403).json({ success: false, message: 'Kiosk PIN auth is only valid for your own business' });
     }
 
-    // Find employees with this PIN for this business
+    const kioskPinGuard = require('../utils/kioskPinGuard');
+    try {
+        kioskPinGuard.assertNotLocked(bpId, 'pin-auth');
+    } catch (err) {
+        return res.status(err.statusCode || 429).json({ success: false, message: err.message });
+    }
+
+    // Find employees with a PIN for THIS business only.
     const bcrypt = require('bcryptjs');
     const employees = await prisma.businessEmployee.findMany({
-        where: { businessProfileId, status: 'ACTIVE', pinCode: { not: null } },
+        where: { businessProfileId: bpId, status: 'ACTIVE', pinCode: { not: null } },
         select: { id: true, pinCode: true, userId: true, role: true, title: true, department: true },
     });
 
@@ -2699,11 +2935,23 @@ router.post('/kiosk/pin-auth', wrap(async (req, res) => {
     }
 
     if (!matched) {
+        kioskPinGuard.recordFailure(bpId, 'pin-auth');
         return res.status(401).json({ success: false, message: 'Invalid PIN' });
     }
+    kioskPinGuard.recordSuccess(bpId, 'pin-auth');
 
-    // Return a SCOPED token — only valid for clock-in/out, not full session
-    // The frontend uses this to identify the employee for kiosk actions
+    // The real scoped credential: a short-lived server-signed capability
+    // bound to this employee + business, verifiable by clock-in/out.
+    const { signCapability } = require('../services/businessOS/kioskCapability');
+    const kioskToken = signCapability({
+        employeeId: matched.id,
+        userId: matched.userId,
+        businessProfileId: bpId,
+        locationId: locationId || null,
+    });
+
+    // Legacy fields kept for wire compatibility; the kioskToken is the
+    // authoritative credential for the subsequent clock-in/out calls.
     res.json({
         success: true,
         employee: {
@@ -2713,8 +2961,9 @@ router.post('/kiosk/pin-auth', wrap(async (req, res) => {
             title: matched.title,
             department: matched.department,
         },
-        scope: 'kiosk_clock_only', // frontend must enforce this scope
-        businessProfileId,
+        kioskToken,
+        scope: 'kiosk_clock_only',
+        businessProfileId: bpId,
         locationId: locationId || null,
     });
 }));
@@ -2752,412 +3001,335 @@ router.get('/reservation-stats', requirePermission('reservations.view'), wrap(as
 }));
 
 // POST /api/business-os/kiosk/clock-in — clock in using PIN auth
+// r34/E — AUTHORITY CONTRACT. Previously this route accepted a bare
+// employeeId from any authenticated caller: any user could clock in ANY
+// employee of ANY business. Now:
+//   • employeeId is NOT a credential — the request must carry the PIN proof
+//     itself (pinCode verified against THAT employee) or the scoped
+//     kioskToken issued by /kiosk/pin-auth (a 5-minute server-signed
+//     capability bound to employeeId/userId/businessProfileId);
+//   • the target employee must be an ACTIVE employee of the CALLER's
+//     effective business (foreign business employees are 404s);
+//   • the mutation is serialized per-employee by locking the
+//     BusinessEmployee row inside the transaction, so two concurrent
+//     clock-ins converge on ONE open shift instead of duplicating state;
+//   • every shift read/write carries the businessProfileId predicate.
 router.post('/kiosk/clock-in', wrap(async (req, res) => {
     const prisma = getPrisma(req);
-    const { employeeId, locationId } = req.body;
+    const bpId = await getBusinessProfileId(req);
+    if (!bpId) return res.status(403).json({ success: false, message: 'No business context for this account' });
+    const { employeeId, locationId, pinCode, kioskToken } = req.body;
     if (!employeeId) return res.status(400).json({ success: false, message: 'Employee ID required' });
 
-    // Find today's scheduled shift for this employee
+    // ── Credential proof: PIN or scoped capability token ──
+    const { verifyCapability } = require('../services/businessOS/kioskCapability');
+    const kioskPinGuard = require('../utils/kioskPinGuard');
+    let capability = null;
+    if (kioskToken) {
+        try {
+            capability = verifyCapability(kioskToken);
+        } catch (err) {
+            return res.status(401).json({ success: false, message: err.message });
+        }
+        if (String(capability.employeeId) !== String(employeeId)) {
+            return res.status(401).json({ success: false, message: 'Kiosk authorization does not belong to this employee' });
+        }
+        if (String(capability.businessProfileId) !== String(bpId)) {
+            return res.status(401).json({ success: false, message: 'Kiosk authorization does not belong to this business' });
+        }
+    }
+    if (!capability && !pinCode) {
+        return res.status(401).json({ success: false, message: 'PIN required — employeeId alone is not a credential' });
+    }
+
+    // ── Tenant scope + PIN verification (outside the lock: bcrypt is slow) ──
+    const emp = await prisma.businessEmployee.findFirst({
+        where: { id: employeeId, businessProfileId: bpId, status: 'ACTIVE' },
+        select: { id: true, userId: true, pinCode: true },
+    });
+    if (!emp) return res.status(404).json({ success: false, message: 'Employee not found' });
+
+    if (capability) {
+        if (String(emp.userId) !== String(capability.userId)) {
+            return res.status(401).json({ success: false, message: 'Kiosk authorization does not belong to this employee' });
+        }
+    } else {
+        try {
+            kioskPinGuard.assertNotLocked(bpId, employeeId);
+        } catch (err) {
+            return res.status(err.statusCode || 429).json({ success: false, message: err.message });
+        }
+        const bcrypt = require('bcryptjs');
+        if (!emp.pinCode || !(await bcrypt.compare(String(pinCode), emp.pinCode))) {
+            kioskPinGuard.recordFailure(bpId, employeeId);
+            return res.status(401).json({ success: false, message: 'Invalid PIN' });
+        }
+        kioskPinGuard.recordSuccess(bpId, employeeId);
+    }
+
+    // ── Serialized mutation: employee row lock, then claim checks ──
+    const now = new Date();
     const today = new Date();
     today.setHours(0, 0, 0, 0);
     const tomorrow = new Date(today);
     tomorrow.setDate(tomorrow.getDate() + 1);
 
-    const shift = await prisma.shift.findFirst({
-        where: {
-            employeeId,
-            shiftDate: { gte: today, lt: tomorrow },
-            status: { in: ['SCHEDULED', 'OPEN'] },
-        },
-    });
+    const result = await prisma.$transaction(async (tx) => {
+        // Per-employee serialization: concurrent kiosk clock-ins for this
+        // employee queue here; the predicate carries the tenant scope, so a
+        // foreign employee never even locks.
+        const locked = await tx.$queryRaw`SELECT id FROM "BusinessEmployee" WHERE id = ${employeeId} AND "businessProfileId" = ${bpId} FOR UPDATE`;
+        if (locked.length === 0) throw new Error('Employee not found');
 
-    if (shift) {
-        // Clock into scheduled shift
-        const now = new Date();
-        const isLate = now > new Date(shift.startTime.getTime() + 5 * 60 * 1000);
-        const lateMinutes = isLate ? Math.floor((now - shift.startTime) / 60000) : 0;
-
-        const updated = await prisma.shift.update({
-            where: { id: shift.id },
-            data: {
-                status: 'OPEN',
-                clockInTime: now,
-                isLate,
-                lateMinutes,
-            },
+        // One active shift per employee, ever — not just today. (r34: the
+        // ShiftStatus enum is SCHEDULED/CLOCKED_IN/LATE/CLOCKED_OUT/NO_SHOW —
+        // the pre-r34 'OPEN'/'COMPLETED' literals never existed in the enum,
+        // so those handlers failed Prisma validation on every call.)
+        const existing = await tx.shift.findFirst({
+            where: { employeeId, businessProfileId: bpId, status: { in: ['CLOCKED_IN', 'LATE'] }, clockInTime: { not: null }, clockOutTime: null },
         });
-        res.json({ success: true, shift: updated, message: isLate ? 'Clocked in (late)' : 'Clocked in' });
-    } else {
-        // No scheduled shift — create an ad-hoc clock-in
-        const emp = await prisma.businessEmployee.findUnique({
-            where: { id: employeeId },
-            select: { businessProfileId: true, userId: true },
-        });
-        if (!emp) return res.status(404).json({ success: false, message: 'Employee not found' });
+        if (existing) return { shift: existing, message: 'Already clocked in — one open shift per employee', duplicate: true };
 
-        const now = new Date();
+        // Claim today's SCHEDULED shift with a conditional updateMany: only
+        // one racer can turn the SCHEDULED→OPEN transition.
+        const scheduled = await tx.shift.findFirst({
+            where: { employeeId, businessProfileId: bpId, shiftDate: { gte: today, lt: tomorrow }, status: 'SCHEDULED' },
+        });
+        if (scheduled) {
+            const isLate = now > new Date(scheduled.startTime.getTime() + 5 * 60 * 1000);
+            const lateMinutes = isLate ? Math.floor((now - scheduled.startTime) / 60000) : 0;
+            const claim = await tx.shift.updateMany({
+                where: { id: scheduled.id, businessProfileId: bpId, status: 'SCHEDULED' },
+                data: { status: isLate ? 'LATE' : 'CLOCKED_IN', clockInTime: now, isLate, lateMinutes },
+            });
+            if (claim.count === 1) {
+                const shift = await tx.shift.findUnique({ where: { id: scheduled.id } });
+                return { shift, message: isLate ? 'Clocked in (late)' : 'Clocked in' };
+            }
+            // Lost the claim race (impossible under the row lock, kept as a
+            // defense in depth): fall through to the open-shift re-read above.
+        }
+
+        // No scheduled shift — ad-hoc clock-in, still under the lock.
         const endTime = new Date(now);
         endTime.setHours(endTime.getHours() + 8); // default 8hr shift
-
-        const adHocShift = await prisma.shift.create({
+        const adHocShift = await tx.shift.create({
             data: {
-                businessProfileId: emp.businessProfileId,
+                businessProfileId: bpId,
                 employeeId,
                 userId: emp.userId,
                 locationId: locationId || null,
                 shiftDate: now,
                 startTime: now,
                 endTime,
-                status: 'OPEN',
+                status: 'CLOCKED_IN',
                 clockInTime: now,
                 notes: 'Ad-hoc kiosk clock-in',
             },
         });
-        res.json({ success: true, shift: adHocShift, message: 'Clocked in (ad-hoc)' });
-    }
+        return { shift: adHocShift, message: 'Clocked in (ad-hoc)' };
+    }, { timeout: 10000 });
+
+    res.json({ success: true, shift: result.shift, message: result.message });
 }));
 
 // POST /api/business-os/kiosk/clock-out — clock out using PIN auth
+// r34/E — same credential contract as clock-in (PIN or scoped capability;
+// employeeId alone is never a credential), plus:
+//   • the shift claim is a conditional updateMany on { id, OPEN,
+//     clockOutTime: null } under the employee row lock — two concurrent
+//     clock-outs can never double-complete a shift or double-increment the
+//     employee's statistics (the stat update only runs for the claim
+//     winner, inside the same transaction);
+//   • the shift search carries the businessProfileId predicate, so only
+//     THIS business's employee's own open shift can ever be targeted.
 router.post('/kiosk/clock-out', wrap(async (req, res) => {
     const prisma = getPrisma(req);
-    const { employeeId } = req.body;
+    const bpId = await getBusinessProfileId(req);
+    if (!bpId) return res.status(403).json({ success: false, message: 'No business context for this account' });
+    const { employeeId, pinCode, kioskToken } = req.body;
     if (!employeeId) return res.status(400).json({ success: false, message: 'Employee ID required' });
 
-    const shift = await prisma.shift.findFirst({
-        where: { employeeId, status: 'OPEN', clockInTime: { not: null }, clockOutTime: null },
-        orderBy: { clockInTime: 'desc' },
-    });
+    const { verifyCapability } = require('../services/businessOS/kioskCapability');
+    const kioskPinGuard = require('../utils/kioskPinGuard');
+    let capability = null;
+    if (kioskToken) {
+        try {
+            capability = verifyCapability(kioskToken);
+        } catch (err) {
+            return res.status(401).json({ success: false, message: err.message });
+        }
+        if (String(capability.employeeId) !== String(employeeId)) {
+            return res.status(401).json({ success: false, message: 'Kiosk authorization does not belong to this employee' });
+        }
+        if (String(capability.businessProfileId) !== String(bpId)) {
+            return res.status(401).json({ success: false, message: 'Kiosk authorization does not belong to this business' });
+        }
+    }
+    if (!capability && !pinCode) {
+        return res.status(401).json({ success: false, message: 'PIN required — employeeId alone is not a credential' });
+    }
 
-    if (!shift) return res.status(404).json({ success: false, message: 'No open shift to clock out from' });
+    const emp = await prisma.businessEmployee.findFirst({
+        where: { id: employeeId, businessProfileId: bpId, status: 'ACTIVE' },
+        select: { id: true, userId: true, pinCode: true },
+    });
+    if (!emp) return res.status(404).json({ success: false, message: 'Employee not found' });
+
+    if (capability) {
+        if (String(emp.userId) !== String(capability.userId)) {
+            return res.status(401).json({ success: false, message: 'Kiosk authorization does not belong to this employee' });
+        }
+    } else {
+        try {
+            kioskPinGuard.assertNotLocked(bpId, employeeId);
+        } catch (err) {
+            return res.status(err.statusCode || 429).json({ success: false, message: err.message });
+        }
+        const bcrypt = require('bcryptjs');
+        if (!emp.pinCode || !(await bcrypt.compare(String(pinCode), emp.pinCode))) {
+            kioskPinGuard.recordFailure(bpId, employeeId);
+            return res.status(401).json({ success: false, message: 'Invalid PIN' });
+        }
+        kioskPinGuard.recordSuccess(bpId, employeeId);
+    }
 
     const now = new Date();
-    const actualMinutes = Math.floor((now - shift.clockInTime) / 60000);
+    const updated = await prisma.$transaction(async (tx) => {
+        // Serialize against concurrent clock-out/clock-in for this employee.
+        const locked = await tx.$queryRaw`SELECT id FROM "BusinessEmployee" WHERE id = ${employeeId} AND "businessProfileId" = ${bpId} FOR UPDATE`;
+        if (locked.length === 0) throw new Error('Employee not found');
 
-    const updated = await prisma.shift.update({
-        where: { id: shift.id },
-        data: {
-            status: 'COMPLETED',
-            clockOutTime: now,
-            actualMinutes,
-        },
-    });
+        const shift = await tx.shift.findFirst({
+            where: { employeeId, businessProfileId: bpId, status: { in: ['CLOCKED_IN', 'LATE'] }, clockInTime: { not: null }, clockOutTime: null },
+            orderBy: { clockInTime: 'desc' },
+        });
+        if (!shift) throw Object.assign(new Error('No open shift to clock out from'), { statusCode: 404 });
 
-    // Update employee stats
-    await prisma.businessEmployee.update({
-        where: { id: employeeId },
-        data: {
-            totalShifts: { increment: 1 },
-            totalHours: { increment: actualMinutes / 60 },
-        },
-    });
+        const actualMinutes = Math.floor((now - shift.clockInTime) / 60000);
 
-    res.json({ success: true, shift: updated, actualMinutes, message: 'Clocked out' });
+        // Conditional claim: only one racer can complete the shift. A loss
+        // (count 0) throws and rolls back — the stats below never run twice.
+        const claim = await tx.shift.updateMany({
+            where: { id: shift.id, businessProfileId: bpId, status: { in: ['CLOCKED_IN', 'LATE'] }, clockOutTime: null },
+            data: { status: 'CLOCKED_OUT', clockOutTime: now, actualMinutes },
+        });
+        if (claim.count === 0) throw Object.assign(new Error('Shift was already clocked out'), { statusCode: 409 });
+
+        // Employee stats increment ONLY for the claim winner, in the SAME
+        // transaction: a rolled-back claim never inflates the counters.
+        await tx.businessEmployee.update({
+            where: { id: employeeId },
+            data: {
+                totalShifts: { increment: 1 },
+                totalHours: { increment: actualMinutes / 60 },
+            },
+        });
+
+        return { shift: await tx.shift.findUnique({ where: { id: shift.id } }), actualMinutes };
+    }, { timeout: 10000 });
+
+    res.json({ success: true, shift: updated.shift, actualMinutes: updated.actualMinutes, message: 'Clocked out' });
 }));
 
 // ── Phase 2: Cash Payment + Idempotency (Section 2.4) ────────────────────────
-// POST /api/business-os/pos/cash-sale — ring up a cash order (bypasses escrow)
-// POST /api/business-os/pos/order — unified POS order (CASH, AZM balance, SPLIT)
-// Replaces the old pos/cash-sale with support for all payment methods.
-// Server-side total re-derivation — never trusts client totals.
-router.post('/pos/order', requirePermission('orders.manage'), wrap(async (req, res) => {
-    const prisma = getPrisma(req);
-    const bpId = await getBusinessProfileId(req);
-    const {
-        items, paymentMethod = 'CASH', totalAmount,
-        cashGiven, azmAmount, idempotencyKey, source,
-        locationId, tableId, customerId,
-    } = req.body;
-
-    if (!items || !Array.isArray(items) || items.length === 0) {
-        return res.status(400).json({ success: false, message: 'Items are required.' });
-    }
-
-    // Idempotency check
-    if (idempotencyKey) {
-        const existing = await prisma.businessOrder.findFirst({ where: { idempotencyKey } });
-        if (existing) return res.json({ success: true, order: existing, message: 'Duplicate (idempotent)' });
-    }
-
-    // Re-derive totals from product prices (never trust client)
-    let computedSubtotal = 0;
-    for (const item of items) {
-        const product = await prisma.businessProduct.findFirst({
-            where: { id: item.productId, businessProfileId: bpId },
-            select: { priceUsdc: true, name: true, isActive: true, isAvailable: true },
-        });
-        if (!product) return res.status(400).json({ success: false, message: 'Invalid product: ' + item.productId });
-        if (product.isActive === false || product.isAvailable === false) {
-            return res.status(400).json({ success: false, message: 'Product unavailable: ' + product.name });
-        }
-        computedSubtotal += parseFloat(product.priceUsdc) * (item.qty || item.quantity || 1);
-    }
-
-    const computedTax = computedSubtotal * 0.025; // 2.5% tax
-    const computedGrand = computedSubtotal + computedTax;
-
-    // Validate payment
-    const pm = (paymentMethod || 'CASH').toUpperCase();
-    let cashReceived = null;
-    let cashChange = null;
-    let azmPortion = 0;
-
-    if (pm === 'CASH') {
-        cashReceived = parseFloat(cashGiven || 0);
-        if (cashReceived < computedGrand) {
-            return res.status(400).json({ success: false, message: 'Insufficient cash received.' });
-        }
-        cashChange = cashReceived - computedGrand;
-    } else if (pm === 'AZM') {
-        // Deduct from customer AZM balance
-        azmPortion = computedGrand;
-    } else if (pm === 'SPLIT') {
-        azmPortion = parseFloat(azmAmount || 0);
-        cashReceived = parseFloat(cashGiven || 0);
-        if (cashReceived + azmPortion < computedGrand) {
-            return res.status(400).json({ success: false, message: 'Insufficient payment (cash + AZM).' });
-        }
-        cashChange = Math.max(0, cashReceived - (computedGrand - azmPortion));
-    } else {
-        return res.status(400).json({ success: false, message: 'Invalid payment method: ' + pm });
-    }
-
-    // Generate order reference first (needed for AZM spend log)
-    const orderRef = 'POS-' + Date.now().toString(36).toUpperCase() + Math.random().toString(36).substring(2, 6).toUpperCase();
-
-    // For AZM/SPLIT: verify and deduct from customer azmBalance
-    if (azmPortion > 0) {
-        const user = await prisma.user.findUnique({
-            where: { id: req.user.id },
-            select: { azmBalance: true },
-        });
-        if (!user || parseFloat(user.azmBalance) < azmPortion) {
-            return res.status(400).json({ success: false, message: 'Insufficient AZM balance.' });
-        }
-        const newBalance = parseFloat(user.azmBalance) - azmPortion;
-        await prisma.user.update({
-            where: { id: req.user.id },
-            data: { azmBalance: newBalance },
-        });
-
-        // Record AZM spend log
-        await prisma.azmSpendLog.create({
-            data: {
-                userId: req.user.id,
-                amount: azmPortion,
-                reason: 'POS order (' + (source || 'POS') + ')',
-                source: 'POS_SALE',
-                balanceAfter: newBalance,
-                metadata: { orderRef },
-            },
-        });
-    }
-
-    const order = await prisma.businessOrder.create({
-        data: {
-            businessProfileId: bpId,
-            customerId: customerId || req.user.id,
-            status: 'COMPLETED',
-            orderRef,
-            title: 'POS Sale (' + pm + ')',
-            amountUsdc: computedGrand,
-            paymentMethod: pm,
-            idempotencyKey,
-            cashReceived: cashReceived || null,
-            cashChange: cashChange || null,
-            completedAt: new Date(),
-        },
-    });
-
-    // Write ledger entry
-    try {
-        await prisma.businessLedgerEntry.create({
-            data: {
-                businessProfileId: bpId,
-                type: 'INCOME',
-                category: 'SALES',
-                description: 'POS Sale (' + orderRef + ' - ' + pm + ')',
-                amount: computedGrand,
-                amountGhs: computedGrand,
-                sourceType: 'POS_SALE',
-                sourceId: order.id,
-                metadata: { orderRef, paymentMethod: pm, items: items.length, locationId, tableId },
-            },
-        });
-    } catch (e) {
-        logger.warn('[pos/order] Ledger entry failed:', e.message);
-    }
-
-    res.status(201).json({
-        success: true,
-        order,
-        computedSubtotal,
-        computedTax,
-        computedGrand,
-        change: cashChange || 0,
-    });
-}));
-
+// POST /api/business-os/pos/order is served by routes/businessOSPosRoutes.js
+// (mounted FIRST, so it shadows this file). The duplicated inline
+// implementation below was dead code drifting from the canonical
+// PosOrderService — r32/I removed it: it accepted ANY business's
+// idempotency key (unscoped findFirst), debited AZM balance with a
+// non-atomic read-modify-write, and wrote the order and its ledger entry
+// outside a transaction.
 router.post('/pos/cash-sale', requirePermission('orders.manage'), wrap(async (req, res) => {
+    // r32/I — LEGACY CASH-SALE DELEGATION: this route previously re-implemented
+    // POS settlement inline with three defects the unified PosOrderService does
+    // not have: (1) the idempotency lookup was not scoped to the business, so
+    // ANY business's idempotency key returned that business's order; (2) the
+    // tax was taken from the client-supplied taxTotal ratio; (3) order + ledger
+    // were written outside a transaction, with the ledger failure swallowed.
+    // It now delegates to the canonical service (CASH path), keeping the
+    // legacy request/response envelope for existing clients.
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
-    const { items, locationId, tableId, customerId, subtotal, taxTotal, tipAmount, idempotencyKey, cashReceived } = req.body;
+    const { items, idempotencyKey, cashReceived, tipAmount, source, locationId, tableId, customerId } = req.body;
 
-    // Idempotency check — if a record with this key exists, return the cached result
-    if (idempotencyKey) {
-        const existing = await prisma.businessOrder.findFirst({
-            where: { idempotencyKey },
-        });
-        if (existing) {
-            return res.json({ success: true, order: existing, message: 'Duplicate (idempotent)' });
-        }
-    }
-
-    // Validate: frontend must NOT compute totals — re-derive from items
-    let computedSubtotal = 0;
-    for (const item of items || []) {
-        const product = await prisma.businessProduct.findFirst({
-            where: { id: item.productId, businessProfileId: bpId },
-            select: { priceUsdc: true, name: true },
-        });
-        if (!product) return res.status(400).json({ success: false, message: 'Invalid product: ' + item.productId });
-
-        const lineTotal = parseFloat(product.priceUsdc) * item.quantity;
-        computedSubtotal += lineTotal;
-    }
-
-    const computedTax = computedSubtotal * (parseFloat(taxTotal || 0) > 0 ? parseFloat(taxTotal) / computedSubtotal : 0);
-    const computedGrand = computedSubtotal + computedTax + parseFloat(tipAmount || 0);
-
-    // Generate order reference
-    const orderRef = 'CSH-' + Date.now().toString(36).toUpperCase() + Math.random().toString(36).substring(2, 6).toUpperCase();
-
-    // Create the order with CASH payment method
-    const order = await prisma.businessOrder.create({
-        data: {
-            businessProfileId: bpId,
-            customerId: customerId || req.user.id,
-            status: 'COMPLETED',
-            orderRef,
-            title: 'POS Cash Sale',
-            amountUsdc: computedGrand,
-            paymentMethod: 'CASH',
-            idempotencyKey,
-            cashReceived: cashReceived ? parseFloat(cashReceived) : null,
-            cashChange: cashReceived ? parseFloat(cashReceived) - computedGrand : null,
-            completedAt: new Date(),
-        },
+    const { PosOrderService } = require('../services/businessOS/posOrderService');
+    const result = await new PosOrderService(prisma).createOrder({
+        businessProfileId: bpId,
+        actorId: req.user.id,
+        items,
+        paymentMethod: 'CASH',
+        cashGiven: cashReceived,
+        idempotencyKey,
+        tipAmount,
+        source: source || 'POS_CASH_SALE',
+        locationId,
+        tableId,
+        customerId,
     });
 
-    // Write a BusinessLedgerEntry for the cash sale (so it shows in Finance/P&L)
-    try {
-        await prisma.businessLedgerEntry.create({
-            data: {
-                businessProfileId: bpId,
-                type: 'INCOME',
-                category: 'SALES',
-                description: 'POS Cash Sale (' + orderRef + ')',
-                amount: computedGrand,
-                amountGhs: computedGrand, // adjust if FX rate needed
-                sourceType: 'POS_CASH_SALE',
-                sourceId: order.id,
-                metadata: { orderRef, items: items?.length || 0, locationId, tableId },
-            },
-        });
-    } catch (e) {
-        logger.warn('[pos/cash-sale] Failed to write ledger entry:', e.message);
-    }
-
-    // Fire webhook event
-    webhookDispatcher.dispatch(bpId, 'order.created', {
-        orderId: order.id, orderRef, amount: computedGrand,
-        paymentMethod: 'CASH', items: items?.length || 0,
-    }).catch(() => {});
-
-    res.status(201).json({
+    const payload = {
         success: true,
-        order,
-        computedSubtotal,
-        computedTax,
-        computedGrand,
-        change: cashReceived ? parseFloat(cashReceived) - computedGrand : 0,
-    });
+        order: result.order,
+        computedSubtotal: result.computedSubtotal,
+        computedTax: result.computedTax,
+        computedGrand: result.computedGrand,
+        change: result.change ?? Number(result.order.cashChange || 0),
+    };
+    if (result.duplicate) payload.message = 'Duplicate (idempotent)';
+    res.status(result.duplicate ? 200 : 201).json(payload);
 }));
 
 // POST /api/business-os/pos/cash-close-tab — close a dine-in tab with cash
+// r35/P0 — ATOMIC CASH CLOSE. The legacy inline implementation ran its
+// idempotency lookup without business scope, closed the tab with an unguarded
+// update (concurrent closes double-posted the ledger), wrote the ledger
+// entry outside the transaction, and swallowed ledger failures (PAID tab,
+// missing financial record). The route now delegates to the canonical
+// DineInCashCloseService: one serializable transaction covers the
+// idempotency claim, the OPEN -> PAID CAS transition, and the ledger entry.
+// Totals are re-derived from durable tab items; tax comes from the business's
+// default tax preset (the invoice/POS machinery) instead of a hardcoded 5%.
+// The legacy response envelope is preserved.
 router.post('/pos/cash-close-tab', requirePermission('orders.manage'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
     const { tabId, cashReceived, tipAmount, idempotencyKey } = req.body;
     if (!tabId) return res.status(400).json({ success: false, message: 'Tab ID required' });
 
-    // Idempotency check
-    if (idempotencyKey) {
-        const existing = await prisma.dineInTab.findFirst({
-            where: { idempotencyKey },
-        });
-        if (existing) {
-            return res.json({ success: true, tab: existing, message: 'Duplicate (idempotent)' });
-        }
-    }
-
-    const tab = await prisma.dineInTab.findFirst({
-        where: { id: tabId, businessProfileId: bpId, status: 'OPEN' },
-        include: { items: true },
-    });
-    if (!tab) return res.status(404).json({ success: false, message: 'Open tab not found' });
-
-    // Re-compute totals from items (never trust client totals)
-    let subtotal = 0;
-    for (const item of tab.items) {
-        subtotal += parseFloat(item.lineTotalUsdc);
-    }
-    const taxTotal = subtotal * 0.05; // default 5% tax — configurable
-    const tip = parseFloat(tipAmount || 0);
-    const grandTotal = subtotal + taxTotal + tip;
-
-    // Close the tab with cash
-    const updated = await prisma.dineInTab.update({
-        where: { id: tabId },
-        data: {
-            status: 'PAID',
-            closedAt: new Date(),
-            subtotalUsdc: subtotal,
-            taxTotalUsdc: taxTotal,
-            tipUsdc: tip,
-            grandTotalUsdc: grandTotal,
-            paymentMethod: 'CASH',
-            idempotencyKey,
-            cashReceived: cashReceived ? parseFloat(cashReceived) : null,
-        },
-    });
-
-    // Write ledger entry
+    const { DineInCashCloseService } = require('../services/businessOS/dineInCashCloseService');
     try {
-        await prisma.businessLedgerEntry.create({
-            data: {
-                businessProfileId: bpId,
-                type: 'INCOME',
-                category: 'DINE_IN',
-                description: 'Dine-in cash close (' + tabId.substring(0, 8) + ')',
-                amount: grandTotal,
-                amountGhs: grandTotal,
-                sourceType: 'DINE_IN_CASH',
-                sourceId: tabId,
-                metadata: { tabId, tip, subtotal, taxTotal },
-            },
+        const result = await new DineInCashCloseService(prisma).closeTab({
+            businessProfileId: bpId,
+            actorId: req.user.id,
+            tabId,
+            cashReceived,
+            tipAmount,
+            idempotencyKey,
         });
-    } catch (e) {
-        logger.warn('[pos/cash-close-tab] Failed to write ledger entry:', e.message);
+        const payload = {
+            success: true,
+            tab: result.tab,
+            subtotal: result.subtotal,
+            taxTotal: result.taxTotal,
+            grandTotal: result.grandTotal,
+            change: result.change,
+        };
+        if (result.duplicate) payload.message = 'Duplicate (idempotent)';
+        res.json(payload);
+    } catch (err) {
+        const statusByCode = {
+            INVALID_INPUT: 400,
+            INSUFFICIENT_CASH: 400,
+            TAB_NOT_FOUND: 404,
+            TAB_ALREADY_CLOSED: 409,
+            IDEMPOTENCY_KEY_FOREIGN: 409,
+            IDEMPOTENCY_KEY_CONFLICT: 409,
+        };
+        const status = statusByCode[err.code] || 400;
+        if (status >= 500) logger.error({ err }, '[pos/cash-close-tab]');
+        res.status(status).json({ success: false, message: err.message });
     }
-
-    res.json({
-        success: true,
-        tab: updated,
-        subtotal,
-        taxTotal,
-        grandTotal,
-        change: cashReceived ? parseFloat(cashReceived) - grandTotal : 0,
-    });
 }));
 
 // ── Phase 2: Employee PIN Management (Section 2.4) ──────────────────────────
@@ -3221,8 +3393,8 @@ router.get('/messages/conversations', wrap(async (req, res) => {
             OR: [{ participantAId: userId }, { participantBId: userId }],
         },
         include: {
-            participantA: { select: { id: true, username: true, avatarUrl: true } },
-            participantB: { select: { id: true, username: true, avatarUrl: true } },
+            participantA: { select: { id: true, username: true, profilePictureUrl: true } },
+            participantB: { select: { id: true, username: true, profilePictureUrl: true } },
         },
         orderBy: { lastMessageAt: 'desc' },
     });
@@ -3245,38 +3417,54 @@ router.post('/messages/conversations', wrap(async (req, res) => {
         return res.status(403).json({ success: false, message: 'Recipient must be an active employee' });
     }
 
-    // Check if conversation already exists
-    const existing = await prisma.businessConversation.findFirst({
-        where: {
-            businessProfileId: bpId,
-            OR: [
-                { participantAId: req.user.id, participantBId: parseInt(recipientUserId) },
-                { participantAId: parseInt(recipientUserId), participantBId: req.user.id },
-            ],
-        },
-    });
-    if (existing) return res.json({ success: true, conversation: existing, message: 'Already exists' });
+    // r36: canonical thread lookup + race-safe creation. The read/create pair
+    // is serialized per business with the same BusinessProfile row lock the
+    // direct-message rail uses, so two concurrent creates converge on one
+    // conversation. Staff↔staff threads are tagged channel=INTERNAL (the
+    // customer-support partial unique index does not apply to them).
+    const recipientId = parseInt(recipientUserId);
+    const outcome = await prisma.$transaction(async (tx) => {
+        await tx.$queryRawUnsafe('SELECT "id" FROM "BusinessProfile" WHERE "id" = $1 FOR UPDATE', bpId);
 
-    // Create Conversation + BusinessConversation
-    const conversation = await prisma.conversation.create({
-        data: { type: 'BUSINESS' },
+        const existing = await tx.businessConversation.findFirst({
+            where: {
+                businessProfileId: bpId,
+                channel: 'INTERNAL',
+                OR: [
+                    { participantAId: req.user.id, participantBId: recipientId },
+                    { participantAId: recipientId, participantBId: req.user.id },
+                ],
+            },
+            orderBy: { createdAt: 'asc' },
+            include: {
+                participantA: { select: { id: true, username: true, profilePictureUrl: true } },
+                participantB: { select: { id: true, username: true, profilePictureUrl: true } },
+            },
+        });
+        if (existing) return { conv: existing, created: false };
+
+        const conversation = await tx.conversation.create({ data: { type: 'BUSINESS' } });
+        return {
+            conv: await tx.businessConversation.create({
+                data: {
+                    businessProfileId: bpId,
+                    conversationId: conversation.id,
+                    participantAId: req.user.id,
+                    participantBId: recipientId,
+                    createdBy: req.user.id,
+                    channel: 'INTERNAL',
+                },
+                include: {
+                    participantA: { select: { id: true, username: true, profilePictureUrl: true } },
+                    participantB: { select: { id: true, username: true, profilePictureUrl: true } },
+                },
+            }),
+            created: true,
+        };
     });
 
-    const bizConv = await prisma.businessConversation.create({
-        data: {
-            businessProfileId: bpId,
-            conversationId: conversation.id,
-            participantAId: req.user.id,
-            participantBId: parseInt(recipientUserId),
-            createdBy: req.user.id,
-        },
-        include: {
-            participantA: { select: { id: true, username: true, avatarUrl: true } },
-            participantB: { select: { id: true, username: true, avatarUrl: true } },
-        },
-    });
-
-    res.status(201).json({ success: true, conversation: bizConv });
+    if (!outcome.created) return res.json({ success: true, conversation: outcome.conv, message: 'Already exists' });
+    res.status(201).json({ success: true, conversation: outcome.conv });
 }));
 
 // GET /api/business-os/messages/:conversationId — get messages for a conversation
@@ -3362,6 +3550,7 @@ router.post('/messages/:conversationId/send', wrap(async (req, res) => {
 // ── Ledger: dashboard stats ──────────────────────────────────────────────────
 // Alias that matches what FinanceV2 calls
 router.get('/finance/dashboard', requirePermission('finance.view'), wrap(async (req, res) => {
+    const svc = getServices(req); // r34 fix — handler used svc without declaring it (ReferenceError on every call)
     const bpId = req.businessProfileId;
     const stats = await svc.ledgerService.getDashboardStats(bpId);
     res.json({ data: stats });
@@ -3369,6 +3558,7 @@ router.get('/finance/dashboard', requirePermission('finance.view'), wrap(async (
 
 // ── Ledger: P&L with prior-period comparison ─────────────────────────────────
 router.get('/finance/pl', requirePermission('finance.view'), wrap(async (req, res) => {
+    const svc = getServices(req); // r34 fix — handler used svc without declaring it (ReferenceError on every call)
     const bpId = req.businessProfileId;
     const { startDate, endDate } = req.query;
     const [current, prior] = await Promise.all([
@@ -3385,6 +3575,7 @@ router.get('/finance/pl', requirePermission('finance.view'), wrap(async (req, re
 
 // ── Ledger: cash flow ─────────────────────────────────────────────────────────
 router.get('/finance/cashflow', requirePermission('finance.view'), wrap(async (req, res) => {
+    const svc = getServices(req); // r34 fix — handler used svc without declaring it (ReferenceError on every call)
     const bpId = req.businessProfileId;
     const cf = await svc.ledgerService.getCashFlow(bpId, req.query);
     res.json({ data: cf });
@@ -3392,6 +3583,7 @@ router.get('/finance/cashflow', requirePermission('finance.view'), wrap(async (r
 
 // ── Ledger: expense list ──────────────────────────────────────────────────────
 router.get('/finance/expenses', requirePermission('finance.view'), wrap(async (req, res) => {
+    const svc = getServices(req); // r34 fix — handler used svc without declaring it (ReferenceError on every call)
     const bpId = req.businessProfileId;
     const exp = await svc.ledgerService.getExpenseBreakdown(bpId, req.query);
     res.json({ data: exp });
@@ -3399,6 +3591,7 @@ router.get('/finance/expenses', requirePermission('finance.view'), wrap(async (r
 
 // ── Escrow: held funds total ──────────────────────────────────────────────────
 router.get('/finance/escrow-held', requirePermission('finance.view'), wrap(async (req, res) => {
+    const svc = getServices(req); // r34 fix — handler used svc without declaring it (ReferenceError on every call)
     const bpId = req.businessProfileId;
     // Sum all open escrow balances for this business
     const escrows = await svc.prisma.escrow.findMany({
@@ -3408,12 +3601,14 @@ router.get('/finance/escrow-held', requirePermission('finance.view'), wrap(async
         },
         select: { amountUsdc: true, status: true },
     });
-    const totalHeld = escrows.reduce((s, e) => s + parseFloat(e.amountUsdc || 0), 0);
+    // r39/P1 — exact Decimal sum over DB decimals (parseFloat never here).
+    const totalHeld = escrows.reduce((s, e) => s.plus(new Prisma.Decimal(e.amountUsdc ?? 0)), new Prisma.Decimal(0));
     res.json({ data: { totalHeld, escrowCount: escrows.length, escrows } });
 }));
 
 // ── Recurring Expense Templates ────────────────────────────────────────────────
 router.get('/finance/recurring', requirePermission('finance.view'), wrap(async (req, res) => {
+    const svc = getServices(req); // r34 fix — handler used svc without declaring it (ReferenceError on every call)
     const bpId = req.businessProfileId;
     const templates = await svc.prisma.recurringExpenseTemplate.findMany({
         where: { businessProfileId: bpId },
@@ -3423,6 +3618,7 @@ router.get('/finance/recurring', requirePermission('finance.view'), wrap(async (
 }));
 
 router.post('/finance/recurring', requirePermission('finance.ledger.manage'), wrap(async (req, res) => {
+    const svc = getServices(req); // r34 fix — handler used svc without declaring it (ReferenceError on every call)
     const bpId = req.businessProfileId;
     const { name, category, amount, description, frequency, dayOfMonth, dayOfWeek } = req.body;
     // Compute nextDueAt
@@ -3432,27 +3628,46 @@ router.post('/finance/recurring', requirePermission('finance.ledger.manage'), wr
     else if (frequency === 'WEEKLY') { const dow = dayOfWeek || 1; const diff = (dow + 7 - now.getDay()) % 7 || 7; nextDueAt.setDate(now.getDate() + diff); }
 
     const template = await svc.prisma.recurringExpenseTemplate.create({
-        data: { businessProfileId: bpId, name, category, amount: parseFloat(amount), description, frequency, dayOfMonth, dayOfWeek, nextDueAt },
+        // r39/P1 — exact Decimal write (parseFloat would truncate beyond
+        // 2^53 and binary-round the template amount).
+        data: { businessProfileId: bpId, name, category, amount: amount != null ? new Prisma.Decimal(String(amount)) : undefined, description, frequency, dayOfMonth, dayOfWeek, nextDueAt },
     });
     res.json({ data: template });
 }));
 
 router.patch('/finance/recurring/:id', requirePermission('finance.ledger.manage'), wrap(async (req, res) => {
+    const svc = getServices(req); // r34 fix — handler used svc without declaring it (ReferenceError on every call)
+    // r34/A — mutation-level tenant predicate: the template must belong to
+    // the caller's effective business at the UPDATE boundary itself, not
+    // merely via a prior authorization read. A foreign or unknown id is
+    // indistinguishable from a nonexistent one and fails closed as 404.
+    const bpId = req.businessProfileId;
     const { name, category, amount, description, frequency, dayOfMonth, dayOfWeek, isActive } = req.body;
-    const template = await svc.prisma.recurringExpenseTemplate.update({
-        where: { id: req.params.id },
-        data: { name, category, amount: amount ? parseFloat(amount) : undefined, description, frequency, dayOfMonth, dayOfWeek, isActive },
+    const updated = await svc.prisma.recurringExpenseTemplate.updateMany({
+        where: { id: req.params.id, businessProfileId: bpId },
+        data: { name, category, amount: amount != null ? new Prisma.Decimal(String(amount)) : undefined, description, frequency, dayOfMonth, dayOfWeek, isActive },
+    });
+    if (updated.count === 0) return res.status(404).json({ message: 'Recurring expense template not found' });
+    const template = await svc.prisma.recurringExpenseTemplate.findFirst({
+        where: { id: req.params.id, businessProfileId: bpId },
     });
     res.json({ data: template });
 }));
 
 router.delete('/finance/recurring/:id', requirePermission('finance.ledger.manage'), wrap(async (req, res) => {
-    await svc.prisma.recurringExpenseTemplate.delete({ where: { id: req.params.id } });
+    const svc = getServices(req); // r34 fix — handler used svc without declaring it (ReferenceError on every call)
+    // r34/A — same mutation-level tenant predicate on the delete boundary.
+    const bpId = req.businessProfileId;
+    const deleted = await svc.prisma.recurringExpenseTemplate.deleteMany({
+        where: { id: req.params.id, businessProfileId: bpId },
+    });
+    if (deleted.count === 0) return res.status(404).json({ message: 'Recurring expense template not found' });
     res.json({ ok: true });
 }));
 
 // ── Payroll liability summary ─────────────────────────────────────────────────
 router.get('/finance/payroll-position', requirePermission('finance.view'), wrap(async (req, res) => {
+    const svc = getServices(req); // r34 fix — handler used svc without declaring it (ReferenceError on every call)
     const bpId = req.businessProfileId;
     const [payrolls, ewaRequests] = await Promise.all([
         svc.prisma.payrollRecord.findMany({
@@ -3464,10 +3679,15 @@ router.get('/finance/payroll-position', requirePermission('finance.view'), wrap(
             select: { requestedAmountUsdc: true },
         }),
     ]);
-    const pendingPayroll = payrolls.filter(p => p.status === 'PENDING').reduce((s, p) => s + parseFloat(p.netPayUsdc || 0), 0);
-    const approvedPayroll = payrolls.filter(p => p.status === 'APPROVED').reduce((s, p) => s + parseFloat(p.netPayUsdc || 0), 0);
-    const ewaFloat = ewaRequests.reduce((s, e) => s + parseFloat(e.requestedAmountUsdc || 0), 0);
-    res.json({ data: { pendingPayroll, approvedPayroll, ewaFloat, totalLiability: pendingPayroll + approvedPayroll + ewaFloat } });
+    // r39/P1 — exact Decimal liability aggregation (parseFloat never here).
+    const pendingPayroll = payrolls.filter(p => p.status === 'PENDING')
+        .reduce((s, p) => s.plus(new Prisma.Decimal(p.netPayUsdc ?? 0)), new Prisma.Decimal(0));
+    const approvedPayroll = payrolls.filter(p => p.status === 'APPROVED')
+        .reduce((s, p) => s.plus(new Prisma.Decimal(p.netPayUsdc ?? 0)), new Prisma.Decimal(0));
+    const ewaFloat = ewaRequests
+        .reduce((s, e) => s.plus(new Prisma.Decimal(e.requestedAmountUsdc ?? 0)), new Prisma.Decimal(0));
+    const totalLiability = pendingPayroll.plus(approvedPayroll).plus(ewaFloat);
+    res.json({ data: { pendingPayroll, approvedPayroll, ewaFloat, totalLiability } });
 }));
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -3476,6 +3696,7 @@ router.get('/finance/payroll-position', requirePermission('finance.view'), wrap(
 
 // ── Promotions CRUD ───────────────────────────────────────────────────────────
 router.get('/marketing/promotions', requirePermission('marketing.view'), wrap(async (req, res) => {
+    const svc = getServices(req); // r34 fix — handler used svc without declaring it (ReferenceError on every call)
     const bpId = req.businessProfileId;
     const promos = await svc.prisma.businessPromotion.findMany({
         where: { businessProfileId: bpId },
@@ -3485,6 +3706,7 @@ router.get('/marketing/promotions', requirePermission('marketing.view'), wrap(as
 }));
 
 router.post('/marketing/promotions', requirePermission('marketing.publish'), wrap(async (req, res) => {
+    const svc = getServices(req); // r34 fix — handler used svc without declaring it (ReferenceError on every call)
     const bpId = req.businessProfileId;
     const promo = await svc.prisma.businessPromotion.create({
         data: { ...req.body, businessProfileId: bpId, discountValue: parseFloat(req.body.discountValue) },
@@ -3493,35 +3715,78 @@ router.post('/marketing/promotions', requirePermission('marketing.publish'), wra
 }));
 
 router.patch('/marketing/promotions/:id', requirePermission('marketing.publish'), wrap(async (req, res) => {
-    const promo = await svc.prisma.businessPromotion.update({
-        where: { id: req.params.id },
-        data: { ...req.body, ...(req.body.discountValue ? { discountValue: parseFloat(req.body.discountValue) } : {}) },
+    const svc = getServices(req); // r34 fix — handler used svc without declaring it (ReferenceError on every call)
+    // r34/B — the permission proves the caller may manage promotions in their
+    // effective business; the RESOURCE boundary must still hold. The update
+    // is a conditional mutation on { id, businessProfileId } and, unlike the
+    // previous { ...req.body } spread, only whitelisted fields can change —
+    // a caller-supplied businessProfileId can no longer ride the patch.
+    const bpId = req.businessProfileId;
+    const b = req.body;
+    const data = {};
+    if (b.name !== undefined) data.name = b.name;
+    if (b.code !== undefined) data.code = b.code;
+    if (b.discountType !== undefined) data.discountType = b.discountType;
+    if (b.discountValue !== undefined) data.discountValue = parseFloat(b.discountValue);
+    if (b.buyQuantity !== undefined) data.buyQuantity = b.buyQuantity;
+    if (b.getQuantity !== undefined) data.getQuantity = b.getQuantity;
+    if (b.scope !== undefined) data.scope = b.scope;
+    if (b.minSpendUsdc !== undefined) data.minSpendUsdc = b.minSpendUsdc;
+    if (b.applicableProductIds !== undefined) data.applicableProductIds = b.applicableProductIds;
+    if (b.startDate !== undefined) data.startDate = b.startDate;
+    if (b.endDate !== undefined) data.endDate = b.endDate;
+    if (b.usageLimit !== undefined) data.usageLimit = b.usageLimit;
+    if (b.perCustomerLimit !== undefined) data.perCustomerLimit = b.perCustomerLimit;
+    if (b.isActive !== undefined) data.isActive = b.isActive;
+    if (b.notes !== undefined) data.notes = b.notes;
+    const updated = await svc.prisma.businessPromotion.updateMany({
+        where: { id: req.params.id, businessProfileId: bpId },
+        data,
+    });
+    if (updated.count === 0) return res.status(404).json({ message: 'Promotion not found' });
+    const promo = await svc.prisma.businessPromotion.findFirst({
+        where: { id: req.params.id, businessProfileId: bpId },
     });
     res.json({ data: promo });
 }));
 
 router.delete('/marketing/promotions/:id', requirePermission('marketing.publish'), wrap(async (req, res) => {
-    // Soft-delete: deactivate instead of hard delete to preserve audit trail
-    await svc.prisma.businessPromotion.update({
-        where: { id: req.params.id },
+    const svc = getServices(req); // r34 fix — handler used svc without declaring it (ReferenceError on every call)
+    // Soft-delete: deactivate instead of hard delete to preserve audit trail.
+    // r34/B — the deactivation itself carries the tenant predicate; a
+    // foreign business's promotion is never readable or mutable here.
+    const bpId = req.businessProfileId;
+    const deactivated = await svc.prisma.businessPromotion.updateMany({
+        where: { id: req.params.id, businessProfileId: bpId },
         data: { isActive: false, endDate: new Date() },
     });
+    if (deactivated.count === 0) return res.status(404).json({ message: 'Promotion not found' });
     res.json({ ok: true });
 }));
 
 // ── Reviews: owner respond ─────────────────────────────────────────────────────
 router.post('/marketing/reviews/:id/respond', requirePermission('marketing.publish'), wrap(async (req, res) => {
+    const svc = getServices(req); // r34 fix — handler used svc without declaring it (ReferenceError on every call)
+    // r34/B — the response write is a conditional mutation on
+    // { id, businessProfileId }: a business can only ever answer reviews OF
+    // ITS OWN PROFILE. A foreign review id is not found and not revealed.
+    const bpId = req.businessProfileId;
     const { response } = req.body;
     if (!response?.trim()) return res.status(400).json({ message: 'Response text required' });
-    const review = await svc.prisma.businessReview.update({
-        where: { id: req.params.id },
+    const updated = await svc.prisma.businessReview.updateMany({
+        where: { id: req.params.id, businessProfileId: bpId },
         data: { businessResponse: response.trim(), businessResponseAt: new Date() },
+    });
+    if (updated.count === 0) return res.status(404).json({ message: 'Review not found' });
+    const review = await svc.prisma.businessReview.findFirst({
+        where: { id: req.params.id, businessProfileId: bpId },
     });
     res.json({ data: review });
 }));
 
 // ── Reviews: flag/dispute ──────────────────────────────────────────────────────
 router.post('/marketing/reviews/:id/flag', requirePermission('marketing.publish'), wrap(async (req, res) => {
+    const svc = getServices(req); // r34 fix — handler used svc without declaring it (ReferenceError on every call)
     const { reason } = req.body;
     const bpId = req.businessProfileId;
     // Write an audit log entry for admin review
@@ -3541,6 +3806,7 @@ router.post('/marketing/reviews/:id/flag', requirePermission('marketing.publish'
 // ── Followers broadcast ────────────────────────────────────────────────────────
 // GET /api/business-os/marketing/broadcast/history — list past broadcasts
 router.get('/marketing/broadcast/history', requirePermission('marketing.view'), wrap(async (req, res) => {
+    const svc = getServices(req); // r34 fix — handler used svc without declaring it (ReferenceError on every call)
     const bpId = req.businessProfileId;
     const page = parseInt(req.query.page) || 1;
     const limit = parseInt(req.query.limit) || 20;
@@ -3581,6 +3847,7 @@ router.get('/marketing/broadcast/history', requirePermission('marketing.view'), 
 }));
 
 router.post('/marketing/broadcast', requirePermission('marketing.publish'), wrap(async (req, res) => {
+    const svc = getServices(req); // r34 fix — handler used svc without declaring it (ReferenceError on every call)
     const bpId = req.businessProfileId;
     const { message, title } = req.body;
     if (!message?.trim()) return res.status(400).json({ message: 'Message required' });
@@ -3620,6 +3887,7 @@ router.post('/marketing/broadcast', requirePermission('marketing.publish'), wrap
 
 // ── Follower stats ─────────────────────────────────────────────────────────────
 router.get('/marketing/followers', requirePermission('marketing.view'), wrap(async (req, res) => {
+    const svc = getServices(req); // r34 fix — handler used svc without declaring it (ReferenceError on every call)
     const bpId = req.businessProfileId;
     const [total, recent] = await Promise.all([
         svc.prisma.businessFollower.count({ where: { businessProfileId: bpId } }),
@@ -3630,6 +3898,7 @@ router.get('/marketing/followers', requirePermission('marketing.view'), wrap(asy
 
 // ── Analytics: customer + operational ─────────────────────────────────────────
 router.get('/analytics/customer', requirePermission('analytics.view'), wrap(async (req, res) => {
+    const svc = getServices(req); // r34 fix — handler used svc without declaring it (ReferenceError on every call)
     const bpId = req.businessProfileId;
     const { startDate, endDate } = req.query;
     const dateFilter = startDate && endDate ? { gte: new Date(startDate), lte: new Date(endDate) } : undefined;
@@ -3650,6 +3919,7 @@ router.get('/analytics/customer', requirePermission('analytics.view'), wrap(asyn
 }));
 
 router.get('/analytics/operational', requirePermission('analytics.view'), wrap(async (req, res) => {
+    const svc = getServices(req); // r34 fix — handler used svc without declaring it (ReferenceError on every call)
     const bpId = req.businessProfileId;
     const [kitchenOrders, housekeepingTasks, trips] = await Promise.all([
         svc.prisma.kitchenOrder.findMany({ where: { businessProfileId: bpId }, select: { sentAt: true, servedAt: true, status: true }, take: 500, orderBy: { sentAt: 'desc' } }),
@@ -4143,39 +4413,74 @@ router.get('/export', requirePermission('settings.manage'), wrap(async (req, res
 
 // ── Missing routes found by route-checker ──────────────────────────────────
 
-// GET /api/business-os/finance/payout — process a payout to a destination
+// POST /api/business-os/finance/payout — record a payout request
+// r36/P1 — HONEST CONTRACT: this endpoint previously called itself a payout
+// processor while only writing an audit log ("for now"). It now records a
+// DURABLE BusinessPayoutRequest (status REQUESTED) in one transaction with
+// the audit log, and the response says exactly what happened: a request was
+// recorded. No balance, ledger, settlement, or external transfer is mutated
+// merely because the endpoint was called.
 router.post('/finance/payout', requirePermission('settings.manage'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
-    const bpId = getBizProfileId(req);
+    const bpId = await getBusinessProfileId(req); // r36: the helper is async — getBizProfileId never existed
+    if (!bpId) return res.status(404).json({ success: false, message: 'No business profile found.' });
+
     const { amount, destination } = req.body;
+    const amt = typeof amount === 'string' ? Number(amount) : amount;
+    if (!amt || !Number.isFinite(amt) || amt <= 0 || amt > 1e9) {
+        return res.status(400).json({ success: false, message: 'Amount must be positive' });
+    }
+    if (!destination || typeof destination !== 'string') {
+        return res.status(400).json({ success: false, message: 'Destination required' });
+    }
 
-    if (!amount || amount <= 0) return res.status(400).json({ success: false, message: 'Amount must be positive' });
-    if (!destination) return res.status(400).json({ success: false, message: 'Destination required' });
-
-    // Look up the payout destination
+    // Look up the payout destination (user-scoped)
     const dest = await prisma.payoutDestination.findFirst({
         where: { id: destination, userId: req.user.id },
     });
     if (!dest) return res.status(404).json({ success: false, message: 'Payout destination not found' });
 
-    // For now, just log the payout request — actual transfer requires payment API integration
-    const log = await prisma.auditLog.create({
-        data: {
-            businessProfileId: bpId,
+    const request = await prisma.$transaction(async (tx) => {
+        // STRICT audit: the evidence row is part of the atomic request boundary
+        // (a failed audit write aborts the request record too).
+        const logId = await audit(tx, {
+            actorId: req.user.id,
+            actorName: req.user.username || null,
             action: 'PAYOUT_REQUESTED',
-            entity: 'Finance',
-            details: `Payout of ${amount} USDC to ${dest.nickname} (${dest.destinationType})`,
-            performedBy: req.user.id,
-        },
+            targetType: 'BUSINESS_PAYOUT_REQUEST',
+            targetId: bpId,
+            metadata: {
+                businessProfileId: bpId,
+                amountUsdc: amt,
+                destinationNickname: dest.nickname,
+                destinationType: dest.destinationType,
+            },
+        }, { throwOnError: true });
+        return tx.businessPayoutRequest.create({
+            data: {
+                businessProfileId: bpId,
+                destinationId: dest.id,
+                amount: amt,
+                status: 'REQUESTED',
+                requestLogId: logId,
+                requestedById: req.user.id,
+            },
+        });
     });
 
-    res.json({ success: true, message: 'Payout request submitted', payoutId: log.id });
+    res.json({
+        success: true,
+        message: 'Payout request recorded — no transfer has been made',
+        payoutId: request.id,
+        status: request.status,
+    });
 }));
 
 // PATCH /api/business-os/transit/vehicles/:id/status — update vehicle status
 router.patch('/transit/vehicles/:id/status', requirePermission('transit.fleet.manage'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
-    const bpId = getBizProfileId(req);
+    const bpId = await getBusinessProfileId(req); // r36: async helper — getBizProfileId never existed
+    if (!bpId) return res.status(404).json({ success: false, message: 'No business profile found.' });
     const { id } = req.params;
     const { status } = req.body;
 
@@ -4199,7 +4504,8 @@ router.patch('/transit/vehicles/:id/status', requirePermission('transit.fleet.ma
 // GET /api/business-os/transit/trips — list business transit trips
 router.get('/transit/trips', requirePermission('transit.trips.view'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
-    const bpId = getBizProfileId(req);
+    const bpId = await getBusinessProfileId(req); // r36: async helper — getBizProfileId never existed
+    if (!bpId) return res.status(404).json({ success: false, message: 'No business profile found.' });
 
     const trips = await prisma.transitTrip.findMany({
         where: { businessProfileId: bpId },
@@ -4297,9 +4603,27 @@ router.post('/retail/purchase-orders', requirePermission('retail.manage'), wrap(
     if (!items || !Array.isArray(items) || items.length === 0)
         return res.status(400).json({ success: false, message: 'At least one item is required.' });
 
-    // Generate PO number
-    const count = await prisma.purchaseOrder.count({ where: { businessProfileId: bpId } });
-    const poNumber = `PO-${String(count + 1).padStart(5, '0')}`;
+    // r32/G: the supplier must belong to the effective business — otherwise a
+    // foreign supplier id could be attached to this business's PO.
+    const supplier = await prisma.supplier.findFirst({
+        where: { id: supplierId, businessProfileId: bpId },
+        select: { id: true },
+    });
+    if (!supplier) return res.status(400).json({ success: false, message: 'Supplier not found.' });
+
+    // r32/G: every referenced product (if any) must belong to the effective
+    // business — the receive step increments that product's stock.
+    const productIds = [...new Set(items.map(i => i.productId).filter(Boolean))];
+    if (productIds.length) {
+        const owned = await prisma.businessProduct.findMany({
+            where: { id: { in: productIds }, businessProfileId: bpId },
+            select: { id: true },
+        });
+        if (owned.length !== productIds.length) {
+            return res.status(400).json({ success: false, message: 'One or more products do not belong to this business.' });
+        }
+    }
+
 
     // Calculate totals
     const processedItems = items.map(item => ({
@@ -4312,58 +4636,105 @@ router.post('/retail/purchase-orders', requirePermission('retail.manage'), wrap(
     }));
     const totalCost = processedItems.reduce((sum, item) => sum + item.lineTotal, 0);
 
-    const po = await prisma.purchaseOrder.create({
-        data: {
-            businessProfileId: bpId,
-            poNumber,
-            supplierId,
-            status: 'SUBMITTED',
-            totalCost,
-            notes,
-            expectedDate: expectedDate ? new Date(expectedDate) : null,
-            createdById: req.user.id,
-            items: { create: processedItems },
-        },
-        include: { supplier: true, items: true },
+    // r36/P1: poNumber comes from the durable per-(business, docType)
+    // sequence INSIDE the creation transaction — concurrent creations get
+    // distinct numbers, numbers are never reused after deletion, and the
+    // composite unique index (businessProfileId, poNumber) is the backstop.
+    const po = await prisma.$transaction(async (tx) => {
+        const poNumber = await nextDocumentNumber(tx, bpId, 'PURCHASE_ORDER');
+        return tx.purchaseOrder.create({
+            data: {
+                businessProfileId: bpId,
+                poNumber,
+                supplierId,
+                status: 'SUBMITTED',
+                totalCost,
+                notes,
+                expectedDate: expectedDate ? new Date(expectedDate) : null,
+                createdById: req.user.id,
+                items: { create: processedItems },
+            },
+            include: { supplier: true, items: true },
+        });
     });
     res.json({ success: true, purchaseOrder: po });
 }));
 
 // PATCH /api/business-os/retail/purchase-orders/:id (status update)
+// r32/G — RECEIVE-ONCE AUTHORITY:
+//   • status must be a known value and follow the transition table
+//     (DRAFT/SUBMITTED → SUBMITTED/RECEIVED/CANCELLED; RECEIVED/CANCELLED
+//     are TERMINAL — a PO can never leave them);
+//   • the stock increment runs EXACTLY ONCE: it lives in the same
+//     transaction as the status flip, and the flip is a CAS on the
+//     pre-RECEIVED status, so concurrent or repeated PATCHes cannot
+//     double-apply stock;
+//   • the PO is resolved by { id, businessProfileId } — a foreign id is a
+//     plain 404, never a Prisma error.
 router.patch('/retail/purchase-orders/:id', requirePermission('retail.manage'), wrap(async (req, res) => {
     const prisma = getPrisma(req);
     const bpId = await getBusinessProfileId(req);
     const { id } = req.params;
     const { status, notes, expectedDate } = req.body;
 
+    const PO_STATUS_TRANSITIONS = {
+        DRAFT: ['SUBMITTED', 'RECEIVED', 'CANCELLED'],
+        SUBMITTED: ['RECEIVED', 'CANCELLED'],
+        RECEIVED: [],
+        CANCELLED: [],
+    };
+    if (status !== undefined && !Object.prototype.hasOwnProperty.call(PO_STATUS_TRANSITIONS, status)) {
+        return res.status(400).json({ success: false, message: `Unknown purchase order status: ${status}` });
+    }
+
+    const existing = await prisma.purchaseOrder.findFirst({
+        where: { id, businessProfileId: bpId },
+        select: { id: true, status: true },
+    });
+    if (!existing) return res.status(404).json({ success: false, message: 'Purchase order not found.' });
+
+    if (status !== undefined && status !== existing.status) {
+        const allowed = PO_STATUS_TRANSITIONS[existing.status] || [];
+        if (!allowed.includes(status)) {
+            return res.status(400).json({
+                success: false,
+                message: `Cannot move purchase order from ${existing.status} to ${status}.`,
+            });
+        }
+    }
+
     const updateData = {};
-    if (status) updateData.status = status;
+    if (status !== undefined) updateData.status = status;
     if (notes !== undefined) updateData.notes = notes;
     if (expectedDate !== undefined) updateData.expectedDate = expectedDate ? new Date(expectedDate) : null;
     if (status === 'RECEIVED') updateData.receivedDate = new Date();
 
-    const po = await prisma.purchaseOrder.update({
-        where: { id, businessProfileId: bpId },
-        data: updateData,
-        include: { supplier: true, items: true },
-    });
-
-    // On RECEIVED, update product stock quantities
-    if (status === 'RECEIVED' && po.items) {
-        for (const item of po.items) {
-            if (item.productId) {
-                const product = await prisma.businessProduct.findUnique({ where: { id: item.productId } });
-                if (product) {
-                    const currentQty = product.stockQty || 0;
-                    const receivedQty = item.quantity;
-                    await prisma.businessProduct.update({
-                        where: { id: item.productId },
-                        data: { stockQty: currentQty + receivedQty },
+    const po = await prisma.$transaction(async (tx) => {
+        if (status === 'RECEIVED') {
+            // CAS: only the first receiver flips a non-RECEIVED PO to RECEIVED.
+            const claimed = await tx.purchaseOrder.updateMany({
+                where: { id, businessProfileId: bpId, status: { not: 'RECEIVED' } },
+                data: updateData,
+            });
+            if (claimed.count !== 1) {
+                throw new Error('Purchase order already received.');
+            }
+            const items = await tx.purchaseOrderItem.findMany({ where: { purchaseOrderId: id } });
+            for (const item of items) {
+                if (item.productId) {
+                    // Increment atomically, scoped to the effective business.
+                    await tx.businessProduct.updateMany({
+                        where: { id: item.productId, businessProfileId: bpId },
+                        data: { stockQty: { increment: item.quantity } },
                     });
                 }
             }
+        } else {
+            await tx.purchaseOrder.update({ where: { id }, data: updateData });
         }
-    }
+
+        return tx.purchaseOrder.findUnique({ where: { id }, include: { supplier: true, items: true } });
+    });
 
     res.json({ success: true, purchaseOrder: po });
 }));
@@ -4393,31 +4764,32 @@ router.post('/retail/stock-counts', requirePermission('retail.manage'), wrap(asy
 
     const { notes } = req.body;
 
-    // Generate count number
-    const count = await prisma.stockCount.count({ where: { businessProfileId: bpId } });
-    const countNumber = `SC-${String(count + 1).padStart(5, '0')}`;
-
     // Get all products that have stock tracking enabled
     const products = await prisma.businessProduct.findMany({
         where: { businessProfileId: bpId, isActive: true, stockQty: { not: null } },
         select: { id: true, stockQty: true, name: true, sku: true },
     });
 
-    const stockCount = await prisma.stockCount.create({
-        data: {
-            businessProfileId: bpId,
-            countNumber,
-            status: 'OPEN',
-            notes,
-            createdById: req.user.id,
-            items: {
-                create: products.map(p => ({
-                    productId: p.id,
-                    systemQty: p.stockQty || 0,
-                })),
+    // r36/P1: countNumber comes from the durable per-(business, docType)
+    // sequence INSIDE the creation transaction (see PurchaseOrder).
+    const stockCount = await prisma.$transaction(async (tx) => {
+        const countNumber = await nextDocumentNumber(tx, bpId, 'STOCK_COUNT');
+        return tx.stockCount.create({
+            data: {
+                businessProfileId: bpId,
+                countNumber,
+                status: 'OPEN',
+                notes,
+                createdById: req.user.id,
+                items: {
+                    create: products.map(p => ({
+                        productId: p.id,
+                        systemQty: p.stockQty || 0,
+                    })),
+                },
             },
-        },
-        include: { items: true },
+            include: { items: true },
+        });
     });
     res.json({ success: true, stockCount });
 }));
@@ -4434,6 +4806,12 @@ router.patch('/retail/stock-counts/:id/items/:itemId', requirePermission('retail
         include: { stockCount: true },
     });
     if (!item) return res.status(404).json({ success: false, message: 'Stock count item not found.' });
+
+    // r32/H: a reconciled count is a settled financial record — counting into
+    // it afterwards silently diverges from the stock that was applied.
+    if (item.stockCount.status === 'RECONCILED') {
+        return res.status(400).json({ success: false, message: 'This stock count has already been reconciled.' });
+    }
 
     const discrepancy = countedQty !== null && countedQty !== undefined
         ? parseInt(countedQty, 10) - item.systemQty
@@ -4459,21 +4837,42 @@ router.post('/retail/stock-counts/:id/reconcile', requirePermission('retail.mana
     if (!stockCount) return res.status(404).json({ success: false, message: 'Stock count not found.' });
     if (stockCount.status === 'RECONCILED') return res.status(400).json({ success: false, message: 'Already reconciled.' });
 
-    // Apply counted quantities to products
-    for (const item of stockCount.items) {
-        if (item.countedQty !== null && item.countedQty !== undefined) {
-            await prisma.businessProduct.update({
-                where: { id: item.productId },
-                data: { stockQty: item.countedQty },
-            });
+    // r32/H — RECONCILE-ONCE: the status flip is a CAS on a non-RECONCILED
+    // count and the product writes live in the SAME transaction, so two
+    // concurrent reconciles converge on one application, and items cannot be
+    // re-counted between the product writes and the flip.
+    await prisma.$transaction(async (tx) => {
+        // Fresh items read INSIDE the transaction.
+        const items = await tx.stockCountItem.findMany({ where: { stockCountId: id } });
+        // r36/P1: ALL-OR-NOTHING reconciliation. A product deleted after the
+        // count was opened previously made updateMany silently match 0 rows —
+        // the count then closed with PARTIAL stock application. Now every
+        // counted item must resolve to EXACTLY one business-scoped product
+        // write; a single mismatch throws and the whole transaction (and the
+        // status flip) rolls back — the count stays OPEN, stock stays intact.
+        for (const item of items) {
+            if (item.countedQty !== null && item.countedQty !== undefined) {
+                // Scoped to the effective business (defense in depth).
+                const applied = await tx.businessProduct.updateMany({
+                    where: { id: item.productId, businessProfileId: bpId },
+                    data: { stockQty: item.countedQty },
+                });
+                if (applied.count !== 1) {
+                    throw Object.assign(
+                        new Error('Product ' + item.productId + ' no longer belongs to this business — reconciliation aborted with no stock changes applied.'),
+                        { status: 400, code: 'PRODUCT_MISSING' }
+                    );
+                }
+            }
         }
-    }
-
-    const updated = await prisma.stockCount.update({
-        where: { id },
-        data: { status: 'RECONCILED', reconciledAt: new Date() },
-        include: { items: true },
+        const claimed = await tx.stockCount.updateMany({
+            where: { id, businessProfileId: bpId, status: { not: 'RECONCILED' } },
+            data: { status: 'RECONCILED', reconciledAt: new Date() },
+        });
+        if (claimed.count !== 1) throw new Error('Already reconciled.');
     });
+
+    const updated = await prisma.stockCount.findUnique({ where: { id }, include: { items: true } });
     res.json({ success: true, stockCount: updated });
 }));
 

@@ -22,10 +22,12 @@ describe('business invoice default tax contract', () => {
       idempotencyKey: 'inv-default-1',
     });
 
-    assert.equal(invoice.subtotalUsdc, 40);
-    assert.equal(invoice.taxTotalUsdc, 5);
-    assert.equal(invoice.billTotalUsdc, 45);
-    assert.deepEqual(invoice.taxLines, [{ name: 'VAT', type: 'PERCENTAGE', value: 12.5, computedAmount: 5 }]);
+    assert.equal(invoice.subtotalUsdc.toFixed(8), '40.00000000');
+    assert.equal(invoice.taxTotalUsdc.toFixed(8), '5.00000000');
+    assert.equal(invoice.billTotalUsdc.toFixed(8), '45.00000000');
+    assert.equal(invoice.taxLines[0].computedAmount.toFixed(8), '5.00000000');
+    assert.equal(invoice.taxLines[0].name, 'VAT');
+    assert.equal(invoice.taxLines[0].type, 'PERCENTAGE');
   });
 
   test('explicit empty taxLines remain tax-free', async () => {
@@ -47,8 +49,8 @@ describe('business invoice default tax contract', () => {
       idempotencyKey: 'inv-explicit-tax-free-1',
     });
 
-    assert.equal(invoice.taxTotalUsdc, 0);
-    assert.equal(invoice.billTotalUsdc, 20);
+    assert.equal(invoice.taxTotalUsdc.toFixed(8), '0.00000000');
+    assert.equal(invoice.billTotalUsdc.toFixed(8), '20.00000000');
     assert.deepEqual(invoice.taxLines, []);
     assert.equal(defaultLookups, 0);
   });

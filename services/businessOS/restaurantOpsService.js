@@ -6,6 +6,17 @@
 // =============================================================================
 
 const logger = require('../../src/config/logger');
+
+// Serializable-conflict retry policy (shared with the feedback aggregate
+// recompute pattern): concurrent KDS item mutations must converge on ONE
+// consistent parent-order status, so the item write + parent recompute run
+// under Serializable isolation and retry on serialization conflicts.
+const SERIALIZABLE_RETRY_LIMIT = 3;
+const isSerializableConflict = (error) => error?.code === 'P2034';
+const waitForRetry = (attempt) => new Promise((resolve) => {
+    setTimeout(resolve, 10 * (2 ** attempt));
+});
+
 class RestaurantOpsService {
     constructor(prisma) {
         this.prisma = prisma;
@@ -99,6 +110,7 @@ class RestaurantOpsService {
         const orders = await this.prisma.kitchenOrder.findMany({
             where,
             orderBy: { ticketNumber: 'asc' },
+            include: { items: true, businessOrder: { include: { customer: true } } },
         });
 
         orders.sort((a, b) => {
@@ -109,7 +121,10 @@ class RestaurantOpsService {
 
         const byStation = {};
         orders.forEach(order => {
-            const items = order.orderItems || [];
+            // r32: KitchenOrder's item relation is `items` (KitchenOrderItem
+            // rows). The legacy `orderItems` reads returned nothing, so the
+            // station projection was permanently empty.
+            const items = order.items || [];
             items.forEach(item => {
                 const itemStation = item.station || order.station || 'HOT';
                 if (!byStation[itemStation]) byStation[itemStation] = [];
@@ -131,12 +146,29 @@ class RestaurantOpsService {
     }
 
     // KDS bump bar — business scope is mandatory for portal callers.
+    // r32: canonical forward-only kitchen order progression. Re-submitting
+    // the CURRENT status is an idempotent no-op; skipping states, jumping
+    // backwards, or unknown values are refused.
+    static ORDER_FLOW = ['NEW', 'PREPARING', 'READY', 'SERVED'];
+
     async updateOrderStatus(orderId, status, businessProfileId) {
         if (!businessProfileId) throw new Error('Business profile context is required.');
+        const FLOW = RestaurantOpsService.ORDER_FLOW;
+        if (!FLOW.includes(status)) throw new Error('Invalid kitchen order status: ' + status);
+
         const order = await this.prisma.kitchenOrder.findFirst({
             where: { id: orderId, businessProfileId },
         });
         if (!order) throw new Error('Kitchen order not found.');
+
+        // Idempotent re-submit of the current status: converge, don't error.
+        if (order.status === status) return this.prisma.kitchenOrder.findUnique({ where: { id: orderId }, include: { businessOrder: { include: { customer: true } } } });
+
+        const currentIdx = FLOW.indexOf(order.status);
+        const nextIdx = FLOW.indexOf(status);
+        if (currentIdx === -1 || nextIdx !== currentIdx + 1) {
+            throw new Error(`Invalid status transition ${order.status} → ${status}.`);
+        }
 
         const updates = { status };
         if (status === 'PREPARING' && !order.startedAt) updates.startedAt = new Date();
@@ -164,39 +196,104 @@ class RestaurantOpsService {
         return updated;
     }
 
-    async updateItemStatus(orderId, itemIndex, status, businessProfileId) {
+    // r32 audit item D — CANONICAL ITEM IDENTIFIER CONTRACT.
+    // The live Business Portal sends `itemId` (a KitchenOrderItem row id);
+    // the schema models items as real rows, so a durable row id is the
+    // canonical mutation key — NOT a positional index (indices reorder and
+    // race). The item is resolved THROUGH its tenant-scoped parent order:
+    // a foreign item id can never be addressed.
+    // Status follows the same forward-only FLOW as the order; re-submitting
+    // the current item status is an idempotent no-op. The item write and the
+    // derived parent-order status recompute are ONE transaction.
+    // r32: bump (advance one step along the canonical FLOW). The pre-read is
+    // tenant-scoped: a foreign order id is refused before any state is
+    // observed or mutated. A SERVED order stays SERVED (idempotent).
+    async bumpOrderStatus(orderId, businessProfileId) {
         if (!businessProfileId) throw new Error('Business profile context is required.');
-        if (!Number.isInteger(itemIndex) || itemIndex < 0) {
-            throw new Error('Invalid kitchen item index.');
-        }
+        const FLOW = RestaurantOpsService.ORDER_FLOW;
+        const order = await this.prisma.kitchenOrder.findFirst({
+            where: { id: orderId, businessProfileId },
+            select: { id: true, status: true },
+        });
+        if (!order) throw new Error('Kitchen order not found.');
+        const currentIdx = FLOW.indexOf(order.status);
+        const nextStatus = currentIdx >= 0 && currentIdx < FLOW.length - 1 ? FLOW[currentIdx + 1] : order.status;
+        return this.updateOrderStatus(orderId, nextStatus, businessProfileId);
+    }
+
+    async updateItemStatus(orderId, itemId, status, businessProfileId) {
+        if (!businessProfileId) throw new Error('Business profile context is required.');
+        if (!itemId || typeof itemId !== 'string') throw new Error('A kitchen item id is required.');
+        const FLOW = RestaurantOpsService.ORDER_FLOW;
+        if (!FLOW.includes(status)) throw new Error('Invalid kitchen item status: ' + status);
 
         const order = await this.prisma.kitchenOrder.findFirst({
             where: { id: orderId, businessProfileId },
-            include: { orderItems: true },
+            select: { id: true, status: true },
         });
         if (!order) throw new Error('Order not found.');
 
-        const items = Array.isArray(order.orderItems) ? [...order.orderItems] : [];
-        if (itemIndex >= items.length) throw new Error('Kitchen item not found.');
+        const item = await this.prisma.kitchenOrderItem.findFirst({
+            where: { id: itemId, kitchenOrderId: orderId },
+            select: { id: true, status: true },
+        });
+        if (!item) throw new Error('Kitchen item not found.');
 
-        items[itemIndex] = { ...items[itemIndex], status };
-
-        const allReady = items.length > 0 && items.every(i => i.status === 'READY' || i.status === 'SERVED');
-        const allServed = items.length > 0 && items.every(i => i.status === 'SERVED');
-
-        const updates = { orderItems: items };
-        if (allServed) {
-            updates.status = 'SERVED';
-            updates.servedAt = new Date();
-        } else if (allReady) {
-            updates.status = 'READY';
-            updates.readyAt = new Date();
+        // Idempotent re-submit: no-op unless the parent order derives a new
+        // aggregate status below.
+        if (item.status !== status) {
+            const currentIdx = FLOW.indexOf(item.status);
+            const nextIdx = FLOW.indexOf(status);
+            if (currentIdx === -1 || nextIdx !== currentIdx + 1) {
+                throw new Error(`Invalid item status transition ${item.status} → ${status}.`);
+            }
         }
 
-        return this.prisma.kitchenOrder.update({
-            where: { id: orderId },
-            data: updates,
-        });
+        // Serializable so concurrent item mutations cannot each observe a
+        // partial item set and lose the parent recompute: the last writer
+        // always re-reads ALL items and converges the parent status.
+        for (let attempt = 0; attempt < SERIALIZABLE_RETRY_LIMIT; attempt += 1) {
+            try {
+                return await this.prisma.$transaction(async (tx) => {
+                    if (item.status !== status) {
+                        await tx.kitchenOrderItem.update({
+                            where: { id: itemId },
+                            data: { status, bumpedAt: status === 'SERVED' ? new Date() : undefined },
+                        });
+                    }
+
+                    // Recompute the parent order status from ALL its item rows.
+                    const items = await tx.kitchenOrderItem.findMany({
+                        where: { kitchenOrderId: orderId },
+                        select: { status: true },
+                    });
+                    const allServed = items.length > 0 && items.every(i => i.status === 'SERVED');
+                    const allReady = items.length > 0 && items.every(i => i.status === 'READY' || i.status === 'SERVED');
+
+                    const updates = {};
+                    if (allServed) { updates.status = 'SERVED'; updates.servedAt = new Date(); }
+                    else if (allReady) { updates.status = 'READY'; updates.readyAt = new Date(); }
+
+                    // The parent may already have advanced past the derived
+                    // status (e.g. a chef bumped the whole ticket): only move
+                    // it FORWARD, never backwards, and skip equal states.
+                    const parentNow = await tx.kitchenOrder.findUnique({ where: { id: orderId }, select: { status: true } });
+                    const FLOW = RestaurantOpsService.ORDER_FLOW;
+                    if (updates.status
+                        && FLOW.indexOf(updates.status) > FLOW.indexOf(parentNow.status)) {
+                        await tx.kitchenOrder.update({ where: { id: orderId }, data: updates });
+                    }
+
+                    return tx.kitchenOrder.findUnique({ where: { id: orderId }, include: { items: true } });
+                }, { isolationLevel: 'Serializable' });
+            } catch (error) {
+                if (!isSerializableConflict(error) || attempt === SERIALIZABLE_RETRY_LIMIT - 1) {
+                    throw error;
+                }
+                await waitForRetry(attempt);
+            }
+        }
+        throw new Error('Kitchen item update failed after retries.');
     }
 
     async assignChef(orderId, employeeId, businessProfileId) {
