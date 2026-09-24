@@ -151,6 +151,8 @@ run('r36/P1 — dine-in table status race', () => {
 
     test('foreign business table → 404', async () => {
         expect((await setStatus(tableB.id, 'SEATED')).status).toBe(404);
-        expect(await db.dineInTab.count()).toBe(0);
+        // Scoped to this business's tables: parallel CI suites may hold
+        // their own DineInTab rows in the shared DB.
+        expect(await db.dineInTab.count({ where: { tableId: { in: [tableA.id, tableB.id] } } })).toBe(0);
     });
 });

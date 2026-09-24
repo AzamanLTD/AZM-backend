@@ -94,6 +94,10 @@ run('r36/P1 — business runtime: payout contract + transit crash fixes', () => 
     describe('POST /finance/payout — the honest contract', () => {
         test('records a durable REQUESTED row + audit log and moves NO money', async () => {
             const balanceBefore = Number((await db.user.findUnique({ where: { id: A.owner.id } })).availableBalance);
+            // Snapshot table state: CI runs suites in parallel on a shared DB,
+            // so only DELTAS are hermetic — other suites may hold rows.
+            const thBefore = await db.transactionHistory.count({ where: { type: { not: 'DEPOSIT_CRYPTO' } } });
+            const ledgerBefore = await db.ledgerTransaction.count();
             const res = await payout({ amount: 50, destination: destA.id });
             expect(res.status).toBe(200);
             expect(res.body.success).toBe(true);
@@ -116,21 +120,21 @@ run('r36/P1 — business runtime: payout contract + transit crash fixes', () => 
             // NO money moved: balance, history, ledger all untouched.
             const balanceAfter = Number((await db.user.findUnique({ where: { id: A.owner.id } })).availableBalance);
             expect(balanceAfter).toBeCloseTo(balanceBefore, 6);
-            expect(await db.transactionHistory.count({ where: { type: { not: 'DEPOSIT_CRYPTO' } } })).toBe(0);
-            expect(await db.ledgerTransaction.count()).toBe(0);
+            expect(await db.transactionHistory.count({ where: { type: { not: 'DEPOSIT_CRYPTO' } } })).toBe(thBefore);
+            expect(await db.ledgerTransaction.count()).toBe(ledgerBefore);
         });
 
         test('a destination belonging to ANOTHER user is refused (404)', async () => {
             const res = await payout({ amount: 10, destination: destB.id });
             expect(res.status).toBe(404);
-            expect(await db.businessPayoutRequest.count()).toBe(0);
+            expect(await db.businessPayoutRequest.count({ where: { requestedById: A.owner.id } })).toBe(0);
             expect(await db.auditLog.count({ where: { action: 'PAYOUT_REQUESTED' } })).toBe(0);
         });
 
         test.each([[0], [-5], ['abc'], [undefined], [1e12]])('invalid amount %p → 400, nothing recorded', async (bad) => {
             const res = await payout({ amount: bad, destination: destA.id });
             expect(res.status).toBe(400);
-            expect(await db.businessPayoutRequest.count()).toBe(0);
+            expect(await db.businessPayoutRequest.count({ where: { requestedById: A.owner.id } })).toBe(0);
         });
 
         test('missing destination → 400; random destination id → 404', async () => {
