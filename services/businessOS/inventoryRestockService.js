@@ -95,19 +95,32 @@ class InventoryRestockService {
         // Fingerprint only caller-controlled economics. In particular, do NOT
         // include catalog cost, stock or active status: replay must survive
         // subsequent catalog changes without re-executing the operation.
-        // NOTE: the fingerprint is intentionally computed from the SAME
-        // normalized floats the original formula used — JSON.stringify of a
-        // Prisma.Decimal would change the digest and strand every operation
-        // committed before §Wave-1B behind 409s. The exact decimals parsed
-        // above are for ledger arithmetic, not for identity.
-        const fingerprint = createHash('sha256').update(JSON.stringify([
+        //
+        // r40 — FINGERPRINT VERSIONING. The v1 digest was computed from
+        // FLOAT-NORMALIZED economics (Number(qty)); two requests that differ
+        // only beyond double precision collided, so a "replay" of a different
+        // purchase silently returned the first operation's result. v2 digests
+        // the EXACT decimal strings. Versioning (not re-hashing) is what makes
+        // the migration safe: every operation stores the version it was
+        // committed under, replay verifies against THAT version, and no
+        // pre-r40 operation can ever be stranded behind a 409. New operations
+        // always commit under v2.
+        const fingerprintV1 = createHash('sha256').update(JSON.stringify([
             businessProfileId, itemId, Number(qty.toString()), hasExplicitCost ? Number(suppliedCost.toString()) : 'DEFAULT_COST',
         ])).digest('hex');
+        const fingerprint = createHash('sha256').update(JSON.stringify([
+            businessProfileId, itemId, qty.toString(), hasExplicitCost ? suppliedCost.toString() : 'DEFAULT_COST',
+        ])).digest('hex');
+        const FINGERPRINT_VERSION = 2;
         const identity = { businessProfileId_idempotencyKey: { businessProfileId, idempotencyKey } };
         const replay = async () => {
             const committed = await this.prisma.inventoryRestockOperation.findUnique({ where: identity });
             if (!committed) return null;
-            if (committed.requestFingerprint !== fingerprint)
+            // Replay against the version the operation was COMMITTED under:
+            // v1 rows verify with the legacy float digest, v2 with the exact
+            // decimal digest. A row with no version is pre-r40 = v1.
+            const committedVersion = committed.fingerprintVersion || 1;
+            if (committed.requestFingerprint !== (committedVersion === 1 ? fingerprintV1 : fingerprint))
                 throw restockError('RESTOCK_IDEMPOTENCY_CONFLICT', 'Idempotency-Key already belongs to a different restock.', 409);
             if (!committed.result || !committed.ledgerId)
                 throw restockError('RESTOCK_INCOMPLETE_OPERATION', 'Restock operation is incomplete.', 409);
@@ -124,7 +137,7 @@ class InventoryRestockService {
                 // waits for the first transaction to commit or roll back; no
                 // second stock/expense writes can occur before this claim.
                 const operation = await tx.inventoryRestockOperation.create({
-                    data: { id: randomUUID(), businessProfileId, itemId, idempotencyKey, requestFingerprint: fingerprint },
+                    data: { id: randomUUID(), businessProfileId, itemId, idempotencyKey, requestFingerprint: fingerprint, fingerprintVersion: FINGERPRINT_VERSION },
                 });
                 const item = await tx.inventoryItem.findFirst({
                     where: { id: itemId, businessProfileId },

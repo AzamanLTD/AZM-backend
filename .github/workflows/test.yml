@@ -119,6 +119,9 @@ jobs:
       - name: Install reservation capacity authority
         run: node infra/install-reservation-capacity-overlay.js
 
+      - name: Install E2EE server-blind authority
+        run: node infra/install-e2ee-server-blind-overlay.js
+
       - name: Generate Prisma client
         run: npx prisma generate
 

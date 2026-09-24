@@ -170,6 +170,7 @@ jobs:
             "__tests__/r30-r25-r29-funding-lifecycle-integration.test.js"
             "__tests__/r31-reservation-capacity-authority.test.js"
             "__tests__/inventory-restock-idempotency.test.js"
+            "__tests__/r40-restock-fingerprint-v2.pg.test.js"
             "__tests__/azm-conversion-economic-atomicity.test.js"
             "__tests__/azm-stake-economic-atomicity.test.js"
             "__tests__/azm-gift-economic-atomicity.test.js"

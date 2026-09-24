@@ -18,6 +18,8 @@ const ddl = [
   `CREATE UNIQUE INDEX IF NOT EXISTS "InventoryRestockOperation_businessProfileId_idempotencyKey_key"
     ON "InventoryRestockOperation"("businessProfileId", "idempotencyKey")`,
   `CREATE INDEX IF NOT EXISTS "InventoryRestockOperation_itemId_idx" ON "InventoryRestockOperation"("itemId")`,
+  // r40 — fingerprint versioning (v1 float digest -> v2 exact-decimal digest)
+  `ALTER TABLE "InventoryRestockOperation" ADD COLUMN IF NOT EXISTS "fingerprintVersion" INTEGER NOT NULL DEFAULT 1`,
   `DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname='InventoryRestockOperation_businessProfileId_fkey') THEN
     ALTER TABLE "InventoryRestockOperation" ADD CONSTRAINT "InventoryRestockOperation_businessProfileId_fkey"
       FOREIGN KEY ("businessProfileId") REFERENCES "BusinessProfile"("id") ON DELETE CASCADE ON UPDATE CASCADE;

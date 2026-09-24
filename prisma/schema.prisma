@@ -840,10 +840,9 @@ model User {
   sentDirectMessages     DirectMessage[] @relation("DirectMessageSender")
   receivedDirectMessages DirectMessage[] @relation("DirectMessageReceiver")
 
-  // E2EE key material
-  e2eePreKeyBundle      E2EEPreKeyBundle?
-  e2eeOneTimePreKeys    E2EEOneTimePreKey[] @relation("UserOneTimePreKeys")
-  e2eeSessions          E2EESession[]       @relation("UserE2EESessions")
+  // E2EE (r40): public-key directory only — see docs/e2ee-protocol.md
+  e2eeDevices           E2eeDevice[]        @relation("UserE2EEDevices")
+  e2eeOneTimePreKeys    E2eeOneTimePreKey[]  @relation("UserE2EEOneTimePreKeys")
   fraudAssessments      FraudAssessment[]
   sentPeerTransfers     PeerTransfer[]      @relation("PeerTransferSender")
   receivedPeerTransfers PeerTransfer[]      @relation("PeerTransferReceiver")
@@ -1303,6 +1302,11 @@ model Message {
   replyToId         String?
   replyToText       String?
   replyToSenderName String?
+
+  // E2EE (r40): ciphertext envelope per docs/e2ee-protocol.md. When present,
+  // `content` is empty — the server persists and relays opaque ciphertext and
+  // cannot decrypt it (no private key material exists server-side).
+  e2eeEnvelope Json?
 
   // Disappearing messages (Phase 2): if set, message is auto-deleted after
   // this many seconds. expiresAt is computed on send = createdAt + seconds.
@@ -5565,6 +5569,10 @@ model InventoryRestockOperation {
   itemId             String
   idempotencyKey     String   @db.VarChar(128)
   requestFingerprint String   @db.VarChar(64)
+  // r40 — fingerprint versioning: v1 = float-normalized digest (legacy,
+  // collides beyond double precision), v2 = exact-decimal digest. Replay
+  // verifies against the version the operation was committed under.
+  fingerprintVersion Int      @default(1)
   result             Json?
   ledgerId           String?
   createdAt          DateTime @default(now())
@@ -6395,77 +6403,50 @@ model RestrictedObligation {
 
 // ── E2EE (Signal-style Protocol) ─────────────────────────────────────────────
 
-model E2EEPreKeyBundle {
-  id     String @id @default(uuid())
-  userId Int
+// ── E2EE (r40): server-blind key directory ──────────────────────────────────
+// PUBLIC KEY MATERIAL ONLY. The server never generates, stores or returns
+// private keys (docs/e2ee-protocol.md). Private keys live in the client OS
+// keystore. These models replace the pre-r40 E2EEPreKeyBundle /
+// E2EEOneTimePreKey / E2EESession models, which stored server-side private
+// identity/session material and made the server a decryption authority.
+model E2eeDevice {
+  id                 String   @id @default(uuid())
+  userId             Int
+  deviceId           String   @db.VarChar(128)
+  signingPublicKey   String   @db.VarChar(100) // Ed25519 pub (b64) — identity anchor
+  identityPublicKey  String   @db.VarChar(100) // X25519 DH identity pub (b64)
+  bindingSignature   String   @db.VarChar(200) // Ed25519 sig binding the two keys
+  signedPreKeyId     Int
+  signedPreKeyPublicKey  String @db.VarChar(100) // X25519 pub (b64)
+  signedPreKeySignature   String @db.VarChar(200) // Ed25519 sig over the SPK pub
+  isActive           Boolean  @default(true)
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
 
-  // Identity key (long-term, per user)
-  identityPublicKey  String  @db.VarChar(100)
-  identityPrivateKey String? @db.VarChar(100) // Only stored if user opts to back up; null otherwise
+  user User @relation("UserE2EEDevices", fields: [userId], references: [id], onDelete: Cascade)
 
-  // Signed preKey (rotated periodically)
-  signedPreKeyId         Int
-  signedPreKeyPublicKey  String  @db.VarChar(100)
-  signedPreKeyPrivateKey String? @db.VarChar(100) // Server needs this to complete session on receiver side
-  signedPreKeySignature  String  @db.VarChar(200)
+  @@map("E2EEDevice")
 
-  // Active session root key (per friendship/contact pair)
-  // Stored encrypted or as derived key material
-  activeRootKey  String? @db.VarChar(200)
-  activeChainKey String? @db.VarChar(200)
-  messageNumber  Int     @default(0)
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
-
-  @@unique([userId])
-  @@index([userId])
+  @@unique([userId, deviceId])
+  @@index([userId, isActive])
 }
 
-model E2EEOneTimePreKey {
-  id         String  @id @default(uuid())
-  userId     Int
-  keyId      Int
-  publicKey  String  @db.VarChar(100)
-  privateKey String  @db.VarChar(100) // Server needs this to complete X3DH
-  isUsed     Boolean @default(false)
-
-  createdAt DateTime  @default(now())
+model E2eeOneTimePreKey {
+  id        String   @id @default(uuid())
+  userId    Int
+  keyId     Int
+  publicKey String   @db.VarChar(100) // X25519 pub (b64) — PRIVATE KEY NEVER UPLOADED
+  isUsed    Boolean  @default(false)
+  createdAt DateTime @default(now())
   usedAt    DateTime?
 
-  user User @relation("UserOneTimePreKeys", fields: [userId], references: [id], onDelete: Cascade)
+  user   User       @relation("UserE2EEOneTimePreKeys", fields: [userId], references: [id], onDelete: Cascade)
 
+  @@map("E2EEOneTimePreKey")
+
+  @@unique([userId, keyId])
   @@index([userId, isUsed])
-  @@index([keyId])
 }
-
-model E2EESession {
-  id         String @id @default(uuid())
-  userId     Int // The user who owns this session
-  peerUserId Int // The other party
-
-  // Session state
-  rootKey              String  @db.VarChar(200)
-  sendingChainKey      String? @db.VarChar(200)
-  receivingChainKey    String? @db.VarChar(200)
-  sendMessageNumber    Int     @default(0)
-  receiveMessageNumber Int     @default(0)
-
-  // Initial ephemeral key from X3DH
-  peerEphemeralPublicKey String? @db.VarChar(100)
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  user User @relation("UserE2EESessions", fields: [userId], references: [id], onDelete: Cascade)
-
-  @@unique([userId, peerUserId])
-  @@index([userId, peerUserId])
-}
-
-// ── Fraud Detection ─────────────────────────────────────────────────────────────
 
 model FraudAssessment {
   id              String  @id @default(uuid())
