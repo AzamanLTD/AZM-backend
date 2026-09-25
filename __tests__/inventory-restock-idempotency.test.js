@@ -64,6 +64,10 @@ describeWithDb('inventory restock durable economic identity (PostgreSQL)', () =>
     test('ledger write failure rolls back stock, key and ledger; same key later succeeds', async () => {
         const failOnce = new InventoryRestockService({
             inventoryRestockOperation: db.inventoryRestockOperation,
+            // §r40.5: the injected client must expose the intent model too —
+            // the restock service binds intent keys to their registered
+            // operation BEFORE any economic mutation.
+            inventoryRestockIntent: db.inventoryRestockIntent,
             $transaction: (fn) => db.$transaction(tx => fn(new Proxy(tx, { get(target, prop) {
                 if (prop === 'businessLedgerEntry') return { create: async () => { throw new Error('injected ledger failure'); } };
                 return target[prop];

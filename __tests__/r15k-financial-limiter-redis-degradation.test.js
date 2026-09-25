@@ -29,6 +29,44 @@ const buildApp = () => {
     return app;
 };
 
+describe('r40.4: E2EE bundle limiter degradation when Redis is unavailable', () => {
+    afterEach(() => middleware.__setRedisErroringForTest(false));
+
+    // OPKs are a consumptive cryptographic resource: during a Redis outage
+    // the bundle limiter must NOT fail open (r40.4 audit P2) — it degrades
+    // to the in-process memory limiter with the same per-pair thresholds.
+    const buildE2eeApp = () => {
+        const app = express();
+        app.get('/keys/:userId',
+            (req, res, next) => { req.user = { id: Number(req.query.claimant) || 7 }; next(); },
+            middleware.e2eeBundleLimiter,
+            (req, res) => res.json({ ok: true }));
+        return app;
+    };
+
+    test('DEGRADED: bundle claims are STILL bounded — 10 per pair pass, the 11th is 429 (never unlimited)', async () => {
+        middleware.__setRedisErroringForTest(true);
+        const app = buildE2eeApp();
+        const statuses = [];
+        for (let i = 0; i < 11; i++) {
+            statuses.push((await request(app).get('/keys/victim-1')).status);
+        }
+        expect(statuses.slice(0, 10)).toEqual(Array(10).fill(200));
+        expect(statuses[10]).toBe(429);
+    });
+
+    test('DEGRADED: per-(claimant, target) pair buckets stay independent', async () => {
+        middleware.__setRedisErroringForTest(true);
+        const app = buildE2eeApp();
+        for (let i = 0; i < 10; i++) await request(app).get('/keys/victim-1');
+        expect((await request(app).get('/keys/victim-1')).status).toBe(429);
+        // a different target pair is unaffected — per-pair keying survives degradation
+        expect((await request(app).get('/keys/victim-2')).status).toBe(200);
+        // and a different claimant against the original target too
+        expect((await request(app).get('/keys/victim-1?claimant=8')).status).toBe(200);
+    });
+});
+
 describe('r15k: financial tier degradation when Redis is unavailable', () => {
     afterEach(() => middleware.__setRedisErroringForTest(false));
 

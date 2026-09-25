@@ -209,6 +209,64 @@ const generalLimiter = _failOpen(rateLimit(_opts({
     message: 'Rate limit exceeded. Please try again shortly.',
 })));
 
+// ── E2EE BUNDLE CLAIM: 10 claims per 15 min per (claimant, target) pair ──────
+// r40.3 (audit P1 — OPK exhaustion): every successful GET /api/e2ee/keys/:userId
+// consumes one of the target's one-time prekeys. The relationship gate in
+// keyService.fetchBundle blocks strangers entirely; this limiter bounds a
+// MALICIOUS PEER — a user who does share a personal conversation with the
+// victim cannot hammer the endpoint to drain their OPK pool. Keyed per pair
+// so one abusive relationship never limits a claimant's sessions with OTHER
+// peers.
+// r40.4 (audit P2 — fail-open was unsafe): OPKs are a CONSUMPTIVE
+// cryptographic resource — during a Redis outage, fail-open meant a
+// conversation peer could drain a victim's OPK pool without any rate bound.
+// This limiter is now FAIL-SAFE (same posture as the financial tier): a
+// store error degrades to an in-process memory limiter with identical
+// thresholds (per-instance bound) instead of unlimited claims.
+// r40.4: dedicated fail-safe machinery for the bundle tier. It must NOT
+// share the financial tier's cached memory limiter — the financial fallback
+// singleton is built from FINANCIAL options (window/keying), and reusing it
+// would key bundle claims with the financial key generator (or vice versa).
+const _memoryBundleLimiter = (() => {
+    let cached = null;
+    return (opts) => {
+        if (!cached) {
+            const { store, ...rest } = opts;
+            cached = rateLimit(rest);
+        }
+        return cached;
+    };
+})();
+const _failSafeBundle = (limiter, opts) => (req, res, next) => {
+    const fallback = () => {
+        logger.warn('[RateLimit] E2EE bundle tier degrading to in-process memory limiter (Redis unavailable)');
+        _memoryBundleLimiter(opts)(req, res, (err) => {
+            if (err) {
+                logger.error({ err: err.message }, '[RateLimit] E2EE bundle memory limiter error — failing open');
+                return next();
+            }
+            next();
+        });
+    };
+    if (_redisErroring) return fallback();
+    limiter(req, res, (err) => {
+        if (err) {
+            _redisErroring = true;
+            logger.warn({ err: err.message }, '[RateLimit] Store error — E2EE bundle tier degrading to memory limiter');
+            return fallback();
+        }
+        next();
+    });
+};
+const e2eeBundleOpts = _opts({
+    windowMs: 15 * 60_000,
+    max: 10,
+    prefix: 'rl:e2ee-bundle:',
+    keyGenerator: (req) => `pair_${req.user?.id ?? 'anon'}_${req.params?.userId ?? 'x'}`,
+    message: 'Too many key bundle requests for this user. Please wait before retrying.',
+});
+const e2eeBundleLimiter = _failSafeBundle(rateLimit(e2eeBundleOpts), e2eeBundleOpts);
+
 // ── WEBHOOK: 30 requests per minute per IP (payment provider callbacks) ───────
 const webhookLimiter = _failOpen(rateLimit(_opts({
     windowMs: 60_000,
@@ -236,4 +294,5 @@ module.exports = {
     generalLimiter,
     webhookLimiter,
     strictLimiter,
+    e2eeBundleLimiter,
 };

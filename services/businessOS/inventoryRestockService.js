@@ -95,28 +95,77 @@ class InventoryRestockService {
         // Fingerprint only caller-controlled economics. In particular, do NOT
         // include catalog cost, stock or active status: replay must survive
         // subsequent catalog changes without re-executing the operation.
-        // NOTE: the fingerprint is intentionally computed from the SAME
-        // normalized floats the original formula used — JSON.stringify of a
-        // Prisma.Decimal would change the digest and strand every operation
-        // committed before §Wave-1B behind 409s. The exact decimals parsed
-        // above are for ledger arithmetic, not for identity.
-        const fingerprint = createHash('sha256').update(JSON.stringify([
+        //
+        // r40 — FINGERPRINT VERSIONING. The v1 digest was computed from
+        // FLOAT-NORMALIZED economics (Number(qty)); two requests that differ
+        // only beyond double precision collided, so a "replay" of a different
+        // purchase silently returned the first operation's result. v2 digests
+        // the EXACT decimal strings. Versioning (not re-hashing) is what makes
+        // the migration safe: every operation stores the version it was
+        // committed under, replay verifies against THAT version, and no
+        // pre-r40 operation can ever be stranded behind a 409. New operations
+        // always commit under v2.
+        const fingerprintV1 = createHash('sha256').update(JSON.stringify([
             businessProfileId, itemId, Number(qty.toString()), hasExplicitCost ? Number(suppliedCost.toString()) : 'DEFAULT_COST',
         ])).digest('hex');
+        const fingerprint = createHash('sha256').update(JSON.stringify([
+            businessProfileId, itemId, qty.toString(), hasExplicitCost ? suppliedCost.toString() : 'DEFAULT_COST',
+        ])).digest('hex');
+        const FINGERPRINT_VERSION = 2;
         const identity = { businessProfileId_idempotencyKey: { businessProfileId, idempotencyKey } };
         const replay = async () => {
             const committed = await this.prisma.inventoryRestockOperation.findUnique({ where: identity });
             if (!committed) return null;
-            if (committed.requestFingerprint !== fingerprint)
+            // Replay against the version the operation was COMMITTED under:
+            // v1 rows verify with the legacy float digest, v2 with the exact
+            // decimal digest. A row with no version is pre-r40 = v1.
+            const committedVersion = committed.fingerprintVersion || 1;
+            if (committed.requestFingerprint !== (committedVersion === 1 ? fingerprintV1 : fingerprint))
                 throw restockError('RESTOCK_IDEMPOTENCY_CONFLICT', 'Idempotency-Key already belongs to a different restock.', 409);
             if (!committed.result || !committed.ledgerId)
                 throw restockError('RESTOCK_INCOMPLETE_OPERATION', 'Restock operation is incomplete.', 409);
             return committed.result;
         };
 
+        // §r40.5 — BIND THE INTENT TO ITS REGISTERED OPERATION (final-audit
+        // P1). When the supplied idempotency key names a server-owned
+        // intent in this business, the request's payload MUST be the
+        // operation that was REGISTERED: the client must never be able to
+        // redefine what an existing intent means. Without this guard the key
+        // of an intent registered for (item A, qty 5) could execute as
+        // (item B, qty 100), corrupting the recovery/audit relationship
+        // between the durable intent and the economic operation.
+        // Exact-decimal contract: quantities are compared as exact base-10
+        // decimals (Decimal.equals), never binary floats — the same
+        // equivalence the v2 fingerprint digests ("12.50" ≡ "12.5", and
+        // never ≡ "100").
+        const registeredIntent = await this.prisma.inventoryRestockIntent.findFirst({
+            where: { id: idempotencyKey, businessProfileId },
+            select: { itemId: true, quantity: true },
+        });
+        if (registeredIntent) {
+            if (registeredIntent.itemId !== itemId) {
+                throw restockError('RESTOCK_INTENT_PAYLOAD_MISMATCH',
+                    'Idempotency-Key belongs to a restock intent registered for a different item. Send the registered item, or register a new intent.', 409);
+            }
+            if (!new Prisma.Decimal(registeredIntent.quantity).equals(qty)) {
+                throw restockError('RESTOCK_INTENT_PAYLOAD_MISMATCH',
+                    'Idempotency-Key belongs to a restock intent registered for a different quantity. Resend the registered exact quantity string.', 409);
+            }
+        }
+
         // A replay is checked before reading the mutable inventory catalog.
         const committed = await replay();
-        if (committed) return committed;
+        if (committed) {
+            // §r40.4: a replay IS the authoritative evidence that the
+            // operation executed (this is exactly the committed-but-
+            // unobserved recovery path). Mark the server-owned intent
+            // EXECUTED with the stored result so a browser that lost the
+            // original response can recover the outcome. Fire-and-forget
+            // semantics, never a failure of the restock itself.
+            await this._markIntentExecuted(idempotencyKey, committed, businessProfileId).catch(() => {});
+            return committed;
+        }
 
         try {
             return await this.prisma.$transaction(async (tx) => {
@@ -124,7 +173,7 @@ class InventoryRestockService {
                 // waits for the first transaction to commit or roll back; no
                 // second stock/expense writes can occur before this claim.
                 const operation = await tx.inventoryRestockOperation.create({
-                    data: { id: randomUUID(), businessProfileId, itemId, idempotencyKey, requestFingerprint: fingerprint },
+                    data: { id: randomUUID(), businessProfileId, itemId, idempotencyKey, requestFingerprint: fingerprint, fingerprintVersion: FINGERPRINT_VERSION },
                 });
                 const item = await tx.inventoryItem.findFirst({
                     where: { id: itemId, businessProfileId },
@@ -185,16 +234,37 @@ class InventoryRestockService {
                 await tx.inventoryRestockOperation.update({
                     where: { id: operation.id }, data: { ledgerId: ledger.id, result },
                 });
+                // §r40.4: the server-owned intent (whose id IS the
+                // idempotency key) is marked EXECUTED in the SAME
+                // transaction as the economic mutation — execution
+                // evidence and outcome are committed atomically.
+                await tx.inventoryRestockIntent.updateMany({
+                    where: { id: idempotencyKey, businessProfileId, status: { in: ['PENDING', 'CANCELLED'] } },
+                    data: { status: 'EXECUTED', executionResult: result, executedAt: new Date() },
+                });
                 return result;
             });
         } catch (error) {
             if (error.code === 'P2002') {
                 const winner = await replay();
-                if (winner) return winner;
+                if (winner) {
+                    await this._markIntentExecuted(idempotencyKey, winner, businessProfileId).catch(() => {});
+                    return winner;
+                }
                 throw restockError('RESTOCK_CLAIM_CONFLICT', 'Restock claim did not complete; retry with the same key.', 409);
             }
             throw error;
         }
+    }
+    // §r40.4 — mark the server-owned restock intent EXECUTED (replay path;
+    // the transaction path marks it inline with tx). Keys outside the intent
+    // namespace simply match no row and are a no-op, so legacy/other-client
+    // keys are unaffected.
+    async _markIntentExecuted(idempotencyKey, result, businessProfileId) {
+        await this.prisma.inventoryRestockIntent.updateMany({
+            where: { id: idempotencyKey, businessProfileId, status: { in: ['PENDING', 'CANCELLED'] } },
+            data: { status: 'EXECUTED', executionResult: result, executedAt: new Date() },
+        });
     }
 }
 

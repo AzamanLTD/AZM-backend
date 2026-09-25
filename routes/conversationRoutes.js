@@ -67,6 +67,10 @@ function _formatMessage(msg, ticket) {
         moneyAmountExact: ticket ? new Prisma.Decimal(ticket.amount).toFixed(8) : null, // r38/P1 — exact machine value
         moneyDirection: null,
         moneyStatus: ticket ? ticket.status : null,
+        // E2EE (r40): opaque envelope relay. When present the message body is
+        // ciphertext the server cannot decrypt (docs/e2ee-protocol.md §8).
+        isE2EE: !!(msg.e2eeEnvelope),
+        e2eeEnvelope: msg.e2eeEnvelope || null,
         escrowTicket: ticket && ticket.kind === 'ESCROW_TICKET'
             ? {
                 amount: new Prisma.Decimal(ticket.amount).toFixed(2), // display
@@ -139,6 +143,85 @@ router.post('/:conversationId/messages', protectActive, async (req, res) => {
         const check = await _verifyParticipant(prisma, conversationId, userId);
         if (!check.ok) return res.status(check.status).json({ success: false, message: check.message });
         const { conv } = check;
+
+        // ── E2EE message (r40): the server relays an opaque ciphertext
+        // envelope and persists NO plaintext (docs/e2ee-protocol.md §8).
+        if (req.body.e2ee) {
+            if (String(process.env.AZM_E2EE_ENABLED || '').toLowerCase() !== 'true') {
+                return res.status(503).json({ success: false, code: 'E2EE_NOT_AVAILABLE',
+                    message: 'E2EE is not yet available on this deployment.' });
+            }
+            const envelope = req.body.e2ee;
+            const INVALID = { success: false, message: 'Invalid E2EE envelope.' };
+            if (!envelope || typeof envelope !== 'object'
+                || envelope.v !== 1
+                || typeof envelope.deviceId !== 'string'
+                || typeof envelope.ik !== 'string'
+                || typeof envelope.ct !== 'string' || typeof envelope.nonce !== 'string'
+                || !envelope.h || typeof envelope.h !== 'object'
+                || typeof envelope.h.dh !== 'string') {
+                return res.status(400).json(INVALID);
+            }
+            // P1-E: the r40 protocol is PAIRWISE (one ratchet session per
+            // device pair). Only PERSONAL conversations — exactly two
+            // device-owning humans — can have a single envelope decryptable
+            // by the peer. TRADE/BUSINESS conversations involve additional
+            // parties or service identities with no registered devices, so
+            // an envelope cannot be end-to-end for every reader. Reject
+            // explicitly instead of advertising a capability that does not
+            // exist.
+            if (conv.type !== 'PERSONAL') {
+                return res.status(400).json({ success: false, code: 'E2EE_NOT_PAIRWISE',
+                    message: 'E2EE is only supported for personal (pairwise) conversations.' });
+            }
+            // P1-F: the authenticated API caller must OWN the cryptographic
+            // sender identity in the envelope. The server stays blind to
+            // plaintext, but the deviceId + identity key must belong to one
+            // of the caller's ACTIVE registered devices — a forged deviceId
+            // or mismatched identity key is rejected before persistence.
+            const senderDevice = await prisma.e2eeDevice.findFirst({
+                where: { userId, isActive: true, deviceId: envelope.deviceId },
+                orderBy: { updatedAt: 'desc' },
+            });
+            if (!senderDevice || senderDevice.identityPublicKey !== envelope.ik) {
+                return res.status(403).json({ success: false, code: 'E2EE_SENDER_IDENTITY_MISMATCH',
+                    message: 'E2EE envelope sender identity does not match an active registered device.' });
+            }
+            // Shape/size bounds only — the server cannot and must not inspect
+            // the encrypted content.
+            if (text !== undefined && text !== null && String(text).length > 0) {
+                return res.status(400).json({ success: false, message: 'An E2EE message cannot also carry plaintext text.' });
+            }
+            const serialized = JSON.stringify(envelope);
+            if (serialized.length > 131072) {
+                return res.status(400).json({ success: false, message: 'E2EE envelope too large.' });
+            }
+            const message = await prisma.message.create({
+                data: {
+                    conversationId,
+                    senderId: userId,
+                    messageType: 'TEXT',
+                    content: '',
+                    replyToId: replyTo || null,
+                    e2eeEnvelope: envelope,
+                },
+                include: { sender: { select: { id: true, username: true } } }
+            });
+
+            const io = req.app.get('socketio');
+            if (io) {
+                if (conv.type === 'PERSONAL') {
+                    const other = conv.participants.find(p => p.id !== userId);
+                    if (other) {
+                        const hash = _personalRoomHash(userId, other.id);
+                        io.to(`personal_${hash}`).emit('new_personal_message', _formatMessage(message));
+                    }
+                } else if (conv.type === 'GROUP') {
+                    io.to(`group_${conversationId}`).emit('new_group_message', _formatMessage(message));
+                }
+            }
+            return res.status(201).json({ success: true, data: _formatMessage(message) });
+        }
 
         // ── TEXT message ── (legacy behavior preserved)
         if (type === 'TEXT' || type === undefined) {

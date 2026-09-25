@@ -840,10 +840,9 @@ model User {
   sentDirectMessages     DirectMessage[] @relation("DirectMessageSender")
   receivedDirectMessages DirectMessage[] @relation("DirectMessageReceiver")
 
-  // E2EE key material
-  e2eePreKeyBundle      E2EEPreKeyBundle?
-  e2eeOneTimePreKeys    E2EEOneTimePreKey[] @relation("UserOneTimePreKeys")
-  e2eeSessions          E2EESession[]       @relation("UserE2EESessions")
+  // E2EE (r40): public-key directory only — see docs/e2ee-protocol.md
+  e2eeDevices           E2eeDevice[]        @relation("UserE2EEDevices")
+  e2eeOneTimePreKeys    E2eeOneTimePreKey[] @relation("UserE2EEOneTimePreKeys")
   fraudAssessments      FraudAssessment[]
   sentPeerTransfers     PeerTransfer[]      @relation("PeerTransferSender")
   receivedPeerTransfers PeerTransfer[]      @relation("PeerTransferReceiver")
@@ -1303,6 +1302,11 @@ model Message {
   replyToId         String?
   replyToText       String?
   replyToSenderName String?
+
+  // E2EE (r40): ciphertext envelope per docs/e2ee-protocol.md. When present,
+  // `content` is empty — the server persists and relays opaque ciphertext and
+  // cannot decrypt it (no private key material exists server-side).
+  e2eeEnvelope Json?
 
   // Disappearing messages (Phase 2): if set, message is auto-deleted after
   // this many seconds. expiresAt is computed on send = createdAt + seconds.
@@ -2804,6 +2808,7 @@ model BusinessProfile {
   routeTemplates             TransitRouteTemplate[]
   inventoryItems             InventoryItem[]
   inventoryRestockOperations InventoryRestockOperation[]
+  inventoryRestockIntents    InventoryRestockIntent[]
   notificationPreferences    BusinessNotificationPreference?
   apiKeys                    BusinessApiKey[]
   webhooks                   BusinessWebhook[]
@@ -3397,10 +3402,10 @@ model BusinessOrder {
 
   createdAt DateTime @default(now())
 
-  paymentMethod  String?  @db.VarChar(20) // "AZAMAN_BALANCE" | "CASH" | "SPLIT"
-  idempotencyKey String?  @unique // client-supplied dedup key for offline sync
-  cashReceived   Decimal? @db.Decimal(20, 8) // for CASH payments — actual cash tendered
-  cashChange     Decimal? @db.Decimal(20, 8) // change given back
+  paymentMethod       String?   @db.VarChar(20) // "AZAMAN_BALANCE" | "CASH" | "SPLIT"
+  idempotencyKey      String?   @unique // client-supplied dedup key for offline sync
+  cashReceived        Decimal?  @db.Decimal(20, 8) // for CASH payments — actual cash tendered
+  cashChange          Decimal?  @db.Decimal(20, 8) // change given back
   // r36/P1: durable marker that recipe inventory was deducted for this order.
   // The deduction route claims it atomically; a retry or concurrent duplicate
   // can never double-reduce stock.
@@ -5557,6 +5562,52 @@ model InventoryItem {
   @@index([businessProfileId])
 }
 
+// §r40.4 — SERVER-OWNED RESTOCK INTENT (final-audit P1 redesign).
+// Browser storage can never be the ultimate authority for exactly-once
+// semantics: a lost response + closed browser destroyed the client's retry
+// identity, so a later attempt minted a NEW key and the backend executed a
+// duplicate restock. The server now owns the operation identity:
+//   • every restock operation is REGISTERED here BEFORE its request is
+//     sent; the intent's id is the idempotency key of the restock;
+//   • the record is DURABLE (no TTL, no expiry) and survives browser
+//     termination, storage loss and cross-tab confusion by construction —
+//     the client can always recover the exact prior operation from the
+//     unresolved list;
+//   • identity is OPERATION-level, not quantity-derived: two genuinely
+//     distinct restocks of the same item and quantity are two intents;
+//   • resolution is keyed by intent id — a late success can never clear a
+//     NEWER intent for the same item/quantity.
+// Lifecycle (guarded state machine):
+//   PENDING   → EXECUTED    by the restock service itself (execution or
+//                            replay) — the authoritative outcome is stored
+//                            in executionResult so a browser that lost the
+//                            response can recover it;
+//   CANCELLED → EXECUTED    allowed: the operator cancelled on a guess, but
+//                            the request had already committed — truth wins,
+//                            the recovery list must surface it;
+//   EXECUTED  → ACKNOWLEDGED by the client after the outcome is OBSERVED;
+//   PENDING   → CANCELLED   by an explicit operator cancel (only while no
+//                            execution has been observed);
+//   EXECUTED  → CANCELLED   FORBIDDEN: an executed financial operation can
+//                            never be cancelled, only acknowledged.
+model InventoryRestockIntent {
+  id               String    @id @default(uuid())
+  businessProfileId String
+  itemId           String
+  quantity         String    @db.VarChar(64)
+  status           String    @default("PENDING")
+  executionResult  Json?
+  executedAt       DateTime?
+  acknowledgedAt   DateTime?
+  createdBy        Int
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+
+  businessProfile BusinessProfile @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+
+  @@index([businessProfileId, status])
+}
+
 // A durable business-scoped request claim: no expiry, because reusing an old
 // restock key must never execute an additional stock/expense mutation.
 model InventoryRestockOperation {
@@ -5565,6 +5616,10 @@ model InventoryRestockOperation {
   itemId             String
   idempotencyKey     String   @db.VarChar(128)
   requestFingerprint String   @db.VarChar(64)
+  // r40 — fingerprint versioning: v1 = float-normalized digest (legacy,
+  // collides beyond double precision), v2 = exact-decimal digest. Replay
+  // verifies against the version the operation was committed under.
+  fingerprintVersion Int      @default(1)
   result             Json?
   ledgerId           String?
   createdAt          DateTime @default(now())
@@ -6395,77 +6450,63 @@ model RestrictedObligation {
 
 // ── E2EE (Signal-style Protocol) ─────────────────────────────────────────────
 
-model E2EEPreKeyBundle {
-  id     String @id @default(uuid())
-  userId Int
+// ── E2EE (r40): server-blind key directory ──────────────────────────────────
+// PUBLIC KEY MATERIAL ONLY. The server never generates, stores or returns
+// private keys (docs/e2ee-protocol.md). Private keys live in the client OS
+// keystore. These models replace the pre-r40 E2EEPreKeyBundle /
+// E2EEOneTimePreKey / E2EESession models, which stored server-side private
+// identity/session material and made the server a decryption authority.
+model E2eeDevice {
+  id                    String   @id @default(uuid())
+  userId                Int
+  deviceId              String   @db.VarChar(128)
+  signingPublicKey      String   @db.VarChar(100) // Ed25519 pub (b64) — identity anchor
+  identityPublicKey     String   @db.VarChar(100) // X25519 DH identity pub (b64)
+  bindingSignature      String   @db.VarChar(200) // Ed25519 sig binding the two keys
+  signedPreKeyId        Int
+  signedPreKeyPublicKey String   @db.VarChar(100) // X25519 pub (b64)
+  signedPreKeySignature String   @db.VarChar(200) // Ed25519 sig over the SPK pub
+  isActive              Boolean  @default(true)
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
 
-  // Identity key (long-term, per user)
-  identityPublicKey  String  @db.VarChar(100)
-  identityPrivateKey String? @db.VarChar(100) // Only stored if user opts to back up; null otherwise
+  user User @relation("UserE2EEDevices", fields: [userId], references: [id], onDelete: Cascade)
 
-  // Signed preKey (rotated periodically)
-  signedPreKeyId         Int
-  signedPreKeyPublicKey  String  @db.VarChar(100)
-  signedPreKeyPrivateKey String? @db.VarChar(100) // Server needs this to complete session on receiver side
-  signedPreKeySignature  String  @db.VarChar(200)
-
-  // Active session root key (per friendship/contact pair)
-  // Stored encrypted or as derived key material
-  activeRootKey  String? @db.VarChar(200)
-  activeChainKey String? @db.VarChar(200)
-  messageNumber  Int     @default(0)
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
-
-  @@unique([userId])
-  @@index([userId])
+  @@unique([userId, deviceId])
+  @@index([userId, isActive])
+  @@map("E2EEDevice")
 }
 
-model E2EEOneTimePreKey {
-  id         String  @id @default(uuid())
-  userId     Int
-  keyId      Int
-  publicKey  String  @db.VarChar(100)
-  privateKey String  @db.VarChar(100) // Server needs this to complete X3DH
-  isUsed     Boolean @default(false)
-
+model E2eeOneTimePreKey {
+  id        String    @id @default(uuid())
+  userId    Int
+  // r40.1 (P0-C): one-time prekeys are DEVICE-scoped. A claimed bundle can
+  // only contain keys belonging to the selected active device — Device B can
+  // never receive Device A's prekey.
+  // r40.2 (audit finding 3): keyId uniqueness is DEVICE-scoped too:
+  // (userId, deviceId, keyId). A fresh device starts its own key-id
+  // sequence — Device B's keyId=1 is distinct material from retired Device
+  // A's keyId=1, and must not collide with it. Identity/immutability
+  // conflicts are per-device only.
+  deviceId  String    @db.VarChar(128)
+  keyId     Int
+  publicKey String    @db.VarChar(100) // X25519 pub (b64) — PRIVATE KEY NEVER UPLOADED
+  isUsed    Boolean   @default(false)
   createdAt DateTime  @default(now())
   usedAt    DateTime?
+  // r40.3 (audit P1): who CLAIMED this key at bundle fetch — the audit
+  // trail for OPK-consumption abuse. Nullable: legacy rows claimed before
+  // the column existed, and replenish-inserted rows are unclaimed until a
+  // peer fetches them. Never a foreign key: a claimant's account deletion
+  // must not delete key-directory forensics.
+  claimedBy Int?
 
-  user User @relation("UserOneTimePreKeys", fields: [userId], references: [id], onDelete: Cascade)
+  user User @relation("UserE2EEOneTimePreKeys", fields: [userId], references: [id], onDelete: Cascade)
 
-  @@index([userId, isUsed])
-  @@index([keyId])
+  @@unique([userId, deviceId, keyId])
+  @@index([userId, deviceId, isUsed])
+  @@map("E2EEOneTimePreKey")
 }
-
-model E2EESession {
-  id         String @id @default(uuid())
-  userId     Int // The user who owns this session
-  peerUserId Int // The other party
-
-  // Session state
-  rootKey              String  @db.VarChar(200)
-  sendingChainKey      String? @db.VarChar(200)
-  receivingChainKey    String? @db.VarChar(200)
-  sendMessageNumber    Int     @default(0)
-  receiveMessageNumber Int     @default(0)
-
-  // Initial ephemeral key from X3DH
-  peerEphemeralPublicKey String? @db.VarChar(100)
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  user User @relation("UserE2EESessions", fields: [userId], references: [id], onDelete: Cascade)
-
-  @@unique([userId, peerUserId])
-  @@index([userId, peerUserId])
-}
-
-// ── Fraud Detection ─────────────────────────────────────────────────────────────
 
 model FraudAssessment {
   id              String  @id @default(uuid())
