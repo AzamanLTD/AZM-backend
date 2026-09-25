@@ -27,6 +27,7 @@ const router = express.Router();
 const crypto = require('crypto');
 const logger = require('../src/config/logger');
 const { Prisma } = require('@prisma/client');
+const e2eeEnvelope = require('../services/e2eeMessageEnvelope');
 const { protect } = require('../middleware/authMiddleware');
 const { protectActive } = require('../middleware/banGuardMiddleware');
 const { ConversationMoneyService } = require('../services/conversationMoneyService');
@@ -54,6 +55,21 @@ async function _verifyParticipant(prisma, conversationId, userId) {
 // their durable structured ticket — the fields the client contract pretends
 // existed are now backed by real data (additive: they were always null before).
 function _formatMessage(msg, ticket) {
+    // r40 E2EE: encrypted rows carry the ciphertext envelope, never message
+    // text (the server does not hold it — content is empty by contract).
+    if (msg.isEncrypted) {
+        return {
+            id: msg.id,
+            conversationId: msg.conversationId,
+            senderId: msg.sender?.id || msg.senderId,
+            senderName: msg.sender?.username || 'Unknown',
+            text: null,
+            type: msg.messageType,
+            status: msg.status || 'sent',
+            createdAt: msg.createdAt,
+            ...e2eeEnvelope.envelopeToWire(msg),
+        };
+    }
     return {
         id: msg.id,
         conversationId: msg.conversationId,
@@ -140,8 +156,50 @@ router.post('/:conversationId/messages', protectActive, async (req, res) => {
         if (!check.ok) return res.status(check.status).json({ success: false, message: check.message });
         const { conv } = check;
 
-        // ── TEXT message ── (legacy behavior preserved)
+        // ── TEXT message ──
         if (type === 'TEXT' || type === undefined) {
+            const e2eePayload = req.body.e2ee;
+
+            // r40 E2EE envelope path: the server persists ONLY the ciphertext
+            // envelope — never plaintext (docs/e2ee/PROTOCOL.md §6–§7).
+            if (e2eePayload) {
+                const envelope = await e2eeEnvelope.validateEnvelope(e2eePayload);
+                // Replay anchor: a retried send reuses the envelopeId and gets
+                // the original row back — never a duplicate delivery.
+                const replayed = await e2eeEnvelope.findExistingByEnvelopeId(prisma, envelope.envelopeId);
+                if (replayed) {
+                    return res.json({ success: true, replayed: true, data: _formatMessage(replayed) });
+                }
+                const message = await prisma.message.create({
+                    data: e2eeEnvelope.buildEncryptedMessageData({
+                        conversationId, senderId: userId, envelope,
+                        extras: { replyToId: replyTo || null },
+                    }),
+                    include: { sender: { select: { id: true, username: true } } }
+                });
+                const io = req.app.get('socketio');
+                if (io) {
+                    if (conv.type === 'PERSONAL') {
+                        const other = conv.participants.find(p => p.id !== userId);
+                        if (other) {
+                            const hash = _personalRoomHash(userId, other.id);
+                            io.to(`personal_${hash}`).emit('new_personal_message', _formatMessage(message));
+                        }
+                    }
+                }
+                return res.status(201).json({ success: true, data: _formatMessage(message) });
+            }
+
+            // Fail-closed (r40): once BOTH participants of a personal
+            // conversation have registered E2EE bundles, plaintext TEXT is
+            // refused — the client MUST send the ciphertext envelope.
+            if (await e2eeEnvelope.personalConversationIsEncrypted(prisma, conv)) {
+                return res.status(409).json({
+                    success: false, code: 'E2EE_REQUIRED',
+                    message: 'Both participants have E2EE registered — send the e2ee ciphertext envelope.',
+                });
+            }
+
             if (!text || !text.trim()) {
                 return res.status(400).json({ success: false, message: 'Message text is required.' });
             }
@@ -192,7 +250,7 @@ router.post('/:conversationId/messages', protectActive, async (req, res) => {
     } catch (err) {
         logger.error({ err }, '[conversationRoutes] POST message error');
         const status = Number.isInteger(err.status) ? err.status : 400;
-        res.status(status).json({ success: false, message: err.message || 'Server error.' });
+        res.status(status).json({ success: false, ...(err.code ? { code: err.code } : {}), message: err.message || 'Server error.' });
     }
 });
 

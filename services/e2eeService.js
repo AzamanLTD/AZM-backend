@@ -1,390 +1,518 @@
+'use strict';
+
 // services/e2eeService.js
 // =============================================================================
-// End-to-End Encryption Service — Signal-style Protocol
+// AZAMAN E2EE v2 — PROTOCOL REFERENCE LIBRARY (r40)
 //
-// Implements:
-//   1. X3DH-like key agreement (using libsodium crypto_box for DH exchange)
-//   2. Double Ratchet (simplified — per-message keys derived via KDF chain)
-//   3. PreKey bundle generation and registration
-//   4. Message encryption/decryption
+// Implements the documented protocol contract in docs/e2ee/PROTOCOL.md:
+// Signal's X3DH (session establishment) + Signal's Double Ratchet
+// (per-message keys, forward secrecy, out-of-order delivery) built ONLY on
+// well-vetted primitives (libsodium + OpenSSL HKDF/HMAC). No ad-hoc
+// constructions.
 //
-// Key Flow:
-//   • Each user generates an Ed25519 identity key pair (for signing)
-//   • Identity key is converted to X25519 for DH key agreement
-//   • PreKeys are X25519 keypairs (used for DH exchange)
-//   • To start a session, sender fetches receiver's preKey bundle
-//   • X3DH derives shared secret → root key → chain keys → message keys
-//   • Each message advances the ratchet, deriving a new message key
+// TRUST MODEL — the server is a blind relay:
+//   • The server never generates, stores, or sees private key material.
+//   • The server never derives or stores session/ratchet state.
+//   • The functions below that touch private keys exist for CLIENTS and for
+//     the invariant proof suite (they are the documented reference
+//     implementation). The server routes (routes/e2eeRoutes.js) use only the
+//     public-side helpers (validation, fingerprints, bundle verification).
 //
-// Trade-offs:
-//   • E2EE means server can't do message search → client-side search
-//   • Dispute evidence: both parties upload message history encrypted with admin key
+// This module is PURE — no database, no I/O. Ratchet state objects are
+// immutable: every operation returns a NEW state object (the Double Ratchet
+// is a state machine; making transitions explicit is what makes replay and
+// out-of-order behavior provable).
 //
-// Reference: Signal Protocol, WhatsApp (Signal Protocol), Wire (E2EE enterprise)
+// Documented deviations from the Signal specs are listed in PROTOCOL.md §2:
+// dual-key identity (Ed25519 signing + X25519 DH) instead of XEdDSA; HKDF
+// info strings domain-separate each KDF; the AEAD nonce is deterministic
+// (u32be(0) || u64be(n)) — safe because message keys are single-use.
 // =============================================================================
 
+const { createHmac, hkdfSync } = require('crypto');
 const _sodium = require('libsodium-wrappers');
 
-let sodium = null;
-async function init() {
-  if (!sodium) {
-    await _sodium.ready;
-    sodium = _sodium;
-  }
-  return sodium;
+const PROTOCOL_VERSION = 2;
+const MAX_SKIP = 1000; // retained skipped message keys per chain (PROTOCOL.md §5)
+const MAX_PREKEY_ID = 0xFFFFFF; // 2^24 - 1
+
+let _s = null;
+async function _ready() {
+    if (!_s) { await _sodium.ready; _s = _sodium; }
+    return _s;
 }
 
-// ── Key Generation ────────────────────────────────────────────────────────────
+// ── Byte helpers ─────────────────────────────────────────────────────────────
 
-/**
- * Generate a user's identity key pair (Ed25519 for signing).
- * The public key is also convertible to X25519 for DH key agreement.
- */
-async function generateIdentityKeyPair() {
-  const s = await init();
-  const kp = s.crypto_sign_keypair();
-  return {
-    publicKey: s.to_base64(kp.publicKey),
-    privateKey: s.to_base64(kp.privateKey),
-  };
+const b64 = (bytes) => Buffer.from(bytes).toString('base64');
+const unb64 = (str) => new Uint8Array(Buffer.from(str, 'base64'));
+
+function u64be(n) {
+    const out = new Uint8Array(8);
+    let v = n;
+    for (let i = 7; i >= 0; i--) { out[i] = v & 0xff; v = Math.floor(v / 256); }
+    return out;
 }
 
-/**
- * Convert an Ed25519 public key to X25519 (Curve25519) for DH.
- */
-async function ed25519PubToCurve25519(ed25519PubB64) {
-  const s = await init();
-  const ed = s.from_base64(ed25519PubB64);
-  const curve = s.crypto_sign_ed25519_pk_to_curve25519(ed);
-  return s.to_base64(curve);
+function concat(...arrays) {
+    let len = 0;
+    for (const a of arrays) len += a.length;
+    const out = new Uint8Array(len);
+    let off = 0;
+    for (const a of arrays) { out.set(a, off); off += a.length; }
+    return out;
 }
 
-/**
- * Convert an Ed25519 private key to X25519 (Curve25519) for DH.
- */
-async function ed25519PrivToCurve25519(ed25519PrivB64) {
-  const s = await init();
-  const ed = s.from_base64(ed25519PrivB64);
-  const curve = s.crypto_sign_ed25519_sk_to_curve25519(ed);
-  return s.to_base64(curve);
+const utf8 = (str) => new Uint8Array(Buffer.from(str, 'utf8'));
+
+// ── KDFs (PROTOCOL.md §5) ────────────────────────────────────────────────────
+
+const X3DH_INFO = 'AzamanE2EE-v2-X3DH';
+const KDF_RK_INFO = 'AzamanE2EE-v2-KDF_RK';
+const ZERO_SALT = new Uint8Array(32);
+
+function hkdfSha512(ikm, info, length) {
+    const out = hkdfSync('sha512', Buffer.from(ikm), Buffer.from(ZERO_SALT), Buffer.from(info, 'utf8'), length);
+    return new Uint8Array(out);
 }
 
-/**
- * Generate a signed preKey (X25519 keypair signed with Ed25519 identity key).
- * The signed preKey is used for DH; its public key is signed for authenticity.
- */
-async function generateSignedPreKey(identityPrivateKey) {
-  const s = await init();
-  const kp = s.crypto_box_keypair(); // X25519
-  const privKey = s.from_base64(identityPrivateKey); // Ed25519
-  const signature = s.crypto_sign_detached(kp.publicKey, privKey);
-
-  return {
-    keyId: s.randombytes_uniform(0xFFFFFF),
-    publicKey: s.to_base64(kp.publicKey),
-    privateKey: s.to_base64(kp.privateKey),
-    signature: s.to_base64(signature),
-  };
+// KDF_RK(rk, dh_out) -> (rk', ck) — HKDF-SHA-512, split at 32 bytes.
+function kdfRk(rootKey, dhOut) {
+    const out = hkdfSha512(concat(rootKey, dhOut), KDF_RK_INFO, 64);
+    return { rootKey: out.slice(0, 32), chainKey: out.slice(32, 64) };
 }
 
-/**
- * Generate a batch of one-time preKeys (X25519 keypairs, consumed on each session start).
- */
-async function generatePreKeys(count = 50) {
-  const s = await init();
-  const keys = [];
-  for (let i = 0; i < count; i++) {
+// KDF_CK(ck) -> (mk, ck') — HMAC-SHA-256 over 0x01 / 0x02.
+function kdfCk(chainKey) {
+    const mk = new Uint8Array(createHmac('sha256', Buffer.from(chainKey)).update(new Uint8Array([0x01])).digest());
+    const next = new Uint8Array(createHmac('sha256', Buffer.from(chainKey)).update(new Uint8Array([0x02])).digest());
+    return { messageKey: mk, chainKey: next };
+}
+
+// ── X25519 primitives ─────────────────────────────────────────────────────────
+
+function dh(privateKey, publicKey) {
+    const out = _s.crypto_scalarmult(privateKey, publicKey);
+    if (!out) throw Object.assign(new Error('X25519: low-order public key rejected.'), { code: 'E2EE_INVALID_KEY' });
+    return out;
+}
+
+function generateDhKeyPair() {
+    const kp = _s.crypto_box_keypair();
+    return { publicKey: kp.publicKey, privateKey: kp.privateKey };
+}
+
+// ── Key generation (client-side; exported for clients and the proof suite) ───
+
+async function generateIdentityKeys() {
+    const s = await _ready();
+    const signing = s.crypto_sign_keypair();
+    const dhIdentity = s.crypto_box_keypair();
+    const identityKeySignature = s.crypto_sign_detached(dhIdentity.publicKey, signing.privateKey);
+    return {
+        identityKey: { publicKey: b64(signing.publicKey), privateKey: b64(signing.privateKey) },          // Ed25519
+        identityDhKey: { publicKey: b64(dhIdentity.publicKey), privateKey: b64(dhIdentity.privateKey) },  // X25519
+        identityKeySignature: b64(identityKeySignature),
+    };
+}
+
+async function generateSignedPreKey(identityPrivateKeyB64) {
+    const s = await _ready();
     const kp = s.crypto_box_keypair();
-    keys.push({
-      keyId: s.randombytes_uniform(0xFFFFFF),
-      publicKey: s.to_base64(kp.publicKey),
-      privateKey: s.to_base64(kp.privateKey),
-    });
-  }
-  return keys;
+    const signature = s.crypto_sign_detached(kp.publicKey, unb64(identityPrivateKeyB64));
+    return {
+        keyId: s.randombytes_uniform(MAX_PREKEY_ID),
+        publicKey: b64(kp.publicKey),
+        privateKey: b64(kp.privateKey),
+        signature: b64(signature),
+    };
 }
 
-// ── Session Establishment (X3DH-like) ────────────────────────────────────────
+async function generateOneTimePreKeys(count) {
+    const s = await _ready();
+    const keys = [];
+    for (let i = 0; i < count; i++) {
+        const kp = s.crypto_box_keypair();
+        keys.push({
+            keyId: s.randombytes_uniform(MAX_PREKEY_ID),
+            publicKey: b64(kp.publicKey),
+            privateKey: b64(kp.privateKey),
+        });
+    }
+    return keys;
+}
+
+// ── Public-side validation (used by the server) ────────────────────────────────
+
+const E32 = 'base64 string of 32 raw bytes';
+const SIG = 'base64 string of 64 raw bytes (Ed25519 detached signature)';
+
+function _invalid(msg, code = 'E2EE_INVALID_BUNDLE') {
+    return Object.assign(new Error(msg), { code, status: 400 });
+}
+
+async function validateBundle({ identityPublicKey, identityDhPublicKey, identityKeySignature, signedPreKeyId, signedPreKeyPublicKey, signedPreKeySignature }) {
+    const s = await _ready();
+    if (typeof identityPublicKey !== 'string' || unb64(identityPublicKey).length !== s.crypto_sign_PUBLICKEYBYTES) {
+        throw _invalid(`identityPublicKey must be a ${E32} (Ed25519 public key).`);
+    }
+    if (typeof identityDhPublicKey !== 'string' || unb64(identityDhPublicKey).length !== s.crypto_scalarmult_BYTES) {
+        throw _invalid(`identityDhPublicKey must be a ${E32} (X25519 public key).`);
+    }
+    if (typeof identityKeySignature !== 'string' || unb64(identityKeySignature).length !== s.crypto_sign_BYTES) {
+        throw _invalid(`identityKeySignature must be a ${SIG}.`);
+    }
+    if (!Number.isSafeInteger(signedPreKeyId) || signedPreKeyId < 0 || signedPreKeyId > MAX_PREKEY_ID) {
+        throw _invalid(`signedPreKeyId must be an integer in [0, ${MAX_PREKEY_ID}].`);
+    }
+    if (typeof signedPreKeyPublicKey !== 'string' || unb64(signedPreKeyPublicKey).length !== s.crypto_scalarmult_BYTES) {
+        throw _invalid(`signedPreKeyPublicKey must be a ${E32}.`);
+    }
+    if (typeof signedPreKeySignature !== 'string' || unb64(signedPreKeySignature).length !== s.crypto_sign_BYTES) {
+        throw _invalid(`signedPreKeySignature must be a ${SIG}.`);
+    }
+    // Cryptographic binding: the identity key must sign BOTH its own DH half
+    // and the signed prekey. A bundle that fails either is not this account's.
+    if (!verifyBundleSignatures({ identityPublicKey, identityDhPublicKey, identityKeySignature, signedPreKeyPublicKey, signedPreKeySignature })) {
+        throw _invalid('Bundle signature verification failed — the identity key does not sign the DH identity key and the signed prekey.');
+    }
+    return true;
+}
+
+function verifyBundleSignatures({ identityPublicKey, identityDhPublicKey, identityKeySignature, signedPreKeyPublicKey, signedPreKeySignature }) {
+    const bindingOk = _s.crypto_sign_verify_detached(unb64(identityKeySignature), unb64(identityDhPublicKey), unb64(identityPublicKey));
+    const prekeyOk = _s.crypto_sign_verify_detached(unb64(signedPreKeySignature), unb64(signedPreKeyPublicKey), unb64(identityPublicKey));
+    return bindingOk && prekeyOk;
+}
+
+function validateOneTimePreKeys(payload, maxCount = 100) {
+    if (!Array.isArray(payload) || payload.length === 0) {
+        throw _invalid('oneTimePreKeys must be a non-empty array of {keyId, publicKey}.');
+    }
+    if (payload.length > maxCount) {
+        throw _invalid(`At most ${maxCount} one-time preKeys per request.`);
+    }
+    for (const k of payload) {
+        if (!k || typeof k !== 'object') throw _invalid('Each one-time preKey must be an object.');
+        if (!Number.isSafeInteger(k.keyId) || k.keyId < 0 || k.keyId > MAX_PREKEY_ID) {
+            throw _invalid(`oneTimePreKey keyId must be an integer in [0, ${MAX_PREKEY_ID}].`);
+        }
+        if (typeof k.publicKey !== 'string' || unb64(k.publicKey).length !== _s.crypto_scalarmult_BYTES) {
+            throw _invalid(`oneTimePreKey publicKey must be a ${E32}.`);
+        }
+    }
+    return true;
+}
+
+// Safety number (PROTOCOL.md §3): BLAKE2b-256 of the Ed25519 identity pub.
+async function fingerprint(identityPublicKey) {
+    const s = await _ready();
+    const hash = s.crypto_generichash(s.crypto_generichash_BYTES, unb64(identityPublicKey));
+    return s.to_hex(hash).toUpperCase().match(/.{1,5}/g).join(' ');
+}
+
+// ── X3DH (PROTOCOL.md §4) ─────────────────────────────────────────────────────
+
+// Session associated data: initiator's Ed25519 identity pub first.
+const sessionAD = (initiatorIdentityPubB64, responderIdentityPubB64) =>
+    `${initiatorIdentityPubB64}|${responderIdentityPubB64}`;
+
+function x3dhSecret(dh1, dh2, dh3, dh4) {
+    const parts = dh4 ? [ZERO_SALT, dh1, dh2, dh3, dh4] : [ZERO_SALT, dh1, dh2, dh3];
+    return hkdfSha512(concat(...parts), X3DH_INFO, 64).slice(0, 32);
+}
 
 /**
- * Establish a session using the receiver's preKey bundle.
- * Derives a shared root key using DH + KDF.
+ * Initiator side (A). A has verified B's bundle (fetched with an atomically
+ * claimed one-time prekey if any remained).
  *
- * @param {Object} receiverBundle - { identityPublicKey (Ed25519), signedPreKeyPublicKey (X25519), signedPreKeySignature, oneTimePreKeyPublicKey (X25519) }
- * @param {Object} senderIdentity - { publicKey (Ed25519), privateKey (Ed25519) }
- * @returns {Object} { rootKey, ephemeralPublicKey (X25519) }
+ * Terms (PROTOCOL.md §4):
+ *   DH1 = DH(identityDhKey_A_priv, signedPreKey_B_pub)
+ *   DH2 = DH(ekA_priv, identityDhKey_B_pub)
+ *   DH3 = DH(ekA_priv, signedPreKey_B_pub)
+ *   DH4 = DH(ekA_priv, oneTimePreKey_B_pub)   [optional]
  */
-async function establishSession(receiverBundle, senderIdentity) {
-  const s = await init();
-
-  // 1. Verify the signed preKey signature with receiver's Ed25519 identity key
-  const identityPub = s.from_base64(receiverBundle.identityPublicKey);
-  const signedPreKeyPub = s.from_base64(receiverBundle.signedPreKeyPublicKey);
-  const signature = s.from_base64(receiverBundle.signedPreKeySignature);
-
-  if (!s.crypto_sign_verify_detached(signature, signedPreKeyPub, identityPub)) {
-    throw new Error('Signed preKey signature verification failed');
-  }
-
-  // 2. Convert sender's Ed25519 identity key to X25519 for DH
-  const senderCurvePriv = s.crypto_sign_ed25519_sk_to_curve25519(
-    s.from_base64(senderIdentity.privateKey)
-  );
-
-  // 3. Generate ephemeral X25519 key pair for this session
-  const ephemeralKp = s.crypto_box_keypair();
-
-  // 4. DH: sender_identity_priv × receiver_signed_prekey_pub
-  const dh1 = s.crypto_scalarmult(senderCurvePriv, signedPreKeyPub);
-
-  // 5. DH: ephemeral_priv × receiver_signed_prekey_pub
-  const dh2 = s.crypto_scalarmult(ephemeralKp.privateKey, signedPreKeyPub);
-
-  // 6. Optionally: DH: ephemeral_priv × receiver_one_time_prekey_pub
-  let dh3 = null;
-  if (receiverBundle.oneTimePreKeyPublicKey) {
-    const otpPub = s.from_base64(receiverBundle.oneTimePreKeyPublicKey);
-    dh3 = s.crypto_scalarmult(ephemeralKp.privateKey, otpPub);
-  }
-
-  // 7. KDF: combine DH outputs into root key
-  const dhCombined = dh3
-    ? new Uint8Array([...dh1, ...dh2, ...dh3])
-    : new Uint8Array([...dh1, ...dh2]);
-
-  const rootKey = s.crypto_generichash(
-    s.crypto_generichash_BYTES, // 32 bytes
-    dhCombined
-  );
-
-  return {
-    rootKey: s.to_base64(rootKey),
-    ephemeralPublicKey: s.to_base64(ephemeralKp.publicKey),
-  };
+async function x3dhInitiate({ peerBundle, identityDhPrivateKey, identityPublicKey, peerIdentityPublicKey, ephemeralKeyPair }) {
+    await _ready();
+    const ek = ephemeralKeyPair || generateDhKeyPair();
+    const spk = unb64(peerBundle.signedPreKeyPublicKey);
+    const dh1 = dh(unb64(identityDhPrivateKey), spk);
+    const dh2 = dh(ek.privateKey, unb64(peerBundle.identityDhPublicKey));
+    const dh3 = dh(ek.privateKey, spk);
+    let dh4 = null;
+    if (peerBundle.oneTimePreKey && peerBundle.oneTimePreKey.publicKey) {
+        dh4 = dh(ek.privateKey, unb64(peerBundle.oneTimePreKey.publicKey));
+    }
+    const rootKey = x3dhSecret(dh1, dh2, dh3, dh4);
+    return {
+        rootKey,
+        ephemeralKeyPair: ek,
+        ephemeralPublicKey: b64(ek.publicKey),
+        associatedData: sessionAD(identityPublicKey, peerIdentityPublicKey),
+        usedOneTimePreKeyId: dh4 && peerBundle.oneTimePreKey ? peerBundle.oneTimePreKey.keyId : null,
+    };
 }
 
 /**
- * Accept a session on the receiver side using the sender's ephemeral key
- * and the receiver's signed preKey private key (+ one-time preKey private key).
- *
- * @param {string} ephemeralPublicKey - Sender's ephemeral X25519 public key
- * @param {string} signedPreKeyPrivateKey - Receiver's signed preKey private key (X25519)
- * @param {string} oneTimePreKeyPrivateKey - Receiver's one-time preKey private key (X25519, optional)
- * @param {string} senderIdentityPublicKey - Sender's Ed25519 public key
- * @param {string} receiverIdentityPrivateKey - Receiver's Ed25519 private key (for DH conversion)
- * @returns {Object} { rootKey }
+ * Responder side (B). Mirrors the SAME DH terms with B's private halves, in
+ * the SAME concatenation order (each mirrored pair produces identical bytes):
+ *   DH1' = DH(signedPreKey_priv, identityDhKey_A_pub)
+ *   DH2' = DH(identityDhKey_B_priv, ekA_pub)
+ *   DH3' = DH(signedPreKey_priv, ekA_pub)
+ *   DH4' = DH(oneTimePreKey_priv, ekA_pub)   [optional]
  */
-async function acceptSession(ephemeralPublicKey, signedPreKeyPrivateKey, oneTimePreKeyPrivateKey, senderIdentityPublicKey, receiverIdentityPrivateKey) {
-  const s = await init();
-  const ephPub = s.from_base64(ephemeralPublicKey);
-  const spkPriv = s.from_base64(signedPreKeyPrivateKey);
-
-  // 1. Convert receiver's Ed25519 identity key to X25519 for DH
-  const receiverCurvePriv = s.crypto_sign_ed25519_sk_to_curve25519(
-    s.from_base64(receiverIdentityPrivateKey)
-  );
-
-  // 2. Convert sender's Ed25519 identity key to X25519 for DH
-  const senderCurvePub = s.crypto_sign_ed25519_pk_to_curve25519(
-    s.from_base64(senderIdentityPublicKey)
-  );
-
-  // 3. DH: receiver_identity_priv × sender_identity_pub (both X25519)
-  const dh1 = s.crypto_scalarmult(receiverCurvePriv, senderCurvePub);
-
-  // 4. DH: receiver_signed_prekey_priv × sender_ephemeral_pub
-  const dh2 = s.crypto_scalarmult(spkPriv, ephPub);
-
-  // 5. Optionally: DH: receiver_onetime_prekey_priv × sender_ephemeral_pub
-  let dh3 = null;
-  if (oneTimePreKeyPrivateKey) {
-    const otpPriv = s.from_base64(oneTimePreKeyPrivateKey);
-    dh3 = s.crypto_scalarmult(otpPriv, ephPub);
-  }
-
-  // 6. KDF: combine DH outputs into root key (same order as establishSession)
-  const dhCombined = dh3
-    ? new Uint8Array([...dh1, ...dh2, ...dh3])
-    : new Uint8Array([...dh1, ...dh2]);
-
-  const rootKey = s.crypto_generichash(
-    s.crypto_generichash_BYTES,
-    dhCombined
-  );
-
-  return { rootKey: s.to_base64(rootKey) };
+async function x3dhRespond({ ephemeralPublicKey, initiatorIdentityDhPublicKey, identityDhPrivateKey, signedPreKeyPrivateKey, oneTimePreKeyPrivateKey, identityPublicKey, initiatorIdentityPublicKey }) {
+    await _ready();
+    const ek = unb64(ephemeralPublicKey);
+    const ikA = unb64(initiatorIdentityDhPublicKey);
+    const dh1 = dh(unb64(signedPreKeyPrivateKey), ikA);
+    const dh2 = dh(unb64(identityDhPrivateKey), ek);
+    const dh3 = dh(unb64(signedPreKeyPrivateKey), ek);
+    let dh4 = null;
+    if (oneTimePreKeyPrivateKey) {
+        dh4 = dh(unb64(oneTimePreKeyPrivateKey), ek);
+    }
+    const rootKey = x3dhSecret(dh1, dh2, dh3, dh4);
+    return {
+        rootKey,
+        associatedData: sessionAD(initiatorIdentityPublicKey, identityPublicKey),
+    };
 }
 
-// ── Double Ratchet (Simplified) ─────────────────────────────────────────────
+// ── Double Ratchet (PROTOCOL.md §5) ────────────────────────────────────────────
 
-/**
- * Derive the next message key from the current chain key.
- * KDF chain: chainKey → KDF(chainKey, 0x01) = messageKey
- *                    → KDF(chainKey, 0x02) = newChainKey
- */
-async function deriveMessageKey(chainKey) {
-  const s = await init();
-  const ck = s.from_base64(chainKey);
-
-  const messageKey = s.crypto_generichash(32, new Uint8Array([...ck, 0x01]));
-  const newChainKey = s.crypto_generichash(32, new Uint8Array([...ck, 0x02]));
-
-  return {
-    messageKey: s.to_base64(messageKey),
-    chainKey: s.to_base64(newChainKey),
-  };
+// Alice (initiator): DHs = X3DH ephemeral, DHr = B's signed prekey pub.
+function initiatorRatchet(rootKey, ephemeralKeyPair, peerSignedPreKeyPublicKey) {
+    const { rootKey: rk, chainKey } = kdfRk(rootKey, dh(ephemeralKeyPair.privateKey, unb64(peerSignedPreKeyPublicKey)));
+    return {
+        protocolVersion: PROTOCOL_VERSION,
+        rootKey: rk,
+        dhs: { publicKey: ephemeralKeyPair.publicKey, privateKey: ephemeralKeyPair.privateKey },
+        dhr: unb64(peerSignedPreKeyPublicKey),
+        cks: chainKey,
+        ckr: null,
+        ns: 0, nr: 0, pn: 0,
+        mkSkipped: {}, // `${b64(dhr)}|${n}` -> base64 message key
+    };
 }
 
-/**
- * Initialize a ratchet from the root key.
- * Derives initial sending chain key.
- */
-async function initRatchet(rootKey) {
-  const s = await init();
-  const rk = s.from_base64(rootKey);
-
-  const chainKey = s.crypto_generichash(32, new Uint8Array([...rk, 0x03]));
-  const nextRootKey = s.crypto_generichash(32, new Uint8Array([...rk, 0x04]));
-
-  return {
-    rootKey: s.to_base64(nextRootKey),
-    chainKey: s.to_base64(chainKey),
-    messageNumber: 0,
-  };
+// Bob (responder): DHs = signed prekey pair, DHr = None. His first RECEIVED
+// message performs the DH ratchet step that creates his sending chain
+// (exactly the Double Ratchet spec's responder initialization).
+function responderRatchet(rootKey, signedPreKeyPair) {
+    return {
+        protocolVersion: PROTOCOL_VERSION,
+        rootKey,
+        dhs: { publicKey: signedPreKeyPair.publicKey, privateKey: signedPreKeyPair.privateKey },
+        dhr: null,
+        cks: null,
+        ckr: null,
+        ns: 0, nr: 0, pn: 0,
+        mkSkipped: {},
+    };
 }
 
-// ── Message Encryption/Decryption ────────────────────────────────────────────
-
-/**
- * Encrypt a message using crypto_secretbox (authenticated symmetric encryption).
- *
- * @param {string} messageKey - Base64 32-byte key
- * @param {string} plaintext - Message to encrypt
- * @returns {Object} { ciphertext, nonce } — both base64
- */
-async function encryptMessage(messageKey, plaintext) {
-  const s = await init();
-  const key = s.from_base64(messageKey);
-  const message = s.from_string(plaintext);
-  const nonce = s.randombytes_buf(s.crypto_secretbox_NONCEBYTES);
-
-  const ciphertext = s.crypto_secretbox_easy(message, nonce, key);
-
-  return {
-    ciphertext: s.to_base64(ciphertext),
-    nonce: s.to_base64(nonce),
-  };
+// Deterministic AEAD nonce: u32be(0) || u64be(n). Message keys are single-use,
+// so (key, nonce) pairs never repeat (PROTOCOL.md §5).
+function messageNonce(n) {
+    return concat(new Uint8Array([0, 0, 0, 0]), u64be(n));
 }
 
-/**
- * Decrypt a message using crypto_secretbox.
- */
-async function decryptMessage(messageKey, ciphertextB64, nonceB64) {
-  const s = await init();
-  const key = s.from_base64(messageKey);
-  const ciphertext = s.from_base64(ciphertextB64);
-  const nonce = s.from_base64(nonceB64);
-
-  const decrypted = s.crypto_secretbox_open_easy(ciphertext, nonce, key);
-  if (!decrypted) {
-    throw new Error('Decryption failed — message may have been tampered with');
-  }
-
-  return s.to_string(decrypted);
+// AEAD associated data binds the session identities AND the exact ratchet
+// header bytes (tampered/mismatched headers fail decryption).
+function messageAD(sessionAd, header) {
+    return utf8(`${sessionAd}|${header.v}|${header.dh}|${header.pn}|${header.n}`);
 }
 
-// ── Full Encrypt/Decrypt Flow (ratchet + encrypt) ────────────────────────────
+function aeadEncrypt(messageKey, nonce, plaintext, aad) {
+    const ct = _s.crypto_aead_chacha20poly1305_ietf_encrypt(plaintext, aad, null, nonce, messageKey);
+    return b64(ct);
+}
 
-/**
- * Full encrypt: derive next message key from chain, then encrypt plaintext.
- * Returns the encrypted payload + updated chain state.
- *
- * @param {Object} session - { chainKey, messageNumber }
- * @param {string} plaintext
- * @returns {Object} { ciphertext, nonce, messageNumber, newChainKey }
- */
-async function encrypt(session, plaintext) {
-  const { messageKey, chainKey } = await deriveMessageKey(session.chainKey);
-  const { ciphertext, nonce } = await encryptMessage(messageKey, plaintext);
+function aeadDecrypt(messageKey, nonce, cipherTextB64, aad) {
+    try {
+        // libsodium.js wrapper signature (verified against the installed
+        // version): decrypt(secret_nonce, ciphertext, additional_data,
+        // public_nonce, key). secret_nonce is always null for ChaCha20-
+        // Poly1305 (IETF variant does not use it).
+        return _s.crypto_aead_chacha20poly1305_ietf_decrypt(null, unb64(cipherTextB64), aad, nonce, messageKey);
+    } catch {
+        throw Object.assign(new Error('AEAD authentication failed — ciphertext tampered or wrong key.'), { code: 'E2EE_DECRYPT_FAILED', status: 400 });
+    }
+}
 
-  return {
-    ciphertext,
-    nonce,
-    messageNumber: session.messageNumber,
-    newChainKey: chainKey,
-  };
+function _skipMessageKeys(state, until) {
+    if (until - state.nr > MAX_SKIP) {
+        throw Object.assign(
+            new Error(`Out-of-order window exceeded (${until - state.nr} > ${MAX_SKIP}) — refusing to derive unbounded message keys.`),
+            { code: 'E2EE_TOO_FAR_BEHIND', status: 400 },
+        );
+    }
+    let { ckr, nr } = state;
+    const mkSkipped = { ...state.mkSkipped };
+    if (ckr) {
+        while (nr < until) {
+            const { messageKey, chainKey } = kdfCk(ckr);
+            mkSkipped[`${b64(state.dhr)}|${nr}`] = b64(messageKey);
+            ckr = chainKey;
+            nr += 1;
+        }
+    }
+    return { ckr, nr, mkSkipped };
+}
+
+function _dhRatchetStep(state, header) {
+    // Receiver-side DH ratchet step (lockstep with the peer, verified by the
+    // proof suite): the NEW RECEIVING chain is derived FIRST with the CURRENT
+    // (old) own ratchet key — this is the mirror of the peer's sending chain,
+    // which it derived as KDF_RK(RK, DH(its_new_key, our_old_public)).
+    // Only then does this party rotate its own ratchet keypair and derive its
+    // new SENDING chain, which the peer will mirror on its next receive.
+    // Deriving them in the other order breaks the lockstep and is exactly the
+    // class of bug this rewrite exists to prevent.
+    const pn = state.ns; // our previous sending chain length (peer's header.pn)
+    const recvStep = kdfRk(state.rootKey, dh(state.dhs.privateKey, unb64(header.dh)));
+    const newPair = generateDhKeyPair();
+    const sendStep = kdfRk(recvStep.rootKey, dh(newPair.privateKey, unb64(header.dh)));
+    return {
+        ...state,
+        rootKey: sendStep.rootKey,
+        dhs: newPair,
+        dhr: unb64(header.dh),
+        cks: sendStep.chainKey,
+        ckr: recvStep.chainKey,
+        ns: 0, nr: 0, pn,
+    };
 }
 
 /**
- * Full decrypt: given the same chain state, derive the message key and decrypt.
+ * Encrypt one message. Returns header, base64 ciphertext, and the NEW state.
+ * The old state is NOT mutated — callers must persist the returned state.
+ * The message key is consumed by advancing the chain, so a second call on
+ * the same state can never re-derive it: nonce reuse is impossible under
+ * this API.
  */
-async function decrypt(session, ciphertextB64, nonceB64) {
-  const { messageKey } = await deriveMessageKey(session.chainKey);
-  return decryptMessage(messageKey, ciphertextB64, nonceB64);
+function ratchetEncrypt(state, plaintext, sessionAd) {
+    if (!state.cks) {
+        throw Object.assign(new Error('No sending chain — this party must receive a message first (Double Ratchet initialization).'), { code: 'E2EE_NO_SENDING_CHAIN', status: 400 });
+    }
+    const { messageKey, chainKey } = kdfCk(state.cks);
+    const header = { v: PROTOCOL_VERSION, dh: b64(state.dhs.publicKey), pn: state.pn, n: state.ns };
+    const cipherText = aeadEncrypt(messageKey, messageNonce(state.ns), utf8(plaintext), messageAD(sessionAd, header));
+    return {
+        header,
+        cipherText,
+        state: { ...state, cks: chainKey, ns: state.ns + 1 },
+    };
 }
 
-// ── Dispute Evidence ─────────────────────────────────────────────────────────
-
 /**
- * Encrypt message history for dispute evidence using an admin public key.
- * Uses crypto_box_seal (sealed box — sender anonymous, receiver can open).
- *
- * @param {string} adminPublicKey - Admin's X25519 public key (base64)
- * @param {Array} messages - Array of { plaintext, timestamp, senderId }
- * @returns {string} Encrypted evidence blob (base64)
+ * Decrypt one message (out-of-order delivery via MKSKIPPED; DH ratchet step
+ * on new remote ratchet keys). Returns plaintext and the NEW state.
  */
+function ratchetDecrypt(state, header, cipherText, sessionAd) {
+    if (!header || typeof header !== 'object' || header.v !== PROTOCOL_VERSION) {
+        throw Object.assign(new Error('Unsupported or missing ratchet header version.'), { code: 'E2EE_BAD_HEADER', status: 400 });
+    }
+    if (typeof header.dh !== 'string' || !Number.isSafeInteger(header.pn) || !Number.isSafeInteger(header.n) || header.pn < 0 || header.n < 0) {
+        throw Object.assign(new Error('Malformed ratchet header.'), { code: 'E2EE_BAD_HEADER', status: 400 });
+    }
+    let s = state;
+
+    // Out-of-order within a known chain: the message key was retained.
+    const skippedKey = `${header.dh}|${header.n}`;
+    if (s.mkSkipped[skippedKey] !== undefined) {
+        const mk = unb64(s.mkSkipped[skippedKey]);
+        const mkSkipped = { ...s.mkSkipped };
+        delete mkSkipped[skippedKey];
+        const plaintextBytes = aeadDecrypt(mk, messageNonce(header.n), cipherText, messageAD(sessionAd, header));
+        return { plaintext: Buffer.from(plaintextBytes).toString('utf8'), state: { ...s, mkSkipped } };
+    }
+
+    // New remote ratchet key → close the old receiving chain, ratchet.
+    if (!s.dhr || b64(s.dhr) !== header.dh) {
+        const skipped = _skipMessageKeys(s, header.pn);
+        s = { ...s, ckr: skipped.ckr, nr: skipped.nr, mkSkipped: skipped.mkSkipped };
+        s = _dhRatchetStep(s, header);
+    }
+
+    // Skip to the message's position in the current receiving chain.
+    const skipped2 = _skipMessageKeys(s, header.n);
+    s = { ...s, ckr: skipped2.ckr, nr: skipped2.nr, mkSkipped: skipped2.mkSkipped };
+    const { messageKey, chainKey } = kdfCk(s.ckr);
+    const plaintextBytes = aeadDecrypt(messageKey, messageNonce(header.n), cipherText, messageAD(sessionAd, header));
+    return {
+        plaintext: Buffer.from(plaintextBytes).toString('utf8'),
+        state: { ...s, ckr: chainKey, nr: header.n + 1 },
+    };
+}
+
+// ── State serialization (client persistence; byte-stable) ─────────────────────
+
+function serializeState(state) {
+    return {
+        protocolVersion: state.protocolVersion,
+        rootKey: b64(state.rootKey),
+        dhs: { publicKey: b64(state.dhs.publicKey), privateKey: b64(state.dhs.privateKey) },
+        dhr: state.dhr ? b64(state.dhr) : null,
+        cks: state.cks ? b64(state.cks) : null,
+        ckr: state.ckr ? b64(state.ckr) : null,
+        ns: state.ns, nr: state.nr, pn: state.pn,
+        mkSkipped: state.mkSkipped,
+    };
+}
+
+function deserializeState(ser) {
+    return {
+        protocolVersion: ser.protocolVersion,
+        rootKey: unb64(ser.rootKey),
+        dhs: { publicKey: unb64(ser.dhs.publicKey), privateKey: unb64(ser.dhs.privateKey) },
+        dhr: ser.dhr ? unb64(ser.dhr) : null,
+        cks: ser.cks ? unb64(ser.cks) : null,
+        ckr: ser.ckr ? unb64(ser.ckr) : null,
+        ns: ser.ns, nr: ser.nr, pn: ser.pn,
+        mkSkipped: { ...ser.mkSkipped },
+    };
+}
+
+// ── Dispute evidence (unchanged contract; operates on client-supplied
+// plaintext history for ADMIN dispute processing — explicitly NOT ordinary
+// user-message confidentiality; see PROTOCOL.md §6 exclusions) ────────────────
+
 async function encryptEvidenceForAdmin(adminPublicKey, messages) {
-  const s = await init();
-  const pubKey = s.from_base64(adminPublicKey);
-  const data = s.from_string(JSON.stringify(messages));
-
-  const sealed = s.crypto_box_seal(data, pubKey);
-  return s.to_base64(sealed);
+    const s = await _ready();
+    return s.to_base64(s.crypto_box_seal(s.from_string(JSON.stringify(messages)), unb64(adminPublicKey)));
 }
 
-/**
- * Decrypt dispute evidence using admin key pair.
- */
 async function decryptEvidence(adminKeyPair, evidenceB64) {
-  const s = await init();
-  const pubKey = s.from_base64(adminKeyPair.publicKey);
-  const privKey = s.from_base64(adminKeyPair.privateKey);
-  const evidence = s.from_base64(evidenceB64);
-
-  const decrypted = s.crypto_box_seal_open(evidence, pubKey, privKey);
-  return JSON.parse(s.to_string(decrypted));
-}
-
-// ── Utility ───────────────────────────────────────────────────────────────────
-
-/**
- * Generate a fingerprint for a public key (for safety number verification).
- * Users compare fingerprints to verify they're talking to the right person.
- */
-async function fingerprint(publicKey) {
-  const s = await init();
-  const key = s.from_base64(publicKey);
-  const hash = s.crypto_generichash(s.crypto_generichash_BYTES, key);
-  const hex = s.to_hex(hash).toUpperCase();
-  return hex.match(/.{1,5}/g).join(' ');
+    const s = await _ready();
+    const opened = s.crypto_box_seal_open(unb64(evidenceB64), unb64(adminKeyPair.publicKey), unb64(adminKeyPair.privateKey));
+    return JSON.parse(s.to_string(opened));
 }
 
 module.exports = {
-  init,
-  generateIdentityKeyPair,
-  ed25519PubToCurve25519,
-  ed25519PrivToCurve25519,
-  generateSignedPreKey,
-  generatePreKeys,
-  establishSession,
-  acceptSession,
-  deriveMessageKey,
-  initRatchet,
-  encryptMessage,
-  decryptMessage,
-  encrypt,
-  decrypt,
-  encryptEvidenceForAdmin,
-  decryptEvidence,
-  fingerprint,
+    PROTOCOL_VERSION,
+    MAX_SKIP,
+    MAX_PREKEY_ID,
+    // client + proofs
+    generateIdentityKeys,
+    generateSignedPreKey,
+    generateOneTimePreKeys,
+    x3dhInitiate,
+    x3dhRespond,
+    initiatorRatchet,
+    responderRatchet,
+    ratchetEncrypt,
+    ratchetDecrypt,
+    serializeState,
+    deserializeState,
+    sessionAD,
+    // server-side (public data only)
+    validateBundle,
+    validateOneTimePreKeys,
+    verifyBundleSignatures,
+    fingerprint,
+    // dispute evidence
+    encryptEvidenceForAdmin,
+    decryptEvidence,
 };

@@ -47,6 +47,14 @@ function exactString(d) {
     return d.toFixed(Math.max(0, d.decimalPlaces()));
 }
 
+// r40/P1 — canonical identity string for the v2 fingerprint: fixed 8dp.
+// Lossless here (MAX_ECONOMIC_DP is 8) and fully canonical: "5", "5.0" and
+// "5.00000000" are the SAME economic intent and hash identically, while
+// any distinct 8dp value hashes differently.
+function exactCanonicalString(d) {
+    return d.toFixed(8);
+}
+
 // Returns an exact Prisma.Decimal or throws a restock error.
 function parseExactDecimal(value, { field, minimum, strictString }) {
     let text;
@@ -95,19 +103,39 @@ class InventoryRestockService {
         // Fingerprint only caller-controlled economics. In particular, do NOT
         // include catalog cost, stock or active status: replay must survive
         // subsequent catalog changes without re-executing the operation.
-        // NOTE: the fingerprint is intentionally computed from the SAME
-        // normalized floats the original formula used — JSON.stringify of a
-        // Prisma.Decimal would change the digest and strand every operation
-        // committed before §Wave-1B behind 409s. The exact decimals parsed
-        // above are for ledger arithmetic, not for identity.
-        const fingerprint = createHash('sha256').update(JSON.stringify([
+        //
+        // r40/P1 — VERSIONED IDENTITY CONTRACT (the float64-collapse fix for
+        // replay identity, mirroring the invoice r39/P1 fix):
+        //   • v2 (new operations): the fingerprint is the sha256 of the exact
+        //     CANONICAL DECIMAL STRINGS. Two distinct 8dp economic intents can
+        //     never collide — Number("999999999999.99999999") and
+        //     Number("999999999999.99999998") are the SAME float64, but their
+        //     canonical strings differ, so their digests differ.
+        //   • v1 (legacy, read-only compatibility): operations committed
+        //     before this change carry fingerprintVersion 1 and keep the
+        //     legacy Number()-coerced interpretation ON REPLAY ONLY, so a
+        //     committed operation is never stranded behind a 409 it cannot
+        //     satisfy. All NEW writes are v2.
+        // The version is chosen by the STORED operation, never the request:
+        // a v1 row replays under the v1 contract, a v2 row under v2, and no
+        // distinct exact economic intent can replay under the same NEW key.
+        const canonicalFingerprintParts = [
+            businessProfileId, itemId,
+            exactCanonicalString(qty),
+            hasExplicitCost ? exactCanonicalString(suppliedCost) : 'DEFAULT_COST',
+        ];
+        const v2Fingerprint = createHash('sha256')
+            .update(JSON.stringify(canonicalFingerprintParts)).digest('hex');
+        const v1Fingerprint = createHash('sha256').update(JSON.stringify([
             businessProfileId, itemId, Number(qty.toString()), hasExplicitCost ? Number(suppliedCost.toString()) : 'DEFAULT_COST',
         ])).digest('hex');
         const identity = { businessProfileId_idempotencyKey: { businessProfileId, idempotencyKey } };
         const replay = async () => {
             const committed = await this.prisma.inventoryRestockOperation.findUnique({ where: identity });
             if (!committed) return null;
-            if (committed.requestFingerprint !== fingerprint)
+            // Compare under the STORED operation's identity contract.
+            const expected = committed.fingerprintVersion === 2 ? v2Fingerprint : v1Fingerprint;
+            if (committed.requestFingerprint !== expected)
                 throw restockError('RESTOCK_IDEMPOTENCY_CONFLICT', 'Idempotency-Key already belongs to a different restock.', 409);
             if (!committed.result || !committed.ledgerId)
                 throw restockError('RESTOCK_INCOMPLETE_OPERATION', 'Restock operation is incomplete.', 409);
@@ -124,7 +152,7 @@ class InventoryRestockService {
                 // waits for the first transaction to commit or roll back; no
                 // second stock/expense writes can occur before this claim.
                 const operation = await tx.inventoryRestockOperation.create({
-                    data: { id: randomUUID(), businessProfileId, itemId, idempotencyKey, requestFingerprint: fingerprint },
+                    data: { id: randomUUID(), businessProfileId, itemId, idempotencyKey, requestFingerprint: v2Fingerprint, fingerprintVersion: 2 },
                 });
                 const item = await tx.inventoryItem.findFirst({
                     where: { id: itemId, businessProfileId },

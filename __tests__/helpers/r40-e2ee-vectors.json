@@ -1,0 +1,37 @@
+{
+  "inputs": {
+    "identityPrivateKeyA": "ERERERERERERERERERERERERERERERERERERERERERHQSrIydCu0qzoTaL1GFeTm0CJKtxoBa6+FIKMyyXeHNw==",
+    "identityPublicKeyA": "0EqyMnQrtKs6E2i9RhXk5tAiSrcaAWuvhSCjMsl3hzc=",
+    "identityDhPrivateKeyA": "MzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzM=",
+    "identityDhPublicKeyA": "ew1H2TQn+DERYHgcfHM/2J+IlwrvSQ2KoO4ZpMuKGxQ=",
+    "identityKeySignatureA": "/dgVn4oFI6uRDnl4RCXCYfk8eb1IY3i+It5QObkd49RelgpfEbVdPbKgrFuQzmdlVQhg4l3g3xhHB+oJmUq5CQ==",
+    "identityPrivateKeyB": "IiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiKgmqX0emdZgC/5VfjcLSoUpcmdI76X+GQSf/k4NFWk8A==",
+    "identityPublicKeyB": "oJql9HpnWYAv+VX43C0qFKXJnSO+l/hkEn/5ODRVpPA=",
+    "identityDhPrivateKeyB": "d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3c=",
+    "identityDhPublicKeyB": "HPV5q6RaELodHvBtkfyiqp7QoRUFFWUxVUBdCxjLmmc=",
+    "identityKeySignatureB": "+OVathdgBWrKrg3Vs5uz+A2iGiez/4m4hSm6DHsztvX93WJxtC4VGZvU1qmAQWjd9dgJ8GHtxpOPoU0jFU/DCA==",
+    "signedPreKeyId": 123456,
+    "signedPreKeyPrivateKeyB": "REREREREREREREREREREREREREREREREREREREREREQ=",
+    "signedPreKeyPublicKeyB": "/y7kVgHsG2cxDHeQQEWFrmlzMe7hwfjPJBlzHB//Pms=",
+    "signedPreKeySignatureB": "CgaDuBYlRfstaXiKREMsyrqGEmY80FzFt+CRdfG2xtj5BgXo3SkbYVnrUiMR+IEBqqzEvSPGtLLNL9dhAGZADg==",
+    "oneTimePreKeyId": 42,
+    "oneTimePreKeyPrivateKeyB": "VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVU=",
+    "oneTimePreKeyPublicKeyB": "OKtmS9hvd9fma92a4HkpE6lP2LM6EmACfktGwfSITGc=",
+    "ephemeralPrivateKeyA": "ZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmY=",
+    "ephemeralPublicKeyA": "IZ5NgA2paNKl/LAJx4T0dGxxOO257khEtznoMLBc9CQ="
+  },
+  "expected": {
+    "rootKeyB64": "sqXwfsOxjaxZcZ7WGoMWMYiC2yLadpVWJD9uenFP71I=",
+    "associatedData": "0EqyMnQrtKs6E2i9RhXk5tAiSrcaAWuvhSCjMsl3hzc=|oJql9HpnWYAv+VX43C0qFKXJnSO+l/hkEn/5ODRVpPA=",
+    "message1": {
+      "header": {
+        "v": 2,
+        "dh": "IZ5NgA2paNKl/LAJx4T0dGxxOO257khEtznoMLBc9CQ=",
+        "pn": 0,
+        "n": 0
+      },
+      "cipherText": "C4l5uYKesfR48hU+k4/uD7kx2ozq/OtU5y3rQ0eUA4NBrQ==",
+      "plaintext": "Vector message one"
+    }
+  }
+}

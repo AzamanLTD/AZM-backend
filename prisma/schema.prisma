@@ -843,7 +843,6 @@ model User {
   // E2EE key material
   e2eePreKeyBundle      E2EEPreKeyBundle?
   e2eeOneTimePreKeys    E2EEOneTimePreKey[] @relation("UserOneTimePreKeys")
-  e2eeSessions          E2EESession[]       @relation("UserE2EESessions")
   fraudAssessments      FraudAssessment[]
   sentPeerTransfers     PeerTransfer[]      @relation("PeerTransferSender")
   receivedPeerTransfers PeerTransfer[]      @relation("PeerTransferReceiver")
@@ -1313,6 +1312,18 @@ model Message {
   isPinned  Boolean   @default(false)
   isStarred Boolean   @default(false)
   pinnedAt  DateTime?
+
+  // r40 E2EE v2 ciphertext envelope (docs/e2ee/PROTOCOL.md §6). When
+  // isEncrypted is true, content is the empty string — the plaintext never
+  // reaches the server. e2eeHeader is the Double Ratchet header JSON
+  // ({v, dh, pn, n}); e2eeCipherText is base64 ChaCha20-Poly1305 output;
+  // e2eeEnvelopeId is the client-generated replay anchor (unique — a retry
+  // of the same send can never create a second row).
+  isEncrypted    Boolean @default(false)
+  e2eeVersion    Int?
+  e2eeHeader     Json?
+  e2eeCipherText String? @db.VarChar(6000)
+  e2eeEnvelopeId String? @db.VarChar(64) @unique
 
   conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
   sender       User?        @relation("MessageSender", fields: [senderId], references: [id])
@@ -5565,6 +5576,11 @@ model InventoryRestockOperation {
   itemId             String
   idempotencyKey     String   @db.VarChar(128)
   requestFingerprint String   @db.VarChar(64)
+  // r40/P1 — versioned identity contract: 1 = legacy Number()-coerced
+  // fingerprint (historical, read-only compatibility), 2 = exact canonical
+  // decimal-string fingerprint (new operations). See
+  // services/businessOS/inventoryRestockService.js.
+  fingerprintVersion Int      @default(1)
   result             Json?
   ledgerId           String?
   createdAt          DateTime @default(now())
@@ -6393,27 +6409,32 @@ model RestrictedObligation {
   @@index([status, asset])
 }
 
-// ── E2EE (Signal-style Protocol) ─────────────────────────────────────────────
+// ── E2EE v2 (r40) — Signal X3DH + Double Ratchet, server-blind ────────────────
+// See docs/e2ee/PROTOCOL.md. The server stores ONLY public key material and
+// relays ciphertext envelopes. There are NO private keys and NO session
+// state in the database — the server must not be a decryption authority for
+// ordinary user messages.
 
 model E2EEPreKeyBundle {
   id     String @id @default(uuid())
   userId Int
 
-  // Identity key (long-term, per user)
-  identityPublicKey  String  @db.VarChar(100)
-  identityPrivateKey String? @db.VarChar(100) // Only stored if user opts to back up; null otherwise
+  // Ed25519 signing identity key (client-generated; private half never leaves
+  // the device).
+  identityPublicKey    String  @db.VarChar(100)
+  // X25519 DH identity key (client-generated). Bound to the signing key by
+  // identityKeySignature (dual-key identity model — see PROTOCOL.md §2).
+  identityDhPublicKey  String  @db.VarChar(100)
+  identityKeySignature String  @db.VarChar(200) // Ed25519 sig over identityDhPublicKey
 
-  // Signed preKey (rotated periodically)
-  signedPreKeyId         Int
-  signedPreKeyPublicKey  String  @db.VarChar(100)
-  signedPreKeyPrivateKey String? @db.VarChar(100) // Server needs this to complete session on receiver side
-  signedPreKeySignature  String  @db.VarChar(200)
+  // Signed prekey (X25519, client-generated, signed by the identity key).
+  signedPreKeyId        Int
+  signedPreKeyPublicKey String  @db.VarChar(100)
+  signedPreKeySignature String  @db.VarChar(200)
 
-  // Active session root key (per friendship/contact pair)
-  // Stored encrypted or as derived key material
-  activeRootKey  String? @db.VarChar(200)
-  activeChainKey String? @db.VarChar(200)
-  messageNumber  Int     @default(0)
+  // Key-change audit trail (reinstall/new device detection for peers).
+  previousIdentityPublicKey   String? @db.VarChar(100)
+  previousIdentityDhPublicKey String? @db.VarChar(100)
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -6428,8 +6449,8 @@ model E2EEOneTimePreKey {
   id         String  @id @default(uuid())
   userId     Int
   keyId      Int
+  // PUBLIC half only (r40): the private half never leaves the client.
   publicKey  String  @db.VarChar(100)
-  privateKey String  @db.VarChar(100) // Server needs this to complete X3DH
   isUsed     Boolean @default(false)
 
   createdAt DateTime  @default(now())
@@ -6439,30 +6460,6 @@ model E2EEOneTimePreKey {
 
   @@index([userId, isUsed])
   @@index([keyId])
-}
-
-model E2EESession {
-  id         String @id @default(uuid())
-  userId     Int // The user who owns this session
-  peerUserId Int // The other party
-
-  // Session state
-  rootKey              String  @db.VarChar(200)
-  sendingChainKey      String? @db.VarChar(200)
-  receivingChainKey    String? @db.VarChar(200)
-  sendMessageNumber    Int     @default(0)
-  receiveMessageNumber Int     @default(0)
-
-  // Initial ephemeral key from X3DH
-  peerEphemeralPublicKey String? @db.VarChar(100)
-
-  createdAt DateTime @default(now())
-  updatedAt DateTime @updatedAt
-
-  user User @relation("UserE2EESessions", fields: [userId], references: [id], onDelete: Cascade)
-
-  @@unique([userId, peerUserId])
-  @@index([userId, peerUserId])
 }
 
 // ── Fraud Detection ─────────────────────────────────────────────────────────────

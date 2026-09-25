@@ -31,6 +31,7 @@
 // =============================================================================
 
 const WebSocket = require('ws');
+const e2eeEnvelope = require('../../services/e2eeMessageEnvelope');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
 const logger = require('../config/logger');
@@ -157,8 +158,8 @@ function createWsBridge(server, deps) {
                 switch (type) {
                     // ── message:send → persist + broadcast ──
                     case 'message:send': {
-                        const { conversationId, text, messageType, replyTo, tempId } = payload || {};
-                        if (!conversationId || !text) return;
+                        const { conversationId, text, messageType, replyTo, tempId, e2ee } = payload || {};
+                        if (!conversationId || (!text && !e2ee)) return;
 
                         // Resolve the conversation to find the other participant
                         const conv = await prisma.conversation.findUnique({
@@ -177,18 +178,55 @@ function createWsBridge(server, deps) {
                             return;
                         }
 
-                        const message = await prisma.message.create({
-                            data: {
-                                conversationId,
-                                senderId: parseInt(userId),
-                                messageType: messageType || 'TEXT',
-                                content: text,
-                                localId: tempId || crypto.randomUUID(),
-                                status: 'sent',
-                                replyToId: replyTo || null,
-                            },
-                            include: { sender: { select: { id: true, username: true } } }
-                        });
+                        let message;
+                        if (e2ee) {
+                            // r40 E2EE envelope: the server stores ONLY the
+                            // ciphertext envelope; content stays empty.
+                            const envelope = await e2eeEnvelope.validateEnvelope(e2ee);
+                            const replayed = await e2eeEnvelope.findExistingByEnvelopeId(prisma, envelope.envelopeId);
+                            if (replayed) {
+                                ws.send(JSON.stringify({
+                                    type: 'message:ack',
+                                    payload: { localId: tempId, id: replayed.id, conversationId, createdAt: replayed.createdAt, replayed: true }
+                                }));
+                                return;
+                            }
+                            message = await prisma.message.create({
+                                data: e2eeEnvelope.buildEncryptedMessageData({
+                                    conversationId,
+                                    senderId: parseInt(userId),
+                                    envelope,
+                                    extras: { localId: tempId || crypto.randomUUID(), status: 'sent', replyToId: replyTo || null },
+                                }),
+                                include: { sender: { select: { id: true, username: true } } }
+                            });
+                        } else {
+                            // Fail-closed (r40): both participants registered →
+                            // plaintext TEXT is refused; the client MUST send
+                            // the e2ee envelope instead.
+                            if (messageType !== 'TEXT' && messageType !== undefined) {
+                                // non-TEXT system message types are exempt
+                            } else if (await e2eeEnvelope.personalConversationIsEncrypted(prisma, conv)) {
+                                ws.send(JSON.stringify({
+                                    type: 'error',
+                                    payload: { message: 'E2EE_REQUIRED: send the e2ee ciphertext envelope', code: 'E2EE_REQUIRED', tempId }
+                                }));
+                                return;
+                            }
+                            if (!text) return;
+                            message = await prisma.message.create({
+                                data: {
+                                    conversationId,
+                                    senderId: parseInt(userId),
+                                    messageType: messageType || 'TEXT',
+                                    content: text,
+                                    localId: tempId || crypto.randomUUID(),
+                                    status: 'sent',
+                                    replyToId: replyTo || null,
+                                },
+                                include: { sender: { select: { id: true, username: true } } }
+                            });
+                        }
 
                         // ACK the sender
                         ws.send(JSON.stringify({
@@ -209,10 +247,11 @@ function createWsBridge(server, deps) {
                             conversationId,
                             senderId: message.sender?.id || parseInt(userId),
                             senderName: message.sender?.username || 'Unknown',
-                            text: message.content,
+                            text: message.isEncrypted ? null : message.content,
                             type: message.messageType,
                             status: 'sent',
-                            createdAt: message.createdAt
+                            createdAt: message.createdAt,
+                            ...(message.isEncrypted ? e2eeEnvelope.envelopeToWire(message) : {}),
                         };
 
                         if (conv.type === 'PERSONAL') {
