@@ -44,6 +44,13 @@ run('r41 — business-OS finance authority (PostgreSQL)', () => {
         process.env.DATABASE_URL = url;
         process.env.NODE_ENV = 'test';
         const { PrismaClient } = require('@prisma/client');
+        // connection_limit=16: gated interleaves hold several concurrent
+        // connections (gate tx + parked service transactions + the
+        // pg_stat_activity polling connection). The sandbox default pool
+        // (num_cpus*2+1) would starve the second parked transaction before
+        // it can even reach the database.
+        const poolUrl = url + (url.includes('?') ? '&' : '?') + 'connection_limit=16';
+        process.env.DATABASE_URL = poolUrl;
         prisma = new PrismaClient();
     });
     afterAll(async () => { await prisma?.$disconnect(); });
@@ -56,6 +63,31 @@ run('r41 — business-OS finance authority (PostgreSQL)', () => {
             'TRUNCATE TABLE "User", "SystemProfitFees", "AdminProfitLog" RESTART IDENTITY CASCADE'
         );
     }, 15000);
+
+    // ── DB-OBSERVED GATE HELPER (r41.audit-followup) ────────────────────────
+    // Polls pg_stat_activity until `count` sessions are BLOCKED ON A LOCK
+    // running a query matching `needle`. Race-proof queue positions come from
+    // this OBSERVED state; the timeout is only a safety bound. No timer ever
+    // establishes the interleaving.
+    const waitForBlocked = async ({ needle, count = 1, timeoutMs = 15000 }) => {
+        const started = Date.now();
+        for (;;) {
+            const rows = await prisma.$queryRaw`
+                SELECT count(*)::int AS n
+                FROM pg_stat_activity
+                WHERE datname = current_database()
+                  AND wait_event_type = 'Lock'
+                  AND query LIKE ${'%' + needle + '%'}`;
+            if (rows[0].n >= count) return rows[0].n;
+            if (Date.now() - started > timeoutMs) {
+                throw new Error(
+                    `DB-observed gate timeout: expected ${count} blocked session(s) on "${needle}", saw ${rows[0].n}`
+                );
+            }
+            await new Promise((r) => setTimeout(r, 25));
+        }
+    };
+
 
     const userBal = async (id) => {
         const u = await prisma.user.findUnique({ where: { id } });
@@ -213,7 +245,7 @@ run('r41 — business-OS finance authority (PostgreSQL)', () => {
         const staleSend = sendInvoice(prisma, { invoiceId: invoice.id, businessProfileId: biz.id })
             .then((v) => ({ ok: true, v }), (e) => ({ ok: false, e }));
 
-        await new Promise((r) => setTimeout(r, 300)); // the send is blocked in the UPDATE
+        await waitForBlocked({ needle: 'UPDATE "public"."BusinessInvoice"' }); // OBSERVED: the send is blocked in the UPDATE
 
         commitA(); // A commits VOIDED — the send's claim re-evaluates and loses
         await txA;
@@ -250,13 +282,13 @@ run('r41 — business-OS finance authority (PostgreSQL)', () => {
         // Position 1 in the lock queue: the REAL send.
         const sendPromise = sendInvoice(prisma, { invoiceId: invoice.id, businessProfileId: biz.id })
             .then((v) => ({ ok: true, v }), (e) => ({ ok: false, e }));
-        await new Promise((r) => setTimeout(r, 300)); // send parked on the row lock, uncommitted
+        await waitForBlocked({ needle: 'UPDATE "public"."BusinessInvoice"' }); // OBSERVED: send parked on the row lock, uncommitted
 
         // Position 2 in the lock queue: the REAL void, its pre-read still
         // sees the committed DRAFT (stale by construction).
         const voidPromise = voidInvoice(prisma, { invoiceId: invoice.id, businessProfileId: biz.id })
             .then((v) => ({ ok: true, v }), (e) => ({ ok: false, e }));
-        await new Promise((r) => setTimeout(r, 300)); // void parked behind the send
+        await waitForBlocked({ needle: 'UPDATE "public"."BusinessInvoice"', count: 2 }); // OBSERVED: void parked behind the send
 
         // Release: the send commits FIRST (SENT), then the void acquires
         // the row and re-evaluates: SENT is legally voidable, and the void
@@ -427,7 +459,7 @@ run('r41 — business-OS finance authority (PostgreSQL)', () => {
         // The stale sweep: its per-booking escrow claim blocks on A's escrow
         // row lock, then re-evaluates against REFUNDED and converges.
         const sweep = sweepNoShowTransitBookings(prisma);
-        await new Promise((r) => setTimeout(r, 300)); // the sweep is blocked mid-claim
+        await waitForBlocked({ needle: 'UPDATE "public"."SmartEscrow"' }); // OBSERVED: the sweep is blocked mid-claim
 
         commitA(); // the cancellation commits — the sweep's claims all lose
         await txA;
@@ -480,7 +512,7 @@ run('r41 — business-OS finance authority (PostgreSQL)', () => {
         // The REAL sweep: fresh reads pass (CONFIRMED + FUNDED), the escrow
         // claim locks the ESCROW row, then its booking claim parks on GATE 1.
         const sweepPromise = sweepNoShowTransitBookings(prisma);
-        await new Promise((r) => setTimeout(r, 500)); // sweep parked: holds ESCROW, wants BOOKING
+        await waitForBlocked({ needle: 'UPDATE "public"."TransitBooking"' }); // OBSERVED: sweep parked — holds ESCROW, wants BOOKING
 
         // The REAL cancellation (post-fix lock order): it takes the escrow
         // FOR UPDATE FIRST — and blocks on the sweep's escrow lock BEFORE
@@ -489,7 +521,7 @@ run('r41 — business-OS finance authority (PostgreSQL)', () => {
         // the escrow — the AB-BA cycle.
         const cancelPromise = cancelTransitBooking(prisma, { bookingId: booking.id, cancelledBy: payer.id })
             .then((v) => ({ ok: true, v }), (e) => ({ ok: false, e }));
-        await new Promise((r) => setTimeout(r, 500)); // cancel parked on the escrow lock
+        await waitForBlocked({ needle: 'SELECT id FROM "SmartEscrow"' }); // OBSERVED: cancel parked on the escrow lock
 
         // Release the booking gate: the sweep (already holding the escrow)
         // completes NO_SHOW + refund atomically and commits.
@@ -538,12 +570,12 @@ run('r41 — business-OS finance authority (PostgreSQL)', () => {
         // The REAL cancellation: parks on the escrow FOR UPDATE (its first
         // lock), holding NOTHING — the fix's whole point.
         const cancelPromise = cancelTransitBooking(prisma, { bookingId: booking.id, cancelledBy: payer.id });
-        await new Promise((r) => setTimeout(r, 500)); // cancel parked FIRST in the escrow lock queue
+        await waitForBlocked({ needle: 'SELECT id FROM "SmartEscrow"' }); // OBSERVED: cancel parked FIRST in the escrow lock queue
 
         // The REAL sweep: fresh reads pass (CONFIRMED + FUNDED), its escrow
         // claim parks BEHIND the cancellation in the same lock queue.
         const sweepPromise = sweepNoShowTransitBookings(prisma);
-        await new Promise((r) => setTimeout(r, 500)); // sweep parked: holds NOTHING, queued on ESCROW
+        await waitForBlocked({ needle: 'UPDATE "public"."SmartEscrow"' }); // OBSERVED: sweep parked — holds NOTHING, queued on ESCROW
 
         // Release: the cancellation is first in the queue — it wins the
         // escrow deterministically, claims the booking (CONFIRMED→CANCELLED),

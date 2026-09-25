@@ -54,6 +54,13 @@ run('r41 — AZM economy authority (PostgreSQL)', () => {
         process.env.DATABASE_URL = url;
         process.env.NODE_ENV = 'test';
         const { PrismaClient } = require('@prisma/client');
+        // connection_limit=16: gated interleaves hold several concurrent
+        // connections (gate tx + parked service transactions + the
+        // pg_stat_activity polling connection). The sandbox default pool
+        // (num_cpus*2+1) would starve the second parked transaction before
+        // it can even reach the database.
+        const poolUrl = url + (url.includes('?') ? '&' : '?') + 'connection_limit=16';
+        process.env.DATABASE_URL = poolUrl;
         prisma = new PrismaClient();
         AzmAuctionService = require('../services/azmAuctionService').AzmAuctionService;
         const { AzmSpendService } = require('../services/azmSpendService');
@@ -66,6 +73,31 @@ run('r41 — AZM economy authority (PostgreSQL)', () => {
             'TRUNCATE TABLE "User", "AzmAuction", "AzmAuctionBid", "AzmSpendLog" RESTART IDENTITY CASCADE'
         );
     }, 15000);
+
+    // ── DB-OBSERVED GATE HELPER (r41.audit-followup) ────────────────────────
+    // Polls pg_stat_activity until `count` sessions are BLOCKED ON A LOCK
+    // running a query matching `needle`. Race-proof queue positions come from
+    // this OBSERVED state; the timeout is only a safety bound. No timer ever
+    // establishes the interleaving.
+    const waitForBlocked = async ({ needle, count = 1, timeoutMs = 15000 }) => {
+        const started = Date.now();
+        for (;;) {
+            const rows = await prisma.$queryRaw`
+                SELECT count(*)::int AS n
+                FROM pg_stat_activity
+                WHERE datname = current_database()
+                  AND wait_event_type = 'Lock'
+                  AND query LIKE ${'%' + needle + '%'}`;
+            if (rows[0].n >= count) return rows[0].n;
+            if (Date.now() - started > timeoutMs) {
+                throw new Error(
+                    `DB-observed gate timeout: expected ${count} blocked session(s) on "${needle}", saw ${rows[0].n}`
+                );
+            }
+            await new Promise((r) => setTimeout(r, 25));
+        }
+    };
+
 
     const seedVendor = async (azmBalance = 1000) => {
         const n = Math.floor(Math.random() * 1e9);
@@ -158,7 +190,7 @@ run('r41 — AZM economy authority (PostgreSQL)', () => {
             });
         }, { timeout: 30000 });
         const closePromise = txClose.then(() => {}, () => {});
-        await new Promise((r) => setTimeout(r, 300)); // closer parked behind the gate
+        await waitForBlocked({ needle: 'UPDATE "public"."AzmAuction"' }); // OBSERVED: closer parked behind the gate
 
         // Position 2 in the queue: the REAL placeBid service path, launched
         // while the window close is still uncommitted. Its ensureOpen
@@ -166,7 +198,7 @@ run('r41 — AZM economy authority (PostgreSQL)', () => {
         // transaction on the auction row lock.
         const staleBid = s.placeBid({ vendorId: vendor.id, adId: ad.id, amountAzm: 20 })
             .then((v) => ({ ok: true, v }), (e) => ({ ok: false, e }));
-        await new Promise((r) => setTimeout(r, 300)); // bid parked behind the closer
+        await waitForBlocked({ needle: 'FROM "AzmAuction"' }); // OBSERVED: bid parked behind the closer (its FOR UPDATE lock)
 
         // Release: the closer commits (window past), THEN the bid acquires
         // the authoritative row and re-verifies from the LOCKED committed
@@ -285,14 +317,14 @@ run('r41 — AZM economy authority (PostgreSQL)', () => {
                 });
             }, { timeout: 30000 });
             const closePromise = txClose.then(() => {}, () => {});
-            await new Promise((r) => setTimeout(r, 300)); // closer queued first on the row lock
+            await waitForBlocked({ needle: 'UPDATE "public"."AzmAuction"' }); // OBSERVED: closer queued first on the row lock
 
             // The REAL withdrawBid service path: ensureOpen read the OPEN
             // auction (targets THIS auction), parks on the auction row lock
             // behind the window-closer.
             const withdraw = s.withdrawBid({ vendorId: vendor.id })
                 .then((v) => ({ ok: true, v }), (e) => ({ ok: false, e }));
-            await new Promise((r) => setTimeout(r, 300)); // withdraw queued second
+            await waitForBlocked({ needle: 'FROM "AzmAuction"' }); // OBSERVED: withdraw queued second (its FOR UPDATE lock)
 
             // Release: closer commits (window past), withdraw acquires the
             // row, re-verifies from the LOCKED committed row → fails closed.
@@ -352,7 +384,7 @@ run('r41 — AZM economy authority (PostgreSQL)', () => {
             // The REAL withdrawBid: parked inside the service on the
             // advisory lock, mid-flight, holding nothing.
             const withdraw = s.withdrawBid({ vendorId: vendor.id });
-            await new Promise((r) => setTimeout(r, 400));
+            await waitForBlocked({ needle: 'pg_advisory_xact_lock' }); // OBSERVED: withdraw parked on the advisory lock, holding nothing
 
             // The REAL settlement commits fully underneath it.
             const settled = await s.settle(auction.id);

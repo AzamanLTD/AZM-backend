@@ -90,3 +90,59 @@ and compare `Tests: N passed` against the per-suite counts above.
   deleted; AZM never burned or refunded twice.
 - Invoices: DRAFT→SENT only; DRAFT|SENT→VOIDED only; PAID can never be
   overwritten; duplicate same-target operations converge; ownership enforced.
+
+## Follow-up 2 (PR #309, review batch 2) — transit funding authority + observed-gate determinism
+
+### The fund-after-cancellation race (economic authority gap)
+
+`fundBookingEscrow` previously confirmed the TRANSIT booking with a best-effort
+tail `updateMany({ where: { id, status: 'PENDING' } })` that never failed on a
+terminal booking. Interleaving:
+
+1. a cancellation acquires the escrow lock first and commits
+   `TransitBooking=CANCELLED` while the escrow stays DRAFT (NO_FUNDS — no money
+   moved);
+2. the previously queued funding acquires the escrow and claims DRAFT→FUNDED;
+3. it debits the payer, locks the principal, posts ledger/fees/history;
+4. its tail `PENDING→CONFIRMED` matches zero rows (the booking is CANCELLED);
+5. the funding transaction still COMMITS — a stranded-funds FUNDED escrow on a
+   CANCELLED booking.
+
+### Fix — escrow-linked booking is authoritative inside the funding transaction
+
+- `fundBookingEscrow` (TRANSIT + bookingId) now calls
+  `_claimTransitBookingForFundingTx` immediately after the escrow claim,
+  BEFORE any economic mutation: the escrow-LINKED booking is re-read inside the
+  transaction; the caller-supplied bookingId must match the linkage; PENDING is
+  confirmed atomically in the same transaction; CONFIRMED/IN_PROGRESS converge
+  without rewriting; CANCELLED/NO_SHOW/COMPLETED and mismatched linkage raise
+  `TRANSIT_FUNDING_CONFLICT` and roll back the escrow claim with the whole
+  transaction. The escrow-first → booking lock order is preserved.
+- `createBookingEscrow` (TRANSIT) now links only into the legal pre-terminal
+  set `PENDING|CONFIRMED|IN_PROGRESS` (previously `{ id, escrowId: null }`), so
+  a create/link racing a cancellation can never attach a fresh fundable escrow
+  to a terminal booking. The IN_PROGRESS test/setup contract is preserved.
+
+### New proofs — `__tests__/r41-transit-funding-cancellation-authority.pg.test.js`
+
+- **A** cancel-vs-fund, cancellation wins: funding wakes to committed CANCELLED
+  truth, fails closed, escrow claim rolls back, zero economic side effects
+  (balance, ledger, history, fees untouched).
+- **B** cancel-vs-fund, funding wins: funding confirms PENDING and commits
+  economics; the queued cancellation then wins the legitimate second step —
+  CANCELLED + REFUNDED, exactly one debit and one refund.
+- **C1/C2** create/link-vs-cancel, both interleavings: the losing create rolls
+  back the whole ticket+escrow aggregate (no orphans); the leftover DRAFT
+  escrow on a terminal booking is UNFUNDABLE.
+- **D1–D3** linkage mismatch, CONFIRMED/IN_PROGRESS convergence, atomic
+  PENDING confirmation.
+
+### Observed-gate determinism (no sleep-established queue positions)
+
+All gated race proofs (new suite plus C8/C9, invoice B2, auction B1/B3) now
+synchronize on OBSERVED PostgreSQL lock state: a `waitForBlocked` helper polls
+`pg_stat_activity` (`wait_event_type='Lock'`, query-text needle) until the
+expected blocking relationship exists before releasing each gate. Timers are
+bounded safety timeouts only — no sleep establishes a queue position. Pool
+sizes in the proof clients were raised (`connection_limit=16`) so gated
+interleaves cannot starve before reaching the database.

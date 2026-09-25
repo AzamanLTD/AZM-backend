@@ -43,6 +43,54 @@ const _claimReservationForFundingTx = async (tx, { bookingId, escrowId }) => {
     throw _escrowError('RESERVATION_FUNDING_CONFLICT');
 };
 
+// r41.audit-followup — TRANSIT funding authority (fund-after-cancellation
+// race). Transit funding previously confirmed the booking with a best-effort
+// tail updateMany that never failed on a terminal booking. A cancellation
+// that won the shared escrow lock first committed TransitBooking=CANCELLED
+// while the escrow stayed DRAFT; the queued funding then claimed DRAFT→FUNDED,
+// debited the payer, posted ledger/fees, and committed a stranded-funds FUNDED
+// escrow on a CANCELLED booking. Funding now validates the ESCROW-LINKED
+// booking inside the same transaction, right after the escrow claim (the
+// escrow-first → booking lock order is preserved, so funding and every
+// terminal lifecycle operation serialize through the escrow row):
+//   • the caller-supplied bookingId must match the escrow-linked booking —
+//     linkage is authoritative, never trusted from caller input;
+//   • PENDING is confirmed atomically in the same transaction;
+//   • CONFIRMED / IN_PROGRESS converge without rewriting (the established
+//     transit contract funds bookings already past confirmation);
+//   • every other state (CANCELLED, NO_SHOW, COMPLETED) or a mismatched
+//     linkage fails closed — the escrow claim rolls back before ANY
+//     economic mutation commits.
+const TRANSIT_FUNDABLE_PRE_TERMINAL = ['PENDING', 'CONFIRMED', 'IN_PROGRESS'];
+const _claimTransitBookingForFundingTx = async (tx, { bookingId, escrowId }) => {
+    const linked = await tx.transitBooking.findFirst({
+        where: { escrowId },
+        select: { id: true, status: true },
+    });
+    if (!linked || linked.id !== bookingId) {
+        throw _escrowError('TRANSIT_FUNDING_CONFLICT');
+    }
+    if (linked.status === 'PENDING') {
+        const claimed = await tx.transitBooking.updateMany({
+            where: { id: bookingId, escrowId, status: 'PENDING' },
+            data: { status: 'CONFIRMED' },
+        });
+        if (claimed.count === 1) return;
+        // The PENDING claim lost to a racing lifecycle decision inside the
+        // escrow-serialized window — re-read and converge or fail closed.
+        const current = await tx.transitBooking.findUnique({
+            where: { id: bookingId },
+            select: { status: true },
+        });
+        if (current && TRANSIT_FUNDABLE_PRE_TERMINAL.includes(current.status)) return;
+        throw _escrowError('TRANSIT_FUNDING_CONFLICT');
+    }
+    if (linked.status === 'CONFIRMED' || linked.status === 'IN_PROGRESS') return;
+    // CANCELLED / NO_SHOW / COMPLETED — terminal or incompatible: fail
+    // closed, rolling back the escrow claim before any money moves.
+    throw _escrowError('TRANSIT_FUNDING_CONFLICT');
+};
+
 // 1. CREATE BOOKING ESCROW — DRAFT state, no money moves.
 const createBookingEscrow = async (prisma, {
     bookingType, bookingId, payerId, payeeId,
@@ -86,11 +134,16 @@ const createBookingEscrow = async (prisma, {
         });
 
         // r29: a terminal reservation can never acquire a fresh,
-        // fundable escrow after its lifecycle decision has committed. Transit
-        // preserves its established IN_PROGRESS test/setup contract.
+        // fundable escrow after its lifecycle decision has committed.
+        // r41.audit-followup: the same terminal-linking authority now covers
+        // TRANSIT — CANCELLED / NO_SHOW / COMPLETED bookings can never
+        // acquire a new fundable escrow (a create/link racing a cancellation
+        // previously could attach a DRAFT escrow to a terminal booking).
+        // PENDING/CONFIRMED/IN_PROGRESS stays the legal pre-terminal set,
+        // preserving the established IN_PROGRESS test/setup contract.
         const linkWhere = bookingType === 'RESERVATION'
             ? { id: bookingId, escrowId: null, status: { in: ['PENDING', 'CONFIRMED'] } }
-            : { id: bookingId, escrowId: null };
+            : { id: bookingId, escrowId: null, status: { in: TRANSIT_FUNDABLE_PRE_TERMINAL } };
         const linked = await tx[model].updateMany({
             where: linkWhere,
             data: { escrowId: escrow.id, ticketId: ticket.id }
@@ -155,6 +208,9 @@ const fundBookingEscrow = async (prisma, { escrowId, payerId, bookingType, booki
         // mismatched reservation aborts and rolls back the escrow claim.
         if (bookingType === 'RESERVATION' && bookingId) {
             await _claimReservationForFundingTx(tx, { bookingId, escrowId });
+        }
+        if (bookingType === 'TRANSIT' && bookingId) {
+            await _claimTransitBookingForFundingTx(tx, { bookingId, escrowId });
         }
 
         const payer = await tx.user.findUnique({ where: { id: payerId }, select: { availableBalance: true } });
@@ -226,13 +282,6 @@ const fundBookingEscrow = async (prisma, { escrowId, payerId, bookingType, booki
 
         // Reservation confirmation was claimed before money. Transit keeps its
         // existing convergence contract and is outside the r29 state machine.
-        if (bookingType === 'TRANSIT' && bookingId) {
-            await tx.transitBooking.updateMany({
-                where: { id: bookingId, status: 'PENDING' },
-                data: { status: 'CONFIRMED' }
-            });
-        }
-
         return {
             escrow: await tx.smartEscrow.findUnique({ where: { id: escrowId } }),
             amount,
@@ -508,7 +557,7 @@ const processBusinessNoShow = async (prisma, {
 };
 
 module.exports = {
-    createBookingEscrow, fundBookingEscrow, releaseBookingEscrow,
+    TRANSIT_FUNDABLE_PRE_TERMINAL, createBookingEscrow, fundBookingEscrow, releaseBookingEscrow,
     refundBookingEscrow, splitReleaseFundedEscrow, processBusinessNoShow,
     _refundBookingEscrowTx, _releaseBookingEscrowTx,
     _splitReleaseFundedEscrowTx, REFUND_CLAIMABLE, RELEASE_CLAIMABLE,
