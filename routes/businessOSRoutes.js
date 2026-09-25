@@ -1729,9 +1729,39 @@ router.patch('/restaurant/inventory/:id', requirePermission('restaurant.inventor
         where: { id: req.params.id, businessProfileId: bpId },
     });
     if (!existing) return res.status(404).json({ success: false, message: 'Item not found' });
+
+    // §r41 — DB-BOUNDARY ADJUSTMENT (final-audit: lost-update race).
+    // The old code computed `existing.currentStock + adjustment` from the
+    // stale pre-read and wrote an ABSOLUTE value: a concurrent restock
+    // (inventoryRestockService atomic increment), recipe deduction
+    // (guarded atomic decrement) or POS deduction committing between the
+    // read and the write was silently overwritten.
+    //
+    // The adjustment is now ONE atomic SQL expression on the locked row —
+    // GREATEST(0, currentStock + adjustment) preserves the documented
+    // floor-at-zero adjustment semantics, and the tenant predicate is
+    // mutation-level (a foreign item is indistinguishable from a missing
+    // one). An explicit `currentStock` body value stays an INTENTIONAL
+    // absolute replacement (unchanged semantics).
+    if (adjustment !== undefined) {
+        const adj = parseFloat(adjustment);
+        if (!Number.isFinite(adj)) {
+            return res.status(400).json({ success: false, message: 'adjustment must be a finite number' });
+        }
+        const updatedRows = await prisma.$executeRaw`
+            UPDATE "InventoryItem"
+            SET "currentStock" = GREATEST(0, "currentStock" + ${adj}),
+                "updatedAt" = now()
+            WHERE "id" = ${req.params.id} AND "businessProfileId" = ${bpId}`;
+        if (updatedRows === 0) {
+            return res.status(404).json({ success: false, message: 'Item not found' });
+        }
+        const item = await prisma.inventoryItem.findUnique({ where: { id: req.params.id } });
+        return res.json({ success: true, item });
+    }
+
     const updateData = {};
     if (currentStock !== undefined) updateData.currentStock = parseFloat(currentStock);
-    if (adjustment !== undefined) updateData.currentStock = Math.max(0, existing.currentStock + parseFloat(adjustment));
     if (minimumStock !== undefined) updateData.minimumStock = parseFloat(minimumStock);
     if (costPerUnit !== undefined) updateData.costPerUnit = parseFloat(costPerUnit);
     if (category !== undefined) updateData.category = category;
@@ -2399,19 +2429,57 @@ router.post('/orders/bulk-status', requirePermission('orders.manage'), wrap(asyn
     if (!Array.isArray(orderIds) || !status) {
         return res.status(400).json({ success: false, message: 'orderIds (array) and status are required.' });
     }
-    const validStatuses = ['AWAITING_PAYMENT', 'PAID', 'DELIVERED', 'COMPLETED', 'CANCELLED'];
+    const validStatuses = ['PAID', 'DELIVERED', 'COMPLETED', 'CANCELLED'];
     if (!validStatuses.includes(status)) {
         return res.status(400).json({ success: false, message: 'Invalid status.' });
     }
+
+    // §r41 — BULK STATUS CLAIMS (final-audit: status bypass). The old
+    // updateMany wrote ANY target status onto ANY current status: a REFUNDED
+    // (escrow money returned) or DISPUTED order could be resurrected to
+    // DELIVERED/COMPLETED, a COMPLETED order dragged back to
+    // AWAITING_PAYMENT, and a bulk CANCELLED on an escrow-backed PAID order
+    // left the customer's FUNDED escrow stranded with no refund. Each bulk
+    // write is now a conditional claim from the LEGAL pre-states only —
+    // escrow-owned statuses (DISPUTED/REFUNDED, set by escrow authority)
+    // and terminal states can never be overwritten here.
+    const BULK_ALLOWED_FROM = {
+        PAID: ['AWAITING_PAYMENT'],
+        DELIVERED: ['PAID'],
+        COMPLETED: ['PAID', 'DELIVERED'],
+        CANCELLED: ['AWAITING_PAYMENT', 'PAID', 'DELIVERED'],
+    };
+    const allowedFrom = BULK_ALLOWED_FROM[status];
+    const bulkWhere = {
+        id: { in: orderIds },
+        businessProfileId: bpId,
+        status: { in: allowedFrom },
+    };
+    if (status === 'CANCELLED') {
+        // Escrow-backed orders must go through the canonical refund path
+        // (POST /orders/:id/refund — escrow dispute + refund economics).
+        // A bulk cancel that skipped the escrow would strand locked funds.
+        bulkWhere.escrowId = null;
+    }
+
     const updateData = { status };
     if (status === 'DELIVERED') updateData.deliveredAt = new Date();
     if (status === 'COMPLETED') updateData.completedAt = new Date();
     if (status === 'CANCELLED') updateData.cancelledAt = new Date();
 
-    const result = await prisma.businessOrder.updateMany({
-        where: { id: { in: orderIds }, businessProfileId: bpId },
-        data: updateData,
-    });
+    const [eligible, result] = await prisma.$transaction([
+        prisma.businessOrder.count({ where: { id: { in: orderIds }, businessProfileId: bpId } }),
+        prisma.businessOrder.updateMany({ where: bulkWhere, data: updateData }),
+    ]);
+    const skipped = eligible - result.count;
+    if (result.count === 0 && eligible > 0) {
+        return res.status(409).json({
+            success: false,
+            message: 'No order is in a state that allows this transition (escrow-owned, terminal or mismatched statuses are never bulk-overwritten).' +
+                (status === 'CANCELLED' ? ' Escrow-backed orders must be cancelled via the refund path.' : ''),
+            skipped,
+        });
+    }
 
     // Audit log
     const { logBusinessAudit } = require('../utils/businessAudit');
@@ -2422,11 +2490,11 @@ router.post('/orders/bulk-status', requirePermission('orders.manage'), wrap(asyn
         action: 'BULK_ORDER_STATUS_UPDATE',
         targetType: 'BUSINESS_ORDER',
         targetId: orderIds.join(','),
-        metadata: { status, count: result.count },
+        metadata: { status, count: result.count, skipped },
         ipAddress: req.ip,
     });
 
-    res.json({ success: true, updated: result.count });
+    res.json({ success: true, updated: result.count, skipped });
 }));
 
 // ── Order Refund/Dispute ─────────────────────────────────────────────────────
@@ -2450,15 +2518,32 @@ router.post('/orders/:id/refund', requirePermission('orders.refund'), wrap(async
     if (order.escrow.status === 'REFUNDED' || order.escrow.status === 'DISPUTED') {
         return res.status(400).json({ success: false, message: 'Escrow already ' + order.escrow.status.toLowerCase() + '.' });
     }
-    // Dispute the escrow
+    // §r41 — REFUND VIA ESCROW AUTHORITY (final-audit: refund route).
+    // Two defects fixed here:
+    // 1. The dispute was raised WITHOUT raisedById, so raiseDispute's
+    //    participant validation could never pass — the route always failed
+    //    with 'Only a participant can dispute this escrow.' The dispute is
+    //    now raised BY the business (the escrow payee participant,
+    //    businessProfile.userId), whichever authorized operator clicks.
+    // 2. The old trailing write unconditionally set the order CANCELLED.
+    //    That raced the escrow-driven order status (updateOrderStatusFromEscrow
+    //    writes DISPUTED on dispute, REFUNDED on resolution) and lied about
+    //    money that had not moved. The escrow authority owns the order
+    //    status from here; this route writes no order status at all.
     const escrow = require('../utils/escrow');
-    const result = await escrow.dispute(order.escrow.id, reason);
-
-    // Update order status
-    await prisma.businessOrder.update({
-        where: { id: req.params.id },
-        data: { status: 'CANCELLED', cancelledAt: new Date() },
+    const business = await prisma.businessProfile.findUnique({
+        where: { id: bpId },
+        select: { userId: true },
     });
+    let result;
+    try {
+        result = await escrow.dispute(order.escrow.id, reason, business ? business.userId : req.user.id);
+    } catch (err) {
+        if (err && (err.message === 'ESCROW_ALREADY_DISPUTED' || err.message === 'Only a participant can dispute this escrow.')) {
+            return res.status(409).json({ success: false, message: 'Refund already initiated: this escrow is already in dispute.' });
+        }
+        throw err;
+    }
 
     // Audit log
     const { logBusinessAudit } = require('../utils/businessAudit');
@@ -2487,7 +2572,10 @@ router.get('/invoices/stats', requirePermission('invoices.view'), wrap(async (re
         prisma.businessInvoice.count({ where: { businessProfileId: bpId, status: 'DRAFT' } }),
         prisma.businessInvoice.count({ where: { businessProfileId: bpId, status: 'SENT' } }),
         prisma.businessInvoice.count({ where: { businessProfileId: bpId, status: 'PAID' } }),
-        prisma.businessInvoice.count({ where: { businessProfileId: bpId, status: 'VOID' } }),
+        // §r41 — ENUM FIX (final-audit: stats enum). This counted 'VOID' but
+        // the InvoiceStatus enum (and voidInvoice) use 'VOIDED', so the
+        // dashboard's voided count was structurally always 0.
+        prisma.businessInvoice.count({ where: { businessProfileId: bpId, status: 'VOIDED' } }),
         prisma.businessInvoice.aggregate({
             where: { businessProfileId: bpId, status: 'PAID' },
             _sum: { billTotalUsdc: true },

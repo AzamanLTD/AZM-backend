@@ -52,7 +52,11 @@ function makeFakePrisma(initialUser) {
                 return row;
             }
         },
+        // §r41: purchaseCardSkin now takes the user row lock (FOR UPDATE)
+        // inside its transaction before recomputing ownedCardSkins — the
+        // mocked tx needs the raw passthrough.
         $transaction: async (fn) => fn(prisma),
+        $executeRaw: async () => 0,
         _debug: { getUser: () => user, getSpendLogs: () => spendLogs }
     };
     return prisma;

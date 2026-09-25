@@ -125,27 +125,84 @@ const sendInvoice = async (prisma, { invoiceId, businessProfileId }) => {
   });
   if (!invoice) throw new Error('Invoice not found.');
   if (invoice.businessProfileId !== businessProfileId) throw new Error('Not authorized.');
-  if (invoice.status !== 'DRAFT') throw new Error(`Cannot send invoice with status ${invoice.status}.`);
+  // Same-target duplicate converges (never an error): the invoice is already
+  // in the requested terminal-for-send state — idempotent by construction.
+  if (invoice.status === 'SENT') return invoice;
+  if (invoice.status !== 'DRAFT') {
+    const conflict = new Error(`Cannot send invoice with status ${invoice.status}.`);
+    conflict.code = 'INVOICE_STATE_CHANGED';
+    throw conflict;
+  }
 
-  return prisma.businessInvoice.update({
-    where: { id: invoiceId },
-    data: { status: 'SENT', sentAt: new Date() },
-    include: { lineItems: true, taxLines: true,
-      customer: { select: { id: true, username: true, profilePictureUrl: true } } },
-  });
+  // §r41 — CONDITIONAL DRAFT → SENT TRANSITION (final-audit: send/void
+  // resurrection). The pre-read above is a fast-fail convenience, NOT
+  // authority. A concurrent void can commit VOIDED between the read and the
+  // write; the old unconditional update resurrected the voided invoice to
+  // SENT, after which payInvoice (rightfully) settled money on it. The
+  // transition is now a DB-boundary CAS: only a still-DRAFT invoice can be
+  // sent; a lost claim converges (already sent) or raises a typed conflict.
+  try {
+    return await prisma.businessInvoice.update({
+      where: { id: invoiceId, status: 'DRAFT' },
+      data: { status: 'SENT', sentAt: new Date() },
+      include: { lineItems: true, taxLines: true,
+        customer: { select: { id: true, username: true, profilePictureUrl: true } } },
+    });
+  } catch (err) {
+    if (err && err.code === 'P2025') {
+      const current = await prisma.businessInvoice.findUnique({
+        where: { id: invoiceId },
+        include: { lineItems: true, taxLines: true,
+          customer: { select: { id: true, username: true, profilePictureUrl: true } } },
+      });
+      if (current && current.status === 'SENT') return current; // idempotent converge
+      const conflict = new Error(
+        `Cannot send invoice with status ${current ? current.status : 'UNKNOWN'} (changed concurrently).`
+      );
+      conflict.code = 'INVOICE_STATE_CHANGED';
+      throw conflict;
+    }
+    throw err;
+  }
 };
 
 const voidInvoice = async (prisma, { invoiceId, businessProfileId }) => {
   const invoice = await prisma.businessInvoice.findUnique({ where: { id: invoiceId } });
   if (!invoice) throw new Error('Invoice not found.');
   if (invoice.businessProfileId !== businessProfileId) throw new Error('Not authorized.');
+  // Same-target duplicate converges (never an error): the invoice is
+  // already voided — idempotent by construction.
+  if (invoice.status === 'VOIDED') return invoice;
   if (!['DRAFT','SENT'].includes(invoice.status)) {
-    throw new Error(`Cannot void invoice with status ${invoice.status}.`);
+    const conflict = new Error(`Cannot void invoice with status ${invoice.status}.`);
+    conflict.code = invoice.status === 'PAID' ? 'INVOICE_ALREADY_PAID' : 'INVOICE_STATE_CHANGED';
+    throw conflict;
   }
-  return prisma.businessInvoice.update({
-    where: { id: invoiceId },
-    data: { status: 'VOIDED', voidedAt: new Date() },
-  });
+
+  // §r41 — CONDITIONAL VOID TRANSITION (final-audit: send/void resurrection).
+  // A concurrent payment commits PAID (+payTxHash, money settled) between
+  // the stale read and the old unconditional write — which would overwrite
+  // PAID with VOIDED after the money had already moved. The void is now a
+  // DB-boundary CAS on DRAFT/SENT; a lost claim converges (already voided)
+  // or raises a typed conflict and never touches the settled state.
+  try {
+    return await prisma.businessInvoice.update({
+      where: { id: invoiceId, status: { in: ['DRAFT', 'SENT'] } },
+      data: { status: 'VOIDED', voidedAt: new Date() },
+    });
+  } catch (err) {
+    if (err && err.code === 'P2025') {
+      const current = await prisma.businessInvoice.findUnique({ where: { id: invoiceId } });
+      if (current && current.status === 'VOIDED') return current; // idempotent converge
+      const conflict = new Error(
+        `Cannot void invoice with status ${current ? current.status : 'UNKNOWN'} (changed concurrently).`
+      );
+      conflict.code = current && current.status === 'PAID'
+        ? 'INVOICE_ALREADY_PAID' : 'INVOICE_STATE_CHANGED';
+      throw conflict;
+    }
+    throw err;
+  }
 };
 
 const payInvoice = async (prisma, {

@@ -33,21 +33,43 @@ class AzmAuctionService {
     // CURRENT AUCTION (creation idempotent)
     // =========================================================================
 
+    // §r41 — DB-IDEMPOTENT OPEN-AUCTION AUTHORITY (final-audit #12).
+    //
+    // Pre-r41: findFirst(OPEN + future) → create(OPEN, from-now window).
+    // Two instances (Render runs more than one) could BOTH see nothing and
+    // create separate OPEN auctions — their from-now timestamps differ, so
+    // no unique constraint can stop it. Fix: a PostgreSQL advisory lock
+    // serializes all ensure-open creators across instances; inside the lock
+    // the findFirst is authoritative. No in-process mutex (useless across
+    // instances); the lock is transaction-scoped and releases itself.
+    //
+    // Stable lock key for azm-auction ensure-open. Keep constant forever —
+    // changing it orphans in-flight holders.
+    static ENSURE_OPEN_LOCK_KEY = 94173001;
+
     async ensureOpen() {
-        const existing = await this.prisma.azmAuction.findFirst({
+        return this.prisma.$transaction((tx) => this._ensureOpenTx(tx), {
+            timeout: 15000,
+        });
+    }
+
+    async _ensureOpenTx(tx) {
+        // Advisory lock: concurrent first callers serialize; the second
+        // re-checks and converges to the first caller's auction.
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(${AzmAuctionService.ENSURE_OPEN_LOCK_KEY})`;
+
+        const existing = await tx.azmAuction.findFirst({
             where: { status: 'OPEN', windowEnd: { gt: new Date() } },
         });
         if (existing) return existing;
 
-        // Compute next window (start = now-aligned to next midnight UTC,
-        // length = 24h). We use a simple "from-now" model for MVP.
+        // Compute next window (start = now, length = 24h — the documented
+        // from-now MVP model; the advisory lock is what makes it safe).
         const now = new Date();
-        const windowStart = now;
-        const windowEnd = new Date(now.getTime() + WINDOW_MS);
-        return this.prisma.azmAuction.create({
+        return tx.azmAuction.create({
             data: {
-                windowStart,
-                windowEnd,
+                windowStart: now,
+                windowEnd: new Date(now.getTime() + WINDOW_MS),
                 status: 'OPEN',
                 winnerCount: DEFAULT_WINNER_COUNT,
             },
@@ -113,28 +135,54 @@ class AzmAuctionService {
             throw new Error('Insufficient AZM balance');
         }
 
-        const auction = await this.ensureOpen();
-        if (auction.status !== 'OPEN') throw new Error('Auction is settling');
+        // §r41 — BID AUTHORITY (final-audit #11).
+        //
+        // Pre-r41: a stale placeBid ran after settlement and its
+        // status-blind upsert reactivated a WON/LOST settlement record on a
+        // SETTLED auction (resurrecting a burned-rank bid). Fix: ONE
+        // transaction that (a) ensures the open auction under the advisory
+        // lock, (b) takes the auction ROW lock — the same row settle()'s
+        // claim-update writes, so bid mutation and settlement serialize on
+        // the auction authority — and (c) re-verifies OPEN from the LOCKED
+        // row, the committed truth, not the stale pre-read. A WON/LOST bid
+        // is settlement audit and can never be rewritten.
+        const bid = await this.prisma.$transaction(async (tx) => {
+            const auction = await this._ensureOpenTx(tx);
+            await tx.$executeRaw`SELECT id FROM "AzmAuction" WHERE "id" = ${auction.id} FOR UPDATE`;
+            const locked = await tx.azmAuction.findUnique({ where: { id: auction.id } });
+            if (!locked || locked.status !== 'OPEN' || new Date(locked.windowEnd) <= new Date()) {
+                throw new Error('Auction is settling');
+            }
 
-        const bid = await this.prisma.azmAuctionBid.upsert({
-            where: { auctionId_vendorId: { auctionId: auction.id, vendorId } },
-            create: {
-                auctionId: auction.id,
-                vendorId,
-                adId: Number(adId),
-                bidAmountAzm: amount,
-                status: 'ACTIVE',
-            },
-            update: {
-                adId: Number(adId),
-                bidAmountAzm: amount,
-                status: 'ACTIVE',
-            },
-        });
+            const existing = await tx.azmAuctionBid.findUnique({
+                where: { auctionId_vendorId: { auctionId: auction.id, vendorId } },
+            });
+            if (existing && existing.status !== 'ACTIVE') {
+                // Settlement audit (WON/LOST) is terminal — never rewritten,
+                // never reactivated. Post-settlement bids fail closed.
+                throw new Error('Bids are final after settlement');
+            }
+
+            return tx.azmAuctionBid.upsert({
+                where: { auctionId_vendorId: { auctionId: auction.id, vendorId } },
+                create: {
+                    auctionId: auction.id,
+                    vendorId,
+                    adId: Number(adId),
+                    bidAmountAzm: amount,
+                    status: 'ACTIVE',
+                },
+                update: {
+                    adId: Number(adId),
+                    bidAmountAzm: amount,
+                    status: 'ACTIVE',
+                },
+            });
+        }, { timeout: 15000 });
 
         if (this.io) {
             this.io.emit('auction:bid_placed', {
-                auctionId: auction.id,
+                auctionId: bid.auctionId,
                 vendorId,
                 adId: Number(adId),
             });
@@ -143,11 +191,23 @@ class AzmAuctionService {
     }
 
     async withdrawBid({ vendorId }) {
-        const auction = await this.ensureOpen();
-        if (auction.status !== 'OPEN') throw new Error('Auction is settling');
-        await this.prisma.azmAuctionBid.deleteMany({
-            where: { auctionId: auction.id, vendorId },
-        });
+        // §r41 — WITHDRAW AUTHORITY (final-audit #11). Same auction-row
+        // serialization as placeBid; the delete is ACTIVE-only so a stale
+        // withdrawal can NEVER delete a WON/LOST settlement record after
+        // AZM was already burned.
+        const result = await this.prisma.$transaction(async (tx) => {
+            const auction = await this._ensureOpenTx(tx);
+            await tx.$executeRaw`SELECT id FROM "AzmAuction" WHERE "id" = ${auction.id} FOR UPDATE`;
+            const locked = await tx.azmAuction.findUnique({ where: { id: auction.id } });
+            if (!locked || locked.status !== 'OPEN' || new Date(locked.windowEnd) <= new Date()) {
+                throw new Error('Auction is settling');
+            }
+            // ACTIVE-only claim: count 0 converges (nothing to withdraw).
+            return tx.azmAuctionBid.deleteMany({
+                where: { auctionId: auction.id, vendorId, status: 'ACTIVE' },
+            });
+        }, { timeout: 15000 });
+        return result;
     }
 
     async history(vendorId, { limit = 20 } = {}) {

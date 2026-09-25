@@ -102,7 +102,9 @@ describe('PayoutBatchWorker canonical withdrawal transaction', () => {
                     id: 92, userId: 7, amount: 50, destination: '0240000000', network: 'AIRTELTIGO',
                     payoutMethod: 'MTN_MOMO', createdAt: new Date('2026-08-30T10:00:00.000Z'),
                 }]),
-                update: jest.fn().mockResolvedValue({}), updateMany: jest.fn(),
+                update: jest.fn().mockResolvedValue({}),
+                // §r41: parking is a conditional PENDING-only claim (updateMany)
+                updateMany: jest.fn().mockResolvedValue({ count: 1 }),
             },
             transactionHistory: {
                 findMany: jest.fn().mockResolvedValue([
@@ -120,8 +122,11 @@ describe('PayoutBatchWorker canonical withdrawal transaction', () => {
         expect(result.processed).toBe(0);
         expect(result.flagged).toBe(1);
         expect(initiateTransfer).not.toHaveBeenCalled();
-        expect(prisma.withdrawal.update).toHaveBeenCalledWith({
-            where: { id: 92 }, data: { status: 'NEEDS_MANUAL_REVIEW' },
+        // §r41: the pre-dispatch parking is a CONDITIONAL PENDING-only claim —
+        // never the old unconditional update.
+        expect(prisma.withdrawal.updateMany).toHaveBeenCalledWith({
+            where: { id: 92, status: { in: ['PENDING'] } },
+            data: { status: 'NEEDS_MANUAL_REVIEW' },
         });
     });
 });
@@ -214,8 +219,11 @@ describe('PayoutBatchWorker provider outcome classification', () => {
         const worker = new PayoutBatchWorker(prisma, { emit: jest.fn() }, { initiateTransfer }, null);
         const result = await worker._processBatch(settings, { isManualTrigger: true });
 
-        expect(update).toHaveBeenCalledWith({
-            where: { id: 101 }, data: { status: 'NEEDS_MANUAL_REVIEW' },
+        // §r41: post-dispatch exception parking is a CONDITIONAL
+        // PROCESSING-only claim (the dispatch claim was already won).
+        expect(updateMany).toHaveBeenCalledWith({
+            where: { id: 101, status: { in: ['PROCESSING'] } },
+            data: { status: 'NEEDS_MANUAL_REVIEW' },
         });
         expect(result.flagged).toBe(1);
         expect(result.details.unknownOutcome).toEqual([]);
@@ -232,8 +240,9 @@ describe('PayoutBatchWorker provider outcome classification', () => {
         const worker = new PayoutBatchWorker(prisma, { emit: jest.fn() }, { initiateTransfer }, null);
         const result = await worker._processBatch(settings, { isManualTrigger: true });
 
-        expect(update).toHaveBeenCalledWith({
-            where: { id: 101 }, data: { status: 'NEEDS_MANUAL_REVIEW' },
+        expect(updateMany).toHaveBeenCalledWith({
+            where: { id: 101, status: { in: ['PROCESSING'] } },
+            data: { status: 'NEEDS_MANUAL_REVIEW' },
         });
         expect(result.flagged).toBe(1);
     });

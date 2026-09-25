@@ -362,7 +362,11 @@ const markSatisfied = async (prisma, { escrowId, userId }) => {
         return { settled: true, alreadySettled: true, escrow };
     }
     if (!['FUNDED', 'IN_PROGRESS', 'PENDING_SETTLEMENT'].includes(escrow.status)) {
-        throw new Error(`Cannot mark satisfied from status ${escrow.status}.`);
+        // §r41: typed fast-fail (the authoritative claim below enforces the
+        // same contract at the DB boundary).
+        const err = new Error(`Cannot mark satisfied from status ${escrow.status}.`);
+        err.code = 'ESCROW_STATE_CHANGED';
+        throw err;
     }
     if (escrow.payerId !== userId && escrow.payeeId !== userId) {
         throw new Error('Only a participant can mark this escrow satisfied.');
@@ -377,9 +381,17 @@ const markSatisfied = async (prisma, { escrowId, userId }) => {
     // single-winner claim inside _releaseEscrow, this makes double-settlement
     // (and therefore double-payout) impossible even under concurrent calls
     // from both parties at once. Mirrors the completeTrade atomic-flip pattern.
+    // §r41: the claim is also STATUS-BOUND — a flag can only be claimed while
+    // the escrow is still in a satisfaction-capable state, so a terminal
+    // refund/dispute resolution that committed after the stale pre-read can
+    // never have a satisfaction flag (or a pending write) land on top of it.
     const guard = isPayer ? { payerSatisfied: false } : { payeeSatisfied: false };
     const claimed = await prisma.smartEscrow.updateMany({
-        where: { id: escrowId, ...guard },
+        where: {
+            id: escrowId,
+            ...guard,
+            status: { in: ['FUNDED', 'IN_PROGRESS', 'PENDING_SETTLEMENT'] }
+        },
         data
     });
     if (claimed.count === 0) {
@@ -387,7 +399,14 @@ const markSatisfied = async (prisma, { escrowId, userId }) => {
         if (current && current.status === 'SETTLED') {
             return { settled: true, alreadySettled: true, escrow: current };
         }
-        throw new Error('You have already marked this escrow as satisfied.');
+        if (current && ['FUNDED', 'IN_PROGRESS', 'PENDING_SETTLEMENT'].includes(current.status)) {
+            throw new Error('You have already marked this escrow as satisfied.');
+        }
+        // §r41: the escrow left the satisfaction-capable states between the
+        // stale pre-read and the claim (refund / dispute resolution won).
+        const err = new Error(`Cannot mark satisfied from status ${current ? current.status : 'UNKNOWN'}.`);
+        err.code = 'ESCROW_STATE_CHANGED';
+        throw err;
     }
     const updated = await prisma.smartEscrow.findUnique({ where: { id: escrowId } });
 
@@ -422,10 +441,39 @@ const markSatisfied = async (prisma, { escrowId, userId }) => {
 
     // Otherwise mark we are awaiting the other side.
     try {
-        const pending = await prisma.smartEscrow.update({
-            where: { id: escrowId },
-            data: { status: 'PENDING_SETTLEMENT' }
-        });
+        // §r41 — TERMINAL-STATE CAS (final-audit: satisfaction resurrection).
+        // The stale pre-read above is only a fast-fail. A concurrent
+        // opposite-party satisfaction can commit SETTLED, and a racing
+        // refund/dispute resolution can commit REFUNDED/RELEASED, between
+        // that read and this write. The PENDING_SETTLEMENT transition is
+        // therefore a DB-boundary conditional claim (extended-unique update:
+        // the status predicate is part of the row's own WHERE, and Prisma
+        // raises P2025 when the terminal state won the race): it may only
+        // land on a still-satisfaction-capable escrow, and a terminal escrow
+        // is NEVER reverted to pending.
+        let pending;
+        try {
+            pending = await prisma.smartEscrow.update({
+                where: {
+                    id: escrowId,
+                    status: { in: ['FUNDED', 'IN_PROGRESS', 'PENDING_SETTLEMENT'] }
+                },
+                data: { status: 'PENDING_SETTLEMENT' }
+            });
+        } catch (err) {
+            if (err && err.code === 'P2025') {
+                const current = await prisma.smartEscrow.findUnique({ where: { id: escrowId } });
+                if (current && current.status === 'SETTLED') {
+                    return { settled: true, alreadySettled: true, escrow: current };
+                }
+                const conflict = new Error(
+                    `Cannot mark satisfied from status ${current ? current.status : 'UNKNOWN'} (terminal state won the race).`
+                );
+                conflict.code = 'ESCROW_STATE_CHANGED';
+                throw conflict;
+            }
+            throw err;
+        }
         // Realtime convergence: emit only after the PENDING_SETTLEMENT update commits.
         if (_socketIo) {
             const payload = {
@@ -1216,7 +1264,11 @@ const assignDisputeToAdmin = async (prisma, { escrowId, assignedToId, requesting
     });
     if (!escrow) throw new Error('Escrow not found.');
     if (escrow.status !== 'DISPUTED' && escrow.status !== 'ADMIN_REVIEW') {
-        throw new Error(`Escrow is not disputed (status ${escrow.status}).`);
+        // §r41: same typed contract as the in-transaction claim loss — a
+        // resolution that finalized first makes assignment a typed no-op.
+        const err = new Error(`Escrow is not disputed (status ${escrow.status}).`);
+        err.code = 'ESCROW_ALREADY_FINALIZED';
+        throw err;
     }
     if (!escrow.dispute) throw new Error('No dispute exists for this escrow.');
 
@@ -1228,15 +1280,41 @@ const assignDisputeToAdmin = async (prisma, { escrowId, assignedToId, requesting
         throw new Error('assignedToId must reference a user with the ADMIN role.');
     }
 
+    // §r41 — AUTHORITATIVE ESCROW-FIRST ASSIGNMENT (final-audit: dispute
+    // assignment resurrection). The stale pre-reads above are fast-fail
+    // convenience only. Inside the transaction the ESCROW ROW is the
+    // authority: a conditional claim on DISPUTED/ADMIN_REVIEW takes the row
+    // lock, so a concurrent resolution (_claimEscrowStatusTx on the same row)
+    // serializes with this assignment instead of interleaving.
+    //   resolution wins first → escrow RELEASED/REFUNDED, dispute RESOLVED —
+    //     the assignment claim loses (count=0) and NOTHING is mutated: the
+    //     admin UI gets a typed conflict, the terminal state stands;
+    //   assignment wins first → escrow ADMIN_REVIEW, dispute ASSIGNED —
+    //     a later resolution remains fully valid (ADMIN_REVIEW is a
+    //     claimable resolution state), so money never moves twice.
+    // The dispute update runs only while the dispute is still unresolved;
+    // because the escrow claim won, a RESOLVED dispute here would be a
+    // durable-state contradiction — the P2025 failure rolls the whole
+    // transaction (including the escrow claim) back, leaving zero mutation.
     const result = await prisma.$transaction(async (tx) => {
-        const dispute = await tx.escrowDispute.update({
-            where: { id: escrow.dispute.id },
-            data: { assignedToId, status: 'ASSIGNED' }
-        });
-        const updated = await tx.smartEscrow.update({
-            where: { id: escrowId },
+        const claim = await tx.smartEscrow.updateMany({
+            where: { id: escrowId, status: { in: ['DISPUTED', 'ADMIN_REVIEW'] } },
             data: { status: 'ADMIN_REVIEW' }
         });
+        if (claim.count === 0) {
+            const current = await tx.smartEscrow.findUnique({
+                where: { id: escrowId },
+                select: { status: true }
+            });
+            const err = new Error(`Escrow is not disputed (status ${current ? current.status : 'UNKNOWN'}).`);
+            err.code = 'ESCROW_ALREADY_FINALIZED';
+            throw err;
+        }
+        const dispute = await tx.escrowDispute.update({
+            where: { id: escrow.dispute.id, status: { not: 'RESOLVED' } },
+            data: { assignedToId, status: 'ASSIGNED' }
+        });
+        const updated = await tx.smartEscrow.findUnique({ where: { id: escrowId } });
         return { escrow: updated, dispute };
     });
 

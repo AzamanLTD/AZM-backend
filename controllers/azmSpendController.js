@@ -106,7 +106,18 @@ exports.boostAd = async (req, res) => {
         }
 
         const userId = req.user.id;
-        const { adId, boostId } = req.body;
+        const { adId, boostId, idempotencyKey } = req.body;
+
+        // §r41 (final-audit #14) — optional stable logical operation
+        // identity. A client retry WITH the same key converges to the
+        // original purchase (exactly-once charge). WITHOUT a key every call
+        // is a distinct purchase.
+        if (idempotencyKey !== undefined && (typeof idempotencyKey !== 'string' || idempotencyKey.length < 8 || idempotencyKey.length > 100)) {
+            return res.status(400).json({
+                success: false,
+                message: 'idempotencyKey, if provided, must be a string of 8-100 characters.'
+            });
+        }
 
         if (!adId || isNaN(parseInt(adId, 10))) {
             return res.status(400).json({ success: false, message: 'adId is required (integer).' });
@@ -127,7 +138,7 @@ exports.boostAd = async (req, res) => {
             });
         }
 
-        const result = await azmSpendService.boostAd(userId, parseInt(adId, 10), boostId);
+        const result = await azmSpendService.boostAd(userId, parseInt(adId, 10), boostId, idempotencyKey || null);
 
         // Emit marketplace update so other users see the boosted ad
         const io = req.app.get('socketio');

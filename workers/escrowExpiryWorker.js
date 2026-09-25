@@ -79,18 +79,35 @@ class EscrowExpiryWorker {
 
         for (const escrow of drafts) {
             try {
-                await this.prisma.$transaction(async (tx) => {
-                    await tx.smartEscrow.update({
-                        where: { id: escrow.id },
+                // §r41 — AUTHORITATIVE DRAFT CLAIM (final-audit: stale unfunded
+                // expiry worker). The scan above is a stale snapshot; a racing
+                // fundEscrow() can commit DRAFT → FUNDED (locking real money)
+                // between the scan and this write. The expiry is therefore a
+                // DB-boundary conditional claim — only a still-DRAFT,
+                // still-expired escrow can be expired:
+                //   funding wins → this claim loses (count=0) and the worker
+                //     does NOTHING: no EXPIRED overwrite, no ticket cancel,
+                //     no system message — the funded escrow lives on;
+                //   expiry wins → fundEscrow's own DRAFT claim loses and
+                //     never moves money. Either ordering strands no funds.
+                const won = await this.prisma.$transaction(async (tx) => {
+                    const claim = await tx.smartEscrow.updateMany({
+                        where: { id: escrow.id, status: 'DRAFT', expiresAt: { lt: now } },
                         data: { status: 'EXPIRED' }
                     });
+                    if (claim.count === 0) return false;
                     if (escrow.ticket && escrow.ticket.status !== 'CANCELLED') {
                         await tx.ticket.update({
                             where: { id: escrow.ticket.id },
                             data: { status: 'CANCELLED', cancelledAt: now, lastActivityAt: now }
                         });
                     }
+                    return true;
                 });
+                if (!won) {
+                    logger.info(`[EscrowExpiryWorker] skip ${escrow.id} — no longer an expired DRAFT (funded/processed concurrently)`);
+                    continue;
+                }
                 if (escrow.ticket) {
                     await this._injectSystem(escrow.ticket,
                         '⏱️ Escrow expired — funds were never locked. This ticket has been closed.',

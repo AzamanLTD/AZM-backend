@@ -368,52 +368,142 @@ class AzmSpendService {
      * @param {string} boostId - 'boost_24h' | 'boost_72h' | 'boost_7d'
      * @returns {Promise<{azmSpent: number, boostExpiresAt: string, newBalance: number}>}
      */
-    async boostAd(userId, adId, boostId) {
+    /**
+     * Boost an ad with AZM — ONE transaction (final-audit #14).
+     *
+     * RETRY CONTRACT:
+     *   • WITHOUT idempotencyKey: every call is a DISTINCT purchase — a
+     *     client retry re-charges. This is the explicit pre-r41 behavior,
+     *     now documented instead of accidental (the old dedup key embedded
+     *     Date.now(), so no retry was ever idempotent anyway).
+     *   • WITH a client-supplied idempotencyKey (per logical purchase, e.g.
+     *     a UUID held through retries): the spend identity
+     *     ad_boost_{adId}_{boostId}_{key} is DB-enforced exactly-once by the
+     *     AzmSpendLog unique invariant — a replay converges to the original
+     *     purchase's result, and an in-flight racing duplicate rolls back
+     *     whole (P2002) and converges to the winner's committed state.
+     *
+     * AUTHORITY: the ad row lock (FOR UPDATE) serializes concurrent boosts;
+     * ownership and the boost extension are recomputed from the LOCKED row,
+     * never the stale pre-read. Debit + entitlement commit in the SAME
+     * transaction, so no crash window can charge AZM without applying the
+     * boost.
+     */
+    async boostAd(userId, adId, boostId, idempotencyKey = null) {
         const option = AD_BOOST_OPTIONS.find(o => o.id === boostId);
         if (!option) throw new Error(`Invalid boost option: ${boostId}`);
 
-        // Verify the ad belongs to this user and is active
-        const ad = await this.prisma.ad.findUnique({
+        const dedupKey = idempotencyKey
+            ? `ad_boost_${adId}_${boostId}_${idempotencyKey}`
+            : null;
+
+        // Fast-fail pre-read (ownership/active) — convenience only; the
+        // authoritative checks run on the LOCKED row inside the transaction.
+        const preAd = await this.prisma.ad.findUnique({
             where: { id: adId },
-            select: { id: true, vendorId: true, status: true, isBoosted: true, boostExpiresAt: true }
+            select: { vendorId: true, status: true }
         });
+        if (!preAd) throw new Error('Ad not found.');
+        if (preAd.vendorId !== userId) throw new Error('You can only boost your own ads.');
+        if (preAd.status !== 'ACTIVE') throw new Error('Only active ads can be boosted.');
 
-        if (!ad) throw new Error('Ad not found.');
-        if (ad.vendorId !== userId) throw new Error('You can only boost your own ads.');
-        if (ad.status !== 'ACTIVE') throw new Error('Only active ads can be boosted.');
+        try {
+            const result = await this.prisma.$transaction(async (tx) => {
+                // §r41 — AD-ROW SERIALIZATION: concurrent boosts of the same
+                // ad serialize behind the row lock; the extension is
+                // recomputed from the LOCKED row so a paid extension can
+                // never silently disappear.
+                await tx.$executeRaw`SELECT id FROM "Ad" WHERE "id" = ${adId} FOR UPDATE`;
+                const ad = await tx.ad.findUnique({
+                    where: { id: adId },
+                    select: { id: true, vendorId: true, status: true, isBoosted: true, boostExpiresAt: true }
+                });
 
-        // If already boosted and not expired, extend from current expiry
-        const now = new Date();
-        let boostStart = now;
-        if (ad.isBoosted && ad.boostExpiresAt && new Date(ad.boostExpiresAt) > now) {
-            boostStart = new Date(ad.boostExpiresAt); // Extend from current expiry
-        }
-        const boostExpiresAt = new Date(boostStart.getTime() + option.durationMs);
+                // Fail-closed cross-user ownership on the locked row.
+                if (!ad) throw new Error('Ad not found.');
+                if (ad.vendorId !== userId) throw new Error('You can only boost your own ads.');
+                if (ad.status !== 'ACTIVE') throw new Error('Only active ads can be boosted.');
 
-        // Debit AZM
-        const result = await this.debitAzm({
-            userId,
-            amount: option.cost,
-            source: AZM_SPEND_SOURCES.AD_BOOST,
-            reason: `Ad #${adId} boosted for ${option.label} (-${option.cost} AZM)`,
-            metadata: { adId, boostId, durationMs: option.durationMs },
-            dedupKey: `ad_boost_${adId}_${boostId}_${Date.now()}`
-        });
+                // Authoritative expiry from the LOCKED row: extend a live
+                // boost, else start from now.
+                const now = new Date();
+                let boostStart = now;
+                if (ad.isBoosted && ad.boostExpiresAt && new Date(ad.boostExpiresAt) > now) {
+                    boostStart = new Date(ad.boostExpiresAt);
+                }
+                const boostExpiresAt = new Date(boostStart.getTime() + option.durationMs);
 
-        // Update the ad with boost status
-        await this.prisma.ad.update({
-            where: { id: adId },
-            data: {
-                isBoosted: true,
-                boostExpiresAt
+                // Debit + entitlement in the SAME transaction. A debit
+                // failure rolls back the boost; an entitlement failure rolls
+                // back the debit. A racing duplicate dedup key (P2002) rolls
+                // back the whole thing.
+                const debit = await this._debitAzmWithClient(tx, {
+                    userId,
+                    amount: option.cost,
+                    source: AZM_SPEND_SOURCES.AD_BOOST,
+                    reason: `Ad #${adId} boosted for ${option.label} (-${option.cost} AZM)`,
+                    metadata: { adId, boostId, durationMs: option.durationMs },
+                    dedupKey
+                });
+
+                // Replay of the same logical purchase: the committed boost
+                // state IS the answer — re-derive the expiry from the locked
+                // row (already committed by the winner) and return it
+                // without a second charge or a second extension.
+                if (dedupKey && debit.debited === false) {
+                    return {
+                        replayed: true,
+                        boostExpiresAt: ad.boostExpiresAt.toISOString(),
+                        newBalance: debit.newBalance
+                    };
+                }
+
+                await tx.ad.update({
+                    where: { id: adId },
+                    data: { isBoosted: true, boostExpiresAt }
+                });
+
+                return {
+                    replayed: false,
+                    boostExpiresAt: boostExpiresAt.toISOString(),
+                    newBalance: debit.newBalance
+                };
+            }, { timeout: 15000 });
+
+            if (!result.replayed) {
+                this._emitSpendUpdate(userId, result.newBalance, option.cost, AZM_SPEND_SOURCES.AD_BOOST, `Ad #${adId} boosted`);
             }
-        });
-
-        return {
-            azmSpent: option.cost,
-            boostExpiresAt: boostExpiresAt.toISOString(),
-            newBalance: result.newBalance
-        };
+            return result;
+        } catch (err) {
+            // In-flight racing duplicate: this caller LOST the DB unique race,
+            // so the whole transaction (debit + boost) rolled back. Converge
+            // to the winner's committed state — the idempotent result a
+            // sequential replay of the same logical purchase would return.
+            if (dedupKey && err?.code === 'P2002') {
+                const winner = await this.prisma.azmSpendLog.findFirst({
+                    where: {
+                        userId,
+                        source: AZM_SPEND_SOURCES.AD_BOOST,
+                        OR: [
+                            { dedupKey },
+                            { metadata: { path: ['dedupKey'], equals: dedupKey } }
+                        ]
+                    }
+                });
+                if (winner) {
+                    const ad = await this.prisma.ad.findUnique({
+                        where: { id: adId },
+                        select: { boostExpiresAt: true }
+                    });
+                    return {
+                        replayed: true,
+                        boostExpiresAt: (ad?.boostExpiresAt || winner.createdAt).toISOString(),
+                        newBalance: winner.balanceAfter
+                    };
+                }
+            }
+            throw err;
+        }
     }
 
     // =========================================================================
@@ -515,7 +605,16 @@ class AzmSpendService {
         }
 
         // Atomic: debit AZM + append to ownedCardSkins in one transaction.
+        // §r41 — USER-ROW SERIALIZATION (final-audit #13): pre-r41 the
+        // array was rebuilt from an UNLOCKED read and written as an absolute
+        // replacement — two concurrent purchases of different skins both
+        // debited, and the last absolute-array writer erased the other's
+        // paid entitlement. Fix: take the user row lock first, then
+        // recompute from the LOCKED row. Concurrent purchases (different or
+        // same skin) serialize behind the lock; the debit + array write
+        // commit as one statement from locked-row truth.
         const result = await this.prisma.$transaction(async (tx) => {
+            await tx.$executeRaw`SELECT id FROM "User" WHERE "id" = ${userId} FOR UPDATE`;
             const fresh = await tx.user.findUnique({
                 where: { id: userId },
                 select: { azmBalance: true, ownedCardSkins: true }
