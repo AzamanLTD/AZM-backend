@@ -127,6 +127,33 @@ class InventoryRestockService {
             return committed.result;
         };
 
+        // §r40.5 — BIND THE INTENT TO ITS REGISTERED OPERATION (final-audit
+        // P1). When the supplied idempotency key names a server-owned
+        // intent in this business, the request's payload MUST be the
+        // operation that was REGISTERED: the client must never be able to
+        // redefine what an existing intent means. Without this guard the key
+        // of an intent registered for (item A, qty 5) could execute as
+        // (item B, qty 100), corrupting the recovery/audit relationship
+        // between the durable intent and the economic operation.
+        // Exact-decimal contract: quantities are compared as exact base-10
+        // decimals (Decimal.equals), never binary floats — the same
+        // equivalence the v2 fingerprint digests ("12.50" ≡ "12.5", and
+        // never ≡ "100").
+        const registeredIntent = await this.prisma.inventoryRestockIntent.findFirst({
+            where: { id: idempotencyKey, businessProfileId },
+            select: { itemId: true, quantity: true },
+        });
+        if (registeredIntent) {
+            if (registeredIntent.itemId !== itemId) {
+                throw restockError('RESTOCK_INTENT_PAYLOAD_MISMATCH',
+                    'Idempotency-Key belongs to a restock intent registered for a different item. Send the registered item, or register a new intent.', 409);
+            }
+            if (!new Prisma.Decimal(registeredIntent.quantity).equals(qty)) {
+                throw restockError('RESTOCK_INTENT_PAYLOAD_MISMATCH',
+                    'Idempotency-Key belongs to a restock intent registered for a different quantity. Resend the registered exact quantity string.', 409);
+            }
+        }
+
         // A replay is checked before reading the mutable inventory catalog.
         const committed = await replay();
         if (committed) {

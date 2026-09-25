@@ -37,6 +37,16 @@
 //   EXECUTED ──cancel──▶ FORBIDDEN (409): an executed operation can only be
 //   acknowledged, never cancelled.
 //
+// RETENTION (§r40.5 P2 follow-up, deliberately deferred): resolved intents
+// (ACKNOWLEDGED / CANCELLED) are retained forever as audit evidence — the
+// operation identity and its exact registered payload stay queryable. The
+// recovery query only ever selects UNRESOLVED statuses, so retention growth
+// does not slow recovery, but the table itself grows without bound at high
+// volume. A future archival/retention mechanism (e.g. move resolved rows
+// older than a business-configured horizon to an archive table, keeping the
+// last N resolved rows hot) is the recorded follow-up. There is deliberately
+// NO client-side TTL and resolved intents are never deleted by the client.
+//
 // quantity is stored as the EXACT decimal string the operator submitted and
 // is resent VERBATIM on retry: the restock fingerprint (v2) digests the raw
 // string, so "12.50" and "12.5" are different fingerprints and a recovered
@@ -158,17 +168,34 @@ class InventoryRestockIntentService {
     // Explicit operator cancel — ONLY while no execution has been observed.
     // An EXECUTED intent refuses cancellation: the restock already happened;
     // the operator must acknowledge it instead (the recovery list says so).
+    //
+    // §r40.5 — CONDITIONAL STATE TRANSITION (final-audit P1). The previous
+    // read-then-act form (SELECT the intent, check PENDING, then UPDATE
+    // unconditionally) left a race: cancel could read PENDING while a
+    // concurrent restock committed PENDING → EXECUTED, and cancel's stale
+    // update then overwrote EXECUTED with CANCELLED — violating the
+    // documented invariant that an executed restock can never become
+    // cancelled. The row itself is now the ONLY authority: a single
+    // conditional UPDATE wins only while the committed status is still
+    // PENDING (PostgreSQL re-checks the WHERE clause on the newest row
+    // version after any row-lock wait), and the affected-row count
+    // classifies the outcome. No preceding SELECT is the authority.
     async cancel({ businessProfileId, id }) {
-        const intent = await this._get({ businessProfileId, id });
-        if (intent.status === STATUS.CANCELLED) return intent; // idempotent re-cancel
-        if (intent.status !== STATUS.PENDING) {
-            throw intentError('RESTOCK_INTENT_ALREADY_EXECUTED',
-                'This restock already executed — it can only be acknowledged, not cancelled.', 409);
-        }
-        return this.prisma.inventoryRestockIntent.update({
-            where: { id: intent.id },
+        if (typeof id !== 'string' || !id) throw intentError('RESTOCK_INTENT_NOT_FOUND', 'Restock intent not found.', 404);
+        const won = await this.prisma.inventoryRestockIntent.updateMany({
+            where: { id, businessProfileId, status: STATUS.PENDING },
             data: { status: STATUS.CANCELLED },
         });
+        if (won.count === 1) return this._get({ businessProfileId, id });
+        // The transition lost (or was already decided). Classify from the
+        // COMMITTED state — never from a pre-read snapshot.
+        const intent = await this.prisma.inventoryRestockIntent.findFirst({ where: { id, businessProfileId } });
+        if (!intent) throw intentError('RESTOCK_INTENT_NOT_FOUND', 'Restock intent not found.', 404);
+        if (intent.status === STATUS.CANCELLED) return intent; // idempotent re-cancel
+        // EXECUTED (or already ACKNOWLEDGED): truth wins — the restock
+        // actually happened and can only be acknowledged, never cancelled.
+        throw intentError('RESTOCK_INTENT_ALREADY_EXECUTED',
+            'This restock already executed — it can only be acknowledged, not cancelled.', 409);
     }
 
     async _get({ businessProfileId, id }) {

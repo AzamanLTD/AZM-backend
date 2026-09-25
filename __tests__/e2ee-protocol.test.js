@@ -258,7 +258,16 @@ describe('E2EE protocol v1 (deterministic real crypto)', () => {
     test('P0-B. tampering header.dh alone is DETECTED (header is authenticated)', async () => {
         const { alice, bob, aliceDev, bobDev } = await makeSession(30, 31);
         const good = alice.encrypt('hdr-auth', ctx(aliceDev, bobDev));
-        const tamperedDh = b64(Buffer.concat([Buffer.from(good.header.dh, 'base64').subarray(0, 31), Buffer.from([1])]));
+        // §r40.5: deterministic tamper. Replacing the final byte with a
+        // literal 1 was NOT a guaranteed mutation (a header whose last byte
+        // already was 1 was "tampered" into itself, and the assertion
+        // flaked — hidden until now by the CI retry). XORing an existing
+        // byte with 1 ALWAYS changes it.
+        const originalDh = Buffer.from(good.header.dh, 'base64');
+        const tampered = Buffer.from(originalDh);
+        tampered[tampered.length - 1] ^= 1;
+        expect(tampered.equals(originalDh)).toBe(false); // guaranteed mutation
+        const tamperedDh = b64(tampered);
         const bad = { header: { dh: tamperedDh, pn: good.header.pn, n: good.header.n }, nonce: good.nonce, ciphertext: good.ciphertext };
         expect(() => D(bob, bad, ctx(aliceDev, bobDev))).toThrow();
     });
