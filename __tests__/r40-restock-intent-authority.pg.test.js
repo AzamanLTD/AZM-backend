@@ -18,6 +18,11 @@
 //  4. AUTHORITATIVE SERVER STATE: the restock service itself marks the
 //     intent EXECUTED (execute AND replay paths) with the stored result, so
 //     the recovery list re-displays the outcome the browser lost.
+//  §r40.7 (final-audit P1): a CANCELLED intent without a committed
+//  operation is TERMINAL — a later submission can never resurrect it. The
+//  restock claim takes the intent row lock (FOR UPDATE) at the DB boundary,
+//  serializing claim vs cancel; truth-wins survives only as the documented
+//  replay of an already-committed operation.
 //  Plus the guarded state machine: cancel is refused once executed; a
 //  cancelled-but-actually-committed operation resurfaces as EXECUTED
 //  (truth wins); ack is only valid for EXECUTED and is idempotent.
@@ -148,23 +153,45 @@ run('r40.4 — server-owned restock intent (PostgreSQL)', () => {
         expect(row.executionResult).toEqual(first); // the outcome is recoverable
     });
 
-    test('7. cancel is refused once executed; a cancel-on-a-guess that actually committed RESURFACES', async () => {
+    test('7. cancel is terminal without a committed operation; a cancel-on-a-guess that DID commit RESURFACES (r40.7)', async () => {
         const a = await createIntent('5');
-        // cancel while pending: allowed
+        // cancel while pending: allowed — and with NO committed operation it
+        // is TERMINAL (§r40.7 final-audit P1): a later submission with the
+        // same key can never resurrect the deliberately discarded operation.
         const cancelled = await intents.cancel({ businessProfileId: biz.id, id: a.id });
         expect(cancelled.status).toBe('CANCELLED');
         expect((await intents.listUnresolved({ businessProfileId: biz.id })).length).toBe(0);
-        // ...but the request was ALREADY in flight and commits afterwards —
-        // truth wins: the executed operation resurfaces in the recovery list
-        await restockWith(a.id, '5', '2');
-        const row = await get(a.id);
-        expect(row.status).toBe('EXECUTED'); // CANCELLED → EXECUTED allowed
+        await expect(restockWith(a.id, '5', '2')).rejects.toMatchObject({
+            code: 'RESTOCK_INTENT_CANCELLED', statusCode: 409,
+        });
+        expect((await get(a.id)).status).toBe('CANCELLED'); // unchanged
+        expect(await stockOf(item.id)).toBe(10);             // no mutation
+        expect(await ledgerCount()).toBe(0);
+        expect(await db.inventoryRestockOperation.count({ where: { businessProfileId: biz.id, idempotencyKey: a.id } })).toBe(0);
+
+        // ...but if the operation HAD already committed when the operator
+        // cancelled on a guess (the documented truth-wins recovery state),
+        // a later retry REPLAYS the committed operation and the intent
+        // resurfaces as EXECUTED with its stored result. Constructed here
+        // directly: under §r40.7 the service itself can no longer create
+        // this state (the intent row lock serializes claim vs cancel), so
+        // this covers exactly the legacy/recovery states the in-list
+        // [PENDING, CANCELLED] → EXECUTED transition exists for.
+        const b = await createIntent('5');
+        const first = await restockWith(b.id, '5', '2');
+        expect((await get(b.id)).status).toBe('EXECUTED');
+        await db.inventoryRestockIntent.update({ where: { id: b.id }, data: { status: 'CANCELLED' } });
+        const replayed = await restockWith(b.id, '5', '2');
+        expect(replayed).toEqual(first); // replay only — never a new operation
+        const row = await get(b.id);
+        expect(row.status).toBe('EXECUTED'); // CANCELLED → EXECUTED allowed (truth wins)
         expect((await intents.listUnresolved({ businessProfileId: biz.id })).length).toBe(1);
-        // cancelling an EXECUTED intent is now FORBIDDEN — only acknowledge
-        await expect(intents.cancel({ businessProfileId: biz.id, id: a.id }))
+        expect(await ledgerCount()).toBe(1); // exactly one economic effect
+        // cancelling an EXECUTED intent is FORBIDDEN — only acknowledge
+        await expect(intents.cancel({ businessProfileId: biz.id, id: b.id }))
             .rejects.toMatchObject({ code: 'RESTOCK_INTENT_ALREADY_EXECUTED' });
-        await intents.acknowledge({ businessProfileId: biz.id, id: a.id });
-        expect((await get(a.id)).status).toBe('ACKNOWLEDGED');
+        await intents.acknowledge({ businessProfileId: biz.id, id: b.id });
+        expect((await get(b.id)).status).toBe('ACKNOWLEDGED');
     });
 
     test('8. ack is only valid for EXECUTED intents (and idempotent); state machine is guarded', async () => {
@@ -309,34 +336,132 @@ run('r40.4 — server-owned restock intent (PostgreSQL)', () => {
         expect(await stockOf(item.id)).toBe(15);
     });
 
-    test('16. RACE cancel-wins-first + a genuine simultaneous race: a committed execution is never cancelled', async () => {
-        // ordering A: cancel commits while the restock is in flight → the
-        // restock truthfully transitions CANCELLED → EXECUTED (truth wins)
+    test('16. RACE cancel-wins-first: reuse of the cancelled key is REJECTED with no mutation; a genuine simultaneous race stays consistent (r40.7)', async () => {
+        // ordering A (§r40.7 proof A — cancel wins BEFORE the economic
+        // claim): a later submission of the cancelled key is rejected
+        // permanently; NO ledger/stock/operation mutation occurs.
         const a = await createIntent('5');
         await intents.cancel({ businessProfileId: biz.id, id: a.id });
         expect((await get(a.id)).status).toBe('CANCELLED');
-        await restockAs(a.id, item.id, '5');
-        expect((await get(a.id)).status).toBe('EXECUTED');
-        await expect(intents.cancel({ businessProfileId: biz.id, id: a.id }))
-            .rejects.toMatchObject({ code: 'RESTOCK_INTENT_ALREADY_EXECUTED' });
-        expect(await stockOf(item.id)).toBe(15);
-        expect(await ledgerCount()).toBe(1);
+        expect(await db.inventoryRestockOperation.count({ where: { businessProfileId: biz.id, idempotencyKey: a.id } })).toBe(0);
+        await expect(restockAs(a.id, item.id, '5')).rejects.toMatchObject({
+            code: 'RESTOCK_INTENT_CANCELLED', statusCode: 409,
+        });
+        expect((await get(a.id)).status).toBe('CANCELLED'); // stays cancelled
+        expect(await stockOf(item.id)).toBe(10);             // stock unchanged
+        expect(await ledgerCount()).toBe(0);                 // no ledger row
+        expect(await db.inventoryRestockOperation.count({ where: { businessProfileId: biz.id, idempotencyKey: a.id } })).toBe(0);
+        // a REPEATED attempt is rejected identically (stable typed conflict)
+        await expect(restockAs(a.id, item.id, '5')).rejects.toMatchObject({ code: 'RESTOCK_INTENT_CANCELLED' });
 
         // ordering B: genuinely simultaneous cancel-vs-restock, five rounds.
-        // Both interleavings are legal; the final state must NEVER be
-        // CANCELLED over a committed execution, with exactly ONE economic
-        // effect per round.
+        // BOTH outcomes are legal — whoever wins the intent row lock first.
+        // The invariant is the audit's state machine:
+        //   execution won  → EXECUTED, exactly ONE economic effect,
+        //                    cancel afterwards refused, replay never mutates;
+        //   cancel won     → CANCELLED, ZERO mutation, reuse rejected.
+        let executed = 0, cancelled = 0;
         for (let round = 0; round < 5; round++) {
             const k = await createIntent('5');
             const [, outcome] = await Promise.allSettled([
                 intents.cancel({ businessProfileId: biz.id, id: k.id }),
                 restockAs(k.id, item.id, '5'),
             ]);
-            expect(outcome.status).toBe('fulfilled'); // the restock always commits
             const final = await get(k.id);
-            expect(['EXECUTED', 'ACKNOWLEDGED']).toContain(final.status); // never CANCELLED
-            expect(await stockOf(item.id)).toBe(20 + round * 5);
-            expect(await ledgerCount()).toBe(2 + round);
+            if (outcome.status === 'fulfilled') {
+                executed += 1;
+                expect(final.status).toBe('EXECUTED'); // never CANCELLED over a commit
+                expect(await stockOf(item.id)).toBe(10 + 5 * executed);
+                expect(await ledgerCount()).toBe(executed);
+                await expect(intents.cancel({ businessProfileId: biz.id, id: k.id }))
+                    .rejects.toMatchObject({ code: 'RESTOCK_INTENT_ALREADY_EXECUTED' });
+                const first = outcome.value;
+                const again = await restockAs(k.id, item.id, '5'); // replay: no second mutation
+                expect(again).toEqual(first);
+                expect(await stockOf(item.id)).toBe(10 + 5 * executed);
+                expect(await ledgerCount()).toBe(executed);
+            } else {
+                cancelled += 1;
+                expect(outcome.reason.code).toBe('RESTOCK_INTENT_CANCELLED');
+                expect(final.status).toBe('CANCELLED');
+                expect(await stockOf(item.id)).toBe(10 + 5 * executed); // unchanged
+                expect(await ledgerCount()).toBe(executed);             // unchanged
+                // later reuse of the cancelled key stays rejected
+                await expect(restockAs(k.id, item.id, '5')).rejects.toMatchObject({ code: 'RESTOCK_INTENT_CANCELLED' });
+            }
+            expect(await db.inventoryRestockOperation.count({ where: { businessProfileId: biz.id, idempotencyKey: k.id } })).toBe(final.status === 'EXECUTED' ? 1 : 0);
         }
+        expect(executed + cancelled).toBe(5);
+    });
+
+    test('17. r40.7 proof B — EXECUTION-WINS: the claim serializes on the intent row lock; after commit, cancel is forbidden and replay never mutates twice (deterministic)', async () => {
+        const k = await createIntent('5');
+        // Hold the intent row lock externally — the service's claim must
+        // queue BEHIND it (the §r40.7 DB boundary: the intent row lock is
+        // taken before ANY economic statement).
+        let release;
+        const gate = new Promise((res) => { release = res; });
+        let lockHeld;
+        const lockAcquired = new Promise((res) => { lockHeld = res; });
+        const held = db.$transaction(async (tx) => {
+            await tx.$queryRaw`SELECT "id" FROM "InventoryRestockIntent" WHERE "id" = ${k.id} FOR UPDATE`;
+            lockHeld();
+            await gate;
+            return 'held';
+        }, { timeout: 15000 });
+        await lockAcquired; // wait for the lock itself, not a timer (§r40.6)
+        const restockP = restockAs(k.id, item.id, '5');
+        let done = false;
+        restockP.then(() => { done = true; });
+        await new Promise((r) => setTimeout(r, 300));
+        expect(done).toBe(false); // blocked on the intent row lock
+        release();
+        await held;
+        const first = await restockP;
+        expect((await get(k.id)).status).toBe('EXECUTED');
+        expect(await stockOf(item.id)).toBe(15);
+        expect(await ledgerCount()).toBe(1);
+        // once EXECUTED, cancel is FORBIDDEN — truth wins
+        await expect(intents.cancel({ businessProfileId: biz.id, id: k.id }))
+            .rejects.toMatchObject({ code: 'RESTOCK_INTENT_ALREADY_EXECUTED' });
+        // replay returns the ORIGINAL result and NEVER creates a second
+        // ledger/stock mutation
+        const again = await restockAs(k.id, item.id, '5');
+        expect(again).toEqual(first);
+        expect(await stockOf(item.id)).toBe(15);
+        expect(await ledgerCount()).toBe(1);
+        expect(await db.inventoryRestockOperation.count({ where: { businessProfileId: biz.id, idempotencyKey: k.id } })).toBe(1);
+    });
+
+    test('18. r40.7 proof C — ACKNOWLEDGED TERMINALITY: reuse replays the original operation only, or fails with a typed conflict; NEVER a new operation', async () => {
+        const k = await createIntent('5');
+        const first = await restockWith(k.id, '5', '2');
+        await intents.acknowledge({ businessProfileId: biz.id, id: k.id });
+        expect((await get(k.id)).status).toBe('ACKNOWLEDGED');
+        // same payload: replay of the original committed operation
+        const replayed = await restockWith(k.id, '5', '2');
+        expect(replayed).toEqual(first);
+        expect((await get(k.id)).status).toBe('ACKNOWLEDGED'); // untouched
+        // a new payload (different cost): typed idempotency conflict
+        await expect(restockWith(k.id, '5', '3')).rejects.toMatchObject({
+            code: 'RESTOCK_IDEMPOTENCY_CONFLICT', statusCode: 409,
+        });
+        // a new payload (different quantity): typed payload binding conflict
+        await expect(restockWith(k.id, '6', '2')).rejects.toMatchObject({
+            code: 'RESTOCK_INTENT_PAYLOAD_MISMATCH', statusCode: 409,
+        });
+        // a new payload (different item): typed payload binding conflict
+        const item2 = await db.inventoryItem.create({ data: {
+            businessProfileId: biz.id, name: 'Rice', unit: 'bags',
+            currentStock: 0, minimumStock: 0, costPerUnit: 10,
+        } });
+        await expect(restocks.restock({ businessProfileId: biz.id, itemId: item2.id, quantity: '5', idempotencyKey: k.id, costPerUnit: '2' }))
+            .rejects.toMatchObject({ code: 'RESTOCK_INTENT_PAYLOAD_MISMATCH', statusCode: 409 });
+        // NEVER a new operation: one op, one ledger row, one stock increment
+        expect(await db.inventoryRestockOperation.count({ where: { businessProfileId: biz.id, idempotencyKey: k.id } })).toBe(1);
+        expect(await ledgerCount()).toBe(1);
+        expect(await stockOf(item.id)).toBe(15);
+        expect(await stockOf(item2.id)).toBe(0);
+        expect((await get(k.id)).status).toBe('ACKNOWLEDGED');
     });
 });

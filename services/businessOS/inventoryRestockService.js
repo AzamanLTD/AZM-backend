@@ -113,8 +113,8 @@ class InventoryRestockService {
         ])).digest('hex');
         const FINGERPRINT_VERSION = 2;
         const identity = { businessProfileId_idempotencyKey: { businessProfileId, idempotencyKey } };
-        const replay = async () => {
-            const committed = await this.prisma.inventoryRestockOperation.findUnique({ where: identity });
+        const replay = async (dbs = this.prisma) => {
+            const committed = await dbs.inventoryRestockOperation.findUnique({ where: identity });
             if (!committed) return null;
             // Replay against the version the operation was COMMITTED under:
             // v1 rows verify with the legacy float digest, v2 with the exact
@@ -169,6 +169,60 @@ class InventoryRestockService {
 
         try {
             return await this.prisma.$transaction(async (tx) => {
+                // §r40.7 — CANCELLED-INTENT REUSE GUARD (final-audit P1).
+                // The pre-reads above are loose; the DB boundary is the
+                // authority. When the key names a server-owned intent, take
+                // its row lock (SELECT ... FOR UPDATE) FIRST — this
+                // serializes the request against a concurrent operator
+                // cancel (whose conditional UPDATE blocks on the same row
+                // and re-checks the newest committed version). Under the
+                // lock, the intent's status decides:
+                //   PENDING     → the economic claim may proceed;
+                //   CANCELLED   → WITHOUT a committed operation this key is
+                //                 TERMINAL: a later submission must never
+                //                 resurrect a deliberately discarded
+                //                 operation (409 RESTOCK_INTENT_CANCELLED).
+                //                 WITH a committed operation (the truth-wins
+                //                 recovery state) it replays that operation
+                //                 only — never a new one;
+                //   EXECUTED /
+                //   ACKNOWLEDGED → replay of the committed operation only
+                //                 (a concurrent duplicate may have committed
+                //                 between the pre-tx replay and this lock);
+                //                 with no operation the intent is terminal.
+                if (registeredIntent) {
+                    const lockedRows = await tx.$queryRaw`
+                        SELECT "status" FROM "InventoryRestockIntent"
+                        WHERE "id" = ${idempotencyKey} AND "businessProfileId" = ${businessProfileId}
+                        FOR UPDATE`;
+                    const intentStatus = lockedRows.length ? lockedRows[0].status : null;
+                    if (intentStatus !== null && intentStatus !== 'PENDING') {
+                        // truth-wins re-check INSIDE the row lock: a committed
+                        // operation is replayed, never re-created.
+                        const committedNow = await replay(tx);
+                        if (committedNow) {
+                            if (intentStatus === 'CANCELLED') {
+                                // the documented truth-wins transition: the
+                                // operator cancelled on a guess, but the
+                                // operation had already committed — it
+                                // resurfaces as EXECUTED with its stored
+                                // result, atomically with this read-only
+                                // replay.
+                                await tx.inventoryRestockIntent.updateMany({
+                                    where: { id: idempotencyKey, businessProfileId, status: 'CANCELLED' },
+                                    data: { status: 'EXECUTED', executionResult: committedNow, executedAt: new Date() },
+                                });
+                            }
+                            return committedNow;
+                        }
+                        if (intentStatus === 'CANCELLED') {
+                            throw restockError('RESTOCK_INTENT_CANCELLED',
+                                'This restock intent was cancelled and never executed. Register a new intent for a new purchase.', 409);
+                        }
+                        throw restockError('RESTOCK_INTENT_ALREADY_EXECUTED',
+                            'This restock intent is already resolved; only its original result can be replayed.', 409);
+                    }
+                }
                 // The DB unique index is the concurrent claim. A losing insert
                 // waits for the first transaction to commit or roll back; no
                 // second stock/expense writes can occur before this claim.
