@@ -146,3 +146,83 @@ expected blocking relationship exists before releasing each gate. Timers are
 bounded safety timeouts only — no sleep establishes a queue position. Pool
 sizes in the proof clients were raised (`connection_limit=16`) so gated
 interleaves cannot starve before reaching the database.
+
+## Follow-up 3 (PR #309, third-pass review) — linkage-pinned claims close the create/link READ COMMITTED races
+
+### The create/link-vs-cancel reverse race (READ COMMITTED, EvalPlanQual)
+
+The second-pass fix pinned the funding path but left the booking CAS predicates
+linkage-blind. Concrete interleave:
+
+1. `createBookingEscrow` (TRANSIT) creates ticket + DRAFT escrow and holds the
+   booking row with its uncommitted `escrowId` link;
+2. a cancellation's in-transaction link read observes `escrowId = null`
+   (the link is not committed), takes NO escrow lock, and its booking CAS
+   queues behind the create's link UPDATE;
+3. the create/link COMMITS (`escrowId = E`, still PENDING);
+4. PostgreSQL legally re-evaluates the blocked CAS's WHERE against the NEW
+   committed row version — `status` still matches, so the old status-only
+   predicate WON the booking while the cancellation carried a stale
+   JavaScript `escrowId = null`;
+5. CANCELLED booking with a silently unreported, still-attached escrow.
+
+The no-show sweep had the same linkage-blind booking claim (a stale-null read
+could strand a FUNDED escrow on a NO_SHOW booking when funding committed
+in the window), plus a rollback defect: a claim loss AFTER this transaction's
+escrow economics was a `return { action: 'CLAIM_LOST' }` — which COMMITS the
+refund/split/expire without the NO_SHOW transition.
+
+### The structural fix — the pinned linkage is part of the CAS identity
+
+- **Cancellation** (`cancelTransitBooking`): the pinned `escrowId` (from the
+  in-transaction link read) is part of the booking CAS predicate
+  (`{ id, status in CANCELLABLE, escrowId: pinned }`). Under EvalPlanQual
+  re-evaluation a raced link (null → E) FAILS the predicate. On a
+  linkage-raced loss the claim holds NOTHING (a failed re-evaluation releases
+  the row; the pinned-null variant never took an escrow lock), so a bounded
+  re-pin loop re-reads the link, locks the escrow FIRST, and claims again.
+  Because linkage is strictly one-way (the create/link path requires
+  `escrowId: null`), the CAS WINNER's pinned escrowId is provably the FINAL
+  linkage. Escrow-first lock order preserved; deadlock-free by construction:
+  while the escrow row is held, no competing lifecycle writer can hold the
+  booking row (they all need the escrow first).
+- **No-show sweep** (`sweepNoShowTransitBookings`): the same linkage-pinned
+  claim (`escrowId: pinnedEscrowId` in the NO_SHOW CAS). A linkage-raced loss
+  (only reachable from a pinned-null read, which executes no economics)
+  reports `RETRY_LINKAGE` and the per-booking loop reprocesses once through
+  the fresh escrow-first authority. A non-linkage claim loss AFTER escrow
+  economics now THROWS (`SWEEP_CLAIM_LOST_ROLLED_BACK`) so the whole
+  transaction rolls back — the racing actor (check-in, cancellation,
+  completion) owns the booking and its escrow truth; the rolled-back sweep
+  reports the same honest `CLAIM_LOST` no-op, not a phantom error.
+
+### Proofs — `r41-transit-funding-cancellation-authority.pg.test.js`
+
+- **C2a** (new) — the exact READ COMMITTED interleave: the gate holds the
+  booking row; the REAL create/link parks at its link UPDATE (observed, count
+  1); the REAL cancellation queues at position 2 with its stale null link
+  read (observed, count 2); the gate releases, the link commits, the parked
+  CAS wakes and re-evaluates. Verified to FAIL against the un-pinned (buggy)
+  CAS: the cancellation's re-pin loop loses the first claim on the raced
+  linkage, re-pins escrow-first, wins the booking, and honestly resolves the
+  raced DRAFT escrow (NO_FUNDS). Asserts terminal state, final linkage,
+  unfundability of the DRAFT escrow (real funding fails
+  `TRANSIT_FUNDING_CONFLICT`), zero economics (balances, ledger, history),
+  exactly one non-orphan ticket, no orphan escrows.
+- **C2b** (new) — the legitimate create-first interleave through concurrent
+  service calls: the REAL create/link is gated mid-transaction at its link
+  UPDATE and then commits; a REAL cancellation and REAL funding then race
+  concurrently on the linked escrow (observed escrow-lock queue, cancel at
+  position 1, funding at position 2). The cancellation wins the escrow-first
+  authority (CANCELLED + NO_FUNDS); the funding wakes to committed terminal
+  truth and fails closed with zero economics.
+- C1 (cancel-wins-first whole-aggregate rollback) unchanged and green.
+
+### Durability lane
+
+`r41-transit-funding-cancellation-authority.pg.test.js` is now in the explicit
+financial-durability suite list (production commit mode
+`synchronous_commit=on`, guarded before and after the run) alongside the other
+three r41 PG suites. It appears exactly once in the workflow; the main battery
+runs it via its normal pattern — no duplication, no semantic change to the
+existing suite list.

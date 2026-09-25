@@ -188,6 +188,11 @@ jobs:
             "__tests__/r41-escrow-terminal-authority.pg.test.js"
             "__tests__/r41-business-os-authority.pg.test.js"
             "__tests__/r41-azm-economy-authority.pg.test.js"
+            # §r41 third-pass review — the transit funding/cancellation
+            # economic-authority proofs (fund-after-cancellation race,
+            # linkage-pinned create/link-vs-cancel, escrow-first serialization)
+            # are financial integrity: they prove customer money cannot strand.
+            "__tests__/r41-transit-funding-cancellation-authority.pg.test.js"
           )
           npx jest --runInBand --forceExit "${SUITES[@]}"
 

@@ -110,91 +110,142 @@ const sweepNoShowTransitBookings = async (prisma) => {
             // AND booking status — now happens in ONE transaction with fresh
             // reads and conditional claims; a cancellation that won first
             // simply converges to CANCELLED and this sweep does nothing.
-            const outcome = await prisma.$transaction(async (tx) => {
-                const fresh = await tx.transitBooking.findUnique({
-                    where: { id: booking.id },
-                    include: { escrow: true },
-                });
-                if (!fresh) return { action: 'SKIPPED_GONE' };
-                if (fresh.status === 'NO_SHOW') return { action: 'ALREADY_NO_SHOW' };
-                if (fresh.status !== 'CONFIRMED') {
-                    return { action: 'SKIPPED_STATUS', status: fresh.status };
-                }
-
-                const escrow = fresh.escrow;
-                const penaltyPct = fresh.noShowPenaltyPct != null ? Number(fresh.noShowPenaltyPct) : null;
-                const penaltyFlatUsdc = fresh.noShowPenaltyUsdc != null ? Number(fresh.noShowPenaltyUsdc) : null;
-                const hasPenalty = (penaltyPct != null && penaltyPct > 0) || (penaltyFlatUsdc != null && penaltyFlatUsdc > 0);
-
-                if (escrow && CUSTODY_STATES.has(escrow.status)) {
-                    // Funds are in dispute custody — a human owns this escrow.
-                    // Record and leave both rows untouched; the dispute
-                    // resolution owns the economics.
-                    return { action: 'ESCROW_IN_DISPUTE', escrowStatus: escrow.status };
-                }
-
-                let penaltyAmount = 0;
-                if (escrow && REFUND_CLAIMABLE.includes(escrow.status)) {
-                    if (hasPenalty) {
-                        // Atomic split-release: escrow RELEASED + balances +
-                        // ledger + booking NO_SHOW claim (CONFIRMED-only)
-                        // all commit together or roll back together.
-                        const split = await _splitReleaseFundedEscrowTx(tx, {
-                            escrowId: escrow.id,
-                            penaltyPct,
-                            penaltyFlatUsdc,
-                            reason: 'Transit no-show sweep',
-                            bookingType: 'TRANSIT',
-                            bookingId: fresh.id,
-                            releaseRef: randomUUID(),
-                            refundRef: randomUUID(),
-                        });
-                        return {
-                            action: 'PENALTY_CHARGED',
-                            penaltyAmount: split.penaltyAmount,
-                            refundAmount: split.refundAmount,
-                            customerId: fresh.customerId,
-                        };
-                    }
-                    // No penalty: the FULL refund is part of the same atomic
-                    // transition — the escrow can never be stranded FUNDED.
-                    await _refundBookingEscrowTx(tx, { escrowId: escrow.id, reference: randomUUID() });
-                } else if (escrow && escrow.status === 'DRAFT') {
-                    // Unfunded escrow: expire it in the same transaction.
-                    const expired = await tx.smartEscrow.updateMany({
-                        where: { id: escrow.id, status: 'DRAFT' },
-                        data: { status: 'EXPIRED' },
+            // §r41 third-pass — one bounded reprocess when the claim lost to
+            // a raced escrow linkage (the linkage is strictly one-way, so a
+            // single retry observes the final linkage; the bound is a safety
+            // valve, not a correctness timer).
+            let outcome = null;
+            for (let sweepAttempt = 1; sweepAttempt <= 2; sweepAttempt++) {
+                outcome = await prisma.$transaction(async (tx) => {
+                    const fresh = await tx.transitBooking.findUnique({
+                        where: { id: booking.id },
+                        include: { escrow: true },
                     });
-                    if (expired.count !== 1) return { action: 'ESCROW_STATE_CONFLICT', escrowStatus: escrow.status };
-                } else if (escrow && !['REFUNDED', 'EXPIRED'].includes(escrow.status)) {
-                    // SETTLED/RELEASED and friends: economics already moved
-                    // by another authority — never overwrite, flag for humans.
-                    return { action: 'ESCROW_ECONOMIC_CONFLICT', escrowStatus: escrow.status };
-                }
+                    if (!fresh) return { action: 'SKIPPED_GONE' };
+                    if (fresh.status === 'NO_SHOW') return { action: 'ALREADY_NO_SHOW' };
+                    if (fresh.status !== 'CONFIRMED') {
+                        return { action: 'SKIPPED_STATUS', status: fresh.status };
+                    }
 
-                // Booking transition is a conditional claim on the still-true
-                // no-show pre-state (racing check-in/cancellation loses nothing).
-                const claim = await tx.transitBooking.updateMany({
-                    where: {
-                        id: fresh.id,
-                        status: 'CONFIRMED',
-                        checkedInAt: null,
-                        scheduledAt: { lt: graceThreshold },
-                    },
-                    data: {
-                        status: 'NO_SHOW',
-                        penaltyChargedAt: hasPenalty ? new Date() : null,
-                        penaltyAmountUsdc: hasPenalty ? penaltyAmount : null,
-                    },
+                    const escrow = fresh.escrow;
+                    const penaltyPct = fresh.noShowPenaltyPct != null ? Number(fresh.noShowPenaltyPct) : null;
+                    const penaltyFlatUsdc = fresh.noShowPenaltyUsdc != null ? Number(fresh.noShowPenaltyUsdc) : null;
+                    const hasPenalty = (penaltyPct != null && penaltyPct > 0) || (penaltyFlatUsdc != null && penaltyFlatUsdc > 0);
+
+                    if (escrow && CUSTODY_STATES.has(escrow.status)) {
+                        // Funds are in dispute custody — a human owns this escrow.
+                        // Record and leave both rows untouched; the dispute
+                        // resolution owns the economics.
+                        return { action: 'ESCROW_IN_DISPUTE', escrowStatus: escrow.status };
+                    }
+
+                    let escrowEconomicsExecuted = false;
+                    let penaltyAmount = 0;
+                    if (escrow && REFUND_CLAIMABLE.includes(escrow.status)) {
+                        if (hasPenalty) {
+                            // Atomic split-release: escrow RELEASED + balances +
+                            // ledger + booking NO_SHOW claim (CONFIRMED-only)
+                            // all commit together or roll back together.
+                            const split = await _splitReleaseFundedEscrowTx(tx, {
+                                escrowId: escrow.id,
+                                penaltyPct,
+                                penaltyFlatUsdc,
+                                reason: 'Transit no-show sweep',
+                                bookingType: 'TRANSIT',
+                                bookingId: fresh.id,
+                                releaseRef: randomUUID(),
+                                refundRef: randomUUID(),
+                            });
+                            return {
+                                action: 'PENALTY_CHARGED',
+                                penaltyAmount: split.penaltyAmount,
+                                refundAmount: split.refundAmount,
+                                customerId: fresh.customerId,
+                            };
+                        }
+                        // No penalty: the FULL refund is part of the same atomic
+                        // transition — the escrow can never be stranded FUNDED.
+                        await _refundBookingEscrowTx(tx, { escrowId: escrow.id, reference: randomUUID() });
+                        escrowEconomicsExecuted = true;
+                    } else if (escrow && escrow.status === 'DRAFT') {
+                        // Unfunded escrow: expire it in the same transaction.
+                        const expired = await tx.smartEscrow.updateMany({
+                            where: { id: escrow.id, status: 'DRAFT' },
+                            data: { status: 'EXPIRED' },
+                        });
+                        if (expired.count !== 1) return { action: 'ESCROW_STATE_CONFLICT', escrowStatus: escrow.status };
+                        escrowEconomicsExecuted = true;
+                    } else if (escrow && !['REFUNDED', 'EXPIRED'].includes(escrow.status)) {
+                        // SETTLED/RELEASED and friends: economics already moved
+                        // by another authority — never overwrite, flag for humans.
+                        return { action: 'ESCROW_ECONOMIC_CONFLICT', escrowStatus: escrow.status };
+                    }
+
+                    // Booking transition is a conditional claim on the still-true
+                    // no-show pre-state (racing check-in/cancellation loses nothing).
+                    // §r41 third-pass review — LINKAGE-PINNED CLAIM: the pinned
+                    // escrowId (null when this tx saw no escrow) is part of the
+                    // CAS identity. A create/link or funding that commits between
+                    // the fresh read above and this claim changes the booking's
+                    // escrowId; PostgreSQL's EvalPlanQual re-evaluation against
+                    // the newly committed row then FAILS this predicate instead of
+                    // silently winning NO_SHOW with a stale null escrowId — which
+                    // would strand a FUNDED escrow on a NO_SHOW booking. Because
+                    // linkage is strictly one-way (escrowId: null -> E), the claim
+                    // winner's pinned escrowId is provably the FINAL linkage.
+                    const pinnedEscrowId = fresh.escrowId ?? null;
+                    const claim = await tx.transitBooking.updateMany({
+                        where: {
+                            id: fresh.id,
+                            status: 'CONFIRMED',
+                            checkedInAt: null,
+                            scheduledAt: { lt: graceThreshold },
+                            escrowId: pinnedEscrowId,
+                        },
+                        data: {
+                            status: 'NO_SHOW',
+                            penaltyChargedAt: hasPenalty ? new Date() : null,
+                            penaltyAmountUsdc: hasPenalty ? penaltyAmount : null,
+                        },
+                    });
+                    if (claim.count !== 1) {
+                        const now2 = await tx.transitBooking.findUnique({
+                            where: { id: fresh.id },
+                            select: { status: true, escrowId: true },
+                        });
+                        const linkageRaced = now2?.status === 'CONFIRMED'
+                            && (now2?.escrowId ?? null) !== pinnedEscrowId;
+                        if (linkageRaced) {
+                            // pinnedEscrowId was null (an escrow-linked claim
+                            // cannot lose to a linkage change — one-way linkage),
+                            // so THIS tx executed NO escrow economics. Tell the
+                            // per-booking loop to re-read and reprocess once
+                            // through the escrow-first authority.
+                            return { action: 'RETRY_LINKAGE' };
+                        }
+                        // The booking lost to a racing lifecycle actor (check-in,
+                        // cancellation, completion). If THIS tx executed escrow
+                        // economics (refund / split-release / DRAFT expiry above),
+                        // returning would COMMIT that economics without the
+                        // NO_SHOW transition — a stranded-funds defect. THROW so
+                        // the whole transaction rolls back; the racing actor owns
+                        // the booking and its escrow truth.
+                        if (escrowEconomicsExecuted) {
+                            const err = new Error('Booking no-show claim lost after escrow economics — rolled back');
+                            err.code = 'SWEEP_CLAIM_LOST_ROLLED_BACK';
+                            throw err;
+                        }
+                        return { action: 'CLAIM_LOST' };
+                    }
+                    return {
+                        action: 'NO_SHOW_NO_PENALTY',
+                        refundAmount: escrow ? Number(escrow.amountUsdc) : 0,
+                        customerId: fresh.customerId,
+                    };
                 });
-                if (claim.count !== 1) return { action: 'CLAIM_LOST' };
-                return {
-                    action: 'NO_SHOW_NO_PENALTY',
-                    refundAmount: escrow ? Number(escrow.amountUsdc) : 0,
-                    customerId: fresh.customerId,
-                };
-            });
 
+            if (outcome.action !== 'RETRY_LINKAGE' || sweepAttempt === 2) break;
+            }
             if (outcome.action === 'PENALTY_CHARGED') {
                 results.penalized++;
                 results.details.push({
@@ -239,6 +290,14 @@ const sweepNoShowTransitBookings = async (prisma) => {
             // claims — the transaction rolled back and nothing was written.
             // Converge on the committed booking fact instead of reporting a
             // phantom error: the row's real owner keeps authority.
+            if (err && err.code === 'SWEEP_CLAIM_LOST_ROLLED_BACK') {
+                // Convergent rollback: a racing actor (check-in, cancellation,
+                // completion) owns the booking, and this sweep's escrow
+                // economics rolled back whole. Nothing was written — report
+                // the same honest no-op as CLAIM_LOST, not a system error.
+                results.details.push({ id: booking.id, action: 'CLAIM_LOST' });
+                continue;
+            }
             if (err && (err.code === 'ESCROW_ALREADY_FINALIZED' || err.code === 'ESCROW_STATE_CONFLICT')) {
                 const current = await prisma.transitBooking.findUnique({ where: { id: booking.id } });
                 results.details.push({

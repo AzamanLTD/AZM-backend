@@ -336,34 +336,173 @@ run('r41.audit-followup — transit funding/cancellation authority (PostgreSQL)'
         }
     }, 45000);
 
-    test('C2. create/link wins first — cancellation sees the linked escrow through the shared authority, and the leftover DRAFT escrow is UNFUNDABLE on the terminal booking', async () => {
-        const { payer, booking, escrow } = await seedBooking();
+    test('C2a. cancellation stales FIRST — the create/link commits its escrow linkage between the cancellation\'s pinned read and its booking CAS — the linkage-pinned claim loses, re-pins escrow-first, and resolves the raced escrow', async () => {
+        // THE EXACT READ COMMITTED INTERLEAVE (third-pass review):
+        //   1. the gate holds the booking row;
+        //   2. the REAL create/link parks at its booking-link UPDATE (its
+        //      ticket + DRAFT escrow uncommitted in its transaction);
+        //   3. the REAL cancellation starts — its in-tx link read observes
+        //      escrowId = null (the link is NOT committed yet), takes NO
+        //      escrow lock, and its booking CAS queues at position 2;
+        //   4. the gate releases: the create/link COMMITS escrowId = E;
+        //      the cancellation's blocked CAS wakes and PostgreSQL legally
+        //      re-evaluates its WHERE against the NEW committed row.
+        // WITHOUT the fix the old predicate (status only) still matched → the
+        // cancellation won the booking carrying a stale JavaScript escrowId =
+        // null → CANCELLED booking with a silently unreported, still-attached
+        // escrow. WITH the linkage-pinned CAS the re-evaluation FAILS on
+        // escrowId (null → E), the claim loses holding nothing, and the
+        // bounded re-pin loop re-reads the link, locks escrow E FIRST, and
+        // wins the booking with the provably-final linkage.
+        const { biz, owner, payer, booking } = await seedBooking({ linkEscrow: false });
         const { cancelTransitBooking } = require('../services/transitBookingService');
         const before = await userBal(payer.id);
 
-        // The create/link committed first: booking PENDING with a linked DRAFT
-        // escrow. The cancellation runs through the shared escrow authority.
-        const cancel = await cancelTransitBooking(prisma, { bookingId: booking.id, cancelledBy: payer.id });
-        expect(cancel.success).toBe(true);
-        expect(cancel.booking.status).toBe('CANCELLED');
-        expect(cancel.refund.outcome).toBe('NO_FUNDS'); // DRAFT — nothing locked
+        const gate = await gateOn('TransitBooking', booking.id);
+        try {
+            // Queue position 1: the REAL create/link parks at its link UPDATE.
+            const createPromise = escrowService.createBookingEscrow(prisma, {
+                bookingType: 'TRANSIT', bookingId: booking.id,
+                payerId: payer.id, payeeId: owner.id,
+                amountUsdc: 50, businessProfileId: biz.id,
+            }).then((v) => ({ ok: true, v }), (e) => ({ ok: false, e }));
+            await waitForBlocked({ needle: 'UPDATE "public"."TransitBooking"' }); // OBSERVED: create parked, uncommitted link
 
-        // The DRAFT escrow survives (it expires naturally) but is NOT
-        // fundable: the funding fails closed against the terminal booking
-        // before ANY money moves.
-        const fund = await escrowService.fundBookingEscrow(prisma, {
-            escrowId: escrow.id, payerId: payer.id,
+            // Queue position 2: the REAL cancellation. Its link read observes
+            // escrowId = null (stale — the link above is uncommitted) and its
+            // linkage-pinned CAS queues BEHIND the create's link UPDATE.
+            const cancelPromise = cancelTransitBooking(prisma, { bookingId: booking.id, cancelledBy: payer.id })
+                .then((v) => ({ ok: true, v }), (e) => ({ ok: false, e }));
+            await waitForBlocked({ needle: 'UPDATE "public"."TransitBooking"', count: 2 }); // OBSERVED: cancel queued behind the create
+
+            // Release: the create/link COMMITS escrowId = E. The parked CAS
+            // wakes, re-evaluates against the linked row, loses on the pinned
+            // linkage, re-pins escrow-first, and wins the booking.
+            await gate.release();
+            const create = await createPromise;
+            const cancel = await cancelPromise;
+
+            // The legitimate create-first outcome: the aggregate committed.
+            expect(create.ok).toBe(true);
+            const createdEscrowId = create.v.escrow.id;
+
+            // The cancellation wins through the re-pin loop and honestly
+            // resolves the raced escrow (DRAFT → NO_FUNDS, nothing locked).
+            expect(cancel.ok).toBe(true);
+            expect(cancel.v.booking.status).toBe('CANCELLED');
+            expect(cancel.v.refund.outcome).toBe('NO_FUNDS');
+
+            // Linkage is correct and final: CANCELLED booking, linked escrow.
+            const bookingAfter = await prisma.transitBooking.findUnique({ where: { id: booking.id } });
+            expect(bookingAfter.status).toBe('CANCELLED');
+            expect(bookingAfter.escrowId).toBe(createdEscrowId);
+
+            // The raced DRAFT escrow is NOT silently stranded-fundable: the
+            // real funding fails closed against the terminal booking before
+            // ANY money moves.
+            const fund = await escrowService.fundBookingEscrow(prisma, {
+                escrowId: createdEscrowId, payerId: payer.id,
+                bookingType: 'TRANSIT', bookingId: booking.id,
+            }).then((v) => ({ ok: true, v }), (e) => ({ ok: false, e }));
+            expect(fund.ok).toBe(false);
+            expect(fund.e.code).toBe('TRANSIT_FUNDING_CONFLICT');
+
+            // Zero economics: DRAFT never moved money, the losing funding
+            // rolled back its claim.
+            const after = await userBal(payer.id);
+            expect(after.available).toBeCloseTo(before.available, 6);
+            expect(after.locked).toBeCloseTo(0, 6);
+            const escrowAfter = await prisma.smartEscrow.findUnique({ where: { id: createdEscrowId } });
+            expect(escrowAfter.status).toBe('DRAFT');
+            expect(await ledgerCount(createdEscrowId, 'ESCROW_LOCK')).toBe(0);
+            expect(await historyCount(payer.id, 'TICKET_ESCROW_FUND')).toBe(0);
+
+            // No duplicate / orphan ticket: exactly one, tied to the escrow.
+            const tickets = await prisma.ticket.findMany({ where: { creatorId: payer.id } });
+            expect(tickets.length).toBe(1);
+            expect(tickets[0].id).toBe(create.v.ticket.id);
+            // No orphan escrows anywhere for this payer.
+            const escrows = await prisma.smartEscrow.findMany({ where: { payerId: payer.id } });
+            expect(escrows.length).toBe(1);
+        } finally {
+            try { await gate.release(); } catch (_) {}
+        }
+    }, 45000);
+
+    test('C2b. create/link commits FIRST — a racing cancellation and funding then serialize CONCURRENTLY on the linked escrow through the escrow-first authority; the cancellation wins, the funding fails closed, no economics from the loser', async () => {
+        const { biz, owner, payer, booking } = await seedBooking({ linkEscrow: false });
+        const { cancelTransitBooking } = require('../services/transitBookingService');
+        const before = await userBal(payer.id);
+
+        // Legitimate create-first, but through the REAL concurrent window: the
+        // create/link is gated mid-transaction at its booking-link UPDATE and
+        // only then commits — we await the real service promise, no sleep.
+        const gateCreate = await gateOn('TransitBooking', booking.id);
+        const createPromise = escrowService.createBookingEscrow(prisma, {
             bookingType: 'TRANSIT', bookingId: booking.id,
+            payerId: payer.id, payeeId: owner.id,
+            amountUsdc: 50, businessProfileId: biz.id,
         }).then((v) => ({ ok: true, v }), (e) => ({ ok: false, e }));
-        expect(fund.ok).toBe(false);
-        expect(fund.e.code).toBe('TRANSIT_FUNDING_CONFLICT');
+        await waitForBlocked({ needle: 'UPDATE "public"."TransitBooking"' }); // OBSERVED: create parked at its link
+        await gateCreate.release();
+        const create = await createPromise;
+        expect(create.ok).toBe(true);
+        const escrowId = create.v.escrow.id;
+        const bookingLinked = await prisma.transitBooking.findUnique({ where: { id: booking.id } });
+        expect(bookingLinked.escrowId).toBe(escrowId);
+        expect(bookingLinked.status).toBe('PENDING');
 
-        const after = await userBal(payer.id);
-        expect(after.available).toBeCloseTo(before.available, 6);
-        expect(after.locked).toBeCloseTo(0, 6);
-        const escrowAfter = await prisma.smartEscrow.findUnique({ where: { id: escrow.id } });
-        expect(escrowAfter.status).toBe('DRAFT'); // claim rolled back — no FUNDED orphan
-    }, 30000);
+        // Now the concurrent lifecycle race on the linked escrow: the gate
+        // holds escrow E; the REAL cancellation parks on the escrow FOR
+        // UPDATE (position 1, its shared-authority lock); the REAL funding
+        // parks on its DRAFT→FUNDED escrow claim (position 2).
+        const gate = await gateOn('SmartEscrow', escrowId);
+        try {
+            const cancelPromise = cancelTransitBooking(prisma, { bookingId: booking.id, cancelledBy: payer.id })
+                .then((v) => ({ ok: true, v }), (e) => ({ ok: false, e }));
+            await waitForBlocked({ needle: 'SELECT id FROM "SmartEscrow"' }); // OBSERVED: cancel parked on the escrow lock
+
+            const fundPromise = escrowService.fundBookingEscrow(prisma, {
+                escrowId, payerId: payer.id,
+                bookingType: 'TRANSIT', bookingId: booking.id,
+            }).then((v) => ({ ok: true, v }), (e) => ({ ok: false, e }));
+            await waitForBlocked({ needle: 'UPDATE "public"."SmartEscrow"' }); // OBSERVED: funding parked behind the cancellation
+
+            // Release: the cancellation wins the escrow-first authority and
+            // commits CANCELLED + NO_FUNDS; the queued funding wakes to the
+            // committed terminal truth and fails closed.
+            await gate.release();
+            const cancel = await cancelPromise;
+            const fund = await fundPromise;
+
+            expect(cancel.ok).toBe(true);
+            expect(cancel.v.booking.status).toBe('CANCELLED');
+            expect(cancel.v.refund.outcome).toBe('NO_FUNDS'); // the linked DRAFT honestly resolved
+
+            expect(fund.ok).toBe(false);
+            expect(fund.e.code).toBe('TRANSIT_FUNDING_CONFLICT');
+
+            // Terminal state + correct final linkage.
+            const bookingAfter = await prisma.transitBooking.findUnique({ where: { id: booking.id } });
+            expect(bookingAfter.status).toBe('CANCELLED');
+            expect(bookingAfter.escrowId).toBe(escrowId);
+
+            // No economics from the losing funding; balances untouched.
+            const after = await userBal(payer.id);
+            expect(after.available).toBeCloseTo(before.available, 6);
+            expect(after.locked).toBeCloseTo(0, 6);
+            const escrowAfter = await prisma.smartEscrow.findUnique({ where: { id: escrowId } });
+            expect(escrowAfter.status).toBe('DRAFT'); // funding claim rolled back
+            expect(await ledgerCount(escrowId, 'ESCROW_LOCK')).toBe(0);
+            expect(await historyCount(payer.id, 'TICKET_ESCROW_FUND')).toBe(0);
+
+            // Exactly one ticket, tied to the escrow — no duplicate, no orphan.
+            const tickets = await prisma.ticket.findMany({ where: { creatorId: payer.id } });
+            expect(tickets.length).toBe(1);
+        } finally {
+            try { await gate.release(); } catch (_) {}
+        }
+    }, 45000);
 
     // ═══════════════════════════════════════════════════════════════════════
     // D. LINKAGE + CONVERGENCE CONTRACTS (sequential, no race needed)

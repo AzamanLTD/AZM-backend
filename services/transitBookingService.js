@@ -268,29 +268,62 @@ const cancelTransitBooking = async (prisma, { bookingId, cancelledBy, note } = {
         //    the authorization read and this claim — cancelling against a
         //    stale null escrowId would strand a funded escrow on a CANCELLED
         //    booking.
-        const freshLink = await tx.transitBooking.findUnique({
-            where: { id: bookingId },
-            select: { escrowId: true },
-        });
-        const escrowId = freshLink?.escrowId ?? null;
-        if (escrowId) {
-            await tx.$executeRaw`SELECT id FROM "SmartEscrow" WHERE "id" = ${escrowId} FOR UPDATE`;
-        }
+        // §r41 third-pass review — LINKAGE-PINNED CAS + bounded re-pin loop.
+        //
+        // The READ COMMITTED hazard: a fresh link read can observe escrowId =
+        // null while a createBookingEscrow holds the booking row with an
+        // uncommitted escrowId link. The cancellation's booking CAS then
+        // BLOCKS on that row, wakes when the link commits, and PostgreSQL
+        // legally re-evaluates the CAS WHERE against the NEW committed row
+        // version (EvalPlanQual) — status is still PENDING, so the old CAS
+        // won the booking while the JavaScript-side escrowId stayed null:
+        // CANCELLED booking with a silently unreported, still-attached
+        // escrow (a FUNDED link would strand customer money).
+        //
+        // Structural fix: the pinned escrowId is part of the CAS identity —
+        // `where: { id, status in CANCELLABLE, escrowId: pinned }`. Under
+        // re-evaluation the raced link (escrowId null -> E) fails the
+        // predicate and the CAS loses. Because linkage is strictly one-way
+        // (the create/link path requires escrowId: null), the CAS WINNER's
+        // pinned escrowId is provably the FINAL linkage.
+        //
+        // On a linkage-raced loss the claim held NOTHING (a failed
+        // re-evaluation releases the row, and the pinned-null variant never
+        // took an escrow lock), so re-pinning — read link, lock escrow FIRST,
+        // CAS again — is deadlock-free by construction: while we hold the
+        // escrow row, no competing lifecycle writer can hold the booking row
+        // (they all need the escrow first). Bounded; the one-way linkage makes
+        // more than one retry unreachable in practice.
+        const MAX_LINKAGE_PIN_ATTEMPTS = 3;
+        let escrowId = null;
+        let claim = null;
+        for (let attempt = 1; ; attempt++) {
+            const freshLink = await tx.transitBooking.findUnique({
+                where: { id: bookingId },
+                select: { escrowId: true },
+            });
+            escrowId = freshLink?.escrowId ?? null;
+            if (escrowId) {
+                await tx.$executeRaw`SELECT id FROM "SmartEscrow" WHERE "id" = ${escrowId} FOR UPDATE`;
+            }
 
-        // 1. CAS claim from the authoritative cancellable set. count 0 means a
-        //    racing actor already moved the booking — re-read and converge.
-        const claim = await tx.transitBooking.updateMany({
-            where: { id: bookingId, status: { in: CANCELLABLE_STATUSES } },
-            data: {
-                status: 'CANCELLED',
-                ...(note != null ? { driverNote: note } : {}),
-            },
-        });
+            // 1. CAS claim from the authoritative cancellable set, WITH the
+            //    pinned linkage in the predicate. count 0 means a racing actor
+            //    moved the booking OR the linkage raced a create/link —
+            //    re-read, converge, or re-pin.
+            claim = await tx.transitBooking.updateMany({
+                where: { id: bookingId, status: { in: CANCELLABLE_STATUSES }, escrowId },
+                data: {
+                    status: 'CANCELLED',
+                    ...(note != null ? { driverNote: note } : {}),
+                },
+            });
 
-        if (claim.count === 0) {
+            if (claim.count === 1) break; // authoritative winner
+
             const current = await tx.transitBooking.findUnique({
                 where: { id: bookingId },
-                select: { status: true },
+                select: { status: true, escrowId: true },
             });
             if (current?.status === 'CANCELLED') {
                 // Idempotent convergence: another cancellation already won.
@@ -308,6 +341,21 @@ const cancelTransitBooking = async (prisma, { bookingId, cancelledBy, note } = {
                         },
                     }),
                 };
+            }
+            const linkageRaced = CANCELLABLE_STATUSES.includes(current?.status)
+                && (current?.escrowId ?? null) !== escrowId;
+            if (linkageRaced && attempt < MAX_LINKAGE_PIN_ATTEMPTS) {
+                // A create/link committed a fresh escrow between the pin read
+                // and this CAS. Nothing is held — re-pin through the shared
+                // escrow-first order and claim again.
+                continue;
+            }
+            if (linkageRaced) {
+                throw new TransitCancellationError(
+                    'LINKAGE_CONFLICT',
+                    'Booking escrow linkage changed while cancelling. Retry.',
+                    409
+                );
             }
             throw new TransitCancellationError(
                 'NOT_CANCELLABLE',
