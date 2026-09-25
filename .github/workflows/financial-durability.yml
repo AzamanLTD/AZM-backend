@@ -180,6 +180,14 @@ jobs:
             "__tests__/withdrawal-fee-discount-atomicity.test.js"
             "__tests__/business-invoice-payment-concurrency.test.js"
             "__tests__/payroll-ewa-settlement.db.test.js"
+            # §r41 final-audit proofs — real-PostgreSQL DB-boundary authority
+            # races (escrow terminal states, business-OS finance, AZM economy).
+            # PG-backed, so they belong in this production-commit-mode lane.
+            # The r41 payout-parking suite is unit-only (mocked tx) and stays
+            # in the main battery lane.
+            "__tests__/r41-escrow-terminal-authority.pg.test.js"
+            "__tests__/r41-business-os-authority.pg.test.js"
+            "__tests__/r41-azm-economy-authority.pg.test.js"
           )
           npx jest --runInBand --forceExit "${SUITES[@]}"
 

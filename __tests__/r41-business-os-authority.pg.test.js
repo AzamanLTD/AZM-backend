@@ -227,21 +227,58 @@ run('r41 — business-OS finance authority (PostgreSQL)', () => {
         expect(after.status).toBe('VOIDED');
     });
 
-    test('B2. a send that commits first blocks void — the SENT invoice stands', async () => {
+    test('B2. send-commits-first interleave: a void parked mid-transaction on the row lock re-evaluates against committed SENT truth — no phantom states', async () => {
         const { biz, invoice } = await seedInvoice('DRAFT');
 
-        const sent = await sendInvoice(prisma, { invoiceId: invoice.id, businessProfileId: biz.id });
-        expect(sent.status).toBe('SENT');
+        // A REAL deterministic row-lock interleave, not a sequential
+        // send-then-void: the gate holds the invoice row; the REAL send
+        // queues first on the lock; the REAL void queues second with a
+        // stale DRAFT pre-read. Releasing the gate makes the send's
+        // DRAFT→SENT claim commit, and only then does the parked void's
+        // (DRAFT|SENT) claim re-evaluate against the NEW committed row —
+        // proving the void path reads committed truth under the row lock,
+        // not its stale pre-read.
+        let gateTaken; const gateOpen = new Promise((r) => { gateTaken = r; });
+        let gateRelease; const gateHold = new Promise((r) => { gateRelease = r; });
+        const txGate = prisma.$transaction(async (tx) => {
+            await tx.$queryRaw`SELECT id FROM "BusinessInvoice" WHERE "id" = ${invoice.id} FOR UPDATE`;
+            gateTaken();
+            await gateHold;
+        }, { timeout: 30000 });
+        await gateOpen; // gate owns the invoice row
 
-        // Delayed void with a stale DRAFT pre-read: its claim
-        // (status in DRAFT/SENT) still wins — void from SENT is legal.
-        const voided = await voidInvoice(prisma, { invoiceId: invoice.id, businessProfileId: biz.id });
-        expect(voided.status).toBe('VOIDED');
+        // Position 1 in the lock queue: the REAL send.
+        const sendPromise = sendInvoice(prisma, { invoiceId: invoice.id, businessProfileId: biz.id })
+            .then((v) => ({ ok: true, v }), (e) => ({ ok: false, e }));
+        await new Promise((r) => setTimeout(r, 300)); // send parked on the row lock, uncommitted
 
-        // But a SECOND void (already VOIDED) converges idempotently.
+        // Position 2 in the lock queue: the REAL void, its pre-read still
+        // sees the committed DRAFT (stale by construction).
+        const voidPromise = voidInvoice(prisma, { invoiceId: invoice.id, businessProfileId: biz.id })
+            .then((v) => ({ ok: true, v }), (e) => ({ ok: false, e }));
+        await new Promise((r) => setTimeout(r, 300)); // void parked behind the send
+
+        // Release: the send commits FIRST (SENT), then the void acquires
+        // the row and re-evaluates: SENT is legally voidable, and the void
+        // converges on the committed truth — never on a phantom state.
+        gateRelease(); await txGate;
+        const sent = await sendPromise;
+        const voided = await voidPromise;
+
+        expect(sent.ok).toBe(true);
+        expect(sent.v.status).toBe('SENT');
+        expect(voided.ok).toBe(true);
+        expect(voided.v.status).toBe('VOIDED');
+
+        const after = await prisma.businessInvoice.findUnique({ where: { id: invoice.id } });
+        expect(after.status).toBe('VOIDED');
+        const rows = await prisma.businessInvoice.findMany({ where: { id: invoice.id } });
+        expect(rows.length).toBe(1); // exactly one row, one lifecycle
+
+        // Duplicate same-target void converges idempotently on VOIDED.
         const again = await voidInvoice(prisma, { invoiceId: invoice.id, businessProfileId: biz.id });
         expect(again.status).toBe('VOIDED');
-    });
+    }, 45000);
 
     test('B3. a payment that commits first can never be voided — INVOICE_ALREADY_PAID, money state intact', async () => {
         const { biz, invoice } = await seedInvoice('SENT');
@@ -409,6 +446,176 @@ run('r41 — business-OS finance authority (PostgreSQL)', () => {
         expect(bal.available).toBeCloseTo(before.available + 50, 6);
         expect(bal.locked).toBe(0);
     });
+
+    // ── C8-C10. The DANGEROUS interleave: cancellation and the no-show sweep
+    // compete for the same booking+escrow pair in OPPOSITE lock orders.
+    // Canonical order (r41 audit-followup): EVERY escrow-backed transit
+    // lifecycle operation takes the ESCROW row lock first, then the booking.
+    // Both directions below drive the REAL service paths (real
+    // cancelTransitBooking, real sweepNoShowTransitBookings) through gated
+    // parking points built ONLY from PostgreSQL row locks — no sleeps decide
+    // the interleaving, they only let each transaction REACH its park point.
+    // A pre-fix cancellation claims the booking row first and the sweep the
+    // escrow row first: these interleaves form the AB-BA cycle and deadlock.
+    // ─────────────────────────────────────────────────────────────────────
+
+    const { cancelTransitBooking } = require('../services/transitBookingService');
+
+    test('C8. sweep holds the escrow authority first — a racing cancellation blocks BEFORE claiming the booking and converges (sweep wins)', async () => {
+        const { payer, escrow, booking } = await seedTransitBooking('FUNDED');
+        const before = await userBal(payer.id);
+
+        // GATE 1 — hold the BOOKING row so the sweep parks between its
+        // escrow claim and its booking claim, HOLDING the escrow lock.
+        let lockTaken; const lockA = new Promise((r) => { lockTaken = r; });
+        let commitA; const releaseA = new Promise((r) => { commitA = r; });
+        const txA = prisma.$transaction(async (tx) => {
+            await tx.$queryRaw`SELECT id FROM "TransitBooking" WHERE "id" = ${booking.id} FOR UPDATE`;
+            lockTaken();
+            await releaseA;
+        }, { timeout: 30000 });
+
+        await lockA; // the booking row is pinned by the gate
+
+        // The REAL sweep: fresh reads pass (CONFIRMED + FUNDED), the escrow
+        // claim locks the ESCROW row, then its booking claim parks on GATE 1.
+        const sweepPromise = sweepNoShowTransitBookings(prisma);
+        await new Promise((r) => setTimeout(r, 500)); // sweep parked: holds ESCROW, wants BOOKING
+
+        // The REAL cancellation (post-fix lock order): it takes the escrow
+        // FOR UPDATE FIRST — and blocks on the sweep's escrow lock BEFORE
+        // touching the booking row. Pre-fix it would have claimed the
+        // booking row (pinned by nobody at this instant) and then blocked on
+        // the escrow — the AB-BA cycle.
+        const cancelPromise = cancelTransitBooking(prisma, { bookingId: booking.id, cancelledBy: payer.id })
+            .then((v) => ({ ok: true, v }), (e) => ({ ok: false, e }));
+        await new Promise((r) => setTimeout(r, 500)); // cancel parked on the escrow lock
+
+        // Release the booking gate: the sweep (already holding the escrow)
+        // completes NO_SHOW + refund atomically and commits.
+        commitA(); await txA;
+        const results = await sweepPromise;
+        const cancel = await cancelPromise;
+
+        // The sweep won the escrow authority — its transition stands.
+        expect(results.errors).toBe(0);
+        const detail = results.details.find((d) => d.id === booking.id);
+        expect(detail.action).toBe('NO_SHOW_NO_PENALTY');
+
+        // The cancellation lost the race and reports HONEST failure — no
+        // phantom success, no stale CANCELLED over a committed NO_SHOW.
+        expect(cancel.ok).toBe(false);
+        expect(cancel.e.code).toBe('NOT_CANCELLABLE');
+        expect(cancel.e.httpStatus).toBe(409);
+
+        const after = await prisma.transitBooking.findUnique({ where: { id: booking.id } });
+        expect(after.status).toBe('NO_SHOW');
+        const escrowAfter = await prisma.smartEscrow.findUnique({ where: { id: escrow.id } });
+        expect(escrowAfter.status).toBe('REFUNDED');
+
+        // Exactly ONE refund — the payer's money moved exactly once.
+        const bal = await userBal(payer.id);
+        expect(bal.available).toBeCloseTo(before.available + 50, 6);
+        expect(bal.locked).toBe(0);
+    }, 45000);
+
+    test('C9. cancellation holds the escrow authority first — the stale sweep rolls back whole and converges on CANCELLED (cancel wins)', async () => {
+        const { payer, escrow, booking } = await seedTransitBooking('FUNDED');
+        const before = await userBal(payer.id);
+
+        // GATE — hold the ESCROW row so the cancellation parks at its
+        // (post-fix) FIRST lock acquisition, holding nothing.
+        let lockTaken; const lockA = new Promise((r) => { lockTaken = r; });
+        let commitA; const releaseA = new Promise((r) => { commitA = r; });
+        const txA = prisma.$transaction(async (tx) => {
+            await tx.$queryRaw`SELECT id FROM "SmartEscrow" WHERE "id" = ${escrow.id} FOR UPDATE`;
+            lockTaken();
+            await releaseA;
+        }, { timeout: 30000 });
+
+        await lockA; // the escrow row is pinned by the gate
+
+        // The REAL cancellation: parks on the escrow FOR UPDATE (its first
+        // lock), holding NOTHING — the fix's whole point.
+        const cancelPromise = cancelTransitBooking(prisma, { bookingId: booking.id, cancelledBy: payer.id });
+        await new Promise((r) => setTimeout(r, 500)); // cancel parked FIRST in the escrow lock queue
+
+        // The REAL sweep: fresh reads pass (CONFIRMED + FUNDED), its escrow
+        // claim parks BEHIND the cancellation in the same lock queue.
+        const sweepPromise = sweepNoShowTransitBookings(prisma);
+        await new Promise((r) => setTimeout(r, 500)); // sweep parked: holds NOTHING, queued on ESCROW
+
+        // Release: the cancellation is first in the queue — it wins the
+        // escrow deterministically, claims the booking (CONFIRMED→CANCELLED),
+        // refunds, and commits. The sweep then wakes to REFUNDED: its escrow
+        // claim fails, the WHOLE no-show transition rolls back, and the
+        // worker converges on the committed CANCELLED fact.
+        commitA(); await txA;
+        const cancel = await cancelPromise;
+        const results = await sweepPromise;
+
+        expect(cancel.success).toBe(true);
+        expect(cancel.booking.status).toBe('CANCELLED');
+        expect(cancel.refund.outcome).toBe('REFUNDED');
+
+        expect(results.errors).toBe(0);
+        const detail = results.details.find((d) => d.id === booking.id);
+        expect(detail.action).toBe('SKIPPED_STATUS');
+        expect(detail.status).toBe('CANCELLED');
+
+        // No stale NO_SHOW over a committed cancellation.
+        const after = await prisma.transitBooking.findUnique({ where: { id: booking.id } });
+        expect(after.status).toBe('CANCELLED');
+        const escrowAfter = await prisma.smartEscrow.findUnique({ where: { id: escrow.id } });
+        expect(escrowAfter.status).toBe('REFUNDED');
+
+        // Exactly ONE refund — the sweep's rolled-back refund left no trace.
+        const bal = await userBal(payer.id);
+        expect(bal.available).toBeCloseTo(before.available + 50, 6);
+        expect(bal.locked).toBe(0);
+    }, 45000);
+
+    test('C10. un-gated true-concurrency race, repeated — either winner, always exactly one lifecycle outcome and one refund, never a deadlock', async () => {
+        // True simultaneous start, no gates: whichever transaction wins the
+        // escrow authority completes; the loser converges. Repeated to catch
+        // order sensitivity. Pre-fix, this is the raw AB-BA race — PostgreSQL's
+        // deadlock detector would kill one transaction (40P01); post-fix the
+        // shared escrow-first order makes the cycle impossible.
+        for (let round = 0; round < 3; round++) {
+            const { payer, escrow, booking } = await seedTransitBooking('FUNDED');
+            const before = await userBal(payer.id);
+
+            const [cancelRes, sweepRes] = await Promise.all([
+                cancelTransitBooking(prisma, { bookingId: booking.id, cancelledBy: payer.id })
+                    .then((v) => ({ ok: true, v }), (e) => ({ ok: false, e })),
+                sweepNoShowTransitBookings(prisma),
+            ]);
+
+            // Exactly ONE lifecycle winner.
+            const after = await prisma.transitBooking.findUnique({ where: { id: booking.id } });
+            expect(['NO_SHOW', 'CANCELLED']).toContain(after.status);
+
+            const escrowAfter = await prisma.smartEscrow.findUnique({ where: { id: escrow.id } });
+            expect(escrowAfter.status).toBe('REFUNDED');
+
+            // Exactly ONE refund, whatever the interleaving.
+            const bal = await userBal(payer.id);
+            expect(bal.available).toBeCloseTo(before.available + 50, 6);
+            expect(bal.locked).toBe(0);
+
+            // Both sides report honestly, no phantom errors.
+            if (cancelRes.ok) {
+                expect(cancelRes.v.booking.status).toBe('CANCELLED');
+                expect(after.status).toBe('CANCELLED');
+            } else {
+                expect(cancelRes.e.code).toBe('NOT_CANCELLABLE');
+                expect(after.status).toBe('NO_SHOW');
+            }
+            expect(sweepRes.errors).toBe(0);
+            const detail = sweepRes.details.find((d) => d.id === booking.id);
+            expect(detail.action).not.toMatch(/ERROR/i);
+        }
+    }, 60000);
 
     test('C3. penalty no-show: escrow split-released, payee credited penalty, payer refunded remainder — one transaction', async () => {
         const { payer, escrow, booking } = await seedTransitBooking('FUNDED', { noShowPenaltyPct: 0.5 });

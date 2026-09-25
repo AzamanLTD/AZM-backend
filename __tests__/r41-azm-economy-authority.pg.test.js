@@ -127,72 +127,93 @@ run('r41 — AZM economy authority (PostgreSQL)', () => {
 
     // ── B. Stale bid writers vs settlement ───────────────────────────────
 
-    test('B1. settle-vs-place: a stale placeBid cannot add/reactivate a bid on the settled auction', async () => {
+    test('B1. settle-vs-place: the window closes UNDER a bid parked mid-transaction — the locked re-check fails closed and settlement owns the row', async () => {
         const vendor = await seedVendor(100);
         const ad = await seedAd(vendor.id);
         const auction = await svc().ensureOpen();
-
-        // Deterministic interleave: hold the auction row lock with the
-        // window CLOSED so a racing placeBid blocks inside its transaction,
-        // then settlement commits and the stale bid must lose.
         const s = svc();
         const bid = await s.placeBid({ vendorId: vendor.id, adId: ad.id, amountAzm: 10 });
         expect(bid.status).toBe('ACTIVE');
 
-        // Force the window closed so settle() is eligible.
-        await prisma.azmAuction.update({
-            where: { id: auction.id },
-            data: { windowEnd: new Date(Date.now() - 1000) },
-        });
-
-        // Stale placeBid: its pre-reads pass, but it blocks on the auction
-        // row lock held by an in-flight settlement.
-        let lockTaken; const lockA = new Promise((r) => { lockTaken = r; });
-        let commitA; const releaseA = new Promise((r) => { commitA = r; });
-        const txA = prisma.$transaction(async (tx) => {
+        // The gate holds the authoritative auction row. The lock QUEUE is
+        // the interleave mechanism — FIFO arrivals, no sleep decides
+        // anything: the window-closer queues FIRST, the bid SECOND.
+        let gateTaken; const gateOpen = new Promise((r) => { gateTaken = r; });
+        let gateRelease; const gateHold = new Promise((r) => { gateRelease = r; });
+        const txGate = prisma.$transaction(async (tx) => {
             await tx.$executeRaw`SELECT id FROM "AzmAuction" WHERE "id" = ${auction.id} FOR UPDATE`;
-            lockTaken();
-            await releaseA;
-        }, { timeout: 20000 });
+            gateTaken();
+            await gateHold;
+        }, { timeout: 30000 });
+        await gateOpen;
 
-        await lockA; // A holds the auction row lock
+        // Position 1 in the row-lock queue: the window closer, UNCOMMITTED.
+        // While it is parked the bid's ensureOpen read (plain, READ
+        // COMMITTED) still sees the OPEN window — exactly the stale pre-read
+        // the locked re-check exists to defend against.
+        const txClose = prisma.$transaction(async (tx) => {
+            await tx.azmAuction.update({
+                where: { id: auction.id },
+                data: { windowEnd: new Date(Date.now() - 1000) },
+            });
+        }, { timeout: 30000 });
+        const closePromise = txClose.then(() => {}, () => {});
+        await new Promise((r) => setTimeout(r, 300)); // closer parked behind the gate
 
+        // Position 2 in the queue: the REAL placeBid service path, launched
+        // while the window close is still uncommitted. Its ensureOpen
+        // targeted THIS auction (stale pre-read passed); it parks inside its
+        // transaction on the auction row lock.
         const staleBid = s.placeBid({ vendorId: vendor.id, adId: ad.id, amountAzm: 20 })
             .then((v) => ({ ok: true, v }), (e) => ({ ok: false, e }));
-        await new Promise((r) => setTimeout(r, 300)); // bid blocked mid-transaction
+        await new Promise((r) => setTimeout(r, 300)); // bid parked behind the closer
 
-        // Meanwhile the real settlement commits (advisory-lock ensureOpen in
-        // placeBid can't run inside A's held window — it waits on the same
-        // row via the auction lock ordering, so run settle AFTER A commits).
-        commitA(); // release A so the bid's blocked lock acquisition proceeds
-        await txA;
-        const settleOutcome = await s.settle(auction.id);
-        expect(settleOutcome.auctionId).toBe(auction.id);
-
+        // Release: the closer commits (window past), THEN the bid acquires
+        // the authoritative row and re-verifies from the LOCKED committed
+        // truth — the window closed under it. It must FAIL CLOSED: the
+        // amount-20 upsert never runs, no reactivation, no rewrite.
+        gateRelease(); await closePromise;
         const outcome = await staleBid;
 
-        // The stale bid either failed (settled auction / final bids) or, if
-        // it snuck through before settlement, its row must remain a legal
-        // settlement input. In every interleaving the invariant is: the
-        // settled auction's audit rows are never corrupted.
-        const settled = await prisma.azmAuction.findUnique({ where: { id: auction.id } });
-        expect(settled.status).toBe('SETTLED');
+        expect(outcome.ok).toBe(false);
+        expect(outcome.e.message).toBe('Auction is settling');
+
+        // The bid row was never rewritten by the stale writer.
+        const bidStill = await prisma.azmAuctionBid.findUnique({
+            where: { auctionId_vendorId: { auctionId: auction.id, vendorId: vendor.id } },
+        });
+        expect(bidStill.status).toBe('ACTIVE');
+        expect(Number(bidStill.bidAmountAzm)).toBe(10);
+
+        // The settlement then wins the authoritative row and commits — the
+        // stale loser's economics never happened.
+        const settled = await s.settle(auction.id);
+        expect(settled.auctionId).toBe(auction.id);
+        const auctionAfter = await prisma.azmAuction.findUnique({ where: { id: auction.id } });
+        expect(auctionAfter.status).toBe('SETTLED');
 
         const bids = await prisma.azmAuctionBid.findMany({ where: { auctionId: auction.id } });
-        if (outcome.ok) {
-            // The bid committed BEFORE the settlement claim: it participated
-            // as a candidate. The settlement burned it (single bidder → WON).
-            expect(bids.length).toBe(1);
-            expect(['WON', 'LOST']).toContain(bids[0].status);
-            expect(outcome.v.status).toBe('ACTIVE'); // its return value was pre-settlement truth
-        } else {
-            // The bid lost the race: no resurrection, no reactivation.
-            expect(['Auction is settling', 'Bids are final after settlement'])
-                .toContain(outcome.e.message);
-        }
-        // AZM burned exactly the winner's amount — never the stale loser's.
-        expect(bids.every((b) => ['WON', 'LOST'].includes(b.status))).toBe(true);
-    });
+        expect(bids.length).toBe(1);
+        expect(bids[0].status).toBe('WON');
+        expect(Number(bids[0].bidAmountAzm)).toBe(10);
+        expect(Number(bids[0].azmBurned)).toBe(10);
+
+        // AZM burned exactly ONCE — the winner's 10, never the stale 20,
+        // never twice, nothing refunded.
+        const vendorAfter = await prisma.user.findUnique({
+            where: { id: vendor.id }, select: { azmBalance: true },
+        });
+        expect(vendorAfter.azmBalance.toFixed()).toBe('90');
+        const winLogs = await prisma.azmSpendLog.count({
+            where: { userId: vendor.id, source: 'AD_AUCTION_BID' },
+        });
+        expect(winLogs).toBe(1);
+
+        // And the bid/settlement pair serialized through the SAME database
+        // authority: by the time settlement claimed the row, no writer could
+        // reach the auction's bids except through its own transaction.
+        expect(outcome.ok).toBe(false); // the parked writer lost to committed truth
+    }, 45000);
 
     test('B2. post-settlement placeBid fails closed — the WON/LOST settlement record is never rewritten', async () => {
         const vendor = await seedVendor(100);
@@ -232,49 +253,134 @@ run('r41 — AZM economy authority (PostgreSQL)', () => {
         expect(settledAuctionBids.every((b) => b.status !== 'ACTIVE')).toBe(true);
     });
 
-    test('B3. post-settlement withdrawBid NEVER deletes the WON settlement audit row (AZM already burned)', async () => {
-        const vendor = await seedVendor(100);
-        const ad = await seedAd(vendor.id);
-        const s = svc();
-        const auction = await s.ensureOpen();
-        await s.placeBid({ vendorId: vendor.id, adId: ad.id, amountAzm: 10 });
-        await prisma.azmAuction.update({
-            where: { id: auction.id },
-            data: { windowEnd: new Date(Date.now() - 1000) },
-        });
-        await s.settle(auction.id);
+    test('B3. stale withdrawBid NEVER deletes the WON/LOST settlement audit rows — real service path, both interleavings', async () => {
+        // ── Part A: the window CLOSES while a withdraw is parked inside its
+        // transaction, between its ensureOpen read and its ACTIVE-only
+        // delete. The committed truth is re-verified from the LOCKED row and
+        // the withdrawal fails closed — the delete never runs.
+        {
+            const vendor = await seedVendor(100);
+            const ad = await seedAd(vendor.id);
+            const s = svc();
+            const auction = await s.ensureOpen();
+            await s.placeBid({ vendorId: vendor.id, adId: ad.id, amountAzm: 10 });
 
-        const balBefore = await prisma.user.findUnique({
-            where: { id: vendor.id }, select: { azmBalance: true },
-        });
+            // Gate holds the auction row. The window-closer queues FIRST,
+            // the withdraw SECOND — deterministic lock-queue order.
+            let gateTaken; const gateOpen = new Promise((r) => { gateTaken = r; });
+            let gateRelease; const gateHold = new Promise((r) => { gateRelease = r; });
+            const txGate = prisma.$transaction(async (tx) => {
+                await tx.$executeRaw`SELECT id FROM "AzmAuction" WHERE "id" = ${auction.id} FOR UPDATE`;
+                gateTaken();
+                await gateHold;
+            }, { timeout: 30000 });
+            await gateOpen;
 
-        // Stale withdraw on the SETTLED auction: ensureOpen returns a NEW
-        // auction (old one is SETTLED), so the withdraw targets the new
-        // window and the settlement audit survives untouched.
-        await expect(s.withdrawBid({ vendorId: vendor.id })).resolves.toBeTruthy();
+            // Window-closer: uncommitted while queued, so the withdraw's
+            // ensureOpen read still sees the OPEN window.
+            const txClose = prisma.$transaction(async (tx) => {
+                await tx.azmAuction.update({
+                    where: { id: auction.id },
+                    data: { windowEnd: new Date(Date.now() - 1000) },
+                });
+            }, { timeout: 30000 });
+            const closePromise = txClose.then(() => {}, () => {});
+            await new Promise((r) => setTimeout(r, 300)); // closer queued first on the row lock
 
-        const audit = await prisma.azmAuctionBid.findUnique({
-            where: { auctionId_vendorId: { auctionId: auction.id, vendorId: vendor.id } },
-        });
-        expect(audit).toBeTruthy();
-        expect(audit.status).toBe('WON');
+            // The REAL withdrawBid service path: ensureOpen read the OPEN
+            // auction (targets THIS auction), parks on the auction row lock
+            // behind the window-closer.
+            const withdraw = s.withdrawBid({ vendorId: vendor.id })
+                .then((v) => ({ ok: true, v }), (e) => ({ ok: false, e }));
+            await new Promise((r) => setTimeout(r, 300)); // withdraw queued second
 
-        // And directly against the settled auction id — simulate the stale
-        // caller by deleting through the service's ACTIVE-only predicate:
-        const direct = await prisma.azmAuctionBid.deleteMany({
-            where: { auctionId: auction.id, vendorId: vendor.id, status: 'ACTIVE' },
-        });
-        expect(direct.count).toBe(0); // the WON row is invisible to the claim
-        const stillThere = await prisma.azmAuctionBid.findUnique({
-            where: { auctionId_vendorId: { auctionId: auction.id, vendorId: vendor.id } },
-        });
-        expect(stillThere.status).toBe('WON');
+            // Release: closer commits (window past), withdraw acquires the
+            // row, re-verifies from the LOCKED committed row → fails closed.
+            gateRelease(); await closePromise;
+            const outcome = await withdraw;
 
-        const balAfter = await prisma.user.findUnique({
-            where: { id: vendor.id }, select: { azmBalance: true },
-        });
-        expect(balAfter.azmBalance.toFixed()).toBe(balBefore.azmBalance.toFixed()); // no double burn, no refund
-    });
+            expect(outcome.ok).toBe(false);
+            expect(outcome.e.message).toBe('Auction is settling');
+
+            // The bid was NOT deleted by the withdraw — settlement owns it now.
+            const bidStill = await prisma.azmAuctionBid.findUnique({
+                where: { auctionId_vendorId: { auctionId: auction.id, vendorId: vendor.id } },
+            });
+            expect(bidStill).toBeTruthy();
+            expect(bidStill.status).toBe('ACTIVE'); // withdraw never reached its delete
+
+            // The settlement then commits: WON audit, single burn.
+            const settled = await s.settle(auction.id);
+            expect(settled.auctionId).toBe(auction.id);
+            const audit = await prisma.azmAuctionBid.findUnique({
+                where: { auctionId_vendorId: { auctionId: auction.id, vendorId: vendor.id } },
+            });
+            expect(audit.status).toBe('WON');
+            const vendorAfter = await prisma.user.findUnique({
+                where: { id: vendor.id }, select: { azmBalance: true },
+            });
+            expect(vendorAfter.azmBalance.toFixed()).toBe('90'); // burned once, no refund, no double burn
+        }
+
+        // ── Part B: a withdraw parked BEFORE its ensureOpen (on the shared
+        // advisory lock) while the settlement FULLY commits. It wakes to a
+        // SETTLED world, converges to the next OPEN window (nothing to
+        // withdraw there) and the WON audit row survives untouched.
+        {
+            const vendor = await seedVendor(100);
+            const ad = await seedAd(vendor.id);
+            const s = svc();
+            const auction = await s.ensureOpen();
+            await s.placeBid({ vendorId: vendor.id, adId: ad.id, amountAzm: 10 });
+            await prisma.azmAuction.update({
+                where: { id: auction.id },
+                data: { windowEnd: new Date(Date.now() - 1000) },
+            });
+
+            // Hold the ENSURE-OPEN advisory lock: the withdraw parks before
+            // it reads anything. The settlement does not need that lock.
+            const { AzmAuctionService: S } = require('../services/azmAuctionService');
+            let gateTaken; const gateOpen = new Promise((r) => { gateTaken = r; });
+            let gateRelease; const gateHold = new Promise((r) => { gateRelease = r; });
+            const txGate = prisma.$transaction(async (tx) => {
+                await tx.$executeRaw`SELECT pg_advisory_xact_lock(${S.ENSURE_OPEN_LOCK_KEY})`;
+                gateTaken();
+                await gateHold;
+            }, { timeout: 30000 });
+            await gateOpen;
+
+            // The REAL withdrawBid: parked inside the service on the
+            // advisory lock, mid-flight, holding nothing.
+            const withdraw = s.withdrawBid({ vendorId: vendor.id });
+            await new Promise((r) => setTimeout(r, 400));
+
+            // The REAL settlement commits fully underneath it.
+            const settled = await s.settle(auction.id);
+            expect(settled.auctionId).toBe(auction.id);
+
+            gateRelease(); await txGate;
+            const result = await withdraw; // converges: next OPEN window has nothing to withdraw
+            expect(result.count).toBe(0);
+
+            // The WON audit row on the settled auction survives — the stale
+            // withdrawal could never reach it through the service path.
+            const audit = await prisma.azmAuctionBid.findUnique({
+                where: { auctionId_vendorId: { auctionId: auction.id, vendorId: vendor.id } },
+            });
+            expect(audit).toBeTruthy();
+            expect(audit.status).toBe('WON');
+
+            // AZM burned exactly once — no double burn, no refund.
+            const vendorAfter = await prisma.user.findUnique({
+                where: { id: vendor.id }, select: { azmBalance: true },
+            });
+            expect(vendorAfter.azmBalance.toFixed()).toBe('90');
+            const winLogs = await prisma.azmSpendLog.count({
+                where: { userId: vendor.id, source: 'AD_AUCTION_BID' },
+            });
+            expect(winLogs).toBe(1);
+        }
+    }, 60000);
 
     test('B4. concurrent placeBids of the same vendor converge to one bid row on the same auction', async () => {
         const vendor = await seedVendor(1000);

@@ -251,6 +251,32 @@ const cancelTransitBooking = async (prisma, { bookingId, cancelledBy, note } = {
     }
 
     return prisma.$transaction(async (tx) => {
+        // 0. §r41.audit-followup — SHARED AUTHORITATIVE LOCK ORDER: every
+        //    escrow-backed transit lifecycle operation (escrow funding, the
+        //    no-show sweep's refund/split-release/DRAFT expiry, business
+        //    no-show settlement) takes the ESCROW row lock first, then the
+        //    booking row. Cancellation previously claimed the booking row
+        //    first and only touched the escrow afterwards — the exact
+        //    inverted order against the no-show sweep, an AB-BA deadlock
+        //    pair on the two hot rows. Lock the escrow row FIRST so every
+        //    competing lifecycle operation serializes through the same
+        //    escrow authority; the booking CAS below then runs strictly
+        //    after the escrow is pinned.
+        //
+        //    The escrowId is re-read INSIDE the transaction: the pre-read
+        //    `booking.escrowId` can be stale if an escrow was linked between
+        //    the authorization read and this claim — cancelling against a
+        //    stale null escrowId would strand a funded escrow on a CANCELLED
+        //    booking.
+        const freshLink = await tx.transitBooking.findUnique({
+            where: { id: bookingId },
+            select: { escrowId: true },
+        });
+        const escrowId = freshLink?.escrowId ?? null;
+        if (escrowId) {
+            await tx.$executeRaw`SELECT id FROM "SmartEscrow" WHERE "id" = ${escrowId} FOR UPDATE`;
+        }
+
         // 1. CAS claim from the authoritative cancellable set. count 0 means a
         //    racing actor already moved the booking — re-read and converge.
         const claim = await tx.transitBooking.updateMany({
@@ -304,9 +330,11 @@ const cancelTransitBooking = async (prisma, { bookingId, cancelledBy, note } = {
 
         // 3. Escrow resolution through the canonical refund economic identity
         //    (same tx). Any refund/ledger failure rolls back EVERYTHING above.
+        //    Uses the FRESH escrowId pinned in step 0 — never the stale
+        //    pre-read link.
         let refund = null;
-        if (booking.escrowId) {
-            const escrow = await tx.smartEscrow.findUnique({ where: { id: booking.escrowId } });
+        if (escrowId) {
+            const escrow = await tx.smartEscrow.findUnique({ where: { id: escrowId } });
             if (escrow && REFUND_CLAIMABLE.includes(escrow.status)) {
                 const reference = randomUUID();
                 await _refundBookingEscrowTx(tx, { escrowId: escrow.id, reference });
