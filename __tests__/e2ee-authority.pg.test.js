@@ -561,11 +561,18 @@ run('E2EE server-blind authority (real PostgreSQL)', () => {
         // that rotation retired underneath it).
         let release;
         const gate = new Promise((resolve) => { release = resolve; });
+        let signalLockHeld;
+        const lockHeld = new Promise((resolve) => { signalLockHeld = resolve; });
         const heldClaim = db.$transaction(async (tx) => {
             await tx.$queryRaw`SELECT "id" FROM "E2EEDevice" WHERE "userId" = ${alice.id} AND "isActive" = true FOR UPDATE`;
+            signalLockHeld(); // PROVE the device row lock is held before racing
             await gate; // hold the device row lock — claim in flight
             return 'held';
         }, { timeout: 15000 });
+        // CI latency (connection pool startup under load) can delay the
+        // transaction past the whole observation window — wait for the lock
+        // itself, not for a timer, so the proof stays deterministic.
+        await lockHeld;
 
         // Rotation (A → B) and a concurrent service-level claim both fire
         // while the lock is held: both MUST block on the device row.
@@ -624,8 +631,11 @@ run('E2EE server-blind authority (real PostgreSQL)', () => {
         // registerDevice performs), then pauses before commit.
         let release;
         const gate = new Promise((resolve) => { release = resolve; });
+        let signalLockHeld;
+        const lockHeld = new Promise((resolve) => { signalLockHeld = resolve; });
         const heldRotation = db.$transaction(async (tx) => {
             await tx.e2eeDevice.updateMany({ where: { userId: alice.id, isActive: true }, data: { isActive: false } });
+            signalLockHeld(); // A's row lock is taken — prove it before racing
             await tx.e2eeDevice.create({
                 data: { userId: alice.id, deviceId: 'device-recheck-bbb',
                     signingPublicKey: bPayload.signingPublicKey,
@@ -649,6 +659,7 @@ run('E2EE server-blind authority (real PostgreSQL)', () => {
         // snapshot predates B — so the claim FAILS CLOSED (null → 404), the
         // only safe answer. It can NEVER serve the retired device A, and a
         // retried claim sees the new device.
+        await lockHeld; // wait for the lock itself, not a timer
         const claimP = svc.fetchBundle(alice.id, { claimantId: bob.id });
         let claimDone = false;
         claimP.then(() => { claimDone = true; });
