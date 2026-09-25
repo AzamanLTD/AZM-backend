@@ -321,12 +321,12 @@ class PayoutBatchWorker {
             const amount = Number(withdrawal.amount);
 
             if (amount > maxAmount) {
-                await this._flagForManualReview(withdrawal, 'AMOUNT_EXCEEDS_THRESHOLD', {
+                const parked = await this._parkForManualReview(withdrawal, 'AMOUNT_EXCEEDS_THRESHOLD', {
                     amount,
                     maxAmount,
                     message: `Withdrawal $${amount} exceeds auto-approve max ($${maxAmount})`
                 });
-                results.flaggedManualReview.push({ id: withdrawal.id, reason: 'AMOUNT_EXCEEDS_THRESHOLD', amount });
+                if (parked) results.flaggedManualReview.push({ id: withdrawal.id, reason: 'AMOUNT_EXCEEDS_THRESHOLD', amount });
                 continue;
             }
 
@@ -337,21 +337,21 @@ class PayoutBatchWorker {
                     : canonical.ambiguous
                         ? 'AMBIGUOUS_TRANSACTION_REFERENCE'
                         : 'MISSING_TRANSACTION_REFERENCE';
-                await this._flagForManualReview(withdrawal, reason, {
+                const parked = await this._parkForManualReview(withdrawal, reason, {
                     amount,
                     message: 'Auto-payout refused because the canonical pending withdrawal transaction could not be identified uniquely.'
                 });
-                results.flaggedManualReview.push({ id: withdrawal.id, reason, amount });
+                if (parked) results.flaggedManualReview.push({ id: withdrawal.id, reason, amount });
                 continue;
             }
 
             const recipientPhone = withdrawal.destination;
             if (!recipientPhone || recipientPhone === 'OLD_RECORD') {
-                await this._flagForManualReview(withdrawal, 'MISSING_RECIPIENT_PHONE', {
+                const parked = await this._parkForManualReview(withdrawal, 'MISSING_RECIPIENT_PHONE', {
                     amount,
                     message: 'No recipient phone number on withdrawal record'
                 });
-                results.flaggedManualReview.push({ id: withdrawal.id, reason: 'MISSING_RECIPIENT_PHONE', amount });
+                if (parked) results.flaggedManualReview.push({ id: withdrawal.id, reason: 'MISSING_RECIPIENT_PHONE', amount });
                 continue;
             }
 
@@ -394,13 +394,13 @@ class PayoutBatchWorker {
                     new Prisma.Decimal(threshold).times(liveRate).toFixed(2)
                 );
                 if (remainingLiquidityGhs.lt(thresholdGhs)) {
-                    await this._flagForManualReview(withdrawal, 'AUTHORITY_HEADROOM_BELOW_THRESHOLD', {
+                    const parked = await this._parkForManualReview(withdrawal, 'AUTHORITY_HEADROOM_BELOW_THRESHOLD', {
                         amount,
                         availableGhs: remainingLiquidityGhs.toString(),
                         thresholdGhs: thresholdGhs.toString(),
                         message: `Operational hold: remaining authoritative GHS liquidity (${remainingLiquidityGhs.toFixed(2)}) below the configured payout floor (${thresholdGhs.toFixed(2)})`
                     });
-                    results.flaggedManualReview.push({ id: withdrawal.id, reason: 'AUTHORITY_HEADROOM_BELOW_THRESHOLD', amount, availableGhs: remainingLiquidityGhs.toString() });
+                    if (parked) results.flaggedManualReview.push({ id: withdrawal.id, reason: 'AUTHORITY_HEADROOM_BELOW_THRESHOLD', amount, availableGhs: remainingLiquidityGhs.toString() });
                     continue;
                 }
             } else {
@@ -410,13 +410,13 @@ class PayoutBatchWorker {
                 // legacy projection ONLY and is never an authority input.
                 const poolBalanceNow = await ensureLegacyPool();
                 if (poolBalanceNow < threshold || poolBalanceNow < amount) {
-                    await this._flagForManualReview(withdrawal, 'INSUFFICIENT_POOL_LIQUIDITY', {
+                    const parked = await this._parkForManualReview(withdrawal, 'INSUFFICIENT_POOL_LIQUIDITY', {
                         amount,
                         poolBalance: poolBalanceNow,
                         threshold,
                         message: `Fiat pool ($${poolBalanceNow.toFixed(2)}) below threshold ($${threshold}) or insufficient for $${amount}`
                     });
-                    results.flaggedManualReview.push({ id: withdrawal.id, reason: 'INSUFFICIENT_POOL_LIQUIDITY', amount, poolBalance: poolBalanceNow });
+                    if (parked) results.flaggedManualReview.push({ id: withdrawal.id, reason: 'INSUFFICIENT_POOL_LIQUIDITY', amount, poolBalance: poolBalanceNow });
                     continue;
                 }
             }
@@ -748,12 +748,32 @@ class PayoutBatchWorker {
         }
     }
 
-    async _flagForManualReview(withdrawal, reason, metadata = {}) {
+    // §r41 — AUTHORITATIVE PARKING CLAIM (final-audit: stale manual-review
+    // writer). Parking a withdrawal for manual review is a CONDITIONAL claim
+    // on the withdrawal row, never an unconditional write: the scan that
+    // selected the row is a stale snapshot, and a second worker may have
+    // claimed the row PROCESSING (or a terminal state may have committed)
+    // since. Terminal states are NEVER stale-overwritten — the claim simply
+    // loses and does nothing (the row's real owner keeps authority).
+    // Returns true when the flag landed.
+    async _claimForManualReview(withdrawal, reason, metadata, claimableStatuses) {
         try {
-            await this.prisma.withdrawal.update({
-                where: { id: withdrawal.id },
+            const claim = await this.prisma.withdrawal.updateMany({
+                where: { id: withdrawal.id, status: { in: claimableStatuses } },
                 data: { status: 'NEEDS_MANUAL_REVIEW' }
             });
+            if (claim.count === 0) {
+                const current = await this.prisma.withdrawal.findUnique({
+                    where: { id: withdrawal.id },
+                    select: { status: true }
+                }).catch(() => null);
+                logger.info(
+                    `[PayoutBatchWorker] skip flag #${withdrawal.id} (${reason}) — row is ` +
+                    `${current ? current.status : 'GONE'}, not ${claimableStatuses.join('/')} ` +
+                    `(a concurrent worker or terminal state owns it — stale scan does nothing)`
+                );
+                return false;
+            }
 
             if (this.notificationService) {
                 await this.notificationService.sendNotification({
@@ -766,9 +786,28 @@ class PayoutBatchWorker {
             }
 
             logger.info(`[PayoutBatchWorker] flagged withdrawal #${withdrawal.id} → NEEDS_MANUAL_REVIEW (${reason})`);
+            return true;
         } catch (err) {
             logger.error(`[PayoutBatchWorker] failed to flag withdrawal #${withdrawal.id}:`, err.message);
+            return false;
         }
+    }
+
+    // PRE-DISPATCH eligibility parking — PENDING only. The row was selected
+    // from a PENDING scan; if another worker already claimed it PROCESSING,
+    // or it reached any other state, this parking does NOTHING (no
+    // notification either — the user's withdrawal is being handled by its
+    // real owner, and a stale reviewer must not tell them otherwise).
+    async _parkForManualReview(withdrawal, reason, metadata = {}) {
+        return this._claimForManualReview(withdrawal, reason, metadata, ['PENDING']);
+    }
+
+    // POST-DISPATCH exception parking — PROCESSING → NEEDS_MANUAL_REVIEW
+    // stays intentionally allowed: the claim was won, provider I/O ran, and
+    // a post-dispatch failure must park the row for humans. Terminal states
+    // (COMPLETED/FAILED/...) can never be stale-overwritten by this path.
+    async _flagForManualReview(withdrawal, reason, metadata = {}) {
+        return this._claimForManualReview(withdrawal, reason, metadata, ['PROCESSING']);
     }
 
     async _getSettings() {
