@@ -201,6 +201,22 @@ run('r42 — shared financial idempotency authority (PostgreSQL)', () => {
     const seedWallet = async (userId, currency, balance) =>
         prisma.currencyWallet.create({ data: { userId, currency, balance } });
 
+    // Post-response bookkeeping (COMMIT / RELEASE / RETAIN) is deliberately
+    // fire-and-forget: a bookkeeping crash only degrades replays to the safe
+    // 409 refusal — it can never corrupt economics. Assertions therefore
+    // observe the CONVERGENCE of the claim row instead of racing the
+    // bookkeeping write: bounded DB polling, never sleeps.
+    const waitForClaim = async (userId, endpoint, key, want = 'COMMITTED') => {
+        const deadline = Date.now() + 5000;
+        for (;;) {
+            const where = endpoint ? { userId, endpoint, key } : { userId, key };
+            const rows = await prisma.financialOperation.findMany({ where });
+            const ok = want === 'RELEASED' ? rows.length === 0 : rows.some((r) => r.status === want);
+            if (ok || Date.now() > deadline) return rows;
+            await new Promise((r) => setTimeout(r, 25));
+        }
+    };
+
     const seedUserRow = async () => (await seedUser(prisma)).id;
 
     // ── P1 + P2 — the unique INSERT is the arbiter under real concurrency ──
@@ -277,9 +293,7 @@ run('r42 — shared financial idempotency authority (PostgreSQL)', () => {
             const loser = a.status === 409 ? a : b;
             expect(loser.body.code).toBe('IDEMPOTENCY_IN_PROGRESS');
 
-            const ops = await prisma.financialOperation.findMany({
-                where: { userId, endpoint: 'POST /spend', key: `round-${i}` },
-            });
+            const ops = await waitForClaim(userId, 'POST /spend', `round-${i}`);
             expect(ops.length).toBe(1);
             expect(ops[0].status).toBe('COMMITTED');
             const winner = a.status === 200 ? a : b; // the unique INSERT decides — either caller may win
@@ -294,6 +308,7 @@ run('r42 — shared financial idempotency authority (PostgreSQL)', () => {
 
         const first = await drive('/spend', { user: userId, key: 'replay-1', body: { walletId: wallet.id, amount: 10 } });
         expect(first.status).toBe(200);
+        await waitForClaim(userId, 'POST /spend', 'replay-1'); // observe COMMIT before replaying
 
         const before = executionCounter;
         const replay = await drive('/spend', { user: userId, key: 'replay-1', body: { walletId: wallet.id, amount: 10 } });
@@ -311,6 +326,7 @@ run('r42 — shared financial idempotency authority (PostgreSQL)', () => {
 
         const first = await drive('/spend', { user: userId, key: 'fp-1', body: { walletId: wallet.id, amount: 10 } });
         expect(first.status).toBe(200);
+        await waitForClaim(userId, 'POST /spend', 'fp-1'); // conflict reads the COMMITTED claim
 
         for (const changedBody of [
             { walletId: wallet.id, amount: 11 },       // different amount (number)
@@ -337,6 +353,8 @@ run('r42 — shared financial idempotency authority (PostgreSQL)', () => {
         const r2 = await drive('/spend', { user: u2, key: 'shared-key', body: { walletId: w2.id, amount: 5 } });
         expect(r1.status).toBe(200);
         expect(r2.status).toBe(200); // no cross-user replay — independent scopes
+        await waitForClaim(u1, 'POST /spend', 'shared-key');
+        await waitForClaim(u2, 'POST /spend', 'shared-key');
 
         // each replay stays within its own user scope
         const re1 = await drive('/spend', { user: u1, key: 'shared-key', body: { walletId: w1.id, amount: 10 } });
@@ -356,6 +374,7 @@ run('r42 — shared financial idempotency authority (PostgreSQL)', () => {
         expect(v1.status).toBe(200);
 
         // the /spend replay must NOT return the /fail-validation response (or vice versa)
+        await waitForClaim(userId, 'POST /spend', 'cross-ep');
         const re = await drive('/spend', { user: userId, key: 'cross-ep', body: { walletId: wallet.id, amount: 10 } });
         expect(re.status).toBe(200);
         expect(re.body).toEqual(s1.body);
@@ -378,6 +397,7 @@ run('r42 — shared financial idempotency authority (PostgreSQL)', () => {
         expect(done.status).toBe(200);
 
         // observed claim state: now COMMITTED, replay returns the result
+        await waitForClaim(userId, 'POST /hang', 'inflight-1');
         const replay = await drive('/hang', { user: userId, key: 'inflight-1', body: {} });
         expect(replay.status).toBe(200);
         expect(replay.body).toEqual(done.body);
@@ -390,7 +410,7 @@ run('r42 — shared financial idempotency authority (PostgreSQL)', () => {
         const bad = await drive('/fail-validation', { user: userId, key: 'val-1', body: { ok: false } });
         expect(bad.status).toBe(400);
 
-        const ops = await prisma.financialOperation.findMany({ where: { userId, key: 'val-1' } });
+        const ops = await waitForClaim(userId, null, 'val-1', 'RELEASED');
         expect(ops.length).toBe(0); // released — nothing committed
 
         const good = await drive('/fail-validation', { user: userId, key: 'val-1', body: { ok: true } });
@@ -428,7 +448,7 @@ run('r42 — shared financial idempotency authority (PostgreSQL)', () => {
         const midBalance = await prisma.currencyWallet.findUnique({ where: { id: wallet.id } });
         expect(Number(midBalance.balance)).toBeCloseTo(100, 8); // the debit ROLLED BACK
 
-        const ops = await prisma.financialOperation.findMany({ where: { userId, key: 'rb-1' } });
+        const ops = await waitForClaim(userId, null, 'rb-1', 'RELEASED');
         expect(ops.length).toBe(0); // released — provably nothing committed
 
         const retry = await drive('/spend', { user: userId, key: 'rb-1', body: { walletId: wallet.id, amount: 10 } });
@@ -466,6 +486,7 @@ run('r42 — shared financial idempotency authority (PostgreSQL)', () => {
 
         const first = await drive('/spend', { user: userId, key: 'old-1', body: { walletId: wallet.id, amount: 10 } });
         expect(first.status).toBe(200);
+        await waitForClaim(userId, 'POST /spend', 'old-1'); // permanence reads the COMMITTED claim
 
         // Backdate the committed operation beyond the retired 24h cache TTL —
         // simulating an age-pruned response cache. The identity is permanent.
