@@ -112,27 +112,13 @@ exports.initiateTrade = async (req, res) => {
             return res.status(400).json({ success: false, message: 'Trade amount exceeds maximum allowed.' });
         }
 
-        // HIGH-12: Idempotency protection — prevent duplicate trades from retries
-        if (idempotencyKey) {
-            const existingTrade = await prisma.trade.findFirst({
-                where: {
-                    userId,
-                    createdAt: { gte: new Date(Date.now() - 60_000) }, // within last 60s
-                    amountCrypto: parseFloat(amountCrypto),
-                    amountFiat: parseFloat(amountFiat)
-                },
-                select: { id: true }
-            });
-            if (existingTrade) {
-                return res.status(200).json({
-                    success: true,
-                    queued: false,
-                    duplicate: true,
-                    message: 'Trade already initiated (idempotent response).',
-                    trade: { id: existingTrade.id }
-                });
-            }
-        }
+        // §r42 — duplicate-trade protection is the durable shared idempotency
+        // authority (FinancialOperation claim, userId+endpoint+key unique).
+        // The HIGH-12 heuristic this replaces was a check-then-act findFirst on
+        // (userId, same amounts, last 60s) — it protected nothing under
+        // concurrency (both racing requests passed the lookup) and could
+        // reject a legitimate second trade with identical amounts inside the
+        // window.
 
         const ad = await prisma.ad.findUnique({
             where:   { id: parseInt(adId) },

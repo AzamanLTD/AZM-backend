@@ -9,7 +9,7 @@ const protect = authMiddleware.protect;
 router.get('/wallets',            protect, mc.getWallets);
 router.post('/wallets',           protect, mc.createWallet);
 router.patch('/wallets/default',  protect, mc.setDefaultWallet);
-router.post('/convert',           protect, idempotency(), mc.convertCurrency);
+router.post('/convert',           protect, idempotency({ failurePolicy: 'RELEASE' }), mc.convertCurrency);
 router.get('/rates',              protect, mc.getRates);
 router.put('/rates',              protect, mc.updateFxRate);
 
