@@ -161,7 +161,8 @@ describe('Idempotency middleware (r42 contract)', () => {
         const committed = {
             status: 'COMMITTED', statusCode: 200,
             fingerprint: fingerprintOf(mockReqRes({ 'idempotency-key': 'committed-key' }).req),
-            responseBody: { success: true, tradeId: 42 },
+            // §r42 byte-fidelity: the claim stores the serialized WIRE text
+            responseBody: JSON.stringify({ success: true, tradeId: 42 }),
         };
         const { req, res, next } = mockReqRes({ 'idempotency-key': 'committed-key' });
         // findUnique returns the committed row regardless of fingerprint match
@@ -178,7 +179,8 @@ describe('Idempotency middleware (r42 contract)', () => {
         await idempotency()(req, res, next);
         expect(next).not.toHaveBeenCalled(); // handler NOT invoked
         expect(res.statusCode).toBe(200);
-        expect(res._json).toEqual(committed.responseBody); // byte-identical replay
+        expect(res._json).toEqual({ success: true, tradeId: 42 }); // byte-identical replay
+        expect(JSON.stringify(res._json)).toBe(committed.responseBody); // ...literally, as bytes
     });
 
     test('refuses a duplicate while the first is IN_PROGRESS — deterministic 409', async () => {
@@ -286,6 +288,6 @@ describe('Idempotency middleware (r42 contract)', () => {
         const claim = Object.values(rows)[0];
         expect(claim.status).toBe('COMMITTED');
         expect(claim.statusCode).toBe(200);
-        expect(claim.responseBody).toEqual({ success: true, handler: 'ran' });
+        expect(claim.responseBody).toBe(JSON.stringify({ success: true, handler: 'ran' })); // WIRE text
     });
 });

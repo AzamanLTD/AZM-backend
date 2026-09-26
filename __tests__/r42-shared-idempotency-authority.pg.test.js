@@ -195,7 +195,7 @@ run('r42 — shared financial idempotency authority (PostgreSQL)', () => {
                     const op = res.locals?.financialOperation;
                     const committed = await tx.financialOperation.updateMany({
                         where: { id: op.id, status: 'IN_PROGRESS' },
-                        data: { status: 'COMMITTED', statusCode: 200, responseBody: body },
+                        data: { status: 'COMMITTED', statusCode: 200, responseBody: JSON.stringify(body) },
                     });
                     if (committed.count !== 1) {
                         const err = new Error('IDEMPOTENCY_STATE_CONFLICT'); err.code = 'IDEMPOTENCY_STATE_CONFLICT'; throw err;
@@ -357,7 +357,9 @@ run('r42 — shared financial idempotency authority (PostgreSQL)', () => {
             expect(ops.length).toBe(1);
             expect(ops[0].status).toBe('COMMITTED');
             const winner = a.status === 200 ? a : b; // the unique INSERT decides — either caller may win
-            expect(ops[0].responseBody).toEqual(winner.body); // the committed result is the delivered 200
+            // the committed result is the delivered 200 — stored as the exact
+            // WIRE bytes (§r42 byte-fidelity: TEXT column, key order preserved)
+            expect(ops[0].responseBody).toBe(JSON.stringify(winner.body));
         }
     }, 45000);
 
@@ -827,7 +829,8 @@ run('r42 — shared financial idempotency authority (PostgreSQL)', () => {
             where: { userId_endpoint_key: { userId, endpoint: 'POST /api/multi-currency/convert', key: 'mc-1' } },
         });
         expect(op.status).toBe('COMMITTED');
-        expect(op.responseBody).toEqual(winner.body);
+        // stored as the exact WIRE bytes of the delivered 200 (§r42 byte-fidelity)
+        expect(op.responseBody).toBe(JSON.stringify(winner.body));
 
         // replay after the committed success → the same conversionId, zero economics
         const replay = await driveConvert({ userId, key: 'mc-1', body });

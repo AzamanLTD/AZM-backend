@@ -131,6 +131,11 @@ on replay).
 - `FinancialOperation` — created by `infra/install-r42-idempotency-overlay.js`
   (idempotent DDL, mirrors the release chain); added to `npm run release`,
   the main CI test lane, and the financial-durability lane install steps.
+  `responseBody` is **TEXT**, not JSONB: JSONB reorders object keys on read,
+  so a JSONB-stored replay body would be JSON-equivalent but not
+  byte-identical to the original response. The column stores the exact
+  serialized WIRE bytes (see Follow-up 3); the installer converges any
+  earlier PR-era JSONB column idempotently with `ALTER ... TYPE TEXT`.
 
 ## 6. Proofs (real PostgreSQL)
 
@@ -253,7 +258,7 @@ mount uses it.
 
 ### Route inventory re-verification (review P1)
 
-All 40+ `idempotency()` mounts were re-checked. Standing disposition:
+All 39 `idempotency()` mounts were re-checked (independently re-counted by the reviewer). Standing disposition:
 every mount now requires the key; `releaseOn4xx` only on the one
 genuinely wired route (`/api/multi-currency/convert`, re-verified from
 route → controller → in-tx claim transition); trade initiation's false
@@ -271,3 +276,70 @@ retries after a crash (409 IN_PROGRESS; never a second mutation) — the client
 must use a new key after confirming operation state. Extending the wired
 in-transaction pattern to the remaining endpoints is the follow-up wave
 (section 7), now with withdrawal as the highest-priority candidate.
+
+
+## 9. Follow-up 3 — merge cleanliness + literal byte-level replay fidelity (2026-09-26)
+
+Reviewer verdict: core P0 fixed and independently verified; two
+merge-cleanliness items plus one proof-tightening item. All executed.
+
+### 9.1 — probe-r40.js removed
+
+The unrelated ad-hoc database probe committed alongside `2d8ea9e` has no
+package.json/CI reference and no production purpose; it is deleted, not
+replaced.
+
+### 9.2 — replay fidelity is now LITERALLY byte-identical
+
+Tightening the T2 regression to assert serialized-string equality (not
+just parsed-JSON structural equality) exposed a second real defect: the
+claim stored `responseBody` in a **JSONB** column, and PostgreSQL JSONB
+does not preserve object key order. Replays were JSON-equivalent but the
+final HTTP bytes differed from the original response (jsonb canonical key
+order). Fixes, end to end:
+
+- `FinancialOperation.responseBody` is `TEXT` (schema + overlay installer,
+  with an idempotent converging `ALTER` for any earlier PR-era JSONB
+  install).
+- The middleware captures `JSON.stringify(body)` — the exact wire bytes
+  `res.json` would have produced (Prisma Decimal's `toJSON` serialization
+  included).
+- The committed replay re-emits those bytes exactly: `res.json(JSON.parse(stored))`
+  round-trips to the identical string (JSON parse preserves key order).
+- The wired in-transaction claim commit in `multiCurrencyController` stores
+  the same wire-text form, so wired and post-response captures are
+  byte-consistent.
+- T2 asserts `replay.wire === winner.wire` — literal serialized-bytes
+  equality — on top of the Decimal/string structural regression.
+
+### 9.3 — response-boundary audit (review item 4): no bypass paths
+
+Every production `idempotency()` mount (39, enumerated from the route
+files) was traced to its handler and the handler body scanned for response
+paths that bypass the middleware's wrapped `res.json` (`res.send`,
+`res.end`, `res.sendStatus`, `res.sendFile`, `res.download`, `res.redirect`,
+`res.write`). Result: **39/39 handlers respond exclusively through
+`res.json`** — the wrapped bookkeeping path — so a claim can never be left
+IN_PROGRESS by a bypassing response writer on these routes. The only
+`res.send` users in the codebase (CSV export in `adminRbacController`,
+PDF receipts in `receiptController`) sit on routes with **no idempotency
+mount**, so no claim can strand there either. Availability/replay-contract
+risk: none found; nothing left to fix or document per-route.
+
+### 9.4 — PR description corrected
+
+The PR body previously stated trade initiation commits the claim
+in-transaction and is a wired `releaseOn4xx` route. Both statements are
+false. The final truth, consistent with this document:
+
+- `/api/multi-currency/convert` is the ONLY currently wired
+  in-transaction FinancialOperation route (its `releaseOn4xx` declaration
+  is backed by the in-tx claim transition).
+- `/api/trades/initiate` is UNWIRED and uses conservative RETAIN
+  semantics; it clears `res.locals.financialClaimRelease` immediately
+  before its economic transaction (proven pre-economics guards may release
+  earlier), and post-transaction/post-commit failures retain the claim —
+  same-key retries receive 409.
+- The independent route sweep found exactly **39 `idempotency()` mounts**
+  in `routes/`, **0** production `required: false` mounts, and **1**
+  `releaseOn4xx` declaration.

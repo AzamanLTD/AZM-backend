@@ -23,11 +23,14 @@ const STATEMENTS = [
     "fingerprint"   TEXT NOT NULL,
     "failurePolicy" TEXT NOT NULL DEFAULT 'RETAIN',
     "statusCode"    INTEGER,
-    "responseBody"  JSONB,
+    "responseBody"  TEXT,
     "createdAt"     TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "updatedAt"     TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
     CONSTRAINT "FinancialOperation_pkey" PRIMARY KEY ("id")
   );`,
+  // §r42 byte-fidelity: converge any existing install that created the
+  // column as JSONB (key-reordering storage) to TEXT (wire-text storage).
+  `ALTER TABLE "FinancialOperation" ALTER COLUMN "responseBody" TYPE TEXT`,
   `CREATE UNIQUE INDEX IF NOT EXISTS "FinancialOperation_userId_endpoint_key_key"
     ON "FinancialOperation"("userId", "endpoint", "key");`,
   `CREATE INDEX IF NOT EXISTS "FinancialOperation_createdAt_idx"

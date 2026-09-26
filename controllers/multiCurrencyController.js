@@ -248,7 +248,9 @@ async function convertCurrency(req, res) {
           data: {
             status: 'COMMITTED',
             statusCode: 200,
-            responseBody: response,
+            // §r42 byte-fidelity: the claim column is TEXT — store the WIRE
+            // serialization so the replay re-emits the exact response bytes.
+            responseBody: JSON.stringify(response),
           },
         });
         if (committed.count !== 1) {

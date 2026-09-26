@@ -75,7 +75,13 @@ run('r42 — trade initiation idempotency regression (PostgreSQL)', () => {
                 app, locals: {}, statusCode: 200, headersSent: false,
                 status(c) { this.statusCode = c; return this; },
                 json(b) {
-                    if (!this.headersSent) { this.headersSent = true; resolve({ status: this.statusCode, body: b }); }
+                    if (!this.headersSent) {
+                        this.headersSent = true;
+                        // `wire` = the exact bytes express would put on the
+                        // HTTP body: res.json serializes with a plain
+                        // JSON.stringify and no replacer.
+                        resolve({ status: this.statusCode, body: b, wire: JSON.stringify(b) });
+                    }
                     return this;
                 },
                 setHeader() {},
@@ -185,6 +191,13 @@ run('r42 — trade initiation idempotency regression (PostgreSQL)', () => {
         const replay = await drive({ user: buyer.id, key: 'ti-2', body: payload });
         expect(replay.status).toBe(201);
         expect(JSON.parse(JSON.stringify(replay.body))).toEqual(JSON.parse(JSON.stringify(winner.body)));
+        // Literal serialized-response equality: the replay's final HTTP
+        // bytes are EXACTLY the original's final HTTP bytes — a string
+        // comparison, not a structural one. This is the strict form of the
+        // replay-fidelity contract (the Decimal regression above catches
+        // the raw-object storage defect; this catches any residual
+        // divergence in the serialized representation).
+        expect(replay.wire).toBe(winner.wire);
         expect(await prisma.trade.count({ where: { userId: buyer.id } })).toBe(1);
     }, 20000);
 

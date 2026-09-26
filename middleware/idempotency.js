@@ -209,7 +209,14 @@ function idempotency(options = {}) {
                     }
                     // Committed replay: the derived response convenience.
                     return res.status(existing.statusCode)
-                        .json(existing.responseBody);
+                        // responseBody is stored as the serialized WIRE
+                        // text; parse + re-stringify inside res.json
+                        // reproduces the original response bytes exactly
+                        // (key order included — the reason the column is
+                        // TEXT, not key-reordering JSONB).
+                        .json(existing.responseBody == null
+                            ? existing.responseBody
+                            : JSON.parse(existing.responseBody));
                 }
                 // IN_PROGRESS: another caller owns the operation right now, or
                 // the owner crashed after claiming (possibly after committing —
@@ -254,14 +261,15 @@ function idempotency(options = {}) {
                         data: {
                             status: OPERATION_COMMITTED,
                             statusCode,
-                            // Store the WIRE form, not the raw object:
+                            // Store the WIRE text, not the raw object:
                             // res.json(body) serializes Prisma Decimal via
-                            // toJSON → "50" (string), while Prisma's
-                            // JSON-column write would store the raw Decimal
-                            // as a number. Normalizing here makes the replay
-                            // byte-identical to the original response (the
-                            // r42 replay-fidelity contract).
-                            responseBody: JSON.parse(JSON.stringify(body)),
+                            // toJSON → "50" (string), while a raw-object
+                            // store would lose that string form. The claim
+                            // column is TEXT, so the replay re-emits the
+                            // exact original response bytes — key order
+                            // included (a JSONB column would reorder keys
+                            // and break byte-identical replay).
+                            responseBody: JSON.stringify(body),
                         },
                     }).catch((e) => logger.warn(
                         { err: e.message, operationId: claim.id },

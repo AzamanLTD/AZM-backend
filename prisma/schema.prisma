@@ -6001,7 +6001,10 @@ model FinancialOperation {
   fingerprint   String // sha256 of the canonical request (exact-decimal preserving)
   failurePolicy String   @default("RETAIN") // RETAIN | RELEASE — behavior on 5xx
   statusCode    Int?
-  responseBody  Json?
+  // §r42 byte-fidelity: stored as the serialized WIRE text, not JSONB —
+  // JSONB reorders object keys on read, which would make the committed
+  // replay JSON-equivalent but NOT byte-identical to the original response.
+  responseBody  String?
   createdAt     DateTime @default(now())
   updatedAt     DateTime @updatedAt
 
