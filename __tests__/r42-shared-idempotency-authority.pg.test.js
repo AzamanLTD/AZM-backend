@@ -645,9 +645,12 @@ run('r42 — shared financial idempotency authority (PostgreSQL)', () => {
             drive('/spend-commit-then-400', { user: userId, key: 'cc-1', body: { walletId: wallet.id, amount: 10 } }),
         ]);
         const statuses = results.map((r) => r.status).sort();
-        expect(statuses[0]).toBe(400); // the claim owner's post-commit failure
-        expect(statuses.slice(1)).toEqual([409, 409]); // duplicates NEVER entered economics
-        expect(results.slice(1).every((r) => r.body.code === 'IDEMPOTENCY_IN_PROGRESS')).toBe(true);
+        expect(statuses).toEqual([400, 409, 409]); // owner's post-commit failure + 2 refusals
+        // The owner is whichever concurrent promise won the claim INSERT —
+        // NEVER assume it is results[0] (scheduler order is not a fact).
+        const owner = results.find((r) => r.status === 400);
+        const duplicates = results.filter((r) => r !== owner);
+        expect(duplicates.every((r) => r.body.code === 'IDEMPOTENCY_IN_PROGRESS')).toBe(true);
         expect(Number((await prisma.currencyWallet.findUnique({ where: { id: wallet.id } })).balance)).toBeCloseTo(90, 8); // ONE debit
         const ops = await prisma.financialOperation.findMany({ where: { userId, key: 'cc-1' } });
         expect(ops.length).toBe(1);
