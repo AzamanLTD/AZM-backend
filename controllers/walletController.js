@@ -244,6 +244,58 @@ exports.requestWithdrawal = async (req, res) => {
 exports.requestWithdrawal.openapi = { summary: "Request a withdrawal", description: "Initiates a withdrawal from the user trade account to a payout destination.", tags: ["wallet", "withdrawal"] };
 
 /**
+ * 2a. GET WITHDRAWAL STATUS — the smallest user-facing status surface for
+ * the saved-wallet payout queue (r42 integration wave).
+ *
+ * POST /wallet/withdraw creates the Withdrawal queue row and returns the
+ * ACCEPTED record; payout workers own dispatch afterwards and emit nothing
+ * user-facing (admin_alert only). Until this endpoint the mobile client had
+ * no owner-scoped way to observe that row's progress, so an accepted wallet
+ * withdrawal could only ever render a generic "requested!" dead-end.
+ *
+ * Contract (GET /api/wallet/withdraw/status/:withdrawalId, protect):
+ *   200 { success, withdrawal: { id, status, amount, destination,
+ *        payoutMethod, providerTxId, createdAt, updatedAt } }
+ *   404 — no such withdrawal FOR THIS USER (foreign ids are
+ *         indistinguishable from nonexistent ones; no existence oracle).
+ *
+ * The row is resolved by its PRIMARY KEY scoped to req.user.id — never by
+ * an amount/timestamp heuristic. status ∈ {PENDING, PROCESSING,
+ * COMPLETED, FAILED, REJECTED, NEEDS_MANUAL_REVIEW}.
+ */
+exports.getWithdrawalStatusById = async (req, res) => {
+    const prisma = req.app.get('prisma');
+    try {
+        const { withdrawalId } = req.params;
+        if (!withdrawalId || !/^[0-9]+$/.test(withdrawalId)) {
+            return res.status(400).json({ success: false, message: 'withdrawalId is required.' });
+        }
+        const row = await prisma.withdrawal.findFirst({
+            where: { id: parseInt(withdrawalId, 10), userId: req.user.id },
+        });
+        if (!row) {
+            return res.status(404).json({ success: false, message: 'No withdrawal found for that id.' });
+        }
+        return res.status(200).json({
+            success: true,
+            withdrawal: {
+                id:           row.id,
+                status:       row.status,
+                amount:       row.amount != null ? Number(row.amount) : null,
+                destination:  row.destination,
+                payoutMethod:  row.payoutMethod,
+                providerTxId:  row.providerTxId || null,
+                createdAt:     row.createdAt ? row.createdAt.toISOString() : null,
+                updatedAt:     row.updatedAt ? row.updatedAt.toISOString() : null,
+            },
+        });
+    } catch (error) {
+        logger.error({ err: error }, '[getWithdrawalStatusById] error');
+        return res.status(500).json({ success: false, message: 'Could not fetch withdrawal status.' });
+    }
+};
+
+/**
  * 2. GET WITHDRAWAL HISTORY
  */
 exports.getWithdrawalHistory = async (req, res) => {

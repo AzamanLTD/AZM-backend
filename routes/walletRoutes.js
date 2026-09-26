@@ -27,6 +27,7 @@ router.post('/withdraw',       protectActive, require2FA(), idempotency({ failur
 
 // Read-only history (banned users still need to see their own history)
 router.get('/history',         protect,       walletController.getWithdrawalHistory);
+router.get('/withdraw/status/:withdrawalId', protect, walletController.getWithdrawalStatusById);
 
 // Saved wallets / payout whitelist
 // r42 §9.5 (integration review): /saved is non-financial saved-address CRUD

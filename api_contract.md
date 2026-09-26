@@ -445,6 +445,31 @@ flow. Runs Double-Check before debiting.
 ### `GET /wallet/history` (auth, read-only)
 Withdrawal history.
 
+### `GET /wallet/withdraw/status/:withdrawalId` (auth, read-only)
+Owner-scoped status for one saved-payout `Withdrawal` queue row (the
+Flutter "crypto wallet" mode's progress surface). Resolved by PRIMARY
+KEY scoped to the requester — never an amount/timestamp heuristic.
+`404` for both foreign and nonexistent ids (no existence oracle),
+`400` for malformed ids.
+
+```json
+{
+  "success": true,
+  "withdrawal": {
+    "id": 123,
+    "status": "PENDING",
+    "amount": 25,
+    "destination": "0x...",
+    "payoutMethod": "MOBILE_MONEY",
+    "providerTxId": null,
+    "createdAt": "2026-09-26T10:00:00.000Z",
+    "updatedAt": "2026-09-26T10:00:00.000Z"
+  }
+}
+```
+`status` ∈ `PENDING | PROCESSING | COMPLETED | FAILED | REJECTED |
+NEEDS_MANUAL_REVIEW`.
+
 ### `POST /wallet/saved` (auth + ban guard)
 Add a saved external wallet (whitelist).
 
