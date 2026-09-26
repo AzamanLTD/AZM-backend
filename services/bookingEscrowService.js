@@ -1,0 +1,565 @@
+// services/bookingEscrowService.js
+// =============================================================================
+// AZAMAN — BOOKING ESCROW SERVICE (2026-07-02)
+// Shared escrow wiring for Reservations (hotels) and TransitBookings (transit).
+// Also provides splitReleaseFundedEscrow — the no-show penalty primitive.
+// =============================================================================
+
+const logger = require('../src/config/logger');
+const { randomUUID } = require('crypto');
+const { runDoubleCheck } = require('../utils/securityCheck');
+
+const BOOKING_ESCROW_FEE_PCT = 0.005;
+const MAX_PENALTY_PCT = 0.50;
+const HOUR_MS = 60 * 60 * 1000;
+const DAY_MS = 24 * HOUR_MS;
+
+const _round6 = (n) => parseFloat(Number(n).toFixed(6));
+const _escrowError = (code) => Object.assign(new Error(code), { code });
+
+const { Prisma } = require('@prisma/client');
+const ledger = require('./ledgerService');
+const _exact = (n) => (n instanceof Prisma.Decimal ? n.toFixed(8) : Number(n).toFixed(8));
+
+const _ensureProfitFeesSingleton = async (tx) =>
+    tx.systemProfitFees.upsert({ where: { id: 1 }, update: {}, create: { id: 1, balance: 0.0 } });
+
+// r25+r29 integration authority. The caller already owns the escrow-row claim,
+// which is the shared first lock for funding and terminal lifecycle operations.
+// PENDING may be confirmed by funding; CONFIRMED is valid convergence. Every
+// other state is terminal/incompatible and aborts the whole financial tx.
+const _claimReservationForFundingTx = async (tx, { bookingId, escrowId }) => {
+    const claimed = await tx.reservation.updateMany({
+        where: { id: bookingId, escrowId, status: 'PENDING' },
+        data: { status: 'CONFIRMED', confirmedAt: new Date() },
+    });
+    if (claimed.count === 1) return;
+
+    const current = await tx.reservation.findUnique({
+        where: { id: bookingId },
+        select: { status: true, escrowId: true },
+    });
+    if (current?.status === 'CONFIRMED' && current.escrowId === escrowId) return;
+    throw _escrowError('RESERVATION_FUNDING_CONFLICT');
+};
+
+// r41.audit-followup — TRANSIT funding authority (fund-after-cancellation
+// race). Transit funding previously confirmed the booking with a best-effort
+// tail updateMany that never failed on a terminal booking. A cancellation
+// that won the shared escrow lock first committed TransitBooking=CANCELLED
+// while the escrow stayed DRAFT; the queued funding then claimed DRAFT→FUNDED,
+// debited the payer, posted ledger/fees, and committed a stranded-funds FUNDED
+// escrow on a CANCELLED booking. Funding now validates the ESCROW-LINKED
+// booking inside the same transaction, right after the escrow claim (the
+// escrow-first → booking lock order is preserved, so funding and every
+// terminal lifecycle operation serialize through the escrow row):
+//   • the caller-supplied bookingId must match the escrow-linked booking —
+//     linkage is authoritative, never trusted from caller input;
+//   • PENDING is confirmed atomically in the same transaction;
+//   • CONFIRMED / IN_PROGRESS converge without rewriting (the established
+//     transit contract funds bookings already past confirmation);
+//   • every other state (CANCELLED, NO_SHOW, COMPLETED) or a mismatched
+//     linkage fails closed — the escrow claim rolls back before ANY
+//     economic mutation commits.
+const TRANSIT_FUNDABLE_PRE_TERMINAL = ['PENDING', 'CONFIRMED', 'IN_PROGRESS'];
+const _claimTransitBookingForFundingTx = async (tx, { bookingId, escrowId }) => {
+    const linked = await tx.transitBooking.findFirst({
+        where: { escrowId },
+        select: { id: true, status: true },
+    });
+    if (!linked || linked.id !== bookingId) {
+        throw _escrowError('TRANSIT_FUNDING_CONFLICT');
+    }
+    if (linked.status === 'PENDING') {
+        const claimed = await tx.transitBooking.updateMany({
+            where: { id: bookingId, escrowId, status: 'PENDING' },
+            data: { status: 'CONFIRMED' },
+        });
+        if (claimed.count === 1) return;
+        // The PENDING claim lost to a racing lifecycle decision inside the
+        // escrow-serialized window — re-read and converge or fail closed.
+        const current = await tx.transitBooking.findUnique({
+            where: { id: bookingId },
+            select: { status: true },
+        });
+        if (current && TRANSIT_FUNDABLE_PRE_TERMINAL.includes(current.status)) return;
+        throw _escrowError('TRANSIT_FUNDING_CONFLICT');
+    }
+    if (linked.status === 'CONFIRMED' || linked.status === 'IN_PROGRESS') return;
+    // CANCELLED / NO_SHOW / COMPLETED — terminal or incompatible: fail
+    // closed, rolling back the escrow claim before any money moves.
+    throw _escrowError('TRANSIT_FUNDING_CONFLICT');
+};
+
+// 1. CREATE BOOKING ESCROW — DRAFT state, no money moves.
+const createBookingEscrow = async (prisma, {
+    bookingType, bookingId, payerId, payeeId,
+    amountUsdc, businessProfileId, deliveryTerms
+}) => {
+    if (!bookingType || !['RESERVATION', 'TRANSIT'].includes(bookingType))
+        throw new Error('bookingType must be RESERVATION or TRANSIT.');
+    if (!bookingId) throw new Error('bookingId is required.');
+    if (!payerId || !payeeId) throw new Error('payerId and payeeId are required.');
+    const amount = Number(amountUsdc);
+    if (!Number.isFinite(amount) || amount <= 0)
+        throw new Error('amountUsdc must be a positive number.');
+    if (payerId === payeeId) throw new Error('Payer and payee cannot be the same user.');
+
+    const model = bookingType === 'RESERVATION' ? 'reservation' : 'transitBooking';
+    const settings = await prisma.globalSettings.findUnique({ where: { id: 1 } });
+    const feePct = settings && settings.smartEscrowFeePct != null ? Number(settings.smartEscrowFeePct) : BOOKING_ESCROW_FEE_PCT;
+    const feeUsdc = _round6(amount * feePct);
+    const reference = randomUUID();
+    const expiresAt = new Date(Date.now() + 24 * HOUR_MS);
+
+    // Ticket, escrow, and booking linkage form one logical aggregate. A failure
+    // in any write must leave no orphan ticket/escrow or half-linked booking.
+    const result = await prisma.$transaction(async (tx) => {
+        const ticket = await tx.ticket.create({
+            data: {
+                creatorId: payerId, counterpartyId: payeeId,
+                name: bookingType === 'RESERVATION' ? 'Reservation Chat' : 'Transit Booking Chat',
+                type: 'ESCROW', targetAmount: amount, targetCurrency: 'USDC',
+                status: 'OPEN', businessProfileId, lastActivityAt: new Date(),
+            }
+        });
+
+        const escrow = await tx.smartEscrow.create({
+            data: {
+                ticketId: ticket.id, payerId, payeeId,
+                amountUsdc: amount, feeUsdc, status: 'DRAFT',
+                deliveryTerms: deliveryTerms || `Booking deposit for ${bookingType}`,
+                expiresAt,
+            }
+        });
+
+        // r29: a terminal reservation can never acquire a fresh,
+        // fundable escrow after its lifecycle decision has committed.
+        // r41.audit-followup: the same terminal-linking authority now covers
+        // TRANSIT — CANCELLED / NO_SHOW / COMPLETED bookings can never
+        // acquire a new fundable escrow (a create/link racing a cancellation
+        // previously could attach a DRAFT escrow to a terminal booking).
+        // PENDING/CONFIRMED/IN_PROGRESS stays the legal pre-terminal set,
+        // preserving the established IN_PROGRESS test/setup contract.
+        const linkWhere = bookingType === 'RESERVATION'
+            ? { id: bookingId, escrowId: null, status: { in: ['PENDING', 'CONFIRMED'] } }
+            : { id: bookingId, escrowId: null, status: { in: TRANSIT_FUNDABLE_PRE_TERMINAL } };
+        const linked = await tx[model].updateMany({
+            where: linkWhere,
+            data: { escrowId: escrow.id, ticketId: ticket.id }
+        });
+        if (linked.count !== 1) {
+            const err = new Error(`${bookingType} booking is missing or already linked to an escrow.`);
+            err.code = 'BOOKING_ESCROW_LINK_CONFLICT';
+            throw err;
+        }
+
+        return { ticket, escrow };
+    });
+
+    return { escrow: result.escrow, ticket: result.ticket, reference };
+};
+
+// 2. FUND BOOKING ESCROW — payer locks USDC.
+const fundBookingEscrow = async (prisma, { escrowId, payerId, bookingType, bookingId }) => {
+    await runDoubleCheck(prisma, payerId);
+
+    const settings = await prisma.globalSettings.findUnique({ where: { id: 1 } });
+    const fundedExpiryDays = settings && settings.escrowFundedExpiryDays != null ? Number(settings.escrowFundedExpiryDays) : 30;
+    const reference = randomUUID();
+
+    // The escrow row is claimed inside the transaction and the payer balance is
+    // decremented with a conditional predicate. This prevents two escrows from
+    // both spending the same available USDC and prevents two fund requests for
+    // one booking from both producing financial effects.
+    const result = await prisma.$transaction(async (tx) => {
+        const escrow = await tx.smartEscrow.findUnique({ where: { id: escrowId }, include: { ticket: true } });
+        if (!escrow) throw new Error('Escrow not found.');
+        if (escrow.payerId !== payerId) throw new Error('Only the payer can fund this escrow.');
+        if (escrow.status !== 'DRAFT') throw new Error(`Escrow cannot be funded from status ${escrow.status}.`);
+
+        // r25+r29 P0 — SHARED AUTHORITATIVE CLAIM ORDER. Funding and every
+        // reservation terminal operation serialize on the escrow row first.
+        // A loser cannot debit money, confirm a terminal reservation, or leave
+        // a partial economic mutation. Any later failure rolls the claim back.
+        const amount = Number(escrow.amountUsdc);
+        const fee = Number(escrow.feeUsdc);
+        const total = _round6(amount + fee);
+
+        const claim = await tx.smartEscrow.updateMany({
+            where: { id: escrowId, status: 'DRAFT', payerId },
+            data: {
+                status: 'FUNDED',
+                fundedAt: new Date(),
+                expiresAt: new Date(Date.now() + fundedExpiryDays * DAY_MS),
+                fundTxHash: reference
+            }
+        });
+        if (claim.count !== 1) {
+            const current = await tx.smartEscrow.findUnique({ where: { id: escrowId }, select: { status: true } });
+            const err = new Error(`Escrow cannot be funded from status ${current?.status || 'UNKNOWN'}.`);
+            err.code = current?.status === 'FUNDED' ? 'ESCROW_ALREADY_FUNDED' : 'ESCROW_STATE_CHANGED';
+            throw err;
+        }
+
+        // Reservation confirmation is authoritative, not a best-effort tail
+        // update. Holding the escrow claim blocks cancellation/check-in/no-show
+        // on this aggregate while PENDING converges to CONFIRMED. A terminal or
+        // mismatched reservation aborts and rolls back the escrow claim.
+        if (bookingType === 'RESERVATION' && bookingId) {
+            await _claimReservationForFundingTx(tx, { bookingId, escrowId });
+        }
+        if (bookingType === 'TRANSIT' && bookingId) {
+            await _claimTransitBookingForFundingTx(tx, { bookingId, escrowId });
+        }
+
+        const payer = await tx.user.findUnique({ where: { id: payerId }, select: { availableBalance: true } });
+        if (!payer) throw new Error('Payer not found.');
+        const debit = await tx.user.updateMany({
+            where: { id: payerId, availableBalance: { gte: total } },
+            data: { availableBalance: { decrement: total } }
+        });
+        if (debit.count !== 1) {
+            const err = new Error(
+                `Insufficient balance. Required: ${total.toFixed(6)} USDC (amount + fee), ` +
+                `available: ${Number(payer.availableBalance).toFixed(6)} USDC.`
+            );
+            err.code = 'INSUFFICIENT_BALANCE';
+            throw err;
+        }
+
+        await tx.user.update({ where: { id: payerId }, data: { escrowLockedBalance: { increment: amount } } });
+        await _ensureProfitFeesSingleton(tx);
+        await tx.systemProfitFees.update({ where: { id: 1 }, data: { balance: { increment: fee } } });
+
+        // §P.4 AUTHORITATIVE LEDGER — same transaction, fail-closed, same
+        // economic identity as the ticket escrow fund path (this escrow row
+        // can only ever be funded once):
+        //   D user:{payer}:liability  (principal + fee)
+        //   C escrow:{escrowId}:locked (principal)
+        //   C revenue:fees            (fee realized at lock)
+        const posting = await ledger.post(tx, {
+            idempotencyKey: `ledger:escrow:fund:${escrowId}`,
+            entryType: 'ESCROW_LOCK',
+            description: 'Booking escrow funded — principal locked, fee realized',
+            reference,
+            userId: payerId,
+            relatedEntity: 'smartEscrow',
+            relatedEntityId: escrowId,
+            metadata: { bookingType: bookingType || null, bookingId: bookingId ?? null },
+            lines: [
+                { account: `user:${payerId}:liability`, debit: _exact(total) },
+                { account: `escrow:escrow-${escrowId}:locked`, credit: _exact(amount) },
+                { account: 'revenue:fees', credit: _exact(fee) },
+            ],
+        });
+
+        // r25 P0: an exact ledger replay inside an operation that JUST won
+        // its own durable state claim is contradictory evidence — abort.
+        // NEVER let a replayed ledger identity permit a second economic
+        // mutation (the claim above would already have refused the double
+        // fund; this makes the invariant explicit and fail-closed).
+        if (posting.replayed) {
+            const err = new Error('Ledger funding identity already committed — refusing a second economic mutation.');
+            err.code = 'LEDGER_REPLAY_IN_CLAIMED_OPERATION';
+            throw err;
+        }
+
+        // At this point all financial mutations are in the same transaction as
+        // the escrow state transition and transaction-history/profit records.
+        await tx.transactionHistory.create({
+            data: {
+                userId: payerId, type: 'TICKET_ESCROW_FUND',
+                amountUsdc: -amount, feeUsdc: fee, txHash: reference, status: 'COMPLETED'
+            }
+        });
+
+        if (fee > 0) {
+            await tx.adminProfitLog.create({
+                data: { amountUsdc: fee, source: 'SMART_ESCROW_FEE', relatedTxId: `booking_fee_${escrow.ticketId}_${reference}` }
+            });
+        }
+
+        // Reservation confirmation was claimed before money. Transit keeps its
+        // existing convergence contract and is outside the r29 state machine.
+        return {
+            escrow: await tx.smartEscrow.findUnique({ where: { id: escrowId } }),
+            amount,
+            fee,
+            ticketId: escrow.ticketId
+        };
+    });
+
+    // Notifications are deliberately post-commit and non-authoritative. A
+    // provider outage must never roll back a completed financial mutation.
+    const _messagingChannelsService = require('./messagingChannels');
+
+    if (bookingType === 'RESERVATION' && bookingId) {
+        // Reservation relation/field names are `customer` and
+        // `startDatetime` (not legacy `user` / `reservationTime`). This is
+        // post-commit and must never throw a validation error after funding.
+        const res = await prisma.reservation.findUnique({ where: { id: bookingId }, include: { customer: true } });
+        if (res?.status === 'CONFIRMED' && res.customer?.phoneNumber) {
+            _messagingChannelsService.notifyBookingConfirmed(res.businessProfileId, res.customer.phoneNumber, res.id, res.startDatetime).catch(err => logger.error('[MessagingChannels] Error:', err));
+        }
+    } else if (bookingType === 'TRANSIT' && bookingId) {
+        // r27: TransitBooking has no `user` relation (it is `customer`) and
+        // TransitTrip has no `scheduledDeparture` (it is `departureAt`) — the
+        // old include threw PrismaClientValidationError AFTER the funding
+        // transaction had committed, 500ing the route with money already
+        // moved. Post-commit lookups must match the real schema.
+        const tb = await prisma.transitBooking.findUnique({ where: { id: bookingId }, include: { customer: true, trip: true } });
+        if (tb?.status === 'CONFIRMED' && tb.customer?.phoneNumber) {
+            _messagingChannelsService.notifyBookingConfirmed(tb.trip?.businessProfileId || tb.businessProfileId, tb.customer.phoneNumber, tb.id, tb.trip?.departureAt || tb.scheduledAt || new Date()).catch(err => logger.error('[MessagingChannels] Error:', err));
+        }
+    }
+
+    return { success: true, escrow: result.escrow, reference };
+};
+
+// 3. RELEASE BOOKING ESCROW — Full release to business on check-in/completion.
+const RELEASE_CLAIMABLE = ['FUNDED', 'IN_PROGRESS', 'PENDING_SETTLEMENT'];
+
+// Transaction-aware core. Reservation lifecycle orchestration composes this
+// with its own state CAS so booking state and custody move in one commit.
+const _releaseBookingEscrowTx = async (tx, { escrowId, reference }) => {
+    const escrow = await tx.smartEscrow.findUnique({ where: { id: escrowId } });
+    if (!escrow) throw new Error('Escrow not found.');
+    const amount = Number(escrow.amountUsdc);
+
+    const claim = await tx.smartEscrow.updateMany({
+        where: { id: escrowId, status: { in: RELEASE_CLAIMABLE } },
+        data: { status: 'SETTLED', settledAt: new Date(), releaseTxHash: reference }
+    });
+    if (claim.count === 0) throw _escrowError('ESCROW_ALREADY_FINALIZED');
+
+    const debit = await tx.user.updateMany({
+        where: { id: escrow.payerId, escrowLockedBalance: { gte: amount } },
+        data: { escrowLockedBalance: { decrement: amount } }
+    });
+    if (debit.count !== 1) throw _escrowError('ESCROW_BALANCE_INSUFFICIENT');
+    await tx.user.update({ where: { id: escrow.payeeId }, data: { availableBalance: { increment: amount } } });
+
+    await ledger.post(tx, {
+        idempotencyKey: `ledger:escrow:release:${escrowId}:SETTLED`,
+        entryType: 'ESCROW_RELEASE',
+        description: 'Booking escrow released to payee on settlement',
+        reference,
+        userId: escrow.payeeId,
+        relatedEntity: 'smartEscrow',
+        relatedEntityId: escrowId,
+        lines: [
+            { account: `escrow:escrow-${escrowId}:locked`, debit: _exact(amount) },
+            { account: `user:${escrow.payeeId}:liability`, credit: _exact(amount) },
+        ],
+    });
+    await tx.transactionHistory.create({
+        data: { userId: escrow.payeeId, type: 'TICKET_ESCROW_RELEASE', amountUsdc: amount, feeUsdc: 0, txHash: reference, status: 'COMPLETED' }
+    });
+    return await tx.smartEscrow.findUnique({ where: { id: escrowId } });
+};
+
+const releaseBookingEscrow = async (prisma, { escrowId }) => {
+    const reference = randomUUID();
+    const updated = await prisma.$transaction((tx) =>
+        _releaseBookingEscrowTx(tx, { escrowId, reference }));
+    return { success: true, escrow: updated, reference };
+};
+
+// 4. REFUND BOOKING ESCROW — Full refund to customer on cancellation.
+//
+// r27: the economic core is exposed as a transaction-aware primitive
+// (_refundBookingEscrowTx) so cancellation orchestrations can compose the
+// refund atomically with their own booking/state mutations. The public
+// refundBookingEscrow keeps its historical standalone contract (opens its own
+// transaction, same return shape).
+const REFUND_CLAIMABLE = ['FUNDED', 'IN_PROGRESS', 'PENDING_SETTLEMENT'];
+
+const _refundBookingEscrowTx = async (tx, { escrowId, reference }) => {
+    const claimable = REFUND_CLAIMABLE;
+
+        const escrow = await tx.smartEscrow.findUnique({ where: { id: escrowId } });
+        if (!escrow) throw new Error('Escrow not found.');
+        const amount = Number(escrow.amountUsdc);
+
+        const claim = await tx.smartEscrow.updateMany({
+            where: { id: escrowId, status: { in: claimable } },
+            data: { status: 'REFUNDED', refundedAt: new Date(), refundTxHash: reference }
+        });
+        if (claim.count === 0) throw _escrowError('ESCROW_ALREADY_FINALIZED');
+
+        // Guarded, atomic refund: the locked principal moves back to the
+        // payer's available balance in ONE conditional statement — a short
+        // bucket can never go negative and never credits the payer.
+        const debit = await tx.user.updateMany({
+            where: { id: escrow.payerId, escrowLockedBalance: { gte: amount } },
+            data: { escrowLockedBalance: { decrement: amount }, availableBalance: { increment: amount } }
+        });
+        if (debit.count !== 1) throw _escrowError('ESCROW_BALANCE_INSUFFICIENT');
+
+        // §P.4 AUTHORITATIVE LEDGER — same economic identity as the ticket
+        // escrow refund:
+        //   D escrow:{id}:locked / C user:{payer}:liability
+        await ledger.post(tx, {
+            idempotencyKey: `ledger:escrow:refund:${escrowId}:REFUNDED`,
+            entryType: 'ESCROW_REFUND',
+            description: 'Booking escrow refunded to payer on cancellation',
+            reference,
+            userId: escrow.payerId,
+            relatedEntity: 'smartEscrow',
+            relatedEntityId: escrowId,
+            lines: [
+                { account: `escrow:escrow-${escrowId}:locked`, debit: _exact(amount) },
+                { account: `user:${escrow.payerId}:liability`, credit: _exact(amount) },
+            ],
+        });
+        await tx.transactionHistory.create({
+            data: { userId: escrow.payerId, type: 'TICKET_ESCROW_REFUND', amountUsdc: amount, feeUsdc: 0, txHash: reference, status: 'COMPLETED' }
+        });
+        return await tx.smartEscrow.findUnique({ where: { id: escrowId } });
+};
+
+const refundBookingEscrow = async (prisma, { escrowId }) => {
+    const reference = randomUUID();
+    const updated = await prisma.$transaction((tx) => _refundBookingEscrowTx(tx, { escrowId, reference }));
+    return { success: true, escrow: updated, reference };
+};
+
+// 5. SPLIT-RELEASE FUNDED ESCROW — The no-show penalty primitive.
+const _splitReleaseFundedEscrowTx = async (tx, {
+    escrowId, penaltyPct, penaltyFlatUsdc, reason, bookingType, bookingId,
+    releaseRef, refundRef, reservationClaimWhere = {}
+}) => {
+    const claimable = ['FUNDED', 'IN_PROGRESS', 'PENDING_SETTLEMENT'];
+
+    const penaltyConfig = () => {
+        let penaltyAmount;
+        const source = penaltyFlatUsdc != null && penaltyFlatUsdc > 0 ? 'flat' : 'pct';
+        if (source === 'flat') return { source, value: Number(penaltyFlatUsdc) };
+        if (penaltyPct != null && penaltyPct > 0) {
+            return { source, value: Math.min(Number(penaltyPct), MAX_PENALTY_PCT) };
+        }
+        throw new Error('Either penaltyPct or penaltyFlatUsdc must be a positive value.');
+    };
+    const config = penaltyConfig();
+    const escrow = await tx.smartEscrow.findUnique({ where: { id: escrowId } });
+    if (!escrow) throw new Error('Escrow not found.');
+
+    const principal = Number(escrow.amountUsdc);
+    const penaltyAmountRaw = config.source === 'flat'
+        ? Math.min(config.value, principal)
+        : _round6(principal * config.value);
+    const penaltyAmount = Math.min(_round6(penaltyAmountRaw), principal);
+    const refundAmount = _round6(principal - penaltyAmount);
+
+    const claim = await tx.smartEscrow.updateMany({
+        where: { id: escrowId, status: { in: claimable } },
+        data: { status: 'RELEASED', settledAt: new Date(), releaseTxHash: releaseRef, refundTxHash: refundRef }
+    });
+    if (claim.count === 0) throw _escrowError('ESCROW_ALREADY_FINALIZED');
+
+    // Guarded, atomic principal drain — the full principal leaves the
+    // payer's escrow bucket only if the bucket still holds it.
+    const debit = await tx.user.updateMany({
+        where: { id: escrow.payerId, escrowLockedBalance: { gte: principal } },
+        data: { escrowLockedBalance: { decrement: principal } }
+    });
+    if (debit.count !== 1) throw _escrowError('ESCROW_BALANCE_INSUFFICIENT');
+
+    // §P.4 AUTHORITATIVE LEDGER — no-show penalty split, one balanced
+    // posting in the same transaction. The penalty and refund shares sum
+    // to the principal exactly, so no rounding dust can remain:
+    //   D escrow:{id}:locked      (full principal leaves escrow holding)
+    //   C user:{payee}:liability  (penalty share)
+    //   C user:{payer}:liability  (refund share)
+    // Zero-share lines are omitted (a zero-value line would be rejected).
+    const splitLines = [
+        { account: `escrow:escrow-${escrowId}:locked`, debit: _exact(principal) },
+    ];
+    if (penaltyAmount > 0) splitLines.push({ account: `user:${escrow.payeeId}:liability`, credit: _exact(penaltyAmount) });
+    if (refundAmount > 0) splitLines.push({ account: `user:${escrow.payerId}:liability`, credit: _exact(refundAmount) });
+    await ledger.post(tx, {
+        idempotencyKey: `ledger:escrow:split-release:${escrowId}`,
+        entryType: 'ESCROW_RELEASE',
+        description: `No-show penalty split — ${_exact(penaltyAmount)} penalty to payee, ${_exact(refundAmount)} refunded to payer`,
+        reference: releaseRef,
+        userId: escrow.payerId,
+        relatedEntity: 'smartEscrow',
+        relatedEntityId: escrowId,
+        metadata: { reason: reason || null, penaltyAmount, refundAmount, bookingType: bookingType || null, bookingId: bookingId ?? null },
+        lines: splitLines,
+    });
+
+    if (penaltyAmount > 0) {
+        await tx.user.update({ where: { id: escrow.payeeId }, data: { availableBalance: { increment: penaltyAmount } } });
+        await tx.transactionHistory.create({
+            data: { userId: escrow.payeeId, type: 'TICKET_ESCROW_RELEASE', amountUsdc: penaltyAmount, feeUsdc: 0, txHash: releaseRef, status: 'COMPLETED' }
+        });
+    }
+    if (refundAmount > 0) {
+        await tx.user.update({ where: { id: escrow.payerId }, data: { availableBalance: { increment: refundAmount } } });
+        await tx.transactionHistory.create({
+            data: { userId: escrow.payerId, type: 'TICKET_ESCROW_REFUND', amountUsdc: refundAmount, feeUsdc: 0, txHash: refundRef, status: 'COMPLETED' }
+        });
+    }
+
+    if (bookingType === 'RESERVATION' && bookingId) {
+        // r29: reservation lifecycle is a single authoritative claim. A
+        // cancellation or check-in that wins CONFIRMED first makes this CAS
+        // fail, rolling back escrow, balances, ledger and history together.
+        const bookingClaim = await tx.reservation.updateMany({
+            where: { ...reservationClaimWhere, id: bookingId, status: 'CONFIRMED' },
+            data: { status: 'NO_SHOW', penaltyChargedAt: new Date(), penaltyAmountUsdc: penaltyAmount }
+        });
+        if (bookingClaim.count === 0) throw new Error('BOOKING_NO_LONGER_CONFIRMED');
+    } else if (bookingType === 'TRANSIT' && bookingId) {
+        // r28 / P0-B race hardening: this used to be an unguarded
+        // updateMany on the booking id — a racing cancellation that won
+        // the booking's economic claim could be silently overwritten to
+        // NO_SHOW here. The CAS below claims ONLY the authoritative
+        // no-show pre-state (CONFIRMED): if a cancellation won, this
+        // whole split rolls back (escrow restored, no penalty/refund,
+        // no ledger posting) and the cancellation's economics stand.
+        const bookingClaim = await tx.transitBooking.updateMany({
+            where: { id: bookingId, status: 'CONFIRMED' },
+            data: { status: 'NO_SHOW', penaltyChargedAt: new Date(), penaltyAmountUsdc: penaltyAmount }
+        });
+        if (bookingClaim.count === 0) {
+            throw new Error('BOOKING_NO_LONGER_CONFIRMED');
+        }
+    }
+
+    return {
+        escrow: await tx.smartEscrow.findUnique({ where: { id: escrowId } }),
+        penaltyAmount,
+        refundAmount
+    };
+};
+
+const splitReleaseFundedEscrow = async (prisma, args) => {
+    const releaseRef = randomUUID();
+    const refundRef = randomUUID();
+    const result = await prisma.$transaction((tx) =>
+        _splitReleaseFundedEscrowTx(tx, { ...args, releaseRef, refundRef }));
+    return { success: true, escrow: result.escrow, penaltyAmount: result.penaltyAmount, refundAmount: result.refundAmount, reference: releaseRef };
+};
+
+// 6. PROCESS BUSINESS NO-SHOW — when the business defaults (cancelled trip,
+//    closed hotel, etc.). Full refund to customer + optional business penalty.
+//    This is the bidirectional penalty from master spec PART 5.4.
+const processBusinessNoShow = async (prisma, {
+    escrowId, bookingType, bookingId, businessProfileId, reason
+}) => {
+    const { processBusinessNoShow: _processBusinessNoShow } = require('./penaltyPolicyService');
+    return _processBusinessNoShow(prisma, {
+        escrowId, bookingType, bookingId, businessProfileId, reason
+    });
+};
+
+module.exports = {
+    TRANSIT_FUNDABLE_PRE_TERMINAL, createBookingEscrow, fundBookingEscrow, releaseBookingEscrow,
+    refundBookingEscrow, splitReleaseFundedEscrow, processBusinessNoShow,
+    _refundBookingEscrowTx, _releaseBookingEscrowTx,
+    _splitReleaseFundedEscrowTx, REFUND_CLAIMABLE, RELEASE_CLAIMABLE,
+    MAX_PENALTY_PCT, BOOKING_ESCROW_FEE_PCT
+};

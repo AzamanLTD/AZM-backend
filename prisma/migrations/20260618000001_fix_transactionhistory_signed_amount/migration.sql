@@ -1,0 +1,30 @@
+-- Fix: TransactionHistory.amountUsdc is SIGNED, so drop the erroneous non-negative CHECK.
+--
+-- The 2026-05-25 phase-J2 migration (20260525_phase_j2_balance_check_constraints)
+-- added:
+--     ALTER TABLE "TransactionHistory"
+--       ADD CONSTRAINT "TH_amountUsdc_nonneg" CHECK ("amountUsdc" >= 0);
+-- under the stated assumption that "TransactionHistory uses `type` to encode
+-- direction, not the sign of amountUsdc ... every callsite passes a positive
+-- number". That assumption is INCORRECT. TransactionHistory uses a SIGNED
+-- amountUsdc convention — credits are positive, debits are negative — and the
+-- ledger audit utils/securityCheck.runDoubleCheck reconciles balances as
+-- SUM(amountUsdc - feeUsdc). Multiple production debit paths depend on it:
+--
+--   • controllers/withdrawalController.js   gas-fee debit   amountUsdc: -gasFeeUsdc
+--   • controllers/chatTransferController.js  outbound xfer   amountUsdc: -amount
+--   • controllers/savingsController.js       savings outflow amountUsdc: -amountUsdc  ("signed: outflow")
+--   • services/finance.service.js            exit fee/amount amountUsdc: -exitFee / -amountFloat
+--   • services/escrowService.js              escrow fund     amountUsdc: -amount  (TICKET_ESCROW_FUND)
+--
+-- With the constraint present, every one of these debits is rejected by Postgres
+-- (error 23514) — escrow funding, withdrawals, friend transfers and savings exits
+-- all break. Production is db-push managed (CHECK constraints from raw migration
+-- SQL are not represented in schema.prisma, so `prisma db push` never created it),
+-- which is why the break only surfaces in migrate-deploy environments (fresh test
+-- DBs, CI). Dropping it aligns the migrated schema with the real ledger design and
+-- with production.
+--
+-- TH_feeUsdc_nonneg is CORRECT (feeUsdc is always a non-negative cost) and is kept,
+-- as are every other table's non-negativity constraint from the J2 migration.
+ALTER TABLE "TransactionHistory" DROP CONSTRAINT IF EXISTS "TH_amountUsdc_nonneg";

@@ -1,0 +1,248 @@
+// routes/walletRoutes.js
+// =============================================================================
+// AZAMAN V2 — WALLET ROUTES
+// Mounted at /api/wallet. Reads are JWT-only (banned users keep read-only
+// access); writes go through the ban guard.
+// =============================================================================
+
+const logger = require('../src/config/logger');
+const { Prisma } = require('@prisma/client');
+const ledger = require('../services/ledgerService');
+const _exact = (n) => (n instanceof Prisma.Decimal ? n.toFixed(8) : Number(n).toFixed(8));
+const express                  = require('express');
+const router                   = express.Router();
+const walletController         = require('../controllers/walletController');
+const { protect }              = require('../middleware/authMiddleware');
+const { idempotency } = require('../middleware/idempotency');
+const { require2FA } = require('../middleware/require2FA');
+const { protectActive }        = require('../middleware/banGuardMiddleware');
+
+// Withdrawals
+router.post('/withdraw',       protectActive, require2FA(), idempotency(), walletController.requestWithdrawal);
+
+// Read-only history (banned users still need to see their own history)
+router.get('/history',         protect,       walletController.getWithdrawalHistory);
+
+// Saved wallets / payout whitelist
+// r42 §9.5 (integration review): /saved is non-financial saved-address CRUD
+// (audit doc §3 classifies it as such). Forcing the financial
+// Idempotency-Key contract onto it would break the production client's
+// wallet-address management for no financial-safety gain — the route is
+// de-mounted from the shared authority. `required: false` was NOT used: a
+// half-protected route is worse than an honestly unprotected one.
+router.post('/saved',          protectActive, walletController.addSavedWallet);
+router.get('/saved',           protect,       walletController.getSavedWallets);
+router.delete('/saved/:id',    protectActive, walletController.deleteSavedWallet);
+
+// Fiat deposit gateway (initialize)
+router.post('/deposit/initialize', protectActive, idempotency(), walletController.initializeFiatDeposit);
+
+// Polygon deposit address (Phase C: Tatum HD wallet derivation)
+router.get('/deposit-address/polygon', protect, walletController.getPolygonDepositAddress);
+
+// ─── VENDOR INTERNAL TRANSFER (Fund Trading Pool / Withdraw to Wallet) ───────
+// GET /api/wallet/pool-withdrawal-preview?amount=X — preview which ads would be deactivated
+router.get('/pool-withdrawal-preview', protect, async (req, res) => {
+    const prisma = req.app.get('prisma');
+    try {
+        const userId = req.user.id;
+        const amount = parseFloat(req.query.amount || '0');
+
+        const user = await prisma.user.findUnique({
+            where: { id: userId },
+            select: { vendorUnallocatedBalance: true }
+        });
+        if (!user) return res.status(404).json({ success: false, message: 'User not found.' });
+
+        const newPoolBalance = Number(user.vendorUnallocatedBalance) - amount;
+
+        const activeAds = await prisma.ad.findMany({
+            where: { vendorId: userId, status: 'ACTIVE' },
+            select: { id: true, maxLimit: true, minLimit: true, paymentMethod: true, type: true, createdAt: true },
+            orderBy: { createdAt: 'desc' }
+        });
+
+        const adsAtRisk = activeAds.filter(a => Number(a.maxLimit) > newPoolBalance);
+        const adsSafe = activeAds.filter(a => Number(a.maxLimit) <= newPoolBalance);
+
+        return res.status(200).json({
+            success: true,
+            data: {
+                currentPoolBalance: Number(user.vendorUnallocatedBalance),
+                withdrawAmount: amount,
+                newPoolBalance: Math.max(0, newPoolBalance),
+                totalActiveAds: activeAds.length,
+                adsAtRisk,
+                adsSafe,
+                willDeactivate: adsAtRisk.length,
+            }
+        });
+    } catch (error) {
+        return res.status(500).json({ success: false, message: error.message });
+    }
+});
+
+// POST /api/wallet/internal-transfer
+// Body: { direction: 'TO_POOL' | 'FROM_POOL', amount: number }
+router.post('/internal-transfer', protectActive, require2FA(), idempotency(), async (req, res) => {
+    const prisma = req.app.get('prisma');
+    const emitBalanceUpdate = req.app.get('emitBalanceUpdate');
+
+    try {
+        const userId = req.user.id;
+        const { direction, amount } = req.body;
+
+        if (!direction || !['TO_POOL', 'FROM_POOL'].includes(direction)) {
+            return res.status(400).json({
+                success: false,
+                message: 'direction must be "TO_POOL" or "FROM_POOL".'
+            });
+        }
+        if (!amount || isNaN(parseFloat(amount)) || parseFloat(amount) <= 0) {
+            return res.status(400).json({
+                success: false,
+                message: 'amount must be a positive number.'
+            });
+        }
+
+        const amountFloat = parseFloat(amount);
+
+        // Verify user is a vendor
+        const user = await prisma.user.findUnique({
+            where: { id: userId },
+            select: { role: true, availableBalance: true, vendorUnallocatedBalance: true }
+        });
+        if (!user) return res.status(404).json({ success: false, message: 'User not found.' });
+        if (user.role !== 'VENDOR' && user.role !== 'ADMIN') {
+            return res.status(403).json({ success: false, message: 'Only vendors can transfer to/from the trading pool.' });
+        }
+
+        if (direction === 'TO_POOL') {
+            // Available → Vendor Unallocated (fund trading pool).
+            // §P.4: the mutation is a guarded conditional decrement inside the
+            // SAME transaction as the history row and the ledger posting —
+            // a racing wallet spend loses the CAS cleanly instead of driving
+            // the balance negative.
+            await prisma.$transaction(async (tx) => {
+                const claim = await tx.user.updateMany({
+                    where: { id: userId, availableBalance: { gte: amountFloat } },
+                    data: {
+                        availableBalance: { decrement: amountFloat },
+                        vendorUnallocatedBalance: { increment: amountFloat },
+                    },
+                });
+                if (claim.count !== 1) {
+                    throw new Error(`Insufficient available balance. You have ${user.availableBalance} USDC.`);
+                }
+                const history = await tx.transactionHistory.create({
+                    data: { userId, type: 'INTERNAL_TRANSFER', amountUsdc: -amountFloat, feeUsdc: 0, status: 'COMPLETED' }
+                });
+                //   D user:{vendor}:liability    — available liability down
+                //   C user:{vendor}:unallocated  — restricted pool liability up
+                await ledger.post(tx, {
+                    idempotencyKey: `ledger:wallet:pool-topup:${history.id}`,
+                    entryType: 'VENDOR_TOPUP',
+                    description: 'Vendor trading-pool top-up from available wallet',
+                    userId,
+                    relatedEntity: 'transactionHistory',
+                    relatedEntityId: history.id,
+                    metadata: { direction, amount: _exact(amountFloat) },
+                    lines: [
+                        { account: `user:${userId}:liability`, debit: _exact(amountFloat) },
+                        { account: `user:${userId}:unallocated`, credit: _exact(amountFloat) },
+                    ],
+                });
+            });
+        } else {
+            // Vendor Unallocated → Available (withdraw from trading pool)
+            if (user.vendorUnallocatedBalance < amountFloat) {
+                return res.status(400).json({
+                    success: false,
+                    message: `Insufficient trading pool balance. You have ${user.vendorUnallocatedBalance} USDC.`
+                });
+            }
+
+            await prisma.$transaction(async (tx) => {
+                const claim = await tx.user.updateMany({
+                    where: { id: userId, vendorUnallocatedBalance: { gte: amountFloat } },
+                    data: {
+                        vendorUnallocatedBalance: { decrement: amountFloat },
+                        availableBalance: { increment: amountFloat },
+                    },
+                });
+                if (claim.count !== 1) {
+                    throw new Error(`Insufficient trading pool balance. You have ${user.vendorUnallocatedBalance} USDC.`);
+                }
+                const history = await tx.transactionHistory.create({
+                    data: { userId, type: 'INTERNAL_TRANSFER', amountUsdc: amountFloat, feeUsdc: 0, status: 'COMPLETED' }
+                });
+                //   D user:{vendor}:unallocated  — restricted pool liability down
+                //   C user:{vendor}:liability    — available liability up
+                await ledger.post(tx, {
+                    idempotencyKey: `ledger:wallet:pool-withdraw:${history.id}`,
+                    entryType: 'VENDOR_ALLOCATE',
+                    description: 'Vendor trading-pool withdrawal to available wallet',
+                    userId,
+                    relatedEntity: 'transactionHistory',
+                    relatedEntityId: history.id,
+                    metadata: { direction, amount: _exact(amountFloat) },
+                    lines: [
+                        { account: `user:${userId}:unallocated`, debit: _exact(amountFloat) },
+                        { account: `user:${userId}:liability`, credit: _exact(amountFloat) },
+                    ],
+                });
+            });
+
+            // Auto-deactivate ads that exceed the new pool balance
+            const newPoolBalance = Number(user.vendorUnallocatedBalance) - amountFloat;
+            const overLimitAds = await prisma.ad.findMany({
+                where: {
+                    vendorId: userId,
+                    status: 'ACTIVE',
+                    maxLimit: { gt: newPoolBalance }
+                },
+                select: { id: true, maxLimit: true, paymentMethod: true }
+            });
+
+            if (overLimitAds.length > 0) {
+                await prisma.ad.updateMany({
+                    where: { id: { in: overLimitAds.map(a => a.id) } },
+                    data: { status: 'INACTIVE' }
+                });
+            }
+
+            // Include deactivated ads info in response
+            if (overLimitAds.length > 0) {
+                if (emitBalanceUpdate) await emitBalanceUpdate(userId);
+                return res.status(200).json({
+                    success: true,
+                    message: `${amountFloat} USDC moved to Available Wallet. ${overLimitAds.length} ad(s) were deactivated because they exceed your new pool balance.`,
+                    data: {
+                        direction,
+                        amount: amountFloat,
+                        newPoolBalance,
+                        deactivatedAds: overLimitAds,
+                        deactivatedCount: overLimitAds.length,
+                    }
+                });
+            }
+        }
+
+        if (emitBalanceUpdate) await emitBalanceUpdate(userId);
+
+        const label = direction === 'TO_POOL' ? 'Trading Pool' : 'Available Wallet';
+        return res.status(200).json({
+            success: true,
+            message: `${amountFloat} USDC moved to ${label}.`,
+            data: { direction, amount: amountFloat }
+        });
+    } catch (error) {
+        if (String(error.message || '').startsWith('Insufficient')) {
+            return res.status(400).json({ success: false, message: error.message });
+        }
+        logger.error({ err: error }, '[wallet.internalTransfer] error');
+        return res.status(500).json({ success: false, message: error.message });
+    }
+});
+
+module.exports = router;

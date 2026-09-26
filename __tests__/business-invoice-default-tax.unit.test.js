@@ -1,0 +1,64 @@
+'use strict';
+
+const assert = require('node:assert/strict');
+const { createInvoice } = require('../services/businessInvoiceService');
+const { computeTaxLines } = require('../utils/invoiceMath');
+
+describe('business invoice default tax contract', () => {
+  test('omitted taxLines use the business default preset', async () => {
+    const prisma = {
+      businessTaxPreset: { findFirst: async () => ({ name: 'VAT', type: 'PERCENTAGE', value: 12.5 }) },
+      user: { findUnique: async () => ({ id: 7, username: 'customer' }) },
+      businessInvoice: {
+        findUnique: async () => null,
+        create: async ({ data }) => ({ id: 'inv-1', ...data, lineItems: data.lineItems.create, taxLines: data.taxLines.create }),
+      },
+    };
+
+    const invoice = await createInvoice(prisma, {
+      businessProfileId: 'biz-1',
+      customerId: 7,
+      lineItems: [{ description: 'Meal', quantity: 2, unitPrice: 20 }],
+      idempotencyKey: 'inv-default-1',
+    });
+
+    assert.equal(invoice.subtotalUsdc.toFixed(8), '40.00000000');
+    assert.equal(invoice.taxTotalUsdc.toFixed(8), '5.00000000');
+    assert.equal(invoice.billTotalUsdc.toFixed(8), '45.00000000');
+    assert.equal(invoice.taxLines[0].computedAmount.toFixed(8), '5.00000000');
+    assert.equal(invoice.taxLines[0].name, 'VAT');
+    assert.equal(invoice.taxLines[0].type, 'PERCENTAGE');
+  });
+
+  test('explicit empty taxLines remain tax-free', async () => {
+    let defaultLookups = 0;
+    const prisma = {
+      businessTaxPreset: { findFirst: async () => { defaultLookups += 1; return { name: 'VAT', type: 'PERCENTAGE', value: 12.5 }; } },
+      user: { findUnique: async () => ({ id: 7, username: 'customer' }) },
+      businessInvoice: {
+        findUnique: async () => null,
+        create: async ({ data }) => ({ id: 'inv-2', ...data, lineItems: data.lineItems.create, taxLines: data.taxLines.create }),
+      },
+    };
+
+    const invoice = await createInvoice(prisma, {
+      businessProfileId: 'biz-1',
+      customerId: 7,
+      lineItems: [{ description: 'Meal', quantity: 1, unitPrice: 20 }],
+      taxLines: [],
+      idempotencyKey: 'inv-explicit-tax-free-1',
+    });
+
+    assert.equal(invoice.taxTotalUsdc.toFixed(8), '0.00000000');
+    assert.equal(invoice.billTotalUsdc.toFixed(8), '20.00000000');
+    assert.deepEqual(invoice.taxLines, []);
+    assert.equal(defaultLookups, 0);
+  });
+
+  test('unsupported tax line types fail closed instead of becoming percentage tax', () => {
+    assert.throws(
+      () => computeTaxLines([{ name: 'Unknown', type: 'BOGUS', value: 10 }], 100),
+      /Unsupported tax line type for 'Unknown'/,
+    );
+  });
+});

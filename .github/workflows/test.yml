@@ -1,0 +1,199 @@
+name: Azaman Test Suite
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  merge_group:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: backend-test-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    # Budget must cover the worst case: one full suite run PLUS the single
+    # retry-on-failure. Measured full run with tuned Postgres: minutes, not
+    # tens of minutes on a healthy runner. But observed 2026-09-20: a noisy
+    # GitHub runner executed the same 236-suite battery ~4x slower (32.5 min
+    # for attempt one) — a retry on such a runner needs ~70 min, which the
+    # previous 45-min budget cut off mid-suite, converting a transient
+    # slow-runner retry into a hard job timeout. 90 min covers the observed
+    # slow-runner full+retry case with margin; on healthy runners the job
+    # finishes in ~10 min regardless.
+    timeout-minutes: 90
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: azm_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d azm_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/azm_test?schema=public
+      TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/azm_test?schema=public
+      JWT_SECRET: test_secret_exactly_32_characters_long
+      NODE_ENV: test
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Node
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Audit production dependencies
+        run: npm audit --omit=dev --audit-level=low
+
+      - name: Prisma schema validation gate
+        # Explicit, named validation of prisma/schema.prisma — do not rely on
+        # `db push`/`generate` failing indirectly on a broken schema. A schema
+        # that does not validate must stop CI at its own gate with a clear
+        # name in the summary.
+        run: npx prisma validate
+
+      - name: Apply database schema
+        # CI uses a disposable PostgreSQL instance. Production remains managed
+        # by the repository's established db-push release process.
+        run: npx prisma db push --accept-data-loss
+
+      - name: Install wallet address overlay
+        run: node infra/install-wallet-address-overlay.js
+
+      - name: Install custody execution overlay
+        run: node infra/install-custody-execution-overlay.js
+
+      - name: Install custody accounting overlay
+        run: node infra/install-custody-accounting-overlay.js
+
+      - name: Install transaction quote overlay
+        run: node infra/install-transaction-quote-overlay.js
+
+      - name: Install r19 smart-route execution snapshot overlay
+        # r19: the snapshot columns the Smart Route executors/recovery read.
+        # Mirrors the release chain (npm run release) and the migration.
+        run: node infra/install-r19-smartroute-execution-snapshot-overlay.js
+      - name: Install r42 financial idempotency overlay
+        # r42: the FinancialOperation claim table behind the Idempotency-Key
+        # financial authority. Mirrors the release chain (npm run release).
+        run: node infra/install-r42-idempotency-overlay.js
+
+      - name: Install payout reconciliation infrastructure
+        run: node infra/install-payout-reconciliation-infra.js
+
+      - name: Install fiat liquidity authority overlay
+        run: node infra/install-fiat-liquidity-overlay.js
+
+      - name: Install Model B settlement overlay
+        run: node infra/install-model-b-settlement-overlay.js
+
+      # PR #292 follow-up: the release chain (npm run release) executes the
+      # business-os overlay in production (it is the schema authority for
+      # Business OS DDL, including the ProfitSource EWA_FEE enum value that
+      # the EWA fee realization writes to AdminProfitLog). CI previously
+      # never executed it, so a broken business-os overlay would only be
+      # discovered at deploy time. CI now exercises the exact same installer.
+      - name: Install business OS overlay
+        run: node infra/install-business-os-overlay.js
+
+      - name: Install inventory restock authority
+        run: node infra/install-inventory-restock-overlay.js
+
+      - name: Install reservation capacity authority
+        run: node infra/install-reservation-capacity-overlay.js
+
+      - name: Install E2EE server-blind authority
+        run: node infra/install-e2ee-server-blind-overlay.js
+
+      # §r40.1 P1-L — static invariant audit, companion to the behavioral
+      # proof suites: no private-key columns can enter the E2EE schema, the
+      # feature stays disabled by default, restock fingerprints stay exact.
+      - name: E2EE server-blind invariant audit
+        run: node infra/audit-e2ee-invariants.js
+
+      - name: Generate Prisma client
+        run: npx prisma generate
+
+      - name: Tune disposable Postgres for test workloads
+        # The service container pays a real fsync on every commit; the
+        # TRUNCATE-heavy cleanup hooks make the suite 10x+ slower than the
+        # same run against a local database. This is a THROWAWAY CI database
+        # (no durability requirement), so relax commit durability:
+        # synchronous_commit is applied to existing sessions via SIGHUP —
+        # no container restart needed. Production databases are unaffected.
+        # This tuning is FORBIDDEN in the financial-durability lane
+        # (financial-durability.yml), which rehearses the critical financial
+        # suites in the production commit mode and fails if it finds it.
+        # prisma db execute wraps statements in a transaction and
+        # ALTER SYSTEM cannot run inside one (run 35367906505), so run
+        # psql inside the service container directly.
+        run: |
+          CONTAINER=$(docker ps --filter "ancestor=postgres:16" --format "{{ .ID }}" | head -1)
+          docker exec "$CONTAINER" psql -U postgres -d azm_test \
+            -c "ALTER SYSTEM SET synchronous_commit = off" \
+            -c "SELECT pg_reload_conf();"
+
+      - name: Run tests
+        # DB-backed suites share one disposable database and truncate between
+        # tests, so Jest must remain serial. The application bootstrap also
+        # leaves Prisma/pg handles open, hence forceExit.
+        # Retry once only to absorb a transient CI database/runner timeout;
+        # genuine test failures must reproduce and still fail the job.
+        run: |
+          set +e
+          npm test -- --runInBand --forceExit
+          code=$?
+          if [ $code -ne 0 ]; then
+            echo "::warning::Test suite failed on first attempt — retrying once for transient CI-environment failures."
+            npm test -- --runInBand --forceExit
+            code=$?
+          fi
+          exit $code
+
+      - name: Checkout authoritative frontend (AZM-businessPortal)
+        # route-check is a FRONTEND/BACKEND compatibility gate: it must scan
+        # the real frontend API layer, never pass vacuously on a backend-only
+        # workspace. The frontend repository is public, so no cross-repo
+        # credentials are needed; the default GITHUB_TOKEN cannot read other
+        # private repos anyway. Pinned to main: the gate validates the
+        # CURRENT authoritative frontend against this backend.
+        uses: actions/checkout@v7
+        with:
+          repository: AzamanLTD/AZM-businessPortal
+          ref: main
+          path: frontend/AZM-businessPortal
+
+      - name: Verify route registry against frontend API usage
+        # Fail-closed: ROUTE_CHECK_REQUIRE_FRONTEND=1 makes an absent or
+        # empty frontend source fail the gate instead of a zero-call PASS.
+        env:
+          ROUTE_CHECK_FRONTEND_ROOT: ${{ github.workspace }}/frontend/AZM-businessPortal
+          ROUTE_CHECK_REQUIRE_FRONTEND: '1'
+        run: npm run route-check
+
+      - name: Database backup and restore drill
+        env:
+          PG_ADMIN_URL: postgres://postgres:postgres@localhost:5432/postgres
+          BACKUP_DRILL_ALLOW_MUTATION: '1'
+        run: npm run db:recovery-drill

@@ -1,0 +1,159 @@
+// services/oracleService.js
+const logger = require('../src/config/logger');
+const axios = require('axios');
+
+const KOTANI_DEFAULT_BASE_URL = 'https://sandbox-api.kotanipay.io/api/v3';
+const FALLBACK_FX_URL = 'https://open.er-api.com/v6/latest/USD';
+
+const asFinitePositive = (value) => {
+    const number = Number(value);
+    return Number.isFinite(number) && number > 0 ? number : null;
+};
+
+const extractKotaniRate = (payload) => {
+    const candidates = [
+        payload?.rate,
+        payload?.exchangeRate,
+        payload?.data?.rate,
+        payload?.data?.exchangeRate,
+        payload?.result?.rate,
+        payload?.result?.exchangeRate,
+    ];
+    for (const candidate of candidates) {
+        const rate = asFinitePositive(candidate);
+        if (rate) return rate;
+    }
+
+    const cryptoAmount = asFinitePositive(
+        payload?.cryptoAmount ?? payload?.data?.cryptoAmount ?? payload?.result?.cryptoAmount
+    );
+    const fiatAmount = asFinitePositive(
+        payload?.fiatAmount ?? payload?.data?.fiatAmount ?? payload?.result?.fiatAmount
+    );
+    if (cryptoAmount && fiatAmount) return fiatAmount / cryptoAmount;
+
+    return null;
+};
+
+class OracleService {
+    constructor(prisma) {
+        this.prisma = prisma;
+        this.updateInterval = 10 * 60 * 1000;
+        this.rateAlertService = null;
+    }
+
+    startOracle() {
+        logger.info('🌐 Azaman Live Market Oracle: INITIALIZED');
+        this.fetchAndUpdateRates();
+        setInterval(() => this.fetchAndUpdateRates(), this.updateInterval);
+    }
+
+    async fetchKotaniUsdcToGhsRate() {
+        const provider = String(process.env.KOTANI_PROVIDER || 'MOCK').toUpperCase();
+        const token = process.env.KOTANI_API_TOKEN || process.env.KOTANI_API_KEY;
+        if (provider !== 'LIVE' || !token || token === 'mock-key') return null;
+
+        const baseUrl = String(process.env.KOTANI_API_BASE_URL || KOTANI_DEFAULT_BASE_URL).replace(/\/$/, '');
+        const from = process.env.KOTANI_RATE_FROM || 'USDC';
+        const to = process.env.KOTANI_RATE_TO || 'CGHS';
+        const response = await axios.post(`${baseUrl}/rate/offramp`, {
+            from,
+            to,
+            cryptoAmount: 1,
+        }, {
+            headers: { Authorization: `Bearer ${token}` },
+            timeout: 8000,
+        });
+        const rate = extractKotaniRate(response.data);
+        if (!rate) throw new Error('Kotani Pay rate response did not contain a usable USDC/GHS rate.');
+        return rate;
+    }
+
+    async fetchFallbackUsdToGhsRate() {
+        const response = await axios.get(FALLBACK_FX_URL, { timeout: 8000 });
+        return asFinitePositive(response.data?.rates?.GHS);
+    }
+
+    async fetchAndUpdateRates() {
+        try {
+            const cryptoResponse = await axios.get('https://api.coingecko.com/api/v3/simple/price?ids=tether,usd-coin,dai&vs_currencies=usd', { timeout: 8000 });
+            const tetherPrice = asFinitePositive(cryptoResponse.data?.tether?.usd);
+            const usdcPrice = asFinitePositive(cryptoResponse.data?.['usd-coin']?.usd);
+            const daiPrice = asFinitePositive(cryptoResponse.data?.dai?.usd);
+            if (!tetherPrice || !usdcPrice || !daiPrice) throw new Error('CoinGecko returned incomplete stablecoin rates.');
+
+            let usdcToGhsRate = null;
+            let usdToGhsRate = null;
+            let rateSource = 'FALLBACK_FX';
+
+            try {
+                usdcToGhsRate = await this.fetchKotaniUsdcToGhsRate();
+                if (usdcToGhsRate) rateSource = 'KOTANI_PAY';
+            } catch (error) {
+                logger.warn({ err: error }, '[Oracle] Kotani Pay rate unavailable; using fallback FX provider.');
+            }
+
+            if (!usdcToGhsRate) {
+                usdToGhsRate = await this.fetchFallbackUsdToGhsRate();
+                if (usdToGhsRate) {
+                    // The fallback quotes USD/GHS; apply the live USDC/USD
+                    // market price so the user-facing rate remains USDC/GHS.
+                    usdcToGhsRate = usdToGhsRate * usdcPrice;
+                }
+            } else {
+                // Kotani supplies the direct USDC/GHS rate. Keep the legacy
+                // USD/GHS field at the same value for backward-compatible API
+                // consumers; the canonical retail field is the authoritative
+                // USDC/GHS display rate.
+                usdToGhsRate = usdcToGhsRate;
+            }
+
+            if (!usdcToGhsRate) throw new Error('No usable USD/USDC to GHS rate is available.');
+
+            // One observation timestamp for both freshness fields (issue
+            // #271 / PR 271B): the oracle is the canonical success-only
+            // EXTERNAL writer, so lastRateSync and lastExternalSync always
+            // describe the same successful observation. On failure the cached
+            // rate and both timestamps are left untouched (see catch below).
+            const observationTimestamp = new Date();
+            await this.prisma.globalSettings.upsert({
+                where: { id: 1 },
+                update: {
+                    liveUsdToGhs: usdToGhsRate,
+                    liveRetailRate: usdcToGhsRate,
+                    liveUsdtToUsd: tetherPrice,
+                    liveUsdcToUsd: usdcPrice,
+                    liveDaiToUsd: daiPrice,
+                    liveRateSource: rateSource,
+                    lastRateSync: observationTimestamp,
+                    lastExternalSync: observationTimestamp,
+                },
+                create: {
+                    id: 1,
+                    liveUsdToGhs: usdToGhsRate,
+                    liveRetailRate: usdcToGhsRate,
+                    liveUsdtToUsd: tetherPrice,
+                    liveUsdcToUsd: usdcPrice,
+                    liveDaiToUsd: daiPrice,
+                    liveRateSource: rateSource,
+                    lastRateSync: observationTimestamp,
+                    lastExternalSync: observationTimestamp,
+                }
+            });
+
+            logger.info(`📈 Oracle Sync: 1 USDC ≈ ${usdcToGhsRate} GHS | source=${rateSource}`);
+
+            if (this.rateAlertService && usdcToGhsRate) {
+                setImmediate(() => {
+                    this.rateAlertService.checkAlerts(usdcToGhsRate, 'USDC_GHS')
+                        .catch(err => logger.error({ err }, '[Oracle] alert check error'));
+                });
+            }
+        } catch (error) {
+            logger.error({ err: error }, '🚨 Oracle Sync Failed. Existing cached rate preserved.');
+        }
+    }
+}
+
+module.exports = OracleService;
+module.exports.extractKotaniRate = extractKotaniRate;

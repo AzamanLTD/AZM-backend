@@ -1,0 +1,2 @@
+ALTER TABLE "RateAlert"
+  ALTER COLUMN "ratePair" SET DEFAULT 'USDC_GHS';

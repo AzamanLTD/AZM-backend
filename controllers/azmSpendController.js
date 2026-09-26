@@ -1,0 +1,306 @@
+// controllers/azmSpendController.js
+// =============================================================================
+// AZAMAN — AZM SPEND CONTROLLER (Phase E2)
+//
+// Endpoints for spending AZM loyalty points on premium features.
+//
+// GET  /api/azm/spend/options       — Available spend options
+// POST /api/azm/spend/fee-discount  — Apply fee discount (standalone, outside withdrawal flow)
+// POST /api/azm/spend/ad-boost      — Boost an ad for featured placement
+// GET  /api/azm/spend/history       — Paginated spend history
+// =============================================================================
+
+const logger = require('../src/config/logger');
+const { AZM_SPEND_SOURCES, FEE_DISCOUNT_TIERS, AD_BOOST_OPTIONS, CARD_SKIN_OPTIONS } = require('../services/azmSpendService');
+
+// =============================================================================
+// GET /api/azm/spend/options
+// Returns available spend options with affordability based on user's balance
+// =============================================================================
+exports.getSpendOptions = async (req, res) => {
+    try {
+        const azmSpendService = req.app.get('azmSpendService');
+        if (!azmSpendService) {
+            return res.status(503).json({ success: false, message: 'AZM spend service unavailable.' });
+        }
+
+        const userId = req.user.id;
+        const options = await azmSpendService.getSpendOptions(userId);
+
+        return res.status(200).json({ success: true, data: options });
+    } catch (error) {
+        logger.error({ err: error }, '[azmSpend.getSpendOptions] Error');
+        return res.status(500).json({ success: false, message: 'Failed to fetch spend options.' });
+    }
+};
+
+// =============================================================================
+// POST /api/azm/spend/fee-discount
+// Body: { tierId: 'tier_25' | 'tier_50' | 'tier_100' }
+//
+// Standalone endpoint for pre-purchasing a fee discount before initiating
+// a withdrawal. Returns a discount token the FE can pass to the withdrawal
+// endpoint. Also usable directly by the withdrawal controller (wired in E2).
+// =============================================================================
+exports.applyFeeDiscount = async (req, res) => {
+    try {
+        const azmSpendService = req.app.get('azmSpendService');
+        if (!azmSpendService) {
+            return res.status(503).json({ success: false, message: 'AZM spend service unavailable.' });
+        }
+
+        const userId = req.user.id;
+        const { tierId } = req.body;
+
+        if (!tierId || typeof tierId !== 'string') {
+            return res.status(400).json({
+                success: false,
+                message: 'tierId is required. Valid options: ' + FEE_DISCOUNT_TIERS.map(t => t.id).join(', ')
+            });
+        }
+
+        const validTier = FEE_DISCOUNT_TIERS.find(t => t.id === tierId);
+        if (!validTier) {
+            return res.status(400).json({
+                success: false,
+                message: `Invalid tierId "${tierId}". Valid options: ${FEE_DISCOUNT_TIERS.map(t => t.id).join(', ')}`
+            });
+        }
+
+        const result = await azmSpendService.applyFeeDiscount(userId, tierId);
+
+        return res.status(200).json({
+            success: true,
+            message: `${validTier.label} fee discount applied! ${validTier.cost} AZM spent.`,
+            data: {
+                discount: result.discount,
+                discountPercent: `${(result.discount * 100).toFixed(0)}%`,
+                azmSpent: result.azmSpent,
+                newAzmBalance: result.newBalance
+            }
+        });
+    } catch (error) {
+        logger.error({ err: error }, '[azmSpend.applyFeeDiscount] Error');
+
+        if (error.message.includes('Insufficient AZM')) {
+            return res.status(400).json({
+                success: false,
+                code: 'INSUFFICIENT_AZM',
+                message: error.message
+            });
+        }
+
+        return res.status(400).json({ success: false, message: error.message });
+    }
+};
+
+// =============================================================================
+// POST /api/azm/spend/ad-boost
+// Body: { adId: number, boostId: 'boost_24h' | 'boost_72h' | 'boost_7d' }
+// =============================================================================
+exports.boostAd = async (req, res) => {
+    try {
+        const azmSpendService = req.app.get('azmSpendService');
+        if (!azmSpendService) {
+            return res.status(503).json({ success: false, message: 'AZM spend service unavailable.' });
+        }
+
+        const userId = req.user.id;
+        const { adId, boostId, idempotencyKey } = req.body;
+
+        // §r41 (final-audit #14) — optional stable logical operation
+        // identity. A client retry WITH the same key converges to the
+        // original purchase (exactly-once charge). WITHOUT a key every call
+        // is a distinct purchase.
+        if (idempotencyKey !== undefined && (typeof idempotencyKey !== 'string' || idempotencyKey.length < 8 || idempotencyKey.length > 100)) {
+            return res.status(400).json({
+                success: false,
+                message: 'idempotencyKey, if provided, must be a string of 8-100 characters.'
+            });
+        }
+
+        if (!adId || isNaN(parseInt(adId, 10))) {
+            return res.status(400).json({ success: false, message: 'adId is required (integer).' });
+        }
+
+        if (!boostId || typeof boostId !== 'string') {
+            return res.status(400).json({
+                success: false,
+                message: 'boostId is required. Valid options: ' + AD_BOOST_OPTIONS.map(o => o.id).join(', ')
+            });
+        }
+
+        const validOption = AD_BOOST_OPTIONS.find(o => o.id === boostId);
+        if (!validOption) {
+            return res.status(400).json({
+                success: false,
+                message: `Invalid boostId "${boostId}". Valid options: ${AD_BOOST_OPTIONS.map(o => o.id).join(', ')}`
+            });
+        }
+
+        const result = await azmSpendService.boostAd(userId, parseInt(adId, 10), boostId, idempotencyKey || null);
+
+        // Emit marketplace update so other users see the boosted ad
+        const io = req.app.get('socketio');
+        if (io) io.emit('market_update');
+
+        return res.status(200).json({
+            success: true,
+            message: `Ad #${adId} boosted for ${validOption.label}! ${validOption.cost} AZM spent.`,
+            data: {
+                adId: parseInt(adId, 10),
+                boostDuration: validOption.label,
+                boostExpiresAt: result.boostExpiresAt,
+                azmSpent: result.azmSpent,
+                newAzmBalance: result.newBalance
+            }
+        });
+    } catch (error) {
+        logger.error({ err: error }, '[azmSpend.boostAd] Error');
+
+        if (error.message.includes('Insufficient AZM')) {
+            return res.status(400).json({
+                success: false,
+                code: 'INSUFFICIENT_AZM',
+                message: error.message
+            });
+        }
+        if (error.message.includes('not found') || error.message.includes('only boost your own')) {
+            return res.status(403).json({ success: false, message: error.message });
+        }
+
+        return res.status(400).json({ success: false, message: error.message });
+    }
+};
+
+// =============================================================================
+// GET /api/azm/spend/history
+// Query params: ?cursor=<id>&limit=20&source=FEE_DISCOUNT
+// =============================================================================
+exports.getSpendHistory = async (req, res) => {
+    try {
+        const azmSpendService = req.app.get('azmSpendService');
+        if (!azmSpendService) {
+            return res.status(503).json({ success: false, message: 'AZM spend service unavailable.' });
+        }
+
+        const userId = req.user.id;
+        const { cursor, limit, source } = req.query;
+
+        const parsedLimit = limit ? Math.min(parseInt(limit, 10) || 20, 100) : 20;
+
+        if (source && !Object.values(AZM_SPEND_SOURCES).includes(source)) {
+            return res.status(400).json({
+                success: false,
+                message: `Invalid source filter. Valid options: ${Object.values(AZM_SPEND_SOURCES).join(', ')}`
+            });
+        }
+
+        const result = await azmSpendService.getSpendHistory(userId, {
+            cursor: cursor || undefined,
+            limit: parsedLimit,
+            source: source || undefined
+        });
+
+        return res.status(200).json({
+            success: true,
+            data: {
+                spends: result.spends,
+                pagination: {
+                    nextCursor: result.nextCursor,
+                    hasMore: result.hasMore,
+                    limit: parsedLimit
+                }
+            }
+        });
+    } catch (error) {
+        logger.error({ err: error }, '[azmSpend.getSpendHistory] Error');
+        return res.status(500).json({ success: false, message: 'Failed to fetch AZM spend history.' });
+    }
+};
+
+
+// =============================================================================
+// GET /api/azm/spend/card-skins
+// Returns the card skin catalog with per-user ownership/equipped/affordability.
+// =============================================================================
+exports.getCardSkinCatalog = async (req, res) => {
+    try {
+        const azmSpendService = req.app.get('azmSpendService');
+        if (!azmSpendService) {
+            return res.status(503).json({ success: false, message: 'AZM spend service unavailable.' });
+        }
+
+        const data = await azmSpendService.getCardSkinCatalog(req.user.id);
+        return res.status(200).json({ success: true, data });
+    } catch (error) {
+        logger.error({ err: error }, '[azmSpend.getCardSkinCatalog] Error');
+        return res.status(500).json({ success: false, message: 'Failed to fetch card skin catalog.' });
+    }
+};
+
+// =============================================================================
+// POST /api/azm/spend/card-skin/purchase
+// Body: { skinId: 'gold' | 'midnight' | 'emerald' | 'sunset' }
+// =============================================================================
+exports.purchaseCardSkin = async (req, res) => {
+    try {
+        const azmSpendService = req.app.get('azmSpendService');
+        if (!azmSpendService) {
+            return res.status(503).json({ success: false, message: 'AZM spend service unavailable.' });
+        }
+
+        const { skinId } = req.body;
+        if (!skinId || typeof skinId !== 'string') {
+            return res.status(400).json({
+                success: false,
+                message: 'skinId is required. Valid options: ' + CARD_SKIN_OPTIONS.map(s => s.id).join(', ')
+            });
+        }
+
+        const result = await azmSpendService.purchaseCardSkin(req.user.id, skinId);
+
+        return res.status(200).json({
+            success: true,
+            message: result.purchased ? 'Card skin purchased!' : 'You already own this skin.',
+            data: result
+        });
+    } catch (error) {
+        logger.error({ err: error }, '[azmSpend.purchaseCardSkin] Error');
+
+        if (error.message.includes('Insufficient AZM')) {
+            return res.status(400).json({ success: false, code: 'INSUFFICIENT_AZM', message: error.message });
+        }
+        return res.status(400).json({ success: false, message: error.message });
+    }
+};
+
+// =============================================================================
+// POST /api/azm/spend/card-skin/equip
+// Body: { skinId: 'classic' | 'gold' | 'midnight' | 'emerald' | 'sunset' }
+// Free — just switches which owned skin is active on future transfers.
+// =============================================================================
+exports.equipCardSkin = async (req, res) => {
+    try {
+        const azmSpendService = req.app.get('azmSpendService');
+        if (!azmSpendService) {
+            return res.status(503).json({ success: false, message: 'AZM spend service unavailable.' });
+        }
+
+        const { skinId } = req.body;
+        if (!skinId || typeof skinId !== 'string') {
+            return res.status(400).json({ success: false, message: 'skinId is required.' });
+        }
+
+        const result = await azmSpendService.equipCardSkin(req.user.id, skinId);
+
+        return res.status(200).json({
+            success: true,
+            message: `Equipped "${skinId}" card skin.`,
+            data: result
+        });
+    } catch (error) {
+        logger.error({ err: error }, '[azmSpend.equipCardSkin] Error');
+        return res.status(400).json({ success: false, message: error.message });
+    }
+};

@@ -1,0 +1,2457 @@
+// controllers/adminController.js
+const logger = require('../src/config/logger');
+const { getReadPrisma } = require('../src/config/readReplica');
+const { sendPushNotification } = require('../utils/firebaseService');
+const { parsePagination, buildPageEnvelope } = require('../utils/pagination');
+const { audit } = require('../utils/audit');
+const { Prisma } = require('@prisma/client');
+const ledger = require('../services/ledgerService');
+const restrictedObligations = require('../services/restrictedObligationService');
+const withdrawalBridge = require('../services/withdrawalBridgeService'); // r18 durable orphan-adoption claim
+const _exact = (n) => (n instanceof Prisma.Decimal ? n.toFixed(8) : Number(n).toFixed(8));
+const financeService = require('../services/finance.service');
+const { resolvePayoutOwner } = require('../services/payoutProviderOwnership');
+
+/**
+ * Helper: retrieve the singleton NotificationService from app context.
+ * Falls back to a lazy-init from prisma + io if needed (belt-and-braces).
+ */
+function _getNotificationService(req) {
+    const svc = req.app.get('notificationService');
+    if (svc) return svc;
+    const NotificationService = require('../services/notificationService');
+    const prisma = req.app.get('prisma');
+    const io = req.app.get('socketio');
+    return new NotificationService(prisma, io);
+}
+
+/**
+ * Helper: format seconds into human-readable uptime string
+ */
+function _formatUptime(seconds) {
+    const d = Math.floor(seconds / 86400);
+    const h = Math.floor((seconds % 86400) / 3600);
+    const m = Math.floor((seconds % 3600) / 60);
+    if (d > 0) return `${d}d ${h}h ${m}m`;
+    if (h > 0) return `${h}h ${m}m`;
+    return `${m}m`;
+}
+
+/**
+ * 1. GET ALL DISPUTED TRADES
+ *
+ * Phase I5 (2026-05-25): pagination added. Was unbounded — a high-dispute
+ * day could push hundreds of rows on every dashboard refresh. Default
+ * page size is 100 (preserves the natural admin-war-room read size);
+ * cap is the shared `MAX_LIMIT = 100` from `utils/pagination`. Cursor
+ * mode (`?cursor=ID&limit=N`) and offset mode (`?page=N&limit=M`) both
+ * accepted. Bare `disputes` top-level key preserved for the existing
+ * `lib/screens/admin_war_room_screen.dart` consumer; new `pagination`
+ * envelope alongside it.
+ */
+exports.getAllDisputes = async (req, res) => {
+    const prisma = req.app.get('prisma');
+
+    try {
+        const queryHasNoPaginationParams =
+            req.query.cursor == null &&
+            req.query.limit == null &&
+            req.query.page == null;
+        // When no pagination param is passed we keep the previous
+        // unbounded-feeling default by raising the take to 100. Opted-in
+        // callers get the standard 20-row default unless they specify.
+        if (queryHasNoPaginationParams) req.query.limit = '100';
+
+        const { take, cursor, mode, page, skip } = parsePagination(req.query);
+
+        const where = { status: 'DISPUTED' };
+        const findArgs = {
+            where,
+            orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+            take,
+            include: {
+                user: { select: { id: true, username: true, email: true } },
+                vendor: { select: { id: true, username: true, email: true } },
+                messages: { orderBy: { createdAt: 'asc' } }
+            }
+        };
+        if (cursor) {
+            findArgs.cursor = { id: parseInt(cursor, 10) };
+            findArgs.skip = 1;
+        } else if (skip > 0) {
+            findArgs.skip = skip;
+        }
+
+        // Only count on page-1 of offset mode — admin dashboards show
+        // pagination chips, but we don't need to recompute the total on
+        // every page navigation. Cursor mode never needs a total.
+        const wantsTotal = mode === 'offset' && page === 1;
+        const [disputes, total] = await Promise.all([
+            prisma.trade.findMany(findArgs),
+            wantsTotal ? prisma.trade.count({ where }) : Promise.resolve(undefined)
+        ]);
+
+        const envelope = buildPageEnvelope(disputes, take, mode, page, total);
+        res.status(200).json({ success: true, disputes, pagination: envelope });
+    } catch (error) {
+        logger.error("Fetch Disputes Error:", error);
+        res.status(500).json({ success: false, message: "Could not fetch disputes." });
+    }
+};
+
+/**
+ * 2. GET ALL LIVE TRADES (THE WAR ROOM FEED)
+ *
+ * ADMIN BUG FIX: The previous filter used 'PENDING' which doesn't exist
+ * in the TradeStatus enum. The actual enum values are:
+ *   PENDING, PENDING_PAYMENT, PAID, COMPLETED, CANCELLED, DISPUTED
+ *
+ * We now fetch ALL non-terminal trades so nothing slips through.
+ *
+ * Phase I5 (2026-05-25): pagination added. The hardcoded `take: 100`
+ * cap was a silent ceiling — a war-room admin during peak hours
+ * couldn't see trade #101+. Cap is preserved as the default page size
+ * (matches MAX_LIMIT) but admins can now navigate past it via
+ * `?cursor=ID&limit=N` (cursor mode, append-stable) or
+ * `?page=N&limit=M` (offset mode, classic page chips). Bare `trades`
+ * top-level key preserved for the existing
+ * `lib/screens/admin_war_room_screen.dart` consumer.
+ */
+exports.getLiveTrades = async (req, res) => {
+    const prisma = req.app.get('prisma');
+
+    try {
+        const queryHasNoPaginationParams =
+            req.query.cursor == null &&
+            req.query.limit == null &&
+            req.query.page == null;
+        if (queryHasNoPaginationParams) req.query.limit = '100';
+
+        const { take, cursor, mode, page, skip } = parsePagination(req.query);
+
+        const where = { status: { notIn: ['COMPLETED', 'CANCELLED'] } };
+        const findArgs = {
+            where,
+            orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+            take,
+            include: {
+                user: { select: { id: true, username: true, email: true } },
+                vendor: { select: { id: true, username: true, email: true } },
+                messages: { orderBy: { createdAt: 'asc' } }
+            }
+        };
+        if (cursor) {
+            findArgs.cursor = { id: parseInt(cursor, 10) };
+            findArgs.skip = 1;
+        } else if (skip > 0) {
+            findArgs.skip = skip;
+        }
+
+        const wantsTotal = mode === 'offset' && page === 1;
+        const [trades, total] = await Promise.all([
+            prisma.trade.findMany(findArgs),
+            wantsTotal ? prisma.trade.count({ where }) : Promise.resolve(undefined)
+        ]);
+
+        logger.info(`📊 Admin War Room: Returning ${trades.length} live trades (page ${page}, mode ${mode})`);
+
+        const envelope = buildPageEnvelope(trades, take, mode, page, total);
+        res.status(200).json({ success: true, trades, pagination: envelope });
+    } catch (error) {
+        logger.error("Fetch Live Trades Error:", error);
+        res.status(500).json({ success: false, message: "Could not fetch live network trades." });
+    }
+};
+
+/**
+ * 3. FORCE RELEASE (Admin override)
+ *
+ * V2: delegates to services/p2p.service.completeTrade — single source of
+ * truth. Admin authorization passes through `releasedByUserId` as the
+ * counterparty receiving fiat, identified from the trade type.
+ */
+exports.forceRelease = async (req, res) => {
+    const prisma            = req.app.get('prisma');
+    const io                = req.app.get('socketio');
+    const emitBalanceUpdate = req.app.get('emitBalanceUpdate');
+
+    try {
+        const { tradeId, adminNotes } = req.body;
+        const id = parseInt(tradeId);
+
+        const trade = await prisma.trade.findUnique({ where: { id } });
+        if (!trade)                          return res.status(404).json({ success: false, message: "Trade not found." });
+        if (trade.status !== 'DISPUTED')     return res.status(400).json({ success: false, message: "Trade is not disputed." });
+
+        // The party authorized to release is the one receiving fiat.
+        const releasedByUserId = trade.type === 'SELL' ? trade.vendorId : trade.userId;
+
+        // Issue #48: The separate DISPUTED → PAID claim is removed.
+        // completeTrade now accepts adminOverride and atomically claims
+        // DISPUTED → COMPLETED in one transaction. If the settlement fails,
+        // the trade remains DISPUTED (full rollback). Concurrent admins
+        // get TRADE_ALREADY_FINALIZED from the atomic claim, mapped to 409.
+        const p2pService = require('../services/p2p.service');
+        const result     = await p2pService.completeTrade(prisma, { tradeId: id, releasedByUserId, adminOverride: true });
+
+        // Lazy-create conversation, drop ADMIN_INTERVENTION message
+        let conversation = await prisma.conversation.findUnique({ where: { tradeId: String(id) } });
+        if (!conversation) {
+            conversation = await prisma.conversation.create({
+                data: {
+                    type:    'TRADE',
+                    tradeId: String(id),
+                    participants: { connect: [{ id: trade.userId }, { id: trade.vendorId }] }
+                }
+            });
+        }
+        await prisma.message.create({
+            data: {
+                conversationId: conversation.id,
+                senderId:       req.user.id,
+                tradeId:        id,
+                messageType:    'ADMIN_INTERVENTION',
+                content:        `Admin force-released the trade. Notes: ${adminNotes ?? 'Resolved by admin.'}`
+            }
+        });
+
+        if (emitBalanceUpdate) {
+            await emitBalanceUpdate(trade.userId);
+            await emitBalanceUpdate(trade.vendorId);
+        }
+
+        io.to(`trade_${id}`).emit('trade_update', {
+            status:  'COMPLETED',
+            message: `ADMIN RESOLUTION: Assets force-released. Notes: ${adminNotes ?? 'Resolved.'}`
+        });
+        io.to(`user_${trade.userId}`).emit('new_notification',   { title: 'Trade Resolved — Assets Released' });
+        io.to(`user_${trade.vendorId}`).emit('new_notification', { title: 'Trade Resolved by Admin' });
+
+        res.status(200).json({ success: true, message: 'Force Release Successful.', data: result });
+
+        // Append-only audit trail (fire-and-forget — never fails the request).
+        await audit(prisma, {
+            actorId: req.user.id, actorName: req.user.username,
+            action: 'FORCE_RELEASE_TRADE', targetType: 'TRADE', targetId: String(tradeId),
+            metadata: { adminNotes: adminNotes || null, previousStatus: 'DISPUTED' },
+            ipAddress: req.ip,
+        });
+    } catch (error) {
+        logger.error("Force Release Error:", error);
+        if (error.message === 'TRADE_ALREADY_FINALIZED') {
+            return res.status(409).json({
+                success: false,
+                message: 'Trade is no longer disputed (concurrent admin action).'
+            });
+        }
+        res.status(500).json({ success: false, message: error.message });
+    }
+};
+
+/**
+ * 4. FORCE CANCEL (Admin override)
+ *
+ * V2: refunds escrow using the V2 ledger fields. SELL ad → vendor's
+ * `escrowLockedBalance` returns to `vendorUnallocatedBalance`. BUY ad →
+ * buyer's escrowed USDC is restored to `availableBalance` (Phase D-2).
+ * Writes an ADMIN_INTERVENTION message.
+ */
+exports.forceCancel = async (req, res) => {
+    const prisma            = req.app.get('prisma');
+    const io                = req.app.get('socketio');
+    const emitBalanceUpdate = req.app.get('emitBalanceUpdate');
+
+    try {
+        const { tradeId, adminNotes } = req.body;
+        const id = parseInt(tradeId);
+
+        const trade = await prisma.trade.findUnique({ where: { id } });
+        if (!trade)                       return res.status(404).json({ success: false, message: "Trade not found." });
+        if (trade.status !== 'DISPUTED')  return res.status(400).json({ success: false, message: "Trade is not disputed." });
+
+        const isSellAd = trade.type === 'SELL';
+
+        await prisma.$transaction(async (tx) => {
+            // Phase H9 BUGFIX (2026-05-27): atomic conditional status
+            // flip. Two concurrent forceCancel calls (two admins or one
+            // admin double-clicking the override button on the dispute
+            // resolution page) would both pass the DISPUTED check above
+            // (which runs OUTSIDE the transaction) and both refund the
+            // escrow. Fix: claim the row FIRST inside the transaction.
+            const claimed = await tx.trade.updateMany({
+                where: { id, status: 'DISPUTED' },
+                data:  { status: 'CANCELLED' }
+            });
+            if (claimed.count === 0) {
+                throw new Error('TRADE_NO_LONGER_DISPUTED');
+            }
+
+            if (isSellAd) {
+                // Vendor's escrow returns to their unallocated pool (V2 fields).
+                await tx.user.update({
+                    where: { id: trade.vendorId },
+                    data: {
+                        escrowLockedBalance:      { decrement: trade.amountCrypto },
+                        vendorUnallocatedBalance: { increment: trade.amountCrypto }
+                    }
+                });
+            } else {
+                // BUY ad: refund the user's escrowed USDC (Phase F correction).
+                await tx.user.update({
+                    where: { id: trade.userId },
+                    data: {
+                        escrowLockedBalance: { decrement: trade.amountCrypto },
+                        availableBalance:    { increment: trade.amountCrypto }
+                    }
+                });
+            }
+
+            // §P.4 AUTHORITATIVE LEDGER — admin force-cancel refund, same
+            // transaction. The DISPUTED → CANCELLED atomic claim above is the
+            // single-winner boundary, so the posting is exactly-once on this
+            // identity. Mirrors the tradeWorker auto-cancel accounting:
+            //   SELL ad → D escrow:trade-{id}:locked  C user:{vendor}:unallocated
+            //   BUY  ad → D escrow:trade-{id}:locked  C user:{user}:liability
+            await ledger.post(tx, {
+                idempotencyKey: `ledger:p2p:force-cancel:${id}`,
+                entryType: isSellAd ? 'VENDOR_ALLOCATE' : 'ESCROW_REFUND',
+                description: isSellAd
+                    ? 'Admin force-cancel — vendor escrow returned to unallocated trading pool'
+                    : 'Admin force-cancel — buyer escrow refunded to available balance',
+                userId: isSellAd ? trade.vendorId : trade.userId,
+                relatedEntity: 'trade',
+                relatedEntityId: id,
+                metadata: { adminId: req.user.id, adminNotes: adminNotes ?? null },
+                lines: isSellAd
+                    ? [
+                        { account: `escrow:trade-${id}:locked`, debit: _exact(trade.amountCrypto) },
+                        { account: `user:${trade.vendorId}:unallocated`, credit: _exact(trade.amountCrypto) },
+                      ]
+                    : [
+                        { account: `escrow:trade-${id}:locked`, debit: _exact(trade.amountCrypto) },
+                        { account: `user:${trade.userId}:liability`, credit: _exact(trade.amountCrypto) },
+                      ],
+            });
+
+            // Trade was already stamped CANCELLED at the top of this
+            // transaction (atomic conditional flip).
+
+            // Lazy-create conversation, drop ADMIN_INTERVENTION message
+            let conversation = await tx.conversation.findUnique({ where: { tradeId: String(id) } });
+            if (!conversation) {
+                conversation = await tx.conversation.create({
+                    data: {
+                        type:    'TRADE',
+                        tradeId: String(id),
+                        participants: { connect: [{ id: trade.userId }, { id: trade.vendorId }] }
+                    }
+                });
+            }
+            await tx.message.create({
+                data: {
+                    conversationId: conversation.id,
+                    senderId:       req.user.id,
+                    tradeId:        id,
+                    messageType:    'ADMIN_INTERVENTION',
+                    content:        `Admin cancelled the trade. Assets refunded. Notes: ${adminNotes ?? 'Resolved by admin.'}`
+                }
+            });
+
+            // Control-plane atomicity (issue #252, PR #241 contract): the
+            // FORCE_CANCEL_TRADE audit row is part of the SAME transaction as
+            // the DISPUTED -> CANCELLED claim, the escrow refund and the
+            // ADMIN_INTERVENTION message. Strict mode propagates an
+            // AuditLog.create failure so the whole financial reversal rolls
+            // back — a successful refund can never exist without its audit
+            // evidence, and a rolled-back refund never leaves an audit row.
+            // The conditional claim above stays first so it remains the
+            // concurrency winner.
+            await audit(tx, {
+                actorId: req.user.id, actorName: req.user.username,
+                action: 'FORCE_CANCEL_TRADE', targetType: 'TRADE', targetId: String(tradeId),
+                metadata: { adminNotes: adminNotes || null, previousStatus: 'DISPUTED' },
+                ipAddress: req.ip,
+            }, { throwOnError: true });
+        });
+
+        if (emitBalanceUpdate) {
+            await emitBalanceUpdate(trade.vendorId);
+            await emitBalanceUpdate(trade.userId);
+        }
+
+        io.to(`trade_${id}`).emit('trade_update', {
+            status:  'CANCELLED',
+            message: `ADMIN RESOLUTION: Trade cancelled. Notes: ${adminNotes ?? 'Resolved.'}`
+        });
+        io.to(`user_${trade.userId}`).emit('new_notification',   { title: 'Trade Cancelled by Admin' });
+        io.to(`user_${trade.vendorId}`).emit('new_notification', { title: 'Trade Resolved — Assets Returned' });
+
+        // The mandatory FORCE_CANCEL_TRADE audit row committed atomically with
+        // the financial reversal above — nothing audit-related runs here.
+        res.status(200).json({ success: true, message: 'Force Cancel Successful.' });
+    } catch (error) {
+        // Phase H9: another concurrent admin already finalized this
+        // trade. Surface a 409 so the FE can refresh and show the new
+        // state instead of a generic 500.
+        if (error.message === 'TRADE_NO_LONGER_DISPUTED') {
+            return res.status(409).json({
+                success: false,
+                message: 'Trade is no longer disputed (concurrent admin action).'
+            });
+        }
+        logger.error("Force Cancel Error:", error);
+        res.status(500).json({ success: false, message: error.message });
+    }
+};
+
+/**
+ * 5. PLATFORM METRICS
+ */
+exports.getPlatformStats = async (req, res) => {
+    const prisma = getReadPrisma(req.app);
+
+    try {
+        const totalUsers = await prisma.user.count();
+        const activeDisputes = await prisma.trade.count({ where: { status: 'DISPUTED' } });
+        
+        const completedTrades = await prisma.trade.aggregate({
+            where: { status: 'COMPLETED' },
+            _sum: { amountFiat: true, amountCrypto: true, vendorProfitCut: true }
+        });
+
+        const totalFiat = completedTrades._sum.amountFiat || 0;
+        const estimatedPlatformProfitGhs = (totalFiat * 0.015).toFixed(2);
+
+        res.status(200).json({
+            success: true,
+            stats: {
+                totalUsers,
+                activeDisputes,
+                totalFiatVolume: totalFiat,
+                totalAdminProfit: estimatedPlatformProfitGhs
+            }
+        });
+    } catch (error) {
+        res.status(500).json({ success: false, message: error.message });
+    }
+};
+
+/**
+ * 6. GET PENDING KYC APPLICATIONS
+ *
+ * Phase I5 (2026-05-25): pagination added. Was unbounded; a backlog of
+ * pending KYCs would push every applicant on every dashboard refresh.
+ * Default page size 100; opt-in via `?cursor=ID&limit=N` or
+ * `?page=N&limit=M`. Bare `applications` top-level key preserved for
+ * the existing `lib/screens/admin_war_room_screen.dart` consumer.
+ */
+exports.getPendingKyc = async (req, res) => {
+    const prisma = req.app.get('prisma');
+    try {
+        const queryHasNoPaginationParams =
+            req.query.cursor == null &&
+            req.query.limit == null &&
+            req.query.page == null;
+        if (queryHasNoPaginationParams) req.query.limit = '100';
+
+        const { take, cursor, mode, page, skip } = parsePagination(req.query);
+
+        const where = { kycStatus: 'PENDING' };
+        const findArgs = {
+            where,
+            orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+            take,
+            select: {
+                id: true,
+                username: true,
+                email: true,
+                legalName: true,
+                idType: true,
+                idNumber: true,
+                idImageFront: true,
+                idImageBack: true,
+                kycStatus: true,
+                createdAt: true,
+            }
+        };
+        if (cursor) {
+            findArgs.cursor = { id: parseInt(cursor, 10) };
+            findArgs.skip = 1;
+        } else if (skip > 0) {
+            findArgs.skip = skip;
+        }
+
+        const wantsTotal = mode === 'offset' && page === 1;
+        const [applications, total] = await Promise.all([
+            prisma.user.findMany(findArgs),
+            wantsTotal ? prisma.user.count({ where }) : Promise.resolve(undefined)
+        ]);
+
+        // Decrypt the at-rest-encrypted idNumber for the authorized admin
+        // review view (this endpoint is adminOnly). Legacy plaintext rows
+        // pass through unchanged; tryDecrypt returns null on any failure
+        // so a bad row degrades to null instead of 500-ing the queue.
+        const fieldCipher = require('../services/crypto/fieldCipher');
+        const decrypted = applications.map((u) => ({
+            ...u,
+            idNumber: u.idNumber ? fieldCipher.tryDecrypt(u.idNumber) : null,
+        }));
+
+        const envelope = buildPageEnvelope(decrypted, take, mode, page, total);
+        res.status(200).json({ success: true, applications: decrypted, pagination: envelope });
+    } catch (error) {
+        logger.error("Fetch KYC Error:", error);
+        res.status(500).json({ success: false, message: "Could not fetch KYC applications." });
+    }
+};
+
+/**
+ * 7. APPROVE KYC APPLICATION
+ *
+ * Phase K — bumps the user's tokenVersion in the same transaction as the
+ * role flip USER -> VENDOR, and revokes every active refresh token. The
+ * client's NEXT request hits `protect`, sees its access JWT's
+ * `tokenVersion` claim is below the live row, gets a `TOKEN_STALE` 401,
+ * tries `/api/auth/refresh` — but every refresh token is revoked too, so
+ * that fails with `REFRESH_INVALID`, and the client is forced to log in
+ * again. After the fresh login, the new JWT carries `role: 'VENDOR'` and
+ * the matching new tokenVersion. The privilege change has propagated
+ * exactly once, atomically.
+ */
+exports.approveKyc = async (req, res) => {
+    const prisma = req.app.get('prisma');
+    const io = req.app.get('socketio');
+
+    try {
+        const { userId } = req.body;
+        if (!userId) return res.status(400).json({ success: false, message: "userId is required." });
+
+        const targetId = parseInt(userId);
+
+        const user = await prisma.user.findUnique({ where: { id: targetId } });
+        if (!user) return res.status(404).json({ success: false, message: "User not found." });
+        if (user.kycStatus !== 'PENDING') return res.status(400).json({ success: false, message: "User is not pending KYC review." });
+
+        // Run the role flip + the tokenVersion bump + refresh-token
+        // revocation as one atomic transaction. If any step fails, none
+        // of them apply. This is critical: a partial state where the
+        // role is VENDOR but the tokenVersion isn't bumped would leave
+        // an old-claim USER access token still able to act for up to
+        // 15 more minutes, blocking the vendor surface from activating.
+        //
+        // Phase H12 BUGFIX (2026-05-27): atomic conditional flip on the
+        // user.update so two admins approving simultaneously can't both
+        // bump tokenVersion + fire two notifications. The standard
+        // updateMany-with-precondition pattern from H8.
+        const claimed = await prisma.$transaction(async (tx) => {
+            const upd = await tx.user.updateMany({
+                where: { id: targetId, kycStatus: 'PENDING' },
+                data: {
+                    kycStatus: 'VERIFIED',
+                    role: 'VENDOR',
+                    tokenVersion: { increment: 1 },
+                }
+            });
+            if (upd.count === 0) return { ok: false };
+            await tx.refreshToken.updateMany({
+                where: { userId: targetId, revokedAt: null },
+                data: { revokedAt: new Date() },
+            });
+            return { ok: true };
+        });
+
+        if (!claimed.ok) {
+            return res.status(409).json({
+                success: false,
+                message: 'KYC was already finalized by another admin (concurrent action).'
+            });
+        }
+
+        // Notify the user
+        await _getNotificationService(req).sendNotification({
+            userId: targetId,
+            title: "KYC Approved",
+            body: "Congratulations! Your identity has been verified. You are now a Verified Vendor.",
+            category: 'ADMIN_SYSTEM',
+            actionPayload: { action: 'KYC_STATUS', status: 'VERIFIED' }
+        });
+
+        io.to(`user_${userId}`).emit('kyc_update', { status: 'VERIFIED' });
+        // Tell the client to refresh its session — the access token it's
+        // holding is now stale (we bumped tokenVersion). The mobile app
+        // should listen for this event in the auth-bound provider and
+        // call POST /api/auth/refresh to get a new pair.
+        io.to(`user_${userId}`).emit('session_refresh_required', {
+            reason: 'role_changed',
+            newRole: 'VENDOR',
+        });
+
+        res.status(200).json({ success: true, message: "KYC approved. User promoted to Vendor." });
+
+        // Append-only audit trail (fire-and-forget — never fails the request).
+        await audit(prisma, {
+            actorId: req.user.id, actorName: req.user.username,
+            action: 'APPROVE_KYC', targetType: 'USER', targetId: String(targetId),
+            metadata: { previousStatus: 'PENDING', newStatus: 'VERIFIED', newRole: 'VENDOR' },
+            ipAddress: req.ip,
+        });
+    } catch (error) {
+        logger.error("Approve KYC Error:", error);
+        res.status(500).json({ success: false, message: error.message });
+    }
+};
+
+/**
+ * 8. REJECT KYC APPLICATION
+ */
+exports.rejectKyc = async (req, res) => {
+    const prisma = req.app.get('prisma');
+    const io = req.app.get('socketio');
+
+    try {
+        const { userId, reason } = req.body;
+        if (!userId) return res.status(400).json({ success: false, message: "userId is required." });
+
+        const user = await prisma.user.findUnique({ where: { id: parseInt(userId) } });
+        if (!user) return res.status(404).json({ success: false, message: "User not found." });
+        if (user.kycStatus !== 'PENDING') return res.status(400).json({ success: false, message: "User is not pending KYC review." });
+
+        // Phase H12 BUGFIX (2026-05-27): atomic conditional flip — same
+        // race protection as approveKyc. Without this, two admins both
+        // rejecting would both fire a notification + websocket emit.
+        const upd = await prisma.user.updateMany({
+            where: { id: parseInt(userId), kycStatus: 'PENDING' },
+            data: { kycStatus: 'REJECTED' }
+        });
+        if (upd.count === 0) {
+            return res.status(409).json({
+                success: false,
+                message: 'KYC was already finalized by another admin (concurrent action).'
+            });
+        }
+
+        await _getNotificationService(req).sendNotification({
+            userId: parseInt(userId),
+            title: "KYC Rejected",
+            body: reason || "Your identity verification was not approved. Please resubmit with clearer documents.",
+            category: 'ADMIN_SYSTEM',
+            actionPayload: { action: 'KYC_STATUS', status: 'REJECTED', reason: reason || null }
+        });
+
+        io.to(`user_${userId}`).emit('kyc_update', { status: 'REJECTED' });
+
+        res.status(200).json({ success: true, message: "KYC rejected." });
+
+        // Append-only audit trail (fire-and-forget — never fails the request).
+        await audit(prisma, {
+            actorId: req.user.id, actorName: req.user.username,
+            action: 'REJECT_KYC', targetType: 'USER', targetId: String(userId),
+            metadata: { previousStatus: 'PENDING', newStatus: 'REJECTED', reason: reason || null },
+            ipAddress: req.ip,
+        });
+    } catch (error) {
+        logger.error("Reject KYC Error:", error);
+        res.status(500).json({ success: false, message: error.message });
+    }
+};
+
+/**
+ * 9. INJECT ADMIN MESSAGE INTO CHAT
+ */
+exports.sendAdminMessage = async (req, res) => {
+    const prisma = req.app.get('prisma');
+    const io     = req.app.get('socketio');
+
+    try {
+        const { tradeId, message } = req.body;
+        const adminId = req.user.id;
+        const id      = parseInt(tradeId, 10);
+
+        if (!message || !message.trim()) {
+            return res.status(400).json({ success: false, message: 'Message content is required.' });
+        }
+
+        const trade = await prisma.trade.findUnique({
+            where:  { id },
+            select: { id: true, userId: true, vendorId: true }
+        });
+        if (!trade) return res.status(404).json({ success: false, message: 'Trade not found.' });
+
+        // Lazy-create the trade conversation (V2 schema)
+        let conversation = await prisma.conversation.findUnique({ where: { tradeId: String(id) } });
+        if (!conversation) {
+            conversation = await prisma.conversation.create({
+                data: {
+                    type:    'TRADE',
+                    tradeId: String(id),
+                    participants: { connect: [{ id: trade.userId }, { id: trade.vendorId }] }
+                }
+            });
+        }
+
+        const savedMessage = await prisma.message.create({
+            data: {
+                conversationId: conversation.id,
+                senderId:       adminId,
+                tradeId:        id,
+                messageType:    'ADMIN_INTERVENTION',
+                content:        message.trim()
+            },
+            include: { sender: { select: { id: true, username: true, role: true } } }
+        });
+
+        // Phase N: route through notificationService for socket + FCM delivery
+        const notifSvc = _getNotificationService(req);
+        await Promise.all([
+            notifSvc.sendNotification({
+                userId:        trade.userId,
+                title:         'Admin Message',
+                body:          message.substring(0, 200),
+                category:      'ADMIN_SYSTEM',
+                actionPayload: { action: 'OPEN_TRADE', tradeId: String(id) }
+            }),
+            notifSvc.sendNotification({
+                userId:        trade.vendorId,
+                title:         'Admin Message',
+                body:          message.substring(0, 200),
+                category:      'ADMIN_SYSTEM',
+                actionPayload: { action: 'OPEN_TRADE', tradeId: String(id) }
+            })
+        ]);
+
+        io.to(`trade_${id}`).emit('new_message', {
+            id:          savedMessage.id,
+            sender:      savedMessage.sender,
+            content:     savedMessage.content,
+            messageType: savedMessage.messageType,
+            createdAt:   savedMessage.createdAt
+        });
+
+        res.status(200).json({ success: true, message: 'Admin message injected successfully.' });
+    } catch (error) {
+        logger.error('Admin Chat Error:', error);
+        res.status(500).json({ success: false, message: error.message });
+    }
+};
+
+/**
+ * 10. LIQUIDATE PLATFORM PROFITS
+ *     Moves accumulated profit from SystemProfitFees → SystemFiatPool.
+ *     V2 FIX: Delegates to finance.service.js; uses V2 singleton models
+ *     (SystemProfitFees, SystemFiatPool) — the old SystemLedger is removed.
+ */
+exports.liquidateProfits = async (req, res) => {
+    const prisma   = req.app.get('prisma');
+    const io       = req.app.get('socketio');
+    const financeService = require('../services/finance.service');
+
+    try {
+        const { amountUsdc } = req.body;
+
+        if (!amountUsdc || Number(amountUsdc) <= 0) {
+            return res.status(400).json({ success: false, message: 'Invalid liquidation amount.' });
+        }
+
+        const data = await financeService.liquidateProfits(
+            prisma,
+            parseFloat(amountUsdc),
+            req.user.id,
+            { actorId: req.user.id, actorName: req.user.username, ipAddress: req.ip }
+        );
+
+        try {
+            io.emit('admin_alert', {
+                type:             'PROFIT_LIQUIDATION',
+                amountLiquidated: data.amountLiquidated,
+                newProfitFees:    data.newProfitFees,
+                newFiatPool:      data.newFiatPool,
+                timestamp:        new Date().toISOString()
+            });
+        } catch (socketErr) {
+            logger.error({ err: socketErr }, '[liquidateProfits] Failed to emit socket alert');
+        }
+
+        return res.status(200).json({
+            success: true,
+            message: `Liquidated ${data.amountLiquidated} USDC from profit fees to fiat pool.`,
+            data
+        });
+    } catch (error) {
+        logger.error({ err: error }, '[liquidateProfits] error');
+        return res.status(400).json({ success: false, message: error.message });
+    }
+};
+
+
+
+// =============================================================================
+// V4: NEW ADMIN ENDPOINTS — Full Command Center
+// =============================================================================
+
+/**
+ * 11. ENHANCED PLATFORM STATS
+ *     GET /api/admin/stats
+ *     Returns comprehensive metrics: 24h volume, new users today, active
+ *     vendors, revenue breakdown, trade counts by status.
+ */
+// (Replaces the old getPlatformStats above — we keep the old one as fallback
+//  but the route now points here)
+const _originalGetPlatformStats = exports.getPlatformStats;
+exports.getPlatformStats = async (req, res) => {
+    const prisma = getReadPrisma(req.app);
+
+    try {
+        const now = new Date();
+        const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+        const yesterday = new Date(today.getTime() - 24 * 60 * 60 * 1000);
+        const thisWeek = new Date(today.getTime() - 7 * 24 * 60 * 60 * 1000);
+
+        const [
+            totalUsers,
+            newUsersToday,
+            activeVendors,
+            totalTrades,
+            activeDisputes,
+            pendingKyc,
+            liveTrades,
+            completedToday,
+            completedAllTime,
+            volume24h,
+            volumeAllTime,
+            profitFees,
+            pendingWithdrawals,
+            activeEscrows,
+            disputedEscrows,
+            pendingBusinessKyb,
+            activeInvoices,
+            paidInvoicesToday,
+            activeLocations
+        ] = await Promise.all([
+            // Total users
+            prisma.user.count(),
+            // New users today
+            prisma.user.count({ where: { createdAt: { gte: today } } }),
+            // Active vendors (VENDOR role + at least 1 active ad)
+            prisma.user.count({ where: { role: 'VENDOR', banStatus: 'ACTIVE' } }),
+            // Total trades (all time)
+            prisma.trade.count(),
+            // Active disputes
+            prisma.trade.count({ where: { status: 'DISPUTED' } }),
+            // Pending KYC
+            prisma.user.count({ where: { kycStatus: 'PENDING' } }),
+            // Live trades (non-terminal)
+            prisma.trade.count({ where: { status: { notIn: ['COMPLETED', 'CANCELLED'] } } }),
+            // Completed today
+            prisma.trade.count({ where: { status: 'COMPLETED', completedAt: { gte: today } } }),
+            // Completed all time aggregate
+            prisma.trade.aggregate({
+                where: { status: 'COMPLETED' },
+                _sum: { amountFiat: true, amountCrypto: true, vendorProfitCut: true },
+                _count: true
+            }),
+            // 24h volume
+            prisma.trade.aggregate({
+                where: { status: 'COMPLETED', completedAt: { gte: yesterday } },
+                _sum: { amountFiat: true, amountCrypto: true }
+            }),
+            // All-time volume
+            prisma.trade.aggregate({
+                where: { status: 'COMPLETED' },
+                _sum: { amountFiat: true, amountCrypto: true }
+            }),
+            // System profit fees
+            prisma.systemProfitFees.findUnique({ where: { id: 1 } }).catch(() => null),
+            // Pending withdrawals
+            prisma.withdrawal.count({ where: { status: 'PENDING' } }),
+            // Active escrows — value currently locked (funded, not yet settled/disputed)
+            prisma.smartEscrow.count({ where: { status: { in: ['FUNDED', 'IN_PROGRESS', 'PENDING_SETTLEMENT'] } } }),
+            // Disputed escrows — escalated, awaiting/under admin ruling
+            prisma.smartEscrow.count({ where: { status: { in: ['DISPUTED', 'ADMIN_REVIEW'] } } }),
+            // Businesses awaiting KYB review
+            prisma.businessProfile.count({ where: { kybStatus: 'PENDING' } }),
+            // Discovery Sprint (2026-06-20): live invoices (sent or paid)
+            prisma.businessInvoice.count({ where: { status: { in: ['SENT', 'PAID'] } } }),
+            // Invoices paid today
+            prisma.businessInvoice.count({ where: { status: 'PAID', paidAt: { gte: today } } }),
+            // Active branch locations
+            prisma.businessLocation.count({ where: { isActive: true } })
+        ]);
+
+        const totalFiatVolume = volumeAllTime._sum.amountFiat || 0;
+        const totalCryptoVolume = volumeAllTime._sum.amountCrypto || 0;
+        const fiatVolume24h = volume24h._sum.amountFiat || 0;
+        const cryptoVolume24h = volume24h._sum.amountCrypto || 0;
+        const totalAdminProfit = profitFees?.balance || 0;
+        const totalVendorProfit = completedAllTime._sum.vendorProfitCut || 0;
+
+        return res.status(200).json({
+            success: true,
+            stats: {
+                // User metrics
+                totalUsers,
+                newUsersToday,
+                activeVendors,
+
+                // Trade metrics
+                totalTrades,
+                liveTrades,
+                completedToday,
+                completedAllTime: completedAllTime._count || 0,
+                activeDisputes,
+
+                // Volume
+                totalFiatVolume,
+                totalCryptoVolume,
+                fiatVolume24h,
+                cryptoVolume24h,
+
+                // Revenue
+                totalAdminProfit,
+                totalVendorProfit,
+                estimatedDailyRevenue: (fiatVolume24h * 0.015).toFixed(2),
+
+                // Operations
+                pendingKyc,
+                pendingWithdrawals,
+
+                // Escrow & Business (WS4)
+                activeEscrows,
+                disputedEscrows,
+                pendingBusinessKyb,
+
+                // Discovery Sprint (2026-06-20): Invoices & Locations
+                activeInvoices,
+                paidInvoicesToday,
+                totalActiveLocations: activeLocations,
+
+                // Timestamps
+                generatedAt: now.toISOString()
+            }
+        });
+    } catch (error) {
+        logger.error({ err: error }, '[getPlatformStats] error');
+        return res.status(500).json({ success: false, message: error.message });
+    }
+};
+
+
+/**
+ * 12. PROFIT BREAKDOWN
+ *     GET /api/admin/profit-breakdown
+ *     Returns real PnL data from AdminProfitLog + SystemProfitFees.
+ *     Includes daily breakdown for charting and source categorization.
+ */
+exports.getProfitBreakdown = async (req, res) => {
+    const prisma = getReadPrisma(req.app);
+
+    try {
+        const now = new Date();
+        const thirtyDaysAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000);
+
+        const [profitFees, fiatPool, hotWallet, masterCrypto, profitLogs, dailySnapshots] = await Promise.all([
+            prisma.systemProfitFees.findUnique({ where: { id: 1 } }).catch(() => ({ balance: 0 })),
+            prisma.systemFiatPool.findUnique({ where: { id: 1 } }).catch(() => ({ balance: 0 })),
+            prisma.systemHotWallet.findUnique({ where: { id: 1 } }).catch(() => ({ balance: 0 })),
+            prisma.systemMasterCrypto.findUnique({ where: { id: 1 } }).catch(() => ({ balance: 0 })),
+            // Last 30 days of profit logs grouped by source
+            prisma.adminProfitLog.groupBy({
+                by: ['source'],
+                where: { createdAt: { gte: thirtyDaysAgo } },
+                _sum: { amountUsdc: true },
+                _count: true
+            }),
+            // Daily snapshots for charting
+            prisma.dailySnapshot.findMany({
+                where: { date: { gte: thirtyDaysAgo } },
+                orderBy: { date: 'asc' },
+                select: { date: true, totalProfitUsdc: true, totalVolumeUsdc: true, activeUsers: true, profitBySource: true }
+            })
+        ]);
+
+        // Build source breakdown
+        const sourceBreakdown = {};
+        for (const log of profitLogs) {
+            sourceBreakdown[log.source] = {
+                totalUsdc: log._sum.amountUsdc || 0,
+                count: log._count
+            };
+        }
+
+        // Build daily PnL array for charting (last 30 days)
+        const dailyPnl = dailySnapshots.map(s => ({
+            date: s.date,
+            profit: s.totalProfitUsdc,
+            volume: s.totalVolumeUsdc,
+            users: s.activeUsers,
+            bySource: s.profitBySource
+        }));
+
+        // If no daily snapshots exist, generate from profit logs
+        if (dailyPnl.length === 0) {
+            const recentLogs = await prisma.adminProfitLog.findMany({
+                where: { createdAt: { gte: thirtyDaysAgo } },
+                orderBy: { createdAt: 'asc' },
+                select: { amountUsdc: true, source: true, createdAt: true }
+            });
+
+            // Group by day
+            const dayMap = {};
+            for (const log of recentLogs) {
+                const dayKey = log.createdAt.toISOString().split('T')[0];
+                if (!dayMap[dayKey]) dayMap[dayKey] = { profit: 0, count: 0 };
+                dayMap[dayKey].profit += log.amountUsdc;
+                dayMap[dayKey].count += 1;
+            }
+
+            for (const [date, data] of Object.entries(dayMap)) {
+                dailyPnl.push({ date, profit: data.profit, volume: 0, users: 0 });
+            }
+        }
+
+        return res.status(200).json({
+            success: true,
+            data: {
+                // Current system pool balances
+                pools: {
+                    profitFees: profitFees?.balance || 0,
+                    fiatPool: fiatPool?.balance || 0,
+                    hotWallet: hotWallet?.balance || 0,
+                    masterCrypto: masterCrypto?.balance || 0
+                },
+
+                // Revenue by source (last 30 days)
+                sourceBreakdown,
+
+                // Daily PnL for charting
+                dailyPnl,
+
+                // Summary
+                totalProfitLast30Days: profitLogs.reduce((sum, l) => sum + (l._sum.amountUsdc || 0), 0),
+                totalTransactionsLast30Days: profitLogs.reduce((sum, l) => sum + l._count, 0),
+
+                period: {
+                    from: thirtyDaysAgo.toISOString(),
+                    to: now.toISOString()
+                }
+            }
+        });
+    } catch (error) {
+        logger.error({ err: error }, '[getProfitBreakdown] error');
+        return res.status(500).json({ success: false, message: error.message });
+    }
+};
+
+
+/**
+ * 13. GET ALL USERS (paginated with search + filters)
+ *     GET /api/admin/users?page=1&limit=20&search=john&role=VENDOR&banStatus=ACTIVE
+ */
+exports.getUsers = async (req, res) => {
+    const prisma = getReadPrisma(req.app);
+
+    try {
+        const page = Math.max(1, parseInt(req.query.page) || 1);
+        const limit = Math.min(100, Math.max(1, parseInt(req.query.limit) || 20));
+        const skip = (page - 1) * limit;
+        const search = req.query.search || '';
+        const role = req.query.role || '';
+        const banStatus = req.query.banStatus || '';
+        const kycStatus = req.query.kycStatus || '';
+
+        // Build where clause
+        const where = { isDeleted: false };
+
+        if (search) {
+            where.OR = [
+                { username: { contains: search, mode: 'insensitive' } },
+                { email: { contains: search, mode: 'insensitive' } },
+                { legalName: { contains: search, mode: 'insensitive' } }
+            ];
+        }
+        if (role) where.role = role;
+        if (banStatus) where.banStatus = banStatus;
+        if (kycStatus) where.kycStatus = kycStatus;
+
+        const [users, totalCount] = await Promise.all([
+            prisma.user.findMany({
+                where,
+                skip,
+                take: limit,
+                orderBy: { createdAt: 'desc' },
+                select: {
+                    id: true,
+                    username: true,
+                    email: true,
+                    role: true,
+                    kycStatus: true,
+                    banStatus: true,
+                    banUntil: true,
+                    strikeCount: true,
+                    tradesCompleted: true,
+                    completionRate: true,
+                    availableBalance: true,
+                    azmBalance: true,
+                    vendorLevel: true,
+                    loyaltyTier: true,
+                    loginStreak: true,
+                    lastLoginAt: true,
+                    createdAt: true,
+                    _count: {
+                        select: {
+                            tradesAsBuyer: true,
+                            tradesAsVendor: true,
+                            ads: true
+                        }
+                    }
+                }
+            }),
+            prisma.user.count({ where })
+        ]);
+
+        return res.status(200).json({
+            success: true,
+            data: {
+                users,
+                pagination: {
+                    page,
+                    limit,
+                    totalCount,
+                    totalPages: Math.ceil(totalCount / limit),
+                    hasNext: page * limit < totalCount,
+                    hasPrev: page > 1
+                }
+            }
+        });
+    } catch (error) {
+        logger.error({ err: error }, '[getUsers] error');
+        return res.status(500).json({ success: false, message: error.message });
+    }
+};
+
+
+/**
+ * 14. BAN / UNBAN USER
+ *     POST /api/admin/users/:id/ban
+ *     Body: { action: 'BAN_24H' | 'BAN_1W' | 'BAN_INDEF' | 'UNBAN', reason? }
+ */
+exports.banUser = async (req, res) => {
+    const prisma = req.app.get('prisma');
+    const io = req.app.get('socketio');
+
+    try {
+        const userId = parseInt(req.params.id);
+        const { action, reason } = req.body;
+
+        if (!userId || isNaN(userId)) {
+            return res.status(400).json({ success: false, message: 'Invalid user ID.' });
+        }
+
+        const validActions = ['BAN_24H', 'BAN_1W', 'BAN_INDEF', 'UNBAN'];
+        if (!action || !validActions.includes(action)) {
+            return res.status(400).json({
+                success: false,
+                message: `action must be one of: ${validActions.join(', ')}`
+            });
+        }
+
+        const user = await prisma.user.findUnique({ where: { id: userId } });
+        if (!user) return res.status(404).json({ success: false, message: 'User not found.' });
+
+        let banStatus, banUntil;
+        const now = new Date();
+
+        switch (action) {
+            case 'BAN_24H':
+                banStatus = 'BANNED_24H';
+                banUntil = new Date(now.getTime() + 24 * 60 * 60 * 1000);
+                break;
+            case 'BAN_1W':
+                banStatus = 'BANNED_1W';
+                banUntil = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
+                break;
+            case 'BAN_INDEF':
+                banStatus = 'BANNED_INDEF';
+                banUntil = null;
+                break;
+            case 'UNBAN':
+                banStatus = 'ACTIVE';
+                banUntil = null;
+                break;
+        }
+
+        await prisma.user.update({
+            where: { id: userId },
+            data: { banStatus, banUntil }
+        });
+
+        // Notify the user
+        await _getNotificationService(req).sendNotification({
+            userId,
+            title: action === 'UNBAN' ? 'Account Restored' : 'Account Restricted',
+            body: action === 'UNBAN'
+                ? 'Your account restrictions have been lifted. You can trade again.'
+                : `Your account has been restricted. ${reason || 'Contact support for details.'}`,
+            category: 'SECURITY_ACCOUNT',
+            actionPayload: { action: 'ACCOUNT_STATUS', banStatus, reason: reason || null }
+        });
+
+        // Real-time notification
+        io.to(`user_${userId}`).emit('account_restricted', {
+            banStatus,
+            banUntil,
+            reason: reason || null
+        });
+
+        // ---- Phase B2 (2026-05-25): force-disconnect any open sockets ----
+        // Without this, a banned user's open WebSocket connections keep
+        // receiving server pushes (and could keep emitting events the
+        // socket auth middleware admitted at connect time) until the
+        // client manually refreshes. Phase K's protect middleware closes
+        // the gap on every NEW HTTP/WS request; this closes the gap on
+        // EXISTING connections.
+        //
+        // Scope: only on actual ban actions, not UNBAN. We don't want to
+        // disturb a user we're un-banning.
+        if (action !== 'UNBAN') {
+            try {
+                io.in(`user_${userId}`).disconnectSockets();
+            } catch (sockErr) {
+                // Disconnect failure must not fail the ban — the DB row
+                // is already flipped, the next request will be rejected.
+                logger.error(`[banUser] socket disconnect non-fatal: ${sockErr.message}`);
+            }
+        }
+
+        // Append-only audit trail (fire-and-forget — never fails the request).
+        await audit(prisma, {
+            actorId: req.user.id, actorName: req.user.username,
+            action: action === 'UNBAN' ? 'UNBAN_USER' : 'BAN_USER',
+            targetType: 'USER', targetId: String(userId),
+            metadata: { banAction: action, reason: reason || null, banStatus, banUntil },
+            ipAddress: req.ip,
+        });
+
+        return res.status(200).json({
+            success: true,
+            message: action === 'UNBAN'
+                ? `User ${user.username} has been unbanned.`
+                : `User ${user.username} has been banned (${action}).`,
+            data: { userId, banStatus, banUntil }
+        });
+    } catch (error) {
+        logger.error({ err: error }, '[banUser] error');
+        return res.status(500).json({ success: false, message: error.message });
+    }
+};
+
+
+/**
+ * 15. CHANGE USER ROLE
+ *     POST /api/admin/users/:id/role
+ *     Body: { role: 'USER' | 'VENDOR' | 'ADMIN' }
+ */
+exports.changeUserRole = async (req, res) => {
+    const prisma = req.app.get('prisma');
+    const io = req.app.get('socketio');
+
+    try {
+        const userId = parseInt(req.params.id);
+        const { role } = req.body;
+
+        if (!userId || isNaN(userId)) {
+            return res.status(400).json({ success: false, message: 'Invalid user ID.' });
+        }
+
+        const validRoles = ['USER', 'VENDOR', 'ADMIN'];
+        if (!role || !validRoles.includes(role)) {
+            return res.status(400).json({
+                success: false,
+                message: `role must be one of: ${validRoles.join(', ')}`
+            });
+        }
+
+        const user = await prisma.user.findUnique({ where: { id: userId } });
+        if (!user) return res.status(404).json({ success: false, message: 'User not found.' });
+
+        // Prevent self-demotion
+        if (userId === req.user.id && role !== 'ADMIN') {
+            return res.status(400).json({ success: false, message: 'You cannot demote yourself.' });
+        }
+
+        // Phase K — same cascade as approveKyc. The role flip MUST land
+        // atomically with the tokenVersion bump and the refresh-token
+        // revocation, so the user can't keep acting under their old role
+        // for the remaining lifetime of an in-flight access JWT (≤ 15 min)
+        // or indefinitely via a still-valid refresh token. If we updated
+        // role only, an admin demoting a user to USER would leave that
+        // user with their old admin JWT working against `protect` until
+        // the JWT expired naturally, which is exactly the "JWT staleness"
+        // the audit called out.
+        //
+        // Skip the cascade only if the role isn't actually changing (admin
+        // re-saving the same role) — we don't want to needlessly invalidate
+        // every device for a no-op write.
+        const isActualChange = user.role !== role;
+
+        if (isActualChange) {
+            await prisma.$transaction([
+                prisma.user.update({
+                    where: { id: userId },
+                    data: { role, tokenVersion: { increment: 1 } }
+                }),
+                prisma.refreshToken.updateMany({
+                    where: { userId, revokedAt: null },
+                    data: { revokedAt: new Date() },
+                }),
+            ]);
+        } else {
+            await prisma.user.update({
+                where: { id: userId },
+                data: { role }
+            });
+        }
+
+        // Notify user — only when role actually changed.
+        if (isActualChange) {
+            await _getNotificationService(req).sendNotification({
+                userId,
+                title: 'Role Updated',
+                body: `Your account role has been changed to ${role}.`,
+                category: 'ADMIN_SYSTEM',
+                actionPayload: { action: 'ROLE_CHANGE', newRole: role }
+            });
+
+            io.to(`user_${userId}`).emit('role_update', { role });
+            // Tell the client to refresh its session — same socket event
+            // approveKyc emits, so the FE has a single handler.
+            io.to(`user_${userId}`).emit('session_refresh_required', {
+                reason: 'role_changed',
+                newRole: role,
+            });
+        }
+
+        return res.status(200).json({
+            success: true,
+            message: `User ${user.username} role changed to ${role}.`,
+            data: { userId, previousRole: user.role, newRole: role }
+        });
+    } catch (error) {
+        logger.error({ err: error }, '[changeUserRole] error');
+        return res.status(500).json({ success: false, message: error.message });
+    }
+};
+
+
+/**
+ * 16. GET PENDING WITHDRAWALS
+ *     GET /api/admin/withdrawals/pending
+ *
+ * Phase I5 (2026-05-25): pagination added on the `pending` array.
+ * Was unbounded; a treasury backlog could push every pending
+ * withdrawal on every dashboard refresh. Default page size 100; opt-in
+ * via `?cursor=ID&limit=N` or `?page=N&limit=M`. The `frozen` array
+ * remains capped at 20 (separate small list, no pagination needed).
+ * Response shape extended: `data: { pending, frozen, counts,
+ * pagination }`. `counts.pending` keeps its original page-length
+ * semantic; the real backlog total is exposed on `pagination.total`
+ * (only populated on page-1 of offset mode, for cost reasons).
+ * UIs that want a "X queued" chip should prefer
+ * `pagination.total ?? counts.pending`. No FE consumer today, free
+ * to evolve.
+ */
+exports.getPendingWithdrawals = async (req, res) => {
+    const prisma = getReadPrisma(req.app);
+
+    try {
+        const queryHasNoPaginationParams =
+            req.query.cursor == null &&
+            req.query.limit == null &&
+            req.query.page == null;
+        if (queryHasNoPaginationParams) req.query.limit = '100';
+
+        const { take, cursor, mode, page, skip } = parsePagination(req.query);
+
+        const where = { status: 'PENDING' };
+        const findArgs = {
+            where,
+            orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+            take,
+            include: {
+                user: {
+                    select: {
+                        id: true,
+                        username: true,
+                        email: true,
+                        kycStatus: true,
+                        banStatus: true,
+                        strikeCount: true,
+                        tradesCompleted: true
+                    }
+                }
+            }
+        };
+        if (cursor) {
+            findArgs.cursor = { id: parseInt(cursor, 10) };
+            findArgs.skip = 1;
+        } else if (skip > 0) {
+            findArgs.skip = skip;
+        }
+
+        const wantsTotal = mode === 'offset' && page === 1;
+        // Run pending list + frozen list + count in parallel.
+        const [pending, frozen, totalPending] = await Promise.all([
+            prisma.withdrawal.findMany(findArgs),
+            prisma.transactionHistory.findMany({
+                where: { status: 'FROZEN_DISPUTE' },
+                include: {
+                    user: { select: { id: true, username: true, email: true } }
+                },
+                orderBy: { createdAt: 'desc' },
+                take: 20
+            }),
+            wantsTotal ? prisma.withdrawal.count({ where }) : Promise.resolve(undefined)
+        ]);
+
+        const envelope = buildPageEnvelope(pending, take, mode, page, totalPending);
+
+        return res.status(200).json({
+            success: true,
+            data: {
+                pending,
+                frozen,
+                counts: {
+                    // Page length only — the original contract.
+                    // Total backlog now lives in `pagination.total`
+                    // (only populated on page-1 of offset mode for cost
+                    // reasons). UIs that want a "X queued" chip should
+                    // read `pagination.total ?? counts.pending`.
+                    pending: pending.length,
+                    frozen: frozen.length
+                },
+                pagination: envelope
+            }
+        });
+    } catch (error) {
+        logger.error({ err: error }, '[getPendingWithdrawals] error');
+        return res.status(500).json({ success: false, message: error.message });
+    }
+};
+
+
+/**
+ * 17. APPROVE WITHDRAWAL
+ *     POST /api/admin/withdrawals/:id/approve
+ *     Body: { adminNotes? }
+ */
+exports.approveWithdrawal = async (req, res) => {
+    const prisma = req.app.get('prisma');
+    const io = req.app.get('socketio');
+    const emitBalanceUpdate = req.app.get('emitBalanceUpdate');
+
+    try {
+        const withdrawalId = parseInt(req.params.id);
+        const { adminNotes } = req.body;
+
+        if (!withdrawalId || isNaN(withdrawalId)) {
+            return res.status(400).json({ success: false, message: 'Invalid withdrawal ID.' });
+        }
+
+        const withdrawal = await prisma.withdrawal.findUnique({ where: { id: withdrawalId } });
+        if (!withdrawal) return res.status(404).json({ success: false, message: 'Withdrawal not found.' });
+        if (withdrawal.status !== 'PENDING') {
+            return res.status(400).json({ success: false, message: `Cannot approve: status is ${withdrawal.status}.` });
+        }
+
+        // Phase H12 BUGFIX (2026-05-27): atomic conditional flip. Without
+        // this, two admins both clicking approve would both fire the
+        // user notification + websocket event. Effect is mostly cosmetic
+        // (no money moves on approve — that happens in the disbursement
+        // worker), but consistent with the rejectWithdrawal fix.
+        const claimed = await prisma.withdrawal.updateMany({
+            where: { id: withdrawalId, status: 'PENDING' },
+            data: { status: 'APPROVED' }
+        });
+        if (claimed.count === 0) {
+            return res.status(409).json({
+                success: false,
+                message: 'Withdrawal was already finalized by another admin (concurrent action).'
+            });
+        }
+
+        // Notify user
+        await _getNotificationService(req).sendNotification({
+            userId: withdrawal.userId,
+            title: 'Withdrawal Approved',
+            body: `Your withdrawal of ${withdrawal.amount} ${withdrawal.payoutMethod} has been approved and is being processed.`,
+            category: 'GENERAL',
+            actionPayload: { action: 'WITHDRAWAL_STATUS', withdrawalId: String(withdrawalId), status: 'APPROVED' }
+        });
+
+        io.to(`user_${withdrawal.userId}`).emit('withdrawal_update', {
+            withdrawalId,
+            status: 'APPROVED',
+            message: 'Your withdrawal has been approved.'
+        });
+
+        // Append-only audit trail (fire-and-forget — never fails the request).
+        await audit(prisma, {
+            actorId: req.user.id, actorName: req.user.username,
+            action: 'APPROVE_WITHDRAWAL', targetType: 'WITHDRAWAL', targetId: String(withdrawalId),
+            metadata: { previousStatus: 'PENDING', userId: withdrawal.userId, amount: withdrawal.amount, adminNotes: adminNotes || null },
+            ipAddress: req.ip,
+        });
+
+        return res.status(200).json({
+            success: true,
+            message: `Withdrawal #${withdrawalId} approved.`,
+            data: { withdrawalId, userId: withdrawal.userId, amount: withdrawal.amount, adminNotes }
+        });
+    } catch (error) {
+        logger.error({ err: error }, '[approveWithdrawal] error');
+        return res.status(500).json({ success: false, message: error.message });
+    }
+};
+
+
+/**
+ * 18. REJECT WITHDRAWAL
+ *     POST /api/admin/withdrawals/:id/reject
+ *     Body: { reason }
+ */
+exports.rejectWithdrawal = async (req, res) => {
+    const prisma = req.app.get('prisma');
+    const io = req.app.get('socketio');
+    const emitBalanceUpdate = req.app.get('emitBalanceUpdate');
+
+    try {
+        const withdrawalId = parseInt(req.params.id);
+        const { reason } = req.body;
+
+        if (!withdrawalId || isNaN(withdrawalId)) {
+            return res.status(400).json({ success: false, message: 'Invalid withdrawal ID.' });
+        }
+        if (!reason || !reason.trim()) {
+            return res.status(400).json({ success: false, message: 'Rejection reason is required.' });
+        }
+
+        const withdrawal = await prisma.withdrawal.findUnique({ where: { id: withdrawalId } });
+        if (!withdrawal) return res.status(404).json({ success: false, message: 'Withdrawal not found.' });
+        if (withdrawal.status !== 'PENDING') {
+            return res.status(400).json({ success: false, message: `Cannot reject: status is ${withdrawal.status}.` });
+        }
+
+        // ── r16 P0-C: canonical-state-safe rejection ────────────────────────
+        // The old path refunded purely on the PENDING mirror status, without
+        // checking the linked canonical TransactionHistory — an admin could
+        // refund a payout the provider had already accepted or settled (a
+        // real double-credit/double-spend). The refund must now go through
+        // the canonical fiat reversal state machine (finance.service), and
+        // the mirror transition + canonical reversal commit in ONE
+        // transaction so no state exists where the mirror says REJECTED but
+        // the canonical reservation is still PENDING (or vice versa).
+        const canonical = await _resolveCanonicalWithdrawalTx(prisma, withdrawal);
+
+        if (canonical) {
+            const gate = await _rejectionSafetyGate(prisma, withdrawal, canonical);
+            if (!gate.safe) {
+                return res.status(409).json({
+                    success: false,
+                    message: gate.message,
+                    data: { withdrawalId, canonicalStatus: canonical.status, evidence: gate.evidence || null }
+                });
+            }
+
+            // Mirror claim + canonical reversal in ONE transaction. The
+            // canonical claim inside reverseFiatWithdrawal (PENDING → FAILED)
+            // is the single-winner guard: a concurrent settlement or reversal
+            // rolls the whole rejection back.
+            let reversed;
+            try {
+                reversed = await prisma.$transaction(async (tx) => {
+                    const claimed = await tx.withdrawal.updateMany({
+                        where: { id: withdrawalId, status: 'PENDING' },
+                        data: { status: 'REJECTED' }
+                    });
+                    if (claimed.count === 0) {
+                        throw new Error('WITHDRAWAL_ALREADY_FINALIZED');
+                    }
+                    const result = await financeService.reverseFiatWithdrawal(prisma, canonical.txHash, {
+                        tx,
+                        reason: `admin_rejection:${reason}`
+                    });
+                    if (!result || result.alreadyReversed) {
+                        // The canonical row moved under us (settled or
+                        // already reversed) — the mirror claim must roll back.
+                        throw new Error('WITHDRAWAL_CANONICAL_ALREADY_FINALIZED');
+                    }
+                    return result;
+                });
+            } catch (err) {
+                if (err.message === 'WITHDRAWAL_ALREADY_FINALIZED') throw err;
+                if (err.message === 'WITHDRAWAL_CANONICAL_ALREADY_FINALIZED') {
+                    return res.status(409).json({
+                        success: false,
+                        message: 'The linked withdrawal transaction was finalized concurrently. Refusing to refund twice — please refresh.'
+                    });
+                }
+                throw err;
+            }
+
+            await _notifyRejection(req, { withdrawal, withdrawalId, reason, io, emitBalanceUpdate, refundedAmount: reversed.refundedAmount });
+
+            await audit(prisma, {
+                actorId: req.user.id, actorName: req.user.username,
+                action: 'REJECT_WITHDRAWAL', targetType: 'WITHDRAWAL', targetId: String(withdrawalId),
+                metadata: {
+                    previousStatus: 'PENDING', userId: withdrawal.userId, amount: withdrawal.amount,
+                    reason: reason || null, canonicalReference: canonical.txHash,
+                    refundedAmount: reversed.refundedAmount
+                },
+                ipAddress: req.ip,
+            });
+
+            return res.status(200).json({
+                success: true,
+                message: `Withdrawal #${withdrawalId} rejected. Funds refunded through the canonical reversal state machine.`,
+                data: {
+                    withdrawalId, userId: withdrawal.userId, amount: withdrawal.amount, reason,
+                    canonicalReference: canonical.txHash, refundedAmount: reversed.refundedAmount
+                }
+            });
+        }
+
+        // ── LEGACY PATH (no canonical TransactionHistory at all) ───────────
+        // Pre-P4 mirror-only rows: the refund draws on the restricted reserve
+        // when a deterministic, identity-derived P4 obligation exists
+        // (withdrawal:wallet:{id} / withdrawal:smartroute:{id}), otherwise on
+        // platform equity. r16c: the previous lookup also matched ANY active
+        // `withdrawal:fiat:*` obligation with a startsWith prefix — an
+        // arbitrary, unrelated obligation (any user, any payout) could be
+        // consumed here. A mirror-only legacy row has NO canonical reference
+        // to derive a fiat obligation from, so no fiat obligation is ever
+        // guessed for it. Never guess a financial obligation identity.
+        await prisma.$transaction(async (tx) => {
+            const claimed = await tx.withdrawal.updateMany({
+                where: { id: withdrawalId, status: 'PENDING' },
+                data: { status: 'REJECTED' }
+            });
+            if (claimed.count === 0) {
+                throw new Error('WITHDRAWAL_ALREADY_FINALIZED');
+            }
+
+            // Refund the balance that was deducted (Phase D-2: unified on availableBalance)
+            await tx.user.update({
+                where: { id: withdrawal.userId },
+                data: { availableBalance: { increment: withdrawal.amount } }
+            });
+
+            // §P.4 AUTHORITATIVE LEDGER — rejection refund, same transaction.
+            const refundExact = new Prisma.Decimal(_exact(withdrawal.amount));
+            // r17 P0: resolve the withdrawal's own obligation through the
+            // DURABLE RELATION (sourceEntity='withdrawal' +
+            // sourceEntityId=withdrawal.id — the columns every
+            // createForPendingWithdrawal call populates), with the
+            // identity-derived legacy wallet reference kept as a
+            // compatibility alias for pre-sourceEntity rows. The phantom
+            // `withdrawal:smartroute:` family (never written by any creation
+            // path in the repository's history) is gone, and no
+            // prefix/startsWith guessing remains anywhere on this path.
+            const activeObligation = await restrictedObligations.findActiveForSource(tx, 'withdrawal', withdrawal.id);
+            const refundPost = await ledger.post(tx, {
+                idempotencyKey: `ledger:admin:reject-withdrawal:${withdrawal.id}`,
+                entryType: 'WITHDRAWAL',
+                description: activeObligation
+                    ? 'Withdrawal rejected by admin — reserved funds refunded to customer'
+                    : 'Withdrawal rejected by admin — pre-P4 withdrawal refunded from platform equity',
+                userId: withdrawal.userId,
+                relatedEntity: 'withdrawal',
+                relatedEntityId: String(withdrawal.id),
+                metadata: { status: 'REJECTED', reason: reason || null, reserved: Boolean(activeObligation) },
+                lines: activeObligation
+                    ? [
+                        { account: 'restricted:reserves', debit: refundExact.toFixed(8) },
+                        { account: `user:${withdrawal.userId}:liability`, credit: refundExact.toFixed(8) },
+                    ]
+                    : [
+                        { account: 'equity:treasury', debit: refundExact.toFixed(8) },
+                        { account: `user:${withdrawal.userId}:liability`, credit: refundExact.toFixed(8) },
+                    ],
+            });
+            if (activeObligation) {
+                await restrictedObligations.cancelOnReversal(tx, {
+                    reference: activeObligation.reference,
+                    releaseLedgerTransactionId: refundPost.transaction.id,
+                });
+            }
+        });
+
+        await _notifyRejection(req, { withdrawal, withdrawalId, reason, io, emitBalanceUpdate, refundedAmount: withdrawal.amount });
+
+        // Append-only audit trail (fire-and-forget — never fails the request).
+        await audit(prisma, {
+            actorId: req.user.id, actorName: req.user.username,
+            action: 'REJECT_WITHDRAWAL', targetType: 'WITHDRAWAL', targetId: String(withdrawalId),
+            metadata: { previousStatus: 'PENDING', userId: withdrawal.userId, amount: withdrawal.amount, reason: reason || null, path: 'LEGACY_MIRROR_ONLY' },
+            ipAddress: req.ip,
+        });
+
+        return res.status(200).json({
+            success: true,
+            message: `Withdrawal #${withdrawalId} rejected. Funds refunded.`,
+            data: { withdrawalId, userId: withdrawal.userId, amount: withdrawal.amount, reason }
+        });
+    } catch (error) {
+        // Phase H12: another admin already finalized this row. Return
+        // 409 instead of a generic 500 so the FE can refresh and show
+        // the new state.
+        if (error.message === 'WITHDRAWAL_ALREADY_FINALIZED') {
+            return res.status(409).json({
+                success: false,
+                message: 'Withdrawal was already finalized by another admin (concurrent action).'
+            });
+        }
+        logger.error({ err: error }, '[rejectWithdrawal] error');
+        return res.status(500).json({ success: false, message: error.message });
+    }
+};
+
+// ── r16 P0-C helpers ───────────────────────────────────────────────────────
+
+/**
+ * Resolve the canonical TransactionHistory row behind a Withdrawal mirror:
+ * the durable transactionHistoryId bridge first; if absent, the reconciler's
+ * conservative legacy match (WITHDRAWAL_FIAT, amount ±, createdAt window),
+ * backfilled onto the bridge. Returns null for mirror-only legacy rows.
+ */
+/**
+ * r17 P0 — drop candidate canonical rows that are durably linked to ANY
+ * Withdrawal row via the transactionHistoryId bridge. A linked canonical
+ * belongs to that withdrawal's economic identity; the guessed amount±5s
+ * fallback may only ever adopt an ORPHAN (pre-bridge legacy) row.
+ */
+async function _excludeBridgeLinked(prisma, candidates) {
+    if (!Array.isArray(candidates) || candidates.length === 0) return [];
+    const ids = candidates.map((c) => c.id);
+    const linked = await prisma.$queryRawUnsafe(
+        'SELECT "transactionHistoryId" FROM "Withdrawal" WHERE "transactionHistoryId" = ANY($1::text[])',
+        ids
+    );
+    const linkedSet = new Set((linked || []).map((r) => r.transactionHistoryId));
+    return candidates.filter((c) => !linkedSet.has(c.id));
+}
+
+async function _resolveCanonicalWithdrawalTx(prisma, withdrawal) {
+    let linkedId = null;
+    if (typeof prisma.$queryRawUnsafe === 'function') {
+        const rows = await prisma.$queryRawUnsafe(
+            'SELECT "transactionHistoryId" FROM "Withdrawal" WHERE "id" = $1 LIMIT 1',
+            withdrawal.id
+        );
+        linkedId = rows?.[0]?.transactionHistoryId || null;
+    }
+
+    if (linkedId) {
+        const linked = await prisma.transactionHistory.findUnique({ where: { id: linkedId } });
+        if (linked) return linked;
+        // Dangling bridge — treat as unresolved rather than guessing.
+        return null;
+    }
+
+    // r17 P0 identity guard: a withdrawal that OWNS its own obligation
+    // (sourceEntity='withdrawal', e.g. the wallet reservation path) has its
+    // own economic identity. It must NEVER adopt a fiat canonical through
+    // the guessed fallback below — that would reverse one withdrawal's
+    // canonical reservation while leaving the adopted row's own obligation
+    // active (refund/obligation divergence). Its refund economics belong to
+    // the durable relation alone.
+    const ownObligation = await restrictedObligations.findActiveForSource(prisma, 'withdrawal', withdrawal.id);
+    if (ownObligation) {
+        return null;
+    }
+
+    // Legacy fallback match (mirrors the reconciliation worker's contract):
+    // a single WITHDRAWAL_FIAT row for this user, this amount, within ±5s.
+    // r17 P0: the guessed match may only adopt a GENUINELY ORPHAN canonical
+    // — a TransactionHistory row that is not durably linked to ANY
+    // Withdrawal row via the bridge. A linked canonical belongs to another
+    // withdrawal's economic identity; adopting it here would reject THIS
+    // row while reversing ANOTHER row's reservation (cross-identity
+    // hijack). Post-bridge fiat rows are always linked, so this constraint
+    // confines adoption to the pre-bridge legacy rows the fallback was
+    // built for.
+    const txRowsRaw = await prisma.transactionHistory.findMany({
+        where: {
+            userId: withdrawal.userId,
+            type: 'WITHDRAWAL_FIAT',
+            amountUsdc: withdrawal.amount,
+            createdAt: {
+                gte: new Date(withdrawal.createdAt.getTime() - 5_000),
+                lte: new Date(withdrawal.createdAt.getTime() + 5_000)
+            }
+        },
+        orderBy: { createdAt: 'desc' },
+        take: 10
+    });
+    const txRows = await _excludeBridgeLinked(prisma, txRowsRaw);
+
+    if (txRows.length === 1) {
+        const txRow = txRows[0];
+        // r18: adopting the orphan is a DURABLE OWNERSHIP CLAIM, not a
+        // fire-and-forget backfill. Exactly one concurrent caller can win
+        // the unique bridge per canonical; a loser (another mirror claimed
+        // the canonical first) never receives the canonical row — it falls
+        // through to the mirror-only legacy path instead of reversing
+        // another withdrawal's reservation.
+        const claim = await withdrawalBridge.claimOrphanCanonical(prisma, withdrawal.id, txRow.id);
+        if (!claim.won) {
+            logger.warn({
+                withdrawalId: withdrawal.id,
+                canonicalId: txRow.id,
+                owner: claim.owner,
+                reason: claim.reason,
+            }, '[rejectWithdrawal] orphan canonical claim lost — refusing canonical adoption');
+            return null;
+        }
+        return txRow;
+    }
+    // Zero or ambiguous — the mirror-only legacy path handles it.
+    return null;
+}
+
+/**
+ * The rejection safety gate: NO admin action may restore spendable balance
+ * once provider money may have left Azaman control. Fail-closed checks on
+ * the canonical state and every durable dispatch evidence source.
+ */
+async function _rejectionSafetyGate(prisma, withdrawal, canonical) {
+    const reference = canonical.txHash;
+    if (!reference) {
+        return { safe: false, message: 'The linked transaction has no provider reference — refusing blind rejection. Escalate to reconciliation.', evidence: 'NO_REFERENCE' };
+    }
+    if (canonical.status === 'COMPLETED') {
+        return { safe: false, message: 'The linked withdrawal has SETTLED at the provider — the customer already has the cash. Rejection would double-spend.', evidence: 'SETTLED' };
+    }
+    if (canonical.status === 'FAILED') {
+        return { safe: false, message: 'The linked withdrawal was already reversed/refunded through the canonical state machine.', evidence: 'ALREADY_REVERSED' };
+    }
+    if (canonical.status !== 'PENDING') {
+        return { safe: false, message: `The linked transaction is in non-reversible state ${canonical.status}.`, evidence: String(canonical.status) };
+    }
+
+    // Any durable outbound evidence for this reference — the r16
+    // DISPATCH_INTENT row (written before ANY provider I/O), the dispatch
+    // acceptance observation, or a provider callback — means the cash
+    // position is unknown: never auto-refund.
+    const outboundEvidence = await prisma.fiatProviderEvent.count({
+        where: { relatedReference: reference, direction: 'OUTBOUND' }
+    });
+    if (outboundEvidence > 0) {
+        return { safe: false, message: 'Provider dispatch evidence exists for this payout — cash may be in flight. Rejection is refused; reconcile the payout instead.', evidence: 'DISPATCH_EVIDENCE' };
+    }
+
+    // Durable owner evidence (canonical metadata or recovered from the
+    // dispatch observation) — the provider owns this payout.
+    const ownership = await resolvePayoutOwner(prisma, canonical);
+    if (ownership.status === 'CONFLICT') {
+        return { safe: false, message: 'Multiple providers hold owner evidence for this payout — parked for operator review. Rejection refused.', evidence: 'OWNERSHIP_CONFLICT' };
+    }
+    if (ownership.status !== 'UNKNOWN') {
+        return { safe: false, message: 'A provider has accepted/owns this payout — rejection would double-spend. Reconcile the payout instead.', evidence: 'OWNER_KNOWN' };
+    }
+
+    // Durable reconciliation exceptions (r16b P0-B): an OPEN
+    // ReconciliationException attached to this withdrawal or its canonical
+    // reference — POST_DISPATCH_BOOKKEEPING_FAILED,
+    // POST_DISPATCH_OWNERSHIP_WRITE_FAILED, DISPATCH_IDENTITY_UNKNOWN /
+    // _CONTRADICTION, or any other operational failure — means the payout
+    // may have reached the provider and the bookkeeping could not prove
+    // the state. The payout stays protected for the reconciliation worker;
+    // admin rejection must never guess past durable anomaly evidence.
+    // Raw SQL — the exception queue is a migration-backed table without a
+    // Prisma model (same pattern as the control-plane tables).
+    const openExceptions = await prisma.$queryRawUnsafe(
+        'SELECT COUNT(*)::int AS n FROM "ReconciliationException" ' +
+        'WHERE "status" = \'OPEN\' AND (' +
+        '("entityType" = $1 AND "entityId" = $2) OR ' +
+        '("entityType" = $3 AND "entityId" = $4))',
+        'WITHDRAWAL', String(withdrawal.id),
+        'TRANSACTION', String(canonical.txHash || reference)
+    );
+    if ((openExceptions?.[0]?.n || 0) > 0) {
+        return {
+            safe: false,
+            message: 'An OPEN reconciliation exception is attached to this payout — the cash position may be unproven. Refusing rejection; the reconciliation worker owns recovery.',
+            evidence: 'OPEN_RECONCILIATION_EXCEPTION',
+        };
+    }
+
+    // Canonical PENDING, zero dispatch evidence, unknown owner, no open
+    // exceptions: the cash never left — safe to reject through the
+    // canonical reversal.
+    return { safe: true };
+}
+
+async function _notifyRejection(req, { withdrawal, withdrawalId, reason, io, emitBalanceUpdate, refundedAmount }) {
+    const prisma = req.app.get('prisma');
+    await _getNotificationService(req).sendNotification({
+        userId: withdrawal.userId,
+        title: 'Withdrawal Rejected',
+        body: `Your withdrawal of ${withdrawal.amount} was rejected: ${reason}. Funds have been returned to your wallet.`,
+        category: 'GENERAL',
+        actionPayload: { action: 'WITHDRAWAL_STATUS', withdrawalId: String(withdrawalId), status: 'REJECTED' }
+    });
+
+    if (emitBalanceUpdate) await emitBalanceUpdate(withdrawal.userId);
+
+    if (io) {
+        io.to(`user_${withdrawal.userId}`).emit('withdrawal_update', {
+            withdrawalId,
+            status: 'REJECTED',
+            reason,
+            message: 'Your withdrawal was rejected. Funds returned.'
+        });
+    }
+}
+
+/**
+ * 19. SYSTEM HEALTH
+ *     GET /api/admin/system-health
+ *     Returns all 4 system pool balances + operational status.
+ */
+exports.getSystemHealth = async (req, res) => {
+    const prisma = getReadPrisma(req.app);
+
+    try {
+        const [masterCrypto, hotWallet, fiatPool, profitFees, settings, recentTrades, recentDeposits] = await Promise.all([
+            prisma.systemMasterCrypto.findUnique({ where: { id: 1 } }).catch(() => null),
+            prisma.systemHotWallet.findUnique({ where: { id: 1 } }).catch(() => null),
+            prisma.systemFiatPool.findUnique({ where: { id: 1 } }).catch(() => null),
+            prisma.systemProfitFees.findUnique({ where: { id: 1 } }).catch(() => null),
+            prisma.globalSettings.findUnique({ where: { id: 1 } }),
+            // Last 5 completed trades (to verify engine is running)
+            prisma.trade.findMany({
+                where: { status: 'COMPLETED' },
+                orderBy: { completedAt: 'desc' },
+                take: 5,
+                select: { id: true, completedAt: true, amountFiat: true }
+            }),
+            // Last 5 deposits
+            prisma.transactionHistory.findMany({
+                where: { type: { in: ['DEPOSIT_FIAT', 'DEPOSIT_CRYPTO'] }, status: 'COMPLETED' },
+                orderBy: { createdAt: 'desc' },
+                take: 5,
+                select: { id: true, type: true, amountUsdc: true, createdAt: true }
+            })
+        ]);
+
+        const lastTradeTime = recentTrades[0]?.completedAt || null;
+        const lastDepositTime = recentDeposits[0]?.createdAt || null;
+
+        return res.status(200).json({
+            success: true,
+            data: {
+                pools: {
+                    masterCrypto: masterCrypto?.balance || 0,
+                    hotWallet: hotWallet?.balance || 0,
+                    fiatPool: fiatPool?.balance || 0,
+                    profitFees: profitFees?.balance || 0,
+                    totalSystemValue: (masterCrypto?.balance || 0) + (hotWallet?.balance || 0) + (fiatPool?.balance || 0) + (profitFees?.balance || 0)
+                },
+
+                oracle: {
+                    liveUsdToGhs: settings?.liveUsdToGhs || 0,
+                    liveRetailRate: settings?.liveRetailRate || 0,
+                    liveCorporateRate: settings?.liveCorporateRate || 0,
+                    rateSource: settings?.liveRateSource || 'UNKNOWN',
+                    lastRateSync: settings?.lastRateSync || null,
+                    // Truthful rate provenance (issue #271 / PR 271B)
+                    lastExternalSync: settings?.lastExternalSync || null,
+                    lastAdminSetAt: settings?.lastAdminSetAt || null,
+                    lastEchoAt: settings?.lastEchoAt || null
+                },
+
+                engine: {
+                    status: 'ONLINE',
+                    lastTradeCompleted: lastTradeTime,
+                    lastDeposit: lastDepositTime,
+                    uptime: _formatUptime(process.uptime()),
+                    memoryUsage: `${(process.memoryUsage().heapUsed / 1024 / 1024).toFixed(1)} MB`,
+                    nodeVersion: process.version
+                },
+
+                recentActivity: {
+                    trades: recentTrades,
+                    deposits: recentDeposits
+                },
+
+                timestamp: new Date().toISOString()
+            }
+        });
+    } catch (error) {
+        logger.error({ err: error }, '[getSystemHealth] error');
+        return res.status(500).json({ success: false, message: error.message });
+    }
+};
+
+
+// =============================================================================
+// PHASE Q8 — AUTONOMOUS PAYOUT ENDPOINTS
+// =============================================================================
+
+/**
+ * POST /api/admin/payouts/batch-process
+ * Manual trigger for the payout batch worker.
+ * Body: { force?: boolean }
+ * - force=true: processes even if autoPayoutEnabled is false
+ */
+exports.batchProcessPayouts = async (req, res) => {
+    try {
+        const payoutBatchWorker = req.app.get('payoutBatchWorker');
+        if (!payoutBatchWorker) {
+            return res.status(503).json({
+                success: false,
+                message: 'Payout batch worker is not initialized.'
+            });
+        }
+
+        const { force } = req.body || {};
+        const result = await payoutBatchWorker.processNow({ force: !!force });
+
+        return res.status(200).json({
+            success: result.success !== false,
+            ...result
+        });
+    } catch (error) {
+        logger.error({ err: error }, '[batchProcessPayouts] error');
+        return res.status(500).json({ success: false, message: error.message });
+    }
+};
+
+/**
+ * GET /api/admin/payouts/settings
+ * Returns the current auto-payout configuration from GlobalSettings.
+ */
+exports.getPayoutSettings = async (req, res) => {
+    const prisma = req.app.get('prisma');
+
+    try {
+        const settings = await prisma.globalSettings.findUnique({ where: { id: 1 } });
+        if (!settings) {
+            return res.status(404).json({ success: false, message: 'GlobalSettings not found.' });
+        }
+
+        const fiatPool = await prisma.systemFiatPool.findUnique({ where: { id: 1 } });
+
+        return res.status(200).json({
+            success: true,
+            settings: {
+                autoPayoutEnabled: settings.autoPayoutEnabled,
+                autoPayoutThresholdUsdc: settings.autoPayoutThresholdUsdc,
+                autoPayoutMaxAmountUsdc: settings.autoPayoutMaxAmountUsdc,
+                autoPayoutIntervalMs: settings.autoPayoutIntervalMs
+            },
+            pool: {
+                balance: fiatPool ? fiatPool.balance : 0,
+                alertThreshold: 5000 // FIAT_POOL_ALERT_THRESH from finance.service
+            }
+        });
+    } catch (error) {
+        logger.error({ err: error }, '[getPayoutSettings] error');
+        return res.status(500).json({ success: false, message: error.message });
+    }
+};
+
+/**
+ * PUT /api/admin/payouts/settings
+ * Updates the auto-payout configuration.
+ * Body: { autoPayoutEnabled?, autoPayoutThresholdUsdc?, autoPayoutMaxAmountUsdc?, autoPayoutIntervalMs? }
+ */
+exports.updatePayoutSettings = async (req, res) => {
+    const prisma = req.app.get('prisma');
+
+    try {
+        const {
+            autoPayoutEnabled,
+            autoPayoutThresholdUsdc,
+            autoPayoutMaxAmountUsdc,
+            autoPayoutIntervalMs
+        } = req.body;
+
+        const updateData = {};
+
+        if (typeof autoPayoutEnabled === 'boolean') {
+            updateData.autoPayoutEnabled = autoPayoutEnabled;
+        }
+        if (autoPayoutThresholdUsdc != null) {
+            const val = parseFloat(autoPayoutThresholdUsdc);
+            if (isNaN(val) || val < 0) {
+                return res.status(400).json({ success: false, message: 'autoPayoutThresholdUsdc must be >= 0.' });
+            }
+            updateData.autoPayoutThresholdUsdc = val;
+        }
+        if (autoPayoutMaxAmountUsdc != null) {
+            const val = parseFloat(autoPayoutMaxAmountUsdc);
+            if (isNaN(val) || val < 0) {
+                return res.status(400).json({ success: false, message: 'autoPayoutMaxAmountUsdc must be >= 0.' });
+            }
+            updateData.autoPayoutMaxAmountUsdc = val;
+        }
+        if (autoPayoutIntervalMs != null) {
+            const val = parseInt(autoPayoutIntervalMs, 10);
+            if (isNaN(val) || val < 10000) {
+                return res.status(400).json({ success: false, message: 'autoPayoutIntervalMs must be >= 10000 (10 seconds).' });
+            }
+            updateData.autoPayoutIntervalMs = val;
+        }
+
+        if (Object.keys(updateData).length === 0) {
+            return res.status(400).json({ success: false, message: 'No valid fields to update.' });
+        }
+
+        const updated = await prisma.globalSettings.update({
+            where: { id: 1 },
+            data: updateData
+        });
+
+        logger.info(`[updatePayoutSettings] admin ${req.user.id} updated:`, JSON.stringify(updateData));
+
+        return res.status(200).json({
+            success: true,
+            message: 'Payout settings updated.',
+            settings: {
+                autoPayoutEnabled: updated.autoPayoutEnabled,
+                autoPayoutThresholdUsdc: updated.autoPayoutThresholdUsdc,
+                autoPayoutMaxAmountUsdc: updated.autoPayoutMaxAmountUsdc,
+                autoPayoutIntervalMs: updated.autoPayoutIntervalMs
+            }
+        });
+    } catch (error) {
+        logger.error({ err: error }, '[updatePayoutSettings] error');
+        return res.status(500).json({ success: false, message: error.message });
+    }
+};
+
+/**
+ * GET /api/admin/payouts/needs-review
+ * Returns withdrawals flagged as NEEDS_MANUAL_REVIEW.
+ * Supports cursor pagination.
+ */
+exports.getNeedsManualReview = async (req, res) => {
+    const prisma = getReadPrisma(req.app);
+
+    try {
+        const queryHasNoPaginationParams =
+            req.query.cursor == null &&
+            req.query.limit == null &&
+            req.query.page == null;
+        if (queryHasNoPaginationParams) req.query.limit = '50';
+
+        const { take, cursor, mode, page, skip } = parsePagination(req.query);
+
+        const where = { status: 'NEEDS_MANUAL_REVIEW' };
+        const findArgs = {
+            where,
+            orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+            take,
+            include: {
+                user: {
+                    select: {
+                        id: true,
+                        username: true,
+                        email: true,
+                        kycStatus: true,
+                        banStatus: true,
+                        tradesCompleted: true,
+                        phoneNumber: true
+                    }
+                }
+            }
+        };
+        if (cursor) {
+            findArgs.cursor = { id: parseInt(cursor, 10) };
+            findArgs.skip = 1;
+        } else if (skip > 0) {
+            findArgs.skip = skip;
+        }
+
+        const wantsTotal = mode === 'offset' && page === 1;
+        const [withdrawals, total] = await Promise.all([
+            prisma.withdrawal.findMany(findArgs),
+            wantsTotal ? prisma.withdrawal.count({ where }) : Promise.resolve(undefined)
+        ]);
+
+        const envelope = buildPageEnvelope(withdrawals, take, mode, page, total);
+
+        return res.status(200).json({
+            success: true,
+            withdrawals,
+            count: withdrawals.length,
+            pagination: envelope
+        });
+    } catch (error) {
+        logger.error({ err: error }, '[getNeedsManualReview] error');
+        return res.status(500).json({ success: false, message: error.message });
+    }
+};
+
+// =============================================================================
+// SMART ESCROW DISPUTES (2026-06-14)
+// Admin/worker management of escrow disputes. Financial rulings are executed by
+// services/escrowService.js (resolveDispute) inside prisma.$transaction.
+// =============================================================================
+
+const escrowService = require('../services/escrowService');
+
+/** Inject a SYSTEM TicketMessage into a ticket and fan it out (best-effort). */
+async function _injectEscrowSystemMessage(prisma, io, ticket, content, metadata = {}) {
+    try {
+        const message = await prisma.ticketMessage.create({
+            data: {
+                ticketId: ticket.id,
+                senderId: ticket.creatorId,
+                type: 'SYSTEM',
+                content,
+                metadata: { system: true, ...metadata }
+            }
+        });
+        await prisma.ticket.update({
+            where: { id: ticket.id },
+            data: { lastActivityAt: new Date() }
+        });
+        if (io) {
+            const payload = { ...message, ticketId: ticket.id };
+            io.to(`ticket_${ticket.id}`).emit('ticket_message', payload);
+            io.to(`user_${ticket.creatorId}`).emit('ticket_message', payload);
+            io.to(`user_${ticket.counterpartyId}`).emit('ticket_message', payload);
+        }
+    } catch (err) {
+        logger.error({ err: err }, '[admin._injectEscrowSystemMessage] error');
+    }
+}
+
+// GET /api/admin/escrow-disputes?status=&page=&limit=
+exports.getEscrowDisputes = async (req, res) => {
+    const prisma = getReadPrisma(req.app);
+    try {
+        const { status } = req.query;
+        const VALID = ['PENDING', 'ASSIGNED', 'UNDER_REVIEW', 'RESOLVED'];
+        const where = {};
+        if (status) {
+            const upper = String(status).toUpperCase();
+            if (!VALID.includes(upper)) {
+                return res.status(400).json({ success: false, message: `status must be one of: ${VALID.join(', ')}` });
+            }
+            where.status = upper;
+        }
+
+        const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
+        const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 100);
+        const skip = (page - 1) * limit;
+
+        const [disputes, total] = await Promise.all([
+            prisma.escrowDispute.findMany({
+                where,
+                orderBy: { createdAt: 'desc' },
+                skip,
+                take: limit,
+                include: {
+                    escrow: {
+                        include: {
+                            ticket: { select: { id: true, name: true, status: true } },
+                            payer: { select: { id: true, username: true } },
+                            payee: { select: { id: true, username: true } }
+                        }
+                    },
+                    raisedBy: { select: { id: true, username: true } },
+                    assignedTo: { select: { id: true, username: true } }
+                }
+            }),
+            prisma.escrowDispute.count({ where })
+        ]);
+
+        return res.status(200).json({
+            success: true,
+            disputes,
+            pagination: { page, limit, total, totalPages: Math.ceil(total / limit) }
+        });
+    } catch (error) {
+        logger.error({ err: error }, '[getEscrowDisputes] error');
+        return res.status(500).json({ success: false, message: error.message });
+    }
+};
+
+// POST /api/admin/escrow-disputes/:id/assign   body: { assignedToId }
+exports.assignEscrowDispute = async (req, res) => {
+    const prisma = req.app.get('prisma');
+    const io = req.app.get('socketio');
+    try {
+        const { id } = req.params; // dispute id
+        const { assignedToId } = req.body;
+        if (!assignedToId) {
+            return res.status(400).json({ success: false, message: 'assignedToId is required.' });
+        }
+
+        const dispute = await prisma.escrowDispute.findUnique({ where: { id } });
+        if (!dispute) {
+            return res.status(404).json({ success: false, message: 'Dispute not found.' });
+        }
+
+        const result = await escrowService.assignDisputeToAdmin(prisma, {
+            escrowId: dispute.escrowId,
+            assignedToId: Number(assignedToId),
+            requestingAdminId: req.user.id
+        });
+
+        if (io) {
+            io.to(`user_${Number(assignedToId)}`).emit('dispute_assigned', {
+                disputeId: result.dispute.id,
+                escrowId: result.escrow.id,
+                status: result.dispute.status
+            });
+        }
+
+        return res.status(200).json({ success: true, escrow: result.escrow, dispute: result.dispute });
+    } catch (error) {
+        logger.error({ err: error }, '[assignEscrowDispute] error');
+        return res.status(500).json({ success: false, message: error.message });
+    }
+};
+
+// POST /api/admin/escrow-disputes/:id/resolve
+// body: { ruling: 'FULL_RELEASE'|'FULL_REFUND'|'SPLIT', rulingNotes, payerPct?, payeePct? }
+exports.resolveEscrowDispute = async (req, res) => {
+    const prisma = req.app.get('prisma');
+    const io = req.app.get('socketio');
+    try {
+        const { id } = req.params; // dispute id
+        const { ruling, rulingNotes, payerPct, payeePct } = req.body;
+
+        if (!['FULL_RELEASE', 'FULL_REFUND', 'SPLIT'].includes(ruling)) {
+            return res.status(400).json({ success: false, message: 'ruling must be FULL_RELEASE, FULL_REFUND, or SPLIT.' });
+        }
+
+        const dispute = await prisma.escrowDispute.findUnique({
+            where: { id },
+            include: {
+                escrow: { include: { ticket: true, payer: { select: { id: true, username: true } }, payee: { select: { id: true, username: true } } } }
+            }
+        });
+        if (!dispute) {
+            return res.status(404).json({ success: false, message: 'Dispute not found.' });
+        }
+        const escrowRow = dispute.escrow;
+
+        // WS3.1 IDEMPOTENCY: an already-resolved dispute (or an escrow that is no
+        // longer in a resolvable state) must be rejected with 409 Conflict, never
+        // re-executed — re-running a ruling would move money twice.
+        const RESOLVABLE_ESCROW = ['DISPUTED', 'ADMIN_REVIEW'];
+        if (dispute.status === 'RESOLVED' || !escrowRow || !RESOLVABLE_ESCROW.includes(escrowRow.status)) {
+            return res.status(409).json({
+                success: false,
+                message: `Dispute already resolved or escrow not in a resolvable state (dispute=${dispute.status}, escrow=${escrowRow ? escrowRow.status : 'missing'}).`
+            });
+        }
+
+        const result = await escrowService.resolveDispute(prisma, {
+            escrowId: dispute.escrowId,
+            adminId: req.user.id,
+            ruling,
+            rulingNotes,
+            payerPct,
+            payeePct
+        });
+
+        const payerName = escrowRow.payer ? escrowRow.payer.username : 'the payer';
+        const payeeName = escrowRow.payee ? escrowRow.payee.username : 'the payee';
+
+        // Emit escrow_resolved to both parties.
+        if (io) {
+            const payload = {
+                escrowId: result.escrow.id,
+                ticketId: result.escrow.ticketId,
+                status: result.escrow.status,
+                ruling,
+                payerPct: result.dispute.payerPct,
+                payeePct: result.dispute.payeePct
+            };
+            io.to(`user_${result.escrow.payerId}`).emit('escrow_resolved', payload);
+            io.to(`user_${result.escrow.payeeId}`).emit('escrow_resolved', payload);
+        }
+
+        // SYSTEM TicketMessage describing the ruling.
+        let msg;
+        if (ruling === 'FULL_RELEASE') {
+            msg = `🏆 Admin ruling: Funds released to ${payeeName}.`;
+        } else if (ruling === 'FULL_REFUND') {
+            msg = `↩️ Admin ruling: Funds refunded to ${payerName}.`;
+        } else {
+            msg = `⚖️ Admin ruling: ${payerPct}% refunded to ${payerName}, ${payeePct}% released to ${payeeName}.`;
+        }
+        // WS3.1 AUDIT: the SYSTEM TicketMessage is the persistent, queryable audit
+        // record for the ruling (the dispute row also stamps ruling/rulingNotes/
+        // resolvedAt/assignedToId). Capture adminId + reason + ruling + timestamp.
+        await _injectEscrowSystemMessage(prisma, io, escrowRow.ticket, msg, {
+            event: 'ESCROW_RESOLVED',
+            escrowId: result.escrow.id,
+            ruling,
+            adminId: req.user.id,
+            rulingNotes: rulingNotes || null,
+            resolvedAt: new Date().toISOString()
+        });
+
+        // Close the parent ticket if still OPEN.
+        if (escrowRow.ticket && escrowRow.ticket.status === 'OPEN') {
+            await prisma.ticket.update({
+                where: { id: escrowRow.ticket.id },
+                data: { status: 'CLOSED', closedAt: new Date(), lastActivityAt: new Date() }
+            });
+        }
+
+        // Append-only audit trail (fire-and-forget — never fails the request).
+        await audit(prisma, {
+            actorId: req.user.id, actorName: req.user.username,
+            action: 'RESOLVE_ESCROW_DISPUTE', targetType: 'ESCROW', targetId: String(dispute.escrowId),
+            metadata: { disputeId: id, ruling, rulingNotes: rulingNotes || null, payerPct: payerPct ?? null, payeePct: payeePct ?? null },
+            ipAddress: req.ip,
+        });
+
+        return res.status(200).json({ success: true, escrow: result.escrow, dispute: result.dispute });
+    } catch (error) {
+        logger.error({ err: error }, '[resolveEscrowDispute] error');
+        return res.status(500).json({ success: false, message: error.message });
+    }
+};
+
+// =============================================================================
+// GENERAL AUDIT LOG — paginated read of the append-only AuditLog (utils/audit).
+// Exposed at GET /api/admin/audit-log/general (the bare /audit-log path is
+// already taken by the settings audit log → adminSettingsController.getAuditLog).
+// Filters: ?page=&limit=&action=&targetType=&actorId=
+// =============================================================================
+exports.getAuditLog = async (req, res) => {
+    const prisma = getReadPrisma(req.app);
+    try {
+        const page  = Math.max(1, parseInt(req.query.page)  || 1);
+        const limit = Math.min(100, parseInt(req.query.limit) || 50);
+        const skip  = (page - 1) * limit;
+
+        const where = {};
+        if (req.query.action)     where.action     = req.query.action;
+        if (req.query.targetType) where.targetType = req.query.targetType;
+        if (req.query.actorId)    where.actorId    = parseInt(req.query.actorId);
+
+        const [rows, total] = await Promise.all([
+            prisma.auditLog.findMany({ where, orderBy: { createdAt: 'desc' }, skip, take: limit }),
+            prisma.auditLog.count({ where }),
+        ]);
+
+        return res.status(200).json({
+            success: true,
+            auditLog: rows,
+            pagination: { page, limit, total, totalPages: Math.ceil(total / limit), hasNext: page * limit < total },
+        });
+    } catch (err) {
+        logger.error({ err: err }, '[getAuditLog]');
+        return res.status(500).json({ success: false, message: err.message });
+    }
+};

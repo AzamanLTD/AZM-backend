@@ -1,0 +1,76 @@
+node_modules
+# Keep environment variables out of version control
+.env
+.env.*
+!.env.example
+!.env.test.example
+
+/generated/prisma
+
+# =============================================================================
+# Secrets — NEVER commit. Add new patterns here as they show up.
+# =============================================================================
+
+# Firebase / Google service-account credentials (loaded by utils/firebaseService.js)
+service-account*.json
+service-account*.json.json
+firebase-adminsdk-*.json
+google-services.json
+GoogleService-Info.plist
+
+# Generic credential / secret material
+*.pem
+*.key
+*.p12
+secrets/
+
+# Local agent semantic-review output (per-session diff annotations)
+/semantic-review/
+
+# Multer-written user uploads (avatars, chat media, vendor docs,
+# trade-account screenshots). The directory tree itself is committed
+# (with .gitkeep) so the server can write into it on a fresh checkout.
+/uploads/avatars/*
+/uploads/chat/*
+/uploads/proofs/*
+/uploads/vendor/*
+/uploads/trade-accounts/*
+!/uploads/avatars/.gitkeep
+!/uploads/chat/.gitkeep
+!/uploads/proofs/.gitkeep
+!/uploads/vendor/.gitkeep
+!/uploads/trade-accounts/.gitkeep
+
+# Local commit-message scratch file used by the agent's commit pipeline.
+.git_commit_msg
+.commit_msg
+
+# AI agent / IDE assistant config and session files (internal tooling, not source)
+.cursorrules
+AZAMAN_MASTER_SOUL.md
+AUDIT.md
+FRONTEND_AUDIT.md
+API_INTEGRATION_SUMMARY.md
+PHASE_5_SUMMARY.md
+PHASE_5_DEPLOYMENT_GUIDE.md
+
+# Build outputs
+dist/
+build/
+*.log
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.temp
+.cache/
+conversations/
