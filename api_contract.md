@@ -552,7 +552,11 @@ Owner-only status lookup for the real-time withdrawal progress sheet.
 and stored as `TransactionHistory.txHash`. Acts as the **5s polling
 fallback** for the `withdrawal_progress` Socket.io event (see Real-time
 events). Returns `404 NOT_FOUND` if no `WITHDRAWAL_FIAT` row with that
-`txHash` belongs to the requester.
+`txHash` belongs to the requester. The mirror `Withdrawal` row is
+resolved through the DURABLE `Withdrawal.transactionHistoryId` link the
+reservation writes — never by an amount/timestamp heuristic, so two
+same-amount withdrawals seconds apart can never cross-associate. The
+amount is reported as `amountUsdc` (the reservation currency), not GHS.
 
 Maps `TransactionHistory.status` → a user-facing `{stage,label,pct}`
 triple:
@@ -572,7 +576,7 @@ triple:
   "stage": "PROCESSING",
   "label": "Sending to your MoMo wallet...",
   "pct": 40,
-  "amountGhs": 100,
+  "amountUsdc": 100,
   "recipient": "233XXXXXXXXX",
   "providerTxId": null,
   "updatedAt": "2026-06-12T10:00:00.000Z"

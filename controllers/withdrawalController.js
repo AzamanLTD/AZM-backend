@@ -1747,23 +1747,15 @@ exports.getWithdrawalStatus = async (req, res) => {
             return res.status(404).json({ success: false, code: 'NOT_FOUND', message: 'No withdrawal found for that reference.' });
         }
 
-        // Try to locate the mirror Withdrawal row for the destination phone and
-        // any provider tracking the reconciliation worker may have stored. The
-        // Withdrawal model has no `reference`/`providerTxId` column, so we
-        // correlate on userId + amount within the same wall-clock window — the
-        // exact heuristic withdrawalReconciliationWorker uses. Non-fatal.
+        // Resolve the mirror Withdrawal row through the DURABLE link the fiat
+        // reservation writes (Withdrawal.transactionHistoryId -> tx.id) — never
+        // by userId + amount + a wall-clock window, which can mis-associate
+        // two same-user withdrawals of the same amount created seconds apart.
+        // Non-fatal: pre-bridge rows simply omit provider context.
         let withdrawalRow = null;
         try {
             withdrawalRow = await prisma.withdrawal.findFirst({
-                where: {
-                    userId: req.user.id,
-                    amount: tx.amountUsdc,
-                    createdAt: {
-                        gte: new Date(tx.createdAt.getTime() - 5_000),
-                        lte: new Date(tx.createdAt.getTime() + 5_000)
-                    }
-                },
-                orderBy: { createdAt: 'desc' }
+                where: { transactionHistoryId: tx.id },
             });
         } catch (_) { /* non-fatal — provider context simply omitted */ }
 
@@ -1786,7 +1778,9 @@ exports.getWithdrawalStatus = async (req, res) => {
             stage:        mapped.stage,
             label:        mapped.label,
             pct:          mapped.pct,
-            amountGhs:    tx.amountUsdc != null ? Number(tx.amountUsdc) : null,
+            // USDC, not GHS — the withdrawal is denominated in USDC and the
+            // MoMo payout quote lives on the Withdrawal row's service metadata.
+            amountUsdc:    tx.amountUsdc != null ? Number(tx.amountUsdc) : null,
             recipient:    withdrawalRow ? withdrawalRow.destination : null,
             providerTxId,
             updatedAt:    tx.createdAt ? tx.createdAt.toISOString() : null

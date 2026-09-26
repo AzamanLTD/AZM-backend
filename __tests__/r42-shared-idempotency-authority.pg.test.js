@@ -964,6 +964,159 @@ run('r42 — shared financial idempotency authority (PostgreSQL)', () => {
         return { ghs: Number(ghs.balance), usd: Number(usd.balance) };
     };
 
+    test('R7. status lookup correlates through the DURABLE transactionHistoryId link: two same-user same-amount withdrawals seconds apart never cross-associate mirrors; final states map honestly; the amount is USDC, never mislabeled GHS', async () => {
+        const { fiatWithdrawal, getWithdrawalStatus } = require('../controllers/withdrawalController');
+        const { seedUser } = require('./helpers/factories');
+
+        // Same singletons/user pattern as R5.
+        await prisma.systemFiatPool.upsert({ where: { id: 1 }, update: { balance: 100000 }, create: { id: 1, balance: 100000 } });
+        await prisma.systemMasterCrypto.upsert({ where: { id: 1 }, update: { balance: 0 }, create: { id: 1, balance: 0 } });
+        await prisma.globalSettings.upsert({
+            where: { id: 1 },
+            update: { liveRetailRate: 13.42, liveRateSource: 'KOTANI_PAY', fiatLiquidityAuthorityEnabled: false, modelBSettlementEnabled: false },
+            create: { id: 1, liveRetailRate: 13.42, liveRateSource: 'KOTANI_PAY', fiatLiquidityAuthorityEnabled: false, modelBSettlementEnabled: false },
+        });
+        const seeded = await seedUser(prisma, { availableBalance: 500 });
+        const userId = seeded.id;
+
+        // Two REAL fiat withdrawals, same user, IDENTICAL amount, created
+        // milliseconds apart — deep inside the old ±5s heuristic window, the
+        // exact scenario that could cross-associate mirrors before the fix.
+        const drive = ({ key, phone }) => new Promise((resolve, reject) => {
+            // Same injection pattern as R5: the balance push throws AFTER the
+            // authoritative withdrawal transaction committed, so the
+            // post-response phase parks BEFORE dispatch — the withdrawal
+            // stays durably PENDING (a null dispatcher would reverse it).
+            const appMap = new Map([
+                ['prisma', prisma], ['socketio', null],
+                ['emitBalanceUpdate', async () => { throw new Error('socket push failed post-commit'); }],
+                ['emailService', null], ['smsService', null],
+                ['adminAlertService', null], ['paymentFailoverService', null],
+                ['mtnDisbursementService', null],
+            ]);
+            const app = { settings: {}, get(k) { return this.settings[k]; }, set(k, v) { this.settings[k] = v; } };
+            for (const [k, v] of appMap) app.set(k, v);
+            const req = {
+                method: 'POST', originalUrl: '/api/withdraw/fiat',
+                path: '/fiat', baseUrl: '/api/withdraw', route: { path: '/fiat' },
+                ip: '127.0.0.1',
+                headers: { 'idempotency-key': key },
+                params: {}, query: {},
+                body: { amount: '50', payoutMethod: 'MTN_MOMO', recipientPhone: phone, network: 'MTN' },
+                app, get: (k) => app.get(k),
+                user: { id: userId, username: 'r42-r7', createdAt: new Date(Date.now() - 90 * 86400000) },
+            };
+            const res = {
+                app, locals: {}, statusCode: 200, headersSent: false,
+                status(c) { this.statusCode = c; return this; },
+                json(b) {
+                    this.body = b;
+                    resolve({ status: this.statusCode, body: b, done: this._controllerPromise || Promise.resolve() });
+                    return this;
+                },
+                setHeader() {},
+                end() { resolve({ status: this.statusCode, body: null }); return this; },
+            };
+            const mw = idempotency();
+            mw(req, res, (err) => {
+                if (err) return reject(err);
+                res._controllerPromise = fiatWithdrawal(req, res);
+                res._controllerPromise.catch(() => { /* controller handles */ });
+            });
+        });
+
+        const driveStatus = ({ reference }) => new Promise((resolve, reject) => {
+            const app = { settings: {}, get(k) { return this.settings[k]; }, set(k, v) { this.settings[k] = v; } };
+            app.set('prisma', prisma);
+            const req = { params: { reference }, app, get: (k) => app.get(k), user: { id: userId } };
+            const res = {
+                statusCode: 200, headersSent: false,
+                status(c) { this.statusCode = c; return this; },
+                json(b) { this.body = b; resolve({ status: this.statusCode, body: b }); return this; },
+                setHeader() {},
+                end() { resolve({ status: this.statusCode, body: null }); return this; },
+            };
+            getWithdrawalStatus(req, res).catch(reject);
+        });
+
+        // Production sequencing note: runDoubleCheck audits only SETTLED
+        // rows, so a user with a pending withdrawal gets FROZEN_DISPUTE on a
+        // second attempt (settle-first policy). A is therefore settled
+        // BEFORE B is driven — which also lets R7 exercise the COMPLETED
+        // mapping honestly. The mirrors still land within the old ±5s
+        // heuristic window, so the cross-association risk R7 pins is fully
+        // in play: the old code would have answered BOTH references with
+        // B's (newest) mirror.
+        const a = await drive({ key: 'r7-a', phone: '0244000001' });
+        await a.done;
+        expect(a.status).toBe(202);
+        const refA = a.body.data.reference;
+        const txA = await prisma.transactionHistory.findFirst({ where: { txHash: refA, userId, type: 'WITHDRAWAL_FIAT' } });
+        await prisma.transactionHistory.update({ where: { id: txA.id }, data: { status: 'COMPLETED' } });
+
+        const b = await drive({ key: 'r7-b', phone: '0244000002' });
+        await b.done;
+        expect(b.status).toBe(202);
+        const refB = b.body.data.reference;
+        expect(refA).not.toBe(refB);
+
+        // The reservation wrote the durable bridge on BOTH mirrors.
+        const txB = await prisma.transactionHistory.findFirst({ where: { txHash: refB, userId, type: 'WITHDRAWAL_FIAT' } });
+        const wa = await prisma.withdrawal.findFirst({ where: { transactionHistoryId: txA.id } });
+        const wb = await prisma.withdrawal.findFirst({ where: { transactionHistoryId: txB.id } });
+        expect(wa.destination).toBe('0244000001');
+        expect(wb.destination).toBe('0244000002');
+
+        // Status for EACH reference resolves ITS OWN mirror — the old
+        // userId+amount±5s heuristic would have returned the newest mirror
+        // (0244000002) for BOTH references here.
+        const sa = await driveStatus({ reference: refA });
+        expect(sa.status).toBe(200);
+        expect(sa.body.recipient).toBe('0244000001');
+        const sb = await driveStatus({ reference: refB });
+        expect(sb.status).toBe(200);
+        expect(sb.body.recipient).toBe('0244000002');
+
+        // Deterministic on repeat — reference → transactionHistoryId →
+        // Withdrawal is stable, not a heuristic race.
+        const sa2 = await driveStatus({ reference: refA });
+        expect(sa2.body).toEqual(sa.body);
+
+        // The amount is reported as USDC (the reservation currency) and the
+        // mislabeled `amountGhs` field is gone.
+        expect(sa.body.amountUsdc).toBe(50);
+        expect(sa.body.amountGhs).toBeUndefined();
+
+        // A settled BEFORE B was driven: its status lookup reports the
+        // honest COMPLETED triple (final-state mapping exercised for real,
+        // not by hand-editing after the fact).
+        expect(sa.body.status).toBe('COMPLETED');
+        expect(sa.body.stage).toBe('COMPLETED');
+        expect(sa.body.pct).toBe(100);
+        expect(sa.body.label).toBe('Money sent successfully!');
+
+        // B is still pending: PROCESSING triple. Then fail B and re-query —
+        // the FAILED mapping must surface the durable-reversal language.
+        expect(sb.body.status).toBe('PENDING');
+        expect(sb.body.stage).toBe('PROCESSING');
+        expect(sb.body.pct).toBe(40);
+        await prisma.transactionHistory.update({ where: { id: txB.id }, data: { status: 'FAILED' } });
+        const saDone = await driveStatus({ reference: refA });
+        expect(saDone.body.status).toBe('COMPLETED');
+        expect(saDone.body.recipient).toBe('0244000001');
+        const sbFail = await driveStatus({ reference: refB });
+        expect(sbFail.body.status).toBe('FAILED');
+        expect(sbFail.body.stage).toBe('FAILED');
+        expect(sbFail.body.pct).toBe(0);
+        expect(sbFail.body.label).toContain('Refund issued');
+        // The FAILED mirror is still B's own — never cross-associated.
+        expect(sbFail.body.recipient).toBe('0244000002');
+
+        // Owner-only: a foreign reference for this user 404s.
+        const foreign = await driveStatus({ reference: refB.replace(/./g, 'f') });
+        expect(foreign.status).toBe(404);
+    }, 60000);
+
     test('MC1. two truly concurrent identical conversions → ONE debit/credit/log; duplicate 409; replay returns the committed conversionId', async () => {
         const userId = await seedConvertEnv();
         const body = { fromCurrency: 'GHS', toCurrency: 'USD', amount: 100 };
