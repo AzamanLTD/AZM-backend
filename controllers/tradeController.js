@@ -82,6 +82,18 @@ exports.initiateTrade = async (req, res) => {
         const { adId, amountCrypto, amountFiat, paymentMethod, idempotencyKey, buyerPaymentDetails } = req.body;
         const userId = req.user.id;
 
+        // ── §r42 idempotency disposition ─────────────────────────────────────
+        // Trade initiation is an UNWIRED route (no in-transaction claim
+        // transition), so its default disposition is RETAIN. Every guard
+        // below runs BEFORE the economic $transaction — until then, nothing
+        // has committed, so a 4xx here provably rolled nothing back and the
+        // claim is marked releasable (the key stays reusable). The flag is
+        // cleared immediately before the $transaction: from that point on,
+        // a failure — including a post-commit failure surfacing as 4xx
+        // through the outer catch — RETAINS the claim, so the same key can
+        // never admit a second trade/queue entry.
+        res.locals.financialClaimRelease = true;
+
         // --- Phase ADMIN-CONTROL-2 FIX 3: Server-side KYC gate ---
         const buyerKyc = await prisma.user.findUnique({
             where: { id: userId },
@@ -196,6 +208,11 @@ exports.initiateTrade = async (req, res) => {
                 };
             }
         }
+
+        // From here on the economic transaction is in play: clear the
+        // pre-economics release mark (§r42). Any failure from this point —
+        // in-transaction OR after commit — retains the claim.
+        res.locals.financialClaimRelease = false;
 
         // ══ SMART QUEUE GATE + TRADE CREATION (ALL inside $transaction) ══════
         // CRITICAL-7: Both the capacity check AND the trade creation happen in a

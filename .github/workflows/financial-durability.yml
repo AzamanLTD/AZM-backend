@@ -201,6 +201,11 @@ jobs:
             # claim/state-machine proofs and the wired multi-currency
             # conversion exactly-once identity.
             "__tests__/r42-shared-idempotency-authority.pg.test.js"
+            # §r42 follow-up review — trade initiation idempotency: the
+            # false releaseOn4xx declaration is removed and the post-commit
+            # failure RETAIN, concurrent duplicate, and pre-economics release
+            # contracts are proven against the real controller + middleware.
+            "__tests__/r42-trade-initiation.pg.test.js"
           )
           npx jest --runInBand --forceExit "${SUITES[@]}"
 

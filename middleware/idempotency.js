@@ -254,7 +254,14 @@ function idempotency(options = {}) {
                         data: {
                             status: OPERATION_COMMITTED,
                             statusCode,
-                            responseBody: body,
+                            // Store the WIRE form, not the raw object:
+                            // res.json(body) serializes Prisma Decimal via
+                            // toJSON → "50" (string), while Prisma's
+                            // JSON-column write would store the raw Decimal
+                            // as a number. Normalizing here makes the replay
+                            // byte-identical to the original response (the
+                            // r42 replay-fidelity contract).
+                            responseBody: JSON.parse(JSON.stringify(body)),
                         },
                     }).catch((e) => logger.warn(
                         { err: e.message, operationId: claim.id },

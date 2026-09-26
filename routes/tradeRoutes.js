@@ -38,7 +38,15 @@ router.get('/:id',     protect, getTradeDetails);
 // ── Buyer actions ────────────────────────────────────────────────────────────
 // Wired: the claim commits inside the trade-creation transaction
 // (tradeController), so a post-response IN_PROGRESS claim proves rollback.
-router.post('/initiate', protectActive, require2FA(), idempotency({ releaseOn4xx: true }), initiateTrade);
+// §r42 — trade initiation is NOT yet wired for in-transaction claim
+// completion (no tx.financialOperation transition inside initiateTrade's
+// $transaction), so it must NOT declare releaseOn4xx: a post-commit
+// failure surfacing as 4xx would delete the claim and admit a second
+// trade on the same key. Conservative default: retain on 4xx; only the
+// controller's explicit pre-economics guards mark the claim releasable
+// (res.locals.financialClaimRelease), and those provably run before the
+// economic transaction.
+router.post('/initiate', protectActive, require2FA(), idempotency(), initiateTrade);
 
 // ── Vendor approval actions ──────────────────────────────────────────────────
 router.post('/accept',  protectActive, idempotency(), acceptTrade);

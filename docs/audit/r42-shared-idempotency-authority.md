@@ -188,8 +188,23 @@ explicit and durable:
   validation failures — or when the route declared `releaseOn4xx`, which is
   ONLY valid for wired endpoints whose claim commits inside the economic
   transaction: there, a post-response IN_PROGRESS claim is itself durable
-  proof of rollback. Wired today: `/api/multi-currency/convert`,
-  `POST /api/trades/initiate`.
+  proof of rollback. Wired today: `/api/multi-currency/convert` (the
+  `tx.financialOperation.updateMany` COMMITTED transition lives inside the
+  same `$transaction` as the debit/credit; proven by R3).
+- **Trade initiation correction (2d8ea9e follow-up review):** `POST /api/trades/initiate` is NOT wired: `initiateTrade()` has no
+in-transaction claim transition, so it must not and no longer declares
+`releaseOn4xx`. Its crash/post-commit protection is RETAIN-based, exactly
+like every other unwired class-B/D route: a post-commit failure (e.g.
+`emitBalanceUpdate`, socket emission, fee-profile resolution, or the
+globalSettings lookup throwing after the `$transaction` commits) surfaces
+through the outer catch as 4xx/500, the claim is retained, and same-key
+retries deterministically refuse (409 IN_PROGRESS; never a second trade).
+Its ten pre-economics guards (input validation, ad existence/status,
+self-trade, min/max limits, buyer payment details) each set
+`res.locals.financialClaimRelease = true` — provably before the economic
+`$transaction` — so genuine request-data 4xx keeps the key reusable.
+See the `r42-trade-initiation` regression proofs (T1–T3).
+
 - **COMMITTED** only via the in-transaction claim commit (wired) or the
   guarded 2xx bookkeeping.
 - Otherwise the claim is **RETAINED** — the key is poisoned; same-key retries
@@ -239,8 +254,11 @@ mount uses it.
 ### Route inventory re-verification (review P1)
 
 All 40+ `idempotency()` mounts were re-checked. Standing disposition:
-every mount now requires the key; `releaseOn4xx` only on the two wired
-routes; schema-validation 4xx released explicitly via `validate()`;
+every mount now requires the key; `releaseOn4xx` only on the one
+genuinely wired route (`/api/multi-currency/convert`, re-verified from
+route → controller → in-tx claim transition); trade initiation's false
+declaration was removed; no production route uses `required: false`;
+schema-validation 4xx released explicitly via `validate()`;
 controller-level 4xx without an explicit mark retains the claim. The prior
 A/B/C/D class table stands, with this tightening: no route anywhere can
 release a claim on status alone.
@@ -248,7 +266,7 @@ release a claim on status alone.
 ### Remaining boundary (documented, tracked)
 
 Crash-after-commit **same-key recovery** is complete only for wired routes
-(convert, trade initiation). Unwired class-B/D routes still refuse same-key
+(convert; trade initiation is unwired and RETAIN-protected). Unwired class-B/D routes still refuse same-key
 retries after a crash (409 IN_PROGRESS; never a second mutation) — the client
 must use a new key after confirming operation state. Extending the wired
 in-transaction pattern to the remaining endpoints is the follow-up wave
