@@ -202,7 +202,7 @@ describeOrSkip('r16b P0-A: fiat withdrawal network propagation (real PostgreSQL)
         ]);
         const app = { get: (k) => (appMap.has(k) ? appMap.get(k) : null) };
         const res = {
-            statusCode: null, body: null,
+            statusCode: null, body: null, locals: {},
             status(c) { this.statusCode = c; return this; },
             json(b) { this.body = b; return res; },
         };

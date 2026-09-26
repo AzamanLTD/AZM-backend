@@ -171,8 +171,32 @@ async function convertCurrency(req, res) {
       return res.status(404).json({ success: false, message: `${from} wallet not found.` });
     }
 
-    // Execute conversion
-    const result = await prisma.$transaction(async (tx) => {
+    // §r42 — DURABLE OPERATION IDENTITY IN THE SAME ECONOMIC TRANSACTION.
+    // The middleware claimed the FinancialOperation row (res.locals) before we
+    // entered. The response is built ONCE, and the claim flips to COMMITTED
+    // INSIDE this $transaction — operation claim + debit + credit + conversion
+    // log + committed result commit together or roll back together. A retry
+    // after a crash between commit and HTTP response replays the stored
+    // committed result instead of executing a second conversion. This is the
+    // exactly-once identity at the economic mutation boundary; the HTTP
+    // middleware layer is only the derived first line.
+    const operation = res.locals?.financialOperation || null;
+    const buildResponse = (logId, toAmountFinal) => ({
+      success: true,
+      message: `Converted ${amt} ${from} to ${toAmountFinal.toFixed(2)} ${to}.`,
+      conversion: {
+        conversionId: logId,
+        fromCurrency: from,
+        toCurrency: to,
+        fromAmount: amt,
+        toAmount: parseFloat(toAmountFinal.toFixed(8)),
+        rate: parseFloat(effectiveRate.toFixed(8)),
+        fee: '1.5% spread',
+      },
+    });
+
+    let response;
+    await prisma.$transaction(async (tx) => {
       // Debit source wallet atomically. The predicate is the authoritative
       // insufficient-balance check under concurrency.
       const debit = await tx.currencyWallet.updateMany({
@@ -213,7 +237,30 @@ async function convertCurrency(req, res) {
         },
       });
 
-      return { log, toAmount };
+      response = buildResponse(log.id, toAmount);
+
+      // Commit the durable operation identity WITH the economics. Guarded on
+      // IN_PROGRESS so an already-committed wired row (impossible here, but
+      // structurally defensive) is never overwritten.
+      if (operation) {
+        const committed = await tx.financialOperation.updateMany({
+          where: { id: operation.id, status: 'IN_PROGRESS' },
+          data: {
+            status: 'COMMITTED',
+            statusCode: 200,
+            // §r42 byte-fidelity: the claim column is TEXT — store the WIRE
+            // serialization so the replay re-emits the exact response bytes.
+            responseBody: JSON.stringify(response),
+          },
+        });
+        if (committed.count !== 1) {
+          // The claim is not ours to complete — treat as an operation-state
+          // conflict and roll the whole conversion back.
+          const err = new Error('Idempotency operation state conflict.');
+          err.code = 'IDEMPOTENCY_STATE_CONFLICT';
+          throw err;
+        }
+      }
     });
 
     // Socket emission
@@ -223,23 +270,14 @@ async function convertCurrency(req, res) {
         fromCurrency: from,
         toCurrency: to,
         fromAmount: amt,
-        toAmount: result.toAmount,
+        toAmount: response.conversion.toAmount,
         rate: effectiveRate,
       });
     }
 
-    return res.json({
-      success: true,
-      message: `Converted ${amt} ${from} to ${result.toAmount.toFixed(2)} ${to}.`,
-      conversion: {
-        fromCurrency: from,
-        toCurrency: to,
-        fromAmount: amt,
-        toAmount: parseFloat(result.toAmount.toFixed(8)),
-        rate: parseFloat(effectiveRate.toFixed(8)),
-        fee: '1.5% spread',
-      },
-    });
+    // The exact response object stored in the committed claim — a replay
+    // delivers the byte-identical committed result.
+    return res.status(200).json(response);
   } catch (err) {
     logger.error({ err }, '[multiCurrency] convert error');
     const status = err?.code === 'INSUFFICIENT_CURRENCY_BALANCE' ? 400 : 500;

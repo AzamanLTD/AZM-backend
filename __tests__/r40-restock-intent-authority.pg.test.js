@@ -321,20 +321,58 @@ run('r40.4 — server-owned restock intent (PostgreSQL)', () => {
                 data: { status: 'EXECUTED', executedAt: new Date() },
             });
             await gate; // hold the transaction — the intent row stays locked
-        });
-        // cancel arrives WHILE the restock transaction is in flight: its
-        // conditional UPDATE blocks on the locked row and must re-check the
+        }, { maxWait: 10000, timeout: 30000 });
+
+        // DB-OBSERVED GATE, phase 1 — wait until the restock transaction
+        // PROVABLY holds the intent row lock: its session is idle in
+        // transaction with the intent UPDATE as its last statement. The
+        // cancel is only launched AFTER this observation, so it can never
+        // jump the queue and commit first (launching cancel before the lock
+        // was a timing assumption — it lost the race on slow CI runners and
+        // silently exercised the legal cancel-wins interleave instead; see
+        // the CI failure on 1a9d7b5). The timeout is only a safety bound —
+        // no timer ever establishes queue position.
+        const t0 = Date.now();
+        for (;;) {
+            const held = await db.$queryRaw`
+                SELECT count(*)::int AS n
+                FROM pg_stat_activity
+                WHERE datname = current_database()
+                  AND state = 'idle in transaction'
+                  AND query LIKE '%UPDATE%InventoryRestockIntent%'`;
+            if (held[0].n >= 1) break;
+            if (Date.now() - t0 > 20000) {
+                throw new Error('DB-observed gate: the restock transaction never held the locked intent row');
+            }
+            await new Promise((r) => setTimeout(r, 25));
+        }
+
+        // Phase 2 — the cancel arrives while the intent row is provably
+        // locked: its conditional UPDATE must BLOCK, then re-check the
         // committed state (PostgreSQL EvalPlanQual) instead of acting on the
         // pre-read PENDING snapshot.
         const cancelPromise = intents.cancel({ businessProfileId: biz.id, id: k.id });
-        await new Promise((r) => setTimeout(r, 200)); // let cancel reach the locked row
+        const t1 = Date.now();
+        for (;;) {
+            const blocked = await db.$queryRaw`
+                SELECT count(*)::int AS n
+                FROM pg_stat_activity
+                WHERE datname = current_database()
+                  AND wait_event_type = 'Lock'
+                  AND query LIKE '%UPDATE%InventoryRestockIntent%'`;
+            if (blocked[0].n >= 1) break;
+            if (Date.now() - t1 > 20000) {
+                throw new Error('DB-observed gate: cancel never blocked on the locked intent row');
+            }
+            await new Promise((r) => setTimeout(r, 25));
+        }
         release();
         await restockTx;
         await expect(cancelPromise).rejects.toMatchObject({ code: 'RESTOCK_INTENT_ALREADY_EXECUTED', statusCode: 409 });
         // truth wins: the committed execution is intact, never CANCELLED
         expect((await get(k.id)).status).toBe('EXECUTED');
         expect(await stockOf(item.id)).toBe(15);
-    });
+    }, 40000);
 
     test('16. RACE cancel-wins-first: reuse of the cancelled key is REJECTED with no mutation; a genuine simultaneous race stays consistent (r40.7)', async () => {
         // ordering A (§r40.7 proof A — cancel wins BEFORE the economic

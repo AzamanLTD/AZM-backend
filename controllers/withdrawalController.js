@@ -90,6 +90,7 @@ exports.fiatWithdrawal = async (req, res) => {
         // mapping (MTN=1, TELECEL=6, AIRTELTIGO=7) remains the authority.
         let networkChoice = (req.body.network || 'MTN').toString().toUpperCase();
         if (!['MTN', 'TELECEL', 'VODAFONE', 'AIRTELTIGO'].includes(networkChoice)) {
+            res.locals.financialClaimRelease = true; // pre-economics guard
             return res.status(400).json({
                 success: false,
                 message: 'network must be one of: MTN, TELECEL, or AIRTELTIGO.'
@@ -98,6 +99,7 @@ exports.fiatWithdrawal = async (req, res) => {
         if (networkChoice === 'VODAFONE') networkChoice = 'TELECEL';
 
         if (!amount || Number(amount) <= 0) {
+            res.locals.financialClaimRelease = true; // pre-economics guard
             return res.status(400).json({ success: false, message: 'Invalid withdrawal amount.' });
         }
 
@@ -112,6 +114,7 @@ exports.fiatWithdrawal = async (req, res) => {
         });
         if (!fraudResult.allowed) {
             logger.warn({ userId: req.user.id, rules: fraudResult.triggeredRules }, '[fiatWithdrawal] Blocked by fraud detection');
+            res.locals.financialClaimRelease = true; // pre-economics guard
             return res.status(403).json({
                 success: false,
                 message: 'Transaction blocked by security checks. Please contact support.',
@@ -124,6 +127,7 @@ exports.fiatWithdrawal = async (req, res) => {
         // legacy `destination` field if older clients are still sending it.
         const phone = recipientPhone || destination;
         if (!phone || typeof phone !== 'string' || phone.length < 9) {
+            res.locals.financialClaimRelease = true; // pre-economics guard
             return res.status(400).json({
                 success: false,
                 message: 'recipientPhone is required for MoMo withdrawal.'
@@ -159,6 +163,7 @@ exports.fiatWithdrawal = async (req, res) => {
         const azmSpendService = req.app.get('azmSpendService');
         if (feeDiscountTierId) {
             if (!azmSpendService) {
+                res.locals.financialClaimRelease = true; // pre-economics guard
                 return res.status(400).json({
                     success: false,
                     code: 'AZM_SPEND_FAILED',
@@ -170,6 +175,7 @@ exports.fiatWithdrawal = async (req, res) => {
             // the client-supplied multiplier is never trusted as authority.
             feeDiscountTier = FEE_DISCOUNT_TIERS.find(t => t.id === feeDiscountTierId) || null;
             if (!feeDiscountTier) {
+                res.locals.financialClaimRelease = true; // pre-economics guard
                 return res.status(400).json({
                     success: false,
                     code: 'AZM_SPEND_FAILED',
@@ -922,6 +928,9 @@ exports.fiatWithdrawal = async (req, res) => {
         // transaction — surface insufficient-AZM failures with the same
         // AZM_SPEND_FAILED contract the FE already handles.
         if (error.code === 'AZM_SPEND_FAILED') {
+            // Thrown INSIDE the reservation transaction — the whole withdrawal
+            // rolled back. Provably pre-economics: the key stays reusable.
+            res.locals.financialClaimRelease = true;
             return res.status(400).json({
                 success: false,
                 code: 'AZM_SPEND_FAILED',
@@ -929,7 +938,18 @@ exports.fiatWithdrawal = async (req, res) => {
             });
         }
 
-        return res.status(400).json({ success: false, message: error.message });
+        // r42 review P0-1: an unknown failure at this boundary may occur AFTER
+        // the authoritative withdrawal transaction committed (post-commit
+        // emits, dispatch, or a failed reversal). It must NEVER masquerade as
+        // a client error: an honest 500 leaves the idempotency claim RETAINED
+        // (poisoned) — same-key retries are refused deterministically (409)
+        // and money can never move twice on this key. The client retries
+        // with a NEW key only after confirming the withdrawal state.
+        return res.status(500).json({
+            success: false,
+            code:    'WITHDRAWAL_INTERNAL_ERROR',
+            message: 'The withdrawal could not be completed. If you were charged, reconciliation will restore it — contact support and retry with a new idempotency key.',
+        });
     }
 };
 

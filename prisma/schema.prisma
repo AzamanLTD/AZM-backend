@@ -5591,17 +5591,17 @@ model InventoryItem {
 //   EXECUTED  → CANCELLED   FORBIDDEN: an executed financial operation can
 //                            never be cancelled, only acknowledged.
 model InventoryRestockIntent {
-  id               String    @id @default(uuid())
+  id                String    @id @default(uuid())
   businessProfileId String
-  itemId           String
-  quantity         String    @db.VarChar(64)
-  status           String    @default("PENDING")
-  executionResult  Json?
-  executedAt       DateTime?
-  acknowledgedAt   DateTime?
-  createdBy        Int
-  createdAt        DateTime  @default(now())
-  updatedAt        DateTime  @updatedAt
+  itemId            String
+  quantity          String    @db.VarChar(64)
+  status            String    @default("PENDING")
+  executionResult   Json?
+  executedAt        DateTime?
+  acknowledgedAt    DateTime?
+  createdBy         Int
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
 
   businessProfile BusinessProfile @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
 
@@ -5983,18 +5983,33 @@ model StorefrontAnalyticsEvent {
 /// When a client sends an Idempotency-Key header, the response is cached
 /// so a retried request with the same key returns the original result
 /// instead of re-executing the operation (preventing double-charges).
-model IdempotencyKey {
-  id           String   @id @default(uuid())
-  key          String   @unique
-  userId       Int?
-  endpoint     String
-  statusCode   Int
-  responseBody Json
-  createdAt    DateTime @default(now())
-  expiresAt    DateTime
+// §r42 — SHARED FINANCIAL IDEMPOTENCY AUTHORITY
+// The durable economic operation identity behind the Idempotency-Key header.
+// This is NOT a response cache: the claim row is the race-proof PostgreSQL
+// authority that decides which request may execute economics. Scoped unique
+// per (userId, endpoint, key) — never global. COMMITTED rows are PERMANENT:
+// they outlive any HTTP response-cache TTL so a settled economic request can
+// never become executable again. The old IdempotencyKey response-cache table
+// (global key scope, 24h expiry, fail-open, lookup→execute→insert race) is
+// removed by the r42 overlay installer.
+model FinancialOperation {
+  id            String   @id @default(uuid())
+  userId        Int
+  endpoint      String // method + route pattern, e.g. "POST /api/multi-currency/convert"
+  key           String // client-supplied Idempotency-Key
+  status        String   @default("IN_PROGRESS") // IN_PROGRESS | COMMITTED
+  fingerprint   String // sha256 of the canonical request (exact-decimal preserving)
+  failurePolicy String   @default("RETAIN") // RETAIN | RELEASE — behavior on 5xx
+  statusCode    Int?
+  // §r42 byte-fidelity: stored as the serialized WIRE text, not JSONB —
+  // JSONB reorders object keys on read, which would make the committed
+  // replay JSON-equivalent but NOT byte-identical to the original response.
+  responseBody  String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
 
-  @@index([key])
-  @@index([expiresAt])
+  @@unique([userId, endpoint, key])
+  @@index([createdAt])
 }
 
 /// On-chain USDC sweep records — tracks consolidation from user deposit

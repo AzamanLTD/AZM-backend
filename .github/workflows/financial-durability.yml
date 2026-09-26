@@ -107,6 +107,10 @@ jobs:
         # r19: the snapshot columns the Smart Route executors/recovery read.
         # Mirrors the release chain (npm run release) and the migration.
         run: node infra/install-r19-smartroute-execution-snapshot-overlay.js
+      - name: Install r42 financial idempotency overlay
+        # r42: the FinancialOperation claim table behind the Idempotency-Key
+        # financial authority. Mirrors the release chain (npm run release).
+        run: node infra/install-r42-idempotency-overlay.js
 
       - name: Install payout reconciliation infrastructure
         run: node infra/install-payout-reconciliation-infra.js
@@ -193,6 +197,15 @@ jobs:
             # linkage-pinned create/link-vs-cancel, escrow-first serialization)
             # are financial integrity: they prove customer money cannot strand.
             "__tests__/r41-transit-funding-cancellation-authority.pg.test.js"
+            # §r42 — shared financial idempotency authority: the durable
+            # claim/state-machine proofs and the wired multi-currency
+            # conversion exactly-once identity.
+            "__tests__/r42-shared-idempotency-authority.pg.test.js"
+            # §r42 follow-up review — trade initiation idempotency: the
+            # false releaseOn4xx declaration is removed and the post-commit
+            # failure RETAIN, concurrent duplicate, and pre-economics release
+            # contracts are proven against the real controller + middleware.
+            "__tests__/r42-trade-initiation.pg.test.js"
           )
           npx jest --runInBand --forceExit "${SUITES[@]}"
 
