@@ -26,10 +26,14 @@ exports.requestWithdrawal = async (req, res) => {
         const withdrawAmount = parseFloat(amount);
 
         // 1. Basic Validation
+        // r42: provably pre-economics failures — the claim (if any) is released
+        // so the key stays reusable; nothing was executed.
         if (!withdrawAmount || withdrawAmount <= 0) {
+            res.locals.financialClaimRelease = true;
             return res.status(400).json({ success: false, message: "Invalid amount." });
         }
         if (!destination) {
+            res.locals.financialClaimRelease = true;
             return res.status(400).json({ success: false, message: "Destination address or number is required." });
         }
 
@@ -190,16 +194,45 @@ exports.requestWithdrawal = async (req, res) => {
                 });
             }
 
-            return withdrawal;
+            // r42 WAVE-2 — the durable claim commits WITH the wallet
+            // withdrawal reservation: conditional balance debit + platform fee
+            // realization + Withdrawal row + ledger reservation + restricted
+            // obligation + the COMMITTED FinancialOperation all land atomically.
+            // This route has NO provider I/O in the request path — dispatch is
+            // owned by the payout workers that claim PENDING Withdrawal rows —
+            // so the stored response (the created withdrawal ticket) is fully
+            // deterministic. Same-key retries replay these exact bytes and can
+            // never create a second debit or a second Withdrawal row.
+            const _operation = res.locals?.financialOperation || null;
+            const _response = {
+                success: true,
+                message: payoutMethod === "BINANCE_ID"
+                    ? "Zero-fee Binance withdrawal initiated!"
+                    : "Withdrawal initiated. 50% of gas fees have been subsidized.",
+                withdrawal,
+            };
+            if (_operation) {
+                const committed = await tx.financialOperation.updateMany({
+                    where: { id: _operation.id, status: 'IN_PROGRESS' },
+                    data: {
+                        status: 'COMMITTED',
+                        statusCode: 200,
+                        responseBody: JSON.stringify(_response), // WIRE text
+                    },
+                });
+                if (committed.count !== 1) {
+                    const err = new Error('Idempotency operation state conflict.');
+                    err.code = 'IDEMPOTENCY_STATE_CONFLICT';
+                    throw err;
+                }
+            }
+
+            return { withdrawal, response: _response };
         });
 
-        res.status(200).json({ 
-            success: true, 
-            message: payoutMethod === "BINANCE_ID" 
-                ? "Zero-fee Binance withdrawal initiated!" 
-                : "Withdrawal initiated. 50% of gas fees have been subsidized.",
-            withdrawal: result
-        });
+        // The EXACT response object stored in the committed claim — the original
+        // response and any same-key replay are byte-identical.
+        res.status(200).json(result.response);
 
         // Emit balance update after successful withdrawal
         if (emitBalanceUpdate) await emitBalanceUpdate(userId);

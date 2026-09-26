@@ -339,6 +339,35 @@ const processFiatWithdrawal = async (prisma, userId, amountIn, opts = {}) => {
             tx.user.findUnique({ where: { id: userId }, select: { availableBalance: true } })
         ]);
 
+        // r42 WAVE-2 — DURABLE OPERATION CLAIM AT THE ECONOMIC BOUNDARY.
+        // Withdrawal economics are database-bound, but the EXTERNAL provider
+        // dispatch is NOT: it happens strictly AFTER this transaction commits.
+        // The FinancialOperation claim therefore commits HERE — atomically
+        // with the debit, fee economics, fiat liquidity reservation, canonical
+        // TransactionHistory row, Withdrawal mirror, ledger reservation and
+        // restricted obligation — while the claim's stored response is the
+        // deterministic accepted/pending fact set that is TRUE BEFORE any
+        // provider I/O. It must NEVER carry provider-dependent facts
+        // (dispatch status, provider tx ids, final settlement) — those remain
+        // owned by the Withdrawal/reconciliation state machine.
+        //   crash after this commit, before provider I/O → replay returns the
+        //   stored accepted/pending response and NEVER starts a second
+        //   withdrawal (the claim is the durable authority).
+        // If the callback throws, the ENTIRE reservation rolls back: no
+        // debit, no canonical row, no claim — the client may retry.
+        if (typeof opts.commitOperationClaimInTransaction === 'function') {
+            await opts.commitOperationClaimInTransaction(tx, {
+                txRecord,
+                withdrawalRecord,
+                amount,           // exact Decimal
+                exitFee,          // exact Decimal
+                totalDeduct,      // exact Decimal
+                payoutGhs,        // exact Decimal (2dp)
+                retailRate:       retailRateExact, // exact Decimal (rate used for payoutGhs)
+                newUserBalance: updatedUser.availableBalance, // exact Decimal
+            });
+        }
+
         return {
             user: updatedUser,
             txRecord,

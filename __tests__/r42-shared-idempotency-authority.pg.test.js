@@ -67,7 +67,7 @@ run('r42 — shared financial idempotency authority (PostgreSQL)', () => {
                 'POST /fail-validation', 'POST /hang', 'POST /unprotected-observe',
                 'POST /api/multi-currency/convert',
                 'POST /spend-commit-then-400', 'POST /spend-wired-in-tx',
-                'POST /spend-optional', 'POST /api/withdraw/fiat',
+                'POST /spend-optional', 'POST /api/withdraw/fiat', 'POST /api/withdraw/crypto',
             ] } },
         });
     });
@@ -697,19 +697,24 @@ run('r42 — shared financial idempotency authority (PostgreSQL)', () => {
             status(c) { this.statusCode = c; return this; },
             json(b) {
                 this.body = b;
-                resolve({ status: this.statusCode, body: b });
+                resolve({ status: this.statusCode, body: b, done: this._controllerPromise || Promise.resolve() });
                 return this;
             },
             setHeader() {},
             end() { resolve({ status: this.statusCode, body: null }); return this; },
         };
         const mw = idempotency();
-        mw(req, res, (err) => (err
-            ? reject(err)
-            : Promise.resolve(fiatWithdrawal(req, res)).catch(() => {/* controller handles */ })));
+        mw(req, res, (err) => {
+            if (err) return reject(err);
+            // Expose the controller's full-run promise so tests can await the
+            // post-response dispatch phase (r42 WAVE-2: the HTTP response is
+            // sent at the commit boundary; provider I/O continues after it).
+            res._controllerPromise = fiatWithdrawal(req, res);
+            res._controllerPromise.catch(() => { /* controller handles */ });
+        });
     });
 
-    test('R5. real fiat withdrawal: economics commit, post-commit emit throws → honest 500, claim retained, same-key retry cannot double-withdraw', async () => {
+    test('R5. real fiat withdrawal: claim commits IN the reservation → accepted 202, post-response emit throw is durable (never 500), same-key retry replays the exact bytes and cannot double-withdraw', async () => {
         // singletons the withdrawal service needs
         await prisma.systemFiatPool.upsert({ where: { id: 1 }, update: { balance: 100000 }, create: { id: 1, balance: 100000 } });
         await prisma.systemMasterCrypto.upsert({ where: { id: 1 }, update: { balance: 0 }, create: { id: 1, balance: 0 } });
@@ -726,24 +731,46 @@ run('r42 — shared financial idempotency authority (PostgreSQL)', () => {
         const userId = seeded.id;
 
         const first = await driveRealWithdrawal({ userId, key: 'rw-1', amount: 50 });
-        // The post-commit emit failure is honestly classified: NEVER a 400.
-        expect(first.status).toBe(500);
-        expect(first.body.code).toBe('WITHDRAWAL_INTERNAL_ERROR');
+        // Let the post-response phase run to completion (the emit throws there).
+        await first.done;
+
+        // r42 WAVE-2: the response is the deterministic accepted/pending body
+        // sent AT the commit boundary. A post-response failure can never
+        // masquerade as an HTTP outcome anymore — there is no honest 500.
+        expect(first.status).toBe(202);
+        expect(first.body.success).toBe(true);
+        expect(first.body.status).toBe('PENDING');
+        const reference = first.body.data.reference;
+        expect(reference).toBeTruthy();
 
         // The withdrawal COMMITTED — debited exactly once.
         const u1 = await prisma.user.findUnique({ where: { id: userId }, select: { availableBalance: true } });
         expect(Number(u1.availableBalance)).toBeLessThan(500); // money moved once
         const afterFirst = Number(u1.availableBalance);
 
-        // The claim is RETAINED (poisoned) — never released on the 5xx.
+        // The claim is COMMITTED with the exact WIRE bytes stored for replay.
         const ops = await prisma.financialOperation.findMany({ where: { userId, key: 'rw-1' } });
         expect(ops.length).toBe(1);
-        expect(ops[0].status).toBe('IN_PROGRESS');
+        expect(ops[0].status).toBe('COMMITTED');
+        expect(ops[0].statusCode).toBe(202);
+        expect(JSON.parse(ops[0].responseBody)).toEqual(first.body);
 
-        // Same-key retry: refused deterministically. No second withdrawal.
+        // The post-response emit failure is durably recorded (operators can
+        // see it) and the withdrawal stays tracked for reconciliation — it
+        // was NOT lost with the response already on the wire.
+        // (ReconciliationException has no Prisma model — raw SQL, as the
+        // service itself writes it.)
+        const excRows = await prisma.$queryRawUnsafe(
+            'SELECT "reason" FROM "ReconciliationException" WHERE "reference" = $1',
+            reference
+        );
+        expect(excRows.map((r) => r.reason)).toContain('FIAT_POST_RESPONSE_PHASE_FAILURE');
+
+        // Same-key retry: replays the SAME accepted response — never a second
+        // withdrawal, never a second debit, byte-identical body.
         const retry = await driveRealWithdrawal({ userId, key: 'rw-1', amount: 50 });
-        expect(retry.status).toBe(409);
-        expect(retry.body.code).toBe('IDEMPOTENCY_IN_PROGRESS');
+        expect(retry.status).toBe(202);
+        expect(retry.body).toEqual(first.body);
         const u2 = await prisma.user.findUnique({ where: { id: userId }, select: { availableBalance: true } });
         expect(Number(u2.availableBalance)).toBeCloseTo(afterFirst, 6); // debited ONCE
         const histories = await prisma.transactionHistory.findMany({ where: { userId, type: 'WITHDRAWAL_FIAT' } });
@@ -751,6 +778,140 @@ run('r42 — shared financial idempotency authority (PostgreSQL)', () => {
         const withdrawals = await prisma.withdrawal.findMany({ where: { userId } });
         expect(withdrawals.length).toBe(1);
     }, 30000);
+
+    test('R6. real CRYPTO withdrawal through the route: accepted 202 at the commit boundary, exactly ONE provider submission, same-key retry replays the exact bytes and cannot double-withdraw', async () => {
+        const custody = require('../services/tatumCustodyExecutionService');
+        const cryptoWithdrawal = require('../controllers/withdrawalController').cryptoWithdrawal;
+        const DEST = '0x' + '33'.repeat(20);
+        const HOT = '0x' + '11'.repeat(20);
+        const CUST = '0x' + '22'.repeat(20);
+
+        // Gate env exactly as the custody suite's enableGates().
+        const KEYS = ['TATUM_PROVIDER', 'TATUM_API_KEY', 'TATUM_KMS_ENABLED', 'TATUM_CRYPTO_EXECUTION_ENABLED',
+            'TATUM_KMS_SIGNATURE_ID', 'TATUM_KMS_CHAIN', 'TATUM_KMS_ENVIRONMENT', 'TATUM_KMS_FOUR_EYE_REQUIRED',
+            'TATUM_HOT_WALLET_SIGNATURE_ID', 'TATUM_HOT_WALLET_INDEX', 'TATUM_HOT_WALLET_ADDRESS',
+            'TATUM_TREASURY_ADDRESS', 'TATUM_KMS_SIGNER_REGISTRY', 'TATUM_KMS_VALIDATOR_ALLOWED_IPS', 'TATUM_BASE_URL'];
+        const saved = {};
+        for (const k of KEYS) saved[k] = process.env[k];
+        process.env.TATUM_PROVIDER = 'LIVE';
+        process.env.TATUM_API_KEY = 'test-tatum-key';
+        process.env.TATUM_KMS_ENABLED = 'true';
+        process.env.TATUM_CRYPTO_EXECUTION_ENABLED = 'true';
+        process.env.TATUM_KMS_SIGNATURE_ID = 'test-kms-signature-id';
+        process.env.TATUM_KMS_CHAIN = 'POLYGON';
+        process.env.TATUM_KMS_ENVIRONMENT = 'TESTNET';
+        process.env.TATUM_KMS_FOUR_EYE_REQUIRED = 'true';
+        process.env.TATUM_HOT_WALLET_SIGNATURE_ID = 'test-hot-signature-id';
+        process.env.TATUM_HOT_WALLET_ADDRESS = HOT;
+        delete process.env.TATUM_TREASURY_ADDRESS;
+        process.env.TATUM_KMS_SIGNER_REGISTRY = JSON.stringify([
+            { signatureId: 'test-kms-signature-id', index: 5, address: CUST, model: 'MNEMONIC_INDEXED' },
+            { signatureId: 'test-hot-signature-id', index: 0, address: HOT, model: 'MNEMONIC_INDEXED' },
+        ]);
+        delete process.env.TATUM_KMS_VALIDATOR_ALLOWED_IPS;
+
+        // KMS stays PENDING — the provider submitted exactly once, no tx hash yet.
+        const submitted = [];
+        custody.__setProviderForTests({
+            name: 'FAKE',
+            submitted,
+            async submitTokenTransfer(payload) { submitted.push(payload); return { pendingId: 'tatum-pending-r6', txHash: null }; },
+            async getKmsRequest() { return { id: 'req-r6', status: 'PENDING', data: JSON.stringify({ params: [] }), signatureId: 'test-hot-signature-id' }; },
+            async deleteKmsRequest() { return { id: 'req-r6' }; },
+            async completeKmsTransaction() { return {}; },
+            async getTransaction() { return null; },
+        });
+
+        const driveCrypto = ({ userId, key, amount }) => new Promise((resolve, reject) => {
+            const appMap = new Map([
+                ['prisma', prisma], ['socketio', null],
+                ['emitBalanceUpdate', async () => {}],
+                ['emailService', null], ['smsService', null],
+                ['adminAlertService', null], ['paymentFailoverService', null],
+                ['mtnDisbursementService', null],
+            ]);
+            const app = { settings: {}, get(k) { return this.settings[k]; }, set(k, v) { this.settings[k] = v; } };
+            for (const [k, v] of appMap) app.set(k, v);
+            const req = {
+                method: 'POST', originalUrl: '/api/withdraw/crypto',
+                path: '/crypto', baseUrl: '/api/withdraw', route: { path: '/crypto' },
+                ip: '127.0.0.1',
+                headers: key ? { 'idempotency-key': key } : {},
+                params: {}, query: {},
+                body: { amount: String(amount), destination: DEST },
+                app, get: (k) => app.get(k),
+                user: { id: userId, username: 'r42-r6', createdAt: new Date(Date.now() - 90 * 86400000) },
+            };
+            const res = {
+                app, locals: {}, statusCode: 200, headersSent: false,
+                status(c) { this.statusCode = c; return this; },
+                json(b) {
+                    this.body = b;
+                    resolve({ status: this.statusCode, body: b, done: this._controllerPromise || Promise.resolve() });
+                    return this;
+                },
+                setHeader() {},
+                end() { resolve({ status: this.statusCode, body: null }); return this; },
+            };
+            const mw = idempotency();
+            mw(req, res, (err) => {
+                if (err) return reject(err);
+                res._controllerPromise = cryptoWithdrawal(req, res);
+                res._controllerPromise.catch(() => { /* controller handles */ });
+            });
+        });
+
+        try {
+            await prisma.systemHotWallet.upsert({ where: { id: 1 }, update: { balance: 1000 }, create: { id: 1, balance: 1000 } });
+            const seeded = await seedUser(prisma, { availableBalance: 500 });
+            const userId = seeded.id;
+
+            const first = await driveCrypto({ userId, key: 'rw-c-1', amount: 50 });
+            await first.done; // let the post-response KMS phase finish
+
+            // WAVE-2 contract: the deterministic accepted/pending fact set.
+            expect(first.status).toBe(202);
+            expect(first.body.success).toBe(true);
+            expect(first.body.status).toBe('PENDING');
+            expect(first.body.data.executionId).toBeTruthy();
+            expect(first.body.data.txHash ?? null).toBe(null); // never a fake hash
+
+            // The claim committed IN the custody reservation with the WIRE bytes.
+            const ops = await prisma.financialOperation.findMany({ where: { userId, key: 'rw-c-1' } });
+            expect(ops.length).toBe(1);
+            expect(ops[0].status).toBe('COMMITTED');
+            expect(ops[0].statusCode).toBe(202);
+            expect(JSON.parse(ops[0].responseBody)).toEqual(first.body);
+
+            // Money moved EXACTLY ONCE: one debit, one PENDING ledger, one execution.
+            const u1 = await prisma.user.findUnique({ where: { id: userId }, select: { availableBalance: true } });
+            expect(Number(u1.availableBalance)).toBeCloseTo(450, 6);
+            expect(await prisma.transactionHistory.count({ where: { userId, type: 'WITHDRAWAL_CRYPTO' } })).toBe(1);
+            expect(await prisma.custodyExecution.count({ where: { userId, kind: 'CUSTOMER_WITHDRAWAL' } })).toBe(1);
+
+            // The provider was contacted EXACTLY once — the KMS submission is
+            // a durable post-response phase fact, never a per-retry side effect.
+            expect(submitted.length).toBe(1);
+            const execution = await prisma.custodyExecution.findFirst({ where: { userId, kind: 'CUSTOMER_WITHDRAWAL' } });
+            expect(execution.status).toBe('SIGNING'); // pending KMS signature
+
+            // Same-key retry: byte-identical replay, zero second mutation,
+            // zero second provider submission.
+            const retry = await driveCrypto({ userId, key: 'rw-c-1', amount: 50 });
+            expect(retry.status).toBe(202);
+            expect(retry.body).toEqual(first.body);
+            const u2 = await prisma.user.findUnique({ where: { id: userId }, select: { availableBalance: true } });
+            expect(Number(u2.availableBalance)).toBeCloseTo(450, 6);
+            expect(submitted.length).toBe(1);
+            expect(await prisma.custodyExecution.count({ where: { userId, kind: 'CUSTOMER_WITHDRAWAL' } })).toBe(1);
+            expect(await prisma.transactionHistory.count({ where: { userId, type: 'WITHDRAWAL_CRYPTO' } })).toBe(1);
+        } finally {
+            custody.__setProviderForTests(null);
+            for (const k of KEYS) {
+                if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k];
+            }
+        }
+    }, 60000);
 
     // ── MC — the real multi-currency conversion, wired through the claim ──
 

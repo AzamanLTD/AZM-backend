@@ -17,8 +17,13 @@ const { idempotency } = require('../middleware/idempotency');
 const { require2FA } = require('../middleware/require2FA');
 const { protectActive }        = require('../middleware/banGuardMiddleware');
 
-// Withdrawals
-router.post('/withdraw',       protectActive, require2FA(), idempotency(), walletController.requestWithdrawal);
+// Withdrawals — r42 WAVE-2: the claim commits INSIDE the withdrawal
+// reservation transaction (see walletController.requestWithdrawal) with the
+// deterministic created-ticket response. There is NO provider I/O in the
+// request path (payout workers own dispatch), so the response is honest
+// post-commit; 4xx/5xx responses prove the reservation rolled back and
+// release the claim for retry (same disposition contract as /api/withdraw/*).
+router.post('/withdraw',       protectActive, require2FA(), idempotency({ failurePolicy: 'RELEASE', releaseOn4xx: true }), walletController.requestWithdrawal);
 
 // Read-only history (banned users still need to see their own history)
 router.get('/history',         protect,       walletController.getWithdrawalHistory);

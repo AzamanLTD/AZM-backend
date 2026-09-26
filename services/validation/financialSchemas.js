@@ -20,15 +20,19 @@ exports.initiateFiatDepositSchema = z.object({
 });
 
 // ── Withdrawal ────────────────────────────────────────────────────────────────
-// fiatWithdrawal reads { amount, payoutMethod, recipientPhone | destination, feeDiscountTierId? }.
+// fiatWithdrawal reads { amount, payoutMethod, recipientPhone | destination,
+// feeDiscountTierId?, savedAccountId? }.
 // recipientPhone/destination kept optional (older clients send `destination`);
-// the controller still enforces the phone-presence rule.
+// the controller still enforces the phone-presence rule. savedAccountId is the
+// saved-momo account selected as payout destination (r42 WAVE-2 alias compat:
+// the live Flutter app sends it; the controller verifies ownership + isVerified).
 exports.fiatWithdrawalSchema = z.object({
   amount:           z.coerce.number().positive('Amount must be positive'),
   payoutMethod:     z.string().optional(),
   recipientPhone:   z.string().min(9, 'recipientPhone must be at least 9 digits').optional(),
   destination:      z.string().optional(),
   feeDiscountTierId: z.string().optional(),
+  savedAccountId:   z.string().optional(),
 });
 
 // cryptoWithdrawal reads { amount, destination, network }. destination is a
