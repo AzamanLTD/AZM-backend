@@ -160,3 +160,96 @@ database race, or concurrent caller must never make AZM move money twice.
   (internal transfer, vault deposit, AZM conversion) is a recommended
   follow-up wave. Until then, their crash window deterministically refuses
   (IN_PROGRESS) rather than double-moving money.
+
+## 8. Follow-up 1 — independent review: HTTP-status/economic-commit boundary (2026-09-26)
+
+An independent review of PR #311 (2d5661f) confirmed the green CI but
+correctly rejected merge on two contract-level gaps, both now closed.
+
+### P0-1 — a 4xx never implies economic rollback (FIXED)
+
+The first implementation deleted the claim on any 4xx, assuming "nothing
+committed". That assumption is unsound at a generic boundary: the reviewer's
+concrete in-repo example — `withdrawalController.fiatWithdrawal` commits
+`financeService.processFiatWithdrawal`, then post-commit work
+(`emitBalanceUpdate`, emit helpers) can throw, and the outer catch converted
+that into an HTTP 400 — would have had the authority asynchronously DELETE the
+claim, re-arming a committed withdrawal for duplicate execution. A real
+double-money path.
+
+The authority now NEVER infers rollback from HTTP status. Dispositions are
+explicit and durable:
+
+- **RELEASED** only when the handler itself marked the failure provably
+  pre-economics (`res.locals.financialClaimRelease = true`) — the schema
+  `validate()` middleware sets this on every rejection, and the seven
+  withdrawal pre-tx guards (network/amount/phone/fraud/tier guards,
+  AZM_SPEND_FAILED thrown inside the rolled-back reservation) set it on
+  validation failures — or when the route declared `releaseOn4xx`, which is
+  ONLY valid for wired endpoints whose claim commits inside the economic
+  transaction: there, a post-response IN_PROGRESS claim is itself durable
+  proof of rollback. Wired today: `/api/multi-currency/convert`,
+  `POST /api/trades/initiate`.
+- **COMMITTED** only via the in-transaction claim commit (wired) or the
+  guarded 2xx bookkeeping.
+- Otherwise the claim is **RETAINED** — the key is poisoned; same-key retries
+  get a deterministic 409 IN_PROGRESS refusal. Worst case is an unusable key,
+  never duplicate money.
+
+`withdrawalController`'s outer catch now classifies unknown failures as an
+honest **500 WITHDRAWAL_INTERNAL_ERROR** — a post-commit failure can never
+masquerade as a client error. The final `res.status(400)` fallback the review
+quoted was the exact hole; it is gone. `cryptoWithdrawal` already 500s.
+
+### P0-2 — the Idempotency-Key is now REQUIRED on authority routes (FIXED)
+
+Previously a missing header simply called `next()` — the authority vanished
+whenever a client omitted it, and a lost-response retry (no key) on a
+withdrawal was a brand-new operation that could debit twice. The factory now
+defaults `required: true`: an unkeyed request receives a deterministic
+`400 IDEMPOTENCY_KEY_REQUIRED` BEFORE any economics execute, and no claim is
+created. `required: false` remains an explicit, per-route opt-out for
+endpoints with a proven independent durable exactly-once identity; no current
+mount uses it.
+
+### Required proofs — mapping (review items 1–8 → r42 suite)
+
+1. committed economics + post-commit exception + HTTP 400 → claim NOT
+   released → **R1** (money moved once; claim IN_PROGRESS).
+2. same-key retry after that failure → no second mutation → **R2** (409
+   IDEMPOTENCY_IN_PROGRESS, zero second debit).
+3. unkeyed financial request → fail-closed/key-required → **P12**
+   (IDEMPOTENCY_KEY_REQUIRED, handler never invoked, no claim; plus unit
+   proof of the required:false opt-out).
+4. validation 4xx before economics → explicitly releasable/reusable →
+   **P8** (explicit pre-economics flag) + unit flag/releaseOn4xx proofs.
+5. transaction failure before commit → reusable same key → **P10** (RELEASE
+   on provable rollback).
+6. commit succeeded but response bookkeeping lost → same-key deterministic
+   recovery → **R3** (wired in-tx claim survives simulated bookkeeping
+   crash; byte-identical replay, one mutation).
+7. concurrent requests covering those failure states → **R4** (one owner
+   executes, all duplicates 409, claim retained through the failure).
+8. at least one real withdrawal path through the post-commit failure →
+   **R5** (real `fiatWithdrawal` + real `financeService.processFiatWithdrawal`
+   on PostgreSQL: economics commit, post-commit emit throws, honest 500,
+   claim retained, same-key retry 409, user debited exactly once, exactly
+   one canonical WITHDRAWAL_FIAT row and one Withdrawal row).
+
+### Route inventory re-verification (review P1)
+
+All 40+ `idempotency()` mounts were re-checked. Standing disposition:
+every mount now requires the key; `releaseOn4xx` only on the two wired
+routes; schema-validation 4xx released explicitly via `validate()`;
+controller-level 4xx without an explicit mark retains the claim. The prior
+A/B/C/D class table stands, with this tightening: no route anywhere can
+release a claim on status alone.
+
+### Remaining boundary (documented, tracked)
+
+Crash-after-commit **same-key recovery** is complete only for wired routes
+(convert, trade initiation). Unwired class-B/D routes still refuse same-key
+retries after a crash (409 IN_PROGRESS; never a second mutation) — the client
+must use a new key after confirming operation state. Extending the wired
+in-transaction pattern to the remaining endpoints is the follow-up wave
+(section 7), now with withdrawal as the highest-priority candidate.

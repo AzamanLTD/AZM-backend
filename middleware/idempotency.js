@@ -103,12 +103,36 @@ const isUniqueViolation = (err) =>
  */
 function idempotency(options = {}) {
     const failurePolicy = options.failurePolicy === RELEASE ? RELEASE : RETAIN;
+    // r42 review P0-2: a financial mutation mounted under this authority
+    // REQUIRES a client Idempotency-Key. Without one, every network retry is a
+    // brand-new operation and can move money twice. Opt out ONLY where an
+    // independent durable exactly-once identity already protects the route
+    // (required: false, with the evidence named at the mount site).
+    const required = options.required !== false;
+    // r42 review P0-1: the authority NEVER infers economic rollback from an
+    // HTTP status alone. releaseOn4xx is a route-level declaration valid ONLY
+    // for endpoints whose claim is committed INSIDE their economic transaction
+    // (the wired pattern): there, a post-response IN_PROGRESS claim is itself
+    // durable proof the transaction rolled back, so the key is reusable.
+    // Every other route RETAINS on 4xx unless the handler explicitly marked a
+    // provably pre-economics failure (res.locals.financialClaimRelease = true).
+    const releaseOn4xx = options.releaseOn4xx === true;
 
     return async (req, res, next) => {
         const key = req.headers['idempotency-key'];
 
-        // No key → no authority to enforce (the header stays optional).
-        if (!key) return next();
+        if (!key) {
+            if (required) {
+                // Deterministic client refusal BEFORE any economics execute:
+                // the request was NOT executed and no claim was created.
+                return res.status(400).json({
+                    success: false,
+                    code: 'IDEMPOTENCY_KEY_REQUIRED',
+                    message: 'This endpoint requires an Idempotency-Key header. Retries without a key can execute twice.',
+                });
+            }
+            return next();
+        }
 
         const prisma = req.app.get('prisma');
         const userId = req.user?.id;
@@ -237,14 +261,33 @@ function idempotency(options = {}) {
                         '[idempotency] commit bookkeeping failed — replays refuse safely (IN_PROGRESS)'
                     ));
                 } else if (statusCode >= 400 && statusCode < 500) {
-                    // Validation/client failure: nothing committed — the key
-                    // is NOT poisoned. The claim is released for reuse.
-                    prisma.financialOperation.deleteMany({
-                        where: { id: claim.id, status: OPERATION_IN_PROGRESS },
-                    }).catch((e) => logger.warn(
-                        { err: e.message, operationId: claim.id },
-                        '[idempotency] claim release failed — replays refuse safely (IN_PROGRESS)'
-                    ));
+                    // r42 review P0-1: a 4xx NEVER implies "nothing committed".
+                    // Post-commit controller work can fail and be converted to
+                    // a 4xx by an outer catch (withdrawalController is the
+                    // concrete in-repo example) — releasing on that signal
+                    // would re-arm a committed financial operation for
+                    // duplicate execution. Release requires an EXPLICIT,
+                    // durable disposition instead:
+                    //   1. res.locals.financialClaimRelease === true — the
+                    //      handler itself marked the failure as provably
+                    //      pre-economics (e.g. schema validation, pre-tx
+                    //      guards), or
+                    //   2. policy releaseOn4xx — the route declared its claim
+                    //      commits inside the economic transaction (wired),
+                    //      so IN_PROGRESS after the response proves rollback.
+                    // Otherwise the claim is RETAINED: the key stays poisoned
+                    // (same-key retries get a deterministic 409) and money can
+                    // never move twice on it.
+                    if (res.locals.financialClaimRelease === true || releaseOn4xx) {
+                        prisma.financialOperation.deleteMany({
+                            where: { id: claim.id, status: OPERATION_IN_PROGRESS },
+                        }).catch((e) => logger.warn(
+                            { err: e.message, operationId: claim.id },
+                            '[idempotency] claim release failed — replays refuse safely (IN_PROGRESS)'
+                        ));
+                    }
+                    // No explicit disposition → RETAIN. Safe by construction:
+                    // the worst case is a poisoned key, never duplicate money.
                 } else if (statusCode >= 500) {
                     if (failurePolicy === RELEASE) {
                         // The route declared its service state-convergent /

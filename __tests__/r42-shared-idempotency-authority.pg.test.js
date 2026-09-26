@@ -66,6 +66,8 @@ run('r42 — shared financial idempotency authority (PostgreSQL)', () => {
                 'POST /spend', 'POST /spend-rollback-500', 'POST /spend-commit-then-500',
                 'POST /fail-validation', 'POST /hang', 'POST /unprotected-observe',
                 'POST /api/multi-currency/convert',
+                'POST /spend-commit-then-400', 'POST /spend-wired-in-tx',
+                'POST /spend-optional', 'POST /api/withdraw/fiat',
             ] } },
         });
     });
@@ -146,8 +148,66 @@ run('r42 — shared financial idempotency authority (PostgreSQL)', () => {
             } },
             '/fail-validation': { policy: {}, fn: async (req, res) => {
                 executionCounter++;
-                if (!req.body.ok) return res.status(400).json({ success: false, code: 'VALIDATION' });
+                // r42 review P0-1: validation rejects BEFORE any economics —
+                // the handler marks the explicit pre-economics release itself.
+                if (!req.body.ok) {
+                    res.locals.financialClaimRelease = true;
+                    return res.status(400).json({ success: false, code: 'VALIDATION' });
+                }
                 return res.status(200).json({ success: true });
+            } },
+            // r42 review P0-1 proof: money commits, THEN a post-commit helper
+            // throws, and the controller-shaped catch converts it to a 400 —
+            // the exact withdrawalController pattern the review called out.
+            '/spend-commit-then-400': { policy: {}, fn: async (req, res) => {
+                executionCounter++;
+                const amount = Number(req.body.amount) || 0;
+                const claim = await prisma.currencyWallet.updateMany({
+                    where: { id: req.body.walletId, balance: { gte: amount } },
+                    data: { balance: { decrement: amount } },
+                });
+                if (claim.count !== 1) {
+                    res.locals.financialClaimRelease = true; // provably nothing committed
+                    return res.status(400).json({ success: false, code: 'INSUFFICIENT_FUNDS' });
+                }
+                try {
+                    throw new Error('post-commit helper failure (e.g. balance emit)');
+                } catch (e) {
+                    // the r41-era controller pattern: unknown failure → client error
+                    return res.status(400).json({ success: false, code: 'ERR', message: e.message });
+                }
+            } },
+            // r42 review P0-1/P1 proof: the WIRED pattern — the claim commits
+            // INSIDE the economic transaction with its response body.
+            '/spend-wired-in-tx': { policy: {}, fn: async (req, res) => {
+                executionCounter++;
+                const amount = Number(req.body.amount) || 0;
+                const response = await prisma.$transaction(async (tx) => {
+                    const debit = await tx.currencyWallet.updateMany({
+                        where: { id: req.body.walletId, balance: { gte: amount } },
+                        data: { balance: { decrement: amount } },
+                    });
+                    if (debit.count !== 1) {
+                        const err = new Error('INSUFFICIENT_FUNDS'); err.code = 'INSUFFICIENT_FUNDS'; throw err;
+                    }
+                    const wallet = await tx.currencyWallet.findUnique({ where: { id: req.body.walletId } });
+                    const body = { success: true, balance: Number(wallet.balance) };
+                    const op = res.locals?.financialOperation;
+                    const committed = await tx.financialOperation.updateMany({
+                        where: { id: op.id, status: 'IN_PROGRESS' },
+                        data: { status: 'COMMITTED', statusCode: 200, responseBody: body },
+                    });
+                    if (committed.count !== 1) {
+                        const err = new Error('IDEMPOTENCY_STATE_CONFLICT'); err.code = 'IDEMPOTENCY_STATE_CONFLICT'; throw err;
+                    }
+                    return body;
+                });
+                return res.status(200).json(response);
+            } },
+            // r42 review P0-2 proof: the proven-safe opt-out (required: false).
+            '/spend-optional': { policy: { required: false }, fn: async (req, res) => {
+                executionCounter++;
+                return res.status(200).json({ success: true, optional: true });
             } },
             '/hang': { policy: {}, fn: async (req, res) => {
                 executionCounter++;
@@ -470,13 +530,27 @@ run('r42 — shared financial idempotency authority (PostgreSQL)', () => {
         expect(executionCounter - before).toBe(0); // no unprotected execution
     }, 20000);
 
-    test('P12. no key → executes (optional header preserved)', async () => {
+    // r42 review P0-2: a financial mutation endpoint mounted under the
+    // authority REQUIRES a client key — an unkeyed retry is a brand-new
+    // operation and can move money twice. Refuse deterministically BEFORE
+    // any economics execute. required:false is the proven-safe opt-out.
+    test('P12. no key → deterministic refusal (IDEMPOTENCY_KEY_REQUIRED); handler NEVER invoked; opt-out only where proven', async () => {
         const userId = await seedUserRow();
         const wallet = await seedWallet(userId, 'GHS', 100);
         const { drive } = buildDriver();
+        const before = executionCounter;
+
         const r = await drive('/spend', { user: userId, body: { walletId: wallet.id, amount: 10 } });
-        expect(r.status).toBe(200);
-        expect(Number((await prisma.currencyWallet.findUnique({ where: { id: wallet.id } })).balance)).toBeCloseTo(90, 8);
+        expect(r.status).toBe(400);
+        expect(r.body.code).toBe('IDEMPOTENCY_KEY_REQUIRED');
+        expect(executionCounter - before).toBe(0); // never executed
+        expect(Number((await prisma.currencyWallet.findUnique({ where: { id: wallet.id } })).balance)).toBeCloseTo(100, 8);
+        const claims = await prisma.financialOperation.findMany({ where: { userId, endpoint: 'POST /spend' } });
+        expect(claims.length).toBe(0); // no claim was ever created
+
+        // the explicit opt-out: routes prove independent safety to use it
+        const opt = await drive('/spend-optional', { user: userId, body: {} });
+        expect(opt.status).toBe(200); // required:false → executes without a key
     }, 20000);
 
     test('P13. committed operations are PERMANENT — a backdated claim beyond any TTL still replays; settled economics can never re-execute', async () => {
@@ -502,6 +576,176 @@ run('r42 — shared financial idempotency authority (PostgreSQL)', () => {
         expect(replay.body).toEqual(first.body); // still the committed result
         expect(Number((await prisma.currencyWallet.findUnique({ where: { id: wallet.id } })).balance)).toBeCloseTo(90, 8);
     }, 20000);
+
+    // ── R — the HTTP-status / economic-commit boundary (review P0-1) ──
+
+    test('R1. committed economics + post-commit exception converted to HTTP 400 → claim NOT released, money moved once', async () => {
+        const userId = await seedUserRow();
+        const wallet = await seedWallet(userId, 'GHS', 100);
+        const { drive } = buildDriver();
+
+        const r = await drive('/spend-commit-then-400', { user: userId, key: 'pc-1', body: { walletId: wallet.id, amount: 10 } });
+        expect(r.status).toBe(400); // the controller-shaped catch converted the failure
+
+        // Money COMMITTED — the debit is durable despite the 400.
+        expect(Number((await prisma.currencyWallet.findUnique({ where: { id: wallet.id } })).balance)).toBeCloseTo(90, 8);
+        // The claim must NOT be released: a 4xx never implies rollback.
+        const ops = await prisma.financialOperation.findMany({ where: { userId, key: 'pc-1' } });
+        expect(ops.length).toBe(1);
+        expect(ops[0].status).toBe('IN_PROGRESS'); // retained — poisoned, never re-executed
+    }, 20000);
+
+    test('R2. same-key retry after the post-commit 400 → deterministic 409, zero second mutation', async () => {
+        const userId = await seedUserRow();
+        const wallet = await seedWallet(userId, 'GHS', 100);
+        const { drive } = buildDriver();
+
+        const first = await drive('/spend-commit-then-400', { user: userId, key: 'pc-2', body: { walletId: wallet.id, amount: 10 } });
+        expect(first.status).toBe(400);
+        const before = executionCounter;
+
+        const retry = await drive('/spend-commit-then-400', { user: userId, key: 'pc-2', body: { walletId: wallet.id, amount: 10 } });
+        expect(retry.status).toBe(409);
+        expect(retry.body.code).toBe('IDEMPOTENCY_IN_PROGRESS');
+        expect(executionCounter - before).toBe(0); // NEVER re-executed
+        // money moved exactly once across both calls
+        expect(Number((await prisma.currencyWallet.findUnique({ where: { id: wallet.id } })).balance)).toBeCloseTo(90, 8);
+    }, 20000);
+
+    test('R3. WIRED claim + lost post-response bookkeeping → same-key replay converges on the committed result', async () => {
+        const userId = await seedUserRow();
+        const wallet = await seedWallet(userId, 'GHS', 100);
+        const { drive } = buildDriver();
+
+        // Simulate the crash-after-commit window: post-response bookkeeping
+        // dies. The in-transaction claim commit is the durable truth.
+        const origUpdate = prisma.financialOperation.updateMany.bind(prisma.financialOperation);
+        prisma.financialOperation.updateMany = () => Promise.reject(new Error('bookkeeping lost (simulated crash)'));
+        const first = await drive('/spend-wired-in-tx', { user: userId, key: 'wr-1', body: { walletId: wallet.id, amount: 10 } });
+        prisma.financialOperation.updateMany = origUpdate; // restore immediately
+        expect(first.status).toBe(200);
+        expect(first.body).toEqual({ success: true, balance: 90 });
+
+        const before = executionCounter;
+        const replay = await drive('/spend-wired-in-tx', { user: userId, key: 'wr-1', body: { walletId: wallet.id, amount: 10 } });
+        expect(executionCounter - before).toBe(0); // never re-executed
+        expect(replay.status).toBe(200);
+        expect(replay.body).toEqual(first.body); // byte-identical committed result
+        expect(Number((await prisma.currencyWallet.findUnique({ where: { id: wallet.id } })).balance)).toBeCloseTo(90, 8); // once
+    }, 20000);
+
+    test('R4. concurrent duplicates across the post-commit failure state → one mutation, everyone else refused, claim retained', async () => {
+        const userId = await seedUserRow();
+        const wallet = await seedWallet(userId, 'GHS', 100);
+        const { drive } = buildDriver();
+
+        const results = await Promise.all([
+            drive('/spend-commit-then-400', { user: userId, key: 'cc-1', body: { walletId: wallet.id, amount: 10 } }),
+            drive('/spend-commit-then-400', { user: userId, key: 'cc-1', body: { walletId: wallet.id, amount: 10 } }),
+            drive('/spend-commit-then-400', { user: userId, key: 'cc-1', body: { walletId: wallet.id, amount: 10 } }),
+        ]);
+        const statuses = results.map((r) => r.status).sort();
+        expect(statuses[0]).toBe(400); // the claim owner's post-commit failure
+        expect(statuses.slice(1)).toEqual([409, 409]); // duplicates NEVER entered economics
+        expect(results.slice(1).every((r) => r.body.code === 'IDEMPOTENCY_IN_PROGRESS')).toBe(true);
+        expect(Number((await prisma.currencyWallet.findUnique({ where: { id: wallet.id } })).balance)).toBeCloseTo(90, 8); // ONE debit
+        const ops = await prisma.financialOperation.findMany({ where: { userId, key: 'cc-1' } });
+        expect(ops.length).toBe(1);
+        expect(ops[0].status).toBe('IN_PROGRESS'); // retained through the failure
+    }, 20000);
+
+    // ── R5 — the REAL withdrawal path through the post-commit failure ──
+    // (review proof 8: withdrawalController.fiatWithdrawal + real
+    // financeService.processFiatWithdrawal on real PostgreSQL)
+
+    const { fiatWithdrawal } = require('../controllers/withdrawalController');
+
+    const driveRealWithdrawal = async ({ userId, key, amount }) => new Promise((resolve, reject) => {
+        const appMap = new Map([
+            ['prisma', prisma],
+            ['socketio', null],
+            // The post-commit failure injection: the balance push throws AFTER
+            // the authoritative withdrawal transaction committed.
+            ['emitBalanceUpdate', async () => { throw new Error('socket push failed post-commit'); }],
+            ['paymentFailoverService', null],
+            ['mtnDisbursementService', null],
+            ['emailService', null],
+            ['smsService', null],
+            ['adminAlertService', null],
+        ]);
+        const app = {
+            settings: {}, get(k) { return this.settings[k]; }, set(k, v) { this.settings[k] = v; },
+        };
+        for (const [k, v] of appMap) app.set(k, v);
+        const req = {
+            method: 'POST', originalUrl: '/api/withdraw/fiat',
+            path: '/fiat', baseUrl: '/api/withdraw', route: { path: '/fiat' },
+            ip: '127.0.0.1',
+            headers: key ? { 'idempotency-key': key } : {},
+            params: {}, query: {},
+            body: { amount: String(amount), payoutMethod: 'MTN_MOMO', recipientPhone: '0244556677', network: 'MTN' },
+            app, get: (k) => app.get(k),
+            user: { id: userId, username: 'r42-rw', createdAt: new Date(Date.now() - 90 * 86400000) },
+        };
+        const res = {
+            app, locals: {}, statusCode: 200, headersSent: false,
+            status(c) { this.statusCode = c; return this; },
+            json(b) {
+                this.body = b;
+                resolve({ status: this.statusCode, body: b });
+                return this;
+            },
+            setHeader() {},
+            end() { resolve({ status: this.statusCode, body: null }); return this; },
+        };
+        const mw = idempotency();
+        mw(req, res, (err) => (err
+            ? reject(err)
+            : Promise.resolve(fiatWithdrawal(req, res)).catch(() => {/* controller handles */ })));
+    });
+
+    test('R5. real fiat withdrawal: economics commit, post-commit emit throws → honest 500, claim retained, same-key retry cannot double-withdraw', async () => {
+        // singletons the withdrawal service needs
+        await prisma.systemFiatPool.upsert({ where: { id: 1 }, update: { balance: 100000 }, create: { id: 1, balance: 100000 } });
+        await prisma.systemMasterCrypto.upsert({ where: { id: 1 }, update: { balance: 0 }, create: { id: 1, balance: 0 } });
+        await prisma.globalSettings.upsert({
+            where: { id: 1 },
+            update: { liveRetailRate: 13.42, liveRateSource: 'KOTANI_PAY', fiatLiquidityAuthorityEnabled: false, modelBSettlementEnabled: false },
+            create: { id: 1, liveRetailRate: 13.42, liveRateSource: 'KOTANI_PAY', fiatLiquidityAuthorityEnabled: false, modelBSettlementEnabled: false },
+        });
+        // factories.seedUser backs the balance with a COMPLETED deposit ledger
+        // row — utils/securityCheck.runDoubleCheck recomputes availableBalance
+        // from COMPLETED TransactionHistory rows and freezes unbacked seeds.
+        const { seedUser } = require('./helpers/factories');
+        const seeded = await seedUser(prisma, { availableBalance: 500 });
+        const userId = seeded.id;
+
+        const first = await driveRealWithdrawal({ userId, key: 'rw-1', amount: 50 });
+        // The post-commit emit failure is honestly classified: NEVER a 400.
+        expect(first.status).toBe(500);
+        expect(first.body.code).toBe('WITHDRAWAL_INTERNAL_ERROR');
+
+        // The withdrawal COMMITTED — debited exactly once.
+        const u1 = await prisma.user.findUnique({ where: { id: userId }, select: { availableBalance: true } });
+        expect(Number(u1.availableBalance)).toBeLessThan(500); // money moved once
+        const afterFirst = Number(u1.availableBalance);
+
+        // The claim is RETAINED (poisoned) — never released on the 5xx.
+        const ops = await prisma.financialOperation.findMany({ where: { userId, key: 'rw-1' } });
+        expect(ops.length).toBe(1);
+        expect(ops[0].status).toBe('IN_PROGRESS');
+
+        // Same-key retry: refused deterministically. No second withdrawal.
+        const retry = await driveRealWithdrawal({ userId, key: 'rw-1', amount: 50 });
+        expect(retry.status).toBe(409);
+        expect(retry.body.code).toBe('IDEMPOTENCY_IN_PROGRESS');
+        const u2 = await prisma.user.findUnique({ where: { id: userId }, select: { availableBalance: true } });
+        expect(Number(u2.availableBalance)).toBeCloseTo(afterFirst, 6); // debited ONCE
+        const histories = await prisma.transactionHistory.findMany({ where: { userId, type: 'WITHDRAWAL_FIAT' } });
+        expect(histories.length).toBe(1); // one canonical withdrawal, not two
+        const withdrawals = await prisma.withdrawal.findMany({ where: { userId } });
+        expect(withdrawals.length).toBe(1);
+    }, 30000);
 
     // ── MC — the real multi-currency conversion, wired through the claim ──
 

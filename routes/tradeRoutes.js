@@ -36,7 +36,9 @@ router.get('/history', protect, getTradeHistory);
 router.get('/:id',     protect, getTradeDetails);
 
 // ── Buyer actions ────────────────────────────────────────────────────────────
-router.post('/initiate', protectActive, require2FA(), idempotency(), initiateTrade);
+// Wired: the claim commits inside the trade-creation transaction
+// (tradeController), so a post-response IN_PROGRESS claim proves rollback.
+router.post('/initiate', protectActive, require2FA(), idempotency({ releaseOn4xx: true }), initiateTrade);
 
 // ── Vendor approval actions ──────────────────────────────────────────────────
 router.post('/accept',  protectActive, idempotency(), acceptTrade);

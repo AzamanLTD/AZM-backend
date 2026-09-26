@@ -92,11 +92,25 @@ function mockPrisma(rows = {}, opts = {}) {
 }
 
 describe('Idempotency middleware (r42 contract)', () => {
-    test('passes through when no Idempotency-Key header', () => {
+    test('no key → deterministic IDEMPOTENCY_KEY_REQUIRED refusal; handler NEVER invoked (r42 P0-2)', async () => {
+        const rows = {};
+        const prisma = mockPrisma(rows);
+        const { req, res, next } = mockReqRes({});
+        req.app = { get: () => prisma };
+        const mw = idempotency();
+        await mw(req, res, next);
+        expect(res.statusCode).toBe(400);
+        expect(res._json.code).toBe('IDEMPOTENCY_KEY_REQUIRED');
+        expect(next).not.toHaveBeenCalled(); // economics never entered
+        expect(Object.keys(rows).length).toBe(0); // no claim was created
+    });
+
+    test('no key with required:false (proven-safe opt-out) → passes through', async () => {
         const { req, res, next } = mockReqRes({});
         req.app = { get: () => mockPrisma({}) };
-        idempotency()(req, res, next);
-        expect(next).toHaveBeenCalled();
+        const mw = idempotency({ required: false });
+        await mw(req, res, next);
+        expect(next).toHaveBeenCalled(); // executes unprotected by explicit opt-in
     });
 
     test('FAILS CLOSED when prisma is not available — handler never invoked', async () => {
@@ -189,18 +203,49 @@ describe('Idempotency middleware (r42 contract)', () => {
         expect(res._json.operationId).toBe('op-inflight');
     });
 
-    test('4xx validation failure releases the claim — the key is not poisoned', async () => {
+    test('4xx WITHOUT an explicit disposition RETAINS the claim — a 4xx never implies rollback (r42 P0-1)', async () => {
         const rows = {};
         const prisma = mockPrisma(rows);
         const { req, res, next } = mockReqRes({ 'idempotency-key': 'valid-key' });
         req.app = { get: () => prisma };
         const mw = idempotency();
         await mw(req, res, async () => {
+            // post-commit failure converted to a 400 by an outer catch —
+            // the withdrawalController pattern. The claim must NOT be released.
+            res.status(400).json({ success: false, code: 'ERR' });
+        });
+        await new Promise((r) => setTimeout(r, 25));
+        const claim = Object.values(rows)[0];
+        expect(claim.status).toBe('IN_PROGRESS'); // retained — poisoned, never re-executed
+    });
+
+    test('4xx WITH res.locals.financialClaimRelease (proven pre-economics) → claim released, key reusable', async () => {
+        const rows = {};
+        const prisma = mockPrisma(rows);
+        const { req, res, next } = mockReqRes({ 'idempotency-key': 'valid-key' });
+        req.app = { get: () => prisma };
+        const mw = idempotency();
+        await mw(req, res, async () => {
+            res.locals.financialClaimRelease = true; // handler proved nothing committed
             res.status(400).json({ success: false, code: 'VALIDATION' });
         });
         await new Promise((r) => setTimeout(r, 25)); // let release bookkeeping land
         const claim = Object.values(rows)[0];
         expect(claim).toBeUndefined(); // claim deleted → retry may execute
+    });
+
+    test('4xx with releaseOn4xx (wired: in-tx claim commit) → claim released', async () => {
+        const rows = {};
+        const prisma = mockPrisma(rows);
+        const { req, res, next } = mockReqRes({ 'idempotency-key': 'valid-key' });
+        req.app = { get: () => prisma };
+        const mw = idempotency({ releaseOn4xx: true });
+        await mw(req, res, async () => {
+            res.status(400).json({ success: false, code: 'VALIDATION' });
+        });
+        await new Promise((r) => setTimeout(r, 25));
+        const claim = Object.values(rows)[0];
+        expect(claim).toBeUndefined(); // IN_PROGRESS after response proves rollback
     });
 
     test('5xx with RETAIN (default) keeps the claim IN_PROGRESS — same key refuses', async () => {

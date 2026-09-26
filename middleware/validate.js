@@ -91,6 +91,11 @@ function validate(schema, formatter) {
     const result = schema.safeParse(req.body);
     if (!result.success) {
       const { status = 400, body } = format(result);
+      // r42 idempotency contract: schema validation rejects BEFORE the
+      // handler runs, so provably NO economic mutation happened. Mark the
+      // pre-economics release explicitly so the financial idempotency
+      // authority may reuse the client's key (it never guesses from status).
+      res.locals.financialClaimRelease = true;
       return res.status(status).json(body);
     }
     req.body = { ...req.body, ...result.data }; // merge coerced values; keep extras
