@@ -258,7 +258,7 @@ mount uses it.
 
 ### Route inventory re-verification (review P1)
 
-All 39 `idempotency()` mounts were re-checked (independently re-counted by the reviewer). Standing disposition:
+All 38 `idempotency()` mounts were re-checked (39 at the time of this review; `POST /api/wallet/saved` was de-mounted afterwards — see §9.5) (independently re-counted by the reviewer). Standing disposition:
 every mount now requires the key; `releaseOn4xx` only on the one
 genuinely wired route (`/api/multi-currency/convert`, re-verified from
 route → controller → in-tx claim transition); trade initiation's false
@@ -314,7 +314,7 @@ order). Fixes, end to end:
 
 ### 9.3 — response-boundary audit (review item 4): no bypass paths
 
-Every production `idempotency()` mount (39, enumerated from the route
+Every production `idempotency()` mount (38 after §9.5; 39 at review time, enumerated from the route
 files) was traced to its handler and the handler body scanned for response
 paths that bypass the middleware's wrapped `res.json` (`res.send`,
 `res.end`, `res.sendStatus`, `res.sendFile`, `res.download`, `res.redirect`,
@@ -340,6 +340,46 @@ false. The final truth, consistent with this document:
   before its economic transaction (proven pre-economics guards may release
   earlier), and post-transaction/post-commit failures retain the claim —
   same-key retries receive 409.
-- The independent route sweep found exactly **39 `idempotency()` mounts**
+- The independent route sweep found exactly **39 `idempotency()` mounts** (now **38** after the §9.5 de-mount)
   in `routes/`, **0** production `required: false` mounts, and **1**
   `releaseOn4xx` declaration.
+
+### 9.5 — Cross-repo integration alignment (final gate): the client contract
+
+The final gate surfaced a real integration blocker outside the backend-only
+suite: the AZM-frontend `ApiClient.post()` did not send the HTTP
+`Idempotency-Key`, so every r42-protected route would have rejected live
+financial operations with `IDEMPOTENCY_KEY_REQUIRED` the moment #311
+deployed. The backend safety was correct; the wire contract had to be
+adopted client-side.
+
+Resolutions:
+
+1. **Frontend contract adoption** (AZM-frontend PR, separate repo):
+   `ApiClient.post()` gained an `idempotencyKey` argument and a dedicated
+   `postFinancial()` helper that refuses to send a money-moving request
+   without a key — the requirement is structural, not convention. Every
+   actual frontend caller of a protected mount was traced (24 mutation call
+   sites across 16 files) and migrated; one key per logical action,
+   generated at the action layer so deliberate retries reuse it; savings
+   deposits and friend transfers reuse their legacy body `clientRequestId`
+   AS the header value — one logical operation, one identity, never two.
+2. **`POST /api/wallet/saved` de-mounted** (this PR): the audit has always
+   classified the route as non-financial saved-address CRUD. It was
+   mounted only for the symmetry of the count, and that symmetry would
+   have broken production wallet-address management (three frontend
+   screens POST to it keylessly — correctly, since nothing about it moves
+   money). The mount is removed; `required: false` was NOT used. The
+   mount count goes 39 → 38, and 38 is the honest number.
+3. **Deployment ordering**: the frontend change is fully backward
+   compatible with the pre-r42 backend (an extra header is ignored), so
+   the contract can ship client-first; #311 deploys only after the
+   frontend release carrying the keys is live. The backend never weakens:
+   `required` stays the default, `releaseOn4xx` stays on `/convert` alone,
+   and no fail-closed behavior changes.
+4. **Re-audit (review item E)**: `required: true` default unchanged; **0**
+   production `required: false`; `releaseOn4xx` exactly once
+   (`/api/multi-currency/convert`); fingerprints and logical identity
+   fields unchanged; the body/header single-identity rule (same value in
+   `clientRequestId` and the HTTP header) prevents identity divergence
+   because the backend derives its economic dedup keys from the header.

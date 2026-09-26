@@ -24,7 +24,13 @@ router.post('/withdraw',       protectActive, require2FA(), idempotency(), walle
 router.get('/history',         protect,       walletController.getWithdrawalHistory);
 
 // Saved wallets / payout whitelist
-router.post('/saved',          protectActive, idempotency(), walletController.addSavedWallet);
+// r42 §9.5 (integration review): /saved is non-financial saved-address CRUD
+// (audit doc §3 classifies it as such). Forcing the financial
+// Idempotency-Key contract onto it would break the production client's
+// wallet-address management for no financial-safety gain — the route is
+// de-mounted from the shared authority. `required: false` was NOT used: a
+// half-protected route is worse than an honestly unprotected one.
+router.post('/saved',          protectActive, walletController.addSavedWallet);
 router.get('/saved',           protect,       walletController.getSavedWallets);
 router.delete('/saved/:id',    protectActive, walletController.deleteSavedWallet);
 
