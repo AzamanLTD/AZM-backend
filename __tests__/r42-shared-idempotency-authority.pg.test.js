@@ -68,6 +68,7 @@ run('r42 — shared financial idempotency authority (PostgreSQL)', () => {
                 'POST /api/multi-currency/convert',
                 'POST /spend-commit-then-400', 'POST /spend-wired-in-tx',
                 'POST /spend-optional', 'POST /api/withdraw/fiat', 'POST /api/withdraw/crypto',
+                'POST /api/admin/users/:id/credit',
             ] } },
         });
     });
@@ -1226,5 +1227,80 @@ run('r42 — shared financial idempotency authority (PostgreSQL)', () => {
         bal = await balances(userId);
         expect(bal.ghs).toBeCloseTo(900, 8);
         expect((await prisma.currencyConversion.findMany({ where: { userId } })).length).toBe(1);
+    }, 30000);
+    // ── R8 — the REAL admin credit route through the shared authority ──
+    // (final-audit catch: adminRoutes /users/:id/credit was the last financial
+    // mutation with NO durable exactly-once identity — a timestamp txHash meant
+    // a re-clicked credit double-credited. It is now mounted under the
+    // authority with a REQUIRED client key; the txHash is key-scoped.)
+
+    test('R8. real admin credit: no key → deterministic refusal; same key twice → credited exactly once, byte-identical replay; new key → executes again', async () => {
+        const { creditUserBalance } = require('../controllers/adminController');
+
+        const seeded = await seedUser(prisma, { availableBalance: 100 });
+        const userId = seeded.id;
+        const admin = { id: 999999, username: 'r42-admin' };
+
+        // Self-cleaning: sweep this test's own key space so stale committed
+        // rows from an earlier run (or a User-sequence reset after another
+        // suite truncated User) can never collide on the txHash UNIQUE.
+        await prisma.transactionHistory.deleteMany({ where: { txHash: { startsWith: 'ADMIN_CREDIT_999999_' } } });
+
+        const driveAdminCredit = ({ key, amount }) => new Promise((resolve, reject) => {
+            const app = {
+                settings: {}, get(k) { return this.settings[k]; }, set(k, v) { this.settings[k] = v; },
+            };
+            app.set('prisma', prisma);
+            app.set('emitBalanceUpdate', null);
+            const req = {
+                method: 'POST', originalUrl: '/api/admin/users/' + userId + '/credit',
+                path: '/users/' + userId + '/credit', baseUrl: '/api/admin',
+                route: { path: '/users/:id/credit' },
+                ip: '127.0.0.1',
+                headers: key ? { 'idempotency-key': key } : {},
+                params: { id: String(userId) }, query: {},
+                body: { amount: String(amount), reason: 'r42 R8' },
+                app, get: (k) => app.get(k),
+                user: admin,
+            };
+            const res = {
+                app, locals: {}, statusCode: 200,
+                status(c) { this.statusCode = c; return this; },
+                json(b) { this.body = b; resolve({ status: this.statusCode, body: b }); return this; },
+                setHeader() {},
+                end() { resolve({ status: this.statusCode, body: null }); return this; },
+            };
+            const mw = idempotency({ failurePolicy: 'RELEASE', releaseOn4xx: true });
+            mw(req, res, (err) => {
+                if (err) return reject(err);
+                creditUserBalance(req, res).catch(reject);
+            });
+        });
+
+        // 1. No key → the request is refused BEFORE any economics; no claim, no credit.
+        const refused = await driveAdminCredit({ key: null, amount: 25 });
+        expect(refused.status).toBe(400);
+        expect(refused.body.code).toBe('IDEMPOTENCY_KEY_REQUIRED');
+        expect(Number((await prisma.user.findUnique({ where: { id: userId }, select: { availableBalance: true } })).availableBalance)).toBe(100);
+
+        // 2. Same key twice → credited EXACTLY once, replay is byte-identical.
+        const first = await driveAdminCredit({ key: 'r42-r8-1', amount: 25 });
+        expect(first.status).toBe(200);
+        expect(first.body.success).toBe(true);
+        expect(Number((await prisma.user.findUnique({ where: { id: userId }, select: { availableBalance: true } })).availableBalance)).toBe(125);
+
+        const replay = await driveAdminCredit({ key: 'r42-r8-1', amount: 25 });
+        expect(replay.status).toBe(200);
+        expect(replay.body).toEqual(first.body);
+        expect(Number((await prisma.user.findUnique({ where: { id: userId }, select: { availableBalance: true } })).availableBalance)).toBe(125);
+
+        // The TransactionHistory identity is key-scoped — exactly one row.
+        const rows = await prisma.transactionHistory.findMany({ where: { userId, txHash: `ADMIN_CREDIT_999999_${userId}_r42-r8-1` } });
+        expect(rows.length).toBe(1);
+
+        // 3. A genuinely new key is a genuinely new operation.
+        const second = await driveAdminCredit({ key: 'r42-r8-2', amount: 25 });
+        expect(second.status).toBe(200);
+        expect(Number((await prisma.user.findUnique({ where: { id: userId }, select: { availableBalance: true } })).availableBalance)).toBe(150);
     }, 30000);
 });

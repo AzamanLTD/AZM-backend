@@ -2455,3 +2455,90 @@ exports.getAuditLog = async (req, res) => {
         return res.status(500).json({ success: false, message: err.message });
     }
 };
+
+// ─── ADMIN CREDIT (Demo: give users test USDC) ──────────────────────────────
+// Extracted from routes/adminRoutes.js (r42) so the idempotency contract is
+// testable against the real handler. Runs under the shared idempotency
+// authority — the route mount REQUIRES an Idempotency-Key; the txHash below
+// is derived from that key, so the TransactionHistory identity is durable
+// across retries rather than a fresh Date.now() per attempt.
+exports.creditUserBalance = async (req, res) => {
+    const prisma = req.app.get('prisma');
+    const emitBalanceUpdate = req.app.get('emitBalanceUpdate');
+    try {
+        const userId = parseInt(req.params.id, 10);
+        const { amount, reason } = req.body;
+
+        if (isNaN(userId)) return res.status(400).json({ success: false, message: 'Invalid user ID.' });
+        if (!amount || isNaN(parseFloat(amount)) || parseFloat(amount) <= 0) {
+            return res.status(400).json({ success: false, message: 'amount must be a positive number.' });
+        }
+
+        const amountFloat = parseFloat(amount);
+
+        const user = await prisma.user.findUnique({ where: { id: userId }, select: { id: true, username: true } });
+        if (!user) return res.status(404).json({ success: false, message: 'User not found.' });
+
+        await prisma.$transaction(async (tx) => {
+            await tx.user.update({
+                where: { id: userId },
+                data: { availableBalance: { increment: amountFloat } },
+            });
+            const history = await tx.transactionHistory.create({
+                data: {
+                    userId,
+                    type: 'DEPOSIT_CRYPTO',
+                    amountUsdc: amountFloat,
+                    feeUsdc: 0,
+                    // durable replay identity: scoped to (admin, target user, key) — the claim
+                    // itself is unique on the same triple, so a replay never reaches this
+                    // insert, and two independent operations can never collide on the
+                    // TransactionHistory txHash UNIQUE constraint.
+                    txHash: `ADMIN_CREDIT_${req.user.id}_${userId}_${req.headers['idempotency-key']}`,
+                    status: 'COMPLETED',
+                }
+            });
+            await tx.adminSettingsAuditLog.create({
+                data: {
+                    adminId: req.user.id,
+                    adminName: req.user.username,
+                    action: 'CREDIT_USER_BALANCE',
+                    targetType: 'USER_BALANCE',
+                    targetId: String(userId),
+                    changes: { amount: amountFloat, reason: reason || 'Admin credit' },
+                }
+            });
+
+            // §P.4 AUTHORITATIVE LEDGER — admin demo credit. This is NOT a
+            // custody deposit: no real USDC arrived. The grant is funded by
+            // platform equity so the books never mint unbacked customer
+            // liability, idempotent on the history row created above:
+            //   D equity:treasury        — platform equity funds the grant
+            //   C user:{userId}:liability — customer credited
+            await ledger.post(tx, {
+                idempotencyKey: `ledger:admin:demo-credit:${history.id}`,
+                entryType: 'ADJUSTMENT',
+                description: 'Admin demo credit — platform equity granted to customer',
+                userId,
+                relatedEntity: 'transactionHistory',
+                relatedEntityId: history.id,
+                metadata: { adminId: req.user.id, reason: reason || 'Admin credit', amount: _exact(amountFloat) },
+                lines: [
+                    { account: 'equity:treasury', debit: _exact(amountFloat) },
+                    { account: `user:${userId}:liability`, credit: _exact(amountFloat) },
+                ],
+            });
+        });
+
+        if (emitBalanceUpdate) await emitBalanceUpdate(userId);
+
+        return res.status(200).json({
+            success: true,
+            message: `Credited ${amountFloat} USDC to ${user.username}.`,
+            data: { userId, username: user.username, credited: amountFloat }
+        });
+    } catch (error) {
+        logger.error({ err: error }, '[admin.creditUser] error');
+        return res.status(500).json({ success: false, message: error.message });
+    }
+};
