@@ -262,9 +262,16 @@ router.post('/trade-accounts/:id/reject', async (req, res) => {
 // ledger key — a re-clicked admin credit double-credited). It now runs under
 // the shared idempotency authority with a REQUIRED client key; the txHash is
 // derived from the key so the TransactionHistory identity is replay-scoped.
-// releaseOn4xx is valid here (the wired pattern): the credit commits inside
-// the handler's own economic transaction, so an IN_PROGRESS claim at response
-// time is durable proof the transaction rolled back and the key is reusable.
+// §r42 P0 (review): this route is now genuinely TRANSACTION-WIRED. The
+// handler builds the accepted response and transitions its claim IN_PROGRESS
+// → COMMITTED inside the credit's own prisma.$transaction, requiring
+// count === 1 (else the whole credit rolls back). So:
+//   FinancialOperation COMMITTED ↔ the credit economics committed —
+// a post-response IN_PROGRESS claim is durable proof of rollback on BOTH
+// 4xx (all validation happens pre-economics) and 5xx (RELEASE policy), and
+// a COMMITTED claim replays the exact stored response bytes. Non-economic
+// post-commit work (emitBalanceUpdate) runs AFTER the wire in a res-silent
+// phase, so a push failure can never release a committed credit.
 router.post('/users/:id/credit', idempotency({ failurePolicy: 'RELEASE', releaseOn4xx: true }), adminController.creditUserBalance);
 
 // ─── AUTONOMOUS PAYOUTS (Phase Q8) ──────────────────────────────────────────

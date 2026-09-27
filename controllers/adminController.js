@@ -2479,6 +2479,25 @@ exports.creditUserBalance = async (req, res) => {
         const user = await prisma.user.findUnique({ where: { id: userId }, select: { id: true, username: true } });
         if (!user) return res.status(404).json({ success: false, message: 'User not found.' });
 
+        // §r42 wired pattern — the durable claim minted by the idempotency
+        // authority. This route transitions the claim to COMMITTED INSIDE the
+        // same economic transaction as the credit itself, so:
+        //   FinancialOperation COMMITTED  ↔  the credit transaction committed
+        // Atomicity makes the equivalence structural: there is never a
+        // committed credit with a releasable IN_PROGRESS claim, and never a
+        // COMMITTED claim without committed economics. HTTP status alone is
+        // never rollback evidence.
+        const operation = res.locals.financialOperation;
+        if (!operation) {
+            // Fail closed: no durable claim, no money movement.
+            return res.status(500).json({ success: false, message: 'Idempotency claim missing — credit refused.' });
+        }
+
+        // The EXACT accepted response is built INSIDE the transaction and
+        // stored on the claim, so a same-key retry replays these bytes
+        // byte-identically and never re-executes the credit.
+        let response;
+
         await prisma.$transaction(async (tx) => {
             await tx.user.update({
                 where: { id: userId },
@@ -2528,15 +2547,48 @@ exports.creditUserBalance = async (req, res) => {
                     { account: `user:${userId}:liability`, credit: _exact(amountFloat) },
                 ],
             });
+
+            response = {
+                success: true,
+                message: `Credited ${amountFloat} USDC to ${user.username}.`,
+                data: { userId, username: user.username, credited: amountFloat }
+            };
+
+            // §r42 P0 — the claim transitions to COMMITTED in the SAME
+            // transaction, immediately after the economic writes. count !== 1
+            // means this row was not the IN_PROGRESS claim we minted — refuse
+            // and roll back the ENTIRE credit.
+            const wired = await tx.financialOperation.updateMany({
+                where: { id: operation.id, status: 'IN_PROGRESS' },
+                data: { status: 'COMMITTED', statusCode: 200, responseBody: JSON.stringify(response) },
+            });
+            if (wired.count !== 1) {
+                throw new Error(`Idempotency claim ${operation.id} was not IN_PROGRESS at commit time — refusing to credit`);
+            }
         });
 
-        if (emitBalanceUpdate) await emitBalanceUpdate(userId);
+        // Only now — transaction durably committed AND claim durably
+        // COMMITTED — is the HTTP acceptance emitted. Any mid-transaction
+        // throw reached the catch below with the claim still IN_PROGRESS
+        // (rolled back atomically with the economics), where the authority's
+        // RELEASE policy can safely free the key for retry.
+        res.status(200).json(response);
 
-        return res.status(200).json({
-            success: true,
-            message: `Credited ${amountFloat} USDC to ${user.username}.`,
-            data: { userId, username: user.username, credited: amountFloat }
-        });
+        // Non-economic post-response phase — deliberately AFTER the wire. A
+        // failure here is logged and dropped: it must NEVER turn the accepted
+        // credit into a 500 that the authority would release, re-arming the
+        // key for duplicate execution.
+        if (emitBalanceUpdate) {
+            try {
+                await emitBalanceUpdate(userId);
+            } catch (pushError) {
+                logger.warn(
+                    { err: pushError.message, userId },
+                    '[admin.creditUser] post-response balance push failed — credit is durably committed'
+                );
+            }
+        }
+        return;
     } catch (error) {
         logger.error({ err: error }, '[admin.creditUser] error');
         return res.status(500).json({ success: false, message: error.message });

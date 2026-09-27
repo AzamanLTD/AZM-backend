@@ -1236,24 +1236,18 @@ run('r42 — shared financial idempotency authority (PostgreSQL)', () => {
     // a re-clicked credit double-credited. It is now mounted under the
     // authority with a REQUIRED client key; the txHash is key-scoped.)
 
-    test('R8. real admin credit: no key → deterministic refusal; same key twice → credited exactly once, byte-identical replay; new key → executes again', async () => {
+    // Shared real-handler driver for the admin credit contract. `emit`
+    // injects the post-response balance push (null by default, matching
+    // production sockets being optional); `emitThrows` is not needed — any
+    // thrown/rejected emit is the post-commit failure under test.
+    const makeAdminCreditDriver = ({ userId, admin }) => {
         const { creditUserBalance } = require('../controllers/adminController');
-
-        const seeded = await seedUser(prisma, { availableBalance: 100 });
-        const userId = seeded.id;
-        const admin = { id: 999999, username: 'r42-admin' };
-
-        // Self-cleaning: sweep this test's own key space so stale committed
-        // rows from an earlier run (or a User-sequence reset after another
-        // suite truncated User) can never collide on the txHash UNIQUE.
-        await prisma.transactionHistory.deleteMany({ where: { txHash: { startsWith: 'ADMIN_CREDIT_999999_' } } });
-
-        const driveAdminCredit = ({ key, amount }) => new Promise((resolve, reject) => {
+            return ({ key, amount, emit }) => new Promise((resolve, reject) => {
             const app = {
                 settings: {}, get(k) { return this.settings[k]; }, set(k, v) { this.settings[k] = v; },
             };
             app.set('prisma', prisma);
-            app.set('emitBalanceUpdate', null);
+            app.set('emitBalanceUpdate', emit === undefined ? null : emit);
             const req = {
                 method: 'POST', originalUrl: '/api/admin/users/' + userId + '/credit',
                 path: '/users/' + userId + '/credit', baseUrl: '/api/admin',
@@ -1278,6 +1272,19 @@ run('r42 — shared financial idempotency authority (PostgreSQL)', () => {
                 creditUserBalance(req, res).catch(reject);
             });
         });
+    };
+
+    test('R8. real admin credit: no key → deterministic refusal; same key twice → credited exactly once, byte-identical replay; new key → executes again', async () => {
+        const seeded = await seedUser(prisma, { availableBalance: 100 });
+        const userId = seeded.id;
+        const admin = { id: 999999, username: 'r42-admin' };
+
+        // Self-cleaning: sweep this test's own key space so stale committed
+        // rows from an earlier run (or a User-sequence reset after another
+        // suite truncated User) can never collide on the txHash UNIQUE.
+        await prisma.transactionHistory.deleteMany({ where: { txHash: { startsWith: 'ADMIN_CREDIT_999999_' } } });
+
+        const driveAdminCredit = makeAdminCreditDriver({ userId, admin });
 
         // 1. No key → the request is refused BEFORE any economics; no claim, no credit.
         const refused = await driveAdminCredit({ key: null, amount: 25 });
@@ -1304,5 +1311,107 @@ run('r42 — shared financial idempotency authority (PostgreSQL)', () => {
         const second = await driveAdminCredit({ key: 'r42-r8-2', amount: 25 });
         expect(second.status).toBe(200);
         expect(Number((await prisma.user.findUnique({ where: { id: userId }, select: { availableBalance: true } })).availableBalance)).toBe(150);
+    }, 30000);
+
+    // §r42 review P0 — the admin credit must be genuinely TRANSACTION-WIRED:
+    // FinancialOperation COMMITTED ↔ the credit economic transaction
+    // committed. Two directions are proven against the REAL handler:
+    //   (a) post-commit non-economic failure (emitBalanceUpdate throws AFTER
+    //       the transaction commits) must NOT degrade the accepted credit
+    //       into a releasable 500 — the wire stays the committed 200, the
+    //       claim stays COMMITTED, and a same-key retry replays the EXACT
+    //       stored bytes with zero economic movement;
+    //   (b) mid-transaction failure (ledger.post rejects INSIDE the credit
+    //       transaction) must roll back EVERYTHING — economics AND the claim
+    //       — after which the RELEASE policy frees the key and a same-key
+    //       retry executes exactly once.
+    test('R8-POSTCOMMIT. wired claim: post-commit emitBalanceUpdate failure keeps the committed 200 + COMMITTED claim; mid-tx failure rolls back everything and the retry executes once', async () => {
+        const { creditUserBalance: _c } = require('../controllers/adminController'); // route contract exercised via the driver
+        const ledgerService = require('../services/ledgerService');
+
+        const seeded = await seedUser(prisma, { availableBalance: 50 });
+        const userId = seeded.id;
+        const admin = { id: 999999, username: 'r42-admin' };
+
+        await prisma.transactionHistory.deleteMany({ where: { txHash: { startsWith: 'ADMIN_CREDIT_999999_' } } });
+
+        const drive = makeAdminCreditDriver({ userId, admin });
+        const balance = async () => Number((await prisma.user.findUnique({ where: { id: userId }, select: { availableBalance: true } })).availableBalance);
+        const history = (key) => prisma.transactionHistory.findMany({ where: { userId, txHash: `ADMIN_CREDIT_999999_${userId}_${key}` } });
+
+        // ── (a) POST-COMMIT failure of the non-economic push ──────────────
+        let emitCalls = 0;
+        const first = await drive({
+            key: 'r42-r8pc-1', amount: 30,
+            emit: async () => { emitCalls += 1; throw new Error('socket push died after commit'); },
+        });
+
+        // The wire response is the committed acceptance — NOT a released 500.
+        expect(first.status).toBe(200);
+        expect(first.body.success).toBe(true);
+        expect(emitCalls).toBe(1); // the push ran once, after the wire
+
+        // The claim is COMMITTED — there is no middleware path left that can
+        // release it: FinancialOperation COMMITTED ↔ economics committed.
+        const claim = await prisma.financialOperation.findUnique({
+            where: { userId_endpoint_key: { userId: admin.id, endpoint: 'POST /api/admin/users/:id/credit', key: 'r42-r8pc-1' } },
+        });
+        expect(claim).not.toBeNull();
+        expect(claim.status).toBe('COMMITTED');
+        expect(claim.statusCode).toBe(200);
+
+        // Exactly ONE credit: balance, history, audit, ledger.
+        expect(await balance()).toBe(80);
+        expect((await history('r42-r8pc-1')).length).toBe(1);
+        const hist1 = (await history('r42-r8pc-1'))[0];
+        expect(await prisma.adminSettingsAuditLog.count({ where: { adminId: admin.id, targetId: String(userId) } })).toBe(1);
+        expect(await prisma.ledgerTransaction.count({ where: { relatedEntity: 'transactionHistory', relatedEntityId: hist1.id } })).toBe(1);
+
+        // Same-key retry: byte-identical replay of the stored acceptance,
+        // no emit, no new history row, no balance movement.
+        const replay = await drive({ key: 'r42-r8pc-1', amount: 30 });
+        expect(replay.status).toBe(200);
+        expect(JSON.stringify(replay.body)).toBe(claim.responseBody); // EXACT stored bytes
+        expect(replay.body).toEqual(first.body);
+        expect(emitCalls).toBe(1);
+        expect(await balance()).toBe(80);
+        expect((await history('r42-r8pc-1')).length).toBe(1);
+
+        // ── (b) MID-TRANSACTION failure: the ledger write throws INSIDE the
+        // credit transaction. Everything must roll back together — economics
+        // AND the claim — never a committed credit with a releasable claim.
+        const postSpy = jest.spyOn(ledgerService, 'post').mockRejectedValueOnce(
+            new Error('injected ledger failure inside the credit transaction')
+        );
+        try {
+            const boom = await drive({ key: 'r42-r8pc-2', amount: 30 });
+            expect(boom.status).toBe(500); // the handler's catch — claim still IN_PROGRESS
+
+            // The whole transaction rolled back: no economics moved.
+            expect(await balance()).toBe(80);
+            expect((await history('r42-r8pc-2')).length).toBe(0);
+            expect(await prisma.adminSettingsAuditLog.count({ where: { adminId: admin.id, targetId: String(userId) } })).toBe(1);
+
+            // RELEASE policy freed the provably-rolled-back claim: bounded
+            // polling, never a race with the fire-and-forget disposition.
+            const released = await waitForClaim(admin.id, 'POST /api/admin/users/:id/credit', 'r42-r8pc-2', 'RELEASED');
+            expect(released.length).toBe(0);
+
+            // Same-key retry now executes EXACTLY ONCE.
+            const retry = await drive({ key: 'r42-r8pc-2', amount: 30 });
+            expect(retry.status).toBe(200);
+            expect(await balance()).toBe(110); // 80 + exactly one credit
+            expect((await history('r42-r8pc-2')).length).toBe(1);
+            expect(await prisma.adminSettingsAuditLog.count({ where: { adminId: admin.id, targetId: String(userId) } })).toBe(2);
+        } finally {
+            postSpy.mockRestore();
+        }
+
+        // A genuinely new key is a genuinely new credit — the wired claim
+        // never bleeds identity across operations.
+        const fresh = await drive({ key: 'r42-r8pc-3', amount: 20 });
+        expect(fresh.status).toBe(200);
+        expect(await balance()).toBe(130);
+        expect((await history('r42-r8pc-3')).length).toBe(1);
     }, 30000);
 });
