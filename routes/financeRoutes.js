@@ -34,17 +34,24 @@ const withdrawalController     = require('../controllers/withdrawalController');
 //
 // The alias stays mounted for backward compatibility with released Flutter
 // builds in the wild; new clients call POST /api/withdraw/fiat (PR
-// AzamanLTD/AZM-frontend#94 migrates the production flow). The endpoint
-// identity recorded on the FinancialOperation claim includes the route path,
-// so a key used here is independent from the same key on the canonical route —
-// the authority is enforced per-surface and can never be bypassed.
+// AzamanLTD/AZM-frontend#95 migrates the production flow).
+//
+// r42 HARDENING (audit follow-up): the alias and the canonical route MUST
+// share ONE economic identity. They call the same controller, so a client
+// key is the identity of the same logical withdrawal regardless of which
+// path carried it. The mount below passes the canonical identity explicitly
+// (`identity: 'POST /api/withdraw/fiat'`): the FinancialOperation claim for
+// `POST /api/finance/withdraw/fiat` + key K and `POST /api/withdraw/fiat` + key K is
+// ONE claim — the second arrival replays/409s instead of executing twice.
+// The stored fingerprint still guards the claim, so a materially different
+// body under the same key fails closed (FINGERPRINT_MISMATCH).
 //
 // NOTE: `protectActive` (ban guard) is kept as the alias's session guard, one
 // notch stronger than the canonical route's `protect`.
 router.post('/withdraw/fiat',
     protectActive,
     require2FA(),
-    idempotency({ failurePolicy: 'RELEASE', releaseOn4xx: true }),
+    idempotency({ failurePolicy: 'RELEASE', releaseOn4xx: true, identity: 'POST /api/withdraw/fiat' }),
     validate(fiatWithdrawalSchema),
     withdrawalController.fiatWithdrawal);
 

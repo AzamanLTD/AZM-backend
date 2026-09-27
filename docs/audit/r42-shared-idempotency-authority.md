@@ -332,9 +332,12 @@ The PR body previously stated trade initiation commits the claim
 in-transaction and is a wired `releaseOn4xx` route. Both statements are
 false. The final truth, consistent with this document:
 
-- `/api/multi-currency/convert` is the ONLY currently wired
-  in-transaction FinancialOperation route (its `releaseOn4xx` declaration
-  is backed by the in-tx claim transition).
+- ~~`/api/multi-currency/convert` is the ONLY currently wired
+  in-transaction FinancialOperation route~~ *(superseded by §10: as of the
+  2026-09-27 close-out, six routes are wired and declare `releaseOn4xx` —
+  convert, admin demo-credit, canonical fiat withdrawal, crypto withdrawal,
+  wallet withdrawal, and the fiat alias. This §9.4 statement described the
+  tree at the time it was written.)*
 - `/api/trades/initiate` is UNWIRED and uses conservative RETAIN
   semantics; it clears `res.locals.financialClaimRelease` immediately
   before its economic transaction (proven pre-economics guards may release
@@ -375,11 +378,88 @@ Resolutions:
    compatible with the pre-r42 backend (an extra header is ignored), so
    the contract can ship client-first; #311 deploys only after the
    frontend release carrying the keys is live. The backend never weakens:
-   `required` stays the default, `releaseOn4xx` stays on `/convert` alone,
-   and no fail-closed behavior changes.
+   `required` stays the default, ~~`releaseOn4xx` stays on `/convert` alone~~ *(superseded by §10: the
+   wired wave extended `releaseOn4xx` to six genuinely in-transaction
+   routes; every declaration is backed by an in-tx COMMITTED claim
+   transition re-verified in §10.3.)* and no fail-closed behavior changes.
 4. **Re-audit (review item E)**: `required: true` default unchanged; **0**
    production `required: false`; `releaseOn4xx` exactly once
    (`/api/multi-currency/convert`); fingerprints and logical identity
    fields unchanged; the body/header single-identity rule (same value in
    `clientRequestId` and the HTTP header) prevents identity divergence
    because the backend derives its economic dedup keys from the header.
+
+## 10. Follow-up 4 — audit close-out: final-tree route inventory (2026-09-27)
+
+The cross-repo audit found this document describing an intermediate state
+while the tree had advanced (the §9.4/§9.5 statements marked superseded
+above). This section is the FINAL-tree truth and closes the audit.
+
+### 10.1 — Final route inventory (re-verified from the tree)
+
+- **`idempotency()` mounts in `routes/`: 40** (39 at §9.4's writing; the
+  wallet-withdrawal status surface and alias canonicalization wave brought
+  the count to 40).
+- **`releaseOn4xx: true` declarations: 6**, every one of them a genuinely
+  WIRED route (the claim transitions to COMMITTED *inside* the economic
+  `$transaction`, so a post-response IN_PROGRESS claim is itself durable
+  proof of rollback):
+  1. `POST /api/admin/users/:id/credit` — admin demo-credit (§10.2 P0 fix)
+  2. `POST /api/multi-currency/convert` — MC convert (MC1, unchanged)
+  3. `POST /api/wallet/withdraw` — wallet withdrawal
+  4. `POST /api/withdraw/fiat` — canonical fiat withdrawal
+  5. `POST /api/withdraw/crypto` — crypto withdrawal
+  6. `POST /api/finance/withdraw/fiat` — legacy fiat alias
+- **Production `required: false` mounts: 0** (`POST /api/wallet/saved`
+  remains de-mounted per §9.5; the remaining match is a comment only).
+- **Explicit `identity` overrides: 1** — the legacy fiat alias
+  (`identity: 'POST /api/withdraw/fiat'`, §10.4).
+
+### 10.2 — The admin-credit P0 (transaction-wired exactly-once credit)
+
+The r42 review's fatal finding on the branch: a socket notification failure
+*after* a committed demo-credit produced a 500 **and released the claim**,
+so a same-key retry double-credited. The credit is now wired: the claim
+flips to COMMITTED inside the credit's own `$transaction`
+(`updateMany === 1` or the whole transaction rolls back), the accepted
+response is built and stored in-transaction for byte-identical replay, and
+`emitBalanceUpdate` runs in a res-silent post-response phase. **R8-POSTCOMMIT**
+(two directions, real handler, real PostgreSQL) proves: post-commit emit
+failure → the exact stored bytes replay, claim stays COMMITTED, second credit
+impossible; in-tx failure → claim released, key reusable, zero credits.
+This makes `FinancialOperation COMMITTED ↔ the credit economics committed`
+structural, not inferred from an HTTP status.
+
+### 10.3 — Wired-route re-verification
+
+Each §10.1 route was re-verified route → controller → in-tx
+`financialOperation.updateMany({ status: 'COMMITTED', ... })` transition.
+All six pass through the same wired disposition contract: 2xx ⇒ the
+economics and the claim committed atomically; 4xx ⇒ provably pre-economic
+rollback, claim RELEASED, key reusable; no outcome status can be produced
+after a commit (post-response provider dispatch is res-silent and lands in
+the Withdrawal / CustodyExecution / reconciliation state machines).
+
+### 10.4 — Legacy fiat alias: one economic identity (cross-repo audit item)
+
+`POST /api/finance/withdraw/fiat` (compatibility alias) and
+`POST /api/withdraw/fiat` (canonical) call the SAME controller. Under
+route-derived identity the same client key on each path was TWO independent
+claims — a latent authority bypass. The alias mount now passes the canonical
+identity explicitly (`identity: 'POST /api/withdraw/fiat'`), so both paths
+share ONE durable claim per (user, key); the stored fingerprint still fails
+closed on materially different bodies
+(`IDEMPOTENCY_PAYLOAD_CONFLICT`). Proofs:
+`__tests__/r42-alias-identity.pg.test.js` (A1–A5, real middleware + real
+PostgreSQL): alias records the canonical identity; cross-path same key + body
+converges to one execution in both orders; divergent body under a reused key
+is refused; distinct keys stay independent. The authority is not weakened —
+the alias gains it.
+
+### 10.5 — Open item carried forward (frontend durability)
+
+The companion frontend PR carries the client half of this contract
+(Idempotency-Key per logical action on every financial mutation). The
+cross-repo audit requires the client key to survive app/screen/process
+recreation before the pair deploys; that work is tracked in the frontend
+repository and does not affect any statement in this document.

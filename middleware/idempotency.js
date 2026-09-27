@@ -100,6 +100,14 @@ const isUniqueViolation = (err) =>
  * @param {object}   options
  * @param {string}  [options.failurePolicy] RETAIN (default) | RELEASE — the
  *        disposition of the claim when the handler responds 5xx.
+ * @param {string}  [options.identity] explicit CANONICAL economic identity
+ *        ("METHOD /canonical/path") that OVERRIDES the route-derived endpoint.
+ *        Use when two mount paths serve the SAME economic operation (a
+ *        compatibility alias): the alias must share one FinancialOperation
+ *        identity with the canonical route, or the same client key sent to
+ *        each path would be two independent claims — the alias becomes a
+ *        bypass of the authority. The fingerprint still guards the claim, so
+ *        a key reuse with materially different bodies fails closed.
  */
 function idempotency(options = {}) {
     const failurePolicy = options.failurePolicy === RELEASE ? RELEASE : RETAIN;
@@ -117,6 +125,9 @@ function idempotency(options = {}) {
     // Every other route RETAINS on 4xx unless the handler explicitly marked a
     // provably pre-economics failure (res.locals.financialClaimRelease = true).
     const releaseOn4xx = options.releaseOn4xx === true;
+    const identity = typeof options.identity === 'string' && options.identity.trim()
+        ? options.identity.trim()
+        : null;
 
     return async (req, res, next) => {
         const key = req.headers['idempotency-key'];
@@ -155,7 +166,10 @@ function idempotency(options = {}) {
             });
         }
 
-        const endpoint = endpointOf(req);
+        // r42 hardening: an explicit canonical identity (alias routes) wins
+        // over the route-derived endpoint, so one economic operation has
+        // exactly one durable identity no matter which mount path served it.
+        const endpoint = identity || endpointOf(req);
         const fingerprint = fingerprintOf(req);
 
         let claim;
