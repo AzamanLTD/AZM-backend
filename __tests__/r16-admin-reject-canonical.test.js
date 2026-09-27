@@ -468,10 +468,12 @@ describeOrSkip('r16 P0-C: Admin rejection canonical-state safety', () => {
 
             if (res.statusCode === 200) {
                 adminWon++;
-                // The controller lost the claim → 409, provider NEVER called.
-                expect(ctrlRes.statusCode).toBe(409);
+                // r42 WAVE-2: the accepted/pending 202 was already sent AT the
+                // commit boundary; the lost dispatch claim is res-silent — the
+                // provider is NEVER called and the admin reversal is the only
+                // money movement (durable state proves it below).
+                expect(ctrlRes.statusCode).toBe(202);
                 expect(captured.length).toBe(0);
-                expect(ctrlRes.payload.code).toBe('WITHDRAWAL_CLAIMED_CONCURRENTLY');
 
                 // Admin's reversal is the ONLY money movement: canonical
                 // FAILED, mirror REJECTED, user restored exactly once.
@@ -548,7 +550,7 @@ describeOrSkip('r16 P0-C: Admin rejection canonical-state safety', () => {
 
             release();
             const ctrlRes = await controllerDone;
-            expect(ctrlRes.statusCode).toBe(200);
+            expect(ctrlRes.statusCode).toBe(202); // r42 WAVE-2: accepted/pending at commit
 
             // The payout continued through the normal Moolre lifecycle:
             // exactly one provider call, acceptance evidence recorded.

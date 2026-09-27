@@ -26,10 +26,14 @@ exports.requestWithdrawal = async (req, res) => {
         const withdrawAmount = parseFloat(amount);
 
         // 1. Basic Validation
+        // r42: provably pre-economics failures — the claim (if any) is released
+        // so the key stays reusable; nothing was executed.
         if (!withdrawAmount || withdrawAmount <= 0) {
+            res.locals.financialClaimRelease = true;
             return res.status(400).json({ success: false, message: "Invalid amount." });
         }
         if (!destination) {
+            res.locals.financialClaimRelease = true;
             return res.status(400).json({ success: false, message: "Destination address or number is required." });
         }
 
@@ -190,16 +194,45 @@ exports.requestWithdrawal = async (req, res) => {
                 });
             }
 
-            return withdrawal;
+            // r42 WAVE-2 — the durable claim commits WITH the wallet
+            // withdrawal reservation: conditional balance debit + platform fee
+            // realization + Withdrawal row + ledger reservation + restricted
+            // obligation + the COMMITTED FinancialOperation all land atomically.
+            // This route has NO provider I/O in the request path — dispatch is
+            // owned by the payout workers that claim PENDING Withdrawal rows —
+            // so the stored response (the created withdrawal ticket) is fully
+            // deterministic. Same-key retries replay these exact bytes and can
+            // never create a second debit or a second Withdrawal row.
+            const _operation = res.locals?.financialOperation || null;
+            const _response = {
+                success: true,
+                message: payoutMethod === "BINANCE_ID"
+                    ? "Zero-fee Binance withdrawal initiated!"
+                    : "Withdrawal initiated. 50% of gas fees have been subsidized.",
+                withdrawal,
+            };
+            if (_operation) {
+                const committed = await tx.financialOperation.updateMany({
+                    where: { id: _operation.id, status: 'IN_PROGRESS' },
+                    data: {
+                        status: 'COMMITTED',
+                        statusCode: 200,
+                        responseBody: JSON.stringify(_response), // WIRE text
+                    },
+                });
+                if (committed.count !== 1) {
+                    const err = new Error('Idempotency operation state conflict.');
+                    err.code = 'IDEMPOTENCY_STATE_CONFLICT';
+                    throw err;
+                }
+            }
+
+            return { withdrawal, response: _response };
         });
 
-        res.status(200).json({ 
-            success: true, 
-            message: payoutMethod === "BINANCE_ID" 
-                ? "Zero-fee Binance withdrawal initiated!" 
-                : "Withdrawal initiated. 50% of gas fees have been subsidized.",
-            withdrawal: result
-        });
+        // The EXACT response object stored in the committed claim — the original
+        // response and any same-key replay are byte-identical.
+        res.status(200).json(result.response);
 
         // Emit balance update after successful withdrawal
         if (emitBalanceUpdate) await emitBalanceUpdate(userId);
@@ -209,6 +242,58 @@ exports.requestWithdrawal = async (req, res) => {
     }
 };
 exports.requestWithdrawal.openapi = { summary: "Request a withdrawal", description: "Initiates a withdrawal from the user trade account to a payout destination.", tags: ["wallet", "withdrawal"] };
+
+/**
+ * 2a. GET WITHDRAWAL STATUS — the smallest user-facing status surface for
+ * the saved-wallet payout queue (r42 integration wave).
+ *
+ * POST /wallet/withdraw creates the Withdrawal queue row and returns the
+ * ACCEPTED record; payout workers own dispatch afterwards and emit nothing
+ * user-facing (admin_alert only). Until this endpoint the mobile client had
+ * no owner-scoped way to observe that row's progress, so an accepted wallet
+ * withdrawal could only ever render a generic "requested!" dead-end.
+ *
+ * Contract (GET /api/wallet/withdraw/status/:withdrawalId, protect):
+ *   200 { success, withdrawal: { id, status, amount, destination,
+ *        payoutMethod, providerTxId, createdAt, updatedAt } }
+ *   404 — no such withdrawal FOR THIS USER (foreign ids are
+ *         indistinguishable from nonexistent ones; no existence oracle).
+ *
+ * The row is resolved by its PRIMARY KEY scoped to req.user.id — never by
+ * an amount/timestamp heuristic. status ∈ {PENDING, PROCESSING,
+ * COMPLETED, FAILED, REJECTED, NEEDS_MANUAL_REVIEW}.
+ */
+exports.getWithdrawalStatusById = async (req, res) => {
+    const prisma = req.app.get('prisma');
+    try {
+        const { withdrawalId } = req.params;
+        if (!withdrawalId || !/^[0-9]+$/.test(withdrawalId)) {
+            return res.status(400).json({ success: false, message: 'withdrawalId is required.' });
+        }
+        const row = await prisma.withdrawal.findFirst({
+            where: { id: parseInt(withdrawalId, 10), userId: req.user.id },
+        });
+        if (!row) {
+            return res.status(404).json({ success: false, message: 'No withdrawal found for that id.' });
+        }
+        return res.status(200).json({
+            success: true,
+            withdrawal: {
+                id:           row.id,
+                status:       row.status,
+                amount:       row.amount != null ? Number(row.amount) : null,
+                destination:  row.destination,
+                payoutMethod:  row.payoutMethod,
+                providerTxId:  row.providerTxId || null,
+                createdAt:     row.createdAt ? row.createdAt.toISOString() : null,
+                updatedAt:     row.updatedAt ? row.updatedAt.toISOString() : null,
+            },
+        });
+    } catch (error) {
+        logger.error({ err: error }, '[getWithdrawalStatusById] error');
+        return res.status(500).json({ success: false, message: 'Could not fetch withdrawal status.' });
+    }
+};
 
 /**
  * 2. GET WITHDRAWAL HISTORY

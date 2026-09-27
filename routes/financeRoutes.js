@@ -12,9 +12,41 @@ const fiatSettlementWebhook    = require('../controllers/fiatSettlementWebhook.c
 const { adminOnly }            = require('../middleware/authMiddleware');
 const { protect }              = require('../middleware/authMiddleware');
 const { protectActive }        = require('../middleware/banGuardMiddleware');
+const { idempotency }          = require('../middleware/idempotency');
+const { require2FA }           = require('../middleware/require2FA');
+const { validate }             = require('../middleware/validate');
+const { fiatWithdrawalSchema } = require('../services/validation/financialSchemas');
+const withdrawalController     = require('../controllers/withdrawalController');
 
-// User endpoints (protected + ban-guarded)
-router.post('/withdraw/fiat', protectActive, financeController.fiatWithdrawal);
+// r42 WAVE-2 — FIAT WITHDRAWAL UNIFICATION.
+//
+// Topology audit (docs/audit/r42-wave2-withdrawal-authority.md): this route
+// was the LIVE Flutter fiat withdrawal path while the hardened
+// POST /api/withdraw/fiat (canonical) went unused — the live flow therefore
+// bypassed the shared financial idempotency authority, step-up 2FA and the
+// Withdrawal mirror bookkeeping entirely. The two independent financial
+// implementations are GONE: this route is now a thin COMPATIBILITY ALIAS to
+// the SAME canonical controller (withdrawalController.fiatWithdrawal) with the
+// SAME full financial authority on the alias — the same r42 idempotency claim
+// contract (in-transaction commit, deterministic accepted/pending response),
+// the same step-up 2FA, the same zod validation. Nothing can reach the money
+// without passing the canonical authority, on either path.
+//
+// The alias stays mounted for backward compatibility with released Flutter
+// builds in the wild; new clients call POST /api/withdraw/fiat (PR
+// AzamanLTD/AZM-frontend#94 migrates the production flow). The endpoint
+// identity recorded on the FinancialOperation claim includes the route path,
+// so a key used here is independent from the same key on the canonical route —
+// the authority is enforced per-surface and can never be bypassed.
+//
+// NOTE: `protectActive` (ban guard) is kept as the alias's session guard, one
+// notch stronger than the canonical route's `protect`.
+router.post('/withdraw/fiat',
+    protectActive,
+    require2FA(),
+    idempotency({ failurePolicy: 'RELEASE', releaseOn4xx: true }),
+    validate(fiatWithdrawalSchema),
+    withdrawalController.fiatWithdrawal);
 
 // Admin endpoints (protectActive runs first so admin must also be ACTIVE)
 router.post(

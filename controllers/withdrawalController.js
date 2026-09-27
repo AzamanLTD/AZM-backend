@@ -39,8 +39,25 @@ const SMS_LARGE_WITHDRAWAL_THRESHOLD = parseFloat(
 );
 
 // =============================================================================
-// POST /api/withdraw/fiat
+// POST /api/withdraw/fiat   (CANONICAL — the /api/finance/withdraw/fiat alias
+// in routes/financeRoutes.js routes here too, with the same authority)
 // Authenticated user requests a fiat withdrawal.
+//
+// r42 WAVE-2 RESPONSE/ECONOMIC BOUNDARY CONTRACT:
+//   • The FinancialOperation claim commits INSIDE the reservation transaction
+//     (debit + fee economics + liquidity reservation + TransactionHistory +
+//     Withdrawal mirror + ledger reservation + restricted obligation + claim,
+//     all atomic). Its stored response is the deterministic ACCEPTED / PENDING
+//     fact set — true BEFORE any provider I/O; it never claims dispatch or
+//     settlement.
+//   • The HTTP response (202 Accepted) is sent AT the commit boundary and is
+//     byte-identical to what a same-key replay returns. The client tracks the
+//     final settlement state through the Withdrawal/reconciliation state
+//     machine (GET /api/withdraw/status/:reference, withdrawal_progress
+//     socket events, settlement webhooks).
+//   • Provider dispatch runs AFTER the response, res-silently: outcomes
+//     (definitive reversal, ambiguous parking, IN_TRANSIT bookkeeping) are
+//     durable state, never HTTP statuses.
 //
 // Flow:
 //   1. financeService.processFiatWithdrawal — debits the user, captures the
@@ -81,8 +98,35 @@ exports.fiatWithdrawal = async (req, res) => {
     const smsService              = req.app.get('smsService');
 
     try {
-        const { amount, payoutMethod, recipientPhone, destination } = req.body;
+        const { amount, payoutMethod, recipientPhone, destination, savedAccountId } = req.body;
         const userId = req.user.id;
+
+        // ── Saved MoMo account verification (r42 WAVE-2, ported from the old
+        // /finance/withdraw/fiat surface this canonical controller replaced).
+        // If the client passes a savedAccountId (the saved-momo account the
+        // user selected as the payout destination), verify it belongs to the
+        // user AND that isVerified === true before proceeding with the payout.
+        // This prevents withdrawals to unverified / name-not-resolved numbers.
+        if (savedAccountId) {
+            const savedAccount = await prisma.savedMomoAccount.findUnique({
+                where: { id: savedAccountId },
+            });
+            if (!savedAccount || savedAccount.userId !== userId) {
+                res.locals.financialClaimRelease = true; // pre-economics guard
+                return res.status(404).json({
+                    success: false,
+                    message: 'Saved payout account not found.'
+                });
+            }
+            if (!savedAccount.isVerified) {
+                res.locals.financialClaimRelease = true; // pre-economics guard
+                return res.status(400).json({
+                    success: false,
+                    code: 'ACCOUNT_NOT_VERIFIED',
+                    message: 'This payout account has not been verified. Please verify the number before withdrawing.'
+                });
+            }
+        }
 
         // r16b P0-A: the destination MoMo network is DATA under the single
         // Moolre provider contract — never a provider choice. VODAFONE is a
@@ -90,6 +134,7 @@ exports.fiatWithdrawal = async (req, res) => {
         // mapping (MTN=1, TELECEL=6, AIRTELTIGO=7) remains the authority.
         let networkChoice = (req.body.network || 'MTN').toString().toUpperCase();
         if (!['MTN', 'TELECEL', 'VODAFONE', 'AIRTELTIGO'].includes(networkChoice)) {
+            res.locals.financialClaimRelease = true; // pre-economics guard
             return res.status(400).json({
                 success: false,
                 message: 'network must be one of: MTN, TELECEL, or AIRTELTIGO.'
@@ -98,6 +143,7 @@ exports.fiatWithdrawal = async (req, res) => {
         if (networkChoice === 'VODAFONE') networkChoice = 'TELECEL';
 
         if (!amount || Number(amount) <= 0) {
+            res.locals.financialClaimRelease = true; // pre-economics guard
             return res.status(400).json({ success: false, message: 'Invalid withdrawal amount.' });
         }
 
@@ -112,6 +158,7 @@ exports.fiatWithdrawal = async (req, res) => {
         });
         if (!fraudResult.allowed) {
             logger.warn({ userId: req.user.id, rules: fraudResult.triggeredRules }, '[fiatWithdrawal] Blocked by fraud detection');
+            res.locals.financialClaimRelease = true; // pre-economics guard
             return res.status(403).json({
                 success: false,
                 message: 'Transaction blocked by security checks. Please contact support.',
@@ -124,6 +171,7 @@ exports.fiatWithdrawal = async (req, res) => {
         // legacy `destination` field if older clients are still sending it.
         const phone = recipientPhone || destination;
         if (!phone || typeof phone !== 'string' || phone.length < 9) {
+            res.locals.financialClaimRelease = true; // pre-economics guard
             return res.status(400).json({
                 success: false,
                 message: 'recipientPhone is required for MoMo withdrawal.'
@@ -159,6 +207,7 @@ exports.fiatWithdrawal = async (req, res) => {
         const azmSpendService = req.app.get('azmSpendService');
         if (feeDiscountTierId) {
             if (!azmSpendService) {
+                res.locals.financialClaimRelease = true; // pre-economics guard
                 return res.status(400).json({
                     success: false,
                     code: 'AZM_SPEND_FAILED',
@@ -170,6 +219,7 @@ exports.fiatWithdrawal = async (req, res) => {
             // the client-supplied multiplier is never trusted as authority.
             feeDiscountTier = FEE_DISCOUNT_TIERS.find(t => t.id === feeDiscountTierId) || null;
             if (!feeDiscountTier) {
+                res.locals.financialClaimRelease = true; // pre-economics guard
                 return res.status(400).json({
                     success: false,
                     code: 'AZM_SPEND_FAILED',
@@ -182,6 +232,11 @@ exports.fiatWithdrawal = async (req, res) => {
         // by the service through the canonical exact-decimal parser (never a
         // binary float). parseFloat mirrors below are NON-authoritative
         // (fraud scoring, SMS/alert thresholds, receipt display).
+        // r42 WAVE-2: built once inside the economic transaction, sent as the
+        // original HTTP response and replayed byte-identically on same-key
+        // retry — one stable meaning: ACCEPTED / PENDING, never a provider fact.
+        let acceptedResponse = null;
+
         const data = await financeService.processFiatWithdrawal(
             prisma,
             userId,
@@ -211,6 +266,55 @@ exports.fiatWithdrawal = async (req, res) => {
                 // debit, no canonical row) — the controller can never reach
                 // provider I/O with a committed withdrawal that has no
                 // reconciliation record for the worker to discover.
+                // r42 WAVE-2 — the durable operation claim commits WITH the
+                // reservation economics. The FinancialOperation represents
+                // the ACCEPTED WITHDRAWAL REQUEST / internal reservation, NOT
+                // the external provider settlement: its stored response is
+                // the deterministic accepted/pending fact set, true BEFORE any
+                // provider I/O (no dispatch status, no provider refs, no
+                // final outcome). Same-key retries replay these exact bytes
+                // and can NEVER start a second withdrawal.
+                commitOperationClaimInTransaction: async (tx, facts) => {
+                    acceptedResponse = {
+                        success: true,
+                        status: 'PENDING',
+                        message: 'Withdrawal request accepted. The payout is being processed — track it with this reference.',
+                        // Top-level `reference` so the Flutter WithdrawalProgressSheet
+                        // can open immediately and subscribe to withdrawal_progress /
+                        // poll GET /api/withdraw/status/:reference without parsing.
+                        reference,
+                        data: {
+                            reference,
+                            status: 'PENDING',
+                            withdrawalId: facts.withdrawalRecord?.id ?? null,
+                            transactionId: facts.txRecord.id,
+                            amount: facts.amount.toFixed(8),            // exact
+                            exitFee: facts.exitFee.toFixed(8),          // exact
+                            totalDeducted: facts.totalDeduct.toFixed(8), // exact
+                            payoutGhs: facts.payoutGhs.toFixed(2),      // exact (2dp pesewas)
+                            retailRate: facts.retailRate.toString(),
+                            network: networkChoice,
+                            destination: phone,
+                            newBalance: facts.newUserBalance.toFixed(8), // post-reservation balance
+                        },
+                    };
+                    const operation = res.locals?.financialOperation || null;
+                    if (!operation) return; // authority not mounted (direct drives) — economics unchanged
+                    const committed = await tx.financialOperation.updateMany({
+                        where: { id: operation.id, status: 'IN_PROGRESS' },
+                        data: {
+                            status: 'COMMITTED',
+                            statusCode: 202,
+                            // WIRE text (TEXT column): replay re-emits these exact bytes.
+                            responseBody: JSON.stringify(acceptedResponse),
+                        },
+                    });
+                    if (committed.count !== 1) {
+                        const err = new Error('Idempotency operation state conflict.');
+                        err.code = 'IDEMPOTENCY_STATE_CONFLICT';
+                        throw err;
+                    }
+                },
                 createWithdrawalRecordInTransaction: async (tx, txRecord) => {
                     const rows = await tx.$queryRawUnsafe(
                         'INSERT INTO "Withdrawal" ' +
@@ -242,6 +346,33 @@ exports.fiatWithdrawal = async (req, res) => {
             }
         );
 
+        // ── r42 WAVE-2: respond at the COMMIT BOUNDARY ────────────────────────
+        // The reservation (and the FinancialOperation claim) committed above.
+        // From the economic boundary's point of view the request is DONE: the
+        // withdrawal is durably accepted/reserved. The external provider
+        // dispatch happens AFTER this response — it must never be represented
+        // in the committed claim, and the HTTP response must be byte-identical
+        // to what a same-key replay returns (the stored accepted/pending
+        // response). Final settlement state remains owned by the Withdrawal
+        // reconciliation state machine (GET /api/withdraw/status/:reference,
+        // withdrawal_progress socket events, settlement callbacks).
+        res.status(202).json(acceptedResponse);
+
+        // ── post-response dispatch phase (res-silent by design) ────────────
+        // Everything below happens AFTER the accepted response is on the wire.
+        // No path may touch the HTTP response again: outcomes are recorded in
+        // the durable Withdrawal/reconciliation state (mirror status, ledger
+        // reversal, exception rows, admin alerts, receipts). A `res.status()`
+        // below is a NO-OP shield kept only to preserve the existing early-exit
+        // control flow — the meaningful record of each branch is the database.
+        const _shield = {
+            locals: res.locals,
+            status() { return _shield; },
+            json()   { return _shield; },
+            setHeader() { return _shield; },
+        };
+        try {
+            await (async (res) => {
         // P0: emit the AZM spend realtime update exactly once, POST-COMMIT.
         // The debit already committed inside the withdrawal transaction, so
         // this event can never surface for a rolled-back withdrawal.
@@ -879,6 +1010,36 @@ exports.fiatWithdrawal = async (req, res) => {
                 data:    { reference, gatewayError: mtnErr.message }
             });
         }
+            })(_shield);
+        } catch (phaseErr) {
+            // Unexpected failure in the post-response phase. The reservation
+            // committed and the client already holds the accepted response —
+            // nothing here may masquerade as an HTTP outcome. The durable
+            // Withdrawal row stays discoverable (PENDING/DISPATCHING) for the
+            // payout worker / reconciliation machinery, and the failure is
+            // recorded loudly for operators.
+            logger.error({ err: phaseErr, reference }, '[fiatWithdrawal] post-response phase failure — withdrawal stays durable, operators alerted');
+            try {
+                await recordReconciliationExceptionLoud(prisma, {
+                    entityType: 'TRANSACTION',
+                    entityId: reference,
+                    reference,
+                    reason: 'FIAT_POST_RESPONSE_PHASE_FAILURE',
+                    details: { error: phaseErr.message, stage: 'POST_RESPONSE_DISPATCH_PHASE' },
+                }, {
+                    escalate: async () => {
+                        if (io) io.emit('admin_alert', {
+                            type: 'WITHDRAWAL_POST_RESPONSE_PHASE_FAILURE',
+                            reference,
+                            timestamp: new Date().toISOString(),
+                        });
+                    },
+                });
+            } catch (recordErr) {
+                logger.error({ err: recordErr }, '[fiatWithdrawal] post-response exception record failed');
+            }
+        }
+        return;
 
     } catch (error) {
         logger.error({ err: error }, '[fiatWithdrawal] error');
@@ -922,6 +1083,9 @@ exports.fiatWithdrawal = async (req, res) => {
         // transaction — surface insufficient-AZM failures with the same
         // AZM_SPEND_FAILED contract the FE already handles.
         if (error.code === 'AZM_SPEND_FAILED') {
+            // Thrown INSIDE the reservation transaction — the whole withdrawal
+            // rolled back. Provably pre-economics: the key stays reusable.
+            res.locals.financialClaimRelease = true;
             return res.status(400).json({
                 success: false,
                 code: 'AZM_SPEND_FAILED',
@@ -929,7 +1093,18 @@ exports.fiatWithdrawal = async (req, res) => {
             });
         }
 
-        return res.status(400).json({ success: false, message: error.message });
+        // r42 WAVE-2: with the accepted response sent AT the commit boundary
+        // and the post-response phase fully shielded above, an error reaching
+        // THIS catch is provably PRE-COMMIT: the reservation transaction rolled
+        // back, nothing was debited, no canonical row exists and no provider
+        // I/O happened. The route's idempotency({ failurePolicy: 'RELEASE' })
+        // disposition releases the claim, so the client may retry safely with
+        // the SAME key; money can never move twice on it either way.
+        return res.status(500).json({
+            success: false,
+            code:    'WITHDRAWAL_INTERNAL_ERROR',
+            message: 'The withdrawal could not be completed. Nothing was deducted — please try again.',
+        });
     }
 };
 
@@ -1058,6 +1233,10 @@ exports.cryptoWithdrawal = async (req, res) => {
         }
 
         const hotWalletAddress = custody.getConfig().hotWalletAddress;
+
+        // r42 WAVE-2: built once inside the reservation transaction; the original
+        // response and any same-key replay are the same bytes (accepted/pending).
+        let acceptedResponse = null;
 
         // ── ACID reservation: customer debit EXACTLY ONCE + durable execution ──
         // The ledger row starts PENDING with NO tx hash (hashes only ever come
@@ -1204,9 +1383,75 @@ exports.cryptoWithdrawal = async (req, res) => {
                 },
             });
 
+            // r42 WAVE-2 — the durable claim commits WITH the custody
+            // reservation: customer debit + PENDING TransactionHistory +
+            // CustodyExecution + ledger reservation + restricted obligation +
+            // the COMMITTED FinancialOperation all land atomically. The stored
+            // response is the deterministic accepted/pending fact set — TRUE
+            // BEFORE any KMS/Tatum I/O (no submission status, no tx hash, no
+            // provider outcome). KMS execution happens strictly after this
+            // commit; same-key retries replay these exact bytes and can never
+            // create a second debit, a second CustodyExecution, or a second
+            // provider submission.
+            acceptedResponse = {
+                success: true,
+                status: 'PENDING',
+                message: 'Withdrawal accepted. The on-chain transfer is being processed and will complete once confirmed on Polygon.',
+                data: {
+                    status:            'PENDING',
+                    executionId:       execution.id,
+                    transactionId:     txRecord.id,
+                    withdrawalAmount:  amountExact,      // exact, from base units
+                    gasFeeMatic:       POLYGON_GAS_FEE_MATIC,
+                    maticUsdcRate,
+                    gasFeeUsdc,
+                    netPayout:         netPayoutExact,   // exact, from base units
+                    gasFeePolicy:      'USER_BEARS_100_PERCENT',
+                    destination,
+                    network:           network || 'Polygon',
+                    newBalance:        user.availableBalance.minus(new Prisma.Decimal(amountExact)).toFixed(6),
+                },
+            };
+            const _cryptoOperation = res.locals?.financialOperation || null;
+            if (_cryptoOperation) {
+                const committed = await tx.financialOperation.updateMany({
+                    where: { id: _cryptoOperation.id, status: 'IN_PROGRESS' },
+                    data: {
+                        status: 'COMMITTED',
+                        statusCode: 202,
+                        responseBody: JSON.stringify(acceptedResponse), // WIRE text
+                    },
+                });
+                if (committed.count !== 1) {
+                    const err = new Error('Idempotency operation state conflict.');
+                    err.code = 'IDEMPOTENCY_STATE_CONFLICT';
+                    throw err;
+                }
+            }
+
             return { user, txRecord, execution };
         });
 
+        // ── r42 WAVE-2: respond at the COMMIT BOUNDARY ──────────────────────
+        // The custody reservation (and the FinancialOperation claim) committed.
+        // External KMS/Tatum execution happens strictly AFTER this response:
+        // the claim must never represent the provider submission, and the HTTP
+        // response must be byte-identical to the stored replay. Final state is
+        // owned by the CustodyExecution lifecycle + custodyRecoveryWorker +
+        // chain-evidence settlement (status surface, receipts).
+        res.status(202).json(acceptedResponse);
+
+        // ── post-response external-execution phase (res-silent) ────────────
+        // Outcomes below are recorded in durable custody state (RECONCILIATION_
+        // REQUIRED marking, exactly-once refund, receipts) — never in HTTP.
+        const _shield = {
+            locals: res.locals,
+            status() { return _shield; },
+            json()   { return _shield; },
+            setHeader() { return _shield; },
+        };
+        try {
+            await (async (res) => {
         // ── Four-eye: durable pre-validation of the EXACT intended transfer ──
         // Verifies destination, token contract, exact base-unit amount, source
         // signer, and the customer withdrawal reference against the stored
@@ -1356,7 +1601,12 @@ exports.cryptoWithdrawal = async (req, res) => {
                     });
                     await tx.adminProfitLog.create({
                         data: {
-                            amountUsdc:   new Prisma.Decimal(feeExact).neg(),
+                            // CHECK armor (APL_amountUsdc_nonneg) forbids negative
+                            // rows on migration-deployed DBs: record the POSITIVE
+                            // fee magnitude; the crypto_withdraw_refund_* tx id
+                            // and the systemProfitFees decrement above carry the
+                            // reversal semantics.
+                            amountUsdc:   new Prisma.Decimal(feeExact),
                             source:       'GAS_FEE_REVENUE',
                             relatedTxId:  `crypto_withdraw_refund_${result.txRecord.id}`,
                             isSubsidized: true
@@ -1398,6 +1648,34 @@ exports.cryptoWithdrawal = async (req, res) => {
                 data:    { gatewayError: execErr.message, refunded: amountExact }
             });
         }
+            })(_shield);
+        } catch (phaseErr) {
+            // Unexpected failure in the post-response execution phase. The
+            // reservation committed and the client holds the accepted response;
+            // the durable CustodyExecution row keeps the operation recoverable
+            // by custodyRecoveryWorker without a second customer debit.
+            logger.error({ err: phaseErr, executionId: result.execution.id }, '[cryptoWithdrawal] post-response phase failure — execution stays durable, operators alerted');
+            try {
+                await recordReconciliationExceptionLoud(prisma, {
+                    entityType: 'CUSTODY_EXECUTION',
+                    entityId: String(result.execution.id),
+                    reference: `custody-exec:${result.execution.id}`,
+                    reason: 'CRYPTO_POST_RESPONSE_PHASE_FAILURE',
+                    details: { error: phaseErr.message, stage: 'POST_RESPONSE_KMS_PHASE' },
+                }, {
+                    escalate: async () => {
+                        if (io) io.emit('admin_alert', {
+                            type: 'CRYPTO_WITHDRAWAL_POST_RESPONSE_PHASE_FAILURE',
+                            executionId: result.execution.id,
+                            timestamp: new Date().toISOString(),
+                        });
+                    },
+                });
+            } catch (recordErr) {
+                logger.error({ err: recordErr }, '[cryptoWithdrawal] post-response exception record failed');
+            }
+        }
+        return;
 
     } catch (error) {
         logger.error({ err: error }, '[cryptoWithdrawal] error');
@@ -1469,23 +1747,15 @@ exports.getWithdrawalStatus = async (req, res) => {
             return res.status(404).json({ success: false, code: 'NOT_FOUND', message: 'No withdrawal found for that reference.' });
         }
 
-        // Try to locate the mirror Withdrawal row for the destination phone and
-        // any provider tracking the reconciliation worker may have stored. The
-        // Withdrawal model has no `reference`/`providerTxId` column, so we
-        // correlate on userId + amount within the same wall-clock window — the
-        // exact heuristic withdrawalReconciliationWorker uses. Non-fatal.
+        // Resolve the mirror Withdrawal row through the DURABLE link the fiat
+        // reservation writes (Withdrawal.transactionHistoryId -> tx.id) — never
+        // by userId + amount + a wall-clock window, which can mis-associate
+        // two same-user withdrawals of the same amount created seconds apart.
+        // Non-fatal: pre-bridge rows simply omit provider context.
         let withdrawalRow = null;
         try {
             withdrawalRow = await prisma.withdrawal.findFirst({
-                where: {
-                    userId: req.user.id,
-                    amount: tx.amountUsdc,
-                    createdAt: {
-                        gte: new Date(tx.createdAt.getTime() - 5_000),
-                        lte: new Date(tx.createdAt.getTime() + 5_000)
-                    }
-                },
-                orderBy: { createdAt: 'desc' }
+                where: { transactionHistoryId: tx.id },
             });
         } catch (_) { /* non-fatal — provider context simply omitted */ }
 
@@ -1508,7 +1778,9 @@ exports.getWithdrawalStatus = async (req, res) => {
             stage:        mapped.stage,
             label:        mapped.label,
             pct:          mapped.pct,
-            amountGhs:    tx.amountUsdc != null ? Number(tx.amountUsdc) : null,
+            // USDC, not GHS — the withdrawal is denominated in USDC and the
+            // MoMo payout quote lives on the Withdrawal row's service metadata.
+            amountUsdc:    tx.amountUsdc != null ? Number(tx.amountUsdc) : null,
             recipient:    withdrawalRow ? withdrawalRow.destination : null,
             providerTxId,
             updatedAt:    tx.createdAt ? tx.createdAt.toISOString() : null

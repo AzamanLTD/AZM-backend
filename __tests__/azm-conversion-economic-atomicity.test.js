@@ -122,6 +122,7 @@ const uniq = () => `conv_${Date.now()}_${Math.random().toString(36).slice(2, 10)
 async function callConvert(userId, azmAmount) {
     const out = { statusCode: null, body: null };
     const res = {
+        locals: {},
         statusCode: 200,
         status(c) { this.statusCode = c; return { json: (b) => this.json(b) }; },
         json(b) { out.statusCode = this.statusCode; out.body = b; },
@@ -188,9 +189,13 @@ afterAll(async () => {
         await sweepUserArtefacts(userId);
         await base.user.delete({ where: { id: userId } }).catch(() => {});
     }
-    const idemKeys = await base.idempotencyKey.findMany({ select: { key: true } });
-    const ours = idemKeys.filter((k) => k.key.startsWith('conv-test-')).map((k) => k.key);
-    await base.idempotencyKey.deleteMany({ where: { key: { in: ours } } }).catch(() => {});
+    // r42: the retired IdempotencyKey response cache is gone; the durable
+    // claim identity lives in FinancialOperation (schema-scoped, permanent
+    // COMMITTED rows are fine to keep — they are economic truth, not cache).
+    // Only sweep un-settled IN_PROGRESS leftovers from crashed attempts.
+    await base.financialOperation.deleteMany({
+        where: { key: { startsWith: 'conv-test-' }, status: 'IN_PROGRESS' },
+    }).catch(() => {});
     // Restore the shared pool to whatever it was before this suite ran.
     await base.systemProfitFees.update({ where: { id: 1 }, data: { balance: poolBalanceBefore } });
     await base.$disconnect();
@@ -384,7 +389,8 @@ describeOrSkip('AZM→USDC conversion economic atomicity (real PostgreSQL)', () 
         const run = () => new Promise((resolve) => {
             const out = { statusCode: null, body: null };
             const res = {
-                statusCode: 200, // the middleware caches on res.statusCode
+                locals: {},
+                statusCode: 200, // the middleware commits the claim on res.statusCode
                 status(c) { this.statusCode = c; return { json: (b) => this.json(b) }; },
                 json(b) { out.statusCode = this.statusCode; out.body = b; resolve(out); },
             };

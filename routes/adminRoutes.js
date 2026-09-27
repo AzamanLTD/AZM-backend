@@ -17,6 +17,7 @@ const router = express.Router();
 const adminController = require('../controllers/adminController');
 const profitBreakdownController = require('../controllers/adminProfitBreakdownController');
 const { protect, adminOnly } = require('../middleware/authMiddleware');
+const { idempotency } = require('../middleware/idempotency');
 const { validate } = require('../middleware/validate');
 const {
     approveKycSchema,
@@ -256,82 +257,22 @@ router.post('/trade-accounts/:id/reject', async (req, res) => {
 });
 
 // ─── ADMIN CREDIT (Demo: give users test USDC) ──────────────────────────────
-router.post('/users/:id/credit', async (req, res) => {
-    const prisma = req.app.get('prisma');
-    const emitBalanceUpdate = req.app.get('emitBalanceUpdate');
-    try {
-        const userId = parseInt(req.params.id, 10);
-        const { amount, reason } = req.body;
-
-        if (isNaN(userId)) return res.status(400).json({ success: false, message: 'Invalid user ID.' });
-        if (!amount || isNaN(parseFloat(amount)) || parseFloat(amount) <= 0) {
-            return res.status(400).json({ success: false, message: 'amount must be a positive number.' });
-        }
-
-        const amountFloat = parseFloat(amount);
-
-        const user = await prisma.user.findUnique({ where: { id: userId }, select: { id: true, username: true } });
-        if (!user) return res.status(404).json({ success: false, message: 'User not found.' });
-
-        await prisma.$transaction(async (tx) => {
-            await tx.user.update({
-                where: { id: userId },
-                data: { availableBalance: { increment: amountFloat } },
-            });
-            const history = await tx.transactionHistory.create({
-                data: {
-                    userId,
-                    type: 'DEPOSIT_CRYPTO',
-                    amountUsdc: amountFloat,
-                    feeUsdc: 0,
-                    txHash: `ADMIN_CREDIT_${Date.now()}_${userId}`,
-                    status: 'COMPLETED',
-                }
-            });
-            await tx.adminSettingsAuditLog.create({
-                data: {
-                    adminId: req.user.id,
-                    adminName: req.user.username,
-                    action: 'CREDIT_USER_BALANCE',
-                    targetType: 'USER_BALANCE',
-                    targetId: String(userId),
-                    changes: { amount: amountFloat, reason: reason || 'Admin credit' },
-                }
-            });
-
-            // §P.4 AUTHORITATIVE LEDGER — admin demo credit. This is NOT a
-            // custody deposit: no real USDC arrived. The grant is funded by
-            // platform equity so the books never mint unbacked customer
-            // liability, idempotent on the history row created above:
-            //   D equity:treasury        — platform equity funds the grant
-            //   C user:{userId}:liability — customer credited
-            await ledger.post(tx, {
-                idempotencyKey: `ledger:admin:demo-credit:${history.id}`,
-                entryType: 'ADJUSTMENT',
-                description: 'Admin demo credit — platform equity granted to customer',
-                userId,
-                relatedEntity: 'transactionHistory',
-                relatedEntityId: history.id,
-                metadata: { adminId: req.user.id, reason: reason || 'Admin credit', amount: _exact(amountFloat) },
-                lines: [
-                    { account: 'equity:treasury', debit: _exact(amountFloat) },
-                    { account: `user:${userId}:liability`, credit: _exact(amountFloat) },
-                ],
-            });
-        });
-
-        if (emitBalanceUpdate) await emitBalanceUpdate(userId);
-
-        return res.status(200).json({
-            success: true,
-            message: `Credited ${amountFloat} USDC to ${user.username}.`,
-            data: { userId, username: user.username, credited: amountFloat }
-        });
-    } catch (error) {
-        logger.error({ err: error }, '[admin.creditUser] error');
-        return res.status(500).json({ success: false, message: error.message });
-    }
-});
+// r42 final-audit catch: this was the LAST financial mutation mounted with NO
+// durable exactly-once identity (timestamp txHash + per-attempt history.id
+// ledger key — a re-clicked admin credit double-credited). It now runs under
+// the shared idempotency authority with a REQUIRED client key; the txHash is
+// derived from the key so the TransactionHistory identity is replay-scoped.
+// §r42 P0 (review): this route is now genuinely TRANSACTION-WIRED. The
+// handler builds the accepted response and transitions its claim IN_PROGRESS
+// → COMMITTED inside the credit's own prisma.$transaction, requiring
+// count === 1 (else the whole credit rolls back). So:
+//   FinancialOperation COMMITTED ↔ the credit economics committed —
+// a post-response IN_PROGRESS claim is durable proof of rollback on BOTH
+// 4xx (all validation happens pre-economics) and 5xx (RELEASE policy), and
+// a COMMITTED claim replays the exact stored response bytes. Non-economic
+// post-commit work (emitBalanceUpdate) runs AFTER the wire in a res-silent
+// phase, so a push failure can never release a committed credit.
+router.post('/users/:id/credit', idempotency({ failurePolicy: 'RELEASE', releaseOn4xx: true }), adminController.creditUserBalance);
 
 // ─── AUTONOMOUS PAYOUTS (Phase Q8) ──────────────────────────────────────────
 router.post('/payouts/batch-process',   adminController.batchProcessPayouts);

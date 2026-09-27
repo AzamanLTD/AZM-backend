@@ -2455,3 +2455,142 @@ exports.getAuditLog = async (req, res) => {
         return res.status(500).json({ success: false, message: err.message });
     }
 };
+
+// ─── ADMIN CREDIT (Demo: give users test USDC) ──────────────────────────────
+// Extracted from routes/adminRoutes.js (r42) so the idempotency contract is
+// testable against the real handler. Runs under the shared idempotency
+// authority — the route mount REQUIRES an Idempotency-Key; the txHash below
+// is derived from that key, so the TransactionHistory identity is durable
+// across retries rather than a fresh Date.now() per attempt.
+exports.creditUserBalance = async (req, res) => {
+    const prisma = req.app.get('prisma');
+    const emitBalanceUpdate = req.app.get('emitBalanceUpdate');
+    try {
+        const userId = parseInt(req.params.id, 10);
+        const { amount, reason } = req.body;
+
+        if (isNaN(userId)) return res.status(400).json({ success: false, message: 'Invalid user ID.' });
+        if (!amount || isNaN(parseFloat(amount)) || parseFloat(amount) <= 0) {
+            return res.status(400).json({ success: false, message: 'amount must be a positive number.' });
+        }
+
+        const amountFloat = parseFloat(amount);
+
+        const user = await prisma.user.findUnique({ where: { id: userId }, select: { id: true, username: true } });
+        if (!user) return res.status(404).json({ success: false, message: 'User not found.' });
+
+        // §r42 wired pattern — the durable claim minted by the idempotency
+        // authority. This route transitions the claim to COMMITTED INSIDE the
+        // same economic transaction as the credit itself, so:
+        //   FinancialOperation COMMITTED  ↔  the credit transaction committed
+        // Atomicity makes the equivalence structural: there is never a
+        // committed credit with a releasable IN_PROGRESS claim, and never a
+        // COMMITTED claim without committed economics. HTTP status alone is
+        // never rollback evidence.
+        const operation = res.locals.financialOperation;
+        if (!operation) {
+            // Fail closed: no durable claim, no money movement.
+            return res.status(500).json({ success: false, message: 'Idempotency claim missing — credit refused.' });
+        }
+
+        // The EXACT accepted response is built INSIDE the transaction and
+        // stored on the claim, so a same-key retry replays these bytes
+        // byte-identically and never re-executes the credit.
+        let response;
+
+        await prisma.$transaction(async (tx) => {
+            await tx.user.update({
+                where: { id: userId },
+                data: { availableBalance: { increment: amountFloat } },
+            });
+            const history = await tx.transactionHistory.create({
+                data: {
+                    userId,
+                    type: 'DEPOSIT_CRYPTO',
+                    amountUsdc: amountFloat,
+                    feeUsdc: 0,
+                    // durable replay identity: scoped to (admin, target user, key) — the claim
+                    // itself is unique on the same triple, so a replay never reaches this
+                    // insert, and two independent operations can never collide on the
+                    // TransactionHistory txHash UNIQUE constraint.
+                    txHash: `ADMIN_CREDIT_${req.user.id}_${userId}_${req.headers['idempotency-key']}`,
+                    status: 'COMPLETED',
+                }
+            });
+            await tx.adminSettingsAuditLog.create({
+                data: {
+                    adminId: req.user.id,
+                    adminName: req.user.username,
+                    action: 'CREDIT_USER_BALANCE',
+                    targetType: 'USER_BALANCE',
+                    targetId: String(userId),
+                    changes: { amount: amountFloat, reason: reason || 'Admin credit' },
+                }
+            });
+
+            // §P.4 AUTHORITATIVE LEDGER — admin demo credit. This is NOT a
+            // custody deposit: no real USDC arrived. The grant is funded by
+            // platform equity so the books never mint unbacked customer
+            // liability, idempotent on the history row created above:
+            //   D equity:treasury        — platform equity funds the grant
+            //   C user:{userId}:liability — customer credited
+            await ledger.post(tx, {
+                idempotencyKey: `ledger:admin:demo-credit:${history.id}`,
+                entryType: 'ADJUSTMENT',
+                description: 'Admin demo credit — platform equity granted to customer',
+                userId,
+                relatedEntity: 'transactionHistory',
+                relatedEntityId: history.id,
+                metadata: { adminId: req.user.id, reason: reason || 'Admin credit', amount: _exact(amountFloat) },
+                lines: [
+                    { account: 'equity:treasury', debit: _exact(amountFloat) },
+                    { account: `user:${userId}:liability`, credit: _exact(amountFloat) },
+                ],
+            });
+
+            response = {
+                success: true,
+                message: `Credited ${amountFloat} USDC to ${user.username}.`,
+                data: { userId, username: user.username, credited: amountFloat }
+            };
+
+            // §r42 P0 — the claim transitions to COMMITTED in the SAME
+            // transaction, immediately after the economic writes. count !== 1
+            // means this row was not the IN_PROGRESS claim we minted — refuse
+            // and roll back the ENTIRE credit.
+            const wired = await tx.financialOperation.updateMany({
+                where: { id: operation.id, status: 'IN_PROGRESS' },
+                data: { status: 'COMMITTED', statusCode: 200, responseBody: JSON.stringify(response) },
+            });
+            if (wired.count !== 1) {
+                throw new Error(`Idempotency claim ${operation.id} was not IN_PROGRESS at commit time — refusing to credit`);
+            }
+        });
+
+        // Only now — transaction durably committed AND claim durably
+        // COMMITTED — is the HTTP acceptance emitted. Any mid-transaction
+        // throw reached the catch below with the claim still IN_PROGRESS
+        // (rolled back atomically with the economics), where the authority's
+        // RELEASE policy can safely free the key for retry.
+        res.status(200).json(response);
+
+        // Non-economic post-response phase — deliberately AFTER the wire. A
+        // failure here is logged and dropped: it must NEVER turn the accepted
+        // credit into a 500 that the authority would release, re-arming the
+        // key for duplicate execution.
+        if (emitBalanceUpdate) {
+            try {
+                await emitBalanceUpdate(userId);
+            } catch (pushError) {
+                logger.warn(
+                    { err: pushError.message, userId },
+                    '[admin.creditUser] post-response balance push failed — credit is durably committed'
+                );
+            }
+        }
+        return;
+    } catch (error) {
+        logger.error({ err: error }, '[admin.creditUser] error');
+        return res.status(500).json({ success: false, message: error.message });
+    }
+};

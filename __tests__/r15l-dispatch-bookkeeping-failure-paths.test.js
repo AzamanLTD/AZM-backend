@@ -722,8 +722,11 @@ describeOrSkip('r15 hardening G–I: controller path — tracked, fail-closed, r
         });
 
         const response = await runWithdrawal(user, { app, res });
-        expect(response.statusCode).toBe(200);
+        // r42 WAVE-2: accepted/pending 202 at the commit boundary; the
+        // ownership failure below is durable (exception + evidence recovery).
+        expect(response.statusCode).toBe(202);
         expect(response.body.success).toBe(true);
+        expect(response.body.status).toBe('PENDING');
 
         // NOT refunded — the provider has the money.
         const u = await freshUser(user.id);
@@ -790,7 +793,7 @@ describeOrSkip('r15 hardening G–I: controller path — tracked, fail-closed, r
         const { app, res } = makeHarness(provider);
 
         const response = await runWithdrawal(user, { app, res });
-        expect(response.statusCode).toBe(200);
+        expect(response.statusCode).toBe(202); // r42 WAVE-2: accepted/pending at commit
 
         const txRow = await prisma.transactionHistory.findFirst({
             where: { userId: user.id, type: 'WITHDRAWAL_FIAT' },
@@ -872,8 +875,11 @@ describeOrSkip('r15 hardening G–I: controller path — tracked, fail-closed, r
         const { app, res } = makeHarness(provider);
 
         const response = await runWithdrawal(user, { app, res });
-        expect(response.statusCode).toBe(503);
-        expect(response.body.success).toBe(false);
+        // r42 WAVE-2: the response is the accepted/pending 202 (already sent at
+        // the commit boundary); the identity-less dispatch is fail-closed in
+        // DURABLE state below — no HTTP status can represent it anymore.
+        expect(response.statusCode).toBe(202);
+        expect(response.body.success).toBe(true);
 
         // The dispatch DID happen (provider called once) and the user was NOT
         // refunded — the payout is in flight.

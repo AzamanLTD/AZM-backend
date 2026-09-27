@@ -17,14 +17,26 @@ const { idempotency } = require('../middleware/idempotency');
 const { require2FA } = require('../middleware/require2FA');
 const { protectActive }        = require('../middleware/banGuardMiddleware');
 
-// Withdrawals
-router.post('/withdraw',       protectActive, require2FA(), idempotency(), walletController.requestWithdrawal);
+// Withdrawals — r42 WAVE-2: the claim commits INSIDE the withdrawal
+// reservation transaction (see walletController.requestWithdrawal) with the
+// deterministic created-ticket response. There is NO provider I/O in the
+// request path (payout workers own dispatch), so the response is honest
+// post-commit; 4xx/5xx responses prove the reservation rolled back and
+// release the claim for retry (same disposition contract as /api/withdraw/*).
+router.post('/withdraw',       protectActive, require2FA(), idempotency({ failurePolicy: 'RELEASE', releaseOn4xx: true }), walletController.requestWithdrawal);
 
 // Read-only history (banned users still need to see their own history)
 router.get('/history',         protect,       walletController.getWithdrawalHistory);
+router.get('/withdraw/status/:withdrawalId', protect, walletController.getWithdrawalStatusById);
 
 // Saved wallets / payout whitelist
-router.post('/saved',          protectActive, idempotency(), walletController.addSavedWallet);
+// r42 §9.5 (integration review): /saved is non-financial saved-address CRUD
+// (audit doc §3 classifies it as such). Forcing the financial
+// Idempotency-Key contract onto it would break the production client's
+// wallet-address management for no financial-safety gain — the route is
+// de-mounted from the shared authority. `required: false` was NOT used: a
+// half-protected route is worse than an honestly unprotected one.
+router.post('/saved',          protectActive, walletController.addSavedWallet);
 router.get('/saved',           protect,       walletController.getSavedWallets);
 router.delete('/saved/:id',    protectActive, walletController.deleteSavedWallet);
 

@@ -235,51 +235,57 @@ On success, atomically:
   provider is settling. Provider `SUCCESS` atomically transitions it to
   `COMPLETED`; provider `FAILED` reverses only a still-PENDING reservation.
 
-Outside the DB transaction the controller dispatches the GHS to the
-user's MoMo wallet via the MTN MoMo Disbursement API
-(`mtnDisbursementService.initiateTransfer`) using a UUID v4 as the
-`X-Reference-Id` idempotency key. If MTN rejects the call (sync error or
-async webhook = `FAILED`), the controller invokes
-`reverseFiatWithdrawal`, which unwinds **all** of the above — including
-the SystemMasterCrypto capture — and returns `502
-MTN_DISBURSEMENT_REJECTED` with the reversal details. Returns
-`data.fiatPoolLow = true` when the pool falls below the alert threshold.
+**r42 WAVE-2 — response at the commit boundary (202).** The route is
+mounted behind the shared financial idempotency authority
+(`Idempotency-Key` header; `RELEASE` policy + `releaseOn4xx`), so the
+claim commits INSIDE the same ACID reservation transaction and the
+customer response is sent AT the commit boundary — HTTP status `202`,
+body status `PENDING`. Provider dispatch runs strictly AFTER the
+response in a res-silent post-response phase:
 
-Response (success) shape:
+- MoMo disbursement (`mtnDisbursementService.initiateTransfer`, UUID v4
+  `X-Reference-Id`) and Kotani outcomes live in the
+  `Withdrawal` / `TransactionHistory` / reconciliation state machines —
+  a provider failure can NEVER masquerade as an HTTP outcome after the
+  reservation committed, and no honest 500 exists post-commit.
+- A same-key retry replays the stored WIRE bytes **byte-identically**
+  and can never double-debit or dispatch twice.
+- 4xx validation/risk failures roll the whole reservation back and
+  release the claim, so the client may safely retry the same key.
+
+Response (accepted, `202`) shape:
 
 ```
 {
   "success": true,
-  "message": "Fiat withdrawal of 100 USDC accepted. Exit fee: 2 USDC. 100 USDC captured to SystemMasterCrypto. MTN MoMo status: PENDING.",
+  "status": "PENDING",
+  "message": "Withdrawal request accepted. The payout is being processed — track it with this reference.",
+  "reference": "<uuid-v4>",
   "data": {
-    "reference":          "<uuid-v4>",
-    "withdrawalAmount":   100,
-    "exitFee":            2,
-    "totalDeducted":      102,
-    "retailRate":         12.45,
-    "payoutGhs":          1245.00,
-    "feeSplit":           { "referrerId": 17, "referrerShare": 1, "systemShare": 1 },
-    "newBalance":         898.00,
-    "systemFiatPool":     ...,
-    "systemProfitFees":   ...,
-    "systemMasterCrypto": ...,
-    "arbitrageCapture":   100,
-    "fiatPoolLow":        false,
-    "fiatPoolBalance":    ...,
-    "transaction":        { "id": ..., "status": "PENDING", "txHash": "<uuid-v4>" },
-    "disbursement": {
-      "provider":       "MTN_MOMO_DISBURSEMENT",
-      "referenceId":    "<uuid-v4>",
-      "externalId":     "AZAMAN_<userId>_<ts>",
-      "status":         "PENDING",
-      "amountGhs":      1245.00,
-      "recipientPhone": "233XXXXXXXXX",
-      "network":        "MTN",
-      "source":         "MOCK"
-    }
+    "reference":        "<uuid-v4>",
+    "status":           "PENDING",
+    "withdrawalId":     88,
+    "transactionId":    1234,
+    "amount":           "100.00000000",
+    "exitFee":          "2.00000000",
+    "totalDeducted":    "102.00000000",
+    "payoutGhs":        "1245.00",
+    "retailRate":       "12.45",
+    "network":          "MTN",
+    "destination":      "0541234567",
+    "newBalance":       "898.00000000"
   }
 }
 ```
+
+The pre-WAVE-2 fields that described live dispatch state
+(`systemFiatPool`, `systemProfitFees`, `systemMasterCrypto`,
+`arbitrageCapture`, `fiatPoolLow`, `fiatPoolBalance`, `transaction`,
+`disbursement`) are intentionally gone from the HTTP response: none of
+them can honestly be known at the commit boundary. Track the payout via
+`GET /withdraw/status/:reference` or the `withdrawal_progress` event;
+operators see pool/fee state and dispatch outcomes in the admin
+surfaces and reconciliation exception queue.
 
 ### `POST /finance/admin/liquidate-profits` (auth + ban guard + admin)
 Body: `{ amountUsdc }`. Atomically moves USDC from `SystemProfitFees` →
@@ -363,10 +369,12 @@ in addition to the amount:
 ```
 
 `network ∈ {MTN, VODAFONE, AIRTELTIGO}`. The 2 % exit fee + 1 %/1 %
-influencer split semantics are unchanged. On a successful debit, the
-controller dispatches the payout to Kotani; if the gateway rejects the
-call, the controller invokes `reverseFiatWithdrawal` and returns
-`502 GATEWAY_REJECTED` with the reversal details.
+influencer split semantics are unchanged. Since r42 WAVE-2 the payout is
+dispatched to Kotani strictly AFTER the accepted `202` response; a
+gateway rejection is recorded against the `Withdrawal` /
+reconciliation state machines (definitive rejections reverse via
+`reverseFiatWithdrawal` in the post-response phase) and is never
+surfaced as a synchronous `502 GATEWAY_REJECTED` anymore.
 
 ---
 
@@ -437,6 +445,31 @@ flow. Runs Double-Check before debiting.
 ### `GET /wallet/history` (auth, read-only)
 Withdrawal history.
 
+### `GET /wallet/withdraw/status/:withdrawalId` (auth, read-only)
+Owner-scoped status for one saved-payout `Withdrawal` queue row (the
+Flutter "crypto wallet" mode's progress surface). Resolved by PRIMARY
+KEY scoped to the requester — never an amount/timestamp heuristic.
+`404` for both foreign and nonexistent ids (no existence oracle),
+`400` for malformed ids.
+
+```json
+{
+  "success": true,
+  "withdrawal": {
+    "id": 123,
+    "status": "PENDING",
+    "amount": 25,
+    "destination": "0x...",
+    "payoutMethod": "MOBILE_MONEY",
+    "providerTxId": null,
+    "createdAt": "2026-09-26T10:00:00.000Z",
+    "updatedAt": "2026-09-26T10:00:00.000Z"
+  }
+}
+```
+`status` ∈ `PENDING | PROCESSING | COMPLETED | FAILED | REJECTED |
+NEEDS_MANUAL_REVIEW`.
+
 ### `POST /wallet/saved` (auth + ban guard)
 Add a saved external wallet (whitelist).
 
@@ -493,23 +526,47 @@ network gas fee. The fee is deducted FROM the withdrawal amount:
   and recorded in `AdminProfitLog (source = 'GAS_FEE_REVENUE')`.
 - Transaction is broadcast to Polygon via Tatum (best-effort).
 
-Returns `502` if the oracle is unreachable (uses 0.55 fallback).
-Returns `400` if `amount` is too low to cover gas.
+Returns `503 CRYPTO_EXECUTION_NOT_ENABLED` (no debit) when the custody
+execution gates are off, `503 CRYPTO_EXECUTION_NOT_CONFIGURED` (no
+debit) on preflight failure, and `400` if `amount` is too low to cover
+gas. A failed/unreachable oracle is NOT an error — the 0.55 fallback
+rate is used and disclosed in `data.maticUsdcRate`.
+
+**r42 WAVE-2 — response at the commit boundary (202).** The route is
+mounted behind the shared financial idempotency authority
+(`Idempotency-Key` header; `RELEASE` policy + `releaseOn4xx`). The
+reservation (conditional customer debit + conditional `SystemHotWallet`
+treasury debit + PENDING `TransactionHistory` with **no tx hash** +
+`CustodyExecution` + double-entry ledger reservation + restricted
+obligation + the COMMITTED `FinancialOperation` claim with the WIRE
+bytes) lands atomically, and the accepted `202 PENDING` response is
+sent AT that commit. KMS/Tatum submission runs strictly AFTER the
+response: the HTTP body can never contain a `txHash` (hashes exist only
+from real chain evidence), a same-key retry replays the exact stored
+bytes with no second debit/execution/submission, and the execution
+outcome lives in the `CustodyExecution` lifecycle (SIGNING → BROADCAST
+→ CONFIRMED / FAILED / RECONCILIATION_REQUIRED) + `custodyRecoveryWorker`.
+
+Response (accepted, `202`) shape:
 
 ```json
 {
   "success": true,
+  "status": "PENDING",
+  "message": "Withdrawal accepted. The on-chain transfer is being processed and will complete once confirmed on Polygon.",
   "data": {
-    "withdrawalAmount": 50.0,
+    "status": "PENDING",
+    "executionId": 12,
+    "transactionId": 1234,
+    "withdrawalAmount": "50.000000",
     "gasFeeMatic": 0.05,
     "maticUsdcRate": 0.55,
     "gasFeeUsdc": 0.0275,
-    "netPayout": 49.9725,
+    "netPayout": "49.972500",
     "gasFeePolicy": "USER_BEARS_100_PERCENT",
     "destination": "0x...",
     "network": "Polygon",
-    "txHash": "0x...",
-    "newBalance": 950.0
+    "newBalance": "450.000000"
   }
 }
 ```
@@ -520,7 +577,11 @@ Owner-only status lookup for the real-time withdrawal progress sheet.
 and stored as `TransactionHistory.txHash`. Acts as the **5s polling
 fallback** for the `withdrawal_progress` Socket.io event (see Real-time
 events). Returns `404 NOT_FOUND` if no `WITHDRAWAL_FIAT` row with that
-`txHash` belongs to the requester.
+`txHash` belongs to the requester. The mirror `Withdrawal` row is
+resolved through the DURABLE `Withdrawal.transactionHistoryId` link the
+reservation writes — never by an amount/timestamp heuristic, so two
+same-amount withdrawals seconds apart can never cross-associate. The
+amount is reported as `amountUsdc` (the reservation currency), not GHS.
 
 Maps `TransactionHistory.status` → a user-facing `{stage,label,pct}`
 triple:
@@ -540,7 +601,7 @@ triple:
   "stage": "PROCESSING",
   "label": "Sending to your MoMo wallet...",
   "pct": 40,
-  "amountGhs": 100,
+  "amountUsdc": 100,
   "recipient": "233XXXXXXXXX",
   "providerTxId": null,
   "updatedAt": "2026-06-12T10:00:00.000Z"

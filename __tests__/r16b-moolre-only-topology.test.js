@@ -202,7 +202,7 @@ describeOrSkip('r16b P0-A: fiat withdrawal network propagation (real PostgreSQL)
         ]);
         const app = { get: (k) => (appMap.has(k) ? appMap.get(k) : null) };
         const res = {
-            statusCode: null, body: null,
+            statusCode: null, body: null, locals: {},
             status(c) { this.statusCode = c; return this; },
             json(b) { this.body = b; return res; },
         };
@@ -225,7 +225,7 @@ describeOrSkip('r16b P0-A: fiat withdrawal network propagation (real PostgreSQL)
         const { dispatcher, captured, moolre } = makeRecordingDispatcher();
 
         const res = await runWithdrawal(user, dispatcher, 'TELECEL');
-        expect(res.statusCode).toBe(200);
+        expect(res.statusCode).toBe(202); // r42 WAVE-2: accepted/pending at commit
 
         // The canonical dispatch payload carries the destination network.
         expect(captured.length).toBe(1);
@@ -253,7 +253,7 @@ describeOrSkip('r16b P0-A: fiat withdrawal network propagation (real PostgreSQL)
         const { dispatcher, captured, moolre } = makeRecordingDispatcher();
 
         const res = await runWithdrawal(user, dispatcher, 'AIRTELTIGO');
-        expect(res.statusCode).toBe(200);
+        expect(res.statusCode).toBe(202); // r42 WAVE-2: accepted/pending at commit
 
         expect(captured[0].network).toBe('AIRTELTIGO');
         const ref = captured[0].referenceId;
@@ -267,7 +267,7 @@ describeOrSkip('r16b P0-A: fiat withdrawal network propagation (real PostgreSQL)
         const { dispatcher, captured } = makeRecordingDispatcher();
 
         const res = await runWithdrawal(user, dispatcher, 'VODAFONE');
-        expect(res.statusCode).toBe(200);
+        expect(res.statusCode).toBe(202); // r42 WAVE-2: accepted/pending at commit
 
         expect(captured[0].network).toBe('TELECEL');
         const withdrawal = await prisma.withdrawal.findFirst({ where: { userId: user.id } });
@@ -294,7 +294,7 @@ describeOrSkip('r16b P0-A: fiat withdrawal network propagation (real PostgreSQL)
         const { dispatcher } = makeRecordingDispatcher();
 
         const res = await runWithdrawal(user, dispatcher, 'TELECEL');
-        expect(res.statusCode).toBe(200);
+        expect(res.statusCode).toBe(202); // r42 WAVE-2: accepted/pending at commit
 
         const canonical = await prisma.transactionHistory.findFirst({
             where: { userId: user.id, type: 'WITHDRAWAL_FIAT' },

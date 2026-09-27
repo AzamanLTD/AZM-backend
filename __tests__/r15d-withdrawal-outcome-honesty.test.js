@@ -34,6 +34,13 @@ if (!hasDb) console.warn('[r15d-withdrawal-outcome-honesty] TEST_DATABASE_URL no
 const START_USDC = 500.0;
 const WITHDRAWAL = 50.0;
 
+// r42 WAVE-2 CONTRACT UPDATE: the fiat initiation route now responds AT the
+// commit boundary with the deterministic accepted/pending 202 body (see
+// controllers/withdrawalController.js). Dispatch outcomes are recorded in
+// durable state — mirror status, exception rows, ledger unwinds — and are
+// NO LONGER HTTP response codes. These proofs keep asserting the economic
+// invariants (no auto-refund of ambiguous outcomes, exactly-one dispatch,
+// exactly-once reversal) and now read outcomes from the durable state.
 describeOrSkip('r15 R15-D: withdrawal dispatch outcome honesty (real PostgreSQL)', () => {
     let prisma;
     let azm;
@@ -127,10 +134,13 @@ describeOrSkip('r15 R15-D: withdrawal dispatch outcome honesty (real PostgreSQL)
 
         await runWithdrawal(user, { app, res });
 
-        // Honest 202 contract — outcome unresolved, do NOT retry.
+        // r42 WAVE-2: the response is the deterministic accepted/pending body
+        // (byte-identical to any same-key replay); the ambiguous outcome is
+        // visible in DURABLE state below, never in the HTTP body.
         expect(res.statusCode).toBe(202);
-        expect(res.body.code).toBe('DISPATCH_OUTCOME_UNKNOWN');
-        expect(res.body.retryable).toBe(false);
+        expect(res.body.success).toBe(true);
+        expect(res.body.status).toBe('PENDING');
+        expect(res.body.data.reference).toBeTruthy();
 
         // The provider was instructed EXACTLY ONCE — no failover re-instruct.
         expect(provider._calls).toHaveLength(1);
@@ -167,7 +177,7 @@ describeOrSkip('r15 R15-D: withdrawal dispatch outcome honesty (real PostgreSQL)
         await runWithdrawal(user, { app, res });
 
         expect(res.statusCode).toBe(202);
-        expect(res.body.code).toBe('MOOLRE_DUPLICATE_REFERENCE');
+        expect(res.body.success).toBe(true); // accepted/pending — outcome is durable
         expect(provider._calls).toHaveLength(1);
 
         const u = await freshUser(user.id);
@@ -182,12 +192,19 @@ describeOrSkip('r15 R15-D: withdrawal dispatch outcome honesty (real PostgreSQL)
 
         await runWithdrawal(user, { app, res });
 
-        expect(res.body.success).toBe(false);
+        // r42 WAVE-2: the client already holds the accepted/pending response;
+        // the definitive provider rejection unwinds durably (balance restored
+        // EXACTLY once, mirror FAILED) and the client sees the final state on
+        // the withdrawal status surface.
+        expect(res.statusCode).toBe(202);
+        expect(res.body.success).toBe(true);
         const u = await freshUser(user.id);
         expect(Number(u.availableBalance)).toBeCloseTo(START_USDC, 6);
 
         const mirror = await prisma.withdrawal.findFirst({ where: { userId: user.id } });
         expect(mirror.status).toBe('FAILED');
+        const hist = await prisma.transactionHistory.findFirst({ where: { userId: user.id, type: 'WITHDRAWAL_FIAT' } });
+        expect(hist.status).toBe('FAILED');
     });
 
     test('NOT_DISPATCHED: provably safe — ledger unwound exactly once', async () => {

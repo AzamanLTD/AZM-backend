@@ -992,8 +992,12 @@ describeOrSkip('§P.2 withdrawalController.cryptoWithdrawal (real PostgreSQL + r
         const { req, res } = makeReqRes({ userId: user.id, body: { amount: '50', destination: DEST } });
         await withdrawalCtrl.cryptoWithdrawal(req, res);
 
-        expect(res.statusCode).toBe(502);
-        expect(res.payload.message).toMatch(/refunded/i);
+        // r42 WAVE-2: the client already holds the deterministic accepted/pending
+        // 202 from the commit boundary; the definitive provider rejection is
+        // unwound DURABLY (exactly-once refund, execution + ledger FAILED).
+        expect(res.statusCode).toBe(202);
+        expect(res.payload.success).toBe(true);
+        expect(res.payload.status).toBe('PENDING');
         const u = await prisma.user.findUnique({ where: { id: user.id } });
         expect(Number(u.availableBalance)).toBe(500); // full refund
 
@@ -1017,8 +1021,13 @@ describeOrSkip('§P.2 withdrawalController.cryptoWithdrawal (real PostgreSQL + r
         const { req, res } = makeReqRes({ userId: user.id, body: { amount: '50', destination: DEST } });
         await withdrawalCtrl.cryptoWithdrawal(req, res);
 
-        expect([202, 502]).toContain(res.statusCode);
-        expect(res.payload.data.reconciliationRequired).toBe(true);
+        // r42 WAVE-2: the accepted/pending 202 replays on same-key retries;
+        // the AMBIGUOUS outcome is durable below (RECONCILIATION_REQUIRED
+        // execution, reserved ledger, NO auto-refund) — never an HTTP fact.
+        expect(res.statusCode).toBe(202);
+        expect(res.payload.success).toBe(true);
+        expect(res.payload.status).toBe('PENDING');
+        expect(res.payload.data.executionId).toBeTruthy();
         const u = await prisma.user.findUnique({ where: { id: user.id } });
         expect(Number(u.availableBalance)).toBe(450); // debited, NOT refunded — reconciliation decides
         const execution = await prisma.custodyExecution.findFirst({});

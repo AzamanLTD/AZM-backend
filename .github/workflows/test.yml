@@ -94,6 +94,10 @@ jobs:
         # r19: the snapshot columns the Smart Route executors/recovery read.
         # Mirrors the release chain (npm run release) and the migration.
         run: node infra/install-r19-smartroute-execution-snapshot-overlay.js
+      - name: Install r42 financial idempotency overlay
+        # r42: the FinancialOperation claim table behind the Idempotency-Key
+        # financial authority. Mirrors the release chain (npm run release).
+        run: node infra/install-r42-idempotency-overlay.js
 
       - name: Install payout reconciliation infrastructure
         run: node infra/install-payout-reconciliation-infra.js
