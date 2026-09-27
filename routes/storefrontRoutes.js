@@ -636,7 +636,27 @@ router.post('/:businessProfileId/checkout', protect, protectActive, wrap(async (
     }
 
     return order;
+  }).catch(async (err) => {
+    // r42 convergence: a concurrent same-key request won the @unique race on
+    // BusinessOrder.idempotencyKey. The whole transaction (ticket, escrow,
+    // order, product counters) rolled back — replay the winner's order as a
+    // deterministic idempotent success instead of surfacing a 5xx.
+    const isUniqueViolation = err?.code === 'P2002' || /unique constraint/i.test(err?.message || '');
+    if (isUniqueViolation && idempotencyKey) {
+      const winner = await prisma.businessOrder.findUnique({
+        where: { idempotencyKey },
+        select: { id: true, orderRef: true, status: true },
+      });
+      if (winner) {
+        return { idempotentWinner: winner };
+      }
+    }
+    throw err;
   });
+
+  if (result.idempotentWinner) {
+    return res.status(200).json({ success: true, data: { order: result.idempotentWinner, idempotent: true } });
+  }
 
   // Track order event
   try {
@@ -689,9 +709,24 @@ router.post('/:businessProfileId/order', protect, protectActive, wrap(async (req
   const prisma = req.app.get('prisma');
   const { businessProfileId } = req.params;
   const userId = req.user.id;
-  const { productId, quantity = 1, customerNotes, deliveryNotes } = req.body;
+  const { productId, quantity = 1, customerNotes, deliveryNotes, idempotencyKey } = req.body;
 
   if (!productId) return res.status(400).json({ success: false, message: 'productId is required.' });
+
+  // r42 alignment: client-supplied body dedup key (same legacy transport as
+  // the checkout route). Same key → the SAME logical order, never a second
+  // one. The findUnique fast-path plus the @unique constraint on
+  // BusinessOrder.idempotencyKey (checked at create) make this race-proof:
+  // a concurrent duplicate loses on the constraint and converges below.
+  if (idempotencyKey) {
+    const existing = await prisma.businessOrder.findUnique({
+      where: { idempotencyKey },
+      select: { id: true, orderRef: true, status: true },
+    });
+    if (existing) {
+      return res.status(200).json({ success: true, data: { order: existing, idempotent: true } });
+    }
+  }
 
   // Verify business exists and is active
   const business = await prisma.businessProfile.findUnique({
@@ -722,20 +757,38 @@ router.post('/:businessProfileId/order', protect, protectActive, wrap(async (req
   const { v4: uuidv4 } = require('uuid');
   const orderRef = `ORD-${Date.now().toString(36).toUpperCase()}-${uuidv4().slice(0, 6).toUpperCase()}`;
 
-  const order = await prisma.businessOrder.create({
-    data: {
-      businessProfileId,
-      customerId: userId,
-      productId,
-      status: 'AWAITING_PAYMENT',
-      orderRef,
-      title: orderTitle,
-      description: `Storefront order for ${orderTitle}`,
-      amountUsdc: amount,
-      customerNotes: customerNotes ? String(customerNotes).slice(0, 500) : null,
-      deliveryNotes: deliveryNotes ? String(deliveryNotes).slice(0, 500) : null,
-    },
-  });
+  let order;
+  try {
+    order = await prisma.businessOrder.create({
+      data: {
+        businessProfileId,
+        customerId: userId,
+        productId,
+        status: 'AWAITING_PAYMENT',
+        orderRef,
+        title: orderTitle,
+        description: `Storefront order for ${orderTitle}`,
+        amountUsdc: amount,
+        customerNotes: customerNotes ? String(customerNotes).slice(0, 500) : null,
+        deliveryNotes: deliveryNotes ? String(deliveryNotes).slice(0, 500) : null,
+        idempotencyKey: idempotencyKey || null,
+      },
+    });
+  } catch (err) {
+    // Race convergence: a concurrent same-key request committed first — the
+    // unique constraint refused ours. Replay theirs: one logical order.
+    const isUniqueViolation = err?.code === 'P2002' || /unique constraint/i.test(err?.message || '');
+    if (isUniqueViolation && idempotencyKey) {
+      const winner = await prisma.businessOrder.findUnique({
+        where: { idempotencyKey },
+        select: { id: true, orderRef: true, status: true },
+      });
+      if (winner) {
+        return res.status(200).json({ success: true, data: { order: winner, idempotent: true } });
+      }
+    }
+    throw err;
+  }
 
   // Track order event
   try {
