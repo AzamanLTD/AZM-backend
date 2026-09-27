@@ -220,7 +220,15 @@ STATEMENTS.push('ALTER TABLE "BusinessOrder" ADD COLUMN IF NOT EXISTS "cashRecei
 STATEMENTS.push('ALTER TABLE "BusinessOrder" ADD COLUMN IF NOT EXISTS "cashChange" DECIMAL(20,8);');
 // r36/P1: durable per-order inventory-deduction claim marker.
 STATEMENTS.push('ALTER TABLE "BusinessOrder" ADD COLUMN IF NOT EXISTS "inventoryDeductedAt" TIMESTAMP(3);');
-STATEMENTS.push('CREATE UNIQUE INDEX IF NOT EXISTS "BusinessOrder_idempotencyKey_key" ON "BusinessOrder"("idempotencyKey") WHERE "idempotencyKey" IS NOT NULL;');
+// §r42 storefront durable identity (docs/retail-checkout-integrity.md): the
+// legacy GLOBAL key unique is REPLACED by the scoped composite
+// (business + customer + key) with a persisted request fingerprint — the
+// same shape installed by infra/install-retail-checkout-integrity.js at boot.
+// Recreating the global unique here would silently re-widen the identity
+// namespace that the retail integrity contract deliberately scoped.
+STATEMENTS.push('ALTER TABLE "BusinessOrder" ADD COLUMN IF NOT EXISTS "idempotencyRequestHash" VARCHAR(64);');
+STATEMENTS.push('DROP INDEX IF EXISTS "BusinessOrder_idempotencyKey_key";');
+STATEMENTS.push('CREATE UNIQUE INDEX IF NOT EXISTS "BusinessOrder_businessProfileId_customerId_idempotencyKey_key" ON "BusinessOrder"("businessProfileId","customerId","idempotencyKey");');
 
 // DineInTab payment method + idempotency
 // r36/P1: ONE ACTIVE TAB PER TABLE (durable invariant). A non-CLOSED tab

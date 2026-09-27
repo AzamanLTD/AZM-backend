@@ -3403,7 +3403,15 @@ model BusinessOrder {
   createdAt DateTime @default(now())
 
   paymentMethod       String?   @db.VarChar(20) // "AZAMAN_BALANCE" | "CASH" | "SPLIT"
-  idempotencyKey      String?   @unique // client-supplied dedup key for offline sync
+  // §r42 storefront durable identity — docs/retail-checkout-integrity.md +
+  // utils/storefrontOrderIdentity.js. The GLOBAL single-column unique is
+  // REPLACED by the scoped composite (business + customer + key): a client
+  // key was never a safe global identifier (cross-customer addressability,
+  // cross-route/cross-subsystem collisions). The request fingerprint is
+  // persisted for exact replay verification — any materially different
+  // reuse of a key fails closed with 409.
+  idempotencyKey         String? // client-supplied durable key (scoped by the storefront boundary)
+  idempotencyRequestHash String? @db.VarChar(64) // sha256 of the canonical economic request
   cashReceived        Decimal?  @db.Decimal(20, 8) // for CASH payments — actual cash tendered
   cashChange          Decimal?  @db.Decimal(20, 8) // change given back
   // r36/P1: durable marker that recipe inventory was deducted for this order.
@@ -3435,6 +3443,12 @@ model BusinessOrder {
   @@index([businessProfileId, status, createdAt(sort: Desc)])
   @@index([customerId, status, createdAt(sort: Desc)])
   @@index([customerId, createdAt(sort: Desc)])
+  // §r42: one order per (business, customer, key) — matches
+  // prisma/migrations/20260829_retail_checkout_integrity and the boot-time
+  // convergence installer infra/install-retail-checkout-integrity.js, so
+  // `prisma db push` converges to the same shape instead of recreating the
+  // legacy global unique. NULLS DISTINCT keeps keyless rows exempt.
+  @@unique([businessProfileId, customerId, idempotencyKey], map: "BusinessOrder_businessProfileId_customerId_idempotencyKey_key")
 }
 
 // =============================================================================

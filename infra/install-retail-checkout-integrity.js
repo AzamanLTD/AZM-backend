@@ -75,3 +75,25 @@ $$`);
 }
 
 module.exports = { installRetailCheckoutIntegrity };
+
+// CLI entry — mirrors every other infra/install-*.js overlay. REQUIRED so the
+// r39/P0 battery-hermetic restore (r38-overlay-upgrade-path runAllOverlays)
+// and `npm run release` can run this installer the same way as the rest of
+// the set: it spawns `node infra/install-*.js`. Without this entry the file
+// defines and exports the function but installs NOTHING when spawned, so any
+// `prisma db push` restore silently loses the retail integrity column while
+// the retail trigger functions survive — leaving every later order-item
+// insert against a trigger referencing a dropped column (r39/P0 poisoning).
+if (require.main === module) {
+  const { PrismaClient } = require('@prisma/client');
+  const prisma = new PrismaClient();
+  installRetailCheckoutIntegrity(prisma)
+    .then((result) => {
+      console.log(`[install-retail-checkout-integrity] ${result.steps.length} steps ok`);
+    })
+    .catch((err) => {
+      console.error('[install-retail-checkout-integrity] fatal:', err && err.message);
+      process.exitCode = 1;
+    })
+    .finally(() => prisma.$disconnect());
+}

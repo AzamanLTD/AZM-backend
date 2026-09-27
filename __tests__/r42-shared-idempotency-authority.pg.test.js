@@ -1334,6 +1334,13 @@ run('r42 — shared financial idempotency authority (PostgreSQL)', () => {
         const admin = { id: 999999, username: 'r42-admin' };
 
         await prisma.transactionHistory.deleteMany({ where: { txHash: { startsWith: 'ADMIN_CREDIT_999999_' } } });
+        // Same self-cleaning contract for the audit keyspace: the battery
+        // truncates User (sequence reset), so a fresh seedUser can recycle a
+        // small id that a PREVIOUS run of this suite already audited under
+        // this literal admin. On a long-lived database those stale rows
+        // would make the exact-count assertions below lie (CI's fresh DB
+        // never sees them, but local batteries do).
+        await prisma.adminSettingsAuditLog.deleteMany({ where: { adminId: admin.id } });
 
         const drive = makeAdminCreditDriver({ userId, admin });
         const balance = async () => Number((await prisma.user.findUnique({ where: { id: userId }, select: { availableBalance: true } })).availableBalance);
