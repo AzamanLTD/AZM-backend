@@ -1215,11 +1215,13 @@ run('r42 — shared financial idempotency authority (PostgreSQL)', () => {
         let bal = await balances(userId);
         expect(bal.ghs).toBeCloseTo(1000, 8);
 
-        const op = await prisma.financialOperation.findUnique({
-            where: { userId_endpoint_key: { userId, endpoint: 'POST /api/multi-currency/convert', key: 'mc-3' } },
-        });
-        // RELEASE policy: the provably-not-committed claim was released
-        expect(op).toBeNull();
+        // RELEASE policy: the provably-not-committed claim was released.
+        // The middleware's post-response disposition is deliberately
+        // fire-and-forget AFTER the wire response (never delay the wire), so
+        // observe the CONVERGENCE of the claim row instead of racing the
+        // bookkeeping delete — bounded DB polling, same as P10.
+        const ops = await waitForClaim(userId, 'POST /api/multi-currency/convert', 'mc-3', 'RELEASED');
+        expect(ops.length).toBe(0);
 
         // retry with the SAME key executes once — money moved exactly once
         const retry = await driveConvert({ userId, key: 'mc-3', body });
