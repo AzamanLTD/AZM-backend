@@ -513,3 +513,56 @@ converges across simulated process death; per-status disposition; the
 cross-instance A/B scenario over real HTTP headers). The wire contract
 with this document is unchanged: one instance, one key, one
 `Idempotency-Key` header, same-value `clientRequestId` overwrite.
+
+### 10.7 — Close-out review (2026-09-27): exact-instance process-death recovery
+
+The independent close-out review verified the v2 registry and all CI
+evidence (frontend main 4214987, backend main 8b8efbe, PR #96 merged, no
+open PRs, all gates green) but rejected closing r42: the frontend's
+AUTOMATIC recovery rule — `adoptPending()` adopts the newest unfinished
+operation of a type — could bind the WRONG instance. With an older
+operation A (K1, response lost) and a newer operation B (K2, response
+lost) both outstanding, it bound B; the user's reconstruction of A then
+failed the fingerprint check and opened a THIRD instance C (K3),
+orphaning A's key. The instance model fixed the storage collision but
+the recovery selector could still lose an earlier operation's identity.
+
+Fix (frontend PR #97, from main, intentionally left unmerged for
+independent review):
+
+- The newest-adoption rule is DELETED. Recovery identifies the
+  operation INSTANCE, never merely its TYPE:
+  `DurableOperationRegistry.recoverExact(account, type, request)`
+  selects pending instances whose recorded fingerprint EXACTLY matches
+  the reconstructed request, returning DurableRecoveryNone /
+  DurableRecoveryUnique / DurableRecoveryAmbiguous. Ambiguity FAILS
+  CLOSED — the candidates are presented and the user picks; no
+  newest/oldest heuristic. Failed and ambiguous lookups mutate nothing.
+- In-session armed refs remain the authoritative exact-instance path;
+  recoverExact is only for binding a ref after process death.
+- `WithdrawalScreen` recovers at submit time against the reconstructed
+  request (with an explicit ambiguity dialog); a new Security-settings
+  "Unfinished Financial Operations" surface lists every pending instance
+  account-scoped and resumes one by replaying its STORED snapshot via
+  `ApiClient.retryRecovered` under its ORIGINAL key — the universal
+  post-death path for all 24 `postFinancial` call sites.
+- Regression proofs pin the reviewer's exact lifecycle at registry and
+  wire level: A=50/K1 and B=75/K2 both lose responses, full process
+  death, reconstruction recovers A (NOT B — B is newer and must not
+  win), retry sends K1, B stays pending with K2, then B recovers with
+  K2, and NO third key is ever minted; identical bodies (two deposits
+  of 10) are ambiguous and fail closed, each independently retryable by
+  explicit instance id.
+- Cross-repo caller audit + the SharedPreferences snapshot threat-model
+  review (plaintext app-private storage; transient until terminal
+  retirement; contained migration path to Keystore/Keychain-backed
+  storage before real-user onboarding) are documented in the frontend
+  repo at `docs/r42-process-death-recovery.md`.
+
+No backend change: the flaw was purely client-side recovery selection.
+The backend wire contract (one instance, one key, one Idempotency-Key
+header, same-value clientRequestId overwrite) and the authority are
+unchanged; backend financial-durability (32/32) and the full Test Suite
+are green on 8b8efbe as independently verified by the review. r42 is
+NOT declared closed until PR #97's application-level process-death
+recovery is independently verified.
