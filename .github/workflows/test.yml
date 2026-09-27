@@ -117,6 +117,15 @@ jobs:
       - name: Install business OS overlay
         run: node infra/install-business-os-overlay.js
 
+      - name: Install retail checkout integrity overlay
+        # Retail checkout convergence (BusinessOrderItem stockReserved/variants,
+        # the storefront checkout identity). CI's disposable db-push database
+        # only carries what prisma/schema.prisma declares, so without this
+        # step the retail columns are missing and the checkout finalization
+        # UPDATE fails into a durable 503. Mirrors the production autoRelease
+        # chain, which converges this same installer after every db-push.
+        run: node infra/install-retail-checkout-integrity.js
+
       - name: Install inventory restock authority
         run: node infra/install-inventory-restock-overlay.js
 
