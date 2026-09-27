@@ -456,10 +456,16 @@ converges to one execution in both orders; divergent body under a reused key
 is refused; distinct keys stay independent. The authority is not weakened —
 the alias gains it.
 
-### 10.5 — Open item carried forward (frontend durability)
+### 10.5 — Cross-repo item closed (frontend durability landed)
 
-The companion frontend PR carries the client half of this contract
-(Idempotency-Key per logical action on every financial mutation). The
-cross-repo audit requires the client key to survive app/screen/process
-recreation before the pair deploys; that work is tracked in the frontend
-repository and does not affect any statement in this document.
+The client half of this contract is deployed: AZM-frontend commit
+`b81b978` ("durable financial operation registry — the retry horizon is
+the device, not the process", main, android CI green). The frontend now
+persists the pending logical action (key + endpoint + canonical
+fingerprint) in durable storage BEFORE the first request, so the armed
+key survives screen recreation and full process death; the disposition
+contract mirrors this document (2xx / definitive pre-economic 4xx
+retire; 401/409/429, 5xx and network loss retain the same key). The
+audit's ten required client proofs are pinned in
+`test/utils/durable_action_registry_test.dart` (22/22 green). The
+cross-repo durability loop is closed end-to-end.
