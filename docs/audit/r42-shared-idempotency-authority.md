@@ -469,3 +469,47 @@ retire; 401/409/429, 5xx and network loss retain the same key). The
 audit's ten required client proofs are pinned in
 `test/utils/durable_action_registry_test.dart` (22/22 green). The
 cross-repo durability loop is closed end-to-end.
+
+### 10.6 — Frontend registry v2: the operation-INSTANCE model (2026-09-27)
+
+Independent review of the v1 frontend `DurableActionRegistry` found a
+remaining correctness flaw in its slot model: v1 stored ONE pending entry
+per logical-action id, so a broad/static id ("withdrawal.fiat") could only
+have ONE outstanding operation. Two failure modes followed:
+
+- **Lost outstanding operation** — A is armed with K1, the response is
+  lost (A may have committed server-side); before A resolves, a genuinely
+  new B of the same type starts; v1 saw a different fingerprint and
+  REPLACED A's entry. The device lost K1 — A's durable identity was gone.
+- **Collapsing distinct operations** — two genuinely separate operations
+  of the same type with the same body converged on the one slot and
+  received the SAME key: two user intentions, one identity.
+
+The fix is one level of structure the v1 model lacked:
+**operation TYPE ≠ operation INSTANCE.** The frontend registry
+(`lib/utils/durable_operation_registry.dart`, AZM-frontend main,
+`DurableOperationRegistry`) now gives every genuinely new financial
+action its own durable INSTANCE record — unique operationId + fresh key,
+persisted before the first request leaves the device — and supports
+multiple outstanding instances of the same type simultaneously.
+`retry(instanceId)` returns the SAME key only for the SAME instance with
+a matching fingerprint and fails closed otherwise; `retire(instanceId)`
+removes that instance only; recovery (`pending`) enumerates every
+unfinished instance, never "the" pending one. Callers hold a
+`FinancialOperationRef` (per-flow retry handle); after process death,
+`adoptPending` re-binds a flow to the newest unfinished instance of its
+type so a same-body resubmit resumes THAT instance instead of opening a
+duplicate. `postFinancial` owns the disposition as before (2xx and
+definitive pre-economic 4xx retire the instance; 401/409/429, 5xx and
+network loss retain it).
+
+The reviewer's most important scenario is pinned at both layers — A=50
+times out, B=75 begins, then A is retried: the retry MUST send A's
+original key, never B's, never a fresh one — in
+`test/utils/durable_operation_registry_test.dart` (reviewer proofs 1–17,
+persistence invariant, corruption fail-safety) and
+`test/services/api_client_idempotency_test.dart` (wire-level: same ref
+converges across simulated process death; per-status disposition; the
+cross-instance A/B scenario over real HTTP headers). The wire contract
+with this document is unchanged: one instance, one key, one
+`Idempotency-Key` header, same-value `clientRequestId` overwrite.
