@@ -566,3 +566,43 @@ unchanged; backend financial-durability (32/32) and the full Test Suite
 are green on 8b8efbe as independently verified by the review. r42 is
 NOT declared closed until PR #97's application-level process-death
 recovery is independently verified.
+
+## §10.8 Close-out review 2 — client hardening pass (2026-09-27, frontend PR #98)
+
+The independent review confirmed PR #97's newest-adoption fix but found
+four additional issues, all CLIENT-SIDE (no backend change required).
+Fixes live in frontend PR #98 (branch `fix/r42-recovery-hardening`,
+based on main 4214987, intentionally left OPEN pending another
+independent audit; supersedes PR #97):
+
+1. **P0 — Exact-only recovery path.** `retryRecovered` previously
+   delegated to `postFinancial`, whose "missing ref means a genuinely new
+   action" semantics could silently mint a new key when the selected
+   instance retired between listing and retry. New
+   `postFinancialRecovered` is exact-only: stale instance, wrong account,
+   fingerprint mismatch, missing fresh secrets, non-replay-safe snapshot
+   → throw with ZERO wire requests; it never `begin()`s, never mints a
+   key, never replaces the instance.
+2. **P0 — Secrets never persisted.** Storefront escrow funding was
+   persisting password + TOTP in the SharedPreferences durable snapshot.
+   `begin()` now strips a `secretFieldsDenylist`; fingerprints are
+   computed over the economic view (secrets excluded) so recovered
+   retries with FRESH credentials converge on the ORIGINAL key; the
+   recovery surface gathers fresh values in-memory only.
+3. **P1 — Snapshot == exact non-secret wire request.** Escrow disputes
+   now store reason + evidence; identity-field placeholders make friend
+   fund requests and storefront checkouts byte-identically replayable;
+   synthetic cart-fingerprint snapshots are `replaySafe:false` (generic
+   replay throws; recovery happens in-flow via `recoverExact`).
+4. **P1 — Fail-closed account namespace.** `operationAccount(failClosed)`
+   throws instead of silently pivoting to 'anon' on secure-storage
+   failure — a user's pending keys can never become invisible while a
+   substitute namespace mints fresh ones. Plus safe (non-secret) recovery
+   summaries for human disambiguation.
+
+Wire contract unchanged: every retry of an instance still carries the
+same Idempotency-Key, and the backend's keyless-request rejection remains
+the structural backstop. r42 is NOT declared closed; the review demanded
+another independent audit before merge.
+
+**Status: pass 2 implemented in PR #98, awaiting independent audit.**
