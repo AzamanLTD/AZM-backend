@@ -562,7 +562,13 @@ describeOrSkip('§P.4 authoritative liability ledger (real PostgreSQL)', () => {
     // ═════════════════════════════════════════════════════════════════════════
     describe('15, 17. fiat withdrawal lifecycle: provider-settlement-safe, exact reserve/settle/reverse', () => {
         async function seedFinanceSettings() {
-            await prisma.globalSettings.create({ data: { id: 1 } });
+            // Converge instead of create: a concurrent upsert landing in
+            // the truncate→seed window must not fail this suite's setup.
+            await prisma.globalSettings.upsert({
+                where: { id: 1 },
+                update: {},
+                create: { id: 1 },
+            });
             await prisma.globalSettings.update({
                 where: { id: 1 },
                 data: { liveRetailRate: '15.5', liveRateSource: 'TEST', lastExternalSync: new Date() },

@@ -6,7 +6,9 @@ This document records the contract implemented by the accumulated retail checkou
 
 `POST /api/storefront/:businessProfileId/checkout` remains the canonical order-creation endpoint. The integrity boundary is mounted immediately before the existing storefront router so the existing pricing, escrow, notification, analytics, and order transaction remain the single financial implementation.
 
-Production checkout is fail-closed until the boot-time schema convergence guard reports ready. This matters because the deployed environment currently uses `prisma db push`; the Prisma schema can otherwise recreate the legacy global idempotency uniqueness constraint after an additive migration.
+`POST /api/storefront/:businessProfileId/order` (single-item legacy endpoint) is mounted under the same boundary with the same contract: scoped key, exact request fingerprint (`productId`, `quantity`, notes), 409 on any materially different key reuse. The single-item fingerprint lives in `utils/storefrontOrderIdentity.js` alongside the shared scoped-key and lookup primitives.
+
+Production checkout is fail-closed until the boot-time schema convergence guard reports ready. The Prisma schema now declares the authoritative shape itself (`BusinessOrder.idempotencyRequestHash` + the scoped composite unique), so `prisma db push` converges to the identity contract directly instead of recreating the legacy global idempotency uniqueness constraint; the convergence installer remains in place as a self-healing mirror.
 
 ### Request
 
@@ -37,7 +39,7 @@ Client keys are never used as global identifiers. The boundary derives a server-
 
 A request fingerprint covers product IDs, quantities, notes, variants, payment mode, and checkout notes. Reusing the same key with different cart contents returns `409` instead of silently replaying the wrong order.
 
-The migration enforces a database-level composite uniqueness constraint on `(businessProfileId, customerId, idempotencyKey)`. If concurrent requests race, the legacy transaction's unique violation is converted back into an idempotent response after the losing transaction has rolled back.
+The migration (and now the Prisma schema) enforces a database-level composite uniqueness constraint on `(businessProfileId, customerId, idempotencyKey)`. The single-item `/order` endpoint stores the same scoped identity, so a client key sent to both storefront order endpoints addresses one logical namespace: cross-route reuse with different payload always fails closed (409). If concurrent requests race, the legacy transaction's unique violation is converted back into an idempotent response after the losing transaction has rolled back.
 
 The runtime convergence installer repeats the critical DDL after `db push`, and the readiness gate blocks checkout until that installer succeeds. This prevents a partially converged production database from accepting financial checkout traffic.
 

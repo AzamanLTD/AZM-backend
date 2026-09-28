@@ -18,7 +18,32 @@ const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 
 const storefrontService = require('../services/storefrontService');
 const storefrontPublishSafeService = require('../services/storefrontPublishSafeService');
 const renderService = require('../services/storefrontRenderService');
+const {
+  checkoutFingerprint,
+  orderFingerprint,
+  findExistingByScopedKey,
+  isExactReplay,
+} = require('../utils/storefrontOrderIdentity');
 const { saveDraftSchema, applyTemplateSchema, revertSchema } = require('../services/validation/storefrontSchemas');
+
+
+// §r42 storefront durable identity (docs/retail-checkout-integrity.md).
+// The identity boundary mounted upstream scopes the client key to
+// (business, customer, key); these helpers keep the legacy handlers
+// composite-safe and fingerprint-aware even if reached without it: the
+// lookup is ALWAYS scoped to the authenticated customer + business, and a
+// convergence/replay is exact ONLY when the persisted request fingerprint
+// matches THIS request — any material difference fails closed with 409.
+function storefrontReplayOrConflict(res, existing, requestHash) {
+  if (isExactReplay(existing, requestHash)) {
+    const { idempotencyRequestHash, ...order } = existing;
+    return res.status(200).json({ success: true, data: { order, idempotent: true } });
+  }
+  return res.status(409).json({
+    success: false,
+    message: 'This order idempotency key was already used for a different request.',
+  });
+}
 
 function wrap(handler) {
   return async (req, res) => {
@@ -470,14 +495,17 @@ router.post('/:businessProfileId/checkout', protect, protectActive, wrap(async (
     return res.status(400).json({ success: false, message: 'Maximum 50 items per order.' });
   }
 
-  // Idempotency check
+  // §r42 scoped + fingerprint-aware replay (docs/retail-checkout-integrity.md):
+  // the mounted boundary scopes the key upstream; scoped to the authenticated
+  // customer + business here, exact fingerprint verified before any replay.
+  const checkoutRequestHash = checkoutFingerprint(req.body);
   if (idempotencyKey) {
-    const existing = await prisma.businessOrder.findUnique({
-      where: { idempotencyKey },
-      select: { id: true, orderRef: true, status: true },
+    const existing = await prisma.businessOrder.findFirst({
+      where: { businessProfileId, customerId: userId, idempotencyKey },
+      select: { id: true, orderRef: true, status: true, idempotencyRequestHash: true },
     });
     if (existing) {
-      return res.status(200).json({ success: true, data: { order: existing, idempotent: true } });
+      return storefrontReplayOrConflict(res, existing, checkoutRequestHash);
     }
   }
 
@@ -615,6 +643,7 @@ router.post('/:businessProfileId/checkout', protect, protectActive, wrap(async (
         customerNotes: customerNotes ? String(customerNotes).slice(0, 500) : null,
         deliveryNotes: deliveryNotes ? String(deliveryNotes).slice(0, 500) : null,
         idempotencyKey: idempotencyKey || null,
+        idempotencyRequestHash: idempotencyKey ? checkoutRequestHash : null,
         escrowId,
         ticketId,
         items: {
@@ -637,25 +666,36 @@ router.post('/:businessProfileId/checkout', protect, protectActive, wrap(async (
 
     return order;
   }).catch(async (err) => {
-    // r42 convergence: a concurrent same-key request won the @unique race on
-    // BusinessOrder.idempotencyKey. The whole transaction (ticket, escrow,
-    // order, product counters) rolled back — replay the winner's order as a
-    // deterministic idempotent success instead of surfacing a 5xx.
+    // r42 convergence: a concurrent request with the SAME durable identity
+    // (business + customer + key) won the composite unique race. The whole
+    // transaction (ticket, escrow, order, product counters) rolled back —
+    // converge on the winner ONLY if it is an exact replay of THIS request;
+    // a materially different winner fails closed (409), never a 5xx and
+    // never a silent convergence onto the wrong order.
     const isUniqueViolation = err?.code === 'P2002' || /unique constraint/i.test(err?.message || '');
     if (isUniqueViolation && idempotencyKey) {
-      const winner = await prisma.businessOrder.findUnique({
-        where: { idempotencyKey },
-        select: { id: true, orderRef: true, status: true },
+      const winner = await prisma.businessOrder.findFirst({
+        where: { businessProfileId, customerId: userId, idempotencyKey },
+        select: { id: true, orderRef: true, status: true, idempotencyRequestHash: true },
       });
       if (winner) {
-        return { idempotentWinner: winner };
+        if (isExactReplay(winner, checkoutRequestHash)) {
+          return { idempotentWinner: winner };
+        }
+        return { idempotencyConflict: winner };
       }
     }
     throw err;
   });
 
   if (result.idempotentWinner) {
-    return res.status(200).json({ success: true, data: { order: result.idempotentWinner, idempotent: true } });
+    return storefrontReplayOrConflict(res, result.idempotentWinner, checkoutRequestHash);
+  }
+  if (result.idempotencyConflict) {
+    return res.status(409).json({
+      success: false,
+      message: 'This checkout idempotency key was already used for different cart contents.',
+    });
   }
 
   // Track order event
@@ -713,18 +753,14 @@ router.post('/:businessProfileId/order', protect, protectActive, wrap(async (req
 
   if (!productId) return res.status(400).json({ success: false, message: 'productId is required.' });
 
-  // r42 alignment: client-supplied body dedup key (same legacy transport as
-  // the checkout route). Same key → the SAME logical order, never a second
-  // one. The findUnique fast-path plus the @unique constraint on
-  // BusinessOrder.idempotencyKey (checked at create) make this race-proof:
-  // a concurrent duplicate loses on the constraint and converges below.
+  const requestHash = orderFingerprint(req.body);
   if (idempotencyKey) {
-    const existing = await prisma.businessOrder.findUnique({
-      where: { idempotencyKey },
-      select: { id: true, orderRef: true, status: true },
+    const existing = await prisma.businessOrder.findFirst({
+      where: { businessProfileId, customerId: userId, idempotencyKey },
+      select: { id: true, orderRef: true, status: true, idempotencyRequestHash: true },
     });
     if (existing) {
-      return res.status(200).json({ success: true, data: { order: existing, idempotent: true } });
+      return storefrontReplayOrConflict(res, existing, requestHash);
     }
   }
 
@@ -772,19 +808,23 @@ router.post('/:businessProfileId/order', protect, protectActive, wrap(async (req
         customerNotes: customerNotes ? String(customerNotes).slice(0, 500) : null,
         deliveryNotes: deliveryNotes ? String(deliveryNotes).slice(0, 500) : null,
         idempotencyKey: idempotencyKey || null,
+        idempotencyRequestHash: idempotencyKey ? requestHash : null,
       },
     });
   } catch (err) {
-    // Race convergence: a concurrent same-key request committed first — the
-    // unique constraint refused ours. Replay theirs: one logical order.
+    // Race convergence: a concurrent request with the SAME durable identity
+    // (business + customer + key) committed first — the composite unique
+    // refused ours. Converge ONLY if the winner is an exact replay of THIS
+    // request (fingerprint match); a materially different winner fails
+    // closed with 409, never a silent convergence onto the wrong order.
     const isUniqueViolation = err?.code === 'P2002' || /unique constraint/i.test(err?.message || '');
     if (isUniqueViolation && idempotencyKey) {
-      const winner = await prisma.businessOrder.findUnique({
-        where: { idempotencyKey },
-        select: { id: true, orderRef: true, status: true },
+      const winner = await prisma.businessOrder.findFirst({
+        where: { businessProfileId, customerId: userId, idempotencyKey },
+        select: { id: true, orderRef: true, status: true, idempotencyRequestHash: true },
       });
       if (winner) {
-        return res.status(200).json({ success: true, data: { order: winner, idempotent: true } });
+        return storefrontReplayOrConflict(res, winner, requestHash);
       }
     }
     throw err;

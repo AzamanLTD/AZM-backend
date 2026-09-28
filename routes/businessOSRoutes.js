@@ -4124,8 +4124,13 @@ router.post('/sync-outbox', requirePermission('orders.manage'), wrap(async (req,
         
         try {
             if (type === 'create_order') {
-                // Check if already processed
-                const existing = await prisma.businessOrder.findUnique({ where: { idempotencyKey } });
+                // Check if already processed — scoped to this business's
+                // outbox (§r42: the durable identity is business + customer +
+                // key; a colliding POS action id from ANOTHER business's
+                // outbox is never silently swallowed as "already processed").
+                const existing = await prisma.businessOrder.findFirst({
+                    where: { idempotencyKey, businessProfileId: bpId },
+                });
                 if (existing) {
                     results.push({ id: idempotencyKey, status: 'SYNCED', message: 'Already processed' });
                     continue;

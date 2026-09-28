@@ -47,11 +47,24 @@ initReadReplica();
 
 const OracleService = require('../../services/oracleService');
 const marketOracle = new OracleService(prisma);
-marketOracle.startOracle();
 
 const GatewayService = require('../../services/gatewayService');
 const gatewayService = new GatewayService(prisma);
-gatewayService.startRateSync();
+
+// The rate-sync lanes (oracle + gateway) are process-global intervals that
+// upsert the GlobalSettings singleton on every tick, plus an unawaited
+// initial fetch. Jest sets NODE_ENV=test and runs EVERY suite in one
+// process, so once any test requires this wiring the lanes keep firing for
+// the rest of the run and their unawaited upserts land inside unrelated
+// suites' truncate/seed windows (run 36337995386: one landed between
+// r42-trade-initiation's TRUNCATE and its seed → unique-violation → the
+// whole job red; run 36310961290 hit the same leak in r21/r42-shared).
+// Tests drive these services' methods directly and never need the pollers;
+// the instances stay wired so composition proofs (r16b) are unaffected.
+if (process.env.NODE_ENV !== 'test') {
+    marketOracle.startOracle();
+    gatewayService.startRateSync();
+}
 
 // Moolre is the primary fiat disbursement provider.
 const MoolreDisbursementService = require('../../services/moolreDisbursementService');

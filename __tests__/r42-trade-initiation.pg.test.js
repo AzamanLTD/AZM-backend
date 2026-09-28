@@ -50,7 +50,13 @@ run('r42 — trade initiation idempotency regression (PostgreSQL)', () => {
         await prisma.$executeRawUnsafe(
             'TRUNCATE TABLE "FinancialOperation", "Trade", "TradeQueue", "Ad", "GlobalSettings", "TransactionHistory", "User" RESTART IDENTITY CASCADE'
         );
-        await prisma.globalSettings.create({ data: { id: 1 } });
+        // Converge instead of create: a concurrent upsert landing in
+        // the truncate→seed window must not fail this suite's setup.
+        await prisma.globalSettings.upsert({
+            where: { id: 1 },
+            update: {},
+            create: { id: 1 },
+        });
     });
 
     // ── Harness ─────────────────────────────────────────────────────────────

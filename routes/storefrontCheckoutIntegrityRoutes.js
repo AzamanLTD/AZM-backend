@@ -1,6 +1,5 @@
 'use strict';
 
-const crypto = require('crypto');
 const { Prisma } = require('@prisma/client');
 const router = require('express').Router();
 const { protect } = require('../middleware/authMiddleware');
@@ -10,51 +9,16 @@ const {
   configuredUnitPrice,
   normalizedSelection,
 } = require('../services/storefrontProductConfigurationService');
+const {
+  scopedIdempotencyKey,
+  checkoutFingerprint,
+  orderFingerprint,
+  findExistingByScopedKey,
+} = require('../utils/storefrontOrderIdentity');
 
 const ORDER_STATUSES = new Set([
   'AWAITING_PAYMENT', 'PAID', 'DELIVERED', 'COMPLETED', 'DISPUTED', 'REFUNDED', 'CANCELLED',
 ]);
-
-function stableJson(value) {
-  if (value === null || typeof value !== 'object') return JSON.stringify(value);
-  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
-  return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${stableJson(value[key])}`).join(',')}}`;
-}
-
-function sha256(value) {
-  return crypto.createHash('sha256').update(value).digest('hex');
-}
-
-function scopedIdempotencyKey(businessProfileId, userId, clientKey) {
-  return `v1:${businessProfileId}:${userId}:${sha256(String(clientKey)).slice(0, 48)}`;
-}
-
-function checkoutFingerprint(body) {
-  return sha256(stableJson({
-    items: (body.items || []).map(item => ({
-      productId: item.productId,
-      quantity: item.quantity,
-      notes: item.notes ?? null,
-      variants: item.variants ?? {},
-    })),
-    customerNotes: body.customerNotes ?? null,
-    deliveryNotes: body.deliveryNotes ?? null,
-    paymentMode: String(body.paymentMode || 'DIRECT').toUpperCase(),
-  }));
-}
-
-async function findExistingByScopedKey(prisma, businessProfileId, customerId, idempotencyKey) {
-  if (!idempotencyKey) return null;
-  const rows = await prisma.$queryRaw`
-    SELECT id, "orderRef", status, "idempotencyRequestHash"
-    FROM "BusinessOrder"
-    WHERE "businessProfileId" = ${businessProfileId}
-      AND "customerId" = ${customerId}
-      AND "idempotencyKey" = ${idempotencyKey}
-    LIMIT 1
-  `;
-  return rows[0] || null;
-}
 
 async function attachVariantSnapshots(prisma, order) {
   if (!order || !Array.isArray(order.items) || order.items.length === 0) return order;
@@ -318,6 +282,93 @@ router.post('/:businessProfileId/checkout', protect, protectActive, async (req, 
         }
       } catch (err) {
         return persistenceFailure(res, originalStatus, originalJson, req.app.get('logger'), err);
+      }
+      return originalJson(payload);
+    };
+
+    return next();
+  } catch (err) {
+    return next(err);
+  }
+});
+
+// POST /api/storefront/:businessProfileId/order — single-item storefront
+// order under the SAME durable identity boundary as /checkout
+// (docs/retail-checkout-integrity.md): the client key is scoped to
+// (business, customer, key) and every replay/convergence path compares the
+// exact request fingerprint — identical requests replay the same logical
+// order; ANY materially different reuse of a key fails closed with 409.
+// On a miss the request falls through to the legacy handler with the key
+// already scoped, and the response wrapper persists the request fingerprint
+// on the created order.
+router.post('/:businessProfileId/order', protect, protectActive, async (req, res, next) => {
+  try {
+    const prisma = req.app.get('prisma');
+    const { businessProfileId } = req.params;
+    const userId = req.user.id;
+    const body = req.body || {};
+
+    if (!body.productId) {
+      return res.status(400).json({ success: false, message: 'productId is required.' });
+    }
+
+    const clientKey = body.idempotencyKey == null ? null : String(body.idempotencyKey).trim();
+    const idempotencyKey = clientKey ? scopedIdempotencyKey(businessProfileId, userId, clientKey) : null;
+    const requestHash = orderFingerprint(body);
+
+    if (idempotencyKey) {
+      const existing = await findExistingByScopedKey(prisma, businessProfileId, userId, idempotencyKey);
+      if (existing) {
+        if (existing.idempotencyRequestHash && existing.idempotencyRequestHash !== requestHash) {
+          return res.status(409).json({ success: false, message: 'This order idempotency key was already used for a different request.' });
+        }
+        const order = await prisma.businessOrder.findUnique({
+          where: { id: existing.id },
+          select: { id: true, orderRef: true, status: true },
+        });
+        return res.status(200).json({ success: true, data: { order, idempotent: true } });
+      }
+    }
+
+    req.body = { ...body, ...(idempotencyKey ? { idempotencyKey } : {}) };
+
+    let statusCode = 200;
+    const originalStatus = res.status.bind(res);
+    const originalJson = res.json.bind(res);
+    res.status = code => {
+      statusCode = code;
+      return originalStatus(code);
+    };
+    res.json = async payload => {
+      try {
+        if (statusCode === 400 && idempotencyKey && typeof payload?.message === 'string' && payload.message.includes('idempotencyKey')) {
+          const existing = await findExistingByScopedKey(prisma, businessProfileId, userId, idempotencyKey);
+          if (existing) {
+            if (existing.idempotencyRequestHash && existing.idempotencyRequestHash !== requestHash) {
+              originalStatus(409);
+              return originalJson({ success: false, message: 'This order idempotency key was already used for a different request.' });
+            }
+            const order = await prisma.businessOrder.findUnique({
+              where: { id: existing.id },
+              select: { id: true, orderRef: true, status: true },
+            });
+            originalStatus(200);
+            return originalJson({ success: true, data: { order, idempotent: true } });
+          }
+        }
+
+        const order = payload?.data?.order;
+        if (payload?.success && order?.id && idempotencyKey) {
+          await prisma.$executeRaw`
+            UPDATE "BusinessOrder"
+            SET "idempotencyRequestHash" = ${requestHash}
+            WHERE id = ${order.id}
+              AND "businessProfileId" = ${businessProfileId}
+              AND "customerId" = ${userId}
+          `;
+        }
+      } catch (err) {
+        req.app.get('logger')?.error?.({ err }, 'Storefront order idempotency persistence failed');
       }
       return originalJson(payload);
     };
