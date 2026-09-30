@@ -51,14 +51,14 @@ remaining work. Treat this as an ongoing standing checklist, not a one-time pass
 |--------|------|-------|
 | ✅ | Route-level code splitting | All 41 pages lazy-loaded via `React.lazy` + `Suspense` — 109 chunks, main bundle is shared vendor only |
 | ✅ | Query caching | TanStack Query with staleTime + retry on all data fetches |
-| 🔲 | List virtualization | Orders, employees, inventory, notifications need virtualization at real volume (400+ rooms, 6+ months of orders) |
+| ✅ | List virtualization | `VirtualizedList`/`VirtualizedGrid` (`@tanstack/react-virtual`, business-portal `components/instrument/`) wired into Employees grid (3-col, virtualized rows) and Messages conversations; Orders kanban/table remains paged for now |
 
 ## Polish (Enterprise Tier)
 
 | Status | Item | Notes |
 |--------|------|-------|
 | ✅ | In-app "What's New" / changelog | `changelogController.js` — Changelog + ChangelogView models, 8 endpoints (user list/unread-count/dismiss/dismiss-all + admin CRUD), per-user seen tracking, 22 tests |
-| 🔲 | Guided product tour | `react-joyride` for first-time users of major sections |
+| ✅ | Guided product tour | `ProductTour.jsx` (business-portal `components/instrument/`) — react-joyride tours for Dashboard, Orders, Employees, auto-runs once per surface keyed off the route, localStorage completion tracking, steps filtered to mounted `data-tour` anchors |
 | ✅ | Sandbox/demo mode (realistic seeded data) | `prisma/seed-demo.js` — 529 lines, 3 business verticals (hotel/restaurant/transit), 20 rooms, 6 menu items, 4 transit routes, 5 employees, 5 customers, reviews, notifications, changelog. Run with `npm run seed:demo` |
 | ✅ | Dark/light theme consistency | Pre-paint script, CSS vars throughout, toast theme wired |
 | ✅ | Onboarding checklist | `OnboardingChecklist.jsx` component with progress tracking |
