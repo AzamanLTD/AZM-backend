@@ -30,7 +30,7 @@ const _genRef = () => 'TRN-' + crypto.randomBytes(4).toString('hex').toUpperCase
 // =============================================================================
 const bookSeats = async (prisma, {
     tripId, customerId, seatIds, passengerNames,
-    customerNote, businessProfileId
+    customerNote, businessProfileId, financialOperation = null
 }) => {
     if (!tripId) throw new Error('tripId is required.');
     if (!customerId) throw new Error('customerId is required.');
@@ -91,9 +91,12 @@ const bookSeats = async (prisma, {
 
     // 6. Create the booking + seats atomically
     const bookingRef = _genRef();
-    let booking;
+    // The $transaction returns the COMPLETE wire response (built in-tx so the
+    // committed claim's responseBody is byte-identical to what the controller
+    // res.json()s).
+    let response;
     try {
-        booking = await prisma.$transaction(async (tx) => {
+        response = await prisma.$transaction(async (tx) => {
             // Create the booking
             const b = await tx.transitBooking.create({
                 data: {
@@ -126,7 +129,34 @@ const bookSeats = async (prisma, {
                 data: { availableSeats: { decrement: seatIds.length } }
             });
 
-            return b;
+            // §r42 WIRED CLAIM (transit booking identity, 2026-10-01): the
+            // durable idempotency identity commits WITH the booking, inside
+            // the SAME transaction. Booking committed ⇒ claim COMMITTED
+            // (replay returns this exact response); transaction rolled back
+            // ⇒ the claim never becomes replayable (no phantom identity).
+            // The stored responseBody is the serialized WIRE text of the
+            // object the controller res.json()s — the replay is byte-identical
+            // (key order preserved; Prisma Decimal via toJSON → string).
+            const response = { success: true, booking: b, seatIds, totalFare };
+            if (financialOperation) {
+                const committed = await tx.financialOperation.updateMany({
+                    where: { id: financialOperation.id, status: 'IN_PROGRESS' },
+                    data: {
+                        status: 'COMMITTED',
+                        statusCode: 201,
+                        responseBody: JSON.stringify(response),
+                    },
+                });
+                if (committed.count !== 1) {
+                    // The claim is not ours to complete — treat as an
+                    // operation-state conflict and roll the booking back.
+                    const err = new Error('Idempotency operation state conflict.');
+                    err.code = 'IDEMPOTENCY_STATE_CONFLICT';
+                    throw err;
+                }
+            }
+
+            return response;
         });
     } catch (err) {
         // P2002 = unique constraint violation — seat was raced by another customer
@@ -136,7 +166,9 @@ const bookSeats = async (prisma, {
         throw err;
     }
 
-    return { success: true, booking, seatIds, totalFare };
+    // Built inside the transaction (byte-identical to the stored claim
+    // responseBody when the request was keyed).
+    return response;
 };
 
 // =============================================================================

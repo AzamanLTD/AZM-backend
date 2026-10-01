@@ -122,6 +122,13 @@ exports.bookTripSeats = async (req, res) => {
             passengerNames,
             customerNote,
             businessProfileId: req.body.businessProfileId,
+            // §r42 wired claim (2026-10-01): present only when the caller sent
+            // an Idempotency-Key (idempotency authority mounted on the route).
+            // The service commits this exact row to COMMITTED INSIDE the
+            // booking $transaction — booking and identity commit atomically,
+            // closing the crash-after-commit window; a rolled-back transaction
+            // leaves no replayable phantom identity.
+            financialOperation: res.locals?.financialOperation || null,
         });
         return res.status(201).json(result);
     } catch (err) {
