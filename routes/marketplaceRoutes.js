@@ -12,6 +12,7 @@ const { protect } = require('../middleware/authMiddleware');
 const ctrl = require('../controllers/marketplaceController');
 const hotelCtrl = require('../controllers/hotelMarketplaceController');
 const { require2FA } = require('../middleware/require2FA');
+const { idempotency } = require('../middleware/idempotency');
 
 // ── QR Check-in ──────────────────────────────────────────────────────────────
 router.get('/reservations/:id/checkin-qr', protect, ctrl.generateCheckInQR);
@@ -26,7 +27,25 @@ router.post('/business/:bizId/reservations', protect, hotelCtrl.createHotelReser
 // ── Transit Trips + Seat Booking ─────────────────────────────────────────────
 router.get('/transit/trips', protect, ctrl.listTransitTrips);
 router.get('/transit/trips/:id/seats', protect, ctrl.getTripSeats);
-router.post('/transit/trips/:id/book', protect, require2FA(), ctrl.bookTripSeats);
+// §r42 WIRING (transit booking identity, 2026-10-01): the shared financial
+// idempotency authority gives ONE logical seat-booking intent ONE durable
+// identity per (user, endpoint, key) — claim-before-execute, exact replay of
+// the committed booking, 409 on same-key/different-intent, exactly one
+// booking under concurrency. Without it, a booking that committed while its
+// HTTP response was lost turned the customer's same-seat retry into an
+// indistinguishable 400 'Seats already booked' (their own committed seats
+// vs another customer's) — the reconciliation gap found in the retail
+// checkout deep-dive step 5.
+//   - failurePolicy RELEASE + releaseOn4xx: the service commits the claim
+//     INSIDE the booking $transaction (wired pattern, like convert), so an
+//     IN_PROGRESS claim after the response PROVES the transaction rolled
+//     back — the key is never poisoned by a failed attempt.
+//   - required: false — evidence-named opt-out: legacy app builds (pre
+//     identity wiring) send no key; the DB-level TransitBookingSeat
+//     @@unique([tripId, seatId]) already prevents duplicate seat claims
+//     structurally, so a keyless request keeps today's behavior (the
+//     exposure is reconciliation UX only, not duplicate economics).
+router.post('/transit/trips/:id/book', protect, require2FA(), idempotency({ failurePolicy: 'RELEASE', releaseOn4xx: true, required: false }), ctrl.bookTripSeats);
 router.post('/transit/bookings/:id/checkin', protect, ctrl.transitCheckIn);
 router.delete('/transit/bookings/:id', protect, ctrl.cancelTransitBooking);
 
