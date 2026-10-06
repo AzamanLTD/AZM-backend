@@ -77,7 +77,14 @@ run('r42.1 — shared idempotency closure, second wired tranche (PostgreSQL)', (
     const TRUNCATE = 'TRUNCATE TABLE "FinancialOperation", "SmartEscrow", "Ticket", "TicketMessage", "Friendship", "User", '
         + '"TransactionHistory", "AdminProfitLog", "SystemProfitFees", "GlobalSettings", "AzmGift", '
         + '"AzmSpendLog", "AzmRewardLog", "AzmConversionLog", "OrderBookOrder", "Trade", "TradeQueue", "Ad", '
-        + '"LedgerTransaction", "JournalEntry", "AuditLog", "Notification" RESTART IDENTITY CASCADE';
+        + '"LedgerTransaction", "JournalEntry", "AuditLog", "Notification", '
+        // Integration hygiene (rebase onto the #317-era main): the wired
+        // settlement paths also touch the shared ledger account lattice
+        // and the fiat liquidity authority. Leaving rows
+        // behind changes foreign suites' fee/ledger behavior (observed: the
+        // r41 transit suite reading a leaked profit-fee balance as a
+        // "side effect" of its own cancelled funding). Clean what we dirty.
+        + '"LedgerAccount", "FiatLiquidityState" RESTART IDENTITY CASCADE';
     const truncateWithRetry = async () => {
         await drain();
         for (let attempt = 1; ; attempt++) {
