@@ -74,7 +74,7 @@ router.get('/:friendshipId/trust-metrics', protect, chatProfileController.getTru
 // =============================================================================
 // PEER TRANSFERS
 // =============================================================================
-router.post('/transfer/send', protect, require2FA(), idempotency(), peerTransferController.sendFunds);
+router.post('/transfer/send', protect, require2FA(), idempotency({ failurePolicy: 'RELEASE', releaseOn4xx: true }), peerTransferController.sendFunds);
 router.post('/transfer/request', protect, peerTransferController.requestFunds);
 router.get('/transfer/pending', protect, peerTransferController.getPendingTransferRequests);
 router.get('/transfer/history/:friendshipId', protect, peerTransferController.getTransferHistory);

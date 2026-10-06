@@ -206,6 +206,14 @@ jobs:
             # failure RETAIN, concurrent duplicate, and pre-economics release
             # contracts are proven against the real controller + middleware.
             "__tests__/r42-trade-initiation.pg.test.js"
+            # §r42.1 — wired idempotency, first tranche: the claim contract
+            # proven on the REAL middleware + REAL controllers for the six
+            # promoted client operations (savings deposit/withdraw, vault
+            # deposit/break, wallet internal-transfer over real HTTP,
+            # peer send) — byte-identical committed replay, concurrent
+            # exactly-once, crash-after-commit claim survival, pre-economics
+            # release, and divergent-identity fail-closed.
+            "__tests__/r42.1-wired-first-tranche.pg.test.js"
           )
           npx jest --runInBand --forceExit "${SUITES[@]}"
 

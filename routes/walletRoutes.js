@@ -90,7 +90,7 @@ router.get('/pool-withdrawal-preview', protect, async (req, res) => {
 
 // POST /api/wallet/internal-transfer
 // Body: { direction: 'TO_POOL' | 'FROM_POOL', amount: number }
-router.post('/internal-transfer', protectActive, require2FA(), idempotency(), async (req, res) => {
+router.post('/internal-transfer', protectActive, require2FA(), idempotency({ failurePolicy: 'RELEASE', releaseOn4xx: true }), async (req, res) => {
     const prisma = req.app.get('prisma');
     const emitBalanceUpdate = req.app.get('emitBalanceUpdate');
 
@@ -123,13 +123,21 @@ router.post('/internal-transfer', protectActive, require2FA(), idempotency(), as
             return res.status(403).json({ success: false, message: 'Only vendors can transfer to/from the trading pool.' });
         }
 
+        // §R42.1 — the shared idempotency claim (Idempotency-Key header,
+        // required by the mounted authority) commits WITH the economics and
+        // the wire response body is built inside the money transaction, so
+        // a same-key retry replays the byte-identical committed result and
+        // a crash between commit and HTTP response can never leave
+        // committed money under an IN_PROGRESS identity.
+        const operation = res.locals?.financialOperation || null;
+
         if (direction === 'TO_POOL') {
             // Available → Vendor Unallocated (fund trading pool).
             // §P.4: the mutation is a guarded conditional decrement inside the
             // SAME transaction as the history row and the ledger posting —
             // a racing wallet spend loses the CAS cleanly instead of driving
             // the balance negative.
-            await prisma.$transaction(async (tx) => {
+            const committedBody = await prisma.$transaction(async (tx) => {
                 const claim = await tx.user.updateMany({
                     where: { id: userId, availableBalance: { gte: amountFloat } },
                     data: {
@@ -158,7 +166,33 @@ router.post('/internal-transfer', protectActive, require2FA(), idempotency(), as
                         { account: `user:${userId}:unallocated`, credit: _exact(amountFloat) },
                     ],
                 });
+
+                const body = {
+                    success: true,
+                    message: `${amountFloat} USDC moved to Trading Pool.`,
+                    data: { direction, amount: amountFloat }
+                };
+                if (operation) {
+                    const committed = await tx.financialOperation.updateMany({
+                        where: { id: operation.id, status: 'IN_PROGRESS' },
+                        data: {
+                            status: 'COMMITTED',
+                            statusCode: 200,
+                            responseBody: JSON.stringify(body),
+                        },
+                    });
+                    if (committed.count !== 1) {
+                        const err = new Error('Idempotency operation state conflict.');
+                        err.code = 'IDEMPOTENCY_STATE_CONFLICT';
+                        throw err;
+                    }
+                }
+                return body;
             });
+
+            if (emitBalanceUpdate) await emitBalanceUpdate(userId);
+            // The exact body committed with the economics.
+            return res.status(200).json(committedBody);
         } else {
             // Vendor Unallocated → Available (withdraw from trading pool)
             if (user.vendorUnallocatedBalance < amountFloat) {
@@ -168,7 +202,15 @@ router.post('/internal-transfer', protectActive, require2FA(), idempotency(), as
                 });
             }
 
-            await prisma.$transaction(async (tx) => {
+            // §R42.1: the ad deactivation and the response derivation now
+            // live INSIDE the money transaction. The old code computed
+            // the post-transfer pool balance from the stale pre-transaction
+            // user read and deactivated the ads AFTER the transaction
+            // committed — a concurrent pool transfer between the read and
+            // the deactivation made the ad set stale. The fresh in-tx
+            // read below is authoritative because the guarded claim holds
+            // the user row lock.
+            const committedBody = await prisma.$transaction(async (tx) => {
                 const claim = await tx.user.updateMany({
                     where: { id: userId, vendorUnallocatedBalance: { gte: amountFloat } },
                     data: {
@@ -197,51 +239,73 @@ router.post('/internal-transfer', protectActive, require2FA(), idempotency(), as
                         { account: `user:${userId}:liability`, credit: _exact(amountFloat) },
                     ],
                 });
-            });
 
-            // Auto-deactivate ads that exceed the new pool balance
-            const newPoolBalance = Number(user.vendorUnallocatedBalance) - amountFloat;
-            const overLimitAds = await prisma.ad.findMany({
-                where: {
-                    vendorId: userId,
-                    status: 'ACTIVE',
-                    maxLimit: { gt: newPoolBalance }
-                },
-                select: { id: true, maxLimit: true, paymentMethod: true }
-            });
-
-            if (overLimitAds.length > 0) {
-                await prisma.ad.updateMany({
-                    where: { id: { in: overLimitAds.map(a => a.id) } },
-                    data: { status: 'INACTIVE' }
+                // Authoritative post-transfer pool balance — read inside
+                // the transaction that holds the row lock, never derived
+                // from the stale pre-transaction snapshot.
+                const freshUser = await tx.user.findUnique({
+                    where: { id: userId },
+                    select: { vendorUnallocatedBalance: true },
                 });
-            }
+                const newPoolBalance = Number(freshUser.vendorUnallocatedBalance);
 
-            // Include deactivated ads info in response
-            if (overLimitAds.length > 0) {
-                if (emitBalanceUpdate) await emitBalanceUpdate(userId);
-                return res.status(200).json({
-                    success: true,
-                    message: `${amountFloat} USDC moved to Available Wallet. ${overLimitAds.length} ad(s) were deactivated because they exceed your new pool balance.`,
-                    data: {
-                        direction,
-                        amount: amountFloat,
-                        newPoolBalance,
-                        deactivatedAds: overLimitAds,
-                        deactivatedCount: overLimitAds.length,
+                // Auto-deactivate ads that exceed the new pool balance —
+                // same transaction as the balance move it depends on.
+                const overLimitAds = await tx.ad.findMany({
+                    where: {
+                        vendorId: userId,
+                        status: 'ACTIVE',
+                        maxLimit: { gt: newPoolBalance }
+                    },
+                    select: { id: true, maxLimit: true, paymentMethod: true }
+                });
+
+                if (overLimitAds.length > 0) {
+                    await tx.ad.updateMany({
+                        where: { id: { in: overLimitAds.map(a => a.id) } },
+                        data: { status: 'INACTIVE' }
+                    });
+                }
+
+                const body = overLimitAds.length > 0
+                    ? {
+                        success: true,
+                        message: `${amountFloat} USDC moved to Available Wallet. ${overLimitAds.length} ad(s) were deactivated because they exceed your new pool balance.`,
+                        data: {
+                            direction,
+                            amount: amountFloat,
+                            newPoolBalance,
+                            deactivatedAds: overLimitAds,
+                            deactivatedCount: overLimitAds.length,
+                        }
                     }
-                });
-            }
+                    : {
+                        success: true,
+                        message: `${amountFloat} USDC moved to Available Wallet.`,
+                        data: { direction, amount: amountFloat }
+                    };
+                if (operation) {
+                    const committed = await tx.financialOperation.updateMany({
+                        where: { id: operation.id, status: 'IN_PROGRESS' },
+                        data: {
+                            status: 'COMMITTED',
+                            statusCode: 200,
+                            responseBody: JSON.stringify(body),
+                        },
+                    });
+                    if (committed.count !== 1) {
+                        const err = new Error('Idempotency operation state conflict.');
+                        err.code = 'IDEMPOTENCY_STATE_CONFLICT';
+                        throw err;
+                    }
+                }
+                return body;
+            });
+
+            if (emitBalanceUpdate) await emitBalanceUpdate(userId);
+            // The exact body committed with the economics.
+            return res.status(200).json(committedBody);
         }
-
-        if (emitBalanceUpdate) await emitBalanceUpdate(userId);
-
-        const label = direction === 'TO_POOL' ? 'Trading Pool' : 'Available Wallet';
-        return res.status(200).json({
-            success: true,
-            message: `${amountFloat} USDC moved to ${label}.`,
-            data: { direction, amount: amountFloat }
-        });
     } catch (error) {
         if (String(error.message || '').startsWith('Insufficient')) {
             return res.status(400).json({ success: false, message: error.message });

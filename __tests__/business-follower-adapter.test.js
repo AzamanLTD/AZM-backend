@@ -85,11 +85,17 @@ async function cleanupAll() {
     }
 
     // Battery-order immunity: prior suites may leave user_* rows behind
-    // with TransactionHistory children (e.g. a factory-backed balance). The
-    // sweep deletes those children first so the user sweep cannot hit the
-    // TransactionHistory_userId_fkey foreign key.
+    // with TransactionHistory children (e.g. a factory-backed balance) or
+    // Withdrawal children (e.g. r42-wallet-withdrawal-status-surface has
+    // no afterAll cleanup). The sweep deletes those children first so the
+    // user sweep cannot hit the TransactionHistory_userId_fkey /
+    // Withdrawal_userId_fkey foreign keys, whatever the jest run order.
     await prisma.$executeRawUnsafe(
         'DELETE FROM "TransactionHistory" WHERE "userId" IN '
+        + "(SELECT id FROM \"User\" WHERE username LIKE 'user_%')"
+    );
+    await prisma.$executeRawUnsafe(
+        'DELETE FROM "Withdrawal" WHERE "userId" IN '
         + "(SELECT id FROM \"User\" WHERE username LIKE 'user_%')"
     );
     await prisma.user.deleteMany({ where: { username: { startsWith: 'user_' } } });

@@ -51,10 +51,33 @@ exports.sendFunds = async (req, res) => {
     try {
         const { friendshipId, amount, reference, clientRequestId } = req.body;
         const senderId = req.user.id;
-        const idempotencyKey =
+
+        // §R42.1 — CANONICAL IDENTITY. The shared idempotency middleware's
+        // FinancialOperation claim (from the Idempotency-Key header) is
+        // the single request identity on the HTTP path; the legacy body
+        // clientRequestId / x-idempotency-key values are explicit
+        // compatibility aliases that MUST match the canonical key when
+        // both are supplied — divergence fails closed before any
+        // economics (never two identities for one client intent). The
+        // TransactionHistory txHashes are derived from the durable claim
+        // id — no second UUID, no Date.now()+Math.random() identity for a
+        // client financial operation. The @unique txHash constraint stays
+        // as the secondary in-transaction backstop.
+        const operation = res.locals?.financialOperation || null;
+        const legacyKey =
             clientRequestId ||
-            req.headers['x-idempotency-key'] ||
-            `srv_${senderId}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+            (req.headers && req.headers['x-idempotency-key']) || null;
+        if (operation && legacyKey && String(legacyKey) !== operation.key) {
+            return res.status(400).json({
+                success: false,
+                code: 'IDEMPOTENCY_IDENTITY_CONFLICT',
+                message: 'Body clientRequestId/x-idempotency-key does not match the Idempotency-Key header. Nothing was executed.',
+            });
+        }
+        const idempotencyKey = operation
+            ? `fo_${operation.id}`
+            : legacyKey ||
+              `srv_${senderId}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
         const senderTxHash   = `PEER_SEND_${idempotencyKey}`;
         const receiverTxHash = `PEER_RECV_${idempotencyKey}`;
 
@@ -100,23 +123,28 @@ exports.sendFunds = async (req, res) => {
             });
         }
 
-        // ── Idempotency replay check ─────────────────────────────────────────
-        // If we already saw this clientRequestId, return the prior outcome
-        // instead of mutating balances a second time.
-        const prior = await prisma.transactionHistory.findUnique({
-            where: { txHash: senderTxHash }
-        });
-        if (prior) {
-            const priorTransfer = await prisma.peerTransfer.findFirst({
-                where: { senderId, friendshipId, amount: transferAmount, type: 'SEND' },
-                orderBy: { createdAt: 'desc' }
+        // ── Idempotency replay check (legacy direct-service path only) ────
+        // On the HTTP path the middleware claim is the authority —
+        // same-key retries never reach this handler (the committed result
+        // replays from the FinancialOperation row). The lookup below only
+        // serves direct service/test invocations that supply a legacy
+        // clientRequestId with no mounted authority.
+        if (!operation && legacyKey) {
+            const prior = await prisma.transactionHistory.findUnique({
+                where: { txHash: senderTxHash }
             });
-            return res.status(200).json({
-                success: true,
-                message: 'Transfer already processed (idempotent replay).',
-                idempotent: true,
-                transfer: priorTransfer
-            });
+            if (prior) {
+                const priorTransfer = await prisma.peerTransfer.findFirst({
+                    where: { senderId, friendshipId, amount: transferAmount, type: 'SEND' },
+                    orderBy: { createdAt: 'desc' }
+                });
+                return res.status(200).json({
+                    success: true,
+                    message: 'Transfer already processed (idempotent replay).',
+                    idempotent: true,
+                    transfer: priorTransfer
+                });
+            }
         }
 
 
@@ -257,7 +285,36 @@ exports.sendFunds = async (req, res) => {
                 }
             });
 
-            return { transfer, chatMessage, senderUsername: sender.username };
+            // §R42.1 — the committed response body is built INSIDE the
+            // economic transaction and the durable claim flips to
+            // COMMITTED in the SAME transaction: claim + debit + credit +
+            // transfer + histories + ledger + chat message commit
+            // together or roll back together. A crash between the
+            // economic commit and the HTTP response replays the stored
+            // committed result instead of executing a second transfer.
+            const body = {
+                success: true,
+                message: `${transferAmount.toFixed(2)} USDC sent successfully.`,
+                transfer
+            };
+            if (operation) {
+                const committed = await tx.financialOperation.updateMany({
+                    where: { id: operation.id, status: 'IN_PROGRESS' },
+                    data: {
+                        status: 'COMMITTED',
+                        statusCode: 200,
+                        // WIRE serialization — byte-identical replay.
+                        responseBody: JSON.stringify(body),
+                    },
+                });
+                if (committed.count !== 1) {
+                    const err = new Error('Idempotency operation state conflict.');
+                    err.code = 'IDEMPOTENCY_STATE_CONFLICT';
+                    throw err;
+                }
+            }
+
+            return { transfer, chatMessage, senderUsername: sender.username, body };
         });
 
 
@@ -311,11 +368,9 @@ exports.sendFunds = async (req, res) => {
             }
         });
 
-        return res.status(200).json({
-            success: true,
-            message: `${transferAmount.toFixed(2)} USDC sent successfully.`,
-            transfer: result.transfer
-        });
+        // The exact response object committed with the economics — a
+        // same-key retry replays the byte-identical committed result.
+        return res.status(200).json(result.body);
 
     } catch (error) {
         if (error.message === 'INSUFFICIENT_FUNDS') {
