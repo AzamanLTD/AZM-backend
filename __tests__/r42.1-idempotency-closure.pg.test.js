@@ -68,6 +68,32 @@ const EP = {
 run('r42.1 — shared idempotency closure, second wired tranche (PostgreSQL)', () => {
     let prisma;
 
+    // CI machines are slower: a just-resolved supertest call can leave a
+    // Prisma pool connection still draining its last writes while this
+    // suite's wide TRUNCATE grabs table locks one by one, and PostgreSQL
+    // reports 40P01 (deadlock) between the two. Draining the event loop
+    // and retrying once the straggler finishes is enough to settle it.
+    const drain = () => new Promise((resolve) => setImmediate(resolve));
+    const TRUNCATE = 'TRUNCATE TABLE "FinancialOperation", "SmartEscrow", "Ticket", "TicketMessage", "Friendship", "User", '
+        + '"TransactionHistory", "AdminProfitLog", "SystemProfitFees", "GlobalSettings", "AzmGift", '
+        + '"AzmSpendLog", "AzmRewardLog", "AzmConversionLog", "OrderBookOrder", "Trade", "TradeQueue", "Ad", '
+        + '"LedgerTransaction", "JournalEntry", "AuditLog", "Notification" RESTART IDENTITY CASCADE';
+    const truncateWithRetry = async () => {
+        await drain();
+        for (let attempt = 1; ; attempt++) {
+            try {
+                await prisma.$executeRawUnsafe(TRUNCATE);
+                return;
+            } catch (err) {
+                const isDeadlock = err?.code === 'P2034'
+                    || /40P01/.test(String(err?.message || ''))
+                    || /40P01/.test(JSON.stringify(err?.meta || ''));
+                if (attempt >= 5 || !isDeadlock) throw err;
+                await new Promise((r) => setTimeout(r, 250 * attempt));
+            }
+        }
+    };
+
     beforeAll(async () => {
         process.env.DATABASE_URL = url;
         process.env.NODE_ENV = 'test';
@@ -78,12 +104,7 @@ run('r42.1 — shared idempotency closure, second wired tranche (PostgreSQL)', (
     // Suite hygiene: the last test's seed rows (trades, escrows, users) must
     // not leak into the shared test DB and break other suites' cleanups.
     afterEach(async () => {
-        await prisma.$executeRawUnsafe(
-            'TRUNCATE TABLE "FinancialOperation", "SmartEscrow", "Ticket", "TicketMessage", "Friendship", "User", '
-            + '"TransactionHistory", "AdminProfitLog", "SystemProfitFees", "GlobalSettings", "AzmGift", '
-            + '"AzmSpendLog", "AzmRewardLog", "AzmConversionLog", "OrderBookOrder", "Trade", "TradeQueue", "Ad", '
-            + '"LedgerTransaction", "JournalEntry", "AuditLog", "Notification" RESTART IDENTITY CASCADE'
-        );
+        await truncateWithRetry();
         await prisma.globalSettings.upsert({ where: { id: 1 }, update: {}, create: { id: 1 } });
         await prisma.systemProfitFees.upsert({
             where: { id: 1 },
@@ -93,12 +114,7 @@ run('r42.1 — shared idempotency closure, second wired tranche (PostgreSQL)', (
     });
 
     beforeEach(async () => {
-        await prisma.$executeRawUnsafe(
-            'TRUNCATE TABLE "FinancialOperation", "SmartEscrow", "Ticket", "TicketMessage", "Friendship", "User", '
-            + '"TransactionHistory", "AdminProfitLog", "SystemProfitFees", "GlobalSettings", "AzmGift", '
-            + '"AzmSpendLog", "AzmRewardLog", "AzmConversionLog", "OrderBookOrder", "Trade", "TradeQueue", "Ad", '
-            + '"LedgerTransaction", "JournalEntry", "AuditLog", "Notification" RESTART IDENTITY CASCADE'
-        );
+        await truncateWithRetry();
         await prisma.globalSettings.upsert({ where: { id: 1 }, update: {}, create: { id: 1 } });
         await prisma.systemProfitFees.upsert({
             where: { id: 1 },
