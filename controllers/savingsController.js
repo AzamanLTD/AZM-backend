@@ -224,36 +224,51 @@ exports.deposit = async (req, res) => {
             return res.status(400).json({ success: false, message: 'amountGhs must be positive.' });
         }
 
-        // BUGFIX (Phase H12, 2026-05-27): idempotency lock for savings
-        // deposits. Without a stable per-request key, two concurrent
-        // deposit calls (network retry, FE double-tap on the deposit
-        // button) both passed the balance check, both decremented the
-        // user, both inserted a goal increment + SavingsDeposit row +
-        // TransactionHistory row. The previous `SAVINGS_DEP_<deposit.id>`
-        // txHash used a fresh uuid per call, so the unique constraint
-        // never tripped. Now we use the client-supplied clientRequestId
-        // (or X-Idempotency-Key header) to derive the txHash. The
-        // @unique constraint on TransactionHistory.txHash rejects the
-        // duplicate inside the transaction and rolls back the whole
-        // deposit (including the user debit). Same pattern as
-        // peerTransferController.sendFunds.
-        const idempotencyKey =
+        // §R42.1 — CANONICAL IDENTITY. The shared idempotency middleware's
+        // FinancialOperation claim (created from the Idempotency-Key
+        // header BEFORE this handler ran) is the single canonical request
+        // identity on the HTTP path. Legacy body clientRequestId /
+        // x-idempotency-key values are explicit compatibility aliases:
+        // when both are supplied they MUST match the canonical key, or
+        // the request fails closed BEFORE any economics (a divergence
+        // must never represent two identities for one client intent).
+        // The txHash is derived from the durable claim id — no second
+        // UUID, no Date.now()+Math.random() identity for a client
+        // financial operation. The @unique constraint on txHash remains
+        // as the secondary in-transaction backstop.
+        const operation = res.locals?.financialOperation || null;
+        const legacyKey =
             clientRequestId ||
-            req.headers['x-idempotency-key'] ||
-            `srv_savings_${userId}_${id}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+            (req.headers && req.headers['x-idempotency-key']) || null;
+        if (operation && legacyKey && String(legacyKey) !== operation.key) {
+            return res.status(400).json({
+                success: false,
+                code: 'IDEMPOTENCY_IDENTITY_CONFLICT',
+                message: 'Body clientRequestId/x-idempotency-key does not match the Idempotency-Key header. Nothing was executed.',
+            });
+        }
+        const idempotencyKey = operation
+            ? `fo_${operation.id}`
+            : legacyKey ||
+              `srv_savings_${userId}_${id}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
         const depositTxHash = `SAVINGS_DEP_${idempotencyKey}`;
 
-        // Idempotency replay check — if we already saw this key, return
-        // the prior outcome instead of attempting another debit.
-        const prior = await prisma.transactionHistory.findUnique({
-            where: { txHash: depositTxHash }
-        });
-        if (prior) {
-            return res.status(200).json({
-                success: true,
-                idempotent: true,
-                message: 'Deposit already processed (idempotent replay).'
+        // Legacy direct-service replay check. The HTTP path NEVER reaches
+        // this point without a claim (the middleware requires the header
+        // and replays committed results itself); the lookup is kept only
+        // for direct service/test invocations that supply a legacy key
+        // with no mounted authority.
+        if (!operation && legacyKey) {
+            const prior = await prisma.transactionHistory.findUnique({
+                where: { txHash: depositTxHash }
             });
+            if (prior) {
+                return res.status(200).json({
+                    success: true,
+                    idempotent: true,
+                    message: 'Deposit already processed (idempotent replay).'
+                });
+            }
         }
 
         const goal = await prisma.savingsGoal.findFirst({
@@ -390,7 +405,41 @@ exports.deposit = async (req, res) => {
             // Notification for milestone streaks
             // Phase N: moved post-commit for full pipeline delivery.
 
-            return { updatedGoal, deposit, newStreak };
+            // §R42.1 — the committed response body is built INSIDE the
+            // economic transaction from committed values, and the durable
+            // claim flips to COMMITTED in the SAME transaction. A crash
+            // between the economic commit and the HTTP response can no
+            // longer leave money committed under an IN_PROGRESS identity:
+            // claim + economics commit together or roll back together.
+            const body = {
+                success: true,
+                message: `Deposited GHS ${amountGhs} into "${lockedGoal.name}".`,
+                data: {
+                    deposit,
+                    goal: updatedGoal,
+                    streak: newStreak,
+                    amountUsdc
+                }
+            };
+            if (operation) {
+                const committed = await tx.financialOperation.updateMany({
+                    where: { id: operation.id, status: 'IN_PROGRESS' },
+                    data: {
+                        status: 'COMMITTED',
+                        statusCode: 200,
+                        // WIRE serialization — the claim column is TEXT so
+                        // the replay re-emits the exact original bytes.
+                        responseBody: JSON.stringify(body),
+                    },
+                });
+                if (committed.count !== 1) {
+                    const err = new Error('Idempotency operation state conflict.');
+                    err.code = 'IDEMPOTENCY_STATE_CONFLICT';
+                    throw err;
+                }
+            }
+
+            return { updatedGoal, deposit, newStreak, body };
         });
 
         if (emitBalanceUpdate) await emitBalanceUpdate(userId);
@@ -418,16 +467,9 @@ exports.deposit = async (req, res) => {
             metadata: { amountGhs: req.body.amountGhs }, ipAddress: req.ip,
         });
 
-        return res.status(200).json({
-            success: true,
-            message: `Deposited GHS ${amountGhs} into "${goal.name}".`,
-            data: {
-                deposit: result.deposit,
-                goal: result.updatedGoal,
-                streak: result.newStreak,
-                amountUsdc
-            }
-        });
+        // The exact response object committed with the economics — a
+        // same-key retry replays the byte-identical committed result.
+        return res.status(200).json(result.body);
 
     } catch (error) {
         // Phase H12: a parallel duplicate hit the @unique txHash
@@ -459,6 +501,27 @@ exports.withdraw = async (req, res) => {
         const { id } = req.params;
         const { amountGhs, requestId } = req.body;
 
+        // §R42.1 — CANONICAL IDENTITY (same contract as deposit): the
+        // shared FinancialOperation claim from the Idempotency-Key header
+        // is the single request identity on the HTTP path. The legacy body
+        // requestId / x-idempotency-key values are compatibility aliases
+        // that must MATCH the canonical key when both are supplied —
+        // divergence fails closed before any economics. The replay hash
+        // is derived from the durable claim id — no generated
+        // Date.now()+Math.random() identity for a client financial
+        // operation.
+        const operation = res.locals?.financialOperation || null;
+        const legacyKey =
+            requestId ||
+            (req.headers && req.headers['x-idempotency-key']) || null;
+        if (operation && legacyKey && String(legacyKey) !== operation.key) {
+            return res.status(400).json({
+                success: false,
+                code: 'IDEMPOTENCY_IDENTITY_CONFLICT',
+                message: 'Body requestId/x-idempotency-key does not match the Idempotency-Key header. Nothing was executed.',
+            });
+        }
+
         // r16 P0-E: the goal row is locked FOR UPDATE INSIDE the money
         // transaction and every amount is derived from that locked
         // authoritative state. The old code read the goal before the
@@ -467,13 +530,15 @@ exports.withdraw = async (req, res) => {
         // against the same currentAmountGhs and both release the same
         // savings money.
         const result = await prisma.$transaction(async (tx) => {
-            // Durable replay identity: a retried request carrying the same
-            // requestId converges to the already-committed withdrawal
-            // instead of executing twice.
-            const replayHash = requestId
-                ? `SAVINGS_WD_${id}_${String(requestId).slice(0, 64)}`
-                : null;
-            if (replayHash) {
+            // Durable replay identity. On the HTTP path the middleware
+            // claim IS the authority (same-key retries never reach this
+            // handler), so the hash is claim-derived. The legacy lookup
+            // below only serves direct service/test invocations that
+            // supply a body requestId with no mounted authority.
+            const replayHash = operation
+                ? `SAVINGS_WD_fo_${operation.id}`
+                : (legacyKey ? `SAVINGS_WD_${id}_${String(legacyKey).slice(0, 64)}` : null);
+            if (replayHash && !operation) {
                 const existing = await tx.transactionHistory.findFirst({
                     where: { txHash: replayHash, userId },
                 });
@@ -596,6 +661,42 @@ exports.withdraw = async (req, res) => {
                 });
             }
 
+            // §R42.1 — committed response built in-tx from committed
+            // values; the durable claim flips to COMMITTED in the SAME
+            // transaction (crash-after-commit can no longer leave the
+            // request identity IN_PROGRESS under committed money).
+            const body = {
+                success: true,
+                message: isEarlyWithdrawal
+                    ? `Early withdrawal: GHS ${Number(netWithdrawGhs.toFixed(2)).toFixed(2)} returned (${(penaltyRate * 100).toFixed(0)}% penalty: GHS ${Number(penaltyGhs).toFixed(2)}).`
+                    : `Withdrawn GHS ${Number(netWithdrawGhs.toFixed(2)).toFixed(2)} from "${goal.name}".`,
+                data: {
+                    withdrawnGhs: Number(withdrawAmount.toFixed(2)),
+                    penaltyGhs: Number(penaltyGhs),
+                    netReceivedGhs: Number(netWithdrawGhs.toFixed(2)),
+                    netReceivedUsdc: netUsdc,
+                    isEarlyWithdrawal,
+                    penaltyRate,
+                    goal: updatedGoal
+                }
+            };
+            if (operation) {
+                const committed = await tx.financialOperation.updateMany({
+                    where: { id: operation.id, status: 'IN_PROGRESS' },
+                    data: {
+                        status: 'COMMITTED',
+                        statusCode: 200,
+                        // WIRE serialization — byte-identical replay.
+                        responseBody: JSON.stringify(body),
+                    },
+                });
+                if (committed.count !== 1) {
+                    const err = new Error('Idempotency operation state conflict.');
+                    err.code = 'IDEMPOTENCY_STATE_CONFLICT';
+                    throw err;
+                }
+            }
+
             return {
                 replay: false,
                 updatedGoal,
@@ -605,7 +706,8 @@ exports.withdraw = async (req, res) => {
                 netWithdrawGhs: Number(netWithdrawGhs.toFixed(2)),
                 netUsdc,
                 isEarlyWithdrawal,
-                penaltyRate
+                penaltyRate,
+                body
             };
         });
 
@@ -626,21 +728,9 @@ exports.withdraw = async (req, res) => {
             metadata: { withdrawAmountGhs: result.withdrawAmount, penaltyGhs: result.penaltyGhs }, ipAddress: req.ip,
         });
 
-        return res.status(200).json({
-            success: true,
-            message: result.isEarlyWithdrawal
-                ? `Early withdrawal: GHS ${result.netWithdrawGhs.toFixed(2)} returned (${(result.penaltyRate * 100).toFixed(0)}% penalty: GHS ${result.penaltyGhs.toFixed(2)}).`
-                : `Withdrawn GHS ${result.netWithdrawGhs.toFixed(2)} from "${result.goalName}".`,
-            data: {
-                withdrawnGhs: result.withdrawAmount,
-                penaltyGhs: result.penaltyGhs,
-                netReceivedGhs: result.netWithdrawGhs,
-                netReceivedUsdc: result.netUsdc,
-                isEarlyWithdrawal: result.isEarlyWithdrawal,
-                penaltyRate: result.penaltyRate,
-                goal: result.updatedGoal
-            }
-        });
+        // The exact response object committed with the economics — a
+        // same-key retry replays the byte-identical committed result.
+        return res.status(200).json(result.body);
 
     } catch (error) {
         logger.error({ err: error }, '[savings.withdraw] error');

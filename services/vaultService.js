@@ -93,7 +93,7 @@ class VaultService {
         return vault;
     }
 
-    async depositManual({ userId, vaultId, amountUsdc, idempotencyKey = null }) {
+    async depositManual({ userId, vaultId, amountUsdc, idempotencyKey = null, financialOperation = null }) {
         const amt = new Prisma.Decimal(amountUsdc);
         if (amt.lte(0)) throw new Error('amountUsdc must be > 0');
 
@@ -109,6 +109,12 @@ class VaultService {
             type: 'MANUAL',
             scheduledFor: null,
             idempotencyKey,
+            // §R42.1 — the shared HTTP idempotency claim. Supplied ONLY by
+            // the direct HTTP path (vaultController); internal callers
+            // (smart route, worker) keep their own durable identities and
+            // pass nothing, preserving their independent replay
+            // convergence.
+            financialOperation,
         });
     }
 
@@ -198,7 +204,7 @@ class VaultService {
      * same row lock, and exactly one terminal identity can win. The losing
      * concurrent operation rolls back without touching money.
      */
-    async breakEarly({ userId, vaultId }) {
+    async breakEarly({ userId, vaultId, financialOperation = null }) {
         const outcome = await this.prisma.$transaction(async (tx) => {
             // r16 P0-D: DB-authoritative terminal claim. SELECT ... FOR
             // UPDATE locks the row; every concurrent mutation of this vault
@@ -278,7 +284,32 @@ class VaultService {
                     { account: 'revenue:fees', credit: penalty.toFixed(8) },
                 ],
             });
-            return { result: [userUpdate, vaultUpdate, profitRow, historyRow], refund, penalty, name: fresh.name };
+            // §R42.1 — the shared HTTP claim commits WITH the economics.
+            // The wire response body ({ success: true, vault }) is built
+            // here from the committed vaultUpdate row and stored as WIRE
+            // text; the controller sends this exact object, so a same-key
+            // retry replays byte-identical committed results and a crash
+            // between commit and HTTP response can never leave committed
+            // money under an IN_PROGRESS identity.
+            let committedBody = null;
+            if (financialOperation) {
+                committedBody = { success: true, vault: vaultUpdate };
+                const committed = await tx.financialOperation.updateMany({
+                    where: { id: financialOperation.id, status: 'IN_PROGRESS' },
+                    data: {
+                        status: 'COMMITTED',
+                        statusCode: 200,
+                        responseBody: JSON.stringify(committedBody),
+                    },
+                });
+                if (committed.count !== 1) {
+                    const err = new Error('Idempotency operation state conflict.');
+                    err.code = 'IDEMPOTENCY_STATE_CONFLICT';
+                    throw err;
+                }
+            }
+
+            return { result: [userUpdate, vaultUpdate, profitRow, historyRow], refund, penalty, name: fresh.name, committedBody };
         });
 
         // Notify
@@ -294,7 +325,7 @@ class VaultService {
 
         this._emitBalanceUpdate(userId);
         this._emitVaultEvent(userId, 'vault:update', vaultId);
-        return outcome.result[1]; // updated vault
+        return { vault: outcome.result[1], committedBody: outcome.committedBody };
     }
 
     /**
@@ -424,7 +455,7 @@ class VaultService {
     // INTERNAL
     // =========================================================================
 
-    async _executeDeposit({ vault, amount, type, scheduledFor, extraVaultUpdate = {}, idempotencyKey = null }) {
+    async _executeDeposit({ vault, amount, type, scheduledFor, extraVaultUpdate = {}, idempotencyKey = null, financialOperation = null }) {
         // Compute AZM reward up-front so the breakdown can be embedded in
         // the deposit row + the FE notification verbatim.
         const breakdown = this.computeAzmIntensity({
@@ -449,7 +480,7 @@ class VaultService {
                 if (existing) return existing;
             }
 
-            const [userRow] = await this.prisma.$transaction(async (tx) => {
+            const [userRow, , , , committedBody] = await this.prisma.$transaction(async (tx) => {
                 // r16 P0-D: guarded user claim — the conditional decrement
                 // fails closed on a concurrent spend instead of relying on
                 // the CHECK constraint as the only guard.
@@ -540,7 +571,33 @@ class VaultService {
                 const freshVault = await tx.vault.findUnique({
                     where: { id: vault.id },
                 });
-                return [freshUser, freshVault, depositRow, historyRow];
+
+                // §R42.1 — the shared HTTP claim commits WITH the
+                // economics. The wire response body is built here (the
+                // controller sends this exact object) and stored as WIRE
+                // text so a same-key retry replays byte-identical
+                // committed results. Crash between commit and HTTP
+                // response can no longer leave committed money under an
+                // IN_PROGRESS identity.
+                let committedBody = null;
+                if (financialOperation) {
+                    committedBody = { success: true, breakdown };
+                    const committed = await tx.financialOperation.updateMany({
+                        where: { id: financialOperation.id, status: 'IN_PROGRESS' },
+                        data: {
+                            status: 'COMMITTED',
+                            statusCode: 200,
+                            responseBody: JSON.stringify(committedBody),
+                        },
+                    });
+                    if (committed.count !== 1) {
+                        const err = new Error('Idempotency operation state conflict.');
+                        err.code = 'IDEMPOTENCY_STATE_CONFLICT';
+                        throw err;
+                    }
+                }
+
+                return [freshUser, freshVault, depositRow, historyRow, committedBody];
             });
 
             // Credit AZM via canonical service so the AzmRewardLog audit
@@ -586,7 +643,7 @@ class VaultService {
             this._emitBalanceUpdate(vault.userId);
             this._emitVaultEvent(vault.userId, 'vault:update', vault.id);
 
-            return { vault: userRow, breakdown };
+            return { vault: userRow, breakdown, committedBody };
         } catch (err) {
             // Insufficient balance violates CHECK constraint → log the
             // failed attempt and rethrow.

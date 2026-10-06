@@ -59,17 +59,22 @@ exports.getDetail = wrap(async function getDetail(req, res) {
 
 exports.deposit = wrap(async function deposit(req, res) {
     const svc = req.app.get('vaultService');
+    // §R42.1 — hand the shared HTTP idempotency claim into the service so
+    // the economics and the claim commit in the SAME transaction; the
+    // response is the exact body committed there (byte-identical replay).
+    const operation = res.locals?.financialOperation || null;
     const result = await svc.depositManual({
         userId: req.user.id,
         vaultId: req.params.id,
         amountUsdc: req.body.amountUsdc,
+        financialOperation: operation,
     });
     await audit(req.app.get('prisma'), {
         actorId: req.user.id, actorName: req.user.username,
         action: 'VAULT_DEPOSIT', targetType: 'VAULT', targetId: String(req.params.id),
         metadata: { amountUsdc: req.body.amountUsdc }, ipAddress: req.ip,
     });
-    res.json({ success: true, breakdown: result.breakdown });
+    res.json(result.committedBody || { success: true, breakdown: result.breakdown });
 });
 
 exports.setAutoRule = wrap(async function setAutoRule(req, res) {
@@ -122,13 +127,14 @@ exports.breakEarly = wrap(async function breakEarly(req, res) {
             message: 'Must explicitly confirmedBreak=true to break a vault early.',
         });
     }
-    const vault = await svc.breakEarly({ userId: req.user.id, vaultId: req.params.id });
+    const operation = res.locals?.financialOperation || null;
+    const outcome = await svc.breakEarly({ userId: req.user.id, vaultId: req.params.id, financialOperation: operation });
     await audit(req.app.get('prisma'), {
         actorId: req.user.id, actorName: req.user.username,
         action: 'VAULT_BROKEN_EARLY', targetType: 'VAULT', targetId: String(req.params.id),
-        metadata: { penaltyUsdc: vault?.penaltyUsdc }, ipAddress: req.ip,
+        metadata: { penaltyUsdc: outcome?.vault?.penaltyUsdc }, ipAddress: req.ip,
     });
-    res.json({ success: true, vault });
+    res.json(outcome.committedBody || { success: true, vault: outcome.vault });
 });
 
 exports.getReceipt = wrap(async function getReceipt(req, res) {
