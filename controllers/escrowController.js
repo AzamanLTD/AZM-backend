@@ -120,7 +120,11 @@ exports.fundEscrow = async (req, res) => {
             return res.status(403).json({ success: false, message: 'Only the payer can fund this escrow.' });
         }
 
-        const result = await escrowService.fundEscrow(prisma, { escrowId, payerId: userId });
+        // §r42.1 wired claim: committed INSIDE the funding transaction.
+        const result = await escrowService.fundEscrow(prisma, {
+            escrowId, payerId: userId,
+            financialOperation: res.locals?.financialOperation || null,
+        });
         const escrow = result.escrow;
 
         _emitToParties(io, escrow, 'escrow_funded', {
@@ -143,9 +147,19 @@ exports.fundEscrow = async (req, res) => {
             metadata: { amountUsdc: escrow.amountUsdc }, ipAddress: req.ip,
         });
 
-        return res.status(200).json({ success: true, escrow });
+        // The wired service committed the claim with THIS exact body — the
+        // committed replay and the live response are byte-identical.
+        return res.status(200).json(result.body);
     } catch (err) {
         logger.error({ err: err }, '[fundEscrow] error');
+        // §r42.1 failure semantics: a lost funding CAS (state changed /
+        // already funded) or an insufficient-balance loss provably committed
+        // NOTHING — the whole transaction rolled back. Deterministic 4xx
+        // lets the authority release the key (releaseOn4xx on this wired
+        // route); the funding itself never ran.
+        if (err.code === 'ESCROW_ALREADY_FUNDED' || err.code === 'ESCROW_STATE_CHANGED') {
+            return res.status(409).json({ success: false, code: err.code, message: err.message });
+        }
         const code = /insufficient/i.test(err.message) ? 400 : 500;
         return res.status(code).json({ success: false, message: err.message });
     }

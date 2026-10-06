@@ -16,7 +16,11 @@ const { validate } = require('../middleware/validate');
 const { fundEscrowSchema, raiseDisputeSchema } = require('../services/validation/financialSchemas');
 
 router.get('/ticket/:ticketId', protect, ctrl.getEscrowForTicket);
-router.post('/fund', protectActive, require2FA(), idempotency(), validate(fundEscrowSchema), ctrl.fundEscrow);
+// §r42.1 wired: the claim commits INSIDE the funding $transaction, so an
+// IN_PROGRESS claim after a 4xx is durable proof of rollback — the key is
+// safely releasable (releaseOn4xx). 5xx stays RETAIN (default): a post-
+// commit failure must never re-arm a funded escrow.
+router.post('/fund', protectActive, require2FA(), idempotency({ releaseOn4xx: true }), validate(fundEscrowSchema), ctrl.fundEscrow);
 router.post('/satisfy', protectActive, idempotency(), ctrl.markSatisfied);
 router.post('/dispute', protectActive, idempotency(), validate(raiseDisputeSchema), ctrl.raiseDispute);
 router.post('/update-terms', protect, ctrl.updateTerms);

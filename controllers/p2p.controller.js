@@ -444,7 +444,11 @@ exports.completeTrade = async (req, res) => {
         if (!tradeId || isNaN(tradeId))
             return res.status(400).json({ success: false, message: 'tradeId is required.' });
 
-        const data = await p2pService.completeTrade(prisma, { tradeId, releasedByUserId });
+        // §r42.1 wired claim: committed INSIDE the settlement transaction.
+        const data = await p2pService.completeTrade(prisma, {
+            tradeId, releasedByUserId,
+            financialOperation: res.locals?.financialOperation || null,
+        });
 
         // Phase N: deliver notifications via full pipeline (DB + socket + FCM)
         _firePostCommitNotifications(req, data._notifications);
@@ -616,24 +620,10 @@ exports.completeTrade = async (req, res) => {
             metadata: { netUsdc: data.netUsdc, vendorCutUsdc: data.vendorCutUsdc }, ipAddress: req.ip,
         });
 
-        return res.status(200).json({
-            success: true,
-            message: `Trade #${tradeId} completed successfully.`,
-            data: {
-                tradeId:         data.tradeId,
-                netUsdc:         data.netUsdc,
-                adminCutUsdc:    data.adminCutUsdc,
-                vendorCutUsdc:   data.vendorCutUsdc,
-                vendorCutGhs:    data.vendorCutGhs,
-                split: {
-                    adminPct:  `${(data.adminPct  * 100).toFixed(0)}%`,
-                    vendorPct: `${(data.vendorPct * 100).toFixed(0)}%`,
-                    tier:      data.tradeId >= 1000 ? '≥$1000 (50/50)' : '<$1000 (60/40)'
-                },
-                totalMarginUsdc: data.totalMarginUsdc,
-                gamification:    data.gamification || null
-            }
-        });
+        // The wired settlement transaction committed the claim with THIS
+        // exact body — the committed replay and the live response are
+        // byte-identical.
+        return res.status(200).json(data.body);
     } catch (error) {
         // Phase H8 (2026-05-27): if a concurrent caller already
         // finalized this trade (vendor double-tapped release on bad
