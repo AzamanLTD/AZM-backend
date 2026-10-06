@@ -431,7 +431,14 @@ run('r42.1 — shared idempotency closure, second wired tranche (PostgreSQL)', (
             // Below MIN_CONVERT → deterministic pre-economics 400.
             const bad = await drive({ user: user.id, key: 'cv-g-1-0001', body: { azmAmount: 5 } });
             expect(bad.status).toBe(400);
-            expect(await prisma.financialOperation.count({ where: { key: 'cv-g-1-0001' } })).toBe(0);
+            // The claim was released — the key is NOT poisoned. (The release
+            // is deliberately fire-and-forget in the middleware: poll for
+            // the converged state instead of racing it.)
+            const released = await waitFor(async () => {
+                const n = await prisma.financialOperation.count({ where: { key: 'cv-g-1-0001' } });
+                return n === 0 ? true : null;
+            });
+            expect(released).toBe(true);
             // Corrected retry with the SAME key executes exactly once.
             const retry = await drive({ user: user.id, key: 'cv-g-1-0001', body: { azmAmount: 100 } });
             expect(retry.status).toBe(200);
@@ -567,7 +574,14 @@ run('r42.1 — shared idempotency closure, second wired tranche (PostgreSQL)', (
             // Invalid amount → deterministic pre-economics 400.
             const bad = await drive({ user: sender.id, key: 'gift-g-1-0001', body: { receiverId: receiver.id, amount: -5, type: 'GIFT' } });
             expect(bad.status).toBe(400);
-            expect(await prisma.financialOperation.count({ where: { key: 'gift-g-1-0001' } })).toBe(0);
+            // The claim was released — the key is NOT poisoned. (The release
+            // is deliberately fire-and-forget in the middleware: poll for
+            // the converged state instead of racing it.)
+            const released = await waitFor(async () => {
+                const n = await prisma.financialOperation.count({ where: { key: 'gift-g-1-0001' } });
+                return n === 0 ? true : null;
+            });
+            expect(released).toBe(true);
             // Corrected retry with the SAME key executes exactly once.
             const retry = await drive({ user: sender.id, key: 'gift-g-1-0001', body: payload(receiver.id) });
             expect(retry.status).toBe(200);
@@ -679,7 +693,14 @@ run('r42.1 — shared idempotency closure, second wired tranche (PostgreSQL)', (
             // Invalid side → deterministic pre-economics 400.
             const bad = await drive({ user: seller.id, key: 'ob-g-1-0001', body: { side: 'NOPE', type: 'LIMIT', price: 1, quantity: 10 } });
             expect(bad.status).toBe(400);
-            expect(await prisma.financialOperation.count({ where: { key: 'ob-g-1-0001' } })).toBe(0);
+            // The claim was released — the key is NOT poisoned. (The release
+            // is deliberately fire-and-forget in the middleware: poll for
+            // the converged state instead of racing it.)
+            const released = await waitFor(async () => {
+                const n = await prisma.financialOperation.count({ where: { key: 'ob-g-1-0001' } });
+                return n === 0 ? true : null;
+            });
+            expect(released).toBe(true);
             // Corrected retry with the SAME key executes exactly once.
             const retry = await drive({ user: seller.id, key: 'ob-g-1-0001', body: sellPayload });
             expect(retry.status).toBe(200);
