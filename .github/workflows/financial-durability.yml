@@ -214,6 +214,14 @@ jobs:
             # exactly-once, crash-after-commit claim survival, pre-economics
             # release, and divergent-identity fail-closed.
             "__tests__/r42.1-wired-first-tranche.pg.test.js"
+            # §r42.1 — wired idempotency, second tranche (the #318 closure):
+            # the same wired claim contract proven on the REAL middleware +
+            # REAL controllers for the five settlement-side operations
+            # (escrow fund, AZM conversion, AZM gifts, order-book placement,
+            # P2P completion) — byte-identical committed replay, concurrent
+            # exactly-once, crash-after-commit claim survival, pre-economics
+            # 4xx release, and divergent-payload fail-closed.
+            "__tests__/r42.1-idempotency-closure.pg.test.js"
           )
           npx jest --runInBand --forceExit "${SUITES[@]}"
 
