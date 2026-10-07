@@ -81,6 +81,10 @@ const financeService = require('./finance.service');
 const fiatLiquidity = require('../src/services/fiatLiquidityService');
 const { canonicalProviderName, persistPayoutOwnership } = require('./payoutProviderOwnership');
 const { recordReconciliationExceptionLoud } = require('./reconciliationExceptionService');
+// §271 residual audit: the savings executor's conversion now goes through the
+// canonical freshness-gated retail-rate reader (same authority as the manual
+// savings deposit/withdrawal quotes).
+const { getFreshServerRateGhsPerUsdc } = require('../src/services/transactionQuoteService');
 // r19: the shared occurrence cadence + settlement-convergence module (a
 // LEAF — finance.service also requires it for canonical convergence).
 const {
@@ -1183,19 +1187,38 @@ class SmartRouteService {
             if (!goal || goal.userId !== route.userId) {
                 throw new Error('Savings goal not found');
             }
-            // r19 P0-5: SAVINGS-CANONICAL DENOMINATION. The savings subsystem
-            // defines GHS valuation through GlobalSettings.liveUsdToGhs — the
-            // manual deposit path (savingsController.deposit converts
-            // amountGhs/liveUsdToGhs into USDC) and the withdrawal path
-            // (withdraw converts GHS back at liveUsdToGhs) BOTH use it. This
-            // executor previously used liveRetailRate (a DIFFERENT field with
-            // a different fallback), which could create GHS at the deposit
-            // boundary that the withdrawal boundary released as more USDC
-            // than was locked — value creation at a denomination seam. One
-            // denomination authority for savings: liveUsdToGhs (same fallback
-            // as the manual paths).
-            const settings = await tx.globalSettings.findUnique({ where: { id: 1 } });
-            const rate = new Prisma.Decimal(settings?.liveUsdToGhs || 15.0);
+            // §271 residual audit (smartroute-savings-rate-authority): the
+            // r19 P0-5 rationale — "the manual deposit and withdrawal paths
+            // both convert at liveUsdToGhs" — was superseded when #321 moved
+            // the manual savings paths onto freshness-gated TransactionQuote
+            // pricing (liveRetailRate semantics via
+            // getFreshServerRateGhsPerUsdc). Keeping this executor on the raw
+            // cached liveUsdToGhs left the last ungated, differently-denominated
+            // money conversion in the app: in the FALLBACK_FX oracle mode the
+            // two fields diverge by the USDC/USD market factor (raw USD/GHS vs
+            // USDC-adjusted), so Smart Route deposits minted goal GHS at a
+            // systematically different rate than the withdrawal side releases
+            // it at — the exact denomination-seam value asymmetry r19 closed,
+            // reopened across two authorities — and there was no freshness
+            // gate, so a frozen oracle could mint goal GHS at an ancient rate
+            // indefinitely. The executor now uses the ONE canonical
+            // freshness-gated retail rate — the same rate authority as the
+            // manual savings deposit/withdrawal quotes — and fails CLOSED on
+            // a stale/unavailable observation: nothing debits, nothing is
+            // credited, the run is marked FAILED with a rate-classified
+            // reason, and the next scheduled occurrence retries at the
+            // recovered rate. No repricing of anything already committed.
+            let freshRate;
+            try {
+                freshRate = await getFreshServerRateGhsPerUsdc({ prisma: tx });
+            } catch (rateErr) {
+                const err = new Error(
+                    `Smart Route savings deposit blocked — stale/unavailable rate (${rateErr.code || 'RATE_UNAVAILABLE'}): ${rateErr.message}`
+                );
+                err.code = rateErr.code || 'RATE_UNAVAILABLE';
+                throw err;
+            }
+            const rate = freshRate.rateGhsPerUsdcExact;
             const ghs = amount.mul(rate);
 
             const debit = await tx.user.updateMany({
@@ -1242,7 +1265,7 @@ class SmartRouteService {
                 userId: route.userId,
                 relatedEntity: 'savingsDeposit',
                 relatedEntityId: depositRow.id,
-                metadata: { goalId: goal.id, amountGhs: ghs.toFixed(8), rateUsed: rate.toFixed(8), smartRoute: true, smartRouteRunId: run.id },
+                metadata: { goalId: goal.id, amountGhs: ghs.toFixed(8), rateUsed: rate.toFixed(8), rateSource: freshRate.rateSource, rateAsOf: new Date(freshRate.rateAsOf).toISOString(), smartRoute: true, smartRouteRunId: run.id },
                 lines: [
                     { account: `user:${route.userId}:liability`, debit: amount.toFixed(8) },
                     { account: `escrow:savings-${goal.id}:locked`, credit: amount.toFixed(8) },

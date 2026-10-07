@@ -58,10 +58,13 @@ describeOrSkip('r19 P0: Smart Route immutable execution snapshot', () => {
     }
 
     async function seedFiatEnv() {
+        // §271: stamp a FRESH external observation — the savings executor
+        // (like every quote consumer) fails closed without one.
+        const observedAt = new Date();
         await prisma.globalSettings.upsert({
             where: { id: 1 },
-            update: { liveRetailRate: 15, liveUsdToGhs: 15 },
-            create: { id: 1, liveRetailRate: 15, liveUsdToGhs: 15 }
+            update: { liveRetailRate: 15, liveUsdToGhs: 15, lastExternalSync: observedAt, lastRateSync: observedAt, liveRateSource: 'KOTANI_PAY' },
+            create: { id: 1, liveRetailRate: 15, liveUsdToGhs: 15, lastExternalSync: observedAt, lastRateSync: observedAt, liveRateSource: 'KOTANI_PAY' }
         });
         await prisma.systemFiatPool.upsert({ where: { id: 1 }, update: { balance: 100000 }, create: { id: 1, balance: 100000 } });
         await prisma.systemMasterCrypto.upsert({ where: { id: 1 }, update: { balance: 0 }, create: { id: 1, balance: 0 } });
@@ -136,7 +139,7 @@ describeOrSkip('r19 P0: Smart Route immutable execution snapshot', () => {
         expect(Number(refreshedRoute.amountUsdc)).toBe(99);
     });
 
-    test('2: savings — claim → edit amount+goal → execute deposits to the CLAIMED goal at liveUsdToGhs; run records economics', async () => {
+    test('2: savings — claim → edit amount+goal → execute deposits to the CLAIMED goal at the freshness-gated retail rate; run records economics', async () => {
         const svc = makeSvc();
         const user = await seedUser(prisma, { availableBalance: 500 });
         const goalA = await prisma.savingsGoal.create({
@@ -145,8 +148,11 @@ describeOrSkip('r19 P0: Smart Route immutable execution snapshot', () => {
         const goalB = await prisma.savingsGoal.create({
             data: { userId: user.id, name: 'B', targetAmountGhs: 1000, currentAmountGhs: 0, frequencyAmount: 10 },
         });
-        // Savings-canonical rate: liveUsdToGhs. A DIFFERENT retail rate must
-        // NOT influence the savings denomination (r19 P0-5).
+        // §271 residual-audit contract: the savings executor uses the ONE
+        // canonical freshness-gated RETAIL rate (same authority as the
+        // manual savings deposit/withdrawal quotes) — never the raw cached
+        // liveUsdToGhs. Divergent fields prove the authority: 12.5 (retail)
+        // must win over 15 (legacy USD/GHS).
         await seedFiatEnv();
         await prisma.globalSettings.update({ where: { id: 1 }, data: { liveRetailRate: 12.5, liveUsdToGhs: 15 } });
 
@@ -174,12 +180,12 @@ describeOrSkip('r19 P0: Smart Route immutable execution snapshot', () => {
 
         const freshA = await prisma.savingsGoal.findUnique({ where: { id: goalA.id } });
         const freshB = await prisma.savingsGoal.findUnique({ where: { id: goalB.id } });
-        expect(Number(freshA.currentAmountGhs)).toBeCloseTo(150, 5); // 10 USDC × liveUsdToGhs 15 (CLAIMED goal+amount)
+        expect(Number(freshA.currentAmountGhs)).toBeCloseTo(125, 5); // 10 USDC × retail 12.5 (CLAIMED goal+amount) — liveUsdToGhs 15 must NOT win
         expect(Number(freshB.currentAmountGhs)).toBeCloseTo(0, 5);
 
         // Honest run economics recorded.
-        expect(Number(run.amountGhs)).toBeCloseTo(150, 5);
-        expect(Number(run.rateUsed)).toBeCloseTo(15, 5);
+        expect(Number(run.amountGhs)).toBeCloseTo(125, 5);
+        expect(Number(run.rateUsed)).toBeCloseTo(12.5, 5);
 
         const deposits = await prisma.savingsDeposit.findMany({ where: { goalId: goalA.id } });
         expect(deposits.length).toBe(1);
