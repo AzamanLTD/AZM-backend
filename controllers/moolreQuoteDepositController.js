@@ -4,7 +4,10 @@ const crypto = require('crypto');
 const { audit } = require('../utils/audit');
 const logger = require('../src/config/logger');
 const ledger = require('../services/ledgerService'); // §P.4 authoritative ledger (shadow journalIntegration no longer used on this path)
-const settlementCore = require('../src/services/moolreDepositSettlement'); // r15 R15-B shared ONCE-settlement core
+const settlementCore = require('../src/services/moolreDepositSettlement');
+const { QuoteConsumptionError } = require('../src/services/transactionQuoteService');
+const { LATE_DEPOSIT_SETTLEMENT_GRACE_MS } = require('../src/config/lateDepositSettlement');
+const { recordReconciliationException } = require('../services/reconciliationExceptionService'); // r15 R15-B shared ONCE-settlement core
 const {
   createTransactionQuote,
   persistTransactionQuote,
@@ -15,7 +18,6 @@ const {
   getPersistedTransactionQuoteExact,
 } = require('../src/services/transactionQuoteService');
 const fiatLiquidity = require('../src/services/fiatLiquidityService'); // §P.5-D
-const { recordReconciliationException } = require('../services/reconciliationExceptionService');
 const modelBSettlement = require('../services/modelBSettlementService'); // §P.5-E
 const routePolicy = require('../src/services/routePolicyService');
 const { Prisma } = require('@prisma/client');
@@ -316,6 +318,19 @@ exports.initiate = async (req, res) => {
 
 exports.webhook = async (req, res) => {
   const prisma = req.app.get('prisma');
+  // §271 — the catch at the end of this handler needs the economic context
+  // of the failed settlement to build the durable ops record for a
+  // beyond-grace LATE_DEPOSIT_SETTLEMENT (request identity, the locked
+  // deposit row, the quote and the parsed settlement amount). const
+  // declarations inside the try body are BLOCK-scoped and invisible to the
+  // catch — hoist them here so the fail-closed flagging path can always
+  // reference them (undefined when the failure predates their assignment,
+  // which is exactly what the record should show).
+  let externalRef;
+  let settledGhs;
+  let existing;
+  let quoteId;
+  let settlementProviderRef;
   try {
     const expectedSecret = process.env.MOOLRE_WEBHOOK_SECRET;
     if (!expectedSecret) return res.status(503).json({ success: false, message: 'Webhook endpoint not configured.' });
@@ -332,7 +347,7 @@ exports.webhook = async (req, res) => {
     const { status, code, data } = req.body || {};
     if (Number(status) !== 1 || code !== 'P01') return res.status(200).json({ success: true, message: 'Event acknowledged.' });
 
-    const externalRef = data?.externalref;
+    externalRef = data?.externalref;
     if (!externalRef) return res.status(400).json({ success: false, message: 'Missing externalref.' });
     // ── §P.5-D/r10: lossless GHS input boundary (audit r10) — the Moolre
     // settlement amount is parsed through the P5-D exact-decimal authority
@@ -341,14 +356,14 @@ exports.webhook = async (req, res) => {
     // 100.30) are rejected fail-closed BEFORE any evidence row or mutation,
     // and accepted input is never altered on its way to evidence/settlement
     // comparison.
-    let settledGhs;
+
     try {
         settledGhs = fiatLiquidity.toExactGhsDecimal(data?.amount, { field: 'amount' });
     } catch (e) {
         return res.status(400).json({ success: false, message: 'Invalid settlement amount — must be a positive decimal exact to the pesewa (2 decimal places).' });
     }
 
-    const existing = await prisma.transactionHistory.findUnique({ where: { txHash: externalRef } });
+    existing = await prisma.transactionHistory.findUnique({ where: { txHash: externalRef } });
     if (!existing) return res.status(404).json({ success: false, message: 'Unknown reference.' });
 
     // ── §P.5-E audit r13 (§4): early-callback prerequisite, reopened per
@@ -384,7 +399,7 @@ exports.webhook = async (req, res) => {
     //     committing a NULL-ref identity for a deposit whose Moolre payment
     //     may not exist; recording-for-enrichment is not needed because the
     //     stamp necessarily precedes collection success on this surface.
-    const quoteId = existing.metadata?.quoteId ?? null;
+    quoteId = existing.metadata?.quoteId ?? null;
     let routeRow = null;
     if (quoteId) {
         try {
@@ -503,7 +518,7 @@ exports.webhook = async (req, res) => {
     //   * event ref + TH NULL   → stamp TransactionHistory (CAS on NULL)
     //   * both present, differ  → CONTRADICTION — fail closed, NOTHING settles
     //   * equal (or both NULL) → converged — settle on the shared identity
-    let settlementProviderRef;
+
     try {
         settlementProviderRef = await settlementCore.reconcileSettlementProviderRef(prisma, { deposit: existing, providerEvent });
     } catch (refErr) {
@@ -579,6 +594,44 @@ exports.webhook = async (req, res) => {
       },
     });
   } catch (err) {
+    // §271 late-settlement policy (deterministic, non-repricing): an
+    // expired-beyond-grace quote on an already-COLLECTED deposit is never a
+    // bare generic 409. The durable ReconciliationException (idempotent
+    // upsert) gives ops the record; the response names the condition. The
+    // economics stay the quote's own — reconciliation settles at the SAME
+    // original terms, never at the current oracle.
+    if (err instanceof QuoteConsumptionError && err.code === 'QUOTE_EXPIRED') {
+      let flagged = false;
+      try {
+        await recordReconciliationException(prisma, {
+          entityType: 'TRANSACTION',
+          entityId: externalRef,
+          reference: settlementProviderRef || externalRef,
+          reason: 'LATE_DEPOSIT_SETTLEMENT_BEYOND_GRACE',
+          details: {
+            surface: 'MOOLRE_WEBHOOK',
+            quoteId: existing.metadata?.quoteId || null,
+            quoteExpiresAt: existing.metadata?.quoteExpiresAt || null,
+            graceHours: LATE_DEPOSIT_SETTLEMENT_GRACE_MS / 3600000,
+            settledGhs: settledGhs ? settledGhs.toFixed(2) : null,
+            note: 'Provider settlement arrived after the quote grace window — reconcile at the ORIGINAL quoted terms (never reprice).',
+          },
+        });
+        flagged = true;
+      } catch (flagErr) {
+        logger.error({ err: flagErr, externalRef }, '[moolreQuoteDeposit] beyond-grace ReconciliationException persistence FAILED');
+      }
+      return res.status(409).json({
+        success: false,
+        code: 'LATE_DEPOSIT_SETTLEMENT_REQUIRES_RECONCILIATION',
+        message: flagged
+          ? 'The deposit quote expired beyond the late-settlement grace window. The provider observation was retained and an operator reconciliation record was created — the deposit will be settled at its ORIGINAL quoted terms by reconciliation.'
+          : 'The deposit quote expired beyond the late-settlement grace window. The provider observation was retained but the operator reconciliation record could not be created — retrying this callback re-attempts the flagging.',
+      });
+    }
+    if (err instanceof QuoteConsumptionError) {
+      return res.status(err.statusCode || 409).json({ success: false, message: err.message, code: err.code });
+    }
     logger.error({ err }, '[moolreQuoteDeposit] webhook error');
     return res.status(409).json({ success: false, message: err.message });
   }

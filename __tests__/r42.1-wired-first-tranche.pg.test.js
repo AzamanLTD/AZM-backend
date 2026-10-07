@@ -98,16 +98,19 @@ run('r42.1 — wired idempotency, first tranche (PostgreSQL)', () => {
         // Pin the conversion rate for deterministic GHS/USDC arithmetic.
         await prisma.globalSettings.upsert({
             where: { id: 1 },
-            update: { liveUsdToGhs: 15, liveRetailRate: 15 },
-            create: { id: 1, liveUsdToGhs: 15, liveRetailRate: 15 },
+            // §271: pin freshness too — the savings-deposit quote gate is
+            // fail-closed on stale oracle observations (503), so a pinned
+            // rate without fresh timestamps would (correctly) reject.
+            update: { liveUsdToGhs: 15, liveRetailRate: 15, liveRateSource: 'KOTANI_PAY', lastRateSync: new Date(), lastExternalSync: new Date() },
+            create: { id: 1, liveUsdToGhs: 15, liveRetailRate: 15, liveRateSource: 'KOTANI_PAY', lastRateSync: new Date(), lastExternalSync: new Date() },
         }).catch(() => {}); // re-pinned after each TRUNCATE in beforeEach below
     });
 
     beforeEach(async () => {
         await prisma.globalSettings.upsert({
             where: { id: 1 },
-            update: { liveUsdToGhs: 15, liveRetailRate: 15 },
-            create: { id: 1, liveUsdToGhs: 15, liveRetailRate: 15 },
+            update: { liveUsdToGhs: 15, liveRetailRate: 15, liveRateSource: 'KOTANI_PAY', lastRateSync: new Date(), lastExternalSync: new Date() },
+            create: { id: 1, liveUsdToGhs: 15, liveRetailRate: 15, liveRateSource: 'KOTANI_PAY', lastRateSync: new Date(), lastExternalSync: new Date() },
         });
     });
 
@@ -122,6 +125,7 @@ run('r42.1 — wired idempotency, first tranche (PostgreSQL)', () => {
         await prisma.$executeRawUnsafe(
             'TRUNCATE TABLE "User", "SavingsGoal", "SavingsDeposit", "Vault", "VaultDeposit", ' +
             '"PeerTransfer", "Friendship", "TransactionHistory", "Ad", "GlobalSettings", "DirectMessage", ' +
+            '"TransactionQuote", ' +
             '"SystemProfitFees", "LedgerTransaction", "LedgerAccount", "JournalEntry" ' +
             'RESTART IDENTITY CASCADE'
         );

@@ -168,15 +168,63 @@ describe('transaction quote service', () => {
     expect(prisma.$queryRaw).toHaveBeenCalledTimes(1);
   });
 
-  test('rejects a quote when the atomic consume update affects no rows', async () => {
+  // §271 typed fail-closed classification: when the atomic UPDATE affects
+  // no rows the consumer MUST diagnose WHY — the surface distinguishes
+  // not-found (404) / owner mismatch / purpose mismatch / already
+  // consumed / expired, instead of one generic 409 for everything.
+  test('classifies a lost consume race as QUOTE_NOT_FOUND (404)', async () => {
     const prisma = { $queryRaw: jest.fn().mockResolvedValue([]) };
-
     await expect(consumeTransactionQuote({
-      prisma,
-      quoteId: 'quote-1',
-      userId: 42,
-      purpose: 'deposit',
+      prisma, quoteId: 'quote-1', userId: 42, purpose: 'deposit',
       now: new Date('2026-08-29T05:11:00.000Z'),
-    })).rejects.toThrow('invalid, expired, already consumed, or not owned');
+    })).rejects.toMatchObject({ code: 'QUOTE_NOT_FOUND', statusCode: 404 });
+  });
+
+  test('classifies a lost consume race as QUOTE_OWNER_MISMATCH', async () => {
+    const prisma = {
+      $queryRaw: jest.fn()
+        .mockResolvedValueOnce([])                                   // UPDATE: no rows
+        .mockResolvedValueOnce([{ userId: 43, purpose: 'deposit', consumedAt: null, expiresAt: new Date('2026-08-29T05:10:00.000Z') }]),
+    };
+    await expect(consumeTransactionQuote({
+      prisma, quoteId: 'quote-1', userId: 42, purpose: 'deposit',
+      now: new Date('2026-08-29T05:11:00.000Z'),
+    })).rejects.toMatchObject({ code: 'QUOTE_OWNER_MISMATCH' });
+  });
+
+  test('classifies a lost consume race as QUOTE_PURPOSE_MISMATCH', async () => {
+    const prisma = {
+      $queryRaw: jest.fn()
+        .mockResolvedValueOnce([])
+        .mockResolvedValueOnce([{ userId: 42, purpose: 'usdc_purchase', consumedAt: null, expiresAt: new Date('2026-08-29T05:10:00.000Z') }]),
+    };
+    await expect(consumeTransactionQuote({
+      prisma, quoteId: 'quote-1', userId: 42, purpose: 'deposit',
+      now: new Date('2026-08-29T05:11:00.000Z'),
+    })).rejects.toMatchObject({ code: 'QUOTE_PURPOSE_MISMATCH' });
+  });
+
+  test('classifies a lost consume race as QUOTE_ALREADY_CONSUMED', async () => {
+    const prisma = {
+      $queryRaw: jest.fn()
+        .mockResolvedValueOnce([])
+        .mockResolvedValueOnce([{ userId: 42, purpose: 'deposit', consumedAt: new Date('2026-08-29T05:05:00.000Z'), expiresAt: new Date('2026-08-29T05:10:00.000Z') }]),
+    };
+    await expect(consumeTransactionQuote({
+      prisma, quoteId: 'quote-1', userId: 42, purpose: 'deposit',
+      now: new Date('2026-08-29T05:11:00.000Z'),
+    })).rejects.toMatchObject({ code: 'QUOTE_ALREADY_CONSUMED' });
+  });
+
+  test('classifies a lost consume race as QUOTE_EXPIRED (default grace)', async () => {
+    const prisma = {
+      $queryRaw: jest.fn()
+        .mockResolvedValueOnce([])
+        .mockResolvedValueOnce([{ userId: 42, purpose: 'deposit', consumedAt: null, expiresAt: new Date('2026-08-29T05:10:00.000Z') }]),
+    };
+    await expect(consumeTransactionQuote({
+      prisma, quoteId: 'quote-1', userId: 42, purpose: 'deposit',
+      now: new Date('2026-08-29T05:11:00.000Z'),
+    })).rejects.toMatchObject({ code: 'QUOTE_EXPIRED' });
   });
 });

@@ -177,8 +177,10 @@ describeOrSkip('r16 P0-E: Savings withdrawal atomic claim', () => {
         // would read a stale rate. Upsert pins BOTH rates explicitly.
         await prisma.globalSettings.upsert({
             where: { id: 1 },
-            update: { liveUsdToGhs: 15, liveRetailRate: 15 }, // USDC→GHS 1:15 for readability
-            create: { id: 1, liveUsdToGhs: 15, liveRetailRate: 15 },
+            // §271: the savings-deposit/withdraw quote gate is fail-closed on
+            // stale oracle observations — pin freshness alongside the rate.
+            update: { liveUsdToGhs: 15, liveRetailRate: 15, liveRateSource: 'KOTANI_PAY', lastRateSync: new Date(), lastExternalSync: new Date() }, // USDC→GHS 1:15 for readability
+            create: { id: 1, liveUsdToGhs: 15, liveRetailRate: 15, liveRateSource: 'KOTANI_PAY', lastRateSync: new Date(), lastExternalSync: new Date() },
         });
         const goal = await prisma.savingsGoal.create({
             data: {
@@ -214,8 +216,8 @@ describeOrSkip('r16 P0-E: Savings withdrawal atomic claim', () => {
         const user = await seedUser(prisma, { availableBalance: 0, escrowLockedBalance: 100 });
         await prisma.globalSettings.upsert({
             where: { id: 1 },
-            update: { liveUsdToGhs: 15, liveRetailRate: 15 },
-            create: { id: 1, liveUsdToGhs: 15, liveRetailRate: 15 },
+            update: { liveUsdToGhs: 15, liveRetailRate: 15, liveRateSource: 'KOTANI_PAY', lastRateSync: new Date(), lastExternalSync: new Date() },
+            create: { id: 1, liveUsdToGhs: 15, liveRetailRate: 15, liveRateSource: 'KOTANI_PAY', lastRateSync: new Date(), lastExternalSync: new Date() },
         });
         const goal = await prisma.savingsGoal.create({
             data: {

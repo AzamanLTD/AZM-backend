@@ -261,13 +261,20 @@ async function seedSavingsGoal(prisma, overrides = {}) {
     // Goal funds are escrow-backed: the deposit path increments the user's
     // escrowLockedBalance by the GHS amount converted at the canonical
     // default rate (15.0, mirroring the controller's fallback when no
-    // GlobalSettings row exists). Seeding goal funds without the matching
-    // escrow projection violates User_escrowLockedBalance_nonneg on withdraw.
+    // GlobalSettings row exists), projected at the platform-wide 8dp HALF_UP
+    // standard (§271 — withdraw releases at the SAME 8dp projection, so a
+    // coarser 6dp seed would underflow the nonneg CHECK by sub-pesewa dust).
+    // Seeding goal funds without the matching escrow projection violates
+    // User_escrowLockedBalance_nonneg on withdraw.
     const seededGhs = g.currentAmountGhs ?? 0;
     if (seededGhs > 0) {
+        const { Prisma } = require('@prisma/client');
+        const escrowExact = new Prisma.Decimal(String(seededGhs))
+            .div(new Prisma.Decimal(15.0))
+            .toDecimalPlaces(8, Prisma.Decimal.ROUND_HALF_UP);
         await prisma.user.update({
             where: { id: user.id },
-            data:  { escrowLockedBalance: { increment: parseFloat((seededGhs / 15.0).toFixed(6)) } },
+            data:  { escrowLockedBalance: { increment: escrowExact } },
         });
     }
     return { user, goal };

@@ -6,7 +6,11 @@
 CREATE TABLE IF NOT EXISTS "TransactionQuote" (
   "id" UUID PRIMARY KEY,
   "userId" INTEGER NOT NULL REFERENCES "User"("id") ON DELETE CASCADE,
-  "purpose" TEXT NOT NULL CHECK ("purpose" IN ('deposit', 'usdc_purchase', 'withdrawal', 'local_wallet')),
+  -- §271: savings_deposit/savings_withdrawal joined the quote authority
+  -- (savings GHS↔USDC conversions are quote-backed like every other
+  -- market-priced operation). The overlay re-normalizes this constraint on
+  -- databases where the table predates the widening.
+  "purpose" TEXT NOT NULL CHECK ("purpose" IN ('deposit', 'usdc_purchase', 'withdrawal', 'local_wallet', 'savings_deposit', 'savings_withdrawal')),
   "amountGhs" DECIMAL(20,8) NOT NULL CHECK ("amountGhs" > 0),
   "feeGhs" DECIMAL(20,8) NOT NULL DEFAULT 0 CHECK ("feeGhs" >= 0),
   "netGhs" DECIMAL(20,8) NOT NULL CHECK ("netGhs" >= 0),

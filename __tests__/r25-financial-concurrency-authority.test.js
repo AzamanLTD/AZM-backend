@@ -81,8 +81,10 @@ describeOrSkip('r25 financial concurrency authority (real PostgreSQL)', () => {
     const ensureSettings = (rate = 12.5) =>
         prisma.globalSettings.upsert({
             where: { id: 1 },
-            update: { liveUsdToGhs: rate },
-            create: { id: 1, liveUsdToGhs: rate },
+            // §271: savings-deposit quotes gate on retail-rate freshness —
+            // pin retail + freshness alongside the legacy USD/GHS pin.
+            update: { liveUsdToGhs: rate, liveRetailRate: rate, liveRateSource: 'KOTANI_PAY', lastRateSync: new Date(), lastExternalSync: new Date() },
+            create: { id: 1, liveUsdToGhs: rate, liveRetailRate: rate, liveRateSource: 'KOTANI_PAY', lastRateSync: new Date(), lastExternalSync: new Date() },
         });
 
     const mockApp = () => ({

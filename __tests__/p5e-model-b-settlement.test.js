@@ -604,15 +604,41 @@ describeOrSkip('§P.5-E Model B settlement / inventory cost-basis realization (r
             expect(await prisma.modelBSettlement.count()).toBe(0);
         });
 
-        test('a stale/expired quote fails closed with zero mutation', async () => {
+        test('a quote expired beyond the late-settlement grace fails closed with zero economic mutation', async () => {
             const { pending } = await seedScenario();
-            await prisma.$executeRaw`UPDATE "TransactionQuote" SET "expiresAt" = NOW() - INTERVAL '60 seconds' WHERE "id" = ${pending.metadata.quoteId}::uuid`;
+            // §271: an expiry only slightly in the past is now legitimately
+            // WITHIN the bounded late-settlement grace window (the paid
+            // deposit still settles at its ORIGINAL quoted terms — never
+            // repriced; see r271d-late-deposit-settlement.test.js). The
+            // fail-closed boundary this suite proves is BEYOND that grace.
+            const { LATE_DEPOSIT_SETTLEMENT_GRACE_MS } = require('../src/config/lateDepositSettlement');
+            const beyondGraceSeconds = Math.ceil(LATE_DEPOSIT_SETTLEMENT_GRACE_MS / 1000) + 60;
+            await prisma.$executeRaw`UPDATE "TransactionQuote" SET "expiresAt" = NOW() - (${beyondGraceSeconds} * INTERVAL '1 second') WHERE "id" = ${pending.metadata.quoteId}::uuid`;
             const res = await moolreWebhook(pending.txHash, 100);
             expect(res.statusCode).toBe(409);
-            expect(res.payload.message).toMatch(/quote/i);
+            expect(res.payload.code).toBe('LATE_DEPOSIT_SETTLEMENT_REQUIRES_RECONCILIATION');
+            // fail closed: no settlement, no inventory realization
             expect((await prisma.transactionHistory.findUnique({ where: { id: pending.id } })).status).toBe('PENDING');
             expect(await prisma.modelBSettlement.count()).toBe(0);
             expect(await prisma.inventoryLotConsumption.count()).toBe(0);
+            // the deliberate durable ops record (evidence, not economics)
+            const flagged = await prisma.$queryRaw`SELECT COUNT(*)::int AS n FROM "ReconciliationException" WHERE "entityId" = ${pending.txHash} AND "reason" = 'LATE_DEPOSIT_SETTLEMENT_BEYOND_GRACE'`;
+            expect(flagged[0].n).toBe(1);
+        });
+
+        test('a quote merely expired (within the late-settlement grace) still settles at its ORIGINAL terms', async () => {
+            const { user, pending } = await seedScenario();
+            // 60 seconds past expiry: inside the grace window — the paid
+            // deposit settles at the QUOTED rate, never repriced.
+            await prisma.$executeRaw`UPDATE "TransactionQuote" SET "expiresAt" = NOW() - INTERVAL '60 seconds' WHERE "id" = ${pending.metadata.quoteId}::uuid`;
+            const res = await moolreWebhook(pending.txHash, 100);
+            expect(res.statusCode).toBe(200);
+            const settled = await prisma.transactionHistory.findUnique({ where: { id: pending.id } });
+            expect(settled.status).toBe('COMPLETED');
+            const meta = typeof settled.metadata === 'string' ? JSON.parse(settled.metadata) : settled.metadata;
+            expect(meta.lateSettlement).toBe(true);
+            expect((await prisma.$queryRaw`SELECT COUNT(*)::int AS n FROM "ReconciliationException" WHERE "entityId" = ${pending.txHash}`)[0].n).toBe(0);
+            expect(Number((await prisma.user.findUnique({ where: { id: user.id } })).availableBalance)).toBeGreaterThan(0);
         });
 
         test('a late contradictory FAILED callback cannot unwind a committed settlement', async () => {

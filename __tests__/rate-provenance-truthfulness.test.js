@@ -324,21 +324,25 @@ describeOrSkip('Rate provenance truthfulness (real PostgreSQL) — issue #271 / 
     test('G. a fresh TransactionQuote snapshots the TRUE external observation timestamp', async () => {
         await seedSettings({ liveRetailRate: 13.42, liveUsdToGhs: 13.10, lastExternalSync: null });
 
-        const { getServerRateGhsPerUsdc, createServerTransactionQuote } = require('../src/services/transactionQuoteService');
+        const {
+            getFreshServerRateGhsPerUsdc,
+            createServerTransactionQuote,
+            RateUnavailableError,
+        } = require('../src/services/transactionQuoteService');
 
-        // Pre-271B historical row: no external provenance recorded → honest
-        // fallback to the legacy field, never a fabricated fresh timestamp.
+        // §271C: pre-271B historical row — no external provenance recorded.
+        // The quote authority no longer trusts the legacy lastRateSync as a
+        // substitute (the old honest-fallback reader is retired): with NULL
+        // external provenance, quote creation FAILS CLOSED.
         const legacyTs = new Date('2026-09-01T09:15:00.000Z');
         await seedSettings({ lastExternalSync: null, lastRateSync: legacyTs });
-        const legacy = await getServerRateGhsPerUsdc({ prisma });
-        expect(legacy.rateGhsPerUsdc).toBe(13.42);
-        expect(legacy.rateAsOf.getTime()).toBe(legacyTs.getTime());
+        await expect(getFreshServerRateGhsPerUsdc({ prisma })).rejects.toBeInstanceOf(RateUnavailableError);
 
         // A genuine external observation now exists.
         await makeOracle(12.75).fetchAndUpdateRates();
         const externalRow = await getSettings();
 
-        const rate = await getServerRateGhsPerUsdc({ prisma });
+        const rate = await getFreshServerRateGhsPerUsdc({ prisma });
         expect(rate.rateSource).toBe('KOTANI_PAY');
         expect(rate.rateAsOf.getTime()).toBe(externalRow.lastExternalSync.getTime());
 
@@ -408,12 +412,17 @@ describeOrSkip('Rate provenance truthfulness (real PostgreSQL) — issue #271 / 
             lastEchoAt: null,
         });
 
-        // Quote snapshot service must not throw; it honestly falls back to the
-        // legacy field rather than fabricating a fresh timestamp.
-        const { getServerRateGhsPerUsdc } = require('../src/services/transactionQuoteService');
-        const rate = await getServerRateGhsPerUsdc({ prisma });
-        expect(rate.rateGhsPerUsdc).toBe(13.42);
-        expect(rate.rateAsOf.getTime()).toBe(new Date('2026-09-16T08:00:00.000Z').getTime());
+        // §271C: with NULL external provenance the QUOTE authority fails
+        // closed (it must not mint a quote at a rate whose freshness is
+        // unprovable — the legacy lastRateSync is no longer a substitute).
+        // The READ MODELS below still expose the cached rate and the honest
+        // NULL provenance: a pre-271B row is safe everywhere, it just cannot
+        // back NEW quote creation.
+        const {
+            getFreshServerRateGhsPerUsdc,
+            RateUnavailableError,
+        } = require('../src/services/transactionQuoteService');
+        await expect(getFreshServerRateGhsPerUsdc({ prisma })).rejects.toBeInstanceOf(RateUnavailableError);
 
         // Public oracle endpoints expose NULL provenance honestly.
         const express = require('express');

@@ -36,7 +36,31 @@ const { audit } = require('../utils/audit');
 const logger = require('../src/config/logger');
 const { Prisma } = require('@prisma/client');
 const ledger = require('../services/ledgerService');
+const {
+    createServerTransactionQuote,
+    consumeTransactionQuote,
+    RateUnavailableError,
+    QuoteConsumptionError,
+} = require('../src/services/transactionQuoteService');
 const _exact = (n) => (n instanceof Prisma.Decimal ? n.toFixed(8) : Number(n).toFixed(8));
+
+// §271 savings quote authority: a savings deposit/withdrawal converts
+// GHS↔USDC, so it is a market-priced financial operation. Each request now
+// goes through the ONE shared TransactionQuote authority — created through
+// the same fail-closed freshness gate as every other quote (no execution-time
+// GlobalSettings read), consumed exactly-once inside the economic
+// transaction, and settled at the QUOTED rate (a mid-flight oracle move can
+// never reprice a savings operation). TTL only covers an orphaned quote after
+// a crash between creation and consumption — normal flow consumes in the
+// same request.
+const SAVINGS_QUOTE_TTL_SECONDS = 120;
+// 12dp persisted quote → 8dp ledger projection, exactly like the fiat
+// deposit settlement (ONE HALF_UP projection; every authoritative write
+// below consumes this same value so the balance, SavingsDeposit row and
+// ledger lines can never disagree).
+const _usdc8dp = (quote) =>
+    new Prisma.Decimal(quote.usdcAmountExact ?? String(quote.usdcAmount))
+        .toDecimalPlaces(8, Prisma.Decimal.ROUND_HALF_UP);
 
 const VALID_FREQUENCIES = ['DAILY', 'WEEKLY', 'BIWEEKLY', 'MONTHLY'];
 
@@ -279,12 +303,52 @@ exports.deposit = async (req, res) => {
             return res.status(404).json({ success: false, message: 'Active savings goal not found.' });
         }
 
-        // Get live rate for USDC conversion
-        const settings = await prisma.globalSettings.findUnique({ where: { id: 1 } });
-        const liveRate = settings ? settings.liveUsdToGhs : 15.0;
-        const amountUsdc = parseFloat((parseFloat(amountGhs) / liveRate).toFixed(6));
+        // §271 — quote-backed conversion rate (was: execution-time
+        // liveUsdToGhs read with no freshness check and no snapshot — the
+        // last stale-exposure money path in the app). The quote is created
+        // through the fail-closed freshness gate; the USDC amount below is
+        // the quote's OWN exact persisted amount, never recomputed.
+        let quote;
+        try {
+            quote = await createServerTransactionQuote({
+                prisma,
+                userId,
+                purpose: 'savings_deposit',
+                amountGhs: parseFloat(amountGhs),
+                feeGhs: 0,
+                ttlSeconds: SAVINGS_QUOTE_TTL_SECONDS,
+            });
+        } catch (rateErr) {
+            if (rateErr instanceof RateUnavailableError) {
+                return res.status(503).json({
+                    success: false,
+                    code: rateErr.code,
+                    message: rateErr.message,
+                });
+            }
+            throw rateErr;
+        }
+        const amountUsdcLedgerExact = _usdc8dp(quote);
+        const amountUsdc = amountUsdcLedgerExact.toNumber();
+        // The quote is the economic contract: the pesewa-precise amount it
+        // priced (HALF_UP from the requested amount) is the amount that
+        // moves everywhere — the raw request value never reaches the goal
+        // arithmetic (sub-pesewa inputs round like every other GHS
+        // settlement in the platform).
+        const depositGhsExact = new Prisma.Decimal(quote.amountGhsExact ?? String(quote.amountGhs));
 
         const result = await prisma.$transaction(async (tx) => {
+            // §271 — exactly-once quote consumption is the FIRST mutation of
+            // the economic transaction: it commits with the money or rolls
+            // back with it. A duplicate execution of the same quote can
+            // never double-debit.
+            const consumedQuote = await consumeTransactionQuote({
+                prisma: tx,
+                quoteId: quote.id,
+                userId,
+                purpose: 'savings_deposit',
+            });
+            void consumedQuote;
             // r25 P1 — the goal row is locked FOR UPDATE INSIDE the money
             // transaction (same rigor as the withdrawal path, r16 P0-E).
             // The old code read the goal before the transaction and computed
@@ -310,11 +374,11 @@ exports.deposit = async (req, res) => {
             const debit = await tx.user.updateMany({
                 where: {
                     id: userId,
-                    availableBalance: { gte: amountUsdc }
+                    availableBalance: { gte: amountUsdcLedgerExact }
                 },
                 data: {
-                    availableBalance: { decrement: amountUsdc },
-                    escrowLockedBalance: { increment: amountUsdc }
+                    availableBalance: { decrement: amountUsdcLedgerExact },
+                    escrowLockedBalance: { increment: amountUsdcLedgerExact }
                 }
             });
             if (debit.count !== 1) {
@@ -329,7 +393,7 @@ exports.deposit = async (req, res) => {
             // Credit the savings goal — derived from the LOCKED row.
             const lockedCurrent = new Prisma.Decimal(lockedGoal.currentAmountGhs);
             const lockedTarget = new Prisma.Decimal(lockedGoal.targetAmountGhs);
-            const depositGhs = new Prisma.Decimal(String(amountGhs));
+            const depositGhs = depositGhsExact;
             const isOnTime = lockedGoal.nextDueDate && new Date() <= new Date(lockedGoal.nextDueDate);
             const newStreak = isOnTime ? lockedGoal.streakCount + 1 : 0; // Reset streak if late
             const newLongest = Math.max(newStreak, lockedGoal.longestStreak);
@@ -338,7 +402,7 @@ exports.deposit = async (req, res) => {
             const updatedGoal = await tx.savingsGoal.update({
                 where: { id },
                 data: {
-                    currentAmountGhs: { increment: parseFloat(amountGhs) },
+                    currentAmountGhs: { increment: depositGhsExact },
                     totalDeposits: { increment: 1 },
                     streakCount: newStreak,
                     longestStreak: newLongest,
@@ -356,8 +420,8 @@ exports.deposit = async (req, res) => {
                 data: {
                     goalId: id,
                     userId,
-                    amountGhs: parseFloat(amountGhs),
-                    amountUsdc,
+                    amountGhs: depositGhsExact,
+                    amountUsdc: amountUsdcLedgerExact,
                     type: type || (isOnTime ? 'SCHEDULED' : 'MANUAL'),
                     status: 'COMPLETED'
                 }
@@ -379,7 +443,19 @@ exports.deposit = async (req, res) => {
                     amountUsdc: -amountUsdc, // signed: outflow from spendable balance
                     feeUsdc: 0,
                     txHash: depositTxHash,
-                    status: 'COMPLETED'
+                    status: 'COMPLETED',
+                    // §271 — durable rate provenance on the money row: the
+                    // quote identity and rate snapshot survive for audit
+                    // (no execution-time repricing is possible at all, but
+                    // the evidence of WHICH rate moved the money stays).
+                    metadata: {
+                        quoteId: quote.id,
+                        quotedRate: quote.rateGhsPerUsdc,
+                        rateSource: quote.rateSource,
+                        rateAsOf: quote.rateAsOf,
+                        amountGhsExact: depositGhsExact.toFixed(2),
+                        usdcLedgerExact: amountUsdcLedgerExact.toFixed(8),
+                    }
                 }
             });
 
@@ -397,8 +473,8 @@ exports.deposit = async (req, res) => {
                 relatedEntityId: id,
                 metadata: { depositId: deposit ? deposit.id : null, amountGhs: _exact(parseFloat(amountGhs)) },
                 lines: [
-                    { account: `user:${userId}:liability`, debit: _exact(amountUsdc) },
-                    { account: `escrow:savings-${id}:locked`, credit: _exact(amountUsdc) },
+                    { account: `user:${userId}:liability`, debit: amountUsdcLedgerExact.toFixed(8) },
+                    { account: `escrow:savings-${id}:locked`, credit: amountUsdcLedgerExact.toFixed(8) },
                 ],
             });
 
@@ -418,7 +494,12 @@ exports.deposit = async (req, res) => {
                     deposit,
                     goal: updatedGoal,
                     streak: newStreak,
-                    amountUsdc
+                    amountUsdc,
+                    // §271 — the rate that actually moved the money.
+                    quotedRate: quote.rateGhsPerUsdc,
+                    rateSource: quote.rateSource,
+                    rateAsOf: quote.rateAsOf,
+                    quoteId: quote.id
                 }
             };
             if (operation) {
@@ -481,6 +562,12 @@ exports.deposit = async (req, res) => {
                 message: 'Deposit already processed (concurrent idempotent replay).'
             });
         }
+        // §271 typed fail-closed surfaces: a stale/unavailable external rate
+        // is a 503 the client may retry (the idempotency middleware's RELEASE
+        // policy frees the claim); a lost quote-consumption race is a 409.
+        if (error instanceof QuoteConsumptionError) {
+            return res.status(error.statusCode || 409).json({ success: false, message: error.message, code: error.code });
+        }
         logger.error({ err: error }, '[savings.deposit] error');
         return res.status(400).json({ success: false, message: error.message });
     }
@@ -522,6 +609,58 @@ exports.withdraw = async (req, res) => {
             });
         }
 
+        // §271 — quote-backed conversion rate (was: execution-time
+        // liveUsdToGhs read inside the money transaction). The quote is
+        // created through the fail-closed freshness gate BEFORE the
+        // economic transaction, at the request's explicit amount — or, for
+        // a withdraw-all request, at the currently persisted goal amount.
+        // The economic transaction re-validates everything against the
+        // locked row: if the goal moved concurrently and no longer matches
+        // the quoted amount, the withdrawal fails closed (nothing releases)
+        // and the client retries with an explicit amount.
+        const explicitWithdrawGhs = amountGhs != null && amountGhs !== '' ? String(amountGhs) : null;
+        let quotedWithdrawGhs = explicitWithdrawGhs;
+        if (!quotedWithdrawGhs) {
+            // Same scoping as the locked in-transaction read below
+            // (id + userId, no status filter): lifecycle decisions stay
+            // with the locked row, never this advisory pre-read.
+            const preGoal = await prisma.savingsGoal.findFirst({
+                where: { id, userId },
+                select: { currentAmountGhs: true }
+            });
+            if (!preGoal) {
+                return res.status(404).json({ success: false, message: 'Active savings goal not found.' });
+            }
+            // Pesewa projection with the SAME HALF_UP rule the in-tx
+            // locked-row check uses — the quote and the check can never
+            // disagree about the goal amount.
+            quotedWithdrawGhs = new Prisma.Decimal(preGoal.currentAmountGhs)
+                .toDecimalPlaces(2, Prisma.Decimal.ROUND_HALF_UP)
+                .toFixed(2);
+        }
+        let quote;
+        try {
+            quote = await createServerTransactionQuote({
+                prisma,
+                userId,
+                purpose: 'savings_withdrawal',
+                amountGhs: parseFloat(new Prisma.Decimal(quotedWithdrawGhs).toFixed(2)),
+                feeGhs: 0,
+                ttlSeconds: SAVINGS_QUOTE_TTL_SECONDS,
+            });
+        } catch (rateErr) {
+            if (rateErr instanceof RateUnavailableError) {
+                return res.status(503).json({
+                    success: false,
+                    code: rateErr.code,
+                    message: rateErr.message,
+                });
+            }
+            throw rateErr;
+        }
+        // The quote's rate is the ONLY conversion rate in this operation.
+        const withdrawRateExact = new Prisma.Decimal(quote.rateGhsPerUsdcExact ?? String(quote.rateGhsPerUsdc));
+
         // r16 P0-E: the goal row is locked FOR UPDATE INSIDE the money
         // transaction and every amount is derived from that locked
         // authoritative state. The old code read the goal before the
@@ -554,11 +693,46 @@ exports.withdraw = async (req, res) => {
             if (goal.status === 'CANCELLED') throw new Error('This savings goal has been cancelled.');
 
             const goalAmount = new Prisma.Decimal(goal.currentAmountGhs);
-            const withdrawAmount = amountGhs ? new Prisma.Decimal(String(amountGhs)) : goalAmount;
-            if (withdrawAmount.lte(0) || withdrawAmount.gt(goalAmount)) {
+            let withdrawAmount = new Prisma.Decimal(quote.amountGhsExact ?? String(quote.amountGhs));
+            // §271 — the locked authoritative row must still match the
+            // QUOTED economics. For a withdraw-all request the quote was
+            // minted from a pre-read of currentAmountGhs; a concurrent
+            // deposit/withdraw that moved the locked row makes that quote
+            // stale for THIS goal state — fail closed (the quote is left
+            // unconsumed and expires; the client retries with an explicit
+            // amount). Never settle a withdrawal at a quote whose amount no
+            // longer describes the locked goal. Legacy goals may carry
+            // sub-pesewa residue from pre-271 float deposits — the quote is
+            // pesewa-precise, so the withdraw-all comparison runs against
+            // the goal's OWN pesewa projection (identical HALF_UP rule),
+            // and the dust is absorbed at the goal update below.
+            const goalPesewa = goalAmount.toDecimalPlaces(2, Prisma.Decimal.ROUND_HALF_UP);
+            if (!explicitWithdrawGhs && !withdrawAmount.eq(goalPesewa)) {
+                const err = new Error(
+                    'The savings goal changed while the withdrawal quote was being prepared. Please retry the withdrawal.'
+                );
+                err.code = 'SAVINGS_GOAL_MOVED';
+                throw err;
+            }
+            if (withdrawAmount.lte(0) || withdrawAmount.gt(explicitWithdrawGhs ? goalAmount : goalPesewa)) {
                 throw new Error(
                     `Cannot withdraw GHS ${withdrawAmount.toFixed(2)}. Available: GHS ${goalAmount.toFixed(2)}.`
                 );
+            }
+
+            // §271 — legacy sub-pesewa residue. The withdraw-all quote was
+            // minted at the goal's pesewa projection (10.005 → 10.01), but
+            // the ACTUAL money the goal holds — and that its escrow
+            // projection locked — is the float residue (10.005). When the
+            // quote exceeds the locked row by less than half a pesewa of
+            // dust, settle at the ACTUAL money: the escrow projection
+            // releases exactly what it locked, no sub-pesewa USDC is
+            // minted from a pesewa rounding, and the dust is absorbed by
+            // the goal update below (the goal fully drains either way).
+            if (!explicitWithdrawGhs
+                && withdrawAmount.gt(goalAmount)
+                && withdrawAmount.minus(goalAmount).lte(new Prisma.Decimal('0.005'))) {
+                withdrawAmount = goalAmount;
             }
 
             // Check if early withdrawal (penalty applies) — derived from the
@@ -569,22 +743,26 @@ exports.withdraw = async (req, res) => {
             const penaltyGhs = withdrawAmount.mul(penaltyRate).toFixed(2);
             const netWithdrawGhs = withdrawAmount.minus(new Prisma.Decimal(penaltyGhs));
 
-            const settings = await tx.globalSettings.findUnique({ where: { id: 1 } });
-            const liveRate = settings ? Number(settings.liveUsdToGhs) : 15.0;
-            const netUsdc = Number(netWithdrawGhs.div(liveRate).toFixed(6));
-            const penaltyUsdc = Number(new Prisma.Decimal(penaltyGhs).div(liveRate).toFixed(6));
+            // §271 — the conversion rate is the QUOTE's, fixed at
+            // initiation; the mid-flight oracle can never reprice this
+            // withdrawal. Exact decimals: 2dp GHS parts / 8dp quoted rate,
+            // projected ONCE at 8dp HALF_UP for the ledger authority (the
+            // same projection standard as every other settlement).
+            const netUsdcExact = netWithdrawGhs.div(withdrawRateExact).toDecimalPlaces(8, Prisma.Decimal.ROUND_HALF_UP);
+            const penaltyUsdcExact = new Prisma.Decimal(penaltyGhs).div(withdrawRateExact).toDecimalPlaces(8, Prisma.Decimal.ROUND_HALF_UP);
+            const netUsdc = netUsdcExact.toNumber();
+            const penaltyUsdc = penaltyUsdcExact.toNumber();
 
             // Credit user's available balance (minus penalty). §P.4: the
             // goal restriction is released for the full net+penalty — the
             // projection escrow column moves with the same money the ledger
             // escrow account drains.
             {
-                const releasedExact = new Prisma.Decimal(_exact(netUsdc))
-                    .plus(new Prisma.Decimal(_exact(penaltyUsdc)));
+                const releasedExact = netUsdcExact.plus(penaltyUsdcExact);
                 await tx.user.update({
                     where: { id: userId },
                     data: {
-                        availableBalance: { increment: netUsdc },
+                        availableBalance: { increment: netUsdcExact },
                         escrowLockedBalance: { decrement: releasedExact }
                     }
                 });
@@ -594,19 +772,35 @@ exports.withdraw = async (req, res) => {
             if (penaltyUsdc > 0) {
                 await tx.systemProfitFees.upsert({
                     where: { id: 1 },
-                    update: { balance: { increment: penaltyUsdc } },
-                    create: { id: 1, balance: penaltyUsdc }
+                    update: { balance: { increment: penaltyUsdcExact } },
+                    create: { id: 1, balance: penaltyUsdcExact }
                 });
             }
 
-            // Update goal — computed from the locked row's own amount
+            // Update goal — computed from the locked row's own amount.
+            // Sub-pesewa residue from pre-271 float deposits is dust: when
+            // the remainder is smaller than half a pesewa the goal is
+            // treated as fully drained (the GHS bookkeeping squares at
+            // pesewa precision, the platform-wide GHS contract).
             const newAmount = goalAmount.minus(withdrawAmount);
+            const dustResidue = newAmount.abs().lt(new Prisma.Decimal('0.005'));
             const updatedGoal = await tx.savingsGoal.update({
                 where: { id },
                 data: {
-                    currentAmountGhs: newAmount.lt(0) ? new Prisma.Decimal(0) : newAmount,
-                    status: newAmount.lte(0) ? 'CANCELLED' : goal.status
+                    currentAmountGhs: (newAmount.lt(0) || dustResidue) ? new Prisma.Decimal(0) : newAmount,
+                    status: (newAmount.lte(0) || dustResidue) ? 'CANCELLED' : goal.status
                 }
+            });
+
+            // §271 — exactly-once quote consumption is the FIRST mutation
+            // of the economic transaction: it commits with the money or
+            // rolls back with it. A duplicate execution of the same quote
+            // can never double-credit.
+            await consumeTransactionQuote({
+                prisma: tx,
+                quoteId: quote.id,
+                userId,
+                purpose: 'savings_withdrawal',
             });
 
             const withdrawHistory = await tx.transactionHistory.create({
@@ -616,7 +810,17 @@ exports.withdraw = async (req, res) => {
                     amountUsdc: netUsdc, // signed: inflow into spendable balance
                     feeUsdc: 0,          // penalty already deducted before crediting
                     txHash: replayHash || `SAVINGS_WD_${id}_${Date.now()}`,
-                    status: 'COMPLETED'
+                    status: 'COMPLETED',
+                    // §271 — durable rate provenance on the money row.
+                    metadata: {
+                        quoteId: quote.id,
+                        quotedRate: quote.rateGhsPerUsdc,
+                        rateSource: quote.rateSource,
+                        rateAsOf: quote.rateAsOf,
+                        withdrawnGhsExact: withdrawAmount.toFixed(2),
+                        netUsdcExact: netUsdcExact.toFixed(8),
+                        penaltyUsdcExact: penaltyUsdcExact.toFixed(8),
+                    }
                 }
             });
 
@@ -628,13 +832,13 @@ exports.withdraw = async (req, res) => {
             //   C revenue:fees                   — early-withdrawal penalty
             //       realized (mirrors the SystemProfitFees increment above)
             {
-                const grossDebit = new Prisma.Decimal(_exact(netUsdc)).plus(new Prisma.Decimal(_exact(penaltyUsdc)));
+                const grossDebit = netUsdcExact.plus(penaltyUsdcExact);
                 const lines = [
                     { account: `escrow:savings-${id}:locked`, debit: grossDebit.toFixed(8) },
-                    { account: `user:${userId}:liability`, credit: _exact(netUsdc) },
+                    { account: `user:${userId}:liability`, credit: netUsdcExact.toFixed(8) },
                 ];
-                if (penaltyUsdc > 0) {
-                    lines.push({ account: 'revenue:fees', credit: _exact(penaltyUsdc) });
+                if (penaltyUsdcExact.greaterThan(0)) {
+                    lines.push({ account: 'revenue:fees', credit: penaltyUsdcExact.toFixed(8) });
                 }
                 await ledger.post(tx, {
                     idempotencyKey: `ledger:savings:withdraw:${withdrawHistory.id}`,
@@ -654,7 +858,7 @@ exports.withdraw = async (req, res) => {
             if (penaltyUsdc > 0) {
                 await tx.adminProfitLog.create({
                     data: {
-                        amountUsdc: penaltyUsdc,
+                        amountUsdc: penaltyUsdcExact,
                         source: 'SAVINGS_FEE',
                         relatedTxId: `savings_penalty_${id}_${Date.now()}`
                     }
@@ -677,7 +881,12 @@ exports.withdraw = async (req, res) => {
                     netReceivedUsdc: netUsdc,
                     isEarlyWithdrawal,
                     penaltyRate,
-                    goal: updatedGoal
+                    goal: updatedGoal,
+                    // §271 — the rate that actually moved the money.
+                    quotedRate: quote.rateGhsPerUsdc,
+                    rateSource: quote.rateSource,
+                    rateAsOf: quote.rateAsOf,
+                    quoteId: quote.id
                 }
             };
             if (operation) {
@@ -733,6 +942,16 @@ exports.withdraw = async (req, res) => {
         return res.status(200).json(result.body);
 
     } catch (error) {
+        // §271 typed fail-closed surfaces (same contract as deposit): a
+        // stale/unavailable external rate is a retryable 503; a lost
+        // quote-consumption race is a 409; a goal that moved under the
+        // withdraw-all quote is a retryable 409.
+        if (error instanceof QuoteConsumptionError) {
+            return res.status(error.statusCode || 409).json({ success: false, message: error.message, code: error.code });
+        }
+        if (error.code === 'SAVINGS_GOAL_MOVED') {
+            return res.status(409).json({ success: false, message: error.message, code: error.code });
+        }
         logger.error({ err: error }, '[savings.withdraw] error');
         return res.status(400).json({ success: false, message: error.message });
     }
