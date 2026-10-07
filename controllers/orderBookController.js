@@ -48,6 +48,7 @@
 // =============================================================================
 
 const { PrismaClient, Prisma } = require('@prisma/client');
+const { commitOperation } = require('../middleware/idempotency');
 const prisma = new PrismaClient();
 const logger = require('../src/config/logger');
 const ledger = require('../services/ledgerService');
@@ -193,15 +194,25 @@ async function placeOrder(req, res) {
       // Match the order
       const matches = await matchOrder(tx, order, { reserveUsdc });
 
-      return { order, matches };
+      // §r42.1 WIRED CLAIM COMMIT — the placement/reserve economics above and
+      // the FinancialOperation COMMITTED transition commit or roll back
+      // TOGETHER. The stored responseBody is the EXACT wire body served
+      // below (same `order` / `matches` objects), so a same-key replay is
+      // byte-identical and a post-commit crash can never re-place the order.
+      const response = {
+        success: true,
+        message: `Order placed. ${matches.length} trade(s) executed.`,
+        order,
+        trades: matches,
+      };
+      await commitOperation(tx, res.locals?.financialOperation || null, 200, response);
+
+      return { order, matches, body: response };
     });
 
-    return res.json({
-      success: true,
-      message: `Order placed. ${result.matches.length} trade(s) executed.`,
-      order: result.order,
-      trades: result.matches,
-    });
+    // The wired transaction committed the claim with THIS exact body — the
+    // committed replay and the live response are byte-identical.
+    return res.json(result.body);
   } catch (err) {
     if (err && err.status === 400) {
       return res.status(400).json({ success: false, message: err.message });

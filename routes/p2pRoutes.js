@@ -24,7 +24,11 @@ router.post('/underpayment', protectActive, idempotency(), p2pController.markUnd
 router.post('/overpayment',  protectActive, idempotency(), p2pController.flagOverpayment);
 
 // Trade completion (the SINGLE SOURCE OF TRUTH for asset release)
-router.post('/complete',     protectActive, require2FA(), idempotency(), p2pController.completeTrade);
+// §r42.1 wired: the claim commits INSIDE the settlement $transaction, so
+// an IN_PROGRESS claim after a 4xx is durable proof of rollback — the key
+// is safely releasable (releaseOn4xx). 5xx stays RETAIN (default): a
+// post-commit failure must never re-settle a trade.
+router.post('/complete',     protectActive, require2FA(), idempotency({ releaseOn4xx: true }), p2pController.completeTrade);
 
 // B-9: Action-required indicator — returns pending items needing user attention.
 router.get('/action-required', protectActive, p2pController.getActionRequired);

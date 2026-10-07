@@ -26,6 +26,7 @@
 // =============================================================================
 
 const { AzmSpendService, AZM_SPEND_SOURCES } = require('./azmSpendService');
+const { commitOperation } = require('../middleware/idempotency');
 const { AzmRewardService } = require('./azmRewardService');
 
 const GIFT_TYPES = ['GIFT', 'TIP', 'REWARD'];
@@ -78,6 +79,7 @@ async function sendGiftTransfer(prisma, io, {
     senderId, receiverId, amount, type = 'GIFT',
     message = null, contextType = null, contextId = null,
     idempotencyKey,
+    financialOperation = null,
 }) {
     // ── request validation (no economic mutation past this point on failure) ──
     if (idempotencyKey == null || typeof idempotencyKey !== 'string' || !IDEMPOTENCY_KEY_RE.test(idempotencyKey)) {
@@ -111,6 +113,23 @@ async function sendGiftTransfer(prisma, io, {
     let outcome;
     try {
         outcome = await prisma.$transaction(async (tx) => {
+            // §r42.1 WIRED CLAIM COMMIT — commit the FinancialOperation row to
+            // COMMITTED with the EXACT wire body (same object the controller
+            // res.json()s), inside the same transaction as the transfer legs.
+            // Fresh and replay paths both commit: there is exactly ONE
+            // committed response per claim identity, and a post-commit crash
+            // can never re-execute the debit.
+            const commit = (gift, senderNewBalance) => {
+                const response = {
+                    success: true,
+                    message: `${gift.type === 'TIP' ? 'Tip' : 'Gift'} sent successfully.`,
+                    gift,
+                    newBalance: senderNewBalance,
+                };
+                return commitOperation(tx, financialOperation, 200, response)
+                    .then(() => response);
+            };
+
             // Sequential-replay fast path: the gift row for this operation
             // already committed — converge WITHOUT touching any balance.
             const existing = await tx.azmGift.findUnique({
@@ -121,7 +140,8 @@ async function sendGiftTransfer(prisma, io, {
                 },
             });
             if (existing) {
-                return { replay: true, gift: existing, debited: false, credited: false };
+                const body = await commit(existing, undefined);
+                return { replay: true, gift: existing, debited: false, credited: false, body };
             }
 
             // Receiver revalidated inside the transaction (a user deleted or
@@ -181,6 +201,7 @@ async function sendGiftTransfer(prisma, io, {
                 dedupKey: reward,
             });
 
+            const body = await commit(gift, debit.newBalance);
             return {
                 replay: false,
                 gift,
@@ -188,6 +209,7 @@ async function sendGiftTransfer(prisma, io, {
                 credited: credit.credited,
                 senderNewBalance: debit.newBalance,
                 receiverNewBalance: credit.newBalance,
+                body,
             };
         });
     } catch (err) {

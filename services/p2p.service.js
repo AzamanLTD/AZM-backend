@@ -16,6 +16,7 @@
 // =============================================================================
 
 const logger = require('../src/config/logger');
+const { commitOperation } = require('../middleware/idempotency');
 
 const gamification = require('./vendorGamificationService');
 const { calculateFeeSplit } = require('../utils/feeMath');
@@ -709,7 +710,7 @@ const flagOverpayment = async (prisma, { tradeId, buyerId, overpaidAmountUsdc })
  *   releasedByUserId: number   // must be vendorId for SELL ad, userId for BUY ad
  * }} params
  */
-const completeTrade = async (prisma, { tradeId, releasedByUserId, adminOverride = false }) => {
+const completeTrade = async (prisma, { tradeId, releasedByUserId, adminOverride = false, financialOperation = null }) => {
     // Pre-fetch outside the transaction (read-only checks)
     const trade = await prisma.trade.findUnique({
         where:  { id: tradeId },
@@ -995,7 +996,34 @@ const completeTrade = async (prisma, { tradeId, releasedByUserId, adminOverride 
         //    double-count if reprocessed, so we don't auto-retry; the engine
         //    moves forward from current state rather than replaying history).
 
-        return { profitLog };
+        // §r42.1 WIRED CLAIM COMMIT — the settlement economics above and the
+        // FinancialOperation COMMITTED transition commit or roll back
+        // TOGETHER. The stored responseBody is the EXACT wire body the
+        // controller res.status(200).json()s (same values; the two legacy
+        // undefined fields stay undefined so the serialized bytes match),
+        // so a same-key replay is byte-identical and a post-commit crash
+        // can never re-settle the trade.
+        const response = {
+            success: true,
+            message: `Trade #${tradeId} completed successfully.`,
+            data: {
+                tradeId,
+                netUsdc,
+                adminCutUsdc,
+                vendorCutUsdc,
+                vendorCutGhs: undefined,
+                split: {
+                    adminPct:  `${(adminPct * 100).toFixed(0)}%`,
+                    vendorPct: `${(vendorPct * 100).toFixed(0)}%`,
+                    tier:      tradeId >= 1000 ? '≥$1000 (50/50)' : '<$1000 (60/40)'
+                },
+                totalMarginUsdc: undefined,
+                gamification:    null
+            }
+        };
+        await commitOperation(tx, financialOperation, 200, response);
+
+        return { profitLog, body: response };
     });
 
     // ── §P.4: the authoritative settlement posting was committed INSIDE the
@@ -1004,6 +1032,7 @@ const completeTrade = async (prisma, { tradeId, releasedByUserId, adminOverride 
     // representation of the same economic event would be double-counting.
 
     return {
+        body: result.body,
         tradeId,
         netUsdc,
         adminCutUsdc,

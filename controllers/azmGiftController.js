@@ -43,14 +43,13 @@ async function sendGift(req, res) {
             // REQUIRED for this economic endpoint — rejected before any
             // mutation if missing/invalid (enforced in the service).
             idempotencyKey: req.headers['idempotency-key'],
+            // §r42.1 wired claim: committed INSIDE the transfer transaction.
+            financialOperation: res.locals?.financialOperation || null,
         });
 
-        return res.json({
-            success: true,
-            message: `${result.gift.type === 'TIP' ? 'Tip' : 'Gift'} sent successfully.`,
-            gift: result.gift,
-            newBalance: result.senderNewBalance,
-        });
+        // The wired transaction committed the claim with THIS exact body —
+        // the committed replay and the live response are byte-identical.
+        return res.json(result.body);
     } catch (err) {
         if (err instanceof GiftValidationError) {
             return res.status(400).json({ success: false, message: err.message });

@@ -27,6 +27,7 @@
 const logger = require('../src/config/logger');
 const { randomUUID } = require('crypto');
 const { runDoubleCheck } = require('../utils/securityCheck');
+const { commitOperation } = require('../middleware/idempotency');
 
 // Socket.IO is wired once at bootstrap by src/sockets/socketServices.js.
 // Refund convergence is emitted from this canonical financial mutation so all
@@ -158,7 +159,7 @@ const createEscrow = async (prisma, { ticketId, payerId, payeeId, amountUsdc, de
 // =============================================================================
 // 2. FUND ESCROW — payer locks USDC. The critical financial step.
 // =============================================================================
-const fundEscrow = async (prisma, { escrowId, payerId }) => {
+const fundEscrow = async (prisma, { escrowId, payerId, financialOperation = null }) => {
     const escrow = await prisma.smartEscrow.findUnique({
         where: { id: escrowId },
         include: { ticket: true }
@@ -309,6 +310,16 @@ const fundEscrow = async (prisma, { escrowId, payerId }) => {
             });
         }
 
+        // §r42.1 WIRED CLAIM COMMIT — the funding economics above and the
+        // FinancialOperation COMMITTED transition commit or roll back
+        // TOGETHER. The stored responseBody is the EXACT wire response the
+        // controller res.json()s (same `updated` row object: Prisma Decimal
+        // serializes identically), so a same-key replay re-emits the
+        // committed result byte-identically and a post-commit crash can
+        // never re-execute the funding.
+        const response = { success: true, escrow: updated };
+        await commitOperation(tx, financialOperation, 200, response);
+
         return updated;
     });
 
@@ -347,7 +358,7 @@ const fundEscrow = async (prisma, { escrowId, payerId }) => {
         }
     }
 
-    return { success: true, escrow: updatedEscrow, reference };
+    return { success: true, escrow: updatedEscrow, reference, body: { success: true, escrow: updatedEscrow } };
 };
 
 // =============================================================================

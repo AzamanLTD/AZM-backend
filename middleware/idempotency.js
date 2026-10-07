@@ -342,8 +342,46 @@ function idempotency(options = {}) {
     };
 }
 
+// ── in-transaction claim commit (the "wired" pattern) ───────────────────────
+//
+// §r42.1 — shared helper for endpoints whose FinancialOperation claim commits
+// INSIDE their economic $transaction. The service calls this at the point the
+// exact wire response is fully known. The economic mutations and the claim
+// COMMITTED transition then commit or roll back TOGETHER:
+//
+//   • tx commits  → the money moved AND the committed response is durable;
+//     a crash before the HTTP response still replays byte-identically.
+//   • tx rolls back → no money moved AND the claim stays IN_PROGRESS, so
+//     releaseOn4xx (valid ONLY on wired routes) can safely release the key.
+//
+// The CAS (`status: 'IN_PROGRESS'`) guards against a claim that was already
+// completed by another execution path; losing it aborts the whole economic
+// transaction — never a committed mutation without its committed response.
+async function commitOperation(tx, operation, statusCode, body) {
+    if (!operation) return; // route not mounted under the authority — no-op
+    const committed = await tx.financialOperation.updateMany({
+        where: { id: operation.id, status: OPERATION_IN_PROGRESS },
+        data: {
+            status: OPERATION_COMMITTED,
+            statusCode,
+            // Store the exact WIRE text (JSON.stringify of the response
+            // object the handler will res.json) — same byte-fidelity rule as
+            // the middleware's post-response bookkeeping: TEXT, not JSONB,
+            // so the replay re-emits the original response bytes exactly
+            // (key order preserved; Prisma Decimal via toJSON → string).
+            responseBody: JSON.stringify(body),
+        },
+    });
+    if (committed.count !== 1) {
+        const err = new Error('Idempotency operation state conflict.');
+        err.code = 'IDEMPOTENCY_STATE_CONFLICT';
+        throw err;
+    }
+}
+
 module.exports = {
     idempotency,
+    commitOperation,
     IDEMPOTENCY_FAILURE_POLICY: { RETAIN, RELEASE },
     endpointOf,
     fingerprintOf,

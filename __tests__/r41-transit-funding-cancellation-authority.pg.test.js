@@ -59,6 +59,19 @@ run('r41.audit-followup — transit funding/cancellation authority (PostgreSQL)'
         );
     }, 15000);
 
+    // Integration hygiene: this suite asserts ABSOLUTE zero-side-effect
+    // economics (e.g. profit-fee balance exactly 0) but previously cleaned
+    // only AFTER each test, so any foreign suite running earlier in the
+    // shared-database battery could leak a SystemProfitFees row that this
+    // suite's first test would then read as its own "side effect" (observed
+    // after the #318 closure suite joined the battery). Mirror the afterEach
+    // TRUNCATE before each test so the suite is immune to foreign leftovers.
+    beforeEach(async () => {
+        await prisma.$executeRawUnsafe(
+            'TRUNCATE TABLE "User", "SystemProfitFees", "AdminProfitLog" RESTART IDENTITY CASCADE'
+        );
+    }, 15000);
+
     // ── DB-OBSERVED GATE HELPER ────────────────────────────────────────────
     // Polls pg_stat_activity until `count` sessions are BLOCKED ON A LOCK
     // running a query matching `needle`. The interleaving's correctness comes

@@ -27,6 +27,7 @@
 const { PrismaClient } = require('@prisma/client');
 const prisma = new PrismaClient();
 const logger = require('../src/config/logger');
+const { commitOperation } = require('../middleware/idempotency');
 const { Prisma } = require('@prisma/client');
 const ledger = require('../services/ledgerService');
 const _exact = (n) => (n instanceof Prisma.Decimal ? n.toFixed(8) : Number(n).toFixed(8));
@@ -257,7 +258,26 @@ async function convertAzmToUsdc(req, res) {
         },
       });
 
-      return { conversionLog, newAzmBalance, newUsdcBalance, usdcAmount };
+      // §r42.1 WIRED CLAIM COMMIT — the conversion economics above and the
+      // FinancialOperation COMMITTED transition commit or roll back TOGETHER.
+      // The stored responseBody is the EXACT wire body built below from the
+      // same in-transaction values the response is served from — replay is
+      // byte-identical and a post-commit crash can never re-execute the
+      // redemption.
+      const response = {
+        success: true,
+        message: `Converted ${amount} AZM to ${usdcAmount.toFixed(4)} USDC.`,
+        conversion: {
+          azmAmount: amount,
+          usdcAmount: parseFloat(usdcAmount.toFixed(8)),
+          rate: rateInfo.rate,
+          newAzmBalance: parseFloat(newAzmBalance.toFixed(8)),
+          newUsdcBalance: parseFloat(newUsdcBalance.toFixed(8)),
+        },
+      };
+      await commitOperation(tx, res.locals?.financialOperation || null, 200, response);
+
+      return { conversionLog, newAzmBalance, newUsdcBalance, usdcAmount, body: response };
     });
 
     // Socket emission
@@ -272,17 +292,9 @@ async function convertAzmToUsdc(req, res) {
       });
     }
 
-    return res.json({
-      success: true,
-      message: `Converted ${amount} AZM to ${result.usdcAmount.toFixed(4)} USDC.`,
-      conversion: {
-        azmAmount: amount,
-        usdcAmount: parseFloat(result.usdcAmount.toFixed(8)),
-        rate: rateInfo.rate,
-        newAzmBalance: parseFloat(result.newAzmBalance.toFixed(8)),
-        newUsdcBalance: parseFloat(result.newUsdcBalance.toFixed(8)),
-      },
-    });
+    // The wired transaction committed the claim with THIS exact body — the
+    // committed replay and the live response are byte-identical.
+    return res.json(result.body);
   } catch (err) {
     logger.error({ err: err }, '[azmConvert] error');
     if (err.isPoolShortage) {
