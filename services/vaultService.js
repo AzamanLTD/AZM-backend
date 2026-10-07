@@ -44,6 +44,19 @@ const AZM_BASE_PER_USDC = 0.10;          // 10 AZM per 100 USDC base rate
 const AZM_STREAK_BONUS_STEP = 0.05;       // +5% per consecutive on-time deposit
 const AZM_STREAK_BONUS_CAP = 1.00;        // capped at +100%
 
+// §vault-completion-reward (2026-10-07): the ESTABLISHED completion-reward
+// contract — flat 25 AZM plus 1.25% of the released final vault balance
+// (balance * 0.0125 + 25). This formula is unchanged since the initial
+// launch commit (2aa9b6c) and is the only behavior ever shipped or exercised.
+// The long-standing "5% of total deposits" comment never matched ANY
+// implementation — the Vault schema has no totalDeposited field, so that rule
+// was never computable — which makes the code the established product
+// contract, not a drift from it. Locked by
+// __tests__/vault-completion-reward-atomicity.test.js so comments and code
+// cannot drift apart again.
+const VAULT_COMPLETION_AZM_BASE = new Prisma.Decimal(25);
+const VAULT_COMPLETION_AZM_BALANCE_RATE = new Prisma.Decimal('0.0125');
+
 class VaultService {
     constructor(prisma, io, notificationService, azmRewardService) {
         this.prisma = prisma;
@@ -340,6 +353,7 @@ class VaultService {
     async completeMatured(vault) {
         const vaultId = typeof vault === 'string' ? vault : vault.id;
         let releaseInfo = null;
+        let rewardInfo = null;
 
         await this.prisma.$transaction(async (tx) => {
             const rows = await tx.$queryRaw`SELECT * FROM "Vault" WHERE "id" = ${vaultId} FOR UPDATE`;
@@ -398,22 +412,56 @@ class VaultService {
                     status: 'COMPLETED',
                 },
             });
+
+            // §vault-completion-reward (2026-10-07): the AZM completion
+            // reward is an economic ENTITLEMENT of the completion, not a
+            // best-effort side effect. It is credited on the SAME
+            // transaction through the reward service's transaction-client
+            // primitive (_creditAzmWithClient) — NEVER the standalone
+            // creditAzm() — so the vault can never be irreversibly
+            // COMPLETED while its promised reward is missing:
+            //   • a reward failure ABORTS the whole completion (vault stays
+            //     ACTIVE, principal stays locked, no ledger/history/receipt
+            //     commits) and the next worker sweep retries;
+            //   • nothing is swallowed — every error propagates.
+            // Exactly-once across concurrent sweeps, crash re-drives and
+            // breakEarly races rests on the same two gates as before: the
+            // FOR UPDATE ACTIVE terminal claim above, and the deterministic
+            // dedup identity `vault-completion-${vaultId}` enforced by the
+            // (userId, source, dedupKey) DB unique on AzmRewardLog.
+            if (!this.azmRewardService || typeof this.azmRewardService._creditAzmWithClient !== 'function') {
+                const err = new Error(
+                    'Vault completion requires the AZM reward service — the completion reward is atomic with the release.'
+                );
+                err.code = 'VAULT_REWARD_SERVICE_UNAVAILABLE';
+                throw err;
+            }
+            const completionBonus = VAULT_COMPLETION_AZM_BASE.plus(
+                balance.mul(VAULT_COMPLETION_AZM_BALANCE_RATE)
+            );
+            const reward = await this.azmRewardService._creditAzmWithClient(tx, {
+                userId: fresh.userId,
+                amount: Number(completionBonus.toFixed(2)),
+                source: 'VAULT_COMPLETION',
+                reason: `Vault "${fresh.name}" matured (+${completionBonus.toFixed(2)} AZM)`,
+                metadata: { vaultId, deposited: balance.toString() },
+                dedupKey: `vault-completion-${vaultId}`,
+            });
+            rewardInfo = { ...reward, amount: Number(completionBonus.toFixed(2)) };
         });
 
-        // Completion AZM bonus — flat 25 AZM for every completed vault,
-        // plus 5% of total deposits as bonus AZM.
-        const completionBonus = releaseInfo.balance.mul(0.0125).plus(25); // ~1.25% + 25 base
-        if (this.azmRewardService) {
-            try {
-                await this.azmRewardService.creditAzm({
-                    userId: releaseInfo.userId,
-                    amount: Number(completionBonus.toFixed(2)),
-                    source: 'VAULT_COMPLETION',
-                    reason: `Vault "${releaseInfo.name}" matured (+${completionBonus.toFixed(2)} AZM)`,
-                    metadata: { vaultId, deposited: releaseInfo.balance.toString() },
-                    dedupKey: `vault-completion-${vaultId}`,
-                });
-            } catch (_) { /* swallow */ }
+        // POST-COMMIT side effects only. The reward leg is part of the
+        // transaction above, so its socket emission (like every other
+        // side effect) happens only after the commit proves it durable —
+        // a rolled-back completion never announces a reward.
+        if (rewardInfo && rewardInfo.credited && typeof this.azmRewardService._emitBalanceUpdate === 'function') {
+            this.azmRewardService._emitBalanceUpdate(
+                releaseInfo.userId,
+                rewardInfo.newBalance,
+                rewardInfo.amount,
+                'VAULT_COMPLETION',
+                `Vault "${releaseInfo.name}" matured (+${rewardInfo.amount} AZM)`
+            );
         }
 
         try {

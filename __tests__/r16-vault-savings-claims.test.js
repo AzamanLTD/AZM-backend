@@ -20,7 +20,7 @@ const describeOrSkip = hasDb ? describe : describe.skip;
 if (!hasDb) console.warn('[r16-vault-savings] TEST_DATABASE_URL not set — skipping.');
 
 describeOrSkip('r16 P0-D: Vault terminal claims', () => {
-    let prisma, vaultSvc;
+    let prisma, vaultSvc, rewardSvc;
 
     beforeAll(() => {
         process.env.DATABASE_URL = process.env.TEST_DATABASE_URL;
@@ -28,12 +28,17 @@ describeOrSkip('r16 P0-D: Vault terminal claims', () => {
         process.env.JWT_SECRET = process.env.JWT_SECRET || 'test_secret_at_least_32_chars_long_xxxxx';
         const { PrismaClient } = require('@prisma/client');
         const { VaultService } = require('../services/vaultService');
+        const { AzmRewardService } = require('../services/azmRewardService');
         prisma = new PrismaClient();
+        // Real reward service since §vault-completion-reward: the completion
+        // reward is atomic with the release, so the race tests exercise the
+        // genuine reward leg (dedup + AzmRewardLog) alongside the claim.
+        rewardSvc = new AzmRewardService(prisma, { to: () => ({ emit: () => {} }) });
         vaultSvc = new VaultService(
             prisma,
             { to: () => ({ emit: () => {} }) },
             { sendNotification: async () => ({}) },
-            { creditAzm: async () => ({}) }
+            rewardSvc
         );
     });
 
@@ -41,7 +46,7 @@ describeOrSkip('r16 P0-D: Vault terminal claims', () => {
 
     afterEach(async () => {
         await prisma.$executeRawUnsafe(
-            'TRUNCATE TABLE "User", "Vault", "VaultDeposit", "TransactionHistory", "AdminProfitLog" RESTART IDENTITY CASCADE'
+            'TRUNCATE TABLE "User", "Vault", "VaultDeposit", "TransactionHistory", "AdminProfitLog", "AzmRewardLog" RESTART IDENTITY CASCADE'
         );
         await prisma.$executeRawUnsafe('TRUNCATE TABLE "LedgerTransaction", "JournalEntry", "LedgerAccount" RESTART IDENTITY CASCADE');
     }, 15000);
