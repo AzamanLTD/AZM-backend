@@ -9,7 +9,11 @@ const {
   consumeTransactionQuote,
   RateUnavailableError,
   QuoteIdentityConflictError,
+  QuoteConsumptionError,
 } = require('../src/services/transactionQuoteService');
+const {
+  LATE_DEPOSIT_SETTLEMENT_GRACE_MS,
+} = require('../src/config/lateDepositSettlement');
 const fiatLiquidity = require('../src/services/fiatLiquidityService'); // §P.5-D
 const { recordReconciliationException } = require('../services/reconciliationExceptionService');
 const modelBSettlement = require('../services/modelBSettlementService'); // §P.5-E
@@ -219,11 +223,22 @@ exports.webhook = async (req, res) => {
   const prisma = req.app.get('prisma');
   const io = req.app.get('socketio');
   const emitBalanceUpdate = req.app.get('emitBalanceUpdate');
+  // §271: the late-settlement catch below names these bindings when it
+  // reports/flags — they must live in the handler's scope, not the try
+  // block's (a const inside try is invisible to catch and the 409 path
+  // would itself crash with a ReferenceError).
+  let reference;
+  let providerTxId;
+  let status;
+  let settledGhs;
+  let existing;
+  let quoteId;
   try {
     const expectedSecret = process.env.FIAT_WEBHOOK_SECRET;
     if (!expectedSecret) return res.status(503).json({ success: false, message: 'Webhook endpoint is not configured.' });
     if (!safeEqual(req.headers['x-azaman-webhook-secret'], expectedSecret)) return res.status(401).json({ success: false, message: 'Invalid webhook signature.' });
-    const { reference, amountGhs, providerTxId, status } = req.body || {};
+    ({ reference, providerTxId, status } = req.body || {});
+    const { amountGhs } = req.body || {};
     if (!reference || amountGhs === undefined || amountGhs === null) return res.status(400).json({ success: false, message: 'reference and amountGhs are required.' });
     // ── §P.5-D/r10: lossless GHS input boundary (audit r10) ──────────────
     // The webhook amount is parsed through the P5-D exact-decimal authority
@@ -234,7 +249,6 @@ exports.webhook = async (req, res) => {
     // silently". Exact parsing rejects them fail-closed (400) BEFORE any
     // evidence row or mutation; accepted input is never altered on its way to
     // evidence/settlement comparison.
-    let settledGhs;
     try {
         settledGhs = fiatLiquidity.toExactGhsDecimal(amountGhs, { field: 'amountGhs' });
     } catch (e) {
@@ -244,7 +258,7 @@ exports.webhook = async (req, res) => {
     // the durable evidence identity and the lifecycle (see above).
     const { evidence: evidenceStatus, intent: statusIntent } = interpretCallbackStatus(status);
 
-    const existing = await prisma.transactionHistory.findUnique({ where: { txHash: reference } });
+    existing = await prisma.transactionHistory.findUnique({ where: { txHash: reference } });
     if (!existing) return res.status(404).json({ success: false, message: 'Unknown deposit reference.' });
 
     // §P.5-D LIQUIDITY EVIDENCE: append the raw provider observation
@@ -362,10 +376,16 @@ exports.webhook = async (req, res) => {
     // settles the purchase through authoritative inventory (Model B).
     const modelBOn = await modelBSettlement.isModelBSettlementEnabled(prisma);
 
-    const quoteId = existing.metadata?.quoteId;
+    quoteId = existing.metadata?.quoteId;
     if (!quoteId) return res.status(409).json({ success: false, message: 'Deposit is missing its transaction quote.' });
     const result = await prisma.$transaction(async (tx) => {
-      const quote = await consumeTransactionQuote({ prisma: tx, quoteId, userId: existing.userId, purpose: 'deposit' });
+      // §271 late-settlement policy: a provider confirmation that arrives
+      // after the quote's own expiry but WITHIN the bounded grace window
+      // still settles at the ORIGINAL quoted terms (never repriced) —
+      // quote.consumedLate marks the settlement for observability. Beyond
+      // the grace window the consumption throws QUOTE_EXPIRED and the outer
+      // catch routes the paid deposit to durable ops reconciliation.
+      const quote = await consumeTransactionQuote({ prisma: tx, quoteId, userId: existing.userId, purpose: 'deposit', graceMs: LATE_DEPOSIT_SETTLEMENT_GRACE_MS });
       // §P.5-C settlement binding: this surface's authenticated identity is
       // the fiat webhook secret. A quote created for a different route (e.g.
       // MOOLRE_MOMO_COLLECTION) may NOT settle here — fail closed before any
@@ -408,7 +428,7 @@ exports.webhook = async (req, res) => {
       // resurrected to COMPLETED.
       const claimed = await tx.transactionHistory.updateMany({
         where: { id: existing.id, status: 'PENDING' },
-        data: { status: 'COMPLETED', amountUsdc: settledUsdcLedger, payerMsisdn: existing.payerMsisdn || null, metadata: { ...(existing.metadata || {}), providerTxId: providerTxId || null, settledAmountGhs: settledGhs.toFixed(2), settledAt: new Date().toISOString(), settlementRate: quote.rateGhsPerUsdc, settledRoute: quote.selectedRoute || null, settledRoutePolicyVersion: quote.routePolicyVersion || null } },
+        data: { status: 'COMPLETED', amountUsdc: settledUsdcLedger, payerMsisdn: existing.payerMsisdn || null, metadata: { ...(existing.metadata || {}), providerTxId: providerTxId || null, settledAmountGhs: settledGhs.toFixed(2), settledAt: new Date().toISOString(), settlementRate: quote.rateGhsPerUsdc, settledRoute: quote.selectedRoute || null, settledRoutePolicyVersion: quote.routePolicyVersion || null, ...(quote.consumedLate ? { lateSettlement: true, quoteExpiredAt: quote.expiresAt } : {}) } },
       });
       if (claimed.count !== 1) {
         throw new Error('Deposit is no longer PENDING — a concurrent state transition won; refusing to settle');
@@ -516,6 +536,44 @@ exports.webhook = async (req, res) => {
     await audit(prisma, { actorId: existing.userId, actorName: '', action: 'DEPOSIT_FIAT_COMPLETED', targetType: 'TRANSACTION', targetId: String(existing.id), metadata: { amountGhs: settledGhs, amountUsdc: result.quote.usdcAmount, rate: result.quote.rateGhsPerUsdc, quoteId, providerTxId: providerTxId || null }, ipAddress: req.ip });
     return res.status(200).json({ success: true, message: 'Deposit confirmed and credited.', data: { reference, userId: existing.userId, amountGhs: settledGhs, usdcEquivalent: result.quote.usdcAmount, rate: result.quote.rateGhsPerUsdc, quoteId, transaction: result.updatedTx } });
   } catch (error) {
+    // §271 late-settlement policy (deterministic, non-repricing): an
+    // expired-beyond-grace quote on an already-PAID deposit is never a bare
+    // generic 409. The durable ReconciliationException (idempotent upsert)
+    // gives ops the record; the response names the exact condition. The
+    // economics stay the quote's own — reconciliation settles at the SAME
+    // original terms, never at the current oracle.
+    if (error instanceof QuoteConsumptionError && error.code === 'QUOTE_EXPIRED') {
+      let flagged = false;
+      try {
+        await recordReconciliationException(prisma, {
+          entityType: 'TRANSACTION',
+          entityId: reference,
+          reference: providerTxId || reference,
+          reason: 'LATE_DEPOSIT_SETTLEMENT_BEYOND_GRACE',
+          details: {
+            surface: 'GENERIC_FIAT_WEBHOOK',
+            quoteId,
+            quoteExpiresAt: existing.metadata?.quoteExpiresAt || null,
+            graceHours: LATE_DEPOSIT_SETTLEMENT_GRACE_MS / 3600000,
+            settledGhs: settledGhs.toFixed(2),
+            note: 'Provider settlement arrived after the quote grace window — reconcile at the ORIGINAL quoted terms (never reprice).',
+          },
+        });
+        flagged = true;
+      } catch (flagErr) {
+        logger.error({ err: flagErr, reference }, '[quoteFiatDepositWebhook] beyond-grace ReconciliationException persistence FAILED');
+      }
+      return res.status(409).json({
+        success: false,
+        code: 'LATE_DEPOSIT_SETTLEMENT_REQUIRES_RECONCILIATION',
+        message: flagged
+          ? 'The deposit quote expired beyond the late-settlement grace window. The provider observation was retained and an operator reconciliation record was created — the deposit will be settled at its ORIGINAL quoted terms by reconciliation.'
+          : 'The deposit quote expired beyond the late-settlement grace window. The provider observation was retained but the operator reconciliation record could not be created — retrying this callback re-attempts the flagging.',
+      });
+    }
+    if (error instanceof QuoteConsumptionError) {
+      return res.status(error.statusCode || 409).json({ success: false, message: error.message, code: error.code });
+    }
     logger.error({ err: error }, '[quoteFiatDepositWebhook] error');
     return res.status(409).json({ success: false, message: error.message });
   }

@@ -33,6 +33,19 @@ class QuoteIdentityReplayError extends QuoteIdentityConflictError {
     }
 }
 
+// §271 — typed quote-consumption failure. Settlement surfaces must be able to
+// DISTINGUISH expiry (late-webhook policy applies) from already-consumed,
+// owner/purpose mismatch and not-found (plain fail-closed 409/404). The typed
+// code is the contract; the message is diagnostics.
+class QuoteConsumptionError extends Error {
+    constructor(message, code, statusCode = 409) {
+        super(message);
+        this.name = 'QuoteConsumptionError';
+        this.code = code; // QUOTE_NOT_FOUND | QUOTE_OWNER_MISMATCH | QUOTE_PURPOSE_MISMATCH | QUOTE_ALREADY_CONSUMED | QUOTE_EXPIRED
+        this.statusCode = statusCode;
+    }
+}
+
 const DEFAULT_QUOTE_TTL_SECONDS = 60;
 const MAX_RATE_GHS_PER_USDC = 1000000;
 const MIN_RATE_GHS_PER_USDC = 0.000001;
@@ -147,54 +160,6 @@ function createTransactionQuote({
     _netGhsExact: netExact.toFixed(2),
     _rateExact: rateExact.toFixed(8),
     _usdcAmountExact: usdcExact.toFixed(12),
-  };
-}
-
-async function getServerRateGhsPerUsdc({ prisma, marketOracle }) {
-  if (!prisma) throw new Error('Quote service requires Prisma');
-
-  const settings = await prisma.globalSettings.findUnique({
-    where: { id: 1 },
-    select: { liveRetailRate: true, liveUsdToGhs: true, liveRateSource: true, lastRateSync: true, lastExternalSync: true },
-  });
-
-  // `liveRetailRate` is the canonical user-facing USDC/GHS rate. The legacy
-  // USD/GHS field is retained only as a compatibility fallback for older
-  // installations that predate the explicit USDC retail-rate field.
-  // §P.5-C Decimal-native rate path: the rate stays a Prisma Decimal
-  // (DB-native) end-to-end; JS Number is only a presentation-boundary
-  // projection (`rateGhsPerUsdc`), never an input to authoritative
-  // economics or persistence. `liveRetailRate` is canonical; the legacy
-  // USD/GHS field is retained only as a compatibility fallback for older
-  // installations that predate the explicit USDC retail-rate field.
-  const retail = settings?.liveRetailRate != null ? new Prisma.Decimal(settings.liveRetailRate) : null;
-  const legacy = settings?.liveUsdToGhs != null ? new Prisma.Decimal(settings.liveUsdToGhs) : null;
-  const retailUsable = !!(retail && retail.isFinite() && retail.greaterThan(0));
-  const rateExact = retailUsable
-    ? retail
-    : (legacy && legacy.isFinite() && legacy.greaterThan(0) ? legacy : null);
-
-  if (!rateExact) {
-    throw new Error('A current USDC/GHS rate is not available');
-  }
-  const rateGhsPerUsdc = rateExact.toNumber();
-
-  void marketOracle;
-  // Snapshot the TRUE external observation timestamp (issue #271 / PR 271B):
-  // a newly-created quote's rateAsOf must never inherit a timestamp
-  // fabricated by the MOCK echo or a manual admin update. Post-271B writers
-  // keep lastRateSync === lastExternalSync for the same genuine observation;
-  // the lastExternalSync-preferred read is what guarantees the snapshot stops
-  // inheriting echo/admin stamps even while lastRateSync remains readable for
-  // staged-rollout compatibility. Rows that predate 271B honestly keep
-  // lastExternalSync = NULL and fall back to the legacy field rather than
-  // fabricating a fresh timestamp; the final new Date() guard only covers a
-  // GlobalSettings row with no recorded history at all (rateAsOf is NOT NULL).
-  return {
-    rateGhsPerUsdc,
-    rateGhsPerUsdcExact: rateExact,
-    rateSource: settings?.liveRateSource || 'AZM_ADMIN_MOCK',
-    rateAsOf: settings?.lastExternalSync || settings?.lastRateSync || new Date(),
   };
 }
 
@@ -429,30 +394,42 @@ async function persistTransactionQuote(prisma, quote) {
 }
 
 async function createServerTransactionQuote({ prisma, marketOracle, userId, purpose, amountGhs, feeGhs = 0, ttlSeconds = DEFAULT_QUOTE_TTL_SECONDS, now = new Date(), maxAgeSeconds, routeIdentity = null, quoteIdentity = null }) {
-  // 271C fail-closed gate: EVERY fiat DEPOSIT quote created through this
-  // helper must pass the canonical lastExternalSync freshness gate. This
-  // includes the mounted generic fiat initiation route and the /api/quotes
-  // endpoint. Non-deposit quote purposes are deliberately NOT gated in this
-  // stage (issue #271 staging).
-  const rate = purpose === 'deposit'
-    ? await getFreshServerRateGhsPerUsdc({ prisma, marketOracle, now, maxAgeSeconds })
-    : await getServerRateGhsPerUsdc({ prisma, marketOracle });
+  // §271 final-stage gate: EVERY quote created through this helper — every
+  // purpose, every surface (mounted initiation routes, /api/quotes, the
+  // savings deposit/withdrawal server-side initiations) — passes the ONE
+  // canonical fail-closed freshness gate on lastExternalSync. There is no
+  // ungated rate reader left: a quote can no longer be minted from a stale
+  // cached number with a fabricated rateAsOf. The staged 271C exception for
+  // non-deposit purposes is closed here.
+  const rate = await getFreshServerRateGhsPerUsdc({ prisma, marketOracle, now, maxAgeSeconds });
   const quote = createTransactionQuote({ userId, purpose, amountGhs, rateGhsPerUsdc: rate.rateGhsPerUsdc, rateGhsPerUsdcExact: rate.rateGhsPerUsdcExact, rateSource: rate.rateSource, rateAsOf: rate.rateAsOf, feeGhs, ttlSeconds, now, routeIdentity, quoteIdentity });
   return persistTransactionQuote(prisma, quote);
 }
 
-async function consumeTransactionQuote({ prisma, quoteId, userId, purpose, now = new Date() }) {
+async function consumeTransactionQuote({ prisma, quoteId, userId, purpose, now = new Date(), graceMs = 0 } = {}) {
   if (!prisma?.$queryRaw) throw new Error('Quote service requires Prisma raw SQL support');
   if (!quoteId || !userId || !Number.isInteger(Number(userId))) throw new Error('quoteId and userId are required');
 
+  // §271 late-settlement grace (deposit surfaces only, passed explicitly by
+  // the caller): the quote's fixed-price economics remain the binding
+  // contract for a bounded window AFTER expiry — a provider confirmation
+  // that arrives late but within grace settles at the ORIGINAL quoted
+  // terms (never repriced). Beyond grace the consumption still fails
+  // closed; the caller applies the beyond-grace ops policy.
+  const effectiveGraceMs = Number.isFinite(graceMs) && graceMs > 0 ? graceMs : 0;
+  const nowDate = new Date(now);
+  const graceAdjustedExpiryFloor = effectiveGraceMs > 0
+    ? new Date(nowDate.getTime() - effectiveGraceMs)
+    : nowDate;
+
   const rows = await prisma.$queryRaw`
     UPDATE "TransactionQuote"
-    SET "consumedAt" = ${new Date(now)}, "consumedFor" = ${purpose || null}
+    SET "consumedAt" = ${nowDate}, "consumedFor" = ${purpose || null}
     WHERE "id" = ${quoteId}::uuid
       AND "userId" = ${Number(userId)}
       AND (${purpose || null}::text IS NULL OR "purpose" = ${purpose})
       AND "consumedAt" IS NULL
-      AND "expiresAt" > ${new Date(now)}
+      AND "expiresAt" > ${graceAdjustedExpiryFloor}
     RETURNING "id", "userId", "purpose", "amountGhs", "feeGhs", "netGhs",
               "rateGhsPerUsdc", "usdcAmount", "rateSource", "rateAsOf",
               "createdAt", "expiresAt", "consumedAt", "consumedFor",
@@ -460,11 +437,37 @@ async function consumeTransactionQuote({ prisma, quoteId, userId, purpose, now =
               "routeProviderRail", "routePolicyVersion", "routeCandidates", "selectionProvenance"
   `;
 
-  if (!rows.length) throw new Error('Transaction quote is invalid, expired, already consumed, or not owned by this user');
+  if (!rows.length) {
+    // §271 typed fail-closed classification: the surface must KNOW why the
+    // claim lost — expiry (late-webhook policy) vs consumed vs identity
+    // mismatch vs missing — instead of one generic 409 for everything.
+    const diag = await prisma.$queryRaw`
+      SELECT "userId", "purpose", "consumedAt", "expiresAt"
+      FROM "TransactionQuote" WHERE "id" = ${quoteId}::uuid LIMIT 1`;
+    if (!diag.length) {
+      throw new QuoteConsumptionError('Transaction quote not found for this request.', 'QUOTE_NOT_FOUND', 404);
+    }
+    const d = diag[0];
+    if (Number(d.userId) !== Number(userId)) {
+      throw new QuoteConsumptionError('Transaction quote is not owned by this user.', 'QUOTE_OWNER_MISMATCH');
+    }
+    if (purpose && d.purpose !== purpose) {
+      throw new QuoteConsumptionError(`Transaction quote purpose mismatch (bound: ${d.purpose}).`, 'QUOTE_PURPOSE_MISMATCH');
+    }
+    if (d.consumedAt) {
+      throw new QuoteConsumptionError('Transaction quote has already been consumed.', 'QUOTE_ALREADY_CONSUMED');
+    }
+    // Remaining cause: expiry beyond the caller's grace window.
+    throw new QuoteConsumptionError('Transaction quote has expired.', 'QUOTE_EXPIRED');
+  }
 
+  const quote = mapQuoteRow(rows[0]);
+  // Late-consumption marker (only possible when the caller passed a grace
+  // window): the quote's own expiry had already passed at consumption time.
+  quote.consumedLate = new Date(quote.expiresAt).getTime() <= nowDate.getTime();
   // §P.5-C: consumption returns the FULL route identity so downstream
   // settlement can never lose it, and candidate/provenance evidence survives.
-  return mapQuoteRow(rows[0]);
+  return quote;
 }
 
 // §P.5-E authority binding: read-only exact fetch of a PERSISTED quote.
@@ -512,8 +515,8 @@ module.exports = {
   createServerTransactionQuote,
   persistTransactionQuote,
   consumeTransactionQuote,
-  getServerRateGhsPerUsdc,
   getFreshServerRateGhsPerUsdc,
+  QuoteConsumptionError,
   RateUnavailableError,
   QuoteIdentityConflictError,
   QuoteIdentityReplayError,

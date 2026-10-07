@@ -55,6 +55,13 @@ const STATEMENTS = [
   `ALTER TABLE "TransactionQuote" ADD COLUMN IF NOT EXISTS "routeCandidates" JSONB;`,
   `ALTER TABLE "TransactionQuote" ADD COLUMN IF NOT EXISTS "selectionProvenance" TEXT;`,
   `ALTER TABLE "TransactionQuote" ADD COLUMN IF NOT EXISTS "quoteIdentity" TEXT;`,
+  // §271: savings quote purposes (savings_deposit / savings_withdrawal)
+  // — normalize the purpose CHECK on databases whose table was created
+  // from the pre-271 migration shape. Idempotent: drop-then-add converges
+  // every environment to the same contract.
+  `ALTER TABLE "TransactionQuote" DROP CONSTRAINT IF EXISTS "TransactionQuote_purpose_check";`,
+  `ALTER TABLE "TransactionQuote" ADD CONSTRAINT "TransactionQuote_purpose_check"
+     CHECK ("purpose" IN ('deposit', 'usdc_purchase', 'withdrawal', 'local_wallet', 'savings_deposit', 'savings_withdrawal'));`,
   // §P.5-C: idempotency keys are CALLER-generated and scoped per user —
   // two users colliding on the same key must remain independent. The unique
   // partial index is therefore on (userId, quoteIdentity), not global.

@@ -27,6 +27,9 @@ const logger = require('../../src/config/logger');
 const {
     consumeTransactionQuote,
 } = require('./transactionQuoteService');
+const {
+    LATE_DEPOSIT_SETTLEMENT_GRACE_MS,
+} = require('../config/lateDepositSettlement');
 const fiatLiquidity = require('./fiatLiquidityService');
 const modelBSettlement = require('../../services/modelBSettlementService');
 const ledger = require('../../services/ledgerService'); // §P.4 authoritative ledger
@@ -120,11 +123,18 @@ async function settleMoolreDeposit(prisma, {
     const modelBOn = await modelBSettlement.isModelBSettlementEnabled(prisma);
 
     const result = await prisma.$transaction(async (tx) => {
+    // §271 late-settlement policy (shared by the mounted webhook AND the
+    // same-reference status-query recovery): a provider confirmation arriving
+    // after the quote's expiry but WITHIN the bounded grace window settles
+    // at the ORIGINAL quoted terms — never repriced. Beyond grace the typed
+    // QUOTE_EXPIRED error propagates and the caller routes the paid deposit
+    // to durable ops reconciliation.
     const quote = await consumeTransactionQuote({
       prisma: tx,
       quoteId,
       userId: deposit.userId,
       purpose: 'deposit',
+      graceMs: LATE_DEPOSIT_SETTLEMENT_GRACE_MS,
     });
 
     // §P.5-C settlement binding: this surface's authenticated provider
@@ -185,6 +195,7 @@ async function settleMoolreDeposit(prisma, {
           settledRoute: quote.selectedRoute || null,
           settledRoutePolicyVersion: quote.routePolicyVersion || null,
           providerData: providerData ?? null,
+          ...(quote.consumedLate ? { lateSettlement: true, quoteExpiredAt: quote.expiresAt } : {}),
         },
       },
     });
