@@ -193,8 +193,12 @@ async function convergeRunOnFiatReversal(tx, reference, { reason = null, runFail
 
     // The caller may classify its own reversal honestly (e.g. the smart-route
     // executor's dispatcher-unavailable unwind is FAILED_OTHER, not a gateway
-    // rejection). Unknown values fail closed to the canonical gateway state.
-    const failureStatus = ['FAILED_GATEWAY', 'FAILED_OTHER'].includes(runFailureStatus)
+    // rejection). The final-authorization hardening adds SKIPPED: a ban/pause
+    // detected at the dispatch-claim boundary unwound a reservation that was
+    // never dispatched — the same classification the pre-execution ban gate
+    // uses, never a gateway rejection. Unknown values fail closed to the
+    // canonical gateway state.
+    const failureStatus = ['FAILED_GATEWAY', 'FAILED_OTHER', 'SKIPPED'].includes(runFailureStatus)
         ? runFailureStatus
         : 'FAILED_GATEWAY';
 

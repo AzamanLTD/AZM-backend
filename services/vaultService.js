@@ -106,7 +106,7 @@ class VaultService {
         return vault;
     }
 
-    async depositManual({ userId, vaultId, amountUsdc, idempotencyKey = null, financialOperation = null }) {
+    async depositManual({ userId, vaultId, amountUsdc, idempotencyKey = null, financialOperation = null, authorizationGuardInTransaction = null }) {
         const amt = new Prisma.Decimal(amountUsdc);
         if (amt.lte(0)) throw new Error('amountUsdc must be > 0');
 
@@ -122,6 +122,7 @@ class VaultService {
             type: 'MANUAL',
             scheduledFor: null,
             idempotencyKey,
+            authorizationGuardInTransaction,
             // §R42.1 — the shared HTTP idempotency claim. Supplied ONLY by
             // the direct HTTP path (vaultController); internal callers
             // (smart route, worker) keep their own durable identities and
@@ -201,6 +202,11 @@ class VaultService {
             // the worker's stale read and the deposit claim must NOT commit
             // money into a terminal vault.
             if (err.code === 'VAULT_TERMINALIZED') return { ok: false, status: 'INACTIVE' };
+            // Final-authorization guard: a banned/deleted user's auto-rule
+            // deposit fails closed inside the deposit transaction — the
+            // worker logs and moves on, no money moved, no streak damage
+            // beyond the ordinary miss accounting below.
+            if (err.code === 'USER_AUTHORIZATION_LOST') return { ok: false, status: 'BANNED' };
             throw err;
         }
         return { ok: true, status: 'COMPLETED' };
@@ -503,7 +509,7 @@ class VaultService {
     // INTERNAL
     // =========================================================================
 
-    async _executeDeposit({ vault, amount, type, scheduledFor, extraVaultUpdate = {}, idempotencyKey = null, financialOperation = null }) {
+    async _executeDeposit({ vault, amount, type, scheduledFor, extraVaultUpdate = {}, idempotencyKey = null, financialOperation = null, authorizationGuardInTransaction = null }) {
         // Compute AZM reward up-front so the breakdown can be embedded in
         // the deposit row + the FE notification verbatim.
         const breakdown = this.computeAzmIntensity({
@@ -529,14 +535,58 @@ class VaultService {
             }
 
             const [userRow, , , , committedBody] = await this.prisma.$transaction(async (tx) => {
+                // ── FINAL AUTHORIZATION RE-PROOF (smart-route final-authorization
+                // race): this transaction is the economic boundary — the
+                // initiator's stale pre-call read is never the authority.
+                //   1. Caller-supplied in-transaction guard (same hook idiom
+                //      as the canonical fiat-withdrawal reservation
+                //      callback) lets the smart-route executor re-prove its
+                //      route/ban predicates inside THIS transaction.
+                //   2. The canonical ban predicate (authMiddleware's live
+                //      per-request rule: existing, non-deleted, banStatus
+                //      'ACTIVE') is re-proved against the live row — this
+                //      also closes the same race for the auto-rule worker
+                //      path, which has no HTTP request gating it.
+                //   3. The predicate is folded into the guarded user claim
+                //      below, so DB ordering decides a racing ban: a ban
+                //      committed before the claim fails the deposit; a
+                //      claim committed first means the ban landed after
+                //      the money moved.
+                if (typeof authorizationGuardInTransaction === 'function') {
+                    await authorizationGuardInTransaction(tx);
+                }
+                const authRow = await tx.user.findUnique({
+                    where: { id: vault.userId },
+                    select: { banStatus: true, isDeleted: true },
+                });
+                if (!authRow || authRow.isDeleted || authRow.banStatus !== 'ACTIVE') {
+                    const err = new Error(
+                        `USER_AUTHORIZATION_LOST: vault deposit blocked at the deposit transaction — account no longer active `
+                        + `(${authRow ? authRow.banStatus : 'missing'}${authRow && authRow.isDeleted ? ', deleted' : ''}).`
+                    );
+                    err.code = 'USER_AUTHORIZATION_LOST';
+                    throw err;
+                }
                 // r16 P0-D: guarded user claim — the conditional decrement
                 // fails closed on a concurrent spend instead of relying on
                 // the CHECK constraint as the only guard.
                 const userClaim = await tx.user.updateMany({
-                    where: { id: vault.userId, availableBalance: { gte: amount } },
+                    where: { id: vault.userId, availableBalance: { gte: amount }, banStatus: 'ACTIVE', isDeleted: false },
                     data: { availableBalance: { decrement: amount } },
                 });
                 if (userClaim.count !== 1) {
+                    const why = await tx.user.findUnique({
+                        where: { id: vault.userId },
+                        select: { banStatus: true, isDeleted: true },
+                    });
+                    if (why && (why.isDeleted || why.banStatus !== 'ACTIVE')) {
+                        const err = new Error(
+                            `USER_AUTHORIZATION_LOST: vault deposit blocked at the deposit transaction — account no longer active `
+                            + `(${why.banStatus}${why.isDeleted ? ', deleted' : ''}).`
+                        );
+                        err.code = 'USER_AUTHORIZATION_LOST';
+                        throw err;
+                    }
                     const err = new Error('Insufficient available balance for vault deposit.');
                     err.code = 'INSUFFICIENT_BALANCE';
                     throw err;
