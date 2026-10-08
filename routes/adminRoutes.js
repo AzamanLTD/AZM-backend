@@ -57,6 +57,9 @@ router.post('/kyc/reject', validate(rejectKycSchema), adminController.rejectKyc)
 router.get('/withdrawals/pending', adminController.getPendingWithdrawals);
 router.post('/withdrawals/:id/approve', adminController.approveWithdrawal);
 router.post('/withdrawals/:id/reject', adminController.rejectWithdrawal);
+// P0 (NEEDS_MANUAL_REVIEW dead-end): deterministic operator resolution of
+// parked withdrawals — backend-proven eligibility, single-winner CAS.
+router.post('/withdrawals/:id/resolve-review', adminController.resolveManualReview);
 
 // ─── CHAT INTERVENTION ───────────────────────────────────────────────────────
 router.post('/chat/inject', adminController.sendAdminMessage);

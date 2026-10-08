@@ -282,7 +282,13 @@ class PayoutBatchWorker {
 
         const pendingWithdrawals = await this.prisma.withdrawal.findMany({
             where: {
-                status: 'PENDING',
+                // P0 (APPROVED dead-end): APPROVED rows are admin-authorized
+                // payouts and are dispatch-eligible exactly like PENDING. The
+                // dispatch claim below is the same single-winner CAS, so an
+                // admin reject racing the worker still yields exactly one
+                // owner. Without this, an approved withdrawal was invisible
+                // to every consumer and the debited funds stranded forever.
+                status: { in: ['PENDING', 'APPROVED'] },
                 OR: [
                     { payoutMethod: { contains: 'MOMO' } },
                     { payoutMethod: { contains: 'momo' } },
@@ -427,7 +433,10 @@ class PayoutBatchWorker {
             // reconciliation worker can safely resume from PROCESSING using the
             // canonical provider reference.
             const claim = await this.prisma.withdrawal.updateMany({
-                where: { id: withdrawal.id, status: 'PENDING' },
+                // P0 (APPROVED dead-end): claim admin-approved rows too — the
+                // CAS is the single-winner guard against a concurrent admin
+                // reject (which also claims from APPROVED).
+                where: { id: withdrawal.id, status: { in: ['PENDING', 'APPROVED'] } },
                 data: { status: 'PROCESSING' }
             });
             if (claim.count !== 1) {
@@ -486,13 +495,8 @@ class PayoutBatchWorker {
                     logger.error({ referenceId, withdrawalId: withdrawal.id },
                         '[payoutBatchWorker] CRITICAL: accepted dispatch carries NO provider identity — parking, never guessing a rail');
                     await this._flagForManualReview(withdrawal, 'DISPATCH_IDENTITY_UNKNOWN', {
-                        amount, referenceId,
-                        message: 'Auto-payout dispatched but the accepting provider identity could not be determined — manual review required.'
-                    });
-                    await this._recordDurableException(withdrawal, 'DISPATCH_IDENTITY_UNKNOWN', {
-                        dispatched: true,
-                        referenceId,
-                        message: 'accepted dispatch carries no provider identity',
+                        amount, referenceId, dispatched: true,
+                        message: 'accepted dispatch carries no provider identity — manual review required.'
                     });
                     results.errors.push({ id: withdrawal.id, reason: 'DISPATCH_IDENTITY_UNKNOWN', referenceId });
                     continue;
@@ -503,15 +507,11 @@ class PayoutBatchWorker {
                     logger.error({ referenceId, withdrawalId: withdrawal.id, tagCanonicalName, selfIdentified: dispatchResult.provider },
                         '[payoutBatchWorker] CRITICAL: dispatch identity contradiction — parking, never guessing a rail');
                     await this._flagForManualReview(withdrawal, 'DISPATCH_IDENTITY_CONTRADICTION', {
-                        amount, referenceId,
-                        message: 'Auto-payout dispatched but the accepting provider identity is contradictory — manual review required.'
-                    });
-                    await this._recordDurableException(withdrawal, 'DISPATCH_IDENTITY_CONTRADICTION', {
-                        dispatched: true,
-                        referenceId,
+                        amount, referenceId, dispatched: true,
                         failoverTag: actualProviderTag,
                         tagCanonicalName,
                         selfIdentifiedProvider: dispatchResult?.provider ? String(dispatchResult.provider) : null,
+                        message: 'dispatch identity contradiction — manual review required.'
                     });
                     results.errors.push({ id: withdrawal.id, reason: 'DISPATCH_IDENTITY_CONTRADICTION', referenceId });
                     continue;
@@ -544,13 +544,9 @@ class PayoutBatchWorker {
                     await this._flagForManualReview(withdrawal, 'POST_DISPATCH_BOOKKEEPING_FAILED', {
                         amount,
                         referenceId,
-                        error: evidenceErr.message
-                    });
-                    await this._recordDurableException(withdrawal, 'POST_DISPATCH_BOOKKEEPING_FAILED', {
                         stage: 'DISPATCH_EVIDENCE',
                         provider: actualProviderName,
-                        referenceId,
-                        error: evidenceErr.message,
+                        error: evidenceErr.message
                     });
                     results.errors.push({ id: withdrawal.id, reason: 'POST_DISPATCH_BOOKKEEPING_FAILED', referenceId });
                     continue;
@@ -606,13 +602,9 @@ class PayoutBatchWorker {
                     await this._flagForManualReview(withdrawal, 'POST_DISPATCH_BOOKKEEPING_FAILED', {
                         amount,
                         referenceId,
-                        error: inTransitErr.message
-                    });
-                    await this._recordDurableException(withdrawal, 'POST_DISPATCH_BOOKKEEPING_FAILED', {
                         stage: 'IN_TRANSIT',
                         provider: actualProviderName,
-                        referenceId,
-                        error: inTransitErr.message,
+                        error: inTransitErr.message
                     });
                     results.errors.push({ id: withdrawal.id, reason: 'POST_DISPATCH_BOOKKEEPING_FAILED', referenceId });
                     continue;
@@ -663,8 +655,9 @@ class PayoutBatchWorker {
                     await this._flagForManualReview(withdrawal, 'DISBURSEMENT_DISPATCH_FAILED', {
                         amount,
                         error: dispatchErr.message,
+                        providerOutcome: outcome,
                         message: `Disbursement dispatch failed: ${dispatchErr.message}`
-                    });
+                    }, 'DISPATCH_FAILED_PROVEN');
                     results.flaggedManualReview.push({ id: withdrawal.id, reason: 'DISBURSEMENT_DISPATCH_FAILED', amount, error: dispatchErr.message });
                     continue;
                 }
@@ -728,26 +721,6 @@ class PayoutBatchWorker {
         return summary;
     }
 
-    // r15 hardening: record the durable exception row that the
-    // reconciliation worker's ownership guard reads to refuse cross-rail
-    // guessing on a dispatched payout whose owner bookkeeping failed.
-    // Best effort — the NEEDS_MANUAL_REVIEW flag from _flagForManualReview
-    // keeps the payout parked even if this write fails.
-    async _recordDurableException(withdrawal, reason, details = {}) {
-        try {
-            await recordReconciliationException(this.prisma, {
-                entityType: 'WITHDRAWAL',
-                entityId: String(withdrawal.id),
-                reference: details.referenceId || null,
-                reason,
-                details,
-            });
-        } catch (excErr) {
-            logger.error({ err: excErr, reason },
-                '[payoutBatchWorker] failed to record the durable reconciliation exception');
-        }
-    }
-
     // §r41 — AUTHORITATIVE PARKING CLAIM (final-audit: stale manual-review
     // writer). Parking a withdrawal for manual review is a CONDITIONAL claim
     // on the withdrawal row, never an unconditional write: the scan that
@@ -755,8 +728,33 @@ class PayoutBatchWorker {
     // claimed the row PROCESSING (or a terminal state may have committed)
     // since. Terminal states are NEVER stale-overwritten — the claim simply
     // loses and does nothing (the row's real owner keeps authority).
+    //
+    // P0 (NEEDS_MANUAL_REVIEW dead-end) — DURABLE PHASE EVIDENCE, FAIL-CLOSED:
+    // the parking reason and phase are recorded as an OPEN
+    // ReconciliationException BEFORE the status claim. A parked row without
+    // this evidence is unresolvable: the operator cannot prove whether
+    // provider dispatch occurred (provably-not-dispatched rows may be
+    // refunded/resumed; rows where the provider may have paid may only be
+    // escalated to the reconciliation authority). If the evidence write
+    // fails the row is NOT parked — a PENDING/APPROVED row stays scannable
+    // by this worker and a PROCESSING row stays owned by the
+    // reconciliation worker, so an existing authority always keeps it.
     // Returns true when the flag landed.
-    async _claimForManualReview(withdrawal, reason, metadata, claimableStatuses) {
+    async _claimForManualReview(withdrawal, reason, metadata = {}, claimableStatuses, phase = 'PRE_DISPATCH') {
+        try {
+            await recordReconciliationException(this.prisma, {
+                entityType: 'WITHDRAWAL',
+                entityId: String(withdrawal.id),
+                reference: metadata.referenceId || null,
+                reason,
+                details: { ...metadata, phase, claimedFrom: claimableStatuses },
+            });
+        } catch (evidenceErr) {
+            logger.error({ err: evidenceErr, reason, withdrawalId: withdrawal.id },
+                '[payoutBatchWorker] parking evidence write failed — NOT parking; the existing status authority keeps the row');
+            return false;
+        }
+
         try {
             const claim = await this.prisma.withdrawal.updateMany({
                 where: { id: withdrawal.id, status: { in: claimableStatuses } },
@@ -793,21 +791,26 @@ class PayoutBatchWorker {
         }
     }
 
-    // PRE-DISPATCH eligibility parking — PENDING only. The row was selected
-    // from a PENDING scan; if another worker already claimed it PROCESSING,
+    // PRE-DISPATCH eligibility parking — PENDING/APPROVED only. The row was
+    // selected from the PENDING/APPROVED scan; if another worker already
+    // claimed it PROCESSING,
     // or it reached any other state, this parking does NOTHING (no
     // notification either — the user's withdrawal is being handled by its
     // real owner, and a stale reviewer must not tell them otherwise).
     async _parkForManualReview(withdrawal, reason, metadata = {}) {
-        return this._claimForManualReview(withdrawal, reason, metadata, ['PENDING']);
+        // PENDING and APPROVED are both pre-dispatch states (the dispatch
+        // claim is the only writer of PROCESSING before provider I/O), so an
+        // APPROVED row failing an eligibility gate parks with the same
+        // provably-not-dispatched phase evidence.
+        return this._claimForManualReview(withdrawal, reason, metadata, ['PENDING', 'APPROVED'], 'PRE_DISPATCH');
     }
 
     // POST-DISPATCH exception parking — PROCESSING → NEEDS_MANUAL_REVIEW
     // stays intentionally allowed: the claim was won, provider I/O ran, and
     // a post-dispatch failure must park the row for humans. Terminal states
     // (COMPLETED/FAILED/...) can never be stale-overwritten by this path.
-    async _flagForManualReview(withdrawal, reason, metadata = {}) {
-        return this._claimForManualReview(withdrawal, reason, metadata, ['PROCESSING']);
+    async _flagForManualReview(withdrawal, reason, metadata = {}, phase = 'POST_ACCEPT') {
+        return this._claimForManualReview(withdrawal, reason, metadata, ['PROCESSING'], phase);
     }
 
     async _getSettings() {
