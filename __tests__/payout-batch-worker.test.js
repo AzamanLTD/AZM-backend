@@ -49,7 +49,9 @@ describe('PayoutBatchWorker canonical withdrawal transaction', () => {
 
         expect(result.processed).toBe(1);
         expect(withdrawalUpdateMany).toHaveBeenCalledWith({
-            where: { id: 91, status: 'PENDING' }, data: { status: 'PROCESSING' },
+            // r271e: the dispatch claim accepts APPROVED rows too — an
+            // admin-approved payout is dispatched by the worker, never stranded.
+            where: { id: 91, status: { in: ['PENDING', 'APPROVED'] } }, data: { status: 'PROCESSING' },
         });
         expect(initiateTransfer).toHaveBeenCalledWith(expect.objectContaining({
             referenceId: 'canonical-ref-1', externalId: 'auto_payout_91', network: 'TELECEL',
@@ -125,7 +127,9 @@ describe('PayoutBatchWorker canonical withdrawal transaction', () => {
         // §r41: the pre-dispatch parking is a CONDITIONAL PENDING-only claim —
         // never the old unconditional update.
         expect(prisma.withdrawal.updateMany).toHaveBeenCalledWith({
-            where: { id: 92, status: { in: ['PENDING'] } },
+            // r271e: pre-dispatch parking claims PENDING/APPROVED (both are
+            // provably undispatched states).
+            where: { id: 92, status: { in: ['PENDING', 'APPROVED'] } },
             data: { status: 'NEEDS_MANUAL_REVIEW' },
         });
     });
@@ -176,9 +180,9 @@ describe('PayoutBatchWorker provider outcome classification', () => {
         const worker = new PayoutBatchWorker(prisma, io, { initiateTransfer }, null);
         const result = await worker._processBatch(settings, { isManualTrigger: true });
 
-        // claim happened before dispatch
+        // claim happened before dispatch (r271e: PENDING/APPROVED claim)
         expect(updateMany).toHaveBeenCalledWith({
-            where: { id: 101, status: 'PENDING' }, data: { status: 'PROCESSING' },
+            where: { id: 101, status: { in: ['PENDING', 'APPROVED'] } }, data: { status: 'PROCESSING' },
         });
         // NOT moved out of the reconciliation pipeline
         expect(update).not.toHaveBeenCalled();

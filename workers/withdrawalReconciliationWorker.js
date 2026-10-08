@@ -67,11 +67,16 @@ class WithdrawalReconciliationWorker {
             // dispatched. PROCESSING covers auto-payout rows claimed before
             // provider I/O. DISPATCHING covers rows claimed by the r16c direct
             // dispatch boundary (Withdrawal PENDING -> DISPATCHING before
-            // provider I/O). Without all three states, a crash after any claim
-            // would leave the customer's funds permanently stranded.
+            // provider I/O). APPROVED covers admin-authorized payouts the
+            // payout worker has not claimed (P0 APPROVED dead-end): a poll
+            // that finds the reference absent at the provider parks it as a
+            // durable, visible reconciliation exception instead of leaving
+            // it silently invisible to every authority. Without all four
+            // states, a crash after any claim would leave the customer's
+            // funds permanently stranded.
             const stuck = await this.prisma.withdrawal.findMany({
                 where: {
-                    status: { in: ['PENDING', 'PROCESSING', 'DISPATCHING'] },
+                    status: { in: ['PENDING', 'PROCESSING', 'DISPATCHING', 'APPROVED'] },
                     createdAt: { lt: cutoff }
                 },
                 include: {

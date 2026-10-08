@@ -11,6 +11,7 @@ const withdrawalBridge = require('../services/withdrawalBridgeService'); // r18 
 const _exact = (n) => (n instanceof Prisma.Decimal ? n.toFixed(8) : Number(n).toFixed(8));
 const financeService = require('../services/finance.service');
 const { resolvePayoutOwner } = require('../services/payoutProviderOwnership');
+const { recordReconciliationException } = require('../services/reconciliationExceptionService');
 
 /**
  * Helper: retrieve the singleton NotificationService from app context.
@@ -1536,7 +1537,14 @@ exports.rejectWithdrawal = async (req, res) => {
 
         const withdrawal = await prisma.withdrawal.findUnique({ where: { id: withdrawalId } });
         if (!withdrawal) return res.status(404).json({ success: false, message: 'Withdrawal not found.' });
-        if (withdrawal.status !== 'PENDING') {
+        // P0 (APPROVED dead-end): an admin-approved withdrawal that has NOT
+        // been claimed by the payout worker is still provably undispatched —
+        // the dispatch claim is the only writer of PROCESSING and no provider
+        // evidence can exist yet (the safety gate below re-verifies this
+        // live). Rejection from APPROVED refunds exactly like rejection from
+        // PENDING; without it, an approved row could never be undone and the
+        // debited funds stranded permanently.
+        if (withdrawal.status !== 'PENDING' && withdrawal.status !== 'APPROVED') {
             return res.status(400).json({ success: false, message: `Cannot reject: status is ${withdrawal.status}.` });
         }
 
@@ -1569,7 +1577,7 @@ exports.rejectWithdrawal = async (req, res) => {
             try {
                 reversed = await prisma.$transaction(async (tx) => {
                     const claimed = await tx.withdrawal.updateMany({
-                        where: { id: withdrawalId, status: 'PENDING' },
+                        where: { id: withdrawalId, status: { in: ['PENDING', 'APPROVED'] } },
                         data: { status: 'REJECTED' }
                     });
                     if (claimed.count === 0) {
@@ -1632,7 +1640,7 @@ exports.rejectWithdrawal = async (req, res) => {
         // guessed for it. Never guess a financial obligation identity.
         await prisma.$transaction(async (tx) => {
             const claimed = await tx.withdrawal.updateMany({
-                where: { id: withdrawalId, status: 'PENDING' },
+                where: { id: withdrawalId, status: { in: ['PENDING', 'APPROVED'] } },
                 data: { status: 'REJECTED' }
             });
             if (claimed.count === 0) {
@@ -2182,6 +2190,16 @@ exports.getNeedsManualReview = async (req, res) => {
 
         const envelope = buildPageEnvelope(withdrawals, take, mode, page, total);
 
+        // P0 (NEEDS_MANUAL_REVIEW dead-end): attach the durable parking
+        // evidence (reason + phase) so the operator can see WHY the row is
+        // parked and which resolution actions are backend-provable. Rows
+        // parked before the fail-closed evidence fix carry no phase — the
+        // backend then only ever proves ESCALATE for them.
+        const parkingEvidence = await _manualReviewParkingEvidence(prisma, withdrawals.map((w) => w.id));
+        for (const w of withdrawals) {
+            w.manualReview = parkingEvidence.get(w.id) || { reasons: [], resolutionOptions: ['ESCALATE'] };
+        }
+
         return res.status(200).json({
             success: true,
             withdrawals,
@@ -2190,6 +2208,435 @@ exports.getNeedsManualReview = async (req, res) => {
         });
     } catch (error) {
         logger.error({ err: error }, '[getNeedsManualReview] error');
+        return res.status(500).json({ success: false, message: error.message });
+    }
+};
+
+// =============================================================================
+// NEEDS_MANUAL_REVIEW RESOLUTION (P0 dead-end fix, 2026-10-08)
+// =============================================================================
+// Parking was durable but had NO exit: no admin action accepted the status,
+// no worker scanned it, and the parking reason was not durably recorded for
+// most sites — the operator could not even prove whether provider dispatch
+// had occurred. This module gives every parked row a deterministic,
+// backend-proven resolution:
+//   RESUME   — provably-undispatched rows re-enter the payout pipeline.
+//   REJECT   — provably-undispatched rows are refunded through the SAME
+//              canonical reversal state machine as admin rejection.
+//   ESCALATE — rows where the provider may have paid are handed, durably,
+//              to the withdrawalReconciliationWorker (the repository's
+//              existing reconciliation authority), which resolves them from
+//              provider truth or parks them visibly. NEVER refunded here.
+// The operator NEVER asserts the cash position: the backend derives
+// eligibility from durable evidence (parking phase, canonical state,
+// dispatch evidence, payout ownership, the exception queue) and refuses
+// fail-closed.
+
+// Parking reasons that PROVE the provider never paid this payout:
+// PRE_DISPATCH parks happen before the PENDING/APPROVED → PROCESSING claim
+// (no provider I/O has run at all); DISBURSEMENT_DISPATCH_FAILED parks
+// happen after the claim but the adapter PROVABLY never invoked the provider
+// or the provider explicitly refused (NOT_DISPATCHED / DEFINITIVE_REJECTION).
+const REVIEW_SAFE_PARKING_REASONS = new Set([
+    'AMOUNT_EXCEEDS_THRESHOLD',
+    'ORPHAN_ADOPTION_CLAIM_LOST',
+    'AMBIGUOUS_TRANSACTION_REFERENCE',
+    'MISSING_TRANSACTION_REFERENCE',
+    'MISSING_RECIPIENT_PHONE',
+    'AUTHORITY_HEADROOM_BELOW_THRESHOLD',
+    'INSUFFICIENT_POOL_LIQUIDITY',
+    'DISBURSEMENT_DISPATCH_FAILED'
+]);
+
+// Anomaly reasons where the provider MAY have paid and the external outcome
+// is unknowable from inside the system. These rows may ONLY be escalated —
+// an admin refund/re-dispatch would double-spend or double-pay.
+const REVIEW_UNKNOWABLE_REASONS = new Set([
+    'DISPATCH_IDENTITY_UNKNOWN',
+    'DISPATCH_IDENTITY_CONTRADICTION',
+    'POST_DISPATCH_BOOKKEEPING_FAILED',
+    'POST_DISPATCH_OWNERSHIP_WRITE_FAILED',
+    'DISPATCHED_OWNERSHIP_NOT_DURABLE',
+    'PAYOUT_OWNERSHIP_CONFLICT',
+    'SETTLEMENT_EVIDENCE_REJECTED',
+    'PROVIDER_STATUS_UNAVAILABLE',
+    'PROVIDER_REFERENCE_NOT_FOUND',
+    'SMART_ROUTE_DISPATCH_INTENT_FAILED'
+]);
+
+const REVIEW_SAFE_PHASES = new Set(['PRE_DISPATCH', 'DISPATCH_FAILED_PROVEN']);
+
+/**
+ * Open WITHDRAWAL-entity exception rows for a set of withdrawal ids,
+ * bucketed for the review listing. Raw SQL — the exception queue is a
+ * migration-backed table without a Prisma model.
+ */
+async function _manualReviewParkingEvidence(prisma, withdrawalIds) {
+    const evidence = new Map();
+    if (!Array.isArray(withdrawalIds) || withdrawalIds.length === 0) return evidence;
+    const rows = await prisma.$queryRawUnsafe(
+        'SELECT "entityId", "reason", "reference", "details", "firstSeenAt", "lastSeenAt" FROM "ReconciliationException" ' +
+        'WHERE "status" = \'OPEN\' AND "entityType" = $1 AND "entityId" = ANY($2::text[]) ' +
+        'ORDER BY "lastSeenAt" DESC',
+        'WITHDRAWAL', withdrawalIds.map(String)
+    );
+    for (const row of rows || []) {
+        const id = Number(row.entityId);
+        const entry = evidence.get(id) || { reasons: [], resolutionOptions: ['ESCALATE'] };
+        entry.reasons.push({
+            reason: String(row.reason),
+            phase: row.details?.phase || null,
+            reference: row.reference || null,
+            firstSeenAt: row.firstSeenAt,
+            lastSeenAt: row.lastSeenAt
+        });
+        evidence.set(id, entry);
+    }
+    return evidence;
+}
+
+/**
+ * Backend-enforced eligibility for NEEDS_MANUAL_REVIEW resolution.
+ * mayMove (RESUME/REJECT) requires POSITIVE proof that the provider never
+ * dispatched: a durable safe-phase parking record, zero unknowable-class
+ * anomalies, zero canonical-entity anomalies, zero outbound dispatch
+ * evidence, unknown payout ownership, and a PENDING canonical (when a
+ * canonical exists). Everything else fails closed to ESCALATE.
+ */
+async function _reviewEligibility(prisma, withdrawal, canonical) {
+    const blockers = [];
+
+    const withdrawalExceptions = await prisma.$queryRawUnsafe(
+        'SELECT "reason", "reference", "details", "lastSeenAt" FROM "ReconciliationException" ' +
+        'WHERE "status" = \'OPEN\' AND "entityType" = $1 AND "entityId" = $2 ' +
+        'ORDER BY "lastSeenAt" DESC',
+        'WITHDRAWAL', String(withdrawal.id)
+    );
+
+    const safeReasons = [];
+    for (const row of withdrawalExceptions || []) {
+        const reason = String(row.reason || '');
+        const phase = row.details?.phase || null;
+        if (REVIEW_UNKNOWABLE_REASONS.has(reason)) {
+            blockers.push(`Durable anomaly ${reason} means the provider may have been paid.`);
+        } else if (REVIEW_SAFE_PARKING_REASONS.has(reason) && REVIEW_SAFE_PHASES.has(phase)) {
+            safeReasons.push({ reason, phase, reference: row.reference || null, lastSeenAt: row.lastSeenAt });
+        } else if (REVIEW_SAFE_PARKING_REASONS.has(reason)) {
+            blockers.push(`Parking record ${reason} carries no provable phase — treated as legacy/unknown.`);
+        } else {
+            blockers.push(`Unrecognized OPEN anomaly ${reason} is attached to this withdrawal.`);
+        }
+    }
+    if (safeReasons.length === 0) {
+        blockers.push('No durable provably-not-dispatched parking record exists for this withdrawal.');
+    }
+
+    if (canonical?.txHash) {
+        const txAnomalies = await prisma.$queryRawUnsafe(
+            'SELECT "reason" FROM "ReconciliationException" ' +
+            'WHERE "status" = \'OPEN\' AND "entityType" = $1 AND "entityId" = $2',
+            'TRANSACTION', String(canonical.txHash)
+        );
+        for (const row of txAnomalies || []) {
+            blockers.push(`OPEN anomaly ${row.reason} is attached to the canonical transaction.`);
+        }
+
+        if (canonical.status !== 'PENDING') {
+            blockers.push(`Canonical transaction status is ${canonical.status}, not PENDING.`);
+        }
+
+        const outboundEvidence = await prisma.fiatProviderEvent.count({
+            where: { relatedReference: canonical.txHash, direction: 'OUTBOUND' }
+        });
+        if (outboundEvidence > 0) {
+            blockers.push('Provider dispatch evidence exists for this payout — the cash position is not provably undispatched.');
+        }
+
+        const ownership = await resolvePayoutOwner(prisma, canonical);
+        if (ownership.status === 'CONFLICT') {
+            blockers.push('Multiple providers hold owner evidence for this payout.');
+        } else if (ownership.status !== 'UNKNOWN') {
+            blockers.push('A provider has accepted/owns this payout — a refund would double-spend.');
+        }
+    }
+
+    return {
+        mayMove: blockers.length === 0,
+        blockers,
+        safeReasons,
+        canonicalReference: canonical?.txHash || null,
+        canonicalStatus: canonical ? canonical.status : null
+    };
+}
+
+/**
+ * POST /api/admin/withdrawals/:id/resolve-review
+ * Body: { action: 'RESUME' | 'REJECT' | 'ESCALATE', reason }
+ *
+ * Deterministic, single-winner resolution of a parked withdrawal. All
+ * mirror transitions are CAS claims from NEEDS_MANUAL_REVIEW; the REJECT
+ * refund runs through the SAME canonical reversal state machine as admin
+ * rejection (single economic winner vs. callbacks/reconcilers); ESCALATE
+ * performs an atomic status claim + durable handoff exception so the
+ * reconciliation worker owns the row afterwards.
+ */
+exports.resolveManualReview = async (req, res) => {
+    const prisma = req.app.get('prisma');
+    const io = req.app.get('socketio');
+    const emitBalanceUpdate = req.app.get('emitBalanceUpdate');
+
+    try {
+        const withdrawalId = parseInt(req.params.id);
+        const action = String(req.body?.action || '').trim().toUpperCase();
+        const reason = typeof req.body?.reason === 'string' ? req.body.reason.trim() : '';
+
+        if (!withdrawalId || Number.isNaN(withdrawalId)) {
+            return res.status(400).json({ success: false, message: 'Invalid withdrawal ID.' });
+        }
+        if (!['RESUME', 'REJECT', 'ESCALATE'].includes(action)) {
+            return res.status(400).json({ success: false, message: 'action must be RESUME, REJECT or ESCALATE.' });
+        }
+        if (reason.length < 3 || reason.length > 500) {
+            return res.status(400).json({ success: false, message: 'A resolution reason between 3 and 500 characters is required.' });
+        }
+
+        const withdrawal = await prisma.withdrawal.findUnique({ where: { id: withdrawalId } });
+        if (!withdrawal) return res.status(404).json({ success: false, message: 'Withdrawal not found.' });
+        if (withdrawal.status !== 'NEEDS_MANUAL_REVIEW') {
+            return res.status(409).json({
+                success: false,
+                message: `Withdrawal #${withdrawalId} is ${withdrawal.status}, not NEEDS_MANUAL_REVIEW — this endpoint only resolves parked rows.`
+            });
+        }
+
+        const canonical = await _resolveCanonicalWithdrawalTx(prisma, withdrawal);
+        const eligibility = await _reviewEligibility(prisma, withdrawal, canonical);
+
+        if (action === 'RESUME' || action === 'REJECT') {
+            if (!eligibility.mayMove) {
+                return res.status(409).json({
+                    success: false,
+                    message: 'Resolution is refused: the backend cannot prove the provider never dispatched this payout. Escalate to the reconciliation authority instead.',
+                    data: { withdrawalId, blockers: eligibility.blockers }
+                });
+            }
+        }
+
+        // ── RESUME: provably-undispatched row re-enters the payout pipeline.
+        // The worker re-runs every eligibility gate on its next tick and
+        // re-parks (with fresh durable evidence) if a gate still refuses —
+        // a deterministic loop an operator can see, never a silent strand.
+        if (action === 'RESUME') {
+            const resumed = await prisma.withdrawal.updateMany({
+                where: { id: withdrawalId, status: 'NEEDS_MANUAL_REVIEW' },
+                data: { status: 'PENDING' }
+            });
+            if (resumed.count === 0) {
+                return res.status(409).json({ success: false, message: 'Withdrawal was resolved concurrently — refresh to see its final state.' });
+            }
+
+            await _getNotificationService(req).sendNotification({
+                userId: withdrawal.userId,
+                title: 'Withdrawal Review Completed',
+                body: 'Your withdrawal has cleared review and is being processed again.',
+                category: 'GENERAL'
+            }).catch(() => {});
+
+            await audit(prisma, {
+                actorId: req.user.id, actorName: req.user.username,
+                action: 'RESOLVE_MANUAL_REVIEW_RESUME', targetType: 'WITHDRAWAL', targetId: String(withdrawalId),
+                metadata: {
+                    previousStatus: 'NEEDS_MANUAL_REVIEW', userId: withdrawal.userId, amount: withdrawal.amount,
+                    reason, safeReasons: eligibility.safeReasons
+                },
+                ipAddress: req.ip
+            });
+
+            return res.status(200).json({
+                success: true,
+                message: `Withdrawal #${withdrawalId} resumed into the payout pipeline.`,
+                data: { withdrawalId, status: 'PENDING', reason }
+            });
+        }
+
+        // ── ESCALATE: atomic status claim + durable handoff record. The
+        // reconciliation worker (which scans PROCESSING rows) now owns the
+        // row: it resolves from provider truth — owner-only polling, r20
+        // evidence binding, terminal CAS claims — or parks it durably and
+        // visibly when the outcome is unknowable. No money moves here.
+        if (action === 'ESCALATE') {
+            await prisma.$transaction(async (tx) => {
+                const claimed = await tx.withdrawal.updateMany({
+                    where: { id: withdrawalId, status: 'NEEDS_MANUAL_REVIEW' },
+                    data: { status: 'PROCESSING' }
+                });
+                if (claimed.count === 0) {
+                    throw new Error('WITHDRAWAL_ALREADY_FINALIZED');
+                }
+                await recordReconciliationException(tx, {
+                    entityType: 'WITHDRAWAL',
+                    entityId: String(withdrawalId),
+                    reference: eligibility.canonicalReference,
+                    reason: 'MANUAL_REVIEW_ESCALATED_TO_RECONCILIATION',
+                    details: {
+                        action: 'ESCALATE',
+                        reason,
+                        escalatedByUserId: req.user.id,
+                        handedTo: 'withdrawalReconciliationWorker'
+                    }
+                });
+            });
+
+            await _getNotificationService(req).sendNotification({
+                userId: withdrawal.userId,
+                title: 'Withdrawal Under Final Verification',
+                body: 'Your withdrawal is in final verification with our payments provider. This usually completes within a few hours.',
+                category: 'GENERAL'
+            }).catch(() => {});
+
+            await audit(prisma, {
+                actorId: req.user.id, actorName: req.user.username,
+                action: 'RESOLVE_MANUAL_REVIEW_ESCALATE', targetType: 'WITHDRAWAL', targetId: String(withdrawalId),
+                metadata: {
+                    previousStatus: 'NEEDS_MANUAL_REVIEW', userId: withdrawal.userId, amount: withdrawal.amount,
+                    reason, canonicalReference: eligibility.canonicalReference, blockers: eligibility.blockers
+                },
+                ipAddress: req.ip
+            });
+
+            return res.status(200).json({
+                success: true,
+                message: `Withdrawal #${withdrawalId} escalated to the reconciliation authority.`,
+                data: { withdrawalId, status: 'PROCESSING', reason }
+            });
+        }
+
+        // ── REJECT: refund through the SAME state machines as admin
+        // rejection, with the mirror claim taken from NEEDS_MANUAL_REVIEW
+        // instead of PENDING/APPROVED. Single economic winner: the canonical
+        // PENDING → FAILED claim inside reverseFiatWithdrawal (canonical rows)
+        // or the mirror CAS (legacy rows) rolls the whole transaction back if
+        // anything moved concurrently.
+        if (canonical) {
+            let reversed;
+            try {
+                reversed = await prisma.$transaction(async (tx) => {
+                    const claimed = await tx.withdrawal.updateMany({
+                        where: { id: withdrawalId, status: 'NEEDS_MANUAL_REVIEW' },
+                        data: { status: 'REJECTED' }
+                    });
+                    if (claimed.count === 0) {
+                        throw new Error('WITHDRAWAL_ALREADY_FINALIZED');
+                    }
+                    const result = await financeService.reverseFiatWithdrawal(prisma, canonical.txHash, {
+                        tx,
+                        reason: `manual_review_rejection:${reason}`
+                    });
+                    if (!result || result.alreadyReversed) {
+                        throw new Error('WITHDRAWAL_CANONICAL_ALREADY_FINALIZED');
+                    }
+                    return result;
+                });
+            } catch (err) {
+                if (err.message === 'WITHDRAWAL_ALREADY_FINALIZED') {
+                    return res.status(409).json({ success: false, message: 'Withdrawal was resolved concurrently — refresh to see its final state.' });
+                }
+                if (err.message === 'WITHDRAWAL_CANONICAL_ALREADY_FINALIZED') {
+                    return res.status(409).json({ success: false, message: 'The linked withdrawal transaction was finalized concurrently. Refusing to refund twice — please refresh.' });
+                }
+                throw err;
+            }
+
+            await _notifyRejection(req, { withdrawal, withdrawalId, reason, io, emitBalanceUpdate, refundedAmount: reversed.refundedAmount });
+
+            await audit(prisma, {
+                actorId: req.user.id, actorName: req.user.username,
+                action: 'RESOLVE_MANUAL_REVIEW_REJECT', targetType: 'WITHDRAWAL', targetId: String(withdrawalId),
+                metadata: {
+                    previousStatus: 'NEEDS_MANUAL_REVIEW', userId: withdrawal.userId, amount: withdrawal.amount,
+                    reason, canonicalReference: canonical.txHash,
+                    refundedAmount: reversed.refundedAmount, safeReasons: eligibility.safeReasons
+                },
+                ipAddress: req.ip
+            });
+
+            return res.status(200).json({
+                success: true,
+                message: `Withdrawal #${withdrawalId} rejected from manual review. Funds refunded through the canonical reversal state machine.`,
+                data: {
+                    withdrawalId, userId: withdrawal.userId, amount: withdrawal.amount, reason,
+                    canonicalReference: canonical.txHash, refundedAmount: reversed.refundedAmount
+                }
+            });
+        }
+
+        // LEGACY PATH (no canonical TransactionHistory at all) — identical
+        // economics to admin rejection's legacy path: mirror claim from
+        // NEEDS_MANUAL_REVIEW, balance refund, authoritative ledger post and
+        // durable restricted-obligation cancellation, all in ONE transaction.
+        await prisma.$transaction(async (tx) => {
+            const claimed = await tx.withdrawal.updateMany({
+                where: { id: withdrawalId, status: 'NEEDS_MANUAL_REVIEW' },
+                data: { status: 'REJECTED' }
+            });
+            if (claimed.count === 0) {
+                throw new Error('WITHDRAWAL_ALREADY_FINALIZED');
+            }
+
+            await tx.user.update({
+                where: { id: withdrawal.userId },
+                data: { availableBalance: { increment: withdrawal.amount } }
+            });
+
+            const refundExact = new Prisma.Decimal(_exact(withdrawal.amount));
+            const activeObligation = await restrictedObligations.findActiveForSource(tx, 'withdrawal', withdrawal.id);
+            const refundPost = await ledger.post(tx, {
+                idempotencyKey: `ledger:admin:resolve-manual-review:${withdrawal.id}`,
+                entryType: 'WITHDRAWAL',
+                description: activeObligation
+                    ? 'Manual review rejection — reserved funds refunded to customer'
+                    : 'Manual review rejection — pre-P4 withdrawal refunded from platform equity',
+                userId: withdrawal.userId,
+                relatedEntity: 'withdrawal',
+                relatedEntityId: String(withdrawal.id),
+                metadata: { status: 'REJECTED', reason: reason || null, manualReview: true, reserved: Boolean(activeObligation) },
+                lines: activeObligation
+                    ? [
+                        { account: 'restricted:reserves', debit: refundExact.toFixed(8) },
+                        { account: `user:${withdrawal.userId}:liability`, credit: refundExact.toFixed(8) },
+                    ]
+                    : [
+                        { account: 'equity:treasury', debit: refundExact.toFixed(8) },
+                        { account: `user:${withdrawal.userId}:liability`, credit: refundExact.toFixed(8) },
+                    ],
+            });
+            if (activeObligation) {
+                await restrictedObligations.cancelOnReversal(tx, {
+                    reference: activeObligation.reference,
+                    releaseLedgerTransactionId: refundPost.transaction.id,
+                });
+            }
+        });
+
+        await _notifyRejection(req, { withdrawal, withdrawalId, reason, io, emitBalanceUpdate, refundedAmount: withdrawal.amount });
+
+        await audit(prisma, {
+            actorId: req.user.id, actorName: req.user.username,
+            action: 'RESOLVE_MANUAL_REVIEW_REJECT', targetType: 'WITHDRAWAL', targetId: String(withdrawalId),
+            metadata: {
+                previousStatus: 'NEEDS_MANUAL_REVIEW', userId: withdrawal.userId, amount: withdrawal.amount,
+                reason: reason || null, path: 'LEGACY_MIRROR_ONLY'
+            },
+            ipAddress: req.ip
+        });
+
+        return res.status(200).json({
+            success: true,
+            message: `Withdrawal #${withdrawalId} rejected from manual review. Funds refunded.`,
+            data: { withdrawalId, userId: withdrawal.userId, amount: withdrawal.amount, reason, refundedAmount: withdrawal.amount }
+        });
+    } catch (error) {
+        logger.error({ err: error }, '[resolveManualReview] error');
         return res.status(500).json({ success: false, message: error.message });
     }
 };

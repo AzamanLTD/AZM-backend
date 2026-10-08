@@ -163,6 +163,13 @@ jobs:
             "__tests__/r15g-moolre-status-contract.test.js"
             "__tests__/r15b-moolre-collection-outcomes.test.js"
             "__tests__/payout-unknown-outcome.test.js"
+            # §r271 P0 — withdrawal dead-end recovery proofs (APPROVED row
+            # worker/recon visibility, admin rejection from APPROVED, and the
+            # deterministic NEEDS_MANUAL_REVIEW exits) are financial integrity:
+            # they prove customer money cannot strand in a status no authority
+            # reads. DB-backed, production-commit-mode rehearsed here.
+            "__tests__/r271e-approved-withdrawal-recovery.test.js"
+            "__tests__/r271f-manual-review-recovery.test.js"
             "__tests__/r271d-late-deposit-settlement.test.js"
             "__tests__/admin-reconciliation-claims.test.js"
             "__tests__/payment-failover.test.js"
