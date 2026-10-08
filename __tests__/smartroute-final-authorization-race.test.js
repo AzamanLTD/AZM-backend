@@ -156,6 +156,13 @@ describeOrSkip('Smart Route final authorization race', () => {
         // Authorization is lost AFTER the claim.
         await banUser(user.id);
 
+        // Baseline captured AFTER all seeding so the zero-movement assertions
+        // below prove THIS run posted nothing — independent of any ambient
+        // journal activity left by fire-and-forget writers of earlier suites
+        // (the battery is serial, but pending async work can commit after a
+        // suite's own truncate).
+        const journalBase = await prisma.journalEntry.count({});
+
         const run = await svc._executeClaim(claim);
         expect(run.status).toBe('SKIPPED');
         expect(run.failureReason).toMatch(/no longer active|banned/i);
@@ -166,7 +173,7 @@ describeOrSkip('Smart Route final authorization race', () => {
         expect(Number(freshUser.availableBalance)).toBeCloseTo(500, 5);
         expect(Number(freshFriend.availableBalance)).toBeCloseTo(0, 5);
         expect(await prisma.transactionHistory.count({ where: { type: 'SMART_ROUTE_RUN' } })).toBe(0);
-        expect(await prisma.journalEntry.count({})).toBe(0);
+        expect(await prisma.journalEntry.count({})).toBe(journalBase);
 
         // The occurrence is consumed exactly once: a re-claim of the same
         // route does not mint a second run for it.
@@ -186,6 +193,9 @@ describeOrSkip('Smart Route final authorization race', () => {
         const claim = await svc._claimExecution(route.id, false);
         await banUser(user.id);
 
+        // Baseline after seeding — see test 1 for the ambient-noise rationale.
+        const journalBase = await prisma.journalEntry.count({});
+
         const run = await svc._executeClaim(claim);
         expect(run.status).toBe('SKIPPED');
         expect(run.failureReason).toMatch(/no longer active|banned/i);
@@ -197,7 +207,7 @@ describeOrSkip('Smart Route final authorization race', () => {
         expect(Number(freshGoal.currentAmountGhs)).toBeCloseTo(0, 5);
         expect(freshGoal.totalDeposits).toBe(0);
         expect(await prisma.savingsDeposit.count({ where: { goalId: goal.id } })).toBe(0);
-        expect(await prisma.journalEntry.count({})).toBe(0);
+        expect(await prisma.journalEntry.count({})).toBe(journalBase);
     });
 
     test('3: vault — ban after claim cannot produce a committed vault deposit; the next occurrence retries once authorized', async () => {
