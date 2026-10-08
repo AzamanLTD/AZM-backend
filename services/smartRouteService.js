@@ -529,6 +529,21 @@ class SmartRouteService {
                 await this._notifyInsufficient(route, new Prisma.Decimal(0), amount).catch(() => {});
                 return await this._finalizeGuardedRun(run, route, occurrenceBased, occurrenceBase, 'FAILED_INSUFFICIENT', 'Balance changed before execution');
             }
+            // Final-authorization race classification: an authorization
+            // predicate that failed INSIDE a money transaction means nothing
+            // committed — the run is SKIPPED with the authorization reason
+            // (same classification the pre-execution ban gate uses), never
+            // SUCCESS and never a generic error. A route that stopped being
+            // ACTIVE fails like the recovery sweep classifies it.
+            if (this._isAuthorizationLostError(err)) {
+                return await this._finalizeGuardedRun(run, route, occurrenceBased, occurrenceBase, 'SKIPPED', err.message);
+            }
+            if (this._isUserMissingError(err)) {
+                return await this._finalizeGuardedRun(run, route, occurrenceBased, occurrenceBase, 'SKIPPED', err.message);
+            }
+            if (this._isRouteNotActiveError(err)) {
+                return await this._finalizeGuardedRun(run, route, occurrenceBased, occurrenceBase, 'FAILED_OTHER', err.message);
+            }
             logger.error({ err, routeId: route.id, runId: run.id }, '[SmartRoute] execution failed');
             return await this._finalizeGuardedRun(run, route, occurrenceBased, occurrenceBase, 'FAILED_OTHER', err.message);
         }
@@ -669,6 +684,16 @@ class SmartRouteService {
                     // record is created INSIDE the authoritative reservation
                     // transaction, durably linked to the canonical row.
                     createWithdrawalRecordInTransaction: async (tx, txRecord) => {
+                        // Final user-authorization re-proof INSIDE the
+                        // canonical reservation transaction — the point
+                        // where the withdrawal reservation becomes
+                        // authoritative. A ban that landed after the
+                        // pre-execution read rolls back the ENTIRE
+                        // reservation (no debit, no canonical row, no
+                        // mirror, no provider I/O). finance.service masks
+                        // err.code on callback failures, so the helper's
+                        // message token carries the classification.
+                        await this._assertLiveUserAuthorizationTx(tx, route.userId, { atBoundary: 'withdrawal reservation' });
                         const rows = await tx.$queryRawUnsafe(
                             'INSERT INTO "Withdrawal" ' +
                             '("userId", "amount", "payoutMethod", "network", "destination", "status", "transactionHistoryId", "createdAt", "updatedAt") ' +
@@ -702,6 +727,112 @@ class SmartRouteService {
             await this._notifySuccess(route, amount, `Routed $${amount.toFixed(2)} to MoMo ${destMomoNumber}`);
         }
         return refreshed;
+    }
+
+    // =========================================================================
+    // FINAL AUTHORIZATION RE-PROOFS (the smart-route final-authorization race)
+    // =========================================================================
+    // Canonical authorization semantics (audited, NOT invented):
+    //   • User authorization = the predicate authMiddleware proves live on
+    //     EVERY HTTP request (middleware/authMiddleware.js): an existing,
+    //     non-deleted user with banStatus 'ACTIVE'. There is no separate
+    //     suspension/freeze model in the schema.
+    //   • Route status = the schedule/authorization state of the standing
+    //     instruction (SmartRouteStatus). The claim transaction requires
+    //     ACTIVE to mint a run, and the stale-recovery sweep already treats
+    //     a non-ACTIVE route as blocking a claimed run's re-drive
+    //     ("Recovered after interruption — route no longer active"). This
+    //     module now encodes that same semantics uniformly at the economic
+    //     boundary: a route paused/cancelled AFTER the claim fails closed
+    //     BEFORE money moves (matching recovery), and no future claim can
+    //     bypass it (the claim gate stays).
+    // The r19 claim freezes the run's ECONOMIC identity (amount, action,
+    // destination, cadence, occurrence). It must NEVER freeze authorization:
+    // these helpers re-prove the live predicates INSIDE the money
+    // transaction, so DB ordering — not a stale pre-read — decides races.
+    // The error message carries a stable token because one integration point
+    // (finance.service's createWithdrawalRecordInTransaction wrapper)
+    // overwrites err.code; classification then matches on the token.
+    async _assertLiveUserAuthorizationTx(tx, userId, { atBoundary = 'economic boundary' } = {}) {
+        const live = await tx.user.findUnique({
+            where: { id: userId },
+            select: { banStatus: true, isDeleted: true },
+        });
+        if (!live) {
+            const err = new Error(`SMART_ROUTE_USER_MISSING: Smart Route blocked at ${atBoundary} — user no longer exists.`);
+            err.code = 'SMART_ROUTE_USER_MISSING';
+            throw err;
+        }
+        if (live.isDeleted || live.banStatus !== 'ACTIVE') {
+            const err = new Error(
+                `SMART_ROUTE_AUTHORIZATION_LOST: Smart Route blocked at ${atBoundary} — account no longer active `
+                + `(${live.banStatus}${live.isDeleted ? ', deleted' : ''}).`
+            );
+            err.code = 'SMART_ROUTE_AUTHORIZATION_LOST';
+            throw err;
+        }
+    }
+
+    async _assertLiveRouteAuthorizationTx(tx, routeId, { atBoundary = 'economic boundary' } = {}) {
+        const live = await tx.smartRoute.findUnique({
+            where: { id: routeId },
+            select: { status: true },
+        });
+        if (!live || live.status !== 'ACTIVE') {
+            const err = new Error(
+                `SMART_ROUTE_ROUTE_NOT_ACTIVE: Smart Route blocked at ${atBoundary} — route no longer active (${live ? live.status : 'missing'}).`
+            );
+            err.code = 'SMART_ROUTE_ROUTE_NOT_ACTIVE';
+            throw err;
+        }
+    }
+
+    /**
+     * Guarded debit whose conditional claim carries the canonical
+     * authorization predicate. A ban that committed before this statement
+     * fails the claim; a claim that committed first means the ban landed
+     * after the money moved. DB ordering decides — a stale pre-read is
+     * never the authority. On claim loss the live row is re-read to
+     * classify honestly (authorization lost vs balance changed).
+     */
+    async _guardedAuthorizationDebitTx(tx, userId, amount, extraData = {}, { atBoundary = 'economic boundary' } = {}) {
+        const debit = await tx.user.updateMany({
+            where: { id: userId, availableBalance: { gte: amount }, banStatus: 'ACTIVE', isDeleted: false },
+            data: { availableBalance: { decrement: amount }, ...extraData },
+        });
+        if (debit.count === 1) return;
+        const why = await tx.user.findUnique({
+            where: { id: userId },
+            select: { banStatus: true, isDeleted: true },
+        });
+        if (why && (why.isDeleted || why.banStatus !== 'ACTIVE')) {
+            const err = new Error(
+                `SMART_ROUTE_AUTHORIZATION_LOST: Smart Route blocked at ${atBoundary} — account no longer active `
+                + `(${why.banStatus}${why.isDeleted ? ', deleted' : ''}).`
+            );
+            err.code = 'SMART_ROUTE_AUTHORIZATION_LOST';
+            throw err;
+        }
+        const err = new Error('Insufficient USDC balance. Balance changed before execution.');
+        err.code = 'INSUFFICIENT_BALANCE';
+        throw err;
+    }
+
+    /** Classification helpers for the final-authorization error family. */
+    _isAuthorizationLostError(err) {
+        return err?.code === 'SMART_ROUTE_AUTHORIZATION_LOST'
+            || err?.code === 'USER_AUTHORIZATION_LOST'
+            || String(err?.message || '').startsWith('SMART_ROUTE_AUTHORIZATION_LOST');
+    }
+
+    _isRouteNotActiveError(err) {
+        return err?.code === 'SMART_ROUTE_ROUTE_NOT_ACTIVE'
+            || String(err?.message || '').startsWith('SMART_ROUTE_ROUTE_NOT_ACTIVE');
+    }
+
+    _isUserMissingError(err) {
+        return err?.code === 'SMART_ROUTE_USER_MISSING'
+            || String(err?.message || '').startsWith('SMART_ROUTE_USER_MISSING');
     }
 
     /**
@@ -830,11 +961,89 @@ class SmartRouteService {
         // REJECTED inside the reversal transaction) and the payout worker
         // (PENDING → PROCESSING). Exactly one winner; only the winner may
         // touch the provider or the money.
+        //
+        // Final-authorization hardening: the LAST SAFE BOUNDARY before the
+        // irreversible provider side effect. The live user + route
+        // predicates are re-proved in the SAME transaction as the dispatch
+        // claim, so a ban/pause that committed before the claim fails here
+        // — and because no provider I/O has happened yet, the reservation
+        // is unwound HONESTLY through the canonical reversal (nothing is
+        // pretended away: the provider was never called). A ban landing
+        // AFTER the claim commits is post-authoritative; the payout then
+        // resolves through the canonical state machine exactly like any
+        // other dispatched withdrawal. DB ordering decides the race.
         if (reservation.withdrawalRecord?.id) {
-            const claim = await this.prisma.withdrawal.updateMany({
-                where: { id: reservation.withdrawalRecord.id, status: 'PENDING' },
-                data: { status: 'DISPATCHING' },
-            });
+            let claim = { count: 0 };
+            let claimTxErr = null;
+            try {
+                claim = await this.prisma.$transaction(async (tx) => {
+                    await this._assertLiveUserAuthorizationTx(tx, route.userId, { atBoundary: 'dispatch claim' });
+                    await this._assertLiveRouteAuthorizationTx(tx, route.id, { atBoundary: 'dispatch claim' });
+                    return await tx.withdrawal.updateMany({
+                        where: { id: reservation.withdrawalRecord.id, status: 'PENDING' },
+                        data: { status: 'DISPATCHING' },
+                    });
+                });
+            } catch (claimErr) {
+                claimTxErr = claimErr;
+            }
+            if (claimTxErr && (this._isAuthorizationLostError(claimTxErr) || this._isUserMissingError(claimTxErr))) {
+                logger.error({ err: claimTxErr, reference, runId: run.id },
+                    '[SmartRoute] authorization lost before dispatch — reversing reservation honestly (no provider I/O)');
+                try {
+                    await financeService.reverseFiatWithdrawal(this.prisma, reference, {
+                        // The authorization detail rides the reason so the
+                        // converged run records WHAT was lost (ban status),
+                        // not merely that a reversal happened.
+                        reason: `smart_route_authorization_lost_before_dispatch: ${claimTxErr.message}`,
+                        // r19: converge + classify exactly as this path did.
+                        runFailureStatus: 'SKIPPED',
+                    });
+                    await this._markMirrorFailed(reservation, 'AUTHORIZATION_LOST');
+                } catch (revErr) {
+                    logger.error({ err: revErr, reference, runId: run.id },
+                        '[SmartRoute] CRITICAL: authorization-loss reversal failed — parking for reconciliation');
+                    await recordReconciliationExceptionLoud(this.prisma, {
+                        entityType: 'WITHDRAWAL',
+                        entityId: String(reservation.withdrawalRecord.id),
+                        reference,
+                        reason: 'SMART_ROUTE_AUTHORIZATION_LOSS_REVERSAL_FAILED',
+                        details: { authorizationError: claimTxErr.message, reversalError: revErr.message },
+                    }).catch(() => {});
+                    await this._finalizeGuardedRun(run, route, occurrenceBased, occurrenceBase, 'AWAITING_RECONCILIATION', 'authorization lost before dispatch and reversal failed — parked, never refunded by guess');
+                    return 'PARKED';
+                }
+                await this._finalizeGuardedRun(run, route, occurrenceBased, occurrenceBase, 'SKIPPED', claimTxErr.message);
+                return 'REVERSED';
+            }
+            if (claimTxErr && this._isRouteNotActiveError(claimTxErr)) {
+                logger.error({ err: claimTxErr, reference, runId: run.id },
+                    '[SmartRoute] route no longer active at dispatch — reversing reservation honestly (no provider I/O)');
+                try {
+                    await financeService.reverseFiatWithdrawal(this.prisma, reference, {
+                        reason: `smart_route_route_not_active_before_dispatch: ${claimTxErr.message}`,
+                        // The recovery sweep classifies route-not-active as
+                        // FAILED_OTHER; match it.
+                        runFailureStatus: 'FAILED_OTHER',
+                    });
+                    await this._markMirrorFailed(reservation, 'ROUTE_NOT_ACTIVE');
+                } catch (revErr) {
+                    logger.error({ err: revErr, reference, runId: run.id },
+                        '[SmartRoute] CRITICAL: route-not-active reversal failed — parking for reconciliation');
+                    await recordReconciliationExceptionLoud(this.prisma, {
+                        entityType: 'WITHDRAWAL',
+                        entityId: String(reservation.withdrawalRecord.id),
+                        reference,
+                        reason: 'SMART_ROUTE_ROUTE_NOT_ACTIVE_REVERSAL_FAILED',
+                        details: { routeError: claimTxErr.message, reversalError: revErr.message },
+                    }).catch(() => {});
+                    await this._finalizeGuardedRun(run, route, occurrenceBased, occurrenceBase, 'AWAITING_RECONCILIATION', 'route not active at dispatch and reversal failed — parked, never refunded by guess');
+                    return 'PARKED';
+                }
+                await this._finalizeGuardedRun(run, route, occurrenceBased, occurrenceBase, 'FAILED_OTHER', claimTxErr.message);
+                return 'REVERSED';
+            }
+            if (claimTxErr) throw claimTxErr;
             if (claim.count !== 1) {
                 const canonical = await this.prisma.transactionHistory.findUnique({ where: { txHash: reference } });
                 if (canonical && canonical.status === 'FAILED') {
@@ -1073,6 +1282,16 @@ class SmartRouteService {
         const recipientId = run.destFriendUserId || route.destFriendUserId;
 
         await this.prisma.$transaction(async (tx) => {
+            // ── FINAL AUTHORIZATION RE-PROOF (smart-route final-authorization
+            // race): the SENDER's live ban predicate and the route's live
+            // ACTIVE predicate participate in the SAME transaction as the
+            // debit, the recipient credit, the ledger posting and the run
+            // finalization. The pre-execution user read is a classifier,
+            // never the authority: a ban that committed before the guarded
+            // claim below fails the whole transaction (no debit, no credit,
+            // no ledger mutation, no successful run).
+            await this._assertLiveUserAuthorizationTx(tx, route.userId, { atBoundary: 'internal transfer transaction' });
+            await this._assertLiveRouteAuthorizationTx(tx, route.id, { atBoundary: 'internal transfer transaction' });
             // ── r19 P0-4: CANONICAL RECIPIENT AUTHORIZATION ──────────────
             // The direct peer-transfer contract (peerTransferController
             // .sendFunds) requires an ACCEPTED Friendship between the two
@@ -1122,16 +1341,12 @@ class SmartRouteService {
             }
 
             // Guarded debit — the conditional claim fails closed on a
-            // concurrent spend instead of driving the balance negative.
-            const debit = await tx.user.updateMany({
-                where: { id: route.userId, availableBalance: { gte: amount } },
-                data: { availableBalance: { decrement: amount } },
-            });
-            if (debit.count !== 1) {
-                const err = new Error('Insufficient USDC balance. Balance changed before execution.');
-                err.code = 'INSUFFICIENT_BALANCE';
-                throw err;
-            }
+            // concurrent spend instead of driving the balance negative. The
+            // claim also carries the canonical authorization predicate, so a
+            // ban that committed between the asserts above and this
+            // statement still fails the whole transaction: DB ordering
+            // decides, never a stale pre-read.
+            await this._guardedAuthorizationDebitTx(tx, route.userId, amount, {}, { atBoundary: 'internal transfer debit' });
             await tx.user.update({
                 where: { id: recipientId },
                 data: { availableBalance: { increment: amount } },
@@ -1179,6 +1394,13 @@ class SmartRouteService {
         const goalId = run.destSavingsGoalId || route.destSavingsGoalId;
 
         await this.prisma.$transaction(async (tx) => {
+            // ── FINAL AUTHORIZATION RE-PROOF (smart-route final-authorization
+            // race): the sender's live ban predicate and the route's live
+            // ACTIVE predicate participate in the SAME transaction as the
+            // debit, the escrow restriction, the goal update, the deposit
+            // row, the ledger posting and the run finalization.
+            await this._assertLiveUserAuthorizationTx(tx, route.userId, { atBoundary: 'savings deposit transaction' });
+            await this._assertLiveRouteAuthorizationTx(tx, route.id, { atBoundary: 'savings deposit transaction' });
             // Goal validation INSIDE the money transaction (the old
             // pre-transaction read was a TOCTOU on goal ownership/state).
             const goal = await tx.savingsGoal.findUnique({
@@ -1221,20 +1443,14 @@ class SmartRouteService {
             const rate = freshRate.rateGhsPerUsdcExact;
             const ghs = amount.mul(rate);
 
-            const debit = await tx.user.updateMany({
-                where: { id: route.userId, availableBalance: { gte: amount } },
-                data: {
-                    availableBalance: { decrement: amount },
-                    // §P.4: projection escrow column moves with the goal
-                    // restriction the ledger locks below.
-                    escrowLockedBalance: { increment: amount },
-                },
-            });
-            if (debit.count !== 1) {
-                const err = new Error('Insufficient USDC balance. Balance changed before execution.');
-                err.code = 'INSUFFICIENT_BALANCE';
-                throw err;
-            }
+            // Guarded debit with the canonical authorization predicate
+            // folded into the conditional claim (§P.4: the projection
+            // escrow column moves with the goal restriction the ledger
+            // locks below). A ban that committed before this statement
+            // fails the whole transaction; DB ordering decides.
+            await this._guardedAuthorizationDebitTx(tx, route.userId, amount, {
+                escrowLockedBalance: { increment: amount },
+            }, { atBoundary: 'savings deposit debit' });
             await tx.savingsGoal.update({
                 where: { id: goal.id },
                 data: {
@@ -1293,11 +1509,28 @@ class SmartRouteService {
         // guarded ACTIVE claim + guarded user debit inside it). The run's
         // durable idempotency key makes a crashed-execution retry converge
         // to the committed deposit instead of moving money twice.
+        //
+        // ── FINAL AUTHORIZATION RE-PROOF (smart-route final-authorization
+        // race): the authoritative vault transaction itself re-proves the
+        // live predicates — the smart-route pre-call ban read is never the
+        // authority. The guard callback runs INSIDE vaultService's money
+        // transaction (the same in-transaction-hook idiom as the canonical
+        // fiat-withdrawal reservation callback): a ban/pause that committed
+        // before the deposit claim aborts the deposit (no debit, no vault
+        // increment, no VaultDeposit row, no ledger posting); the run then
+        // finalizes SKIPPED/FAILED and the next occurrence retries once the
+        // user/route is authorized again. Preserved: the r16 guarded ACTIVE
+        // vault claim, R42.1 idempotency on the run's durable key, the
+        // authoritative ledger posting, and the atomic completion reward.
         await this.vaultService.depositManual({
             userId: route.userId,
             vaultId,
             amountUsdc: amount,
             idempotencyKey: `smartroute-run-${run.id}`,
+            authorizationGuardInTransaction: async (tx) => {
+                await this._assertLiveUserAuthorizationTx(tx, route.userId, { atBoundary: 'vault deposit transaction' });
+                await this._assertLiveRouteAuthorizationTx(tx, route.id, { atBoundary: 'vault deposit transaction' });
+            },
         });
 
         // Finalize the run in a second transaction. A crash between the
