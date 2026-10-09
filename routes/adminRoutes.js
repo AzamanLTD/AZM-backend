@@ -17,6 +17,7 @@ const router = express.Router();
 const adminController = require('../controllers/adminController');
 const profitBreakdownController = require('../controllers/adminProfitBreakdownController');
 const { protect, adminOnly } = require('../middleware/authMiddleware');
+const { requireEffectivePermission } = require('../middleware/requireEffectivePermission');
 const { idempotency } = require('../middleware/idempotency');
 const { validate } = require('../middleware/validate');
 const {
@@ -40,26 +41,26 @@ router.get('/profit-breakdown', profitBreakdownController.getProfitBreakdown);
 // ─── TRADE OVERSIGHT ─────────────────────────────────────────────────────────
 router.get('/trades/live', adminController.getLiveTrades);
 router.get('/disputes', adminController.getAllDisputes);
-router.post('/disputes/force-release', validate(forceReleaseSchema), adminController.forceRelease);
-router.post('/disputes/force-cancel', validate(forceReleaseSchema), adminController.forceCancel);
+router.post('/disputes/force-release', requireEffectivePermission('disputes.resolve'), validate(forceReleaseSchema), adminController.forceRelease);
+router.post('/disputes/force-cancel', requireEffectivePermission('disputes.resolve'), validate(forceReleaseSchema), adminController.forceCancel);
 
 // ─── USER MANAGEMENT ─────────────────────────────────────────────────────────
 router.get('/users', adminController.getUsers);
-router.post('/users/:id/ban', validate(banUserSchema), adminController.banUser);
-router.post('/users/:id/role', adminController.changeUserRole);
+router.post('/users/:id/ban', requireEffectivePermission('users.ban', 'users.unban'), validate(banUserSchema), adminController.banUser);
+router.post('/users/:id/role', requireEffectivePermission('users.role_change'), adminController.changeUserRole);
 
 // ─── KYC MANAGEMENT ──────────────────────────────────────────────────────────
 router.get('/kyc/pending', adminController.getPendingKyc);
-router.post('/kyc/approve', validate(approveKycSchema), adminController.approveKyc);
-router.post('/kyc/reject', validate(rejectKycSchema), adminController.rejectKyc);
+router.post('/kyc/approve', requireEffectivePermission('users.kyc_approve'), validate(approveKycSchema), adminController.approveKyc);
+router.post('/kyc/reject', requireEffectivePermission('users.kyc_reject'), validate(rejectKycSchema), adminController.rejectKyc);
 
 // ─── WITHDRAWAL MANAGEMENT ───────────────────────────────────────────────────
 router.get('/withdrawals/pending', adminController.getPendingWithdrawals);
 router.post('/withdrawals/:id/approve', adminController.approveWithdrawal);
-router.post('/withdrawals/:id/reject', adminController.rejectWithdrawal);
+router.post('/withdrawals/:id/reject', requireEffectivePermission('withdrawals.approve'), adminController.rejectWithdrawal);
 // P0 (NEEDS_MANUAL_REVIEW dead-end): deterministic operator resolution of
 // parked withdrawals — backend-proven eligibility, single-winner CAS.
-router.post('/withdrawals/:id/resolve-review', adminController.resolveManualReview);
+router.post('/withdrawals/:id/resolve-review', requireEffectivePermission('withdrawals.approve'), adminController.resolveManualReview);
 
 // ─── CHAT INTERVENTION ───────────────────────────────────────────────────────
 router.post('/chat/inject', adminController.sendAdminMessage);
@@ -275,12 +276,12 @@ router.post('/trade-accounts/:id/reject', async (req, res) => {
 // a COMMITTED claim replays the exact stored response bytes. Non-economic
 // post-commit work (emitBalanceUpdate) runs AFTER the wire in a res-silent
 // phase, so a push failure can never release a committed credit.
-router.post('/users/:id/credit', idempotency({ failurePolicy: 'RELEASE', releaseOn4xx: true }), adminController.creditUserBalance);
+router.post('/users/:id/credit', requireEffectivePermission('fees.manage'), idempotency({ failurePolicy: 'RELEASE', releaseOn4xx: true }), adminController.creditUserBalance);
 
 // ─── AUTONOMOUS PAYOUTS (Phase Q8) ──────────────────────────────────────────
-router.post('/payouts/batch-process',   adminController.batchProcessPayouts);
+router.post('/payouts/batch-process',   requireEffectivePermission('withdrawals.approve'), adminController.batchProcessPayouts);
 router.get('/payouts/settings',         adminController.getPayoutSettings);
-router.put('/payouts/settings',         adminController.updatePayoutSettings);
+router.put('/payouts/settings',         requireEffectivePermission('withdrawals.approve'), adminController.updatePayoutSettings);
 router.get('/payouts/needs-review',     adminController.getNeedsManualReview);
 
 // ─── APP VERSION GATE (Phase Q15) ────────────────────────────────────────────

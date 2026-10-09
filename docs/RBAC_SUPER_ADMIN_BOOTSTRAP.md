@@ -97,6 +97,31 @@ Those enforced flows are exactly:
 | Multi-step approval lifecycle (`createApprovalRequest`, `approveRequest`, `rejectRequest`) | `controllers/adminRbacController.js` |
 | `approveWithdrawal` — acting role and re-derivation of every recorded participant | `controllers/adminController.js` |
 | Role provisioning (`GET /admins`, `POST /admins/:id/role`, `POST /admins/:id/deprovision`) | `controllers/adminRoleAdminController.js` |
+| Legacy migration **tranche 1** — per-endpoint effective-role permission gates (`requireEffectivePermission`) on the consolidated command center's money/privilege mutations | `middleware/requireEffectivePermission.js`, wired in `routes/adminRoutes.js` and `routes/financeRoutes.js` |
+
+Tranche 1 covers exactly these operations (endpoint → required catalog
+permission, OR-composed where noted):
+
+| Endpoint | Required permission |
+| --- | --- |
+| `POST /api/admin/users/:id/credit` (manual balance credit) | `fees.manage` (the established `MANUAL_BALANCE_ADJUST` mapping) |
+| `POST /api/admin/withdrawals/:id/reject` | `withdrawals.approve` (finalize authority, mirroring hardened `approveWithdrawal`) |
+| `POST /api/admin/withdrawals/:id/resolve-review` | `withdrawals.approve` |
+| `POST /api/admin/payouts/batch-process` | `withdrawals.approve` (disbursement trigger) |
+| `PUT /api/admin/payouts/settings` | `withdrawals.approve` |
+| `POST /api/finance/admin/liquidate-profits` | `fees.manage` (profit-fee pool management) |
+| `POST /api/admin/disputes/force-release` | `disputes.resolve` |
+| `POST /api/admin/disputes/force-cancel` | `disputes.resolve` |
+| `POST /api/admin/users/:id/ban` | `users.ban` **or** `users.unban` at the route; the handler narrows to the action-specific permission |
+| `POST /api/admin/kyc/approve` | `users.kyc_approve` |
+| `POST /api/admin/kyc/reject` | `users.kyc_reject` |
+| `POST /api/admin/users/:id/role` | `users.role_change` — a RESERVED permission granted to no specialized role: primary-role changes (including elevation to ADMIN) stay SUPER_ADMIN/legacy-ADMIN only |
+
+The gates run BEFORE the financial idempotency claim on the credit route, so
+a denied credit never mints a claim and never touches economics. All gates
+fail closed (no live row, deleted, banned, demoted or unresolvable → 403),
+resolve the acting role from `AdminRoleAssignment` + the live `User` row, and
+never consult the JWT role claim.
 
 Operational consequences:
 
@@ -114,6 +139,14 @@ Operational consequences:
   `checkAdminPermission`/`requireAdminPermission`.
 
 ### Legacy surfaces still OUTSIDE authoritative specialized-role enforcement
+
+> **Migration in progress (tranche 1 landed):** the two files below carry
+> per-endpoint authoritative gates on their tranche-1 operations (see the
+> enforced-flows table above) — `routes/adminRoutes.js` and
+> `routes/financeRoutes.js`. Their REMAINING endpoints, and every other file
+> in this inventory, are still claim-gated only. The files stay listed here
+> because the router-level claim gate remains their outer boundary; the
+> authoritative enforcement inside them is per-endpoint, not file-wide.
 
 Route files gated only by `protect` + `isAdmin`-style claim checks (no
 effective-role resolution). This inventory is maintained and versioned with
@@ -155,6 +188,26 @@ role claim (inside `controllers/adminRbacController.js`):
 - `getSusuHealthDashboard` (`susu.health`)
 
 Migrating this legacy surface to authoritative effective-role enforcement is
-a **separately tracked task** — it is deliberately out of scope for this
-branch. Do not assume it has happened; check this inventory and its
-accompanying test.
+a **separately tracked task** — tranche 1 (above) has landed; the remaining
+surface is tracked in explicit follow-up tranches so nothing disappears from
+scope. Planned migration order (highest risk first):
+
+- **Tranche 2 — remaining adminRoutes mutations + reads:** fee-profile CRUD,
+  platform settings (`PUT /settings`, risk tiers), trade-account
+  approve/reject, escrow-dispute assign/resolve, business suspend/delete,
+  and the read surfaces (`GET /users`, `GET /withdrawals/pending`, stats).
+- **Tranche 3 — financial surveillance routes:** `adminSusuRoutes`,
+  `custodyRoutes`, `tradeRoutes`, `fraudRoutes`, `creditScoreRoutes`,
+  `proofOfReservesRoutes`, `kycRoutes`, `liabilityContractRoutes`,
+  `warRoomRoutes`, `adminWarRoomRoutes`, `journalRoutes`.
+- **Tranche 4 — operational/back-office routes:** the `businessOSRoutes`
+  family (`businessOSRoutes`, `businessOSKioskRoutes`), `adminStorefrontRoutes`,
+  `adminDineInRoutes`, `adminChatRoutes`, `adminStatsRoutes`, `aiRoutes`,
+  `changelogRoutes`, `notificationRoutes`, `qrRoutes`, `vendorStatsRoutes`,
+  `proofOfResidencyRoutes`.
+- **Tranche 5 — the three claim-gated RBAC controller handlers**
+  (`listApprovals`, `exportAuditLog`, `getSusuHealthDashboard`) in
+  `controllers/adminRbacController.js`.
+
+Do not assume a tranche has happened until it is listed in the enforced-flows
+table; check this inventory and its accompanying test.
