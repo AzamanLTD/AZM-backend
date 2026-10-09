@@ -1493,7 +1493,6 @@ exports.approveWithdrawal = async (req, res) => {
                 yourRole: req.user.role
             });
         }
-        const requirement = rbac.getApprovalRequirement('WITHDRAWAL', Number(withdrawal.amount));
 
         // Phase H12 BUGFIX (2026-05-27): atomic conditional flip. Without
         // this, two admins both clicking approve would both fire the
@@ -1502,16 +1501,103 @@ exports.approveWithdrawal = async (req, res) => {
         // worker), but consistent with the rejectWithdrawal fix.
         let approvalRequest = null;
         const claimed = await prisma.$transaction(async (tx) => {
+            // P0 (r272 follow-up): re-read the authoritative withdrawal INSIDE
+            // the transaction — the pre-tx read above is a fast-path only.
+            // The amount that decides the tier is the persisted one, never a
+            // client-supplied value.
+            const authoritative = await tx.withdrawal.findUnique({
+                where: { id: withdrawalId },
+                select: { amount: true, status: true }
+            });
+            if (!authoritative) {
+                const err = new Error('Withdrawal not found.');
+                err.statusCode = 404;
+                throw err;
+            }
+            if (authoritative.status !== 'PENDING') {
+                // The pre-tx fast-path above already 400'd a genuinely
+                // non-PENDING withdrawal — reaching here with a different
+                // status means another admin finalized it between the two
+                // reads: a concurrent action, surfaced as 409.
+                const err = new Error('Withdrawal was already finalized by another admin (concurrent action).');
+                err.statusCode = 409;
+                throw err;
+            }
+            const requirement = rbac.getApprovalRequirement('WITHDRAWAL', Number(authoritative.amount));
+
             if (requirement.requiredApprovals > 1) {
-                const consumed = await tx.adminApprovalRequest.updateMany({
+                // P0 (r272 follow-up) — approval-evidence binding. The old
+                // consumption matched ONLY type/entityId/status and
+                // bulk-transitioned every APPROVED request, so a quorum
+                // approved for a LOWER amount could authorize a withdrawal
+                // whose actual amount requires a HIGHER tier. The evidence
+                // must now prove, per request, that it was approved for THIS
+                // withdrawal exactly:
+                const withdrawalAmount = new Prisma.Decimal(authoritative.amount);
+                const requiresFinCompliance = Number(authoritative.amount) >= 50000;
+                const candidates = await tx.adminApprovalRequest.findMany({
                     where: { type: 'WITHDRAWAL', entityId: String(withdrawalId), status: 'APPROVED' },
+                    orderBy: { id: 'asc' },
+                });
+
+                let chosen = null;
+                let reason = 'No approval request exists for this withdrawal yet.';
+                for (const cand of candidates) {
+                    // 1. Exact amount — Decimal equality, never float.
+                    const candAmount = new Prisma.Decimal(cand.amount);
+                    if (!candAmount.equals(withdrawalAmount)) {
+                        reason = `Approval request #${cand.id} was approved for ${candAmount.toString()} but this withdrawal is ${withdrawalAmount.toString()}.`;
+                        continue;
+                    }
+                    // 2. Re-derived tier — the request's declared quorum must
+                    //    match the authoritative tier for the ACTUAL amount.
+                    if (cand.requiredApprovals !== requirement.requiredApprovals) {
+                        reason = `Approval request #${cand.id} was formed under a ${cand.requiredApprovals}-approval tier but ${withdrawalAmount.toString()} requires ${requirement.requiredApprovals}.`;
+                        continue;
+                    }
+                    // 3. Recorded quorum satisfies the required count.
+                    const approvals = Array.isArray(cand.approvals) ? cand.approvals : [];
+                    if (approvals.length < requirement.requiredApprovals) {
+                        reason = `Approval request #${cand.id} records ${approvals.length} of ${requirement.requiredApprovals} required approvals.`;
+                        continue;
+                    }
+                    // 4. >= 50,000 requires Finance/Compliance participation,
+                    //    proven from the recorded evidence.
+                    if (requiresFinCompliance) {
+                        const hasFinCompliance = approvals.some((a) => {
+                            const role = String(a?.role || '').trim().toUpperCase();
+                            return role === 'FINANCE_ADMIN' || role === 'COMPLIANCE_ADMIN';
+                        });
+                        if (!hasFinCompliance) {
+                            reason = `Approval request #${cand.id} lacks the Finance/Compliance participation required for withdrawals of 50,000 or more.`;
+                            continue;
+                        }
+                    }
+                    chosen = cand;
+                    break;
+                }
+                if (!chosen) {
+                    // Fail closed: nothing consumed, withdrawal untouched.
+                    const err = new Error(
+                        `Withdrawal #${withdrawalId} (${withdrawalAmount.toString()}) requires ${requirement.requiredApprovals} approvals under the RBAC tier policy. ` +
+                        `No consumable approval evidence: ${reason}`
+                    );
+                    err.statusCode = 403;
+                    err.code = 'WITHDRAWAL_APPROVAL_QUORUM_REQUIRED';
+                    throw err;
+                }
+
+                // Consume ONE specific validated request by ID — a
+                // compare-and-swap on status = APPROVED, never a bulk
+                // transition of every request for this withdrawal.
+                const consumed = await tx.adminApprovalRequest.updateMany({
+                    where: { id: chosen.id, status: 'APPROVED' },
                     data: { status: 'EXECUTED', executedAt: new Date() }
                 });
                 if (consumed.count === 0) {
-                    // Fail-closed, but distinguish the two causes: another
-                    // admin already approved this withdrawal concurrently
-                    // (their transaction consumed the request AND flipped
-                    // the row) versus no quorum ever formed.
+                    // Lost the consumption race or the state moved under us.
+                    // Fail closed; distinguish concurrent approval from
+                    // evidence that went stale between validation and claim.
                     const current = await tx.withdrawal.findUnique({
                         where: { id: withdrawalId },
                         select: { status: true }
@@ -1522,18 +1608,13 @@ exports.approveWithdrawal = async (req, res) => {
                         throw err;
                     }
                     const err = new Error(
-                        `Withdrawals of this amount require ${requirement.requiredApprovals} approvals under the RBAC tier policy. ` +
-                        'Create and quorum-approve an AdminApprovalRequest (type WITHDRAWAL) for this withdrawal first.'
+                        'The approval request for this withdrawal changed while approving it. Refresh and retry.'
                     );
-                    err.statusCode = 403;
-                    err.code = 'WITHDRAWAL_APPROVAL_QUORUM_REQUIRED';
+                    err.statusCode = 409;
+                    err.code = 'WITHDRAWAL_APPROVAL_CONFLICT';
                     throw err;
                 }
-                approvalRequest = await tx.adminApprovalRequest.findFirst({
-                    where: { type: 'WITHDRAWAL', entityId: String(withdrawalId), status: 'EXECUTED' },
-                    orderBy: { id: 'desc' },
-                    select: { id: true, approvals: true }
-                });
+                approvalRequest = { id: chosen.id, approvals: chosen.approvals };
             }
 
             const flip = await tx.withdrawal.updateMany({
@@ -1585,6 +1666,9 @@ exports.approveWithdrawal = async (req, res) => {
     } catch (error) {
         if (error?.statusCode && error?.code === 'WITHDRAWAL_APPROVAL_QUORUM_REQUIRED') {
             return res.status(403).json({ success: false, code: error.code, message: error.message });
+        }
+        if (error?.statusCode && error?.code === 'WITHDRAWAL_APPROVAL_CONFLICT') {
+            return res.status(409).json({ success: false, code: error.code, message: error.message });
         }
         if (error?.statusCode === 409) {
             return res.status(409).json({ success: false, message: error.message });

@@ -51,6 +51,20 @@ function makeMockDb(seedRows = []) {
     const db = {
         rows,
         nextId: 100,
+        // P0 (r272 follow-up): createApprovalRequest binds WITHDRAWAL
+        // evidence to the persisted withdrawal — the mock now serves the
+        // authoritative rows (amount as string, like Decimal.toString()).
+        withdrawals: new Map([
+            [1, { id: 1, amount: '20000', status: 'PENDING' }],
+            [2, { id: 2, amount: '60000', status: 'PENDING' }],
+            [3, { id: 3, amount: '500', status: 'PENDING' }],
+        ]),
+        withdrawal: {
+            findUnique: async ({ where }) => {
+                const w = db.withdrawals.get(where.id);
+                return w ? clone(w) : null;
+            },
+        },
         adminApprovalRequest: {
             create: async ({ data }) => {
                 const id = db.nextId++;
@@ -151,7 +165,7 @@ describe('Admin RBAC — action-specific permission enforcement', () => {
         const db = makeMockDb();
         const r = makeRes();
         await ctrl.createApprovalRequest(
-            makeReq({ user: users.readOnly, body: { type: 'WITHDRAWAL', entityId: 'w1', amount: 20000 }, db }),
+            makeReq({ user: users.readOnly, body: { type: 'WITHDRAWAL', entityId: '1', amount: 20000 }, db }),
             r
         );
         expect(r._status).toBe(403);
@@ -164,7 +178,7 @@ describe('Admin RBAC — action-specific permission enforcement', () => {
         const db = makeMockDb();
         const r = makeRes();
         await ctrl.createApprovalRequest(
-            makeReq({ user: users.finance, body: { type: 'WITHDRAWAL', entityId: 'w1', amount: 20000 }, db }),
+            makeReq({ user: users.finance, body: { type: 'WITHDRAWAL', entityId: '1', amount: 20000 }, db }),
             r
         );
         expect(r._status).toBe(200);
@@ -176,7 +190,7 @@ describe('Admin RBAC — action-specific permission enforcement', () => {
         const db = makeMockDb();
         const r = makeRes();
         await ctrl.createApprovalRequest(
-            makeReq({ user: users.compliance, body: { type: 'WITHDRAWAL', entityId: 'w1', amount: 60000 }, db }),
+            makeReq({ user: users.compliance, body: { type: 'WITHDRAWAL', entityId: '2', amount: 60000 }, db }),
             r
         );
         expect(r._status).toBe(200);
@@ -344,7 +358,7 @@ describe('Admin RBAC — non-monetary actions never auto-approve', () => {
         const db = makeMockDb();
         const r = makeRes();
         await ctrl.createApprovalRequest(
-            makeReq({ user: users.finance, body: { type: 'WITHDRAWAL', entityId: 'w1', amount: 500 }, db }),
+            makeReq({ user: users.finance, body: { type: 'WITHDRAWAL', entityId: '3', amount: 500 }, db }),
             r
         );
         expect(r._status).toBe(200);

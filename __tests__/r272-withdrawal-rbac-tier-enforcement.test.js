@@ -222,7 +222,11 @@ describeOrSkip('r272 RBAC approval tiers are enforced on approveWithdrawal (real
 
     test('concurrent approvals of the same ≥ $10k withdrawal → one commit, one 409, one consumption', async () => {
         const w = await seedWithdrawal(30000);
-        await seedApprovedRequest(w.id, { amount: 30000, requiredApprovals: 3 });
+        // P0 follow-up: the evidence must now match the AUTHORITATIVE tier
+        // for 30,000 (>= $10k → 2 approvals). The old fixture seeded a
+        // 3-approval request that 30,000 never required — exactly the
+        // misleading-evidence mismatch the binding fix refuses.
+        await seedApprovedRequest(w.id, { amount: 30000, requiredApprovals: 2 });
 
         const r1 = makeRes();
         const r2 = makeRes();

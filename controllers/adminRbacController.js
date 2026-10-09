@@ -27,6 +27,7 @@
 // =============================================================================
 
 const logger = require('../src/config/logger');
+const { Prisma } = require('@prisma/client');
 
 // ── Admin Role Definitions ──────────────────────────────────────────────────
 const ADMIN_ROLES = {
@@ -235,13 +236,60 @@ async function createApprovalRequest(req, res) {
     }
 
     const amt = parseFloat(amount) || 0;
-    const requirement = getApprovalRequirement(type, amt);
+
+    // P0 (r272 follow-up) — WITHDRAWAL approval evidence is BOUND to the
+    // persisted withdrawal: entityId must reference an existing PENDING
+    // withdrawal, and the tier-deciding amount is the withdrawal's OWN
+    // amount, never the client-supplied one. Before this, a request could
+    // be created for e.g. 15,000 (2-approval tier) and later consumed to
+    // authorize a 60,000 withdrawal (3-approval tier + Finance/Compliance).
+    // The recorded amount is kept in exact Decimal form — the stored
+    // evidence equals the authoritative amount to the stored scale.
+    let authoritativeAmount;
+    if (type === 'WITHDRAWAL') {
+        const withdrawalId = parseInt(entityId, 10);
+        if (!withdrawalId || isNaN(withdrawalId)) {
+            return res.status(400).json({
+                success: false,
+                message: 'For WITHDRAWAL approval requests, entityId must be the withdrawal ID.',
+            });
+        }
+        const withdrawal = await prisma.withdrawal.findUnique({
+            where: { id: withdrawalId },
+            select: { id: true, amount: true, status: true }
+        });
+        if (!withdrawal) {
+            return res.status(404).json({
+                success: false,
+                message: `Withdrawal ${withdrawalId} does not exist; approval evidence must be bound to a real withdrawal.`,
+            });
+        }
+        if (withdrawal.status !== 'PENDING') {
+            return res.status(409).json({
+                success: false,
+                message: `Withdrawal ${withdrawalId} is ${withdrawal.status}, not PENDING — ineligible for approval evidence.`,
+            });
+        }
+        const persistedAmount = new Prisma.Decimal(withdrawal.amount);
+        if (amt > 0 && !new Prisma.Decimal(amt).equals(persistedAmount)) {
+            return res.status(400).json({
+                success: false,
+                message: `Approval request amount ${amt} does not match withdrawal ${withdrawalId}'s actual amount ${persistedAmount.toString()}.`,
+            });
+        }
+        authoritativeAmount = persistedAmount;
+    }
+
+    const requirement = getApprovalRequirement(
+        type,
+        authoritativeAmount ? Number(authoritativeAmount) : amt
+    );
 
     const request = await prisma.adminApprovalRequest.create({
       data: {
         type,
         entityId,
-        amount: amt,
+        amount: authoritativeAmount !== undefined ? authoritativeAmount : amt,
         description,
         metadata: metadata || {},
         requestedBy: userId,
