@@ -15,6 +15,8 @@
 
 const logger = require('../src/config/logger');
 const crypto         = require('crypto');
+const ledger         = require('../services/ledgerService');
+const { commitOperation } = require('../middleware/idempotency');
 const financeService = require('../services/finance.service');
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -58,27 +60,48 @@ const logCorporatePurchase = async (req, res) => {
             });
         }
 
-        const usdcAmountFloat       = parseFloat(usdcAmount);
-        const fiatSentTotalFloat    = parseFloat(fiatSentTotal);
-        const discountRateFloat     = parseFloat(discountRate);
-        const actualMarketRateFloat = parseFloat(actualMarketRate);
-
-        if ([usdcAmountFloat, fiatSentTotalFloat, discountRateFloat, actualMarketRateFloat].some(v => isNaN(v) || v <= 0)) {
-            return res.status(400).json({
+        // r272 finding 2 — exact money. parseFloat feeds Decimal(20,8)/
+        // Decimal(18,8) columns with binary floats (0.1+0.2 problems,
+        // silent 17-digit representations on the increment projection).
+        // Every monetary field now enters as an exact Decimal through the
+        // ledger's fail-closed parser: exponent notation, >8dp strings and
+        // negative/NaN values are rejected before any economics execute.
+        const parsePositive = (value, label) => {
+            const d = ledger.toExactDecimal(value, label);
+            if (d.isZero()) {
+                throw Object.assign(new Error(`${label} must be positive.`), { statusCode: 400 });
+            }
+            return d;
+        };
+        let usdcAmountD, fiatSentTotalD, discountRateD, actualMarketRateD;
+        try {
+            usdcAmountD       = parsePositive(usdcAmount, 'usdcAmount');
+            fiatSentTotalD    = parsePositive(fiatSentTotal, 'fiatSentTotal');
+            discountRateD     = parsePositive(discountRate, 'discountRate');
+            actualMarketRateD = parsePositive(actualMarketRate, 'actualMarketRate');
+        } catch (err) {
+            return res.status(err.statusCode || 400).json({
                 success: false,
-                message: 'All numeric fields must be positive numbers.'
+                message: err.statusCode === 400 ? err.message : 'All numeric fields must be exact positive decimals (<= 8 decimal places).'
             });
         }
 
         const method = (purchaseMethod === 'API') ? 'API' : 'MANUAL';
 
-        const result = await prisma.$transaction(async (tx) => {
+        // r272 finding 2 — the idempotency claim is committed INSIDE the
+        // economic transaction (the wired pattern): commitOperation runs
+        // on the SAME `tx`, so the claim flip and the treasury credit are
+        // one atomic unit. A rolled-back transaction leaves the claim
+        // IN_PROGRESS — durable proof of rollback that releaseOn4xx
+        // re-arms — and a retry with the same key replays the committed
+        // result instead of crediting the treasury twice.
+        const responseBody = await prisma.$transaction(async (tx) => {
             const log = await tx.corporatePurchaseLog.create({
                 data: {
-                    usdcAmount:       usdcAmountFloat,
-                    fiatSentTotal:    fiatSentTotalFloat,
-                    discountRate:     discountRateFloat,
-                    actualMarketRate: actualMarketRateFloat,
+                    usdcAmount:       usdcAmountD,
+                    fiatSentTotal:    fiatSentTotalD,
+                    discountRate:     discountRateD,
+                    actualMarketRate: actualMarketRateD,
                     screenshotUrl:    screenshotUrl || null,
                     purchaseMethod:   method,
                     adminId:          parseInt(adminId, 10)
@@ -88,21 +111,23 @@ const logCorporatePurchase = async (req, res) => {
             await _ensureMasterCrypto(tx);
             await tx.systemMasterCrypto.update({
                 where: { id: 1 },
-                data:  { balance: { increment: usdcAmountFloat } }
+                data:  { balance: { increment: usdcAmountD } }
             });
 
             const updated = await tx.systemMasterCrypto.findUnique({ where: { id: 1 } });
-            return { log, updated };
+            const body = {
+                success: true,
+                message: 'Corporate purchase logged. SystemMasterCrypto credited.',
+                data: {
+                    purchaseLog:           log,
+                    systemMasterCrypto:    updated.balance
+                }
+            };
+            await commitOperation(tx, res.locals.financialOperation, 201, body);
+            return body;
         });
 
-        return res.status(201).json({
-            success: true,
-            message: 'Corporate purchase logged. SystemMasterCrypto credited.',
-            data: {
-                purchaseLog:           result.log,
-                systemMasterCrypto:    result.updated.balance
-            }
-        });
+        return res.status(201).json(responseBody);
     } catch (error) {
         logger.error({ err: error }, 'logCorporatePurchase error');
         return res.status(500).json({ success: false, message: error.message });
@@ -151,6 +176,18 @@ const purchaseCorporateViaApi = async (req, res) => {
                 message: 'fiatGhs is required and must be positive.'
             });
         }
+        // r272 finding 2 — exact money: the GHS amount enters as an exact
+        // Decimal (fail-closed parse), never a binary float.
+        let fiatGhsD;
+        try {
+            fiatGhsD = ledger.toExactDecimal(fiatGhs, 'fiatGhs');
+            if (fiatGhsD.isZero()) throw new Error('fiatGhs must be positive.');
+        } catch (err) {
+            return res.status(400).json({
+                success: false,
+                message: 'fiatGhs must be an exact positive decimal (<= 8 decimal places).'
+            });
+        }
         if (!gatewayService) {
             return res.status(503).json({
                 success: false,
@@ -167,23 +204,37 @@ const purchaseCorporateViaApi = async (req, res) => {
             });
         }
 
-        const fiatGhsFloat       = parseFloat(fiatGhs);
-        const corporateRate      = rates.corporateRate;
-        const actualMarketRate   = rates.retailRate;
-        const usdcAmount         = parseFloat((fiatGhsFloat / corporateRate).toFixed(6));
-        const discountRate       = parseFloat((((actualMarketRate - corporateRate) / actualMarketRate) || 0).toFixed(6));
+        // r272 finding 2 — exact money end-to-end. Rates arrive as floats
+        // from the gateway; every derived amount is computed with exact
+        // Decimal arithmetic and persisted as the 8dp string the
+        // Decimal(20,8)/Decimal(18,8) columns actually store — the float
+        // pipeline (parseFloat, toFixed(6), increment-by-float) is gone.
+        const corporateRateD    = ledger.toExactDecimal(rates.corporateRate, 'corporateRate');
+        const actualMarketRateD = ledger.toExactDecimal(rates.retailRate, 'retailRate');
+        const usdcAmountD       = fiatGhsD.div(corporateRateD).toDecimalPlaces(8);
+        const discountRateD     = actualMarketRateD.isZero()
+            ? new (require('@prisma/client').Decimal)(0)
+            : actualMarketRateD.minus(corporateRateD).div(actualMarketRateD).toDecimalPlaces(8);
+        const corporateRate      = corporateRateD.toString();
+        const actualMarketRate   = actualMarketRateD.toString();
+        const usdcAmount         = usdcAmountD.toString();
+        const discountRate       = discountRateD.toString();
+        const fiatGhsValue       = fiatGhsD.toString();
         const gatewayReference   = (typeof incomingRef === 'string' && incomingRef.length > 0)
             ? incomingRef
             : `KOTANI_BUY_${adminId}_${Date.now()}_${crypto.randomBytes(4).toString('hex').toUpperCase()}`;
 
-        // 2. Atomic write: log + credit.
-        const result = await prisma.$transaction(async (tx) => {
+        // 2. Atomic write: log + credit + idempotency claim commit — one
+        // transaction. The claim commits on the same tx (wired pattern), so
+        // a retried POST replays the committed response instead of writing a
+        // second CorporatePurchaseLog row and crediting the treasury twice.
+        const responseBody = await prisma.$transaction(async (tx) => {
             const log = await tx.corporatePurchaseLog.create({
                 data: {
-                    usdcAmount,
-                    fiatSentTotal:    fiatGhsFloat,
-                    discountRate,
-                    actualMarketRate,
+                    usdcAmount:       usdcAmountD,
+                    fiatSentTotal:    fiatGhsD,
+                    discountRate:     discountRateD,
+                    actualMarketRate: actualMarketRateD,
                     screenshotUrl:    screenshotUrl || null,
                     purchaseMethod:   'API',
                     adminId:          parseInt(adminId, 10),
@@ -195,35 +246,37 @@ const purchaseCorporateViaApi = async (req, res) => {
             await _ensureMasterCrypto(tx);
             await tx.systemMasterCrypto.update({
                 where: { id: 1 },
-                data:  { balance: { increment: usdcAmount } }
+                data:  { balance: { increment: usdcAmountD } }
             });
 
             const updated = await tx.systemMasterCrypto.findUnique({ where: { id: 1 } });
-            return { log, updated };
+            const body = {
+                success: true,
+                message: 'Corporate API purchase logged. SystemMasterCrypto credited.',
+                data: {
+                    purchaseLog:        log,
+                    systemMasterCrypto: updated.balance,
+                    quote: {
+                        provider:         rates.provider,
+                        source:           rates.source,
+                        corporateRate,
+                        actualMarketRate,
+                        discountRate,
+                        fiatGhs:          fiatGhsValue,
+                        usdcAmount,
+                        gatewayReference
+                    },
+                    metadata: {
+                        recipientPhone:   recipientPhone   || null,
+                        recipientNetwork: recipientNetwork || null
+                    }
+                }
+            };
+            await commitOperation(tx, res.locals.financialOperation, 201, body);
+            return body;
         });
 
-        return res.status(201).json({
-            success: true,
-            message: 'Corporate API purchase logged. SystemMasterCrypto credited.',
-            data: {
-                purchaseLog:        result.log,
-                systemMasterCrypto: result.updated.balance,
-                quote: {
-                    provider:         rates.provider,
-                    source:           rates.source,
-                    corporateRate,
-                    actualMarketRate,
-                    discountRate,
-                    fiatGhs:          fiatGhsFloat,
-                    usdcAmount,
-                    gatewayReference
-                },
-                metadata: {
-                    recipientPhone:   recipientPhone   || null,
-                    recipientNetwork: recipientNetwork || null
-                }
-            }
-        });
+        return res.status(201).json(responseBody);
     } catch (error) {
         // P2002 → unique constraint violation on gatewayReference (replay)
         if (error?.code === 'P2002') {

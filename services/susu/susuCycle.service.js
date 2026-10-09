@@ -604,6 +604,47 @@ class SusuCycleService {
   // ── Cycle finalization (payout or escrow divert) ──────────────────────
   async _finalizeCycle(cycle, susu) {
     return this.prisma.$transaction(async (tx) => {
+      // r272 finding 1 — transactional frozen/closed group gate, taken
+      // BEFORE the cycle claim so that BOTH paths that can move this pool
+      // acquire their locks in the same order (group row first, cycle rows
+      // second). With the gate after the cycle claim, a refund in flight
+      // (group row locked, waiting on cycle rows) could deadlock against
+      // this payout (cycle row locked, waiting on the group row's FOR
+      // SHARE): Postgres would abort one of them, turning a mutually
+      // exclusive race into a liveness failure. Group-first ordering makes
+      // the losing side queue on the group row and never touch the cycle
+      // rows until the winner commits. The
+      // pre-tx check (Property 18) reads the group status once and races
+      // the admin resolve flow: an admin can freeze + REFUND_AND_CLOSE the
+      // group after the worker passed that check but before this
+      // transaction pays the pool, double-spending the same escrow. A
+      // locked re-read here is the arbiter: the row lock blocks on the admin
+      // transaction's exclusive claim (or makes it block on us), so this
+      // transaction only commits a payout against a group the resolver
+      // provably did NOT close, and the resolver only refunds cycles this
+      // worker provably did NOT pay.
+      // FOR NO KEY UPDATE (not FOR SHARE): a shared lock would let TWO
+      // concurrent payouts hold the group row simultaneously, and the loser
+      // would then block the winner's subsequent group/cycle writes —
+      // a self-deadlock Postgres resolves by aborting a racer with a raw
+      // deadlock error instead of the clean CYCLE_ALREADY_FINALIZED loss.
+      // NO KEY UPDATE is self-conflicting, so payout-vs-payout serializes
+      // here (loser re-reads, then loses the cycle CAS cleanly), and it
+      // conflicts with the refund path's exclusive group-row claim, so
+      // refund-vs-payout serializes here too — same order, group row first,
+      // no inversion. Tagged-template $queryRaw keeps the values
+      // parameterized (Phase-2 SQL-injection gate).
+      const [groupRow] = await tx.$queryRaw`
+        SELECT status FROM "SusuGroup" WHERE id = ${susu.id} FOR NO KEY UPDATE
+      `;
+      if (!groupRow || groupRow.status === 'FROZEN_DISPUTE' || groupRow.status === 'CANCELLED') {
+        throw new SusuError(
+          ErrorCodes.SUSU_FROZEN,
+          `Susu group ${susu.id} is ${groupRow ? groupRow.status : 'missing'} at payout time; payout refused.`,
+          409,
+        );
+      }
+
       // Single-winner claim — the payout authority (exactly-once payout).
       // The advisory lock in _acquireCycle is transaction-scoped: it expires
       // the moment that transaction commits, and from then on exclusion

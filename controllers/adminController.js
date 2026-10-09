@@ -8,6 +8,7 @@ const { Prisma } = require('@prisma/client');
 const ledger = require('../services/ledgerService');
 const restrictedObligations = require('../services/restrictedObligationService');
 const withdrawalBridge = require('../services/withdrawalBridgeService'); // r18 durable orphan-adoption claim
+const rbac = require('./adminRbacController'); // r272 finding 3 — the declared approval-tier authority
 const _exact = (n) => (n instanceof Prisma.Decimal ? n.toFixed(8) : Number(n).toFixed(8));
 const financeService = require('../services/finance.service');
 const { resolvePayoutOwner } = require('../services/payoutProviderOwnership');
@@ -1463,16 +1464,90 @@ exports.approveWithdrawal = async (req, res) => {
             return res.status(400).json({ success: false, message: `Cannot approve: status is ${withdrawal.status}.` });
         }
 
+        // r272 finding 3 — the declared RBAC approval tiers are now
+        // AUTHORITATIVE at this boundary. Until now APPROVAL_TIERS
+        // (>= $10k → 2 approvals, >= $50k → 3 with Finance/Compliance
+        // participation) was a parallel ledger no enforcement point ever
+        // consulted: any ADMIN could single-handedly approve a withdrawal
+        // of ANY size, and the AdminApprovalRequest workflow was pure
+        // ceremony (advisory-only RBAC). Two gates now run INSIDE the same
+        // transaction as the status flip:
+        //
+        //   1. Action permission — the approver must hold
+        //      `withdrawals.approve` per the role catalog.
+        //   2. Tier quorum — when the declared tier for this amount
+        //      requires more than one approval, an APPROVED
+        //      AdminApprovalRequest (type WITHDRAWAL, entityId = this
+        //      withdrawal) must exist and is consumed EXACTLY ONCE here
+        //      (APPROVED → EXECUTED, claimed by updateMany in the same
+        //      atomic unit). The request itself already enforced who may
+        //      approve and the >= $50k Finance/Compliance invariant.
+        // Below the $10k tier (requiredApprovals <= 1) the acting admin's
+        // own authorization remains sufficient, preserving today's
+        // low-value flow. No second authority is created: the
+        // AdminApprovalRequest ledger stays the single approval authority.
+        if (!rbac.hasApprovalActionPermission(req.user, 'WITHDRAWAL')) {
+            return res.status(403).json({
+                success: false,
+                message: 'You are not authorized to approve withdrawals.',
+                yourRole: req.user.role
+            });
+        }
+        const requirement = rbac.getApprovalRequirement('WITHDRAWAL', Number(withdrawal.amount));
+
         // Phase H12 BUGFIX (2026-05-27): atomic conditional flip. Without
         // this, two admins both clicking approve would both fire the
         // user notification + websocket event. Effect is mostly cosmetic
         // (no money moves on approve — that happens in the disbursement
         // worker), but consistent with the rejectWithdrawal fix.
-        const claimed = await prisma.withdrawal.updateMany({
-            where: { id: withdrawalId, status: 'PENDING' },
-            data: { status: 'APPROVED' }
+        let approvalRequest = null;
+        const claimed = await prisma.$transaction(async (tx) => {
+            if (requirement.requiredApprovals > 1) {
+                const consumed = await tx.adminApprovalRequest.updateMany({
+                    where: { type: 'WITHDRAWAL', entityId: String(withdrawalId), status: 'APPROVED' },
+                    data: { status: 'EXECUTED', executedAt: new Date() }
+                });
+                if (consumed.count === 0) {
+                    // Fail-closed, but distinguish the two causes: another
+                    // admin already approved this withdrawal concurrently
+                    // (their transaction consumed the request AND flipped
+                    // the row) versus no quorum ever formed.
+                    const current = await tx.withdrawal.findUnique({
+                        where: { id: withdrawalId },
+                        select: { status: true }
+                    });
+                    if (current && current.status !== 'PENDING') {
+                        const err = new Error('Withdrawal was already finalized by another admin (concurrent action).');
+                        err.statusCode = 409;
+                        throw err;
+                    }
+                    const err = new Error(
+                        `Withdrawals of this amount require ${requirement.requiredApprovals} approvals under the RBAC tier policy. ` +
+                        'Create and quorum-approve an AdminApprovalRequest (type WITHDRAWAL) for this withdrawal first.'
+                    );
+                    err.statusCode = 403;
+                    err.code = 'WITHDRAWAL_APPROVAL_QUORUM_REQUIRED';
+                    throw err;
+                }
+                approvalRequest = await tx.adminApprovalRequest.findFirst({
+                    where: { type: 'WITHDRAWAL', entityId: String(withdrawalId), status: 'EXECUTED' },
+                    orderBy: { id: 'desc' },
+                    select: { id: true, approvals: true }
+                });
+            }
+
+            const flip = await tx.withdrawal.updateMany({
+                where: { id: withdrawalId, status: 'PENDING' },
+                data: { status: 'APPROVED' }
+            });
+            if (flip.count === 0) {
+                const err = new Error('Withdrawal was already finalized by another admin (concurrent action).');
+                err.statusCode = 409;
+                throw err;
+            }
+            return flip.count;
         });
-        if (claimed.count === 0) {
+        if (claimed !== 1) {
             return res.status(409).json({
                 success: false,
                 message: 'Withdrawal was already finalized by another admin (concurrent action).'
@@ -1508,6 +1583,12 @@ exports.approveWithdrawal = async (req, res) => {
             data: { withdrawalId, userId: withdrawal.userId, amount: withdrawal.amount, adminNotes }
         });
     } catch (error) {
+        if (error?.statusCode && error?.code === 'WITHDRAWAL_APPROVAL_QUORUM_REQUIRED') {
+            return res.status(403).json({ success: false, code: error.code, message: error.message });
+        }
+        if (error?.statusCode === 409) {
+            return res.status(409).json({ success: false, message: error.message });
+        }
         logger.error({ err: error }, '[approveWithdrawal] error');
         return res.status(500).json({ success: false, message: error.message });
     }

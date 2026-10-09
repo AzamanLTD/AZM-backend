@@ -337,15 +337,45 @@ class AdminSusuMonitorService {
     if (susu.status !== 'FROZEN_DISPUTE') {
       throw new SusuError(ErrorCodes.SUSU_FROZEN, `Susu is ${susu.status}, not FROZEN_DISPUTE.`, 409);
     }
+    // NOTE: the read above is a fast-path validation only. The FROZEN_DISPUTE
+    // gate is re-proven AUTHORITATIVELY inside the transaction below as a
+    // conditional claim on the row itself (r272 finding 1 — TOCTOU): the old
+    // code checked the status outside the transaction and never touched the
+    // row until the final write, so two concurrent resolves — or a resolve
+    // racing the cycle worker — could both pass the stale check and move
+    // money twice. The database is now the single arbiter.
 
     const result = await this.prisma.$transaction(async (tx) => {
       if (action === 'RESUME') {
         // Lift the freeze; cycles resume on the next scheduler tick.
-        await tx.susuGroup.update({
-          where: { id: susuGroupId },
+        // r272 finding 1: CAS claim — only a row still FROZEN_DISPUTE can
+        // be resumed. A concurrent REFUND_AND_CLOSE that claimed the row
+        // first makes this count 0, so RESUME can never resurrect a Susu
+        // that was already closed and refunded.
+        const resumed = await tx.susuGroup.updateMany({
+          where: { id: susuGroupId, status: 'FROZEN_DISPUTE' },
           data: { status: 'ACTIVE', frozenAt: null, frozenReason: null },
         });
+        if (resumed.count !== 1) {
+          const fresh = await tx.susuGroup.findUnique({ where: { id: susuGroupId }, select: { status: true } });
+          throw new SusuError(ErrorCodes.SUSU_FROZEN, `Susu is ${fresh?.status || 'unknown'}, not FROZEN_DISPUTE (concurrent resolution won).`, 409);
+        }
         return { status: 'ACTIVE', refundedMembers: 0, refundedTotal: '0' };
+      }
+
+      // r272 finding 1: REFUND_AND_CLOSE claims the group row FIRST, inside
+      // the transaction that moves the money. The conditional update is the
+      // single arbiter between two racing admins (and against the cycle
+      // worker's frozen-group gate): exactly one racer can flip
+      // FROZEN_DISPUTE → CANCELLED; the loser's count is 0 and its whole
+      // transaction — refunds included — never executes.
+      const closed = await tx.susuGroup.updateMany({
+        where: { id: susuGroupId, status: 'FROZEN_DISPUTE' },
+        data: { status: 'CANCELLED' },
+      });
+      if (closed.count !== 1) {
+        const fresh = await tx.susuGroup.findUnique({ where: { id: susuGroupId }, select: { status: true } });
+        throw new SusuError(ErrorCodes.SUSU_FROZEN, `Susu is ${fresh?.status || 'unknown'}, not FROZEN_DISPUTE (concurrent resolution won).`, 409);
       }
 
       // REFUND_AND_CLOSE: refund every PAID contribution belonging to a
@@ -362,6 +392,25 @@ class AdminSusuMonitorService {
       let refundedTotal = new Prisma.Decimal(0);
 
       if (cycleIds.length > 0) {
+        // r272 finding 1: claim every open cycle conditionally BEFORE any
+        // refund moves money. The cycle worker finalizes a COLLECTING cycle
+        // through its own CAS (COLLECTING → PAID_OUT); this CAS
+        // (COLLECTING-family → DEFAULTED) is mutually exclusive with it, so
+        // the database decides the winner per cycle. If the worker won any
+        // cycle mid-flight, this claim under-counts and the whole
+        // transaction — every refund — rolls back untouched. A refund can
+        // never race a payout on the same pool.
+        const claimedCycles = await tx.susuCycle.updateMany({
+          where: { id: { in: cycleIds }, status: { in: ['PENDING', 'COLLECTING', 'COLLECTING_GRACE'] } },
+          data: { status: 'DEFAULTED' },
+        });
+        if (claimedCycles.count !== cycleIds.length) {
+          throw new SusuError(
+            ErrorCodes.SUSU_FROZEN,
+            `Susu ${susuGroupId} had a cycle claimed by the payout worker mid-resolution; refund refused (no money moved).`,
+            409
+          );
+        }
         const paid = await tx.susuContribution.findMany({
           where: { cycleId: { in: cycleIds }, status: 'PAID' },
           select: { id: true, cycleId: true, memberId: true, userId: true, amountUsdc: true },
@@ -408,17 +457,14 @@ class AdminSusuMonitorService {
           refundedMembers += 1;
           refundedTotal = refundedTotal.plus(amount);
         }
-        // Default the still-open cycles (no payout will ever happen).
-        await tx.susuCycle.updateMany({
-          where: { id: { in: cycleIds } },
-          data: { status: 'DEFAULTED' },
-        });
+        // Cycles were already claimed → DEFAULTED by the conditional
+        // claim above (r272 finding 1); no unconditional second write may
+        // exist here, or it would overwrite a cycle the payout worker won.
       }
 
-      await tx.susuGroup.update({
-        where: { id: susuGroupId },
-        data: { status: 'CANCELLED' },
-      });
+      // The group row was already claimed → CANCELLED by the conditional
+      // claim above; the old unconditional write is gone — it could
+      // resurrect a group state another transaction had already moved.
 
       // Void vouches tied to this Susu (no slash) — mirrors cancelSusu.
       if (this.susuVouchService) {

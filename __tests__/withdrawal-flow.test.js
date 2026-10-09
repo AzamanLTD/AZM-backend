@@ -71,7 +71,9 @@ describeOrSkip('Withdrawal flow', () => {
     });
     const res = mockRes();
     await adminCtrl.approveWithdrawal(
-      { user: { id: admin.id, username: 'admin' }, params: { id: String(wr.id) }, body: {}, ip: '127.0.0.1', app: mockApp(prisma) },
+      // r272 finding 3: approveWithdrawal now consults the RBAC role catalog,
+      // so the (middleware-attached) role must be present in req.user.
+      { user: { id: admin.id, username: 'admin', role: 'ADMIN' }, params: { id: String(wr.id) }, body: {}, ip: '127.0.0.1', app: mockApp(prisma) },
       res
     );
     expect(res._status).toBe(200);
