@@ -34,28 +34,28 @@ router.use(protect);
 router.use(adminOnly);
 
 // ─── PLATFORM OVERVIEW ───────────────────────────────────────────────────────
-router.get('/stats', adminController.getPlatformStats);
-router.get('/system-health', adminController.getSystemHealth);
-router.get('/profit-breakdown', profitBreakdownController.getProfitBreakdown);
+router.get('/stats', requireEffectivePermission('reports.view'), adminController.getPlatformStats);
+router.get('/system-health', requireEffectivePermission('reports.view'), adminController.getSystemHealth);
+router.get('/profit-breakdown', requireEffectivePermission('fees.manage'), profitBreakdownController.getProfitBreakdown);
 
 // ─── TRADE OVERSIGHT ─────────────────────────────────────────────────────────
-router.get('/trades/live', adminController.getLiveTrades);
-router.get('/disputes', adminController.getAllDisputes);
+router.get('/trades/live', requireEffectivePermission('trades.view'), adminController.getLiveTrades);
+router.get('/disputes', requireEffectivePermission('disputes.view'), adminController.getAllDisputes);
 router.post('/disputes/force-release', requireEffectivePermission('disputes.resolve'), validate(forceReleaseSchema), adminController.forceRelease);
 router.post('/disputes/force-cancel', requireEffectivePermission('disputes.resolve'), validate(forceReleaseSchema), adminController.forceCancel);
 
 // ─── USER MANAGEMENT ─────────────────────────────────────────────────────────
-router.get('/users', adminController.getUsers);
+router.get('/users', requireEffectivePermission('users.view'), adminController.getUsers);
 router.post('/users/:id/ban', requireEffectivePermission('users.ban', 'users.unban'), validate(banUserSchema), adminController.banUser);
 router.post('/users/:id/role', requireEffectivePermission('users.role_change'), adminController.changeUserRole);
 
 // ─── KYC MANAGEMENT ──────────────────────────────────────────────────────────
-router.get('/kyc/pending', adminController.getPendingKyc);
+router.get('/kyc/pending', requireEffectivePermission('users.view'), adminController.getPendingKyc);
 router.post('/kyc/approve', requireEffectivePermission('users.kyc_approve'), validate(approveKycSchema), adminController.approveKyc);
 router.post('/kyc/reject', requireEffectivePermission('users.kyc_reject'), validate(rejectKycSchema), adminController.rejectKyc);
 
 // ─── WITHDRAWAL MANAGEMENT ───────────────────────────────────────────────────
-router.get('/withdrawals/pending', adminController.getPendingWithdrawals);
+router.get('/withdrawals/pending', requireEffectivePermission('withdrawals.review'), adminController.getPendingWithdrawals);
 router.post('/withdrawals/:id/approve', adminController.approveWithdrawal);
 router.post('/withdrawals/:id/reject', requireEffectivePermission('withdrawals.approve'), adminController.rejectWithdrawal);
 // P0 (NEEDS_MANUAL_REVIEW dead-end): deterministic operator resolution of
@@ -63,27 +63,27 @@ router.post('/withdrawals/:id/reject', requireEffectivePermission('withdrawals.a
 router.post('/withdrawals/:id/resolve-review', requireEffectivePermission('withdrawals.approve'), adminController.resolveManualReview);
 
 // ─── CHAT INTERVENTION ───────────────────────────────────────────────────────
-router.post('/chat/inject', adminController.sendAdminMessage);
+router.post('/chat/inject', requireEffectivePermission('messages.inject'), adminController.sendAdminMessage);
 
 // ─── PROFIT OPERATIONS ───────────────────────────────────────────────────────
-router.post('/profits/liquidate', adminController.liquidateProfits);
+router.post('/profits/liquidate', requireEffectivePermission('fees.manage'), adminController.liquidateProfits);
 
 // ─── FEE PROFILES (Phase Q1) ─────────────────────────────────────────────────
 const feeProfileController = require('../controllers/adminFeeProfileController');
-router.get('/fee-profiles',          feeProfileController.listFeeProfiles);
-router.get('/fee-profiles/resolve',  feeProfileController.resolveProfile);
-router.post('/fee-profiles',         feeProfileController.createFeeProfile);
-router.put('/fee-profiles/:id',      feeProfileController.updateFeeProfile);
-router.delete('/fee-profiles/:id',   feeProfileController.deactivateFeeProfile);
+router.get('/fee-profiles',          requireEffectivePermission('fees.manage'), feeProfileController.listFeeProfiles);
+router.get('/fee-profiles/resolve',  requireEffectivePermission('fees.manage'), feeProfileController.resolveProfile);
+router.post('/fee-profiles',         requireEffectivePermission('fees.manage'), feeProfileController.createFeeProfile);
+router.put('/fee-profiles/:id',      requireEffectivePermission('fees.manage'), feeProfileController.updateFeeProfile);
+router.delete('/fee-profiles/:id',   requireEffectivePermission('fees.manage'), feeProfileController.deactivateFeeProfile);
 
 // ─── GLOBAL SETTINGS & FINANCIAL PARAMETERS ──────────────────────────────────
 const adminSettingsController = require('../controllers/adminSettingsController');
-router.get('/settings',              adminSettingsController.getSettings);
-router.put('/settings',              adminSettingsController.updateSettings);
-router.post('/users/:id/risk-tier',  adminSettingsController.setUserRiskTier);
+router.get('/settings',              requireEffectivePermission('platform.settings'), adminSettingsController.getSettings);
+router.put('/settings',              requireEffectivePermission('platform.settings'), adminSettingsController.updateSettings);
+router.post('/users/:id/risk-tier',  requireEffectivePermission('users.risk_tier'), adminSettingsController.setUserRiskTier);
 
 // ─── USER DETAIL DRAWER (Phase 3) ────────────────────────────────────────────
-router.get("/users/:id/detail", async (req, res) => {
+router.get("/users/:id/detail", requireEffectivePermission('users.view'), async (req, res) => {
     const prisma = req.app.get("prisma");
     const readPrisma = req.app.get("readPrisma") || prisma;
     try {
@@ -177,10 +177,10 @@ router.get("/users/:id/detail", async (req, res) => {
         return res.status(500).json({ success: false, message: error.message });
     }
 });
-router.get('/audit-log',             adminSettingsController.getAuditLog);
+router.get('/audit-log',             requireEffectivePermission('audit.view'), adminSettingsController.getAuditLog);
 
 // ─── TRADE ACCOUNT VERIFICATION ──────────────────────────────────────────────
-router.get('/trade-accounts/pending', async (req, res) => {
+router.get('/trade-accounts/pending', requireEffectivePermission('trades.view'), async (req, res) => {
     const prisma = req.app.get('prisma');
     try {
         const accounts = await prisma.tradeAccount.findMany({
@@ -194,7 +194,7 @@ router.get('/trade-accounts/pending', async (req, res) => {
     }
 });
 
-router.post('/trade-accounts/:id/approve', async (req, res) => {
+router.post('/trade-accounts/:id/approve', requireEffectivePermission('trades.account_approve'), async (req, res) => {
     const prisma = req.app.get('prisma');
     const notificationService = req.app.get('notificationService');
     try {
@@ -227,7 +227,7 @@ router.post('/trade-accounts/:id/approve', async (req, res) => {
     }
 });
 
-router.post('/trade-accounts/:id/reject', async (req, res) => {
+router.post('/trade-accounts/:id/reject', requireEffectivePermission('trades.account_approve'), async (req, res) => {
     const prisma = req.app.get('prisma');
     const notificationService = req.app.get('notificationService');
     try {
@@ -280,12 +280,12 @@ router.post('/users/:id/credit', requireEffectivePermission('fees.manage'), idem
 
 // ─── AUTONOMOUS PAYOUTS (Phase Q8) ──────────────────────────────────────────
 router.post('/payouts/batch-process',   requireEffectivePermission('withdrawals.approve'), adminController.batchProcessPayouts);
-router.get('/payouts/settings',         adminController.getPayoutSettings);
+router.get('/payouts/settings',         requireEffectivePermission('withdrawals.review'), adminController.getPayoutSettings);
 router.put('/payouts/settings',         requireEffectivePermission('withdrawals.approve'), adminController.updatePayoutSettings);
-router.get('/payouts/needs-review',     adminController.getNeedsManualReview);
+router.get('/payouts/needs-review',     requireEffectivePermission('withdrawals.review'), adminController.getNeedsManualReview);
 
 // ─── APP VERSION GATE (Phase Q15) ────────────────────────────────────────────
-router.get('/version-gate', async (req, res) => {
+router.get('/version-gate', requireEffectivePermission('platform.settings'), async (req, res) => {
     const prisma = req.app.get('prisma');
     try {
         const settings = await prisma.globalSettings.findUnique({
@@ -298,7 +298,7 @@ router.get('/version-gate', async (req, res) => {
     }
 });
 
-router.put('/version-gate', async (req, res) => {
+router.put('/version-gate', requireEffectivePermission('platform.settings'), async (req, res) => {
     const prisma = req.app.get('prisma');
     try {
         const { minAppVersion, forceUpdateUrl, updateMessage } = req.body;
@@ -331,7 +331,7 @@ router.put('/version-gate', async (req, res) => {
 });
 
 // Phase Q14: Dispute Resolution
-router.post('/disputes/:tradeId/resolve', async (req, res) => {
+router.post('/disputes/:tradeId/resolve', requireEffectivePermission('disputes.resolve'), async (req, res) => {
     const DisputeResolutionService = require('../services/disputeResolutionService');
     const prisma = req.app.get('prisma');
     const notificationService = req.app.get('notificationService');
@@ -385,7 +385,7 @@ router.post('/disputes/:tradeId/resolve', async (req, res) => {
     }
 });
 
-router.get('/disputes/resolutions', async (req, res) => {
+router.get('/disputes/resolutions', requireEffectivePermission('disputes.view'), async (req, res) => {
     const DisputeResolutionService = require('../services/disputeResolutionService');
     const prisma = req.app.get('prisma');
     const notificationService = req.app.get('notificationService');
@@ -406,33 +406,33 @@ router.get('/disputes/resolutions', async (req, res) => {
 
 // ─── SMART ESCROW DISPUTES (2026-06-14) ──────────────────────────────────────
 // protect + adminOnly are already applied globally via router.use at the top.
-router.get('/escrow-disputes', adminController.getEscrowDisputes);
-router.post('/escrow-disputes/:id/assign', adminController.assignEscrowDispute);
-router.post('/escrow-disputes/:id/resolve', adminController.resolveEscrowDispute);
+router.get('/escrow-disputes', requireEffectivePermission('disputes.view'), adminController.getEscrowDisputes);
+router.post('/escrow-disputes/:id/assign', requireEffectivePermission('disputes.resolve'), adminController.assignEscrowDispute);
+router.post('/escrow-disputes/:id/resolve', requireEffectivePermission('disputes.resolve'), adminController.resolveEscrowDispute);
 
 // BUSINESS KYB REVIEW (2026-06-16)
 // protect + adminOnly are already applied globally via router.use at the top.
 const businessKybCtrl = require('../controllers/businessKybController');
-router.get('/business-kyb',                            businessKybCtrl.getKybQueue);
-router.post('/business-kyb/:documentId/review',        businessKybCtrl.reviewKybDocument);
-router.post('/business-kyb/:bizId/approve',            businessKybCtrl.approveBusinessKyb);
-router.post('/business-kyb/:bizId/reject',             businessKybCtrl.rejectBusinessKyb);
+router.get('/business-kyb',                            requireEffectivePermission('users.view'), businessKybCtrl.getKybQueue);
+router.post('/business-kyb/:documentId/review',        requireEffectivePermission('users.kyc_approve'), businessKybCtrl.reviewKybDocument);
+router.post('/business-kyb/:bizId/approve',            requireEffectivePermission('users.kyc_approve'), businessKybCtrl.approveBusinessKyb);
+router.post('/business-kyb/:bizId/reject',             requireEffectivePermission('users.kyc_reject'), businessKybCtrl.rejectBusinessKyb);
 
 // ─── BUSINESS MANAGEMENT (WS4, 2026-06-18) ───────────────────────────────────
 // List all businesses + suspend/unsuspend. protect + adminOnly applied globally.
 const businessAdminCtrl = require('../controllers/businessAdminController');
 router.get('/businesses',                    businessAdminCtrl.getBusinesses);
-router.post('/businesses/:bizId/suspend',    businessAdminCtrl.suspendBusiness);
-router.post('/businesses/:bizId/unsuspend',  businessAdminCtrl.unsuspendBusiness);
-router.delete('/businesses/:bizId',          businessAdminCtrl.deleteBusiness);
-router.delete('/ad-posts/:id',               businessAdminCtrl.deleteAdPost);
+router.post('/businesses/:bizId/suspend',    requireEffectivePermission('business.manage'), businessAdminCtrl.suspendBusiness);
+router.post('/businesses/:bizId/unsuspend',  requireEffectivePermission('business.manage'), businessAdminCtrl.unsuspendBusiness);
+router.delete('/businesses/:bizId',          requireEffectivePermission('business.manage'), businessAdminCtrl.deleteBusiness);
+router.delete('/ad-posts/:id',               requireEffectivePermission('business.manage'), businessAdminCtrl.deleteAdPost);
 
 // ─── GENERAL AUDIT LOG (append-only ledger of privileged actions) ────────────
 // NOTE: the bare GET /audit-log path above maps to the settings-change log
 // (adminSettingsController.getAuditLog). This distinct path serves the general
 // AuditLog model written by utils/audit.js. protect + adminOnly applied globally.
 // GET /api/admin/audit-log/general?page=1&limit=50&action=APPROVE_KYC&targetType=USER
-router.get('/audit-log/general', adminController.getAuditLog);
+router.get('/audit-log/general', requireEffectivePermission('audit.view'), adminController.getAuditLog);
 
 // ─── MARKETPLACE OVERSIGHT (Admin View-All Mode) ─────────────────────────────
 router.get('/marketplace-businesses', async (req, res) => {

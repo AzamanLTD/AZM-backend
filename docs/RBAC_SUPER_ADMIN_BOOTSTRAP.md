@@ -98,6 +98,7 @@ Those enforced flows are exactly:
 | `approveWithdrawal` — acting role and re-derivation of every recorded participant | `controllers/adminController.js` |
 | Role provisioning (`GET /admins`, `POST /admins/:id/role`, `POST /admins/:id/deprovision`) | `controllers/adminRoleAdminController.js` |
 | Legacy migration **tranche 1** — per-endpoint effective-role permission gates (`requireEffectivePermission`) on the consolidated command center's money/privilege mutations | `middleware/requireEffectivePermission.js`, wired in `routes/adminRoutes.js` and `routes/financeRoutes.js` |
+| Legacy migration **tranche 2** — remaining `adminRoutes` mutations + reads: fee-profile CRUD, platform settings, risk tiers, trade-account approvals, dispute/escrow-dispute resolution, business KYB, business suspend/delete, chat injection, the `/profits/liquidate` alias, and the admin read surfaces | `middleware/requireEffectivePermission.js`, wired in `routes/adminRoutes.js` |
 
 Tranche 1 covers exactly these operations (endpoint → required catalog
 permission, OR-composed where noted):
@@ -123,6 +124,46 @@ fail closed (no live row, deleted, banned, demoted or unresolvable → 403),
 resolve the acting role from `AdminRoleAssignment` + the live `User` row, and
 never consult the JWT role claim.
 
+Tranche 2 covers exactly these operations (same conventions):
+
+| Endpoint | Required permission |
+| --- | --- |
+| `POST /api/admin/profits/liquidate` | `fees.manage` — tranche-1 completeness: an ungated alias of the finance liquidation route |
+| `POST /api/admin/fee-profiles`, `PUT /api/admin/fee-profiles/:id`, `DELETE /api/admin/fee-profiles/:id` | `fees.manage` |
+| `GET /api/admin/fee-profiles`, `GET /api/admin/fee-profiles/resolve` | `fees.manage` |
+| `GET /api/admin/profit-breakdown` | `fees.manage` |
+| `PUT /api/admin/settings`, `GET /api/admin/settings` | `platform.settings` — RESERVED |
+| `PUT /api/admin/version-gate`, `GET /api/admin/version-gate` | `platform.settings` — RESERVED |
+| `POST /api/admin/users/:id/risk-tier` | `users.risk_tier` — RESERVED |
+| `POST /api/admin/trade-accounts/:id/approve`, `POST /api/admin/trade-accounts/:id/reject` | `trades.account_approve` — RESERVED |
+| `GET /api/admin/trade-accounts/pending` | `trades.view` |
+| `POST /api/admin/disputes/:tradeId/resolve` | `disputes.resolve` |
+| `POST /api/admin/escrow-disputes/:id/assign`, `POST /api/admin/escrow-disputes/:id/resolve` | `disputes.resolve` |
+| `POST /api/admin/chat/inject` | `messages.inject` — RESERVED |
+| `POST /api/admin/business-kyb/:documentId/review`, `POST /api/admin/business-kyb/:bizId/approve` | `users.kyc_approve` |
+| `POST /api/admin/business-kyb/:bizId/reject` | `users.kyc_reject` |
+| `POST /api/admin/businesses/:bizId/suspend`, `POST /api/admin/businesses/:bizId/unsuspend`, `DELETE /api/admin/businesses/:bizId`, `DELETE /api/admin/ad-posts/:id` | `business.manage` — RESERVED |
+| `GET /api/admin/users`, `GET /api/admin/users/:id/detail` | `users.view` |
+| `GET /api/admin/kyc/pending` | `users.view` |
+| `GET /api/admin/business-kyb` | `users.view` |
+| `GET /api/admin/withdrawals/pending` | `withdrawals.review` |
+| `GET /api/admin/payouts/settings`, `GET /api/admin/payouts/needs-review` | `withdrawals.review` |
+| `GET /api/admin/trades/live` | `trades.view` |
+| `GET /api/admin/disputes`, `GET /api/admin/disputes/resolutions`, `GET /api/admin/escrow-disputes` | `disputes.view` |
+| `GET /api/admin/audit-log`, `GET /api/admin/audit-log/general` | `audit.view` |
+| `GET /api/admin/stats`, `GET /api/admin/system-health` | `reports.view` |
+
+RESERVED permissions (`platform.settings`, `users.risk_tier`,
+`trades.account_approve`, `business.manage`, `messages.inject`) are granted
+to NO specialized role: those operations are SUPER_ADMIN/legacy-ADMIN only
+until a separate, reviewed policy change (registry in
+`controllers/adminRbacController.js`).
+
+Tranche-2 exclusions (explicit, tracked for later tranches): the 2FA
+self-service routes act on the requester's own account; `GET /businesses` and
+the marketplace-business reads move with the businessOS family in tranche 4;
+`GET /payment-providers/health` is a non-mutating diagnostic.
+
 Operational consequences:
 
 - **`READ_ONLY_ADMIN`, `FINANCE_ADMIN`, `SUPPORT_ADMIN` and
@@ -140,13 +181,16 @@ Operational consequences:
 
 ### Legacy surfaces still OUTSIDE authoritative specialized-role enforcement
 
-> **Migration in progress (tranche 1 landed):** the two files below carry
-> per-endpoint authoritative gates on their tranche-1 operations (see the
-> enforced-flows table above) — `routes/adminRoutes.js` and
-> `routes/financeRoutes.js`. Their REMAINING endpoints, and every other file
-> in this inventory, are still claim-gated only. The files stay listed here
-> because the router-level claim gate remains their outer boundary; the
-> authoritative enforcement inside them is per-endpoint, not file-wide.
+> **Migration in progress (tranches 1 and 2 landed):** the two files below
+> carry per-endpoint authoritative gates on their tranche-1 and tranche-2
+> operations (see the enforced-flows table above) — `routes/adminRoutes.js`
+> and `routes/financeRoutes.js`. What remains ungated inside them is now
+> narrow and enumerated: the 2FA self-service routes, `GET /businesses`, the
+> marketplace-business reads, and `GET /payment-providers/health` (all in
+> `adminRoutes.js`). Every other file in this inventory is still claim-gated
+> only. The files stay listed here because the router-level claim gate
+> remains their outer boundary; the authoritative enforcement inside them is
+> per-endpoint, not file-wide.
 
 Route files gated only by `protect` + `isAdmin`-style claim checks (no
 effective-role resolution). This inventory is maintained and versioned with
@@ -192,10 +236,13 @@ a **separately tracked task** — tranche 1 (above) has landed; the remaining
 surface is tracked in explicit follow-up tranches so nothing disappears from
 scope. Planned migration order (highest risk first):
 
-- **Tranche 2 — remaining adminRoutes mutations + reads:** fee-profile CRUD,
-  platform settings (`PUT /settings`, risk tiers), trade-account
-  approve/reject, escrow-dispute assign/resolve, business suspend/delete,
-  and the read surfaces (`GET /users`, `GET /withdrawals/pending`, stats).
+- **Tranche 2 — LANDED (this revision):** remaining adminRoutes mutations +
+  reads: fee-profile CRUD, platform settings (`PUT /settings`, `PUT
+  /version-gate`, risk tiers), trade-account approve/reject, dispute and
+  escrow-dispute assign/resolve, business KYB review/approve/reject, business
+  suspend/unsuspend/delete, ad-post delete, chat injection, the
+  `/profits/liquidate` alias, and the read surfaces (`GET /users`, `GET
+  /withdrawals/pending`, stats and the rest per the tranche-2 table above).
 - **Tranche 3 — financial surveillance routes:** `adminSusuRoutes`,
   `custodyRoutes`, `tradeRoutes`, `fraudRoutes`, `creditScoreRoutes`,
   `proofOfReservesRoutes`, `kycRoutes`, `liabilityContractRoutes`,

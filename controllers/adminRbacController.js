@@ -87,6 +87,22 @@ const ADMIN_ROLES = {
 // the legacy full-ADMIN fallback. Do not add it to a specialized role without
 // a separate, reviewed policy change: specialized role provisioning goes
 // through adminRoleAdminController, not the primary-role endpoint.
+//
+// r273 tranche 2 — ADDITIONAL RESERVED PERMISSIONS, same policy: granted to NO
+// specialized role until a separate, reviewed policy change:
+//   'platform.settings'       — global platform config (PUT /settings,
+//                                PUT /version-gate) and their reads; a single
+//                                knob that can lock out or wedge the whole
+//                                platform, so reserved to SUPER_ADMIN/legacy.
+//   'users.risk_tier'         — withdrawal risk-tier assignment; changes a
+//                                user's financial rails without their consent.
+//   'trades.account_approve'  — trade-account approve/reject; grants users
+//                                managed trade accounts (a monetary-feature
+//                                gate).
+//   'business.manage'         — business suspend/unsuspend/delete and ad-post
+//                                deletion; destructive back-office actions.
+//   'messages.inject'         — injecting an admin message into a user's
+//                                conversation; impersonation-adjacent.
 function checkAdminPermission(user, permission) {
   if (!user || !user.role) return false;
   if (user.role.toUpperCase() === 'ADMIN') return true; // legacy full admin
