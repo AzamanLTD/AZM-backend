@@ -59,11 +59,12 @@ describeOrSkip('r272 RBAC approval tiers are enforced on approveWithdrawal (real
                 role: 'ADMIN',
             },
         });
-        // NOTE: the Prisma Role enum only has USER/VENDOR/ADMIN; the RBAC
-        // catalog's FINANCE_ADMIN / COMPLIANCE_ADMIN / SUPER_ADMIN identities
-        // live inside the approvals JSON of the AdminApprovalRequest, not as
-        // persisted user roles (checkAdminPermission treats plain ADMIN as
-        // legacy full admin, which holds withdrawals.approve).
+        // NOTE: the Prisma Role enum only has USER/VENDOR/ADMIN, so the
+        // specialized FINANCE_ADMIN designation lives in the AUTHORITATIVE
+        // AdminRoleAssignment table (the only persistent source of a
+        // specialized role). The recorded approvals-JSON role strings are
+        // audit records; the consumption validator re-derives every
+        // approver's role from this table.
         financeAdmin = await prisma.user.create({
             data: {
                 username: `r272rbac_fin_${uniq}`,
@@ -71,6 +72,9 @@ describeOrSkip('r272 RBAC approval tiers are enforced on approveWithdrawal (real
                 password: 'test_password',
                 role: 'ADMIN',
             },
+        });
+        await prisma.adminRoleAssignment.create({
+            data: { userId: financeAdmin.id, role: 'FINANCE_ADMIN' },
         });
         member = await prisma.user.create({
             data: {
@@ -89,6 +93,7 @@ describeOrSkip('r272 RBAC approval tiers are enforced on approveWithdrawal (real
         await prisma.withdrawal.deleteMany({ where: { userId: member.id } });
         await prisma.adminApprovalRequest.deleteMany({ where: { requestedBy: { in: [admin.id, financeAdmin.id] } } });
         await prisma.auditLog.deleteMany({ where: { actorId: { in: [admin.id, financeAdmin.id] } } });
+        await prisma.adminRoleAssignment.deleteMany({ where: { userId: { in: [admin.id, financeAdmin.id] } } });
         await prisma.user.deleteMany({ where: { id: { in: [admin.id, financeAdmin.id, member.id] } } });
         await prisma.$disconnect();
     });

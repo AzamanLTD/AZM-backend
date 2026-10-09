@@ -1697,6 +1697,23 @@ model Notification {
 // =============================================================================
 
 /// Tracks total USDT/crypto held across all on-chain wallets
+// r272 follow-up (P0): the authoritative, server-side source of each
+// admin's specialized approval role. The Prisma Role enum deliberately only
+// holds USER/VENDOR/ADMIN, so the specialized catalog roles (SUPER_ADMIN,
+// FINANCE_ADMIN, SUPPORT_ADMIN, COMPLIANCE_ADMIN, READ_ONLY_ADMIN) can ONLY
+// be held via this table — a role name in a JWT, a request body, or an
+// approval JSON is never evidence of a role. An assignment only counts
+// while the account is still an admin (User.role = ADMIN): demoting the
+// account strips the specialized powers even if a row lingers.
+model AdminRoleAssignment {
+  id         Int      @id @default(autoincrement())
+  userId     Int      @unique
+  role       String   @db.VarChar(30) // validated in code against the RBAC catalog
+  assignedBy Int?
+  assignedAt DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+}
+
 model SystemMasterCrypto {
   id      Int     @id @default(1)
   balance Decimal @default(0.0) @db.Decimal(20, 8)

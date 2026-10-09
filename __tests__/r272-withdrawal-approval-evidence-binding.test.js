@@ -49,7 +49,7 @@ if (!hasDb) console.warn('[r272-evidence-binding] TEST_DATABASE_URL not set — 
 const { PrismaClient } = require('@prisma/client');
 
 describeOrSkip('r272 withdrawal approval-evidence binding (real PostgreSQL)', () => {
-    let prisma, ctrl, rbacCtrl, admin, financeAdmin, complianceAdmin, thirdAdmin, member;
+    let prisma, ctrl, rbacCtrl, admin, financeAdmin, complianceAdmin, thirdAdmin, plainAdmin, member;
 
     beforeAll(async () => {
         process.env.DATABASE_URL = process.env.TEST_DATABASE_URL;
@@ -59,10 +59,12 @@ describeOrSkip('r272 withdrawal approval-evidence binding (real PostgreSQL)', ()
         rbacCtrl = require('../controllers/adminRbacController');
 
         const uniq = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-        // NOTE: the Prisma Role enum only has USER/VENDOR/ADMIN; the RBAC
-        // catalog's FINANCE_ADMIN / COMPLIANCE_ADMIN identities live inside
-        // the approvals JSON of the AdminApprovalRequest (plain ADMIN holds
-        // withdrawals.approve as the legacy full admin).
+        // NOTE: the Prisma Role enum only has USER/VENDOR/ADMIN, so the
+        // specialized FINANCE_ADMIN / COMPLIANCE_ADMIN designations live in
+        // the AUTHORITATIVE AdminRoleAssignment table — the only persistent
+        // source of a specialized role. Recorded approvals-JSON role strings
+        // are audit records; the consumption validator re-derives every
+        // approver's role from this table.
         const mkAdmin = async (name) => prisma.user.create({
             data: {
                 username: `r272eb_${name}_${uniq}`,
@@ -75,6 +77,9 @@ describeOrSkip('r272 withdrawal approval-evidence binding (real PostgreSQL)', ()
         financeAdmin = await mkAdmin('fin');
         complianceAdmin = await mkAdmin('comp');
         thirdAdmin = await mkAdmin('third');
+        plainAdmin = await mkAdmin('plain'); // no specialized assignment
+        await prisma.adminRoleAssignment.create({ data: { userId: financeAdmin.id, role: 'FINANCE_ADMIN' } });
+        await prisma.adminRoleAssignment.create({ data: { userId: complianceAdmin.id, role: 'COMPLIANCE_ADMIN' } });
         member = await prisma.user.create({
             data: {
                 username: `r272eb_member_${uniq}`,
@@ -91,13 +96,16 @@ describeOrSkip('r272 withdrawal approval-evidence binding (real PostgreSQL)', ()
         await prisma.transactionHistory.deleteMany({ where: { userId: member.id } });
         await prisma.withdrawal.deleteMany({ where: { userId: member.id } });
         await prisma.adminApprovalRequest.deleteMany({
-            where: { requestedBy: { in: [admin.id, financeAdmin.id, complianceAdmin.id, thirdAdmin.id] } }
+            where: { requestedBy: { in: [admin.id, financeAdmin.id, complianceAdmin.id, thirdAdmin.id, plainAdmin.id] } }
         });
         await prisma.auditLog.deleteMany({
-            where: { actorId: { in: [admin.id, financeAdmin.id, complianceAdmin.id, thirdAdmin.id] } }
+            where: { actorId: { in: [admin.id, financeAdmin.id, complianceAdmin.id, thirdAdmin.id, plainAdmin.id] } }
+        });
+        await prisma.adminRoleAssignment.deleteMany({
+            where: { userId: { in: [admin.id, financeAdmin.id, complianceAdmin.id, thirdAdmin.id, plainAdmin.id] } }
         });
         await prisma.user.deleteMany({
-            where: { id: { in: [admin.id, financeAdmin.id, complianceAdmin.id, thirdAdmin.id, member.id] } }
+            where: { id: { in: [admin.id, financeAdmin.id, complianceAdmin.id, thirdAdmin.id, plainAdmin.id, member.id] } }
         });
         await prisma.$disconnect();
     });
@@ -209,10 +217,14 @@ describeOrSkip('r272 withdrawal approval-evidence binding (real PostgreSQL)', ()
 
     test('amount-matching, correct-tier request WITHOUT Finance/Compliance participation → refused, unconsumed', async () => {
         const w = await seedWithdrawal(60000);
+        // None of these three approvers holds a FINANCE_ADMIN /
+        // COMPLIANCE_ADMIN assignment, so the authoritative source proves
+        // the required participation is absent — even though the recorded
+        // stamps (deliberately) claim otherwise for one of them.
         const bad = await seedRequest(w.id, {
             amount: 60000,
             requiredApprovals: 3,
-            approvals: [byAdmin(admin), byAdmin(thirdAdmin), byAdmin(complianceAdmin, 'ADMIN')], // no FINANCE_ADMIN/COMPLIANCE_ADMIN role stamp
+            approvals: [byAdmin(admin), byAdmin(thirdAdmin), byAdmin(plainAdmin, 'FINANCE_ADMIN')], // forged FINANCE_ADMIN stamp on an unassigned admin
         });
         const res = makeRes();
         await ctrl.approveWithdrawal(makeReq(admin, w.id), res);

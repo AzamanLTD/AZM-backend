@@ -1486,11 +1486,14 @@ exports.approveWithdrawal = async (req, res) => {
         // own authorization remains sufficient, preserving today's
         // low-value flow. No second authority is created: the
         // AdminApprovalRequest ledger stays the single approval authority.
-        if (!rbac.hasApprovalActionPermission(req.user, 'WITHDRAWAL')) {
+        // r272 P0 follow-up: the acting admin's authority is resolved from
+        // the authoritative role source, never from the JWT's role claim.
+        const actingRole = await rbac.resolveEffectiveAdminRole(prisma, req.user.id);
+        if (!rbac.hasApprovalActionPermission({ id: req.user.id, role: actingRole }, 'WITHDRAWAL')) {
             return res.status(403).json({
                 success: false,
                 message: 'You are not authorized to approve withdrawals.',
-                yourRole: req.user.role
+                yourRole: actingRole
             });
         }
 
@@ -1561,13 +1564,37 @@ exports.approveWithdrawal = async (req, res) => {
                         reason = `Approval request #${cand.id} records ${approvals.length} of ${requirement.requiredApprovals} required approvals.`;
                         continue;
                     }
-                    // 4. >= 50,000 requires Finance/Compliance participation,
-                    //    proven from the recorded evidence.
+                    // 4. r272 P0 follow-up — the recorded approvals must come
+                    //    from DISTINCT, ELIGIBLE approvers whose roles are
+                    //    re-derived from the AUTHORITATIVE source
+                    //    (AdminRoleAssignment + live User row) inside this
+                    //    transaction. Role strings in the approvals JSON are
+                    //    audit records, never the trust basis: a forged,
+                    //    stale, or revoked stamp cannot authorize anything.
+                    const distinctUserIds = [...new Set(
+                        approvals.map((a) => a?.userId).filter((uid) => Number.isInteger(uid))
+                    )];
+                    if (distinctUserIds.length < requirement.requiredApprovals) {
+                        reason = `Approval request #${cand.id} records only ${distinctUserIds.length} distinct approvers; ${requirement.requiredApprovals} required.`;
+                        continue;
+                    }
+                    const resolvedRoles = await Promise.all(
+                        distinctUserIds.map((uid) => rbac.resolveEffectiveAdminRole(tx, uid))
+                    );
+                    if (resolvedRoles.some((role) => !role)) {
+                        reason = `Approval request #${cand.id} includes an approver who no longer holds a verified admin role.`;
+                        continue;
+                    }
+                    if (resolvedRoles.some((role) => !rbac.isApprovalRoleEligible(role, requirement.requiredRoles))) {
+                        reason = `Approval request #${cand.id} includes an approver whose admin role is not eligible for the ${withdrawalAmount.toString()} tier.`;
+                        continue;
+                    }
+                    // 5. >= 50,000 requires Finance/Compliance participation,
+                    //    proven against the authoritative role source.
                     if (requiresFinCompliance) {
-                        const hasFinCompliance = approvals.some((a) => {
-                            const role = String(a?.role || '').trim().toUpperCase();
-                            return role === 'FINANCE_ADMIN' || role === 'COMPLIANCE_ADMIN';
-                        });
+                        const hasFinCompliance = resolvedRoles.some(
+                            (role) => role === 'FINANCE_ADMIN' || role === 'COMPLIANCE_ADMIN'
+                        );
                         if (!hasFinCompliance) {
                             reason = `Approval request #${cand.id} lacks the Finance/Compliance participation required for withdrawals of 50,000 or more.`;
                             continue;
