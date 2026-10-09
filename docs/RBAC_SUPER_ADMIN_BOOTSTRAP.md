@@ -67,8 +67,10 @@ Valid role names are exactly the server-side catalog:
 
 ## Revocation semantics (important)
 
-- Assigning `READ_ONLY_ADMIN` keeps the account administrative but
-  restricted to the catalog's read-only permission set.
+- Assigning `READ_ONLY_ADMIN` keeps the account administrative. Within
+  the **enforced flows** listed below it is restricted to the catalog's
+  read-only permission set — but see the next section: legacy claim-based
+  endpoints do **not** honor this restriction until they are migrated.
 - **Full deprovision** (`POST /admins/:id/deprovision`) removes the
   specialized assignment, sets the primary role to `USER`, and bumps
   `tokenVersion` so every outstanding token is rejected — all in one
@@ -80,3 +82,79 @@ Valid role names are exactly the server-side catalog:
 - No mutation may leave the platform with zero active Super Admins; the
   API refuses such changes (`RBAC_SUPER_ADMIN_LOCKOUT`), and no
   administrator can target themselves.
+
+## ⚠️ Scope of enforcement — READ BEFORE ASSIGNING ANY SPECIALIZED ROLE
+
+Specialized-role enforcement is **partial, not platform-wide**.
+
+Effective-role enforcement applies **only** to flows that explicitly resolve
+the acting admin's role from authoritative database state
+(`AdminRoleAssignment` + primary `User.role`) at the moment of authorization.
+Those enforced flows are exactly:
+
+| Enforced flow | Where |
+| --- | --- |
+| Multi-step approval lifecycle (`createApprovalRequest`, `approveRequest`, `rejectRequest`) | `controllers/adminRbacController.js` |
+| `approveWithdrawal` — acting role and re-derivation of every recorded participant | `controllers/adminController.js` |
+| Role provisioning (`GET /admins`, `POST /admins/:id/role`, `POST /admins/:id/deprovision`) | `controllers/adminRoleAdminController.js` |
+
+Operational consequences:
+
+- **`READ_ONLY_ADMIN`, `FINANCE_ADMIN`, `SUPPORT_ADMIN` and
+  `COMPLIANCE_ADMIN` must NOT be treated as globally least-privilege
+  identities** until the legacy admin endpoint migration is complete. A
+  specialized designation restricts only the enforced flows listed above.
+- On the unenforced surfaces below, authorization still checks the **JWT
+  role claim / primary `User.role`** — an account demoted to
+  `READ_ONLY_ADMIN` retains whatever those endpoints grant to its primary
+  `ADMIN` role. Only **full deprovision** removes that access.
+- The role catalog **does not automatically secure an endpoint** simply
+  because a permission is listed there. A permission binds only where code
+  explicitly calls the effective-role resolver or
+  `checkAdminPermission`/`requireAdminPermission`.
+
+### Legacy surfaces still OUTSIDE authoritative specialized-role enforcement
+
+Route files gated only by `protect` + `isAdmin`-style claim checks (no
+effective-role resolution). This inventory is maintained and versioned with
+this runbook, and a regression test
+(`__tests__/r272-bootstrap-runbook-doc-contract.test.js`) fails if it drifts
+from the codebase:
+
+- `routes/adminChatRoutes.js`
+- `routes/adminDineInRoutes.js`
+- `routes/adminRoutes.js`
+- `routes/adminStatsRoutes.js`
+- `routes/adminStorefrontRoutes.js`
+- `routes/adminSusuRoutes.js`
+- `routes/adminWarRoomRoutes.js`
+- `routes/aiRoutes.js`
+- `routes/businessOSKioskRoutes.js`
+- `routes/businessOSRoutes.js`
+- `routes/changelogRoutes.js`
+- `routes/creditScoreRoutes.js`
+- `routes/custodyRoutes.js`
+- `routes/financeRoutes.js`
+- `routes/fraudRoutes.js`
+- `routes/journalRoutes.js`
+- `routes/kycRoutes.js`
+- `routes/liabilityContractRoutes.js`
+- `routes/notificationRoutes.js`
+- `routes/proofOfReservesRoutes.js`
+- `routes/proofOfResidencyRoutes.js`
+- `routes/qrRoutes.js`
+- `routes/tradeRoutes.js`
+- `routes/vendorStatsRoutes.js`
+- `routes/warRoomRoutes.js`
+
+Controller handlers gated by `requireAdminPermission`, which reads the JWT
+role claim (inside `controllers/adminRbacController.js`):
+
+- `listApprovals` (`audit.view`)
+- `exportAuditLog` (`audit.export`)
+- `getSusuHealthDashboard` (`susu.health`)
+
+Migrating this legacy surface to authoritative effective-role enforcement is
+a **separately tracked task** — it is deliberately out of scope for this
+branch. Do not assume it has happened; check this inventory and its
+accompanying test.
