@@ -27,6 +27,7 @@
 // =============================================================================
 
 const logger = require('../src/config/logger');
+const { Prisma } = require('@prisma/client');
 
 // ── Admin Role Definitions ──────────────────────────────────────────────────
 const ADMIN_ROLES = {
@@ -178,6 +179,44 @@ function isApprovalRoleEligible(role, requiredRoles) {
   return requiredRoles.includes(normalizedRole) || normalizedRole === 'ADMIN';
 }
 
+// ── Authoritative admin-role resolution (r272 P0 follow-up) ──────────────────
+// The ONLY persistent source of a specialized admin role is the
+// AdminRoleAssignment table; the Prisma Role enum deliberately holds only
+// USER/VENDOR/ADMIN. A role name in a JWT, a request body, or a recorded
+// approval JSON is NEVER evidence of a role — approveRequest stamps and
+// approveWithdrawal consumes roles resolved from live database state.
+//
+// Resolution rules (fail closed):
+//   • No live user row, deleted, or banned → null (no admin role at all).
+//   • Valid specialized assignment AND the account still holds
+//     User.role = ADMIN → the assigned specialized role.
+//   • Otherwise: legacy 'ADMIN' if User.role = ADMIN, else null.
+// Demoting the account to USER/VENDOR instantly strips specialized powers
+// even if an assignment row lingers.
+const SPECIALIZED_ADMIN_ROLES = new Set(Object.keys(ADMIN_ROLES));
+
+async function resolveEffectiveAdminRole(db, userId) {
+  const [assignment, user] = await Promise.all([
+    db.adminRoleAssignment.findUnique({ where: { userId } }),
+    db.user.findUnique({
+      where: { id: userId },
+      select: { role: true, isDeleted: true, banStatus: true },
+    }),
+  ]);
+  if (!user || user.isDeleted) return null;
+  if (user.banStatus && user.banStatus !== 'ACTIVE') return null;
+
+  const storedRole = String(user.role || '').trim().toUpperCase();
+  const assignedRole = assignment
+    ? String(assignment.role || '').trim().toUpperCase()
+    : null;
+
+  if (assignedRole && SPECIALIZED_ADMIN_ROLES.has(assignedRole)) {
+    return storedRole === 'ADMIN' ? assignedRole : null;
+  }
+  return storedRole === 'ADMIN' ? 'ADMIN' : null;
+}
+
 // ── Deterministic conflict mapping ─────────────────────────────────────────
 // Never surface raw Prisma errors for expected state conflicts.
 const APPROVAL_ERROR_STATUS = Object.freeze({
@@ -225,30 +264,90 @@ async function createApprovalRequest(req, res) {
       return res.status(400).json({ success: false, message: 'Invalid approval type.' });
     }
 
+    // r272 P0 follow-up: the requester's authority is resolved from the
+    // authoritative server-side role source (AdminRoleAssignment + live
+    // User row), never from the JWT's role claim.
+    const effectiveRole = await resolveEffectiveAdminRole(prisma, userId);
+    const actingUser = { id: userId, role: effectiveRole };
+    if (!effectiveRole) {
+      return res.status(403).json({
+        success: false,
+        message: 'Your admin role could not be verified against the authoritative role source.',
+        yourRole: effectiveRole,
+      });
+    }
+
     // The requester must hold the permission for the action being requested.
-    if (!hasApprovalActionPermission(req.user, type)) {
+    if (!hasApprovalActionPermission(actingUser, type)) {
       return res.status(403).json({
         success: false,
         message: 'You are not authorized to create an approval request for this action type.',
-        yourRole: req.user.role,
+        yourRole: effectiveRole,
       });
     }
 
     const amt = parseFloat(amount) || 0;
-    const requirement = getApprovalRequirement(type, amt);
+
+    // P0 (r272 follow-up) — WITHDRAWAL approval evidence is BOUND to the
+    // persisted withdrawal: entityId must reference an existing PENDING
+    // withdrawal, and the tier-deciding amount is the withdrawal's OWN
+    // amount, never the client-supplied one. Before this, a request could
+    // be created for e.g. 15,000 (2-approval tier) and later consumed to
+    // authorize a 60,000 withdrawal (3-approval tier + Finance/Compliance).
+    // The recorded amount is kept in exact Decimal form — the stored
+    // evidence equals the authoritative amount to the stored scale.
+    let authoritativeAmount;
+    if (type === 'WITHDRAWAL') {
+        const withdrawalId = parseInt(entityId, 10);
+        if (!withdrawalId || isNaN(withdrawalId)) {
+            return res.status(400).json({
+                success: false,
+                message: 'For WITHDRAWAL approval requests, entityId must be the withdrawal ID.',
+            });
+        }
+        const withdrawal = await prisma.withdrawal.findUnique({
+            where: { id: withdrawalId },
+            select: { id: true, amount: true, status: true }
+        });
+        if (!withdrawal) {
+            return res.status(404).json({
+                success: false,
+                message: `Withdrawal ${withdrawalId} does not exist; approval evidence must be bound to a real withdrawal.`,
+            });
+        }
+        if (withdrawal.status !== 'PENDING') {
+            return res.status(409).json({
+                success: false,
+                message: `Withdrawal ${withdrawalId} is ${withdrawal.status}, not PENDING — ineligible for approval evidence.`,
+            });
+        }
+        const persistedAmount = new Prisma.Decimal(withdrawal.amount);
+        if (amt > 0 && !new Prisma.Decimal(amt).equals(persistedAmount)) {
+            return res.status(400).json({
+                success: false,
+                message: `Approval request amount ${amt} does not match withdrawal ${withdrawalId}'s actual amount ${persistedAmount.toString()}.`,
+            });
+        }
+        authoritativeAmount = persistedAmount;
+    }
+
+    const requirement = getApprovalRequirement(
+        type,
+        authoritativeAmount ? Number(authoritativeAmount) : amt
+    );
 
     const request = await prisma.adminApprovalRequest.create({
       data: {
         type,
         entityId,
-        amount: amt,
+        amount: authoritativeAmount !== undefined ? authoritativeAmount : amt,
         description,
         metadata: metadata || {},
         requestedBy: userId,
         requiredApprovals: requirement.requiredApprovals,
         status: requirement.requiredApprovals === 0 ? 'AUTO_APPROVED' : 'PENDING',
         approvals: requirement.requiredApprovals === 0
-          ? [{ userId, role: req.user.role, auto: true, at: new Date().toISOString() }]
+          ? [{ userId, role: effectiveRole, auto: true, at: new Date().toISOString() }]
           : [],
       },
     });
@@ -286,13 +385,28 @@ async function approveRequest(req, res) {
         throw approvalError('APPROVAL_NOT_PENDING', `Request is ${request.status}.`);
       }
 
+      // r272 P0 follow-up: the approver's authority is resolved INSIDE the
+      // transaction from the authoritative role source — never from the
+      // JWT's role claim. Everything downstream (permission gate, tier
+      // eligibility, the >= $50k Finance/Compliance participation check,
+      // and the recorded evidence stamp) uses this resolved role.
+      const effectiveRole = await resolveEffectiveAdminRole(tx, userId);
+      const actingUser = { id: userId, role: effectiveRole };
+      if (!effectiveRole) {
+        throw approvalError(
+          'APPROVAL_FORBIDDEN_ROLE',
+          'Your admin role could not be verified against the authoritative role source.',
+          effectiveRole
+        );
+      }
+
       // Approve the action type the STORED request is for, per the requestor's
       // stored type — never a client-supplied type.
-      if (!hasApprovalActionPermission(req.user, request.type)) {
+      if (!hasApprovalActionPermission(actingUser, request.type)) {
         throw approvalError(
           'APPROVAL_FORBIDDEN_TYPE',
           'You are not authorized to approve this action type.',
-          req.user.role
+          effectiveRole
         );
       }
 
@@ -310,43 +424,48 @@ async function approveRequest(req, res) {
 
       // Tier role eligibility for the request's monetary amount.
       const tier = getApprovalTier(Number(request.amount));
-      if (!isApprovalRoleEligible(req.user.role, tier.requiredRoles)) {
+      if (!isApprovalRoleEligible(effectiveRole, tier.requiredRoles)) {
         throw approvalError(
           'APPROVAL_FORBIDDEN_ROLE',
           'Your admin role is not eligible to approve this request.',
-          req.user.role
+          effectiveRole
         );
       }
 
       // >= $50k requires at least one Finance or Compliance admin approval.
-      const normalizedApprovals = approvals.map((approval) =>
-        String(approval?.role || '').trim().toUpperCase()
-      );
-      const normalizedCurrentRole = String(req.user.role || '').trim().toUpperCase();
-
+      // Recorded role strings are audit evidence, never the trust basis:
+      // prior participation is re-derived from the authoritative role
+      // source inside this same transaction.
       if (Number(request.amount) >= 50000) {
-        const financeOrComplianceAlreadyPresent =
-          normalizedApprovals.includes('FINANCE_ADMIN') ||
-          normalizedApprovals.includes('COMPLIANCE_ADMIN');
+        const priorUserIds = [...new Set(
+          approvals.map((a) => a?.userId).filter((uid) => Number.isInteger(uid))
+        )];
+        const priorRoles = await Promise.all(
+          priorUserIds.map((uid) => resolveEffectiveAdminRole(tx, uid))
+        );
+        const financeOrComplianceAlreadyPresent = priorRoles.some(
+          (role) => role === 'FINANCE_ADMIN' || role === 'COMPLIANCE_ADMIN'
+        );
 
         const currentIsFinanceOrCompliance =
-          normalizedCurrentRole === 'FINANCE_ADMIN' ||
-          normalizedCurrentRole === 'COMPLIANCE_ADMIN';
+          effectiveRole === 'FINANCE_ADMIN' || effectiveRole === 'COMPLIANCE_ADMIN';
 
         if (!financeOrComplianceAlreadyPresent && !currentIsFinanceOrCompliance) {
           throw approvalError(
             'APPROVAL_FORBIDDEN_FINANCE',
             'At least one Finance or Compliance admin approval is required for requests of $50,000 or more.',
-            req.user.role
+            effectiveRole
           );
         }
       }
 
+      // The evidence stamp records the role RESOLVED from the authoritative
+      // source — a JWT role claim can never inject a role into evidence.
       const newApprovals = [
         ...approvals,
         {
           userId,
-          role: req.user.role,
+          role: effectiveRole,
           at: new Date().toISOString(),
         },
       ];
@@ -433,13 +552,25 @@ async function rejectRequest(req, res) {
         throw approvalError('APPROVAL_NOT_FOUND', 'Request not found.');
       }
 
+      // r272 P0 follow-up: rejection authority is resolved from the
+      // authoritative role source too — the JWT role claim decides nothing.
+      const effectiveRole = await resolveEffectiveAdminRole(tx, req.user.id);
+      const actingUser = { id: req.user.id, role: effectiveRole };
+      if (!effectiveRole) {
+        throw approvalError(
+          'APPROVAL_FORBIDDEN_ROLE',
+          'Your admin role could not be verified against the authoritative role source.',
+          effectiveRole
+        );
+      }
+
       // Rejection authority follows the stored request type, not a
       // client-supplied type.
-      if (!hasApprovalActionPermission(req.user, request.type)) {
+      if (!hasApprovalActionPermission(actingUser, request.type)) {
         throw approvalError(
           'APPROVAL_FORBIDDEN_TYPE',
           'You are not authorized to approve this action type.',
-          req.user.role
+          effectiveRole
         );
       }
 
@@ -694,6 +825,7 @@ async function getAdminRoles(req, res) {
 
 module.exports = {
   ADMIN_ROLES,
+  resolveEffectiveAdminRole,
   checkAdminPermission,
   requireAdminPermission,
   createApprovalRequest,

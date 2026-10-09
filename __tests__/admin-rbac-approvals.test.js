@@ -51,6 +51,41 @@ function makeMockDb(seedRows = []) {
     const db = {
         rows,
         nextId: 100,
+        // r272 P0 follow-up: approveRequest/createApprovalRequest resolve the
+        // acting admin's role from the AUTHORITATIVE source (User row +
+        // AdminRoleAssignment) — never from req.user. The mock mirrors that
+        // model: makeReq registers each fixture user's authoritative state
+        // (stored User.role = ADMIN for every admin fixture; specialized
+        // roles live ONLY in AdminRoleAssignment, exactly like the real
+        // Prisma Role enum), and role resolution ignores req.user entirely.
+        users: new Map(),
+        roleAssignments: new Map(),
+        user: {
+            findUnique: async ({ where }) => {
+                const u = db.users.get(where.id);
+                return u ? { ...u } : null;
+            },
+        },
+        adminRoleAssignment: {
+            findUnique: async ({ where }) => {
+                const a = db.roleAssignments.get(where.userId);
+                return a ? { ...a } : null;
+            },
+        },
+        // P0 (r272 follow-up): createApprovalRequest binds WITHDRAWAL
+        // evidence to the persisted withdrawal — the mock now serves the
+        // authoritative rows (amount as string, like Decimal.toString()).
+        withdrawals: new Map([
+            [1, { id: 1, amount: '20000', status: 'PENDING' }],
+            [2, { id: 2, amount: '60000', status: 'PENDING' }],
+            [3, { id: 3, amount: '500', status: 'PENDING' }],
+        ]),
+        withdrawal: {
+            findUnique: async ({ where }) => {
+                const w = db.withdrawals.get(where.id);
+                return w ? clone(w) : null;
+            },
+        },
         adminApprovalRequest: {
             create: async ({ data }) => {
                 const id = db.nextId++;
@@ -109,6 +144,20 @@ function makeMockDb(seedRows = []) {
 }
 
 function makeReq({ user, body = {}, params = {}, query = {}, db }) {
+    // Register the fixture user's AUTHORITATIVE identity with the mock db:
+    // every catalog admin role is stored as User.role = ADMIN with the
+    // specialization in AdminRoleAssignment (mirroring the real enum);
+    // unknown roles (GHOST_ADMIN) stay unassignable and non-admin.
+    if (db && user) {
+        const normalized = String(user.role || '').trim().toUpperCase();
+        const specialized = ['SUPER_ADMIN', 'FINANCE_ADMIN', 'SUPPORT_ADMIN', 'COMPLIANCE_ADMIN', 'READ_ONLY_ADMIN'];
+        if (specialized.includes(normalized)) {
+            db.users.set(user.id, { role: 'ADMIN', isDeleted: false, banStatus: 'ACTIVE' });
+            db.roleAssignments.set(user.id, { userId: user.id, role: normalized });
+        } else {
+            db.users.set(user.id, { role: normalized, isDeleted: false, banStatus: 'ACTIVE' });
+        }
+    }
     return {
         user,
         body,
@@ -151,7 +200,7 @@ describe('Admin RBAC — action-specific permission enforcement', () => {
         const db = makeMockDb();
         const r = makeRes();
         await ctrl.createApprovalRequest(
-            makeReq({ user: users.readOnly, body: { type: 'WITHDRAWAL', entityId: 'w1', amount: 20000 }, db }),
+            makeReq({ user: users.readOnly, body: { type: 'WITHDRAWAL', entityId: '1', amount: 20000 }, db }),
             r
         );
         expect(r._status).toBe(403);
@@ -164,7 +213,7 @@ describe('Admin RBAC — action-specific permission enforcement', () => {
         const db = makeMockDb();
         const r = makeRes();
         await ctrl.createApprovalRequest(
-            makeReq({ user: users.finance, body: { type: 'WITHDRAWAL', entityId: 'w1', amount: 20000 }, db }),
+            makeReq({ user: users.finance, body: { type: 'WITHDRAWAL', entityId: '1', amount: 20000 }, db }),
             r
         );
         expect(r._status).toBe(200);
@@ -176,7 +225,7 @@ describe('Admin RBAC — action-specific permission enforcement', () => {
         const db = makeMockDb();
         const r = makeRes();
         await ctrl.createApprovalRequest(
-            makeReq({ user: users.compliance, body: { type: 'WITHDRAWAL', entityId: 'w1', amount: 60000 }, db }),
+            makeReq({ user: users.compliance, body: { type: 'WITHDRAWAL', entityId: '2', amount: 60000 }, db }),
             r
         );
         expect(r._status).toBe(200);
@@ -344,7 +393,7 @@ describe('Admin RBAC — non-monetary actions never auto-approve', () => {
         const db = makeMockDb();
         const r = makeRes();
         await ctrl.createApprovalRequest(
-            makeReq({ user: users.finance, body: { type: 'WITHDRAWAL', entityId: 'w1', amount: 500 }, db }),
+            makeReq({ user: users.finance, body: { type: 'WITHDRAWAL', entityId: '3', amount: 500 }, db }),
             r
         );
         expect(r._status).toBe(200);
@@ -645,7 +694,7 @@ describeOrSkip('Admin RBAC — real-DB concurrency (compare-and-swap)', () => {
 
     afterEach(async () => {
         await prisma.$executeRawUnsafe(
-            'TRUNCATE TABLE "AdminApprovalRequest","User" RESTART IDENTITY CASCADE'
+            'TRUNCATE TABLE "AdminRoleAssignment","AdminApprovalRequest","User" RESTART IDENTITY CASCADE'
         );
     }, 15000);
 
@@ -655,6 +704,19 @@ describeOrSkip('Admin RBAC — real-DB concurrency (compare-and-swap)', () => {
         r.status = (s) => { r._status = s; return r; };
         r.json = (b) => { r._body = b; return r; };
         return r;
+    }
+
+    // Authoritative admin identity: stored User.role = ADMIN (the Prisma
+    // enum holds nothing else) + the specialized designation in
+    // AdminRoleAssignment. The req.user role claims below are deliberately
+    // kept — the resolver must ignore them and read only the persistent
+    // source, so their presence proves claim-independence.
+    async function seedAdmin(role) {
+        const u = await seedUser(prisma, { role: 'ADMIN' });
+        if (role && role !== 'ADMIN') {
+            await prisma.adminRoleAssignment.create({ data: { userId: u.id, role } });
+        }
+        return u;
     }
 
     async function seedPendingRequest(requestedBy, { type = 'WITHDRAWAL', amount = 20000, requiredApprovals = 2 } = {}) {
@@ -674,9 +736,9 @@ describeOrSkip('Admin RBAC — real-DB concurrency (compare-and-swap)', () => {
     }
 
     test('two truly concurrent approvals never lose an approval (18/19)', async () => {
-        const requester = await seedUser(prisma);
-        const fin = await seedUser(prisma);
-        const comp = await seedUser(prisma);
+        const requester = await seedAdmin();
+        const fin = await seedAdmin('FINANCE_ADMIN');
+        const comp = await seedAdmin('SUPER_ADMIN');
 
         const request = await seedPendingRequest(requester.id);
 
@@ -727,8 +789,8 @@ describeOrSkip('Admin RBAC — real-DB concurrency (compare-and-swap)', () => {
     });
 
     test('concurrent approve + reject leaves exactly one terminal state (20)', async () => {
-        const requester = await seedUser(prisma);
-        const fin = await seedUser(prisma);
+        const requester = await seedAdmin();
+        const fin = await seedAdmin('FINANCE_ADMIN');
 
         const request = await seedPendingRequest(requester.id, { requiredApprovals: 1 });
 
@@ -758,10 +820,10 @@ describeOrSkip('Admin RBAC — real-DB concurrency (compare-and-swap)', () => {
     });
 
     test('compliance + finance concurrent approvals on a $60k withdrawal complete via CAS (22)', async () => {
-        const requester = await seedUser(prisma);
-        const comp = await seedUser(prisma);
-        const fin = await seedUser(prisma);
-        const sup = await seedUser(prisma);
+        const requester = await seedAdmin();
+        const comp = await seedAdmin('COMPLIANCE_ADMIN');
+        const fin = await seedAdmin('FINANCE_ADMIN');
+        const sup = await seedAdmin('SUPER_ADMIN');
 
         const request = await seedPendingRequest(requester.id, { amount: 60000, requiredApprovals: 3 });
 
@@ -820,9 +882,9 @@ describeOrSkip('Admin RBAC — real-DB concurrency (compare-and-swap)', () => {
     });
 
     test('concurrent rejects produce exactly one REJECTED mutation (21)', async () => {
-        const requester = await seedUser(prisma);
-        const fin = await seedUser(prisma);
-        const sup = await seedUser(prisma);
+        const requester = await seedAdmin();
+        const fin = await seedAdmin('SUPER_ADMIN');
+        const sup = await seedAdmin('SUPPORT_ADMIN');
 
         const request = await seedPendingRequest(requester.id, { type: 'USER_BAN', amount: 0, requiredApprovals: 1 });
 
