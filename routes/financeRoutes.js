@@ -10,6 +10,7 @@ const router                   = express.Router();
 const financeController        = require('../controllers/finance.controller');
 const fiatSettlementWebhook    = require('../controllers/fiatSettlementWebhook.controller');
 const { adminOnly }            = require('../middleware/authMiddleware');
+const { requireEffectivePermission } = require('../middleware/requireEffectivePermission');
 const { protect }              = require('../middleware/authMiddleware');
 const { protectActive }        = require('../middleware/banGuardMiddleware');
 const { idempotency }          = require('../middleware/idempotency');
@@ -60,6 +61,7 @@ router.post(
     '/admin/liquidate-profits',
     protectActive,
     adminOnly,
+    requireEffectivePermission('fees.manage'),
     financeController.liquidateProfits
 );
 

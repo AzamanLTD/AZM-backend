@@ -1159,6 +1159,24 @@ exports.banUser = async (req, res) => {
         const user = await prisma.user.findUnique({ where: { id: userId } });
         if (!user) return res.status(404).json({ success: false, message: 'User not found.' });
 
+        // r273 tranche 1 — action-level least privilege inside the ban/unban
+        // lifecycle endpoint. The route gate (requireEffectivePermission)
+        // admits holders of EITHER users.ban OR users.unban; this narrows to
+        // the permission matching the ACTUAL action, resolved against the
+        // authoritative effective role (set by the gate in this request, or
+        // re-resolved here for direct handler invocations — same resolver,
+        // never the JWT claim).
+        const actingRole = req.effectiveAdminRole
+            || await rbac.resolveEffectiveAdminRole(prisma, req.user.id);
+        const actionPermission = action === 'UNBAN' ? 'users.unban' : 'users.ban';
+        if (!rbac.checkAdminPermission({ id: req.user.id, role: actingRole }, actionPermission)) {
+            return res.status(403).json({
+                success: false,
+                message: `Admin permission required: ${actionPermission}`,
+                yourRole: actingRole
+            });
+        }
+
         let banStatus, banUntil;
         const now = new Date();
 

@@ -80,6 +80,13 @@ const ADMIN_ROLES = {
 };
 
 // ── Check admin permission ──────────────────────────────────────────────────
+// r273 tranche 1 — RESERVED PERMISSIONS: 'users.role_change' is intentionally
+// granted to NO specialized role. It guards the primary-role mutation
+// endpoint (POST /api/admin/users/:id/role), which can elevate an account to
+// ADMIN — a privilege-management operation reserved to SUPER_ADMIN ('*') and
+// the legacy full-ADMIN fallback. Do not add it to a specialized role without
+// a separate, reviewed policy change: specialized role provisioning goes
+// through adminRoleAdminController, not the primary-role endpoint.
 function checkAdminPermission(user, permission) {
   if (!user || !user.role) return false;
   if (user.role.toUpperCase() === 'ADMIN') return true; // legacy full admin
