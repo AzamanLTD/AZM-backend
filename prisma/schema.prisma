@@ -3214,11 +3214,41 @@ model BusinessProduct {
   createdAt      DateTime        @default(now())
   updatedAt      DateTime        @updatedAt
   dineInTabItems DineInTabItem[]
+  prices         BusinessPrice[]
 
   @@index([businessProfileId])
   @@index([businessProfileId, isActive])
   @@index([slug])
   @@index([catalogSectionId]) // section → products lookup (2026-06-24)
+}
+
+// =============================================================================
+// GHS LISTING PRICES (2026-10-10) — docs/MARKETPLACE_GHS_PRICING_AND_PAYMENT_CONTRACT_2026-10-10.md §1.1 (Option B, owner-approved).
+// Normalized, scoped, effective-dated price rows. GHS is a data row here, not
+// a schema migration; one ACTIVE current row per (product, currency, scope,
+// branch) is DB-enforced by the partial unique index in
+// infra/install-business-price-overlay.js — the application layer is never the
+// single-current-price authority. No column on BusinessProduct is touched.
+// =============================================================================
+
+model BusinessPrice {
+  id                String          @id @default(uuid())
+  businessProductId String
+  currency          String          @db.VarChar(3) // "GHS" today; multi-country-ready
+  amountExact       Decimal         @db.Decimal(20, 2) // canonical 2dp; never a float; > 0 (free-item model separately approved, not in v1)
+  scope             String          @default("DEFAULT") // DEFAULT | BRANCH
+  locationId        String? // null = all branches; set for BRANCH scope
+  status            String          @default("ACTIVE") // ACTIVE | ARCHIVED (soft, keeps history)
+  confirmedByType   String          @default("BUSINESS") // BUSINESS | ADMIN | MIGRATION
+  confirmedById     String? // auditable confirming actor (userId / adminId)
+  confirmedAt       DateTime? // set on every confirmation; part of the audit trail
+  note              String? // audit note (e.g. backfill batch id)
+  effectiveFrom     DateTime        @default(now())
+  effectiveTo       DateTime? // null = current
+
+  businessProduct   BusinessProduct @relation(fields: [businessProductId], references: [id], onDelete: Cascade)
+
+  @@index([businessProductId, currency, status, effectiveTo])
 }
 
 // =============================================================================

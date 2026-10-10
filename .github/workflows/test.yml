@@ -126,6 +126,13 @@ jobs:
         # chain, which converges this same installer after every db-push.
         run: node infra/install-retail-checkout-integrity.js
 
+      - name: Install business price overlay
+        # GHS listing prices (P1): the DB-enforced constraints Prisma cannot
+        # express — partial unique single-current-price index, effective-window
+        # CHECK, positive-amount CHECK, closed value domains. Mirrors the
+        # release chain (npm run release).
+        run: node infra/install-business-price-overlay.js
+
       - name: Install inventory restock authority
         run: node infra/install-inventory-restock-overlay.js
 
