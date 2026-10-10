@@ -258,6 +258,24 @@ router.post('/employees/my-ewa-request', wrap(async (req, res) => {
     res.json({ success: true, ...result });
 }));
 
+// GET /api/business-os/employees/my-ewa-intents — worker self-service
+// withdrawal intent recovery (issue #330). Same contract as the operator
+// route above, scoped to the authenticated employee: the caller can only
+// ever see their own intents. Required because the worker path also carries
+// a mandatory clientRequestId — a lost device loses that key, and this
+// endpoint is how the SAME identity is recovered instead of minted anew.
+router.get('/employees/my-ewa-intents', wrap(async (req, res) => {
+    if (!req.user?.id) return res.status(401).json({ success: false, message: 'Authentication required.' });
+    const prisma = getPrisma(req);
+    const employee = await prisma.businessEmployee.findFirst({
+        where: { userId: req.user.id, status: 'ACTIVE' },
+    });
+    if (!employee) throw new Error('You are not an active employee.');
+    const svc = getServices(req);
+    const intents = await svc.ewaService.getWithdrawalIntents(employee.id, { scope: 'self' });
+    res.json({ success: true, intents });
+}));
+
 // GET /api/business-os/employees/my-feedback — get feedback received by the current user
 router.get('/employees/my-feedback', wrap(async (req, res) => {
     if (!req.user?.id) return res.status(401).json({ success: false, message: 'Authentication required.' });
@@ -688,6 +706,22 @@ router.get('/ewa/history/:employeeId', requirePermission('ewa.manage'), wrap(asy
     const svc = getServices(req);
     const history = await svc.ewaService.getEwaHistory(req.params.employeeId);
     res.json({ success: true, history });
+}));
+
+// GET /api/business-os/ewa/intents/:employeeId — cross-device withdrawal
+// intent recovery (issue #330). The server now owns a durable intent
+// lifecycle: every keyed attempt is registered BEFORE the economics, so an
+// authorized operator on ANOTHER device can discover an unresolved attempt,
+// recover its original idempotency key and exact amount, and retry the SAME
+// identity (the backend replays the committed withdrawal and cannot pay
+// twice). Strictly scoped to the caller's resolved business context — a
+// foreign or absent context returns an empty list, never a disclosure.
+// Unresolved (PENDING) intents sort first; the response carries status,
+// amount, destination, committedTxHash and refusalMessage per intent.
+router.get('/ewa/intents/:employeeId', requirePermission('ewa.manage'), wrap(async (req, res) => {
+    const svc = getServices(req);
+    const intents = await svc.ewaService.getWithdrawalIntents(req.params.employeeId);
+    res.json({ success: true, intents });
 }));
 
 router.get('/ewa/summary', requirePermission('ewa.manage'), wrap(async (req, res) => {

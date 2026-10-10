@@ -959,3 +959,40 @@ END $$;`);
 // value, subsequent runs are a clean no-op. (Same convention as susu
 // overlay's 'ALTER TYPE "ProfitSource" ADD VALUE IF NOT EXISTS 'SUSU_FEE';'.)
 STATEMENTS.push(`ALTER TYPE "ProfitSource" ADD VALUE IF NOT EXISTS 'EWA_FEE';`);
+
+// ── Issue #330: server-owned EWA withdrawal intent lifecycle ─────────────
+// Additive table; parity with the Prisma model EwaWithdrawalIntent (both
+// `prisma db push` in CI/test and this installer — the production path,
+// since production has no _prisma_migrations table — produce this shape).
+// The (employeeId, idempotencyKey) unique index is the concurrency
+// arbiter for intent claims; status is PENDING | COMMITTED | REFUSED.
+STATEMENTS.push(`CREATE TABLE IF NOT EXISTS "EwaWithdrawalIntent" (
+    "id" TEXT NOT NULL,
+    "employeeId" TEXT NOT NULL,
+    "businessProfileId" TEXT NOT NULL,
+    "idempotencyKey" TEXT NOT NULL,
+    "amountExact" TEXT NOT NULL,
+    "destination" TEXT NOT NULL DEFAULT 'AZAMAN_BALANCE',
+    "status" TEXT NOT NULL DEFAULT 'PENDING',
+    "committedTxHash" TEXT,
+    "refusalMessage" TEXT,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "updatedAt" TIMESTAMP(3) NOT NULL,
+    "resolvedAt" TIMESTAMP(3),
+    CONSTRAINT "EwaWithdrawalIntent_pkey" PRIMARY KEY ("id")
+);`);
+STATEMENTS.push('CREATE UNIQUE INDEX IF NOT EXISTS "EwaWithdrawalIntent_employeeId_idempotencyKey_key" ON "EwaWithdrawalIntent"("employeeId", "idempotencyKey");');
+STATEMENTS.push('CREATE INDEX IF NOT EXISTS "EwaWithdrawalIntent_employeeId_status_idx" ON "EwaWithdrawalIntent"("employeeId", "status");');
+STATEMENTS.push('CREATE INDEX IF NOT EXISTS "EwaWithdrawalIntent_businessProfileId_status_createdAt_idx" ON "EwaWithdrawalIntent"("businessProfileId", "status", "createdAt" DESC);');
+// Referential integrity mirrors the Prisma relations (onDelete: Cascade):
+// deleting the employee or business profile removes its intent history.
+STATEMENTS.push(`DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.table_constraints WHERE constraint_name = 'EwaWithdrawalIntent_employeeId_fkey') THEN
+      ALTER TABLE "EwaWithdrawalIntent" ADD CONSTRAINT "EwaWithdrawalIntent_employeeId_fkey" FOREIGN KEY ("employeeId") REFERENCES "BusinessEmployee"("id") ON DELETE CASCADE;
+    END IF;
+END $$;`);
+STATEMENTS.push(`DO $$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM information_schema.table_constraints WHERE constraint_name = 'EwaWithdrawalIntent_businessProfileId_fkey') THEN
+      ALTER TABLE "EwaWithdrawalIntent" ADD CONSTRAINT "EwaWithdrawalIntent_businessProfileId_fkey" FOREIGN KEY ("businessProfileId") REFERENCES "BusinessProfile"("id") ON DELETE CASCADE;
+    END IF;
+END $$;`);

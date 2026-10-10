@@ -1848,6 +1848,45 @@ model SystemProfitFees {
 // TREASURY ENGINE: TRANSACTION HISTORY & PROFIT LOGS
 // =============================================================================
 
+// ── Issue #330: server-owned EWA withdrawal intent lifecycle ────────────────
+// Durable, server-persisted withdrawal identity so an authorized session on
+// ANY device can discover an unresolved attempt without possessing the
+// browser-local key (portal PR #115 stores it only in localStorage).
+// State machine: PENDING → COMMITTED | REFUSED.
+//   PENDING   — registered durably BEFORE any economics (claim phase);
+//               may be in-flight or crashed; always reconcilable.
+//   COMMITTED — transitioned INSIDE the same Serializable $transaction as
+//               the treasury debit / employee credit / fee / ledger writes:
+//               committed-intent ⟺ committed money. committedTxHash anchors
+//               the authoritative TransactionHistory row.
+//   REFUSED   — an authoritative pre-commit refusal recorded after the
+//               rollback. A same-key retry re-evaluates fresh (the existing
+//               "never replay a failure" contract is preserved).
+// Uniqueness on (employeeId, idempotencyKey) arbitrates concurrent claims;
+// materially different reuse of a key fails closed as EWA_IDEMPOTENCY_CONFLICT.
+// Keyless (legacy) withdrawals create no intent — unchanged behavior.
+model EwaWithdrawalIntent {
+  id                String    @id @default(uuid())
+  employeeId        String
+  businessProfileId String
+  idempotencyKey    String
+  amountExact       String // normalized exact decimal (8dp) of the requested gross
+  destination       String    @default("AZAMAN_BALANCE")
+  status            String    @default("PENDING") // PENDING | COMMITTED | REFUSED
+  committedTxHash   String? // TransactionHistory.txHash — written in the money's own transaction
+  refusalMessage    String?
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+  resolvedAt        DateTime?
+
+  businessEmployee BusinessEmployee @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+  businessProfile  BusinessProfile  @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
+
+  @@unique([employeeId, idempotencyKey])
+  @@index([employeeId, status])
+  @@index([businessProfileId, status, createdAt(sort: Desc)])
+}
+
 model TransactionHistory {
   id                String            @id @default(uuid())
   userId            Int
@@ -2837,6 +2876,7 @@ model BusinessProfile {
   storefrontLayoutVersions  BusinessStorefrontLayoutVersion[]
   storefrontDisabled        Boolean                           @default(false)
   storefrontAnalyticsEvents StorefrontAnalyticsEvent[]
+  ewaWithdrawalIntents      EwaWithdrawalIntent[] // issue #330: server-owned intent lifecycle
 
   @@index([bizId])
   @@index([category])
@@ -3419,7 +3459,7 @@ model BusinessOrder {
 
   createdAt DateTime @default(now())
 
-  paymentMethod       String?   @db.VarChar(20) // "AZAMAN_BALANCE" | "CASH" | "SPLIT"
+  paymentMethod          String?   @db.VarChar(20) // "AZAMAN_BALANCE" | "CASH" | "SPLIT"
   // §r42 storefront durable identity — docs/retail-checkout-integrity.md +
   // utils/storefrontOrderIdentity.js. The GLOBAL single-column unique is
   // REPLACED by the scoped composite (business + customer + key): a client
@@ -3428,13 +3468,13 @@ model BusinessOrder {
   // persisted for exact replay verification — any materially different
   // reuse of a key fails closed with 409.
   idempotencyKey         String? // client-supplied durable key (scoped by the storefront boundary)
-  idempotencyRequestHash String? @db.VarChar(64) // sha256 of the canonical economic request
-  cashReceived        Decimal?  @db.Decimal(20, 8) // for CASH payments — actual cash tendered
-  cashChange          Decimal?  @db.Decimal(20, 8) // change given back
+  idempotencyRequestHash String?   @db.VarChar(64) // sha256 of the canonical economic request
+  cashReceived           Decimal?  @db.Decimal(20, 8) // for CASH payments — actual cash tendered
+  cashChange             Decimal?  @db.Decimal(20, 8) // change given back
   // r36/P1: durable marker that recipe inventory was deducted for this order.
   // The deduction route claims it atomically; a retry or concurrent duplicate
   // can never double-reduce stock.
-  inventoryDeductedAt DateTime?
+  inventoryDeductedAt    DateTime?
 
   updatedAt DateTime @updatedAt
 
@@ -3448,6 +3488,12 @@ model BusinessOrder {
   kitchenOrder    KitchenOrder?
   orderTracking   OrderTracking?
 
+  // §r42: one order per (business, customer, key) — matches
+  // prisma/migrations/20260829_retail_checkout_integrity and the boot-time
+  // convergence installer infra/install-retail-checkout-integrity.js, so
+  // `prisma db push` converges to the same shape instead of recreating the
+  // legacy global unique. NULLS DISTINCT keeps keyless rows exempt.
+  @@unique([businessProfileId, customerId, idempotencyKey], map: "BusinessOrder_businessProfileId_customerId_idempotencyKey_key")
   @@index([businessProfileId])
   @@index([businessProfileId, status])
   @@index([customerId])
@@ -3460,12 +3506,6 @@ model BusinessOrder {
   @@index([businessProfileId, status, createdAt(sort: Desc)])
   @@index([customerId, status, createdAt(sort: Desc)])
   @@index([customerId, createdAt(sort: Desc)])
-  // §r42: one order per (business, customer, key) — matches
-  // prisma/migrations/20260829_retail_checkout_integrity and the boot-time
-  // convergence installer infra/install-retail-checkout-integrity.js, so
-  // `prisma db push` converges to the same shape instead of recreating the
-  // legacy global unique. NULLS DISTINCT keeps keyless rows exempt.
-  @@unique([businessProfileId, customerId, idempotencyKey], map: "BusinessOrder_businessProfileId_customerId_idempotencyKey_key")
 }
 
 // =============================================================================
@@ -4937,9 +4977,10 @@ model BusinessEmployee {
   ratingCount Int     @default(0)
 
   // EWA (Earned Wage Access) tracking
-  accruedWages   Decimal @default(0.0) @db.Decimal(20, 8) // running accrued wages
-  withdrawnEarly Decimal @default(0.0) @db.Decimal(20, 8) // total withdrawn via EWA
-  ewaEligible    Boolean @default(true)
+  accruedWages         Decimal               @default(0.0) @db.Decimal(20, 8) // running accrued wages
+  ewaWithdrawalIntents EwaWithdrawalIntent[] // issue #330: server-owned intent lifecycle
+  withdrawnEarly       Decimal               @default(0.0) @db.Decimal(20, 8) // total withdrawn via EWA
+  ewaEligible          Boolean               @default(true)
 
   // Employment dates
   hireDate        DateTime  @default(now())
