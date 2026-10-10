@@ -53,6 +53,20 @@ const settlementError = (code, message) => {
 
 const isSerializableConflict = (error) => error?.code === 'P2034';
 
+// ── Issue #330: server-owned withdrawal-intent lifecycle ────────────────────
+const EWA_INTENT_STATUS = { PENDING: 'PENDING', COMMITTED: 'COMMITTED', REFUSED: 'REFUSED' };
+
+// A DEFINITIVE pre-commit refusal marker. Only throws from the documented
+// refusal sites below carry it; only such a refusal may retire an attempt
+// as REFUSED. Every other failure (connection loss, serialization retries
+// exhausted, unknown errors) leaves the intent PENDING — reconcilable, and
+// never misclassified as a refusal or a committed payout.
+const ewaRefusal = (message, code) => {
+    const err = code ? settlementError(code, message) : new Error(message);
+    err.ewaPreCommitRefusal = true;
+    return err;
+};
+
 const waitForSerializableRetry = (attempt) => new Promise((resolve) => {
     setTimeout(resolve, SERIALIZABLE_BACKOFF_MS * (2 ** attempt));
 });
@@ -138,9 +152,9 @@ class EwaService {
             ? 'AZAMAN_BALANCE'
             : String(destination);
         if (!INTERNAL_DESTINATIONS.includes(requestedDestination)) {
-            throw settlementError(
-                'EWA_EXTERNAL_DESTINATION_UNSUPPORTED',
+            throw ewaRefusal(
                 `EWA destination ${requestedDestination} has no authoritative payout path; the withdrawal was not executed.`,
+                'EWA_EXTERNAL_DESTINATION_UNSUPPORTED',
             );
         }
 
@@ -153,17 +167,46 @@ class EwaService {
             throw new Error('Amount must be a valid number.');
         }
         if (!withdrawAmount.isFinite() || !withdrawAmount.isPositive()) {
-            throw new Error('Amount must be a valid number.');
+            throw ewaRefusal('Amount must be a valid number.');
         }
         if (withdrawAmount.dp() > 8) {
-            throw new Error('Amount supports at most 8 decimal places.');
+            throw ewaRefusal('Amount supports at most 8 decimal places.');
         }
         if (withdrawAmount.lt(EWA_MIN_WITHDRAWAL)) {
-            throw new Error('Minimum withdrawal is 1 AZM.');
+            throw ewaRefusal('Minimum withdrawal is 1 AZM.');
         }
         if (idempotencyKey !== undefined && idempotencyKey !== null
             && (typeof idempotencyKey !== 'string' || idempotencyKey.length === 0 || idempotencyKey.length > 140)) {
-            throw new Error('idempotencyKey must be a string of 1-140 characters.');
+            throw ewaRefusal('idempotencyKey must be a string of 1-140 characters.');
+        }
+
+        // ── Issue #330: durable server-side intent registration ───────────
+        // The browser-local key (portal PR #115) cannot survive a device
+        // change. The server now claims the intent BEFORE any economics, in
+        // its own durable write, so an authorized session on ANY device can
+        // discover the unresolved attempt and recover the original identity
+        // without minting a new one. The claim is bound to the canonical
+        // economic request: employeeId + idempotencyKey (DB-unique) +
+        // normalized exact amount + destination. Keyless (legacy) attempts
+        // register no intent — unchanged behavior.
+        let intent = null;
+        if (idempotencyKey) {
+            const employeeRef = await this.prisma.businessEmployee.findUnique({
+                where: { id: employeeId },
+                select: { id: true, businessProfileId: true },
+            });
+            if (employeeRef) {
+                intent = await this._claimWithdrawalIntent({
+                    employeeId,
+                    businessProfileId: employeeRef.businessProfileId,
+                    idempotencyKey,
+                    amountExact: withdrawAmount.toFixed(8),
+                    destination: requestedDestination,
+                });
+            }
+            // If the employee does not exist the Serializable transaction
+            // below throws the documented 'Employee not found.' refusal —
+            // no intent is ever registered for a phantom employee.
         }
 
         for (let attempt = 0; attempt < SERIALIZABLE_RETRY_LIMIT; attempt += 1) {
@@ -174,7 +217,7 @@ class EwaService {
                             where: { id: employeeId, businessProfileId: scopedBusinessProfileId },
                         })
                         : await tx.businessEmployee.findUnique({ where: { id: employeeId } });
-                    if (!employee) throw new Error('Employee not found.');
+                    if (!employee) throw ewaRefusal('Employee not found.');
                     if (scopedBusinessProfileId) {
                         await this._assertWithdrawalAuthorization(tx, employee, scopedBusinessProfileId);
                     }
@@ -221,6 +264,24 @@ class EwaService {
                                 const priorNet = priorMeta.netToEmployee != null
                                     ? new Prisma.Decimal(String(priorMeta.netToEmployee))
                                     : withdrawAmount.minus(priorFee);
+                                // Issue #330: a replay is an authoritative
+                                // resolution — settle the intent in the same
+                                // transaction (best-effort guard: a no-op if
+                                // another attempt already settled it).
+                                if (intent) {
+                                    await tx.ewaWithdrawalIntent.updateMany({
+                                        where: {
+                                            id: intent.id,
+                                            status: { in: [EWA_INTENT_STATUS.PENDING, EWA_INTENT_STATUS.REFUSED] },
+                                        },
+                                        data: {
+                                            status: EWA_INTENT_STATUS.COMMITTED,
+                                            committedTxHash: txHash,
+                                            refusalMessage: null,
+                                            resolvedAt: new Date(),
+                                        },
+                                    });
+                                }
                                 return {
                                     success: true,
                                     replayed: true,
@@ -246,8 +307,78 @@ class EwaService {
                             );
                         }
                     }
-                    if (!employee.ewaEligible) throw new Error('EWA is not available for this employee.');
-                    if (employee.status !== 'ACTIVE') throw new Error('Only active employees can request EWA.');
+
+                    // ── Issue #330: in-transaction intent claim ──────────
+                    // The single arbiter for concurrent same-intent attempts:
+                    // only one transaction can move PENDING/REFUSED →
+                    // COMMITTED, atomically with the financial writes below.
+                    // A concurrent duplicate either loses the guarded update
+                    // (Serializable write conflict → retry → the replay path
+                    // above returns the committed truth) or observes
+                    // COMMITTED here and returns it without moving money.
+                    if (intent) {
+                        const claimed = await tx.ewaWithdrawalIntent.updateMany({
+                            where: {
+                                id: intent.id,
+                                status: { in: [EWA_INTENT_STATUS.PENDING, EWA_INTENT_STATUS.REFUSED] },
+                            },
+                            data: {
+                                status: EWA_INTENT_STATUS.COMMITTED,
+                                committedTxHash: txHash,
+                                refusalMessage: null,
+                                resolvedAt: new Date(),
+                            },
+                        });
+                        if (claimed.count !== 1) {
+                            const current = await tx.ewaWithdrawalIntent.findUnique({
+                                where: { id: intent.id },
+                            });
+                            if (current?.status === EWA_INTENT_STATUS.COMMITTED) {
+                                // This exact economic identity already
+                                // committed — replay the committed truth.
+                                const prior = current.committedTxHash
+                                    ? await tx.transactionHistory.findUnique({
+                                        where: { txHash: current.committedTxHash },
+                                    })
+                                    : null;
+                                const priorMeta = (prior?.metadata && typeof prior.metadata === 'object')
+                                    ? prior.metadata
+                                    : {};
+                                const committedGross = priorMeta.grossAmount != null
+                                    ? new Prisma.Decimal(String(priorMeta.grossAmount)) : null;
+                                const committedFee = priorMeta.fee != null
+                                    ? new Prisma.Decimal(String(priorMeta.fee)) : null;
+                                const committedNet = prior
+                                    ? new Prisma.Decimal(String(prior.amountUsdc)) : null;
+                                if (prior && committedGross && committedFee !== null && committedNet) {
+                                    return {
+                                        success: true,
+                                        replayed: true,
+                                        idempotencyKey,
+                                        grossAmount: Number(committedGross),
+                                        fee: Number(committedFee),
+                                        netToEmployee: Number(committedNet),
+                                        remainingWithdrawable: Number(Prisma.Decimal.max(ZERO,
+                                            new Prisma.Decimal(employee.accruedWages).mul(EWA_CAP_RATE)
+                                                .minus(new Prisma.Decimal(employee.withdrawnEarly)))),
+                                        employee,
+                                    };
+                                }
+                                // COMMITTED intent whose authoritative anchor
+                                // row cannot be loaded: fail closed. Never
+                                // move money, never claim a fresh refusal.
+                                throw settlementError(
+                                    'EWA_INTENT_RECONCILIATION_REQUIRED',
+                                    'This withdrawal request is already committed but its authoritative record could not be loaded; the withdrawal was not executed. Use the EWA intent recovery endpoint and contact support for reconciliation.',
+                                );
+                            }
+                            throw new Error(
+                                'EWA withdrawal failed — insufficient available balance (concurrent withdrawal detected).',
+                            );
+                        }
+                    }
+                    if (!employee.ewaEligible) throw ewaRefusal('EWA is not available for this employee.');
+                    if (employee.status !== 'ACTIVE') throw ewaRefusal('Only active employees can request EWA.');
 
                     // §7 exact cap math on the Decimal columns
                     const accrued = new Prisma.Decimal(employee.accruedWages);
@@ -256,7 +387,7 @@ class EwaService {
                     const remaining = maxAvailable.minus(alreadyWithdrawn);
 
                     if (withdrawAmount.gt(remaining)) {
-                        throw new Error(
+                        throw ewaRefusal(
                             `Amount exceeds available EWA balance. Max: ${Prisma.Decimal.max(ZERO, remaining).toFixed(2)} AZM`,
                         );
                     }
@@ -269,7 +400,7 @@ class EwaService {
                         where: { id: employee.businessProfileId },
                         select: { userId: true },
                     });
-                    if (!business) throw new Error('Business profile not found.');
+                    if (!business) throw ewaRefusal('Business profile not found.');
 
 
                     const guardWhere = {
@@ -288,7 +419,7 @@ class EwaService {
                     });
 
                     if (guardResult.count !== 1) {
-                        throw new Error(
+                        throw ewaRefusal(
                             'EWA withdrawal failed — insufficient available balance (concurrent withdrawal detected).',
                         );
                     }
@@ -300,9 +431,9 @@ class EwaService {
                         data: { availableBalance: { decrement: withdrawAmount } },
                     });
                     if (debit.count !== 1) {
-                        throw settlementError(
-                            'EWA_INSUFFICIENT_BUSINESS_FUNDS',
+                        throw ewaRefusal(
                             'Business treasury has insufficient spendable balance for this EWA withdrawal; it was not executed.',
+                            'EWA_INSUFFICIENT_BUSINESS_FUNDS',
                         );
                     }
 
@@ -424,6 +555,33 @@ class EwaService {
                 }, { isolationLevel: 'Serializable' });
             } catch (error) {
                 if (!isSerializableConflict(error) || attempt === SERIALIZABLE_RETRY_LIMIT - 1) {
+                    // ── Issue #330: post-outcome intent bookkeeping ──────
+                    // Only a MARKED pre-commit refusal may retire the
+                    // attempt as REFUSED (retry re-evaluates fresh — the
+                    // existing "never replay a failure" contract is
+                    // preserved). Every other outcome leaves the intent
+                    // PENDING: durable, discoverable, reconcilable — never
+                    // silently misclassified as refused or committed. This
+                    // write is outside the rolled-back transaction and is
+                    // best-effort: if it fails the intent stays PENDING,
+                    // which is the conservative direction.
+                    if (intent && error?.ewaPreCommitRefusal) {
+                        try {
+                            await this.prisma.ewaWithdrawalIntent.updateMany({
+                                where: {
+                                    id: intent.id,
+                                    status: { in: [EWA_INTENT_STATUS.PENDING, EWA_INTENT_STATUS.REFUSED] },
+                                },
+                                data: {
+                                    status: EWA_INTENT_STATUS.REFUSED,
+                                    refusalMessage: String(error.message || '').slice(0, 500),
+                                    resolvedAt: new Date(),
+                                },
+                            });
+                        } catch (bookkeepingError) {
+                            console.error('[EwaService] failed to record refusal on intent', bookkeepingError);
+                        }
+                    }
                     throw error;
                 }
                 await waitForSerializableRetry(attempt);
@@ -431,6 +589,88 @@ class EwaService {
         }
 
         throw new Error('EWA withdrawal failed after retries.');
+    }
+
+    // ── Issue #330: claim the durable server-side intent ─────────────────────
+    // Registration is race-safe: the (employeeId, idempotencyKey) unique
+    // constraint arbitrates concurrent first-claims — the loser re-reads.
+    // Materially different reuse of the same key fails closed as
+    // EWA_IDEMPOTENCY_CONFLICT and never touches the original intent.
+    async _claimWithdrawalIntent({ employeeId, businessProfileId, idempotencyKey, amountExact, destination }) {
+        try {
+            return await this.prisma.ewaWithdrawalIntent.create({
+                data: {
+                    employeeId,
+                    businessProfileId,
+                    idempotencyKey,
+                    amountExact,
+                    destination,
+                    status: EWA_INTENT_STATUS.PENDING,
+                },
+            });
+        } catch (e) {
+            if (e?.code !== 'P2002') throw e;
+        }
+        const existing = await this.prisma.ewaWithdrawalIntent.findUniqueOrThrow({
+            where: { employeeId_idempotencyKey: { employeeId, idempotencyKey } },
+        });
+        const differing = [];
+        if (existing.amountExact !== amountExact) differing.push('amount');
+        if (existing.destination !== destination) differing.push('destination');
+        if (differing.length > 0) {
+            throw settlementError(
+                'EWA_IDEMPOTENCY_CONFLICT',
+                `Idempotency key was already used with different parameters (differing: ${differing.join(', ')}); the withdrawal was not executed.`,
+            );
+        }
+        // Same economic identity. PENDING: in-flight or crashed — the
+        // in-transaction guard is the single arbiter. REFUSED: the prior
+        // attempt was authoritatively refused; a same-key retry still
+        // re-evaluates fresh per the existing contract. COMMITTED: the
+        // transaction below replays the committed outcome via the
+        // txHash/committedTxHash anchor.
+        return existing;
+    }
+
+    // ── Issue #330: cross-device recovery list ────────────────────────────────
+    // Returns the employee's withdrawal intents (unresolved first) INCLUDING
+    // the original idempotency key, so an authorized session on a second
+    // device can retry the SAME identity instead of minting a new one.
+    //
+    // scope='business' (default): strict business-context isolation — the
+    //   caller's resolved business context must own the employee; a foreign
+    //   or absent context discloses nothing (empty list, never a hint).
+    // scope='self': the worker self-service path — the route has already
+    //   established that the authenticated user IS this employee.
+    async getWithdrawalIntents(employeeId, { scope = 'business', limit = 20 } = {}) {
+        if (scope !== 'self') {
+            const scopedBusinessProfileId = this._resolveBusinessProfileId(undefined);
+            if (!scopedBusinessProfileId) return [];
+            const employee = await this.prisma.businessEmployee.findUnique({
+                where: { id: employeeId },
+                select: { id: true, businessProfileId: true },
+            });
+            if (!employee || employee.businessProfileId !== scopedBusinessProfileId) return [];
+        }
+        const intents = await this.prisma.ewaWithdrawalIntent.findMany({
+            where: { employeeId },
+            // Unresolved (PENDING) first, then REFUSED, then COMMITTED —
+            // alphabetical DESC happens to be exactly PENDING, REFUSED,
+            // COMMITTED — newest within each status.
+            orderBy: [{ status: 'desc' }, { createdAt: 'desc' }],
+            take: limit,
+        });
+        return intents.map((i) => ({
+            id: i.id,
+            status: i.status,
+            idempotencyKey: i.idempotencyKey,
+            amount: i.amountExact,
+            destination: i.destination,
+            committedTxHash: i.committedTxHash,
+            refusalMessage: i.refusalMessage,
+            createdAt: i.createdAt,
+            resolvedAt: i.resolvedAt,
+        }));
     }
 
     // ── Get EWA History ─────────────────────────────────────────────────────
