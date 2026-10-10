@@ -847,6 +847,11 @@ model User {
   sentPeerTransfers     PeerTransfer[]      @relation("PeerTransferSender")
   receivedPeerTransfers PeerTransfer[]      @relation("PeerTransferReceiver")
 
+  // Standalone payment requests (request-resource lifecycle; see the
+  // PaymentRequest model for the contract). NOT the chat PeerTransfer flow.
+  sentPaymentRequests     PaymentRequest[] @relation("PaymentRequestRequester")
+  receivedPaymentRequests PaymentRequest[] @relation("PaymentRequestRecipient")
+
   // Phase UI-4 (2026-05-26): Tickets Engine
   createdTickets     Ticket[]        @relation("TicketCreator")
   receivedTickets    Ticket[]        @relation("TicketCounterparty")
@@ -6041,6 +6046,58 @@ model FinancialOperation {
 
   @@unique([userId, endpoint, key])
   @@index([createdAt])
+}
+
+// =============================================================================
+// STANDALONE PAYMENT REQUESTS - server-owned request resource.
+//
+// This is the standalone "request money" resource surfaced by the Receive /
+// Request UX (POST /api/payment-requests). It is deliberately SEPARATE from
+// the chat-oriented PeerTransfer REQUEST flow (POST /api/friends/transfer/
+// request): no PeerTransfer row and no DirectMessage is ever created here.
+//
+// Invariants (enforced by the controller + service, rehearsed by
+// __tests__/payment-requests-authority.pg.test.js):
+//   - amountExact is the canonical 2-dp GHS decimal string, IMMUTABLE after
+//     creation (there is no amount-edit endpoint); arithmetic is done in
+//     integer pesewas, never floats.
+//   - currency is fixed to GHS at creation and immutable.
+//   - DIRECT addresses exactly ONE recipient (recipientUserId is a User.id -
+//     never a Friendship.id); LINK has no preselected payer and instead
+//     carries a high-entropy share token whose sha256 hash is the ONLY
+//     stored token material (tokenHash, unique). The raw token exists only
+//     in the create response / share URL.
+//   - Lifecycle: PENDING -> CANCELLED (requester) | DECLINED (recipient,
+//     DIRECT only) via single-winner conditional updates; EXPIRED is a
+//     server-projected terminal state from expiresAt - every transition and
+//     the public link enforce it server-side. There is NO PAID transition in
+//     this PR: no authoritative per-user GHS settlement rail exists (the
+//     user balance projection is USDC; GHS exists only as SS P.5-D treasury
+//     liquidity evidence), so settlement is reported as a separate blocking
+//     dependency instead of being faked.
+//   - Creation runs under the SS r42 shared idempotency authority with the
+//     claim committed INSIDE the create transaction (wired pattern).
+// =============================================================================
+model PaymentRequest {
+  id          String    @id @default(uuid())
+  requesterId Int
+  recipientId Int? // DIRECT only; null for LINK (no preselected payer)
+  mode        String // "DIRECT" | "LINK" - immutable
+  status      String    @default("PENDING") // PENDING | CANCELLED | DECLINED (EXPIRED is projected from expiresAt)
+  amountExact String // canonical exact decimal (2dp) GHS string - immutable
+  currency    String    @default("GHS") // immutable at creation
+  tokenHash   String?   @unique // sha256(link token), LINK only - the raw token is NEVER stored
+  expiresAt   DateTime
+  resolvedAt  DateTime?
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  requester User  @relation("PaymentRequestRequester", fields: [requesterId], references: [id], onDelete: Cascade)
+  recipient User? @relation("PaymentRequestRecipient", fields: [recipientId], references: [id], onDelete: Cascade)
+
+  @@index([requesterId, status, createdAt])
+  @@index([recipientId, status, createdAt])
+  @@index([expiresAt])
 }
 
 /// On-chain USDC sweep records — tracks consolidation from user deposit
