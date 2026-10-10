@@ -53,6 +53,10 @@ function buildTx({ accruedWages = new Prisma.Decimal('100'), withdrawnEarly = ne
                 } : null),
                 create: jest.fn().mockImplementation(async () => { if (failureAt === 'history') throw new Error('history write failed'); return { id: 'history-a' }; }),
             },
+            ewaWithdrawalIntent: {
+                // Issue #330 in-tx claim guard / replay settlement
+                updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+            },
             adminProfitLog: { create: jest.fn().mockImplementation(async () => { if (failureAt === 'profitLog') throw new Error('profit log write failed'); return { id: 'log-a' }; }) },
             businessLedgerEntry: { create: jest.fn().mockImplementation(async () => { if (failureAt === 'ledgerEntry') throw new Error('ledger entry write failed'); return { id: 'ble-a' }; }) },
         },
@@ -60,9 +64,24 @@ function buildTx({ accruedWages = new Prisma.Decimal('100'), withdrawnEarly = ne
 }
 
 function buildPrisma(opts = {}) {
-    const { tx } = buildTx(opts);
+    const { employee, tx } = buildTx(opts);
     return {
         tx,
+        // Issue #330 durable claim phase runs on the OUTER client, before
+        // the Serializable transaction: resolve the employee's business for
+        // the intent row, create-if-absent (PENDING), re-read on the unique
+        // claim race, and record post-outcome refusals.
+        businessEmployee: { findUnique: jest.fn().mockResolvedValue(employee) },
+        ewaWithdrawalIntent: {
+            create: jest.fn().mockImplementation(async (args) => ({
+                id: 'intent-a', status: 'PENDING', ...args.data,
+            })),
+            findUniqueOrThrow: jest.fn().mockImplementation(async (args) => ({
+                id: 'intent-a', status: 'PENDING', ...args.where.employeeId_idempotencyKey,
+                amountExact: '20.00000000', destination: 'AZAMAN_BALANCE',
+            })),
+            updateMany: jest.fn().mockResolvedValue({ count: 1 }),
+        },
         $transaction: jest.fn(async (callback, options) => { expect(options).toEqual({ isolationLevel: 'Serializable' }); return callback(tx); }),
     };
 }

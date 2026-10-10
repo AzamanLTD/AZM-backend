@@ -153,6 +153,7 @@ jobs:
             "__tests__/withdrawal-reconciliation-settlement.test.js"
             "__tests__/withdrawal-reconciliation-finance-settlement.test.js"
             "__tests__/withdrawal-reconciliation-terminal-claim.test.js"
+            "__tests__/ewa-withdrawal-intent-reconciliation.db.test.js"
             "__tests__/r15a-reconciliation-single-claim.test.js"
             "__tests__/r15h-reconciliation-resolves-through-status-contract.test.js"
             "__tests__/r15k-reconciliation-provider-ownership.test.js"
