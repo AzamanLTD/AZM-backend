@@ -98,6 +98,11 @@ jobs:
         # r42: the FinancialOperation claim table behind the Idempotency-Key
         # financial authority. Mirrors the release chain (npm run release).
         run: node infra/install-r42-idempotency-overlay.js
+      - name: Install standalone payment requests overlay
+        # PaymentRequest table (server-owned request resource behind
+        # /api/payment-requests). Mirrors the release chain (npm run release)
+        # and prisma/migrations/20261010120000_payment_requests.
+        run: node infra/install-payment-requests-overlay.js
 
       - name: Install payout reconciliation infrastructure
         run: node infra/install-payout-reconciliation-infra.js

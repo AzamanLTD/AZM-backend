@@ -111,6 +111,11 @@ jobs:
         # r42: the FinancialOperation claim table behind the Idempotency-Key
         # financial authority. Mirrors the release chain (npm run release).
         run: node infra/install-r42-idempotency-overlay.js
+      - name: Install standalone payment requests overlay
+        # PaymentRequest table (server-owned request resource behind
+        # /api/payment-requests). Mirrors the release chain (npm run release)
+        # and prisma/migrations/20261010120000_payment_requests.
+        run: node infra/install-payment-requests-overlay.js
 
       - name: Install payout reconciliation infrastructure
         run: node infra/install-payout-reconciliation-infra.js
@@ -230,6 +235,12 @@ jobs:
             # exactly-once, crash-after-commit claim survival, pre-economics
             # 4xx release, and divergent-payload fail-closed.
             "__tests__/r42.1-idempotency-closure.pg.test.js"
+            # Standalone payment requests (request-resource lifecycle): the
+            # create idempotency exactly-once proof, the single-winner
+            # cancel-vs-decline terminal races, and the immutable exact-
+            # decimal/privacy/authorization contracts, against the REAL
+            # controller + middleware over real PostgreSQL.
+            "__tests__/payment-requests-authority.pg.test.js"
           )
           npx jest --runInBand --forceExit "${SUITES[@]}"
 
