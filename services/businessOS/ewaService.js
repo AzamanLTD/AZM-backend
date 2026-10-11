@@ -88,12 +88,19 @@ class EwaService {
         const context = getBusinessRequestContext();
         if (!context?.businessProfileId) return;
         if (context.businessProfileId !== businessProfileId) throw new Error('Business scope mismatch.');
-        if (context.isAdmin || context.isBusinessOwner || String(context.userId) === String(employee.userId)) return;
+        // §Issue #330 review Finding 1: resolve the acting identity from BOTH
+        // context shapes — the route middleware sets `user` (req.user), tests
+        // and direct calls may set `userId` directly. Never resolve to an
+        // undefined filter that Prisma would silently drop (a dropped userId
+        // would authorize by business membership alone — fail closed instead).
+        const actorUserId = context.userId ?? context.user?.id ?? null;
+        if (context.isAdmin || context.isBusinessOwner
+            || (actorUserId != null && String(actorUserId) === String(employee.userId))) return;
 
         const actor = await tx.businessEmployee.findFirst({
             where: {
                 businessProfileId,
-                userId: context.userId,
+                userId: actorUserId,
                 status: 'ACTIVE',
             },
             select: { permissions: true },
@@ -191,11 +198,27 @@ class EwaService {
         // register no intent — unchanged behavior.
         let intent = null;
         if (idempotencyKey) {
-            const employeeRef = await this.prisma.businessEmployee.findUnique({
-                where: { id: employeeId },
-                select: { id: true, businessProfileId: true },
-            });
+            // §Issue #330 review Finding 1: business scope and authorization
+            // are resolved BEFORE the durable claim. The preflight lookup
+            // mirrors the in-transaction read (scoped findFirst when a scope
+            // is resolved, findUnique otherwise) and runs the SAME
+            // authorization rule, so an unauthorized or foreign-tenant
+            // request can never create or alter a durable intent — a
+            // rejected request leaves the intent table unchanged. The
+            // transaction below re-asserts ownership and authorization
+            // inside its Serializable boundary; this preflight only stops
+            // durable writes by requests that could never pass it.
+            const employeeRef = scopedBusinessProfileId
+                ? await this.prisma.businessEmployee.findFirst({
+                    where: { id: employeeId, businessProfileId: scopedBusinessProfileId },
+                    select: { id: true, userId: true, businessProfileId: true },
+                })
+                : await this.prisma.businessEmployee.findUnique({
+                    where: { id: employeeId },
+                    select: { id: true, userId: true, businessProfileId: true },
+                });
             if (employeeRef) {
+                await this._assertWithdrawalAuthorization(this.prisma, employeeRef, employeeRef.businessProfileId);
                 intent = await this._claimWithdrawalIntent({
                     employeeId,
                     businessProfileId: employeeRef.businessProfileId,
@@ -204,9 +227,10 @@ class EwaService {
                     destination: requestedDestination,
                 });
             }
-            // If the employee does not exist the Serializable transaction
-            // below throws the documented 'Employee not found.' refusal —
-            // no intent is ever registered for a phantom employee.
+            // If the employee does not exist in the caller's scope the
+            // Serializable transaction below throws the documented
+            // 'Employee not found.' refusal — no intent is ever registered
+            // for a phantom or foreign employee.
         }
 
         for (let attempt = 0; attempt < SERIALIZABLE_RETRY_LIMIT; attempt += 1) {
@@ -592,11 +616,21 @@ class EwaService {
     }
 
     // ── Issue #330: claim the durable server-side intent ─────────────────────
-    // Registration is race-safe: the (employeeId, idempotencyKey) unique
-    // constraint arbitrates concurrent first-claims — the loser re-reads.
+    // Registration is race-safe on TWO database arbiters:
+    //   1. (employeeId, idempotencyKey) unique — concurrent same-key claims
+    //      collide and the loser re-reads the committed claim.
+    //   2. EwaWithdrawalIntent_unresolved_employee_key (partial unique on
+    //      employeeId WHERE status = 'PENDING', installed by the business-OS
+    //      overlay) — at most ONE unresolved intent per employee. A
+    //      DIFFERENT key attempting to bypass an unresolved PENDING intent
+    //      fails closed with EWA_UNRESOLVED_INTENT_CONFLICT at the database
+    //      boundary; same-key retries are exempt (they reuse the row), and
+    //      once the intent is authoritatively resolved (COMMITTED/REFUSED)
+    //      the partial index vacates and legitimate new withdrawals pass.
     // Materially different reuse of the same key fails closed as
     // EWA_IDEMPOTENCY_CONFLICT and never touches the original intent.
     async _claimWithdrawalIntent({ employeeId, businessProfileId, idempotencyKey, amountExact, destination }) {
+        let collision = null;
         try {
             return await this.prisma.ewaWithdrawalIntent.create({
                 data: {
@@ -610,10 +644,32 @@ class EwaService {
             });
         } catch (e) {
             if (e?.code !== 'P2002') throw e;
+            collision = e;
         }
-        const existing = await this.prisma.ewaWithdrawalIntent.findUniqueOrThrow({
+        // §Issue #330 review Finding 3: the P2002 is either the
+        // (employeeId, idempotencyKey) claim collision (same key) or the
+        // SINGLE-UNRESOLVED-INTENT partial unique index
+        // (EwaWithdrawalIntent_unresolved_employee_key: at most ONE PENDING
+        // intent per employee, enforced by PostgreSQL, not by this app-level
+        // pre-check — a concurrent different-key attempt races on the index
+        // itself and the loser is failed closed here).
+        const existing = await this.prisma.ewaWithdrawalIntent.findUnique({
             where: { employeeId_idempotencyKey: { employeeId, idempotencyKey } },
         });
+        if (!existing) {
+            const unresolved = await this.prisma.ewaWithdrawalIntent.findFirst({
+                where: { employeeId, status: EWA_INTENT_STATUS.PENDING },
+                orderBy: { createdAt: 'desc' },
+            });
+            if (unresolved) {
+                throw settlementError(
+                    'EWA_UNRESOLVED_INTENT_CONFLICT',
+                    'Another withdrawal request for this employee is still unresolved (PENDING); retry it with its original idempotency key (recoverable via the EWA intent recovery endpoint) instead of starting a new one; the withdrawal was not executed.',
+                );
+            }
+            // Unknown P2002 source — fail closed with the original error.
+            throw collision;
+        }
         const differing = [];
         if (existing.amountExact !== amountExact) differing.push('amount');
         if (existing.destination !== destination) differing.push('destination');
@@ -652,14 +708,26 @@ class EwaService {
             });
             if (!employee || employee.businessProfileId !== scopedBusinessProfileId) return [];
         }
-        const intents = await this.prisma.ewaWithdrawalIntent.findMany({
-            where: { employeeId },
-            // Unresolved (PENDING) first, then REFUSED, then COMMITTED —
-            // alphabetical DESC happens to be exactly PENDING, REFUSED,
-            // COMMITTED — newest within each status.
-            orderBy: [{ status: 'desc' }, { createdAt: 'desc' }],
-            take: limit,
-        });
+        // §Issue #330 review Finding 2: DETERMINISTIC status priority —
+        // PENDING (unresolved) first, then REFUSED, then COMMITTED, newest
+        // first within each tier. Tiers are fetched independently so the
+        // bounded list can NEVER hide an unresolved PENDING intent behind a
+        // flood of REFUSED/COMMITTED records: a string sort cannot express
+        // this priority and a single bounded query could drop the PENDING
+        // row entirely. Total rows stay bounded by the caller's limit.
+        const safeLimit = Math.max(1, Math.min(100, Number.parseInt(limit, 10) || 20));
+        const tiers = [EWA_INTENT_STATUS.PENDING, EWA_INTENT_STATUS.REFUSED, EWA_INTENT_STATUS.COMMITTED];
+        const rows = [];
+        for (const status of tiers) {
+            if (rows.length >= safeLimit) break;
+            const batch = await this.prisma.ewaWithdrawalIntent.findMany({
+                where: { employeeId, status },
+                orderBy: { createdAt: 'desc' },
+                take: safeLimit - rows.length,
+            });
+            rows.push(...batch);
+        }
+        const intents = rows;
         return intents.map((i) => ({
             id: i.id,
             status: i.status,

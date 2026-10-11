@@ -982,6 +982,15 @@ STATEMENTS.push(`CREATE TABLE IF NOT EXISTS "EwaWithdrawalIntent" (
     CONSTRAINT "EwaWithdrawalIntent_pkey" PRIMARY KEY ("id")
 );`);
 STATEMENTS.push('CREATE UNIQUE INDEX IF NOT EXISTS "EwaWithdrawalIntent_employeeId_idempotencyKey_key" ON "EwaWithdrawalIntent"("employeeId", "idempotencyKey");');
+// §Issue #330 review Finding 3: at most ONE unresolved (PENDING) withdrawal
+// intent per employee, enforced by the DATABASE — a concurrent different-key
+// attempt cannot bypass an unresolved attempt (the loser fails closed with
+// EWA_UNRESOLVED_INTENT_CONFLICT). A partial unique index cannot be declared
+// in Prisma schema; this installer is the single source of the constraint for
+// both production and the CI/test db-push path (both run this installer).
+// Same-key retries reuse the existing row (no insert), and COMMITTED/REFUSED
+// rows vacate the index so legitimately subsequent withdrawals pass.
+STATEMENTS.push('CREATE UNIQUE INDEX IF NOT EXISTS "EwaWithdrawalIntent_unresolved_employee_key" ON "EwaWithdrawalIntent"("employeeId") WHERE "status" = \'PENDING\';');
 STATEMENTS.push('CREATE INDEX IF NOT EXISTS "EwaWithdrawalIntent_employeeId_status_idx" ON "EwaWithdrawalIntent"("employeeId", "status");');
 STATEMENTS.push('CREATE INDEX IF NOT EXISTS "EwaWithdrawalIntent_businessProfileId_status_createdAt_idx" ON "EwaWithdrawalIntent"("businessProfileId", "status", "createdAt" DESC);');
 // Referential integrity mirrors the Prisma relations (onDelete: Cascade):

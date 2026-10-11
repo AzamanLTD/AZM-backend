@@ -36,6 +36,16 @@
 //         disclosed nothing
 //     10. route level: operator recovery endpoint, worker self-service
 //         endpoint, and the withdraw route carry the contract end-to-end
+//     11. review F1: an authorized actor in business A cannot create or
+//         alter a durable intent for an employee in business B — scope and
+//         authorization resolve BEFORE the durable claim
+//     12. review F2: recovery ordering is a deterministic PENDING → REFUSED
+//         → COMMITTED priority, newest within a tier; a bounded list can
+//         never hide an unresolved intent behind refusals
+//     13. review F3: a DIFFERENT idempotency key cannot bypass an unresolved
+//         PENDING intent (DB partial unique index — EWA_UNRESOLVED_INTENT_
+//         CONFLICT); same-key retry and legitimate post-resolution
+//         withdrawals still pass, with no duplicate economic movement
 
 const hasDb = !!process.env.TEST_DATABASE_URL;
 const describeOrSkip = hasDb ? describe : describe.skip;
@@ -477,5 +487,248 @@ describeOrSkip('EWA server-owned withdrawal intent lifecycle (real Postgres)', (
         expect(retry.status).toBe(200);
         expect(retry.body.result.replayed).toBe(true);
         expect((await movements()).history).toBe(1);
+    });
+
+    // ── 11. review Finding 1: scope + authorization BEFORE the claim ──────
+
+    test('11a. an authorized actor in business A leaves the intent table untouched for an employee in business B', async () => {
+        const worldA = await seedWorld();
+        const worldB = await seedWorld();
+        const svc = new EwaService(prisma);
+        const k = key();
+
+        // An otherwise fully authorized owner of business A requests a
+        // withdrawal for an employee of business B, with A's business scope.
+        await runWithBusinessRequestContext(
+            { businessProfileId: worldA.business.id, isBusinessOwner: true, user: { id: worldA.owner.id } },
+            () => expect(svc.requestWithdrawal({
+                employeeId: worldB.employee.id, amount: '20', idempotencyKey: k,
+            })).rejects.toThrow('Employee not found.'),
+        );
+
+        // The durable intent table is UNCHANGED — no row for the foreign
+        // employee, no row for the foreign business, nothing at all.
+        expect(await prisma.ewaWithdrawalIntent.count()).toBe(0);
+        expect(await intentOf(worldB.employee.id, k)).toBeNull();
+        expect((await movements()).history).toBe(0);
+        // Business B's employee economics are untouched.
+        const empB = await prisma.businessEmployee.findUnique({ where: { id: worldB.employee.id } });
+        expect(D8(empB.withdrawnEarly)).toBe(D8(0));
+        const userB = await prisma.user.findUnique({ where: { id: worldB.employeeUser.id } });
+        expect(D8(userB.availableBalance)).toBe(D8(0));
+    });
+
+    test('11b. an actor without ewa permission in the SAME business is refused before any durable claim', async () => {
+        const world = await seedWorld();
+        const stranger = await prisma.user.create({ data: {
+            username: `str_${Date.now()}`, email: `str_${Date.now()}@t.co`, password: 'x',
+        }});
+        // ACTIVE employee of the same business WITHOUT '*' or 'ewa.manage'
+        await prisma.businessEmployee.create({ data: {
+            businessProfileId: world.business.id, userId: stranger.id,
+            payrollType: 'HOURLY', hourlyRate: '10', accruedWages: '0',
+        }});
+        const svc = new EwaService(prisma);
+        const k = key();
+
+        await runWithBusinessRequestContext(
+            { businessProfileId: world.business.id, user: { id: stranger.id } },
+            () => expect(svc.requestWithdrawal({
+                employeeId: world.employee.id, amount: '20', idempotencyKey: k,
+            })).rejects.toThrow('You do not have permission to manage EWA for this employee.'),
+        );
+        expect(await prisma.ewaWithdrawalIntent.count()).toBe(0);
+        expect((await movements()).history).toBe(0);
+    });
+
+    test('11c. the ordinary authorized owner path and the worker self-service path still work (post-preflight)', async () => {
+        const world = await seedWorld();
+        const svc = new EwaService(prisma);
+        const kOwner = key();
+        const kSelf = key();
+
+        // Owner path (business context): authorized by isBusinessOwner.
+        const ownerResult = await runWithBusinessRequestContext(
+            { businessProfileId: world.business.id, isBusinessOwner: true, user: { id: world.owner.id } },
+            () => svc.requestWithdrawal({
+                employeeId: world.employee.id, amount: '10', idempotencyKey: kOwner,
+            }),
+        );
+        expect(ownerResult.success).toBe(true);
+
+        // Worker self-service path (no business context): the employee IS
+        // the authenticated user; idempotency scoped to their own identity.
+        const selfResult = await runWithBusinessRequestContext(
+            { user: { id: world.employeeUser.id } },
+            () => svc.requestWithdrawal({
+                employeeId: world.employee.id, amount: '10', idempotencyKey: kSelf,
+            }),
+        );
+        expect(selfResult.success).toBe(true);
+
+        expect((await movements()).history).toBe(2);
+        expect((await intentOf(world.employee.id, kOwner)).status).toBe('COMMITTED');
+        expect((await intentOf(world.employee.id, kSelf)).status).toBe('COMMITTED');
+    });
+
+    // ── 12. review Finding 2: deterministic priority ordering ──────────────
+
+    test('12. a bounded recovery list can never hide an unresolved PENDING intent behind refusals', async () => {
+        const world = await seedWorld();
+        const svc = new EwaService(prisma);
+
+        // 25 REFUSED records with staggered createdAt, and an older
+        // unresolved PENDING intent created before all of them.
+        const base = new Date('2026-01-01T00:00:00.000Z');
+        const rows = [];
+        rows.push({
+            employeeId: world.employee.id, businessProfileId: world.business.id,
+            idempotencyKey: 'pending-old', amountExact: '20.00000000',
+            destination: 'AZMAN_BALANCE', status: 'PENDING',
+            createdAt: new Date(base.getTime()), updatedAt: new Date(base.getTime()),
+        });
+        for (let i = 0; i < 25; i += 1) {
+            const at = new Date(base.getTime() + (i + 1) * 60000);
+            rows.push({
+                employeeId: world.employee.id, businessProfileId: world.business.id,
+                idempotencyKey: `refused-${String(i).padStart(2, '0')}`,
+                amountExact: '20.00000000', destination: 'AZMAN_BALANCE',
+                status: 'REFUSED', refusalMessage: 'refusal', resolvedAt: at,
+                createdAt: at, updatedAt: at,
+            });
+        }
+        await prisma.ewaWithdrawalIntent.createMany({ data: rows });
+
+        // Default bounded list (limit 20): the unresolved intent is STILL
+        // discoverable — it leads the response despite being the OLDEST
+        // record and despite 25 newer refusals.
+        const intents = await runWithBusinessRequestContext(
+            { businessProfileId: world.business.id, isBusinessOwner: true, user: { id: world.owner.id } },
+            () => svc.getWithdrawalIntents(world.employee.id),
+        );
+        expect(intents).toHaveLength(20);
+        expect(intents[0].status).toBe('PENDING');
+        expect(intents[0].idempotencyKey).toBe('pending-old');
+        // Documented priority: all remaining rows are REFUSED (this pass),
+        // newest first within the tier.
+        expect(intents.slice(1).every((i) => i.status === 'REFUSED')).toBe(true);
+        const refusedTimes = intents.slice(1).map((i) => i.createdAt.getTime());
+        expect(refusedTimes).toEqual([...refusedTimes].sort((a, b) => b - a));
+        // The newest refusals are the visible window; the oldest refusal and
+        // every COMMITTED row fall outside the bounded limit by design.
+        expect(intents[1].idempotencyKey).toBe('refused-24');
+
+        // Same tier order for the worker self-service scope, and the limit
+        // is preserved and respected at the boundary value.
+        const self = await svc.getWithdrawalIntents(world.employee.id, { scope: 'self', limit: 5 });
+        expect(self).toHaveLength(5);
+        expect(self[0].status).toBe('PENDING');
+        expect(self[1].idempotencyKey).toBe('refused-24');
+    });
+
+    // ── 13. review Finding 3: different-key bypass of an unresolved intent ─
+
+    test('13a. a different key racing an unresolved PENDING intent fails closed at the database boundary; no duplicate movement', async () => {
+        const world = await seedWorld({ ownerBalance: '500', accruedWages: '100' });
+        const svc = new EwaService(prisma);
+        const kA = key();
+        const kB = key();
+
+        // Widen the in-flight window honestly: attempt A is genuinely in
+        // flight (its Serializable transaction delayed), so its intent is
+        // durably PENDING while attempt B's different-key claim fires.
+        const realTx = svc.prisma.$transaction.bind(svc.prisma);
+        const txSpy = jest.spyOn(svc.prisma, '$transaction');
+        txSpy.mockImplementationOnce(async (fn, opts) => {
+            await new Promise((resolve) => setTimeout(resolve, 400));
+            return realTx(fn, opts);
+        });
+
+        // Attempt A is fired first; once its intent is durably PENDING and
+        // its (genuinely running) transaction is still in flight, attempt B
+        // fires with a DIFFERENT key — the exact unresolved-intent window.
+        const aPromise = svc.requestWithdrawal({ employeeId: world.employee.id, amount: '10', idempotencyKey: kA });
+        let pendingRow = null;
+        for (let i = 0; i < 200 && !pendingRow; i += 1) {
+            pendingRow = await intentOf(world.employee.id, kA);
+            if (!pendingRow) await new Promise((resolve) => setTimeout(resolve, 5));
+        }
+        expect(pendingRow?.status).toBe('PENDING');
+
+        const bPromise = svc.requestWithdrawal({ employeeId: world.employee.id, amount: '10', idempotencyKey: kB });
+        const [a, b] = await Promise.allSettled([aPromise, bPromise]);
+        txSpy.mockRestore();
+
+        // Exactly one economic withdrawal — no duplicate movement while the
+        // first intent remains unresolved.
+        expect(a.status).toBe('fulfilled');
+        expect(a.value.success).toBe(true);
+        expect(b.status).toBe('rejected');
+        expect(b.reason.code).toBe('EWA_UNRESOLVED_INTENT_CONFLICT');
+        expect(b.reason.message).toMatch(/still unresolved/);
+        expect((await movements()).history).toBe(1);
+        expect((await movements()).ledger).toBe(1);
+
+        // Only the winner's intent exists — the loser never wrote one.
+        const allIntents = await prisma.ewaWithdrawalIntent.findMany({
+            where: { employeeId: world.employee.id },
+        });
+        expect(allIntents).toHaveLength(1);
+        expect(allIntents[0].idempotencyKey).toBe(kA);
+        expect(allIntents[0].status).toBe('COMMITTED');
+
+        // Same-key retry of the winner replays the committed truth — the
+        // original-key path is exempt from the single-unresolved-intent rule.
+        const replay = await svc.requestWithdrawal({
+            employeeId: world.employee.id, amount: '10', idempotencyKey: kA,
+        });
+        expect(replay.replayed).toBe(true);
+        expect((await movements()).history).toBe(1);
+
+        // A DIFFERENT key is now legitimate: the earlier attempt is
+        // authoritatively resolved (COMMITTED), the partial index vacated.
+        const next = await svc.requestWithdrawal({
+            employeeId: world.employee.id, amount: '10', idempotencyKey: key(),
+        });
+        expect(next.success).toBe(true);
+        expect((await movements()).history).toBe(2);
+    });
+
+    test('13b. while an attempt is crashed-PENDING, any different-key attempt is refused; the recovered original key still commits', async () => {
+        const world = await seedWorld();
+        const svc = new EwaService(prisma);
+        const kA = key();
+
+        // A crashed attempt: durably PENDING, nothing committed (proof 6's
+        // transient-failure shape).
+        const txSpy = jest.spyOn(svc.prisma, '$transaction').mockRejectedValueOnce(
+            new Error('db connection lost mid-flight'),
+        );
+        await expect(svc.requestWithdrawal({
+            employeeId: world.employee.id, amount: '10', idempotencyKey: kA,
+        })).rejects.toThrow('db connection lost mid-flight');
+        txSpy.mockRestore();
+
+        // A different key on another device is refused — it must recover and
+        // retry the ORIGINAL identity instead of bypassing it.
+        await expect(svc.requestWithdrawal({
+            employeeId: world.employee.id, amount: '10', idempotencyKey: key(),
+        })).rejects.toMatchObject({ code: 'EWA_UNRESOLVED_INTENT_CONFLICT' });
+        expect((await movements()).history).toBe(0);
+
+        // The recovered ORIGINAL key still commits exactly once, and the
+        // PENDING intent it settles vacates the guard for future attempts.
+        const recovered = await svc.requestWithdrawal({
+            employeeId: world.employee.id, amount: '10', idempotencyKey: kA,
+        });
+        expect(recovered.success).toBe(true);
+        expect((await movements()).history).toBe(1);
+        expect((await intentOf(world.employee.id, kA)).status).toBe('COMMITTED');
+
+        const fresh = await svc.requestWithdrawal({
+            employeeId: world.employee.id, amount: '10', idempotencyKey: key(),
+        });
+        expect(fresh.success).toBe(true);
+        expect((await movements()).history).toBe(2);
     });
 });

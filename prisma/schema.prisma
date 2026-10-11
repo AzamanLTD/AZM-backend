@@ -1870,6 +1870,10 @@ model SystemProfitFees {
 // Uniqueness on (employeeId, idempotencyKey) arbitrates concurrent claims;
 // materially different reuse of a key fails closed as EWA_IDEMPOTENCY_CONFLICT.
 // Keyless (legacy) withdrawals create no intent — unchanged behavior.
+/// §Issue #330 review Finding 3: a PARTIAL unique index (one PENDING intent
+/// per employee) is enforced by infra/install-business-os-overlay.js
+/// (EwaWithdrawalIntent_unresolved_employee_key) — Prisma cannot declare
+/// partial indexes, so the overlay installer is the authoritative source.
 model EwaWithdrawalIntent {
   id                String    @id @default(uuid())
   employeeId        String

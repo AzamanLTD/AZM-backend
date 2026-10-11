@@ -37,6 +37,23 @@ minting a new one (and risking a duplicate payout).
   arbiter, atomic with the money. The loser either hits a Serializable write
   conflict (→ retry → the existing txHash replay path returns the committed
   truth) or observes `COMMITTED` and returns it without moving money.
+- **Different-key attempt against an UNRESOLVED intent** (review
+  Finding 3): at most one `PENDING` intent may exist per employee, enforced
+  by the database — the partial unique index
+  `EwaWithdrawalIntent_unresolved_employee_key` (employeeId WHERE status =
+  'PENDING', installed by the business-OS overlay; Prisma cannot declare
+  partial indexes, so the installer is the authoritative source for both
+  production and the CI/test db-push path). A new idempotency key whose
+  claim would bypass an existing unresolved `PENDING` intent fails closed
+  at the insert with typed `EWA_UNRESOLVED_INTENT_CONFLICT` — no
+  application-level pre-check is trusted to arbitrate the race; the index
+  is the arbiter, so concurrent different-key attempts cannot both pass.
+  Same-key retries are exempt (they reuse the existing row, never insert a
+  second one). Once the intent is authoritatively resolved (`COMMITTED` /
+  `REFUSED`), the partial index vacates and a legitimately new withdrawal
+  proceeds normally. A loser of this race leaves NO intent row and moves NO
+  money; the client must recover the original key via the recovery
+  endpoints and retry that identity.
 - **Changed parameters on the same key** (`amount` or `destination` differ):
   typed `EWA_IDEMPOTENCY_CONFLICT`, fail closed. The original intent is
   untouched and remains recoverable. (Portal clients hold this conflict as
@@ -102,6 +119,28 @@ as above). The worker route also carries a mandatory `clientRequestId`, so
 this endpoint is how a worker who lost their device recovers the same
 identity instead of minting a new key.
 
+## Claim ordering and authorization (review Finding 1)
+
+Business scope, employee ownership and actor authorization are resolved
+BEFORE the durable claim: the pre-claim lookup mirrors the in-transaction
+read (scoped `findFirst` when a business scope is resolved — a
+foreign-tenant employee is simply not found), and the same authorization
+rule (`_assertWithdrawalAuthorization`) runs against the pre-claim read.
+An unauthorized or foreign-tenant request therefore leaves the intent table
+completely unchanged. The Serializable financial transaction re-asserts
+both ownership (scoped employee read) and authorization inside its own
+boundary; the preflight only stops durable writes by requests that could
+never pass the transaction — it is not the arbiter of record.
+
+## Recovery list ordering (review Finding 2)
+
+`GET /ewa/intents/:employeeId` and `GET /employees/my-ewa-intents` return a
+deterministic status priority — `PENDING` (unresolved) first, then
+`REFUSED`, then `COMMITTED`, newest first within each tier. Tiers are
+fetched independently under the caller's bounded limit, so a flood of
+refusals or committed rows can never push an unresolved `PENDING` intent
+out of the visible window.
+
 ## Client recovery sequence (second device)
 
 1. Open the employee's EWA panel; call the intents list.
@@ -133,6 +172,10 @@ pre-change behavior (the txHash anchor and response envelope are unchanged).
 
 - Prisma model `EwaWithdrawalIntent` (additive; unique
   `(employeeId, idempotencyKey)`, cascade deletes with employee/business).
+- The single-unresolved-intent rule is a PARTIAL unique index
+  (`EwaWithdrawalIntent_unresolved_employee_key`: one `PENDING` row per
+  employee), created by the overlay installer below — Prisma schema cannot
+  express partial indexes, so the installer is its authoritative source.
 - Production DDL: `infra/install-business-os-overlay.js` (idempotent
   `CREATE TABLE IF NOT EXISTS` + indexes + FKs), which runs in the Render
   build via `npm run release` — the production path (production Neon has no
@@ -147,8 +190,10 @@ pre-change behavior (the txHash anchor and response envelope are unchanged).
 - Intent history is retention-bounded to 20 per list call; older rows remain
   queryable by the database but are not paginated in this API yet.
 - The unique-claim guard makes same-intent retries exactly-once **for that
-  intent**; it does not prevent a deliberately NEW intent (new key) — that
-  is the existing economic-cap guard's job, unchanged.
+  intent**. The single-unresolved-intent index additionally prevents a new
+  key from bypassing an unresolved `PENDING` intent; once that intent is
+  resolved, deliberately NEW intents are again allowed and are bounded by
+  the existing economic-cap guard, unchanged.
 - "Exactly once" is claimed only for the same-key lifecycle: claim + guarded
   in-transaction transition + txHash uniqueness + replay. No claim is made
   about distinct-key attempts or external providers (EWA settles internally
