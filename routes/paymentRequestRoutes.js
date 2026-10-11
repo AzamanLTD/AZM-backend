@@ -32,26 +32,51 @@ const { idempotency } = require('../middleware/idempotency');
 const { validate } = require('../middleware/validate');
 const { createPaymentRequestSchema } = require('../services/validation/financialSchemas');
 const { isShareCryptoAvailable } = require('../services/crypto/shareToken');
+const { resolvePublicAppOrigin } = require('../src/config/publicAppUrl');
 
 // Fail-closed PRE-CLAIM guard: a LINK create must never reach the
-// idempotency authority (or economics) when the share-token key is unusable
-// — the persisted replay response would otherwise have to carry plaintext
-// token material, or the create would fail post-claim. DIRECT creates are
-// unaffected (they need no share token). Refusal leaves NO claim residue
-// and NO request row; the operator fixes ENCRYPTION_KEY and the same retry
-// starts clean.
+// idempotency authority (or economics) when ANY piece of link configuration
+// is unusable. Two independent requirements, both validated BEFORE the
+// claim so a refusal leaves no residue:
+//
+//   1. Share-token key (ENCRYPTION_KEY via fieldCipher) — the persisted
+//      replay response must never carry plaintext token material.
+//   2. Canonical origin (PUBLIC_APP_URL) — a LINK request needs a
+//      server-minted share URL, and the origin must come from validated
+//      configuration, never the untrusted Host header. The controller's
+//      mintLinkShare() would otherwise throw PUBLIC_APP_URL_UNCONFIGURED
+//      AFTER the idempotency claim exists; with releaseOn4xx declared (4xx
+//      only), a 5xx refusal RETAINS an IN_PROGRESS claim — and the same-key
+//      retry Luis's review found would then get an in-progress conflict even
+//      after the operator fixes configuration. Validating the origin here,
+//      before the claim, makes the failure leave NO claim residue and NO
+//      request row; the operator fixes PUBLIC_APP_URL and the same retry
+//      with the preserved key starts clean.
+//
+// DIRECT creates are unaffected (they need no share URL and no token).
 //
 // REPLAY EXEMPTION: when a COMMITTED claim already exists for
 // (user, endpoint, key), the request is a legitimate replay — the
-// middleware re-emits the stored ciphertext bytes WITHOUT touching crypto,
-// so refusing it would break the §r42 replay contract. Such requests are
-// passed through (the guard only refuses NEW work). A read error falls
-// through to refusal: the guard fails closed.
-async function requireLinkCrypto(req, res, next) {
+// middleware re-emits the stored bytes WITHOUT touching crypto or URL
+// configuration, so refusing it would break the §r42 byte-identical replay
+// contract. Missing configuration must never prevent a replay of an
+// already-committed response. Such requests are passed through (the guard
+// only refuses NEW work). A read error falls through to refusal: the guard
+// fails closed.
+async function requireLinkConfig(req, res, next) {
     const mode = String(req.body?.requestMode ?? '').trim().toUpperCase();
-    if (mode !== 'LINK' || isShareCryptoAvailable()) {
-        return next();
+    if (mode !== 'LINK') {
+        return next(); // DIRECT: no share token, no share URL — unaffected.
     }
+
+    // Gather configuration failures first; refuse only after the replay
+    // exemption is checked so a committed operation replays regardless.
+    const cryptoOk = isShareCryptoAvailable();
+    const origin = resolvePublicAppOrigin();
+    if (cryptoOk && origin.ok) {
+        return next(); // fully configured — new LINK work may proceed.
+    }
+
     try {
         const prisma = req.app.get('prisma');
         const key = req.headers['idempotency-key'];
@@ -65,15 +90,26 @@ async function requireLinkCrypto(req, res, next) {
             select: { id: true },
         });
         if (committed) {
-            return next(); // replay of committed bytes — crypto not required
+            return next(); // replay of committed bytes — configuration not required
         }
     } catch {
         // fall through to refusal — fail closed
     }
+
+    if (!cryptoOk) {
+        // Deterministic precedence: the token key is the more fundamental
+        // failure (no envelope could exist at all); report it first when
+        // both are missing, matching the pre-existing L4 contract.
+        return res.status(503).json({
+            success: false,
+            code: 'LINK_SHARE_CRYPTO_UNCONFIGURED',
+            message: 'Link request sharing is unavailable because the server share-token key is not configured. Nothing was created.',
+        });
+    }
     return res.status(503).json({
         success: false,
-        code: 'LINK_SHARE_CRYPTO_UNCONFIGURED',
-        message: 'Link request sharing is unavailable because the server share-token key is not configured. Nothing was created.',
+        code: 'PUBLIC_APP_URL_UNCONFIGURED',
+        message: `Link request sharing is unavailable because the server's public app URL is not usable. ${origin.message} Nothing was created.`,
     });
 }
 
@@ -81,11 +117,12 @@ async function requireLinkCrypto(req, res, next) {
 router.get('/', protect, ctrl.list);
 
 // Create. Wired claim: committed inside the create transaction.
-// The pre-claim crypto guard runs BEFORE the idempotency claim so a
-// misconfigured server refuses LINK creates cleanly (no claim, no row).
+// The pre-claim LINK configuration guard runs BEFORE the idempotency claim
+// so a misconfigured server refuses LINK creates cleanly (no claim, no row)
+// while committed replays still pass through.
 router.post('/',
     protectActive,
-    requireLinkCrypto,
+    requireLinkConfig,
     idempotency({ releaseOn4xx: true }),
     validate(createPaymentRequestSchema),
     ctrl.create);
