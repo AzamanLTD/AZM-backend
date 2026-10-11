@@ -11,6 +11,10 @@
 //      (business_product_id, currency, scope, COALESCE(location_id, '')).
 //   2. business_price_effective_window_check — effective dating integrity:
 //      effective_to IS NULL OR effective_to > effective_from.
+//   2b. business_price_scope_location_check — scope/location integrity:
+//      DEFAULT requires location_id IS NULL (the global identity); BRANCH
+//      requires a non-null location id. A malformed combination can never
+//      be written by ANY path, raw writes included.
 //   3. business_price_amount_positive — a base price is positive; zero is
 //      permitted only under a separately approved free-item model (none in v1).
 //   4. business_price_scope_check / business_price_status_check /
@@ -85,6 +89,29 @@ const STATEMENTS = [
        ALTER TABLE "BusinessPrice"
          ADD CONSTRAINT "business_price_status_check"
          CHECK ("status" IN ('ACTIVE', 'ARCHIVED'));
+     END IF;
+   END $$;`,
+
+  // Scope/location integrity: the DEFAULT (global) identity is the row with a
+  // NULL location; BRANCH rows must name one. Raw writes violating the
+  // combination are rejected by the database, not by app code.
+  `DO $$ BEGIN
+     IF NOT EXISTS (
+       SELECT 1 FROM pg_constraint WHERE conname = 'business_price_scope_location_check'
+     ) THEN
+       ALTER TABLE "BusinessPrice"
+         ADD CONSTRAINT "business_price_scope_location_check"
+         CHECK (
+           ("scope" = 'DEFAULT' AND "locationId" IS NULL)
+           OR ("scope" = 'BRANCH' AND "locationId" IS NOT NULL)
+         ) NOT VALID;
+     END IF;
+   END $$;`,
+  `DO $$ BEGIN
+     IF EXISTS (
+       SELECT 1 FROM pg_constraint WHERE conname = 'business_price_scope_location_check' AND NOT convalidated
+     ) THEN
+       ALTER TABLE "BusinessPrice" VALIDATE CONSTRAINT "business_price_scope_location_check";
      END IF;
    END $$;`,
   `DO $$ BEGIN

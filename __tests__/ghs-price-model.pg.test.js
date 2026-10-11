@@ -12,7 +12,18 @@
 //   • exact-decimal discipline: sub-pesewa, float, negative-zero and
 //     whitespace inputs are rejected; the parser never rounds silently;
 //   • priceDeltaGhs bounds + worst-case final-price validation in integer
-//     pesewas.
+//     pesewas (the intentionally stricter v1 worst-case rule is documented
+//     and demonstrated: every negative delta counts, even mutually exclusive
+//     options and options beyond a modifier group's max);
+//   • confirmation is a SINGLE-WINNER compare-and-set: concurrent actors
+//     race on one row, exactly one actor/timestamp persists, both callers
+//     converge on the committed authoritative row, retries never rewrite
+//     the audit trail;
+//   • scope/location integrity at the DB layer (DEFAULT ⇔ NULL location,
+//     BRANCH ⇔ non-null) plus service tenant verification (a BRANCH price
+//     names only a real location of the product's OWN business);
+//   • NO scheduled future pricing in v1: a future-dated confirmed current
+//     row fails closed — never served early, never silently hidden.
 // =============================================================================
 
 const { PrismaClient, Prisma } = require('@prisma/client');
@@ -35,6 +46,7 @@ run('BusinessPrice GHS listing model (real PostgreSQL)', () => {
     beforeEach(async () => {
         await db.businessPrice.deleteMany({});
         await db.businessProduct.deleteMany({ where: { slug: { startsWith: 'ghs-price-test-' } } });
+        await db.businessLocation.deleteMany({ where: { label: { startsWith: 'GHS Price Test Branch' } } });
         await db.businessProfile.deleteMany({ where: { businessName: { startsWith: 'GHS Price Test Profile' } } });
         await db.user.deleteMany({ where: { username: { startsWith: 'ghs-price-test-user' } } });
     });
@@ -60,6 +72,18 @@ run('BusinessPrice GHS listing model (real PostgreSQL)', () => {
             },
         });
         return { profile, product };
+    }
+
+    async function seedBranch(profile, n = 1) {
+        return db.businessLocation.create({
+            data: {
+                businessProfileId: profile.id,
+                label: `GHS Price Test Branch ${n}`,
+                address: 'Osu Road, Accra',
+                latitude: new Prisma.Decimal('5.5600'),
+                longitude: new Prisma.Decimal('-0.1900'),
+            },
+        });
     }
 
     // ─── exact-decimal parser (§6 test matrix) ────────────────────────────────
@@ -113,6 +137,41 @@ run('BusinessPrice GHS listing model (real PostgreSQL)', () => {
                 variants: [{ options: [{ label: 'Small', priceDeltaGhs: '-5.00' }] }],
                 modifierGroups: [{ options: [{ name: 'X', priceDeltaGhs: '-15.01' }] }],
             })).toThrow(/positive price/);
+        });
+
+        test('STRICTER V1 RULE (documented): mutually exclusive options are BOTH counted in the worst case', () => {
+            // Size variants are alternatives (a customer picks one), so the true
+            // selectable worst case is 20.00 − 12.00 = 8.00 — but v1 sums every
+            // negative delta: 20.00 − 12.00 − 8.00 = 0.00 → rejected as too
+            // conservative. Intentional: the rule never under-rejects.
+            expect(() => svc.validateGhsDeltas({
+                baseGhs: '20.00',
+                variants: [{ name: 'Size', options: [
+                    { label: 'Small', priceDeltaGhs: '-12.00' },
+                    { label: 'Large', priceDeltaGhs: '-8.00' },
+                ] }],
+            })).toThrow(/positive price/);
+        });
+
+        test('STRICTER V1 RULE (documented): modifier group max selection does not bound the sum', () => {
+            // max: 1, but BOTH negative options count: 10.00 − 6.00 − 6.00 = −2.00,
+            // even though a customer can select at most one sauce (true worst 4.00).
+            expect(() => svc.validateGhsDeltas({
+                baseGhs: '10.00',
+                modifierGroups: [{ name: 'Sauce', max: 1, options: [
+                    { label: 'Ketchup', priceDeltaGhs: '-6.00' },
+                    { label: 'Mayo', priceDeltaGhs: '-6.00' },
+                ] }],
+            })).toThrow(/-2\.00 GHS/); // the error names the summed worst case
+        });
+
+        test('the stricter rule stays exact in integer pesewas and passes healthy configs', () => {
+            const r = svc.validateGhsDeltas({
+                baseGhs: '20.00',
+                variants: [{ name: 'Size', options: [{ label: 'Small', priceDeltaGhs: '-5.00' }, { label: 'Large', priceDeltaGhs: '3.00' }] }],
+                modifierGroups: [{ name: 'Add-ons', max: 2, options: [{ name: 'Extra Sauce', priceDeltaGhs: '-4.00' }] }],
+            });
+            expect(r.worstCaseFinalPesewas).toBe(1100n); // 20 − 5 − 4, positive, BigInt pesewas
         });
 
         test('rejects out-of-bounds and float deltas', () => {
@@ -265,20 +324,111 @@ run('BusinessPrice GHS listing model (real PostgreSQL)', () => {
         });
 
         test('resolveEffectiveGhsPrice ignores BRANCH rows (v1 rule) and unknown products', async () => {
-            const { product } = await seedProduct();
+            const { profile, product } = await seedProduct();
+            const loc = await seedBranch(profile);
             await db.$transaction(async (tx) => svc.setPrice(tx, {
-                businessProductId: product.id, amountGhs: '9.99', scope: 'BRANCH', locationId: 'loc-1',
+                businessProductId: product.id, amountGhs: '9.99', scope: 'BRANCH', locationId: loc.id,
                 confirmedByType: 'ADMIN', confirmedById: 'a1', confirm: true,
             }));
             expect(await svc.resolveEffectiveGhsPrice(db, product.id)).toBeNull(); // BRANCH is schema-ready, not consumed in v1
             expect(await svc.resolveEffectiveGhsPrice(db, 'does-not-exist')).toBeNull();
+        });
+
+        // ─── no scheduled future pricing (v1: fail closed) ─────────────────────
+
+        test('a future-dated confirmed current price FAILS CLOSED — never served early, never silently hidden', async () => {
+            const { product } = await seedProduct();
+            const future = new Date(Date.now() + 60 * 60 * 1000); // +1h
+            // A raw scheduled price (setPrice cannot create this — it stamps now).
+            await db.businessPrice.create({
+                data: {
+                    businessProductId: product.id, currency: 'GHS', amountExact: new Prisma.Decimal('19.00'),
+                    effectiveFrom: future, effectiveTo: null, status: 'ACTIVE',
+                    confirmedByType: 'BUSINESS', confirmedById: 'u1', confirmedAt: new Date(),
+                },
+            });
+            await expect(svc.resolveEffectiveGhsPrice(db, product.id))
+                .rejects.toThrow(svc.BusinessPriceError);
+            await expect(svc.resolveEffectiveGhsPrice(db, product.id))
+                .rejects.toThrow(/scheduled for the future|not supported in v1/);
+
+            // A present-dated confirmed row resolves normally (the guard must not
+            // over-fire on legitimate rows).
+            const { product: p2 } = await seedProduct(2);
+            await db.$transaction(async (tx) => svc.setPrice(tx, {
+                businessProductId: p2.id, amountGhs: '19.00', confirmedByType: 'BUSINESS', confirmedById: 'u1', confirm: true,
+            }));
+            const resolved = await svc.resolveEffectiveGhsPrice(db, p2.id);
+            expect(resolved.amountExact.toString()).toBe('19');
+        });
+
+        // ─── confirmation is a single-winner CAS ───────────────────────────────
+
+        test('two concurrent confirmations (different actors) produce exactly one winner; both converge; retry never rewrites the trail', async () => {
+            const { product } = await seedProduct();
+            const row = await db.$transaction(async (tx) => svc.setPrice(tx, {
+                businessProductId: product.id, amountGhs: '18.00',
+                confirmedByType: 'MIGRATION', confirm: false, confirmedById: null, // P2 worklist row
+            }));
+            expect(row.confirmedAt).toBeNull();
+
+            // Two INDEPENDENT clients, two actors, launched simultaneously.
+            const dbA = new PrismaClient();
+            const dbB = new PrismaClient();
+            try {
+                const [a, b] = await Promise.all([
+                    dbA.$transaction((tx) => svc.confirmPrice(tx, {
+                        priceId: row.id, confirmedByType: 'BUSINESS', confirmedById: 'actor-business', note: 'business-note',
+                    })),
+                    dbB.$transaction((tx) => svc.confirmPrice(tx, {
+                        priceId: row.id, confirmedByType: 'ADMIN', confirmedById: 'actor-admin', note: 'admin-note',
+                    })),
+                ]);
+                // Exactly one winner persisted; both callers converge on it.
+                const persisted = await db.businessPrice.findUnique({ where: { id: row.id } });
+                expect(['actor-business', 'actor-admin']).toContain(persisted.confirmedById);
+                expect(a.confirmedById).toBe(persisted.confirmedById);
+                expect(b.confirmedById).toBe(persisted.confirmedById);
+                expect(a.confirmedAt.toISOString()).toBe(persisted.confirmedAt.toISOString());
+                expect(b.confirmedAt.toISOString()).toBe(persisted.confirmedAt.toISOString());
+                expect(a.note).toBe(persisted.note);
+                expect(b.note).toBe(persisted.note); // loser converged — its note did NOT overwrite
+
+                // A late retry with yet another actor must not rewrite the trail.
+                const replay = await db.$transaction((tx) => svc.confirmPrice(tx, {
+                    priceId: row.id, confirmedByType: 'ADMIN', confirmedById: 'late-retry', note: 'late-note',
+                }));
+                expect(replay.confirmedById).toBe(persisted.confirmedById);
+                expect(replay.confirmedAt.toISOString()).toBe(persisted.confirmedAt.toISOString());
+                expect(replay.note).toBe(persisted.note);
+                const after = await db.businessPrice.findUnique({ where: { id: row.id } });
+                expect(after.confirmedById).toBe(persisted.confirmedById);
+                expect(after.note).toBe(persisted.note);
+            } finally {
+                await dbA.$disconnect();
+                await dbB.$disconnect();
+            }
+        });
+
+        test('confirmPrice fails closed on a non-current row — a CAS can never resurrect an archived row', async () => {
+            const { product } = await seedProduct();
+            const first = await db.$transaction(async (tx) => svc.setPrice(tx, {
+                businessProductId: product.id, amountGhs: '18.00', confirmedByType: 'MIGRATION', confirm: false,
+            }));
+            // Archive it by setting a successor.
+            await db.$transaction(async (tx) => svc.setPrice(tx, {
+                businessProductId: product.id, amountGhs: '19.00', confirmedByType: 'BUSINESS', confirmedById: 'u1', confirm: true,
+            }));
+            await expect(db.$transaction(async (tx) => svc.confirmPrice(tx, {
+                priceId: first.id, confirmedByType: 'BUSINESS', confirmedById: 'u2',
+            }))).rejects.toThrow(/current ACTIVE row/);
         });
     });
 
     // ─── scope hygiene ───────────────────────────────────────────────────────
 
     describe('scope rules', () => {
-        test('BRANCH requires a location; DEFAULT forbids one', async () => {
+        test('BRANCH requires a location; DEFAULT forbids one (service layer)', async () => {
             const { product } = await seedProduct();
             await expect(db.$transaction(async (tx) => svc.setPrice(tx, {
                 businessProductId: product.id, amountGhs: '5.00', scope: 'BRANCH', locationId: null,
@@ -288,6 +438,61 @@ run('BusinessPrice GHS listing model (real PostgreSQL)', () => {
                 businessProductId: product.id, amountGhs: '5.00', scope: 'DEFAULT', locationId: 'loc-1',
                 confirmedByType: 'ADMIN', confirmedById: 'a1',
             }))).rejects.toThrow(/DEFAULT scope must have locationId null/);
+        });
+
+        test('the DB scope/location CHECK rejects malformed combinations from RAW writes', async () => {
+            const { product } = await seedProduct();
+            // DEFAULT with a location — rejected by the database, not app code.
+            await expect(db.businessPrice.create({
+                data: { businessProductId: product.id, currency: 'GHS', amountExact: new Prisma.Decimal('5.00'), scope: 'DEFAULT', locationId: 'loc-x' },
+            })).rejects.toThrow(/business_price_scope_location_check/);
+            // BRANCH without a location — rejected by the database.
+            await expect(db.businessPrice.create({
+                data: { businessProductId: product.id, currency: 'GHS', amountExact: new Prisma.Decimal('5.00'), scope: 'BRANCH', locationId: null },
+            })).rejects.toThrow(/business_price_scope_location_check/);
+            // The constraint is installed and validated.
+            const c = await db.$queryRaw`
+                SELECT convalidated FROM pg_constraint WHERE conname = 'business_price_scope_location_check'`;
+            expect(c).toHaveLength(1);
+            expect(c[0].convalidated).toBe(true);
+        });
+
+        test('a malformed DEFAULT-with-location row can never resolve as the global price', async () => {
+            const { product } = await seedProduct();
+            await db.businessPrice.create({
+                data: {
+                    businessProductId: product.id, currency: 'GHS', amountExact: new Prisma.Decimal('4.00'),
+                    scope: 'DEFAULT', locationId: 'loc-y', // violates the CHECK on a healthy DB; the resolver is belt-and-braces
+                    confirmedByType: 'BUSINESS', confirmedById: 'u1', confirmedAt: new Date(),
+                },
+            }).catch(() => {}); // the DB CHECK may reject it first — exactly the point
+            const rows = await db.businessPrice.findMany({ where: { businessProductId: product.id, scope: 'DEFAULT', locationId: 'loc-y' } });
+            if (rows.length > 0) { // present only if the CHECK was somehow absent — resolver must still refuse
+                expect(await svc.resolveEffectiveGhsPrice(db, product.id)).toBeNull();
+            }
+        });
+
+        test('BRANCH prices accept only a REAL location of the product\'s OWN business', async () => {
+            const { profile, product } = await seedProduct();
+            const own = await seedBranch(profile, 1);
+            await expect(db.$transaction(async (tx) => svc.setPrice(tx, {
+                businessProductId: product.id, amountGhs: '7.50', scope: 'BRANCH', locationId: own.id,
+                confirmedByType: 'ADMIN', confirmedById: 'a1', confirm: true,
+            }))).resolves.toBeTruthy();
+
+            // Nonexistent branch id — arbitrary ids are refused.
+            await expect(db.$transaction(async (tx) => svc.setPrice(tx, {
+                businessProductId: product.id, amountGhs: '7.50', scope: 'BRANCH', locationId: 'no-such-loc-123',
+                confirmedByType: 'ADMIN', confirmedById: 'a1', confirm: true,
+            }))).rejects.toThrow(/unknown location no-such-loc-123/);
+
+            // Cross-business branch: a location of ANOTHER business — refused.
+            const other = await seedProduct(2);
+            const otherLoc = await seedBranch(other.profile, 2);
+            await expect(db.$transaction(async (tx) => svc.setPrice(tx, {
+                businessProductId: product.id, amountGhs: '7.50', scope: 'BRANCH', locationId: otherLoc.id,
+                confirmedByType: 'ADMIN', confirmedById: 'a1', confirm: true,
+            }))).rejects.toThrow(/cross-tenant branch prices/);
         });
     });
 });
