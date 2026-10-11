@@ -20,13 +20,19 @@ minting a new one (and risking a duplicate payout).
             │                                           │
             ▼                                           ▼
         COMMITTED                                    REFUSED
+                                                        │
+                            guarded reopen (review Finding 4,
+                            arbitrated by the partial unique index)
+                                                        │
+                                                        ▼
+                                                     PENDING
 ```
 
 | Status | Meaning | Durability | Concurrent retry behavior |
 |---|---|---|---|
 | `PENDING` | Registered durably BEFORE any economics. The attempt is in-flight, crashed, or its outcome is otherwise not yet provable. **Nothing is claimed about the money.** | Written in its own transaction, before the withdrawal transaction runs. Survives restart. | Retry proceeds into the Serializable transaction; the in-tx claim guard is the single arbiter (below). |
 | `COMMITTED` | The withdrawal atomically committed with its authoritative ledger/history records. `committedTxHash` anchors the `TransactionHistory` row. | Transitioned INSIDE the same Serializable `$transaction` as the treasury debit / employee credit / fee / ledger writes: committed-intent ⟺ committed money. | Exact retry replays the committed outcome (server-truth amounts). No second movement. |
-| `REFUSED` | An authoritative pre-commit refusal (documented catalog only), recorded after rollback. | Written outside the rolled-back transaction. | Retry with the same key re-evaluates fresh — the existing "never replay a failure" contract is preserved. A refusal is authoritative for THAT attempt, not forever. |
+| `REFUSED` | An authoritative pre-commit refusal (documented catalog only), recorded after rollback. | Written outside the rolled-back transaction. | Same-key retry first REOPENS the row `REFUSED → PENDING` (guarded, index-arbitrated — review Finding 4), then re-evaluates fresh — the existing "never replay a failure" contract is preserved. A refusal is authoritative for THAT attempt, not forever. |
 
 ### Edge behavior
 
@@ -54,6 +60,18 @@ minting a new one (and risking a duplicate payout).
   proceeds normally. A loser of this race leaves NO intent row and moves NO
   money; the client must recover the original key via the recovery
   endpoints and retry that identity.
+- **Same-key retry of a REFUSED intent** (review Finding 4): the retry
+  REOPENS its intent `REFUSED → PENDING` before the financial transaction,
+  via a guarded `updateMany` that only transitions while the row is still
+  `REFUSED` — and the transition itself is arbitrated by the same partial
+  unique index (an existing different-key `PENDING` intent rejects the
+  reopen with `EWA_UNRESOLVED_INTENT_CONFLICT`; both intents and all money
+  unchanged). The retry therefore durably holds the unresolved slot for
+  its whole attempt: no different-key `PENDING` can be claimed in the
+  pre-transaction gap, a crash after reopening leaves a discoverable
+  `PENDING` intent, and a concurrent same-key twin that loses the guarded
+  race re-reads the row it already shares (the in-transaction guard remains
+  the single economic arbiter).
 - **Changed parameters on the same key** (`amount` or `destination` differ):
   typed `EWA_IDEMPOTENCY_CONFLICT`, fail closed. The original intent is
   untouched and remains recoverable. (Portal clients hold this conflict as
@@ -72,6 +90,21 @@ minting a new one (and risking a duplicate payout).
   movement, never a fresh refusal claim.
 
 ## API contract
+
+### Typed conflict envelope (review Finding 5)
+
+`EWA_UNRESOLVED_INTENT_CONFLICT` and `EWA_IDEMPOTENCY_CONFLICT` (and the
+`EWA_INTENT_RECONCILIATION_REQUIRED` reconciliation state) are surfaced by
+the routes as **HTTP 409** with a stable JSON envelope:
+
+```json
+{ "success": false, "code": "EWA_UNRESOLVED_INTENT_CONFLICT", "message": "..." }
+```
+
+The exact `code` is the contract; `message` is human guidance. Clients should
+key reconciliation logic off `code`, not message strings. Unrelated error
+semantics (the reservation-availability 409, kiosk statusCodes and the
+conservative 400 default for pre-commit refusals) are unchanged.
 
 ### `POST /api/business-os/ewa/withdraw` (unchanged surface, new backing)
 

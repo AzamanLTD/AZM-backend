@@ -46,6 +46,15 @@
 //         PENDING intent (DB partial unique index — EWA_UNRESOLVED_INTENT_
 //         CONFLICT); same-key retry and legitimate post-resolution
 //         withdrawals still pass, with no duplicate economic movement
+//     14. review F4: a REFUSED same-key retry REOPENS its intent to PENDING
+//         (guarded, index-arbitrated) before the financial transaction —
+//         a different-key attempt in the reopened window fails closed; a
+//         crash after reopening stays discoverable PENDING; the retry
+//         commits exactly once and fresh keys pass after resolution
+//     15. review F5: the typed conflicts (EWA_UNRESOLVED_INTENT_CONFLICT,
+//         EWA_IDEMPOTENCY_CONFLICT) are client-visible through the actual
+//         HTTP routes — 409 with { success, code, message } — on BOTH the
+//         operator withdraw endpoint and the worker self-service endpoint
 
 const hasDb = !!process.env.TEST_DATABASE_URL;
 const describeOrSkip = hasDb ? describe : describe.skip;
@@ -729,6 +738,259 @@ describeOrSkip('EWA server-owned withdrawal intent lifecycle (real Postgres)', (
             employeeId: world.employee.id, amount: '10', idempotencyKey: key(),
         });
         expect(fresh.success).toBe(true);
+        expect((await movements()).history).toBe(2);
+    });
+
+    // ── 14. review Finding 4: REFUSED retry reclaims the guard ─────────────
+
+    test('14. a REFUSED same-key retry reopens PENDING durably; different-key attempts in the reopened window fail closed; the retry then commits exactly once', async () => {
+        const world = await seedWorld({ ownerBalance: '500', accruedWages: '100' });
+        const svc = new EwaService(prisma);
+        const kA = key();
+
+        // 1. An intent reaches REFUSED: amount 40 exceeds the 30% cap of 100.
+        await expect(svc.requestWithdrawal({
+            employeeId: world.employee.id, amount: '40', idempotencyKey: kA,
+        })).rejects.toThrow(/exceeds available EWA balance/);
+        const refused = await intentOf(world.employee.id, kA);
+        expect(refused.status).toBe('REFUSED');
+        expect(refused.refusalMessage).toBeTruthy();
+        expect((await movements()).history).toBe(0);
+
+        // 2. The underlying refusal condition is fixed (wages accrued to 200
+        //    — cap 60 now covers the 40 retry).
+        await prisma.businessEmployee.update({
+            where: { id: world.employee.id },
+            data: { accruedWages: '200' },
+        });
+
+        // 3. Same-key retry, paused after the durable claim (reopened
+        //    PENDING) and before financial execution.
+        const realTx = svc.prisma.$transaction.bind(svc.prisma);
+        const txSpy = jest.spyOn(svc.prisma, '$transaction');
+        txSpy.mockImplementationOnce(async (fn, opts) => {
+            await new Promise((resolve) => setTimeout(resolve, 400));
+            return realTx(fn, opts);
+        });
+        const aPromise = svc.requestWithdrawal({ employeeId: world.employee.id, amount: '40', idempotencyKey: kA });
+        let reopenedRow = null;
+        for (let i = 0; i < 200 && !(reopenedRow && reopenedRow.status === 'PENDING'); i += 1) {
+            reopenedRow = await intentOf(world.employee.id, kA);
+            if (!(reopenedRow && reopenedRow.status === 'PENDING')) {
+                await new Promise((resolve) => setTimeout(resolve, 5));
+            }
+        }
+        // The retry durably reclaims the unresolved slot BEFORE its
+        // financial transaction runs.
+        expect(reopenedRow.status).toBe('PENDING');
+        expect(reopenedRow.refusalMessage).toBeNull();
+
+        // 4. A different-key withdrawal in the reopened window fails closed.
+        await expect(svc.requestWithdrawal({
+            employeeId: world.employee.id, amount: '10', idempotencyKey: key(),
+        })).rejects.toMatchObject({ code: 'EWA_UNRESOLVED_INTENT_CONFLICT' });
+
+        // 5. No movement and no second intent from the loser.
+        expect((await movements()).history).toBe(0);
+        expect((await movements()).ledger).toBe(0);
+        expect(await prisma.ewaWithdrawalIntent.count({ where: { employeeId: world.employee.id } })).toBe(1);
+
+        // 6. The original-key retry resolves exactly once.
+        const result = await aPromise;
+        txSpy.mockRestore();
+        expect(result.success).toBe(true);
+        expect(result.replayed).toBeUndefined(); // fresh commit, not a replay
+        expect((await movements()).history).toBe(1);
+        expect((await intentOf(world.employee.id, kA)).status).toBe('COMMITTED');
+
+        // The original-key exact replay still replays.
+        const replay = await svc.requestWithdrawal({
+            employeeId: world.employee.id, amount: '40', idempotencyKey: kA,
+        });
+        expect(replay.replayed).toBe(true);
+        expect((await movements()).history).toBe(1);
+
+        // A fresh key passes after the active intent is resolved.
+        const fresh = await svc.requestWithdrawal({
+            employeeId: world.employee.id, amount: '10', idempotencyKey: key(),
+        });
+        expect(fresh.success).toBe(true);
+        expect((await movements()).history).toBe(2);
+    });
+
+    test('14b. a process crash after reopening leaves a discoverable PENDING intent; the same key then commits', async () => {
+        const world = await seedWorld({ ownerBalance: '500', accruedWages: '100' });
+        const svc = new EwaService(prisma);
+        const kA = key();
+
+        await expect(svc.requestWithdrawal({
+            employeeId: world.employee.id, amount: '40', idempotencyKey: kA,
+        })).rejects.toThrow(/exceeds available EWA balance/);
+        await prisma.businessEmployee.update({
+            where: { id: world.employee.id },
+            data: { accruedWages: '200' },
+        });
+
+        // The retry reopens the intent, then crashes before economics — a
+        // NON-refusal failure keeps the reopened intent PENDING (never
+        // misclassified back to REFUSED, never COMMITTED).
+        const txSpy = jest.spyOn(svc.prisma, '$transaction').mockRejectedValueOnce(
+            new Error('db connection lost mid-flight'),
+        );
+        await expect(svc.requestWithdrawal({
+            employeeId: world.employee.id, amount: '40', idempotencyKey: kA,
+        })).rejects.toThrow('db connection lost mid-flight');
+        txSpy.mockRestore();
+
+        const intent = await intentOf(world.employee.id, kA);
+        expect(intent.status).toBe('PENDING');
+        expect(intent.refusalMessage).toBeNull();
+        expect((await movements()).history).toBe(0);
+
+        // The reopened PENDING intent is discoverable (with its key) on the
+        // recovery list while the guard is held.
+        const svcB = new EwaService(prisma);
+        const list = await runWithBusinessRequestContext(
+            { businessProfileId: world.business.id, isBusinessOwner: true, user: { id: world.owner.id } },
+            () => svcB.getWithdrawalIntents(world.employee.id),
+        );
+        expect(list[0]).toMatchObject({ status: 'PENDING', idempotencyKey: kA });
+
+        // Restart: the same key commits exactly once.
+        const result = await svcB.requestWithdrawal({
+            employeeId: world.employee.id, amount: '40', idempotencyKey: kA,
+        });
+        expect(result.success).toBe(true);
+        expect((await movements()).history).toBe(1);
+        expect((await intentOf(world.employee.id, kA)).status).toBe('COMMITTED');
+    });
+
+    // ── 15. review Finding 5: typed conflicts through the real HTTP API ───
+
+    test('15a. the operator withdraw route surfaces EWA_UNRESOLVED_INTENT_CONFLICT as 409 { success, code, message }', async () => {
+        const world = await seedWorld();
+        const app = mkApp();
+        const kCrashed = key();
+
+        // A crashed attempt leaves a durable PENDING intent for the employee.
+        await prisma.ewaWithdrawalIntent.create({ data: {
+            employeeId: world.employee.id,
+            businessProfileId: world.business.id,
+            idempotencyKey: kCrashed,
+            amountExact: '20.00000000',
+            destination: 'AZAMAN_BALANCE',
+            status: 'PENDING',
+        }});
+
+        // A DIFFERENT-key withdrawal through the actual Express handler.
+        const res = await request(app)
+            .post('/api/business-os/ewa/withdraw')
+            .set('Authorization', tokenFor(world.owner.id))
+            .send({ employeeId: world.employee.id, amount: 20, idempotencyKey: key() });
+
+        expect(res.status).toBe(409);
+        expect(res.body).toMatchObject({
+            success: false,
+            code: 'EWA_UNRESOLVED_INTENT_CONFLICT',
+        });
+        expect(typeof res.body.message).toBe('string');
+        expect(res.body.message.length).toBeGreaterThan(0);
+        expect((await movements()).history).toBe(0);
+        // No second intent was minted by the refused attempt.
+        expect(await prisma.ewaWithdrawalIntent.count({ where: { employeeId: world.employee.id } })).toBe(1);
+    });
+
+    test('15b. the operator withdraw route surfaces EWA_IDEMPOTENCY_CONFLICT as 409 { success, code, message }', async () => {
+        const world = await seedWorld();
+        const app = mkApp();
+        const k = key();
+
+        const ok = await request(app)
+            .post('/api/business-os/ewa/withdraw')
+            .set('Authorization', tokenFor(world.owner.id))
+            .send({ employeeId: world.employee.id, amount: 20, idempotencyKey: k });
+        expect(ok.status).toBe(200);
+
+        // Same key, materially different amount → typed conflict, not a 400.
+        const res = await request(app)
+            .post('/api/business-os/ewa/withdraw')
+            .set('Authorization', tokenFor(world.owner.id))
+            .send({ employeeId: world.employee.id, amount: 30, idempotencyKey: k });
+
+        expect(res.status).toBe(409);
+        expect(res.body).toMatchObject({
+            success: false,
+            code: 'EWA_IDEMPOTENCY_CONFLICT',
+        });
+        expect(res.body.message).toMatch(/differing: amount/);
+        expect((await movements()).history).toBe(1);
+
+        // Unrelated error semantics preserved: a pre-commit refusal is
+        // still the conservative 400 with the service message.
+        const refusal = await request(app)
+            .post('/api/business-os/ewa/withdraw')
+            .set('Authorization', tokenFor(world.owner.id))
+            .send({ employeeId: world.employee.id, amount: 999, idempotencyKey: key() });
+        expect(refusal.status).toBe(400);
+        expect(refusal.body).toMatchObject({ success: false });
+        expect(refusal.body.code).toBeUndefined();
+    });
+
+    test('15c. the worker self-service route surfaces both typed conflicts as 409 { success, code, message }', async () => {
+        const world = await seedWorld();
+        const app = mkApp();
+        const kCrashed = key();
+
+        await prisma.ewaWithdrawalIntent.create({ data: {
+            employeeId: world.employee.id,
+            businessProfileId: world.business.id,
+            idempotencyKey: kCrashed,
+            amountExact: '20.00000000',
+            destination: 'AZAMAN_BALANCE',
+            status: 'PENDING',
+        }});
+
+        // Worker path, different clientRequestId while an attempt is
+        // unresolved → typed 409.
+        const conflict = await request(app)
+            .post('/api/business-os/employees/my-ewa-request')
+            .set('Authorization', tokenFor(world.employeeUser.id))
+            .send({ amount: 20, clientRequestId: key() });
+        expect(conflict.status).toBe(409);
+        expect(conflict.body).toMatchObject({
+            success: false,
+            code: 'EWA_UNRESOLVED_INTENT_CONFLICT',
+        });
+        expect((await movements()).history).toBe(0);
+
+        // Settle the crashed attempt with the ORIGINAL key (worker path).
+        const settle = await request(app)
+            .post('/api/business-os/employees/my-ewa-request')
+            .set('Authorization', tokenFor(world.employeeUser.id))
+            .send({ amount: 20, clientRequestId: kCrashed });
+        expect(settle.status).toBe(200);
+        expect(settle.body.success).toBe(true);
+
+        // Same key, materially different amount → typed 409 on the worker
+        // path too (EWA_IDEMPOTENCY_CONFLICT).
+        const idem = await request(app)
+            .post('/api/business-os/employees/my-ewa-request')
+            .set('Authorization', tokenFor(world.employeeUser.id))
+            .send({ amount: 30, clientRequestId: kCrashed });
+        expect(idem.status).toBe(409);
+        expect(idem.body).toMatchObject({
+            success: false,
+            code: 'EWA_IDEMPOTENCY_CONFLICT',
+        });
+        expect((await movements()).history).toBe(1);
+
+        // A fresh key after resolution is accepted on the worker path.
+        const fresh = await request(app)
+            .post('/api/business-os/employees/my-ewa-request')
+            .set('Authorization', tokenFor(world.employeeUser.id))
+            .send({ amount: 5, clientRequestId: key() });
+        expect(fresh.status).toBe(200);
+        expect(fresh.body.success).toBe(true);
         expect((await movements()).history).toBe(2);
     });
 });

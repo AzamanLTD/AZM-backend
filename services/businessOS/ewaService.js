@@ -629,6 +629,16 @@ class EwaService {
     //      the partial index vacates and legitimate new withdrawals pass.
     // Materially different reuse of the same key fails closed as
     // EWA_IDEMPOTENCY_CONFLICT and never touches the original intent.
+    //
+    // §Issue #330 review Finding 4 — REFUSED same-key retries REOPEN the
+    // intent REFUSED → PENDING (guarded updateMany, arbitrated by the same
+    // partial unique index) BEFORE the financial transaction, so the retry
+    // durably holds the unresolved-intent slot for its whole attempt: no
+    // different-key PENDING can be claimed in the pre-transaction gap, a
+    // crash after reopening leaves a discoverable PENDING intent, the
+    // in-transaction guard still transitions PENDING → COMMITTED atomically
+    // with the money, and a post-rollback authoritative refusal still
+    // records REFUSED (retry re-evaluates fresh).
     async _claimWithdrawalIntent({ employeeId, businessProfileId, idempotencyKey, amountExact, destination }) {
         let collision = null;
         try {
@@ -679,12 +689,62 @@ class EwaService {
                 `Idempotency key was already used with different parameters (differing: ${differing.join(', ')}); the withdrawal was not executed.`,
             );
         }
-        // Same economic identity. PENDING: in-flight or crashed — the
-        // in-transaction guard is the single arbiter. REFUSED: the prior
-        // attempt was authoritatively refused; a same-key retry still
-        // re-evaluates fresh per the existing contract. COMMITTED: the
-        // transaction below replays the committed outcome via the
-        // txHash/committedTxHash anchor.
+        // Same economic identity. COMMITTED: the transaction below replays
+        // the committed outcome via the txHash/committedTxHash anchor.
+        // PENDING: in-flight or crashed — the row already holds the
+        // unresolved-intent slot; the in-transaction guard is the single
+        // commit arbiter.
+        if (existing.status === EWA_INTENT_STATUS.REFUSED) {
+            // §Issue #330 review Finding 4: a same-key retry of a REFUSED
+            // intent must RECLAIM the unresolved slot durably BEFORE any
+            // financial transaction runs. The guarded updateMany below is
+            // the arbiter: it transitions REFUSED → PENDING only while the
+            // row is still REFUSED, and the transition itself is arbitrated
+            // by the single-unresolved-intent partial unique index — if a
+            // DIFFERENT-key PENDING intent already exists for this employee,
+            // PostgreSQL rejects the transition with P2002 and this retry
+            // fails closed with the typed conflict, both intents and all
+            // money unchanged. A crash after reopening leaves a discoverable
+            // PENDING intent; a concurrent same-key twin that loses the
+            // guarded race re-reads the row it already shares.
+            let reopened;
+            try {
+                reopened = await this.prisma.ewaWithdrawalIntent.updateMany({
+                    where: { id: existing.id, status: EWA_INTENT_STATUS.REFUSED },
+                    data: {
+                        status: EWA_INTENT_STATUS.PENDING,
+                        refusalMessage: null,
+                        resolvedAt: null,
+                        updatedAt: new Date(),
+                    },
+                });
+            } catch (e) {
+                if (e?.code !== 'P2002') throw e;
+                // The partial unique index refused the reopen: a different-key
+                // PENDING intent owns the unresolved slot.
+                throw settlementError(
+                    'EWA_UNRESOLVED_INTENT_CONFLICT',
+                    'Another withdrawal request for this employee is still unresolved (PENDING); retry it with its original idempotency key (recoverable via the EWA intent recovery endpoint) instead of starting a new one; the withdrawal was not executed.',
+                );
+            }
+            if (reopened.count !== 1) {
+                // A same-key twin won the guarded reopen race (or the row
+                // settled concurrently). Re-read and proceed with the row
+                // AS IT IS — a shared identity must never fork into two
+                // claims; the in-transaction guard remains the single
+                // economic arbiter.
+                const current = await this.prisma.ewaWithdrawalIntent.findUniqueOrThrow({
+                    where: { id: existing.id },
+                });
+                return current;
+            }
+            return {
+                ...existing,
+                status: EWA_INTENT_STATUS.PENDING,
+                refusalMessage: null,
+                resolvedAt: null,
+            };
+        }
         return existing;
     }
 

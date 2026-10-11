@@ -86,6 +86,23 @@ function getServices(req) {
 }
 
 // Helper: async error wrapper — uses existing backend response envelope
+//
+// §Issue #330 review Finding 5: typed EWA reconciliation conflicts are
+// client-visible CONTRACT states, not generic 400s. The service layer
+// attaches a stable `code` (settlementError) to each; these MUST survive
+// the API boundary so portal/worker clients can key reconciliation logic
+// off the code instead of matching message strings. They are states of
+// the request identity conflicting with the durable intent lifecycle, so
+// they map to 409 Conflict with a stable envelope:
+//   { success: false, code: <exact typed code>, message: <service message> }
+// Unrelated error semantics (the reservation P2002 special case, kiosk
+// statusCode attachments, and the conservative 400 default) are preserved.
+const EWA_TYPED_CONFLICT_CODES = new Set([
+    'EWA_UNRESOLVED_INTENT_CONFLICT',
+    'EWA_IDEMPOTENCY_CONFLICT',
+    'EWA_INTENT_RECONCILIATION_REQUIRED',
+]);
+
 function wrap(handler) {
     return async (req, res) => {
         try {
@@ -94,6 +111,9 @@ function wrap(handler) {
             logger.error({ err: err }, '[BusinessOS]');
             if (err.code === 'P2002' && err.meta?.target === null) {
                 return res.status(409).json({ success: false, message: 'The requested reservation or room interval is no longer available.' });
+            }
+            if (EWA_TYPED_CONFLICT_CODES.has(err.code)) {
+                return res.status(409).json({ success: false, code: err.code, message: err.message });
             }
             // Handlers may attach a specific statusCode (e.g. kiosk 404/409);
             // the default remains a conservative 400.
