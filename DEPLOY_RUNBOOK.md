@@ -23,6 +23,37 @@ it. (The `20260920060000_r15_receipt_available_unique` migration file was
 removed for exactly this reason — the fiat-liquidity overlay creates that
 unique index.)
 
+## Free-plan Render deploy path (CURRENT LIVE SERVICE)
+
+The **live azaman-backend Render service is on the Free plan**, which does NOT
+execute the Pre-Deploy Command. Its Build Command runs only three overlay
+installers (E2EE server-blind, inventory-restock, reservation-capacity).
+Consequences:
+
+- `npm run release` does not run on deploys, so an installer added to the
+  release chain does NOT automatically provision the production database.
+- `infra/autoRelease.js` is not invoked during normal startup, so boot does
+  not self-heal the gap either.
+
+**Required dashboard change (Settings → Build & Deploy)** — append the
+missing installer to the Build Command (idempotent, additive-only, ~1s):
+
+    npm install && npm run build && node infra/install-business-price-overlay.js
+
+Long term the blueprint (`render.yaml`) already encodes
+`preDeployCommand: npm run release`; once the service moves to a plan that
+executes pre-deploy commands, that becomes the authoritative path again and
+the appended build-command step is a harmless replay.
+
+**Until the dashboard change is applied**, the guarded workflow
+`.github/workflows/provision-azaman-new-business-price.yml` (dispatch it on
+the branch that carries it) is the supported way to provision new overlay
+objects on the Azaman-New Neon database: it requires typing `Azaman-New` as
+an explicit confirmation, applies ONLY `install-business-price-overlay.js`,
+and finishes with a read-only verification of the full BusinessPrice
+contract. See also `ops/azaman-new-neon-bootstrap` for the initial bootstrap
+workflow (do not re-run it — it requires an EMPTY database).
+
 ## Production-required environment variables (fail-closed contracts)
 
 - `ENCRYPTION_KEY` - 32-byte key (64 hex chars or 44-char base64) for the
