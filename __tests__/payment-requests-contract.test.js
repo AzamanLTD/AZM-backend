@@ -53,20 +53,28 @@ run('payment-requests — contract', () => {
         process.env.NODE_ENV = 'test';
         process.env.JWT_SECRET = process.env.JWT_SECRET || 'test_secret_at_least_32_chars_long_xxxxx';
         process.env.PUBLIC_APP_URL = 'https://app.azaman.test';
+        // LINK share tokens are AEAD-wrapped; the contract proofs exercise
+        // the real wrap/unwrap path.
+        process.env.ENCRYPTION_KEY = process.env.ENCRYPTION_KEY
+            || '3f9a2c8e1d4b6a0f7e5c3d2b1a098877665544332211ffeeddccbbaa99887766';
         prisma = new PrismaClient();
         const { seedUser, seedFriendship } = require('./helpers/factories');
         const uniq = `${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
-        requester = await seedUser(prisma, { username: `prc_a_${uniq}`, email: `prc_a_${uniq}@test.com` });
-        recipient = await seedUser(prisma, { username: `prc_b_${uniq}`, email: `prc_b_${uniq}@test.com` });
-        outsider = await seedUser(prisma, { username: `prc_c_${uniq}`, email: `prc_c_${uniq}@test.com` });
+        requester = await seedUser(prisma, { username: `prc_a_${uniq}`, email: `prc_a_${uniq}@test.com`, azamanId: `AZM-PRC-${uniq}-a` });
+        recipient = await seedUser(prisma, { username: `prc_b_${uniq}`, email: `prc_b_${uniq}@test.com`, azamanId: `AZM-PRC-${uniq}-b` });
+        outsider = await seedUser(prisma, { username: `prc_c_${uniq}`, email: `prc_c_${uniq}@test.com`, azamanId: `AZM-PRC-${uniq}-c` });
         await seedFriendship(prisma, requester.id, recipient.id, 'ACCEPTED');
         app = require('../server');
     }, 60000);
 
     const cleanupRows = async () => {
         const ids = [requester.id, recipient.id, outsider.id];
+        // Strictly user-scoped (jest runs sibling suites against the same
+        // disposable DB in parallel — an unscoped sweep would delete other
+        // suites' in-flight claims mid-request). Endpoints use the §r42
+        // canonical mount patterns (trailing slash on the create mount).
         await prisma.financialOperation.deleteMany({
-            where: { endpoint: { in: ['POST /api/payment-requests', 'POST /api/payment-requests/:id/cancel', 'POST /api/payment-requests/:id/decline'] } },
+            where: { endpoint: { in: ['POST /api/payment-requests/', 'POST /api/payment-requests/:id/cancel', 'POST /api/payment-requests/:id/decline'] }, userId: { in: ids } },
         }).catch(() => {});
         await prisma.paymentRequest.deleteMany({
             where: { OR: [{ requesterId: { in: ids } }, { recipientId: { in: ids } }] },
@@ -206,6 +214,9 @@ run('payment-requests — contract', () => {
     test('C7: no token material, email, phone, azamanId or recipient identity leaks', async () => {
         const t = tokenFor(requester);
         const link = await create(t, { amount: '9.99', currency: 'GHS', requestMode: 'LINK' }, nextKey());
+        // The URL segment is the raw token's AEAD envelope (encu1.…), not a
+        // plaintext token — see services/crypto/shareToken.js.
+        expect(link.body.data.request.shareUrl).toMatch(/\/request\/encu1\./);
         const rawToken = link.body.data.request.shareUrl.split('/request/')[1];
         const direct = await create(t, { amount: '2.22', currency: 'GHS', requestMode: 'DIRECT', recipientUserId: String(recipient.id) }, nextKey());
 

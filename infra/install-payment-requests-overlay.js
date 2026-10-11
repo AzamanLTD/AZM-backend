@@ -53,13 +53,22 @@ const STATEMENTS = [
          ON DELETE CASCADE ON UPDATE CASCADE;
      END IF;
    END $$;`,
-  `CREATE INDEX IF NOT EXISTS "PaymentRequest_requesterId_status_createdAt_idx"
-     ON "PaymentRequest"("requesterId", "status", "createdAt");`,
-  `CREATE INDEX IF NOT EXISTS "PaymentRequest_recipientId_status_createdAt_idx"
-     ON "PaymentRequest"("recipientId", "status", "createdAt");`,
+  // Cursor-query indexes: the list query filters requesterId/recipientId and
+  // orders createdAt DESC, id DESC with the (createdAt, id) cursor predicate.
+  // Convergence: drop the pre-review (status, createdAt) variants if an
+  // environment already ran the earlier DDL (status is never list-filtered).
+  `DROP INDEX IF EXISTS "PaymentRequest_requesterId_status_createdAt_idx";`,
+  `DROP INDEX IF EXISTS "PaymentRequest_recipientId_status_createdAt_idx";`,
+  `CREATE INDEX IF NOT EXISTS "PaymentRequest_requesterId_createdAt_id_idx"
+     ON "PaymentRequest"("requesterId", "createdAt", "id");`,
+  `CREATE INDEX IF NOT EXISTS "PaymentRequest_recipientId_createdAt_id_idx"
+     ON "PaymentRequest"("recipientId", "createdAt", "id");`,
   `CREATE INDEX IF NOT EXISTS "PaymentRequest_expiresAt_idx"
      ON "PaymentRequest"("expiresAt");`,
-  // The ONLY stored token material is the sha256 hash; unique lookup key.
+  // The ONLY durable token material on this row is the sha256 hash of the
+  // RAW link token; unique lookup key. The raw token is never stored in
+  // plaintext anywhere (the share URL carries its AES-256-GCM envelope —
+  // see services/crypto/shareToken.js).
   `CREATE UNIQUE INDEX IF NOT EXISTS "PaymentRequest_tokenHash_key"
      ON "PaymentRequest"("tokenHash");`,
 ];

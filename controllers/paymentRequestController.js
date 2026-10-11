@@ -23,6 +23,23 @@
 //     per-user GHS settlement rail exists (user balance projection is USDC;
 //     GHS exists only as §P.5-D treasury liquidity evidence). Settlement is
 //     reported as a blocking dependency instead of being faked.
+//
+// LINK token persistence model (whole row, stated once here and enforced
+// in services/crypto/shareToken.js + paymentRequestService.js):
+//   • RAW token — memory only; never stored, never logged, never echoed.
+//   • PaymentRequest.tokenHash — sha256(raw) only, unique.
+//   • FinancialOperation.responseBody — the exact create wire bytes, whose
+//     shareUrl token segment is the raw token's AES-256-GCM envelope
+//     (ENCRYPTION_KEY, services/crypto/fieldCipher.js). Ciphertext at rest;
+//     the §r42 byte-identical replay re-emits it untouched. No unencrypted
+//     durable field ever holds the raw token.
+//
+// DIRECT recipient notification is post-commit best-effort: if the process
+// dies between the create transaction and the notification call, the
+// request is committed and the notification is silently lost. This is the
+// pre-existing pipeline guarantee (no transactional outbox exists yet);
+// durable delivery is proposed as separate outbox work, not silently
+// claimed here.
 // =============================================================================
 
 const logger = require('../src/config/logger');
@@ -31,9 +48,10 @@ const svc = require('../services/paymentRequestService');
 const {
     normalizeAmount,
     resolveExpiry,
-    mintLinkToken,
-    hashToken,
-    buildShareUrl,
+    mintLinkShare,
+    resolveLinkTokenHash,
+    isShareCryptoAvailable,
+    ShareCryptoUnavailableError,
     projectStatus,
     toListItem,
     toPublicDto,
@@ -134,16 +152,20 @@ exports.create = async (req, res) => {
         // Expiry: server-owned policy (documented default 7 days).
         const expiresAt = resolveExpiry();
 
-        // LINK: mint the high-entropy share token now; only its sha256 hash
-        // is stored. The share URL needs the validated PUBLIC_APP_URL origin
-        // — fail BEFORE any economics if it is unconfigured.
-        let token = null;
+        // LINK: mint the share material now. The RAW token stays in memory;
+        // only sha256(raw) is stored on the row, and the share URL carries
+        // the raw token as an AES-256-GCM envelope so the §r42 replay truth
+        // (FinancialOperation.responseBody, plaintext column) never holds a
+        // usable bearer token. Fails closed (503) without a usable
+        // ENCRYPTION_KEY — the route guard normally refuses BEFORE the
+        // claim; this is the belt-and-braces re-check. The validated
+        // PUBLIC_APP_URL origin is required BEFORE any economics.
         let tokenHash = null;
         let shareUrl = null;
         if (requestMode === 'LINK') {
-            token = mintLinkToken();
-            tokenHash = hashToken(token);
-            shareUrl = buildShareUrl(token);
+            const share = mintLinkShare(); // throws ShareCryptoUnavailableError
+            tokenHash = share.tokenHash;
+            shareUrl = share.shareUrl;
         }
 
         const created = await prisma.$transaction(async (tx) => {
@@ -236,6 +258,9 @@ exports.create = async (req, res) => {
         }
         if (err?.code === 'PUBLIC_APP_URL_UNCONFIGURED') {
             return fail(res, 503, err.code, err.message);
+        }
+        if (err instanceof ShareCryptoUnavailableError || err?.code === 'LINK_SHARE_CRYPTO_UNCONFIGURED') {
+            return fail(res, 503, 'LINK_SHARE_CRYPTO_UNCONFIGURED', err.message);
         }
         if (err?.code === 'IDEMPOTENCY_STATE_CONFLICT') {
             return fail(res, 409, err.code, err.message);
@@ -331,16 +356,35 @@ exports.list.openapi = {
 exports.publicDetail = async (req, res) => {
     const prisma = req.app.get('prisma');
     try {
-        const token = String(req.params.token || '');
-        if (!token || token.length > 256) {
+        // The path segment is the AEAD envelope of the raw token (not the
+        // raw token itself). Bound its length BEFORE any decryption work.
+        const urlToken = String(req.params.token || '');
+        if (!urlToken || urlToken.length > 512) {
             return fail(res, 404, 'PAYMENT_REQUEST_NOT_FOUND',
                 'This payment request does not exist.');
         }
 
-        // The token is looked up ONLY via its sha256 hash; the raw token is
-        // never stored, compared, logged or echoed.
+        // Unwrap (AEAD-verified) → sha256(raw) → lookup. A malformed or
+        // tampered envelope is indistinguishable from an unknown token
+        // (404, no oracle); a missing share key 503s (config failure, not
+        // "not found"). The raw token is never stored, logged or echoed.
+        let tokenHash;
+        try {
+            tokenHash = resolveLinkTokenHash(urlToken);
+        } catch (err) {
+            if (err instanceof ShareCryptoUnavailableError || err?.code === 'LINK_SHARE_CRYPTO_UNCONFIGURED') {
+                return fail(res, 503, 'LINK_SHARE_CRYPTO_UNCONFIGURED',
+                    'Link sharing is temporarily unavailable. Please try again later.');
+            }
+            throw err;
+        }
+        if (!tokenHash) {
+            return fail(res, 404, 'PAYMENT_REQUEST_NOT_FOUND',
+                'This payment request does not exist.');
+        }
+
         const row = await prisma.paymentRequest.findUnique({
-            where: { tokenHash: hashToken(token) },
+            where: { tokenHash },
             select: {
                 id: true, mode: true, status: true, amountExact: true,
                 currency: true, expiresAt: true, createdAt: true,

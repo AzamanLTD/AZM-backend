@@ -60,6 +60,9 @@ jobs:
       DATABASE_URL: postgres://postgres:postgres@localhost:5432/azm_test?schema=public
       TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/azm_test?schema=public
       JWT_SECRET: test_secret_exactly_32_characters_long
+      # Test-only AES key for fieldCipher/shareToken at-rest proofs
+      # (64 hex chars = 32 bytes; never a production value).
+      ENCRYPTION_KEY: 3f9a2c8e1d4b6a0f7e5c3d2b1a098877665544332211ffeeddccbbaa99887766
       NODE_ENV: test
 
     steps:

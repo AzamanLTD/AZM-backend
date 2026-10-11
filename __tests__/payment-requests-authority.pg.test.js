@@ -25,9 +25,12 @@
 //   PR6. Server-enforced expiry: an expired request cannot be cancelled or
 //        declined (409 PAYMENT_REQUEST_EXPIRED); the public link returns 410;
 //        lists project EXPIRED — never left to the UI.
-//   PR7. Token privacy: the raw LINK token appears in NO PaymentRequest
-//        column (only its sha256 hash is stored); a wrong token 404s; the
-//        share URL is minted from the validated PUBLIC_APP_URL origin only.
+//   PR7. Token privacy: the raw LINK token appears in NO unencrypted
+//        durable column — PaymentRequest stores only its sha256 hash, the
+//        persisted §r42 replay bytes hold only its AES-256-GCM envelope; a
+//        tampered token 404s; the share URL is minted from the validated
+//        PUBLIC_APP_URL origin only. (At-rest regression detail lives in
+//        payment-requests-link-at-rest.test.js.)
 //   PR8. Authorization isolation: a stranger can neither cancel nor decline;
 //        the requester cannot decline their own request; the recipient
 //        cannot cancel; LINK requests cannot be declined by anyone.
@@ -48,16 +51,24 @@ run('payment-requests — authority (PostgreSQL)', () => {
     let requester, recipient, stranger;
     const tokenFor = (user) => jwt.sign({ id: user.id }, process.env.JWT_SECRET);
 
+    // §r42 canonicalizes the mount pattern WITH a trailing slash — the
+    // stored endpoint string is exactly what the middleware persists.
     const EP = {
-        create: 'POST /api/payment-requests',
+        create: 'POST /api/payment-requests/',
         cancel: 'POST /api/payment-requests/:id/cancel',
         decline: 'POST /api/payment-requests/:id/decline',
     };
     const userFilter = () => ({ OR: [{ requesterId: { in: [requester.id, recipient.id, stranger.id] } }, { recipientId: { in: [requester.id, recipient.id, stranger.id] } }] });
-    // Sweeps BEFORE seeding can only clear claims (no ids yet); after
-    // seeding, both claims and rows.
+    // Sweeps are STRICTLY user-scoped: jest runs sibling suites against this
+    // same disposable DB in parallel worker processes, so an unscoped claim
+    // sweep would delete OTHER suites' in-flight claims mid-request (the
+    // in-tx CAS then fails as IDEMPOTENCY_STATE_CONFLICT, or a P2002 replay
+    // read finds the row gone). Before seeding there are no ids — the
+    // per-run usernames are unique, so nothing needs pre-seed sweeping.
     const sweep = () => Promise.all([
-        prisma.financialOperation.deleteMany({ where: { endpoint: { in: Object.values(EP) } } }).catch(() => {}),
+        requester ? prisma.financialOperation.deleteMany({
+            where: { endpoint: { in: Object.values(EP) }, userId: { in: [requester.id, recipient.id, stranger.id] } },
+        }).catch(() => {}) : Promise.resolve(),
         requester ? prisma.paymentRequest.deleteMany({ where: userFilter() }).catch(() => {}) : Promise.resolve(),
     ]);
 
@@ -67,15 +78,19 @@ run('payment-requests — authority (PostgreSQL)', () => {
         process.env.JWT_SECRET = process.env.JWT_SECRET || 'test_secret_at_least_32_chars_long_xxxxx';
         // Server-issued share URLs require a validated canonical origin.
         process.env.PUBLIC_APP_URL = 'https://app.azaman.test';
+        // LINK share tokens are AEAD-wrapped (services/crypto/shareToken.js);
+        // the authority proofs exercise the real wrap/unwrap path.
+        process.env.ENCRYPTION_KEY = process.env.ENCRYPTION_KEY
+            || '3f9a2c8e1d4b6a0f7e5c3d2b1a098877665544332211ffeeddccbbaa99887766';
         prisma = new PrismaClient();
         await sweep();
         const { seedUser, seedFriendship } = require('./helpers/factories');
         // Unique-per-run ids: the disposable test DB is shared across local
         // re-runs, and fixed usernames would collide with the previous run.
         const run = `${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
-        requester = await seedUser(prisma, { username: `prq_a_${run}`, email: `prq_a_${run}@test.com` });
-        recipient = await seedUser(prisma, { username: `prq_b_${run}`, email: `prq_b_${run}@test.com` });
-        stranger = await seedUser(prisma, { username: `prq_c_${run}`, email: `prq_c_${run}@test.com` });
+        requester = await seedUser(prisma, { username: `prq_a_${run}`, email: `prq_a_${run}@test.com`, azamanId: `AZM-PRQ-${run}-a` });
+        recipient = await seedUser(prisma, { username: `prq_b_${run}`, email: `prq_b_${run}@test.com`, azamanId: `AZM-PRQ-${run}-b` });
+        stranger = await seedUser(prisma, { username: `prq_c_${run}`, email: `prq_c_${run}@test.com`, azamanId: `AZM-PRQ-${run}-c` });
         await seedFriendship(prisma, requester.id, recipient.id, 'ACCEPTED');
         app = require('../server');
     }, 60000);
@@ -108,11 +123,21 @@ run('payment-requests — authority (PostgreSQL)', () => {
             postCreate(tokenFor(requester), body, key),
         ]);
         const resA = a.value; const resB = b.value;
+        // Under concurrency exactly one request EXECUTES. The loser is
+        // either refused (409 IN_PROGRESS — tight race) or REPLAYS the
+        // committed result (loose race: its claim insert lands after the
+        // winner's in-tx commit). Both interleavings are correct §r42
+        // behavior; what must NEVER happen is a second execution.
         const ok = [resA, resB].filter(r => r.statusCode === 201);
-        expect(ok.length).toBe(1);
         const refused = [resA, resB].filter(r => r.statusCode !== 201);
-        expect(refused.map(r => r.statusCode)).toEqual([409]);
-        expect(refused[0].body.code).toBe('IDEMPOTENCY_IN_PROGRESS');
+        if (ok.length === 2) {
+            expect(resA.text).toBe(resB.text); // byte-identical committed replay
+            expect(refused).toHaveLength(0);
+        } else {
+            expect(ok.length).toBe(1);
+            expect(refused.map(r => r.statusCode)).toEqual([409]);
+            expect(refused[0].body.code).toBe('IDEMPOTENCY_IN_PROGRESS');
+        }
 
         const rows = await prisma.paymentRequest.findMany({ where: { requesterId: requester.id } });
         expect(rows).toHaveLength(1);
@@ -236,43 +261,65 @@ run('payment-requests — authority (PostgreSQL)', () => {
 
         // LINK variant: the public endpoint must be dead for expired links.
         const link = await postCreate(tokenFor(requester), { amount: '3.00', currency: 'GHS', requestMode: 'LINK' }, 'pr-auth-exp-2');
-        const token = link.body.data.request.shareUrl.split('/request/')[1];
+        // The URL segment is the raw token's AEAD envelope — unwrap to the
+        // raw token, then hash it exactly as the server did at creation.
+        const urlToken = link.body.data.request.shareUrl.split('/request/')[1];
+        const rawToken = require('../services/crypto/shareToken').unwrapShareToken(urlToken);
+        expect(rawToken).toBeTruthy();
         await prisma.paymentRequest.update({
-            where: { tokenHash: require('crypto').createHash('sha256').update(token, 'utf8').digest('hex') },
+            where: { tokenHash: require('crypto').createHash('sha256').update(rawToken, 'utf8').digest('hex') },
             data: { expiresAt: new Date(Date.now() - 1000) },
         });
-        const pub = await request(app).get(`/api/payment-requests/public/${token}`);
+        const pub = await request(app).get(`/api/payment-requests/public/${urlToken}`);
         expect(pub.status).toBe(410);
         expect(pub.body.code).toBe('PAYMENT_REQUEST_EXPIRED');
     });
 
     // ── PR7: token privacy + validated-origin share URL ─────────────────────
-    test('PR7: raw token stored nowhere; only its sha256 hash; wrong token 404s; canonical origin only', async () => {
+    test('PR7: raw token stored nowhere unencrypted; sha256-only on the row; tampered envelope 404s; canonical origin only', async () => {
         const link = await postCreate(tokenFor(requester), { amount: '12.50', currency: 'GHS', requestMode: 'LINK' }, 'pr-auth-token');
         expect(link.status).toBe(201);
         const shareUrl = link.body.data.request.shareUrl;
         expect(shareUrl.startsWith('https://app.azaman.test/request/')).toBe(true);
 
-        const token = shareUrl.split('/request/')[1];
-        expect(token.length).toBeGreaterThanOrEqual(32);
+        // The URL segment is the raw token's AEAD envelope (encu1.…), not the
+        // raw token. Unwrap it with the SAME key the server used to prove the
+        // model end-to-end, then derive what the server must have stored.
+        const urlToken = shareUrl.split('/request/')[1];
+        expect(urlToken.startsWith('encu1.')).toBe(true);
+        const { unwrapShareToken } = require('../services/crypto/shareToken');
+        const rawToken = unwrapShareToken(urlToken);
+        expect(rawToken).toBeTruthy();
+        const { createHash } = require('crypto');
+        const hash = createHash('sha256').update(rawToken, 'utf8').digest('hex');
 
-        // Prove NO PaymentRequest column contains the raw token.
+        // Prove NO PaymentRequest column contains the raw token or the
+        // envelope's decryptable secret; only the sha256 hash is present.
         const rows = await prisma.$queryRaw`SELECT * FROM "PaymentRequest" WHERE "requesterId" = ${requester.id} AND "mode" = 'LINK'`;
         expect(rows).toHaveLength(1);
         for (const [col, value] of Object.entries(rows[0])) {
             if (typeof value === 'string') {
-                expect(value).not.toContain(token);
+                expect(value).not.toContain(rawToken);
             }
         }
-        const hash = require('crypto').createHash('sha256').update(token, 'utf8').digest('hex');
         expect(rows[0].tokenHash).toBe(hash);
-        expect(rows[0].tokenHash).not.toBe(token);
+        expect(rows[0].tokenHash).not.toBe(rawToken);
 
-        // Correct token resolves; wrong token does not.
-        const ok = await request(app).get(`/api/payment-requests/public/${token}`);
+        // The persisted §r42 replay bytes hold the envelope, never the raw
+        // token (full at-rest regression: link-at-rest suite).
+        const claim = await prisma.financialOperation.findFirst({
+            where: { endpoint: EP.create, key: 'pr-auth-token' },
+        });
+        expect(claim).toBeTruthy();
+        expect(claim.responseBody).not.toContain(rawToken);
+
+        // Correct envelope resolves; a tampered envelope fails AEAD auth and
+        // is indistinguishable from an unknown token.
+        const ok = await request(app).get(`/api/payment-requests/public/${urlToken}`);
         expect(ok.status).toBe(200);
         expect(ok.body.data.request.amount).toBe('12.50');
-        const wrong = await request(app).get(`/api/payment-requests/public/${token.slice(0, -1)}X`);
+        const tampered = `${urlToken.slice(0, -2)}XX`;
+        const wrong = await request(app).get(`/api/payment-requests/public/${tampered}`);
         expect(wrong.status).toBe(404);
         expect(wrong.body.code).toBe('PAYMENT_REQUEST_NOT_FOUND');
     });

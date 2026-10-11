@@ -6086,7 +6086,7 @@ model PaymentRequest {
   status      String    @default("PENDING") // PENDING | CANCELLED | DECLINED (EXPIRED is projected from expiresAt)
   amountExact String // canonical exact decimal (2dp) GHS string - immutable
   currency    String    @default("GHS") // immutable at creation
-  tokenHash   String?   @unique // sha256(link token), LINK only - the raw token is NEVER stored
+  tokenHash   String?   @unique // sha256(RAW link token), LINK only - the raw token is NEVER stored in plaintext: the share URL carries its AES-256-GCM envelope (services/crypto/shareToken.js)
   expiresAt   DateTime
   resolvedAt  DateTime?
   createdAt   DateTime  @default(now())
@@ -6095,8 +6095,11 @@ model PaymentRequest {
   requester User  @relation("PaymentRequestRequester", fields: [requesterId], references: [id], onDelete: Cascade)
   recipient User? @relation("PaymentRequestRecipient", fields: [recipientId], references: [id], onDelete: Cascade)
 
-  @@index([requesterId, status, createdAt])
-  @@index([recipientId, status, createdAt])
+  // Cursor-query indexes: the list query filters requesterId/recipientId and
+  // orders createdAt DESC, id DESC with the (createdAt, id) cursor predicate —
+  // status is never filtered in the list, so it does not belong in the index.
+  @@index([requesterId, createdAt, id])
+  @@index([recipientId, createdAt, id])
   @@index([expiresAt])
 }
 

@@ -40,13 +40,15 @@ ALTER TABLE "PaymentRequest"
     ADD CONSTRAINT "PaymentRequest_recipientId_fkey"
     FOREIGN KEY ("recipientId") REFERENCES "User"("id") ON DELETE CASCADE ON UPDATE CASCADE;
 
--- Outgoing list (requester's own requests, status filter, newest first).
-CREATE INDEX "PaymentRequest_requesterId_status_createdAt_idx"
-    ON "PaymentRequest"("requesterId", "status", "createdAt");
+-- Outgoing list: the cursor query filters requesterId and orders
+-- createdAt DESC, id DESC with the (createdAt, id) cursor predicate —
+-- status is never filtered in the list, so it is not part of the index.
+CREATE INDEX "PaymentRequest_requesterId_createdAt_id_idx"
+    ON "PaymentRequest"("requesterId", "createdAt", "id");
 
 -- Incoming list (requests addressed to the authenticated user).
-CREATE INDEX "PaymentRequest_recipientId_status_createdAt_idx"
-    ON "PaymentRequest"("recipientId", "status", "createdAt");
+CREATE INDEX "PaymentRequest_recipientId_createdAt_id_idx"
+    ON "PaymentRequest"("recipientId", "createdAt", "id");
 
 -- Expiry sweep/audit target: EXPIRED is a server-projected terminal state.
 CREATE INDEX "PaymentRequest_expiresAt_idx"

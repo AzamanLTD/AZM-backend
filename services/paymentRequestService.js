@@ -13,6 +13,12 @@
 
 const crypto = require('crypto');
 const { resolvePublicAppOrigin } = require('../src/config/publicAppUrl');
+const {
+    wrapShareToken,
+    unwrapShareToken,
+    isShareCryptoAvailable,
+    ShareCryptoUnavailableError,
+} = require('./crypto/shareToken');
 
 // ── Amounts (exact GHS decimals) ─────────────────────────────────────────────
 
@@ -97,10 +103,21 @@ function resolveExpiry(now = new Date()) {
 }
 
 // ── LINK share tokens ────────────────────────────────────────────────────────
-
-// 32 random bytes, base64url: 256 bits of CSPRNG entropy (crypto.randomBytes).
-// Only the sha256 hash is stored (PaymentRequest.tokenHash, unique); the raw
-// token exists in the create response/share URL and nowhere else.
+//
+// WHOLE-ROW PERSISTENCE MODEL (must stay accurate everywhere it is stated):
+//   • RAW token: 32 CSPRNG bytes (base64url) — MEMORY ONLY, never stored,
+//     never logged, never echoed.
+//   • PaymentRequest.tokenHash: ONLY sha256(raw token), unique — the sole
+//     durable form of the token, and it is a one-way hash.
+//   • The share URL carries the raw token as an AES-256-GCM envelope
+//     (services/crypto/shareToken.js, ENCRYPTION_KEY via fieldCipher), so
+//     the §r42 replay truth (FinancialOperation.responseBody, a permanent
+//     plaintext column) holds ciphertext, never a usable bearer token.
+//     No unencrypted durable field anywhere holds the raw token.
+//   • The public route unwraps (AEAD-verified) and resolves by sha256(raw);
+//     tampered envelopes are indistinguishable from unknown tokens (404).
+//   • Fail-closed in EVERY environment: no usable ENCRYPTION_KEY → LINK
+//     create and public resolution refuse with 503, nothing persisted.
 function mintLinkToken() {
     return crypto.randomBytes(32).toString('base64url');
 }
@@ -110,14 +127,43 @@ function hashToken(token) {
 }
 
 /** Build the canonical server-issued share URL. Fails honestly if unset. */
-function buildShareUrl(token) {
+function buildShareUrl(urlToken) {
     const origin = resolvePublicAppOrigin();
     if (!origin.ok) {
         const err = new Error(origin.message);
         err.code = 'PUBLIC_APP_URL_UNCONFIGURED';
         throw err;
     }
-    return `${origin.origin}/request/${token}`;
+    return `${origin.origin}/request/${urlToken}`;
+}
+
+/**
+ * Mint a LINK share: raw token (memory only), its sha256 hash (the only
+ * durable token form), and the canonical share URL whose token segment is
+ * the AEAD envelope of the raw token (ciphertext safe to persist in the
+ * idempotency replay bytes). Throws ShareCryptoUnavailableError when the
+ * share-token key is unusable — the caller must fail closed (503).
+ */
+function mintLinkShare() {
+    const raw = mintLinkToken();
+    const urlToken = wrapShareToken(raw); // throws ShareCryptoUnavailableError
+    return {
+        tokenHash: hashToken(raw),
+        urlToken,
+        shareUrl: buildShareUrl(urlToken),
+    };
+}
+
+/**
+ * Resolve the share-URL token segment (an AEAD envelope) to the sha256 hash
+ * used for lookup. Returns null for malformed/tampered/unknown envelopes
+ * (caller 404s). Throws ShareCryptoUnavailableError when the key is
+ * unusable (caller 503s — a config failure is never a "not found").
+ */
+function resolveLinkTokenHash(urlToken) {
+    const raw = unwrapShareToken(urlToken);
+    if (!raw) return null;
+    return hashToken(raw);
 }
 
 // ── Status projection ─────────────────────────────────────────────────────────
@@ -160,10 +206,14 @@ function personDto(user) {
 
 /**
  * List DTO — only what the inbox/outbox UI needs. Privacy rules:
- *   • never tokenHash or any token material;
- *   • the canonical share URL is exposed ONLY to the requester (an
- *     outgoing row), because the requester minted it at creation — an
- *     incoming viewer never receives link material they could forward.
+ *   • never tokenHash or any token material (raw or envelope);
+ *   • the canonical share URL is NEVER in list responses, for anyone: the
+ *     raw token is not stored anywhere (only its sha256 hash and its AEAD
+ *     envelope inside the one-time create response), so the server cannot
+ *     rebuild it. Product contract: the share URL is delivered ONCE, at
+ *     creation; a lost link is recovered by cancelling and re-creating.
+ *     (Documented in the PR body — do not "fix" this in the UI by
+ *     reintroducing token persistence.)
  */
 function toListItem(row, { viewerIsRequester }) {
     const dto = {
@@ -241,6 +291,10 @@ module.exports = {
     mintLinkToken,
     hashToken,
     buildShareUrl,
+    mintLinkShare,
+    resolveLinkTokenHash,
+    isShareCryptoAvailable,
+    ShareCryptoUnavailableError,
     projectStatus,
     toListItem,
     toPublicDto,
