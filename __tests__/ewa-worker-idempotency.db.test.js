@@ -330,7 +330,11 @@ describeOrSkip('EWA worker request identity (real Postgres)', () => {
             .post('/api/business-os/employees/my-ewa-request')
             .set('Authorization', tokenFor(world.employeeUser.id))
             .send({ amount: 25, clientRequestId: k });
-        expect(res2.status).toBe(400);
+        // §Issue #330 review Finding 5: typed idempotency conflicts are
+        // client-visible contract states — HTTP 409 with the exact code
+        // (previously a generic 400). Fail-closed semantics unchanged.
+        expect(res2.status).toBe(409);
+        expect(res2.body.code).toBe('EWA_IDEMPOTENCY_CONFLICT');
         expect(res2.body.message).toMatch(/different parameters/i);
         expect(await balances(world)).toEqual(afterFirst);
         expect(await movements(world)).toEqual(mvFirst);

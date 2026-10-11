@@ -86,6 +86,23 @@ function getServices(req) {
 }
 
 // Helper: async error wrapper — uses existing backend response envelope
+//
+// §Issue #330 review Finding 5: typed EWA reconciliation conflicts are
+// client-visible CONTRACT states, not generic 400s. The service layer
+// attaches a stable `code` (settlementError) to each; these MUST survive
+// the API boundary so portal/worker clients can key reconciliation logic
+// off the code instead of matching message strings. They are states of
+// the request identity conflicting with the durable intent lifecycle, so
+// they map to 409 Conflict with a stable envelope:
+//   { success: false, code: <exact typed code>, message: <service message> }
+// Unrelated error semantics (the reservation P2002 special case, kiosk
+// statusCode attachments, and the conservative 400 default) are preserved.
+const EWA_TYPED_CONFLICT_CODES = new Set([
+    'EWA_UNRESOLVED_INTENT_CONFLICT',
+    'EWA_IDEMPOTENCY_CONFLICT',
+    'EWA_INTENT_RECONCILIATION_REQUIRED',
+]);
+
 function wrap(handler) {
     return async (req, res) => {
         try {
@@ -94,6 +111,9 @@ function wrap(handler) {
             logger.error({ err: err }, '[BusinessOS]');
             if (err.code === 'P2002' && err.meta?.target === null) {
                 return res.status(409).json({ success: false, message: 'The requested reservation or room interval is no longer available.' });
+            }
+            if (EWA_TYPED_CONFLICT_CODES.has(err.code)) {
+                return res.status(409).json({ success: false, code: err.code, message: err.message });
             }
             // Handlers may attach a specific statusCode (e.g. kiosk 404/409);
             // the default remains a conservative 400.
@@ -256,6 +276,24 @@ router.post('/employees/my-ewa-request', wrap(async (req, res) => {
     }
     const result = await svc.employeeService.requestEWA(employee.id, req.body.amount, idempotencyKey);
     res.json({ success: true, ...result });
+}));
+
+// GET /api/business-os/employees/my-ewa-intents — worker self-service
+// withdrawal intent recovery (issue #330). Same contract as the operator
+// route above, scoped to the authenticated employee: the caller can only
+// ever see their own intents. Required because the worker path also carries
+// a mandatory clientRequestId — a lost device loses that key, and this
+// endpoint is how the SAME identity is recovered instead of minted anew.
+router.get('/employees/my-ewa-intents', wrap(async (req, res) => {
+    if (!req.user?.id) return res.status(401).json({ success: false, message: 'Authentication required.' });
+    const prisma = getPrisma(req);
+    const employee = await prisma.businessEmployee.findFirst({
+        where: { userId: req.user.id, status: 'ACTIVE' },
+    });
+    if (!employee) throw new Error('You are not an active employee.');
+    const svc = getServices(req);
+    const intents = await svc.ewaService.getWithdrawalIntents(employee.id, { scope: 'self' });
+    res.json({ success: true, intents });
 }));
 
 // GET /api/business-os/employees/my-feedback — get feedback received by the current user
@@ -688,6 +726,22 @@ router.get('/ewa/history/:employeeId', requirePermission('ewa.manage'), wrap(asy
     const svc = getServices(req);
     const history = await svc.ewaService.getEwaHistory(req.params.employeeId);
     res.json({ success: true, history });
+}));
+
+// GET /api/business-os/ewa/intents/:employeeId — cross-device withdrawal
+// intent recovery (issue #330). The server now owns a durable intent
+// lifecycle: every keyed attempt is registered BEFORE the economics, so an
+// authorized operator on ANOTHER device can discover an unresolved attempt,
+// recover its original idempotency key and exact amount, and retry the SAME
+// identity (the backend replays the committed withdrawal and cannot pay
+// twice). Strictly scoped to the caller's resolved business context — a
+// foreign or absent context returns an empty list, never a disclosure.
+// Unresolved (PENDING) intents sort first; the response carries status,
+// amount, destination, committedTxHash and refusalMessage per intent.
+router.get('/ewa/intents/:employeeId', requirePermission('ewa.manage'), wrap(async (req, res) => {
+    const svc = getServices(req);
+    const intents = await svc.ewaService.getWithdrawalIntents(req.params.employeeId);
+    res.json({ success: true, intents });
 }));
 
 router.get('/ewa/summary', requirePermission('ewa.manage'), wrap(async (req, res) => {
