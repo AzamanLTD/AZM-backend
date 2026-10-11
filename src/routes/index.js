@@ -70,6 +70,12 @@ function mountRoutes(app, {
     app.use('/api/receipts', generalLimiter, require('../../routes/receiptRoutes'));
     app.use('/api/tickets', generalLimiter, require('../../routes/ticketRoutes'));
     app.use('/api/escrow', financialLimiter, require('../../routes/escrowRoutes'));
+    // Standalone payment requests (Receive/Request UX). Mutations run under
+    // the r42 idempotency authority (wired in-tx claim commit); the public
+    // link endpoint is unauthenticated by contract. generalLimiter (not
+    // financialLimiter) because creation moves no money — the requests that
+    // DO move money (the P2P pay side of this flow) do not exist yet.
+    app.use('/api/payment-requests', generalLimiter, require('../../routes/paymentRequestRoutes'));
     app.use('/api/business', generalLimiter, require('../../routes/businessRoutes'));
     app.use('/api/reservations', generalLimiter, require('../../routes/reservationRoutes'));
     app.use('/api/follows', generalLimiter, require('../../routes/followRoutes'));
