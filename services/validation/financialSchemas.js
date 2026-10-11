@@ -99,3 +99,19 @@ exports.initiateMoolreFiatDepositSchema = z.object({
                }),
   phoneNumber: z.string().min(9, { message: 'A valid phone number is required.' }),
 }).passthrough();
+
+// ── Standalone payment requests (POST /api/payment-requests) ──────────────────
+// Consumed by controllers/paymentRequestController.create. The amount is an
+// EXACT 2-dp GHS decimal STRING ("12.50") — a JSON number is a float and is
+// refused by the regex/message here, not silently coerced: money values are
+// compared by their exact string form (§r42 exact-decimal discipline).
+// recipientUserId is a User account id (string or number accepted on the
+// wire; the controller verifies it is NOT a friendship id by requiring an
+// integer that matches an existing user).
+exports.createPaymentRequestSchema = z.object({
+  amount:          z.string({ error: 'amount must be an exact decimal string, e.g. "12.50".' })
+                    .regex(/^\d{1,9}(\.\d{1,2})?$/, 'amount must be a positive number with at most two fractional digits, e.g. "12.50".'),
+  currency:        z.literal('GHS', { errorMap: () => ({ message: 'currency must be "GHS".' }) }),
+  requestMode:     z.enum(['DIRECT', 'LINK']),
+  recipientUserId: z.union([z.string().min(1).max(64), z.number()]).optional(),
+}).passthrough();
