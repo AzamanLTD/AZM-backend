@@ -1,0 +1,294 @@
+name: AZM fresh Neon database bootstrap
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: Type Azaman-New exactly to confirm the intended target
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: azm-azaman-new-neon-bootstrap
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    name: Confirm Azaman-New is empty
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Require explicit project confirmation
+        env:
+          CONFIRMATION: ${{ inputs.confirmation }}
+        run: |
+          if [ "$CONFIRMATION" != "Azaman-New" ]; then
+            echo "::error::Confirmation did not match Azaman-New. No database connection was attempted."
+            exit 1
+          fi
+
+      - name: Checkout backend
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Read-only target preflight
+        env:
+          DATABASE_URL: ${{ secrets.AZM_NEW_DATABASE_URL }}
+        run: |
+          node <<'NODE'
+          const { Client } = require('pg');
+
+          (async () => {
+            let client;
+            try {
+              const raw = process.env.DATABASE_URL;
+              if (!raw) throw Object.assign(new Error('missing secret'), { code: 'MISSING_SECRET' });
+
+              const url = new URL(raw);
+              if (!['postgres:', 'postgresql:'].includes(url.protocol)) {
+                throw Object.assign(new Error('invalid protocol'), { code: 'INVALID_URL' });
+              }
+              const host = url.hostname.toLowerCase();
+              if (!host.endsWith('.neon.tech') || host.includes('-pooler')) {
+                throw Object.assign(new Error('must use direct Neon endpoint'), { code: 'NOT_DIRECT_NEON' });
+              }
+
+              client = new Client({ connectionString: raw, connectionTimeoutMillis: 10000 });
+              await client.connect();
+              const { rows } = await client.query(`
+                SELECT current_database() AS database_name,
+                       current_schema() AS schema_name,
+                       (SELECT COUNT(*)::int
+                          FROM information_schema.tables
+                         WHERE table_schema = 'public'
+                           AND table_type = 'BASE TABLE') AS public_table_count
+              `);
+              const row = rows[0];
+              const count = Number(row.public_table_count);
+              console.log(`Read-only target check: database=${row.database_name}, schema=${row.schema_name}, public tables=${count}`);
+
+              if (row.schema_name !== 'public') {
+                throw Object.assign(new Error('unexpected schema'), { code: 'UNEXPECTED_SCHEMA' });
+              }
+              if (count !== 0) {
+                throw Object.assign(new Error('database is not empty'), { code: 'DATABASE_NOT_EMPTY' });
+              }
+              console.log('Preflight passed. No schema or data writes were performed by this job.');
+            } catch (err) {
+              console.error(`Preflight failed (${err.code || 'connection/precondition error'}). Connection details are withheld; no schema initialization was started.`);
+              process.exitCode = 1;
+            } finally {
+              if (client) await client.end().catch(() => {});
+            }
+          })();
+          NODE
+
+  apply_prisma_schema:
+    name: Create Prisma base schema
+    needs: preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout backend
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Validate Prisma schema
+        env:
+          DATABASE_URL: postgresql://bootstrap:bootstrap@localhost:5432/azm_bootstrap?schema=public
+        run: npx prisma validate
+
+      - name: Push base schema without data-loss override
+        env:
+          DATABASE_URL: ${{ secrets.AZM_NEW_DATABASE_URL }}
+        run: npx prisma db push
+
+      - name: Generate Prisma Client
+        env:
+          DATABASE_URL: postgresql://bootstrap:bootstrap@localhost:5432/azm_bootstrap?schema=public
+        run: npx prisma generate
+
+  apply_overlays:
+    name: Apply all backend schema overlays
+    needs: apply_prisma_schema
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout backend
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Generate Prisma Client for overlay installers
+        env:
+          DATABASE_URL: postgresql://bootstrap:bootstrap@localhost:5432/azm_bootstrap?schema=public
+        run: npx prisma generate
+
+      - name: Apply repository release chain
+        env:
+          DATABASE_URL: ${{ secrets.AZM_NEW_DATABASE_URL }}
+        run: npm run release
+
+      - name: Apply remaining CI and boot-time overlays
+        env:
+          DATABASE_URL: ${{ secrets.AZM_NEW_DATABASE_URL }}
+        run: |
+          node infra/install-wallet-address-overlay.js
+          node infra/install-custody-execution-overlay.js
+          node infra/install-custody-accounting-overlay.js
+          node infra/install-retail-checkout-integrity.js
+
+      - name: Audit E2EE structural invariants
+        run: node infra/audit-e2ee-invariants.js
+
+  verify_schema:
+    name: Read-only schema verification
+    needs: apply_overlays
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout backend
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Verify required tables, columns, indexes, and triggers
+        env:
+          DATABASE_URL: ${{ secrets.AZM_NEW_DATABASE_URL }}
+        run: |
+          node <<'NODE'
+          const { Client } = require('pg');
+
+          const requiredTables = [
+            'User', 'BusinessProfile', 'InventoryItem', 'BusinessOrder', 'BusinessOrderItem',
+            'TransactionHistory', 'Withdrawal', 'GlobalSettings', 'SmartRouteRun',
+            'FinancialOperation', 'PaymentRequest', 'ProviderSettlementAttempt',
+            'ReconciliationException', 'WalletAddress', 'CustodyExecution',
+            'InventoryRestockOperation', 'InventoryRestockIntent', 'Reservation',
+            'HotelRoom', 'HotelRoomBlock',
+          ];
+          const requiredColumns = [
+            ['Withdrawal', 'transactionHistoryId'],
+            ['SmartRouteRun', 'action'],
+            ['GlobalSettings', 'lastExternalSync'],
+            ['InventoryRestockOperation', 'fingerprintVersion'],
+            ['InventoryRestockIntent', 'status'],
+            ['PaymentRequest', 'tokenHash'],
+          ];
+          const requiredIndexes = [
+            'FinancialOperation_userId_endpoint_key_key',
+            'PaymentRequest_tokenHash_key',
+            'PaymentRequest_requesterId_createdAt_id_idx',
+            'Withdrawal_transactionHistoryId_key',
+            'ProviderSettlementAttempt_provider_providerReference_key',
+            'InventoryRestockOperation_businessProfileId_idempotencyKey_key',
+            'InventoryRestockIntent_businessProfileId_status_idx',
+          ];
+          const requiredTriggers = [
+            'azm_reservation_capacity_trigger',
+            'azaman_retail_reserve_stock',
+          ];
+
+          (async () => {
+            let client;
+            try {
+              const raw = process.env.DATABASE_URL;
+              if (!raw) throw Object.assign(new Error('missing secret'), { code: 'MISSING_SECRET' });
+              const url = new URL(raw);
+              const host = url.hostname.toLowerCase();
+              if (!host.endsWith('.neon.tech') || host.includes('-pooler')) {
+                throw Object.assign(new Error('must use direct Neon endpoint'), { code: 'NOT_DIRECT_NEON' });
+              }
+
+              client = new Client({ connectionString: raw, connectionTimeoutMillis: 10000 });
+              await client.connect();
+
+              const tableRows = await client.query(`
+                SELECT table_name
+                  FROM information_schema.tables
+                 WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
+              `);
+              const tables = new Set(tableRows.rows.map(r => r.table_name));
+              const missingTables = requiredTables.filter(name => !tables.has(name));
+
+              const missingColumns = [];
+              for (const [table, column] of requiredColumns) {
+                const result = await client.query(
+                  'SELECT 1 FROM information_schema.columns WHERE table_schema = $1 AND table_name = $2 AND column_name = $3',
+                  ['public', table, column],
+                );
+                if (result.rowCount !== 1) missingColumns.push(`${table}.${column}`);
+              }
+
+              const indexRows = await client.query(
+                'SELECT indexname FROM pg_indexes WHERE schemaname = $1 AND indexname = ANY($2::text[])',
+                ['public', requiredIndexes],
+              );
+              const foundIndexes = new Set(indexRows.rows.map(r => r.indexname));
+              const missingIndexes = requiredIndexes.filter(name => !foundIndexes.has(name));
+
+              const triggerRows = await client.query(`
+                SELECT t.tgname AS name
+                  FROM pg_trigger t
+                  JOIN pg_class c ON c.oid = t.tgrelid
+                  JOIN pg_namespace n ON n.oid = c.relnamespace
+                 WHERE n.nspname = 'public'
+                   AND NOT t.tgisinternal
+                   AND t.tgname = ANY($1::text[])
+              `, [requiredTriggers]);
+              const foundTriggers = new Set(triggerRows.rows.map(r => r.name));
+              const missingTriggers = requiredTriggers.filter(name => !foundTriggers.has(name));
+
+              console.log(`Schema verification: ${tables.size} public tables; required tables ${requiredTables.length - missingTables.length}/${requiredTables.length}; columns ${requiredColumns.length - missingColumns.length}/${requiredColumns.length}; indexes ${requiredIndexes.length - missingIndexes.length}/${requiredIndexes.length}; triggers ${requiredTriggers.length - missingTriggers.length}/${requiredTriggers.length}.`);
+
+              const failed = missingTables.length || missingColumns.length || missingIndexes.length || missingTriggers.length;
+              if (failed) {
+                if (missingTables.length) console.error('Missing tables: ' + missingTables.join(', '));
+                if (missingColumns.length) console.error('Missing columns: ' + missingColumns.join(', '));
+                if (missingIndexes.length) console.error('Missing indexes: ' + missingIndexes.join(', '));
+                if (missingTriggers.length) console.error('Missing triggers: ' + missingTriggers.join(', '));
+                process.exitCode = 1;
+              } else {
+                console.log('PASS: required AZM schema objects are present. This step performed read-only checks only.');
+              }
+            } catch (err) {
+              console.error(`Schema verification failed (${err.code || 'connection/verification error'}). Connection details are withheld.`);
+              process.exitCode = 1;
+            } finally {
+              if (client) await client.end().catch(() => {});
+            }
+          })();
+          NODE

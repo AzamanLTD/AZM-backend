@@ -66,11 +66,13 @@ class DepositReconciliationWorker {
                 where: {
                     type: 'DEPOSIT_FIAT',
                     status: 'PENDING',
-                    updatedAt: { lt: cutoff },
+                    // TransactionHistory has createdAt but no updatedAt in schema.prisma.
+                    // Age the pending deposit from creation time so Prisma never queries a nonexistent field.
+                    createdAt: { lt: cutoff },
                     metadata: { path: ['selectedRoute'], equals: 'MOOLRE_MOMO_COLLECTION' },
                 },
                 select: { id: true, txHash: true },
-                orderBy: { updatedAt: 'asc' },
+                orderBy: { createdAt: 'asc' },
                 take: MAX_BATCH_SIZE,
             });
             for (const row of stale) {
