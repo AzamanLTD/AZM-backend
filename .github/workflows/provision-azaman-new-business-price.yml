@@ -12,6 +12,11 @@ name: AZM Azaman-New BusinessPrice overlay provision
 #
 # Safety contract (mirrors .github/workflows/bootstrap-azaman-new.yml):
 #   - Requires a human to type "Azaman-New" in the confirmation input.
+#   - ALL THREE jobs fail closed on target mismatch: the direct Neon hostname
+#     must be EXACTLY ep-floral-hat-b9qwuuq0.c-7.eu-central-1.aws.neon.tech
+#     (no pooler, no other Neon project) and current_database() must be
+#     exactly neondb. Preflight AND apply AND post-install verify assert both
+#     before doing anything else; a mismatch aborts before any write.
 #   - Preflight is READ-ONLY: validates the direct Neon endpoint, confirms the
 #     database is initialized (BusinessProduct/BusinessProfile/BusinessLocation
 #     present), reports the current BusinessPrice state, and refuses to run
@@ -82,9 +87,15 @@ jobs:
               if (!['postgres:', 'postgresql:'].includes(url.protocol)) {
                 throw Object.assign(new Error('invalid protocol'), { code: 'INVALID_URL' });
               }
+              const EXPECTED_HOST = 'ep-floral-hat-b9qwuuq0.c-7.eu-central-1.aws.neon.tech';
               const host = url.hostname.toLowerCase();
               if (!host.endsWith('.neon.tech') || host.includes('-pooler')) {
                 throw Object.assign(new Error('must use direct Neon endpoint'), { code: 'NOT_DIRECT_NEON' });
+              }
+              if (host !== EXPECTED_HOST) {
+                // Fail closed: any other Neon project/endpoint is a wrong target.
+                console.error(`Target hostname mismatch: expected ${EXPECTED_HOST}, got ${host}. Aborting before any query.`);
+                throw Object.assign(new Error('not the Azaman-New direct endpoint'), { code: 'WRONG_TARGET_HOST' });
               }
 
               client = new Client({ connectionString: raw, connectionTimeoutMillis: 10000 });
@@ -100,6 +111,10 @@ jobs:
               const row = rows[0];
               console.log(`Read-only target check: database=${row.database_name}, schema=${row.schema_name}, public tables=${row.public_table_count}`);
 
+              if (row.database_name !== 'neondb') {
+                console.error(`Target database mismatch: expected neondb, got ${row.database_name}. Aborting.`);
+                throw Object.assign(new Error('not the neondb database'), { code: 'WRONG_TARGET_DATABASE' });
+              }
               if (row.schema_name !== 'public') {
                 throw Object.assign(new Error('unexpected schema'), { code: 'UNEXPECTED_SCHEMA' });
               }
@@ -157,6 +172,48 @@ jobs:
         env:
           DATABASE_URL: postgresql://provision:provision@localhost:5432/azm_provision?schema=public
         run: npx prisma generate
+
+      - name: Fail-closed target guard before apply (read-only)
+        env:
+          DATABASE_URL: ${{ secrets.AZM_NEW_DATABASE_URL }}
+        run: |
+          node <<'NODE'
+          const { Client } = require('pg');
+
+          (async () => {
+            const EXPECTED_HOST = 'ep-floral-hat-b9qwuuq0.c-7.eu-central-1.aws.neon.tech';
+            let client;
+            try {
+              const raw = process.env.DATABASE_URL;
+              if (!raw) throw Object.assign(new Error('missing secret'), { code: 'MISSING_SECRET' });
+              const url = new URL(raw);
+              if (!['postgres:', 'postgresql:'].includes(url.protocol)) {
+                throw Object.assign(new Error('invalid protocol'), { code: 'INVALID_URL' });
+              }
+              const host = url.hostname.toLowerCase();
+              if (!host.endsWith('.neon.tech') || host.includes('-pooler')) {
+                throw Object.assign(new Error('must use direct Neon endpoint'), { code: 'NOT_DIRECT_NEON' });
+              }
+              if (host !== EXPECTED_HOST) {
+                console.error(`Target hostname mismatch: expected ${EXPECTED_HOST}, got ${host}. Refusing to apply.`);
+                throw Object.assign(new Error('not the Azaman-New direct endpoint'), { code: 'WRONG_TARGET_HOST' });
+              }
+              client = new Client({ connectionString: raw, connectionTimeoutMillis: 10000 });
+              await client.connect();
+              const { rows } = await client.query('SELECT current_database() AS database_name');
+              if (rows[0].database_name !== 'neondb') {
+                console.error(`Target database mismatch: expected neondb, got ${rows[0].database_name}. Refusing to apply.`);
+                throw Object.assign(new Error('not the neondb database'), { code: 'WRONG_TARGET_DATABASE' });
+              }
+              console.log(`Target guard passed: neondb @ ${EXPECTED_HOST}. No writes performed by this step.`);
+            } catch (err) {
+              console.error(`Target guard failed (${err.code || 'connection error'}). Connection details are withheld; the overlay was NOT applied.`);
+              process.exitCode = 1;
+            } finally {
+              if (client) await client.end().catch(() => {});
+            }
+          })();
+          NODE
 
       - name: Apply the BusinessPrice overlay
         env:
@@ -226,13 +283,27 @@ jobs:
               const raw = process.env.DATABASE_URL;
               if (!raw) throw Object.assign(new Error('missing secret'), { code: 'MISSING_SECRET' });
               const url = new URL(raw);
+              const EXPECTED_HOST = 'ep-floral-hat-b9qwuuq0.c-7.eu-central-1.aws.neon.tech';
               const host = url.hostname.toLowerCase();
               if (!host.endsWith('.neon.tech') || host.includes('-pooler')) {
                 throw Object.assign(new Error('must use direct Neon endpoint'), { code: 'NOT_DIRECT_NEON' });
               }
+              if (host !== EXPECTED_HOST) {
+                console.error(`Target hostname mismatch: expected ${EXPECTED_HOST}, got ${host}. Aborting before any query.`);
+                throw Object.assign(new Error('not the Azaman-New direct endpoint'), { code: 'WRONG_TARGET_HOST' });
+              }
 
               client = new Client({ connectionString: raw, connectionTimeoutMillis: 10000 });
               await client.connect();
+
+              // 0. Fail closed on target database — verify must never run
+              // against (or silently pass on) anything but Azaman-New neondb.
+              const db = await client.query('SELECT current_database() AS database_name');
+              if (db.rows[0].database_name !== 'neondb') {
+                console.error(`Target database mismatch: expected neondb, got ${db.rows[0].database_name}. Aborting.`);
+                throw Object.assign(new Error('not the neondb database'), { code: 'WRONG_TARGET_DATABASE' });
+              }
+              console.log('PASS  target            neondb @ ep-floral-hat-b9qwuuq0.c-7.eu-central-1.aws.neon.tech');
 
               // 1. Table
               const table = await client.query(`SELECT to_regclass('public."BusinessPrice"')::text AS oid`);

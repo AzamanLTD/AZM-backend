@@ -46,13 +46,24 @@ executes pre-deploy commands, that becomes the authoritative path again and
 the appended build-command step is a harmless replay.
 
 **Until the dashboard change is applied**, the guarded workflow
-`.github/workflows/provision-azaman-new-business-price.yml` (dispatch it on
-the branch that carries it) is the supported way to provision new overlay
-objects on the Azaman-New Neon database: it requires typing `Azaman-New` as
-an explicit confirmation, applies ONLY `install-business-price-overlay.js`,
-and finishes with a read-only verification of the full BusinessPrice
-contract. See also `ops/azaman-new-neon-bootstrap` for the initial bootstrap
-workflow (do not re-run it — it requires an EMPTY database).
+`.github/workflows/provision-azaman-new-business-price.yml` is the supported
+way to provision new overlay objects on the Azaman-New Neon database: it
+requires typing `Azaman-New` as an explicit confirmation, fails closed
+unless the connection resolves to exactly the Azaman-New direct Neon
+endpoint (`ep-floral-hat-b9qwuuq0.c-7.eu-central-1.aws.neon.tech`) with
+`current_database()` = `neondb` (checked read-only in preflight, before
+apply, and in post-install verification), applies ONLY
+`install-business-price-overlay.js`, and finishes with a read-only
+verification of the full BusinessPrice contract.
+
+**When it can be run:** GitHub only offers `workflow_dispatch` workflows
+whose workflow file is present on the **default branch** — the runbook
+manual path therefore becomes dispatchable only after the branch carrying
+the workflow file is merged to main. Until then the dashboard Build Command
+change above is the only way to provision the overlay. Do not attempt to
+dispatch it from a non-default branch; the Actions UI will not list it.
+See also `ops/azaman-new-neon-bootstrap` for the initial bootstrap workflow
+(do not re-run it — it requires an EMPTY database).
 
 ## Production-required environment variables (fail-closed contracts)
 
