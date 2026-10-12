@@ -90,17 +90,18 @@ workflow `.github/workflows/provision-azaman-new-receive-request.yml`.
   read-only and fail closed on any mismatch. Requires typing `Azaman-New`
   as the confirmation input. Connection details are never printed.
 - **Fail-closed conditions:** a populated legacy `IdempotencyKey` table.
-  The r42 overlay retires that table by dropping it, and the installer
-  does NOT safeguard populated legacy data — if the table exists with any
-  rows, preflight refuses to proceed (export/migrate them first, empty
-  the table, then re-dispatch). An absent or empty `IdempotencyKey` is
-  safe: it is simply dropped/absent by design. The preflight refusal is
-  defense-in-depth: the r42 installer itself ALSO fails closed — its
+  The r42 overlay retires that table by dropping it, and BOTH layers
+  safeguard populated legacy data. The installer itself fails closed — its
   check-and-drop is one atomic lock-then-count block (ACCESS EXCLUSIVE on
-  the legacy table before counting), so rows inserted between the
-  preflight job and the apply job (a TOCTOU window across jobs) are
-  refused independently, with the table and every row left intact. A
-  populated table cannot be destroyed by either layer. Post-install verification
+  the legacy table before counting), so a table with any rows is refused
+  with the table and every row left intact, and rows that legally appear
+  between the preflight job and the apply job (a TOCTOU window across
+  jobs) are waited out by the lock and refused the same way. The preflight
+  refusal is defense-in-depth and the early, operator-facing guard: if
+  the table exists with any rows, preflight refuses to proceed
+  (export/migrate them first, empty the table, then re-dispatch). An
+  absent or empty `IdempotencyKey` is safe: it is simply dropped/absent by
+  design. A populated table cannot be destroyed by either layer. Post-install verification
   (read-only) asserts the full contract — every column, type and default,
   both primary keys, the User FKs with cascade, all indexes, the unique
   token-hash lookup, the §r42 byte-fidelity requirement that
@@ -116,9 +117,12 @@ workflow `.github/workflows/provision-azaman-new-receive-request.yml`.
   proves the same contract in CI — provisioning both tables from absent
   through the two installers, the empty-legacy retirement, the JSONB→TEXT
   byte-fidelity convergence, idempotent replay, and the live invariants
-  (unique claim identity, User FK, unique token hash). It also documents
-  why the populated-legacy refusal exists: the r42 installer would drop
-  populated legacy data without a safeguard.
+  (unique claim identity, User FK, unique token hash). The populated
+  legacy refusal is exercised by dedicated PG proofs: a populated table
+  is refused with every row intact, and a TOCTOU test deterministically
+  reproduces the cross-job window (a row committed while the installer
+  runs, coordinated through real `pg_locks` lock-state observation, no
+  fixed delays) and proves the installer still fails closed.
 
 Running this workflow provisions the missing tables only. It does NOT
 deploy the API runtime, change Render settings, or by itself make the

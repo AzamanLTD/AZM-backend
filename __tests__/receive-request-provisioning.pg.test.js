@@ -278,70 +278,97 @@ run('Receive/Request release-path provisioning (real PostgreSQL)', () => {
         // The race is coordinated by an EXPLICIT HANDSHAKE, not a fixed sleep:
         // the writer transaction stays open after the insert, the installer is
         // started, and PostgreSQL's own lock state (pg_locks) is polled until
-        // the installer is OBSERVED waiting for an ungranted ACCESS EXCLUSIVE
-        // lock on IdempotencyKey. Only then is the writer permitted to commit —
+        // the installer is OBSERVED waiting for an ungranted AccessExclusiveLock
+        // on IdempotencyKey. Only then is the writer permitted to commit —
         // so the interleaving under test is guaranteed to have actually
-        // happened, deterministically, on every machine.
+        // happened, deterministically, on every machine. Every coordination
+        // phase (writer startup, insert handshake, installer startup, lock
+        // polling) is bounded and covered by the finally block below, so any
+        // failure path still releases the writer, kills the installer and
+        // leaves the database provisioned.
         await dropProvisionedTables();
         await createLegacyIdempotencyKey(false); // empty at "preflight" time
 
-        writer = new PrismaClient();
-        // gate: holds the writer's transaction open until the installer is
-        // confirmed blocked on the lock — resolved by the poll loop below.
-        let releaseWriter;
-        const gate = new Promise((resolve) => { releaseWriter = resolve; });
-        let signalInsert;
-        const insertOpen = new Promise((r) => { signalInsert = r; });
-        const writerPromise = writer.$transaction(async (tx) => {
-            await tx.$executeRawUnsafe(
-                `INSERT INTO "IdempotencyKey" ("id", "response") VALUES ('racer-1', '{"r":1}')`);
-            signalInsert(); // the writer's ROW EXCLUSIVE is now held
-            await gate; // hold the row uncommitted until the lock wait is observed
-        }, { timeout: 60000 });
-        await insertOpen; // only NOW is the writer guaranteed in-flight
-
-        // Start the installer without awaiting it. Its ACCESS EXCLUSIVE lock
-        // request queues behind the writer's ROW EXCLUSIVE.
+        // Every in-flight resource is declared up here so the finally block
+        // can clean up from ANY failure path — writer startup, insert
+        // handshake, installer startup, lock polling, or the assertions.
         let child = null;
         let childClosed = false;
-        const childPromise = new Promise((resolve) => {
-            child = require('child_process').spawn('node', [R42_INSTALLER], {
-                env: { ...process.env, DATABASE_URL: url, LOG_LEVEL: 'debug' },
-            });
-            let out = '';
-            child.stdout.on('data', (d) => { out += d; });
-            child.stderr.on('data', (d) => { out += d; });
-            child.on('close', (code) => { childClosed = true; resolve({ status: code, out }); });
-        });
-
-        // Poll the real lock state until the installer is confirmed WAITING
-        // (an ungranted AccessExclusiveLock request on the legacy table —
-        // pg_locks spells the mode 'AccessExclusiveLock'). Bounded:
-        // a bounded poll window, an early-exit check, and a finally block that
-        // always releases the writer, kills a stuck installer, disconnects the
-        // second connection and re-provisions — a failed assertion can never
-        // leak an open transaction or a half-provisioned database.
-        const LOCK_WAIT_TIMEOUT_MS = 20000;
-        const deadline = Date.now() + LOCK_WAIT_TIMEOUT_MS;
-        let sawLockWait = false;
-        while (Date.now() < deadline) {
-            if (childClosed) break; // installer exited before blocking — diagnosed below
-            const waiting = await db.$queryRaw`
-                SELECT count(*)::int AS n FROM pg_locks
-                 WHERE locktype = 'relation'
-                   AND relation = to_regclass('public."IdempotencyKey"')
-                   AND mode = 'AccessExclusiveLock' -- pg_locks mode spelling
-                   AND NOT granted`;
-            if (waiting[0].n > 0) { sawLockWait = true; break; }
-            await new Promise((r) => setTimeout(r, 25));
-        }
-
+        let releaseWriter = () => {}; // resolving twice is a no-op
+        let writerPromise = Promise.resolve();
+        let childPromise = Promise.resolve();
         let res = null;
+        let sawLockWait = false;
+
         try {
+            // -- Writer startup + insert handshake (bounded): the writer
+            //    holds the inserted row uncommitted behind a gate. If the
+            //    writer fails early (connection, insert) the handshake can
+            //    never arrive, so the handshake is raced against the writer
+            //    promise itself and a deadline — early failure is detected,
+            //    never hung on.
+            writer = new PrismaClient();
+            const gate = new Promise((resolve) => { releaseWriter = resolve; });
+            let signalInsert;
+            const insertOpen = new Promise((r) => { signalInsert = r; });
+            writerPromise = writer.$transaction(async (tx) => {
+                await tx.$executeRawUnsafe(
+                    `INSERT INTO "IdempotencyKey" ("id", "response") VALUES ('racer-1', '{"r":1}')`);
+                signalInsert(); // the writer's ROW EXCLUSIVE is now held
+                await gate; // hold the row uncommitted until the lock wait is observed
+            }, { timeout: 60000 });
+            const INSERT_HANDSHAKE_TIMEOUT_MS = 5000;
+            const inserted = await Promise.race([
+                insertOpen.then(() => true),
+                writerPromise.then(() => false), // writer ended before holding — caught below
+                new Promise((_, reject) => setTimeout(
+                    () => reject(new Error('writer insert handshake timed out')),
+                    INSERT_HANDSHAKE_TIMEOUT_MS)),
+            ]);
+            expect(inserted).toBe(true); // the writer is in-flight, ROW EXCLUSIVE held
+
+            // -- Installer startup: spawned async; its ACCESS EXCLUSIVE lock
+            //    request queues behind the writer's ROW EXCLUSIVE. A spawn
+            //    error resolves childPromise with status null instead of
+            //    hanging the close handler.
+            childPromise = new Promise((resolve) => {
+                child = require('child_process').spawn('node', [R42_INSTALLER], {
+                    env: { ...process.env, DATABASE_URL: url, LOG_LEVEL: 'debug' },
+                });
+                let out = '';
+                child.stdout.on('data', (d) => { out += d; });
+                child.stderr.on('data', (d) => { out += d; });
+                child.on('error', (e) => {
+                    childClosed = true;
+                    resolve({ status: null, out: `${out}\n${e}` });
+                });
+                child.on('close', (code) => { childClosed = true; resolve({ status: code, out }); });
+            });
+
+            // -- pg_locks polling (bounded): poll the REAL lock state until
+            //    the installer is confirmed WAITING for an ungranted
+            //    AccessExclusiveLock on the legacy table. If the installer
+            //    dies before blocking, the poll exits early and the
+            //    assertions below surface its output.
+            const LOCK_WAIT_TIMEOUT_MS = 20000;
+            const deadline = Date.now() + LOCK_WAIT_TIMEOUT_MS;
+            while (Date.now() < deadline) {
+                if (childClosed) break; // installer exited before blocking — diagnosed below
+                const waiting = await db.$queryRaw`
+                    SELECT count(*)::int AS n FROM pg_locks
+                     WHERE locktype = 'relation'
+                       AND relation = to_regclass('public."IdempotencyKey"')
+                       AND mode = 'AccessExclusiveLock' -- pg_locks mode spelling
+                       AND NOT granted`;
+                if (waiting[0].n > 0) { sawLockWait = true; break; }
+                await new Promise((r) => setTimeout(r, 25));
+            }
             expect(sawLockWait).toBe(true); // the race was REAL, not timed
-            // Permit the writer to commit: the installer's lock is granted,
-            // the count runs INSIDE the lock, sees the committed racer row
-            // and the block aborts — the row is never destroyed.
+
+            // -- The race itself: permit the writer to commit. The installer's
+            //    lock is granted, the count runs INSIDE the lock, sees the
+            //    committed racer row and the block aborts — the row is never
+            //    destroyed.
             releaseWriter();
             [res] = await Promise.all([childPromise, writerPromise]);
             expect(res.status).not.toBe(0);
@@ -351,10 +378,12 @@ run('Receive/Request release-path provisioning (real PostgreSQL)', () => {
             const rows = await db.$queryRawUnsafe(`SELECT "id" FROM "IdempotencyKey" ORDER BY "id"`);
             expect(rows.map((r) => r.id)).toEqual(['racer-1']);
         } finally {
-            // Reliable cleanup on ANY exit path (assertion, poll timeout,
-            // early installer death): no stuck child, no leaked writer
-            // transaction, and the database re-provisioned for the suites
-            // that follow. All steps are idempotent and failure-tolerant.
+            // Reliable cleanup on ANY exit path — writer startup failure,
+            // insert-handshake timeout, installer spawn error, poll timeout,
+            // early installer death, or a failed assertion: no stuck child,
+            // no leaked writer transaction, and the database re-provisioned
+            // for the suites that follow. Every step is idempotent and
+            // failure-tolerant.
             releaseWriter(); // resolving twice is a no-op
             if (child && !childClosed && child.exitCode === null) child.kill('SIGKILL');
             try { await childPromise; } catch (e) { /* child already dead */ }
