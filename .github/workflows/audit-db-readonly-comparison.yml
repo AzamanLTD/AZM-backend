@@ -1,0 +1,75 @@
+name: Audit DB read-only comparison
+
+# STRICTLY READ-ONLY audit: counts and table presence only. No row contents,
+# no credentials, no DDL, no writes. Each connection runs every query inside a
+# BEGIN READ ONLY transaction and always rolls back.
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  compare:
+    name: Read-only counts (Azaman-New vs current Render runtime)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      AZAMAN_NEW_URL: ${{ secrets.AZM_NEW_DATABASE_URL }}
+      RENDER_RUNTIME_URL: ${{ secrets.AUDIT_RENDER_RUNTIME_DB_URL }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      - name: Install pg driver only
+        run: npm install pg --no-save --silent
+      - name: Read-only schema and row-count comparison
+        run: |
+          node <<'AUDIT'
+          const { Client } = require('pg');
+          const assert = (c, m) => { if (!c) throw new Error('GUARD FAILED: ' + m); };
+          const parse = (raw, label) => {
+            assert(raw, label + ' secret missing');
+            const u = new URL(raw);
+            const host = u.hostname.toLowerCase();
+            assert(host.endsWith('.neon.tech'), label + ': not a Neon host');
+            return raw;
+          };
+          // Owner-requested data tables for the comparison
+          const DATA_TABLES = ['User','BusinessProfile','BusinessProduct','CurrencyWallet',
+            'TransactionHistory','Withdrawal','JournalEntry','LedgerTransaction',
+            'LedgerAccount','BusinessLedgerEntry','FinancialOperation','PaymentRequest'];
+          async function audit(raw, label) {
+            parse(raw, label);
+            const c = new Client({ connectionString: raw, ssl: { rejectUnauthorized: false } });
+            await c.connect();
+            await c.query('BEGIN READ ONLY');
+            const ident = await c.query("SELECT current_database() AS db");
+            const host = new URL(raw).hostname.toLowerCase();
+            console.log(`\n=== ${label}: ${host} / ${ident.rows[0].db} ===`);
+            const tot = await c.query("SELECT count(*)::int AS n FROM information_schema.tables WHERE table_schema='public' AND table_type='BASE TABLE'");
+            console.log(`public base tables: ${tot.rows[0].n}`);
+            // Presence + counts for the requested groups
+            for (const t of DATA_TABLES) {
+              const ex = await c.query("SELECT to_regclass($1) IS NOT NULL AS present", [`public."${t}"`]);
+              if (!ex.rows[0].present) { console.log(`  ${t}: ABSENT`); continue; }
+              const n = await c.query(`SELECT count(*)::int AS n FROM "public"."${t}"`);
+              console.log(`  ${t}: present, ${n.rows[0].n} rows`);
+            }
+            // Any table holding data at all (data-safety sweep)
+            const tables = await c.query("SELECT table_name FROM information_schema.tables WHERE table_schema='public' AND table_type='BASE TABLE' ORDER BY table_name");
+            let nonEmpty = [];
+            for (const r of tables.rows) {
+              const n = await c.query(`SELECT count(*)::int AS n FROM "public"."${r.table_name}"`);
+              if (n.rows[0].n > 0) nonEmpty.push(`${r.table_name}=${n.rows[0].n}`);
+            }
+            console.log(`  tables with rows (${nonEmpty.length}): ${nonEmpty.join(', ') || 'NONE'}`);
+            await c.query('ROLLBACK');
+            await c.end();
+          }
+          (async () => {
+            await audit(process.env.RENDER_RUNTIME_URL, 'CURRENT-RENDER-RUNTIME');
+            await audit(process.env.AZAMAN_NEW_URL, 'AZAMAN-NEW');
+          })().catch(e => { console.error('AUDIT FAILED:', e.message); process.exit(1); });
+          AUDIT
