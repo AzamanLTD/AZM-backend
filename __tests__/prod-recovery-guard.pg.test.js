@@ -186,6 +186,16 @@ run('prod-recovery guard helper (real PostgreSQL)', () => {
     beforeAll(async () => {
         db = new PrismaClient();
         await ensureIdentityRows();
+        // FiatLiquidityState is an expected-initialization target in verify mode.
+        // Battery-neighbor suites sometimes leave it truncated; on an empty table
+        // the verify rule expects "exactly one zero-valued row after
+        // initialization" and fails. Restore the pristine zero singleton so this
+        // suite is hermetic regardless of what earlier suites left behind.
+        await db.$executeRawUnsafe('DELETE FROM "FiatLiquidityState"');
+        await db.$executeRawUnsafe(
+            'INSERT INTO "FiatLiquidityState" ("id","availableGhs","reservedGhs","inTransitGhs","paidOutGhs","reconciliationHeldGhs","updatedAt") ' +
+            'VALUES (1,0,0,0,0,0,CURRENT_TIMESTAMP) ON CONFLICT ("id") DO NOTHING'
+        );
     });
 
     afterAll(async () => {
@@ -282,6 +292,7 @@ run('prod-recovery guard helper (real PostgreSQL)', () => {
     test('verify passes end-to-end on the fully provisioned database', async () => {
         const base = await baselines();
         const res = runScript('verify', { env: baselineEnv(base) });
+        expect(res.stderr).toBe('');
         expect(res.stdout).toContain('verification complete');
         expect(res.status).toBe(0);
     });
