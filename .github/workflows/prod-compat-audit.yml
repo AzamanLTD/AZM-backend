@@ -7,114 +7,87 @@ permissions:
   contents: read
 jobs:
   audit:
-    name: Read-only schema compatibility audit (ep-crimson-cell production branch)
+    name: Read-only schema compatibility audit (both eu-west-2 endpoints)
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     env:
       DB_URL: ${{ secrets.AUDIT_RENDER_RUNTIME_DB_URL }}
     steps:
       - uses: actions/checkout@v4
-      - name: Install PostgreSQL client
-        run: |
-          curl -fsS https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo gpg --dearmor -o /usr/share/keyrings/pgdg.gpg
-          echo "deb [signed-by=/usr/share/keyrings/pgdg.gpg] http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list
-          sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client-17
       - name: Run audit (structural metadata and counts only)
         run: |
+          pip install -q psycopg2-binary
           python3 - <<'PY'
-          import os, re, subprocess
+          import os, re, psycopg2
 
-          PROD = os.environ['DB_URL'].replace('ep-small-butterfly-abxfnkn5-pooler.', 'ep-crimson-cell-ab81e3bp.')
-          host = re.search(r'@([a-z0-9.-]+)', PROD).group(1)
-          assert host == 'ep-crimson-cell-ab81e3bp.eu-west-2.aws.neon.tech', 'unexpected target: ' + host
-          print('target host:', host, '(production branch, direct endpoint)')
+          def audit(label, url):
+              print(f'\n########## AUDIT TARGET: {label} ##########')
+              conn = psycopg2.connect(url, connect_timeout=15)
+              cur = conn.cursor()
+              def sql(q):
+                  cur.execute(q); row = cur.fetchone()
+                  return row[0] if row else None
+              print('current_database():', sql('SELECT current_database()'))
+              host = re.search(r'@([a-z0-9.-]+)', url).group(1)
+              print('host:', host)
 
-          def sql(q):
-              return subprocess.check_output(['psql', PROD, '-tAc', q], text=True).strip()
+              if sql("SELECT to_regclass('\"IdempotencyKey\"') IS NULL") is False:
+                  cur.execute('SELECT count(*) FROM \"IdempotencyKey\"')
+                  print('IdempotencyKey: EXISTS, row count:', cur.fetchone()[0])
+              else:
+                  print('IdempotencyKey: ABSENT')
 
-          db = sql('SELECT current_database()')
-          assert db == 'neondb', 'unexpected database: ' + db
-          print('current_database():', db)
+              schema = open('prisma/schema.prisma').read()
+              model_names = set(re.findall(r'^model (\w+)', schema, re.M))
+              req = {}
+              for m in re.finditer(r'^model (\w+) \{(.*?)^\}', schema, re.M | re.S):
+                  name, body = m.group(1), m.group(2)
+                  tm = re.search(r'@@map\("([^"]+)"\)', body)
+                  table = tm.group(1) if tm else name
+                  cols = set()
+                  for line in body.splitlines():
+                      line = line.strip()
+                      if not line or line.startswith('//') or line.startswith('@@'): continue
+                      fm = re.match(r'(\w+)\s+([\w\[\]]+)', line)
+                      if not fm: continue
+                      fld, typ = fm.group(1), fm.group(2)
+                      if typ.rstrip('?').rstrip('[]') in model_names: continue
+                      cm = re.search(r'@map\("([^"]+)"\)', line)
+                      cols.add(cm.group(1) if cm else fld)
+                  req[table] = cols
 
-          # ---- IdempotencyKey (existence + count only) ----
-          print('\n== IdempotencyKey ==')
-          if sql("SELECT to_regclass('\"IdempotencyKey\"') IS NULL") == 't':
-              print('  ABSENT on production branch')
-          else:
-              print('  EXISTS, row count:', sql('SELECT count(*) FROM \"IdempotencyKey\"'))
+              cur.execute("SELECT tablename FROM pg_tables WHERE schemaname='public'")
+              have = {r[0] for r in cur.fetchall()}
+              missing_tables = sorted(t for t in req if t not in have)
+              print('\nprisma tables MISSING (%d):' % len(missing_tables))
+              for t in missing_tables: print('  -', t)
 
-          # ---- prisma schema requirements ----
-          schema = open('prisma/schema.prisma').read()
-          model_names = set(re.findall(r'^model (\w+)', schema, re.M))
-          req = {}
-          for m in re.finditer(r'^model (\w+) \{(.*?)^\}', schema, re.M | re.S):
-              name, body = m.group(1), m.group(2)
-              tm = re.search(r'@@map\("([^"]+)"\)', body)
-              table = tm.group(1) if tm else name
-              cols = set()
-              for line in body.splitlines():
-                  line = line.strip()
-                  if not line or line.startswith('//') or line.startswith('@@'):
-                      continue
-                  fm = re.match(r'(\w+)\s+([\w\[\]]+)', line)
-                  if not fm: continue
-                  fld, typ = fm.group(1), fm.group(2)
-                  base = typ.rstrip('?').rstrip('[]')
-                  if base in model_names: continue
-                  cm = re.search(r'@map\("([^"]+)"\)', line)
-                  cols.add(cm.group(1) if cm else fld)
-              req[table] = cols
-          print('\nprisma models on this branch:', len(req))
+              print('\nexisting prisma tables with missing columns:')
+              cur.execute("SELECT table_name, column_name FROM information_schema.columns WHERE table_schema='public'")
+              dbcols = {(r[0], r[1]) for r in cur.fetchall()}
+              ncol = 0
+              for t, cols in req.items():
+                  if t in missing_tables: continue
+                  miss = sorted(c for c in cols if (t, c) not in dbcols)
+                  if miss:
+                      ncol += 1
+                      print(f'  {t}: missing {miss}')
+              if ncol == 0: print('  NONE')
+              conn.close()
+              return missing_tables
 
-          have_raw = sql("SELECT string_agg(tablename, ',' ORDER BY tablename) FROM pg_tables WHERE schemaname='public'")
-          have = set(have_raw.split(',')) if have_raw else set()
-          missing_tables = sorted(t for t in req if t not in have)
-          print('\n== prisma tables MISSING on production branch ==')
-          print('  count:', len(missing_tables))
-          for t in missing_tables: print('  -', t)
-
-          print('\n== existing prisma tables with missing columns ==')
-          ncol = 0
-          for t, cols in req.items():
-              if t in missing_tables: continue
-              got_raw = sql(f"SELECT string_agg(column_name, ',' ORDER BY column_name) FROM information_schema.columns WHERE table_schema='public' AND table_name='{t}'")
-              got = set(got_raw.split(',')) if got_raw else set()
-              miss = sorted(cols - got)
-              if miss:
-                  ncol += 1
-                  print(f'  {t}: missing {miss}')
-          if ncol == 0: print('  NONE')
-
-          print('\n== primary key / foreign key / index presence on existing prisma tables ==')
-          nopk, nofk, noidx = [], [], []
-          for t in req:
-              if t in missing_tables: continue
-              if sql(f"SELECT count(*) FROM information_schema.table_constraints WHERE table_schema='public' AND table_name='{t}' AND constraint_type='PRIMARY KEY'") == '0':
-                  nopk.append(t)
-              if sql(f"SELECT count(*) FROM information_schema.table_constraints WHERE table_schema='public' AND table_name='{t}' AND constraint_type='FOREIGN KEY'") == '0' and any(c.endswith('Id') for c in req[t]):
-                  nofk.append(t)
-              if sql(f"SELECT count(*) FROM pg_indexes WHERE schemaname='public' AND tablename='{t}'") == '0':
-                  noidx.append(t)
-          print('  tables missing PRIMARY KEY:', nopk or 'NONE')
-          print('  tables with *Id columns but NO foreign keys (prisma may not map FKs):', nofk or 'NONE')
-          print('  tables with NO indexes at all:', noidx or 'NONE')
-
-          print('\n== release-chain installers vs production branch ==')
-          installers = ['install-prod-drift-remediation.js','install-susu-overlay.js','install-transaction-quote-overlay.js',
-           'install-business-os-overlay.js','install-inventory-restock-overlay.js','install-reservation-capacity-overlay.js',
-           'install-e2ee-server-blind-overlay.js','install-phase3-overlay.js','install-payout-reconciliation-infra.js',
-           'install-fiat-liquidity-overlay.js','install-model-b-settlement-overlay.js','install-r16-execution-identity-overlay.js',
-           'install-r19-smartroute-execution-snapshot-overlay.js','install-r42-idempotency-overlay.js',
-           'install-payment-requests-overlay.js','install-business-price-overlay.js']
-          for f in installers:
-              src = open('infra/' + f).read()
-              tabs = sorted(set(re.findall(r'CREATE TABLE (?:IF NOT EXISTS )?"([A-Za-z0-9_]+)"', src)))
-              tabs_missing = [t for t in tabs if t not in have]
-              adds = sorted(set((a, b) for a, b in re.findall(r'ALTER TABLE (?:IF EXISTS )?"([A-Za-z0-9_]+)"[^;]*?ADD COLUMN (?:IF NOT EXISTS )?"([A-Za-z0-9_]+)"', src)))
-              add_missing = [(t, c) for (t, c) in adds if t in have and sql(f"SELECT count(*) FROM information_schema.columns WHERE table_schema='public' AND table_name='{t}' AND column_name='{c}'") == '0']
-              status = []
-              if tabs_missing: status.append('missing tables: ' + ', '.join(tabs_missing))
-              if add_missing: status.append('missing added-columns: ' + ', '.join(f'{t}.{c}' for t, c in add_missing))
-              print(f'  {f}: ' + ('; '.join(status) if status else 'fully present (no missing targets)'))
+          base = os.environ['DB_URL']
+          current = base.replace('-pooler.', '.')   # small-butterfly direct
+          prod   = base.replace('ep-small-butterfly-abxfnkn5.', 'ep-crimson-cell-ab81e3bp.')
+          for u in (current, prod):
+              h = re.search(r'@([a-z0-9.-]+)', u).group(1)
+              assert h in ('ep-small-butterfly-abxfnkn5.eu-west-2.aws.neon.tech',
+                           'ep-crimson-cell-ab81e3bp.eu-west-2.aws.neon.tech'), h
+          miss_current = audit('CURRENT prod DB (small-butterfly, direct)', current)
+          miss_prod    = audit('ORIGINAL prod branch (ep-crimson-cell, direct)', prod)
+          print('\n########## DELTA ##########')
+          print('missing on current but PRESENT on original branch:', sorted(set(miss_current) - set(miss_prod)) or 'NONE')
+          print('missing on original branch but PRESENT on current:', sorted(set(miss_prod) - set(miss_current)) or 'NONE')
+          print('missing on BOTH:', sorted(set(miss_prod) & set(miss_current)) or 'NONE')
           print('\nAUDIT COMPLETE')
           PY
