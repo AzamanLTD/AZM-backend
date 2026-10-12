@@ -36,7 +36,7 @@ jobs:
             const c = new Client({ connectionString: raw, ssl: { rejectUnauthorized: false } });
             await c.connect();
             await c.query('BEGIN READ ONLY');
-            console.log(`\n### ${label}: ${host} / ${ (await c.query('SELECT current_database()')).rows[0].db }`);
+            console.log(`\n### ${label}: ${host} / ${ (await c.query('SELECT current_database() AS db')).rows[0].db }`);
             // created-date ranges for tables holding data (no row contents)
             const tables = await c.query("SELECT table_name FROM information_schema.tables WHERE table_schema='public' AND table_type='BASE TABLE' ORDER BY table_name");
             for (const r of tables.rows) {
@@ -47,7 +47,7 @@ jobs:
               if (m.rows[0].n > 0) console.log(`  ${r.table_name}: ${m.rows[0].n} rows, created ${m.rows[0].dmin} .. ${m.rows[0].dmax}`);
             }
             // User email-domain aggregate only (no local parts)
-            const uq = await c.query("SELECT split_part(email, '@', 2) AS dom, count(*)::int n, min(createdAt)::date dmin, max(createdAt)::date dmax FROM \"public\".\"User\" GROUP BY 1 ORDER BY 2 DESC");
+            const uq = await c.query("SELECT split_part(email, '@', 2) AS dom, count(*)::int n, min(\"createdAt\")::date dmin, max(\"createdAt\")::date dmax FROM \"public\".\"User\" GROUP BY 1 ORDER BY 2 DESC");
             for (const x of uq.rows) console.log(`  User domain ${x.dom}: ${x.n} rows, created ${x.dmin} .. ${x.dmax}`);
             await c.query('ROLLBACK');
             await c.end();
