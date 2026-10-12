@@ -54,7 +54,7 @@ const CMT_FKS = [
 ];
 
 describe('prod-recovery workflow graph contract', () => {
-    test('verify directly depends on preflight so production preservation baselines are available', () => {
+    test('converge rechecks production gates and verification uses fresh baselines', () => {
         const workflow = fs.readFileSync(
             path.join(__dirname, '..', '.github', 'workflows', 'converge-original-prod-branch.yml'),
             'utf8',
@@ -67,8 +67,15 @@ describe('prod-recovery workflow graph contract', () => {
         const applyJob = workflow.slice(applyIndex, verifyIndex);
         const verifyJob = workflow.slice(verifyIndex);
         expect(verifyJob).toMatch(/^\s+needs:\s*\[preflight,\s*apply\]/m);
-        expect(verifyJob).toContain('FIAT_LIQUIDITY_STATE_CHECKSUM: ${{ needs.preflight.outputs.fiat_liquidity_state_checksum }}');
-        expect(verifyJob).toContain('DEFI_YIELD_STRATEGY_INTERNAL_LP_CHECKSUM: ${{ needs.preflight.outputs.defi_yield_strategy_internal_lp_checksum }}');
+        expect(verifyJob).toContain('FIAT_LIQUIDITY_STATE_CHECKSUM: ${{ needs.apply.outputs.fiat_liquidity_state_checksum }}');
+        expect(verifyJob).toContain('DEFI_YIELD_STRATEGY_INTERNAL_LP_CHECKSUM: ${{ needs.apply.outputs.defi_yield_strategy_internal_lp_checksum }}');
+
+        // Mutation revalidates side-effect gates and takes a fresh baseline
+        // from the same job immediately before running the installer sequence.
+        expect(applyJob).toContain('run: node infra/scripts/guarded-preflight-verify.mjs preflight');
+        expect(applyJob).toContain('id: baseline');
+        expect(applyJob).toContain('run: node infra/scripts/guarded-preflight-verify.mjs counts');
+        expect(applyJob).toContain('user_count: ${{ steps.baseline.outputs.user_count }}');
 
         // A manual run must be non-mutating by default: the operator first
         // inspects the read-only preflight, then explicitly dispatches converge.
