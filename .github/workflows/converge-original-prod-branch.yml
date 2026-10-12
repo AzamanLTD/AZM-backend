@@ -106,7 +106,13 @@ jobs:
       azm_spend_log_checksum: ${{ steps.counts.outputs.azm_spend_log_checksum }}
       defi_yield_strategy_count: ${{ steps.counts.outputs.defi_yield_strategy_count }}
       defi_yield_strategy_seed_count: ${{ steps.counts.outputs.defi_yield_strategy_seed_count }}
+      defi_yield_strategy_aave_count: ${{ steps.counts.outputs.defi_yield_strategy_aave_count }}
+      defi_yield_strategy_aave_checksum: ${{ steps.counts.outputs.defi_yield_strategy_aave_checksum }}
+      defi_yield_strategy_compound_count: ${{ steps.counts.outputs.defi_yield_strategy_compound_count }}
+      defi_yield_strategy_compound_checksum: ${{ steps.counts.outputs.defi_yield_strategy_compound_checksum }}
+      defi_yield_strategy_nonseed_checksum: ${{ steps.counts.outputs.defi_yield_strategy_nonseed_checksum }}
       fiat_liquidity_state_count: ${{ steps.counts.outputs.fiat_liquidity_state_count }}
+      fiat_liquidity_state_checksum: ${{ steps.counts.outputs.fiat_liquidity_state_checksum }}
     steps:
       - name: Require explicit target confirmation
         env:
@@ -136,7 +142,7 @@ jobs:
           node infra/scripts/guarded-preflight-verify.mjs counts
 
   apply:
-    name: Apply reviewed schema-only installer sequence
+    name: Apply reviewed convergence sequence (side effects gated)
     needs: [preflight]
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -152,7 +158,7 @@ jobs:
           DB_URL: ${{ secrets.AZM_ORIGINAL_PROD_DATABASE_URL }}
         run: |
           node infra/scripts/guarded-preflight-verify.mjs guard
-      - name: Schema-only convergence (reviewed sequence, seed omitted)
+      - name: Apply guarded installer sequence (seed omitted; side effects preflight-gated)
         env:
           DATABASE_URL: ${{ secrets.AZM_ORIGINAL_PROD_DATABASE_URL }}
         run: |
@@ -183,7 +189,9 @@ jobs:
 
   verify:
     name: Read-only post-apply verification (full inventory + content preservation)
-    needs: [apply]
+    # Direct dependency is required: the needs context does not expose
+    # transitive preflight outputs through apply.
+    needs: [preflight, apply]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -213,6 +221,12 @@ jobs:
           AZM_SPEND_LOG_CHECKSUM: ${{ needs.preflight.outputs.azm_spend_log_checksum }}
           DEFI_YIELD_STRATEGY_COUNT: ${{ needs.preflight.outputs.defi_yield_strategy_count }}
           DEFI_YIELD_STRATEGY_SEED_COUNT: ${{ needs.preflight.outputs.defi_yield_strategy_seed_count }}
+          DEFI_YIELD_STRATEGY_AAVE_COUNT: ${{ needs.preflight.outputs.defi_yield_strategy_aave_count }}
+          DEFI_YIELD_STRATEGY_AAVE_CHECKSUM: ${{ needs.preflight.outputs.defi_yield_strategy_aave_checksum }}
+          DEFI_YIELD_STRATEGY_COMPOUND_COUNT: ${{ needs.preflight.outputs.defi_yield_strategy_compound_count }}
+          DEFI_YIELD_STRATEGY_COMPOUND_CHECKSUM: ${{ needs.preflight.outputs.defi_yield_strategy_compound_checksum }}
+          DEFI_YIELD_STRATEGY_NONSEED_CHECKSUM: ${{ needs.preflight.outputs.defi_yield_strategy_nonseed_checksum }}
           FIAT_LIQUIDITY_STATE_COUNT: ${{ needs.preflight.outputs.fiat_liquidity_state_count }}
+          FIAT_LIQUIDITY_STATE_CHECKSUM: ${{ needs.preflight.outputs.fiat_liquidity_state_checksum }}
         run: |
           node infra/scripts/guarded-preflight-verify.mjs verify
