@@ -25,6 +25,48 @@ jobs:
           node-version: 24
       - name: Install pg driver only
         run: npm install pg --no-save --silent
+      - name: Read-only date ranges and pooled-endpoint check
+        run: |
+          node <<'AUDIT2'
+          const { Client } = require('pg');
+          const assert = (c, m) => { if (!c) throw new Error('GUARD FAILED: ' + m); };
+          async function ranges(raw, label, poolCheck) {
+            const u = new URL(raw); const host = u.hostname.toLowerCase();
+            assert(host.endsWith('.neon.tech'), label + ': not a Neon host');
+            const c = new Client({ connectionString: raw, ssl: { rejectUnauthorized: false } });
+            await c.connect();
+            await c.query('BEGIN READ ONLY');
+            console.log(`\n### ${label}: ${host} / ${ (await c.query('SELECT current_database()')).rows[0].db }`);
+            // created-date ranges for tables holding data (no row contents)
+            const tables = await c.query("SELECT table_name FROM information_schema.tables WHERE table_schema='public' AND table_type='BASE TABLE' ORDER BY table_name");
+            for (const r of tables.rows) {
+              const cols = await c.query("SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name=$1 AND column_name IN ('createdAt','created_at')", [r.table_name]);
+              if (!cols.rows.length) continue;
+              const col = cols.rows[0].column_name;
+              const m = await c.query(`SELECT count(*)::int n, min("${col}")::date dmin, max("${col}")::date dmax FROM "public"."${r.table_name}"`);
+              if (m.rows[0].n > 0) console.log(`  ${r.table_name}: ${m.rows[0].n} rows, created ${m.rows[0].dmin} .. ${m.rows[0].dmax}`);
+            }
+            // User email-domain aggregate only (no local parts)
+            const uq = await c.query("SELECT split_part(email, '@', 2) AS dom, count(*)::int n, min(createdAt)::date dmin, max(createdAt)::date dmax FROM \"public\".\"User\" GROUP BY 1 ORDER BY 2 DESC");
+            for (const x of uq.rows) console.log(`  User domain ${x.dom}: ${x.n} rows, created ${x.dmin} .. ${x.dmax}`);
+            await c.query('ROLLBACK');
+            await c.end();
+            if (poolCheck) {
+              // swap the direct endpoint for the project's pooled runtime endpoint
+              const poolHost = host.replace(/^ep-([a-z0-9-]+)\./, 'ep-$1-pooler.');
+              u.hostname = poolHost;
+              const pc = new Client({ connectionString: u.toString(), ssl: { rejectUnauthorized: false } });
+              await pc.connect();
+              const r = await pc.query('SELECT current_database() AS db');
+              console.log(`  POOLED ENDPOINT OK: ${poolHost} -> ${r.rows[0].db}`);
+              await pc.end();
+            }
+          }
+          (async () => {
+            await ranges(process.env.RENDER_RUNTIME_URL, 'CURRENT-RENDER-RUNTIME', false);
+            await ranges(process.env.AZAMAN_NEW_URL, 'AZAMAN-NEW', true);
+          })().catch(e => { console.error('AUDIT2 FAILED:', e.message); process.exit(1); });
+          AUDIT2
       - name: Read-only schema and row-count comparison
         run: |
           node <<'AUDIT'
