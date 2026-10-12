@@ -363,8 +363,13 @@ run('prod-recovery guard helper (real PostgreSQL)', () => {
     });
 
     test('preflight REFUSES pending dedupKey backfills on existing reward/spend rows', async () => {
-        await dynamicInsert('AzmSpendLog', { metadata: { dedupKey: 'dk-gate-test' } });
-        await dynamicInsert('AzmRewardLog', { metadata: { dedupKey: 'dk-gate-test' } });
+        // use a real User id: the FKs on these tables are NOT dropped here, and a
+        // fresh CI database has no user with id 1 (local databases pick one up
+        // from earlier suite runs, which is why this only failed in CI)
+        const u = await db.user.findFirst({ select: { id: true } });
+        expect(u).not.toBeNull();
+        await dynamicInsert('AzmSpendLog', { userId: u.id, metadata: { dedupKey: 'dk-gate-test' } });
+        await dynamicInsert('AzmRewardLog', { userId: u.id, metadata: { dedupKey: 'dk-gate-test' } });
         try {
             const res = runScript('preflight');
             expect(res.status).toBe(1);
