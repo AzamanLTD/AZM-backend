@@ -185,11 +185,12 @@ run('prod-recovery guard helper (real PostgreSQL)', () => {
         expect(res.status).toBe(0);
         const out = {};
         for (const line of res.stdout.split('\n')) {
-            let m = line.match(/^([a-z_]+)=(\-?\d+)$/);
-            if (m) { out[m[1]] = Number(m[2]); continue; }
-            // checksums are hex strings (or -1 when a table is absent)
-            m = line.match(/^([a-z_]+checksum)=([0-9a-f]{32}|\-1)$/);
-            if (m) out[m[1]] = m[2];
+            // Parse checksums first so the absent-table sentinel "-1" remains
+            // a string instead of being consumed by the numeric-count parser.
+            let m = line.match(/^([a-z_]+checksum)=([0-9a-f]{32}|-1)$/);
+            if (m) { out[m[1]] = m[2]; continue; }
+            m = line.match(/^([a-z_]+)=(-?\d+)$/);
+            if (m) out[m[1]] = Number(m[2]);
         }
         return out;
     }
