@@ -1,5 +1,5 @@
 name: Archive current DB (one-time, encrypted)
-true:
+on:
   push:
     branches:
     - db-archive
