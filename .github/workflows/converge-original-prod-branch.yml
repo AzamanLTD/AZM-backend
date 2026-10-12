@@ -76,6 +76,14 @@ on:
         description: Type Azaman-Original-Prod exactly to confirm the intended target
         required: true
         type: string
+      operation:
+        description: Preflight-only is read-only; converge applies the reviewed installer sequence
+        required: true
+        type: choice
+        options:
+          - preflight-only
+          - converge
+        default: preflight-only
 
 permissions:
   contents: read
@@ -145,6 +153,9 @@ jobs:
 
   apply:
     name: Apply reviewed convergence sequence (side effects gated)
+    # Read-only preflight is the default. Mutation requires the operator to
+    # explicitly select operation=converge on a separate manual dispatch.
+    if: ${{ inputs.operation == 'converge' }}
     needs: [preflight]
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -193,6 +204,8 @@ jobs:
     name: Read-only post-apply verification (full inventory + content preservation)
     # Direct dependency is required: the needs context does not expose
     # transitive preflight outputs through apply.
+    # This job is only meaningful after the explicitly requested mutation run.
+    if: ${{ inputs.operation == 'converge' }}
     needs: [preflight, apply]
     runs-on: ubuntu-latest
     timeout-minutes: 15
