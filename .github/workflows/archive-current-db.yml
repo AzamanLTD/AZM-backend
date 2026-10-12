@@ -102,14 +102,11 @@ jobs:
               print(f'diag: /projects status={st}, body[:200]={body[:200]!r}')
               PID = 'polished-river-71067591'
               print('project-scoped key: querying only its own project', PID)
-          for p in [get(f'/projects/{PID}')] if PID else []:
-              print(f"PROJECT {p['id']} name={p.get('name')} region={p.get('region_id')} created={p.get('created_at')} updated={p.get('updated_at')} logical_size={p.get('logical_size')}")
+          for path in [f'/projects/{PID}', f'/projects/{PID}/endpoints', f'/projects/{PID}/branches']:
+              print(f'== GET {path}')
               try:
-                  for e in get(f"/projects/{p['id']}/endpoints").get('endpoints', []):
-                      print(f"  endpoint {e.get('host')} type={e.get('type')} created={e.get('created_at')} updated={e.get('updated_at')}")
-              except Exception as ex: print('  endpoints error:', ex)
-              try:
-                  for b in get(f"/projects/{p['id']}/branches").get('branches', []):
-                      print(f"  branch {b.get('name')} created={b.get('created_at')} updated={b.get('updated_at')} last_changed={b.get('last_changed_at')} logical_size={b.get('logical_size')}")
-              except Exception as ex: print('  branches error:', ex)
-          PY
+                  raw = get(path)
+                  print(json.dumps(raw)[:1800])
+              except Exception as ex:
+                  print('  error:', ex)
+                    PY
