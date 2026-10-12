@@ -157,6 +157,32 @@ jobs:
     # explicitly select operation=converge on a separate manual dispatch.
     if: ${{ inputs.operation == 'converge' }}
     needs: [preflight]
+    outputs:
+      user_count: ${{ steps.baseline.outputs.user_count }}
+      transaction_count: ${{ steps.baseline.outputs.transaction_count }}
+      message_count: ${{ steps.baseline.outputs.message_count }}
+      trade_count: ${{ steps.baseline.outputs.trade_count }}
+      peer_transfer_count: ${{ steps.baseline.outputs.peer_transfer_count }}
+      business_profile_count: ${{ steps.baseline.outputs.business_profile_count }}
+      business_product_count: ${{ steps.baseline.outputs.business_product_count }}
+      wallet_count: ${{ steps.baseline.outputs.wallet_count }}
+      conversation_money_ticket_count: ${{ steps.baseline.outputs.conversation_money_ticket_count }}
+      conversation_money_ticket_checksum: ${{ steps.baseline.outputs.conversation_money_ticket_checksum }}
+      azm_reward_log_count: ${{ steps.baseline.outputs.azm_reward_log_count }}
+      azm_reward_log_checksum: ${{ steps.baseline.outputs.azm_reward_log_checksum }}
+      azm_spend_log_count: ${{ steps.baseline.outputs.azm_spend_log_count }}
+      azm_spend_log_checksum: ${{ steps.baseline.outputs.azm_spend_log_checksum }}
+      defi_yield_strategy_count: ${{ steps.baseline.outputs.defi_yield_strategy_count }}
+      defi_yield_strategy_seed_count: ${{ steps.baseline.outputs.defi_yield_strategy_seed_count }}
+      defi_yield_strategy_aave_count: ${{ steps.baseline.outputs.defi_yield_strategy_aave_count }}
+      defi_yield_strategy_aave_checksum: ${{ steps.baseline.outputs.defi_yield_strategy_aave_checksum }}
+      defi_yield_strategy_compound_count: ${{ steps.baseline.outputs.defi_yield_strategy_compound_count }}
+      defi_yield_strategy_compound_checksum: ${{ steps.baseline.outputs.defi_yield_strategy_compound_checksum }}
+      defi_yield_strategy_internal_lp_count: ${{ steps.baseline.outputs.defi_yield_strategy_internal_lp_count }}
+      defi_yield_strategy_internal_lp_checksum: ${{ steps.baseline.outputs.defi_yield_strategy_internal_lp_checksum }}
+      defi_yield_strategy_nonseed_checksum: ${{ steps.baseline.outputs.defi_yield_strategy_nonseed_checksum }}
+      fiat_liquidity_state_count: ${{ steps.baseline.outputs.fiat_liquidity_state_count }}
+      fiat_liquidity_state_checksum: ${{ steps.baseline.outputs.fiat_liquidity_state_checksum }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -171,6 +197,17 @@ jobs:
           DB_URL: ${{ secrets.AZM_ORIGINAL_PROD_DATABASE_URL }}
         run: |
           node infra/scripts/guarded-preflight-verify.mjs guard
+      - name: Re-run side-effect gates immediately before mutation
+        # The first preflight is useful for inspection, but the guarded apply
+        # run must not rely on a potentially stale side-effect snapshot.
+        env:
+          DB_URL: ${{ secrets.AZM_ORIGINAL_PROD_DATABASE_URL }}
+        run: node infra/scripts/guarded-preflight-verify.mjs preflight
+      - name: Capture preservation baselines immediately before mutation
+        id: baseline
+        env:
+          DB_URL: ${{ secrets.AZM_ORIGINAL_PROD_DATABASE_URL }}
+        run: node infra/scripts/guarded-preflight-verify.mjs counts
       - name: Apply guarded installer sequence (seed omitted; side effects preflight-gated)
         env:
           DATABASE_URL: ${{ secrets.AZM_ORIGINAL_PROD_DATABASE_URL }}
@@ -220,30 +257,30 @@ jobs:
       - name: Verify the complete audited set, content preservation, and expected initializations
         env:
           DB_URL: ${{ secrets.AZM_ORIGINAL_PROD_DATABASE_URL }}
-          USER_COUNT: ${{ needs.preflight.outputs.user_count }}
-          TRANSACTION_COUNT: ${{ needs.preflight.outputs.transaction_count }}
-          MESSAGE_COUNT: ${{ needs.preflight.outputs.message_count }}
-          TRADE_COUNT: ${{ needs.preflight.outputs.trade_count }}
-          PEER_TRANSFER_COUNT: ${{ needs.preflight.outputs.peer_transfer_count }}
-          BUSINESS_PROFILE_COUNT: ${{ needs.preflight.outputs.business_profile_count }}
-          BUSINESS_PRODUCT_COUNT: ${{ needs.preflight.outputs.business_product_count }}
-          WALLET_COUNT: ${{ needs.preflight.outputs.wallet_count }}
-          CONVERSATION_MONEY_TICKET_COUNT: ${{ needs.preflight.outputs.conversation_money_ticket_count }}
-          CONVERSATION_MONEY_TICKET_CHECKSUM: ${{ needs.preflight.outputs.conversation_money_ticket_checksum }}
-          AZM_REWARD_LOG_COUNT: ${{ needs.preflight.outputs.azm_reward_log_count }}
-          AZM_REWARD_LOG_CHECKSUM: ${{ needs.preflight.outputs.azm_reward_log_checksum }}
-          AZM_SPEND_LOG_COUNT: ${{ needs.preflight.outputs.azm_spend_log_count }}
-          AZM_SPEND_LOG_CHECKSUM: ${{ needs.preflight.outputs.azm_spend_log_checksum }}
-          DEFI_YIELD_STRATEGY_COUNT: ${{ needs.preflight.outputs.defi_yield_strategy_count }}
-          DEFI_YIELD_STRATEGY_SEED_COUNT: ${{ needs.preflight.outputs.defi_yield_strategy_seed_count }}
-          DEFI_YIELD_STRATEGY_AAVE_COUNT: ${{ needs.preflight.outputs.defi_yield_strategy_aave_count }}
-          DEFI_YIELD_STRATEGY_AAVE_CHECKSUM: ${{ needs.preflight.outputs.defi_yield_strategy_aave_checksum }}
-          DEFI_YIELD_STRATEGY_COMPOUND_COUNT: ${{ needs.preflight.outputs.defi_yield_strategy_compound_count }}
-          DEFI_YIELD_STRATEGY_COMPOUND_CHECKSUM: ${{ needs.preflight.outputs.defi_yield_strategy_compound_checksum }}
-          DEFI_YIELD_STRATEGY_INTERNAL_LP_COUNT: ${{ needs.preflight.outputs.defi_yield_strategy_internal_lp_count }}
-          DEFI_YIELD_STRATEGY_INTERNAL_LP_CHECKSUM: ${{ needs.preflight.outputs.defi_yield_strategy_internal_lp_checksum }}
-          DEFI_YIELD_STRATEGY_NONSEED_CHECKSUM: ${{ needs.preflight.outputs.defi_yield_strategy_nonseed_checksum }}
-          FIAT_LIQUIDITY_STATE_COUNT: ${{ needs.preflight.outputs.fiat_liquidity_state_count }}
-          FIAT_LIQUIDITY_STATE_CHECKSUM: ${{ needs.preflight.outputs.fiat_liquidity_state_checksum }}
+          USER_COUNT: ${{ needs.apply.outputs.user_count }}
+          TRANSACTION_COUNT: ${{ needs.apply.outputs.transaction_count }}
+          MESSAGE_COUNT: ${{ needs.apply.outputs.message_count }}
+          TRADE_COUNT: ${{ needs.apply.outputs.trade_count }}
+          PEER_TRANSFER_COUNT: ${{ needs.apply.outputs.peer_transfer_count }}
+          BUSINESS_PROFILE_COUNT: ${{ needs.apply.outputs.business_profile_count }}
+          BUSINESS_PRODUCT_COUNT: ${{ needs.apply.outputs.business_product_count }}
+          WALLET_COUNT: ${{ needs.apply.outputs.wallet_count }}
+          CONVERSATION_MONEY_TICKET_COUNT: ${{ needs.apply.outputs.conversation_money_ticket_count }}
+          CONVERSATION_MONEY_TICKET_CHECKSUM: ${{ needs.apply.outputs.conversation_money_ticket_checksum }}
+          AZM_REWARD_LOG_COUNT: ${{ needs.apply.outputs.azm_reward_log_count }}
+          AZM_REWARD_LOG_CHECKSUM: ${{ needs.apply.outputs.azm_reward_log_checksum }}
+          AZM_SPEND_LOG_COUNT: ${{ needs.apply.outputs.azm_spend_log_count }}
+          AZM_SPEND_LOG_CHECKSUM: ${{ needs.apply.outputs.azm_spend_log_checksum }}
+          DEFI_YIELD_STRATEGY_COUNT: ${{ needs.apply.outputs.defi_yield_strategy_count }}
+          DEFI_YIELD_STRATEGY_SEED_COUNT: ${{ needs.apply.outputs.defi_yield_strategy_seed_count }}
+          DEFI_YIELD_STRATEGY_AAVE_COUNT: ${{ needs.apply.outputs.defi_yield_strategy_aave_count }}
+          DEFI_YIELD_STRATEGY_AAVE_CHECKSUM: ${{ needs.apply.outputs.defi_yield_strategy_aave_checksum }}
+          DEFI_YIELD_STRATEGY_COMPOUND_COUNT: ${{ needs.apply.outputs.defi_yield_strategy_compound_count }}
+          DEFI_YIELD_STRATEGY_COMPOUND_CHECKSUM: ${{ needs.apply.outputs.defi_yield_strategy_compound_checksum }}
+          DEFI_YIELD_STRATEGY_INTERNAL_LP_COUNT: ${{ needs.apply.outputs.defi_yield_strategy_internal_lp_count }}
+          DEFI_YIELD_STRATEGY_INTERNAL_LP_CHECKSUM: ${{ needs.apply.outputs.defi_yield_strategy_internal_lp_checksum }}
+          DEFI_YIELD_STRATEGY_NONSEED_CHECKSUM: ${{ needs.apply.outputs.defi_yield_strategy_nonseed_checksum }}
+          FIAT_LIQUIDITY_STATE_COUNT: ${{ needs.apply.outputs.fiat_liquidity_state_count }}
+          FIAT_LIQUIDITY_STATE_CHECKSUM: ${{ needs.apply.outputs.fiat_liquidity_state_checksum }}
         run: |
           node infra/scripts/guarded-preflight-verify.mjs verify
