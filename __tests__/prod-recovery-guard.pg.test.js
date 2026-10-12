@@ -39,6 +39,7 @@ const PAYOUT_INSTALLER = path.join(__dirname, '..', 'infra', 'install-payout-rec
 const R16_INSTALLER = path.join(__dirname, '..', 'infra', 'install-r16-execution-identity-overlay.js');
 const R42_INSTALLER = path.join(__dirname, '..', 'infra', 'install-r42-idempotency-overlay.js');
 const FIAT_INSTALLER = path.join(__dirname, '..', 'infra', 'install-fiat-liquidity-overlay.js');
+const PHASE3_INSTALLER = path.join(__dirname, '..', 'infra', 'install-phase3-overlay.js');
 const BUSINESS_OS_INSTALLER = path.join(__dirname, '..', 'infra', 'install-business-os-overlay.js');
 
 const CMT_FKS = [
@@ -71,6 +72,7 @@ run('prod-recovery guard helper (real PostgreSQL)', () => {
     let db;
     let seededUserId = null;
     let seededTxId = null;
+    let seededDeFiStrategyIds = [];
     let cmtFksDropped = false;
 
     const localHost = new URL(url).hostname;
@@ -204,6 +206,23 @@ run('prod-recovery guard helper (real PostgreSQL)', () => {
     beforeAll(async () => {
         db = new PrismaClient();
         await ensureIdentityRows();
+
+        // The test.yml bootstrap does not run the release chain's Phase 3
+        // installer, but verify() correctly requires its three documented
+        // strategy seeds. Run the real installer for this fixture, tracking
+        // only rows it newly inserts so afterAll can clean them up.
+        const strategiesBefore = await db.$queryRawUnsafe(
+            'SELECT "id", "name" FROM "DeFiYieldStrategy" WHERE "name" IN (\'AAVE\', \'COMPOUND\', \'INTERNAL_LP\')'
+        );
+        const namesBefore = new Set(strategiesBefore.map((row) => row.name));
+        runInstaller(PHASE3_INSTALLER);
+        const strategiesAfter = await db.$queryRawUnsafe(
+            'SELECT "id", "name" FROM "DeFiYieldStrategy" WHERE "name" IN (\'AAVE\', \'COMPOUND\', \'INTERNAL_LP\')'
+        );
+        seededDeFiStrategyIds = strategiesAfter
+            .filter((row) => !namesBefore.has(row.name))
+            .map((row) => row.id);
+
         // FiatLiquidityState is an expected-initialization target in verify mode.
         // Battery-neighbor suites sometimes leave it truncated; on an empty table
         // the verify rule expects "exactly one zero-valued row after
@@ -242,6 +261,9 @@ run('prod-recovery guard helper (real PostgreSQL)', () => {
             runInstaller(R16_INSTALLER);   // restores VaultDeposit.idempotencyKey
             runInstaller(PAYOUT_INSTALLER);// restores ReconciliationException
             runInstaller(R42_INSTALLER);   // restores FinancialOperation + retirement
+            for (const id of seededDeFiStrategyIds) {
+                await db.$executeRawUnsafe('DELETE FROM "DeFiYieldStrategy" WHERE "id" = $1', id).catch(() => {});
+            }
             if (seededTxId) await db.transactionHistory.delete({ where: { id: seededTxId } }).catch(() => {});
             if (seededUserId) await db.user.delete({ where: { id: seededUserId } }).catch(() => {});
         } finally {
