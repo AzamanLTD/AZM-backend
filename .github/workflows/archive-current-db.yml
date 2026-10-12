@@ -73,25 +73,20 @@ jobs:
         env:
           NEON_KEY: ${{ secrets.NEON_API_KEY }}
         run: |
-          set -euo pipefail
-          list() { curl -fsS -H "Authorization: Bearer $NEON_KEY" "$1"; }
-          list "https://console.neon.tech/api/v2/projects" > projects.json
           python3 - <<'PY'
-          import json
-          d = json.load(open('projects.json'))
-          for p in d.get('projects', []):
+          import json, os, urllib.request
+          key = os.environ['NEON_KEY']
+          def get(path):
+              req = urllib.request.Request('https://console.neon.tech/api/v2' + path, headers={'Authorization': 'Bearer ' + key})
+              with urllib.request.urlopen(req) as r: return json.load(r)
+          for p in get('/projects').get('projects', []):
               print(f"PROJECT {p['id']} name={p.get('name')} region={p.get('region_id')} created={p.get('created_at')} updated={p.get('updated_at')} logical_size={p.get('logical_size')}")
-          open('pids.txt','w').write('\n'.join(p['id'] for p in d.get('projects', [])))
+              try:
+                  for e in get(f"/projects/{p['id']}/endpoints").get('endpoints', []):
+                      print(f"  endpoint {e.get('host')} type={e.get('type')} created={e.get('created_at')} updated={e.get('updated_at')}")
+              except Exception as ex: print('  endpoints error:', ex)
+              try:
+                  for b in get(f"/projects/{p['id']}/branches").get('branches', []):
+                      print(f"  branch {b.get('name')} created={b.get('created_at')} updated={b.get('updated_at')} last_changed={b.get('last_changed_at')} logical_size={b.get('logical_size')}")
+              except Exception as ex: print('  branches error:', ex)
           PY
-          for pid in $(cat pids.txt); do
-            echo "--- project $pid endpoints:"
-            list "https://console.neon.tech/api/v2/projects/$pid/endpoints" | python3 -c "
-import json,sys
-for e in json.load(sys.stdin).get('endpoints',[]):
-    print(f\"  endpoint {e.get('host')} type={e.get('type')} created={e.get('created_at')} updated={e.get('updated_at')}\")"
-            echo "--- project $pid branches:"
-            list "https://console.neon.tech/api/v2/projects/$pid/branches" | python3 -c "
-import json,sys
-for b in json.load(sys.stdin).get('branches',[]):
-    print(f\"  branch {b.get('name')} created={b.get('created_at')} updated={b.get('updated_at')} last_changed={b.get('last_changed_at')} logical_size={b.get('logical_size')}\")"
-          done
