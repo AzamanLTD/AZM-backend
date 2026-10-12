@@ -4,7 +4,7 @@ name: AZM original production branch schema convergence (guarded, one-time)
 # Guarded operational workflow: converges the ORIGINAL production Neon branch
 # (project "Azaman DB" polished-river-71067591, branch br-shy-mode "production",
 # direct endpoint ep-crimson-cell-ab81e3bp.eu-west-2.aws.neon.tech) with the
-# current main release chain so it can resume its role as the backend's
+# current main installer set so it can resume its role as the backend's
 # operational database (Render recovery, Option B).
 #
 # Why this exists: the October 11 Render DATABASE_URL switch pointed the
@@ -14,11 +14,17 @@ name: AZM original production branch schema convergence (guarded, one-time)
 # prisma tables missing there, all owned by reviewed idempotent installers)
 # and holds all application history through Oct 11.
 #
-# What it applies: ONLY the same additive/idempotent steps the Render deploy
-# path itself runs — the three build-time installers (e2ee-server-blind,
-# inventory-restock, reservation-capacity) and the exact `npm run release`
-# pre-deploy chain (see package.json / DEPLOY_RUNBOOK.md). No `prisma db
-# push`, no `migrate deploy`, no broad restore, no unrelated installer.
+# What it applies: ONLY the reviewed, additive, idempotent schema installers —
+# the same DDL the Render deploy path itself runs. This is deliberately a
+# SCHEMA-ONLY sequence: `npm run release` is NOT used verbatim because it also
+# invokes infra/seed-susu-foundation.js, which can CREATE the treasury user
+# and liability-contract record. A recovery convergence must not silently
+# broaden into a seed operation, so the seed is omitted here and the remaining
+# installers run in the exact release-chain order. Deploying the backend is a
+# separate, independent step: the server's boot path can invoke its own
+# conditional auto-release behavior (including conditional seeding and
+# backfills) at startup — that runtime behavior is unchanged by this PR and is
+# neither suppressed nor altered here.
 #
 # Safety contract (mirrors provision-azaman-new-*.yml):
 #   - Requires a human to type "Azaman-Original-Prod" in the confirmation input.
@@ -26,16 +32,19 @@ name: AZM original production branch schema convergence (guarded, one-time)
 #     be EXACTLY ep-crimson-cell-ab81e3bp.eu-west-2.aws.neon.tech (no pooler,
 #     no other Neon project, no other branch) and current_database() must be
 #     exactly neondb. Verified before ANY write.
-#   - Preflight is READ-ONLY: proves production identity (User +
-#     TransactionHistory present and non-empty), REFUSES if the legacy
-#     IdempotencyKey table is populated (the r42 installer retires it; any
-#     non-empty legacy cache must be exported by a human first), records
-#     row counts of core tables for the post-apply comparison, and confirms
-#     the expected additive targets are still absent-or-partial.
-#   - Post-apply verify is READ-ONLY: asserts the audited missing tables and
-#     columns now exist, that IdempotencyKey was retired and recreated empty,
-#     and that NO core application table lost rows. A verification failure
-#     fails the workflow.
+#   - Preflight/counts/verify run the helper script
+#     infra/scripts/guarded-preflight-verify.mjs, whose every mode executes
+#     inside a single BEGIN READ ONLY transaction and always rolls back and
+#     releases the connection (engine-enforced read-only; see the script's
+#     header for the full audited inventory and the out-of-scope objects).
+#   - Preflight REFUSES if the legacy IdempotencyKey table is populated (the
+#     r42 installer retires it; non-empty legacy data must be exported by a
+#     human first). The r42 installer independently re-checks this fail-closed
+#     at apply time (defense in depth).
+#   - Verify asserts the COMPLETE audited inventory: every missing table and
+#     column from the 2026-10-12 audit, the named constraints/indexes, the
+#     IdempotencyKey retirement, and baseline preservation for the important
+#     existing business/financial tables (no core rows lost).
 #   - Connection details are never printed; failures withhold them.
 #
 # REQUIRED SECRET (must exist before dispatch, owner-created):
@@ -63,13 +72,16 @@ jobs:
   preflight:
     name: Confirm target and read-only preflight
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     outputs:
       user_count: ${{ steps.counts.outputs.user_count }}
       transaction_count: ${{ steps.counts.outputs.transaction_count }}
       message_count: ${{ steps.counts.outputs.message_count }}
+      trade_count: ${{ steps.counts.outputs.trade_count }}
+      peer_transfer_count: ${{ steps.counts.outputs.peer_transfer_count }}
       business_profile_count: ${{ steps.counts.outputs.business_profile_count }}
       business_product_count: ${{ steps.counts.outputs.business_product_count }}
+      wallet_count: ${{ steps.counts.outputs.wallet_count }}
     steps:
       - name: Require explicit target confirmation
         env:
@@ -84,7 +96,9 @@ jobs:
         with:
           node-version: "24"
           cache: npm
-      - name: Read-only preflight (identity, IdempotencyKey state, baseline counts)
+      - name: Install dependencies (the helper imports pg)
+        run: npm ci
+      - name: Read-only preflight (identity, IdempotencyKey state, audited targets)
         env:
           DB_URL: ${{ secrets.AZM_ORIGINAL_PROD_DATABASE_URL }}
         run: |
@@ -97,7 +111,7 @@ jobs:
           node infra/scripts/guarded-preflight-verify.mjs counts
 
   apply:
-    name: Apply build-time installers + exact release chain
+    name: Apply reviewed schema-only installer sequence
     needs: [preflight]
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -113,20 +127,36 @@ jobs:
           DB_URL: ${{ secrets.AZM_ORIGINAL_PROD_DATABASE_URL }}
         run: |
           node infra/scripts/guarded-preflight-verify.mjs guard
-      - name: Build-time installers (identical to the Render Build Command)
+      - name: Schema-only convergence (reviewed sequence, seed omitted)
         env:
           DATABASE_URL: ${{ secrets.AZM_ORIGINAL_PROD_DATABASE_URL }}
         run: |
+          set -e
+          # Build-time installers first, matching the Render Build Command.
           node infra/install-e2ee-server-blind-overlay.js
           node infra/install-inventory-restock-overlay.js
           node infra/install-reservation-capacity-overlay.js
-      - name: Exact release chain (identical to the Render Pre-Deploy Command)
-        env:
-          DATABASE_URL: ${{ secrets.AZM_ORIGINAL_PROD_DATABASE_URL }}
-        run: npm run release
+          # The npm run release chain WITHOUT seed-susu-foundation.js,
+          # in the exact package.json release order. Additive and idempotent.
+          node infra/install-prod-drift-remediation.js
+          node infra/install-susu-overlay.js
+          node infra/install-transaction-quote-overlay.js
+          node infra/install-business-os-overlay.js
+          node infra/install-inventory-restock-overlay.js
+          node infra/install-reservation-capacity-overlay.js
+          node infra/install-e2ee-server-blind-overlay.js
+          node infra/install-phase3-overlay.js
+          node infra/install-payout-reconciliation-infra.js
+          node infra/install-fiat-liquidity-overlay.js
+          node infra/install-model-b-settlement-overlay.js
+          node infra/install-r16-execution-identity-overlay.js
+          node infra/install-r19-smartroute-execution-snapshot-overlay.js
+          node infra/install-r42-idempotency-overlay.js
+          node infra/install-payment-requests-overlay.js
+          node infra/install-business-price-overlay.js
 
   verify:
-    name: Read-only post-apply verification
+    name: Read-only post-apply verification (complete audited inventory)
     needs: [apply]
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -136,13 +166,18 @@ jobs:
         with:
           node-version: "24"
           cache: npm
-      - name: Verify audited targets now exist and no core table lost rows
+      - name: Install dependencies (the helper imports pg)
+        run: npm ci
+      - name: Verify the complete audited set and baseline preservation
         env:
           DB_URL: ${{ secrets.AZM_ORIGINAL_PROD_DATABASE_URL }}
           USER_COUNT: ${{ needs.preflight.outputs.user_count }}
           TRANSACTION_COUNT: ${{ needs.preflight.outputs.transaction_count }}
           MESSAGE_COUNT: ${{ needs.preflight.outputs.message_count }}
+          TRADE_COUNT: ${{ needs.preflight.outputs.trade_count }}
+          PEER_TRANSFER_COUNT: ${{ needs.preflight.outputs.peer_transfer_count }}
           BUSINESS_PROFILE_COUNT: ${{ needs.preflight.outputs.business_profile_count }}
           BUSINESS_PRODUCT_COUNT: ${{ needs.preflight.outputs.business_product_count }}
+          WALLET_COUNT: ${{ needs.preflight.outputs.wallet_count }}
         run: |
           node infra/scripts/guarded-preflight-verify.mjs verify
