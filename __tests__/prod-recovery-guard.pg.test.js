@@ -59,12 +59,22 @@ describe('prod-recovery workflow graph contract', () => {
             path.join(__dirname, '..', '.github', 'workflows', 'converge-original-prod-branch.yml'),
             'utf8',
         );
+        const applyIndex = workflow.indexOf('\n  apply:\n');
         const verifyIndex = workflow.indexOf('\n  verify:\n');
-        expect(verifyIndex).toBeGreaterThanOrEqual(0);
+        expect(applyIndex).toBeGreaterThanOrEqual(0);
+        expect(verifyIndex).toBeGreaterThan(applyIndex);
+
+        const applyJob = workflow.slice(applyIndex, verifyIndex);
         const verifyJob = workflow.slice(verifyIndex);
         expect(verifyJob).toMatch(/^\s+needs:\s*\[preflight,\s*apply\]/m);
         expect(verifyJob).toContain('FIAT_LIQUIDITY_STATE_CHECKSUM: ${{ needs.preflight.outputs.fiat_liquidity_state_checksum }}');
         expect(verifyJob).toContain('DEFI_YIELD_STRATEGY_INTERNAL_LP_CHECKSUM: ${{ needs.preflight.outputs.defi_yield_strategy_internal_lp_checksum }}');
+
+        // A manual run must be non-mutating by default: the operator first
+        // inspects the read-only preflight, then explicitly dispatches converge.
+        expect(workflow).toContain('default: preflight-only');
+        expect(applyJob).toMatch(/^\s+if:\s*\$\{\{\s*inputs\.operation\s*==\s*'converge'\s*\}\}/m);
+        expect(verifyJob).toMatch(/^\s+if:\s*\$\{\{\s*inputs\.operation\s*==\s*'converge'\s*\}\}/m);
     });
 });
 
