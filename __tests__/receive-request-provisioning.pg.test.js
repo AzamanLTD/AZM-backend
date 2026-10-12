@@ -274,49 +274,97 @@ run('Receive/Request release-path provisioning (real PostgreSQL)', () => {
         // 0, then drop the table out from under the committing writer. The
         // installer's single atomic lock-then-count DO block must serialize
         // behind the writer and see the committed row.
+        //
+        // The race is coordinated by an EXPLICIT HANDSHAKE, not a fixed sleep:
+        // the writer transaction stays open after the insert, the installer is
+        // started, and PostgreSQL's own lock state (pg_locks) is polled until
+        // the installer is OBSERVED waiting for an ungranted ACCESS EXCLUSIVE
+        // lock on IdempotencyKey. Only then is the writer permitted to commit —
+        // so the interleaving under test is guaranteed to have actually
+        // happened, deterministically, on every machine.
         await dropProvisionedTables();
         await createLegacyIdempotencyKey(false); // empty at "preflight" time
 
-        // Writer connection: insert, hold the transaction open, then commit
-        // while the installer is (blockingly) waiting for the table lock.
         writer = new PrismaClient();
+        // gate: holds the writer's transaction open until the installer is
+        // confirmed blocked on the lock — resolved by the poll loop below.
+        let releaseWriter;
+        const gate = new Promise((resolve) => { releaseWriter = resolve; });
         let signalInsert;
         const insertOpen = new Promise((r) => { signalInsert = r; });
         const writerPromise = writer.$transaction(async (tx) => {
             await tx.$executeRawUnsafe(
                 `INSERT INTO "IdempotencyKey" ("id", "response") VALUES ('racer-1', '{"r":1}')`);
             signalInsert(); // the writer's ROW EXCLUSIVE is now held
-            await new Promise((r) => setTimeout(r, 2500)); // hold uncommitted
-        }, { timeout: 10000 });
+            await gate; // hold the row uncommitted until the lock wait is observed
+        }, { timeout: 60000 });
         await insertOpen; // only NOW is the writer guaranteed in-flight
 
-        // Start the installer while the writer's transaction is open. Its
-        // ACCESS EXCLUSIVE lock waits for the writer; after the writer commits
-        // the count sees the racer row and the block aborts.
-        const res = await new Promise((resolve) => {
-            const child = require('child_process').spawn('node', [R42_INSTALLER], {
+        // Start the installer without awaiting it. Its ACCESS EXCLUSIVE lock
+        // request queues behind the writer's ROW EXCLUSIVE.
+        let child = null;
+        let childClosed = false;
+        const childPromise = new Promise((resolve) => {
+            child = require('child_process').spawn('node', [R42_INSTALLER], {
                 env: { ...process.env, DATABASE_URL: url, LOG_LEVEL: 'debug' },
             });
             let out = '';
             child.stdout.on('data', (d) => { out += d; });
             child.stderr.on('data', (d) => { out += d; });
-            child.on('close', (code) => resolve({ status: code, out }));
+            child.on('close', (code) => { childClosed = true; resolve({ status: code, out }); });
         });
-        await writerPromise; // writer committed (or rolled back) by now
 
-        expect(res.status).not.toBe(0);
-        expect(res.out).toMatch(/IdempotencyKey is populated \(1 rows\)/);
+        // Poll the real lock state until the installer is confirmed WAITING
+        // (an ungranted AccessExclusiveLock request on the legacy table —
+        // pg_locks spells the mode 'AccessExclusiveLock'). Bounded:
+        // a bounded poll window, an early-exit check, and a finally block that
+        // always releases the writer, kills a stuck installer, disconnects the
+        // second connection and re-provisions — a failed assertion can never
+        // leak an open transaction or a half-provisioned database.
+        const LOCK_WAIT_TIMEOUT_MS = 20000;
+        const deadline = Date.now() + LOCK_WAIT_TIMEOUT_MS;
+        let sawLockWait = false;
+        while (Date.now() < deadline) {
+            if (childClosed) break; // installer exited before blocking — diagnosed below
+            const waiting = await db.$queryRaw`
+                SELECT count(*)::int AS n FROM pg_locks
+                 WHERE locktype = 'relation'
+                   AND relation = to_regclass('public."IdempotencyKey"')
+                   AND mode = 'AccessExclusiveLock' -- pg_locks mode spelling
+                   AND NOT granted`;
+            if (waiting[0].n > 0) { sawLockWait = true; break; }
+            await new Promise((r) => setTimeout(r, 25));
+        }
 
-        // The committing writer's row survived the refused drop attempt.
-        const rows = await db.$queryRawUnsafe(`SELECT "id" FROM "IdempotencyKey" ORDER BY "id"`);
-        expect(rows.map((r) => r.id)).toEqual(['racer-1']);
+        let res = null;
+        try {
+            expect(sawLockWait).toBe(true); // the race was REAL, not timed
+            // Permit the writer to commit: the installer's lock is granted,
+            // the count runs INSIDE the lock, sees the committed racer row
+            // and the block aborts — the row is never destroyed.
+            releaseWriter();
+            [res] = await Promise.all([childPromise, writerPromise]);
+            expect(res.status).not.toBe(0);
+            expect(res.out).toMatch(/IdempotencyKey is populated \(1 rows\)/);
 
-        // Clean the fixture and re-provision for the remaining assertions.
-        await db.$executeRawUnsafe('DROP TABLE IF EXISTS "IdempotencyKey";');
-        runInstallers();
-        await verifyProvisionedShape();
-        await writer.$disconnect();
-        writer = null;
+            // The committing writer's row survived the refused drop attempt.
+            const rows = await db.$queryRawUnsafe(`SELECT "id" FROM "IdempotencyKey" ORDER BY "id"`);
+            expect(rows.map((r) => r.id)).toEqual(['racer-1']);
+        } finally {
+            // Reliable cleanup on ANY exit path (assertion, poll timeout,
+            // early installer death): no stuck child, no leaked writer
+            // transaction, and the database re-provisioned for the suites
+            // that follow. All steps are idempotent and failure-tolerant.
+            releaseWriter(); // resolving twice is a no-op
+            if (child && !childClosed && child.exitCode === null) child.kill('SIGKILL');
+            try { await childPromise; } catch (e) { /* child already dead */ }
+            try { await writerPromise; } catch (e) { /* rolled back or committed — either is clean */ }
+            if (writer) { try { await writer.$disconnect(); } catch (e) { /* already gone */ } }
+            writer = null;
+            try { await db.$executeRawUnsafe('DROP TABLE IF EXISTS "IdempotencyKey";'); } catch (e) { /* fixture may already be gone */ }
+            try { runInstallers(); } catch (e) { /* re-provision best effort */ }
+            await verifyProvisionedShape();
+        }
     });
 
     test('converges a pre-review JSONB FinancialOperation.responseBody back to TEXT (§r42 byte-fidelity)', async () => {
