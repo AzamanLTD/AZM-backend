@@ -61,7 +61,7 @@ describe('prod-recovery workflow graph contract', () => {
         const verifyIndex = workflow.indexOf('\n  verify:\n');
         expect(verifyIndex).toBeGreaterThanOrEqual(0);
         const verifyJob = workflow.slice(verifyIndex);
-        expect(verifyJob).toMatch(/^\\s+needs:\\s*\\[preflight,\\s*apply\\]/m);
+        expect(verifyJob).toMatch(/^\s+needs:\s*\[preflight,\s*apply\]/m);
         expect(verifyJob).toContain('FIAT_LIQUIDITY_STATE_CHECKSUM: ${{ needs.preflight.outputs.fiat_liquidity_state_checksum }}');
         expect(verifyJob).toContain('DEFI_YIELD_STRATEGY_INTERNAL_LP_CHECKSUM: ${{ needs.preflight.outputs.defi_yield_strategy_internal_lp_checksum }}');
     });
