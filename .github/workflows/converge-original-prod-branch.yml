@@ -1,0 +1,148 @@
+name: AZM original production branch schema convergence (guarded, one-time)
+
+# =============================================================================
+# Guarded operational workflow: converges the ORIGINAL production Neon branch
+# (project "Azaman DB" polished-river-71067591, branch br-shy-mode "production",
+# direct endpoint ep-crimson-cell-ab81e3bp.eu-west-2.aws.neon.tech) with the
+# current main release chain so it can resume its role as the backend's
+# operational database (Render recovery, Option B).
+#
+# Why this exists: the October 11 Render DATABASE_URL switch pointed the
+# backend at the "pre-phase-3-backup" branch (ep-small-butterfly, a May-31
+# snapshot missing 146 prisma tables). The original production branch is a
+# strict superset of that snapshot (read-only dual audit 2026-10-12: 18
+# prisma tables missing there, all owned by reviewed idempotent installers)
+# and holds all application history through Oct 11.
+#
+# What it applies: ONLY the same additive/idempotent steps the Render deploy
+# path itself runs — the three build-time installers (e2ee-server-blind,
+# inventory-restock, reservation-capacity) and the exact `npm run release`
+# pre-deploy chain (see package.json / DEPLOY_RUNBOOK.md). No `prisma db
+# push`, no `migrate deploy`, no broad restore, no unrelated installer.
+#
+# Safety contract (mirrors provision-azaman-new-*.yml):
+#   - Requires a human to type "Azaman-Original-Prod" in the confirmation input.
+#   - ALL jobs fail closed on target mismatch: the direct Neon hostname must
+#     be EXACTLY ep-crimson-cell-ab81e3bp.eu-west-2.aws.neon.tech (no pooler,
+#     no other Neon project, no other branch) and current_database() must be
+#     exactly neondb. Verified before ANY write.
+#   - Preflight is READ-ONLY: proves production identity (User +
+#     TransactionHistory present and non-empty), REFUSES if the legacy
+#     IdempotencyKey table is populated (the r42 installer retires it; any
+#     non-empty legacy cache must be exported by a human first), records
+#     row counts of core tables for the post-apply comparison, and confirms
+#     the expected additive targets are still absent-or-partial.
+#   - Post-apply verify is READ-ONLY: asserts the audited missing tables and
+#     columns now exist, that IdempotencyKey was retired and recreated empty,
+#     and that NO core application table lost rows. A verification failure
+#     fails the workflow.
+#   - Connection details are never printed; failures withhold them.
+#
+# REQUIRED SECRET (must exist before dispatch, owner-created):
+#   AZM_ORIGINAL_PROD_DATABASE_URL = full connection string for the DIRECT
+#   endpoint ep-crimson-cell-ab81e3bp.eu-west-2.aws.neon.tech, database
+#   neondb. Never the pooled host (DDL must not traverse pgbouncer).
+# =============================================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: Type Azaman-Original-Prod exactly to confirm the intended target
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: azm-original-prod-branch-convergence
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    name: Confirm target and read-only preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      user_count: ${{ steps.counts.outputs.user_count }}
+      transaction_count: ${{ steps.counts.outputs.transaction_count }}
+      message_count: ${{ steps.counts.outputs.message_count }}
+      business_profile_count: ${{ steps.counts.outputs.business_profile_count }}
+      business_product_count: ${{ steps.counts.outputs.business_product_count }}
+    steps:
+      - name: Require explicit target confirmation
+        env:
+          CONFIRMATION: ${{ inputs.confirmation }}
+        run: |
+          if [ "$CONFIRMATION" != "Azaman-Original-Prod" ]; then
+            echo "::error::Confirmation did not match Azaman-Original-Prod. No database connection was attempted."
+            exit 1
+          fi
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: npm
+      - name: Read-only preflight (identity, IdempotencyKey state, baseline counts)
+        env:
+          DB_URL: ${{ secrets.AZM_ORIGINAL_PROD_DATABASE_URL }}
+        run: |
+          node infra/scripts/guarded-preflight-verify.mjs preflight
+      - name: Export baseline core-table counts
+        id: counts
+        env:
+          DB_URL: ${{ secrets.AZM_ORIGINAL_PROD_DATABASE_URL }}
+        run: |
+          node infra/scripts/guarded-preflight-verify.mjs counts
+
+  apply:
+    name: Apply build-time installers + exact release chain
+    needs: [preflight]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: npm
+      - run: npm ci
+      - name: Fail closed unless target is the original production branch
+        env:
+          DB_URL: ${{ secrets.AZM_ORIGINAL_PROD_DATABASE_URL }}
+        run: |
+          node infra/scripts/guarded-preflight-verify.mjs guard
+      - name: Build-time installers (identical to the Render Build Command)
+        env:
+          DATABASE_URL: ${{ secrets.AZM_ORIGINAL_PROD_DATABASE_URL }}
+        run: |
+          node infra/install-e2ee-server-blind-overlay.js
+          node infra/install-inventory-restock-overlay.js
+          node infra/install-reservation-capacity-overlay.js
+      - name: Exact release chain (identical to the Render Pre-Deploy Command)
+        env:
+          DATABASE_URL: ${{ secrets.AZM_ORIGINAL_PROD_DATABASE_URL }}
+        run: npm run release
+
+  verify:
+    name: Read-only post-apply verification
+    needs: [apply]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: npm
+      - name: Verify audited targets now exist and no core table lost rows
+        env:
+          DB_URL: ${{ secrets.AZM_ORIGINAL_PROD_DATABASE_URL }}
+          USER_COUNT: ${{ needs.preflight.outputs.user_count }}
+          TRANSACTION_COUNT: ${{ needs.preflight.outputs.transaction_count }}
+          MESSAGE_COUNT: ${{ needs.preflight.outputs.message_count }}
+          BUSINESS_PROFILE_COUNT: ${{ needs.preflight.outputs.business_profile_count }}
+          BUSINESS_PRODUCT_COUNT: ${{ needs.preflight.outputs.business_product_count }}
+        run: |
+          node infra/scripts/guarded-preflight-verify.mjs verify
