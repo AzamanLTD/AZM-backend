@@ -3,10 +3,16 @@
 // §r42 — shared financial idempotency authority overlay.
 //
 // Creates the FinancialOperation claim table (the durable economic operation
-// identity behind the Idempotency-Key header) and drops the retired
-// IdempotencyKey response-cache table. The old table was a pure derived
-// convenience cache (24h TTL) — no economic identity lives in it, so dropping
-// it loses nothing that can affect money. Idempotent: safe to re-run.
+// identity behind the Idempotency-Key header) and retires the IdempotencyKey
+// response-cache table. The old table was a pure derived convenience cache
+// (24h TTL) — no economic identity lives in it. Idempotent: safe to re-run.
+//
+// Fail-closed retirement: the legacy table is dropped ONLY when absent or
+// empty. The check-and-drop is a single atomic DO block that first takes an
+// ACCESS EXCLUSIVE lock on the legacy table, so concurrent writers cannot
+// populate it between the check and the drop (the workflow preflight runs in
+// a separate job earlier — rows may legally appear in between). A populated
+// table aborts the installer (exit 1) with every legacy row intact.
 // =============================================================================
 
 const logger = require('../src/config/logger');
@@ -36,8 +42,34 @@ const STATEMENTS = [
   `CREATE INDEX IF NOT EXISTS "FinancialOperation_createdAt_idx"
     ON "FinancialOperation"("createdAt");`,
   // Retire the r41-era response cache. Global key scope + 24h expiry made it
-  // unsafe as an economic identity; its rows carry no money truth.
-  `DROP TABLE IF EXISTS "IdempotencyKey";`,
+  // unsafe as an economic identity; its rows carry no money truth — but rows
+  // the operator has not exported are never ours to destroy.
+  //
+  // Atomic TOCTOU-safe retirement: one statement = one transaction. The
+  // ACCESS EXCLUSIVE lock waits out any in-flight INSERT (its writer
+  // transaction holds ROW EXCLUSIVE) and blocks new writers until this
+  // transaction ends, so the row count and the DROP observe exactly the
+  // same committed state. If a writer committed even a single row before
+  // the lock landed, the count sees it and the block aborts with the table
+  // fully intact — the never-drop-a-populated-table invariant holds even
+  // for rows inserted after the caller's preflight.
+  `DO $$
+  DECLARE
+    legacy_rows INTEGER;
+  BEGIN
+    IF to_regclass('public."IdempotencyKey"') IS NOT NULL THEN
+      LOCK TABLE public."IdempotencyKey" IN ACCESS EXCLUSIVE MODE;
+      SELECT count(*) INTO legacy_rows FROM public."IdempotencyKey";
+      IF legacy_rows > 0 THEN
+        RAISE EXCEPTION USING
+          ERRCODE = 'P0001',
+          MESSAGE = format(
+            'IdempotencyKey is populated (%s rows); refusing to drop it — legacy rows would be destroyed. Export/migrate the rows, empty the table, and re-run.',
+            legacy_rows);
+      END IF;
+      DROP TABLE public."IdempotencyKey";
+    END IF;
+  END $$;`,
 ];
 
 async function main() {

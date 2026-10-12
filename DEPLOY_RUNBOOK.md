@@ -94,7 +94,13 @@ workflow `.github/workflows/provision-azaman-new-receive-request.yml`.
   does NOT safeguard populated legacy data — if the table exists with any
   rows, preflight refuses to proceed (export/migrate them first, empty
   the table, then re-dispatch). An absent or empty `IdempotencyKey` is
-  safe: it is simply dropped/absent by design. Post-install verification
+  safe: it is simply dropped/absent by design. The preflight refusal is
+  defense-in-depth: the r42 installer itself ALSO fails closed — its
+  check-and-drop is one atomic lock-then-count block (ACCESS EXCLUSIVE on
+  the legacy table before counting), so rows inserted between the
+  preflight job and the apply job (a TOCTOU window across jobs) are
+  refused independently, with the table and every row left intact. A
+  populated table cannot be destroyed by either layer. Post-install verification
   (read-only) asserts the full contract — every column, type and default,
   both primary keys, the User FKs with cascade, all indexes, the unique
   token-hash lookup, the §r42 byte-fidelity requirement that

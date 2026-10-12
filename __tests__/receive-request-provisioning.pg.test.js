@@ -12,9 +12,11 @@
 //   1. provision both tables FROM ABSENT with the exact reviewed DDL render
 //      (columns, types, defaults, PKs, User FKs with cascade, indexes),
 //   2. retire an EMPTY legacy IdempotencyKey table safely,
-//   3. would silently drop a POPULATED legacy IdempotencyKey table — which is
-//      precisely why the workflow preflight fails closed on populated legacy
-//      data (the guard is mandatory, not paranoia),
+//   3. independently REFUSE to destroy a POPULATED legacy IdempotencyKey
+//      table (the installer is fail-closed on its own, so rows that appear
+//      between the workflow preflight and the apply job — a TOCTOU window —
+//      are still safe; the preflight is an early operator-facing refusal,
+//      the installer is the hard guarantee),
 //   4. converge a pre-review JSONB FinancialOperation.responseBody back to
 //      TEXT (§r42 byte-fidelity),
 //   5. replay idempotently.
@@ -41,6 +43,7 @@ const PR_INSTALLER = path.join(__dirname, '..', 'infra', 'install-payment-reques
 
 run('Receive/Request release-path provisioning (real PostgreSQL)', () => {
     let db;
+    let writer; // second connection used to hold an uncommitted legacy insert
 
     beforeAll(async () => {
         db = new PrismaClient();
@@ -48,17 +51,33 @@ run('Receive/Request release-path provisioning (real PostgreSQL)', () => {
 
     afterAll(async () => {
         // Self-heal: whatever happened above, leave both tables provisioned
-        // for the rest of the battery (the installers are idempotent).
+        // for the rest of the battery (the installers are idempotent). The
+        // intentional-failure tests may leave a POPULATED legacy IdempotencyKey
+        // behind — the installer would (correctly) refuse to retire it, so
+        // remove the test fixture first, then re-provision.
+        try {
+            await db.$executeRawUnsafe('DROP TABLE IF EXISTS "IdempotencyKey";');
+        } catch (e) { /* fixture may already be gone */ }
         runInstallers();
+        if (writer) await writer.$disconnect();
         await db.$disconnect();
     });
 
+    // Spawns one installer and RETURNS the result without throwing, so a
+    // test can assert on an intentional failure.
+    function spawnInstaller(installer) {
+        return spawnSync('node', [installer], {
+            // LOG_LEVEL: the logger is silent under NODE_ENV=test, but the
+            // workflow's apply job runs with logging enabled — assert on the
+            // same refusal message the operator sees.
+            env: { ...process.env, DATABASE_URL: url, LOG_LEVEL: 'debug' },
+            encoding: 'utf8',
+        });
+    }
+
     function runInstallers() {
         for (const installer of [R42_INSTALLER, PR_INSTALLER]) {
-            const res = spawnSync('node', [installer], {
-                env: { ...process.env, DATABASE_URL: url },
-                encoding: 'utf8',
-            });
+            const res = spawnInstaller(installer);
             if (res.status !== 0) {
                 throw new Error(
                     `installer ${path.basename(installer)} exited ${res.status}\nstdout: ${res.stdout}\nstderr: ${res.stderr}`
@@ -216,18 +235,88 @@ run('Receive/Request release-path provisioning (real PostgreSQL)', () => {
         expect(legacy[0].oid).toBe(null);
     });
 
-    test('a POPULATED legacy IdempotencyKey would be silently dropped by the r42 installer — the workflow preflight refusal is the guard', async () => {
-        // This documents WHY .github/workflows/provision-azaman-new-receive-request.yml
-        // fails closed when IdempotencyKey exists and is non-empty: the
-        // installer itself does NOT safeguard populated legacy data.
+    test('the r42 installer REFUSES a populated legacy IdempotencyKey — rows and table survive intact', async () => {
+        // The workflow preflight is a separate job that runs earlier; rows may
+        // legally appear between it and the apply job. The installer itself
+        // must fail closed: it exits non-zero and leaves the legacy table and
+        // every row exactly as it found them.
         await createLegacyIdempotencyKey(true);
-        const populated = await db.$queryRawUnsafe(`SELECT COUNT(*)::int AS n FROM "IdempotencyKey"`);
-        expect(populated[0].n).toBe(1);
+        await db.$executeRawUnsafe(
+            `INSERT INTO "IdempotencyKey" ("id", "response") VALUES ('legacy-2', '{"x":1}')`);
+        const before = await db.$queryRawUnsafe(`SELECT "id", "response" FROM "IdempotencyKey" ORDER BY "id"`);
+        expect(before).toHaveLength(2);
 
+        const res = spawnInstaller(R42_INSTALLER);
+        expect(res.status).not.toBe(0); // intentional, fail-closed refusal
+        expect(`${res.stdout}${res.stderr}`).toMatch(/IdempotencyKey is populated \(2 rows\)/);
+        expect(`${res.stdout}${res.stderr}`).toMatch(/refusing to drop/i);
+
+        // Nothing was destroyed: the table still exists, with both original
+        // rows byte-identical.
+        const legacyGone = await db.$queryRaw`SELECT to_regclass('public."IdempotencyKey"')::text AS oid`;
+        expect(legacyGone[0].oid).toBe('"IdempotencyKey"');
+        const after = await db.$queryRawUnsafe(`SELECT "id", "response" FROM "IdempotencyKey" ORDER BY "id"`);
+        expect(after).toEqual(before);
+
+        // Operator recovery path (runbook): export/migrate the rows, EMPTY the
+        // table, re-run — then the retirement proceeds safely.
+        await db.$executeRawUnsafe(`DELETE FROM "IdempotencyKey"`);
         runInstallers();
         const legacy = await db.$queryRaw`SELECT to_regclass('public."IdempotencyKey"')::text AS oid`;
-        expect(legacy[0].oid).toBe(null); // gone, rows included — hence the preflight guard
+        expect(legacy[0].oid).toBe(null); // emptied legacy cache retired safely
         await verifyProvisionedShape();
+    });
+
+    test('TOCTOU: a legacy row COMMITTED while the installer runs is still refused (lock-then-count atomicity)', async () => {
+        // Reproduces the exact race from the PR review: the workflow preflight
+        // saw an EMPTY table, a writer inserts+commits before the installer's
+        // DROP lands. A check-then-drop split across two statements would count
+        // 0, then drop the table out from under the committing writer. The
+        // installer's single atomic lock-then-count DO block must serialize
+        // behind the writer and see the committed row.
+        await dropProvisionedTables();
+        await createLegacyIdempotencyKey(false); // empty at "preflight" time
+
+        // Writer connection: insert, hold the transaction open, then commit
+        // while the installer is (blockingly) waiting for the table lock.
+        writer = new PrismaClient();
+        let signalInsert;
+        const insertOpen = new Promise((r) => { signalInsert = r; });
+        const writerPromise = writer.$transaction(async (tx) => {
+            await tx.$executeRawUnsafe(
+                `INSERT INTO "IdempotencyKey" ("id", "response") VALUES ('racer-1', '{"r":1}')`);
+            signalInsert(); // the writer's ROW EXCLUSIVE is now held
+            await new Promise((r) => setTimeout(r, 2500)); // hold uncommitted
+        }, { timeout: 10000 });
+        await insertOpen; // only NOW is the writer guaranteed in-flight
+
+        // Start the installer while the writer's transaction is open. Its
+        // ACCESS EXCLUSIVE lock waits for the writer; after the writer commits
+        // the count sees the racer row and the block aborts.
+        const res = await new Promise((resolve) => {
+            const child = require('child_process').spawn('node', [R42_INSTALLER], {
+                env: { ...process.env, DATABASE_URL: url, LOG_LEVEL: 'debug' },
+            });
+            let out = '';
+            child.stdout.on('data', (d) => { out += d; });
+            child.stderr.on('data', (d) => { out += d; });
+            child.on('close', (code) => resolve({ status: code, out }));
+        });
+        await writerPromise; // writer committed (or rolled back) by now
+
+        expect(res.status).not.toBe(0);
+        expect(res.out).toMatch(/IdempotencyKey is populated \(1 rows\)/);
+
+        // The committing writer's row survived the refused drop attempt.
+        const rows = await db.$queryRawUnsafe(`SELECT "id" FROM "IdempotencyKey" ORDER BY "id"`);
+        expect(rows.map((r) => r.id)).toEqual(['racer-1']);
+
+        // Clean the fixture and re-provision for the remaining assertions.
+        await db.$executeRawUnsafe('DROP TABLE IF EXISTS "IdempotencyKey";');
+        runInstallers();
+        await verifyProvisionedShape();
+        await writer.$disconnect();
+        writer = null;
     });
 
     test('converges a pre-review JSONB FinancialOperation.responseBody back to TEXT (§r42 byte-fidelity)', async () => {
@@ -270,7 +359,8 @@ run('Receive/Request release-path provisioning (real PostgreSQL)', () => {
         // A real requester row (FK target), removed again in cleanup below.
         await db.$executeRawUnsafe(`
             INSERT INTO "User" ("id", "username", "email", "password")
-            VALUES (900000001, 'prov-smoke-user', 'prov-smoke@example.test', 'x')`);
+            VALUES (900000001, 'prov-smoke-user', 'prov-smoke@example.test', 'x')
+            ON CONFLICT ("id") DO NOTHING`);
         // FinancialOperation: unique claim identity is live.
         await expect(db.$executeRawUnsafe(`
             INSERT INTO "FinancialOperation" ("userId","endpoint","key","fingerprint")
