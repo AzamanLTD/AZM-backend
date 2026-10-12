@@ -196,19 +196,19 @@ async function hasColumn(client, table, column) {
 }
 
 async function checksum(client, table) {
-  const absent = isAbsent(await scalar(client, `SELECT to_regclass('"\${table}"') IS NULL`));
+  const absent = isAbsent(await scalar(client, `SELECT to_regclass('"${table}"') IS NULL`));
   if (absent) return '-1';
   return String(await scalar(client,
-    `SELECT md5(COALESCE(string_agg(CAST(t AS text), '|' ORDER BY t."id"), '')) FROM "\${table}" t`));
+    `SELECT md5(COALESCE(string_agg(CAST(t AS text), '|' ORDER BY t."id"), '')) FROM "${table}" t`));
 }
 
 // Content checksum over a reviewed, static predicate. An absent table is
 // represented by -1; callers separately handle an expected table creation.
 async function filteredChecksum(client, table, predicate) {
-  const absent = isAbsent(await scalar(client, `SELECT to_regclass('"\${table}"') IS NULL`));
+  const absent = isAbsent(await scalar(client, `SELECT to_regclass('"${table}"') IS NULL`));
   if (absent) return '-1';
   return String(await scalar(client,
-    `SELECT md5(COALESCE(string_agg(CAST(t AS text), '|' ORDER BY t."id"), '')) FROM "\${table}" t WHERE ${predicate}`));
+    `SELECT md5(COALESCE(string_agg(CAST(t AS text), '|' ORDER BY t."id"), '')) FROM "${table}" t WHERE ${predicate}`));
 }
 
 async function coreCounts(client) {
