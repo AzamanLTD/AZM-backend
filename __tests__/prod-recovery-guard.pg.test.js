@@ -26,6 +26,7 @@
 // assertion fails (mirrors __tests__/ghs-price-provisioning.pg.test.js).
 
 const { spawnSync } = require('child_process');
+const fs = require('fs');
 const path = require('path');
 const { URL } = require('url');
 const { PrismaClient } = require('@prisma/client');
@@ -37,6 +38,7 @@ const SCRIPT = path.join(__dirname, '..', 'infra', 'scripts', 'guarded-preflight
 const PAYOUT_INSTALLER = path.join(__dirname, '..', 'infra', 'install-payout-reconciliation-infra.js');
 const R16_INSTALLER = path.join(__dirname, '..', 'infra', 'install-r16-execution-identity-overlay.js');
 const R42_INSTALLER = path.join(__dirname, '..', 'infra', 'install-r42-idempotency-overlay.js');
+const FIAT_INSTALLER = path.join(__dirname, '..', 'infra', 'install-fiat-liquidity-overlay.js');
 const BUSINESS_OS_INSTALLER = path.join(__dirname, '..', 'infra', 'install-business-os-overlay.js');
 
 const CMT_FKS = [
@@ -49,6 +51,21 @@ const CMT_FKS = [
     ['ConversationMoneyTicket_counterpartyId_fkey',
         'ALTER TABLE "ConversationMoneyTicket" ADD CONSTRAINT "ConversationMoneyTicket_counterpartyId_fkey" FOREIGN KEY ("counterpartyId") REFERENCES "User"("id") ON DELETE RESTRICT'],
 ];
+
+describe('prod-recovery workflow graph contract', () => {
+    test('verify directly depends on preflight so production preservation baselines are available', () => {
+        const workflow = fs.readFileSync(
+            path.join(__dirname, '..', '.github', 'workflows', 'converge-original-prod-branch.yml'),
+            'utf8',
+        );
+        const verifyIndex = workflow.indexOf('\n  verify:\n');
+        expect(verifyIndex).toBeGreaterThanOrEqual(0);
+        const verifyJob = workflow.slice(verifyIndex);
+        expect(verifyJob).toMatch(/^\\s+needs:\\s*\\[preflight,\\s*apply\\]/m);
+        expect(verifyJob).toContain('FIAT_LIQUIDITY_STATE_CHECKSUM: ${{ needs.preflight.outputs.fiat_liquidity_state_checksum }}');
+        expect(verifyJob).toContain('DEFI_YIELD_STRATEGY_INTERNAL_LP_CHECKSUM: ${{ needs.preflight.outputs.defi_yield_strategy_internal_lp_checksum }}');
+    });
+});
 
 run('prod-recovery guard helper (real PostgreSQL)', () => {
     let db;
@@ -287,6 +304,26 @@ run('prod-recovery guard helper (real PostgreSQL)', () => {
         expect(res.stderr).toContain('ReconciliationException');
         // self-heal immediately so later suites cannot observe the gap
         runInstaller(PAYOUT_INSTALLER);
+    });
+
+    test('verify accepts and checks expected FiatLiquidityState initialization when the table was absent at baseline', async () => {
+        await db.$executeRawUnsafe('DROP TABLE IF EXISTS "FiatLiquidityState"');
+        try {
+            const base = await baselines();
+            expect(base.fiat_liquidity_state_count).toBe(-1);
+            expect(base.fiat_liquidity_state_checksum).toBe('-1');
+
+            runInstaller(FIAT_INSTALLER);
+            const res = runScript('verify', { env: baselineEnv(base) });
+            expect(res.status).toBe(0);
+            expect(res.stderr).toBe('');
+            expect(res.stdout).toContain('initialized to the documented zero-valued singleton');
+            expect(res.stdout).toContain('verification complete');
+        } finally {
+            // Re-provision the expected zero-valued singleton even if an
+            // assertion fails, so the serial test battery stays hermetic.
+            runInstaller(FIAT_INSTALLER);
+        }
     });
 
     test('verify passes end-to-end on the fully provisioned database', async () => {
