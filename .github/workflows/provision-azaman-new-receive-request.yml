@@ -1,0 +1,475 @@
+name: AZM Azaman-New Receive/Request overlay provision
+
+# =============================================================================
+# Guarded operational workflow: applies ONLY the reviewed Receive/Request
+# overlays — infra/install-r42-idempotency-overlay.js (FinancialOperation +
+# retirement of the legacy IdempotencyKey cache) and
+# infra/install-payment-requests-overlay.js (PaymentRequest) — to the
+# already-initialized Azaman-New Neon database.
+#
+# Why this exists: PR #332 (server-owned payment-request API) is merged, but
+# the live Render service (Free plan) does not execute the Pre-Deploy Command
+# (`npm run release` — see DEPLOY_RUNBOOK.md "Free-plan Render deploy path"),
+# so the deployed runtime database still lacks compatible FinancialOperation
+# and PaymentRequest tables and frontend PR #147 cannot ship against it.
+# Until the dashboard change is applied, this workflow is the supported,
+# repeatable provisioning path for exactly those two overlays.
+#
+# Safety contract (mirrors .github/workflows/provision-azaman-new-business-price.yml):
+#   - Requires a human to type "Azaman-New" in the confirmation input.
+#   - ALL THREE jobs fail closed on target mismatch: the direct Neon hostname
+#     must be EXACTLY ep-floral-hat-b9qwuuq0.c-7.eu-central-1.aws.neon.tech
+#     (no pooler, no other Neon project) and current_database() must be
+#     exactly neondb. Preflight AND apply AND post-install verify assert both
+#     before doing anything else; a mismatch aborts before any write.
+#   - Preflight is READ-ONLY: reports the existing states of
+#     FinancialOperation, PaymentRequest, and the legacy IdempotencyKey
+#     table. If IdempotencyKey EXISTS AND IS NON-EMPTY, preflight REFUSES to
+#     proceed — the r42 installer drops that table, and populated legacy data
+#     must never be silently dropped; a human must export/migrate it first.
+#   - Apply runs ONLY the two reviewed, idempotent, additive installers —
+#     no `prisma db push`, no `migrate deploy`, no `npm run release` chain,
+#     no seeds, no unrelated installers.
+#   - Verify is READ-ONLY: asserts the full FinancialOperation + PaymentRequest
+#     contract (columns, types, defaults, PKs, User FKs with cascade, all
+#     indexes) including the §r42 byte-fidelity requirement that
+#     FinancialOperation.responseBody is TEXT (wire text, never JSONB), and
+#     confirms the legacy IdempotencyKey table is retired. A verification
+#     failure fails the workflow.
+#   - Connection details are never printed; failures withhold them.
+# =============================================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: Type Azaman-New exactly to confirm the intended target
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: azm-azaman-new-receive-request-provision
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    name: Confirm target and read-only preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Require explicit target confirmation
+        env:
+          CONFIRMATION: ${{ inputs.confirmation }}
+        run: |
+          if [ "$CONFIRMATION" != "Azaman-New" ]; then
+            echo "::error::Confirmation did not match Azaman-New. No database connection was attempted."
+            exit 1
+          fi
+
+      - name: Checkout backend
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Read-only target preflight
+        env:
+          DATABASE_URL: ${{ secrets.AZM_NEW_DATABASE_URL }}
+        run: |
+          node <<'NODE'
+          const { Client } = require('pg');
+
+          (async () => {
+            let client;
+            try {
+              const raw = process.env.DATABASE_URL;
+              if (!raw) throw Object.assign(new Error('missing secret'), { code: 'MISSING_SECRET' });
+              const url = new URL(raw);
+              if (!['postgres:', 'postgresql:'].includes(url.protocol)) {
+                throw Object.assign(new Error('invalid protocol'), { code: 'INVALID_URL' });
+              }
+              const EXPECTED_HOST = 'ep-floral-hat-b9qwuuq0.c-7.eu-central-1.aws.neon.tech';
+              const host = url.hostname.toLowerCase();
+              if (!host.endsWith('.neon.tech') || host.includes('-pooler')) {
+                throw Object.assign(new Error('must use direct Neon endpoint'), { code: 'NOT_DIRECT_NEON' });
+              }
+              if (host !== EXPECTED_HOST) {
+                // Fail closed: any other Neon project/endpoint is a wrong target.
+                console.error(`Target hostname mismatch: expected ${EXPECTED_HOST}, got ${host}. Aborting before any query.`);
+                throw Object.assign(new Error('not the Azaman-New direct endpoint'), { code: 'WRONG_TARGET_HOST' });
+              }
+
+              client = new Client({ connectionString: raw, connectionTimeoutMillis: 10000 });
+              await client.connect();
+              const { rows } = await client.query(`
+                SELECT current_database() AS database_name,
+                       current_schema() AS schema_name,
+                       (SELECT COUNT(*)::int
+                          FROM information_schema.tables
+                         WHERE table_schema = 'public'
+                           AND table_type = 'BASE TABLE') AS public_table_count
+              `);
+              const row = rows[0];
+              console.log(`Read-only target check: database=${row.database_name}, schema=${row.schema_name}, public tables=${row.public_table_count}`);
+
+              if (row.database_name !== 'neondb') {
+                console.error(`Target database mismatch: expected neondb, got ${row.database_name}. Aborting.`);
+                throw Object.assign(new Error('not the neondb database'), { code: 'WRONG_TARGET_DATABASE' });
+              }
+              if (row.schema_name !== 'public') {
+                throw Object.assign(new Error('unexpected schema'), { code: 'UNEXPECTED_SCHEMA' });
+              }
+
+              // The database must be the INITIALIZED Azaman-New — the
+              // installers only add FinancialOperation/PaymentRequest on top
+              // of an existing schema (PaymentRequest FKs reference User).
+              const required = ['User', 'BusinessProfile', 'BusinessProduct'];
+              const present = await client.query(`
+                SELECT table_name FROM information_schema.tables
+                 WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
+                   AND table_name = ANY($1::text[])`, [required]);
+              const found = new Set(present.rows.map((r) => r.table_name));
+              const missing = required.filter((t) => !found.has(t));
+              if (missing.length) {
+                throw Object.assign(
+                  new Error(`target is not an initialized Azaman-New (missing ${missing.join(', ')})`),
+                  { code: 'TARGET_NOT_INITIALIZED' }
+                );
+              }
+
+              // Report the current state of every table this workflow touches
+              // (read-only; the installers are a safe replay on existing ones).
+              for (const t of ['FinancialOperation', 'PaymentRequest']) {
+                const exists = await client.query(
+                  `SELECT to_regclass($1) IS NOT NULL AS present`, [`public."${t}"`]);
+                if (exists.rows[0].present) {
+                  const n = await client.query(`SELECT COUNT(*)::int AS n FROM public."${t}"`);
+                  console.log(`${t} before apply: present, ${n.rows[0].n} rows (installer is an idempotent replay)`);
+                } else {
+                  console.log(`${t} before apply: absent (will be created)`);
+                }
+              }
+
+              // FAIL CLOSED on populated legacy IdempotencyKey data. The r42
+              // installer DROPS that table; if it exists AND holds rows, a
+              // human must export/migrate them first — this workflow must
+              // never silently destroy populated legacy data.
+              const legacy = await client.query(
+                `SELECT to_regclass('public."IdempotencyKey"') IS NOT NULL AS present`);
+              if (legacy.rows[0].present) {
+                const n = await client.query(`SELECT COUNT(*)::int AS n FROM public."IdempotencyKey"`);
+                const rows = n.rows[0].n;
+                if (rows > 0) {
+                  console.error(`IdempotencyKey exists and is NON-EMPTY (${rows} rows). The r42 overlay retires that table by dropping it; refusing to proceed. Export/migrate the legacy rows, empty the table, then re-dispatch.`);
+                  throw Object.assign(new Error('populated legacy IdempotencyKey data present'), { code: 'LEGACY_IDEMPOTENCYKEY_POPULATED' });
+                }
+                console.log('IdempotencyKey exists and is EMPTY — the r42 installer will retire (drop) it safely.');
+              } else {
+                console.log('IdempotencyKey already absent.');
+              }
+              console.log('Preflight passed. No writes were performed by this job.');
+            } catch (err) {
+              console.error(`Preflight failed (${err.code || 'connection/precondition error'}). Connection details are withheld; no schema writes were started.`);
+              process.exitCode = 1;
+            } finally {
+              if (client) await client.end().catch(() => {});
+            }
+          })();
+          NODE
+
+  apply_overlay:
+    name: Apply r42-idempotency + payment-requests overlays (idempotent, additive only)
+    needs: preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout backend
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Generate Prisma Client for the overlay installers
+        env:
+          DATABASE_URL: postgresql://provision:provision@localhost:5432/azm_provision?schema=public
+        run: npx prisma generate
+
+      - name: Fail-closed target guard before apply (read-only)
+        env:
+          DATABASE_URL: ${{ secrets.AZM_NEW_DATABASE_URL }}
+        run: |
+          node <<'NODE'
+          const { Client } = require('pg');
+
+          (async () => {
+            const EXPECTED_HOST = 'ep-floral-hat-b9qwuuq0.c-7.eu-central-1.aws.neon.tech';
+            let client;
+            try {
+              const raw = process.env.DATABASE_URL;
+              if (!raw) throw Object.assign(new Error('missing secret'), { code: 'MISSING_SECRET' });
+              const url = new URL(raw);
+              if (!['postgres:', 'postgresql:'].includes(url.protocol)) {
+                throw Object.assign(new Error('invalid protocol'), { code: 'INVALID_URL' });
+              }
+              const host = url.hostname.toLowerCase();
+              if (!host.endsWith('.neon.tech') || host.includes('-pooler')) {
+                throw Object.assign(new Error('must use direct Neon endpoint'), { code: 'NOT_DIRECT_NEON' });
+              }
+              if (host !== EXPECTED_HOST) {
+                console.error(`Target hostname mismatch: expected ${EXPECTED_HOST}, got ${host}. Refusing to apply.`);
+                throw Object.assign(new Error('not the Azaman-New direct endpoint'), { code: 'WRONG_TARGET_HOST' });
+              }
+              client = new Client({ connectionString: raw, connectionTimeoutMillis: 10000 });
+              await client.connect();
+              const { rows } = await client.query('SELECT current_database() AS database_name');
+              if (rows[0].database_name !== 'neondb') {
+                console.error(`Target database mismatch: expected neondb, got ${rows[0].database_name}. Refusing to apply.`);
+                throw Object.assign(new Error('not the neondb database'), { code: 'WRONG_TARGET_DATABASE' });
+              }
+              console.log(`Target guard passed: neondb @ ${EXPECTED_HOST}. No writes performed by this step.`);
+            } catch (err) {
+              console.error(`Target guard failed (${err.code || 'connection error'}). Connection details are withheld; the overlays were NOT applied.`);
+              process.exitCode = 1;
+            } finally {
+              if (client) await client.end().catch(() => {});
+            }
+          })();
+          NODE
+
+      - name: Apply the r42 idempotency and payment-request overlays
+        env:
+          DATABASE_URL: ${{ secrets.AZM_NEW_DATABASE_URL }}
+        run: node infra/install-r42-idempotency-overlay.js && node infra/install-payment-requests-overlay.js
+
+  verify:
+    name: Read-only post-install verification
+    needs: apply_overlay
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout backend
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Verify FinancialOperation + PaymentRequest contract (read-only)
+        env:
+          DATABASE_URL: ${{ secrets.AZM_NEW_DATABASE_URL }}
+        run: |
+          node <<'NODE'
+          const { Client } = require('pg');
+
+          const fail = (code, detail) => {
+            console.error(`VERIFY FAILED [${code}] ${detail}`);
+            process.exitCode = 1;
+            return false;
+          };
+
+          // The exact reviewed overlay DDL render. name -> [data_type, nullable, default-check]
+          const FIN_COLUMNS = {
+            id:            ['text', 'NO', (d) => /gen_random_uuid/.test(d || '')],
+            userId:        ['integer', 'NO', (d) => d === null],
+            endpoint:      ['text', 'NO', (d) => d === null],
+            key:           ['text', 'NO', (d) => d === null],
+            status:        ['text', 'NO', (d) => d === `'IN_PROGRESS'::text`],
+            fingerprint:   ['text', 'NO', (d) => d === null],
+            failurePolicy: ['text', 'NO', (d) => d === `'RETAIN'::text`],
+            statusCode:    ['integer', 'YES', (d) => d === null],
+            responseBody:  ['text', 'YES', (d) => d === null],
+            createdAt:     ['timestamp without time zone', 'NO', (d) => /^CURRENT_TIMESTAMP/.test(d || '')],
+            updatedAt:     ['timestamp without time zone', 'NO', (d) => /^CURRENT_TIMESTAMP/.test(d || '')],
+          };
+          const PR_COLUMNS = {
+            id:          ['text', 'NO', (d) => /gen_random_uuid/.test(d || '')],
+            requesterId: ['integer', 'NO', (d) => d === null],
+            recipientId: ['integer', 'YES', (d) => d === null],
+            mode:        ['text', 'NO', (d) => d === null],
+            status:      ['text', 'NO', (d) => d === `'PENDING'::text`],
+            amountExact: ['text', 'NO', (d) => d === null],
+            currency:    ['text', 'NO', (d) => d === `'GHS'::text`],
+            tokenHash:   ['text', 'YES', (d) => d === null],
+            expiresAt:   ['timestamp without time zone', 'NO', (d) => d === null],
+            resolvedAt:  ['timestamp without time zone', 'YES', (d) => d === null],
+            createdAt:   ['timestamp without time zone', 'NO', (d) => /^CURRENT_TIMESTAMP/.test(d || '')],
+            updatedAt:   ['timestamp without time zone', 'NO', (d) => d === null],
+          };
+          const TIMESTAMP_PRECISION = 3;
+
+          async function verifyTable(client, table, columns) {
+            // Table
+            const t = await client.query(`SELECT to_regclass($1)::text AS oid`, [`public."${table}"`]);
+            if (!t.rows[0].oid) return fail('TABLE_MISSING', table);
+            console.log(`PASS  table            public."${table}"`);
+
+            // Columns: inventory, types, nullability, defaults
+            const cols = await client.query(`
+              SELECT column_name, data_type, datetime_precision AS dprec,
+                     is_nullable, column_default
+                FROM information_schema.columns
+               WHERE table_schema = 'public' AND table_name = $1`, [table]);
+            const byName = new Map(cols.rows.map((c) => [c.column_name, c]));
+            if (byName.size !== Object.keys(columns).length) {
+              return fail('COLUMN_COUNT', `${table}: expected ${Object.keys(columns).length} columns, found ${byName.size}`);
+            }
+            for (const [name, [type, nullable, defaultOk]] of Object.entries(columns)) {
+              const c = byName.get(name);
+              if (!c) return fail('COLUMN_MISSING', `${table}.${name}`);
+              if (c.data_type !== type) return fail('COLUMN_TYPE', `${table}.${name}: ${c.data_type} != ${type}`);
+              if (c.is_nullable !== nullable) return fail('COLUMN_NULLABLE', `${table}.${name}: ${c.is_nullable} != ${nullable}`);
+              if (type === 'timestamp without time zone' && c.dprec !== TIMESTAMP_PRECISION) {
+                return fail('COLUMN_PRECISION', `${table}.${name}: dprec ${c.dprec} != ${TIMESTAMP_PRECISION}`);
+              }
+              if (!defaultOk(c.column_default)) {
+                return fail('COLUMN_DEFAULT', `${table}.${name}: ${JSON.stringify(c.column_default)}`);
+              }
+              console.log(`PASS  column           ${table}.${name.padEnd(16)} ${type} ${nullable === 'NO' ? 'NOT NULL' : 'nullable'}`);
+            }
+          }
+
+          (async () => {
+            let client;
+            try {
+              const raw = process.env.DATABASE_URL;
+              if (!raw) throw Object.assign(new Error('missing secret'), { code: 'MISSING_SECRET' });
+              const url = new URL(raw);
+              const EXPECTED_HOST = 'ep-floral-hat-b9qwuuq0.c-7.eu-central-1.aws.neon.tech';
+              const host = url.hostname.toLowerCase();
+              if (!host.endsWith('.neon.tech') || host.includes('-pooler')) {
+                throw Object.assign(new Error('must use direct Neon endpoint'), { code: 'NOT_DIRECT_NEON' });
+              }
+              if (host !== EXPECTED_HOST) {
+                console.error(`Target hostname mismatch: expected ${EXPECTED_HOST}, got ${host}. Aborting before any query.`);
+                throw Object.assign(new Error('not the Azaman-New direct endpoint'), { code: 'WRONG_TARGET_HOST' });
+              }
+
+              client = new Client({ connectionString: raw, connectionTimeoutMillis: 10000 });
+              await client.connect();
+
+              // 0. Fail closed on target database — verify must never run
+              // against (or silently pass on) anything but Azaman-New neondb.
+              const db = await client.query('SELECT current_database() AS database_name');
+              if (db.rows[0].database_name !== 'neondb') {
+                console.error(`Target database mismatch: expected neondb, got ${db.rows[0].database_name}. Aborting.`);
+                throw Object.assign(new Error('not the neondb database'), { code: 'WRONG_TARGET_DATABASE' });
+              }
+              console.log('PASS  target            neondb @ ep-floral-hat-b9qwuuq0.c-7.eu-central-1.aws.neon.tech');
+
+              // 1-2. FinancialOperation table + columns
+              if (await verifyTable(client, 'FinancialOperation', FIN_COLUMNS) === false) return;
+              // §r42 byte-fidelity: responseBody MUST be TEXT (wire text),
+              // never JSONB — a JSONB column reorders keys on read and breaks
+              // byte-identical replay of the committed response.
+              const rb = await client.query(`
+                SELECT data_type FROM information_schema.columns
+                 WHERE table_schema = 'public' AND table_name = 'FinancialOperation'
+                   AND column_name = 'responseBody'`);
+              if (rb.rows[0].data_type !== 'text') {
+                return fail('RESPONSE_BODY_NOT_TEXT', `FinancialOperation.responseBody is ${rb.rows[0].data_type}, expected text (§r42 byte-fidelity)`);
+              }
+              console.log('PASS  byte-fidelity     FinancialOperation.responseBody is TEXT (wire text, not JSONB)');
+
+              // 3. FinancialOperation PK
+              const finPk = await client.query(`
+                SELECT conname FROM pg_constraint
+                 WHERE conrelid = 'public."FinancialOperation"'::regclass AND contype = 'p'`);
+              if (finPk.rows.length !== 1 || finPk.rows[0].conname !== 'FinancialOperation_pkey') {
+                return fail('PRIMARY_KEY', `FinancialOperation: ${JSON.stringify(finPk.rows.map((r) => r.conname))}`);
+              }
+              console.log('PASS  primary key      FinancialOperation_pkey (id)');
+
+              // 4. FinancialOperation indexes: unique claim identity + createdAt
+              const finIdx = await client.query(`
+                SELECT indexname, indexdef FROM pg_indexes
+                 WHERE schemaname = 'public' AND tablename = 'FinancialOperation'`);
+              const finIdxByName = new Map(finIdx.rows.map((i) => [i.indexname, i.indexdef]));
+              const uniq = finIdxByName.get('FinancialOperation_userId_endpoint_key_key');
+              if (!uniq || !/UNIQUE/i.test(uniq)) return fail('INDEX_MISSING', 'FinancialOperation_userId_endpoint_key_key (unique)');
+              console.log('PASS  index            FinancialOperation_userId_endpoint_key_key (unique: userId, endpoint, key)');
+              if (!finIdxByName.has('FinancialOperation_createdAt_idx')) return fail('INDEX_MISSING', 'FinancialOperation_createdAt_idx');
+              console.log('PASS  index            FinancialOperation_createdAt_idx');
+
+              // 5-6. PaymentRequest table + columns
+              if (await verifyTable(client, 'PaymentRequest', PR_COLUMNS) === false) return;
+
+              // 7. PaymentRequest PK
+              const prPk = await client.query(`
+                SELECT conname FROM pg_constraint
+                 WHERE conrelid = 'public."PaymentRequest"'::regclass AND contype = 'p'`);
+              if (prPk.rows.length !== 1 || prPk.rows[0].conname !== 'PaymentRequest_pkey') {
+                return fail('PRIMARY_KEY', `PaymentRequest: ${JSON.stringify(prPk.rows.map((r) => r.conname))}`);
+              }
+              console.log('PASS  primary key      PaymentRequest_pkey (id)');
+
+              // 8. PaymentRequest FKs — requester (required) + recipient (nullable),
+              // both to User(id) ON UPDATE CASCADE ON DELETE CASCADE
+              const prFk = await client.query(`
+                SELECT conname, confupdtype, confdeltype,
+                       confrelid = 'public."User"'::regclass AS refs_user
+                  FROM pg_constraint
+                 WHERE conrelid = 'public."PaymentRequest"'::regclass AND contype = 'f'`);
+              const fkByName = new Map(prFk.rows.map((f) => [f.conname, f]));
+              for (const [conname, nullable] of [
+                ['PaymentRequest_requesterId_fkey', false],
+                ['PaymentRequest_recipientId_fkey', true],
+              ]) {
+                const f = fkByName.get(conname);
+                if (!f || f.refs_user !== true || f.confupdtype !== 'c' || f.confdeltype !== 'c') {
+                  return fail('FOREIGN_KEY', `${conname}: ${JSON.stringify(f)}`);
+                }
+                console.log(`PASS  foreign key      ${conname} -> User(id) ON UPDATE CASCADE ON DELETE CASCADE${nullable ? ' (nullable)' : ''}`);
+              }
+
+              // 9. PaymentRequest indexes: cursor list queries + expiry sweep +
+              // unique token hash lookup
+              const prIdx = await client.query(`
+                SELECT indexname, indexdef FROM pg_indexes
+                 WHERE schemaname = 'public' AND tablename = 'PaymentRequest'`);
+              const prIdxByName = new Map(prIdx.rows.map((i) => [i.indexname, i.indexdef]));
+              for (const name of [
+                'PaymentRequest_requesterId_createdAt_id_idx',
+                'PaymentRequest_recipientId_createdAt_id_idx',
+                'PaymentRequest_expiresAt_idx',
+              ]) {
+                if (!prIdxByName.has(name)) return fail('INDEX_MISSING', name);
+                console.log(`PASS  index            ${name}`);
+              }
+              const token = prIdxByName.get('PaymentRequest_tokenHash_key');
+              if (!token || !/UNIQUE/i.test(token)) return fail('INDEX_MISSING', 'PaymentRequest_tokenHash_key (unique)');
+              console.log('PASS  index            PaymentRequest_tokenHash_key (unique: tokenHash)');
+
+              // 10. The legacy IdempotencyKey response-cache table must be retired.
+              const legacy = await client.query(`SELECT to_regclass('public."IdempotencyKey"')::text AS oid`);
+              if (legacy.rows[0].oid) return fail('LEGACY_TABLE_PRESENT', 'IdempotencyKey still exists — r42 retirement did not complete');
+              console.log('PASS  retired          IdempotencyKey table is absent (r42 retirement)');
+
+              console.log('VERIFICATION PASSED: FinancialOperation + PaymentRequest contract fully present (read-only — no writes performed by this job).');
+            } catch (err) {
+              console.error(`Verification failed (${err.code || 'connection error'}). Connection details are withheld.`);
+              process.exitCode = 1;
+            } finally {
+              if (client) await client.end().catch(() => {});
+            }
+          })();
+          NODE

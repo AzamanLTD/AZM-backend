@@ -65,6 +65,70 @@ dispatch it from a non-default branch; the Actions UI will not list it.
 See also `ops/azaman-new-neon-bootstrap` for the initial bootstrap workflow
 (do not re-run it — it requires an EMPTY database).
 
+## Receive/Request (FinancialOperation + PaymentRequest) provisioning
+
+PR #332 (server-owned payment-request API) is merged on main, but the
+Free-plan Render service never ran `npm run release`, so the deployed
+Azaman-New database still lacks the two tables that API requires —
+`FinancialOperation` (r42 idempotency authority) and `PaymentRequest`
+(standalone request resource). Frontend PR #147 is blocked on exactly this.
+
+**Supported path until the dashboard change is applied:** the guarded
+workflow `.github/workflows/provision-azaman-new-receive-request.yml`.
+
+- **Exact scope:** applies ONLY the two reviewed, idempotent, additive
+  installers — `infra/install-r42-idempotency-overlay.js` and
+  `infra/install-payment-requests-overlay.js` (plus a Prisma client
+  generation step the installers need). No `prisma db push`, no
+  `migrate deploy`, no full release chain, no seeds, no unrelated
+  installers.
+- **Prerequisites:** the target must be the INITIALIZED Azaman-New Neon
+  database — direct endpoint `ep-floral-hat-b9qwuuq0.c-7.eu-central-1.aws.neon.tech`
+  (no pooler), `current_database()` = `neondb`, with `User`, `BusinessProfile`
+  and `BusinessProduct` present (the PaymentRequest FKs reference `User`).
+  All three jobs (preflight, apply, verify) assert the exact target
+  read-only and fail closed on any mismatch. Requires typing `Azaman-New`
+  as the confirmation input. Connection details are never printed.
+- **Fail-closed conditions:** a populated legacy `IdempotencyKey` table.
+  The r42 overlay retires that table by dropping it, and BOTH layers
+  safeguard populated legacy data. The installer itself fails closed — its
+  check-and-drop is one atomic lock-then-count block (ACCESS EXCLUSIVE on
+  the legacy table before counting), so a table with any rows is refused
+  with the table and every row left intact, and rows that legally appear
+  between the preflight job and the apply job (a TOCTOU window across
+  jobs) are waited out by the lock and refused the same way. The preflight
+  refusal is defense-in-depth and the early, operator-facing guard: if
+  the table exists with any rows, preflight refuses to proceed
+  (export/migrate them first, empty the table, then re-dispatch). An
+  absent or empty `IdempotencyKey` is safe: it is simply dropped/absent by
+  design. A populated table cannot be destroyed by either layer. Post-install verification
+  (read-only) asserts the full contract — every column, type and default,
+  both primary keys, the User FKs with cascade, all indexes, the unique
+  token-hash lookup, the §r42 byte-fidelity requirement that
+  `FinancialOperation.responseBody` is TEXT (never JSONB), and the
+  retirement of `IdempotencyKey`. A verification failure fails the
+  workflow.
+- **When it can be run:** GitHub only offers `workflow_dispatch` workflows
+  whose workflow file is present on the **default branch** — this manual
+  path becomes dispatchable only after the branch carrying the workflow
+  file is merged to main. Do not attempt to dispatch it from a
+  non-default branch; the Actions UI will not list it.
+- **Automated checks:** `__tests__/receive-request-provisioning.pg.test.js`
+  proves the same contract in CI — provisioning both tables from absent
+  through the two installers, the empty-legacy retirement, the JSONB→TEXT
+  byte-fidelity convergence, idempotent replay, and the live invariants
+  (unique claim identity, User FK, unique token hash). The populated
+  legacy refusal is exercised by dedicated PG proofs: a populated table
+  is refused with every row intact, and a TOCTOU test deterministically
+  reproduces the cross-job window (a row committed while the installer
+  runs, coordinated through real `pg_locks` lock-state observation, no
+  fixed delays) and proves the installer still fails closed.
+
+Running this workflow provisions the missing tables only. It does NOT
+deploy the API runtime, change Render settings, or by itself make the
+deployed integration live — deploy the backend service normally
+(`POST /api/payment-requests` ships with the code) after the tables exist.
+
 ## Production-required environment variables (fail-closed contracts)
 
 - `ENCRYPTION_KEY` - 32-byte key (64 hex chars or 44-char base64) for the
