@@ -3,6 +3,7 @@
 // Safety: fails closed on any target mismatch; NEVER prints the connection
 // string or credentials; failures withhold connection details.
 import pg from 'pg';
+import fs from 'node:fs';
 
 const EXPECTED_HOST = 'ep-crimson-cell-ab81e3bp.eu-west-2.aws.neon.tech';
 const EXPECTED_DB = 'neondb';
@@ -96,7 +97,7 @@ async function main() {
       for (const [key, val] of Object.entries(counts)) {
         console.log(`${key}=${val}`);
         if (process.env.GITHUB_OUTPUT) {
-          require('fs').appendFileSync(process.env.GITHUB_OUTPUT, `${key}=${val}\n`);
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `${key}=${val}\n`);
         }
       }
       return;
