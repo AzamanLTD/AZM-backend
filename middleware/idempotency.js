@@ -261,9 +261,57 @@ function idempotency(options = {}) {
         // Post-response disposition. Bookkeeping happens AFTER the response is
         // delivered — a bookkeeping crash only degrades replays to the safe
         // 409 IN_PROGRESS refusal, never to a wrong replay or re-execution.
+        //
+        // EXCEPTION (2026-10-11): claim RELEASES are made durable BEFORE the
+        // response is sent. An unawaited, post-send release let the key be
+        // briefly poisoned after a 400/500 the client had already observed —
+        // a corrected retry inside that window was refused with 409
+        // IN_PROGRESS (the phantom-identity window; proven flaky in CI by
+        // transit-booking-identity T9). Awaiting the release costs one
+        // primary-key deleteMany before the send; if the release itself
+        // fails, the claim stays IN_PROGRESS and replays still refuse
+        // safely — the response is delivered either way.
+        const releaseClaim = () => prisma.financialOperation.deleteMany({
+            where: { id: claim.id, status: OPERATION_IN_PROGRESS },
+        });
+
         const originalJson = res.json.bind(res);
         res.json = function (body) {
             const statusCode = res.statusCode;
+
+            // Release dispositions — durable BEFORE the response leaves.
+            // r42 review P0-1 (4xx): a 4xx NEVER implies "nothing committed";
+            // release still requires an EXPLICIT disposition — either the
+            // handler set res.locals.financialClaimRelease = true (provably
+            // pre-economics), or the route declared releaseOn4xx (valid only
+            // on wired routes: the in-tx commit means a post-response
+            // IN_PROGRESS claim proves the transaction rolled back).
+            if (statusCode >= 400 && statusCode < 500) {
+                if (res.locals.financialClaimRelease === true || releaseOn4xx) {
+                    releaseClaim().catch((e) => logger.warn(
+                        { err: e.message, operationId: claim.id },
+                        '[idempotency] claim release failed — replays refuse safely (IN_PROGRESS)'
+                    )).finally(() => originalJson(body));
+                    return res;
+                }
+                // RETAIN (no explicit disposition): the key stays poisoned —
+                // same-key retries get a deterministic 409 — and money can
+                // never move twice on it.
+            } else if (statusCode >= 500) {
+                if (failurePolicy === RELEASE) {
+                    // The route declared its service state-convergent /
+                    // provably rolled back on 5xx: release for retry.
+                    releaseClaim().catch((e) => logger.warn(
+                        { err: e.message, operationId: claim.id },
+                        '[idempotency] claim release failed — replays refuse safely (IN_PROGRESS)'
+                    )).finally(() => originalJson(body));
+                    return res;
+                }
+                // RETAIN: a 5xx may follow a committed mutation. The claim
+                // stays IN_PROGRESS and the same key deterministically
+                // refuses. The client must use a NEW key.
+            }
+
             originalJson(body);
 
             try {
@@ -289,48 +337,6 @@ function idempotency(options = {}) {
                         { err: e.message, operationId: claim.id },
                         '[idempotency] commit bookkeeping failed — replays refuse safely (IN_PROGRESS)'
                     ));
-                } else if (statusCode >= 400 && statusCode < 500) {
-                    // r42 review P0-1: a 4xx NEVER implies "nothing committed".
-                    // Post-commit controller work can fail and be converted to
-                    // a 4xx by an outer catch (withdrawalController is the
-                    // concrete in-repo example) — releasing on that signal
-                    // would re-arm a committed financial operation for
-                    // duplicate execution. Release requires an EXPLICIT,
-                    // durable disposition instead:
-                    //   1. res.locals.financialClaimRelease === true — the
-                    //      handler itself marked the failure as provably
-                    //      pre-economics (e.g. schema validation, pre-tx
-                    //      guards), or
-                    //   2. policy releaseOn4xx — the route declared its claim
-                    //      commits inside the economic transaction (wired),
-                    //      so IN_PROGRESS after the response proves rollback.
-                    // Otherwise the claim is RETAINED: the key stays poisoned
-                    // (same-key retries get a deterministic 409) and money can
-                    // never move twice on it.
-                    if (res.locals.financialClaimRelease === true || releaseOn4xx) {
-                        prisma.financialOperation.deleteMany({
-                            where: { id: claim.id, status: OPERATION_IN_PROGRESS },
-                        }).catch((e) => logger.warn(
-                            { err: e.message, operationId: claim.id },
-                            '[idempotency] claim release failed — replays refuse safely (IN_PROGRESS)'
-                        ));
-                    }
-                    // No explicit disposition → RETAIN. Safe by construction:
-                    // the worst case is a poisoned key, never duplicate money.
-                } else if (statusCode >= 500) {
-                    if (failurePolicy === RELEASE) {
-                        // The route declared its service state-convergent /
-                        // provably rolled back on 5xx: release for retry.
-                        prisma.financialOperation.deleteMany({
-                            where: { id: claim.id, status: OPERATION_IN_PROGRESS },
-                        }).catch((e) => logger.warn(
-                            { err: e.message, operationId: claim.id },
-                            '[idempotency] claim release failed — replays refuse safely (IN_PROGRESS)'
-                        ));
-                    }
-                    // RETAIN: a 5xx may follow a committed mutation. The claim
-                    // stays IN_PROGRESS and the same key deterministically
-                    // refuses. The client must use a NEW key.
                 }
             } catch (e) {
                 logger.warn({ err: e.message }, '[idempotency] disposition error');
