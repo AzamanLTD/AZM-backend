@@ -167,16 +167,30 @@ async function installFiatLiquidityOverlay() {
   // failing the CREATE INDEX. We surface the offending rows FIRST, loudly,
   // with their identities — and NEVER auto-select a "winner": choosing among
   // historical double-claims requires human evidence review.
-  const conflicting = await prisma.$queryRawUnsafe(`
-    SELECT "relatedTransactionId", "dedupKey", "amountGhs", "confirmedAt"
-    FROM "FiatLiquidityReceipt"
-    WHERE "status" = 'AVAILABLE' AND "relatedTransactionId" IS NOT NULL
-      AND "relatedTransactionId" IN (
-        SELECT "relatedTransactionId" FROM "FiatLiquidityReceipt"
-        WHERE "status" = 'AVAILABLE' AND "relatedTransactionId" IS NOT NULL
-        GROUP BY "relatedTransactionId" HAVING COUNT(*) > 1
-      )
-    ORDER BY "relatedTransactionId", "confirmedAt"`);
+  // First-install recovery: the receipt table may genuinely be absent on a
+  // production branch that predates this overlay. In that case there are no
+  // historical receipt rows to inspect; skip only this data-dependent check
+  // and let the idempotent statements below create the empty table. When the
+  // table already exists, keep the duplicate-evidence check BEFORE any DDL so
+  // contradictory historical rows are surfaced before the partial unique
+  // index is attempted.
+  const receiptTable = await prisma.$queryRawUnsafe(
+    `SELECT to_regclass('"FiatLiquidityReceipt"') IS NOT NULL AS "exists"`);
+  let conflicting = [];
+  if (receiptTable[0]?.exists) {
+    conflicting = await prisma.$queryRawUnsafe(`
+      SELECT "relatedTransactionId", "dedupKey", "amountGhs", "confirmedAt"
+      FROM "FiatLiquidityReceipt"
+      WHERE "status" = 'AVAILABLE' AND "relatedTransactionId" IS NOT NULL
+        AND "relatedTransactionId" IN (
+          SELECT "relatedTransactionId" FROM "FiatLiquidityReceipt"
+          WHERE "status" = 'AVAILABLE' AND "relatedTransactionId" IS NOT NULL
+          GROUP BY "relatedTransactionId" HAVING COUNT(*) > 1
+        )
+      ORDER BY "relatedTransactionId", "confirmedAt"`);
+  } else {
+    logger.info('[install-fiat-liquidity-overlay] FiatLiquidityReceipt is absent on first install; skipping historical duplicate preflight.');
+  }
   if (conflicting.length > 0) {
     logger.error({ conflicts: conflicting },
       '[install-fiat-liquidity-overlay] PRE-FLIGHT FAILURE: historical duplicate AVAILABLE receipts exist for the same deposit. '
