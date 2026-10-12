@@ -100,7 +100,8 @@ jobs:
               print('key allows account-wide listing; first project:', PID)
           else:
               print(f'diag: /projects status={st}, body[:200]={body[:200]!r}')
-              raise SystemExit('project-scoped key: cannot list all projects')
+              PID = 'polished-river-71067591'
+              print('project-scoped key: querying only its own project', PID)
           for p in [get(f'/projects/{PID}')] if PID else []:
               print(f"PROJECT {p['id']} name={p.get('name')} region={p.get('region_id')} created={p.get('created_at')} updated={p.get('updated_at')} logical_size={p.get('logical_size')}")
               try:
