@@ -196,10 +196,19 @@ async function hasColumn(client, table, column) {
 }
 
 async function checksum(client, table) {
-  const absent = isAbsent(await scalar(client, `SELECT to_regclass('"${table}"') IS NULL`));
+  const absent = isAbsent(await scalar(client, `SELECT to_regclass('"\${table}"') IS NULL`));
   if (absent) return '-1';
   return String(await scalar(client,
-    `SELECT md5(COALESCE(string_agg(CAST(t AS text), '|' ORDER BY t."id"), '')) FROM "${table}" t`));
+    `SELECT md5(COALESCE(string_agg(CAST(t AS text), '|' ORDER BY t."id"), '')) FROM "\${table}" t`));
+}
+
+// Content checksum over a reviewed, static predicate. An absent table is
+// represented by -1; callers separately handle an expected table creation.
+async function filteredChecksum(client, table, predicate) {
+  const absent = isAbsent(await scalar(client, `SELECT to_regclass('"\${table}"') IS NULL`));
+  if (absent) return '-1';
+  return String(await scalar(client,
+    `SELECT md5(COALESCE(string_agg(CAST(t AS text), '|' ORDER BY t."id"), '')) FROM "\${table}" t WHERE ${predicate}`));
 }
 
 async function coreCounts(client) {
@@ -223,10 +232,12 @@ async function contentBaselines(client) {
 
 async function defiInfo(client) {
   const info = await tableInfo(client, 'DeFiYieldStrategy');
-  if (!info.exists) return { count: -1, seeds: 0 };
-  const seeds = Number(await scalar(client,
-    `SELECT count(*) FROM "DeFiYieldStrategy" WHERE "name" IN ${DEFI_SEED_NAMES}`));
-  return { count: info.rows, seeds };
+  if (!info.exists) return { count: -1, seeds: 0, aaveCount: 0, compoundCount: 0 };
+  const aaveCount = Number(await scalar(client,
+    `SELECT count(*) FROM "DeFiYieldStrategy" WHERE "name" = 'AAVE'`));
+  const compoundCount = Number(await scalar(client,
+    `SELECT count(*) FROM "DeFiYieldStrategy" WHERE "name" = 'COMPOUND'`));
+  return { count: info.rows, seeds: aaveCount + compoundCount, aaveCount, compoundCount };
 }
 
 async function fiatInfo(client) {
@@ -388,12 +399,20 @@ async function main() {
     }
 
     if (mode === 'counts') {
+      const defi = await defiInfo(client);
+      const fiat = await fiatInfo(client);
       const out = {
         ...await coreCounts(client),
         ...await contentBaselines(client),
-        defi_yield_strategy_count: (await defiInfo(client)).count,
-        defi_yield_strategy_seed_count: (await defiInfo(client)).seeds,
-        fiat_liquidity_state_count: (await fiatInfo(client)).count,
+        defi_yield_strategy_count: defi.count,
+        defi_yield_strategy_seed_count: defi.seeds,
+        defi_yield_strategy_aave_count: defi.aaveCount,
+        defi_yield_strategy_aave_checksum: await filteredChecksum(client, 'DeFiYieldStrategy', `"name" = 'AAVE'`),
+        defi_yield_strategy_compound_count: defi.compoundCount,
+        defi_yield_strategy_compound_checksum: await filteredChecksum(client, 'DeFiYieldStrategy', `"name" = 'COMPOUND'`),
+        defi_yield_strategy_nonseed_checksum: await filteredChecksum(client, 'DeFiYieldStrategy', `"name" NOT IN ('AAVE','COMPOUND')`),
+        fiat_liquidity_state_count: fiat.count,
+        fiat_liquidity_state_checksum: await checksum(client, 'FiatLiquidityState'),
       };
       for (const [key, val] of Object.entries(out)) {
         console.log(`${key}=${val}`);
@@ -437,19 +456,32 @@ async function main() {
       // baseline preservation: core tables
       const after = await coreCounts(client);
       for (const [key, val] of Object.entries(after)) {
-        const before = Number(process.env[key.toUpperCase()]);
-        if (val === -1) { console.log(`${key}: table absent (skipped)`); continue; }
-        if (Number.isNaN(before)) { console.log(`${key}: ${val} (no baseline passed)`); continue; }
-        if (val !== before) { console.error(`::error::verify failed: ${key} changed ${before} -> ${val}; core tables must not lose rows.`); failed++; }
-        else console.log(`${key}: ${val} (unchanged)`);
+        const rawBefore = process.env[key.toUpperCase()];
+        if (rawBefore == null || rawBefore === '' || Number.isNaN(Number(rawBefore))) {
+          console.error(`::error::verify failed: baseline missing or invalid for ${key}; refusing to claim preservation.`);
+          failed++;
+          continue;
+        }
+        const before = Number(rawBefore);
+        if (val !== before) {
+          console.error(`::error::verify failed: ${key} changed ${before} -> ${val}; core table state must remain unchanged.`);
+          failed++;
+        } else {
+          console.log(`${key}: ${val === -1 ? 'table remained absent' : `${val} (unchanged)`}`);
+        }
       }
 
       // content preservation: count AND order-stable checksum per table —
       // row-count equality alone is never accepted as proof.
       const contentAfter = await contentBaselines(client);
       for (const [key, val] of Object.entries(contentAfter)) {
-        const before = String(process.env[key.toUpperCase()] ?? '');
-        if (before === '') { console.log(`${key}: ${String(val).slice(0, 12)}… (no baseline passed)`); continue; }
+        const rawBefore = process.env[key.toUpperCase()];
+        if (rawBefore == null || rawBefore === '') {
+          console.error(`::error::verify failed: baseline missing for ${key}; refusing to claim content preservation.`);
+          failed++;
+          continue;
+        }
+        const before = String(rawBefore);
         if (String(val) !== before) {
           console.error(`::error::verify failed: ${key} changed (${before} -> ${String(val)}) — content must be byte-identical after the guarded path.`);
           failed++;
@@ -458,31 +490,79 @@ async function main() {
         }
       }
 
+
       // expected-initialization rules: DeFiYieldStrategy + FiatLiquidityState.
       const defi = await defiInfo(client);
-      const defiBefore = Number(process.env.DEFI_YIELD_STRATEGY_COUNT);
-      const defiSeedBefore = Number(process.env.DEFI_YIELD_STRATEGY_SEED_COUNT);
-      if (!Number.isNaN(defiBefore)) {
-        if (defi.count < defiBefore) {
-          console.error(`::error::verify failed: DeFiYieldStrategy lost rows (${defiBefore} -> ${defi.count}).`); failed++;
+      const defiBeforeRaw = process.env.DEFI_YIELD_STRATEGY_COUNT;
+      const defiSeedBeforeRaw = process.env.DEFI_YIELD_STRATEGY_SEED_COUNT;
+      if (defiBeforeRaw == null || defiBeforeRaw === '' || defiSeedBeforeRaw == null || defiSeedBeforeRaw === '' ||
+          Number.isNaN(Number(defiBeforeRaw)) || Number.isNaN(Number(defiSeedBeforeRaw))) {
+        console.error('::error::verify failed: DeFiYieldStrategy baseline missing or invalid.'); failed++;
+      } else {
+        // A -1 baseline means the whole table was absent before this approved
+        // initializer. Treat it as zero pre-existing rows, permitting only
+        // the documented AAVE/COMPOUND inserts and no non-seed records.
+        const defiBefore = Math.max(0, Number(defiBeforeRaw));
+        const defiSeedBefore = Math.max(0, Number(defiSeedBeforeRaw));
+        if (defi.count < 0 || defi.count < defiBefore) {
+          console.error(`::error::verify failed: DeFiYieldStrategy disappeared or lost rows (${defiBeforeRaw} -> ${defi.count}).`); failed++;
         } else if ((defi.count - defiBefore) !== (defi.seeds - defiSeedBefore)) {
-          console.error(`::error::verify failed: DeFiYieldStrategy changed beyond the expected seed initialization (${defiBefore}/${defiSeedBefore} seeds -> ${defi.count}/${defi.seeds} seeds): pre-existing records must not change.`); failed++;
+          console.error(`::error::verify failed: DeFiYieldStrategy changed beyond expected AAVE/COMPOUND initialization (${defiBeforeRaw}/${defiSeedBeforeRaw} seeds -> ${defi.count}/${defi.seeds}).`); failed++;
         } else if ((defi.count - defi.seeds) !== (defiBefore - defiSeedBefore)) {
-          console.error(`::error::verify failed: DeFiYieldStrategy non-seed records changed.`); failed++;
+          console.error('::error::verify failed: DeFiYieldStrategy non-seed row count changed.'); failed++;
         } else {
-          console.log(`DeFiYieldStrategy: ${defi.count} rows (${defi.seeds} seeds) — only the documented seed initialization ${defi.count === defiBefore ? 'was' : 'was added'}.`);
+          const baselineWasAbsent = Number(defiBeforeRaw) < 0;
+          const nonseedBefore = process.env.DEFI_YIELD_STRATEGY_NONSEED_CHECKSUM;
+          const nonseedAfter = await filteredChecksum(client, 'DeFiYieldStrategy', `"name" NOT IN ('AAVE','COMPOUND')`);
+          if (!baselineWasAbsent && (nonseedBefore == null || nonseedBefore === '' || nonseedBefore !== nonseedAfter)) {
+            console.error('::error::verify failed: pre-existing non-seed DeFiYieldStrategy content changed or its baseline is missing.'); failed++;
+          } else if (baselineWasAbsent && (defi.count - defi.seeds) !== 0) {
+            console.error('::error::verify failed: newly created DeFiYieldStrategy table contains unexpected non-seed records.'); failed++;
+          }
+          for (const [name, currentCount, currentChecksum, countKey, checksumKey] of [
+            ['AAVE', defi.aaveCount, await filteredChecksum(client, 'DeFiYieldStrategy', `"name" = 'AAVE'`), 'DEFI_YIELD_STRATEGY_AAVE_COUNT', 'DEFI_YIELD_STRATEGY_AAVE_CHECKSUM'],
+            ['COMPOUND', defi.compoundCount, await filteredChecksum(client, 'DeFiYieldStrategy', `"name" = 'COMPOUND'`), 'DEFI_YIELD_STRATEGY_COMPOUND_COUNT', 'DEFI_YIELD_STRATEGY_COMPOUND_CHECKSUM'],
+          ]) {
+            const rawCount = process.env[countKey];
+            const rawChecksum = process.env[checksumKey];
+            if (rawCount == null || rawCount === '' || Number.isNaN(Number(rawCount)) || rawChecksum == null || rawChecksum === '') {
+              console.error(`::error::verify failed: pre-initialization baseline missing for DeFiYieldStrategy ${name}.`); failed++;
+            } else if (Number(rawCount) > 0) {
+              if (currentCount !== Number(rawCount) || currentChecksum !== rawChecksum) {
+                console.error(`::error::verify failed: pre-existing DeFiYieldStrategy ${name} records changed.`); failed++;
+              }
+            } else if (currentCount !== 1) {
+              console.error(`::error::verify failed: expected exactly one new DeFiYieldStrategy ${name} seed, found ${currentCount}.`); failed++;
+            }
+          }
+          if (failed === 0) {
+            console.log(`DeFiYieldStrategy: ${defi.count} rows (${defi.seeds} AAVE/COMPOUND seeds); existing records preserved and only documented seed initialization permitted.`);
+          }
         }
       }
+
       const fiat = await fiatInfo(client);
-      const fiatBefore = Number(process.env.FIAT_LIQUIDITY_STATE_COUNT);
-      if (!Number.isNaN(fiatBefore)) {
-        if (fiatBefore === 0) {
-          if (fiat.count === 1 && fiat.zeroValued === 1) console.log('FiatLiquidityState: initialized to the documented zero-valued singleton.');
-          else { console.error(`::error::verify failed: FiatLiquidityState expected exactly one zero-valued row after initialization, found count=${fiat.count}, zeroValued=${fiat.zeroValued}.`); failed++; }
+      const fiatBeforeRaw = process.env.FIAT_LIQUIDITY_STATE_COUNT;
+      const fiatChecksumBefore = process.env.FIAT_LIQUIDITY_STATE_CHECKSUM;
+      if (fiatBeforeRaw == null || fiatBeforeRaw === '' || Number.isNaN(Number(fiatBeforeRaw))) {
+        console.error('::error::verify failed: FiatLiquidityState baseline missing or invalid.'); failed++;
+      } else {
+        const fiatBefore = Number(fiatBeforeRaw);
+        if (fiatBefore <= 0) {
+          // -1 means table absent; 0 means present-but-empty. Both may be
+          // initialized by the approved zero-valued singleton insert.
+          if (fiat.count === 1 && fiat.zeroValued === 1) {
+            console.log('FiatLiquidityState: initialized to the documented zero-valued singleton.');
+          } else {
+            console.error(`::error::verify failed: FiatLiquidityState expected exactly one zero-valued row after initialization, found count=${fiat.count}, zeroValued=${fiat.zeroValued}.`); failed++;
+          }
         } else if (fiat.count !== fiatBefore) {
           console.error(`::error::verify failed: FiatLiquidityState count changed (${fiatBefore} -> ${fiat.count}).`); failed++;
+        } else if (fiatChecksumBefore == null || fiatChecksumBefore === '' ||
+                   await checksum(client, 'FiatLiquidityState') !== fiatChecksumBefore) {
+          console.error('::error::verify failed: pre-existing FiatLiquidityState content changed or its baseline is missing.'); failed++;
         } else {
-          console.log(`FiatLiquidityState: ${fiat.count} row(s), unchanged (pre-existing record not modified).`);
+          console.log(`FiatLiquidityState: ${fiat.count} row(s), content checksum unchanged.`);
         }
       }
 
