@@ -110,6 +110,8 @@ jobs:
       defi_yield_strategy_aave_checksum: ${{ steps.counts.outputs.defi_yield_strategy_aave_checksum }}
       defi_yield_strategy_compound_count: ${{ steps.counts.outputs.defi_yield_strategy_compound_count }}
       defi_yield_strategy_compound_checksum: ${{ steps.counts.outputs.defi_yield_strategy_compound_checksum }}
+      defi_yield_strategy_internal_lp_count: ${{ steps.counts.outputs.defi_yield_strategy_internal_lp_count }}
+      defi_yield_strategy_internal_lp_checksum: ${{ steps.counts.outputs.defi_yield_strategy_internal_lp_checksum }}
       defi_yield_strategy_nonseed_checksum: ${{ steps.counts.outputs.defi_yield_strategy_nonseed_checksum }}
       fiat_liquidity_state_count: ${{ steps.counts.outputs.fiat_liquidity_state_count }}
       fiat_liquidity_state_checksum: ${{ steps.counts.outputs.fiat_liquidity_state_checksum }}
@@ -225,6 +227,8 @@ jobs:
           DEFI_YIELD_STRATEGY_AAVE_CHECKSUM: ${{ needs.preflight.outputs.defi_yield_strategy_aave_checksum }}
           DEFI_YIELD_STRATEGY_COMPOUND_COUNT: ${{ needs.preflight.outputs.defi_yield_strategy_compound_count }}
           DEFI_YIELD_STRATEGY_COMPOUND_CHECKSUM: ${{ needs.preflight.outputs.defi_yield_strategy_compound_checksum }}
+          DEFI_YIELD_STRATEGY_INTERNAL_LP_COUNT: ${{ needs.preflight.outputs.defi_yield_strategy_internal_lp_count }}
+          DEFI_YIELD_STRATEGY_INTERNAL_LP_CHECKSUM: ${{ needs.preflight.outputs.defi_yield_strategy_internal_lp_checksum }}
           DEFI_YIELD_STRATEGY_NONSEED_CHECKSUM: ${{ needs.preflight.outputs.defi_yield_strategy_nonseed_checksum }}
           FIAT_LIQUIDITY_STATE_COUNT: ${{ needs.preflight.outputs.fiat_liquidity_state_count }}
           FIAT_LIQUIDITY_STATE_CHECKSUM: ${{ needs.preflight.outputs.fiat_liquidity_state_checksum }}
