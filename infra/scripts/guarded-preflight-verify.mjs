@@ -511,13 +511,13 @@ async function main() {
       } else {
         // A -1 baseline means the whole table was absent before this approved
         // initializer. Treat it as zero pre-existing rows, permitting only
-        // the documented AAVE/COMPOUND inserts and no non-seed records.
+        // the documented AAVE/COMPOUND/INTERNAL_LP inserts and no non-seed records.
         const defiBefore = Math.max(0, Number(defiBeforeRaw));
         const defiSeedBefore = Math.max(0, Number(defiSeedBeforeRaw));
         if (defi.count < 0 || defi.count < defiBefore) {
           console.error(`::error::verify failed: DeFiYieldStrategy disappeared or lost rows (${defiBeforeRaw} -> ${defi.count}).`); failed++;
         } else if ((defi.count - defiBefore) !== (defi.seeds - defiSeedBefore)) {
-          console.error(`::error::verify failed: DeFiYieldStrategy changed beyond expected AAVE/COMPOUND initialization (${defiBeforeRaw}/${defiSeedBeforeRaw} seeds -> ${defi.count}/${defi.seeds}).`); failed++;
+          console.error(`::error::verify failed: DeFiYieldStrategy changed beyond expected AAVE/COMPOUND/INTERNAL_LP initialization (${defiBeforeRaw}/${defiSeedBeforeRaw} seeds -> ${defi.count}/${defi.seeds}).`); failed++;
         } else if ((defi.count - defi.seeds) !== (defiBefore - defiSeedBefore)) {
           console.error('::error::verify failed: DeFiYieldStrategy non-seed row count changed.'); failed++;
         } else {
@@ -547,7 +547,7 @@ async function main() {
             }
           }
           if (failed === 0) {
-            console.log(`DeFiYieldStrategy: ${defi.count} rows (${defi.seeds} AAVE/COMPOUND seeds); existing records preserved and only documented seed initialization permitted.`);
+            console.log(`DeFiYieldStrategy: ${defi.count} rows (${defi.seeds} AAVE/COMPOUND/INTERNAL_LP seeds); existing records preserved and only documented seed initialization permitted.`);
           }
         }
       }
