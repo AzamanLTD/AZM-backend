@@ -1,0 +1,97 @@
+name: Archive current DB (one-time, encrypted)
+
+# One-time archival of the current Render runtime database:
+# - consistent pg_dump (custom format, single repeatable-read snapshot)
+# - verification: non-empty, size, sha256, pg_restore --list readable
+# - AES-256 encryption (PBKDF2) BEFORE any upload; only ciphertext leaves the runner
+# - no connection strings or row contents in logs; table names and counts only
+on:
+  push:
+    branches: [db-archive]
+
+permissions:
+  contents: read
+
+jobs:
+  archive-current:
+    name: pg_dump + verify + encrypt current Render DB
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      DB_URL: ${{ secrets.AUDIT_RENDER_RUNTIME_DB_URL }}
+      ARCHIVE_PASS: ${{ secrets.ARCHIVE_PASSPHRASE }}
+    steps:
+      - name: Install PostgreSQL client tools
+        run: |
+          curl -fsS https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo gpg --dearmor -o /usr/share/keyrings/pgdg.gpg
+          echo "deb [signed-by=/usr/share/keyrings/pgdg.gpg] http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq postgresql-client-16 postgresql-client-17 postgresql-client-18 2>/dev/null || sudo apt-get install -y -qq postgresql-client-16 postgresql-client-17
+      - name: Dump (direct endpoint), verify, encrypt
+        run: |
+          set -euo pipefail
+          # pg_dump must use the DIRECT endpoint (pgbouncer transaction pooling breaks session state).
+          DIRECT="${DB_URL/-pooler.eu-west-2/}"; DIRECT="${DIRECT/-pooler.c-/-.c-}"
+          host=$(python3 -c "import os,urllib.parse; print(urllib.parse.urlparse(os.environ['DIRECT']).hostname)")
+          case "$host" in
+            ep-small-butterfly-abxfnkn5.eu-west-2.aws.neon.tech) echo "target host: $host (direct)";;
+            *) echo "UNEXPECTED TARGET HOST - ABORT"; exit 1;;
+          esac
+          SRV=$(psql "$DIRECT" -tAc "SHOW server_version_num" | head -c 2)
+          echo "server major version: $SRV"
+          for V in 18 17 16; do
+            if command -v "pg_dump$V" >/dev/null && [ "$V" -ge "$SRV" ]; then PGD="pg_dump$V"; PGRESTORE="pg_restore$V"; break; fi
+          done
+          [ -n "${PGD:-}" ] || { echo "no pg_dump >= server version available"; exit 1; }
+          echo "using $PGD"
+          $PGD "$DIRECT" --format=custom --no-owner --no-privileges --file=current-db.pgdump
+          echo "== verification =="
+          ls -l current-db.pgdump | awk '{print "raw size:", $5, "bytes"}'
+          SHA_RAW=$(sha256sum current-db.pgdump | cut -d' ' -f1)
+          echo "raw sha256: $SHA_RAW"
+          test -s current-db.pgdump
+          $PGRESTORE --list current-db.pgdump > toc.txt
+          echo "pg_restore --list: OK, $(wc -l < toc.txt) TOC lines, $(grep -c 'TABLE DATA' toc.txt || true) table-data entries"
+          test "$(wc -c < toc.txt)" -gt 0
+          openssl enc -aes-256-cbc -pbkdf2 -iter 600000 -salt -in current-db.pgdump -out current-db.pgdump.enc -pass env:ARCHIVE_PASS
+          echo "enc size: $(wc -c < current-db.pgdump.enc) bytes"
+          SHA_ENC=$(sha256sum current-db.pgdump.enc | cut -d' ' -f1)
+          echo "enc sha256: $SHA_ENC"
+      - name: Upload ciphertext (1-day retention, replaced by private storage)
+        uses: actions/upload-artifact@v4
+        with:
+          name: current-db-archive
+          path: current-db.pgdump.enc
+          retention-days: 1
+          if-no-files-found: error
+  neon-metadata:
+    name: Historical Neon project identification (metadata only)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: List projects, endpoints, branches (no secrets)
+        env:
+          NEON_KEY: ${{ secrets.NEON_API_KEY }}
+        run: |
+          set -euo pipefail
+          list() { curl -fsS -H "Authorization: Bearer $NEON_KEY" "$1"; }
+          list "https://console.neon.tech/api/v2/projects" > projects.json
+          python3 - <<'PY'
+          import json
+          d = json.load(open('projects.json'))
+          for p in d.get('projects', []):
+              print(f"PROJECT {p['id']} name={p.get('name')} region={p.get('region_id')} created={p.get('created_at')} updated={p.get('updated_at')} logical_size={p.get('logical_size')}")
+          open('pids.txt','w').write('\n'.join(p['id'] for p in d.get('projects', [])))
+          PY
+          for pid in $(cat pids.txt); do
+            echo "--- project $pid endpoints:"
+            list "https://console.neon.tech/api/v2/projects/$pid/endpoints" | python3 -c "
+import json,sys
+for e in json.load(sys.stdin).get('endpoints',[]):
+    print(f\"  endpoint {e.get('host')} type={e.get('type')} created={e.get('created_at')} updated={e.get('updated_at')}\")"
+            echo "--- project $pid branches:"
+            list "https://console.neon.tech/api/v2/projects/$pid/branches" | python3 -c "
+import json,sys
+for b in json.load(sys.stdin).get('branches',[]):
+    print(f\"  branch {b.get('name')} created={b.get('created_at')} updated={b.get('updated_at')} last_changed={b.get('last_changed_at')} logical_size={b.get('logical_size')}\")"
+          done
