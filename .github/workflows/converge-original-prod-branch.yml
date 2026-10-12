@@ -1,0 +1,286 @@
+name: AZM original production branch guarded schema convergence (side-effect gates)
+
+# =============================================================================
+# Guarded operational workflow: converges the ORIGINAL production Neon branch
+# (project "Azaman DB" polished-river-71067591, branch br-shy-mode "production",
+# direct endpoint ep-crimson-cell-ab81e3bp.eu-west-2.aws.neon.tech) with the
+# current main installer set so it can resume its role as the backend's
+# operational database (Render recovery, Option B).
+#
+# Why this exists: the October 11 Render DATABASE_URL switch pointed the
+# backend at the "pre-phase-3-backup" branch (ep-small-butterfly, a May-31
+# snapshot missing 146 prisma tables). The original production branch is a
+# strict superset of that snapshot (read-only dual audit 2026-10-12: 18
+# prisma tables missing there, all owned by reviewed idempotent installers)
+# and holds all application history through Oct 11.
+#
+# WHAT THIS OPERATION IS: guarded schema convergence with EXPLICIT SIDE-EFFECT
+# GATES — NOT purely DDL-only work. The reviewed installer sequence contains
+# steps beyond schema creation:
+#   - legacy E2EE private-key table retirement (E2EESession, E2EEPreKeyBundle,
+#     and a legacy-shaped E2EEOneTimePreKey are DROPPED by
+#     install-e2ee-server-blind-overlay.js);
+#   - ConversationMoneyTicket orphan archival + deletion before FK creation
+#     (install-business-os-overlay.js);
+#   - AzmRewardLog/AzmSpendLog dedupKey backfills on existing rows
+#     (install-prod-drift-remediation.js);
+#   - intentional initial system rows: DeFiYieldStrategy seeds (AAVE,
+#     COMPOUND) and the zero-valued FiatLiquidityState singleton.
+#
+# The preflight makes every one of those effects visible and FAILS CLOSED on
+# any effect that has not been separately reviewed for this convergence run:
+# a populated legacy E2EE table, any orphan-archival candidate, or any
+# pending existing-row backfill refuses the run. Empty legacy tables follow
+# the reviewed retirement path. The seed is omitted from the apply step
+# entirely (infra/seed-susu-foundation.js is NOT run — the recovery cannot
+# create the treasury user or liability-contract record), while the phase3
+# seed rows and the fiat singleton are the documented, allowed
+# initializations above. Deploying the backend is a separate, independent
+# step: the server's boot path can invoke its own conditional auto-release
+# behavior (including conditional seeding and backfills) at startup — that
+# runtime behavior is unchanged by this PR and is neither suppressed nor
+# altered here.
+#
+# Safety contract (mirrors provision-azaman-new-*.yml):
+#   - Requires a human to type "Azaman-Original-Prod" in the confirmation input.
+#   - ALL jobs fail closed on target mismatch: the direct Neon hostname must
+#     be EXACTLY ep-crimson-cell-ab81e3bp.eu-west-2.aws.neon.tech (no pooler,
+#     no other Neon project, no other branch) and current_database() must be
+#     exactly neondb. Verified before ANY write.
+#   - Preflight/counts/verify run the helper script
+#     infra/scripts/guarded-preflight-verify.mjs, whose every mode executes
+#     inside a single BEGIN READ ONLY transaction and always rolls back and
+#     releases the connection (engine-enforced read-only; see the script's
+#     header for the full audited inventory, the side-effect gates, and the
+#     out-of-scope objects).
+#   - Post-apply verify asserts the COMPLETE audited inventory (tables, PKs,
+#     columns, named indexes), the IdempotencyKey retirement, baseline
+#     preservation for important existing business/financial tables, and
+#     CONTENT preservation (order-stable checksums) for ConversationMoneyTicket,
+#     AzmRewardLog and AzmSpendLog — row-count equality alone is never
+#     accepted as proof. Expected initial system rows (DeFi seeds, fiat
+#     singleton) are distinguished from any change to pre-existing records.
+#   - Connection details are never printed; failures withhold them; E2EE key
+#     values are never read (existence, shape and row counts only).
+#
+# REQUIRED SECRET (must exist before dispatch, owner-created):
+#   AZM_ORIGINAL_PROD_DATABASE_URL = full connection string for the DIRECT
+#   endpoint ep-crimson-cell-ab81e3bp.eu-west-2.aws.neon.tech, database
+#   neondb. Never the pooled host (DDL must not traverse pgbouncer).
+# =============================================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: Type Azaman-Original-Prod exactly to confirm the intended target
+        required: true
+        type: string
+      operation:
+        description: Preflight-only is read-only; converge applies the reviewed installer sequence
+        required: true
+        type: choice
+        options:
+          - preflight-only
+          - converge
+        default: preflight-only
+
+permissions:
+  contents: read
+
+concurrency:
+  group: azm-original-prod-branch-convergence
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    name: Confirm target and read-only preflight (side-effect gates)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      user_count: ${{ steps.counts.outputs.user_count }}
+      transaction_count: ${{ steps.counts.outputs.transaction_count }}
+      message_count: ${{ steps.counts.outputs.message_count }}
+      trade_count: ${{ steps.counts.outputs.trade_count }}
+      peer_transfer_count: ${{ steps.counts.outputs.peer_transfer_count }}
+      business_profile_count: ${{ steps.counts.outputs.business_profile_count }}
+      business_product_count: ${{ steps.counts.outputs.business_product_count }}
+      wallet_count: ${{ steps.counts.outputs.wallet_count }}
+      conversation_money_ticket_count: ${{ steps.counts.outputs.conversation_money_ticket_count }}
+      conversation_money_ticket_checksum: ${{ steps.counts.outputs.conversation_money_ticket_checksum }}
+      azm_reward_log_count: ${{ steps.counts.outputs.azm_reward_log_count }}
+      azm_reward_log_checksum: ${{ steps.counts.outputs.azm_reward_log_checksum }}
+      azm_spend_log_count: ${{ steps.counts.outputs.azm_spend_log_count }}
+      azm_spend_log_checksum: ${{ steps.counts.outputs.azm_spend_log_checksum }}
+      defi_yield_strategy_count: ${{ steps.counts.outputs.defi_yield_strategy_count }}
+      defi_yield_strategy_seed_count: ${{ steps.counts.outputs.defi_yield_strategy_seed_count }}
+      defi_yield_strategy_aave_count: ${{ steps.counts.outputs.defi_yield_strategy_aave_count }}
+      defi_yield_strategy_aave_checksum: ${{ steps.counts.outputs.defi_yield_strategy_aave_checksum }}
+      defi_yield_strategy_compound_count: ${{ steps.counts.outputs.defi_yield_strategy_compound_count }}
+      defi_yield_strategy_compound_checksum: ${{ steps.counts.outputs.defi_yield_strategy_compound_checksum }}
+      defi_yield_strategy_internal_lp_count: ${{ steps.counts.outputs.defi_yield_strategy_internal_lp_count }}
+      defi_yield_strategy_internal_lp_checksum: ${{ steps.counts.outputs.defi_yield_strategy_internal_lp_checksum }}
+      defi_yield_strategy_nonseed_checksum: ${{ steps.counts.outputs.defi_yield_strategy_nonseed_checksum }}
+      fiat_liquidity_state_count: ${{ steps.counts.outputs.fiat_liquidity_state_count }}
+      fiat_liquidity_state_checksum: ${{ steps.counts.outputs.fiat_liquidity_state_checksum }}
+    steps:
+      - name: Require explicit target confirmation
+        env:
+          CONFIRMATION: ${{ inputs.confirmation }}
+        run: |
+          if [ "$CONFIRMATION" != "Azaman-Original-Prod" ]; then
+            echo "::error::Confirmation did not match Azaman-Original-Prod. No database connection was attempted."
+            exit 1
+          fi
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: npm
+      - name: Install dependencies (the helper imports pg)
+        run: npm ci
+      - name: Read-only preflight (identity, side-effect gates, audited targets)
+        env:
+          DB_URL: ${{ secrets.AZM_ORIGINAL_PROD_DATABASE_URL }}
+        run: |
+          node infra/scripts/guarded-preflight-verify.mjs preflight
+      - name: Export baseline counts and content checksums
+        id: counts
+        env:
+          DB_URL: ${{ secrets.AZM_ORIGINAL_PROD_DATABASE_URL }}
+        run: |
+          node infra/scripts/guarded-preflight-verify.mjs counts
+
+  apply:
+    name: Apply reviewed convergence sequence (side effects gated)
+    # Read-only preflight is the default. Mutation requires the operator to
+    # explicitly select operation=converge on a separate manual dispatch.
+    if: ${{ inputs.operation == 'converge' }}
+    needs: [preflight]
+    outputs:
+      user_count: ${{ steps.baseline.outputs.user_count }}
+      transaction_count: ${{ steps.baseline.outputs.transaction_count }}
+      message_count: ${{ steps.baseline.outputs.message_count }}
+      trade_count: ${{ steps.baseline.outputs.trade_count }}
+      peer_transfer_count: ${{ steps.baseline.outputs.peer_transfer_count }}
+      business_profile_count: ${{ steps.baseline.outputs.business_profile_count }}
+      business_product_count: ${{ steps.baseline.outputs.business_product_count }}
+      wallet_count: ${{ steps.baseline.outputs.wallet_count }}
+      conversation_money_ticket_count: ${{ steps.baseline.outputs.conversation_money_ticket_count }}
+      conversation_money_ticket_checksum: ${{ steps.baseline.outputs.conversation_money_ticket_checksum }}
+      azm_reward_log_count: ${{ steps.baseline.outputs.azm_reward_log_count }}
+      azm_reward_log_checksum: ${{ steps.baseline.outputs.azm_reward_log_checksum }}
+      azm_spend_log_count: ${{ steps.baseline.outputs.azm_spend_log_count }}
+      azm_spend_log_checksum: ${{ steps.baseline.outputs.azm_spend_log_checksum }}
+      defi_yield_strategy_count: ${{ steps.baseline.outputs.defi_yield_strategy_count }}
+      defi_yield_strategy_seed_count: ${{ steps.baseline.outputs.defi_yield_strategy_seed_count }}
+      defi_yield_strategy_aave_count: ${{ steps.baseline.outputs.defi_yield_strategy_aave_count }}
+      defi_yield_strategy_aave_checksum: ${{ steps.baseline.outputs.defi_yield_strategy_aave_checksum }}
+      defi_yield_strategy_compound_count: ${{ steps.baseline.outputs.defi_yield_strategy_compound_count }}
+      defi_yield_strategy_compound_checksum: ${{ steps.baseline.outputs.defi_yield_strategy_compound_checksum }}
+      defi_yield_strategy_internal_lp_count: ${{ steps.baseline.outputs.defi_yield_strategy_internal_lp_count }}
+      defi_yield_strategy_internal_lp_checksum: ${{ steps.baseline.outputs.defi_yield_strategy_internal_lp_checksum }}
+      defi_yield_strategy_nonseed_checksum: ${{ steps.baseline.outputs.defi_yield_strategy_nonseed_checksum }}
+      fiat_liquidity_state_count: ${{ steps.baseline.outputs.fiat_liquidity_state_count }}
+      fiat_liquidity_state_checksum: ${{ steps.baseline.outputs.fiat_liquidity_state_checksum }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: npm
+      - run: npm ci
+      - name: Fail closed unless target is the original production branch
+        env:
+          DB_URL: ${{ secrets.AZM_ORIGINAL_PROD_DATABASE_URL }}
+        run: |
+          node infra/scripts/guarded-preflight-verify.mjs guard
+      - name: Re-run side-effect gates immediately before mutation
+        # The first preflight is useful for inspection, but the guarded apply
+        # run must not rely on a potentially stale side-effect snapshot.
+        env:
+          DB_URL: ${{ secrets.AZM_ORIGINAL_PROD_DATABASE_URL }}
+        run: node infra/scripts/guarded-preflight-verify.mjs preflight
+      - name: Capture preservation baselines immediately before mutation
+        id: baseline
+        env:
+          DB_URL: ${{ secrets.AZM_ORIGINAL_PROD_DATABASE_URL }}
+        run: node infra/scripts/guarded-preflight-verify.mjs counts
+      - name: Apply guarded installer sequence (seed omitted; side effects preflight-gated)
+        env:
+          DATABASE_URL: ${{ secrets.AZM_ORIGINAL_PROD_DATABASE_URL }}
+        run: |
+          set -e
+          # Build-time installers first, matching the Render Build Command.
+          node infra/install-e2ee-server-blind-overlay.js
+          node infra/install-inventory-restock-overlay.js
+          node infra/install-reservation-capacity-overlay.js
+          # The npm run release chain WITHOUT seed-susu-foundation.js,
+          # in the exact package.json release order. Additive and idempotent;
+          # every non-DDL effect is surfaced and gated by the preflight.
+          node infra/install-prod-drift-remediation.js
+          node infra/install-susu-overlay.js
+          node infra/install-transaction-quote-overlay.js
+          node infra/install-business-os-overlay.js
+          node infra/install-inventory-restock-overlay.js
+          node infra/install-reservation-capacity-overlay.js
+          node infra/install-e2ee-server-blind-overlay.js
+          node infra/install-phase3-overlay.js
+          node infra/install-payout-reconciliation-infra.js
+          node infra/install-fiat-liquidity-overlay.js
+          node infra/install-model-b-settlement-overlay.js
+          node infra/install-r16-execution-identity-overlay.js
+          node infra/install-r19-smartroute-execution-snapshot-overlay.js
+          node infra/install-r42-idempotency-overlay.js
+          node infra/install-payment-requests-overlay.js
+          node infra/install-business-price-overlay.js
+
+  verify:
+    name: Read-only post-apply verification (full inventory + content preservation)
+    # Direct dependency is required: the needs context does not expose
+    # transitive preflight outputs through apply.
+    # This job is only meaningful after the explicitly requested mutation run.
+    if: ${{ inputs.operation == 'converge' }}
+    needs: [preflight, apply]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: npm
+      - name: Install dependencies (the helper imports pg)
+        run: npm ci
+      - name: Verify the complete audited set, content preservation, and expected initializations
+        env:
+          DB_URL: ${{ secrets.AZM_ORIGINAL_PROD_DATABASE_URL }}
+          USER_COUNT: ${{ needs.apply.outputs.user_count }}
+          TRANSACTION_COUNT: ${{ needs.apply.outputs.transaction_count }}
+          MESSAGE_COUNT: ${{ needs.apply.outputs.message_count }}
+          TRADE_COUNT: ${{ needs.apply.outputs.trade_count }}
+          PEER_TRANSFER_COUNT: ${{ needs.apply.outputs.peer_transfer_count }}
+          BUSINESS_PROFILE_COUNT: ${{ needs.apply.outputs.business_profile_count }}
+          BUSINESS_PRODUCT_COUNT: ${{ needs.apply.outputs.business_product_count }}
+          WALLET_COUNT: ${{ needs.apply.outputs.wallet_count }}
+          CONVERSATION_MONEY_TICKET_COUNT: ${{ needs.apply.outputs.conversation_money_ticket_count }}
+          CONVERSATION_MONEY_TICKET_CHECKSUM: ${{ needs.apply.outputs.conversation_money_ticket_checksum }}
+          AZM_REWARD_LOG_COUNT: ${{ needs.apply.outputs.azm_reward_log_count }}
+          AZM_REWARD_LOG_CHECKSUM: ${{ needs.apply.outputs.azm_reward_log_checksum }}
+          AZM_SPEND_LOG_COUNT: ${{ needs.apply.outputs.azm_spend_log_count }}
+          AZM_SPEND_LOG_CHECKSUM: ${{ needs.apply.outputs.azm_spend_log_checksum }}
+          DEFI_YIELD_STRATEGY_COUNT: ${{ needs.apply.outputs.defi_yield_strategy_count }}
+          DEFI_YIELD_STRATEGY_SEED_COUNT: ${{ needs.apply.outputs.defi_yield_strategy_seed_count }}
+          DEFI_YIELD_STRATEGY_AAVE_COUNT: ${{ needs.apply.outputs.defi_yield_strategy_aave_count }}
+          DEFI_YIELD_STRATEGY_AAVE_CHECKSUM: ${{ needs.apply.outputs.defi_yield_strategy_aave_checksum }}
+          DEFI_YIELD_STRATEGY_COMPOUND_COUNT: ${{ needs.apply.outputs.defi_yield_strategy_compound_count }}
+          DEFI_YIELD_STRATEGY_COMPOUND_CHECKSUM: ${{ needs.apply.outputs.defi_yield_strategy_compound_checksum }}
+          DEFI_YIELD_STRATEGY_INTERNAL_LP_COUNT: ${{ needs.apply.outputs.defi_yield_strategy_internal_lp_count }}
+          DEFI_YIELD_STRATEGY_INTERNAL_LP_CHECKSUM: ${{ needs.apply.outputs.defi_yield_strategy_internal_lp_checksum }}
+          DEFI_YIELD_STRATEGY_NONSEED_CHECKSUM: ${{ needs.apply.outputs.defi_yield_strategy_nonseed_checksum }}
+          FIAT_LIQUIDITY_STATE_COUNT: ${{ needs.apply.outputs.fiat_liquidity_state_count }}
+          FIAT_LIQUIDITY_STATE_CHECKSUM: ${{ needs.apply.outputs.fiat_liquidity_state_checksum }}
+        run: |
+          node infra/scripts/guarded-preflight-verify.mjs verify
