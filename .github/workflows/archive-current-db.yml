@@ -31,7 +31,7 @@ jobs:
         run: |
           set -euo pipefail
           # pg_dump must use the DIRECT endpoint (pgbouncer transaction pooling breaks session state).
-          export DIRECT; DIRECT="${DB_URL/-pooler.eu-west-2/}"; DIRECT="${DIRECT/-pooler.c-/-.c-}"
+          export DIRECT; DIRECT="${DB_URL/-pooler./.}"
           host=$(python3 -c "import os,urllib.parse; print(urllib.parse.urlparse(os.environ['DIRECT']).hostname)")
           case "$host" in
             ep-small-butterfly-abxfnkn5.eu-west-2.aws.neon.tech) echo "target host: $host (direct)";;
@@ -76,16 +76,25 @@ jobs:
           python3 - <<'PY'
           import json, os, urllib.request
           key = os.environ['NEON_KEY']
-          def get(path, base=None):
-              bases = ['https://console.neon.tech/api/v2', 'https://api.neon.tech/api/v2']
-              if base: bases = [base]
-              last = None
-              for b in bases:
-                  try:
-                      req = urllib.request.Request(b + path, headers={'Authorization': 'Bearer ' + key})
-                      with urllib.request.urlopen(req, timeout=30) as r: return json.load(r)
-                  except Exception as ex: last = ex
-              print('API ERROR', path, ':', last); raise last
+          import urllib.error
+          BASE = 'https://console.neon.tech/api/v2'
+          def probe(path, use_key=True):
+              h = {'Authorization': 'Bearer ' + key} if use_key else {}
+              req = urllib.request.Request(BASE + path, headers=h)
+              try:
+                  with urllib.request.urlopen(req, timeout=30) as r:
+                      return r.status, r.read()
+              except urllib.error.HTTPError as e:
+                  return e.code, e.read()
+          st, body = probe('/projects')
+          if st != 200:
+              st2, body2 = probe('/projects', use_key=False)
+              print(f'diag: with-key status={st}, body[:300]={body[:300]!r}')
+              print(f'diag: no-key   status={st2}, body[:300]={body2[:300]!r}')
+              raise SystemExit('neon api not reachable with key')
+          def get(path):
+              req = urllib.request.Request(BASE + path, headers={'Authorization': 'Bearer ' + key})
+              with urllib.request.urlopen(req, timeout=30) as r: return json.load(r)
           for p in get('/projects').get('projects', []):
               print(f"PROJECT {p['id']} name={p.get('name')} region={p.get('region_id')} created={p.get('created_at')} updated={p.get('updated_at')} logical_size={p.get('logical_size')}")
               try:
