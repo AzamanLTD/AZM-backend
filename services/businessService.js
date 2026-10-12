@@ -128,6 +128,7 @@ const searchBusinesses = async (prisma, { query, category, verified, limit, curs
     const EXCLUDED_NAMES = ['test portal biz', 'azaman', 'test chop bar', 'az-qa transit test co'];
     const where = {
         isSuspended: false, // CRITICAL: never show suspended businesses publicly
+        isPausedByOwner: false, // owner-paused businesses are not discoverable (order/booking attempts are refused; search must not surface them either)
         NOT: {
             businessName: {
                 in: EXCLUDED_NAMES,
