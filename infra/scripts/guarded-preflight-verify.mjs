@@ -141,7 +141,7 @@ const CONTENT_TABLES = [
   ['azm_spend_log', 'AzmSpendLog'],
 ];
 
-const DEFI_SEED_NAMES = "('AAVE','COMPOUND')";
+const DEFI_SEED_NAMES = "('AAVE','COMPOUND','INTERNAL_LP')";
 
 function targetUrl() {
   const url = process.env.DB_URL || process.env.DATABASE_URL;
@@ -232,12 +232,16 @@ async function contentBaselines(client) {
 
 async function defiInfo(client) {
   const info = await tableInfo(client, 'DeFiYieldStrategy');
-  if (!info.exists) return { count: -1, seeds: 0, aaveCount: 0, compoundCount: 0 };
+  if (!info.exists) return { count: -1, seeds: 0, aaveCount: 0, compoundCount: 0, internalLpCount: 0 };
   const aaveCount = Number(await scalar(client,
     `SELECT count(*) FROM "DeFiYieldStrategy" WHERE "name" = 'AAVE'`));
   const compoundCount = Number(await scalar(client,
     `SELECT count(*) FROM "DeFiYieldStrategy" WHERE "name" = 'COMPOUND'`));
-  return { count: info.rows, seeds: aaveCount + compoundCount, aaveCount, compoundCount };
+  const internalLpCount = Number(await scalar(client,
+    `SELECT count(*) FROM "DeFiYieldStrategy" WHERE "name" = 'INTERNAL_LP'`));
+  const seeds = Number(await scalar(client,
+    `SELECT count(*) FROM "DeFiYieldStrategy" WHERE "name" IN ${DEFI_SEED_NAMES}`));
+  return { count: info.rows, seeds, aaveCount, compoundCount, internalLpCount };
 }
 
 async function fiatInfo(client) {
@@ -329,10 +333,14 @@ async function backfillGate(client) {
       `SELECT count(*) FROM "${t}" WHERE "dedupKey" IS NULL AND metadata ? 'dedupKey' AND metadata->>'dedupKey' IS NOT NULL`));
     const affected = Number(await scalar(client,
       `SELECT count(*) FROM (
-         SELECT id, row_number() OVER (PARTITION BY "userId", "source", metadata->>'dedupKey' ORDER BY id) AS rn
+         SELECT id, "dedupKey",
+                row_number() OVER (
+                  PARTITION BY "userId", "source", metadata->>'dedupKey'
+                  ORDER BY "createdAt", id
+                ) AS rn
          FROM "${t}"
-         WHERE metadata ? 'dedupKey' AND metadata->>'dedupKey' IS NOT NULL AND "dedupKey" IS NULL
-       ) ranked WHERE rn = 1`));
+         WHERE metadata ? 'dedupKey' AND metadata->>'dedupKey' IS NOT NULL
+       ) ranked WHERE rn = 1 AND "dedupKey" IS NULL`));
     if (affected > 0) {
       console.error(`::error::preflight REFUSED: install-prod-drift would backfill dedupKey on ${affected} existing ${t} row(s) (${pending} pending total). Existing-row backfills require explicit review; the schema-only convergence must not run them implicitly.`);
       refused = true;
@@ -410,7 +418,9 @@ async function main() {
         defi_yield_strategy_aave_checksum: await filteredChecksum(client, 'DeFiYieldStrategy', `"name" = 'AAVE'`),
         defi_yield_strategy_compound_count: defi.compoundCount,
         defi_yield_strategy_compound_checksum: await filteredChecksum(client, 'DeFiYieldStrategy', `"name" = 'COMPOUND'`),
-        defi_yield_strategy_nonseed_checksum: await filteredChecksum(client, 'DeFiYieldStrategy', `"name" NOT IN ('AAVE','COMPOUND')`),
+        defi_yield_strategy_internal_lp_count: defi.internalLpCount,
+        defi_yield_strategy_internal_lp_checksum: await filteredChecksum(client, 'DeFiYieldStrategy', `"name" = 'INTERNAL_LP'`),
+        defi_yield_strategy_nonseed_checksum: await filteredChecksum(client, 'DeFiYieldStrategy', `"name" NOT IN ('AAVE','COMPOUND','INTERNAL_LP')`),
         fiat_liquidity_state_count: fiat.count,
         fiat_liquidity_state_checksum: await checksum(client, 'FiatLiquidityState'),
       };
@@ -513,7 +523,7 @@ async function main() {
         } else {
           const baselineWasAbsent = Number(defiBeforeRaw) < 0;
           const nonseedBefore = process.env.DEFI_YIELD_STRATEGY_NONSEED_CHECKSUM;
-          const nonseedAfter = await filteredChecksum(client, 'DeFiYieldStrategy', `"name" NOT IN ('AAVE','COMPOUND')`);
+          const nonseedAfter = await filteredChecksum(client, 'DeFiYieldStrategy', `"name" NOT IN ('AAVE','COMPOUND','INTERNAL_LP')`);
           if (!baselineWasAbsent && (nonseedBefore == null || nonseedBefore === '' || nonseedBefore !== nonseedAfter)) {
             console.error('::error::verify failed: pre-existing non-seed DeFiYieldStrategy content changed or its baseline is missing.'); failed++;
           } else if (baselineWasAbsent && (defi.count - defi.seeds) !== 0) {
@@ -522,6 +532,7 @@ async function main() {
           for (const [name, currentCount, currentChecksum, countKey, checksumKey] of [
             ['AAVE', defi.aaveCount, await filteredChecksum(client, 'DeFiYieldStrategy', `"name" = 'AAVE'`), 'DEFI_YIELD_STRATEGY_AAVE_COUNT', 'DEFI_YIELD_STRATEGY_AAVE_CHECKSUM'],
             ['COMPOUND', defi.compoundCount, await filteredChecksum(client, 'DeFiYieldStrategy', `"name" = 'COMPOUND'`), 'DEFI_YIELD_STRATEGY_COMPOUND_COUNT', 'DEFI_YIELD_STRATEGY_COMPOUND_CHECKSUM'],
+            ['INTERNAL_LP', defi.internalLpCount, await filteredChecksum(client, 'DeFiYieldStrategy', `"name" = 'INTERNAL_LP'`), 'DEFI_YIELD_STRATEGY_INTERNAL_LP_COUNT', 'DEFI_YIELD_STRATEGY_INTERNAL_LP_CHECKSUM'],
           ]) {
             const rawCount = process.env[countKey];
             const rawChecksum = process.env[checksumKey];
