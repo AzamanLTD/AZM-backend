@@ -36,6 +36,12 @@ const STATEMENTS = [
   );`,
   // §r42 byte-fidelity: converge any existing install that created the
   // column as JSONB (key-reordering storage) to TEXT (wire-text storage).
+  // Convergence for tables first created by Prisma db-push: Prisma's
+  // @default(uuid()) and @updatedAt are client-side defaults, so these
+  // columns can exist without database defaults. The overlay contract
+  // requires server-side defaults for direct inserts and replay-safe deploys.
+  `ALTER TABLE "FinancialOperation" ALTER COLUMN "id" SET DEFAULT gen_random_uuid()::text`,
+  `ALTER TABLE "FinancialOperation" ALTER COLUMN "updatedAt" SET DEFAULT CURRENT_TIMESTAMP`,
   `ALTER TABLE "FinancialOperation" ALTER COLUMN "responseBody" TYPE TEXT`,
   `CREATE UNIQUE INDEX IF NOT EXISTS "FinancialOperation_userId_endpoint_key_key"
     ON "FinancialOperation"("userId", "endpoint", "key");`,
