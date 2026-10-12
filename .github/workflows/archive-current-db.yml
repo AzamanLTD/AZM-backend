@@ -39,10 +39,13 @@ jobs:
           esac
           SRV=$(psql "$DIRECT" -tAc "SHOW server_version_num" | head -c 2)
           echo "server major version: $SRV"
-          for V in 18 17 16; do
-            if command -v "pg_dump$V" >/dev/null && [ "$V" -ge "$SRV" ]; then PGD="pg_dump$V"; PGRESTORE="pg_restore$V"; break; fi
+          PGD=""
+          for d in $(ls -d /usr/lib/postgresql/*/bin 2>/dev/null | sort -Vr) /usr/bin; do
+            [ -x "$d/pg_dump" ] || continue
+            V=$("$d/pg_dump" --version | grep -oE '[0-9]+' | head -1)
+            if [ -n "$V" ] && [ "$V" -ge "$SRV" ]; then PGD="$d/pg_dump"; PGRESTORE="$d/pg_restore"; echo "selected $PGD (v$V)"; break; fi
           done
-          [ -n "${PGD:-}" ] || { echo "no pg_dump >= server version available"; exit 1; }
+          [ -n "${PGD:-}" ] || { echo "no pg_dump >= server version available"; ls -d /usr/lib/postgresql/*/bin 2>/dev/null; exit 1; }
           echo "using $PGD"
           $PGD "$DIRECT" --format=custom --no-owner --no-privileges --file=current-db.pgdump
           echo "== verification =="
@@ -86,16 +89,19 @@ jobs:
                       return r.status, r.read()
               except urllib.error.HTTPError as e:
                   return e.code, e.read()
-          st, body = probe('/projects')
-          if st != 200:
-              st2, body2 = probe('/projects', use_key=False)
-              print(f'diag: with-key status={st}, body[:300]={body[:300]!r}')
-              print(f'diag: no-key   status={st2}, body[:300]={body2[:300]!r}')
-              raise SystemExit('neon api not reachable with key')
           def get(path):
               req = urllib.request.Request(BASE + path, headers={'Authorization': 'Bearer ' + key})
               with urllib.request.urlopen(req, timeout=30) as r: return json.load(r)
-          for p in get('/projects').get('projects', []):
+          # this key is project-scoped; discover its own project id first
+          PID = None
+          st, body = probe('/projects')
+          if st == 200:
+              PID = json.loads(body).get('projects', [{}])[0].get('id')
+              print('key allows account-wide listing; first project:', PID)
+          else:
+              print(f'diag: /projects status={st}, body[:200]={body[:200]!r}')
+              raise SystemExit('project-scoped key: cannot list all projects')
+          for p in [get(f'/projects/{PID}')] if PID else []:
               print(f"PROJECT {p['id']} name={p.get('name')} region={p.get('region_id')} created={p.get('created_at')} updated={p.get('updated_at')} logical_size={p.get('logical_size')}")
               try:
                   for e in get(f"/projects/{p['id']}/endpoints").get('endpoints', []):
