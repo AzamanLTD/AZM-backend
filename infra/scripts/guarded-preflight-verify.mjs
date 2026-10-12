@@ -65,7 +65,7 @@ const DEFAULT_EXPECTED_DB = 'neondb';
 //   ReconciliationException_entity_reason_open_key, business_price_current_unique.
 //
 // INTENTIONAL INITIAL SYSTEM ROWS (documented, allowed):
-//   install-phase3 seeds DeFiYieldStrategy rows AAVE + COMPOUND
+//   install-phase3 seeds DeFiYieldStrategy rows AAVE + COMPOUND + INTERNAL_LP
 //     (INSERT ... WHERE NOT EXISTS — additive, never overwrites);
 //   install-fiat-liquidity inserts the zero-valued FiatLiquidityState
 //     singleton (ON CONFLICT DO NOTHING).
@@ -395,7 +395,7 @@ async function main() {
 
       // ---- expected-initialization state (documented, allowed) ----
       const defi = await defiInfo(client);
-      console.log(`expected initialization DeFiYieldStrategy: ${defi.count < 0 ? 'table absent' : `${defi.count} rows (${defi.seeds} of the seeded names)`} — the sequence seeds AAVE/COMPOUND additively where absent.`);
+      console.log(`expected initialization DeFiYieldStrategy: ${defi.count < 0 ? 'table absent' : `${defi.count} rows (${defi.seeds} of the seeded names)`} — the sequence seeds AAVE/COMPOUND/INTERNAL_LP additively where absent.`);
       const fiat = await fiatInfo(client);
       console.log(`expected initialization FiatLiquidityState: ${fiat.count < 0 ? 'table absent' : `${fiat.count} row(s), ${fiat.zeroValued} zero-valued`} — the sequence inserts the zero-valued singleton once (ON CONFLICT DO NOTHING).`);
 
