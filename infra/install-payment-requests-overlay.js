@@ -32,6 +32,9 @@ const STATEMENTS = [
     "updatedAt"   TIMESTAMP(3) NOT NULL,
     CONSTRAINT "PaymentRequest_pkey" PRIMARY KEY ("id")
   );`,
+  // Converge tables first created by Prisma db-push: @default(uuid()) is
+  // applied client-side by Prisma and does not create a database default.
+  `ALTER TABLE "PaymentRequest" ALTER COLUMN "id" SET DEFAULT gen_random_uuid()::text`,
   // FKs are added idempotently via DO blocks: a plain ADD CONSTRAINT would
   // fail the whole installer on re-run once the constraint already exists.
   `DO $$

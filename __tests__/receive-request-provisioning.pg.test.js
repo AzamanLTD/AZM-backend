@@ -235,6 +235,67 @@ run('Receive/Request release-path provisioning (real PostgreSQL)', () => {
         expect(legacy[0].oid).toBe(null);
     });
 
+    test('converges existing Prisma-created tables to the installer defaults without losing rows', async () => {
+        const finId = 'provision-existing-financial-operation';
+        const requestId = 'provision-existing-payment-request';
+        const userId = 900000098;
+
+        // Model the already-initialized production database: Prisma's
+        // @default(uuid()) and @updatedAt are client-side values, so a table
+        // created via db push can lack the DB-side defaults in the installer
+        // contract. Keep sentinel rows in place while the overlays converge.
+        try {
+            await db.$executeRawUnsafe(
+                'ALTER TABLE "FinancialOperation" ALTER COLUMN "id" DROP DEFAULT');
+            await db.$executeRawUnsafe(
+                'ALTER TABLE "FinancialOperation" ALTER COLUMN "updatedAt" DROP DEFAULT');
+            await db.$executeRawUnsafe(
+                'ALTER TABLE "PaymentRequest" ALTER COLUMN "id" DROP DEFAULT');
+
+            await db.$executeRawUnsafe(`
+                INSERT INTO "User" ("id", "username", "email", "password")
+                VALUES (${userId}, 'prov-default-user', 'prov-default-user@example.test', 'x')`);
+            await db.$executeRawUnsafe(`
+                INSERT INTO "FinancialOperation"
+                    ("id", "userId", "endpoint", "key", "fingerprint", "updatedAt")
+                VALUES ('${finId}', 1, 'POST /api/default-proof', 'default-proof-key',
+                        'default-proof-fingerprint', CURRENT_TIMESTAMP)`);
+            await db.$executeRawUnsafe(`
+                INSERT INTO "PaymentRequest"
+                    ("id", "requesterId", "mode", "amountExact", "expiresAt", "updatedAt")
+                VALUES ('${requestId}', ${userId}, 'DIRECT', '10.00',
+                        CURRENT_TIMESTAMP + interval '1 day', CURRENT_TIMESTAMP)`);
+
+            runInstallers();
+            await verifyProvisionedShape();
+
+            const finRows = await db.$queryRawUnsafe(
+                'SELECT "id", "key", "fingerprint" FROM "FinancialOperation" WHERE "id" = $1',
+                finId);
+            expect(finRows).toEqual([{
+                id: finId, key: 'default-proof-key', fingerprint: 'default-proof-fingerprint',
+            }]);
+
+            const requestRows = await db.$queryRawUnsafe(
+                'SELECT "id", "requesterId", "amountExact", "status", "currency" FROM "PaymentRequest" WHERE "id" = $1',
+                requestId);
+            expect(requestRows).toEqual([{
+                id: requestId, requesterId: userId, amountExact: '10.00',
+                status: 'PENDING', currency: 'GHS',
+            }]);
+        } finally {
+            // Remove only this test's synthetic rows and leave the overlays
+            // converged even if an assertion fails.
+            await db.$executeRawUnsafe(
+                'DELETE FROM "PaymentRequest" WHERE "id" = $1', requestId).catch(() => {});
+            await db.$executeRawUnsafe(
+                'DELETE FROM "FinancialOperation" WHERE "id" = $1', finId).catch(() => {});
+            await db.$executeRawUnsafe(
+                'DELETE FROM "User" WHERE "id" = $1', userId).catch(() => {});
+            runInstallers();
+        }
+    });
+
     test('the r42 installer REFUSES a populated legacy IdempotencyKey — rows and table survive intact', async () => {
         // The workflow preflight is a separate job that runs earlier; rows may
         // legally appear between it and the apply job. The installer itself
