@@ -4,7 +4,8 @@ name: Audit DB read-only comparison
 # no credentials, no DDL, no writes. Each connection runs every query inside a
 # BEGIN READ ONLY transaction and always rolls back.
 on:
-  workflow_dispatch: {}
+  push:
+    branches: [audit/db-readonly-comparison]
 
 permissions:
   contents: read
