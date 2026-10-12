@@ -1,0 +1,395 @@
+name: AZM Azaman-New BusinessPrice overlay provision
+
+# =============================================================================
+# Guarded operational workflow: applies ONLY infra/install-business-price-overlay.js
+# to the already-initialized Azaman-New Neon database.
+#
+# Why this exists: the live Render service (Free plan) does not execute the
+# Pre-Deploy Command (`npm run release` — see DEPLOY_RUNBOOK.md "Free-plan
+# Render deploy path"), so an overlay added to the release chain does not
+# automatically provision production. Until that dashboard change is applied,
+# this workflow is the supported, repeatable provisioning path.
+#
+# Safety contract (mirrors .github/workflows/bootstrap-azaman-new.yml):
+#   - Requires a human to type "Azaman-New" in the confirmation input.
+#   - ALL THREE jobs fail closed on target mismatch: the direct Neon hostname
+#     must be EXACTLY ep-floral-hat-b9qwuuq0.c-7.eu-central-1.aws.neon.tech
+#     (no pooler, no other Neon project) and current_database() must be
+#     exactly neondb. Preflight AND apply AND post-install verify assert both
+#     before doing anything else; a mismatch aborts before any write.
+#   - Preflight is READ-ONLY: validates the direct Neon endpoint, confirms the
+#     database is initialized (BusinessProduct/BusinessProfile/BusinessLocation
+#     present), reports the current BusinessPrice state, and refuses to run
+#     against any other target. No writes in preflight.
+#   - Apply runs the single idempotent, additive installer — no db push, no
+#     migrate deploy, no seed, no destructive SQL.
+#   - Verify is READ-ONLY: asserts the full BusinessPrice contract (13 columns,
+#     PK, BusinessProduct FK with cascade, both indexes, all 7 validated CHECK
+#     constraints) and prints the object inventory.
+#   - Connection details are never printed; failures withhold them.
+# =============================================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: Type Azaman-New exactly to confirm the intended target
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: azm-azaman-new-business-price-provision
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    name: Confirm target and read-only preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Require explicit target confirmation
+        env:
+          CONFIRMATION: ${{ inputs.confirmation }}
+        run: |
+          if [ "$CONFIRMATION" != "Azaman-New" ]; then
+            echo "::error::Confirmation did not match Azaman-New. No database connection was attempted."
+            exit 1
+          fi
+
+      - name: Checkout backend
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Read-only target preflight
+        env:
+          DATABASE_URL: ${{ secrets.AZM_NEW_DATABASE_URL }}
+        run: |
+          node <<'NODE'
+          const { Client } = require('pg');
+
+          (async () => {
+            let client;
+            try {
+              const raw = process.env.DATABASE_URL;
+              if (!raw) throw Object.assign(new Error('missing secret'), { code: 'MISSING_SECRET' });
+              const url = new URL(raw);
+              if (!['postgres:', 'postgresql:'].includes(url.protocol)) {
+                throw Object.assign(new Error('invalid protocol'), { code: 'INVALID_URL' });
+              }
+              const EXPECTED_HOST = 'ep-floral-hat-b9qwuuq0.c-7.eu-central-1.aws.neon.tech';
+              const host = url.hostname.toLowerCase();
+              if (!host.endsWith('.neon.tech') || host.includes('-pooler')) {
+                throw Object.assign(new Error('must use direct Neon endpoint'), { code: 'NOT_DIRECT_NEON' });
+              }
+              if (host !== EXPECTED_HOST) {
+                // Fail closed: any other Neon project/endpoint is a wrong target.
+                console.error(`Target hostname mismatch: expected ${EXPECTED_HOST}, got ${host}. Aborting before any query.`);
+                throw Object.assign(new Error('not the Azaman-New direct endpoint'), { code: 'WRONG_TARGET_HOST' });
+              }
+
+              client = new Client({ connectionString: raw, connectionTimeoutMillis: 10000 });
+              await client.connect();
+              const { rows } = await client.query(`
+                SELECT current_database() AS database_name,
+                       current_schema() AS schema_name,
+                       (SELECT COUNT(*)::int
+                          FROM information_schema.tables
+                         WHERE table_schema = 'public'
+                           AND table_type = 'BASE TABLE') AS public_table_count
+              `);
+              const row = rows[0];
+              console.log(`Read-only target check: database=${row.database_name}, schema=${row.schema_name}, public tables=${row.public_table_count}`);
+
+              if (row.database_name !== 'neondb') {
+                console.error(`Target database mismatch: expected neondb, got ${row.database_name}. Aborting.`);
+                throw Object.assign(new Error('not the neondb database'), { code: 'WRONG_TARGET_DATABASE' });
+              }
+              if (row.schema_name !== 'public') {
+                throw Object.assign(new Error('unexpected schema'), { code: 'UNEXPECTED_SCHEMA' });
+              }
+
+              // The database must be the INITIALIZED Azaman-New — the
+              // installer only adds BusinessPrice on top of an existing schema.
+              const required = ['BusinessProduct', 'BusinessProfile', 'BusinessLocation'];
+              const present = await client.query(`
+                SELECT table_name FROM information_schema.tables
+                 WHERE table_schema = 'public' AND table_type = 'BASE TABLE'
+                   AND table_name = ANY($1::text[])`, [required]);
+              const found = new Set(present.rows.map((r) => r.table_name));
+              const missing = required.filter((t) => !found.has(t));
+              if (missing.length) {
+                throw Object.assign(
+                  new Error(`target is not an initialized Azaman-New (missing ${missing.join(', ')})`),
+                  { code: 'TARGET_NOT_INITIALIZED' }
+                );
+              }
+
+              // Report current BusinessPrice state (informational either way —
+              // the installer is a safe replay on an existing table).
+              const price = await client.query(`
+                SELECT to_regclass('public."BusinessPrice"')::text AS oid`);
+              console.log(`BusinessPrice before apply: ${price.rows[0].oid || 'absent (will be created)'}`);
+              console.log('Preflight passed. No writes were performed by this job.');
+            } catch (err) {
+              console.error(`Preflight failed (${err.code || 'connection/precondition error'}). Connection details are withheld; no schema writes were started.`);
+              process.exitCode = 1;
+            } finally {
+              if (client) await client.end().catch(() => {});
+            }
+          })();
+          NODE
+
+  apply_overlay:
+    name: Apply install-business-price-overlay.js (idempotent, additive only)
+    needs: preflight
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout backend
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Generate Prisma Client for the overlay installer
+        env:
+          DATABASE_URL: postgresql://provision:provision@localhost:5432/azm_provision?schema=public
+        run: npx prisma generate
+
+      - name: Fail-closed target guard before apply (read-only)
+        env:
+          DATABASE_URL: ${{ secrets.AZM_NEW_DATABASE_URL }}
+        run: |
+          node <<'NODE'
+          const { Client } = require('pg');
+
+          (async () => {
+            const EXPECTED_HOST = 'ep-floral-hat-b9qwuuq0.c-7.eu-central-1.aws.neon.tech';
+            let client;
+            try {
+              const raw = process.env.DATABASE_URL;
+              if (!raw) throw Object.assign(new Error('missing secret'), { code: 'MISSING_SECRET' });
+              const url = new URL(raw);
+              if (!['postgres:', 'postgresql:'].includes(url.protocol)) {
+                throw Object.assign(new Error('invalid protocol'), { code: 'INVALID_URL' });
+              }
+              const host = url.hostname.toLowerCase();
+              if (!host.endsWith('.neon.tech') || host.includes('-pooler')) {
+                throw Object.assign(new Error('must use direct Neon endpoint'), { code: 'NOT_DIRECT_NEON' });
+              }
+              if (host !== EXPECTED_HOST) {
+                console.error(`Target hostname mismatch: expected ${EXPECTED_HOST}, got ${host}. Refusing to apply.`);
+                throw Object.assign(new Error('not the Azaman-New direct endpoint'), { code: 'WRONG_TARGET_HOST' });
+              }
+              client = new Client({ connectionString: raw, connectionTimeoutMillis: 10000 });
+              await client.connect();
+              const { rows } = await client.query('SELECT current_database() AS database_name');
+              if (rows[0].database_name !== 'neondb') {
+                console.error(`Target database mismatch: expected neondb, got ${rows[0].database_name}. Refusing to apply.`);
+                throw Object.assign(new Error('not the neondb database'), { code: 'WRONG_TARGET_DATABASE' });
+              }
+              console.log(`Target guard passed: neondb @ ${EXPECTED_HOST}. No writes performed by this step.`);
+            } catch (err) {
+              console.error(`Target guard failed (${err.code || 'connection error'}). Connection details are withheld; the overlay was NOT applied.`);
+              process.exitCode = 1;
+            } finally {
+              if (client) await client.end().catch(() => {});
+            }
+          })();
+          NODE
+
+      - name: Apply the BusinessPrice overlay
+        env:
+          DATABASE_URL: ${{ secrets.AZM_NEW_DATABASE_URL }}
+        run: node infra/install-business-price-overlay.js
+
+  verify:
+    name: Read-only post-install verification
+    needs: apply_overlay
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout backend
+        uses: actions/checkout@v7
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Verify BusinessPrice contract (read-only)
+        env:
+          DATABASE_URL: ${{ secrets.AZM_NEW_DATABASE_URL }}
+        run: |
+          node <<'NODE'
+          const { Client } = require('pg');
+
+          const fail = (code, detail) => {
+            console.error(`VERIFY FAILED [${code}] ${detail}`);
+            process.exitCode = 1;
+          };
+
+          // The exact prisma/schema.prisma render (what `prisma db push`
+          // creates). name -> [data_type, precision, is_nullable, default-check]
+          const EXPECTED_COLUMNS = {
+            id:                ['text', null, 'NO', (d) => d === null],
+            businessProductId: ['text', null, 'NO', (d) => d === null],
+            currency:          ['character varying', 3, 'NO', (d) => d === null],
+            amountExact:       ['numeric', 20, 'NO', (d) => d === null],
+            scope:             ['text', null, 'NO', (d) => d === `'DEFAULT'::text`],
+            locationId:        ['text', null, 'YES', (d) => d === null],
+            status:            ['text', null, 'NO', (d) => d === `'ACTIVE'::text`],
+            confirmedByType:   ['text', null, 'NO', (d) => d === `'BUSINESS'::text`],
+            confirmedById:     ['text', null, 'YES', (d) => d === null],
+            confirmedAt:       ['timestamp without time zone', 3, 'YES', (d) => d === null],
+            note:              ['text', null, 'YES', (d) => d === null],
+            effectiveFrom:     ['timestamp without time zone', 3, 'NO', (d) => /^CURRENT_TIMESTAMP/.test(d || '')],
+            effectiveTo:       ['timestamp without time zone', 3, 'YES', (d) => d === null],
+          };
+          const CHECK_CONSTRAINTS = [
+            'business_price_effective_window_check',
+            'business_price_scope_location_check',
+            'business_price_amount_positive',
+            'business_price_scope_check',
+            'business_price_status_check',
+            'business_price_confirmed_by_check',
+            'business_price_currency_check',
+          ];
+
+          (async () => {
+            let client;
+            try {
+              const raw = process.env.DATABASE_URL;
+              if (!raw) throw Object.assign(new Error('missing secret'), { code: 'MISSING_SECRET' });
+              const url = new URL(raw);
+              const EXPECTED_HOST = 'ep-floral-hat-b9qwuuq0.c-7.eu-central-1.aws.neon.tech';
+              const host = url.hostname.toLowerCase();
+              if (!host.endsWith('.neon.tech') || host.includes('-pooler')) {
+                throw Object.assign(new Error('must use direct Neon endpoint'), { code: 'NOT_DIRECT_NEON' });
+              }
+              if (host !== EXPECTED_HOST) {
+                console.error(`Target hostname mismatch: expected ${EXPECTED_HOST}, got ${host}. Aborting before any query.`);
+                throw Object.assign(new Error('not the Azaman-New direct endpoint'), { code: 'WRONG_TARGET_HOST' });
+              }
+
+              client = new Client({ connectionString: raw, connectionTimeoutMillis: 10000 });
+              await client.connect();
+
+              // 0. Fail closed on target database — verify must never run
+              // against (or silently pass on) anything but Azaman-New neondb.
+              const db = await client.query('SELECT current_database() AS database_name');
+              if (db.rows[0].database_name !== 'neondb') {
+                console.error(`Target database mismatch: expected neondb, got ${db.rows[0].database_name}. Aborting.`);
+                throw Object.assign(new Error('not the neondb database'), { code: 'WRONG_TARGET_DATABASE' });
+              }
+              console.log('PASS  target            neondb @ ep-floral-hat-b9qwuuq0.c-7.eu-central-1.aws.neon.tech');
+
+              // 1. Table
+              const table = await client.query(`SELECT to_regclass('public."BusinessPrice"')::text AS oid`);
+              if (!table.rows[0].oid) return fail('TABLE_MISSING', 'BusinessPrice is absent');
+              console.log('PASS  table            public."BusinessPrice"');
+
+              // 2. All 13 columns: type, precision, nullability, default
+              const cols = await client.query(`
+                SELECT column_name, data_type, character_maximum_length AS charlen,
+                       numeric_precision AS nprec, numeric_scale AS nscale,
+                       datetime_precision AS dprec, is_nullable, column_default
+                  FROM information_schema.columns
+                 WHERE table_schema = 'public' AND table_name = 'BusinessPrice'`);
+              const byName = new Map(cols.rows.map((c) => [c.column_name, c]));
+              if (byName.size !== Object.keys(EXPECTED_COLUMNS).length) {
+                return fail('COLUMN_COUNT', `expected 13 columns, found ${byName.size}`);
+              }
+              for (const [name, [type, prec, nullable, defaultOk]] of Object.entries(EXPECTED_COLUMNS)) {
+                const c = byName.get(name);
+                if (!c) return fail('COLUMN_MISSING', name);
+                if (c.data_type !== type) return fail('COLUMN_TYPE', `${name}: ${c.data_type} != ${type}`);
+                if (c.is_nullable !== nullable) return fail('COLUMN_NULLABLE', `${name}: ${c.is_nullable} != ${nullable}`);
+                if (type === 'character varying' && c.charlen !== prec) return fail('COLUMN_LENGTH', name);
+                if (type === 'numeric' && (c.nprec !== prec || c.nscale !== 2)) return fail('COLUMN_PRECISION', name);
+                if (type === 'timestamp without time zone' && c.dprec !== prec) return fail('COLUMN_PRECISION', name);
+                if (!defaultOk(c.column_default)) return fail('COLUMN_DEFAULT', `${name}: ${JSON.stringify(c.column_default)}`);
+                console.log(`PASS  column           ${name.padEnd(18)} ${type}${prec ? `(${prec}${type === 'numeric' ? ',2' : ''})` : ''} ${nullable === 'NO' ? 'NOT NULL' : 'nullable'}`);
+              }
+
+              // 3. Primary key
+              const pk = await client.query(`
+                SELECT conname FROM pg_constraint
+                 WHERE conrelid = 'public."BusinessPrice"'::regclass AND contype = 'p'`);
+              if (pk.rows.length !== 1 || pk.rows[0].conname !== 'BusinessPrice_pkey') {
+                return fail('PRIMARY_KEY', JSON.stringify(pk.rows.map((r) => r.conname)));
+              }
+              console.log('PASS  primary key      BusinessPrice_pkey (id)');
+
+              // 4. BusinessProduct FK with ON UPDATE CASCADE ON DELETE CASCADE
+              const fk = await client.query(`
+                SELECT conname, confupdtype, confdeltype,
+                       confrelid = 'public."BusinessProduct"'::regclass AS refs_product
+                  FROM pg_constraint
+                 WHERE conrelid = 'public."BusinessPrice"'::regclass AND contype = 'f'`);
+              const f = fk.rows[0];
+              if (fk.rows.length !== 1
+                  || f.conname !== 'BusinessPrice_businessProductId_fkey'
+                  || f.refs_product !== true
+                  || f.confupdtype !== 'c' || f.confdeltype !== 'c') {
+                return fail('FOREIGN_KEY', JSON.stringify(fk.rows));
+              }
+              console.log('PASS  foreign key      BusinessPrice_businessProductId_fkey -> BusinessProduct(id) ON UPDATE CASCADE ON DELETE CASCADE');
+
+              // 5. Both indexes
+              const idx = await client.query(`
+                SELECT indexname, indexdef FROM pg_indexes
+                 WHERE schemaname = 'public' AND tablename = 'BusinessPrice'`);
+              const idxByName = new Map(idx.rows.map((i) => [i.indexname, i.indexdef]));
+              const prismaIdx = 'BusinessPrice_businessProductId_currency_status_effectiveTo_idx';
+              if (!idxByName.has(prismaIdx)) return fail('INDEX_MISSING', prismaIdx);
+              console.log(`PASS  index            ${prismaIdx}`);
+              const uniq = idxByName.get('business_price_current_unique');
+              if (!uniq || !/UNIQUE/i.test(uniq) || !/WHERE/.test(uniq)) {
+                return fail('INDEX_MISSING', 'business_price_current_unique (partial unique)');
+              }
+              console.log('PASS  index            business_price_current_unique (partial unique, WHERE status = ACTIVE AND effectiveTo IS NULL)');
+
+              // 6. All seven CHECK constraints, fully validated
+              const cks = await client.query(`
+                SELECT conname, convalidated FROM pg_constraint
+                 WHERE conrelid = 'public."BusinessPrice"'::regclass AND contype = 'c'`);
+              const ckByName = new Map(cks.rows.map((c) => [c.conname, c.convalidated]));
+              if (cks.rows.length !== CHECK_CONSTRAINTS.length) {
+                return fail('CHECK_COUNT', `expected 7 CHECK constraints, found ${cks.rows.length}`);
+              }
+              for (const name of CHECK_CONSTRAINTS) {
+                if (ckByName.get(name) !== true) return fail('CHECK_NOT_VALIDATED', name);
+                console.log(`PASS  check constraint ${name} (validated)`);
+              }
+
+              console.log('VERIFICATION PASSED: BusinessPrice contract fully present (read-only — no writes performed by this job).');
+            } catch (err) {
+              console.error(`Verification failed (${err.code || 'connection error'}). Connection details are withheld.`);
+              process.exitCode = 1;
+            } finally {
+              if (client) await client.end().catch(() => {});
+            }
+          })();
+          NODE
