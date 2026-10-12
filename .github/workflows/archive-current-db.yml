@@ -2,7 +2,7 @@ name: Archive current DB (one-time, encrypted)
 on:
   push:
     branches:
-    - db-archive
+      - db-archive
 permissions:
   contents: read
 jobs:
@@ -14,63 +14,138 @@ jobs:
       DB_URL: ${{ secrets.AUDIT_RENDER_RUNTIME_DB_URL }}
       ARCHIVE_PASS: ${{ secrets.ARCHIVE_PASSPHRASE }}
     steps:
-    - name: Install PostgreSQL client tools
-      run: 'curl -fsS https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo gpg --dearmor -o /usr/share/keyrings/pgdg.gpg
-
-        echo "deb [signed-by=/usr/share/keyrings/pgdg.gpg] http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list
-
-        sudo apt-get update -qq
-
-        sudo apt-get install -y -qq postgresql-client-16 postgresql-client-17 postgresql-client-18 2>/dev/null || sudo apt-get install -y -qq postgresql-client-16 postgresql-client-17
-
-        '
-    - name: Dump (direct endpoint), verify, encrypt
-      run: "set -euo pipefail\n# pg_dump must use the DIRECT endpoint (pgbouncer transaction pooling breaks session state).\nexport DIRECT; DIRECT=\"${DB_URL/-pooler./.}\"\nhost=$(python3 -c \"import os,urllib.parse; print(urllib.parse.urlparse(os.environ['DIRECT']).hostname)\")\ncase \"$host\" in\n  ep-small-butterfly-abxfnkn5.eu-west-2.aws.neon.tech) echo \"target host: $host (direct)\";;\n  *) echo \"UNEXPECTED TARGET HOST - ABORT\"; exit 1;;\nesac\nSRV=$(psql \"$DIRECT\" -tAc \"SHOW server_version_num\" | head -c 2)\necho \"server major version: $SRV\"\nPGD=\"\"\nfor d in $(ls -d /usr/lib/postgresql/*/bin 2>/dev/null | sort -Vr) /usr/bin; do\n  [ -x \"$d/pg_dump\" ] || continue\n  V=$(\"$d/pg_dump\" --version | grep -oE '[0-9]+' | head -1)\n  if [ -n \"$V\" ] && [ \"$V\" -ge \"$SRV\" ]; then PGD=\"$d/pg_dump\"; PGRESTORE=\"$d/pg_restore\"; echo \"selected $PGD (v$V)\"; break; fi\ndone\n[ -n \"${PGD:-}\" ] || { echo \"no pg_dump >= server version available\"; ls -d /usr/lib/postgresql/*/bin 2>/dev/null; exit 1; }\necho \"using $PGD\"\n$PGD \"$DIRECT\" --format=custom --no-owner --no-privileges --file=current-db.pgdump\necho \"== verification ==\"\nls -l current-db.pgdump | awk '{print \"raw size:\", $5, \"bytes\"}'\nSHA_RAW=$(sha256sum current-db.pgdump | cut -d' ' -f1)\necho \"raw sha256: $SHA_RAW\"\ntest -s current-db.pgdump\n$PGRESTORE --list current-db.pgdump > toc.txt\necho \"pg_restore --list: OK, $(wc -l < toc.txt) TOC lines, $(grep -c 'TABLE DATA' toc.txt || true) table-data entries\"\ntest \"$(wc -c < toc.txt)\" -gt 0\nopenssl enc -aes-256-cbc -pbkdf2 -iter 600000 -salt -in current-db.pgdump -out current-db.pgdump.enc -pass env:ARCHIVE_PASS\necho \"enc size: $(wc -c < current-db.pgdump.enc) bytes\"\nSHA_ENC=$(sha256sum current-db.pgdump.enc | cut -d' ' -f1)\necho \"enc sha256: $SHA_ENC\"\n"
-    - name: Upload ciphertext (1-day retention, replaced by private storage)
-      uses: actions/upload-artifact@v4
-      with:
-        name: current-db-archive
-        path: current-db.pgdump.enc
-        retention-days: 1
-        if-no-files-found: error
+      - name: Install PostgreSQL client tools
+        run: |
+          curl -fsS https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo gpg --dearmor -o /usr/share/keyrings/pgdg.gpg
+          echo "deb [signed-by=/usr/share/keyrings/pgdg.gpg] http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq postgresql-client-16 postgresql-client-17 postgresql-client-18
+      - name: Dump (direct endpoint), verify, encrypt
+        run: |
+          set -euo pipefail
+          # pg_dump must use the DIRECT endpoint (pgbouncer transaction pooling breaks session state).
+          export DIRECT
+          DIRECT="${DB_URL/-pooler./.}"
+          host=$(python3 -c "import os,urllib.parse; print(urllib.parse.urlparse(os.environ['DIRECT']).hostname)")
+          case "$host" in
+            ep-small-butterfly-abxfnkn5.eu-west-2.aws.neon.tech) echo "target host: $host (direct)";;
+            *) echo "UNEXPECTED TARGET HOST - ABORT"; exit 1;;
+          esac
+          SRV=$(psql "$DIRECT" -tAc "SELECT current_setting('server_version_num')" | cut -c1-2)
+          echo "server major version: $SRV"
+          PGD=""
+          for d in $(ls -d /usr/lib/postgresql/*/bin 2>/dev/null | sort -Vr) /usr/bin; do
+            [ -x "$d/pg_dump" ] || continue
+            V=$("$d/pg_dump" --version | grep -oE '[0-9]+' | head -1)
+            if [ -n "$V" ] && [ "$V" -ge "$SRV" ]; then PGD="$d/pg_dump"; PGRESTORE="$d/pg_restore"; echo "selected $PGD (v$V)"; break; fi
+          done
+          [ -n "${PGD:-}" ] || { echo "no pg_dump >= server version available"; ls -d /usr/lib/postgresql/*/bin 2>/dev/null; exit 1; }
+          echo "using $PGD"
+          $PGD "$DIRECT" --format=custom --no-owner --no-privileges --file=current-db.pgdump
+          echo "== verification =="
+          ls -l current-db.pgdump | awk '{print "raw size:", $5, "bytes"}'
+          SHA_RAW=$(sha256sum current-db.pgdump | cut -d' ' -f1)
+          echo "raw sha256: $SHA_RAW"
+          test -s current-db.pgdump
+          $PGRESTORE --list current-db.pgdump > toc.txt
+          echo "pg_restore --list: OK, $(wc -l < toc.txt) TOC lines, $(grep -c 'TABLE DATA' toc.txt || true) table-data entries"
+          test "$(wc -c < toc.txt)" -gt 0
+          openssl enc -aes-256-cbc -pbkdf2 -iter 600000 -salt -in current-db.pgdump -out current-db.pgdump.enc -pass env:ARCHIVE_PASS
+          echo "enc size: $(wc -c < current-db.pgdump.enc) bytes"
+          SHA_ENC=$(sha256sum current-db.pgdump.enc | cut -d' ' -f1)
+          echo "enc sha256: $SHA_ENC"
+      - name: Upload ciphertext (1-day retention, moved to private storage)
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: current-db-archive
+          path: current-db.pgdump.enc
+          retention-days: 1
+          if-no-files-found: error
   neon-metadata:
     name: Historical Neon project identification (metadata only)
+    needs: [archive-current]
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
+    env:
+      NEON_KEY: ${{ secrets.NEON_API_KEY }}
     steps:
-    - name: List projects, endpoints, branches (no secrets)
-      env:
-        NEON_KEY: ${{ secrets.NEON_API_KEY }}
-      run: "python3 - <<'PY'\nimport json, os, urllib.request\nkey = os.environ['NEON_KEY']\nimport urllib.error\nBASE = 'https://console.neon.tech/api/v2'\ndef probe(path, use_key=True):\n    h = {'Authorization': 'Bearer ' + key} if use_key else {}\n    req = urllib.request.Request(BASE + path, headers=h)\n    try:\n        with urllib.request.urlopen(req, timeout=30) as r:\n            return r.status, r.read()\n    except urllib.error.HTTPError as e:\n        return e.code, e.read()\ndef get(path):\n    req = urllib.request.Request(BASE + path, headers={'Authorization': 'Bearer ' + key})\n    with urllib.request.urlopen(req, timeout=30) as r: return json.load(r)\n# this key is project-scoped; discover its own project id first\nPID = None\nst, body = probe('/projects')\nif st == 200:\n    PID = json.loads(body).get('projects', [{}])[0].get('id')\n    print('key allows account-wide listing; first project:', PID)\nelse:\n    print(f'diag: /projects status={st}, body[:200]={body[:200]!r}')\n    PID = 'polished-river-71067591'\n    print('project-scoped key: querying only its own project', PID)\nfor path in [f'/projects/{PID}', f'/projects/{PID}/endpoints', f'/projects/{PID}/branches']:\n    print(f'== GET {path}')\n    try:\n        raw = get(path)\n        print(json.dumps(raw)[:1800])\n    except Exception as ex:\n        print('  error:', ex)\nPY\n"
-    needs:
-    - archive-current
+      - name: List projects, endpoints, branches (no secrets)
+        run: |
+          python3 - <<'PY'
+          import json, os, urllib.request, urllib.error
+          BASE = 'https://console.neon.tech/api/v2'
+          key = os.environ['NEON_KEY']
+          def get(path):
+              req = urllib.request.Request(BASE + path, headers={'Authorization': 'Bearer ' + key})
+              with urllib.request.urlopen(req, timeout=30) as r: return json.load(r)
+          # this key is project-scoped; its own project id came from the scope error message
+          PID = 'polished-river-71067591'
+          print('querying the key-scoped project', PID)
+          for path in [f'/projects/{PID}', f'/projects/{PID}/endpoints', f'/projects/{PID}/branches']:
+              print(f'== GET {path}')
+              try:
+                  print(json.dumps(get(path))[:2400])
+              except Exception as ex:
+                  print('  error:', ex)
+          PY
   archive-production:
     name: Audit + archive the historical production branch (read-only)
-    needs:
-    - archive-current
+    needs: [archive-current]
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
       DB_URL: ${{ secrets.AUDIT_RENDER_RUNTIME_DB_URL }}
       ARCHIVE_PASS: ${{ secrets.ARCHIVE_PASSPHRASE }}
     steps:
-    - name: Install PostgreSQL client tools
-      run: 'curl -fsS https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo gpg --dearmor -o /usr/share/keyrings/pgdg.gpg
-
-        echo "deb [signed-by=/usr/share/keyrings/pgdg.gpg] http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list
-
-        sudo apt-get update -qq
-
-        sudo apt-get install -y -qq postgresql-client-17 postgresql-client-18
-
-        '
-    - name: Aggregate audit + dump + encrypt (production branch, ep-crimson-cell)
-      run: "set -euo pipefail\nexport PROD_DIRECT; PROD_DIRECT=\"${DB_URL/ep-small-butterfly-abxfnkn5-pooler./ep-crimson-cell-ab81e3bp.}\"\nhost=$(python3 -c \"import os,urllib.parse; print(urllib.parse.urlparse(os.environ['PROD_DIRECT']).hostname)\")\ncase \"$host\" in\n  ep-crimson-cell-ab81e3bp.eu-west-2.aws.neon.tech) echo \"target: $host (production branch, direct)\";;\n  *) echo \"UNEXPECTED TARGET HOST - ABORT\"; exit 1;;\nesac\nif ! psql \"$PROD_DIRECT\" -tAc \"SELECT current_database()\" >/dev/null 2>/tmp/auth.err; then\n  echo \"ACCESS RESULT: production branch identified (ep-crimson-cell / br-shy-mode 'production') but NOT accessible with current credentials\"\n  cat /tmp/auth.err\n  exit 3\nfi\necho \"ACCESS RESULT: reachable, database=$(psql \"$PROD_DIRECT\" -tAc 'SELECT current_database()')\"\necho \"== aggregate audit (counts and timestamp ranges only) ==\"\npsql \"$PROD_DIRECT\" -tAc \"SELECT count(*) FROM pg_stat_user_tables\" | awk '{print \"tables:\", $1}'\nfor T in \"User\" \"TransactionHistory\" \"Trade\" \"Withdrawal\" \"PeerTransfer\" \"Message\" \"BusinessProfile\" \"BusinessProduct\" \"CurrencyWallet\" \"JournalEntry\" \"LedgerTransaction\" \"FinancialOperation\" \"PaymentRequest\"; do\n  psql \"$PROD_DIRECT\" -tAc \"SELECT to_regclass('$T') IS NULL\" | grep -q t && { echo \"  $T: ABSENT\"; continue; }\n  psql \"$PROD_DIRECT\" -tAc \"SELECT format('  %s: %s rows', '$T', count(*)) FROM \\\"$T\\\"\" 2>/dev/null || echo \"  $T: count error\"\ndone\nfor T in \"\\\"User\\\"\" \"\\\"TransactionHistory\\\"\" \"\\\"Trade\\\"\" \"\\\"Withdrawal\\\"\" \"\\\"PeerTransfer\\\"\" \"\\\"Message\\\"\"; do\n  psql \"$PROD_DIRECT\" -tAc \"SELECT to_regclass('$T') IS NULL\" | grep -q t && continue\n  psql \"$PROD_DIRECT\" -tAc \"SELECT format('  %s span: %s .. %s', trim(both '\\\"' from '$T'), min(\\\"createdAt\\\")::date, max(\\\"createdAt\\\")::date) FROM $T\" 2>/dev/null || true\ndone\nPGD=/usr/lib/postgresql/18/bin/pg_dump\n$PGD --version\n$PGD \"$PROD_DIRECT\" --format=custom --no-owner --no-privileges --file=production-db.pgdump\necho \"== verification ==\"\necho \"raw size: $(wc -c < production-db.pgdump) bytes\"\nSHA_RAW=$(sha256sum production-db.pgdump | cut -d' ' -f1); echo \"raw sha256: $SHA_RAW\"\n/usr/lib/postgresql/18/bin/pg_restore --list production-db.pgdump > toc.txt\necho \"pg_restore --list: OK, $(wc -l < toc.txt) TOC lines, $(grep -c 'TABLE DATA' toc.txt || true) table-data entries\"\nopenssl enc -aes-256-cbc -pbkdf2 -iter 600000 -salt -in production-db.pgdump -out production-db.pgdump.enc -pass env:ARCHIVE_PASS\necho \"enc size: $(wc -c < production-db.pgdump.enc) bytes\"\necho \"enc sha256: $(sha256sum production-db.pgdump.enc | cut -d' ' -f1)\"\n"
-    - name: Upload ciphertext (1-day retention, moved to private storage)
-      if: success()
-      uses: actions/upload-artifact@v4
-      with:
-        name: production-db-archive
-        path: production-db.pgdump.enc
-        retention-days: 1
-        if-no-files-found: error
+      - name: Install PostgreSQL client tools
+        run: |
+          curl -fsS https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo gpg --dearmor -o /usr/share/keyrings/pgdg.gpg
+          echo "deb [signed-by=/usr/share/keyrings/pgdg.gpg] http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq postgresql-client-17 postgresql-client-18
+      - name: Aggregate audit + dump + encrypt (production branch, ep-crimson-cell)
+        run: |
+          set -euo pipefail
+          export PROD_DIRECT
+          PROD_DIRECT="${DB_URL/ep-small-butterfly-abxfnkn5-pooler./ep-crimson-cell-ab81e3bp.}"
+          host=$(python3 -c "import os,urllib.parse; print(urllib.parse.urlparse(os.environ['PROD_DIRECT']).hostname)")
+          case "$host" in
+            ep-crimson-cell-ab81e3bp.eu-west-2.aws.neon.tech) echo "target: $host (production branch, direct)";;
+            *) echo "UNEXPECTED TARGET HOST - ABORT"; exit 1;;
+          esac
+          if ! psql "$PROD_DIRECT" -tAc "SELECT current_database()" >/dev/null 2>/tmp/auth.err; then
+            echo "ACCESS RESULT: production branch identified (ep-crimson-cell / br-shy-mode 'production') but NOT accessible with current credentials"
+            cat /tmp/auth.err
+            exit 3
+          fi
+          echo "ACCESS RESULT: reachable, database=$(psql "$PROD_DIRECT" -tAc 'SELECT current_database()')"
+          echo "== aggregate audit (counts and timestamp ranges only) =="
+          psql "$PROD_DIRECT" -tAc "SELECT count(*) FROM pg_stat_user_tables" | awk '{print "tables:", $1}'
+          for T in User TransactionHistory Trade Withdrawal PeerTransfer Message BusinessProfile BusinessProduct CurrencyWallet JournalEntry LedgerTransaction FinancialOperation PaymentRequest; do
+            psql "$PROD_DIRECT" -tAc "SELECT to_regclass('\"$T\"') IS NULL" | grep -q t && { echo "  $T: ABSENT"; continue; }
+            psql "$PROD_DIRECT" -tAc "SELECT format('  %s: %s rows', '$T', count(*)) FROM \"$T\"" || echo "  $T: count error"
+          done
+          for T in User TransactionHistory Trade Withdrawal PeerTransfer Message BusinessProfile BusinessProduct; do
+            psql "$PROD_DIRECT" -tAc "SELECT to_regclass('\"$T\"') IS NULL" | grep -q t && continue
+            psql "$PROD_DIRECT" -tAc "SELECT format('  %s span: %s .. %s', '$T', min(\"createdAt\")::date, max(\"createdAt\")::date) FROM \"$T\"" 2>/dev/null || true
+          done
+          PGD=/usr/lib/postgresql/18/bin/pg_dump
+          $PGD --version
+          $PGD "$PROD_DIRECT" --format=custom --no-owner --no-privileges --file=production-db.pgdump
+          echo "== verification =="
+          echo "raw size: $(wc -c < production-db.pgdump) bytes"
+          SHA_RAW=$(sha256sum production-db.pgdump | cut -d' ' -f1); echo "raw sha256: $SHA_RAW"
+          /usr/lib/postgresql/18/bin/pg_restore --list production-db.pgdump > toc.txt
+          echo "pg_restore --list: OK, $(wc -l < toc.txt) TOC lines, $(grep -c 'TABLE DATA' toc.txt || true) table-data entries"
+          openssl enc -aes-256-cbc -pbkdf2 -iter 600000 -salt -in production-db.pgdump -out production-db.pgdump.enc -pass env:ARCHIVE_PASS
+          echo "enc size: $(wc -c < production-db.pgdump.enc) bytes"
+          echo "enc sha256: $(sha256sum production-db.pgdump.enc | cut -d' ' -f1)"
+      - name: Upload ciphertext (1-day retention, moved to private storage)
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: production-db-archive
+          path: production-db.pgdump.enc
+          retention-days: 1
+          if-no-files-found: error
