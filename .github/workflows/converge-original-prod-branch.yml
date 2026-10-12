@@ -1,4 +1,4 @@
-name: AZM original production branch schema convergence (guarded, one-time)
+name: AZM original production branch guarded schema convergence (side-effect gates)
 
 # =============================================================================
 # Guarded operational workflow: converges the ORIGINAL production Neon branch
@@ -14,17 +14,32 @@ name: AZM original production branch schema convergence (guarded, one-time)
 # prisma tables missing there, all owned by reviewed idempotent installers)
 # and holds all application history through Oct 11.
 #
-# What it applies: ONLY the reviewed, additive, idempotent schema installers —
-# the same DDL the Render deploy path itself runs. This is deliberately a
-# SCHEMA-ONLY sequence: `npm run release` is NOT used verbatim because it also
-# invokes infra/seed-susu-foundation.js, which can CREATE the treasury user
-# and liability-contract record. A recovery convergence must not silently
-# broaden into a seed operation, so the seed is omitted here and the remaining
-# installers run in the exact release-chain order. Deploying the backend is a
-# separate, independent step: the server's boot path can invoke its own
-# conditional auto-release behavior (including conditional seeding and
-# backfills) at startup — that runtime behavior is unchanged by this PR and is
-# neither suppressed nor altered here.
+# WHAT THIS OPERATION IS: guarded schema convergence with EXPLICIT SIDE-EFFECT
+# GATES — NOT purely DDL-only work. The reviewed installer sequence contains
+# steps beyond schema creation:
+#   - legacy E2EE private-key table retirement (E2EESession, E2EEPreKeyBundle,
+#     and a legacy-shaped E2EEOneTimePreKey are DROPPED by
+#     install-e2ee-server-blind-overlay.js);
+#   - ConversationMoneyTicket orphan archival + deletion before FK creation
+#     (install-business-os-overlay.js);
+#   - AzmRewardLog/AzmSpendLog dedupKey backfills on existing rows
+#     (install-prod-drift-remediation.js);
+#   - intentional initial system rows: DeFiYieldStrategy seeds (AAVE,
+#     COMPOUND) and the zero-valued FiatLiquidityState singleton.
+#
+# The preflight makes every one of those effects visible and FAILS CLOSED on
+# any effect that has not been separately reviewed for this convergence run:
+# a populated legacy E2EE table, any orphan-archival candidate, or any
+# pending existing-row backfill refuses the run. Empty legacy tables follow
+# the reviewed retirement path. The seed is omitted from the apply step
+# entirely (infra/seed-susu-foundation.js is NOT run — the recovery cannot
+# create the treasury user or liability-contract record), while the phase3
+# seed rows and the fiat singleton are the documented, allowed
+# initializations above. Deploying the backend is a separate, independent
+# step: the server's boot path can invoke its own conditional auto-release
+# behavior (including conditional seeding and backfills) at startup — that
+# runtime behavior is unchanged by this PR and is neither suppressed nor
+# altered here.
 #
 # Safety contract (mirrors provision-azaman-new-*.yml):
 #   - Requires a human to type "Azaman-Original-Prod" in the confirmation input.
@@ -36,16 +51,17 @@ name: AZM original production branch schema convergence (guarded, one-time)
 #     infra/scripts/guarded-preflight-verify.mjs, whose every mode executes
 #     inside a single BEGIN READ ONLY transaction and always rolls back and
 #     releases the connection (engine-enforced read-only; see the script's
-#     header for the full audited inventory and the out-of-scope objects).
-#   - Preflight REFUSES if the legacy IdempotencyKey table is populated (the
-#     r42 installer retires it; non-empty legacy data must be exported by a
-#     human first). The r42 installer independently re-checks this fail-closed
-#     at apply time (defense in depth).
-#   - Verify asserts the COMPLETE audited inventory: every missing table and
-#     column from the 2026-10-12 audit, the named constraints/indexes, the
-#     IdempotencyKey retirement, and baseline preservation for the important
-#     existing business/financial tables (no core rows lost).
-#   - Connection details are never printed; failures withhold them.
+#     header for the full audited inventory, the side-effect gates, and the
+#     out-of-scope objects).
+#   - Post-apply verify asserts the COMPLETE audited inventory (tables, PKs,
+#     columns, named indexes), the IdempotencyKey retirement, baseline
+#     preservation for important existing business/financial tables, and
+#     CONTENT preservation (order-stable checksums) for ConversationMoneyTicket,
+#     AzmRewardLog and AzmSpendLog — row-count equality alone is never
+#     accepted as proof. Expected initial system rows (DeFi seeds, fiat
+#     singleton) are distinguished from any change to pre-existing records.
+#   - Connection details are never printed; failures withhold them; E2EE key
+#     values are never read (existence, shape and row counts only).
 #
 # REQUIRED SECRET (must exist before dispatch, owner-created):
 #   AZM_ORIGINAL_PROD_DATABASE_URL = full connection string for the DIRECT
@@ -70,7 +86,7 @@ concurrency:
 
 jobs:
   preflight:
-    name: Confirm target and read-only preflight
+    name: Confirm target and read-only preflight (side-effect gates)
     runs-on: ubuntu-latest
     timeout-minutes: 15
     outputs:
@@ -82,6 +98,15 @@ jobs:
       business_profile_count: ${{ steps.counts.outputs.business_profile_count }}
       business_product_count: ${{ steps.counts.outputs.business_product_count }}
       wallet_count: ${{ steps.counts.outputs.wallet_count }}
+      conversation_money_ticket_count: ${{ steps.counts.outputs.conversation_money_ticket_count }}
+      conversation_money_ticket_checksum: ${{ steps.counts.outputs.conversation_money_ticket_checksum }}
+      azm_reward_log_count: ${{ steps.counts.outputs.azm_reward_log_count }}
+      azm_reward_log_checksum: ${{ steps.counts.outputs.azm_reward_log_checksum }}
+      azm_spend_log_count: ${{ steps.counts.outputs.azm_spend_log_count }}
+      azm_spend_log_checksum: ${{ steps.counts.outputs.azm_spend_log_checksum }}
+      defi_yield_strategy_count: ${{ steps.counts.outputs.defi_yield_strategy_count }}
+      defi_yield_strategy_seed_count: ${{ steps.counts.outputs.defi_yield_strategy_seed_count }}
+      fiat_liquidity_state_count: ${{ steps.counts.outputs.fiat_liquidity_state_count }}
     steps:
       - name: Require explicit target confirmation
         env:
@@ -98,12 +123,12 @@ jobs:
           cache: npm
       - name: Install dependencies (the helper imports pg)
         run: npm ci
-      - name: Read-only preflight (identity, IdempotencyKey state, audited targets)
+      - name: Read-only preflight (identity, side-effect gates, audited targets)
         env:
           DB_URL: ${{ secrets.AZM_ORIGINAL_PROD_DATABASE_URL }}
         run: |
           node infra/scripts/guarded-preflight-verify.mjs preflight
-      - name: Export baseline core-table counts
+      - name: Export baseline counts and content checksums
         id: counts
         env:
           DB_URL: ${{ secrets.AZM_ORIGINAL_PROD_DATABASE_URL }}
@@ -137,7 +162,8 @@ jobs:
           node infra/install-inventory-restock-overlay.js
           node infra/install-reservation-capacity-overlay.js
           # The npm run release chain WITHOUT seed-susu-foundation.js,
-          # in the exact package.json release order. Additive and idempotent.
+          # in the exact package.json release order. Additive and idempotent;
+          # every non-DDL effect is surfaced and gated by the preflight.
           node infra/install-prod-drift-remediation.js
           node infra/install-susu-overlay.js
           node infra/install-transaction-quote-overlay.js
@@ -156,7 +182,7 @@ jobs:
           node infra/install-business-price-overlay.js
 
   verify:
-    name: Read-only post-apply verification (complete audited inventory)
+    name: Read-only post-apply verification (full inventory + content preservation)
     needs: [apply]
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -168,7 +194,7 @@ jobs:
           cache: npm
       - name: Install dependencies (the helper imports pg)
         run: npm ci
-      - name: Verify the complete audited set and baseline preservation
+      - name: Verify the complete audited set, content preservation, and expected initializations
         env:
           DB_URL: ${{ secrets.AZM_ORIGINAL_PROD_DATABASE_URL }}
           USER_COUNT: ${{ needs.preflight.outputs.user_count }}
@@ -179,5 +205,14 @@ jobs:
           BUSINESS_PROFILE_COUNT: ${{ needs.preflight.outputs.business_profile_count }}
           BUSINESS_PRODUCT_COUNT: ${{ needs.preflight.outputs.business_product_count }}
           WALLET_COUNT: ${{ needs.preflight.outputs.wallet_count }}
+          CONVERSATION_MONEY_TICKET_COUNT: ${{ needs.preflight.outputs.conversation_money_ticket_count }}
+          CONVERSATION_MONEY_TICKET_CHECKSUM: ${{ needs.preflight.outputs.conversation_money_ticket_checksum }}
+          AZM_REWARD_LOG_COUNT: ${{ needs.preflight.outputs.azm_reward_log_count }}
+          AZM_REWARD_LOG_CHECKSUM: ${{ needs.preflight.outputs.azm_reward_log_checksum }}
+          AZM_SPEND_LOG_COUNT: ${{ needs.preflight.outputs.azm_spend_log_count }}
+          AZM_SPEND_LOG_CHECKSUM: ${{ needs.preflight.outputs.azm_spend_log_checksum }}
+          DEFI_YIELD_STRATEGY_COUNT: ${{ needs.preflight.outputs.defi_yield_strategy_count }}
+          DEFI_YIELD_STRATEGY_SEED_COUNT: ${{ needs.preflight.outputs.defi_yield_strategy_seed_count }}
+          FIAT_LIQUIDITY_STATE_COUNT: ${{ needs.preflight.outputs.fiat_liquidity_state_count }}
         run: |
           node infra/scripts/guarded-preflight-verify.mjs verify

@@ -9,8 +9,16 @@
 //      always release the connection (no residue on the shared test DB);
 //   3. verify detects a missing audited TABLE and a missing audited COLUMN;
 //   4. verify passes end-to-end on the fully provisioned database, including
-//      the baseline no-rows-lost comparison;
-//   5. preflight REFUSES when the legacy IdempotencyKey is populated.
+//      the baseline comparison;
+//   5. preflight REFUSES when the legacy IdempotencyKey is populated;
+//   6. side-effect gates: preflight REFUSES populated legacy E2EE private-key
+//      tables (E2EESession/E2EEPreKeyBundle, and a legacy-shaped populated
+//      E2EEOneTimePreKey), orphaned ConversationMoneyTicket rows that
+//      install-business-os would archive+delete, and pending
+//      AzmRewardLog/AzmSpendLog dedupKey backfills;
+//   7. content preservation: verify detects a MODIFIED
+//      ConversationMoneyTicket record even when the row count is unchanged
+//      (row-count equality alone is never accepted as proof).
 //
 // CI runs the full battery with --runInBand, so this suite's fixture
 // drops/recreates are serialized against the other suites; afterAll
@@ -26,16 +34,27 @@ const url = process.env.TEST_DATABASE_URL;
 const run = url ? describe : describe.skip;
 
 const SCRIPT = path.join(__dirname, '..', 'infra', 'scripts', 'guarded-preflight-verify.mjs');
-const FIAT_INSTALLER = path.join(__dirname, '..', 'infra', 'install-fiat-liquidity-overlay.js');
 const PAYOUT_INSTALLER = path.join(__dirname, '..', 'infra', 'install-payout-reconciliation-infra.js');
-const PHASE3_INSTALLER = path.join(__dirname, '..', 'infra', 'install-phase3-overlay.js');
 const R16_INSTALLER = path.join(__dirname, '..', 'infra', 'install-r16-execution-identity-overlay.js');
 const R42_INSTALLER = path.join(__dirname, '..', 'infra', 'install-r42-idempotency-overlay.js');
+const BUSINESS_OS_INSTALLER = path.join(__dirname, '..', 'infra', 'install-business-os-overlay.js');
+
+const CMT_FKS = [
+    ['ConversationMoneyTicket_messageId_fkey',
+        'ALTER TABLE "ConversationMoneyTicket" ADD CONSTRAINT "ConversationMoneyTicket_messageId_fkey" FOREIGN KEY ("messageId") REFERENCES "Message"("id") ON DELETE RESTRICT'],
+    ['ConversationMoneyTicket_conversationId_fkey',
+        'ALTER TABLE "ConversationMoneyTicket" ADD CONSTRAINT "ConversationMoneyTicket_conversationId_fkey" FOREIGN KEY ("conversationId") REFERENCES "Conversation"("id") ON DELETE RESTRICT'],
+    ['ConversationMoneyTicket_requesterId_fkey',
+        'ALTER TABLE "ConversationMoneyTicket" ADD CONSTRAINT "ConversationMoneyTicket_requesterId_fkey" FOREIGN KEY ("requesterId") REFERENCES "User"("id") ON DELETE RESTRICT'],
+    ['ConversationMoneyTicket_counterpartyId_fkey',
+        'ALTER TABLE "ConversationMoneyTicket" ADD CONSTRAINT "ConversationMoneyTicket_counterpartyId_fkey" FOREIGN KEY ("counterpartyId") REFERENCES "User"("id") ON DELETE RESTRICT'],
+];
 
 run('prod-recovery guard helper (real PostgreSQL)', () => {
     let db;
     let seededUserId = null;
     let seededTxId = null;
+    let cmtFksDropped = false;
 
     const localHost = new URL(url).hostname;
     const localDb = new URL(url).pathname.replace(/^\//, '').split('?')[0];
@@ -65,6 +84,54 @@ run('prod-recovery guard helper (real PostgreSQL)', () => {
     async function scalar(q) {
         const r = await db.$queryRawUnsafe(q);
         return r[0] ? Object.values(r[0])[0] : null;
+    }
+
+    async function fkExists(constraint) {
+        return Number(await scalar(
+            `SELECT count(*) FROM information_schema.table_constraints WHERE table_schema='public' AND constraint_name='${constraint}'`)) > 0;
+    }
+
+    async function dropCmtFks() {
+        for (const [name] of CMT_FKS) {
+            if (await fkExists(name)) {
+                await db.$executeRawUnsafe(`ALTER TABLE "ConversationMoneyTicket" DROP CONSTRAINT "${name}"`);
+            }
+        }
+        cmtFksDropped = true;
+    }
+
+    async function restoreCmtFks() {
+        for (const [name, ddl] of CMT_FKS) {
+            if (!(await fkExists(name))) {
+                await db.$executeRawUnsafe(ddl);
+            }
+        }
+        cmtFksDropped = false;
+    }
+
+    // generic, schema-driven insert: fills every NOT NULL column lacking a
+    // default with a type-appropriate value so no fixture depends on a
+    // hand-maintained column list (safe against schema evolution).
+    async function dynamicInsert(table, overrides = {}) {
+        const cols = await db.$queryRawUnsafe(
+            `SELECT column_name, data_type, is_nullable, column_default FROM information_schema.columns WHERE table_schema='public' AND table_name='${table}' ORDER BY ordinal_position`);
+        const names = [];
+        const vals = [];
+        for (const c of cols) {
+            if (overrides[c.column_name] !== undefined) { names.push(c.column_name); vals.push(overrides[c.column_name]); continue; }
+            if (c.is_nullable === 'NO' && !c.column_default) {
+                names.push(c.column_name);
+                if (c.data_type === 'integer' || c.data_type === 'smallint') vals.push(1);
+                else if (c.data_type.startsWith('numeric') || c.data_type === 'double precision') vals.push(0);
+                else if (c.data_type === 'boolean') vals.push(false);
+                else if (c.data_type === 'json' || c.data_type === 'jsonb') vals.push('{}');
+                else if (c.data_type.includes('timestamp')) vals.push(new Date()); // prisma maps Date to timestamp params
+                else vals.push(`dyn_${Date.now()}_${Math.floor(Math.random() * 1e6)}`);
+            }
+        }
+        const placeholders = names.map((_, i) => `$${i + 1}`).join(',');
+        await db.$executeRawUnsafe(
+            `INSERT INTO "${table}" (${names.map(n => `"${n}"`).join(',')}) VALUES (${placeholders})`, ...vals);
     }
 
     async function ensureIdentityRows() {
@@ -101,10 +168,19 @@ run('prod-recovery guard helper (real PostgreSQL)', () => {
         expect(res.status).toBe(0);
         const out = {};
         for (const line of res.stdout.split('\n')) {
-            const m = line.match(/^([a-z_]+)=(\-?\d+)$/);
-            if (m) out[m[1]] = Number(m[2]);
+            let m = line.match(/^([a-z_]+)=(\-?\d+)$/);
+            if (m) { out[m[1]] = Number(m[2]); continue; }
+            // checksums are hex strings (or -1 when a table is absent)
+            m = line.match(/^([a-z_]+checksum)=([0-9a-f]{32}|\-1)$/);
+            if (m) out[m[1]] = m[2];
         }
         return out;
+    }
+
+    function baselineEnv(base) {
+        const env = {};
+        for (const [k, v] of Object.entries(base)) env[k.toUpperCase()] = String(v);
+        return env;
     }
 
     beforeAll(async () => {
@@ -115,10 +191,29 @@ run('prod-recovery guard helper (real PostgreSQL)', () => {
     afterAll(async () => {
         // self-heal: restore every fixture this suite touched
         try {
+            await db.$executeRawUnsafe('DELETE FROM "ConversationMoneyTicket" WHERE "id" LIKE \'dyn_%\'');
+            await db.$executeRawUnsafe('DELETE FROM "AzmSpendLog" WHERE "id"::text LIKE \'dyn_%\' OR ("metadata"->>\'dedupKey\') = \'dk-gate-test\'');
+            await db.$executeRawUnsafe('DELETE FROM "AzmRewardLog" WHERE "id"::text LIKE \'dyn_%\' OR ("metadata"->>\'dedupKey\') = \'dk-gate-test\'');
             await db.$executeRawUnsafe('DROP TABLE IF EXISTS "IdempotencyKey_guard_dummy"');
-            runInstaller(PHASE3_INSTALLER);   // restores OrderTracking.yieldEnabled
-            runInstaller(PAYOUT_INSTALLER);   // restores ReconciliationException
-            runInstaller(R42_INSTALLER);      // restores FinancialOperation + retirement
+            await db.$executeRawUnsafe('DROP TABLE IF EXISTS "E2EESession_guard_dummy"');
+            await db.$executeRawUnsafe('DROP TABLE IF EXISTS "E2EEPreKeyBundle_guard_dummy"');
+            // restore a modern-shaped E2EEOneTimePreKey if a fixture displaced it
+            if (!(await scalar(`SELECT to_regclass('"E2EEOneTimePreKey"') IS NULL`))) {
+                const legacy = Number(await scalar(
+                    `SELECT count(*) FROM information_schema.columns WHERE table_schema='public' AND table_name='E2EEOneTimePreKey' AND column_name='privateKey'`));
+                if (legacy > 0) {
+                    await db.$executeRawUnsafe('DROP TABLE "E2EEOneTimePreKey"');
+                    runInstaller(R42_INSTALLER); // harmless idempotent heal while we are here
+                    // the e2ee installer owns this table; run it via the release path
+                    const e2ee = path.join(__dirname, '..', 'infra', 'install-e2ee-server-blind-overlay.js');
+                    runInstaller(e2ee);
+                }
+            }
+            if (cmtFksDropped) await restoreCmtFks();
+            await restoreCmtFks(); // idempotent: re-add anything still missing
+            runInstaller(R16_INSTALLER);   // restores VaultDeposit.idempotencyKey
+            runInstaller(PAYOUT_INSTALLER);// restores ReconciliationException
+            runInstaller(R42_INSTALLER);   // restores FinancialOperation + retirement
             if (seededTxId) await db.transactionHistory.delete({ where: { id: seededTxId } }).catch(() => {});
             if (seededUserId) await db.user.delete({ where: { id: seededUserId } }).catch(() => {});
         } finally {
@@ -141,28 +236,33 @@ run('prod-recovery guard helper (real PostgreSQL)', () => {
         expect(res.stdout).toContain('target guard passed');
     });
 
-    test('a read-only mode leaves row counts untouched', async () => {
+    test('a read-only preflight passes the side-effect gates cleanly and leaves row counts untouched', async () => {
         const before = await baselines();
-        runScript('preflight');
+        const res = runScript('preflight');
+        expect(res.status).toBe(0);
+        expect(res.stdout).toContain('expected initialization');
         const after = await baselines();
         expect(after).toEqual(before);
     });
 
-    test('counts mode reports the full baseline set', async () => {
+    test('counts mode reports the full baseline set including content checksums', async () => {
         const res = runScript('counts');
         expect(res.status).toBe(0);
         for (const key of ['user_count', 'transaction_count', 'message_count', 'trade_count',
-            'peer_transfer_count', 'business_profile_count', 'business_product_count', 'wallet_count']) {
+            'peer_transfer_count', 'business_profile_count', 'business_product_count', 'wallet_count',
+            'conversation_money_ticket_count', 'azm_reward_log_count', 'azm_spend_log_count',
+            'defi_yield_strategy_count', 'defi_yield_strategy_seed_count', 'fiat_liquidity_state_count']) {
             expect(res.stdout).toMatch(new RegExp(`^${key}=\\-?\\d+$`, 'm'));
+        }
+        for (const key of ['conversation_money_ticket_checksum', 'azm_reward_log_checksum', 'azm_spend_log_checksum']) {
+            expect(res.stdout).toMatch(new RegExp(`^${key}=[0-9a-f]{32}$`, 'm'));
         }
     });
 
     test('verify fails closed when an audited column is missing', async () => {
         await db.$executeRawUnsafe('ALTER TABLE "VaultDeposit" DROP COLUMN IF EXISTS "idempotencyKey"');
         const base = await baselines();
-        const env = Object.fromEntries(
-            Object.entries(base).map(([k, v]) => [k.toUpperCase(), String(v)]));
-        const res = runScript('verify', { env });
+        const res = runScript('verify', { env: baselineEnv(base) });
         expect(res.status).toBe(1);
         expect(res.stderr).toContain('VaultDeposit.idempotencyKey');
         // self-heal immediately so later tests/suites cannot observe the gap
@@ -172,9 +272,7 @@ run('prod-recovery guard helper (real PostgreSQL)', () => {
     test('verify fails closed when an audited table is missing', async () => {
         await db.$executeRawUnsafe('DROP TABLE IF EXISTS "ReconciliationException"');
         const base = await baselines();
-        const env = Object.fromEntries(
-            Object.entries(base).map(([k, v]) => [k.toUpperCase(), String(v)]));
-        const res = runScript('verify', { env });
+        const res = runScript('verify', { env: baselineEnv(base) });
         expect(res.status).toBe(1);
         expect(res.stderr).toContain('ReconciliationException');
         // self-heal immediately so later suites cannot observe the gap
@@ -183,9 +281,7 @@ run('prod-recovery guard helper (real PostgreSQL)', () => {
 
     test('verify passes end-to-end on the fully provisioned database', async () => {
         const base = await baselines();
-        const env = Object.fromEntries(
-            Object.entries(base).map(([k, v]) => [k.toUpperCase(), String(v)]));
-        const res = runScript('verify', { env });
+        const res = runScript('verify', { env: baselineEnv(base) });
         expect(res.stdout).toContain('verification complete');
         expect(res.status).toBe(0);
     });
@@ -211,6 +307,90 @@ run('prod-recovery guard helper (real PostgreSQL)', () => {
             if (preExisting === true || preExisting === 't') {
                 await db.$executeRawUnsafe('ALTER TABLE "IdempotencyKey_guard_aside" RENAME TO "IdempotencyKey"');
             }
+        }
+    });
+
+    test('preflight REFUSES populated legacy E2EE private-key tables', async () => {
+        await db.$executeRawUnsafe('CREATE TABLE "E2EESession_guard_dummy" (k TEXT)');
+        await db.$executeRawUnsafe('INSERT INTO "E2EESession_guard_dummy" (k) VALUES (\'x\')');
+        await db.$executeRawUnsafe('ALTER TABLE "E2EESession_guard_dummy" RENAME TO "E2EESession"');
+        try {
+            const res = runScript('preflight');
+            expect(res.status).toBe(1);
+            expect(res.stderr).toContain('REFUSED');
+            expect(res.stderr).toContain('E2EESession');
+            // no key values may ever be printed
+            expect(res.stderr).not.toContain('x\')');
+        } finally {
+            await db.$executeRawUnsafe('DROP TABLE IF EXISTS "E2EESession"');
+        }
+        // same refusal for a legacy-SHAPED populated E2EEOneTimePreKey
+        await db.$executeRawUnsafe('DROP TABLE IF EXISTS "E2EEPreKeyBundle_guard_dummy"');
+        const otpkLegacy = await scalar(
+            "SELECT to_regclass('\"E2EEOneTimePreKey\"') IS NOT NULL");
+        if (otpkLegacy === true || otpkLegacy === 't') {
+            await db.$executeRawUnsafe('ALTER TABLE "E2EEOneTimePreKey" RENAME TO "E2EEOneTimePreKey_guard_aside"');
+        }
+        await db.$executeRawUnsafe('CREATE TABLE "E2EEOneTimePreKey" ("id" TEXT PRIMARY KEY, "privateKey" TEXT)');
+        await db.$executeRawUnsafe('INSERT INTO "E2EEOneTimePreKey" ("id", "privateKey") VALUES (\'dyn\', \'k\')');
+        try {
+            const res = runScript('preflight');
+            expect(res.status).toBe(1);
+            expect(res.stderr).toContain('REFUSED');
+            expect(res.stderr).toContain('E2EEOneTimePreKey');
+            expect(res.stderr).toContain('LEGACY shape');
+        } finally {
+            await db.$executeRawUnsafe('DROP TABLE "E2EEOneTimePreKey"');
+            if (otpkLegacy === true || otpkLegacy === 't') {
+                await db.$executeRawUnsafe('ALTER TABLE "E2EEOneTimePreKey_guard_aside" RENAME TO "E2EEOneTimePreKey"');
+            }
+        }
+    });
+
+    test('preflight REFUSES orphaned ConversationMoneyTicket rows the business-os installer would archive', async () => {
+        await dropCmtFks();
+        await dynamicInsert('ConversationMoneyTicket', {});
+        try {
+            const res = runScript('preflight');
+            expect(res.status).toBe(1);
+            expect(res.stderr).toContain('REFUSED');
+            expect(res.stderr).toContain('ConversationMoneyTicket');
+            expect(res.stderr).toContain('archived+deleted');
+        } finally {
+            await db.$executeRawUnsafe('DELETE FROM "ConversationMoneyTicket" WHERE "id" LIKE \'dyn_%\'');
+            await restoreCmtFks();
+        }
+    });
+
+    test('preflight REFUSES pending dedupKey backfills on existing reward/spend rows', async () => {
+        await dynamicInsert('AzmSpendLog', { metadata: { dedupKey: 'dk-gate-test' } });
+        await dynamicInsert('AzmRewardLog', { metadata: { dedupKey: 'dk-gate-test' } });
+        try {
+            const res = runScript('preflight');
+            expect(res.status).toBe(1);
+            expect(res.stderr).toContain('REFUSED');
+            expect(res.stderr).toContain('AzmSpendLog');
+            expect(res.stderr).toContain('AzmRewardLog');
+            expect(res.stderr).toContain('backfill');
+        } finally {
+            await db.$executeRawUnsafe('DELETE FROM "AzmSpendLog" WHERE ("metadata"->>\'dedupKey\') = \'dk-gate-test\'');
+            await db.$executeRawUnsafe('DELETE FROM "AzmRewardLog" WHERE ("metadata"->>\'dedupKey\') = \'dk-gate-test\'');
+        }
+    });
+
+    test('verify detects a MODIFIED ConversationMoneyTicket record despite an unchanged row count', async () => {
+        await dropCmtFks();
+        await dynamicInsert('ConversationMoneyTicket', {});
+        try {
+            const base = await baselines();
+            // same row count, different content — row-count equality must not pass
+            await db.$executeRawUnsafe('UPDATE "ConversationMoneyTicket" SET "amount" = 999 WHERE "id" LIKE \'dyn_%\'');
+            const res = runScript('verify', { env: baselineEnv(base) });
+            expect(res.status).toBe(1);
+            expect(res.stderr).toContain('conversation_money_ticket_checksum');
+        } finally {
+            await db.$executeRawUnsafe('DELETE FROM "ConversationMoneyTicket" WHERE "id" LIKE \'dyn_%\'');
+            await restoreCmtFks();
         }
     });
 });

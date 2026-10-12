@@ -3,9 +3,26 @@
 //
 // Read-only contract: every mode opens ONE connection, issues
 // `BEGIN READ ONLY`, does all of its work inside that transaction, and ALWAYS
-// rolls back + ends the connection in a finally block. PostgreSQL rejects any
-// write inside a READ ONLY transaction, so the contract is enforced by the
+// rolls back + releases the connection in a finally block. PostgreSQL rejects
+// any write inside a READ ONLY transaction, so the contract is enforced by the
 // engine, not by discipline.
+//
+// Side-effect gates: the reviewed installer sequence is NOT purely DDL. Some
+// steps would retire legacy tables, archive+delete orphaned financial
+// records, backfill columns on existing rows, or insert initial system rows.
+// preflight makes every one of those effects VISIBLE, and fails closed on any
+// effect that has not been separately reviewed for THIS convergence run:
+//   - legacy E2EE private-key tables (dropped by install-e2ee-server-blind):
+//     a populated legacy table refuses the run;
+//   - ConversationMoneyTicket orphan archival (install-business-os): any
+//     orphan candidate refuses the run — those records must go through a
+//     separately reviewed archival/reconciliation step;
+//   - AzmRewardLog/AzmSpendLog dedupKey backfills (install-prod-drift):
+//     any affected row refuses the run;
+//   - initial system rows (DeFiYieldStrategy seeds, FiatLiquidityState
+//     singleton) are EXPECTED INITIALIZATIONS: preflight reports their
+//     current state and verify distinguishes them from changes to
+//     pre-existing records.
 //
 // Target guard (fails closed): the connection host must equal GUARD_EXPECTED_HOST
 // (default: the original production branch direct endpoint) and the database
@@ -13,6 +30,9 @@
 // echoed on mismatch; connection strings and credentials are never printed.
 // The env overrides exist ONLY so disposable-PostgreSQL tests can exercise all
 // modes; the production workflow never sets them.
+//
+// Key values are never read: E2EE gates use row COUNTS and column presence
+// only. No key material, passphrase, or credential is ever printed.
 
 import pg from 'pg';
 import fs from 'node:fs';
@@ -22,8 +42,7 @@ const DEFAULT_EXPECTED_DB = 'neondb';
 
 // ============================================================================
 // Audited convergence inventory (read-only dual audit 2026-10-12, Actions run
-// 38248783888, branch prod-audit). These are EXACTLY the objects the audited
-// schema-only installer sequence provisions on the original production branch.
+// 38248783888, branch prod-audit) — schema objects the sequence provisions.
 //
 // Installer-owned tables (missing on the branch, created by the sequence):
 //   r42 -> FinancialOperation; payment-requests -> PaymentRequest;
@@ -44,6 +63,14 @@ const DEFAULT_EXPECTED_DB = 'neondb';
 // Named constraints/indexes asserted after apply:
 //   Withdrawal_transactionHistoryId_key, ProviderSettlementAttempt_provider_providerReference_key,
 //   ReconciliationException_entity_reason_open_key, business_price_current_unique.
+//
+// INTENTIONAL INITIAL SYSTEM ROWS (documented, allowed):
+//   install-phase3 seeds DeFiYieldStrategy rows AAVE + COMPOUND
+//     (INSERT ... WHERE NOT EXISTS — additive, never overwrites);
+//   install-fiat-liquidity inserts the zero-valued FiatLiquidityState
+//     singleton (ON CONFLICT DO NOTHING).
+// verify() distinguishes these expected initializations from any change to
+// pre-existing records (see DEFI/FIAT rules below).
 //
 // OUT OF SCOPE (prisma-schema objects with NO production installer — missing on
 // BOTH audited databases, NOT provisioned by the reviewed sequence, and NOT
@@ -105,6 +132,17 @@ const CORE_TABLES = [
   ['wallet_count', 'Wallet'],
 ];
 
+// Content-preservation set: tables whose DATA must not change at all. Row-count
+// equality alone is never accepted as proof — verify() also compares an
+// order-stable md5 checksum over every row.
+const CONTENT_TABLES = [
+  ['conversation_money_ticket', 'ConversationMoneyTicket'],
+  ['azm_reward_log', 'AzmRewardLog'],
+  ['azm_spend_log', 'AzmSpendLog'],
+];
+
+const DEFI_SEED_NAMES = "('AAVE','COMPOUND')";
+
 function targetUrl() {
   const url = process.env.DB_URL || process.env.DATABASE_URL;
   if (!url) { console.error('::error::no connection URL provided'); process.exit(1); }
@@ -144,13 +182,154 @@ function isAbsent(v) {
   return v === true || v === 't';
 }
 
+async function tableInfo(client, table) {
+  const absent = isAbsent(await scalar(client, `SELECT to_regclass('"${table}"') IS NULL`));
+  if (absent) return { exists: false, rows: 0 };
+  const rows = Number(await scalar(client, `SELECT count(*) FROM "${table}"`));
+  return { exists: true, rows };
+}
+
+async function hasColumn(client, table, column) {
+  const n = Number(await scalar(client,
+    `SELECT count(*) FROM information_schema.columns WHERE table_schema='public' AND table_name='${table}' AND column_name='${column}'`));
+  return n > 0;
+}
+
+async function checksum(client, table) {
+  const absent = isAbsent(await scalar(client, `SELECT to_regclass('"${table}"') IS NULL`));
+  if (absent) return '-1';
+  return String(await scalar(client,
+    `SELECT md5(COALESCE(string_agg(CAST(t AS text), '|' ORDER BY t."id"), '')) FROM "${table}" t`));
+}
+
 async function coreCounts(client) {
   const out = {};
   for (const [key, tbl] of CORE_TABLES) {
-    const absent = isAbsent(await scalar(client, `SELECT to_regclass('"${tbl}"') IS NULL`));
-    out[key] = absent ? -1 : Number(await scalar(client, `SELECT count(*) FROM "${tbl}"`));
+    const info = await tableInfo(client, tbl);
+    out[key] = info.exists ? info.rows : -1;
   }
   return out;
+}
+
+async function contentBaselines(client) {
+  const out = {};
+  for (const [key, tbl] of CONTENT_TABLES) {
+    const info = await tableInfo(client, tbl);
+    out[`${key}_count`] = info.exists ? info.rows : -1;
+    out[`${key}_checksum`] = await checksum(client, tbl);
+  }
+  return out;
+}
+
+async function defiInfo(client) {
+  const info = await tableInfo(client, 'DeFiYieldStrategy');
+  if (!info.exists) return { count: -1, seeds: 0 };
+  const seeds = Number(await scalar(client,
+    `SELECT count(*) FROM "DeFiYieldStrategy" WHERE "name" IN ${DEFI_SEED_NAMES}`));
+  return { count: info.rows, seeds };
+}
+
+async function fiatInfo(client) {
+  const info = await tableInfo(client, 'FiatLiquidityState');
+  if (!info.exists) return { count: -1, zeroValued: 0 };
+  const zeroValued = Number(await scalar(client,
+    `SELECT count(*) FROM "FiatLiquidityState" WHERE "availableGhs" = 0 AND "reservedGhs" = 0 AND "inTransitGhs" = 0 AND "paidOutGhs" = 0 AND "reconciliationHeldGhs" = 0`));
+  return { count: info.rows, zeroValued };
+}
+
+// ---------------------------------------------------------------------------
+// Side-effect gate: legacy E2EE private-key tables dropped by
+// install-e2ee-server-blind-overlay.js. Counts and column presence only —
+// key values are never read.
+async function e2eeGate(client) {
+  let refused = false;
+  for (const t of ['E2EESession', 'E2EEPreKeyBundle']) {
+    const info = await tableInfo(client, t);
+    if (!info.exists) { console.log(`e2ee legacy table ${t}: absent (nothing to retire).`); continue; }
+    if (info.rows > 0) {
+      console.error(`::error::preflight REFUSED: legacy E2EE table ${t} is populated (${info.rows} rows). The e2ee installer drops it unconditionally; populated private-key data must be reviewed before retirement. No key values were read.`);
+      refused = true;
+    } else {
+      console.log(`e2ee legacy table ${t}: exists, 0 rows (follows the reviewed retirement path).`);
+    }
+  }
+  const otpk = await tableInfo(client, 'E2EEOneTimePreKey');
+  if (otpk.exists) {
+    const legacyShape = await hasColumn(client, 'E2EEOneTimePreKey', 'privateKey');
+    if (legacyShape) {
+      if (otpk.rows > 0) {
+        console.error(`::error::preflight REFUSED: E2EEOneTimePreKey has the LEGACY shape (privateKey column) and is populated (${otpk.rows} rows). The e2ee installer drops the legacy shape; live claimed keys must be reviewed first. No key values were read.`);
+        refused = true;
+      } else {
+        console.log('E2EEOneTimePreKey: legacy shape, 0 rows (dropped and recreated by the reviewed path).');
+      }
+    } else {
+      console.log(`E2EEOneTimePreKey: current shape, ${otpk.rows} rows (not dropped; created if absent).`);
+    }
+  } else {
+    console.log('E2EEOneTimePreKey: absent (created by the sequence).');
+  }
+  const dev = await tableInfo(client, 'E2EEDevice');
+  console.log(`E2EEDevice: ${dev.exists ? `exists, ${dev.rows} rows (never dropped)` : 'absent (created by the sequence)'}.`);
+  return !refused;
+}
+
+// ---------------------------------------------------------------------------
+// Side-effect gate: ConversationMoneyTicket orphan archival + deletion inside
+// install-business-os-overlay.js. Each FK is added only when absent, and the
+// archive+delete runs only when candidates exist — a general convergence run
+// must not silently perform financial-record archival.
+async function orphanGate(client) {
+  const reasons = [
+    ['missing_message', 'ConversationMoneyTicket_messageId_fkey', 'Message', 'messageId'],
+    ['missing_conversation', 'ConversationMoneyTicket_conversationId_fkey', 'Conversation', 'conversationId'],
+    ['missing_requester', 'ConversationMoneyTicket_requesterId_fkey', 'User', 'requesterId'],
+    ['missing_counterparty', 'ConversationMoneyTicket_counterpartyId_fkey', 'User', 'counterpartyId'],
+  ];
+  let total = 0;
+  for (const [reason, constraint, refTable, col] of reasons) {
+    const fkPresent = Number(await scalar(client,
+      `SELECT count(*) FROM information_schema.table_constraints WHERE table_schema='public' AND constraint_name='${constraint}'`)) > 0;
+    if (fkPresent) { console.log(`orphan check ${reason}: FK already present (archival path for this relationship is inert).`); continue; }
+    const tickets = await tableInfo(client, 'ConversationMoneyTicket');
+    if (!tickets.exists) { console.log(`orphan check ${reason}: ConversationMoneyTicket absent.`); continue; }
+    const n = Number(await scalar(client,
+      `SELECT count(*) FROM "ConversationMoneyTicket" t LEFT JOIN "${refTable}" r ON r."id" = t."${col}" WHERE r."id" IS NULL`));
+    if (n > 0) {
+      console.error(`::error::preflight REFUSED: ${n} ConversationMoneyTicket rows would be archived+deleted by install-business-os (${reason}). Orphan financial records require a separately reviewed archival/reconciliation step before schema convergence.`);
+      total += n;
+    } else {
+      console.log(`orphan check ${reason}: 0 candidates.`);
+    }
+  }
+  return total === 0;
+}
+
+// ---------------------------------------------------------------------------
+// Side-effect gate: dedupKey backfills in install-prod-drift-remediation.js.
+// affected = rows the installer would actually UPDATE (dedupKey IS NULL,
+// legacy metadata carries dedupKey, first row per (userId, source, dedupKey)).
+async function backfillGate(client) {
+  let refused = false;
+  for (const t of ['AzmRewardLog', 'AzmSpendLog']) {
+    const info = await tableInfo(client, t);
+    if (!info.exists) { console.log(`backfill check ${t}: table absent.`); continue; }
+    const pending = Number(await scalar(client,
+      `SELECT count(*) FROM "${t}" WHERE "dedupKey" IS NULL AND metadata ? 'dedupKey' AND metadata->>'dedupKey' IS NOT NULL`));
+    const affected = Number(await scalar(client,
+      `SELECT count(*) FROM (
+         SELECT id, row_number() OVER (PARTITION BY "userId", "source", metadata->>'dedupKey' ORDER BY id) AS rn
+         FROM "${t}"
+         WHERE metadata ? 'dedupKey' AND metadata->>'dedupKey' IS NOT NULL AND "dedupKey" IS NULL
+       ) ranked WHERE rn = 1`));
+    if (affected > 0) {
+      console.error(`::error::preflight REFUSED: install-prod-drift would backfill dedupKey on ${affected} existing ${t} row(s) (${pending} pending total). Existing-row backfills require explicit review; the schema-only convergence must not run them implicitly.`);
+      refused = true;
+    } else {
+      console.log(`backfill check ${t}: 0 rows affected (${pending} pending).`);
+    }
+  }
+  return !refused;
 }
 
 async function main() {
@@ -185,6 +364,22 @@ async function main() {
         console.log('IdempotencyKey: absent.');
       }
 
+      // ---- side-effect gates (fail closed before anything is applied) ----
+      const e2eeOk = await e2eeGate(client);
+      const orphanOk = await orphanGate(client);
+      const backfillOk = await backfillGate(client);
+      if (!e2eeOk || !orphanOk || !backfillOk) {
+        console.error('::error::preflight failed closed on a side-effect gate: review the reported effect(s) before authorizing convergence.');
+        process.exitCode = 1;
+        return;
+      }
+
+      // ---- expected-initialization state (documented, allowed) ----
+      const defi = await defiInfo(client);
+      console.log(`expected initialization DeFiYieldStrategy: ${defi.count < 0 ? 'table absent' : `${defi.count} rows (${defi.seeds} of the seeded names)`} — the sequence seeds AAVE/COMPOUND additively where absent.`);
+      const fiat = await fiatInfo(client);
+      console.log(`expected initialization FiatLiquidityState: ${fiat.count < 0 ? 'table absent' : `${fiat.count} row(s), ${fiat.zeroValued} zero-valued`} — the sequence inserts the zero-valued singleton once (ON CONFLICT DO NOTHING).`);
+
       for (const t of AUDITED_TABLES) {
         const absent = isAbsent(await scalar(client, `SELECT to_regclass('"${t}"') IS NULL`));
         console.log(`audited additive target ${t}: ${absent ? 'absent (will be created)' : 'already present (idempotent replay)'}`);
@@ -193,8 +388,14 @@ async function main() {
     }
 
     if (mode === 'counts') {
-      const counts = await coreCounts(client);
-      for (const [key, val] of Object.entries(counts)) {
+      const out = {
+        ...await coreCounts(client),
+        ...await contentBaselines(client),
+        defi_yield_strategy_count: (await defiInfo(client)).count,
+        defi_yield_strategy_seed_count: (await defiInfo(client)).seeds,
+        fiat_liquidity_state_count: (await fiatInfo(client)).count,
+      };
+      for (const [key, val] of Object.entries(out)) {
         console.log(`${key}=${val}`);
         if (process.env.GITHUB_OUTPUT) {
           fs.appendFileSync(process.env.GITHUB_OUTPUT, `${key}=${val}\n`);
@@ -232,6 +433,8 @@ async function main() {
       } else {
         console.log('IdempotencyKey: absent (retired cleanly by the r42 installer).');
       }
+
+      // baseline preservation: core tables
       const after = await coreCounts(client);
       for (const [key, val] of Object.entries(after)) {
         const before = Number(process.env[key.toUpperCase()]);
@@ -240,8 +443,51 @@ async function main() {
         if (val !== before) { console.error(`::error::verify failed: ${key} changed ${before} -> ${val}; core tables must not lose rows.`); failed++; }
         else console.log(`${key}: ${val} (unchanged)`);
       }
+
+      // content preservation: count AND order-stable checksum per table —
+      // row-count equality alone is never accepted as proof.
+      const contentAfter = await contentBaselines(client);
+      for (const [key, val] of Object.entries(contentAfter)) {
+        const before = String(process.env[key.toUpperCase()] ?? '');
+        if (before === '') { console.log(`${key}: ${String(val).slice(0, 12)}… (no baseline passed)`); continue; }
+        if (String(val) !== before) {
+          console.error(`::error::verify failed: ${key} changed (${before} -> ${String(val)}) — content must be byte-identical after the guarded path.`);
+          failed++;
+        } else {
+          console.log(`${key}: unchanged${key.endsWith('checksum') ? ' (checksum match)' : ''}`);
+        }
+      }
+
+      // expected-initialization rules: DeFiYieldStrategy + FiatLiquidityState.
+      const defi = await defiInfo(client);
+      const defiBefore = Number(process.env.DEFI_YIELD_STRATEGY_COUNT);
+      const defiSeedBefore = Number(process.env.DEFI_YIELD_STRATEGY_SEED_COUNT);
+      if (!Number.isNaN(defiBefore)) {
+        if (defi.count < defiBefore) {
+          console.error(`::error::verify failed: DeFiYieldStrategy lost rows (${defiBefore} -> ${defi.count}).`); failed++;
+        } else if ((defi.count - defiBefore) !== (defi.seeds - defiSeedBefore)) {
+          console.error(`::error::verify failed: DeFiYieldStrategy changed beyond the expected seed initialization (${defiBefore}/${defiSeedBefore} seeds -> ${defi.count}/${defi.seeds} seeds): pre-existing records must not change.`); failed++;
+        } else if ((defi.count - defi.seeds) !== (defiBefore - defiSeedBefore)) {
+          console.error(`::error::verify failed: DeFiYieldStrategy non-seed records changed.`); failed++;
+        } else {
+          console.log(`DeFiYieldStrategy: ${defi.count} rows (${defi.seeds} seeds) — only the documented seed initialization ${defi.count === defiBefore ? 'was' : 'was added'}.`);
+        }
+      }
+      const fiat = await fiatInfo(client);
+      const fiatBefore = Number(process.env.FIAT_LIQUIDITY_STATE_COUNT);
+      if (!Number.isNaN(fiatBefore)) {
+        if (fiatBefore === 0) {
+          if (fiat.count === 1 && fiat.zeroValued === 1) console.log('FiatLiquidityState: initialized to the documented zero-valued singleton.');
+          else { console.error(`::error::verify failed: FiatLiquidityState expected exactly one zero-valued row after initialization, found count=${fiat.count}, zeroValued=${fiat.zeroValued}.`); failed++; }
+        } else if (fiat.count !== fiatBefore) {
+          console.error(`::error::verify failed: FiatLiquidityState count changed (${fiatBefore} -> ${fiat.count}).`); failed++;
+        } else {
+          console.log(`FiatLiquidityState: ${fiat.count} row(s), unchanged (pre-existing record not modified).`);
+        }
+      }
+
       if (failed > 0) { console.error(`::error::verification failed with ${failed} error(s).`); process.exitCode = 1; return; }
-      console.log('verification complete: all audited targets converged, core rows intact.');
+      console.log('verification complete: all audited targets converged, core rows and content intact, expected initializations only.');
       return;
     }
 
