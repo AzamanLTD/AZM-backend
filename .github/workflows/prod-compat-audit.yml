@@ -78,7 +78,7 @@ jobs:
 
           base = os.environ['DB_URL']
           current = base.replace('-pooler.', '.')   # small-butterfly direct
-          prod   = base.replace('ep-small-butterfly-abxfnkn5.', 'ep-crimson-cell-ab81e3bp.')
+          prod   = current.replace('ep-small-butterfly-abxfnkn5.', 'ep-crimson-cell-ab81e3bp.')
           for u in (current, prod):
               h = re.search(r'@([a-z0-9.-]+)', u).group(1)
               assert h in ('ep-small-butterfly-abxfnkn5.eu-west-2.aws.neon.tech',
