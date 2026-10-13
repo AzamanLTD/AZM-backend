@@ -72,25 +72,17 @@ const DEFAULT_EXPECTED_DB = 'neondb';
 // verify() distinguishes these expected initializations from any change to
 // pre-existing records (see DEFI/FIAT rules below).
 //
-// OUT OF SCOPE (prisma-schema objects with NO production installer — missing on
-// BOTH audited databases, NOT provisioned by the reviewed sequence, and NOT
-// verified here; the backend demonstrably runs without them):
-//   LedgerAccount, LedgerTransaction, RestrictedObligation,
-//   AdminRoleAssignment, CustodyAccount/CustodyEvidence/CustodyExecution/CustodyMovement
-//   (custody installers are not part of the release chain),
-//   GlobalSettings.lastAdminSetAt/lastEchoAt/lastExternalSync,
-//   JournalEntry.ledgerTransactionId/lineNumber, SmartRouteRun.updatedAt,
-//   AdminApprovalRequest.executedAt, OrderTracking.yieldEnabled (neither is
-//   installer-owned: the first audit's installer-scan pairing attributed
-//   these to installers via a regex artifact — the dual prisma-authoritative
-//   audit shows no installer adds them),
-//   ProofOfReservesSnapshot custody/ledger columns.
+// OUT OF SCOPE (intentionally not added by this convergence):
+//   AdminRoleAssignment, AdminApprovalRequest.executedAt, OrderTracking.yieldEnabled
+//   (the dual prisma-authoritative audit showed no production installer owns them).
 // ============================================================================
 
 const AUDITED_TABLES = [
   'FinancialOperation', 'PaymentRequest', 'BusinessPrice',
   'FiatLiquidityReceipt', 'FiatLiquidityReservation', 'FiatLiquidityState', 'FiatProviderEvent',
   'ModelBSettlement', 'InventoryLot', 'InventoryLotConsumption', 'ProviderSettlementAttempt', 'ReconciliationException',
+  'LedgerAccount', 'LedgerTransaction', 'RestrictedObligation',
+  'CustodyExecution', 'CustodyAccount', 'CustodyMovement', 'CustodyEvidence', 'ProofOfReservesLeaf',
 ];
 
 const AUDITED_COLUMNS = [
@@ -110,6 +102,55 @@ const AUDITED_COLUMNS = [
   ['SmartRouteRun', 'frequency'],
   ['InventoryRestockOperation', 'fingerprintVersion'],
   ['InventoryRestockIntent', 'status'],
+  ['GlobalSettings', 'lastExternalSync'],
+  ['GlobalSettings', 'lastAdminSetAt'],
+  ['GlobalSettings', 'lastEchoAt'],
+  ['SmartRouteRun', 'updatedAt'],
+  ['JournalEntry', 'ledgerTransactionId'],
+  ['JournalEntry', 'lineNumber'],
+  ['LedgerAccount', 'code'],
+  ['LedgerAccount', 'accountClass'],
+  ['LedgerAccount', 'normalSide'],
+  ['LedgerTransaction', 'idempotencyKey'],
+  ['LedgerTransaction', 'entryType'],
+  ['LedgerTransaction', 'postingHash'],
+  ['LedgerTransaction', 'conversionIdentity'],
+  ['RestrictedObligation', 'reference'],
+  ['RestrictedObligation', 'amount'],
+  ['RestrictedObligation', 'status'],
+  ['RestrictedObligation', 'reserveInclusionPolicy'],
+  ['CustodyExecution', 'idempotencyKey'],
+  ['CustodyExecution', 'status'],
+  ['CustodyExecution', 'lastRecoveryAttemptAt'],
+  ['CustodyExecution', 'nextRecoveryAttemptAt'],
+  ['CustodyExecution', 'recoveryAttemptCount'],
+  ['CustodyAccount', 'tier'],
+  ['CustodyAccount', 'status'],
+  ['CustodyAccount', 'walletAddressId'],
+  ['CustodyMovement', 'idempotencyKey'],
+  ['CustodyMovement', 'kind'],
+  ['CustodyMovement', 'status'],
+  ['CustodyMovement', 'custodyExecutionId'],
+  ['CustodyEvidence', 'custodyAccountId'],
+  ['CustodyEvidence', 'scope'],
+  ['CustodyEvidence', 'status'],
+  ['CustodyEvidence', 'balanceBaseUnits'],
+  ['ProofOfReservesLeaf', 'snapshotId'],
+  ['ProofOfReservesLeaf', 'userId'],
+  ['ProofOfReservesSnapshot', 'usdcLiabilityTotal'],
+  ['ProofOfReservesSnapshot', 'evidenceLinkedLiabilityTotal'],
+  ['ProofOfReservesSnapshot', 'unclassifiedExposure'],
+  ['ProofOfReservesSnapshot', 'eligibleReserveTotal'],
+  ['ProofOfReservesSnapshot', 'restrictedObligationsTotal'],
+  ['ProofOfReservesSnapshot', 'restrictedObligationsAvailable'],
+  ['ProofOfReservesSnapshot', 'liabilityAttestation'],
+  ['ProofOfReservesSnapshot', 'evidenceStatus'],
+  ['ProofOfReservesSnapshot', 'custodyAccountCount'],
+  ['ProofOfReservesSnapshot', 'acceptedEvidenceCount'],
+  ['ProofOfReservesSnapshot', 'missingEvidenceCount'],
+  ['ProofOfReservesSnapshot', 'evidenceSummary'],
+  ['ProofOfReservesSnapshot', 'assetIdentity'],
+  ['ProofOfReservesSnapshot', 'liabilityBreakdown'],
 ];
 
 const AUDITED_INDEXES = [
@@ -121,6 +162,72 @@ const AUDITED_INDEXES = [
   'InventoryLotConsumption_consumptionKey_key',
   'InventoryLotConsumption_lotId_idx',
   'InventoryLot_eligible_status_idx',
+  'JournalEntry_ledgerTransactionId_idx',
+  'JournalEntry_account_ledgerTransactionId_idx',
+  'LedgerAccount_code_key',
+  'LedgerAccount_userId_idx',
+  'LedgerAccount_accountClass_status_idx',
+  'LedgerTransaction_idempotencyKey_key',
+  'LedgerTransaction_relatedEntity_relatedEntityId_idx',
+  'LedgerTransaction_userId_postedAt_idx',
+  'LedgerTransaction_entryType_postedAt_idx',
+  'LedgerTransaction_conversionIdentity_key',
+  'RestrictedObligation_reference_key',
+  'RestrictedObligation_sourceType_status_idx',
+  'RestrictedObligation_userId_status_idx',
+  'RestrictedObligation_status_asset_idx',
+  'CustodyExecution_idempotencyKey_key',
+  'CustodyExecution_txHash_key',
+  'CustodyExecution_kind_refId_idx',
+  'CustodyExecution_status_idx',
+  'CustodyExecution_walletAddressId_idx',
+  'CustodyExecution_status_nextRecoveryAttemptAt_idx',
+  'CustodyExecution_userId_idx',
+  'CustodyExecution_one_inflight_sweep_per_wallet_idx',
+  'CustodyAccount_address_network_asset_contract_key',
+  'CustodyAccount_walletAddressId_key',
+  'CustodyAccount_tier_status_idx',
+  'CustodyAccount_userId_idx',
+  'CustodyMovement_idempotencyKey_key',
+  'CustodyMovement_custodyExecutionId_key',
+  'CustodyMovement_kind_status_idx',
+  'CustodyMovement_sourceAccountId_idx',
+  'CustodyMovement_destinationAccountId_idx',
+  'CustodyMovement_txHash_idx',
+  'CustodyMovement_status_createdAt_idx',
+  'CustodyEvidence_account_active_key',
+  'CustodyEvidence_account_tx_key',
+  'CustodyEvidence_account_createdAt_idx',
+  'CustodyEvidence_status_idx',
+  'CustodyEvidence_scope_status_idx',
+  'ProofOfReservesLeaf_snapshotId_userId_idx',
+];
+
+const AUDITED_CONSTRAINTS = [
+  ['JournalEntry', 'JournalEntry_ledgerTransactionId_fkey'],
+  ['ProofOfReservesLeaf', 'ProofOfReservesLeaf_snapshotId_fkey'],
+  ['ProofOfReservesLeaf', 'ProofOfReservesLeaf_userId_fkey'],
+  ['ProofOfReservesLeaf', 'ProofOfReservesLeaf_snapshotId_userId_key'],
+];
+
+const AUDITED_ENUM_VALUES = [
+  ['LedgerAccountClass', 'ASSET'],
+  ['LedgerAccountClass', 'LIABILITY'],
+  ['LedgerAccountClass', 'RESTRICTED'],
+  ['LedgerNormalSide', 'DEBIT'],
+  ['LedgerNormalSide', 'CREDIT'],
+  ['RestrictedObligationStatus', 'ACTIVE'],
+  ['RestrictedObligationStatus', 'RELEASED'],
+  ['RestrictedObligationStatus', 'CANCELLED'],
+  ['ReserveInclusionPolicy', 'INCLUDED_IN_RESERVE_DENOMINATOR'],
+  ['ReserveInclusionPolicy', 'EXCLUDED_FROM_RESERVE_DENOMINATOR'],
+  ['JournalEntryType', 'ASSET_CONVERSION'],
+  ['JournalEntryType', 'CUSTODY_DEPOSIT'],
+  ['JournalEntryType', 'CUSTODY_SWEEP'],
+  ['JournalEntryType', 'CUSTODY_WITHDRAWAL'],
+  ['JournalEntryType', 'INVENTORY_ACQUISITION'],
+  ['InventoryLotStatus', 'OPEN'],
+  ['InventoryLotStatus', 'CONSUMED'],
 ];
 
 // Baseline-preservation set: important existing business/financial tables whose
@@ -457,6 +564,18 @@ async function main() {
         const n = Number(await scalar(client, `SELECT count(*) FROM pg_indexes WHERE schemaname='public' AND indexname='${idx}'`));
         if (n === 0) { console.error(`::error::verify failed: audited index ${idx} missing after apply.`); failed++; }
         else console.log(`index ${idx}: present`);
+      }
+      for (const [table, constraint] of AUDITED_CONSTRAINTS) {
+        const n = Number(await scalar(client,
+          `SELECT count(*) FROM pg_constraint WHERE conname='${constraint}' AND conrelid = '"${table}"'::regclass`));
+        if (n === 0) { console.error(`::error::verify failed: audited constraint ${table}.${constraint} missing after apply.`); failed++; }
+        else console.log(`constraint ${table}.${constraint}: present`);
+      }
+      for (const [typeName, value] of AUDITED_ENUM_VALUES) {
+        const n = Number(await scalar(client,
+          `SELECT count(*) FROM pg_type t JOIN pg_namespace n ON n.oid=t.typnamespace JOIN pg_enum e ON e.enumtypid=t.oid WHERE n.nspname='public' AND t.typname='${typeName}' AND e.enumlabel='${value}'`));
+        if (n === 0) { console.error(`::error::verify failed: audited enum value ${typeName}.${value} missing after apply.`); failed++; }
+        else console.log(`enum value ${typeName}.${value}: present`);
       }
       const ikAbsent = isAbsent(await scalar(client, 'SELECT to_regclass(\'"IdempotencyKey"\') IS NULL'));
       if (!ikAbsent) {
