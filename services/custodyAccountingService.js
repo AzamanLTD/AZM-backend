@@ -654,6 +654,36 @@ async function observeAccountBalance(db, { account, provider }) {
     ) {
         return { recorded: false, reason: EVIDENCE_ERRORS.MALFORMED_RESPONSE, retryable: false };
     }
+    // §TATUM-TESTNET DOMAIN WALL: custody accounting serves the canonical
+    // MAINNET domain ONLY. An observation branded with a non-mainnet scope
+    // (e.g. networkScope: 'TESTNET' from the Amoy adapter) can NEVER be
+    // accepted for a production custody account — testnet evidence must
+    // never satisfy, back, or dilute mainnet Proof-of-Reserves. The attempt
+    // is recorded for audit and rejected, exactly like out-of-order data.
+    // Observations from the mainnet adapters carry networkScope: 'MAINNET';
+    // legacy observations without a scope are treated as MAINNET (the only
+    // domain this service has ever served).
+    const obsScope = String(obs.networkScope || 'MAINNET').toUpperCase();
+    if (obsScope !== 'MAINNET') {
+        await db.$transaction(async (tx) => {
+            await tx.custodyEvidence.create({
+                data: {
+                    custodyAccountId: account.id,
+                    source: String(obs.source || 'UNKNOWN'),
+                    scope: 'ACCOUNT_BALANCE',
+                    network: account.network,
+                    asset: account.asset,
+                    contractAddress: normalizeAddress(account.contractAddress),
+                    address: normalizeAddress(account.address),
+                    balanceBaseUnits: obs.balanceBaseUnits,
+                    observedAt: obs.observedAt,
+                    status: 'REJECTED',
+                    rejectionReason: 'NETWORK_SCOPE_MISMATCH',
+                },
+            });
+        });
+        return { recorded: false, reason: 'NETWORK_SCOPE_MISMATCH', retryable: false };
+    }
     return db.$transaction(async (tx) => {
         const current = await tx.custodyEvidence.findFirst({
             where: { custodyAccountId: account.id, scope: 'ACCOUNT_BALANCE', status: 'ACTIVE' },
