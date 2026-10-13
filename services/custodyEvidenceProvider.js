@@ -287,6 +287,19 @@ function createTatumV4TestnetBalanceProvider(config = {}) {
                         { echoed: e.address }
                     );
                 }
+                // §REVIEW-R2 (final hardening): the request specifies
+                // tokenTypes=fungible, so ANY entry of another type
+                // (native, nft, multitoken, unknown) means the provider
+                // violated the requested filter — its absence signal is
+                // untrustworthy. Reject before absence is concluded. This
+                // also covers the matched entry (the loop precedes
+                // matching), so a non-fungible entry can never be accepted
+                // as the USDC balance either.
+                if (e.type !== 'fungible') throw new CustodyEvidenceError(
+                    EVIDENCE_ERRORS.MALFORMED_RESPONSE,
+                    `Provider returned a portfolio entry of type "${e.type}" despite tokenTypes=fungible — the response violates the requested filter, absence cannot be concluded (fail closed).`,
+                    { echoedType: e.type }
+                );
             }
             const matches = payload.result.filter((e) => normalizeAddress(e.tokenAddress) === contract);
             if (matches.length > 1) throw new CustodyEvidenceError(
@@ -304,13 +317,35 @@ function createTatumV4TestnetBalanceProvider(config = {}) {
             // here would be a FALSE zero. Fail closed instead (review
             // guidance: validate all pages or fail closed on an incomplete
             // response; the conservative branch is fail-closed).
-            const hasMorePages = payload.nextPage != null && String(payload.nextPage) !== '';
-            if (!entry && hasMorePages) {
-                throw new CustodyEvidenceError(
-                    EVIDENCE_ERRORS.MALFORMED_RESPONSE,
-                    'Incomplete paginated provider response: the requested token is not on the fetched page and the provider indicates more pages — absence cannot be concluded, refusing to fabricate a zero (fail closed).',
-                    { nextPage: String(payload.nextPage) }
-                );
+            //
+            // §REVIEW-R1 (final hardening): the pagination metadata itself
+            // must be PRESENT and well-shaped before absence can become a
+            // zero. A response with no `nextPage` field, or with metadata of
+            // an invalid shape, gives no completeness signal at all — the
+            // documented valid completion values are exactly null and the
+            // empty string (both observed live), and a non-empty string is a
+            // valid more-pages cursor. Anything else is shape drift and the
+            // absence interpretation is refused.
+            if (!entry) {
+                const nextPage = payload.nextPage;
+                if (nextPage === null) {
+                    // documented valid completion value — complete page.
+                } else if (typeof nextPage === 'string') {
+                    if (nextPage !== '') {
+                        throw new CustodyEvidenceError(
+                            EVIDENCE_ERRORS.MALFORMED_RESPONSE,
+                            'Incomplete paginated provider response: the requested token is not on the fetched page and the provider indicates more pages — absence cannot be concluded, refusing to fabricate a zero (fail closed).',
+                            { nextPage }
+                        );
+                    }
+                    // '' — documented valid completion value — complete page.
+                } else {
+                    throw new CustodyEvidenceError(
+                        EVIDENCE_ERRORS.MALFORMED_RESPONSE,
+                        'Provider response lacks valid pagination metadata (nextPage absent or malformed) — the completeness of the page cannot be established, absence cannot be concluded (fail closed).',
+                        { nextPageType: nextPage === undefined ? 'absent/undefined' : typeof nextPage }
+                    );
+                }
             }
             // Absent token entry = the wallet holds ZERO of the requested
             // token (a legal balance), mirroring the v3 source where a zero
@@ -332,16 +367,9 @@ function createTatumV4TestnetBalanceProvider(config = {}) {
                     raw: { absent: true, chain: tatumChain },
                 };
             }
-            // §REVIEW-R3 — the matched entry must be the expected FUNGIBLE
-            // token type. The request asks tokenTypes=fungible; an entry of
-            // any other type (native, nft, multitoken, unknown) must never be
-            // accepted as the token balance of a fungible USDC position.
-            if (entry.type !== 'fungible') throw new CustodyEvidenceError(
-                EVIDENCE_ERRORS.MALFORMED_RESPONSE,
-                `Matched provider portfolio entry type "${entry.type}" is not the expected fungible token type.`,
-                { echoedType: entry.type }
-            );
             // Bind the response to exactly what was requested — fail closed.
+            // (The matched entry's fungible TYPE was already enforced by the
+            // per-entry validation loop above, which runs before matching.)
             if (String(entry.chain || '').toLowerCase() !== String(tatumChain).toLowerCase()) {
                 throw new CustodyEvidenceError(
                     EVIDENCE_ERRORS.MALFORMED_RESPONSE,
