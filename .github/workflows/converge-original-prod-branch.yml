@@ -25,7 +25,10 @@ name: AZM original production branch guarded schema convergence (side-effect gat
 #   - AzmRewardLog/AzmSpendLog dedupKey backfills on existing rows
 #     (install-prod-drift-remediation.js);
 #   - intentional initial system rows: DeFiYieldStrategy seeds (AAVE,
-#     COMPOUND) and the zero-valued FiatLiquidityState singleton.
+#     COMPOUND) and the zero-valued FiatLiquidityState singleton;
+#   - one-time SmartRouteRun.updatedAt initialization from createdAt only for
+#     missing/NULL timestamps (preflight reports the row scope; existing lease
+#     timestamps are never reset); rate-provenance timestamps are NOT backfilled.
 #
 # The preflight makes every one of those effects visible and FAILS CLOSED on
 # any effect that has not been separately reviewed for this convergence run:
