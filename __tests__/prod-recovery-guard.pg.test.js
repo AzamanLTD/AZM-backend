@@ -54,6 +54,28 @@ const CMT_FKS = [
 ];
 
 describe('prod-recovery workflow graph contract', () => {
+    test('Model B production overlay owns the missing P5-B inventory substrate before adding eligibility', () => {
+        const installer = fs.readFileSync(
+            path.join(__dirname, '..', 'infra', 'install-model-b-settlement-overlay.js'),
+            'utf8',
+        );
+        const guard = fs.readFileSync(
+            path.join(__dirname, '..', 'infra', 'scripts', 'guarded-preflight-verify.mjs'),
+            'utf8',
+        );
+        expect(installer).toContain(`ALTER TYPE "JournalEntryType" ADD VALUE IF NOT EXISTS 'INVENTORY_ACQUISITION'`);
+        const lotTable = installer.indexOf(`CREATE TABLE IF NOT EXISTS "InventoryLot"`);
+        const consumptionTable = installer.indexOf(`CREATE TABLE IF NOT EXISTS "InventoryLotConsumption"`);
+        const eligibilityColumn = installer.indexOf(`ALTER TABLE "InventoryLot"
+     ADD COLUMN IF NOT EXISTS "eligibleForModelBSettlement"`);
+        expect(lotTable).toBeGreaterThan(-1);
+        expect(consumptionTable).toBeGreaterThan(lotTable);
+        expect(eligibilityColumn).toBeGreaterThan(consumptionTable);
+        expect(guard).toContain("'InventoryLotConsumption'");
+        expect(guard).toContain("'InventoryLot_remaining_bounds_check'");
+        expect(guard).toContain("['InventoryLotStatus', 'CONSUMED']");
+    });
+
     test('converge rechecks production gates and verification uses fresh baselines', () => {
         const workflow = fs.readFileSync(
             path.join(__dirname, '..', '.github', 'workflows', 'converge-original-prod-branch.yml'),
