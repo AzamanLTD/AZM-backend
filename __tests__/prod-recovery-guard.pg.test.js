@@ -41,6 +41,7 @@ const R42_INSTALLER = path.join(__dirname, '..', 'infra', 'install-r42-idempoten
 const FIAT_INSTALLER = path.join(__dirname, '..', 'infra', 'install-fiat-liquidity-overlay.js');
 const PHASE3_INSTALLER = path.join(__dirname, '..', 'infra', 'install-phase3-overlay.js');
 const BUSINESS_OS_INSTALLER = path.join(__dirname, '..', 'infra', 'install-business-os-overlay.js');
+const RUNTIME_SCHEMA_INSTALLER = path.join(__dirname, '..', 'infra', 'install-runtime-schema-gaps-overlay.js');
 
 const CMT_FKS = [
     ['ConversationMoneyTicket_messageId_fkey',
@@ -416,6 +417,28 @@ run('prod-recovery guard helper (real PostgreSQL)', () => {
             // assertion fails, so the serial test battery stays hermetic.
             runInstaller(FIAT_INSTALLER);
         }
+    });
+
+    test('runtime schema overlay executes idempotently on PostgreSQL', async () => {
+        runInstaller(RUNTIME_SCHEMA_INSTALLER);
+        runInstaller(RUNTIME_SCHEMA_INSTALLER);
+
+        const checks = await db.$queryRawUnsafe(`SELECT
+            to_regclass('"LedgerAccount"') IS NOT NULL AS ledger_account,
+            to_regclass('"LedgerTransaction"') IS NOT NULL AS ledger_transaction,
+            to_regclass('"RestrictedObligation"') IS NOT NULL AS restricted_obligation,
+            EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='SmartRouteRun' AND column_name='updatedAt') AS smart_route_updated_at,
+            EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='GlobalSettings' AND column_name='lastExternalSync') AS last_external_sync,
+            EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='JournalEntry' AND column_name='ledgerTransactionId') AS journal_ledger_link
+        `);
+        expect(checks[0]).toEqual({
+            ledger_account: true,
+            ledger_transaction: true,
+            restricted_obligation: true,
+            smart_route_updated_at: true,
+            last_external_sync: true,
+            journal_ledger_link: true,
+        });
     });
 
     test('verify passes end-to-end on the fully provisioned database', async () => {
