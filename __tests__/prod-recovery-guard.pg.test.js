@@ -41,6 +41,7 @@ const R42_INSTALLER = path.join(__dirname, '..', 'infra', 'install-r42-idempoten
 const FIAT_INSTALLER = path.join(__dirname, '..', 'infra', 'install-fiat-liquidity-overlay.js');
 const PHASE3_INSTALLER = path.join(__dirname, '..', 'infra', 'install-phase3-overlay.js');
 const BUSINESS_OS_INSTALLER = path.join(__dirname, '..', 'infra', 'install-business-os-overlay.js');
+const RUNTIME_SCHEMA_INSTALLER = path.join(__dirname, '..', 'infra', 'install-runtime-schema-gaps-overlay.js');
 
 const CMT_FKS = [
     ['ConversationMoneyTicket_messageId_fkey',
@@ -54,6 +55,64 @@ const CMT_FKS = [
 ];
 
 describe('prod-recovery workflow graph contract', () => {
+    test('runtime schema convergence repairs live-worker prerequisites without rewriting freshness or leases', () => {
+        const runtimeInstaller = fs.readFileSync(
+            path.join(__dirname, '..', 'infra', 'install-runtime-schema-gaps-overlay.js'),
+            'utf8',
+        );
+        const custodyExecutionInstaller = fs.readFileSync(
+            path.join(__dirname, '..', 'infra', 'install-custody-execution-overlay.js'),
+            'utf8',
+        );
+        const custodyAccountingInstaller = fs.readFileSync(
+            path.join(__dirname, '..', 'infra', 'install-custody-accounting-overlay.js'),
+            'utf8',
+        );
+        const guard = fs.readFileSync(
+            path.join(__dirname, '..', 'infra', 'scripts', 'guarded-preflight-verify.mjs'),
+            'utf8',
+        );
+        const workflow = fs.readFileSync(
+            path.join(__dirname, '..', '.github', 'workflows', 'converge-original-prod-branch.yml'),
+            'utf8',
+        );
+
+        expect(runtimeInstaller).toContain('ADD COLUMN IF NOT EXISTS "updatedAt" TIMESTAMP(3)');
+        expect(runtimeInstaller).toContain('WHERE "updatedAt" IS NULL');
+        expect(runtimeInstaller).toContain('ADD COLUMN IF NOT EXISTS "lastExternalSync" TIMESTAMP(3)');
+        expect(runtimeInstaller).toContain('ADD COLUMN IF NOT EXISTS "lastAdminSetAt" TIMESTAMP(3)');
+        expect(runtimeInstaller).toContain('ADD COLUMN IF NOT EXISTS "lastEchoAt" TIMESTAMP(3)');
+        expect(runtimeInstaller).toContain('CREATE TABLE IF NOT EXISTS "LedgerAccount"');
+        expect(runtimeInstaller).toContain('CREATE TABLE IF NOT EXISTS "LedgerTransaction"');
+        expect(runtimeInstaller).toContain('CREATE TABLE IF NOT EXISTS "RestrictedObligation"');
+        for (const entryType of [
+            'ESCROW_DISPUTE', 'SUSU_SEIZURE', 'SUSU_REFUND', 'VENDOR_TOPUP',
+            'VENDOR_ALLOCATE', 'CUSTODY_VERIFICATION', 'CUSTODY_REJECTION',
+        ]) {
+            expect(runtimeInstaller).toContain(`ADD VALUE IF NOT EXISTS '${entryType}'`);
+        }
+        expect(runtimeInstaller).not.toContain('UPDATE "GlobalSettings"');
+        expect(custodyExecutionInstaller).toContain('CREATE TABLE IF NOT EXISTS "CustodyExecution"');
+        expect(custodyAccountingInstaller).toContain('CREATE TABLE IF NOT EXISTS "CustodyAccount"');
+        expect(custodyAccountingInstaller).toContain('CREATE TABLE IF NOT EXISTS "CustodyMovement"');
+        expect(custodyAccountingInstaller).toContain('CREATE TABLE IF NOT EXISTS "CustodyEvidence"');
+        expect(custodyAccountingInstaller).toContain('CREATE TABLE IF NOT EXISTS "ProofOfReservesLeaf"');
+
+        for (const name of [
+            'LedgerAccount', 'LedgerTransaction', 'RestrictedObligation',
+            'CustodyExecution', 'CustodyAccount', 'CustodyMovement', 'CustodyEvidence', 'ProofOfReservesLeaf',
+        ]) {
+            expect(guard).toContain(`'${name}'`);
+        }
+        expect(guard).toContain("['SmartRouteRun', 'updatedAt']");
+        expect(guard).toContain("['GlobalSettings', 'lastExternalSync']");
+        expect(guard).toContain("['JournalEntry', 'ledgerTransactionId']");
+        expect(guard).toContain("['ProofOfReservesSnapshot', 'missingEvidenceCount']");
+        expect(workflow).toContain('node infra/install-runtime-schema-gaps-overlay.js');
+        expect(workflow).toContain('node infra/install-custody-execution-overlay.js');
+        expect(workflow).toContain('node infra/install-custody-accounting-overlay.js');
+    });
+
     test('converge rechecks production gates and verification uses fresh baselines', () => {
         const workflow = fs.readFileSync(
             path.join(__dirname, '..', '.github', 'workflows', 'converge-original-prod-branch.yml'),
@@ -364,6 +423,41 @@ run('prod-recovery guard helper (real PostgreSQL)', () => {
             // assertion fails, so the serial test battery stays hermetic.
             runInstaller(FIAT_INSTALLER);
         }
+    });
+
+    test('runtime schema overlay executes idempotently on PostgreSQL', async () => {
+        runInstaller(RUNTIME_SCHEMA_INSTALLER);
+        runInstaller(RUNTIME_SCHEMA_INSTALLER);
+
+        const checks = await db.$queryRawUnsafe(`SELECT
+            to_regclass('"LedgerAccount"') IS NOT NULL AS ledger_account,
+            to_regclass('"LedgerTransaction"') IS NOT NULL AS ledger_transaction,
+            to_regclass('"RestrictedObligation"') IS NOT NULL AS restricted_obligation,
+            EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='SmartRouteRun' AND column_name='updatedAt') AS smart_route_updated_at,
+            EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='GlobalSettings' AND column_name='lastExternalSync') AS last_external_sync,
+            EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public' AND table_name='JournalEntry' AND column_name='ledgerTransactionId') AS journal_ledger_link
+        `);
+        expect(checks[0]).toEqual({
+            ledger_account: true,
+            ledger_transaction: true,
+            restricted_obligation: true,
+            smart_route_updated_at: true,
+            last_external_sync: true,
+            journal_ledger_link: true,
+        });
+
+        const requiredEntryTypes = [
+            'ESCROW_DISPUTE', 'SUSU_SEIZURE', 'SUSU_REFUND', 'VENDOR_TOPUP',
+            'VENDOR_ALLOCATE', 'CUSTODY_VERIFICATION', 'CUSTODY_REJECTION',
+        ];
+        const enumRows = await db.$queryRawUnsafe(
+            `SELECT e.enumlabel FROM pg_enum e
+             JOIN pg_type t ON t.oid = e.enumtypid
+             WHERE t.typname = 'JournalEntryType' AND e.enumlabel = ANY($1::text[])
+             ORDER BY e.enumlabel`,
+            requiredEntryTypes,
+        );
+        expect(enumRows.map((row) => row.enumlabel)).toEqual([...requiredEntryTypes].sort());
     });
 
     test('verify passes end-to-end on the fully provisioned database', async () => {
