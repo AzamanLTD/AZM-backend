@@ -30,6 +30,9 @@
 //   7. Final hardening (r1/r2): pagination metadata must be PRESENT and
 //      well-shaped (null or '' completes a page; any other shape fails
 //      closed); every entry must be fungible per the requested filter.
+//   8. Final hardening (r3): every entry's tokenAddress must be a structurally
+//      valid 20-byte EVM address BEFORE matching/absence; malformed entries
+//      are never silently filtered out of the scan.
 // =============================================================================
 
 const { Prisma, PrismaClient } = require('@prisma/client');
@@ -367,6 +370,55 @@ describe('§TATUM-TESTNET review hardening — pagination, absence identity, USD
             data: { result: [livePortfolioEntry(), { chain: 'polygon-amoy', address: HOLDER, balance: '2.394863274000720944', denominatedBalance: '2394863274000720944', decimals: 18, type: 'native' }], prevPage: '', nextPage: '' },
         }));
         await expect(get(http)).rejects.toMatchObject({ code: EVIDENCE_ERRORS.MALFORMED_RESPONSE });
+    });
+    // ── r3 (final): tokenAddress structural validation before absence ──
+    const fungibleOther = (tokenAddress, type = 'fungible') => ({
+        chain: 'polygon-amoy', address: HOLDER, balance: '12.345678', denominatedBalance: '12345678', decimals: 6, tokenAddress, type,
+    });
+
+    it('r3: USDC absent + a malformed tokenAddress entry fails closed on a COMPLETE page (nextPage null)', async () => {
+        // Missing, null, non-string, wrong-length, and non-hex token
+        // addresses are all structural drift: the entry cannot be reliably
+        // matched against the USDC contract, so the page cannot support an
+        // absence conclusion even though pagination says the page is complete.
+        const malformed = [
+            undefined,           // key absent / undefined
+            null,
+            42,                  // non-string
+            '0x' + 'a'.repeat(39), // 19.5 bytes — short
+            '0x' + 'a'.repeat(41), // 20.5 bytes — long
+            '0x' + 'z'.repeat(40), // right length, non-hex
+            '41e94eb019c0762f9bfcf9fb1e58725bfb0e7582', // 20 bytes but no 0x prefix
+        ];
+        for (const tokenAddress of malformed) {
+            const result = tokenAddress === undefined
+                ? { chain: 'polygon-amoy', address: HOLDER, balance: '12.345678', denominatedBalance: '12345678', decimals: 6, type: 'fungible' }
+                : fungibleOther(tokenAddress);
+            const http = fakeHttp(() => ({ data: { result: [result], prevPage: '', nextPage: null } }));
+            await expect(get(http)).rejects.toMatchObject({ code: EVIDENCE_ERRORS.MALFORMED_RESPONSE });
+        }
+    });
+
+    it('r3: USDC absent + a malformed tokenAddress entry fails closed with nextPage empty string', async () => {
+        const http = fakeHttp(() => ({ data: { result: [fungibleOther(null)], prevPage: '', nextPage: '' } }));
+        await expect(get(http)).rejects.toMatchObject({ code: EVIDENCE_ERRORS.MALFORMED_RESPONSE });
+    });
+
+    it('r3: a VALID USDC entry plus a malformed unrelated entry is still rejected (matching never rescues a malformed page)', async () => {
+        // The requested token IS present and perfectly formed — but the
+        // malformed sibling entry proves the page itself is untrustworthy,
+        // so even the matched balance is refused.
+        const http = fakeHttp(() => ({ data: { result: [livePortfolioEntry(), fungibleOther(12345)], prevPage: '', nextPage: null } }));
+        await expect(get(http)).rejects.toMatchObject({ code: EVIDENCE_ERRORS.MALFORMED_RESPONSE });
+    });
+
+    it('r3: a VALID 20-byte hex tokenAddress of a different contract still observes a legal zero (strictness does not over-reject)', async () => {
+        // Mixed-case checksum form is structurally valid and must pass the
+        // structural gate; the unrelated contract simply does not match.
+        const http = fakeHttp(() => ({ data: { result: [fungibleOther('0x' + 'AbCdEf0123456789AbCdEf0123456789AbCdEf01')], prevPage: '', nextPage: null } }));
+        const obs = await get(http);
+        expect(obs.balanceBaseUnits).toBe(0n);
+        expect(obs.raw.absent).toBe(true);
     });
 });
 

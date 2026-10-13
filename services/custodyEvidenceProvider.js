@@ -120,6 +120,14 @@ function normalizeAddress(address) {
     return String(address || '').toLowerCase().trim();
 }
 
+// §REVIEW-R3 — strict structural check for a 20-byte EVM address: a string
+// of the exact form 0x + 40 hex characters. Used to validate every portfolio
+// entry's tokenAddress before absence detection: a malformed address must
+// never be silently filtered out of the matching scan.
+function isValidEvmAddress(value) {
+    return typeof value === 'string' && /^0x[0-9a-fA-F]{40}$/.test(value);
+}
+
 function classifyHttpError(err) {
     const status = err && err.response ? err.response.status : null;
     if (status === 401 || status === 403) {
@@ -299,6 +307,22 @@ function createTatumV4TestnetBalanceProvider(config = {}) {
                     EVIDENCE_ERRORS.MALFORMED_RESPONSE,
                     `Provider returned a portfolio entry of type "${e.type}" despite tokenTypes=fungible — the response violates the requested filter, absence cannot be concluded (fail closed).`,
                     { echoedType: e.type }
+                );
+                // §REVIEW-R3 (final): the request is restricted to Polygon
+                // Amoy FUNGIBLE assets, so every entry must carry a
+                // structurally valid 20-byte EVM tokenAddress before it can
+                // be considered during absence detection. A missing, null,
+                // non-string, wrong-length, or non-hex tokenAddress means
+                // the entry cannot be reliably matched against the requested
+                // USDC contract — a malformed UNRELATED entry must not be
+                // silently filtered out of the scan, because that is exactly
+                // the shape a compromised or drifted provider would use to
+                // smuggle a false absence. Reject before matching and before
+                // any zero can be emitted.
+                if (!isValidEvmAddress(e.tokenAddress)) throw new CustodyEvidenceError(
+                    EVIDENCE_ERRORS.MALFORMED_RESPONSE,
+                    'Provider v4 portfolio entry carries a structurally invalid tokenAddress (missing, non-string, wrong length, or non-hex) — the entry cannot be reliably matched, absence cannot be concluded (fail closed).',
+                    { echoedTokenAddress: e.tokenAddress === undefined ? 'absent/undefined' : (e.tokenAddress === null ? 'null' : String(e.tokenAddress).slice(0, 78)) }
                 );
             }
             const matches = payload.result.filter((e) => normalizeAddress(e.tokenAddress) === contract);
