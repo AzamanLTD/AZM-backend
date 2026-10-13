@@ -75,7 +75,7 @@ const DEFAULT_EXPECTED_DB = 'neondb';
 // OUT OF SCOPE (prisma-schema objects with NO production installer — missing on
 // BOTH audited databases, NOT provisioned by the reviewed sequence, and NOT
 // verified here; the backend demonstrably runs without them):
-//   LedgerAccount, LedgerTransaction, RestrictedObligation, InventoryLotConsumption,
+//   LedgerAccount, LedgerTransaction, RestrictedObligation,
 //   AdminRoleAssignment, CustodyAccount/CustodyEvidence/CustodyExecution/CustodyMovement
 //   (custody installers are not part of the release chain),
 //   GlobalSettings.lastAdminSetAt/lastEchoAt/lastExternalSync,
