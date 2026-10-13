@@ -54,6 +54,58 @@ const CMT_FKS = [
 ];
 
 describe('prod-recovery workflow graph contract', () => {
+    test('runtime schema convergence repairs live-worker prerequisites without rewriting freshness or leases', () => {
+        const runtimeInstaller = fs.readFileSync(
+            path.join(__dirname, '..', 'infra', 'install-runtime-schema-gaps-overlay.js'),
+            'utf8',
+        );
+        const custodyExecutionInstaller = fs.readFileSync(
+            path.join(__dirname, '..', 'infra', 'install-custody-execution-overlay.js'),
+            'utf8',
+        );
+        const custodyAccountingInstaller = fs.readFileSync(
+            path.join(__dirname, '..', 'infra', 'install-custody-accounting-overlay.js'),
+            'utf8',
+        );
+        const guard = fs.readFileSync(
+            path.join(__dirname, '..', 'infra', 'scripts', 'guarded-preflight-verify.mjs'),
+            'utf8',
+        );
+        const workflow = fs.readFileSync(
+            path.join(__dirname, '..', '.github', 'workflows', 'converge-original-prod-branch.yml'),
+            'utf8',
+        );
+
+        expect(runtimeInstaller).toContain('ADD COLUMN IF NOT EXISTS "updatedAt" TIMESTAMP(3)');
+        expect(runtimeInstaller).toContain('WHERE "updatedAt" IS NULL');
+        expect(runtimeInstaller).toContain('ADD COLUMN IF NOT EXISTS "lastExternalSync" TIMESTAMP(3)');
+        expect(runtimeInstaller).toContain('ADD COLUMN IF NOT EXISTS "lastAdminSetAt" TIMESTAMP(3)');
+        expect(runtimeInstaller).toContain('ADD COLUMN IF NOT EXISTS "lastEchoAt" TIMESTAMP(3)');
+        expect(runtimeInstaller).toContain('CREATE TABLE IF NOT EXISTS "LedgerAccount"');
+        expect(runtimeInstaller).toContain('CREATE TABLE IF NOT EXISTS "LedgerTransaction"');
+        expect(runtimeInstaller).toContain('CREATE TABLE IF NOT EXISTS "RestrictedObligation"');
+        expect(runtimeInstaller).not.toContain('UPDATE "GlobalSettings"');
+        expect(custodyExecutionInstaller).toContain('CREATE TABLE IF NOT EXISTS "CustodyExecution"');
+        expect(custodyAccountingInstaller).toContain('CREATE TABLE IF NOT EXISTS "CustodyAccount"');
+        expect(custodyAccountingInstaller).toContain('CREATE TABLE IF NOT EXISTS "CustodyMovement"');
+        expect(custodyAccountingInstaller).toContain('CREATE TABLE IF NOT EXISTS "CustodyEvidence"');
+        expect(custodyAccountingInstaller).toContain('CREATE TABLE IF NOT EXISTS "ProofOfReservesLeaf"');
+
+        for (const name of [
+            'LedgerAccount', 'LedgerTransaction', 'RestrictedObligation',
+            'CustodyExecution', 'CustodyAccount', 'CustodyMovement', 'CustodyEvidence', 'ProofOfReservesLeaf',
+        ]) {
+            expect(guard).toContain(`'${name}'`);
+        }
+        expect(guard).toContain("['SmartRouteRun', 'updatedAt']");
+        expect(guard).toContain("['GlobalSettings', 'lastExternalSync']");
+        expect(guard).toContain("['JournalEntry', 'ledgerTransactionId']");
+        expect(guard).toContain("['ProofOfReservesSnapshot', 'missingEvidenceCount']");
+        expect(workflow).toContain('node infra/install-runtime-schema-gaps-overlay.js');
+        expect(workflow).toContain('node infra/install-custody-execution-overlay.js');
+        expect(workflow).toContain('node infra/install-custody-accounting-overlay.js');
+    });
+
     test('converge rechecks production gates and verification uses fresh baselines', () => {
         const workflow = fs.readFileSync(
             path.join(__dirname, '..', '.github', 'workflows', 'converge-original-prod-branch.yml'),
