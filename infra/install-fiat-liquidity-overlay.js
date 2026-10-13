@@ -151,6 +151,16 @@ const STATEMENTS = [
 ];
 
 async function installFiatLiquidityOverlay() {
+  // The duplicate scan below is deliberately before the partial unique index,
+  // but a first install has no receipt table to scan yet. Create only the
+  // empty receipt table first; CREATE TABLE IF NOT EXISTS is additive and
+  // preserves any existing table/data. The full installer loop below remains
+  // responsible for the indexes, constraints and the rest of the overlay.
+  const receiptTableDdl = STATEMENTS.find((statement) =>
+    statement.startsWith('CREATE TABLE IF NOT EXISTS "FiatLiquidityReceipt"'));
+  if (!receiptTableDdl) throw new Error('FiatLiquidityReceipt CREATE TABLE statement is missing');
+  await prisma.$executeRawUnsafe(receiptTableDdl);
+
   // r15 R15-A duplicate preflight (READ-ONLY): the partial unique index
   // enforcing "at most one AVAILABLE receipt per relatedTransactionId"
   // cannot be applied over contradictory historical rows without PostgreSQL
