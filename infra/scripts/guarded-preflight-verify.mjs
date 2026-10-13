@@ -201,6 +201,7 @@ const AUDITED_INDEXES = [
   'CustodyEvidence_status_idx',
   'CustodyEvidence_scope_status_idx',
   'ProofOfReservesLeaf_snapshotId_userId_idx',
+  'ProofOfReservesLeaf_userId_idx',
 ];
 
 const AUDITED_CONSTRAINTS = [
