@@ -236,6 +236,13 @@ const AUDITED_ENUM_VALUES = [
   ['JournalEntryType', 'INVENTORY_ACQUISITION'],
   ['InventoryLotStatus', 'OPEN'],
   ['InventoryLotStatus', 'CONSUMED'],
+  // r16c P0-B lease/parking states installed by the r16 release overlay
+  // (install-r16-execution-identity-overlay.js). The pre-r16c production
+  // branch enum lacks both, which fails every smartRouteWorker lease-sweep
+  // query with 22P02 — the verify step must prove convergence actually
+  // applied them.
+  ['SmartRouteRunStatus', 'EXECUTING'],
+  ['SmartRouteRunStatus', 'AWAITING_RECONCILIATION'],
 ];
 
 // Baseline-preservation set: important existing business/financial tables whose
