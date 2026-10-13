@@ -14,6 +14,85 @@ const STATEMENTS = [
   `ALTER TABLE "GlobalSettings"
      ADD COLUMN IF NOT EXISTS "modelBSettlementEnabled" BOOLEAN NOT NULL DEFAULT false;`,
 
+  // Production release runs standalone overlays, not prisma migrate deploy.
+  // P5-B's InventoryLot substrate was previously defined only in a migration,
+  // so the original production branch can lack both the enum and table even
+  // though P5-E needs to add eligibility to it. Converge the P5-B substrate
+  // here, using the exact migration shape and idempotent guards.
+  `ALTER TYPE "JournalEntryType" ADD VALUE IF NOT EXISTS 'INVENTORY_ACQUISITION';`,
+  `DO $ BEGIN
+     CREATE TYPE "InventoryLotStatus" AS ENUM ('OPEN', 'CONSUMED');
+   EXCEPTION WHEN duplicate_object THEN NULL;
+   END $;`,
+  `CREATE TABLE IF NOT EXISTS "InventoryLot" (
+    "id" SERIAL NOT NULL,
+    "acquisitionKey" VARCHAR(140) NOT NULL,
+    "sourceType" VARCHAR(40) NOT NULL,
+    "sourceReference" VARCHAR(140) NOT NULL,
+    "quantityOriginal" DECIMAL(20,8) NOT NULL,
+    "quantityRemaining" DECIMAL(20,8) NOT NULL,
+    "costBasisGhs" DECIMAL(20,8) NOT NULL,
+    "acquisitionRate" DECIMAL(18,8),
+    "ledgerTxnId" TEXT,
+    "status" "InventoryLotStatus" NOT NULL DEFAULT 'OPEN',
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT "InventoryLot_pkey" PRIMARY KEY ("id")
+  );`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS "InventoryLot_acquisitionKey_key"
+     ON "InventoryLot"("acquisitionKey");`,
+  `DO $ BEGIN
+     IF NOT EXISTS (SELECT 1 FROM pg_constraint
+       WHERE conname = 'InventoryLot_qty_positive_check'
+         AND conrelid = '"InventoryLot"'::regclass) THEN
+       ALTER TABLE "InventoryLot" ADD CONSTRAINT "InventoryLot_qty_positive_check"
+         CHECK ("quantityOriginal" > 0);
+     END IF;
+     IF NOT EXISTS (SELECT 1 FROM pg_constraint
+       WHERE conname = 'InventoryLot_remaining_bounds_check'
+         AND conrelid = '"InventoryLot"'::regclass) THEN
+       ALTER TABLE "InventoryLot" ADD CONSTRAINT "InventoryLot_remaining_bounds_check"
+         CHECK ("quantityRemaining" >= 0 AND "quantityRemaining" <= "quantityOriginal");
+     END IF;
+     IF NOT EXISTS (SELECT 1 FROM pg_constraint
+       WHERE conname = 'InventoryLot_cost_positive_check'
+         AND conrelid = '"InventoryLot"'::regclass) THEN
+       ALTER TABLE "InventoryLot" ADD CONSTRAINT "InventoryLot_cost_positive_check"
+         CHECK ("costBasisGhs" > 0);
+     END IF;
+   END $;`,
+  `CREATE TABLE IF NOT EXISTS "InventoryLotConsumption" (
+    "id" SERIAL NOT NULL,
+    "consumptionKey" VARCHAR(140) NOT NULL,
+    "lotId" INTEGER NOT NULL,
+    "quantity" DECIMAL(20,8) NOT NULL,
+    "purpose" VARCHAR(40) NOT NULL,
+    "sourceReference" VARCHAR(140),
+    "ledgerTxnId" TEXT,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT "InventoryLotConsumption_pkey" PRIMARY KEY ("id")
+  );`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS "InventoryLotConsumption_consumptionKey_key"
+     ON "InventoryLotConsumption"("consumptionKey");`,
+  `CREATE INDEX IF NOT EXISTS "InventoryLotConsumption_lotId_idx"
+     ON "InventoryLotConsumption"("lotId");`,
+  `DO $ BEGIN
+     IF NOT EXISTS (SELECT 1 FROM pg_constraint
+       WHERE conname = 'InventoryLotConsumption_lotId_fkey'
+         AND conrelid = '"InventoryLotConsumption"'::regclass) THEN
+       ALTER TABLE "InventoryLotConsumption"
+         ADD CONSTRAINT "InventoryLotConsumption_lotId_fkey"
+         FOREIGN KEY ("lotId") REFERENCES "InventoryLot"("id")
+         ON DELETE RESTRICT ON UPDATE CASCADE;
+     END IF;
+     IF NOT EXISTS (SELECT 1 FROM pg_constraint
+       WHERE conname = 'InventoryLotConsumption_qty_positive_check'
+         AND conrelid = '"InventoryLotConsumption"'::regclass) THEN
+       ALTER TABLE "InventoryLotConsumption"
+         ADD CONSTRAINT "InventoryLotConsumption_qty_positive_check"
+         CHECK ("quantity" > 0);
+     END IF;
+   END $;`,
+
   `CREATE TABLE IF NOT EXISTS "ModelBSettlement" (
     "id" SERIAL NOT NULL,
     "reference" VARCHAR(140) NOT NULL,
