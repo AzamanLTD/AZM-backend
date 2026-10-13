@@ -498,7 +498,40 @@ async function main() {
       const e2eeOk = await e2eeGate(client);
       const orphanOk = await orphanGate(client);
       const backfillOk = await backfillGate(client);
-      if (!e2eeOk || !orphanOk || !backfillOk) {
+
+      // Runtime schema convergence includes a one-time, null-only timestamp
+      // initialization; expose the exact row scope before any mutation.
+      let runtimeBasesOk = true;
+      for (const table of ['GlobalSettings', 'SmartRouteRun', 'JournalEntry', 'ProofOfReservesSnapshot']) {
+        const info = await tableInfo(client, table);
+        if (!info.exists) {
+          console.error('::error::preflight REFUSED: required base table ' + table + ' is absent.');
+          runtimeBasesOk = false;
+        }
+      }
+      const smartRouteInfo = await tableInfo(client, 'SmartRouteRun');
+      if (smartRouteInfo.exists) {
+        if (!(await hasColumn(client, 'SmartRouteRun', 'updatedAt'))) {
+          console.log('expected runtime initialization SmartRouteRun.updatedAt: missing column; ' +
+            smartRouteInfo.rows + ' existing row(s) will initialize from createdAt.');
+        } else {
+          const nulls = Number(await scalar(client, 'SELECT count(*) FROM "SmartRouteRun" WHERE "updatedAt" IS NULL'));
+          console.log('runtime initialization SmartRouteRun.updatedAt: ' + nulls +
+            ' NULL row(s) will initialize from createdAt; existing timestamps will not be reset.');
+        }
+      }
+      const settingsInfo = await tableInfo(client, 'GlobalSettings');
+      if (settingsInfo.exists) {
+        const missingProvenance = [];
+        for (const col of ['lastExternalSync', 'lastAdminSetAt', 'lastEchoAt']) {
+          if (!(await hasColumn(client, 'GlobalSettings', col))) missingProvenance.push(col);
+        }
+        console.log('rate-provenance columns ' + (missingProvenance.length
+          ? missingProvenance.join(', ') + ' will be added nullable without a historical backfill.'
+          : 'already present; no backfill required.'));
+      }
+
+      if (!e2eeOk || !orphanOk || !backfillOk || !runtimeBasesOk) {
         console.error('::error::preflight failed closed on a side-effect gate: review the reported effect(s) before authorizing convergence.');
         process.exitCode = 1;
         return;
