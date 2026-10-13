@@ -15,14 +15,14 @@ const STATEMENTS = [
   // P5-E installer must provision the substrate it extends on first install.
   // These are additive/idempotent mirrors of migration 20260918200000_p5b_inventory_lots.
   `ALTER TYPE "JournalEntryType" ADD VALUE IF NOT EXISTS 'INVENTORY_ACQUISITION';`,
-  `DO $ BEGIN
+  `DO $azminventory$ BEGIN
     IF NOT EXISTS (
       SELECT 1 FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace
       WHERE n.nspname = 'public' AND t.typname = 'InventoryLotStatus'
     ) THEN
       CREATE TYPE "InventoryLotStatus" AS ENUM ('OPEN', 'CONSUMED');
     END IF;
-  END $;`,
+  END $azminventory$;`,
   `CREATE TABLE IF NOT EXISTS "InventoryLot" (
     "id" SERIAL NOT NULL,
     "acquisitionKey" VARCHAR(140) NOT NULL,
@@ -54,7 +54,7 @@ const STATEMENTS = [
     ON "InventoryLotConsumption"("consumptionKey");`,
   `CREATE INDEX IF NOT EXISTS "InventoryLotConsumption_lotId_idx"
     ON "InventoryLotConsumption"("lotId");`,
-  `DO $ BEGIN
+  `DO $azminventory$ BEGIN
     IF NOT EXISTS (
       SELECT 1 FROM pg_constraint
       WHERE conname = 'InventoryLotConsumption_lotId_fkey'
@@ -65,8 +65,8 @@ const STATEMENTS = [
         FOREIGN KEY ("lotId") REFERENCES "InventoryLot"("id")
         ON DELETE RESTRICT ON UPDATE CASCADE;
     END IF;
-  END $;`,
-  `DO $ BEGIN
+  END $azminventory$;`,
+  `DO $azminventory$ BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_constraint
       WHERE conname = 'InventoryLot_qty_positive_check'
         AND conrelid = '"InventoryLot"'::regclass) THEN
@@ -91,7 +91,7 @@ const STATEMENTS = [
       ALTER TABLE "InventoryLotConsumption" ADD CONSTRAINT "InventoryLotConsumption_qty_positive_check"
         CHECK ("quantity" > 0);
     END IF;
-  END $;`,
+  END $azminventory$;`,
   `ALTER TABLE "GlobalSettings"
      ADD COLUMN IF NOT EXISTS "modelBSettlementEnabled" BOOLEAN NOT NULL DEFAULT false;`,
 
