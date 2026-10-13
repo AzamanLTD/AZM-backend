@@ -341,6 +341,15 @@ describeOrSkip('§R15-A reconciliation single-claim invariant (real PostgreSQL)'
         process.env.DATABASE_URL = process.env.TEST_DATABASE_URL;
         const { installFiatLiquidityOverlay: freshInstaller } = require('../infra/install-fiat-liquidity-overlay');
 
+        // First-install regression: on the original production branch this
+        // table was absent, so the duplicate scan used to fail with 42P01
+        // before the installer reached its CREATE TABLE statement.
+        await prisma.$executeRawUnsafe('DROP TABLE IF EXISTS "FiatLiquidityReceipt"');
+        await expect(freshInstaller()).resolves.toBeUndefined();
+        const recreated = await prisma.$queryRawUnsafe(
+            `SELECT to_regclass('"FiatLiquidityReceipt"') AS relation`);
+        expect(recreated[0].relation).toBe('FiatLiquidityReceipt');
+
         // Simulate a pre-index deployment with contradictory history:
         // drop the invariant, write two AVAILABLE claims for one deposit.
         await prisma.$executeRawUnsafe('DROP INDEX IF EXISTS "FiatLiquidityReceipt_availableRelatedTx_unique"');
