@@ -48,6 +48,15 @@ const STATEMENTS = [
    EXCEPTION WHEN duplicate_object THEN NULL;
    END $azm_runtime$;`,
   `ALTER TYPE "JournalEntryType" ADD VALUE IF NOT EXISTS 'ASSET_CONVERSION';`,
+  // §P.4 wave 2: enum expansion existed only in a Prisma migration, which
+  // production's raw-SQL release sequence does not execute.
+  `ALTER TYPE "JournalEntryType" ADD VALUE IF NOT EXISTS 'ESCROW_DISPUTE';`,
+  `ALTER TYPE "JournalEntryType" ADD VALUE IF NOT EXISTS 'SUSU_SEIZURE';`,
+  `ALTER TYPE "JournalEntryType" ADD VALUE IF NOT EXISTS 'SUSU_REFUND';`,
+  `ALTER TYPE "JournalEntryType" ADD VALUE IF NOT EXISTS 'VENDOR_TOPUP';`,
+  `ALTER TYPE "JournalEntryType" ADD VALUE IF NOT EXISTS 'VENDOR_ALLOCATE';`,
+  `ALTER TYPE "JournalEntryType" ADD VALUE IF NOT EXISTS 'CUSTODY_VERIFICATION';`,
+  `ALTER TYPE "JournalEntryType" ADD VALUE IF NOT EXISTS 'CUSTODY_REJECTION';`,
 
   `ALTER TABLE "JournalEntry" ADD COLUMN IF NOT EXISTS "ledgerTransactionId" VARCHAR(36);`,
   `ALTER TABLE "JournalEntry" ADD COLUMN IF NOT EXISTS "lineNumber" INTEGER;`,
