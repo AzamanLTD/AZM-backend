@@ -347,8 +347,8 @@ describeOrSkip('§R15-A reconciliation single-claim invariant (real PostgreSQL)'
         await prisma.$executeRawUnsafe('DROP TABLE IF EXISTS "FiatLiquidityReceipt"');
         await expect(freshInstaller()).resolves.toBeUndefined();
         const recreated = await prisma.$queryRawUnsafe(
-            `SELECT to_regclass('"FiatLiquidityReceipt"') AS relation`);
-        expect(recreated[0].relation).toBe('FiatLiquidityReceipt');
+            `SELECT to_regclass('"FiatLiquidityReceipt"') IS NOT NULL AS exists`);
+        expect(recreated[0].exists).toBe(true);
 
         // Simulate a pre-index deployment with contradictory history:
         // drop the invariant, write two AVAILABLE claims for one deposit.
