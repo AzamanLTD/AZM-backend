@@ -217,6 +217,11 @@ jobs:
           node infra/install-e2ee-server-blind-overlay.js
           node infra/install-inventory-restock-overlay.js
           node infra/install-reservation-capacity-overlay.js
+          # Runtime schema used by workers/PoR; all steps below are additive,
+          # idempotent and do not seed or mutate business/financial rows.
+          node infra/install-runtime-schema-gaps-overlay.js
+          node infra/install-custody-execution-overlay.js
+          node infra/install-custody-accounting-overlay.js
           # The npm run release chain WITHOUT seed-susu-foundation.js,
           # in the exact package.json release order. Additive and idempotent;
           # every non-DDL effect is surfaced and gated by the preflight.
