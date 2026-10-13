@@ -140,11 +140,11 @@ const AUDITED_INDEXES = [
 ];
 
 const AUDITED_CONSTRAINTS = [
-  'InventoryLot_qty_positive_check',
-  'InventoryLot_remaining_bounds_check',
-  'InventoryLot_cost_positive_check',
-  'InventoryLotConsumption_lotId_fkey',
-  'InventoryLotConsumption_qty_positive_check',
+  ['InventoryLot', 'InventoryLot_qty_positive_check'],
+  ['InventoryLot', 'InventoryLot_remaining_bounds_check'],
+  ['InventoryLot', 'InventoryLot_cost_positive_check'],
+  ['InventoryLotConsumption', 'InventoryLotConsumption_lotId_fkey'],
+  ['InventoryLotConsumption', 'InventoryLotConsumption_qty_positive_check'],
 ];
 
 const AUDITED_ENUM_VALUES = [
@@ -488,10 +488,11 @@ async function main() {
         if (n === 0) { console.error(`::error::verify failed: audited index ${idx} missing after apply.`); failed++; }
         else console.log(`index ${idx}: present`);
       }
-      for (const constraint of AUDITED_CONSTRAINTS) {
-        const n = Number(await scalar(client, `SELECT count(*) FROM pg_constraint WHERE conname='${constraint}'`));
-        if (n === 0) { console.error(`::error::verify failed: audited constraint ${constraint} missing after apply.`); failed++; }
-        else console.log(`constraint ${constraint}: present`);
+      for (const [table, constraint] of AUDITED_CONSTRAINTS) {
+        const n = Number(await scalar(client,
+          `SELECT count(*) FROM pg_constraint WHERE conname='${constraint}' AND conrelid = '"${table}"'::regclass`));
+        if (n === 0) { console.error(`::error::verify failed: audited constraint ${table}.${constraint} missing after apply.`); failed++; }
+        else console.log(`constraint ${table}.${constraint}: present`);
       }
       for (const [typeName, value] of AUDITED_ENUM_VALUES) {
         const n = Number(await scalar(client,
