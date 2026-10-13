@@ -20,10 +20,10 @@ const STATEMENTS = [
   // though P5-E needs to add eligibility to it. Converge the P5-B substrate
   // here, using the exact migration shape and idempotent guards.
   `ALTER TYPE "JournalEntryType" ADD VALUE IF NOT EXISTS 'INVENTORY_ACQUISITION';`,
-  `DO $ BEGIN
+  `DO $inv$ BEGIN
      CREATE TYPE "InventoryLotStatus" AS ENUM ('OPEN', 'CONSUMED');
    EXCEPTION WHEN duplicate_object THEN NULL;
-   END $;`,
+   END $inv$;`,
   `CREATE TABLE IF NOT EXISTS "InventoryLot" (
     "id" SERIAL NOT NULL,
     "acquisitionKey" VARCHAR(140) NOT NULL,
@@ -40,7 +40,7 @@ const STATEMENTS = [
   );`,
   `CREATE UNIQUE INDEX IF NOT EXISTS "InventoryLot_acquisitionKey_key"
      ON "InventoryLot"("acquisitionKey");`,
-  `DO $ BEGIN
+  `DO $inv$ BEGIN
      IF NOT EXISTS (SELECT 1 FROM pg_constraint
        WHERE conname = 'InventoryLot_qty_positive_check'
          AND conrelid = '"InventoryLot"'::regclass) THEN
@@ -59,7 +59,7 @@ const STATEMENTS = [
        ALTER TABLE "InventoryLot" ADD CONSTRAINT "InventoryLot_cost_positive_check"
          CHECK ("costBasisGhs" > 0);
      END IF;
-   END $;`,
+   END $inv$;`,
   `CREATE TABLE IF NOT EXISTS "InventoryLotConsumption" (
     "id" SERIAL NOT NULL,
     "consumptionKey" VARCHAR(140) NOT NULL,
@@ -75,7 +75,7 @@ const STATEMENTS = [
      ON "InventoryLotConsumption"("consumptionKey");`,
   `CREATE INDEX IF NOT EXISTS "InventoryLotConsumption_lotId_idx"
      ON "InventoryLotConsumption"("lotId");`,
-  `DO $ BEGIN
+  `DO $inv$ BEGIN
      IF NOT EXISTS (SELECT 1 FROM pg_constraint
        WHERE conname = 'InventoryLotConsumption_lotId_fkey'
          AND conrelid = '"InventoryLotConsumption"'::regclass) THEN
@@ -91,7 +91,7 @@ const STATEMENTS = [
          ADD CONSTRAINT "InventoryLotConsumption_qty_positive_check"
          CHECK ("quantity" > 0);
      END IF;
-   END $;`,
+   END $inv$;`,
 
   `CREATE TABLE IF NOT EXISTS "ModelBSettlement" (
     "id" SERIAL NOT NULL,
