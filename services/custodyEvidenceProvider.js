@@ -58,6 +58,14 @@ const TATUM_V4_CHAIN = { POLYGON: 'polygon-mainnet' };
 const TATUM_V4_CHAIN_TESTNET = { POLYGON_TESTNET: 'polygon-amoy' };
 const SOURCE_BALANCE_TESTNET = 'TATUM_V4_WALLET_PORTFOLIO_TESTNET';
 
+// §REVIEW-R3 — the testnet evidence domain serves EXACTLY ONE token: the
+// canonical Circle-official USDC contract on Polygon PoS Amoy (verified live,
+// 2026-10-13: 6 dp, type 'fungible'). The provider refuses to fetch — let
+// alone label — any other contract address as USDC: an arbitrary contract's
+// balance must never be rebranded as USDC evidence. This constant is
+// deliberate and not overridable from caller config.
+const AMOY_USDC_CONTRACT = normalizeAddress('0x41e94eb019c0762f9bfcf9fb1e58725bfb0e7582');
+
 class CustodyEvidenceError extends Error {
     constructor(code, message, detail) {
         super(message);
@@ -228,6 +236,12 @@ function createTatumV4TestnetBalanceProvider(config = {}) {
                 'Testnet balance evidence requires an exact integer token decimals value.'
             );
             const contract = normalizeAddress(contractAddress);
+            // §REVIEW-R3: only the canonical Amoy USDC contract may ever be
+            // observed under the USDC asset label (see AMOY_USDC_CONTRACT).
+            if (contract !== AMOY_USDC_CONTRACT) throw new CustodyEvidenceError(
+                EVIDENCE_ERRORS.CONFIGURATION_ERROR,
+                `Testnet balance evidence serves the canonical Polygon Amoy USDC contract only — refusing to observe ${contract} under a USDC label.`
+            );
             const addr = normalizeAddress(address);
             let resp;
             try {
@@ -246,12 +260,63 @@ function createTatumV4TestnetBalanceProvider(config = {}) {
                     { payloadType: payload === null ? 'null' : typeof payload }
                 );
             }
-            const entry = payload.result.find(
-                (e) => e && normalizeAddress(e.tokenAddress) === contract
-            ) || null;
+            // §REVIEW-R2 — response identity BEFORE any absence conclusion:
+            // every entry on the page must belong to the requested chain and
+            // the requested wallet. A portfolio containing an entry for a
+            // different chain or a different address means the provider
+            // response cannot be bound to this request, so its "no USDC
+            // entry" signal is untrustworthy — fail closed instead of
+            // concluding absence.
+            for (const e of payload.result) {
+                if (!e || typeof e !== 'object') throw new CustodyEvidenceError(
+                    EVIDENCE_ERRORS.MALFORMED_RESPONSE,
+                    'Provider v4 portfolio entry is not an object.',
+                    { entryType: e === null ? 'null' : typeof e }
+                );
+                if (String(e.chain || '').toLowerCase() !== String(tatumChain).toLowerCase()) {
+                    throw new CustodyEvidenceError(
+                        EVIDENCE_ERRORS.MALFORMED_RESPONSE,
+                        `Provider v4 portfolio page contains an entry for chain ${e.chain} — the request was for ${tatumChain}. Absence cannot be concluded (fail closed).`,
+                        { echoedChain: e.chain }
+                    );
+                }
+                if (normalizeAddress(e.address) !== addr) {
+                    throw new CustodyEvidenceError(
+                        EVIDENCE_ERRORS.MALFORMED_RESPONSE,
+                        'Provider v4 portfolio page contains an entry for a different address — absence cannot be concluded (fail closed).',
+                        { echoed: e.address }
+                    );
+                }
+            }
+            const matches = payload.result.filter((e) => normalizeAddress(e.tokenAddress) === contract);
+            if (matches.length > 1) throw new CustodyEvidenceError(
+                EVIDENCE_ERRORS.MALFORMED_RESPONSE,
+                `Provider v4 portfolio returned ${matches.length} ambiguous entries for the requested token contract.`,
+                { matchCount: matches.length }
+            );
+            const entry = matches[0] || null;
+            // §REVIEW-R1 — pagination: absence is only conclusive on a
+            // COMPLETE response. The wallet-portfolio API is paginated
+            // (verified live: `nextPage` is null/'' when there are no more
+            // pages, a non-empty cursor otherwise). If the requested token
+            // is not on the fetched page and the provider indicates more
+            // pages, the wallet may hold the token on a later page — a zero
+            // here would be a FALSE zero. Fail closed instead (review
+            // guidance: validate all pages or fail closed on an incomplete
+            // response; the conservative branch is fail-closed).
+            const hasMorePages = payload.nextPage != null && String(payload.nextPage) !== '';
+            if (!entry && hasMorePages) {
+                throw new CustodyEvidenceError(
+                    EVIDENCE_ERRORS.MALFORMED_RESPONSE,
+                    'Incomplete paginated provider response: the requested token is not on the fetched page and the provider indicates more pages — absence cannot be concluded, refusing to fabricate a zero (fail closed).',
+                    { nextPage: String(payload.nextPage) }
+                );
+            }
             // Absent token entry = the wallet holds ZERO of the requested
             // token (a legal balance), mirroring the v3 source where a zero
-            // balance is returned as "0".
+            // balance is returned as "0". Reaching here means the page was
+            // complete (no more pages) AND every entry was bound to this
+            // request — absence is now a trustworthy zero.
             if (!entry) {
                 return {
                     source: SOURCE_BALANCE_TESTNET,
@@ -267,6 +332,15 @@ function createTatumV4TestnetBalanceProvider(config = {}) {
                     raw: { absent: true, chain: tatumChain },
                 };
             }
+            // §REVIEW-R3 — the matched entry must be the expected FUNGIBLE
+            // token type. The request asks tokenTypes=fungible; an entry of
+            // any other type (native, nft, multitoken, unknown) must never be
+            // accepted as the token balance of a fungible USDC position.
+            if (entry.type !== 'fungible') throw new CustodyEvidenceError(
+                EVIDENCE_ERRORS.MALFORMED_RESPONSE,
+                `Matched provider portfolio entry type "${entry.type}" is not the expected fungible token type.`,
+                { echoedType: entry.type }
+            );
             // Bind the response to exactly what was requested — fail closed.
             if (String(entry.chain || '').toLowerCase() !== String(tatumChain).toLowerCase()) {
                 throw new CustodyEvidenceError(

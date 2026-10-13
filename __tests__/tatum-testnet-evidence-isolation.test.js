@@ -24,6 +24,9 @@
 //      accepted — while mainnet observations still flow (REAL POSTGRESQL).
 //   5. Testnet evidence can therefore never enter accepted mainnet
 //      custody-account evidence or a Proof-of-Reserves numerator.
+//   6. Review hardening (r1–r3): paginated responses never yield false zeros;
+//      entry identity is validated BEFORE absence is concluded; only the
+//      canonical Amoy USDC contract with a fungible type is ever labeled USDC.
 // =============================================================================
 
 const { Prisma, PrismaClient } = require('@prisma/client');
@@ -198,6 +201,111 @@ describe('§TATUM-TESTNET v4 wallet-portfolio provider (offline, live shapes)', 
         expect(Object.values(TATUM_V4_CHAIN_TESTNET)).toEqual(['polygon-amoy']);
         expect(TATUM_V4_CHAIN_TESTNET.POLYGON).toBeUndefined();
         expect(TATUM_V4_CHAIN_TESTNET.POLYGON_MAINNET).toBeUndefined();
+    });
+});
+
+// ── 1b. §REVIEW r1–r3 hardening: pagination, identity-before-absence, USDC identity ──
+describe('§TATUM-TESTNET review hardening — pagination, absence identity, USDC identity', () => {
+    const get = async (http, opts = {}) => {
+        const p = makeTestnetProvider(http);
+        return p.getBalance({
+            network: 'POLYGON_TESTNET',
+            contractAddress: USDC_AMOY,
+            address: HOLDER,
+            decimals: 6,
+            ...opts,
+        });
+    };
+    /** A complete live-shape page WITHOUT the USDC entry (an unrelated native token). */
+    const pageWithoutUsdc = (nextPage) => ({
+        data: {
+            result: [{ chain: 'polygon-amoy', address: HOLDER, balance: '2.394863274000720944', denominatedBalance: '2394863274000720944', decimals: 18, type: 'native' }],
+            prevPage: '',
+            nextPage,
+        },
+    });
+
+    // ── r1: pagination and false-zero prevention ──
+    it('r1: NEVER returns zero when the token is absent from the page but nextPage indicates more results (later-page USDC)', async () => {
+        // The target USDC entry lives on a LATER page; page 1 has only an
+        // unrelated token and a non-empty nextPage cursor. A zero here would
+        // be a fabricated false zero — the provider must fail closed.
+        const http = fakeHttp(() => pageWithoutUsdc('b2xYcGVyc2VhbF9jdXJzb3I='));
+        await expect(get(http)).rejects.toMatchObject({ code: EVIDENCE_ERRORS.MALFORMED_RESPONSE });
+    });
+
+    it('r1: an EMPTY first page with a nextPage cursor also fails closed (no zero)', async () => {
+        const http = fakeHttp(() => ({ data: { result: [], prevPage: '', nextPage: 'b2xY' } }));
+        await expect(get(http)).rejects.toMatchObject({ code: EVIDENCE_ERRORS.MALFORMED_RESPONSE });
+    });
+
+    it('r1: a token FOUND on the first page still returns its balance even when nextPage indicates more pages', async () => {
+        // Presence on the fetched page is valid evidence; later pages can
+        // only hold OTHER tokens — absence is not being concluded here.
+        const http = fakeHttp(() => ({ data: { result: [livePortfolioEntry()], prevPage: '', nextPage: 'b2xY' } }));
+        const obs = await get(http);
+        expect(obs.balanceBaseUnits).toBe(20000000008929275n);
+        expect(obs.raw.absent).toBeUndefined();
+    });
+
+    it('r1: absence on a COMPLETE page (nextPage null OR empty string) still observes a legal zero', async () => {
+        // Verified live 2026-10-13: no-more-pages is signalled by nextPage
+        // being null OR the empty string.
+        const a = fakeHttp(() => pageWithoutUsdc(null));
+        expect((await get(a)).balanceBaseUnits).toBe(0n);
+        const b = fakeHttp(() => pageWithoutUsdc(''));
+        expect((await get(b)).balanceBaseUnits).toBe(0n);
+    });
+
+    // ── r2: response identity BEFORE absence handling ──
+    it('r2: token absent but a returned entry is for the WRONG CHAIN — fails closed, never zero', async () => {
+        const http = fakeHttp(() => ({
+            data: { result: [{ chain: 'polygon-mainnet', address: HOLDER, balance: '5.0', denominatedBalance: '5000000', decimals: 6, tokenAddress: '0x3c499c542cef5e3811e1192ce70d8cc03d5c3359', type: 'fungible' }], prevPage: '', nextPage: '' },
+        }));
+        await expect(get(http)).rejects.toMatchObject({ code: EVIDENCE_ERRORS.MALFORMED_RESPONSE });
+    });
+
+    it('r2: token absent but a returned entry is for the WRONG ADDRESS — fails closed, never zero', async () => {
+        const http = fakeHttp(() => ({
+            data: { result: [{ chain: 'polygon-amoy', address: '0x0000000000000000000000000000000000000001', balance: '5.0', denominatedBalance: '5000000', decimals: 6, tokenAddress: USDC_AMOY, type: 'fungible' }], prevPage: '', nextPage: '' },
+        }));
+        await expect(get(http)).rejects.toMatchObject({ code: EVIDENCE_ERRORS.MALFORMED_RESPONSE });
+    });
+
+    it('r2: identity validation fires even when a nextPage cursor is present (fail closed either way)', async () => {
+        const http = fakeHttp(() => ({
+            data: { result: [{ chain: 'polygon-mainnet', address: HOLDER, balance: '5.0', denominatedBalance: '5000000', decimals: 6, tokenAddress: '0x3c499c542cef5e3811e1192ce70d8cc03d5c3359', type: 'fungible' }], prevPage: '', nextPage: 'b2xY' },
+        }));
+        await expect(get(http)).rejects.toMatchObject({ code: EVIDENCE_ERRORS.MALFORMED_RESPONSE });
+    });
+
+    // ── r3: USDC contract identity and fungible token type ──
+    it('r3: refuses to observe ANY contract other than the canonical Polygon Amoy USDC — no HTTP call is made', async () => {
+        let calls = 0;
+        const http = fakeHttp(() => { calls += 1; return { data: { result: [livePortfolioEntry()], prevPage: '', nextPage: '' } }; });
+        const arbitrary = '0x1111111111111111111111111111111111111111';
+        await expect(get(http, { contractAddress: arbitrary })).rejects.toMatchObject({ code: EVIDENCE_ERRORS.CONFIGURATION_ERROR });
+        // even a one-character drift of the canonical contract is refused:
+        await expect(get(http, { contractAddress: '0x41e94eb019c0762f9bfcf9fb1e58725bfb0e7583' })).rejects.toMatchObject({ code: EVIDENCE_ERRORS.CONFIGURATION_ERROR });
+        expect(calls).toBe(0); // the gate fires BEFORE any provider request
+    });
+
+    it('r3: a matched entry whose type is not fungible is rejected (nft / native / unknown types)', async () => {
+        for (const type of ['nft', 'native', 'multitoken', null, undefined]) {
+            const http = fakeHttp(() => ({ data: { result: [Object.assign(livePortfolioEntry(), { type })], prevPage: '', nextPage: '' } }));
+            await expect(get(http)).rejects.toMatchObject({ code: EVIDENCE_ERRORS.MALFORMED_RESPONSE });
+        }
+    });
+
+    it('r3: duplicate entries for the requested token contract are ambiguous and fail closed', async () => {
+        const http = fakeHttp(() => ({ data: { result: [livePortfolioEntry(), livePortfolioEntry({ balance: '1.000000', denominatedBalance: '1000000' })], prevPage: '', nextPage: '' } }));
+        await expect(get(http)).rejects.toMatchObject({ code: EVIDENCE_ERRORS.MALFORMED_RESPONSE });
+    });
+
+    it('r3: the canonical contract gate is case-insensitive (EIP-55 checksums normalize to the same identity)', async () => {
+        const http = fakeHttp(() => ({ data: { result: [livePortfolioEntry()], prevPage: '', nextPage: '' } }));
+        const obs = await get(http, { contractAddress: USDC_AMOY.toUpperCase() });
+        expect(obs.balanceBaseUnits).toBe(20000000008929275n);
     });
 });
 
