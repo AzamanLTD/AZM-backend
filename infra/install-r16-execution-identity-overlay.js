@@ -1,7 +1,13 @@
 #!/usr/bin/env node
 // Idempotent additive installer for the r16 smart-route execution identity
 // (audit P0-A, 2026-09-20). Mirrored by
-// prisma/migrations/20260920170000_r16_smartroute_execution_identity/migration.sql.
+// prisma/migrations/20260920170000_r16_smartroute_execution_identity/migration.sql
+// and prisma/migrations/20260920210000_r16c_smartroute_awaiting_reconciliation/migration.sql:
+// production enum values are installed ONLY through this overlay (db push
+// owns greenfield; the release chain owns convergence), so the r16c lease
+// and reconciliation values must be added here too — a production branch
+// whose enum predates r16c otherwise rejects every lease/reconciliation
+// query with 22P02 (observed on the original production branch 2026-10-13).
 //
 // Production is db-push managed, so the enum value, the unique columns and
 // their indexes are installed idempotently here at release time. Running
@@ -16,6 +22,16 @@ const prisma = new PrismaClient();
 const STATEMENTS = [
   `DO $$ BEGIN
     ALTER TYPE "SmartRouteRunStatus" ADD VALUE IF NOT EXISTS 'PENDING';
+  EXCEPTION
+    WHEN duplicate_object THEN NULL;
+  END $$;`,
+  `DO $$ BEGIN
+    ALTER TYPE "SmartRouteRunStatus" ADD VALUE IF NOT EXISTS 'EXECUTING';
+  EXCEPTION
+    WHEN duplicate_object THEN NULL;
+  END $$;`,
+  `DO $$ BEGIN
+    ALTER TYPE "SmartRouteRunStatus" ADD VALUE IF NOT EXISTS 'AWAITING_RECONCILIATION';
   EXCEPTION
     WHEN duplicate_object THEN NULL;
   END $$;`,
