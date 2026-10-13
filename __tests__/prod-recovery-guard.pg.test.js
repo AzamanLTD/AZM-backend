@@ -85,6 +85,12 @@ describe('prod-recovery workflow graph contract', () => {
         expect(runtimeInstaller).toContain('CREATE TABLE IF NOT EXISTS "LedgerAccount"');
         expect(runtimeInstaller).toContain('CREATE TABLE IF NOT EXISTS "LedgerTransaction"');
         expect(runtimeInstaller).toContain('CREATE TABLE IF NOT EXISTS "RestrictedObligation"');
+        for (const entryType of [
+            'ESCROW_DISPUTE', 'SUSU_SEIZURE', 'SUSU_REFUND', 'VENDOR_TOPUP',
+            'VENDOR_ALLOCATE', 'CUSTODY_VERIFICATION', 'CUSTODY_REJECTION',
+        ]) {
+            expect(runtimeInstaller).toContain(`ADD VALUE IF NOT EXISTS '${entryType}'`);
+        }
         expect(runtimeInstaller).not.toContain('UPDATE "GlobalSettings"');
         expect(custodyExecutionInstaller).toContain('CREATE TABLE IF NOT EXISTS "CustodyExecution"');
         expect(custodyAccountingInstaller).toContain('CREATE TABLE IF NOT EXISTS "CustodyAccount"');
@@ -439,6 +445,19 @@ run('prod-recovery guard helper (real PostgreSQL)', () => {
             last_external_sync: true,
             journal_ledger_link: true,
         });
+
+        const requiredEntryTypes = [
+            'ESCROW_DISPUTE', 'SUSU_SEIZURE', 'SUSU_REFUND', 'VENDOR_TOPUP',
+            'VENDOR_ALLOCATE', 'CUSTODY_VERIFICATION', 'CUSTODY_REJECTION',
+        ];
+        const enumRows = await db.$queryRawUnsafe(
+            `SELECT e.enumlabel FROM pg_enum e
+             JOIN pg_type t ON t.oid = e.enumtypid
+             WHERE t.typname = 'JournalEntryType' AND e.enumlabel = ANY($1::text[])
+             ORDER BY e.enumlabel`,
+            requiredEntryTypes,
+        );
+        expect(enumRows.map((row) => row.enumlabel)).toEqual([...requiredEntryTypes].sort());
     });
 
     test('verify passes end-to-end on the fully provisioned database', async () => {
