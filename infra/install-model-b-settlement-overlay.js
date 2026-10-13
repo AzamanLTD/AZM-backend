@@ -11,6 +11,87 @@ const logger = require('../src/config/logger');
 const prisma = new PrismaClient();
 
 const STATEMENTS = [
+  // P5-B inventory substrate. Production does not run Prisma db-push, so the
+  // P5-E installer must provision the substrate it extends on first install.
+  // These are additive/idempotent mirrors of migration 20260918200000_p5b_inventory_lots.
+  `ALTER TYPE "JournalEntryType" ADD VALUE IF NOT EXISTS 'INVENTORY_ACQUISITION';`,
+  `DO $azminventory$ BEGIN
+    IF NOT EXISTS (
+      SELECT 1 FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace
+      WHERE n.nspname = 'public' AND t.typname = 'InventoryLotStatus'
+    ) THEN
+      CREATE TYPE "InventoryLotStatus" AS ENUM ('OPEN', 'CONSUMED');
+    END IF;
+  END $azminventory$;`,
+  `CREATE TABLE IF NOT EXISTS "InventoryLot" (
+    "id" SERIAL NOT NULL,
+    "acquisitionKey" VARCHAR(140) NOT NULL,
+    "sourceType" VARCHAR(40) NOT NULL,
+    "sourceReference" VARCHAR(140) NOT NULL,
+    "quantityOriginal" DECIMAL(20,8) NOT NULL,
+    "quantityRemaining" DECIMAL(20,8) NOT NULL,
+    "costBasisGhs" DECIMAL(20,8) NOT NULL,
+    "acquisitionRate" DECIMAL(18,8),
+    "ledgerTxnId" TEXT,
+    "status" "InventoryLotStatus" NOT NULL DEFAULT 'OPEN',
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT "InventoryLot_pkey" PRIMARY KEY ("id")
+  );`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS "InventoryLot_acquisitionKey_key"
+    ON "InventoryLot"("acquisitionKey");`,
+  `CREATE TABLE IF NOT EXISTS "InventoryLotConsumption" (
+    "id" SERIAL NOT NULL,
+    "consumptionKey" VARCHAR(140) NOT NULL,
+    "lotId" INTEGER NOT NULL,
+    "quantity" DECIMAL(20,8) NOT NULL,
+    "purpose" VARCHAR(40) NOT NULL,
+    "sourceReference" VARCHAR(140),
+    "ledgerTxnId" TEXT,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT "InventoryLotConsumption_pkey" PRIMARY KEY ("id")
+  );`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS "InventoryLotConsumption_consumptionKey_key"
+    ON "InventoryLotConsumption"("consumptionKey");`,
+  `CREATE INDEX IF NOT EXISTS "InventoryLotConsumption_lotId_idx"
+    ON "InventoryLotConsumption"("lotId");`,
+  `DO $azminventory$ BEGIN
+    IF NOT EXISTS (
+      SELECT 1 FROM pg_constraint
+      WHERE conname = 'InventoryLotConsumption_lotId_fkey'
+        AND conrelid = '"InventoryLotConsumption"'::regclass
+    ) THEN
+      ALTER TABLE "InventoryLotConsumption"
+        ADD CONSTRAINT "InventoryLotConsumption_lotId_fkey"
+        FOREIGN KEY ("lotId") REFERENCES "InventoryLot"("id")
+        ON DELETE RESTRICT ON UPDATE CASCADE;
+    END IF;
+  END $azminventory$;`,
+  `DO $azminventory$ BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+      WHERE conname = 'InventoryLot_qty_positive_check'
+        AND conrelid = '"InventoryLot"'::regclass) THEN
+      ALTER TABLE "InventoryLot" ADD CONSTRAINT "InventoryLot_qty_positive_check"
+        CHECK ("quantityOriginal" > 0);
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+      WHERE conname = 'InventoryLot_remaining_bounds_check'
+        AND conrelid = '"InventoryLot"'::regclass) THEN
+      ALTER TABLE "InventoryLot" ADD CONSTRAINT "InventoryLot_remaining_bounds_check"
+        CHECK ("quantityRemaining" >= 0 AND "quantityRemaining" <= "quantityOriginal");
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+      WHERE conname = 'InventoryLot_cost_positive_check'
+        AND conrelid = '"InventoryLot"'::regclass) THEN
+      ALTER TABLE "InventoryLot" ADD CONSTRAINT "InventoryLot_cost_positive_check"
+        CHECK ("costBasisGhs" > 0);
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM pg_constraint
+      WHERE conname = 'InventoryLotConsumption_qty_positive_check'
+        AND conrelid = '"InventoryLotConsumption"'::regclass) THEN
+      ALTER TABLE "InventoryLotConsumption" ADD CONSTRAINT "InventoryLotConsumption_qty_positive_check"
+        CHECK ("quantity" > 0);
+    END IF;
+  END $azminventory$;`,
   `ALTER TABLE "GlobalSettings"
      ADD COLUMN IF NOT EXISTS "modelBSettlementEnabled" BOOLEAN NOT NULL DEFAULT false;`,
 

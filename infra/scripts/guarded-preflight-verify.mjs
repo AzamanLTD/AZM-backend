@@ -47,7 +47,7 @@ const DEFAULT_EXPECTED_DB = 'neondb';
 // Installer-owned tables (missing on the branch, created by the sequence):
 //   r42 -> FinancialOperation; payment-requests -> PaymentRequest;
 //   business-price -> BusinessPrice; fiat-liquidity -> Fiat* x4;
-//   model-b-settlement -> ModelBSettlement, InventoryLot;
+//   model-b-settlement -> ModelBSettlement, InventoryLot, InventoryLotConsumption;
 //   payout-reconciliation -> ProviderSettlementAttempt, ReconciliationException.
 // Installer-owned columns (missing on the branch, added by the sequence):
 //   payout-reconciliation -> Withdrawal.transactionHistoryId
@@ -75,7 +75,7 @@ const DEFAULT_EXPECTED_DB = 'neondb';
 // OUT OF SCOPE (prisma-schema objects with NO production installer — missing on
 // BOTH audited databases, NOT provisioned by the reviewed sequence, and NOT
 // verified here; the backend demonstrably runs without them):
-//   LedgerAccount, LedgerTransaction, RestrictedObligation, InventoryLotConsumption,
+//   LedgerAccount, LedgerTransaction, RestrictedObligation,
 //   AdminRoleAssignment, CustodyAccount/CustodyEvidence/CustodyExecution/CustodyMovement
 //   (custody installers are not part of the release chain),
 //   GlobalSettings.lastAdminSetAt/lastEchoAt/lastExternalSync,
@@ -90,7 +90,7 @@ const DEFAULT_EXPECTED_DB = 'neondb';
 const AUDITED_TABLES = [
   'FinancialOperation', 'PaymentRequest', 'BusinessPrice',
   'FiatLiquidityReceipt', 'FiatLiquidityReservation', 'FiatLiquidityState', 'FiatProviderEvent',
-  'ModelBSettlement', 'InventoryLot', 'ProviderSettlementAttempt', 'ReconciliationException',
+  'ModelBSettlement', 'InventoryLot', 'InventoryLotConsumption', 'ProviderSettlementAttempt', 'ReconciliationException',
 ];
 
 const AUDITED_COLUMNS = [
@@ -117,6 +117,10 @@ const AUDITED_INDEXES = [
   'ProviderSettlementAttempt_provider_providerReference_key',
   'ReconciliationException_entity_reason_open_key',
   'business_price_current_unique',
+  'InventoryLot_acquisitionKey_key',
+  'InventoryLotConsumption_consumptionKey_key',
+  'InventoryLotConsumption_lotId_idx',
+  'InventoryLot_eligible_status_idx',
 ];
 
 // Baseline-preservation set: important existing business/financial tables whose
