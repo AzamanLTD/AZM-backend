@@ -33,6 +33,9 @@ const logger = require('../../src/config/logger');
 const DEFAULT_LIMIT = 24;
 const MAX_LIMIT = 50;
 const MAX_QUERY_LEN = 100;
+// §3.1 repeatable taxonomy chips: bound the IN-list a single request can
+// demand so a crafted query cannot demand an unbounded chip OR.
+const MAX_TAXONOMY_CHIPS = 10;
 // §3.2: cursor pagination is cursor-only (no offset scan amplification).
 // Rounds bound the window-filter refill loop: each round fetches (need+1)
 // where-eligible rows and post-filters section windows; the loop exits early
@@ -128,18 +131,41 @@ function encodeCursor(row) {
     })).toString('base64url');
 }
 
+// Cursor input safety: a cursor is untrusted client input. Everything a
+// crafted cursor could push into the Prisma query is validated BEFORE the
+// query is constructed — out-of-range/NaN timestamps, non-finite or
+// negative counts, and oversized/empty id strings are all rejected as
+// malformed (→ 422), never surfaced as a Prisma 500.
+const CURSOR_RAW_MAX_LEN = 4096;   // base64url envelope cap, checked pre-decode
+const CURSOR_ID_MAX_LEN = 64;      // cuid/uuid-sized, plus headroom
+// ECMAScript/PostgreSQL Date range bound: |ms| beyond ±8.64e15 is not a
+// valid Date, and new Date(NaN) must never reach the query either.
+const MAX_DATE_MS = 8640000000000000;
+
 function decodeCursor(raw) {
+    if (typeof raw !== 'string' || raw.length === 0 || raw.length > CURSOR_RAW_MAX_LEN) return null;
     let parsed;
     try {
-        parsed = JSON.parse(Buffer.from(String(raw), 'base64url').toString('utf8'));
+        parsed = JSON.parse(Buffer.from(raw, 'base64url').toString('utf8'));
     } catch {
         return null;
     }
-    if (!parsed || parsed.v !== CURSOR_VERSION) return null;
+    if (!parsed || typeof parsed !== 'object' || parsed.v !== CURSOR_VERSION) return null;
     if (!Number.isInteger(parsed.o) || !Number.isInteger(parsed.c) || typeof parsed.i !== 'string') {
         return null;
     }
-    return { totalOrders: parsed.o, createdAt: new Date(parsed.c), id: parsed.i };
+    // totalOrders is a non-negative count: reject negatives and values beyond
+    // 2^53-1 (Number.MAX_SAFE_INTEGER) so the bound is never a float lie.
+    if (parsed.o < 0 || parsed.o > Number.MAX_SAFE_INTEGER) return null;
+    // createdAt must land inside the valid Date range (both ECMAScript and
+    // PostgreSQL timestamp bounds): reject NaN-date integers and out-of-
+    // range epochs before they reach the query.
+    if (!Number.isSafeInteger(parsed.c) || Math.abs(parsed.c) >= MAX_DATE_MS) return null;
+    const createdAt = new Date(parsed.c);
+    if (Number.isNaN(createdAt.getTime())) return null;
+    // id participates in a gt comparison — cap its length.
+    if (parsed.i.length === 0 || parsed.i.length > CURSOR_ID_MAX_LEN) return null;
+    return { totalOrders: parsed.o, createdAt, id: parsed.i };
 }
 
 function afterKeyWhere(key) {
@@ -185,10 +211,13 @@ function isRedisReady(client) {
 }
 
 function cacheKey(params) {
+    // The taxonomy list is normalized (sorted — parseParams already deduped)
+    // so chip order does not fragment the cache for the same membership set.
+    const taxonomies = [...(params.taxonomies || [])].sort();
     const normalized = [
         params.category || '',
         params.q || '',
-        params.taxonomy || '',
+        taxonomies.join(','),
         params.city || '',
         params.region || '',
         String(params.limit),
@@ -252,7 +281,7 @@ function invalidateDiscoveryFeedCache() {
 // batch, grouped by section) because "HH:MM" strings + wrap windows are not
 // a Prisma predicate; the refill loop keeps pages exact despite the filter.
 
-function buildWhere({ category, q, taxonomy, city, region, key }) {
+function buildWhere({ category, q, taxonomies, city, region, key }) {
     const AND = [];
 
     // Product category inherits from the profile when null (schema comment).
@@ -275,9 +304,10 @@ function buildWhere({ category, q, taxonomy, city, region, key }) {
     }
 
     // A specific chip NEVER surfaces UNMAPPED sections (§4); the chip filter
-    // implies the section must exist and be active.
-    if (taxonomy) {
-        AND.push({ catalogSection: { isActive: true, taxonomy } });
+    // implies the section must exist and be active. Repeatable chips OR
+    // together (set membership) — deterministic regardless of request order.
+    if (taxonomies && taxonomies.length > 0) {
+        AND.push({ catalogSection: { isActive: true, taxonomy: { in: taxonomies } } });
     }
 
     if (city || region) {
@@ -298,7 +328,7 @@ function buildWhere({ category, q, taxonomy, city, region, key }) {
     // item has no section constraint (general feed). A taxonomy chip filter
     // already implies an active section via its own AND clause, so this OR is
     // only needed without one.
-    if (!taxonomy) {
+    if (!taxonomies || taxonomies.length === 0) {
         AND.push({
             OR: [
                 { catalogSectionId: null },
@@ -362,18 +392,103 @@ function serializeRank(product) {
     return { score: Number(score.toFixed(4)), label: null };
 }
 
-function serializeVariantGhs(rawVariants) {
-    // Variants/modifierGroups pass through as stored — they are validated at
-    // write time by storefrontProductConfigurationService + the GHS delta
-    // validation in businessPriceService. priceDeltaGhs stays an exact 2dp
-    // STRING end-to-end; the USDC priceDelta keeps its own independent
-    // meaning (companion contract §1.1 — the two deltas are never converted
-    // into each other).
-    if (!rawVariants) return null;
-    return rawVariants;
+// ─── variant/modifier GHS truth (READ-TIME VALIDATION, fail closed) ────────
+//
+// WRITE-PATH AUDIT (2026-10-14, review correction #3): the product write
+// services (businessProductService._cleanOptionRows/_cleanModifierGroups and
+// storefrontProductConfigurationService.normalizedOptionList) whitelist
+// {name, priceDelta} and DISCARD any priceDeltaGhs — no sanctioned write path
+// persists GHS deltas yet, and validateGhsDeltas had ZERO wired callers. The
+// earlier "validated at write time" claim on a pass-through serializer was
+// therefore FALSE and is withdrawn: the READ path is the gate. The feed is
+// the only P1 consumer of priceDeltaGhs, so the validation authority lives
+// HERE:
+//   • every option carrying priceDeltaGhs must be a 2dp-precision decimal
+//     STRING within the configured delta bounds (a JSON number, a >2dp
+//     value, or garbage is a corrupt configuration);
+//   • the whole configuration must pass the price service's
+//     validateGhsDeltas against the item's resolved base GHS price (the
+//     worst-case all-negative-deltas selection must stay a positive price);
+//   • valid deltas are reserialized as the EXACT 2dp canonical decimal
+//     string ("5" → "5.00", "-1.5" → "-1.50");
+//   • ANY violation excludes the item from the feed (fail closed per
+//     identity, loud log) — never a partial DTO, never a silent delta drop,
+//     never a 500.
+// The USDC priceDelta passes through unchanged: it keeps its own independent
+// meaning (companion contract §1.1 — the two deltas are never converted into
+// each other).
+//
+// When a portal write path for GHS deltas ships (P2+), it MUST wire
+// validateGhsDeltas at write time too; until then this read gate keeps
+// direct-DB or legacy rows out of the public surface.
+
+function _optionsOf(group) {
+    if (Array.isArray(group?.options)) return group.options;
+    if (Array.isArray(group?.values)) return group.values;
+    return [];
+}
+
+function _groupsOf(raw) {
+    if (!Array.isArray(raw)) return [];
+    return raw;
+}
+
+// Returns the validated, canonically reserialized groups, or null when the
+// product carries no variant/modifier data. Throws priceService.
+// BusinessPriceError on any corrupt configuration (caller excludes the item).
+function serializeOptionGroupsGhs(rawGroups) {
+    if (!Array.isArray(rawGroups) || rawGroups.length === 0) return null;
+    return rawGroups.map((group) => {
+        const out = {
+            name: group?.name,
+            ...(group?.required !== undefined ? { required: group.required } : {}),
+            ...(group?.maxSelection !== undefined ? { maxSelection: group.maxSelection } : {}),
+            options: _optionsOf(group).map((option) => {
+                const reserialized = { ...option };
+                if (option && typeof option === 'object' && Object.prototype.hasOwnProperty.call(option, 'priceDeltaGhs')
+                    && option.priceDeltaGhs !== undefined && option.priceDeltaGhs !== null) {
+                    if (typeof option.priceDeltaGhs !== 'string') {
+                        // Incorrectly typed (JSON number, bool, object…): the
+                        // approved contract is a decimal STRING — corrupt.
+                        throw new priceService.BusinessPriceError('GHS_DELTA_NOT_A_STRING',
+                            'priceDeltaGhs must be an exact 2dp decimal STRING');
+                    }
+                    const d = priceService.parseGhsDecimal(option.priceDeltaGhs, { field: 'priceDeltaGhs', allowNegative: true });
+                    // Exact canonical 2dp string end-to-end.
+                    reserialized.priceDeltaGhs = priceService.pesewasToGhsString(priceService.toPesewas(d));
+                }
+                return reserialized;
+            }),
+        };
+        return out;
+    });
+}
+
+function serializeVariantGhs(rawVariants, rawModifierGroups, baseGhs) {
+    const hasVariants = Array.isArray(rawVariants) && rawVariants.length > 0;
+    const hasModifiers = Array.isArray(rawModifierGroups) && rawModifierGroups.length > 0;
+    if (!hasVariants && !hasModifiers) return null;
+
+    // Canonicalize (validates typing + precision per delta) BEFORE the
+    // whole-config check, so the base is compared against canonically
+    // reserialized deltas — then run the price service's own authority for
+    // bounds + the positive-final-price invariant.
+    const variantsOut = serializeOptionGroupsGhs(rawVariants);
+    const modifiersOut = serializeOptionGroupsGhs(rawModifierGroups);
+    priceService.validateGhsDeltas({
+        baseGhs,
+        variants: variantsOut ?? undefined,
+        modifierGroups: modifiersOut ?? undefined,
+    });
+    return { variants: variantsOut, modifierGroups: modifiersOut };
 }
 
 function buildItemDto(product, priceRow, windowOpenBySection) {
+    // READ-TIME GHS delta authority (see serializeVariantGhs block): a corrupt
+    // variant/modifier configuration throws here and the caller EXCLUDES the
+    // item (fail closed per identity) — it never reaches the DTO partially
+    // validated, and the feed never 500s on one bad row.
+    const variantData = serializeVariantGhs(product.variants, product.modifierGroups, priceRow.amountExact);
     const pricing = {
         // Exact 2dp string straight from the effective BusinessPrice row —
         // string, not number, so no client ever floats it (companion §3.2).
@@ -408,7 +523,8 @@ function buildItemDto(product, priceRow, windowOpenBySection) {
             tags: product.tags,
         },
         pricing,
-        variants: serializeVariantGhs(product.variants),
+        variants: variantData?.variants ?? null,
+        modifierGroups: variantData?.modifierGroups ?? null,
         availability: {
             isAvailable: product.isAvailable, // where-enforced true; stored truth reported
             sectionWindowOpen,
@@ -452,7 +568,21 @@ function parseParams(raw) {
     }
     params.q = q || null;
 
-    params.taxonomy = raw.taxonomy ? String(raw.taxonomy).trim() : null;
+    // §3.1: `taxonomy` is a REPEATABLE parameter (?taxonomy=MEALS&taxonomy=
+    // DRINKS). Express's query parser yields an array for repeats and a
+    // string for a single value; both are accepted. A comma-list inside one
+    // value is NOT a taxonomy split — it is simply an unknown id → 422
+    // (no silent fuzzy parsing of client input).
+    params.taxonomies = [];
+    const rawTaxonomies = raw.taxonomy == null ? [] : Array.isArray(raw.taxonomy) ? raw.taxonomy : [raw.taxonomy];
+    for (const t of rawTaxonomies) {
+        const value = String(t).trim();
+        if (!value) continue;
+        if (!params.taxonomies.includes(value)) params.taxonomies.push(value); // dedupe, first-seen order
+    }
+    if (params.taxonomies.length > MAX_TAXONOMY_CHIPS) {
+        throw new DiscoveryParamError('taxonomy', `at most ${MAX_TAXONOMY_CHIPS} taxonomy filters per request`);
+    }
     params.city = raw.city ? String(raw.city).trim().slice(0, 100) : null;
     params.region = raw.region ? String(raw.region).trim().slice(0, 100) : null;
 
@@ -464,6 +594,9 @@ function parseParams(raw) {
     params.limit = limit;
 
     if (raw.cursor) {
+        if (String(raw.cursor).length > CURSOR_RAW_MAX_LEN) {
+            throw new DiscoveryParamError('cursor', 'cursor longer than ' + CURSOR_RAW_MAX_LEN + ' characters');
+        }
         const key = decodeCursor(raw.cursor);
         if (!key) throw new DiscoveryParamError('cursor', 'malformed or unsupported cursor');
         params.key = key;
@@ -486,11 +619,26 @@ async function searchDiscoveryItems(prisma, rawParams, { useCache = true } = {})
 
     // Taxonomy chips are validated against the canonical mapping table so a
     // typo never silently degrades to an empty feed, and an unknown chip is
-    // a 422, not a zero-item success.
-    if (params.taxonomy) {
-        const chip = await prisma.catalogSectionTaxonomy.findUnique({ where: { id: params.taxonomy } });
-        if (!chip || !chip.isActive) {
-            throw new DiscoveryParamError('taxonomy', `unknown or inactive taxonomy: ${params.taxonomy}`);
+    // a 422, not a zero-item success. Every requested id must be a known,
+    // ACTIVE chip. §4 reserved id: UNMAPPED means "no chip" — its items stay
+    // discoverable under the category's GENERAL feed (no taxonomy filter),
+    // but UNMAPPED is NOT a requestable chip (filtering "all unmapped
+    // sections" is not an owner-approved browse mode and would leak a
+    // moderation/debug surface). Requesting it is a 422.
+    if (params.taxonomies.length > 0) {
+        if (params.taxonomies.includes('UNMAPPED')) {
+            throw new DiscoveryParamError('taxonomy',
+                'UNMAPPED is not a requestable chip — unmapped sections appear only in the general feed');
+        }
+        const chips = await prisma.catalogSectionTaxonomy.findMany({
+            where: { id: { in: params.taxonomies } },
+            select: { id: true, isActive: true },
+        });
+        const activeIds = new Set(chips.filter((c) => c.isActive).map((c) => c.id));
+        const unknown = params.taxonomies.filter((t) => !activeIds.has(t));
+        if (unknown.length > 0) {
+            throw new DiscoveryParamError('taxonomy',
+                `unknown or inactive taxonomy: ${unknown.join(', ')}`);
         }
     }
 
@@ -567,7 +715,15 @@ async function runQuery(prisma, params) {
             logger.warn(`[DiscoveryFeed] product ${row.id} passed the price predicate but resolved no eligible GHS price — excluding (no fallback)`);
             continue;
         }
-        items.push(buildItemDto(row, priceRow, windowOpenBySection));
+        try {
+            items.push(buildItemDto(row, priceRow, windowOpenBySection));
+        } catch (err) {
+            if (err instanceof priceService.BusinessPriceError) {
+                logger.warn(`[DiscoveryFeed] product ${row.id} excluded — corrupt variant/modifier GHS configuration (${err.code ?? err.message})`);
+                continue; // fail closed per identity: never a 500, never a partial DTO
+            }
+            throw err;
+        }
     }
 
     return {
@@ -594,6 +750,8 @@ module.exports = {
         encodeCursor,
         decodeCursor,
         buildWhere,
+        serializeVariantGhs,
+        parseParams,
         VALID_CATEGORIES,
     },
 };

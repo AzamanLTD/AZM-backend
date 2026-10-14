@@ -36,10 +36,28 @@
 //   5. Discovery indexes (§3.3): the three composites the cross-business
 //      candidate query drives off — without them the Mix feed table-scans
 //      business_products/business_profiles as the marketplace grows.
+//      Indexes are built with CREATE INDEX CONCURRENTLY — a plain
+//      CREATE INDEX takes a WRITE lock and rewrites/holds the table on a
+//      live marketplace, so the concurrent build (no write-blocking) is the
+//      production-appropriate path. CONCURRENTLY cannot run inside a
+//      transaction, so index statements run OUTSIDE any transaction block
+//      as single autocommitted statements, and a build that fails midway
+//      (leaving an INVALID index) is detected via pg_index.indisvalid,
+//      dropped, and rebuilt on the next run — IF NOT EXISTS alone would
+//      silently keep an invalid index forever.
 //
 // Idempotent: safe to re-run on every deploy. CI runs this installer after
-// `db push` (CREATE … IF NOT EXISTS no-ops); the production release chain
-// runs it standalone.
+// `db push` (probes no-op); the production release chain runs it standalone.
+// The installer is exported as installMarketplaceDiscoveryOverlay(prisma) so
+// boot-time autoRelease can converge the same surface without a subprocess,
+// and runs as a CLI when invoked directly (`node infra/install-...`).
+//
+// LIVE-SERVICE ACTIVATION BLOCKER (DEPLOY_RUNBOOK.md, read before
+// enabling anything): the Render Free-plan path runs NEITHER
+// `npm run release` NOR `infra/autoRelease.js` — wiring this installer into
+// those chains does NOT provision the live database. See the "Marketplace
+// Mix discovery surface" runbook section for the supported provisioning
+// paths and the full activation-blocker list.
 
 const { PrismaClient } = require('@prisma/client');
 const logger = require('../src/config/logger');
@@ -83,6 +101,7 @@ const NAME_TO_TAXONOMY = new Map([
 const normalizeName = (name) =>
   String(name || '').toLowerCase().trim().replace(/\s+/g, ' ');
 
+// Transactional DDL — additive, idempotent, safe inside a transaction.
 const STATEMENTS = [
   // 1. Marketplace-visibility flag (§9 D-5) — additive column, default true.
   `ALTER TABLE "BusinessProfile"
@@ -104,17 +123,71 @@ const STATEMENTS = [
     "updatedAt" TIMESTAMP(3) NOT NULL,
     CONSTRAINT "CatalogSectionTaxonomy_pkey" PRIMARY KEY ("id")
   );`,
-
-  // 5. Discovery indexes (§3.3) — online CREATE INDEX, no lock rewrite.
-  `CREATE INDEX IF NOT EXISTS "business_product_discovery"
-     ON "BusinessProduct" ("category", "isActive", "isAvailable");`,
-  `CREATE INDEX IF NOT EXISTS "business_product_section_active"
-     ON "BusinessProduct" ("catalogSectionId", "isActive");`,
-  `CREATE INDEX IF NOT EXISTS "business_profile_eligible"
-     ON "BusinessProfile" ("category", "isSuspended", "isPausedByOwner");`,
 ];
 
-async function main() {
+// Discovery indexes (§3.3) — built CONCURRENTLY (no write-blocking lock), so
+// they CANNOT run inside a transaction block: each runs as a single
+// autocommitted statement, probed first for existence+validity so a failed
+// CONCURRENTLY build (invalid index) is dropped and rebuilt, and an already
+// valid index is left untouched.
+const CONCURRENT_INDEXES = [
+  {
+    name: 'business_product_discovery',
+    table: 'BusinessProduct',
+    columns: '("category", "isActive", "isAvailable")',
+  },
+  {
+    name: 'business_product_section_active',
+    table: 'BusinessProduct',
+    columns: '("catalogSectionId", "isActive")',
+  },
+  {
+    name: 'business_profile_eligible',
+    table: 'BusinessProfile',
+    columns: '("category", "isSuspended", "isPausedByOwner")',
+  },
+];
+
+// Probe one index: 'absent' | 'valid' | 'invalid' (a failed CONCURRENTLY
+// build leaves an index with indisvalid=false).
+async function indexState(prisma, indexName) {
+  const rows = await prisma.$queryRawUnsafe(
+    `SELECT c.relname AS name, i.indisvalid AS valid
+       FROM pg_index i
+       JOIN pg_class c ON c.oid = i.indexrelid
+      WHERE c.relname = $1`,
+    indexName
+  );
+  if (!rows || rows.length === 0) return 'absent';
+  return rows[0].valid === true ? 'valid' : 'invalid';
+}
+
+async function ensureConcurrentIndex(prisma, def) {
+  const state = await indexState(prisma, def.name);
+  if (state === 'valid') {
+    return 'kept';
+  }
+  if (state === 'invalid') {
+    // A previous concurrent build failed midway. IF NOT EXISTS would skip it
+    // forever, silently leaving the feed without the index — drop and rebuild.
+    logger.warn(`[marketplace-discovery-overlay] index ${def.name} exists but is INVALID — dropping and rebuilding`);
+    await prisma.$executeRawUnsafe(`DROP INDEX IF EXISTS "${def.name}";`);
+  }
+  // CONCURRENTLY cannot run inside a transaction block: this is a single
+  // autocommitted statement via $executeRawUnsafe (no explicit transaction,
+  // no $transaction wrapper). It does not block writes on the live table.
+  await prisma.$executeRawUnsafe(
+    `CREATE INDEX CONCURRENTLY IF NOT EXISTS "${def.name}"
+       ON "${def.table}" ${def.columns};`
+  );
+  const after = await indexState(prisma, def.name);
+  if (after !== 'valid') {
+    throw new Error(`index ${def.name} is ${after} after concurrent build — runbook: inspect pg_index.indisvalid for this name`);
+  }
+  return state === 'invalid' ? 'rebuilt' : 'created';
+}
+
+async function installMarketplaceDiscoveryOverlay(prisma) {
   for (const sql of STATEMENTS) {
     try {
       await prisma.$executeRawUnsafe(sql);
@@ -160,17 +233,49 @@ async function main() {
     mapped += 1;
   }
 
+  // Discovery indexes (§3.3) — concurrent, probe-first (see CONCURRENT_INDEXES).
+  let created = 0;
+  let rebuilt = 0;
+  let kept = 0;
+  for (const def of CONCURRENT_INDEXES) {
+    const outcome = await ensureConcurrentIndex(prisma, def);
+    if (outcome === 'created') created += 1;
+    else if (outcome === 'rebuilt') rebuilt += 1;
+    else kept += 1;
+  }
+
   logger.info(
     `[marketplace-discovery-overlay] discovery surface installed (idempotent): ` +
-    `${TAXONOMY_ROWS.length} taxonomy rows ensured, ${mapped} sections backfilled by name match`
+    `${TAXONOMY_ROWS.length} taxonomy rows ensured, ${mapped} sections backfilled by name match, ` +
+    `indexes: ${created} created, ${rebuilt} rebuilt, ${kept} kept valid`
   );
+
+  return {
+    taxonomyRows: TAXONOMY_ROWS.length,
+    sectionsBackfilled: mapped,
+    indexesCreated: created,
+    indexesRebuilt: rebuilt,
+    indexesKept: kept,
+  };
 }
 
-main()
-  .catch((error) => {
-    logger.error(`[marketplace-discovery-overlay] failed: ${error.message}`);
-    process.exitCode = 1;
-  })
-  .finally(async () => {
-    await prisma.$disconnect();
-  });
+// CLI wrapper — delegates to the same exported installer so the release
+// chain, CI and boot autoRelease all converge the IDENTICAL surface.
+async function main() {
+  return installMarketplaceDiscoveryOverlay(prisma);
+}
+
+// CLI entry (release chain / CI): runs standalone with its own Prisma client.
+// When required as a module (autoRelease), exports the installer instead.
+module.exports = { installMarketplaceDiscoveryOverlay };
+
+if (require.main === module) {
+  main()
+    .catch((error) => {
+      logger.error(`[marketplace-discovery-overlay] failed: ${error.message}`);
+      process.exitCode = 1;
+    })
+    .finally(async () => {
+      await prisma.$disconnect();
+    });
+}

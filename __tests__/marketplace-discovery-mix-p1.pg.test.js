@@ -142,6 +142,8 @@ run('Marketplace Mix P1 discovery (real PostgreSQL)', () => {
                 ...(opts.deliveryTerms ? { deliveryTerms: opts.deliveryTerms } : {}),
                 ...(opts.preparationMins ? { preparationMins: opts.preparationMins } : {}),
                 ...(opts.imageUrls ? { imageUrls: opts.imageUrls } : {}),
+                ...(opts.variants ? { variants: opts.variants } : {}),
+                ...(opts.modifierGroups ? { modifierGroups: opts.modifierGroups } : {}),
             },
         });
     }
@@ -645,5 +647,284 @@ run('Marketplace Mix P1 discovery (real PostgreSQL)', () => {
             if (prev === undefined) delete process.env.AZM_MARKETPLACE_DISCOVERY_ENABLED;
             else process.env.AZM_MARKETPLACE_DISCOVERY_ENABLED = prev;
         }
+    });
+    // ─── 8. review-correction pass (2026-10-14): cursor safety ─────────────
+
+    const b64 = (obj) => Buffer.from(JSON.stringify(obj)).toString('base64url');
+
+    test('cursor: crafted out-of-Date-range epoch is rejected before the query — 422, never 500 (route level)', async () => {
+        const request = require('supertest');
+        const express = require('express');
+        const discoveryRouter = require('../routes/discoveryRoutes');
+        const prev = process.env.AZM_MARKETPLACE_DISCOVERY_ENABLED;
+        const app = express();
+        app.set('prisma', db);
+        app.use('/api/discovery', discoveryRouter);
+        try {
+            process.env.AZM_MARKETPLACE_DISCOVERY_ENABLED = 'true';
+            const crafted = b64({ v: 1, o: 0, c: 99999999999999999, i: 'x' });
+            const res = await request(app).get(`/api/discovery/items?cursor=${encodeURIComponent(crafted)}`);
+            expect(res.status).toBe(422);
+            expect(res.body.success).toBe(false);
+            expect(res.body.field).toBe('cursor');
+        } finally {
+            if (prev === undefined) delete process.env.AZM_MARKETPLACE_DISCOVERY_ENABLED;
+            else process.env.AZM_MARKETPLACE_DISCOVERY_ENABLED = prev;
+        }
+    });
+
+    test('cursor: invalid keys decode to null — every crafted shape (unit level)', () => {
+        const { decodeCursor } = discoveryService._internal;
+        expect(decodeCursor(b64({ v: 1, o: 0, c: 99999999999999999, i: 'x' }))).toBeNull(); // beyond Date range
+        expect(decodeCursor(b64({ v: 1, o: 0, c: 8640000000000000, i: 'x' }))).toBeNull(); // == ECMAScript bound
+        expect(decodeCursor(b64({ v: 1, o: 0, c: -8640000000000000, i: 'x' }))).toBeNull();
+        expect(decodeCursor(b64({ v: 1, o: -1, c: 0, i: 'x' }))).toBeNull(); // negative count
+        expect(decodeCursor(b64({ v: 1, o: 1.5, c: 0, i: 'x' }))).toBeNull(); // non-integer count
+        expect(decodeCursor(b64({ v: 1, o: 9007199254740993, c: 0, i: 'x' }))).toBeNull(); // > MAX_SAFE_INTEGER
+        expect(decodeCursor(b64({ v: 1, o: 0, c: 0, i: '' }))).toBeNull(); // empty id
+        expect(decodeCursor(b64({ v: 1, o: 0, c: 0, i: 'x'.repeat(65) }))).toBeNull(); // oversized id
+        expect(decodeCursor(b64({ v: 2, o: 0, c: 0, i: 'x' }))).toBeNull(); // wrong version
+        expect(decodeCursor('not-base64!!!')).toBeNull();
+        expect(decodeCursor(null)).toBeNull();
+        expect('x'.repeat(5000)).not.toHaveLength(0);
+        expect(decodeCursor('x'.repeat(5000))).toBeNull(); // oversized raw envelope
+        // valid cursor still decodes
+        const row = { totalOrders: 7, createdAt: new Date('2026-01-01T00:00:00.000Z'), id: 'abc' };
+        const dec = decodeCursor(discoveryService._internal.encodeCursor(row));
+        expect(dec).toEqual({ totalOrders: 7, createdAt: row.createdAt, id: 'abc' });
+    });
+
+    test('cursor: oversized raw cursor rejected 422 at parse, before any DB work', async () => {
+        await expect(feed({ cursor: 'y'.repeat(4097) })).rejects.toMatchObject({
+            name: 'DiscoveryParamError', field: 'cursor',
+        });
+    });
+
+    test('cursor: valid pagination still walks cleanly after the hardening', async () => {
+        const { profile } = await seedBusiness();
+        const token = `walktoken${seq}`;
+        const made = [];
+        for (let i = 0; i < 4; i++) {
+            // q-scoped so shared-test-DB leftovers from other suites can
+            // never outrank these rows in the ordering (isolation honesty).
+            const prod = await seedProduct(profile, { totalOrders: 10 + i, description: token });
+            await setConfirmedPrice(prod.id, '10.00');
+            made.push(prod.id);
+        }
+        const p1 = await feed({ limit: '2', q: token });
+        expect(p1.items.length).toBe(2);
+        expect(p1.nextCursor).toBeTruthy();
+        // ordering: totalOrders DESC → the walk visits made[3], made[2], then
+        // made[1], made[0].
+        expect(ids(p1)).toEqual([made[3], made[2]]);
+        const p2 = await feed({ limit: '2', q: token, cursor: p1.nextCursor });
+        expect(ids(p2)).toEqual([made[1], made[0]]);
+        expect(p2.nextCursor).toBeNull();
+    });
+
+    // ─── 9. review-correction pass: variant/modifier GHS truth (read-time) ─
+
+    test('variant GHS: valid deltas are canonically reserialized as exact 2dp strings', async () => {
+        const { profile } = await seedBusiness();
+        const good = await seedProduct(profile, {
+            totalOrders: 50,
+            variants: [
+                { name: 'Size', required: true, options: [
+                    { name: 'Small', priceDelta: 0, priceDeltaGhs: '0' },
+                    { name: 'Medium', priceDelta: 1, priceDeltaGhs: '5' },
+                    { name: 'Large', priceDelta: 2, priceDeltaGhs: '5.0' },
+                ] },
+            ],
+            modifierGroups: [
+                { name: 'Extras', required: false, maxSelection: 3, options: [
+                    { name: 'Cheese', priceDelta: 0.5, priceDeltaGhs: '-1.5' },
+                ] },
+            ],
+        });
+        await setConfirmedPrice(good.id, '25.00');
+
+        const page = await feed({});
+        const item = page.items.find((i) => i.id === good.id);
+        expect(item).toBeDefined();
+        expect(item.variants[0].options.map((o) => o.priceDeltaGhs)).toEqual(['0.00', '5.00', '5.00']);
+        expect(item.modifierGroups[0].options[0].priceDeltaGhs).toBe('-1.50');
+        // USDC deltas pass through independently, never converted
+        expect(item.variants[0].options[1].priceDelta).toBe(1);
+    });
+
+    test('variant GHS: unit-level serialization enforces typing and 2dp precision', () => {
+        const { serializeVariantGhs } = discoveryService._internal;
+        const base = '25.00';
+        // valid: canonicalized exactly
+        const out = serializeVariantGhs(
+            [{ name: 'Size', options: [{ name: 'L', priceDeltaGhs: '5' }] }],
+            [],
+            base,
+        );
+        expect(out.variants[0].options[0].priceDeltaGhs).toBe('5.00');
+        // sub-pesewa precision → corrupt
+        expect(() => serializeVariantGhs(
+            [{ name: 'Size', options: [{ name: 'L', priceDeltaGhs: '1.005' }] }], [], base))
+            .toThrow(priceService.BusinessPriceError);
+        // JSON number type (contract is a STRING) → corrupt
+        expect(() => serializeVariantGhs(
+            [{ name: 'Size', options: [{ name: 'L', priceDeltaGhs: 5 }] }], [], base))
+            .toThrow(priceService.BusinessPriceError);
+        // garbage → corrupt
+        expect(() => serializeVariantGhs(
+            [{ name: 'Size', options: [{ name: 'L', priceDeltaGhs: 'free!' }] }], [], base))
+            .toThrow(priceService.BusinessPriceError);
+        // non-positive worst-case final price → corrupt
+        expect(() => serializeVariantGhs(
+            [{ name: 'Size', options: [{ name: 'L', priceDeltaGhs: '-25.00' }] }], [], base))
+            .toThrow(priceService.BusinessPriceError);
+        // no variant data at all → null (unchanged DTO surface)
+        expect(serializeVariantGhs([], [], base)).toBeNull();
+    });
+
+    test('variant GHS: corrupt configurations are excluded from the feed (fail closed per identity, never a 500)', async () => {
+        const { profile } = await seedBusiness();
+        const healthy = await seedProduct(profile, { totalOrders: 100, variants: [
+            { name: 'Size', options: [{ name: 'L', priceDeltaGhs: '5.00' }] },
+        ] });
+        await setConfirmedPrice(healthy.id, '25.00');
+        const subPesewa = await seedProduct(profile, { totalOrders: 90, variants: [
+            { name: 'Size', options: [{ name: 'L', priceDeltaGhs: '1.005' }] },
+        ] });
+        await setConfirmedPrice(subPesewa.id, '25.00');
+        const wrongType = await seedProduct(profile, { totalOrders: 80, variants: [
+            { name: 'Size', options: [{ name: 'L', priceDeltaGhs: 7 }] }, // JSON number
+        ] });
+        await setConfirmedPrice(wrongType.id, '25.00');
+        const nonPositive = await seedProduct(profile, { totalOrders: 70, variants: [
+            { name: 'Size', options: [{ name: 'L', priceDeltaGhs: '-30.00' }] }, // 25.00 - 30.00 <= 0
+        ] });
+        await setConfirmedPrice(nonPositive.id, '25.00');
+
+        const page = await feed({});
+        const got = ids(page);
+        expect(got).toContain(healthy.id);
+        expect(got).not.toContain(subPesewa.id);
+        expect(got).not.toContain(wrongType.id);
+        expect(got).not.toContain(nonPositive.id);
+        // the feed stays a clean 200 with the healthy item; no partial DTO
+        expect(page.items.find((i) => i.id === healthy.id).variants[0].options[0].priceDeltaGhs).toBe('5.00');
+    });
+
+    // ─── 10. review-correction pass: repeatable taxonomy contract ──────────
+
+    test('taxonomy: repeatable params OR together; single + repeated + dedupe are deterministic', async () => {
+        const { profile } = await seedBusiness();
+        const meals = await seedSection(profile, { name: 'Main Course', taxonomy: 'MEALS' });
+        const drinks = await seedSection(profile, { name: 'Drinks', taxonomy: 'DRINKS' });
+        const desserts = await seedSection(profile, { name: 'Desserts', taxonomy: 'DESSERTS' });
+        const mealItem = await seedProduct(profile, { sectionId: meals.id, totalOrders: 30 });
+        const drinkItem = await seedProduct(profile, { sectionId: drinks.id, totalOrders: 20 });
+        const dessertItem = await seedProduct(profile, { sectionId: desserts.id, totalOrders: 10 });
+        for (const p of [mealItem, drinkItem, dessertItem]) await setConfirmedPrice(p.id, '10.00');
+
+        const both = await feed({ taxonomy: ['MEALS', 'DRINKS'] });
+        expect(ids(both).sort()).toEqual([drinkItem.id, mealItem.id].sort());
+
+        const single = await feed({ taxonomy: 'MEALS' });
+        expect(ids(single)).toEqual([mealItem.id]);
+
+        const deduped = await feed({ taxonomy: ['MEALS', 'MEALS'] });
+        expect(ids(deduped)).toEqual([mealItem.id]);
+
+        // no taxonomy → general feed still surfaces every section (incl. UNMAPPED)
+        const general = await feed({});
+        expect(ids(general)).toEqual(expect.arrayContaining([mealItem.id, drinkItem.id, dessertItem.id]));
+    });
+
+    test('taxonomy: UNMAPPED cannot be requested as a chip — 422, stays in the general feed', async () => {
+        const { profile } = await seedBusiness();
+        const unmapped = await seedSection(profile, { name: 'House Special', taxonomy: 'UNMAPPED' });
+        const item = await seedProduct(profile, { sectionId: unmapped.id, totalOrders: 5 });
+        await setConfirmedPrice(item.id, '10.00');
+
+        const general = await feed({});
+        expect(ids(general)).toContain(item.id); // general feed: yes
+        await expect(feed({ taxonomy: 'UNMAPPED' })).rejects.toMatchObject({
+            name: 'DiscoveryParamError', field: 'taxonomy',
+        });
+        await expect(feed({ taxonomy: ['MEALS', 'UNMAPPED'] })).rejects.toMatchObject({
+            field: 'taxonomy',
+        });
+    });
+
+    test('taxonomy: unknown, inactive and over-limit chips are 422s, never silent empty feeds', async () => {
+        await expect(feed({ taxonomy: 'NOT_A_CHIP' })).rejects.toMatchObject({ field: 'taxonomy' });
+        // comma-list inside one value is NOT silently split — it is an unknown id
+        await expect(feed({ taxonomy: 'MEALS,DRINKS' })).rejects.toMatchObject({ field: 'taxonomy' });
+        // inactive chip
+        await db.catalogSectionTaxonomy.update({ where: { id: 'DRINKS' }, data: { isActive: false } });
+        try {
+            await expect(feed({ taxonomy: 'DRINKS' })).rejects.toMatchObject({ field: 'taxonomy' });
+        } finally {
+            await db.catalogSectionTaxonomy.update({ where: { id: 'DRINKS' }, data: { isActive: true } });
+        }
+        // > MAX chips (10) rejected before any DB validation
+        const eleven = ['MEALS', 'STARTERS', 'SIDES', 'DRINKS', 'DESSERTS', 'ROOMS', 'RIDES', 'RETAIL_ITEMS', 'SERVICES', 'UNMAPPED', 'MEALS'];
+        await expect(feed({ taxonomy: eleven })).rejects.toMatchObject({ field: 'taxonomy' });
+    });
+
+    test('taxonomy: route passes repeated query params through as an array (supertest)', async () => {
+        const request = require('supertest');
+        const express = require('express');
+        const discoveryRouter = require('../routes/discoveryRoutes');
+        const prev = process.env.AZM_MARKETPLACE_DISCOVERY_ENABLED;
+        const app = express();
+        app.set('prisma', db);
+        app.use('/api/discovery', discoveryRouter);
+        try {
+            process.env.AZM_MARKETPLACE_DISCOVERY_ENABLED = 'true';
+            const okRes = await request(app).get('/api/discovery/items?taxonomy=MEALS&taxonomy=DRINKS');
+            expect(okRes.status).toBe(200);
+            expect(okRes.body.success).toBe(true);
+            const badRes = await request(app).get('/api/discovery/items?taxonomy=UNMAPPED');
+            expect(badRes.status).toBe(422);
+            expect(badRes.body.field).toBe('taxonomy');
+        } finally {
+            if (prev === undefined) delete process.env.AZM_MARKETPLACE_DISCOVERY_ENABLED;
+            else process.env.AZM_MARKETPLACE_DISCOVERY_ENABLED = prev;
+        }
+    });
+
+    // ─── 11. review-correction pass: installer index safety ────────────────
+
+    test('installer: indexes exist and are VALID (concurrent build), and replay is idempotent', async () => {
+        const { installMarketplaceDiscoveryOverlay } = require('../infra/install-marketplace-discovery-overlay');
+        const first = await installMarketplaceDiscoveryOverlay(db);
+        expect(first.indexesCreated + first.indexesRebuilt + first.indexesKept).toBe(3);
+
+        const states = await db.$queryRawUnsafe(
+            `SELECT c.relname AS name, i.indisvalid AS valid
+               FROM pg_index i
+               JOIN pg_class c ON c.oid = i.indexrelid
+              WHERE c.relname IN ('business_product_discovery', 'business_product_section_active', 'business_profile_eligible')`
+        );
+        expect(states.length).toBe(3);
+        for (const row of states) expect(row.valid).toBe(true);
+
+        const replay = await installMarketplaceDiscoveryOverlay(db);
+        expect(replay.indexesKept).toBe(3); // no rebuild churn on a healthy DB
+    });
+
+    test('installer: a failed concurrent build (indisvalid=false) is detected, dropped and rebuilt', async () => {
+        const { installMarketplaceDiscoveryOverlay } = require('../infra/install-marketplace-discovery-overlay');
+        // Simulate a failed CREATE INDEX CONCURRENTLY: the index exists but is INVALID.
+        await db.$executeRawUnsafe(
+            `UPDATE pg_index SET indisvalid = false
+              WHERE indexrelid = (SELECT oid FROM pg_class WHERE relname = 'business_product_discovery')`
+        );
+        const result = await installMarketplaceDiscoveryOverlay(db);
+        expect(result.indexesRebuilt).toBe(1);
+        const rows = await db.$queryRawUnsafe(
+            `SELECT i.indisvalid AS valid FROM pg_index i
+               JOIN pg_class c ON c.oid = i.indexrelid
+              WHERE c.relname = 'business_product_discovery'`
+        );
+        expect(rows[0].valid).toBe(true);
     });
 });
