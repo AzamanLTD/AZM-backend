@@ -422,65 +422,236 @@ function serializeRank(product) {
 // validateGhsDeltas at write time too; until then this read gate keeps
 // direct-DB or legacy rows out of the public surface.
 
-function _optionsOf(group) {
-    if (Array.isArray(group?.options)) return group.options;
-    if (Array.isArray(group?.values)) return group.values;
+// ─── variant/modifier STORAGE-SHAPE normalization ────────────────────────────
+//
+// The platform has TWO sanctioned writers and therefore several storage
+// shapes that a BusinessProduct.variants / .modifierGroups JSON column can
+// legitimately hold. This read path must understand ALL of them — a shape
+// it does not normalize is a shape whose options (and GHS deltas) silently
+// vanish from the public feed:
+//
+//   A. FLAT option arrays — businessProductService._cleanOptionRows writes
+//      variants as [{ name, priceDelta }] with NO group wrapper. The
+//      storefront's normalizeVariantGroups semantics fold these into a
+//      single synthesized { name: 'Size', required: true } group; this read
+//      path folds them identically (mixed arrays that contain BOTH flat
+//      rows and grouped rows follow the storefront's grouped reading).
+//   B. GROUPED arrays — [{ name, required?, options: [...] | values: [...] }]
+//      from the portal write path (modifierGroups always take this shape).
+//   C. LEGACY object-keyed configurations — storefrontProductConfiguration
+//      .normalizeVariantGroups accepts { "Size": [...options], ... } keyed by
+//      option group; each entry becomes a required group.
+//   D. Modifier groups may carry the legacy keys `values` (option list) and
+//      `max` (selection bound), and inherit the storefront's required
+//      semantics: required is true ONLY when explicitly set.
+//
+// Shape reading mirrors the storefront service (the USDC checkout authority)
+// so the feed and checkout can never disagree about what a row means. The
+// USDC priceDelta passes through unchanged — it keeps its own independent
+// meaning and is never converted into (or derived from) a GHS delta.
+
+function _optionLabel(option) {
+    if (option && typeof option === 'object') {
+        return String(option.name ?? option.label ?? option.value ?? '').trim();
+    }
+    return String(option ?? '').trim();
+}
+
+// Mirrors storefront normalizedOptionList shape rules, but PRESERVES the
+// original option fields for object options (so id/label/priceDelta/… ride
+// through untouched) and NEVER silently drops a priceDeltaGhs: an option the
+// legacy USDC normalizer would discard (nameless) is tolerated only while it
+// carries no GHS delta — a delta on a dropped option fails the whole item.
+function _normalizedOptions(rawOptions, ctx) {
+    if (!Array.isArray(rawOptions)) return [];
+    const out = [];
+    for (const option of rawOptions) {
+        if (option && typeof option === 'object' && !Array.isArray(option)) {
+            const name = _optionLabel(option);
+            if (!name) {
+                if (Object.prototype.hasOwnProperty.call(option, 'priceDeltaGhs')
+                    && option.priceDeltaGhs !== undefined && option.priceDeltaGhs !== null) {
+                    throw new priceService.BusinessPriceError('GHS_DELTA_ON_DROPPED_OPTION',
+                        `${ctx}: an unnamed option carries priceDeltaGhs — refusing to silently drop a GHS delta`);
+                }
+                continue; // legacy normalizedOptionList drops nameless options (USDC semantics preserved)
+            }
+            const reserialized = { ...option };
+            if (Object.prototype.hasOwnProperty.call(option, 'priceDeltaGhs')
+                && option.priceDeltaGhs !== undefined && option.priceDeltaGhs !== null) {
+                reserialized.priceDeltaGhs = _canonicalDelta(option.priceDeltaGhs);
+            }
+            out.push(reserialized);
+        } else {
+            // Non-object option (legacy lists allow bare strings): the
+            // storefront normalizes these to { id, name, priceDelta: 0 } —
+            // preserve that exact USDC meaning. No GHS delta can ride here.
+            const label = _optionLabel(option);
+            out.push({ id: label, name: label, priceDelta: 0 });
+        }
+    }
+    return out;
+}
+
+function _hasAnyGhsDelta(group) {
+    if (group && typeof group === 'object' && !Array.isArray(group)) {
+        if (Object.prototype.hasOwnProperty.call(group, 'priceDeltaGhs')
+            && group.priceDeltaGhs !== undefined && group.priceDeltaGhs !== null) return true;
+        const opts = Array.isArray(group.options) ? group.options
+            : Array.isArray(group.values) ? group.values : [];
+        for (const option of opts) {
+            if (option && typeof option === 'object' && !Array.isArray(option)
+                && Object.prototype.hasOwnProperty.call(option, 'priceDeltaGhs')
+                && option.priceDeltaGhs !== undefined && option.priceDeltaGhs !== null) return true;
+        }
+    }
+    return false;
+}
+
+// Validates + canonicalizes one GHS delta to the exact 2dp decimal STRING.
+// A JSON number, boolean, object, or malformed/sub-pesewa value is a corrupt
+// configuration (the approved contract is a decimal string; the authority
+// never rounds silently).
+function _canonicalDelta(value) {
+    if (typeof value !== 'string') {
+        throw new priceService.BusinessPriceError('GHS_DELTA_NOT_A_STRING',
+            'priceDeltaGhs must be an exact 2dp decimal STRING');
+    }
+    const d = priceService.parseGhsDecimal(value, { field: 'priceDeltaGhs', allowNegative: true });
+    return priceService.pesewasToGhsString(priceService.toPesewas(d));
+}
+
+// A priceDeltaGhs sitting at the GROUP ROOT (not on an option) is not part of
+// the pricing math, but it is still GHS data under this identity — validate
+// + canonicalize it in place, never drop it.
+function _canonicalGroupRootDelta(group) {
+    if (group && typeof group === 'object' && !Array.isArray(group)
+        && Object.prototype.hasOwnProperty.call(group, 'priceDeltaGhs')
+        && group.priceDeltaGhs !== undefined && group.priceDeltaGhs !== null) {
+        return _canonicalDelta(group.priceDeltaGhs);
+    }
+    return undefined;
+}
+
+// Mirrors storefront normalizeVariantGroups (the USDC checkout authority for
+// what a variants column MEANS), preserving the shapes above.
+function _normalizedVariantGroups(raw) {
+    if (Array.isArray(raw)) {
+        const objectEntries = raw.filter((entry) => entry && typeof entry === 'object');
+        const isFlatOptionList = objectEntries.length > 0
+            && objectEntries.every((entry) => !Array.isArray(entry.options) && !Array.isArray(entry.values));
+        if (isFlatOptionList) {
+            // Shape A: businessProductService flat rows → one Size group.
+            return [{ name: 'Size', required: true, options: _normalizedOptions(raw, 'variants') }];
+        }
+        // Shape B (grouped, incl. storefront's mixed reading). Name semantics
+        // mirror normalizeVariantGroups exactly: entries without a usable
+        // name/id keep the `Variant N` placeholder (legacy keeps them);
+        // ONLY an object whose explicit name/id trims empty is dropped —
+        // and a dropped group must not take a GHS delta with it.
+        const groups = [];
+        raw.forEach((group, index) => {
+            const isObj = Boolean(group) && typeof group === 'object' && !Array.isArray(group);
+            const nameRaw = isObj ? (group.name ?? group.id) : undefined;
+            const name = String(nameRaw ?? `Variant ${index + 1}`).trim();
+            if (isObj && name === '') {
+                if (_hasAnyGhsDelta(group)) {
+                    throw new priceService.BusinessPriceError('GHS_DELTA_ON_DROPPED_GROUP',
+                        `variants[${index}]: a nameless group carries priceDeltaGhs — refusing to silently drop a GHS delta`);
+                }
+                return; // legacy .filter(group => group.name) drops it
+            }
+            const rootDelta = _canonicalGroupRootDelta(group);
+            const options = _normalizedOptions(isObj ? (group.options ?? group.values) : undefined,
+                `variants[${index}]`);
+            const out = {
+                name,
+                required: isObj ? group.required !== false : true,
+                options,
+            };
+            if (rootDelta !== undefined) out.priceDeltaGhs = rootDelta;
+            groups.push(out);
+        });
+        return groups;
+    }
+    // Shape C: legacy object-keyed configuration — each key is a required group.
+    if (raw && typeof raw === 'object') {
+        const groups = [];
+        for (const [key, values] of Object.entries(raw)) {
+            const name = String(key).trim();
+            const options = _normalizedOptions(values, `variants["${key}"]`);
+            if (!name) {
+                // An empty key can only carry deltas via its options; guard.
+                const carriesDelta = Array.isArray(values) && values.some((o) => o && typeof o === 'object'
+                    && Object.prototype.hasOwnProperty.call(o, 'priceDeltaGhs')
+                    && o.priceDeltaGhs !== undefined && o.priceDeltaGhs !== null);
+                if (carriesDelta) {
+                    throw new priceService.BusinessPriceError('GHS_DELTA_ON_DROPPED_GROUP',
+                        `variants["${key}"]: a nameless group carries priceDeltaGhs — refusing to silently drop a GHS delta`);
+                }
+                continue; // legacy Object.entries().filter(group => group.name) drops it
+            }
+            groups.push({ name, required: true, options });
+        }
+        return groups;
+    }
+    // Not a supported shape (scalar/null): carries no options, no deltas.
     return [];
 }
 
-function _groupsOf(raw) {
+// Mirrors storefront normalizeModifierGroups: required ONLY when explicitly
+// true, maxSelection from maxSelection|max (≥1), options or values.
+function _normalizedModifierGroups(raw) {
     if (!Array.isArray(raw)) return [];
-    return raw;
-}
-
-// Returns the validated, canonically reserialized groups, or null when the
-// product carries no variant/modifier data. Throws priceService.
-// BusinessPriceError on any corrupt configuration (caller excludes the item).
-function serializeOptionGroupsGhs(rawGroups) {
-    if (!Array.isArray(rawGroups) || rawGroups.length === 0) return null;
-    return rawGroups.map((group) => {
+    const groups = [];
+    raw.forEach((group, index) => {
+        const isObj = Boolean(group) && typeof group === 'object' && !Array.isArray(group);
+        const nameRaw = isObj ? (group.name ?? group.id) : undefined;
+        const name = String(nameRaw ?? `Options ${index + 1}`).trim();
+        if (isObj && name === '') {
+            if (_hasAnyGhsDelta(group)) {
+                throw new priceService.BusinessPriceError('GHS_DELTA_ON_DROPPED_GROUP',
+                    `modifierGroups[${index}]: a nameless group carries priceDeltaGhs — refusing to silently drop a GHS delta`);
+            }
+            return; // legacy .filter(group => group.name) drops it
+        }
+        const maxRaw = isObj ? Number(group.maxSelection ?? group.max ?? 1) : NaN;
+        const maxSelection = Math.max(1, Math.floor(Number.isFinite(maxRaw) ? maxRaw : 0));
+        const rootDelta = _canonicalGroupRootDelta(group);
+        const options = _normalizedOptions(isObj ? (group.options ?? group.values) : undefined,
+            `modifierGroups[${index}]`);
         const out = {
-            name: group?.name,
-            ...(group?.required !== undefined ? { required: group.required } : {}),
-            ...(group?.maxSelection !== undefined ? { maxSelection: group.maxSelection } : {}),
-            options: _optionsOf(group).map((option) => {
-                const reserialized = { ...option };
-                if (option && typeof option === 'object' && Object.prototype.hasOwnProperty.call(option, 'priceDeltaGhs')
-                    && option.priceDeltaGhs !== undefined && option.priceDeltaGhs !== null) {
-                    if (typeof option.priceDeltaGhs !== 'string') {
-                        // Incorrectly typed (JSON number, bool, object…): the
-                        // approved contract is a decimal STRING — corrupt.
-                        throw new priceService.BusinessPriceError('GHS_DELTA_NOT_A_STRING',
-                            'priceDeltaGhs must be an exact 2dp decimal STRING');
-                    }
-                    const d = priceService.parseGhsDecimal(option.priceDeltaGhs, { field: 'priceDeltaGhs', allowNegative: true });
-                    // Exact canonical 2dp string end-to-end.
-                    reserialized.priceDeltaGhs = priceService.pesewasToGhsString(priceService.toPesewas(d));
-                }
-                return reserialized;
-            }),
+            name,
+            required: isObj ? group.required === true : false,
+            maxSelection,
+            options,
         };
-        return out;
+        if (rootDelta !== undefined) out.priceDeltaGhs = rootDelta;
+        groups.push(out);
     });
+    return groups;
 }
 
+// Returns the validated, canonically reserialized variant/modifier groups for
+// the DTO, or null when the product carries no variant/modifier data at all.
+// Throws priceService.BusinessPriceError on any corrupt GHS configuration
+// (caller excludes the item — fail closed per identity).
 function serializeVariantGhs(rawVariants, rawModifierGroups, baseGhs) {
-    const hasVariants = Array.isArray(rawVariants) && rawVariants.length > 0;
-    const hasModifiers = Array.isArray(rawModifierGroups) && rawModifierGroups.length > 0;
+    const variantsOut = _normalizedVariantGroups(rawVariants);
+    const modifiersOut = _normalizedModifierGroups(rawModifierGroups);
+    const hasVariants = variantsOut.length > 0;
+    const hasModifiers = modifiersOut.length > 0;
     if (!hasVariants && !hasModifiers) return null;
 
-    // Canonicalize (validates typing + precision per delta) BEFORE the
-    // whole-config check, so the base is compared against canonically
-    // reserialized deltas — then run the price service's own authority for
-    // bounds + the positive-final-price invariant.
-    const variantsOut = serializeOptionGroupsGhs(rawVariants);
-    const modifiersOut = serializeOptionGroupsGhs(rawModifierGroups);
+    // Canonicalization (typing + precision per delta) happened during shape
+    // normalization; now run the price service's own authority for bounds +
+    // the positive-worst-case-final-price invariant against the resolved base.
     priceService.validateGhsDeltas({
         baseGhs,
-        variants: variantsOut ?? undefined,
-        modifierGroups: modifiersOut ?? undefined,
+        variants: hasVariants ? variantsOut : undefined,
+        modifierGroups: hasModifiers ? modifiersOut : undefined,
     });
-    return { variants: variantsOut, modifierGroups: modifiersOut };
+    return { variants: hasVariants ? variantsOut : null, modifierGroups: hasModifiers ? modifiersOut : null };
 }
 
 function buildItemDto(product, priceRow, windowOpenBySection) {

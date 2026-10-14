@@ -927,4 +927,287 @@ run('Marketplace Mix P1 discovery (real PostgreSQL)', () => {
         );
         expect(rows[0].valid).toBe(true);
     });
+    // ─── 12. review-correction pass: variant storage-SHAPE truth ───────────
+    //
+    // The variants/modifierGroups JSON columns hold several legitimate
+    // storage shapes (businessProductService flat rows, grouped arrays with
+    // options|values, legacy object-keyed configs, modifier legacy keys).
+    // These tests pin the DTO for EVERY shape using rows shaped exactly like
+    // the sanctioned writers produce, and prove fail-closed behavior for
+    // corrupt deltas in each shape. They FAIL against the pre-correction
+    // serializer (flat rows lost their options; object-keyed configs were
+    // silently nulled).
+
+    test('shapes: FLAT businessProductService rows (real write path) fold into one Size group, every option preserved', async () => {
+        const businessProductService = require('../services/businessProductService');
+        const { profile } = await seedBusiness();
+        const token = `shapetoken${seq}`;
+        const flat = await businessProductService.createProduct(db, {
+            businessProfileId: profile.id,
+            name: `MixP1 flat service item ${seq}`,
+            description: token,
+            priceUsdc: 4.20,
+            variants: [
+                { name: 'Small', priceDelta: 0 },
+                { name: 'Medium', priceDelta: 1.5 },
+                { name: 'Large', priceDelta: 2.25 },
+            ],
+            modifierGroups: [{
+                name: 'Extras',
+                maxSelection: 2,
+                options: [
+                    { name: 'Cheese', priceDelta: 0.5 },
+                    { name: 'Bacon', priceDelta: 1 },
+                ],
+            }],
+        });
+        await setConfirmedPrice(flat.id, '25.00');
+
+        const page = await feed({ q: token });
+        const item = page.items.find((i) => i.id === flat.id);
+        expect(item).toBeDefined();
+        expect(item.variants).toEqual([
+            {
+                name: 'Size',
+                required: true,
+                options: [
+                    { name: 'Small', priceDelta: 0 },
+                    { name: 'Medium', priceDelta: 1.5 },
+                    { name: 'Large', priceDelta: 2.25 },
+                ],
+            },
+        ]);
+        // modifierGroups from the sanctioned writer: required is true ONLY
+        // when explicit — this row has none, so required: false.
+        expect(item.modifierGroups).toEqual([
+            {
+                name: 'Extras',
+                required: false,
+                maxSelection: 2,
+                options: [
+                    { name: 'Cheese', priceDelta: 0.5 },
+                    { name: 'Bacon', priceDelta: 1 },
+                ],
+            },
+        ]);
+    });
+
+    test('shapes: flat rows carrying priceDeltaGhs (direct-DB legacy rows) — canonical 2dp strings, USDC deltas untouched', async () => {
+        const { profile } = await seedBusiness();
+        const token = `shapeflat${seq}`;
+        const prod = await seedProduct(profile, {
+            description: token, totalOrders: 60, variants: [
+                { name: 'Small', priceDelta: 0, priceDeltaGhs: '0' },
+                { name: 'Medium', priceDelta: 1.5, priceDeltaGhs: '5' },
+                { name: 'Large', priceDelta: 2.25, priceDeltaGhs: '-1.5' },
+            ],
+        });
+        await setConfirmedPrice(prod.id, '25.00');
+
+        const page = await feed({ q: token });
+        const item = page.items.find((i) => i.id === prod.id);
+        expect(item).toBeDefined();
+        expect(item.variants).toEqual([{
+            name: 'Size', required: true,
+            options: [
+                { name: 'Small', priceDelta: 0, priceDeltaGhs: '0.00' },
+                { name: 'Medium', priceDelta: 1.5, priceDeltaGhs: '5.00' },
+                { name: 'Large', priceDelta: 2.25, priceDeltaGhs: '-1.50' },
+            ],
+        }]);
+    });
+
+    test('shapes: GROUPED rows with options AND values keys both surface; mixed flat+string rows keep string options', async () => {
+        const { profile } = await seedBusiness();
+        const token = `shapegrp${seq}`;
+        const prod = await seedProduct(profile, {
+            description: token, totalOrders: 55, variants: [
+                { name: 'Size', required: true, options: [
+                    { name: 'Regular', priceDelta: 0, priceDeltaGhs: '0' },
+                ] },
+                { name: 'Color', values: [
+                    { name: 'Red', priceDelta: 0.5, priceDeltaGhs: '2.5' },
+                ] },
+            ],
+        });
+        await setConfirmedPrice(prod.id, '25.00');
+
+        const page = await feed({ q: token });
+        const item = page.items.find((i) => i.id === prod.id);
+        expect(item).toBeDefined();
+        expect(item.variants).toEqual([
+            { name: 'Size', required: true, options: [{ name: 'Regular', priceDelta: 0, priceDeltaGhs: '0.00' }] },
+            { name: 'Color', required: true, options: [{ name: 'Red', priceDelta: 0.5, priceDeltaGhs: '2.50' }] },
+        ]);
+    });
+
+    test('shapes: LEGACY object-keyed variant configs become required groups (the shape the old serializer silently nulled)', async () => {
+        const { profile } = await seedBusiness();
+        const token = `shapeobj${seq}`;
+        const prod = await seedProduct(profile, {
+            description: token, totalOrders: 50, variants: {
+                Size: [
+                    { name: 'Regular', priceDelta: 0, priceDeltaGhs: '0' },
+                    { name: 'Large', priceDelta: 1, priceDeltaGhs: '2.5' },
+                ],
+                'Spice level': [
+                    { name: 'Mild', priceDelta: 0 },
+                ],
+            },
+        });
+        await setConfirmedPrice(prod.id, '25.00');
+
+        const page = await feed({ q: token });
+        const item = page.items.find((i) => i.id === prod.id);
+        expect(item).toBeDefined();
+        expect(item.variants).toEqual([
+            {
+                name: 'Size', required: true,
+                options: [
+                    { name: 'Regular', priceDelta: 0, priceDeltaGhs: '0.00' },
+                    { name: 'Large', priceDelta: 1, priceDeltaGhs: '2.50' },
+                ],
+            },
+            { name: 'Spice level', required: true, options: [{ name: 'Mild', priceDelta: 0 }] },
+        ]);
+    });
+
+    test('shapes: modifier legacy keys (max, values) and explicit required semantics are preserved', async () => {
+        const { profile } = await seedBusiness();
+        const token = `shapemod${seq}`;
+        const prod = await seedProduct(profile, {
+            description: token, totalOrders: 45, modifierGroups: [
+                { name: 'Extras', max: 2, values: [
+                    { name: 'Cheese', priceDelta: 0.5, priceDeltaGhs: '-1.5' },
+                ] },
+                { name: 'Drinks', required: true, options: [
+                    { name: 'Cola', priceDelta: 1 },
+                ] },
+            ],
+        });
+        await setConfirmedPrice(prod.id, '25.00');
+
+        const page = await feed({ q: token });
+        const item = page.items.find((i) => i.id === prod.id);
+        expect(item).toBeDefined();
+        expect(item.modifierGroups).toEqual([
+            {
+                name: 'Extras', required: false, maxSelection: 2,
+                options: [{ name: 'Cheese', priceDelta: 0.5, priceDeltaGhs: '-1.50' }],
+            },
+            {
+                name: 'Drinks', required: true, maxSelection: 1,
+                options: [{ name: 'Cola', priceDelta: 1 }],
+            },
+        ]);
+    });
+
+    test('shapes: a priceDeltaGhs at the GROUP ROOT is validated + canonicalized in place, never dropped', async () => {
+        const { profile } = await seedBusiness();
+        const token = `shaperoot${seq}`;
+        const valid = await seedProduct(profile, {
+            description: token, totalOrders: 40, variants: [
+                { name: 'Size', priceDeltaGhs: '2.5', options: [{ name: 'Regular', priceDelta: 0, priceDeltaGhs: '0' }] },
+            ],
+        });
+        await setConfirmedPrice(valid.id, '25.00');
+
+        const page = await feed({ q: token });
+        const item = page.items.find((i) => i.id === valid.id);
+        expect(item).toBeDefined();
+        expect(item.variants).toEqual([{
+            name: 'Size', required: true, priceDeltaGhs: '2.50',
+            options: [{ name: 'Regular', priceDelta: 0, priceDeltaGhs: '0.00' }],
+        }]);
+    });
+
+    test('shapes: INVALID root-level deltas (number) exclude the item; healthy sibling stays served — variants AND modifierGroups', async () => {
+        const { profile } = await seedBusiness();
+        const token = `shaperootbad${seq}`;
+        const healthy = await seedProduct(profile, {
+            description: token, totalOrders: 100, variants: [
+                { name: 'Size', options: [{ name: 'Regular', priceDelta: 0, priceDeltaGhs: '1' }] },
+            ],
+        });
+        await setConfirmedPrice(healthy.id, '25.00');
+        const badVariantRoot = await seedProduct(profile, {
+            description: token, totalOrders: 90, variants: [
+                { name: 'Size', priceDeltaGhs: 5, options: [{ name: 'Regular', priceDelta: 0 }] }, // JSON number at root
+            ],
+        });
+        await setConfirmedPrice(badVariantRoot.id, '25.00');
+        const badModifierRoot = await seedProduct(profile, {
+            description: token, totalOrders: 80, modifierGroups: [
+                { name: 'Extras', priceDeltaGhs: '1.005', options: [{ name: 'Cheese', priceDelta: 0 }] }, // sub-pesewa at root
+            ],
+        });
+        await setConfirmedPrice(badModifierRoot.id, '25.00');
+
+        const page = await feed({ q: token });
+        const got = ids(page);
+        expect(got).toContain(healthy.id);
+        expect(got).not.toContain(badVariantRoot.id);
+        expect(got).not.toContain(badModifierRoot.id);
+        // the healthy item's option delta is canonicalized
+        const served = page.items.find((i) => i.id === healthy.id);
+        expect(served.variants[0].options[0].priceDeltaGhs).toBe('1.00');
+    });
+
+    test('shapes: INVALID option-level deltas exclude the item in EVERY storage shape (flat, grouped, object-keyed)', async () => {
+        const { profile } = await seedBusiness();
+        const token = `shapeoptbad${seq}`;
+        const healthy = await seedProduct(profile, {
+            description: token, totalOrders: 100, variants: [
+                { name: 'Size', options: [{ name: 'Regular', priceDelta: 0, priceDeltaGhs: '1' }] },
+            ],
+        });
+        await setConfirmedPrice(healthy.id, '25.00');
+
+        const cases = [
+            // flat row with a JSON-number delta
+            [{ name: 'Small', priceDelta: 0 }, { name: 'Large', priceDelta: 2, priceDeltaGhs: 7 }],
+            // grouped options with sub-pesewa precision
+            [{ name: 'Size', options: [{ name: 'Large', priceDelta: 1, priceDeltaGhs: '1.005' }] }],
+            // legacy object-keyed config with garbage
+            { Size: [{ name: 'Large', priceDelta: 1, priceDeltaGhs: 'free!' }] },
+            // values-keyed grouped row with a non-positive worst case
+            [{ name: 'Size', values: [{ name: 'Large', priceDelta: 2, priceDeltaGhs: '-30.00' }] }],
+        ];
+        const bad = [];
+        for (const [i, variants] of cases.entries()) {
+            const prod = await seedProduct(profile, { description: token, totalOrders: 90 - i, variants });
+            await setConfirmedPrice(prod.id, '25.00');
+            bad.push(prod.id);
+        }
+
+        const page = await feed({ q: token });
+        const got = ids(page);
+        expect(got).toContain(healthy.id);
+        for (const id of bad) expect(got).not.toContain(id);
+    });
+
+    test('shapes: an UNNAMED option carrying a priceDeltaGhs is never silently dropped — the item fails closed', async () => {
+        const { profile } = await seedBusiness();
+        const token = `shapedropped${seq}`;
+        const healthy = await seedProduct(profile, {
+            description: token, totalOrders: 100, variants: [
+                { name: 'Size', options: [{ name: 'Regular', priceDelta: 0 }] },
+            ],
+        });
+        await setConfirmedPrice(healthy.id, '25.00');
+        const droppedDelta = await seedProduct(profile, {
+            description: token, totalOrders: 90, variants: [
+                { name: 'Size', options: [
+                    { name: '', priceDeltaGhs: '1.00' }, // nameless → legacy drops the option; carries a delta → corrupt
+                    { name: 'Large', priceDelta: 1 },
+                ] },
+            ],
+        });
+        await setConfirmedPrice(droppedDelta.id, '25.00');
+
+        const page = await feed({ q: token });
+        const got = ids(page);
+        expect(got).toContain(healthy.id);
+        expect(got).not.toContain(droppedDelta.id);
+    });
 });
