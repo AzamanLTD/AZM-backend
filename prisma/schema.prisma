@@ -2795,6 +2795,15 @@ model BusinessProfile {
   groupId          String? // optional FK to BusinessGroup for multi-brand owners
   group            BusinessGroup? @relation(fields: [groupId], references: [id], onDelete: SetNull)
   suspendReason    String?        @db.VarChar(500)
+  // MARKETPLACE MIX P1 (§9 D-5, MARKETPLACE_MIX_REDESIGN_2026-10-10.md):
+  // explicit marketplace-visibility capability — the business's eligibility
+  // for the public cross-business discovery feed (Mix). This is a SEPARATE
+  // capability from storefrontDisabled (the admin kill-switch scoped to the
+  // custom SDUI storefront experience): neither bypasses nor implies the
+  // other. Default true preserves today's "every unsuspended, unpaused
+  // business is publicly discoverable" behavior — flipping it to false hides
+  // the business from Mix WITHOUT touching its custom storefront.
+  isPubliclyDiscoverable Boolean @default(true)
 
   // Public contact info
   phoneNumber  String? @db.VarChar(20)
@@ -2903,6 +2912,10 @@ model BusinessProfile {
   @@index([subcategory])
   @@index([priceRange])
   @@index([isSuspended, subcategory, totalEscrows(sort: Desc)])
+  // MARKETPLACE MIX P1 discovery eligibility (§3.3): Mix's where-clause
+  // filters (category, isSuspended, isPausedByOwner) — composite lets the
+  // candidate query drive off the index as the feed grows.
+  @@index([category, isSuspended, isPausedByOwner])
 }
 
 // =============================================================================
@@ -3201,6 +3214,16 @@ model CatalogSection {
   availableTo       String? // "11:00"
   imageUrl          String?
   isActive          Boolean @default(true)
+  // MARKETPLACE MIX P1 taxonomy (§4, D-2 DECIDED): canonical taxonomy id
+  // (MEALS/STARTERS/SIDES/DRINKS/DESSERTS/ROOMS/RIDES/RETAIL_ITEMS/SERVICES/
+  // UNMAPPED). The value is owned by the catalog_section_taxonomy mapping
+  // table + the business's owner override — never a silent client-side
+  // guess. Seeded UNMAPPED by default; the installer backfill maps by
+  // normalized section name ("Main Course"→MEALS …); the portal can set any
+  // canonical value explicitly (one-tap categorize). UNMAPPED sections stay
+  // discoverable in the category's general feed but never under a specific
+  // taxonomy chip.
+  taxonomy          String  @default("UNMAPPED")
 
   businessProfile BusinessProfile   @relation(fields: [businessProfileId], references: [id], onDelete: Cascade)
   location        BusinessLocation? @relation(fields: [locationId], references: [id])
@@ -3211,6 +3234,34 @@ model CatalogSection {
   updatedAt DateTime @updatedAt
 
   @@index([businessProfileId, displayOrder])
+  // MARKETPLACE MIX P1 (§3.3): section-driven discovery support.
+  @@index([taxonomy])
+}
+
+// =============================================================================
+// MARKETPLACE MIX P1 — canonical section taxonomy (§4, D-2 DECIDED 2026-10-10).
+// Mapping-table authority: the canonical chip vocabulary for the Mix feed.
+// The mapping rule is a deterministic normalized-name match ("Main Course"→
+// MEALS, "Starters"→STARTERS, …) executed by the idempotent installer
+// backfill; the business portal can override CatalogSection.taxonomy
+// explicitly (one-tap categorize). Unmatched sections are UNMAPPED — items
+// stay discoverable under the category's general feed but never under a
+// specific chip. Mapping is a property of the section, owned by this table
+// + the owner override field — never a silent client-side guess.
+// =============================================================================
+
+model CatalogSectionTaxonomy {
+  id                  String  @id // MEALS | STARTERS | SIDES | DRINKS | DESSERTS | ROOMS | RIDES | RETAIL_ITEMS | SERVICES | UNMAPPED
+  label               String  @db.VarChar(60) // display metadata ("Main dishes")
+  description         String? @db.VarChar(200)
+  // Per-category validity (D-2): the categories whose feeds may surface this
+  // chip (wire values). Empty = applies to every category.
+  applicableCategories String[]
+  displayOrder        Int     @default(0)
+  isActive            Boolean @default(true)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 }
 
 // =============================================================================
@@ -3269,6 +3320,11 @@ model BusinessProduct {
   @@index([businessProfileId, isActive])
   @@index([slug])
   @@index([catalogSectionId]) // section → products lookup (2026-06-24)
+  // MARKETPLACE MIX P1 discovery (§3.3): the cross-business candidate query
+  // filters (category, isActive, isAvailable) and section-driven lookups —
+  // without these the Mix feed table-scans business_products as it grows.
+  @@index([category, isActive, isAvailable])
+  @@index([catalogSectionId, isActive])
 }
 
 // =============================================================================

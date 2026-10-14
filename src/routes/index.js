@@ -77,6 +77,10 @@ function mountRoutes(app, {
     // DO move money (the P2P pay side of this flow) do not exist yet.
     app.use('/api/payment-requests', generalLimiter, require('../../routes/paymentRequestRoutes'));
     app.use('/api/business', generalLimiter, require('../../routes/businessRoutes'));
+    // MARKETPLACE MIX P1 (§3.1): public cross-business item discovery feed.
+    // Read-only, public by contract (pre-login browsing), feature-flagged
+    // via AZM_MARKETPLACE_DISCOVERY_ENABLED (404 until enabled).
+    app.use('/api/discovery', generalLimiter, require('../../routes/discoveryRoutes'));
     app.use('/api/reservations', generalLimiter, require('../../routes/reservationRoutes'));
     app.use('/api/follows', generalLimiter, require('../../routes/followRoutes'));
     app.use('/api/ad-posts', generalLimiter, require('../../routes/adPostRoutes'));

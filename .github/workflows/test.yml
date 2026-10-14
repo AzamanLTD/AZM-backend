@@ -140,6 +140,11 @@ jobs:
         # CHECK, positive-amount CHECK, closed value domains. Mirrors the
         # release chain (npm run release).
         run: node infra/install-business-price-overlay.js
+      - name: Install marketplace discovery overlay
+        # Marketplace Mix P1: marketplace-visibility flag (§9 D-5), section
+        # taxonomy mapping table + backfill (§4 D-2), discovery indexes
+        # (§3.3). Mirrors the release chain (npm run release).
+        run: node infra/install-marketplace-discovery-overlay.js
 
       - name: Install inventory restock authority
         run: node infra/install-inventory-restock-overlay.js

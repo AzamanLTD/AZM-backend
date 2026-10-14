@@ -65,6 +65,45 @@ dispatch it from a non-default branch; the Actions UI will not list it.
 See also `ops/azaman-new-neon-bootstrap` for the initial bootstrap workflow
 (do not re-run it — it requires an EMPTY database).
 
+## Marketplace Mix discovery surface (PR #349) — activation blockers
+
+`infra/install-marketplace-discovery-overlay.js` provisions the Marketplace
+Mix P1 surface: the `BusinessProfile."isPubliclyDiscoverable"` flag (§9 D-5),
+`CatalogSection."taxonomy"` + the `CatalogSectionTaxonomy` mapping table with
+its seed rows and deterministic name-match backfill (§4 D-2), and the §3.3
+discovery indexes (built `CONCURRENTLY` — no write-blocking lock; a failed
+concurrent build leaves an `indisvalid = false` index which the installer
+detects, drops and rebuilds on the next run). The installer is wired into
+`npm run release` AND boot `infra/autoRelease.js` (same exported function —
+no subprocess divergence).
+
+**That wiring does NOT provision the live Free-plan service.** Per the section
+above, the live Render Free plan executes NEITHER the Pre-Deploy Command
+(`npm run release`) NOR `infra/autoRelease.js` at startup, so the discovery
+surface is an **explicit activation blocker** — until one of the supported
+paths below runs against the authoritative production database, the
+`/api/discovery/items` route cannot be enabled:
+
+1. **Database provisioning** (blocker): apply the installer on the
+   authoritative production database. Supported paths, in order of preference:
+   the Settings → Build & Deploy dashboard change appending the installer to
+   the Build Command (idempotent, additive-only), or a guarded
+   `workflow_dispatch` provisioning workflow — which GitHub only offers once
+   the workflow file is on the default branch, i.e. after this PR merges.
+   **Do not guess which Neon branch is authoritative and do not dispatch any
+   provisioning workflow from a non-default branch.** Verify post-apply by
+   probing `pg_index` for `business_product_discovery`,
+   `business_product_section_active`, `business_profile_eligible`
+   (`indisvalid = true`) and the ten `CatalogSectionTaxonomy` rows.
+2. **Feature flag** (blocker): `AZM_MARKETPLACE_DISCOVERY_ENABLED=true` in the
+   service environment. The route responds 404 until the flag is set.
+3. **Consumer** (sequencing, not a blocker): the P2 Mix UI PR swaps the
+   frontend gateway composition for `GET /api/discovery/items` behind
+   `MixCapability.crossStoreDiscovery` once this PR merges and the flag is on.
+
+Local/CI databases converge via `test.yml` (installer runs after `db push`)
+and the release chain; the manual paths above concern only the LIVE service.
+
 ## Receive/Request (FinancialOperation + PaymentRequest) provisioning
 
 PR #332 (server-owned payment-request API) is merged on main, but the

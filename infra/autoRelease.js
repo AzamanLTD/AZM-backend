@@ -9,11 +9,14 @@ const logger = require('../src/config/logger');
 //   1. Converges the retail checkout integrity schema after production db-push.
 //   2. Installs the additive Susu overlay schema objects.
 //   3. Installs the transaction quote overlay schema objects.
-//   4. Seeds the azaman-treasury wallet + v1.0 liability contract when needed.
+//   4. Installs the Marketplace Mix discovery surface (PR #349).
+//   5. Seeds the azaman-treasury wallet + v1.0 liability contract when needed.
 // =============================================================================
 
 const releaseStatus = {
   ran: false,
+  marketplaceDiscoveryInstalled: null,
+  marketplaceDiscoveryResult: null,
   startedAt: null,
   finishedAt: null,
   overlayInstalled: null,
@@ -120,6 +123,25 @@ async function autoRelease(prisma, opts = {}) {
     } catch (e) {
       log(`wallet address overlay threw (non-fatal): ${e.message}`);
       releaseStatus.walletAddressInstallerResult = { error: e.message };
+    }
+
+    // Marketplace Mix discovery surface (PR #349): D-5 visibility flag, D-2
+    // taxonomy column + mapping table + backfill, §3.3 indexes (built
+    // CONCURRENTLY — see the installer). Converges the SAME surface as the
+    // release chain via the exported installer (no subprocess). NOTE
+    // (DEPLOY_RUNBOOK.md): the live Render Free-plan path invokes NEITHER
+    // this boot step NOR `npm run release` — this wiring only heals
+    // environments that actually run autoRelease.
+    try {
+      const { installMarketplaceDiscoveryOverlay } = require('./install-marketplace-discovery-overlay');
+      const r = await installMarketplaceDiscoveryOverlay(prisma);
+      releaseStatus.marketplaceDiscoveryInstalled = true;
+      releaseStatus.marketplaceDiscoveryResult = r;
+      log(`marketplace discovery overlay: ${r.taxonomyRows} taxonomy rows, ${r.sectionsBackfilled} backfilled, indexes ${r.indexesCreated}c/${r.indexesRebuilt}r/${r.indexesKept}k`);
+    } catch (e) {
+      releaseStatus.marketplaceDiscoveryInstalled = false;
+      releaseStatus.marketplaceDiscoveryResult = { error: e.message };
+      log(`marketplace discovery overlay failed (non-fatal): ${e.message}`);
     }
 
     try {
