@@ -151,33 +151,53 @@ const STATEMENTS = [
 ];
 
 async function installFiatLiquidityOverlay() {
-  // The duplicate scan below is deliberately before the partial unique index,
-  // but a first install has no receipt table to scan yet. Create only the
-  // empty receipt table first; CREATE TABLE IF NOT EXISTS is additive and
-  // preserves any existing table/data. The full installer loop below remains
-  // responsible for the indexes, constraints and the rest of the overlay.
-  const receiptTableDdl = STATEMENTS.find((statement) =>
-    statement.startsWith('CREATE TABLE IF NOT EXISTS "FiatLiquidityReceipt"'));
-  if (!receiptTableDdl) throw new Error('FiatLiquidityReceipt CREATE TABLE statement is missing');
-  await prisma.$executeRawUnsafe(receiptTableDdl);
-
   // r15 R15-A duplicate preflight (READ-ONLY): the partial unique index
   // enforcing "at most one AVAILABLE receipt per relatedTransactionId"
   // cannot be applied over contradictory historical rows without PostgreSQL
   // failing the CREATE INDEX. We surface the offending rows FIRST, loudly,
   // with their identities — and NEVER auto-select a "winner": choosing among
   // historical double-claims requires human evidence review.
-  // First-install recovery: the receipt table may genuinely be absent on a
-  // production branch that predates this overlay. In that case there are no
-  // historical receipt rows to inspect; skip only this data-dependent check
-  // and let the idempotent statements below create the empty table. When the
-  // table already exists, keep the duplicate-evidence check BEFORE any DDL so
-  // contradictory historical rows are surfaced before the partial unique
-  // index is attempted.
-  const receiptTable = await prisma.$queryRawUnsafe(
-    `SELECT to_regclass('"FiatLiquidityReceipt"') IS NOT NULL AS "exists"`);
+  //
+  // §PR-342 first-install recovery: the receipt table may genuinely be absent
+  // on a production branch that predates this overlay, and the historical
+  // duplicate scan cannot run against a table that does not exist. The
+  // existence probe is therefore the FIRST thing this installer does, BEFORE
+  // any DDL:
+  //   * probe verifies exists = false → genuine first install: skip ONLY the
+  //     data-dependent historical scan and fall through to the normal
+  //     idempotent DDL below, which creates the table and then its indexes in
+  //     their normal order. No unrelated safety check is skipped or re-ordered.
+  //   * probe verifies exists = true → the historical scan runs BEFORE any
+  //     DDL, so contradictory historical rows are surfaced before the partial
+  //     unique index is attempted.
+  //   * the probe itself fails, or returns a malformed, missing, or ambiguous
+  //     result → FAIL CLOSED with a classified error before any DDL. An
+  //     unexpected probe result is NEVER interpreted as proof that the table
+  //     is absent (§PR-342 review item C).
+  let probe;
+  try {
+    probe = await prisma.$queryRawUnsafe(
+      `SELECT to_regclass('"FiatLiquidityReceipt"') IS NOT NULL AS "exists"`);
+  } catch (err) {
+    err.code = 'FIAT_LIQUIDITY_RECEIPT_PROBE_FAILED';
+    logger.error({ err: err.message },
+      '[install-fiat-liquidity-overlay] PRE-FLIGHT FAILURE: the FiatLiquidityReceipt existence probe failed — refusing to guess between a first install and an upgrade; no DDL was executed.');
+    throw err;
+  }
+  // Only a probe result of EXACTLY one row carrying a boolean exists flag is
+  // decisive. Anything else (empty result, extra rows, a missing or
+  // non-boolean flag) is ambiguous and must never decide the first-install
+  // path — fail closed before any DDL.
+  const probeRow = Array.isArray(probe) && probe.length === 1 ? probe[0] : null;
+  if (!probeRow || typeof probeRow.exists !== 'boolean') {
+    const err = new Error('FiatLiquidityReceipt existence probe returned a malformed or ambiguous result — refusing to guess between a first install and an upgrade; no DDL was executed.');
+    err.code = 'FIAT_LIQUIDITY_RECEIPT_PROBE_MALFORMED';
+    logger.error({ probe: JSON.stringify(probe) },
+      '[install-fiat-liquidity-overlay] PRE-FLIGHT FAILURE: ' + err.message);
+    throw err;
+  }
   let conflicting = [];
-  if (receiptTable[0]?.exists) {
+  if (probeRow.exists) {
     conflicting = await prisma.$queryRawUnsafe(`
       SELECT "relatedTransactionId", "dedupKey", "amountGhs", "confirmedAt"
       FROM "FiatLiquidityReceipt"
@@ -189,7 +209,7 @@ async function installFiatLiquidityOverlay() {
         )
       ORDER BY "relatedTransactionId", "confirmedAt"`);
   } else {
-    logger.info('[install-fiat-liquidity-overlay] FiatLiquidityReceipt is absent on first install; skipping historical duplicate preflight.');
+    logger.info('[install-fiat-liquidity-overlay] FiatLiquidityReceipt is absent on first install; skipping the historical duplicate preflight (the data-dependent scan cannot run against a table that does not exist). The idempotent DDL below creates the empty table and then its indexes in their normal order.');
   }
   if (conflicting.length > 0) {
     logger.error({ conflicts: conflicting },
