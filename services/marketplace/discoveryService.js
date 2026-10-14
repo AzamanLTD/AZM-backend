@@ -521,16 +521,20 @@ function _canonicalDelta(value) {
     return priceService.pesewasToGhsString(priceService.toPesewas(d));
 }
 
-// A priceDeltaGhs sitting at the GROUP ROOT (not on an option) is not part of
-// the pricing math, but it is still GHS data under this identity — validate
-// + canonicalize it in place, never drop it.
-function _canonicalGroupRootDelta(group) {
+// A priceDeltaGhs sitting at the GROUP ROOT (not on an option) is NOT a
+// supported shape: the approved contract defines GHS deltas on OPTIONS only,
+// a root delta has no pricing semantics (validateGhsDeltas never inspects
+// it, so nothing would bound it), and exposing it as a price field would be
+// misleading. Reject it outright — the item fails closed instead. If root
+// deltas are ever to be supported, their semantics and bounds must first be
+// defined and enforced consistently.
+function _assertNoGroupRootDelta(group, ctx) {
     if (group && typeof group === 'object' && !Array.isArray(group)
         && Object.prototype.hasOwnProperty.call(group, 'priceDeltaGhs')
         && group.priceDeltaGhs !== undefined && group.priceDeltaGhs !== null) {
-        return _canonicalDelta(group.priceDeltaGhs);
+        throw new priceService.BusinessPriceError('GHS_DELTA_AT_GROUP_ROOT',
+            `${ctx}: priceDeltaGhs at the group ROOT is not a supported shape (the approved contract defines deltas on OPTIONS only) — item excluded`);
     }
-    return undefined;
 }
 
 // Mirrors storefront normalizeVariantGroups (the USDC checkout authority for
@@ -538,17 +542,29 @@ function _canonicalGroupRootDelta(group) {
 function _normalizedVariantGroups(raw) {
     if (Array.isArray(raw)) {
         const objectEntries = raw.filter((entry) => entry && typeof entry === 'object');
-        const isFlatOptionList = objectEntries.length > 0
-            && objectEntries.every((entry) => !Array.isArray(entry.options) && !Array.isArray(entry.values));
+        const flatObjectRows = objectEntries.filter((entry) => !Array.isArray(entry.options) && !Array.isArray(entry.values));
+        const groupedObjectRows = objectEntries.length - flatObjectRows.length;
+        if (flatObjectRows.length > 0 && groupedObjectRows > 0) {
+            // GENUINELY MIXED flat option rows + grouped entries. The legacy
+            // normalizer reads this as grouped and silently turns every flat
+            // row into an empty group — losing its option semantics, its USDC
+            // priceDelta and any GHS delta. That legacy reading is NOT a safe
+            // normalization: the shape is ambiguous (is the flat row an
+            // option or a group?) and cannot be represented without loss, so
+            // the item fails closed rather than publishing a misshapen DTO.
+            throw new priceService.BusinessPriceError('GHS_MIXED_VARIANT_SHAPE',
+                'variants mixes flat option rows with grouped entries — ambiguous shape that cannot be represented without losing data; item excluded');
+        }
+        const isFlatOptionList = flatObjectRows.length > 0 && groupedObjectRows === 0;
         if (isFlatOptionList) {
             // Shape A: businessProductService flat rows → one Size group.
             return [{ name: 'Size', required: true, options: _normalizedOptions(raw, 'variants') }];
         }
-        // Shape B (grouped, incl. storefront's mixed reading). Name semantics
-        // mirror normalizeVariantGroups exactly: entries without a usable
-        // name/id keep the `Variant N` placeholder (legacy keeps them);
-        // ONLY an object whose explicit name/id trims empty is dropped —
-        // and a dropped group must not take a GHS delta with it.
+        // Shape B (grouped). Name semantics mirror normalizeVariantGroups
+        // exactly: entries without a usable name/id keep the `Variant N`
+        // placeholder (legacy keeps them); ONLY an object whose explicit
+        // name/id trims empty is dropped — and a dropped group must not take
+        // a GHS delta with it.
         const groups = [];
         raw.forEach((group, index) => {
             const isObj = Boolean(group) && typeof group === 'object' && !Array.isArray(group);
@@ -561,7 +577,7 @@ function _normalizedVariantGroups(raw) {
                 }
                 return; // legacy .filter(group => group.name) drops it
             }
-            const rootDelta = _canonicalGroupRootDelta(group);
+            _assertNoGroupRootDelta(group, `variants[${index}]`);
             const options = _normalizedOptions(isObj ? (group.options ?? group.values) : undefined,
                 `variants[${index}]`);
             const out = {
@@ -569,7 +585,6 @@ function _normalizedVariantGroups(raw) {
                 required: isObj ? group.required !== false : true,
                 options,
             };
-            if (rootDelta !== undefined) out.priceDeltaGhs = rootDelta;
             groups.push(out);
         });
         return groups;
@@ -615,9 +630,9 @@ function _normalizedModifierGroups(raw) {
             }
             return; // legacy .filter(group => group.name) drops it
         }
+        _assertNoGroupRootDelta(group, `modifierGroups[${index}]`);
         const maxRaw = isObj ? Number(group.maxSelection ?? group.max ?? 1) : NaN;
         const maxSelection = Math.max(1, Math.floor(Number.isFinite(maxRaw) ? maxRaw : 0));
-        const rootDelta = _canonicalGroupRootDelta(group);
         const options = _normalizedOptions(isObj ? (group.options ?? group.values) : undefined,
             `modifierGroups[${index}]`);
         const out = {
@@ -626,7 +641,6 @@ function _normalizedModifierGroups(raw) {
             maxSelection,
             options,
         };
-        if (rootDelta !== undefined) out.priceDeltaGhs = rootDelta;
         groups.push(out);
     });
     return groups;

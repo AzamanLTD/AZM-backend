@@ -1017,7 +1017,7 @@ run('Marketplace Mix P1 discovery (real PostgreSQL)', () => {
         }]);
     });
 
-    test('shapes: GROUPED rows with options AND values keys both surface; mixed flat+string rows keep string options', async () => {
+    test('shapes: GROUPED rows with options AND values keys both surface (values treated identically to options)', async () => {
         const { profile } = await seedBusiness();
         const token = `shapegrp${seq}`;
         const prod = await seedProduct(profile, {
@@ -1102,55 +1102,85 @@ run('Marketplace Mix P1 discovery (real PostgreSQL)', () => {
         ]);
     });
 
-    test('shapes: a priceDeltaGhs at the GROUP ROOT is validated + canonicalized in place, never dropped', async () => {
+    test('shapes: a priceDeltaGhs at the GROUP ROOT is an UNSUPPORTED shape — rejected in every form, never served', async () => {
         const { profile } = await seedBusiness();
         const token = `shaperoot${seq}`;
-        const valid = await seedProduct(profile, {
-            description: token, totalOrders: 40, variants: [
-                { name: 'Size', priceDeltaGhs: '2.5', options: [{ name: 'Regular', priceDelta: 0, priceDeltaGhs: '0' }] },
-            ],
-        });
-        await setConfirmedPrice(valid.id, '25.00');
-
-        const page = await feed({ q: token });
-        const item = page.items.find((i) => i.id === valid.id);
-        expect(item).toBeDefined();
-        expect(item.variants).toEqual([{
-            name: 'Size', required: true, priceDeltaGhs: '2.50',
-            options: [{ name: 'Regular', priceDelta: 0, priceDeltaGhs: '0.00' }],
-        }]);
-    });
-
-    test('shapes: INVALID root-level deltas (number) exclude the item; healthy sibling stays served — variants AND modifierGroups', async () => {
-        const { profile } = await seedBusiness();
-        const token = `shaperootbad${seq}`;
         const healthy = await seedProduct(profile, {
             description: token, totalOrders: 100, variants: [
                 { name: 'Size', options: [{ name: 'Regular', priceDelta: 0, priceDeltaGhs: '1' }] },
             ],
         });
         await setConfirmedPrice(healthy.id, '25.00');
-        const badVariantRoot = await seedProduct(profile, {
-            description: token, totalOrders: 90, variants: [
-                { name: 'Size', priceDeltaGhs: 5, options: [{ name: 'Regular', priceDelta: 0 }] }, // JSON number at root
-            ],
-        });
-        await setConfirmedPrice(badVariantRoot.id, '25.00');
-        const badModifierRoot = await seedProduct(profile, {
-            description: token, totalOrders: 80, modifierGroups: [
-                { name: 'Extras', priceDeltaGhs: '1.005', options: [{ name: 'Cheese', priceDelta: 0 }] }, // sub-pesewa at root
-            ],
-        });
-        await setConfirmedPrice(badModifierRoot.id, '25.00');
+        // The approved contract defines GHS deltas on OPTIONS only; a root
+        // delta has no pricing semantics and no bounds check, so it is
+        // rejected regardless of how well-formed it is — including the exact
+        // out-of-range decimal string the review called out.
+        const cases = [
+            { variants: [{ name: 'Size', priceDeltaGhs: '2.5', options: [{ name: 'Regular', priceDelta: 0 }] }] }, // well-formed, in range
+            { variants: [{ name: 'Size', priceDeltaGhs: '100000.01', options: [{ name: 'Regular', priceDelta: 0 }] }] }, // out-of-range bounds escape
+            { variants: [{ name: 'Size', priceDeltaGhs: 5, options: [{ name: 'Regular', priceDelta: 0 }] }] }, // JSON number
+            { modifierGroups: [{ name: 'Extras', priceDeltaGhs: '1.005', options: [{ name: 'Cheese', priceDelta: 0 }] }] }, // sub-pesewa at modifier root
+        ];
+        const bad = [];
+        for (const [i, extra] of cases.entries()) {
+            const prod = await seedProduct(profile, { description: token, totalOrders: 90 - i, ...extra });
+            await setConfirmedPrice(prod.id, '25.00');
+            bad.push(prod.id);
+        }
 
         const page = await feed({ q: token });
         const got = ids(page);
         expect(got).toContain(healthy.id);
-        expect(got).not.toContain(badVariantRoot.id);
-        expect(got).not.toContain(badModifierRoot.id);
-        // the healthy item's option delta is canonicalized
-        const served = page.items.find((i) => i.id === healthy.id);
+        for (const id of bad) expect(got).not.toContain(id);
+        // the healthy item's OPTION-level delta is still canonicalized
+        const served = page.items.find((it) => it.id === healthy.id);
         expect(served.variants[0].options[0].priceDeltaGhs).toBe('1.00');
+        // no served DTO ever carries a group-root priceDeltaGhs
+        for (const it of page.items) {
+            for (const g of (it.variants ?? []).concat(it.modifierGroups ?? [])) {
+                expect(Object.prototype.hasOwnProperty.call(g, 'priceDeltaGhs')).toBe(false);
+            }
+        }
+    });
+
+    test('shapes: a GENUINELY MIXED flat+grouped array never silently loses flat options — the item fails closed', async () => {
+        const { profile } = await seedBusiness();
+        const token = `shapemixed${seq}`;
+        const healthy = await seedProduct(profile, {
+            description: token, totalOrders: 100, variants: [
+                { name: 'Size', options: [{ name: 'Regular', priceDelta: 0 }] },
+            ],
+        });
+        await setConfirmedPrice(healthy.id, '25.00');
+        // The legacy normalizer reads a mixed array as grouped and turns each
+        // flat row into an empty group — losing the option, its USDC
+        // priceDelta and any GHS delta. The feed refuses to publish that.
+        const cases = [
+            [
+                { name: 'Small', priceDelta: 0 },
+                { name: 'Color', options: [{ name: 'Red', priceDelta: 0.5 }] },
+            ],
+            [
+                { name: 'Small', priceDelta: 0, priceDeltaGhs: '1' },
+                { name: 'Color', values: [{ name: 'Red', priceDelta: 0.5 }] },
+            ],
+        ];
+        const bad = [];
+        for (const [i, variants] of cases.entries()) {
+            const prod = await seedProduct(profile, { description: token, totalOrders: 90 - i, variants });
+            await setConfirmedPrice(prod.id, '25.00');
+            bad.push(prod.id);
+        }
+
+        const page = await feed({ q: token });
+        const got = ids(page);
+        expect(got).toContain(healthy.id);
+        for (const id of bad) expect(got).not.toContain(id);
+        // healthy grouped DTO is intact
+        const served = page.items.find((it) => it.id === healthy.id);
+        expect(served.variants).toEqual([
+            { name: 'Size', required: true, options: [{ name: 'Regular', priceDelta: 0 }] },
+        ]);
     });
 
     test('shapes: INVALID option-level deltas exclude the item in EVERY storage shape (flat, grouped, object-keyed)', async () => {
