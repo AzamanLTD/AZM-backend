@@ -337,6 +337,43 @@ async function confirmPrice(tx, { priceId, confirmedByType, confirmedById, note 
 // This is the ONLY eligibility gate; consumers (Mix discovery P3, checkout
 // P4) must call it, never query BusinessPrice directly.
 
+// ─── shared eligibility internals ───────────────────────────────────────────
+//
+// The single-source eligibility predicates below are exported so the ONLY
+// two consumers that must filter on price eligibility in the database —
+// Mix discovery's paginated candidate query and any future checkout
+// revalidation — apply EXACTLY this predicate, instead of hand-writing a
+// where-clause that can drift from the resolver. The resolver remains the
+// single eligibility authority (consumers must call it, never query
+// BusinessPrice directly); this fragment IS the resolver's predicate.
+
+function eligibleCurrentGhsPriceWhere() {
+    return {
+        currency: 'GHS',
+        scope: 'DEFAULT',
+        locationId: null, // the GLOBAL identity only — a malformed row (DEFAULT with a location) must never resolve as the global price
+        status: 'ACTIVE',
+        effectiveTo: null,
+        // A price is never eligible before its effective start (v1: no
+        // scheduled pricing — see resolveEffectiveGhsPrice).
+        effectiveFrom: { lte: new Date() },
+        confirmedByType: { in: ['BUSINESS', 'ADMIN'] }, // MIGRATION rows never resolve
+        confirmedAt: { not: null }, // an unconfirmed row (e.g. MIGRATION backfill) never confers eligibility
+    };
+}
+
+// Row-level selection shared by the single-product resolver and the batch
+// resolver so the two can never disagree. v1 contract: NO scheduled future
+// pricing — a confirmed current row with effectiveFrom in the future can
+// only exist via a raw write or clock skew.
+function selectEligiblePriceRows(rows, now = new Date()) {
+    const confirmed = rows.filter((row) =>
+        ['BUSINESS', 'ADMIN'].includes(row.confirmedByType) && row.confirmedAt !== null);
+    const eligible = confirmed.filter((row) => row.effectiveFrom.getTime() <= now.getTime());
+    const futureDated = confirmed.filter((row) => row.effectiveFrom.getTime() > now.getTime());
+    return { eligible, futureDated };
+}
+
 async function resolveEffectiveGhsPrice(client, businessProductId) {
     const rows = await client.businessPrice.findMany({
         where: {
@@ -354,11 +391,7 @@ async function resolveEffectiveGhsPrice(client, businessProductId) {
     // so a current row with effectiveFrom in the future can only exist via a
     // raw write or clock skew — serving it would silently expose a scheduled
     // price this contract does not support, so the resolver FAILS CLOSED.
-    const now = new Date();
-    const confirmed = rows.filter((row) =>
-        ['BUSINESS', 'ADMIN'].includes(row.confirmedByType) && row.confirmedAt !== null);
-    const eligible = confirmed.filter((row) => row.effectiveFrom.getTime() <= now.getTime());
-    const futureDated = confirmed.filter((row) => row.effectiveFrom.getTime() > now.getTime());
+    const { eligible, futureDated } = selectEligiblePriceRows(rows);
     if (futureDated.length > 0 && eligible.length === 0) {
         throw new BusinessPriceError('GHS_FUTURE_DATED_CURRENT_PRICE',
             `current price for product ${businessProductId} is scheduled for the future (${futureDated[0].effectiveFrom.toISOString()}) — scheduled pricing is not supported in v1; refusing to serve or hide it silently`);
@@ -373,6 +406,57 @@ async function resolveEffectiveGhsPrice(client, businessProductId) {
     return eligible[0];
 }
 
+// Batch resolver for feed-shaped consumers (Mix discovery): resolves the
+// effective GHS price for many products in ONE query, with the same
+// eligibility decision as resolveEffectiveGhsPrice (shared row selector).
+//
+// Divergence from the single resolver, deliberate and documented: a feed
+// must not 500 on ONE corrupt identity. The single resolver THROWS on
+// future-dated/ambiguous rows (correct for a per-product read or a
+// checkout, where the caller must learn the row set is corrupt); the batch
+// resolver FAILS CLOSED PER IDENTITY instead — the corrupt product's item
+// is EXCLUDED from the feed (never exposed early, never served ambiguous)
+// and the corruption is logged loudly for operators. Every other product
+// on the page is unaffected.
+async function resolveEffectiveGhsPrices(client, businessProductIds) {
+    if (!Array.isArray(businessProductIds) || businessProductIds.length === 0) {
+        return new Map();
+    }
+    const rows = await client.businessPrice.findMany({
+        where: {
+            businessProductId: { in: businessProductIds },
+            ...eligibleCurrentGhsPriceWhere(),
+        },
+        orderBy: { effectiveFrom: 'desc' },
+    });
+    const byProduct = new Map();
+    for (const row of rows) {
+        const list = byProduct.get(row.businessProductId) || [];
+        list.push(row);
+        byProduct.set(row.businessProductId, list);
+    }
+    const logger = require('../src/config/logger');
+    const resolved = new Map();
+    for (const [productId, productRows] of byProduct) {
+        const { eligible } = selectEligiblePriceRows(productRows);
+        if (eligible.length === 0) {
+            // Eligibility-where already excludes unconfirmed/ future rows, so
+            // landing here means the row changed between the candidate query
+            // and this resolution (archived/confirmed away mid-request).
+            // Fail closed: the item loses its price and must not render.
+            continue;
+        }
+        if (eligible.length > 1) {
+            // The partial unique index makes this impossible in a healthy
+            // database. Never pick a winner silently — exclude + log.
+            logger.error(`[businessPriceService] GHS_CURRENT_PRICE_AMBIGUOUS (batch): multiple eligible current prices for product ${productId} — the unique index is missing or the row set is corrupt; item excluded from the feed`);
+            continue;
+        }
+        resolved.set(productId, eligible[0]);
+    }
+    return resolved;
+}
+
 module.exports = {
     BusinessPriceError,
     parseGhsDecimal,
@@ -383,6 +467,8 @@ module.exports = {
     setPrice,
     confirmPrice,
     resolveEffectiveGhsPrice,
+    resolveEffectiveGhsPrices,
+    eligibleCurrentGhsPriceWhere,
     // closed domains exported for tests and future admin surfaces
     SCOPE_VALUES,
     CONFIRMED_BY_VALUES,
