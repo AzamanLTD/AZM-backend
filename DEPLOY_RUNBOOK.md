@@ -25,25 +25,72 @@ unique index.)
 
 ## Free-plan Render deploy path (CURRENT LIVE SERVICE)
 
-The **live azaman-backend Render service is on the Free plan**, which does NOT
-execute the Pre-Deploy Command. Its Build Command runs only three overlay
-installers (E2EE server-blind, inventory-restock, reservation-capacity).
-Consequences:
+The **live azaman-backend Render service is on the Free plan** (verified
+read-only against the Render API on 2026-10-15, alongside the release-path
+preflight for the Marketplace Mix discovery surface). Its actual execution
+paths are:
 
-- `npm run release` does not run on deploys, so an installer added to the
-  release chain does NOT automatically provision the production database.
-- `infra/autoRelease.js` is not invoked during normal startup, so boot does
-  not self-heal the gap either.
+- **Build Command** (Settings → Build & Deploy):
+  `npm install && npm run build && node infra/install-e2ee-server-blind-overlay.js && node infra/install-inventory-restock-overlay.js && node infra/install-reservation-capacity-overlay.js`
+  — i.e. `prisma generate` plus THREE overlay installers (E2EE server-blind,
+  inventory-restock, reservation-capacity). It does NOT include the other
+  fifteen installers of the release chain.
+- **Pre-Deploy Command**: `npm run release` is CONFIGURED but the Free plan
+  does NOT execute it. The full 18-installer release chain therefore does
+  not run on deploys.
+- **Start Command**: `node index.js` → `server.js` → `bootTreasury(app, prisma)`
+  → `infra/autoRelease.js` — the boot-time auto-release path runs at EVERY
+  process start, in the background, non-fatal. Its current `main` steps are:
+  retail-checkout-integrity, prod-drift-remediation, susu overlay,
+  transaction-quote overlay, wallet-address overlay, azamanId backfill,
+  susu-foundation seed, and — since PR #349 — the Marketplace Mix
+  discovery overlay. This is the "startup schema-convergence activity"
+  visible in Render logs.
 
-**Required dashboard change (Settings → Build & Deploy)** — append the
-missing installer to the Build Command (idempotent, additive-only, ~1s):
+Two consequences of that split:
 
-    npm install && npm run build && node infra/install-business-price-overlay.js
+- An installer added ONLY to the release chain (e.g. a future
+  `npm run release` addition) does NOT automatically provision the
+  production database, because the release chain itself never runs.
+- The boot-time path is NOT equivalent to the full release chain: it is a
+  SMALLER subset. In particular `infra/autoRelease.js` includes the
+  Marketplace Discovery installer but does NOT run
+  `infra/install-business-price-overlay.js` (nor r42 idempotency,
+  payment-requests, e2ee, inventory-restock, reservation-capacity — the
+  last three run at BUILD time instead). Anything the boot subset omits
+  still needs the dashboard Build Command, the guarded provisioning
+  workflows, or a plan upgrade.
+
+**Verified live database target (2026-10-15 preflight, non-secret facts
+only):** the service's `DATABASE_URL` points at the ORIGINAL production
+Neon branch of project "Azaman DB" — host `ep-crimson-cell-ab81e3bp.eu-west-2.aws.neon.tech`,
+database `neondb`, TLS — NOT the Azaman-New greenfield project
+(`ep-floral-hat-…`). Do not assume a Neon branch identity from this
+document's history alone: re-verify the target before any provisioning
+decision, and never print credentials.
+
+**Ordering invariant for future provisioning:** the full release chain
+installs `install-business-price-overlay.js` BEFORE
+`install-marketplace-discovery-overlay.js` (the discovery overlay is the
+LAST step of the chain). The boot-time path inverts coverage — it carries
+Discovery but NOT BusinessPrice. When provisioning by any other route
+(dashboard Build Command or a guarded workflow), preserve the
+BusinessPrice-before-Discovery order and never remove existing installers.
+As of 2026-10-15 the inspected production branch ALREADY carries the
+expected `BusinessPrice` schema and DB constraints but ZERO confirmed price
+rows — a discovery feed served against it would be legitimately empty
+until real business-confirmed prices exist.
+
+**Dashboard Build Command note:** appending
+`node infra/install-business-price-overlay.js` to the Build Command
+(idempotent, additive-only, ~1s) remains a supported belt-and-braces step,
+but it is NOT required for the Marketplace Discovery surface — deploying
+current `main` provisions the discovery overlay at boot via autoRelease.
 
 Long term the blueprint (`render.yaml`) already encodes
 `preDeployCommand: npm run release`; once the service moves to a plan that
 executes pre-deploy commands, that becomes the authoritative path again and
-the appended build-command step is a harmless replay.
+any duplicated installer steps are harmless replays.
 
 **Until the dashboard change is applied**, the guarded workflow
 `.github/workflows/provision-azaman-new-business-price.yml` is the supported
@@ -77,26 +124,40 @@ detects, drops and rebuilds on the next run). The installer is wired into
 `npm run release` AND boot `infra/autoRelease.js` (same exported function —
 no subprocess divergence).
 
-**That wiring does NOT provision the live Free-plan service.** Per the section
-above, the live Render Free plan executes NEITHER the Pre-Deploy Command
-(`npm run release`) NOR `infra/autoRelease.js` at startup, so the discovery
-surface is an **explicit activation blocker** — until one of the supported
-paths below runs against the authoritative production database, the
-`/api/discovery/items` route cannot be enabled:
+**On the live Free-plan service the boot-time path IS the provisioning
+path** (see the Free-plan section above — verified 2026-10-15): current
+`main` includes this installer in `infra/autoRelease.js`, and
+`autoRelease` runs at every process start. Deploying current `main`
+therefore provisions the discovery surface automatically (additively,
+non-fatally, in the background) against whatever database the service's
+`DATABASE_URL` targets. No dashboard change is strictly required for the
+schema. The activation gates remain:
 
-1. **Database provisioning** (blocker): apply the installer on the
-   authoritative production database. Supported paths, in order of preference:
-   the Settings → Build & Deploy dashboard change appending the installer to
-   the Build Command (idempotent, additive-only), or a guarded
-   `workflow_dispatch` provisioning workflow — which GitHub only offers once
-   the workflow file is on the default branch, i.e. after this PR merges.
-   **Do not guess which Neon branch is authoritative and do not dispatch any
-   provisioning workflow from a non-default branch.** Verify post-apply by
-   probing `pg_index` for `business_product_discovery`,
-   `business_product_section_active`, `business_profile_eligible`
-   (`indisvalid = true`) and the ten `CatalogSectionTaxonomy` rows.
-2. **Feature flag** (blocker): `AZM_MARKETPLACE_DISCOVERY_ENABLED=true` in the
-   service environment. The route responds 404 until the flag is set.
+1. **Deploy + post-deploy schema verification** (gate): deploy current
+   `main` (manual deploy; auto-deploy stays off), then confirm in the boot
+   logs that `[autoRelease] … discovery surface installed` appears, and
+   verify the schema read-only: `pg_index` rows for
+   `business_product_discovery`, `business_product_section_active`,
+   `business_profile_eligible` all `indisvalid = true`, and the ten
+   `CatalogSectionTaxonomy` seed rows. **Do not guess which Neon branch
+   is authoritative** — re-verify the live `DATABASE_URL` target first
+   (see the Free-plan section) and do not dispatch any provisioning
+   workflow from a non-default branch.
+2. **Feature flag** (gate, off during deployment and verification):
+   `AZM_MARKETPLACE_DISCOVERY_ENABLED=true` in the service environment.
+   The route responds 404 until the flag is set — verify the flag-off 404
+   BEFORE enabling, and run the live API smoke suite (200 envelope,
+   cursor pagination, category + repeatable `taxonomy` filters, 422 on
+   invalid chips, honest empty feed) immediately after.
+3. **Real price data** (gate): the price-eligibility gate serves only
+   products with a business-confirmed effective `BusinessPrice` GHS row.
+   As of 2026-10-15 the production branch has ZERO confirmed rows, so
+   the feed would be legitimately EMPTY even with everything else green.
+   Do NOT seed prices via the installer or any automation path — real
+   confirmed price data must come from business owners through the
+   normal price-management flow. Do not enable the flag until genuine
+   price data exists (or the owner explicitly accepts an empty feed as
+   the interim state).
 3. **Consumer** (sequencing, not a blocker): the P2 Mix UI PR swaps the
    frontend gateway composition for `GET /api/discovery/items` behind
    `MixCapability.crossStoreDiscovery` once this PR merges and the flag is on.
@@ -107,10 +168,15 @@ and the release chain; the manual paths above concern only the LIVE service.
 ## Receive/Request (FinancialOperation + PaymentRequest) provisioning
 
 PR #332 (server-owned payment-request API) is merged on main, but the
-Free-plan Render service never ran `npm run release`, so the deployed
-Azaman-New database still lacks the two tables that API requires —
-`FinancialOperation` (r42 idempotency authority) and `PaymentRequest`
-(standalone request resource). Frontend PR #147 is blocked on exactly this.
+Free-plan Render service never ran `npm run release`, and its boot-time
+`autoRelease` path does not include the r42 or payment-requests installers —
+so the two tables that API requires — `FinancialOperation` (r42
+idempotency authority) and `PaymentRequest` (standalone request resource) —
+were NOT provisioned by the deploy path and must be verified on the live
+branch (the 2026-10-15 preflight showed the service's `DATABASE_URL` targets
+the ORIGINAL production Neon branch, not Azaman-New — see the Free-plan
+section) before any provisioning decision. Frontend PR #147 is blocked on
+exactly this.
 
 **Supported path until the dashboard change is applied:** the guarded
 workflow `.github/workflows/provision-azaman-new-receive-request.yml`.
