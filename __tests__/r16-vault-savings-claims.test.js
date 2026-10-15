@@ -115,22 +115,59 @@ describeOrSkip('r16 P0-D: Vault terminal claims', () => {
         const user = await seedUser(prisma, { availableBalance: 50 });
         const vault = await seedVaultWithBalance(user.id, 100);
 
-        // Break wins the row lock; the concurrent deposit must roll back.
-        const [, depositRes] = await Promise.allSettled([
+        // The two transactions now share the Vault→User lock order, so
+        // Postgres serializes them instead of deadlocking: EITHER break
+        // wins (the deposit's guarded ACTIVE claim finds count 0 → clean
+        // VAULT_TERMINALIZED rollback) OR deposit wins (break then runs to
+        // completion behind it). The assertions below hold in BOTH orders.
+        const [breakRes, depositRes] = await Promise.allSettled([
             vaultSvc.breakEarly({ userId: user.id, vaultId: vault.id }),
             vaultSvc.depositManual({ userId: user.id, vaultId: vault.id, amountUsdc: 30 }),
         ]);
 
+        // r16 P0-F regression: neither side may die to a Prisma deadlock /
+        // write-conflict error (P2034) — the pre-fix AB-BA lock order
+        // produced exactly that flaky failure on CI. Only the clean
+        // business outcomes are allowed to surface.
+        for (const res of [breakRes, depositRes]) {
+            if (res.status === 'rejected') {
+                const msg = String(res.reason?.message || res.reason || '');
+                expect(msg).not.toMatch(/P2034|deadlock|write conflict|40P01|40001/i);
+                expect(['VAULT_TERMINALIZED', 'VAULT_ALREADY_TERMINALIZED'])
+                    .toContain(res.reason?.code);
+            }
+        }
+
         const freshVault = await prisma.vault.findUnique({ where: { id: vault.id } });
+        // Whichever order serialized, the vault ends TERMINAL and drained
+        // exactly once (deposit-winner: break refunds 130−penalty; break-
+        // winner: deposit rolled back). It can never remain ACTIVE with a
+        // stranded deposit while both calls have settled.
         expect(freshVault.status).not.toBe('ACTIVE');
-        // Whatever committed, the vault balance must be terminal-consistent:
-        // a broken vault holds ZERO (any deposit that lost the race rolled back).
         expect(Number(freshVault.currentAmountUsdc)).toBe(0);
 
         const freshUser = await prisma.user.findUnique({ where: { id: user.id } });
-        // Either the deposit lost (balance back to 50+release) or never happened.
-        expect(Number(freshUser.availableBalance)).toBeGreaterThan(0);
+        // Break-winner: 50 + 95 = 145. Deposit-winner: 50 − 30 + 123.5 = 143.5.
+        expect([145, 143.5]).toContain(Number(freshUser.availableBalance));
         expect(depositRes).toBeDefined();
+    });
+
+    test('D2b: deposit-winner serialization — a committed deposit is refunded by the subsequent break', async () => {
+        const user = await seedUser(prisma, { availableBalance: 50 });
+        const vault = await seedVaultWithBalance(user.id, 100);
+
+        // Pin the deposit-winner branch deterministically: the deposit
+        // commits fully, then the break runs to completion behind it.
+        await vaultSvc.depositManual({ userId: user.id, vaultId: vault.id, amountUsdc: 30 });
+        await vaultSvc.breakEarly({ userId: user.id, vaultId: vault.id });
+
+        const freshVault = await prisma.vault.findUnique({ where: { id: vault.id } });
+        expect(freshVault.status).toBe('BROKEN_EARLY');
+        expect(Number(freshVault.currentAmountUsdc)).toBe(0);
+
+        // 130 balance − 5% penalty = 123.5 refunded, on top of 50 − 30.
+        const freshUser = await prisma.user.findUnique({ where: { id: user.id } });
+        expect(Number(freshUser.availableBalance)).toBeCloseTo(143.5, 5);
     });
 });
 
