@@ -567,9 +567,41 @@ class VaultService {
                     err.code = 'USER_AUTHORIZATION_LOST';
                     throw err;
                 }
+                // r16 P0-D: guarded vault claim — a vault terminalized
+                // (broken early / completed) between the caller's stale
+                // read and this deposit can NEVER receive money: the
+                // conditional ACTIVE claim is the single-winner guard.
+                //
+                // LOCK ORDER (r16 P0-F deadlock elimination): this claim is
+                // FIRST so the deposit takes row locks Vault→User, the same
+                // order as breakEarly/completeMatured (SELECT … FOR UPDATE on
+                // the vault, then the user credit). The previous User→Vault
+                // ordering formed a classic AB-BA pair with a concurrent
+                // terminal release: Postgres resolved it by killing one
+                // victim (P2034), so a user depositing and breaking the same
+                // vault at the same moment could deadlock one request into a
+                // hard error. Both claims are conditional CAS updates inside
+                // this single transaction, so ordering between them changes
+                // nothing semantically — whichever claim fails, the whole
+                // transaction rolls back.
+                const vaultClaim = await tx.vault.updateMany({
+                    where: { id: vault.id, status: 'ACTIVE' },
+                    data: {
+                        currentAmountUsdc: { increment: amount },
+                        ...(isOnTime ? { streakCount: { increment: 1 } } : {}),
+                        totalAzmEarned: { increment: new Prisma.Decimal(breakdown.totalAzm) },
+                        ...extraVaultUpdate,
+                    },
+                });
+                if (vaultClaim.count !== 1) {
+                    const err = new Error('Vault is no longer active.');
+                    err.code = 'VAULT_TERMINALIZED';
+                    throw err;
+                }
                 // r16 P0-D: guarded user claim — the conditional decrement
                 // fails closed on a concurrent spend instead of relying on
-                // the CHECK constraint as the only guard.
+                // the CHECK constraint as the only guard. Taken AFTER the
+                // vault claim to preserve the Vault→User lock order.
                 const userClaim = await tx.user.updateMany({
                     where: { id: vault.userId, availableBalance: { gte: amount }, banStatus: 'ACTIVE', isDeleted: false },
                     data: { availableBalance: { decrement: amount } },
@@ -589,24 +621,6 @@ class VaultService {
                     }
                     const err = new Error('Insufficient available balance for vault deposit.');
                     err.code = 'INSUFFICIENT_BALANCE';
-                    throw err;
-                }
-                // r16 P0-D: guarded vault claim — a vault terminalized
-                // (broken early / completed) between the caller's stale
-                // read and this deposit can NEVER receive money: the
-                // conditional ACTIVE claim is the single-winner guard.
-                const vaultClaim = await tx.vault.updateMany({
-                    where: { id: vault.id, status: 'ACTIVE' },
-                    data: {
-                        currentAmountUsdc: { increment: amount },
-                        ...(isOnTime ? { streakCount: { increment: 1 } } : {}),
-                        totalAzmEarned: { increment: new Prisma.Decimal(breakdown.totalAzm) },
-                        ...extraVaultUpdate,
-                    },
-                });
-                if (vaultClaim.count !== 1) {
-                    const err = new Error('Vault is no longer active.');
-                    err.code = 'VAULT_TERMINALIZED';
                     throw err;
                 }
                 // We hold the vault row lock from the claim inside this
