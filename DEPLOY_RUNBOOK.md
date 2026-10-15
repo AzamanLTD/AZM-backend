@@ -40,12 +40,22 @@ paths are:
   not run on deploys.
 - **Start Command**: `node index.js` → `server.js` → `bootTreasury(app, prisma)`
   → `infra/autoRelease.js` — the boot-time auto-release path runs at EVERY
-  process start, in the background, non-fatal. Its current `main` steps are:
-  retail-checkout-integrity, prod-drift-remediation, susu overlay,
-  transaction-quote overlay, wallet-address overlay, azamanId backfill,
-  susu-foundation seed, and — since PR #349 — the Marketplace Mix
-  discovery overlay. This is the "startup schema-convergence activity"
-  visible in Render logs.
+  process start, in the background, non-fatal. Its current `main` sequence
+  (source order, mid-way through the chain — NOT appended last):
+  1. retail-checkout-integrity
+  2. prod-drift-remediation
+  3. susu overlay
+  4. transaction-quote overlay
+  5. wallet-address overlay
+  6. **Marketplace Discovery overlay (PR #349)**
+  7. azamanId backfill
+  8. treasury lookup — the susu-foundation seed and id-number encryption
+     run ONLY when the treasury row is missing or a forced release is
+     requested; otherwise autoRelease skips both and finishes early.
+  Separately, AFTER `autoRelease()` completes, `bootTreasury()` runs the
+  Business OS overlay (fail-closed 503 for `/api/business-os` if it
+  fails). This whole boot sequence is the "startup schema-convergence
+  activity" visible in Render logs.
 
 Two consequences of that split:
 
