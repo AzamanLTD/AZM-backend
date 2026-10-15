@@ -57,9 +57,10 @@
 // (`npm run release`, 18 installers) is configured as the Pre-Deploy
 // Command but NEVER EXECUTED. The installer nonetheless reaches the live
 // database at every process start: server.js → bootTreasury() →
-// infra/autoRelease.js includes this installer (step 4) — that boot-time
-// subset is NOT the full release chain (it does not run the BusinessPrice
-// installer; see the runbook's ordering invariant). Deployment provisions
+// infra/autoRelease.js includes this installer mid-chain (after the
+// wallet-address overlay) — that boot-time subset is NOT the full
+// release chain (it does not run the BusinessPrice installer; see the
+// runbook's ordering invariant). Deployment provisions
 // the schema automatically; the remaining activation gates (flag off
 // during deploy, post-deploy schema verification, live API smoke tests,
 // and real business-confirmed BusinessPrice rows before enabling) are
