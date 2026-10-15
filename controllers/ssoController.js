@@ -53,10 +53,16 @@ exports.ssoLogin = async (req, res) => {
         // ── Verify Firebase ID Token ─────────────────────────────────────
         let decodedToken;
         try {
-            const admin = require('firebase-admin');
+            // firebase-admin v14: the legacy namespaced API is removed —
+            // use the modular entry points (app + auth subpaths). Requiring
+            // them does not initialize anything; the readiness check is
+            // getApps().length (the previous namespaced apps-length guard
+            // crashed on v14 reading `.length` of undefined).
+            const { getApps } = require('firebase-admin/app');
+            const { getAuth } = require('firebase-admin/auth');
             // Firebase Admin should be initialized once at server startup
             // If not initialized, skip verification in dev mode
-            if (!admin.apps.length) {
+            if (getApps().length === 0) {
                 // Phase K: this fallback used to silently decode the JWT
                 // WITHOUT verifying the signature, which is fine for a
                 // local dev box but a critical hole if the env-flag
@@ -114,7 +120,7 @@ exports.ssoLogin = async (req, res) => {
                 // Production path. verifyIdToken in firebase-admin already
                 // checks signature, expiry, AND aud (it must equal the
                 // initialised project id), so we get all three for free.
-                decodedToken = await admin.auth().verifyIdToken(idToken);
+                decodedToken = await getAuth().verifyIdToken(idToken);
                 // Defence-in-depth: if SSO_EXPECTED_AUD is configured,
                 // double-check it. The SDK's check is project-scoped
                 // already, so this is mostly a belt-and-braces on
