@@ -52,12 +52,19 @@
 // boot-time autoRelease can converge the same surface without a subprocess,
 // and runs as a CLI when invoked directly (`node infra/install-...`).
 //
-// LIVE-SERVICE ACTIVATION BLOCKER (DEPLOY_RUNBOOK.md, read before
-// enabling anything): the Render Free-plan path runs NEITHER
-// `npm run release` NOR `infra/autoRelease.js` — wiring this installer into
-// those chains does NOT provision the live database. See the "Marketplace
-// Mix discovery surface" runbook section for the supported provisioning
-// paths and the full activation-blocker list.
+// LIVE-SERVICE PROVISIONING PATH (DEPLOY_RUNBOOK.md, read before
+// enabling anything): on the Render Free plan the release chain
+// (`npm run release`, 18 installers) is configured as the Pre-Deploy
+// Command but NEVER EXECUTED. The installer nonetheless reaches the live
+// database at every process start: server.js → bootTreasury() →
+// infra/autoRelease.js includes this installer mid-chain (after the
+// wallet-address overlay) — that boot-time subset is NOT the full
+// release chain (it does not run the BusinessPrice installer; see the
+// runbook's ordering invariant). Deployment provisions
+// the schema automatically; the remaining activation gates (flag off
+// during deploy, post-deploy schema verification, live API smoke tests,
+// and real business-confirmed BusinessPrice rows before enabling) are
+// listed in the "Marketplace Mix discovery surface" runbook section.
 
 const { PrismaClient } = require('@prisma/client');
 const logger = require('../src/config/logger');
