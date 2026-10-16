@@ -56,12 +56,12 @@ describe('OracleService Kotani rate preference', () => {
         }));
     });
 
-    test('falls back to open FX when Kotani is unavailable', async () => {
+    test('fails closed when Kotani is unavailable — no canonical write, no fallback rate', async () => {
         axios.get.mockImplementation((url) => {
             if (url.includes('coingecko')) {
                 return Promise.resolve({ data: { tether: { usd: 1 }, 'usd-coin': { usd: 1 }, dai: { usd: 1 } } });
             }
-            if (url.includes('open.er-api.com')) return Promise.resolve({ data: { rates: { GHS: 12.11 } } });
+            // The retired FX composite must never be consulted.
             throw new Error(`unexpected GET URL: ${url}`);
         });
         axios.post.mockImplementation((url) => {
@@ -72,17 +72,19 @@ describe('OracleService Kotani rate preference', () => {
         const prisma = {
             globalSettings: {
                 upsert: jest.fn().mockResolvedValue({}),
+                update: jest.fn().mockResolvedValue({}),
             },
         };
         const service = new OracleService(prisma);
         await service.fetchAndUpdateRates();
 
-        expect(prisma.globalSettings.upsert).toHaveBeenCalledWith(expect.objectContaining({
-            update: expect.objectContaining({
-                liveUsdToGhs: 12.11,
-                liveRetailRate: 12.11,
-                liveRateSource: 'FALLBACK_FX',
-            }),
-        }));
+        // No canonical write of any kind: cached rate, source and every
+        // freshness timestamp stay untouched (Kotani-only authority).
+        expect(prisma.globalSettings.upsert).not.toHaveBeenCalled();
+        // At most a supplementary display-only refresh of the stablecoin
+        // fields — which can never touch transaction-rate authority.
+        expect(prisma.globalSettings.update).toHaveBeenCalledTimes(1);
+        const data = prisma.globalSettings.update.mock.calls[0][0].data;
+        expect(Object.keys(data).sort()).toEqual(['liveDaiToUsd', 'liveUsdcToUsd', 'liveUsdtToUsd']);
     });
 });

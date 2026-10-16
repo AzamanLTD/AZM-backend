@@ -45,7 +45,9 @@ describe('OracleService USDC/GHS fallback precision', () => {
     }));
   });
 
-  test('derives USDC/GHS from USD/GHS × USDC/USD when Kotani is unavailable', async () => {
+  test('writes NO canonical rate when Kotani is unavailable — the FX × CoinGecko composite is retired', async () => {
+    // Both supplementary feeds are healthy — their success must not
+    // manufacture a transaction rate or refresh freshness.
     axios.get.mockImplementation((url) => {
       if (url.includes('coingecko')) {
         return Promise.resolve({ data: { tether: { usd: 1 }, 'usd-coin': { usd: 0.9985 }, dai: { usd: 1 } } });
@@ -57,16 +59,24 @@ describe('OracleService USDC/GHS fallback precision', () => {
     });
     axios.post.mockRejectedValue(new Error('Kotani unavailable'));
 
-    const prisma = { globalSettings: { upsert: jest.fn().mockResolvedValue({}) } };
+    const prisma = {
+      globalSettings: {
+        upsert: jest.fn().mockResolvedValue({}),
+        update: jest.fn().mockResolvedValue({}),
+      },
+    };
     await new OracleService(prisma).fetchAndUpdateRates();
 
-    expect(prisma.globalSettings.upsert).toHaveBeenCalledWith(expect.objectContaining({
-      update: expect.objectContaining({
-        liveUsdToGhs: 13.20,
-        liveRetailRate: 13.1802,
-        liveUsdcToUsd: 0.9985,
-        liveRateSource: 'FALLBACK_FX',
-      }),
-    }));
+    // No canonical write: liveRetailRate / liveUsdToGhs / liveRateSource /
+    // lastRateSync / lastExternalSync all stay untouched.
+    expect(prisma.globalSettings.upsert).not.toHaveBeenCalled();
+    // Supplementary display-only refresh touches the stablecoin fields only.
+    expect(prisma.globalSettings.update).toHaveBeenCalledTimes(1);
+    const data = prisma.globalSettings.update.mock.calls[0][0].data;
+    expect(Object.keys(data).sort()).toEqual(['liveDaiToUsd', 'liveUsdcToUsd', 'liveUsdtToUsd']);
+    expect(data.liveUsdcToUsd).toBeCloseTo(0.9985, 10);
+    // The retired FX feed was never even requested.
+    const getUrls = axios.get.mock.calls.map(([url]) => String(url));
+    expect(getUrls.some((url) => url.includes('open.er-api.com'))).toBe(false);
   });
 });

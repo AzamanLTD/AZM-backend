@@ -5,25 +5,28 @@
 // The oracle composes THREE independent external sources. Failure isolation
 // is a hard contract:
 //
-//   Kotani (direct USDC/GHS)  — canonical; success writes KOTANI_PAY.
-//   CoinGecko (stablecoin USD) — supplementary; failure NEVER blocks the
-//                                canonical write (Kotani path), and alone it
-//                                can NEVER produce a retail write.
-//   open.er-api (USD/GHS FX)  — fallback leg of the composite; quotes USD,
-//                                never USDC — the raw FX rate must NEVER
-//                                reach liveRetailRate (a depeg would
-//                                misprice every USDC conversion).
+//   Kotani (direct USDC/GHS)  — the ONLY canonical transaction-rate source;
+//                                success writes KOTANI_PAY.
+//   CoinGecko (stablecoin USD) — supplementary DISPLAY-ONLY; failure NEVER
+//                                blocks the canonical write (Kotani path),
+//                                and alone it can NEVER produce a retail
+//                                write or refresh any freshness timestamp.
+//   open.er-api (USD/GHS FX)  — RETIRED. The FX × CoinGecko composite is
+//                                no longer consulted at all: it must never
+//                                write liveRetailRate/liveRateSource or
+//                                refresh canonical freshness.
 //
-// Consequences proven:
-//   A. Kotani success + CoinGecko failure → write proceeds (KOTANI_PAY),
-//      stablecoin fields preserved (absent from the update).
-//   B. Kotani failure + both composite legs succeed → FALLBACK_FX write
-//      with retail = FX × USDC/USD (USDC/GHS, never raw USD/GHS).
-//   C. Any PARTIAL composite (only one leg usable) writes NOTHING — the
-//      cached rate and every freshness timestamp stay untouched.
+// Consequences proven (Kotani-only authority, 2026-10-16 hardening wave):
+//   A. Kotani success + CoinGecko failure → canonical write proceeds
+//      (KOTANI_PAY), stablecoin fields preserved (absent from the update).
+//   B. Kotani failure + supplementary feeds succeeding → NO canonical
+//      write; at most a stablecoin DISPLAY-ONLY update whose keys can
+//      never touch liveRetailRate / liveRateSource / freshness.
+//   C. Any supplementary failure → NOTHING is written at all.
 //   D. Total failure writes NOTHING.
-//   E. Every successful write stamps lastRateSync === lastExternalSync
-//      (one observation, both freshness fields — the 271B contract).
+//   E. Every successful canonical write stamps
+//      lastRateSync === lastExternalSync (one observation, both freshness
+//      fields — the 271B contract).
 //
 // axios is mocked at the provider boundary; the prisma upsert is a jest spy
 // (the DB-level writer contracts live in rate-provenance-truthfulness.test.js).
@@ -48,12 +51,14 @@ describe('271D oracle per-source isolation', () => {
     });
 
     const mockPrisma = () => ({
-        globalSettings: { upsert: jest.fn().mockResolvedValue({}) },
+        globalSettings: {
+            upsert: jest.fn().mockResolvedValue({}),
+            update: jest.fn().mockResolvedValue({}),
+        },
     });
 
     const COINGECKO_OK = () =>
         Promise.resolve({ data: { tether: { usd: 1 }, 'usd-coin': { usd: 0.999 }, dai: { usd: 1.001 } } });
-    const FX_OK = (ghs = 12.50) => Promise.resolve({ data: { rates: { GHS: ghs } } });
     const KOTANI_OK = (rate = 12.75) => Promise.resolve({ data: { rate } });
 
     test('A: Kotani success + CoinGecko failure still writes the canonical observation', async () => {
@@ -80,54 +85,54 @@ describe('271D oracle per-source isolation', () => {
         expect(update.liveDaiToUsd).toBeUndefined();
     });
 
-    test('B: Kotani failure + both composite legs succeed writes FALLBACK_FX as USDC/GHS (never raw USD/GHS)', async () => {
+    test('B: Kotani failure + supplementary feeds succeeding writes NO canonical rate — display-only update only', async () => {
         axios.post.mockImplementation((url) => {
             if (url.includes('/api/v3/rate/offramp')) return Promise.reject(new Error('kotani down'));
             throw new Error(`unexpected POST ${url}`);
         });
         axios.get.mockImplementation((url) => {
             if (url.includes('coingecko')) return COINGECKO_OK();
-            if (url.includes('open.er-api.com')) return FX_OK(12.50);
+            // The retired FX composite must never even be consulted.
             throw new Error(`unexpected GET ${url}`);
         });
 
         const prisma = mockPrisma();
         await new OracleService(prisma).fetchAndUpdateRates();
 
-        expect(prisma.globalSettings.upsert).toHaveBeenCalledTimes(1);
-        const update = prisma.globalSettings.upsert.mock.calls[0][0].update;
-        expect(update.liveRateSource).toBe('FALLBACK_FX');
-        // retail = FX(USD/GHS) × USDC/USD — a USDC/GHS observation
-        expect(update.liveRetailRate).toBeCloseTo(12.50 * 0.999, 10);
-        // the legacy USD/GHS field carries the raw FX quote for API consumers
-        expect(update.liveUsdToGhs).toBe(12.50);
-        // never the raw FX quote on the retail field
-        expect(update.liveRetailRate).not.toBe(12.50);
-        // composite write carries the stablecoin observations
-        expect(update.liveUsdcToUsd).toBeCloseTo(0.999, 10);
+        // NO canonical write of any kind — the cached rate, its source and
+        // every freshness timestamp stay untouched.
+        expect(prisma.globalSettings.upsert).not.toHaveBeenCalled();
+        // The stablecoin observations land ONLY on the dedicated
+        // display-only fields — the update payload can never touch
+        // liveRetailRate / liveUsdToGhs / liveRateSource / timestamps.
+        expect(prisma.globalSettings.update).toHaveBeenCalledTimes(1);
+        const data = prisma.globalSettings.update.mock.calls[0][0].data;
+        expect(Object.keys(data).sort()).toEqual(['liveDaiToUsd', 'liveUsdcToUsd', 'liveUsdtToUsd']);
+        expect(data.liveUsdcToUsd).toBeCloseTo(0.999, 10);
+        expect(prisma.globalSettings.update.mock.calls[0][0].where).toEqual({ id: 1 });
     });
 
-    test('C1: partial composite (CoinGecko down, FX up) writes NOTHING', async () => {
+    test('C1: supplementary failure (CoinGecko down) writes NOTHING at all', async () => {
         axios.post.mockRejectedValue(new Error('kotani down'));
         axios.get.mockImplementation((url) => {
             if (url.includes('coingecko')) return Promise.reject(new Error('coingecko down'));
-            if (url.includes('open.er-api.com')) return FX_OK(12.50);
             throw new Error(`unexpected GET ${url}`);
         });
 
         const prisma = mockPrisma();
         await new OracleService(prisma).fetchAndUpdateRates();
 
-        // Raw USD/GHS alone is NOT a retail observation — nothing is written,
-        // the cached rate and every freshness timestamp stay untouched.
+        // No Kotani observation and no supplementary observation — nothing
+        // is written; the cached rate and every freshness timestamp stay
+        // untouched.
         expect(prisma.globalSettings.upsert).not.toHaveBeenCalled();
+        expect(prisma.globalSettings.update).not.toHaveBeenCalled();
     });
 
-    test('C2: partial composite (FX down, CoinGecko up) writes NOTHING', async () => {
+    test('C2: Kotani failure + CoinGecko success — display-only update, and the retired FX feed is never consulted', async () => {
         axios.post.mockRejectedValue(new Error('kotani down'));
         axios.get.mockImplementation((url) => {
             if (url.includes('coingecko')) return COINGECKO_OK();
-            if (url.includes('open.er-api.com')) return Promise.reject(new Error('fx down'));
             throw new Error(`unexpected GET ${url}`);
         });
 
@@ -135,23 +140,31 @@ describe('271D oracle per-source isolation', () => {
         await new OracleService(prisma).fetchAndUpdateRates();
 
         expect(prisma.globalSettings.upsert).not.toHaveBeenCalled();
+        // Stablecoin display fields still refresh (supplementary,
+        // non-authoritative), with no canonical keys in the payload.
+        expect(prisma.globalSettings.update).toHaveBeenCalledTimes(1);
+        const data = prisma.globalSettings.update.mock.calls[0][0].data;
+        expect(Object.keys(data).sort()).toEqual(['liveDaiToUsd', 'liveUsdcToUsd', 'liveUsdtToUsd']);
+        // The retired FX feed was never even requested.
+        const getUrls = axios.get.mock.calls.map(([url]) => String(url));
+        expect(getUrls.some((url) => url.includes('open.er-api.com'))).toBe(false);
     });
 
-    test('C3: a zero USDC/USD price is an incomplete composite — NOTHING is written', async () => {
+    test('C3: a malformed stablecoin observation (zero USDC/USD) writes NOTHING', async () => {
         axios.post.mockRejectedValue(new Error('kotani down'));
         axios.get.mockImplementation((url) => {
             if (url.includes('coingecko')) {
                 return Promise.resolve({ data: { tether: { usd: 1 }, 'usd-coin': { usd: 0 }, dai: { usd: 1 } } });
             }
-            if (url.includes('open.er-api.com')) return FX_OK(12.50);
             throw new Error(`unexpected GET ${url}`);
         });
 
         const prisma = mockPrisma();
         await new OracleService(prisma).fetchAndUpdateRates();
 
-        // A depeg-shaped observation must never multiply into liveRetailRate.
+        // A malformed supplementary observation is discarded entirely.
         expect(prisma.globalSettings.upsert).not.toHaveBeenCalled();
+        expect(prisma.globalSettings.update).not.toHaveBeenCalled();
     });
 
     test('D: total external failure writes NOTHING (cached rate + timestamps preserved)', async () => {
@@ -162,6 +175,7 @@ describe('271D oracle per-source isolation', () => {
         await new OracleService(prisma).fetchAndUpdateRates();
 
         expect(prisma.globalSettings.upsert).not.toHaveBeenCalled();
+        expect(prisma.globalSettings.update).not.toHaveBeenCalled();
     });
 
     test('E: every successful write stamps lastRateSync === lastExternalSync (one observation)', async () => {
