@@ -3,7 +3,6 @@ const logger = require('../src/config/logger');
 const axios = require('axios');
 
 const KOTANI_DEFAULT_BASE_URL = 'https://sandbox-api.kotanipay.io/api/v3';
-const FALLBACK_FX_URL = 'https://open.er-api.com/v6/latest/USD';
 
 const asFinitePositive = (value) => {
     const number = Number(value);
@@ -69,37 +68,36 @@ class OracleService {
         return rate;
     }
 
-    async fetchFallbackUsdToGhsRate() {
-        const response = await axios.get(FALLBACK_FX_URL, { timeout: 8000 });
-        return asFinitePositive(response.data?.rates?.GHS);
-    }
-
-    // §271 per-source isolation (issue #271 recommendation D): the old flow
-    // made CoinGecko a HARD gate — a single CoinGecko 429 aborted the whole
-    // sync, freezing even the Kotani direct observation that does not
-    // depend on CoinGecko at all. The restructured flow isolates every
-    // external source, and the single freshness contract is preserved:
+    // §Kotani-only transaction-rate authority (2026-10-16 hardening wave).
     //
-    //   lastExternalSync/lastRateSync advance ONLY when the CANONICAL retail
-    //   rate (liveRetailRate, USDC/GHS) was genuinely observed:
-    //     • Kotani LIVE direct USDC/GHS          → full write, KOTANI_PAY
-    //     • FX(USD/GHS) + CoinGecko(USDC/USD)    → composite write,
-    //                                               FALLBACK_FX (BOTH must
-    //                                               succeed — the raw USD/GHS
-    //                                               alone is NOT a USDC/GHS
-    //                                               observation and must not
-    //                                               refresh freshness)
-    //   Stablecoin prices (tether/usdc/dai vs USD) are supplementary display
-    //   fields: a CoinGecko failure never blocks the Kotani write, and a
-    //   Kotani/MOCK mode never blocks the stablecoin update.
+    // Kotani Pay is the single canonical USDC/GHS transaction-rate provider.
+    // The contract, preserved from the §271 per-source isolation work and
+    // tightened from "fallback allowed" to "Kotani-only":
     //
-    //   Repeated failure: cached values and ALL timestamps stay untouched —
-    //   the freshness gate (/rateFreshness) fails new quotes closed after
-    //   RATE_FRESHNESS_MAX_AGE_SECONDS, and /api/oracle/rates exposes the
-    //   true age (externalRateAgeSeconds). No code path can present the
-    //   frozen number as fresh (271B echo isolation + this isolation).
-    //   Recovery: the next successful observation simply resumes; there is no
-    //   stuck backoff state to clear.
+    //   • ONLY a successfully validated Kotani observation may write the
+    //     transaction-eligible liveRetailRate, the canonical liveRateSource
+    //     ('KOTANI_PAY') and the freshness timestamps
+    //     (lastRateSync === lastExternalSync, one observation, both fields —
+    //     the 271B contract).
+    //
+    //   • The legacy CoinGecko USDC/USD × external USD/GHS FX composite is
+    //     RETIRED as a rate source: it must never write liveRetailRate /
+    //     liveRateSource and must never refresh canonical transaction-rate
+    //     freshness. A successful supplementary feed must not launder the
+    //     cached rate into "fresh" — a cached old value stays old.
+    //
+    //   • Stablecoin prices (tether/usdc/dai vs USD) remain SUPPLEMENTARY
+    //     DISPLAY-ONLY data: cached in their dedicated non-authoritative
+    //     GlobalSettings fields, never blocking the canonical write, and
+    //     never advancing any freshness timestamp. When Kotani is missing
+    //     (unconfigured/MOCK), fails, returns malformed data, or is stale,
+    //     the sync performs at most this supplementary display refresh and
+    //     NOTHING else — new rate-dependent financial quotes fail closed at
+    //     the /rateFreshness gate (RATE_STALE / RATE_UNAVAILABLE).
+    //
+    //   Repeated Kotani failure: cached values and ALL timestamps stay
+    //   untouched — no code path can present the frozen number as fresh.
+    //   Recovery: the next successful Kotani observation simply resumes.
     async fetchStablecoinUsdPrices() {
         const cryptoResponse = await axios.get(
             'https://api.coingecko.com/api/v3/simple/price?ids=tether,usd-coin,dai&vs_currencies=usd',
@@ -114,113 +112,106 @@ class OracleService {
         return { tetherPrice, usdcPrice, daiPrice };
     }
 
+    // Supplementary display-only refresh. Deliberately uses update (not
+    // upsert): a supplementary-only observation may never create or reshape
+    // the canonical GlobalSettings row. Deliberately touches ONLY the
+    // dedicated stablecoin display fields — no canonical rate, no source,
+    // no freshness timestamp.
+    async _updateSupplementaryDisplayRates() {
+        let stablecoins = null;
+        try {
+            stablecoins = await this.fetchStablecoinUsdPrices();
+        } catch (err) {
+            logger.warn(
+                { err },
+                '[Oracle] Supplementary stablecoin prices unavailable; prior display values preserved.'
+            );
+            return;
+        }
+        try {
+            await this.prisma.globalSettings.update({
+                where: { id: 1 },
+                data: {
+                    liveUsdtToUsd: stablecoins.tetherPrice,
+                    liveUsdcToUsd: stablecoins.usdcPrice,
+                    liveDaiToUsd: stablecoins.daiPrice,
+                },
+            });
+            logger.info(
+                '[Oracle] Supplementary display rates refreshed (non-authoritative; transaction-rate freshness untouched).'
+            );
+        } catch (err) {
+            logger.warn(
+                { err },
+                '[Oracle] Supplementary display update skipped (settings row unavailable or DB error); canonical fields untouched.'
+            );
+        }
+    }
+
     async fetchAndUpdateRates() {
         try {
+            // ── CANONICAL source: Kotani direct USDC/GHS ───────────────────
             let usdcToGhsRate = null;
-            let usdToGhsRate = null;
-            let rateSource = null;
-            let stablecoins = null;
-
-            // ── Source 1 (isolated): Kotani direct USDC/GHS ────────────────
             try {
                 usdcToGhsRate = await this.fetchKotaniUsdcToGhsRate();
-                if (usdcToGhsRate) {
-                    // Kotani supplies the direct USDC/GHS rate. Keep the
-                    // legacy USD/GHS field at the same value for
-                    // backward-compatible API consumers; the canonical retail
-                    // field is the authoritative USDC/GHS display rate.
-                    rateSource = 'KOTANI_PAY';
-                }
             } catch (kotaniErr) {
                 logger.warn(
                     { err: kotaniErr },
-                    '[Oracle] Kotani Pay rate unavailable; trying the fallback FX composite.'
+                    '[Oracle] Kotani Pay rate unavailable; the canonical USDC/GHS observation failed.'
                 );
             }
 
-            // ── Source 2 (isolated): FX × CoinGecko composite ─────────────
             if (!usdcToGhsRate) {
-                // In MOCK mode there is no external Kotani observation at
-                // all; the composite is the only genuine external path.
-                let usdcPrice = null;
-                let usdToGhs = null;
-                let coingeckoErr = null;
-                let fxErr = null;
-                try {
-                    stablecoins = await this.fetchStablecoinUsdPrices();
-                    usdcPrice = stablecoins.usdcPrice;
-                } catch (err) {
-                    coingeckoErr = err;
-                }
-                try {
-                    usdToGhs = await this.fetchFallbackUsdToGhsRate();
-                } catch (err) {
-                    fxErr = err;
-                }
-                if (usdToGhs && usdcPrice) {
-                    // The fallback quotes USD/GHS; apply the live USDC/USD
-                    // market price so the user-facing rate remains USDC/GHS.
-                    usdcToGhsRate = usdToGhs * usdcPrice;
-                    usdToGhsRate = usdToGhs;
-                    rateSource = 'FALLBACK_FX';
-                } else {
-                    // Partial observation is NOT a retail observation: the
-                    // raw USD/GHS alone can never write liveRetailRate or
-                    // refresh freshness (that would misprice every USDC
-                    // conversion during a depeg). Nothing is written; the
-                    // cached rate and every timestamp stay untouched.
-                    if (coingeckoErr) {
-                        logger.error(
-                            { err: coingeckoErr },
-                            '[Oracle] CoinGecko stablecoin observation failed — composite rate unavailable; cached rate preserved.'
-                        );
-                    }
-                    if (fxErr) {
-                        logger.error(
-                            { err: fxErr },
-                            '[Oracle] Fallback FX observation failed — composite rate unavailable; cached rate preserved.'
-                        );
-                    }
-                    if (!coingeckoErr && !fxErr) {
-                        logger.error('[Oracle] Composite sources returned no usable rate; cached rate preserved.');
-                    }
-                    throw new Error('No usable external USDC/GHS observation is available.');
-                }
-            } else {
-                // Kotani succeeded: stablecoin prices are supplementary —
-                // fetch best-effort, never blocking the canonical write.
-                usdToGhsRate = usdcToGhsRate;
-                try {
-                    stablecoins = await this.fetchStablecoinUsdPrices();
-                } catch (err) {
-                    logger.warn(
-                        { err },
-                        '[Oracle] Stablecoin price update unavailable (non-blocking); prior values preserved.'
-                    );
-                }
+                // Kotani is missing (unconfigured/MOCK), failed, or returned
+                // a malformed response. There is NO fallback transaction rate:
+                // the retired FX × CoinGecko composite must never write the
+                // canonical fields or refresh freshness. At most the
+                // supplementary display cache is refreshed; the cached
+                // canonical rate, its source and every freshness timestamp
+                // stay untouched, so the 271C gate fails new quotes closed
+                // once the last genuine Kotani observation ages out.
+                logger.error(
+                    '[Oracle] No valid Kotani USDC/GHS observation — canonical retail rate, source and freshness preserved (fail-closed; no fallback rate).'
+                );
+                await this._updateSupplementaryDisplayRates();
+                return;
             }
 
-            // ── ONE success-only external write ───────────────────────────
+            // ── SUPPLEMENTARY source: stablecoin USD prices (display-only) ──
+            // Never blocking the canonical write; failure leaves the prior
+            // display values preserved.
+            let stablecoins = null;
+            try {
+                stablecoins = await this.fetchStablecoinUsdPrices();
+            } catch (err) {
+                logger.warn(
+                    { err },
+                    '[Oracle] Stablecoin price update unavailable (non-blocking); prior values preserved.'
+                );
+            }
+
+            // ── ONE success-only canonical write (Kotani observation) ─────
             // One observation timestamp for both freshness fields (issue
             // #271 / PR 271B): the oracle is the canonical success-only
             // EXTERNAL writer, so lastRateSync and lastExternalSync always
-            // describe the same successful observation. On failure the cached
-            // rate and both timestamps are left untouched (see catch below).
+            // describe the same successful Kotani observation. On failure
+            // the cached rate and both timestamps are left untouched (see
+            // the fail-closed branch above).
             const observationTimestamp = new Date();
             const update = {
-                liveUsdToGhs: usdToGhsRate,
+                liveUsdToGhs: usdcToGhsRate,
                 liveRetailRate: usdcToGhsRate,
                 lastRateSync: observationTimestamp,
                 lastExternalSync: observationTimestamp,
-                liveRateSource: rateSource,
+                liveRateSource: 'KOTANI_PAY',
             };
             const create = {
                 id: 1,
-                liveUsdToGhs: usdToGhsRate,
+                liveUsdToGhs: usdcToGhsRate,
                 liveRetailRate: usdcToGhsRate,
                 lastRateSync: observationTimestamp,
                 lastExternalSync: observationTimestamp,
-                liveRateSource: rateSource,
+                liveRateSource: 'KOTANI_PAY',
             };
             if (stablecoins) {
                 update.liveUsdtToUsd = stablecoins.tetherPrice;
@@ -236,7 +227,7 @@ class OracleService {
                 create,
             });
 
-            logger.info(`📈 Oracle Sync: 1 USDC ≈ ${usdcToGhsRate} GHS | source=${rateSource}`);
+            logger.info(`📈 Oracle Sync: 1 USDC ≈ ${usdcToGhsRate} GHS | source=KOTANI_PAY`);
 
             if (this.rateAlertService && usdcToGhsRate) {
                 setImmediate(() => {
