@@ -1422,7 +1422,11 @@ model GlobalSettings {
   gasFeeErc20 Decimal @default(5.00) @db.Decimal(20, 8)
   gasFeeBep20 Decimal @default(0.30) @db.Decimal(20, 8)
 
-  // Live Oracle Rates  (legacy single rate — kept synced with liveRetailRate)
+  // Live Oracle Rates
+  // liveUsdToGhs is the LEGACY USD/GHS compatibility field: the oracle NEVER
+  // writes it (a USDC/GHS observation must not populate a USD/GHS field);
+  // it holds the admin override / legacy-era value and is read only as an
+  // explicit fallback. The canonical transaction rate is liveRetailRate.
   liveUsdToGhs  Decimal @default(12.50) @db.Decimal(18, 8)
   liveUsdtToUsd Decimal @default(1.00) @db.Decimal(18, 8)
   liveUsdcToUsd Decimal @default(1.00) @db.Decimal(18, 8)

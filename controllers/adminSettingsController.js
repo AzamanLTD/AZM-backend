@@ -123,7 +123,7 @@ exports.updateSettings = async (req, res) => {
             'withdrawalFeeByRiskTier', 'feeByPaymentMethod', 'supportedPaymentMethods',
             'gasFeeTrc20', 'gasFeeErc20', 'gasFeeBep20',
             'autoPayoutEnabled', 'autoPayoutThresholdUsdc', 'autoPayoutMaxAmountUsdc', 'autoPayoutIntervalMs',
-            'liveUsdToGhs', 'liveRateSource',
+            'liveUsdToGhs', 'liveRetailRate', 'liveRateSource',
             'minAppVersion', 'forceUpdateUrl', 'updateMessage',
             'susuProfitPct',
             'smartEscrowFeePct', 'escrowDraftExpiryHours', 'escrowFundedExpiryDays',
@@ -177,6 +177,20 @@ exports.updateSettings = async (req, res) => {
                 }
             }
 
+            // B fix (lead review 2026-10-17): the canonical transaction rate
+            // liveRetailRate is now admin-overridable directly, with the same
+            // validation as the legacy liveUsdToGhs override. This preserves
+            // the operator's manual-rate capability now that the oracle no
+            // longer mirrors the canonical rate into the legacy field.
+            if (field === 'liveRetailRate') {
+                if (typeof newValue !== 'number' || !Number.isFinite(newValue) || newValue <= 0 || newValue > 1000000) {
+                    return res.status(400).json({
+                        success: false,
+                        message: 'liveRetailRate must be a positive number no greater than 1,000,000.'
+                    });
+                }
+            }
+
             if (field === 'liveRateSource') {
                 if (typeof newValue !== 'string' || newValue.trim().length < 1 || newValue.length > 100) {
                     return res.status(400).json({
@@ -226,7 +240,10 @@ exports.updateSettings = async (req, res) => {
         // Instead the manual provenance is recorded explicitly: lastAdminSetAt
         // is stamped and liveRateSource is labeled 'AZM_ADMIN_OVERRIDE' unless
         // the admin supplied an explicit source in the same request.
-        if (Object.prototype.hasOwnProperty.call(updateData, 'liveUsdToGhs')) {
+        if (
+            Object.prototype.hasOwnProperty.call(updateData, 'liveUsdToGhs')
+            || Object.prototype.hasOwnProperty.call(updateData, 'liveRetailRate')
+        ) {
             updateData.lastAdminSetAt = new Date();
             changes.lastAdminSetAt = { old: current.lastAdminSetAt, new: updateData.lastAdminSetAt };
             if (!Object.prototype.hasOwnProperty.call(updateData, 'liveRateSource')) {

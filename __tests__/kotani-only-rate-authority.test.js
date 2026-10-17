@@ -60,6 +60,7 @@ const mockPrisma = () => ({
     globalSettings: {
         upsert: jest.fn().mockResolvedValue({}),
         update: jest.fn().mockResolvedValue({}),
+        findUnique: jest.fn().mockResolvedValue(null),
     },
 });
 
@@ -93,7 +94,9 @@ describe('Kotani-only transaction-rate authority (unit proofs)', () => {
         const { update, create } = prisma.globalSettings.upsert.mock.calls[0][0];
         for (const payload of [update, create]) {
             expect(payload.liveRetailRate).toBe(12.75);
-            expect(payload.liveUsdToGhs).toBe(12.75);
+            // B fix: the legacy USD/GHS field is never populated with the
+            // USDC/GHS observation.
+            expect(payload.liveUsdToGhs).toBeUndefined();
             expect(payload.liveRateSource).toBe('KOTANI_PAY');
             expect(payload.lastRateSync).toBeInstanceOf(Date);
             expect(payload.lastExternalSync).toBe(payload.lastRateSync); // one observation, both fields
@@ -256,13 +259,17 @@ describe('Kotani-only transaction-rate authority (unit proofs)', () => {
         expect(OracleService.extractKotaniRate({ success: false, data: { value: '15.53' } })).toBeNull();
     });
 
-    test('A2-b. kotaniPairMatches validates the echoed pair, with C-prefix stablecoin equivalence', () => {
+    test('A2-b. kotaniPairMatches validates the echoed pair EXACTLY — no C-prefix equivalence (fix C)', () => {
         const echo = (from, to) => ({ success: true, data: { from, to, value: '1' } });
         expect(OracleService.kotaniPairMatches(echo('USDC', 'GHS'), 'USDC', 'GHS')).toBe(true);
-        // C-prefixed stablecoins denote the same national fiat (CGHS === GHS).
-        expect(OracleService.kotaniPairMatches(echo('USDC', 'CGHS'), 'USDC', 'GHS')).toBe(true);
-        expect(OracleService.kotaniPairMatches(echo('USDC', 'GHS'), 'USDC', 'CGHS')).toBe(true);
-        // A mismatched pair must never be trusted.
+        // Exact match is case-insensitive and trimmed only.
+        expect(OracleService.kotaniPairMatches(echo(' usdc ', 'ghs'), 'USDC', 'GHS')).toBe(true);
+        // CGHS is a DIFFERENT instrument: a stablecoin listed in the
+        // provider `from` enum, not the fiat code for a cedi offramp.
+        // Related codes are NOT the same instrument — a CGHS echo for a GHS
+        // request must be rejected (fix C: no "equivalent code" laundering).
+        expect(OracleService.kotaniPairMatches(echo('USDC', 'CGHS'), 'USDC', 'GHS')).toBe(false);
+        expect(OracleService.kotaniPairMatches(echo('USDC', 'GHS'), 'USDC', 'CGHS')).toBe(false);
         expect(OracleService.kotaniPairMatches(echo('USDC', 'KES'), 'USDC', 'GHS')).toBe(false);
         expect(OracleService.kotaniPairMatches(echo('USDT', 'GHS'), 'USDC', 'GHS')).toBe(false);
         // A response with no pair echo at all is an unvalidated observation.
@@ -310,6 +317,58 @@ describe('Kotani-only transaction-rate authority (unit proofs)', () => {
         await new OracleService(prisma).fetchAndUpdateRates();
 
         expect(prisma.globalSettings.upsert).not.toHaveBeenCalled();
+    });
+
+    test('A2-f. an envelope with NO success declaration fails closed too (fix D: explicit success required)', async () => {
+        // A payload that merely contains a rate but never declares success
+        // is not the documented v3 response — treat it as unvalidated.
+        axios.post.mockResolvedValue({ data: { data: { from: 'USDC', to: 'GHS', value: '15.53' } } });
+        axios.get.mockImplementation((url) => {
+            if (url.includes('coingecko')) return COINGECKO_OK();
+            throw new Error(`unexpected GET ${url}`);
+        });
+
+        const prisma = mockPrisma();
+        await new OracleService(prisma).fetchAndUpdateRates();
+
+        expect(prisma.globalSettings.upsert).not.toHaveBeenCalled();
+    });
+
+    test('B-unit-1. a successful canonical write NEVER touches the legacy liveUsdToGhs field (fix B)', async () => {
+        axios.post.mockImplementation(() => KOTANI_OK(12.75));
+        axios.get.mockImplementation((url) => {
+            if (url.includes('coingecko')) return COINGECKO_OK(0.999);
+            throw new Error(`unexpected GET ${url}`);
+        });
+
+        const prisma = mockPrisma();
+        await new OracleService(prisma).fetchAndUpdateRates();
+
+        expect(prisma.globalSettings.upsert).toHaveBeenCalledTimes(1);
+        const payload = prisma.globalSettings.upsert.mock.calls[0][0];
+        expect(payload.update).toEqual(expect.objectContaining({
+            liveRetailRate: 12.75,
+            liveRateSource: 'KOTANI_PAY',
+        }));
+        expect(payload.update).not.toHaveProperty('liveUsdToGhs');
+        expect(payload.create).not.toHaveProperty('liveUsdToGhs');
+    });
+
+    test('B-unit-2. the gateway MOCK anchor derives from the canonical liveRetailRate, never the legacy field (fix B)', async () => {
+        const GatewayService = require('../services/gatewayService');
+        process.env.KOTANI_PROVIDER = 'MOCK';
+        delete process.env.KOTANI_API_KEY;
+        const prisma = mockPrisma();
+        prisma.globalSettings.findUnique.mockResolvedValue({
+            liveRetailRate: 14.10,
+            liveUsdToGhs: 11.02, // deliberately different legacy value
+        });
+
+        const rates = await new GatewayService(prisma).fetchOfframpRates();
+
+        expect(rates.source).toBe('MOCK');
+        expect(rates.retailRate).toBeCloseTo(14.10, 6);
+        expect(rates.retailRate).not.toBeCloseTo(11.02, 6);
     });
 
     // ── A3 HARDENING (2026-10-17): gateway LIVE fetch uses the documented
@@ -428,14 +487,16 @@ describe('Kotani config audit — sandbox-fallback hardening (unit)', () => {
         expect(placeholder.state).toBe('MISSING_TOKEN');
     });
 
-    test('B1. LIVE + token but NO base URL: armed, and the audit names the DEFAULT SANDBOX endpoint', () => {
+    test('B1. LIVE + token but NO base URL OUTSIDE production: armed for ONBOARDING on the default sandbox, loudly named', () => {
+        // Jest runs with NODE_ENV=test — the non-production branch.
         process.env.KOTANI_PROVIDER = 'LIVE';
         process.env.KOTANI_API_TOKEN = 'onboarding-token';
         const cfg = new OracleService(mockPrisma()).kotaniConfigState();
         expect(cfg.armed).toBe(true);
+        expect(cfg.state).toBe('ARMED_ONBOARDING_SANDBOX');
         expect(cfg.baseUrlExplicit).toBe(false);
         expect(cfg.baseUrl).toBe('https://sandbox-api.kotanipay.io/api/v3');
-        expect(cfg.detail).toContain('DEFAULT SANDBOX endpoint');
+        expect(cfg.detail).toContain('ONBOARDING SANDBOX');
     });
 
     test('B2. LIVE + token + explicit base URL: armed, explicit, no sandbox mention', () => {
@@ -461,6 +522,89 @@ describe('Kotani config audit — sandbox-fallback hardening (unit)', () => {
         expect(prisma.globalSettings.upsert).not.toHaveBeenCalled(); // no canonical write
         // At most the supplementary display refresh (its own axios calls
         // may or may not succeed — irrelevant to the canonical contract).
+    });
+});
+
+describe('Production endpoint policy — a sandbox endpoint can never be the production rate source (fix A)', () => {
+    const originalEnv = process.env;
+
+    beforeEach(() => {
+        process.env = { ...originalEnv };
+        process.env.NODE_ENV = 'production';
+        process.env.KOTANI_PROVIDER = 'LIVE';
+        process.env.KOTANI_API_TOKEN = 'real-prod-token';
+        delete process.env.KOTANI_API_BASE_URL;
+    });
+
+    afterAll(() => {
+        process.env = originalEnv;
+    });
+
+    test('P1. LIVE + token but NO endpoint in production: NOT armed — the sandbox default is not a production source', () => {
+        const cfg = new OracleService(mockPrisma()).kotaniConfigState();
+        expect(cfg.armed).toBe(false);
+        expect(cfg.state).toBe('MISSING_ENDPOINT');
+        expect(cfg.baseUrl).toBeNull();
+        expect(cfg.detail).toContain('FAILS CLOSED');
+    });
+
+    test('P2. an EXPLICIT sandbox endpoint in production: rejected by policy, NOT armed', () => {
+        process.env.KOTANI_API_BASE_URL = 'https://sandbox-api.kotanipay.io/api/v3';
+        const cfg = new OracleService(mockPrisma()).kotaniConfigState();
+        expect(cfg.armed).toBe(false);
+        expect(cfg.state).toBe('SANDBOX_ENDPOINT_REJECTED');
+        expect(cfg.baseUrl).toBeNull();
+        expect(cfg.detail).toContain('REJECTED BY POLICY');
+    });
+
+    test('P2-b. sandbox-shaped hosts in other spellings are rejected too', () => {
+        process.env.KOTANI_API_BASE_URL = 'https://sandbox.kotanipay.io/api/v3';
+        expect(new OracleService(mockPrisma()).kotaniConfigState().state).toBe('SANDBOX_ENDPOINT_REJECTED');
+        process.env.KOTANI_API_BASE_URL = 'https://api.kotanipay.io/sandbox/api/v3';
+        expect(new OracleService(mockPrisma()).kotaniConfigState().state).toBe('SANDBOX_ENDPOINT_REJECTED');
+    });
+
+    test('P3. an explicitly configured PRODUCTION endpoint in production: armed', () => {
+        process.env.KOTANI_API_BASE_URL = 'https://api.kotanipay.io/api/v3';
+        const cfg = new OracleService(mockPrisma()).kotaniConfigState();
+        expect(cfg.armed).toBe(true);
+        expect(cfg.state).toBe('ARMED');
+        expect(cfg.baseUrlExplicit).toBe(true);
+        expect(cfg.baseUrl).toBe('https://api.kotanipay.io/api/v3');
+    });
+
+    test('P4. missing or placeholder token in production: MISSING_TOKEN before any endpoint decision', () => {
+        delete process.env.KOTANI_API_TOKEN;
+        delete process.env.KOTANI_API_KEY;
+        expect(new OracleService(mockPrisma()).kotaniConfigState().state).toBe('MISSING_TOKEN');
+        process.env.KOTANI_API_TOKEN = 'mock-key';
+        expect(new OracleService(mockPrisma()).kotaniConfigState().state).toBe('MISSING_TOKEN');
+    });
+
+    test('P5. MOCK/disabled configuration in production: CONFIG_DISABLED, no request, no canonical write', async () => {
+        process.env.KOTANI_PROVIDER = 'MOCK';
+        axios.post.mockReset();
+        axios.get.mockReset();
+
+        const cfg = new OracleService(mockPrisma()).kotaniConfigState();
+        expect(cfg.armed).toBe(false);
+        expect(cfg.state).toBe('CONFIG_DISABLED');
+
+        const prisma = mockPrisma();
+        await new OracleService(prisma).fetchAndUpdateRates();
+        expect(axios.post).not.toHaveBeenCalled();
+        expect(prisma.globalSettings.upsert).not.toHaveBeenCalled();
+    });
+
+    test('P6. a MISSING_ENDPOINT production deployment makes NO Kotani request and writes nothing canonical', async () => {
+        axios.post.mockReset();
+        axios.get.mockReset();
+
+        const prisma = mockPrisma();
+        await new OracleService(prisma).fetchAndUpdateRates();
+
+        expect(axios.post).not.toHaveBeenCalled();
+        expect(prisma.globalSettings.upsert).not.toHaveBeenCalled();
     });
 });
 
@@ -567,6 +711,37 @@ describeDbOrSkip('Kotani-only transaction-rate authority (real PostgreSQL)', () 
         expect(rate.rateGhsPerUsdc).toBeCloseTo(12.75, 8);
         expect(rate.rateSource).toBe('KOTANI_PAY');
         expect(rate.rateAsOf.getTime()).toBe(row.lastExternalSync.getTime());
+    });
+
+    test('DB-B: a successful Kotani observation updates ONLY the canonical fields — liveUsdToGhs is preserved untouched (fix B)', async () => {
+        await seedKotaniRow({
+            liveUsdToGhs: 13.10,       // legacy USD/GHS value — must survive
+            liveRetailRate: 13.42,
+        });
+
+        axios.get.mockReset();
+        axios.post.mockReset();
+        axios.post.mockImplementation(() => KOTANI_OK(12.75));
+        axios.get.mockImplementation((url) => {
+            if (url.includes('coingecko')) return COINGECKO_OK(0.999);
+            throw new Error(`unexpected GET ${url}`);
+        });
+        process.env.KOTANI_PROVIDER = 'LIVE';
+        process.env.KOTANI_API_TOKEN = 'test-token';
+
+        await new OracleService(prisma).fetchAndUpdateRates();
+
+        const row = await getSettings();
+        // The canonical USDC/GHS transaction rate moves to the observation.
+        expect(Number(row.liveRetailRate)).toBeCloseTo(12.75, 8);
+        expect(row.liveRateSource).toBe('KOTANI_PAY');
+        // The legacy USD/GHS compatibility field is NOT refreshed and NOT
+        // populated with the USDC/GHS value: it keeps its own prior value.
+        expect(Number(row.liveUsdToGhs)).toBeCloseTo(13.10, 8);
+        expect(Number(row.liveUsdToGhs)).not.toBeCloseTo(12.75, 8);
+        // Quote eligibility comes from the canonical field + freshness.
+        const rate = await getFreshServerRateGhsPerUsdc({ prisma, maxAgeSeconds: 1800 });
+        expect(rate.rateGhsPerUsdc).toBeCloseTo(12.75, 8);
     });
 
     test('DB-3: repeated Kotani outages never advance freshness — the clock only moves on a real Kotani observation', async () => {

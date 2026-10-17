@@ -52,7 +52,13 @@ exports.getAds = async (req, res) => {
 
     try {
         const settings = await prisma.globalSettings.findUnique({ where: { id: 1 } });
-        const baseRate = settings ? settings.liveUsdToGhs : 12.50;
+        // B fix (lead review 2026-10-17): the canonical USDC/GHS transaction
+        // rate is liveRetailRate. liveUsdToGhs is the legacy USD/GHS
+        // compatibility field — the oracle no longer writes it — and is read
+        // only as the explicit AZM_ADMIN_OVERRIDE fallback.
+        const baseRate = (Number(settings?.liveRetailRate) > 0)
+            ? Number(settings.liveRetailRate)
+            : (settings ? Number(settings.liveUsdToGhs) : 12.50);
 
         let ads = await prisma.ad.findMany({
             where: { status: 'ACTIVE' },

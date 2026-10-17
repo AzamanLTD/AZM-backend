@@ -337,7 +337,13 @@ class GatewayService {
         // hasn't run yet, fall back to the schema default (12.50). The
         // corporate rate is a realistic OTC discount below retail.
         const settings    = await this.prisma.globalSettings.findUnique({ where: { id: 1 } });
-        const retailRate  = settings?.liveUsdToGhs ?? 12.5;
+        // B fix (lead review 2026-10-17): anchor to the canonical
+        // liveRetailRate snapshot (the oracle no longer writes
+        // liveUsdToGhs); legacy field kept only as the admin-override
+        // fallback.
+        const retailRate  = (Number(settings?.liveRetailRate) > 0)
+            ? Number(settings.liveRetailRate)
+            : Number(settings?.liveUsdToGhs ?? 12.5);
         const corporate   = parseFloat((retailRate * (1 - MOCK_CORPORATE_DISCOUNT)).toFixed(6));
         return {
             provider:      PROVIDER_NAME,
