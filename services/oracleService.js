@@ -55,17 +55,23 @@ const extractKotaniRate = (payload) => {
     return null;
 };
 
-// C-prefix equivalence: the Kotani `from` enum lists C-prefixed
-// stablecoins (CGHS, CKES...) that denote the same national currency as
-// their unprefixed fiat code. A request for GHS may be echoed as CGHS
-// (or vice versa) and still be the pair we asked for.
+// EXACT pair validation (lead review 2026-10-17): the provider contract
+// (https://documentation.kotanipay.com/v3/api-reference/rates/offramp-rate)
+// is unambiguous — `from` is an ENUM of stablecoin codes (USDC, USDT, CGHS,
+// CKES, ...) and `to` is the FIAT payout code ("GHS" for a cedi offramp;
+// CGHS is a stablecoin listed under `from`, NOT the fiat code). A CGHS echo
+// for a GHS request is therefore a DIFFERENT instrument, not an alias: codes
+// are related, but the codes do not describe the same instrument, so a
+// "related code" equivalence is exactly how a foreign-pair rate could be
+// laundered into the canonical USDC/GHS slot. Validation is EXACT
+// (case-insensitive, trimmed) — no prefix, no "near enough" families.
 const sameCurrencyCode = (requested, echoed) => {
     if (requested === undefined || requested === null || echoed === undefined || echoed === null) {
         return false;
     }
     const a = String(requested).trim().toUpperCase();
     const b = String(echoed).trim().toUpperCase();
-    return a === b || a === 'C' + b || b === 'C' + a;
+    return a === b && a.length > 0;
 };
 
 // Validates that the response echoes the pair we requested. Fail-closed
@@ -111,13 +117,34 @@ class OracleService {
     // it must be an EXPLICIT choice: the startup audit names the endpoint
     // and says when it is the default-sandbox one, so promotion can be
     // checked from the logs at a glance.
+    // Production endpoint policy (lead review 2026-10-17, fix A):
+    //
+    // A sandbox endpoint must NEVER become the production transaction-rate
+    // source — not by default and not even by explicit configuration.
+    //   • In PRODUCTION (NODE_ENV=production), a LIVE provider is armed ONLY
+    //     with an explicitly configured endpoint that is not a sandbox host.
+    //     No KOTANI_API_BASE_URL → NOT ARMED (the previous behavior silently
+    //     sent production traffic to the sandbox default). An explicit
+    //     sandbox endpoint in production → NOT ARMED (rejected by policy).
+    //   • OUTSIDE production (development/onboarding), the sandbox default
+    //     remains available for explicit onboarding/testing, but it is
+    //     always named loudly in the audit log as the ONBOARDING SANDBOX —
+    //     it can never silently become production authority because
+    //     production arming requires the explicit approved endpoint.
     kotaniConfigState() {
         const provider = String(process.env.KOTANI_PROVIDER || 'MOCK').toUpperCase();
         const token = process.env.KOTANI_API_TOKEN || process.env.KOTANI_API_KEY;
         const explicitBaseUrl = process.env.KOTANI_API_BASE_URL
             ? String(process.env.KOTANI_API_BASE_URL).replace(/\/$/, '')
             : null;
+        const isProduction = process.env.NODE_ENV === 'production';
+        // Fail-closed match: ANY 'sandbox' marker anywhere in the endpoint
+        // URL (host or path) marks it as a sandbox endpoint. False
+        // positives (a production URL that contains 'sandbox') fail CLOSED
+        // — the operator must configure a clean production endpoint.
+        const isSandboxEndpoint = (url) => String(url).toLowerCase().includes('sandbox');
         const baseUrl = explicitBaseUrl || KOTANI_DEFAULT_BASE_URL;
+
         if (provider !== 'LIVE') {
             return {
                 armed: false,
@@ -142,15 +169,59 @@ class OracleService {
                 baseUrlExplicit: !!explicitBaseUrl,
             };
         }
+        // LIVE + a real token. From here the ENDPOINT decides arming.
+        if (isProduction) {
+            if (!explicitBaseUrl) {
+                return {
+                    armed: false,
+                    state: 'MISSING_ENDPOINT',
+                    detail: 'KOTANI_PROVIDER=LIVE in PRODUCTION but KOTANI_API_BASE_URL is NOT SET. '
+                        + 'A production transaction-rate provider FAILS CLOSED without an explicitly configured '
+                        + 'production endpoint: the sandbox default is NOT a production source, so no Kotani '
+                        + 'observation will be attempted and quotes fail closed (RATE_UNAVAILABLE/RATE_STALE). '
+                        + 'Set the verified production KOTANI_API_BASE_URL to arm it.',
+                    provider,
+                    baseUrl: null,
+                    baseUrlExplicit: false,
+                };
+            }
+            if (isSandboxEndpoint(explicitBaseUrl)) {
+                return {
+                    armed: false,
+                    state: 'SANDBOX_ENDPOINT_REJECTED',
+                    detail: `KOTANI_API_BASE_URL='${explicitBaseUrl}' is a SANDBOX endpoint and is REJECTED BY POLICY `
+                        + 'in production: a sandbox observation must never be the production transaction-rate '
+                        + 'authority. The provider is NOT armed; quotes fail closed (RATE_UNAVAILABLE/RATE_STALE). '
+                        + 'Configure the verified production endpoint to arm it.',
+                    provider,
+                    baseUrl: null,
+                    baseUrlExplicit: true,
+                };
+            }
+            return {
+                armed: true,
+                state: 'ARMED',
+                detail: `Kotani LIVE provider ARMED against the explicitly configured production endpoint ${explicitBaseUrl}.`,
+                provider,
+                baseUrl: explicitBaseUrl,
+                baseUrlExplicit: true,
+            };
+        }
+
+        // Non-production (development/onboarding): the sandbox default is
+        // available, but it is always NAMED as the onboarding sandbox — it
+        // can never silently become production authority because production
+        // arming requires the explicit approved endpoint (see above).
         return {
             armed: true,
-            state: 'ARMED',
+            state: explicitBaseUrl ? 'ARMED' : 'ARMED_ONBOARDING_SANDBOX',
             detail: explicitBaseUrl
-                ? `Kotani LIVE provider ARMED against ${explicitBaseUrl}.`
-                : `Kotani LIVE provider ARMED — KOTANI_API_BASE_URL is NOT SET, so the DEFAULT SANDBOX endpoint is in use (${KOTANI_DEFAULT_BASE_URL}). `
-                    + 'Legitimate during onboarding, but set the production endpoint explicitly before go-live.',
+                ? `Kotani LIVE provider ARMED against ${explicitBaseUrl} (non-production).`
+                : `Kotani LIVE provider ARMED in ONBOARDING SANDBOX mode — KOTANI_API_BASE_URL is NOT SET, so the `
+                    + `DEFAULT SANDBOX endpoint is in use (${KOTANI_DEFAULT_BASE_URL}). Legitimate for onboarding `
+                    + 'and testing outside production only.',
             provider,
-            baseUrl,
+            baseUrl: baseUrl,
             baseUrlExplicit: !!explicitBaseUrl,
         };
     }
@@ -194,13 +265,17 @@ class OracleService {
             timeout: 8000,
         });
 
-        // A2 hardening: the response must explicitly declare success, echo
-        // the requested pair, and carry a usable rate — anything else is
-        // an unvalidated observation and fails closed with a distinct,
-        // greppable tag.
-        if (response.data?.success === false) {
+        // A2/D hardening: the documented v3 envelope must EXPLICITLY declare
+        // success (auth/quota failures arrive as HTTP 200 with
+        // success:false, and an envelope with NO success field is not the
+        // documented response of this endpoint — a missing declaration is
+        // treated as an unvalidated observation, not as success). Then the
+        // echoed pair and the rate value are validated; anything else fails
+        // closed with a distinct, greppable tag.
+        if (response.data?.success !== true) {
             throw new Error(
-                `[KOTANI_RATE_REJECTED] Kotani returned success:false (${response.data?.message ?? 'no message'}) `
+                `[KOTANI_RATE_REJECTED] Kotani did not explicitly declare success:true `
+                + `(success=${JSON.stringify(response.data?.success ?? null)}, message=${JSON.stringify(response.data?.message ?? null)}) `
                 + '— the observation is rejected, not parsed.'
             );
         }
@@ -347,9 +422,23 @@ class OracleService {
             // describe the same successful Kotani observation. On failure
             // the cached rate and both timestamps are left untouched (see
             // the fail-closed branch above).
+            // SERVICE-OBSERVATION freshness policy (fix D): the documented
+            // v3 response carries NO provider-side observation time and no
+            // expiry field, so there is no provider timestamp to copy or
+            // trust. lastRateSync/lastExternalSync therefore mean exactly
+            // what their names say: the SERVICE time at which a validated
+            // Kotani observation was received and written. No provider
+            // timestamp is ever invented, and no future/expired
+            // provider-time claim is possible on this contract.
             const observationTimestamp = new Date();
+            // B fix (lead review 2026-10-17): liveUsdToGhs is the LEGACY
+            // USD/GHS compatibility field — a USDC/GHS observation must
+            // NEVER be written into it merely to keep the two fields equal.
+            // The canonical transaction rate (1 USDC → X GHS) lives in
+            // liveRetailRate alone; liveUsdToGhs is left untouched by the
+            // oracle (it remains whatever the admin override or the legacy
+            // era left there, and is never refreshed by this service).
             const update = {
-                liveUsdToGhs: usdcToGhsRate,
                 liveRetailRate: usdcToGhsRate,
                 lastRateSync: observationTimestamp,
                 lastExternalSync: observationTimestamp,
@@ -357,7 +446,6 @@ class OracleService {
             };
             const create = {
                 id: 1,
-                liveUsdToGhs: usdcToGhsRate,
                 liveRetailRate: usdcToGhsRate,
                 lastRateSync: observationTimestamp,
                 lastExternalSync: observationTimestamp,

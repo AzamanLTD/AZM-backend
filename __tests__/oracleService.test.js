@@ -25,7 +25,7 @@ describe('OracleService Kotani rate preference', () => {
         expect(OracleService.extractKotaniRate({ cryptoAmount: 2, fiatAmount: 24.8 })).toBe(12.4);
     });
 
-    test('prefers Kotani USDC/CGHS over fallback FX data', async () => {
+    test('prefers Kotani USDC/GHS over fallback FX data (legacy liveUsdToGhs NOT written)', async () => {
         axios.get.mockImplementation((url) => {
             if (url.includes('coingecko')) {
                 return Promise.resolve({ data: { tether: { usd: 1 }, 'usd-coin': { usd: 1 }, dai: { usd: 1 } } });
@@ -57,11 +57,15 @@ describe('OracleService Kotani rate preference', () => {
 
         expect(prisma.globalSettings.upsert).toHaveBeenCalledWith(expect.objectContaining({
             update: expect.objectContaining({
-                liveUsdToGhs: 12.75,
                 liveRetailRate: 12.75,
                 liveRateSource: 'KOTANI_PAY',
             }),
         }));
+        // B fix (lead review 2026-10-17): the USDC/GHS observation must
+        // NEVER populate the legacy USD/GHS compatibility field.
+        const payload = prisma.globalSettings.upsert.mock.calls[0][0];
+        expect(payload.update).not.toHaveProperty('liveUsdToGhs');
+        expect(payload.create).not.toHaveProperty('liveUsdToGhs');
     });
 
     test('fails closed when Kotani is unavailable — no canonical write, no fallback rate', async () => {

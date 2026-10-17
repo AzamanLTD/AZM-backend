@@ -40,12 +40,15 @@ describe('OracleService USDC/GHS fallback precision', () => {
     );
     expect(prisma.globalSettings.upsert).toHaveBeenCalledWith(expect.objectContaining({
       update: expect.objectContaining({
-        liveUsdToGhs: 13.11,
         liveRetailRate: 13.11,
         liveUsdcToUsd: 0.9998,
         liveRateSource: 'KOTANI_PAY',
       }),
     }));
+    // B fix: the legacy USD/GHS field is never populated with the USDC rate.
+    const payload = prisma.globalSettings.upsert.mock.calls[0][0];
+    expect(payload.update).not.toHaveProperty('liveUsdToGhs');
+    expect(payload.create).not.toHaveProperty('liveUsdToGhs');
   });
 
   test('writes NO canonical rate when Kotani is unavailable — the FX × CoinGecko composite is retired', async () => {
