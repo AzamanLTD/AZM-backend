@@ -27,7 +27,7 @@ const { protect, adminOnly } = require('../../middleware/authMiddleware');
  */
 function mountHealthRoutes(app, { prisma, workerStatus, redisStatusRef, APP_VERSION, IS_PRODUCTION }) {
   // GET /health — DB liveness probe + optional system stats.
-  app.get('/health', async (req, res) => {
+  const healthHandler = async (req, res) => {
     try {
       await prisma.$queryRaw`SELECT 1`;
 
@@ -120,7 +120,13 @@ function mountHealthRoutes(app, { prisma, workerStatus, redisStatusRef, APP_VERS
         error: IS_PRODUCTION ? 'Service unavailable' : err.message,
       });
     }
-  });
+  };
+
+  // GET /health — DB liveness probe + optional system stats.
+  app.get('/health', healthHandler);
+  // GET /api/health — alias so API-base clients (baseUrl already ends in /api)
+  // can reach the same liveness + version-gate payload without a second host.
+  app.get('/api/health', healthHandler);
 
   // POST /api/admin/susu/release — manual one-time Susu release trigger.
   // Lets an authenticated admin run the idempotent migrate + seed on demand
