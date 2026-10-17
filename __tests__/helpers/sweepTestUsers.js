@@ -31,7 +31,12 @@
 // CI database. No other rows are ever deleted.
 // =============================================================================
 
-const USER_IDS = '(SELECT id FROM "User" WHERE username LIKE \'user_%\')';
+// LITERAL-prefix match (r44 review): LIKE 'user_%' leaves `_` as a SQL
+// single-char wildcard, so it would also match e.g. 'username123' —
+// a NON-test identity on a shared database. left(username, 5) = 'user_'
+// is an exact literal-prefix comparison with the same semantics as the
+// Prisma `startsWith: 'user_'` deleteMany below — no escaping ambiguity.
+const USER_IDS = '(SELECT id FROM "User" WHERE left(username, 5) = \'user_\')';
 const SWEPT_TRADES =
     '(SELECT id FROM "Trade" WHERE "userId" IN ' + USER_IDS + ' OR "vendorId" IN ' + USER_IDS + ')';
 

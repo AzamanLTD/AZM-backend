@@ -292,7 +292,15 @@ describeOrSkip('r22 recovery (real PostgreSQL)', () => {
         // sweeps on WalletAddress_userId_fkey. Sweep our own users before
         // disconnecting.
         if (prisma) {
-            try { await sweepTestUsers(prisma); } catch (e) { /* best-effort */ }
+            // r44 review: a failed sweep is NOT swallowed — it recreates the
+            // exact battery-poisoning failure mode this helper exists to fix
+            // (leaked user_% rows block later suites), so it must be loud.
+            try {
+                await sweepTestUsers(prisma);
+            } catch (e) {
+                console.error('[r22 afterAll] sweepTestUsers failed:', e);
+                throw e;
+            }
             await prisma.$disconnect();
         }
     });
