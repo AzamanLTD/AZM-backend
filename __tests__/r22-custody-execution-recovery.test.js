@@ -19,6 +19,7 @@
 // =============================================================================
 
 const fs = require('fs');
+const { sweepTestUsers } = require('./helpers/sweepTestUsers');
 const path = require('path');
 
 const hasDb = !!process.env.TEST_DATABASE_URL;
@@ -284,7 +285,17 @@ describeOrSkip('r22 recovery (real PostgreSQL)', () => {
         const { PrismaClient } = require('@prisma/client');
         prisma = new PrismaClient();
     });
-    afterAll(async () => { if (prisma) await prisma.$disconnect(); });
+    afterAll(async () => {
+        // Battery-order hygiene (CI run 39007452456): this suite creates
+        // `user_%` users with WalletAddress/CustodyExecution children and
+        // previously left them behind, which blocked later suites' user
+        // sweeps on WalletAddress_userId_fkey. Sweep our own users before
+        // disconnecting.
+        if (prisma) {
+            try { await sweepTestUsers(prisma); } catch (e) { /* best-effort */ }
+            await prisma.$disconnect();
+        }
+    });
 
     beforeEach(() => { enableGates(); });
 
