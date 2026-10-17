@@ -249,6 +249,97 @@ describe('Kotani-only transaction-rate authority (unit proofs)', () => {
 // =============================================================================
 // Part 2 — real PostgreSQL proofs
 // =============================================================================
+// ── SANDBOX-FALLBACK HARDENING (review follow-up) ─────────────────────────
+//
+// The two ways a deployment can end up WITHOUT a working Kotani source
+// must be distinguishable at a glance, and the default-sandbox endpoint
+// must be visible, never silent:
+//   Risk A — KOTANI_PROVIDER != LIVE (or a placeholder token) disables the
+//     canonical source BY CONFIGURATION. That state must be named loudly
+//     at startup and tagged differently from a LIVE outage, because it is
+//     a deployment mistake, not a provider incident.
+//   Risk B — the DEFAULT base URL is the SANDBOX endpoint. A LIVE provider
+//     with KOTANI_API_BASE_URL unset must surface that it is running
+//     against the default sandbox endpoint (legitimate during onboarding,
+//     but explicit, never silent).
+describe('Kotani config audit — sandbox-fallback hardening (unit)', () => {
+    const originalEnv = process.env;
+
+    beforeEach(() => {
+        process.env = { ...originalEnv };
+        delete process.env.KOTANI_PROVIDER;
+        delete process.env.KOTANI_API_TOKEN;
+        delete process.env.KOTANI_API_KEY;
+        delete process.env.KOTANI_API_BASE_URL;
+    });
+
+    afterAll(() => {
+        process.env = originalEnv;
+    });
+
+    test('A1. provider not LIVE: DISABLED BY CONFIGURATION, audit names the env to set', () => {
+        process.env.KOTANI_PROVIDER = 'MOCK';
+        const cfg = new OracleService(mockPrisma()).kotaniConfigState();
+        expect(cfg.armed).toBe(false);
+        expect(cfg.state).toBe('CONFIG_DISABLED');
+        expect(cfg.detail).toContain('KOTANI_PROVIDER');
+        expect(cfg.detail).toContain('DISABLED BY CONFIGURATION');
+    });
+
+    test('A2. unset provider defaults to MOCK and is CONFIG_DISABLED too', () => {
+        const cfg = new OracleService(mockPrisma()).kotaniConfigState();
+        expect(cfg.armed).toBe(false);
+        expect(cfg.state).toBe('CONFIG_DISABLED');
+    });
+
+    test('A3. LIVE provider with a missing or placeholder token: MISSING_TOKEN, not armed', () => {
+        process.env.KOTANI_PROVIDER = 'LIVE';
+        const missing = new OracleService(mockPrisma()).kotaniConfigState();
+        expect(missing.armed).toBe(false);
+        expect(missing.state).toBe('MISSING_TOKEN');
+
+        process.env.KOTANI_API_TOKEN = 'mock-key';
+        const placeholder = new OracleService(mockPrisma()).kotaniConfigState();
+        expect(placeholder.armed).toBe(false);
+        expect(placeholder.state).toBe('MISSING_TOKEN');
+    });
+
+    test('B1. LIVE + token but NO base URL: armed, and the audit names the DEFAULT SANDBOX endpoint', () => {
+        process.env.KOTANI_PROVIDER = 'LIVE';
+        process.env.KOTANI_API_TOKEN = 'onboarding-token';
+        const cfg = new OracleService(mockPrisma()).kotaniConfigState();
+        expect(cfg.armed).toBe(true);
+        expect(cfg.baseUrlExplicit).toBe(false);
+        expect(cfg.baseUrl).toBe('https://sandbox-api.kotanipay.io/api/v3');
+        expect(cfg.detail).toContain('DEFAULT SANDBOX endpoint');
+    });
+
+    test('B2. LIVE + token + explicit base URL: armed, explicit, no sandbox mention', () => {
+        process.env.KOTANI_PROVIDER = 'LIVE';
+        process.env.KOTANI_API_TOKEN = 'onboarding-token';
+        process.env.KOTANI_API_BASE_URL = 'https://api.kotanipay.io/api/v3/';
+        const cfg = new OracleService(mockPrisma()).kotaniConfigState();
+        expect(cfg.armed).toBe(true);
+        expect(cfg.baseUrlExplicit).toBe(true);
+        expect(cfg.baseUrl).toBe('https://api.kotanipay.io/api/v3'); // trailing slash stripped
+        expect(cfg.detail).not.toContain('SANDBOX');
+    });
+
+    test('C1. a DISABLED deployment makes NO Kotani request and the fail-closed path still writes nothing canonical', async () => {
+        process.env.KOTANI_PROVIDER = 'MOCK';
+        axios.post.mockReset();
+        axios.get.mockReset();
+
+        const prisma = mockPrisma();
+        await new OracleService(prisma).fetchAndUpdateRates();
+
+        expect(axios.post).not.toHaveBeenCalled(); // no Kotani attempt
+        expect(prisma.globalSettings.upsert).not.toHaveBeenCalled(); // no canonical write
+        // At most the supplementary display refresh (its own axios calls
+        // may or may not succeed — irrelevant to the canonical contract).
+    });
+});
+
 describeDbOrSkip('Kotani-only transaction-rate authority (real PostgreSQL)', () => {
     let prisma;
 

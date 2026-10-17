@@ -43,16 +43,97 @@ class OracleService {
 
     startOracle() {
         logger.info('🌐 Azaman Live Market Oracle: INITIALIZED');
+        this.logKotaniConfigAudit();
         this.fetchAndUpdateRates();
         setInterval(() => this.fetchAndUpdateRates(), this.updateInterval);
     }
 
-    async fetchKotaniUsdcToGhsRate() {
+    // ── SANDBOX-FALLBACK HARDENING (review follow-up on PR #353) ──────────
+    //
+    // Risk A — a misconfigured deployment is silent. `provider !== 'LIVE'`
+    // or a placeholder token made the oracle return null and collapse
+    // into the SAME generic fail-closed log as a Kotani outage: a
+    // production deployment missing KOTANI_PROVIDER/KOTANI_API_TOKEN was
+    // indistinguishable from an outage until quotes began failing
+    // RATE_STALE. The arm state is now computed in ONE place, logged ONCE
+    // LOUDLY at startup, and every cycle's fail-closed log names WHICH of
+    // the two states it is (CONFIG_DISABLED vs UNAVAILABLE).
+    //
+    // Risk B — the DEFAULT base URL is the SANDBOX endpoint. A LIVE
+    // provider with KOTANI_API_BASE_URL unset silently sent production
+    // traffic to sandbox-api.kotanipay.io — a sandbox fallback baked into
+    // the default. Using the sandbox during onboarding is legitimate, but
+    // it must be an EXPLICIT choice: the startup audit names the endpoint
+    // and says when it is the default-sandbox one, so promotion can be
+    // checked from the logs at a glance.
+    kotaniConfigState() {
         const provider = String(process.env.KOTANI_PROVIDER || 'MOCK').toUpperCase();
         const token = process.env.KOTANI_API_TOKEN || process.env.KOTANI_API_KEY;
-        if (provider !== 'LIVE' || !token || token === 'mock-key') return null;
+        const explicitBaseUrl = process.env.KOTANI_API_BASE_URL
+            ? String(process.env.KOTANI_API_BASE_URL).replace(/\/$/, '')
+            : null;
+        const baseUrl = explicitBaseUrl || KOTANI_DEFAULT_BASE_URL;
+        if (provider !== 'LIVE') {
+            return {
+                armed: false,
+                state: 'CONFIG_DISABLED',
+                detail: `KOTANI_PROVIDER='${provider}' — the canonical transaction-rate source is DISABLED BY CONFIGURATION. `
+                    + 'Quotes fail closed (RATE_UNAVAILABLE/RATE_STALE) once the cached observation ages out. '
+                    + 'Set KOTANI_PROVIDER=LIVE with a real KOTANI_API_TOKEN to arm it.',
+                provider,
+                baseUrl,
+                baseUrlExplicit: !!explicitBaseUrl,
+            };
+        }
+        if (!token || token === 'mock-key') {
+            return {
+                armed: false,
+                state: 'MISSING_TOKEN',
+                detail: `KOTANI_PROVIDER=LIVE but the token is ${token ? "the placeholder 'mock-key'" : 'not set'} `
+                    + '(KOTANI_API_TOKEN/KOTANI_API_KEY). The canonical transaction-rate source is DISABLED BY '
+                    + 'CONFIGURATION; quotes fail closed once the cached observation ages out.',
+                provider,
+                baseUrl,
+                baseUrlExplicit: !!explicitBaseUrl,
+            };
+        }
+        return {
+            armed: true,
+            state: 'ARMED',
+            detail: explicitBaseUrl
+                ? `Kotani LIVE provider ARMED against ${explicitBaseUrl}.`
+                : `Kotani LIVE provider ARMED — KOTANI_API_BASE_URL is NOT SET, so the DEFAULT SANDBOX endpoint is in use (${KOTANI_DEFAULT_BASE_URL}). `
+                    + 'Legitimate during onboarding, but set the production endpoint explicitly before go-live.',
+            provider,
+            baseUrl,
+            baseUrlExplicit: !!explicitBaseUrl,
+        };
+    }
 
-        const baseUrl = String(process.env.KOTANI_API_BASE_URL || KOTANI_DEFAULT_BASE_URL).replace(/\/$/, '');
+    // One loud, startup-visible statement of the arm state (Risk A/B).
+    logKotaniConfigAudit() {
+        const cfg = this.kotaniConfigState();
+        if (cfg.armed) {
+            const log = cfg.baseUrlExplicit ? logger.info : logger.warn;
+            log(`[Oracle] Kotani config audit: ${cfg.detail}`);
+        } else {
+            logger.error(`[Oracle] Kotani config audit: ${cfg.detail}`);
+        }
+        return cfg;
+    }
+
+    async fetchKotaniUsdcToGhsRate() {
+        const cfg = this.kotaniConfigState();
+        if (!cfg.armed) {
+            // Distinct, greppable per-cycle tag: an operator can tell a
+            // DISABLED-BY-CONFIG deployment from a Kotani outage instantly.
+            logger.error(
+                `[Oracle] [KOTANI_CONFIG_DISABLED] ${cfg.state}: no Kotani observation will be attempted this cycle. ${cfg.detail}`
+            );
+            return null;
+        }
+
+        const baseUrl = cfg.baseUrl;
         const from = process.env.KOTANI_RATE_FROM || 'USDC';
         const to = process.env.KOTANI_RATE_TO || 'CGHS';
         const response = await axios.post(`${baseUrl}/rate/offramp`, {
@@ -60,7 +141,7 @@ class OracleService {
             to,
             cryptoAmount: 1,
         }, {
-            headers: { Authorization: `Bearer ${token}` },
+            headers: { Authorization: `Bearer ${process.env.KOTANI_API_TOKEN || process.env.KOTANI_API_KEY}` },
             timeout: 8000,
         });
         const rate = extractKotaniRate(response.data);
@@ -157,7 +238,7 @@ class OracleService {
             } catch (kotaniErr) {
                 logger.warn(
                     { err: kotaniErr },
-                    '[Oracle] Kotani Pay rate unavailable; the canonical USDC/GHS observation failed.'
+                    '[Oracle] [KOTANI_UNAVAILABLE] the LIVE provider is armed but the canonical USDC/GHS observation failed — outage path, NOT a configuration problem.'
                 );
             }
 
