@@ -35,8 +35,16 @@ describe('OracleService Kotani rate preference', () => {
         });
         axios.post.mockImplementation((url, body) => {
             expect(url).toContain('/api/v3/rate/offramp');
-            expect(body).toEqual({ from: 'USDC', to: 'CGHS', cryptoAmount: 1 });
-            return Promise.resolve({ data: { rate: 12.75 } });
+            // Documented v3 fiat payout code ('to' is the FIAT code;
+            // CGHS is a stablecoin in the `from` enum).
+            expect(body).toEqual({ from: 'USDC', to: 'GHS', cryptoAmount: 1 });
+            // Documented v3 response envelope: success + echoed pair + value.
+            return Promise.resolve({
+                data: {
+                    success: true,
+                    data: { from: 'USDC', to: 'GHS', value: '12.75' },
+                },
+            });
         });
 
         const prisma = {

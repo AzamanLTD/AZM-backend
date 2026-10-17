@@ -59,7 +59,12 @@ describe('271D oracle per-source isolation', () => {
 
     const COINGECKO_OK = () =>
         Promise.resolve({ data: { tether: { usd: 1 }, 'usd-coin': { usd: 0.999 }, dai: { usd: 1.001 } } });
-    const KOTANI_OK = (rate = 12.75) => Promise.resolve({ data: { rate } });
+    // Documented v3 envelope (https://documentation.kotanipay.com/v3/api-reference/rates/offramp-rate):
+// { success: true, data: { from, to, value: "<rate>", ... } }. Every mock
+// below uses this exact shape so the tests mirror what Kotani actually sends.
+const KOTANI_OK = (rate = 12.75, from = 'USDC', to = 'GHS') => Promise.resolve({
+    data: { success: true, data: { from, to, value: String(rate) } },
+});
 
     test('A: Kotani success + CoinGecko failure still writes the canonical observation', async () => {
         axios.post.mockImplementation((url) => {

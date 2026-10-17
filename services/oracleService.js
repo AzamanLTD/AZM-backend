@@ -9,8 +9,29 @@ const asFinitePositive = (value) => {
     return Number.isFinite(number) && number > 0 ? number : null;
 };
 
+// ── KOTANI V3 RESPONSE CONTRACT (2026-10-17 hardening, A2) ────────────────
+//
+// The documented POST /api/v3/rate/offramp response shape is
+//   { "success": true, "message": "Available exchange rate.",
+//     "data": { "from": "USDC", "to": "GHS", "value": "15.53",
+//               "fiatAmount": ..., "cryptoAmount": ..., "fee": ... } }
+// (https://documentation.kotanipay.com/v3/api-reference/rates/offramp-rate).
+// The rate lives in data.value AS A STRING; the pair is echoed in
+// data.from/data.to. Auth/quota failures can arrive as HTTP 200 with
+// success:false and an empty data object — so an explicit success:false
+// must fail closed, and the echoed pair must be validated before an
+// observation is trusted: a misconfigured from/to (or an off-target
+// response) must never write a foreign-pair rate into the canonical
+// USDC/GHS slot.
 const extractKotaniRate = (payload) => {
+    // A 200 envelope that explicitly says failure is a failure.
+    if (payload?.success === false) return null;
     const candidates = [
+        // Documented v3 shape first: data.value (string rate).
+        payload?.data?.value,
+        payload?.value,
+        // Legacy/observed shapes retained (parse-only; all are gated by
+        // the same finite-positive check).
         payload?.rate,
         payload?.exchangeRate,
         payload?.data?.rate,
@@ -32,6 +53,30 @@ const extractKotaniRate = (payload) => {
     if (cryptoAmount && fiatAmount) return fiatAmount / cryptoAmount;
 
     return null;
+};
+
+// C-prefix equivalence: the Kotani `from` enum lists C-prefixed
+// stablecoins (CGHS, CKES...) that denote the same national currency as
+// their unprefixed fiat code. A request for GHS may be echoed as CGHS
+// (or vice versa) and still be the pair we asked for.
+const sameCurrencyCode = (requested, echoed) => {
+    if (requested === undefined || requested === null || echoed === undefined || echoed === null) {
+        return false;
+    }
+    const a = String(requested).trim().toUpperCase();
+    const b = String(echoed).trim().toUpperCase();
+    return a === b || a === 'C' + b || b === 'C' + a;
+};
+
+// Validates that the response echoes the pair we requested. Fail-closed
+// semantics: a response with NO echoed pair, or a mismatched one, must
+// never be trusted as the requested rate.
+const kotaniPairMatches = (payload, expectedFrom, expectedTo) => {
+    const echoedFrom = payload?.data?.from ?? payload?.from;
+    const echoedTo = payload?.data?.to ?? payload?.to;
+    if (!sameCurrencyCode(expectedFrom, echoedFrom)) return false;
+    if (!sameCurrencyCode(expectedTo, echoedTo)) return false;
+    return true;
 };
 
 class OracleService {
@@ -135,7 +180,11 @@ class OracleService {
 
         const baseUrl = cfg.baseUrl;
         const from = process.env.KOTANI_RATE_FROM || 'USDC';
-        const to = process.env.KOTANI_RATE_TO || 'CGHS';
+        // The documented `to` is the FIAT payout currency code (docs
+        // example: "EUR"); CGHS is a stablecoin listed in the `from` enum,
+        // not the fiat code for a cedi offramp. KOTANI_RATE_TO remains the
+        // explicit override for operators.
+        const to = process.env.KOTANI_RATE_TO || 'GHS';
         const response = await axios.post(`${baseUrl}/rate/offramp`, {
             from,
             to,
@@ -144,8 +193,28 @@ class OracleService {
             headers: { Authorization: `Bearer ${process.env.KOTANI_API_TOKEN || process.env.KOTANI_API_KEY}` },
             timeout: 8000,
         });
+
+        // A2 hardening: the response must explicitly declare success, echo
+        // the requested pair, and carry a usable rate — anything else is
+        // an unvalidated observation and fails closed with a distinct,
+        // greppable tag.
+        if (response.data?.success === false) {
+            throw new Error(
+                `[KOTANI_RATE_REJECTED] Kotani returned success:false (${response.data?.message ?? 'no message'}) `
+                + '— the observation is rejected, not parsed.'
+            );
+        }
+        if (!kotaniPairMatches(response.data, from, to)) {
+            const echoedFrom = response.data?.data?.from ?? response.data?.from;
+            const echoedTo = response.data?.data?.to ?? response.data?.to;
+            throw new Error(
+                `[KOTANI_RATE_PAIR_MISMATCH] requested ${from}->${to} but Kotani echoed `
+                + `${JSON.stringify(echoedFrom ?? null)}->${JSON.stringify(echoedTo ?? null)} `
+                + '— a foreign-pair response must never write the canonical USDC/GHS rate.'
+            );
+        }
         const rate = extractKotaniRate(response.data);
-        if (!rate) throw new Error('Kotani Pay rate response did not contain a usable USDC/GHS rate.');
+        if (!rate) throw new Error('[KOTANI_RATE_UNPARSEABLE] Kotani Pay rate response did not contain a usable USDC/GHS rate.');
         return rate;
     }
 
@@ -324,3 +393,4 @@ class OracleService {
 
 module.exports = OracleService;
 module.exports.extractKotaniRate = extractKotaniRate;
+module.exports.kotaniPairMatches = kotaniPairMatches;

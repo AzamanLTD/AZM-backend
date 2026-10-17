@@ -46,7 +46,12 @@ const coingecko429 = () => {
     return Promise.reject(err);
 };
 
-const KOTANI_OK = (rate = 12.75) => Promise.resolve({ data: { rate } });
+// Documented v3 envelope (https://documentation.kotanipay.com/v3/api-reference/rates/offramp-rate):
+// { success: true, data: { from, to, value: "<rate>", ... } }. Every mock
+// below uses this exact shape so the tests mirror what Kotani actually sends.
+const KOTANI_OK = (rate = 12.75, from = 'USDC', to = 'GHS') => Promise.resolve({
+    data: { success: true, data: { from, to, value: String(rate) } },
+});
 const COINGECKO_OK = (usdcUsd = 0.999) =>
     Promise.resolve({ data: { tether: { usd: 1 }, 'usd-coin': { usd: usdcUsd }, dai: { usd: 1.001 } } });
 const FX_OK = (ghs = 13.20) => Promise.resolve({ data: { rates: { GHS: ghs } } });
@@ -236,6 +241,125 @@ describe('Kotani-only transaction-rate authority (unit proofs)', () => {
         expect(axios.post).not.toHaveBeenCalled();
         expect(prisma.globalSettings.upsert).not.toHaveBeenCalled();
         expect(prisma.globalSettings.update).toHaveBeenCalledTimes(1);
+    });
+
+    // ── A2 HARDENING (2026-10-17): documented v3 envelope, fail-closed
+    // pair validation, and the correct fiat payout code. Docs:
+    // https://documentation.kotanipay.com/v3/api-reference/rates/offramp-rate
+
+    test('A2-a. extractKotaniRate parses the DOCUMENTED v3 envelope (data.value as a string)', () => {
+        const v3 = { success: true, message: 'Available exchange rate.',
+            data: { from: 'USDC', to: 'GHS', value: '15.53', fiatAmount: 15.53, cryptoAmount: 1 } };
+        expect(OracleService.extractKotaniRate(v3)).toBe(15.53);
+        // success:false with a payload is still a failure — fail closed.
+        expect(OracleService.extractKotaniRate({ success: false, message: 'Invalid API Key', data: {} })).toBeNull();
+        expect(OracleService.extractKotaniRate({ success: false, data: { value: '15.53' } })).toBeNull();
+    });
+
+    test('A2-b. kotaniPairMatches validates the echoed pair, with C-prefix stablecoin equivalence', () => {
+        const echo = (from, to) => ({ success: true, data: { from, to, value: '1' } });
+        expect(OracleService.kotaniPairMatches(echo('USDC', 'GHS'), 'USDC', 'GHS')).toBe(true);
+        // C-prefixed stablecoins denote the same national fiat (CGHS === GHS).
+        expect(OracleService.kotaniPairMatches(echo('USDC', 'CGHS'), 'USDC', 'GHS')).toBe(true);
+        expect(OracleService.kotaniPairMatches(echo('USDC', 'GHS'), 'USDC', 'CGHS')).toBe(true);
+        // A mismatched pair must never be trusted.
+        expect(OracleService.kotaniPairMatches(echo('USDC', 'KES'), 'USDC', 'GHS')).toBe(false);
+        expect(OracleService.kotaniPairMatches(echo('USDT', 'GHS'), 'USDC', 'GHS')).toBe(false);
+        // A response with no pair echo at all is an unvalidated observation.
+        expect(OracleService.kotaniPairMatches({ data: { value: '15.53' } }, 'USDC', 'GHS')).toBe(false);
+        expect(OracleService.kotaniPairMatches({}, 'USDC', 'GHS')).toBe(false);
+    });
+
+    test('A2-c. the fetch request uses the documented fiat payout code (to=GHS, POST body)', async () => {
+        let seenBody = null;
+        axios.post.mockImplementation((url, body) => {
+            expect(url).toContain('/api/v3/rate/offramp');
+            seenBody = body;
+            return KOTANI_OK(12.75);
+        });
+        axios.get.mockImplementation(() => Promise.reject(new Error('unexpected GET')));
+
+        await new OracleService(mockPrisma()).fetchAndUpdateRates();
+
+        expect(seenBody).toEqual({ from: 'USDC', to: 'GHS', cryptoAmount: 1 });
+    });
+
+    test('A2-d. a foreign-pair echo fails closed with a distinct, greppable error — no canonical write', async () => {
+        axios.post.mockResolvedValue({ data: {
+            success: true, data: { from: 'USDC', to: 'KES', value: '129.47' },
+        } });
+        axios.get.mockImplementation((url) => {
+            if (url.includes('coingecko')) return COINGECKO_OK();
+            throw new Error(`unexpected GET ${url}`);
+        });
+
+        const prisma = mockPrisma();
+        await new OracleService(prisma).fetchAndUpdateRates();
+
+        expect(prisma.globalSettings.upsert).not.toHaveBeenCalled();
+    });
+
+    test('A2-e. success:false fails closed with KOTANI_RATE_REJECTED — no canonical write', async () => {
+        axios.post.mockResolvedValue({ data: { success: false, message: 'Invalid API Key', data: {} } });
+        axios.get.mockImplementation((url) => {
+            if (url.includes('coingecko')) return COINGECKO_OK();
+            throw new Error(`unexpected GET ${url}`);
+        });
+
+        const prisma = mockPrisma();
+        await new OracleService(prisma).fetchAndUpdateRates();
+
+        expect(prisma.globalSettings.upsert).not.toHaveBeenCalled();
+    });
+
+    // ── A3 HARDENING (2026-10-17): gateway LIVE fetch uses the documented
+    // POST + v3 envelope and FAILS CLOSED (null, never a MOCK fallback).
+
+    test('A3-a. gateway LIVE fetch: documented POST body + v3 envelope; one rate, spread 0', async () => {
+        const GatewayService = require('../services/gatewayService');
+        process.env.KOTANI_PROVIDER = 'LIVE';
+        process.env.KOTANI_API_KEY = 'test-key';
+        axios.post.mockImplementation((url, body) => {
+            expect(url).toContain('/api/v3/rate/offramp');
+            expect(body).toEqual({ from: 'USDC', to: 'GHS', cryptoAmount: 1 });
+            return Promise.resolve({ data: {
+                success: true, data: { from: 'USDC', to: 'GHS', value: '12.90' },
+            } });
+        });
+
+        const rates = await new GatewayService(mockPrisma()).fetchOfframpRates();
+
+        expect(rates.source).toBe('LIVE');
+        expect(rates.retailRate).toBe(12.90);
+        expect(rates.corporateRate).toBe(12.90);
+        expect(rates.spread).toBe(0); // no fabricated corporate spread from a one-rate envelope
+        delete process.env.KOTANI_API_KEY;
+    });
+
+    test('A3-b. gateway LIVE failure FAILS CLOSED: null, never a silent MOCK fallback rate', async () => {
+        const GatewayService = require('../services/gatewayService');
+        process.env.KOTANI_PROVIDER = 'LIVE';
+        process.env.KOTANI_API_KEY = 'test-key';
+        axios.post.mockRejectedValue(new Error('kotani LIVE outage'));
+
+        const rates = await new GatewayService(mockPrisma()).fetchOfframpRates();
+
+        expect(rates).toBeNull(); // the war-room OTC quote 503s instead of trading at a MOCK rate
+        delete process.env.KOTANI_API_KEY;
+    });
+
+    test('A3-c. gateway LIVE fetch with a foreign pair or success:false also fails closed', async () => {
+        const GatewayService = require('../services/gatewayService');
+        process.env.KOTANI_PROVIDER = 'LIVE';
+        process.env.KOTANI_API_KEY = 'test-key';
+        axios.post.mockResolvedValue({ data: {
+            success: true, data: { from: 'USDC', to: 'KES', value: '129.47' },
+        } });
+        expect(await new GatewayService(mockPrisma()).fetchOfframpRates()).toBeNull();
+
+        axios.post.mockResolvedValue({ data: { success: false, message: 'Invalid API Key', data: {} } });
+        expect(await new GatewayService(mockPrisma()).fetchOfframpRates()).toBeNull();
+        delete process.env.KOTANI_API_KEY;
     });
 
     test('RateUnavailableError is exported with its typed codes for explicit fail-closed reasons', () => {
