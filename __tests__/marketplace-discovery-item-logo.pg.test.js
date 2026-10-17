@@ -19,6 +19,17 @@
 //     nextCursor/cache) and the feature flag still gates it identically —
 //     the logo change touches NO authorization, pricing, filtering,
 //     availability, ranking or payment capability.
+//
+// HERMETIC FIXTURE CONTRACT (#355): this suite NEVER truncates shared tables.
+// The original beforeEach nuked the whole test world
+// (TRUNCATE "User" ... CASCADE), destroying every other suite's fixtures in
+// the shared battery DB. Cleanup is now SUITE-OWNED: the suite deletes only
+// the users it created (username prefix 'logo-dto-user-'; the
+// User→BusinessProfile→BusinessProduct→BusinessPrice chain is
+// onDelete: Cascade, so one prefix deleteMany removes exactly this suite's
+// rows and nothing else). Queries pin the suite's own uniquely-named products
+// via the feed's `q` filter, so foreign rows in a shared DB can never crowd
+// this suite's items out of the queried page.
 // =============================================================================
 
 const { PrismaClient, Prisma } = require('@prisma/client');
@@ -35,20 +46,29 @@ run('marketplace discovery item businessLogoUrl (PostgreSQL)', () => {
     let db;
     let seq;
 
+    // Deletes ONLY this suite's rows: the username-prefix deleteMany removes
+    // the suite's users, and the User→BusinessProfile→BusinessProduct→
+    // BusinessPrice onDelete: Cascade chain removes everything else it
+    // created. Idempotent: also clears leftovers from a prior run that
+    // crashed before its own afterAll. No other suite's data is touched.
+    const cleanupSuiteRows = () =>
+        db.user.deleteMany({ where: { username: { startsWith: 'logo-dto-user-' } } });
+
     beforeAll(async () => {
         process.env.DATABASE_URL = url;
         process.env.NODE_ENV = 'test';
         db = new PrismaClient();
+        await cleanupSuiteRows();
     });
 
     afterAll(async () => {
+        await cleanupSuiteRows();
         await db?.$disconnect();
     });
 
     beforeEach(async () => {
         seq = Date.now();
         discoveryService.invalidateDiscoveryFeedCache();
-        await db.$executeRawUnsafe('TRUNCATE TABLE "User" RESTART IDENTITY CASCADE');
     });
 
     // ── seed helpers (mirror the mix-p1 suite's shapes) ─────────────────────
@@ -111,7 +131,7 @@ run('marketplace discovery item businessLogoUrl (PostgreSQL)', () => {
         const product = await seedProduct(profile);
         await seedConfirmedPrice(product.id);
 
-        const page = await feed({});
+        const page = await feed({ q: product.name }); // pin to suite-owned rows
         const item = page.items.find((i) => i.id === product.id);
         expect(item).toBeDefined();
         // Byte-identical pass-through of the stored value — no default,
@@ -134,7 +154,7 @@ run('marketplace discovery item businessLogoUrl (PostgreSQL)', () => {
         const product = await seedProduct(profile);
         await seedConfirmedPrice(product.id);
 
-        const page = await feed({});
+        const page = await feed({ q: product.name }); // pin to suite-owned rows
         const item = page.items.find((i) => i.id === product.id);
         expect(item).toBeDefined();
         // The key is ALWAYS present (uniform client handling of missing
@@ -148,7 +168,7 @@ run('marketplace discovery item businessLogoUrl (PostgreSQL)', () => {
         const product = await seedProduct(profile);
         await seedConfirmedPrice(product.id);
 
-        const page = await feed({});
+        const page = await feed({ q: product.name }); // pin to suite-owned rows
         const item = page.items.find((i) => i.id === product.id);
         expect(item).toBeDefined();
 
@@ -188,7 +208,9 @@ run('marketplace discovery item businessLogoUrl (PostgreSQL)', () => {
         await seedConfirmedPrice(productA.id);
         await seedConfirmedPrice(productB.id);
 
-        const page = await feed({});
+        // One q pins BOTH suite-owned products (shared 'LogoDto item'
+        // prefix) while excluding every foreign row in a shared battery DB.
+        const page = await feed({ q: 'LogoDto item' });
         const itemA = page.items.find((i) => i.id === productA.id);
         const itemB = page.items.find((i) => i.id === productB.id);
         expect(itemA.businessLogoUrl).toBe(logoA);
@@ -216,7 +238,10 @@ run('marketplace discovery item businessLogoUrl (PostgreSQL)', () => {
         const prev = process.env.AZM_MARKETPLACE_DISCOVERY_ENABLED;
         process.env.AZM_MARKETPLACE_DISCOVERY_ENABLED = 'true';
         try {
-            const res = await request(buildApp()).get('/api/discovery/items').expect(200);
+            const res = await request(buildApp())
+                .get('/api/discovery/items')
+                .query({ q: product.name }) // pin to suite-owned rows
+                .expect(200);
             // Envelope contract unchanged (success/items/nextCursor/cache).
             expect(res.body.success).toBe(true);
             expect(Array.isArray(res.body.items)).toBe(true);
