@@ -21,14 +21,17 @@ describe('OracleService USDC/GHS fallback precision', () => {
       }
       throw new Error(`unexpected GET URL: ${url}`);
     });
-    axios.post.mockResolvedValue({ data: { rate: 13.11 } });
+    axios.post.mockResolvedValue({ data: {
+      success: true,
+      data: { from: 'USDC', to: 'GHS', value: '13.11' },
+    } });
 
     const prisma = { globalSettings: { upsert: jest.fn().mockResolvedValue({}) } };
     await new OracleService(prisma).fetchAndUpdateRates();
 
     expect(axios.post).toHaveBeenCalledWith(
       expect.stringContaining('/api/v3/rate/offramp'),
-      { from: 'USDC', to: 'CGHS', cryptoAmount: 1 },
+      { from: 'USDC', to: 'GHS', cryptoAmount: 1 },
       expect.objectContaining({ headers: { Authorization: 'Bearer test-token' } }),
     );
     expect(axios.get).not.toHaveBeenCalledWith(
