@@ -4,6 +4,21 @@ const axios = require('axios');
 
 const KOTANI_DEFAULT_BASE_URL = 'https://sandbox-api.kotanipay.io/api/v3';
 
+// ── §1 VERIFIED PRODUCTION HOST ALLOWLIST (review follow-up 2026-10-18) ──
+//
+// A production transaction-rate endpoint must be HTTPS AND on a host that
+// Kotani has CONFIRMED in writing during onboarding. We do not invent the
+// production hostname: this allowlist ships EMPTY and production arming
+// fails closed (UNVERIFIED_PRODUCTION_HOST) until the verified host is
+// added here by the platform operator as the explicit onboarding step.
+//
+// TO ARM PRODUCTION (one line, one commit, auditable): push the host Kotani
+// confirmed, e.g.  KOTANI_VERIFIED_PRODUCTION_HOSTS.push('api.kotanipay.io')
+// — ONLY once Kotani onboarding has confirmed that exact hostname in writing.
+// The array is exported so policy tests can exercise the armed path with a
+// simulated verified host and restore it afterwards.
+const KOTANI_VERIFIED_PRODUCTION_HOSTS = [];
+
 const asFinitePositive = (value) => {
     const number = Number(value);
     return Number.isFinite(number) && number > 0 ? number : null;
@@ -198,10 +213,60 @@ class OracleService {
                     baseUrlExplicit: true,
                 };
             }
+            // §1 (review follow-up 2026-10-18): production arming additionally
+            // requires an HTTPS endpoint ON A HOST KOTANI HAS VERIFIED. A
+            // plaintext endpoint (credential/rate interception) or an
+            // unverified host (typosquat / lookalike provider) must NEVER
+            // become the production rate authority. Until Kotani onboarding
+            // confirms the production hostname, this fails CLOSED for every
+            // host — by design.
+            let parsedEndpoint;
+            try {
+                parsedEndpoint = new URL(explicitBaseUrl);
+            } catch (err) {
+                return {
+                    armed: false,
+                    state: 'INVALID_ENDPOINT',
+                    detail: `KOTANI_API_BASE_URL='${explicitBaseUrl}' is not a parseable URL and is REJECTED BY POLICY `
+                        + 'in production. The provider is NOT armed; quotes fail closed. Configure the verified '
+                        + 'production endpoint to arm it.',
+                    provider,
+                    baseUrl: null,
+                    baseUrlExplicit: true,
+                };
+            }
+            if (parsedEndpoint.protocol !== 'https:') {
+                return {
+                    armed: false,
+                    state: 'NON_HTTPS_ENDPOINT_REJECTED',
+                    detail: `KOTANI_API_BASE_URL='${explicitBaseUrl}' is NOT an https:// endpoint and is REJECTED `
+                        + 'BY POLICY in production: transaction-rate credentials and observations must travel over '
+                        + 'TLS. The provider is NOT armed; quotes fail closed. Configure the verified https:// '
+                        + 'production endpoint to arm it.',
+                    provider,
+                    baseUrl: null,
+                    baseUrlExplicit: true,
+                };
+            }
+            if (!KOTANI_VERIFIED_PRODUCTION_HOSTS.includes(parsedEndpoint.hostname)) {
+                return {
+                    armed: false,
+                    state: 'UNVERIFIED_PRODUCTION_HOST',
+                    detail: `KOTANI_API_BASE_URL host '${parsedEndpoint.hostname}' is NOT on the verified production `
+                        + 'host allowlist (services/oracleService.js KOTANI_VERIFIED_PRODUCTION_HOSTS). Production '
+                        + 'arming fails CLOSED until Kotani onboarding confirms the production hostname in writing '
+                        + 'and the operator adds it to the allowlist. The provider is NOT armed; quotes fail closed '
+                        + '(RATE_UNAVAILABLE/RATE_STALE).',
+                    provider,
+                    baseUrl: null,
+                    baseUrlExplicit: true,
+                };
+            }
             return {
                 armed: true,
                 state: 'ARMED',
-                detail: `Kotani LIVE provider ARMED against the explicitly configured production endpoint ${explicitBaseUrl}.`,
+                detail: `Kotani LIVE provider ARMED against the explicitly configured verified production endpoint `
+                    + `${explicitBaseUrl} (host confirmed by Kotani onboarding, https-only policy satisfied).`,
                 provider,
                 baseUrl: explicitBaseUrl,
                 baseUrlExplicit: true,
@@ -482,3 +547,4 @@ class OracleService {
 module.exports = OracleService;
 module.exports.extractKotaniRate = extractKotaniRate;
 module.exports.kotaniPairMatches = kotaniPairMatches;
+module.exports.KOTANI_VERIFIED_PRODUCTION_HOSTS = KOTANI_VERIFIED_PRODUCTION_HOSTS;

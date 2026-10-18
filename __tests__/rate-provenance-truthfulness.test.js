@@ -306,6 +306,65 @@ describeOrSkip('Rate provenance truthfulness (real PostgreSQL) — issue #271 / 
         expect(log.changes.lastAdminSetAt).toBeDefined();
     });
 
+    // ---- E2. §1 provider-owned canonical fields (review follow-up 2026-10-18) ----
+
+    test('E2-a. admin settings CANNOT mutate liveRetailRate — the field is provider-owned', async () => {
+        const prior = await seedSettings({ liveRetailRate: 13.42, liveRateSource: 'KOTANI_PAY', lastAdminSetAt: null });
+        const { updateSettings } = require('../controllers/adminSettingsController');
+
+        const res = mockRequest({ liveRetailRate: 99.99 });
+        const out = mockResponse();
+        await updateSettings(res, out);
+
+        expect(out.statusCode).toBe(400);
+        expect(out.payload.success).toBe(false);
+        expect(out.payload.message).toContain('provider-owned');
+
+        // The canonical row is byte-identical — no mutation, no freshness move.
+        const row = await getSettings();
+        expect(Number(row.liveRetailRate)).toBe(13.42);
+        expect(row.liveRateSource).toBe('KOTANI_PAY');
+        expect(row.lastExternalSync ? row.lastExternalSync.getTime() : null)
+            .toBe(prior.lastExternalSync ? prior.lastExternalSync.getTime() : null);
+        expect(row.lastAdminSetAt).toBeNull();
+    });
+
+    test('E2-b. admin settings CANNOT spoof liveRateSource=KOTANI_PAY — a manual value can never be relabeled as a provider observation', async () => {
+        const prior = await seedSettings({ liveRetailRate: 13.42, liveRateSource: 'AZM_ADMIN_OVERRIDE', lastAdminSetAt: null });
+        const { updateSettings } = require('../controllers/adminSettingsController');
+
+        // The spoof shape: a rate PLUS a provider label in one request.
+        const res = mockRequest({ liveRetailRate: 99.99, liveRateSource: 'KOTANI_PAY' });
+        const out = mockResponse();
+        await updateSettings(res, out);
+
+        expect(out.statusCode).toBe(400);
+        const row = await getSettings();
+        expect(Number(row.liveRetailRate)).toBe(13.42);
+        expect(row.liveRateSource).toBe('AZM_ADMIN_OVERRIDE');
+
+        // The label alone is also refused.
+        const res2 = mockRequest({ liveRateSource: 'KOTANI_PAY' });
+        const out2 = mockResponse();
+        await updateSettings(res2, out2);
+        expect(out2.statusCode).toBe(400);
+        const row2 = await getSettings();
+        expect(row2.liveRateSource).toBe('AZM_ADMIN_OVERRIDE');
+        expect(row2.lastExternalSync ? row2.lastExternalSync.getTime() : null)
+            .toBe(prior.lastExternalSync ? prior.lastExternalSync.getTime() : null);
+    });
+
+    test('E2-c. the legacy liveUsdToGhs override still works and stamps manual provenance (operator capability preserved)', async () => {
+        const { updateSettings } = require('../controllers/adminSettingsController');
+        const res = mockRequest({ liveUsdToGhs: 14.20 });
+        const out = mockResponse();
+        await updateSettings(res, out);
+        expect(out.statusCode).toBe(200);
+        const row = await getSettings();
+        expect(Number(row.liveUsdToGhs)).toBe(14.20);
+        expect(row.lastAdminSetAt).not.toBeNull();
+    });
+
     // ---- F. Mixed writer sequence ---------------------------------------------
 
     test('F. mixed sequence: the external timestamp survives echo + admin + oracle failure', async () => {

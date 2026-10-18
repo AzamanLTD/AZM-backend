@@ -123,7 +123,7 @@ exports.updateSettings = async (req, res) => {
             'withdrawalFeeByRiskTier', 'feeByPaymentMethod', 'supportedPaymentMethods',
             'gasFeeTrc20', 'gasFeeErc20', 'gasFeeBep20',
             'autoPayoutEnabled', 'autoPayoutThresholdUsdc', 'autoPayoutMaxAmountUsdc', 'autoPayoutIntervalMs',
-            'liveUsdToGhs', 'liveRetailRate', 'liveRateSource',
+            'liveUsdToGhs',
             'minAppVersion', 'forceUpdateUrl', 'updateMessage',
             'susuProfitPct',
             'smartEscrowFeePct', 'escrowDraftExpiryHours', 'escrowFundedExpiryDays',
@@ -131,6 +131,26 @@ exports.updateSettings = async (req, res) => {
 
         const updateData = {};
         const changes = {};
+
+        // §1 provider-owned canonical fields (review follow-up 2026-10-18):
+        // liveRetailRate / liveRateSource are established ONLY by a validated
+        // Kotani observation in OracleService (the one-writer promise). A
+        // generic admin settings update can neither mutate them nor spoof
+        // their provenance — in particular, an admin-supplied
+        // liveRateSource: 'KOTANI_PAY' must NOT be able to relabel a manual
+        // value as a provider observation. Any request that carries these
+        // fields is rejected loudly instead of being silently ignored, so a
+        // spoofing attempt is visible to the operator and the audit trail.
+        const PROVIDER_OWNED_FIELDS = ['liveRetailRate', 'liveRateSource'];
+        for (const field of PROVIDER_OWNED_FIELDS) {
+            if (Object.prototype.hasOwnProperty.call(req.body || {}, field)) {
+                return res.status(400).json({
+                    success: false,
+                    message: `'${field}' is a provider-owned canonical rate field: it is written only by a validated `
+                        + 'Kotani observation and cannot be set through admin settings.',
+                });
+            }
+        }
 
         for (const field of ALLOWED_FIELDS) {
             if (req.body[field] === undefined) continue;
@@ -177,30 +197,6 @@ exports.updateSettings = async (req, res) => {
                 }
             }
 
-            // B fix (lead review 2026-10-17): the canonical transaction rate
-            // liveRetailRate is now admin-overridable directly, with the same
-            // validation as the legacy liveUsdToGhs override. This preserves
-            // the operator's manual-rate capability now that the oracle no
-            // longer mirrors the canonical rate into the legacy field.
-            if (field === 'liveRetailRate') {
-                if (typeof newValue !== 'number' || !Number.isFinite(newValue) || newValue <= 0 || newValue > 1000000) {
-                    return res.status(400).json({
-                        success: false,
-                        message: 'liveRetailRate must be a positive number no greater than 1,000,000.'
-                    });
-                }
-            }
-
-            if (field === 'liveRateSource') {
-                if (typeof newValue !== 'string' || newValue.trim().length < 1 || newValue.length > 100) {
-                    return res.status(400).json({
-                        success: false,
-                        message: 'liveRateSource must be a non-empty string of at most 100 characters.'
-                    });
-                }
-                newValue = newValue.trim();
-            }
-
             // Validation: tierThreshold must be positive
             if (field === 'tierThreshold' && (typeof newValue !== 'number' || newValue < 0)) {
                 return res.status(400).json({
@@ -240,10 +236,7 @@ exports.updateSettings = async (req, res) => {
         // Instead the manual provenance is recorded explicitly: lastAdminSetAt
         // is stamped and liveRateSource is labeled 'AZM_ADMIN_OVERRIDE' unless
         // the admin supplied an explicit source in the same request.
-        if (
-            Object.prototype.hasOwnProperty.call(updateData, 'liveUsdToGhs')
-            || Object.prototype.hasOwnProperty.call(updateData, 'liveRetailRate')
-        ) {
+        if (Object.prototype.hasOwnProperty.call(updateData, 'liveUsdToGhs')) {
             updateData.lastAdminSetAt = new Date();
             changes.lastAdminSetAt = { old: current.lastAdminSetAt, new: updateData.lastAdminSetAt };
             if (!Object.prototype.hasOwnProperty.call(updateData, 'liveRateSource')) {

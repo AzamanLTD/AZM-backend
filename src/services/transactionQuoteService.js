@@ -183,7 +183,16 @@ function createTransactionQuote({
 // (lastEchoAt) never refresh freshness, and the legacy lastRateSync field is
 // deliberately NOT consulted — the gate fails closed on the canonical
 // lastExternalSync timestamp alone.
+//
+// §1 provenance (review follow-up 2026-10-18): freshness is necessary but NOT
+// sufficient. The gate additionally requires (a) liveRateSource ===
+// 'KOTANI_PAY' — the one verified transaction-rate provider — and (b) that
+// no manual change (lastAdminSetAt) is newer than the observation, so an old
+// fresh timestamp can never be recycled to authorize a mutated rate. There
+// is NO liveUsdToGhs fallback: a missing/invalid canonical rate, or an
+// unproven provenance, fails closed with the typed 503 semantics above.
 // =============================================================================
+
 
 class RateUnavailableError extends Error {
     constructor(message, code) {
@@ -201,9 +210,9 @@ async function getFreshServerRateGhsPerUsdc({ prisma, marketOracle, now = new Da
         where: { id: 1 },
         select: {
             liveRetailRate: true,
-            liveUsdToGhs: true,
             liveRateSource: true,
             lastExternalSync: true,
+            lastAdminSetAt: true,
         },
     });
 
@@ -243,20 +252,55 @@ async function getFreshServerRateGhsPerUsdc({ prisma, marketOracle, now = new Da
         );
     }
 
-    // Rate resolution is identical to the ungated legacy reader: the canonical
-    // liveRetailRate with the legacy USD/GHS field as a compatibility fallback
-    // for installations that predate the explicit USDC retail-rate field.
+    // §1 provenance gate (review follow-up 2026-10-18): a fresh observation
+    // timestamp is NOT, by itself, proof that today's rate value is that
+    // observation. Two further conditions must hold before the timestamp is
+    // allowed to attest the value:
+    //
+    //   (a) liveRateSource must be the one verified transaction-rate provider
+    //       label ('KOTANI_PAY'). Any other label (AZM_ADMIN_OVERRIDE, MOCK,
+    //       FALLBACK_FX, ...) means the value was not established by a
+    //       validated provider observation — fail closed.
+    //   (b) lastAdminSetAt must NOT be newer than lastExternalSync. A manual
+    //       change stamped AFTER the last external observation means the
+    //       observation no longer describes the stored value — the old
+    //       "recent" timestamp must not be recycled to authorize a mutated
+    //       rate. (Defense in depth: since the review the admin settings
+    //       surface can no longer mutate liveRetailRate/liveRateSource at
+    //       all; this check also catches rows mutated by older deployments
+    //       or direct DB surgery.)
+    //
+    // Provenance failures throw the same typed 503 RateUnavailableError as
+    // the freshness failures — RATE_UNAVAILABLE for a non-provider label,
+    // RATE_UNTRUSTED for a manually-superseded observation.
+    const providerLabel = settings?.liveRateSource;
+    if (providerLabel !== 'KOTANI_PAY') {
+        throw new RateUnavailableError(
+            'Exchange rate is temporarily unavailable. Please retry shortly.',
+            'RATE_UNAVAILABLE'
+        );
+    }
+    const adminSetMs = settings?.lastAdminSetAt
+        ? new Date(settings.lastAdminSetAt).getTime()
+        : NaN;
+    if (Number.isFinite(adminSetMs) && adminSetMs > observedMs) {
+        throw new RateUnavailableError(
+            'Exchange rate is temporarily unavailable. Please retry shortly.',
+            'RATE_UNTRUSTED'
+        );
+    }
+
+    // §1 rate resolution (review follow-up 2026-10-18): the USDC/GHS
+    // transaction rate comes from the canonical liveRetailRate ONLY. The
+    // legacy liveUsdToGhs is a USD/GHS compatibility DISPLAY field — it
+    // must never be substituted as a USDC/GHS transaction rate, so there is
+    // NO fallback: a missing/invalid canonical value fails closed.
     // §P.5-C Decimal-native rate path: the authoritative rate stays a Prisma
     // Decimal (DB-native) end-to-end — JS Number is only a
     // presentation-boundary projection, never an input to authoritative
-    // economics or persistence. The 271C freshness semantics above
-    // (lastExternalSync as the sole freshness authority) are unchanged.
+    // economics or persistence.
     const retail = settings?.liveRetailRate != null ? new Prisma.Decimal(settings.liveRetailRate) : null;
-    const legacy = settings?.liveUsdToGhs != null ? new Prisma.Decimal(settings.liveUsdToGhs) : null;
-    const retailUsable = !!(retail && retail.isFinite() && retail.greaterThan(0));
-    const rateExact = retailUsable
-        ? retail
-        : (legacy && legacy.isFinite() && legacy.greaterThan(0) ? legacy : null);
+    const rateExact = !!(retail && retail.isFinite() && retail.greaterThan(0)) ? retail : null;
     if (!rateExact) {
         throw new RateUnavailableError(
             'Exchange rate is temporarily unavailable. Please retry shortly.',
