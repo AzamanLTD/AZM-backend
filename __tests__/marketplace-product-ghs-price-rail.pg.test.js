@@ -254,3 +254,203 @@ run('Marketplace product GHS price rail (real PostgreSQL)', () => {
         expect(b.priceGhs).toBeNull();
     });
 });
+
+// ─── 4. customer-facing business-detail route carries the same contract ───
+//
+// Route-level regression (review 2026-10-18): GET /api/marketplace/business/:bizId
+// must expose the SAME authoritative priceGhs contract as the product rails —
+// exact 2dp string for an eligible current row, null for
+// missing/unconfirmed/future/archived rows, and priceUsdc untouched.
+
+run('Marketplace business-detail GHS price contract (real PostgreSQL, route-level)', () => {
+    let db;
+    let seq;
+
+    const buildApp = () => {
+        const express = require('express');
+        const request = require('supertest');
+        const app = express();
+        app.set('prisma', db);
+        app.use(express.json());
+        app.use('/api/marketplace', require('../routes/marketplaceRoutes'));
+        return { app, request };
+    };
+
+    beforeAll(async () => {
+        db = new PrismaClient();
+    });
+
+    afterAll(async () => {
+        await db.businessPrice.deleteMany({ where: { note: { startsWith: 'ghsrail' } } });
+        await db.businessProduct.deleteMany({ where: { slug: { startsWith: 'ghsrail-' } } });
+        await db.businessProfile.deleteMany({ where: { businessName: { startsWith: 'GhsRail Biz' } } });
+        await db.user.deleteMany({ where: { username: { startsWith: 'ghsrail-user' } } });
+        await db.$disconnect();
+    });
+
+    beforeEach(async () => {
+        seq = Date.now();
+        await db.businessPrice.deleteMany({ where: { note: { startsWith: 'ghsrail' } } });
+        await db.businessProduct.deleteMany({ where: { slug: { startsWith: 'ghsrail-' } } });
+        await db.businessProfile.deleteMany({ where: { businessName: { startsWith: 'GhsRail Biz' } } });
+        await db.user.deleteMany({ where: { username: { startsWith: 'ghsrail-user' } } });
+    });
+
+    async function seedBusinessDetailFixture() {
+        const n = seq++;
+        const owner = await db.user.create({
+            data: {
+                username: `ghsrail-user-${n}-${Date.now()}`,
+                email: `ghsrail-${n}-${Date.now()}@t.test`,
+                password: 'x',
+            },
+        });
+        const profile = await db.businessProfile.create({
+            data: {
+                userId: owner.id,
+                businessName: `GhsRail Biz ${n}`,
+                bizId: `BIZ-GHSRAIL-${n}-${String(Date.now()).slice(-6)}`,
+                category: 'RETAIL',
+                isVerified: true,
+            },
+        });
+        const product = await db.businessProduct.create({
+            data: {
+                businessProfileId: profile.id,
+                name: `Rail Product ${n}`,
+                slug: `ghsrail-${n}-${String(Date.now()).slice(-6)}`,
+                description: 'route proof product',
+                priceUsdc: new Prisma.Decimal('13.42'),
+                category: 'RETAIL',
+                isActive: true,
+                isAvailable: true,
+            },
+        });
+        return { profile, product };
+    }
+
+    const getDetailProduct = async (bizId) => {
+        const { app, request } = buildApp();
+        const res = await request(app).get(`/api/marketplace/business/${bizId}`);
+        expect(res.status).toBe(200);
+        expect(res.body.success).toBe(true);
+        return res.body.data.business.products[0];
+    };
+
+    test('4a. confirmed current price → priceGhs exact 2dp string on the business-detail route', async () => {
+        const { profile, product } = await seedBusinessDetailFixture();
+        await priceService.setPrice(db, {
+            businessProductId: product.id,
+            amountGhs: '49.99',
+            confirmedByType: 'BUSINESS',
+            confirmedById: 'rail-actor',
+            note: 'ghsrail',
+            confirm: true,
+        });
+
+        const dto = await getDetailProduct(profile.bizId);
+        expect(dto.priceGhs).toBe('49.99');
+        expect(Number(dto.priceUsdc)).toBeCloseTo(13.42, 8); // legacy field untouched
+    });
+
+    test('4b. trailing-zero amount serializes as the exact 2dp string (never "7.5")', async () => {
+        const { profile, product } = await seedBusinessDetailFixture();
+        await priceService.setPrice(db, {
+            businessProductId: product.id,
+            amountGhs: '7.50',
+            confirmedByType: 'BUSINESS',
+            confirmedById: 'rail-actor',
+            note: 'ghsrail',
+            confirm: true,
+        });
+
+        const dto = await getDetailProduct(profile.bizId);
+        expect(dto.priceGhs).toBe('7.50');
+    });
+
+    test('4c. missing row → priceGhs null (no converted priceUsdc)', async () => {
+        const { profile } = await seedBusinessDetailFixture();
+        const dto = await getDetailProduct(profile.bizId);
+        expect(dto.priceGhs).toBeNull();
+        expect(Number(dto.priceUsdc)).toBeCloseTo(13.42, 8); // USDC still shown raw
+    });
+
+    test('4d. unconfirmed row → null', async () => {
+        const { profile, product } = await seedBusinessDetailFixture();
+        await priceService.setPrice(db, {
+            businessProductId: product.id,
+            amountGhs: '49.99',
+            confirmedByType: 'BUSINESS',
+            confirmedById: 'rail-actor',
+            note: 'ghsrail',
+            confirm: false, // drafted, never confirmed
+        });
+
+        const dto = await getDetailProduct(profile.bizId);
+        expect(dto.priceGhs).toBeNull();
+    });
+
+    test('4e. future-dated row → null', async () => {
+        const { profile, product } = await seedBusinessDetailFixture();
+        await db.businessPrice.create({
+            data: {
+                businessProductId: product.id,
+                currency: 'GHS',
+                amountExact: new Prisma.Decimal('49.99'),
+                confirmedByType: 'BUSINESS',
+                confirmedById: 'rail-actor',
+                confirmedAt: new Date(),
+                effectiveFrom: new Date(Date.now() + 86400000), // tomorrow
+                note: 'ghsrail-future',
+            },
+        });
+
+        const dto = await getDetailProduct(profile.bizId);
+        expect(dto.priceGhs).toBeNull();
+    });
+
+    test('4f. archived row → null', async () => {
+        const { profile, product } = await seedBusinessDetailFixture();
+        await priceService.setPrice(db, {
+            businessProductId: product.id,
+            amountGhs: '49.99',
+            confirmedByType: 'BUSINESS',
+            confirmedById: 'rail-actor',
+            note: 'ghsrail',
+            confirm: true,
+        });
+        // Archive the confirmed row directly (same lifecycle as test 2e).
+        const price = await db.businessPrice.findFirst({
+            where: { businessProductId: product.id, status: 'ACTIVE' },
+        });
+        await db.businessPrice.update({
+            where: { id: price.id },
+            data: { status: 'ARCHIVED' },
+        });
+
+        const dto = await getDetailProduct(profile.bizId);
+        expect(dto.priceGhs).toBeNull();
+    });
+
+    test('4g. priceUsdc is byte-identical with and without a GHS row on the route', async () => {
+        const plain = await seedBusinessDetailFixture();
+        const withoutRow = await getDetailProduct(plain.profile.bizId);
+
+        const priced = await seedBusinessDetailFixture();
+        await priceService.setPrice(db, {
+            businessProductId: priced.product.id,
+            amountGhs: '49.99',
+            confirmedByType: 'BUSINESS',
+            confirmedById: 'rail-actor',
+            note: 'ghsrail',
+            confirm: true,
+        });
+        const withRow = await getDetailProduct(priced.profile.bizId);
+
+        // Same seeded priceUsdc decimal in both fixtures — the GHS rail must
+        // not disturb the legacy field. (Names differ by seed design.)
+        expect(withRow.priceUsdc).toEqual(withoutRow.priceUsdc);
+        expect(Number(withRow.priceUsdc)).toBeCloseTo(13.42, 8);
+        expect(withRow.id).toEqual(priced.product.id);
+    });
+});
