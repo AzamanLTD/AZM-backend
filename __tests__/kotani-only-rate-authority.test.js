@@ -200,19 +200,35 @@ describe('Kotani-only transaction-rate authority (unit proofs)', () => {
         }
     });
 
-    test('5. the documented Kotani response shapes still parse (existing contract regression)', () => {
-        // Restates the long-standing extractKotaniRate response-shape
-        // contract — it must remain green under the Kotani-only authority.
-        expect(OracleService.extractKotaniRate({ rate: '12.34' })).toBe(12.34);
-        expect(OracleService.extractKotaniRate({ exchangeRate: 13.21 })).toBe(13.21);
-        expect(OracleService.extractKotaniRate({ data: { rate: '12.05' } })).toBe(12.05);
-        expect(OracleService.extractKotaniRate({ data: { exchangeRate: 12.9 } })).toBe(12.9);
-        expect(OracleService.extractKotaniRate({ result: { rate: 12.5 } })).toBe(12.5);
-        expect(OracleService.extractKotaniRate({ cryptoAmount: 2, fiatAmount: 24.8 })).toBe(12.4);
+    test('5. extractKotaniRate accepts ONLY the documented data.value field (P0 review 2026-10-18)', () => {
+        // SUPERSEDED CONTRACT: the earlier version of this test enshrined
+        // legacy/unexpected rate fields (rate/exchangeRate at any depth, and
+        // a fiatAmount/cryptoAmount derivation) as acceptable sources. The
+        // P0 review rejects that: a canonical USDC/GHS transaction rate may
+        // come ONLY from the documented v3 field data.value (string). Any
+        // other shape is UNPARSEABLE — never guessed, never derived.
+        // Documented shape parses.
+        expect(OracleService.extractKotaniRate({ success: true, data: { value: '15.53' } })).toBe(15.53);
+        expect(OracleService.extractKotaniRate({ success: true, data: { value: 12.75 } })).toBe(12.75);
+        // Legacy/unexpected fields are NO LONGER accepted at any depth.
+        expect(OracleService.extractKotaniRate({ rate: '12.34' })).toBeNull();
+        expect(OracleService.extractKotaniRate({ exchangeRate: 13.21 })).toBeNull();
+        expect(OracleService.extractKotaniRate({ data: { rate: '12.05' } })).toBeNull();
+        expect(OracleService.extractKotaniRate({ data: { exchangeRate: 12.9 } })).toBeNull();
+        expect(OracleService.extractKotaniRate({ result: { rate: 12.5 } })).toBeNull();
+        expect(OracleService.extractKotaniRate({ result: { exchangeRate: 12.5 } })).toBeNull();
+        // The fiatAmount/cryptoAmount derivation is REMOVED — no rate can be
+        // computed when the documented field is absent.
+        expect(OracleService.extractKotaniRate({ cryptoAmount: 2, fiatAmount: 24.8 })).toBeNull();
+        expect(OracleService.extractKotaniRate({ data: { cryptoAmount: 2, fiatAmount: 24.8 } })).toBeNull();
         // Malformed / unusable observations are rejected — never guessed.
         expect(OracleService.extractKotaniRate({})).toBeNull();
-        expect(OracleService.extractKotaniRate({ rate: -1 })).toBeNull();
-        expect(OracleService.extractKotaniRate({ rate: 'not-a-number' })).toBeNull();
+        expect(OracleService.extractKotaniRate({ data: { value: -1 } })).toBeNull();
+        expect(OracleService.extractKotaniRate({ data: { value: 'not-a-number' } })).toBeNull();
+        expect(OracleService.extractKotaniRate({ data: { value: '' } })).toBeNull();
+        expect(OracleService.extractKotaniRate({ data: {} })).toBeNull();
+        // success:false with a payload is still a failure — fail closed.
+        expect(OracleService.extractKotaniRate({ success: false, data: { value: '15.53' } })).toBeNull();
     });
 
     test('a malformed Kotani response fails closed exactly like an outage (no canonical write)', async () => {
@@ -289,6 +305,102 @@ describe('Kotani-only transaction-rate authority (unit proofs)', () => {
         await new OracleService(mockPrisma()).fetchAndUpdateRates();
 
         expect(seenBody).toEqual({ from: 'USDC', to: 'GHS', cryptoAmount: 1 });
+    });
+
+    // ── P0 HARD-BOUND CANONICAL PAIR (review follow-up 2026-10-18) ─────────
+    //
+    // KOTANI_RATE_FROM/KOTANI_RATE_TO can no longer retarget the requested
+    // pair: any override other than exactly USDC -> GHS fails closed BEFORE
+    // Kotani is called, and a rejected observation never writes the
+    // canonical slot nor creates new quote eligibility.
+
+    test('P0-a. a non-canonical KOTANI_RATE_FROM override fails closed BEFORE the request — no canonical write', async () => {
+        process.env.KOTANI_RATE_FROM = 'USDT'; // a valid Kotani stablecoin, but NOT the canonical pair
+        axios.post.mockImplementation(() => { throw new Error('Kotani must not be called for a non-canonical pair'); });
+        axios.get.mockImplementation((url) => {
+            if (url.includes('coingecko')) return COINGECKO_OK();
+            throw new Error(`unexpected GET ${url}`);
+        });
+
+        const prisma = mockPrisma();
+        await new OracleService(prisma).fetchAndUpdateRates();
+
+        expect(axios.post).not.toHaveBeenCalled(); // the foreign-pair request is never sent
+        expect(prisma.globalSettings.upsert).not.toHaveBeenCalled(); // no canonical write
+        expect(prisma.globalSettings.update).toHaveBeenCalledTimes(1); // display-only refresh only
+        delete process.env.KOTANI_RATE_FROM;
+    });
+
+    test('P0-b. a non-canonical KOTANI_RATE_TO override fails closed BEFORE the request — no canonical write', async () => {
+        process.env.KOTANI_RATE_TO = 'KES'; // a valid fiat payout code, but NOT the canonical pair
+        axios.post.mockImplementation(() => { throw new Error('Kotani must not be called for a non-canonical pair'); });
+        axios.get.mockImplementation((url) => {
+            if (url.includes('coingecko')) return COINGECKO_OK();
+            throw new Error(`unexpected GET ${url}`);
+        });
+
+        const prisma = mockPrisma();
+        await new OracleService(prisma).fetchAndUpdateRates();
+
+        expect(axios.post).not.toHaveBeenCalled();
+        expect(prisma.globalSettings.upsert).not.toHaveBeenCalled();
+        delete process.env.KOTANI_RATE_TO;
+    });
+
+    test('P0-c. an override spelling exactly the canonical pair (case/whitespace-insensitive) is accepted; the request still sends USDC -> GHS', async () => {
+        process.env.KOTANI_RATE_FROM = ' usdc ';
+        process.env.KOTANI_RATE_TO = 'ghs';
+        let seenBody = null;
+        axios.post.mockImplementation((url, body) => {
+            expect(url).toContain('/api/v3/rate/offramp');
+            seenBody = body;
+            return KOTANI_OK(12.75);
+        });
+        axios.get.mockImplementation((url) => {
+            if (url.includes('coingecko')) return COINGECKO_OK();
+            throw new Error(`unexpected GET ${url}`);
+        });
+
+        const prisma = mockPrisma();
+        await new OracleService(prisma).fetchAndUpdateRates();
+
+        expect(seenBody).toEqual({ from: 'USDC', to: 'GHS', cryptoAmount: 1 });
+        expect(prisma.globalSettings.upsert).toHaveBeenCalledTimes(1); // the canonical write DID happen
+        delete process.env.KOTANI_RATE_FROM;
+        delete process.env.KOTANI_RATE_TO;
+    });
+
+    test('P0-d. success:true with the correct echoed pair but NO data.value is unparseable — no canonical write', async () => {
+        axios.post.mockResolvedValue({ data: {
+            success: true, message: 'Available exchange rate.',
+            data: { from: 'USDC', to: 'GHS' }, // pair echoed, rate field MISSING
+        } });
+        axios.get.mockImplementation((url) => {
+            if (url.includes('coingecko')) return COINGECKO_OK();
+            throw new Error(`unexpected GET ${url}`);
+        });
+
+        const prisma = mockPrisma();
+        await new OracleService(prisma).fetchAndUpdateRates();
+
+        expect(prisma.globalSettings.upsert).not.toHaveBeenCalled();
+    });
+
+    test('P0-e. a legacy-only payload (rate fields, fiat/crypto amounts) is rejected — never derived into a canonical rate', async () => {
+        axios.post.mockResolvedValue({ data: {
+            success: true,
+            // Only legacy/unexpected fields — the documented data.value is absent.
+            rate: 12.34, cryptoAmount: 2, fiatAmount: 24.8,
+        } });
+        axios.get.mockImplementation((url) => {
+            if (url.includes('coingecko')) return COINGECKO_OK();
+            throw new Error(`unexpected GET ${url}`);
+        });
+
+        const prisma = mockPrisma();
+        await new OracleService(prisma).fetchAndUpdateRates();
+
+        expect(prisma.globalSettings.upsert).not.toHaveBeenCalled(); // no canonical write
     });
 
     test('A2-d. a foreign-pair echo fails closed with a distinct, greppable error — no canonical write', async () => {
@@ -794,6 +906,79 @@ describeDbOrSkip('Kotani-only transaction-rate authority (real PostgreSQL)', () 
         // Quote eligibility comes from the canonical field + freshness.
         const rate = await getFreshServerRateGhsPerUsdc({ prisma, maxAgeSeconds: 1800 });
         expect(rate.rateGhsPerUsdc).toBeCloseTo(12.75, 8);
+    });
+
+    test('DB-P0: a rejected observation (foreign-pair echo or missing data.value) leaves the canonical row unchanged and creates NO new quote eligibility', async () => {
+        const staleTs = new Date(Date.now() - 45 * 60 * 1000);
+        await seedKotaniRow({ lastRateSync: staleTs, lastExternalSync: staleTs });
+        const before = await getSettings();
+
+        axios.get.mockReset();
+        axios.post.mockReset();
+        axios.get.mockImplementation((url) => {
+            if (url.includes('coingecko')) return COINGECKO_OK(0.9985);
+            throw new Error(`unexpected GET ${url}`);
+        });
+        process.env.KOTANI_PROVIDER = 'LIVE';
+        process.env.KOTANI_API_TOKEN = 'test-token';
+
+        // Case 1 — success:true but a FOREIGN echoed pair (USDT -> GHS):
+        // a valid rate for a different stablecoin must never be accepted
+        // as the canonical USDC/GHS quote rate.
+        axios.post.mockResolvedValue({ data: {
+            success: true, data: { from: 'USDT', to: 'GHS', value: '12.40' },
+        } });
+        await new OracleService(prisma).fetchAndUpdateRates();
+
+        let row = await getSettings();
+        expect(Number(row.liveRetailRate)).toBeCloseTo(Number(before.liveRetailRate), 8);
+        expect(row.lastRateSync.getTime()).toBe(staleTs.getTime());
+        expect(row.lastExternalSync.getTime()).toBe(staleTs.getTime());
+
+        // Case 2 — success:true, correct pair, but NO documented data.value:
+        // unparseable, no canonical write.
+        axios.post.mockResolvedValue({ data: {
+            success: true, data: { from: 'USDC', to: 'GHS', rate: 12.5, cryptoAmount: 2, fiatAmount: 25 },
+        } });
+        await new OracleService(prisma).fetchAndUpdateRates();
+
+        row = await getSettings();
+        expect(Number(row.liveRetailRate)).toBeCloseTo(Number(before.liveRetailRate), 8);
+        expect(row.lastRateSync.getTime()).toBe(staleTs.getTime());
+        expect(row.lastExternalSync.getTime()).toBe(staleTs.getTime());
+
+        // Neither rejected observation restores quote eligibility.
+        await expect(
+            getFreshServerRateGhsPerUsdc({ prisma, maxAgeSeconds: 1800 })
+        ).rejects.toMatchObject({ code: 'RATE_STALE' });
+    });
+
+    test('DB-P0-2: a non-canonical pair OVERRIDE fails closed before the request — canonical row unchanged, quotes stay stale', async () => {
+        const staleTs = new Date(Date.now() - 45 * 60 * 1000);
+        await seedKotaniRow({ lastRateSync: staleTs, lastExternalSync: staleTs });
+        const before = await getSettings();
+
+        axios.get.mockReset();
+        axios.post.mockReset();
+        axios.get.mockImplementation((url) => {
+            if (url.includes('coingecko')) return COINGECKO_OK(0.9985);
+            throw new Error(`unexpected GET ${url}`);
+        });
+        axios.post.mockImplementation(() => { throw new Error('Kotani must not be called for a non-canonical pair'); });
+        process.env.KOTANI_PROVIDER = 'LIVE';
+        process.env.KOTANI_API_TOKEN = 'test-token';
+        process.env.KOTANI_RATE_FROM = 'USDT';
+
+        await new OracleService(prisma).fetchAndUpdateRates();
+
+        expect(axios.post).not.toHaveBeenCalled();
+        const row = await getSettings();
+        expect(Number(row.liveRetailRate)).toBeCloseTo(Number(before.liveRetailRate), 8);
+        expect(row.lastRateSync.getTime()).toBe(staleTs.getTime());
+        await expect(
+            getFreshServerRateGhsPerUsdc({ prisma, maxAgeSeconds: 1800 })
+        ).rejects.toMatchObject({ code: 'RATE_STALE' });
+        delete process.env.KOTANI_RATE_FROM;
     });
 
     test('DB-3: repeated Kotani outages never advance freshness — the clock only moves on a real Kotani observation', async () => {

@@ -19,6 +19,15 @@ const KOTANI_DEFAULT_BASE_URL = 'https://sandbox-api.kotanipay.io/api/v3';
 // simulated verified host and restore it afterwards.
 const KOTANI_VERIFIED_PRODUCTION_HOSTS = [];
 
+// ── P0 HARD-BOUND CANONICAL PAIR (review follow-up 2026-10-18) ──────────────
+//
+// The canonical transaction-rate slot (globalSettings.liveRetailRate) is
+// defined as the USDC/GHS rate and NOTHING ELSE. These constants are the
+// single source of truth for the pair the oracle requests, validates and
+// writes; an operator cannot retarget the canonical slot at another pair.
+const CANONICAL_RATE_FROM = 'USDC';
+const CANONICAL_RATE_TO = 'GHS';
+
 const asFinitePositive = (value) => {
     const number = Number(value);
     return Number.isFinite(number) && number > 0 ? number : null;
@@ -39,35 +48,16 @@ const asFinitePositive = (value) => {
 // response) must never write a foreign-pair rate into the canonical
 // USDC/GHS slot.
 const extractKotaniRate = (payload) => {
-    // A 200 envelope that explicitly says failure is a failure.
+    // P0 review (2026-10-18): the canonical transaction rate may come ONLY
+    // from the documented v3 field — data.value as a string. Legacy or
+    // unexpected rate fields (rate/exchangeRate at any depth) and a
+    // fiatAmount/cryptoAmount derivation are NO LONGER accepted: deriving a
+    // canonical USDC/GHS rate from an undocumented shape is exactly how a
+    // foreign or mislabeled number could be laundered into the canonical
+    // slot. When data.value is absent or malformed the observation is
+    // UNPARSEABLE — fail closed, never guess.
     if (payload?.success === false) return null;
-    const candidates = [
-        // Documented v3 shape first: data.value (string rate).
-        payload?.data?.value,
-        payload?.value,
-        // Legacy/observed shapes retained (parse-only; all are gated by
-        // the same finite-positive check).
-        payload?.rate,
-        payload?.exchangeRate,
-        payload?.data?.rate,
-        payload?.data?.exchangeRate,
-        payload?.result?.rate,
-        payload?.result?.exchangeRate,
-    ];
-    for (const candidate of candidates) {
-        const rate = asFinitePositive(candidate);
-        if (rate) return rate;
-    }
-
-    const cryptoAmount = asFinitePositive(
-        payload?.cryptoAmount ?? payload?.data?.cryptoAmount ?? payload?.result?.cryptoAmount
-    );
-    const fiatAmount = asFinitePositive(
-        payload?.fiatAmount ?? payload?.data?.fiatAmount ?? payload?.result?.fiatAmount
-    );
-    if (cryptoAmount && fiatAmount) return fiatAmount / cryptoAmount;
-
-    return null;
+    return asFinitePositive(payload?.data?.value);
 };
 
 // EXACT pair validation (lead review 2026-10-17): the provider contract
@@ -303,6 +293,35 @@ class OracleService {
         return cfg;
     }
 
+    // P0 review (2026-10-18) — HARD-BOUND canonical currency pair.
+    //
+    // The canonical transaction rate slot (liveRetailRate) describes
+    // USDC/GHS and nothing else. KOTANI_RATE_FROM/KOTANI_RATE_TO overrides
+    // are NO LONGER honored as a way to request a different pair: any
+    // override value other than exactly USDC -> GHS is a deployment error
+    // and fails closed BEFORE Kotani is called, so a valid USDT/GHS (or
+    // any other pair) response can never be accepted as a USDC/GHS quote.
+    // Empty/unset values fall back to the canonical pair.
+    _canonicalKotaniPair() {
+        const rawFrom = process.env.KOTANI_RATE_FROM;
+        const rawTo = process.env.KOTANI_RATE_TO;
+        const from = (rawFrom === undefined || String(rawFrom).trim() === '')
+            ? CANONICAL_RATE_FROM
+            : String(rawFrom).trim().toUpperCase();
+        const to = (rawTo === undefined || String(rawTo).trim() === '')
+            ? CANONICAL_RATE_TO
+            : String(rawTo).trim().toUpperCase();
+        if (from !== CANONICAL_RATE_FROM || to !== CANONICAL_RATE_TO) {
+            throw new Error(
+                `[KOTANI_PAIR_OVERRIDE_REJECTED] KOTANI_RATE_FROM/KOTANI_RATE_TO `
+                + `override "${from}->${to}" is not the canonical transaction pair `
+                + `${CANONICAL_RATE_FROM}->${CANONICAL_RATE_TO}; refusing to request a foreign `
+                + 'pair — the canonical USDC/GHS slot can never be fed from another pair.'
+            );
+        }
+        return { from: CANONICAL_RATE_FROM, to: CANONICAL_RATE_TO };
+    }
+
     async fetchKotaniUsdcToGhsRate() {
         const cfg = this.kotaniConfigState();
         if (!cfg.armed) {
@@ -315,12 +334,11 @@ class OracleService {
         }
 
         const baseUrl = cfg.baseUrl;
-        const from = process.env.KOTANI_RATE_FROM || 'USDC';
-        // The documented `to` is the FIAT payout currency code (docs
-        // example: "EUR"); CGHS is a stablecoin listed in the `from` enum,
-        // not the fiat code for a cedi offramp. KOTANI_RATE_TO remains the
-        // explicit override for operators.
-        const to = process.env.KOTANI_RATE_TO || 'GHS';
+        // P0 (2026-10-18): the pair is HARD-BOUND to the canonical
+        // USDC -> GHS transaction pair. _canonicalKotaniPair() throws
+        // (fail-closed, greppable) if an operator override tries to point
+        // the canonical slot at any other pair — the request is never sent.
+        const { from, to } = this._canonicalKotaniPair();
         const response = await axios.post(`${baseUrl}/rate/offramp`, {
             from,
             to,

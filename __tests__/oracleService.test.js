@@ -16,13 +16,19 @@ describe('OracleService Kotani rate preference', () => {
         process.env = originalEnv;
     });
 
-    test('extracts direct Kotani rate fields', () => {
-        expect(OracleService.extractKotaniRate({ rate: '12.34' })).toBe(12.34);
-        expect(OracleService.extractKotaniRate({ data: { exchangeRate: 13.21 } })).toBe(13.21);
+    // P0 review (2026-10-18) SUPERSEDED CONTRACT: the earlier tests here
+    // enshrined legacy/unexpected rate fields (rate/exchangeRate) and a
+    // fiatAmount/cryptoAmount derivation as acceptable canonical sources.
+    // The canonical USDC/GHS transaction rate now comes ONLY from the
+    // documented v3 field data.value; every other shape is rejected.
+    test('extracts ONLY the documented data.value field — legacy fields are rejected', () => {
+        expect(OracleService.extractKotaniRate({ success: true, data: { value: '12.34' } })).toBe(12.34);
+        expect(OracleService.extractKotaniRate({ rate: '12.34' })).toBeNull();
+        expect(OracleService.extractKotaniRate({ data: { exchangeRate: 13.21 } })).toBeNull();
     });
 
-    test('extracts a conversion rate when only crypto and fiat amounts are returned', () => {
-        expect(OracleService.extractKotaniRate({ cryptoAmount: 2, fiatAmount: 24.8 })).toBe(12.4);
+    test('derives NO rate from crypto/fiat amounts when data.value is absent', () => {
+        expect(OracleService.extractKotaniRate({ cryptoAmount: 2, fiatAmount: 24.8 })).toBeNull();
     });
 
     test('prefers Kotani USDC/GHS over fallback FX data (legacy liveUsdToGhs NOT written)', async () => {
