@@ -80,7 +80,11 @@ describe('transaction quote service', () => {
       globalSettings: {
         findUnique: jest.fn().mockResolvedValue({
           liveUsdToGhs: 12.5,
-          liveRateSource: 'LIVE',
+          // §1 (2026-10-18): the gated deposit quote resolves the rate from
+          // the canonical liveRetailRate with Kotani provenance only.
+          liveRetailRate: 12.5,
+          liveRateSource: 'KOTANI_PAY',
+          lastAdminSetAt: null,
           lastRateSync: new Date('2026-08-29T04:59:00.000Z'),
           // 271C: deposit-purpose quotes are gated on the canonical external
           // observation timestamp. 60 seconds old — fresh.
@@ -101,7 +105,7 @@ describe('transaction quote service', () => {
 
     expect(quote.rateGhsPerUsdc).toBe(12.5);
     expect(quote.usdcAmount).toBe(10);
-    expect(quote.rateSource).toBe('LIVE');
+    expect(quote.rateSource).toBe('KOTANI_PAY');
     // rateAsOf is the verified external observation, not the create time.
     expect(new Date(quote.rateAsOf).toISOString()).toBe('2026-08-29T04:59:00.000Z');
     expect(prisma.$executeRaw).toHaveBeenCalledTimes(1);
@@ -112,7 +116,9 @@ describe('transaction quote service', () => {
       globalSettings: {
         findUnique: jest.fn().mockResolvedValue({
           liveUsdToGhs: 12.5,
-          liveRateSource: 'LIVE',
+          liveRetailRate: 12.5,
+          liveRateSource: 'KOTANI_PAY',
+          lastAdminSetAt: null,
           lastRateSync: new Date('2026-08-29T04:59:00.000Z'),
           lastExternalSync: null, // no truthful external provenance
         }),

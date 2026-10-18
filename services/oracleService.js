@@ -3,15 +3,50 @@ const logger = require('../src/config/logger');
 const axios = require('axios');
 
 const KOTANI_DEFAULT_BASE_URL = 'https://sandbox-api.kotanipay.io/api/v3';
-const FALLBACK_FX_URL = 'https://open.er-api.com/v6/latest/USD';
+
+// ── §1 VERIFIED PRODUCTION HOST ALLOWLIST (review follow-up 2026-10-18) ──
+//
+// A production transaction-rate endpoint must be HTTPS AND on a host that
+// Kotani has CONFIRMED in writing during onboarding. We do not invent the
+// production hostname: this allowlist ships EMPTY and production arming
+// fails closed (UNVERIFIED_PRODUCTION_HOST) until the verified host is
+// added here by the platform operator as the explicit onboarding step.
+//
+// TO ARM PRODUCTION (one line, one commit, auditable): push the host Kotani
+// confirmed, e.g.  KOTANI_VERIFIED_PRODUCTION_HOSTS.push('api.kotanipay.io')
+// — ONLY once Kotani onboarding has confirmed that exact hostname in writing.
+// The array is exported so policy tests can exercise the armed path with a
+// simulated verified host and restore it afterwards.
+const KOTANI_VERIFIED_PRODUCTION_HOSTS = [];
 
 const asFinitePositive = (value) => {
     const number = Number(value);
     return Number.isFinite(number) && number > 0 ? number : null;
 };
 
+// ── KOTANI V3 RESPONSE CONTRACT (2026-10-17 hardening, A2) ────────────────
+//
+// The documented POST /api/v3/rate/offramp response shape is
+//   { "success": true, "message": "Available exchange rate.",
+//     "data": { "from": "USDC", "to": "GHS", "value": "15.53",
+//               "fiatAmount": ..., "cryptoAmount": ..., "fee": ... } }
+// (https://documentation.kotanipay.com/v3/api-reference/rates/offramp-rate).
+// The rate lives in data.value AS A STRING; the pair is echoed in
+// data.from/data.to. Auth/quota failures can arrive as HTTP 200 with
+// success:false and an empty data object — so an explicit success:false
+// must fail closed, and the echoed pair must be validated before an
+// observation is trusted: a misconfigured from/to (or an off-target
+// response) must never write a foreign-pair rate into the canonical
+// USDC/GHS slot.
 const extractKotaniRate = (payload) => {
+    // A 200 envelope that explicitly says failure is a failure.
+    if (payload?.success === false) return null;
     const candidates = [
+        // Documented v3 shape first: data.value (string rate).
+        payload?.data?.value,
+        payload?.value,
+        // Legacy/observed shapes retained (parse-only; all are gated by
+        // the same finite-positive check).
         payload?.rate,
         payload?.exchangeRate,
         payload?.data?.rate,
@@ -35,6 +70,36 @@ const extractKotaniRate = (payload) => {
     return null;
 };
 
+// EXACT pair validation (lead review 2026-10-17): the provider contract
+// (https://documentation.kotanipay.com/v3/api-reference/rates/offramp-rate)
+// is unambiguous — `from` is an ENUM of stablecoin codes (USDC, USDT, CGHS,
+// CKES, ...) and `to` is the FIAT payout code ("GHS" for a cedi offramp;
+// CGHS is a stablecoin listed under `from`, NOT the fiat code). A CGHS echo
+// for a GHS request is therefore a DIFFERENT instrument, not an alias: codes
+// are related, but the codes do not describe the same instrument, so a
+// "related code" equivalence is exactly how a foreign-pair rate could be
+// laundered into the canonical USDC/GHS slot. Validation is EXACT
+// (case-insensitive, trimmed) — no prefix, no "near enough" families.
+const sameCurrencyCode = (requested, echoed) => {
+    if (requested === undefined || requested === null || echoed === undefined || echoed === null) {
+        return false;
+    }
+    const a = String(requested).trim().toUpperCase();
+    const b = String(echoed).trim().toUpperCase();
+    return a === b && a.length > 0;
+};
+
+// Validates that the response echoes the pair we requested. Fail-closed
+// semantics: a response with NO echoed pair, or a mismatched one, must
+// never be trusted as the requested rate.
+const kotaniPairMatches = (payload, expectedFrom, expectedTo) => {
+    const echoedFrom = payload?.data?.from ?? payload?.from;
+    const echoedTo = payload?.data?.to ?? payload?.to;
+    if (!sameCurrencyCode(expectedFrom, echoedFrom)) return false;
+    if (!sameCurrencyCode(expectedTo, echoedTo)) return false;
+    return true;
+};
+
 class OracleService {
     constructor(prisma) {
         this.prisma = prisma;
@@ -44,62 +109,285 @@ class OracleService {
 
     startOracle() {
         logger.info('🌐 Azaman Live Market Oracle: INITIALIZED');
+        this.logKotaniConfigAudit();
         this.fetchAndUpdateRates();
         setInterval(() => this.fetchAndUpdateRates(), this.updateInterval);
     }
 
-    async fetchKotaniUsdcToGhsRate() {
+    // ── SANDBOX-FALLBACK HARDENING (review follow-up on PR #353) ──────────
+    //
+    // Risk A — a misconfigured deployment is silent. `provider !== 'LIVE'`
+    // or a placeholder token made the oracle return null and collapse
+    // into the SAME generic fail-closed log as a Kotani outage: a
+    // production deployment missing KOTANI_PROVIDER/KOTANI_API_TOKEN was
+    // indistinguishable from an outage until quotes began failing
+    // RATE_STALE. The arm state is now computed in ONE place, logged ONCE
+    // LOUDLY at startup, and every cycle's fail-closed log names WHICH of
+    // the two states it is (CONFIG_DISABLED vs UNAVAILABLE).
+    //
+    // Risk B — the DEFAULT base URL is the SANDBOX endpoint. A LIVE
+    // provider with KOTANI_API_BASE_URL unset silently sent production
+    // traffic to sandbox-api.kotanipay.io — a sandbox fallback baked into
+    // the default. Using the sandbox during onboarding is legitimate, but
+    // it must be an EXPLICIT choice: the startup audit names the endpoint
+    // and says when it is the default-sandbox one, so promotion can be
+    // checked from the logs at a glance.
+    // Production endpoint policy (lead review 2026-10-17, fix A):
+    //
+    // A sandbox endpoint must NEVER become the production transaction-rate
+    // source — not by default and not even by explicit configuration.
+    //   • In PRODUCTION (NODE_ENV=production), a LIVE provider is armed ONLY
+    //     with an explicitly configured endpoint that is not a sandbox host.
+    //     No KOTANI_API_BASE_URL → NOT ARMED (the previous behavior silently
+    //     sent production traffic to the sandbox default). An explicit
+    //     sandbox endpoint in production → NOT ARMED (rejected by policy).
+    //   • OUTSIDE production (development/onboarding), the sandbox default
+    //     remains available for explicit onboarding/testing, but it is
+    //     always named loudly in the audit log as the ONBOARDING SANDBOX —
+    //     it can never silently become production authority because
+    //     production arming requires the explicit approved endpoint.
+    kotaniConfigState() {
         const provider = String(process.env.KOTANI_PROVIDER || 'MOCK').toUpperCase();
         const token = process.env.KOTANI_API_TOKEN || process.env.KOTANI_API_KEY;
-        if (provider !== 'LIVE' || !token || token === 'mock-key') return null;
+        const explicitBaseUrl = process.env.KOTANI_API_BASE_URL
+            ? String(process.env.KOTANI_API_BASE_URL).replace(/\/$/, '')
+            : null;
+        const isProduction = process.env.NODE_ENV === 'production';
+        // Fail-closed match: ANY 'sandbox' marker anywhere in the endpoint
+        // URL (host or path) marks it as a sandbox endpoint. False
+        // positives (a production URL that contains 'sandbox') fail CLOSED
+        // — the operator must configure a clean production endpoint.
+        const isSandboxEndpoint = (url) => String(url).toLowerCase().includes('sandbox');
+        const baseUrl = explicitBaseUrl || KOTANI_DEFAULT_BASE_URL;
 
-        const baseUrl = String(process.env.KOTANI_API_BASE_URL || KOTANI_DEFAULT_BASE_URL).replace(/\/$/, '');
+        if (provider !== 'LIVE') {
+            return {
+                armed: false,
+                state: 'CONFIG_DISABLED',
+                detail: `KOTANI_PROVIDER='${provider}' — the canonical transaction-rate source is DISABLED BY CONFIGURATION. `
+                    + 'Quotes fail closed (RATE_UNAVAILABLE/RATE_STALE) once the cached observation ages out. '
+                    + 'Set KOTANI_PROVIDER=LIVE with a real KOTANI_API_TOKEN to arm it.',
+                provider,
+                baseUrl,
+                baseUrlExplicit: !!explicitBaseUrl,
+            };
+        }
+        if (!token || token === 'mock-key') {
+            return {
+                armed: false,
+                state: 'MISSING_TOKEN',
+                detail: `KOTANI_PROVIDER=LIVE but the token is ${token ? "the placeholder 'mock-key'" : 'not set'} `
+                    + '(KOTANI_API_TOKEN/KOTANI_API_KEY). The canonical transaction-rate source is DISABLED BY '
+                    + 'CONFIGURATION; quotes fail closed once the cached observation ages out.',
+                provider,
+                baseUrl,
+                baseUrlExplicit: !!explicitBaseUrl,
+            };
+        }
+        // LIVE + a real token. From here the ENDPOINT decides arming.
+        if (isProduction) {
+            if (!explicitBaseUrl) {
+                return {
+                    armed: false,
+                    state: 'MISSING_ENDPOINT',
+                    detail: 'KOTANI_PROVIDER=LIVE in PRODUCTION but KOTANI_API_BASE_URL is NOT SET. '
+                        + 'A production transaction-rate provider FAILS CLOSED without an explicitly configured '
+                        + 'production endpoint: the sandbox default is NOT a production source, so no Kotani '
+                        + 'observation will be attempted and quotes fail closed (RATE_UNAVAILABLE/RATE_STALE). '
+                        + 'Set the verified production KOTANI_API_BASE_URL to arm it.',
+                    provider,
+                    baseUrl: null,
+                    baseUrlExplicit: false,
+                };
+            }
+            if (isSandboxEndpoint(explicitBaseUrl)) {
+                return {
+                    armed: false,
+                    state: 'SANDBOX_ENDPOINT_REJECTED',
+                    detail: `KOTANI_API_BASE_URL='${explicitBaseUrl}' is a SANDBOX endpoint and is REJECTED BY POLICY `
+                        + 'in production: a sandbox observation must never be the production transaction-rate '
+                        + 'authority. The provider is NOT armed; quotes fail closed (RATE_UNAVAILABLE/RATE_STALE). '
+                        + 'Configure the verified production endpoint to arm it.',
+                    provider,
+                    baseUrl: null,
+                    baseUrlExplicit: true,
+                };
+            }
+            // §1 (review follow-up 2026-10-18): production arming additionally
+            // requires an HTTPS endpoint ON A HOST KOTANI HAS VERIFIED. A
+            // plaintext endpoint (credential/rate interception) or an
+            // unverified host (typosquat / lookalike provider) must NEVER
+            // become the production rate authority. Until Kotani onboarding
+            // confirms the production hostname, this fails CLOSED for every
+            // host — by design.
+            let parsedEndpoint;
+            try {
+                parsedEndpoint = new URL(explicitBaseUrl);
+            } catch (err) {
+                return {
+                    armed: false,
+                    state: 'INVALID_ENDPOINT',
+                    detail: `KOTANI_API_BASE_URL='${explicitBaseUrl}' is not a parseable URL and is REJECTED BY POLICY `
+                        + 'in production. The provider is NOT armed; quotes fail closed. Configure the verified '
+                        + 'production endpoint to arm it.',
+                    provider,
+                    baseUrl: null,
+                    baseUrlExplicit: true,
+                };
+            }
+            if (parsedEndpoint.protocol !== 'https:') {
+                return {
+                    armed: false,
+                    state: 'NON_HTTPS_ENDPOINT_REJECTED',
+                    detail: `KOTANI_API_BASE_URL='${explicitBaseUrl}' is NOT an https:// endpoint and is REJECTED `
+                        + 'BY POLICY in production: transaction-rate credentials and observations must travel over '
+                        + 'TLS. The provider is NOT armed; quotes fail closed. Configure the verified https:// '
+                        + 'production endpoint to arm it.',
+                    provider,
+                    baseUrl: null,
+                    baseUrlExplicit: true,
+                };
+            }
+            if (!KOTANI_VERIFIED_PRODUCTION_HOSTS.includes(parsedEndpoint.hostname)) {
+                return {
+                    armed: false,
+                    state: 'UNVERIFIED_PRODUCTION_HOST',
+                    detail: `KOTANI_API_BASE_URL host '${parsedEndpoint.hostname}' is NOT on the verified production `
+                        + 'host allowlist (services/oracleService.js KOTANI_VERIFIED_PRODUCTION_HOSTS). Production '
+                        + 'arming fails CLOSED until Kotani onboarding confirms the production hostname in writing '
+                        + 'and the operator adds it to the allowlist. The provider is NOT armed; quotes fail closed '
+                        + '(RATE_UNAVAILABLE/RATE_STALE).',
+                    provider,
+                    baseUrl: null,
+                    baseUrlExplicit: true,
+                };
+            }
+            return {
+                armed: true,
+                state: 'ARMED',
+                detail: `Kotani LIVE provider ARMED against the explicitly configured verified production endpoint `
+                    + `${explicitBaseUrl} (host confirmed by Kotani onboarding, https-only policy satisfied).`,
+                provider,
+                baseUrl: explicitBaseUrl,
+                baseUrlExplicit: true,
+            };
+        }
+
+        // Non-production (development/onboarding): the sandbox default is
+        // available, but it is always NAMED as the onboarding sandbox — it
+        // can never silently become production authority because production
+        // arming requires the explicit approved endpoint (see above).
+        return {
+            armed: true,
+            state: explicitBaseUrl ? 'ARMED' : 'ARMED_ONBOARDING_SANDBOX',
+            detail: explicitBaseUrl
+                ? `Kotani LIVE provider ARMED against ${explicitBaseUrl} (non-production).`
+                : `Kotani LIVE provider ARMED in ONBOARDING SANDBOX mode — KOTANI_API_BASE_URL is NOT SET, so the `
+                    + `DEFAULT SANDBOX endpoint is in use (${KOTANI_DEFAULT_BASE_URL}). Legitimate for onboarding `
+                    + 'and testing outside production only.',
+            provider,
+            baseUrl: baseUrl,
+            baseUrlExplicit: !!explicitBaseUrl,
+        };
+    }
+
+    // One loud, startup-visible statement of the arm state (Risk A/B).
+    logKotaniConfigAudit() {
+        const cfg = this.kotaniConfigState();
+        if (cfg.armed) {
+            const log = cfg.baseUrlExplicit ? logger.info : logger.warn;
+            log(`[Oracle] Kotani config audit: ${cfg.detail}`);
+        } else {
+            logger.error(`[Oracle] Kotani config audit: ${cfg.detail}`);
+        }
+        return cfg;
+    }
+
+    async fetchKotaniUsdcToGhsRate() {
+        const cfg = this.kotaniConfigState();
+        if (!cfg.armed) {
+            // Distinct, greppable per-cycle tag: an operator can tell a
+            // DISABLED-BY-CONFIG deployment from a Kotani outage instantly.
+            logger.error(
+                `[Oracle] [KOTANI_CONFIG_DISABLED] ${cfg.state}: no Kotani observation will be attempted this cycle. ${cfg.detail}`
+            );
+            return null;
+        }
+
+        const baseUrl = cfg.baseUrl;
         const from = process.env.KOTANI_RATE_FROM || 'USDC';
-        const to = process.env.KOTANI_RATE_TO || 'CGHS';
+        // The documented `to` is the FIAT payout currency code (docs
+        // example: "EUR"); CGHS is a stablecoin listed in the `from` enum,
+        // not the fiat code for a cedi offramp. KOTANI_RATE_TO remains the
+        // explicit override for operators.
+        const to = process.env.KOTANI_RATE_TO || 'GHS';
         const response = await axios.post(`${baseUrl}/rate/offramp`, {
             from,
             to,
             cryptoAmount: 1,
         }, {
-            headers: { Authorization: `Bearer ${token}` },
+            headers: { Authorization: `Bearer ${process.env.KOTANI_API_TOKEN || process.env.KOTANI_API_KEY}` },
             timeout: 8000,
         });
+
+        // A2/D hardening: the documented v3 envelope must EXPLICITLY declare
+        // success (auth/quota failures arrive as HTTP 200 with
+        // success:false, and an envelope with NO success field is not the
+        // documented response of this endpoint — a missing declaration is
+        // treated as an unvalidated observation, not as success). Then the
+        // echoed pair and the rate value are validated; anything else fails
+        // closed with a distinct, greppable tag.
+        if (response.data?.success !== true) {
+            throw new Error(
+                `[KOTANI_RATE_REJECTED] Kotani did not explicitly declare success:true `
+                + `(success=${JSON.stringify(response.data?.success ?? null)}, message=${JSON.stringify(response.data?.message ?? null)}) `
+                + '— the observation is rejected, not parsed.'
+            );
+        }
+        if (!kotaniPairMatches(response.data, from, to)) {
+            const echoedFrom = response.data?.data?.from ?? response.data?.from;
+            const echoedTo = response.data?.data?.to ?? response.data?.to;
+            throw new Error(
+                `[KOTANI_RATE_PAIR_MISMATCH] requested ${from}->${to} but Kotani echoed `
+                + `${JSON.stringify(echoedFrom ?? null)}->${JSON.stringify(echoedTo ?? null)} `
+                + '— a foreign-pair response must never write the canonical USDC/GHS rate.'
+            );
+        }
         const rate = extractKotaniRate(response.data);
-        if (!rate) throw new Error('Kotani Pay rate response did not contain a usable USDC/GHS rate.');
+        if (!rate) throw new Error('[KOTANI_RATE_UNPARSEABLE] Kotani Pay rate response did not contain a usable USDC/GHS rate.');
         return rate;
     }
 
-    async fetchFallbackUsdToGhsRate() {
-        const response = await axios.get(FALLBACK_FX_URL, { timeout: 8000 });
-        return asFinitePositive(response.data?.rates?.GHS);
-    }
-
-    // §271 per-source isolation (issue #271 recommendation D): the old flow
-    // made CoinGecko a HARD gate — a single CoinGecko 429 aborted the whole
-    // sync, freezing even the Kotani direct observation that does not
-    // depend on CoinGecko at all. The restructured flow isolates every
-    // external source, and the single freshness contract is preserved:
+    // §Kotani-only transaction-rate authority (2026-10-16 hardening wave).
     //
-    //   lastExternalSync/lastRateSync advance ONLY when the CANONICAL retail
-    //   rate (liveRetailRate, USDC/GHS) was genuinely observed:
-    //     • Kotani LIVE direct USDC/GHS          → full write, KOTANI_PAY
-    //     • FX(USD/GHS) + CoinGecko(USDC/USD)    → composite write,
-    //                                               FALLBACK_FX (BOTH must
-    //                                               succeed — the raw USD/GHS
-    //                                               alone is NOT a USDC/GHS
-    //                                               observation and must not
-    //                                               refresh freshness)
-    //   Stablecoin prices (tether/usdc/dai vs USD) are supplementary display
-    //   fields: a CoinGecko failure never blocks the Kotani write, and a
-    //   Kotani/MOCK mode never blocks the stablecoin update.
+    // Kotani Pay is the single canonical USDC/GHS transaction-rate provider.
+    // The contract, preserved from the §271 per-source isolation work and
+    // tightened from "fallback allowed" to "Kotani-only":
     //
-    //   Repeated failure: cached values and ALL timestamps stay untouched —
-    //   the freshness gate (/rateFreshness) fails new quotes closed after
-    //   RATE_FRESHNESS_MAX_AGE_SECONDS, and /api/oracle/rates exposes the
-    //   true age (externalRateAgeSeconds). No code path can present the
-    //   frozen number as fresh (271B echo isolation + this isolation).
-    //   Recovery: the next successful observation simply resumes; there is no
-    //   stuck backoff state to clear.
+    //   • ONLY a successfully validated Kotani observation may write the
+    //     transaction-eligible liveRetailRate, the canonical liveRateSource
+    //     ('KOTANI_PAY') and the freshness timestamps
+    //     (lastRateSync === lastExternalSync, one observation, both fields —
+    //     the 271B contract).
+    //
+    //   • The legacy CoinGecko USDC/USD × external USD/GHS FX composite is
+    //     RETIRED as a rate source: it must never write liveRetailRate /
+    //     liveRateSource and must never refresh canonical transaction-rate
+    //     freshness. A successful supplementary feed must not launder the
+    //     cached rate into "fresh" — a cached old value stays old.
+    //
+    //   • Stablecoin prices (tether/usdc/dai vs USD) remain SUPPLEMENTARY
+    //     DISPLAY-ONLY data: cached in their dedicated non-authoritative
+    //     GlobalSettings fields, never blocking the canonical write, and
+    //     never advancing any freshness timestamp. When Kotani is missing
+    //     (unconfigured/MOCK), fails, returns malformed data, or is stale,
+    //     the sync performs at most this supplementary display refresh and
+    //     NOTHING else — new rate-dependent financial quotes fail closed at
+    //     the /rateFreshness gate (RATE_STALE / RATE_UNAVAILABLE).
+    //
+    //   Repeated Kotani failure: cached values and ALL timestamps stay
+    //   untouched — no code path can present the frozen number as fresh.
+    //   Recovery: the next successful Kotani observation simply resumes.
     async fetchStablecoinUsdPrices() {
         const cryptoResponse = await axios.get(
             'https://api.coingecko.com/api/v3/simple/price?ids=tether,usd-coin,dai&vs_currencies=usd',
@@ -114,113 +402,119 @@ class OracleService {
         return { tetherPrice, usdcPrice, daiPrice };
     }
 
+    // Supplementary display-only refresh. Deliberately uses update (not
+    // upsert): a supplementary-only observation may never create or reshape
+    // the canonical GlobalSettings row. Deliberately touches ONLY the
+    // dedicated stablecoin display fields — no canonical rate, no source,
+    // no freshness timestamp.
+    async _updateSupplementaryDisplayRates() {
+        let stablecoins = null;
+        try {
+            stablecoins = await this.fetchStablecoinUsdPrices();
+        } catch (err) {
+            logger.warn(
+                { err },
+                '[Oracle] Supplementary stablecoin prices unavailable; prior display values preserved.'
+            );
+            return;
+        }
+        try {
+            await this.prisma.globalSettings.update({
+                where: { id: 1 },
+                data: {
+                    liveUsdtToUsd: stablecoins.tetherPrice,
+                    liveUsdcToUsd: stablecoins.usdcPrice,
+                    liveDaiToUsd: stablecoins.daiPrice,
+                },
+            });
+            logger.info(
+                '[Oracle] Supplementary display rates refreshed (non-authoritative; transaction-rate freshness untouched).'
+            );
+        } catch (err) {
+            logger.warn(
+                { err },
+                '[Oracle] Supplementary display update skipped (settings row unavailable or DB error); canonical fields untouched.'
+            );
+        }
+    }
+
     async fetchAndUpdateRates() {
         try {
+            // ── CANONICAL source: Kotani direct USDC/GHS ───────────────────
             let usdcToGhsRate = null;
-            let usdToGhsRate = null;
-            let rateSource = null;
-            let stablecoins = null;
-
-            // ── Source 1 (isolated): Kotani direct USDC/GHS ────────────────
             try {
                 usdcToGhsRate = await this.fetchKotaniUsdcToGhsRate();
-                if (usdcToGhsRate) {
-                    // Kotani supplies the direct USDC/GHS rate. Keep the
-                    // legacy USD/GHS field at the same value for
-                    // backward-compatible API consumers; the canonical retail
-                    // field is the authoritative USDC/GHS display rate.
-                    rateSource = 'KOTANI_PAY';
-                }
             } catch (kotaniErr) {
                 logger.warn(
                     { err: kotaniErr },
-                    '[Oracle] Kotani Pay rate unavailable; trying the fallback FX composite.'
+                    '[Oracle] [KOTANI_UNAVAILABLE] the LIVE provider is armed but the canonical USDC/GHS observation failed — outage path, NOT a configuration problem.'
                 );
             }
 
-            // ── Source 2 (isolated): FX × CoinGecko composite ─────────────
             if (!usdcToGhsRate) {
-                // In MOCK mode there is no external Kotani observation at
-                // all; the composite is the only genuine external path.
-                let usdcPrice = null;
-                let usdToGhs = null;
-                let coingeckoErr = null;
-                let fxErr = null;
-                try {
-                    stablecoins = await this.fetchStablecoinUsdPrices();
-                    usdcPrice = stablecoins.usdcPrice;
-                } catch (err) {
-                    coingeckoErr = err;
-                }
-                try {
-                    usdToGhs = await this.fetchFallbackUsdToGhsRate();
-                } catch (err) {
-                    fxErr = err;
-                }
-                if (usdToGhs && usdcPrice) {
-                    // The fallback quotes USD/GHS; apply the live USDC/USD
-                    // market price so the user-facing rate remains USDC/GHS.
-                    usdcToGhsRate = usdToGhs * usdcPrice;
-                    usdToGhsRate = usdToGhs;
-                    rateSource = 'FALLBACK_FX';
-                } else {
-                    // Partial observation is NOT a retail observation: the
-                    // raw USD/GHS alone can never write liveRetailRate or
-                    // refresh freshness (that would misprice every USDC
-                    // conversion during a depeg). Nothing is written; the
-                    // cached rate and every timestamp stay untouched.
-                    if (coingeckoErr) {
-                        logger.error(
-                            { err: coingeckoErr },
-                            '[Oracle] CoinGecko stablecoin observation failed — composite rate unavailable; cached rate preserved.'
-                        );
-                    }
-                    if (fxErr) {
-                        logger.error(
-                            { err: fxErr },
-                            '[Oracle] Fallback FX observation failed — composite rate unavailable; cached rate preserved.'
-                        );
-                    }
-                    if (!coingeckoErr && !fxErr) {
-                        logger.error('[Oracle] Composite sources returned no usable rate; cached rate preserved.');
-                    }
-                    throw new Error('No usable external USDC/GHS observation is available.');
-                }
-            } else {
-                // Kotani succeeded: stablecoin prices are supplementary —
-                // fetch best-effort, never blocking the canonical write.
-                usdToGhsRate = usdcToGhsRate;
-                try {
-                    stablecoins = await this.fetchStablecoinUsdPrices();
-                } catch (err) {
-                    logger.warn(
-                        { err },
-                        '[Oracle] Stablecoin price update unavailable (non-blocking); prior values preserved.'
-                    );
-                }
+                // Kotani is missing (unconfigured/MOCK), failed, or returned
+                // a malformed response. There is NO fallback transaction rate:
+                // the retired FX × CoinGecko composite must never write the
+                // canonical fields or refresh freshness. At most the
+                // supplementary display cache is refreshed; the cached
+                // canonical rate, its source and every freshness timestamp
+                // stay untouched, so the 271C gate fails new quotes closed
+                // once the last genuine Kotani observation ages out.
+                logger.error(
+                    '[Oracle] No valid Kotani USDC/GHS observation — canonical retail rate, source and freshness preserved (fail-closed; no fallback rate).'
+                );
+                await this._updateSupplementaryDisplayRates();
+                return;
             }
 
-            // ── ONE success-only external write ───────────────────────────
+            // ── SUPPLEMENTARY source: stablecoin USD prices (display-only) ──
+            // Never blocking the canonical write; failure leaves the prior
+            // display values preserved.
+            let stablecoins = null;
+            try {
+                stablecoins = await this.fetchStablecoinUsdPrices();
+            } catch (err) {
+                logger.warn(
+                    { err },
+                    '[Oracle] Stablecoin price update unavailable (non-blocking); prior values preserved.'
+                );
+            }
+
+            // ── ONE success-only canonical write (Kotani observation) ─────
             // One observation timestamp for both freshness fields (issue
             // #271 / PR 271B): the oracle is the canonical success-only
             // EXTERNAL writer, so lastRateSync and lastExternalSync always
-            // describe the same successful observation. On failure the cached
-            // rate and both timestamps are left untouched (see catch below).
+            // describe the same successful Kotani observation. On failure
+            // the cached rate and both timestamps are left untouched (see
+            // the fail-closed branch above).
+            // SERVICE-OBSERVATION freshness policy (fix D): the documented
+            // v3 response carries NO provider-side observation time and no
+            // expiry field, so there is no provider timestamp to copy or
+            // trust. lastRateSync/lastExternalSync therefore mean exactly
+            // what their names say: the SERVICE time at which a validated
+            // Kotani observation was received and written. No provider
+            // timestamp is ever invented, and no future/expired
+            // provider-time claim is possible on this contract.
             const observationTimestamp = new Date();
+            // B fix (lead review 2026-10-17): liveUsdToGhs is the LEGACY
+            // USD/GHS compatibility field — a USDC/GHS observation must
+            // NEVER be written into it merely to keep the two fields equal.
+            // The canonical transaction rate (1 USDC → X GHS) lives in
+            // liveRetailRate alone; liveUsdToGhs is left untouched by the
+            // oracle (it remains whatever the admin override or the legacy
+            // era left there, and is never refreshed by this service).
             const update = {
-                liveUsdToGhs: usdToGhsRate,
                 liveRetailRate: usdcToGhsRate,
                 lastRateSync: observationTimestamp,
                 lastExternalSync: observationTimestamp,
-                liveRateSource: rateSource,
+                liveRateSource: 'KOTANI_PAY',
             };
             const create = {
                 id: 1,
-                liveUsdToGhs: usdToGhsRate,
                 liveRetailRate: usdcToGhsRate,
                 lastRateSync: observationTimestamp,
                 lastExternalSync: observationTimestamp,
-                liveRateSource: rateSource,
+                liveRateSource: 'KOTANI_PAY',
             };
             if (stablecoins) {
                 update.liveUsdtToUsd = stablecoins.tetherPrice;
@@ -236,7 +530,7 @@ class OracleService {
                 create,
             });
 
-            logger.info(`📈 Oracle Sync: 1 USDC ≈ ${usdcToGhsRate} GHS | source=${rateSource}`);
+            logger.info(`📈 Oracle Sync: 1 USDC ≈ ${usdcToGhsRate} GHS | source=KOTANI_PAY`);
 
             if (this.rateAlertService && usdcToGhsRate) {
                 setImmediate(() => {
@@ -252,3 +546,5 @@ class OracleService {
 
 module.exports = OracleService;
 module.exports.extractKotaniRate = extractKotaniRate;
+module.exports.kotaniPairMatches = kotaniPairMatches;
+module.exports.KOTANI_VERIFIED_PRODUCTION_HOSTS = KOTANI_VERIFIED_PRODUCTION_HOSTS;
