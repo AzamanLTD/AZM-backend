@@ -31,6 +31,15 @@ run('Marketplace product GHS price rail (real PostgreSQL)', () => {
     });
 
     afterAll(async () => {
+        // Hermetic teardown: the mix P1 cursor walk counts active products
+        // without a per-suite prefix filter, so any ghsrail- residue left
+        // behind after the last test shifts its expected totals under other
+        // battery run orders. Sweep the same prefixed rows as beforeEach.
+        await db.businessPrice.deleteMany({ where: { note: { startsWith: 'ghsrail' } } });
+        await db.businessProduct.deleteMany({ where: { slug: { startsWith: 'ghsrail-' } } });
+        await db.businessLocation.deleteMany({ where: { label: { startsWith: 'GhsRail Branch' } } });
+        await db.businessProfile.deleteMany({ where: { businessName: { startsWith: 'GhsRail Biz' } } });
+        await db.user.deleteMany({ where: { username: { startsWith: 'ghsrail-user' } } });
         await db.$disconnect();
     });
 

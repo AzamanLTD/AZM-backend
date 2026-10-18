@@ -422,6 +422,17 @@ async function resolveEffectiveGhsPrices(client, businessProductIds) {
     if (!Array.isArray(businessProductIds) || businessProductIds.length === 0) {
         return new Map();
     }
+    // Fail-closed on clients without the businessPrice model (e.g. a partial
+    // test double or a read replica scoped away from pricing): every product
+    // resolves priceGhs: null. A feed must never 500 over a missing price
+    // surface, and it must never invent a price.
+    if (!client?.businessPrice?.findMany) {
+        require('../src/config/logger').warn(
+            'resolveEffectiveGhsPrices: client has no businessPrice model; resolving priceGhs null for %d products',
+            businessProductIds.length,
+        );
+        return new Map();
+    }
     const rows = await client.businessPrice.findMany({
         where: {
             businessProductId: { in: businessProductIds },

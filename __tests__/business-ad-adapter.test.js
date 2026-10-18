@@ -55,9 +55,24 @@ async function seedBusiness(userId) {
 }
 
 async function cleanupAll() {
-    await prisma.businessAdPost.deleteMany();
-    await prisma.story.deleteMany();
-    await prisma.businessFollower.deleteMany();
+    // SUITE-SCOPED ad/story/follower cleanup (review 2026-10-18): the
+    // global deleteMany() calls that were here wiped BusinessAdPost/Story/
+    // BusinessFollower rows owned by OTHER suites under battery run orders
+    // — a cross-suite hazard. This suite's rows are identified by its own
+    // business profile and users only. (All three also cascade on the
+    // profile/user deletes below; the explicit deletes document intent.)
+    if (biz) {
+        await prisma.businessAdPost.deleteMany({ where: { businessProfileId: biz.id } });
+        await prisma.story.deleteMany({
+            where: {
+                OR: [
+                    { businessProfileId: biz.id },
+                    { userId: { in: [owner.id, follower.id, nonFollower.id] } },
+                ],
+            },
+        });
+        await prisma.businessFollower.deleteMany({ where: { businessProfileId: biz.id } });
+    }
 
     const testProfiles = await prisma.businessProfile.findMany({
         where: { businessName: { startsWith: 'Test Business ' } },
