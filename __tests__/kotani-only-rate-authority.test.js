@@ -564,13 +564,65 @@ describe('Production endpoint policy — a sandbox endpoint can never be the pro
         expect(new OracleService(mockPrisma()).kotaniConfigState().state).toBe('SANDBOX_ENDPOINT_REJECTED');
     });
 
-    test('P3. an explicitly configured PRODUCTION endpoint in production: armed', () => {
+    // §1 (review follow-up 2026-10-18): an explicit production endpoint is
+    // necessary but NOT sufficient. Production arming additionally requires
+    // an https:// endpoint on a host Kotani has verified at onboarding. The
+    // allowlist ships EMPTY, so production fails CLOSED for every host
+    // until the verified hostname is added in services/oracleService.js.
+    test('P3. an explicit production endpoint NOT on the verified host allowlist: NOT armed (fail-closed until onboarding)', () => {
         process.env.KOTANI_API_BASE_URL = 'https://api.kotanipay.io/api/v3';
         const cfg = new OracleService(mockPrisma()).kotaniConfigState();
-        expect(cfg.armed).toBe(true);
-        expect(cfg.state).toBe('ARMED');
-        expect(cfg.baseUrlExplicit).toBe(true);
-        expect(cfg.baseUrl).toBe('https://api.kotanipay.io/api/v3');
+        expect(cfg.armed).toBe(false);
+        expect(cfg.state).toBe('UNVERIFIED_PRODUCTION_HOST');
+        expect(cfg.baseUrl).toBeNull();
+        expect(cfg.detail).toContain('verified production host allowlist');
+        expect(cfg.detail).toContain('fails CLOSED');
+    });
+
+    test('P3-b. a NON-HTTPS endpoint in production is rejected by policy even when not a sandbox host', () => {
+        process.env.KOTANI_API_BASE_URL = 'http://api.kotanipay.io/api/v3';
+        const cfg = new OracleService(mockPrisma()).kotaniConfigState();
+        expect(cfg.armed).toBe(false);
+        expect(cfg.state).toBe('NON_HTTPS_ENDPOINT_REJECTED');
+        expect(cfg.detail).toContain('NOT an https:// endpoint');
+    });
+
+    test('P3-c. an unparseable endpoint URL in production is rejected by policy', () => {
+        process.env.KOTANI_API_BASE_URL = 'not-a-url';
+        const cfg = new OracleService(mockPrisma()).kotaniConfigState();
+        expect(cfg.armed).toBe(false);
+        expect(cfg.state).toBe('INVALID_ENDPOINT');
+    });
+
+    test('P3-d. a host ON the verified allowlist over https: armed (simulated onboarding confirmation)', () => {
+        const { KOTANI_VERIFIED_PRODUCTION_HOSTS } = require('../services/oracleService');
+        const len = KOTANI_VERIFIED_PRODUCTION_HOSTS.length;
+        KOTANI_VERIFIED_PRODUCTION_HOSTS.push('api.kotanipay.io'); // simulate the onboarding-verified host
+        try {
+            process.env.KOTANI_API_BASE_URL = 'https://api.kotanipay.io/api/v3';
+            const cfg = new OracleService(mockPrisma()).kotaniConfigState();
+            expect(cfg.armed).toBe(true);
+            expect(cfg.state).toBe('ARMED');
+            expect(cfg.baseUrlExplicit).toBe(true);
+            expect(cfg.baseUrl).toBe('https://api.kotanipay.io/api/v3');
+            expect(cfg.detail).toContain('https-only policy satisfied');
+        } finally {
+            KOTANI_VERIFIED_PRODUCTION_HOSTS.length = len; // restore the empty allowlist exactly
+        }
+        // And the restored (empty) allowlist fails closed again:
+        expect(new OracleService(mockPrisma()).kotaniConfigState().state).toBe('UNVERIFIED_PRODUCTION_HOST');
+    });
+
+    test('P3-e. a lookalike host (typosquat) is NOT armed even when the real host is verified', () => {
+        const { KOTANI_VERIFIED_PRODUCTION_HOSTS } = require('../services/oracleService');
+        const len = KOTANI_VERIFIED_PRODUCTION_HOSTS.length;
+        KOTANI_VERIFIED_PRODUCTION_HOSTS.push('api.kotanipay.io');
+        try {
+            process.env.KOTANI_API_BASE_URL = 'https://api-kotanipay.io/api/v3';
+            expect(new OracleService(mockPrisma()).kotaniConfigState().state).toBe('UNVERIFIED_PRODUCTION_HOST');
+        } finally {
+            KOTANI_VERIFIED_PRODUCTION_HOSTS.length = len;
+        }
     });
 
     test('P4. missing or placeholder token in production: MISSING_TOKEN before any endpoint decision', () => {
