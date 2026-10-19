@@ -31,26 +31,29 @@ const { sweepTestUsers } = require('./helpers/sweepTestUsers');
 const url = process.env.TEST_DATABASE_URL;
 const run = url ? describe : describe.skip;
 
-// The helper's documented blocking set (see sweepTestUsers.js derivation):
-// 40 tables with a direct RESTRICT/NO ACTION FK into "User", plus
-// KitchenOrder which only blocks via BusinessOrder. If this test fails
-// with a MISSING table, a new blocking child of "User" exists and the
-// helper must be extended. If it fails with an EXTRA table, a blocking
-// child was REMOVED and the helper (and this list) should be simplified.
+// The TRUE blocking closure of "User" (see sweepTestUsers.js derivation):
+// the 33 tables with a DIRECT ON DELETE RESTRICT / NO ACTION FK into "User"
+// (pg_constraint confdeltype IN ('r','a')), plus KitchenOrder, which only
+// blocks at depth 2 via BusinessOrder. SET NULL and CASCADE children never
+// block a user delete and are DELIBERATELY not expected here — that is what
+// makes this pin order-independent: runtime DDL like the control-plane staff
+// migration (SET NULL FKs) must not trip it no matter which suites ran first.
+//
+// If this test fails with a MISSING table, a new blocking child of "User"
+// exists and the helper must be extended. If it fails with an EXTRA table,
+// a blocking child was REMOVED and this list should be simplified.
 const EXPECTED_BLOCKERS = new Set([
-    'Ad', 'AdminApprovalRequest', 'AdminWarRoomAlert', 'BusinessConversation',
+    'Ad', 'AdminApprovalRequest', 'BusinessConversation',
     'BusinessInvoice', 'BusinessOrder', 'BusinessReview',
-    'BusinessVerificationDocument', 'ConversationMoneyTicket',
-    'CrossBorderFxSnapshot', 'CrossBorderSusuConfig', 'DineInTab',
-    'DineInTabItem', 'DisputeResolution', 'EscrowDispute',
-    'GovernanceProposal', 'GroupChat', 'GroupMessage',
-    'HotelHousekeepingTask', 'LiabilityAcceptance',
-    'LiabilityContractVersion', 'Message', 'OrderBookTrade',
+    'ConversationMoneyTicket', 'CrossBorderFxSnapshot',
+    'CrossBorderSusuConfig', 'DineInTab', 'DineInTabItem',
+    'DisputeResolution', 'EscrowDispute', 'GovernanceProposal',
+    'GroupChat', 'KitchenOrder', 'LiabilityAcceptance',
+    'LiabilityContractVersion', 'OrderBookTrade',
     'ProofOfReservesLeaf', 'Reservation', 'Review', 'SavedWallet',
-    'ShiftSwap', 'SmartEscrow', 'SmartRouteRun', 'SusuContribution',
+    'SmartEscrow', 'SmartRouteRun', 'SusuContribution',
     'SusuCycle', 'SusuInvite', 'Trade', 'TransactionHistory',
-    'TransitBooking', 'VendorApplication', 'VoucherSlashLog', 'WalletAddress',
-    'Withdrawal',
+    'TransitBooking', 'VoucherSlashLog', 'WalletAddress', 'Withdrawal',
 ]);
 
 run('sweepTestUsers contract (real PostgreSQL)', () => {
@@ -63,9 +66,14 @@ run('sweepTestUsers contract (real PostgreSQL)', () => {
         if (db) await db.$disconnect();
     });
 
-    test('the live pg_constraint blocking closure matches the helper\'s documented set', async () => {
+    test('the live pg_constraint blocking closure matches the documented set (order-independent)', async () => {
         // Tables with an ON DELETE RESTRICT / NO ACTION foreign key into
         // "User" — the complete set that can block user_% deletion.
+        // confdeltype: 'r' = RESTRICT, 'a' = NO ACTION. ('n' is SET NULL —
+        // it never blocks and must NOT be included: runtime DDL such as the
+        // control-plane staff migration creates SET NULL children of "User"
+        // mid-battery, and a query that counted them made this test fail
+        // depending on suite order — main run 39273776066, invocation 1.)
         const rows = await db.$queryRawUnsafe(`
             SELECT DISTINCT cl.relname AS table_name
             FROM pg_constraint con
@@ -73,14 +81,26 @@ run('sweepTestUsers contract (real PostgreSQL)', () => {
             JOIN pg_class parent ON parent.oid = con.confrelid
             WHERE parent.relname = 'User'
               AND con.contype = 'f'
-              AND con.confdeltype IN ('r', 'n')
+              AND con.confdeltype IN ('r', 'a')
         `);
-        const live = new Set(rows.map((r) => r.table_name));
+        const liveDirect = new Set(rows.map((r) => r.table_name));
+
+        // KitchenOrder is the one depth-2 blocker: no direct FK into
+        // "User", but deleting a user_% row's BusinessOrders is
+        // RESTRICT-blocked by KitchenOrder.businessOrderId.
+        const live = new Set([...liveDirect, 'KitchenOrder']);
 
         const missing = [...live].filter((t) => !EXPECTED_BLOCKERS.has(t));
         const extra = [...EXPECTED_BLOCKERS].filter((t) => !live.has(t));
         expect(missing).toEqual([]);
         expect(extra).toEqual([]);
+
+        // COVERAGE: the shared helper must sweep every live blocker — a new
+        // RESTRICT/NO ACTION child that the helper does not clear would
+        // re-poison the battery the moment a suite leaves matching rows.
+        const { SWEEP_TABLES } = require('./helpers/sweepTestUsers');
+        const uncovered = [...live].filter((t) => !SWEEP_TABLES.includes(t));
+        expect(uncovered).toEqual([]);
     });
 
     test('a full ordering-edge graph of user_% rows is swept in one call, FK-safely', async () => {

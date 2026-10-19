@@ -14,6 +14,7 @@
 // SKIPS unless TEST_DATABASE_URL is set.
 // =============================================================================
 const { seedUser } = require('./helpers/factories');
+const { sweepTestUsers } = require('./helpers/sweepTestUsers');
 
 const hasDb = !!process.env.TEST_DATABASE_URL;
 const describeOrSkip = hasDb ? describe : describe.skip;
@@ -35,12 +36,15 @@ describeOrSkip('AzmRewardService.getFriendsLeaderboard', () => {
     afterAll(async () => { if (prisma) await prisma.$disconnect(); });
 
     afterEach(async () => {
-        // Sequential deletes (not TRUNCATE) per project convention to avoid
-        // 40P01 deadlocks under concurrent test-file execution.
-        await prisma.azmRewardLog.deleteMany({});
-        await prisma.friendship.deleteMany({});
-        await prisma.transactionHistory.deleteMany({});
-        await prisma.user.deleteMany({});
+        // FK-safe shared sweep (battery-order immunity): the previous inline
+        // chain cleared only AzmRewardLog / Friendship / TransactionHistory
+        // before user.deleteMany({}) — on a battery-reused DB (the CI lane's
+        // retry invocation) leftover Trade rows with a RESTRICT FK into
+        // "User" threw Trade_userId_fkey and failed every remaining test in
+        // this suite (main run 39273776066, invocation 2). The helper deletes
+        // every user_%-referencing blocker child before the users
+        // themselves; reward logs and friendships cascade with their users.
+        await sweepTestUsers(prisma);
         await new Promise((r) => setTimeout(r, 150));
     }, 15000);
 
@@ -148,9 +152,7 @@ describeOrSkip('AzmRewardService.getRewardSummary — streak fields', () => {
     afterAll(async () => { if (prisma) await prisma.$disconnect(); });
 
     afterEach(async () => {
-        await prisma.azmRewardLog.deleteMany({});
-        await prisma.transactionHistory.deleteMany({});
-        await prisma.user.deleteMany({});
+        await sweepTestUsers(prisma);
         await new Promise((r) => setTimeout(r, 150));
     }, 15000);
 

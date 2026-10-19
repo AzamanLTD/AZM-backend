@@ -16,18 +16,28 @@
 // failed to run.
 //
 // DERIVATION (re-derived 2026-10-19 against a fresh CI-parity database
-// built from main d6f7da149d527ad2d50f6126f6e28c6b2214a1e8 with the test
-// lane's exact 20-step setup — `npx prisma db push` + all 19 overlay
-// installers — and read back from pg_constraint): only ON DELETE RESTRICT /
-// NO ACTION foreign keys into "User" can block a user delete; SET NULL and
-// CASCADE columns never block. At this head the blocking set is 41 tables —
-// the RESTRICT edges the original helper covered PLUS NO ACTION edges it
-// did not (Message.senderId, GroupMessage.senderId,
-// AdminWarRoomAlert.acknowledgedBy, BusinessVerificationDocument.reviewedById,
-// EscrowDispute.assignedToId, GovernanceProposal.executedById,
-// HotelHousekeepingTask.userId, LiabilityAcceptance.voucherUserId,
-// ShiftSwap.claimingUserId, SusuInvite.inviteeUserId,
-// VendorApplication.reviewedBy, VoucherSlashLog.voucherId).
+// built from main d6f7da1 with the test lane's exact 20-step setup —
+// `npx prisma db push` + all 19 overlay installers — and read back from
+// pg_constraint): only ON DELETE RESTRICT / NO ACTION foreign keys into
+// "User" (confdeltype IN ('r','a')) can block a user delete; SET NULL and
+// CASCADE columns never block. CORRECTED 2026-10-19 (main run 39273776066,
+// invocation 1): an earlier draft of this derivation read confdeltype 'n'
+// as "NO ACTION" — 'n' is actually SET NULL (NO ACTION is 'a'). The TRUE
+// blocking closure is 33 direct RESTRICT/NO ACTION children of "User" plus
+// KitchenOrder, which blocks only at depth 2 via BusinessOrder.
+//
+// The sweep below still covers 41 tables: the 34 true blockers PLUS 7
+// SET NULL children (Message, GroupMessage, AdminWarRoomAlert,
+// BusinessVerificationDocument, HotelHousekeepingTask, ShiftSwap,
+// VendorApplication). Those 7 never block a user delete, but their
+// user_-referencing rows are cleared anyway for residue hygiene — a
+// user_% sender's Message rows, for example, would otherwise linger with
+// nulled senderId columns and could contaminate later suites' counts.
+// Over-sweeping is safe: every statement below is scoped to user_% ids.
+// The contract suite (sweep-test-users-contract.pg.test.js) pins the TRUE
+// blocker closure from pg_constraint and asserts this helper's list
+// covers it, so a future schema/overlay that adds a genuine blocker fails
+// that suite loudly instead of silently re-poisoning the battery.
 //
 // Deletion order matters among the swept tables themselves. The inter-table
 // RESTRICT/NO ACTION edges within the blocking set are:
@@ -47,11 +57,11 @@
 // Every other cross-reference among swept tables (e.g. DineInTabItem -> DineInTab,
 // GroupMessage -> GroupChat, SusuContribution -> SusuCycle) is SET NULL or
 // CASCADE and is handled automatically by Postgres. The statements below run
-// blockers FIRST, so no swept delete can hit one of these edges. The
-// derivation was verified: the recursive closure over pg_constraint contains
-// exactly 42 relations (User + 41 blockers), all FKs into User are
-// single-column, and nothing outside the closure RESTRICT-references a
-// swept table.
+// blockers FIRST, so no swept delete can hit one of these edges. Verified at
+// derivation time: the true recursive blocker closure over pg_constraint is
+// User + 33 direct children + KitchenOrder, all FKs into User are
+// single-column, and nothing outside the closure RESTRICT/NO ACTION-references
+// a swept table.
 //
 // SCOPE: every statement only touches rows whose RESTRICT/NO ACTION foreign
 // key points at a user named `user_%` — a test-only naming convention on the
@@ -161,4 +171,10 @@ async function sweepTestUsers(prisma) {
     await prisma.user.deleteMany({ where: { username: { startsWith: 'user_' } } });
 }
 
-module.exports = { sweepTestUsers };
+// The swept tables in deletion order, parsed from the statements themselves
+// so this list can never drift from the SQL above. The contract suite uses
+// it to assert every live RESTRICT/NO ACTION blocker of "User" is covered.
+const SWEEP_TABLES = [...BLOCKERS_FIRST, ...SWEPT_CHILDREN]
+    .map((sql) => sql.match(/DELETE FROM "([A-Za-z]+)"/)[1]);
+
+module.exports = { sweepTestUsers, SWEEP_TABLES };
