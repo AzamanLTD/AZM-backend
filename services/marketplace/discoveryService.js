@@ -39,9 +39,34 @@ const MAX_TAXONOMY_CHIPS = 10;
 // §3.2: cursor pagination is cursor-only (no offset scan amplification).
 // Rounds bound the window-filter refill loop: each round fetches (need+1)
 // where-eligible rows and post-filters section windows; the loop exits early
-// whenever the page fills or the source exhausts. 3 rounds covers a pathological
-// first page without turning one request into an unbounded scan.
-const MAX_ROUNDS = 3;
+// whenever the page fills or the source exhausts. The bound exists to keep one
+// request from becoming an unbounded scan — it must NOT break §4 page
+// exactness: every row dropped by the section-window post-filter still has to
+// be walked past, or eligible items sorting behind them silently vanish from
+// the page. (2026-10-18 CI proof, run 39120763057: with only 3 rounds the
+// battery's disposable database accumulated >75 stale window-closed rows
+// ahead of a freshly seeded eligible item and the feed returned an EMPTY
+// first page — items: [] — for tests asserting the item surfaces.) MAX_ROUNDS
+// bounds the QUERY count per request; the adaptive take below (2026-10-19)
+// grows each round's fetch after zero-eligible rounds so the same query
+// budget now walks far past the old fixed ~1920-row ceiling, with a separate
+// MAX_SCAN_ROWS row budget as the hard per-request work cap.
+const MAX_ROUNDS = 80;
+// ── Adaptive scan growth (acceptance close-out, 2026-10-19) ─────────────────
+// The refill loop's per-ROUND fetch grows when rounds come back with NOTHING
+// eligible: a fixed take of (need+1) re-walks window-closed candidates at ~24
+// rows per query, so a feed with thousands of stale rows burned its 80-round
+// query budget on ~1920 rows and returned an empty page with a cursor (the
+// measured stress case: 21k stale rows -> 9 client requests / 720 queries /
+// ~60s before the first eligible item). Growth keeps the SAME hard budgets —
+// MAX_ROUNDS bounds queries, MAX_SCAN_ROWS bounds examined rows per request —
+// while doubling the fetch after each empty round so a zero-eligible walk
+// covers far more source per query. A productive round resets the fetch to
+// (need+1) so the page's tail stays cheap. Both caps ship as constants: one
+// request can never scan more than MAX_SCAN_ROWS rows or issue more than
+// MAX_ROUNDS findMany queries, whatever the data looks like.
+const MAX_ROUND_TAKE = 512; // per-query fetch cap (rows)
+const MAX_SCAN_ROWS = 25000; // hard per-request row-examination budget
 const CACHE_TTL_SECONDS = 60; // §3.2 first-page TTL
 // Pre-calibration rank normalization (§5.2 fallback w7: category-wide
 // engagement ordering). score = min(1, log1p(totalOrders)/log1p(NORM)).
@@ -846,34 +871,57 @@ async function runQuery(prisma, params) {
     let lastConsumed = null;
     let lastOverflow = false;
     let rounds = 0;
+    let scanned = 0;
+    let take = Math.min(params.limit + 1, MAX_ROUND_TAKE);
     const emitted = [];
     const nowMin = nowMinutesUtc();
 
-    while (emitted.length < params.limit && rounds < MAX_ROUNDS) {
+    while (emitted.length < params.limit && rounds < MAX_ROUNDS && scanned < MAX_SCAN_ROWS) {
         const need = params.limit - emitted.length;
         const key = rounds === 0 ? (params.key || null) : cursorKeyOf(lastConsumed);
         const where = buildWhere({ ...params, key });
-        const rows = await fetchRound(prisma, where, need + 1);
+        // Adaptive take (2026-10-19): clamp the fetch to the remaining row
+        // budget so the per-request work cap is exact even at the boundary.
+        const effTake = Math.min(take, MAX_SCAN_ROWS - scanned);
+        const rows = await fetchRound(prisma, where, effTake);
         rounds += 1;
         if (rows.length === 0) {
             lastOverflow = false;
             break;
         }
-        lastOverflow = rows.length > need;
-        const batch = lastOverflow ? rows.slice(0, need) : rows;
+        scanned += rows.length;
         // §4: compute the section window once per section per request batch.
         const windowBySection = new Map();
-        for (const row of batch) {
+        for (const row of rows) {
             if (row.catalogSection && !windowBySection.has(row.catalogSection.id)) {
                 windowBySection.set(row.catalogSection.id, sectionWindowOpen(row.catalogSection, nowMin));
             }
         }
-        for (const row of batch) {
+        // Examine fetched rows in order, emitting eligible ones until the
+        // page is exact. lastConsumed tracks the LAST EXAMINED row — the
+        // cursor never skips an unexamined row, so §4 page exactness holds
+        // with any take size. When the page fills mid-fetch the remaining
+        // fetched rows stay UNEXAMINED (cursor rests before them — the next
+        // page re-fetches them; correctness over re-examination cost).
+        const emittedBefore = emitted.length;
+        let examinedAll = true;
+        for (const row of rows) {
+            if (emitted.length >= params.limit) { examinedAll = false; break; }
             lastConsumed = row;
             if (row.catalogSection && !windowBySection.get(row.catalogSection.id)) continue;
             emitted.push(row);
         }
+        // Overflow truth: more source may exist when the fetch hit its take
+        // cap, or we stopped examining with fetched rows still behind the
+        // cursor. A short fetch (< take, fully examined) is real exhaustion.
+        lastOverflow = !examinedAll || rows.length === effTake;
         if (!lastOverflow) break; // source exhausted under the where-clause
+        if (emitted.length >= params.limit) break;
+        // Grow after a zero-emit round (re-walk closed candidates faster);
+        // reset after a productive round (cheap tail fetches).
+        take = emitted.length === emittedBefore
+            ? Math.min(take * 2, MAX_ROUND_TAKE)
+            : Math.min(params.limit - emitted.length + 1, MAX_ROUND_TAKE);
     }
 
     const hasMore = lastOverflow && Boolean(lastConsumed);
