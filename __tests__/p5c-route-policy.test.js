@@ -44,6 +44,7 @@ jest.mock('../src/config/logger', () => ({
 
 const hasDb = !!process.env.TEST_DATABASE_URL;
 const describeOrSkip = hasDb ? describe : describe.skip;
+const { sweepTestUsers } = require('./helpers/sweepTestUsers');
 if (!hasDb) console.warn('[p5c-route-policy.test] TEST_DATABASE_URL not set — skipping.');
 
 describeOrSkip('§P.5-C route-aware quote authority (real PostgreSQL)', () => {
@@ -74,10 +75,13 @@ describeOrSkip('§P.5-C route-aware quote authority (real PostgreSQL)', () => {
         // user.deleteMany() (RESTRICT FK from TransactionHistory/TransactionQuote).
         if (prisma) {
             // seedUser backs every starting balance with a COMPLETED
-            // DEPOSIT_CRYPTO ledger row — clear ALL rows owned by this suite's
-            // seeded users (username pattern 'user_%'), plus every quote, so
-            // later suites' user.deleteMany() teardowns are not FK-blocked.
-            await prisma.$executeRaw`DELETE FROM "TransactionHistory" WHERE "userId" IN (SELECT id FROM "User" WHERE username LIKE 'user_%')`;
+            // DEPOSIT_CRYPTO ledger row — and user_% rows leaked by OTHER
+            // suites can carry Withdrawal children that RESTRICT-block a
+            // bare TransactionHistory delete (Withdrawal_transactionHistoryId
+            // is NO ACTION). The shared helper sweeps EVERY blocking child
+            // of user_% users in FK-safe order AND removes the users, so
+            // later suites' user.deleteMany() teardowns are never FK-blocked.
+            await sweepTestUsers(prisma);
             await prisma.$executeRaw`DELETE FROM "TransactionQuote"`;
             await prisma.$disconnect();
         }

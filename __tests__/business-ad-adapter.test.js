@@ -7,6 +7,7 @@
 // See businessAdService.js header comment for the full breakdown.
 // =============================================================================
 const { PrismaClient } = require('@prisma/client');
+const { sweepTestUsers } = require('./helpers/sweepTestUsers');
 const bcrypt = require('bcryptjs');
 const prisma = new PrismaClient();
 
@@ -74,20 +75,13 @@ async function cleanupAll() {
     }
 
     // Battery-order immunity: prior suites may leave user_* rows behind
-    // with TransactionHistory children (e.g. a factory-backed balance) or
-    // Withdrawal children (e.g. r42-wallet-withdrawal-status-surface has
-    // no afterAll cleanup). The sweep deletes those children first so the
-    // user sweep cannot hit the TransactionHistory_userId_fkey /
-    // Withdrawal_userId_fkey foreign keys, whatever the jest run order.
-    await prisma.$executeRawUnsafe(
-        'DELETE FROM "TransactionHistory" WHERE "userId" IN '
-        + "(SELECT id FROM \"User\" WHERE username LIKE 'user_%')"
-    );
-    await prisma.$executeRawUnsafe(
-        'DELETE FROM "Withdrawal" WHERE "userId" IN '
-        + "(SELECT id FROM \"User\" WHERE username LIKE 'user_%')"
-    );
-    await prisma.user.deleteMany({ where: { username: { startsWith: 'user_' } } });
+    // with RESTRICT/NO ACTION children beyond TransactionHistory and
+    // Withdrawal — e.g. WalletAddress rows (r22-custody-execution-recovery
+    // historically had no DB afterAll; CI run 39007452456 failed the whole
+    // suite on WalletAddress_userId_fkey, recurrence 39246041036). The
+    // shared helper sweeps EVERY blocking child of user_% users in FK-safe
+    // order, whatever the jest run order.
+    await sweepTestUsers(prisma);
 }
 
 let owner, follower, nonFollower, biz, ownerBiz;
