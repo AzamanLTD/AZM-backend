@@ -10,11 +10,6 @@
 //     optional transaction client so it can run inside the user-create txn.
 //   • lookupByAzamanId(callerId, azamanId) — resolve a well-formed Azaman_ID
 //     to a minimal public profile, rejecting malformed input and self-lookup.
-//     r43 (2026-10-17): the response also carries the CALLER's friendship
-//     state with the found user ({ friendshipId, status } | null) so the
-//     Send flow can route to the canonical friendship-scoped transfer rail
-//     or fail closed — instead of posting to a nonexistent by-identifier
-//     transfer endpoint. The TARGET's projection is unchanged.
 //   • discoverByPhones(callerId, e164List) — match a batch of normalized phone
 //     numbers against verified + discoverable users, projecting only the
 //     public fields. Submitted numbers are NEVER persisted; they are hashed
@@ -24,10 +19,7 @@
 //
 // Privacy contract (Requirement 18): every projection here is exactly
 // { azamanId, displayName, avatar } — no User.id, email, balances, raw phone,
-// or KYC fields ever leave this service. The r43 `friendship` field is an
-// exception that reveals nothing about the TARGET: it is the CALLER's own
-// friendship row (id + status) — the same datum GET /api/friends already
-// returns to them — and is null when no row exists.
+// or KYC fields ever leave this service.
 // =============================================================================
 
 const logger = require('../../src/config/logger');
@@ -120,28 +112,7 @@ class IdentityService {
         400,
       );
     }
-
-    // r43 — the CALLER's friendship state with the found user, so the client
-    // can wire an AZM-ID hit to the canonical friendship-scoped transfer
-    // rail (POST /api/friends/transfer/send) or fail closed. Reveals only
-    // the caller's own row; the target's projection is unchanged.
-    let friendship = null;
-    if (callerId != null) {
-      const row = await this.prisma.friendship.findFirst({
-        where: {
-          OR: [
-            { requesterId: callerId, addresseeId: user.id },
-            { addresseeId: callerId, requesterId: user.id },
-          ],
-        },
-        select: { id: true, status: true },
-        orderBy: { id: 'desc' }, // deterministic if duplicate rows ever exist
-      });
-      if (row) friendship = { friendshipId: row.id, status: row.status };
-    }
-    // friendship is attached HERE (lookup only) — discoverByPhones keeps the
-    // pure Requirement-18 projection, byte-identical to its old shape.
-    return { ...this._project(user), friendship };
+    return this._project(user);
   }
 
   // ── Contact discovery ─────────────────────────────────────────────────
