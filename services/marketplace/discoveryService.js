@@ -39,9 +39,17 @@ const MAX_TAXONOMY_CHIPS = 10;
 // §3.2: cursor pagination is cursor-only (no offset scan amplification).
 // Rounds bound the window-filter refill loop: each round fetches (need+1)
 // where-eligible rows and post-filters section windows; the loop exits early
-// whenever the page fills or the source exhausts. 3 rounds covers a pathological
-// first page without turning one request into an unbounded scan.
-const MAX_ROUNDS = 3;
+// whenever the page fills or the source exhausts. The bound exists to keep one
+// request from becoming an unbounded scan — it must NOT break §4 page
+// exactness: every row dropped by the section-window post-filter still has to
+// be walked past, or eligible items sorting behind them silently vanish from
+// the page. (2026-10-18 CI proof, run 39120763057: with only 3 rounds the
+// battery's disposable database accumulated >75 stale window-closed rows
+// ahead of a freshly seeded eligible item and the feed returned an EMPTY
+// first page — items: [] — for tests asserting the item surfaces.) 80 rounds
+// walks up to 80x(need+1) ≈ 2000 rows for a 24-item page: generous headroom
+// over realistic closed-window volumes, still a hard per-request cost cap.
+const MAX_ROUNDS = 80;
 const CACHE_TTL_SECONDS = 60; // §3.2 first-page TTL
 // Pre-calibration rank normalization (§5.2 fallback w7: category-wide
 // engagement ordering). score = min(1, log1p(totalOrders)/log1p(NORM)).
