@@ -10,6 +10,15 @@
 // historical orders keep their product reference intact.
 // =============================================================================
 
+// Marketplace GHS price rail (follow-up review §3): product read DTOs attach
+// the server-confirmed GHS price via the SAME eligibility authority the Mix
+// discovery feed uses (businessPriceService — the single resolver; never
+// queried directly). Additive only: priceGhs is a new nullable string field;
+// priceUsdc and every existing field are untouched. No USDC→GHS conversion
+// ever happens here — a null priceGhs means "no authoritative merchant GHS
+// price exists", and consumers must render their truthful fallback state.
+const priceService = require('./businessPriceService');
+
 const VALID_CATEGORIES = new Set([
     'FREELANCE_SERVICES', 'RETAIL', 'FOOD_BEVERAGE', 'TECHNOLOGY', 'REAL_ESTATE',
     'EDUCATION', 'HEALTH_WELLNESS', 'ENTERTAINMENT', 'LOGISTICS',
@@ -274,6 +283,23 @@ const updateProduct = async (prisma, { productId, businessProfileId, updates }) 
     return prisma.businessProduct.update({ where: { id: productId }, data });
 };
 
+// Attaches priceGhs (exact 2dp string, identical semantics to the Mix feed's
+// pricing.amount: pesewasToGhsString(toPesewas(amountExact))) to each product
+// for which an eligible current BusinessPrice row exists. Per-identity fail
+// closed: corrupt/ambiguous/absent rows yield priceGhs: null, never a guess
+// and never a converted priceUsdc.
+const _attachGhsPrices = async (prisma, products) => {
+    if (!Array.isArray(products) || products.length === 0) return products;
+    const resolved = await priceService.resolveEffectiveGhsPrices(prisma, products.map(p => p.id));
+    for (const product of products) {
+        const row = resolved.get(product.id);
+        product.priceGhs = row
+            ? priceService.pesewasToGhsString(priceService.toPesewas(row.amountExact))
+            : null;
+    }
+    return products;
+};
+
 const listProducts = async (prisma, { businessProfileId, isActive, locationId, limit, cursor }) => {
     const take = Math.min(Math.max(parseInt(limit, 10) || 20, 1), 50);
     const where = { businessProfileId };
@@ -290,11 +316,12 @@ const listProducts = async (prisma, { businessProfileId, isActive, locationId, l
     const hasMore = rows.length > take;
     const products = hasMore ? rows.slice(0, take) : rows;
     const nextCursor = hasMore ? products[products.length - 1].id : null;
+    await _attachGhsPrices(prisma, products);
     return { products, hasMore, nextCursor };
 };
 
-const getProduct = async (prisma, { productId, includeBusinessProfile }) =>
-    prisma.businessProduct.findUnique({
+const getProduct = async (prisma, { productId, includeBusinessProfile }) => {
+    const product = await prisma.businessProduct.findUnique({
         where: { id: productId },
         ...(includeBusinessProfile
             ? {
@@ -306,6 +333,9 @@ const getProduct = async (prisma, { productId, includeBusinessProfile }) =>
             }
             : {}),
     });
+    if (product) await _attachGhsPrices(prisma, [product]);
+    return product;
+};
 
 const deleteProduct = async (prisma, { productId, businessProfileId }) => {
     if (!productId) throw new Error('productId is required.');

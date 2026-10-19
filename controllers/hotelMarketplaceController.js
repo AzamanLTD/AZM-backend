@@ -11,6 +11,7 @@
 
 const { Prisma } = require('@prisma/client');
 const reservationController = require('./reservationController');
+const priceService = require('../services/businessPriceService');
 
 function startOfUtcDay(value) {
     const d = new Date(value);
@@ -163,6 +164,26 @@ exports.getBusinessDetail = async (req, res) => {
         variants: product.variants ?? null,
         modifierGroups: product.modifierGroups ?? null,
     }));
+
+    // Authoritative GHS listing price on the customer-facing business-detail
+    // response (review 2026-10-18): the SAME shared resolver as every other
+    // product read surface (businessProductService._attachGhsPrices), so
+    // /api/marketplace/business/:bizId carries the identical priceGhs
+    // contract — exact 2dp string when an eligible current BusinessPrice
+    // row exists, null otherwise (never a converted/relabeled priceUsdc).
+    // Per-identity fail-closed semantics come from the resolver itself.
+    if (products.length > 0) {
+        const resolvedGhs = await priceService.resolveEffectiveGhsPrices(
+            prisma,
+            products.map((product) => product.id),
+        );
+        for (const product of products) {
+            const row = resolvedGhs.get(product.id);
+            product.priceGhs = row
+                ? priceService.pesewasToGhsString(priceService.toPesewas(row.amountExact))
+                : null;
+        }
+    }
 
     return res.json({
         success: true,

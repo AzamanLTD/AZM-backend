@@ -18,6 +18,14 @@ const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 
 const storefrontService = require('../services/storefrontService');
 const storefrontPublishSafeService = require('../services/storefrontPublishSafeService');
 const renderService = require('../services/storefrontRenderService');
+// Shared GHS price authority (final acceptance follow-up 2026-10-19): the
+// customer-facing storefront catalogue is a product read surface — it carries
+// the SAME authoritative priceGhs contract as every other product read
+// (business-detail route, product rails): the exact 2dp GHS string of the
+// eligible current BusinessPrice row, or null. priceUsdc remains the payable
+// rail amount, byte-identical — never converted, never a substitute listing
+// price.
+const priceService = require('../services/businessPriceService');
 const {
   checkoutFingerprint,
   orderFingerprint,
@@ -194,6 +202,14 @@ router.get('/:businessProfileId/products', wrap(async (req, res) => {
     take,
   });
 
+  // Authoritative GHS listing price per product — the same shared resolver
+  // and serialization as the business-detail route (priceService is the
+  // single eligibility authority; per-identity fail closed to null).
+  const resolvedGhs = await priceService.resolveEffectiveGhsPrices(
+    prisma,
+    products.map((p) => p.id),
+  );
+
   res.json({
     success: true,
     data: {
@@ -203,6 +219,12 @@ router.get('/:businessProfileId/products', wrap(async (req, res) => {
         ...p,
         priceUsdc: Number(p.priceUsdc),
         imageUrls: p.imageUrls || [],
+        priceGhs: (() => {
+          const row = resolvedGhs.get(p.id);
+          return row
+            ? priceService.pesewasToGhsString(priceService.toPesewas(row.amountExact))
+            : null;
+        })(),
       })),
     },
   });
