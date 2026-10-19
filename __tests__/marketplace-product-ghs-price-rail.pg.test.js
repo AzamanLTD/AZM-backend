@@ -454,3 +454,163 @@ run('Marketplace business-detail GHS price contract (real PostgreSQL, route-leve
         expect(withRow.id).toEqual(priced.product.id);
     });
 });
+
+// ─── 5. customer-facing storefront ordering catalogue carries the contract ─
+//
+// Route-level regression (final acceptance follow-up 2026-10-19): the
+// storefront product listing (GET /api/storefront/:businessProfileId/products)
+// feeds the customer's ordering journey — it must expose the SAME
+// authoritative priceGhs contract (exact 2dp string for an eligible current
+// row, null otherwise) while priceUsdc, the payable rail amount, stays
+// byte-identical and never substitutes for the listing price.
+
+run('Storefront ordering catalogue GHS price contract (real PostgreSQL, route-level)', () => {
+    let db;
+    let seq;
+
+    const buildApp = () => {
+        const express = require('express');
+        const request = require('supertest');
+        const app = express();
+        app.set('prisma', db);
+        app.use(express.json());
+        app.use('/api/storefront', require('../routes/storefrontRoutes'));
+        return { app, request };
+    };
+
+    beforeAll(async () => {
+        db = new PrismaClient();
+    });
+
+    afterAll(async () => {
+        await db.businessPrice.deleteMany({ where: { note: { startsWith: 'ghsrail' } } });
+        await db.businessProduct.deleteMany({ where: { slug: { startsWith: 'ghsrail-' } } });
+        await db.businessProfile.deleteMany({ where: { businessName: { startsWith: 'GhsRail Biz' } } });
+        await db.user.deleteMany({ where: { username: { startsWith: 'ghsrail-user' } } });
+        await db.$disconnect();
+    });
+
+    beforeEach(async () => {
+        seq = Date.now();
+        await db.businessPrice.deleteMany({ where: { note: { startsWith: 'ghsrail' } } });
+        await db.businessProduct.deleteMany({ where: { slug: { startsWith: 'ghsrail-' } } });
+        await db.businessProfile.deleteMany({ where: { businessName: { startsWith: 'GhsRail Biz' } } });
+        await db.user.deleteMany({ where: { username: { startsWith: 'ghsrail-user' } } });
+    });
+
+    async function seedStorefrontFixture() {
+        const n = seq++;
+        const owner = await db.user.create({
+            data: {
+                username: `ghsrail-user-${n}-${Date.now()}`,
+                email: `ghsrail-${n}-${Date.now()}@t.test`,
+                password: 'x',
+            },
+        });
+        const profile = await db.businessProfile.create({
+            data: {
+                userId: owner.id,
+                businessName: `GhsRail Biz ${n}`,
+                bizId: `BIZ-GHSRAIL-${n}-${String(Date.now()).slice(-6)}`,
+                category: 'RETAIL',
+                isVerified: true,
+            },
+        });
+        const product = await db.businessProduct.create({
+            data: {
+                businessProfileId: profile.id,
+                name: `Rail Product ${n}`,
+                slug: `ghsrail-${n}-${String(Date.now()).slice(-6)}`,
+                description: 'storefront catalogue proof product',
+                priceUsdc: new Prisma.Decimal('13.42'),
+                category: 'RETAIL',
+                isActive: true,
+                isAvailable: true,
+            },
+        });
+        return { profile, product };
+    }
+
+    const getStorefrontProducts = async (businessProfileId) => {
+        const { app, request } = buildApp();
+        const res = await request(app).get(`/api/storefront/${businessProfileId}/products`);
+        expect(res.status).toBe(200);
+        expect(res.body.success).toBe(true);
+        return res.body.data.products[0];
+    };
+
+    test('5a. confirmed current price → priceGhs exact 2dp string on the storefront catalogue route', async () => {
+        const { profile, product } = await seedStorefrontFixture();
+        await priceService.setPrice(db, {
+            businessProductId: product.id,
+            amountGhs: '25.50',
+            confirmedByType: 'BUSINESS',
+            confirmedById: 'rail-actor',
+            note: 'ghsrail',
+            confirm: true,
+        });
+
+        const dto = await getStorefrontProducts(profile.id);
+        expect(dto.id).toBe(product.id);
+        expect(dto.priceGhs).toBe('25.50');
+        expect(Number(dto.priceUsdc)).toBeCloseTo(13.42, 8); // payable rail amount untouched
+    });
+
+    test('5b. trailing-zero amount serializes as the exact 2dp string (never "7.5")', async () => {
+        const { profile, product } = await seedStorefrontFixture();
+        await priceService.setPrice(db, {
+            businessProductId: product.id,
+            amountGhs: '7.50',
+            confirmedByType: 'BUSINESS',
+            confirmedById: 'rail-actor',
+            note: 'ghsrail',
+            confirm: true,
+        });
+
+        const dto = await getStorefrontProducts(profile.id);
+        expect(dto.priceGhs).toBe('7.50');
+    });
+
+    test('5c. missing row → priceGhs null (no converted priceUsdc); priceUsdc byte-identical with/without a GHS row', async () => {
+        const plain = await seedStorefrontFixture();
+        const withoutRow = await getStorefrontProducts(plain.profile.id);
+        expect(withoutRow.priceGhs).toBeNull();
+        expect(Number(withoutRow.priceUsdc)).toBeCloseTo(13.42, 8);
+
+        const priced = await seedStorefrontFixture();
+        await priceService.setPrice(db, {
+            businessProductId: priced.product.id,
+            amountGhs: '49.99',
+            confirmedByType: 'BUSINESS',
+            confirmedById: 'rail-actor',
+            note: 'ghsrail',
+            confirm: true,
+        });
+        const withRow = await getStorefrontProducts(priced.profile.id);
+        expect(withRow.priceGhs).toBe('49.99');
+        expect(withRow.priceUsdc).toEqual(withoutRow.priceUsdc); // byte-identical payable rail amount
+    });
+
+    test('5d. archived row → priceGhs null (soft history never surfaces as a listing price)', async () => {
+        const { profile, product } = await seedStorefrontFixture();
+        await priceService.setPrice(db, {
+            businessProductId: product.id,
+            amountGhs: '10.00',
+            confirmedByType: 'BUSINESS',
+            confirmedById: 'rail-actor',
+            note: 'ghsrail',
+            confirm: true,
+        });
+        await priceService.setPrice(db, {
+            businessProductId: product.id,
+            amountGhs: '20.00',
+            confirmedByType: 'BUSINESS',
+            confirmedById: 'rail-actor',
+            note: 'ghsrail',
+            confirm: true,
+        });
+
+        const dto = await getStorefrontProducts(profile.id);
+        expect(dto.priceGhs).toBe('20.00'); // only the CURRENT eligible row
+    });
+});
