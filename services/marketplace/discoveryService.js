@@ -367,7 +367,7 @@ function buildWhere({ category, q, taxonomies, city, region, key }) {
 // ─── fetch + refill loop ─────────────────────────────────────────────────────
 
 const INCLUDE = {
-    businessProfile: { select: { id: true, bizId: true, businessName: true, category: true, logoUrl: true } },
+    businessProfile: { select: { id: true, bizId: true, businessName: true, category: true } },
     location: { select: { id: true, label: true, city: true, region: true } },
     catalogSection: {
         select: { id: true, name: true, taxonomy: true, isActive: true, availableFrom: true, availableTo: true },
@@ -698,14 +698,6 @@ function buildItemDto(product, priceRow, windowOpenBySection) {
         businessId: product.businessProfile.id,
         bizId: product.businessProfile.bizId,
         businessName: product.businessProfile.businessName,
-        // Real business logo (branding display ONLY — never a capability,
-        // price, availability or ranking input). Nullable by schema
-        // (BusinessProfile.logoUrl String?): null = business has not set a
-        // logo; the field is always present so clients can treat missing
-        // logos uniformly. Additive contract: consumers that ignore it keep
-        // working, and the existing frontend DTO tolerates the null/missing
-        // value identically.
-        businessLogoUrl: product.businessProfile.logoUrl ?? null,
         businessCategory,
         item: {
             name: product.name,

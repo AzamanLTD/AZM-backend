@@ -266,22 +266,6 @@ async function setPrice(tx, {
             scope,
             locationId: locationId ?? null,
             status: 'ACTIVE',
-            // CLOCK-DOMAIN FIX (2026-10-17, CI run 39007452456 flake root cause):
-            // effectiveFrom is compared against the APPLICATION clock by the
-            // eligibility predicates (eligibleCurrentGhsPriceWhere /
-            // selectEligiblePriceRows use `new Date()`). Relying on the DB-side
-            // DEFAULT CURRENT_TIMESTAMP mixes clock domains: when the database
-            // clock runs even 1ms ahead of the app clock (measured on CI and
-            // locally: embedded/service Postgres vs the Node process), a price
-            // written now is read-back as "scheduled in the future" for that
-            // skew window — a just-confirmed price becomes invisible to the
-            // discovery candidate query and the resolver (read-your-write
-            // violation; observed as marketplace-discovery-mix-p1 flaking on
-            // its final-seeded product). Stamping the app clock here makes
-            // write-then-read monotonic within a single clock domain. This is
-            // the v1 contract anyway: setPrice always stamps effectiveFrom
-            // "now" — it never accepts a caller-supplied or DB-default value.
-            effectiveFrom: new Date(),
             confirmedByType,
             confirmedById: confirm ? confirmedById : null,
             confirmedAt: confirm ? new Date() : null,

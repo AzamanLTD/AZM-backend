@@ -21,9 +21,6 @@ function fail(res, err) {
 const wrap = (h) => async (req, res) => { try { await h(req, res); } catch (e) { fail(res, e); } };
 
 // GET /api/users/lookup/:azamanId — minimal public profile by Azaman ID.
-// r43: the profile also carries the CALLER's friendship state with the found
-// user ({ friendshipId, status } | null) so the Send flow can route to the
-// canonical friendship-scoped transfer rail or fail closed.
 exports.lookup = wrap(async (req, res) => {
   const svc = new IdentityService(req.app.get('prisma'));
   const profile = await svc.lookupByAzamanId(req.user.id, req.params.azamanId);
