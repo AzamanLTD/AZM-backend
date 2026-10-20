@@ -6,7 +6,8 @@
 // TradeAccount, no matter how the two requests interleave.
 //
 // Protocol being proven (controllers/tradeAccountController.deleteTradeAccount
-// + controllers/adController.createAd): both handlers run their
+// + controllers/adController.createAd + adController.toggleAdStatus): the
+// account-touching handlers run their
 // check-and-write phases inside ONE transaction whose FIRST statement is a
 // SELECT ... FOR UPDATE on the same TradeAccount row. Postgres serializes the
 // pair on that row lock:
@@ -161,6 +162,145 @@ run('Trade-account archive ↔ ad-create lifecycle (real PostgreSQL)', () => {
         expect(await activeAdsOn(account.id)).toBe(0);
         const totalAds = await prisma.ad.count({ where: { tradeAccountId: account.id } });
         expect(totalAds).toBe(1); // only the original (now INACTIVE) ad
+    });
+
+    const toggleReq = (userId, adId) => ({
+        ...handlerEnv(userId),
+        params: { id: String(adId) },
+        body: {},
+    });
+
+    test('lifecycle: an OFFLINE ad cannot be reactivated after its trade account is archived', async () => {
+        const { user, account } = await seedVendorAndAccount();
+
+        // Ad created and ACTIVE against the account.
+        let res = makeRes();
+        await adController.createAd(createAdReq(user.id, account.id), res);
+        expect(res.statusCode).toBe(201);
+        const adId = res.body.ad.id;
+        seededAds.push(adId);
+
+        // Deactivate via the toggle (legitimate deactivation path).
+        res = makeRes();
+        await adController.toggleAdStatus(toggleReq(user.id, adId), res);
+        expect(res.statusCode).toBe(200);
+        expect(res.body.ad.status).toBe('OFFLINE');
+
+        // Archive now succeeds (no ACTIVE ads reference the account).
+        res = makeRes();
+        await tradeAccountController.deleteTradeAccount(archiveReq(user.id, account.id), res);
+        expect(res.statusCode).toBe(200);
+        const stored = await prisma.tradeAccount.findUnique({ where: { id: account.id } });
+        expect(stored.archivedAt).not.toBeNull();
+
+        // THE GAP UNDER REVIEW: reactivating the OFFLINE ad against the
+        // archived account must be rejected server-side.
+        res = makeRes();
+        await adController.toggleAdStatus(toggleReq(user.id, adId), res);
+        expect(res.statusCode).toBe(400);
+        expect(res.body.success).toBe(false);
+        expect(res.body.message).toContain('archived');
+
+        // Committed-state invariant: no ACTIVE ad references an archived account.
+        const ad = await prisma.ad.findUnique({ where: { id: adId } });
+        expect(ad.status).toBe('OFFLINE');
+        expect(await activeAdsOn(account.id)).toBe(0);
+
+        // Deactivation of an ACTIVE ad remains allowed even after archive
+        // (it only ever reduces the archiver's count).
+        await prisma.ad.update({ where: { id: adId }, data: { status: 'ACTIVE' } });
+        res = makeRes();
+        await adController.toggleAdStatus(toggleReq(user.id, adId), res);
+        expect(res.statusCode).toBe(200);
+        expect(res.body.ad.status).toBe('OFFLINE');
+        expect(await activeAdsOn(account.id)).toBe(0);
+    });
+
+    test('lifecycle: an ARCHIVED ad is terminal — the toggle path never resurrects it', async () => {
+        const { user, account } = await seedVendorAndAccount();
+
+        let res = makeRes();
+        await adController.createAd(createAdReq(user.id, account.id), res);
+        expect(res.statusCode).toBe(201);
+        const adId = res.body.ad.id;
+        seededAds.push(adId);
+
+        // Deactivate, then soft-archive the ad via the archiveAd contract.
+        res = makeRes();
+        await adController.toggleAdStatus(toggleReq(user.id, adId), res);
+        expect(res.statusCode).toBe(200);
+        res = makeRes();
+        await adController.archiveAd(toggleReq(user.id, adId), res);
+        expect(res.statusCode).toBe(200);
+
+        // Toggle attempts on the terminally archived ad are refused.
+        res = makeRes();
+        await adController.toggleAdStatus(toggleReq(user.id, adId), res);
+        expect(res.statusCode).toBe(400);
+        expect(res.body.message).toContain('Archived ads cannot be reactivated');
+        const ad = await prisma.ad.findUnique({ where: { id: adId } });
+        expect(ad.status).toBe('ARCHIVED');
+    });
+
+    test('race: concurrent ad RE-activation vs account archival never leaves an ACTIVE ad on an archived account', async () => {
+        const ITERATIONS = 12;
+        const outcomes = { archiveWon: 0, activationWon: 0 };
+        const biases = ['simultaneous', 'archive-first', 'activation-first'];
+        const delay = (ms) => new Promise((r) => setTimeout(r, ms));
+
+        for (let i = 0; i < ITERATIONS; i++) {
+            const { user, account } = await seedVendorAndAccount();
+
+            // Seed an OFFLINE, account-linked ad (the reactivation candidate).
+            let res = makeRes();
+            await adController.createAd(createAdReq(user.id, account.id), res);
+            expect(res.statusCode).toBe(201);
+            const adId = res.body.ad.id;
+            seededAds.push(adId);
+            res = makeRes();
+            await adController.toggleAdStatus(toggleReq(user.id, adId), res);
+            expect(res.body.ad.status).toBe('OFFLINE');
+
+            const bias = biases[i % biases.length];
+            const archiveRes = makeRes();
+            const toggleRes = makeRes();
+            const runArchive = () => tradeAccountController.deleteTradeAccount(archiveReq(user.id, account.id), archiveRes);
+            const runToggle = () => adController.toggleAdStatus(toggleReq(user.id, adId), toggleRes);
+            await Promise.all([
+                bias === 'activation-first' ? delay(25).then(runArchive) : runArchive(),
+                bias === 'archive-first' ? delay(25).then(runToggle) : runToggle(),
+            ]);
+
+            const stored = await prisma.tradeAccount.findUnique({ where: { id: account.id } });
+            const activeAds = await activeAdsOn(account.id);
+            const archived = stored.archivedAt !== null;
+            if (archived) outcomes.archiveWon += 1; else outcomes.activationWon += 1;
+
+            // THE INVARIANT, in committed database state.
+            expect(archived && activeAds > 0).toBe(false);
+
+            if (archived) {
+                expect(toggleRes.statusCode).toBe(400);
+                expect(toggleRes.body.message).toContain('archived');
+                expect(archiveRes.statusCode).toBe(200);
+            } else {
+                // Activation won: ad ACTIVE, archive refused on active ads.
+                expect(toggleRes.statusCode).toBe(200);
+                expect(toggleRes.body.ad.status).toBe('ACTIVE');
+                expect(activeAds).toBe(1);
+                expect(archiveRes.statusCode).toBe(400);
+                expect(archiveRes.body.message).toContain('active ad');
+            }
+        }
+
+        expect(outcomes.archiveWon + outcomes.activationWon).toBe(ITERATIONS);
+        // The biases must have crossed the lock in BOTH orders.
+        expect(outcomes.archiveWon).toBeGreaterThan(0);
+        expect(outcomes.activationWon).toBeGreaterThan(0);
+        // eslint-disable-next-line no-console
+        console.log(
+            `reactivation-race outcomes over ${ITERATIONS} iterations: archive won ${outcomes.archiveWon}, activation won ${outcomes.activationWon}`,
+        );
     });
 
     test('race: concurrent archive + ad-create never leaves an ACTIVE ad on an archived account', async () => {

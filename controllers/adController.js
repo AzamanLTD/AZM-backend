@@ -446,27 +446,93 @@ exports.getMyAds = async (req, res) => {
 };
 
 // 5. TOGGLE AD STATUS
+// =============================================================================
+// ACTIVATION ↔ ACCOUNT-ARCHIVAL MUTUAL EXCLUSION (2026-10-20 review
+// follow-up). The previous unconditional `status === 'ACTIVE' ? 'OFFLINE'
+// : 'ACTIVE'` flip had two defects:
+//   (a) an OFFLINE ad linked to a trade account could be reactivated AFTER
+//       that account was archived — the exact lifecycle gap createAd was
+//       fixed for, reopened through this path; and it raced account
+//       archival the same way createAd did.
+//   (b) an ARCHIVED ad — a TERMINAL soft-archive state (see archiveAd) —
+//       could be resurrected to ACTIVE through this path.
+//
+// Protocol (identical to createAd / deleteTradeAccount): validation and the
+// status write run inside ONE transaction; when the ad is linked to a
+// trade account, the transaction takes the same SELECT ... FOR UPDATE row
+// lock on the TradeAccount row BEFORE deciding the transition, so
+// activation and archival serialize on that lock: whichever commits first,
+// the other re-reads post-commit state — the reactivator sees archivedAt
+// and refuses; the archiver counts the newly re-ACTIVE ad and refuses.
+// Deactivation (ACTIVE→OFFLINE) remains always allowed: it only ever
+// reduces the archiver's active-ad count and can never violate the
+// invariant. The pre-read of the ad (to learn its immutable
+// tradeAccountId) is only used to select the lock set; ALL validation and
+// the write are re-done inside the transaction.
+// =============================================================================
 exports.toggleAdStatus = async (req, res) => {
     const prisma = req.app.get('prisma');
     try {
         const { id }     = req.params;
         const vendorId   = req.user.id;
-        const ad         = await prisma.ad.findUnique({ where: { id: parseInt(id) } });
 
-        if (!ad) return res.status(404).json({ success: false, message: 'Ad not found.' });
-        if (ad.vendorId !== vendorId) return res.status(403).json({ success: false, message: 'Unauthorized.' });
+        const fail = (status, message) => {
+            const e = new Error(message);
+            e.statusCode = status;
+            return e;
+        };
 
-        const newStatus  = ad.status === 'ACTIVE' ? 'OFFLINE' : 'ACTIVE';
-        const updatedAd  = await prisma.ad.update({
-            where: { id: parseInt(id) },
-            data:  { status: newStatus }
+        const updatedAd = await prisma.$transaction(async (tx) => {
+            const pre = await tx.ad.findUnique({ where: { id: parseInt(id) } });
+            if (!pre) throw fail(404, 'Ad not found.');
+
+            if (pre.tradeAccountId) {
+                await tx.$queryRaw`
+                    SELECT "id"
+                    FROM "TradeAccount"
+                    WHERE "id" = ${pre.tradeAccountId}
+                    FOR UPDATE`;
+            }
+
+            // Re-read and validate the ad's CURRENT state under the lock.
+            const ad = await tx.ad.findUnique({ where: { id: parseInt(id) } });
+            if (!ad) throw fail(404, 'Ad not found.');
+            if (ad.vendorId !== vendorId) throw fail(403, 'Unauthorized.');
+
+            // ARCHIVED is terminal soft-archive — never resurrected here.
+            if (ad.status === 'ARCHIVED') {
+                throw fail(400, 'Archived ads cannot be reactivated. Create a new ad instead.');
+            }
+
+            const newStatus = ad.status === 'ACTIVE' ? 'OFFLINE' : 'ACTIVE';
+
+            // Reactivation (→ACTIVE) of an account-linked ad requires the
+            // linked account to still exist and be unarchived. The row lock
+            // above makes this check race-free against deleteTradeAccount.
+            if (newStatus === 'ACTIVE' && ad.tradeAccountId) {
+                const acct = await tx.tradeAccount.findUnique({
+                    where: { id: ad.tradeAccountId },
+                    select: { archivedAt: true },
+                });
+                if (!acct || acct.archivedAt) {
+                    throw fail(400, 'Trade account is archived and can no longer be attached to ads.');
+                }
+            }
+
+            return tx.ad.update({
+                where: { id: parseInt(id) },
+                data:  { status: newStatus }
+            });
         });
 
         const io = req.app.get('socketio');
         if (io) io.emit('market_update');
 
-        res.status(200).json({ success: true, message: `Ad is now ${newStatus}.`, ad: updatedAd });
+        res.status(200).json({ success: true, message: `Ad is now ${updatedAd.status}.`, ad: updatedAd });
     } catch (error) {
+        if (error && error.statusCode) {
+            return res.status(error.statusCode).json({ success: false, message: error.message });
+        }
         logger.error('Toggle Ad Error:', error);
         res.status(500).json({ success: false, error: error.message });
     }
@@ -503,11 +569,19 @@ exports.archiveAd = async (req, res) => {
             });
         }
 
-        // Check for in-progress trades referencing this ad
-        const activeTrades = await prisma.trade.count({
+        // Check for in-progress trades referencing this ad.
+        // SCHEMA-CORRECTED 2026-10-20 (found while proving the ARCHIVED
+        // terminal contract): the Trade model has NO adId column — adId
+        // lives on TradeQueue (the ad's overflow queue). The original
+        // prisma.trade.count({ where: { adId } }) always threw
+        // PrismaClientValidationError (Unknown argument adId) and 500'd
+        // the whole archiveAd endpoint, making the ARCHIVED terminal state
+        // unreachable. The schema's only trade↔ad linkage is a WAITING
+        // TradeQueue entry, so the pending-reference check counts those.
+        const activeTrades = await prisma.tradeQueue.count({
             where: {
                 adId: parseInt(id),
-                status: { in: ['PENDING', 'IN_PROGRESS', 'ESCROW', 'DISPUTED'] }
+                status: 'WAITING'
             }
         });
         if (activeTrades > 0) {
