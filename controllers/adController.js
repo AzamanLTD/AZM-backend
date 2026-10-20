@@ -457,10 +457,12 @@ exports.getMyAds = async (req, res) => {
 //   (b) an ARCHIVED ad — a TERMINAL soft-archive state (see archiveAd) —
 //       could be resurrected to ACTIVE through this path.
 //
-// Protocol (identical to createAd / deleteTradeAccount): validation and the
-// status write run inside ONE transaction; when the ad is linked to a
-// trade account, the transaction takes the same SELECT ... FOR UPDATE row
-// lock on the TradeAccount row BEFORE deciding the transition, so
+// Protocol (identical to createAd / deleteTradeAccount / archiveAd):
+// validation and the status write run inside ONE transaction; when the ad
+// is linked to a trade account, the transaction takes the same
+// SELECT ... FOR UPDATE row lock on the TradeAccount row FIRST, then the
+// Ad row lock (one consistent TradeAccount→Ad order across all ad-status
+// writers), so
 // activation and archival serialize on that lock: whichever commits first,
 // the other re-reads post-commit state — the reactivator sees archivedAt
 // and refuses; the archiver counts the newly re-ACTIVE ad and refuses.
@@ -493,6 +495,16 @@ exports.toggleAdStatus = async (req, res) => {
                     WHERE "id" = ${pre.tradeAccountId}
                     FOR UPDATE`;
             }
+            // Ad-row lock (final review 2026-10-20): the same lock
+            // archiveAd takes AFTER its TradeAccount lock — one consistent
+            // TradeAccount→Ad order across every ad-status writer, so
+            // toggle-vs-archive serializes even for account-unlinked ads
+            // and no lock-order inversion is possible.
+            await tx.$queryRaw`
+                SELECT "id"
+                FROM "Ad"
+                WHERE "id" = ${parseInt(id)}
+                FOR UPDATE`;
 
             // Re-read and validate the ad's CURRENT state under the lock.
             const ad = await tx.ad.findUnique({ where: { id: parseInt(id) } });
@@ -547,7 +559,9 @@ exports.toggleAdStatus = async (req, res) => {
 //
 // Rules:
 //   - Only INACTIVE or OFFLINE ads can be archived (not ACTIVE).
-//   - No in-progress trades may reference the ad (status IN_PROGRESS / ESCROW).
+//   - QUEUE POLICY: no WAITING TradeQueue buyers on the ad (the Trade model
+//     has no adId, so the old "no in-progress trades on this ad" rule is
+//     unenforceable in the current schema — see the in-handler note).
 //   - Once archived, the ad is hidden from getMyAds and the marketplace.
 //   - Admin can still view archived ads via the war room.
 // =============================================================================
@@ -557,47 +571,88 @@ exports.archiveAd = async (req, res) => {
         const { id } = req.params;
         const vendorId = req.user.id;
 
-        const ad = await prisma.ad.findUnique({ where: { id: parseInt(id) } });
-        if (!ad) return res.status(404).json({ success: false, message: 'Ad not found.' });
-        if (ad.vendorId !== vendorId) return res.status(403).json({ success: false, message: 'Unauthorized.' });
+        const fail = (status, message) => {
+            const e = new Error(message);
+            e.statusCode = status;
+            return e;
+        };
 
-        // Cannot archive an ACTIVE ad — must deactivate first
-        if (ad.status === 'ACTIVE') {
-            return res.status(400).json({
-                success: false,
-                message: 'Cannot archive an active ad. Deactivate it first.'
-            });
-        }
+        // TOGGLE ↔ ARCHIVE MUTUAL EXCLUSION (2026-10-20 final review).
+        // archiveAd used to be a non-transactional read/check/update, so a
+        // concurrent toggleAdStatus could validate an OFFLINE ad and then
+        // overwrite the committed ARCHIVED status with ACTIVE, defeating the
+        // terminal contract. Both ad-status writers (toggleAdStatus and
+        // archiveAd) now run inside ONE transaction with a CONSISTENT lock
+        // order:
+        //   1. TradeAccount row FOR UPDATE (only when the ad is
+        //      account-linked) — the same lock createAd and
+        //      deleteTradeAccount take FIRST, so no lock-order inversion
+        //      is introduced into the existing account protocol;
+        //   2. Ad row FOR UPDATE — serializes toggle-vs-archive even for
+        //      account-unlinked ads.
+        // The ad's status is then RE-READ under the lock before the write,
+        // so ARCHIVED is terminal under concurrent as well as sequential
+        // requests: whichever writer commits first, the other re-reads the
+        // post-commit status and refuses (ARCHIVED → toggle 400; ACTIVE →
+        // archive 400).
+        const archivedAd = await prisma.$transaction(async (tx) => {
+            const pre = await tx.ad.findUnique({ where: { id: parseInt(id) } });
+            if (!pre) throw fail(404, 'Ad not found.');
 
-        // Check for in-progress trades referencing this ad.
-        // SCHEMA-CORRECTED 2026-10-20 (found while proving the ARCHIVED
-        // terminal contract): the Trade model has NO adId column — adId
-        // lives on TradeQueue (the ad's overflow queue). The original
-        // prisma.trade.count({ where: { adId } }) always threw
-        // PrismaClientValidationError (Unknown argument adId) and 500'd
-        // the whole archiveAd endpoint, making the ARCHIVED terminal state
-        // unreachable. The schema's only trade↔ad linkage is a WAITING
-        // TradeQueue entry, so the pending-reference check counts those.
-        const activeTrades = await prisma.tradeQueue.count({
-            where: {
-                adId: parseInt(id),
-                status: 'WAITING'
+            if (pre.tradeAccountId) {
+                await tx.$queryRaw`
+                    SELECT "id"
+                    FROM "TradeAccount"
+                    WHERE "id" = ${pre.tradeAccountId}
+                    FOR UPDATE`;
             }
-        });
-        if (activeTrades > 0) {
-            return res.status(400).json({
-                success: false,
-                message: `Cannot archive: ${activeTrades} trade(s) still in progress on this ad.`
-            });
-        }
+            await tx.$queryRaw`
+                SELECT "id"
+                FROM "Ad"
+                WHERE "id" = ${parseInt(id)}
+                FOR UPDATE`;
 
-        // Soft-delete: set status to ARCHIVED with timestamp
-        const archivedAd = await prisma.ad.update({
-            where: { id: parseInt(id) },
-            data: {
-                status: 'ARCHIVED',
-                archivedAt: new Date()
+            // Re-read the ad's CURRENT state under the locks.
+            const ad = await tx.ad.findUnique({ where: { id: parseInt(id) } });
+            if (!ad) throw fail(404, 'Ad not found.');
+            if (ad.vendorId !== vendorId) throw fail(403, 'Unauthorized.');
+
+            // Cannot archive an ACTIVE ad — must deactivate first
+            if (ad.status === 'ACTIVE') {
+                throw fail(400, 'Cannot archive an active ad. Deactivate it first.');
             }
+
+            // QUEUE POLICY (named honestly 2026-10-20 final review): this
+            // guard is the ad's overflow-QUEUE policy — a vendor cannot
+            // archive an ad while buyers are WAITING in its TradeQueue.
+            // It is NOT the historical "no in-progress trades on this ad"
+            // policy: the Trade model has NO adId column (the original
+            // prisma.trade.count({ where: { adId } }) always threw
+            // PrismaClientValidationError and 500'd this endpoint), so
+            // ad-to-trade association does not exist in the schema and
+            // that older policy is UNENFORCEABLE today. Implementing it
+            // requires adding Trade.adId (schema migration, write at
+            // trade-initiation, backfill) — tracked as a separate,
+            // explicitly-scoped change; do NOT treat this queue count as
+            // proof that no in-progress trades exist.
+            const waitingQueueEntries = await tx.tradeQueue.count({
+                where: {
+                    adId: parseInt(id),
+                    status: 'WAITING'
+                }
+            });
+            if (waitingQueueEntries > 0) {
+                throw fail(400, `Cannot archive: ${waitingQueueEntries} buyer(s) are still waiting in this ad's trade queue.`);
+            }
+
+            // Soft-delete: set status to ARCHIVED with timestamp
+            return tx.ad.update({
+                where: { id: parseInt(id) },
+                data: {
+                    status: 'ARCHIVED',
+                    archivedAt: new Date()
+                }
+            });
         });
 
         const io = req.app.get('socketio');
@@ -609,6 +664,9 @@ exports.archiveAd = async (req, res) => {
             ad: archivedAd
         });
     } catch (error) {
+        if (error && error.statusCode) {
+            return res.status(error.statusCode).json({ success: false, message: error.message });
+        }
         logger.error('Archive Ad Error:', error);
         res.status(500).json({ success: false, error: error.message });
     }
